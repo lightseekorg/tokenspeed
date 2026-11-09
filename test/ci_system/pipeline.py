@@ -55,6 +55,10 @@ WORKFLOW_STAGE_TYPES = {
     "model-test": {"eval", "perf"},
 }
 SUPPORTED_WORKFLOW_STAGES = tuple(WORKFLOW_STAGE_TYPES)
+# Model modules sit directly under this package; `model_sources` lists them.
+MODEL_DIRECTORY = "python/tokenspeed/runtime/models"
+# Test sources cannot change what a served model computes.
+TEST_DIRECTORIES = ("test/runtime", "tokenspeed-kernel/test")
 # Kernel benchmark suite definitions are read only by `kernel-benchmark` tasks.
 KERNEL_BENCHMARK_SUITE_DIRECTORY = "tokenspeed-kernel/benchmarks/"
 SUPPORTED_SETUP_MODES = ("ci", "slurm")
@@ -331,6 +335,21 @@ def validate_task(data: Dict[str, Any], path: Path) -> None:
                 f"{path}: ignore_changes must be a non-empty list of paths without "
                 "a trailing slash"
             )
+    if "model_sources" in data:
+        sources = data["model_sources"]
+        if (
+            not isinstance(sources, list)
+            or not sources
+            or not all(
+                isinstance(source, str)
+                and re.fullmatch(rf"{MODEL_DIRECTORY}/[A-Za-z0-9_]+\.py", source)
+                for source in sources
+            )
+        ):
+            raise ValueError(
+                f"{path}: model_sources must be a non-empty list of modules "
+                f"directly under {MODEL_DIRECTORY}"
+            )
     if "changed_paths" in data and not isinstance(data["changed_paths"], bool):
         raise ValueError(f"{path}: changed_paths must be a boolean")
     if "retries" in data:
@@ -388,6 +407,14 @@ def validate_task(data: Dict[str, Any], path: Path) -> None:
 def normalize_task(path: Path, repo_root: Path) -> Dict[str, Any]:
     data = load_yaml(path)
     validate_task(data, path)
+    # A renamed model module must not quietly stop selecting its tasks.
+    missing = [
+        source
+        for source in data.get("model_sources", [])
+        if not (repo_root / source).is_file()
+    ]
+    if missing:
+        raise ValueError(f"{path}: model_sources do not exist: {missing}")
     data["_source_path"] = path.relative_to(repo_root).as_posix()
     return data
 
@@ -2331,20 +2358,61 @@ def path_is_ignored(path: str, prefixes: List[str]) -> bool:
     )
 
 
+def model_specific_modules(root: Path, repo_root: Path) -> frozenset[str]:
+    """The modules directly under the models package that belong to one model:
+    those defining ``EntryClass`` and those a task lists in ``model_sources``.
+    Every other module there, such as ``utils.py``, is shared by all models."""
+    listed = {
+        source
+        for path in find_task_files(root)
+        for source in normalize_task(path, repo_root).get("model_sources", [])
+    }
+    defining = {
+        path.relative_to(repo_root).as_posix()
+        for path in (repo_root / MODEL_DIRECTORY).glob("*.py")
+        if re.search(r"^EntryClass\s*=", path.read_text(encoding="utf-8"), re.M)
+    }
+    return frozenset(listed | defining)
+
+
+def path_is_ignored_for_model(
+    path: str, sources: List[str], model_specific: frozenset[str]
+) -> bool:
+    """Return whether a task serving ``sources`` can ignore ``path``: Markdown,
+    a test, or another model's module."""
+    if path.endswith(".md") or any(
+        path.startswith(f"{directory}/") for directory in TEST_DIRECTORIES
+    ):
+        return True
+    return path in model_specific and path not in sources
+
+
 def drop_unaffected_tasks(
-    include: List[Dict[str, Any]], changed: List[str], repo_root: Path
+    include: List[Dict[str, Any]], changed: List[str], repo_root: Path, root: Path
 ) -> List[Dict[str, Any]]:
-    """Drop the entries of tasks whose ``ignore_changes`` covers every change."""
-    prefixes_by_config: Dict[str, Optional[List[str]]] = {}
+    """Drop the entries of tasks that ``ignore_changes`` or ``model_sources``
+    lets ignore every change."""
+    tasks: Dict[str, Dict[str, Any]] = {}
+    model_specific: Optional[frozenset[str]] = None
     kept = []
     for entry in include:
         config = entry["config"]
-        if config not in prefixes_by_config:
-            task = normalize_task(repo_root / config, repo_root)
-            prefixes_by_config[config] = task.get("ignore_changes")
-        prefixes = prefixes_by_config[config]
-        if prefixes is None or not all(
-            path_is_ignored(path, prefixes) for path in changed
+        if config not in tasks:
+            tasks[config] = normalize_task(repo_root / config, repo_root)
+        prefixes = tasks[config].get("ignore_changes")
+        sources = tasks[config].get("model_sources")
+        if prefixes is None and sources is None:
+            kept.append(entry)
+            continue
+        if sources is not None and model_specific is None:
+            model_specific = model_specific_modules(root, repo_root)
+        if not all(
+            (prefixes is not None and path_is_ignored(path, prefixes))
+            or (
+                sources is not None
+                and path_is_ignored_for_model(path, sources, model_specific)
+            )
+            for path in changed
         ):
             kept.append(entry)
     return kept
@@ -2405,7 +2473,7 @@ def main(argv: Iterable[str] | None = None) -> int:
             # Pull requests only: pushes to main still run every task.
             if args.trigger == "per-commit" and 0 < len(changed) < 300:
                 matrix["include"] = drop_unaffected_tasks(
-                    matrix["include"], changed, repo_root
+                    matrix["include"], changed, repo_root, root
                 )
                 attach_changed_paths(matrix["include"], changed, repo_root)
         print(json.dumps(matrix, separators=(",", ":")))

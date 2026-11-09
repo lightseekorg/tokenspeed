@@ -1451,6 +1451,93 @@ def test_validate_task_rejects_a_non_boolean_changed_paths(tmp_path):
         validate_task(_yaml.safe_load(path.read_text()), path)
 
 
+_MODELS = "python/tokenspeed/runtime/models"
+_MODEL_FILES = {
+    f"{_MODELS}/alpha.py": "EntryClass = Alpha\n",
+    # A helper only the alpha task lists.
+    f"{_MODELS}/alpha_vision.py": "",
+    f"{_MODELS}/beta.py": "EntryClass = [Beta]\n",
+    f"{_MODELS}/gamma.py": "EntryClass = Gamma\n",
+    f"{_MODELS}/utils.py": "",
+    f"{_MODELS}/base/layer.py": "",
+}
+
+
+@pytest.mark.parametrize(
+    ("changed", "trigger", "expected"),
+    [
+        (f"{_MODELS}/beta.py\n", "per-commit", ["beta", "other"]),
+        (f"{_MODELS}/alpha_vision.py\n", "per-commit", ["alpha", "other"]),
+        (f"{_MODELS}/gamma.py\n", "per-commit", ["other"]),
+        (
+            f"{_MODELS}/gamma.py\ntest/runtime/test_a.py\ntokenspeed-kernel/test/t.py\n"
+            "docs/a.md\n",
+            "per-commit",
+            ["other"],
+        ),
+        (f"{_MODELS}/utils.py\n", "per-commit", ["alpha", "beta", "other"]),
+        (f"{_MODELS}/base/layer.py\n", "per-commit", ["alpha", "beta", "other"]),
+        (f"{_MODELS}/deleted.py\n", "per-commit", ["alpha", "beta", "other"]),
+        (
+            f"{_MODELS}/gamma.py\npython/tokenspeed/runtime/layers/a.py\n",
+            "per-commit",
+            ["alpha", "beta", "other"],
+        ),
+        (f"{_MODELS}/gamma.py\n", "post-submit", ["alpha", "beta", "other"]),
+    ],
+)
+def test_scan_drops_model_tasks_for_other_models_changes(
+    changed, trigger, expected, tmp_path, capsys, monkeypatch
+):
+    monkeypatch.delenv(pipeline.EXCLUDED_RUNNER_LABELS_ENV, raising=False)
+    monkeypatch.delenv(pipeline.B200_RUNNER_LABEL_ENV, raising=False)
+    for name, text in _MODEL_FILES.items():
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_text(text)
+    root = tmp_path / "test/ci"
+    root.mkdir(parents=True)
+    for name, sources in [("alpha", ["alpha", "alpha_vision"]), ("beta", ["beta"])]:
+        listed = "".join(f"  - {_MODELS}/{source}.py\n" for source in sources)
+        body = _default_body(name, ["b200-1gpu"], f"model_sources:\n{listed}")
+        _write_task_yaml(root, f"{name}.yaml", body)
+    _write_task_yaml(root, "other.yaml", _default_body("other", ["b200-1gpu"]))
+    changed_file = tmp_path / "changed.txt"
+    changed_file.write_text(changed)
+    argv = ["scan", "--repo-root", str(tmp_path), "--trigger", trigger]
+    argv += ["--changed-files", str(changed_file)]
+    assert pipeline.main(argv) == 0
+    matrix = json.loads(capsys.readouterr().out)
+    assert [entry["name"] for entry in matrix["include"]] == expected
+
+
+def test_scan_fails_on_a_missing_model_source(tmp_path, monkeypatch):
+    monkeypatch.delenv(pipeline.EXCLUDED_RUNNER_LABELS_ENV, raising=False)
+    root = tmp_path / "test/ci"
+    root.mkdir(parents=True)
+    listed = f"model_sources:\n  - {_MODELS}/renamed.py\n"
+    _write_task_yaml(root, "eval.yaml", _default_body("eval", ["b200-1gpu"], listed))
+    with pytest.raises(ValueError, match="model_sources do not exist"):
+        pipeline.main(["scan", "--repo-root", str(tmp_path)])
+
+
+@pytest.mark.parametrize(
+    "sources",
+    [
+        "[]",
+        f"{_MODELS}/alpha.py",
+        f"[{_MODELS}/base/layer.py]",
+        "[python/tokenspeed/runtime/layers/a.py]",
+    ],
+)
+def test_validate_task_rejects_malformed_model_sources(tmp_path, sources):
+    body = _default_body("ut-a", ["b300-1gpu"], extra=f"model_sources: {sources}\n")
+    path = _write_task_yaml(tmp_path, "bad.yaml", body)
+    import yaml as _yaml
+
+    with pytest.raises(ValueError, match=r"model_sources must be"):
+        validate_task(_yaml.safe_load(path.read_text()), path)
+
+
 @pytest.mark.parametrize(
     "prefixes", ["[]", "python/tokenspeed", "['']", "[python/tokenspeed/]"]
 )
