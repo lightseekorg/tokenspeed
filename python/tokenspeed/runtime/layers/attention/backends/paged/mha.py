@@ -135,12 +135,19 @@ class MHAAttnBackend(PagedAttentionBackend):
 
     # Every kernel call site forwards layer.sliding_window_size.
     supports_layer_sliding_window: bool = True
+    # Set from the resolved kernel solution in __init__: a token sink reaches
+    # only the Triton decode leaf, so a backend pinned to another solution
+    # cannot serve one and says so before a layer declares a sink.
+    supports_layer_window_sink: bool = False
 
     def __init__(self, config: AttnConfig, spec: MHAConfig, *, kernel_page_size: int):
         super().__init__(config, spec, kernel_page_size=kernel_page_size)
         # Map the selected backend to the corresponding kernel solution string.
         backend_name = spec.backend_name or "mha"
         self.kernel_solution = _KERNEL_SOLUTION_BY_BACKEND[backend_name]
+        # ``None`` leaves selection free, so the sink-capable leaf is reachable;
+        # a pinned solution must be the one that declares the trait.
+        self.supports_layer_window_sink = self.kernel_solution in (None, "triton")
 
         self.skip_softmax_threshold = spec.skip_softmax_threshold
 
@@ -521,6 +528,7 @@ class MHAAttnBackend(PagedAttentionBackend):
             page_table=metadata.page_table,
             cache_seqlens=metadata.seq_lens,
             window_left=layer.sliding_window_size,
+            window_sink=layer.sliding_window_sink,
             logit_cap=layer.logit_cap,
             sinks=sinks,
             max_seqlen_k=self.max_context_len,

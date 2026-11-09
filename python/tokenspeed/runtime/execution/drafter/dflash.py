@@ -32,7 +32,7 @@ from tokenspeed_kernel.ops.sampling.cute_dsl import (
 )
 from typing_extensions import override
 
-from tokenspeed.runtime.distributed.comm_ops import all_gather_single
+from tokenspeed.runtime.distributed.comm_ops import all_gather, all_gather_single
 from tokenspeed.runtime.execution.cache_loc_kernel import (
     dflash_prepare_decode,
 )
@@ -50,7 +50,13 @@ from tokenspeed.runtime.execution.forward_batch_info import (
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.layers.logits_processor import (
     LogitsMetadata,
+    LogitsProcessor,
     _dist_argmax_vetoed,
+)
+from tokenspeed.runtime.layers.paged_attention import PagedAttention
+from tokenspeed.runtime.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
 )
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.nvtx import nvtx_range
@@ -111,6 +117,14 @@ def _resolve_draft_query_width(verify_width: int, sample_from_anchor: bool) -> i
 
 
 _UNSET = object()
+
+# Dtypes a replicated draft head can carry over from the target's shards.
+# A whitelist, not a blacklist: the draft matmuls the gathered rows directly,
+# so a dtype belongs here only once its raw bytes ARE the vocabulary's values.
+# That excludes packed and scaled weights (fp8, int4/int8 quantized), whose
+# rows need their scales applied first. Adding a dtype means verifying that
+# much, not just that the cast succeeds.
+_REPLICABLE_HEAD_DTYPES = frozenset({torch.bfloat16, torch.float16, torch.float32})
 
 
 class DFlash(BaseDrafter):
@@ -180,6 +194,7 @@ class DFlash(BaseDrafter):
         self.hidden_size = int(getattr(cfg, "hidden_size"))
         self._init_native_buffers()
         self._validate_draft_attention_window()
+        self._validate_draft_window_sink()
         self._greedy_gathered_max: torch.Tensor | None = None
         self._greedy_gathered_ids: torch.Tensor | None = None
         self._greedy_gather_cap = 0
@@ -238,15 +253,12 @@ class DFlash(BaseDrafter):
         Raises:
             ValueError: The draft declares a window the backend cannot apply.
         """
-        if getattr(self.attn_backend, "supports_layer_sliding_window", False):
+        if self.attn_backend.supports_layer_sliding_window:
             return
         windows = {
-            int(window)
-            for window in (
-                getattr(module, "sliding_window_size", None)
-                for module in self.model.modules()
-            )
-            if window is not None and int(window) >= 0
+            int(module.sliding_window_size)
+            for module in self.model.modules()
+            if isinstance(module, PagedAttention) and module.sliding_window_size >= 0
         }
         if not windows:
             return
@@ -262,6 +274,40 @@ class DFlash(BaseDrafter):
             "--drafter-attention-backend mla or tokenspeed_mla ('gluon' on "
             "AMD) for MLA drafts, or one of "
             "mha/fa3/fa4/triton/flashinfer/trtllm_mha for GQA drafts."
+        )
+
+    def _validate_draft_window_sink(self) -> None:
+        """Reject a drafter backend that would drop the draft's window sink.
+
+        A token sink keeps the first N tokens visible outside the sliding
+        window. A backend without it answers with plain sliding-window
+        attention, which raises nothing and costs acceptance quality only, so
+        the mismatch has to be refused here. Ask the built layers, as
+        :meth:`_validate_draft_attention_window` does.
+
+        Raises:
+            ValueError: The draft declares a sink the backend cannot apply.
+        """
+        sinks = {
+            int(module.sliding_window_sink)
+            for module in self.model.modules()
+            if isinstance(module, PagedAttention) and module.sliding_window_sink > 0
+        }
+        if not sinks:
+            return
+        if self.attn_backend.supports_layer_window_sink:
+            return
+        backend_name = (
+            self.draft_model_runner.server_args.drafter_attention_backend
+            or type(self.attn_backend).__name__
+        )
+        raise ValueError(
+            "The draft's attention layers declare a window sink "
+            f"(sink={sorted(sinks)}), but the {backend_name!r} drafter "
+            "attention backend cannot keep those leading tokens visible and "
+            "would silently serve plain sliding-window attention. Launch with "
+            "--drafter-attention-backend triton, or export the draft without "
+            "sliding_window_sink."
         )
 
     def _init_native_buffers(self) -> None:
@@ -327,6 +373,96 @@ class DFlash(BaseDrafter):
             self.embed_tokens = self.model.embed_tokens
         self.lm_head = target_model.lm_head
         self.logits_processor = language_model.logits_processor
+        self._replicate_head_over_attention_dp()
+
+    def _replicate_head_over_attention_dp(self) -> None:
+        """Replace the wired head and processor with replicated ones when the
+        target's head is vocab-sharded over attention-DP ranks.
+
+        Every route from a vocab-sharded head to a token is a collective over
+        the head's TP group (this drafter's argmax all-gathers the per-shard
+        maxima; ``LogitsProcessor._get_logits`` all-gathers the rows). Under
+        ``dp_lm_head_tp`` that group spans attention-DP ranks holding DIFFERENT
+        rows, and the target's forward keeps every one of them in the exchange.
+        A drafter has no such guarantee: only the rank holding a request
+        drafts, while its peers' idle forward skips the drafter
+        (``ModelExecutor.execute_idle_forward``), so a collective one rank
+        enters and the rest skip never completes.
+
+        The shards are therefore gathered ONCE here, at setup, where every rank
+        is running, into a rank-local full-vocabulary copy. Drafting then needs
+        no collective, and the target keeps its ``--lm-head-tp-size``.
+        """
+        processor = self.logits_processor
+        if not processor.dp_lm_head_tp:
+            return
+        head = self.lm_head
+        if not isinstance(head, VocabParallelEmbedding):
+            raise ValueError(
+                "a vocab-sharded LM head under attention DP must be a "
+                f"VocabParallelEmbedding to replicate; got {type(head).__name__}"
+            )
+        weight = head.weight
+        shard = head.shard_indices
+        if weight.dtype not in _REPLICABLE_HEAD_DTYPES:
+            # The draft matmuls the gathered rows directly: a packed or scaled
+            # weight's bytes are not the vocabulary's values.
+            raise ValueError(
+                "DFLASH replicates only an unquantized LM head for drafting; "
+                f"the target's head holds {weight.dtype} rows"
+            )
+        if shard.num_added_elements:
+            # An added-vocabulary block sits after this rank's padded org block,
+            # so the gathered rows are not one contiguous vocabulary.
+            raise ValueError(
+                "DFLASH does not support an added-vocabulary LM head under "
+                "--lm-head-tp-size > 1 with attention DP"
+            )
+        vocab_size = int(head.num_embeddings)
+        gathered = all_gather(weight.detach(), processor.tp_group, dim=0)
+        if gathered.shape[0] < vocab_size:
+            raise ValueError(
+                f"the gathered LM head holds {gathered.shape[0]} rows for a "
+                f"vocabulary of {vocab_size}"
+            )
+        # Built with the SOURCE head's vocabulary and padding so both hold the
+        # same row geometry: the gather returns the padded row count, not
+        # vocab_size, and a head padded differently would place the vocabulary
+        # at different indices than the shards it came from.
+        replicated = ParallelLMHead(
+            vocab_size,
+            int(gathered.shape[1]),
+            bias=False,
+            params_dtype=gathered.dtype,
+            org_num_embeddings=int(head.org_vocab_size),
+            padding_size=int(head.padding_size),
+            prefix="dflash_replicated_lm_head",
+        ).to(gathered.device)
+        rows = int(replicated.weight.shape[0])
+        if rows != gathered.shape[0]:
+            raise ValueError(
+                f"the replicated LM head holds {rows} rows while the gathered "
+                f"shards hold {gathered.shape[0]}"
+            )
+        with torch.no_grad():
+            replicated.weight.copy_(gathered)
+        self.lm_head = replicated
+        # One rank, so no vocabulary gather or row exchange; do_argmax stays
+        # off (the draft takes a local argmax over full-vocabulary logits). The
+        # config is the replaced processor's: the head is the TARGET's, and the
+        # processor slices logits to config.vocab_size.
+        self.logits_processor = LogitsProcessor(
+            processor.config,
+            skip_all_gather=processor.skip_all_gather,
+            logit_scale=processor.logit_scale,
+            attn_tp_size=1,
+            dp_lm_head_tp=False,
+        )
+        logger.info(
+            "DFLASH replicated the LM head for drafting: the target's "
+            f"{processor.tp_size}-way vocab shard spans attention-DP ranks, "
+            "whose collectives a single drafting rank cannot complete"
+        )
 
     def _probe_dist_argmax_state(self, dtype: torch.dtype, device: torch.device):
         """Ask for a drafting state, once the head's shard is a fit for one."""
@@ -566,27 +702,36 @@ class DFlash(BaseDrafter):
         if hidden is None:
             raise RuntimeError("DFLASH requires target hidden states.")
         if hidden.shape[0] != base_ctx.input_num_tokens:
+            # The width separates "taps collected but rows narrowed" from "no
+            # taps, so the plain final hidden came through": a FULL capture
+            # carries num_taps * hidden_size columns, and they need different fixes.
             raise RuntimeError(
                 "DFLASH hidden-state/token mismatch: "
-                f"hidden_tokens={hidden.shape[0]}, input_tokens={base_ctx.input_num_tokens}."
+                f"hidden_tokens={hidden.shape[0]}, "
+                f"input_tokens={base_ctx.input_num_tokens}, "
+                f"hidden_width={hidden.shape[-1]}, "
+                f"expected_width={self.model.num_context_features * self.hidden_size} "
+                f"({self.model.num_context_features} taps x {self.hidden_size}), "
+                f"bs={base_ctx.bs}, num_extends={base_ctx.num_extends}."
             )
         if base_ctx.input_num_tokens == 0:
             return
 
         positions = self.input_buffers.positions_buf[: base_ctx.input_num_tokens]
-        # Target and draft views share the full-history group's page-id space.
-        # Preserve the target's packed order: extend rows, then verify rows.
-        target_backend = base_ctx.attn_backend
+        # The TARGET's router names these rows (the draft's own has already
+        # republished a block window by now). Packed order is kept: extend
+        # rows, then verify rows.
+        backend = base_ctx.attn_backend
         if base_ctx.num_extends == base_ctx.bs:
             # A PD prefill worker may never publish a decode window.
-            cache_locs = target_backend.extend_span_locations()
+            cache_locs = backend.extend_span_locations()
         elif base_ctx.num_extends == 0:
-            cache_locs = target_backend.decode_window_locations()
+            cache_locs = backend.decode_window_locations()
         else:
             cache_locs = torch.cat(
                 (
-                    target_backend.extend_span_locations(),
-                    target_backend.decode_window_locations(),
+                    backend.extend_span_locations(),
+                    backend.decode_window_locations(),
                 )
             )
         self._write_native_cache(
@@ -1001,6 +1146,11 @@ class DFlash(BaseDrafter):
         num_tokens = ctx.input_num_tokens
         self._sink_tokens = num_tokens
         self._sink_positions = self.input_buffers.positions_buf[:num_tokens]
+        # The TARGET's router: these are rows the target computed, so they are
+        # named in its page-id space. The draft's own router has already
+        # published its block window, and writing the taps through that one
+        # would leave the draft reading history from rows its KV never landed
+        # in -- nothing errors, the speculation is simply wasted.
         self._sink_cache_locs = ctx.attn_backend.decode_window_locations()[:num_tokens]
         ctx.target_capture_sink = self
 
@@ -1206,7 +1356,16 @@ class DFlash(BaseDrafter):
         )
 
         flat_ids = block_ids.reshape(-1)
-        input_embeds = self.embed_tokens(flat_ids, reduce_results=False)
+        # The target's embedding may be vocab-sharded over the attention TP
+        # group (for example 8 shards of 36864 rows). ``_partial_lookup`` then
+        # answers with this rank's rows and ZERO rows for every id outside its
+        # shard, so the sum over the group is the embedding and one rank's view
+        # is not. Without the reduce every rank but an id's owner drafts from
+        # zeros -- no error, just a draft that predicts nothing. With a
+        # single-rank table (TP=1, or attention DP where the rank holds the
+        # whole vocabulary) there is nothing to sum: the all-reduce is a no-op,
+        # so this matches the unreduced lookup exactly.
+        input_embeds = self.embed_tokens(flat_ids, reduce_results=True)
 
         with torch.inference_mode():
             logits_output = self.draft_model_runner.forward(
