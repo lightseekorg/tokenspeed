@@ -456,7 +456,7 @@ normalized FP32 weights (scale 1) and INT32 IDs into caller-owned buffers.
 The routing-only kernel has no expert-plan workspace or 8,192-token limit.
 Other contracts retain their existing routers.
 
-## Optional Kimi-K3 front projections
+## Kimi-K3 front projections
 
 `try_latent_moe_input_projections` runs a registered fused implementation or
 returns `None` before any projection. This lets the runtime retain the
@@ -464,13 +464,17 @@ separate projections and their stream scheduling for unsupported inputs.
 `latent_moe_input_projections` keeps its portable composition when no fused
 implementation is available.
 
-The FlashInfer front is enabled on SM103 with 152 SMs for 2048–16384 BF16
-rows, Kimi-K3's replicated router/latent weights, full shared-expert weights,
-and SiTU clamps 4 and 25. Attention-DP uses it only without shared-expert TP;
-EP routing/quantization and the shared down projection keep their existing
-owners. Smaller shapes and shared-expert TP retain their existing paths.
+`cuda_latent_input` is the vendored FlashInfer/Cake fused front
+(`thirdparty/cuda/kimi3_latent_front.py` and `csrc/kimi3_latent_front/`): one
+persistent launch produces the FP32 router logits, the BF16 latent input and
+the BF16 SiTU-activated shared-expert input. It is registered on SM103 with 152
+SMs for 2048-16384 BF16 rows, Kimi-K3's replicated router/latent weights, full
+shared-expert weights, and SiTU clamps 4 and 25. Attention-DP uses it only
+without shared-expert TP; EP routing/quantization and the shared down projection
+keep their existing owners. Smaller shapes and shared-expert TP retain their
+existing paths.
 
-This optional backend requires the qualified 152-SM planner and the matching
-CUDA source payload in FlashInfer. The unpatched 0.7.2 wheel lacks these and
-does not enable the registration. Prepare/warm up before graph capture;
+The programs are JIT-built through FlashInfer's toolchain like the Kimi-K3
+router and do not depend on the FlashInfer package shipping its experimental
+kernel sources (release wheels omit them). Prepare/warm up before graph capture;
 no persistent activation tensors are cached per layer by this adapter.

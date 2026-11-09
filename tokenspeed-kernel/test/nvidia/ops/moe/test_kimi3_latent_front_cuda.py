@@ -30,7 +30,7 @@ from tokenspeed_kernel.ops.moe import (
 )
 from tokenspeed_kernel.platform import ArchVersion, current_platform
 from tokenspeed_kernel.selection import NoKernelFoundError, kernel_override
-from tokenspeed_kernel.thirdparty.cuda.flashinfer_kimi_k3 import latent_front_available
+from tokenspeed_kernel.thirdparty.cuda import kimi3_latent_front
 
 
 @pytest.fixture(scope="module")
@@ -40,9 +40,9 @@ def weights():
         not platform.is_nvidia
         or platform.arch_version != ArchVersion(10, 3)
         or platform.sm_count != 152
-        or not latent_front_available()
+        or not kimi3_latent_front.available()
     ):
-        pytest.skip("requires the GB300 Kimi-K3 source bundle")
+        pytest.skip("requires a 152-SM GB300")
     torch.manual_seed(621)
     return tuple(
         (torch.randn(rows, 7168, device="cuda") / math.sqrt(7168)).bfloat16()
@@ -75,7 +75,7 @@ def test_front_matches_reference_and_replays_changed_inputs(weights, rows):
             *weights,
             gate_clamp=4.0,
             up_clamp=25.0,
-            override="flashinfer_latent_input",
+            override="cuda_latent_input",
         )
 
     actual = run()
@@ -112,7 +112,7 @@ def test_front_declines_unvalidated_rows(weights, rows):
             *weights,
             gate_clamp=4.0,
             up_clamp=25.0,
-            solution="flashinfer",
+            solution="cuda",
         )
 
 

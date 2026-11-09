@@ -28,7 +28,7 @@ import pytest
 import torch
 from tokenspeed_kernel.ops.moe import try_latent_moe_input_projections
 from tokenspeed_kernel.platform import ArchVersion, current_platform
-from tokenspeed_kernel.thirdparty.cuda.flashinfer_kimi_k3 import latent_front_available
+from tokenspeed_kernel.thirdparty.cuda import kimi3_latent_front
 from tokenspeed_kernel.thirdparty.cute_dsl.mega_moe import runner
 from torch import nn
 
@@ -91,9 +91,9 @@ def test_attention_dp_front_preserves_routing_and_output(monkeypatch, rows):
         platform.is_nvidia
         and platform.arch_version == ArchVersion(10, 3)
         and platform.sm_count == 152
-        and latent_front_available()
+        and kimi3_latent_front.available()
     ):
-        pytest.skip("requires the GB300 Kimi-K3 source bundle")
+        pytest.skip("requires a 152-SM GB300")
     monkeypatch.setattr(kimi_k3, "MoELayer", UnloadedExperts)
     monkeypatch.setattr(runner, "get_runner", lambda plan, experts: experts)
     monkeypatch.setattr(kimi_k3, "get_moe_backend", lambda: MoeBackend.MEGA_MOE)
