@@ -770,7 +770,7 @@ role only.
 Requirements: `--speculative-algorithm EAGLE3` or `MTP` (`DSPARK` proposes a
 whole block greedily outside [Block verification](#block-verification-experimental);
 `DFLASH` is covered below), `--speculative-eagle-topk 1`,
-and `--sampling-backend flashinfer`, `flashinfer_full` or `sonic` (`sonic`
+and `--sampling-backend flashinfer`, `flashinfer_full`, or `sonic` (`sonic`
 reads `q` at its top-128 target candidates; `greedy` verifies by exact match,
 the Triton backends by target-sampled exact match; neither reads the dense
 `q`). The drafter switches its draft model's fused TP-sharded argmax off so
