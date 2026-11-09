@@ -30,7 +30,6 @@ from tokenspeed_kernel.ops.activation.triton import (
     fused_gate_sigmoid_mul_add,
     moe_finalize_gate_add,
 )
-from tokenspeed_kernel.ops.moe import moe_warmup
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
@@ -344,9 +343,10 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
 
     def warmup(self) -> None:
         """Reserve and warm the selected persistent MoE backend before capture."""
-        capacity = self.experts.plan["persistent_max_num_tokens_per_gpu"]
-        if capacity is not None:
-            moe_warmup(self.experts.plan, self.experts, max_num_tokens=capacity)
+        plan = self.experts.plan
+        warmup = plan.get("warmup")
+        if warmup is not None and plan["persistent_max_num_tokens_per_gpu"] is not None:
+            warmup(plan, self.experts)
 
     def nvfp4_global_scale(self) -> torch.Tensor | None:
         """None: the experts quantize their own inputs, so no producer applies a scale."""

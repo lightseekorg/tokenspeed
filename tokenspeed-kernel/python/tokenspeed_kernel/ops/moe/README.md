@@ -672,15 +672,12 @@ the speculative verification width. It does not depend on the first batch.
 Unchunked prefill requires an explicit positive `--max-model-len` and
 reserves for `max_prefill_tokens + max_model_len`. Chunked prefill bounds the
 workspace and startup work for long contexts.
-Post-quantization warmup uses the existing DeepGEMM warmup hook to reserve
-workspace and compile reachable tiles before capture; matching layers reuse
-the backend's workspace and warmup cache. A lower warmup limit reduces the
-token counts exercised by the hook while retaining the planned workspace.
-DeepGEMM JIT-compiles any uncached tile needed by a forward above that limit.
+Post-quantization warmup reserves the planned workspace and compiles tiles up
+to its per-rank token capacity before capture. Matching layers reuse the
+backend's workspace and warmup cache.
 Set `TOKENSPEED_DISABLE_MEGA_MOE_WARMUP=1` to defer this work to the first
-forward. An empty owner still enters the
-collective with zero-row inputs and output, using DeepGEMM's native empty-rank
-support.
+forward. An empty owner still enters the collective with zero-row inputs and
+output, using DeepGEMM's native empty-rank support.
 
 Qwen4 NextN can also load MXFP4 routed experts when the checkpoint leaves its
 attention and shared expert in BF16. For a draft with packed MXFP4 weights, use

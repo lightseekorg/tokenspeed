@@ -68,7 +68,7 @@ _MXFP4_BLOCK_SIZE = 32
 _DISABLE_WARMUP_ENV = "TOKENSPEED_DISABLE_MEGA_MOE_WARMUP"
 _symm_buffer_cache: dict[tuple[int, int, int, int, int, int, int, int], object] = {}
 _warmed_configs: set[
-    tuple[int, torch.device, int, int, int, int, int, int, int, float | None, bool]
+    tuple[int, torch.device, int, int, int, int, int, int, float | None, bool]
 ] = set()
 
 
@@ -441,13 +441,6 @@ def _warmup_mega_moe_jit(
 
 
 def warmup_deep_gemm_mxfp4_mega_moe(plan: dict, w: torch.nn.Module) -> None:
-    capacity = plan["persistent_max_num_tokens_per_gpu"]
-    max_num_tokens = plan["warmup_max_num_tokens"]
-    if not 0 < max_num_tokens <= capacity:
-        raise ValueError(
-            f"DeepGEMM MegaMoE warmup max_num_tokens must be in [1, {capacity}], "
-            f"got {max_num_tokens}"
-        )
     if get_pdl() != pdl_enabled():
         set_pdl(pdl_enabled())
     if os.environ.get(_DISABLE_WARMUP_ENV) == "1":
@@ -460,6 +453,7 @@ def warmup_deep_gemm_mxfp4_mega_moe(plan: dict, w: torch.nn.Module) -> None:
     top_k = w.top_k
     hidden_size = w.hidden_size
     intermediate_size = w.intermediate_size
+    max_num_tokens = plan["persistent_max_num_tokens_per_gpu"]
     activation_clamp = None if w.swiglu_arg is None else w.swiglu_arg.limit
     fast_math = plan["fast_math"]
     group = _resolve_process_group(process_group)
@@ -467,7 +461,6 @@ def warmup_deep_gemm_mxfp4_mega_moe(plan: dict, w: torch.nn.Module) -> None:
         id(group),
         state.device,
         num_experts,
-        capacity,
         max_num_tokens,
         top_k,
         hidden_size,
@@ -487,7 +480,7 @@ def warmup_deep_gemm_mxfp4_mega_moe(plan: dict, w: torch.nn.Module) -> None:
         top_k=top_k,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
-        max_num_tokens=capacity,
+        max_num_tokens=max_num_tokens,
     )
     _warmup_mega_moe_jit(
         state=state,
