@@ -278,6 +278,33 @@ default), the plans are the ones built without the option. The fused role
 does not offer it: there, retraction picks the largest incomplete prefill
 first, and a carried prompt could make the yielding request that victim.
 
+
+**New prompts retain submission order by default.**
+`--enable-short-prefill-first` opts in to ordering by prompt tokens minus
+currently reusable Device or Host prefixes, plus any tokens replayed to
+regenerate replayable groups; equal work preserves submission order. Resident chunks retain priority. The policy applies to P and fused
+local prefill; D's remote admission and decode ordering are unchanged.
+
+Only the oldest waiting prompt counts successful later first admissions.
+After eight, it receives selection priority; once it starts or leaves, the
+next oldest gets its own allowance. Priority is reevaluated after each
+admission, including within one batch. Failed admissions and resident chunks
+do not count. When chunk yielding is also enabled, carried first admissions
+count toward the same allowance; the bounded carry scan retains FIFO order.
+On the fused role, a first admission granted after capacity retraction also
+counts; a resident chunk granted capacity does not.
+Priority cannot bypass resource or transfer dependencies, and
+an inadmissible protected prompt does not block other admissible requests.
+
+Both policies share the same admission and execution path. Ranking does not
+reserve pages or replace the admission-time cache check. With the option
+disabled, there are no extra prefix probes for ranking or bypass counts.
+When the new-prompt phase runs with the option enabled, ranking probes every
+eligible submitted candidate, without a fixed scan window. This finds short
+work beyond the front of a deep queue, but adds prefix-index lookup cost on
+each such round. Request hashes and keys are reused; cache matches are not
+cached across rounds because publication, eviction and transfers can change them.
+
 ### 1.2 State groups: two slots, natural checkpoints
 
 A State group (a recurrent layer's state, `AttnKind::kState`) keeps no
