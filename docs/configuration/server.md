@@ -568,7 +568,7 @@ parser option keeps its existing behavior.
 | --- | --- |
 | `--speculative-config` | JSON speculative decoding configuration. |
 | `--speculative-algorithm` | Speculative algorithm, such as `EAGLE3`, `EAGLE4`, `MTP`, `DFLASH`, `DSPARK`, or `DUMMY`. `DUMMY` generates deterministic candidates without a draft checkpoint; it tests target multi-token verification, not draft-model quality. Set `--speculative-num-draft-tokens` above 1 and do not pass a draft model path. |
-| `--speculative-verify-policy` | `fixed` or experimental `confidence`; confidence selects DSpark verify prefixes using its trained head. Omitted legacy settings resolve to `fixed`. See the Qwen3.8 Flash Next recipe for validation limits. |
+| `--speculative-verify-policy` | `fixed`, experimental `confidence`, or experimental `history`; adaptive policies select DSpark verify prefixes using checkpoint confidence, optionally combined with completed acceptance history. Omitted legacy settings resolve to `fixed`. See the Qwen3.8 Flash Next recipe for validation limits. |
 | `--speculative-draft-model-path` | Draft model path or repo ID. |
 | `--speculative-draft-model-quantization` | Draft model quantization. Defaults to `unquant`. |
 | `--speculative-num-steps` | Number of draft model steps. Defaults to `3`. |

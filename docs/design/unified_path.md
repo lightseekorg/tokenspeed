@@ -2350,6 +2350,26 @@ heads and shares the target embedding and LM head.
 
 The experimental `--speculative-verify-policy confidence` selects a per-round
 query budget.
+The `history` policy uses the same graph stages and cost planner, with completed
+acceptance history estimating the budget's output. It keeps an EMA of each
+request's prefix-survival probabilities with observation weight 0.25. A
+rejection identifies every longer prefix as unsuccessful; a fully accepted
+budget leaves its longer prefixes unknown. For that unknown tail, the latest
+available N-2 model probabilities extrapolate from the empirical prefix, so
+the cost planner can expand when the expected output gain pays for the time.
+The observed-only curve is also scored to report how often tail prediction
+actually increases Q. A full-window success has no unknown tail.
+
+History is keyed by candidate generation: a sample publishing generation G
+reports acceptance of G-1. Selection uses the newest completed acceptance no
+newer than N-2, without waiting for a later CUDA event. Four immutable EMA
+snapshots bound the host cache, and diagnostics report the actual generation
+lag and history coverage. Missing history falls back to the existing model
+scores or empirical prior. Recompute and request-slot reuse discard history
+with the other expendable host feedback. Device prefix allocation still uses
+the latest confidence for both policies; no additional device state or graph
+ladder is introduced.
+
 The C++ `ConfidenceBudgetPlanner` scores `(request capacity, query capacity)`
 budgets by expected committed tokens per round. These are cost-model keys,
 not graph keys: target execution and verification are captured by query capacity

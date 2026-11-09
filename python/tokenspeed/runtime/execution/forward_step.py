@@ -336,11 +336,12 @@ class ForwardStepRunner:
         self.confidence_batch: int | None = None
         self.confidence_round_prepared = False
         self._confidence_host_group = None
-        if drafter is not None and drafter.verify_policy == "confidence":
+        if drafter is not None and drafter.verify_policy in ("confidence", "history"):
             self.confidence_feedback = ConfidenceFeedback(
                 self.max_tokens_per_req,
                 max(2, config.overlap_schedule_depth + 2),
                 self.max_decode_bs,
+                budget_policy=drafter.verify_policy,
             )
             if self.world_size > 1:
                 from tokenspeed.runtime.distributed.process_group_manager import (

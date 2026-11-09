@@ -1551,9 +1551,11 @@ class ServerArgs:
         # consumers always receive an explicit policy.
         if self.speculative_verify_policy is None:
             self.speculative_verify_policy = "fixed"
-        if self.speculative_verify_policy not in ("fixed", "confidence"):
-            raise ValueError("speculative verify policy must be fixed or confidence")
-        if self.speculative_verify_policy == "confidence":
+        if self.speculative_verify_policy not in ("fixed", "confidence", "history"):
+            raise ValueError(
+                "speculative verify policy must be fixed, confidence or history"
+            )
+        if self.speculative_verify_policy in ("confidence", "history"):
             if self.speculative_algorithm != "DSPARK":
                 raise ValueError("confidence verification requires DSPARK")
             if self.enable_speculative_sampling or self.speculative_eagle_topk != 1:
@@ -3579,9 +3581,9 @@ class ServerArgs:
         )
         parser.add_argument(
             "--speculative-verify-policy",
-            choices=["fixed", "confidence"],
+            choices=["fixed", "confidence", "history"],
             default=None,
-            help="DSpark verification budget policy; old commands resolve to fixed.",
+            help="DSpark verify budget: fixed, confidence probabilities, or acceptance history with confidence-guided growth. Old commands resolve to fixed.",
         )
         parser.add_argument(
             "--speculative-num-steps",

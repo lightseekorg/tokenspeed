@@ -1163,12 +1163,20 @@ ts serve nvidia/Qwen3.8-Flash-Next-NVFP4 \
     --moe-backend flashinfer_trtllm
 ```
 
-Use `fixed` to compare full-width DSpark on the same checkpoint. Confidence
-is experimental and keeps selected rows compact through attention, GDN, PLE
-and MLP. State rollback capacity and the external sampling layout retain the
-maximum window. Confidence captures target execution, LM head, verification
-and stop processing by total query capacity; draft context writes, native drafting
-and state commit are captured separately by request capacity. With the greedy
+Use `fixed` to compare full-width DSpark on the same checkpoint. Use
+`--speculative-verify-policy history` to estimate the total query budget from
+completed acceptance history and extrapolate unverified tails with checkpoint
+confidence. Both adaptive policies use the latest device confidence to assign
+request prefixes. History is asynchronous and may be older than generation
+N-2; its diagnostics report the observed lag. Neither policy guarantees a
+throughput improvement for every workload.
+
+Confidence verification is experimental and keeps selected rows compact
+through attention, GDN, PLE and MLP. State rollback capacity and the external
+sampling layout retain the maximum window. Confidence captures target execution,
+LM head, verification and stop processing by total query capacity; draft context
+writes, native drafting and state commit are captured separately by request
+capacity. With the greedy
 sampler the head and verifier consume compact query rows directly; other samplers
 retain maximum-window scores. Target graphs are shared across request counts.
 Metadata refresh and host scheduling remain outside the graphs.

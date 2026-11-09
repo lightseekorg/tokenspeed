@@ -27,11 +27,13 @@ They are refreshed on the execution stream; no tensor value reaches Python.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 
 import torch
 from tokenspeed_kernel.ops.metadata import gather_query_rows
 
+from tokenspeed.runtime.execution.confidence_history import AcceptanceHistory
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.utils import get_colorful_logger
 
@@ -188,6 +190,7 @@ class _ConfidenceRequest:
     epoch: int
     generation: int
     device_generation_offset: int | None
+    history: AcceptanceHistory | None
     rates: dict[int, list[float]] = field(default_factory=dict)
 
 
@@ -212,10 +215,15 @@ class ConfidenceFeedback:
     reuse bounds this expendable host cache without changing device state.
     """
 
-    def __init__(self, width: int, max_pending: int, max_batch_size: int):
+    def __init__(
+        self, width: int, max_pending: int, max_batch_size: int, *, budget_policy: str
+    ):
         from tokenspeed_scheduler import ConfidenceBudgetPlanner
 
+        if budget_policy not in ("confidence", "history"):
+            raise ValueError("confidence budget policy must be confidence or history")
         self.planner = ConfidenceBudgetPlanner(width)
+        self.budget_policy = budget_policy
         self.width = width
         self.max_pending = max_pending
         self._free_buffers = [
@@ -249,6 +257,12 @@ class ConfidenceFeedback:
         self.accepted_tokens = 0
         self.confidence_error = 0.0
         self.confidence_observations = 0
+        self.history_requests = 0
+        self.history_censored_requests = 0
+        self.history_generation_lag = 0
+        self.history_growth_rounds = 0
+        self.history_growth_queries = 0
+        self.decision_nanoseconds = 0
 
     def prepare(
         self,
@@ -276,6 +290,11 @@ class ConfidenceFeedback:
                     self._next_epoch,
                     0,
                     0 if row < output_layout.num_extends else None,
+                    (
+                        AcceptanceHistory(self.width, observation_weight=0.25)
+                        if self.budget_policy == "history"
+                        else None
+                    ),
                 )
                 self._requests[key] = state
             elif state.slot != slot:
@@ -331,6 +350,12 @@ class ConfidenceFeedback:
                 queries, accepted = int(row[-2]), int(row[-1])
                 if queries <= 0 or expected < 2:
                     continue
+                if state.history is not None:
+                    # The newly published scores are generation `expected`;
+                    # acceptance describes its predecessor's candidates.
+                    state.history.observe(
+                        expected - 1, queries=queries, accepted=accepted
+                    )
                 # These scores accompanied the candidates just verified;
                 # newly published scores above are for a later budget.
                 rates = row[self.width - 1 : 2 * (self.width - 1)]
@@ -353,11 +378,14 @@ class ConfidenceFeedback:
             self._free_buffers.append((sample.values, sample.generations))
 
     def select(self, batch: int, request_ids: list[str]) -> int:
+        started = time.perf_counter_ns()
         prior = [
             successes / trials
             for successes, trials in zip(self._successes, self._trials, strict=True)
         ]
         rates = []
+        observed_rates = []
+        censored = False
         for key in request_ids:
             state = self._requests.get(key)
             scores = (
@@ -366,17 +394,42 @@ class ConfidenceFeedback:
             if scores is None:
                 self.fallback_requests += 1
                 scores = prior
+            observed = scores
+            if (
+                self.budget_policy == "history"
+                and state is not None
+                and state.history is not None
+            ):
+                forecast = state.history.forecast(
+                    scores, maximum_generation=state.generation - 2
+                )
+                if forecast is not None:
+                    scores, observed = forecast.rates, forecast.observed_rates
+                    self.history_requests += 1
+                    self.history_generation_lag += (
+                        state.generation - forecast.generation
+                    )
+                    self.history_censored_requests += int(forecast.censored)
+                    censored |= forecast.censored
             rates.append(scores)
+            observed_rates.append(observed)
         self.selections += 1
         self.selected_requests += len(request_ids)
         queries = self.planner.select(batch, rates)
+        if censored:
+            observed_queries = self.planner.select(batch, observed_rates)
+            if queries > observed_queries:
+                self.history_growth_rounds += 1
+                self.history_growth_queries += queries - observed_queries
+        self.decision_nanoseconds += time.perf_counter_ns() - started
         if self.selections % 256 == 0:
             logger.info(f"Confidence verification: {self.summary()}")
         return queries
 
-    def summary(self) -> dict[str, float | int]:
+    def summary(self) -> dict[str, float | int | str]:
         """Return completed, same-round budget and confidence diagnostics."""
         return {
+            "budget_policy": self.budget_policy,
             "rounds": self.completed_rounds,
             "mean_q": self.allocated_queries / max(1, self.completed_rounds),
             "queries_per_request": self.effective_queries
@@ -391,6 +444,16 @@ class ConfidenceFeedback:
             "fallback_fraction": self.fallback_requests
             / max(1, self.selected_requests),
             "rejected_generations": self.rejected_generations,
+            "history_fraction": self.history_requests / max(1, self.selected_requests),
+            "history_censored_fraction": self.history_censored_requests
+            / max(1, self.history_requests),
+            "history_generation_lag": self.history_generation_lag
+            / max(1, self.history_requests),
+            "history_growth_rounds": self.history_growth_rounds,
+            "history_growth_queries": self.history_growth_queries,
+            "decision_time_us": self.decision_nanoseconds
+            / max(1, self.selections)
+            / 1000,
         }
 
     def can_record(self) -> bool:

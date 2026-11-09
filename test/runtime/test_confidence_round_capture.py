@@ -263,7 +263,7 @@ class _Executor(ModelExecutor):
 
 
 class _Runner(ForwardStepRunner):
-    def __init__(self, executor, *, grammar):
+    def __init__(self, executor, *, grammar, budget_policy):
         self.config = executor.config
         self.max_tokens_per_req = 4
         self.capture_bs = [1, 2, 4]
@@ -287,7 +287,9 @@ class _Runner(ForwardStepRunner):
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
         self._graph_debug = True
         self.enable_cudagraph_gc = False
-        self.confidence_feedback = ConfidenceFeedback(4, 2, 8)
+        self.confidence_feedback = ConfidenceFeedback(
+            4, 2, 8, budget_policy=budget_policy
+        )
         self.update_runtime_state = executor._update_forward_runtime_state
         self.decode_stages = DecodeStages(
             executor._forward_target,
@@ -381,7 +383,7 @@ def _inputs(executor, runner, slots, *, queries, step, graph):
 @pytest.mark.parametrize("graph", [False, True])
 def test_confidence_feedback_keeps_acceptance_before_token_limit(process_group, graph):
     executor = _Executor(logprobs=False, grammar=False)
-    runner = _Runner(executor, grammar=False)
+    runner = _Runner(executor, grammar=False, budget_policy="confidence")
     if graph:
         runner.capture(entries=None, observer=_Observer())
     states = executor.runtime_states
@@ -397,12 +399,14 @@ def test_confidence_feedback_keeps_acceptance_before_token_limit(process_group, 
 @pytest.mark.parametrize(
     "logprobs,grammar", [(False, False), (True, False), (True, True)]
 )
+@pytest.mark.parametrize("budget_policy", ["confidence", "history"])
 def test_captured_round_preserves_outputs_and_state_when_b_and_q_change(
-    process_group, logprobs, grammar
+    process_group, logprobs, grammar, budget_policy
 ):
     eager, captured = (_Executor(logprobs=logprobs, grammar=grammar) for _ in range(2))
     reference, runner = (
-        _Runner(executor, grammar=grammar) for executor in (eager, captured)
+        _Runner(executor, grammar=grammar, budget_policy=budget_policy)
+        for executor in (eager, captured)
     )
     runner.capture(entries=None, observer=_Observer())
     cases = [
@@ -485,7 +489,7 @@ def test_explicit_decode_override_and_above_ladder_keep_the_same_stage_behavior(
     process_group,
 ):
     executor = _Executor(logprobs=False, grammar=False)
-    runner = _Runner(executor, grammar=False)
+    runner = _Runner(executor, grammar=False, budget_policy="confidence")
     runner.capture(entries=None, observer=_Observer())
     ctx, info = _inputs(executor, runner, [1, 2], queries=8, step=2, graph=True)
     ctx.decode_input_ids = [3, 3]
@@ -539,7 +543,7 @@ def test_captured_grammar_host_node_uses_the_live_request_batch(process_group):
     ).compile_grammar('root ::= "b"{128}')
     grammars = {slot: host_grammar(compiled) for slot in (1, 2, 3)}
     executor = _Executor(logprobs=False, grammar=True)
-    runner = _Runner(executor, grammar=False)
+    runner = _Runner(executor, grammar=False, budget_policy="confidence")
     runtime = CapturableGrammarExecutor(8, 16, 4)
     executor.grammar_runtime = runtime
     runner.capturable_grammar = runtime

@@ -710,13 +710,14 @@ class ModelExecutor:
             if (
                 draft_model_runner is not None
                 and draft_model_runner.server_args.speculative_verify_policy
-                == "confidence"
-                and self.drafter.verify_policy != "confidence"
+                in ("confidence", "history")
+                and self.drafter.verify_policy
+                != draft_model_runner.server_args.speculative_verify_policy
             ):
                 raise ValueError(
                     "This DSpark drafter does not implement confidence verification"
                 )
-            if self.drafter.verify_policy == "confidence":
+            if self.drafter.verify_policy in ("confidence", "history"):
                 from tokenspeed.runtime.models.qwen4_exp import (
                     Qwen4ExpForCausalLM,
                     Qwen4ExpForConditionalGeneration,
