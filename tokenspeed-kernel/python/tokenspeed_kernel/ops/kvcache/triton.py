@@ -3253,7 +3253,7 @@ def index_k_layernorm_scatter(
 
 
 @triton.jit
-def _index_k_layernorm_fp8_scatter_kernel(
+def _index_k_layernorm_fp8_scatter_row(
     fp8_buf_ptr,  # uint8 flat view of the paged plane
     scale_buf_ptr,  # float32 flat view of the same storage
     x_ptr,  # [tokens, HD] pre-norm keys, unit inner stride
@@ -3261,6 +3261,7 @@ def _index_k_layernorm_fp8_scatter_kernel(
     bias_ptr,  # [HD] LayerNorm bias
     loc_ptr,  # int [tokens] slot index
     write_mask_ptr,
+    t,  # int64 row
     x_row_stride,
     page_bytes,  # bytes per page (page stride)
     scale_base_off,  # float32 offset of a page's scales ((ps*hd)//4)
@@ -3273,7 +3274,6 @@ def _index_k_layernorm_fp8_scatter_kernel(
     BLOCK_NG: tl.constexpr,
     FP8_MAX: tl.constexpr,
 ):
-    t = tl.program_id(0).to(tl.int64)
     g = tl.arange(0, BLOCK_NG)[:, None]
     c = tl.arange(0, GROUP)[None, :]
     d = g * GROUP + c
@@ -3306,6 +3306,129 @@ def _index_k_layernorm_fp8_scatter_kernel(
         scale[:, None],
         mask=store_mask,
     )
+
+
+@triton.jit
+def _index_k_layernorm_fp8_scatter_kernel(
+    fp8_buf_ptr,
+    scale_buf_ptr,
+    x_ptr,
+    weight_ptr,
+    bias_ptr,
+    loc_ptr,
+    write_mask_ptr,
+    x_row_stride,
+    page_bytes,
+    scale_base_off,
+    eps,
+    HAS_WRITE_MASK: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    HD: tl.constexpr,
+    GROUP: tl.constexpr,
+    NG: tl.constexpr,
+    BLOCK_NG: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+):
+    _index_k_layernorm_fp8_scatter_row(
+        fp8_buf_ptr,
+        scale_buf_ptr,
+        x_ptr,
+        weight_ptr,
+        bias_ptr,
+        loc_ptr,
+        write_mask_ptr,
+        tl.program_id(0).to(tl.int64),
+        x_row_stride,
+        page_bytes,
+        scale_base_off,
+        eps,
+        HAS_WRITE_MASK,
+        PAGE_SIZE,
+        HD,
+        GROUP,
+        NG,
+        BLOCK_NG,
+        FP8_MAX,
+    )
+
+
+def _index_k_layernorm_fp8_scatter_args(
+    buf: torch.Tensor,
+    index_k: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    loc: torch.Tensor,
+    *,
+    eps: float,
+    page_size: int,
+    group_size: int,
+    write_mask: torch.Tensor | None,
+) -> tuple[tuple, dict[str, object]]:
+    """Validate an :func:`index_k_layernorm_fp8_scatter` write (same arguments).
+
+    Returns ``(args, constexprs)``: the runtime arguments and the constexprs
+    ``_index_k_layernorm_fp8_scatter_kernel`` takes for it.
+    """
+    tokens = index_k.shape[0]
+    head_dim = index_k.shape[1] if index_k.ndim == 2 else -1
+    if index_k.ndim != 2 or index_k.stride(-1) != 1:
+        raise ValueError(
+            f"index_k must be [tokens, head_dim] with unit inner stride, got "
+            f"shape {tuple(index_k.shape)} strides {tuple(index_k.stride())}"
+        )
+    if group_size <= 0 or head_dim % group_size or group_size & (group_size - 1):
+        raise ValueError(
+            f"group_size {group_size} must be a power of two dividing {head_dim}"
+        )
+    if weight.shape != (head_dim,) or bias.shape != (head_dim,):
+        raise ValueError(f"LayerNorm weight and bias must be [{head_dim}]")
+    if loc.numel() != tokens:
+        raise ValueError(f"loc must hold {tokens} slots, got {loc.numel()}")
+    if write_mask is not None and (
+        write_mask.shape != (tokens,)
+        or write_mask.dtype != torch.bool
+        or write_mask.device != loc.device
+    ):
+        raise ValueError("Index-K write mask must be bool [tokens] on the slot device")
+    ng = head_dim // group_size
+    row_bytes = head_dim + ng * 4
+    page_bytes = page_size * row_bytes
+    if buf.ndim == 3:
+        buf = buf.view(buf.shape[0], -1)
+    if buf.dtype != torch.uint8 or buf.ndim != 2 or buf.stride(-1) != 1:
+        raise ValueError("Index-K cache must be a uint8 slot or page matrix")
+    if buf.shape[1] == row_bytes and buf.is_contiguous():
+        if buf.shape[0] % page_size:
+            raise ValueError("Index-K slot count must contain whole pages")
+    elif buf.shape[1] == page_bytes and buf.stride(0) >= page_bytes:
+        page_bytes = buf.stride(0)
+    else:
+        raise ValueError("Index-K cache requires dense rows within each page")
+    if buf.storage_offset() % 4 or page_bytes % 4:
+        raise ValueError("Index-K pages must be float32 aligned")
+    args = (
+        buf,
+        buf.view(torch.float32),
+        index_k,
+        weight.contiguous(),
+        bias.contiguous(),
+        loc.reshape(-1),
+        write_mask,
+        index_k.stride(0),
+        page_bytes,
+        (page_size * head_dim) // 4,
+        float(eps),
+    )
+    constexprs = {
+        "HAS_WRITE_MASK": write_mask is not None,
+        "PAGE_SIZE": page_size,
+        "HD": head_dim,
+        "GROUP": group_size,
+        "NG": ng,
+        "BLOCK_NG": _next_power_of_two(ng),
+        "FP8_MAX": float(torch.finfo(torch.float8_e4m3fn).max),
+    }
+    return args, constexprs
 
 
 def index_k_layernorm_fp8_scatter(
@@ -3345,65 +3468,21 @@ def index_k_layernorm_fp8_scatter(
     Returns:
         None; ``buf`` is written in place.
     """
-    tokens = index_k.shape[0]
-    head_dim = index_k.shape[1] if index_k.ndim == 2 else -1
-    if index_k.ndim != 2 or index_k.stride(-1) != 1:
-        raise ValueError(
-            f"index_k must be [tokens, head_dim] with unit inner stride, got "
-            f"shape {tuple(index_k.shape)} strides {tuple(index_k.stride())}"
-        )
-    if group_size <= 0 or head_dim % group_size or group_size & (group_size - 1):
-        raise ValueError(
-            f"group_size {group_size} must be a power of two dividing {head_dim}"
-        )
-    if weight.shape != (head_dim,) or bias.shape != (head_dim,):
-        raise ValueError(f"LayerNorm weight and bias must be [{head_dim}]")
-    if loc.numel() != tokens:
-        raise ValueError(f"loc must hold {tokens} slots, got {loc.numel()}")
-    if write_mask is not None and (
-        write_mask.shape != (tokens,)
-        or write_mask.dtype != torch.bool
-        or write_mask.device != loc.device
-    ):
-        raise ValueError("Index-K write mask must be bool [tokens] on the slot device")
-    ng = head_dim // group_size
-    row_bytes = head_dim + ng * 4
-    page_bytes = page_size * row_bytes
-    if buf.ndim == 3:
-        buf = buf.view(buf.shape[0], -1)
-    if buf.dtype != torch.uint8 or buf.ndim != 2 or buf.stride(-1) != 1:
-        raise ValueError("Index-K cache must be a uint8 slot or page matrix")
-    if buf.shape[1] == row_bytes and buf.is_contiguous():
-        if buf.shape[0] % page_size:
-            raise ValueError("Index-K slot count must contain whole pages")
-    elif buf.shape[1] == page_bytes and buf.stride(0) >= page_bytes:
-        page_bytes = buf.stride(0)
-    else:
-        raise ValueError("Index-K cache requires dense rows within each page")
-    if buf.storage_offset() % 4 or page_bytes % 4:
-        raise ValueError("Index-K pages must be float32 aligned")
-    if tokens == 0:
-        return
-    _index_k_layernorm_fp8_scatter_kernel[(tokens,)](
+    args, constexprs = _index_k_layernorm_fp8_scatter_args(
         buf,
-        buf.view(torch.float32),
         index_k,
-        weight.contiguous(),
-        bias.contiguous(),
-        loc.reshape(-1),
-        write_mask,
-        index_k.stride(0),
-        page_bytes,
-        (page_size * head_dim) // 4,
-        float(eps),
-        HAS_WRITE_MASK=write_mask is not None,
-        PAGE_SIZE=page_size,
-        HD=head_dim,
-        GROUP=group_size,
-        NG=ng,
-        BLOCK_NG=_next_power_of_two(ng),
-        FP8_MAX=float(torch.finfo(torch.float8_e4m3fn).max),
-        num_warps=1,
+        weight,
+        bias,
+        loc,
+        eps=eps,
+        page_size=page_size,
+        group_size=group_size,
+        write_mask=write_mask,
+    )
+    if index_k.shape[0] == 0:
+        return
+    _index_k_layernorm_fp8_scatter_kernel[(index_k.shape[0],)](
+        *args, **constexprs, num_warps=1
     )
 
 

@@ -48,6 +48,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
+from tokenspeed_kernel.ops.attention.dsa import cute_dsl as dsa_cute_dsl
 from tokenspeed_kernel.ops.attention.mla import mla_project_value
 from tokenspeed_kernel.ops.gemm import kimi3_mla_gate_projection, mm
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
@@ -210,6 +211,51 @@ def _scorers_take_fp8_index_queries(indexer: KimiK31Indexer) -> bool:
     return True
 
 
+def _fused_decode_topk_solution(indexer: KimiK31Indexer) -> str | None:
+    """``"cute_dsl"`` where the fused decode top-k serves this indexer, else None.
+
+    It serves BF16 queries, and the E4M3 ones the index-K write quantizes, over
+    a packed ``fp8_scaled`` plane, 1-8 rows per request, and is pinned only
+    where ``max_num_seqs`` fits the requests one of its rounds schedules. It scores
+    bit-identically to the DeepGEMM leaf and gives exact ties at the threshold
+    the lowest positions.
+    """
+    signatures = (
+        format_signature(
+            q=dense_tensor_format(torch.bfloat16),
+            weights=dense_tensor_format(torch.bfloat16),
+        ),
+        format_signature(
+            q=dense_tensor_format(torch.float8_e4m3fn),
+            weights=dense_tensor_format(torch.float32),
+        ),
+    )
+    traits = {
+        "q_len": frozenset(range(1, 9)),
+        "index_heads": indexer.index_n_heads,
+        "head_dim": indexer.index_head_dim,
+        "page_size": 64,
+        "topk": indexer.index_topk,
+        "index_k_format": "fp8_scaled",
+        "index_k_layout": "packed",
+    }
+    try:
+        for signature in signatures:
+            select_kernel(
+                "attention",
+                "dsa_decode_topk",
+                signature,
+                traits=traits,
+                solution="cute_dsl",
+            )
+    except NoKernelFoundError:
+        return None
+    max_requests = int(global_server_args_dict["max_num_seqs"] or 0)
+    if max_requests > dsa_cute_dsl.FUSED_DECODE_TOPK_MAX_REQUESTS:
+        return None
+    return "cute_dsl"
+
+
 class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttention):
     """K3's gated NoPE MLA attending its own indexer's top-k (DSA).
 
@@ -279,6 +325,12 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
         self.indexer = KimiK31Indexer(config, prefix=add_prefix("indexer", prefix))
         # FP8 index queries where the platform registers fp8_scaled scorers.
         self.index_query_fp8 = _scorers_take_fp8_index_queries(self.indexer)
+        # The fused decode top-k takes BF16 or unit-scale E4M3 index queries.
+        self.decode_topk_solution = (
+            None if self.index_query_fp8 else _fused_decode_topk_solution(self.indexer)
+        )
+        # A decode round quantizes its index query in the index-K write's launch.
+        self.index_k_write_quantizes_query = self.decode_topk_solution is not None
         self._decode_topk_indices_buffer: torch.Tensor | None = None
         self._decode_topk_lens_buffer: torch.Tensor | None = None
         self._retired_decode_workspaces: list[torch.Tensor] = []
