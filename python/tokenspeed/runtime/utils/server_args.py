@@ -3739,6 +3739,7 @@ class ServerArgs:
                 "triton",
                 "triton_full",
                 "ascend_full",
+                "sonic",
             ],
             default=ServerArgs.sampling_backend,
             help="Sampling backend. "
@@ -3754,7 +3755,17 @@ class ServerArgs:
             "'ascend_full': graph-safe Ascend top-k/top-p/min-p sampling and chain verify. "
             "Allocates a counts[max_req_pool_size, vocab_size] int32 buffer (substantial memory). "
             "ascend_full caps finite top_k at 4096; larger values use 4096. "
-            "Other backends require finite top_k < 128. -1 disables top-k.",
+            "Other backends require finite top_k < 128. -1 disables top-k. "
+            "'sonic': one fused Triton pipeline per step (vendored sonic-sampler; two kernels "
+            "for sampling, three for chain verification) covering greedy, "
+            "temperature/top_k/top_p/min_p, penalties, logit_bias and grammar for both "
+            "single-step sampling and chain verification; top_k=-1 is realized as bounded "
+            "top-128 truncation. bf16 logits are ranked at bf16 resolution; fp32 logits "
+            "(soft-capped heads) are sampled exactly in fp32 among the top-128 candidates. "
+            "Its kernel config per batch size comes from a table measured on "
+            "Blackwell, so nothing is tuned at startup. Allocates slot-indexed "
+            "[max_req_pool_size, vocab_size] token counts and logit bias: about 10 bytes "
+            "per element on device (substantial memory).",
         )
         parser.add_argument(
             "--sampling-stream",
