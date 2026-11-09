@@ -77,6 +77,12 @@ public:
     }
     void NoteRetracted() { ++retraction_count_; }
 
+    // Decode rounds in which the prefill/decode interval held this prompt
+    // back (Submitted or Prefilling). Never reset, so the interval's bound
+    // on it spans every chunk.
+    std::int32_t PrefillDeferredRounds() const { return prefill_deferred_rounds_; }
+    void NotePrefillDeferred() { ++prefill_deferred_rounds_; }
+
     // True when the last admission's headroom already covers every token
     // this request could still generate. Retracting such a request is pure
     // thrash -- its readmission must take back exactly what the retraction
@@ -225,6 +231,12 @@ public:
     std::vector<std::span<const std::int32_t>> FullPrefixPages(bool except_last) const {
         return token_container_.FullPrefixPages(prefix_granularity_, except_last);
     }
+    // Full prefix pages [first_page, past_end_page), all of them complete. A
+    // step hashes only the pages it completed through this, never a view of
+    // the whole context.
+    std::vector<std::span<const std::int32_t>> PrefixPages(std::int32_t first_page, std::int32_t past_end_page) const {
+        return token_container_.PrefixPages(prefix_granularity_, first_page, past_end_page);
+    }
     // Immutable input-page identities, owned by this request. Admission may
     // retry against changing cache contents without hashing the input again.
     std::span<const std::string> PromptPrefixHashes();
@@ -272,6 +284,12 @@ public:
 
     std::vector<BlockTable>& BlockTablesRef() { return forwardResources("BlockTablesRef").block_tables; }
 
+    // The copy-in blocks the request holds for its prompt end
+    // (fsm::ForwardResources::copy_in_blocks).
+    std::vector<std::vector<CacheBlockRef>>& CopyInBlocksRef() {
+        return forwardResources("CopyInBlocksRef").copy_in_blocks;
+    }
+
     fsm::CacheProgress CacheProgress() const { return forwardResources("CacheProgress").cache_progress; }
     // Written by the scheduler when an admission succeeds, like the block
     // tables the same admission fills: resources and progress land at
@@ -315,6 +333,7 @@ public:
                               [](const fsm::PrefillAwaitingResult&) -> std::string { return "PrefillAwaitingResult"; },
                               [](const fsm::PrefillDone&) -> std::string { return "PrefillDone"; },
                               [](const fsm::Decoding&) -> std::string { return "Decoding"; },
+                              [](const fsm::PdTransferring&) -> std::string { return "PdTransferring"; },
                               [](const fsm::Retracted&) -> std::string { return "Retracted"; },
                               [](const fsm::Restoring&) -> std::string { return "Restoring"; },
                               [](const fsm::Finishing&) -> std::string { return "Finishing"; },
@@ -335,6 +354,7 @@ private:
     std::int32_t max_new_tokens_{0};
     std::int32_t max_cached_prefix_tokens_{std::numeric_limits<std::int32_t>::max()};
     std::int32_t retraction_count_{0};
+    std::int32_t prefill_deferred_rounds_{0};
     // GeneratedTokens() when the current admission was granted.
     std::int32_t generated_tokens_at_admission_{0};
     std::vector<std::int32_t> spec_candidate_ids_;

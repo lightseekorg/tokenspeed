@@ -72,6 +72,7 @@ def _bare_mla_backend(
     backend.is_draft = is_draft
     backend.spec_num_tokens = spec_num_tokens
     backend.draft_block_decode = draft_block_decode
+    backend.draft_block_causal = False
     backend.kv_lora_rank = _KV_LORA
     backend.qk_rope_head_dim = _ROPE
     backend.kv_cache_dim = _KV_LORA + _ROPE

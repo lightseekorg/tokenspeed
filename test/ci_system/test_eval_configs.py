@@ -47,7 +47,7 @@ DATASETS = {
         "dataset_args": {"dataset_id": "math-ai/aime25"},
     },
     "aime26": {
-        "count": 16,
+        "count": 13,
         "dataset_args": {"dataset_id": "math-ai/aime26"},
     },
     "gpqa_diamond": {
@@ -245,7 +245,9 @@ def test_muse_spark_aime26_uses_validated_mxfp4_configuration(tp_size, ep_size):
     assert "--disable-prefill-graph" in server_tokens
     assert "--disable-overlap-schedule" not in server_tokens
     assert flag_value(eval_tokens, "--eval-batch-size") == "8"
-    assert generation_config["max_tokens"] == 32768
+    assert generation_config["max_tokens"] == (
+        63488 if (tp_size, ep_size) == (8, 1) else 32768
+    )
     assert generation_config["extra_body"]["reasoning_effort"] == "high"
     assert task["score_threshold"] == 0.91
 
@@ -347,90 +349,6 @@ def test_deepseek_v41_flash_runs_tp4_gsm8k_on_b200_and_mi35x():
             assert "--moe-backend" not in server_tokens
             # Not yet exercised on AMD; keep that gate on eager prefill.
             assert "--disable-prefill-graph" in server_tokens
-
-
-def test_kimi_k3_amd_gates_use_eagle3():
-    filenames = (
-        "kimi-k3-eagle3-mxfp4-tp8ep1-evalscope-aime26-amd.yaml",
-        "kimi-k3-eagle3-mxfp4-tp8ep1-evalscope-random-50k-500-mi35x.yaml",
-    )
-    ep_sizes = ("1", "1")
-    tasks = []
-    for config_dir, filename, ep_size in zip(
-        (EVAL_CONFIG_DIR, PERF_CONFIG_DIR), filenames, ep_sizes, strict=True
-    ):
-        task = yaml.safe_load((config_dir / filename).read_text(encoding="utf-8"))
-        server_tokens = shlex.split(task["server"]["command"])
-
-        assert task["triggers"] == ["per-commit", "manual"]
-        assert flag_value(server_tokens, "--speculative-algorithm") == "EAGLE3"
-        assert (
-            flag_value(server_tokens, "--speculative-draft-model-path")
-            == "lightseekorg/kimi-k3-eagle3-mla"
-        )
-        assert flag_value(server_tokens, "--speculative-num-steps") == "3"
-        assert flag_value(server_tokens, "--speculative-num-draft-tokens") == "4"
-        assert flag_value(server_tokens, "--speculative-eagle-topk") == "1"
-        assert flag_value(server_tokens, "--eagle3-layers-to-capture") == "2,46,90"
-        assert flag_value(server_tokens, "--tp") == "8"
-        assert flag_value(server_tokens, "--ep-size") == ep_size
-        tasks.append(task)
-
-    eval_tokens = shlex.split(tasks[0]["eval"]["command"])
-    generation_config = json.loads(flag_value(eval_tokens, "--generation-config"))
-    assert generation_config["seed"] == 42
-    assert generation_config["max_tokens"] == 32768
-    assert flag_value(eval_tokens, "--eval-batch-size") == "16"
-    assert "--limit" not in eval_tokens
-    assert (
-        flag_value(eval_tokens, "--work-dir")
-        == ".ci-artifacts/published/kimi-k3-eagle3-aime26"
-    )
-    assert tasks[0]["score_threshold"] == 0.90
-    perf_server_tokens = shlex.split(tasks[1]["server"]["command"])
-    # EP1 has no expert placement, so server-arg validation rejects these.
-    assert "--init-expert-location" not in perf_server_tokens
-    assert "--ep-dispatch-algorithm" not in perf_server_tokens
-    assert flag_value(perf_server_tokens, "--attention-backend") == "gluon"
-    assert flag_value(perf_server_tokens, "--drafter-attention-backend") == "gluon"
-    assert flag_value(perf_server_tokens, "--max-model-len") == "65536"
-    assert flag_value(perf_server_tokens, "--max-num-seqs") == "16"
-    assert flag_value(perf_server_tokens, "--chunked-prefill-size") == "8192"
-    assert flag_value(perf_server_tokens, "--max-prefill-tokens") == "8192"
-    assert tasks[1]["perf_reference"] == {16: [65, 16]}
-    assert tasks[1]["perf_threshold"] == 0.9
-    assert "'evalscope[perf]==1.11.1'" in tasks[1]["perf"]["install"][0]
-    perf_tokens = shlex.split(tasks[1]["perf"]["command"])
-    assert (
-        "OUTPUTS_DIR=$PWD/.ci-artifacts/published/kimi-k3-eagle3-tp8ep1-50k-500-perf"
-        in perf_tokens
-    )
-    assert "trap" not in perf_tokens
-    for flag, value in {
-        "--parallel": "16",
-        "--number": "16",
-        "--warmup-num": "0",
-        "--dataset-offset": "300160",
-        "--seed": "20260906",
-        "--min-prompt-length": "50000",
-        "--max-prompt-length": "50000",
-        "--min-tokens": "500",
-        "--max-tokens": "500",
-    }.items():
-        assert flag_value(perf_tokens, flag) == value
-    assert flag_value(perf_tokens, "--total-timeout") == "21600"
-    assert "--no-apply-chat-template" in perf_tokens
-    assert "--no-test-connection" in perf_tokens
-
-    control_filenames = (
-        "kimi-k3-mxfp4-tp8ep8-evalscope-aime26-amd.yaml",
-        "kimi-k3-mxfp4-tp8ep8-evalscope-random-4k-1k-mi35x.yaml",
-    )
-    for config_dir, filename in zip(
-        (EVAL_CONFIG_DIR, PERF_CONFIG_DIR), control_filenames, strict=True
-    ):
-        task = yaml.safe_load((config_dir / filename).read_text(encoding="utf-8"))
-        assert task["triggers"] == ["manual"]
 
 
 def test_kvv_configs_use_pinned_upstream_and_local_api():

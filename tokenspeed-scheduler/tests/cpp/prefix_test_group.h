@@ -59,10 +59,12 @@ public:
 
     // --- allocation (token API, converted through GroupGeometry) ---
     bool Acquire(BlockPool& pool, BlockTable& table, std::int32_t num_tokens, std::int32_t reserve_tokens = 0) {
-        return allocator_.Acquire(pool, table, geometry_.PlanAcquire(table, num_tokens, reserve_tokens));
+        return allocator_.Acquire(pool, table, geometry_.PlanAcquire(table, num_tokens, reserve_tokens),
+                                  /*first_placed_slot=*/table.NumBlocks(), /*placed=*/{});
     }
     bool Acquire(BlockPool& pool, BlockTable& table, const GroupDemand& demand) {
-        return allocator_.Acquire(pool, table, geometry_.PlanAcquire(table, demand));
+        return allocator_.Acquire(pool, table, geometry_.PlanAcquire(table, demand),
+                                  /*first_placed_slot=*/table.NumBlocks(), /*placed=*/{});
     }
     std::int32_t BlocksNeededFor(const BlockTable& table, std::int32_t num_tokens) const {
         return geometry_.BlocksNeededFor(table, num_tokens);
@@ -130,8 +132,9 @@ public:
     }
     void RegisterFullBlocks(BlockPool& pool, BlockTable& table, std::span<const CacheKey> keys,
                             std::uint64_t access_epoch, std::int32_t first_slot = 0) {
-        index_.RegisterFullBlocks(pool, allocator_.BlocksToPublish(table, first_slot, keys.size()), keys, access_epoch,
-                                  first_slot, CacheBoundaryKind::kChunk, /*newly_cached=*/nullptr, /*session=*/nullptr);
+        BlockTable::PublishWindow window = allocator_.BlocksToPublish(table, first_slot, keys.size());
+        index_.RegisterFullBlocks(pool, window.Blocks(), keys, access_epoch, first_slot, CacheBoundaryKind::kChunk,
+                                  /*newly_cached=*/nullptr, /*session=*/nullptr);
     }
 
     bool ContainsCachedBlock(const BlockPool& pool, const CacheKey& key) const { return index_.Contains(pool, key); }

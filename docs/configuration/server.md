@@ -98,7 +98,7 @@ switch an envelope folds is also available individually under `auto`.
 | `--mla-lora-scale {folded,runtime}` | Where LongCat-style MLA applies its `sqrt(hidden / lora_rank)` norm scales: folded into the norm weights at load, or multiplied at runtime after `q_b_proj` / `kv_a_layernorm` as the trainer does. Folded to `runtime` by `rl-bitwise`. |
 | `--layer-boundary-norm {fused,unfused}` | `unfused` materializes `hidden + residual` in bf16 before the norm that opens each physical layer and before the final norm, instead of the fused add+norm kernel; also vetoes all-reduce+norm fusion. Folded to `unfused` by `rl-bitwise`. |
 | `--router-topk {fused,torch}` | Correction-bias MoE routing: the fused CUDA kernel, or fp32 `torch.softmax` + `torch.topk(probs + bias)` with PyTorch tie order and `-1` zero-expert ids. Folded to `torch` by `rl-bitwise`. |
-| `--logprob-order {torch,megatron}` | Order of the selected-token log-softmax: `torch.log_softmax`, or Megatron's vocab-parallel cross-entropy order over fixed 32768-wide vocab blocks; output and prompt (input) logprobs share it. Changes logprobs only. Folded to `megatron` by `rl-bitwise`. |
+| `--logprob-order {torch,blockwise,blockwise-direct,blockwise-16384,blockwise-direct-16384}` | Order of the selected-token log-softmax: `torch.log_softmax`, or fixed-width blockwise reduction over 32768-wide vocab blocks; output and prompt (input) logprobs share it. `blockwise` returns negative cross-entropy; `blockwise-direct` uses direct subtraction. The `-16384` variants select 16384-wide blocks independently of serving TP. Changes logprobs only. `rl-bitwise` folds to `blockwise`, overriding explicit `torch` and preserving an explicit blockwise form and block width. |
 | `--dsa-slot-order {selection,sorted}` | The order a token's selected KV rows are reduced in by the sparse (DSA) attention: as the top-k leaf emitted them (`selection`), or in ascending position order (`sorted`: one reduction order per selected set, invariant across batch compositions, runs and engines -- not ascending slot order, which follows the page placement). The top-k leaf emits the order and the core keeps it, so both must declare the `slot_order` trait (registered batch-invariant leaves); a silent kernel is refused under `sorted`. Defaults to `selection`; `rl-bitwise` fixes it to `selection`, overriding an explicit `sorted`. Both top-k and attention leaves must still be batch-invariant under `rl-bitwise`. |
 | `--moe-combine-order {rank,slot}` | How a token's routed-expert contributions meet across the MoE TP-EP group. `rank`: the MoE kernel returns this rank's partial and the host sums the partials, adding LongCat's identity zero-expert residual once around the reduction. `slot`: the MoE kernel folds the token's top-k slots in fp32 slot order across the EP group itself, residual included, as the trainer's grouped MLP does, and the host reduces nothing; needs MoE TP 1 and a kernel declaring `combine_order` with `slot` (a registered batch-invariant leaf), and vetoes all-reduce+norm fusion. Folded to `slot` by `rl-bitwise`. |
 
@@ -288,6 +288,13 @@ offload keeps its pinned Host history mapped across a release and zeroes it on
 resume. Other device memory (input buffers, communication workspaces such as
 symmetric memory or DeepEP buffers, the prefill CUDA graphs) stays resident.
 
+With attention DP, every rank must stop admissions and drain before any rank
+releases memory. Send the release to every DP engine concurrently; a release
+itself stops admissions, so a separate pause is unnecessary. A peer explicitly
+paused with `wait` or `abort` may also satisfy the drain. An idle engine that
+has not paused prevents release. After a partial or staggered resume, no DP
+rank forwards until every region released on every rank has been restored.
+
 Queued weight operations finish before a release frees memory. If a PD engine
 is paused with buffered requests, release is refused: resume and drain those
 requests first. While any region is released, a pause is refused; resume the
@@ -349,6 +356,23 @@ runs across one generates under both weights. Pause first (see the
 trainer-side contract below) when that matters.
 
 ### Mooncake weight updates
+
+The runtime includes the independent WeightStore receiver at
+`tokenspeed.runtime.execution.weight_store`. Select it with
+`--model-update-sdk-module tokenspeed.runtime.execution.weight_store` and
+`--model-update-engine-type TOKENSPEED`, supply the standalone SDK's flat
+`backend=weight_store` configuration and use `--model-update-draft-weights retain`.
+This optional path requires the independent `weight_store` and `data_dist_hub`
+packages in the scheduler environment. It does not import a rollout framework or
+the previous weight-update SDK.
+
+The update request carries a complete publication directory in `snapshot`,
+encoded as `{version, zlib_base64}`. Tensor contents remain in the Store.
+The receiver validates the publication version, declares the target's logical HF
+regions and calls the standalone SDK on the Store device's current CUDA stream.
+The SDK reads and assembles the tensors; the native loader owns physical TP/EP
+layout and the surrounding weight-update session owns finalization. This path
+supports one unquantized target and retains draft checkpoint weights.
 
 `UpdateWeightsFromMooncakeReqInput` loads one committed checkpoint version
 that the RL trainer published to a Mooncake weight store through the Model
@@ -420,9 +444,11 @@ Trainer-side contract:
 | `--gpu-memory-utilization` | Fraction of GPU memory used for model weights and KV cache. Lower it to leave headroom. |
 | `--max-num-seqs` | Maximum number of active sequences the scheduler may process concurrently. |
 | `--chunked-prefill-size` | Token budget the scheduler may issue in one iteration; it also bounds the multimodal placeholder tokens one encoder call produces (an item larger than that runs alone). Defaults to `8192`. Set `-1` to disable chunked prefill. |
+| `--prefill-chunk-yield-tokens` | Prefill servers: the room, in tokens, a prefill chunk that cannot finish its prompt makes for bootstrapped prompts waiting behind it that fit whole (counted past their prefix hit), so they run complete in the same forward instead of waiting for the long prompt's chunk to pass. The chunk ends on an earlier page and gives up fewer than N plus one page, only while such prompts wait and only what they take, so the long prompt keeps about half of every round or more. `0` (default) is off; at most half of `--chunked-prefill-size`; a decode server ignores it ([scheduler §1.1](../design/scheduler.md#11-head-of-line-an-incomplete-prefill-holds-the-queue)). |
 | `--max-prefill-tokens` | Prefill token budget used when chunked prefill is disabled. Defaults to `8192`. |
+| `--prefill-decode-interval` | After a round that runs a prefill chunk, run this many decode rounds before the next prefill round, unless no decode can run. Every chunk starts a new interval, but no prompt is held back more than this many decode rounds in total, so TTFT grows by at most this many decode steps and running decodes stall less often. Aggregated serving only. `0` (default) is off ([scheduler §3.3](../design/scheduler.md#33-fused--one-engine-everything-local)). |
 | `--max-total-tokens` | Override the automatically calculated token pool size. |
-| `--enable-state-checkpoint-in-forward` | Hybrid (recurrent-state) models: the prefill forward that spans the last prefix-page boundary before a long prompt's replay tail (normally the final token) also writes the recurrent state there, so a later request that resends the prompt or diverges from it after that boundary resumes there. No extra prefill round; that forward holds one more state block. Requires prefix caching; startup refuses it unless every State group is GDN (FlashInfer prefill, a prefix granularity that is a multiple of its 64-token scan chunk) or Qwen4-Exp PLE. Off by default ([scheduler §1.2](../design/scheduler.md#12-state-groups-two-slots-natural-checkpoints)). |
+| `--enable-state-checkpoint-in-forward` | Hybrid (recurrent-state) models: the prefill forward that spans the last prefix-page boundary before a long prompt's replay tail (normally the final token) also writes the recurrent state there, so a later request that resends the prompt or diverges from it after that boundary resumes there. No extra prefill round; that forward holds one more state block. The recurrent-state checkpoints, and their KV tails, that a next turn re-rendering the end of the previous prompt and its reply cannot resume at are then kept out of the prefix cache. On prefill and fused servers this is the prompt end when it lies inside the page that boundary starts and the request did not resume past it; a prompt end published at the request's finish, as on a prefill server, is kept if the state at the boundary has left the cache by then. On fused servers it is also every finish past the prompt end, including that of a prompt too short to have such a boundary. A next turn that repeats the previous reply verbatim therefore resumes at an earlier checkpoint and recomputes the reply. Requires prefix caching; a decode server ignores it; startup refuses it unless every State group is GDN (FlashInfer prefill, a prefix granularity that is a multiple of its 64-token scan chunk) or Qwen4-Exp PLE. With prefill graphs, the GDN layers of a forward that writes one stay captured; every captured shape shares one float32 scan scratch of (largest prefill-graph token capacity / prefix granularity) recurrent states. When a request publishes an in-forward checkpoint past the one it resumed from, which its own predecessor wrote past an earlier one, that earlier checkpoint -- two turns back on the conversation -- is evicted early from the device and host caches, and no new store or eviction write-back copies it to host, unless another request also resumed from it, or acquired or republished it after the conversation's previous turn resumed there, so multi-turn traffic keeps more live prefixes cached. On a prefill server, a prompt too short for the in-forward checkpoint (by default, one no longer than the chunk budget) whose end lies inside a prefix page also leaves only its full pages in the prefix cache, with no recurrent state and no KV tail at its end; a longer prompt that repeats it whole resumes at an earlier checkpoint instead, a page-aligned prompt end keeps its state, and a fused server keeps short prompt ends. Off by default ([scheduler §1.2](../design/scheduler.md#12-state-groups-two-slots-natural-checkpoints)). |
 | `--enable-prefix-caching` / `--disable-prefix-caching` | Enable or disable prefix cache reuse. |
 | `--enforce-eager` | Disable device-graph execution (CUDA Graph on CUDA, ACL Graph on NPU). |
 | `--disable-prefill-graph` | Keep prefill eager while leaving decode device graphs enabled. |
@@ -431,7 +457,8 @@ Trainer-side contract:
 | `--max-cudagraph-capture-size` | Largest decode batch size to capture as a device graph. |
 | `--cudagraph-capture-sizes` | Explicit decode batch sizes to capture as device graphs. |
 | `--prefill-graph-capture-token-sizes` | Total input-token capacities per forward, summed across the batch. Shorter inputs are padded. |
-| `--prefill-graph-capture-batch-sizes` | Request capacities for inline KDA prefill capture. Replay selects the smallest compatible capacity that fits the batch. |
+| `--prefill-graph-capture-batch-sizes` | Request capacities for inline recurrent-layer (KDA, Mamba2, GDN) prefill capture. Replay selects the smallest compatible capacity that fits the batch. With `--enable-drafter-prefill-graph` these request counts also select the drafter's step-0 and decode-step graphs, which replay only at the exact count (unset: one request per bucket, or the fewest that fit a bucket longer than the context length). |
+| `--enable-drafter-prefill-graph` | Also replay the speculative drafter's work inside a prefill forward from CUDA graphs: its extend step per prefill token bucket at each exact request count of `--prefill-graph-capture-batch-sizes` (unset: the fewest requests the bucket fits in the context length, one whenever the context length is at least the bucket), its decode steps per request count, attention at eager breaks. Only pure-extend forwards at a captured request count replay; mixed forwards and other request counts draft eagerly. Needs the prefill graph on one rank (no TP, EP, PP or attention DP) and a chain EAGLE-style drafter (no `--speculative-eagle-topk` > 1, no `--enable-speculative-sampling`) whose draft model declares it (Qwen4-Exp MTP without `index_share_for_mtp_iteration`) and reads no request-token history; startup refuses other launches. The graphs' memory is part of the CUDA-graph reserve; their static input buffers (the target's hidden rows at the largest bucket) come out of the `--gpu-memory-utilization` headroom. Off by default ([design](../design/unified_path.md#drafter-prefill-graphs)). |
 | `--retraction-snapshot-host-gb` | Explicit size, in gigabytes, of the per-rank pinned Host pool that holds a retraction image's tail (a retracted request's blocks of groups Host L2 never holds, a state group's unpublished input block, and its slot state; the published blocks, the partial last page and the live state block included, go to Host L2 and stay pinned there until the request is restored; with `--disable-kvstore` the pool holds whole images). Wins over `--retraction-snapshot-ratio` when set; `0` (the default) means not set, like `--kvstore-size` against `--kvstore-ratio`. A request a capacity retraction suspends is imaged here and resumes exactly where it stopped once the image is copied back; nothing is recomputed. When no resident's image fits -- the pool or its rows are exhausted -- the scheduler aborts the newest resident instead (finish `err_type` 524, see "Retraction snapshot pool" below), so the pool bounds how much can be suspended at once, never how long an admission waits. Fused and decode roles only; the prefill and encode roles never retract and ignore it with a log. Allowed under `--kv-parallel-size > 1`. |
 | `--retraction-snapshot-ratio` | Size of the retraction snapshot pool as a multiple of this rank's Device KV capacity (the base `--kvstore-ratio` scales too), used when `--retraction-snapshot-host-gb` is not set. Unset (the default) derives the pool at device build: 0.1 of the Device KV without the Host KVStore (whole images, kept cheap to pin; `1` makes every resident suspendable), else the image tails of `--retraction-snapshot-max-requests` requests (table below). An explicit `0` is the one way to run **without a pool**: nothing can be imaged, so every capacity block aborts its victim (the newest resident). |
 | `--retraction-snapshot-max-requests` | Slot-state image rows of the retraction snapshot pool, that is, the most requests suspended at once, and the request count the derived pool size is multiplied by. `0` (the default) derives to `--max-num-seqs / attention-DP size`, which covers every resident request of the rank; refused with `--retraction-snapshot-ratio 0`, which has no rows to size. When no row is free the scheduler aborts a resident rather than waiting. |
@@ -466,7 +493,7 @@ issue budget, while `--max-total-tokens` controls the global token pool.
 | `--lm-head-tp-size` | Vocab-shard the LM head over this many contiguous ranks. Under attention DP the default 1 replicates it; a wider group gathers the ranks' rows before the logits GEMM and transposes the shards back. Without attention DP it must equal the attention TP size. Not combinable with `--dp-sampling`; under attention DP, requests asking for prompt logprobs (`logprob_start_len`) are refused. |
 | `--tp-batch-invariant` | `none` (default), `attn`, or `attn+dense`: make the head-sharded `o_proj` and the dense `down_proj` column-parallel on hidden (all-gather of the reduction dim, full-K GEMM, all-to-all back to own rows) so no cross-rank sum remains outside MoE and the bits equal a TP1 full-K GEMM. `attn` needs `--attn-head-tp-size` > 1; `attn+dense` also needs a dense TP group wider than attention TP (so not under `--query-context-parallel-size`, whose dense group is 1 or the attention TP width; only `attn` applies there); both need unquantized `o_proj` / `down_proj`, judged on the checkpoint's resolved quantization (a quantized checkpoint passes when its `disable_quant_module` excludes `self_attn` and, for `attn+dense`, `dense_mlp` / `mlps`). |
 | `--head-tp-exchange-max-rows` | Rows per rank the head-TP Lamport exchanges are prepared for (the absorbed query, the latent attention output, and, under `--tp-batch-invariant`, the `o_proj` rows). The symmetric-memory scratch is allocated before CUDA-graph capture; larger forwards fall back to the generic all-to-all. Only used with `--attn-head-tp-size` > 1. 256 (default). |
-| `--query-context-parallel-size` | Query context parallelism (QCP) on the PD prefill role: shard every extend forward's rows over the attention TP group, rank `r` computing a contiguous slice of the chunk against the gathered KV history of its requests (the KV write, index-K write, sampled rows and prompt-logprob rows are gathered across the group; the scheduler, cache allocation and PD transfer are unchanged, and `--chunked-prefill-size` keeps counting the whole chunk). Requires `--disaggregation-mode prefill` and must equal both `--attn-tp-size` and `--kv-parallel-size` (the shard is a layout over the sharded pages, so it inherits KVP's rules: Host KVStore, snapshot pool and L3 use the same owner translation); attention DP 1, no `--enable-mixed-batch`, `--dense-tp-size` and the MoE TP×EP group each 1 or the attention TP width; GPU DSA attention with a bf16 KV cache (the gathered write stores native latent rows), checked where the attention config is built. The prefill stays eager -- the GPU DSA backend declares no prefill graph under a shard -- without `--disable-prefill-graph` on the launch. The attention weights are head-replicated unless `--attn-head-tp-size` equals it, which shards them over the shard group. 1 (default) is off. |
+| `--query-context-parallel-size` | Query context parallelism (QCP) on the PD prefill role: shard every extend forward's rows over the attention TP group, each request split into `2N` near-equal segments with rank `r` computing segments `r` and `2N - 1 - r` against the gathered KV history (the KV write, index-K write, sampled rows and prompt-logprob rows are gathered across the group; the scheduler, cache allocation and PD transfer are unchanged, and `--chunked-prefill-size` keeps counting the whole chunk). Requires `--disaggregation-mode prefill` and must equal both `--attn-tp-size` and `--kv-parallel-size` (the shard is a layout over the sharded pages, so it inherits KVP's rules: Host KVStore, snapshot pool and L3 use the same owner translation); attention DP 1, no `--enable-mixed-batch`, `--dense-tp-size` and the MoE TP×EP group each 1 or the attention TP width; GPU DSA attention with a bf16 KV cache (the gathered write stores native latent rows), checked where the attention config is built. The prefill stays eager -- the GPU DSA backend declares no prefill graph under a shard -- without `--disable-prefill-graph` on the launch. The attention weights are head-replicated unless `--attn-head-tp-size` equals it, which shards them over the shard group. 1 (default) is off. |
 | `--dense-tp-size` | Tensor parallel size for dense layers. Defaults to the attention TP width: the full world without DP attention, one replica with it. |
 | `--moe-tp-size` | Tensor parallel size for MoE layers. |
 | `--data-parallel-size` | Number of data-parallel replicas. |
@@ -512,6 +539,7 @@ for the online variant.
 | --- | --- |
 | `--attention-backend` | Attention kernel backend. Common values include `mha`, `fa3`, `fa4`, `triton`, `flashinfer`, `trtllm_mla`, and `tokenspeed_mla`. Names are checked against the backend registry at startup, after plugins load, so an installed plugin's backends are accepted too. On SM103 (B300/GB300), `fa4` ranks below every other attention kernel: naming it here or in `--drafter-attention-backend` selects it, and the default selection is unchanged. |
 | `--drafter-attention-backend` | Attention backend for the speculative decoding drafter model; accepts the same names as `--attention-backend`. |
+| `--enable-qsa-prefill-bf16-scratch` | Opt-in for QSA sparse-attention models (Qwen4-Exp) with `--kv-cache-dtype fp8_e4m3` (or `fp8`) on SM100 to SM107. A target prefill call of at least 2048 query rows copies the FP8 KV pages it can read into a BF16 scratch and attends there with the CuTe QSA kernel's BF16 path instead of the FP8 prefill kernel (FlashInfer FA2 by default, or the CuTe kernel's FP8 path under a kernel override); smaller or mixed calls, calls whose context exceeds the scratch or 128 cache tokens per query row, decode, verify and drafts keep the FP8 path, and the cache stays FP8. The scratch holds one maximum-length context plus one `--chunked-prefill-size` chunk of pages, with that chunk's remapped slots and attention output; it is reserved from the KV cache budget before the pool is sized, so the pool shrinks by its size (logged at startup). Startup fails for a model without QSA layers, another KV cache dtype (`mxfp8` included), `--chunked-prefill-size` below 2048 or disabled, or a GPU without the CuTe QSA kernel. The decode role, which runs no prefill, reserves no scratch. Part of the L3 storage identity when set. Off by default. |
 | `--moe-backend` | MoE backend. |
 | `--moe-cutlass-fused-finalize` / `--no-moe-cutlass-fused-finalize` | GEMM2 atomic expert combine for unquantized FP16/BF16 MoE on `flashinfer_cutlass`, for both target and draft models. On by default and forced off by `--numerics rl-bitwise`. The fused reduction order is nondeterministic. |
 | `--moe-mxfp4-fp8-activation` | Opt-in: run MXFP4 routed experts with FP8 activations. On Hopper this is the FlashInfer cutlass W4A8 MoE (faster than the default W4A16 kernel, a few percent of extra error on expert outputs). Applies to every MXFP4 expert layer, target and draft; startup fails where the selected MoE backend has no FP8-activation kernel for a layer, when a model's routed experts are not MXFP4, when the model pins another activation precision (Kimi-K3 on Hopper Marlin), or when the layer's SwiGLU is unclamped (the W4A8 FC2 scale relies on the clamp). |
@@ -519,6 +547,7 @@ for the online variant.
 | `--all2all-backend` | MoE all-to-all backend. |
 | `--deepep-mode` | DeepEP mode: `auto`, `normal`, or `low_latency`. `auto` uses `low_latency` for decode batches and `normal` for prefill batches. `normal` reads its per-expert receive counts on the host, so it forces eager execution and disables CUDA graphs. |
 | `--sampling-backend` | Sampling backend: `greedy`, `flashinfer`, `flashinfer_full`, `triton`, or `triton_full`. |
+| `--disable-deepseek-v41-token-blacklist` | Allow DeepSeek V4.1 to generate BOS, PAD, and image control/placeholder token IDs `0, 2, 129262..129264`; these are masked by default. |
 
 Set backend choices explicitly in production. `auto` is useful for bring-up, but
 explicit values make benchmark comparisons and regressions easier to reason
@@ -545,11 +574,11 @@ with the logits output.
 
 | Parameter | Purpose |
 | --- | --- |
-| `--reasoning-parser` | Parser for extracting reasoning content from model outputs (handled by the smg gateway). |
+| `--reasoning-parser` | Parser for extracting reasoning content from model outputs (handled by the smg gateway). The engine also uses its single-token block markers to emit cumulative `reasoning_tokens` in output batches, independently of `--grammar-backend`; parsers without known markers report zero. |
 | `--tool-call-parser` | Parser for OpenAI-compatible tool-call payloads (handled by the smg gateway). |
 
 Common reasoning parser values include `kimi_k25`, `base`, `qwen3`,
-`deepseek_r1`, and `deepseek_v31`. Common tool-call parser values include
+`deepseek_r1`, `deepseek_v31`, and `deepseek_v41`. Common tool-call parser values include
 `kimik2`, `qwen`, `deepseek_v4`, `json`, and `passthrough`. The SMG gateway
 validates the parser names, so use the values accepted by the bundled
 `tokenspeed-smg` package.
@@ -574,8 +603,9 @@ parser option keeps its existing behavior.
 | `--speculative-num-draft-tokens` | Number of draft tokens. Defaults to `--speculative-num-steps + 1`; required for draft trees. |
 | `--synthetic-acceptance-length` | Benchmark-only mean emitted tokens per speculative verification, including the guaranteed target token. Unset disables it. |
 | `--speculative-eagle-topk` | Children each draft node expands to per step. Defaults to `1` (a chain); above 1 the draft is a tree. |
-| `--enable-speculative-sampling` | Draft-prob rejection sampling for the chain drafters and EAGLE-Harness trees and chains (see below). Off by default. |
-| `--spec-reject-draft-prob-threshold` | With `--enable-speculative-sampling`, recorded draft probabilities above this value mark a request with no proposal yet and always reject. Defaults to `2.0`; must lie within `[1.0, 2**20]`. |
+| `--enable-speculative-sampling` | Draft-prob rejection sampling for the chain drafters, EAGLE-Harness trees and chains, and `DFLASH` with a DFlash2 draft (see below). Off by default. |
+| `--speculative-rejection-sample-method` | Verify rule, named as vLLM's `rejection_sample_method`: `standard` (default, token-wise), `block` (block verification; see [Block verification](#block-verification-experimental)) or `synthetic` (set by `--synthetic-acceptance-length`). |
+| `--spec-reject-draft-prob-threshold` | With `--enable-speculative-sampling`, recorded draft probabilities above this value mark a request with no proposal yet and always reject. Defaults to `2.0`; must lie within `[1.0, 2**20]`. No effect on `DFLASH`. |
 | `--eagle3-layers-to-capture` | Target layers whose hidden states feed an `EAGLE3` or `EAGLE4` draft. A target whose forward returns no layer taps (for example Qwen3, Qwen3-MoE or DeepSeek V4.1) refuses these drafts and `DFLASH` at startup. |
 | `--speculative-exec-mode` | `EAGLE4` drafting (see below): `-1` (default) static chains and trees, `0` EAGLE-Harness dynamic chains and trees, `1` the same for evaluation runs, `2` measures the EAGLE-Harness cost data. |
 | `--speculative-data-path` | EAGLE-Harness run directory: the cost data exec modes 0 and 1 read, which exec mode 2 writes. |
@@ -622,6 +652,9 @@ AL `2.6`:
 
 Conflicting values between the flag and JSON configuration are rejected.
 The value must be finite and speculative decoding must be enabled.
+It selects the `synthetic` rejection method. The flashinfer backend accepts it
+only over sampled drafts (`--enable-speculative-sampling`); see
+[Block verification](#block-verification-experimental).
 For block drafters with implicit widths, the upper bound is checked against
 the checkpoint's resolved verify width when the sampler is initialized.
 
@@ -692,6 +725,9 @@ run on the draft-tree path and share its requirements, with these limits:
 - `--enable-speculative-sampling` samples harness trees and chains (not
   when measuring) and needs `--sampling-backend flashinfer`, which accepts
   them by tree rejection sampling. Static `EAGLE4` drafts do not take it.
+  Its sampling kernels are NVIDIA-only: elsewhere (AMD) harness rounds
+  draft greedy trees and chains, and the drafter refuses sampling at
+  startup.
 
 ### Draft-prob rejection sampling
 
@@ -728,11 +764,12 @@ prefill`): that role never verifies a chain and its candidates ship without
 `q`, so it would only allocate the distribution buffer. Pass it to the decode
 role only.
 
-Requirements: `--speculative-algorithm EAGLE3` or `MTP` (block drafters
-`DFLASH`/`DSPARK` propose a whole block greedily), `--speculative-eagle-topk 1`,
+Requirements: `--speculative-algorithm EAGLE3` or `MTP` (`DSPARK` proposes a
+whole block greedily outside [Block verification](#block-verification-experimental);
+`DFLASH` is covered below), `--speculative-eagle-topk 1`,
 and `--sampling-backend flashinfer` or `flashinfer_full` (`greedy` verifies by
 exact match, the Triton backends by target-sampled exact match; neither reads
-`q`). The drafter switches its draft model's fused TP-sharded argmax off so
+the dense `q`). The drafter switches its draft model's fused TP-sharded argmax off so
 the full-vocab logits reach it, which adds the logits all-gather to every
 draft step under tensor parallelism.
 
@@ -754,6 +791,46 @@ vocabulary cost about 330 MB in total. On CUDA, when the CUDA-graph memory
 reserve is on, the runtime charges both to it as startup residue, out of the
 KV-cache budget. Otherwise they come out of the `--gpu-memory-utilization`
 headroom.
+
+#### DFLASH with a DFlash2 draft
+
+`DFLASH` takes the flag with a DFlash2 draft (a checkpoint with candidate
+selector weights) and `--sampling-backend triton` only; `DFLASH` with any other
+backend is refused at startup, and a base DFlash draft (no selector) is refused
+when the server loads it. The DFlash2 walk picks one of the selector's `K`
+candidates per draft step. Under the flag a sampling request draws that
+candidate from `q = softmax(scores / T)` over the `K` edges out of the
+previous pick, with noise keyed by the request's seed, the round and the drawn
+token id, so every TP rank draws the same token. Greedy requests keep the best
+edge. Requests with top-k disabled and `top_p < 1` also keep it (see the
+routes below), as does a step whose scores are not finite. None of these
+three records a proposal. The walk records `q` and the candidate ids per step,
+which is `K` entries instead of a vocabulary row. Verify accepts draft `x` with
+probability `min(1, p'(x) / q(x))` and on rejection samples from
+`norm(max(p' - q, 0))`, where `p'` is the target distribution after the
+request's temperature, top-k and top-p, the one the Triton backend serves.
+
+- Memory: `q` reuses the draft-tree q tables (`RuntimeStates.future_draft_q`),
+  `(max_num_seqs + 2) x (num_draft_tokens - 1) x K x 8` bytes plus two int32
+  rows of `num_draft_tokens` per slot. That is under 1 MB at 512 slots, 8
+  draft tokens and `K = 16`. No dense per-vocab rows, no gather buffer, and
+  the draft head keeps its shard-local top-K.
+- No proposal: a fresh admission, a PD landing and a forced single-token
+  verify record no `q`. Their drafts are checked by the target-only rule,
+  which keeps a draft exactly when it equals the target's own draw at that
+  position. So a landed request's first verify can still accept drafts,
+  unlike the step drafters' sentinel, which always rejects.
+  `--spec-reject-draft-prob-threshold` has no effect here.
+- Routes: the Triton backend picks one sampling route per batch. The
+  rejection rule runs on batches with no filter (top-k disabled, `top_p = 1`)
+  and on batches where every request has a finite top-k, with any `top_p`.
+  Under the flag those top-k batches always use the two-stage top-k kernel,
+  at every row count. Batches with top-p only (top-k disabled, `top_p < 1`)
+  and mixed batches (for example greedy next to no-filter requests) have no
+  exact `p'` and verify every row by the target-only rule. There a sampled
+  draft is kept with probability `sum(p * q)`, which can be below the greedy
+  draft's `p(argmax q)`. Keep sampling parameters uniform across a batch for
+  the best acceptance.
 
 `DFLASH` and `DSPARK` are block drafters: one draft forward proposes a whole
 block instead of one token per step, so their two token counts are coupled.
@@ -824,6 +901,13 @@ Both Prefill and Decode engines select their transport from the detected
 platform. Startup settings pass this protocol to the Rust transfer peer,
 which keeps it when recreating a session after a memory resume.
 
+Upgrade Prefill and Decode nodes together: cache registrations now carry a
+separate cache identity in a ninth frame, and requests name that identity.
+Older peers without this field are incompatible. Each Decode cache resume
+gets a new identity even if its transport IP and port are reused. The sender
+refreshes cached remote memory keys on address reuse without changing the
+public address used by EPD.
+
 ## Observability
 
 | Parameter | Purpose |
@@ -838,6 +922,8 @@ which keeps it when recreating a session after a memory resume.
 | `--metrics-host` | Bind host for the `/metrics` endpoint. Defaults to `--host`. |
 | `--decode-log-interval` | Decode batch log interval. |
 | `--kv-events-config` | JSON config for KV cache mutation events. Set `enable_kv_cache_events` and a publisher such as `zmq` to publish device prefix-cache stores and removals. |
+| `--otlp-traces-endpoint` | OTLP/HTTP traces endpoint (a collector's `/v1/traces`, Jaeger, Langfuse). Each finished request exports one span built from its lifecycle timestamps. |
+| `--trace-sample-ratio` | The share of requests the OTLP endpoint traces (0..1). 0, the default, disables tracing. |
 
 Every `--decode-log-interval` decode rounds the scheduler's representative rank
 prints one `Decode batch.` line: `#running-req`, `avg_seq_len` (the mean of
@@ -894,6 +980,14 @@ is intentionally verbose. Enable it only while debugging. For
 decode-only batches it also logs the anchor, draft candidates, target verify
 tokens, and their position-wise matches.
 
+Set `TOKENSPEED_VALIDATE_PAGE_IDS=1` to check every page ID in each forward's
+block tables against its cache group's page range before the forward runs.
+The structural checks (cache groups, dtype, shape, rows) always run; the scan
+reads every ID of every scheduled row, which at long contexts costs as much as
+the rest of the forward thread's table packing, so it is off by default.
+Enable it while debugging a page-table fault. The model executor reads it once
+at startup. Prefill-graph capture scans the tables it builds either way.
+
 To send observations to another monitoring system, install and select a
 [metric output plugin](../metrics-plugins.md). Selecting only external outputs
 does not start a Prometheus endpoint.
@@ -938,6 +1032,21 @@ retraction whose victim cannot be imaged aborts it instead — those are
 `tokenspeed:num_capacity_aborted_requests`, never preemptions. A forced
 retraction's victim refused after its pages were published is aborted and
 counts there too.
+
+### OTLP tracing
+
+`--otlp-traces-endpoint` exports one span per request to an OTLP/HTTP
+receiver, assembled at the request's release from the same timestamps the
+stats line prints — the serving loop never blocks on it, a full export
+queue drops spans and counts them, and `--trace-sample-ratio` bounds the
+share. A request that names a continual-prompting session
+(`session_params.id`) carries it as the `session.id` attribute, so a
+tracing UI groups one conversation's requests under the session. Trace ids derive from the request id, so a span, its `Req: … Finish!`
+line and its Prometheus samples cross-reference. The span carries the GenAI
+attribute conventions (`gen_ai.request.model`, prompt and completion tokens,
+finish reason) plus the cached prompt tokens and preemption counts, with the
+lifecycle points as time-stamped events. See
+[the tracing design](../design/tracing.md).
 
 ### Per-request stats
 
@@ -1139,10 +1248,18 @@ Mooncake Store (L3)
 ```
 
 Host L2 and the retraction snapshot pool pack each group's payload independently
-of Device strides. A shared Host parent fits the largest single group payload;
-each group fits as many whole children in it as possible. Empty parents are
-available to every group, including recurrent State; no group has reserved
-capacity.
+of Device strides. A shared Host parent fits the largest single group payload,
+and each group fits as many whole children in it as possible. When that
+payload is a recurrent-state checkpoint, or a replayable sliding-window page
+that Host L2 never stores, the KV pages of every parent leave a gap smaller
+than one page, so the parent may instead round up to a whole number of pages
+of the KV group that stores the most Host bytes per token: those pages then
+fill it without a gap, but every parent of the largest payload gains the same
+bytes as slack. The parent rounds up only when that lowers the Host bytes per
+cached token, assuming one State checkpoint per 8,192 cached tokens (a
+request publishes only a few, so a prefix cache of long prompts holds far
+fewer). Empty parents are available to every group, including recurrent
+State; no group has reserved capacity.
 Mirrored ranks must have the same Host packing; startup refuses local layouts
 that would give the same Host block ID different meanings across ranks.
 
@@ -1208,16 +1325,31 @@ fused role,
 `--kvstore-ratio` (a multiple of this rank's Device LCM block count, 2 by
 default). Host parents use compact payload geometry, so the ratio counts
 parents rather than allocated bytes. Use `--kvstore-size` to request a byte
-budget.
+budget. A parent rounded up to whole KV pages (above) is less than one KV page
+larger than the largest payload, a large share when it holds few pages: with
+Qwen3.8-Flash-Next and FP8 KV it grows 4.3% at attention TP 1 and 2, 16% at
+TP 4 and 39% at TP 8, where the recurrent state keeps splitting across the
+ranks but the two KV heads stop at TP 2. Sizes that count parents (the
+ratios and the derived retraction snapshot pool) pin that much more Host
+memory; the gigabyte sizes keep their byte budget.
 Every rank of a node pins its Host buffers at the same point of startup, so
 each rank checks the Host L2 and the retraction snapshot pool against an
 equal share of the Host memory its node has available, less a 10 GiB
-headroom per rank. Each buffer counts at the size its configured pinned
-allocator reserves. On CUDA/ROCm, the launcher defaults
-`pinned_max_round_threshold_mb:1024` before starting the ranks: allocations
-up to 1 GiB round to a power of two; larger buffers use their requested size.
-This avoids reserving 274.88 GB for a 140 GB L2 buffer. Explicit thresholds
-and other allocator options are preserved. To override the default, set
+headroom per rank. Available means the smaller of the host's free memory and
+what the process's memory cgroup still allows (its limit, `memory.max` or
+`memory.high` on cgroup v2, less its usage with page cache counted as free;
+the tightest limit over its cgroup and the ones above it, found through
+`/proc/self/mountinfo`), so a container or a Slurm step is sized against its
+own limit; the sizing warning and the refusal name which one was used.
+Each buffer counts at the size its configured pinned
+allocator reserves. When the CUDA/ROCm allocator supports it, the launcher sets
+`pinned_max_round_threshold_mb:1024` as the default before starting the ranks.
+Allocations up to 1 GiB round to a power of two; larger buffers use their
+requested size.
+This avoids reserving 274.88 GB for a 140 GB L2 buffer. Allocators without this
+option keep their native defaults. The capability probe has a 60-second timeout.
+Probe failures stop startup. Explicit thresholds and other allocator options
+are preserved. To override the default, set
 `PYTORCH_ALLOC_CONF=pinned_max_round_threshold_mb:<MiB>` before launch;
 the legacy `PYTORCH_CUDA_ALLOC_CONF` and `PYTORCH_HIP_ALLOC_CONF` variables
 take precedence, in that order. The check reads the effective allocator
@@ -1374,3 +1506,47 @@ On a host whose address is IPv6, the PD transfer engine sets `MC_USE_IPV6=1`
 (unless it is already set) so Mooncake's handshake uses IPv6. The Mooncake L3
 store client reads `MC_USE_IPV6` on its own when the store starts, so export
 `MC_USE_IPV6=1` yourself when the L3 store runs on an IPv6 host.
+
+### Block verification (experimental)
+
+`--speculative-rejection-sample-method block --enable-speculative-sampling --sampling-backend flashinfer`
+verifies a sampled draft chain by block verification instead of token-wise
+rejection. The names follow vLLM: `--enable-speculative-sampling` is
+`draft_sample_method=probabilistic`, and `--speculative-config` also accepts
+the `draft_sample_method` and `rejection_sample_method` keys. It supports `DSPARK` (probabilistic Markov drafting) and `EAGLE3`
+with `--speculative-eagle-topk 1`; block verification is defined on a single
+chain, so draft trees are refused. EAGLE3 already samples its chain under
+`--enable-speculative-sampling`, and its hot-token `q` is recorded over the full
+vocabulary with zeros outside the draft vocabulary. The feature is disabled by
+default; without it, the greedy DSpark path and the token-wise EAGLE3 verifier
+are unchanged. The initial support scope is aggregate TP, including DCP, without
+attention DP, DP sampling, pipeline parallelism or PD disaggregation. Other
+combinations fail at startup.
+
+Draft probabilities follow the request temperature; greedy requests retain
+one-hot proposals. Target filtering and grammar masks still apply before
+verification. The verifier uses clipped prefix likelihood ratios, selects the
+longest accepted prefix, and samples a prefix-scaled positive residual (or a
+target bonus token). It is not a single whole-block likelihood-ratio test.
+The output uses the existing accepted-length and state rollback contract.
+
+The existing per-request proposal RNG and verifier coin streams are reused.
+A stochastic output difference from greedy decoding is expected; validate the
+output distribution and accuracy, rather than requiring identical token IDs.
+
+Replacing `block` with `--synthetic-acceptance-length L` (the `synthetic`
+method) gives a benchmark-only mode, the equivalent of vLLM's probabilistic
+draft sampling with synthetic rejection; for `DSPARK` it also turns on sampled
+Markov drafting.
+The drafter still samples: the full-vocabulary draft logits (and DSpark's Markov
+steps) and the recorded fp32 draft probabilities all stay on the path. Verify
+gathers those probabilities and runs the standard draft-probability chain rule
+for its cost; the synthetic length then replaces its outcome, as in the greedy
+synthetic mode above. The block verifier itself is not run, because synthetic
+rejection replaces it. The token at the cutoff is drawn from the target
+probabilities at that position (the argmax for greedy requests); this costs one
+full-vocabulary pass per request. Do not use generated text for correctness or
+accuracy evaluation; validate the algorithm and its natural acceptance length
+without this flag. Full-vocabulary draft gathering, probability storage, and
+verification reductions all add work; measure their cost and natural acceptance
+length before drawing performance conclusions.

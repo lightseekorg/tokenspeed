@@ -66,7 +66,7 @@ expert_apply = prepare_sm90_fp8_moe(
 ```
 
 Private modes apply `sm90_moe.patch` to a cached source copy of FlashInfer
-0.7.2.post1 and compile isolated modules, operators, and tuning caches. They require
+0.7.3 and compile isolated modules, operators, and tuning caches. They require
 matching upstream sources, JIT enabled, and both CUDA toolkit and runtime
 12.8 or newer. Initialization reports unsupported sources or build settings.
 Private cold JIT compilations bind their include path to that versioned source
@@ -141,7 +141,7 @@ replay. Performance depends on routing; benchmark the intended workload.
 
 ### NVFP4 routing-map padding
 
-The pinned FlashInfer version (0.7.2.post1) initializes unused rows inside active
+The pinned FlashInfer version (0.7.3) initializes unused rows inside active
 expert tiles of `permuted_idx_to_token_idx` to `-1` in its routing producers.
 This prevents unnecessary activation loads in the first GEMM without a separate
 fill-kernel launch. Routing refreshes live mappings and tile padding on every
@@ -330,6 +330,12 @@ Per-channel FP8 experts store weights in FP8 E4M3 with FP32 scales per output
 channel and quantize activations per token. FP32 routing weights remain FP32
 during combination. Native FP8 matrix arithmetic uses FP32 accumulators but
 need not match sequential FP32 arithmetic.
+
+On SM90 the Triton kernel stays at 32 rows per tile. A 64-row FP8 tile lowers
+to wgmma, whose accumulator is coarser than FP32, and misses the FP64 reference
+by 5e-3 to 7e-3. The smaller tiles stay within 5e-4 but give up wgmma's
+throughput: from 2048 tokens, and on wide experts at every size above 512, they
+run slower than 64-row tiles would.
 
 ## Shared MoE precision policies
 
@@ -537,6 +543,19 @@ one collective with no 128-token chunk loop. All layers and captured capacities
 continue to share stable workspace addresses. Kimi K3 writes packed activations
 and routes directly into views of this full-capacity symmetric allocation.
 
+## DeepSeek V4 MegaMoE shared expert (`deep_gemm.py`)
+
+DeepGEMM's MXFP4 MegaMoE can run one MXFP8 shared expert of the routed
+experts' intermediate size inside the same launch. The MoE plan exposes this
+as `fuse_shared_expert`; `MoELayer.fuse_shared_expert` hands over the shared
+expert's E4M3 weights and UE8M0 scale bytes once the routed weights are
+processed. They are re-laid out in place like a routed expert (gate/up rows
+interleaved by eight, scales packed four per int32 and UTCCP-transposed), and
+the routed output then includes the shared expert. The input staging kernel
+also writes the activation scales the shared expert reads: MN-major, with rows
+grouped by the BLOCK_M MegaMoE picks for the token count. The shared expert's
+SwiGLU uses the routed experts' clamp.
+
 ## Kimi-K3 TP8 decode chain (`_cute_dsl/k3_decode.py`)
 
 On Blackwell with one TP8 group shared by attention and MoE, a decode forward
@@ -564,6 +583,28 @@ CUDA graph. Every rank must run the same batches, since each mailbox is shared
 by the group. Other row counts and every non-decode forward keep the TRT-LLM
 MoE.
 
+At 5-8 rows the routing kernel lets the experts launch as it starts, and the
+shared expert runs on a highest-priority side stream that the tail never waits
+for: the tail polls the shared rows from their mailbox. Those tails keep their
+release after the output multicast: a release at entry lets kernels in that can
+hold the SMs the side stream still needs. The forward rejoins that side stream once
+at its end (`KimiK3DecodeMoE.join`), since a CUDA graph capture fails while a
+forked stream is not joined. These only reorder work; the outputs are the same
+bit for bit.
+
+Up to 8 rows a decode step is bound by HBM bandwidth, which the attention core
+and the all-reduces leave idle, so the chain prefetches weights into L2
+(`_cute_dsl/k3_decode_prefetch.py` has the row counts and caps). A side stream
+prefetches the MoE front's packed weight after the o-projection exit; the
+o-projection shard and the MoE layer's front, shared-expert and up-projection
+weights after the KDA input projection or the MLA core; and, once the routed
+experts launch, the next layer's attention weights up to a cap. At 4-7 rows the
+routed experts instead prefetch the up-projection shard and the next attention's
+weights themselves, once their last weight load is issued. The forward rejoins
+the prefetch stream at its end as well. The prefetch tables hold weight
+addresses, so the weights must not move after binding. Prefetching changes no
+result.
+
 Three places decide where the chain runs. The Kimi-K3 MoE execution plan
 allows it for one tensor-parallel group shared by attention and MoE on
 Blackwell TRT-LLM. `supports()` in `_cute_dsl/k3_decode_support.py` (no
@@ -589,7 +630,9 @@ o-projection shard). Each layer then does the following:
    with the block snapshots (AttnRes), reading a MoE layer's output row
    straight from the tail's ring.
 2. Run the packed input projection as a split-K GEMM with per-batch tactics.
-3. Run the attention core as usual.
+3. Run the attention core as usual, through the attention's `o_proj_input`
+   (Kimi-K3.1's DSA layers select their indexer's top-k there, as in their
+   `forward`).
 4. Multiply by this rank's o-projection shard and multicast the partial;
    a consumer kernel sums the partials, updates the prefix, and applies the
    post-attention AttnRes. Above 32 rows each rank sums its column share and

@@ -81,6 +81,7 @@ private:
     std::int64_t decodeWidth() const;
     std::int64_t protectedTokens() const;
     std::int64_t tailHandoverBlocks(std::size_t group_index) const;
+    std::int64_t copyInReserveBlocks(std::size_t group_index) const;
 
     SchedulerConfig config_;
     std::vector<Group> groups_;

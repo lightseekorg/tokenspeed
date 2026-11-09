@@ -67,7 +67,8 @@ DEBUG_HIP_FORCE_GRAPH_QUEUES=1 DEBUG_HIP_GRAPH_BATCH_SIZE=1 ts serve \
     --moe-backend gluon \
     --kv-cache-dtype fp8_e4m3 \
     --max-model-len 1048576 \
-    --max-num-seqs 64 \
+    --max-num-seqs 2 \
+    --prefill-decode-interval 192 \
     --max-prefill-tokens 8192 \
     --chunked-prefill-size 8192 \
     --cudagraph-capture-sizes 1 2 3 4 5 6 8 12 16 32 64 \
@@ -79,6 +80,7 @@ DEBUG_HIP_FORCE_GRAPH_QUEUES=1 DEBUG_HIP_GRAPH_BATCH_SIZE=1 ts serve \
     --kvstore-ratio 0.0 \
     --speculative-algorithm DFLASH \
     --speculative-draft-model-path RadixArk/Muse-Spark-Open-DFlash2 \
+    --speculative-draft-model-quantization fp8_weight_only \
     --speculative-num-steps 7 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 8 \
@@ -90,22 +92,42 @@ DEBUG_HIP_FORCE_GRAPH_QUEUES=1 DEBUG_HIP_GRAPH_BATCH_SIZE=1 ts serve \
 `--max-model-len 1048576` keeps the checkpoint's native context, which agentic
 workloads with long cached prefixes need; prefix caching is on by default.
 
+`--speculative-draft-model-quantization fp8_weight_only` streams the draft's
+MLP, `o_proj` and LM-head weights in FP8 with one scale per output row, which
+shortens each draft step at unchanged acceptance.
+
+With MXFP4 experts at MoE TP8 and EP1, startup also builds a column-split copy
+of the expert down-projection weights for prefill. The copy holds one more set
+of those weights on each GPU, which leaves less memory for the KV cache. While
+the copy exists, TokenSpeed refuses live weight updates.
+
 The two HIP runtime settings are needed for speed; TokenSpeed does not set them
 itself. `DEBUG_HIP_FORCE_GRAPH_QUEUES=1` matters most for the two-stream
 speculative decode graph. The extra capture sizes (3, 5, 6, 12) cut padding at
 the small batch sizes that speculative decoding runs at.
 
-For multi-turn agentic traffic, set `--max-num-seqs` by concurrency:
+For multi-turn agentic traffic, set `--max-num-seqs` and
+`--prefill-decode-interval` by concurrency. The earlier launch uses the row for
+a concurrency of 2:
 
-| Concurrency | `--max-num-seqs` |
-| ----------- | ---------------- |
-| 1 to 4      | 64               |
-| 8           | 3                |
-| 16          | 4                |
+| Concurrency | `--max-num-seqs` | `--prefill-decode-interval` |
+| ----------- | ---------------- | --------------------------- |
+| 1           | 1                | 0                           |
+| 2           | 2                | 192                         |
+| 4           | 2                | 96                          |
+| 8           | 2                | 256                         |
+| 16          | 3                | 384                         |
 
-A `--max-num-seqs` below the concurrency queues the extra requests: decode
-batches stay small, which lowers TPOT, but queued requests wait longer for
-their first token. Keep 64 when time-to-first-token matters more.
+A `--max-num-seqs` below the concurrency queues the extra requests. With an
+interval of N, the scheduler runs N decode rounds after each prefill chunk
+before the next one. Both keep decode batches small and uninterrupted, which
+lowers TPOT, but queued and deferred prompts wait longer for their first token.
+At a concurrency of 8, time-to-first-token is noticeably higher. If
+time-to-first-token matters more, raise `--max-num-seqs` and lower the
+interval.
+
+`--prefill-decode-interval` needs a `tokenspeed-scheduler` release that
+includes the prefill/decode interval. With an older scheduler, leave it at 0.
 
 ### Blackwell NVFP4
 
@@ -445,9 +467,8 @@ Notes:
 - The SMG packages pinned by TokenSpeed resolve `moonshotai/Kimi-K3` directly.
   You no longer need a flattened local checkpoint and a separately staged
   remote-code cache.
-- The checkpoint carries no FP8 KV scaling factors. When the target K3 uses an
-  FP8 LCM cache, TokenSpeed keeps the separate K3 DSpark draft cache in
-  BF16 so context injection and draft attention match the reference precision.
+- K3's target and DSpark draft MLA caches follow the shared `--kv-cache-dtype`
+  setting, as with EAGLE3: `fp8` selects FP8; `auto` and `bfloat16` select BF16.
 - DSpark proposal blocks use non-causal MLA draft attention. Both the `mla` and
   `trtllm_mla` draft backends preserve every block row during eager execution
   and CUDA graph capture. When K3's 128-token logical cache pages feed the
@@ -612,6 +633,117 @@ TORCH_NCCL_BLOCKING_WAIT=1 tokenspeed serve moonshotai/Kimi-K3 \
   --chunked-prefill-size 1024 --max-prefill-tokens 1024 \
   --disable-kvstore --disable-autotune
 ```
+
+## Kimi K3.1 Pro {#kimi-k3-1-pro}
+
+Kimi-K3.1 (`KimiK31ForConditionalGeneration`) is Kimi-K3 with a DSA lightning
+indexer on each of its 24 MLA layers: every MLA layer attends only the 2048
+history tokens (`index_topk`) its own indexer selects. The KDA layers, the
+MoE, the vision encoder, the parsers, and the cache family are Kimi-K3's, so
+the [Kimi K3](#kimi-k3) notes apply unless a note below says otherwise.
+
+Notes:
+
+- Leave `--attention-backend` unset (or pass `dsa`): the MLA layers then run
+  the `dsa` sparse-MLA backend inside the KDA hybrid wrapper. The dense MLA
+  backends do not run the indexer.
+- The indexer keys live in an index-K plane beside each MLA layer's latent
+  plane in the full-attention cache group, so prefix caching, PD transfer, and
+  frees treat them with the latent rows. The plane stores the keys as FP8 with
+  one FP32 scale per 128 channels, 132 bytes per token per layer, whatever
+  `--kv-cache-dtype` sets for the latent.
+- The checkpoint ships no modeling code. The indexer follows DeepSeek-V3.2:
+  queries from the normalized MLA q latent, LayerNorm keys without RoPE, and
+  per-head ReLU scores weighted by `weights_proj`. Loading validates
+  `dsa_config` against that and fails on anything else, on an indexer tensor
+  without a parameter, and on an indexer parameter the checkpoint does not
+  fill.
+- Speculative verify takes up to 8 query rows per request on Blackwell and
+  up to 6 on gfx950.
+- The DSA layers run attention TP only; TokenSpeed refuses the Kimi-K3 QKV
+  and output projection TP subgroups at startup.
+- On NVIDIA, prefill CUDA graphs replay with the DSA attention at eager
+  breaks on the PD prefill role (with `--disaggregation-layerwise-interval 0`)
+  and on the aggregated role unless `--enable-mixed-batch` is on; elsewhere
+  prefill runs eager. `--disable-prefill-graph` turns them off. On the
+  aggregated role the default bucket ladder takes about 7.5 GB more per GPU,
+  out of the KV cache, and adds about 7 minutes to startup;
+  `--prefill-graph-capture-token-sizes` captures fewer buckets for less.
+- The Kimi-K3.1 DSpark draft (`Inferact/Kimi-K3.1-Pro-DSpark-preview`)
+  proposes 7 tokens per step, so it takes
+  `--speculative-num-draft-tokens 8`. Unlike Kimi-K3's draft, it attends
+  causally within its block (its config sets `dflash_config.causal`).
+  `--drafter-attention-backend tokenspeed_mla` runs causal blocks; the other
+  MLA drafter backends refuse the draft at startup.
+- A checkpoint with a Python XTML encoder and no Jinja chat template needs
+  its tokenizer's `apply_chat_template` to encode messages. Pass the token
+  IDs as `input_ids` to the native `/generate` endpoint.
+
+### NVIDIA
+
+Install `flash-linear-attention` for the KDA layers, as for
+[Kimi K3](#kimi-k3), then serve with the DSpark draft on 8 Blackwell GPUs.
+This launch was validated on 2 GB300 nodes with 4 GPUs each. On such nodes,
+start each one with the command below plus
+`--nnodes 2 --node-rank <rank> --dist-init-addr <first-node>:<port>`, where
+`<rank>` is the node's rank (`0` on the first node, `1` on the second) and
+`<first-node>:<port>` is the first node's address and a free port on it. Drop
+the 4 speculative flags to serve without the draft. The context length is the
+checkpoint's 1,048,576 tokens.
+
+```bash
+tokenspeed serve moonshotai/Kimi-K3.1-Pro \
+  --served-model-name kimi-k3.1 \
+  --trust-remote-code \
+  --kv-cache-dtype fp8 \
+  --tensor-parallel-size 8 \
+  --mm-encoder-tp-mode data \
+  --moe-backend flashinfer_trtllm \
+  --max-num-seqs 64 \
+  --speculative-algorithm DSPARK \
+  --speculative-draft-model-path Inferact/Kimi-K3.1-Pro-DSpark-preview \
+  --speculative-num-draft-tokens 8 \
+  --drafter-attention-backend tokenspeed_mla \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+### AMD
+
+On 8x MI350X/MI355X (gfx950), serve at TP8 with Kimi-K3's EAGLE-3.1 draft
+(`lightseekorg/kimi-k3-eagle3.1-mla`), which accepts slightly more tokens per
+step than the EAGLE3 draft. The index-K planes make a K3.1 cache block about
+22% larger than K3's, so at the default `--gpu-memory-utilization`, 15 requests
+of 50K input and 500 output tokens run at once.
+
+```bash
+tokenspeed serve moonshotai/Kimi-K3.1-Pro \
+  --served-model-name kimi-k3.1 \
+  --trust-remote-code \
+  --max-model-len 65536 \
+  --kv-cache-dtype fp8 \
+  --tensor-parallel-size 8 \
+  --mm-encoder-tp-mode data \
+  --speculative-algorithm EAGLE3 \
+  --speculative-draft-model-path lightseekorg/kimi-k3-eagle3.1-mla \
+  --drafter-attention-backend gluon \
+  --max-num-seqs 64 \
+  --disable-kvstore \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+- The rest comes from the defaults and the draft's config: a 3-step EAGLE3
+  chain (a 4-token verify window), the draft's capture layers
+  (2, 46, 90) and BF16 weights, TP8 without expert parallelism, automatic MoE
+  selection, an 8192-token prefill budget, and CUDA graph capture sizes up to
+  `--max-num-seqs`.
+- `--drafter-attention-backend gluon` pins the draft's MLA layers to the Gluon
+  kernels and fails fast where none is registered; leaving it unset lets the
+  `mla` backend select the kernels.
+- Prefill runs eager on gfx950: the DSA backend replays prefill CUDA graphs on
+  NVIDIA only.
+- The Kimi-K3 AMD note on greedy sampling applies.
 
 ## GLM5 / GLM5.2
 
@@ -1044,8 +1176,10 @@ object:
 ```
 
 - `ple_embed_dtype: "float8_e4m3fn"`: store the PLE n-gram embedding table in
-  FP8 to save memory. Omit it to store the table in the model's compute
-  dtype.
+  FP8 to save memory, quantizing a BF16 table per row at load. When omitted,
+  the table keeps the checkpoint's format: checkpoints that ship it in FP8,
+  such as `Qwen/Qwen3.8-Flash-Next-FP8` and `nvidia/Qwen3.8-Flash-Next-NVFP4`,
+  keep it in FP8, and other checkpoints store it in the model's compute dtype.
 - `ple_offload_embedding`: keep the PLE table in pinned host memory when `true`
   or GPU memory when `false`. When omitted, TokenSpeed enables offloading on
   NVIDIA CUDA and disables it on other platforms.
@@ -1109,6 +1243,12 @@ The B200 and AMD GSM8K CI jobs, the GB300 Slurm 1P1D GSM8K job, and the
 manual 1P1D smoke test use `deepseek-ai/DeepSeek-V4.1-Flash-1017`.
 The 1P1D CI tasks set `MODEL` explicitly so both serving roles and the
 evaluation client select the same checkpoint.
+
+The target LM head masks BOS, PAD, and the image control/placeholder token IDs
+`0, 2, 129262..129264` to `-inf`. The mask applies before ordinary sampling,
+fused argmax, and speculative verification, and to target-side logprob scoring;
+draft-model proposals are unchanged. Pass
+`--disable-deepseek-v41-token-blacklist` to allow these tokens.
 
 DeepSeek V4.1 (`deepseek_v41`) runs on its own FlatKV attention backend
 with a four-group KV cache: the global KV chains, the SWA rows, and the

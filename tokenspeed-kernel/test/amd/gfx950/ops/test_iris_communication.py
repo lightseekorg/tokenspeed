@@ -464,6 +464,32 @@ def _ar_worker_main(
             )
         if world_size == 8:
             _check_all_reduce_residual_attnres(k3, rank, device)
+            from tokenspeed_kernel.ops.communication._iris.kimi_k3 import (
+                prepare_k3_communication,
+            )
+
+            # Lamport path to 32 rows; up to 16 rows the push one-shot is its oracle.
+            lamport_k3 = prepare_k3_communication(
+                group=dist.group.WORLD,
+                rank_in_group=rank,
+                staged_max_numel=0,
+                producer_direct_max_numel=32 * (7168 + 3584),
+                attnres_max_numel=16 * 7168,
+                attnres_max_rows=16,
+                enable_lamport=True,
+                sharded_max_rows=0,
+                dtype=torch.bfloat16,
+                device=device,
+                all_reduce=None,
+            )
+            assert lamport_k3.two_shot_region is not None
+            _check_all_reduce_residual_attnres(
+                lamport_k3,
+                rank,
+                device,
+                token_counts=(1, 2, 4, 7, 8, 16, 24, 32),
+                reference=state,
+            )
     finally:
         dist.destroy_process_group()
 
@@ -671,7 +697,9 @@ def _check_all_reduce_symmetric_outputs(
             )
 
 
-def _check_all_reduce_residual_attnres(k3_state, rank: int, device) -> None:
+def _check_all_reduce_residual_attnres(
+    k3_state, rank: int, device, token_counts=(1, 2, 4, 8, 16), reference=None
+) -> None:
     from tokenspeed_kernel.ops.activation.triton import (
         attnres_combine,
         attnres_partial,
@@ -681,7 +709,7 @@ def _check_all_reduce_residual_attnres(k3_state, rank: int, device) -> None:
     )
 
     state = k3_state.all_reduce
-    for num_tokens in (1, 2, 4, 8, 16):
+    for num_tokens in token_counts:
         torch.manual_seed(101 + num_tokens)
         hidden = 7168
         blocks = (torch.randn(4, num_tokens, hidden, device=device) * 0.1).to(
@@ -704,7 +732,7 @@ def _check_all_reduce_residual_attnres(k3_state, rank: int, device) -> None:
         )
         attnres_partial(blocks, score_weight, 1e-6, scratch)
 
-        reduced = iris_all_reduce(state, local.clone(), safe=False)
+        reduced = iris_all_reduce(reference or state, local.clone(), safe=False)
         expected_residual = residual + reduced
         expected_hidden = attnres_combine(
             expected_residual,
@@ -735,6 +763,24 @@ def _check_all_reduce_residual_attnres(k3_state, rank: int, device) -> None:
             )
             torch.testing.assert_close(
                 actual_hidden, expected_hidden, atol=2e-2, rtol=2e-2
+            )
+            # Lamport plus row epilogue must equal the fused push one-shot bit for bit.
+            if num_tokens > k3_state.attnres.max_rows:
+                continue
+            fused_hidden, fused_residual = k3_state.attnres.run(
+                local, residual, score_weight, output_weight, scratch, 1e-6
+            )
+            torch.testing.assert_close(
+                actual_hidden.view(torch.int16),
+                fused_hidden.view(torch.int16),
+                atol=0,
+                rtol=0,
+            )
+            torch.testing.assert_close(
+                actual_residual.view(torch.int16),
+                fused_residual.view(torch.int16),
+                atol=0,
+                rtol=0,
             )
 
         graph = torch.cuda.CUDAGraph()
@@ -1112,8 +1158,84 @@ def _arrms_worker_main(rank: int, world_size: int, port: int, persistent: bool) 
                 weight=weight,
                 device=device,
             )
+        if not persistent:
+            _check_arrms_lamport(rank, world_size, device)
     finally:
         dist.destroy_process_group()
+
+
+def _check_arrms_lamport(rank: int, world_size: int, device) -> None:
+    """Decode rows through the Lamport mailbox match the pull path bit for bit."""
+    import time
+
+    from tokenspeed_kernel.ops.communication.iris import (
+        create_iris_ar_rmsnorm_state,
+        iris_allreduce_residual_rmsnorm,
+    )
+
+    for hidden in (7168, 2880):
+        state = create_iris_ar_rmsnorm_state(
+            group=dist.group.WORLD,
+            rank_in_group=rank,
+            max_token_num=64,
+            hidden_dim=hidden,
+            dtype=torch.bfloat16,
+        )
+        assert (state._lamport is not None) == (world_size in (4, 8))
+        mailbox = state._lamport
+        weight = torch.linspace(0.5, 1.5, hidden, dtype=torch.bfloat16, device=device)
+        generator = torch.Generator(device=device).manual_seed(rank + hidden)
+        for rows in (1, 8, 3, 16, 4, 17, 2):
+            x = torch.randn(rows, hidden, generator=generator, device=device).to(
+                torch.bfloat16
+            )
+            x[:, ::29] = -0.0
+            residual = torch.randn(rows, hidden, device=device).to(torch.bfloat16)
+            fast = [
+                t.clone()
+                for t in iris_allreduce_residual_rmsnorm(
+                    state, input_tensor=x, residual=residual, weight=weight, eps=1e-6
+                )
+            ]
+            state._lamport = None
+            pulled = iris_allreduce_residual_rmsnorm(
+                state, input_tensor=x, residual=residual, weight=weight, eps=1e-6
+            )
+            state._lamport = mailbox
+            for got, want in zip(fast, pulled, strict=True):
+                assert torch.equal(got.view(torch.int16), want.view(torch.int16))
+        if mailbox is None:
+            continue
+        # Captured decode calls with one rank late, replayed without host sync.
+        x = torch.empty(4, hidden, dtype=torch.bfloat16, device=device)
+        residual = torch.randn(4, hidden, device=device).to(torch.bfloat16)
+        torch.cuda.synchronize()
+        dist.barrier()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            outs = [
+                iris_allreduce_residual_rmsnorm(
+                    state,
+                    input_tensor=x,
+                    residual=residual,
+                    weight=weight,
+                    eps=1e-6,
+                )
+                for _ in range(3)
+            ]
+        for replay in range(4):
+            x.fill_((rank + 1) * (replay + 1) / 64)
+            dist.barrier()
+            if rank == replay % world_size:
+                time.sleep(0.005)
+            graph.replay()
+            torch.cuda.synchronize()
+            want = (
+                residual.float() + world_size * (world_size + 1) / 2 * (replay + 1) / 64
+            ).to(torch.bfloat16)
+            for _, residual_out in outs:
+                torch.testing.assert_close(residual_out, want, atol=0, rtol=0)
+        dist.barrier()
 
 
 def _check_arrms_one(state, rank, world_size, tokens, weight, device) -> None:
@@ -1187,3 +1309,95 @@ def test_iris_allreduce_residual_rmsnorm_world4(persistent: bool):
 @pytest.mark.parametrize("persistent", [False, True], ids=["per_row", "persistent"])
 def test_iris_allreduce_residual_rmsnorm_world8(persistent: bool):
     _run_arrms_test(world_size=8, persistent=persistent)
+
+
+def _arrms_hint_worker_fn(rank, world_size, port, error_dict):
+    try:
+        _arrms_hint_worker_main(rank, world_size, port)
+    except Exception:
+        error_dict[rank] = traceback.format_exc()
+
+
+def _arrms_hint_worker_main(rank: int, world_size: int, port: int) -> None:
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        backend="nccl",
+        init_method=f"tcp://localhost:{port}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        from tokenspeed_kernel._triton import triton
+        from tokenspeed_kernel.ops.communication._iris.all_reduce import (
+            iris_pull_oneshot_rmsnorm,
+            iris_pull_oneshot_rmsnorm_persistent,
+        )
+        from tokenspeed_kernel.ops.communication.iris import (
+            create_iris_ar_rmsnorm_state,
+        )
+
+        # 7168 rows are 16-byte multiples; 2884 rows only 8-byte multiples.
+        for hidden in (7168, 2884):
+            for persistent in (False, True):
+                state = create_iris_ar_rmsnorm_state(
+                    group=dist.group.WORLD,
+                    rank_in_group=rank,
+                    max_token_num=512,
+                    hidden_dim=hidden,
+                    dtype=torch.bfloat16,
+                    persistent=persistent,
+                )
+                weight = torch.linspace(0.5, 1.5, hidden, device=device)
+                weight = weight.to(torch.bfloat16)
+                for tokens in (1, 4, 16, 300):
+                    gen = torch.Generator(device=device).manual_seed(
+                        tokens * world_size + rank
+                    )
+                    x = torch.randn(tokens, hidden, generator=gen, device=device)
+                    x = x.to(torch.bfloat16)
+                    residual = torch.randn(
+                        tokens, hidden, generator=gen, device=device
+                    ).to(torch.bfloat16)
+                    norm, res = state.fused(x, residual, weight, _ARRMS_EPS)
+
+                    view = state._input_buf[:tokens]
+                    view.copy_(x)
+                    ref_norm, ref_res = torch.empty_like(x), torch.empty_like(x)
+                    state._ctx.device_barrier()
+                    if persistent:
+                        kernel = iris_pull_oneshot_rmsnorm_persistent
+                        grid = (min(tokens, state._num_programs),)
+                    else:
+                        kernel = iris_pull_oneshot_rmsnorm
+                        grid = (tokens,)
+                    kernel[grid](
+                        view,
+                        residual,
+                        weight,
+                        ref_norm,
+                        ref_res,
+                        tokens,
+                        state._ctx.get_heap_bases(),
+                        iris_rank=rank,
+                        world_size=world_size,
+                        rank_start=0,
+                        rank_stride=1,
+                        HIDDEN_SIZE=hidden,
+                        BLOCK_SIZE=triton.next_power_of_2(hidden),
+                        EPS=_ARRMS_EPS,
+                        num_warps=8,
+                    )
+                    state._ctx.device_barrier()
+                    case = f"hidden={hidden} persistent={persistent} tokens={tokens}"
+                    assert torch.equal(norm, ref_norm), case
+                    assert torch.equal(res, ref_res), case
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("world_size", [2, 8])
+def test_iris_ar_rmsnorm_aligned_peer_loads_match_unhinted(world_size: int):
+    _skip_if_unsupported(world_size, "Iris fused tests")
+    port = _get_open_port()
+    _spawn_and_collect(_arrms_hint_worker_fn, (world_size, port), world_size)

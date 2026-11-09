@@ -253,6 +253,8 @@ control_struct! {
         flush_cache: bool,
         /// The L3 namespace afterwards; `None` for the version's default.
         weight_version: Option<String>,
+        /// Optional SDK publication directory; tensor data stays in the store.
+        snapshot: Option<Value> = None,
     }
     /// [`UpdateWeightsFromMooncakeReqInput`]'s reply.
     UpdateWeightsFromMooncakeReqOutput {
@@ -353,6 +355,25 @@ control_struct! {
         /// Whether the profiler changed state.
         success: bool,
         /// Detail.
+        message: String,
+    }
+
+    /// Development: drain, re-execute edited forward code and recapture the graphs.
+    ReloadForwardReqInput {
+        /// How the drain treats running requests: `wait` lets them finish, `abort` ends them.
+        mode: String = "wait".to_owned(),
+        /// The modules to re-execute; `None` reloads every module whose source changed.
+        modules: Option<Vec<String>> = None,
+        /// The caller's id for this reload, the same on every engine it is sent to; required.
+        id: Option<String> = None,
+        /// Seconds the reload may wait to drain and to be held by every attention-DP engine; `None` waits until cancelled.
+        timeout_s: Option<f64> = None,
+    }
+    /// [`ReloadForwardReqInput`]'s reply.
+    ReloadForwardReqOutput {
+        /// Whether the new code runs and its graphs are captured.
+        success: bool,
+        /// What was reloaded and how long each step took, or why it failed.
         message: String,
     }
 }
@@ -504,6 +525,8 @@ tagged_union! {
         SetInternalState(SetInternalStateReq),
         /// See [`ProfileReq`].
         Profile(ProfileReq),
+        /// See [`ReloadForwardReqInput`].
+        ReloadForward(ReloadForwardReqInput),
     }
 }
 
@@ -549,6 +572,8 @@ tagged_union! {
         SetInternalState(SetInternalStateReqOutput),
         /// See [`ProfileReqOutput`].
         Profile(ProfileReqOutput),
+        /// See [`ReloadForwardReqOutput`].
+        ReloadForward(ReloadForwardReqOutput),
     }
 }
 
@@ -575,6 +600,7 @@ impl ControlRequest {
             Self::GetInternalState(_) => "GetInternalStateReqOutput",
             Self::SetInternalState(_) => "SetInternalStateReqOutput",
             Self::Profile(_) => "ProfileReqOutput",
+            Self::ReloadForward(_) => "ReloadForwardReqOutput",
         }
     }
 }
@@ -602,6 +628,7 @@ impl ControlOutput {
             Self::DemoteSessions(output) => said(output.success, &output.message),
             Self::GetAdmission(output) => (output.success, None),
             Self::Profile(output) => said(output.success, &output.message),
+            Self::ReloadForward(output) => said(output.success, &output.message),
             Self::IsSchedulerPaused(_) | Self::IsSleeping(_) | Self::GetInternalState(_) => {
                 (true, None)
             }

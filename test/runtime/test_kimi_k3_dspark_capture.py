@@ -193,6 +193,7 @@ def test_attnres_capture_runs_at_owner_entry_across_pipeline_boundaries(
             layers_to_capture=[1, 3],
             _dflash_capture_idx_map={1: 0, 3: 1},
             eagle3_layers_to_capture=(),
+            decode_chain=None,
             dflash_aux_stream="attn_res",
             output_attn_res_proj=None,
             output_attn_res_norm=None,

@@ -83,7 +83,9 @@ class TestAttnResTests:
         group = object()
         comm = kimi_k3_comm.K3AttnComm.__new__(kimi_k3_comm.K3AttnComm)
         comm.iris_state = SimpleNamespace(
-            attnres_supported=mock.Mock(), attnres_combine=mock.Mock()
+            attnres_supported=mock.Mock(),
+            attnres_combine=mock.Mock(),
+            reduce_attention=mock.Mock(return_value=None),
         )
         comm.attn_ar_fusion_ok = False
         comm.cute_ar = None
@@ -136,7 +138,9 @@ class TestAttnResTests:
         group = object()
         comm = kimi_k3_comm.K3AttnComm.__new__(kimi_k3_comm.K3AttnComm)
         comm.iris_state = SimpleNamespace(
-            attnres_supported=mock.Mock(), attnres_combine=mock.Mock()
+            attnres_supported=mock.Mock(),
+            attnres_combine=mock.Mock(),
+            reduce_attention=mock.Mock(return_value=None),
         )
         comm.attn_ar_fusion_ok = False
         comm.cute_ar = None
@@ -180,6 +184,65 @@ class TestAttnResTests:
         assert (hidden) is None
         supported.assert_called_once()
         fallback_reduce.assert_called_once_with(partial, comm.mapping.attn.tp_group)
+
+    def test_attnres_reduce_prefers_the_lamport_mailboxes(self, subtests):
+        """Prepared or not, the partial reduces through the Iris mailboxes
+        when they take it; the ordinary all-reduce serves the rest and every
+        partial under the deterministic knobs."""
+        import tokenspeed.runtime.models.kimi_k3_comm as kimi_k3_comm
+
+        comm = kimi_k3_comm.K3AttnComm.__new__(kimi_k3_comm.K3AttnComm)
+        comm.mapping = SimpleNamespace(attn=SimpleNamespace(tp_group=object()))
+        partial = torch.randn(4, _HIDDEN, dtype=torch.bfloat16)
+        prefix = torch.randn_like(partial)
+        lamport = torch.randn_like(partial)
+        fallback = torch.randn_like(partial)
+        for producer_direct in (False, True):
+            for served in (True, False):
+                for knob in (
+                    None,
+                    "force_deterministic_rsag",
+                    "batch_invariant_collectives",
+                ):
+                    with subtests.test(
+                        producer_direct=producer_direct, served=served, knob=knob
+                    ):
+                        comm.iris_state = SimpleNamespace(
+                            reduce_attention=mock.Mock(
+                                return_value=lamport if served else None
+                            )
+                        )
+                        args = {} if knob is None else {knob: True}
+                        with (
+                            mock.patch.dict(kimi_k3_comm.global_server_args_dict, args),
+                            mock.patch.object(
+                                kimi_k3_comm,
+                                "all_reduce",
+                                side_effect=lambda value, group: (
+                                    (fallback,)
+                                    if isinstance(value, tuple)
+                                    else fallback
+                                ),
+                            ) as ordinary,
+                        ):
+                            residual, delta = comm.reduce_for_attnres(
+                                partial, prefix, producer_direct=producer_direct
+                            )
+                        assert residual is prefix
+                        if served and knob is None:
+                            assert delta is lamport
+                            ordinary.assert_not_called()
+                            comm.iris_state.reduce_attention.assert_called_once_with(
+                                partial
+                            )
+                        else:
+                            assert delta is fallback
+                            expected = (partial,) if producer_direct else partial
+                            ordinary.assert_called_once_with(
+                                expected, comm.mapping.attn.tp_group
+                            )
+                        if knob is not None:
+                            comm.iris_state.reduce_attention.assert_not_called()
 
     def test_fused_attention_reduce_window(self, subtests):
 
@@ -442,6 +505,7 @@ class TestAttnResTests:
                             hidden_states=hidden_states,
                             ctx=SimpleNamespace(forward_mode=forward_mode),
                             block_residual=block_residual,
+                            stream=None,
                         )
                     )
 
@@ -487,6 +551,7 @@ class TestAttnResTests:
                 moe.native_latent_moe = None
                 comm = SimpleNamespace(
                     acquire_projection_output=mock.Mock(return_value=partial),
+                    take_published=mock.Mock(return_value=None),
                     mix_for_moe=mock.Mock(return_value=(shard, normalized)),
                     reduce_for_attnres=mock.Mock(
                         side_effect=AssertionError("mixed twice")
@@ -516,7 +581,7 @@ class TestAttnResTests:
                 ) as pre_mix:
                     actual, actual_history = (
                         kimi_k3.KimiLinearDecoderLayer._forward_fused_attnres_graph(
-                            layer, torch.empty(0), hidden, ctx, history
+                            layer, torch.empty(0), hidden, ctx, history, None
                         )
                     )
                 assert (actual) is (output)
@@ -537,8 +602,12 @@ class TestAttnResTests:
                         max_num_tokens_per_gpu=4096,
                         ctx=ctx,
                         prefix_is_sharded=True,
+                        next_mix=None,
+                        attention_gather=None,
                     )
                 )
+                # At 4096 rows the MoE projects its own rows while the rest gather.
+                assert comm.mix_for_moe.call_args.kwargs["defer_gather"] is True
 
     def test_fused_model_graph_preserves_single_token_collective_path(self):
         weight = torch.empty(_HIDDEN, dtype=torch.bfloat16)

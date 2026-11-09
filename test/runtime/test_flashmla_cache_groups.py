@@ -199,7 +199,7 @@ def test_flashmla_grouped_decode_block_table_follows_the_stack_expansion(
 
 
 def test_flashmla_grouped_prefill_index_math(flashmla, device) -> None:
-    """The per-token slot table built from the expanded kernel-page table
+    """The per-token slots built from the expanded host kernel-page table
     (flashinfer paged prefill, plan page_size=1).
 
     Validates the metadata math directly through the module helper. The
@@ -210,25 +210,20 @@ def test_flashmla_grouped_prefill_index_math(flashmla, device) -> None:
     page_size = pool.arena.prefix_granularity
     backend = _make_flashmla_backend(flashmla, pool, 1, False)
 
-    # The leaf consumes the KERNEL-page table the router's stacks expand.
-    logical_table = torch.tensor([[3, 5]], device=device, dtype=torch.int32)
+    # The leaf consumes the host KERNEL-page table the router's stacks expand.
+    logical_table = torch.tensor([[3, 5]], dtype=torch.int32)
     stacks = _stacks_for(backend, pool)
-    stacks.fill(1, 1, {_FULL: logical_table})
-    table = stacks.table(_FULL, 1)
+    table_cpu = stacks.host_table(_FULL, logical_table, 1)
 
-    # Per-token slot table: token t -> table[0, t // p] * p + t % p, which by
+    # Per-token slots: token t -> table[0, t // p] * p + t % p, which by
     # the expansion invariant equals the logical-table slot. Position
     # page_size+2 -> logical index 1 -> page 5, offset 2.
-    slots = flashmla._per_token_slot_table(
-        table,
-        batch_size=1,
-        page_size=_KERNEL_PAGE,
-        max_context_len=backend.max_context_len,
+    slots = flashmla._per_token_kv_indices(
+        table_cpu, torch.tensor([page_size + 3]), page_size=_KERNEL_PAGE
     )
-    assert slots[0, 0].item() == 3 * page_size + 0
-    assert slots[0, page_size - 1].item() == 3 * page_size + (page_size - 1)
-    assert slots[0, page_size].item() == 5 * page_size + 0
-    assert slots[0, page_size + 2].item() == 5 * page_size + 2
+    assert slots.tolist() == [3 * page_size + t for t in range(page_size)] + [
+        5 * page_size + t for t in range(3)
+    ]
 
 
 def test_flashmla_grouped_target_verify_uses_the_whole_window(flashmla, device) -> None:

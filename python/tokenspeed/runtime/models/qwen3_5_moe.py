@@ -28,12 +28,8 @@ from typing import Literal
 import torch
 from tokenspeed_kernel.ops.activation.triton import (
     fused_gate_sigmoid_mul_add,
-    fused_swiglu_fp8_ue8m0,
+    moe_finalize_gate_add,
 )
-from tokenspeed_kernel.ops.gemm._cute_dsl.nvfp4_gemm_swiglu import (
-    nvfp4_gemm_swiglu_nvfp4_quant,
-)
-from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
@@ -45,14 +41,12 @@ from tokenspeed.runtime.execution.forward_step import (
     get_is_capture_mode,
     get_is_cuda_graph_phase,
 )
-from tokenspeed.runtime.layers.activation import SiluAndMul
-from tokenspeed.runtime.layers.dense.mxfp4 import Mxfp4LinearMethod
-from tokenspeed.runtime.layers.dense.nvfp4 import Nvfp4LinearMethod
 from tokenspeed.runtime.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
+from tokenspeed.runtime.layers.mlp import GatedMLP, GatedMLPFusion, gated_activation
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.topk import TopK
 from tokenspeed.runtime.layers.moe.utils import (
@@ -66,9 +60,7 @@ from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config
 from tokenspeed.runtime.layers.quantization.utils import should_exclude_quant_module
 from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
-from tokenspeed.runtime.utils.env import envs, global_server_args_dict
-
-_is_blackwell = current_platform().is_blackwell
+from tokenspeed.runtime.utils.env import global_server_args_dict
 
 
 def _is_moe_layer(layer_id: int, config) -> bool:
@@ -106,7 +98,7 @@ def _gate_up_quant_config(
     return quant_config
 
 
-class Qwen3_5MoeMLP(nn.Module):
+class Qwen3_5MoeMLP(GatedMLP):
     def __init__(
         self,
         hidden_size: int,
@@ -138,8 +130,6 @@ class Qwen3_5MoeMLP(nn.Module):
                 tensor-parallel reduction would sum partial products computed
                 from different tokens.
         """
-        super().__init__()
-        self.mapping = mapping
         gate_up_quant_config = _gate_up_quant_config(
             quant_config, add_prefix("gate_up_proj", prefix)
         )
@@ -154,7 +144,7 @@ class Qwen3_5MoeMLP(nn.Module):
         else:
             raise ValueError(f"Unsupported MLP parallelism: {parallelism}")
         if tp_size > 1 and not replicate_weights:
-            self.gate_up_proj = MergedColumnParallelLinear(
+            gate_up_proj = MergedColumnParallelLinear(
                 hidden_size,
                 [intermediate_size] * 2,
                 bias=False,
@@ -164,7 +154,7 @@ class Qwen3_5MoeMLP(nn.Module):
                 quant_config=gate_up_quant_config,
                 prefix=add_prefix("gate_up_proj", prefix),
             )
-            self.down_proj = RowParallelLinear(
+            down_proj = RowParallelLinear(
                 intermediate_size,
                 hidden_size,
                 bias=False,
@@ -176,104 +166,29 @@ class Qwen3_5MoeMLP(nn.Module):
                 prefix=add_prefix("down_proj", prefix),
             )
         else:
-            self.gate_up_proj = ReplicatedLinear(
+            gate_up_proj = ReplicatedLinear(
                 hidden_size,
                 intermediate_size * 2,
                 bias=False,
                 quant_config=gate_up_quant_config,
                 prefix=add_prefix("gate_up_proj", prefix),
             )
-            self.down_proj = ReplicatedLinear(
+            down_proj = ReplicatedLinear(
                 intermediate_size,
                 hidden_size,
                 bias=False,
                 quant_config=quant_config,
                 prefix=add_prefix("down_proj", prefix),
             )
-
-        if hidden_act != "silu":
-            raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
-            )
-        self.act_fn = SiluAndMul()
-
-        self._use_nvfp4_gemm_swiglu_nvfp4_quant = (
-            envs.TOKENSPEED_NVFP4_GEMM_SWIGLU_NVFP4_QUANT.get()
-            and _is_blackwell
-            and isinstance(self.gate_up_proj.quant_method, Nvfp4LinearMethod)
-            and isinstance(self.down_proj.quant_method, Nvfp4LinearMethod)
+        super().__init__(
+            gate_up_proj,
+            down_proj,
+            gated_activation(hidden_act, swiglu_limit=None),
+            fusions=(
+                GatedMLPFusion.NVFP4_GEMM_SWIGLU_QUANT,
+                GatedMLPFusion.MXFP4_GEMM_SWIGLU,
+            ),
         )
-        self.gate_up_proj.interleave_linear_and_gate = (
-            self._use_nvfp4_gemm_swiglu_nvfp4_quant
-        )
-        # Dynamic-activation MXFP4 projections fuse SiLU-and-mul into the
-        # gate_up GEMM epilogue; down_proj quantizes that output on load.
-        self._use_mxfp4_swiglu = isinstance(
-            self.gate_up_proj.quant_method, Mxfp4LinearMethod
-        ) and isinstance(self.down_proj.quant_method, Mxfp4LinearMethod)
-        if self._use_mxfp4_swiglu:
-            self.gate_up_proj.quant_method.enable_swiglu(self.gate_up_proj)
-
-    def _uses_deep_gemm_fp8_mlp(self) -> bool:
-        """Whether both projections can consume packed UE8M0 activations."""
-        return bool(
-            _is_blackwell
-            and getattr(self.gate_up_proj, "_use_deep_gemm_fp8", False)
-            and getattr(self.down_proj, "_use_deep_gemm_fp8", False)
-        )
-
-    def nvfp4_global_scale(self) -> torch.Tensor | None:
-        """The global scale gate_up_proj quantizes its input to NVFP4 with, if it does."""
-        return self.gate_up_proj.quant_method.nvfp4_global_scale(self.gate_up_proj)
-
-    def forward(self, x):
-        return self.forward_prequantized(x, None)
-
-    def forward_prequantized(
-        self, x: torch.Tensor, x_nvfp4: tuple[torch.Tensor, torch.Tensor] | None
-    ) -> torch.Tensor:
-        """``forward(x)``, taking gate_up_proj's NVFP4 input from its producer when given."""
-        if x.shape[0] == 0:
-            return x
-        if self._use_nvfp4_gemm_swiglu_nvfp4_quant:
-            x_fc1_fp4, x_fc1_scale = (
-                fp4_quantize(x, self.gate_up_proj.input_scale_inv)
-                if x_nvfp4 is None
-                else x_nvfp4
-            )
-            x_fp4, x_scale = nvfp4_gemm_swiglu_nvfp4_quant(
-                x_fc1_fp4,
-                x_fc1_scale,
-                self.gate_up_proj.weight_swiglu_interleaved,
-                self.gate_up_proj.weight_scale_swiglu_interleaved,
-                self.gate_up_proj.alpha,
-                self.down_proj.input_scale_inv,
-            )
-            x, _ = self.down_proj((x_fp4, x_scale))
-            return x
-        if self._use_mxfp4_swiglu:
-            x = self.gate_up_proj.quant_method.apply_swiglu(self.gate_up_proj, x)
-            x, _ = self.down_proj(x)
-            return x
-        gate_up, _ = self.gate_up_proj(x if x_nvfp4 is None else x_nvfp4)
-        if self._uses_deep_gemm_fp8_mlp():
-            x_fp8, x_scale = fused_swiglu_fp8_ue8m0(gate_up)
-            if isinstance(self.down_proj, RowParallelLinear):
-                x, _ = self.down_proj(x_fp8, x_scale)
-            else:
-                # Replicated shared-expert projections do not have the
-                # RowParallelLinear scale shortcut, so request BF16 explicitly
-                # instead of inheriting the FP8 activation dtype.
-                x, _ = self.down_proj(
-                    x_fp8,
-                    block_scale=x_scale,
-                    output_dtype=torch.bfloat16,
-                )
-            return x
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
-        return x
 
 
 class Qwen3_5MoeSparseMoeBlock(nn.Module):
@@ -518,15 +433,45 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
                     router_logits=router_logits,
                 )
 
+            # The shared-expert gate add absorbs the routed finalize: one
+            # latency-bound gather kernel instead of the kernel's finalize and
+            # the gate kernel, bitwise equal. Only plans that hand back
+            # (route outputs, route weights, row map) defer, and only when no
+            # post-kernel routing scale applies to the finalized output. The
+            # fold is limited to NVFP4 experts, the deferred layout it was
+            # checked against; other plans (e.g. the FP8 MTP draft experts)
+            # keep the kernel's own finalize.
+            fuse_finalize = (
+                self.shared_expert is not None
+                and self.shared_expert_gate is not None
+                and hidden_states.shape[0] > 0
+                and hidden_states.dtype == torch.bfloat16
+                and self.experts.supports_deferred_finalize
+                and self.experts.plan.get("weight_dtype") == "nvfp4"
+                and current_platform().is_nvidia
+                and not isinstance(topk_output.output_scale, torch.Tensor)
+                and topk_output.output_scale == 1.0
+            )
             final_hidden_states = self.experts(
                 hidden_states=hidden_states,
                 topk_output=topk_output,
                 num_global_tokens=num_global_tokens,
                 max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+                do_finalize=not fuse_finalize,
             )
 
         if shared_output is not None:
-            if self.shared_expert_gate is not None and hidden_states.shape[0] > 0:
+            if fuse_finalize:
+                gemm2_out, expert_weights, expanded_idx = final_hidden_states
+                final_hidden_states = moe_finalize_gate_add(
+                    gemm2_out,
+                    expanded_idx,
+                    expert_weights,
+                    hidden_states,
+                    self.shared_expert_gate.weight.squeeze(0),
+                    shared_output,
+                )
+            elif self.shared_expert_gate is not None and hidden_states.shape[0] > 0:
                 fused_gate_sigmoid_mul_add(
                     hidden_states,
                     self.shared_expert_gate.weight.squeeze(0),

@@ -20,17 +20,18 @@
 
 """Other operators remain importable without the optional TRT-LLM extension."""
 
-import importlib.util
-
 import pytest
 import torch
 from tokenspeed_kernel.ops.attention.dsa import deep_gemm  # noqa: F401
-from tokenspeed_kernel.ops.gemm.trtllm import dsv3_fused_a_gemm
+from tokenspeed_kernel.ops.gemm.trtllm import (
+    _HAS_TRTLLM_KERNEL,
+    dsv3_fused_a_gemm,
+)
 from tokenspeed_kernel.ops.quantization.trtllm import _per_token_group_quant_8bit
 
 pytestmark = pytest.mark.skipif(
-    importlib.util.find_spec("trtllm_kernel") is not None,
-    reason="requires an environment without the optional TRT-LLM GPU extension",
+    _HAS_TRTLLM_KERNEL,
+    reason="requires an environment without a usable TRT-LLM GPU extension",
 )
 
 
@@ -42,3 +43,17 @@ def test_fused_a_projection_reports_missing_optional_extension():
 def test_trtllm_quantization_reports_missing_optional_extension():
     with pytest.raises(RuntimeError, match="compatible trtllm_kernel package"):
         _per_token_group_quant_8bit(torch.ones(1, 128), 128, False)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_flashinfer_fp8_prepacking_falls_back_without_optional_extension():
+    from tokenspeed_kernel.ops.gemm._flashinfer.fp8_quant import (
+        flashinfer_fp8_blockscale_quantize_prepacked,
+    )
+
+    # Aligned BF16 rows would select TRT-LLM if it were available.
+    x = torch.ones(4, 128, dtype=torch.bfloat16, device="cuda")
+    quantized, scales = flashinfer_fp8_blockscale_quantize_prepacked(x)
+    torch.testing.assert_close(
+        quantized.float() * scales.t(), x.float(), atol=1e-6, rtol=0
+    )

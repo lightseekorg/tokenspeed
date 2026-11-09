@@ -50,12 +50,12 @@ std::span<const std::string> Request::PromptPrefixHashes() {
 
 std::span<const std::uint64_t> Request::KvEventBlockHashes(std::size_t num_pages) {
     if (kv_event_block_hashes_.size() < num_pages) {
-        const std::vector<std::span<const std::int32_t>> pages = FullPrefixPages(false);
-        _assert(num_pages <= pages.size(), "KV event hashes exceed the request's complete pages");
-        for (std::size_t i = kv_event_block_hashes_.size(); i < num_pages; ++i) {
+        const auto first_page = static_cast<std::int32_t>(kv_event_block_hashes_.size());
+        for (const std::span<const std::int32_t> page : PrefixPages(first_page, static_cast<std::int32_t>(num_pages))) {
             const std::optional<std::uint64_t> parent_hash =
-                i == 0 ? std::nullopt : std::optional<std::uint64_t>{kv_event_block_hashes_[i - 1]};
-            kv_event_block_hashes_.push_back(HashKvBlock(pages[i], parent_hash));
+                kv_event_block_hashes_.empty() ? std::nullopt
+                                               : std::optional<std::uint64_t>{kv_event_block_hashes_.back()};
+            kv_event_block_hashes_.push_back(HashKvBlock(page, parent_hash));
         }
     }
     return std::span<const std::uint64_t>{kv_event_block_hashes_}.first(num_pages);

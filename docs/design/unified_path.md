@@ -46,8 +46,8 @@ and leaf (`backends/paged/base.py`) alike: `extend_seq_lens`,
 `extend_seq_lens_cpu`, `extend_prefix_lens`, `extend_prefix_lens_cpu` are
 plain `torch.Tensor` (`[>= num_extends]` entries; empty, never `None`, when
 there are no extend requests) and `extend_with_prefix` is a plain `bool`, and `query_shard` is the forward's
-`QueryShardPlan` (plain host integers: which rows of the span this rank
-computes under query context parallelism) or `None` when every rank computes
+`QueryShardPlan` (which rows of the span this rank computes under query
+context parallelism: host integers and the staged row-index tensors) or `None` when every rank computes
 every row.
 Runner-facing nodes additionally take two host-only facts the scheduler
 knows and only V4.1 plans from: `extend_replay_lens_cpu` (how many leading
@@ -61,11 +61,14 @@ rewriting rows the prefix hit already shares. Likewise every node without a
 gathered-history extend arm calls `reject_query_shard`; the router forwards
 the shard to its leaves together with `page_table_cpu`, the host mirror of
 the extend rows of each leaf's kernel page table (built for a sharded
-forward, and for an extend with a prefix on a KVP page-sharded group; `None`
-otherwise). The one leaf that attends a shard — GPU DSA — counts page
-ownership from it on the host, and an MLA leaf declaring `supports_mla_dcp`
-hands it to `_prepare_prefix_history`, which splits the prefix-chunk gathers
-by page owner the same way. No default values: the runner
+forward, and on a KVP page-sharded group for an extend with a prefix or a
+pure extend; `None` otherwise). The one leaf that attends a shard — GPU DSA
+— counts page ownership from it on the host, and an MLA leaf declaring
+`supports_mla_dcp` hands it to `_prepare_prefix_history`, which splits the
+prefix-chunk gathers by page owner the same way. On a pure KVP extend the
+GPU DSA leaf also bounds the index pages any rank owns from it
+(`max_owned_index_pages`), so its indexer tiles span that owned width with the
+same plan on every rank. No default values: the runner
 passes the `[:num_extends]` slices of its input buffers on every call (the
 idle replay passes the empty `[:0]` slices), so a node that reads a field
 can never see a silently-defaulted one. This is deliberate — a `= False`
@@ -77,6 +80,13 @@ total cache length is the cached prefix plus the current input length.
 FlashInfer receives host CSR metadata derived from those mirrors, with fresh
 pinned sources for asynchronous uploads. Planning does not download device
 lengths or indptrs; mixed batches apply the same rule to their extend rows.
+
+Prefill token inputs arrive as the scheduler's read-only, one-dimensional
+int32 NumPy views. Input fill copies them directly into fresh pinned storage
+for the round, then uploads that storage asynchronously. It neither wraps
+the read-only source in a writable tensor nor creates an intermediate token
+copy. The pinned allocation must remain per-round: overlap can prepare the
+next round while the previous upload is still reading its source.
 
 NPU graph task updates and replay run in inference mode because they write the
 output tensors allocated during capture. This applies to active and idle DP
@@ -136,6 +146,12 @@ before capture or task update and maps authoritative router slots once before
 the first Prolog. Its normalized FP32 partials use the same direct LSE merge as
 DSA, with empty-shard masking and layout conversion fused at that boundary.
 
+Layer-shared Ascend metadata compares retained Tensor storage views when reusing
+prepared results. Equivalent views reuse the result; replacement storage or an
+in-place storage rebind invalidates it. The retained views share allocations
+without copying data and are cleared at the forward boundary. Prefill keeps
+the same storage-view contract for each layer's prepared cache planes.
+
 DSA CP prepares its metadata before the first fused Prolog. One device launch
 expands request lengths into causal query rows, compacts owned pages, counts
 visible/initial/window tokens, writes the Indexer's grouped layout, and maps
@@ -168,6 +184,9 @@ additional storage for sanitization/layout conversion, TopK and LSE. At 16K
 rows and 64 heads these are 1.125 GiB for Q and 2 GiB per partial buffer.
 Plan the prefill chunk against this transient peak as well as resident weights
 and cache; the native fused bucket's memory plan does not bound this path.
+The persistent gather workspace also reserves the retained current rows used
+by attention after exchange, and budgets every transport and slot view with
+the workspace pool's 256-byte alignment.
 
 Single-rank decode uses the same preparation with identity page ownership:
 verify still needs one causal length and page-table row per candidate. Its
@@ -277,7 +296,10 @@ from one first bound to that pool:
   is sampled and priced the same
   way, whatever shape its cost takes down the ladder: flat, falling with the
   entry's width, or lumpy. That is not a bound: a cost that drops between
-  two anchors is priced short over that stretch.
+  two anchors is priced short over that stretch. Nor is it known to be
+  tight: Kimi-K3.1 on the PD prefill role, with 60 prefill entries sharing
+  one pool, was reserved 11.64 GB and booted with 6.64 GB more device memory
+  free than the same launch without the ladder.
   The result is reduced across ranks with MAX. The orchestrator
   releases the probe's graphs and collects the cycles they sit in, then
   rebuilds on the memory profile the probe build took -- where a boot without
@@ -432,6 +454,11 @@ never captured (above-ladder decode, enforce-eager) builds its views lazily
 on first refresh — no new storage, one-time cost. Views must be
 pointer-stable: a captured graph holds their addresses forever.
 
+Kernel page tables and router write-slot buffers retain int32. Cache binding
+bounds local and virtual token slots to the int32 range, including sharded
+groups. Ascend adapters accept int32 router slots and prepare
+int64 buffers only for native consumers that require them.
+
 Helpers that memoize tensors created inside capture must not return those
 tensors to eager callers. Keeping a Python reference preserves the allocation,
 but an earlier graph sharing the same private pool can overwrite its contents
@@ -516,6 +543,10 @@ Startup uses the ordinary dummy model traversal with `kernel_warmup` to
 prepare CuTe QSA, streaming top-k and gated residual configurations. It follows
 normal dispatch overrides and scratch budgets, independently of optional
 FlashInfer tactic profiling. Pipeline parallelism skips this traversal.
+The dummy extend has no cached prefix, so the MHA backend, which sends such
+an extend to its prefill kernel, also runs its cached-prefix extend kernel on
+the same rows during this traversal; that kernel compiles every variant a
+later batch can pick.
 
 CuTe QSA keeps query rows and selected-slot row strides dynamic; model
 geometry, selection budgets and launch configurations stay static. Warmup
@@ -622,13 +653,25 @@ capture/refresh signatures are pinned by
 
 ### Graded CUDA-graph support
 
-A backend's static graph capability is a class attribute,
-`cuda_graph_support: CudaGraphSupport(decode_graph, prefill_graph)`, never a
-scattered executor-side arch check. `ModelExecutor.__init__` AND-composes it
+A backend's graph capability is a class attribute,
+`cuda_graph_support: CudaGraphSupport(decode_graph, prefill_graph)`, which an
+instance may only narrow or widen from its construction arguments (the DSA
+leaf below), never a scattered executor-side arch check.
+`ModelExecutor.__init__` AND-composes it
 over the target and draft `child_backends()` trees once
 (`resolve_cuda_graph_support`), logs every culprit class, and downgrades the
 two graph subsystems (`ForwardStepRunner.disable`, `PrefillGraph.disable`).
-`DSABackend` disables the prefill graph (rationale on the class). Qwen4-Exp's
+`DSABackend` disables the prefill graph (rationale on the class) unless its
+consumer narrows a padded replay to the live rows in an eager break: a KPool
+instance (GLM-5.3-Flash), and Kimi-K3.1 on the prefill role and, without
+`--enable-mixed-batch`, on the aggregated role
+(`DSAConfig.padded_prefill_replay`).
+That instance declaration follows launch arguments, so the prefill role and
+Kimi-K3.1's aggregated role check at boot that every rank plans the same
+prefill graphs (`check_rank_uniform_prefill_plan`; keyed on the role and
+the checkpoint's `ModelConfig.dsa_padded_prefill_replay`, never on a rank's
+graph decision) under the same indexer prefill logits budget, which sets how
+many KVP exchanges those breaks make. Qwen4-Exp's
 PLE and QSA indexer support the breakable graph: their model methods are eager
 break points, where live request metadata controls cache writes and padded
 token rows are sliced before state updates. The root composes its actual
@@ -638,7 +681,8 @@ no GDN leaf.
 Rules: declarations are static "never works" facts — a runtime prefill
 capture failure is FATAL (no silent eager degrade: a family that cannot
 capture must declare it, or the boot dies). Resolution is device-side at startup and
-class-attribute-driven, so every DP rank derives the same answer
+driven by class attributes or by instance declarations derived from replicated
+configuration, so every DP rank derives the same answer
 (event-loop.md). `disable_prefill_graph` in the config carries user intent
 only. `decode_graph=False` still requires `refresh_decode_metadata` and
 `init_cuda_graph_state` — eager decode runs the same unified path.
@@ -730,6 +774,58 @@ respects both deterministic and batch-invariant collective settings. Empty
 consumer rows carry no deferred post. Cache-only narrowing completes the incoming
 post before the global KV producer and skips new HC mixes; idle ranks still
 participate in expert-owned dispatch/combine, which never defers another reduction.
+
+### Drafter prefill graphs
+
+With `--enable-drafter-prefill-graph` the drafter's work inside an extend
+forward replays from graphs too. The drafter declares what it records
+(`BaseDrafter.extend_graph_plan`), and the capture and the CUDA-graph memory
+projection read that one plan: Eagle's step 0 per target token bucket at each
+exact request count of `--prefill-graph-capture-batch-sizes`
+(`prefill:drafter-step0`), and its decode steps per request count
+(`prefill:drafter-decode`). They are breakable graphs in one private pool,
+apart from the target's prefill and decode pools. Their static buffers (the
+target's hidden rows at the largest bucket) are allocated outside the
+measured windows, like the target graph's static outputs, so the utilization
+headroom funds them. A drafter's single prefill graph of its own
+(`captures_prefill_graph`, the `prefill:drafter` ladder) is a separate hook
+with its own contract.
+
+Step 0 is token-shaped up to the narrowing and one row per request after it,
+so its graph pads the rows to the bucket and bakes the request count. The
+sequence mixers stay at their breaks (the QSA indexer, `PagedAttention.attend`),
+and so do the drafter steps that publish backend state a later break reads:
+the accepted-prefix publication, and per decode step the top-k reset, the
+seq_lens advance and the write window (`run_eager`). Recorded into a segment
+they would pin per-forward host state to the capture's batch (the indexer
+backend's active metadata, the router's published window). Step 0's context
+is one fixed object per (bucket, requests); the replay stages its inputs into
+static buffers (the target's hidden rows with a zero tail, the gather rows,
+the frontier), and its outputs land in static buffers the decode steps read.
+The draft prologue writes K/V inside a captured segment, which holds no
+per-layer Host-load wait, so a step-0 replay first waits for the draft pool's
+whole Host load, as the target's replay does. These captures run each segment
+as soon as it is captured (`run_segments_while_capturing`): their breaks index
+with values a segment computes (the top-k rows the narrowing gathers, the
+decode steps' positions), which a capture alone leaves unwritten when the
+break runs.
+
+A round replays only what the graphs baked: a pure extend (MIXED rounds run
+eager), no attention DP or query shard, a fitting bucket at the exact request
+count (a round over the largest bucket still replays the decode steps). Only a
+chain drafter on one rank, without a draft sampler, token history or a top-k
+carried across steps, over a draft model that declares
+`supports_breakable_draft_extend` (its draft backend also attends in the mode
+a break passes it), captures at all. `ServerArgs` refuses the switch for the
+launches its arguments rule out, and `ModelExecutor` for a boot whose plan is
+empty.
+
+A replay is not bit-identical to a serving-time eager round in general. The
+graphs keep the kernels startup dispatch chose for them, as the decode graphs
+do: small-M BF16 GEMMs route to FlashInfer only before serving
+(`compile_monitor.is_serving`). A padded replay also runs the token-shaped
+kernels at the bucket's row count, where a kernel may pick its implementation
+or tactic by row count, as the target's padded replays do.
 
 ### Prefill requests without generated outputs
 
@@ -947,6 +1043,17 @@ graph records. `SamplingBatchInfo.is_all_greedy` and the eager-only argmax
 branches were deleted. Equivalence (top_k=1 == argmax, ties excepted) is
 pinned by `test/runtime/sampling/test_greedy_route_equivalence.py`.
 
+Admission uses the selected sampling backend's finite top-k bound. GPU
+backends retain the exclusive 128 bound. `ascend_full` accepts positive
+finite values and caps them at 4096 when populating its per-request scalar
+pool, before the int32 write. The normalized disabled sentinel (`top_k=-1`)
+keeps whole-vocabulary sampling. The captured graph reads that same pool
+for single-step sampling and chain verification.
+Ascend sampling consumes the logits already audited and sanitized by the
+executor's `NanGuard`; it does not repeat a host-side NaN truth test inside
+the captured graph. Per-request numerical error flags keep their existing
+executor and output-processor path.
+
 Synthetic acceptance length shares executor scheduling, logit processing,
 persistent output buffers and downstream state updates with ordinary
 verification. Only the greedy sampler supports this benchmark mode. It runs
@@ -1018,6 +1125,11 @@ predicts position 2049 whether computed as `1024 + 1024 + 1`,
 `130 cached + 1024 + 895`, or 2048 cached tokens plus one decode input.
 Constructing the base position does not implement MTP acceptance/residual RNG
 or domain separation; multi-token FlashInfer still uses its existing coins.
+The Triton chain verify under `--enable-speculative-sampling` (DFLASH with a
+DFlash2 draft) keys its accept coins and draft noise by salted offsets
+disjoint from these positions. A row with a recorded draft q then emits an
+exact sample of the same distribution, not the position-keyed draw. Greedy
+rows and rows without a q keep the position-keyed token.
 
 With `sampling_stream=per-request`, FlashInfer and FlashInferFull route both
 `sample()` and `verify(N=1)` through the existing Gumbel pool kernel, keyed by
@@ -1117,10 +1229,14 @@ computes, the rest reuse, and nothing outlives its forward; the
 drafter's in-loop seq_lens edits are not a new forward and leave the share
 alone — the drafter itself
 hands each draft step the top-k it reuses (or clears it) through the draft
-backend, and starts from the target backend's. `ForwardContext` carries
-none of this. What unification still can NOT test: mempool reuse and
-hostfunc semantics — the e2e regression matrix keeps graph-on and graph-off
-configurations for this reason.
+backend, and starts from the target backend's. The MHA leaf's decode
+split schedule (`decode_schedule_buf`, read by gfx950 verify) is the same
+kind of memo: its decode refresh marks it stale, the first verify layer
+computes it from the forward's lengths (inside the graph under replay),
+and the rest reuse it. `ForwardContext` carries none of this. What
+unification still can NOT test: mempool reuse and hostfunc semantics — the
+e2e regression matrix keeps graph-on and graph-off configurations for this
+reason.
 
 ## Backend package layout
 
@@ -1350,11 +1466,11 @@ vocabulary is fixed, with exactly one conversion point:
 | layer | sees | never sees |
 |---|---|---|
 | C++ scheduler | per-group `BlockTable`s: rows in `block_granularity` logical index, entries are `CacheBlock` ids | kernel pages, backends |
-| bridge (`CacheBatchMetadata`) | contract-ordered group ids; `{gid: [bs, W_g]}` views over one packed int32 upload | pages, backends |
+| bridge (`CacheBatchMetadata`) | contract-ordered group ids; `{gid: [bs, W_g]}` views over one packed int32 table, uploaded once as each row's span from the scheduler (its released prefix's null holes and its padding stay behind) and rebuilt on the device | pages, backends |
 | **`CacheGroupRouter`** | attention group geometry (`CacheGroupGeometry`), each leaf's `kernel_page_size`, expansion, padding, and KV write-location slot math | kernel calls |
 | `QSAIndexerBackend` | its raw compressed/recent group tables, query lengths, full-KV address view, and private verify workspace | MHA leaf metadata, persistent cache allocation |
 | `Qwen4ExpPLEBackend` | its PLE state table, input/output state blocks, and verify workspace | Mamba metadata and verify context, persistent cache allocation |
-| paged leaf (`PagedAttentionBackend`) | `page_table` (kernel pages, batch-ordered, padded), `seq_lens`, `out_cache_loc`; under a query shard, or on an extend with a prefix when its group is KVP page-sharded, also `page_table_cpu`, the host mirror of its extend rows, for page-owner counts | groups, block tables, contracts, draft/target table provenance |
+| paged leaf (`PagedAttentionBackend`) | `page_table` (kernel pages, batch-ordered, padded), `seq_lens`, `out_cache_loc`; under a query shard, or on an extend with a prefix or a pure extend when its group is KVP page-sharded, also `page_table_cpu`, the host mirror of its extend rows, for page-owner counts | groups, block tables, contracts, draft/target table provenance |
 | state consumers (Mamba/KDA, Inkling conv, V4.1) | their own groups' raw `block_tables[gid]` (block vocabulary) | other groups' tables, runner padding |
 
 The runner (`ForwardStepRunner`) does one thing with tables: hand the
@@ -1393,7 +1509,9 @@ null page 0.
 The bridge's `{gid: view}` dict is the router's input; the router does not
 require the views to share one storage, only the one-launch fill does. The
 executor pads stopped requests' state rows in place
-(`RuntimeStates.masked_state_tables`), so the views stay in that storage.
+(`RuntimeStates.masked_state_tables`), so the views stay in that storage;
+the bridge packs the state groups last and end to end, so that padding is
+one launch for every state group.
 The slot math lives in
 `paged/write_locations.py` as pure functions with one invariant: `slot = table[req, pos // P] * P + pos % P` is page-size
 invariant, so locations computed over the kernel-page stack equal
@@ -1633,8 +1751,8 @@ them. This responsibility is fixed at construction, not inferred from a
 per-round readiness flag. The producer enqueues writes before the drafter on
 the same stream; failures propagate instead of selecting a fallback writer.
 The common block drafter always updates accepted-prefix lengths, but only
-projects/writes context when no producer is configured. Its optional auxiliary-stream writer is disabled for a forward with
-this producer, avoiding a second writer or a missing stream dependency.
+projects/writes context when no producer is configured. Its capture sink
+is not armed for a forward with this producer, avoiding a second writer.
 The final PD readiness barrier remains after the whole proposal call, since
 proposal execution can write the same draft fields after context injection.
 
@@ -1647,15 +1765,20 @@ seam is `BaseDrafter.prepare_target_forward(ctx)`, called right before the
 target runs: the drafter decides under its own gate whether this round
 qualifies and attaches what it needs; a fresh context per round means
 nothing outlives it, and a model that sees no attachment does nothing.
-DFLASH is the one user: its incremental projection attaches
+DFLASH is the one user: on decode-only rounds it attaches
 `ctx.target_capture_sink`, the target hands each captured tap to
-`on_target_capture` as it is produced, and the sink accumulates the
-draft's `fc` projection on the aux stream so the draft KV is written under
-the target's remaining layers. The arming gate is the same
-`_overlap_allowed` the drafter's `run` decides the overlap path by, so a
-round can never be armed on one side and drained on the other. These hooks
-consume the target's capture configuration; they do not change the tap
-selection or output layout.
+`on_target_capture` as it is produced, and the sink copies it (rounding a
+wider residual once) into its columns of one tap block. The last tap runs
+the same context projection and KV write as the drafter's `run` would on
+the concatenated taps, inline on the forward's stream: `fc` is split by
+output columns across attention TP, so the projection reads 1/TP of the
+weight and gathers the columns in order with the target's own
+collectives. No auxiliary stream is involved, so a capture point must
+hold no borrowed collective output the gather could overwrite. `run`
+writes the context itself only for a round the sink did not take, and
+refuses one it armed but never saw complete. These hooks consume the
+target's capture configuration; they do not change the tap selection or
+output layout.
 
 The reverse direction rides on the context as well: a target that captures
 its taps on a row subset reports it as ctx.captured_rows
@@ -1692,9 +1815,15 @@ builder. Decode-only refresh/capture remains unchanged and carries no
 prefill convolution schedule. Breakable prefill graphs consume the live
 metadata in the eager attention break, as ordinary eager forwards do.
 
+Prefill convolution returns `[channels, tokens]` with contiguous channels per
+token, independent of the input strides. Transposing to `[tokens, channels]`
+and splitting the packed channels can therefore remain views.
+
 Prefill state staging fuses resumed conv-window copying, recurrent-state
-gather/zero, and history flags in one kernel. It preserves scheduler-owned
-block ids and arbitrary cache strides. Fresh rows never read null or stale
+gather/zero, and history flags in one kernel. KDA gathers directly into FP32
+scan state, including from BF16 cache storage; final writeback casts to the
+cache dtype. It preserves scheduler-owned block ids and arbitrary cache strides.
+Fresh rows never read null or stale
 recurrent state; their conv working windows remain unchanged. Shared input
 snapshots are read-only, output blocks are unique, and a private in-place
 source/destination is legal. This changes neither scan arithmetic nor cache
@@ -1718,8 +1847,9 @@ GEMM arithmetic.
 ### Capturing recurrent layers in the outer graph
 
 `CapacityPrefillBackend` (`state/prefill_capacity.py`) owns this contract for
-KDA, Mamba2, and GDN; each subclass only states which forwards it admits and whether
-uncaptured shapes also run the capacity layout.
+KDA, Mamba2, and GDN; each subclass only states which forwards it admits, whether
+uncaptured shapes also run the capacity layout, and whether that layout stores
+in-forward State checkpoints.
 Supported pure-extend forwards use `prepare_prefill_metadata` before eager
 execution, startup capture, and replay. This consumer-stream seam builds or
 refreshes `CapacityPrefillMetadata` with the selected token and request capacities.
@@ -1748,6 +1878,26 @@ its launch from the sequence count and reads the bounds on device
 Mamba2, uncaptured shapes keep the scheduler metadata. The scan chunks each
 sequence from its own start, so captures of any request count match eager bit
 for bit.
+
+A forward writing in-forward State checkpoints
+(`--enable-state-checkpoint-in-forward`) runs inline too: GDN is told the flag
+at construction, and its capacity metadata then keeps one fixed checkpoint slot
+per request slot (a row writes at most one). The captured scan stores a state
+at every page of the bound pool's prefix granularity, which divides every
+checkpoint offset, into one float32 scratch that all shapes share (forwards
+run in stream order), with a row per page of the widest captured token
+capacity. Before each use the refresh rewrites, in one pinned upload and a
+few device copies, each sequence's state count and each live checkpoint's
+scratch row, token index and block; an unused slot keeps an in-range token
+index and block `-1`, which the masked writers of the conv window and the
+recurrent state skip. The stored states are the scan's own, so the checkpoint
+blocks match eager bit for bit; the cost is the extra scratch writes and the
+shared scratch. A backend without the flag, and every other family, keeps such
+a forward on its live metadata at the eager break.
+
+Qwen4-Exp's composite passes these seams to its attention child, so its GDN
+layers run inline; PLE and the QSA indexer keep their breaks over their own
+live metadata.
 
 For retained shapes, the hybrid wrapper can omit the KDA attention break and
 capture neighboring projections, KDA kernels, and post-attention compute together.
@@ -1826,7 +1976,8 @@ host lengths and GPU boundaries still agree. Its `PrefillCapacity` validates
 the packed bounds it builds. For KDA, an explicit
 `KdaPrefillCapacity` passed to the kernel facade admits the live CPU lengths:
 each sequence may fill the bucket, but their combined tokens must also fit it.
-The CuTeDSL adapter alone converts this descriptor to native planning bounds.
+The CuTeDSL adapter converts this descriptor to native planning bounds;
+cuDNN plans from tensor capacities and reads live boundaries on the device.
 Convolution maps reserve `ceil(token_capacity / block_m) + sequences - 1`
 programs, bounding the sum of per-request rounded lengths without reserving
 the entire token bucket for every request. One GPU metadata refresh
@@ -1850,11 +2001,16 @@ global functions or changing scan arithmetic. Routing and workspace partition
 rules remain owned by the native host. Unsupported layouts retain the public
 wrapper's capacity preparation.
 
-The preparation copies every input with its capacity padding scrubbed: the
+The CuTeDSL preparation copies every input with its capacity padding scrubbed: the
 gate projection can produce undefined padding, and the inline path has no
 handoff copy to clean it. Per-call plan and scratch tensors belong to the
 active graph pool or eager invocation; they are not a mutable process-global
 plan shared across replay streams.
+
+The cuDNN adapter reuses FlashInfer's cached plans and workspace, warmed by the
+existing startup capture loop. Replay matches eager execution at the same
+capacity bitwise; different capacities can select different scan partitions
+and therefore differ by floating-point rounding.
 
 Changes to this capacity contract require validation of full-model overlap,
 memory use and performance in addition to kernel correctness.
@@ -1866,17 +2022,49 @@ attn.tp_size == attn.kvp_size`) shards every extend forward of a PD prefill
 engine over the attention TP group, over the pages `--kv-parallel-size N`
 shards. One forward, one path: the scheduler plans the whole
 chunk on every rank, the executor builds a `QueryShardPlan` from the request
-lengths (`execution/query_shard.py`: `row_counts = scatter_count(total, N)`
-— the reduce-scatter / all-gather split, so the `CommManager` row tables
-already describe the shard and the final gather needs no permutation; rank
-order is request order) and puts it on `ForwardContext.query_shard`. The
-model's rows are then `input_ids_buf[start:end]`, `positions_buf[start:end]`
-and the same slice of every per-row input; per-request inputs keep the whole
-batch with `RequestTokenHistoryView.row_offset = start`; a pipeline stage's
-boundary bundle carries shard rows. `ctx.input_num_tokens` and
+lengths (`execution/query_shard.py`) and puts it on
+`ForwardContext.query_shard`. The shard is zigzag per request: every
+request's new rows are cut into `2N` near-equal segments and rank `r` takes
+segments `r` and `2N - 1 - r` of every request, so every rank holds an early
+and a late part of sufficiently long requests — under causal attention the
+two approximately balance. Short requests can leave ranks empty; those ranks
+still join every history collective.
+A contiguous split of the chunk would hand whole requests to single ranks
+and serialize the group-by-group history gathers behind whichever rank owns
+the group's rows. A rank's rows are ascending span rows but not one range:
+the model's rows are `input_ids_buf[plan.local_row_ids]`,
+`positions_buf[plan.local_row_ids]` and the same rows of every per-row
+input; per-request inputs keep the whole batch; a pipeline stage's boundary
+bundle carries shard rows. The collectives over the shard group concatenate
+the ranks' rows rank by rank (*gather order*, `plan.span_to_gather_cpu`), with
+the per-rank counts `plan.row_counts` as the `CommManager` row tables: a leg
+that only moves or sums rows (the dense and MoE legs, the head exchanges,
+the embedding's id gather and row reduce-scatter) works in that order
+unchanged, and whoever reads gathered rows by their span position — the KV
+and index-K writes by slot, the n-gram hash, the sampled and prompt rows of
+the exit — puts them in span order first (`plan.to_span_order`, or the
+`RowSplit` of `plan.split_rows`), one `index_select` of bytes. `ctx.input_num_tokens` and
 `global_num_tokens` keep the scheduler's full-chunk meaning: only collective
-sizing (`CommManager`, `models/base/comm_ops.py`) reads them, a model reads
-its rows from its tensors or `ctx.query_shard`.
+sizing (`CommManager`) reads them, a model reads its rows from its tensors or
+`ctx.query_shard`.
+
+Plugin API 4 replaces the contiguous query-shard contract with per-request
+zigzag rows. Plugins must declare support for API 4 after migrating their
+row-layout and request-history consumers; API 3 adapters are incompatible.
+`QueryShardPlan.from_forward` requires an explicit `device` for its row
+indices (use `device="cpu"` for host-only plans).
+The CPU permutation tables are `span_to_gather_cpu` and `gather_to_span_cpu`;
+their target-device copies are `span_to_gather` and `gather_to_span`.
+
+Adapter migration: a query shard no longer exposes a contiguous range
+(`local_slice`, `local_start`, `local_end`). Use `local_row_ids` for device
+row selection and `local_row_ids_cpu` for host planning. Consumers of
+`RequestTokenHistoryView` must use the full request layout together with
+`ctx.query_shard`; `row_offset` cannot represent a zigzag shard. Upgrade
+adapters that rely on those fields together with the runtime. A row gather
+returns rank-major rows, so position-dependent consumers must restore span
+order before reading them; span-order partials must be put in gather order
+before reduce-scatter.
 
 The contract a model (in tree or a plugin) implements:
 
@@ -1907,23 +2095,25 @@ The contract a model (in tree or a plugin) implements:
 * `PagedAttention.latent_prologue(..., key_rows=QueryShardGather(ctx.query_shard,
   mapping.attn.qcp_group))` (through `DeepseekV3AttentionMLA.forward_absorb_qkv_proj`
   automatically): the prologue rotates the local rows without a cache
-  (`mla_prologue(cache=None)`), all-gathers the rotated latent to the whole
-  span with the plan's row counts and stores it owner-masked
+  (`mla_prologue(cache=None)`), all-gathers the rotated latent with the
+  plan's row counts, puts it in span order and stores it owner-masked
   (`latent_store`); `slots` is the whole span. A rank whose shard is empty
   rotates nothing but joins the gather and the store, so a model must reach
   the prologue (and every other QCP collective: the index-K gather, each
   group's history gathers) with zero rows rather than return early; the
   dense MLA path (`DeepseekV3AttentionMLA.forward`, the expanded prologue)
   refuses a shard up front. Index-K the model gathers the same way
-  (`token_all_gather` of the local keys before quantization) and writes
-  with the owner mask.
+  (`token_all_gather` of the local keys before quantization, then span
+  order) and writes with the owner mask.
 * GPU DSA (`backends/paged/dsa.py`): `init_forward_metadata` builds a
   `DSAQueryShardMetadata` — request groups whose summed history fits the
   gather workspace (one whole history, reserved from the cache budget by the
   recipe's `workspace_bytes`, allocated once on the target tree by
   `registry._prepare_fixed_workspaces` and shared with the draft tree, whose
   extend step never gathers concurrently), each with its `row_base` in the request-major
-  history-row numbering, this rank's `local_query` slice, and a
+  history-row numbering, this rank's `local_query` slice (a rank's rows
+  are in request order, so a request range is one run of them; the counts
+  come from `plan.local_rows_per_request`), and a
   `HistoryGatherPlan` (per-owner row counts from `page_table_cpu`,
   `dcp/placement.py: owned_history_rows`). For the indexer the model calls
   `backend.gather_history_index_k(layer_id, pool, group)` per group, which
@@ -1952,15 +2142,26 @@ The contract a model (in tree or a plugin) implements:
   `forward_sparse_prefill(topk_slots=<workspace rows>)` the local rows;
   the arm gathers every group's KV (`gather_history_kv`, a collective every
   rank joins even without rows in the group) and attends the local rows with
-  every head, `return_lse=False`, no combine. The gathered buffer handed to
+  every head, `return_lse=False`, no combine. Latent KV stays in the padded
+  rank-major layout of the equal-share history gather: position `p` lives at
+  `gathered_index[p]`. The arm maps each nonnegative top-k workspace row within `topk_lens`
+  through `gathered_index[row - group.row_base]`, retaining the emitted order
+  and the `-1` sentinel. Index-K remains in position order for causal scoring.
+  The position-to-row map and padded send slots belong to `HistoryGatherPlan`;
+  this requires the equal-share history-gather planner. The mapped indices
+  must not be sorted by physical row: sparse cores preserve the supplied
+  selection order, including when `slot_order="sorted"` denotes position order.
+  The gathered buffer handed to
   `dsa_prefill` as a flat `[slots, dim]` cache is a whole number of kernel
   pages (the workspace rows are padded by
   `dsa_history_gather_workspace_rows`), so the paged solutions' view of it
   holds too and no solution is wrong at runtime; the padding rows are never
-  selected. The history gathers move any row dtype (uint8 index-K rows
-  packed in the plane's format -- FP8 bytes then fp32 scales, or bf16 key
-  bytes -- fp32 scales, fp8 latent) as bf16 pairs of their bytes, since the
-  token all-gather's low-latency solution is bf16-only; the workspace
+  selected. Its capacity covers `degree * send_rows` rounded to kernel pages;
+  if owner padding exceeds the reserved workspace, the latent gather uses a
+  temporary buffer of that size for the group. Latent rows move as uint8 bytes
+  directly into that buffer, without a position-order read-back. The index-K
+  history gather remains separate. Both gathers preserve row bytes, including
+  FP8 latent values and packed index-K keys with their scales. The workspace
   (`HistoryGatherWorkspace`, `index_k_format` recorded, rows of
   `index_k_row_bytes(head_dim, format)`) is sized by the recipe and
   allocated by the leaf from the same formula; the recipe refuses a draft
@@ -1990,7 +2191,8 @@ The contract a model (in tree or a plugin) implements:
   first, then selects the sampled rows — `hidden_states[gather_ids]` on
   whole rows, `gather_sampled_rows` over the group on a shard (one
   byte-preserving all-gather, `token_all_gather_rows`, with
-  `sampled_rows_per_rank`; rank order is request order) — and runs the LM
+  `sampled_rows_per_rank`, then `plan.sampled_to_request` back to request
+  order) — and runs the LM
   head on the batch's `[bs, hidden]` rows, so the vocab all-gather is the
   TP one. The group of both gathers is the processor's TP group: the LM
   head is vocab-sharded over it, every rank of it must end with the same
@@ -2007,11 +2209,12 @@ The contract a model (in tree or a plugin) implements:
   model cannot serve prompt logprobs, sharded or not. `ctx.gather_ids`
   keeps the batch's full layout on every forward, the
   drafters' extend steps included (Eagle's step 0 and every depth of the
-  multi-depth `Mtp` drafter read the shard's slice of the shifted prefill
+  multi-depth `Mtp` drafter read the shard's rows of the shifted prefill
   ids and positions, chain the shard's hidden rows, and carry the plan on
   their context; `Mtp` sums its cross-chunk stash of target hiddens over
-  the group, one owner per row): `QueryShardPlan.local_sampled_ids(
-  ctx.gather_ids)` is the one place that cuts them to the shard, used by
+  the group, one owner per row). The plan derives `local_sampled_index`
+  from each request's last row; QCP consumers read it directly instead of
+  passing full-layout gather ids into a shard-local selector. It is used by
   `gather_sampled_rows` and by any model that narrows to its live rows
   itself. A draft model's FULL capture under a shard is the shard's rows,
   which is what the next depth consumes.
@@ -2020,15 +2223,15 @@ The contract a model (in tree or a plugin) implements:
   plan's targets and slots on every rank (the shifted ids are the whole span
   everywhere, so the target audit flags the same requests on every rank)
   and keeps as this rank's `InputLogprobRows.rows` the plan's rows inside
-  its shard, re-based to it; the plan's rows are sorted, so each rank's are
-  one contiguous run and the per-rank counts (`rows_per_rank`) are host
-  arithmetic over the shard boundaries (`QueryShardPlan.rows_per_rank`,
-  `local_rows_run` — the one row split of the plan, the same that counts
-  the sampled rows per rank; it refuses unsorted rows rather than miscount
-  them). Scoring a row needs its full-vocabulary logits, and
+  its shard, as indices into it, with the per-rank counts (`rows_per_rank`)
+  and the index that restores plan order after the gather
+  (`gathered_to_rows`): host arithmetic over the shard's row tables
+  (`QueryShardPlan.split_rows` — the one row split of the plan, the same
+  that splits the sampled rows). Scoring a row needs its full-vocabulary
+  logits, and
   the head is vocab-sharded over the group: every rank must hold every
   planned row, so `compute_input_token_logprobs` all-gathers the planned
-  rows' activations with those counts (`[plan rows, hidden]`, rank order is
+  rows' activations with those counts (`[plan rows, hidden]`, put back in
   row order — a rank without a planned row contributes none and still
   joins) and then runs the unsharded chunk loop over the whole plan on
   every rank; the chunk schedule is thereby the same on every rank, which
@@ -2107,13 +2310,18 @@ head TP: only the absorbed sparse prefill can take the exchange. The
 alternative to this fork — sharding the drafter's decode rows by a plan too,
 so every forward exchanges — needs a sharded DSA decode arm (history gathers
 for decode rows) that does not exist; the fork is the contained form until
-it does. The decode-only gates of the attention-DP
-layout (`disaggregation_mode == "decode"`, the decode-shaped autotune; a
-retracted request restores rather than recomputes, so no admission rule is
-needed) key on
-`mapping.attn.head_tp_serves_decode_only`, which is False over the query
-shards; the prefill role's own rules (`validate_qcp`) and the mapping (`head
-TP == qcp`) gate this layout.
+it does. `mapping.attn.head_tp_serves_decode_only`, which is False over the
+query shards, requires the Decode role for head TP without QCP. The prefill
+role's own rules (`validate_qcp`) and the mapping (`head TP == qcp`) gate
+the sharded Prefill layout.
+
+Startup chooses its forward from the engine role. Every disaggregated Decode
+worker warms the existing Decode path at its maximum Decode batch, including
+ordinary TP and TP1 attention DP. It reserves no Prefill graph buckets and never
+captures an extend-shaped graph, even if a Prefill graph limit was supplied.
+Remote admission and snapshot restore do not execute local Prefill. Prefill
+workers and aggregated engines retain their extend warmup; disabling autotune
+disables tactic profiling, not the role's warmup traversal.
 
 Eager only: the history gather runs in the attention break, so the GPU DSA
 backend declares `CudaGraphSupport(prefill_graph=False)` under a query shard
@@ -2153,8 +2361,10 @@ Principle 5).
   signature conformance.
 * `test/runtime/execution/test_draft_target_wiring.py` — the drafter's
   target-forward hook: DFLASH arms its capture sink on the context only
-  under its overlap gate (not on mixed rounds, not in graph warmup), the
-  sink folds the taps into the projection and writes the KV once; the
+  on decode-only, non-idle rounds, the sink concatenates the taps and
+  writes the context once at the last tap
+  (`test_dflash_context_projection.py`: bit for bit what the projection of
+  the concatenated taps writes, with `fc` split across attention TP); the
   executor calls the hook before the target forward
   (`test_model_executor_cache_state.py`); the target hands taps to the
   forward's sink in concat order (`test_dspark_config.py`).
@@ -2280,10 +2490,14 @@ sequence-parallel router projections have nonempty, equal local row counts.
 A single-request TP warmup can skip a GEMM on an empty peer while another
 peer waits in distributed tactic selection. The draft remains in the same
 autotune context as the target. Serving batches and graph capture sizes are
-unchanged. A speculative decode service must reserve at least one request
-per attention TP peer: `max_num_seqs // data_parallel_size >= attn_tp_size`.
-Server-argument validation rejects smaller capacities before allocating
-buffers or running a forward, including with `--disable-autotune` (which
-disables profiling, not startup warmup). Increase `--max-num-seqs` to at
-least `data_parallel_size * attn_tp_size`. Prefill-only roles do not run
-this draft decode warmup and are exempt.
+unchanged. On NVIDIA, a speculative decode service must reserve at least one
+request per attention TP peer: `max_num_seqs // data_parallel_size >=
+attn_tp_size`. Server-argument validation rejects smaller capacities before
+allocating buffers or running a forward, including with `--disable-autotune`
+(which disables profiling, not startup warmup). Increase `--max-num-seqs` to
+at least `data_parallel_size * attn_tp_size`. Prefill-only roles do not run
+this draft decode warmup and are exempt. Other platforms run no FlashInfer
+tuning, so startup tuning has no cross-rank collectives: the draft decode
+warmup uses `min(attn_tp_size, max_decode_bs)` requests, and an empty peer
+skips its GEMMs as it does when serving fewer requests than peers. Decode
+state stays sized by `--max-num-seqs`.

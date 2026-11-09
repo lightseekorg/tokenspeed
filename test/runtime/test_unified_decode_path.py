@@ -403,6 +403,80 @@ class TestWrapperForwardsTheExtendBundleTest(_TorchCase):
             assert _pytest_expr1_3 is _pytest_expr2_4, _pytest_msg_5
 
 
+class TestInklingConvTablesRefreshTest(_RouterCase):
+    """The Inkling wrapper refreshes every conv group's persistent table in
+    place: live rows from the step's tables, padding rows at -1."""
+
+    def test_refresh_copies_live_rows_and_pads_the_rest(self):
+        from tokenspeed.runtime.configs.inkling_config import InklingModelConfig
+        from tokenspeed.runtime.layers.attention.backends.specific.inkling import (
+            InklingAttnBackend,
+        )
+        from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
+        from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
+
+        torch = self.torch
+        config = AttnConfig(
+            components=(
+                MHAConfig(
+                    backend_name="fa2",
+                    num_attention_heads=1,
+                    num_kv_heads=1,
+                    head_dim=2,
+                    attn_tp_size=1,
+                    cache_layer_types=(),
+                ),
+            ),
+            device="cpu",
+            dtype=torch.bfloat16,
+            kv_cache_dtype=torch.bfloat16,
+            kv_cache_quant_method="none",
+            kv_cache_mxfp8=False,
+            kernel_page_size=2,
+            context_len=MAX_NUM_PAGES * 2,
+            max_bs=MAX_DECODE_BS,
+        )
+        text = InklingModelConfig(
+            hidden_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=1,
+            num_key_value_heads=1,
+            head_dim=2,
+            use_sconv=True,
+            sconv_kernel_size=4,
+        )
+        wrapper = InklingAttnBackend.from_config(
+            self.router,
+            text,
+            config,
+            num_layers=1,
+            is_draft=False,
+            enable_layerwise_cache_ready=False,
+        )
+        groups = ("kvconv", "hiddenconv_a", "hiddenconv_b")
+        wrapper.conv_columns = {"groups": groups, "pd_endpoint_snapshots": False}
+        wrapper.init_cuda_graph_state(MAX_DECODE_BS)
+        live = {
+            g: torch.arange(4, dtype=torch.int32).reshape(2, 2) + 10 * i
+            for i, g in enumerate(groups)
+        }
+
+        # Two live requests in a four-row graph batch.
+        wrapper.refresh_decode_metadata(
+            LADDER_BS,
+            2,
+            torch.arange(LADDER_BS, dtype=torch.int64),
+            torch.tensor([5, 4, 1, 1], dtype=torch.int32),
+            forward_mode=ForwardMode.DECODE,
+            block_tables={**self._tables(2), **live},
+            for_graph_replay=True,
+        )
+        tables = wrapper.conv_decode_metadata.col_block_table
+        for g in groups:
+            torch.testing.assert_close(tables[g][:2], live[g])
+            assert (tables[g][2:LADDER_BS] == -1).all()
+
+
 class TestGraphPtrGuardWalkTest(_TorchCase):
     """Walk semantics of graph_ptr_guard on a stub backend (no kernels)."""
 

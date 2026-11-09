@@ -181,7 +181,8 @@ CacheCoordinator MakeAdmissionCoordinator(BlockPool& pool) {
     };
     return MakeCoordinator(specs, /*prefix_granularity=*/4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                            /*snapshot_pool=*/nullptr,
-                           /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+                           /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false,
+                           /*checkpoint_retention_requests=*/0);
 }
 
 void FillAdmissionCache(CacheCoordinator& coordinator, BlockPool& pool, std::int32_t pool_size) {
@@ -206,7 +207,8 @@ void MeasureAdmission(std::int32_t pool_size, std::int32_t iterations) {
     std::array<GroupDemand, 1> no_demand{GroupDemand{.table = &table}};
     Measure("admit_no_demand_cached_pool", pool_size, 0, iterations, [&] {
         const std::optional<CacheCoordinator::AdmissionResult> result = coordinator.Admit(
-            coordinator.ProbePrefix({}), no_demand, RequestProgress{},
+            coordinator.ProbePrefix({}), no_demand, RequestProgress{}, /*copy_in_blocks=*/{},
+            /*copy_in_point=*/std::nullopt,
             /*request_access_epoch=*/std::nullopt, /*evict_blocks_past_segments=*/false, /*session_id=*/{});
         if (!result) {
             std::abort();
@@ -218,7 +220,8 @@ void MeasureAdmission(std::int32_t pool_size, std::int32_t iterations) {
     std::uint64_t next_key = static_cast<std::uint64_t>(pool_size);
     Measure("admit_small_demand_evict_and_restore", pool_size, 1, iterations, [&] {
         const std::optional<CacheCoordinator::AdmissionResult> result = coordinator.Admit(
-            coordinator.ProbePrefix({}), demand, RequestProgress{},
+            coordinator.ProbePrefix({}), demand, RequestProgress{}, /*copy_in_blocks=*/{},
+            /*copy_in_point=*/std::nullopt,
             /*request_access_epoch=*/std::nullopt, /*evict_blocks_past_segments=*/false, /*session_id=*/{});
         if (!result) {
             std::abort();
@@ -260,7 +263,8 @@ void MeasurePinnedAdmission(std::int32_t pool_size, std::int32_t iterations) {
     BlockTable table;
     const std::array demand{GroupDemand{.table = &table, .extent = DenseGrowth{4}}};
     Measure("admit_small_demand_all_pinned", pool_size, 1, iterations, [&] {
-        const auto result = coordinator.Admit(coordinator.ProbePrefix({}), demand, RequestProgress{}, std::nullopt,
+        const auto result = coordinator.Admit(coordinator.ProbePrefix({}), demand, RequestProgress{},
+                                              /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, std::nullopt,
                                               /*evict_blocks_past_segments=*/false, /*session_id=*/{});
         if (result) {
             std::abort();
@@ -286,9 +290,10 @@ void MeasureHostBlockAcquisition(std::int32_t pool_size, std::int32_t iterations
         CacheGroupSpec{
             .attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
     };
-    CacheCoordinator coordinator = MakeCoordinator(
-        specs, /*prefix_granularity=*/4, pool, /*enable_l3_storage=*/false, &host_pool,
-        /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, /*prefix_granularity=*/4, pool, /*enable_l3_storage=*/false, &host_pool,
+                        /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false,
+                        /*checkpoint_retention_requests=*/0);
     for (std::int32_t i = 0; i < pool_size; ++i) {
         CacheBlockRef block = host_pool.AcquireBlock(/*group_id=*/0);
         if (!block) {
@@ -329,7 +334,7 @@ void MeasureSparseHostBlockAcquisition(std::int32_t pool_size, std::int32_t iter
     };
     CacheCoordinator coordinator = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, &host_pool,
                                                    /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/true,
-                                                   /*write_back_evictions=*/false);
+                                                   /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     std::vector<CacheBlockRef> pins = host_pool.AcquireBlocks(0, pool_size - 1);
     CacheBlockRef cached = host_pool.AcquireBlock(1);
     coordinator.CacheHostBlock(cached, CacheKey{.group_id = 1, .content_hash = "initial", .page_offset = 0},
@@ -359,7 +364,7 @@ void MeasureMultiGroupHostBlockAcquisition(std::int32_t pool_size, std::int32_t 
     };
     CacheCoordinator coordinator = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, &host_pool,
                                                    /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/true,
-                                                   /*write_back_evictions=*/false);
+                                                   /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     for (std::int32_t i = 0; i < pool_size; ++i) {
         const auto group_id = static_cast<std::uint32_t>(i % 2);
         CacheBlockRef block = host_pool.AcquireBlock(group_id);
@@ -404,9 +409,9 @@ void MeasureSessionWithoutDeviceCheckpointAdmission(std::int32_t pages, std::int
         CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1},
         CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, kP, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true);
+    CacheCoordinator coordinator = MakeCoordinator(
+        specs, kP, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
+        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true, /*checkpoint_retention_requests=*/0);
     std::vector<std::string> hashes;
     for (std::int32_t page = 0; page < pages; ++page) {
         const std::array<std::int32_t, 2> tokens{0, page};
@@ -500,9 +505,9 @@ void MeasureSegmentAdmission(bool write_back_evictions, std::int32_t segments, s
         CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1},
         CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, kP, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/false, write_back_evictions);
+    CacheCoordinator coordinator = MakeCoordinator(
+        specs, kP, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
+        /*stream_device_cache_to_host=*/false, write_back_evictions, /*checkpoint_retention_requests=*/0);
     std::vector<std::vector<std::string>> sessions;
     const auto publish = [&](const std::vector<std::string>& hashes) {
         std::vector<BlockTable> tables(4);
@@ -603,9 +608,9 @@ void MeasureWriteBackPlan(std::int32_t admissions, std::int32_t iterations) {
         CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1},
         CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, kP, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
-                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true);
+    CacheCoordinator coordinator = MakeCoordinator(
+        specs, kP, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
+        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true, /*checkpoint_retention_requests=*/0);
     TierTransferManager transfers{coordinator};
     std::int32_t next_session = 0;
     std::vector<std::vector<std::string>> sessions;

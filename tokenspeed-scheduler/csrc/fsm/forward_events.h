@@ -54,6 +54,7 @@ struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefill
                                    ReqPoolAllocator* req_pool_allocator, PrefillSource source,
                                    CacheCoordinator* coordinator, std::vector<BlockTable> block_tables,
                                    std::int32_t hit_tokens, CacheProgress cache_progress,
+                                   std::vector<std::vector<CacheBlockRef>> copy_in_blocks,
                                    std::vector<BlockTransfer> load_pairs, bool awaits_result)
         : tokens_this_round_{tokens_this_round},
           reserve_num_tokens_in_next_schedule_event_{reserve_num_tokens_in_next_schedule_event},
@@ -63,6 +64,7 @@ struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefill
           block_tables_{std::move(block_tables)},
           hit_tokens_{hit_tokens},
           cache_progress_{std::move(cache_progress)},
+          copy_in_blocks_{std::move(copy_in_blocks)},
           load_pairs_{std::move(load_pairs)},
           awaits_result_{awaits_result} {}
 
@@ -78,6 +80,7 @@ private:
     std::vector<BlockTable> block_tables_;
     std::int32_t hit_tokens_{0};
     CacheProgress cache_progress_;
+    std::vector<std::vector<CacheBlockRef>> copy_in_blocks_;
     std::vector<BlockTransfer> load_pairs_;
     bool awaits_result_{false};
 };
@@ -201,12 +204,13 @@ struct SnapshotRetractEvent : InvalidTransitionHandler<SnapshotRetractEvent> {
     using InvalidTransitionHandler<SnapshotRetractEvent>::operator();
 
     SnapshotRetractEvent(CacheCoordinator* coordinator, std::int64_t epoch, bool resumes_generation,
-                         RetractionImage image, std::shared_ptr<SnapshotSlotIndex> blob_slot,
-                         std::vector<StoreWait> image_stores)
+                         RetractionImage image, std::vector<std::int32_t> kv_event_tails,
+                         std::shared_ptr<SnapshotSlotIndex> blob_slot, std::vector<StoreWait> image_stores)
         : coordinator_{coordinator},
           epoch_{epoch},
           resumes_generation_{resumes_generation},
           image_{std::move(image)},
+          kv_event_tails_{std::move(kv_event_tails)},
           blob_slot_{std::move(blob_slot)},
           image_stores_{std::move(image_stores)} {}
 
@@ -222,6 +226,7 @@ private:
     std::int64_t epoch_{0};
     bool resumes_generation_{false};
     RetractionImage image_;
+    std::vector<std::int32_t> kv_event_tails_;
     std::shared_ptr<SnapshotSlotIndex> blob_slot_;
     std::vector<StoreWait> image_stores_;
 };
@@ -232,17 +237,25 @@ private:
 // carries a SnapshotRestore cache op, and nothing is schedulable until its
 // ACK. The request-pool row stays with that op until then (see Restoring).
 // Nothing is out against the pages yet.
+// copy_in_blocks are the copy-in blocks the restore reserved for the resumed
+// request's prompt end (ForwardResources::copy_in_blocks), empty when it
+// resumes decoding.
 struct ScheduleRestoreEvent : InvalidTransitionHandler<ScheduleRestoreEvent> {
     using InvalidTransitionHandler<ScheduleRestoreEvent>::operator();
 
-    ScheduleRestoreEvent(CacheCoordinator* coordinator, std::vector<BlockTable> block_tables, std::uint32_t restore_op)
-        : coordinator_{coordinator}, block_tables_{std::move(block_tables)}, restore_op_{restore_op} {}
+    ScheduleRestoreEvent(CacheCoordinator* coordinator, std::vector<BlockTable> block_tables,
+                         std::vector<std::vector<CacheBlockRef>> copy_in_blocks, std::uint32_t restore_op)
+        : coordinator_{coordinator},
+          block_tables_{std::move(block_tables)},
+          copy_in_blocks_{std::move(copy_in_blocks)},
+          restore_op_{restore_op} {}
 
     Restoring operator()(Retracted&& state);
 
 private:
     CacheCoordinator* coordinator_{};
     std::vector<BlockTable> block_tables_;
+    std::vector<std::vector<CacheBlockRef>> copy_in_blocks_;
     std::uint32_t restore_op_{0};
 };
 
@@ -271,6 +284,7 @@ struct UpdateReserveNumTokensEvent : InvalidTransitionHandler<UpdateReserveNumTo
         state.SetReserveNumTokensInNextScheduleEvent(value_);
         return std::move(state);
     }
+    PdTransferring operator()(PdTransferring&& state) { return std::move(state); }
     Finished operator()(Finished&& state) { return std::move(state); }
 
 private:
@@ -316,6 +330,8 @@ struct ExtendResultEvent : InvalidTransitionHandler<ExtendResultEvent> {
         return std::move(state);
     }
     RemotePrefilling operator()(RemotePrefilling&& state) { return std::move(state); }
+    // A forward that was out when the request ended lands: nothing reads it.
+    PdTransferring operator()(PdTransferring&& state) { return std::move(state); }
 
     Finished operator()(Finished&& state) { return std::move(state); }
 

@@ -313,12 +313,12 @@ def _config_layer_fields(
     rows = prefix_granularity
     if isinstance(spec, DSAConfig):
         return _mla_layer_fields(config, rows, layer_id, occurrence) + (
-            _index_k_field(config, rows, layer_id),
+            index_k_field(config, rows, layer_id),
         )
     if isinstance(spec, MSAConfig):
         fields = _mha_layer_fields(config, rows, layer_id, occurrence)
         if local_layer_id in spec.sparse_layer_ids:
-            fields += (_index_k_field(config, rows, layer_id),)
+            fields += (index_k_field(config, rows, layer_id),)
         return fields
     if isinstance(spec, MLAConfig):
         return _mla_layer_fields(config, rows, layer_id, occurrence)
@@ -406,8 +406,14 @@ def _mla_layer_fields(config, rows: int, layer_id: int, occurrence: int):
     )
 
 
-def _index_k_field(config, rows: int, layer_id: int) -> CacheFieldSpec:
-    """The sparse indexer's key row for one layer (DSA bytes, MSA elements)."""
+def index_k_field(config, rows: int, layer_id: int) -> CacheFieldSpec:
+    """The sparse indexer's key rows for one layer (DSA bytes, MSA elements).
+
+    Args:
+        config: The attention config owning the layer.
+        rows: Token rows per cache page: the recipe's prefix granularity.
+        layer_id: The layer's id in the merged plan.
+    """
     from tokenspeed.runtime.layers.attention.configs.dsa import (
         DSAConfig,
         dsa_index_k_row_bytes,

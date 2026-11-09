@@ -30,7 +30,7 @@ server:
     --disable-cuda-graph-padding
     --trust-remote-code
     --attention-backend tokenspeed_mla
-    --kda-backend cutedsl_kda
+    --kda-backend cudnn
     --moe-backend flashinfer_trtllm
     --kv-cache-dtype fp8
     --speculative-algorithm EAGLE3

@@ -503,7 +503,11 @@ def test_compressor_query_shards_preserve_pairs_and_tails(
         if initial_tail is not None:
             backend.cache_pool.compressor_tail(owner).copy_(initial_tail)
         plan = QueryShardPlan.from_forward(
-            total_tokens=sum(lengths), input_lengths=lengths, size=4, rank=rank
+            total_tokens=sum(lengths),
+            input_lengths=lengths,
+            size=4,
+            rank=rank,
+            device="cpu",
         )
         calls = []
 
@@ -515,16 +519,16 @@ def test_compressor_query_shards_preserve_pairs_and_tails(
             assert value.dtype == torch.bfloat16
             torch.testing.assert_close(
                 value.view(projected.dtype),
-                projected[plan.local_slice],
+                projected[plan.local_row_ids],
                 rtol=1e-5,
                 atol=1e-6,
             )
             calls.append(value.shape[0])
-            return projected.clone().view(torch.bfloat16)
+            return plan.to_gather_order(projected).view(torch.bfloat16)
 
         monkeypatch.setattr(comm_ops, "token_all_gather", gather)
         actual = compressor(
-            x[plan.local_slice],
+            x[plan.local_row_ids],
             owner,
             local_meta.positions,
             local_meta.request_indices,
@@ -625,7 +629,7 @@ def test_attention_model_query_shards(monkeypatch, layer, lengths):
         backend = _backend("cuda", 2)
         backend.cache_pool.arena.buffer.copy_(before)
         plan = QueryShardPlan.from_forward(
-            total_tokens=total, input_lengths=lengths, size=4, rank=rank
+            total_tokens=total, input_lengths=lengths, size=4, rank=rank, device="cuda"
         )
         local_meta = prepare(backend, plan)
         ctx = _ctx(backend, total, ForwardMode.EXTEND)
@@ -636,20 +640,23 @@ def test_attention_model_query_shards(monkeypatch, layer, lengths):
             assert payload.dtype == torch.bfloat16
             assert counts == list(plan.row_counts)
             actual = payload.view(projected.dtype)
-            torch.testing.assert_close(actual, projected[plan.local_slice])
-            return projected.contiguous().view(torch.bfloat16)
+            torch.testing.assert_close(actual, projected[plan.local_row_ids])
+            return plan.to_gather_order(projected).view(torch.bfloat16)
 
         def gather_swa(value, group, counts):
             query_plan = row_plan.query_shard
             assert counts == list(query_plan.row_counts)
-            torch.testing.assert_close(value, swa[query_plan.local_slice])
-            return swa.clone()
+            torch.testing.assert_close(value, swa[query_plan.local_row_ids])
+            return query_plan.to_gather_order(swa)
 
         monkeypatch.setattr(comm_ops, "token_all_gather", gather_projection)
         monkeypatch.setattr(impl, "token_all_gather", gather_swa)
         outputs.append(
             attention(
-                local_meta.positions[plan.local_slice], x[plan.local_slice], ctx, True
+                local_meta.positions[plan.local_row_ids],
+                x[plan.local_row_ids],
+                ctx,
+                True,
             )
         )
         torch.testing.assert_close(
@@ -660,7 +667,7 @@ def test_attention_model_query_shards(monkeypatch, layer, lengths):
         )
     # Sharding changes GEMM/attention shapes and can change BF16 rounding.
     # Cache bytes above must still match exactly; floating outputs need not.
-    actual = torch.cat(outputs)
+    actual = row_plan.query_shard.to_span_order(torch.cat(outputs))
     torch.testing.assert_close(actual, expected, rtol=1.6e-2, atol=1e-4)
     relative_rms = (actual.float() - expected.float()).norm() / (
         expected.float().norm().clamp_min(1e-12)

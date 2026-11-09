@@ -176,7 +176,8 @@ def test_lamport_two_shot_polling_codegen(tmp_path):
     assert re.search(r"\.amdhsa_private_segment_fixed_size\s+0\b", assembly)
 
 
-def test_lamport_unspecialized_mailbox_polling_codegen():
+@pytest.mark.parametrize("output_fp32", (False, True))
+def test_lamport_unspecialized_mailbox_polling_codegen(output_fp32):
     """Readiness polls must read whole 32-bit words at any mailbox alignment.
 
     Compile the one-shot without the mailbox pointer's alignment
@@ -194,7 +195,7 @@ def test_lamport_unspecialized_mailbox_polling_codegen():
     signature = {
         "input_sym_ptr": "*bf16",
         "region_sym_ptr": "*bf16",
-        "output_ptr": "*bf16",
+        "output_ptr": "*fp32" if output_fp32 else "*bf16",
         "epochs": "*i32",
         "regions": ("i64",) * 8,
         "total_elements": "i32",
@@ -218,6 +219,7 @@ def test_lamport_unspecialized_mailbox_polling_codegen():
             "PEER_SIGNAL_STORE_CACHE": iris_arch_policy(
                 ArchVersion(9, 5)
             ).peer_signal_store,
+            "OUTPUT_FP32": output_fp32,
         },
         attrs=attrs,
     )
@@ -262,11 +264,14 @@ def _new_state(rank, device, capacity, dtype):
 
 def _check_lamport_state(rank, device):
 
-    state = _new_state(rank, device, 8 * 10752, torch.bfloat16)
+    state = _new_state(rank, device, 10 * 10752, torch.bfloat16)
     region = state.lamport.mailbox
     epochs = state.lamport.epochs
-    assert region.shape == (3, 8, 6 * 10752)
-    assert epochs.shape == (126,)
+    # Seven-row all-reduce window, wider than the MoE input gather's 64 rows of 1024.
+    assert region.shape == (3, 8, 7 * 10752)
+    assert epochs.shape == (147,)
+    # Even rows from 8 take the two-shot through its own mailboxes.
+    assert state.two_shot_region.shape == (3, 2, 8, 10 * 10752 // 1024 * 1024 // 8)
     torch.testing.assert_close(
         region.view(torch.int32),
         torch.full_like(region.view(torch.int32), -2147483648),
@@ -276,13 +281,13 @@ def _check_lamport_state(rank, device):
     # Peers may push into this mailbox as soon as they pass their own check.
     dist.barrier()
     expected_epochs = torch.zeros_like(epochs)
-    for rows in range(1, 9):
+    for rows in range(1, 11):
         widths_cases = ((3584, 7168), (7168, 3584))
         if rows in (1, 6):
             widths_cases += ((5376, 5376),)
         for widths in widths_cases:
             shapes = tuple((rows, width) for width in widths)
-            use_lamport = rows <= 6 and widths != (5376, 5376)
+            use_lamport = rows <= 7 and widths != (5376, 5376)
             inputs = state.all_reduce.acquire_outputs(shapes)
             # Distinct element/rank values, cancellation, and sentinel-valued
             # inputs. Reference uses the kernel's ascending-rank FP32 order.
@@ -313,7 +318,7 @@ def _check_lamport_state(rank, device):
     # Capture every row count, then alternate Lamport and pull without host
     # synchronization between replays. Skipped tiles retain independent epochs.
     captures = []
-    for rows in (6, 1, 7, 3, 8, 2, 5, 4):
+    for rows in (6, 1, 9, 7, 3, 10, 8, 2, 5, 4):
         inputs = state.all_reduce.acquire_outputs(((rows, 7168), (rows, 3584)))
         sources = tuple(torch.full_like(tensor, rank + 1) for tensor in inputs)
         graph = torch.cuda.CUDAGraph()
@@ -352,6 +357,48 @@ def _check_lamport_state(rank, device):
             torch.testing.assert_close(
                 output, torch.full_like(output, 36 * scale * index), atol=0, rtol=0
             )
+
+    # Attention partials share the MoE mailboxes, from producer or plain tensors.
+    for rows, owned in (
+        (8, True),
+        (15, True),
+        (9, False),
+        (12, True),
+        (1, False),
+        (4, False),
+        (7, True),
+        (2, False),
+    ):
+        generator = torch.Generator().manual_seed(500 + rows)
+        peers = torch.randn(8, rows * 7168, generator=generator).bfloat16()
+        peers[:, 3::29] = float("inf")
+        expected = peers[0].float()
+        for peer in range(1, 8):
+            expected += peers[peer].float()
+        if owned:
+            (partial,) = state.all_reduce.acquire_outputs(((rows, 7168),))
+        else:
+            partial = torch.empty(
+                (rows + 1, 7168), dtype=torch.bfloat16, device=device
+            )[1:]
+        partial.copy_(peers[rank].view(rows, 7168))
+        actual = state.reduce_attention(partial)
+        assert actual is not None and actual.data_ptr() != partial.data_ptr()
+        torch.testing.assert_close(
+            actual.flatten().cpu(), expected.bfloat16(), atol=0, rtol=0
+        )
+        moe_inputs = state.all_reduce.acquire_outputs(((8, 3584), (8, 7168)))
+        for tensor in moe_inputs:
+            tensor.fill_(rank + 1)
+        for output in state.reduce_moe(moe_inputs):
+            torch.testing.assert_close(
+                output, torch.full_like(output, 36), atol=0, rtol=0
+            )
+    wide = torch.zeros((8, 2 * 7168), dtype=torch.bfloat16, device=device)
+    assert state.reduce_attention(wide[:, :7168]) is None
+    assert state.reduce_attention(wide[:, :7000].contiguous()) is None
+    torch.cuda.synchronize()
+    dist.barrier()
 
     for capacity, expected_capacity in (
         (0, 0),

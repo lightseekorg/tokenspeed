@@ -43,11 +43,12 @@ operator modules, plus a compatibility layer over the installed
 The FA4 and CUDA imports are restricted to NVIDIA Blackwell platforms.
 """
 
+from tokenspeed_kernel._optional import has_fa4_cute
 from tokenspeed_kernel.platform import current_platform
 
 _PLATFORM = current_platform()
 
-if _PLATFORM.is_nvidia and _PLATFORM.is_blackwell:
+if _PLATFORM.is_nvidia and _PLATFORM.is_blackwell and has_fa4_cute():
     from tokenspeed_kernel.ops.attention.rmha._cute_dsl import (  # isort: skip  (FA4 mount precedes the kernels)
         fmha_bias_helper,
         rel_decode,

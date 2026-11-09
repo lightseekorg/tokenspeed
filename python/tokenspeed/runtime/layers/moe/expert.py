@@ -728,6 +728,33 @@ class MoELayer(torch.nn.Module):
                 self.plan, hidden_states, self, router_logits, **kwargs
             )
 
+    def fuse_shared_expert(
+        self,
+        gate_up_weight: torch.Tensor,
+        gate_up_scale: torch.Tensor,
+        down_weight: torch.Tensor,
+        down_scale: torch.Tensor,
+    ) -> bool:
+        """Have the planned kernel run a shared expert in the routed launch.
+
+        On success the given tensors are re-laid out for the kernel and the
+        routed output includes the shared expert, so the caller stops running
+        it. Call once, after ``process_weights_after_loading``.
+
+        Returns:
+            Whether the kernel took the shared expert. Kernels without the
+            capability, or shapes they do not take, leave the tensors as they
+            were.
+        """
+        hook = self.plan.get("fuse_shared_expert")
+        if hook is None:
+            return False
+        if not self._weights_processed:
+            raise RuntimeError("Process the routed weights before fusing")
+        return hook(
+            self.plan, self, gate_up_weight, gate_up_scale, down_weight, down_scale
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor],

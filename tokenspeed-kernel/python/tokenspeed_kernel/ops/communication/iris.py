@@ -26,6 +26,7 @@ Fusions can explicitly reuse those buffers when their execution is ordered.
 """
 
 import logging
+import math
 from typing import TYPE_CHECKING, Tuple
 
 import torch
@@ -35,8 +36,14 @@ from tokenspeed_kernel.platform import current_platform
 
 if TYPE_CHECKING:
     from tokenspeed_kernel.ops.communication._iris import IrisGroup
+    from tokenspeed_kernel.ops.communication._iris.residual_rmsnorm import (
+        LamportResidualRMSNorm,
+    )
 
 logger = logging.getLogger(__file__)
+
+# Rows of the fused AR+RMSNorm that reduce through its Lamport mailbox.
+_LAMPORT_MAX_ROWS = 16
 _platform = current_platform()
 IRIS_ALL_REDUCE_MAX_BYTES = 512 << 10
 _PACKED_WORD_BYTES = 8
@@ -403,6 +410,79 @@ def iris_all_reduce_symmetric(
     return state.all_reduce_symmetric(tensors)
 
 
+def iris_lamport_residual_rmsnorm_supported(
+    world_size: int, hidden_size: int, dtype: torch.dtype
+) -> bool:
+    """Whether the row-owned Lamport reduction + residual RMSNorm serves a group.
+
+    Args:
+        world_size: Number of ranks in the group.
+        hidden_size: Row width in elements.
+        dtype: Element type of the reduced rows and the residual.
+
+    Returns:
+        Whether this device has the kernel for this group size, width and dtype.
+    """
+    from tokenspeed_kernel.ops.communication._iris.residual_rmsnorm import (
+        LamportResidualRMSNorm,
+    )
+
+    return dtype == torch.bfloat16 and LamportResidualRMSNorm.supported(
+        world_size, hidden_size
+    )
+
+
+def prepare_iris_lamport_residual_rmsnorm(
+    all_reduce: IrisAllReduce, max_rows: int, hidden_size: int
+) -> "LamportResidualRMSNorm":
+    """Allocate the fused reduction's mailboxes on a prepared group's heap.
+
+    Collective: every rank of the group calls it in the same order, before
+    graph capture. The mailboxes come from the shared heap that the group's
+    first preparation sized; Iris's allocator enforces its capacity.
+
+    Args:
+        all_reduce: The group's prepared all-reduce, which supplies the peers.
+        max_rows: Most rows one call reduces, at most
+            ``LamportResidualRMSNorm.MAX_ROWS``.
+        hidden_size: Row width in elements.
+
+    Returns:
+        The prepared operation, used with ``iris_lamport_residual_rmsnorm``.
+    """
+    from tokenspeed_kernel.ops.communication._iris.residual_rmsnorm import (
+        LamportResidualRMSNorm,
+    )
+
+    state = LamportResidualRMSNorm(all_reduce.peers, max_rows, hidden_size)
+    all_reduce.peers.finish_prepare()
+    return state
+
+
+def iris_lamport_residual_rmsnorm(
+    state: "LamportResidualRMSNorm",
+    tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sum ``tensor`` over the group, add ``residual`` and apply RMSNorm.
+
+    Args:
+        state: The group's prepared operation.
+        tensor: BF16 ``[rows, hidden]`` partial, at most the prepared rows.
+        residual: BF16 ``[rows, hidden]`` residual, the same on every rank.
+        weight: ``[hidden]`` RMSNorm weight.
+        eps: RMSNorm epsilon, a model constant (it is compiled in).
+
+    Returns:
+        ``(normalized, residual_out)`` as new BF16 tensors, equal to
+        ``rmsnorm(all_reduce(tensor), weight, eps, residual=residual)`` with
+        the sum taken in FP32 rank order and rounded once to BF16.
+    """
+    return state.run(tensor, residual, weight, eps)
+
+
 class IrisAllReduceResidualRMSNorm(object):
 
     def __init__(
@@ -453,6 +533,8 @@ class IrisAllReduceResidualRMSNorm(object):
         self._rank_start = 0
         self._rank_stride = 1
         self._iris_rank = dist.get_rank()
+        # Peer pointers carry no alignment; heap rows start at row-size multiples.
+        self._peer_load_hint = math.gcd(hidden_dim * dtype.itemsize, 16)
 
         self.persistent = persistent
         self._num_programs = (
@@ -460,6 +542,49 @@ class IrisAllReduceResidualRMSNorm(object):
             if persistent
             else 0
         )
+        self._lamport = self._prepare_lamport()
+
+    def _prepare_lamport(self):
+        """A sentinel mailbox for decode-sized rows, or None.
+
+        Rows of up to ``_LAMPORT_MAX_ROWS`` reduce through it in one launch,
+        with no input copy or device barrier, then take the same residual
+        add and norm. It needs the group to be the whole world (the heap
+        bases are ordered by global rank) and room left on the heap.
+        """
+        max_numel = (
+            min(self.max_token_num, _LAMPORT_MAX_ROWS) * self.hidden_dim // 512 * 512
+        )
+        if (
+            not _platform.is_cdna4
+            or self.world_size not in (4, 8)
+            or self.world_size != dist.get_world_size()
+            or self.dtype != torch.bfloat16
+            or self.hidden_dim % 8 != 0
+            or max_numel == 0
+            # Preparing it synchronizes the group; every rank captures alike.
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return None
+        try:
+            region = self._ctx.empty(
+                (3, self.world_size, max_numel), dtype=torch.bfloat16
+            )
+        except Exception:  # the heap is fully allocated
+            region = None
+        else:
+            region.view(torch.int32).fill_(-2147483648)
+        # This collective orders every rank's fill before any peer pushes here.
+        allocated = torch.tensor([int(region is not None)], device=self.device)
+        dist.all_reduce(allocated, op=dist.ReduceOp.MIN, group=self.group)
+        if not allocated.item():
+            logger.info("Iris AR+RMSNorm keeps the pull path: no heap room")
+            return None
+        epochs = torch.zeros(max_numel // 512, dtype=torch.int32, device=self.device)
+        bases = [int(base) for base in self._ctx.get_heap_bases().tolist()]
+        offset = region.data_ptr() - bases[self._iris_rank]
+        addresses = tuple(base + offset for base in bases[: self.world_size])
+        return region, epochs, addresses, max_numel
 
     def fused(
         self,
@@ -496,17 +621,58 @@ class IrisAllReduceResidualRMSNorm(object):
         assert input_tensor.is_contiguous() and residual.is_contiguous()
 
         from tokenspeed_kernel.ops.communication._iris.all_reduce import (
+            iris_arch_policy,
+            iris_lamport_bf16_allreduce,
             iris_pull_oneshot_rmsnorm,
             iris_pull_oneshot_rmsnorm_persistent,
+            iris_residual_rmsnorm_rows,
         )
-
-        in_view = self._input_buf[:num_tokens, :]
-        in_view.copy_(input_tensor)
 
         if norm_out is None:
             norm_out = torch.empty_like(input_tensor)
         if residual_out is None:
             residual_out = torch.empty_like(residual)
+        numel = input_tensor.numel()
+        if (
+            self._lamport is not None
+            and 0 < numel <= self._lamport[3]
+            and numel % 512 == 0
+        ):
+            region, epochs, addresses, max_numel = self._lamport
+            reduced = torch.empty(
+                input_tensor.shape, dtype=torch.float32, device=input_tensor.device
+            )
+            iris_lamport_bf16_allreduce[(numel // 512,)](
+                input_tensor,
+                region,
+                reduced,
+                epochs,
+                addresses,
+                RANK=self._iris_rank,
+                WORLD_SIZE=self.world_size,
+                total_elements=numel,
+                MAX_ELEMENTS=max_numel,
+                NUM_STAGES=3,
+                PEER_SIGNAL_STORE_CACHE=iris_arch_policy().peer_signal_store,
+                OUTPUT_FP32=True,
+                num_warps=1,
+            )
+            iris_residual_rmsnorm_rows[(num_tokens,)](
+                reduced,
+                residual,
+                weight,
+                norm_out,
+                residual_out,
+                num_tokens,
+                HIDDEN_SIZE=self.hidden_dim,
+                BLOCK_SIZE=triton.next_power_of_2(self.hidden_dim),
+                EPS=eps,
+                num_warps=8,
+            )
+            return norm_out, residual_out
+
+        in_view = self._input_buf[:num_tokens, :]
+        in_view.copy_(input_tensor)
 
         self._ctx.device_barrier()
 
@@ -533,6 +699,7 @@ class IrisAllReduceResidualRMSNorm(object):
             HIDDEN_SIZE=self.hidden_dim,
             BLOCK_SIZE=BLOCK_SIZE,
             EPS=eps,
+            PEER_LOAD_HINT=self._peer_load_hint,
             num_warps=8,
         )
         # Ensure all peer loads finish before the next call reuses _input_buf.

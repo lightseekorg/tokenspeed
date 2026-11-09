@@ -53,7 +53,12 @@ class TargetCaptureSink(Protocol):
     def on_target_capture(self, capture_idx: int, hidden: torch.Tensor) -> None:
         """Consume capture ``capture_idx`` (the draft's positional tap index)
         for the forward's ``[num_tokens, hidden]`` rows, gathered across
-        attention TP."""
+        attention TP. The rows may be wider than the draft's dtype (a target
+        with an FP32 residual hands it over as is) and are valid only in
+        stream order at this call: the sink copies what it keeps. The sink
+        may run a collective on the attention TP group (DFLASH gathers its
+        context columns at the last tap), so the target must hold no
+        borrowed collective output live across this call."""
 
 
 class DraftNarrowing(Protocol):
@@ -105,11 +110,14 @@ class InputLogprobRows:
     it belongs to (for per-request NaN flags) -- the whole plan's, in row
     order, on every rank, since every rank scores every row: the head is
     vocab-sharded, so a row's logits need every rank. Under a query shard
-    ``rows`` are the plan's rows inside the shard, re-based to it, and
+    ``rows`` are the plan's rows inside the shard, as indices into it,
     ``rows_per_rank`` is the plan's row count on every rank of the group,
     the split of the activation gather that puts the whole plan's rows on
-    every rank; without a shard it is ``None`` and ``rows`` are already the
-    whole plan's. All index tensors are int64 on the device. ``chunk_tokens``
+    every rank, and ``gathered_to_rows`` puts the gathered rows (rank by
+    rank) back in row order (``QueryShardPlan.split_rows``); without a shard
+    both must be passed explicitly as ``None`` and ``rows`` are already the
+    whole plan's. All index
+    tensors are int64 on the device. ``chunk_tokens``
     bounds how many rows the processor pushes through the LM head at once (a
     memory knob, not a numerics one: log-softmax is row-local).
     """
@@ -120,6 +128,7 @@ class InputLogprobRows:
     num_input_rows: int
     chunk_tokens: int
     rows_per_rank: tuple[int, ...] | None
+    gathered_to_rows: torch.Tensor | None
     # The plan's ``top_k``: how many most likely next tokens every row also
     # returns (0 for none).
     top_k: int = 0
@@ -165,8 +174,8 @@ class ForwardContext:
     all_decode_or_idle: bool = False
     all_extend: bool = False
     # --- query context parallelism ---
-    # The rows this rank computes of a sharded extend forward (plain host
-    # integers); None means every rank computes every row. ``input_num_tokens``
+    # The rows this rank computes of a sharded extend forward (its zigzag
+    # segments of every request); None means every rank computes every row. ``input_num_tokens``
     # and ``global_num_tokens`` keep the scheduler's full-chunk meaning, the
     # model's row axis is the shard.
     query_shard: QueryShardPlan | None = None
@@ -198,8 +207,10 @@ class ForwardContext:
     # ``gather_ids`` live rows; its presence is the narrowing flag.
     draft_narrowing: DraftNarrowing | None = None
     # The drafter's consumer of this target forward's captured taps, attached
-    # by the drafter (prepare_target_forward) for the rounds it overlaps with
-    # the target; None means the taps are only collected in aux_hidden_states.
+    # by the drafter (prepare_target_forward) on the decode rounds whose taps
+    # it consumes; None means the taps are only collected in aux_hidden_states.
+    # While attached, the forward returns no hidden capture: the sink has
+    # every tap.
     target_capture_sink: TargetCaptureSink | None = None
     # Context production carries behavior. Its accumulator stays in the model
     # forward or travels in PPStageState, never on ctx. A configured producer

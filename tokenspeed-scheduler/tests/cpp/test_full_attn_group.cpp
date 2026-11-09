@@ -604,6 +604,25 @@ TEST(FullAttnManagerLcmTest, DuplicateRegistrationUpdatesEpochWithoutReorderingE
     EXPECT_EQ(pool.NumOccupiedSlots(), 2);
 }
 
+TEST(FullAttnManagerLcmTest, ADedupedSlotExportsTheCanonicalBlocksPageId) {
+    BlockPool pool(2, {2});
+    FullAttnManager mgr(4, 2, 0);
+    BlockTable first;
+    BlockTable duplicate;
+    ASSERT_TRUE(mgr.Acquire(pool, first, 4));
+    ASSERT_TRUE(mgr.Acquire(pool, duplicate, 8));
+    const CacheKey key = RealKey({1, 2, 3, 4}, 0);
+    mgr.CacheFullBlocks(pool, first, std::vector<CacheKey>{key});
+    const std::int32_t canonical = mgr.BlockTablePageIds(first)[0];
+    const std::vector<std::int32_t> before = mgr.BlockTablePageIds(duplicate);
+    ASSERT_NE(before[0], canonical);
+
+    mgr.CacheFullBlocks(pool, duplicate, std::vector<CacheKey>{key});
+
+    EXPECT_EQ(duplicate.Blocks()[0], first.Blocks()[0]) << "publishing swapped in the canonical block";
+    EXPECT_EQ(mgr.BlockTablePageIds(duplicate), (std::vector<std::int32_t>{canonical, before[1]}));
+}
+
 TEST(FullAttnManagerLcmTest, NamespaceIsPartOfPrefixIndex) {
     BlockPool pool(2, {1});
     FullAttnManager mgr(4, 1, 0);

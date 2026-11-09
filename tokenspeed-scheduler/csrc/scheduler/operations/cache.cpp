@@ -50,17 +50,4 @@ void FreeRequest(CacheCoordinator& coordinator, std::vector<BlockTable>& tables)
     coordinator.Free(tables);
 }
 
-std::map<std::string, std::vector<std::int32_t>> BuildBlockTables(const CacheCoordinator& coordinator,
-                                                                  const std::vector<BlockTable>& tables,
-                                                                  std::span<const std::string> group_ids) {
-    _assert(tables.size() == group_ids.size(), "BuildBlockTables: tables/group_ids size mismatch");
-    _assert(tables.size() == static_cast<std::size_t>(coordinator.NumGroups()),
-            "BuildBlockTables: tables/coordinator size mismatch");
-    std::map<std::string, std::vector<std::int32_t>> out;
-    for (std::size_t i = 0; i < tables.size(); ++i) {
-        out.emplace(group_ids[i], coordinator.Allocator(static_cast<std::int32_t>(i)).BlockTablePageIds(tables[i]));
-    }
-    return out;
-}
-
 }  // namespace tokenspeed

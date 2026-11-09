@@ -22,48 +22,126 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 
 try:
-    from flash_ops.npu_sample import (
-        SamplingWorkspace,
-        chain_speculative_sampling_target_only,
-        fused_topk_topp_renorm,
-        sample_from_probs,
-        verify_chain_greedy,
-    )
+    import flash_ops  # noqa: F401
 except ImportError as exc:
     raise ImportError(
         "Ascend full sampling requires flash_ops built with the npu_sample "
         "operators (fused_topk_topp_renorm and sorted_topk_topp_renorm)"
     ) from exc
 
-if not hasattr(torch.ops.custom, "fused_topk_topp_renorm"):
-    raise RuntimeError(
-        "flash_ops.npu_sample was imported, but the "
-        "custom::fused_topk_topp_renorm operator is not registered; rebuild "
-        "flash-npu-kernel with the npu_sample operators and matching OPP"
+for _name in (
+    "fused_topk_topp_renorm",
+    "npu_sampling_workspace",
+    "npu_sample_from_probs",
+    "npu_verify_chain_greedy",
+    "npu_chain_speculative_sampling_target_only",
+    "npu_min_p_renorm",
+):
+    if not hasattr(torch.ops.custom, _name):
+        raise RuntimeError(
+            f"Missing custom::{_name}; rebuild flash_ops with sampling operators"
+        )
+
+
+@dataclass(frozen=True)
+class SamplingWorkspace:
+    """Retain the operator-allocated scratch tensors across graph replay."""
+
+    partial_sums: torch.Tensor
+    selected_blocks: torch.Tensor
+    residuals: torch.Tensor
+    rejected_ids: torch.Tensor
+    sample_positions: torch.Tensor
+
+    @classmethod
+    def create(cls, max_rows: int, vocab_size: int, device: torch.device | str):
+        return cls(
+            *torch.ops.custom.npu_sampling_workspace(
+                max_rows, vocab_size, torch.device(device)
+            )
+        )
+
+
+def fused_topk_topp_renorm(probs, top_ks, top_ps, *, out=None):
+    """Filter each row through the native top-k/top-p operator."""
+    if out is not None and (
+        out.shape != probs.shape
+        or out.dtype != torch.float32
+        or out.device != probs.device
+    ):
+        raise ValueError(
+            "out must match probs in shape and device and have float32 dtype"
+        )
+    result = torch.ops.custom.fused_topk_topp_renorm(probs, top_ks, top_ps)
+    if out is not None:
+        out.copy_(result)
+        return out
+    return result
+
+
+def sample_from_probs(probs, coins, workspace, *, out=None):
+    """Sample using caller-provided coins, outputs and retained scratch."""
+    if out is None:
+        out = torch.empty((probs.shape[0],), dtype=torch.int32, device=probs.device)
+    return torch.ops.custom.npu_sample_from_probs(
+        probs,
+        coins,
+        workspace.partial_sums,
+        workspace.selected_blocks,
+        workspace.residuals,
+        workspace.rejected_ids,
+        workspace.sample_positions,
+        out,
     )
 
 
-def min_p_renorm_prob(
-    probs: torch.Tensor,
-    min_ps: torch.Tensor,
-) -> torch.Tensor:
-    """Apply row-wise min-p filtering and renormalize in FP32.
+def chain_speculative_sampling_target_only(
+    predicts,
+    accept_index,
+    accept_token_num,
+    candidates,
+    uniform_samples,
+    uniform_samples_for_final_sampling,
+    target_probs,
+    workspace,
+    *,
+    threshold_single=1.0,
+    threshold_acc=1.0,
+):
+    """Verify a chain through the packaged Torch operator with caller-owned outputs."""
+    torch.ops.custom.npu_chain_speculative_sampling_target_only(
+        predicts,
+        accept_index,
+        accept_token_num,
+        candidates,
+        uniform_samples,
+        uniform_samples_for_final_sampling,
+        target_probs,
+        workspace.partial_sums,
+        workspace.selected_blocks,
+        workspace.residuals,
+        workspace.rejected_ids,
+        workspace.sample_positions,
+        threshold_single,
+        threshold_acc,
+    )
 
-    The implementation is intentionally composed from capturable tensor ops.
-    It is a correctness path until the operation is folded into the Ascend
-    filtering kernel.
-    """
-    if probs.ndim != 2 or probs.dtype != torch.float32:
-        raise ValueError("probs must be a 2D float32 tensor")
-    if min_ps.shape != (probs.shape[0],) or min_ps.dtype != torch.float32:
-        raise ValueError("min_ps must be float32 with one value per row")
-    thresholds = probs.amax(dim=-1, keepdim=True) * min_ps.unsqueeze(-1)
-    filtered = torch.where(probs >= thresholds, probs, torch.zeros_like(probs))
-    normalizer = filtered.sum(dim=-1, keepdim=True)
-    return filtered / normalizer.clamp_min(torch.finfo(torch.float32).tiny)
+
+def verify_chain_greedy(
+    predicts, accept_index, accept_token_num, candidates, target_predict
+):
+    """Verify the greedy prefix into the caller-owned output tensors."""
+    torch.ops.custom.npu_verify_chain_greedy(
+        predicts, accept_index, accept_token_num, candidates, target_predict
+    )
+
+
+min_p_renorm_prob = torch.ops.custom.npu_min_p_renorm
 
 
 __all__ = [

@@ -222,7 +222,8 @@ def test_gdn_backend_reads_projection_views_like_dense_inputs(steps: int) -> Non
                 spec_tokens=steps,
                 max_bs=batch,
                 device="cuda",
-            )
+            ),
+            writes_state_checkpoints_in_forward=False,
         )
         backend.set_kv_pool(pool)
         backend.init_cuda_graph_state(batch)

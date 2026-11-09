@@ -600,13 +600,15 @@ def post_load_transformed_modules(model: nn.Module) -> list[str]:
     loaded and cannot run a second time, so checkpoint tensors streamed into
     such a module later land in the processed layout. A hook counts as a
     transform unless it is in ``no_op_post_load_hooks``; an MoE layer's hook
-    transforms exactly when its planned kernel has a weight preprocessor.
+    transforms exactly when its planned kernel has a weight preprocessor, and a
+    DeepSeek V4 MoE block's exactly when it fused its shared expert.
 
     Returns:
         ``"<module name> (<hook owner>)"`` for each such module, in
         ``named_modules`` order; empty when every hook is a no-op.
     """
     from tokenspeed.runtime.layers.moe.expert import MoELayer
+    from tokenspeed.runtime.models.deepseek_v41_moe import DeepseekV4MoE
 
     no_op_hooks = no_op_post_load_hooks()
     transformed: list[str] = []
@@ -626,6 +628,11 @@ def post_load_transformed_modules(model: nn.Module) -> list[str]:
                 if preprocessor is None:
                     continue
                 owner_name = getattr(preprocessor, "__name__", repr(preprocessor))
+            elif hook is DeepseekV4MoE.process_weights_after_loading:
+                # Only fusing rewrites the shared expert's weights in place.
+                if not module.shared_expert_fused:
+                    continue
+                owner_name = owner.__name__
             else:
                 owner_name = owner.__name__
             transformed.append(f"{name or type(module).__name__} ({owner_name})")

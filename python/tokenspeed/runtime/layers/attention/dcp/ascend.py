@@ -20,7 +20,7 @@
 
 """Ascend collectives shared by dense MLA and sparse DSA.
 
-Native Prefill reuses scheduler placement and page tables.
+Prefill reuses scheduler placement and page tables.
 """
 
 from __future__ import annotations
@@ -32,94 +32,23 @@ import torch
 import torch.distributed as dist
 from tokenspeed_kernel.ops.attention.dsa.ascend import ascend_dsa_cp_metadata
 
-from tokenspeed.runtime.execution.workspace import WorkspacePool
 from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
-
-
-def _prefill_workspace_sizes(
-    *, max_current_rows, history_capacity_rows, degree, index_width
-):
-    if history_capacity_rows < 1 or degree < 1 or index_width not in (0, 128):
-        raise ValueError("Invalid native Prefill workspace geometry")
-    send_rows = -(-max_current_rows // (degree * 128)) * 128
-    history_rows = history_capacity_rows
-    width = 576 + index_width
-    return (
-        (history_rows + degree * send_rows) * width,
-        send_rows * width,
-        history_rows * width,
-    )
 
 
 @dataclass(frozen=True)
 class AscendPrefillOptions:
-    """A model's explicit native Prefill choice and bounded runtime capacity."""
+    """Prefill token capacity and physical page geometry, independent of admission."""
 
     max_current_rows: int
-    max_kv_page_num: int
-    kv_page_size: int = 128
+    kv_page_size: int
 
     def __post_init__(self):
-        if (
-            self.max_current_rows < 1
-            or self.max_kv_page_num < 1
-            or self.kv_page_size < 1
-            or self.max_current_rows > self.max_kv_page_num * self.kv_page_size
-        ):
-            raise ValueError(
-                "Native Prefill needs a positive page limit, "
-                "with current rows bounded by the page limit"
-            )
-
-    @property
-    def history_capacity_rows(self):
-        # One null page precedes the compact per-batch pages.
-        return (self.max_kv_page_num + 1) * self.kv_page_size
-
-    def required_workspace(self, *, local_rows: int, degree: int, index_width: int):
-        """Transport buffers and commit slots, including pool alignment."""
-        if local_rows < 1 or degree < 1 or index_width not in (0, 128):
-            raise ValueError("Invalid native Prefill workspace geometry")
-        return (
-            2
-            * sum(
-                _prefill_workspace_sizes(
-                    max_current_rows=self.max_current_rows,
-                    history_capacity_rows=self.history_capacity_rows,
-                    degree=degree,
-                    index_width=index_width,
-                )
-            )
-            + self.slot_workspace_rows * torch.int64.itemsize
-        )
-
-    @property
-    def slot_workspace_rows(self):
-        # WorkspacePool aligns each view to 256 bytes (32 int64 slots).
-        return -(-self.max_current_rows // 32) * 32
-
-    def allocate_workspace(self, *, local_rows, degree, index_width, device):
-        """Own transport and commit views together, disjoint across streams."""
-        required = self.required_workspace(
-            local_rows=local_rows, degree=degree, index_width=index_width
-        )
-        sizes = _prefill_workspace_sizes(
-            max_current_rows=self.max_current_rows,
-            history_capacity_rows=self.history_capacity_rows,
-            degree=degree,
-            index_width=index_width,
-        )
-        pool = WorkspacePool(device, initial_nbytes=required)
-        buffers = pool.allocate(
-            *(((size,), torch.bfloat16) for size in sizes),
-            ((self.slot_workspace_rows,), torch.int64),
-        )
-        pool.freeze()
-        return pool, tuple(buffers)
+        if self.max_current_rows < 1 or self.kv_page_size < 1:
+            raise ValueError("Prefill needs positive token capacity and page geometry")
 
 
 class AscendPrefillCache:
-    """Opt a model cache view into the native Prefill hooks it implements."""
+    """Carry the physical Prefill geometry supported by a model cache."""
 
     def __init__(self, *, prefill_options: AscendPrefillOptions | None, **kwargs):
         self.prefill_options = prefill_options
@@ -151,23 +80,15 @@ class AscendPrefillGatherPlan:
         columns,
     ):
         if table_cpu is None or table_cpu.device.type != "cpu":
-            raise ValueError(
-                "Bounded native Prefill requires the scheduler's host page table"
-            )
+            raise ValueError("Prefill requires the scheduler's host page table")
         if options.kv_page_size % page_size or len(extends) != table_cpu.shape[0]:
-            raise ValueError("Prefill page budget and kernel table geometry disagree")
-        total_pages = sum(
-            (prefix + extent + options.kv_page_size - 1) // options.kv_page_size
-            for prefix, extent in zip(prefixes, extends, strict=True)
-        )
-        if total_pages > options.max_kv_page_num:
-            raise ValueError(
-                f"Prefill batch needs {total_pages} KV pages, limit is {options.max_kv_page_num}"
-            )
+            raise ValueError("Prefill page and kernel table geometry disagree")
         per_block = 1 if placement is None else placement.block_granularity // page_size
         pages = table_cpu.tolist()
         owners = [{} for _ in range(degree)]
         for req, (prefix, extent) in enumerate(zip(prefixes, extends, strict=True)):
+            if extent <= 0:
+                continue
             count = (prefix + extent + page_size - 1) // page_size
             if count > min(len(pages[req]), columns):
                 raise ValueError("Prefill KV length exceeds its scheduler page table")
@@ -184,8 +105,6 @@ class AscendPrefillGatherPlan:
         for owner in owners:
             offsets.append(offset)
             offset += len(owner)
-        if offset * page_size > options.history_capacity_rows:
-            raise ValueError("Compacted Prefill pages exceed the receive workspace")
         mapping = {
             page: offsets[owner] + i
             for owner, entries in enumerate(owners)
@@ -193,6 +112,8 @@ class AscendPrefillGatherPlan:
         }
         packed = torch.zeros((len(extends), columns), dtype=table_cpu.dtype)
         for req, (prefix, extent) in enumerate(zip(prefixes, extends, strict=True)):
+            if extent <= 0:
+                continue
             count = (prefix + extent + page_size - 1) // page_size
             packed[req, :count] = torch.tensor(
                 [mapping.get(page, 0) for page in pages[req][:count]],
@@ -263,7 +184,7 @@ class AscendPrefillPlan:
         local_cache_pages,
         query_partition=None,
         page_table_cpu=None,
-        options=None,
+        options,
     ):
         # Lengths already exist on the host. Bounded gathers also reuse the
         # scheduler's host page table; no device readback is needed.
@@ -293,35 +214,23 @@ class AscendPrefillPlan:
             offset += extent
         table = metadata.page_table
         per_block = 1 if placement is None else placement.block_granularity // page_size
-        gather = None
-        patch_slots = None
-        history_pages = degree * local_cache_pages
-        if options is not None and options.max_kv_page_num:
-            gather = AscendPrefillGatherPlan.build(
-                table if table.device.type == "cpu" else page_table_cpu,
-                extends,
-                prefixes,
-                placement=placement,
-                page_size=page_size,
-                local_pages=local_cache_pages,
-                degree=degree,
-                rank=rank,
-                options=options,
-                device=table.device,
-                columns=table.shape[1],
-            )
-            history_pages = options.history_capacity_rows // page_size
-            patch_slots = torch.empty(rows, dtype=torch.int64, device=table.device)
+        gather = AscendPrefillGatherPlan.build(
+            table if table.device.type == "cpu" else page_table_cpu,
+            extends,
+            prefixes,
+            placement=placement,
+            page_size=page_size,
+            local_pages=local_cache_pages,
+            degree=degree,
+            rank=rank,
+            options=options,
+            device=table.device,
+            columns=table.shape[1],
+        )
+        history_pages = (options.kv_page_size + sum(gather.row_counts)) // page_size
+        patch_slots = torch.empty(rows, dtype=torch.int64, device=table.device)
         if table.device.type == "cpu":
-            pages = table.long()
-            block = pages // per_block
-            positive = (block - 1).clamp_min(0)
-            local = (positive // degree + 1) * per_block + pages % per_block
-            mapped = torch.where(
-                block > 0, positive % degree * local_cache_pages + local, 0
-            ).int()
-            if gather is not None:
-                mapped = gather.table.clone()
+            mapped = gather.table.clone()
             cumulative = metadata.cum_extend_seq_lens.long()
             prefix = metadata.extend_prefix_lens.long()
             direct = torch.zeros(rows, dtype=torch.uint8)
@@ -429,7 +338,7 @@ class AscendPrefillPlan:
                 page_size=page_size,
                 topk=topk,
                 active_requests=active,
-                history_table=None if gather is None else gather.table,
+                history_table=gather.table,
                 patch_slots=patch_slots,
                 history_pages=history_pages,
             )
@@ -677,6 +586,7 @@ class AscendDCPMetadata:
         self._indexer_metadata: AscendIndexerMetadata | None = None
         self._query_group_size: int | None = None
         self._write_slot_source: tuple | None = None
+        self._write_slot_tensor: torch.Tensor | None = None
 
     def clear_forward_metadata(self) -> None:
         """Invalidate layer-shared results before the next forward/capture."""
@@ -685,6 +595,7 @@ class AscendDCPMetadata:
         self._indexer_metadata = None
         self._query_group_size = None
         self._write_slot_source = None
+        self._write_slot_tensor = None
 
     def prepare_metadata(
         self,
@@ -701,9 +612,7 @@ class AscendDCPMetadata:
     ) -> None:
         sources = (seq_lens, page_table) + (() if slots is None else (slots,))
         key = (
-            tuple(
-                (t.data_ptr(), t.shape, t.stride(), t.dtype, t.device) for t in sources
-            ),
+            tuple((t.shape, t.stride(), t.dtype, t.device) for t in sources),
             page_size,
             block_granularity,
             init_tokens,
@@ -711,7 +620,12 @@ class AscendDCPMetadata:
             query_width,
             query_group_size,
         )
-        if key == self._prepared_metadata_key:
+        if key == self._prepared_metadata_key and all(
+            previous.is_set_to(current)
+            for previous, current in zip(
+                self._metadata_sources[: len(sources)], sources, strict=True
+            )
+        ):
             return
         self.refresh_metadata(
             seq_lens=seq_lens,
@@ -724,7 +638,9 @@ class AscendDCPMetadata:
             query_group_size=query_group_size,
             slots=slots,
         )
-        self._metadata_sources = sources
+        # Separate view objects preserve storage identity if a caller rebinds
+        # its Tensor in place; detach shares the allocation without copying it.
+        self._metadata_sources = tuple(source.detach() for source in sources)
         self._prepared_metadata_key = key
 
     def prepare_write_slots(self, locations, placement):
@@ -735,14 +651,17 @@ class AscendDCPMetadata:
         is captured once in the graph, just as DSA's Prolog preparation is.
         """
         key = (
-            locations.data_ptr(),
             locations.shape,
             locations.stride(),
             locations.dtype,
             locations.device,
             placement,
         )
-        if key != self._write_slot_source:
+        if (
+            key != self._write_slot_source
+            or self._write_slot_tensor is None
+            or not self._write_slot_tensor.is_set_to(locations)
+        ):
             local, owned = resolve_cache_slots(locations, placement)
             self.write_slots = (
                 (local if owned is None else torch.where(owned, local, -1))
@@ -751,6 +670,7 @@ class AscendDCPMetadata:
             )
             self._metadata_sources += (locations,)
             self._write_slot_source = key
+            self._write_slot_tensor = locations.detach()
         return self.write_slots
 
     def bind_virtual_block_count(self, virtual_block_count: int) -> None:

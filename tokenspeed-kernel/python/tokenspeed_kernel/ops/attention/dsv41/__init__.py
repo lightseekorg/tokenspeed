@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel.ops.attention.dsv41._inputs import IndexKeyInput, IndexQueryInput
+from tokenspeed_kernel.ops.attention.dsv41._metadata import index_logit_rows
 from tokenspeed_kernel.ops.attention.mla._triton.page_table import bounded_group_slots
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
@@ -62,6 +63,7 @@ __all__ = [
     "decode_rows",
     "decode_window",
     "global_slots",
+    "prefill_indices",
     "compact_slots",
     "selection_table",
     "cache_pack",
@@ -74,11 +76,14 @@ __all__ = [
     "index_query_rope_weights",
     "index_query_rope_quant",
     "selected_attention",
+    "selected_attention_fp8",
+    "prepare_fused_decode_weights",
     "selected_attention_rope",
     "new_attention_schedule",
     "index_score",
     "index_topk",
     "new_index_metadata",
+    "index_logit_rows",
     "index_select_all",
     "local_index_supported",
     "index_candidates",
@@ -91,6 +96,7 @@ __all__ = [
     "rope_inplace",
     "rope_weights_inplace",
     "rope_pad_query",
+    "rope_quantize_fp8_grouped",
     "dspark_rows",
     "dspark_anchors",
     "dspark_block",
@@ -358,6 +364,79 @@ def new_attention_schedule() -> object | None:
     return new_flashmla_schedule()
 
 
+def prepare_fused_decode_weights(
+    q_weight: torch.Tensor,
+    q_scales: torch.Tensor,
+    output_weight: torch.Tensor,
+    output_scales: torch.Tensor,
+    num_heads: int,
+    num_groups: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    """Prepare separate projection weights for fused V4.1 decode attention.
+
+    Q scales are canonical uint8 UE8M0 [N,K/32]; output scales are the
+    packed scales from ``prepare_grouped_fp8_projection``. Returns permuted
+    Q codes/canonical scales and grouped output codes/packed scales, without
+    changing the original tensors. None means this device has no fused kernel.
+    """
+    from tokenspeed_kernel.ops.attention.dsv41.flash_mla import (
+        is_flash_mla_fused_decode_available,
+    )
+
+    if not is_flash_mla_fused_decode_available():
+        return None
+    try:
+        kernel = _kernel("prepare_fused_decode_weights", q_weight)
+    except NoKernelFoundError:
+        return None
+    return kernel(
+        q_weight, q_scales, output_weight, output_scales, num_heads, num_groups
+    )
+
+
+def selected_attention_fp8(
+    q: torch.Tensor,
+    swa_cache: torch.Tensor | None,
+    swa_slots: torch.Tensor | None,
+    swa_lens: torch.Tensor | None,
+    global_cache: torch.Tensor | None,
+    global_slots: torch.Tensor | None,
+    global_lens: torch.Tensor | None,
+    attn_sink: torch.Tensor,
+    softmax_scale: float,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    num_groups: int,
+    prefill_kv: torch.Tensor | None,
+    prefill_indices: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused Q RoPE, selected attention and inverse RoPE with FP8 output.
+
+    Q is unrotated BF16 [T,H,512] from the prepared Q weight; no extra Q norm
+    is applied. Cache/selection inputs follow ``selected_attention``. A BF16
+    workspace and its indices may replace paged inputs for draft decoding.
+    Returns E4M3 [T,groups,H/groups*512] and packed UE8M0 int32 scales for
+    ``grouped_fp8_projection`` with the prepared output weight. Both prepared
+    projections must be used together; this layout is not the ordinary output.
+    """
+    return _kernel("selected_attention_fp8", q)(
+        q,
+        swa_cache,
+        swa_slots,
+        swa_lens,
+        global_cache,
+        global_slots,
+        global_lens,
+        attn_sink,
+        softmax_scale,
+        positions,
+        cos_sin_cache,
+        num_groups,
+        prefill_kv,
+        prefill_indices,
+    )
+
+
 def selected_attention(
     q: torch.Tensor,
     swa_cache: torch.Tensor,
@@ -608,10 +687,12 @@ def index_topk(
             [T, candidate_topk], [T]), or None to allocate them.
         solution: Optional registered implementation restriction. Pass None for
             automatic kernel selection.
-        index_metadata: Object from new_index_metadata for these exact table and
-            length tensors, shared only within one invocation, or None (default). Native
+        index_metadata: Object from new_index_metadata for these exact table,
+            length and optional request-ID tensors, shared only within one
+            invocation, or None (default). Native
             kernels reuse Full schedules and matching immutable sparse candidate
-            geometry across layers. Table, lengths and candidate contents must
+            geometry across layers. Grouped paged Full reuses KV for consecutive
+            rows of one request. Table, lengths, request IDs and candidate contents must
             not change while sharing this object; graph replay refreshes the
             captured producers. A new invocation needs a fresh object.
 
@@ -632,14 +713,23 @@ def index_topk(
     FP32 scores and int64 IDs use12 bytes per partial entry; capacities round
     to powers of two and at least the score tile width (at most256 lanes).
     With replicated32 heads and compatible Blackwell pages, optional DeepGEMM
-    scores packed FP4 inputs with FP32 accumulation and DeepSelect selects rows
-    and block maxima; on Hopper, DeepGEMM scores FP8 ``index_v4`` rows and the
-    in-tree CuTe DSL DeepSelect kernel selects. This native accumulation
+    scores packed FP4 inputs with FP32 accumulation and BF16 logits, and
+    DeepSelect selects rows and FP32 block maxima; on Hopper, DeepGEMM scores
+    FP8 ``index_v4`` rows into FP32 logits and the in-tree CuTe DSL DeepSelect
+    kernel selects. This native accumulation
     differs from the portable reference's intermediate BF16 rounding.
-    Full-scoring query tiles cap logits at 32MiB for paged queries and
-    128MiB for a zero-row-stride request table.
-    That broadcast layout gathers packed history once per call and packs Q
-    once before the score tiles; no payload survives the call. For unsharded
+    Blackwell paged scoring (decode and verify) uses query_chunk_size and
+    optional request IDs; its cleaned rows have native-aligned strides and are
+    borrowed by TopK with exclusive ends. Blackwell dense scoring (prefill,
+    history_rows) scores the caller's whole batch: packed keys plus per-row
+    cu_seq_len starts, without a 128MiB inner tile. The runtime keeps one
+    call's BF16 logits within index_logit_rows. DeepSelect borrows the MQA
+    view; invalid pages before each row's end are set to -inf in place.
+    Candidate block reduction only writes valid blocks and the final aligned
+    prefetch segment. For paged and candidate-source scoring, native logits
+    and their cleaned copy can coexist. Hopper retains its 32MiB paged /
+    128MiB broadcast budgets. Packed history is gathered once per call and Q
+    is packed once; no payload survives the call. For unsharded
     68-byte MXFP4 caches, AMD Gluon Full similarly caps each FP32 logits query
     tile at 32MiB instead of limiting history width; Reindex scores only the
     candidate rows.
@@ -906,6 +996,35 @@ def rope_pad_query(
         solution=solution,
     )
     return kernel(values, positions, cos_sin_cache)
+
+
+def rope_quantize_fp8_grouped(
+    values: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    groups: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Rotate each head's interleaved RoPE tail and FP8-quantize grouped heads.
+
+    Args:
+        values: BF16 [T,H,512], unit channel stride, arbitrary token/head
+            strides; H divisible by groups.
+        positions: Int32/int64 [T]; negative positions use table row 0.
+        cos_sin_cache: FP32 [max_positions,64], cosine then sine halves, applied
+            with rope_inplace's formula (pass the inverse table to undo RoPE).
+        groups: Number of output head groups, each D = H/groups*512 wide.
+
+    Returns:
+        codes: FP8 E4M3 [T,groups,D], a view of contiguous [groups,T,D].
+        scales: Int32 [T,groups,D/128], MN-major and TMA-aligned (strides
+            (1, D/128*aligned_T, aligned_T), aligned_T = ceil(T/4)*4). Each
+            element packs four UE8M0 exponents of 32-channel groups, byte j
+            for group 4w+j, matching DeepGEMM's SM100 scale layout. The rotated
+            values are rounded to BF16 before quantizing.
+    """
+    return _kernel("rope_quantize_fp8_grouped", values)(
+        values, positions, cos_sin_cache, groups
+    )
 
 
 def dspark_rows(
@@ -1245,6 +1364,55 @@ def global_slots(rows, positions, requests, table, ratio, pages):
     )
 
 
+def prefill_indices(swa_indices, logical_rows, global_slots, rows, history_base):
+    """Build int32 sparse prefill attention indices into a packed KV workspace.
+
+    Each query's indices are its SWA workspace rows followed by its selected
+    compressed-history rows, shifted to where its request's history starts in
+    the workspace. A selected row that is negative, or whose physical slot is
+    negative, becomes -1.
+
+    Args:
+        swa_indices: Integer [Q, W] SWA workspace rows per query, -1 for none.
+        logical_rows: Integer [T, K] request-local selected history rows.
+        global_slots: Integer [T, K] physical slots of logical_rows; negative
+            marks a row absent from the cache.
+        rows: The Q query rows of logical_rows and global_slots, as a slice
+            with step 1 or an integer [Q] tensor.
+        history_base: Integer [Q] first workspace row of each query's history.
+
+    Returns:
+        Contiguous int32 [Q, W + K] indices.
+    """
+    if logical_rows.shape != global_slots.shape or logical_rows.ndim != 2:
+        raise ValueError("logical_rows and global_slots must share shape [T, K]")
+    if swa_indices.ndim != 2 or history_base.shape != swa_indices.shape[:1]:
+        raise ValueError("swa_indices must be [Q, W] and history_base [Q]")
+    if isinstance(rows, slice):
+        if rows.step not in (None, 1) or rows.start is None:
+            raise ValueError("rows must be a slice with an explicit start and step 1")
+        if len(range(*rows.indices(logical_rows.shape[0]))) != swa_indices.shape[0]:
+            raise ValueError("rows must select one logical row per query")
+    elif rows.shape != history_base.shape:
+        raise ValueError("rows must select one logical row per query")
+    # The kernel reads every row's columns contiguously.
+    swa_indices, logical_rows, global_slots = (
+        x if x.stride(-1) == 1 else x.contiguous()
+        for x in (swa_indices, logical_rows, global_slots)
+    )
+    if not swa_indices.is_cuda:
+        selected, slots = logical_rows[rows], global_slots[rows]
+        history = torch.where(
+            (selected >= 0) & (slots >= 0),
+            selected.to(torch.int64) + history_base[:, None].to(torch.int64),
+            -1,
+        )
+        return torch.cat((swa_indices.to(torch.int64), history), dim=-1).to(torch.int32)
+    return _kernel("prefill_indices", logical_rows)(
+        swa_indices, logical_rows, global_slots, rows, history_base
+    )
+
+
 def selection_table(positions, requests, table, ratio):
     """Gather indexer page rows and visible lengths for logical queries [N].
 
@@ -1468,19 +1636,46 @@ def index_select_all(page_table, visible_lens, pages, candidate_block_size, out)
     return out
 
 
-def new_index_metadata(page_table: torch.Tensor, visible_lens: torch.Tensor) -> object:
+def new_index_metadata(
+    page_table: torch.Tensor,
+    visible_lens: torch.Tensor,
+    request_indices: torch.Tensor | None,
+    *,
+    history_rows: tuple[int, ...] | None,
+) -> object:
     """Create invocation-owned reusable index geometry for these exact inputs.
 
-    page_table and visible_lens have the index_topk contract and must remain
-    unchanged for this object's lifetime. Share it only between layers of one
-    forward; create a new object for every eager invocation and graph capture.
-    Replay recomputes the captured producers. No KV values or scores are cached.
-    Consumers on other streams wait for metadata producers before reading.
-    Cached geometry is retained until this object is released.
+    page_table and visible_lens have the index_topk contract. request_indices
+    is contiguous int32 [queries] on the same device, or None for independent
+    rows. Equal consecutive IDs group queries of one request: their page tables
+    must match and their visible lengths must be nondecreasing. Rows with a
+    positive visible length must carry nonnegative IDs in that order; the values
+    are not scanned here because a device-to-host check would synchronize the
+    step. Rows whose visible length is 0 are relabeled with distinct negative
+    IDs before the grouped call, whatever ID they carry (decode padding carries
+    -1), so a padding row cannot end an active request's run. All supplied
+    tensors must remain unchanged for this object's lifetime. Share it only
+    between layers of one forward; create a new object for every eager
+    invocation and graph capture. Replay recomputes the captured producers. No
+    KV values or scores are cached. Consumers on other streams wait for metadata
+    producers before reading. Cached geometry is retained until this object is
+    released.
+
+    history_rows selects the Blackwell Full scorer. A tuple gives the number of
+    consecutive query rows that share one request history, in table order, and
+    sums to the table's rows: each history is gathered once into a packed key
+    buffer and scored densely (prefill). None scores every row through the
+    paged page table (decode and verify). request_indices only groups paged
+    scoring; dense scoring ignores it.
     """
     from tokenspeed_kernel.ops.attention.dsv41._metadata import IndexMetadata
 
-    return IndexMetadata(page_table, visible_lens)
+    if history_rows is not None and (
+        any(rows < 1 for rows in history_rows)
+        or sum(history_rows) != page_table.shape[0]
+    ):
+        raise ValueError("history_rows must be positive and cover every query row")
+    return IndexMetadata(page_table, visible_lens, request_indices, history_rows)
 
 
 def compact_slots(slots: torch.Tensor, lengths: torch.Tensor):
