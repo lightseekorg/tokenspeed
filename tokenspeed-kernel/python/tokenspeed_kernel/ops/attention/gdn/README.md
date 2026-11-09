@@ -279,3 +279,13 @@ request, and key head streams its value heads' state tiles through a
 two-stage cp.async shared-memory ring, loading the next tile while the
 current one replays. It keeps the per-tile arithmetic, so results match the
 per-tile kernel bitwise.
+
+`gluon_nvidia_gdn_replay_commit` is an opt-in NVIDIA experiment registered at
+REFERENCE priority, below the portable kernel, so it only runs when selected
+explicitly through `solution="gluon_nvidia"`, an exact-name override, or
+`TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_GDN_REPLAY_COMMIT`. It requires K = V =
+128 and windows of at most 16 tokens, and launches a persistent kernel with
+fixed saved settings: at most 24 CTAs, two producer warps, eight compute
+warps, two shared-memory state slots, and a 168-register compilation limit.
+The kernel detects pool row alignment from the GPU metadata at runtime, so it
+accepts both `rows_aligned` values without a separate path.

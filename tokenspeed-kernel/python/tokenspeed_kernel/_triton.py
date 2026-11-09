@@ -41,6 +41,7 @@ if _IS_NPU:
     aggregate = None
     TensorDescriptor = None
     gl = None
+    gluon_nvidia_async_copy = None
 
     class _UnavailableGluonKernel:
         def __init__(self, fn, options):
@@ -76,6 +77,9 @@ else:
     import tokenspeed_triton.experimental.gluon.language as gl
     from tokenspeed_triton import language as tl
     from tokenspeed_triton.experimental import gluon
+    from tokenspeed_triton.experimental.gluon.language.nvidia.ampere import (
+        async_copy as gluon_nvidia_async_copy,
+    )
     from tokenspeed_triton.language.core import _aggregate as aggregate
     from tokenspeed_triton.language.extra import libdevice
     from tokenspeed_triton.tools.tensor_descriptor import TensorDescriptor
@@ -91,6 +95,7 @@ __all__ = [
     "get_hip_runtime_path",
     "gl",
     "gluon",
+    "gluon_nvidia_async_copy",
     "libdevice",
     "proton",
     "redirect_triton_to_tokenspeed_triton",
