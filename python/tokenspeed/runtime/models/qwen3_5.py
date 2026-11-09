@@ -584,79 +584,96 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         return output
 
 
-class Qwen3_5LinearDecoderLayer(nn.Module):
-    """Qwen3.5 Decoder Layer with Linear Attention (GatedDeltaNet)."""
+def _qwen3_5_uses_sparse_moe(config: Qwen3_5TextConfig) -> bool:
+    """Qwen3.5 MLPs are dense in every layer; Qwen3.5-MoE uses sparse MoE blocks."""
+    if config.model_type == "qwen3_5_moe_text":
+        return True
+    if config.model_type == "qwen3_5_text":
+        return False
+    raise ValueError(f"Invalid model type: {config.model_type}")
 
-    def __init__(
-        self,
-        config: Qwen3_5TextConfig,
-        mapping: Mapping,
-        layer_id: int,
-        quant_config: QuantizationConfig | None = None,
-        prefix: str = "",
-        alt_stream: torch.cuda.Stream | None = None,
-    ) -> None:
-        super().__init__()
-        self.config = config
-        self.mapping = mapping
-        self.layer_id = layer_id
 
-        self.linear_attn = Qwen3_5GatedDeltaNet(
-            config, mapping, layer_id, quant_config, prefix=prefix
+def build_qwen3_5_mlp(
+    config: Qwen3_5TextConfig,
+    mapping: Mapping,
+    layer_id: int,
+    quant_config: QuantizationConfig | None,
+    alt_stream: torch.cuda.Stream | None,
+    prefix: str,
+    is_moe: bool,
+) -> nn.Module:
+    """A decoder layer's sparse MoE block or dense MLP under ``prefix``, the layer's."""
+    if is_moe:
+        return Qwen3_5MoeSparseMoeBlock(
+            config=config,
+            mapping=mapping,
+            quant_config=quant_config,
+            layer_index=layer_id,
+            alt_stream=alt_stream,
+            prefix=add_prefix("mlp", prefix),
         )
+    return Qwen3_5MoeMLP(
+        parallelism="dense",
+        mapping=mapping,
+        hidden_size=config.hidden_size,
+        intermediate_size=config.intermediate_size,
+        hidden_act=config.hidden_act,
+        quant_config=quant_config,
+        reduce_results=False,
+        prefix=add_prefix("mlp", prefix),
+    )
 
-        #  Determine the MLP type based on the model type
-        # Qwen3.5 use all layers for MLP / Qwen3.5-MoE use sparse MoE blocks
-        if config.model_type == "qwen3_5_moe_text":
-            self.mlp = Qwen3_5MoeSparseMoeBlock(
-                config=config,
-                mapping=self.mapping,
-                quant_config=quant_config,
-                layer_index=layer_id,
-                alt_stream=alt_stream,
-                prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
-            )
-            is_moe = True
-        elif config.model_type == "qwen3_5_text":
-            self.mlp = Qwen3_5MoeMLP(
-                parallelism="dense",
-                mapping=self.mapping,
-                hidden_size=config.hidden_size,
-                intermediate_size=config.intermediate_size,
-                hidden_act=config.hidden_act,
-                quant_config=quant_config,
-                reduce_results=False,
-                prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
-            )
-            is_moe = False
-        else:
-            raise ValueError(f"Invalid model type: {config.model_type}")
 
-        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = GemmaRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+class Qwen3_5DecoderLayer(nn.Module):
+    """The norms, communication and MLP shared by both Qwen3.5 layer kinds.
 
-        self.is_moe = is_moe
-        self.comm_manager = CommManager(
+    A subclass builds its token mixer and supplies ``attention_fp8_scale`` and
+    ``attend``.
+    """
+
+    def _build_comm_manager(self) -> CommManager:
+        return CommManager(
             mapping=self.mapping,
             layer_id=self.layer_id,
-            is_moe=is_moe,
-            prev_is_moe=is_moe,
+            is_moe=self.is_moe,
+            prev_is_moe=self.is_moe,
             dense_batch_invariant=False,
             input_layernorm=self.input_layernorm,
             post_attn_layernorm=self.post_attention_layernorm,
             query_sharded=False,
         )
 
-    def forward(
+    def attention_fp8_scale(self) -> torch.Tensor | None:
+        """The static FP8 input scale of the mixer's input projection, if any."""
+        raise NotImplementedError
+
+    def attend(
         self,
+        positions: torch.Tensor | None,
+        hidden_states: torch.Tensor,
+        hidden_fp8: torch.Tensor | None,
+        ctx: ForwardContext,
+    ) -> torch.Tensor:
+        """Run the token mixer on the normed rows or, when present, their FP8 copy."""
+        raise NotImplementedError
+
+    def _maybe_narrow_residual(
+        self,
+        residual: torch.Tensor,
+        ctx: ForwardContext,
+    ) -> torch.Tensor:
+        """Hook: subclasses narrow residual to match a sliced attn output."""
+        return residual
+
+    def forward_layer(
+        self,
+        positions: torch.Tensor | None,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         ctx: ForwardContext,
-        aux_hidden_states: list[torch.Tensor] | None = None,
-        **kwargs,
+        aux_hidden_states: list[torch.Tensor] | None,
     ):
+        """The layer's forward; ``positions`` is None for a linear-attention layer."""
         num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
             ctx
         )
@@ -668,19 +685,14 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 self.input_layernorm,
                 hidden_states,
                 residual,
-                self.linear_attn.input_fp8_scale(),
+                self.attention_fp8_scale(),
             )
             capture_layer_input(self.comm_manager, residual, ctx, aux_hidden_states)
             hidden_states = self.comm_manager.pre_attn_comm(hidden_states, ctx)
-
-            hidden_states = self.linear_attn(
-                hidden_states,
-                hidden_fp8,
-                ctx,
-            )
+            hidden_states = self.attend(positions, hidden_states, hidden_fp8, ctx)
             # Free the copy once consumed, as the projection frees its own quant.
             del hidden_fp8
-
+            residual = self._maybe_narrow_residual(residual, ctx)
             hidden_states, hidden_fp4, residual = _post_attn_norm(
                 self.comm_manager,
                 self.post_attention_layernorm,
@@ -728,7 +740,67 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         return hidden_states
 
 
-class Qwen3_5AttentionDecoderLayer(nn.Module):
+class Qwen3_5LinearDecoderLayer(Qwen3_5DecoderLayer):
+    """Qwen3.5 Decoder Layer with Linear Attention (GatedDeltaNet)."""
+
+    def __init__(
+        self,
+        config: Qwen3_5TextConfig,
+        mapping: Mapping,
+        layer_id: int,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+        alt_stream: torch.cuda.Stream | None = None,
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.mapping = mapping
+        self.layer_id = layer_id
+
+        self.linear_attn = Qwen3_5GatedDeltaNet(
+            config, mapping, layer_id, quant_config, prefix=prefix
+        )
+
+        self.is_moe = _qwen3_5_uses_sparse_moe(config)
+        self.mlp = build_qwen3_5_mlp(
+            config,
+            mapping,
+            layer_id,
+            quant_config,
+            alt_stream,
+            prefix.replace(".linear_attn", ""),
+            self.is_moe,
+        )
+        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = GemmaRMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.comm_manager = self._build_comm_manager()
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        ctx: ForwardContext,
+        aux_hidden_states: list[torch.Tensor] | None = None,
+        **kwargs,
+    ):
+        return self.forward_layer(None, hidden_states, residual, ctx, aux_hidden_states)
+
+    def attention_fp8_scale(self) -> torch.Tensor | None:
+        return self.linear_attn.input_fp8_scale()
+
+    def attend(
+        self,
+        positions: torch.Tensor | None,
+        hidden_states: torch.Tensor,
+        hidden_fp8: torch.Tensor | None,
+        ctx: ForwardContext,
+    ) -> torch.Tensor:
+        return self.linear_attn(hidden_states, hidden_fp8, ctx)
+
+
+class Qwen3_5AttentionDecoderLayer(Qwen3_5DecoderLayer):
     """Qwen3.5 Decoder Layer with Full Attention."""
 
     def __init__(
@@ -743,6 +815,37 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         super().__init__()
         self.config = config
         self.mapping = mapping
+        self._init_attention(config, mapping, layer_id, quant_config, prefix)
+
+        self.is_moe = _qwen3_5_uses_sparse_moe(config)
+        self.mlp = build_qwen3_5_mlp(
+            config,
+            mapping,
+            layer_id,
+            quant_config,
+            alt_stream,
+            prefix.replace(".self_attn", ""),
+            self.is_moe,
+        )
+        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = GemmaRMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.comm_manager = self._build_comm_manager()
+
+    @staticmethod
+    def _uses_attention_output_gate(config: Qwen3_5TextConfig) -> bool:
+        return getattr(config, "attn_output_gate", True)
+
+    def _init_attention(
+        self,
+        config: Qwen3_5TextConfig,
+        mapping: Mapping,
+        layer_id: int,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ) -> None:
+        """Build the attention projections, RoPE and paged attention on the layer."""
         self.hidden_size = config.hidden_size
         self.attn_tp_rank = mapping.attn.tp_rank
         self.attn_tp_size = mapping.attn.tp_size
@@ -768,7 +871,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         self.partial_rotary_factor = self.rope_scaling.get("partial_rotary_factor", 1.0)
         self.layer_id = layer_id
 
-        self.attn_output_gate = getattr(config, "attn_output_gate", True)
+        self.attn_output_gate = self._uses_attention_output_gate(config)
         if self.attn_output_gate:
             logger.warning_once("using attn output gate!")
 
@@ -826,49 +929,6 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             qk_norm=(self.q_norm, self.k_norm),
         )
 
-        # Dense MLP for non-MoE variant
-        if config.model_type == "qwen3_5_text":
-            self.mlp = Qwen3_5MoeMLP(
-                parallelism="dense",
-                mapping=self.mapping,
-                hidden_size=config.hidden_size,
-                intermediate_size=config.intermediate_size,
-                hidden_act=config.hidden_act,
-                quant_config=quant_config,
-                reduce_results=False,
-                prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
-            )
-            is_moe = False
-        elif config.model_type == "qwen3_5_moe_text":
-            self.mlp = Qwen3_5MoeSparseMoeBlock(
-                config=config,
-                mapping=self.mapping,
-                quant_config=quant_config,
-                layer_index=layer_id,
-                alt_stream=alt_stream,
-                prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
-            )
-            is_moe = True
-        else:
-            raise ValueError(f"Invalid model type: {config.model_type}")
-
-        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = GemmaRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-
-        self.is_moe = is_moe
-        self.comm_manager = CommManager(
-            mapping=self.mapping,
-            layer_id=self.layer_id,
-            is_moe=is_moe,
-            prev_is_moe=is_moe,
-            dense_batch_invariant=False,
-            input_layernorm=self.input_layernorm,
-            post_attn_layernorm=self.post_attention_layernorm,
-            query_sharded=False,
-        )
-
     def _project_qkv(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
@@ -910,14 +970,6 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         output, _ = self.o_proj(attn_output)
         return output
 
-    def _maybe_narrow_residual(
-        self,
-        residual: torch.Tensor,
-        ctx: ForwardContext,
-    ) -> torch.Tensor:
-        """Hook: subclasses narrow residual to match a sliced attn output."""
-        return residual
-
     def forward(
         self,
         positions: torch.Tensor,
@@ -927,75 +979,26 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         aux_hidden_states: list[torch.Tensor] | None = None,
         **kwargs,
     ):
-        num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
-            ctx
+        return self.forward_layer(
+            positions, hidden_states, residual, ctx, aux_hidden_states
         )
 
-        hidden_fp4 = None
-        if not ctx.forward_mode.is_idle():
-            hidden_states, hidden_fp8, residual = _input_norm(
-                self.comm_manager,
-                self.input_layernorm,
-                hidden_states,
-                residual,
-                self.qkv_proj.quant_method.static_fp8_input_scale(self.qkv_proj),
-            )
-            capture_layer_input(self.comm_manager, residual, ctx, aux_hidden_states)
-            hidden_states = self.comm_manager.pre_attn_comm(hidden_states, ctx)
-            # qkv_proj is the only reader, so the FP8 copy can stand in for the rows.
-            hidden_states = self.self_attention(
-                positions=positions,
-                hidden_states=hidden_states if hidden_fp8 is None else hidden_fp8,
-                ctx=ctx,
-            )
-            # Free the copy once consumed, as the projection frees its own quant.
-            del hidden_fp8
-            residual = self._maybe_narrow_residual(residual, ctx)
-            hidden_states, hidden_fp4, residual = _post_attn_norm(
-                self.comm_manager,
-                self.post_attention_layernorm,
-                hidden_states,
-                residual,
-                self.mlp.nvfp4_global_scale(),
-                ctx,
-            )
-        else:
-            # No rows, but the tap and its gather stay aligned across ranks.
-            capture_layer_input(
-                self.comm_manager, hidden_states, ctx, aux_hidden_states
-            )
+    def attention_fp8_scale(self) -> torch.Tensor | None:
+        return self.qkv_proj.quant_method.static_fp8_input_scale(self.qkv_proj)
 
-        hidden_states = self.forward_mlp(
-            hidden_states,
-            hidden_fp4,
-            residual,
-            ctx,
-            num_global_tokens,
-            max_num_tokens_per_gpu,
-        )
-
-        return hidden_states, residual
-
-    def forward_mlp(
+    def attend(
         self,
-        hidden_states,
-        hidden_fp4,
-        residual,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        hidden_fp8: torch.Tensor | None,
         ctx: ForwardContext,
-        num_global_tokens,
-        max_num_tokens_per_gpu,
-    ):
-        if isinstance(self.mlp, Qwen3_5MoeSparseMoeBlock):
-            hidden_states = self.mlp(
-                hidden_states, num_global_tokens, max_num_tokens_per_gpu, ctx
-            )
-        else:
-            hidden_states = self.comm_manager.pre_mlp_comm(hidden_states, ctx)
-            hidden_states = self.mlp(hidden_states, hidden_fp4)
-            hidden_states, residual = self.comm_manager.post_mlp_fused(
-                hidden_states, residual, ctx
-            )
-        return hidden_states
+    ) -> torch.Tensor:
+        # qkv_proj is the only reader, so the FP8 copy can stand in for the rows.
+        return self.self_attention(
+            positions=positions,
+            hidden_states=hidden_states if hidden_fp8 is None else hidden_fp8,
+            ctx=ctx,
+        )
 
 
 class Qwen3_5ForCausalLM(nn.Module):
