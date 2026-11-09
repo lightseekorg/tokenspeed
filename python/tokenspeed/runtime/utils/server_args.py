@@ -79,12 +79,14 @@ from tokenspeed.runtime.utils.spec_block_geometry import (
 logger = get_colorful_logger(__name__)
 
 # Sampling backends whose verify runs a draft-prob chain kernel
-# (--enable-speculative-sampling) for the step drafters (EAGLE3, MTP): the
-# FlashInfer backends over whole rows, sonic over its top-128 candidates.
-# greedy verifies by exact match and the Triton backends by target-sampled
-# exact match; the step drafters' dense recorded distribution never enters
-# either.
-SPECULATIVE_SAMPLING_BACKENDS = frozenset({"flashinfer", "flashinfer_full", "sonic"})
+# (--enable-speculative-sampling) for the step drafters (EAGLE3, MTP, and
+# DSpark's Markov steps): the FlashInfer and triton backends over whole rows,
+# sonic over its top-128 candidates. greedy verifies by exact match and
+# triton_full by target-sampled exact match; the step drafters' dense
+# recorded distribution never enters either.
+SPECULATIVE_SAMPLING_BACKENDS = frozenset(
+    {"flashinfer", "flashinfer_full", "sonic", "triton"}
+)
 # The one backend whose verify reads the DFlash2 candidate selector's sparse
 # draft q (RuntimeStates.future_draft_q): a DFlash2 draft needs it. A base DFLASH
 # draft records the dense q and takes SPECULATIVE_SAMPLING_BACKENDS; DFlash.
@@ -2299,13 +2301,13 @@ class ServerArgs:
         distribution q, so the drafter must propose one token per step from
         its own logits (the Eagle family, the multi-depth MTP drafter, and
         DSpark's Markov steps) and the verifier must be a backend that runs
-        the draft-prob chain kernel:
-        ``greedy`` verifies by exact match, so a dense q never enters it, and
-        ``triton`` by a target-sampled exact match unless it runs block
-        verification, which reads the dense q. DFLASH is admitted with either
-        ``triton`` (a DFlash2 draft's sparse q) or a draft-prob backend (a base
-        draft's dense q); only the loaded checkpoint says which, so the drafter
-        refuses the wrong pairing when it binds the verifier. The prefill role of a
+        the draft-prob chain rule:
+        ``greedy`` verifies by exact match and ``triton_full`` by a
+        target-sampled exact match, so a dense q never enters either. DFLASH
+        is admitted with either ``triton`` (a DFlash2 draft's sparse q) or a
+        draft-prob backend (a base draft's dense q); only the loaded checkpoint
+        says which, so the drafter refuses the wrong pairing when it binds the
+        verifier. The prefill role of a
         disaggregated deployment never verifies a chain of its own and its
         drafted candidates ship to the decode node without q, so there the
         flag would only allocate the per-slot distribution buffer; it is
@@ -2344,18 +2346,13 @@ class ServerArgs:
                     f"(DFlash2) or one of {sorted(SPECULATIVE_SAMPLING_BACKENDS)} "
                     f"(base draft); got --sampling-backend {self.sampling_backend}"
                 )
-        elif (
-            self.sampling_backend not in SPECULATIVE_SAMPLING_BACKENDS
-            and not self._block_verifies_on_triton
-        ):
+        elif self.sampling_backend not in SPECULATIVE_SAMPLING_BACKENDS:
             if self.sampling_backend == "greedy":
                 why = "verifies by exact match, so the draft distribution never enters"
-            elif self.sampling_backend in ("triton", "triton_full"):
+            elif self.sampling_backend == "triton_full":
                 why = (
                     "verifies by target-sampled exact match and has no dense "
-                    "draft-prob rejection kernel (triton reads only the DFlash2 "
-                    "selector's sparse q, under DFLASH, and the dense q under "
-                    "--speculative-rejection-sample-method block)"
+                    "draft-prob rejection rule"
                 )
             else:
                 why = "has no draft-prob rejection kernel"

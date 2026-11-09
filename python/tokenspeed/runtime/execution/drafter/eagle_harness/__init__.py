@@ -63,7 +63,7 @@ Where it departs from ``docs/design/tree-speculation.md``:
   masks in place of ``draft_tree_expand``.
 * Sampled trees and chains (``--enable-speculative-sampling``) draw each
   node's children from the draft q (``RuntimeStates.future_draft_q``), which
-  the verifier accepts by recursive rejection sampling
-  (``TreeRejectionSampler``). A sampled round stops at a depth planned before
+  the verifier (the flashinfer or triton sampling backend) accepts by
+  recursive rejection sampling (``TreeRejectionSampler``). A sampled round stops at a depth planned before
   its draws, so where it stops never depends on them.
 """
