@@ -908,6 +908,40 @@ gets a new identity even if its transport IP and port are reused. The sender
 refreshes cached remote memory keys on address reuse without changing the
 public address used by EPD.
 
+### P/D admission
+
+`--disaggregation-decode-allocation-policy` sets what a request's Decode
+allocation gates on a prefill server; the other roles refuse the flag. Under
+either policy the Decode server allocates a request's destination once the
+request reaches it and its pages allow. `early`, the default, admits the
+prefill once every Decode rank of the request has allocated its destination,
+so the KV can stream layer by layer during the forward. `independent`
+(experimental) admits the prefill at once and holds only its KV transfer: a
+computed prompt keeps its pages until the destination is allocated, and a
+destination allocated before the prompt finishes is remembered.
+`independent` requires attention TP 1, `--kv-parallel-size 1`,
+`--pipeline-parallel-size 1`, no `--enable-external-encoder`, an explicit
+`--disaggregation-layerwise-interval 0` and a model without multimodal input
+(or `--language-model-only`); anything else is refused at startup.
+
+Under `independent`, computed prompts waiting for their destination hold
+prefill pages and request slots. Prompts whose destination is allocated go
+first: when one of them does not fit in the pages left, waits behind a partly
+computed prompt without a destination whose next chunk does not fit, or finds
+no free request slot, the prompts behind it wait, and the prefill server
+requeues prompts without a destination, which release their pages and slot,
+stay registered with their Decode server, and are computed again later from
+what the prefix cache kept
+([PD KV transfer metrics](#pd-kv-transfer-metrics) counts them). A Decode
+server short of pages therefore costs the prefill server recomputation. A
+prompt whose destination is not allocated within
+`TOKENSPEED_DISAGGREGATION_BOOTSTRAP_TIMEOUT` (120 s by default) of its
+arrival fails, and its client gets an abort, computed or not. With
+speculative decoding, a requeued prompt sends the first token and draft
+candidates of its first computation beside the draft KV of its second; where
+the two sampled differently, the Decode server's first drafts are accepted
+less. Outputs do not change.
+
 ## Observability
 
 | Parameter | Purpose |
@@ -958,7 +992,11 @@ on the prefill role, waiting for the decode side to allocate their KV pages —
 which the `#req-state(bootstrap/prefill/remote-prefill/decode/pd-pinned)`
 suffix also lists on its own. The Prometheus waiting gauge and the router
 load snapshot report the scheduler's narrower waiting count, without the
-bootstrapping share.
+bootstrapping share. A prefill server under
+`--disaggregation-decode-allocation-policy independent` has no bootstrapping
+share: a request counts as waiting until it is admitted, then in the
+`prefill` share until its transfer starts, and as waiting again once
+requeued ([P/D admission](#pd-admission)).
 
 `tokenspeed:request_queue_time_seconds` is the Prometheus per-request
 queue-wait histogram (`--enable-metrics`): the wall time from a request's
@@ -1116,6 +1154,21 @@ carry the `model_name` and `app_key` labels:
 | `tokenspeed:kv_transfer_latency_seconds` | Histogram | Wall time of one KV transfer send to a peer, recorded on the prefill node (one sample per peer per transferred chunk — per layerwise interval in layerwise mode, except an interval with nothing for that peer; buckets span 1 ms to 60 s). |
 | `tokenspeed:kv_transfer_timeouts_total` | Counter | Transfers that timed out, with a bounded `stage` label: `bootstrapping` (prefill never received the cache manifest; `TOKENSPEED_DISAGGREGATION_BOOTSTRAP_TIMEOUT`) or `waiting_for_input` (decode never received the transfer-done signal; `TOKENSPEED_DISAGGREGATION_WAITING_TIMEOUT`). |
 | `tokenspeed:kv_transfer_failures_total` | Counter | Transfers aborted on failure: send failures on the prefill node, and rooms failed on prefill-node loss (heartbeat) on the decode node. Timeouts are counted separately. |
+
+A prefill server under `--disaggregation-decode-allocation-policy
+independent` ([P/D admission](#pd-admission)) also reports its admission
+with the scheduler's metrics, which carry the `dp_rank` label too:
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `tokenspeed:num_prefill_awaiting_destination_reqs` | Gauge | Prompts computed and waiting for their decode destination, with their pages and request slot. `tokenspeed:num_prefill_inflight_queue_reqs`, the prefill requests whose pages a transfer pins, counts them too. |
+| `tokenspeed:num_prefill_awaiting_destination_pages` | Gauge | KV pages in those prompts' block tables, counted as `tokenspeed:num_free_tokens` counts pages; blocks held outside the tables (such as a pending in-forward State checkpoint) are not included. |
+| `tokenspeed:num_prefill_requeued_requests_total` | Counter | Prompts without a destination requeued to free pages or a request slot for prompts whose destination is allocated. The client sees nothing: the prompt is computed again, and that admission counts again in the prefix-cache metrics. |
+| `tokenspeed:prefill_requeued_tokens_total` | Counter | Prompt tokens the requeued prompts held in KV when requeued, prefix-cache hits included: an upper bound on what their next admission computes again. |
+
+Under `independent` no prefill request waits for its decode peer before it
+computes: `tokenspeed:num_prefill_prealloc_queue_reqs` stays 0, and a request
+not yet computed counts in `tokenspeed:num_requests_waiting`.
 
 ## TokenSpeed-specific runtime knobs
 

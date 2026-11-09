@@ -118,6 +118,7 @@ def make_config(
     storage_config: StorageConfig | None,
     host_write_policy: str,
     prefill_decode_interval: int,
+    decode_allocation_policy: str | None,
     debug_force_retraction_interval: int = 0,
     enable_kv_cache_events: bool = False,
     decode_input_tokens: int = 1,
@@ -172,6 +173,12 @@ def make_config(
             owed to the running decodes after each round that schedules a
             prefill chunk, unless no decode can run, and the most rounds it
             holds any one prompt back in total; 0 is off. Fused role only.
+        decode_allocation_policy:
+            ``--disaggregation-decode-allocation-policy``, required on the
+            prefill role and None on every other: ``"early"`` admits a prompt
+            once its Decode destination is allocated; ``"independent"``
+            admits it at once and holds only its KV transfer for the
+            destination.
         debug_force_retraction_interval: ``--debug-force-retraction-interval``:
             0 is off; every ``|N|`` plans the scheduler retracts the oldest
             quiescent Decoding (``N > 0``) or Prefilling (``N < 0``) request
@@ -265,6 +272,18 @@ def make_config(
     cfg.enable_kv_cache_events = enable_kv_cache_events
 
     cfg.role = scheduler_role(role)
+    # Read here, not at import: a scheduler wheel released before the policy
+    # has neither the field nor its enum and admits every prompt early, so
+    # early is left unset there and independent raises AttributeError.
+    # ServerArgs validates the name, SchedulerConfig::Validate the role.
+    if decode_allocation_policy is not None and (
+        decode_allocation_policy != "early" or hasattr(cfg, "decode_allocation_policy")
+    ):
+        policies = SchedulerConfig.DecodeAllocationPolicy
+        cfg.decode_allocation_policy = {
+            "early": policies.Early,
+            "independent": policies.Independent,
+        }[decode_allocation_policy]
     cfg.decode_input_tokens = decode_input_tokens
     cfg.overlap_schedule_depth = overlap_schedule_depth
     cfg.disable_prefix_cache = disable_prefix_cache

@@ -50,6 +50,7 @@ from test.runtime.cache_pool_test_utils import (  # noqa: E402
 )
 
 import tokenspeed.runtime.engine.rank_setup as rank_setup  # noqa: E402
+import tokenspeed.runtime.engine.scheduler_utils as scheduler_utils  # noqa: E402
 from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig  # noqa: E402
 from tokenspeed.runtime.distributed.mapping import Mapping  # noqa: E402
 from tokenspeed.runtime.engine.rank_setup import (  # noqa: E402
@@ -124,6 +125,7 @@ def test_make_config_requires_and_maps_the_host_write_policy():
         max_retracted_requests=0,
         storage_config=None,
         prefill_decode_interval=0,
+        decode_allocation_policy=None,
     )
     # Keyword-only and required, with or without a Host tier.
     with pytest.raises(TypeError, match="host_write_policy"):
@@ -192,8 +194,8 @@ def test_an_engine_with_l3_passes_its_prefetch_threshold():
 
 @pytest.mark.parametrize("role", ["prefill", "decode"])
 def test_pd_roles_configure_their_pools_as_resolved(role):
-    # The prefill role resolves to no pool and no forced retraction; the
-    # decode role keeps both.
+    # The prefill role resolves to no pool, no forced retraction and early
+    # admission; the decode role keeps both and has no admission policy.
     args = ServerArgs(
         model="x",
         max_num_seqs=8,
@@ -208,6 +210,54 @@ def test_pd_roles_configure_their_pools_as_resolved(role):
     )
     assert (cfg.num_snapshot_pages, cfg.max_retracted_requests) == pool
     assert cfg.debug_force_retraction_interval == (0 if role == "prefill" else 3)
+    assert cfg.decode_allocation_policy == (
+        ts.SchedulerConfig.DecodeAllocationPolicy.Early if role == "prefill" else None
+    )
+
+
+def test_independent_admission_reaches_the_prefill_scheduler():
+    args = ServerArgs(
+        model="x",
+        disaggregation_mode="prefill",
+        disaggregation_decode_allocation_policy="independent",
+        disaggregation_layerwise_interval=0,
+    )
+    cfg = _config(args, _specs(num_host_pages=0, num_snapshot_pages=1, max_retracted=0))
+    assert (
+        cfg.decode_allocation_policy
+        == ts.SchedulerConfig.DecodeAllocationPolicy.Independent
+    )
+
+
+def test_an_older_scheduler_wheel_admits_early_without_the_policy(monkeypatch):
+    # tokenspeed-scheduler 0.1.52 has neither the field nor its enum and only
+    # admits a prompt once its destination is allocated: a prefill server
+    # starts with early left unset, and independent fails at startup.
+    class OldSchedulerConfig:
+        pass
+
+    monkeypatch.setattr(scheduler_utils, "SchedulerConfig", OldSchedulerConfig)
+    specs = _specs(num_host_pages=0, num_snapshot_pages=1, max_retracted=0)
+    args = ServerArgs(
+        model="x",
+        max_num_seqs=8,
+        disaggregation_mode="prefill",
+        disaggregation_transfer_backend="mooncake",
+    )
+    assert args.disaggregation_decode_allocation_policy == "early"
+    cfg = _config(args, specs)
+    assert cfg.num_snapshot_pages == 1
+    assert "decode_allocation_policy" not in vars(cfg)
+    args = ServerArgs(
+        model="x",
+        max_num_seqs=8,
+        disaggregation_mode="prefill",
+        disaggregation_transfer_backend="mooncake",
+        disaggregation_decode_allocation_policy="independent",
+        disaggregation_layerwise_interval=0,
+    )
+    with pytest.raises(AttributeError, match="DecodeAllocationPolicy"):
+        _config(args, specs)
 
 
 @pytest.mark.parametrize(
@@ -877,6 +927,7 @@ def test_make_config_sets_the_prefill_chunk_yield_only_when_on():
         storage_config=None,
         host_write_policy="write_through",
         prefill_decode_interval=0,
+        decode_allocation_policy="early",
     )
     assert make_config(**fields).prefill_chunk_yield_tokens == 0
     assert (

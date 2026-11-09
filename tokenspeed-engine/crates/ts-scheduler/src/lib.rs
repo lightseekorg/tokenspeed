@@ -378,6 +378,17 @@ mod ffi {
         remote_prefilling: usize,
         /// PD: requests whose pages a transfer still pins.
         pd_transfer: usize,
+        /// PD, P role, independent admission: computed prompts waiting for
+        /// their decode destination; also counted in `prefilling` and
+        /// `pd_transfer`.
+        awaiting_destination: usize,
+        /// PD, P role, independent admission: prompts requeued for granted
+        /// work since start.
+        requeues: u64,
+        /// The prompt tokens those prompts held in KV when requeued,
+        /// prefix-cache hits included: an upper bound on what their next
+        /// admission computes again.
+        requeued_tokens: u64,
         /// Cache blocks holding nothing.
         empty_lcm_blocks: i32,
     }
@@ -435,6 +446,7 @@ mod ffi {
         fn admission_snapshot(scheduler: &Scheduler, token_step: i32) -> AdmissionSnapshot;
         fn sizes(scheduler: &Scheduler) -> SchedulerSizes;
         fn active_lcm_blocks(scheduler: &Scheduler) -> i32;
+        fn awaiting_destination_lcm_blocks(scheduler: &Scheduler) -> i32;
         fn cache_group_pages(scheduler: &Scheduler, group_id: &str) -> CacheGroupPages;
         fn drain_kv_events(scheduler: Pin<&mut Scheduler>) -> Vec<KvEventView>;
         fn request_token_size(scheduler: &Scheduler, request_id: &str) -> i32;
@@ -622,6 +634,14 @@ impl Scheduler {
     /// context; a caller on the round's path reuses it.
     pub fn active_lcm_blocks(&self) -> i32 {
         ffi::active_lcm_blocks(self.get())
+    }
+
+    /// Cache blocks in the block tables of the prompts
+    /// `sizes().awaiting_destination` counts, counted as `active_lcm_blocks`
+    /// counts them (a walk of those tables); blocks held outside the tables
+    /// (e.g. a pending in-forward State checkpoint) are not included.
+    pub fn awaiting_destination_lcm_blocks(&self) -> i32 {
+        ffi::awaiting_destination_lcm_blocks(self.get())
     }
 
     /// One cache group's page counts.

@@ -114,6 +114,10 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .value("WriteThrough", tokenspeed::SchedulerConfig::HostWritePolicy::kWriteThrough)
         .value("WriteBack", tokenspeed::SchedulerConfig::HostWritePolicy::kWriteBack);
 
+    nb::enum_<tokenspeed::SchedulerConfig::DecodeAllocationPolicy>(scheduler_config, "DecodeAllocationPolicy")
+        .value("Early", tokenspeed::SchedulerConfig::DecodeAllocationPolicy::kEarly)
+        .value("Independent", tokenspeed::SchedulerConfig::DecodeAllocationPolicy::kIndependent);
+
     nb::enum_<tokenspeed::AttnKind>(m, "AttnKind")
         .value("Full", tokenspeed::AttnKind::kFull)
         .value("SlidingWindow", tokenspeed::AttnKind::kSlidingWindow)
@@ -163,6 +167,10 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("decode_input_tokens", &tokenspeed::SchedulerConfig::decode_input_tokens)
         .def_rw("overlap_schedule_depth", &tokenspeed::SchedulerConfig::overlap_schedule_depth)
         .def_rw("role", &tokenspeed::SchedulerConfig::role)
+        // P role, required there and None elsewhere: Early admits a prompt
+        // once its Decode destination is allocated, Independent at
+        // submission, holding only its KV transfer for the destination.
+        .def_rw("decode_allocation_policy", &tokenspeed::SchedulerConfig::decode_allocation_policy)
         .def_prop_rw(
             "num_device_pages", [](const tokenspeed::SchedulerConfig& c) { return c.device_allocator.total_pages; },
             [](tokenspeed::SchedulerConfig& c, std::int32_t v) { c.device_allocator.total_pages = v; })
@@ -701,11 +709,24 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
              "while this is non-zero.")
         .def("decoding_size", &tokenspeed::Scheduler::DecodingSize, "Count requests in the Decoding FSM state.")
         .def("prefilling_size", &tokenspeed::Scheduler::PrefillSize,
-             "Count local/remote prefills, PrefillAwaitingResult, and PrefillDone requests.")
+             "Count local/remote prefills, PrefillAwaitingResult, PrefillAwaitingDestination, and PrefillDone "
+             "requests.")
         .def("remote_prefilling_size", &tokenspeed::Scheduler::RemotePrefillSize,
              "Count RemotePrefilling requests; these are also included in prefilling_size().")
         .def("pd_transfer_size", &tokenspeed::Scheduler::PdTransferSize,
              "Count requests with PD-pinned pages; this resource count overlaps lifecycle states.")
+        .def("awaiting_destination_size", &tokenspeed::Scheduler::AwaitingDestinationSize,
+             "P role, independent admission: count computed prompts waiting for their Decode destination "
+             "(PrefillAwaitingDestination); these are also included in prefilling_size() and pd_transfer_size().")
+        .def("awaiting_destination_lcm_blocks", &tokenspeed::Scheduler::AwaitingDestinationLcmBlocks,
+             "Device LCM blocks in the block tables of the prompts awaiting_destination_size() counts, counted "
+             "as active_lcm_blocks() counts them; blocks held outside the tables (e.g. a pending in-forward "
+             "State checkpoint) are not included.")
+        .def("requeues", &tokenspeed::Scheduler::Requeues,
+             "P role, independent admission: prompts requeued for granted work since start.")
+        .def("requeued_tokens", &tokenspeed::Scheduler::RequeuedTokens,
+             "Prompt tokens the requeued prompts held in KV when requeued, prefix-cache hits included; an upper "
+             "bound on what their next admission computes again.")
         .def("available_lcm_blocks", &tokenspeed::Scheduler::AvailableLcmBlocks)
         .def("empty_lcm_blocks", &tokenspeed::Scheduler::EmptyLcmBlocks)
         .def("active_lcm_blocks", &tokenspeed::Scheduler::ActiveLcmBlocks)

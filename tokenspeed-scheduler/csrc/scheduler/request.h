@@ -44,7 +44,7 @@ namespace tokenspeed {
 
 class Request {
 public:
-    Request(const RequestSpec& spec, std::int32_t prefix_granularity, Role role);
+    Request(const RequestSpec& spec, std::int32_t prefix_granularity, bool awaits_bootstrap);
 
     const std::string& Id() const { return id_; }
     const std::string& SessionId() const { return session_id_; }
@@ -82,6 +82,21 @@ public:
     // on it spans every chunk.
     std::int32_t PrefillDeferredRounds() const { return prefill_deferred_rounds_; }
     void NotePrefillDeferred() { ++prefill_deferred_rounds_; }
+
+    // A pd::BootstrappedEvent arrived; on the P role, which alone reads this,
+    // that means every Decode rank allocated the destination. Until then a
+    // computed P prompt waits for it in PrefillAwaitingDestination instead
+    // of sending its KV.
+    bool DestinationReady() const { return destination_ready_; }
+    void MarkDestinationReady() { destination_ready_ = true; }
+
+    // P role: requeued (fsm::RequeueEvent) after its final chunk sampled the
+    // first token, which the runtime keeps and sends with the KV of the next
+    // computation; true until that computation's token lands or the request
+    // ends. A flush -- a weight update -- in between would pair a token of the
+    // old weights with KV of the new, so every flush refuses meanwhile
+    // (Scheduler::CanClearCache), though the prompt holds no pages.
+    bool RequeuedAfterSampling() const { return requeued_after_sampling_; }
 
     // True when the last admission's headroom already covers every token
     // this request could still generate. Retracting such a request is pure
@@ -132,9 +147,16 @@ public:
                       std::same_as<std::remove_cvref_t<Event>, fsm::ScheduleRestoreEvent>) {
             generated_tokens_at_admission_ = GeneratedTokens();
         }
+        // A requeue drops the sampled token, so it is read first.
+        if constexpr (std::same_as<std::remove_cvref_t<Event>, fsm::RequeueEvent>) {
+            requeued_after_sampling_ = requeued_after_sampling_ || HasGeneratedOutput();
+        }
         state_ = std::visit(
             [&event](auto&& state) -> fsm::State { return fsm::ToState(std::forward<Event>(event)(std::move(state))); },
             std::move(state_));
+        if (HasGeneratedOutput() || Is<fsm::Finished>()) {
+            requeued_after_sampling_ = false;
+        }
     }
 
     template <typename State>
@@ -313,6 +335,9 @@ public:
             Overloaded{
                 [](const fsm::PrefillDone& state) { return state.ReserveNumTokensInNextScheduleEvent(); },
                 [](const fsm::PrefillAwaitingResult& state) { return state.ReserveNumTokensInNextScheduleEvent(); },
+                [](const fsm::PrefillAwaitingDestination& state) {
+                    return state.ReserveNumTokensInNextScheduleEvent();
+                },
                 [](const fsm::Decoding& state) { return state.ReserveNumTokensInNextScheduleEvent(); },
                 [this](const auto&) -> std::int32_t {
                     throw std::logic_error(
@@ -324,22 +349,24 @@ public:
     }
 
     std::string StateName() const {
-        return std::visit(Overloaded{
-                              [](const fsm::Bootstrapping&) -> std::string { return "Bootstrapping"; },
-                              [](const fsm::Submitted&) -> std::string { return "Submitted"; },
-                              [](const fsm::Prefetching&) -> std::string { return "Prefetching"; },
-                              [](const fsm::Prefilling&) -> std::string { return "Prefilling"; },
-                              [](const fsm::RemotePrefilling&) -> std::string { return "RemotePrefilling"; },
-                              [](const fsm::PrefillAwaitingResult&) -> std::string { return "PrefillAwaitingResult"; },
-                              [](const fsm::PrefillDone&) -> std::string { return "PrefillDone"; },
-                              [](const fsm::Decoding&) -> std::string { return "Decoding"; },
-                              [](const fsm::PdTransferring&) -> std::string { return "PdTransferring"; },
-                              [](const fsm::Retracted&) -> std::string { return "Retracted"; },
-                              [](const fsm::Restoring&) -> std::string { return "Restoring"; },
-                              [](const fsm::Finishing&) -> std::string { return "Finishing"; },
-                              [](const fsm::Finished&) -> std::string { return "Finished"; },
-                          },
-                          state_);
+        return std::visit(
+            Overloaded{
+                [](const fsm::Bootstrapping&) -> std::string { return "Bootstrapping"; },
+                [](const fsm::Submitted&) -> std::string { return "Submitted"; },
+                [](const fsm::Prefetching&) -> std::string { return "Prefetching"; },
+                [](const fsm::Prefilling&) -> std::string { return "Prefilling"; },
+                [](const fsm::RemotePrefilling&) -> std::string { return "RemotePrefilling"; },
+                [](const fsm::PrefillAwaitingResult&) -> std::string { return "PrefillAwaitingResult"; },
+                [](const fsm::PrefillAwaitingDestination&) -> std::string { return "PrefillAwaitingDestination"; },
+                [](const fsm::PrefillDone&) -> std::string { return "PrefillDone"; },
+                [](const fsm::Decoding&) -> std::string { return "Decoding"; },
+                [](const fsm::PdTransferring&) -> std::string { return "PdTransferring"; },
+                [](const fsm::Retracted&) -> std::string { return "Retracted"; },
+                [](const fsm::Restoring&) -> std::string { return "Restoring"; },
+                [](const fsm::Finishing&) -> std::string { return "Finishing"; },
+                [](const fsm::Finished&) -> std::string { return "Finished"; },
+            },
+            state_);
     }
 
 private:
@@ -358,6 +385,8 @@ private:
     // GeneratedTokens() when the current admission was granted.
     std::int32_t generated_tokens_at_admission_{0};
     std::vector<std::int32_t> spec_candidate_ids_;
+    bool destination_ready_{false};
+    bool requeued_after_sampling_{false};
     std::int32_t prefix_granularity_{};
     std::optional<std::vector<std::string>> prompt_prefix_hashes_{};
     std::vector<std::uint64_t> kv_event_block_hashes_;

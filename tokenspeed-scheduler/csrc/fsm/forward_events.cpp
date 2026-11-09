@@ -165,6 +165,10 @@ Finished AbortEvent::operator()(PrefillAwaitingResult&& state) {
     return abortForward(std::move(state));
 }
 
+Finished AbortEvent::operator()(PrefillAwaitingDestination&& state) {
+    return abortForward(std::move(state));
+}
+
 Finished AbortEvent::operator()(Decoding&& state) {
     return abortForward(std::move(state));
 }
@@ -182,6 +186,23 @@ Finished AbortEvent::operator()(Restoring&& state) {
     // both ends of every pair pinned until the ACK, so freeing the tables
     // here only drops the request's own references.
     return abortForward(std::move(state));
+}
+
+template <typename State>
+Submitted RequeueEvent::requeue(State&& state) {
+    _assert(coordinator_ != nullptr, "RequeueEvent requires a cache coordinator");
+    _assert(state.resources.results_in_flight == 0, "a requeued prompt has no forward in flight");
+    FreeRequest(*coordinator_, state.resources.block_tables);
+    state.resources.token_container->DropGeneratedTokens();
+    return Submitted{state.resources.token_container, state.resources.prefix_granularity};
+}
+
+Submitted RequeueEvent::operator()(Prefilling&& state) {
+    return requeue(std::move(state));
+}
+
+Submitted RequeueEvent::operator()(PrefillAwaitingDestination&& state) {
+    return requeue(std::move(state));
 }
 
 template <typename State>

@@ -172,6 +172,7 @@ struct AbortEvent : InvalidTransitionHandler<AbortEvent> {
     Finished operator()(RemotePrefilling&& state);
     Finished operator()(PrefillDone&& state);
     Finished operator()(PrefillAwaitingResult&& state);
+    Finished operator()(PrefillAwaitingDestination&& state);
     Finished operator()(Decoding&& state);
     Finished operator()(Retracted&& state);
     Finished operator()(Restoring&& state);
@@ -182,6 +183,34 @@ struct AbortEvent : InvalidTransitionHandler<AbortEvent> {
 private:
     template <typename State>
     Finished abortForward(State&& state);
+
+    CacheCoordinator* coordinator_{};
+};
+
+// P role: a prompt whose Decode destination is not allocated yet gives its
+// pages and request-pool slot to granted work and waits in Submitted to be
+// computed again (Scheduler::buildPrefillWorkerPlan); the caller published
+// what it computed first, so its next admission resumes from the prefix
+// cache. Nothing is out against the pages: no forward (the caller checks)
+// and no PD transfer -- the peer has no destination to send them to, and
+// only a remote decode, which needs one, hands them over. A computed prompt
+// drops the token its final chunk sampled; the runtime keeps that token and
+// reports it again when the prompt completes again, so the drafter
+// candidates that came with it (Request::StoreSpecCandidates) still match
+// the token sent. The drafter KV sent with them is the recomputation's,
+// though: where its sample differed, the decode node's first drafts are
+// accepted less (verification is exact, so outputs do not change).
+struct RequeueEvent : InvalidTransitionHandler<RequeueEvent> {
+    using InvalidTransitionHandler<RequeueEvent>::operator();
+
+    explicit RequeueEvent(CacheCoordinator* coordinator) : coordinator_{coordinator} {}
+
+    Submitted operator()(Prefilling&& state);
+    Submitted operator()(PrefillAwaitingDestination&& state);
+
+private:
+    template <typename State>
+    Submitted requeue(State&& state);
 
     CacheCoordinator* coordinator_{};
 };
@@ -294,7 +323,11 @@ private:
 struct ExtendResultEvent : InvalidTransitionHandler<ExtendResultEvent> {
     using InvalidTransitionHandler<ExtendResultEvent>::operator();
 
-    explicit ExtendResultEvent(std::vector<std::int32_t> result_tokens) : result_tokens_{std::move(result_tokens)} {}
+    // `await_destination`: a P prompt whose Decode destination is not
+    // allocated yet parks in PrefillAwaitingDestination once its last token
+    // is real, instead of becoming PrefillDone.
+    ExtendResultEvent(std::vector<std::int32_t> result_tokens, bool await_destination)
+        : result_tokens_{std::move(result_tokens)}, await_destination_{await_destination} {}
 
     template <typename State>
         requires CanExtendTokenContainer<State>
@@ -311,11 +344,16 @@ struct ExtendResultEvent : InvalidTransitionHandler<ExtendResultEvent> {
     // waiting FOR: the prompt's last token is now real, so the request
     // becomes schedulable (P: its remote decode can carry the bootstrap
     // token).
-    std::variant<PrefillDone, PrefillAwaitingResult> operator()(PrefillAwaitingResult&& state) {
+    std::variant<PrefillDone, PrefillAwaitingResult, PrefillAwaitingDestination> operator()(
+        PrefillAwaitingResult&& state) {
         if (result_tokens_.empty()) {
             return std::move(state);
         }
         state.ExtendResultTokens(result_tokens_);
+        if (await_destination_) {
+            return PrefillAwaitingDestination{std::move(state.resources), state.window,
+                                              state.ReserveNumTokensInNextScheduleEvent()};
+        }
         // Older intermediate chunk results may still be landing on these
         // pages (see above): the bundle, in-flight count included, moves on.
         return PrefillDone{std::move(state.resources), state.window, state.ReserveNumTokensInNextScheduleEvent()};
@@ -337,6 +375,7 @@ struct ExtendResultEvent : InvalidTransitionHandler<ExtendResultEvent> {
 
 private:
     std::vector<std::int32_t> result_tokens_;
+    bool await_destination_;
 };
 
 }  // namespace tokenspeed::fsm

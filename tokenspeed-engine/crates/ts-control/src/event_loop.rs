@@ -154,7 +154,10 @@ const ACTIVE_PAGES_REFRESH: Duration = Duration::from_millis(100);
 /// loop runs no request, when the walk costs nothing and an engine that went
 /// idle reports none active at once. A count taken while idle is not kept:
 /// the first round after requests arrive takes a new one, so an engine that
-/// just took a burst does not report none active for the next 100 ms.
+/// just took a burst does not report none active for the next 100 ms. The
+/// prefill role's gauge of the pages its computed prompts hold while they
+/// wait for their decode destination is the same walk over their tables, so
+/// it is throttled the same way, idle while no prompt waits.
 #[derive(Debug, Default)]
 struct ActivePages {
     /// The last count taken while requests ran, and when.
@@ -550,6 +553,9 @@ pub struct EventLoop<D: DataPlane, F: Frontend> {
     reported_load: Option<Load>,
     /// The scheduler's active page count, reused across rounds.
     active_pages: ActivePages,
+    /// P role: the pages of the computed prompts waiting for their decode
+    /// destination, reused across rounds as `active_pages` is.
+    awaiting_destination_pages: ActivePages,
 }
 
 /// What a round starts from, the same on every replica member.
@@ -608,6 +614,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             last_load_report: None,
             reported_load: None,
             active_pages: ActivePages::default(),
+            awaiting_destination_pages: ActivePages::default(),
         }
     }
 
@@ -831,7 +838,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         // the batch line: nothing between the two mutates the scheduler, so
         // they are taken once, and only for a reader.
         let mut planned_sizes: Option<SchedulerSizes> = None;
-        if let Some(metrics) = &self.metrics {
+        if let Some(metrics) = &mut self.metrics {
             // A retraction victim's image store is the retraction signal.
             let retracted = cache_ops
                 .iter()
@@ -866,11 +873,28 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 self.config.kv_token_capacity,
             );
             match self.outputs.role() {
-                crate::output::Role::Prefill => metrics.record_prefill_queues(
-                    sizes.bootstrapping as i64,
-                    sizes.pd_transfer as i64,
-                    sizes.retracted as i64,
-                ),
+                crate::output::Role::Prefill => {
+                    // A walk of the waiting prompts' block tables, throttled
+                    // as the active count's is; none while no prompt waits.
+                    let none_waiting = sizes.awaiting_destination == 0;
+                    let awaiting_destination_pages =
+                        self.awaiting_destination_pages
+                            .read(Instant::now(), none_waiting, || {
+                                if none_waiting {
+                                    0
+                                } else {
+                                    scheduler.awaiting_destination_lcm_blocks()
+                                }
+                            });
+                    metrics.record_prefill_queues(
+                        sizes.bootstrapping as i64,
+                        sizes.pd_transfer as i64,
+                        sizes.retracted as i64,
+                        sizes.awaiting_destination as i64,
+                        i64::from(awaiting_destination_pages),
+                    );
+                    metrics.record_prefill_requeues(sizes.requeues, sizes.requeued_tokens);
+                }
                 crate::output::Role::Decode => metrics.record_decode_queues(
                     sizes.bootstrapping as i64,
                     sizes.pd_transfer as i64,

@@ -1090,13 +1090,15 @@ Scheduler::VictimChoice Scheduler::chooseVictim(std::span<Request* const> candid
     return newest_choice;
 }
 
-// The first half of a retraction: hashes the prefix pages the victim
+// The first half of a retraction, and what a P requeue publishes before its
+// pages go (buildPrefillWorkerPlan): hashes the prefix pages the victim
 // completed since its last admission and publishes them into the Device index
 // -- exactly what its next admission would have published -- then writes the
 // progress back. Only what has actually been computed is published (an
 // incomplete prefill has only the chunks it has been through; TokenSize()
 // would publish pages that were never computed). Device-only: the pages reach
-// Host through the image's L2 leg.
+// Host through the image's L2 leg (a requeue has none: its next admission
+// resumes from what the Device keeps).
 void Scheduler::publishCompletedPrefix(Request& victim) {
     fsm::CacheProgress cache_progress = victim.CacheProgress();
     const std::int32_t num_computed_tokens = victim.NumComputedTokens();
@@ -1787,7 +1789,9 @@ void Scheduler::carryWholePrompts(AdmissionFeedback& feedback, PlanBuild& build,
 // becoming the capacity blocker (retracting a victim for it is pure thrash
 // -- the two simply do not fit together), but it does seal new-prompt
 // admission (new_prompts_sealed): a newcomer taking the pages it is waiting
-// for would starve it.
+// for would starve it. With blocked_prompt_seals (the P role while a
+// computed prompt waits for its Decode destination, buildPrefillWorkerPlan),
+// a new prompt that fails for capacity stops the new prompts behind it too.
 //
 // With prefill_chunk_yield_tokens (P role), a chunk that cannot finish its
 // prompt -- a resident's or a new prompt's first -- first gives up the tokens
@@ -1799,7 +1803,7 @@ void Scheduler::carryWholePrompts(AdmissionFeedback& feedback, PlanBuild& build,
 // stops everything behind it.
 void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild& build,
                                          std::span<Request* const> candidates, bool new_prompts_sealed,
-                                         std::int32_t decode_reserve) {
+                                         bool blocked_prompt_seals, std::int32_t decode_reserve) {
     std::optional<std::vector<WholePrompt>> whole_prompts;
     for (const bool resident : {true, false}) {
         if (!resident && new_prompts_sealed) {
@@ -1850,7 +1854,7 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
                 }
             } else if (feedback.admission_failed) {
                 feedback.NoteCapacityBlocked(request);
-                if (resident) {
+                if (resident || blocked_prompt_seals) {
                     return;
                 }
             }
@@ -1884,15 +1888,41 @@ void Scheduler::scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& buil
 
 // P role: prefill worker. Completed prompts leave on plan.remote_decode
 // first -- their KV pages stay pinned until the transfer finishes
-// (pdTransferInFlight: on this role every page-holding state is pinned, from
-// the first scheduled chunk to the PD ACK), so releasing them outranks
+// (pdTransferInFlight: on this role a page-holding state is pinned from the
+// first scheduled chunk to the PD ACK), so releasing them outranks
 // feeding more prompt work -- then the prefill phases run with the same
 // completing-chunk decode reserve as every other role: this node never
 // decodes locally, but the forward that completes a prompt drafts the first
 // candidate window into that reserve before the remote decode ships it. No
-// retraction either: a P node's pressure valve is the transfer itself, so
-// this grammar never calls maybeRetractForCapacity and nothing here is ever
-// restored.
+// retraction either: this grammar never calls maybeRetractForCapacity and
+// nothing here is ever restored.
+//
+// Granted work first. At most one prefill is ever incomplete, the head of
+// line (scheduleLocalPrefillWork): its chunk runs first, whether or not its
+// Decode destination is allocated (Request::DestinationReady), then the
+// prompts that have one, then the rest; under early admission every
+// candidate has one, so the order stays the FIFO. Under independent
+// admission a prompt without a destination may hold pages and a request-pool
+// slot that only its destination, or its bootstrap timeout, would free,
+// while a granted prompt's come back at its transfer's ACK. So while a
+// granted admission is blocked -- it failed for capacity, it waits behind a
+// head of line without a destination whose chunk failed, or it found no free
+// request-pool slot, which an admission does not report as a capacity
+// failure -- no prompt without a destination is admitted, and in a round no
+// prefill progressed holders without one are requeued (fsm::RequeueEvent)
+// until the blocked admission fits: the head of line first, once its
+// forward landed, then computed prompts waiting for their destination,
+// newest first. While a computed prompt waits for its destination, the
+// prompts behind a granted one that failed for capacity wait too, granted or
+// not: smaller ones that kept fitting would keep every round in progress,
+// and the blocked prompt would wait for the destination of a prompt holding
+// its pages, which the Decode node may not allocate before the blocked
+// prompt's KV frees its own. (A head of line without a destination holds
+// the line or stops the phases anyway, and a prompt whose final forward is
+// out is computed within the in-flight depth.) A requeued prompt's room
+// stays registered and its client sees nothing: it is computed again,
+// resuming from what the prefix cache kept of it, once granted work no
+// longer blocks or its destination is allocated.
 void Scheduler::buildPrefillWorkerPlan(AdmissionFeedback& feedback, PlanBuild& build,
                                        std::span<Request* const> candidates) {
     // The prompt decodes on the peer node: its KV goes out on the plan's own
@@ -1911,7 +1941,91 @@ void Scheduler::buildPrefillWorkerPlan(AdmissionFeedback& feedback, PlanBuild& b
         }
     }
 
-    scheduleLocalPrefillWork(feedback, build, candidates, /*new_prompts_sealed=*/false, config_.decode_input_tokens);
+    // The resident chunk -- at most one prefill is ever incomplete, and it
+    // keeps the head of line -- and the prompts whose destination is
+    // allocated, then the prompts without one. While a computed prompt waits
+    // for its destination, a granted prompt that does not fit stops the
+    // prompts behind it, so that the round makes no progress and requeues.
+    std::vector<Request*> ordered(candidates.begin(), candidates.end());
+    const auto rest = std::ranges::stable_partition(ordered, [](const Request* request) {
+                          return request->DestinationReady() || request->Is<fsm::Prefilling>();
+                      }).begin();
+    const std::span<Request* const> first(ordered.begin(), rest);
+    scheduleLocalPrefillWork(feedback, build, first, /*new_prompts_sealed=*/false,
+                             /*blocked_prompt_seals=*/AwaitingDestinationSize() > 0, config_.decode_input_tokens);
+    if (std::ranges::any_of(
+            first, [&build](Request* request) { return build.Scheduled(*request) && holdsHeadOfLine(*request); })) {
+        return;
+    }
+    // Granted work blocked: a granted chunk failed for capacity, granted
+    // prompts wait behind a resident without a destination that failed, or
+    // they found no free request-pool slot.
+    const auto waiting = std::ranges::find_if(
+        first, [&build](Request* request) { return request->Is<fsm::Submitted>() && !build.Scheduled(*request); });
+    Request* blocked = feedback.capacity_blocker;
+    const bool resident_failed = blocked != nullptr && blocked->Is<fsm::Prefilling>();
+    if ((blocked != nullptr && !blocked->DestinationReady()) ||
+        (blocked == nullptr && req_pool_allocator_.AvailableSlots() == 0)) {
+        blocked = waiting == first.end() ? nullptr : *waiting;
+    }
+    if (blocked == nullptr) {
+        if (!resident_failed) {
+            scheduleLocalPrefillWork(feedback, build, std::span<Request* const>(rest, ordered.end()),
+                                     /*new_prompts_sealed=*/false, /*blocked_prompt_seals=*/false,
+                                     config_.decode_input_tokens);
+        }
+        return;
+    }
+    // As for a retraction (maybeRetractForCapacity), only a round in which no
+    // prefill progressed requeues; the blocked admission is then its only
+    // prefill.
+    if (!build.NoPrefillProgress()) {
+        return;
+    }
+    auto newest_first = requests_ | std::views::reverse;
+    while (true) {
+        // A resident without a destination keeps the head of line, so it goes
+        // first, once its forward landed; then the newest computed prompt
+        // waiting for its destination.
+        Request* victim = nullptr;
+        const auto resident = std::ranges::find_if(newest_first, [](const std::unique_ptr<Request>& request) {
+            return request->Is<fsm::Prefilling>() && !request->DestinationReady();
+        });
+        if (resident != newest_first.end()) {
+            if ((*resident)->ResultsInFlight() > 0) {
+                return;
+            }
+            victim = resident->get();
+        } else {
+            const auto computed = std::ranges::find_if(newest_first, [](const std::unique_ptr<Request>& request) {
+                return request->Is<fsm::PrefillAwaitingDestination>() && request->ResultsInFlight() == 0;
+            });
+            if (computed == newest_first.end()) {
+                return;  // granted holders free their pages as their transfers finish
+            }
+            victim = computed->get();
+        }
+        // No forward is out against the victim's pages, so none of this
+        // round's batch either.
+        publishCompletedPrefix(*victim);
+        ++requeues_;
+        requeued_tokens_ += static_cast<std::uint64_t>(victim->NumComputedTokens());
+        victim->Apply(fsm::RequeueEvent{&coordinator_});
+        spdlog::info("[Scheduler] requeue: request {} ({} tokens) gives its pages to granted work", victim->Id(),
+                     victim->TokenSize());
+        feedback.admission_failed = false;
+        if (auto admitted =
+                schedulePrefillCandidate(build.plan, feedback, blocked, build.token_budget, config_.decode_input_tokens,
+                                         build.load_backs, build.kv_page_budget, /*yield_tokens=*/0,
+                                         /*must_complete=*/false)) {
+            pushOperation(build, *blocked, std::move(*admitted));
+            blocked->TrackScheduledForward();
+            return;
+        }
+        if (!feedback.admission_failed && req_pool_allocator_.AvailableSlots() > 0) {
+            return;  // not a capacity failure (zero-token alignment, a pending eviction store)
+        }
+    }
 }
 
 // D role: decode worker. One restore rides beside the decode batch, then at
@@ -2004,7 +2118,8 @@ void Scheduler::buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, st
 
     const bool prefill_phases_skipped = interval_owes_decodes && build.pushed_decode;
     if (!prefill_phases_skipped) {
-        scheduleLocalPrefillWork(feedback, build, candidates, new_prompts_sealed, config_.decode_input_tokens);
+        scheduleLocalPrefillWork(feedback, build, candidates, new_prompts_sealed, /*blocked_prompt_seals=*/false,
+                                 config_.decode_input_tokens);
     }
 
     if (!config_.enable_mixed_prefill_decode && !interval_owes_decodes && !build.pushed_prefill) {

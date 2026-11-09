@@ -230,7 +230,9 @@ bool Scheduler::cacheIsClearable(bool include_host) const {
     const bool has_pd_transfers = std::ranges::any_of(
         requests_, [this](const std::unique_ptr<Request>& request) { return pdTransferInFlight(*request); });
     const bool has_tier_transfers = tier_transfers_.HasAnyInFlight() || (include_host && StoragePending());
-    if (has_pd_transfers || has_tier_transfers || RetractedSize() > 0) {
+    const bool has_sampled_requeues = std::ranges::any_of(
+        requests_, [](const std::unique_ptr<Request>& request) { return request->RequeuedAfterSampling(); });
+    if (has_pd_transfers || has_tier_transfers || RetractedSize() > 0 || has_sampled_requeues) {
         return false;
     }
     return coordinator_.CacheIsClearable(include_host);
@@ -246,14 +248,21 @@ bool Scheduler::clearCache(bool include_host) {
     // continues from those bytes once restored, so a flush (a weight update)
     // under it would resume old-weight KV under new weights. Its L2 leg is
     // pinned and would refuse the Host clear by itself; its snapshot-pool leg
-    // is not indexed anywhere, so the suspended set is checked directly.
+    // is not indexed anywhere, so the suspended set is checked directly. A P
+    // prompt requeued after sampling its first token holds no pages either,
+    // but the runtime sends that token with the KV of its next computation
+    // (Request::RequeuedAfterSampling).
     const bool has_pd_transfers = std::ranges::any_of(
         requests_, [this](const std::unique_ptr<Request>& request) { return pdTransferInFlight(*request); });
     const bool has_tier_transfers = tier_transfers_.HasAnyInFlight() || (include_host && StoragePending());
     const std::size_t suspended = RetractedSize();
-    if (has_pd_transfers || has_tier_transfers || suspended > 0) {
-        spdlog::info("[Scheduler] flush {}cache rejected: pd_transfers={} tier_transfers={} suspended_requests={}",
-                     include_host ? "" : "L1 ", has_pd_transfers, has_tier_transfers, suspended);
+    const bool has_sampled_requeues = std::ranges::any_of(
+        requests_, [](const std::unique_ptr<Request>& request) { return request->RequeuedAfterSampling(); });
+    if (has_pd_transfers || has_tier_transfers || suspended > 0 || has_sampled_requeues) {
+        spdlog::info(
+            "[Scheduler] flush {}cache rejected: pd_transfers={} tier_transfers={} suspended_requests={} "
+            "sampled_requeues={}",
+            include_host ? "" : "L1 ", has_pd_transfers, has_tier_transfers, suspended, has_sampled_requeues);
         return false;
     }
     const bool cleared = include_host ? coordinator_.ClearCache() : coordinator_.ClearDeviceCache();
@@ -393,6 +402,12 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
     request_ids.reserve(request_specs.size());
     std::vector<std::unique_ptr<Request>> pending_requests;
     pending_requests.reserve(request_specs.size());
+    // The decode allocation policy picks only the initial state: a fused
+    // request, or a P one under independent admission, needs no Decode
+    // destination before it computes.
+    const bool awaits_bootstrap = config_.role == Role::kD ||
+                                  (config_.role == Role::kP &&
+                                   config_.decode_allocation_policy == SchedulerConfig::DecodeAllocationPolicy::kEarly);
     for (const RequestSpec& spec : request_specs) {
         if (spec.tokens.empty()) {
             throw std::invalid_argument("Scheduler: request tokens must be non-empty");
@@ -422,7 +437,7 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
             throw std::invalid_argument("Scheduler: request token limit " + std::to_string(token_limit) +
                                         " exceeds cache capacity " + std::to_string(max_single_request_tokens_));
         }
-        pending_requests.push_back(std::make_unique<Request>(spec, config_.prefix_granularity, config_.role));
+        pending_requests.push_back(std::make_unique<Request>(spec, config_.prefix_granularity, awaits_bootstrap));
     }
 
     requests_.reserve(requests_.size() + pending_requests.size());
@@ -458,8 +473,26 @@ std::size_t Scheduler::DecodingSize() const {
 
 std::size_t Scheduler::PrefillSize() const {
     return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const std::unique_ptr<Request>& request) {
-        return request->IsAnyOf<fsm::Prefilling, fsm::RemotePrefilling, fsm::PrefillAwaitingResult, fsm::PrefillDone>();
+        return request->IsAnyOf<fsm::Prefilling, fsm::RemotePrefilling, fsm::PrefillAwaitingResult,
+                                fsm::PrefillAwaitingDestination, fsm::PrefillDone>();
     }));
+}
+
+std::size_t Scheduler::AwaitingDestinationSize() const {
+    return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const std::unique_ptr<Request>& request) {
+        return request->Is<fsm::PrefillAwaitingDestination>();
+    }));
+}
+
+std::int32_t Scheduler::AwaitingDestinationLcmBlocks() const {
+    std::vector<std::span<const BlockTable>> request_tables;
+    for (const auto& request : requests_) {
+        if (!request->Is<fsm::PrefillAwaitingDestination>()) {
+            continue;
+        }
+        request_tables.emplace_back(request->BlockTablesRef());
+    }
+    return coordinator_.NumActiveLcmBlocks(request_tables);
 }
 
 std::size_t Scheduler::RemotePrefillSize() const {

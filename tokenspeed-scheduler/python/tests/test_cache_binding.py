@@ -167,6 +167,7 @@ def test_snapshot_pool_is_stated_explicitly():
     assert scheduler.host_pool_total_blocks() == 0
     assert scheduler.host_pool_free_blocks() == 0
     cfg.role = ts.SchedulerConfig.Role.P
+    cfg.decode_allocation_policy = ts.SchedulerConfig.DecodeAllocationPolicy.Early
     cfg.cache_groups[0].transfer_policy = ts.CacheTransferPolicy.FullSuffix
     with pytest.raises(ValueError, match="P role"):
         ts.Scheduler(cfg)
@@ -219,6 +220,7 @@ def test_an_eviction_store_is_stream_ordered_and_published_at_its_ack():
     page = 16
     cfg = ts.SchedulerConfig()
     cfg.role = ts.SchedulerConfig.Role.P
+    cfg.decode_allocation_policy = ts.SchedulerConfig.DecodeAllocationPolicy.Early
     cfg.prefix_granularity = page
     cfg.max_scheduled_tokens = 256
     cfg.max_batch_size = 4
@@ -450,6 +452,7 @@ def test_host_cache_stats_count_eviction_write_backs():
     cfg.num_snapshot_pages = 1
     cfg.disable_l2_cache = False
     cfg.role = ts.SchedulerConfig.Role.P
+    cfg.decode_allocation_policy = ts.SchedulerConfig.DecodeAllocationPolicy.Early
     cfg.host_write_policy = ts.SchedulerConfig.HostWritePolicy.WriteBack
     cfg.cache_groups = [
         ts.CacheGroupConfig(

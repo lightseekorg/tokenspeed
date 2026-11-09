@@ -102,7 +102,11 @@ pub struct RemotePrefill {
 /// A transfer whose state the replica agreed changed.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PdEvent {
-    /// The request's peers are connected.
+    /// The request's peers are connected. On the P role every decode rank
+    /// has also allocated the request's destination: the scheduler admits
+    /// the request then or, under independent decode allocation, where it
+    /// admitted the request at submission, lets it send its KV once
+    /// computed.
     Bootstrapped(String),
     /// The request's transfer failed. Its readers or writers may still be
     /// stopping: [`PdEvent::Stopped`] follows.

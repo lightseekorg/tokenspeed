@@ -598,7 +598,10 @@ request's state and dies with it; no cleanup pass exists.
 
 Generation throughput counts tokens committed by decode forwards; on a plain
 worker the first token normally comes from prefill. Completion counts are
-role-local: the bootstrap token appears in both P and D totals. Use decode
+role-local: the bootstrap token appears in both P and D totals. A P prompt the
+scheduler requeued (`scheduler.md` §3.1) commits its first token once: when it
+completes again, the commit reports that token to the scheduler instead of the
+new sample. Use decode
 completion totals for a disaggregated service's output-token count.
 L3 query hits count the token span of each successful storage key. Cache
 groups can cover the same prompt positions, so this measures storage hits
@@ -649,7 +652,12 @@ the pause), as a pause is under a release. A drain (`abort`, `wait`, a
 release) cancels the admitted requests the scheduler does not hold yet, which
 end toward their clients: those compiling their grammars, and those waiting
 for their images' embeddings, which end once their receives settle — the
-drain waits for those.
+drain waits for those. On a prefill engine under `independent` decode
+allocation (`scheduler.md` §3.1) the scheduler holds a request before its
+decode destination is allocated, so a `wait` drain also waits for those
+destinations, up to the bootstrap timeout: a computed prompt is still
+prefilling until its transfer starts. Under `early` such a request is
+bootstrapping, which a `wait` drain does not wait for.
 A disaggregated engine refuses new requests while a release is draining or
 memory is released: their transfer registration would name memory the
 release unmaps. On release the prefill peer deregisters its cache regions
@@ -838,7 +846,20 @@ for an uncertain room.
 **PD** (`pd`, `ts-pd`). Requests register with the transfer peer at
 admission, and every round the replica agrees on which transfers changed
 state; their scheduler events join the round's tail feedback, and a failed
-transfer aborts its request on every rank together. A peer keeps state only
+transfer aborts its request on every rank together. On the prefill side
+`Bootstrapped` reports that every decode rank allocated the request's
+destination: under `early` decode allocation it admits the request, under
+`independent` it lets a computed prompt send its KV (`scheduler.md` §3.1).
+The peer is polled once per round, after the dispatch, so a destination
+allocated after that poll is seen at the end of the next round, behind its
+forward: the KV goes out up to one forward later, as under `early` the
+admission does. A prompt's output on the prefill side waits for its
+transfer, so when the transfer fails its client gets an abort even if its
+token already ended it; a client that aborted the request gets nothing.
+A prompt whose logits held a NaN is aborted as its forward commits, which
+cancels its transfer, and its client gets the `NumericalError` abort once
+that transfer failed.
+A peer keeps state only
 for the rooms of requests the loop tracks (a sleep waits for those alone),
 with one exception on the prefill side: a room the decode node pre-allocated
 for before its request registered here, or one this rank failed first (an

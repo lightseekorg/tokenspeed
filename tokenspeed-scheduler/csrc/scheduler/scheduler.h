@@ -113,7 +113,8 @@ public:
     // rank clears. Every flush refuses while RetractedSize() > 0: a
     // suspended request's image would otherwise resume old KV under a flushed
     // (re-weighted) engine, and its snapshot-pool leg is visible through no
-    // pin.
+    // pin. Likewise while a P prompt requeued after sampling its first token
+    // waits to be computed again (Request::RequeuedAfterSampling).
     bool CanClearCache() const;
     bool StoragePending() const { return storage_transfers_ && storage_transfers_->HasPending(); }
     std::size_t StorageHeldBlocks() const { return storage_transfers_ ? storage_transfers_->NumHeldBlocks() : 0; }
@@ -130,6 +131,19 @@ public:
     std::size_t WaitingSize() const;
     std::size_t DecodingSize() const;
     std::size_t PrefillSize() const;
+    // P role, independent admission: computed prompts waiting for their
+    // Decode destination (PrefillAwaitingDestination, a subset of
+    // PrefillSize()), and the Device parents in their block tables, counted
+    // as ActiveLcmBlocks() counts them; blocks held outside the tables (e.g. a
+    // pending in-forward State checkpoint) are not included.
+    std::size_t AwaitingDestinationSize() const;
+    std::int32_t AwaitingDestinationLcmBlocks() const;
+    // P role, independent admission: prompts requeued for granted work since
+    // start (buildPrefillWorkerPlan), and the prompt tokens they held in KV
+    // when requeued, prefix-cache hits included: an upper bound on what their
+    // next admission computes again. Accounting only.
+    std::uint64_t Requeues() const { return requeues_; }
+    std::uint64_t RequeuedTokens() const { return requeued_tokens_; }
     // Device pool parents that are empty or hold only unpinned cache entries.
     // Scans the pool and every prefix index: a leak check for tests and
     // diagnostics, not a per-step gauge.
@@ -379,9 +393,11 @@ private:
     // destination pages (RemotePrefilling); on the P role it is the peer's
     // decode reading them, which begins with the first scheduled chunk and
     // ends only with the PD ACK -- every page-holding state before Finishing.
-    // A request that ends while pinned (an abort, a failed transfer) parks
-    // in PdTransferring until the transport reports the transfer stopped. A
-    // fused engine never transfers.
+    // A P prompt whose destination is not allocated yet is pinned too, though
+    // no transfer can read its pages yet: a requeue may release them
+    // (buildPrefillWorkerPlan). A request that ends while pinned (an abort, a
+    // failed transfer) parks in PdTransferring until the transport reports
+    // the transfer stopped. A fused engine never transfers.
     bool pdTransferInFlight(const Request& request) const;
     // Ends a request on an abort or a failed transfer, through PdTransferring
     // while a transfer may still touch its pages.
@@ -569,8 +585,8 @@ private:
     };
     // `ignore_exemption`: the empty-round retraction (docs/design/scheduler.md §2).
     VictimChoice chooseVictim(std::span<Request* const> candidates, bool ignore_exemption) const;
-    // The first half of a retraction: publishes the pages the victim completed
-    // since its last admission (see forward.cpp).
+    // The first half of a retraction, and a P requeue's publication: publishes
+    // the pages the victim completed since its last admission (see forward.cpp).
     void publishCompletedPrefix(Request& victim);
     // Why the host budgets cannot hold the request's image right now
     // (projected, nothing mutated), unset when they can (see forward.cpp).
@@ -616,7 +632,7 @@ private:
     // (docs/design/scheduler.md §3.3).
     bool prefillDeferralExhausted(std::span<Request* const> candidates) const;
     void scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
-                                  bool new_prompts_sealed, std::int32_t decode_reserve);
+                                  bool new_prompts_sealed, bool blocked_prompt_seals, std::int32_t decode_reserve);
     void scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates);
 
     SchedulerConfig config_;
@@ -643,6 +659,9 @@ private:
     std::int32_t max_single_request_tokens_{0};
     // Accounting only (schedulePrefillFirstChunk); no decision reads it.
     PrefixHitStats prefix_hit_stats_;
+    // Accounting only (buildPrefillWorkerPlan); no decision reads them.
+    std::uint64_t requeues_{0};
+    std::uint64_t requeued_tokens_{0};
 
     // Stamped onto each retraction; the readmission order lives on the
     // Retracted states themselves (rankedReadmissions).
