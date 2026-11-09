@@ -1793,14 +1793,18 @@ class ServerArgs:
         if self.speculative_draft_model_path == self.model:
             self.draft_model_path_use_base = True
 
-        if (
-            self.draft_model_path_use_base
-            and self.speculative_draft_model_revision is not None
-        ):
+        draft_revision = self.speculative_draft_model_revision
+        if draft_revision is not None and self.speculative_draft_model_path is None:
+            raise ValueError(
+                "--speculative-draft-model-revision applies only to a draft in its "
+                "own repository, but no draft model is set. Pass "
+                f"--speculative-draft-model-path (got {draft_revision!r})."
+            )
+        if draft_revision is not None and self.draft_model_path_use_base:
             raise ValueError(
                 "--speculative-draft-model-revision applies only to a draft in its "
                 "own repository, but this draft is the target checkpoint. Set "
-                f"--revision instead (got {self.speculative_draft_model_revision!r})."
+                f"--revision instead (got {draft_revision!r})."
             )
 
         if self.speculative_draft_model_quantization == "unquant":

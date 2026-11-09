@@ -1100,12 +1100,27 @@ def test_a_draft_inside_the_target_checkpoint_shares_its_revision(offline_hub):
     assert draft.hf_config.hidden_size == 48
 
 
-def test_server_args_refuse_a_draft_revision_for_the_target_checkpoint():
-    with pytest.raises(ValueError, match="--speculative-draft-model-revision"):
+@pytest.mark.parametrize(
+    "draft, error",
+    [
+        # The draft is the target checkpoint.
+        (
+            dict(speculative_algorithm="EAGLE3", speculative_draft_model_path="org/t"),
+            "target checkpoint",
+        ),
+        # No draft model is loaded at all.
+        ({}, "no draft model is set"),
+        (
+            dict(speculative_algorithm="DUMMY", speculative_num_draft_tokens=4),
+            "no draft model is set",
+        ),
+    ],
+)
+def test_server_args_refuse_a_draft_revision_nothing_uses(draft, error):
+    with pytest.raises(ValueError, match=error):
         ServerArgs(
-            model="org/target",
+            model="org/t",
             revision="pinned",
-            speculative_algorithm="EAGLE3",
-            speculative_draft_model_path="org/target",
             speculative_draft_model_revision="v2",
+            **draft,
         )
