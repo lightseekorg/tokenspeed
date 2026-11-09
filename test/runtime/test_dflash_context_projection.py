@@ -23,16 +23,19 @@ the replicated one, through weight loading and the projection, and the
 target's capture sink writes exactly what the projection of the
 concatenated taps gives."""
 
+import importlib.util
 import os
 import socket
 import sys
 import traceback
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from tokenspeed_kernel.platform import current_platform
 from transformers import PretrainedConfig
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -203,6 +206,83 @@ def _check_projection(rank, world_size, port):
     dist.all_gather(gathered, written)
     for other in gathered:
         assert torch.equal(other, written)
+
+
+def _kernel_test_utils():
+    helper = Path(__file__).resolve().parents[2] / "tokenspeed-kernel/test/utils.py"
+    spec = importlib.util.spec_from_file_location("kernel_test_utils", helper)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _check_extend_warmup(rank, world_size, port):
+    """The drafter's extend warmup compiles the projection's Iris column
+    gather for the rows a prefill brings (a long chunk and a short last one)."""
+    from tokenspeed_kernel.ops.communication._iris.all_gather import (
+        iris_pull_allgather_columns,
+    )
+    from tokenspeed_kernel.ops.tuning import kernel_warmup
+
+    from tokenspeed.runtime.distributed.comm_backend import set_global_backend
+    from tokenspeed.runtime.distributed.comm_backend.iris import IrisBackend
+    from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
+    from tokenspeed.runtime.distributed.process_group_manager import (
+        process_group_manager as pg_manager,
+    )
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    device = torch.device("cuda", rank)
+    torch.cuda.set_device(device)
+    mapping = Mapping(rank=rank, world_size=world_size, attn_tp_size=world_size)
+    pg_manager.init_distributed(
+        mapping=mapping,
+        distributed_init_method=f"tcp://localhost:{port}",
+        backend="nccl",
+    )
+    pg_manager.init_process_group(mapping.attn.tp_group)
+    global_server_args_dict["mapping"] = mapping
+    global_server_args_dict["force_deterministic_rsag"] = False
+    # Serving's gather capacity: a long chunk's gather takes two subgroups
+    # a program, a short one one.
+    set_global_backend(
+        IrisBackend(NcclBackend(), producer_direct_max_bytes=8192 * 8192 * 2)
+    )
+
+    # Muse Spark's draft: 8192 hidden columns, 1024 a rank at TP8.
+    hidden = 8192
+    model = _draft(mapping, hidden).to(device=device, dtype=torch.bfloat16)
+    drafter = _sink_drafter(model, device, 1, 8)
+    with kernel_warmup(enabled=True):
+        drafter.warmup_extend(8192)
+    taps = torch.zeros((8192, TAPS * hidden), dtype=torch.bfloat16, device=device)
+    with _kernel_test_utils().assert_no_triton_compile(iris_pull_allgather_columns):
+        for rows in (151, 8192):
+            model.project_target_hidden(taps[:rows])
+        torch.cuda.synchronize()
+
+
+def _warmup_worker(rank, world_size, port, error_dict):
+    try:
+        _check_extend_warmup(rank, world_size, port)
+    except Exception:
+        error_dict[rank] = traceback.format_exc()
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.device_count() < 8
+    or not current_platform().is_cdna4,
+    reason="the Iris column gather needs eight CDNA4 GPUs",
+)
+def test_extend_warmup_compiles_the_projection_gather():
+    error_dict = mp.Manager().dict()
+    mp.spawn(_warmup_worker, args=(8, _open_port(), error_dict), nprocs=8, join=True)
+    if error_dict:
+        raise RuntimeError("\n".join(f"Rank {r}: {e}" for r, e in error_dict.items()))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU projection")
