@@ -2144,8 +2144,8 @@ def moe_process_weights(
 def moe_warmup(plan: dict, w: torch.nn.Module, *, max_num_tokens: int) -> None:
     """Warm ``plan``'s selected backend using ``w``'s processed expert weights.
 
-    ``max_num_tokens`` bounds global routing rows. Plans without a warmup
-    callback need no work; this function returns nothing.
+    ``max_num_tokens`` bounds the routing rows exercised by the backend.
+    Plans without a warmup callback need no work; this function returns nothing.
     """
     warmup = plan.get("warmup")
     if warmup is not None:

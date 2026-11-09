@@ -151,6 +151,12 @@ def init_distributed(
 ) -> float:
     """Initialize this rank's process groups; return the free-memory floor
     the KV budget is sized against."""
+    if server_args.chunked_prefill_size <= 0 and (
+        server_args.max_model_len is None or server_args.max_model_len <= 0
+    ):
+        raise ValueError(
+            "A positive --max-model-len is required when chunked prefill is disabled"
+        )
     # The communication backend reads the resolved launch (node spans,
     # RS/AG buffer capacity, the collective switches) from this dict, and
     # the distributed init already probes it; publish before probing. The

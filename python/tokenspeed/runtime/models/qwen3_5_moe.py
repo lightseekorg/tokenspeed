@@ -198,9 +198,13 @@ def _mxfp4_mega_moe_capacity(mapping: Mapping) -> int:
     args = global_server_args_dict
     prefill = int(args.get("chunked_prefill_size") or 0)
     if prefill <= 0:
-        prefill = int(args.get("max_prefill_tokens") or 0) + int(
-            args.get("max_model_len") or 0
-        )
+        max_model_len = args["max_model_len"]
+        if max_model_len is None or max_model_len <= 0:
+            raise ValueError(
+                "MXFP4 MegaMoE requires a positive --max-model-len "
+                "when chunked prefill is disabled"
+            )
+        prefill = args["max_prefill_tokens"] + max_model_len
     verify_tokens = max(int(args.get("speculative_num_draft_tokens") or 1), 1)
     per_dp_requests = int(args.get("max_num_seqs") or 0) // mapping.attn.dp_size
     decode_batch = max(

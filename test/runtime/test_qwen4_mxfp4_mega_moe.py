@@ -71,6 +71,17 @@ def test_capacity_includes_prefill_and_verify(
     assert _mxfp4_mega_moe_capacity(mapping) == expected
 
 
+@pytest.mark.parametrize("max_model_len", [None, 0])
+def test_unchunked_mxfp4_megamoe_requires_max_model_len(monkeypatch, max_model_len):
+    mapping = Mapping(
+        rank=0, world_size=8, attn_tp_size=2, moe_tp_size=1, moe_ep_size=8
+    )
+    monkeypatch.setitem(global_server_args_dict, "chunked_prefill_size", -1)
+    monkeypatch.setitem(global_server_args_dict, "max_model_len", max_model_len)
+    with pytest.raises(ValueError, match="--max-model-len"):
+        _mxfp4_mega_moe_capacity(mapping)
+
+
 @pytest.mark.parametrize(
     "backend", [MoeBackend.MEGA_MOE, MoeBackend.DEEP_GEMM_MEGA_MOE]
 )

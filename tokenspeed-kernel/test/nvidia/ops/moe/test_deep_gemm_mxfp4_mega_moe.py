@@ -160,7 +160,9 @@ def test_uneven_empty_and_graph_replay(group):
     )
     moe_process_weights(plan, experts)
     assert experts._moe_backend_state.num_shared_experts == 0
-    moe_warmup(plan, experts, max_num_tokens=64)
+    with pytest.raises(ValueError, match=r"warmup max_num_tokens must be in \[1, 64\]"):
+        moe_warmup(plan, experts, max_num_tokens=65)
+    moe_warmup(plan, experts, max_num_tokens=32)
     for rows in (7, 0, 1, 31, 3):
         n = rows if group.rank() == 0 else rows + 3
         x = torch.randn(n, 512, device="cuda", dtype=torch.bfloat16) * 0.25

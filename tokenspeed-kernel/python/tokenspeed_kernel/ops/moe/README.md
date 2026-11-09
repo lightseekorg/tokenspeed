@@ -45,6 +45,12 @@ arguments or bucketed, never `constexpr`.
 
 ## FlashInfer adapters (`flashinfer.py`)
 
+### TRT-LLM MXFP4 activation
+
+FlashInfer TRT-LLM MXFP4 defaults to standard SwiGLU (`silu(gate) * up`)
+when the layer supplies no activation parameters. Explicit SwiGLU and SiTU
+parameters come from the model.
+
 ### Opt-in SM90 block-FP8 grouped MoE
 
 `prepare_sm90_fp8_moe(mode=...)` prepares a callable before warmup and graph
@@ -440,10 +446,6 @@ byte on random rows, tie, edge, and NaN corpora and in CUDA-graph replay.
 
 ## Routing weight storage and deferred finalize
 
-FlashInfer TRT-LLM MXFP4 defaults to standard SwiGLU (`silu(gate) * up`)
-when the layer supplies no activation parameters. Explicit SwiGLU and SiTU
-parameters come from the model.
-
 `moe_plan` records the selected expert kernel's `topk_weights_dtype`. DeepSeek V4
 routing stores its weights in that dtype after FP32 scoring, normalization, and
 scaling.
@@ -667,9 +669,15 @@ its fusion remain unchanged.
 The persistent per-rank token capacity covers chunked prefill (or the
 unchunked prefill bound), prefill graphs, and the maximum decode batch times
 the speculative verification width. It does not depend on the first batch.
+Unchunked prefill requires an explicit positive `--max-model-len` and
+reserves for `max_prefill_tokens + max_model_len`. Chunked prefill bounds the
+workspace and startup work for long contexts.
 Post-quantization warmup uses the existing DeepGEMM warmup hook to reserve
 workspace and compile reachable tiles before capture; matching layers reuse
-the backend's workspace and warmup cache. An empty owner still enters the
+the backend's workspace and warmup cache. A lower warmup limit reduces the
+token counts exercised by the hook while retaining the planned workspace.
+Set `TOKENSPEED_DISABLE_MEGA_MOE_WARMUP=1` to defer this work to the first
+forward. An empty owner still enters the
 collective with zero-row inputs and output, using DeepGEMM's native empty-rank
 support.
 
