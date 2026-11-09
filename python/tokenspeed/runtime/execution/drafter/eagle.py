@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import bisect
 from collections.abc import Callable, Sequence
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -661,7 +661,13 @@ class Eagle(BaseDrafter):
                         committed_lengths=self.draft_history_lengths_buf,
                     )
                 )
-            with nvtx_range("draft_forward", color="red"):
+            # The lane flag ends with this forward, even one that raises.
+            lane_forward = (
+                nullcontext()
+                if self.tree_lanes is None
+                else self.tree_lanes.lane_forward()
+            )
+            with nvtx_range("draft_forward", color="red"), lane_forward:
                 logits_output = self.draft_model_runner.forward(
                     ctx=ctx,
                     input_ids=self._map_hot(draft_ids.reshape(-1)),
@@ -671,8 +677,6 @@ class Eagle(BaseDrafter):
                     **history_kwargs,
                 )
                 dsa_topk = self._extract_dsa_topk(dsa_topk)
-            if self.tree_lanes is not None:
-                self.tree_lanes.active = False
             if self.draft_reads_token_history and i + 1 < self.spec_num_steps:
                 self.draft_history_lengths_buf.index_copy_(
                     0,

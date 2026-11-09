@@ -6,10 +6,13 @@ set -e
 # ============================================================
 GFX_ARCH=${GFX_ARCH:-gfx950}
 BUILD_AND_DOWNLOAD_PARALLEL=${BUILD_AND_DOWNLOAD_PARALLEL:-16}
-TORCH_VERSION=${TORCH_VERSION:-2.14.0}
-TORCHVISION_VERSION=${TORCHVISION_VERSION:-0.29.0}
+# Torch pins carry the local build tag of the wheels on TORCH_INDEX_URL; keep
+# them in sync so the reuse check in Step 3 only accepts builds for this ROCm.
+TORCH_VERSION=${TORCH_VERSION:-2.14.0+rocm7.2}
+TORCHVISION_VERSION=${TORCHVISION_VERSION:-0.29.0+rocm7.2}
 TORCH_INDEX_URL=${TORCH_INDEX_URL:-https://download.pytorch.org/whl/rocm7.2}
 TORCH_DEVICE_PACKAGE=${TORCH_DEVICE_PACKAGE:-}
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 export MAX_JOBS=${BUILD_AND_DOWNLOAD_PARALLEL}
 WORKSPACE=${WORKSPACE:-$(pwd)}
@@ -49,9 +52,15 @@ torch_packages=("torch==${TORCH_VERSION}" "torchvision==${TORCHVISION_VERSION}")
 if [ -n "${TORCH_DEVICE_PACKAGE}" ]; then
     torch_packages+=("${TORCH_DEVICE_PACKAGE}")
 fi
-pip_install_with_retry pip3 install --upgrade "${torch_packages[@]}" \
-    --index-url "${TORCH_INDEX_URL}"
-python3 -c 'import torch, torchvision; assert torch.__version__.startswith("2.14.0"), torch.__version__; assert torchvision.__version__.startswith("0.29.0"), torchvision.__version__'
+if python3 "${SCRIPT_DIR}/verify_rocm_stack.py" torch \
+    "${TORCH_VERSION}" "${TORCHVISION_VERSION}" "${TORCH_DEVICE_PACKAGE}"; then
+    echo "Reusing matching PyTorch ${TORCH_VERSION} ROCm stack"
+else
+    pip_install_with_retry pip3 install --upgrade "${torch_packages[@]}" \
+        --index-url "${TORCH_INDEX_URL}"
+fi
+python3 "${SCRIPT_DIR}/verify_rocm_stack.py" torch \
+    "${TORCH_VERSION}" "${TORCHVISION_VERSION}" "${TORCH_DEVICE_PACKAGE}"
 
 echo "=== Step 4: Install tokenspeed-kernel packages ==="
 

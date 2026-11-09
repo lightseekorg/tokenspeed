@@ -39,11 +39,21 @@ from tokenspeed_kernel.ops.gemm import (
     prepare_fp8_projection,
     prepare_grouped_fp8_projection,
 )
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import ArchVersion, current_platform
 
 pytestmark = pytest.mark.skipif(
     not (torch.cuda.is_available() and current_platform().is_blackwell),
-    reason="The packed UE8M0 scale layout and the grouped FP8 GEMM target SM100.",
+    reason="The packed UE8M0 scale layout requires a major-10 NVIDIA GPU.",
+)
+
+# Keep the Triton RoPE checks on every major-10 device, but match the
+# DeepGEMM projection registration's narrower hardware contract.
+projection_supported = (
+    ArchVersion(10, 0) <= current_platform().arch_version <= ArchVersion(10, 3)
+)
+requires_fp8_projection = pytest.mark.skipif(
+    not projection_supported,
+    reason="DeepGEMM FP8 projections require SM100/SM103.",
 )
 
 GROUPS, HEADS_PER_GROUP, OUTPUT_DIM = 8, 8, 1024
@@ -164,6 +174,7 @@ def _dequantize(codes, exponents):
 
 
 @pytest.mark.parametrize("tokens", [0, 1, 5, 64, 256, 1031])
+@requires_fp8_projection
 def test_grouped_fp8_projection_matches_dequantized_einsum(tokens):
     input_dim = HEADS_PER_GROUP * 512
     weight, weight_scales = _weights(GROUPS, OUTPUT_DIM, input_dim)
@@ -195,8 +206,13 @@ def test_prepare_grouped_fp8_projection_declines_cpu_weights():
 def test_has_grouped_fp8_projection_agrees_with_prepare():
     input_dim = HEADS_PER_GROUP * 512
     weight, weight_scales = _weights(GROUPS, OUTPUT_DIM, input_dim)
-    assert has_grouped_fp8_projection(weight.device, OUTPUT_DIM, input_dim)
-    assert prepare_grouped_fp8_projection(weight, weight_scales, GROUPS) is not None
+    assert (
+        has_grouped_fp8_projection(weight.device, OUTPUT_DIM, input_dim)
+        == projection_supported
+    )
+    assert (
+        prepare_grouped_fp8_projection(weight, weight_scales, GROUPS) is not None
+    ) == projection_supported
     weight, weight_scales = weight.cpu(), weight_scales.cpu()
     assert not has_grouped_fp8_projection(weight.device, OUTPUT_DIM, input_dim)
     assert prepare_grouped_fp8_projection(weight, weight_scales, GROUPS) is None
@@ -213,6 +229,7 @@ def _projection_inputs(tokens):
 
 
 @pytest.mark.parametrize("tokens", [0, 1, 5, 64, 256, 1031])
+@requires_fp8_projection
 def test_grouped_fp8_projection_quantize_fp8_matches_bf16_then_quantize(tokens):
     codes, scales, grouped, prepared = _projection_inputs(tokens)
     projected = grouped_fp8_projection(codes, scales, grouped, prepared, None)
@@ -228,6 +245,7 @@ def test_grouped_fp8_projection_quantize_fp8_matches_bf16_then_quantize(tokens):
 
 
 @pytest.mark.parametrize("tokens", [0, 1, 5, 64, 256, 1031])
+@requires_fp8_projection
 def test_fp8_projection_matches_dequantized_matmul(tokens):
     codes, scales, grouped, prepared = _projection_inputs(tokens)
     x, x_scales = grouped_fp8_projection_quantize_fp8(codes, scales, grouped, prepared)
@@ -313,8 +331,16 @@ print("no compilation after warmup")
 
 
 @pytest.mark.parametrize("fp8_output", [False, True])
+@requires_fp8_projection
 def test_warmup_fp8_projections_leaves_nothing_to_compile(tmp_path, fp8_output):
     # A fresh DeepGEMM JIT cache records every kernel compiled in the child.
+    env = {**os.environ, "DG_JIT_CACHE_DIR": str(tmp_path / "jit")}
+    # conftest's sys.path change is not inherited, and cwd below changes the
+    # meaning of relative PYTHONPATH entries used by CI.
+    python_path = [str(Path(__file__).resolve().parents[3] / "python")]
+    if env.get("PYTHONPATH"):
+        python_path.append(env["PYTHONPATH"])
+    env["PYTHONPATH"] = os.pathsep.join(python_path)
     result = subprocess.run(
         [
             sys.executable,
@@ -324,7 +350,7 @@ def test_warmup_fp8_projections_leaves_nothing_to_compile(tmp_path, fp8_output):
             "300",
             "1" if fp8_output else "0",
         ],
-        env={**os.environ, "DG_JIT_CACHE_DIR": str(tmp_path / "jit")},
+        env=env,
         cwd=Path(__file__).resolve().parent,
         capture_output=True,
         text=True,

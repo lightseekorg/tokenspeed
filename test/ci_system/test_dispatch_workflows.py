@@ -29,7 +29,6 @@ PR_TEST_WORKFLOWS = (
 MI450_STACK_KEYS = (
     "ROCM_NIGHTLY_INDEX",
     "ROCM_SDK_VERSION",
-    "ROCM_SYSTEMS_REF",
     "TORCH_DEVICE_PACKAGE",
     "TORCH_INDEX_URL",
     "TORCH_VERSION",
@@ -155,6 +154,11 @@ def test_amd_workflow_builds_architecture_matrices(
         .replace("${{ steps.changes.outputs.should_run }}", str(full).lower())
         .replace(
             "${{ steps.changes.outputs.should_run_import_check }}", str(imports).lower()
+        )
+        # No reviewer asked for every test.
+        .replace(
+            "${{ steps.changes.outputs.full_tests == 'true' && '--full-tests' || '' }}",
+            "",
         )
     )
     script = re.sub(r"\$\{\{ github.event_name.*?\}\}", "per-commit", script)
@@ -1425,10 +1429,14 @@ def test_mi450_sim_uses_bounded_smoke_suite():
 
     assert task["env"]["MI450_SIM_RUN_TIMEOUT"] == "600"
     assert task["env"]["MI450_SIM_THREADS_PER_WORKER"] == "2"
-    assert 'config["cpu_thread_budget"] = thread_budget' in setup_script
+    assert 'config["max_ticks"] = 0' in setup_script
+    assert "rocm-systems" not in setup_script
+    assert "UV_CACHE_DIR=${UV_CACHE_DIR:-${PIP_CACHE_DIR}/uv}" in setup_script
     assert 'threads_per_emulator="${MI450_SIM_THREADS_PER_WORKER:-2}"' in (
         parallel_script
     )
+    assert '-n "${workers}"' in parallel_script
+    assert "--tx" not in parallel_script
     assert "/sys/fs/cgroup/cpu.max" in parallel_script
     assert task["env"]["MI450_SIM_TEST_ROOT"] != "tokenspeed-kernel/test"
     assert "tokenspeed-kernel/test/amd/ops/attention" in task["env"]["MI450_SIM_TESTS"]
@@ -1465,7 +1473,7 @@ def test_mi450_installers_receive_shared_stack(tmp_path, task_name, case):
         # A shared-file edit must reach both installers without task YAML edits.
         profile.write_text(
             (REPO_ROOT / "test/ci_system/mi450_sim_env.sh").read_text()
-            + "\nexport ROCM_SYSTEMS_REF=test-shared-revision\n"
+            + "\nexport ROCM_SDK_VERSION=test-shared-version\n"
         )
     # Replace only the installers that need root and external package downloads.
     (scripts / "setup_mi450_sim.sh").write_text(
@@ -1522,6 +1530,10 @@ def test_standalone_mi450_setup_loads_shared_stack(tmp_path):
 def test_mi450_sim_pins_one_rocm_nightly():
     env = read_mi450_sim_env(REPO_ROOT / "test/ci_system/mi450_sim_env.sh")
 
+    assert env["ROCM_SDK_VERSION"] == "10.3.0a20261107"
+    assert env["TORCH_VERSION"] == "2.14.0+rocm10.3.0a20261107"
+    assert env["TORCHVISION_VERSION"] == "0.29.0+rocm10.3.0a20261107"
+
     # PyTorch requires the exact ROCm SDK build it was built against.
     rocm_build = f"+rocm{env['ROCM_SDK_VERSION']}"
     for name in ("TORCH_VERSION", "TORCHVISION_VERSION", "TORCH_DEVICE_PACKAGE"):
@@ -1529,9 +1541,12 @@ def test_mi450_sim_pins_one_rocm_nightly():
     assert env["TORCH_INDEX_URL"] == env["ROCM_NIGHTLY_INDEX"]
 
 
-def test_mi450_sim_uses_stock_triton_compatible_libhip_path():
+def test_mi450_sim_uses_stock_mirage_and_triton_compatible_libhip_path():
     script = (REPO_ROOT / "test/ci_system/run_mi450_rocjitsu.sh").read_text()
 
+    assert 'mirage="${rocm_root}/bin/mirage"' in script
+    assert "run --in-process" in script
+    assert "--cpu-thread-budget" in script
     assert 'libhip_path="${rocm_root}/lib/libamdhip64.so"' in script
     assert 'test -f "${libhip_path}"' in script
     assert 'export TRITON_LIBHIP_PATH="${libhip_path}"' in script

@@ -2490,10 +2490,14 @@ sequence-parallel router projections have nonempty, equal local row counts.
 A single-request TP warmup can skip a GEMM on an empty peer while another
 peer waits in distributed tactic selection. The draft remains in the same
 autotune context as the target. Serving batches and graph capture sizes are
-unchanged. A speculative decode service must reserve at least one request
-per attention TP peer: `max_num_seqs // data_parallel_size >= attn_tp_size`.
-Server-argument validation rejects smaller capacities before allocating
-buffers or running a forward, including with `--disable-autotune` (which
-disables profiling, not startup warmup). Increase `--max-num-seqs` to at
-least `data_parallel_size * attn_tp_size`. Prefill-only roles do not run
-this draft decode warmup and are exempt.
+unchanged. On NVIDIA, a speculative decode service must reserve at least one
+request per attention TP peer: `max_num_seqs // data_parallel_size >=
+attn_tp_size`. Server-argument validation rejects smaller capacities before
+allocating buffers or running a forward, including with `--disable-autotune`
+(which disables profiling, not startup warmup). Increase `--max-num-seqs` to
+at least `data_parallel_size * attn_tp_size`. Prefill-only roles do not run
+this draft decode warmup and are exempt. Other platforms run no FlashInfer
+tuning, so startup tuning has no cross-rank collectives: the draft decode
+warmup uses `min(attn_tp_size, max_decode_bs)` requests, and an empty peer
+skips its GEMMs as it does when serving fewer requests than peers. Decode
+state stays sized by `--max-num-seqs`.

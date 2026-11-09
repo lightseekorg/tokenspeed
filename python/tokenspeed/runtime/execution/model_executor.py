@@ -936,6 +936,23 @@ class ModelExecutor:
             if is_block_drafter(self.config.spec_algo, is_draft=True):
                 check_block_drafter_storage(draft_runner.model, self.token_to_kv_pool)
 
+    def forget_served_inputs(self) -> None:
+        """Return what dummy forwards read to its startup state; call only while no request holds a slot."""
+        # Dummy batches index real slots, whose served lengths would place rows past the rope tables.
+        self._active_multimodal_context = None
+        self._active_positions_override = None
+        # A batch that ended mid-prefill leaves it set, and EAGLE captures would skip their later draft steps.
+        self.input_buffers.all_extends_mid_chunk = False
+        if self.tree_spec is not None:
+            # The last step's trees would make every warmup compact shift the positions again.
+            self.tree_spec.reset_to_chain()
+        slots = torch.arange(
+            self.config.max_req_pool_size + 1, dtype=torch.int64, device=self.device
+        )
+        self.runtime_states.reset_states(
+            slots, torch.zeros_like(slots, dtype=torch.int32)
+        )
+
     def release_graphs(self) -> None:
         """Drop the captured graphs and unfreeze the workspace they pinned.
 
@@ -1177,8 +1194,8 @@ class ModelExecutor:
             num_tokens, bs, self.draft_attn_backend
         )
 
-    def autotune(self) -> None:
-        """Warm encountered kernels and optionally tune missing FlashInfer tactics."""
+    def autotune(self, *, keep_loaded_tactics: bool) -> None:
+        """Warm encountered kernels and optionally tune missing FlashInfer tactics; a reload keeps the tactics this process holds."""
 
         per_rank_max_batch = max(
             1,
@@ -1219,7 +1236,8 @@ class ModelExecutor:
             if self.config.autotune_cache_key is not None
             else None
         )
-        load_autotune_cache(cache_path, cpu_group, owner_rank)
+        if not keep_loaded_tactics:
+            load_autotune_cache(cache_path, cpu_group, owner_rank)
 
         if self.config.pp_size > 1:
             # These dummy forwards do not perform pipeline stage transfers.
@@ -1289,9 +1307,18 @@ class ModelExecutor:
                         # The draft model is reached through the shared speculative
                         # forward, not model_runner.forward above. One request
                         # per attention TP rank keeps sequence-parallel router
-                        # GEMMs nonempty on every peer during distributed tuning.
+                        # GEMMs nonempty on every peer for FlashInfer's lockstep
+                        # distributed tuning; on NVIDIA, server-argument
+                        # validation keeps the request cap at least that large.
+                        # Other platforms tune no cross-rank collectives, so a
+                        # smaller cap bounds the warmup to the decode state.
                         self.forward_step.warmup_decode_path(
-                            batch_sizes=(self.config.attention_tp_size,),
+                            batch_sizes=(
+                                min(
+                                    self.config.attention_tp_size,
+                                    self.forward_step.max_decode_bs,
+                                ),
+                            ),
                             graph_phase=False,
                         )
                 if self._samples_from_vocab_shard:

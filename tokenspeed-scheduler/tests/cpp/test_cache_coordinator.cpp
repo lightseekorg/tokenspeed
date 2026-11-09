@@ -1552,6 +1552,138 @@ TEST(CacheCoordinatorAdmissionTest, RetriesWithFreshCursorsAfterPinnedAdmissionF
     EXPECT_TRUE(coordinator.GroupPrefixIndex(2).Contains(pool, Key(hashes[2], 2, 0)));
 }
 
+TEST(CacheCoordinatorAdmissionTest, AReleasedCheckpointCanLeaveWithItsCanonicalPrefix) {
+    for (const auto [reverse_access_order, allow_block_eviction, state_groups] :
+         {std::tuple{false, false, 1}, std::tuple{false, true, 1}, std::tuple{false, false, 3},
+          std::tuple{false, true, 3}, std::tuple{true, false, 1}, std::tuple{true, true, 1}, std::tuple{true, false, 3},
+          std::tuple{true, true, 3}}) {
+        SCOPED_TRACE(reverse_access_order);
+        SCOPED_TRACE(allow_block_eviction);
+        SCOPED_TRACE(state_groups);
+        const auto num_groups = static_cast<std::size_t>(state_groups + 1);
+        const auto capacity = 5 + 2 * state_groups + (reverse_access_order ? 2 + 2 * state_groups : 0);
+        const std::vector<std::int32_t> packing(num_groups, 1);
+        BlockPool pool(capacity, packing);
+        BlockPool host_pool(capacity, packing);
+        std::vector<CacheGroupSpec> specs(
+            num_groups,
+            CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0});
+        specs[0] = {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 4};
+        auto coordinator = MakeCoordinator(specs, 4, pool, false, &host_pool, nullptr, false, true,
+                                           /*checkpoint_retention_requests=*/0);
+        const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}, {9, 10, 11, 12}});
+        const auto prefix = std::span<const std::string>(hashes).first(2);
+        const auto admit = [&](std::vector<GroupDemand>& demands, const RequestProgress& progress) {
+            return coordinator.Admit(coordinator.ProbePrefix({}), demands, progress, /*copy_in_blocks=*/{},
+                                     /*copy_in_point=*/std::nullopt, std::nullopt, allow_block_eviction,
+                                     /*session_id=*/{});
+        };
+
+        // A live older request can publish its KV under its admission epoch
+        // after a newer request publishes State, reversing their eviction order.
+        std::vector<BlockTable> older(num_groups);
+        std::optional<std::uint64_t> older_epoch;
+        if (reverse_access_order) {
+            std::vector<GroupDemand> older_demands{{.table = &older[0], .extent = DenseGrowth{8}}};
+            for (std::size_t group = 1; group < num_groups; ++group) {
+                older_demands.push_back(
+                    {.table = &older[group], .extent = StateStep{.kind = StateStep::Kind::kRotate}});
+            }
+            auto admission = admit(older_demands, RequestProgress{});
+            ASSERT_TRUE(admission);
+            older_epoch = admission->access_epoch;
+        }
+
+        // The prefix has KV but no State checkpoint, so P must recompute it.
+        std::vector<BlockTable> publisher(num_groups);
+        std::vector<GroupDemand> publish_demands{{.table = &publisher[0], .extent = DenseGrowth{8}}};
+        for (std::size_t group = 1; group < num_groups; ++group) {
+            publish_demands.push_back(
+                {.table = &publisher[group], .extent = StateStep{.kind = StateStep::Kind::kKeep}});
+        }
+        ASSERT_TRUE(admit(publish_demands, RequestProgress{}));
+        coordinator.CacheCompletedBlocks(
+            publisher,
+            RequestProgress{.completed_pages = CompletedPages{.prefix_hashes = prefix}, .num_computed_tokens = 8},
+            CacheCoordinatorTestAccess::NextAccessEpoch(coordinator));
+        coordinator.Free(publisher);
+        EXPECT_EQ(coordinator.ProbePrefix(prefix).device.num_common_tokens, 0);
+
+        std::vector<BlockTable> tables(num_groups);
+        std::vector<GroupDemand> demands{{.table = &tables[0], .extent = DenseGrowth{8}}};
+        for (std::size_t group = 1; group < num_groups; ++group) {
+            demands.push_back({.table = &tables[group], .extent = StateStep{.kind = StateStep::Kind::kRotate}});
+        }
+        ASSERT_TRUE(admit(demands, RequestProgress{}));
+        demands[0].extent = DenseGrowth{4};
+        const RequestProgress junction{.completed_pages = CompletedPages{.prefix_hashes = prefix,
+                                                                         .preserve_source_blocks = true,
+                                                                         .publish_state = true,
+                                                                         .boundary_kind = CacheBoundaryKind::kEndpoint},
+                                       .num_computed_tokens = 8};
+        ASSERT_TRUE(admit(demands, junction));
+        ASSERT_EQ(pool.NumEmptyLcmBlocks(), 0);
+        if (older_epoch) {
+            coordinator.CacheCompletedBlocks(
+                older,
+                RequestProgress{
+                    .completed_pages = CompletedPages{.prefix_hashes = prefix, .preserve_source_blocks = true},
+                    .num_computed_tokens = 8},
+                *older_epoch);
+        }
+        const auto sources = BlockTableLcmBlockIds(tables[0]);
+        const CacheBlockLocation input_location = tables[1].Blocks()[0]->Location();
+        const auto evictions_before = coordinator.DeviceEvictions();
+        const auto next_chunk = RequestProgress{
+            .completed_pages =
+                CompletedPages{.prefix_hashes = hashes, .first_new_prefix_page = 2, .preserve_source_blocks = true},
+            .num_computed_tokens = 12};
+
+        // An outside reader prevents both reclaiming the input and evicting
+        // its canonical prefix. A failed plan must leave the tables intact.
+        CacheBlockRef outside_reader = tables[1].Blocks()[0];
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            EXPECT_FALSE(admit(demands, next_chunk));
+            EXPECT_EQ(BlockTableLcmBlockIds(tables[0]), sources);
+            EXPECT_EQ(tables[1].Blocks()[0], outside_reader);
+            EXPECT_EQ(pool.NumEmptyLcmBlocks(), 0);
+        }
+        outside_reader.reset();
+
+        // Releasing the input pays for State rotation, but the next KV block
+        // also needs the canonical prefix to leave. Its subtree must absorb
+        // the input selected for reclaim, including when this segment was
+        // already rejected before that selection.
+        ASSERT_TRUE(admit(demands, next_chunk));
+        const auto after = BlockTableLcmBlockIds(tables[0]);
+        ASSERT_EQ(after.size(), sources.size() + 1);
+        EXPECT_TRUE(std::equal(sources.begin(), sources.end(), after.begin()));
+        EXPECT_FALSE(coordinator.GroupPrefixIndex(1).Contains(pool, input_location));
+        EXPECT_EQ(coordinator.DeviceEvictions().request_reclaim.blocks - evictions_before.request_reclaim.blocks,
+                  state_groups);
+        EXPECT_EQ(coordinator.DeviceEvictions().request_reclaim_for_write_back -
+                      evictions_before.request_reclaim_for_write_back,
+                  state_groups);
+        std::unordered_set<CacheBlockLocation, CacheBlockLocationHash> written_back;
+        auto segments = coordinator.TakeEvictedSegments();
+        for (auto& segment : segments) {
+            for (auto& member : segment.members) {
+                EXPECT_TRUE(written_back.insert(member.device_location).second);
+                member.host_block = host_pool.AcquireBlock(member.key.group_id);
+                ASSERT_TRUE(member.host_block);
+            }
+            const auto count = segment.members.size();
+            EXPECT_EQ(coordinator.SettleEvictedSegment(std::move(segment), /*placed_on_host=*/true).size(), count);
+        }
+        EXPECT_EQ(written_back.size(), 2 + state_groups) << "two canonical KV blocks and the released State inputs";
+        EXPECT_EQ(coordinator.ProbePrefix(prefix).host.num_common_tokens, 8);
+        EXPECT_EQ(pool.NumEmptyLcmBlocks(), 1);
+        EXPECT_TRUE(CacheCoordinatorTestAccess::BoundaryTreeMismatches(coordinator).empty());
+        coordinator.Free(tables);
+        coordinator.Free(older);
+    }
+}
+
 TEST(CacheCoordinatorAdmissionTest, LiveHistoryCannotFundRotationButAReleasedInputCan) {
     for (const std::int32_t capacity : {18, 19}) {
         SCOPED_TRACE(capacity);
@@ -6843,6 +6975,7 @@ TEST_F(ShardedTailCopyPackingFourTest, PreservedPublicationKeepsPrivateTransferS
         };
         ASSERT_TRUE(admit(canonical));
         ASSERT_TRUE(admit(source));
+        const auto source_page_ids = coordinator_.Allocator(0).BlockTablePageIds(source[0]);
         const CacheBlockLocation canonical_location = canonical[0].Blocks()[0]->Location();
         const CacheBlockLocation source_location = source[0].Blocks()[0]->Location();
         ASSERT_NE(source_location, canonical_location);
@@ -6859,12 +6992,63 @@ TEST_F(ShardedTailCopyPackingFourTest, PreservedPublicationKeepsPrivateTransferS
         progress.completed_pages->preserve_source_blocks = true;
         coordinator_.CacheCompletedBlocks(source, progress, CacheCoordinatorTestAccess::NextAccessEpoch(coordinator_));
         EXPECT_EQ(source[0].Blocks()[0]->Location(), source_location);
+        EXPECT_EQ(coordinator_.Allocator(0).BlockTablePageIds(source[0]), source_page_ids);
         EXPECT_EQ(CacheCoordinatorTestAccess::DeviceLocationOf(coordinator_, 0,
                                                                Key(partial ? tail_hash_ : hashes.front(), 0)),
                   canonical_location);
         coordinator_.Free(source);
         coordinator_.ClearCache();
         EXPECT_EQ(pool_.NumEmptyLcmBlocks(), 3);
+    }
+}
+
+TEST(CacheCoordinatorPublicationTest, CompletedPublicationDeduplicatesOnlyWhenSourcesMayMove) {
+    for (const bool preserve_sources : {false, true}) {
+        for (const bool canonical_pinned : {false, true}) {
+            SCOPED_TRACE(preserve_sources);
+            SCOPED_TRACE(canonical_pinned);
+            BlockPool pool(12, {1, 1});
+            const std::array specs{
+                CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
+                CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0}};
+            auto coordinator = MakeCoordinator(specs, 4, pool, false, nullptr, nullptr, false, false,
+                                               /*checkpoint_retention_requests=*/0);
+            const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
+            std::vector<BlockTable> canonical(2);
+            std::vector<BlockTable> source(2);
+            ASSERT_TRUE(AdmitForTest(coordinator, canonical, 8));
+            ASSERT_TRUE(AdmitForTest(coordinator, source, 8));
+            RequestProgress progress{.completed_pages = CompletedPages{.prefix_hashes = hashes, .publish_state = true},
+                                     .num_computed_tokens = 8};
+            coordinator.CacheCompletedBlocks(canonical, progress,
+                                             CacheCoordinatorTestAccess::NextAccessEpoch(coordinator));
+            const auto canonical_kv = coordinator.Allocator(0).BlockTablePageIds(canonical[0]);
+            const auto canonical_state = coordinator.Allocator(1).BlockTablePageIds(canonical[1]);
+            const auto source_kv = coordinator.Allocator(0).BlockTablePageIds(source[0]);
+            const auto source_state = coordinator.Allocator(1).BlockTablePageIds(source[1]);
+            ASSERT_NE(source_kv, canonical_kv);
+            ASSERT_NE(source_state[1], canonical_state[1]);
+            if (!canonical_pinned) {
+                coordinator.Free(canonical);
+            }
+            const auto empty_before = pool.NumEmptyLcmBlocks();
+            progress.completed_pages->preserve_source_blocks = preserve_sources;
+            coordinator.CacheCompletedBlocks(source, progress,
+                                             CacheCoordinatorTestAccess::NextAccessEpoch(coordinator));
+            EXPECT_EQ(coordinator.Allocator(0).BlockTablePageIds(source[0]),
+                      preserve_sources ? source_kv : canonical_kv);
+            EXPECT_EQ(
+                coordinator.Allocator(1).BlockTablePageIds(source[1]),
+                (std::vector<std::int32_t>{source_state[0], preserve_sources ? source_state[1] : canonical_state[1]}));
+            // The two KV pages and checkpoint occupy three physical parents,
+            // independently of whether another request pins the canonical copy.
+            EXPECT_EQ(pool.NumEmptyLcmBlocks() - empty_before, preserve_sources ? 0 : 3);
+            EXPECT_EQ(coordinator.ProbePrefix(hashes).device.num_common_tokens, 8);
+            coordinator.Free(source);
+            coordinator.Free(canonical);
+            coordinator.ClearCache();
+            EXPECT_EQ(pool.NumEmptyLcmBlocks(), 12);
+        }
     }
 }
 

@@ -46,6 +46,25 @@ they publish a generation and all consumer subgroups before they read the
 peer inbox. Removing either rendezvous can increase cross-rank
 skew and regress performance even when the generated kernel remains correct.
 
+### Inline asm
+
+Prefer Gluon ops, then LLVM intrinsics through an extern `.ll` library
+(see `_extern.py`), over inline asm. The compiler inserts the wait states
+between dependent instructions and protects live registers only for
+instructions it can see. It doesn't look inside an asm block. Use inline asm
+only where neither exists, and follow these rules:
+
+- Say why at the site with an `# asm:` comment.
+- Declare every register the template writes: outputs and `~{...}` clobbers,
+  including SCC and VCC.
+- Don't read a value inside its producer's hazard window (an MFMA or
+  transcendental result, or an SGPR that a VALU instruction just wrote). Pass
+  it through a compiler-visible op first.
+- Don't pad with `s_nop`.
+
+`tokenspeed-kernel/test/amd/gfx950/ops/test_inline_asm_gfx950.py` lists the
+allowed helpers and checks these rules on the compiled kernels.
+
 ## GEMM
 
 ### gfx950 dense BF16 projections
@@ -611,7 +630,9 @@ quantize the result for `wo_b` (`gluon_grouped_bf16_projection_fp8_gfx1250`).
   contiguous `B` `[G, N, K]`, and returns contiguous BF16 `[M, G, N]`. With
   quantization (`N` divisible by 32) it returns E4M3 codes `[M, G * N]` and
   uint8 UE8M0 scales `[M, G * N / 32]`, bit-identical to quantizing the BF16
-  result with `gluon_quantize_fp8_group32_ue8m0_gfx1250`.
+  result of the same K split with `gluon_quantize_fp8_group32_ue8m0_gfx1250`.
+  Up to 32 rows that split differs from the unquantized form's, so a sum can
+  round to an adjacent BF16 value before it is quantized.
 
 #### Algorithm
 

@@ -144,10 +144,11 @@ Request* Scheduler::findRequest(const std::string& request_id) {
 bool Scheduler::pdTransferInFlight(const Request& request) const {
     switch (config_.role) {
         case Role::kD:
-            return request.Is<fsm::RemotePrefilling>();
+            return request.IsAnyOf<fsm::RemotePrefilling, fsm::PdTransferring>();
         case Role::kP:
-            // Every page-holding state but Finishing: SucceededEvent moves a
-            // request there once the peer has read its pages.
+            // Every page-holding state but Finishing, PdTransferring
+            // included: SucceededEvent moves a request to Finishing once the
+            // peer has read its pages.
             return request.HoldsPages() && !request.Is<fsm::Finishing>();
         case Role::kFused:
             return false;
@@ -563,9 +564,6 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
     std::vector<Request*> candidates;
     candidates.reserve(requests_.size());
     for (const auto& request : requests_) {
-        if (request->PdFailureRetired()) {
-            continue;  // local forward results still own the failed request's pages
-        }
         if (request->IsAnyOf<fsm::Submitted, fsm::Prefilling, fsm::RemotePrefilling, fsm::PrefillDone, fsm::Decoding,
                              fsm::Retracted>()) {
             candidates.push_back(request.get());

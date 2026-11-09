@@ -20,13 +20,51 @@
 
 """Shared chain verification preserves the complete greedy Torch outputs."""
 
+import importlib.util
+import os
+import sys
+
 import pytest
 import torch
 from tokenspeed_kernel.ops.sampling.triton import verify_chain_target_sampled
 from tokenspeed_kernel.ops.sampling.triton.verify import (
     _verify_chain_target_sampled_kernel,
 )
-from utils import assert_no_triton_compile
+
+sys.path.insert(
+    0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+)
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=20, suite="runtime-1gpu")
+
+from tokenspeed.runtime.sampling.backends.greedy import (  # noqa: E402
+    _verify_chain_greedy_torch,
+)
+
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+
+
+def _kernel_test_utils():
+    kernel_test_dir = os.path.join(
+        os.path.dirname(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        ),
+        "tokenspeed-kernel",
+        "test",
+    )
+    spec = importlib.util.spec_from_file_location(
+        "greedy_chain_verify_kernel_test_utils",
+        os.path.join(kernel_test_dir, "utils.py"),
+    )
+    utils = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(utils)
+    return utils
+
+
+@pytest.fixture
+def device() -> str:
+    return "cuda"
 
 
 def _inputs(bs, width, pattern, device):
@@ -62,9 +100,6 @@ def _outputs(bs, width, device):
 
 
 def _reference(candidates, target):
-    # Keep this private oracle import in sync with runtime verifier refactors.
-    from tokenspeed.runtime.sampling.backends.greedy import _verify_chain_greedy_torch
-
     bs, width = candidates.shape
     out = _outputs(bs, width, candidates.device)
     _verify_chain_greedy_torch(*out, candidates, target, bs, width)
@@ -129,7 +164,9 @@ def test_greedy_chain_no_row_or_stride_specialization(device):
     verify_chain_target_sampled(
         *actual, candidates, target, write_rejected_targets=True, enable_pdl=False
     )
-    with assert_no_triton_compile(_verify_chain_target_sampled_kernel):
+    with _kernel_test_utils().assert_no_triton_compile(
+        _verify_chain_target_sampled_kernel
+    ):
         for bs in range(1, 33):
             verify_chain_target_sampled(
                 actual[0][: bs * 6],

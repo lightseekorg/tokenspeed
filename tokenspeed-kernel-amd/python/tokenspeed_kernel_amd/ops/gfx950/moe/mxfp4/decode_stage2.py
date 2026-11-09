@@ -35,8 +35,6 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_common import (
     _direct_mxfp4_load_tile,
     _direct_mxfp4_mfma,
     _direct_mxfp4_mfma_layouts,
-    _group_routes,
-    _route_groups_from_ids,
 )
 
 
@@ -483,7 +481,19 @@ def _route_tile_launch_metadata(grid, kernel, args):
     return {"name": f"{kernel.name} (routes={args['out'].shape[0]})"}
 
 
-@gluon.jit(launch_metadata=_route_tile_launch_metadata, do_not_specialize=["rows"])
+@gluon.jit
+def _issue_here(value):
+    # An empty asm that uses the value keeps the compiler from sinking its
+    # load below the job loop's bound check, so it overlaps the group-count
+    # load instead of following it.
+    # asm: an empty template (no instruction). Gluon has no op that keeps a
+    # value at a program point.
+    return gl.inline_asm("", "=s,0", [value], gl.int32, is_pure=False)
+
+
+@gluon.jit(
+    launch_metadata=_route_tile_launch_metadata, do_not_specialize=["descriptor_rows"]
+)
 def gluon_mxfp4_moe_stage2_route_tiles_gfx950(
     x,
     xscale,
@@ -492,8 +502,8 @@ def gluon_mxfp4_moe_stage2_route_tiles_gfx950(
     sorted_routes,
     descriptors,
     group_count,
+    descriptor_rows,
     out,
-    rows,
     INTERMEDIATE: gl.constexpr,
     OUTPUT: gl.constexpr,
     XS0: gl.constexpr,
@@ -506,17 +516,13 @@ def gluon_mxfp4_moe_stage2_route_tiles_gfx950(
     BLOCK_K: gl.constexpr,
     BLOCK_M: gl.constexpr,
     PREFETCH_TILES: gl.constexpr,
-    ROUTES_FROM_IDS: gl.constexpr,
-    TOPK: gl.constexpr,
-    EXPERT_START: gl.constexpr,
-    NUM_EXPERTS: gl.constexpr,
 ):
     """Read expert route tiles and return separate token/slot outputs.
 
-    With ``ROUTES_FROM_IDS`` the program groups the routes of at most
-    ``BLOCK_M`` tokens by expert itself from the top-k IDs ``[rows, TOPK]``
-    in ``sorted_routes``; ``descriptors`` and ``group_count`` are unused.
-    Otherwise they are the route-descriptor kernels' outputs.
+    ``sorted_routes``, ``descriptors`` and ``group_count`` hold the routes
+    grouped by expert, from the route-descriptor kernels or from stage 1
+    (``gluon_mxfp4_moe_stage1_route_tiles_gfx950`` with ``ROUTES_FROM_IDS``);
+    ``descriptor_rows`` is the descriptor table's row count.
     """
     gl.static_assert(
         INTERMEDIATE % BLOCK_K == 0, "route tiles require complete K tiles"
@@ -541,32 +547,34 @@ def gluon_mxfp4_moe_stage2_route_tiles_gfx950(
     ask = gl.arange(0, KS, layout=gl.SliceLayout(0, lsa))[None, :]
     bsn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, lsb))[:, None]
     bsk = gl.arange(0, KS, layout=gl.SliceLayout(0, lsb))[None, :]
-    if ROUTES_FROM_IDS:
-        route_expert, counts, group_index, groups = _route_groups_from_ids(
-            sorted_routes, rows, EXPERT_START, NUM_EXPERTS, TOPK, BLOCK_M
-        )
-    else:
-        groups = gl.load(group_count)
+    # The first job's descriptor is read alongside the group count instead of
+    # after it (a program rarely has a second job), so the route loads wait
+    # for one round trip less. Padding rows repeat the group's last route.
+    groups = gl.load(group_count)
+    first_group = gl.minimum(
+        gl.program_id(0) // (OUTPUT // BLOCK_N), descriptor_rows - 1
+    )
+    first_start = gl.load(descriptors + first_group * 3)
+    first_count = gl.load(descriptors + first_group * 3 + 1)
+    first_expert = gl.load(descriptors + first_group * 3 + 2)
+    first_start = _issue_here(first_start)
+    first_count = _issue_here(first_count)
+    first_expert = _issue_here(first_expert)
     for job in range(
         gl.program_id(0), groups * (OUTPUT // BLOCK_N), gl.num_programs(0)
     ):
         group = job // (OUTPUT // BLOCK_N)
         n = job % (OUTPUT // BLOCK_N)
-        if ROUTES_FROM_IDS:
-            expert, count, members = _group_routes(
-                route_expert, counts, group_index, group, BLOCK_M
-            )
-            routes = gl.convert_layout(members, gl.SliceLayout(1, la))[:, None]
-            scale_routes = gl.convert_layout(members, gl.SliceLayout(1, lsa))[:, None]
+        if job == gl.program_id(0):
+            start = first_start
+            count = first_count
+            expert = first_expert
         else:
             start = gl.load(descriptors + group * 3)
             count = gl.load(descriptors + group * 3 + 1)
             expert = gl.load(descriptors + group * 3 + 2)
-            first = gl.load(sorted_routes + start)
-            routes = gl.load(sorted_routes + start + am, am < count, other=first)
-            scale_routes = gl.load(
-                sorted_routes + start + asm, asm < count, other=first
-            )
+        routes = gl.load(sorted_routes + start + gl.minimum(am, count - 1))
+        scale_routes = gl.load(sorted_routes + start + gl.minimum(asm, count - 1))
         xoff = routes.to(gl.int64) * K_PACKED
         woff = expert.to(gl.int64) * WE
         wsoff = expert.to(gl.int64) * SE
@@ -606,10 +614,7 @@ def gluon_mxfp4_moe_stage2_route_tiles_gfx950(
         )
         sm = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, mfma))[:, None]
         sn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfma))[None, :]
-        if ROUTES_FROM_IDS:
-            destinations = gl.convert_layout(members, gl.SliceLayout(1, mfma))[:, None]
-        else:
-            destinations = gl.load(sorted_routes + start + sm, sm < count, other=first)
+        destinations = gl.load(sorted_routes + start + gl.minimum(sm, count - 1))
         gl.store(
             out + destinations.to(gl.int64) * OUTPUT + n * BLOCK_N + sn,
             acc.to(gl.bfloat16),
