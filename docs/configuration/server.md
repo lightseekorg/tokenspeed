@@ -1045,8 +1045,11 @@ nothing here is schedulable until the bootstrap token arrives.
 to connect. `tokenspeed:num_decode_transfer_queue_reqs` counts requests whose
 pages a transfer still pins, including requests that already ended (aborted or
 failed) and are only waiting for the transport to report stopped; it is a
-resource count, not a queue depth. Use `num_decode_kv_wait_reqs` for "waiting
-for KV", and `num_requests_inflight` for the rank's total held requests.
+resource count, not a queue depth. The transfer gauge is a superset of
+`num_decode_kv_wait_reqs`: every waiting request's destination pages are pinned
+by its inbound transfer, so do not add the two. Use `num_decode_kv_wait_reqs`
+for "waiting for KV", and `num_requests_inflight` for the rank's total held
+requests.
 `tokenspeed:num_requests_waiting` is the scheduler's narrower waiting queue,
 without the PD bootstrapping share (see `#queue-req` above). All of these carry
 the `dp_rank` label and are per scheduler rank.
