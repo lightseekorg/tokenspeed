@@ -442,7 +442,7 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
     )
     if failure:
         with pytest.raises(RuntimeError, match="profiling failed"):
-            ModelExecutor.autotune(executor)
+            ModelExecutor.autotune(executor, keep_loaded_tactics=False)
         assert events == [
             "load",
             ("group", None),
@@ -451,7 +451,7 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
             ("group", None),
         ]
     else:
-        ModelExecutor.autotune(executor)
+        ModelExecutor.autotune(executor, keep_loaded_tactics=False)
         assert events == [
             "load",
             ("group", None),
@@ -533,7 +533,7 @@ def test_a_query_sharding_engine_tunes_on_the_shards_rows(monkeypatch):
         lambda path, group, owner: events.append(("save", path, group, owner)),
     )
     _tap(monkeypatch, executor_module, "autotune", lambda *args, **kwargs: None)
-    ModelExecutor.autotune(executor)
+    ModelExecutor.autotune(executor, keep_loaded_tactics=False)
     assert seen["input_ids"].tolist() == [2, 6, 10, 14]
     assert seen["positions"].tolist() == [20, 60, 100, 140]
     assert seen["rows"].tolist() == [2, 6, 10, 14] and seen["span"] == 16
@@ -643,9 +643,9 @@ def test_decode_only_attention_tunes_on_a_decode_step(
     )
     if failure:
         with pytest.raises(RuntimeError, match="decode warmup failed"):
-            ModelExecutor.autotune(executor)
+            ModelExecutor.autotune(executor, keep_loaded_tactics=False)
     else:
-        ModelExecutor.autotune(executor)
+        ModelExecutor.autotune(executor, keep_loaded_tactics=False)
     assert max_tokens == [8 * 3]
     assert events == [
         "load",
@@ -686,7 +686,7 @@ def test_pipeline_parallelism_does_not_run_unsupported_dummy_forward(
         model_input_kwargs=unexpected_forward,
         events=[],
     )
-    ModelExecutor.autotune(executor)
+    ModelExecutor.autotune(executor, keep_loaded_tactics=False)
     assert not tuning_module.is_warming_up()
 
 

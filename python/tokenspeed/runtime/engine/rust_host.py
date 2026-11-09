@@ -426,6 +426,7 @@ class HostConfig:
             multimodal inputs.
         memory_saver: ``--enable-memory-saver``: memory can be released.
         memory_regions: The regions this engine can release.
+        allow_reload_forward: ``--allow-reload-forward``: the reload_forward control call is served.
         metrics_prometheus_dir: ``PROMETHEUS_MULTIPROC_DIR``, where the host
             writes its Prometheus series, when the Prometheus reporter is
             on; else None.
@@ -505,6 +506,7 @@ class HostConfig:
     multimodal: bool
     memory_saver: bool
     memory_regions: tuple[str, ...]
+    allow_reload_forward: bool
     metrics_prometheus_dir: str | None
     metrics_relay_endpoint: str | None
     engine_metrics: bool
@@ -965,6 +967,13 @@ class HostDataPlane:
         output = self._profiler.profile(request)
         return bool(output.success), str(output.message)
 
+    def reload_forward(self, payload: bytes) -> tuple[bool, str]:
+        """Reload edited forward code and recapture the graphs (a msgpack ``ReloadForwardReqInput``); the engine drained and flushed."""
+        ok, message = self._device.reload_forward(
+            zmq_wire.decode_request_frames([zmq_wire.REQ_TYPE_CONTROL, payload])[0]
+        )
+        return bool(ok), str(message)
+
     def release_memory(self, tags: list[str]) -> None:
         """Free memory regions, in order; the scheduler has drained."""
         for tag in tags:
@@ -1398,6 +1407,7 @@ class HostBootstrap:
                 multimodal=model_config.is_multimodal_active,
                 memory_saver=server_args.enable_memory_saver,
                 memory_regions=tuple(regions),
+                allow_reload_forward=server_args.allow_reload_forward,
                 metrics_prometheus_dir=(
                     os.environ["PROMETHEUS_MULTIPROC_DIR"]
                     if metrics_enabled(server_args, "prometheus")

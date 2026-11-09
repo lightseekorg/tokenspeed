@@ -1383,6 +1383,75 @@ def test_scan_drops_tasks_whose_ignored_paths_cover_every_change(
 
 
 @pytest.mark.parametrize(
+    ("trigger", "changed", "expected"),
+    [
+        (
+            "per-commit",
+            "tokenspeed-kernel/python/a.py\n python/tokenspeed/b.py\n",
+            {"kernel": "tokenspeed-kernel/python/a.py\npython/tokenspeed/b.py"},
+        ),
+        ("post-submit", "tokenspeed-kernel/python/a.py\n", {"kernel": None}),
+        (
+            "per-commit",
+            "\n".join(f"tokenspeed-kernel/python/{i}.py" for i in range(300)),
+            {"kernel": None},
+        ),
+    ],
+)
+def test_scan_hands_changed_paths_only_to_tasks_that_ask(
+    trigger, changed, expected, tmp_path, capsys, monkeypatch
+):
+    monkeypatch.delenv(pipeline.EXCLUDED_RUNNER_LABELS_ENV, raising=False)
+    monkeypatch.delenv(pipeline.B200_RUNNER_LABEL_ENV, raising=False)
+    root = tmp_path / "test/ci"
+    root.mkdir(parents=True)
+    opt_in = "changed_paths: true\n"
+    _write_task_yaml(
+        root, "kernel.yaml", _default_body("kernel", ["b200-1gpu"], opt_in)
+    )
+    _write_task_yaml(root, "other.yaml", _default_body("other", ["b200-1gpu"]))
+    changed_file = tmp_path / "changed.txt"
+    changed_file.write_text(changed)
+    argv = ["scan", "--repo-root", str(tmp_path), "--trigger", trigger]
+    argv += ["--changed-files", str(changed_file)]
+    assert pipeline.main(argv) == 0
+    matrix = json.loads(capsys.readouterr().out)
+    assert {
+        entry["name"]: entry.get("changed_paths") for entry in matrix["include"]
+    } == {**expected, "other": None}
+
+
+def test_scan_full_tests_request_skips_every_narrowing(tmp_path, capsys, monkeypatch):
+    monkeypatch.delenv(pipeline.EXCLUDED_RUNNER_LABELS_ENV, raising=False)
+    monkeypatch.delenv(pipeline.B200_RUNNER_LABEL_ENV, raising=False)
+    root = tmp_path / "test/ci"
+    root.mkdir(parents=True)
+    narrowed = "ignore_changes:\n  - python/tokenspeed\nchanged_paths: true\n"
+    _write_task_yaml(
+        root, "kernel.yaml", _default_body("kernel", ["b200-1gpu"], narrowed)
+    )
+    _write_task_yaml(root, "other.yaml", _default_body("other", ["b200-1gpu"]))
+    changed_file = tmp_path / "changed.txt"
+    changed_file.write_text("python/tokenspeed/runtime/a.py\n")
+    argv = ["scan", "--repo-root", str(tmp_path), "--trigger", "per-commit"]
+    argv += ["--changed-files", str(changed_file), "--full-tests"]
+    assert pipeline.main(argv) == 0
+    matrix = json.loads(capsys.readouterr().out)
+    assert [
+        (entry["name"], entry.get("changed_paths")) for entry in matrix["include"]
+    ] == [("kernel", None), ("other", None)]
+
+
+def test_validate_task_rejects_a_non_boolean_changed_paths(tmp_path):
+    body = _default_body("ut-a", ["b300-1gpu"], extra="changed_paths: yes please\n")
+    path = _write_task_yaml(tmp_path, "bad.yaml", body)
+    import yaml as _yaml
+
+    with pytest.raises(ValueError, match=r"changed_paths must be a boolean"):
+        validate_task(_yaml.safe_load(path.read_text()), path)
+
+
+@pytest.mark.parametrize(
     "prefixes", ["[]", "python/tokenspeed", "['']", "[python/tokenspeed/]"]
 )
 def test_validate_task_rejects_malformed_ignore_changes(tmp_path, prefixes):
