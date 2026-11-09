@@ -1258,6 +1258,13 @@ def _capture_serving_graphs(
     from tokenspeed.runtime.utils import set_random_seed
 
     executor.capture_graphs(entries=None, observer=NULL_MEMORY_DELTA_OBSERVER)
+    if server_args.enable_dsv41_adaptive_dspark:
+        from tokenspeed.runtime.execution.drafter.verify_startup import (
+            profile_dsv41_startup,
+        )
+
+        with startup_phase("dspark.profile"):
+            profile_dsv41_startup(executor)
     if replays_prefill_graphs and not executor.prefill_graph.disable:
         # Release capture-stream cache no forward reuses; graph pools are not freed.
         device_module = torch.get_device_module(server_args.device)

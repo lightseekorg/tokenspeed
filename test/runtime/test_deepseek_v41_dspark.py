@@ -1753,6 +1753,7 @@ def test_budget_allocation_graphs_are_prepared_and_reused(tmp_path, monkeypatch)
     drafter._active_verify_timing = None
     drafter._verify_step_samples = []
     drafter._aligned_verify_samples = ()
+    drafter._verify_startup_ready = False
     drafter._verify_collecting = True
     drafter._verify_cache_initialized = True
     drafter._verify_cache = None
@@ -1868,6 +1869,7 @@ def test_budget_allocation_graphs_are_prepared_and_reused(tmp_path, monkeypatch)
     from tokenspeed.runtime.execution.drafter.verify_calibration import VerifyStepSample
 
     drafter._verify_calibrations = ()
+    drafter._verify_startup_ready = False
     drafter._verify_collecting = True
     for tier, capacity in enumerate((24, 20, 16, 12, 8, 4)):
         drafter._aligned_verify_samples = tuple(

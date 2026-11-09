@@ -58,6 +58,7 @@ def _make_drafter(mapping):
     drafter._active_verify_timing = None
     drafter._verify_step_samples = []
     drafter._aligned_verify_samples = ()
+    drafter._verify_startup_ready = False
     drafter._verify_collecting = True
     drafter._verify_cache_initialized = True
     drafter._verify_cache = None
@@ -211,6 +212,21 @@ def test_dp_budget_agreement_and_native_fallback():
     assert (
         drafter.prepare_decode_graph_token_layout(ctx, actual_bs=4, padded_bs=4) == 12
     )
+    # Startup owns profiling: an uncovered serving shape must remain native,
+    # without starting online collection or allocating step timing events.
+    profiles = drafter._verify_calibrations
+    drafter._verify_startup_ready = True
+    drafter._verify_calibrations = ()
+    for _ in range(3):
+        assert (
+            drafter.prepare_decode_graph_token_layout(ctx, actual_bs=4, padded_bs=4)
+            == 24
+        )
+        assert not drafter._verify_collecting
+        assert drafter._active_verify_timing is None
+    assert not drafter._verify_collectors
+    drafter._verify_calibrations = profiles
+    drafter._verify_startup_ready = False
     # Different local lengths within a region can share a synchronized cost.
     drafter._verify_step_samples = [
         VerifyStepSample(20, 4, 12, 120 + rank, 125 + rank, float(rank + 1))

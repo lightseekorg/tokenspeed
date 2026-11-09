@@ -177,6 +177,7 @@ class DeepseekV41DSpark(BaseDrafter):
         self.verify_graph_token_step: int | None = None
         self._verify_calibrations: tuple[VerifyCalibration, ...] = ()
         self._verify_policy_ms: float | None = None
+        self._verify_startup_ready = False
         self.verify_budget_policy: VerifyBudgetPolicy | None = None
         if global_server_args_dict.get("enable_dsv41_adaptive_dspark", False):
             self.verify_budget_policy = VerifyBudgetPolicy(
@@ -331,6 +332,10 @@ class DeepseekV41DSpark(BaseDrafter):
                 batch_size=actual_bs, graph_batch_size=padded_bs
             ):
                 return padded_bs * self.spec_num_tokens
+            if self._verify_startup_ready:
+                return self._prepare_calibrated_budget(
+                    actual_bs=actual_bs, padded_bs=padded_bs
+                )
             if self._verify_collecting and actual_bs in self._verify_budget_buffers:
                 self._poll_verify_feedback()
                 self._synchronize_verify_samples(self._verify_budget_buffers[actual_bs])
@@ -582,7 +587,7 @@ class DeepseekV41DSpark(BaseDrafter):
                         policy_ms=self._verify_policy_ms,
                     )
                     break
-            if collecting:
+            if collecting and not self._verify_startup_ready:
                 region = self._verify_context_region((lower, upper))
                 collector = (
                     self._verify_collectors.get((batch_size, *region))
@@ -591,7 +596,7 @@ class DeepseekV41DSpark(BaseDrafter):
                 )
                 if collector is not None:
                     selected = collector.next_capacity() or full
-        self._verify_collecting = collecting
+        self._verify_collecting = collecting and not self._verify_startup_ready
         if selected != full:
             # Keep the pinned H2D source step-local; peers is CPU-only storage.
             buffers.packet.copy_(packet, non_blocking=True)
@@ -638,7 +643,7 @@ class DeepseekV41DSpark(BaseDrafter):
                             policy_ms=self._verify_policy_ms,
                         )
                         break
-                if collecting:
+                if collecting and not self._verify_startup_ready:
                     region = self._verify_context_region(bounds)
                     if region is not None:
                         collector = self._verify_collectors.get((actual_bs, *region))
@@ -658,7 +663,7 @@ class DeepseekV41DSpark(BaseDrafter):
             selected_value, collecting_value = packet[:2].tolist()
             selected = int(selected_value)
             collecting = bool(collecting_value)
-        self._verify_collecting = collecting
+        self._verify_collecting = collecting and not self._verify_startup_ready
         if selected != full:
             buffers.packet.copy_(packet, non_blocking=True)
             source = buffers.packet[2:].view(actual_bs, self.block_size)
@@ -907,7 +912,8 @@ class DeepseekV41DSpark(BaseDrafter):
                     else []
                 )
                 identity = {
-                    "schema": 2,
+                    "schema": 3,
+                    "measurement": "startup-synthetic-graph-with-host-budget-v1",
                     "model": args.model,
                     "revision": args.revision,
                     "model_config": model_config.hf_config.to_dict(),
