@@ -29,6 +29,8 @@ FILES = {
     # Not in the suite, yet it links test_two_hop to test_misc.
     f"{TESTS}/test_unregistered.py": "import test.runtime.test_misc\n",
     f"{TESTS}/test_two_hop.py": "from runtime.test_unregistered import helper\n",
+    # Imports a test file that the change deletes.
+    f"{TESTS}/test_uses_deleted.py": "from test.runtime.test_deleted import helper\n",
 }
 ALL = sorted(
     path
@@ -52,6 +54,7 @@ def repo(tmp_path: Path) -> Path:
         ([f"{MODELS}/beta.py"], ["test_beta"]),
         ([f"{MODELS}/gamma.py"], ["test_gamma", "test_gamma_deepep"]),
         ([f"{MODELS}/gpt_oss.py"], ["test_serving_e2e"]),
+        ([f"{TESTS}/test_deleted.py"], ["test_uses_deleted"]),
         (
             [f"{TESTS}/test_misc.py"],
             ["test_misc", "test_two_hop", "test_uses_misc", "test_uses_misc_bare"],

@@ -123,8 +123,8 @@ def select_runtime_tests(
         or model_names(imports[test]) & reached
         or any(name in squashed(path.read_text(encoding="utf-8")) for name in names)
     }
-    # A test that imports an affected test file is affected too.
-    pending = list(affected)
+    # A test that imports an affected test file, or a deleted one, is affected too.
+    pending = list(affected | changed_tests)
     while pending:
         modules = test_module_names(pending.pop())
         for test in sources:
