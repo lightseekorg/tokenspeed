@@ -1018,6 +1018,22 @@ requires restarting these workers.
 See [distributed immutable weights](../design/distributed-weights.md) for
 storage ownership and stream-ordering invariants.
 
+Every forward streams the expert shards the worker does not own, so a DWDP
+prefill forward takes seconds whether it carries one token or the whole
+budget; the per-forward cost is paid in full by forwards well below the
+budget. Choose the chunk size and admission so forwards stay near the budget.
+Every timeout between the frontend and the decode side must then cover at
+least one full forward plus queueing: the gateway's per-worker silence bound
+(SMG `--worker-wedge-secs`, 3 s by default, after which every request on the
+worker returns 504), and in prefill/decode disaggregation
+`TOKENSPEED_DISAGGREGATION_BOOTSTRAP_TIMEOUT` (120 s) and
+`TOKENSPEED_DISAGGREGATION_WAITING_TIMEOUT` (300 s), which otherwise drop
+requests queued behind a saturated decode instance as `KV transfer failed`;
+the client's stream then ends with no content and no error. A larger token
+budget also grows the MoE activation workspace, which must fit beside the
+staging pools; if startup runs out of memory there, lower
+`--gpu-memory-utilization` rather than the budget.
+
 DWDP supports local Device and Host L2 caches and auto/safetensors checkpoint
 loading. Memory-saver sleep/wake is unsupported. Shared L3 cache control and
 online expert rebalancing are currently unsupported: L3 flushes coordinate
