@@ -46,6 +46,7 @@ from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.layers.quantization.mxfp4 import Mxfp4Config
 from tokenspeed.runtime.layers.quantization.utils import (
     should_exclude_quant_module,
     should_ignore_quant_layer,
@@ -71,6 +72,11 @@ def _resolve_mtp_quant_config(
         return None
     if should_exclude_quant_module("mtp.layers.0", quant_config.exclude_modules):
         return None
+    if (
+        not isinstance(quant_config, Mxfp4Config)
+        or quant_config.quant_method != "quark"
+    ):
+        return quant_config
     # AMD Quark expands an ``mtp.*`` exclusion into the MTP layer's linear
     # module names only; its fused routed experts (and ``fc_embedding``) are
     # left out of the list but stay BF16 as well.

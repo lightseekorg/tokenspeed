@@ -669,6 +669,10 @@ the backend's workspace and warmup cache. An empty owner still enters the
 collective with zero-row inputs and output, using DeepGEMM's native empty-rank
 support.
 
+Qwen4 NextN can also load MXFP4 routed experts when the checkpoint leaves its
+attention and shared expert in BF16. For a draft with packed MXFP4 weights, use
+`--speculative-draft-model-quantization mxfp4`.
+
 `test/runtime/test_qwen4_mxfp4_mega_moe.py` checks model planning, EP checkpoint
 loading, capacity bounds, and (under torch.distributed.run) independent shared
 expert execution. The Blackwell numerical and graph regression can
