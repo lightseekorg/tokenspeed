@@ -106,6 +106,8 @@ def test_cuda_mxfp8_row_gather_matches_quantized_dequant(index_dtype):
     table = _mxfp8_table(40, 256, generator).pin_memory()
     ids = torch.randint(0, 40, (5, 3, 4), generator=generator)
     ids[0, 1, 0], ids[2, 1, 3], ids[4, 1, 1] = -1, 40, 0
+    # Rows 1 and 2 hold exponent bytes 0 and 1; gather them whatever the draw.
+    ids[1, 1, 0], ids[3, 1, 2] = 1, 2
     # A layer's slice of [tokens, layers, columns] ids: not contiguous.
     indices = ids.to(device="cuda:0", dtype=index_dtype)[:, 1]
     codes, scales = host_gather.mxfp8_row_gather(table, indices, None, None)
