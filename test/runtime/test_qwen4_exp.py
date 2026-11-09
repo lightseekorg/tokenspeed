@@ -274,6 +274,32 @@ def test_qwen4_exp_decoder_policies_are_model_local() -> None:
     assert moe_qwen38.model_type == "qwen4_exp_text"
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_qwen4_exp_attention_layer_gates_its_output_whatever_the_config_says() -> None:
+    config = Qwen4ExpTextConfig(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=32,
+        layer_types=["linear_attention", "full_attention"],
+        hc_count=2,
+        hc_lowrank=8,
+        num_experts=None,
+        attn_output_gate=False,
+    )
+    with torch.device("cuda"):
+        layer = Qwen4ExpAttentionDecoderLayer(
+            config, Mapping(rank=0, world_size=1), 1, prefix="model.layers.1.self_attn"
+        )
+
+    # The query projection carries a gate per head on top of q, k and v.
+    assert layer.attn_output_gate
+    assert layer.qkv_proj.weight.shape[0] == (2 * 2 + 1 + 1) * 32
+
+
 def test_qwen4_exp_config_normalizes_layer_and_ple_geometry() -> None:
     config = Qwen4ExpTextConfig(
         vocab_size=128,
