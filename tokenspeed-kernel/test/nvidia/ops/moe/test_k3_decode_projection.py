@@ -215,6 +215,21 @@ def test_a_weight_the_warp_split_k_cannot_take_runs_the_cluster_split_k(projecti
             assert torch.equal(out, expected), (case, rows)
 
 
+def test_every_weight_the_warp_split_k_takes_gets_a_valid_tactic():
+    from tokenspeed_kernel.thirdparty.cute_dsl.k3_decode.gemm.decode import (
+        warp_eligible,
+        warp_tactic,
+    )
+
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    assert not warp_eligible(64, 128) and not warp_eligible(64, 256)
+    for k in range(384, 64 * 128 + 1, 128):
+        for n in (16, 32, 6288, 16384):
+            assert warp_eligible(n, k)
+            for rows in (1, 9, 16):
+                warp_tactic(rows, n, k, sms)  # raises on an invalid tactic
+
+
 def test_unprepared_rows_and_other_operands_are_rejected(projection):
     n = projection.weight.shape[0]
     x = _randn(18, HIDDEN, std=1.0, seed=700)

@@ -54,7 +54,8 @@ def warp_tactic(m, n, k, sms):
 
 
 def warp_eligible(n, k):
-    return n % 16 == 0 and k % 128 == 0 and k // 128 <= 64
+    # ``warp_tactic`` rings at least two K tiles; K = 128 or 256 is a single tile.
+    return n % 16 == 0 and k % 128 == 0 and 3 <= k // 128 <= 64
 
 
 def warp_weight(weight):
