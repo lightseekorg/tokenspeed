@@ -182,7 +182,7 @@ def _fwd_folded_kernel_stage1(
         safe_max = tl.where(n_e_max == float("-inf"), 0.0, n_e_max)
         re_scale = tl.exp2(e_max - safe_max)
         p = tl.exp2(qk - safe_max[:, None])
-        acc = acc * re_scale[:, None] + tl.dot(p.to(v.dtype), v)
+        acc = acc * re_scale[:, None] + tl.dot(p.to(q.dtype), v.to(q.dtype))
         e_sum = e_sum * re_scale + tl.sum(p, 1)
         e_max = n_e_max
 
