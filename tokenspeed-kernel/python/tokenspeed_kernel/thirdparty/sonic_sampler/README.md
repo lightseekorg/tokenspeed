@@ -42,13 +42,13 @@ The vendored sources differ from `src/sonic_sampler` at that commit only by:
 - vocabulary-sharded logits (a vocab-parallel LM head under TP): the new
   `ops/shard.py` (not upstream) adds `shard_candidates_kernel`, which writes
   each rank's best `MAX_K` (value, global token id) pairs from its reduced
-  shard for the ranks' gather and merge, and `merged_candidates`, which
-  `cumulative_selection_kernel` and `cumulative_unpack_kernel` read through
-  their new trailing `cv_ptr`, `ci_ptr` and `stride_m` arguments in place of
-  their own unpack. `ops/prologue.py` adds `head_logits`, the logits
-  processor's logit scale and softcap, which `bitpacked_reduction_kernel` (new
-  trailing `logit_scale` and `softcap`) and `exact_candidates` apply to a
-  shard's raw head logits;
+  shard for the ranks' gather, and `merged_candidates` and `merged_first`,
+  which merge every rank's gathered pairs inside `cumulative_selection_kernel`
+  and `cumulative_unpack_kernel` (new trailing `cand_ptr`, `ranks`, `stride_mr`
+  and `stride_mb`) in place of their own unpack. `ops/prologue.py` adds
+  `head_logits`, the logits processor's logit scale and softcap, which
+  `bitpacked_reduction_kernel` (new trailing `logit_scale` and `softcap`) and
+  `exact_candidates` apply to a shard's raw head logits;
 - the msgspec host layer is not vendored: `base/`, `core/buffer.py`,
   `interface/` (the `fused_singular`/`fused_multistep` wrappers, the tiling
   and warp-config structs, the class-based interfaces), the packaged dispatch

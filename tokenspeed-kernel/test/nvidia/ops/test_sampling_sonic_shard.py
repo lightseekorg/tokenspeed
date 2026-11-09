@@ -126,8 +126,6 @@ class _Ranks:
         ]
         self.config = pick(self.width, rows)
         self.landing = torch.empty((RANKS, rows, 2 * MAX_K), device="cuda")
-        self.ids = torch.empty((rows, MAX_K), dtype=torch.int32, device="cuda")
-        self.values = torch.empty((rows, MAX_K), device="cuda")
         self.scale, self.softcap = logit_scale, softcap
         self.state, self.slots, self.drafted = state, slots, drafted
 
@@ -138,8 +136,6 @@ class _Ranks:
             self.softcap,
             self.gather,
             self.landing[rank],
-            self.ids,
-            self.values,
         )
 
     def gather(self, pairs: torch.Tensor) -> torch.Tensor:

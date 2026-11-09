@@ -36,7 +36,10 @@ from tokenspeed_kernel.thirdparty.sonic_sampler.ops.prologue import (
     exact_candidates,
     exact_greedy,
 )
-from tokenspeed_kernel.thirdparty.sonic_sampler.ops.shard import merged_candidates
+from tokenspeed_kernel.thirdparty.sonic_sampler.ops.shard import (
+    merged_candidates,
+    merged_first,
+)
 from tokenspeed_kernel.thirdparty.sonic_sampler.ops.topk.unpack import unpack_top_k
 
 
@@ -231,10 +234,11 @@ def cumulative_selection_kernel(
     stride_tr: tl.constexpr,  # Batch Stride of Drafted Tokens.
     block_t: tl.constexpr,  # Block Size of Drafted Tokens.
     exact: tl.constexpr,  # Exact fp32 Logits Flag.
-    # Merged Candidates of Vocabulary-Sharded Logits (in place of the scratch-pad).
-    cv_ptr=None,  # Candidate Values -> [ B, M ].
-    ci_ptr=None,  # Candidate Token Ids -> [ B, M ].
-    stride_m: tl.constexpr = None,  # Batch Stride of Candidates.
+    # Every Rank's Candidates of Vocabulary-Sharded Logits (in place of the scratch-pad).
+    cand_ptr=None,  # Gathered Candidate Pairs -> [ W, L, 2 • M ] fp32: values, then token ids.
+    ranks: tl.constexpr = None,  # Ranks -> W.
+    stride_mr=None,  # Rank Stride of Gathered Candidate Pairs.
+    stride_mb: tl.constexpr = None,  # Batch Stride of Gathered Candidate Pairs.
 ) -> None:
 
     # Extract the batch id from program id and load the indicator.
@@ -252,15 +256,11 @@ def cumulative_selection_kernel(
 
         # Load, reduce, and select greedy i.e. top-1 maximum.
 
-        if cv_ptr is not None:
+        if cand_ptr is not None:
 
-            # The merged candidates lead with the row's first maximum.
-
-            if enable_pdl:
-
-                gdc_wait()
-
-            selection = tl.load(ci_ptr + (row_id * stride_m))
+            selection = merged_first(
+                cand_ptr, row_id, ranks, stride_mr, stride_mb, enable_pdl, max_k
+            )
 
         elif exact:
 
@@ -310,10 +310,10 @@ def cumulative_selection_kernel(
 
         # Load, reduce, and unpack top-k stochastic subset.
 
-        if cv_ptr is not None:
+        if cand_ptr is not None:
 
             values, indices = merged_candidates(
-                cv_ptr, ci_ptr, row_id, exact, enable_pdl, stride_m, max_k
+                cand_ptr, row_id, ranks, stride_mr, stride_mb, exact, enable_pdl, max_k
             )
 
         else:
@@ -339,7 +339,7 @@ def cumulative_selection_kernel(
                 block_v,
             )
 
-        if exact and cv_ptr is None:
+        if exact and cand_ptr is None:
 
             # Re-read the candidates' exact values: bf16 keys only chose them.
 

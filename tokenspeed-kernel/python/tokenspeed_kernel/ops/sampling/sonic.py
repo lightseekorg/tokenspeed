@@ -45,7 +45,6 @@ from dataclasses import dataclass
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.ops.sampling import vocab_topk_merge
 from tokenspeed_kernel.thirdparty.sonic_sampler.core.flags import Indicator
 from tokenspeed_kernel.thirdparty.sonic_sampler.ops.base import MAX_K, next_power_of_2
 from tokenspeed_kernel.thirdparty.sonic_sampler.ops.multistep import (
@@ -247,25 +246,21 @@ def _check_offsets(logits: Tensor, scratchpad: Tensor) -> None:
 
 @dataclass(frozen=True)
 class VocabShard:
-    """This rank's slice of vocabulary-parallel logits, and the buffers its candidates meet the other ranks' in.
+    """This rank's slice of vocabulary-parallel logits, and how its candidates meet the other ranks'.
 
     A launch given one reads ``logits`` as this rank's raw head logits ``[rows,
     V_s]`` (before the logit scale and softcap) for global tokens
     ``vocab_start`` onward; each rank selects its best ``MAX_K`` candidates
-    (``shard_candidates``), ``gather`` collects every rank's, and their merge is
-    sampled as whole-vocabulary logits would be. The buffers hold at least the
-    launch's rows.
+    (``shard_candidates``), ``gather`` collects every rank's, and the draw
+    merges them and samples them as whole-vocabulary logits would be.
     """
 
     vocab_start: int  # Global token id of shard column 0.
     logit_scale: float | None  # The logits processor's multiplier, or None.
     softcap: float | None  # The processor's final logit softcap, or None.
-    gather: Callable[
-        [Tensor], Tensor
-    ]  # This rank's [rows, 2 * MAX_K] pairs to every rank's [W, rows, 2 * MAX_K].
-    pairs: Tensor  # [rows, 2 * MAX_K] fp32: this rank's candidates.
-    ids: Tensor  # [rows, MAX_K] int32: the merged token ids.
-    values: Tensor  # [rows, MAX_K] fp32: the merged values.
+    # This rank's [rows, 2 * MAX_K] pairs to every rank's [W, rows, 2 * MAX_K], W a power of two.
+    gather: Callable[[Tensor], Tensor]
+    pairs: Tensor  # [>= rows, 2 * MAX_K] fp32: this rank's candidates.
 
 
 def _exact(logits: Tensor) -> bool:
@@ -437,17 +432,24 @@ def _merged(
     config: SonicConfig,
     enable_pdl: bool,
 ) -> dict:
-    """The selection kernels' merged-candidate arguments: none for whole rows, else every rank's candidates merged."""
+    """The selection kernels' candidate arguments: none for whole rows, else every rank's gathered candidates, which they merge."""
     if shard is None:
         _reduce(logits, state, slots, drafted, scratchpad, config, enable_pdl, None)
         return {}
-    rows = logits.shape[0]
-    pairs = shard_candidates(
-        logits, state, slots, drafted, scratchpad, shard, config, enable_pdl
+    pairs = shard.gather(
+        shard_candidates(
+            logits, state, slots, drafted, scratchpad, shard, config, enable_pdl
+        )
     )
-    ids, values = shard.ids[:rows], shard.values[:rows]
-    vocab_topk_merge(shard.gather(pairs), MAX_K, None, ids, values)
-    return dict(cv_ptr=values, ci_ptr=ids, stride_m=ids.stride(0))
+    ranks = pairs.shape[0]
+    if ranks & (ranks - 1):
+        raise ValueError(f"sonic merges a power-of-two count of ranks, got {ranks}")
+    return dict(
+        cand_ptr=pairs,
+        ranks=ranks,
+        stride_mr=pairs.stride(0),
+        stride_mb=pairs.stride(1),
+    )
 
 
 def sample(

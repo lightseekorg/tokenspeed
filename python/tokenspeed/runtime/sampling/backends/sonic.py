@@ -231,15 +231,13 @@ class SonicSamplingBackend(SamplingBackend):
                 self.values = torch.empty((rows, MAX_K), dtype=torch.float32)
                 self.indices = torch.empty((rows, MAX_K), dtype=torch.int32)
 
-            # Vocabulary-sharded rows: this rank's candidates, every rank's, and their merge.
+            # Vocabulary-sharded rows: this rank's candidates and every rank's.
             self._shard_ranks = self._vocab_shard_ranks(config)
             if self._shard_ranks is not None:
                 self._shard_pairs = torch.empty((rows, 2 * MAX_K), dtype=torch.float32)
                 self._shard_landing = torch.empty(
                     (self._shard_ranks * rows, 2 * MAX_K), dtype=torch.float32
                 )
-                self._shard_ids = torch.empty((rows, MAX_K), dtype=torch.int32)
-                self._shard_values = torch.empty((rows, MAX_K), dtype=torch.float32)
 
             # fp32 temperature, top-p, min-p and penalties, read with fp32 logits so none rounds to bf16.
             self.exact_scalars = (
@@ -297,6 +295,8 @@ class SonicSamplingBackend(SamplingBackend):
             self._shard_ranks == tp_size
             and dtype in _LOGITS_DTYPES
             and columns >= 512
+            # The draw merges a power-of-two count of ranks' candidates.
+            and tp_size & (tp_size - 1) == 0
             and columns * tp_size == self.vocab_size
             and vocab_topk_merge_supports(tp_size, MAX_K)
         )
@@ -315,8 +315,6 @@ class SonicSamplingBackend(SamplingBackend):
                 tp_group=shard.tp_group,
             ),
             pairs=self._shard_pairs,
-            ids=self._shard_ids,
-            values=self._shard_values,
         )
 
     @override

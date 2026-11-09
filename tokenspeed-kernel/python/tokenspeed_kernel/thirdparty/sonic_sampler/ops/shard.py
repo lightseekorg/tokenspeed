@@ -23,10 +23,10 @@
 A vocabulary-parallel head leaves each rank the logits of its own vocabulary
 columns. Each rank reduces its shard with ``bitpacked_reduction_kernel`` (at
 its ``shard_offset``) and ``shard_candidates_kernel`` writes its best
-``max_k`` (value, global token id) pairs; the ranks gather the pairs and merge
-them into each row's sorted best ``max_k`` over the whole vocabulary, which
-``cumulative_selection_kernel`` and ``cumulative_unpack_kernel`` read through
-``merged_candidates`` in place of their own unpack.
+``max_k`` (value, global token id) pairs; the ranks gather the pairs, and
+``cumulative_selection_kernel`` and ``cumulative_unpack_kernel`` merge them
+into each row's sorted best ``max_k`` over the whole vocabulary
+(``merged_candidates``, ``merged_first``) in place of their own unpack.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ from tokenspeed_kernel.thirdparty.sonic_sampler.ops.base import gdc_wait
 from tokenspeed_kernel.thirdparty.sonic_sampler.ops.prologue import exact_candidates
 from tokenspeed_kernel.thirdparty.sonic_sampler.ops.topk.unpack import unpack_top_k
 
-__all__ = ["merged_candidates", "shard_candidates_kernel"]
+__all__ = ["merged_candidates", "merged_first", "shard_candidates_kernel"]
 
 
 @jit
@@ -246,28 +246,94 @@ def shard_candidates_kernel(
 
 
 @jit
-def merged_candidates(
-    cv_ptr,
-    ci_ptr,
+def merged_keys(
+    cand_ptr,
     row_id,
-    exact: tl.constexpr,
+    ranks: tl.constexpr,
+    stride_mr,
+    stride_mb: tl.constexpr,
     enable_pdl: tl.constexpr,
-    stride_m: tl.constexpr,
     max_k: tl.constexpr,
 ):
-    """A row's merged best ``max_k`` candidates over the whole vocabulary: their values (bf16 unless ``exact``, as the unpack keeps them) and token ids."""
+    """Every rank's candidates of a row as sortable keys (the value's order-preserving bits above the inverted rank-major slot), and their token ids."""
 
-    offsets = (row_id * stride_m) + tl.arange(0, max_k)
+    span = tl.arange(0, ranks * max_k)
+    pairs = cand_ptr + (span // max_k) * stride_mr + row_id * stride_mb + span % max_k
 
     if enable_pdl:
 
         gdc_wait()
 
-    values = tl.load(cv_ptr + offsets)
-    indices = tl.load(ci_ptr + offsets)
+    bits = tl.load(pairs).to(tl.uint32, bitcast=True)
+    ids = tl.load(pairs + max_k).to(tl.int32)
+
+    ordered = tl.where((bits & 0x80000000) != 0, ~bits, bits | 0x80000000)
+    keys = (ordered.to(tl.uint64) << 32) | (~span.to(tl.uint32)).to(tl.uint64)
+
+    return keys, ids
+
+
+@jit
+def unpack_key(keys):
+    """The values and rank-major slots ``merged_keys`` packed."""
+
+    ordered = (keys >> 32).to(tl.uint32)
+    bits = tl.where((ordered & 0x80000000) != 0, ordered & 0x7FFFFFFF, ~ordered)
+    slots = (~(keys & 0xFFFFFFFF).to(tl.uint32)).to(tl.int32)
+
+    return bits.to(tl.float32, bitcast=True), slots
+
+
+@jit
+def merged_candidates(
+    cand_ptr,
+    row_id,
+    ranks: tl.constexpr,
+    stride_mr,
+    stride_mb: tl.constexpr,
+    exact: tl.constexpr,
+    enable_pdl: tl.constexpr,
+    max_k: tl.constexpr,
+):
+    """
+    A row's best ``max_k`` candidates over the whole vocabulary, merged from
+    every rank's gathered pairs (``[ranks, rows, 2 • max_k]`` at ``cand_ptr``):
+    the values in descending order, the lowest rank-major slot (so the lowest
+    token id) first among equal values (bf16 unless ``exact``, as the unpack
+    keeps them), and their token ids.
+    """
+
+    keys, ids = merged_keys(
+        cand_ptr, row_id, ranks, stride_mr, stride_mb, enable_pdl, max_k
+    )
+
+    best = tl.gather(tl.sort(keys, descending=True), tl.arange(0, max_k), axis=0)
+    values, slots = unpack_key(best)
+    indices = tl.gather(ids, slots, axis=0)
 
     if not exact:
 
         values = values.to(tl.bfloat16)
 
     return values, indices
+
+
+@jit
+def merged_first(
+    cand_ptr,
+    row_id,
+    ranks: tl.constexpr,
+    stride_mr,
+    stride_mb: tl.constexpr,
+    enable_pdl: tl.constexpr,
+    max_k: tl.constexpr,
+):
+    """A greedy row's first maximum over the whole vocabulary, from every rank's gathered pairs."""
+
+    keys, ids = merged_keys(
+        cand_ptr, row_id, ranks, stride_mr, stride_mb, enable_pdl, max_k
+    )
+
+    _, slot = unpack_key(tl.max(keys, axis=0))
+
+    return tl.sum(tl.where(tl.arange(0, ranks * max_k) == slot, ids, 0), axis=0)

@@ -218,8 +218,6 @@ class _Group:
                     peer_shard.softcap,
                     None,
                     out,
-                    None,
-                    None,
                 ),
                 pick(SHARD, rows),
                 False,
