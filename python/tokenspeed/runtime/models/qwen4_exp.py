@@ -94,6 +94,12 @@ def _qwen4_exp_uses_sigmoid_output_gate(config: Qwen4ExpTextConfig) -> bool:
     return getattr(config, "output_gate_type", None) == "sigmoid"
 
 
+def _warmup_qwen4_moe(model: nn.Module) -> None:
+    for module in model.modules():
+        if isinstance(module, Qwen3_5MoeSparseMoeBlock):
+            module.warmup()
+
+
 def _qwen4_exp_uses_sparse_moe(config: Qwen4ExpTextConfig) -> bool:
     """Return whether the Qwen4-Exp checkpoint has sparse experts."""
 
@@ -859,6 +865,7 @@ class Qwen4ExpForCausalLM(BaseCausalLM):
         )
 
     def post_quant_warmup(self) -> None:
+        _warmup_qwen4_moe(self.model)
         enable_decode_monokernels(self.model)
 
     @classmethod
@@ -908,6 +915,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         )
 
     def post_quant_warmup(self) -> None:
+        _warmup_qwen4_moe(self.model)
         enable_decode_monokernels(self.model)
 
     @classmethod
