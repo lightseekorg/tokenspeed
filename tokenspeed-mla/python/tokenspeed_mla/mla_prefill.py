@@ -330,6 +330,31 @@ def _packed_input(tensor):
     return tensor if tensor.data_ptr() % 16 == 0 else tensor.clone()
 
 
+def _value_input(tensor: torch.Tensor) -> torch.Tensor:
+    """Prepare V shape [tokens, heads, channels] for the attention kernel.
+
+    Return the input unchanged when channels are contiguous, the pointer is
+    16-byte aligned, and token/head strides are multiples of 64 element
+    to keep the vectors separate. This accepts both packed V and
+    V views into interleaved K/V projections, avoiding an unnecessary copy.
+
+    Otherwise, return an aligned, contiguous tensor with strides,
+    including for dimensions of size one.
+    """
+    token_stride, head_stride, channel_stride = tensor.stride()
+    # Compilation assumes V's token/head strides are multiples of 64 elements.
+    if (
+        tensor.data_ptr() % 16 == 0
+        and channel_stride == 1
+        and head_stride % 64 == 0
+        and token_stride % 64 == 0
+        and head_stride >= tensor.shape[2]
+        and token_stride >= tensor.shape[1] * head_stride
+    ):
+        return tensor
+    return _packed_input(tensor).view(-1).view(tensor.shape)
+
+
 def tokenspeed_mla_prefill(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -352,8 +377,11 @@ def tokenspeed_mla_prefill(
       Q shape: [sum(q_lens), h_q, d_qk]
       K shape: [sum(kv_lens), h_k, d_qk]
       V shape: [sum(kv_lens), h_k, d_v]
-    Inputs share a CUDA device and an FP16, BF16 or E4M3 dtype. Strided or
-    unaligned inputs are packed before launch. If provided, out must be
+    Inputs share a CUDA device and an FP16, BF16 or E4M3 dtype. Q/K are packed.
+    V is read directly when its channels are contiguous, its pointer is
+    16-byte aligned, and its non-overlapping token/head strides are positive
+    multiples of 64 elements. Other V layouts are packed before launch.
+    If provided, out must be
     contiguous, 16-byte aligned BF16 with shape [sum(q_lens), h_q, d_v].
     LSE is FP32 in natural-log units. Empty visible rows return zero / -inf.
     Cumulative vectors are authoritative; seq_lens is redundant KV metadata
@@ -375,7 +403,8 @@ def tokenspeed_mla_prefill(
         max_seq_len_q,
         max_seq_len,
     )
-    query, key, value = (_packed_input(t) for t in (query, key, value))
+    query, key = (_packed_input(t) for t in (query, key))
+    value = _value_input(value)
     total_q_tokens, h_q, d_qk = query.shape
     total_kv_tokens, h_k, _ = key.shape
     d_v = value.shape[2]

@@ -904,16 +904,19 @@ class CuteDSLMLABackend(PagedAttentionBackend):
             if step_counter is not None:
                 step_counter.record_cache()
 
-        # The CuteDSL FMHA prefill kernel assumes packed (contiguous) Q/K/V; its
-        # TMA descriptors ignore input strides. On the BF16 (NoPE, e.g. Kimi-K3)
-        # path V arrives as a non-contiguous slice ``kv[..., qk_nope:]`` of the
-        # fused kv_b_proj output (its stride skips the interleaved k_nope block),
-        # so without this the kernel reads interleaved garbage and produces an
-        # attention output orthogonal to the correct result. Force contiguity on
-        # all three; Q/K are already contiguous so ``.contiguous()`` is a no-op.
+        # The prefill kernel still assumes packed (contiguous) Q and K. On the
+        # BF16 path, V can be a slice ``kv[..., qk_nope:]`` of the kv_b_proj
+        # output, which stores K and V next to each other for every head.
+        # Its head/token strides therefore skip the intervening K elements;
+        # treating this view as packed would read K elements as V.
+        # The kernel now uses V's actual strides, so preserve the view here
+        # instead of copying each history chunk into a separate V buffer.
+        # The prefill wrapper checks alignment and strides and packs V when
+        # its layout does not meet the kernel's requirements. Q and K retain
+        # their contiguous conversion, which is a no-op when already packed.
         q = q.reshape(-1, self.num_local_heads, head_dim).contiguous()
         k = k.reshape(-1, self.num_local_heads, head_dim).contiguous()
-        v = v.reshape(-1, self.num_local_heads, self.v_head_dim).contiguous()
+        v = v.reshape(-1, self.num_local_heads, self.v_head_dim)
 
         # CuteDSL FMHA MLA: if Q is FP8, ensure K/V match. `.to()` is a no-op
         # when the source dtype already matches.

@@ -281,6 +281,12 @@ What it supports:
   - `K: [sum(kv_lens), h_k, d_qk]`
   - `V: [sum(kv_lens), h_k, d_v]`
 - Different Q/KV sequence packs (`cum_seq_lens_q` and `cum_seq_lens_kv` can differ)
+- V can be read directly from the interleaved BF16 K/V projection, avoiding
+  a separate copy into packed storage. Direct reads require contiguous
+  channels, a 16-byte-aligned pointer, and token/head strides that
+  are multiples of 64 elements. Other V layouts
+  are packed automatically. Q and K are packed. The kernel accepts V
+  strides at runtime, so changing those strides reuses the compiled kernel.
 - Causal and non-causal execution
 - Optional LSE return (`return_lse=True`)
 - PDL enable/disable (`enable_pdl`)
