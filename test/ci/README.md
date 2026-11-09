@@ -216,11 +216,11 @@ change is Markdown, a test file, or a model module: a module directly under
 `python/tokenspeed/runtime/models/` that defines `EntryClass`. It then runs these
 test files:
 
-- the changed runtime test files;
-- for a changed model module, the tests that import it or a module built on it,
+- The changed runtime test files.
+- For a changed model module, the tests that import it or a module built on it,
   or that name one of them, so `gpt_oss` matches a test serving
-  `openai/gpt-oss-20b`;
-- the tests that import any of these, directly or through other test files.
+  `openai/gpt-oss-20b`.
+- The tests that import any of these, directly or through other test files.
 
 Any other change runs every test.
 

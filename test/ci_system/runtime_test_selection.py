@@ -5,10 +5,10 @@ The runtime tests narrow only when every change is Markdown, a test file, or a
 model module: a module directly under the models package that defines
 ``EntryClass``. Then only these runtime test files run:
 
-- the changed ones;
-- for a changed model module, the tests that import it or a module built on
-  it, or that name one of them, so ``gpt_oss`` matches ``openai/gpt-oss-20b``;
-- the tests that import any of these, directly or through other test files.
+- The changed ones.
+- For a changed model module, the tests that import it or a module built on
+  it, or that name one of them, so ``gpt_oss`` matches ``openai/gpt-oss-20b``.
+- The tests that import any of these, directly or through other test files.
 
 Any other change runs every test.
 """
@@ -27,8 +27,11 @@ KERNEL_TEST_DIRECTORY = "tokenspeed-kernel/test"
 
 
 def imported_modules(path: Path) -> set[str]:
-    """Modules that any import statement in ``path`` names, including imports
-    inside functions; a name after ``from ... import`` counts as a submodule."""
+    """Modules named by any import statement in ``path``.
+
+    Imports inside functions count, and a name after ``from ... import`` counts
+    as a submodule.
+    """
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     modules = set()
     for node in ast.walk(tree):
@@ -51,21 +54,28 @@ def model_names(modules: set[str]) -> set[str]:
 
 
 def test_module_names(test: str) -> set[str]:
-    """Names that import a test file: test.runtime.<name>, runtime.<name> or
-    <name>."""
+    """Names that import the test file ``test``.
+
+    They are test.runtime.<name>, runtime.<name> and <name>.
+    """
     dotted = test.removesuffix(".py").replace("/", ".")
     return {dotted, dotted.removeprefix("test."), Path(test).stem}
 
 
 def squashed(text: str) -> str:
-    """``text`` lowercased without ``_``, ``-`` and ``.``, so that the module
-    ``qwen3_5`` matches the checkpoint ``Qwen3.5-35B``."""
+    """``text`` lowercased without ``_``, ``-`` and ``.``.
+
+    The module ``qwen3_5`` then matches the checkpoint ``Qwen3.5-35B``.
+    """
     return re.sub(r"[_.-]", "", text.lower())
 
 
 def model_modules(repo_root: Path) -> dict[str, Path]:
-    """The model modules by name: those directly under the models package
-    that define ``EntryClass``."""
+    """The model modules by name.
+
+    A model module sits directly under the models package and defines
+    ``EntryClass``.
+    """
     return {
         path.stem: path
         for path in sorted((repo_root / MODEL_DIRECTORY).glob("*.py"))
@@ -74,8 +84,11 @@ def model_modules(repo_root: Path) -> dict[str, Path]:
 
 
 def models_built_on(changed: set[str], repo_root: Path) -> set[str]:
-    """``changed`` and every module directly under the models package that
-    imports one of them, directly or through other such modules."""
+    """``changed`` and the modules built on them.
+
+    These are the modules directly under the models package that import one of
+    ``changed``, directly or through other such modules.
+    """
     importers: dict[str, set[str]] = {}
     for path in sorted((repo_root / MODEL_DIRECTORY).glob("*.py")):
         for imported in model_names(imported_modules(path)):
@@ -93,8 +106,10 @@ def models_built_on(changed: set[str], repo_root: Path) -> set[str]:
 def select_runtime_tests(
     test_files: list[str], changed_paths: list[str], repo_root: Path
 ) -> list[str] | None:
-    """The repository-relative ``test_files`` that the changes can reach, or
-    None when a change can reach any of them."""
+    """The repository-relative ``test_files`` that the changes can reach.
+
+    It is None when a change can reach any of them.
+    """
     models = model_modules(repo_root)
     changed_tests: set[str] = set()
     changed_models: set[str] = set()
