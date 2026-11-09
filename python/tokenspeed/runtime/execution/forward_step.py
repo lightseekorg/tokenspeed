@@ -1230,14 +1230,14 @@ class ForwardStepRunner:
             graph = self.graphs[graph_key]
             if self._graph_debug:
                 self._verify_graph_metadata(graph_key)
+            npu_update_input = None
             if self.device == "npu":
-                # Update callbacks write the inference tensors created at capture.
+                # Stage host inputs before replay: a D2H on the replay stream
+                # would otherwise wait for Graph events released by update().
                 with torch.inference_mode():
-                    graph.update(
-                        cpu_update_input=[
-                            {"actual_seq_lengths_kv": seq_lens.to("cpu").tolist()}
-                        ]
-                    )
+                    npu_update_input = [
+                        {"actual_seq_lengths_kv": seq_lens.to("cpu").tolist()}
+                    ]
             if self._expert_load_rows is not None:
                 # Every rank replays the same padded batch; the live rows are
                 # the DP-gathered live counts (this rank's own without DP).
@@ -1257,6 +1257,11 @@ class ForwardStepRunner:
                     self.drafter.replay_decode_graph(graph, bs=bs, graph_bs=padded_bs)
                 else:
                     graph.replay()
+                if npu_update_input is not None:
+                    # Each captured task group waits on its ExternalEvent.
+                    # The update stream signals it after updating that group,
+                    # allowing earlier Graph work to overlap later updates.
+                    graph.update(cpu_update_input=npu_update_input)
             if self._expert_load_rows is not None:
                 self._expert_load_rows.clear()
 

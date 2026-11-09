@@ -88,6 +88,11 @@ next round while the previous upload is still reading its source.
 NPU graph task updates and replay run in inference mode because they write the
 output tensors allocated during capture. This applies to active and idle DP
 ranks; callers need not establish an inference context.
+Prepare CPU update inputs before submitting replay. A device-to-host copy on
+the replay stream after submission could wait for a captured event that the
+pending update must release. Submit replay before updating the task groups:
+each group's external event gates its execution until that group's update is
+complete, allowing earlier graph work to overlap updates for later groups.
 
 ### Buffer sizing: the ladder is a performance subset, never a capacity limit
 
