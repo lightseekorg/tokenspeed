@@ -5,6 +5,12 @@ The independent opt-in registry entry retains its 24-CTA baseline. All launch
 settings are explicit: CTA budget, state-buffer count, compute-warps, and
 register limit. `candidate.json` records the selected benchmark settings.
 
+The baseline registry entry is `gluon_nvidia_gdn_replay_commit`, below the
+portable kernel's selection priority. Select it explicitly with
+`TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_GDN_REPLAY_COMMIT=gluon_nvidia_gdn_replay_commit`.
+A bounded commit launch alone does not create draft overlap; the independent
+captured-graph probe supplies the stream ordering and joins.
+
 ## Accepted-state computation
 
 For BF16 four-token windows with three value heads per key head, each work
