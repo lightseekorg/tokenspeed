@@ -440,6 +440,10 @@ byte on random rows, tie, edge, and NaN corpora and in CUDA-graph replay.
 
 ## Routing weight storage and deferred finalize
 
+FlashInfer TRT-LLM MXFP4 defaults to standard SwiGLU (`silu(gate) * up`)
+when the layer supplies no activation parameters. Explicit SwiGLU and SiTU
+parameters come from the model.
+
 `moe_plan` records the selected expert kernel's `topk_weights_dtype`. DeepSeek V4
 routing stores its weights in that dtype after FP32 scoring, normalization, and
 scaling.
