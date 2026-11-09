@@ -41,7 +41,6 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
-from tokenspeed.runtime.configs.utils import get_rope_theta
 from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.comm_ops import all_gather_single
@@ -80,9 +79,7 @@ from tokenspeed.runtime.models.deepseek_v3 import (
     DeepseekV3AttentionMLA,
     DeepseekV3DecoderLayer,
     DeepseekV3ForCausalLM,
-    DeepseekV3MLP,
     DeepseekV3Model,
-    DeepseekV3MoE,
 )
 from tokenspeed.runtime.utils import add_prefix, set_weight_attrs
 from tokenspeed.runtime.utils.device_stream import is_current_stream_capturing
@@ -141,6 +138,8 @@ class GlmDsaIndexerOutput:
     key_norm: LayerNorm | None = None
     # When set, query holds input rows and ranks project only their top-k share.
     query_proj: Callable[[torch.Tensor], torch.Tensor] | None = None
+    # When set, the decode rows' E4M3 query and FP32 weights folding its scales and the score scale.
+    quantized_query: tuple[torch.Tensor, torch.Tensor] | None = None
 
     def query_rows(self, start: int, end: int) -> torch.Tensor:
         rows = self.query[start:end]
@@ -352,9 +351,20 @@ class GlmDsaSparseAttentionMixin:
     ``fp8_scaled`` plane take FP8 E4M3 index queries with per-(token, head)
     scales (:meth:`_scorer_index_query`); a host sets it only where the
     platform registers such scorers.
+
+    ``decode_topk_solution`` (default None: normal selection) pins the
+    tensor-parallel decode top-k to one ``dsa_decode_topk`` solution; a host
+    sets it only to a solution it validated and that selects on the platform.
+
+    ``index_k_write_quantizes_query`` (default off) quantizes a decode round's
+    index query in the launch of its index-K write (an ``fp8_scaled`` plane,
+    keys with ``key_norm``) and hands the decode top-k E4M3 queries with unit
+    scales; a host sets it only where its ``decode_topk_solution`` takes them.
     """
 
     index_query_fp8: bool = False
+    decode_topk_solution: str | None = None
+    index_k_write_quantizes_query: bool = False
 
     def _scorer_index_query(
         self, q: torch.Tensor, index_k_cache: torch.Tensor
@@ -606,10 +616,22 @@ class GlmDsaSparseAttentionMixin:
         num_decode_tokens: int,
         topk: int,
     ) -> GlmDsaDecodeTopK:
-        q = indexer_output.query_rows(decode_start, decode_start + num_decode_tokens)
-        weights = indexer_output.weights[
-            decode_start : decode_start + num_decode_tokens
-        ]
+        quantized = indexer_output.quantized_query
+        if quantized is None:
+            q = indexer_output.query_rows(
+                decode_start, decode_start + num_decode_tokens
+            )
+            weights = indexer_output.weights[
+                decode_start : decode_start + num_decode_tokens
+            ]
+        elif decode_start != 0 or quantized[0].shape[0] != num_decode_tokens:
+            raise RuntimeError(
+                "the index-K write quantized rows [0, "
+                f"{quantized[0].shape[0]}), not the decode window [{decode_start}, "
+                f"{decode_start + num_decode_tokens})"
+            )
+        else:
+            q, weights = quantized
         index_k_cache = ctx.token_to_kv_pool.get_index_k_buffer(self.attn_mqa.layer_id)
         if index_k_cache is None:
             raise RuntimeError("GLM DSA top-k requires an index-K cache.")
@@ -642,6 +664,8 @@ class GlmDsaSparseAttentionMixin:
         dcp_index = None
         capturing = False
         if placement is not None:
+            if quantized is not None:
+                raise RuntimeError("the KV-parallel decode top-k scores BF16 queries")
             page_size = ctx.token_to_kv_pool.index_k_page_size
             capturing = is_current_stream_capturing(q.device)
             dcp_index = self._reusable_dcp_index(
@@ -700,7 +724,12 @@ class GlmDsaSparseAttentionMixin:
                 lens_out=topk_lens_slice,
             )
         else:
-            q, q_scales = self._scorer_index_query(q, index_k_cache)
+            softmax_scale = self.indexer.weights_softmax_scale
+            if quantized is None:
+                q, q_scales = self._scorer_index_query(q, index_k_cache)
+            else:
+                # Unit query scales: the weights carry them and the score scale.
+                q_scales, softmax_scale = None, 1.0
             dsa_decode_topk(
                 q,
                 weights,
@@ -708,7 +737,7 @@ class GlmDsaSparseAttentionMixin:
                 page_table,
                 page_size=ctx.token_to_kv_pool.index_k_page_size,
                 topk=topk,
-                softmax_scale=self.indexer.weights_softmax_scale,
+                softmax_scale=softmax_scale,
                 batch_invariant=False,
                 q_len_per_req=q_len_per_req,
                 index_k_cache=index_k_cache,
@@ -718,6 +747,7 @@ class GlmDsaSparseAttentionMixin:
                 out=topk_slice,
                 lens_out=topk_lens_slice,
                 slot_order=global_server_args_dict["dsa_slot_order"],
+                solution=self.decode_topk_solution,
             )
         return GlmDsaDecodeTopK(
             topk_indices=topk_indices,
@@ -1147,6 +1177,8 @@ class GlmDsaSparseAttentionMixin:
         ctx: ForwardContext,
         comm_manager: CommManager,
         output_gate: torch.Tensor | None = None,
+        projected_q: torch.Tensor | None = None,
+        index_query: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """DSA sparse MLA after the a-projections: the indexer and its index-K
         write, the shared prefill/decode top-k, then the sparse prefill and
@@ -1164,6 +1196,10 @@ class GlmDsaSparseAttentionMixin:
             comm_manager: The layer's attention communication.
             output_gate: Optional raw ``[T, num_local_heads * v_head_dim]``
                 sigmoid gate the value projection applies; decode rounds only.
+            projected_q: Optional ``q_b_proj(q_norm)`` rows a caller projected
+                ahead; None projects them here.
+            index_query: Optional ``[T, index_heads, index_head_dim]`` index
+                query a caller projected ahead; None leaves the indexer's.
 
         Returns:
             ``[T, num_local_heads * v_head_dim]`` attention output before
@@ -1182,8 +1218,16 @@ class GlmDsaSparseAttentionMixin:
                 raise RuntimeError(
                     "padded DSA replay needs an identity pre-attention comm"
                 )
-            positions, q_norm, latent_cache, output_gate = slice_to_real_tokens(
-                valid_rows, positions, q_norm, latent_cache, output_gate
+            positions, q_norm, latent_cache, output_gate, projected_q, index_query = (
+                slice_to_real_tokens(
+                    valid_rows,
+                    positions,
+                    q_norm,
+                    latent_cache,
+                    output_gate,
+                    projected_q,
+                    index_query,
+                )
             )
             num_attn_tokens = valid_rows
         decode_window = self._resolve_decode_window(
@@ -1241,16 +1285,37 @@ class GlmDsaSparseAttentionMixin:
             if valid_rows is not None:
                 (hidden_states,) = slice_to_real_tokens(num_attn_tokens, hidden_states)
             indexer_output = self.indexer(hidden_states, q_norm, positions)
-            index_slots, index_mask = resolve_cache_slots(
-                out_cache_loc, ctx.attn_backend.cache_placement(self.attn_mqa)
-            )
-            ctx.token_to_kv_pool.set_index_k_buffer(
-                self.attn_mqa.layer_id,
-                index_slots,
-                indexer_output.key,
-                write_mask=index_mask,
-                key_norm=indexer_output.key_norm,
-            )
+            if index_query is not None:
+                indexer_output = replace(
+                    indexer_output, query=index_query, query_proj=None
+                )
+            placement = ctx.attn_backend.cache_placement(self.attn_mqa)
+            index_slots, index_mask = resolve_cache_slots(out_cache_loc, placement)
+            # Decode rounds only (every row decodes); the KV-parallel top-k scores BF16 queries.
+            if (
+                self.index_k_write_quantizes_query
+                and num_prefill_tokens == 0
+                and placement is None
+            ):
+                quantized = ctx.token_to_kv_pool.set_index_k_buffer_and_quantize_query(
+                    self.attn_mqa.layer_id,
+                    index_slots,
+                    indexer_output.key,
+                    write_mask=index_mask,
+                    key_norm=indexer_output.key_norm,
+                    query=indexer_output.query_rows(0, num_attn_tokens),
+                    query_weights=indexer_output.weights,
+                    softmax_scale=self.indexer.weights_softmax_scale,
+                )
+                indexer_output = replace(indexer_output, quantized_query=quantized)
+            else:
+                ctx.token_to_kv_pool.set_index_k_buffer(
+                    self.attn_mqa.layer_id,
+                    index_slots,
+                    indexer_output.key,
+                    write_mask=index_mask,
+                    key_norm=indexer_output.key_norm,
+                )
             if ctx.num_extends > 0:
                 shared_topk.prefill = self._compute_prefill_topk_indices(
                     indexer_output,
@@ -1263,7 +1328,7 @@ class GlmDsaSparseAttentionMixin:
                     ctx,
                 )
 
-        q = self.q_b_proj(q_norm)[0]
+        q = self.q_b_proj(q_norm)[0] if projected_q is None else projected_q
         attn_output = torch.empty(
             q.size(0),
             self.num_local_heads * self.v_head_dim,
@@ -1564,163 +1629,33 @@ class GlmMoeDsaAttention(GlmDsaSparseAttentionMixin, DeepseekV3AttentionMLA):
 
 
 class GlmMoeDsaDecoderLayer(DeepseekV3DecoderLayer):
-    def __init__(
-        self,
-        config: PretrainedConfig,
-        layer_id: int,
-        mapping: Mapping,
-        quant_config: QuantizationConfig | None = None,
-        is_nextn: bool = False,
-        prefix: str = "",
-        alt_stream: torch.cuda.Stream | None = None,
-    ) -> None:
-        nn.Module.__init__(self)
-        self.mapping = mapping
-        self.hidden_size = config.hidden_size
-        rope_theta = get_rope_theta(config)
-        rope_scaling = getattr(config, "rope_scaling", None)
-        max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
+    @property
+    def attention_cls(self) -> type[nn.Module]:
+        return GlmMoeDsaAttention
 
-        self.self_attn = GlmMoeDsaAttention(
-            config=config,
-            hidden_size=self.hidden_size,
-            num_heads=config.num_attention_heads,
-            qk_nope_head_dim=config.qk_nope_head_dim,
-            qk_rope_head_dim=config.qk_rope_head_dim,
-            v_head_dim=config.v_head_dim,
-            q_lora_rank=(
-                config.q_lora_rank if hasattr(config, "q_lora_rank") else None
-            ),
-            kv_lora_rank=config.kv_lora_rank,
-            rope_theta=rope_theta,
-            rope_scaling=rope_scaling,
-            max_position_embeddings=max_position_embeddings,
-            quant_config=(
-                None
-                if "self_attn" in getattr(config, "disable_quant_module", [])
-                else quant_config
-            ),
-            layer_id=layer_id,
-            prefix=add_prefix("self_attn", prefix),
-            reduce_attn_results=False,
-            alt_stream=alt_stream,
-            mapping=self.mapping,
-            is_nextn=is_nextn,
-        )
+    @property
+    def dense_batch_invariant(self) -> bool:
+        return False
 
-        self.layer_id = layer_id
-        self.is_moe_layer = self._is_moe_layer(layer_id, is_nextn, config)
-        if self.is_moe_layer:
-            self.mlp = DeepseekV3MoE(
-                config=config,
-                mapping=self.mapping,
-                quant_config=quant_config,
-                layer_index=layer_id,
-                prefix=add_prefix("mlp", prefix),
-                alt_stream=alt_stream,
-            )
-        else:
-            self.mlp = DeepseekV3MLP(
-                hidden_size=config.hidden_size,
-                intermediate_size=(
-                    config.ffn_hidden_size
-                    if hasattr(config, "ffn_hidden_size")
-                    else config.intermediate_size
-                ),
-                hidden_act=config.hidden_act,
-                mapping=self.mapping,
-                quant_config=(
-                    None
-                    if "dense_mlp" in getattr(config, "disable_quant_module", [])
-                    else quant_config
-                ),
-                prefix=add_prefix("mlp", prefix),
-                is_shared_expert=False,
-                batch_invariant=False,
-            )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.comm_manager = CommManager(
-            mapping=self.mapping,
-            layer_id=self.layer_id,
-            is_moe=self.is_moe_layer,
-            prev_is_moe=self._is_moe_layer(layer_id - 1, is_nextn, config),
-            dense_batch_invariant=False,
-            input_layernorm=self.input_layernorm,
-            post_attn_layernorm=self.post_attention_layernorm,
-            query_sharded=False,
-        )
+    def attention_kwargs(self, prefix: str) -> dict:
+        return {**super().attention_kwargs(prefix), "is_nextn": self.is_nextn}
 
-    def forward(
+    def narrow_residual(
+        self, residual: torch.Tensor, ctx: ForwardContext
+    ) -> torch.Tensor:
+        if ctx.draft_narrowing is None:
+            return residual
+        return residual.index_select(0, ctx.gather_ids)
+
+    def forward_idle_attn(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        residual: torch.Tensor | None,
-        aux_hidden_states: list[torch.Tensor] | None = None,
-    ) -> torch.Tensor:
-        num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
-            ctx
-        )
-
-        if not ctx.forward_mode.is_idle():
-            hidden_states, residual = self.comm_manager.input_reduce_norm(
-                hidden_states, residual
-            )
-            capture_layer_input(self.comm_manager, residual, ctx, aux_hidden_states)
-            hidden_states = self.self_attn(
-                positions=positions,
-                hidden_states=hidden_states,
-                ctx=ctx,
-                comm_manager=self.comm_manager,
-            )
-            if ctx.draft_narrowing is not None:
-                residual = residual.index_select(0, ctx.gather_ids)
-            hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
-                hidden_states, residual, ctx
-            )
-            hidden_states = self.forward_mlp(
-                hidden_states,
-                residual,
-                ctx,
-                num_global_tokens,
-                max_num_tokens_per_gpu,
-            )
-        else:
-            # No rows, but the tap and its gather stay aligned across ranks.
-            capture_layer_input(
-                self.comm_manager, hidden_states, ctx, aux_hidden_states
-            )
-            hidden_states = self.forward_mlp(
-                hidden_states,
-                residual,
-                ctx,
-                num_global_tokens,
-                max_num_tokens_per_gpu,
-            )
-        return hidden_states, residual
-
-    def forward_mlp(
-        self,
-        hidden_states,
-        residual,
-        ctx: ForwardContext,
-        num_global_tokens,
-        max_num_tokens_per_gpu,
-    ):
-        hidden_states = self.comm_manager.pre_mlp_comm(hidden_states, ctx)
-        if self.is_moe_layer:
-            hidden_states = self.mlp(
-                hidden_states, num_global_tokens, max_num_tokens_per_gpu
-            )
-        else:
-            hidden_states = self.mlp(hidden_states)
-        hidden_states, residual = self.comm_manager.post_mlp_fused(
-            hidden_states, residual, ctx
-        )
-        return hidden_states
+        aux_hidden_states: list[torch.Tensor] | None,
+    ) -> None:
+        # No rows, but the tap and its gather stay aligned across ranks.
+        capture_layer_input(self.comm_manager, hidden_states, ctx, aux_hidden_states)
 
 
 class GlmMoeDsaModel(DeepseekV3Model):
@@ -1799,6 +1734,57 @@ def pad_fused_qkv_a_proj_weight_for_fp8_blockscale(attn) -> None:
     proj.weight = padded
 
 
+def load_fused_indexer_projection(
+    name: str,
+    loaded_weight: torch.Tensor,
+    *,
+    params_dict: dict[str, torch.Tensor],
+    modules_dict: dict[str, nn.Module],
+    pending_fp8_wk: dict[str, dict[str, torch.Tensor]],
+    loaded_shards: dict[str, set[int]],
+    weight_block_size: list[int] | None,
+) -> None:
+    """Copy an indexer ``wk`` / ``weights_proj`` checkpoint tensor into shard
+    0 / 1 of the bf16 fused ``wk_weights_proj``.
+
+    An FP8 ``wk`` and its ``weight_scale_inv`` wait in ``pending_fp8_wk`` for
+    each other, then load block-dequantized. Once both shards of a module have
+    loaded, its indexer switches to the fused projection.
+    """
+    if ".indexer.weights_proj.weight" in name:
+        module_name, shard_id = name.rsplit(".weights_proj.weight", 1)[0], 1
+    elif ".indexer.wk." in name:
+        module_name, shard_id = name.rsplit(".wk.", 1)[0], 0
+        is_fp8_weight = name.endswith(".weight") and loaded_weight.dtype in (
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fnuz,
+        )
+        if is_fp8_weight or "weight_scale_inv" in name:
+            entry = pending_fp8_wk.setdefault(module_name, {})
+            entry["weight" if is_fp8_weight else "scale"] = loaded_weight
+            if len(entry) < 2 or weight_block_size is None:
+                return
+            del pending_fp8_wk[module_name]
+            loaded_weight = block_dequant(
+                entry["weight"], entry["scale"], list(weight_block_size)
+            ).to(torch.bfloat16)
+        elif not name.endswith(".weight"):
+            return
+    else:
+        return
+
+    param = params_dict.get(f"{module_name}.wk_weights_proj.weight")
+    if param is None:
+        return
+    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+    weight_loader(param, loaded_weight, shard_id)
+    shards = loaded_shards.setdefault(module_name, set())
+    shards.add(shard_id)
+    module = modules_dict.get(module_name)
+    if shards == {0, 1} and isinstance(module, GlmDsaIndexer):
+        module.set_wk_weights_proj_loaded()
+
+
 class GlmMoeDsaForCausalLM(DeepseekV3ForCausalLM):
     model_cls = GlmMoeDsaModel
 
@@ -1856,144 +1842,6 @@ class GlmMoeDsaForCausalLM(DeepseekV3ForCausalLM):
             )
         super().end_weight_update()
 
-    def _record_fused_indexer_projection_shard(
-        self,
-        *,
-        module_name: str,
-        shard_id: int,
-        loaded_shards: dict[str, set[int]],
-        modules_dict: dict[str, nn.Module],
-    ) -> None:
-        shards = loaded_shards.setdefault(module_name, set())
-        shards.add(int(shard_id))
-        if shards != {0, 1}:
-            return
-
-        module = modules_dict.get(module_name)
-        if isinstance(module, GlmDsaIndexer):
-            module.set_wk_weights_proj_loaded()
-
-    def _load_fused_indexer_projection_shard(
-        self,
-        *,
-        module_name: str,
-        shard_id: int,
-        loaded_weight: torch.Tensor,
-        params_dict: dict[str, torch.Tensor],
-        modules_dict: dict[str, nn.Module],
-        loaded_shards: dict[str, set[int]],
-    ) -> bool:
-        param = params_dict.get(f"{module_name}.wk_weights_proj.weight")
-        if param is None:
-            return False
-
-        weight_loader = getattr(param, "weight_loader", default_weight_loader)
-        weight_loader(param, loaded_weight, shard_id)
-        self._record_fused_indexer_projection_shard(
-            module_name=module_name,
-            shard_id=shard_id,
-            loaded_shards=loaded_shards,
-            modules_dict=modules_dict,
-        )
-        return True
-
-    def _flush_fused_indexer_fp8_wk(
-        self,
-        *,
-        module_name: str,
-        pending_fp8_wk: dict[str, dict[str, torch.Tensor]],
-        params_dict: dict[str, torch.Tensor],
-        modules_dict: dict[str, nn.Module],
-        loaded_shards: dict[str, set[int]],
-    ) -> None:
-        entry = pending_fp8_wk.get(module_name)
-        if not entry or "weight" not in entry or "scale" not in entry:
-            return
-        weight_block_size = getattr(self.quant_config, "weight_block_size", None)
-        if weight_block_size is None:
-            return
-
-        weight_fp8 = entry["weight"]
-        scale = entry["scale"]
-        weight_bf16 = block_dequant(
-            weight_fp8,
-            scale,
-            list(weight_block_size),
-        ).to(torch.bfloat16)
-        if self._load_fused_indexer_projection_shard(
-            module_name=module_name,
-            shard_id=0,
-            loaded_weight=weight_bf16,
-            params_dict=params_dict,
-            modules_dict=modules_dict,
-            loaded_shards=loaded_shards,
-        ):
-            del pending_fp8_wk[module_name]
-
-    def _try_load_fused_indexer_projection(
-        self,
-        *,
-        name: str,
-        loaded_weight: torch.Tensor,
-        params_dict: dict[str, torch.Tensor],
-        modules_dict: dict[str, nn.Module],
-        pending_fp8_wk: dict[str, dict[str, torch.Tensor]],
-        loaded_shards: dict[str, set[int]],
-    ) -> None:
-        if ".indexer.wk_weights_proj." in name:
-            return
-
-        if ".indexer.weights_proj.weight" in name:
-            module_name = name.rsplit(".weights_proj.weight", 1)[0]
-            self._load_fused_indexer_projection_shard(
-                module_name=module_name,
-                shard_id=1,
-                loaded_weight=loaded_weight,
-                params_dict=params_dict,
-                modules_dict=modules_dict,
-                loaded_shards=loaded_shards,
-            )
-            return
-
-        if ".indexer.wk." not in name:
-            return
-
-        module_name = name.rsplit(".wk.", 1)[0]
-        if name.endswith(".weight") and loaded_weight.dtype in (
-            torch.float8_e4m3fn,
-            torch.float8_e4m3fnuz,
-        ):
-            pending_fp8_wk.setdefault(module_name, {})["weight"] = loaded_weight
-            self._flush_fused_indexer_fp8_wk(
-                module_name=module_name,
-                pending_fp8_wk=pending_fp8_wk,
-                params_dict=params_dict,
-                modules_dict=modules_dict,
-                loaded_shards=loaded_shards,
-            )
-            return
-
-        if name.endswith(".weight"):
-            self._load_fused_indexer_projection_shard(
-                module_name=module_name,
-                shard_id=0,
-                loaded_weight=loaded_weight,
-                params_dict=params_dict,
-                modules_dict=modules_dict,
-                loaded_shards=loaded_shards,
-            )
-            return
-
-        if "weight_scale_inv" in name:
-            pending_fp8_wk.setdefault(module_name, {})["scale"] = loaded_weight
-            self._flush_fused_indexer_fp8_wk(
-                module_name=module_name,
-                pending_fp8_wk=pending_fp8_wk,
-                params_dict=params_dict,
-                modules_dict=modules_dict,
-                loaded_shards=loaded_shards,
-            )
-
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params_dict = dict(self.named_parameters())
         modules_dict = dict(self.named_modules())
@@ -2022,13 +1870,16 @@ class GlmMoeDsaForCausalLM(DeepseekV3ForCausalLM):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
                 loaded.add(param_names[id(param)])
-                self._try_load_fused_indexer_projection(
-                    name=name,
-                    loaded_weight=loaded_weight,
+                load_fused_indexer_projection(
+                    name,
+                    loaded_weight,
                     params_dict=params_dict,
                     modules_dict=modules_dict,
                     pending_fp8_wk=pending_fp8_wk,
                     loaded_shards=loaded_fused_indexer_shards,
+                    weight_block_size=getattr(
+                        self.quant_config, "weight_block_size", None
+                    ),
                 )
 
         loaded |= super().load_weights(base_weights())

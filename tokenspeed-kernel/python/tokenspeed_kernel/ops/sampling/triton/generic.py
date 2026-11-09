@@ -28,11 +28,11 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.sampling.triton.common import TOP_K_DISABLED
 
 _GENERIC_GUMBEL_BLOCK_SIZE = 2048
 _GENERIC_GUMBEL_TOP_K_PAD = 128
 _GENERIC_GUMBEL_NUM_ATTEMPTS = 8
-_TOP_K_DISABLED = 1 << 30
 
 
 @triton.jit
@@ -322,7 +322,7 @@ def gumbel_sample_from_pools_generic(
         BLOCK_SIZE=_GENERIC_GUMBEL_BLOCK_SIZE,
         TOPK_PAD=_GENERIC_GUMBEL_TOP_K_PAD,
         NUM_ATTEMPTS=_GENERIC_GUMBEL_NUM_ATTEMPTS,
-        TOP_K_DISABLED=_TOP_K_DISABLED,
+        TOP_K_DISABLED=TOP_K_DISABLED,
         NUM_TOKENS_PER_REQ=num_tokens_per_req,
         num_warps=8,
         num_stages=3,

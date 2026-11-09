@@ -213,6 +213,160 @@ if _PLATFORM.is_nvidia and _PLATFORM.arch_version == ArchVersion(10, 7):
     )(cute_dsl_tma_gather_qsa_prefill)
 
 
+def can_use_cute_dsl_fp8_prefill_layout(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    selected_slots: torch.Tensor,
+    metadata: QSASparseMetadata | None,
+) -> bool:
+    """Check the layout of rank-three Q/K/V and rank-two selected slots.
+
+    Args:
+        q: Queries whose rank and row geometry the facade validated.
+        k_cache: Physical key pool.
+        v_cache: Physical value pool.
+        selected_slots: Physical slot rows, with contiguous int32 columns.
+        metadata: Existing logical metadata, or None when unavailable.
+
+    Returns:
+        Whether dense alignment, metadata dtypes and TMA row bounds are valid,
+        without reading GPU values. Dtype/head geometry are separate traits.
+    """
+    if metadata is None or metadata.query_positions.dtype != torch.int64:
+        return False
+    operands = (q, k_cache, v_cache)
+    return (
+        all(t.is_contiguous() and t.data_ptr() % 16 == 0 for t in operands)
+        and all(
+            t.device == q.device
+            for t in (*operands, selected_slots, metadata.query_positions)
+        )
+        and selected_slots.dtype == torch.int32
+        and selected_slots.stride(1) == 1
+        and k_cache.shape[0] < (1 << 31)
+        and q.shape[0] < (1 << 31)
+    )
+
+
+def cute_dsl_fp8_qsa_sparse_prefill(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    selected_slots: torch.Tensor,
+    *,
+    scale: float,
+    max_seqlen_q: int | None,
+    metadata_capacity_rows: int | None,
+    k_scale: float | torch.Tensor | None,
+    v_scale: float | torch.Tensor | None,
+    sparse_metadata: QSASparseMetadata | None,
+) -> torch.Tensor:
+    """Attend to FP8 physical slots using temporary FP8 Q/P operands on SM107.
+
+    Args:
+        q: Dense, 16-byte-aligned BF16 [rows, 12 * kv_heads, 256] queries.
+        k_cache: Dense aligned E4M3FN [slots, kv_heads, 256] keys; 1 or 2 heads.
+        v_cache: Values with the same shape and dtype as keys.
+        selected_slots: Int32 [rows, 2051] slots, with contiguous columns.
+            Nonpositive slots contribute no mass; row strides may vary.
+        scale: Attention scale applied to FP32 query-key scores.
+        max_seqlen_q: None for prefill, including one-row or ragged prefill.
+        metadata_capacity_rows: Fallback plan capacity, unused without scratch.
+        k_scale: Scalar key descale, or None for one; tensors are unsupported.
+        v_scale: Scalar value descale, or None for one; tensors are unsupported.
+        sparse_metadata: Existing four-token/512-block metadata with live int64
+            query positions. Its complete prefix and fixed tail bound each row.
+
+    Returns:
+        Dense BF16 output shaped like q; empty rows are zero. Q and cache are
+        unmodified. Q quantizes per head with maxabs/448; online probabilities
+        quantize per 128-token tile with scale 1/448. These extra roundings can
+        change model outputs. Accumulators and normalization remain FP32.
+    """
+    if max_seqlen_q is not None or sparse_metadata is None:
+        raise ValueError("CuTe FP8 QSA prefill requires prefill with logical metadata")
+    sparse_metadata.validate(q.shape[0], selected_slots.shape[1], query_width=None)
+    if (
+        q.dtype != torch.bfloat16
+        or k_cache.dtype != torch.float8_e4m3fn
+        or v_cache.dtype != k_cache.dtype
+        or k_cache.shape != v_cache.shape
+        or q.shape[1:] != (12 * k_cache.shape[1], 256)
+        or k_cache.shape[1] not in (1, 2)
+        or k_cache.shape[2] != 256
+        or selected_slots.shape != (q.shape[0], 2051)
+        or sparse_metadata.block_size != 4
+    ):
+        raise ValueError("Unsupported CuTe FP8 QSA prefill geometry or dtype")
+    if not can_use_cute_dsl_fp8_prefill_layout(
+        q, k_cache, v_cache, selected_slots, sparse_metadata
+    ):
+        raise ValueError(
+            "CuTe FP8 QSA prefill requires aligned dense Q/K/V, int32 slots and int64 positions"
+        )
+    if isinstance(k_scale, torch.Tensor) or isinstance(v_scale, torch.Tensor):
+        raise TypeError("CuTe FP8 QSA prefill requires scalar K/V descales")
+    from tokenspeed_kernel.ops.attention.qsa._cute_dsl.fp8_prefill import (
+        launch_fp8_sparse_prefill,
+    )
+
+    del metadata_capacity_rows  # No fallback plan or global scratch allocation.
+    output = torch.empty(q.shape, dtype=q.dtype, device=q.device)
+    return launch_fp8_sparse_prefill(
+        q,
+        k_cache,
+        v_cache,
+        selected_slots,
+        sparse_metadata.query_positions,
+        output,
+        scale=scale,
+        k_scale=1.0 if k_scale is None else float(k_scale),
+        v_scale=1.0 if v_scale is None else float(v_scale),
+        enable_pdl=pdl_enabled(),
+    )
+
+
+if _PLATFORM.is_nvidia and _PLATFORM.arch_version == ArchVersion(10, 7):
+    register_kernel(
+        "attention",
+        "qsa_sparse_attention",
+        name="cute_dsl_fp8_qsa_sparse_prefill",
+        solution="cute_dsl",
+        capability=CapabilityRequirement(
+            vendors=frozenset({"nvidia"}),
+            min_arch_version=ArchVersion(10, 7),
+            max_arch_version=ArchVersion(10, 7),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    q=dense_tensor_format(torch.bfloat16),
+                    k_cache=dense_tensor_format(torch.float8_e4m3fn),
+                    v_cache=dense_tensor_format(torch.float8_e4m3fn),
+                )
+            }
+        ),
+        traits={
+            "is_decode": frozenset({False}),
+            "has_sparse_metadata": frozenset({True}),
+            "head_dim": frozenset({256}),
+            "value_head_dim": frozenset({256}),
+            "equal_head_dims": frozenset({True}),
+            "q_heads_per_kv": frozenset({12}),
+            "num_kv_heads": frozenset({1, 2}),
+            "selected_width": frozenset({2051}),
+            "block_size": frozenset({4}),
+            "block_topk": frozenset({512}),
+            "scalar_scales": frozenset({True}),
+            "supported_fp8_prefill_layout": frozenset({True}),
+        },
+        # Keep the established decode entry first for a forced solution override.
+        priority=Priority.SPECIALIZED + 1,
+        features=frozenset({"qsa_sparse_metadata"}),
+    )(cute_dsl_fp8_qsa_sparse_prefill)
+
+
 def _supported_stream_topk_tensors(
     query: torch.Tensor,
     key_cache: torch.Tensor,
@@ -487,6 +641,7 @@ def cute_dsl_blackwell_qsa_sparse_attention(
     metadata_capacity_rows: int | None,
     k_scale: float | torch.Tensor | None,
     v_scale: float | torch.Tensor | None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run Blackwell QSA with exact query-prefix and KV operand reuse.
 
@@ -505,22 +660,28 @@ def cute_dsl_blackwell_qsa_sparse_attention(
             by this implementation's call-owned prefix flags.
         k_scale: Scalar key-cache descale, folded into scale.
         v_scale: Scalar value-cache descale, applied to the output.
+        out: Optional contiguous output shaped and typed like q; None
+            allocates one.
 
     Returns:
-        BF16 attention output with q's shape.
+        BF16 attention output with q's shape (``out`` when given).
 
-    Twelve BF16 query heads share one sixteen-head tile. Larger batches group
-    consecutive queries only when their complete ordered 2048-entry prefixes
-    match; each query keeps separate softmax state and three private tail slots.
-    A distinct prefix retains one query per CTA. The measured head geometry
-    selects query-group size, operand stages and warp/register allocation.
+    Twelve query heads share one sixteen-head tile for BF16 and FP8 caches;
+    SM107 FP8 grids with fewer tiles than SMs keep two eight-head tiles.
+    Larger BF16 batches group consecutive queries only when their complete
+    ordered 2048-entry prefixes match; each query keeps separate softmax state
+    and three private tail slots. A distinct prefix retains one query per CTA.
+    The measured head geometry selects query-group size, operand stages and
+    warp/register allocation.
 
     Two-query groups and six-head geometries detect equality inside attention.
     Larger twelve-head groups refresh prefix flags in one preparation kernel
     before attention. Both launches are included in full-call benchmarks. KV
     data is gathered directly from the cache with 64-bit offsets; preparation
     neither copies KV nor caches decisions across calls or graph replays.
-    FP8 retains its gather/conversion and split-cluster path.
+    FP8 retains its synchronous gather/conversion; on SM100/SM103 its rows per
+    CTA and KV splits follow the wave count of the launch grid. BF16 gathers
+    zero-fill padded entries instead of reading slot 1.
     """
 
     del metadata_capacity_rows  # This backend does not use fallback plan storage.
@@ -534,6 +695,7 @@ def cute_dsl_blackwell_qsa_sparse_attention(
         k_scale=k_scale,
         v_scale=v_scale,
         enable_pdl=pdl_enabled(),
+        out=out,
     )
 
 
@@ -573,6 +735,8 @@ if _IS_NVIDIA_BLACKWELL:
         priority=Priority.SPECIALIZED + 2,
     )(cute_dsl_blackwell_qsa_sparse_attention)
     __all__ = [
+        "can_use_cute_dsl_fp8_prefill_layout",
+        "cute_dsl_fp8_qsa_sparse_prefill",
         "can_use_cute_dsl_tma_gather_qsa",
         "cute_dsl_tma_gather_qsa_prefill",
         "can_use_cute_dsl_qwen4_exp_qsa_block_topk",

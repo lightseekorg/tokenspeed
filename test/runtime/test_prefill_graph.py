@@ -143,6 +143,7 @@ class TestPrefillCaptureArgsTest:
             prefix_granularity=128,
             max_num_seqs=4,
             chunked_prefill_size=4096,
+            input_vocab_size=32,
             vocab_size=32,
             context_len=4096,
             physical_context_len=4096,
@@ -162,6 +163,7 @@ class TestPrefillCaptureArgsTest:
             query_shard_size=1,
             query_shard_rank=0,
             enable_memory_saver=False,
+            enable_drafter_prefill_graph=False,
         )
         with pytest.raises((TypeError), match=("prefill_graph_capture_batch_sizes")):
             ModelExecutorConfig(**config_args)
@@ -688,6 +690,8 @@ class TestDummyGroupTablesTest:
         capture_bs,
         arena_blocks=64,
         query_shard=(1, 0),
+        drafter=None,
+        draft_backend=None,
     ):
         """Drive make_dummy_batch to the backend hand-off and record it.
 
@@ -729,7 +733,7 @@ class TestDummyGroupTablesTest:
             query_shard_rank=query_shard[1],
         )
         pg.dp_size = 1
-        pg.drafter = None
+        pg.drafter = drafter
         pg.input_buffers = InputBuffers(
             max_bs=16,
             max_num_tokens=4096,
@@ -747,10 +751,11 @@ class TestDummyGroupTablesTest:
             seen["max_prefix"] = int(pg.input_buffers.extend_prefix_lens_cpu.max())
 
         pg.attn_backend.init_forward_metadata = _record
-        ctx = pg.make_dummy_batch(
-            num_tokens,
-            -(-num_tokens // context_len) if capture_bs is None else capture_bs,
-        )
+        requests = -(-num_tokens // context_len) if capture_bs is None else capture_bs
+        if draft_backend is None:
+            ctx = pg.make_dummy_batch(num_tokens, requests)
+        else:
+            ctx = pg.make_dummy_draft_batch(num_tokens, requests, draft_backend)
         bs = ctx.bs
         ib = pg.input_buffers
         assert (ib.request_token_history_input_lengths_buf[:bs].tolist()) == (
@@ -820,6 +825,8 @@ class TestDummyGroupTablesTest:
         one, so the autotune's dummy carries the plan a real extend of these
         rows would -- on the context and in the metadata hand-off -- and an
         engine that does not shard carries none."""
+        import torch
+
         from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 
         spec = _spec("full_attention", block_granularity=64)
@@ -832,16 +839,16 @@ class TestDummyGroupTablesTest:
             query_shard=(4, 3),
         )
         plan = seen["ctx"].query_shard
-        assert (plan) == (
-            QueryShardPlan.from_forward(
-                total_tokens=1737, input_lengths=[869, 868], size=4, rank=3
-            )
+        expected = QueryShardPlan.from_forward(
+            total_tokens=1737, input_lengths=[869, 868], size=4, rank=3, device="cpu"
         )
+        assert plan.rank == 3 and plan.row_counts == expected.row_counts
+        assert torch.equal(plan.local_row_ids, expected.local_row_ids)
         assert (seen["query_shard"]) is (plan)
         assert (sum(plan.row_counts)) == (1737)
         assert (plan.local_rows) == (plan.row_counts[3])
         # The whole span still fills the buffers and the metadata; the model
-        # takes its slice (ModelExecutor.autotune).
+        # takes its rows (ModelExecutor.autotune).
         assert (seen["num_tokens"]) == (1737)
         assert (seen["extend_seq_lens_cpu"].tolist()) == ([869, 868])
         unsharded = self._dummy_batch_probe(
@@ -853,6 +860,52 @@ class TestDummyGroupTablesTest:
         )
         assert (unsharded["ctx"].query_shard) is None
         assert (unsharded["query_shard"]) is None
+
+    def test_the_drafter_dummy_batch_prepares_the_draft_from_the_same_tables(self):
+        """The drafter's prefill-graph capture runs over a dummy extend whose
+        draft metadata comes from the same tables and lengths as the target's,
+        through the live extend's two-step prep."""
+        import torch
+
+        from tokenspeed.runtime.execution.drafter.base import BaseDrafter
+        from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+
+        class Drafter(BaseDrafter):
+            def __init__(self) -> None:
+                super().__init__(spec_num_tokens=4, spec_num_steps=3)
+                self.draft_seq_lens_buf = torch.zeros(16, dtype=torch.int32)
+
+        calls = []
+        draft_backend = _backend(
+            init_forward_metadata=lambda **kwargs: calls.append(("init", kwargs)),
+            refresh_decode_metadata=lambda *args, **kwargs: calls.append(
+                ("refresh", args, kwargs)
+            ),
+        )
+        drafter = Drafter()
+        spec = _spec("full_attention", block_granularity=64)
+        seen = self._dummy_batch_probe(
+            num_tokens=1737,
+            context_len=2048,
+            physical=2048,
+            specs=(spec,),
+            capture_bs=2,
+            drafter=drafter,
+            draft_backend=draft_backend,
+        )
+        assert [call[0] for call in calls] == ["init", "refresh"]
+        (_, init), (_, refresh_args, refresh) = calls
+        assert init["bs"] == 2 and init["num_extends"] == 2
+        assert init["forward_mode"] == ForwardMode.EXTEND
+        assert init["block_tables"] is seen["block_tables"]
+        assert init["extend_seq_lens_cpu"].tolist() == [869, 868]
+        # Step two: the decode metadata of the round's later steps.
+        assert refresh_args[:2] == (2, 2)
+        assert refresh_args[3].tolist() == [869, 868]
+        assert refresh["forward_mode"] == ForwardMode.DECODE
+        assert refresh["block_tables"] is seen["block_tables"]
+        assert drafter.draft_seq_lens_buf[:2].tolist() == [869, 868]
+        assert drafter.round_block_tables is seen["block_tables"]
 
     def test_real_active_page_backend_gets_positions_alongside_its_tables(self):
         """A backend that validates live-page geometry (V4) is told how many
@@ -1362,6 +1415,7 @@ class TestPrefillRoleGraphsTest:
             prefix_granularity=128,
             max_num_seqs=4,
             chunked_prefill_size=4096,
+            input_vocab_size=32,
             vocab_size=32,
             context_len=4096,
             physical_context_len=4096,
@@ -1383,6 +1437,7 @@ class TestPrefillRoleGraphsTest:
             query_shard_rank=0,
             enable_memory_saver=False,
             prefill_graph_max_tokens=256,
+            enable_drafter_prefill_graph=False,
         )
 
     def _decode_runner(self, config):

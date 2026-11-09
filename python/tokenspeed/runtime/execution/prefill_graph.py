@@ -77,12 +77,13 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cudagraph_memory import (
     CapturedLadder,
-    probe_positions,
+    ladder_from_plan,
 )
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from tokenspeed.runtime.execution.forward_step import prepare_draft_extend_metadata
 from tokenspeed.runtime.execution.memory_delta import MemoryDeltaObserver
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan
@@ -807,15 +808,23 @@ class PrefillGraph:
         A bucket's inline variants are entries at the bucket's width, sampled
         with it.
         """
-        ladders = {}
-        for series, graphs in self.capture_plan.items():
-            buckets = [bucket for bucket, bs in graphs if bs is None]
-            sampled = {buckets[i] for i in probe_positions(len(buckets), entries)}
-            ladders[series] = CapturedLadder(
-                [bucket for bucket, _ in graphs],
-                [i for i, (bucket, _) in enumerate(graphs) if bucket in sampled],
-            )
-        return ladders
+        return {
+            series: ladder_from_plan(graphs, entries)
+            for series, graphs in self.capture_plan.items()
+        }
+
+    def captured_hidden_spec(self) -> tuple[int, torch.dtype]:
+        """Per-row width and dtype of the hidden rows a captured forward hands
+        a drafter: the FULL capture, its aux taps side by side (or the final
+        hidden rows without taps), as the logits processor stores it.
+
+        Raises:
+            RuntimeError: Nothing has been captured yet.
+        """
+        if self._outputs is None:
+            raise RuntimeError("the prefill graph has captured no output rows yet")
+        taps = self._outputs[1:] or self._outputs[:1]
+        return sum(int(tap.shape[1]) for tap in taps), taps[0].dtype
 
     def release_graphs(self) -> None:
         """Drop the captured buckets and the private pool they share.
@@ -1125,10 +1134,43 @@ class PrefillGraph:
         On a query-sharding engine (``config.query_shard_size > 1``) the
         dummy carries the shard plan a real extend of these rows would, so the
         one extend form the engine runs is what startup tunes on; the model
-        then takes ``ctx.query_shard.local_slice`` of the span, as
+        then takes ``ctx.query_shard.local_row_ids`` of the span, as
         ``ModelExecutor._run_target_forward`` does. (Query sharding refuses
         the prefill graph, so this serves the autotune alone.)
         """
+        return self._make_dummy_batch(num_tokens, bs, draft_attn_backend=None)
+
+    def make_dummy_draft_batch(
+        self, num_tokens: int, bs: int, draft_attn_backend: AttentionBackend
+    ) -> ForwardContext:
+        """:meth:`make_dummy_batch`, with the draft backend's metadata too.
+
+        The drafter's prefill-graph capture runs the draft model over the
+        dummy extend, so the draft backend gets the metadata a live extend's
+        prep gives it (``prepare_draft_extend_metadata``), from the same
+        dummy tables and lengths as the target's.
+
+        Args:
+            num_tokens: Tokens of the dummy extend.
+            bs: Its requests.
+            draft_attn_backend: The draft model's attention backend.
+
+        Returns:
+            The target's ForwardContext for the dummy extend.
+        """
+        if self.drafter is None:
+            raise RuntimeError("a dummy draft batch needs the drafter")
+        return self._make_dummy_batch(
+            num_tokens, bs, draft_attn_backend=draft_attn_backend
+        )
+
+    def _make_dummy_batch(
+        self,
+        num_tokens: int,
+        bs: int,
+        *,
+        draft_attn_backend: AttentionBackend | None,
+    ) -> ForwardContext:
         ib = self.input_buffers
         # Logical context_len, deliberately NOT physical_context_len: the
         # fabricated positions run 0..max_req_tokens-1 and must stay inside
@@ -1172,6 +1214,7 @@ class PrefillGraph:
                 input_lengths=seq_lens,
                 size=self.config.query_shard_size,
                 rank=self.config.query_shard_rank,
+                device=self.config.device,
             )
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
@@ -1219,7 +1262,10 @@ class PrefillGraph:
                 for group_id, array in arrays.items()
             }
             dummy_forward_op = SimpleNamespace(
-                block_tables_arrays=lambda: arrays, block_table_spans=lambda: spans
+                block_table_windows=lambda: {
+                    key: (array, array.shape[1]) for key, array in arrays.items()
+                },
+                block_table_spans=lambda: spans,
             )
             cache_metadata = CacheBatchMetadata.from_forward_op(
                 dummy_forward_op,
@@ -1236,12 +1282,7 @@ class PrefillGraph:
             extra_metadata_kwargs["block_tables_cpu"] = dict(
                 cache_metadata.tables_cpu(active_forward_op=dummy_forward_op)
             )
-        self.attn_backend.init_forward_metadata(
-            bs=bs,
-            num_extends=bs,
-            req_pool_indices=ib.req_pool_indices_buf[:bs],
-            seq_lens=ib.seq_lens_buf[:bs],
-            forward_mode=ForwardMode.EXTEND,
+        extend_kwargs = dict(
             extend_seq_lens=ib.extend_seq_lens_buf[:bs],
             extend_seq_lens_cpu=ib.extend_seq_lens_cpu[:bs],
             extend_prefix_lens=ib.extend_prefix_lens_buf[:bs],
@@ -1252,6 +1293,25 @@ class PrefillGraph:
             query_shard=query_shard,
             **extra_metadata_kwargs,
         )
+        self.attn_backend.init_forward_metadata(
+            bs=bs,
+            num_extends=bs,
+            req_pool_indices=ib.req_pool_indices_buf[:bs],
+            seq_lens=ib.seq_lens_buf[:bs],
+            forward_mode=ForwardMode.EXTEND,
+            **extend_kwargs,
+        )
+        if draft_attn_backend is not None:
+            prepare_draft_extend_metadata(
+                draft_attn_backend,
+                self.drafter,
+                padded_bs=bs,
+                num_extends=bs,
+                req_pool_indices=ib.req_pool_indices_buf[:bs],
+                seq_lens=ib.seq_lens_buf[:bs],
+                forward_mode=ForwardMode.EXTEND,
+                **extend_kwargs,
+            )
         return ctx
 
     # ------------------------------------------------------------------
@@ -1322,10 +1382,7 @@ class PrefillGraph:
         # segment.
         tracker = self.token_to_kv_pool.layerwise_load_tracker
         if tracker is not None:
-            for index in tracker.consumer_indices:
-                torch.cuda.current_stream().wait_event(
-                    tracker.event_sets[index].last_layer_done_event
-                )
+            tracker.wait_for_all_layers()
         if self._narrowing is not None:
             hidden_states, aux_hidden_states = self._replay_narrowed(
                 bucket, ctx, num_tokens

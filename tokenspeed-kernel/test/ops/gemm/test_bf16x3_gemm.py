@@ -303,22 +303,11 @@ def test_kernel_is_launched_with_the_drain_and_without_fp_fusion(monkeypatch, m)
 
 @pytest.fixture
 def select_on(monkeypatch):
-    # These tests read the split kernel's own registration. The FP32 CUDA-core
-    # kernel registered ahead of it for rows 17 to 96 of weights up to 256
-    # rows is set aside here; test_decode_gemv_fp32_simt.py checks the two
-    # together.
-    reg = KernelRegistry.get()
-    name = "gluon_simt_gemm_fp32"
-    spec, impl = reg.get_by_name(name), reg.get_impl(name)
-    assert spec is not None
-    reg._unregister(name)
-
     def use(platform):
         monkeypatch.setattr(gemm_api, "current_platform", lambda: platform)
         gemm_api._select_mv.cache_clear()
 
     yield use
-    reg.register(spec, impl)
     gemm_api._select_mv.cache_clear()
 
 
@@ -439,7 +428,7 @@ def test_weight_split_is_made_under_a_kernel_preferred_for_some_rows(
             solution="test",
             format_signatures=gemm_triton._BF16_FP32_SIG,
             traits={"m_min": frozenset({17}), "m_max": frozenset({96})},
-            priority=Priority.SPECIALIZED + 1,
+            priority=Priority.SPECIALIZED + 3,
         ),
         stand_in,
     )

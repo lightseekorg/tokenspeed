@@ -281,6 +281,10 @@ impl DataPlane for InstantDevice {
         unreachable!("no control operation in the benchmark")
     }
 
+    fn reload_forward(&mut self, _: &ControlRequest) -> Result<(bool, String), DataPlaneError> {
+        unreachable!("no control operation in the benchmark")
+    }
+
     fn resume_memory(&mut self, _: &[String]) -> Result<(), DataPlaneError> {
         unreachable!("no control operation in the benchmark")
     }
@@ -397,6 +401,7 @@ fn bench_rounds(name: &str, shape: RoundShape) {
     });
     let config = LoopConfig {
         in_flight_depth: 1,
+        prefill_delay: None,
         limits: IngressLimits {
             vocab_size: 1 << 17,
             eos_token_ids: vec![2],
@@ -408,6 +413,7 @@ fn bench_rounds(name: &str, shape: RoundShape) {
             multimodal: false,
             grammar: false,
             reasoning: None,
+            reasoning_usage: None,
             logprobs: LogprobServability {
                 supports_prompt_logprobs: true,
                 logprob_order: "torch".to_owned(),
@@ -421,10 +427,12 @@ fn bench_rounds(name: &str, shape: RoundShape) {
         kv_token_capacity: (pages * shape.page) as i64,
         ngram_context_len: 0,
         request_token_history: false,
+        request_token_history_lookback: None,
         controls: ControlConfig {
             memory_saver: false,
             memory_regions: Vec::new(),
             l3_weight_version: None,
+            allow_reload_forward: false,
         },
         batch_log: BatchLogConfig {
             enabled: false,

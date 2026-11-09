@@ -48,6 +48,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
+from tokenspeed_kernel.ops.attention.dsa import cute_dsl as dsa_cute_dsl
 from tokenspeed_kernel.ops.attention.mla import mla_project_value
 from tokenspeed_kernel.ops.gemm import kimi3_mla_gate_projection, mm
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
@@ -210,6 +211,51 @@ def _scorers_take_fp8_index_queries(indexer: KimiK31Indexer) -> bool:
     return True
 
 
+def _fused_decode_topk_solution(indexer: KimiK31Indexer) -> str | None:
+    """``"cute_dsl"`` where the fused decode top-k serves this indexer, else None.
+
+    It serves BF16 queries, and the E4M3 ones the index-K write quantizes, over
+    a packed ``fp8_scaled`` plane, 1-8 rows per request, and is pinned only
+    where ``max_num_seqs`` fits the requests one of its rounds schedules. It scores
+    bit-identically to the DeepGEMM leaf and gives exact ties at the threshold
+    the lowest positions.
+    """
+    signatures = (
+        format_signature(
+            q=dense_tensor_format(torch.bfloat16),
+            weights=dense_tensor_format(torch.bfloat16),
+        ),
+        format_signature(
+            q=dense_tensor_format(torch.float8_e4m3fn),
+            weights=dense_tensor_format(torch.float32),
+        ),
+    )
+    traits = {
+        "q_len": frozenset(range(1, 9)),
+        "index_heads": indexer.index_n_heads,
+        "head_dim": indexer.index_head_dim,
+        "page_size": 64,
+        "topk": indexer.index_topk,
+        "index_k_format": "fp8_scaled",
+        "index_k_layout": "packed",
+    }
+    try:
+        for signature in signatures:
+            select_kernel(
+                "attention",
+                "dsa_decode_topk",
+                signature,
+                traits=traits,
+                solution="cute_dsl",
+            )
+    except NoKernelFoundError:
+        return None
+    max_requests = int(global_server_args_dict["max_num_seqs"] or 0)
+    if max_requests > dsa_cute_dsl.FUSED_DECODE_TOPK_MAX_REQUESTS:
+        return None
+    return "cute_dsl"
+
+
 class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttention):
     """K3's gated NoPE MLA attending its own indexer's top-k (DSA).
 
@@ -279,11 +325,19 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
         self.indexer = KimiK31Indexer(config, prefix=add_prefix("indexer", prefix))
         # FP8 index queries where the platform registers fp8_scaled scorers.
         self.index_query_fp8 = _scorers_take_fp8_index_queries(self.indexer)
+        # The fused decode top-k takes BF16 or unit-scale E4M3 index queries.
+        self.decode_topk_solution = (
+            None if self.index_query_fp8 else _fused_decode_topk_solution(self.indexer)
+        )
+        # A decode round quantizes its index query in the index-K write's launch.
+        self.index_k_write_quantizes_query = self.decode_topk_solution is not None
         self._decode_topk_indices_buffer: torch.Tensor | None = None
         self._decode_topk_lens_buffer: torch.Tensor | None = None
         self._retired_decode_workspaces: list[torch.Tensor] = []
         # The attention group's K3 Iris state, once communication is prepared.
         self.topk_iris_state: K3IrisState | None = None
+        # [q_b_proj; indexer wq_b] stacked after load: one GEMM over q_norm.
+        self.q_b_wq_b_weight: torch.Tensor | None = None
 
     def _gather_prefill_topk_rows(
         self, local: torch.Tensor, local_lens: torch.Tensor, gather_dtype: torch.dtype
@@ -311,6 +365,26 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
         ):
             return None
         return weight[: self._qkv_a_width]
+
+    def fuse_query_projections(self) -> None:
+        """Stack ``q_b_proj`` and the indexer's ``wq_b`` into one ``[q_b rows +
+        index_heads * index_head_dim, q_lora_rank]`` weight, as
+        ``KimiK31Indexer.fuse_key_weight_projections`` stacks ``wk``, for
+        decode rounds to project both from ``q_norm`` in one GEMM. The two
+        parameters become views of its rows. Bitwise numerics and a quantized
+        ``q_b_proj`` keep the separate GEMMs."""
+        q_b, wq_b = self.q_b_proj.weight, self.indexer.wq_b.weight
+        if (
+            global_server_args_dict["numerics"] in BITWISE_ENVELOPES
+            or q_b.dtype != torch.bfloat16
+            or wq_b.dtype != torch.bfloat16
+        ):
+            return
+        rows = q_b.shape[0]
+        fused = torch.cat((q_b.data, wq_b.data))
+        q_b.data = fused[:rows]
+        wq_b.data = fused[rows:]
+        self.q_b_wq_b_weight = fused
 
     def forward(
         self,
@@ -386,6 +460,24 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
         )
         return attn_output if gate is None else sigmoid_mul(attn_output, gate)
 
+    def decode_weights(self) -> tuple[torch.Tensor, ...]:
+        """The weights one decode step reads, in reading order.
+
+        The packed [q_a | kv_a | gate] projection, q_b with the index query
+        projection, the index key and head-weight projections, the absorbed key
+        and value projections (once derived) and the o-projection.
+        """
+        indexer = self.indexer
+        queries = (self.q_b_wq_b_weight,)
+        if self.q_b_wq_b_weight is None:
+            queries = (self.q_b_proj.weight, indexer.wq_b.weight)
+        keys = (indexer.wk_weights_proj_weight,)
+        if indexer.wk_weights_proj_weight is None:
+            keys = (indexer.wk.weight, indexer.weights_proj.weight)
+        absorbed = tuple(w for w in (self.w_kc, self.w_vc) if w is not None)
+        projection = self.fused_qkv_a_proj_with_mqa.weight
+        return (projection, *queries, *keys, *absorbed, self.o_proj.weight)
+
     def _attend(
         self,
         positions: torch.Tensor,
@@ -413,6 +505,17 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
             and self.absorbed_weights_k_major
             and not self.o_proj.supports_fp8_group128_input
         )
+        projected_q = index_query = None
+        # Decode rounds only: a prefill projects wq_b for its rank's top-k share of rows.
+        if self.q_b_wq_b_weight is not None and ctx.num_extends == 0:
+            # Token-shaped, so it may run before the eager break.
+            projected_q, index_query = mm(q_norm, self.q_b_wq_b_weight).split(
+                (self.q_b_proj.weight.shape[0], self.indexer.wq_b.weight.shape[0]),
+                dim=-1,
+            )
+            index_query = index_query.view(
+                -1, self.indexer.index_n_heads, self.indexer.index_head_dim
+            )
         attn_output = self._sparse_attention(
             positions,
             hidden_states,
@@ -421,6 +524,8 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
             ctx,
             comm_manager,
             gate if fuse_value_gate else None,
+            projected_q,
+            index_query,
         )
         return attn_output, None if fuse_value_gate else gate
 
@@ -444,6 +549,8 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
         ctx: ForwardContext,
         comm_manager: CommManager,
         output_gate: torch.Tensor | None,
+        projected_q: torch.Tensor | None,
+        index_query: torch.Tensor | None,
     ) -> torch.Tensor:
         """The eager break: index-K write, top-k, and the sparse cores.
 
@@ -465,6 +572,8 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
             replace(ctx, attn_backend=backend),
             comm_manager,
             output_gate=output_gate,
+            projected_q=projected_q,
+            index_query=index_query,
         )
 
 
@@ -500,6 +609,7 @@ class KimiK31ForConditionalGeneration(KimiK3ForConditionalGeneration):
         for layer in self.language_model.model.layers:
             if isinstance(layer.self_attn, KimiK31SparseMLAAttention):
                 layer.self_attn.indexer.fuse_key_weight_projections()
+                layer.self_attn.fuse_query_projections()
 
 
 EntryClass = [KimiK31ForConditionalGeneration]

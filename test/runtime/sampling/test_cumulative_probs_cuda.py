@@ -146,7 +146,7 @@ def _reference(logits, tokens):
             ),
         ),
         ("per-request", "torch", "auto"),
-        ("per-request", "megatron", "rl-bitwise"),
+        ("per-request", "blockwise", "rl-bitwise"),
     ],
 )
 @pytest.mark.parametrize("decode", [False, True], ids=["sample", "verify_n1"])

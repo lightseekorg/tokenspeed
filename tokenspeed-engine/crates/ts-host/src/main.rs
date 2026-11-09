@@ -56,7 +56,7 @@ use ts_control::{
     batch_log::BatchLogConfig,
     control::ControlConfig,
     eplb::{Algorithm, Controller, EplbConfig, EplbSpecs, COMMIT_DELAY_FORWARDS},
-    event_loop::{EventLoop, LoopConfig, LoopError, Ranks, Subsystems},
+    event_loop::{EventLoop, LoopConfig, LoopError, PrefillDelay, Ranks, Subsystems},
     grammar::{GrammarConfig, Grammars, ReasoningGrammar},
     ingress::{IngressLimits, LogprobServability},
     kv_events::{KvEventPublisher, KvEventsConfig},
@@ -219,6 +219,7 @@ struct HostConfig {
     spec_num_tokens: Option<usize>,
     ngram_context_len: usize,
     request_token_history: bool,
+    request_token_history_lookback: Option<usize>,
     physical_context_len: i64,
     kv_total_pages: i64,
     /// Effective token capacity of the usable KV pool.
@@ -249,6 +250,9 @@ struct HostConfig {
     grammar: Option<GrammarConfig>,
     /// The data plane fills bitmasks from the matchers' committed state.
     eager_grammar: bool,
+    /// The fused role's prefill-delay gate, `(attempt_interval,
+    /// any_interval)` in rounds, when `--prefill-attempt-interval` is set.
+    prefill_delay: Option<PrefillDelay>,
 }
 
 /// `rust_host.HostConfig.eplb`.
@@ -296,13 +300,8 @@ impl Eplb {
     }
 }
 
-/// The grammar settings' `reasoning` (`rust_host.GrammarSettings`), if
-/// grammars are on and it is set.
-fn reasoning_grammar(grammar: &Bound<'_, PyAny>) -> PyResult<Option<ReasoningGrammar>> {
-    if grammar.is_none() {
-        return Ok(None);
-    }
-    let reasoning = grammar.getattr("reasoning")?;
+/// The host's reasoning parser settings (`rust_host.ReasoningGrammar`).
+fn reasoning_grammar(reasoning: &Bound<'_, PyAny>) -> PyResult<Option<ReasoningGrammar>> {
     if reasoning.is_none() {
         return Ok(None);
     }
@@ -311,6 +310,7 @@ fn reasoning_grammar(grammar: &Bound<'_, PyAny>) -> PyResult<Option<ReasoningGra
         may_open: reasoning.getattr("may_open")?.extract()?,
         schema_slot: reasoning.getattr("schema_slot")?.extract()?,
         markers: reasoning.getattr("markers")?.extract()?,
+        implicit_closer: reasoning.getattr("implicit_closer")?.extract()?,
     }))
 }
 
@@ -396,6 +396,8 @@ impl HostConfig {
                 Some(ts_l3::Settings::from_python(&l3)?)
             }
         };
+        let reasoning = reasoning_grammar(&config.getattr("reasoning")?)?;
+        let grammar_enabled = !config.getattr("grammar")?.is_none();
         Ok(Self {
             handshake_address: config.getattr("handshake_address")?.extract()?,
             engine_index: config.getattr("engine_index")?.extract()?,
@@ -417,8 +419,13 @@ impl HostConfig {
                     .extract()?,
                 requires_bootstrap,
                 multimodal: config.getattr("multimodal")?.extract()?,
-                grammar: !config.getattr("grammar")?.is_none(),
-                reasoning: reasoning_grammar(&config.getattr("grammar")?)?,
+                grammar: grammar_enabled,
+                reasoning: if grammar_enabled {
+                    reasoning.clone()
+                } else {
+                    None
+                },
+                reasoning_usage: reasoning,
                 logprobs: {
                     let servability = config.getattr("logprob_servability")?;
                     LogprobServability {
@@ -438,6 +445,9 @@ impl HostConfig {
             spec_num_tokens: config.getattr("spec_num_tokens")?.extract()?,
             ngram_context_len: config.getattr("ngram_context_len")?.extract()?,
             request_token_history: config.getattr("request_token_history")?.extract()?,
+            request_token_history_lookback: config
+                .getattr("request_token_history_lookback")?
+                .extract()?,
             physical_context_len: config.getattr("physical_context_len")?.extract()?,
             kv_total_pages: config.getattr("kv_total_pages")?.extract()?,
             kv_token_capacity: config.getattr("kv_token_capacity")?.extract()?,
@@ -451,6 +461,7 @@ impl HostConfig {
                 memory_regions: config.getattr("memory_regions")?.extract()?,
                 // With L3, the namespace's weight version.
                 l3_weight_version: l3.as_ref().map(|l3| l3.weight_version.clone()),
+                allow_reload_forward: config.getattr("allow_reload_forward")?.extract()?,
             },
             l3,
             eplb: Eplb::from_python(&config.getattr("eplb")?)?,
@@ -471,6 +482,24 @@ impl HostConfig {
                 }
             },
             eager_grammar: config.getattr("eager_grammar")?.extract()?,
+            prefill_delay: match config
+                .getattr("prefill_delay")?
+                .extract::<Option<(u64, u64)>>()?
+            {
+                None => None,
+                Some((attempt_interval, any_interval)) => {
+                    if attempt_interval < 1 || any_interval < attempt_interval {
+                        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                            "prefill delay needs 1 <= attempt_interval <= any_interval, got \
+                             {attempt_interval} and {any_interval}"
+                        )));
+                    }
+                    Some(PrefillDelay {
+                        attempt_interval,
+                        any_interval,
+                    })
+                }
+            },
             metrics: Metrics::from_python(config)?,
             batch_log: BatchLogConfig {
                 enabled: config.getattr("batch_log")?.extract()?,
@@ -720,11 +749,13 @@ fn serve(args: &Args) -> Result<(), HostError> {
         kv_token_capacity: config.kv_token_capacity,
         ngram_context_len: config.ngram_context_len,
         request_token_history: config.request_token_history,
+        request_token_history_lookback: config.request_token_history_lookback,
         controls: config.controls.clone(),
         batch_log: config.batch_log.clone(),
         kv_events: config.kv_events,
         epd_receive_enabled: config.epd_receive_enabled,
         eager_grammar: config.eager_grammar,
+        prefill_delay: config.prefill_delay,
     };
     tracing::info!(
         rank = config.rank,

@@ -50,15 +50,16 @@ tensors. Two kernels are registered:
   ``2^-11`` in place of the division by 2048, one IEEE round-to-nearest
   multiply, one BF16 store; no table). It admits BF16 rank-2 ``q``/``k`` with a
   contiguous last axis and token strides covering the row (Beam's ``qkv.split``
-  column views or contiguous tensors), the head pairs ``(48, 8)`` and ``(6, 1)``
-  of head dimension 128, contiguous BF16 ``[128]`` weights, a contiguous int32 /
-  int64 ``[tokens]`` positions vector, a finite positive ``eps``, ``tokens > 0``
-  and one CUDA device. Ranked selection picks it wherever its traits admit the
-  call and keeps ``torch_qk_rmsnorm_ssmax`` everywhere else; reached by name it
-  raises on any other call (:func:`qk_rmsnorm_ssmax_rejection`), an empty batch
-  included: no in-function fallback. ``positions >= 0`` is the caller's
-  contract on both kernels, as it is for ``apply_ssmax_root10`` (never read on
-  the host: the product path runs under CUDA-graph capture).
+  column views or contiguous tensors), the head pairs ``(48, 8)``, ``(24, 4)``,
+  ``(12, 2)`` and ``(6, 1)`` of head dimension 128, contiguous BF16 ``[128]``
+  weights, a contiguous int32 / int64 ``[tokens]`` positions vector, a finite
+  positive ``eps``, ``tokens > 0`` and one CUDA device. Ranked selection picks
+  it wherever its traits admit the call and keeps ``torch_qk_rmsnorm_ssmax``
+  everywhere else; reached by name it raises on any other call
+  (:func:`qk_rmsnorm_ssmax_rejection`), an empty batch included: no in-function
+  fallback. ``positions >= 0`` is the caller's contract on both kernels, as it
+  is for ``apply_ssmax_root10`` (never read on the host: the product path runs
+  under CUDA-graph capture).
 
 The fused kernel's scale equals Torch's bit for bit on every position of
 ``[0, 2^20]`` for int32 and int64 (measured, zero mismatches), and the two kernels
@@ -120,9 +121,9 @@ QK_RMSNORM_SSMAX_MODE = "qk_rmsnorm_ssmax"
 TORCH_QK_RMSNORM_SSMAX = "torch_qk_rmsnorm_ssmax"
 TRITON_FUSED_QK_RMSNORM_SSMAX = "triton_fused_qk_rmsnorm_ssmax"
 # The head geometry the fused kernel admits: Beam's head dimension and its
-# (q heads, kv heads) pairs at TP1 and on the TP8 shard.
+# (q heads, kv heads) pairs at TP1 and on the TP2, TP4 and TP8 shards.
 BEAM_HEAD_DIM = 128
-BEAM_HEADS = ((48, 8), (6, 1))
+BEAM_HEADS = ((48, 8), (24, 4), (12, 2), (6, 1))
 # ``apply_ssmax_root10(q, positions, 1, 2048.0)`` in ``BeamAttention.prepare_qkv``;
 # the fused kernel carries the same constants as literals.
 SSMAX_OFFSET = 1
