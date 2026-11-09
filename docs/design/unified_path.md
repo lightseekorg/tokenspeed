@@ -2453,7 +2453,11 @@ slots. Dense MHA and TRT-LLM decode use one causal cache length per compact row.
 Unsupported paged leaves reject compact verification before capture.
 
 GDN convolution and recurrence read device offsets, skip empty requests and
-compute only selected prefixes. State destinations retain maximum verify
+compute only selected prefixes. Output-only GDN verification with 128-wide
+heads and request widths up to sixteen uses the same CuTe WY kernel as uniform
+verification. It reads packed Q/K/V directly and clears graph filler in that
+launch; unsupported geometry and state-writing verification retain the portable
+recurrence. State destinations retain maximum verify
 width. ReplaySSM writes raw k/v/a/b into that same request-major layout so the
 existing accepted-prefix commit reconstructs the selected state. PLE reuses the
 device request/column map for hashing, lookup and dilated convolution; negative
@@ -2476,6 +2480,5 @@ for the next decode. Unspecified legacy launch policies resolve explicitly to
 adaptive graphs, reuse of Q=8 as request counts change, and compact eager
 verification with graph metadata identity checks enabled. Full-budget
 and adaptive output parity acceptance, distributed performance and multimodal
-validation remain outstanding. The compact GDN layout currently selects the
-portable verify kernel; serving with automatic kernel selection does not
+validation remain outstanding. Serving with automatic kernel selection does not
 establish batch-invariant target numerics.

@@ -36,6 +36,7 @@ from tokenspeed_kernel.ops.attention.gdn.cute_dsl import (
     cute_dsl_gdn_decode_mtp as run_wy,
 )
 from tokenspeed_kernel.ops.tuning import kernel_warmup
+from utils import assert_no_cute_compile, move_pages_past_int32
 
 
 def make_case(*, batch, tokens, dtype, state_dtype, tree, strided, heads, vheads):
@@ -123,6 +124,221 @@ def reference(case):
             states.append(h)
         outputs.append(torch.stack(result))
     return torch.stack(outputs)
+
+
+def pack_prefixes(case, lengths, capacity, *, offset_dtype):
+    packed = dict(case)
+    for name in ("q", "k", "v", "a", "b"):
+        source = case[name]
+        shape = (1, capacity, *source.shape[2:])
+        strides = (capacity * source.stride(1), *source.stride()[1:])
+        target = torch.empty_strided(
+            shape, strides, dtype=source.dtype, device=source.device
+        ).fill_(float("nan"))
+        rows = torch.cat([source[i, :length] for i, length in enumerate(lengths)])
+        target[0, : rows.shape[0]].copy_(rows)
+        packed[name] = target
+    packed["query_start_loc"] = torch.tensor(
+        [0, *torch.tensor(lengths).cumsum(0).tolist()],
+        dtype=offset_dtype,
+        device=case["q"].device,
+    )
+    packed["max_seqlen_q"] = case["q"].shape[1]
+    return packed
+
+
+def assert_packed_output(output, case, lengths):
+    expected = reference(case)
+    live = torch.cat([expected[i, :length] for i, length in enumerate(lengths)])
+    torch.testing.assert_close(
+        output[0, : live.shape[0]].double(), live, atol=1e-4, rtol=2**-7
+    )
+    assert torch.count_nonzero(output[0, live.shape[0] :]) == 0
+
+
+@pytest.mark.parametrize(
+    "tokens,dtype,state_dtype,strided,offset_dtype",
+    [
+        (4, torch.bfloat16, torch.float32, False, torch.int32),
+        (8, torch.bfloat16, torch.bfloat16, True, torch.int64),
+        (8, torch.bfloat16, torch.float32, True, torch.int32),
+        (13, torch.float16, torch.float32, True, torch.int32),
+        (16, torch.float16, torch.float16, False, torch.int64),
+    ],
+)
+def test_wy_packed_prefixes_and_raw_replay(
+    tokens, dtype, state_dtype, strided, offset_dtype
+):
+    case = make_case(
+        batch=4,
+        tokens=tokens,
+        dtype=dtype,
+        state_dtype=state_dtype,
+        tree=False,
+        strided=strided,
+        heads=2,
+        vheads=6,
+    )
+    lengths = [0, tokens - 1, 1, tokens]
+    packed = pack_prefixes(case, lengths, 4 * tokens + 3, offset_dtype=offset_dtype)
+    raw = torch.cat([case[name].flatten(2) for name in ("k", "v", "a", "b")], dim=-1)
+    replay = torch.full_like(raw.flatten(0, 1), float("nan"))
+    packed["replay_payload"] = replay
+    before = case["initial_state"].clone()
+    # Empty requests must not dereference even an invalid state row.
+    packed["initial_state_indices"] = case["initial_state_indices"].clone()
+    packed["initial_state_indices"][0] = case["initial_state"].shape[0] + 100
+    output = run_wy(**packed)
+    assert_packed_output(output, case, lengths)
+    for i, length in enumerate(lengths):
+        torch.testing.assert_close(
+            replay.view_as(raw)[i, :length], raw[i, :length], atol=0, rtol=0
+        )
+        assert replay.view_as(raw)[i, length:].isnan().all()
+    assert torch.equal(case["initial_state"], before)
+
+
+@pytest.mark.parametrize(
+    "tokens,state_dtype",
+    [
+        (4, torch.float32),
+        (4, torch.bfloat16),
+        (8, torch.bfloat16),
+        (8, torch.float32),
+        (13, torch.float32),
+    ],
+)
+def test_wy_packed_graph_refreshes_prefixes_without_compiling(tokens, state_dtype):
+    from tokenspeed_kernel.ops.attention.gdn import gdn_decode_mtp
+
+    def inputs(batch, lengths, capacity, *, strided):
+        case = make_case(
+            batch=batch,
+            tokens=tokens,
+            dtype=torch.bfloat16,
+            state_dtype=state_dtype,
+            tree=False,
+            strided=strided,
+            heads=2,
+            vheads=6,
+        )
+        case["initial_state_indices"][-1] = -1
+        packed = pack_prefixes(case, lengths, capacity, offset_dtype=torch.int32)
+        payload_width = 2 * 128 + 6 * 128 + 2 * 6
+        packed["replay_payload"] = torch.empty(
+            (batch * tokens, payload_width), dtype=torch.bfloat16, device="cuda"
+        )
+        return case, packed
+
+    _, warm = inputs(1, [tokens], tokens, strided=False)
+    with kernel_warmup(enabled=True):
+        gdn_decode_mtp(**warm)
+    # B crosses launch tiers and Q exceeds sixteen, while max request width is
+    # unchanged. Both must reuse kernels prepared by the operator's warmup.
+    lengths = [tokens] * 48
+    case, packed = inputs(48, lengths, 48 * tokens + 5, strided=True)
+    before = case["initial_state"].clone()
+    with assert_no_cute_compile():
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = gdn_decode_mtp(**packed)
+        for lengths in ([tokens] * 48, [i % (tokens + 1) for i in range(48)], [0] * 48):
+            case["q"].mul_(-0.75)
+            case["initial_state_indices"].copy_(case["initial_state_indices"].roll(1))
+            refreshed = pack_prefixes(
+                case, lengths, 48 * tokens + 5, offset_dtype=torch.int32
+            )
+            for name in ("q", "k", "v", "a", "b", "query_start_loc"):
+                packed[name].copy_(refreshed[name])
+            # Poisoning output checks that every replay clears the whole filler,
+            # including an all-empty graph with no valid state row.
+            output.fill_(float("nan"))
+            graph.replay()
+            assert_packed_output(output, case, lengths)
+    assert torch.equal(case["initial_state"], before)
+
+
+def test_wy_packed_state_offsets_exceed_int32():
+    case = make_case(
+        batch=2,
+        tokens=4,
+        dtype=torch.bfloat16,
+        state_dtype=torch.bfloat16,
+        tree=False,
+        strided=False,
+        heads=1,
+        vheads=1,
+    )
+    case["initial_state"] = case["initial_state"].contiguous()
+    expected = reference(case)
+    (case["initial_state"],), case["initial_state_indices"] = move_pages_past_int32(
+        (case["initial_state"],), case["initial_state_indices"]
+    )
+    packed = pack_prefixes(case, [1, 4], 7, offset_dtype=torch.int64)
+    output = run_wy(**packed)
+    torch.testing.assert_close(
+        output[0, :5].double(),
+        torch.cat([expected[0, :1], expected[1]]),
+        atol=1e-4,
+        rtol=2**-7,
+    )
+    assert torch.count_nonzero(output[0, 5:]) == 0
+
+
+def test_wy_packed_query_strides_exceed_int32():
+    case = make_case(
+        batch=2,
+        tokens=1,
+        dtype=torch.bfloat16,
+        state_dtype=torch.float32,
+        tree=False,
+        strided=False,
+        heads=1,
+        vheads=1,
+    )
+    # One shared allocation places the second row beyond int32 while touching
+    # only 256 elements. All five packed operands exercise the prefix address.
+    pitch = 2**31 + 128
+    backing = torch.empty(pitch + 128, dtype=torch.bfloat16, device="cuda")
+    rows = backing.as_strided((1, 2, 1, 128), (0, pitch, 128, 1))
+    rows.copy_(case["q"].reshape_as(rows))
+    packed = dict(case)
+    for name in ("q", "k", "v"):
+        packed[name] = rows
+        case[name] = rows.clone().reshape(2, 1, 1, 128)
+    for name in ("a", "b"):
+        packed[name] = rows[..., 0]
+        case[name] = rows[..., 0].clone().reshape(2, 1, 1)
+    packed["query_start_loc"] = torch.tensor(
+        [0, 1, 2], dtype=torch.int64, device="cuda"
+    )
+    packed["max_seqlen_q"] = 1
+    output = run_wy(**packed)
+    assert_packed_output(output, case, [1, 1])
+
+
+def test_wy_packed_automatic_selection(tmp_path):
+    from tokenspeed_kernel.ops.attention.gdn import gdn_decode_mtp
+
+    case = make_case(
+        batch=32,
+        tokens=4,
+        dtype=torch.bfloat16,
+        state_dtype=torch.float32,
+        tree=False,
+        strided=False,
+        heads=4,
+        vheads=12,
+    )
+    lengths = [1, 2, 3, 4] * 8
+    packed = pack_prefixes(case, lengths, 96, offset_dtype=torch.int32)
+    path = tmp_path / "packed-selection.json"
+    ShapeCapture.get().clear()
+    with shape_capture(path):
+        output = gdn_decode_mtp(**packed)
+    selected = json.loads(path.read_text())
+    assert selected[-1]["kernel_name"] == "cute_dsl_gdn_decode_mtp"
+    assert_packed_output(output, case, lengths)
 
 
 @pytest.mark.parametrize(
@@ -416,17 +632,20 @@ def test_wy_two_value_heads_per_key_with_pdl(state_dtype):
     assert torch.equal(case["initial_state"], before)
 
 
-def test_wy_pdl_equivalence():
+@pytest.mark.parametrize("packed", [False, True])
+def test_wy_pdl_equivalence(packed):
     case = make_case(
         batch=2,
         tokens=8,
         dtype=torch.bfloat16,
         state_dtype=torch.bfloat16,
-        tree=True,
+        tree=not packed,
         strided=True,
         heads=2,
         vheads=6,
     )
+    if packed:
+        case = pack_prefixes(case, [0, 5], 16, offset_dtype=torch.int32)
     previous = pdl_enabled()
     try:
         pdl_enabled(False)

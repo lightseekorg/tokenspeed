@@ -57,7 +57,7 @@ if _AVAILABLE:
         priority=Priority.SPECIALIZED + 2,
         traits={
             "head_dim": frozenset({128}),
-            "varlen": frozenset({False}),
+            "varlen": frozenset({False, True}),
             "value_head_dim": frozenset({128}),
             "verify_tokens": frozenset(range(1, 17)),
             "output_only": frozenset({True}),
@@ -85,6 +85,8 @@ if _AVAILABLE:
         output_state: torch.Tensor | None,
         tree_ancestors: torch.Tensor | None,
         replay_payload: torch.Tensor | None,
+        query_start_loc: torch.Tensor | None = None,
+        max_seqlen_q: int | None = None,
     ) -> torch.Tensor:
         """Verify a GDN chain or tree in WY form without writing recurrent states.
 
@@ -111,9 +113,18 @@ if _AVAILABLE:
             replay_payload: Optional contiguous ``[B*T, H*128 + HV*128 + 2*HV]``
                 destination for exact raw ``[k | v | a | b]`` rows. Its dtype and
                 those of ``a``/``b`` must equal ``q.dtype``.
+            query_start_loc: Optional contiguous device int32/int64 ``[B+1]``
+                prefix offsets for packed ``[1,Q,...]`` inputs. Empty requests
+                are skipped; output rows after the last offset are zeroed.
+                Offsets start at zero, are nondecreasing, end at most at Q, and
+                adjacent offsets differ by at most ``max_seqlen_q``.
+            max_seqlen_q: Maximum per-request width for packed inputs, required
+                with offsets. Replay keeps ``B*max_seqlen_q`` rows even when Q
+                is smaller. Packed trees are unsupported.
 
         Returns:
-            Output shaped ``[B, T, HV, 128]`` with ``q.dtype``, for ``1 <= T <= 16``.
+            Output shaped ``[B,T,HV,128]`` or packed ``[1,Q,HV,128]`` with
+            ``q.dtype``, for request widths from 1 to 16.
             Products use native TF32 MMA and FP32 accumulation. WY coefficients use
             FP32 triangular solves, or backward query propagation for four tokens.
             Warm the selected dtype/geometry/4/8/16-token bucket before capture.
@@ -122,7 +133,25 @@ if _AVAILABLE:
             raise ValueError(
                 "q/k must have equal [B,T,H,128] shapes; v must be [B,T,HV,128]"
             )
-        B, T, H, K = q.shape
+        physical_batch, physical_tokens, H, K = q.shape
+        B, T = physical_batch, physical_tokens
+        if query_start_loc is not None:
+            B = initial_state_indices.numel()
+            if (
+                physical_batch != 1
+                or query_start_loc.shape != (B + 1,)
+                or query_start_loc.dtype not in (torch.int32, torch.int64)
+                or not query_start_loc.is_contiguous()
+                or max_seqlen_q is None
+                or tree_ancestors is not None
+                or (B == 0 and physical_tokens != 0)
+            ):
+                raise ValueError(
+                    "packed GDN WY requires device prefix offsets, a maximum width and no tree"
+                )
+            T = max_seqlen_q
+        elif max_seqlen_q is not None:
+            raise ValueError("max_seqlen_q requires device query offsets")
         HV, V = v.shape[2:]
         if (
             K != 128
@@ -131,7 +160,7 @@ if _AVAILABLE:
             or H <= 0
             or HV % H
             or HV <= 0
-            or v.shape[:2] != (B, T)
+            or v.shape[:2] != q.shape[:2]
         ):
             raise ValueError("GDN WY requires K=V=128 and 1 <= T <= 16")
         if not disable_state_update or any(
@@ -147,8 +176,8 @@ if _AVAILABLE:
             raise ValueError("q/k/v must share BF16 or FP16 dtype")
         floating = (torch.bfloat16, torch.float16, torch.float32)
         if (
-            a.shape != (B, T, HV)
-            or b.shape != (B, T, HV)
+            a.shape != (*q.shape[:2], HV)
+            or b.shape != (*q.shape[:2], HV)
             or a.dtype not in floating
             or b.dtype not in floating
         ):
@@ -192,6 +221,8 @@ if _AVAILABLE:
                     "replay_payload must be contiguous [B*T,H*K+HV*V+2*HV], with the dtype of q/k/v/a/b"
                 )
         inputs = (q, k, v, a, b, A_log, dt_bias, initial_state, initial_state_indices)
+        if query_start_loc is not None:
+            inputs = inputs + (query_start_loc,)
         if tree_ancestors is not None:
             inputs = inputs + (tree_ancestors,)
         if replay_payload is not None:
@@ -215,4 +246,6 @@ if _AVAILABLE:
             use_qk_l2norm=use_qk_l2norm,
             tree_ancestors=tree_ancestors,
             replay_payload=replay_payload,
+            query_start_loc=query_start_loc,
+            max_seqlen_q=max_seqlen_q,
         )

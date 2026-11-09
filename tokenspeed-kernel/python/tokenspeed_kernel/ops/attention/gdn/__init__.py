@@ -794,7 +794,7 @@ def gdn_decode_mtp(
     traits = {
         "head_dim": head_dim,
         "value_head_dim": v.shape[-1],
-        "verify_tokens": q.shape[1],
+        "verify_tokens": max_seqlen_q if query_start_loc is not None else q.shape[1],
         "tree": tree_ancestors is not None,
         "output_only": output_only,
         "padding_safe": _requires_padding_safe_decode(

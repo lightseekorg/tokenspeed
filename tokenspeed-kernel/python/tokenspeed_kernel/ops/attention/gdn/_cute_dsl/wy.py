@@ -251,6 +251,7 @@ class GdnWYKernel:
         use_tma_state: Whether checkpoint state tiles load through TMA.
         gram_rows: Gram matrix side length (8 or 16).
         key_chunk: Checkpoint key columns loaded per stage (64 or 128).
+        varlen: Whether inputs use packed rows with device prefix offsets.
         reduction_bound: Token reduction bound derived from ``token_bound``
             (8 for short windows, 16 otherwise).
     """
@@ -270,6 +271,7 @@ class GdnWYKernel:
         use_tma_state: bool,
         gram_rows: int,
         key_chunk: int,
+        varlen: bool,
     ):
         self.heads = heads
         self.vheads = vheads
@@ -284,6 +286,7 @@ class GdnWYKernel:
         self.use_tma_state = use_tma_state
         self.gram_rows = gram_rows
         self.key_chunk = key_chunk
+        self.varlen = varlen
         self.reduction_bound = 8 if token_bound <= 8 else 16
 
     @cute.jit
@@ -294,6 +297,7 @@ class GdnWYKernel:
         batch: Int32,
         tokens: Int32,
         scale: Float32,
+        query_capacity: Int64,
         qkv_tensors,
         state_tensor,
         stream: cuda.CUstream,
@@ -360,8 +364,10 @@ class GdnWYKernel:
         self.run(
             operands,
             strides,
+            batch,
             tokens,
             scale,
+            query_capacity,
             atoms,
             sources,
             state_atom,
@@ -497,8 +503,74 @@ class GdnWYKernel:
         self,
         operands: tuple,
         strides: tuple,
+        requests: Int32,
         tokens: Int32,
         scale: Float32,
+        query_capacity: Int64,
+        atoms: tuple,
+        sources: tuple,
+        state_atom,
+        state_source,
+        h_layout,
+    ):
+        if cutlass.const_expr(self.enable_pdl):
+            cute.arch.griddepcontrol_wait()
+            cute.arch.griddepcontrol_launch_dependents()
+        nh, tile, _ = cute.arch.block_idx()
+        batch, hv = nh // self.vheads, nh % self.vheads
+        output_start = Int64(batch) * tokens
+        replay_width = tokens
+        active = True
+        if cutlass.const_expr(self.varlen):
+            offsets = cute.make_tensor(
+                operands[12], cute.make_layout(9223372036854775807)
+            )
+            output_start = Int64(offsets[batch])
+            tokens = Int32(Int64(offsets[batch + 1]) - output_start)
+            active = tokens > 0
+            shifted = ()
+            for i in cutlass.range_constexpr(5):
+                shifted += (operands[i] + output_start * strides[i][1],)
+            operands = (*shifted, *operands[5:])
+            # Each value tile clears its own filler columns. No extra fill launch
+            # or replay scratch is needed, including when every request is empty.
+            if batch == 0:
+                out = cute.make_tensor(
+                    operands[11], cute.make_layout(9223372036854775807)
+                )
+                first_padding = Int64(offsets[requests])
+                for i in cutlass.range(
+                    Int64(cute.arch.thread_idx()[0]),
+                    (query_capacity - first_padding) * self.value_tile,
+                    128,
+                ):
+                    row = first_padding + i // self.value_tile
+                    column = tile * self.value_tile + i % self.value_tile
+                    out[(row * self.vheads + hv) * 128 + column] = out.element_type(0)
+        if active:
+            self.compute(
+                operands,
+                strides,
+                tokens,
+                scale,
+                output_start,
+                replay_width,
+                atoms,
+                sources,
+                state_atom,
+                state_source,
+                h_layout,
+            )
+
+    @cute.jit
+    def compute(
+        self,
+        operands: tuple,
+        strides: tuple,
+        tokens: Int32,
+        scale: Float32,
+        output_start: Int64,
+        replay_width: Int32,
         atoms: tuple,
         sources: tuple,
         state_atom,
@@ -508,7 +580,7 @@ class GdnWYKernel:
         """Compute the output-only WY verification, one value tile per CTA.
 
         The grid maps one CTA of 128 threads (four warps) to each (request,
-        value head, value tile) triple. ``operands`` packs twelve raw gmem
+        value head, value tile) triple. ``operands`` packs thirteen raw gmem
         pointers in this order:
 
         - ``q``, ``k``: BF16/FP16 ``[B, T, H, 128]``.
@@ -524,15 +596,22 @@ class GdnWYKernel:
           ``[B*T, H*128 + HV*128 + 2*HV]``, or a placeholder when
           ``self.replay`` is off.
         - ``out``: ``q``-dtype output ``[B, T, HV, 128]``.
+        - ``offsets``: packed prefix offsets, or a placeholder for uniform inputs.
+
+        Packed inputs have their pointers advanced to this request's first row
+        and batch strides set to zero. Output starts at its compact offset;
+        replay keeps the maximum request width independently of live lengths.
 
         ``strides`` packs the element strides of ``q``, ``k``, ``v``, ``a``
         and ``b``, followed by the pool row stride.
 
         Args:
-            operands: The twelve raw pointers described above.
+            operands: The thirteen raw pointers described above.
             strides: Per-operand element strides ``(qs, ks, vs, as_, bs, ps)``.
             tokens: Runtime token count per request, at most ``token_bound``.
             scale: Query scale multiplied into the normalized queries.
+            output_start: First output row for this request.
+            replay_width: Maximum request width in the request-major replay buffer.
             atoms: TMA copy atoms for q, k and v; empty without TMA.
             sources: TMA gmem source tensors for q, k and v; empty without TMA.
             state_atom: TMA copy atom for checkpoint tiles, or ``None``.
@@ -548,11 +627,8 @@ class GdnWYKernel:
         tensors = tuple(
             cute.make_tensor(p, cute.make_layout(9223372036854775807)) for p in operands
         )
-        q, k, v, a, b, A_log, dt_bias, pool, indices, tree, replay, out = tensors
+        q, k, v, a, b, A_log, dt_bias, pool, indices, tree, replay, out, _ = tensors
         qs, ks, vs, as_, bs, ps = strides
-        if cutlass.const_expr(self.enable_pdl):
-            cute.arch.griddepcontrol_wait()
-            cute.arch.griddepcontrol_launch_dependents()
         smem = cutlass.utils.SmemAllocator()
         # Short-window MMA reads eight padded token rows, never sixteen.
         workspace_rows = 8 if self.token_bound <= 8 else 16
@@ -722,7 +798,7 @@ class GdnWYKernel:
                         & (hv % (self.vheads // self.heads) == 0)
                     ):
                         replay[
-                            (Int64(batch) * tokens + row) * width
+                            (Int64(batch) * replay_width + row) * width
                             + head * 128
                             + qk_dimension
                         ] = replay.element_type(rk[part])
@@ -765,7 +841,7 @@ class GdnWYKernel:
                 if cutlass.const_expr(self.replay):
                     if tile == 0:
                         r = (
-                            (Int64(batch) * tokens + tid) * width
+                            (Int64(batch) * replay_width + tid) * width
                             + self.heads * 128
                             + self.vheads * 128
                             + hv
@@ -814,7 +890,7 @@ class GdnWYKernel:
                 if cutlass.const_expr(self.replay):
                     if vector_row < tokens:
                         replay[
-                            (Int64(batch) * tokens + vector_row) * width
+                            (Int64(batch) * replay_width + vector_row) * width
                             + self.heads * 128
                             + hv * 128
                             + col_base
@@ -1076,8 +1152,7 @@ class GdnWYKernel:
                         value = value_base + row + (j // 2) * 8
                         if token < tokens:
                             out[
-                                ((Int64(batch) * tokens + token) * self.vheads + hv)
-                                * 128
+                                ((output_start + token) * self.vheads + hv) * 128
                                 + col_base
                                 + value
                             ] = out.element_type(output_values[j])
@@ -1103,7 +1178,7 @@ class GdnWYKernel:
                     vc = col + (j % 2)
                     if r < tokens:
                         out[
-                            ((Int64(batch) * tokens + r) * self.vheads + hv) * 128
+                            ((output_start + r) * self.vheads + hv) * 128
                             + col_base
                             + vc
                         ] = out.element_type(output_values[j])
@@ -1178,6 +1253,8 @@ def launch_gdn_wy(
     use_qk_l2norm: bool,
     tree_ancestors: torch.Tensor | None,
     replay_payload: torch.Tensor | None,
+    query_start_loc: torch.Tensor | None,
+    max_seqlen_q: int | None,
 ) -> torch.Tensor:
     """Launch GDN WY verification with cached CuTe specializations.
 
@@ -1185,12 +1262,15 @@ def launch_gdn_wy(
     CuTe pointer types; absent tree masks and replay destinations use existing
     tensors as placeholders. Return ``[B, T, HV, V]`` output with ``q.dtype``,
     including an empty output for an empty batch, without writing the state pool.
+    Packed inputs keep ``[1,Q,HV,V]`` output and use device offsets to locate
+    requests; ``max_seqlen_q`` bounds each request and the raw replay row pitch.
 
     ``_COMPILED`` caches one kernel per device, operand dtypes, model geometry,
     execution flags and bounded launch/transport choices. Token bounds use
     4/8/16 buckets; value tiles and accumulators follow batch/head thresholds.
-    Actual batch/token counts, strides and scale remain runtime inputs. A cache
-    miss compiles all Q/K/V and state transport combinations; ``kernel_warmup``
+    Actual batch/token counts, query capacity, strides and scale remain runtime
+    inputs. A cache miss compiles all applicable Q/K/V and state transport
+    combinations; ``kernel_warmup``
     also prepares reachable launch tiers for the selected token bucket.
 
     Warm every selected bucket/dtype/geometry before CUDA Graph capture;
@@ -1199,6 +1279,9 @@ def launch_gdn_wy(
     B, T, H, K = q.shape
     HV, V = v.shape[2:]
     out = q.new_empty((B, T, HV, V))
+    varlen = query_start_loc is not None
+    if varlen:
+        B, T = initial_state_indices.numel(), max_seqlen_q
     if B == 0:
         return out
     tensors = (
@@ -1214,6 +1297,7 @@ def launch_gdn_wy(
         tree_ancestors if tree_ancestors is not None else initial_state_indices,
         replay_payload if replay_payload is not None else out,
         out,
+        query_start_loc if varlen else initial_state_indices,
     )
     dtypes = {
         torch.bfloat16: cutlass.BFloat16,
@@ -1231,11 +1315,12 @@ def launch_gdn_wy(
         )
         for x in tensors
     )
-    strides = tuple(tuple(Int64(s) for s in x.stride()) for x in (q, k, v, a, b)) + (
-        Int64(initial_state.stride(0)),
-    )
+    strides = tuple(
+        tuple(Int64(0 if varlen and i == 0 else s) for i, s in enumerate(x.stride()))
+        for x in (q, k, v, a, b)
+    ) + (Int64(initial_state.stride(0)),)
     pdl = pdl_enabled()
-    use_tma_qkv = all(
+    use_tma_qkv = not varlen and all(
         x.data_ptr() % 16 == 0
         and x.stride(3) == 1
         and all(s * x.element_size() % 16 == 0 for s in x.stride()[:3])
@@ -1281,6 +1366,7 @@ def launch_gdn_wy(
         token_bound,
         gram_rows,
         key_chunk,
+        varlen,
     )
     with torch.cuda.device(q.device):
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -1290,6 +1376,7 @@ def launch_gdn_wy(
             Int32(B),
             Int32(T),
             Float32(K**-0.5 if scale is None else scale),
+            Int64(q.shape[0] * q.shape[1]),
             qkv_tensors,
             state_tensor,
             stream,
@@ -1302,6 +1389,7 @@ def launch_gdn_wy(
                 token_bound,
                 gram_rows,
                 key_chunk,
+                varlen,
             )
             compiled = _COMPILED.get(config_key)
             if compiled is None:
@@ -1311,7 +1399,7 @@ def launch_gdn_wy(
                     )
                 # Graph replay may refresh from a contiguous input to a strided view.
                 # Warm both transport variants together before any graph capture.
-                for qkv_variant in (False, True):
+                for qkv_variant in ((False,) if varlen else (False, True)):
                     for state_variant in (False, True):
                         variant_key = (
                             *config_key[:8],
@@ -1352,7 +1440,7 @@ def launch_gdn_wy(
                                 variant_state = from_dlpack(
                                     warm_state, assumed_align=16
                                 ).mark_layout_dynamic(leading_dim=3)
-                        variant_args = (*args[:5], variant_qkv, variant_state, stream)
+                        variant_args = (*args[:6], variant_qkv, variant_state, stream)
                         _COMPILED[variant_key] = cute.compile(
                             GdnWYKernel(
                                 H,
@@ -1368,6 +1456,7 @@ def launch_gdn_wy(
                                 state_variant,
                                 gram_rows,
                                 key_chunk,
+                                varlen,
                             ),
                             *variant_args,
                         )
