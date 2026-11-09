@@ -684,6 +684,9 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def(
             "next_execution_plan",
             [](tokenspeed::Scheduler& s) {
+                // Python deliberately fixes ordinary scheduling for this API.
+                // Only the Rust host drives the serving prefill gate, passing
+                // both options explicitly for each plan.
                 return s.NextExecutionPlan(
                     tokenspeed::Scheduler::PlanOptions{.allow_prefill = true, .apply_prefill_watermark = false});
             },
