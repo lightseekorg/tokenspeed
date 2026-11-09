@@ -107,9 +107,12 @@ def get_sampling_backend_class(server_args: ServerArgs) -> type[SamplingBackend]
         flashinfer_full as _ff,
     )
     from tokenspeed.runtime.sampling.backends import greedy as _g  # noqa: F401
-    from tokenspeed.runtime.sampling.backends import sonic as _so  # noqa: F401
     from tokenspeed.runtime.sampling.backends import triton as _t  # noqa: F401
     from tokenspeed.runtime.sampling.backends import triton_full as _tf  # noqa: F401
+
+    # sonic's kernels use NVIDIA's libdevice; other platforms never import them.
+    if current_platform().is_nvidia:
+        from tokenspeed.runtime.sampling.backends import sonic as _so  # noqa: F401
 
     name = _resolve_backend_name(server_args)
     if current_platform().is_npu and name == "ascend_full":

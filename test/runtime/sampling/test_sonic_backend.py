@@ -62,7 +62,14 @@ sys.path.insert(
 )
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
-register_cuda_ci(est_time=180, suite="runtime-1gpu")
+register_cuda_ci(
+    est_time=180,
+    suite="runtime-1gpu",
+    disabled_on_runners=["amd-*"],
+    disabled_on_runners_reason="sonic's kernels need NVIDIA's libdevice (fast_logf).",
+)
+
+from tokenspeed_kernel.platform import current_platform  # noqa: E402
 
 from tokenspeed.runtime.sampling.backends.base import (  # noqa: E402
     SamplingBackendConfig,
@@ -72,11 +79,12 @@ from tokenspeed.runtime.sampling.sampling_batch_info import (  # noqa: E402
 )
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams  # noqa: E402
 
-requires_cuda = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="requires CUDA"
+requires_nvidia = pytest.mark.skipif(
+    not (torch.cuda.is_available() and current_platform().is_nvidia),
+    reason="sonic's kernels run on NVIDIA GPUs",
 )
 
-pytestmark = [requires_cuda]
+pytestmark = [requires_nvidia]
 
 VOCAB = 1024  # two 512-column tiles: the small-vocabulary fallback
 REAL_VOCAB = 151936  # qwen-sized
