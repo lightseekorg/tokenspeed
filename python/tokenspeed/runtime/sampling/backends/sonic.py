@@ -166,8 +166,11 @@ class SonicSamplingBackend(SamplingBackend):
     pick the top-128 candidates, whose fp32 values are re-read and given fp32
     temperature, top_p, min_p and penalties (logit bias stays bf16), and
     greedy is the first exact fp32 maximum. Under TP, decode counts for
-    penalties accumulate in-kernel from each rank's own draw, before the
-    rank-0 broadcast that decides the emitted token.
+    penalties accumulate in-kernel from each rank's own draw. Sharded draws
+    are the emitted tokens (every rank draws the same, no broadcast); draws
+    from gathered whole rows (output logprobs, cumulative probabilities, NaN
+    detection) are followed by the rank-0 broadcast that decides the emitted
+    token.
 
     Requires bf16 or fp32 logits and ``vocab_size >= 512`` (its top-k
     reduction's minimum)."""

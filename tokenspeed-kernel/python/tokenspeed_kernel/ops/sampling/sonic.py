@@ -612,17 +612,22 @@ def verify(
             ``draft_probs``), or None for point-draw drafts.
         reject_threshold: Recorded probabilities above it mark a slot with
             no proposal: its draft is rejected and the token drawn from ``p``.
+            Required with ``draft_probs``.
 
     Raises:
         ValueError: The logits are neither bf16 nor fp32, a row offset
             would pass ``MAX_OFFSET``, or ``draft_probs`` rows are not dense
-            whole-vocabulary rows.
+            whole-vocabulary rows or come without ``reject_threshold``.
     """
     _check_offsets(logits, scratchpad)
     exact = _exact(logits)
     rows, vocab_size = logits.shape
     batch_size, timesteps = drafted.shape
     stride_c = state.decode_counts.stride(0)
+    if draft_probs is not None and reject_threshold is None:
+        raise ValueError(
+            "sonic reads draft_probs with the no-proposal sentinel: pass reject_threshold"
+        )
     if draft_probs is not None and (
         draft_probs.dtype != torch.float32
         or draft_probs.shape[1] < timesteps - 1
