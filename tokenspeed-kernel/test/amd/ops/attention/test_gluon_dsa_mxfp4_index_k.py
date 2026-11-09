@@ -18,15 +18,16 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""GFX950 DSA scoring of E4M3 queries over mxfp4 index-K pages.
+"""GFX950 DSA scoring of mxfp4 queries over mxfp4 index-K pages.
 
 Each page holds 64 rows of 64 nibble-packed E2M1 code bytes, then each row's
 four UE8M0 scales as one 4-byte word: DSV4.1's 68-byte index rows, page
-planar. The writer must match DSV4.1's ``cache_pack`` byte for byte; the
-decode, prefill and owned-page scorers must score as FP32 over the E4M3
-queries and the ``cache_unpack`` keys (E2M1 times a power of two is exact, so
-only the summation order differs); and the facades must reach them only when
-the caller names the format, a bare uint8 plane staying fp8_scaled.
+planar. The writer and the query quantizer must match DSV4.1's ``cache_pack``
+byte for byte; the decode, prefill and owned-page scorers must score as FP32
+over the ``cache_unpack`` queries and keys (E2M1 times a power of two is
+exact, so only the summation order differs); a query must meet only its own
+format's pages; and the facades must reach them only when the caller names
+the format, a bare uint8 plane staying fp8_scaled.
 """
 
 from __future__ import annotations
@@ -67,6 +68,17 @@ def _mxfp4_plane(keys: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return plane.contiguous(), cache_unpack(packed.view(-1, 68), "index", None).float()
 
 
+def _mxfp4_query(
+    tokens: int, heads: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """mxfp4 query codes and scale words, and the queries they dequantize to."""
+    q = torch.randn(tokens, heads, _DIM, device="cuda", dtype=torch.bfloat16) * 3
+    codes, scales = dsa_ops.dsa_quantize_index_query_mxfp4(q)
+    packed = cache_pack(q.reshape(-1, _DIM), "index", None)
+    values = cache_unpack(packed, "index", None).float().view(tokens, heads, _DIM)
+    return codes, scales, values
+
+
 def _fp8_query(tokens: int, heads: int) -> tuple[torch.Tensor, torch.Tensor]:
     q = torch.randn(tokens, heads, _DIM, device="cuda", dtype=torch.bfloat16)
     codes, scales = quantize_fp8(
@@ -75,9 +87,9 @@ def _fp8_query(tokens: int, heads: int) -> tuple[torch.Tensor, torch.Tensor]:
     return codes.view(tokens, heads, _DIM), scales.view(tokens, heads).contiguous()
 
 
-def _reference(q, q_scales, weights, keys):
-    dots = torch.einsum("thd,nd->thn", q.float(), keys)
-    return _SCALE * (torch.relu(dots) * (weights * q_scales)[:, :, None]).sum(1)
+def _reference(values, weights, keys):
+    dots = torch.einsum("thd,nd->thn", values, keys)
+    return _SCALE * (torch.relu(dots) * weights[:, :, None]).sum(1)
 
 
 def _assert_scores(got: torch.Tensor, want: torch.Tensor) -> None:
@@ -131,6 +143,52 @@ def test_writer_matches_dsv41_codec(dtype, masked):
     assert torch.equal(buf.view(pages, -1), want)
 
 
+def test_query_quantizer_matches_dsv41_codec():
+    torch.manual_seed(5)
+    q = torch.randn(37, 64, 160, device="cuda", dtype=torch.bfloat16)[..., :_DIM]
+    q = q * torch.logspace(-3, 3, 64, device="cuda").to(torch.bfloat16)[:, None]
+    codes, scales = dsa_ops.dsa_quantize_index_query_mxfp4(q)
+    packed = cache_pack(q.reshape(-1, _DIM).float(), "index", None).view(37, 64, 68)
+    assert codes.shape == (37, 64, 64) and codes.dtype == torch.uint8
+    assert scales.shape == (37, 64) and scales.dtype == torch.int32
+    assert torch.equal(codes, packed[..., :64])
+    assert torch.equal(scales.view(torch.uint8).view(37, 64, 4), packed[..., 64:])
+
+
+def test_queries_meet_only_their_own_pages():
+    plane, _ = _mxfp4_plane(
+        torch.randn(4 * _PAGE, _DIM, device="cuda", dtype=torch.bfloat16)
+    )
+    fp8_plane = torch.zeros(4 * _PAGE, 132, device="cuda", dtype=torch.uint8)
+    seq_lens = torch.tensor([200], device="cuda", dtype=torch.int32)
+    table = torch.arange(4, device="cuda", dtype=torch.int32)[None]
+    weights = torch.rand(1, 32, device="cuda")
+    fp8_q, fp8_scales = _fp8_query(1, 32)
+    codes, scales, _ = _mxfp4_query(1, 32)
+    common = dict(page_size=_PAGE, topk=2048, softmax_scale=_SCALE)
+    with pytest.raises(TypeError, match="mxfp4"):
+        sparse_mla.launch_gluon_dsa_decode_topk_fp8_rows_gfx950(
+            fp8_q,
+            weights,
+            seq_lens,
+            table,
+            index_k_cache=plane,
+            q_scales=fp8_scales,
+            index_k_format="mxfp4",
+            **common,
+        )
+    with pytest.raises(TypeError, match="mxfp4"):
+        sparse_mla.launch_gluon_dsa_decode_topk_fp8_rows_gfx950(
+            codes,
+            weights,
+            seq_lens,
+            table,
+            index_k_cache=fp8_plane,
+            q_scales=scales,
+            **common,
+        )
+
+
 @pytest.mark.parametrize("heads", [32, 64])
 @pytest.mark.parametrize("q_len", [1, 4])
 def test_decode_scores(captured_logits, heads, q_len):
@@ -143,7 +201,7 @@ def test_decode_scores(captured_logits, heads, q_len):
     table = torch.stack(
         [torch.randperm(pages, device="cuda")[:66] for _ in range(4)]
     ).to(torch.int32)
-    q, q_scales = _fp8_query(4 * q_len, heads)
+    q, q_scales, values = _mxfp4_query(4 * q_len, heads)
     weights = torch.rand(4 * q_len, heads, device="cuda")
     sparse_mla.launch_gluon_dsa_decode_topk_fp8_rows_gfx950(
         q,
@@ -164,12 +222,7 @@ def test_decode_scores(captured_logits, heads, q_len):
         req = row // q_len
         visible = int(seq_lens[req]) - (q_len - 1) + row % q_len
         slots = (table[req].long()[:, None] * _PAGE + offsets).reshape(-1)[:visible]
-        want = _reference(
-            q[row : row + 1],
-            q_scales[row : row + 1],
-            weights[row : row + 1],
-            keys[slots],
-        )
+        want = _reference(values[row : row + 1], weights[row : row + 1], keys[slots])
         _assert_scores(logits[row, :visible], want[0])
 
 
@@ -181,7 +234,7 @@ def test_prefill_scores(captured_logits, heads):
         torch.randn(pages * _PAGE, _DIM, device="cuda", dtype=torch.bfloat16)
     )
     workspace = torch.randperm(pages * _PAGE, device="cuda")[:rows]
-    q, q_scales = _fp8_query(tokens, heads)
+    q, q_scales, values = _mxfp4_query(tokens, heads)
     weights = torch.rand(tokens, heads, device="cuda")
     ends = torch.randint(1, rows + 1, (tokens,), device="cuda", dtype=torch.int32)
     starts = (ends // 3).to(torch.int32)
@@ -201,7 +254,7 @@ def test_prefill_scores(captured_logits, heads):
     (logits,) = captured_logits
     columns = torch.arange(rows, device="cuda")[None]
     live = (columns >= starts[:, None]) & (columns < ends[:, None])
-    want = _reference(q, q_scales, weights, keys[workspace])
+    want = _reference(values, weights, keys[workspace])
     _assert_scores(torch.where(live, logits, 0.0), torch.where(live, want, 0.0))
 
 
@@ -212,7 +265,7 @@ def test_owned_page_scores(rows, requests):
     plane, keys = _mxfp4_plane(
         torch.randn(pages * _PAGE, _DIM, device="cuda", dtype=torch.bfloat16)
     )
-    q, q_scales = _fp8_query(rows, 32)
+    q, q_scales, values = _mxfp4_query(rows, 32)
     weights = torch.rand(rows, 32, device="cuda")
     owned = torch.randperm(pages, device="cuda")[:owned_pages].to(torch.int32)
     table = owned[None].expand(rows, -1).contiguous()
@@ -241,7 +294,7 @@ def test_owned_page_scores(rows, requests):
     slots = (
         owned.long()[:, None] * _PAGE + torch.arange(_PAGE, device="cuda")
     ).reshape(-1)
-    want = _reference(q, q_scales, weights, keys[slots])
+    want = _reference(values, weights, keys[slots])
     live = torch.arange(want.shape[1], device="cuda")[None] < lengths[:, None]
     _assert_scores(torch.where(live, logits, 0.0), torch.where(live, want, 0.0))
 
@@ -252,7 +305,7 @@ def test_facades_select_mxfp4_only_when_named():
     plane, keys = _mxfp4_plane(
         torch.randn(pages * _PAGE, _DIM, device="cuda", dtype=torch.bfloat16)
     )
-    q, q_scales = _fp8_query(reqs, 32)
+    q, q_scales, values = _mxfp4_query(reqs, 32)
     weights = torch.rand(reqs, 32, device="cuda")
     seq_lens = torch.tensor([5000, 3100], device="cuda", dtype=torch.int32)
     table = torch.stack(
@@ -274,12 +327,9 @@ def test_facades_select_mxfp4_only_when_named():
     for req in range(reqs):
         slots = (table[req].long()[:, None] * _PAGE + offsets).reshape(-1)
         slots = slots[: int(seq_lens[req])]
-        scores = _reference(
-            q[req : req + 1],
-            q_scales[req : req + 1],
-            weights[req : req + 1],
-            keys[slots],
-        )[0]
+        scores = _reference(values[req : req + 1], weights[req : req + 1], keys[slots])[
+            0
+        ]
         kth = scores.topk(2048).values[-1]
         assert int(lens[req]) == 2048
         chosen = indices[req].long()
