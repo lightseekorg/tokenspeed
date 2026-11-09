@@ -109,13 +109,6 @@ With the switch off, floating GDN checkpoint projections stay floating even
 with a global online FP8 config. Serialized GDN projections use the
 checkpoint config.
 
-#### Small-M DeepGEMM
-
-For packed projections with `N <= 4096` and `K >= 4096`, FlashInfer autotuning
-compares native SM grids and batched split-K at `M=1/2/4/8/16/32`. Split-K uses
-views of the codes and packed scales and reduces FP32 partials to BF16.
-CUDA Graph capture reads cached tactics by shape, layout and PDL mode. Larger M and uncached shapes use the native DeepGEMM heuristic.
-
 #### Projection fusion
 
 With packed DeepGEMM scales, eligible BF16 output projections fuse activation

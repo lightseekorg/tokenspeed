@@ -68,24 +68,6 @@ def block_fp8_mm(
     import deep_gemm
 
     if a_scale.dtype == torch.int32:
-        # Narrow, long-K output projections can underfill the default cluster
-        # layout. Keep prefill native and profile small-M tactics at startup.
-        if b.shape[0] <= 4096 and a.shape[1] >= 4096:
-            from tokenspeed_kernel._optional import has_optional_package
-
-            if has_optional_package("flashinfer"):
-                from tokenspeed_kernel.thirdparty.deepgemm_small_m import (
-                    block_fp8_mm_tuned,
-                )
-
-                return block_fp8_mm_tuned(
-                    a,
-                    b,
-                    a_scale,
-                    b_scale,
-                    out,
-                    enable_pdl=enable_pdl,
-                )
         deep_gemm.set_pdl(enable_pdl)
         deep_gemm.fp8_gemm_nt(
             (a, a_scale),
