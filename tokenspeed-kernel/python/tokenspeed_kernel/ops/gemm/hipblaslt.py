@@ -18,12 +18,14 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Offline-tuned hipBLASLt solutions for dense GEMMs on ROCm.
+"""Offline-tuned BLAS solutions (TunableOp) for dense GEMMs on ROCm.
 
-hipBLASLt's heuristic picks one solution per GEMM shape. For skinny shapes,
-such as speculative-decoding verify projections, a measured solution can
-be much faster. PyTorch's TunableOp can replay measured solutions from a
-results file. This module loads such a file read-only:
+On ROCm, ``torch.mm`` takes the hipBLASLt heuristic's solution for each GEMM
+shape. For skinny shapes, such as speculative-decoding verify projections, a
+measured solution can be much faster. PyTorch's TunableOp times both
+hipBLASLt and rocBLAS solutions, and can replay the fastest one from a results
+file, so a tuned file can list solutions from either library. This module
+loads such a file read-only:
 
 * lookups only, so serving never tunes;
 * GEMM shapes the file does not list keep PyTorch's default solution;
@@ -82,7 +84,7 @@ def _current_validators() -> dict[str, str]:
 
 
 def load_hipblaslt_tuned_solutions(path: str) -> bool:
-    """Replay the hipBLASLt solutions measured in a TunableOp results file.
+    """Replay the BLAS solutions (hipBLASLt or rocBLAS) in a TunableOp results file.
 
     Process-wide: every later ``torch.mm``-family GEMM whose shape, layout
     and dtype the file lists uses the recorded solution; other GEMMs keep
@@ -100,12 +102,12 @@ def load_hipblaslt_tuned_solutions(path: str) -> bool:
     """
     tunable = torch.cuda.tunable
     if torch.version.hip is None:
-        logger.warning(f"Ignoring hipBLASLt tuned solutions {path}: not a ROCm build")
+        logger.warning(f"Ignoring tuned BLAS solutions {path}: not a ROCm build")
         return False
     try:
         expected = hipblaslt_file_validators(path)
     except OSError as e:
-        logger.warning(f"Ignoring hipBLASLt tuned solutions {path}: {e}")
+        logger.warning(f"Ignoring tuned BLAS solutions {path}: {e}")
         return False
     # Lookups only: no tuning on a miss and no untuned-shape log. TunableOp
     # rewrites its file at exit only when it tuned something new, so the file
@@ -126,16 +128,16 @@ def load_hipblaslt_tuned_solutions(path: str) -> bool:
     if not expected or mismatch or missing:
         tunable.enable(False)
         logger.warning(
-            f"Ignoring hipBLASLt tuned solutions {path}: made for a different "
+            f"Ignoring tuned BLAS solutions {path}: made for a different "
             f"stack (file vs running: {mismatch}, unstamped: {missing}); "
             "using default solutions"
         )
         return False
     if not tunable.read_file(path):
         tunable.enable(False)
-        logger.warning(f"Could not load hipBLASLt tuned solutions {path}")
+        logger.warning(f"Could not load tuned BLAS solutions {path}")
         return False
-    logger.info(f"Loaded {len(tunable.get_results())} hipBLASLt tuned solutions")
+    logger.info(f"Loaded {len(tunable.get_results())} tuned BLAS solutions (TunableOp)")
     return True
 
 
@@ -194,7 +196,8 @@ def tune_hipblaslt_solutions(
 
 def _main() -> None:
     parser = argparse.ArgumentParser(
-        description="Tune hipBLASLt solutions for dense projections "
+        description="Tune BLAS solutions (hipBLASLt and rocBLAS, via TunableOp) "
+        "for dense projections "
         "(writes a file for load_hipblaslt_tuned_solutions)."
     )
     parser.add_argument(

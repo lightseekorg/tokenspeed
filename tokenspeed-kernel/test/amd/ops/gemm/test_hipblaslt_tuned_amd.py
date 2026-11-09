@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Offline-tuned hipBLASLt solutions: loading, stack check and numerics."""
+"""Offline-tuned TunableOp BLAS solutions: loading, stack check and numerics."""
 
 from __future__ import annotations
 

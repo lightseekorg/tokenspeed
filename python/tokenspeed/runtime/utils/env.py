@@ -374,9 +374,9 @@ class Envs:
     TOKENSPEED_MODEL_REDIRECT_PATH = EnvStr(None)
     TOKENSPEED_MOE_PADDING = EnvBool(False)
     TOKENSPEED_MOE_CONFIG_DIR = EnvStr(None)
-    # ROCm: TunableOp results file of offline-tuned hipBLASLt GEMM solutions,
-    # replayed read-only for the GEMMs it lists; unset keeps hipBLASLt's own
-    # choice. See tokenspeed_kernel.ops.gemm.hipblaslt.
+    # ROCm: TunableOp results file of offline-tuned BLAS GEMM solutions
+    # (hipBLASLt or rocBLAS), replayed read-only for the GEMMs it lists; unset
+    # keeps the default choice. See tokenspeed_kernel.ops.gemm.hipblaslt.
     TOKENSPEED_HIPBLASLT_TUNED_FILE = EnvStr(None)
     # "uniform" routes each token to a fixed random set of experts, so dummy
     # weights spread MoE traffic like a trained router does.
