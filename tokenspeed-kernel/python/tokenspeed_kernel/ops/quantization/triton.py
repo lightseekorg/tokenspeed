@@ -2119,3 +2119,58 @@ register_triton_warmup(
     _fp8_group32_ue8m0_quantize_swizzled,
     variants=({"GROUPS": (4, 16, 32, 64)},),
 )
+
+
+@register_kernel(
+    "quantization",
+    "output_fp8_packed",
+    name="triton_output_fp8_packed",
+    solution="triton",
+    capability=CapabilityRequirement(
+        vendors=frozenset({"nvidia"}),
+        min_arch_version=ArchVersion(10, 0),
+        max_arch_version=ArchVersion(10, 3),
+    ),
+    signatures=format_signatures("x", "dense", {torch.bfloat16}),
+    priority=Priority.PERFORMANT,
+)
+def triton_output_fp8_packed(x, z, weight, *, head_dim, eps, sigmoid_gate, enable_pdl):
+    from tokenspeed_kernel.ops.quantization._triton.output_fp8 import launch
+
+    return launch(
+        x,
+        z,
+        weight,
+        head_dim=head_dim,
+        eps=eps,
+        sigmoid_gate=sigmoid_gate,
+        enable_pdl=enable_pdl,
+    )
+
+
+@register_kernel(
+    "quantization",
+    "add_rmsnorm_fp8_block",
+    name="triton_add_rmsnorm_fp8_block",
+    solution="triton",
+    capability=CapabilityRequirement(
+        vendors=frozenset({"nvidia"}),
+        min_arch_version=ArchVersion(10, 0),
+        max_arch_version=ArchVersion(10, 3),
+    ),
+    signatures=format_signatures("x", "dense", {torch.bfloat16}),
+    priority=Priority.PERFORMANT,
+)
+def triton_add_rmsnorm_fp8_block(
+    x, residual, weight, *, eps, scale_encoding, enable_pdl
+):
+    from tokenspeed_kernel.ops.quantization._triton.input_fp8 import launch
+
+    return launch(
+        x,
+        residual,
+        weight,
+        eps=eps,
+        scale_encoding=scale_encoding,
+        enable_pdl=enable_pdl,
+    )

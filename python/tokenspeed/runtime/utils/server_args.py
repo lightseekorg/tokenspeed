@@ -3484,9 +3484,9 @@ class ServerArgs:
             "--enable-fp8-attn-proj",
             action="store_true",
             default=ServerArgs.enable_fp8_attn_proj,
-            help="Use online block-FP8 full-attention QKV/O and GDN QKVZ/output "
-            "projections for Qwen3.5/Qwen4-Exp, keeping GDN BA in floating precision. "
-            "Requires floating attention weights; MoE quantization is unchanged.",
+            help="Use online block-FP8 QKV/O and GDN QKVZ/output projections "
+            "in the Qwen3.5/Qwen4-Exp target model. GDN BA uses floating precision "
+            "and MTP draft projections follow the checkpoint.",
         )
         parser.add_argument(
             "--dense-gemm-backend",

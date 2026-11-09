@@ -79,54 +79,58 @@ its request partition is invalidated before another PD owner uses it.
 | `--mamba-ssm-dtype` | Stored linear-attention recurrent state dtype (GDN and KDA): `float32` (default) or `bfloat16`. Scans still accumulate in FP32; `bfloat16` halves state memory. |
 | `--quantization` | Weight quantization mode such as `fp8`, `nvfp4`, `w8a8_fp8`, or `compressed-tensors`. |
 | `--quantization-param-path` | JSON file of FP8 KV cache scaling factors, read only under an FP8 KV cache. KV caches run unscaled, so every factor must be 1.0, as must any KV-cache scale the checkpoint carries. |
-| `--enable-fp8-attn-proj` | Opt-in online block-FP8 full-attention QKV/O and GDN QKVZ/output projections for Qwen3.5 and Qwen4-Exp. GDN BA projections keep the model's floating dtype. |
+| `--enable-fp8-attn-proj` | Enable online FP8 QKV/O and GDN QKVZ/output projections in the Qwen3.5 or Qwen4-Exp target model. Off by default. |
 
-The Qwen projection switch defaults to off. It accepts
-an unquantized checkpoint (including an existing online FP8 config), or an
-NVFP4 checkpoint whose selected attention projections are all excluded from
-weight quantization. Online conversion requires floating projection weights;
-there is no per-projection validation of the checkpoint's exclusion list.
-Existing FP8 configs are reused, including serialized FP8 checkpoint configs.
+### Qwen FP8 attention projections
 
-Weights are quantized once after loading with 128x128 block scales. Each
-linear dynamically quantizes its input in groups of 128 channels per token
-and returns the model's floating activation dtype. The existing
-`--dense-gemm-backend` selects the GEMM implementation. Attention cores,
-KV-cache formats, GDN states, and TP communication keep their existing
-contracts. The switch applies to the corresponding target and draft layers.
+Online conversion uses floating target projection weights from an unquantized
+checkpoint or an NVFP4 checkpoint that excludes those projections. Existing FP8
+configs are reused, including serialized FP8 configs. MTP draft
+projections follow the checkpoint.
 
-On SM100/SM103, `--dense-gemm-backend deepgemm` requantizes block-FP8 dense
-weights to UE8M0 once after loading. Activations are quantized directly into
-DeepGEMM's packed int32 scale layout, including PDL and CUDA Graph support.
-This changes quantization scales; `auto` retains its existing FP32-scale path.
+Group128 quantizes floating weights once after loading with 128×128 block
+scales and dynamically quantizes activation rows in groups of 128 channels.
+The GEMM returns the model's floating activation dtype. On SM100/SM103,
+`--dense-gemm-backend deepgemm` prepares UE8M0 weight scales and writes
+activation scales directly into the packed layout. The `auto` backend uses
+FP32 scales for this online block FP8 path.
 
-`Fp8Config` permits online quantization of GDN QKVZ/output projections by
-default. BA, conv, Mamba mixer projections and grouped `wo_a`
-remain excluded, and explicit checkpoint exclusions still apply. The Qwen
-projection switch selects this ordinary FP8 config for its attention
-projections; there is no separate GDN configuration toggle. The Qwen GDN
-constructor keeps its projections unquantized when this switch is off, even
-with an existing global online FP8 config. Serialized FP8 checkpoints continue
-to use their existing quantization configuration when the switch is off.
-
-With GDN FP8 projections enabled, the input projection is split into an FP8
-QKVZ GEMM and a floating BA GEMM. This keeps the recurrence-control inputs
-out of FP8 and adds a GEMM launch compared with the fully merged floating
-projection. Conv and gated normalization keep their existing precision.
-When an auxiliary CUDA stream is available, block-FP8 QKVZ and floating BA
-run concurrently. Events order both branches after their input and join them
-before GDN consumes the projections; the same dependency graph is captured
-for CUDA Graph replay. PDL remains enabled within each stream when requested,
-and block-FP8 activation quantization follows the global PDL setting.
-For Qwen4-Exp, PLE, hyper-connections, and the QSA indexer retain their
-existing quantization choices.
-
-For an NVFP4 checkpoint with floating attention projections, add the flag
-to the usual launch command to enable both projection groups:
+For an NVFP4 checkpoint with floating attention projections, use
 
 ```bash
 --quantization nvfp4 --enable-fp8-attn-proj
 ```
+
+GDN splits its input into an FP8 QKVZ GEMM and a floating BA GEMM. With an
+auxiliary stream, BA overlaps QKVZ and joins before the attention boundary.
+The standard FP8 exclusions cover BA, convolution, Mamba mixer projections,
+grouped `wo_a` and explicit checkpoint exclusions.
+With the switch off, floating GDN checkpoint projections stay floating even
+with a global online FP8 config. Serialized GDN projections use the
+checkpoint config.
+
+#### Small-M DeepGEMM
+
+For packed projections with `N <= 4096` and `K >= 4096`, FlashInfer autotuning
+compares native SM grids and batched split-K at `M=1/2/4/8/16/32`. Split-K uses
+views of the codes and packed scales and reduces FP32 partials to BF16.
+CUDA Graph capture reads cached tactics by shape, layout and PDL mode. Larger M and uncached shapes use the native DeepGEMM heuristic.
+
+#### Projection fusion
+
+With packed DeepGEMM scales, eligible BF16 output projections fuse activation
+quantization with the full-attention sigmoid gate or GDN per-head RMSNorm and
+SiLU/sigmoid gate. This path preserves the BF16 rounding boundary and supports
+group128, CUDA Graph and PDL. Set `TOKENSPEED_FUSE_FP8_OUTPUT_QUANT=0`
+to use separate launches.
+
+Set `TOKENSPEED_FUSE_FP8_INPUT_QUANT=1` to opt into Qwen3.5 residual add,
+GemmaRMSNorm and FP8 activation quantization for QKV/QKVZ. The fused path
+requires an existing residual, a fused layer boundary and attention TP size 1.
+It writes packed UE8M0 scales for DeepGEMM or group128 FP32 scales for
+FlashInfer/TRTLLM, plus BF16 normalized rows for BA. Qwen4-Exp computes
+hyper-connection mixing between normalization and projection and uses
+separate input quantization.
 
 ## Numerics
 

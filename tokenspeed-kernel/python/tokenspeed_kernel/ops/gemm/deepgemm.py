@@ -37,11 +37,11 @@ from tokenspeed_kernel.signature import (
 )
 from tokenspeed_kernel.thirdparty.deepgemm import (
     block_fp8_mm,
-    prepare_block_fp8_weight,
     fp8_mm,
     fp8_weight_scales,
     grouped_fp8_mm,
     grouped_fp8_weight_scales,
+    prepare_block_fp8_weight,
 )
 
 

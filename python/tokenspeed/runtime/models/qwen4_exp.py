@@ -147,6 +147,7 @@ class _Qwen4ExpRMSNormGated(nn.Module):
     def __init__(self, hidden_size: int, eps: float) -> None:
         super().__init__()
         self.eps = float(eps)
+        self.sigmoid_gate = True
         self.weight = nn.Parameter(torch.ones(hidden_size))
 
     def forward(self, x: torch.Tensor, z: torch.Tensor | None = None) -> torch.Tensor:
@@ -414,7 +415,9 @@ class Qwen4ExpAttentionDecoderLayer(
             is_neox_style=True,
             dtype=torch.get_default_dtype(),
         )
-        fp8_proj = global_server_args_dict["enable_fp8_attn_proj"]
+        fp8_proj = (
+            self.ALLOW_FP8_ATTN_PROJ and global_server_args_dict["enable_fp8_attn_proj"]
+        )
         attn_quant_config = _get_attn_proj_quant_config(
             quant_config,
             enabled=fp8_proj,
@@ -498,11 +501,17 @@ class Qwen4ExpAttentionDecoderLayer(
             if self.indexer is not None
             else None
         )
+        fuse_output_quant = self._should_fuse_output_quant(gate)
         attention_output = self._attn(
-            positions, q, k, v, gate, ctx, topk_indices=selected_slots
+            positions,
+            q,
+            k,
+            v,
+            None if fuse_output_quant else gate,
+            ctx,
+            topk_indices=selected_slots,
         )
-        output, _ = self.o_proj(attention_output)
-        return output
+        return self._project_output(attention_output, gate, fuse_output_quant)
 
     def forward(
         self,

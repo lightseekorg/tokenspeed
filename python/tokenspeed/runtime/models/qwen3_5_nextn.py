@@ -77,6 +77,9 @@ class Qwen3_5DraftAttentionDecoderLayer(Qwen3_5AttentionDecoderLayer):
     that assert ``not is_mixed()`` at metadata init are not supported.
     """
 
+    # Draft projections retain the checkpoint quantization policy.
+    ALLOW_FP8_ATTN_PROJ = False
+
     def _attn(
         self,
         positions: torch.Tensor,

@@ -16,11 +16,16 @@
 # SOFTWARE.
 from __future__ import annotations
 
+from functools import cache
 from typing import Literal
 
 import torch
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
-from tokenspeed_kernel.selection import SelectedKernel, select_kernel
+from tokenspeed_kernel.selection import (
+    NoKernelFoundError,
+    SelectedKernel,
+    select_kernel,
+)
 from tokenspeed_kernel.signature import (
     dense_format_signature,
     dense_tensor_format,
@@ -29,6 +34,8 @@ from tokenspeed_kernel.signature import (
 
 __all__ = [
     "quantize_fp8",
+    "output_fp8_quant_pack",
+    "add_rmsnorm_quantize_fp8_block",
     "quantize_fp8_with_gate",
     "quantize_fp8_with_scale",
     "rmsnorm_quantize_fp8",
@@ -890,3 +897,154 @@ from tokenspeed_kernel.ops.quantization.triton import (  # noqa: E402
     triton_rmsnorm_quantize_fp8,
     triton_silu_and_mul_quantize_fp8,
 )
+
+
+def output_fp8_quant_pack(
+    x: torch.Tensor,
+    z: torch.Tensor,
+    weight: torch.Tensor | None,
+    *,
+    head_dim: int,
+    eps: float,
+    sigmoid_gate: bool,
+    enable_pdl: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fuse an output gate, optional per-head RMSNorm, and group128 DeepGEMM quant-pack.
+
+    Args:
+        x: BF16 [M,K] activations, unit inner stride.
+        z: BF16 gate, [M,K] or [M,H,D]; rows/heads may be strided.
+        weight: BF16 [head_dim] norm weight, or None for sigmoid-mul only.
+        head_dim: Power-of-two head width, divisible by 128.
+        eps: RMSNorm epsilon; unused without weight.
+        sigmoid_gate: True for sigmoid, False for SiLU after RMSNorm.
+        enable_pdl: Wait for the producer and signal dependent launches.
+
+    Returns:
+        E4M3 [M,K] codes and int32 packed UE8M0 [M,ceil(K/512)]
+        scales with strides [1,round_up(M,4)]. Padding is zero. The norm/gate
+        result rounds to BF16 before quantization, matching separate launches.
+    """
+    if (
+        x.ndim != 2
+        or x.dtype != torch.bfloat16
+        or not x.is_cuda
+        or x.stride(-1) != 1
+        or head_dim < 128
+        or head_dim & (head_dim - 1)
+        or x.shape[1] % head_dim
+        or x.shape[1] % 128
+    ):
+        raise ValueError("requires BF16 [M,K], K%128=0, and aligned power-of-two heads")
+    expected = (
+        x.shape if z.ndim == 2 else (x.shape[0], x.shape[1] // head_dim, head_dim)
+    )
+    if (
+        z.shape != expected
+        or z.dtype != x.dtype
+        or z.device != x.device
+        or z.stride(-1) != 1
+    ):
+        raise ValueError("gate must match the activation with unit inner stride")
+    if weight is not None and (
+        weight.shape != (head_dim,)
+        or weight.dtype != x.dtype
+        or weight.device != x.device
+        or not weight.is_contiguous()
+    ):
+        raise ValueError(
+            "norm weight must be contiguous BF16 [head_dim] on the input device"
+        )
+    if weight is None and not sigmoid_gate:
+        raise ValueError("the unnormalized output gate must be sigmoid")
+    kernel = select_kernel(
+        "quantization",
+        "output_fp8_packed",
+        format_signature(x=dense_tensor_format(x.dtype)),
+        traits={},
+        override=None,
+        solution=None,
+    )
+    return kernel(
+        x,
+        z,
+        weight,
+        head_dim=head_dim,
+        eps=eps,
+        sigmoid_gate=sigmoid_gate,
+        enable_pdl=enable_pdl,
+    )
+
+
+def add_rmsnorm_quantize_fp8_block(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    eps: float,
+    scale_encoding: Literal["float32", "packed_ue8m0"],
+    enable_pdl: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fuse residual add, GemmaRMSNorm and group128 FP8, retaining BF16 rows.
+
+    Args:
+        x: BF16 [M,K] addend with dense columns; replaced by normalized rows.
+        residual: BF16 [M,K] residual, updated in place with the BF16 sum.
+            Normalization uses the unrounded FP32 sum, matching add_rmsnorm.
+        weight: BF16 [K] Gemma weight; the multiplier is 1 + weight in FP32.
+        eps: RMSNorm epsilon.
+        scale_encoding: Canonical FP32 scales or DeepGEMM packed UE8M0.
+        enable_pdl: Wait for producers and signal dependent launches.
+
+    Returns:
+        (normalized BF16 x, E4M3 codes, scales, updated residual). FP32 scales
+        are [M,K/128]; packed int32 scales are [M,ceil(K/512)]
+        with strides [1,round_up(M,4)] and zero row/K padding. Quantization
+        reads the BF16 normalized value, preserving the separate-call boundary.
+    """
+    if (
+        x.ndim != 2
+        or x.dtype != torch.bfloat16
+        or not x.is_cuda
+        or x.stride(1) != 1
+        or x.shape[1] % 128
+        or residual.shape != x.shape
+        or residual.dtype != x.dtype
+        or residual.device != x.device
+        or residual.stride(1) != 1
+        or weight.shape != (x.shape[1],)
+        or weight.dtype != x.dtype
+        or weight.device != x.device
+        or not weight.is_contiguous()
+        or scale_encoding not in ("float32", "packed_ue8m0")
+    ):
+        raise ValueError(
+            "requires BF16 [M,K], K%128=0, matching residual/weight and supported group scales"
+        )
+    kernel = select_kernel(
+        "quantization",
+        "add_rmsnorm_fp8_block",
+        format_signature(x=dense_tensor_format(x.dtype)),
+    )
+    return kernel(
+        x,
+        residual,
+        weight,
+        eps=eps,
+        scale_encoding=scale_encoding,
+        enable_pdl=enable_pdl,
+    )
+
+
+@cache
+def has_add_rmsnorm_quantize_fp8_block() -> bool:
+    """Whether the registry provides the BF16 add/norm/block-FP8 producer."""
+    try:
+        select_kernel(
+            "quantization",
+            "add_rmsnorm_fp8_block",
+            format_signature(x=dense_tensor_format(torch.bfloat16)),
+        )
+    except NoKernelFoundError:
+        return False
+    return True

@@ -114,6 +114,9 @@ def _build_mtp_lm_head(config, mapping: Mapping, quant_config, prefix: str):
 class Qwen4ExpDraftAttentionDecoderLayer(Qwen4ExpAttentionDecoderLayer):
     """Qwen4-Exp draft attention that removes dead catch-up rows on step zero."""
 
+    # Draft projections retain the checkpoint quantization policy.
+    ALLOW_FP8_ATTN_PROJ = False
+
     def _attn(
         self,
         positions: torch.Tensor,
