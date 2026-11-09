@@ -48,6 +48,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
+from tokenspeed_kernel.ops.attention.dsa import cute_dsl as dsa_cute_dsl
 from tokenspeed_kernel.ops.attention.mla import mla_project_value
 from tokenspeed_kernel.ops.gemm import kimi3_mla_gate_projection, mm
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
@@ -214,7 +215,8 @@ def _fused_decode_topk_solution(indexer: KimiK31Indexer) -> str | None:
     """``"cute_dsl"`` where the fused decode top-k serves this indexer, else None.
 
     It serves BF16 queries, and the E4M3 ones the index-K write quantizes, over
-    a packed ``fp8_scaled`` plane, 1-8 rows per request. It scores
+    a packed ``fp8_scaled`` plane, 1-8 rows per request, and is pinned only
+    where ``max_num_seqs`` fits the requests one of its rounds schedules. It scores
     bit-identically to the DeepGEMM leaf and gives exact ties at the threshold
     the lowest positions.
     """
@@ -247,6 +249,9 @@ def _fused_decode_topk_solution(indexer: KimiK31Indexer) -> str | None:
                 solution="cute_dsl",
             )
     except NoKernelFoundError:
+        return None
+    max_requests = int(global_server_args_dict["max_num_seqs"] or 0)
+    if max_requests > dsa_cute_dsl.FUSED_DECODE_TOPK_MAX_REQUESTS:
         return None
     return "cute_dsl"
 

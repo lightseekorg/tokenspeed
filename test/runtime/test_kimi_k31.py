@@ -1472,6 +1472,25 @@ def test_decode_topk_keeps_the_best_topk_of_a_longer_history() -> None:
 
 
 @requires_gpu
+def test_the_fused_decode_topk_is_pinned_only_where_every_round_fits(
+    monkeypatch,
+) -> None:
+    """More requests per round than the fused top-k takes keep normal selection."""
+    from tokenspeed_kernel.ops.attention.dsa import cute_dsl as dsa_cute_dsl
+
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    cap = dsa_cute_dsl.FUSED_DECODE_TOPK_MAX_REQUESTS
+    monkeypatch.setitem(global_server_args_dict, "max_num_seqs", cap)
+    if _indexer_attention(index_topk=2048).decode_topk_solution is None:
+        pytest.skip("needs the fused decode top-k (SM100-SM103)")
+    monkeypatch.setitem(global_server_args_dict, "max_num_seqs", cap + 1)
+    attention = _indexer_attention(index_topk=2048)
+    assert attention.decode_topk_solution is None
+    assert not attention.index_k_write_quantizes_query
+
+
+@requires_gpu
 @pytest.mark.parametrize("q_len_per_req", [1, 8])
 def test_decode_topk_scores_the_query_the_index_k_write_quantized(
     q_len_per_req,

@@ -196,6 +196,11 @@ if _ts_supported_arch():
     except ImportError:
         _fused_indexer = None
 
+# Requests one fused decode round schedules (the scorer's tile prefix sum), 0 without it.
+FUSED_DECODE_TOPK_MAX_REQUESTS = (
+    0 if _fused_indexer is None else _fused_indexer.MAX_REQUESTS
+)
+
 # Index-K page: 64 keys of 128 FP8 bytes, then their 64 FP32 scales.
 _FUSED_PAGE = 64
 _FUSED_ROW_BYTES = 128 + 4
@@ -417,10 +422,10 @@ if _fused_indexer is not None:
                 f"q_len_per_req={q_len_per_req} must be 1-8 and divide tokens={tokens}"
             )
         requests = tokens // q_len_per_req
-        if requests > _fused_indexer.MAX_REQUESTS:
+        if requests > FUSED_DECODE_TOPK_MAX_REQUESTS:
             raise ValueError(
                 f"the fused DSA decode top-k schedules at most "
-                f"{_fused_indexer.MAX_REQUESTS} requests, got {requests}"
+                f"{FUSED_DECODE_TOPK_MAX_REQUESTS} requests, got {requests}"
             )
         if int(page_size) != _FUSED_PAGE or q.shape[1:] != (_FUSED_HEADS, 128):
             raise ValueError(
