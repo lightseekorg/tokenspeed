@@ -23,33 +23,22 @@
 KV parallelism shards every request's MLA pages page-cyclically over the KVP
 ranks. DCP decode runs each rank over its owned pages only (a compact local
 page table and one local causal length per query row) and merges the per-rank
-partials by their LSE. This mirrors ``test_flashmla_shards_merge_to_full_attention``
-for the gfx950 Gluon kernels: every rank is emulated on one GPU, and the merge
-must reproduce the unsharded decode over the full page table.
+partials by their LSE. Every rank is emulated on one GPU, and the merge must
+reproduce the unsharded decode over the full page table.
 
 Geometry is Kimi-K3.1's EAGLE-3.1 MLA draft layer: 12 heads per TP rank, so a
 KVP group of ``degree`` ranks attends ``12 * degree`` gathered heads.
 """
-
-import os
-import sys
 
 import pytest
 import torch
 from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (
     virtual_slots_to_local,
 )
-from tokenspeed_kernel.platform import current_platform
+from utils import is_cdna4
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from ci_system.ci_register import register_cuda_ci
-
-register_cuda_ci(est_time=30, suite="runtime-1gpu")
-
-pytestmark = pytest.mark.skipif(
-    not (torch.cuda.is_available() and current_platform().is_cdna4),
-    reason="the Gluon MLA decode kernels require AMD gfx950 (CDNA4)",
-)
+if not is_cdna4():
+    pytest.skip("AMD CDNA4 is required for Gluon MLA tests", allow_module_level=True)
 
 KV_LORA, ROPE, NOPE = 512, 64, 128
 WIDTH = KV_LORA + ROPE

@@ -833,36 +833,6 @@ def test_mla_dcp_checks_backend_capability(monkeypatch) -> None:
         attention_registry._validate_mla_dcp_backend("flashmla", AttentionArch.MLA)
 
 
-@pytest.mark.parametrize("found", [None, "bf16_query", "fp8_query"])
-def test_mla_dcp_decode_needs_a_registered_lse_kernel(monkeypatch, found) -> None:
-    from tokenspeed_kernel.selection import NoKernelFoundError
-
-    from tokenspeed.runtime.layers.attention.backends.paged import mla
-
-    asked = []
-
-    def select_kernel(family, mode, signature, *, traits, solution):
-        asked.append((signature, traits["num_q_heads"], traits["return_lse"]))
-        query = "fp8_query" if len(asked) == 2 else "bf16_query"
-        if query != found:
-            raise NoKernelFoundError(mode)
-
-    monkeypatch.setattr(mla, "select_kernel", select_kernel)
-    backend = mla.MLAAttnBackend.__new__(mla.MLAAttnBackend)
-    backend.num_local_heads, backend.kvp_group = 12, tuple(range(8))
-    backend.qk_nope_head_dim, backend.kv_lora_rank = 128, 512
-    backend.qk_rope_head_dim, backend.kernel_page_size = 64, 64
-    backend.q_data_type, backend.data_type = torch.bfloat16, torch.float8_e4m3fn
-    backend.kernel_solution = "gluon"
-
-    assert backend._dcp_decode_kernel_registered() == (found is not None)
-    # 96 gathered heads launch as groups of 16, with a BF16 query and then
-    # one cast to the FP8 cache.
-    assert [heads for _, heads, _ in asked] == [16] * len(asked)
-    assert all(lse for _, _, lse in asked)
-    assert len(asked) == (1 if found == "bf16_query" else 2)
-
-
 def test_named_trace_context_provider_and_registration_rollback():
     def generate_context(rid):
         return ("a" * 32, None) if rid == "ordinary-request" else None

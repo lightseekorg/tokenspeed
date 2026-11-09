@@ -28,9 +28,6 @@ from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (
     _vector_layout,
 )
 
-# Measured on MI350X over 8 x 2048 gathered candidates per row: 13.5 us per
-# launch with these digits and warps, 19.3 us with the merge top-k's 12-12-8
-# digits (twice the buckets to scan per pass), 18.9 us with 4 warps.
 _RADIX_SCHEDULE = (11, 11, 10)
 _NUM_WARPS = 8
 # A row's candidates from every rank stay in registers: 32 per lane.

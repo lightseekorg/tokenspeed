@@ -705,7 +705,7 @@ step than the EAGLE3 draft. The index-K planes make a K3.1 cache block about
 of 50K input and 500 output tokens run at once.
 
 ```bash
-tokenspeed serve moonshotai/Kimi-K3.1-Pro \
+GPU_MAX_HW_QUEUES=2 tokenspeed serve moonshotai/Kimi-K3.1-Pro \
   --served-model-name kimi-k3.1 \
   --trust-remote-code \
   --max-model-len 65536 \
@@ -731,6 +731,9 @@ tokenspeed serve moonshotai/Kimi-K3.1-Pro \
   `mla` backend select the kernels.
 - Prefill runs eager on gfx950: the DSA backend replays prefill CUDA graphs on
   NVIDIA only.
+- `GPU_MAX_HW_QUEUES=2` gives each stream priority one hardware queue per
+  compute pipe. With ROCm's default of 4, two queues share a pipe, so
+  prefill's high-priority side kernels can wait behind the forward's GEMMs.
 - Optionally, add `--kv-parallel-size 8 --decode-context-parallel-size 8` for
   long contexts or many concurrent requests. Each GPU then stores one eighth of
   every request's full-attention pages, so about 55 requests of 50K input and
