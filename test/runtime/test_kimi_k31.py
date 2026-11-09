@@ -1218,7 +1218,7 @@ def test_the_decode_chain_projection_carries_the_index_keys_and_head_weights() -
 def test_the_fused_query_projection_matches_the_two_gemms(monkeypatch) -> None:
     """One GEMM over ``q_norm`` for ``q_b_proj`` and the indexer's ``wq_b``
     gives the two projections, keeps tracking in-place loads into either
-    parameter, and is skipped under bitwise numerics."""
+    parameter across a repeated fusion, and is skipped under bitwise numerics."""
     from tokenspeed_kernel.ops.gemm import mm
 
     from tokenspeed.runtime.utils.env import global_server_args_dict
@@ -1258,6 +1258,9 @@ def test_the_fused_query_projection_matches_the_two_gemms(monkeypatch) -> None:
         atol=2e-3,
         rtol=1.6e-2,
     )
+    attention.fuse_query_projections()
+    assert attention.q_b_wq_b_weight is fused
+    assert attention.q_b_proj.weight.data_ptr() == fused.data_ptr()
 
     bitwise = _indexer_attention(index_topk=2048)
     monkeypatch.setitem(global_server_args_dict, "numerics", "rl-bitwise")

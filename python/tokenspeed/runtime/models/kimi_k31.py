@@ -413,13 +413,15 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
         index_heads * index_head_dim, q_lora_rank]`` weight, as
         ``KimiK31Indexer.fuse_key_weight_projections`` stacks ``wk``, for
         decode rounds to project both from ``q_norm`` in one GEMM. The two
-        parameters become views of its rows. Bitwise numerics and a quantized
-        ``q_b_proj`` keep the separate GEMMs."""
+        parameters become views of its rows, so later in-place weight loads keep
+        it current, and a repeated call (a weight update's) keeps it. Bitwise
+        numerics and a quantized ``q_b_proj`` keep the separate GEMMs."""
         q_b, wq_b = self.q_b_proj.weight, self.indexer.wq_b.weight
         if (
             global_server_args_dict["numerics"] in BITWISE_ENVELOPES
             or q_b.dtype != torch.bfloat16
             or wq_b.dtype != torch.bfloat16
+            or self.q_b_wq_b_weight is not None
         ):
             return
         rows = q_b.shape[0]
