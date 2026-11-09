@@ -967,6 +967,32 @@ process-local shutdown latch: once cleanup starts, later rank notifications
 cannot interrupt it. Signal callbacks do not log or enumerate processes;
 cleanup runs outside the callback.
 
+### Startup requests
+
+Model warmup runs the model alone on a probe cache. It never reaches the
+request bookkeeping (input preparation, accepted-state commits), and the
+final cache can change kernel specializations it did prepare. With
+`--enable-startup-requests` the host closes both gaps before it registers:
+the loop starts with no frontend and `EventLoop::warm_up` serves requests of
+its own through the ordinary rounds (admission, planning, the data plane,
+commits), on every rank of the replica as a frontend's would be.
+
+`startup::Limits::phases` sizes them from the engine's limits alone: one
+one-token request, one each of a thirty-second of a prefill chunk, a
+sixteenth, one token more, and three sixteenths (the partial forwards that
+short prompts and a long prompt's last chunk run, aligned and not), one of a
+whole chunk, then `max_num_seqs` requests whose prompts cross one chunk
+boundary, each cut to what ingress
+admits and so the whole batch fits the cache. Each phase runs until every
+rank is idle, then its prefixes are flushed, so serving starts from an
+empty cache. Their outputs go nowhere and kernels prepare their compile
+variants as in model warmup. Only
+then does the host complete the frontend handshake and report ready: no
+client request waits behind them or is timed with them.
+
+A disaggregated node is refused (its requests need a peer), and so is an
+L3 store (the flush would delete its shared namespace).
+
 ## Checklist for extending the loop
 
 * New logic that reacts to scheduler/transfer/cache progress: put it in the
