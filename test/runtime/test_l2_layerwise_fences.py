@@ -32,6 +32,7 @@ landed, the bytes the model saw or kept.
 
 import os
 import sys
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -70,6 +71,7 @@ def host_cache(request, io_backend):
     from tokenspeed.runtime.execution.model_executor import ModelExecutor
     from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
     from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
+    from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
     from tokenspeed.runtime.layers.attention.kv_cache.factory import (
         create_cache_arena,
         create_cache_pool,
@@ -125,6 +127,32 @@ def host_cache(request, io_backend):
         # The K3 drafts (DSpark, DFLASH2) are plain MLA views over the arena.
         recipe = kimi_recipe(draft_layers=1)
         draft_family = "mla"
+    elif family in ("mha", "mha_mxfp8"):
+        # A GQA target with a one-layer GQA draft (DFLASH, DSpark).
+        mxfp8 = family == "mha_mxfp8"
+        attn_config = AttnConfig(
+            kv_cache_dtype=torch.float8_e4m3fn if mxfp8 else torch.bfloat16,
+            kv_cache_mxfp8=mxfp8,
+            kernel_page_size=128,
+            components=(
+                MHAConfig(
+                    backend_name="mha",
+                    num_attention_heads=16,
+                    num_kv_heads=4,
+                    head_dim=128,
+                    attn_tp_size=1,
+                ),
+            ),
+            **model_wide,
+        )
+        recipe = cache_recipe(
+            "mha",
+            model_config=SimpleNamespace(num_attention_layers=2),
+            attn_config=attn_config,
+            draft_model_config=SimpleNamespace(num_attention_layers=1),
+            draft_attn_config=replace(attn_config, is_draft=True),
+            **recipe_args,
+        )
     elif family == "dsa":
         # GLM-5 / DeepSeek-V3.2: MLA latent plus an FP8 index-K plane.
         attn_config = AttnConfig(
@@ -321,6 +349,74 @@ def test_a_draft_context_write_lands_after_its_tail_page_load(host_cache):
     start = page * page_size
     assert torch.equal(latent[start : start + hit].view(torch.uint8), host_rows)
     assert torch.equal(latent[slots].view(torch.uint8), expected)
+
+
+@pytest.mark.parametrize("io_backend", ["kernel", "direct"])
+@pytest.mark.parametrize(
+    "host_cache",
+    [("mha", "full_attention"), ("mha_mxfp8", "full_attention")],
+    ids=["mha", "mha_mxfp8"],
+    indirect=True,
+)
+def test_a_gqa_draft_context_write_lands_after_its_tail_page_load(host_cache):
+    """DFLASH / DSpark GQA drafts inject the target's context into the draft's
+    K/V cache (``set_kv_buffer``) before the draft forward's first layerwise
+    wait. On a Host tail hit the round's rows land in the loaded tail block,
+    whose draft copy lands after every target layer's."""
+    from tokenspeed.runtime.layers.paged_attention import PagedAttention
+
+    cache = host_cache
+    draft = cache.draft_pool
+    page_size = cache.arena.prefix_granularity
+    page, hit = 2, page_size // 2
+    slots = torch.arange(page * page_size + hit, (page + 1) * page_size, device="cuda")
+    generator = torch.Generator(device="cuda").manual_seed(11)
+    k, v = (
+        torch.randn(
+            page_size - hit,
+            draft.head_num,
+            draft.head_dim,
+            dtype=torch.bfloat16,
+            device="cuda",
+            generator=generator,
+        )
+        for _ in range(2)
+    )
+    layer = PagedAttention(
+        draft.head_num,
+        draft.head_dim,
+        1.0,
+        draft.head_num,
+        0,
+        rotary_emb=None,
+        qk_norm=None,
+    )
+    k_rows, v_rows = draft.get_kv_buffer(0)
+    # The rows the write leaves, from the same write into page 3.
+    draft.set_kv_buffer(layer, slots + page_size, k, v)
+    torch.cuda.synchronize()
+    expected = [rows[slots + page_size].view(torch.uint8) for rows in (k_rows, v_rows)]
+    host_rows = [
+        rows[page_size : page_size + hit].view(torch.uint8).clone()
+        for rows in (k_rows, v_rows)
+    ]
+
+    with torch.cuda.stream(cache.executor.load_stream):
+        torch.cuda._sleep(_HOLD_BACK_CYCLES)
+    cache.handle.execute(
+        cache.ts.ExecutionPlan(),
+        None,
+        cache_ops=[cache.LoadBackOp(3, [cache.group], 1, page)],
+    )
+    draft.set_kv_buffer(layer, slots, k, v)
+    draft.get_key_buffer(0)
+    assert not cache.executor.load_stream.query()
+    torch.cuda.synchronize()
+    assert [int(ack.op_id) for ack in cache.handle.poll_cache_results()] == [3]
+    start = page * page_size
+    for rows, host, written in zip((k_rows, v_rows), host_rows, expected):
+        assert torch.equal(rows[start : start + hit].view(torch.uint8), host)
+        assert torch.equal(rows[slots].view(torch.uint8), written)
 
 
 @pytest.mark.parametrize("io_backend", ["kernel", "direct"])
