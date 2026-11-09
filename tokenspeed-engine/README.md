@@ -55,6 +55,14 @@ for a token that came without one, so the column never misaligns with the
 tokens. An older producer defaults this column to empty; older readers skip
 it.
 
+The appended `reasoning_tokens` column is cumulative per request, like
+`completion_tokens`, and excludes reasoning-block delimiters. The control plane
+counts committed token ids before detokenization, including a PD prefill's
+bootstrap token. An older producer defaults the column to empty and its output
+rows report zero; older readers skip the appended column. `ts-client` output
+chunks, the Python chunk dictionaries, and `WireDriver.Completion` expose the
+same cumulative count.
+
 ## Building
 
 Snapshot SDK updates carry a complete publication directory in the optional

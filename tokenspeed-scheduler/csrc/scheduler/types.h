@@ -98,6 +98,9 @@ struct SchedulerConfig {
     std::optional<StorageConfig> storage_config;
     bool enable_kv_cache_events{false};
     bool enable_mixed_prefill_decode{false};
+    // Fused role only: decode rounds owed after a local prefill round
+    // (docs/design/scheduler.md §3.3). 0 is off.
+    std::int32_t prefill_decode_interval{0};
 
     // The P and D roles ARE the cache-transfer PD protocol: there is no
     // disaggregated deployment without it, so everything PD-specific

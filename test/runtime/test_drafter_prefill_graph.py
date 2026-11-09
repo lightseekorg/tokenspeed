@@ -422,7 +422,11 @@ def test_rounds_a_graph_did_not_bake_run_eager(monkeypatch) -> None:
     assert drafter._extend_graph_route(1, dp) is None
     # A query shard of the span.
     shard = QueryShardPlan.from_forward(
-        total_tokens=8, input_lengths=[8], size=2, rank=0
+        total_tokens=8,
+        input_lengths=[8],
+        size=2,
+        rank=0,
+        device=drafter.input_buffers.seq_lens_buf.device,
     )
     sharded = extend_input(drafter, [8], query_shard=shard)
     assert drafter._extend_graph_route(1, sharded) is None

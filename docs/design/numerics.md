@@ -524,6 +524,12 @@ exact conversion) instead of materializing an fp32 copy of the `[rows, vocab]`
 tensor first; because both paths go through the one function, whatever
 rounding the kernel applies is applied to both.
 
+This comparison requires identical logits. With an ordinary unplanned GEMM,
+changing the prompt chunk size can change projection rounding; selecting a
+logprob order alone does not make that GEMM batch invariant. Dispatch tests
+use exactly representable projections to isolate the logprob operation,
+while `rl-bitwise` serving relies on its planned batch-invariant LM head.
+
 Vocabulary-parallel argmax packs the shard maximum and its global index into
 an int64 key, reduced with MAX over the vocabulary group. This portable Triton
 kernel runs on CUDA, ROCm and Ascend; signed zeros have one canonical key so

@@ -1540,7 +1540,7 @@ def _gated_fp8_quantize_kernel(
     tl.store(scale_ptr + row * groups + group, scale, valid_group)
 
 
-@triton.jit(do_not_specialize=["M", "X0"])
+@triton.jit(do_not_specialize=["M", "X0", "SA"])
 def _rmsnorm_fp8_group32_ue8m0(
     X,
     W,
@@ -1549,10 +1549,11 @@ def _rmsnorm_fp8_group32_ue8m0(
     S,
     M,
     X0,
+    SA,
     K: tl.constexpr,
     EPS: tl.constexpr,
     BLOCK: tl.constexpr,
-    SWIZZLED: tl.constexpr,
+    LAYOUT: tl.constexpr,
     PADDED_GROUPS: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
@@ -1580,12 +1581,26 @@ def _rmsnorm_fp8_group32_ue8m0(
             (BLOCK,),
         ).to(tl.float8e4nv)
         tl.store(Q + row * K + col, quantized, col < K)
-        if SWIZZLED:
-            offsets = _fp8_swizzled_scale_offset(row, groups, k_tiles)
+        if LAYOUT == "packed":
+            # Four group bytes form one little-endian int32 word, and the words
+            # are MN-major: word w of this row sits at w * SA + row. Groups past
+            # K/32 contribute zero so a trailing word carries no stale byte.
+            words: tl.constexpr = BLOCK // 128
+            packed = tl.sum(
+                tl.reshape(tl.where(groups < K // 32, exponent, 0), (words, 4))
+                << (tl.arange(0, 4) * 8)[None, :],
+                1,
+            )
+            # SA grows with the token count; widen before multiplying it.
+            word = tl.arange(0, words).to(tl.int64)
+            tl.store(S + word * SA + row, packed, word < K // 128)
         else:
-            offsets = row * (K // 32) + groups
-        tl.store(S + offsets, exponent.to(tl.uint8), groups < K // 32)
-    if SWIZZLED:
+            if LAYOUT == "swizzled":
+                offsets = _fp8_swizzled_scale_offset(row, groups, k_tiles)
+            else:
+                offsets = row * (K // 32) + groups
+            tl.store(S + offsets, exponent.to(tl.uint8), groups < K // 32)
+    if LAYOUT == "swizzled":
         # The grid covers every row of the last 128-row tile. Padding rows and
         # the scale columns past K/32 read as zero; each program owns its row.
         padded = tl.arange(0, PADDED_GROUPS)
@@ -1682,13 +1697,16 @@ def triton_rmsnorm_fp8_group32_ue8m0(
     weight: torch.Tensor,
     eps: float,
     *,
-    swizzled_scales: bool,
+    scale_layout: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return BF16 normalized rows, E4M3 codes and group-32 UE8M0 scales.
 
-    The scales are canonical ``[M, K/32]``, or with ``swizzled_scales`` the
-    1-D F8_128x4 layout ``mm(prepacked_scales=True)`` reads directly.
+    The scales follow ``scale_layout``: ``"canonical"`` uint8 ``[M, K/32]``,
+    ``"swizzled"`` the 1-D F8_128x4 bytes ``mm(prepacked_scales=True)`` reads,
+    or ``"packed"`` int32 ``[M, K/128]`` words that ``fp8_projection`` reads.
     """
+    if scale_layout not in ("canonical", "swizzled", "packed"):
+        raise ValueError(f"unsupported group-32 scale layout: {scale_layout!r}")
     if (
         x.ndim != 2
         or not x.is_cuda
@@ -1703,16 +1721,27 @@ def triton_rmsnorm_fp8_group32_ue8m0(
         or eps <= 0
     ):
         raise ValueError("Expected BF16 [M,K] input and [K] weight, K divisible by 32")
+    if scale_layout == "packed" and x.shape[1] % 128:
+        raise ValueError("Packed group-32 scales need K divisible by 128")
     m, k = x.shape
     normalized = torch.empty_like(x, memory_format=torch.contiguous_format)
     quantized = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=x.device)
-    if swizzled_scales:
-        rows = triton.cdiv(m, 128) * 128
+    # Only the swizzled layout pads its row count; the kernel's padding-only
+    # programs zero the bytes the GEMM reads past M and past K/32.
+    rows = triton.cdiv(m, 128) * 128 if scale_layout == "swizzled" else m
+    scale_stride = 0
+    if scale_layout == "swizzled":
         scales = torch.empty(
             (rows * triton.cdiv(k, 128) * 4,), dtype=torch.uint8, device=x.device
         )
+    elif scale_layout == "packed":
+        # MN-major words with the token count padded to four, so each column
+        # starts 16-byte aligned for TMA; the row stride stays one.
+        scale_stride = (m + 3) // 4 * 4
+        scales = torch.empty(
+            k // 128 * scale_stride, dtype=torch.int32, device=x.device
+        ).as_strided((m, k // 128), (1, scale_stride))
     else:
-        rows = m
         scales = torch.empty((m, k // 32), dtype=torch.uint8, device=x.device)
     if m:
         enable_pdl = pdl_enabled()
@@ -1724,10 +1753,11 @@ def triton_rmsnorm_fp8_group32_ue8m0(
             scales,
             m,
             x.stride(0),
+            scale_stride,
             k,
             eps,
             triton.next_power_of_2(k),
-            swizzled_scales,
+            scale_layout,
             triton.next_power_of_2(triton.cdiv(k, 128) * 4),
             enable_pdl,
             num_warps=4,

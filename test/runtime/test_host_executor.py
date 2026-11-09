@@ -2195,20 +2195,18 @@ class TestCompactLayoutRoundTripTest:
             )
 
     @pytest.mark.parametrize("io_backend", ["kernel", "direct"])
-    @pytest.mark.parametrize(
-        "source_pinned", [False, True], ids=["stream_ordered", "pinned_control"]
-    )
-    def test_a_stream_ordered_write_back_reads_blocks_the_plan_reuses(
-        self, io_backend, source_pinned
-    ):
+    def test_a_stream_ordered_write_back_reads_blocks_the_plan_reuses(self, io_backend):
         """An eviction's store reads what the evicted block held, though the
         same plan overwrites the block right after submitting the store.
 
         The copy is held back on the write stream, so the overwrite, enqueued
         on the fence stream right after the submission, would land first
-        unless the fence orders it behind the copy. The control submits the
-        same row as a pinned store, which fences nothing: its copy reads the
-        overwritten bytes, so the test tells the two apart.
+        unless the fence orders it behind the copy.
+
+        There is no unfenced negative control: nothing orders an unfenced
+        overwrite against the held copy. ROCm can run several streams on one
+        hardware queue, so the overwrite can wait behind the copy, and the
+        copy then reads the original bytes.
         """
         torch = self.torch
         device = torch.zeros((128,), dtype=torch.uint8, device="cuda")
@@ -2227,7 +2225,7 @@ class TestCompactLayoutRoundTripTest:
                 self.group_ids = [[0]]
                 self.src_pages = [[1]]
                 self.dst_pages = [[2]]
-                self.source_pinned = [source_pinned]
+                self.source_pinned = [False]
 
         def submit(op_id: int) -> None:
             with patch.object(self.executor_module.Cache, "WriteBackOp", WriteBackOp):
@@ -2268,10 +2266,7 @@ class TestCompactLayoutRoundTripTest:
         pool.load_tracker.wait_for_layer(0)
         torch.cuda.synchronize()
         assert [int(event.op_id) for event in executor.poll_results()] == [9]
-        expected = (
-            torch.full((4,), 0xEE, dtype=torch.uint8) if source_pinned else evicted
-        )
-        assert torch.equal(device[32:36].cpu(), expected)  # block 3
+        assert torch.equal(device[32:36].cpu(), evicted)  # block 3
         assert torch.equal(
             device[16:20].cpu(), torch.full((4,), 0xEE, dtype=torch.uint8)
         )

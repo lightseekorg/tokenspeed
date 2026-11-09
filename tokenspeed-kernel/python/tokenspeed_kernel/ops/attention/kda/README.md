@@ -50,3 +50,31 @@ The value tile is 32, 64, or 128 rows, chosen from the number of
 (request, head) pairs to balance occupancy against repeating the token-side
 work in every tile; windows above 8 tokens use 32 rows, and the tile halves
 until it divides the value dim.
+
+## Fused one-token verify (`kda_fused_paged_verify`)
+
+Decode without speculation verifies one-token windows.
+`cute_dsl_kda_fused_paged_verify_step` (NVIDIA SM100 to SM103) runs that
+verify together with its two producers, the gate projection `f_a @ f_b.T` and
+the convolution, in one launch. Multi-token windows keep running the producers
+as separate kernels (`triton_nvidia_kda_fused_paged_verify_split`). Results
+match the split producers followed by `kda_recoverssm_verify`: the same
+outputs, correction and key/gate records, stamps, and retained
+pre-convolution rows, so commit is unchanged. The gate projection sums in its
+own order, so a raw gate may differ from cuBLAS's by one BF16 step.
+
+`kda_fused_paged_verify_fuses_producers` tells the caller whether the selected
+kernel runs the producers itself for a window length; the kernel declares
+`spec_query_len_max` 1, so callers that state no window length never select
+it. It takes BF16 activations. Inputs it cannot address (rows or state not 16-byte
+aligned, head widths or gate ranks other than 128, positive lower bounds) run
+the split producers inside the same call.
+
+One CTA of four warps covers one (request, head). It bulk-copies the head's
+checkpoint into shared memory while thread t convolves channel t of q, k and
+v. For the gate projection and the checkpoint product, warp w takes 32 keys or
+32 checkpoint rows and lane l elements [4l, 4l + 4) of each, so every
+warp-wide load reads one contiguous row, and a transposing butterfly leaves
+each row's total in the lane of the matching thread. Weights load (or are
+prefetched into L2) before the programmatic dependency wait, activations and
+state after it.

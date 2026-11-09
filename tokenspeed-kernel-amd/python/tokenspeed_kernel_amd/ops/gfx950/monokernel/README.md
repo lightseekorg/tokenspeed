@@ -274,7 +274,7 @@ Rules:
   - A base for each lane. A base that a reduction computes (an expert from
     the routing) is not known to be wave-uniform. Every buffer load then
     becomes a loop over the lanes' bases. Mark the base with
-    `_scheduling.wave_uniform_i32`.
+    `_extern.wave_uniform_i32`.
   - A branch around loads. Two load sequences that join need copies at the
     join, and the copies wait for the loads. Select the base with a scalar
     `gl.where` and keep one sequence.

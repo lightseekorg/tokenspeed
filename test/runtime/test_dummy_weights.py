@@ -19,7 +19,8 @@
 # SOFTWARE.
 
 """Dummy loading gives integer parameters valid values before post-processing
-reads them, and tells an EAGLE3 draft its embedding is initialized."""
+reads them, tells an EAGLE3 draft its embedding is initialized, and derives a
+wrapped text model's weights."""
 
 from __future__ import annotations
 
@@ -36,11 +37,14 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
+from tokenspeed.runtime.configs.kimi_k25_config import KimiK25Config  # noqa: E402
 from tokenspeed.runtime.configs.load_config import LoadConfig  # noqa: E402
+from tokenspeed.runtime.distributed.mapping import Mapping  # noqa: E402
 from tokenspeed.runtime.model_loader import loader  # noqa: E402
 from tokenspeed.runtime.model_loader.weight_utils import (  # noqa: E402
     initialize_dummy_integer_weights,
 )
+from tokenspeed.runtime.models import kimi_k25  # noqa: E402
 
 
 class _QuantizedLinear(nn.Module):
@@ -90,3 +94,28 @@ def test_the_dummy_loader_marks_the_draft_embedding_initialized(monkeypatch):
         device_config=SimpleNamespace(device="cpu"),
     )
     assert marked == [True]
+
+
+def test_the_dummy_loader_derives_the_kimi_k25_text_model(monkeypatch):
+    derived = []
+
+    # The DeepSeek-V3 text model needs process groups; record its derivation.
+    class _TextModel(nn.Module):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__()
+
+        def post_load_weights(self) -> None:
+            derived.append(True)
+
+    monkeypatch.setattr(kimi_k25, "DeepseekV3ForCausalLM", _TextModel)
+    model = kimi_k25.KimiK25ForConditionalGeneration(
+        KimiK25Config(),
+        mapping=Mapping(rank=0, world_size=1),
+        is_multimodal_active=False,
+    )
+    monkeypatch.setattr(loader, "_initialize_model", lambda *args: model)
+    loader.DummyModelLoader(LoadConfig()).load_model(
+        model_config=SimpleNamespace(dtype=torch.float32),
+        device_config=SimpleNamespace(device="cpu"),
+    )
+    assert derived == [True]

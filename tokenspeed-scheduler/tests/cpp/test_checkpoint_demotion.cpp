@@ -888,7 +888,7 @@ protected:
             // Cancellation retains P's pages until the transfer and the
             // probe's dispatched forward have both retired.
             ExecutionEvent event;
-            event.With(pd::FailedEvent{id});
+            event.With(pd::TransferStoppedEvent{id});
             scheduler_->Advance(std::move(event));
             if (prefix >= 0) {
                 SendForwardDone(id);

@@ -30,6 +30,10 @@ from types import MappingProxyType
 
 import torch
 from tokenspeed_kernel.compile_monitor import is_serving
+from tokenspeed_kernel.ops.gemm._cute_dsl.nvfp4_gemm_swiglu_layout import (
+    interleave_linear_and_gate,
+    swizzle_blockscale_2d,
+)
 from tokenspeed_kernel.ops.gemm._flashinfer.fp8_quant import (
     flashinfer_fp8_blockscale_quantize_prepacked,
 )
@@ -85,6 +89,9 @@ __all__ = [
     # NVFP4 x BF16 weight preparation
     "has_flashinfer_cute_dsl_nvfp4_a16",
     "prepare_nvfp4_a16_weights",
+    # NVFP4 GEMM+SwiGLU weight layout
+    "interleave_linear_and_gate",
+    "swizzle_blockscale_2d",
     # DeepSeek V4.1 projections
     "dsv4_linear_fp32",
     "grouped_bf16_projection",
@@ -95,16 +102,21 @@ __all__ = [
     "has_grouped_fp8_projection",
     "prepare_fp8_projection",
     "prepare_grouped_fp8_projection",
+    "warmup_fp8_projection",
     "warmup_fp8_projections",
     # MV: small-M dense projection
     "mv",
+    "MV_FP8_WEIGHT_MAX_M",
+    "mv_fp8_weight",
     "mv_weightless_rmsnorm_gated_sigmoid",
     "mv_weightless_rmsnorm_gated_sigmoid_supported",
     # Linear AttnRes partials
     "fp32_router_gemv",
     "fp32_router_gemv_counters",
     "fp32_router_gemv_execute",
+    "fp32_router_gemv_execute_with_mm",
     "fp32_router_gemv_plan",
+    "fp32_router_gemv_with_mm_supported",
     "fp32_router_gemv_process_weight",
     "has_flashinfer_cute_dsl_nvfp4_a16",
     "linear_attnres_partials",
@@ -579,7 +591,7 @@ def mm(
             ``[1, 32]`` from ``prepare_mxfp8_weight_scales``, and ``A`` may
             also be E4M3 codes with UE8M0 ``A_scales``, canonical
             ``[M, K/32]`` or already in the 1-D F8_128x4 layout (such as
-            ``rmsnorm_quantize_fp8_group32(swizzled_scales=True)`` writes).
+            ``rmsnorm_quantize_fp8_group32(scale_layout="swizzled")`` writes).
     """
     if plan is not None and prepacked_scales:
         raise ValueError("A GEMM plan cannot use prepacked online quantization")
@@ -685,6 +697,7 @@ def mm(
         # the same bias-free tuning branch for FI's timing collectives, even
         # when this rank's actual GEMM retains the generic biased path.
         autotune_bf16_gemm(A, B)
+        warm_tgv_decode_gemm(A, B)
         if (
             bias is None
             and M <= BF16_GEMM_MAX_M
@@ -704,6 +717,36 @@ def mm(
                 has_out=out is not None,
             ):
                 return flashinfer_bf16_gemm(A, B, out)
+        # Decode rows on small weights take one pinned TGV tile on SM100/103
+        # under PDL (README "Decode GEMMs on small weights"). Like the joint
+        # path, only before serving: CUDA graphs captured at startup keep the
+        # tile, and eager calls while serving keep cuBLASLt. Registering the
+        # tile kernel instead (m bounds, a K-window, weight-size, and one-wave
+        # mnk_problem_filter, plus serving, bias, and 32-byte alignment traits
+        # that mm() does not pass today) was considered; it stays a shortcut
+        # like the joint path so both serving-gated FlashInfer routes sit
+        # here. So override= and solution= skip it, it cannot be benchmarked
+        # by name, and for the GEMMs it routes it precedes every registered
+        # BF16 gemm.mm kernel, plugins included.
+        tgv_tactic = (
+            flashinfer_tgv_decode_tactic(A, B, out)
+            if bias is None and not is_serving()
+            else None
+        )
+        if tgv_tactic is not None:
+            shape_params = {"M": M, "N": N, "K": K}
+            ShapeCapture.get().record(
+                "gemm", "mm", "flashinfer_tgv_decode_gemm", A.dtype, shape_params
+            )
+            with kernel_scope(
+                "gemm",
+                "mm",
+                A.dtype,
+                kernel_name="flashinfer_tgv_decode_gemm",
+                **shape_params,
+                has_out=out is not None,
+            ):
+                return flashinfer_tgv_decode_gemm(A, B, out, tgv_tactic)
         if bias is None and _use_mv(A, B):
             return mv(A, B, out)
 
@@ -1257,7 +1300,9 @@ def grouped_bf16_projection_quantize_fp8(
         ``[tokens, groups * output_dim / 32]`` of the BF16 projection, as
         ``quantize_fp8(granularity="token_group", group_size=32,
         scale_encoding="ue8m0")`` produces them. A kernel that quantizes in
-        its epilogue is used when one is registered for the geometry.
+        its epilogue is used when one is registered for the geometry; it may
+        split K differently from ``grouped_bf16_projection``, so a BF16 value
+        it quantizes can differ from that projection's by one ulp.
     """
     try:
         kernel = select_kernel(
@@ -1604,6 +1649,36 @@ def warmup_fp8_projections(
     torch.cuda.synchronize(device)
 
 
+def warmup_fp8_projection(
+    weight: torch.Tensor, weight_scales: torch.Tensor, max_tokens: int
+) -> None:
+    """Launch ``fp8_projection`` once per tile configuration up to max_tokens.
+
+    The kernel JIT-compiles a tile configuration on its first launch; running
+    every reachable one at startup keeps compilation out of serving.
+
+    Args:
+        weight: E4M3 ``[output_dim, input_dim]`` codes given to
+            ``prepare_fp8_projection``.
+        weight_scales: Scales from ``prepare_fp8_projection``.
+        max_tokens: Largest token count a forward can carry.
+    """
+    output_dim, input_dim = weight.shape
+    device = weight.device
+    codes = torch.zeros(max_tokens * input_dim, dtype=_fp8_dtype, device=device)
+    padded = (max_tokens + 3) // 4 * 4
+    scale_storage = torch.zeros(
+        input_dim // 128 * padded, dtype=torch.int32, device=device
+    )
+    # Largest first, so the outputs each launch allocates reuse cached blocks.
+    for tokens in reversed(_warmup_token_counts(max_tokens)):
+        aligned = (tokens + 3) // 4 * 4
+        x = codes[: tokens * input_dim].view(tokens, input_dim)
+        x_scales = scale_storage.as_strided((tokens, input_dim // 128), (1, aligned))
+        fp8_projection(x, x_scales, weight, weight_scales, None)
+    torch.cuda.synchronize(device)
+
+
 def dsv4_linear_fp32(
     hidden_states: torch.Tensor,
     weight: torch.Tensor,
@@ -1716,9 +1791,9 @@ def dsv4_linear_fp32(
 # activations first. A layer that keeps the weight split from
 # :func:`mv_weight_split` passes it to :func:`mv`, and the
 # registry can then run the product on BF16 tensor cores
-# (``triton_bf16x3_gemm_fp32``). From 17 to 96 rows, for weights of up to 256
-# rows (a multiple of 4) with K a multiple of 512 up to 8192, the registry runs
-# it on CUDA cores from the FP32 weight instead, with or without the split
+# (``triton_bf16x3_gemm_fp32``). Without a split, from 17 to 96 rows, for
+# weights of up to 256 rows (a multiple of 4) with K a multiple of 512 up to
+# 8192, the registry runs it on CUDA cores from the FP32 weight
 # (``gluon_simt_gemm_fp32``).
 
 # Registry signature of each served (x dtype, weight dtype) pair.
@@ -1909,6 +1984,57 @@ def mv_weight_split(weight: torch.Tensor) -> torch.Tensor | None:
     ):
         return None
     return split_fp32_weight_bf16x3(weight)
+
+
+# Rows one weight-only FP8 GEMV launch takes; larger calls run in chunks.
+MV_FP8_WEIGHT_MAX_M = 32
+
+
+def mv_fp8_weight(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """``(x @ weight.T) * weight_scale`` with a weight-only FP8 weight.
+
+    The weight is E4M3 with one FP32 scale per row (output channel), as a
+    16-bit weight quantizes once at load. Up to ``MV_FP8_WEIGHT_MAX_M`` rows
+    take a registered GEMV that reads the weight once, or the Torch
+    reference, which upcasts the weight in chunks; more rows run as chunks of
+    that many.
+
+    Args:
+        x: ``[M, K]`` 16-bit activations.
+        weight: Contiguous ``[N, K]`` ``float8_e4m3fn`` weight.
+        weight_scale: Contiguous FP32 scale of each weight row, ``N``
+            elements.
+        out: Optional ``[M, N]`` destination in ``x``'s dtype with a unit
+            inner stride.
+
+    Returns:
+        ``[M, N]`` output in ``x``'s dtype.
+    """
+    m, k = x.shape
+    n = weight.shape[0]
+    if out is None:
+        out = x.new_empty((m, n))
+    if not x.is_contiguous():
+        x = x.contiguous()
+    if m > MV_FP8_WEIGHT_MAX_M:
+        # Each chunk re-reads the weight: past this many rows the one-launch
+        # GEMV measured slower than chunks of it (and than a BF16 GEMM).
+        for start in range(0, m, MV_FP8_WEIGHT_MAX_M):
+            stop = min(start + MV_FP8_WEIGHT_MAX_M, m)
+            mv_fp8_weight(x[start:stop], weight, weight_scale, out[start:stop])
+        return out
+    kernel = select_kernel(
+        "gemm",
+        "mv_fp8_weight",
+        mv_fp8_weight_signature(x.dtype),
+        traits={"m": m, "n": n, "k": k},
+    )
+    return kernel(x, weight, weight_scale, out)
 
 
 def _select_mv_weightless_rmsnorm_gated_sigmoid(
@@ -3876,11 +4002,14 @@ from tokenspeed_kernel.ops.gemm.flashinfer import (  # noqa: E402
     autotune_bf16_gemm,
     flashinfer_bf16_gemm,
     flashinfer_joint_bf16_supported,
+    flashinfer_tgv_decode_gemm,
+    flashinfer_tgv_decode_tactic,
     gemm_fp8_nt_groupwise,
     has_flashinfer_cute_dsl_nvfp4_a16,
     has_flashinfer_mxfp8,
     prepare_nvfp4_a16_weights,
     swizzle_mxfp8_scale,
+    warm_tgv_decode_gemm,
 )
 
 if has_flashinfer_mxfp8():
@@ -3891,7 +4020,10 @@ from tokenspeed_kernel.ops.gemm.gluon import (  # noqa: E402
     MXFP4_LINEAR_MFMA_LAYOUT,
     prepare_mxfp4_linear_mfma_weight,
 )
-from tokenspeed_kernel.ops.gemm.native import torch_decode_gemv  # noqa: E402
+from tokenspeed_kernel.ops.gemm.native import (  # noqa: E402
+    mv_fp8_weight_signature,
+    torch_decode_gemv,
+)
 from tokenspeed_kernel.ops.gemm.triton import (  # noqa: E402
     MXFP4_LINEAR_LINEAR_LAYOUT,
     MXFP4_LINEAR_SIGNATURE,
@@ -3941,6 +4073,7 @@ class _FP32RouterGEMVPlan:
     hidden_size: int
     output_size: int
     dtype: torch.dtype
+    batch_invariant: bool
 
 
 def fp32_router_gemv_plan(
@@ -3985,6 +4118,7 @@ def fp32_router_gemv_plan(
         hidden_size=hidden_size,
         output_size=output_size,
         dtype=dtype,
+        batch_invariant=batch_invariant,
     )
 
 
@@ -4056,3 +4190,126 @@ def fp32_router_gemv_execute(
         counters,
         enable_pdl,
     )
+
+
+def _select_fp32_router_gemv_with_mm(
+    plan: _FP32RouterGEMVPlan,
+    x: torch.Tensor,
+    mm_a: torch.Tensor,
+    mm_b: torch.Tensor,
+) -> SelectedKernel | None:
+    """Select the launch that runs the router next to a decode GEMM, or None."""
+    if (
+        plan.batch_invariant
+        or x.ndim != 2
+        or x.shape[1] != plan.hidden_size
+        or x.dtype != plan.dtype
+        or not x.is_contiguous()
+        or not x.is_cuda
+        or mm_a.ndim != 2
+        or mm_b.ndim != 2
+        or mm_a.shape != (x.shape[0], mm_b.shape[1])
+        or not mm_a.is_contiguous()
+        or not mm_b.is_contiguous()
+        or mm_a.device != x.device
+        or mm_b.device != x.device
+        or resolve_kernel_override("gemm", "mm", None) is not None
+    ):
+        return None
+    rows, (mm_n, mm_k) = x.shape[0], mm_b.shape
+    try:
+        kernel = select_kernel(
+            "gemm",
+            "prepared_fp32_router_gemv_with_mm",
+            dense_format_signature(
+                ("x", "weight", "mm_a", "mm_b"),
+                (x.dtype, plan.dtype, mm_a.dtype, mm_b.dtype),
+            ),
+            traits={
+                "m": rows,
+                "n": mm_n,
+                "k": mm_k,
+                "router_n": plan.output_size,
+                "router_k": plan.hidden_size,
+            },
+        )
+    except NoKernelFoundError:
+        return None
+    registry = KernelRegistry.get()
+    spec = registry.get_by_name(kernel.name)
+    # The launch reads the plan's prepared weight and writes the bits mm would
+    # write, so it only stands in where both match.
+    if (
+        spec is None
+        or spec.weight_preprocessor is not plan.weight_preprocessor
+        or not _use_mv(mm_a, mm_b)
+        or _select_mv(rows, mm_n, mm_k, True, mm_a.dtype, mm_b.dtype, False)
+        is not registry.get_impl("gluon_mm_a16w16_decode_gfx950")
+    ):
+        return None
+    return kernel
+
+
+def fp32_router_gemv_with_mm_supported(
+    plan: object,
+    x: torch.Tensor,
+    mm_a: torch.Tensor,
+    mm_b: torch.Tensor,
+) -> bool:
+    """Return whether :func:`fp32_router_gemv_execute_with_mm` serves these operands.
+
+    Args:
+        plan: Opaque router GEMV plan.
+        x: FP32 router rows.
+        mm_a: ``[rows, K]`` activations of the independent GEMM.
+        mm_b: ``[N, K]`` weight of the independent GEMM.
+
+    Returns:
+        ``True`` when one launch can run the router and ``mm(mm_a, mm_b)``.
+    """
+    return (
+        _select_fp32_router_gemv_with_mm(
+            _require_fp32_router_gemv_plan(plan), x, mm_a, mm_b
+        )
+        is not None
+    )
+
+
+def fp32_router_gemv_execute_with_mm(
+    plan: object,
+    x: torch.Tensor,
+    prepared_weight: torch.Tensor,
+    multiplier: float,
+    mm_a: torch.Tensor,
+    mm_b: torch.Tensor,
+    mm_out: torch.Tensor,
+) -> torch.Tensor:
+    """Project router rows and compute an independent GEMM in one launch.
+
+    Where :func:`fp32_router_gemv_with_mm_supported` holds, the two share a
+    launch instead of paying a kernel boundary each. ``mm_out`` receives
+    ``mm(mm_a, mm_b)`` bit for bit; the router runs its split-K GEMM at every
+    supported row count, so its logits may differ from the plan's single-row
+    GEMV in the last bits.
+
+    Args:
+        plan: Opaque router GEMV plan.
+        x: Contiguous FP32 router rows.
+        prepared_weight: Result of :func:`fp32_router_gemv_process_weight`.
+        multiplier: Scale applied to the router logits.
+        mm_a: Contiguous ``[rows, K]`` BF16 activations.
+        mm_b: Contiguous ``[N, K]`` BF16 weight.
+        mm_out: ``[rows, N]`` BF16 destination.
+
+    Returns:
+        FP32 router logits in ``[rows, outputs]`` layout.
+    """
+    typed_plan = _require_fp32_router_gemv_plan(plan)
+    kernel = _select_fp32_router_gemv_with_mm(typed_plan, x, mm_a, mm_b)
+    if kernel is None:
+        raise ValueError(
+            "fp32_router_gemv_execute_with_mm needs supported operands "
+            "(see fp32_router_gemv_with_mm_supported), got router rows "
+            f"{tuple(x.shape)} and a {tuple(mm_b.shape)} GEMM"
+        )
+    return kernel(x, prepared_weight, multiplier, mm_a, mm_b, mm_out)

@@ -45,7 +45,9 @@ use ts_collective::{Group, Mesh, Reduce};
 
 use crate::{
     batch::{BatchRows, Staged},
-    control::{BootstrapInfo, PdError, PdEvent, RemotePrefill, TransferPeer},
+    control::{
+        stalled_drains, BootstrapInfo, Draining, PdError, PdEvent, RemotePrefill, TransferPeer,
+    },
     http,
     layout::{
         contract::Contract,
@@ -688,6 +690,7 @@ struct Receiver {
     addr: String,
     local: TransferPoll,
     concluded: Option<TransferPoll>,
+    draining: Option<Draining>,
 }
 
 /// A Decode rank's PD transfer peer.
@@ -702,6 +705,7 @@ pub struct DecodePeer {
     order: Vec<String>,
     receivers: HashMap<String, Receiver>,
     timeout_logged: bool,
+    drain_logged_at: Option<Instant>,
 }
 
 impl DecodePeer {
@@ -795,6 +799,7 @@ impl DecodePeer {
                 order: Vec::new(),
                 receivers: HashMap::new(),
                 timeout_logged: false,
+                drain_logged_at: None,
             },
             outbox,
         ))
@@ -860,6 +865,7 @@ impl TransferPeer for DecodePeer {
                     addr: addr.clone(),
                     local: TransferPoll::Bootstrapping,
                     concluded: None,
+                    draining: None,
                 },
             )
             .is_none()
@@ -969,16 +975,27 @@ impl TransferPeer for DecodePeer {
             if receiver.local == TransferPoll::Bootstrapping && poll == TransferPoll::Bootstrapped {
                 receiver.local = TransferPoll::Bootstrapped;
                 events.push(PdEvent::Bootstrapped(rid.clone()));
-            } else if poll == TransferPoll::Failed && retired != 0 {
-                let reason = self
-                    .shared
-                    .state()
-                    .rooms
-                    .failure(receiver.room)
-                    .map(str::to_owned);
-                tracing::warn!(rid, room = receiver.room, reason, "KV transfer failed");
-                events.push(PdEvent::Failed(rid.clone()));
-                ended.push(rid.clone());
+            } else if poll == TransferPoll::Failed {
+                if receiver.local != TransferPoll::Failed {
+                    receiver.local = TransferPoll::Failed;
+                    receiver.draining = Some(Draining {
+                        rid: rid.clone(),
+                        room: receiver.room,
+                        since: now,
+                    });
+                    let reason = self
+                        .shared
+                        .state()
+                        .rooms
+                        .failure(receiver.room)
+                        .map(str::to_owned);
+                    tracing::warn!(rid, room = receiver.room, reason, "KV transfer failed");
+                    events.push(PdEvent::Failed(rid.clone()));
+                }
+                if retired != 0 {
+                    events.push(PdEvent::Stopped(rid.clone()));
+                    ended.push(rid.clone());
+                }
             } else if receiver.local == TransferPoll::Bootstrapped && poll == TransferPoll::Success
             {
                 receiver.local = TransferPoll::Success;
@@ -1006,6 +1023,19 @@ impl TransferPeer for DecodePeer {
         }
         for rid in ended {
             self.forget(&rid);
+        }
+        let stalled = stalled_drains(
+            self.order
+                .iter()
+                .filter_map(|rid| self.receivers[rid].draining.as_ref()),
+            &mut self.drain_logged_at,
+            now,
+        );
+        if !stalled.is_empty() {
+            tracing::warn!(
+                ?stalled,
+                "PD destination pages are waiting for cancellation acknowledgments"
+            );
         }
         Ok(events)
     }
@@ -1096,6 +1126,41 @@ mod tests {
         assert!(state.expected.is_empty());
         assert!(state.targets.is_empty());
         assert!(state.pending.is_empty() && state.landed.is_empty());
+    }
+
+    #[test]
+    fn failure_and_lost_routes_do_not_replace_cancellation_acknowledgments() {
+        let mut state = State {
+            cache_id: "cache".to_owned(),
+            ..State::default()
+        };
+        connected(&mut state, 1, "prefill:80");
+        state.targets.insert(
+            1,
+            Arc::new(
+                (0..2)
+                    .map(|rank| Target {
+                        host: "prefill".to_owned(),
+                        port: 80,
+                        rank,
+                        is_dummy: false,
+                    })
+                    .collect(),
+            ),
+        );
+        state.admissions.insert(1, 3);
+        state.apply(StatusMessage::bare(1, TransferPoll::Failed, 0));
+        state.cancellations.insert(1, Cancellation::default());
+        assert!(!state.cancellation_retired(1));
+        state.acknowledge_cancellation(1, "cache", 0);
+        assert!(!state.cancellation_retired(1));
+        state.lose_node("prefill:80");
+        assert!(!state.cancellation_retired(1));
+        state.apply(success(1, 1, 7));
+        assert_eq!(state.rooms.get(1), Some(TransferPoll::Failed));
+        assert!(!state.cancellation_retired(1));
+        state.acknowledge_cancellation(1, "cache", 1);
+        assert!(state.cancellation_retired(1));
     }
 
     #[test]

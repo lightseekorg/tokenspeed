@@ -284,6 +284,7 @@ struct UpdateReserveNumTokensEvent : InvalidTransitionHandler<UpdateReserveNumTo
         state.SetReserveNumTokensInNextScheduleEvent(value_);
         return std::move(state);
     }
+    PdTransferring operator()(PdTransferring&& state) { return std::move(state); }
     Finished operator()(Finished&& state) { return std::move(state); }
 
 private:
@@ -329,6 +330,8 @@ struct ExtendResultEvent : InvalidTransitionHandler<ExtendResultEvent> {
         return std::move(state);
     }
     RemotePrefilling operator()(RemotePrefilling&& state) { return std::move(state); }
+    // A forward that was out when the request ended lands: nothing reads it.
+    PdTransferring operator()(PdTransferring&& state) { return std::move(state); }
 
     Finished operator()(Finished&& state) { return std::move(state); }
 

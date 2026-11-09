@@ -46,7 +46,7 @@ use ts_collective::{Group, Mesh, Reduce};
 
 use crate::{
     batch::{BatchRows, Staged},
-    control::{BootstrapInfo, PdError, PdEvent, TransferPeer},
+    control::{stalled_drains, BootstrapInfo, Draining, PdError, PdEvent, TransferPeer},
     http,
     layout::{
         contract::Contract,
@@ -219,6 +219,9 @@ struct State {
     tracked: HashSet<u64>,
     // Queued and executing jobs that can still read source pages.
     pending_chunks: HashMap<u64, usize>,
+    /// A native write error does not establish a remote DMA fence. Such a
+    /// room must never acknowledge cancellation and release its destinations.
+    uncertain: HashSet<u64>,
     /// Cancelled room ids, retained until their associated cache identities
     /// retire. An empty set has not received a manifest yet: no TTL proves
     /// that a delayed manifest can no longer arrive.
@@ -246,6 +249,30 @@ struct State {
 }
 
 impl State {
+    /// Take cancellation replies only after all writers retired with no
+    /// uncertain native write. Failure notices alone never release D pages.
+    #[allow(clippy::type_complexity)]
+    fn take_cancellation_replies(&mut self) -> Vec<((u64, String), (String, u16))> {
+        let ready: Vec<_> = self
+            .cancellation_replies
+            .keys()
+            .filter(|(room, _)| {
+                !self.pending_chunks.contains_key(room) && !self.uncertain.contains(room)
+            })
+            .cloned()
+            .collect();
+        ready
+            .into_iter()
+            .map(|key| {
+                let route = self
+                    .cancellation_replies
+                    .remove(&key)
+                    .expect("pending reply");
+                (key, route)
+            })
+            .collect()
+    }
+
     fn route_of(&self, cache_id: &str) -> Option<(String, u16)> {
         self.registrations
             .get(cache_id)
@@ -466,25 +493,7 @@ impl Shared {
     /// This also runs without any registered Prefill request: an unclaimed
     /// room's cancellation must not wait for the bootstrap TTL or a forward.
     fn flush_cancellations(&self) {
-        let replies = {
-            let mut state = self.state();
-            let ready: Vec<_> = state
-                .cancellation_replies
-                .keys()
-                .filter(|(room, _)| !state.pending_chunks.contains_key(room))
-                .cloned()
-                .collect();
-            ready
-                .into_iter()
-                .map(|key| {
-                    let route = state
-                        .cancellation_replies
-                        .remove(&key)
-                        .expect("pending reply");
-                    (key, route)
-                })
-                .collect::<Vec<_>>()
-        };
+        let replies = self.state().take_cancellation_replies();
         for ((room, cache_id), (endpoint, port)) in replies {
             self.transport.sockets.send(
                 &endpoint,
@@ -836,6 +845,7 @@ impl Shared {
             self.transport
                 .write_cache(&registration.session_id, &registration.cache_id, copies)
         {
+            self.state().uncertain.insert(room);
             self.mark_session_failed(&registration.cache_id);
             return Err(format!(
                 "Mooncake transfer failed for {}:{}: {error}",
@@ -1437,6 +1447,7 @@ struct Sender {
     started: Instant,
     local: TransferPoll,
     concluded: Option<TransferPoll>,
+    draining: Option<Draining>,
 }
 
 /// A Prefill rank's PD transfer peer.
@@ -1449,6 +1460,7 @@ pub struct PrefillPeer {
     order: Vec<String>,
     senders: HashMap<String, Sender>,
     stall_logged_at: Option<Instant>,
+    drain_logged_at: Option<Instant>,
     timeout_logged: bool,
 }
 
@@ -1537,6 +1549,7 @@ impl PrefillPeer {
                 order: Vec::new(),
                 senders: HashMap::new(),
                 stall_logged_at: None,
+                drain_logged_at: None,
                 timeout_logged: false,
             },
             outbox,
@@ -1632,6 +1645,7 @@ impl TransferPeer for PrefillPeer {
                     started: Instant::now(),
                     local: TransferPoll::Bootstrapping,
                     concluded: None,
+                    draining: None,
                 },
             )
             .is_none()
@@ -1741,16 +1755,27 @@ impl TransferPeer for PrefillPeer {
             if sender.local == TransferPoll::Bootstrapping && poll == TransferPoll::Bootstrapped {
                 sender.local = TransferPoll::Bootstrapped;
                 events.push(PdEvent::Bootstrapped(rid.clone()));
-            } else if poll == TransferPoll::Failed && retired != 0 {
-                let reason = self
-                    .shared
-                    .state()
-                    .rooms
-                    .failure(sender.room)
-                    .map(str::to_owned);
-                tracing::warn!(rid, room = sender.room, reason, "KV transfer failed");
-                events.push(PdEvent::Failed(rid.clone()));
-                ended.push(rid.clone());
+            } else if poll == TransferPoll::Failed {
+                if sender.local != TransferPoll::Failed {
+                    sender.local = TransferPoll::Failed;
+                    sender.draining = Some(Draining {
+                        rid: rid.clone(),
+                        room: sender.room,
+                        since: now,
+                    });
+                    let reason = self
+                        .shared
+                        .state()
+                        .rooms
+                        .failure(sender.room)
+                        .map(str::to_owned);
+                    tracing::warn!(rid, room = sender.room, reason, "KV transfer failed");
+                    events.push(PdEvent::Failed(rid.clone()));
+                }
+                if retired != 0 {
+                    events.push(PdEvent::Stopped(rid.clone()));
+                    ended.push(rid.clone());
+                }
             } else if sender.local == TransferPoll::Bootstrapped
                 && poll == TransferPoll::Success
                 && retired != 0
@@ -1762,6 +1787,19 @@ impl TransferPeer for PrefillPeer {
         }
         for rid in ended {
             self.forget(&rid);
+        }
+        let stalled = stalled_drains(
+            self.order
+                .iter()
+                .filter_map(|rid| self.senders[rid].draining.as_ref()),
+            &mut self.drain_logged_at,
+            now,
+        );
+        if !stalled.is_empty() {
+            tracing::warn!(
+                ?stalled,
+                "PD source pages are waiting for transfers to stop"
+            );
         }
         Ok(events)
     }
@@ -2027,6 +2065,42 @@ mod tests {
             interval_targets(STEP_COUNT_MAX - 1, 2, 1),
             [STEP_COUNT_MAX - 1, 0]
         );
+    }
+
+    #[test]
+    fn cancellation_ack_waits_for_the_last_pending_chunk() {
+        let mut state = State::default();
+        let key = (4, "cache".to_owned());
+        let route = ("decode".to_owned(), 7000);
+        state.cancel_room(4, Some("cache"));
+        state
+            .cancellation_replies
+            .insert(key.clone(), route.clone());
+        state.pending_chunks.insert(4, 2);
+        assert!(state.take_cancellation_replies().is_empty());
+        *state.pending_chunks.get_mut(&4).unwrap() -= 1;
+        assert!(state.take_cancellation_replies().is_empty());
+        state.pending_chunks.remove(&4);
+        assert_eq!(state.take_cancellation_replies(), [(key, route)]);
+        assert!(state.take_cancellation_replies().is_empty());
+    }
+
+    #[test]
+    fn uncertain_writes_never_acknowledge_cancellation() {
+        let mut state = State::default();
+        let key = (5, "cache".to_owned());
+        state.cancel_room(5, Some("cache"));
+        state
+            .cancellation_replies
+            .insert(key.clone(), ("decode".to_owned(), 7000));
+        state.uncertain.insert(5);
+        state.pending_chunks.insert(5, 1);
+        assert!(state.take_cancellation_replies().is_empty());
+        state.pending_chunks.remove(&5);
+        assert!(state.take_cancellation_replies().is_empty());
+        state.clear(5);
+        assert!(state.take_cancellation_replies().is_empty());
+        assert!(state.cancellation_replies.contains_key(&key));
     }
 }
 
