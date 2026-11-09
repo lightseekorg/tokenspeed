@@ -125,6 +125,30 @@ struct SchedulerConfig {
     // unaffected. Requires prefix caching, except on the D role, which never
     // computes a prompt and publishes as ever.
     bool state_checkpoint_in_forward{false};
+    // P role, with state_checkpoint_in_forward: the finish of a prompt too
+    // short for the in-forward checkpoint (PrefillStateCheckpointTokens is 0:
+    // by default a prompt within one chunk budget) whose end lies inside a
+    // page publishes like a chunk end -- its full pages, no KV tail and no
+    // State checkpoint -- and marks no input superseded. A next turn that
+    // re-renders the end of the prompt cannot resume at that tail; a longer
+    // prompt that repeats the whole prompt resumes at an earlier checkpoint
+    // instead. A page-aligned prompt end, a prompt long enough for the
+    // in-forward checkpoint and a model without State groups are unaffected
+    // (docs/design/scheduler.md §1.2). The other roles refuse it. The fused
+    // role keeps its short prompt ends because this is a P-role policy,
+    // chosen from PD measurements; the same case exists at the fused first
+    // decode, and applying the drop there is a possible follow-up.
+    bool drop_short_prompt_end_checkpoints{false};
+    // A finish that publishes an in-forward State checkpoint past the one it
+    // resumed from, itself an in-forward checkpoint whose request resumed from
+    // an earlier one, demotes that earlier one -- two turns back on the
+    // conversation -- unless another request shares it: its State entries and
+    // the sliding-window blocks behind it are dated back, so both tiers evict
+    // them early, and no new store or eviction write-back copies them to the
+    // Host (docs/design/scheduler.md §1.2).
+    // Requires state_checkpoint_in_forward, except on the D role, where it has
+    // no effect; so does a model without State groups.
+    bool demote_superseded_state_checkpoints{false};
     // Under cache pressure, a State checkpoint more than
     // checkpoint_retention_leaf_distance from the newest checkpoint on its
     // branch ranks as if last used this many new requests ago, or at its own
@@ -140,6 +164,15 @@ struct SchedulerConfig {
         return checkpoint_retention_requests.value_or(
             std::min<std::int64_t>(std::int64_t{16} * max_batch_size, kMaxCheckpointRetentionRequests));
     }
+    // P role: the room, in tokens, a local prefill chunk that cannot finish
+    // its prompt this round makes for bootstrapped prompts waiting behind it
+    // that fit whole, so they run complete in the same forward: the chunk
+    // ends on an earlier page and gives up fewer than this plus one page
+    // (docs/design/scheduler.md §1.1). A chunk yields only while such prompts
+    // wait, and only what they take. 0 (the default) is off; at most half of
+    // max_scheduled_tokens, so a long prompt keeps about half of every round
+    // or more.
+    std::int32_t prefill_chunk_yield_tokens{0};
 
     // The single validation entry point for a scheduler configuration: every
     // scheduler scalar, every group's own invariants, and the cross-checks

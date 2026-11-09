@@ -115,11 +115,10 @@ def _select_head_tile(
     if (
         not bf16_kv
         and heads_per_kv == 12
-        and rows * kv_heads >= sm_count
-        and _is_sm107(device)
+        and (not _is_sm107(device) or rows * kv_heads >= sm_count)
     ):
-        # Cover twelve heads with one gather/conversion stream once the
-        # unsplit grid has at least one tile per SM. Smaller grids keep tile8.
+        # Cover twelve heads with one gather/conversion stream. SM107 keeps
+        # tile8 until the unsplit grid has at least one tile per SM.
         return 16
     return _head_tile_for_geometry(heads_per_kv * query_group, bf16_kv, query_group)
 
@@ -149,6 +148,8 @@ def _configuration(rows, q_heads, kv_heads, max_seqlen_q, bf16_kv, sm_count, dev
             if rows * head_tiles_per_row <= _SMALL_MAX_CLUSTERS
             else 0
         ),
+        # The FP8 wave cost model was fitted on SM103; SM107 keeps its split rule.
+        fp8_wave_sizing=not _is_sm107(device),
     )
     return (
         head_tile,
@@ -367,13 +368,18 @@ def kernel(
     k_scale: float | torch.Tensor | None,
     v_scale: float | torch.Tensor | None,
     enable_pdl: bool,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run direct-slot QSA with exact prefix reuse within uniform requests.
 
     Query heads form contiguous groups for each KV head. Non-positive selected
     slots are masked, and each query retains its own last three candidates.
-    K/V offsets are 64-bit. The enable_pdl flag is retained by CUDA graph capture.
-    Returns BF16 output with the query's shape.
+    With an FP8 cache, each query and KV split stops its prefix loop after the
+    last 128-entry tile holding a positive id (at least one tile); the skipped
+    tiles hold only masked entries, so the output matches the full loop. K/V
+    offsets are 64-bit. The enable_pdl flag is retained by CUDA graph capture.
+    Returns BF16 output with the query's shape, written into ``out`` when
+    given (contiguous, the query's shape and dtype).
     """
     if query.ndim != 3 or query.shape[-1] != _HEAD_DIM:
         raise ValueError("QSA requires query shape [tokens, query_heads, 256]")
@@ -398,11 +404,22 @@ def kernel(
         raise TypeError("QSA requires int32 selected slots")
     if max_seqlen_q < 1 or query.shape[0] % max_seqlen_q:
         raise ValueError("max_seqlen_q must be positive and divide the query rows")
+    if out is not None and (
+        out.shape != query.shape
+        or out.dtype is not query.dtype
+        or out.device != query.device
+        or not out.is_contiguous()
+    ):
+        raise ValueError("QSA output must be a contiguous tensor like the query")
     if query.shape[0] == 0:
-        return torch.empty_like(query)
+        return torch.empty_like(query) if out is None else out
     if not query.is_contiguous():
         query = query.contiguous()
-    output = torch.empty(query.shape, dtype=query.dtype, device=query.device)
+    output = (
+        torch.empty(query.shape, dtype=query.dtype, device=query.device)
+        if out is None
+        else out
+    )
     scale_qs = float(scale) * _scalar(k_scale, 1.0)
     scale_o = _scalar(v_scale, 1.0)
     bf16_kv = key_cache.dtype is torch.bfloat16

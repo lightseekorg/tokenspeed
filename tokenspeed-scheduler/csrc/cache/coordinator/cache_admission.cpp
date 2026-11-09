@@ -52,10 +52,10 @@ struct VictimSet {
         // set was chosen for, taken along so no Device page outlives its
         // parent (counted as a stranded suffix).
         bool in_stranded_suffix;
+        // Kept per block when a segment absorbs the request's released slots.
+        bool is_request_reclaim;
     };
     std::vector<Member> members;
-    // The admitted request's own released slots (counted apart).
-    bool is_request_reclaim{false};
 };
 
 // A copy-in block an admission reserves: the table slot it serves and the
@@ -184,11 +184,13 @@ private:
             return false;
         }
         using NodeEntry = CacheCoordinator::NodeEntry;
-        // Whether a segment may take a Device entry: not in use, not a hit
-        // this admission keeps, not one of the request's own released slots.
+        // A selected request reclaim still has its table reference until Admit
+        // executes. A later segment may absorb that set; the merge below keeps
+        // its capacity counted once and Minimize must restore them together.
         const auto is_evictable = [&](const NodeEntry& entry) {
-            return !entry.in_use && !protected_locations_.contains(entry.location) &&
-                   !request_reclaim_locations_.contains(entry.location);
+            return set_member_by_location_.contains(entry.location) ||
+                   (!entry.in_use && !protected_locations_.contains(entry.location) &&
+                    !request_reclaim_locations_.contains(entry.location));
         };
         // The Device checkpoint boundaries at or under a node that no selected
         // set takes whole: every one while candidates last, then those staying.
@@ -203,6 +205,9 @@ private:
         // rules passed over, tried again block by block.
         bool blocks_alone = false;
         std::size_t next_passed_over = 0;
+        bool reclaim_selection_changed = false;
+        std::vector<VictimCandidate> retry_segments;
+        std::size_t next_retry_segment = 0;
         const bool fits = eviction_plan_.SelectUntilFits(shape_need_, blocks_needed_, pair_need_, [&] {
             while (true) {
                 std::optional<VictimCandidate> candidate = eviction_plan_.Next(request_reclaim_candidates_);
@@ -241,6 +246,19 @@ private:
                     }
                     candidate = deferred_shared_pages_[next_deferred_shared_page++];
                 }
+                if (!candidate && !blocks_alone && next_retry_segment == retry_segments.size() &&
+                    reclaim_selection_changed) {
+                    // A reclaim selected after a rejected segment can make that
+                    // segment evictable. Retry a fixed batch before block fallback;
+                    // another pass requires a newly selected reclaim block.
+                    reclaim_selection_changed = false;
+                    unevictable_locations_.clear();
+                    retry_segments = std::exchange(passed_over_, {});
+                    next_retry_segment = 0;
+                }
+                if (!candidate && next_retry_segment < retry_segments.size()) {
+                    candidate = retry_segments[next_retry_segment++];
+                }
                 if (!candidate && evicts_blocks_past_segments_ && next_passed_over < passed_over_.size()) {
                     blocks_alone = true;
                     candidate = passed_over_[next_passed_over++];
@@ -259,7 +277,8 @@ private:
                     passed_over_.push_back(*candidate);
                     continue;
                 }
-                VictimSet set{.is_request_reclaim = request_reclaim_locations_.contains(location)};
+                const bool is_request_reclaim = request_reclaim_locations_.contains(location);
+                VictimSet set;
                 // A segment that takes an earlier segment's lists over in place
                 // keeps them first (the first num_taken_over_members members, their
                 // set_member_by_location_ entries as they are).
@@ -275,21 +294,25 @@ private:
                 }
                 const bool sliding =
                     !groups_[group_id].Matcher().IsPrefixClosed() && !coordinator_.GroupIsState(group_id);
-                if (candidate_node == nullptr || (sliding && !set.is_request_reclaim)) {
+                if (candidate_node == nullptr || (sliding && !is_request_reclaim)) {
                     // Block by block; or a block with no tree node (never
                     // published, or registered straight into an index); or a window
                     // block, which only shortens the boundaries its prefix resumes
                     // at.
-                    set.members.push_back(
-                        VictimSet::Member{.group_id = group_id, .location = location, .in_stranded_suffix = false});
-                } else if (set.is_request_reclaim) {
+                    set.members.push_back(VictimSet::Member{.group_id = group_id,
+                                                            .location = location,
+                                                            .in_stranded_suffix = false,
+                                                            .is_request_reclaim = is_request_reclaim});
+                } else if (is_request_reclaim) {
                     // The request's released slots at this hash, and at a tail
                     // the tail's other blocks, which their eviction takes along.
                     for (const NodeEntry& entry : coordinator_.NodeEntries(pool_, *candidate_node)) {
                         if (request_reclaim_locations_.contains(entry.location) ||
                             (candidate_node->tail_tokens > 0 && is_evictable(entry))) {
-                            set.members.push_back(VictimSet::Member{
-                                .group_id = entry.group_id, .location = entry.location, .in_stranded_suffix = false});
+                            set.members.push_back(VictimSet::Member{.group_id = entry.group_id,
+                                                                    .location = entry.location,
+                                                                    .in_stranded_suffix = false,
+                                                                    .is_request_reclaim = true});
                         }
                     }
                 } else if (blocks_alone ? coordinator_.GroupIsState(group_id)
@@ -308,8 +331,10 @@ private:
                     for (const NodeEntry& entry : coordinator_.NodeEntries(pool_, *candidate_node)) {
                         if (coordinator_.GroupIsState(entry.group_id)) {
                             evictable = evictable && is_evictable(entry);
-                            set.members.push_back(VictimSet::Member{
-                                .group_id = entry.group_id, .location = entry.location, .in_stranded_suffix = false});
+                            set.members.push_back(VictimSet::Member{.group_id = entry.group_id,
+                                                                    .location = entry.location,
+                                                                    .in_stranded_suffix = false,
+                                                                    .is_request_reclaim = false});
                         }
                     }
                     if (!evictable) {
@@ -403,7 +428,8 @@ private:
                             }
                             set.members.push_back(VictimSet::Member{.group_id = entry.group_id,
                                                                     .location = entry.location,
-                                                                    .in_stranded_suffix = frame.in_stranded_suffix});
+                                                                    .in_stranded_suffix = frame.in_stranded_suffix,
+                                                                    .is_request_reclaim = false});
                         }
                         if (!evictable) {
                             break;
@@ -481,6 +507,7 @@ private:
                     if (it == set_member_by_location_.end()) {
                         eviction_plan_.Remove(member.group_id, member.location);
                         set_member_by_location_.emplace(member.location, std::pair{set_index, j});
+                        reclaim_selection_changed = reclaim_selection_changed || member.is_request_reclaim;
                         continue;
                     }
                     // The set holding the block now, through the sets that took
@@ -490,7 +517,7 @@ private:
                         earlier = taken_by_[earlier] = taken_by_[taken_by_[earlier]];
                     }
                     const std::size_t position = it->second.second;
-                    member.in_stranded_suffix = victims_[earlier].members[position].in_stranded_suffix;
+                    member = victims_[earlier].members[position];
                     if (std::ranges::find(absorbed, earlier) == absorbed.end()) {
                         absorbed.push_back(earlier);
                     }
@@ -967,16 +994,16 @@ private:
     // The selected segments by the tree node each starts at: every Device block
     // of that node's subtree, in post-order.
     std::pmr::unordered_map<const BoundaryTree::Node*, std::size_t> segment_at_{&scratch_};
-    // Blocks that, tried as candidates, would expand to a set found unable
-    // to leave this pass (a member in use or kept): skipped at once.
+    // Blocks that expand to a set found unable to leave under the current
+    // reclaim selection: skipped until a retry invalidates that decision.
     std::pmr::unordered_set<CacheBlockLocation, CacheBlockLocationHash> unevictable_locations_{&scratch_};
     // Pages two or more Device checkpoint boundaries depend on, passed over
     // while candidates last, oldest first: tried again once they run out.
     std::vector<VictimCandidate> deferred_shared_pages_;
     // Candidates no segment rule let leave (a set member in use or kept, or a
     // shared page still shared once the candidates ran out), in the order
-    // they were passed over: tried again block by block once the shared pages
-    // run out too.
+    // they were passed over: retried as segments after reclaim selection
+    // changes, then block by block if the admission permits it.
     std::vector<VictimCandidate> passed_over_;
     // Per tree node: how many checkpoint boundaries at or under it have every
     // Device checkpoint in a selected set, counted once the candidates run out.
@@ -1246,11 +1273,11 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
     // retry the blocks whose request reference has just been released.
     for (const VictimSet& set : plan.victims) {
         EvictedSegment* segment = write_back_evictions_ ? &evicted_segments_.emplace_back() : nullptr;
-        for (const auto& [group_id, location, in_stranded_suffix] : set.members) {
+        for (const auto& [group_id, location, in_stranded_suffix, is_request_reclaim] : set.members) {
             DeviceEvictionCounts DeviceEvictionStats::*reason =
-                set.is_request_reclaim ? &DeviceEvictionStats::request_reclaim
-                : in_stranded_suffix   ? &DeviceEvictionStats::stranded_suffix
-                                       : &DeviceEvictionStats::admission;
+                is_request_reclaim   ? &DeviceEvictionStats::request_reclaim
+                : in_stranded_suffix ? &DeviceEvictionStats::stranded_suffix
+                                     : &DeviceEvictionStats::admission;
             if (!evictCachedBlock(group_id, location, reason, segment)) {
                 prospective_victims.emplace_back(group_id, location, reason, segment);
             }
@@ -1551,9 +1578,9 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Restore(const
     // write-back policy each set is recorded whole as one segment for this
     // plan's drain, as Admit does.
     for (const VictimSet& set : candidate->victims) {
-        _assert(!set.is_request_reclaim, "a restore rebuilds empty tables and reclaims nothing of its own");
         EvictedSegment* segment = write_back_evictions_ ? &evicted_segments_.emplace_back() : nullptr;
         for (const VictimSet::Member& member : set.members) {
+            _assert(!member.is_request_reclaim, "a restore rebuilds empty tables and reclaims nothing of its own");
             if (!evictCachedBlock(member.group_id, member.location, &DeviceEvictionStats::restore, segment)) {
                 FatalCheck(!pool_.IsOccupied(member.location), "restore victim changed before acquisition");
             }

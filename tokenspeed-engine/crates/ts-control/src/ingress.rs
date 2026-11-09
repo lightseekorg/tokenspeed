@@ -33,7 +33,10 @@ use ts_wire::{SamplingParams, StrOrList, TokenizedGenerateReqInput};
 
 use crate::{
     grammar::ReasoningGrammar,
-    request::{LogprobRequest, RequestState, MAX_CACHE_SESSION_ID_BYTES, MAX_STOP_TOKEN_IDS},
+    request::{
+        LogprobRequest, ReasoningTokens, RequestState, MAX_CACHE_SESSION_ID_BYTES,
+        MAX_STOP_TOKEN_IDS,
+    },
     sampling,
 };
 
@@ -63,6 +66,9 @@ pub struct IngressLimits {
     /// How a JSON schema waits for the reasoning block; `None` without a
     /// grammar, a reasoning parser, or xgrammar's template for it.
     pub reasoning: Option<ReasoningGrammar>,
+    /// The reasoning parser's token markers, independent of whether grammar
+    /// constraints are enabled; `None` when the parser has no known template.
+    pub reasoning_usage: Option<ReasoningGrammar>,
     /// Which logprobs beyond the sampled tokens' the engine returns.
     pub logprobs: LogprobServability,
 }
@@ -94,7 +100,7 @@ impl LogprobServability {
     /// Why the engine cannot compute this prompt's logprobs, or `None`.
     fn prompt_logprobs_refusal(
         &self,
-        input_ids: &[i32],
+        target_ids: &[i32],
         has_multimodal_inputs: bool,
         vocab_size: i64,
     ) -> Option<String> {
@@ -113,13 +119,13 @@ impl LogprobServability {
                     .to_owned(),
             );
         }
-        let outside = input_ids
+        let outside = target_ids
             .iter()
             .any(|&id| id < 0 || i64::from(id) >= vocab_size);
         outside.then(|| {
             format!(
-                "prompt logprobs need every prompt token id inside the vocabulary \
-                 [0, {vocab_size}); input_ids contains one outside it."
+                "prompt logprobs need every scored target token id inside the vocabulary \
+                 [0, {vocab_size}); the scored input_ids suffix contains one outside it."
             )
         })
     }
@@ -288,6 +294,10 @@ pub fn admit(mut request: TokenizedGenerateReqInput, limits: &IngressLimits) -> 
         params.stream_interval,
         request.return_logprob,
     );
+    state.reasoning_tokens = limits
+        .reasoning_usage
+        .as_ref()
+        .map(|grammar| ReasoningTokens::new(grammar, &state.prompt_ids));
     state.created_time = request.created_time;
     state.session_id = request
         .session_params
@@ -511,10 +521,10 @@ fn refusal(
             ));
         }
         if start >= 0 && start < input_len - 1 {
-            // Only prompt logprobs need every id inside the vocabulary, so
-            // the ids are walked here and not on admission's common path.
+            // A scored row predicts the next token. Earlier context may use
+            // input-only ids that the output head cannot score.
             if let Some(reason) = limits.logprobs.prompt_logprobs_refusal(
-                input_ids,
+                &input_ids[start as usize + 1..],
                 request.has_multimodal_inputs,
                 limits.vocab_size,
             ) {
@@ -586,6 +596,7 @@ mod tests {
             multimodal: false,
             grammar: false,
             reasoning: None,
+            reasoning_usage: None,
             logprobs: LogprobServability {
                 supports_prompt_logprobs: true,
                 logprob_order: "torch".to_owned(),
@@ -851,6 +862,7 @@ mod tests {
             may_open: r#"{"may_open":SLOT}"#.to_owned(),
             schema_slot: "SLOT".to_owned(),
             markers: Some((7, 8)),
+            implicit_closer: None,
         };
         let admitted = |limits: &IngressLimits, prompt: Vec<i32>, schema: &str| {
             let params = SamplingParams {
@@ -960,6 +972,63 @@ mod tests {
         assert_eq!(admission.spec.max_cached_prefix_tokens, i32::MAX);
         assert!(!admission.state.wants_input_logprobs());
         assert!(admission.state.returns_input_logprobs);
+    }
+
+    #[test]
+    fn prompt_logprobs_accept_input_only_context() {
+        let limits = IngressLimits {
+            vocab_size: 64,
+            enable_output_logprobs: true,
+            ..limits()
+        };
+        for (input_ids, start) in [
+            (vec![100, 10, 11, 12], 0),
+            (vec![100, 100, 11, 12], 1),
+            (vec![100, 100, 100, 12], 2),
+            (vec![100, 100, 100, 100], 3),
+        ] {
+            let scored = TokenizedGenerateReqInput {
+                return_logprob: true,
+                logprob_start_len: start,
+                ..request(
+                    "input-only-context",
+                    input_ids.clone(),
+                    SamplingParams::default(),
+                )
+            };
+            let Some(Admitted::Run(admission)) = admit(scored, &limits) else {
+                panic!("unscored context must not be checked against the output vocabulary");
+            };
+            assert_eq!(admission.state.prompt_ids, input_ids);
+            assert_eq!(
+                admission.state.input_logprob_rows.as_ref().map(Vec::len),
+                (start < 3).then_some((3 - start) as usize)
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_logprobs_refuse_targets_outside_the_output_vocabulary() {
+        let limits = IngressLimits {
+            vocab_size: 64,
+            enable_output_logprobs: true,
+            ..limits()
+        };
+        for start in 0..3 {
+            for target_position in start + 1..4 {
+                for target in [-1, 64, 100] {
+                    let mut input_ids = vec![10; 4];
+                    input_ids[target_position] = target;
+                    let scored = TokenizedGenerateReqInput {
+                        return_logprob: true,
+                        logprob_start_len: start as i64,
+                        ..request("invalid-target", input_ids, SamplingParams::default())
+                    };
+                    assert!(refused_message(admit(scored, &limits).unwrap())
+                        .contains("inside the vocabulary"));
+                }
+            }
+        }
     }
 
     #[test]

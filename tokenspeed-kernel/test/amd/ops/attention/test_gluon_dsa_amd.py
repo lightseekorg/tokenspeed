@@ -1500,6 +1500,76 @@ def test_dsa_decode_topk_gluon_long_row_uses_radix_path() -> None:
     torch.testing.assert_close(torch.sort(topk_slots[0]).values.cpu(), expected.cpu())
 
 
+@pytest.mark.skipif(not is_cdna4(), reason="gfx950 codegen")
+@pytest.mark.parametrize("is_decode", [False, True])
+def test_dsa_persistent_topk_atomics_reach_l2_before_arrival(is_decode) -> None:
+    """Every wave's histogram atomics reach L2 before the program arrives.
+
+    All waves add to the row histogram, then one thread bumps the arrival
+    counter, and the last program releases pass_done to the others. Compile
+    without launching and check that, on every path, each wave runs
+    s_waitcnt vmcnt(0) before the barrier preceding each pass's arrival and
+    release.
+    """
+    from tokenspeed_kernel._triton import gluon, triton
+    from tokenspeed_kernel_amd._extern import extern_compile_options
+    from utils import vmcnt_zero_before_barrier
+
+    fn = dsa_topk_backend._dsa_persistent_radix_topk_kernel
+    pointers = (
+        "logits",
+        "histograms",
+        "pass_arrivals",
+        "pass_done",
+        "reset_arrivals",
+        "output_counters",
+        "block_table",
+        "row_starts",
+        "row_ends",
+        "out",
+        "lens_out",
+    )
+    signature = {name: "*i32" for name in pointers}
+    signature.update(logits="*fp32", logits_stride="i32", block_table_cols="i32")
+    constexprs = {
+        "out_stride": 2048,
+        "page_size": 64,
+        "q_len_per_req": 1,
+        "IS_DECODE": is_decode,
+        "GROUPS_PER_ROW": 4,
+        "TOPK": 2048,
+        "BLOCK_N": 8192,
+    }
+    signature.update({name: "constexpr" for name in constexprs})
+    signature = {name: signature[name] for name in fn.arg_names}
+    attrs = {
+        (index,): [["tt.divisibility", 16]]
+        for index, name in enumerate(fn.arg_names)
+        if name in pointers
+    }
+    kernel = triton.compile(
+        gluon._runtime.GluonASTSource(
+            fn, signature, constexprs=constexprs, attrs=attrs
+        ),
+        target=triton.backends.compiler.GPUTarget("hip", "gfx950", 64),
+        options={
+            "num_warps": dsa_topk_backend._PERSISTENT_NUM_WARPS,
+            **extern_compile_options(),
+        },
+    )
+    # Each pass has one arrival and one pass_done atomic on a scalar address,
+    # and the passes come first in program order; the later output-slot and
+    # reset atomics publish no histogram.
+    passes = int(dsa_topk_backend._PERSISTENT_NUM_PASSES)
+    atomics = vmcnt_zero_before_barrier(
+        kernel.asm["amdgcn"],
+        "_dsa_persistent_radix_topk_kernel",
+        r"\bglobal_atomic_add v\d+, v\d+, (?:v\d+, )?s\[",
+    )[: 2 * passes]
+    assert len(atomics) == 2 * passes, atomics
+    assert all(waited for _, waited, _ in atomics), atomics
+
+
 def test_dsa_prefill_topk_gluon_long_row_uses_radix_path() -> None:
     device = "cuda"
     page_size = 64

@@ -69,11 +69,26 @@ def _attribute_calls(node: ast.AST) -> list[ast.Call]:
     ]
 
 
+def _serving_captures(builder: ast.AST) -> list[int]:
+    """Lines where the boot path runs the serving capture on its executor."""
+    return [
+        call.lineno
+        for call in ast.walk(builder)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id == "_capture_serving_graphs"
+        and call.args
+        and isinstance(call.args[0], ast.Name)
+        and call.args[0].id == "executor"
+    ]
+
+
 def test_the_boot_path_runs_the_capture_step():
     """The one line that keeps boot behaviour unchanged has to be asserted.
 
     Construction no longer tunes, freezes or captures, so ``build_device_side``
-    calling ``capture_graphs`` is the whole of the change's boot contract. With
+    calling ``capture_graphs`` (through ``_capture_serving_graphs``, which a
+    forward reload repeats) is the whole of the change's boot contract. With
     that call gone the engine boots untuned, with an unfrozen workspace, no
     graphs and no post-startup seed -- and the first decode dies inside
     ``ForwardStepRunner`` on a graph key that was never captured, because
@@ -81,9 +96,12 @@ def test_the_boot_path_runs_the_capture_step():
     membership in ``self.graphs``.
     """
     builder = _function(_tree("device.py"), "build_device_side")
+    boot = _serving_captures(builder)
+    assert len(boot) == 1, boot
+    serving = _function(_tree("device.py"), "_capture_serving_graphs")
     calls = [
         call
-        for call in _attribute_calls(builder)
+        for call in _attribute_calls(serving)
         if call.func.attr == "capture_graphs"
         and isinstance(call.func.value, ast.Name)
         and call.func.value.id == "executor"
@@ -98,11 +116,7 @@ def test_the_capture_step_precedes_the_per_rank_memory_summary():
     graphs are already captured, so the step has to sit above the summary.
     """
     builder = _function(_tree("device.py"), "build_device_side")
-    capture = [
-        call.lineno
-        for call in _attribute_calls(builder)
-        if call.func.attr == "capture_graphs"
-    ]
+    capture = _serving_captures(builder)
     summary = [
         call.lineno
         for call in ast.walk(builder)
@@ -177,8 +191,8 @@ def test_the_step_names_every_operation_the_constructor_gave_up():
 def test_the_step_runs_its_operations_in_the_order_the_constructor_did():
     """Freeze, capture decode, capture prefill; the boot tunes before and seeds after.
 
-    Tuning and capture draw from the generator, so the boot path seeds once
-    they are done, exactly where the constructor used to.
+    Tuning and capture draw from the generator, so the serving capture seeds
+    once they are done, exactly where the constructor used to.
     """
     step = _function(_tree("model_executor.py"), "capture_graphs")
     sequence = [
@@ -194,11 +208,7 @@ def test_the_step_runs_its_operations_in_the_order_the_constructor_did():
         for call in _attribute_calls(builder)
         if call.func.attr == "autotune"
     ]
-    capture = [
-        call.lineno
-        for call in _attribute_calls(builder)
-        if call.func.attr == "capture_graphs"
-    ]
+    capture = _serving_captures(builder)
     assert len(tune) == 1, tune
     assert max(tune) < min(capture), (tune, capture)
 
@@ -213,14 +223,20 @@ def test_the_step_runs_its_operations_in_the_order_the_constructor_did():
     assert len(rebind) == 1, rebind
     assert max(tune) < min(rebind), (tune, rebind)
 
+    serving = _function(_tree("device.py"), "_capture_serving_graphs")
+    captured = [
+        call.lineno
+        for call in _attribute_calls(serving)
+        if call.func.attr == "capture_graphs"
+    ]
     seed = [
         call.lineno
-        for call in ast.walk(builder)
+        for call in ast.walk(serving)
         if isinstance(call, ast.Call)
         and isinstance(call.func, ast.Name)
         and call.func.id == "set_random_seed"
     ]
-    assert seed and capture and max(capture) < min(seed), (capture, seed)
+    assert seed and captured and max(captured) < min(seed), (captured, seed)
 
 
 if __name__ == "__main__":

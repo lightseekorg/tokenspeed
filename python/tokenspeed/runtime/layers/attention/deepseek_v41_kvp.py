@@ -69,7 +69,7 @@ def gather_paged_history(
         placement=placement,
         owned_rows_per_rank=counts,
     )
-    slots = plan.local_fetch_slots
+    slots = plan.send_slots
     local = cache[slots // 64, slots % 64].contiguous()
     # Page zero is never selected; padding is masked by visible lengths.
     result = cache.new_zeros((pages + 1, 64, cache.shape[-1]))

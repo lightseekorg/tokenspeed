@@ -34,6 +34,7 @@ from __future__ import annotations
 import math
 
 import torch
+from tokenspeed_kernel_amd._extern import extern_compile_options
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 from tokenspeed_kernel_amd.ops.gfx950.attention._common import (
     _INV_LN2,
@@ -41,9 +42,17 @@ from tokenspeed_kernel_amd.ops.gfx950.attention._common import (
     _LN2,
     MAX_KV_SPLITS,
     InputStrides,
+    _join_columns,
+    _keep_in_cluster,
+    _mfma_unscaled_fp8,
+    _split_columns,
+    _wave_maxima_unchanged,
     attention_layouts,
+    fp8_lse_shift,
+    fp8_probability_shift,
     max,
     maximum,
+    reject_block_scales,
     select_kv_splits,
 )
 
@@ -111,20 +120,78 @@ def _resolve_grid(
 # ===-----------------------------------------------------------------------===#
 
 _EXTEND_BLOCK_N = 64
-_EXTEND_SHORT_Q_BLOCK_M = 64
-_EXTEND_SHORT_Q_NUM_WARPS = 2
-_EXTEND_LONG_Q_BLOCK_M = 128
-_EXTEND_LONG_Q_NUM_WARPS = 4
+# (BLOCK_M, NUM_WARPS) of the query tiles, smallest first. The 8-wave tile
+# runs the warp-pipelined page loop (_stream_kv_warp_pipelined); the launcher
+# picks it by _use_warp_pipeline rather than by query length.
+_EXTEND_TILES = ((64, 2), (128, 4), (256, 8))
+_WARP_PIPELINE_NUM_WARPS = 8
+# Limits of the 8-wave tile (see _use_warp_pipeline): the shortest cached
+# prefix and sliding window, in keys, and the most rounds of work-groups a
+# sliding-window launch may take. Measured on MI355X with 16 query and 2 KV
+# heads (Muse Spark TP8), CUDA graph replay; re-checked on MI350X.
+_WARP_PIPELINE_MIN_PREFIX = 8192
+_WARP_PIPELINE_MIN_WINDOW = 2047
+_WARP_PIPELINE_MAX_WINDOW_ROUNDS = 4
 
 
-def _select_extend_tile(
-    max_seqlen_q: int, group_size: int
+def _warp_pipeline_supported(
+    *, head_dim: int, element_size: int, window_left: int
+) -> bool:
+    """Whether a layer can take the 8-wave tile: head dim 64 with 16-bit K/V,
+    where a wave's operands fit in 256 VGPRs and the K/V rings in 64 KB of
+    LDS, and full attention or a window of at least 2047 keys."""
+    return (
+        head_dim == 64
+        and element_size == 2
+        and (window_left < 0 or window_left >= _WARP_PIPELINE_MIN_WINDOW)
+    )
+
+
+def _use_warp_pipeline(
+    *,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    total_q: int,
+    group_size: int,
+    n_kv_heads: int,
+    head_dim: int,
+    element_size: int,
+    window_left: int,
+) -> bool:
+    """Whether an extend launch takes the 8-wave warp-pipelined tile.
+
+    The 8-wave loop finishes a page faster than the 4-wave one, but costs
+    more per work-group: it fills its K and V rings before the first page,
+    and one work-group takes a whole CU where two 4-wave ones fit. It wins
+    when every work-group streams many cached keys: under full attention a
+    cached prefix of at least _WARP_PIPELINE_MIN_PREFIX keys (split-K keeps
+    the grid full); under a sliding window a full window in every tile, a
+    work-group for every CU (windows never split), and at most
+    _WARP_PIPELINE_MAX_WINDOW_ROUNDS rounds of work-groups. Over more rounds
+    of one-window tiles the 4-wave tile measured as fast or faster.
+
+    The cached prefix is read as max_seqlen_k - max_seqlen_q, so callers
+    should pass the longest request's length as max_seqlen_k, as the
+    serving backend does for pure extends. A looser bound (the context
+    limit) can send short-prefix extends to the 8-wave tile, which then
+    runs up to 14% slower.
+    """
+    if max_seqlen_q <= _EXTEND_TILES[0][0] or not _warp_pipeline_supported(
+        head_dim=head_dim, element_size=element_size, window_left=window_left
+    ):
+        return False
+    prefix = max_seqlen_k - max_seqlen_q
+    if window_left < 0:
+        return prefix >= _WARP_PIPELINE_MIN_PREFIX
+    block_m, num_warps = _EXTEND_TILES[-1]
+    block_q = _extend_tile(block_m, num_warps, group_size)[1]
+    rounds = triton.cdiv(total_q, block_q) * n_kv_heads / _GFX950_SM_COUNT
+    return prefix >= window_left and 1 <= rounds <= _WARP_PIPELINE_MAX_WINDOW_ROUNDS
+
+
+def _extend_tile(
+    block_m: int, num_warps: int, group_size: int
 ) -> tuple[int, int, int, int]:
-    # Return (BLOCK_M, BLOCK_Q, BLOCK_N, NUM_WARPS) for the given max query length.
-    if max_seqlen_q <= _EXTEND_SHORT_Q_BLOCK_M:
-        block_m, num_warps = _EXTEND_SHORT_Q_BLOCK_M, _EXTEND_SHORT_Q_NUM_WARPS
-    else:
-        block_m, num_warps = _EXTEND_LONG_Q_BLOCK_M, _EXTEND_LONG_Q_NUM_WARPS
     # Each query position owns a power-of-two head span. Mask unused head
     # lanes instead of shrinking MFMA/range extents for groups such as 5 or 6.
     padded_group_size = triton.next_power_of_2(group_size)
@@ -132,6 +199,23 @@ def _select_extend_tile(
         block_m = padded_group_size
     block_q = block_m // padded_group_size
     return block_m, block_q, _EXTEND_BLOCK_N, num_warps
+
+
+def _select_extend_tile(
+    max_seqlen_q: int, group_size: int, warp_pipeline: bool
+) -> tuple[int, int, int, int]:
+    # Return (BLOCK_M, BLOCK_Q, BLOCK_N, NUM_WARPS): the 8-wave tile when
+    # warp_pipeline, else the smallest other tile with at least max_seqlen_q
+    # rows, or the largest one.
+    tiles = [
+        tile
+        for tile in _EXTEND_TILES
+        if (tile[1] == _WARP_PIPELINE_NUM_WARPS) == warp_pipeline
+    ]
+    for block_m, num_warps in tiles:
+        if max_seqlen_q <= block_m:
+            break
+    return _extend_tile(block_m, num_warps, group_size)
 
 
 @gluon.aggregate
@@ -192,7 +276,8 @@ class ExtendConfig:
         padded_group_size = triton.next_power_of_2(N_HEADS // N_KV_HEADS)
         assert BLOCK_M == BLOCK_Q * padded_group_size
 
-        # Extend uses a [32, 32, 16] MFMA with NUM_WARPS warp tiling.
+        # Extend uses a 32x32 MFMA with NUM_WARPS warp tiling: depth 16 for
+        # BF16, depth 64 (F8F6F4, twice the rate) for FP8.
         (
             qk_layout,
             pv_layout,
@@ -210,7 +295,7 @@ class ExtendConfig:
             IS_FP8,
             KV_DTYPE,
             num_warps=NUM_WARPS,
-            instr_shape=[32, 32, 16],
+            instr_shape=[32, 32, 64] if IS_FP8 else [32, 32, 16],
         )
 
         self.N_HEADS = gl.constexpr(N_HEADS)
@@ -436,10 +521,14 @@ class ExtendProgram:
         qk = gl.zeros(
             [cfg.BLOCK_M, cfg.BLOCK_N], dtype=gl.float32, layout=cfg.qk_layout
         )
+        if cfg.IS_FP8:
+            return _mfma_unscaled_fp8(q, k, qk)
         return cdna4.mfma(q, k, qk)
 
     @gluon.jit
     def compute_pv(self, p, v, acc):
+        if self.cfg.IS_FP8:
+            return _mfma_unscaled_fp8(p, v, acc)
         return cdna4.mfma(p, v, acc)
 
     @gluon.jit
@@ -518,7 +607,8 @@ class ExtendProgram:
             invalid = m_new == -float("inf")
             m_new_scaled = gl.where(invalid, 0.0, m_new_scaled)
 
-        qk_shifted = qk * cfg.SM_SCALE - m_new_scaled[:, None]
+        p_shift = fp8_probability_shift(m_new_scaled, cfg.IS_FP8)
+        qk_shifted = qk * cfg.SM_SCALE - p_shift[:, None]
         p = gl.exp2(qk_shifted)
         m_diff = m_i * cfg.SM_SCALE - m_new_scaled
         if HAS_INVALID:
@@ -536,7 +626,7 @@ class ExtendProgram:
     def apply_sinks(self, l_i, m_i, sink_log2):
         cfg = self.cfg
         if cfg.HAS_SINK:
-            l_i += gl.exp2(sink_log2 - m_i * cfg.SM_SCALE)
+            l_i += gl.exp2(sink_log2 - fp8_lse_shift(m_i, cfg.SM_SCALE, cfg.IS_FP8))
         return l_i
 
     @gluon.jit
@@ -565,10 +655,11 @@ class ExtendProgram:
             offsets = ((self.seq_base + q_pos) * cfg.N_HEADS + q_head).to(gl.int32)
             mask = (q_pos < self.seq_len) & self.row_has_head(offs_m)
             lse_l_i = gl.where(l_i > 0.0, l_i, 1.0)
-            # Softmax runs in base-2 (exp2 hardware fast path), so m_i*SM_SCALE +
-            # log2(l_i) is the LSE in base-2 units. Convert to natural log (the
-            # public op contract / torch.logsumexp convention) by scaling by ln2.
-            lse = (m_i * cfg.SM_SCALE + gl.log2(lse_l_i)) * _LN2
+            # Softmax runs in base 2, so `fp8_lse_shift(m_i) + log2(l_i)` is
+            # the base-2 LSE; scale by ln 2 for the natural-log contract.
+            lse = (
+                fp8_lse_shift(m_i, cfg.SM_SCALE, cfg.IS_FP8) + gl.log2(lse_l_i)
+            ) * _LN2
             cdna4.buffer_store(lse, self.lse_ptr, offsets, mask=mask)
 
     @gluon.jit
@@ -577,7 +668,7 @@ class ExtendProgram:
     ):
         # Split-K partial store: mid_o[row, head, split] = acc / l_i (this
         # split's local softmax normalization) and mid_lse[row, head, split] =
-        # m_i * SM_SCALE + log2(l_i) in base-2 units, matching the decode
+        # fp8_lse_shift(m_i) + log2(l_i), the base-2 LSE, matching the decode
         # kernel's store_split so a shared reduce can merge splits. Rows whose
         # split saw no valid key (l_i == 0, e.g. a split entirely above the
         # causal diagonal) store a -inf lse / zero output so the reduce ignores
@@ -598,7 +689,8 @@ class ExtendProgram:
         part_o = acc * inv_l[:, None]
         part_lse = gl.where(
             has_kv,
-            m_i * cfg.SM_SCALE + gl.log2(gl.where(has_kv, l_i, 1.0)),
+            fp8_lse_shift(m_i, cfg.SM_SCALE, cfg.IS_FP8)
+            + gl.log2(gl.where(has_kv, l_i, 1.0)),
             -float("inf"),
         )
         o_off = (
@@ -607,6 +699,282 @@ class ExtendProgram:
         lse_off = (row * cfg.N_HEADS + q_head) * num_kv_splits + split_id
         cdna4.buffer_store(part_o, mid_o_ptr, o_off, mask=valid[:, None])
         cdna4.buffer_store(part_lse, mid_lse_ptr, lse_off, mask=valid)
+
+
+@gluon.jit
+def _needs_mask(cfg, start_n, window_end, mask_start):
+    # Whether the page starting at key start_n holds a key that some row of
+    # the tile must not see (see _stream_kv). The operands are the same for
+    # every lane of the work-group, so all its waves take the same branch.
+    needs = start_n + cfg.BLOCK_N > mask_start
+    if cfg.WINDOW_LEFT >= 0:
+        needs = needs | (start_n < window_end)
+    return needs
+
+
+# ===-----------------------------------------------------------------------===#
+# Warp-pipelined page loop (8 waves)
+#
+# A work-group of 8 waves owns 256 query rows, 32 per wave, and walks the KV
+# pages. Each loop iteration j finishes page j in four warp-pipeline clusters,
+# as in mla/prefill_8wave.py:
+#
+#   load_k   read K(j + 1) from LDS; copy V(j + 2) into LDS; deferred rescale
+#   qk_sum   QK MFMAs of page j + 1; exp2, row sum and P conversion of page j
+#   load_v   read V(j) from LDS; copy K(j + 4) into LDS
+#   pv_max   PV MFMAs of page j; row maximum and exp2 of page j + 1
+#
+# The two waves on a SIMD run one cluster apart, so one wave's MFMAs and
+# softmax overlap the other wave's LDS reads and copy issue. The copy clusters
+# run at a higher s_setprio priority, so when both waves have an instruction
+# ready, the copy wave's issues first. K and V move through 4-slot LDS rings,
+# K four pages ahead and V two; a copy overwrites a slot that both waves read
+# in an earlier cluster. Copies past the range repeat its last page, and the
+# last page is finished after the loop, so no page past the range is scored.
+#
+# The running maximum is updated lazily: it moves only when a page raises a
+# row's maximum by more than 2**8, so exp2 of a score stays below 2**8 and most
+# pages skip the accumulator rescale.
+# ===-----------------------------------------------------------------------===#
+
+# exp2(score - running maximum) stays below 2**_RESCALE_THRESHOLD, which a
+# 16-bit P holds without losing relative precision.
+_RESCALE_THRESHOLD = gl.constexpr(8.0)
+
+
+@gluon.jit
+def _rescale_accumulator(*args):
+    # map_elementwise passes a lane's accumulator values, then alpha and the
+    # wave's vote, each once per value. All of a lane's accumulator values
+    # belong to one row, so one scalar branch skips the multiplies for a wave
+    # whose rows all kept their maximum.
+    n: gl.constexpr = len(args) // 3
+    values = args[:n]
+    if args[2 * n] == 0:
+        scaled = ()
+        for i in gl.static_range(n):
+            scaled += (values[i] * args[n],)
+        values = scaled
+    return values
+
+
+@gluon.jit
+def _rescale(cfg, acc, l_i, m_old, m_new):
+    # Apply the deferred correction from m_old to m_new.
+    unchanged = _wave_maxima_unchanged(m_old, m_new)
+    alpha = gl.where(unchanged == 0, gl.exp2(m_old - m_new), 1.0)
+    l_i = l_i * alpha
+    acc_per_lane: gl.constexpr = cfg.BLOCK_M * cfg.HEAD_DIM // (cfg.NUM_WARPS * 64)
+    (acc,) = gl.map_elementwise(
+        _rescale_accumulator,
+        acc,
+        alpha[:, None],
+        unchanged[:, None],
+        pack=acc_per_lane,
+    )
+    return acc, l_i
+
+
+@gluon.jit
+def _softmax_max(program, scores, m_run, start_n, kv_end, MASKED: gl.constexpr):
+    # Row maximum and exponent argument of page start_n's scores in base-2
+    # units, plus exp2 of their first quarter. _softmax_sum exponentiates the
+    # rest, so both MFMA clusters carry vector work. Every returned value is
+    # computed here, into fresh registers, so the next QK MFMA can reuse the
+    # score registers.
+    cfg = program.cfg
+    if MASKED:
+        scores = program.mask_kv(scores, start_n, kv_end)
+    row_max = max(scores, 1) * cfg.SM_SCALE
+    if MASKED:
+        # A row with no visible key keeps a finite maximum, so exp2 of its
+        # masked scores is 0 rather than NaN.
+        row_max = gl.where(row_max == -float("inf"), -1.0e20, row_max)
+    m_new = gl.where(row_max - m_run > _RESCALE_THRESHOLD, row_max, m_run)
+    # A multiply-subtract rather than gl.fma packs into v_pk_fma_f32.
+    shifted = scores * cfg.SM_SCALE - m_new[:, None]
+    first_half, second_half = _split_columns(shifted)
+    first, second = _split_columns(first_half)
+    p_first = _keep_in_cluster(gl.exp2(first))
+    second = _keep_in_cluster(second)
+    second_half = _keep_in_cluster(second_half)
+    return m_new, p_first, second, second_half
+
+
+@gluon.jit
+def _softmax_sum(program, p_first, second, second_half, l_i):
+    cfg = program.cfg
+    p = _join_columns(_join_columns(p_first, gl.exp2(second)), gl.exp2(second_half))
+    l_i = l_i + gl.sum(p, axis=1)
+    # With 16-bit P (k_width 4) the PV operand matches the score layout
+    # register for register, so the conversion moves no data.
+    p = gl.convert_layout(p.to(program.q_ptr.dtype.element_ty), cfg.p_layout)
+    return _keep_in_cluster(p), l_i
+
+
+@gluon.jit
+def _pipelined_pages(
+    program,
+    q,
+    k_smem,
+    v_smem,
+    tile_offsets,
+    kv_start,
+    kv_end,
+    last_page,
+    state,
+    begin,
+    end,
+    MASKED: gl.constexpr,
+):
+    # Finish pages [begin, end). state carries the loop's values between
+    # calls. On entry the softmax pieces (p_first, second, second_half) and
+    # m_i hold page begin's softmax input, and the rescale from m_old to m_i
+    # is still pending; K up to page begin + 3 and V up to begin + 1 are
+    # copied, with K(begin + 1) and V(begin) visible to every wave. pages
+    # holds the physical pages of begin + 2 to begin + 5. MASKED selects the
+    # score mask of page j + 1, whose row maximum iteration j computes.
+    cfg = program.cfg
+    ring: gl.constexpr = k_smem.shape[0]
+    pages, p_first, second, second_half, m_old, m_i, l_i, acc = state
+    p2, p3, p4, p5 = pages
+    for j in range(begin, end):
+        # A wave waits only for its own copies, and the other wave on the SIMD
+        # runs one cluster behind. Keeping three groups in flight completes
+        # each page a full cluster before its first read, so both waves'
+        # shares have landed whichever wave reads it.
+        async_copy.wait_group(3)
+        with gl.amd.warp_pipeline_stage("load_k", priority=1):
+            # A scalar load, issued four iterations before its first use.
+            p6 = program.select_page(
+                program.load_page_indices(
+                    kv_start + (j + 6) * cfg.BLOCK_N, last_page, 1
+                ),
+                0,
+            )
+            k = program.shared_load_k(k_smem.index((j + 1) % ring))
+            program.load_page_to_shared(
+                program.v_cache_ptr, p2, tile_offsets, v_smem.index((j + 2) % ring)
+            )
+            async_copy.commit_group()
+            # Control flow stays out of the MFMA clusters: a branch there is
+            # scheduled ahead of the first MFMA and stalls the matrix core.
+            acc, l_i = _rescale(cfg, acc, l_i, m_old, m_i)
+        with gl.amd.warp_pipeline_stage("qk_sum", priority=0):
+            scores = program.compute_qk(q, k)
+            p, l_i = _softmax_sum(program, p_first, second, second_half, l_i)
+        async_copy.wait_group(3)
+        with gl.amd.warp_pipeline_stage("load_v", priority=1):
+            v = program.shared_load_v(v_smem.index(j % ring))
+            program.load_page_to_shared(
+                program.k_cache_ptr, p4, tile_offsets, k_smem.index((j + 4) % ring)
+            )
+            async_copy.commit_group()
+        with gl.amd.warp_pipeline_stage("pv_max", priority=0):
+            acc = program.compute_pv(p, v, acc)
+            m_old = m_i
+            m_i, p_first, second, second_half = _softmax_max(
+                program, scores, m_i, kv_start + (j + 1) * cfg.BLOCK_N, kv_end, MASKED
+            )
+        p2, p3, p4, p5 = p3, p4, p5, p6
+    return (p2, p3, p4, p5), p_first, second, second_half, m_old, m_i, l_i, acc
+
+
+@gluon.jit
+def _stream_kv_warp_pipelined(
+    program,
+    q,
+    m_i,
+    l_i,
+    acc,
+    kv_start,
+    kv_end,
+    window_end,
+    mask_start,
+    last_page,
+    tile_offsets,
+    k_smem,
+    v_smem,
+):
+    """_stream_kv for 8-wave tiles. m_i is in raw score units on entry and
+    return, as elsewhere; the loop keeps it in base-2 units."""
+    cfg = program.cfg
+    gl.static_assert(cfg.NUM_WARPS == 8 and cfg.BLOCK_M == 256)
+    gl.static_assert(k_smem.shape[0] == 4, "the loop's copy distances need 4 slots")
+    gl.static_assert(not cfg.IS_FP8, "FP8 uses the 4-wave tiles")
+    count = gl.cdiv(kv_end - kv_start, cfg.BLOCK_N)
+    m_i = m_i * cfg.SM_SCALE
+    if count > 0:
+        first = program.load_page_indices(kv_start, last_page, 4)
+        # The loop's page queue, loaded before the first copies so its scalar
+        # loads return while they are in flight.
+        p2 = program.select_page(
+            program.load_page_indices(kv_start + 2 * cfg.BLOCK_N, last_page, 1), 0
+        )
+        p3 = program.select_page(
+            program.load_page_indices(kv_start + 3 * cfg.BLOCK_N, last_page, 1), 0
+        )
+        p4 = program.select_page(
+            program.load_page_indices(kv_start + 4 * cfg.BLOCK_N, last_page, 1), 0
+        )
+        p5 = program.select_page(
+            program.load_page_indices(kv_start + 5 * cfg.BLOCK_N, last_page, 1), 0
+        )
+        # Fill the rings in the loop's steady-state commit order: iteration j
+        # commits V(j + 2) and then K(j + 4).
+        page0 = program.select_page(first, 0)
+        page1 = program.select_page(first, 1)
+        page2 = program.select_page(first, 2)
+        page3 = program.select_page(first, 3)
+        k_ptr = program.k_cache_ptr
+        v_ptr = program.v_cache_ptr
+        program.load_page_to_shared(k_ptr, page0, tile_offsets, k_smem.index(0))
+        async_copy.commit_group()
+        program.load_page_to_shared(k_ptr, page1, tile_offsets, k_smem.index(1))
+        async_copy.commit_group()
+        program.load_page_to_shared(v_ptr, page0, tile_offsets, v_smem.index(0))
+        async_copy.commit_group()
+        program.load_page_to_shared(k_ptr, page2, tile_offsets, k_smem.index(2))
+        async_copy.commit_group()
+        program.load_page_to_shared(v_ptr, page1, tile_offsets, v_smem.index(1))
+        async_copy.commit_group()
+        program.load_page_to_shared(k_ptr, page3, tile_offsets, k_smem.index(3))
+        async_copy.commit_group()
+        # Six groups are in flight; waiting down to five retires K(0). The
+        # compiler's barrier after each wait makes every wave's share of the
+        # page visible before it is read.
+        async_copy.wait_group(5)
+        scores = program.compute_qk(q, program.shared_load_k(k_smem.index(0)))
+        m_new, p_first, second, second_half = _softmax_max(
+            program, scores, m_i, kv_start, kv_end, True
+        )
+        # Down to three retires K(1) and V(0) for the first iteration.
+        async_copy.wait_group(3)
+        # acc and l_i still hold no keys, so page 0 needs no rescale: the
+        # pending rescale starts from m_new.
+        state = ((p2, p3, p4, p5), p_first, second, second_half, m_new, m_new, l_i, acc)
+        # The pages _needs_mask selects are the head_pages before the window's
+        # lower edge and those from tail_page on. Iteration j scores page
+        # j + 1, so each boundary moves one iteration back. The loops stop
+        # before the last page, which is finished after them.
+        head_pages = gl.cdiv(window_end - kv_start, cfg.BLOCK_N)
+        tail_page = (mask_start - kv_start) // cfg.BLOCK_N
+        head = gl.minimum(gl.maximum(head_pages - 1, 0), count - 1)
+        tail = gl.minimum(gl.maximum(tail_page - 1, head), count - 1)
+        args = (program, q, k_smem, v_smem, tile_offsets, kv_start, kv_end, last_page)
+        if cfg.WINDOW_LEFT >= 0:
+            state = _pipelined_pages(*args, state, 0, head, True)
+        state = _pipelined_pages(*args, state, head, tail, False)
+        state = _pipelined_pages(*args, state, tail, count - 1, True)
+        _, p_first, second, second_half, m_old, m_i, l_i, acc = state
+        # Finish the last page without scoring a page after it. Its V and the
+        # copies past the range retire together.
+        acc, l_i = _rescale(cfg, acc, l_i, m_old, m_i)
+        p, l_i = _softmax_sum(program, p_first, second, second_half, l_i)
+        async_copy.wait_group(0)
+        v = program.shared_load_v(v_smem.index((count - 1) % k_smem.shape[0]))
+        acc = program.compute_pv(p, v, acc)
+    return m_i / cfg.SM_SCALE, l_i, acc
 
 
 @gluon.jit
@@ -629,6 +997,9 @@ def _stream_kv(
     copied into the buffer page p - 1 freed while page p is consumed. Each
     iteration consumes NUM_STAGES pages, one per buffer. NUM_STAGES == 1, or a
     range with fewer pages than buffers, is single-buffered.
+
+    8-wave tiles take the warp-pipelined loop instead
+    (_stream_kv_warp_pipelined), with NUM_STAGES == 4 slots per ring.
     """
     cfg = program.cfg
     k_smem = gl.allocate_shared_memory(
@@ -641,16 +1012,41 @@ def _stream_kv(
         [NUM_STAGES, cfg.BLOCK_N, cfg.HEAD_DIM],
         cfg.v_smem_layout,
     )
-    # Keys before mask_start are visible to every row of the tile, so pages
-    # that end by it need no mask.
-    if cfg.WINDOW_LEFT >= 0:
-        mask_start = kv_start
-    elif cfg.IS_CAUSAL:
+    # Keys in [window_end, mask_start) are visible to every row of the tile,
+    # so pages inside that range need no mask. The causal diagonal and the
+    # cache end only cut pages that end past mask_start (the first row's
+    # position when causal, else the cache end). A sliding window only cuts
+    # pages that start before window_end, the window's lower edge for the
+    # tile's last row: a long window spans many pages, and only the pages
+    # that hold some row's window edge need the mask.
+    if cfg.IS_CAUSAL:
         mask_start = min(program.prefix + program.q_pos_base, kv_end)
     else:
         mask_start = kv_end
+    if cfg.WINDOW_LEFT >= 0:
+        window_end = (
+            program.prefix + program.q_pos_base + cfg.BLOCK_Q - 1 - cfg.WINDOW_LEFT
+        )
+    else:
+        window_end = kv_start
     last_page = (kv_end - 1) // cfg.PAGE_SIZE
     tile_offsets = program.page_tile_offsets()
+    if cfg.NUM_WARPS == 8:
+        return _stream_kv_warp_pipelined(
+            program,
+            q,
+            m_i,
+            l_i,
+            acc,
+            kv_start,
+            kv_end,
+            window_end,
+            mask_start,
+            last_page,
+            tile_offsets,
+            k_smem,
+            v_smem,
+        )
     iteration_tokens: gl.constexpr = NUM_STAGES * cfg.BLOCK_N
 
     if NUM_STAGES == 1 or kv_end - kv_start < iteration_tokens:
@@ -665,7 +1061,7 @@ def _stream_kv(
             async_copy.wait_group(1)
             k = program.shared_load_k(k_smem.index(0))
             qk = program.compute_qk(q, k)
-            if start_n + cfg.BLOCK_N > mask_start:
+            if _needs_mask(cfg, start_n, window_end, mask_start):
                 qk = program.mask_kv(qk, start_n, kv_end)
             p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc, ALLOW_INVALID)
             async_copy.wait_group(0)
@@ -711,7 +1107,7 @@ def _stream_kv(
                 async_copy.wait_group(2 * NUM_STAGES - 1)
                 k = program.shared_load_k(k_smem.index(stage))
                 qk = program.compute_qk(q, k)
-                if start_n + cfg.BLOCK_N > mask_start:
+                if _needs_mask(cfg, start_n, window_end, mask_start):
                     qk = program.mask_kv(qk, start_n, kv_end)
                 p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc, ALLOW_INVALID)
                 async_copy.wait_group(2 * NUM_STAGES - 2)
@@ -724,7 +1120,9 @@ def _stream_kv(
     return m_i, l_i, acc
 
 
-@gluon.jit
+# The request count follows the batch. Without do_not_specialize, Triton would
+# compile separate binaries for a count of 1 and for multiples of 16.
+@gluon.jit(do_not_specialize=("num_seqs",))
 def gluon_mha_extend_gfx950(
     q_ptr,
     k_cache_ptr,
@@ -852,7 +1250,7 @@ def gluon_mha_extend_gfx950(
     program.store_lse(l_i, m_i)
 
 
-@gluon.jit
+@gluon.jit(do_not_specialize=("num_seqs",))
 def gluon_mha_extend_split_gfx950(
     q_ptr,
     k_cache_ptr,
@@ -1077,10 +1475,24 @@ _EXTEND_PIPELINED_WORKGROUPS_PER_CU = 2
 _EXTEND_SINGLE_WORKGROUPS_PER_CU = 3
 
 
+def _extend_stage_choices(
+    *, num_warps: int, head_dim: int, page_size: int, element_size: int
+) -> tuple[int, ...]:
+    """Pipeline depths _extend_stages picks from, single-buffered first."""
+    if num_warps == _WARP_PIPELINE_NUM_WARPS:
+        # The warp-pipelined loop always streams through 4-slot rings.
+        return (_EXTEND_STAGES,)
+    pipeline_bytes = 2 * _EXTEND_STAGES * page_size * head_dim * element_size
+    if pipeline_bytes > _EXTEND_PIPELINE_MAX_LDS_BYTES:
+        return (1,)
+    return (1, _EXTEND_STAGES)
+
+
 def _extend_stages(
     *,
     num_workgroups: int,
     split: bool,
+    num_warps: int,
     head_dim: int,
     page_size: int,
     element_size: int,
@@ -1091,18 +1503,21 @@ def _extend_stages(
     launch of num_workgroups workgroups pipelines only when the grid then needs
     no more rounds of resident workgroups than single-buffered.
     """
-    pipeline_bytes = 2 * _EXTEND_STAGES * page_size * head_dim * element_size
-    if pipeline_bytes > _EXTEND_PIPELINE_MAX_LDS_BYTES:
-        return 1
-    if split:
-        return _EXTEND_STAGES
+    choices = _extend_stage_choices(
+        num_warps=num_warps,
+        head_dim=head_dim,
+        page_size=page_size,
+        element_size=element_size,
+    )
+    if split or len(choices) == 1:
+        return choices[-1]
     pipelined_rounds = triton.cdiv(
         num_workgroups, _EXTEND_PIPELINED_WORKGROUPS_PER_CU * _GFX950_SM_COUNT
     )
     single_rounds = triton.cdiv(
         num_workgroups, _EXTEND_SINGLE_WORKGROUPS_PER_CU * _GFX950_SM_COUNT
     )
-    return _EXTEND_STAGES if pipelined_rounds <= single_rounds else 1
+    return choices[-1] if pipelined_rounds <= single_rounds else choices[0]
 
 
 def launch_gluon_mha_extend_gfx950(
@@ -1125,12 +1540,121 @@ def launch_gluon_mha_extend_gfx950(
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    reject_block_scales(
+        "gluon_mha_extend_gfx950", q_scale=q_scale, k_scale=k_scale, v_scale=v_scale
+    )
+    return _extend(
+        q,
+        cu_seqlens_q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        is_causal=is_causal,
+        window_left=window_left,
+        sinks=sinks,
+        return_lse=return_lse,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        softmax_scale=softmax_scale,
+        compile_all_variants=False,
+    )
+
+
+def warmup_gluon_mha_extend_gfx950(
+    q: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_kv: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    is_causal: bool = False,
+    window_left: int = -1,
+    logit_cap: float = 0.0,
+    sinks: torch.Tensor | None = None,
+    return_lse: bool = False,
+    max_seqlen_q: int = 1,
+    max_seqlen_k: int = 1,
+    softmax_scale: float | None = None,
+    q_scale: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+) -> None:
+    """Compile every kernel variant the extend launcher can pick, without running.
+
+    Takes the launcher's arguments. The query tile, the K/V pipeline depth,
+    the grid, whether full attention splits the KV stream and whether the
+    split count is a multiple of 16 follow the batch; each choice is a
+    separate binary. This compiles all of them for the model's heads, dtypes, window,
+    sinks and LSE output, and for the tensors' strides and alignment, so a
+    server can compile them at startup. The batch shape of the arguments
+    (lengths, request count) does not matter.
+    """
+    reject_block_scales(
+        "gluon_mha_extend_gfx950", q_scale=q_scale, k_scale=k_scale, v_scale=v_scale
+    )
+    _extend(
+        q,
+        cu_seqlens_q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_seqlens,
+        is_causal=is_causal,
+        window_left=window_left,
+        sinks=sinks,
+        return_lse=return_lse,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        softmax_scale=softmax_scale,
+        compile_all_variants=True,
+    )
+
+
+def _extend(
+    q: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    *,
+    is_causal: bool,
+    window_left: int,
+    sinks: torch.Tensor | None,
+    return_lse: bool,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float | None,
+    compile_all_variants: bool,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None:
+    """Launch the extend variant this batch selects, or compile them all.
+
+    Picks the query tile, K/V pipeline depth, grid layout, and split count
+    from the batch, then launches that variant and returns its output (and
+    the LSE with ``return_lse``). With ``compile_all_variants``, it instead
+    compiles every variant any batch can select and returns None. Other
+    arguments are as for ``launch_gluon_mha_extend_gfx950``.
+    """
     head_dim = q.shape[2]
     n_heads = q.shape[1]
     n_kv_heads = k_cache.shape[2]
     group_size = n_heads // n_kv_heads
     page_size = k_cache.shape[1]
-    block_m, block_q, block_n, num_warps = _select_extend_tile(max_seqlen_q, group_size)
+    total_q = q.shape[0]
+    warp_pipeline = _use_warp_pipeline(
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        total_q=total_q,
+        group_size=group_size,
+        n_kv_heads=n_kv_heads,
+        head_dim=head_dim,
+        element_size=k_cache.element_size(),
+        window_left=window_left,
+    )
+    tile = _select_extend_tile(max_seqlen_q, group_size, warp_pipeline)
+    block_q = tile[1]
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
     sm_scale = softmax_scale * _INV_LN2_VALUE
@@ -1147,7 +1671,6 @@ def launch_gluon_mha_extend_gfx950(
     # this avoids the ragged +num_seqs padding regressing uniform-q launches
     # while still unlocking the fused mixed path.
     batch = cu_seqlens_q.shape[0] - 1
-    total_q = q.shape[0]
     safe_max_q = max_seqlen_q if max_seqlen_q > 0 else 1
     blocks_per_req = (safe_max_q + block_q - 1) // block_q
     rect_num_q_blocks = blocks_per_req * batch
@@ -1181,7 +1704,9 @@ def launch_gluon_mha_extend_gfx950(
     if not is_sliding:
         num_pages = (max_seqlen_k + page_size - 1) // page_size
         num_kv_splits = select_kv_splits(
-            base_ctas=grid_num_q_blocks * n_kv_heads,
+            # An 8-wave work-group takes a whole CU, where two 4-wave ones
+            # fit, so it counts twice toward filling the machine.
+            base_ctas=grid_num_q_blocks * n_kv_heads * (2 if warp_pipeline else 1),
             num_pages=num_pages,
             sm_count=_GFX950_SM_COUNT,
         )
@@ -1189,30 +1714,19 @@ def launch_gluon_mha_extend_gfx950(
     # Bound on q-blocks with query rows: the dense count plus one partial
     # block for each further request.
     num_q_blocks = min(rect_num_q_blocks, triton.cdiv(total_q, block_q) + batch - 1)
+    stage_args = dict(
+        head_dim=head_dim, page_size=page_size, element_size=k_cache.element_size()
+    )
     num_stages = _extend_stages(
         num_workgroups=num_q_blocks * n_kv_heads,
         split=num_kv_splits > 1,
-        head_dim=head_dim,
-        page_size=page_size,
-        element_size=k_cache.element_size(),
+        num_warps=tile[3],
+        **stage_args,
     )
 
-    if num_kv_splits > 1:
-        mid_o = torch.empty(
-            (total_q, n_heads, num_kv_splits, head_dim),
-            device=q.device,
-            dtype=torch.float32,
-        )
-        mid_lse = torch.empty(
-            (total_q, n_heads, num_kv_splits),
-            device=q.device,
-            dtype=torch.float32,
-        )
-        if use_ragged:
-            split_grid = (ragged_num_q_blocks, n_kv_heads, num_kv_splits)
-        else:
-            split_grid = (blocks_per_req * num_kv_splits, batch, n_kv_heads)
-        gluon_mha_extend_split_gfx950[split_grid](
+    def split_args(tile, num_stages, ragged, num_kv_splits, mid_o, mid_lse):
+        block_m, block_q, block_n, num_warps = tile
+        return (
             q,
             k_cache,
             v_cache,
@@ -1239,12 +1753,12 @@ def launch_gluon_mha_extend_gfx950(
             num_kv_splits,
             is_causal,
             is_fp8,
-            use_ragged,
+            ragged,
             num_stages,
-            num_warps=num_warps,
         )
-        reduce_grid = (total_q, n_heads)
-        gluon_mha_extend_reduce_gfx950[reduce_grid](
+
+    def reduce_args(num_kv_splits, mid_o, mid_lse):
+        return (
             mid_o,
             mid_lse,
             output,
@@ -1255,6 +1769,115 @@ def launch_gluon_mha_extend_gfx950(
             head_dim,
             has_sink,
             return_lse,
+        )
+
+    def unsplit_args(tile, num_stages, ragged):
+        block_m, block_q, block_n, num_warps = tile
+        return (
+            q,
+            k_cache,
+            v_cache,
+            page_table,
+            output,
+            lse_arg,
+            sink_arg,
+            cu_q_i32,
+            cache_i32,
+            batch,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            sm_scale,
+            page_table.stride(0),
+            page_size,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            block_m,
+            block_q,
+            block_n,
+            num_warps,
+            is_causal,
+            has_sink,
+            return_lse,
+            window_left,
+            is_fp8,
+            ragged,
+            num_stages,
+        )
+
+    def split_buffers(rows, num_kv_splits):
+        mid_o = torch.empty(
+            (rows, n_heads, num_kv_splits, head_dim),
+            device=q.device,
+            dtype=torch.float32,
+        )
+        mid_lse = torch.empty(
+            (rows, n_heads, num_kv_splits),
+            device=q.device,
+            dtype=torch.float32,
+        )
+        return mid_o, mid_lse
+
+    if compile_all_variants:
+        # Every tile _select_extend_tile can return, with every pipeline depth
+        # _extend_stages can pick for it, on both grids. Triton also compiles
+        # an integer argument separately when it is a multiple of 16, so the
+        # split kernels take one split count of each kind select_kv_splits
+        # can return. The request count is not specialized.
+        pipeline_supported = _warp_pipeline_supported(
+            head_dim=head_dim,
+            element_size=k_cache.element_size(),
+            window_left=window_left,
+        )
+        tiles = {
+            _extend_tile(m, w, group_size)
+            for m, w in _EXTEND_TILES
+            if w != _WARP_PIPELINE_NUM_WARPS or pipeline_supported
+        }
+        split_counts = {n % 16 == 0: n for n in range(2, MAX_KV_SPLITS + 1)}
+        # Compiling needs only their dtype and alignment, not their size.
+        mid_o, mid_lse = split_buffers(1, MAX_KV_SPLITS)
+        for tile in sorted(tiles):
+            options = dict(grid=(1,), num_warps=tile[3], **extern_compile_options())
+            stage_choices = _extend_stage_choices(num_warps=tile[3], **stage_args)
+            split_stages = _extend_stages(
+                num_workgroups=1, split=True, num_warps=tile[3], **stage_args
+            )
+            for ragged in (False, True):
+                for stages in stage_choices:
+                    gluon_mha_extend_gfx950.warmup(
+                        *unsplit_args(tile, stages, ragged), **options
+                    )
+                if is_sliding:
+                    continue
+                for splits in split_counts.values():
+                    gluon_mha_extend_split_gfx950.warmup(
+                        *split_args(tile, split_stages, ragged, splits, mid_o, mid_lse),
+                        **options,
+                    )
+        if not is_sliding:
+            for splits in split_counts.values():
+                gluon_mha_extend_reduce_gfx950.warmup(
+                    *reduce_args(splits, mid_o, mid_lse), grid=(1,), num_warps=1
+                )
+        return None
+
+    num_warps = tile[3]
+    if num_kv_splits > 1:
+        mid_o, mid_lse = split_buffers(total_q, num_kv_splits)
+        if use_ragged:
+            split_grid = (ragged_num_q_blocks, n_kv_heads, num_kv_splits)
+        else:
+            split_grid = (blocks_per_req * num_kv_splits, batch, n_kv_heads)
+        gluon_mha_extend_split_gfx950[split_grid](
+            *split_args(tile, num_stages, use_ragged, num_kv_splits, mid_o, mid_lse),
+            num_warps=num_warps,
+            **extern_compile_options(),
+        )
+        reduce_grid = (total_q, n_heads)
+        gluon_mha_extend_reduce_gfx950[reduce_grid](
+            *reduce_args(num_kv_splits, mid_o, mid_lse),
             num_warps=1,
         )
         if return_lse:
@@ -1266,37 +1889,9 @@ def launch_gluon_mha_extend_gfx950(
     else:
         grid = (blocks_per_req, batch, n_kv_heads)
     gluon_mha_extend_gfx950[grid](
-        q,
-        k_cache,
-        v_cache,
-        page_table,
-        output,
-        lse_arg,
-        sink_arg,
-        cu_q_i32,
-        cache_i32,
-        batch,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        sm_scale,
-        page_table.stride(0),
-        page_size,
-        n_heads,
-        n_kv_heads,
-        head_dim,
-        block_m,
-        block_q,
-        block_n,
-        num_warps,
-        is_causal,
-        has_sink,
-        return_lse,
-        window_left,
-        is_fp8,
-        use_ragged,
-        num_stages,
+        *unsplit_args(tile, num_stages, use_ragged),
         num_warps=num_warps,
+        **extern_compile_options(),
     )
     if return_lse:
         return output, lse

@@ -185,6 +185,9 @@ struct Submission {
     embeddings: Vec<EmbeddingItem>,
 }
 
+/// `control::gate_code` of a forward reload.
+const RELOAD_GATE_CODE: i64 = 7;
+
 /// How long a frozen round sleeps, so a `keep` pause does not spin a core.
 const PAUSED_IDLE_SLEEP: Duration = Duration::from_millis(1);
 
@@ -258,6 +261,9 @@ pub trait DataPlane {
 
     /// Free these memory regions, in order, once the scheduler drained.
     fn release_memory(&mut self, tags: &[String]) -> Result<(), DataPlaneError>;
+
+    /// Development: reload edited forward code and recapture the graphs on a drained, flushed engine; returns success and a report.
+    fn reload_forward(&mut self, op: &ControlRequest) -> Result<(bool, String), DataPlaneError>;
 
     /// Restore these memory regions, in order.
     fn resume_memory(&mut self, tags: &[String]) -> Result<(), DataPlaneError>;
@@ -453,6 +459,9 @@ pub struct LoopConfig {
     /// The model reads each request's committed token history, which the
     /// forwards seed into the history rows.
     pub request_token_history: bool,
+    /// Committed tokens behind the frontier the model reads, which bounds
+    /// the seeds; None reads the whole prefix.
+    pub request_token_history_lookback: Option<usize>,
     /// The control operations' settings.
     pub controls: ControlConfig,
     /// The batch log's settings.
@@ -571,7 +580,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         Self {
             controls: Controls::new(config.controls.clone()),
             batch_logger: BatchLogger::new(config.batch_log.clone()),
-            history: config.request_token_history.then(HistoryRows::default),
+            history: config
+                .request_token_history
+                .then(|| HistoryRows::new(config.request_token_history_lookback)),
             l3: subsystems.l3.map(Tier::new),
             l3_metrics: subsystems.l3_metrics,
             scheduler,
@@ -661,13 +672,21 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         self.apply_pause_transitions(&mut outputs, &mut released)?;
         self.drain_grammar_queue(&mut outputs, &mut released)?;
         self.drain_staged(&mut outputs, &mut released)?;
+        // A reload past its timeout expires on every replica member in the same round.
+        if self.controls.reload_pending() {
+            let timed_out = self.controls.reload_timed_out(Instant::now());
+            if self.replica_any(timed_out)? {
+                self.controls.expire_reload();
+            }
+        }
         // Every round on every rank, so the attention-DP ranks agree on the
         // flushes and weight operations they run together.
-        self.gate()?;
+        let (memory_resident, release_pending) = self.gate()?;
+        let forward_allowed = memory_resident && !self.controls.forward_blocked();
 
         // The storage tick and the cache-op acknowledgments advance at the
         // head of the round, so this round's plan sees them.
-        let storage = self.storage_round(&l3_reports)?;
+        let storage = self.storage_round(&l3_reports, forward_allowed)?;
         let ready = if self.cache_ops.open() > 0 {
             let polled = self.data_plane.poll_cache_events()?;
             self.cache_ops
@@ -690,7 +709,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         self.record_storage_metrics()?;
 
         let mut events = Vec::new();
-        if self.controls.forward_blocked() {
+        if !forward_allowed {
             // Frozen: what is dispatched commits, no forward is planned, and
             // the attention-DP ranks stay in step. With memory released not
             // even an idle forward may run: the weights are unmapped.
@@ -707,7 +726,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             }
             let mut forwarded = false;
             if let Some(dp) = self.dp_round(None, &mut stop)? {
-                if dp.idle_forward && !self.controls.memory_released() {
+                if dp.idle_forward && memory_resident {
                     self.data_plane.idle_forward(&dp)?;
                     forwarded = true;
                 }
@@ -721,6 +740,15 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         // The forward-result feedback point: everything committed this round
         // reaches the scheduler before the next round plans.
         if !events.is_empty() {
+            // An ended request's transfer stops; its pages wait for that
+            // (PdEvent::Stopped) unless it succeeds first.
+            if let Some(transfer) = self.transfer.as_mut() {
+                for event in &events {
+                    if event.kind == ForwardEventKind::Abort {
+                        transfer.cancel(&event.request_id);
+                    }
+                }
+            }
             self.scheduler
                 .advance(&events)
                 .map_err(|error| LoopError::Scheduler(error.what().to_owned()))?;
@@ -758,7 +786,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             }
         }
         // A deferred pause or release resolves once the scheduler drained.
-        self.finish_drain()?;
+        self.finish_drain(release_pending)?;
         for reply in self.controls.take_replies() {
             self.frontend.reply(reply);
         }
@@ -971,8 +999,11 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
     /// permission when a freeze starts or ends: the tick is the scheduler's
     /// only input that carries it, and its clock, which times only storage
     /// deadlines, stays 0.
-    fn storage_round(&mut self, l3_reports: &[Vec<u8>]) -> Result<StorageRound, LoopError> {
-        let allowed = !self.controls.forward_blocked();
+    fn storage_round(
+        &mut self,
+        l3_reports: &[Vec<u8>],
+        allowed: bool,
+    ) -> Result<StorageRound, LoopError> {
         if let Some(l3) = self.l3.as_mut() {
             return Ok(l3.agree(l3_reports, allowed, allowed)?);
         }
@@ -1005,6 +1036,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         if self.controls.take_abort_all() {
             for rid in self.outputs.rids() {
                 self.outputs.mark_abort(&rid, true);
+                if let Some(transfer) = self.transfer.as_mut() {
+                    transfer.cancel(&rid);
+                }
             }
         }
         if self.controls.take_cancel_unscheduled() {
@@ -1409,6 +1443,10 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             self.outputs.mark_submitted(&rid, now);
             if let (Some(transfer), Some(bootstrap)) = (self.transfer.as_mut(), &bootstrap) {
                 transfer.register(&rid, bootstrap)?;
+                // An abort may precede this round's batched submission.
+                if self.outputs.state(&rid).is_some_and(|state| state.to_abort) {
+                    transfer.cancel(&rid);
+                }
             }
         }
         Ok(())
@@ -1477,17 +1515,27 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
     /// The same-round gate: standalone cache
     /// flushes, and the weight operation at the queue's head once every
     /// attention-DP rank holds one of the same kind. One blocking weight
-    /// operation per round.
-    fn gate(&mut self) -> Result<(), LoopError> {
+    /// operation per round. Returns whether every rank's memory is resident
+    /// and whether any rank has a pending memory release.
+    fn gate(&mut self) -> Result<(bool, bool), LoopError> {
         let flushes = self.controls.take_flushes();
         let head = self.controls.weight_head().and_then(control::gate_code);
         let internal = self.controls.internal_head().map(InternalOp::gate_code);
+        // A reload heads the queue from its arrival; it runs once drained, with the same id, everywhere.
+        let reload_key = match self.controls.weight_head() {
+            Some(ControlRequest::ReloadForward(op)) => Some(control::reload_key(op)),
+            _ => None,
+        };
+        let reload_ready = reload_key.is_none() || self.controls.reload_ready();
         let mut want_flush = flushes > 0;
-        let mut all_have_head = head.is_some();
+        let mut all_have_head = head.is_some() && reload_ready;
         let mut all_have_internal = internal.is_some();
+        let mut memory_resident = !self.controls.memory_released();
+        let mut release_pending = matches!(self.controls.drain(), Some(Drain::Release(_)));
         if let Some(world) = &self.ranks.dp {
             let code = head.unwrap_or(0);
             let internal_code = internal.unwrap_or(0);
+            let key = reload_key.unwrap_or(0);
             let row = [
                 i64::from(want_flush),
                 if head.is_some() { -1 } else { 0 },
@@ -1496,11 +1544,27 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 if internal.is_some() { -1 } else { 0 },
                 internal_code,
                 -internal_code,
+                i64::from(!memory_resident),
+                i64::from(release_pending),
+                key,
+                -key,
+                if reload_ready { -1 } else { 0 },
             ];
             let reduced = self.ranks.mesh.all_reduce(world, &row, Reduce::Max)?;
+            // A resume reaches DP engines independently. None may forward
+            // until every peer can join its device collectives again.
+            memory_resident = reduced[7] == 0;
+            release_pending = reduced[8] != 0;
             want_flush = reduced[0] > 0;
             all_have_head = reduced[1] == -1;
-            if all_have_head && reduced[2] != -reduced[3] {
+            let reload_heads = reduced[2] == RELOAD_GATE_CODE || -reduced[3] == RELOAD_GATE_CODE;
+            if reload_heads {
+                // A reload some rank was not sent, cancelled, or not drained yet waits; it is never fatal.
+                all_have_head = all_have_head
+                    && reduced[2] == -reduced[3]
+                    && reduced[9] == -reduced[10]
+                    && reduced[11] == -1;
+            } else if all_have_head && reduced[2] != -reduced[3] {
                 return Err(LoopError::Control(
                     "attention-DP ranks hold different weight operations at their queue \
                      heads; the frontend must send every weight operation to every DP \
@@ -1564,7 +1628,19 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         } else if let Some(op) = ready_internal {
             self.complete_internal_op(op)?;
         }
-        Ok(())
+        Ok((memory_resident, release_pending))
+    }
+
+    /// Whether any member of this rank's replica says yes.
+    fn replica_any(&mut self, local: bool) -> Result<bool, LoopError> {
+        if self.ranks.replica.size() == 1 {
+            return Ok(local);
+        }
+        let reduced =
+            self.ranks
+                .mesh
+                .all_reduce(&self.ranks.replica, &[i64::from(local)], Reduce::Max)?;
+        Ok(reduced[0] != 0)
     }
 
     /// Whether every rank sharing this decision says yes: MIN over the
@@ -1619,6 +1695,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 };
                 (agreed, message)
             }
+            ControlRequest::ReloadForward(_) => self.complete_reload(&op, flushed)?,
             _ if flush_refused => (
                 false,
                 "cache flush failed; retry the update after in-flight Host cache ops drain \
@@ -1665,7 +1742,36 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         tracing::info!(op = op.tag(), success, message, "weight operation done");
         self.controls
             .reply(control::gated_reply(&op, success, message));
+        if matches!(op, ControlRequest::ReloadForward(_)) {
+            self.controls.finish_reload();
+        }
         Ok(())
+    }
+
+    /// Run a drained, gate-agreed forward reload; its result is agreed across the ranks.
+    fn complete_reload(
+        &mut self,
+        op: &ControlRequest,
+        flushed: bool,
+    ) -> Result<(bool, String), LoopError> {
+        if !flushed {
+            return Ok((
+                false,
+                "the prefix caches could not be flushed, so the forward code was not reloaded; \
+                 retry once in-flight Host cache operations drain"
+                    .to_owned(),
+            ));
+        }
+        let (local, message) = self.data_plane.reload_forward(op)?;
+        let agreed = self.converge(local)?;
+        Ok(if local && !agreed {
+            (
+                false,
+                format!("forward reload failed on another rank in the replica ({message})"),
+            )
+        } else {
+            (agreed, message)
+        })
     }
 
     /// Agree a weight load's device prerequisites before its flush and
@@ -1804,33 +1910,57 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 .is_none_or(|transfer| !transfer.has_in_flight())
     }
 
-    /// Resolve a deferred pause or memory release once the scheduler drained
-    /// and nothing it dispatched is in flight.
-    fn finish_drain(&mut self) -> Result<(), LoopError> {
-        let Some(drain) = self.controls.drain() else {
-            return Ok(());
-        };
+    /// The local scheduler, including parked PD transfers, drained and no
+    /// forward or cancelled embedding receive can still finish a request.
+    fn drained(&self) -> bool {
         let sizes = self.scheduler.sizes();
-        if sizes.waiting != 0 || sizes.decoding != 0 || sizes.prefilling != 0 {
-            return Ok(());
+        if sizes.waiting != 0
+            || sizes.decoding != 0
+            || sizes.prefilling != 0
+            || sizes.retracted != 0
+            || sizes.pd_transfer != 0
+        {
+            return false;
         }
         if !self.in_flight.is_empty() {
-            return Ok(());
+            return false;
         }
         // EPD: a request the drain cancelled (or its client aborted) ends
         // toward its client only once its embedding receive settles.
-        let settling = self.staged.iter().any(|submission| {
+        !self.staged.iter().any(|submission| {
             self.outputs
                 .state(&submission.rid)
                 .is_some_and(|state| state.finished())
-        });
-        if settling {
+        })
+    }
+
+    /// Resolve a local pause once drained; release memory only once every
+    /// rank has stopped admissions and drained its work.
+    fn finish_drain(&mut self, release_pending: bool) -> Result<(), LoopError> {
+        let drained = self.controls.admit_blocked() && self.drained();
+        // Every rank joins, even without a local drain. An idle but unpaused
+        // peer may admit work next round and still needs our idle forwards.
+        let all_paused = release_pending
+            && self.converge(
+                drained
+                    && !self.controls.weights_busy()
+                    && self.transfers_idle()
+                    && self.cache_ops.open() == 0,
+            )?;
+        let Some(drain) = self.controls.drain() else {
+            return Ok(());
+        };
+        if !drained {
+            return Ok(());
+        }
+        if matches!(drain, Drain::Reload)
+            && (!self.transfers_idle() || !self.scheduler.can_clear_cache())
+        {
+            // Capture writes KV pages a transfer or a Host write-back could still touch.
             return Ok(());
         }
         if let Drain::Release(tags) = drain {
-            // A gated operation still writes the weights, a transfer still
-            // touches the cache, or the cache index still pins pages.
-            if self.controls.weights_busy() || !self.transfers_idle() {
+            if !all_paused {
                 return Ok(());
             }
             if tags.iter().any(|tag| tag == "kv_cache") && !self.scheduler.clear_l1_cache() {
@@ -1843,6 +1973,10 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 self.data_plane.release_memory(&tags)?;
                 tracing::info!(?tags, "memory released");
                 self.controls.finish_release(tags);
+            }
+            Drain::Reload => {
+                tracing::info!("drained for a forward reload");
+                self.controls.mark_reload_ready();
             }
         }
         Ok(())
@@ -2073,9 +2207,13 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                     absorb(self.outputs.finish_prefill(&rid), events, outputs, released);
                 }
                 PdEvent::Failed(rid) => {
-                    // The scheduler releases the request on the event itself.
+                    // The scheduler ends the request on the event; its pages
+                    // wait for the transfer to stop.
                     events.push(pd_event(ForwardEventKind::PdFailed, &rid, -1));
                     absorb(self.outputs.fail_transfer(&rid), events, outputs, released);
+                }
+                PdEvent::Stopped(rid) => {
+                    events.push(pd_event(ForwardEventKind::PdTransferStopped, &rid, -1));
                 }
                 PdEvent::RemotePrefillDone(done) => {
                     let rid = done.rid.clone();
@@ -2243,6 +2381,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 EngineRequest::Abort(rids) => {
                     for rid in rids {
                         self.outputs.mark_abort(&rid, false);
+                        if let Some(transfer) = self.transfer.as_mut() {
+                            transfer.cancel(&rid);
+                        }
                         // On the storage path the abort detaches the request
                         // from its storage work at the next round's head; one
                         // that holds no pages yet finishes there, and no

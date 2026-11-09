@@ -39,6 +39,7 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
+from tokenspeed.runtime.distributed.mapping import Mapping  # noqa: E402
 from tokenspeed.runtime.execution import device, prefill_graph  # noqa: E402
 from tokenspeed.runtime.execution.cudagraph_memory import (  # noqa: E402
     probe_arena_parent_blocks,
@@ -363,7 +364,8 @@ def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager, is_nv
         def __init__(self):
             free[0] -= init_keeps
 
-        def autotune(self):
+        def autotune(self, *, keep_loaded_tactics):
+            assert not keep_loaded_tactics
             # Tried tactics also raise the stack limit, which reserves local memory.
             free[0] -= tune_keeps + (1 << 30)
             stack[0] += 1 << 30
@@ -440,6 +442,7 @@ def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager, is_nv
     )
     server_args = SimpleNamespace(
         disaggregation_mode="null",
+        mapping=Mapping(rank=0, world_size=1),
         enable_external_encoder=False,
         chunked_prefill_size=8192,
         attention_backend=None,
@@ -521,8 +524,7 @@ def test_the_boot_probes_rebuilds_and_captures_in_order() -> None:
         "build_components",
         "autotune",
         "_rebind_under_reserve",
-        "capture_graphs",
-        "set_random_seed",
+        "_capture_serving_graphs",
     }
     calls = sorted(
         (n for n in ast.walk(build) if isinstance(n, ast.Call) and _callee(n) in steps),
@@ -533,10 +535,21 @@ def test_the_boot_probes_rebuilds_and_captures_in_order() -> None:
         "build_components",
         "autotune",
         "_rebind_under_reserve",
-        "capture_graphs",
-        "set_random_seed",
+        "_capture_serving_graphs",
     ]
-    refusal, probe_build, _, _, serving, _ = calls
+    refusal, probe_build, _, _, _ = calls
+    # The serving capture, which a forward reload repeats, then reseeds the generator.
+    capture = _function("execution/device.py", "_capture_serving_graphs")
+    serving, seed = sorted(
+        (
+            n
+            for n in ast.walk(capture)
+            if isinstance(n, ast.Call)
+            and _callee(n) in {"capture_graphs", "set_random_seed"}
+        ),
+        key=lambda n: (n.lineno, n.col_offset),
+    )
+    assert [_callee(serving), _callee(seed)] == ["capture_graphs", "set_random_seed"]
     assert [ast.unparse(arg) for arg in refusal.args] == ["server_args"]
     # The target's model: the narrowing floor must not read the draft's.
     (narrowing,) = (
@@ -686,13 +699,18 @@ def test_the_roles_that_replay_prefill_graphs_agree_on_and_release_them() -> Non
         and [ast.unparse(target) for target in node.targets]
         == ["replays_prefill_graphs"]
     ]
-    assert ast.unparse(assigned) == (
+    assert ast.unparse(assigned) == "_replays_prefill_graphs(server_args, model_config)"
+    replays = _function("execution/device.py", "_replays_prefill_graphs")
+    (returned,) = [n.value for n in ast.walk(replays) if isinstance(n, ast.Return)]
+    assert ast.unparse(returned) == (
         "server_args.disaggregation_mode == 'prefill' or "
         "(server_args.disaggregation_mode == 'null' and "
         "model_config.dsa_padded_prefill_replay)"
     )
+    # The serving capture, which a forward reload repeats, gets the boot's verdict.
+    capture = _function("execution/device.py", "_capture_serving_graphs")
     guards: dict[str, list[str]] = {}
-    for node in ast.walk(build):
+    for node in (*ast.walk(build), *ast.walk(capture)):
         if not isinstance(node, ast.If):
             continue
         called = {

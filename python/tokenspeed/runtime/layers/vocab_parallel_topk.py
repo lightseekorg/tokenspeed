@@ -23,12 +23,16 @@
 from __future__ import annotations
 
 import torch
-
-from tokenspeed.runtime.distributed.comm_ops import all_gather_single
-from tokenspeed.runtime.layers.logits_processor import (
-    fused_softcap_generic,
-    should_apply_lm_head_quant_method,
+from tokenspeed_kernel.ops.gemm import mv_fp8_weight
+from tokenspeed_kernel.ops.sampling import (
+    vocab_shard_topk,
+    vocab_shard_topk_supports,
+    vocab_topk_merge,
+    vocab_topk_merge_supports,
 )
+
+from tokenspeed.runtime.layers.logits_processor import should_apply_lm_head_quant_method
+from tokenspeed.runtime.layers.sampled_vocab_shard import gather_topk_pairs
 from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
@@ -60,6 +64,9 @@ class VocabParallelTopK:
             so it changes the scores but never which candidates survive.
         skip_all_gather: The owning processor keeps its logits rank-local.
         dp_sampling_enabled: The owning processor samples per DP rank.
+        fp8_weight: ``(weight, scale)``, a weight-only FP8 copy of this
+            rank's head rows (``mv_fp8_weight``) to project through instead
+            of ``lm_head``, or None to use ``lm_head`` itself.
     """
 
     def __init__(
@@ -75,8 +82,10 @@ class VocabParallelTopK:
         softcapping: float | None,
         skip_all_gather: bool,
         dp_sampling_enabled: bool,
+        fp8_weight: tuple[torch.Tensor, torch.Tensor] | None,
     ) -> None:
         self.lm_head = lm_head
+        self.fp8_weight = fp8_weight
         self.tp_size = int(tp_size)
         self.tp_group = tp_group
         self.vocab_size = int(vocab_size)
@@ -107,6 +116,12 @@ class VocabParallelTopK:
         ):
             return
         num_org = int(shard.num_org_elements)
+        if not vocab_topk_merge_supports(self.tp_size, self.top_k):
+            logger.info(
+                f"Vocab-parallel top-k disabled: no one-launch merge of "
+                f"{self.tp_size:d} ranks x top-{self.top_k:d}.",
+            )
+            return
         if self.vocab_size > _MAX_EXACT_ID:
             logger.info(
                 f"Vocab-parallel top-k disabled: a token id in a {self.vocab_size:d}"
@@ -247,6 +262,9 @@ class VocabParallelTopK:
         Returns:
             This rank's ``[rows, shard_padded]`` logits.
         """
+        if self.fp8_weight is not None:
+            weight, scale = self.fp8_weight
+            return mv_fp8_weight(hidden_states, weight, scale)
         head = self.lm_head
         quant_method = getattr(head, "quant_method", None)
         if should_apply_lm_head_quant_method(head, quant_method):
@@ -268,31 +286,38 @@ class VocabParallelTopK:
         """
         shard = self.lm_head.shard_indices
         top_k = self.top_k
+        vocab_start = int(shard.org_vocab_start_index)
 
         logits = self._shard_logits(hidden_states)[:, : int(shard.num_org_elements)]
-        if self.logit_scale is not None:
-            logits.mul_(self.logit_scale)
-        values, ids = self._shard_topk(logits)
-
-        rows = int(values.shape[0])
-        staged, gathered = self._ensure_gather_buffers(rows, values.device)
-        staged[:, :top_k].copy_(values)
-        staged[:, top_k:].copy_(ids)
-        staged[:, top_k:].add_(float(shard.org_vocab_start_index))
-        all_gather_single(gathered, staged, self.tp_group)
-
-        # Rank-major to row-major, so one row's candidates from every rank sit
-        # side by side for the final selection, values and ids each on a plane.
-        planes = (
-            gathered.view(self.tp_size, rows, 2, top_k)
-            .permute(1, 2, 0, 3)
-            .reshape(rows, 2, self.tp_size * top_k)
+        rows, columns = logits.shape
+        staged, landing = self._ensure_gather_buffers(rows, logits.device)
+        if self._radix_topk is None and vocab_shard_topk_supports(
+            logits.dtype, columns, top_k
+        ):
+            # The draft caps the kept values after the merge, in fp32.
+            vocab_shard_topk(
+                logits,
+                top_k,
+                self.logit_scale,
+                vocab_start,
+                staged,
+                softcap=None,
+                vocab_mask=None,
+            )
+        else:
+            if self.logit_scale is not None:
+                logits.mul_(self.logit_scale)
+            values, ids = self._shard_topk(logits)
+            staged[:, :top_k].copy_(values)
+            # Global ids in fp32, in one launch: both terms are exact below 2**24.
+            torch.add(ids, float(vocab_start), out=staged[:, top_k:])
+        pairs = gather_topk_pairs(staged, landing, self.tp_size, self.tp_group)
+        candidate_ids = torch.empty(
+            (rows, top_k), dtype=torch.int64, device=logits.device
         )
+        values = torch.empty((rows, top_k), dtype=torch.float32, device=logits.device)
         # Sorted, so the surviving candidate order does not depend on which
-        # rank happened to contribute a value.
-        values, lanes = torch.topk(planes[:, 0], top_k, dim=-1, sorted=True)
-        # Everything downstream indexes codebooks with these.
-        candidate_ids = torch.gather(planes[:, 1], 1, lanes).to(torch.int64)
-        if self.softcapping:
-            fused_softcap_generic(values, self.softcapping)
+        # rank happened to contribute a value; the softcap is monotone, so it
+        # never changes which candidates survive.
+        vocab_topk_merge(pairs, top_k, self.softcapping, candidate_ids, values)
         return candidate_ids, values

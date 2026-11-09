@@ -122,6 +122,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_match_host_pages.cpp
         tests/cpp/test_cache_coordinator.cpp
         tests/cpp/test_checkpoint_retention.cpp
+        tests/cpp/test_checkpoint_demotion.cpp
         tests/cpp/test_storage_query.cpp
         tests/cpp/test_state_checkpoints.cpp
         tests/cpp/test_joint_match_invariants.cpp
@@ -134,6 +135,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_scheduler_plan.cpp
         tests/cpp/test_token_level_hits.cpp
         tests/cpp/test_outside_event_handler.cpp
+        tests/cpp/test_pd_replayable.cpp
         tests/cpp/test_cache_operations.cpp
         tests/cpp/test_pending_prefix_store.cpp
         tests/cpp/test_req_pool_allocator.cpp
@@ -204,5 +206,14 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         PRIVATE
             csrc
             tests/cpp
+    )
+
+    add_executable(tokenspeed_scheduler_forward_batch_benchmark EXCLUDE_FROM_ALL
+        tests/cpp/benchmark_forward_batch.cpp
+    )
+
+    target_link_libraries(tokenspeed_scheduler_forward_batch_benchmark
+        PRIVATE
+            tokenspeed_scheduler_core
     )
 endif()

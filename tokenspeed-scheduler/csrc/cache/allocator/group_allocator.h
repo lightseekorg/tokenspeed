@@ -83,18 +83,20 @@ public:
     std::vector<std::int32_t> BlockTablePageIds(const BlockTable& table) const {
         std::vector<std::int32_t> ids;
         ids.reserve(static_cast<std::size_t>(table.NumBlocks()));
-        AppendBlockTablePageIds(table, ids);
+        AppendBlockTablePageIds(table, ids, 0);
         return ids;
     }
 
-    // Append one absolute row directly to its C++-owned batch buffer: the
-    // page ids the table keeps, the released prefix as null holes.
-    void AppendBlockTablePageIds(const BlockTable& table, std::vector<std::int32_t>& ids) const {
+    // Append the row from first_slot on, preserving null holes in that range.
+    void AppendBlockTablePageIds(const BlockTable& table, std::vector<std::int32_t>& ids,
+                                 std::size_t first_slot) const {
         assertPageIdsCurrent(table);
         const auto released = static_cast<std::size_t>(table.ReclaimedPrefixBlocks());
         const std::span<const std::int32_t> page_ids = table.PageIds();
-        ids.insert(ids.end(), released, 0);
-        ids.insert(ids.end(), page_ids.begin() + static_cast<std::ptrdiff_t>(released), page_ids.end());
+        _assert(first_slot <= page_ids.size(), "block-table range starts beyond its row");
+        if (first_slot < released) ids.insert(ids.end(), released - first_slot, 0);
+        ids.insert(ids.end(), page_ids.begin() + static_cast<std::ptrdiff_t>(std::max(first_slot, released)),
+                   page_ids.end());
     }
 
     // The table window handed to PrefixCacheIndex::RegisterFullBlocks. The
@@ -221,7 +223,8 @@ public:
     // (any bucket when the slot was a hole), and sets the table's unconsumed
     // tail capacity. Returns the replaced block: a hitter's shared partial
     // block, which the caller copies into the fresh block; empty for a hole,
-    // which the caller zeroes instead.
+    // which the caller zeroes instead. Installing into a hole ends the released
+    // prefix at this slot, so subsequent exports include the new writable block.
     CacheBlockRef SwapInFreshBlock(BlockPool& pool, BlockTable& table, std::int32_t slot,
                                    std::int32_t available_tokens) {
         _assert(0 <= slot && slot < table.NumBlocks(), "swapped slot lies inside the table");
@@ -237,6 +240,7 @@ public:
         FatalCheck(fresh.size() == 1, "admission plan no longer fits the block pool");
         CacheBlockRef replaced = table.exchange(group_id_, static_cast<std::size_t>(slot), std::move(fresh.front()));
         table.available_tokens_ = available_tokens;
+        table.reclaimed_prefix_blocks_ = std::min(table.reclaimed_prefix_blocks_, slot);
         return replaced;
     }
 

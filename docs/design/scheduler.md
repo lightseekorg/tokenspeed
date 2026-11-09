@@ -201,9 +201,11 @@ capacity model (§1.4) states the same split.
 ### 1.1 Head-of-line: an incomplete prefill holds the queue
 
 `holdsHeadOfLine` breaks the candidate loop after scheduling a chunk of a
-prefill that is still incomplete. Nothing behind it is scheduled that round.
-A resident chunk that fails admission ends the prefill phases too: admitting
-anything behind it would strand it.
+prefill that is still incomplete. Nothing behind it is scheduled that round
+(on the P role, `prefill_chunk_yield_tokens` lets whole prompts complete
+beside it; see the end of this section). A resident chunk that fails
+admission ends the prefill phases too: admitting anything behind it would
+strand it.
 
 The reason is that per-chunk admission gives an in-progress prefill **no claim
 on the capacity it still needs**. Let a newcomer take pages while a prompt is
@@ -222,11 +224,14 @@ by whether the window reaches `PrefillSize()`), so a prompt scheduled in full
 never holds the line. A round can therefore carry **several prefills that
 complete this round plus at most one truncated one — and the truncated one is
 necessarily last**, because `holdsHeadOfLine` seals the phase the moment it
-appears. With 6K of budget left and prompts of 2K / 1K / 10K waiting, the
-round schedules the 2K and the 1K in full and the first 3K chunk of the 10K
-prompt, then stops. The same rule makes the finishing round of a chunked
-prefill cheap: its final chunk releases the line *within* the round, so the
-prompts queued behind it start in that round, not the next.
+appears; a chunk that gives way (below) is admitted before the whole prompts
+it carries, but its row moves behind theirs. The runtime relies on this order
+(`unified_path.md`, "Prefill requests without generated outputs"). With 6K of
+budget left and prompts of 2K / 1K / 10K waiting, the round schedules the 2K
+and the 1K in full and the first 3K chunk of the 10K prompt, then stops. The
+same rule makes the finishing round of a chunked prefill cheap: its final
+chunk releases the line *within* the round, so the prompts queued behind it
+start in that round, not the next.
 
 **Decodes are not part of the line.** In mixed mode the decode batch is built
 before the prefill phases and takes its token budget first (§3.3), so a round
@@ -234,6 +239,43 @@ is *all decodes + the completing prefills + at most one truncated prefill*.
 Outside mixed mode, prefill and decode never share a round at all — decodes
 get the round only when no prefill scheduled — so head-of-line only ever
 orders prefills against each other, never a decode behind a prefill.
+
+**A chunk that cannot finish may give way (P role, opt-in).** With
+`prefill_chunk_yield_tokens` N (`--prefill-chunk-yield-tokens`), a chunk that
+cannot finish its prompt this round — a resident's, or a new prompt's first —
+shares its forward with waiting bootstrapped prompts that fit whole. Once per
+round, `wholePromptsAfter` probes up to eight `Submitted` candidates (for a
+new prompt's chunk, only those behind it) the way admission would. A
+candidate qualifies when its first chunk could complete it: no eviction store
+pending on its prefix, no junction cut, no in-forward checkpoint spanned from
+inside a page, and — beside a resident chunk on a model with State groups —
+no page shared with what that chunk's admission is about to publish (its
+probe would be stale). What it takes is counted past its hit, replay
+included: a 100k-token prompt with 1k uncached tokens takes 1k.
+`carriedPrompts` keeps them in FIFO order while they fit N, the batch, the
+free request slots and, with `max_kv_page_num`, the page budget. The chunk
+then ends on the last page (with aligned State checkpoints, segment boundary)
+at least their total before the end of its budget (`YieldingChunkBudget`).
+Once it is admitted and keeps the head of line, `carryWholePrompts` admits
+each carried prompt only if its first chunk completes it on the budget left;
+the first capacity failure ends the fill. None of them holds the head of
+line, so the round is still *completing prefills + at most one truncated
+prefill*, and the truncated one still runs last: `carryWholePrompts` then
+moves its row behind the carried prompts', so the completing prefills form a
+prefix of the batch.
+
+The chunk gives way only while such prompts wait, and only what they take:
+fewer than N plus one page. N is at most half of `max_scheduled_tokens` (B),
+so with R = B - N - page + 1 the long prompt advances by at least
+`max(R, page)` tokens in every round it starts with the whole budget (a
+resident always does; a first chunk may find part of it spent by prompts
+admitted ahead of it), less a hit's replay window, and finishes U uncached
+tokens within `1 + ceil((U - B) / R)` such rounds. A final chunk never gives
+way. A resident chunk whose admission fails still blocks everything behind
+it, and the chunk that gave way is admitted first again next round. Off (the
+default), the plans are the ones built without the option. The fused role
+does not offer it: there, retraction picks the largest incomplete prefill
+first, and a carried prompt could make the yielding request that victim.
 
 ### 1.2 State groups: two slots, natural checkpoints
 
@@ -393,6 +435,30 @@ decode-produced state, which those groups keep private anyway. Their other
 unaligned prompt ends still publish a KV tail, although no hit resumes there
 either.
 
+**Short prompt ends.** A prompt too short for a pre-tail checkpoint
+(`PrefillStateCheckpointTokens` is 0: by default a prompt within one chunk
+budget) has no `C` to make its end dead, so the rule above publishes it. With
+`drop_short_prompt_end_checkpoints` (on with
+`--enable-state-checkpoint-in-forward`, P role only) the P role's finish skips
+that end too when it lies inside a page: it publishes the full pages alone,
+like a chunk end (`shortPromptEndIsDropped`). A re-rendered next turn cannot
+resume at that end either; a longer prompt that repeats the whole prompt
+resumes at an earlier checkpoint instead and recomputes the rest of it. A
+page-aligned end keeps its state: it is a chain boundary a longer prompt
+resumes from. The decision reads only the prompt, so it holds whatever the
+cache holds, and nothing before the finish depends on it: the P role
+reserves no copy-in block for its prompt end and never retracts. Such a
+finish publishes no end state, and it marks no input superseded (below): the
+tail it resumed from, if any (a junction's, whose state a junction cut
+published), may still be the deepest checkpoint a prompt extending it
+resumes at. Under write-back the pages it leaves, with no checkpoint at or
+under them, are dead entries an eviction drops instead of writing back. The
+fused role keeps its short prompt ends, and `Validate` refuses the flag
+there: the drop is a P-role policy, chosen from PD measurements. The same
+case exists at the fused first decode, which publishes a short prompt's end
+and moves off it into its copy-in blocks; applying the drop there, decided
+at admission like `promptEndCheckpoint`, is a possible follow-up.
+
 **A finish settles when its last forward has landed.** `forward::Finish`
 (and the P role's `pd::SucceededEvent`) moves a page-holding request to
 `Finishing` and nothing else; after every batch of events,
@@ -472,7 +538,56 @@ state still rank level, since which of them the next turn resumes at depends
 on whether the client sends the reply back as it was generated. A dead finish
 that publishes no end state (above) marks the input all the same: the prompt
 end, or the pre-tail checkpoint the next turn resumes at instead, was
-published or found cached earlier.
+published or found cached earlier. A short prompt end the opt-in drop skips
+(above) is the exception: nothing replaces the input, so it stays unmarked.
+
+**Superseded checkpoints.** With in-forward checkpoints, each turn
+of a conversation that re-renders the end of the last prompt resumes at the
+checkpoint the turn before wrote and writes its own, and the prompt ends and
+finishes that such a turn cannot resume at are skipped (dead checkpoints,
+above). A long conversation therefore leaves a chain of in-forward
+checkpoints, and only the newest two serve its next turn (one that diverges
+inside the last turn resumes at the older). With
+`demote_superseded_state_checkpoints` (on with
+`--enable-state-checkpoint-in-forward`; it requires in-forward checkpoints and
+has no effect on the D role or without State groups) a finish that publishes an in-forward checkpoint
+`C(n)` past the page boundary it resumed from, itself an in-forward checkpoint
+`C(n-1)` whose request resumed from an earlier one `C(n-2)`, demotes `C(n-2)`:
+its State entries and the sliding-window blocks behind it, less any block
+`C(n-1)` or `C(n)` resumes with, are dated back to access epoch 0 on both tiers
+and marked demoted (`CacheCoordinator::DemoteEntries`). The Device and a
+write-through Host evict them first, ahead of every dated entry and of the aged
+checkpoints checkpoint retention ranks at its cutoff, which keeps the live
+conversations' prefixes cached longer. A write-back Host segment plan takes a
+Host-only checkpoint boundary whose checkpoints are all demoted after dead
+entries, Host boundaries the Device covers or supersedes, and the Host copies
+of KV a request holds on the Device, but before the Host copies of unheld
+Device KV ([Cache concepts](cache-concepts.md)). The scheduler records which
+in-forward checkpoint each finish published and where its request resumed
+(`CheckpointLineage`, bounded). A shared `C(n-2)` stays: one another first
+admission also resumed at, or one an acquisition or publication touched after
+`C(n-1)`'s request resumed there
+(`BoundaryTree::Node::latest_state_access_epoch`) -- a fork, or a system prompt
+every new conversation resumes at. The scheduler sees no conversations, so a
+boundary only this conversation has resumed from so far is demoted even when
+another request published it before, until the next hit there. A boundary no
+in-forward checkpoint was recorded at (a junction or a prompt end alone) is
+never demoted. That holds for its State entries, not for the window blocks it
+shares with `C(n-2)`: another checkpoint whose own window reaches into
+`C(n-2)`'s, such as the prompt end of the turn that wrote `C(n-2)` when that
+one is not dead, or a junction just before it, can still need a demoted
+block. No entry a request or a transfer holds is demoted either; a hit, touch
+or republication dates an entry forward again and ends its demotion. No new store
+or eviction write-back copies a demoted entry to the Host: a finish's store
+skips it, and an eviction under the write-back policy drops it whatever evicted
+it (counted under that cause and in
+`HostCacheStats::demoted_entries_not_written_back`). A Host copy made before
+the demotion stays there, demoted too, and one an eviction write-back is still
+carrying lands demoted (`TierTransferManager::DemoteInFlightEvictions`). Only
+a demotion marks an entry demoted
+(`PrefixCacheIndex::CachedBlockMetadata::demoted`): a demoted session's entries
+(`DemoteSessions`) and superseded inputs sit at epoch 0 too, but keep their own
+rules with the flag on or off.
 
 **Aligned state checkpoints.** A State group can declare
 `checkpoint_granularity`, a multiple of the prefix-hash grain. Its published
@@ -574,12 +689,15 @@ restore (§4). Replayable groups combine freely with State groups: a junction
 inside the final window yields to the window rule (above), and nothing else
 about a State group constrains a chunk.
 
-PD: a replayable group travels like any sliding-window group. The prefill
-role replays on its own local hits exactly as the fused role does and, at
-completion, transfers the group's retained tail (`full_suffix` selects the
-pages intersecting the last `sliding_window_tokens − 1` positions). Every
-page of that tail exists because a hit re-feeds the whole retention window:
-the regenerated suffix starts at or before the tail. The decode role computes no prompt rows, so
+PD: the decode role caches none of a replayable group's pages, so remote
+admission allocates its **whole retained window**, independently of the
+global prefix hit. `full_suffix` selects the same complete window for the
+destination manifest, its validation and the prefill peer's layerwise
+selection: every page intersecting the last `sliding_window_tokens − 1`
+positions. Ordinary cached windows still reuse their matched pages.
+The prefill role replays on its own local hits exactly as the fused role
+does, so every page of the retained tail exists when it sends it. The
+decode role computes no prompt rows, so
 `SchedulePrefillFirstChunkEvent` gives a remote prefill `replay = 0` and
 `Admit` leaves a demand that already names the landing's sparse suffix
 alone; the landed tail is what the first decode steps read, with no
@@ -622,6 +740,19 @@ tail-handover charge (below) is bucket-blind, so on a KV-sharded pool of a
 few pages a request alone can still wait for good, when its hit holds the
 only cache left and its copy of the tail needs a page in a bucket that is
 full.
+
+A request's expired slots and released State input are different from live
+pins: `Admit` releases their table references before evicting those blocks. Once the plan
+selects their reclaim set, a later segment may absorb that set even though
+the table still holds its references during planning. Segments rejected before
+that selection are reconsidered before any block-by-block fallback: a cached
+rejection is valid only while the selected reclaim blocks remain unchanged.
+Another retry requires newly selected reclaim blocks, so an unchanged pin
+cannot cause an endless scan. The merge counts each physical block once,
+and minimization keeps or restores the combined set whole. This lets a P
+request rotate past a junction and evict its unpinned
+canonical KV duplicates in the same admission. Another reader's reference,
+or a prefix hit this admission keeps, still prevents reclaim.
 
 The `CapacityModel` is deliberately **config-only**: it reads every
 `SchedulerConfig` field that is known before a pool exists and no
@@ -1043,7 +1174,11 @@ outcomes but never compose the batch.
 **Phases:** completed prompts out on `plan.remote_decode` (their pages stay
 pinned until the transfer finishes, so releasing them outranks feeding more
 prompt work), then the shared local-prefill phases
-(`scheduleLocalPrefillWork`): resident chunks, then new prompts.
+(`scheduleLocalPrefillWork`): resident chunks, then new prompts. With
+`prefill_chunk_yield_tokens`, a chunk that cannot finish gives way to the
+whole prompts waiting behind it, which complete in its forward, ahead of its
+row (§1.1). Each carried prompt's pages are then pinned until its own
+transfer is acknowledged, like any completed prompt's.
 
 **Reserve: the decode slot, nothing else.** The completing chunk reserves
 `decode_input_tokens` like every role, because the drafter writes the first
@@ -1055,7 +1190,9 @@ The transfer ACK (`pd::SucceededEvent`) publishes the prompt like a finish —
 its full pages, its partial page as a tail and each State group's prompt-end
 state (§1.2) — and releases request ownership; cached entries remain subject
 to normal eviction. With the in-forward checkpoint a prompt end it covers is
-published like a chunk end instead (§1.2).
+published like a chunk end instead, and with
+`drop_short_prompt_end_checkpoints` so is a short prompt's end inside a page
+(§1.2).
 
 **Host L2: write-back.** With `host_write_policy` `kWriteBack`
 (`--kvstore-write-policy write_back`; this role or the fused one (§3.3), no
@@ -1082,14 +1219,46 @@ of what the Device holds.
 are pinned until the peer acknowledges, then released wholesale. Retracting a
 prompt whose KV is mid-transfer would strand the decode side.
 
-The PD pin is not recorded anywhere; it is a function of the FSM
+While P holds a request, prefix publication uses a copy of its block table.
+Deduplication may redirect that copy to canonical cache blocks, but the real
+request keeps the physical source blocks named by queued layerwise transfers.
+A client abort waits for the transfer retirement event; a failed transfer also
+waits for outstanding local forward results before freeing its tables. Failed
+requests waiting for those results receive no further forward work. Successful
+and failed terminal paths both release the source references, without an extra
+long-lived copy of the tables.
+
+This preservation is limited to P publications while the request owns its
+transfer sources (`CompletedPages::preserve_source_blocks`). Fused and D
+requests use ordinary canonical deduplication once their publication is safe.
+A fused owner that keeps writing past its tail retains the existing copy-in
+rule: register its own tail without taking another owner's canonical block,
+then copy any tail block the index took into its pre-reserved private block.
+
+The PD pin is a function of the FSM
 (`Scheduler::pdTransferInFlight`). On this role every page-holding state is
 pinned — the peer's decode reads the pages from the first scheduled chunk until
-the PD ACK finishes or aborts the request. On the D role the pin is exactly
-`RemotePrefilling`: the peer's prefill is writing the destination pages, and
-`RemotePrefillDone` ends it by leaving that state. A fused engine never
-transfers. Because the pin is the state, no event handler can forget to clear
-it, and `Abort`/`Finish`/`RemotePrefillDone` release it by transitioning.
+the PD ACK finishes the request. On the D role the pin is `RemotePrefilling`:
+the peer's prefill is writing the destination pages, and `RemotePrefillDone`
+ends it by leaving that state. A fused engine never transfers. Because the pin
+is the state, no event handler can forget to clear it.
+
+A transfer reads and writes pages through the page IDs its operations
+exported, so while the pin holds, a pinned table loses no block a transfer may
+still address. P publication keeps its source references, including State
+checkpoints, and D publishes its landing table after successful receive.
+The owner-tail copy-in runs only on the fused role, which never transfers.
+
+A pinned request that ends — an abort, or a failed transfer — does not free
+its pages: the transfer may still be reading or writing them. It parks whole in
+`PdTransferring`, which is pinned on both roles, until the transport reports
+`pd::TransferStoppedEvent` once every reader and writer on every rank stopped
+(or the transfer's success lands first), and every outstanding local forward
+result has landed. Observing transport retirement before a local result records
+that fact in `PdTransferring`; a repeated abort preserves it and cannot restart
+the transfer wait. The state owns this record along with the retained resources,
+so leaving it needs no separate abort-marker cleanup. Nothing is scheduled,
+published or retracted from that state.
 
 **Restore: n/a.** Nothing on this role is ever `Retracted`, so the restore
 phase does not exist in its grammar; `Validate` refuses a snapshot pool on it.
@@ -1115,7 +1284,8 @@ phase does not exist in its grammar; `Validate` refuses a snapshot pool on it.
    the pages it waits for would starve it.
    Remote admission therefore bypasses local prefill chunking and prefix
    promotion boundaries; the destination tables must cover the entire
-   unmatched suffix advertised by the transfer manifest.
+   unmatched suffix and each replayable group's complete retained window
+   advertised by the transfer manifest (§1.3).
 4. `maybeRetractForCapacity` (§2), whose grant also rides beside the batch
    (a remote admission) or joins it (a blocked decode).
 
@@ -1350,13 +1520,24 @@ end and its finish (unless they are dead, §1.2), its junction cuts and the
 in-forward checkpoint's page boundary, never for another interior chunk
 end's chain hash; a tail's
 descriptor carries the rows below `T` and the residency check counts a
-tail's blocks from it. Retraction publishes twice
-without an admission: `retractVictim` registers the newly hashed pages before
-`CacheCompletedBlocks` (as the finish-time publication does), and the
-`RestoreDone` handler registers the restored request's whole prefix chain
-before `CompleteSnapshotRestore` republishes its L2-tier destinations — the
-victim's pages left the Device when they were granted away, so their
-descriptors are typically gone by the time the restore lands.
+tail's blocks from it. A publication registers its newly hashed pages and its
+tail, and every page below them it registers an entry under
+(`CacheCoordinator::FirstPublishedPage`: the deepest page, where a State
+checkpoint lands when no page is new, and the pages a sliding window behind
+one of its boundaries reaches back into). Those pages keep their descriptors
+while the request's own published blocks hold them on the Device, but not
+once a restore has brought the request back on unpublished copies of them
+(snapshot-pool rows) and a drain has dropped them. Retraction publishes twice
+without an admission: `retractVictim` registers before `CacheCompletedBlocks`
+(as the finish-time publication does), and the `RestoreDone` handler
+registers the restored request's whole prefix chain, and the tails the
+image's published slots sit at, before `CompleteSnapshotRestore` republishes
+its L2-tier destinations — the victim's pages left the Device when they were
+granted away, so their descriptors are typically gone by the time the restore
+lands. No page hash names such a tail (slot 0 of a State group holding the
+checkpoint of a prompt end inside a page), so the retraction reads its
+boundary off the descriptor while the victim still holds it and keeps it with
+the image (`Retracted::kv_event_tails`).
 
 **A readmission that does not fit waits.** Its failed restore never
 triggers retraction (it is never recorded as the capacity blocker): when the
@@ -1483,7 +1664,11 @@ must use matching contracts; releases follow the sequence in AGENTS.md.
   helper asserts it found none set.
 - An incomplete local prefill is not overtaken (1.1). Decodes are never hostage
   to it: they consume no fresh capacity within their reserve, so they keep
-  running beside a stalled prefill.
+  running beside a stalled prefill. With `prefill_chunk_yield_tokens` on the P
+  role, whole prompts may complete in its forward, ahead of its row, within
+  the tokens its chunk gave up. The incomplete prefill is still admitted
+  first, and a resident chunk that fails admission still stops everything
+  behind it.
 - Retraction fires only when no prefill progressed and an admission failed
   (2). The chosen victim must be quiescent — no forward of its own in flight,
   no PD transfer against its pages (§3.1) — and, in both tiers, is chosen only
@@ -1583,3 +1768,9 @@ must use matching contracts; releases follow the sequence in AGENTS.md.
   remainder (4). Only the empty-round retraction (2), in a round that builds
   nothing and waits for no finished request, retracts or aborts an exempt
   request.
+
+Deferred PD cancellation belongs to the request: it first waits for transfer
+retirement, then for any outstanding local forward. Repeated cancellation
+cannot restart a transfer wait after its retirement event has arrived. Destroying
+the request destroys this state, so reusing a client request ID cannot inherit
+an old abort.

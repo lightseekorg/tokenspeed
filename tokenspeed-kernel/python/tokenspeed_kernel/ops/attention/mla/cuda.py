@@ -18,8 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-import importlib.util
-
+from tokenspeed_kernel._optional import has_optional_package
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import error_fn
 
@@ -27,10 +26,7 @@ flash_mla_sparse_fwd = error_fn
 flash_mla_with_kvcache = error_fn
 get_mla_metadata = error_fn
 
-if (
-    current_platform().is_hopper_plus
-    and importlib.util.find_spec("flash_mla") is not None
-):
+if current_platform().is_hopper_plus and has_optional_package("flash_mla"):
     from flash_mla import (
         flash_mla_sparse_fwd,
         flash_mla_with_kvcache,

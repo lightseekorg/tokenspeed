@@ -80,6 +80,9 @@ pub struct ReasoningGrammar {
     /// The block's opener and closer token ids; `None` when they are not
     /// single tokens, and every prompt counts as having opened the block.
     pub markers: Option<(i32, i32)>,
+    /// A tool-block opener that ends reasoning without the closing marker;
+    /// excluded from reasoning usage like the explicit markers.
+    pub implicit_closer: Option<i32>,
 }
 
 impl ReasoningGrammar {

@@ -67,6 +67,7 @@ from tokenspeed_scheduler import Scheduler
 
 from tokenspeed.runtime.cache.l3.config import L3Settings
 from tokenspeed.runtime.cache.l3.factory import l3_settings
+from tokenspeed.runtime.configs.model_profile import resolve_history_seed_lookback
 from tokenspeed.runtime.distributed.nccl_suspend import nccl_suspend_supported
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -93,6 +94,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     cache_ops_from_plan,
     engram_context_len,
     resolve_dspark_prefix_replay_tokens,
+    resolve_in_flight_depth,
     should_use_overlap_schedule,
 )
 from tokenspeed.runtime.epd.encode_host import EncodeBootstrap
@@ -405,6 +407,9 @@ class HostConfig:
             model without Engram.
         request_token_history: The model reads each request's committed
             token history (``ModelConfig.requires_request_token_history``).
+        request_token_history_lookback: Committed tokens the model reads
+            behind the frontier, which bounds the history seeds; None seeds
+            the whole prefix.
         physical_context_len: Tokens a request's buffers hold.
         kv_total_pages: Usable cache pages, reported with the load.
         rank: This rank.
@@ -421,6 +426,7 @@ class HostConfig:
             multimodal inputs.
         memory_saver: ``--enable-memory-saver``: memory can be released.
         memory_regions: The regions this engine can release.
+        allow_reload_forward: ``--allow-reload-forward``: the reload_forward control call is served.
         metrics_prometheus_dir: ``PROMETHEUS_MULTIPROC_DIR``, where the host
             writes its Prometheus series, when the Prometheus reporter is
             on; else None.
@@ -464,6 +470,9 @@ class HostConfig:
         epd_receive_enabled: An EPD prefill node: requests whose images an encode
             node embeds wait for the embeddings before they are scheduled;
             its first stage receives them (``HostBootstrap.epd_receive``).
+        reasoning: The reasoning parser's structural tags and token markers;
+            used for grammar deferral and reasoning usage, also when grammar
+            constraints are off. None without a supported parser.
         grammar: Grammar-constrained decoding's settings; None with
             ``--grammar-backend none``.
         eager_grammar: The forward fills grammar bitmasks from the
@@ -485,6 +494,7 @@ class HostConfig:
     spec_num_tokens: int | None
     ngram_context_len: int
     request_token_history: bool
+    request_token_history_lookback: int | None
     physical_context_len: int
     kv_total_pages: int
     kv_token_capacity: int
@@ -496,6 +506,7 @@ class HostConfig:
     multimodal: bool
     memory_saver: bool
     memory_regions: tuple[str, ...]
+    allow_reload_forward: bool
     metrics_prometheus_dir: str | None
     metrics_relay_endpoint: str | None
     engine_metrics: bool
@@ -521,8 +532,19 @@ class HostConfig:
     engine_role: str
     eplb: EplbSettings | None
     epd_receive_enabled: bool
+    reasoning: ReasoningGrammar | None
     grammar: GrammarSettings | None
     eager_grammar: bool
+
+
+def host_in_flight_depth(server_args: ServerArgs) -> int:
+    """``HostConfig.in_flight_depth`` of a rank launched with
+    ``server_args`` (``resolve_in_flight_depth``)."""
+    return resolve_in_flight_depth(
+        disable_overlap_schedule=server_args.disable_overlap_schedule,
+        disaggregation_mode=server_args.disaggregation_mode,
+        pp_size=server_args.mapping.pp_size,
+    )
 
 
 _SAMPLING_PARAMS = msgspec.msgpack.Decoder(SamplingParams)
@@ -945,6 +967,13 @@ class HostDataPlane:
         output = self._profiler.profile(request)
         return bool(output.success), str(output.message)
 
+    def reload_forward(self, payload: bytes) -> tuple[bool, str]:
+        """Reload edited forward code and recapture the graphs (a msgpack ``ReloadForwardReqInput``); the engine drained and flushed."""
+        ok, message = self._device.reload_forward(
+            zmq_wire.decode_request_frames([zmq_wire.REQ_TYPE_CONTROL, payload])[0]
+        )
+        return bool(ok), str(message)
+
     def release_memory(self, tags: list[str]) -> None:
         """Free memory regions, in order; the scheduler has drained."""
         for tag in tags:
@@ -1152,7 +1181,8 @@ class HostBootstrap:
             else:
                 draft_model_config = None
             ngram_context_len = engram_context_len(model_config.hf_text_config)
-            if ngram_context_len and mapping.has_pp:
+            in_flight_depth = host_in_flight_depth(server_args)
+            if ngram_context_len and in_flight_depth > 1:
                 raise NotImplementedError(
                     "Engram input history requires PP=1 and in-flight depth <= 1"
                 )
@@ -1311,14 +1341,16 @@ class HostBootstrap:
                 ),
                 pg_manager=pg_manager,
             )
+            reasoning = (
+                reasoning_grammar(server_args.reasoning_parser, tokenizer)
+                if server_args.reasoning_parser
+                else None
+            )
             self.config = HostConfig(
                 handshake_address=server_args.zmq_handshake_endpoint(),
                 engine_index=server_args.zmq_engine_index + dp_rank,
                 ready_response=zmq_wire.encode(ready_response),
-                # The chunk pipeline keeps one forward per stage in flight.
-                in_flight_depth=(
-                    mapping.pp_size if mapping.has_pp else overlap_schedule_depth
-                ),
+                in_flight_depth=in_flight_depth,
                 vocab_size=model_config.vocab_size,
                 eos_token_ids=tuple(sorted(eos_token_ids)),
                 top_k_exclusive_max=get_sampling_backend_class(
@@ -1338,6 +1370,16 @@ class HostBootstrap:
                 ),
                 ngram_context_len=ngram_context_len,
                 request_token_history=model_config.requires_request_token_history,
+                request_token_history_lookback=(
+                    resolve_history_seed_lookback(
+                        model_config.model_profile,
+                        (
+                            draft_model_config.model_profile
+                            if draft_model_config is not None
+                            else None
+                        ),
+                    )
+                ),
                 physical_context_len=(
                     model_config.context_len + server_args.spec_context_pad
                 ),
@@ -1365,6 +1407,7 @@ class HostBootstrap:
                 multimodal=model_config.is_multimodal_active,
                 memory_saver=server_args.enable_memory_saver,
                 memory_regions=tuple(regions),
+                allow_reload_forward=server_args.allow_reload_forward,
                 metrics_prometheus_dir=(
                     os.environ["PROMETHEUS_MULTIPROC_DIR"]
                     if metrics_enabled(server_args, "prometheus")
@@ -1406,6 +1449,7 @@ class HostBootstrap:
                     )
                     and model_config.is_multimodal_active
                 ),
+                reasoning=reasoning,
                 grammar=(
                     GrammarSettings(
                         tokenizer_info=grammar_tokenizer_info(
@@ -1418,11 +1462,7 @@ class HostBootstrap:
                             server_args.grammar_compile_timeout_secs
                         ),
                         max_retries=int(server_args.grammar_compile_max_retries),
-                        reasoning=(
-                            reasoning_grammar(server_args.reasoning_parser, tokenizer)
-                            if server_args.reasoning_parser
-                            else None
-                        ),
+                        reasoning=reasoning,
                     )
                     if server_args.grammar_backend == "xgrammar"
                     else None

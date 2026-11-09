@@ -101,6 +101,9 @@ void advance(tokenspeed::Scheduler& scheduler, rust::Slice<const ForwardEvent> e
             case ForwardEventKind::PdFailed:
                 execution_event.With(tokenspeed::pd::FailedEvent(std::move(request_id)));
                 break;
+            case ForwardEventKind::PdTransferStopped:
+                execution_event.With(tokenspeed::pd::TransferStoppedEvent(std::move(request_id)));
+                break;
             case ForwardEventKind::PdSucceeded:
                 execution_event.With(tokenspeed::pd::SucceededEvent(std::move(request_id)));
                 break;
@@ -336,12 +339,11 @@ TransferBatchView transfer_view(const tokenspeed::ForwardBatch& batch) {
         view.spec_candidate_offsets.push_back(view.spec_candidate_ids.size());
     }
     view.num_extends = batch.NumExtends();
-    const std::size_t rows = batch.request_ids.size();
-    for (const auto& [group_id, blocks] : batch.block_tables_contig) {
+    for (const auto& [group_id, table] : batch.block_tables) {
         view.block_tables.push_back(BlockTableView{
             .group_id = rust::String(group_id),
-            .columns = rows == 0 ? 0 : blocks.size() / rows,
-            .blocks = to_rust(blocks),
+            .columns = table.Columns(),
+            .blocks = to_rust(table.AbsoluteRows()),
         });
     }
     return view;

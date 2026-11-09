@@ -35,6 +35,7 @@ __all__ = [
     "fused_gate_sigmoid_mul_add",
     "fused_swiglu_fp8_ue8m0",
     "fused_swiglu_fp8_ue8m0_masked_packed",
+    "moe_finalize_gate_add",
     "relu2",
     "sigmoid_mul",
     "silu_and_mul",
@@ -154,6 +155,142 @@ def fused_gate_sigmoid_mul_add(
         **pdl_kwargs,
     )
     return final_hidden_states
+
+
+@triton.jit
+def _moe_finalize_gate_add_kernel(
+    gemm2_out,
+    permuted_idx,
+    expert_weights,
+    hidden_states_ptr,
+    gate_weight_ptr,
+    shared_output_ptr,
+    out_ptr,
+    hidden_dim: tl.constexpr,
+    gemm2_row_stride: tl.constexpr,
+    TOPK: tl.constexpr,
+    BLOCK: tl.constexpr,
+    CHUNK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+):
+    token_id = tl.program_id(0).to(tl.int64)
+    row_offset = token_id * hidden_dim
+    cols = tl.arange(0, BLOCK)
+    mask = cols < hidden_dim
+
+    if ENABLE_PDL:
+        # Wait for the predecessor's stores; release dependents immediately.
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+
+    # Same code as _fused_gate_sigmoid_mul_add_kernel, so the same reduction
+    # and rounding. Every program of a token recomputes this 1-row dot.
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    h = tl.load(hidden_states_ptr + row_offset + cols, mask=mask, other=0.0)
+    w = tl.load(gate_weight_ptr + cols, mask=mask, other=0.0)
+    acc += h.to(tl.float32) * w.to(tl.float32)
+    gate_val = tl.sigmoid(tl.sum(acc, axis=0))
+
+    # The TRT-LLM finalize's arithmetic: fp32 sum over k in order, one bf16
+    # rounding; every gather of a CHUNK of columns is issued at once.
+    ccols = tl.program_id(1) * CHUNK + tl.arange(0, CHUNK)
+    cmask = ccols < hidden_dim
+    routed = tl.zeros([CHUNK], dtype=tl.float32)
+    for k in tl.static_range(TOPK):
+        row = tl.load(permuted_idx + token_id * TOPK + k).to(tl.int64)
+        scale = tl.load(expert_weights + token_id * TOPK + k).to(tl.float32)
+        valid = row >= 0
+        x = tl.load(
+            gemm2_out + tl.maximum(row, 0) * gemm2_row_stride + ccols,
+            mask=cmask & valid,
+            other=0.0,
+        ).to(tl.float32)
+        routed = tl.where(valid, routed + scale * x, routed)
+    routed = routed.to(tl.bfloat16)
+    s = tl.load(shared_output_ptr + row_offset + ccols, mask=cmask)
+    result = routed.to(tl.float32) + gate_val * s.to(tl.float32)
+    tl.store(out_ptr + row_offset + ccols, result.to(tl.bfloat16), mask=cmask)
+
+
+def moe_finalize_gate_add(
+    gemm2_out: torch.Tensor,
+    expanded_idx_to_permuted_idx: torch.Tensor,
+    expert_weights: torch.Tensor,
+    hidden_states: torch.Tensor,
+    gate_weight: torch.Tensor,
+    shared_output: torch.Tensor,
+) -> torch.Tensor:
+    """MoE finalize fused with ``fused_gate_sigmoid_mul_add``.
+
+    ``out[t] = bf16(bf16(sum_k w[t, k] * gemm2_out[perm[t, k]]) +
+    sigmoid(hidden_states[t] . gate_weight) * shared_output[t])``, bitwise equal
+    to the TRT-LLM finalize followed by ``fused_gate_sigmoid_mul_add``.
+
+    Args:
+        gemm2_out: ``[permuted_rows, hidden_padded]`` bf16 expert outputs from a
+            ``do_finalize=False`` MoE call.
+        expanded_idx_to_permuted_idx: ``[tokens * top_k]`` int32 row map (-1: not local).
+        expert_weights: ``[tokens, top_k]`` routing weights.
+        hidden_states: ``[tokens, hidden]`` MoE input (the gate's input).
+        gate_weight: ``[hidden]`` shared-expert gate weight.
+        shared_output: ``[tokens, hidden]`` shared-expert output.
+
+    Returns:
+        A new ``[tokens, hidden]`` bf16 tensor.
+    """
+    if hidden_states.ndim != 2 or not hidden_states.is_contiguous():
+        raise ValueError("hidden_states must be a contiguous 2D tensor")
+    num_tokens, hidden_dim = hidden_states.shape
+    if hidden_states.dtype != torch.bfloat16 or gemm2_out.dtype != torch.bfloat16:
+        raise ValueError("moe_finalize_gate_add expects bf16 activations")
+    if gate_weight.shape != (hidden_dim,) or not gate_weight.is_contiguous():
+        raise ValueError("gate_weight must be a contiguous [hidden] vector")
+    if shared_output.shape != (num_tokens, hidden_dim):
+        raise ValueError(
+            f"shared_output shape mismatch: expected {(num_tokens, hidden_dim)}, "
+            f"got {tuple(shared_output.shape)}"
+        )
+    if not shared_output.is_contiguous():
+        raise ValueError("shared_output must be contiguous")
+    if (
+        gemm2_out.ndim != 2
+        or gemm2_out.stride(1) != 1
+        or gemm2_out.shape[1] < hidden_dim
+    ):
+        raise ValueError("gemm2_out must be [rows, >= hidden] with unit column stride")
+    out = torch.empty_like(hidden_states)
+    if num_tokens == 0:
+        return out
+    top_k = expert_weights.shape[-1]
+    if expert_weights.ndim != 2 or expert_weights.shape[0] < num_tokens:
+        raise ValueError("expert_weights must be [tokens, top_k]")
+    if expanded_idx_to_permuted_idx.numel() < num_tokens * top_k:
+        raise ValueError("expanded_idx_to_permuted_idx must hold tokens * top_k rows")
+    # Only the first tokens' rows are read, densely in [token, k] order.
+    expert_weights = expert_weights[:num_tokens].contiguous()
+    expanded_idx_to_permuted_idx = expanded_idx_to_permuted_idx.reshape(-1).contiguous()
+    BLOCK = triton.next_power_of_2(hidden_dim)
+    num_warps = 4 if BLOCK <= 2048 else (8 if BLOCK <= 4096 else 16)
+    chunk = min(BLOCK, 1024)
+    enable_pdl = pdl_enabled()
+    _moe_finalize_gate_add_kernel[(num_tokens, triton.cdiv(hidden_dim, chunk))](
+        gemm2_out,
+        expanded_idx_to_permuted_idx,
+        expert_weights,
+        hidden_states,
+        gate_weight,
+        shared_output,
+        out,
+        hidden_dim=hidden_dim,
+        gemm2_row_stride=gemm2_out.stride(0),
+        TOPK=top_k,
+        BLOCK=BLOCK,
+        CHUNK=chunk,
+        ENABLE_PDL=enable_pdl,
+        num_warps=num_warps,
+        **({"launch_pdl": True} if enable_pdl else {}),
+    )
+    return out
 
 
 @triton.jit

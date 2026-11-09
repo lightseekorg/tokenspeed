@@ -24,6 +24,9 @@ on:
       version_date:
         description: "Nightly version date override, formatted as YYYYMMDD."
         type: string
+      release_candidate:
+        description: "Nightly only: the release_candidate of the manual kernel nightly to pair with (1 -> 0.1.1rc1.post20261108, pinning tokenspeed-kernel 0.1.4rc1.post20261108)."
+        type: string
 
 permissions:
   contents: read
@@ -59,9 +62,14 @@ jobs:
           REPLACE_NIGHTLY: ${{ inputs.replace_nightly }}
           PUBLISH_GITHUB: ${{ github.event_name == 'schedule' || inputs.publish_github }}
           VERSION_DATE: ${{ inputs.version_date }}
+          RELEASE_CANDIDATE: ${{ inputs.release_candidate }}
         run: |
           if [ "$REPLACE_NIGHTLY" = "true" ] && { [ "$NIGHTLY" != "true" ] || [ "$PUBLISH_GITHUB" != "true" ] || [ "$GITHUB_REF" != "refs/heads/main" ]; }; then
             echo "Replacing nightly assets requires nightly publication from main." >&2
+            exit 1
+          fi
+          if [ -n "$RELEASE_CANDIDATE" ] && [ "$NIGHTLY" != "true" ]; then
+            echo "release_candidate applies to nightly builds only." >&2
             exit 1
           fi
           echo "nightly=${NIGHTLY}" >> "$GITHUB_OUTPUT"
@@ -81,6 +89,7 @@ jobs:
               TOKENSPEED_KERNEL_BACKEND=cuda \
               TOKENSPEED_KERNEL_NIGHTLY=true \
               TOKENSPEED_KERNEL_VERSION_DATE="$version_date" \
+              TOKENSPEED_KERNEL_RELEASE_CANDIDATE="$RELEASE_CANDIDATE" \
                 python setup.py --version
             )
           }
@@ -271,7 +280,9 @@ jobs:
           exit 1
 
   check-nightly-rocm:
-    if: needs.build.outputs.nightly == 'true' && (github.event_name == 'schedule' || inputs.publish_github)
+    # A manual release-candidate nightly has no ROCm kernel of the same version;
+    # the scheduled nightly of its date indexes ROCm.
+    if: needs.build.outputs.nightly == 'true' && (github.event_name == 'schedule' || inputs.publish_github) && !inputs.release_candidate
     needs: [build, publish-nightly]
     runs-on: ubuntu-latest
     timeout-minutes: 75

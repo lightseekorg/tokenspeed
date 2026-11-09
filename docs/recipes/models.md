@@ -79,6 +79,7 @@ DEBUG_HIP_FORCE_GRAPH_QUEUES=1 DEBUG_HIP_GRAPH_BATCH_SIZE=1 ts serve \
     --kvstore-ratio 0.0 \
     --speculative-algorithm DFLASH \
     --speculative-draft-model-path RadixArk/Muse-Spark-Open-DFlash2 \
+    --speculative-draft-model-quantization fp8_weight_only \
     --speculative-num-steps 7 \
     --speculative-eagle-topk 1 \
     --speculative-num-draft-tokens 8 \
@@ -89,6 +90,15 @@ DEBUG_HIP_FORCE_GRAPH_QUEUES=1 DEBUG_HIP_GRAPH_BATCH_SIZE=1 ts serve \
 
 `--max-model-len 1048576` keeps the checkpoint's native context, which agentic
 workloads with long cached prefixes need; prefix caching is on by default.
+
+`--speculative-draft-model-quantization fp8_weight_only` streams the draft's
+MLP, `o_proj` and LM-head weights in FP8 with one scale per output row, which
+shortens each draft step at unchanged acceptance.
+
+With MXFP4 experts at MoE TP8 and EP1, startup also builds a column-split copy
+of the expert down-projection weights for prefill. The copy holds one more set
+of those weights on each GPU, which leaves less memory for the KV cache. While
+the copy exists, TokenSpeed refuses live weight updates.
 
 The two HIP runtime settings are needed for speed; TokenSpeed does not set them
 itself. `DEBUG_HIP_FORCE_GRAPH_QUEUES=1` matters most for the two-stream
@@ -642,9 +652,11 @@ Notes:
   and output projection TP subgroups at startup.
 - On NVIDIA, prefill CUDA graphs replay with the DSA attention at eager
   breaks on the PD prefill role (with `--disaggregation-layerwise-interval 0`)
-  and on the aggregated role when `--prefill-graph-capture-token-sizes` names
-  the buckets and `--enable-mixed-batch` is off; elsewhere prefill runs eager.
-  `--disable-prefill-graph` turns them off.
+  and on the aggregated role unless `--enable-mixed-batch` is on; elsewhere
+  prefill runs eager. `--disable-prefill-graph` turns them off. On the
+  aggregated role the default bucket ladder takes about 7.5 GB more per GPU,
+  out of the KV cache, and adds about 7 minutes to startup;
+  `--prefill-graph-capture-token-sizes` captures fewer buckets for less.
 - The Kimi-K3.1 DSpark draft (`Inferact/Kimi-K3.1-Pro-DSpark-preview`)
   proposes 7 tokens per step, so it takes
   `--speculative-num-draft-tokens 8`. Unlike Kimi-K3's draft, it attends
@@ -1152,8 +1164,10 @@ object:
 ```
 
 - `ple_embed_dtype: "float8_e4m3fn"`: store the PLE n-gram embedding table in
-  FP8 to save memory. Omit it to store the table in the model's compute
-  dtype.
+  FP8 to save memory, quantizing a BF16 table per row at load. When omitted,
+  the table keeps the checkpoint's format: checkpoints that ship it in FP8,
+  such as `Qwen/Qwen3.8-Flash-Next-FP8` and `nvidia/Qwen3.8-Flash-Next-NVFP4`,
+  keep it in FP8, and other checkpoints store it in the model's compute dtype.
 - `ple_offload_embedding`: keep the PLE table in pinned host memory when `true`
   or GPU memory when `false`. When omitted, TokenSpeed enables offloading on
   NVIDIA CUDA and disables it on other platforms.
@@ -1217,6 +1231,12 @@ The B200 and AMD GSM8K CI jobs, the GB300 Slurm 1P1D GSM8K job, and the
 manual 1P1D smoke test use `deepseek-ai/DeepSeek-V4.1-Flash-1017`.
 The 1P1D CI tasks set `MODEL` explicitly so both serving roles and the
 evaluation client select the same checkpoint.
+
+The target LM head masks BOS, PAD, and the image control/placeholder token IDs
+`0, 2, 129262..129264` to `-inf`. The mask applies before ordinary sampling,
+fused argmax, and speculative verification, and to target-side logprob scoring;
+draft-model proposals are unchanged. Pass
+`--disable-deepseek-v41-token-blacklist` to allow these tokens.
 
 DeepSeek V4.1 (`deepseek_v41`) runs on its own FlatKV attention backend
 with a four-group KV cache: the global KV chains, the SWA rows, and the
