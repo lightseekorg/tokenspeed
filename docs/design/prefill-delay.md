@@ -54,6 +54,17 @@ by construction, and a decode node's prompts are its peer's work; both ignore
 `allow_prefill`, and `ServerArgs` refuses the intervals with a
 disaggregated launch.
 
+`ServerArgs.prefill_delay` returns `None` only when both intervals are unset.
+An incomplete pair raises `ValueError` at the property as well as during
+startup validation, including after programmatic configuration changes.
+
+The gate also cannot be combined with `--prefill-decode-interval` (the local
+policy in [scheduler §3.3](scheduler.md#33-fused--one-engine-everything-local)).
+A local interval could close a rank's prefill after the group opens a window,
+breaking alignment; the group gate could also hold a prompt whose local delay
+budget is exhausted. `ServerArgs` refuses the combination. Leaving the gate
+unset preserves the local interval's scheduling and per-request bound.
+
 ## 2. What a rank votes with
 
 `Scheduler::ProbePrefillGate` answers two questions, read once per round:
@@ -75,6 +86,11 @@ For new prompts the watermark also bounds what ANY can open: a rank above
 backlog waits for occupancy to fall to the watermark or below, so its wait
 depends on the workload, not only `any_interval`. Resident chunks remain
 eligible at high occupancy and can finish to release their reservations.
+
+A pressured rank with decode work and no resident prefill publishes
+`want=false, decodes=true`, blocking ALL for the whole group. Peers with
+backlog may therefore wait for ANY even when their own pools have room. Under
+skewed request routing, `any_interval` controls those peers' cadence too.
 
 ## 3. Agreement without a second collective
 
@@ -117,6 +133,13 @@ cache-op acknowledgments, storage ticks and weight updates are untouched.
 With `enable_mixed_prefill_decode` the decode batch's
 `pending_prefill_reserve` drops to 0 when the gate is closed, since no
 prefill can ride beside it.
+
+The same permission and watermark checks apply to capacity retraction:
+an ineligible prefill neither triggers a retraction nor receives its grant.
+Every prefill alternative in the blocker-redirect order is checked again,
+so retrying admission cannot bypass the gate. Decode-driven retraction and
+readmission restores keep their ordinary behavior; see
+[scheduler §2](scheduler.md#2-retraction-when-admission-fails).
 
 The gate only matters when the rank has a free batch slot: `max_batch_size`
 is `--max-num-seqs` divided by the attention-DP size, and a full batch

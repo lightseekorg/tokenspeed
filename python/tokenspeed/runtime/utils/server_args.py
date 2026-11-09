@@ -2804,15 +2804,10 @@ class ServerArgs:
         os.environ.setdefault("TLLM_LOG_LEVEL", "INFO")
 
     def validate_prefill_delay(self) -> None:
-        attempt = self.prefill_attempt_interval
-        any_attempt = self.prefill_any_attempt_interval
-        if attempt is None and any_attempt is None:
+        intervals = self.prefill_delay
+        if intervals is None:
             return
-        if attempt is None or any_attempt is None:
-            raise ValueError(
-                "--prefill-attempt-interval and --prefill-any-attempt-interval "
-                "must be set together"
-            )
+        attempt, any_attempt = intervals
         if attempt < 1:
             raise ValueError(f"--prefill-attempt-interval must be >= 1, got {attempt}")
         if any_attempt < attempt:
@@ -2825,13 +2820,27 @@ class ServerArgs:
                 "the prefill delay gate applies to a fused engine "
                 "(--disaggregation-mode null) only"
             )
+        if self.prefill_decode_interval:
+            raise ValueError(
+                "--prefill-decode-interval cannot be combined with "
+                "--prefill-attempt-interval and --prefill-any-attempt-interval: "
+                "local decode intervals and the attention-DP gate use different "
+                "prefill windows"
+            )
 
     @property
     def prefill_delay(self) -> tuple[int, int] | None:
-        """The fused engine's prefill-delay gate intervals, or None."""
-        if self.prefill_attempt_interval is None:
+        """The gate intervals, or None; reject an incompletely configured pair."""
+        attempt = self.prefill_attempt_interval
+        any_attempt = self.prefill_any_attempt_interval
+        if attempt is None and any_attempt is None:
             return None
-        return (self.prefill_attempt_interval, self.prefill_any_attempt_interval)
+        if attempt is None or any_attempt is None:
+            raise ValueError(
+                "--prefill-attempt-interval and --prefill-any-attempt-interval "
+                "must be set together"
+            )
+        return (attempt, any_attempt)
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
