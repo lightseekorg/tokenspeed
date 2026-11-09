@@ -425,6 +425,10 @@ Cached-only parents are `num_usable_pages - empty - active`. Active and cached
 counts are disjoint, even when cache groups pack multiple blocks into a parent.
 `LoadSnapshot.num_used_pages` sums active and cached parents to report all
 resident occupancy, including evictable cache, rather than cache alone.
+Parents do not measure a rank's attention work: hybrid packing and state
+reservations make their count drift from the tokens attended. The snapshot
+therefore also carries `num_resident_tokens`, the prompt plus committed
+output of every request the rank holds, read from the output processor.
 `available_lcm_blocks()` scans the pool and prefix indexes for reclaimability
 and belongs in diagnostics and leak checks, never in the per-round sampler.
 

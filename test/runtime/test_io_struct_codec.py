@@ -119,7 +119,7 @@ def _roundtrip(obj):
 
 def test_load_snapshot_round_trips_as_one_tagged_frame():
     """The scheduler snapshot stays a standalone, single-frame IPC message."""
-    snapshot = LoadSnapshot("boot-a", 1, 0, 2, 3, 4, 5, 6, 1_000)
+    snapshot = LoadSnapshot("boot-a", 1, 0, 2, 3, 4, 5, 6, 1_000, 70_000)
 
     frames = MsgpackEncoder().encode(snapshot)
 

@@ -1131,6 +1131,12 @@ class EventLoop:
     def _num_running(self) -> int:
         return len(self.output_processor.rid_to_state)
 
+    def _num_resident_tokens(self) -> int:
+        return sum(
+            state.input_length + state.output_length
+            for state in self.output_processor.rid_to_state.values()
+        )
+
     def _request_context_length(self, rid: str) -> int:
         """Tokens ``rid`` holds right now: its prompt plus everything committed."""
         state = self.output_processor.rid_to_state[rid]
@@ -1301,7 +1307,9 @@ class EventLoop:
 
                     forward_op = self._get_forward_op(execution_plan)
                     stats = self._get_scheduler_stats()
-                    self.load_reporter.observe(stats, self._num_running())
+                    self.load_reporter.observe(
+                        stats, self._num_running(), self._num_resident_tokens()
+                    )
                     num_iter_tokens = (
                         sum(forward_op.input_lengths) if forward_op is not None else 0
                     )
@@ -1431,7 +1439,9 @@ class EventLoop:
                 if self._pause.forward_blocked:
                     # Frozen rounds take no planning sample of their own; the
                     # idle sleep bounds this to one sample per millisecond.
-                    self.load_reporter.sample_and_observe(self._num_running())
+                    self.load_reporter.sample_and_observe(
+                        self._num_running(), self._num_resident_tokens()
+                    )
 
                 # Resolve a deferred abort/wait pause reply once in-flight work drains.
                 self._pause.maybe_finish_drain(self.scheduler)

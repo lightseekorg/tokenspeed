@@ -1191,6 +1191,8 @@ class LoadSnapshot(
     num_used_pages: int
     max_total_pages: int
     valid_for_ms: int
+    # Prompt plus committed output tokens summed over the rank's requests.
+    num_resident_tokens: int
 
 
 class BlockReqType(Enum):

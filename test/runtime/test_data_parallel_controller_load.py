@@ -63,6 +63,7 @@ def snapshot(dp_rank: int, **overrides) -> LoadSnapshot:
         num_used_pages=0,
         max_total_pages=100,
         valid_for_ms=1_000,
+        num_resident_tokens=0,
     )
     fields.update(overrides)
     return LoadSnapshot(**fields)

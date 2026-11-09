@@ -39,7 +39,7 @@ from tokenspeed.runtime.engine.io_struct import (
 
 logger = logging.getLogger(__name__)
 
-_LoadValues = tuple[int, int, int, int, int]
+_LoadValues = tuple[int, int, int, int, int, int]
 _SocketFactory = Callable[[str], tuple[object, object]]
 _SEND_RETRY_INTERVAL_S = 0.01
 _CLOSE_TIMEOUT_S = 1.0
@@ -92,7 +92,7 @@ class DirectLoadSnapshotSink:
         self._set_load_snapshot = set_load_snapshot
 
     def observe(self, values: _LoadValues) -> None:
-        num_running, num_waiting, num_active_pages, _, max_total_pages = values
+        num_running, num_waiting, num_active_pages, _, max_total_pages, _ = values
         self._set_load_snapshot(
             num_running,
             num_waiting,
@@ -232,12 +232,25 @@ class LoadSnapshotPublisher:
 
     def _new_snapshot(self, values: _LoadValues) -> LoadSnapshot:
         self._sequence += 1
+        (
+            num_running,
+            num_waiting,
+            num_active_pages,
+            num_used_pages,
+            max_total_pages,
+            num_resident_tokens,
+        ) = values
         return LoadSnapshot(
             self._epoch,
             self._sequence,
             self._dp_rank,
-            *values,
+            num_running,
+            num_waiting,
+            num_active_pages,
+            num_used_pages,
+            max_total_pages,
             self._valid_for_ms,
+            num_resident_tokens,
         )
 
 
@@ -274,7 +287,7 @@ class LoadReporter:
         self._sample_stats = sample_stats
         self._enabled = enabled
 
-    def observe(self, stats: dict, num_running: int) -> None:
+    def observe(self, stats: dict, num_running: int, num_resident_tokens: int) -> None:
         """Publish a sample the caller already took."""
         self._publisher.observe(
             (
@@ -283,14 +296,15 @@ class LoadReporter:
                 stats["num_active_pages"],
                 stats["num_active_pages"] + stats["num_cached_pages"],
                 self._num_total_pages,
+                num_resident_tokens,
             )
         )
 
-    def sample_and_observe(self, num_running: int) -> None:
+    def sample_and_observe(self, num_running: int, num_resident_tokens: int) -> None:
         """Take a fresh scheduler sample and publish it."""
         if not self._enabled:
             return
-        self.observe(self._sample_stats(), num_running)
+        self.observe(self._sample_stats(), num_running, num_resident_tokens)
 
     def close(self) -> None:
         self._publisher.close()
@@ -375,6 +389,7 @@ class LoadSnapshotStore:
             snapshot.num_used_pages,
             snapshot.max_total_pages,
             snapshot.valid_for_ms,
+            snapshot.num_resident_tokens,
         )
         self._snapshots[rank] = _StoredSnapshot(copied, now)
         return True
@@ -423,6 +438,7 @@ class LoadSnapshotStore:
                 snapshot.num_waiting_reqs,
                 snapshot.num_active_pages,
                 snapshot.num_used_pages,
+                snapshot.num_resident_tokens,
             )
         ):
             return False

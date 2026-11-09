@@ -142,12 +142,13 @@ def observed_values(**overrides) -> dict:
         num_active_pages=3,
         num_used_pages=4,
         max_total_pages=10,
+        num_resident_tokens=6,
     )
     values.update(overrides)
     return values
 
 
-def observed_tuple(**overrides) -> tuple[int, int, int, int, int]:
+def observed_tuple(**overrides) -> tuple[int, int, int, int, int, int]:
     values = observed_values(**overrides)
     return (
         values["num_running_reqs"],
@@ -155,6 +156,7 @@ def observed_tuple(**overrides) -> tuple[int, int, int, int, int]:
         values["num_active_pages"],
         values["num_used_pages"],
         values["max_total_pages"],
+        values["num_resident_tokens"],
     )
 
 
@@ -191,6 +193,7 @@ def make_snapshot(**overrides) -> LoadSnapshot:
         num_used_pages=5,
         max_total_pages=10,
         valid_for_ms=int(VALID_FOR_SECONDS * 1_000),
+        num_resident_tokens=6,
     )
     fields.update(overrides)
     return LoadSnapshot(**fields)
@@ -224,6 +227,20 @@ def test_publisher_observe_accepts_one_scalar_tuple():
         wait_until(lambda: socket.decoded_snapshots)
 
         assert socket.decoded_snapshots[0].num_running_reqs == 1
+    finally:
+        publisher.close()
+
+
+def test_published_snapshot_carries_the_observed_resident_tokens():
+    socket = RecordingSocket()
+    publisher, _ = start_publisher(socket)
+    try:
+        publisher.observe(observed_tuple(num_resident_tokens=123_456))
+        wait_until(lambda: socket.decoded_snapshots)
+
+        snapshot = socket.decoded_snapshots[0]
+        assert (snapshot.dp_rank, snapshot.max_total_pages) == (2, 10)
+        assert snapshot.num_resident_tokens == 123_456
     finally:
         publisher.close()
 
@@ -396,6 +413,7 @@ def test_running_round_publishes_the_sample_the_loop_already_took(active, cached
     reporter.observe(
         {"num_queue_reqs": 3, "num_active_pages": active, "num_cached_pages": cached},
         num_running=2,
+        num_resident_tokens=9_000,
     )
 
     assert trace == [
@@ -407,6 +425,7 @@ def test_running_round_publishes_the_sample_the_loop_already_took(active, cached
                 num_active_pages=active,
                 num_used_pages=active + cached,
                 max_total_pages=20,
+                num_resident_tokens=9_000,
             ),
         )
     ]
@@ -421,15 +440,15 @@ def test_frozen_rounds_sample_for_themselves():
     scheduler_state = {"waiting": 0, "active": 0, "cached": 0}
     reporter = _reporter(trace, scheduler_state)
 
-    reporter.sample_and_observe(num_running=0)
+    reporter.sample_and_observe(num_running=0, num_resident_tokens=0)
     scheduler_state.update(waiting=1, active=2, cached=2)
-    reporter.sample_and_observe(num_running=0)
+    reporter.sample_and_observe(num_running=1, num_resident_tokens=300)
 
     assert trace == [
         "sample",
-        ("observe", (0, 0, 0, 0, 20)),
+        ("observe", (0, 0, 0, 0, 20, 0)),
         "sample",
-        ("observe", (0, 1, 2, 4, 20)),
+        ("observe", (1, 1, 2, 4, 20, 300)),
     ]
 
 
@@ -437,7 +456,7 @@ def test_non_reporting_rank_never_samples_the_scheduler():
     trace = []
     reporter = _reporter(trace, {"waiting": 0, "active": 0, "cached": 0}, enabled=False)
 
-    reporter.sample_and_observe(num_running=0)
+    reporter.sample_and_observe(num_running=0, num_resident_tokens=0)
 
     assert trace == []
 
@@ -490,6 +509,43 @@ def test_reporter_factory_selects_the_sink_for_each_mode(
         )
 
 
+def test_resident_tokens_sum_prompt_and_committed_output_of_every_request():
+    pytest.importorskip("tokenspeed_scheduler")
+    from tokenspeed.runtime.engine import event_loop as event_loop_module
+    from tokenspeed.runtime.engine.generation_output_processor import (
+        OutputProcesser,
+        RequestState,
+    )
+    from tokenspeed.runtime.metrics.collector import EngineMetrics
+    from tokenspeed.runtime.sampling.sampling_params import SamplingParams
+
+    output = OutputProcesser(
+        send_to_tokenizer=lambda message: None,
+        metrics=EngineMetrics(labels={}, enabled=False, reporters=[]),
+    )
+    decoding = RequestState(
+        [1, 2, 3],
+        SamplingParams(max_new_tokens=8),
+        False,
+        None,
+        computes_prompt_logprobs=False,
+    )
+    decoding.output_ids.extend([7, 8])
+    arriving = RequestState(
+        [4] * 5,
+        SamplingParams(max_new_tokens=8),
+        False,
+        None,
+        computes_prompt_logprobs=False,
+    )
+    output.register("decoding", decoding)
+    output.register("arriving", arriving)
+    loop = event_loop_module.EventLoop.__new__(event_loop_module.EventLoop)
+    loop.output_processor = output
+
+    assert loop._num_resident_tokens() == (3 + 2) + 5
+
+
 def test_event_loop_binds_the_output_setter_only_where_it_exists():
     """Non-reporting ranks send through a NullSender with no snapshot setter,
     so the loop must not reach for it while wiring the reporter."""
@@ -521,7 +577,7 @@ def test_event_loop_binds_the_output_setter_only_where_it_exists():
 
 def test_load_snapshot_is_immutable_and_positional():
     """Snapshots cannot be mutated after their wire values are assigned."""
-    snapshot = LoadSnapshot("boot-a", 1, 0, 2, 3, 4, 5, 10, 1_000)
+    snapshot = LoadSnapshot("boot-a", 1, 0, 2, 3, 4, 5, 10, 1_000, 6)
 
     with pytest.raises(AttributeError):
         snapshot.sequence = 2
@@ -589,6 +645,7 @@ def test_store_rejects_non_increasing_sequence_in_current_epoch():
         {"num_active_pages": 11},
         {"num_used_pages": 11},
         {"valid_for_ms": -1},
+        {"num_resident_tokens": -1},
     ],
 )
 def test_store_rejects_invalid_snapshot_values(overrides):

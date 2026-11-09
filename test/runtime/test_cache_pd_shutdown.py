@@ -164,8 +164,12 @@ class _EventLoopHarness:
             note_round=lambda *, forwarded: self.trace.append("gc_round")
         )
         self.load_reporter = SimpleNamespace(
-            observe=lambda _stats, _running: self.trace.append("observe_load"),
-            sample_and_observe=lambda _running: self.trace.append("sample_load"),
+            observe=lambda _stats, _running, _resident: self.trace.append(
+                "observe_load"
+            ),
+            sample_and_observe=lambda _running, _resident: self.trace.append(
+                "sample_load"
+            ),
             close=lambda: self.trace.append("close_load"),
         )
 
@@ -190,6 +194,9 @@ class _EventLoopHarness:
         return object()
 
     def _num_running(self) -> int:
+        return 0
+
+    def _num_resident_tokens(self) -> int:
         return 0
 
     def _record_scheduler_iteration_metrics(
