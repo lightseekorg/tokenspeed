@@ -45,6 +45,7 @@ from tokenspeed_kernel.ops.attention.dsv4._triton.dcp import (
 )
 from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.selection import NoKernelFoundError
 
 torch.manual_seed(42)
 
@@ -1508,7 +1509,7 @@ def test_dsa_prefill_dcp_records_match_dispatch(tokens, degree, local_heads):
     )
     heads = degree * local_heads
     assert dsa_prefill_dcp_records_supported(
-        tokens=tokens, heads=heads, topk=_RECORDS_TOPK
+        tokens=tokens, heads=heads, topk=_RECORDS_TOPK, q_dtype=q.dtype
     )
     kwargs = _records_kwargs(cache, slots, lengths)
     # Reference: head-sharded prefill with LSE, repacked into the all-to-all records.
@@ -1536,16 +1537,20 @@ def test_dsa_prefill_dcp_records_match_dispatch(tokens, degree, local_heads):
 def test_dsa_prefill_dcp_records_refuse_split_launches():
     # Under one program per SM, dsa_prefill splits keys and the records would differ.
     sm_count = current_platform().sm_count
-    assert not dsa_prefill_dcp_records_supported(tokens=0, heads=16, topk=2048)
-    assert not dsa_prefill_dcp_records_supported(tokens=1, heads=16, topk=2048)
-    assert not dsa_prefill_dcp_records_supported(tokens=sm_count, heads=16, topk=2048)
-    assert dsa_prefill_dcp_records_supported(tokens=sm_count + 1, heads=16, topk=2048)
+
+    def supported(tokens, heads):
+        return dsa_prefill_dcp_records_supported(
+            tokens=tokens, heads=heads, topk=2048, q_dtype=torch.float8_e4m3fn
+        )
+
+    assert not supported(0, 16)
+    assert not supported(1, 16)
+    assert not supported(sm_count, 16)
+    assert supported(sm_count + 1, 16)
     # Heads past one 16-head block double the programs per token.
-    assert dsa_prefill_dcp_records_supported(
-        tokens=sm_count // 2 + 1, heads=17, topk=2048
-    )
+    assert supported(sm_count // 2 + 1, 17)
     q, cache, slots, lengths = _records_inputs(8, 2, 8, seed=5)
-    with pytest.raises(ValueError, match="runs one split"):
+    with pytest.raises(NoKernelFoundError, match="dsa_prefill_dcp_records"):
         dsa_prefill_dcp_records(q=q, **_records_kwargs(cache, slots, lengths))
 
 

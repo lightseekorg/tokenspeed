@@ -493,10 +493,15 @@ the Triton leaf registers it. A `dsa_prefill` registration would make it a
 candidate for ordinary calls. The leaf runs `_dsa_dense_kv_kernel`'s
 single-split program over dense KV, with the same jitted body
 (`_dsa_dense_kv_attend`) and launch configuration. The token count is a
-runtime argument (`do_not_specialize`). `dsa_prefill_dcp_records_supported`
-accepts a size only when `dsa_prefill` would not split the keys either: the
-launch needs at least about one program per SM. Any other size raises.
-Callers check this from host sizes before they gather the query.
+runtime argument (`do_not_specialize`). The leaf accepts a size only when
+`dsa_prefill` would not split the keys either: the launch needs at least
+about one program per SM. The records ops pass their sizes (rows, every
+rank's heads, the selection width and the dtypes) as selection traits, and
+each leaf states its size rule as a `problem_filter` over them, so selection
+refuses any other size. `dsa_prefill_dcp_records_supported` and
+`dsa_decode_dcp_records_supported` are that selection, which callers make
+from host sizes before they gather the query; `dsa_select_owned_candidates`
+does the same over its gathered scores' sizes.
 
 `dsa_decode_dcp_records` is the decode counterpart, with the same layouts and
 bit-identity to `dispatch_dcp_attention_partials` over

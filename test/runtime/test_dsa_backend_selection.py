@@ -668,7 +668,6 @@ def test_dsa_sparse_leaf_log_names_the_real_selection(monkeypatch, caplog, kv_dt
         "triton",
         "trtllm_core",
         "other_core",
-        "no_records_leaf",
         "planned",
         "no_kvp",
         "bf16_cache",
@@ -679,11 +678,12 @@ def test_dcp_records_core_follows_the_ordinary_prefill_selection(monkeypatch, ca
     its padded query for the trtllm-gen one only.
 
     configure_runtime, once the solution pin has landed, asks the forward's
-    own LSE prefill selection (an FP8 query on the FP8 cache) and the records
-    op for the same inputs. A planned leaf keeps its core and a leaf without
-    KVP runs no head-sharded prefill, so neither asks. Nor does a BF16 cache,
-    although its selection here is the Triton core: its query keeps the
-    ordinary gather, which takes the multicast kernels where they reach.
+    own LSE prefill selection (an FP8 query on the FP8 cache); the records op
+    selects per prefill size instead. A planned leaf keeps its core and a
+    leaf without KVP runs no head-sharded prefill, so neither asks. Nor does a
+    BF16 cache, although its selection here is the Triton core: its query
+    keeps the ordinary gather, which takes the multicast kernels where they
+    reach.
     """
     dsa = backends.dsa
     backend, _ = _sparse_leaf_backend(
@@ -704,8 +704,6 @@ def test_dcp_records_core_follows_the_ordinary_prefill_selection(monkeypatch, ca
                 "trtllm_core": "flashinfer_trtllm_dsa_prefill",
             }.get(case, "triton_dsa_prefill")
             return SimpleNamespace(name=core)
-        if mode == "dsa_prefill_dcp_records" and case == "no_records_leaf":
-            raise NoKernelFoundError("no records leaf")
         return SimpleNamespace(name=f"fake_{mode}")
 
     monkeypatch.setattr(dsa, "select_kernel", select)
@@ -716,14 +714,12 @@ def test_dcp_records_core_follows_the_ordinary_prefill_selection(monkeypatch, ca
     )
     assert backend._dcp_records_core is (case == "triton")
     assert backend._dcp_padded_query is (case == "trtllm_core")
-    records = [call for call in calls if call[0] == "dsa_prefill_dcp_records"]
+    assert not [call for call in calls if call[0] == "dsa_prefill_dcp_records"]
     if case in ("planned", "no_kvp", "bf16_cache"):
-        assert not records
         return
-    # The probe precedes the startup log and asks the records op what it asked prefill.
-    prefill, records_call = calls[:2]
-    assert records == [records_call]
-    assert prefill[0] == "dsa_prefill" and prefill[1:] == records_call[1:]
+    # The probe precedes the startup log.
+    prefill = calls[0]
+    assert prefill[0] == "dsa_prefill"
     _, signature, traits, solution = prefill
     assert signature == format_signature(q=dense_tensor_format(torch.float8_e4m3fn))
     assert traits["return_lse"] is True and traits["topk"] == 2048
@@ -736,7 +732,6 @@ def test_dcp_records_core_follows_the_ordinary_prefill_selection(monkeypatch, ca
         "gfx950",
         "verify_other_core",
         "other_core",
-        "no_records_leaf",
         "planned",
         "no_kvp",
         "bf16_cache",
@@ -766,8 +761,6 @@ def test_dcp_decode_records_core_follows_every_decode_selection(monkeypatch, cas
             return SimpleNamespace(
                 name="triton_dsa_decode" if other else "gluon_dsa_decode_gfx950"
             )
-        if mode == "dsa_decode_dcp_records" and case == "no_records_leaf":
-            raise NoKernelFoundError("no records leaf")
         return SimpleNamespace(name=f"fake_{mode}")
 
     monkeypatch.setattr(dsa, "select_kernel", select)

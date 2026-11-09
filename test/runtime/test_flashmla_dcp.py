@@ -899,7 +899,15 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(
         return out[:, rank * 2 : (rank + 1) * 2]
 
     def supported(
-        *, tokens, heads, topk, q_dtype, kv_dtype, kv_lora_rank, qk_rope_head_dim
+        *,
+        tokens,
+        heads,
+        topk,
+        q_dtype,
+        kv_dtype,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        solution,
     ):
         # Host values every rank shares: the rows, the gathered heads, the
         # selection width and the leaf's geometry.
@@ -1118,7 +1126,7 @@ def test_dsa_prefill_partitions_candidates_and_merges_gathered_heads(
         assert lse.shape == out.shape[:-1]
         return out[:, rank * 2 : (rank + 1) * 2]
 
-    def supported(*, tokens, heads, topk):
+    def supported(*, tokens, heads, topk, q_dtype, solution):
         # Host-side sizes every rank shares: rows, gathered heads, selection width.
         sizes.append((tokens, heads, topk))
         return arm == "records"

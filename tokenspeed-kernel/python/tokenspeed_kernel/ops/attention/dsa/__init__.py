@@ -68,6 +68,15 @@ def _attention_format_signature(**roles: torch.Tensor):
     )
 
 
+def _selects(op: str, signature, traits: dict, solution: str | None) -> bool:
+    """Whether attention ``op`` selects a kernel for ``traits``."""
+    try:
+        select_kernel("attention", op, signature, traits=traits, solution=solution)
+    except NoKernelFoundError:
+        return False
+    return True
+
+
 def dsa_interleave_rope(
     tensor: torch.Tensor,
     positions: torch.Tensor,
@@ -745,13 +754,14 @@ def dsa_decode_dcp_records_supported(
     kv_dtype: torch.dtype,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
+    solution: str | None = None,
 ) -> bool:
     """Whether :func:`dsa_decode_dcp_records` serves a decode of this size.
 
     Host values only, so every rank of a KVP group decides alike before the
-    query gather. The op has one leaf, gfx950's dense matrix core, which
-    writes a row's records itself or through its reduction over split keys:
-    other inputs, and other platforms, are refused.
+    query gather: the selection the launch makes for these sizes, whose
+    leaves' ``problem_filter`` refuses sizes they cannot take. Platforms
+    without a leaf are refused.
 
     Args:
         tokens: Query rows.
@@ -761,22 +771,39 @@ def dsa_decode_dcp_records_supported(
         kv_dtype: The KV cache's dtype.
         kv_lora_rank: MLA latent rank.
         qk_rope_head_dim: RoPE q/k dimension.
+        solution: As for :func:`dsa_decode_dcp_records`.
     """
-    if not current_platform().is_amd:
-        return False
-    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (
-        gluon_dsa_decode_dcp_records_supported_gfx950,
+    return _selects(
+        "dsa_decode_dcp_records",
+        format_signature(q=dense_tensor_format(q_dtype)),
+        {
+            **_dcp_records_size_traits(
+                tokens=tokens,
+                heads=heads,
+                topk=topk,
+                q_dtype=q_dtype,
+                kv_dtype=kv_dtype,
+            ),
+            "kv_lora_rank": int(kv_lora_rank),
+            "qk_rope_head_dim": int(qk_rope_head_dim),
+        },
+        solution,
     )
 
-    return gluon_dsa_decode_dcp_records_supported_gfx950(
-        tokens=tokens,
-        heads=heads,
-        topk=topk,
-        q_dtype=q_dtype,
-        kv_dtype=kv_dtype,
-        kv_lora_rank=kv_lora_rank,
-        qk_rope_head_dim=qk_rope_head_dim,
-    )
+
+def _dcp_records_size_traits(
+    *, tokens: int, heads: int, topk: int, q_dtype: torch.dtype, kv_dtype: torch.dtype
+) -> dict:
+    """The DCP records ops' size traits, which their leaves' ``problem_filter``
+    checks: query rows, every rank's heads, the selection width and the
+    query and cache dtypes."""
+    return {
+        "tokens": int(tokens),
+        "heads": int(heads),
+        "topk": int(topk),
+        "q_dtype": q_dtype,
+        "kv_dtype": kv_dtype,
+    }
 
 
 def dsa_decode_dcp_records_workspace_bytes(
@@ -847,7 +874,7 @@ def dsa_decode_dcp_records(
         live length and the launch's size, so a short one, as one near its
         rank's share of the selection, may split less than that decode and
         round differently; a row long enough for all its splits matches it
-        bit for bit. Raises ``ValueError`` for a size
+        bit for bit. Raises ``NoKernelFoundError`` for a size
         :func:`dsa_decode_dcp_records_supported` refuses.
     """
     return _dsa_dcp_records(
@@ -909,11 +936,17 @@ def _dsa_dcp_records(
         )
     traits = {
         **traits,
+        **_dcp_records_size_traits(
+            tokens=tokens,
+            heads=degree * local_heads,
+            topk=topk_slots.shape[-1],
+            q_dtype=q.dtype,
+            kv_dtype=kv_cache.dtype,
+        ),
         "qk_nope_head_dim": int(qk_nope_head_dim),
         "kv_lora_rank": int(kv_lora_rank),
         "qk_rope_head_dim": int(qk_rope_head_dim),
         "page_size": int(page_size),
-        "topk": int(topk_slots.shape[-1]),
         "logit_cap": logit_cap != 0.0,
         "topk_layout": "global_slots",
         "slot_order": slot_order,
@@ -959,31 +992,39 @@ def _dsa_dcp_records(
         )
 
 
-def dsa_prefill_dcp_records_supported(*, tokens: int, heads: int, topk: int) -> bool:
+def dsa_prefill_dcp_records_supported(
+    *,
+    tokens: int,
+    heads: int,
+    topk: int,
+    q_dtype: torch.dtype,
+    solution: str | None = None,
+) -> bool:
     """Whether :func:`dsa_prefill_dcp_records` serves a prefill of this size.
 
-    Host integers only, so every rank of a KVP group decides alike before
-    the query gather. The op has one leaf, the portable Triton core, and its
-    launch geometry decides: it runs one split per row, which matches
-    ``dsa_prefill``'s Triton launch only when that launch does not split the
-    keys either (a grid of at least about one program per SM).
+    Host values only, so every rank of a KVP group decides alike before the
+    query gather: the selection the launch makes for these sizes. The
+    portable Triton leaf's ``problem_filter`` decides by its launch
+    geometry: it runs one split per row, which matches ``dsa_prefill``'s
+    Triton launch only when that launch does not split the keys either (a
+    grid of at least about one program per SM).
 
     Args:
         tokens: Query rows.
         heads: Gathered query heads, every rank's.
         topk: Selected-slot width.
+        q_dtype: The query's dtype.
+        solution: As for :func:`dsa_prefill_dcp_records`.
 
     Returns:
         True when the records hold the bits the Triton ``dsa_prefill`` plus
         ``dispatch_dcp_attention_partials`` would produce.
     """
-    # The only registered leaf answers for its own launch; selection has no size bound.
-    from tokenspeed_kernel.ops.attention.dsa.triton import (
-        triton_dsa_prefill_dcp_records_supported,
-    )
-
-    return triton_dsa_prefill_dcp_records_supported(
-        tokens=tokens, heads=heads, topk=topk
+    return _selects(
+        "dsa_prefill_dcp_records",
+        format_signature(q=dense_tensor_format(q_dtype)),
+        {"tokens": int(tokens), "heads": int(heads), "topk": int(topk)},
+        solution,
     )
 
 
@@ -1037,7 +1078,7 @@ def dsa_prefill_dcp_records(
         degree=ranks)`` packs from ``dsa_prefill(..., return_lse=True)`` on the
         token-major gather (head ``r * local_heads + h``): BF16 output pairs,
         low half first, then the natural-log FP32 LSE; an empty row is zero
-        output with ``-inf`` LSE. Raises ``ValueError`` for a size
+        output with ``-inf`` LSE. Raises ``NoKernelFoundError`` for a size
         :func:`dsa_prefill_dcp_records_supported` refuses.
     """
     return _dsa_dcp_records(
@@ -1427,25 +1468,43 @@ def dsa_merge_candidates(
 
 
 def dsa_select_owned_candidates_supported(
-    *, ranks: int, rows: int, topk: int, rank_stride: int
+    *,
+    ranks: int,
+    rows: int,
+    topk: int,
+    rank_stride: int,
+    solution: str | None = None,
 ) -> bool:
     """Whether :func:`dsa_select_owned_candidates` serves gathered scores of
     ``ranks`` ranks' ``rows`` rows of ``topk`` candidates, ``rank_stride``
     elements apart.
 
     Host values only, so every rank of a KVP group decides alike before the
-    scores are gathered. The op has one leaf, gfx950's one-launch selection:
-    other sizes, and other platforms, keep :func:`dsa_merge_candidates`.
+    scores are gathered: the selection the launch makes for these sizes.
+    Sizes no leaf takes, and platforms without one, keep
+    :func:`dsa_merge_candidates`. ``solution`` as for the launch.
     """
-    if not current_platform().is_cdna4:
-        return False
-    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.owned_selection import (
-        gathered_owned_selection_supported,
+    return _selects(
+        "dsa_select_owned_candidates",
+        format_signature(scores=dense_tensor_format(torch.float32)),
+        _owned_selection_traits(
+            ranks=ranks, rows=rows, topk=topk, rank_stride=rank_stride
+        ),
+        solution,
     )
 
-    return gathered_owned_selection_supported(
-        ranks=ranks, rows=rows, topk=topk, rank_stride=rank_stride
-    )
+
+def _owned_selection_traits(
+    *, ranks: int, rows: int, topk: int, rank_stride: int
+) -> dict:
+    """:func:`dsa_select_owned_candidates`' selection traits: its sizes,
+    which its leaves' ``problem_filter`` checks."""
+    return {
+        "ranks": int(ranks),
+        "rows": int(rows),
+        "topk": int(topk),
+        "rank_stride": int(rank_stride),
+    }
 
 
 def dsa_select_owned_candidates(
@@ -1492,11 +1551,21 @@ def dsa_select_owned_candidates(
         at the k-th score go to the ranks in order, and within a rank in
         candidate order, so the ranks' shares partition one selection.
     """
+    if scores.dim() != 3:
+        raise ValueError(
+            "dsa_select_owned_candidates takes rank-major scores "
+            f"[ranks, rows, candidates], got {tuple(scores.shape)}"
+        )
     kernel = select_kernel(
         "attention",
         "dsa_select_owned_candidates",
         _attention_format_signature(scores=scores),
-        traits={"topk": topk},
+        traits=_owned_selection_traits(
+            ranks=scores.shape[0],
+            rows=scores.shape[1],
+            topk=topk,
+            rank_stride=scores.stride(0),
+        ),
         solution=solution,
     )
     with kernel_scope(

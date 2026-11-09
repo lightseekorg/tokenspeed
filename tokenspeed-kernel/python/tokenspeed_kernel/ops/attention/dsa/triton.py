@@ -27,6 +27,7 @@ from tokenspeed_kernel.ops.attention.dsa._triton.candidate_exchange import (
 )
 from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.selection import traits_problem_filter
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 # Selected-slot DSA attention in absorbed-MLA form: the values are the latent
@@ -976,6 +977,13 @@ def triton_dsa_prefill(
         "topk": frozenset({512, 1024, 2048, 2049, 2050, 2051}),
         "topk_layout": frozenset({"global_slots"}),
         "logit_cap": frozenset({False}),
+        "problem_filter": frozenset(
+            {
+                traits_problem_filter(
+                    triton_dsa_prefill_dcp_records_supported, "tokens", "heads", "topk"
+                )
+            }
+        ),
     },
     priority=Priority.PORTABLE,
 )
