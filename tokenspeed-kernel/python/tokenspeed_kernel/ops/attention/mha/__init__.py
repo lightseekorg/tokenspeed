@@ -146,9 +146,12 @@ def mha_plan(
         - "extend_mode":
           "postwrite" means prefill attends the new K/V rows directly;
           "prewrite" means extend attention reads them from the KV cache.
+        - "mixed_decode": whether the single-token decode rows of a mixed
+          prefill/decode batch run decode attention (``mha_decode_with_kvcache``)
+          instead of extend attention.
     """
     if dtype == torch.float8_e4m3fn:
-        return {"extend_mode": "prewrite"}
+        return {"extend_mode": "prewrite", "mixed_decode": False}
 
     traits = {
         "head_dim": head_dim,
@@ -182,7 +185,10 @@ def mha_plan(
         if any(spec.priority >= Priority.PERFORMANT for spec in candidates)
         else "prewrite"
     )
-    return {"extend_mode": extend_mode}
+    # RDNA4's Triton extend kernel is slow for single-token rows; its split
+    # decode kernel serves them faster.
+    mixed_decode = current_platform().is_rdna4 and solution in (None, "triton")
+    return {"extend_mode": extend_mode, "mixed_decode": mixed_decode}
 
 
 def mha_prefill(

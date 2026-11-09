@@ -162,6 +162,10 @@ def _fp8_override_layer_patterns(config: Mapping[str, Any]) -> list[str]:
 
 def _iter_ignored_layer_pattern_aliases(raw: str):
     yield raw
+    # Some exporters (AMD Quark) list tensor names; layers match module names.
+    if raw.endswith(".weight"):
+        yield from _iter_ignored_layer_pattern_aliases(raw.removesuffix(".weight"))
+        return
     if raw.startswith("language_model."):
         yield raw.removeprefix("language_model.")
         return

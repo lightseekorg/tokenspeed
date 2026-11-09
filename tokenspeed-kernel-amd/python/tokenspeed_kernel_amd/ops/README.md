@@ -787,6 +787,47 @@ the scale math past the branches of the warp pipeline's closing barrier and
 of the cluster arrive, which keeps every partial live and spills. The row
 count is a runtime argument.
 
+### RDNA4 dense MXFP4 linear (dynamic MXFP4 activations)
+
+`gluon_mxfp4_linear_gfx120x` and `gluon_mxfp4_swiglu_linear_gfx120x` run the dense
+MXFP4 projections on gfx1201 from decode to prefill batch sizes.
+
+#### Contract
+
+- Same operands and outputs as the portable `triton_mxfp4_linear`: BF16
+  `x [M, K]`, a packed E2M1 weight `[N, K/2]` in checkpoint order with UE8M0
+  scales `[N, K/32]`, `K % 32 == 0`. The SwiGLU variant takes stacked
+  `[gate; up]` rows and returns `silu(gate) * up` after rounding the
+  projection to BF16, as the unfused path does.
+- `x` is quantized exactly as `mxfp4_quantize` does, so the products are
+  those of the portable path; only FP32 summation order differs.
+- `M` is a runtime argument: one binary serves 1-3 rows, and no row count
+  recompiles while serving.
+
+#### Algorithm
+
+One to three rows run two kernels. `gluon_mm_mxfp4_decode_quantize_gfx120x`
+quantizes the BF16 rows to MXFP4 and writes E2M1 already expanded exactly to
+twice its value as int8, so no GEMM program unpacks activations. Then
+`gluon_mm_mxfp4_decode_gfx120x` streams four weight rows per program, expanding
+the weight through two `v_perm_b32` lookups; `v_dot4_i32_iu8` reduces each
+32-value group in integers, and `v_ldexp_f32` applies both E8M0 exponents
+(minus the doubling) to the group sum in FP32. The row count picks a
+specialization outside the K loop.
+
+Larger M expands the quantized activations exactly to BF16 once (every MXFP4
+value is a BF16 value) and runs the portable scaled-dot Triton GEMM with
+128x128x64 tiles, so each tile upcasts only the weight.
+
+### RDNA4 BF16 decode GEMM
+
+`gluon_mm_bf16_decode_gfx120x` serves `mm` for 1-4 BF16 rows on gfx1201 (the
+decode LM head) with contiguous `A [M, K]`, `B [N, K]` and `K % 256 == 0`,
+returning BF16. Each program sums 16 output columns of every row in FP32
+over 256-wide K steps, issuing the next step's weight loads before the
+current step's math, so the weight streams once near peak read bandwidth.
+`M` is a runtime argument; one row and two to four rows are two binaries.
+
 ## Attention
 
 ### gfx1250 standard-cache DSA and KPool scoring

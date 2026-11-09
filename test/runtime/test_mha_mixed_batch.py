@@ -678,17 +678,45 @@ def _cached_attention_cpu(
     return torch.stack(outputs).to(q.dtype)
 
 
+def _decode_attention_cpu(
+    q,
+    k_cache,
+    v_cache,
+    page_table,
+    cache_seqlens,
+    *,
+    window_left,
+    block_draft,
+    **kwargs
+):
+    """CPU stand-in for single-token decode attention, using its public ABI."""
+    assert not block_draft and kwargs["max_seqlen_q"] == 1
+    return _cached_attention_cpu(
+        q=q,
+        cu_seqlens_q=torch.arange(q.shape[0] + 1),
+        k_cache=k_cache,
+        v_cache=v_cache,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        window_left=window_left,
+    )
+
+
 @pytest.mark.parametrize("window", [-1, 2])
 @pytest.mark.parametrize("width", [1, 16])
 @pytest.mark.parametrize("heads", [(12, 2, 1), (48, 8, 8)])
+# A plan may send a mixed batch's single-token decode rows to decode attention.
+@pytest.mark.parametrize("mixed_decode", [False, True])
 def test_mixed_forward_keeps_decode_history_and_drops_only_padding(
-    monkeypatch, window, width, heads
+    monkeypatch, window, width, heads, mixed_decode
 ):
     backend = _backend(width=width, heads=heads)
     # Some registry solutions can prefer fresh-prefill without cache. Mixed
     # decode rows must still consume their history even when prefills are fresh.
-    monkeypatch.setattr(backend, "plan", lambda **kwargs: {"extend_mode": "postwrite"})
+    plan = {"extend_mode": "postwrite", "mixed_decode": mixed_decode}
+    monkeypatch.setattr(backend, "plan", lambda **kwargs: plan)
     monkeypatch.setattr(mha, "mha_extend_with_kvcache", _cached_attention_cpu)
+    monkeypatch.setattr(mha, "mha_decode_with_kvcache", _decode_attention_cpu)
     layer = PagedAttention(
         backend.tp_q_head_num,
         128,
