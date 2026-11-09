@@ -101,7 +101,11 @@ struct SchedulerConfig {
     // Fused role only: decode rounds owed after a local prefill round
     // (docs/design/scheduler.md §3.3). 0 is off.
     std::int32_t prefill_decode_interval{0};
-    // Opt in to remaining-work ordering with oldest-request starvation protection.
+    // P and fused roles: rank new local prefills by work after Device/Host
+    // prefix reuse, keeping stable ties and resident chunks first. Only the
+    // oldest waiting prompt counts successful later first admissions; after
+    // eight, it gains selection priority. Off preserves submission order.
+    // See docs/design/scheduler.md section 1.1.
     bool enable_short_prefill_first{false};
 
     // The P and D roles ARE the cache-transfer PD protocol: there is no

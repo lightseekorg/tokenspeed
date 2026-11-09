@@ -528,7 +528,9 @@ private:
     // it on the budget left; stops at the first capacity failure. Nothing it
     // admits holds the head of line, and the holder's operation then moves
     // behind theirs: the completing prefills run first, the incomplete one
-    // last.
+    // last. candidates supplies the round's FIFO order. With
+    // enable_short_prefill_first, a successful carried first admission that
+    // overtakes the oldest waiting prompt increments that prompt's bypass count.
     void carryWholePrompts(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                            std::span<const WholePrompt> carried, std::int32_t decode_reserve);
 
