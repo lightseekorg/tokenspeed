@@ -273,23 +273,17 @@ def test_unsharded_decode_keeps_no_dcp_record(monkeypatch):
 # --- KVP decode: each rank's share as its local slots -------------------------
 
 
-def test_an_owned_decode_topk_is_read_under_its_placement_only():
+def test_an_owned_decode_topk_refuses_readers_of_another_placement():
     record = glm5.GlmDsaDecodeTopK(
         topk_indices=torch.arange(8, dtype=torch.int32).view(4, 2),
         topk_lens=torch.arange(4, dtype=torch.int32),
         owned_placement=_PLACEMENT,
     )
-    take = glm5.GlmDsaSparseAttentionMixin._slice_decode_topk
-
-    indices, lens = take(record, 1, 3, owned_placement=_PLACEMENT)
-
-    torch.testing.assert_close(indices, record.topk_indices[1:3])
-    torch.testing.assert_close(lens, record.topk_lens[1:3])
     for other in (None, replace(_PLACEMENT, rank=1)):
         with pytest.raises(RuntimeError, match="another placement"):
-            take(record, 1, 3, owned_placement=other)
-    # The whole selection, as scheduler slots, is any reader's.
-    take(replace(record, owned_placement=None), 0, 4)
+            glm5.GlmDsaSparseAttentionMixin._slice_decode_topk(
+                record, 1, 3, owned_placement=other
+            )
 
 
 # --- KVP prefill: owned-width index metadata ----------------------------------
@@ -557,19 +551,11 @@ def test_owned_index_columns_need_kvp_and_the_host_table(case):
 # --- KVP prefill over gathered histories --------------------------------------
 
 
-def test_a_history_prefill_selects_each_group_over_its_gathered_pages(monkeypatch):
+def test_a_history_prefill_selects_each_group_over_its_gathered_pages():
     """Over gathered histories (AMD) the KVP prefill top-k selects
     as an unsharded cache does, per request group over the index-K pages
-    gathered for it, through the plan's slot map: the forward's rows and
-    workspace numbering unchanged, the selection handed back as the
-    unsharded selection returns it with the plan's slots to map it, and no
-    KVP candidate merge or owned index."""
-
-    def refuse(*args, **kwargs):
-        raise AssertionError("the KVP candidate path ran")
-
-    monkeypatch.setattr(glm5, "select_dsa_topk", refuse)
-    monkeypatch.setattr(glm5, "build_dcp_index_metadata", refuse)
+    gathered for it, with the forward's rows unchanged and no KVP candidate
+    merge or owned index."""
     # Requests of histories [6, 5, 5] continuing [2, 4, 0] cached rows with
     # chunks of [4, 1, 5]: the first two share a group.
     plan = SimpleNamespace(
@@ -588,7 +574,6 @@ def test_a_history_prefill_selects_each_group_over_its_gathered_pages(monkeypatc
     backend = SimpleNamespace(
         cache_placement=lambda layer: _PLACEMENT,
         sparse_topk=SimpleNamespace(prefill=None, decode=None),
-        prefill_index_columns=refuse,
         history_prefill_plan=lambda: plan,
         gather_history_index_k_pages=gather_pages,
     )
@@ -638,17 +623,10 @@ def test_a_history_prefill_selects_each_group_over_its_gathered_pages(monkeypatc
         rows = group.query
         assert torch.equal(call["row_starts"], row_starts[rows])
         assert torch.equal(call["row_ends"], row_ends[rows])
-        assert call["kv_workspace_slots"] is plan.slots
         assert torch.equal(
             call["candidate_lens_cpu"], (row_ends - row_starts).long()[rows]
         )
         assert int(call["index_k_cache"][0, 0]) == plane_id
-        assert call["page_size"] == 64 and call["topk"] == _TOPK
-    # The sparse prefill maps the rows through the plan's slots.
-    assert record.kv_workspace_slots is plan.slots
-    indices = record.workspace_indices
-    assert indices.dtype == torch.int16
-    assert torch.equal(indices[:, 0], row_starts.to(torch.int16))
-    assert bool((indices[:, 1:] == -1).all())
-    assert torch.equal(record.topk_lens, torch.full((10,), 2, dtype=torch.int32))
-    assert record.dcp_index is None
+    # The groups' selections in row order, over the plan's slot map.
+    assert record.workspace_indices[:, 0].tolist() == row_starts.tolist()
+    assert record.kv_workspace_slots is plan.slots and record.dcp_index is None

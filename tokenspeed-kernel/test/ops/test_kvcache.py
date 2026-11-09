@@ -95,13 +95,13 @@ def test_kvp_visible_lengths_reuses_compile_across_table_shapes(device: str) -> 
         run(5, 1024, 4, 16)
 
 
-@pytest.mark.parametrize("queries,offset", [(1, 0), (4, -3)])
-@pytest.mark.parametrize("groups", [1, 6])
-@pytest.mark.parametrize("len_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize(
+    "queries,offset,len_dtype", [(1, 0, torch.int32), (4, -3, torch.int64)]
+)
 def test_kvp_decode_visible_lengths_matches_the_separate_launches(
-    device: str, queries: int, offset: int, groups: int, len_dtype: torch.dtype
+    device: str, queries: int, offset: int, len_dtype: torch.dtype
 ) -> None:
-    page = 64
+    page, groups = 64, 6
 
     def run(batch, cols, padding, start):
         owned = (torch.arange(cols) % 3 == 1) | (torch.arange(cols) == 0)

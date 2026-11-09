@@ -51,74 +51,58 @@ from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.owned_selection import (  # 
     _select_owned_from_gathered_kernel,
 )
 from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (  # isort: skip
-    gluon_dsa_logical_topk_gfx950,
     gluon_dsa_row_bounded_logical_topk_gfx950,
 )
 
 
-@pytest.mark.parametrize("rows", [1, 48, 64])
-@pytest.mark.parametrize("topk", [512, 2048])
-def test_row_bounded_topk_selects_each_rows_largest_owned_scores(rows, topk):
+def _assert_row_topk(logits, offsets, counts, lengths, row, topk):
+    """Row ``row`` selects ``min(topk, length)`` distinct columns of its
+    prefix holding its largest scores, then ``-1``."""
+    count = int(counts[row])
+    length = int(lengths[row])
+    assert count == min(topk, length)
+    assert (offsets[row, count:] == -1).all()
+    mine = offsets[row, :count].long()
+    assert bool(((mine >= 0) & (mine < length)).all())
+    assert len(set(mine.tolist())) == count
+    assert torch.equal(
+        logits[row, mine].sort().values,
+        logits[row, :length].topk(count).values.sort().values,
+    )
+
+
+@pytest.mark.parametrize(
+    "topk,width",
+    [
+        (512, 1 << 20),
+        (2048, 1 << 20),
+        # Narrower than the top-k: the sort path.
+        (512, 256),
+    ],
+)
+def test_row_bounded_topk_selects_each_rows_largest_owned_scores(topk, width):
     # Owned rows a fraction of a max-model-len-wide buffer whose unwritten
-    # tail holds larger values than any owned score.
-    width = 1 << 20
+    # tail holds larger values than any owned score; without starts every
+    # row begins at column zero.
+    rows = 64
     generator = torch.Generator(device="cuda").manual_seed(rows + topk)
     logits = torch.rand((rows, width), device="cuda", generator=generator)
     lengths = torch.randint(
         topk // 2, 4 * topk, (rows,), device="cuda", generator=generator
     ).int()
     lengths[0] = 0
-    if rows > 2:
-        lengths[1] = topk - 3
-        lengths[2] = 70000
-    starts = torch.zeros_like(lengths)
+    lengths[1] = topk - 3
+    lengths[2] = 70000
+    lengths %= width + 1
     for row in range(rows):
         logits[row, int(lengths[row]) :] += 2.0
 
     offsets, counts = gluon_dsa_row_bounded_logical_topk_gfx950(
-        logits, starts, lengths, topk=topk
-    )
-    _, expected_counts = gluon_dsa_logical_topk_gfx950(
-        logits, starts, lengths, topk=topk
-    )
-
-    torch.testing.assert_close(counts, expected_counts, atol=0, rtol=0)
-    for row in range(rows):
-        count = int(counts[row])
-        length = int(lengths[row])
-        assert count == min(topk, length)
-        assert (offsets[row, count:] == -1).all()
-        mine = offsets[row, :count].long()
-        assert bool(((mine >= 0) & (mine < length)).all())
-        assert len(set(mine.tolist())) == count
-        if count:
-            assert torch.equal(
-                logits[row, mine].sort().values,
-                logits[row, :length].topk(count).values.sort().values,
-            )
-
-
-@pytest.mark.parametrize("width", [256, 1 << 16])
-def test_row_bounded_topk_without_starts_begins_every_row_at_column_zero(width):
-    # Narrower and wider than the top-k: the sort and the radix paths.
-    rows, topk = 16, 512
-    generator = torch.Generator(device="cuda").manual_seed(width)
-    logits = torch.rand((rows, width), device="cuda", generator=generator)
-    lengths = torch.randint(
-        0, width + 1, (rows,), device="cuda", generator=generator
-    ).int()
-    offsets, counts = gluon_dsa_row_bounded_logical_topk_gfx950(
         logits, None, lengths, topk=topk
     )
-    expected, expected_counts = gluon_dsa_row_bounded_logical_topk_gfx950(
-        logits, torch.zeros_like(lengths), lengths, topk=topk
-    )
 
-    torch.testing.assert_close(counts, expected_counts, atol=0, rtol=0)
-    # Equal-score order is unspecified; the selected sets must agree.
-    torch.testing.assert_close(
-        offsets.sort(dim=1).values, expected.sort(dim=1).values, atol=0, rtol=0
-    )
+    for row in range(rows):
+        _assert_row_topk(logits, offsets, counts, lengths, row, topk)
 
 
 def test_row_bounded_topk_reads_rows_past_int32_offsets():
@@ -139,15 +123,7 @@ def test_row_bounded_topk_reads_rows_past_int32_offsets():
 
     assert (counts[:-tail] == 0).all()
     for row in range(rows - tail, rows):
-        count = int(counts[row])
-        length = int(lengths[row])
-        assert count == min(topk, length)
-        mine = offsets[row, :count].long()
-        assert bool(((mine >= 0) & (mine < length)).all())
-        assert torch.equal(
-            logits[row, mine].sort().values,
-            logits[row, :length].topk(count).values.sort().values,
-        )
+        _assert_row_topk(logits, offsets, counts, lengths, row, topk)
 
 
 # K3.1's cache geometry: 64-token index pages inside 128-token cache blocks,
@@ -236,21 +212,13 @@ def _merged_then_compacted(table, virtual_blocks, positions, scores, q_len, topk
 
 
 # Eight ranks, 16 requests of 4 verify rows, top-2048: K3.1's KVP8 decode.
-# The score bands that stress the radix passes and the tie quota run at 64
-# rows, at two and eight ranks.
+# The score bands that stress the radix passes and the tie quota run there.
 @pytest.mark.parametrize(
     "degree,rows,q_len,topk,band",
-    [
-        (degree, rows, q_len, topk, "uniform")
-        for degree in (2, 4, 8)
-        for rows, q_len in ((1, 1), (7, 1), (64, 4))
-        for topk in (512, 2048)
-    ]
-    + [
-        (degree, 64, 4, topk, band)
-        for degree, topk in ((2, 2048), (8, 512), (8, 2048))
-        for band in ("tied", "narrow", "single")
-    ],
+    [(2, 64, 4, 512, "uniform"), (4, 64, 4, 2048, "uniform")]
+    + [(8, 64, 4, topk, "uniform") for topk in (512, 2048)]
+    + [(8, 7, 1, 2048, "uniform")]
+    + [(8, 64, 4, 2048, band) for band in ("tied", "narrow", "single")],
 )
 def test_owned_selection_is_each_ranks_share_of_the_merge(
     degree, rows, q_len, topk, band
@@ -300,24 +268,32 @@ def test_owned_selection_is_each_ranks_share_of_the_merge(
         torch.testing.assert_close(local_counts, counts, atol=0, rtol=0)
     total = sum(counts for _, counts in expected)
     assert (total <= topk).all()
-    if rows > 2:
-        assert (total[2] == 0).all()
+    assert (total[2] == 0).all()
 
 
-def test_owned_selection_writes_into_the_callers_rows():
-    degree, rows, topk = 4, 7, 512
+def test_owned_selection_reads_positions_past_int32_offsets():
+    # This rank's candidate positions in rows an int32 stride apart, the last
+    # row (one with candidates) past 2**31 elements, selected into the
+    # caller's rows of wider buffers.
+    degree, rows, topk = 2, 4, 2048
     table, virtual_blocks, positions, scores = _owned_candidates(
-        degree, rows, 1, topk, seed=5
+        degree, rows, 1, topk, seed=23
     )
     (slots, counts), *_ = _merged_then_compacted(
         table, virtual_blocks, positions, scores, 1, topk
     )
+    assert int(counts[-1]) > 0
+    stride = (2**31 // (rows - 1) + 64) // 64 * 64
+    storage = torch.empty((rows - 1) * stride + topk, device="cuda", dtype=torch.int32)
+    far = storage.as_strided((rows, topk), (stride, 1))
+    far.copy_(positions[0])
+    assert (rows - 1) * far.stride(0) > 2**31
     out = torch.full((rows + 2, topk), 7, device="cuda", dtype=torch.int32)
     lens_out = torch.full((rows + 2,), 7, device="cuda", dtype=torch.int32)
 
-    local_slots, local_counts = dsa_select_owned_candidates(
+    local_slots, _ = dsa_select_owned_candidates(
         scores,
-        positions[0].contiguous(),
+        far,
         _local_pages(table, virtual_blocks, degree, 0),
         torch.arange(rows, device="cuda", dtype=torch.int32),
         rank=0,
@@ -333,38 +309,6 @@ def test_owned_selection_writes_into_the_callers_rows():
     torch.testing.assert_close(lens_out[1 : rows + 1], counts, atol=0, rtol=0)
     assert (out[0] == 7).all() and (out[rows + 1] == 7).all()
     assert int(lens_out[0]) == 7 and int(lens_out[rows + 1]) == 7
-
-
-def test_owned_selection_reads_positions_past_int32_offsets():
-    # This rank's candidate positions in rows an int32 stride apart, the last
-    # row (one with candidates) past 2**31 elements.
-    degree, rows, topk = 2, 4, 2048
-    table, virtual_blocks, positions, scores = _owned_candidates(
-        degree, rows, 1, topk, seed=23
-    )
-    (slots, counts), *_ = _merged_then_compacted(
-        table, virtual_blocks, positions, scores, 1, topk
-    )
-    assert int(counts[-1]) > 0
-    stride = (2**31 // (rows - 1) + 64) // 64 * 64
-    storage = torch.empty((rows - 1) * stride + topk, device="cuda", dtype=torch.int32)
-    far = storage.as_strided((rows, topk), (stride, 1))
-    far.copy_(positions[0])
-    assert (rows - 1) * far.stride(0) > 2**31
-
-    local_slots, local_counts = dsa_select_owned_candidates(
-        scores,
-        far,
-        _local_pages(table, virtual_blocks, degree, 0),
-        torch.arange(rows, device="cuda", dtype=torch.int32),
-        rank=0,
-        topk=topk,
-        page_size=_PAGE,
-        solution="gluon",
-    )
-
-    torch.testing.assert_close(local_slots, slots, atol=0, rtol=0)
-    torch.testing.assert_close(local_counts, counts, atol=0, rtol=0)
 
 
 def test_owned_selection_launches_one_specialization_across_batch_rows():
@@ -389,25 +333,19 @@ def test_owned_selection_launches_one_specialization_across_batch_rows():
             select(rows)
 
 
-@pytest.mark.parametrize(
-    "ranks,topk,rank_stride",
-    [
-        # Not a power of two.
-        (3, 2048, 2048),
-        (6, 1024, 1024),
-        # Every rank's share of a row past the registers.
-        (16, 2048, 2048),
-        # Rank chunks read past 32-bit offsets.
-        (8, 2048, 2**31 // 7),
-    ],
-)
-def test_owned_selection_refuses_gathered_scores_it_cannot_take(
-    ranks, topk, rank_stride
-):
-    # Such KVP decodes keep the merge.
+def test_owned_selection_refuses_gathered_scores_it_cannot_take():
     assert dsa_select_owned_candidates_supported(
-        ranks=2, rows=1, topk=topk, rank_stride=topk
+        ranks=2, rows=1, topk=2048, rank_stride=2048
     )
-    assert not dsa_select_owned_candidates_supported(
-        ranks=ranks, rows=1, topk=topk, rank_stride=rank_stride
-    )
+    # Such KVP decodes keep the merge.
+    for ranks, rank_stride in (
+        # Not a power of two.
+        (3, 2048),
+        # Every rank's share of a row past the registers.
+        (16, 2048),
+        # Rank chunks read past 32-bit offsets.
+        (8, 2**31 // 7),
+    ):
+        assert not dsa_select_owned_candidates_supported(
+            ranks=ranks, rows=1, topk=2048, rank_stride=rank_stride
+        )

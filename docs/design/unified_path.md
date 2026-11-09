@@ -2344,7 +2344,7 @@ bounds retain coherent 16-byte peer transactions. Paged history-table row
 offsets are computed in 64 bits before multiplying by the runtime stride.
 Scalar prefix-length reads share one binary across slice alignments.
 
-`test_startup_compile_keys.py` checks binary reuse across runtime sizes;
+`test_batch_shape_recompiles_gfx950.py` checks binary reuse across runtime sizes;
 `test_mla_prefix_chunks.py` exercises a table offset beyond 2**31.
 Full serving validation must additionally show no compilation after
 readiness with the compilation monitor enabled.

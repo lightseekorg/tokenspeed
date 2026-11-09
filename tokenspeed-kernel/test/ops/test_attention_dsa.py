@@ -680,6 +680,7 @@ def test_dsa_lse_partials_reconstruct_full_attention(packed, degree):
 
 @pytest.mark.parametrize("degree", [1, 2, 4, 8])
 def test_dsa_sharded_index_candidates_global_windows(device, degree):
+    from tokenspeed_kernel.ops.attention.dsa import dsa_index_candidates
     from tokenspeed_kernel.ops.attention.dsa.triton import triton_dsa_index_candidates
 
     torch.manual_seed(821)
@@ -713,25 +714,46 @@ def test_dsa_sharded_index_candidates_global_windows(device, degree):
         )
         owned = (table - 1) % degree == rank
         local_table = torch.where(owned, (table - 1) // degree + 1, -1)
-        offsets, scores = triton_dsa_index_candidates(
-            q,
-            weights,
-            local,
-            local_table,
-            query_requests,
-            causal_lens,
+        args = (q, weights, local, local_table, query_requests, causal_lens)
+        kwargs = dict(
             page_size=page_size,
             topk=topk,
             softmax_scale=0.1,
             initial_tokens=4,
             local_tokens=8,
         )
+        offsets, scores = triton_dsa_index_candidates(*args, **kwargs)
         valid = offsets >= 0
+        assert not valid.all()
         expected_scores = reference.gather(1, offsets.clamp_min(0).long())
         torch.testing.assert_close(
             scores[valid], expected_scores[valid], rtol=2e-4, atol=2e-4
         )
         assert torch.all(scores[~valid] == -float("inf"))
+
+        # The portable leaf does not declare INDEX_CANDIDATE_SCORES_OUT_FEATURE:
+        # the facade fills a send buffer's rows, wider than the scores.
+        leaf_offsets, leaf_scores = _by_offset(
+            dsa_index_candidates(*args, solution="triton", **kwargs)
+        )
+        buffer = torch.full((3, topk + 2), 11.0, device=device)
+        sent = dsa_index_candidates(
+            *args, solution="triton", scores_out=buffer[:, 1:-1], **kwargs
+        )
+        assert sent[1].data_ptr() == buffer[:, 1:-1].data_ptr()
+        sent_offsets, sent_scores = _by_offset(sent)
+        assert torch.equal(sent_offsets, leaf_offsets)
+        assert torch.equal(
+            sent_scores, torch.where(leaf_offsets >= 0, leaf_scores, -float("inf"))
+        )
+        assert (buffer[:, [0, -1]] == 11.0).all()
+        with pytest.raises(ValueError, match=r"FP32 \[rows, topk\] output"):
+            dsa_index_candidates(
+                *args,
+                solution="triton",
+                scores_out=torch.empty((3, topk - 1), device=device),
+                **kwargs,
+            )
         all_offsets.append(offsets)
         all_scores.append(scores)
     offsets, scores = torch.cat(all_offsets, 1), torch.cat(all_scores, 1)

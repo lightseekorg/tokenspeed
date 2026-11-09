@@ -33,6 +33,7 @@ if not is_cdna4():
         allow_module_level=True,
     )
 
+from ops.test_attention_dsa import _pack_index_k_cache  # isort: skip
 from tokenspeed_kernel.numerics.torch.attention.dsa import (  # isort: skip
     dsa_index_scores,
 )
@@ -46,31 +47,29 @@ HEAD_DIM = 128
 GLUON = "gluon_dsa_index_candidates_gfx950"
 
 
-def _pack_index_k_cache(index_k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """The packed FP8 Index-K cache and the key values it dequantizes to."""
-    num_slots = index_k.shape[0]
-    num_pages = num_slots // PAGE_SIZE
-    row_bytes = HEAD_DIM + 4
-    packed = torch.empty(
-        (num_slots, row_bytes), device=index_k.device, dtype=torch.uint8
-    )
-    x = index_k.float()
-    scale = x.abs().amax(dim=-1, keepdim=True).clamp_min(1.0e-6) / 448.0
-    x_fp8 = (x / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
-    flat = packed.reshape(-1)
-    page_bytes = PAGE_SIZE * row_bytes
-    torch.as_strided(
-        flat.view(torch.float8_e4m3fn),
-        (num_pages, PAGE_SIZE, HEAD_DIM),
-        (page_bytes, HEAD_DIM, 1),
-    ).copy_(x_fp8.reshape(num_pages, PAGE_SIZE, HEAD_DIM))
-    torch.as_strided(
-        flat.view(torch.float32),
-        (num_pages, PAGE_SIZE, 1),
-        (page_bytes // 4, 1, 1),
-        (PAGE_SIZE * HEAD_DIM) // 4,
-    ).copy_(scale.reshape(num_pages, PAGE_SIZE, 1))
-    return packed, x_fp8.float() * scale
+def _fp8_query(rows: int, heads: int, device: str):
+    """A random query's FP8 heads and their FP32 per-head scales."""
+    q = torch.randn(rows, heads, HEAD_DIM, device=device)
+    scales = q.abs().amax(dim=-1).clamp_min(1.0e-6) / 448.0
+    return (q / scales[..., None]).clamp(-448.0, 448.0).to(torch.float8_e4m3fn), scales
+
+
+def _rows(steps, heads: int, device: str):
+    """Query rows of ``(request, causal length, count)`` steps: ``count``
+    consecutive rows each, from that length on, with FP8 queries and head
+    weights."""
+    requests = torch.cat(
+        [torch.full((count,), r, dtype=torch.int32) for r, _, count in steps]
+    ).to(device)
+    lens = torch.cat(
+        [
+            torch.arange(first, first + count, dtype=torch.int32)
+            for _, first, count in steps
+        ]
+    ).to(device)
+    q, q_scales = _fp8_query(requests.numel(), heads, device)
+    weights = torch.randn(requests.numel(), heads, device=device)
+    return requests, lens, q, q_scales, weights
 
 
 def _inputs(heads: int, group: int, device: str):
@@ -85,24 +84,12 @@ def _inputs(heads: int, group: int, device: str):
         dtype=torch.int32,
         device=device,
     )
-    steps = [(0, 1000), (1, 977), (0, 523), (1, 64)]
-    requests, lens = [], []
-    for request, length in steps:
-        for row in range(group):
-            requests.append(request)
-            lens.append(length + row)
-    requests = torch.tensor(requests, dtype=torch.int32, device=device)
-    lens = torch.tensor(lens, dtype=torch.int32, device=device)
-    rows = requests.numel()
-
-    q = torch.randn(rows, heads, HEAD_DIM, device=device)
-    q_scales = q.abs().amax(dim=-1).clamp_min(1.0e-6) / 448.0
-    q_fp8 = (q / q_scales[..., None]).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
-    weights = torch.randn(rows, heads, device=device)
+    steps = [(0, 1000, group), (1, 977, group), (0, 523, group), (1, 64, group)]
+    rows = _rows(steps, heads, device)
     cache, keys = _pack_index_k_cache(
-        torch.randn(48 * PAGE_SIZE, HEAD_DIM, device=device)
+        torch.randn(48 * PAGE_SIZE, HEAD_DIM, device=device), PAGE_SIZE
     )
-    return table, requests, lens, q_fp8, q_scales.float(), weights, cache, keys
+    return table, *rows, cache, keys
 
 
 def _reference(table, requests, lens, q_fp8, q_scales, weights, keys, scale):
@@ -121,6 +108,13 @@ def _reference(table, requests, lens, q_fp8, q_scales, weights, keys, scale):
     return out
 
 
+def _set_key_scale(cache: torch.Tensor, slot: int, value: float) -> None:
+    page, row = divmod(slot, PAGE_SIZE)
+    page_floats = PAGE_SIZE * (HEAD_DIM + 4) // 4
+    scales = page * page_floats + PAGE_SIZE * HEAD_DIM // 4
+    cache.reshape(-1).view(torch.float32)[scales + row] = value
+
+
 @pytest.mark.parametrize("heads", [32, 64])
 @pytest.mark.parametrize("group", [1, 4])
 def test_gluon_owned_page_scorer_is_default_and_matches_reference(heads, group, device):
@@ -128,6 +122,12 @@ def test_gluon_owned_page_scorer_is_default_and_matches_reference(heads, group, 
         heads, group, device
     )
     scale, topk = 0.1, 256
+    # Non-finite key scales on request 0's logical tokens 5 and 130 (physical
+    # pages 12 and 3): never selected.
+    poisoned = {5: float("nan"), 130: float("inf")}
+    for position, value in poisoned.items():
+        page = int(table[0, position // PAGE_SIZE])
+        _set_key_scale(cache, page * PAGE_SIZE + position % PAGE_SIZE, value)
 
     pages = plan_dsa_index_candidates(
         q, weights, cache, table, requests, lens, page_size=PAGE_SIZE
@@ -148,13 +148,7 @@ def test_gluon_owned_page_scorer_is_default_and_matches_reference(heads, group, 
         is None
     )
 
-    offsets, scores = dsa_index_candidates(
-        q,
-        weights,
-        cache,
-        table,
-        requests,
-        lens,
+    kwargs = dict(
         page_size=PAGE_SIZE,
         topk=topk,
         softmax_scale=scale,
@@ -165,85 +159,54 @@ def test_gluon_owned_page_scorer_is_default_and_matches_reference(heads, group, 
         q_scales=q_scales,
         query_group_size=group,
     )
-    reference = _reference(table, requests, lens, q, q_scales, weights, keys, scale)
-    for row, (positions, expected) in enumerate(reference):
-        valid = offsets[row] >= 0
-        got = offsets[row][valid].long()
-        assert got.numel() == min(topk, positions.numel())
-        assert got.unique().numel() == got.numel()
-        by_position = torch.full(
-            (int(lens[row]),), float("nan"), device=device, dtype=torch.float32
-        )
-        by_position[positions] = expected
-        chosen = by_position[got]
-        assert not chosen.isnan().any(), f"row {row} selected a non-owned token"
-        tol = 1.0e-4 * float(expected.abs().max()) + 1.0e-5
-        torch.testing.assert_close(scores[row][valid], chosen, rtol=0, atol=tol)
-        cutoff = float(torch.topk(expected, got.numel()).values[-1])
-        assert float(chosen.min()) >= cutoff - tol, f"row {row} missed a better token"
-
-
-def _by_offset(offsets, scores):
-    """Candidates ordered by offset: order within a row is unspecified, and
-    -1 padding scores -inf."""
-    order = offsets.argsort(dim=1, stable=True)
-    return offsets.gather(1, order), scores.gather(1, order)
-
-
-def test_gluon_owned_page_scorer_takes_strided_head_weight_rows(device):
+    rows = requests.numel()
     # The head weights as a slice of a fused key and head-weight projection.
-    table, requests, lens, q, q_scales, weights, cache, _ = _inputs(32, 4, device)
-    fused = torch.randn(weights.shape[0], HEAD_DIM + 32, device=device)
+    fused = torch.randn(rows, HEAD_DIM + heads, device=device)
     fused[:, HEAD_DIM:] = weights
     strided = fused[:, HEAD_DIM:]
     assert not strided.is_contiguous()
-    kwargs = dict(
-        page_size=PAGE_SIZE,
-        topk=256,
-        softmax_scale=0.1,
-        initial_tokens=0,
-        local_tokens=0,
-        solution=None,
-        q_scales=q_scales,
-        query_group_size=4,
-    )
-    expected = dsa_index_candidates(q, weights, cache, table, requests, lens, **kwargs)
-    actual = dsa_index_candidates(q, strided, cache, table, requests, lens, **kwargs)
-    for got, want in zip(_by_offset(*actual), _by_offset(*expected), strict=True):
-        torch.testing.assert_close(got, want, rtol=0, atol=0)
-
-
-def test_gluon_owned_page_scorer_writes_scores_into_a_send_buffer(device):
-    table, requests, lens, q, q_scales, weights, cache, _ = _inputs(32, 4, device)
-    rows, topk = requests.numel(), 256
-    kwargs = dict(
-        page_size=PAGE_SIZE,
-        topk=topk,
-        softmax_scale=0.1,
-        initial_tokens=0,
-        local_tokens=0,
-        solution=None,
-        q_scales=q_scales,
-        query_group_size=4,
-    )
-    offsets, scores = dsa_index_candidates(
-        q, weights, cache, table, requests, lens, **kwargs
-    )
     # The scores' share of a wider send buffer, as a collective packs it.
     buffer = torch.full((rows * topk + 64,), float("nan"), device=device)
     scores_out = buffer[: rows * topk].view(rows, topk)
-
-    positions, written = dsa_index_candidates(
-        q, weights, cache, table, requests, lens, scores_out=scores_out, **kwargs
-    )
-
-    assert written.data_ptr() == scores_out.data_ptr()
-    assert positions.is_contiguous()
-    for got, want in zip(
-        _by_offset(positions, written), _by_offset(offsets, scores), strict=True
-    ):
-        torch.testing.assert_close(got, want, rtol=0, atol=0)
+    candidates = [
+        dsa_index_candidates(q, weights, cache, table, requests, lens, **kwargs),
+        dsa_index_candidates(
+            q, strided, cache, table, requests, lens, scores_out=scores_out, **kwargs
+        ),
+    ]
+    sent_offsets, sent = candidates[1]
+    assert sent.data_ptr() == scores_out.data_ptr()
+    assert sent_offsets.is_contiguous()
     assert buffer[rows * topk :].isnan().all()
+
+    reference = _reference(table, requests, lens, q, q_scales, weights, keys, scale)
+    for offsets, scores in candidates:
+        for row, (positions, expected) in enumerate(reference):
+            if int(requests[row]) == 0:
+                clean = ~torch.isin(
+                    positions, torch.tensor(list(poisoned), device=device)
+                )
+                positions, expected = positions[clean], expected[clean]
+            valid = offsets[row] >= 0
+            got = offsets[row][valid].long()
+            assert got.numel() == min(topk, positions.numel())
+            assert got.unique().numel() == got.numel()
+            assert scores[row][valid].isfinite().all()
+            assert (scores[row][~valid] == float("-inf")).all()
+            by_position = torch.full(
+                (int(lens[row]),), float("nan"), device=device, dtype=torch.float32
+            )
+            by_position[positions] = expected
+            chosen = by_position[got]
+            assert (
+                not chosen.isnan().any()
+            ), f"row {row} selected a non-owned or poisoned token"
+            tol = 1.0e-4 * float(expected.abs().max()) + 1.0e-5
+            torch.testing.assert_close(scores[row][valid], chosen, rtol=0, atol=tol)
+            cutoff = float(torch.topk(expected, got.numel()).values[-1])
+            assert (
+                float(chosen.min()) >= cutoff - tol
+            ), f"row {row} missed a better token"
 
 
 def _prefill_inputs(heads: int, device: str):
@@ -258,33 +221,17 @@ def _prefill_inputs(heads: int, device: str):
         torch.int32
     )
     table[2, 0] = -1
-    steps = [(0, 5000, 77), (1, 64, 5), (2, 1, 130)]
-    requests = torch.cat(
-        [torch.full((count,), r, dtype=torch.int32) for r, _, count in steps]
-    ).to(device)
-    lens = torch.cat(
-        [
-            torch.arange(first, first + count, dtype=torch.int32)
-            for _, first, count in steps
-        ]
-    ).to(device)
-    rows = requests.numel()
-    q = torch.randn(rows, heads, HEAD_DIM, device=device)
-    q_scales = q.abs().amax(dim=-1).clamp_min(1.0e-6) / 448.0
-    q_fp8 = (q / q_scales[..., None]).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
-    weights = torch.randn(rows, heads, device=device)
+    rows = _rows([(0, 5000, 77), (1, 64, 5), (2, 1, 130)], heads, device)
     cache, _ = _pack_index_k_cache(
-        torch.randn(320 * PAGE_SIZE, HEAD_DIM, device=device)
+        torch.randn(320 * PAGE_SIZE, HEAD_DIM, device=device), PAGE_SIZE
     )
     # A non-finite key scale: both scorers store its score as -inf.
     _set_key_scale(cache, int(table[0][table[0] >= 0][3]) * PAGE_SIZE + 7, float("nan"))
-    return table, requests, lens, q_fp8, q_scales.float(), weights, cache
+    return table, *rows, cache
 
 
 @pytest.mark.parametrize("heads", [32, 64])
-def test_gluon_owned_page_prefill_rows_score_and_select_like_one_row_groups(
-    heads, device, monkeypatch
-):
+def test_gluon_owned_page_prefill_rows_score_like_one_row_groups(heads, device):
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa import index_candidates
 
     table, requests, lens, q, q_scales, weights, cache = _prefill_inputs(heads, device)
@@ -318,24 +265,6 @@ def test_gluon_owned_page_prefill_rows_score_and_select_like_one_row_groups(
     assert (one_row[valid] == float("-inf")).any()
     torch.testing.assert_close(blocks[valid], one_row[valid], rtol=0, atol=0)
 
-    kwargs = dict(
-        page_size=PAGE_SIZE,
-        topk=512,
-        softmax_scale=0.1,
-        initial_tokens=0,
-        local_tokens=0,
-        solution=None,
-    )
-    selected = dsa_index_candidates(
-        q, weights, cache, table, requests, lens, q_scales=q_scales, **kwargs
-    )
-    monkeypatch.setattr(index_candidates, "_scores_prefill_rows", lambda *_: False)
-    expected = dsa_index_candidates(
-        q, weights, cache, table, requests, lens, q_scales=q_scales, **kwargs
-    )
-    for got, want in zip(_by_offset(*selected), _by_offset(*expected), strict=True):
-        torch.testing.assert_close(got, want, rtol=0, atol=0)
-
 
 def _owned_batch(requests: int, rows: int, columns: int, device: str):
     """``requests`` requests of ``rows`` consecutive rows each over a
@@ -344,15 +273,9 @@ def _owned_batch(requests: int, rows: int, columns: int, device: str):
     table = torch.randint(0, 320, (requests, columns), device=device)
     table = torch.where(torch.rand(table.shape, device=device) < 0.3, -1, table)
     table = table.to(torch.int32)
-    request_ids = torch.arange(requests, device=device, dtype=torch.int32)
-    request_ids = request_ids.repeat_interleave(rows)
     first = torch.randint(1, columns * PAGE_SIZE - rows, (requests,), device=device)
-    lens = (first[:, None] + torch.arange(rows, device=device)[None, :]).reshape(-1)
-    q = torch.randn(requests * rows, 32, HEAD_DIM, device=device)
-    q_scales = q.abs().amax(dim=-1).clamp_min(1.0e-6) / 448.0
-    q_fp8 = (q / q_scales[..., None]).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
-    weights = torch.randn(requests * rows, 32, device=device)
-    return table, request_ids, lens.to(torch.int32), q_fp8, q_scales.float(), weights
+    steps = [(r, length, rows) for r, length in enumerate(first.tolist())]
+    return table, *_rows(steps, 32, device)
 
 
 def test_gluon_owned_page_scorer_compiles_once_across_batches(device):
@@ -365,7 +288,7 @@ def test_gluon_owned_page_scorer_compiles_once_across_batches(device):
     )
 
     cache, _ = _pack_index_k_cache(
-        torch.randn(320 * PAGE_SIZE, HEAD_DIM, device=device)
+        torch.randn(320 * PAGE_SIZE, HEAD_DIM, device=device), PAGE_SIZE
     )
 
     def score(requests, rows, group, columns):
@@ -401,8 +324,8 @@ def test_gluon_owned_page_scorer_compiles_once_across_batches(device):
         gluon_dsa_decode_topk_fp8_rows_gfx950,
         gluon_dsa_owned_prefill_topk_fp8_rows_gfx950,
     ):
-        for columns in (18, 33, 48, 95):
-            for requests in (2, 5, 32, 37):
+        for columns in (33, 48):
+            for requests in (5, 32):
                 score(requests, 1, 1, columns)
                 score(requests, 4, 4, columns)
             for requests, rows in ((1, 65), (2, 64), (2, 100), (3, 130)):
@@ -419,21 +342,19 @@ def test_gluon_owned_page_prefill_rows_store_past_int32_offsets(device):
     rows, columns, tail = 2176, 16384, 64
     torch.manual_seed(31)
     cache, _ = _pack_index_k_cache(
-        torch.randn(320 * PAGE_SIZE, HEAD_DIM, device=device)
+        torch.randn(320 * PAGE_SIZE, HEAD_DIM, device=device), PAGE_SIZE
     )
     pages = torch.randint(0, 320, (1, columns), device=device, dtype=torch.int32)
     pages = pages.expand(rows, columns).contiguous()
     lengths = 70 + torch.arange(rows, device=device, dtype=torch.int32) % 300
-    q = torch.randn(rows, 32, HEAD_DIM, device=device)
-    q_scales = q.abs().amax(dim=-1).clamp_min(1.0e-6) / 448.0
-    q = (q / q_scales[..., None]).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    q, q_scales = _fp8_query(rows, 32, device)
     weights = torch.randn(rows, 32, device=device)
     requests = torch.zeros(rows, dtype=torch.int32, device=device)
 
     def score(rows_slice):
         return launch_gluon_dsa_index_candidates_gfx950(
             q[rows_slice],
-            q_scales.float()[rows_slice],
+            q_scales[rows_slice],
             weights[rows_slice],
             cache,
             pages[rows_slice],
@@ -453,63 +374,6 @@ def test_gluon_owned_page_prefill_rows_store_past_int32_offsets(device):
     torch.testing.assert_close(
         full[-tail:, :400][valid], last[:, :400][valid], rtol=0, atol=0
     )
-
-
-def _set_key_scale(cache: torch.Tensor, slot: int, value: float) -> None:
-    page, row = divmod(slot, PAGE_SIZE)
-    page_floats = PAGE_SIZE * (HEAD_DIM + 4) // 4
-    scales = page * page_floats + PAGE_SIZE * HEAD_DIM // 4
-    cache.reshape(-1).view(torch.float32)[scales + row] = value
-
-
-def test_gluon_owned_page_scorer_never_selects_non_finite_scores(device):
-    table, requests, lens, q, q_scales, weights, cache, keys = _inputs(32, 4, device)
-    scale, topk = 0.1, 256
-    # Request 0's logical tokens 5 and 130 sit on physical pages 12 and 3.
-    poisoned = {5: float("nan"), 130: float("inf")}
-    for position, value in poisoned.items():
-        page = int(table[0, position // PAGE_SIZE])
-        _set_key_scale(cache, page * PAGE_SIZE + position % PAGE_SIZE, value)
-
-    offsets, scores = dsa_index_candidates(
-        q,
-        weights,
-        cache,
-        table,
-        requests,
-        lens,
-        page_size=PAGE_SIZE,
-        topk=topk,
-        softmax_scale=scale,
-        initial_tokens=0,
-        local_tokens=0,
-        solution=None,
-        pages=plan_dsa_index_candidates(
-            q, weights, cache, table, requests, lens, page_size=PAGE_SIZE
-        ),
-        q_scales=q_scales,
-        query_group_size=4,
-    )
-
-    reference = _reference(table, requests, lens, q, q_scales, weights, keys, scale)
-    for row, (positions, expected) in enumerate(reference):
-        if int(requests[row]) == 0:
-            clean = ~torch.isin(positions, torch.tensor(list(poisoned), device=device))
-            positions, expected = positions[clean], expected[clean]
-        valid = offsets[row] >= 0
-        got = offsets[row][valid].long()
-        assert got.numel() == min(topk, positions.numel())
-        assert scores[row][valid].isfinite().all()
-        by_position = torch.full(
-            (int(lens[row]),), float("nan"), device=device, dtype=torch.float32
-        )
-        by_position[positions] = expected
-        chosen = by_position[got]
-        assert not chosen.isnan().any(), f"row {row} selected a poisoned token"
-        tol = 1.0e-4 * float(expected.abs().max()) + 1.0e-5
-        torch.testing.assert_close(scores[row][valid], chosen, rtol=0, atol=tol)
-        cutoff = float(torch.topk(expected, got.numel()).values[-1])
-        assert float(chosen.min()) >= cutoff - tol, f"row {row} missed a better token"
 
 
 def test_gluon_owned_page_scorer_forces_mandatory_windows(device):

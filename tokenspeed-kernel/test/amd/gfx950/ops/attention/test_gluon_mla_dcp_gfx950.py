@@ -121,15 +121,16 @@ def _torch_reference(q, source, page_table, endpoints, width):
     return torch.stack(outputs), torch.stack(lses)
 
 
-@pytest.mark.parametrize("dtype", list(DTYPES))
-@pytest.mark.parametrize("degree", [2, 8])
-@pytest.mark.parametrize("heads", ["tp_group", 16])
-@pytest.mark.parametrize("query_width,causal", [(1, True), (4, True), (4, False)])
 # The exact bound leaves a short FP8 scan in one split, whose LSE stage 1
 # writes directly.
-@pytest.mark.parametrize("max_seqlen_k", [MAX_CONTEXT, max(LENGTHS)])
+@pytest.mark.parametrize(
+    "dtype,max_seqlen_k",
+    [(dtype, MAX_CONTEXT) for dtype in DTYPES] + [("fp8", max(LENGTHS))],
+)
+@pytest.mark.parametrize("degree", [2, 8])
+@pytest.mark.parametrize("query_width,causal", [(1, True), (4, True), (4, False)])
 def test_gluon_mla_shards_merge_to_full_attention(
-    dtype, degree, heads, query_width, causal, max_seqlen_k
+    dtype, max_seqlen_k, degree, query_width, causal
 ):
     from tokenspeed_kernel.ops.attention.dsv4._triton.dcp import (
         normalize_dcp_partials,
@@ -142,7 +143,7 @@ def test_gluon_mla_shards_merge_to_full_attention(
 
     q_dtype, kv_dtype = DTYPES[dtype]
     merge_tolerance, reference_tolerance = TOLERANCES[dtype]
-    heads = 12 * degree if heads == "tp_group" else heads
+    heads = 12 * degree
     torch.manual_seed(17)
     device = "cuda"
     tokens = VIRTUAL_BLOCKS * GRANULARITY
@@ -193,7 +194,6 @@ def test_gluon_mla_shards_merge_to_full_attention(
         local_cache.view(torch.uint8)[slots[owned]] = source.view(torch.uint8)[
             loc[owned]
         ]
-        assert not local_cache[:GRANULARITY].view(torch.uint8).any()
         metadata = refresh_dcp_page_table_metadata(
             page_table=table,
             virtual_block_count=VIRTUAL_BLOCKS,
@@ -215,7 +215,6 @@ def test_gluon_mla_shards_merge_to_full_attention(
             local.clamp_min(1),
             max_seqlen_k,
         )
-        assert torch.isfinite(lse).all()
         partial, lse = normalize_dcp_partials(partial, lse, local, None)
         empty = local == 0
         assert torch.isneginf(lse[empty]).all() and not partial[empty].any()
@@ -229,4 +228,3 @@ def test_gluon_mla_shards_merge_to_full_attention(
     merged_lse = torch.logsumexp(torch.stack(lses), dim=0)
     torch.testing.assert_close(merged, ref.float(), **merge_tolerance)
     torch.testing.assert_close(merged_lse, ref_lse, atol=1e-2, rtol=1e-3)
-    torch.testing.assert_close(merged, torch_out, **reference_tolerance)

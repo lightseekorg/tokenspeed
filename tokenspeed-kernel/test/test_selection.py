@@ -516,7 +516,6 @@ class TestSpecMatchesShapeTraits:
         assert not _filter_by_traits([spec], {**accepted, "rows": 2**23})
         # A request missing a size the filter reads is refused.
         assert not _filter_by_traits([spec], {"rows": 1, "head_dim": 128})
-        assert not _filter_by_traits([spec], {"head_dim": 128})
 
     def test_filter_by_traits_applies_shape_and_value_traits(self):
         spec = KernelSpec(

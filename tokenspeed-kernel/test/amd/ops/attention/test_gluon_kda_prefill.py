@@ -25,7 +25,7 @@ from itertools import accumulate
 import pytest
 import torch
 from tokenspeed_kernel.numerics.torch.attention.kda import kda_delta_rule, kda_gate
-from utils import assert_no_triton_compile, is_cdna4, is_cdna5
+from utils import assert_no_triton_compile, assert_warmup_covers, is_cdna4, is_cdna5
 
 if is_cdna4():
     from tokenspeed_kernel_amd.ops.gfx950.attention.kda import prefill as _prefill
@@ -221,12 +221,12 @@ def test_kda_prefill_new_batches_reuse_compiled_kernels() -> None:
 @pytest.mark.skipif(not is_cdna4(), reason="gfx950 warms its walk configurations")
 def test_kda_prefill_warmup_compiles_every_walk_configuration() -> None:
     torch.manual_seed(43)
-    for kernel in _KERNELS:
-        kernel.device_caches.clear()
-    # One short sequence takes the narrowest unsplit walk.
-    _run_prefill([64], warm_variants=True)
-    # Unsplit walks over 64 and 128 rows, then split walks over half and full
+    # One short sequence takes the narrowest unsplit walk. The sweep runs
+    # unsplit walks over 64 and 128 rows, then split walks over half and full
     # rows, the latter with the full-width summary.
-    with assert_no_triton_compile(*_KERNELS):
-        for lengths in ([16] * 40, [16] * 80, [1700, 1600], [20000], [4096] * 8):
-            _run_prefill(lengths)
+    assert_warmup_covers(
+        _KERNELS,
+        lambda: _run_prefill([64], warm_variants=True),
+        _run_prefill,
+        ([16] * 40, [16] * 80, [1700, 1600], [20000], [4096] * 8),
+    )

@@ -25,7 +25,7 @@ import contextlib
 import pytest
 import torch
 from tokenspeed_kernel.numerics.torch.gemm import torch_mm
-from utils import assert_no_triton_compile, is_cdna4
+from utils import assert_no_triton_compile, assert_warmup_covers, is_cdna4
 
 if not is_cdna4():
     pytest.skip(
@@ -496,50 +496,37 @@ def test_decode_gemm_supports_only_measured_buckets() -> None:
     assert not supports_gluon_mm_a16w16_decode_gfx950(257, 512, 8192)
 
 
-# Kimi K3 shared gate/up, and the Muse TP8 pre-expert projection, whose
-# 64-row bucket splits K.
-@pytest.mark.parametrize("n,k", [(1536, 7168), (512, 8192)])
-def test_decode_gemm_row_count_does_not_recompile(n: int, k: int) -> None:
-    torch.manual_seed(0)
-    a = torch.randn((64, k), device="cuda", dtype=torch.bfloat16) * 0.25
-    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
-
-    def run(rows):
-        out = _decode(a[:rows], b, torch.bfloat16)
-        torch.testing.assert_close(out, torch.mm(a[:rows], b.T), atol=1e-4, rtol=_RTOL)
-
-    gluon_mm_a16w16_medium_gfx950.device_caches.clear()
-    # One row count per bucket; the row count itself does not specialize, so
-    # multiples of 16 reuse those binaries.
-    for rows in (3, 4, 5, 8, 9, 17, 33):
-        run(rows)
-    with assert_no_triton_compile(gluon_mm_a16w16_medium_gfx950):
-        for rows in (2, 6, 7, 12, 14, 16, 20, 27, 32, 40, 48, 61, 64):
-            run(rows)
-
-
-# The indexer wq_b has a 32-row and a 64-row tile; the other shape splits K.
-@pytest.mark.parametrize("n,k", [(4096, 1536), (1536, 7168)])
+# Kimi K3 shared gate/up, the Muse TP8 pre-expert projection, whose 64-row
+# bucket splits K, and the indexer wq_b, which has only a 32-row and a 64-row
+# tile.
+@pytest.mark.parametrize("n,k", [(1536, 7168), (512, 8192), (4096, 1536)])
 def test_decode_gemm_warmup_compiles_every_row_bucket(n: int, k: int) -> None:
     torch.manual_seed(0)
     a = torch.randn((64, k), device="cuda", dtype=torch.bfloat16) * 0.25
     b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
-    gluon_mm_a16w16_medium_gfx950.device_caches.clear()
     counters = zeroed_state(
         gluon_mm_a16w16_decode_num_counters_gfx950(64, n, k),
         dtype=torch.int32,
         device=a.device,
     )
-    launch_gluon_mm_a16w16_decode_gfx950(
-        a, b, torch.bfloat16, counters=counters, warm_variants=True
+
+    def run(rows):
+        if supports_gluon_mm_a16w16_decode_gfx950(rows, n, k):
+            out = _decode(a[:rows], b, torch.bfloat16)
+            torch.testing.assert_close(
+                out, torch.mm(a[:rows], b.T), atol=1e-4, rtol=_RTOL
+            )
+
+    # The row count itself does not specialize, so one launch per bucket
+    # covers every count in it, multiples of 16 included.
+    assert_warmup_covers(
+        (gluon_mm_a16w16_medium_gfx950,),
+        lambda: launch_gluon_mm_a16w16_decode_gfx950(
+            a, b, torch.bfloat16, counters=counters, warm_variants=True
+        ),
+        run,
+        (2, 6, 7, 12, 14, 16, 20, 27, 32, 40, 48, 61, 64),
     )
-    with assert_no_triton_compile(gluon_mm_a16w16_medium_gfx950):
-        for rows in (2, 5, 9, 17, 33, 64):
-            if supports_gluon_mm_a16w16_decode_gfx950(rows, n, k):
-                out = _decode(a[:rows], b, torch.bfloat16)
-                torch.testing.assert_close(
-                    out, torch.mm(a[:rows], b.T), atol=1e-4, rtol=_RTOL
-                )
 
 
 @pytest.mark.parametrize("m", [2, 4, 7, 8, 16, 24, 32])

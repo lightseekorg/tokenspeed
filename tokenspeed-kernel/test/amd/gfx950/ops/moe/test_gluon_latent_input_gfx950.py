@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from utils import assert_no_triton_compile, is_cdna4
+from utils import assert_no_triton_compile, assert_warmup_covers, is_cdna4
 
 pytest.importorskip(
     "tokenspeed_kernel_amd.ops.gfx950.moe.fp16",
@@ -211,61 +211,57 @@ def test_projection_row_counts_reuse_one_binary() -> None:
     hidden = torch.randn(2048, 7168, dtype=torch.bfloat16, device="cuda")
 
     def run(tokens: int) -> None:
-        latent_input_mediumm.launch_gluon_latent_input_mediumm_gfx950(
-            hidden[: tokens // 2], *weights, beta=4.0, linear_beta=None
-        )
         latent_input_largem.launch_gluon_latent_input_largem_gfx950(
             hidden[:tokens], *weights, beta=4.0, linear_beta=None
         )
 
-    kernels = (
-        latent_input_mediumm.gluon_latent_input_mediumm_gfx950,
-        latent_input_largem.gluon_latent_input_largem_situ_gfx950,
+    assert_warmup_covers(
+        (latent_input_largem.gluon_latent_input_largem_situ_gfx950,),
+        lambda: run(1536),
+        run,
+        (1282, 1301, 1999, 2048),
     )
-    for kernel in kernels:
-        kernel.device_caches.clear()
-    run(1536)
-    with assert_no_triton_compile(*kernels):
-        for tokens in (1282, 1301, 1999, 2048):
-            run(tokens)
 
 
 @requires_cdna4
 def test_small_batch_warmup_compiles_every_tile_and_split() -> None:
     torch.manual_seed(7)
-    kernels = (
-        latent_input_small_batch.gluon_latent_input_small_batch_gfx950,
-        latent_input_small_batch.gluon_latent_input_small_batch_epilogue_gfx950,
-    )
-    for kernel in kernels:
-        kernel.device_caches.clear()
     weights = _packed_k3_weights()
     hidden = torch.randn(320, 7168, dtype=torch.bfloat16, device="cuda")
-    latent_input_small_batch.launch_gluon_latent_input_small_batch_gfx950(
-        hidden[:8], *weights, beta=4.0, linear_beta=None, warm_max_tokens=320
+
+    def run(tokens: int, **options) -> None:
+        latent_input_small_batch.launch_gluon_latent_input_small_batch_gfx950(
+            hidden[:tokens], *weights, beta=4.0, linear_beta=None, **options
+        )
+
+    assert_warmup_covers(
+        (
+            latent_input_small_batch.gluon_latent_input_small_batch_gfx950,
+            latent_input_small_batch.gluon_latent_input_small_batch_epilogue_gfx950,
+        ),
+        lambda: run(8, warm_max_tokens=320),
+        run,
+        (1, 16, 17, 64, 65, 130, 200, 320),
     )
-    with assert_no_triton_compile(*kernels):
-        for tokens in (1, 16, 17, 64, 65, 130, 200, 320):
-            latent_input_small_batch.launch_gluon_latent_input_small_batch_gfx950(
-                hidden[:tokens], *weights, beta=4.0, linear_beta=None
-            )
 
 
 @requires_cdna4
 def test_projection_warmup_compiles_both_row_tiles() -> None:
     torch.manual_seed(7)
-    kernel = latent_input_mediumm.gluon_latent_input_mediumm_gfx950
-    kernel.device_caches.clear()
     weights = _packed_k3_weights()
     hidden = torch.randn(1024, 7168, dtype=torch.bfloat16, device="cuda")
-    latent_input_mediumm.launch_gluon_latent_input_mediumm_gfx950(
-        hidden[:512], *weights, beta=4.0, linear_beta=None, warm_variants=True
+
+    def run(tokens: int, **options) -> None:
+        latent_input_mediumm.launch_gluon_latent_input_mediumm_gfx950(
+            hidden[:tokens], *weights, beta=4.0, linear_beta=None, **options
+        )
+
+    assert_warmup_covers(
+        (latent_input_mediumm.gluon_latent_input_mediumm_gfx950,),
+        lambda: run(512, warm_variants=True),
+        run,
+        (64, 641, 848, 1000, 1024),
     )
-    with assert_no_triton_compile(kernel):
-        for tokens in (64, 848, 1024):
-            latent_input_mediumm.launch_gluon_latent_input_mediumm_gfx950(
-                hidden[:tokens], *weights, beta=4.0, linear_beta=None
-            )
 
 
 @requires_cdna4

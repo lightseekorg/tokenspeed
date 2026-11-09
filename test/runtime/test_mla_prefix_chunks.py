@@ -183,7 +183,7 @@ def test_page_table_width_does_not_compile_a_new_kernel():
 
     fill(16)
     with module.assert_no_triton_compile(create_chunked_cache_kv_indices_paged):
-        for width in (17, 31, 32, 47):
+        for width in (1, 17, 31, 32, 47):
             fill(width)
 
 

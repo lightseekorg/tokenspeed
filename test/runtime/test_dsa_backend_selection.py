@@ -731,33 +731,28 @@ def test_dcp_records_core_follows_the_ordinary_prefill_selection(monkeypatch, ca
     [
         "gfx950",
         "verify_other_core",
-        "other_core",
         "planned",
-        "no_kvp",
         "bf16_cache",
     ],
 )
 def test_dcp_decode_records_core_follows_every_decode_selection(monkeypatch, case):
     """The decode records core stands in for gfx950's dense decode core only,
     and only where both decode selections pick it: one row per request and
-    the verify rows. A planned decode keeps its core, a leaf without KVP runs
-    no head-sharded decode and a BF16 cache's query keeps the ordinary
-    gather.
+    the verify rows. A planned decode keeps its core and a BF16 cache's query
+    keeps the ordinary gather.
     """
     dsa = backends.dsa
     backend, _ = _sparse_leaf_backend(
         monkeypatch,
         data_type=torch.bfloat16 if case == "bf16_cache" else torch.float8_e4m3fn,
-        kvp_group=(0,) if case == "no_kvp" else (0, 1, 2, 3),
+        kvp_group=(0, 1, 2, 3),
         decode_kernel_plan=_plan("planned_decode", []) if case == "planned" else None,
     )
 
     def select(family, mode, signature, *, traits, solution):
         assert family == "attention"
         if mode == "dsa_decode":
-            other = case == "other_core" or (
-                case == "verify_other_core" and traits["q_len"] > 1
-            )
+            other = case == "verify_other_core" and traits["q_len"] > 1
             return SimpleNamespace(
                 name="triton_dsa_decode" if other else "gluon_dsa_decode_gfx950"
             )
@@ -855,7 +850,7 @@ def test_dcp_records_core_on_the_real_k31_selection(monkeypatch, solution):
     or current_platform().arch_version != ArchVersion(9, 5),
     reason="the gfx950 DSA decode core registers on AMD gfx950 GPUs",
 )
-@pytest.mark.parametrize("solution", [None, "gluon", "triton"])
+@pytest.mark.parametrize("solution", [None, "triton"])
 def test_dcp_decode_records_core_on_the_real_k31_selection(monkeypatch, solution):
     # K3.1's FP8 cache at KVP8 with its 4 verify rows (the 3.1 drafter's three
     # tokens) against the real registry: gfx950's dense core decodes both

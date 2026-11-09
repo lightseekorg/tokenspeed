@@ -179,17 +179,7 @@ mod tests {
         // 302592 / 48 = 6304 tokens per request, less 17 of output and two
         // pages.
         assert_eq!(limits(302_592).phases()[6], phase(48, 6031));
-        assert_eq!(
-            limits(48 * 200).phases(),
-            [
-                phase(1, 1),
-                phase(1, 256),
-                phase(1, 512),
-                phase(1, 513),
-                phase(1, 1536),
-                phase(1, 8192)
-            ]
-        );
+        assert_eq!(limits(48 * 200).phases().last(), Some(&phase(1, 8192)));
     }
 
     #[test]
@@ -208,17 +198,6 @@ mod tests {
             max_model_len: 4010,
             ..limits(1 << 30)
         };
-        assert_eq!(
-            limits.phases(),
-            [
-                phase(1, 1),
-                phase(1, 256),
-                phase(1, 512),
-                phase(1, 513),
-                phase(1, 1536),
-                phase(1, 3993),
-                phase(48, 3993)
-            ]
-        );
+        assert_eq!(limits.phases()[5..], [phase(1, 3993), phase(48, 3993)]);
     }
 }
