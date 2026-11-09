@@ -420,3 +420,46 @@ def test_draft_layer_of_two_requests_matches_a_launch_of_each(
         sock.bind(("", 0))
         port = sock.getsockname()[1]
     mp.spawn(_two_requests_worker, args=(port, prefixes), nprocs=WORLD, join=True)
+
+
+def test_one_binary_serves_every_layer_step_and_length():
+    """Each launch changes the layer, the step, the length, the rows'
+    positions and slots and the page table's width: compiling the launches
+    for one GPU's rank finds the first launch's binary. The last layer (it
+    runs the final norm) is another plan, which the guard must see
+    compile."""
+    rows, device = 8, torch.device("cuda:0")
+    # Compiling alone reads none of these: plain device memory stands in for
+    # the symmetric heap and the peers.
+    scratch = torch.zeros(
+        plan(rows, True).scratch_pairs, dtype=torch.int64, device=device
+    )
+    peer_bases = torch.zeros(WORLD, dtype=torch.int64, device=device)
+
+    def compile_launch(layer: int, step: int, prefix: int) -> None:
+        _, weights, rt = layer_inputs(prefix, 0, rows, device)
+        if layer == 4:
+            rt["out"] = None
+            rt["final_gain"] = torch.ones(OWNED, device=device)
+            rt["normed"] = torch.zeros(
+                rows, HIDDEN, dtype=torch.bfloat16, device=device
+            )
+        draft_layer.launch_gluon_muse_spark_draft_layer_gfx950(
+            weights,
+            **rt,
+            scratch=scratch,
+            step=torch.full((1,), step, dtype=torch.int32, device=device),
+            peer_bases=peer_bases,
+            layer=layer,
+            trace_buf=None,
+            compile_only=True,
+        )
+
+    compile_launch(2, 31, 3000)
+    with assert_no_triton_compile(draft_layer.gluon_muse_spark_draft_layer_gfx950):
+        for layer, step, prefix in ((3, 32, 3001), (2, 33, 900), (3, 34, 9000)):
+            compile_launch(layer, step, prefix)
+    # The guard is live: the last layer's plan compiles.
+    with pytest.raises(AssertionError, match="compiled 1 new"):
+        with assert_no_triton_compile(draft_layer.gluon_muse_spark_draft_layer_gfx950):
+            compile_launch(4, 35, 3000)

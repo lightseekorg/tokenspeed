@@ -469,6 +469,79 @@ def test_the_kernel_boundary_packs_a_layer_for_its_launches(full):
     assert fused.scratch_pairs >= widest.scratch_pairs
 
 
+@pytest.mark.parametrize("full", [False, True])
+def test_one_binary_serves_every_layer_step_and_length(full):
+    """What serving changes from launch to launch (the layer index, the step,
+    the lengths and the KV slots) reaches the kernel at runtime: compiling
+    the launches for one GPU's rank finds the first launch's binary. A new
+    row count is a new plan, which the guard must see compile."""
+    rows, length = 8, 3000
+    end = length + rows - 1
+    dev = torch.device("cuda:0")
+    sh = _shared(42, length, rows)
+    w = _rank_weights(0, end)
+    weights = _pack(0, dev, sh, end, full)
+    k_cache, v_cache = w["k_cache"].to(dev), w["v_cache"].to(dev)
+    # Compiling alone reads none of these: plain device memory stands in for
+    # the symmetric heap and the peers.
+    widest = layer.layer_plan(
+        full=full,
+        rows=rows,
+        chain=rows,
+        warm_next=True,
+        own_qkvg=True,
+        next_qkvg=False,
+        check_parity=False,
+    )
+    scratch = torch.zeros(widest.scratch_pairs, dtype=torch.int64, device=dev)
+    peer_bases = torch.zeros(WORLD, dtype=torch.int64, device=dev)
+
+    def compile_launch(index: int, step: int, seq_len: int, rows: int) -> None:
+        pos = torch.arange(seq_len - 1, seq_len - 1 + rows)
+        slots = sh["table"][pos // 64].long() * 64 + pos % 64
+        layer.launch_gluon_muse_spark_layer_gfx950(
+            weights,
+            h=torch.zeros(rows, OWNED, device=dev),
+            a=torch.zeros(rows, HIDDEN, dtype=torch.bfloat16, device=dev),
+            h_out=torch.empty(rows, OWNED, device=dev),
+            a_out=torch.empty(rows, HIDDEN, dtype=torch.bfloat16, device=dev),
+            seq_len=(pos + 1).to(torch.int32).to(dev),
+            slot=slots.to(torch.int32).to(dev),
+            page_table=sh["table"].to(dev),
+            k_cache=k_cache,
+            v_cache=v_cache,
+            cos_sin=ref.rope_table(end + 1).to(dev),
+            scratch=scratch,
+            step=torch.full((1,), step, dtype=torch.int32, device=dev),
+            peer_bases=peer_bases,
+            layer=index,
+            chain=rows,
+            whole_rows=False,
+            tap=torch.zeros(rows, 5, HIDDEN, dtype=torch.bfloat16, device=dev),
+            tap_slot=3,
+            warm_next=weights,
+            proj_in=None,
+            proj_out=None,
+            trace_buf=None,
+            stuck_rec=None,
+            check_parity=False,
+            compile_only=True,
+        )
+
+    lay = 1 if full else 2
+    compile_launch(lay, 3, length, rows)
+    with assert_no_triton_compile(layer.gluon_muse_spark_layer_gfx950):
+        for step, (index, seq_len) in enumerate(
+            ((lay + 1, length), (lay + 18, length - 1), (lay + 35, length - 70)),
+            start=4,
+        ):
+            compile_launch(index, step, seq_len, rows)
+    # The guard is live: a row count the server did not warm compiles.
+    with pytest.raises(AssertionError, match="compiled 1 new"):
+        with assert_no_triton_compile(layer.gluon_muse_spark_layer_gfx950):
+            compile_launch(lay, 7, length, rows - 1)
+
+
 @pytest.mark.parametrize("rows", [1, 8])
 @pytest.mark.parametrize("full", [False, True])
 def test_layer_matches_the_regular_path_math(full, rows):

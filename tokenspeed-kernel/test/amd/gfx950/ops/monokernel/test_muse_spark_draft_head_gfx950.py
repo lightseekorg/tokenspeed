@@ -293,3 +293,57 @@ def test_the_head_scratch_query_matches_the_heads_plan():
     assert muse_spark_draft_head_scratch_pairs(max_rows=STEPS + 1) is None
     rows = (draft_head.MAX_REQUESTS + 1) * STEPS
     assert muse_spark_draft_head_scratch_pairs(max_rows=rows) is None
+
+
+def test_one_binary_serves_every_step_and_block():
+    """Each launch changes the step, the block's rows and its first token,
+    all device tensors: compiling the launches for one GPU's rank finds the
+    first launch's binary. Another request count is another plan, which the
+    guard must see compile."""
+    dev = torch.device("cuda:0")
+    x, hidden_proj, pred, succ, anchor = _shared(0, dev)
+    weights = draft_head.pack_draft_head(
+        {
+            "lm_head": _shard(0, 0, dev),
+            "hidden_proj": hidden_proj,
+            "pred_codebook": pred,
+            "succ_codebook": succ,
+        },
+        0,
+        SCALE,
+        SOFTCAP,
+    )
+    widest = draft_head.head_plan(draft_head.MAX_REQUESTS * STEPS)
+    # Compiling alone reads none of these: plain device memory stands in for
+    # the symmetric heap and the peers.
+    scratch = torch.zeros(widest.scratch_pairs, dtype=torch.int64, device=dev)
+    peer_bases = torch.zeros(WORLD, dtype=torch.int64, device=dev)
+
+    def compile_launch(step: int, requests: int, seed: int) -> None:
+        rows = requests * STEPS
+        g = torch.Generator(device=dev).manual_seed(seed)
+        draft_head.launch_gluon_muse_spark_draft_head_gfx950(
+            weights,
+            x=torch.randn(rows, HIDDEN, generator=g, device=dev).to(torch.bfloat16),
+            first_token=torch.randint(
+                0, VOCAB, (requests,), generator=g, device=dev, dtype=torch.int32
+            ),
+            anchor=torch.empty(requests, dtype=torch.int64, device=dev),
+            cand_ids=torch.empty(rows, TOPK, dtype=torch.int64, device=dev),
+            unary=torch.empty(rows, TOPK, dtype=torch.float32, device=dev),
+            scores=torch.empty(rows, TOPK, TOPK, dtype=torch.float32, device=dev),
+            scratch=scratch,
+            step=torch.full((1,), step, dtype=torch.int32, device=dev),
+            peer_bases=peer_bases,
+            trace_buf=None,
+            compile_only=True,
+        )
+
+    compile_launch(5, 1, 1)
+    with assert_no_triton_compile(draft_head.gluon_muse_spark_draft_head_gfx950):
+        for step in (6, 7, 1 << 20):
+            compile_launch(step, 1, step)
+    # The guard is live: two requests' steps are a new plan and compile.
+    with pytest.raises(AssertionError, match="compiled 1 new"):
+        with assert_no_triton_compile(draft_head.gluon_muse_spark_draft_head_gfx950):
+            compile_launch(8, 2, 8)

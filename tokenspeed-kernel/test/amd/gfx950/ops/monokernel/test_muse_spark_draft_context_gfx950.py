@@ -219,3 +219,67 @@ def test_draft_context_write_in_one_launch_matches_fc_norm_and_kv(seed: int):
         sock.bind(("", 0))
         port = sock.getsockname()[1]
     mp.spawn(_worker, args=(port, seed), nprocs=WORLD, join=True)
+
+
+def test_one_binary_serves_every_step_position_and_slot():
+    """Each launch changes the step, the rows' positions and their KV slots,
+    all device tensors: compiling the launches for one GPU's rank finds the
+    first launch's binary. Another request count is another plan, which the
+    guard must see compile."""
+    device = torch.device("cuda:0")
+    g = torch.Generator(device=device).manual_seed(0)
+
+    def randn(*shape, std):
+        return (torch.randn(*shape, generator=g, device=device) * std).to(
+            torch.bfloat16
+        )
+
+    weights = draft_context.pack_draft_context(
+        {
+            "fc": randn(HIDDEN // WORLD, TAPS_K, std=0.005),
+            "hidden_norm": randn(HIDDEN, std=0.1),
+            **{f"qkv_{i}": randn(1280, HIDDEN, std=0.01) for i in range(LAYERS)},
+            **{f"k_norm_{i}": randn(HEAD, std=0.1) for i in range(LAYERS)},
+        },
+        0,
+    )
+    plan = draft_context.context_plan(2 * ROWS)
+    # Compiling alone reads none of these: plain device memory stands in for
+    # the symmetric heap and the peers.
+    scratch = torch.zeros(plan.scratch_pairs, dtype=torch.int64, device=device)
+    peer_bases = torch.zeros(WORLD, dtype=torch.int64, device=device)
+    caches = tuple(
+        torch.zeros(4096, 1, HEAD, dtype=torch.bfloat16, device=device)
+        for _ in range(2 * LAYERS)
+    )
+    cos_sin = _rope_table(70000, device)
+
+    def compile_launch(step: int, start: int, requests: int) -> None:
+        rows = requests * ROWS
+        draft_context.launch_gluon_muse_spark_draft_context_gfx950(
+            weights,
+            taps=randn(rows, TAPS_K, std=1.0),
+            positions=torch.arange(
+                start, start + rows, dtype=torch.int32, device=device
+            ),
+            slots=torch.randperm(4096, generator=g, device=device)[:rows],
+            k_caches=caches[:LAYERS],
+            v_caches=caches[LAYERS:],
+            cos_sin=cos_sin,
+            scratch=scratch,
+            step=torch.full((1,), step, dtype=torch.int32, device=device),
+            peer_bases=peer_bases,
+            trace_buf=None,
+            compile_only=True,
+        )
+
+    compile_launch(3, 60000, 1)
+    with assert_no_triton_compile(draft_context.gluon_muse_spark_draft_context_gfx950):
+        for step, start in ((4, 129), (5, 0), (6, 65530)):
+            compile_launch(step, start, 1)
+    # The guard is live: two requests' rows are a new plan and compile.
+    with pytest.raises(AssertionError, match="compiled 1 new"):
+        with assert_no_triton_compile(
+            draft_context.gluon_muse_spark_draft_context_gfx950
+        ):
+            compile_launch(7, 5000, 2)
