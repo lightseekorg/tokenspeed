@@ -829,11 +829,13 @@ static buffers (the target's hidden rows with a zero tail, the gather rows,
 the frontier), and its outputs land in static buffers the decode steps read.
 The draft prologue writes K/V inside a captured segment, which holds no
 per-layer Host-load wait, so a step-0 replay first waits for the draft pool's
-whole Host load, as the target's replay does. These captures run each segment
-as soon as it is captured (`run_segments_while_capturing`): their breaks index
-with values a segment computes (the top-k rows the narrowing gathers, the
-decode steps' positions), which a capture alone leaves unwritten when the
-break runs.
+whole Host load, as the target's replay does on a pool that does not declare
+`layer_accesses_wait_for_load`, and skips the per-layer waits its capture
+noted; the decode-step replays, behind step 0, skip theirs too. These captures
+run each segment as soon as it is captured (`run_segments_while_capturing`):
+their breaks index with values a segment computes (the top-k rows the
+narrowing gathers, the decode steps' positions), which a capture alone leaves
+unwritten when the break runs.
 
 A round replays only what the graphs baked: a pure extend (MIXED rounds run
 eager), no attention DP or query shard, a fitting bucket at the exact request
