@@ -629,7 +629,16 @@ o-projection shard). Each layer then does the following:
 1. Add the previous feed-forward output to the residual prefix and mix it
    with the block snapshots (AttnRes), reading a MoE layer's output row
    straight from the tail's ring.
-2. Run the packed input projection as a split-K GEMM with per-batch tactics.
+2. Run the packed input projection as a split-K GEMM with per-batch tactics:
+   up to 16 rows a warp split-K (many small CTAs whose four compute warps
+   each sum a quarter of K, reduced in shared memory), above 16 rows a cluster
+   split-K (each CTA of a cluster sums a K slice, reduced over distributed
+   shared memory). A weight that is not contiguous and 32-byte aligned, or
+   strided or misaligned activations or outputs, take the cluster split-K at
+   every row count. Both multiply BF16, accumulate in FP32 and round the
+   output once to BF16; only the order in which they sum the K partials
+   differs, so their outputs can differ by one BF16 rounding step. Both
+   compile when the layer is bound, before graph capture.
 3. Run the attention core as usual, through the attention's `o_proj_input`
    (Kimi-K3.1's DSA layers select their indexer's top-k there, as in their
    `forward`).
