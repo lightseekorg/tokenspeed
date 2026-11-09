@@ -434,8 +434,8 @@ class DSABackend(PagedAttentionBackend):
             # replay explicitly in its model code, so the class-level DSA
             # restriction does not apply to it.
             self.cuda_graph_support = CudaGraphSupport(prefill_graph=True)
-        elif spec.padded_prefill_replay and platform.is_nvidia:
-            # K3.1 narrows padded replays to live rows; validated on NVIDIA only.
+        elif spec.padded_prefill_replay and (platform.is_nvidia or platform.is_cdna4):
+            # K3.1 narrows padded replays to live rows; validated on NVIDIA and gfx950.
             self.cuda_graph_support = CudaGraphSupport(prefill_graph=True)
             padded_replay_opt_in = True
         if len(self.qcp_group) > 1:
@@ -446,9 +446,11 @@ class DSABackend(PagedAttentionBackend):
             self._probe_history_gather_topk_leaf(spec)
         # A pure KVP extend over gathered histories attends each request
         # group's history in the eager attention break, as the sharded extend
-        # arm does, so prefill capture is off here too.
+        # arm does, so prefill capture is off here too -- except under K3.1's
+        # padded replay, whose model code keeps the history gather inside the
+        # break and narrows the captured segments to live rows.
         self._history_prefill: bool = dsa_kvp_history_prefill(config)
-        if self._history_prefill:
+        if self._history_prefill and not padded_replay_opt_in:
             self.cuda_graph_support = CudaGraphSupport(prefill_graph=False)
         # Planned sparse cores are captured only if they declare cuda_graph.
         self.cuda_graph_support = self.cuda_graph_support & CudaGraphSupport.from_plans(
