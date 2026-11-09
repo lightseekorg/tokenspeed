@@ -63,6 +63,24 @@ def region(plan, name):
 
 
 @gluon.constexpr_function
+def world(plan):
+    """Ranks that run the plan together (``Plan.world``)."""
+    return plan.plan.world
+
+
+@gluon.constexpr_function
+def is_peer(plan, name):
+    """Whether other ranks write mailbox region ``name``."""
+    return plan.plan.is_peer(name)
+
+
+@gluon.constexpr_function
+def peer_copy(plan, name):
+    """Pairs between the two copies of peer region ``name``."""
+    return plan.plan.peer_copy(name)
+
+
+@gluon.constexpr_function
 def has_stage(plan, name):
     """Whether the plan has stage ``name``."""
     return plan.plan.has_stage(name)
@@ -85,6 +103,12 @@ def _stage_base(plan, name):
 @gluon.constexpr_function
 def _stage_tasks(plan, name):
     return plan.plan.stage(name).tasks
+
+
+@gluon.constexpr_function
+def stage_base(plan, name):
+    """The CTA that runs task 0 of stage ``name``."""
+    return _stage_base(plan, name)
 
 
 @gluon.constexpr_function
@@ -150,6 +174,8 @@ __all__ = [
     "grid",
     "has_stage",
     "head_sleep",
+    "is_peer",
+    "peer_copy",
     "region",
     "row_pairs",
     "row_task",
@@ -157,5 +183,6 @@ __all__ = [
     "stage_event",
     "stage_rounds",
     "stage_task",
+    "world",
     "stage_tasks",
 ]

@@ -27,9 +27,11 @@ Read these documents with this one:
 | `weights.py` | Host side: the weight and scale layouts that `mx.py` and `bf16.py` read. |
 | `trace.py` | Timestamps for each wave and stage inside a launch. |
 | `warm.py` | A warm task: reads weights of the next launch into the memory-side cache, through LDS, with no registers. |
+| `code_warm.py` | A code task: reads the launch's own code into every XCD's L2 at its start, so later stages do not wait on instruction fetch. |
 
 | Model directory | Model |
 |---|---|
+| [`muse_spark/`](muse_spark/README.md) | Muse Spark Open: TP8 decoder layers with MXFP4 routed experts. |
 | [`qwen4_exp/`](qwen4_exp/README.md) | Qwen3.8-Flash-Next: Gated DeltaNet and QSA attention layers. |
 
 ## Adding a model's kernels
@@ -81,7 +83,9 @@ read the outputs with `payloads`.
   same time. Thus each CU holds one CTA, the kernel has no spills, and no
   other kernel runs on the GPU during the launch.
 - `scratch` is int64, at least `Plan.scratch_pairs` pairs. Every launch uses
-  the same buffer, and nothing clears it.
+  the same buffer, and nothing clears it. Launches that share a buffer must
+  share one region layout: the peer regions' two copies keep a rank a
+  launch ahead off the copy a slower rank reads only within one layout.
 - `step` is an int32 `[1]` device counter. The caller changes it before each
   step, inside the CUDA graph. The launch tag is
   `step * LAYER_SLOTS + layer + 1`, so `layer < LAYER_SLOTS` (64).
@@ -148,19 +152,40 @@ last CTA ends, and otherwise the runtime seam moves it after the layers.
 
 Memory rules on gfx950 (coarse-grained VRAM):
 
-- Every put and every poll load is agent scope (`sc1`). The vL1D serves a
+- Every put and every poll load of a local region is at least agent scope
+  (`sc1`); a peer region's are system scope (below). The vL1D serves a
   plain or `sc0` load, which can then spin on a stale line forever.
 - The 64-bit store and load are single-copy atomic. Thus a pair never holds
   an old payload with a new tag.
-- A poll traps (`s_trap 2`) after `MAX_RETRIES` retries (at least about
-  8 s). A deadlock then stops the process with a GPU error, not a hang.
-- A CTA never reads another CTA's plain global store from the same launch.
-  For example, the current token's K and V come from mailboxes, not from the
-  KV cache that another CTA writes in the same launch.
+- A poll traps (`s_trap 2`) after about a minute of waiting, timed with the
+  realtime clock (read every `POLL_CHECK` retries only). A deadlock then
+  stops the process with a GPU error, not a hang, while a rank whose host
+  submits a launch seconds late only stalls its peers. Given a stuck-poll
+  record buffer, the poll first writes what it waited for (tag, address,
+  observed pair, clocks) for the host to decode.
+- A CTA reads another CTA's plain global store from the same launch only
+  behind a flag: the producer stores plain words past the caches, waits
+  until they land, then raises one tagged flag (`store_words`,
+  `raise_flag`), and the consumer polls the flag before it loads the words
+  past the caches. Other plain stores of a launch are never read in it: the
+  current token's K and V come from mailboxes, not from the KV cache that
+  another CTA writes in the same launch.
 - Many waves that spin on `sc1` loads can starve the producers' stores, and
   the grid can then livelock. Before a poll that all waves of many CTAs make,
   `pre_poll` (or `pre_poll_spread`) lets wave 0 spin on one hint pair for each
   producer. The full poll then usually succeeds on its first load.
+
+Across ranks (`Plan(world=..., peers=...)`), the buffer comes from Iris's
+symmetric heap (`ctx.zeros`), and `Mailbox(..., peers=load_peers(bases,
+rank, parity, world))` adds the other ranks: `bases` is `IrisGroup.bases`,
+read once a launch, and `parity` alternates from launch to launch.
+
+- `put_peer(region, peer, index, payload, mask)` stores into rank `peer`'s
+  copy of a peer region (system scope). A one-shot all-reduce puts each
+  rank's partial into a slot per source rank on every rank, then polls the
+  slots and adds them in rank order, so every rank gets the same bits.
+- Polls of a peer region load with `sc0 sc1`. `poll_pairs` serves local
+  regions only; poll peer regions by name.
 
 `Mailbox(scratch, tag, plan, trace_table)` is the view that a stage gets:
 
@@ -173,6 +198,7 @@ Memory rules on gfx950 (coarse-grained VRAM):
 | `row(r)`, `row_offset(row)` | Address the copies of another row. |
 | `pre_poll(region, hints)`, `pre_poll_spread(region, N)` | Let wave 0 spin on hint pairs before a wide poll. |
 | `stamp(stage, point)` | Records a trace point. |
+| `put_peer(region, peer, index, payload, mask)` | Publishes into another rank's copy of a peer region. |
 
 `mx.load_mxfp4_rows` polls the MXFP4 rows of a GEMV input in one round trip.
 

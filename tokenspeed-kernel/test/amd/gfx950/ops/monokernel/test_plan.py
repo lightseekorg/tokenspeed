@@ -148,3 +148,35 @@ def test_placement_must_name_the_module_stages_in_order():
         placement({"b3": 30, "b1": 28}, ("b1", "b3"))
     with pytest.raises(ValueError, match="must place"):
         placement({"b1": 28}, ("b1", "b3"))
+
+
+def _peer_plan(world, peers):
+    return Plan(
+        grid=4,
+        stages=(
+            Stage("push", 2, 0, writes=("part",)),
+            Stage("sum", 2, 2, reads=("part",)),
+        ),
+        regions=(("part", 40), ("local", 8)),
+        rows=1,
+        chain=1,
+        world=world,
+        peers=peers,
+    )
+
+
+def test_plan_peer_regions_hold_two_aligned_copies():
+    plan = _peer_plan(8, ("part",))
+    # 40 pairs round up to 64 per copy; the local region follows both copies.
+    assert plan.peer_copy("part") == 64
+    assert plan.offset("local") == 128
+    assert plan.is_peer("part") and not plan.is_peer("local")
+    assert json.loads(plan.key)["peers"] == ["part"]
+    assert plan.only(("sum",)).peers == ("part",)
+
+
+def test_plan_rejects_peer_regions_on_one_rank_or_unknown_names():
+    with pytest.raises(ValueError, match="more than one rank"):
+        _peer_plan(1, ("part",))
+    with pytest.raises(ValueError, match="unknown peer regions"):
+        _peer_plan(8, ("nope",))

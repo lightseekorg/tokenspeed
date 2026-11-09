@@ -106,6 +106,8 @@ def stamp(table, event: gl.constexpr):
         lanes: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
         i = gl.arange(0, 64 * gl.num_warps(), lanes)
         offset = (event * gl.num_warps() + i // 64) * 8
+        # asm: the clock read and its LDS store in this order, uncounted by
+        # vmcnt; Gluon has no clock op, and its LDS store may be reordered.
         gl.inline_asm(
             _stamp_asm,
             "=&v,=&v,=&s,s,v",

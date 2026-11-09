@@ -110,7 +110,7 @@ _IR_ASM = re.compile(
 # SALU instructions that leave SCC alone; every other s_* ALU op writes it.
 _SCC_KEEPERS = re.compile(
     r"s_(?:mov|movk|cmov|cselect|load|store|buffer|waitcnt|nop|cbranch|branch"
-    r"|getreg|setreg|sleep|memrealtime|memtime|dcache|barrier|mul_i32|sendmsg"
+    r"|getreg|setreg|getpc|sleep|memrealtime|memtime|dcache|barrier|mul_i32|sendmsg"
     r"|trap|setprio|endpgm)"
 )
 # Instructions whose first operand is read, not written.
