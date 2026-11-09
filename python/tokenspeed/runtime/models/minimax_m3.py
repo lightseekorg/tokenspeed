@@ -583,6 +583,7 @@ class MiniMaxM3DecoderLayer(BaseDecoderLayer[MiniMaxM3VLTextConfig]):
         prefix: str = "",
         alt_stream: torch.cuda.Stream | None = None,
     ) -> None:
+        # Set before the base constructor, whose resolve_mlp() reads it.
         self.alt_stream = alt_stream
         super().__init__(
             config=config,
