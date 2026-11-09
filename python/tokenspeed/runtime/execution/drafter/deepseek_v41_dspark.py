@@ -710,6 +710,16 @@ class DeepseekV41DSpark(BaseDrafter):
                     warmup_samples=2,
                 )
                 self._verify_collectors[key] = collector
+                if self._verification_rank == 0:
+                    logger.info(
+                        f"Adaptive DSpark calibration started: "
+                        f"local_bs={sample.batch_size}, context={region}, "
+                        f"query_capacities={collector.capacities}, "
+                        f"warmup_per_capacity={collector.warmup_samples}, "
+                        f"samples_per_capacity={collector.minimum_samples}. "
+                        "Only aligned valid steps count; progress is retained "
+                        "across requests in the same batch/context region."
+                    )
             # The alignment step already verified every rank and reduced max.
             collector.observe(
                 step=sample.step,

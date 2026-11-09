@@ -4142,8 +4142,10 @@ class ServerArgs:
             "--dsv41-dspark-min-batch-size",
             type=int,
             default=ServerArgs.dsv41_dspark_min_batch_size,
-            help="Minimum actual decode batch size for adaptive DSpark. Smaller "
-            "or padded batches retain full verification.",
+            help="Minimum actual decode batch size per attention rank for adaptive "
+            "DSpark, not global request concurrency. Smaller or padded batches "
+            "retain full verification; attention DP also requires equal local "
+            "decode batch sizes across ranks.",
         )
         parser.add_argument(
             "--draft-model-path-use-base",
