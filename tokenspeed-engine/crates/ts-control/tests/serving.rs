@@ -70,8 +70,9 @@ use ts_wire::{
     codec::Dict,
     control::{
         FlushCacheReqInput, IsSchedulerPausedReqInput, IsSleepingReqInput, PauseSchedulerReqInput,
-        ProfileReq, ReleaseMemoryOccupationReqInput, ResumeMemoryOccupationReqInput,
-        ResumeSchedulerReqInput, UpdateWeightFromDiskReqInput, PROFILE_START,
+        ProfileReq, ReleaseMemoryOccupationReqInput, ReloadForwardReqInput,
+        ResumeMemoryOccupationReqInput, ResumeSchedulerReqInput, UpdateWeightFromDiskReqInput,
+        PROFILE_START,
     },
     multimodal::{Modality, MultimodalDataItem, MultimodalInputs},
     ControlOutput, ControlRequest, EngineCoreReadyResponse, EngineRequest, SamplingParams,
@@ -852,6 +853,11 @@ impl DataPlane for FakeDevice {
         Ok(())
     }
 
+    fn reload_forward(&mut self, op: &ControlRequest) -> Result<(bool, String), DataPlaneError> {
+        self.device_ops.lock().unwrap().push(op.tag().to_owned());
+        Ok((!self.fail_weight_update, "reloaded".to_owned()))
+    }
+
     fn resume_memory(&mut self, tags: &[String]) -> Result<(), DataPlaneError> {
         self.device_ops
             .lock()
@@ -1314,6 +1320,7 @@ fn loop_config(in_flight_depth: usize, pipeline: bool, setup: &Setup) -> LoopCon
             memory_saver: true,
             memory_regions: vec!["kv_cache".to_owned(), "weights".to_owned()],
             l3_weight_version: None,
+            allow_reload_forward: true,
         },
         batch_log: BatchLogConfig {
             enabled: true,
@@ -1662,6 +1669,7 @@ struct ScriptedRank {
     cache_ops: Vec<CacheOpKind>,
     idle_forwards: usize,
     forwards: usize,
+    /// The device operations the rank ran (weight updates, reloads, ...).
     device_ops: Vec<String>,
 }
 
@@ -4191,6 +4199,7 @@ fn outcome(replies: Vec<ControlOutput>) -> Vec<(&'static str, bool)> {
                 ControlOutput::ResumeMemoryOccupation(r) => r.success,
                 ControlOutput::IsSleeping(r) => r.is_sleeping,
                 ControlOutput::Profile(r) => r.success,
+                ControlOutput::ReloadForward(r) => r.success,
                 other => panic!("unexpected {}", other.tag()),
             };
             (reply.tag(), flag)
@@ -4254,6 +4263,100 @@ async fn a_wait_pause_answers_once_drained_and_withholds_new_requests() {
         chunks.push(chunk.unwrap());
     }
     assert_eq!(tokens(&chunks), [1000, 1001, 1002]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forward_reload_drains_runs_once_on_every_rank_and_resumes() {
+    let engine = start_ranks(Layout::Tp(2), 1, Tiers::DeviceOnly).await;
+    let running = engine
+        .client
+        .generate(request("r1", 3, budget(40)))
+        .await
+        .unwrap();
+    let reload = ControlRequest::ReloadForward(ReloadForwardReqInput {
+        rid: None,
+        http_worker_ipc: None,
+        mode: "wait".to_owned(),
+        modules: None,
+        id: Some("tp".to_owned()),
+        timeout_s: None,
+    });
+    // The reload answers only after r1 finished, on the old code.
+    let (reloaded, chunks) = tokio::join!(control(&engine, reload), collect(running));
+    assert_eq!(reloaded, [("ReloadForwardReqOutput", true)]);
+    assert_eq!(tokens(&chunks).len(), 40);
+    for rank in &engine.ranks {
+        assert_eq!(*rank.device_ops.lock().unwrap(), ["ReloadForwardReqInput"]);
+    }
+    // It resumed on its own: a new request is served.
+    let served = collect(
+        engine
+            .client
+            .generate(request("r2", 3, budget(3)))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(tokens(&served), [1000, 1001, 1002]);
+}
+
+#[test]
+fn a_reload_runs_once_every_dp_engine_holds_the_same_one() {
+    let reload = |id: &str| {
+        EngineRequest::Control(Box::new(ControlRequest::ReloadForward(
+            ReloadForwardReqInput {
+                rid: None,
+                http_worker_ipc: None,
+                mode: "wait".to_owned(),
+                modules: None,
+                id: Some(id.to_owned()),
+                timeout_s: None,
+            },
+        )))
+    };
+    let mut first: Script = vec![Vec::new(); 14];
+    let mut second: Script = vec![Vec::new(); 14];
+    // Sent to one engine only, it waits there until a resume cancels it.
+    first[0].push(reload("lost"));
+    first[3].push(EngineRequest::Control(Box::new(resume())));
+    // Different reloads at the two heads wait, never fail the loop.
+    first[5].push(reload("a"));
+    second[5].push(reload("b"));
+    first[7].push(EngineRequest::Control(Box::new(resume())));
+    second[7].push(EngineRequest::Control(Box::new(resume())));
+    // The same one on both runs once on each, in the round both drained.
+    first[8].push(reload("both"));
+    second[9].push(reload("both"));
+    let ranks = run_scripted(
+        Layout::Dp(2),
+        1,
+        Tiers::DeviceOnly,
+        Setup::default(),
+        vec![first, second],
+        no_reaction,
+    );
+    for rank in &ranks {
+        assert_eq!(rank.outcome, Ok(()));
+        assert_eq!(rank.device_ops, ["ReloadForwardReqInput"]);
+    }
+    assert_eq!(
+        outcome(ranks[0].replies.clone()),
+        [
+            ("ReloadForwardReqOutput", false),
+            ("ResumeSchedulerReqOutput", true),
+            ("ReloadForwardReqOutput", false),
+            ("ResumeSchedulerReqOutput", true),
+            ("ReloadForwardReqOutput", true)
+        ]
+    );
+    assert_eq!(
+        outcome(ranks[1].replies.clone()),
+        [
+            ("ReloadForwardReqOutput", false),
+            ("ResumeSchedulerReqOutput", true),
+            ("ReloadForwardReqOutput", true)
+        ]
+    );
 }
 
 /// A JSON schema the toy vocabulary takes most of a second to compile.

@@ -331,6 +331,8 @@ def validate_task(data: Dict[str, Any], path: Path) -> None:
                 f"{path}: ignore_changes must be a non-empty list of paths without "
                 "a trailing slash"
             )
+    if "changed_paths" in data and not isinstance(data["changed_paths"], bool):
+        raise ValueError(f"{path}: changed_paths must be a boolean")
     if "retries" in data:
         retries = data["retries"]
         if isinstance(retries, bool) or not isinstance(retries, int) or retries < 0:
@@ -2221,7 +2223,12 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     scan_parser.add_argument(
         "--changed-files",
         type=Path,
-        help="Optional changed-path list; only task-YAML-only diffs narrow the matrix",
+        help="Optional changed-path list that narrows the matrix (see test/ci/README.md)",
+    )
+    scan_parser.add_argument(
+        "--full-tests",
+        action="store_true",
+        help="A reviewer asked for every test (pr_test_scope.py): ignore --changed-files.",
     )
     scan_parser.add_argument(
         "--trigger",
@@ -2343,6 +2350,22 @@ def drop_unaffected_tasks(
     return kept
 
 
+def attach_changed_paths(
+    include: List[Dict[str, Any]], changed: List[str], repo_root: Path
+) -> None:
+    """Give the entries of ``changed_paths`` tasks the pull request's changed
+    paths, which the workflow exports as ``TOKENSPEED_CI_CHANGED_PATHS``."""
+    paths = "\n".join(path.strip() for path in changed if path.strip())
+    opted_in: Dict[str, bool] = {}
+    for entry in include:
+        config = entry["config"]
+        if config not in opted_in:
+            task = normalize_task(repo_root / config, repo_root)
+            opted_in[config] = task.get("changed_paths", False)
+        if opted_in[config]:
+            entry["changed_paths"] = paths
+
+
 def main(argv: Iterable[str] | None = None) -> int:
     args = parse_args(argv)
     if args.command == "scan":
@@ -2356,7 +2379,8 @@ def main(argv: Iterable[str] | None = None) -> int:
             args.workflow_stage,
             args.multi_node,
         )
-        if args.changed_files is not None:
+        # A reviewer's full-test request (pr_test_scope.py) skips every narrowing.
+        if args.changed_files is not None and not args.full_tests:
             changed = args.changed_files.read_text(encoding="utf-8").splitlines()
             suite_changed = any(
                 path.startswith(KERNEL_BENCHMARK_SUITE_DIRECTORY) for path in changed
@@ -2383,6 +2407,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                 matrix["include"] = drop_unaffected_tasks(
                     matrix["include"], changed, repo_root
                 )
+                attach_changed_paths(matrix["include"], changed, repo_root)
         print(json.dumps(matrix, separators=(",", ":")))
         return 0
 

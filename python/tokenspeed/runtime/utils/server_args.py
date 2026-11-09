@@ -766,6 +766,8 @@ class ServerArgs:
     weight_loader_prefetch_checkpoints: bool = True
     weight_loader_prefetch_num_threads: int = 8
     enable_memory_saver: bool = False
+    # Dev: permit the reload_forward control call; nothing reloads until it arrives.
+    allow_reload_forward: bool = False
     weight_memory_policy: Literal["cpu_backup", "discard"] | None = None
     disable_cudagraph_memory_reserve: bool = False
     mla_disable_ragged: bool = False
@@ -838,6 +840,7 @@ class ServerArgs:
 
     def __post_init__(self):
         self.validate_weight_memory_policy()
+        self.validate_forward_reload()
         self.resolve_basic_defaults()
         self.resolve_model_defaults()
         self.resolve_launcher_topology()
@@ -2423,6 +2426,22 @@ class ServerArgs:
                     f"{self.prefill_chunk_yield_tokens}"
                 )
 
+    def validate_forward_reload(self):
+        """A forward reload recaptures graphs, which tagged pools cannot, and spans one engine, which PD roles are not."""
+        if not self.allow_reload_forward:
+            return
+        if self.enable_memory_saver:
+            raise ValueError(
+                "--allow-reload-forward cannot be combined with --enable-memory-saver: "
+                "a tagged CUDA-graph pool cannot be discarded and captured again"
+            )
+        if self.disaggregation_mode != "null":
+            raise ValueError(
+                "--allow-reload-forward does not support prefill/decode disaggregation: "
+                "each role would reload and resume on its own, mixing code versions in "
+                "one request"
+            )
+
     def validate_weight_memory_policy(self):
         """Memory saving chooses its weight semantics explicitly."""
         if self.weight_memory_policy not in (None, "cpu_backup", "discard"):
@@ -2690,6 +2709,7 @@ class ServerArgs:
 
     def validate(self):
         self.validate_weight_memory_policy()
+        self.validate_forward_reload()
         if self.low_latency_max_num_tokens_per_gpu <= 0:
             raise ValueError("--low-latency-max-num-tokens-per-gpu must be positive")
         if self.input_logprob_chunk_tokens <= 0:
@@ -4275,6 +4295,14 @@ class ServerArgs:
             "--enable-memory-saver",
             action="store_true",
             help="Allow saving memory using release_memory_occupation and resume_memory_occupation",
+        )
+        parser.add_argument(
+            "--allow-reload-forward",
+            action="store_true",
+            help="Development: allow the reload_forward control call (ts reload-forward), "
+            "which drains the engine, re-executes edited model, layer and kernel modules "
+            "in place, warms their kernels and recaptures the CUDA graphs. Nothing "
+            "reloads until the call arrives.",
         )
         parser.add_argument(
             "--weight-memory-policy",

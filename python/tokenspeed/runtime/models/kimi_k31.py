@@ -408,6 +408,24 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
         )
         return attn_output if gate is None else sigmoid_mul(attn_output, gate)
 
+    def decode_weights(self) -> tuple[torch.Tensor, ...]:
+        """The weights one decode step reads, in reading order.
+
+        The packed [q_a | kv_a | gate] projection, q_b with the index query
+        projection, the index key and head-weight projections, the absorbed key
+        and value projections (once derived) and the o-projection.
+        """
+        indexer = self.indexer
+        queries = (self.q_b_wq_b_weight,)
+        if self.q_b_wq_b_weight is None:
+            queries = (self.q_b_proj.weight, indexer.wq_b.weight)
+        keys = (indexer.wk_weights_proj_weight,)
+        if indexer.wk_weights_proj_weight is None:
+            keys = (indexer.wk.weight, indexer.weights_proj.weight)
+        absorbed = tuple(w for w in (self.w_kc, self.w_vc) if w is not None)
+        projection = self.fused_qkv_a_proj_with_mqa.weight
+        return (projection, *queries, *keys, *absorbed, self.o_proj.weight)
+
     def _attend(
         self,
         positions: torch.Tensor,

@@ -583,6 +583,28 @@ CUDA graph. Every rank must run the same batches, since each mailbox is shared
 by the group. Other row counts and every non-decode forward keep the TRT-LLM
 MoE.
 
+At 5-8 rows the routing kernel lets the experts launch as it starts, and the
+shared expert runs on a highest-priority side stream that the tail never waits
+for: the tail polls the shared rows from their mailbox. Those tails keep their
+release after the output multicast: a release at entry lets kernels in that can
+hold the SMs the side stream still needs. The forward rejoins that side stream once
+at its end (`KimiK3DecodeMoE.join`), since a CUDA graph capture fails while a
+forked stream is not joined. These only reorder work; the outputs are the same
+bit for bit.
+
+Up to 8 rows a decode step is bound by HBM bandwidth, which the attention core
+and the all-reduces leave idle, so the chain prefetches weights into L2
+(`_cute_dsl/k3_decode_prefetch.py` has the row counts and caps). A side stream
+prefetches the MoE front's packed weight after the o-projection exit; the
+o-projection shard and the MoE layer's front, shared-expert and up-projection
+weights after the KDA input projection or the MLA core; and, once the routed
+experts launch, the next layer's attention weights up to a cap. At 4-7 rows the
+routed experts instead prefetch the up-projection shard and the next attention's
+weights themselves, once their last weight load is issued. The forward rejoins
+the prefetch stream at its end as well. The prefetch tables hold weight
+addresses, so the weights must not move after binding. Prefetching changes no
+result.
+
 Three places decide where the chain runs. The Kimi-K3 MoE execution plan
 allows it for one tensor-parallel group shared by attention and MoE on
 Blackwell TRT-LLM. `supports()` in `_cute_dsl/k3_decode_support.py` (no
