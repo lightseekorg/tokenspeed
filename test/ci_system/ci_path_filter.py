@@ -62,6 +62,7 @@ VENDOR_PATHS = {
         "test/ci_system/install_deps_rocm.sh",
         "test/ci_system/install_kernel_benchmark_rocm.sh",
         "test/ci_system/kernel_benchmark_ci.py",
+        "test/ci_system/verify_rocm_stack.py",
         "tokenspeed-kernel-amd",
         "tokenspeed-kernel/benchmarks/amd",
         "tokenspeed-kernel/python/requirements/rocm.txt",
@@ -93,7 +94,6 @@ RUNNER_GROUP_PATHS = {
     **{
         f"test/ci_system/{name}": frozenset({"amd-mi450"})
         for name in (
-            "mi450_rocjitsu_worker_python.sh",
             "mi450_sim_env.sh",
             "mi450_sim_report_digest.py",
             "run_mi450_rocjitsu.sh",

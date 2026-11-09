@@ -6,6 +6,10 @@ triggers:
   - per-commit
   - manual
   - debug
+# Kernel tests never import the runtime (a pre-commit hook checks it).
+ignore_changes:
+  - python/tokenspeed
+  - test/runtime
 runner:
   labels:
     - amd-mi45x-cpu-test

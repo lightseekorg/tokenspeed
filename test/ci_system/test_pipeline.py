@@ -1332,6 +1332,68 @@ def test_scan_runs_only_kernel_benchmarks_for_suite_only_changes(
     assert [entry["name"] for entry in matrix["include"]] == expected
 
 
+@pytest.mark.parametrize(
+    ("changed", "trigger", "expected"),
+    [
+        ("python/tokenspeed/runtime/a.py\n", "per-commit", ["other"]),
+        (
+            "python/tokenspeed/runtime/a.py\ntest/runtime/test_a.py\ndocs/a.md\n",
+            "per-commit",
+            ["other"],
+        ),
+        ("python/tokenspeed/data.json\n", "per-commit", ["other"]),
+        (
+            "python/tokenspeed/runtime/a.py\ntokenspeed-kernel/python/a.py\n",
+            "per-commit",
+            ["kernel", "other"],
+        ),
+        ("python/tokenspeed_extra/a.py\n", "per-commit", ["kernel", "other"]),
+        (
+            "python/tokenspeed/runtime/a.py\ntest/ci_system/pipeline.py\n",
+            "per-commit",
+            ["kernel", "other"],
+        ),
+        ("python/tokenspeed/runtime/a.py\n", "post-submit", ["kernel", "other"]),
+        (
+            "\n".join(f"python/tokenspeed/runtime/{i}.py" for i in range(300)),
+            "per-commit",
+            ["kernel", "other"],
+        ),
+    ],
+)
+def test_scan_drops_tasks_whose_ignored_paths_cover_every_change(
+    changed, trigger, expected, tmp_path, capsys, monkeypatch
+):
+    monkeypatch.delenv(pipeline.EXCLUDED_RUNNER_LABELS_ENV, raising=False)
+    monkeypatch.delenv(pipeline.B200_RUNNER_LABEL_ENV, raising=False)
+    root = tmp_path / "test/ci"
+    root.mkdir(parents=True)
+    ignored = "ignore_changes:\n  - python/tokenspeed\n  - test/runtime\n"
+    _write_task_yaml(
+        root, "kernel.yaml", _default_body("kernel", ["b200-1gpu"], ignored)
+    )
+    _write_task_yaml(root, "other.yaml", _default_body("other", ["b200-1gpu"]))
+    changed_file = tmp_path / "changed.txt"
+    changed_file.write_text(changed)
+    argv = ["scan", "--repo-root", str(tmp_path), "--trigger", trigger]
+    argv += ["--changed-files", str(changed_file)]
+    assert pipeline.main(argv) == 0
+    matrix = json.loads(capsys.readouterr().out)
+    assert [entry["name"] for entry in matrix["include"]] == expected
+
+
+@pytest.mark.parametrize(
+    "prefixes", ["[]", "python/tokenspeed", "['']", "[python/tokenspeed/]"]
+)
+def test_validate_task_rejects_malformed_ignore_changes(tmp_path, prefixes):
+    body = _default_body("ut-a", ["b300-1gpu"], extra=f"ignore_changes: {prefixes}\n")
+    path = _write_task_yaml(tmp_path, "bad.yaml", body)
+    import yaml as _yaml
+
+    with pytest.raises(ValueError, match=r"ignore_changes must be"):
+        validate_task(_yaml.safe_load(path.read_text()), path)
+
+
 def test_validate_task_accepts_known_priorities(tmp_path):
     for priority in ("low", "normal", "high"):
         body = _default_body("ut-a", ["b300-1gpu"], extra=f"priority: {priority}\n")
