@@ -211,13 +211,18 @@ followed; pushes to `main` run every test.
 
 The runtime unit-test tasks use it too: `test/runtime/run_ci_suite.py` keeps
 only the test files the changes reach before it partitions the suite
-(`test/ci_system/runtime_test_selection.py`). When every change is Markdown, a
-test file, or a model module (a module directly under
-`python/tokenspeed/runtime/models/` that defines `EntryClass`), it runs the
-changed runtime test files; for a changed model module, the tests that import
-it or a module built on it, or that name it or such a module (`gpt_oss` matches
-a test serving `openai/gpt-oss-20b`); and the tests that import any of these,
-directly or through other test files. Any other change runs every test.
+(`test/ci_system/runtime_test_selection.py`). The suite narrows only when every
+change is Markdown, a test file, or a model module: a module directly under
+`python/tokenspeed/runtime/models/` that defines `EntryClass`. It then runs these
+test files:
+
+- the changed runtime test files;
+- for a changed model module, the tests that import it or a module built on it,
+  or that name one of them, so `gpt_oss` matches a test serving
+  `openai/gpt-oss-20b`;
+- the tests that import any of these, directly or through other test files.
+
+Any other change runs every test.
 
 A reviewer can widen a pull request's tests. The `ci-full-tests` label turns
 off every changed-path narrowing (vendor path filtering, `ignore_changes`,
