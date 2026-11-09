@@ -346,14 +346,6 @@ def _run_mega_moe(
 ) -> None:
     """Stage ``x`` and its routing into the symmetric buffer and launch."""
     num_tokens = x.shape[0]
-    if num_tokens == 0:
-        # A non-null dummy output keeps the native tensor binding valid. Clear
-        # its routes after a previous nonempty call so it cannot dispatch stale
-        # tokens. Zero activations also cover a fused shared expert, if present.
-        symm_buffer.x[:1].zero_()
-        symm_buffer.x_sf[:1].fill_(0x7F7F7F7F)
-        symm_buffer.topk_idx[:1].fill_(-1)
-        symm_buffer.topk_weights[:1].zero_()
     shared_x_sf = shared_block_m = None
     shared_kwargs = {}
     if state.num_shared_experts:
@@ -590,7 +582,7 @@ if _HAS_DEEP_GEMM:
         )
         # Staging widens ids to the buffer's int64; one input dtype keeps one compile.
         topk_ids = topk_ids.to(torch.int32)
-        output = x.new_empty((max(x.shape[0], 1), w.hidden_size), dtype=torch.bfloat16)
+        output = torch.empty_like(x, dtype=torch.bfloat16)
         _run_mega_moe(
             state,
             symm_buffer,
@@ -601,7 +593,7 @@ if _HAS_DEEP_GEMM:
             None if w.swiglu_arg is None else w.swiglu_arg.limit,
             plan["fast_math"],
         )
-        return output[: x.shape[0]]
+        return output
 
     deep_gemm_mxfp4_mega_moe_apply._tokenspeed_warmup = (  # type: ignore[attr-defined]
         warmup_deep_gemm_mxfp4_mega_moe

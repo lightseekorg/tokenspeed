@@ -666,7 +666,8 @@ the speculative verification width. It does not depend on the first batch.
 Post-quantization warmup uses the existing DeepGEMM warmup hook to reserve
 workspace and compile reachable tiles before capture; matching layers reuse
 the backend's workspace and warmup cache. An empty owner still enters the
-collective with one invalid dummy route row and returns a zero-row view.
+collective with zero-row inputs and output, using DeepGEMM's native empty-rank
+support.
 
 `test/runtime/test_qwen4_mxfp4_mega_moe.py` checks model planning, EP checkpoint
 loading, capacity bounds, and (under torch.distributed.run) independent shared
