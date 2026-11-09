@@ -15,6 +15,8 @@ triggers:
 # The model modules this task serves; pull requests changing only other models skip it.
 model_sources:
   - python/tokenspeed/runtime/models/deepseek_v3.py
+  - python/tokenspeed/runtime/models/dflash.py
+  - python/tokenspeed/runtime/models/dspark.py
   - python/tokenspeed/runtime/models/glm5.py
   - python/tokenspeed/runtime/models/kimi_k3.py
   - python/tokenspeed/runtime/models/kimi_k31.py

@@ -2375,15 +2375,59 @@ def model_specific_modules(root: Path, repo_root: Path) -> frozenset[str]:
     return frozenset(listed | defining)
 
 
+def imported_model_modules(path: Path) -> set[str]:
+    """Repo paths of the modules directly under the models package that any
+    import statement in ``path`` names."""
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    package = MODEL_DIRECTORY.removeprefix("python/").replace("/", ".")
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            names.add(node.module)
+            names.update(f"{node.module}.{alias.name}" for alias in node.names)
+    return {
+        f"{MODEL_DIRECTORY}/{name[len(package) + 1 :].split('.')[0]}.py"
+        for name in names
+        if name.startswith(f"{package}.")
+    }
+
+
+def check_model_sources_closed(root: Path, repo_root: Path) -> None:
+    """Fail when a task lists a model module but not a model-specific module it
+    imports, which would let changes to that module skip the task."""
+    model_specific = model_specific_modules(root, repo_root)
+    for path in find_task_files(root):
+        sources = normalize_task(path, repo_root).get("model_sources", [])
+        for source in sources:
+            missing = sorted(
+                (imported_model_modules(repo_root / source) & model_specific)
+                - set(sources)
+            )
+            if missing:
+                raise ValueError(
+                    f"{path}: model_sources lists {source}, which imports "
+                    f"{missing}; list them too"
+                )
+
+
 def path_is_ignored_for_model(
-    path: str, sources: List[str], model_specific: frozenset[str]
+    path: str,
+    sources: List[str],
+    model_specific: frozenset[str],
+    task_text: Optional[str],
 ) -> bool:
     """Return whether a task serving ``sources`` can ignore ``path``: Markdown,
-    a test, or another model's module."""
-    if path.endswith(".md") or any(
-        path.startswith(f"{directory}/") for directory in TEST_DIRECTORIES
-    ):
+    another model's module, or a test. ``task_text`` is the definition of a
+    unit-test task, which cannot ignore the test files it names or any test
+    helper; it is None for a model-test task."""
+    if path.endswith(".md"):
         return True
+    if any(path.startswith(f"{directory}/") for directory in TEST_DIRECTORIES):
+        return task_text is None or (
+            Path(path).name.startswith("test_") and path not in task_text
+        )
     return path in model_specific and path not in sources
 
 
@@ -2410,7 +2454,16 @@ def drop_unaffected_tasks(
             (prefixes is not None and path_is_ignored(path, prefixes))
             or (
                 sources is not None
-                and path_is_ignored_for_model(path, sources, model_specific)
+                and path_is_ignored_for_model(
+                    path,
+                    sources,
+                    model_specific,
+                    (
+                        None
+                        if tasks[config].get("workflow_stage") == "model-test"
+                        else (repo_root / config).read_text(encoding="utf-8")
+                    ),
+                )
             )
             for path in changed
         ):
@@ -2439,6 +2492,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     if args.command == "scan":
         repo_root = Path(args.repo_root).resolve()
         root = (repo_root / args.root).resolve()
+        check_model_sources_closed(root, repo_root)
         matrix = build_matrix(
             root,
             repo_root,

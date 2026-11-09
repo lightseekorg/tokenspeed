@@ -200,11 +200,13 @@ ignore_changes:
 `model_sources` lists the model modules (directly under
 `python/tokenspeed/runtime/models/`) that a model-test task serves, including
 those its model and draft model import. On pull requests the scan drops the
-task when every changed file is Markdown, a test under `test/runtime/` or
-`tokenspeed-kernel/test/`, or another model's module. A module there belongs to
-one model when it defines `EntryClass` or a task lists it; any other module,
-such as `utils.py`, is shared, and a change to it runs every task. A listed
-module that does not exist fails the scan.
+task when every changed file is Markdown, another model's module, or a test
+under `test/runtime/` or `tokenspeed-kernel/test/`; a unit-test task keeps the
+test files its definition names and every test helper. A
+module there belongs to one model when it defines `EntryClass` or a task lists
+it; any other module, such as `utils.py`, is shared, and a change to it runs
+every task. The scan fails when a listed module does not exist, or imports a
+module that belongs to one model without the task listing it too.
 
 ```yaml
 model_sources:

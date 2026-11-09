@@ -1498,8 +1498,9 @@ def test_scan_drops_model_tasks_for_other_models_changes(
     root.mkdir(parents=True)
     for name, sources in [("alpha", ["alpha", "alpha_vision"]), ("beta", ["beta"])]:
         listed = "".join(f"  - {_MODELS}/{source}.py\n" for source in sources)
-        body = _default_body(name, ["b200-1gpu"], f"model_sources:\n{listed}")
-        _write_task_yaml(root, f"{name}.yaml", body)
+        _write_task_yaml(
+            root, f"{name}.yaml", _model_task_body(name, f"model_sources:\n{listed}")
+        )
     _write_task_yaml(root, "other.yaml", _default_body("other", ["b200-1gpu"]))
     changed_file = tmp_path / "changed.txt"
     changed_file.write_text(changed)
@@ -1508,6 +1509,66 @@ def test_scan_drops_model_tasks_for_other_models_changes(
     assert pipeline.main(argv) == 0
     matrix = json.loads(capsys.readouterr().out)
     assert [entry["name"] for entry in matrix["include"]] == expected
+
+
+def _model_task_body(name: str, extra: str) -> str:
+    body = _default_body(name, ["b200-1gpu"], extra)
+    body = body.replace("type: ut", "type: perf")
+    body = body.replace("workflow_stage: unit-test", "workflow_stage: model-test")
+    return body + "perf:\n  command: true\n"
+
+
+def test_scan_keeps_a_model_unit_test_task_for_test_changes(
+    tmp_path, capsys, monkeypatch
+):
+    monkeypatch.delenv(pipeline.EXCLUDED_RUNNER_LABELS_ENV, raising=False)
+    monkeypatch.delenv(pipeline.B200_RUNNER_LABEL_ENV, raising=False)
+    for name, text in _MODEL_FILES.items():
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_text(text)
+    root = tmp_path / "test/ci"
+    root.mkdir(parents=True)
+    listed = f"model_sources:\n  - {_MODELS}/alpha.py\n"
+    runs = "ut:\n  commands:\n    - pytest test/runtime/test_alpha_pd.py\n"
+    _write_task_yaml(root, "ut.yaml", _default_body("ut", ["b200-1gpu"], listed + runs))
+    _write_task_yaml(root, "eval.yaml", _model_task_body("eval", listed))
+    for changed, expected in [
+        # The unit-test task runs this test; the eval never reads tests.
+        ("test/runtime/test_alpha_pd.py\n", ["ut"]),
+        ("test/runtime/pd_helpers.py\n", ["ut"]),
+        ("test/runtime/test_other.py\n", []),
+    ]:
+        changed_file = tmp_path / "changed.txt"
+        changed_file.write_text(changed)
+        argv = ["scan", "--repo-root", str(tmp_path), "--trigger", "per-commit"]
+        argv += ["--changed-files", str(changed_file)]
+        assert pipeline.main(argv) == 0
+        matrix = json.loads(capsys.readouterr().out)
+        assert [entry["name"] for entry in matrix["include"]] == expected
+
+
+def test_scan_fails_when_a_listed_module_imports_an_unlisted_model(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv(pipeline.EXCLUDED_RUNNER_LABELS_ENV, raising=False)
+    for name, text in _MODEL_FILES.items():
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_text(text)
+    (tmp_path / _MODELS / "alpha.py").write_text(
+        "def build():\n"
+        "    from tokenspeed.runtime.models.gamma import Gamma\n"
+        "    from tokenspeed.runtime.models import utils\n"
+        "EntryClass = Alpha\n"
+    )
+    root = tmp_path / "test/ci"
+    root.mkdir(parents=True)
+    listed = f"model_sources:\n  - {_MODELS}/alpha.py\n"
+    _write_task_yaml(root, "eval.yaml", _model_task_body("eval", listed))
+    # gamma.py defines EntryClass; the shared utils.py need not be listed.
+    with pytest.raises(
+        ValueError, match=r"imports \['python/tokenspeed/runtime/models/gamma.py'\]"
+    ):
+        pipeline.main(["scan", "--repo-root", str(tmp_path)])
 
 
 def test_scan_fails_on_a_missing_model_source(tmp_path, monkeypatch):
