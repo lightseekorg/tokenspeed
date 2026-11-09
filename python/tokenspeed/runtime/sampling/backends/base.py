@@ -74,8 +74,9 @@ class SamplingBackendConfig:
     # Draft-prob rejection sampling: the FlashInfer backends gather the step
     # drafters' recorded distributions by pool index into a persistent
     # [max_pad_bs, N, vocab] fp32 buffer, and the triton backend reads the
-    # DFlash2 walk's sparse q (SamplingBatchInfo.draft_q) in place; both run
-    # coin * q(x) < p(x) instead of the target-only rule. Selects the verify
+    # recorded distributions or the DFlash2 walk's sparse q
+    # (SamplingBatchInfo.draft_q) in place; both run coin * q(x) < p(x)
+    # instead of the target-only rule. Selects the verify
     # rule, so it is explicit.
     enable_speculative_sampling: bool
 
@@ -86,6 +87,12 @@ class SamplingBackendConfig:
     # Selected-token logprob recipe (see
     # ServerArgs.logprob_order). Behaviour-selecting, so no default either.
     logprob_order: str
+
+    # Sampled draft trees (--enable-speculative-sampling with a draft tree):
+    # verify accepts each tree by recursive rejection against its q table
+    # (TreeVerifyBatch.draft_q). The triton backend sizes its tree scratch by
+    # it; the FlashInfer backends always hold theirs. Off when no tree samples.
+    sampled_draft_trees: bool = False
 
     enable_nan_detection: bool = False
 
@@ -145,6 +152,10 @@ class SamplingBackendConfig:
             enable_speculative_sampling=(
                 server_args.enable_speculative_sampling
                 and not server_args.speculative_draft_tree
+            ),
+            sampled_draft_trees=(
+                server_args.enable_speculative_sampling
+                and server_args.speculative_draft_tree
             ),
             spec_reject_draft_prob_threshold=(
                 server_args.spec_reject_draft_prob_threshold
@@ -486,7 +497,7 @@ class SamplingBackend(ABC):
         raise NotImplementedError(
             f"{type(self).__name__} has no draft-prob verify; "
             "--enable-speculative-sampling needs the flashinfer, "
-            "flashinfer_full or sonic sampling backend (triton for DFLASH)"
+            "flashinfer_full, sonic or triton sampling backend"
         )
 
     def maybe_broadcast(self, *tensors: torch.Tensor) -> None:

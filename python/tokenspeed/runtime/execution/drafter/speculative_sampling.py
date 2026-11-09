@@ -46,7 +46,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
-from tokenspeed_kernel.ops.sampling.flashinfer import softmax
+from tokenspeed_kernel.ops.sampling import softmax
 from tokenspeed_kernel.ops.sampling.triton import (
     DRAFT_SAMPLE_OFFSET_SALT,
     gumbel_sample_from_pools,

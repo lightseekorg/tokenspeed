@@ -20,6 +20,11 @@
 
 """Triton sampling kernel entry points."""
 
+from tokenspeed_kernel.ops.sampling.triton.draft_prob_verify import (
+    chain_verify_draft_probs,
+    target_probs_from_pools,
+    tree_verify_coins,
+)
 from tokenspeed_kernel.ops.sampling.triton.draft_tree import (
     draft_tree_expand,
     draft_tree_finalize,
@@ -69,6 +74,9 @@ from .topp import gumbel_sample_top_p_parallel_from_pools
 
 __all__ = [
     "_QRITA_PERCENTILE_TO_STD_TABLE",
+    "chain_verify_draft_probs",
+    "target_probs_from_pools",
+    "tree_verify_coins",
     "gather_and_expand_scalars",
     "gumbel_sample_from_pools",
     "gumbel_sample_from_pools_compact",

@@ -201,9 +201,7 @@ class FlashInferSamplingBackend(SamplingBackend):
         self._init_dp_sampling(config)
         self._init_shared_buffers(config)
         self._init_pool_scalars(config)
-        self._tree_sampler = TreeRejectionSampler(
-            self.speculative_sampling_pools(), self._dp_max_pad_bs, config.device
-        )
+        self._tree_sampler = TreeRejectionSampler(self._dp_max_pad_bs, config.device)
         if _FUSED_TOPK_TOPP_AVAILABLE:
             # Pre-create the fused renorm side stream: cudaStreamCreate is
             # illegal inside capture, and verify() runs from the captured graph.
@@ -975,11 +973,36 @@ class FlashInferSamplingBackend(SamplingBackend):
         predict = self._predict_buf[: bs * n]
         path = self._accept_index_buf[: bs * n].view(bs, n)
         accept_length = self._accept_length_buf[:bs]
+        temperatures, top_ks, top_ps, _, _, _ = gather_and_expand_scalars(
+            sampling_info.req_pool_indices,
+            temperature=self._temperature_pool,
+            top_k=self._top_k_pool,
+            top_p=self._top_p_pool,
+            n=n,
+        )
+        # The target p': the softmax at the request's temperature, cut to its
+        # top-k and top-p and renormalized (a row that cuts nothing keeps its
+        # softmax values). The unfused cut reads every row, so only the fused
+        # one lets greedy rows skip the softmax and the cut.
+        probs = softmax(
+            logits,
+            temperature=temperatures,
+            skip_greedy_top_ks=top_ks if _FUSED_TOPK_TOPP_AVAILABLE else None,
+        )
+        if _FUSED_TOPK_TOPP_AVAILABLE:
+            probs = fused_topk_topp_renorm(probs, top_ks, top_ps, in_place_skip=True)
+        else:
+            cut = top_k_renorm_prob(probs, top_ks)
+            cut = top_p_renorm_prob(cut, top_ps, is_deterministic=True)
+            uncut = (top_ks >= probs.shape[1]) & (top_ps >= 1.0)
+            probs = torch.where(uncut[:, None], probs, cut)
         self._tree_sampler(
+            probs,
             logits,
             candidates,
             tree,
             sampling_info.req_pool_indices,
+            top_ks,
             coins=self._coins_buf[row0 : row0 + bs, :n],
             final_coins=self._final_coins_buf[row0 : row0 + bs],
             path=path,

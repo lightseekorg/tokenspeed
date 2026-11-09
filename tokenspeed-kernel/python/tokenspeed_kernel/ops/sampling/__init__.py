@@ -39,6 +39,7 @@ __all__ = [
     "eagle4_shard_topk",
     "blockwise_logprobs",
     "prepare_sampling_offsets",
+    "softmax",
     "vocab_shard_topk",
     "vocab_shard_topk_supports",
     "vocab_topk_merge",
@@ -133,6 +134,32 @@ def argmax(
         "sampling", "argmax", logits.dtype, kernel_name=kernel.name, **shape_params
     ):
         return kernel(logits, out=out)
+
+
+def softmax(
+    logits: _torch.Tensor,
+    *,
+    temperature: _torch.Tensor,
+    out: _torch.Tensor | None = None,
+) -> _torch.Tensor:
+    """Row-wise fp32 ``softmax(logits / temperature)``.
+
+    Args:
+        logits: ``[M, V]`` fp32, fp16 or bf16 logits.
+        temperature: ``[M]`` fp32 temperature of each row (any shape with
+            ``M`` contiguous elements). A row at temperature 0 scales its
+            logits by 0.
+        out: Optional ``[M, V]`` fp32 destination.
+
+    Returns:
+        ``[M, V]`` fp32 probabilities (``out`` when given).
+    """
+    kernel = select_kernel(
+        "sampling",
+        "softmax",
+        format_signature(logits=dense_tensor_format(logits.dtype)),
+    )
+    return kernel(logits, temperature=temperature, out=out)
 
 
 # The CUDA shard top-k's widest launch: 8-CTA clusters of 1024 threads x 32
@@ -335,4 +362,5 @@ import tokenspeed_kernel.ops.sampling.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.cute_dsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.torch  # noqa: E402,F401
+import tokenspeed_kernel.ops.sampling.triton.softmax  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.triton.vocab_topk  # noqa: E402,F401
