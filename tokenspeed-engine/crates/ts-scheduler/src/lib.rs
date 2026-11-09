@@ -361,6 +361,16 @@ mod ffi {
         capacity_blocks: Vec<i64>,
     }
 
+    /// What the prefill-delay vote reads from one rank
+    /// (`Scheduler::ProbePrefillGate`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct PrefillGateProbe {
+        /// A resident chunk, or new prefill work at or below the watermark.
+        wants_prefill: bool,
+        /// Decode work the round would otherwise run.
+        has_decode_work: bool,
+    }
+
     /// Request and page counts.
     #[derive(Debug, Clone, PartialEq)]
     struct SchedulerSizes {
@@ -421,7 +431,11 @@ mod ffi {
         type ExecutionPlan;
 
         fn submit_requests(scheduler: Pin<&mut Scheduler>, specs: &[RequestSpec]) -> Result<()>;
-        fn next_execution_plan(scheduler: Pin<&mut Scheduler>) -> UniquePtr<ExecutionPlan>;
+        fn next_execution_plan(
+            scheduler: Pin<&mut Scheduler>,
+            allow_prefill: bool,
+            apply_prefill_watermark: bool,
+        ) -> UniquePtr<ExecutionPlan>;
         fn advance(scheduler: Pin<&mut Scheduler>, events: &[ForwardEvent]) -> Result<()>;
         fn advance_head(
             scheduler: Pin<&mut Scheduler>,
@@ -439,6 +453,7 @@ mod ffi {
         fn admission_snapshot(scheduler: &Scheduler, token_step: i32) -> AdmissionSnapshot;
         fn sizes(scheduler: &Scheduler) -> SchedulerSizes;
         fn active_lcm_blocks(scheduler: &Scheduler) -> i32;
+        fn probe_prefill_gate(scheduler: &Scheduler) -> PrefillGateProbe;
         fn cache_group_pages(scheduler: &Scheduler, group_id: &str) -> CacheGroupPages;
         fn drain_kv_events(scheduler: Pin<&mut Scheduler>) -> Vec<KvEventView>;
         fn request_token_size(scheduler: &Scheduler, request_id: &str) -> i32;
@@ -466,9 +481,10 @@ mod ffi {
 
 pub use ffi::{
     BlockTableView, CacheEvent, CacheEventKind, CacheGroupPages, CacheOpKind, CacheOpView,
-    ForwardBatchView, ForwardEvent, ForwardEventKind, KvEventView, PrefixHitView, RequestSpec,
-    SchedulerAbortView, SchedulerSizes, StorageCancellationView, StorageDoneView, StorageKeyView,
-    StorageOpKind, StorageOpView, StorageStatsView, StorageTickView, TransferBatchView,
+    ForwardBatchView, ForwardEvent, ForwardEventKind, KvEventView, PrefillGateProbe, PrefixHitView,
+    RequestSpec, SchedulerAbortView, SchedulerSizes, StorageCancellationView, StorageDoneView,
+    StorageKeyView, StorageOpKind, StorageOpView, StorageStatsView, StorageTickView,
+    TransferBatchView,
 };
 
 /// What advances the scheduler at the head of a round: with L3, the agreed
@@ -572,9 +588,20 @@ impl Scheduler {
         ffi::submit_requests(self.pinned(), specs)
     }
 
-    /// Plan the next round.
-    pub fn next_execution_plan(&mut self) -> ExecutionPlan {
-        ExecutionPlan(ffi::next_execution_plan(self.pinned()))
+    /// Plan the next round. `allow_prefill` gates the fused role's prefill
+    /// work; `apply_prefill_watermark` checks pressure before new admissions
+    /// when delay is enabled. Resident chunks ignore pressure, and PD roles
+    /// ignore both options (see `docs/design/prefill-delay.md`).
+    pub fn next_execution_plan(
+        &mut self,
+        allow_prefill: bool,
+        apply_prefill_watermark: bool,
+    ) -> ExecutionPlan {
+        ExecutionPlan(ffi::next_execution_plan(
+            self.pinned(),
+            allow_prefill,
+            apply_prefill_watermark,
+        ))
     }
 
     /// Feed forward results back. Fails, applying none of `events`' later
@@ -626,6 +653,11 @@ impl Scheduler {
     /// context; a caller on the round's path reuses it.
     pub fn active_lcm_blocks(&self) -> i32 {
         ffi::active_lcm_blocks(self.get())
+    }
+
+    /// What the prefill-delay vote should publish for this rank.
+    pub fn probe_prefill_gate(&self) -> PrefillGateProbe {
+        ffi::probe_prefill_gate(self.get())
     }
 
     /// One cache group's page counts.

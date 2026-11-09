@@ -424,6 +424,16 @@ class ServerArgs:
     # off (docs/design/scheduler.md §3.3).
     prefill_decode_interval: int = 0
     enable_short_prefill_first: bool = False
+    # The fused engine's prefill-delay gate (docs/design/prefill-delay.md):
+    # prefill work is held for a window of decode rounds and then batched, so
+    # a scattered prompt does not interrupt every rank's decode. Unset keeps
+    # the engine planning prefill every round.
+    # Rounds between ALL attempt points: every rank that would decode also
+    # has prefill work, so the group's prefills land in the same rounds.
+    prefill_attempt_interval: int | None = None
+    # Rounds between ANY attempt points: one rank's backlog opens the gate,
+    # bounding how long a prefill waits. Must be >= prefill_attempt_interval.
+    prefill_any_attempt_interval: int | None = None
     # Opt-in: the prefill forward that spans a long prompt's last prefix-page
     # boundary before its replay tail (normally the final token) also writes
     # the recurrent state there, where hybrid models publish a checkpoint;
@@ -2736,6 +2746,7 @@ class ServerArgs:
 
         self.validate_petit_moe_options()
         self.validate_rank_emulation()
+        self.validate_prefill_delay()
 
         if (
             self.max_num_seqs is not None
@@ -2791,6 +2802,45 @@ class ServerArgs:
             # Enable PDL for fused attention kernels.
             os.environ.setdefault("TRTLLM_ENABLE_PDL", "1")
         os.environ.setdefault("TLLM_LOG_LEVEL", "INFO")
+
+    def validate_prefill_delay(self) -> None:
+        intervals = self.prefill_delay
+        if intervals is None:
+            return
+        attempt, any_attempt = intervals
+        if attempt < 1:
+            raise ValueError(f"--prefill-attempt-interval must be >= 1, got {attempt}")
+        if any_attempt < attempt:
+            raise ValueError(
+                "--prefill-any-attempt-interval must be >= --prefill-attempt-interval "
+                f"(got {any_attempt} < {attempt})"
+            )
+        if self.disaggregation_mode != "null":
+            raise ValueError(
+                "the prefill delay gate applies to a fused engine "
+                "(--disaggregation-mode null) only"
+            )
+        if self.prefill_decode_interval:
+            raise ValueError(
+                "--prefill-decode-interval cannot be combined with "
+                "--prefill-attempt-interval and --prefill-any-attempt-interval: "
+                "local decode intervals and the attention-DP gate use different "
+                "prefill windows"
+            )
+
+    @property
+    def prefill_delay(self) -> tuple[int, int] | None:
+        """The gate intervals, or None; reject an incompletely configured pair."""
+        attempt = self.prefill_attempt_interval
+        any_attempt = self.prefill_any_attempt_interval
+        if attempt is None and any_attempt is None:
+            return None
+        if attempt is None or any_attempt is None:
+            raise ValueError(
+                "--prefill-attempt-interval and --prefill-any-attempt-interval "
+                "must be set together"
+            )
+        return (attempt, any_attempt)
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -3278,6 +3328,27 @@ class ServerArgs:
                 "prompt length; an undersized budget fails startup. Omit to keep "
                 "the existing unbounded batch policy."
             ),
+        )
+        parser.add_argument(
+            "--prefill-attempt-interval",
+            metavar="ROUNDS",
+            type=int,
+            default=ServerArgs.prefill_attempt_interval,
+            help="Prefill delay: rounds between ALL attempt points. On an "
+            "ALL point the attention-DP ranks that would decode and also "
+            "have prefill work open the group's prefill gate together, so "
+            "the group batches prefills instead of each rank interrupting "
+            "the others' decode rounds alone. Unset plans prefill every "
+            "round. Requires --prefill-any-attempt-interval.",
+        )
+        parser.add_argument(
+            "--prefill-any-attempt-interval",
+            metavar="ROUNDS",
+            type=int,
+            default=ServerArgs.prefill_any_attempt_interval,
+            help="Prefill delay: rounds between ANY attempt points, where "
+            "one rank's backlog opens the gate, bounding how long a prefill "
+            "waits. Must be >= --prefill-attempt-interval.",
         )
         # Other runtime options
         parser.add_argument(
