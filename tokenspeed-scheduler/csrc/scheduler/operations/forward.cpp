@@ -1895,9 +1895,11 @@ struct PendingPrefill {
     std::int32_t remaining_tokens;
 };
 
-Request* popShortPrefill(std::vector<PendingPrefill>& pending) {
+// The next prompt by rank, with the work it was ranked by; a null request once
+// none is left.
+PendingPrefill popShortPrefill(std::vector<PendingPrefill>& pending) {
     if (pending.empty()) {
-        return nullptr;
+        return PendingPrefill{nullptr, 0};
     }
     // Reevaluate age after every admission, including inside one batch.
     // min_element preserves submission order for equal work or protected requests.
@@ -1910,9 +1912,9 @@ Request* popShortPrefill(std::vector<PendingPrefill>& pending) {
             }
             return !aged_a && a.remaining_tokens < b.remaining_tokens;
         });
-    Request* request = selected->request;
+    const PendingPrefill popped = *selected;
     pending.erase(selected);
-    return request;
+    return popped;
 }
 
 }  // namespace
@@ -1968,7 +1970,7 @@ std::vector<Scheduler::WholePrompt> Scheduler::wholePromptsAfter(std::span<Reque
         }
         ++probes;
         const std::optional<std::int32_t> tokens = wholePromptTokens(*request, resident_holder, has_state_group);
-        if (tokens && *tokens <= config_.prefill_chunk_yield_tokens) {
+        if (tokens && *tokens <= std::max(config_.prefill_chunk_yield_tokens, build.token_budget)) {
             whole_prompts.push_back(WholePrompt{
                 .index = index,
                 .request = request,
@@ -1991,7 +1993,10 @@ std::vector<Scheduler::WholePrompt> Scheduler::carriedPrompts(std::span<const Wh
     std::int64_t tokens = 0;
     std::int64_t pages = 0;
     for (const WholePrompt& prompt : whole_prompts) {
-        if (prompt.index < from || !prompt.request->Is<fsm::Submitted>() || build.Scheduled(*prompt.request)) {
+        // A prompt larger than the knob is never given way to; only the
+        // budget a chunk leaves on its own may take it (carryWholePrompts).
+        if (prompt.index < from || prompt.tokens > config_.prefill_chunk_yield_tokens ||
+            !prompt.request->Is<fsm::Submitted>() || build.Scheduled(*prompt.request)) {
             continue;
         }
         const std::size_t count = carried.size() + 1;
@@ -2080,10 +2085,16 @@ bool Scheduler::prefillAllowed(const Request& request, const PlanBuild& build) c
 // of the waiting prompts it can carry whole (carriedPrompts, from the round's
 // once-probed wholePromptsAfter list; for a new prompt only those behind it),
 // and after it keeps the head of line those prompts are admitted complete in
-// the same forward (carryWholePrompts), their rows ahead of its own. It is
-// still admitted first, and a resident's chunk that fails admission still
-// stops everything behind it. A chunk whose admission compacted carries none:
-// they would be later admissions in the compaction's plan.
+// the same forward (carryWholePrompts), their rows ahead of its own. Any
+// chunk that keeps the head of line then fills the budget it leaves the same
+// way: from the same list in submission order or, with
+// enable_short_prefill_first, from the new prompts still ranked, in rank
+// order (popShortPrefill; for a resident's chunk ranked after its
+// admission), so a protected prompt goes first. The carry keeps submission
+// order either way. The chunk is still admitted first, and a resident's
+// chunk that fails admission still stops everything behind it. A chunk whose
+// admission compacted carries and fills none: they would be later admissions
+// in the compaction's plan.
 void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild& build,
                                          std::span<Request* const> candidates, bool new_prompts_sealed,
                                          std::int32_t decode_reserve) {
@@ -2096,7 +2107,9 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
         }
         const bool short_work_first = !resident && config_.enable_short_prefill_first;
         std::vector<PendingPrefill> pending;
-        if (short_work_first) {
+        // Ranks the new prompts no phase scheduled yet; also for a resident
+        // chunk's fill, after its admission.
+        const auto rank_new_prompts = [&] {
             pending.reserve(candidates.size());
             for (Request* request : candidates) {
                 if (!request->Is<fsm::Submitted>() || build.Scheduled(*request)) {
@@ -2111,11 +2124,14 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
                                                                             coordinator_.ReplayTokens(hit_tokens);
                 pending.push_back(PendingPrefill{request, remaining});
             }
+        };
+        if (short_work_first) {
+            rank_new_prompts();
         }
         auto fifo = candidates;
         const auto next_request = [&]() -> Request* {
             if (short_work_first) {
-                return popShortPrefill(pending);
+                return popShortPrefill(pending).request;
             }
             if (fifo.empty()) {
                 return nullptr;
@@ -2142,6 +2158,13 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
                 // an earlier newcomer may have crossed the watermark.
                 return;
             }
+            // The carry takes the prompts submitted after this one, in
+            // submission order, even when it was ranked; so does the fill
+            // when the prompts are not ranked.
+            std::size_t from = 0;
+            if (config_.prefill_chunk_yield_tokens > 0 && !resident) {
+                from = static_cast<std::size_t>(std::ranges::find(candidates, request) - candidates.begin()) + 1;
+            }
             // Whether this chunk may hold the head of line: a resident's rest
             // past the budget, or a new prompt that could not finish it even
             // with no hit replayed.
@@ -2149,12 +2172,6 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
             std::int32_t yield_tokens = 0;
             if (config_.prefill_chunk_yield_tokens > 0 &&
                 (resident ? request->UnscheduledPrefillSize() : request->PrefillSize()) > build.token_budget) {
-                // Carry selection keeps submission order, even when this holder was ranked.
-                std::size_t from = 0;
-                if (!resident) {
-                    const auto holder = std::ranges::find(candidates, request);
-                    from = static_cast<std::size_t>(holder - candidates.begin()) + 1;
-                }
                 if (!whole_prompts) {
                     whole_prompts = wholePromptsAfter(candidates, from, build, resident ? request : nullptr);
                 }
@@ -2183,6 +2200,59 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
                 request->TrackScheduledForward();
                 if (holdsHeadOfLine(*request)) {
                     carryWholePrompts(feedback, build, candidates, carried, decode_reserve);
+                    // The budget the chunk still leaves -- whatever ended it
+                    // short of where it gave way, a junction say -- goes to
+                    // other whole prompts, admitted the same way, unless a
+                    // carried one already failed for capacity or the chunk's
+                    // admission compacted.
+                    if (config_.prefill_chunk_yield_tokens > 0 && !build.Full(config_.max_batch_size) &&
+                        !feedback.admission_failed && last_lone_compaction_plan_ != plan_calls_) {
+                        if (config_.enable_short_prefill_first) {
+                            // With the new prompts ranked, in rank order,
+                            // submitted before this prompt or not: a
+                            // protected one first, priority reevaluated after
+                            // each admission. A resident's chunk ranks them
+                            // after its admission, which published what its
+                            // last chunk completed.
+                            if (resident) {
+                                rank_new_prompts();
+                            }
+                            while (!build.Full(config_.max_batch_size) && build.token_budget > 0 &&
+                                   req_pool_allocator_.AvailableSlots() > 0 && !feedback.admission_failed) {
+                                // Drop those the carry admitted (the pop reads
+                                // a waiting prompt's bypasses) and those whose
+                                // ranked work exceeds the budget left: it only
+                                // shrinks, so popping them would only skip
+                                // them, at O(n) a pop.
+                                std::erase_if(pending, [&build](const PendingPrefill& prompt) {
+                                    return build.Scheduled(*prompt.request) ||
+                                           prompt.remaining_tokens > build.token_budget;
+                                });
+                                const PendingPrefill next = popShortPrefill(pending);
+                                if (next.request == nullptr) {
+                                    break;
+                                }
+                                // Admitted on the work it was ranked by; its
+                                // admission probes again.
+                                const WholePrompt prompt{.request = next.request, .tokens = next.remaining_tokens};
+                                carryWholePrompts(feedback, build, candidates, std::span<const WholePrompt>(&prompt, 1),
+                                                  decode_reserve);
+                            }
+                        } else {
+                            // Otherwise those behind it in the round's list.
+                            if (!whole_prompts) {
+                                // Probed after the admission, which published
+                                // what a resident's last chunk completed: none
+                                // is stale.
+                                whole_prompts = wholePromptsAfter(candidates, from, build, /*resident_holder=*/nullptr);
+                            }
+                            const auto behind = std::ranges::find_if(
+                                *whole_prompts, [from](const WholePrompt& prompt) { return prompt.index >= from; });
+                            carryWholePrompts(feedback, build, candidates,
+                                              std::span<const WholePrompt>(behind, whole_prompts->end()),
+                                              decode_reserve);
+                        }
+                    }
                     return;
                 }
             } else if (feedback.admission_failed) {

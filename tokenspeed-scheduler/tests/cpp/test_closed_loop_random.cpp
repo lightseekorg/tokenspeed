@@ -46,7 +46,7 @@
 // admission, stranded suffix or restore) equal the sum of the drain's
 // outcomes, the dead and demoted entries it dropped included. On the P role
 // a plan leaves at most one prefill incomplete, and it runs last, after any
-// whole prompts its chunk gave way to (prefill_chunk_yield_tokens): the
+// whole prompts run beside its chunk (prefill_chunk_yield_tokens): the
 // completing prefills form a prefix of the batch. With KV cache events on,
 // every plan's drain removes only blocks the feed stored and stores none
 // twice, alike on mirrored ranks. Once everything is acknowledged, no Host
@@ -529,7 +529,7 @@ struct ClosedLoop {
         if (role == Role::kP && runs_forward) {
             // At most one prefill is left incomplete, the head of line, and
             // it runs last: the completing prefills form a prefix of the
-            // batch, whole prompts its chunk gave way to included.
+            // batch, whole prompts run beside its chunk included.
             std::optional<std::size_t> incomplete;
             for (std::size_t i = 0; i < batch->NumExtends(); ++i) {
                 if (batch->extend_prefix_lens[i] + batch->input_lengths[i] < batch->prefill_lengths[i]) {

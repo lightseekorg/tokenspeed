@@ -3134,9 +3134,11 @@ class ServerArgs:
             "run complete in the same forward instead of waiting for the long "
             "prompt's chunk to pass. The chunk ends on an earlier page and gives "
             "up fewer than N plus one page, only while such prompts wait and "
-            "only what they take. 0 (default) is off; at most half of "
-            "--chunked-prefill-size. A decode server ignores it. See "
-            "docs/design/scheduler.md section 1.1.",
+            "only what they take; whatever budget it leaves besides (such as "
+            "when it is cut where a cached prefix diverges) goes to other "
+            "bootstrapped prompts that fit whole in it, larger than N or not. "
+            "0 (default) is off; at most half of --chunked-prefill-size. A "
+            "decode server ignores it. See docs/design/scheduler.md section 1.1.",
         )
         parser.add_argument(
             "--enable-short-prefill-first",

@@ -225,9 +225,11 @@ def make_config(
             ``--prefill-chunk-yield-tokens``: the most tokens a prefill chunk
             that cannot finish its prompt gives up, page-aligned, so that
             bootstrapped prompts waiting behind it that fit whole run in the
-            same forward. 0 is off; the prefill role only, at most half of
-            ``max_scheduled_tokens`` (``SchedulerConfig::Validate`` refuses
-            it elsewhere).
+            same forward; whatever budget it leaves besides also goes to
+            other bootstrapped prompts that fit whole in it, larger than this
+            or not. 0 is off; the prefill role only, at most half of
+            ``max_scheduled_tokens`` (``SchedulerConfig::Validate`` refuses it
+            elsewhere).
     """
     if not 0 <= prefix_replay_tokens <= (1 << 31) - 1:
         raise ValueError(
