@@ -1711,6 +1711,45 @@ def test_qwen_recipe_plans_a_draft_layer_wider_than_a_target_attention_layer(
     assert setup.spec.token_capacity > 0
 
 
+def test_qwen_fp8_kv_cache_narrows_attention_planes_only() -> None:
+    """An FP8 KV cache halves the attention layers' K/V bytes; GDN SSM and conv states keep their dtypes."""
+    bf16, fp8 = (
+        _qwen_gdn_setup(2, target_kv_dtype=dtype).spec
+        for dtype in (torch.bfloat16, torch.float8_e4m3fn)
+    )
+
+    def dtypes(spec):
+        return {
+            suffix: {
+                field.dtype
+                for field in spec.memory_plan.fields
+                if field.field_id.endswith(suffix)
+            }
+            for suffix in (".k", ".v", ".ssm", ".conv")
+        }
+
+    def payload(spec, suffix):
+        return sum(
+            field.payload_bytes
+            for field in spec.memory_plan.fields
+            if field.field_id.endswith(suffix)
+        )
+
+    # FP8 is stored as uint8 (scatter writes have no fp8 kernel).
+    assert dtypes(bf16) == {
+        ".k": {"bfloat16"},
+        ".v": {"bfloat16"},
+        ".ssm": {"float32"},
+        ".conv": {"bfloat16"},
+    }
+    assert dtypes(fp8) == {**dtypes(bf16), ".k": {"uint8"}, ".v": {"uint8"}}
+    for suffix in (".k", ".v"):
+        assert 2 * payload(fp8, suffix) == payload(bf16, suffix)
+    for suffix in (".ssm", ".conv"):
+        assert payload(fp8, suffix) == payload(bf16, suffix)
+    assert fp8.token_capacity > bf16.token_capacity
+
+
 def test_qwen_state_blocks_carry_no_attention_planes() -> None:
     """A GDN state block holds its SSM states and conv windows only; KV pages pad by the conv windows."""
     plan = _qwen_gdn_setup(2, gdn_layers_per_block=2).spec.memory_plan

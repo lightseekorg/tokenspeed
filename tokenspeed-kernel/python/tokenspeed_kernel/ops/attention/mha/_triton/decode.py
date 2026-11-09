@@ -145,7 +145,8 @@ def _fwd_kernel_stage1(
                 mask=(offs_n[:, None] < split_kv_end) & (mask_d[None, :]),
                 other=0.0,
             )
-            qk = tl.sum(q[None, :] * k, 1)
+            # K/V may be stored narrower than q (fp8 KV cache); upcast in registers.
+            qk = tl.sum(q[None, :] * k.to(q.dtype), 1)
             qk *= sm_scale
 
             if logit_cap > 0:
@@ -168,7 +169,7 @@ def _fwd_kernel_stage1(
             re_scale = tl.exp(e_max - n_e_max)
             p = tl.exp(qk - n_e_max)
             acc *= re_scale
-            acc += tl.sum(p[:, None] * v, 0)
+            acc += tl.sum(p[:, None] * v.to(q.dtype), 0)
 
             e_sum = e_sum * re_scale + tl.sum(p, 0)
             e_max = n_e_max
@@ -427,7 +428,7 @@ def _fwd_grouped_kernel_stage1(
             re_scale = tl.exp(e_max - n_e_max)
             p = tl.exp(qk - n_e_max[:, None])
             acc *= re_scale[:, None]
-            acc += tl.dot(p.to(v.dtype), v)
+            acc += tl.dot(p.to(q.dtype), v.to(q.dtype))
 
             e_sum = e_sum * re_scale + tl.sum(p, 1)
             e_max = n_e_max
@@ -997,7 +998,7 @@ def _fwd_folded_kernel_stage1(
         safe_max = tl.where(n_e_max == float("-inf"), 0.0, n_e_max)
         re_scale = tl.exp2(e_max - safe_max)
         p = tl.exp2(qk - safe_max[:, None])
-        acc = acc * re_scale[:, None] + tl.dot(p.to(v.dtype), v)
+        acc = acc * re_scale[:, None] + tl.dot(p.to(q.dtype), v.to(q.dtype))
         e_sum = e_sum * re_scale + tl.sum(p, 1)
         e_max = n_e_max
 

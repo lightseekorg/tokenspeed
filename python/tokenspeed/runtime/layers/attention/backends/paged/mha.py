@@ -30,6 +30,7 @@ from tokenspeed_kernel.ops.attention.mha import (
     mha_decode_takes_schedule,
     mha_decode_with_kvcache,
     mha_extend_with_kvcache,
+    mha_fp8_kvcache_query_dtype,
     mha_plan,
     mha_prefill,
 )
@@ -171,6 +172,11 @@ class MHAAttnBackend(PagedAttentionBackend):
         # seq_lens (block_decode_expansion).
         self.draft_block_decode = bool(config.draft_block_decode)
 
+        # Query dtype of each unit-scale FP8 cache read, per (kernel mode,
+        # layer, sinks): FP8 when a kernel reads FP8 queries, else the
+        # activation dtype (see mha_fp8_kvcache_query_dtype).
+        self._fp8_query_dtypes: dict[tuple[str, int, bool | None], torch.dtype] = {}
+
         self.forward_decode_metadata: MHADecodeMetadata | None = None
         self.forward_extend_metadata: MHAExtendMetadata | None = None
         # The per-forward split schedule (see the class docstring), whether
@@ -231,11 +237,40 @@ class MHAAttnBackend(PagedAttentionBackend):
     def query_dtype(
         self, layer: PagedAttention, forward_mode: ForwardMode, activation: torch.dtype
     ) -> torch.dtype:
-        # Decode reads an FP8 cache with FP8 queries. A fresh prefill attends
-        # the activation-dtype K/V rows instead, so extend converts its own.
-        if self.is_fp8 and forward_mode.is_decode():
-            return self.kv_cache_dtype
-        return activation
+        # Decode reads an FP8 cache with FP8 queries where a kernel takes them.
+        # A fresh prefill attends the activation-dtype K/V rows instead, so
+        # extend converts its own. A bound draft tree's cascade reads the
+        # activation-dtype query (see _tree_cascade).
+        if (
+            not self.is_fp8
+            or not forward_mode.is_decode()
+            or self.tree_verify is not None
+            or self.tree_lane_step_active
+        ):
+            return activation
+        # Sinks are passed per call, not known here; forward_decode settles the
+        # dtype with them.
+        return self._fp8_query_dtype("mha_decode_with_kvcache", layer, sinks=None)
+
+    def _fp8_query_dtype(
+        self, mode: str, layer: PagedAttention, *, sinks: bool | None
+    ) -> torch.dtype:
+        key = (mode, layer.layer_id, sinks)
+        dtype = self._fp8_query_dtypes.get(key)
+        if dtype is None:
+            dtype = mha_fp8_kvcache_query_dtype(
+                mode=mode,
+                kv_cache_dtype=self.kv_cache_dtype,
+                activation_dtype=self.qkv_dtype,
+                head_dim=layer.qk_head_dim,
+                page_size=self.kernel_page_size,
+                window_left=layer.sliding_window_size,
+                logit_cap=layer.logit_cap,
+                sinks=sinks,
+                solution=self.kernel_solution,
+            )
+            self._fp8_query_dtypes[key] = dtype
+        return dtype
 
     # ------------------------------------------------------------------
     # Metadata
@@ -492,18 +527,22 @@ class MHAAttnBackend(PagedAttentionBackend):
                 q, layer, token_to_kv_pool, tree, sinks=kwargs.get("sinks")
             )
 
+        sinks = kwargs.get("sinks")
         scale_kwargs = {}
         if self.is_mxfp8:
             q, q_sf = self._quantize_mxfp8_tokens(q)
             k_sf, v_sf = token_to_kv_pool.get_kv_scale_buffer(layer.layer_id)
             scale_kwargs = dict(q_scale=q_sf, k_scale=k_sf, v_scale=v_sf)
         elif self.is_fp8:
-            # A no-op on the prologue's decode query (see query_dtype).
-            q = q.to(self.kv_cache_dtype)
+            # Usually a no-op on the prologue's decode query (see query_dtype).
+            q = q.to(
+                self._fp8_query_dtype(
+                    "mha_decode_with_kvcache", layer, sinks=sinks is not None
+                )
+            )
             scale_kwargs = _fp8_scale_kwargs(layer)
 
         k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
-        sinks = kwargs.get("sinks")
         schedule = self._decode_schedule(
             layer,
             q,
@@ -532,14 +571,20 @@ class MHAAttnBackend(PagedAttentionBackend):
         return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def tree_support(self) -> TreeSupport:
-        if self.kv_cache_dtype == self.qkv_dtype:
+        # The cascade's Triton prefix and window kernels read the model dtype or
+        # a unit-scale FP8 E4M3 cache (widened under the model-dtype query).
+        if self.kv_cache_dtype == self.qkv_dtype or (
+            self.kv_cache_dtype == torch.float8_e4m3fn and not self.is_mxfp8
+        ):
             return TreeSupport(verify_blocker=None, draft_blocker=None)
         name = type(self).__name__
         return TreeSupport(
-            verify_blocker=f"{name} reads the verify window K/V in the model dtype; "
-            f"kv_cache_dtype {self.kv_cache_dtype} is not supported",
-            draft_blocker=f"{name} reads the lane window K/V in the model dtype; "
-            f"kv_cache_dtype {self.kv_cache_dtype} is not supported",
+            verify_blocker=f"{name} reads the verify window K/V in the model dtype "
+            f"or FP8 E4M3; kv_cache_dtype {self.kv_cache_dtype}"
+            f"{' (MXFP8)' if self.is_mxfp8 else ''} is not supported",
+            draft_blocker=f"{name} reads the lane window K/V in the model dtype "
+            f"or FP8 E4M3; kv_cache_dtype {self.kv_cache_dtype}"
+            f"{' (MXFP8)' if self.is_mxfp8 else ''} is not supported",
         )
 
     def _tree_cascade(
@@ -560,7 +605,15 @@ class MHAAttnBackend(PagedAttentionBackend):
         A sliding-window draft layer sees the window frozen at the round's
         prefix end: each lane decodes the prefix alone (its query placed at the
         prefix's last key), so no prefix tail remains for the window kernel.
+
+        ``q`` stays in the model dtype (query_dtype); with an FP8 cache both
+        kernels widen the K/V tiles under it.
         """
+        if layer.fp8_kv_scales is not None:
+            raise NotImplementedError(
+                "draft trees read a unit-scale FP8 cache only; per-tensor "
+                "scales have no tree path yet"
+            )
         causal_prefix = layer.sliding_window_size < 0
         # Only lane rows (their own tables) decode a sliding window.
         if sinks is not None or (not causal_prefix and tree.row_page_table is None):
@@ -733,7 +786,11 @@ class MHAAttnBackend(PagedAttentionBackend):
             k_sf, v_sf = token_to_kv_pool.get_kv_scale_buffer(layer.layer_id)
             scale_kwargs = dict(q_scale=q_sf, k_scale=k_sf, v_scale=v_sf)
         elif self.is_fp8:
-            q = q.to(self.kv_cache_dtype)
+            q = q.to(
+                self._fp8_query_dtype(
+                    "mha_extend_with_kvcache", layer, sinks=sinks is not None
+                )
+            )
             scale_kwargs = _fp8_scale_kwargs(layer)
 
         k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)

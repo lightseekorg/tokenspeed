@@ -702,7 +702,7 @@ measured cost data (or, for chains, from the width table where it applies):
 how deep the draft grows and how many nodes the target verifies. Measure the cost data with the exec mode `2` driver
 (`python -m tokenspeed.runtime.execution.drafter.eagle_harness.measure_run --help`),
 then serve with `--speculative-data-path` set to its run directory and the
-same draft shape, TP size, attention backends and state dtype. Exec mode
+same draft shape, TP size, attention backends, state dtype and KV cache dtype. Exec mode
 `1` serves evaluation clients that write their batch size to
 `<data path>/config/benchmark_config.json`: it runs like exec mode `0`,
 except that a tree round far smaller than that batch drafts only the root's
