@@ -87,6 +87,7 @@ def _fwd_kernel_stage1(
     logit_cap: tl.constexpr,
     Lk: tl.constexpr,
     Lv: tl.constexpr,
+    DIRECT_OUTPUT: tl.constexpr,
 ):
     cur_q = tl.program_id(0)
     cur_batch = cur_q // MAX_SEQLEN_Q
@@ -114,7 +115,7 @@ def _fwd_kernel_stage1(
     # iterations at absolute token indices.
     sink_len = tl.minimum(WINDOW_SINK, kv_start_offset)
     cur_batch_seq_len = cur_batch_seq_len + sink_len
-    kv_splits = tl.load(num_kv_splits + cur_batch)
+    kv_splits = 1 if DIRECT_OUTPUT else tl.load(num_kv_splits + cur_batch)
 
     off_q = cur_q * stride_qbs + cur_head * stride_qh + offs_d
 
@@ -197,16 +198,20 @@ def _fwd_kernel_stage1(
             mask=(mask_dv),
         )
 
-        offs_mid_o_1 = (
-            cur_q * stride_mid_ob
-            + cur_head * stride_mid_oh
-            + split_kv_id * stride_mid_os
-        ) // Lv
+        if not DIRECT_OUTPUT:
+            offs_mid_o_1 = (
+                cur_q * stride_mid_ob
+                + cur_head * stride_mid_oh
+                + split_kv_id * stride_mid_os
+            ) // Lv
 
-        tl.store(
-            Att_Lse + offs_mid_o_1,
-            e_max + tl.log(e_sum),
-        )
+            tl.store(
+                Att_Lse + offs_mid_o_1,
+                e_max + tl.log(e_sum),
+            )
+    elif DIRECT_OUTPUT:
+        offs_out = cur_q * stride_mid_ob + cur_head * stride_mid_oh + offs_dv
+        tl.store(Att_Out + offs_out, float("nan"), mask=mask_dv)
 
 
 def _decode_att_m_fwd(
@@ -226,6 +231,8 @@ def _decode_att_m_fwd(
     window_sink,
     sm_scale,
     logit_cap,
+    *,
+    direct_output=False,
 ):
     platform = current_platform()
 
@@ -272,7 +279,7 @@ def _decode_att_m_fwd(
         v_buffer.stride(0) if v_buffer.ndim == 4 else v_buffer.stride(0) * page_size,
         att_out.stride(0),
         att_out.stride(1),
-        att_out.stride(2),
+        0 if direct_output else att_out.stride(2),
         page_table_stride_b,
         page_size,
         MAX_SEQLEN_Q=max_seqlen_q,
@@ -288,6 +295,7 @@ def _decode_att_m_fwd(
         num_stages=2,
         Lk=Lk,
         Lv=Lv,
+        DIRECT_OUTPUT=direct_output,
     )
 
 
@@ -331,6 +339,7 @@ def _fwd_grouped_kernel_stage1(
     logit_cap: tl.constexpr,
     Lk: tl.constexpr,
     Lv: tl.constexpr,
+    DIRECT_OUTPUT: tl.constexpr,
 ):
     cur_q = tl.program_id(0)
     cur_batch = cur_q // MAX_SEQLEN_Q
@@ -364,7 +373,7 @@ def _fwd_grouped_kernel_stage1(
     # Sinks: see _fwd_kernel_stage1.
     sink_len = tl.minimum(WINDOW_SINK, kv_start_offset)
     cur_batch_seq_len = cur_batch_seq_len + sink_len
-    kv_splits = tl.load(num_kv_splits + cur_batch)
+    kv_splits = 1 if DIRECT_OUTPUT else tl.load(num_kv_splits + cur_batch)
 
     offs_q = cur_q * stride_qbs + cur_head[:, None] * stride_qh + offs_d[None, :]
 
@@ -468,16 +477,24 @@ def _fwd_grouped_kernel_stage1(
             mask=(mask_h[:, None]) & (mask_dv[None, :]),
         )
 
-        offs_mid_o_1 = (
-            cur_q * stride_mid_ob
-            + cur_head * stride_mid_oh
-            + split_kv_id * stride_mid_os
-        ) // Lv
+        if not DIRECT_OUTPUT:
+            offs_mid_o_1 = (
+                cur_q * stride_mid_ob
+                + cur_head * stride_mid_oh
+                + split_kv_id * stride_mid_os
+            ) // Lv
 
+            tl.store(
+                Att_Lse + offs_mid_o_1,
+                e_max + tl.log(e_sum),
+                mask=mask_h,
+            )
+    elif DIRECT_OUTPUT:
+        offs_out = (
+            cur_q * stride_mid_ob + cur_head[:, None] * stride_mid_oh + offs_dv[None, :]
+        )
         tl.store(
-            Att_Lse + offs_mid_o_1,
-            e_max + tl.log(e_sum),
-            mask=mask_h,
+            Att_Out + offs_out, float("nan"), mask=mask_h[:, None] & mask_dv[None, :]
         )
 
 
@@ -498,6 +515,8 @@ def _decode_grouped_att_m_fwd(
     window_sink,
     sm_scale,
     logit_cap,
+    *,
+    direct_output=False,
 ):
     platform = current_platform()
 
@@ -557,7 +576,7 @@ def _decode_grouped_att_m_fwd(
         v_buffer.stride(0) if v_buffer.ndim == 4 else v_buffer.stride(0) * page_size,
         att_out.stride(0),
         att_out.stride(1),
-        att_out.stride(2),
+        0 if direct_output else att_out.stride(2),
         page_table_stride_b,
         page_size,
         MAX_SEQLEN_Q=max_seqlen_q,
@@ -576,6 +595,7 @@ def _decode_grouped_att_m_fwd(
         num_stages=num_stages,
         Lk=Lk,
         Lv=Lv,
+        DIRECT_OUTPUT=direct_output,
         **extra_kargs,
     )
 
@@ -1378,6 +1398,33 @@ def _triton_mha_decode_with_kvcache_impl(
             lse_out=lse,
         )
         return (out, lse) if return_lse else out
+    if sinks is None and window_sink == 0:
+        # With one KV split and no sink, stage 2 only casts and stores the result.
+        launch = (
+            _decode_att_m_fwd
+            if q.shape[1] == v_cache.shape[2]
+            else _decode_grouped_att_m_fwd
+        )
+        launch(
+            q,
+            k_cache.view(-1, k_cache.shape[2], k_cache.shape[3]),
+            v_cache.view(-1, v_cache.shape[2], v_cache.shape[3]),
+            out,
+            None,
+            page_table,
+            cache_seqlens,
+            None,
+            1,
+            page_table.stride(0),
+            k_cache.shape[1],
+            max_seqlen_q,
+            window_left,
+            window_sink,
+            softmax_scale,
+            logit_cap,
+            direct_output=True,
+        )
+        return out
     max_kv_splits = 4
     attn_logits = torch.empty(
         q.shape[0],
