@@ -458,6 +458,7 @@ impl HostConfig {
                 memory_regions: config.getattr("memory_regions")?.extract()?,
                 // With L3, the namespace's weight version.
                 l3_weight_version: l3.as_ref().map(|l3| l3.weight_version.clone()),
+                allow_reload_forward: config.getattr("allow_reload_forward")?.extract()?,
             },
             l3,
             eplb: Eplb::from_python(&config.getattr("eplb")?)?,

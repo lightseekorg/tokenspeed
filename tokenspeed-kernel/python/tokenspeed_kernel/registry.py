@@ -24,7 +24,7 @@ import logging
 from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import TYPE_CHECKING, Any, Callable, Iterable
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping
 
 if TYPE_CHECKING:
     import torch
@@ -40,6 +40,7 @@ __all__ = [
     "KernelSpec",
     "KernelRegistry",
     "Priority",
+    "RegistrySnapshot",
     "load_builtin_kernels",
     "register_kernel",
     "describe_kernel",
@@ -263,6 +264,15 @@ class KernelSpec:
         )
 
 
+@dataclass(frozen=True)
+class RegistrySnapshot:
+    """The registrations of a :class:`KernelRegistry` at one moment."""
+
+    by_operator: dict[tuple[str, str], list[KernelSpec]]
+    by_name: dict[str, KernelSpec]
+    impls: dict[str, Callable]
+
+
 class KernelRegistry:
     """Central registry for all kernel implementations."""
 
@@ -300,6 +310,35 @@ class KernelRegistry:
         self._by_operator[key].append(spec)
         self._by_operator[key].sort(key=lambda s: s.priority, reverse=True)
         self._invalidate_cache(key)
+
+    def snapshot(self) -> RegistrySnapshot:
+        """Copy the registrations, so a failed module reload can put them back with :meth:`restore`."""
+        return RegistrySnapshot(
+            by_operator={key: list(specs) for key, specs in self._by_operator.items()},
+            by_name=dict(self._by_name),
+            impls=dict(self._impls),
+        )
+
+    def restore(self, snapshot: RegistrySnapshot) -> None:
+        """Return to the registrations ``snapshot`` copied, dropping every cached selection."""
+        self._by_operator = defaultdict(
+            list, {key: list(specs) for key, specs in snapshot.by_operator.items()}
+        )
+        self._by_name = dict(snapshot.by_name)
+        self._impls = dict(snapshot.impls)
+        self._selection_cache.clear()
+
+    def replace_impls(self, replacements: Mapping[int, Callable]) -> None:
+        """Swap each implementation whose ``id`` keys ``replacements`` for its value, dropping cached selections."""
+        for name, impl in list(self._impls.items()):
+            replacement = replacements.get(id(impl))
+            if replacement is not None:
+                self._impls[name] = replacement
+        self._selection_cache.clear()
+
+    def unregister(self, name: str) -> None:
+        """Remove the kernel registered as ``name``, if any, dropping its cached selections."""
+        self._unregister(name)
 
     def _unregister(self, name: str) -> None:
         if name not in self._by_name:
