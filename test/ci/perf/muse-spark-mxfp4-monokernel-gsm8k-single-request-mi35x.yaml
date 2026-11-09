@@ -35,6 +35,8 @@ runner:
 optional: true
 env:
   CI: "true"
+  # main compiles kernels while serving under this recipe (gaps in the startup warmups); set this to error once those warmups cover them.
+  TOKENSPEED_JIT_COMPILE_CHECK: warn
 install:
   - bash test/ci_system/install_deps_rocm.sh
 server:
