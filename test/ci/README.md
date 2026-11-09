@@ -217,9 +217,8 @@ change is Markdown, a test file, or a model module: a module directly under
 test files:
 
 - The changed runtime test files.
-- For a changed model module, the tests that import it or a module built on it,
-  or that name one of them, so `gpt_oss` matches a test serving
-  `openai/gpt-oss-20b`.
+- The tests that import a changed model module or a module built on it, or that
+  name one of them, so `gpt_oss` matches a test serving `openai/gpt-oss-20b`.
 - The tests that import any of these, directly or through other test files.
 
 Any other change runs every test.

@@ -6,8 +6,8 @@ model module: a module directly under the models package that defines
 ``EntryClass``. Then only these runtime test files run:
 
 - The changed ones.
-- For a changed model module, the tests that import it or a module built on
-  it, or that name one of them, so ``gpt_oss`` matches ``openai/gpt-oss-20b``.
+- The tests that import a changed model module or a module built on it, or
+  that name one of them, so ``gpt_oss`` matches ``openai/gpt-oss-20b``.
 - The tests that import any of these, directly or through other test files.
 
 Any other change runs every test.
@@ -33,7 +33,7 @@ def imported_modules(path: Path) -> set[str]:
     as a submodule.
     """
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    modules = set()
+    modules: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             modules.update(alias.name for alias in node.names)
@@ -93,7 +93,8 @@ def models_built_on(changed: set[str], repo_root: Path) -> set[str]:
     for path in sorted((repo_root / MODEL_DIRECTORY).glob("*.py")):
         for imported in model_names(imported_modules(path)):
             importers.setdefault(imported, set()).add(path.stem)
-    reached, pending = set(), list(changed)
+    reached: set[str] = set()
+    pending = list(changed)
     while pending:
         name = pending.pop()
         if name in reached:
@@ -135,7 +136,7 @@ def select_runtime_tests(
         for path in sorted((repo_root / RUNTIME_TEST_DIRECTORY).rglob("*.py"))
     }
     imports = {test: imported_modules(path) for test, path in sources.items()}
-    affected = set()
+    affected: set[str] = set()
     for test, path in sources.items():
         imports_model = bool(model_names(imports[test]) & reached)
         text = squashed(path.read_text(encoding="utf-8"))
