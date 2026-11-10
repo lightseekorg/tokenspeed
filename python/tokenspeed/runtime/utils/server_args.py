@@ -3373,7 +3373,10 @@ class ServerArgs:
             "--stream-interval",
             type=int,
             default=ServerArgs.stream_interval,
-            help="The interval (or buffer size) for streaming in terms of the token length. A smaller value makes streaming smoother, while a larger value makes the throughput higher",
+            help="Streaming buffer size in generated tokens: send the first step's "
+            "tokens at once, then whenever at least this many tokens are unsent. A "
+            "smaller value streams more smoothly; a larger value sends fewer, "
+            "larger chunks.",
         )
         parser.add_argument(
             "--seed",
