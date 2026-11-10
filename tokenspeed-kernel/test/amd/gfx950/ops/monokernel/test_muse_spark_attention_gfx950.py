@@ -287,27 +287,22 @@ def _check_attention(
         # Reference: the regular path's math with its BF16 rounding points.
         # The cache slots of the launch's tokens hold stale values: the
         # kernel must take those keys from the projection.
-        z, k, v, _ = ref.attention_z(
+        _, k, v, _, z_exact, z_error = ref.attention_z(
             qkvg[b * rows : (b + 1) * rows],
             k_cache.view(-1, KV_HEADS, HEAD),
             v_cache.view(-1, KV_HEADS, HEAD),
             tables[b],
             lengths[b],
             window,
-            splits,
             cs[lengths[b] - 1 - position_base :],
         )
         for t in range(rows):
             row = b * rows + t
             got = payloads(scratch, plan, "z", HEADS * HEAD // 2, tag, row=row)
-            # FP32 sums in another order, then two BF16 roundings (the
-            # merge's output and the gated head norm): within two steps.
-            torch.testing.assert_close(
-                got.view(torch.bfloat16).cpu().float(),
-                z[t].float(),
-                rtol=2**-6,
-                atol=1e-3,
-            )
+            # z_error: the kernel's BF16 softmax weights, FP32 sums and two
+            # BF16 roundings (the attention output and z).
+            err = (got.view(torch.bfloat16).cpu().float() - z_exact[t]).abs()
+            assert torch.all(err <= z_error[t]), float((err / z_error[t]).max())
             # The cache gets the rotated k and the raw v of each row's token.
             slot = slots[row] + page_base * PAGE
             got_k = kc.view(-1, KV_HEADS, HEAD)[slot].cpu()

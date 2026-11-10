@@ -27,6 +27,11 @@ import math
 from types import SimpleNamespace
 
 import torch
+from tokenspeed_kernel.numerics.torch.attention.mha import (
+    torch_dense_attention,
+    torch_merge_attention_states,
+)
+from tokenspeed_kernel.numerics.torch.attention.prologue import torch_head_norm_rope
 from tokenspeed_kernel.numerics.torch.quantization import (
     dequantize_mxfp4,
     fake_quantize_mxfp4_even,
@@ -52,90 +57,82 @@ def rope_rows(first: int, count: int) -> torch.Tensor:
 def norm_rope(
     x: torch.Tensor, gain: float, cs: torch.Tensor, rope: bool, dtype: torch.dtype
 ) -> torch.Tensor:
-    """Per-head RMS norm, then interleaved RoPE: FP32, one rounding to
-    ``dtype``."""
-    x = x.float()
-    y = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-5) * gain
-    if rope:
-        c, s = cs[:32], cs[32:]
-        lo, hi = y[..., 0::2], y[..., 1::2]
-        y = torch.stack([lo * c - hi * s, hi * c + lo * s], dim=-1).flatten(-2)
-    return y.to(dtype)
+    """Per-head RMS norm (one gain for every element), then interleaved RoPE
+    (``cs``: one row of :func:`rope_table`), computed in FP64 by the shared
+    reference (``torch_head_norm_rope``) and rounded once to ``dtype``."""
+    heads = x.reshape(-1, HEAD)
+    values, _ = torch_head_norm_rope(
+        heads,
+        HEAD,
+        norm_weight=torch.full((HEAD,), gain, dtype=torch.float64, device=x.device),
+        norm_weight_offset=0.0,
+        norm_eps=1e-5,
+        cos_sin_cache=cs.reshape(1, -1) if rope else None,
+        positions=(
+            torch.zeros(heads.shape[0], dtype=torch.long, device=x.device)
+            if rope
+            else None
+        ),
+        neox=False,
+        mrope_section=None,
+        mrope_interleaved=False,
+    )
+    return values.reshape(x.shape).to(dtype)
 
 
-def _online(state, scores, values):
-    """One chunk of the monokernel's online base-2 softmax for a batch of q
-    heads (``scores [heads, keys]``, -inf where masked); its weights round
-    to BF16 before the PV product."""
-    m, l, acc = state
-    m_new = torch.maximum(m, scores.amax(-1))
-    m_safe = torch.where(m_new == float("-inf"), 0.0, m_new)
-    alpha = torch.exp2(m - m_safe)
-    p = torch.exp2(scores - m_safe[:, None])
-    acc = acc * alpha[:, None] + p.to(torch.bfloat16).float() @ values
-    return m_new, l * alpha + p.sum(-1), acc
+# The kernel rounds each softmax weight to BF16 before the PV product, a
+# relative error of at most 2^-9 a weight; independent roundings give the
+# output an error of standard deviation at most 2^-9 / sqrt(3) * sqrt(sum_j
+# w_j^2 v_j^2). The bound below allows 6 of those, and 2^-16 * sum_j w_j |v_j|
+# for the FP32 scores and sums.
+_WEIGHT_STEP_SIGMAS = 6 * 2**-9 / math.sqrt(3)
+_FP32_SLACK = 2**-16
 
 
-def verify_attention(
-    q,
-    q_cached,
-    keys,
-    values,
-    own_k,
-    own_v,
-    t,
-    first,
-    L0,
-    row_first,
-    splits,
-    chunk,
-    align,
-):
-    """The monokernel's split attention of row ``t``'s q heads ``q [heads,
-    64]`` (of one KV head): the splits share the cached keys ``first .. L0 -
-    1`` (``keys`` / ``values`` ``[L0 - first, 64]``) in chunks of ``chunk``, the
-    keys before ``row_first`` masked; the last split then takes the launch's
-    keys ``0 .. t`` (``own_k`` / ``own_v``) as one more chunk. Then the LSE
-    merge. A split's keys are a multiple of ``align`` (whole pages when 64).
+def verify_attention(q, q_cached, keys, values, own_k, own_v):
+    """Attention of one row's q heads ``q [heads, 64]`` (of one KV head) over
+    its visible cached keys ``keys`` / ``values`` ``[n, 64]`` and the launch's
+    keys up to its own ``own_k`` / ``own_v`` ``[t + 1, 64]``, in FP64 by the
+    shared references (``torch_dense_attention`` per part, merged by
+    ``torch_merge_attention_states``).
+
     ``q_cached`` scores the cached keys (``q``, or q rounded once to an FP8
     cache's dtype where the kernel's long full-layer path multiplies in FP8);
     ``q`` scores the launch's keys. That path is not the regular path's math
     exactly: the regular path scores every key of an FP8 cache with the FP8
-    q, and here the launch's own keys still take the BF16 q, and P x V stays
-    BF16. Returns ``[heads, 64]``."""
-    scale = 0.125 * math.log2(math.e)
-    heads = q.shape[0]
-    n = L0 - first
-    per = -(-n // splits)
-    per = -(-per // align) * align
-    pos = torch.arange(first, L0)
-    scores = (q_cached.float() @ keys.T) * scale
-    scores = torch.where(pos >= row_first, scores, float("-inf"))
-    outs, lses = [], []
-    for s in range(splits):
-        lo, hi = s * per, min(s * per + per, n)
-        state = (
-            torch.full((heads,), float("-inf")),
-            torch.zeros(heads),
-            torch.zeros(heads, HEAD),
+    q, and here the launch's own keys still take the BF16 q.
+
+    Returns ``(out, error)``, both FP64 ``[heads, 64]``: ``error`` bounds the
+    kernel's difference from ``out`` (its BF16 softmax weights and FP32 sums).
+    """
+
+    def part(query, k, v):
+        return torch_dense_attention(
+            query.double()[None],
+            k.double()[:, None],
+            v.double()[:, None],
+            scale=0.125,
+            causal_offset=None,
+            window_left=None,
+            sinks=None,
         )
-        for c0 in range(lo, hi, chunk):
-            c1 = min(c0 + chunk, hi)
-            state = _online(state, scores[:, c0:c1], values[c0:c1])
-        if s == splits - 1:
-            own = (q.float() @ own_k[: t + 1].T) * scale
-            state = _online(state, own, own_v[: t + 1])
-        m, l, acc = state
-        outs.append(acc / torch.where(l > 0, l, 1.0)[:, None])
-        lses.append(
-            torch.where(l > 0, m + torch.log2(torch.where(l > 0, l, 1.0)), -math.inf)
+
+    out, lse = part(q, own_k, own_v)
+    if keys.shape[0]:
+        cached_out, cached_lse = part(q_cached, keys, values)
+        out, _ = torch_merge_attention_states(
+            cached_out, cached_lse, out, lse, math.log2(math.e)
         )
-    lse = torch.stack(lses)  # [splits, heads]
-    w = torch.where(lse == -math.inf, 0.0, torch.exp2(lse - lse.amax(0)))
-    return (torch.stack(outs) * w[:, :, None]).sum(0) / w.sum(0)[:, None]
+    scores = torch.cat(
+        [q_cached.double() @ keys.double().T, q.double() @ own_k.double().T], 1
+    )
+    w = torch.softmax(scores * 0.125, dim=-1)
+    v = torch.cat([values, own_v]).double()
+    error = _WEIGHT_STEP_SIGMAS * (w.pow(2) @ v.pow(2)).sqrt()
+    return out[0], error + _FP32_SLACK * (w @ v.abs())
 
 
-def attention_z(qkvg, k_cache, v_cache, table, length, window, splits, cs):
+def attention_z(qkvg, k_cache, v_cache, table, length, window, cs):
     """One rank's gated head-norm output ``z [rows, 1024]`` of the rows of one
     request (``qkvg [rows, 2304]``; row ``t`` at position ``length - 1 +
     t``), and the rows' K, V ``[rows, 2, 64]`` and cache slots.
@@ -144,6 +141,14 @@ def attention_z(qkvg, k_cache, v_cache, table, length, window, splits, cs):
     or FP8 e4m3 at unit scale: the rows' K and V round once to that dtype,
     and attention reads them (and the cache) exactly widened. ``cs``: FP32
     ``[rows, 64]``, the RoPE rows of the rows' positions.
+
+    Returns ``(z, k, v, slots, z_exact, z_error)``. ``z`` has the regular
+    path's BF16 roundings (the attention output and z). ``z_exact`` is z
+    without them, and ``z_error`` bounds the kernel's difference from it, both
+    FP32 ``[rows, 1024]``: the attention error of :func:`verify_attention`
+    plus the attention output's BF16 rounding (unit roundoff 2^-8), carried
+    through the head norm (``z = a / rms(a) * gate`` moves by ``(da + |z| *
+    rms(da)) / rms(a) * gate``), then z's own BF16 rounding.
     """
     rope = window != 0
     kv_dtype = k_cache.dtype
@@ -169,39 +174,50 @@ def attention_z(qkvg, k_cache, v_cache, table, length, window, splits, cs):
     cached_slots = table[cached // PAGE].long() * PAGE + cached % PAGE
     keys, values = k_cache[cached_slots].float(), v_cache[cached_slots].float()
     z = torch.empty(rows, HEADS, HEAD)
-    # Full layers with 8 rows (64 MFMA rows) take attention.py's key groups
-    # from LONG_KEYS cached keys: a BF16 cache splits on whole pages, an FP8
-    # cache scores its keys with q rounded once from FP32 to the cache's
-    # dtype (the regular path's FP8 query).
-    groups = window == 0 and rows == 8 and L0 >= 32768
-    fp8_qk = groups and kv_dtype != torch.bfloat16
+    z_exact = torch.empty(rows, HEADS, HEAD)
+    z_error = torch.empty(rows, HEADS, HEAD)
+    # Full layers with 8 rows (64 MFMA rows) score LONG_KEYS cached keys of
+    # an FP8 cache with q rounded once from FP32 to the cache's dtype (the
+    # regular path's FP8 query).
+    fp8_qk = window == 0 and rows == 8 and L0 >= 32768 and kv_dtype != torch.bfloat16
     for t in range(rows):
         q_args = (qkvg[t, :K_ROW].view(HEADS, HEAD), 5.473006248474121, cs[t])
         q = norm_rope(*q_args, rope, torch.bfloat16)
         q_cached = norm_rope(*q_args, rope, kv_dtype) if fp8_qk else q
-        gate = qkvg[t, GATE_ROW:].view(HEADS, HEAD).float()
-        row_first = L0 + t - window + 1 if window else 0
+        gate = torch.sigmoid(qkvg[t, GATE_ROW:].view(HEADS, HEAD).double())
+        # A sliding row sees the cached keys from L0 + t - window + 1 on.
+        seen = max(0, L0 + t - window + 1 - first) if window else 0
         for kv in range(KV_HEADS):
             heads = slice(kv * GROUP, (kv + 1) * GROUP)
-            a = verify_attention(
+            a, da = verify_attention(
                 q[heads],
                 q_cached[heads],
-                keys[:, kv],
-                values[:, kv],
-                k[:, kv].float(),
-                v[:, kv].float(),
-                t,
-                first,
-                L0,
-                row_first,
-                splits,
-                128,
-                64 if groups and not fp8_qk else 1,
+                keys[seen:, kv],
+                values[seen:, kv],
+                k[: t + 1, kv].float(),
+                v[: t + 1, kv].float(),
             )
-            a = a.to(torch.bfloat16).float()
+            exact = a / torch.sqrt(a.pow(2).mean(-1, keepdim=True) + 1e-5)
+            z_exact[t, heads] = (exact * gate[heads]).float()
+            # The kernel's BF16 attention output: its error, then one rounding.
+            da = da + 2**-8 * (a.abs() + da)
             inv = torch.rsqrt(a.pow(2).mean(-1, keepdim=True) + 1e-5)
-            z[t, heads] = a * inv * torch.sigmoid(gate[heads])
-    return z.reshape(rows, -1).to(torch.bfloat16), k, v, slots
+            rms_da = da.pow(2).mean(-1, keepdim=True).sqrt()
+            dz = (da + exact.abs() * rms_da) * inv * gate[heads]
+            # Then z's own rounding.
+            dz = dz + 2**-8 * (exact.abs() * gate[heads] + dz)
+            z_error[t, heads] = dz.float()
+            a = a.to(torch.bfloat16).double()
+            inv = torch.rsqrt(a.pow(2).mean(-1, keepdim=True) + 1e-5)
+            z[t, heads] = (a * inv * gate[heads]).float()
+    return (
+        z.reshape(rows, -1).to(torch.bfloat16),
+        k,
+        v,
+        slots,
+        z_exact.reshape(rows, -1),
+        z_error.reshape(rows, -1),
+    )
 
 
 def raw_experts(rank: int, experts: int):

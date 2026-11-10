@@ -147,20 +147,18 @@ def _reference(sh, length, full, kernel_pooled, kernel_hp, dev):
     rows = sh["a_in"].shape[0]
     end = length + rows - 1
     window = 0 if full else layer.WINDOW
-    splits = layer.FULL_SPLITS if full else layer.SLIDING_SPLITS
     cs = ref.rope_table(end + 1)
     b = torch.zeros(rows, HIDDEN)
     for r in range(WORLD):
         w = _rank_weights(r, end)
         qkvg = (sh["a_in"].float() @ w["w_qkvg"].float().T).to(torch.bfloat16)
-        z, _, _, _ = ref.attention_z(
+        z, _, _, _, _, _ = ref.attention_z(
             qkvg,
             w["k_cache"],
             w["v_cache"],
             sh["table"],
             length,
             window,
-            splits,
             cs[length - 1 : end],
         )
         b = b + (z.float() @ w["w_o"].float().T).to(torch.bfloat16).float()

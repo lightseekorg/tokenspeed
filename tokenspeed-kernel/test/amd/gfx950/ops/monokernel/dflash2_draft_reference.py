@@ -30,6 +30,8 @@ around each sublayer, blocks of 8 rows a request.
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.numerics.torch.conv import torch_block_grouped_conv
+from tokenspeed_kernel.numerics.torch.layernorm import torch_rmsnorm
 
 HIDDEN, INTER, WORLD = 8192, 28672, 8
 INTER_RANK = INTER // WORLD  # 3584 gate rows and 3584 up rows a rank
@@ -44,23 +46,14 @@ def grouped_conv(
 ) -> torch.Tensor:
     """``dflash2_grouped_conv``: FP32 sum over the taps in tap order of
     ``(base + delta) * x[t - tap]`` within each block of ``BLOCK`` rows,
-    rounded once to BF16.
+    rounded once to BF16 (the shared reference ``torch_block_grouped_conv``).
 
     Args:
         x: BF16 ``[R, HIDDEN]``, ``R`` a multiple of ``BLOCK``.
         delta: BF16 ``[R, TAPS, GROUPS]`` (one side of the coefficients).
         base: BF16 ``[TAPS, HIDDEN]`` (the same side of ``base_kernel``).
     """
-    rows = x.shape[0]
-    position = torch.arange(rows, device=x.device) % BLOCK
-    groups = delta.float().repeat_interleave(GROUP_SIZE, dim=-1)  # [R, TAPS, HIDDEN]
-    acc = (base[0].float() + groups[:, 0]) * x.float()
-    for tap in range(1, TAPS):
-        shifted = torch.zeros_like(acc)
-        shifted[tap:] = x[:-tap].float()
-        live = (position >= tap)[:, None]
-        acc = acc + torch.where(live, (base[tap].float() + groups[:, tap]) * shifted, 0)
-    return acc.to(torch.bfloat16)
+    return torch_block_grouped_conv(x, delta, base, BLOCK, GROUP_SIZE)
 
 
 def tp_sum_norm(
@@ -91,11 +84,10 @@ def tp_sum_norm(
         total += part.float()
     if round_tp_sum:
         total = total.to(torch.bfloat16).float()
-    stream = total + residual.float()
-    # The norm reads the FP32 sum; only the stored residual is rounded.
-    scale = torch.rsqrt(stream.pow(2).mean(dim=-1, keepdim=True) + EPS)
-    hidden = (stream * scale * post_norm.float()).to(torch.bfloat16)
-    return hidden, stream.to(torch.bfloat16)
+    # The norm reads the FP32 sum with the residual; only the stored residual
+    # is rounded.
+    hidden, stream = torch_rmsnorm(total, post_norm, EPS, residual)
+    return hidden.to(torch.bfloat16), stream.to(torch.bfloat16)
 
 
 def mlp(
