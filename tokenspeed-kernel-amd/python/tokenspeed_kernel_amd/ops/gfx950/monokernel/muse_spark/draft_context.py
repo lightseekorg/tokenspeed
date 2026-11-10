@@ -33,14 +33,14 @@ on every rank of the TP8 group:
   ``1024 rank ..``) x a 1280-wide K part of the taps, FP32 partials into
   ``fpart``. ``fc`` is the draft's largest weight (671 MB); each rank reads
   its eighth.
-* fsum, 64 tasks (8 a row, 128 columns each): the K parts' sum rounded to
+* fsum, 8 tasks a row (128 owned columns each): the K parts' sum rounded to
   BF16 (the projection's output) and its sum of squares, put to every rank.
 * fnorm, on fsum's CTAs: ``hidden_norm`` of the owned columns, put to every
   rank's ``chin``: the whole normed rows on every rank.
 * kv, 160 tasks: the 5 layers' K and V rows of the rank's KV head (1280
   rows) x 512-wide K parts of the normed rows, into ``kvpart``. The tasks
   issue their weight loads before they poll ``chin``.
-* kvout, 80 tasks (10 a row: layer, then K or V): the K parts' sum rounded
+* kvout, 10 tasks a row (layer, then K or V): the K parts' sum rounded
   to BF16, then for K the per-head RMSNorm and NeoX RoPE in FP32, rounded
   once, stored at the row's slot of the layer's cache.
 """
@@ -60,7 +60,11 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel import (
     schedule,
     trace,
 )
-from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import draft_mlp
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import (
+    draft_attn,
+    draft_layer,
+    draft_mlp,
+)
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.dims import (
     DRAFT_BLOCK,
     DRAFT_HEAD_DIM,
@@ -72,22 +76,24 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import Plan, Stage, placem
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.weights import bf16_tiles
 
 TAPS = 5
-TAPS_K = gl.constexpr(TAPS * 8192)  # fc's input width
+TAPS_K = gl.constexpr(TAPS * HIDDEN)  # fc's input width
+FC_ROWS = gl.constexpr(128)  # owned columns of an fc task: 16 a wave
 FC_KS = gl.constexpr(1280)  # K values of an fc task
-FC_KPARTS = gl.constexpr(32)  # TAPS_K / FC_KS
+FC_KPARTS = gl.constexpr(TAPS_K // FC_KS)  # 32
 FC_ROUND = gl.constexpr(256)  # K values of one weight load round
-FC_TASKS = gl.constexpr(256)  # 8 groups of 128 rows x 32 K parts
-SUM_TASKS = gl.constexpr(8)  # per row: 128 owned columns each
+FC_TASKS = gl.constexpr(OWNED // FC_ROWS * FC_KPARTS)  # 8 groups x 32 K parts
 SUM_COLS = gl.constexpr(128)
-LAYERS = gl.constexpr(5)
+SUM_TASKS = gl.constexpr(OWNED // SUM_COLS)  # per row: 128 owned columns each
+LAYERS = draft_layer.DRAFT_LAYERS
 HEAD = DRAFT_HEAD_DIM
-HALF = gl.constexpr(64)
-KV = gl.constexpr(1280)  # K then V rows (128 each) of the 5 layers
+HALF = draft_attn.HALF
+KV = gl.constexpr(LAYERS * 2 * HEAD)  # K then V rows of the 5 layers
+KV_ROWS = gl.constexpr(128)  # K, V rows of a kv task
 KV_KS = gl.constexpr(512)
-KV_KPARTS = gl.constexpr(16)
-KV_TASKS = gl.constexpr(160)  # 10 groups of 128 rows x 16 K parts
-OUT_TASKS = gl.constexpr(10)  # per row: layer, then K or V
-EPS = gl.constexpr(1e-5)
+KV_KPARTS = gl.constexpr(HIDDEN // KV_KS)  # 16
+KV_TASKS = gl.constexpr(KV // KV_ROWS * KV_KPARTS)  # 10 groups x 16 K parts
+OUT_TASKS = gl.constexpr(2 * LAYERS)  # per row: layer, then K or V
+EPS = draft_mlp.EPS
 ROWS = int(DRAFT_BLOCK)  # one request's verify rows
 MAX_REQUESTS = 2  # requests a launch: their verify rows one after another
 
@@ -95,7 +101,8 @@ PEERS = ("css", "chin")
 
 
 def regions() -> tuple[tuple[str, int], ...]:
-    """The context write's regions as (name, int64 pairs): fpart, css, chin, kvpart."""
+    """The context write's regions as (name, int64 pairs): fpart, css, chin,
+    kvpart."""
     return (
         ("fpart", int(FC_KPARTS) * int(OWNED)),  # FP32 [K part][owned column]
         ("css", int(WORLD) * int(SUM_TASKS)),  # FP32 sums of squares [rank][task]
@@ -104,7 +111,9 @@ def regions() -> tuple[tuple[str, int], ...]:
     )
 
 
-BASES = {"fc": 0, "fsum": 0, "kv": 96, "kvout": 0}
+GRID = 256
+# kv's tasks end on the last CTA.
+BASES = {"fc": 0, "fsum": 0, "kv": GRID - int(KV_TASKS), "kvout": 0}
 
 
 def stages(bases: dict[str, int], rows: int) -> tuple[Stage, ...]:
@@ -130,7 +139,7 @@ CODE_TASKS = 64
 def context_plan(rows: int) -> Plan:
     """The plan of the context write for ``rows`` verify rows."""
     return Plan(
-        grid=256,
+        grid=GRID,
         stages=(Stage("code", CODE_TASKS, 0),) + stages(BASES, rows),
         regions=regions(),
         rows=rows,
@@ -173,10 +182,11 @@ def pack_draft_context(
             ``k_norm_4`` ``[128]``.
         rank: The rank in the TP8 group.
     """
+    qkv_rows = int(draft_attn.QKV)
     shapes = {
         "fc": (int(OWNED), int(TAPS_K)),
         "hidden_norm": (int(HIDDEN),),
-        **{f"qkv_{i}": (1280, int(HIDDEN)) for i in range(int(LAYERS))},
+        **{f"qkv_{i}": (qkv_rows, int(HIDDEN)) for i in range(int(LAYERS))},
         **{f"k_norm_{i}": (int(HEAD),) for i in range(int(LAYERS))},
     }
     for name, shape in shapes.items():
@@ -184,7 +194,9 @@ def pack_draft_context(
         if t.dtype != torch.bfloat16 or tuple(t.shape) != shape:
             raise ValueError(f"{name}: BF16 {shape}, got {t.dtype} {tuple(t.shape)}")
     own = slice(rank * int(OWNED), (rank + 1) * int(OWNED))
-    kv = torch.cat([tensors[f"qkv_{i}"][1024:] for i in range(int(LAYERS))])
+    # Each layer's k and v rows follow its q rows.
+    q_rows = int(draft_attn.Q_ROWS)
+    kv = torch.cat([tensors[f"qkv_{i}"][q_rows:] for i in range(int(LAYERS))])
     return DraftContextWeights(
         rank=rank,
         fc=bf16_tiles(tensors["fc"].contiguous()),
@@ -228,6 +240,7 @@ def fc_stage(mb, task, x, w):
     R: gl.constexpr = schedule.rows(mb.plan)
     RP: gl.constexpr = triton.next_power_of_2(R)
     NW: gl.constexpr = gl.num_warps()
+    gl.static_assert(16 * NW == FC_ROWS)
     KI: gl.constexpr = FC_ROUND // 32
     ROUNDS: gl.constexpr = FC_KS // FC_ROUND
     group = task // FC_KPARTS
@@ -337,24 +350,8 @@ def kvout_stage(
     at = k * KV + h * HEAD + i[None, :]
     lo_w, hi_w = mb.poll_many(("kvpart", "kvpart"), (at, at + HALF))
     mb.stamp("kvout", trace.READY)
-    x1 = gl.sum(lo_w.to(gl.float32, bitcast=True), axis=0)
-    x2 = gl.sum(hi_w.to(gl.float32, bitcast=True), axis=0)
-    x1 = x1.to(gl.bfloat16).to(gl.float32)
-    x2 = x2.to(gl.bfloat16).to(gl.float32)
-    if is_k:
-        inv = gl.rsqrt(gl.sum(x1 * x1 + x2 * x2, axis=0) / HEAD + EPS)
-        n1 = x1 * inv * w1
-        n2 = x2 * inv * w2
-        o1 = gl.fma(n1, cos, -n2 * sin)
-        o2 = gl.fma(n2, cos, n1 * sin)
-    else:
-        o1 = x1
-        o2 = x2
-    full = gl.join(o1.to(gl.bfloat16), o2.to(gl.bfloat16))  # [64, 2]: (i, i + 64)
-    vals = gl.reshape(gl.permute(full, [1, 0]), [HEAD])  # head order
-    pl: gl.constexpr = gl.BlockedLayout([2], [64], [nw], [0])
-    vals = gl.convert_layout(vals, pl)
-    cols = gl.arange(0, HEAD, pl)
+    vals = draft_attn.head_values(lo_w, hi_w, w1, w2, cos, sin, is_k)
+    cols = gl.arange(0, HEAD, vals.type.layout)
     at = slot * HEAD + cols
     # The layer's cache: one store, picked by the task.
     if h == 0:
@@ -420,8 +417,8 @@ def gluon_muse_spark_draft_context_gfx950(
     PLAN: gl.constexpr,
     RANK: gl.constexpr,
 ):
-    """The context write of the verify rows on rank ``RANK`` (see
-    the module docstring and :func:`launch_gluon_muse_spark_draft_context_gfx950`)."""
+    """The context write of the verify rows on rank ``RANK`` (see the module
+    docstring and :func:`launch_gluon_muse_spark_draft_context_gfx950`)."""
     table_ = trace.allocate(trace_buf)
     peers = mailbox.load_peers(bases, RANK, gl.load(step) & 1, WORLD)
     mb = mailbox.Mailbox(scratch, mailbox.launch_tag(step, 0), PLAN, table_, peers)
@@ -445,7 +442,7 @@ def gluon_muse_spark_draft_context_gfx950(
     task, active = schedule.stage_task(PLAN, "kv")
     if active:
         draft_mlp.proj_task(
-            mb, task, kv_w, "chin", "kvpart", KV, HIDDEN, 128, KV_KS, "kv"
+            mb, task, kv_w, "chin", "kvpart", KV, HIDDEN, KV_ROWS, KV_KS, "kv"
         )
     task, active = schedule.stage_task(PLAN, "kvout")
     if active:
@@ -485,13 +482,14 @@ def launch_gluon_muse_spark_draft_context_gfx950(
     trace_buf,
     compile_only: bool,
 ) -> None:
-    """The context write of one or two requests' verify rows, on every rank of the
-    TP8 group at once (the launches exchange the norm and its output).
+    """The context write of one or two requests' verify rows, on every rank of
+    the TP8 group at once (the launches exchange the norm and its output).
 
     Args:
         weights: From :func:`pack_draft_context`.
-        taps: BF16 ``[rows, 40960]`` (8 or 16 rows) contiguous: the target's tapped hidden
-            states of the verify rows (the same on every rank).
+        taps: BF16 ``[rows, 40960]`` (8 or 16 rows) contiguous: the
+            target's tapped hidden states of the verify rows (the same on
+            every rank).
         positions: int32 ``[rows]``: the rows' positions.
         slots: int32 or int64 ``[rows]``: the rows' draft cache slots.
         k_caches, v_caches: 5 BF16 ``[slots, 1, 128]`` each: the draft

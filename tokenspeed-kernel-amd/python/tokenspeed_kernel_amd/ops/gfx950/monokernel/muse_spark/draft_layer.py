@@ -53,13 +53,16 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import (
 )
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.dims import (
     DRAFT_BLOCK,
+    HIDDEN,
+    OWNED,
     WORLD,
 )
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import Plan, Stage
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.weights import bf16_tiles
 
 DRAFT_LAYERS = gl.constexpr(5)  # launches a draft forward runs
-SPLITS = 16  # attention splits: 16 x 128 keys hold the 2041 cached
+# Attention splits: 16 x 128 keys hold the 2040 cached.
+SPLITS = gl.constexpr(16)
 BLOCK_ROWS = int(DRAFT_BLOCK)  # one request's block
 MAX_ROWS = 16  # two requests' blocks, one after the other
 
@@ -92,9 +95,10 @@ def regions(splits: int) -> tuple[tuple[str, int], ...]:
 def stages(
     bases: dict[str, int], splits: int, rows: int, last: bool
 ) -> tuple[Stage, ...]:
-    """The layer's stages of ``rows`` token rows (one block), placed by
-    ``bases`` (both halves' names; ``isum`` and ``sum`` must match). The
-    ``last`` layer's launch ends in the draft's final norm."""
+    """The layer's stages of ``rows`` token rows (one or two requests'
+    blocks), placed by ``bases`` (both halves' names; ``isum`` and ``sum``
+    must match). The ``last`` layer's launch ends in the draft's final
+    norm."""
     if bases["isum"] != bases["sum"]:
         raise ValueError(
             "isum and sum must share CTAs: sum takes isum's residual from registers"
@@ -165,12 +169,14 @@ BASES = {
 
 @functools.lru_cache(maxsize=None)
 def layer_plan(rows: int, last: bool) -> Plan:
-    """The plan of a draft layer for ``rows`` token rows (one block); the
-    ``last`` layer's launch ends in the draft's final norm."""
+    """The plan of a draft layer for ``rows`` token rows (one or two
+    requests' blocks); the ``last`` layer's launch ends in the draft's final
+    norm."""
+    splits = int(SPLITS)
     return Plan(
         grid=256,
-        stages=(Stage("code", CODE_TASKS, 0),) + stages(BASES, SPLITS, rows, last),
-        regions=regions(SPLITS),
+        stages=(Stage("code", CODE_TASKS, 0),) + stages(BASES, splits, rows, last),
+        regions=regions(splits),
         rows=rows,
         chain=min(rows, BLOCK_ROWS),
         world=int(WORLD),
@@ -216,25 +222,27 @@ def pack_draft_layer(tensors: dict[str, torch.Tensor], rank: int) -> DraftLayerW
             columns).
         rank: The rank in the TP8 group.
     """
+    hidden, coefs = int(HIDDEN), int(draft_mlp.COEFS)
+    head, inter = int(draft_attn.HEAD), int(draft_mlp.INTER)
     shapes = {
-        "input_norm": (8192,),
-        "post_norm": (8192,),
-        "attn_coef": (2048, 8192),
-        "mlp_coef": (2048, 8192),
-        "attn_base": (2, 2, 8192),
-        "mlp_base": (2, 2, 8192),
-        "qkv": (1280, 8192),
-        "q_norm": (128,),
-        "k_norm": (128,),
-        "o_proj": (8192, 1024),
-        "gate_up": (7168, 8192),
-        "down": (8192, 3584),
+        "input_norm": (hidden,),
+        "post_norm": (hidden,),
+        "attn_coef": (coefs, hidden),
+        "mlp_coef": (coefs, hidden),
+        "attn_base": (2, 2, hidden),  # side, tap, channel
+        "mlp_base": (2, 2, hidden),
+        "qkv": (int(draft_attn.QKV), hidden),
+        "q_norm": (head,),
+        "k_norm": (head,),
+        "o_proj": (hidden, int(draft_attn.Q_ROWS)),
+        "gate_up": (int(draft_mlp.GU), hidden),
+        "down": (hidden, inter),
     }
     for name, shape in shapes.items():
         t = tensors[name]
         if t.dtype != torch.bfloat16 or tuple(t.shape) != shape:
             raise ValueError(f"{name}: BF16 {shape}, got {t.dtype} {tuple(t.shape)}")
-    own = slice(rank * 1024, (rank + 1) * 1024)
+    own = slice(rank * int(OWNED), (rank + 1) * int(OWNED))
     return DraftLayerWeights(
         rank=rank,
         in_gain=tensors["input_norm"][own].float().contiguous(),
@@ -306,7 +314,6 @@ def gluon_muse_spark_draft_layer_gfx950(
     trace_buf,
     PLAN: gl.constexpr,
     RANK: gl.constexpr,
-    SPLITS_: gl.constexpr,
     LAST: gl.constexpr,
 ):
     """One step of draft layer ``layer`` on rank ``RANK`` (see the module
@@ -373,7 +380,16 @@ def gluon_muse_spark_draft_layer_gfx950(
     task, active = schedule.stage_task(PLAN, "qkv")
     if active:
         draft_mlp.proj_task(
-            mb, task, qkv_w, "ahc", "qpart", draft_attn.QKV, H, 128, 512, "qkv"
+            mb,
+            task,
+            qkv_w,
+            "ahc",
+            "qpart",
+            draft_attn.QKV,
+            H,
+            draft_attn.QKV_ROWS,
+            draft_attn.QKV_KS,
+            "qkv",
         )
     task, active = schedule.stage_task(PLAN, "head")
     if active:
@@ -392,14 +408,25 @@ def gluon_muse_spark_draft_layer_gfx950(
     task, active = schedule.stage_task(PLAN, "attn")
     if active:
         draft_attn.attn_stage(
-            mb, task, table, table_stride, seq_len, k_cache, v_cache, SPLITS_, "attn"
+            mb, task, table, table_stride, seq_len, k_cache, v_cache, SPLITS, "attn"
         )
     task, active = schedule.stage_task(PLAN, "merge")
     if active:
-        draft_attn.merge_stage(mb, task, SPLITS_, "merge")
+        draft_attn.merge_stage(mb, task, SPLITS, "merge")
     task, active = schedule.stage_task(PLAN, "oproj")
     if active:
-        draft_mlp.proj_task(mb, task, o_w, "ao", "opart", H, 1024, 128, 512, "oproj")
+        draft_mlp.proj_task(
+            mb,
+            task,
+            o_w,
+            "ao",
+            "opart",
+            H,
+            draft_attn.Q_ROWS,
+            draft_attn.OPROJ_ROWS,
+            draft_attn.OPROJ_KS,
+            "oproj",
+        )
     task, active = schedule.stage_task(PLAN, "afin")
     if active:
         draft_mlp.fin_to_owners(
@@ -445,8 +472,10 @@ def gluon_muse_spark_draft_layer_gfx950(
             draft_mlp.COEF_KS,
             "coef",
         )
-    # The CTAs that host no conv0 task start their first gate/up task right
-    # after coef (see draft_mlp).
+    # The CTAs that host no conv0 task start their first gate/up task (its
+    # weight loads) right after coef. vmcnt counts loads in order, so on the
+    # CTAs that do host one, conv0's polls run first, with no weight loads in
+    # flight.
     gu_task, rounds = schedule.stage_rounds(PLAN, "gu")
     _, has_conv0 = schedule.stage_task(PLAN, "conv0")
     free = not has_conv0
@@ -661,10 +690,11 @@ def launch_gluon_muse_spark_draft_layer_gfx950(
     last = normed is not None
     if (out is None) != last or (final_gain is not None) != last:
         raise ValueError("either out, or (the last layer) final_gain and normed")
+    owned, hidden = int(OWNED), int(HIDDEN)
     if last and (
-        final_gain.dtype != torch.float32 or tuple(final_gain.shape) != (1024,)
+        final_gain.dtype != torch.float32 or tuple(final_gain.shape) != (owned,)
     ):
-        raise ValueError("final_gain: FP32 [1024]")
+        raise ValueError(f"final_gain: FP32 [{owned}]")
     for name, t in (
         ("x", x),
         ("residual", residual),
@@ -673,10 +703,10 @@ def launch_gluon_muse_spark_draft_layer_gfx950(
     ):
         if (
             t.dtype != torch.bfloat16
-            or tuple(t.shape) != (rows, 8192)
+            or tuple(t.shape) != (rows, hidden)
             or not t.is_contiguous()
         ):
-            raise ValueError(f"{name}: contiguous BF16 [{rows}, 8192]")
+            raise ValueError(f"{name}: contiguous BF16 [{rows}, {hidden}]")
     # The launch reads x and residual while other CTAs already write the outputs.
     written = normed if last else out
     if {x.data_ptr(), residual.data_ptr()} & {
@@ -684,8 +714,24 @@ def launch_gluon_muse_spark_draft_layer_gfx950(
         written.data_ptr(),
     }:
         raise ValueError("the outputs must not alias the inputs")
-    if k_cache.dtype != torch.bfloat16 or v_cache.dtype != torch.bfloat16:
-        raise ValueError("k_cache, v_cache: BF16 (the kernel reads BF16 keys)")
+    # The kernel reads and writes the caches as dense BF16 rows of 128 at
+    # slot * 128, and the rows' positions and slots at their row index.
+    head = int(draft_attn.HEAD)
+    for c in (k_cache, v_cache):
+        if c.dtype != torch.bfloat16 or c.shape[-1] != head or not c.is_contiguous():
+            raise ValueError(f"k_cache, v_cache: contiguous BF16 [slots, 1, {head}]")
+    if (
+        positions.dtype != torch.int32
+        or tuple(positions.shape) != (rows,)
+        or not positions.is_contiguous()
+    ):
+        raise ValueError(f"positions: contiguous int32 [{rows}]")
+    if (
+        slots.dtype not in (torch.int32, torch.int64)
+        or tuple(slots.shape) != (rows,)
+        or not slots.is_contiguous()
+    ):
+        raise ValueError(f"slots: contiguous int32 or int64 [{rows}]")
     if not 0 <= layer < int(DRAFT_LAYERS):
         raise ValueError(f"layer {layer} out of range({int(DRAFT_LAYERS)})")
     plan = layer_plan(rows, last)
@@ -728,7 +774,6 @@ def launch_gluon_muse_spark_draft_layer_gfx950(
             trace_buf,
             plan.key,
             w.rank,
-            SPLITS,
             last,
         )
 

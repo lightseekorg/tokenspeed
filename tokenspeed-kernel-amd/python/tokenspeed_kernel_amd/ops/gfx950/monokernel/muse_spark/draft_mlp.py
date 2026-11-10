@@ -63,10 +63,9 @@ norm, as in ``attn_tail``:
   this rank's partial, stored in ``out``.
 
 The projections share :func:`proj_issue`, :func:`proj_poll` and
-:func:`proj_compute`; their
-weights are in ``weights.bf16_tiles`` order. A task issues its weight loads
-before it polls its input, so the weights stream while the earlier stages
-finish.
+:func:`proj_compute`; their weights are in ``weights.bf16_tiles`` order. A
+task issues its weight loads before it polls its input, so the weights stream
+while the earlier stages finish.
 """
 
 from __future__ import annotations
@@ -77,40 +76,41 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.dims import (
     DRAFT_BLOCK,
     HIDDEN,
     OWNED,
+    PRE_EPS,
     WORLD,
 )
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import Stage, placement
 
-SCAT_TASKS = gl.constexpr(128)
 SCAT_COLS = gl.constexpr(64)
-SUM_TASKS = gl.constexpr(8)  # tasks per row of sum1 and norm
+SCAT_TASKS = gl.constexpr(HIDDEN // SCAT_COLS)  # 128
 SUM_COLS = gl.constexpr(128)
-EPS = gl.constexpr(1e-5)
-COEFS = gl.constexpr(2048)  # side x tap x group of the MLP convolution
+SUM_TASKS = gl.constexpr(OWNED // SUM_COLS)  # tasks per row of sum1 and norm
+EPS = PRE_EPS  # the draft's RMSNorm epsilon, the target's (1e-5)
+INTER = gl.constexpr(3584)  # gate (and up) rows a rank
+GU = gl.constexpr(2 * INTER)  # gate then up rows
 # Gate/up and down tasks: 128 output rows x a 512-wide K part (128 KiB of
 # weight). Longer K parts make fewer partials to sum, but each task then polls
 # a longer stretch of its input rows: 64 x 1024 and 32 x 2048 for gate/up, and
 # 32 x 1792 for down, measured equal or slower.
 GU_ROWS = gl.constexpr(128)
 GU_KS = gl.constexpr(512)
-GU_KPARTS = gl.constexpr(16)  # HIDDEN / GU_KS
+GU_KPARTS = gl.constexpr(HIDDEN // GU_KS)  # 16
 DOWN_ROWS = gl.constexpr(128)
 DOWN_KS = gl.constexpr(512)
-DOWN_KPARTS = gl.constexpr(7)  # INTER / DOWN_KS
-COEF_KS = gl.constexpr(4096)  # K values of a coef task
-COEF_KPARTS = gl.constexpr(2)  # HIDDEN / COEF_KS
-COEF_ROWS = gl.constexpr(16)  # output rows of a coef task
-GROUPS = gl.constexpr(512)  # convolution groups of 16 channels
+DOWN_KPARTS = gl.constexpr(INTER // DOWN_KS)  # 7
 GROUP_SIZE = gl.constexpr(16)
+GROUPS = gl.constexpr(HIDDEN // GROUP_SIZE)  # convolution groups of 16 channels
+COEFS = gl.constexpr(4 * GROUPS)  # side x tap x group of the MLP convolution
+COEF_KS = gl.constexpr(4096)  # K values of a coef task
+COEF_KPARTS = gl.constexpr(HIDDEN // COEF_KS)  # 2
+COEF_ROWS = gl.constexpr(16)  # output rows of a coef task
 BLOCK = DRAFT_BLOCK  # the convolution's span
-CONV_TASKS = gl.constexpr(64)
 CONV_COLS = gl.constexpr(128)
-INTER = gl.constexpr(3584)  # gate (and up) rows a rank
-GU = gl.constexpr(7168)  # gate then up rows
-ACT_TASKS = gl.constexpr(112)
+CONV_TASKS = gl.constexpr(HIDDEN // CONV_COLS)  # 64
 ACT_COLS = gl.constexpr(32)
+ACT_TASKS = gl.constexpr(INTER // ACT_COLS)  # 112
 FIN_TASKS = gl.constexpr(256)
-FIN_COLS = gl.constexpr(32)
+FIN_COLS = gl.constexpr(HIDDEN // FIN_TASKS)  # 32
 
 PEERS = ("red", "ss", "hin")
 
@@ -366,6 +366,8 @@ def _sum_norm(
     inv = gl.rsqrt(gl.sum(got.to(gl.float32, bitcast=True), axis=0) / HIDDEN + EPS)
     h_lo = (lo * inv * gain_lo).to(gl.bfloat16)
     h_hi = (hi * inv * gain_hi).to(gl.bfloat16)
+    # Packed by hand: mx.pack_bf16_pairs(gl.join(...)) returns the words in
+    # another layout than the put's offsets.
     word = (h_lo.to(gl.int16, bitcast=True).to(gl.int32) & 0xFFFF) | (
         h_hi.to(gl.int16, bitcast=True).to(gl.int32) << 16
     )
@@ -538,6 +540,8 @@ def conv0_stage(
     p_hi = mx.bf16_half(hp_w, 1)
     y_lo = (b0_lo + d0) * h_lo + gl.where(live, (b1_lo + d1) * p_lo, 0.0)
     y_hi = (b0_hi + d0) * h_hi + gl.where(live, (b1_hi + d1) * p_hi, 0.0)
+    # Packed by hand: mx.pack_bf16_pairs(gl.join(...)) returns the words in
+    # another layout than the put's offsets.
     word = (y_lo.to(gl.bfloat16).to(gl.int16, bitcast=True).to(gl.int32) & 0xFFFF) | (
         y_hi.to(gl.bfloat16).to(gl.int16, bitcast=True).to(gl.int32) << 16
     )
@@ -578,6 +582,8 @@ def act_stage(mb, task, STAGE: gl.constexpr):
     )
     lo = (lo_g / (1.0 + gl.exp(-lo_g)) * lo_u).to(gl.bfloat16)
     hi = (hi_g / (1.0 + gl.exp(-hi_g)) * hi_u).to(gl.bfloat16)
+    # Packed by hand: mx.pack_bf16_pairs(gl.join(...)) returns the words in
+    # another layout than the put's offsets.
     word = (lo.to(gl.int16, bitcast=True).to(gl.int32) & 0xFFFF) | (
         hi.to(gl.int16, bitcast=True).to(gl.int32) << 16
     )

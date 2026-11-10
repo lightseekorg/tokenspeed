@@ -72,22 +72,27 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.weights import bf16_tiles
 cdna4 = gl.amd.cdna4
 
 VOCAB = 202048
-SHARD = gl.constexpr(25256)  # vocabulary rows a rank: VOCAB / WORLD
-BLOCKS = gl.constexpr(1579)  # 16-row blocks of the shard, the last half padding
+SHARD = gl.constexpr(VOCAB // WORLD)  # vocabulary rows a rank: 25256
+# 16-row blocks of the shard, the last half padding.
+BLOCKS = gl.constexpr(triton.cdiv(SHARD, 16))
 TASK_BLOCKS = gl.constexpr(7)
-LMH_TASKS = gl.constexpr(226)  # ceil(BLOCKS / TASK_BLOCKS)
+LMH_TASKS = gl.constexpr(triton.cdiv(BLOCKS, TASK_BLOCKS))  # 226
 LMH_KS = gl.constexpr(512)  # K values of one weight load round
 TOPK = gl.constexpr(16)
 RANK_DIM = gl.constexpr(256)  # the selector's rank
+HPROJ_ROWS = gl.constexpr(128)
 HPROJ_KS = gl.constexpr(1024)
-HPROJ_KPARTS = gl.constexpr(8)
-HPROJ_TASKS = gl.constexpr(16)  # 2 groups of 128 rows x 8 K parts
+HPROJ_KPARTS = gl.constexpr(HIDDEN // HPROJ_KS)  # 8
+HPROJ_TASKS = gl.constexpr(RANK_DIM // HPROJ_ROWS * HPROJ_KPARTS)  # 2 x 8
 STEPS = 7  # draft steps a block: rows 1 .. 7
-REQUEST_STEPS = gl.constexpr(STEPS)
 MAX_REQUESTS = 2  # requests a launch: their steps one after another
+# The kernels read module globals only as constexprs; the host code above
+# takes the plain ints.
+REQUEST_STEPS = gl.constexpr(STEPS)
 VOCAB_IDS = gl.constexpr(VOCAB)
 ID_BITS = gl.constexpr(15)  # a shard row's index fits 15 bits
 GID_BITS = gl.constexpr(18)  # a token id fits 18 bits
+assert int(SHARD) <= 1 << int(ID_BITS) and VOCAB <= 1 << int(GID_BITS)
 
 PEERS = ("rk",)
 
@@ -102,7 +107,12 @@ def regions() -> tuple[tuple[str, int], ...]:
     )
 
 
-BASES = {"lmh": 0, "hproj": 226, "merge": 242}
+# hproj and merge run on the CTAs after lmh's.
+BASES = {
+    "lmh": 0,
+    "hproj": int(LMH_TASKS),
+    "merge": int(LMH_TASKS) + int(HPROJ_TASKS),
+}
 
 
 def stages(bases: dict[str, int], rows: int) -> tuple[Stage, ...]:
@@ -292,12 +302,8 @@ def lmh_stage(mb, task, x, w, scale):
     key = _ordered(y.to(gl.int16, bitcast=True).to(gl.int32))
     # Larger is better; on equal values the lower row wins.
     packed = gl.where(valid, (key << ID_BITS) | ((1 << ID_BITS) - 1 - lid), -1)
+    best = _best16(packed, 1, gl.SliceLayout(0, bl))
     j = gl.arange(0, TOPK, gl.SliceLayout(0, bl))[None, :]
-    best = gl.full([RP, TOPK], -1, gl.int32, bl)
-    for i in range(TOPK):  # a runtime loop, as in _best16
-        m = gl.max(packed, axis=1)[:, None]
-        best = gl.where(j == i, m, best)
-        packed = gl.where(packed == m, -1, packed)
     mb.put("tk", mb.row_offset(r) + task * TOPK + j, best, mask=(r < R) & (j >= 0))
     mb.stamp("lmh", trace.END)
 
@@ -307,11 +313,11 @@ def hproj_stage(mb, task, x, w):
     """Hproj task ``task``: the selector's hidden projection, rows
     ``128 (task // 8) ..``, K part ``task % 8``, into ``hpart``."""
     R: gl.constexpr = schedule.rows(mb.plan)
-    tiles = draft_mlp.proj_issue(task, w, RANK_DIM, HIDDEN, 128, HPROJ_KS)
+    tiles = draft_mlp.proj_issue(task, w, RANK_DIM, HIDDEN, HPROJ_ROWS, HPROJ_KS)
     mb.stamp("hproj", trace.START)
     xs = bf16.load_global_rows(x, HIDDEN, (task % HPROJ_KPARTS) * HPROJ_KS, HPROJ_KS, R)
     draft_mlp.proj_compute(
-        mb, task, tiles, xs, "hpart", RANK_DIM, HIDDEN, 128, HPROJ_KS, "hproj"
+        mb, task, tiles, xs, "hpart", RANK_DIM, HIDDEN, HPROJ_ROWS, HPROJ_KS, "hproj"
     )
 
 
@@ -470,8 +476,9 @@ def gluon_muse_spark_draft_head_gfx950(
     PLAN: gl.constexpr,
     RANK: gl.constexpr,
 ):
-    """The draft head of one or two requests' draft steps on rank ``RANK`` (see the
-    module docstring and :func:`launch_gluon_muse_spark_draft_head_gfx950`)."""
+    """The draft head of one or two requests' draft steps on rank ``RANK``
+    (see the module docstring and
+    :func:`launch_gluon_muse_spark_draft_head_gfx950`)."""
     table_ = trace.allocate(trace_buf)
     peers = mailbox.load_peers(bases, RANK, gl.load(step) & 1, WORLD)
     mb = mailbox.Mailbox(scratch, mailbox.launch_tag(step, 0), PLAN, table_, peers)
@@ -545,18 +552,19 @@ def launch_gluon_muse_spark_draft_head_gfx950(
             f"the head serves {STEPS} draft steps a request, at most "
             f"{MAX_REQUESTS} requests, got {rows} rows"
         )
+    hidden, topk = int(HIDDEN), int(TOPK)
     if (
         x.dtype != torch.bfloat16
-        or tuple(x.shape) != (rows, 8192)
+        or tuple(x.shape) != (rows, hidden)
         or not x.is_contiguous()
     ):
-        raise ValueError(f"x: contiguous BF16 [{rows}, 8192]")
+        raise ValueError(f"x: contiguous BF16 [{rows}, {hidden}]")
     for name, t, dtype, shape in (
         ("first_token", first_token, torch.int32, (requests,)),
         ("anchor", anchor, torch.int64, (requests,)),
-        ("cand_ids", cand_ids, torch.int64, (rows, 16)),
-        ("unary", unary, torch.float32, (rows, 16)),
-        ("scores", scores, torch.float32, (rows, 16, 16)),
+        ("cand_ids", cand_ids, torch.int64, (rows, topk)),
+        ("unary", unary, torch.float32, (rows, topk)),
+        ("scores", scores, torch.float32, (rows, topk, topk)),
     ):
         if t.dtype != dtype or tuple(t.shape) != shape or not t.is_contiguous():
             raise ValueError(f"{name}: contiguous {dtype} {shape}")

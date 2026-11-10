@@ -45,13 +45,13 @@ layers' ``window_left`` of 2047 plus the row's own key).
   two requests, each with its own length and page table): one task per
   split of the request's cached keys
   ``[max(seq_len - 2048, 0), seq_len - 8)``, ``ceil(n / SPLITS)`` each, one
-  chunk of at most 128 (16 splits hold the 2040) with a base-2 softmax; every row's 8 heads are one
-  MFMA row each (64 rows). The last split also takes the block's 8 keys from
-  ``kb`` / ``vb``, as one more chunk, for every row (non-causal). A task
-  publishes FP32 ``acc / l`` and the LSE (``-inf`` for an empty split) as
-  plain words, then one flag (``Mailbox.store_words`` / ``raise_flag``): at
-  8 rows a task writes 64 x 128 values, and tagged pairs would double the
-  stores.
+  chunk of at most 128 (16 splits hold the 2040) with a base-2 softmax;
+  every row's 8 heads are one MFMA row each (64 rows). The last split also
+  takes the block's 8 keys from ``kb`` / ``vb``, as one more chunk, for
+  every row (non-causal). A task publishes FP32 ``acc / l`` and the LSE
+  (``-inf`` for an empty split) as plain words, then one flag
+  (``Mailbox.store_words`` / ``raise_flag``): at 8 rows a task writes
+  64 x 128 values, and tagged pairs would double the stores.
 * merge, 8 tasks per row, one per q head: after the splits' flags, the LSE
   merge of the splits, BF16, published in ``ao`` for the output projection.
 
@@ -71,16 +71,17 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.dims import (
     DRAFT_BLOCK,
     DRAFT_HEAD_DIM,
     DRAFT_Q_HEADS,
+    HIDDEN,
 )
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import Stage, placement
 
 HEAD = DRAFT_HEAD_DIM
-HALF = gl.constexpr(64)  # rotary pairs of a head (NeoX: i and i + 64)
+HALF = gl.constexpr(HEAD // 2)  # rotary pairs of a head (NeoX: i and i + 64)
 Q_HEADS = DRAFT_Q_HEADS
-QKV = gl.constexpr(1280)  # q (8 x 128), k (128), v (128) rows a rank
-QKV_KPARTS = gl.constexpr(16)  # K parts of the qkv projection (8192 / 512)
-HEAD_TASKS = gl.constexpr(10)  # tasks per row: 8 q heads, k, v
-EPS = gl.constexpr(1e-5)
+Q_ROWS = gl.constexpr(Q_HEADS * HEAD)  # q rows a rank: the attention width
+QKV = gl.constexpr(Q_ROWS + 2 * HEAD)  # q, k (128), v (128) rows a rank
+HEAD_TASKS = gl.constexpr(Q_HEADS + 2)  # tasks per row: 8 q heads, k, v
+EPS = draft_mlp.EPS
 PAGE = gl.constexpr(64)  # tokens a KV page
 BN = gl.constexpr(128)  # keys a chunk
 QM = gl.constexpr(64)  # MFMA rows of attention: 8 block rows x 8 heads
@@ -91,11 +92,18 @@ BLOCK_ROWS = DRAFT_BLOCK
 QK_SCALE = gl.constexpr(0.08838834764831845 * 1.4426950408889634)
 
 
-QKV_TASKS = gl.constexpr(160)  # 10 groups of 128 rows x 16 K parts of 512
-OPROJ_KPARTS = gl.constexpr(2)  # o_proj's K (1024) in parts of 512
-OPROJ_TASKS = gl.constexpr(128)  # 64 groups of 128 rows x 2 K parts
+# The projections' tasks: QKV_ROWS (OPROJ_ROWS) output rows x a K part of
+# QKV_KS (OPROJ_KS) values.
+QKV_ROWS = gl.constexpr(128)
+QKV_KS = gl.constexpr(512)
+QKV_KPARTS = gl.constexpr(HIDDEN // QKV_KS)  # 16
+QKV_TASKS = gl.constexpr(QKV // QKV_ROWS * QKV_KPARTS)  # 10 groups x 16 K parts
+OPROJ_ROWS = gl.constexpr(128)
+OPROJ_KS = gl.constexpr(512)
+OPROJ_KPARTS = gl.constexpr(Q_ROWS // OPROJ_KS)  # o_proj's K (1024): 2 parts
+OPROJ_TASKS = gl.constexpr(HIDDEN // OPROJ_ROWS * OPROJ_KPARTS)  # 64 x 2
 AFIN_TASKS = gl.constexpr(256)
-AFIN_COLS = gl.constexpr(32)  # 8192 / AFIN_TASKS
+AFIN_COLS = gl.constexpr(HIDDEN // AFIN_TASKS)  # 32
 
 
 def regions(splits: int) -> tuple[tuple[str, int], ...]:
@@ -126,8 +134,8 @@ PEERS = ("ared", "ass", "ahin")
 
 
 def stages(bases: dict[str, int], splits: int, rows: int) -> tuple[Stage, ...]:
-    """The attention half of ``rows`` token rows (one block), placed by
-    ``bases``."""
+    """The attention half of ``rows`` token rows (one or two requests'
+    blocks), placed by ``bases``."""
     names = (
         "iscat",
         "isum",
@@ -232,7 +240,32 @@ def head_stage(
     at = k * QKV + head * HEAD + i[None, :]
     lo_w, hi_w = mb.poll_many(("qpart", "qpart"), (at, at + HALF))
     mb.stamp(STAGE, trace.READY)
-    # The projection's output: the K parts summed, rounded once to BF16.
+    vals = head_values(lo_w, hi_w, w1, w2, cos, sin, rotated)
+    pl: gl.constexpr = vals.type.layout
+    pair = gl.reshape(vals, [HALF, 2])
+    word = mx.pack_bf16_pairs(pair)
+    p = gl.arange(0, HALF, word.type.layout)
+    if is_q:
+        mb.put("qh", head * (HEAD // 2) + p, word)
+    elif is_k:
+        mb.put("kb", p, word)
+        cols = gl.arange(0, HEAD, pl)
+        gl.store(k_cache + slot * HEAD + cols, vals)
+    else:
+        mb.put("vb", p, word)
+        cols = gl.arange(0, HEAD, pl)
+        gl.store(v_cache + slot * HEAD + cols, vals)
+    mb.stamp(STAGE, trace.END)
+
+
+@gluon.jit
+def head_values(lo_w, hi_w, w1, w2, cos, sin, rotated):
+    """A head's K-part words ``[K part, 64]`` (lo_w: dims i, hi_w: i + 64) as
+    its BF16 values ``[128]`` in head order, two a lane: the K parts summed
+    and rounded once to BF16 (the projection's output), then if ``rotated``
+    the per-head RMSNorm (gains ``w1``, ``w2``) and NeoX RoPE in FP32,
+    rounded once, as the attention prologue does. The draft context write
+    (``draft_context``) forms its K and V the same way."""
     x1 = gl.sum(lo_w.to(gl.float32, bitcast=True), axis=0)
     x2 = gl.sum(hi_w.to(gl.float32, bitcast=True), axis=0)
     x1 = x1.to(gl.bfloat16).to(gl.float32)
@@ -253,22 +286,8 @@ def head_stage(
     # odd halves of a pair sit on two lanes; regroup through a layout change.
     full = gl.join(b1, b2)  # [64, 2]: (i, i + 64)
     vals = gl.reshape(gl.permute(full, [1, 0]), [HEAD])  # head order
-    pl: gl.constexpr = gl.BlockedLayout([2], [64], [nw], [0])
-    vals = gl.convert_layout(vals, pl)
-    pair = gl.reshape(vals, [HALF, 2])
-    word = mx.pack_bf16_pairs(pair)
-    p = gl.arange(0, HALF, word.type.layout)
-    if is_q:
-        mb.put("qh", head * (HEAD // 2) + p, word)
-    elif is_k:
-        mb.put("kb", p, word)
-        cols = gl.arange(0, HEAD, pl)
-        gl.store(k_cache + slot * HEAD + cols, vals)
-    else:
-        mb.put("vb", p, word)
-        cols = gl.arange(0, HEAD, pl)
-        gl.store(v_cache + slot * HEAD + cols, vals)
-    mb.stamp(STAGE, trace.END)
+    pl: gl.constexpr = gl.BlockedLayout([2], [64], [gl.num_warps()], [0])
+    return gl.convert_layout(vals, pl)
 
 
 @gluon.constexpr_function
@@ -348,14 +367,15 @@ def attn_stage(
     """
     R: gl.constexpr = min(schedule.rows(mb.plan), BLOCK_ROWS)
     gl.static_assert(R * Q_HEADS <= QM)
-    # One request: no request index (the launch's code stays as it was).
+    # Two requests: request task // SPLITS's split task % SPLITS. A launch of
+    # one request computes no request index.
     if schedule.rows(mb.plan) > BLOCK_ROWS:
         req = task // SPLITS
         task = task % SPLITS
         mb = mb.row(req * BLOCK_ROWS)
         table = table + req * table_stride
         seq_len = seq_len + req
-    # Every split's cached keys fit one chunk: ceil(2041 / SPLITS) <= BN.
+    # Every split's cached keys fit one chunk: ceil(2040 / SPLITS) <= BN.
     gl.static_assert((WINDOW_KEYS - BLOCK_ROWS + SPLITS - 1) // SPLITS <= BN)
     mb.stamp(STAGE, trace.START)
     s = task
@@ -424,11 +444,17 @@ def attn_stage(
     acc = gl.zeros([QM, HEAD], gl.float32, pv_mma)
     # A split's cached keys fit one chunk (see the static assert): no loop,
     # and no second chunk's registers.
+    # Every wave's LDS stores above (v_smem, cur_k, cur_v) land before any
+    # wave loads them.
     gl.barrier()
     m, l, acc = softmax_step(
         q, keys, v_smem.load(v_layout), valid, m, l, acc, p_layout, QK_SCALE
     )
-    # The block's keys, for every row (the block is non-causal).
+    # The block's keys, for every row (the block is non-causal). The other
+    # splits mask every key, so for them the step leaves m, l and acc as
+    # they were.
+    # Every wave is done with the first step's LDS reads (v_smem and its
+    # layout changes) before the block's step writes LDS again.
     gl.barrier()
     qi = gl.arange(0, QM, gl.SliceLayout(1, qk_mma))
     u = gl.arange(0, KT, gl.SliceLayout(0, qk_mma))
@@ -486,7 +512,8 @@ def merge_stage(mb, task, SPLITS: gl.constexpr, STAGE: gl.constexpr):
     s = gl.arange(0, SPLITS, gl.SliceLayout(1, ml))
     c = gl.arange(0, HEAD, gl.SliceLayout(0, ml))
     mb.poll_flags("aflag", flag0 + s)
-    # Every split's flag is in: the words load after the poll returned.
+    # Each wave polls some of the splits' flags: the words load after every
+    # wave's poll returned, so every split's flag is in.
     gl.barrier()
     got_p = mb.load_words("apart", (s[:, None] * Q_HEADS + h) * HEAD + c[None, :])
     got_l = mb.load_words("alse", s * Q_HEADS + h)
