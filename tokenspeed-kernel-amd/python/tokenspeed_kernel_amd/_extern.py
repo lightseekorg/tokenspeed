@@ -155,25 +155,30 @@ def sched_group(mask, size, _semantic):
 # Memory synchronization (_sync.ll).
 
 
+def _wait(function, _semantic):
+    return _call("sync", function, [], (), tl.int32, is_pure=False, _semantic=_semantic)
+
+
 @tl.core.extern
-def release_drain(_semantic):
-    """Wait for this wave's vector memory operations (``s_waitcnt vmcnt(0)``),
-    keeping its earlier stores above the wait; no L2 write-back.
+def wait_vmem(_semantic):
+    """Wait for this wave's vector memory loads, stores and atomics
+    (``s_waitcnt vmcnt(0)``). gfx9 targets such as gfx950 count them all in
+    one counter. Launch with :func:`extern_compile_options`.
 
     Only this wave's operations are waited for: follow it with
     ``gl.barrier()`` when every wave's stores must land before one thread
-    publishes. Loads the wave issued earlier are waited for too (one
-    in-order counter). Launch with :func:`extern_compile_options`.
+    publishes. It doesn't write back any cache.
     """
-    return _call(
-        "sync",
-        "release_drain",
-        [],
-        (),
-        tl.int32,
-        is_pure=False,
-        _semantic=_semantic,
-    )
+    return _wait("wait_vmem", _semantic)
+
+
+@tl.core.extern
+def wait_stores(_semantic):
+    """Wait for this wave's vector stores and non-returning atomics
+    (``s_wait_storecnt 0x0``) on gfx12 targets such as gfx1250. Launch with
+    :func:`extern_compile_options`.
+    """
+    return _wait("wait_stores", _semantic)
 
 
 # Wave-level operations (_wave.ll).

@@ -28,7 +28,7 @@ from threading import Lock
 from typing import NamedTuple
 
 import torch
-from tokenspeed_kernel_amd._extern import extern_compile_options, release_drain
+from tokenspeed_kernel_amd._extern import extern_compile_options, wait_vmem
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.indexing import (
     _check_packed_fp8_inputs,
@@ -485,7 +485,7 @@ def _dsa_persistent_radix_topk_kernel(
         # the whole program, and s_barrier does not wait for memory. So each
         # wave first waits until its no-return atomics reach L2 (vmcnt counts
         # them like stores).
-        release_drain()
+        wait_vmem()
         gl.barrier()
 
         row_pass_arrival = pass_arrivals + row * _PERSISTENT_COUNTER_STRIDE
@@ -1011,11 +1011,6 @@ def _dsa_multi_cta_histogram_kernel(
 
 
 @gluon.jit
-def _wait_vector_memory():
-    gl.inline_asm("s_waitcnt vmcnt(0)", "", [], (), is_pure=False)
-
-
-@gluon.jit
 def _count_multi_cta_digits(
     shared_histogram,
     keys,
@@ -1487,7 +1482,7 @@ def _dsa_multi_cta_select_kernel(
         )
     gl.store(row_counts + tile, gl.minimum(listed_count, CHUNK), cache_modifier=".wt")
     # Write-through stores: arrival needs no writeback, only every wave's stores done.
-    _wait_vector_memory()
+    wait_vmem()
     gl.barrier()
     arrived = gl.atomic_add(
         row_arrival, 1 + ((totals & 0xFFFF) << 12), sem="relaxed", scope="gpu"
@@ -3119,6 +3114,7 @@ def _dsa_multi_cta_topk(
         CHUNK=chunk,
         TIE_CAP=_MULTI_CTA_TIE_CAP,
         num_warps=_MULTI_CTA_NUM_WARPS,
+        **extern_compile_options(),
     )
     return out, lens_out
 

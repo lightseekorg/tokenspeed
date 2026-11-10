@@ -632,11 +632,6 @@ INLINE_ASM_ON_MAIN = {
         "keeps each K step's FMAs at their step (an empty template)",
         "a Gluon op that pins a value to a program point",
     ),
-    "gluon_mm_a16w16_medium_gfx950": (
-        _AMD + "gemm.fp16.mm:gluon_mm_a16w16_medium_gfx950",
-        "waits for the wave's partial stores before the split-K arrival",
-        "a release fence that waits for stores without an L2 write-back",
-    ),
     "_iris_subgroup_any": (
         "tokenspeed_kernel.ops.communication._iris.all_reduce:_iris_subgroup_any",
         "a wave vote in Iris kernels, which link no library for"
