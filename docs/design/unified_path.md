@@ -539,6 +539,31 @@ computes the stored width and consumes only logical columns, while CuTe gives
 TMA a logical view of that same storage. Eager and CUDA graph calls therefore
 share both the weight layout and its update semantics.
 
+CuTe gated residual mixing keeps model dimensions static and token rows dynamic
+within bounded full/tail and scheduling-round buckets. Scheduling-round
+boundaries depend on measured worker capacity, so one tile bucket can span
+several round buckets on a different device or stream. The cooperative grid
+must fit the selected function's measured resident capacity. Local pipelines
+share a physical CTA; their logical tiles are counted separately from that
+capacity. A rank-ordered FP32 merge completes Down before SiLU and publishes
+activation tiles through per-invocation epochs. Persistent scratch is allocated
+independently of the inference-mode context that first warms a layout.
+
+Down and Up reuse one shared-memory operand arena after Down's MMA completion.
+Up uses separate weight and activation rings when their stage counts differ;
+each ring waits for its last MMA reader before overwriting a slot. Large token
+tiles can retain two Up accumulators, publishing the first only after its final
+K tiles complete while the second continues. Readers acknowledge TMEM before
+reuse or deallocation. PDL, mutable weights and eager/graph calls use these same
+ownership and publication edges. Startup warms the bounded tactic variants
+through the ordinary operator. The validated model dimensions `(4, 2560, 320)`
+and `(4, 8192, 1024)` use the same parameterized implementation, with
+model-specific tile geometry, Up K width and cache policy. Token tiles for the
+existing model preserve resident parallelism and bound per-thread gate state
+for larger batches. Row-derived reduction groups and token pairing belong
+only to the wider model. Other dimensions keep ordinary kernel selection;
+the fused work budget still bounds automatic selection.
+
 Startup uses the ordinary dummy model traversal with `kernel_warmup` to
 prepare CuTe QSA, streaming top-k and gated residual configurations. It follows
 normal dispatch overrides and scratch budgets, independently of optional
