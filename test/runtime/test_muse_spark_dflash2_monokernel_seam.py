@@ -196,10 +196,28 @@ def test_decode_monokernel_refuses_a_draft_it_cannot_pack() -> None:
     assert draft.monokernel_state is None
 
 
+def _mla_checkpoint(draft: DFlash2DraftModel):
+    """``draft``'s own parameters under the names of an MLA DFlash2
+    checkpoint, which keeps the projections the draft fuses apart."""
+    q_lora_rank = int(draft.config.q_lora_rank)
+    for name, param in draft.named_parameters():
+        if ".gate_up_proj." in name:
+            gate, up = param.chunk(2)
+            yield name.replace("gate_up_proj", "gate_proj"), gate
+            yield name.replace("gate_up_proj", "up_proj"), up
+        elif ".fused_qkv_a_proj_with_mqa." in name:
+            fused = "fused_qkv_a_proj_with_mqa"
+            yield name.replace(fused, "q_a_proj"), param[:q_lora_rank]
+            yield name.replace(fused, "kv_a_proj_with_mqa"), param[q_lora_rank:]
+        else:
+            yield name, param
+
+
 def test_an_mla_draft_under_decode_monokernel_fails_at_packing() -> None:
     """An MLA draft is not the one the kernels bake in: under the switch it
-    still builds the monokernel layer class, and packing refuses it with the
-    reason, so startup fails instead of serving it on the regular path."""
+    still builds the monokernel layer class, and loading its weights packs
+    it, which refuses it with the reason, so startup fails instead of serving
+    it on the regular path. One rank: the weights load unsharded."""
     mla = _config(
         decode_monokernel=True,
         qk_nope_head_dim=128,
@@ -209,12 +227,11 @@ def test_an_mla_draft_under_decode_monokernel_fails_at_packing() -> None:
         kv_lora_rank=512,
     )
     mla.dflash_config = {**mla.dflash_config, "attention_mode": "mla"}
-    draft = _draft(mla)
+    draft = _draft(mla, tp=1)
     assert config_reasons(mla) == [MLA_DRAFT]
     assert draft.decoder_layer_cls is DFlash2MonokernelDecoderLayer
-    assert model_reasons(draft) == [MLA_DRAFT]
     with pytest.raises(ValueError, match=f"layers: {MLA_DRAFT}"):
-        enable_draft_monokernels(draft)
+        draft.load_weights(_mla_checkpoint(draft))
 
 
 def test_without_decode_monokernel_the_same_draft_loads() -> None:

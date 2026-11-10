@@ -691,12 +691,16 @@ class DFlash2DraftModel(DFlashDraftModel):
             )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        if not self._uses_mla:
+        if self._uses_mla:
+            loaded = self._load_mla_weights(weights)
+        else:
             loaded = super().load_weights(weights)
-            if self.decoder_layer_cls is DFlash2MonokernelDecoderLayer:
-                enable_draft_monokernels(self)
-            return loaded
+        # Packs every piece or fails startup naming why, an MLA draft too.
+        if self.decoder_layer_cls is DFlash2MonokernelDecoderLayer:
+            enable_draft_monokernels(self)
+        return loaded
 
+    def _load_mla_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
         params = dict(self.named_parameters())
         loaded: set[str] = set()
         unexpected: list[str] = []
