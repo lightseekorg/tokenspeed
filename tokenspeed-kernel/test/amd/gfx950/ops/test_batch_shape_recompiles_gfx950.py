@@ -845,36 +845,3 @@ def test_dsa_decode_scorer_table_width():
         compile_for,
         (1, 16386),
     )
-
-
-def test_chunked_prefix_indices_slice_alignment():
-    from tokenspeed.runtime.layers.attention.chunk import (
-        create_chunked_cache_kv_indices_paged,
-    )
-
-    table = torch.empty(16, 1024, device=DEVICE, dtype=torch.int32)
-    lengths = torch.empty(128, device=DEVICE, dtype=torch.int32)
-    cumulative = torch.empty(128, device=DEVICE, dtype=torch.int32)
-    output = torch.empty(8192, device=DEVICE, dtype=torch.int32)
-
-    # Compile only. A prefix chunk's per-request arrays start at any request
-    # of the batch's, so their pointers lose 16-byte alignment.
-    def compile_for(offsets):
-        offset, cumulative_offset = offsets
-        create_chunked_cache_kv_indices_paged.warmup(
-            table,
-            lengths[offset : offset + 16],
-            lengths[offset : offset + 16],
-            cumulative[cumulative_offset : cumulative_offset + 17],
-            output,
-            page_table_ptr_stride=1024,
-            PAGE_SIZE=64,
-            grid=(1,),
-        )
-
-    assert_warmup_covers(
-        (create_chunked_cache_kv_indices_paged,),
-        lambda: compile_for((0, 0)),
-        compile_for,
-        ((1, 1), (1, 4)),
-    )

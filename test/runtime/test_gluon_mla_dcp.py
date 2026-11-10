@@ -30,15 +30,25 @@ Geometry is Kimi-K3.1's EAGLE-3.1 MLA draft layer: 12 heads per TP rank, so a
 KVP group of ``degree`` ranks attends ``12 * degree`` gathered heads.
 """
 
+import os
+import sys
+
 import pytest
 import torch
 from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (
     virtual_slots_to_local,
 )
-from utils import is_cdna4
+from tokenspeed_kernel.platform import current_platform
 
-if not is_cdna4():
-    pytest.skip("AMD CDNA4 is required for Gluon MLA tests", allow_module_level=True)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=30, suite="runtime-1gpu")
+
+pytestmark = pytest.mark.skipif(
+    not (torch.cuda.is_available() and current_platform().is_cdna4),
+    reason="the Gluon MLA decode kernels require AMD gfx950 (CDNA4)",
+)
 
 KV_LORA, ROPE, NOPE = 512, 64, 128
 WIDTH = KV_LORA + ROPE
