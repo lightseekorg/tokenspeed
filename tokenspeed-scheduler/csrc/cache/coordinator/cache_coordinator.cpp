@@ -162,6 +162,7 @@ CacheCoordinator::CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t 
                                    std::int32_t checkpoint_retention_leaf_distance)
     : groups_{std::move(groups)},
       pool_{pool},
+      active_parents_{pool.NumLcmBlocks()},
       host_pool_{host_pool},
       snapshot_pool_{snapshot_pool},
       stream_device_cache_to_host_{stream_device_cache_to_host && host_pool != nullptr},
@@ -1401,30 +1402,18 @@ std::int32_t CacheCoordinator::NumAvailableLcmBlocks() const {
     return available;
 }
 
-std::int32_t CacheCoordinator::NumActiveLcmBlocks(std::span<const std::span<const BlockTable>> request_tables) const {
+std::int32_t CacheCoordinator::CountActiveLcmBlocks(std::span<const std::span<const BlockTable>> request_tables) const {
     // Parent ids are dense in [1, NumLcmBlocks], so byte flags dedupe shared
     // prefixes without hashing every block reference of every live request.
-    // The walk reads each table's page ids, kept contiguous beside its
-    // references, rather than following every reference to its block: at long
-    // contexts that pointer chase was most of the walk. A Device page id is
-    // 1 + (parent - 1) * packing + slot (BlockPool::ResolveCacheBlockId), and 0
-    // for a null slot.
     std::vector<std::uint8_t> seen(static_cast<std::size_t>(pool_.NumLcmBlocks()) + 1, 0);
-    std::vector<std::uint32_t> packing(groups_.size());
-    for (std::size_t i = 0; i < groups_.size(); ++i) {
-        packing[i] = static_cast<std::uint32_t>(pool_.Packing(groups_[i].Id()));
-    }
     std::int32_t active = 0;
     for (std::span<const BlockTable> tables : request_tables) {
-        _assert(tables.size() <= groups_.size(), "a request has one table per cache group");
-        for (std::size_t i = 0; i < tables.size(); ++i) {
-            const BlockTable& table = tables[i];
-            for (const std::int32_t page_id : table.PageIds().subspan(table.ReclaimedPrefixBlocks())) {
-                if (page_id == 0) {
+        for (const BlockTable& table : tables) {
+            for (const CacheBlockRef& block_ref : table.Blocks().subspan(table.ReclaimedPrefixBlocks())) {
+                if (!block_ref) {
                     continue;
                 }
-                const std::uint32_t parent = (static_cast<std::uint32_t>(page_id) - 1) / packing[i] + 1;
-                std::uint8_t& parent_seen = seen[parent];
+                std::uint8_t& parent_seen = seen[static_cast<std::size_t>(block_ref->Location().lcm_block_id)];
                 if (!parent_seen) {
                     parent_seen = 1;
                     ++active;

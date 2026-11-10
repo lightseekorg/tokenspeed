@@ -429,11 +429,17 @@ public:
 private:
     // Debug builds re-resolve every live slot the way the export did before
     // tables kept their page ids, and fail on any slot a write left stale.
+    // They also check that the released prefix holds no block: the export
+    // skips it, and the slots' ParentRefs count every non-null slot.
     void assertPageIdsCurrent([[maybe_unused]] const BlockTable& table) const {
 #ifndef NDEBUG
         const std::span<const CacheBlockRef> blocks = table.Blocks();
         const std::span<const std::int32_t> page_ids = table.PageIds();
         _assert(blocks.size() == page_ids.size(), "a table keeps one page id per slot");
+        const auto released = std::min(static_cast<std::size_t>(table.ReclaimedPrefixBlocks()), blocks.size());
+        for (std::size_t slot = 0; slot < released; ++slot) {
+            _assert(!blocks[slot], "a released-prefix slot still holds a block");
+        }
         for (std::size_t slot = static_cast<std::size_t>(table.ReclaimedPrefixBlocks()); slot < blocks.size(); ++slot) {
             const std::int32_t expected = blocks[slot] ? ResolveCacheBlockId(*blocks[slot]) : 0;
             _assert(page_ids[slot] == expected, "a table's page id went stale");
