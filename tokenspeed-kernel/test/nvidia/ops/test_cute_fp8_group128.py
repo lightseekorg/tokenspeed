@@ -108,7 +108,7 @@ def test_finite_bf16_patterns():
 
 
 def test_variable_rows_do_not_compile():
-    from tokenspeed_kernel.thirdparty.cute_dsl.fp8_group128 import compile_kernel
+    from tokenspeed_kernel.ops.quantization._cute_dsl_fp8_group128 import compile_kernel
 
     for m in (1, 4, 1024):
         quantize(torch.zeros((m, 2560), device="cuda", dtype=torch.bfloat16), True)

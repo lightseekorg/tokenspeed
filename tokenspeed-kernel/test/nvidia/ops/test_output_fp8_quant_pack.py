@@ -134,7 +134,9 @@ def test_output_quant_graph(rows, width, head, kind, pdl):
 
 
 def test_output_quant_reuses_compilation():
-    from tokenspeed_kernel.thirdparty.cute_dsl.fp8_group128 import compile_output_kernel
+    from tokenspeed_kernel.ops.quantization._cute_dsl_fp8_group128 import (
+        compile_output_kernel,
+    )
 
     def run(rows):
         x = torch.randn(rows, 640, device="cuda", dtype=torch.bfloat16)

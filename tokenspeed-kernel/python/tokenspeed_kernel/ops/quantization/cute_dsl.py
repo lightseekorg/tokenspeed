@@ -66,7 +66,7 @@ def cute_dsl_quantize_fp8_group128_packed(
         [1, round_up(M, 4)]. M flattens the leading dimensions. Padding is zero.
         Warm the chosen width and PDL setting before capturing a CUDA Graph.
     """
-    from tokenspeed_kernel.thirdparty.cute_dsl.fp8_group128 import launch
+    from tokenspeed_kernel.ops.quantization._cute_dsl_fp8_group128 import launch
 
     if (
         granularity != "token_group"
@@ -115,7 +115,7 @@ def cute_dsl_quantize_fp8_group128_packed(
 def cute_dsl_output_fp8_packed(
     x, z, weight, *, head_dim, eps, sigmoid_gate, enable_pdl
 ):
-    from tokenspeed_kernel.thirdparty.cute_dsl.fp8_group128 import launch_output
+    from tokenspeed_kernel.ops.quantization._cute_dsl_fp8_group128 import launch_output
 
     rows, width = x.shape
     output = torch.empty_like(
