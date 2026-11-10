@@ -34,6 +34,7 @@ global_server_args_dict: dict = {
     "attention_use_fp4_indexer_cache": ServerArgs.attention_use_fp4_indexer_cache,
     "deepseek_v4_mega_moe_max_num_tokens": ServerArgs.deepseek_v4_mega_moe_max_num_tokens,
     "deepseek_v4_indexer_prefill_max_logits_mb": ServerArgs.deepseek_v4_indexer_prefill_max_logits_mb,
+    "disable_deepseek_v41_token_blacklist": ServerArgs.disable_deepseek_v41_token_blacklist,
     "engram_host_table": ServerArgs.engram_host_table,
     "engram_host_table_dir": ServerArgs.engram_host_table_dir,
     "engram_host_table_layout": ServerArgs.engram_host_table_layout,
@@ -43,6 +44,9 @@ global_server_args_dict: dict = {
     "force_deterministic_rsag": ServerArgs.force_deterministic_rsag,
     "batch_invariant_collectives": ServerArgs.batch_invariant_collectives,
     "numerics": ServerArgs.numerics,
+    "speculative_rejection_sample_method": (
+        ServerArgs.speculative_rejection_sample_method
+    ),
     "yarn_ramp_mask_device": ServerArgs.yarn_ramp_mask_device,
     "yarn_frequency_device": ServerArgs.yarn_frequency_device,
     "mla_lora_scale": ServerArgs.mla_lora_scale,
@@ -98,6 +102,7 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "attention_use_fp4_indexer_cache": server_args.attention_use_fp4_indexer_cache,
             "deepseek_v4_mega_moe_max_num_tokens": server_args.deepseek_v4_mega_moe_max_num_tokens,
             "deepseek_v4_indexer_prefill_max_logits_mb": server_args.deepseek_v4_indexer_prefill_max_logits_mb,
+            "disable_deepseek_v41_token_blacklist": server_args.disable_deepseek_v41_token_blacklist,
             "engram_host_table": server_args.engram_host_table,
             "engram_host_table_dir": server_args.engram_host_table_dir,
             "engram_host_table_layout": server_args.engram_host_table_layout,
@@ -107,6 +112,9 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "force_deterministic_rsag": server_args.force_deterministic_rsag,
             "batch_invariant_collectives": server_args.batch_invariant_collectives,
             "numerics": server_args.numerics,
+            "speculative_rejection_sample_method": (
+                server_args.speculative_rejection_sample_method
+            ),
             "yarn_ramp_mask_device": server_args.yarn_ramp_mask_device,
             "yarn_frequency_device": server_args.yarn_frequency_device,
             "mla_lora_scale": server_args.mla_lora_scale,

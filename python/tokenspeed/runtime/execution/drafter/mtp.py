@@ -70,7 +70,6 @@ A draft model served by this drafter implements:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
@@ -79,7 +78,10 @@ from typing_extensions import override
 
 from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.execution.context import ForwardContext
-from tokenspeed.runtime.execution.drafter.base import BaseDrafter
+from tokenspeed.runtime.execution.drafter.base import (
+    HiddenDraftInput,
+    HiddenStateDrafter,
+)
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
@@ -94,7 +96,6 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
-    from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 
 
 def _extend_depth_precompute(
@@ -295,35 +296,18 @@ def _sharded_tail_contribution(
     """
     n = lengths.shape[0]
     offs, rows = _tail_row_offsets(lengths, width)
-    owned = (offs >= 0) & (rows >= plan.local_start) & (rows < plan.local_end)
     out = shard.new_zeros((n, width) + shard.shape[1:])
     if plan.local_rows > 0:
-        local = (rows - plan.local_start).clamp(0, plan.local_rows - 1)
-        picked = shard[local.reshape(-1)].reshape(out.shape)
+        # A tail slot before a short request's first row names no row.
+        local = plan.local_index_of_row[rows.clamp(0, plan.total_rows - 1)]
+        owned = (offs >= 0) & (local >= 0)
+        picked = shard[local.clamp_min(0).reshape(-1)].reshape(out.shape)
         mask = owned.view((n, width) + (1,) * (shard.dim() - 1))
         out = torch.where(mask, picked, out)
     return out
 
 
-@dataclass
-class MtpDraftInput:
-    input_num_tokens: int
-    num_extends: int
-    forward_mode: ForwardMode
-    base_model_output: torch.Tensor  # [bs] (extend) / [bs * k] (decode verify outputs)
-    accept_lengths: torch.Tensor  # [bs]
-    # The target's FULL hidden rows: the whole span, or this rank's shard of
-    # it under a query shard.
-    base_out_hidden_states: torch.Tensor
-    global_num_tokens: list[int] | None = None
-    global_bs: list[int] | None = None
-    all_decode_or_idle: bool = False
-    # The target forward's query shard: the extend depths run the same shard
-    # of the same span; a sharded engine runs no decode rounds.
-    query_shard: QueryShardPlan | None = None
-
-
-class Mtp(BaseDrafter):
+class Mtp(HiddenStateDrafter):
     """
     Draft model runner for original multi-depth MTP heads.
 
@@ -336,10 +320,6 @@ class Mtp(BaseDrafter):
     KV write to the depth's plane — is enqueued on the caller's stream, so
     the executor's draft-final cache step publishes the complete chain.
     """
-
-    shares_target_embed_head = True
-    supports_pd_layerwise_finalization = True
-    supports_speculative_sampling = True
 
     def __init__(
         self,
@@ -364,8 +344,6 @@ class Mtp(BaseDrafter):
             vocab_size=vocab_size,
         )
 
-        self.device = draft_model_runner.device
-
         # Depth selection rides on spec_step_idx, which ModelRunner forwards
         # only to a forward that declares it: a draft without the parameter
         # would run depth 0 at every step and draft silently wrong tokens.
@@ -387,20 +365,6 @@ class Mtp(BaseDrafter):
                 "step: the step count must not exceed the draft's depth count"
             )
 
-        # Drafter-owned seq_lens the CUDA-graph wrapper aliases into every
-        # draft metadata init (it copies the round's live lengths in; on
-        # EXTEND this buffer also serves as the draft prefill seq_lens).
-        self.draft_seq_lens_buf = torch.zeros_like(self.input_buffers.seq_lens_buf)
-
-        # Precomputed `arange(max_bs) * spec_num_tokens - 1`
-        # gather_ids = gather_ids_offsets + accept_lengths
-        self.padded_gather_ids_offsets_buf = (
-            torch.arange(
-                self.input_buffers.max_bs, dtype=torch.int64, device=self.device
-            )
-            * spec_num_tokens
-            - 1
-        )
         # Static last-row sample gather (request r's window-final row,
         # r*k + k-1): the row at frontier-1 predicts frontier+d+1 at depth d.
         self.padded_gather_ids_buf = (
@@ -455,7 +419,7 @@ class Mtp(BaseDrafter):
         self,
         bs: int,
         next_tokens: torch.Tensor,
-        draft_input: MtpDraftInput,
+        draft_input: HiddenDraftInput,
     ) -> None:
         """Frontier-anchored decode window: every depth 0..steps-1 runs
         the SAME k rows per request, ending at the committed frontier
@@ -549,7 +513,7 @@ class Mtp(BaseDrafter):
         self._stash_tokens_buf[slot] = window_ids[:, 1:]
         self._stash_hidden_buf[slot] = spliced_hidden.view(bs, k, -1)[:, 1:]
 
-    def _update_stash_extend(self, draft_input: MtpDraftInput) -> None:
+    def _update_stash_extend(self, draft_input: HiddenDraftInput) -> None:
         """Roll the stash across an EXTEND round's chunk rows: the last
         stash-width shift-1 ids and target hidden rows of each request's
         chunk (blending across chunk boundaries when a chunk is shorter
@@ -591,7 +555,7 @@ class Mtp(BaseDrafter):
         self,
         bs: int,
         next_tokens: torch.Tensor,
-        draft_input: MtpDraftInput,
+        draft_input: HiddenDraftInput,
     ) -> None:
         """Depths 0..steps-1 over an EXTEND round's ragged prompt rows.
 
@@ -606,7 +570,7 @@ class Mtp(BaseDrafter):
 
         Under a query shard every depth runs the target's shard of the span,
         exactly as Eagle's step 0: the ids and positions are the shard's
-        slice of the whole-span buffers (the per-depth shifts are computed
+        rows of the whole-span buffers (the per-depth shifts are computed
         over the whole span, every rank holds it), ``gather_ids`` keep the
         full layout and the chain hiddens are the shard's rows -- the
         target's capture in, the draft's FULL capture out.
@@ -617,7 +581,7 @@ class Mtp(BaseDrafter):
         rows = (
             slice(0, input_num_tokens)
             if plan is None or plan.size == 1
-            else plan.local_slice
+            else plan.local_row_ids
         )
 
         # Final chunks carry a -1 placeholder in their last shift-1 row;
@@ -649,10 +613,11 @@ class Mtp(BaseDrafter):
         )
 
         prev_hidden = draft_input.base_out_hidden_states  # [rows, H]
-        if prev_hidden.shape[0] != rows.stop - rows.start:
+        num_rows = positions.shape[0]
+        if prev_hidden.shape[0] != num_rows:
             raise RuntimeError(
                 f"the target captured {prev_hidden.shape[0]} hidden rows for the "
-                f"drafter's {rows.stop - rows.start} extend rows"
+                f"drafter's {num_rows} extend rows"
             )
         for d in range(self.spec_num_steps):
             step_ids = (
@@ -697,7 +662,7 @@ class Mtp(BaseDrafter):
     @override
     def draft(
         self,
-        draft_input: MtpDraftInput,
+        draft_input: HiddenDraftInput,
     ) -> torch.Tensor:
 
         bs = draft_input.accept_lengths.shape[0]
@@ -727,28 +692,3 @@ class Mtp(BaseDrafter):
             self._run_decode_depths(bs, next_tokens, draft_input)
 
         return next_tokens
-
-    @override
-    @nvtx_range("drafter", color="purple")
-    def run(
-        self,
-        base_ctx: ForwardContext,
-        logits_output: LogitsProcessorOutput,
-        output_tokens: torch.Tensor,
-        accept_lengths: torch.Tensor,
-    ) -> torch.Tensor:
-
-        draft_input = MtpDraftInput(
-            input_num_tokens=base_ctx.input_num_tokens,
-            num_extends=base_ctx.num_extends,
-            forward_mode=base_ctx.forward_mode,
-            base_model_output=output_tokens,
-            accept_lengths=accept_lengths,
-            base_out_hidden_states=logits_output.hidden_states,
-            global_num_tokens=base_ctx.global_num_tokens,
-            global_bs=base_ctx.global_bs,
-            all_decode_or_idle=base_ctx.all_decode_or_idle,
-            query_shard=base_ctx.query_shard,
-        )
-
-        return self.draft(draft_input)

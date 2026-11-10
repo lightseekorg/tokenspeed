@@ -30,11 +30,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 from tokenspeed_kernel.ops.attention.gdn import (
-    GdnChainVerifyForm,
     GdnStateCheckpoints,
-    gdn_chain_verify,
-    gdn_chain_verify_form,
-    gdn_chain_verify_supported,
     gdn_chunk_prefill,
     gdn_decode_mtp,
     gdn_decode_step,
@@ -47,7 +43,6 @@ from tokenspeed_kernel.ops.attention.gdn.triton import (
     CausalConv1dPrefillMetadata,
     build_causal_conv1d_prefill_metadata,
     fused_qkv_split_gdn_prefill,
-    gdn_chain_verify_warm_batch_sizes,
 )
 from tokenspeed_kernel.ops.attention.gdn.triton import (
     prepare_prefill_state_inputs as _prepare_cache_prefill_state_inputs,
@@ -61,7 +56,9 @@ from tokenspeed_kernel.ops.attention.kda.triton import (
     verify_state_blocks,
 )
 from tokenspeed_kernel.ops.conv import (
+    PREFILL_QKV_CHANNEL_MULTIPLE,
     causal_conv1d_fn,
+    causal_conv1d_qkv_fn,
     causal_conv1d_update,
 )
 from tokenspeed_kernel.ops.kvcache.triton import (
@@ -213,7 +210,8 @@ class MambaForwardMetadata:
     # chunked scan's plan for them (its interval, buffer and the buffer row of
     # each checkpoint); None when the forward writes none. A MIXED forward
     # that runs its decode rows apart writes them through its extend rows'
-    # metadata alone (_prepare_mixed_verify_metadata).
+    # metadata alone (_prepare_mixed_verify_metadata). Capacity metadata may
+    # instead keep fixed slots here (``CapacityPrefillMetadata``).
     state_checkpoints: InForwardStateCheckpoints | None = None
     scan_state_checkpoints: GdnStateCheckpoints | None = None
     scan_checkpoint_rows: torch.Tensor | None = None
@@ -228,6 +226,18 @@ class MambaForwardMetadata:
     def scrub_padding(self, *tensors: torch.Tensor | None) -> None:
         """Zero the padded tail rows of token-shaped inputs in place."""
         scrub_padding_tail(self.prefill_token_extent, *tensors)
+
+
+def _prefill_conv_writes_qkv(key_split_dim: int, value_split_dim: int) -> bool:
+    """Whether the prefill convolution writes q, k and v rows itself (AMD).
+
+    The direct write skips the q/k/v split pass and leaves the same values.
+    """
+    return (
+        current_platform().is_amd
+        and key_split_dim % PREFILL_QKV_CHANNEL_MULTIPLE == 0
+        and value_split_dim % PREFILL_QKV_CHANNEL_MULTIPLE == 0
+    )
 
 
 @dataclass
@@ -278,8 +288,6 @@ class MambaAttnBackend(AttentionBackend):
     # Whether the family's prefill scan stores in-forward State checkpoints
     # (SchedulerConfig::state_checkpoint_in_forward).
     _stores_in_forward_state_checkpoints: bool = False
-    # Whether the family's verify scan may run GDN's chain form (gdn_chain_verify).
-    _verify_scan_runs_chain_form: bool = False
 
     def __init__(self, config: AttnConfig, spec: SoftmaxAttnConfig):
         super().__init__(config, spec)
@@ -329,7 +337,6 @@ class MambaAttnBackend(AttentionBackend):
         self.state_out_by_group: dict[str, list[torch.Tensor]] = {}
         self._verify_seed_dst_cache: dict[tuple[int, int, int], torch.Tensor] = {}
         self._verify_grid_cache: dict[tuple[int, int], torch.Tensor] = {}
-        self._chain_ancestors_cache: dict[tuple[int, int], torch.Tensor] = {}
         self._verify_base_cache: dict[tuple[int, int], torch.Tensor] = {}
         self._qsl_dirty: list[bool] = []
         self._qsl_last_mode: list[tuple[ForwardMode, bool] | None] = []
@@ -607,7 +614,6 @@ class MambaAttnBackend(AttentionBackend):
         if not self.state_paging_active or self.is_draft:
             return 0
         self._ensure_verify_scratch(max_bs, draft_token_num)
-        self._warm_chain_verify(max_bs, draft_token_num)
         total = sum(
             tensor.nbytes
             for layer_scratch in self._verify_scratch.values()
@@ -620,54 +626,6 @@ class MambaAttnBackend(AttentionBackend):
         if self._tree_node_states is not None:
             total += self._tree_node_states.nbytes
         return total
-
-    def _warm_chain_verify(self, max_bs: int, width: int) -> None:
-        """Compile the chain verify's launch tiers up to ``max_bs`` (all-padding launches)."""
-        if not self.replay_ssm or self.draft_tree:
-            return
-        num_k_heads, num_v_heads, head_k_dim, head_v_dim = self._gdn_replay.geometry
-        sizes = gdn_chain_verify_warm_batch_sizes(
-            (
-                bs
-                for bs in range(1, max_bs + 1)
-                if self._chain_verify_form(bs, width, num_v_heads)
-                is GdnChainVerifyForm.CHAIN
-            ),
-            num_v_heads,
-            width,
-        )
-        if not sizes:
-            return
-        _, ssm = self._state_components(self._state_layer_ids()[0])
-        rows = sizes[-1] * width
-        # Dense rows, as the split writes q/k/v (the gates' layout is not specialized).
-        query = torch.zeros(
-            (rows, num_k_heads, head_k_dim), dtype=self.dtype, device=self.device
-        )
-        value = torch.zeros(
-            (rows, num_v_heads, head_v_dim), dtype=self.dtype, device=self.device
-        )
-        gates = torch.zeros((rows, num_v_heads), dtype=self.dtype, device=self.device)
-        parameters = torch.zeros(num_v_heads, dtype=torch.float32, device=self.device)
-        padding = torch.full(
-            (sizes[-1],), self.pad_slot_id, dtype=torch.int32, device=self.device
-        )
-        for bs in sizes:
-            tokens = bs * width
-            q = query[:tokens].view(bs, width, num_k_heads, head_k_dim)
-            gdn_chain_verify(
-                q,
-                q,
-                value[:tokens].view(bs, width, num_v_heads, head_v_dim),
-                A_log=parameters,
-                a=gates[:tokens].view(bs, width, num_v_heads),
-                dt_bias=parameters,
-                b=gates[:tokens].view(bs, width, num_v_heads),
-                initial_state=ssm,
-                initial_state_indices=padding[:bs],
-                scale=None,
-                use_qk_l2norm=True,
-            )
 
     def _verify_copy_tables_get(self) -> dict[str, torch.Tensor | int | None]:
         """Pointer tables for the batched verify state copies and replay:
@@ -685,6 +643,7 @@ class MambaAttnBackend(AttentionBackend):
         ssm_element_st = []
         conv_bytes: int | None = None
         ssm_bytes: int | None = None
+        ssm_rows_aligned = True
 
         for layer_id in layer_ids:
             conv, ssm = self._state_components(layer_id)
@@ -702,6 +661,10 @@ class MambaAttnBackend(AttentionBackend):
             ssm_src.append(ssm.data_ptr())
             ssm_src_st.append(row_stride_i32(ssm))
             ssm_element_st.append(ssm.stride(0))
+            ssm_rows_aligned &= (
+                ssm.data_ptr() % 16 == 0
+                and ssm.stride(0) * ssm.element_size() % 16 == 0
+            )
             if not self.replay_ssm:
                 ssm_dst.append(ssm_scratch.data_ptr())
                 ssm_dst_st.append(row_stride_i32(ssm_scratch))
@@ -725,6 +688,7 @@ class MambaAttnBackend(AttentionBackend):
             "ssm_element_stride": _i64(ssm_element_st),
             "ssm_scratch_stride": None if self.replay_ssm else _i64(ssm_dst_st),
             "ssm_bytes": ssm_bytes,
+            "ssm_rows_aligned": ssm_rows_aligned,
             "group_sel": _i64(group_sel),
             "num_layers": len(layer_ids),
         }
@@ -788,40 +752,11 @@ class MambaAttnBackend(AttentionBackend):
     def _tree_parents(self, bs: int) -> torch.Tensor | None:
         return None if self.tree_verify is None else self.tree_verify.parent[:bs]
 
-    def _verify_ancestors(
-        self, bs: int, draft_token_num: int, num_value_heads: int
-    ) -> torch.Tensor | None:
-        """Ancestor masks for the GDN verify: the draft tree's, or a ReplaySSM
-        chain's where it verifies in the tree form (a one-path tree).
-        Memoized per (bs, T): CUDA-graph capture records the tensor's storage."""
+    def _verify_ancestors(self, bs: int) -> torch.Tensor | None:
+        """The draft tree's ancestor masks; a chain needs no runtime tree metadata."""
         if self.tree_verify is not None:
             return self.tree_verify.mask.view(-1, self.tree_verify.num_nodes)[:bs]
-        if (
-            self._chain_verify_form(bs, draft_token_num, num_value_heads)
-            is not GdnChainVerifyForm.TREE
-        ):
-            return None
-        key = (bs, draft_token_num)
-        ancestors = self._chain_ancestors_cache.get(key)
-        if ancestors is None:
-            steps = torch.arange(draft_token_num, device=self.device)
-            ancestors = ((1 << (steps + 1)) - 1).repeat(bs, 1)
-            self._chain_ancestors_cache[key] = ancestors
-        return ancestors
-
-    def _chain_verify_form(
-        self, bs: int, width: int, num_value_heads: int
-    ) -> GdnChainVerifyForm:
-        """The verify form of ``bs`` chains of ``width`` rows, from the shape alone."""
-        if not self.replay_ssm:
-            return GdnChainVerifyForm.STEP
-        state_shape, state_dtype = self._state_layer_geometry[0][3:]
-        chain_form = self._verify_scan_runs_chain_form and gdn_chain_verify_supported(
-            state_shape[-1], state_shape[-2], state_dtype
-        )
-        return gdn_chain_verify_form(
-            width, bs * num_value_heads, state_dtype, chain_form=chain_form
-        )
+        return None
 
     def _pack_projection(
         self,
@@ -893,7 +828,12 @@ class MambaAttnBackend(AttentionBackend):
         Families with another recurrence replace the kernel; the payload,
         tables and page resolution stay shared.
         """
-        gdn_replay_commit(payload, parameters, **tables)
+        gdn_replay_commit(
+            payload,
+            parameters,
+            rows_aligned=self._verify_copy_tables_get()["ssm_rows_aligned"],
+            **tables,
+        )
 
     def tree_support(self) -> TreeSupport:
         return TreeSupport(
@@ -1612,10 +1552,14 @@ class MambaAttnBackend(AttentionBackend):
 
     # ---- Forward ----
 
-    def _layer_state(
+    def layer_state(
         self, layer_id: int
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Resolve one recurrent layer's page indices and component views."""
+        """One recurrent layer's ``(state_in, state_out, conv, ssm)``.
+
+        ``state_in`` / ``state_out`` are the batch rows' input and output state
+        pages (-1 for padding rows); ``conv`` / ``ssm`` the layer's state pools.
+        """
         metadata = self.forward_metadata
         state_in_by_group = metadata.state_in_blocks_by_group
         group_id = self._state_group_for(layer_id)
@@ -1630,6 +1574,43 @@ class MambaAttnBackend(AttentionBackend):
             metadata.state_out_blocks_by_group[group_id],
             conv_states,
             ssm_states,
+        )
+
+    def fused_verify_operands(
+        self, layer_id: int, a_log: torch.Tensor, dt_bias: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """What a fused kernel needs to run one recurrent layer's target
+        verify itself, in place of :meth:`forward_extend`.
+
+        Returns ``(conv scratch [rows, *conv], scratch rows [bs * T] int32,
+        replay payload [bs * T, width])``: token ``t`` of request ``r`` writes
+        its conv window to scratch row ``r * (T + 1) + 1 + t`` and its
+        ``[k | v | a | b]`` to payload row ``r * T + t``, as the regular verify
+        does; the post-verify commit then reads them. It also stores the
+        layer's replay parameters on first use, as the regular verify does.
+
+        Raises:
+            RuntimeError: Not a target verify with ReplaySSM.
+        """
+        metadata = self.forward_metadata
+        replay = self._gdn_replay
+        if (
+            metadata.mamba_output_indices is None
+            or not self.replay_ssm
+            or replay is None
+        ):
+            raise RuntimeError("a fused verify needs a target verify with ReplaySSM")
+        slot = replay.layer_ids.index(layer_id)
+        if layer_id not in replay.initialized_layers:
+            # Model-static; copied once during warmup, before graph capture.
+            replay.parameters[slot, 0].copy_(a_log)
+            replay.parameters[slot, 1].copy_(dt_bias)
+            replay.initialized_layers.add(layer_id)
+        grid = metadata.mamba_output_indices
+        return (
+            self._verify_scratch[layer_id][0],
+            grid.reshape(-1),
+            replay.payload[slot, : grid.numel()],
         )
 
     def forward_decode(
@@ -1684,7 +1665,7 @@ class MambaAttnBackend(AttentionBackend):
 
         # Read the page holding position n-1 and write the page holding
         # position n. Padding rows use -1 and are skipped by both kernels.
-        state_in_blocks, state_out_blocks, conv_states, ssm_states = self._layer_state(
+        state_in_blocks, state_out_blocks, conv_states, ssm_states = self.layer_state(
             layer_id
         )
         read_indices = state_in_blocks
@@ -1994,11 +1975,12 @@ class MambaAttnBackend(AttentionBackend):
 
         conv_replay = None
         conv_rows = None
+        conv_qkv = None
         if is_target_verify:
             draft_token_num = self.speculative_num_draft_tokens
             batch_size = seq_len // draft_token_num
             output_indices = self.forward_metadata.mamba_output_indices
-            state_in_blocks, _, conv_comp, ssm_comp = self._layer_state(layer_id)
+            state_in_blocks, _, conv_comp, ssm_comp = self.layer_state(layer_id)
             conv_scratch, ssm_scratch = self._verify_scratch[layer_id]
             fused_out = self._verify(
                 mixed_qkv,
@@ -2031,12 +2013,11 @@ class MambaAttnBackend(AttentionBackend):
                 mixed_qkv, a, b = self._pack_projection(mixed_qkv, a, b)
             if (
                 self.tree_verify is None
-                and self._chain_verify_form(
-                    batch_size, draft_token_num, value_dim // attn_tp_size // head_v_dim
-                )
-                is GdnChainVerifyForm.CHAIN
+                and self.replay_ssm
+                and self._verify_scan_writes_replay
+                and self._verify_packed_qkv_views
             ):
-                # The chain form's conv update writes the payload and dense q/k/v rows (no split).
+                # The selected verify reads projection views; conv also fills the replay payload.
                 conv_replay = self._replay_inputs(
                     layer_id, seq_len, a, b, A_log=A_log, dt_bias=dt_bias
                 )
@@ -2071,13 +2052,14 @@ class MambaAttnBackend(AttentionBackend):
             mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
         else:
             state_in_blocks, state_out_blocks, conv_states, ssm_states = (
-                self._layer_state(layer_id)
+                self.layer_state(layer_id)
             )
             recurrent_state, has_initial_states = _prepare_cache_prefill_state_inputs(
                 conv_states,
                 ssm_states,
                 state_in_blocks,
                 state_out_blocks,
+                dtype=self._prefill_state_dtype(ssm_states.dtype),
             )
             conv_cache_indices = state_out_blocks
             extend_seq_lens_cpu = self.forward_metadata.extend_seq_lens_cpu
@@ -2093,32 +2075,56 @@ class MambaAttnBackend(AttentionBackend):
             checkpoints = self.forward_metadata.state_checkpoints
             if checkpoints is not None:
                 # The conv state at a checkpoint is the window of the
-                # conv's inputs just before it (oldest first).
+                # conv's inputs just before it (oldest first). The masked
+                # writer skips the -1 blocks of capacity metadata's unused
+                # checkpoint slots.
                 window = conv_states.shape[-1]
                 rows = checkpoints.token_index.unsqueeze(1) + torch.arange(
                     -window, 0, device=checkpoints.token_index.device
                 )
-                conv_states[
-                    checkpoints.blocks_by_group[self._state_group_for(layer_id)].long()
-                ] = (mixed_qkv[rows].transpose(1, 2).to(conv_states.dtype))
+                store_state_rows(
+                    mixed_qkv[rows].transpose(1, 2).unsqueeze(1),
+                    conv_states.unsqueeze(1),
+                    checkpoints.blocks_by_group[self._state_group_for(layer_id)],
+                )
 
             mixed_qkv_t = mixed_qkv.transpose(0, 1)
-            mixed_qkv = causal_conv1d_fn(
-                mixed_qkv_t,
-                conv_weights,
-                bias,
-                activation=activation,
-                conv_states=conv_states,
-                has_initial_state=has_initial_states,
-                cache_indices=conv_cache_indices,
-                query_start_loc=query_start_loc,
-                prefill_metadata=self.forward_metadata.conv_prefill_metadata,
-            ).transpose(0, 1)[:seq_len]
-            if extend_seq_lens_cpu is not None:
-                # The convolution allocates its output uninitialized and gives
-                # the padded rows no work, so the rows a capacity scan reads
-                # past the live tokens are zeroed again here.
-                self.forward_metadata.scrub_padding(mixed_qkv)
+            if _prefill_conv_writes_qkv(
+                key_dim // attn_tp_size, value_dim // attn_tp_size
+            ):
+                # The convolution writes q, k and v rows directly; no split pass.
+                conv_qkv = tuple(
+                    rows[:seq_len]
+                    for rows in causal_conv1d_qkv_fn(
+                        mixed_qkv_t,
+                        conv_weights,
+                        bias,
+                        activation=activation,
+                        conv_states=conv_states,
+                        has_initial_state=has_initial_states,
+                        cache_indices=conv_cache_indices,
+                        query_start_loc=query_start_loc,
+                        prefill_metadata=self.forward_metadata.conv_prefill_metadata,
+                        key_dim=key_dim // attn_tp_size,
+                    )
+                )
+                if extend_seq_lens_cpu is not None:
+                    self.forward_metadata.scrub_padding(*conv_qkv)
+            else:
+                mixed_qkv = causal_conv1d_fn(
+                    mixed_qkv_t,
+                    conv_weights,
+                    bias,
+                    activation=activation,
+                    conv_states=conv_states,
+                    has_initial_state=has_initial_states,
+                    cache_indices=conv_cache_indices,
+                    query_start_loc=query_start_loc,
+                    prefill_metadata=self.forward_metadata.conv_prefill_metadata,
+                ).transpose(0, 1)[:seq_len]
+                if extend_seq_lens_cpu is not None:
+                    # The conv leaves padding rows unset; a capacity scan reads them.
+                    self.forward_metadata.scrub_padding(mixed_qkv)
 
         key_split_dim = key_dim // attn_tp_size
         value_split_dim = value_dim // attn_tp_size
@@ -2140,18 +2146,28 @@ class MambaAttnBackend(AttentionBackend):
             and self._tree_node_states is None
         ):
             scan_replay, replay_inputs = replay_inputs[0], None
-        # KDA's verify consumes zero-copy strided views. When recurrent-state
-        # replay is enabled, the split kernel also saves the persistent inputs
-        # needed to reconstruct accepted state later.
-        if (
+        if conv_qkv is not None:
+            query, key, value = (
+                rows.view(1, seq_len, -1, head_dim)
+                for rows, head_dim in zip(
+                    conv_qkv, (head_k_dim, head_k_dim, head_v_dim)
+                )
+            )
+        # Scans supporting strided QKV consume views of the convolution output.
+        # Replay payloads still need the split kernel to save recovery inputs.
+        elif (
             (
-                self._verify_packed_qkv_views
-                or scan_replay is not None
-                or conv_replay is not None
+                is_target_verify
+                and (
+                    self._verify_packed_qkv_views
+                    or scan_replay is not None
+                    or conv_replay is not None
+                )
+                or not is_target_verify
+                and self._prefill_supports_strided_qkv()
             )
             and replay_inputs is None
             and mixed_qkv.stride(-1) == 1
-            and is_target_verify
         ):
             query, key, value = _packed_qkv_views(
                 mixed_qkv,
@@ -2232,7 +2248,7 @@ class MambaAttnBackend(AttentionBackend):
             )
             # The final state goes to the live slot. Capacity metadata pads the
             # request dimension with -1 blocks whose dummy scan result the
-            # masked writer drops.
+            # masked writer drops; it skips unused checkpoint slots alike.
             store_state_rows(last_recurrent_state, ssm_states, state_out_blocks)
             if metadata.state_checkpoints is not None:
                 store_state_rows(
@@ -2416,26 +2432,6 @@ class MambaAttnBackend(AttentionBackend):
         a_b = a.view(batch_size, draft_token_num, -1)
         b_b = b.view(batch_size, draft_token_num, -1)
 
-        if (
-            self.tree_verify is None
-            and self._chain_verify_form(batch_size, draft_token_num, num_value_heads)
-            is GdnChainVerifyForm.CHAIN
-        ):
-            # Whole chain windows from the committed pages; the conv update filled the payload.
-            return gdn_chain_verify(
-                query_b,
-                key_b,
-                value_b,
-                A_log=A_log,
-                a=a_b,
-                dt_bias=dt_bias,
-                b=b_b,
-                initial_state=ssm_comp,
-                initial_state_indices=state_in_blocks[:batch_size],
-                scale=None,
-                use_qk_l2norm=True,
-            ).reshape(1, seq_len, num_value_heads, head_v_dim)
-
         intermediate_states = None
         output_state = None
         if self.replay_ssm:
@@ -2471,12 +2467,16 @@ class MambaAttnBackend(AttentionBackend):
             output_state_indices=output_state_indices,
             output_state=output_state,
             intermediate_states_buffer=intermediate_states,
-            tree_ancestors=self._verify_ancestors(
-                batch_size, draft_token_num, num_value_heads
-            ),
+            tree_ancestors=self._verify_ancestors(batch_size),
             replay_payload=replay_payload,
             disable_state_update=self.replay_ssm,
         ).reshape(1, seq_len, num_value_heads, head_v_dim)
+
+    def _prefill_state_dtype(self, cache_dtype: torch.dtype) -> torch.dtype:
+        return cache_dtype
+
+    def _prefill_supports_strided_qkv(self) -> bool:
+        return False
 
     def _prefill_scan(
         self,

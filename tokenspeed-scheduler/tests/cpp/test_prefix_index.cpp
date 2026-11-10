@@ -774,6 +774,8 @@ TEST(PrefixCacheSessionTest, DemotionAgesExclusiveIdleBlocksButProtectsSharedAnd
     EXPECT_EQ(index.MetadataFor(pool, shared_location)->last_access_epoch, 40u);
     EXPECT_EQ(index.MetadataFor(pool, active_location)->last_access_epoch, 50u);
     EXPECT_EQ(index.MetadataFor(pool, other_location)->last_access_epoch, 10u);
+    EXPECT_EQ(DrainEvictionOrder(index, pool),
+              (std::vector<CacheBlockLocation>{exclusive_location, other_location, shared_location}));
     EXPECT_FALSE(index.Evict(pool, active_location).has_value());
     active = {};
     EXPECT_EQ(index.DemoteSession(pool, first), 1u);
@@ -783,5 +785,8 @@ TEST(PrefixCacheSessionTest, DemotionAgesExclusiveIdleBlocksButProtectsSharedAnd
     auto hit = index.AcquireMatched(pool, std::vector<CacheKey>{KeyOf("exclusive")}, 0, GroupPrefixProbe{.hits = {1}},
                                     60, first);
     EXPECT_EQ(index.MetadataFor(pool, exclusive_location)->last_access_epoch, 60u);
+    hit.blocks.clear();
+    EXPECT_EQ(DrainEvictionOrder(index, pool),
+              (std::vector<CacheBlockLocation>{active_location, other_location, shared_location, exclusive_location}));
 }
 }  // namespace tokenspeed::test

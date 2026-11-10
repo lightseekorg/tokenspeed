@@ -22,11 +22,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
+from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
 from tokenspeed_kernel.ops.attention.dsa import (
     dsa_decode_topk,
     dsa_prefill_topk,
@@ -35,17 +36,30 @@ from tokenspeed_kernel.ops.attention.dsa.triton import (
     local_topk_to_global_slots,
     workspace_topk_to_global_slots,
 )
+from tokenspeed_kernel.ops.quantization import quantize_fp8
 from torch import nn
 from transformers import PretrainedConfig
 
-from tokenspeed.runtime.configs.utils import get_rope_theta
+from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.distributed.comm_manager import CommManager
-from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
+from tokenspeed.runtime.distributed.comm_ops import all_gather_single
+from tokenspeed.runtime.execution.breakable_cuda_graph import (
+    break_point,
+    current_valid_rows,
+    slice_to_real_tokens,
+)
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.layers.attention.dcp.indexer import select_dsa_topk
-from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
+from tokenspeed.runtime.layers.attention.dcp.indexer import (
+    DCPIndexMetadata,
+    build_dcp_index_metadata,
+    select_dsa_topk,
+)
+from tokenspeed.runtime.layers.attention.dcp.placement import (
+    CachePlacement,
+    resolve_cache_slots,
+)
 from tokenspeed.runtime.layers.attention.page_table import (
     build_prefill_kv_workspace_slots,
 )
@@ -65,14 +79,54 @@ from tokenspeed.runtime.models.deepseek_v3 import (
     DeepseekV3AttentionMLA,
     DeepseekV3DecoderLayer,
     DeepseekV3ForCausalLM,
-    DeepseekV3MLP,
     DeepseekV3Model,
-    DeepseekV3MoE,
 )
 from tokenspeed.runtime.utils import add_prefix, set_weight_attrs
+from tokenspeed.runtime.utils.device_stream import is_current_stream_capturing
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 _INDEXER_PREFILL_MAX_LOGITS_MB_ARG = "deepseek_v4_indexer_prefill_max_logits_mb"
+# Fewer rows: the all-gather costs more than split scoring saves (TP8 50K, MI350X).
+_PREFILL_TOPK_TP_SPLIT_MIN_ROWS = 384
+_PREFILL_TOPK_ROW_ALIGN = 16
+# Below this many rows every rank merges every KVP prefill row: the row-owner merge's two extra collectives cost more.
+_KVP_PREFILL_ROW_OWNER_MIN_ROWS = 1024
+
+
+def _int32_to_device(
+    tensors: tuple[torch.Tensor, ...], device: torch.device
+) -> tuple[torch.Tensor, ...]:
+    """Copy 1-D host integer tensors to ``device`` as int32 in one async copy.
+
+    A pageable host-to-device copy blocks the host until the device has
+    drained its queue, so the host loses its lead over the device for the
+    rest of the forward. The tensors go through one pinned staging buffer
+    instead; each device view starts 64-byte aligned.
+    """
+    align = _PREFILL_TOPK_ROW_ALIGN
+    starts = [0]
+    for tensor in tensors:
+        starts.append(starts[-1] + -(-tensor.numel() // align) * align)
+    staging = torch.empty(starts[-1], dtype=torch.int32, pin_memory=True)
+    for tensor, start in zip(tensors, starts):
+        staging[start : start + tensor.numel()] = tensor
+    on_device = staging.to(device, non_blocking=True)
+    return tuple(
+        on_device[start : start + tensor.numel()]
+        for tensor, start in zip(tensors, starts)
+    )
+
+
+def _prefill_query_requests(
+    seq_lens: torch.Tensor, row_starts: torch.Tensor
+) -> torch.Tensor:
+    """The request of every prefill query row, as int32: the request whose
+    span of the request-major history holds the row's start."""
+    return torch.searchsorted(
+        torch.cumsum(seq_lens.to(device=row_starts.device, dtype=torch.int64), 0),
+        row_starts.long(),
+        right=True,
+    ).to(torch.int32)
 
 
 @dataclass
@@ -80,10 +134,21 @@ class GlmDsaIndexerOutput:
     query: torch.Tensor
     key: torch.Tensor
     weights: torch.Tensor
+    # When set, key is pre-norm and the index-K write applies this LayerNorm.
+    key_norm: LayerNorm | None = None
+    # When set, query holds input rows and ranks project only their top-k share.
+    query_proj: Callable[[torch.Tensor], torch.Tensor] | None = None
+    # When set, the decode rows' E4M3 query and FP32 weights folding its scales and the score scale.
+    quantized_query: tuple[torch.Tensor, torch.Tensor] | None = None
+
+    def query_rows(self, start: int, end: int) -> torch.Tensor:
+        rows = self.query[start:end]
+        return rows if self.query_proj is None else self.query_proj(rows)
 
 
 @dataclass
 class GlmDsaPrefillTopK:
+    # int32, or int16 holding unsigned 16-bit indices with -1 where empty.
     workspace_indices: torch.Tensor
     topk_lens: torch.Tensor
     page_table: torch.Tensor
@@ -94,12 +159,19 @@ class GlmDsaPrefillTopK:
     row_starts: torch.Tensor | None = None
     row_ends: torch.Tensor | None = None
     candidate_lens_cpu: torch.Tensor | None = None
+    # DCP index metadata for owned-width tiles, reused by later indexer layers.
+    dcp_index: DCPIndexMetadata | None = None
 
 
 @dataclass
 class GlmDsaDecodeTopK:
     topk_indices: torch.Tensor
     topk_lens: torch.Tensor
+    # DCP index metadata and its source, reused by the forward's later indexer layers.
+    dcp_index: Any = None
+    dcp_source: Any = None
+    dcp_q_len: int = 0
+    dcp_capturing: bool = False
 
 
 @dataclass(frozen=True)
@@ -257,88 +329,83 @@ class GlmDsaIndexer(nn.Module):
         )
 
 
-class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
-    _RAGGED_PREFILL_BACKENDS = ("trtllm_mla", "tokenspeed_mla", "dsa")
-    rope_is_neox_style = False
+class GlmDsaSparseAttentionMixin:
+    """DSA sparse MLA shared by the GLM-DSA and Kimi-K3.1 attention layers.
 
-    def __init__(
-        self,
-        config: PretrainedConfig,
-        mapping: Mapping,
-        hidden_size: int,
-        num_heads: int,
-        qk_nope_head_dim: int,
-        qk_rope_head_dim: int,
-        v_head_dim: int,
-        q_lora_rank: int,
-        kv_lora_rank: int,
-        rope_theta: float = 10000,
-        rope_scaling: dict[str, Any] | None = None,
-        max_position_embeddings: int = 8192,
-        quant_config: QuantizationConfig | None = None,
-        layer_id=None,
-        prefix: str = "",
-        reduce_attn_results=True,
-        alt_stream: torch.cuda.Stream | None = None,
-        skip_rope: bool = False,
-        is_nextn: bool = False,
-    ) -> None:
-        rope_scaling = _glm_dsa_rope_scaling(rope_scaling)
-        super().__init__(
-            config=config,
-            mapping=mapping,
-            hidden_size=hidden_size,
-            num_heads=num_heads,
-            qk_nope_head_dim=qk_nope_head_dim,
-            qk_rope_head_dim=qk_rope_head_dim,
-            v_head_dim=v_head_dim,
-            q_lora_rank=q_lora_rank,
-            kv_lora_rank=kv_lora_rank,
-            rope_theta=rope_theta,
-            rope_scaling=rope_scaling,
-            max_position_embeddings=max_position_embeddings,
-            quant_config=quant_config,
-            layer_id=layer_id,
-            prefix=prefix,
-            reduce_attn_results=reduce_attn_results,
-            alt_stream=alt_stream,
-            skip_rope=skip_rope,
+    The index-K write, the decode/prefill top-k selection, and the sparse
+    prefill and decode cores. A host class derives from this mixin and a
+    ``DeepseekV3AttentionMLA`` subclass, and declares in its ``__init__``:
+    ``indexer`` (its forward returns :class:`GlmDsaIndexerOutput`, and it has
+    ``weights_softmax_scale``), ``index_topk``, ``skip_indexer_topk``,
+    ``is_nextn``, the decode top-k workspaces
+    ``_decode_topk_indices_buffer`` / ``_decode_topk_lens_buffer`` /
+    ``_retired_decode_workspaces``, and ``prefill_topk_tp_split``.
+
+    ``prefill_topk_tp_split`` lets a host whose indexer is replicated on every
+    attention-TP rank divide the prefill top-k rows among those ranks: each
+    rank selects for its contiguous slice of rows and an all-gather assembles
+    the selection every rank's sparse attention reads. A host sets it only
+    when every rank holds the same indexer output.
+
+    ``index_query_fp8`` (default off) makes the paged top-k scorers of an
+    ``fp8_scaled`` plane take FP8 E4M3 index queries with per-(token, head)
+    scales (:meth:`_scorer_index_query`); a host sets it only where the
+    platform registers such scorers.
+
+    ``decode_topk_solution`` (default None: normal selection) pins the
+    tensor-parallel decode top-k to one ``dsa_decode_topk`` solution; a host
+    sets it only to a solution it validated and that selects on the platform.
+
+    ``index_k_write_quantizes_query`` (default off) quantizes a decode round's
+    index query in the launch of its index-K write (an ``fp8_scaled`` plane,
+    keys with ``key_norm``) and hands the decode top-k E4M3 queries with unit
+    scales; a host sets it only where its ``decode_topk_solution`` takes them.
+
+    A host that hands ``forward_dsa_core`` the index keys and head weights it
+    projected itself (``index_key_weights``) gives its indexer
+    ``from_key_weights(q_lora, key_weights)``, which returns the indexer
+    output over them without projecting the attention input.
+    """
+
+    index_query_fp8: bool = False
+    decode_topk_solution: str | None = None
+    index_k_write_quantizes_query: bool = False
+
+    def _scorer_index_query(
+        self, q: torch.Tensor, index_k_cache: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """The index query and its scales as the paged top-k scorer takes them.
+
+        With ``index_query_fp8`` set and an ``fp8_scaled`` (uint8) plane, the
+        query is quantized to FP8 E4M3 with one FP32 scale
+        ``max(amax, 1e-10) / 448`` per (token, head) over ``head_dim``.
+        Otherwise, a bf16 plane included, the BF16 query passes through, as it
+        does under bitwise numerics: the quantizer's rounding path follows the
+        batch's token count.
+
+        Args:
+            q: ``[tokens, index_heads, head_dim]`` BF16 index query, heads and
+                head_dim contiguous.
+            index_k_cache: The layer's index-K plane.
+
+        Returns:
+            ``(q, q_scales)``: FP8 ``[tokens, index_heads, head_dim]`` and
+            contiguous FP32 ``[tokens, index_heads]``, or ``q`` itself and
+            ``None``.
+        """
+        if (
+            not self.index_query_fp8
+            or index_k_cache.dtype != torch.uint8
+            or global_server_args_dict["numerics"] in BITWISE_ENVELOPES
+        ):
+            return q, None
+        tokens, heads, head_dim = q.shape
+        q_fp8, q_scales = quantize_fp8(
+            q.view(tokens, heads * head_dim),
+            granularity="token_group",
+            group_size=head_dim,
         )
-        if q_lora_rank is None:
-            raise ValueError("GLM DSA requires q_lora_rank.")
-        # Let process_weights choose DeepGEMM only after it has transformed
-        # FP8 block scales into the layout that kernel expects.
-        self.q_a_layernorm = RMSNorm(q_lora_rank, eps=1e-6)
-        self.kv_a_layernorm = RMSNorm(kv_lora_rank, eps=1e-6)
-        self.fused_qk_layernorm = FusedRMSNorm(
-            self.q_a_layernorm,
-            self.kv_a_layernorm,
-        )
-        self.index_topk = config.index_topk
-        self.is_nextn = is_nextn
-        # NextN/MTP has its own indexer weights but may reuse the previous
-        # draft iteration's top-k. Shared target layers do not have usable
-        # indexer weights and must consume the context-carried top-k.
-        self.skip_indexer_topk = (
-            True if is_nextn else _glm_dsa_skip_indexer_topk(config, layer_id)
-        )
-        if self.skip_indexer_topk and not self.is_nextn:
-            self.indexer = None
-        else:
-            self.indexer = GlmDsaIndexer(
-                config=config,
-                hidden_size=hidden_size,
-                q_lora_rank=q_lora_rank,
-                qk_rope_head_dim=qk_rope_head_dim,
-                rope_theta=rope_theta,
-                rope_scaling=rope_scaling,
-                max_position_embeddings=max_position_embeddings,
-                quant_config=quant_config,
-                prefix=add_prefix("indexer", prefix),
-            )
-        self._decode_topk_indices_buffer: torch.Tensor | None = None
-        self._decode_topk_lens_buffer: torch.Tensor | None = None
-        self._retired_decode_workspaces: list[torch.Tensor] = []
+        return q_fp8.view(tokens, heads, head_dim), q_scales
 
     def _get_decode_topk_workspace(
         self,
@@ -448,8 +515,10 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         *,
         total_tokens: int,
     ) -> GlmDsaDecodeWindow:
-        num_decode_reqs = GlmMoeDsaAttention._resolve_decode_req_count(ctx, metadata)
-        num_decode_tokens = GlmMoeDsaAttention._resolve_num_decode_tokens(
+        num_decode_reqs = GlmDsaSparseAttentionMixin._resolve_decode_req_count(
+            ctx, metadata
+        )
+        num_decode_tokens = GlmDsaSparseAttentionMixin._resolve_num_decode_tokens(
             ctx,
             total_tokens=total_tokens,
             num_decode_reqs=num_decode_reqs,
@@ -459,7 +528,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 "GLM DSA decode token split is invalid: "
                 f"tokens={total_tokens}, decode_tokens={num_decode_tokens}"
             )
-        q_len_per_req = GlmMoeDsaAttention._resolve_decode_q_len(
+        q_len_per_req = GlmDsaSparseAttentionMixin._resolve_decode_q_len(
             ctx, num_decode_tokens, num_decode_reqs
         )
         decode_start = int(total_tokens) - int(num_decode_tokens)
@@ -484,14 +553,11 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
 
     @staticmethod
     def _check_decode_q_len_per_req(q_len_per_req: int) -> None:
-        # Multi-step MTP verify runs num_draft_tokens query rows per request.
-        # DeepGEMM paged MQA logits (our fork) and FlashMLA sparse decode are
-        # both verified bit-exact against batch expansion up to next_n = 6,
-        # which covers --speculative-num-steps 5 (5 draft + 1 bonus).
-        if not 1 <= q_len_per_req <= 6:
+        # DSpark verifies 7 drafts plus a bonus; leaves handle each row's causal bound.
+        if not 1 <= q_len_per_req <= 8:
             raise NotImplementedError(
-                "GLM DSA sparse decode supports 1-6 query tokens per request "
-                f"(verified next_n <= 6), got {q_len_per_req}."
+                "GLM DSA sparse decode supports 1-8 query tokens per request, "
+                f"got {q_len_per_req}."
             )
 
     def _compute_decode_topk_indices(
@@ -555,10 +621,22 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         num_decode_tokens: int,
         topk: int,
     ) -> GlmDsaDecodeTopK:
-        q = indexer_output.query[decode_start : decode_start + num_decode_tokens]
-        weights = indexer_output.weights[
-            decode_start : decode_start + num_decode_tokens
-        ]
+        quantized = indexer_output.quantized_query
+        if quantized is None:
+            q = indexer_output.query_rows(
+                decode_start, decode_start + num_decode_tokens
+            )
+            weights = indexer_output.weights[
+                decode_start : decode_start + num_decode_tokens
+            ]
+        elif decode_start != 0 or quantized[0].shape[0] != num_decode_tokens:
+            raise RuntimeError(
+                "the index-K write quantized rows [0, "
+                f"{quantized[0].shape[0]}), not the decode window [{decode_start}, "
+                f"{decode_start + num_decode_tokens})"
+            )
+        else:
+            q, weights = quantized
         index_k_cache = ctx.token_to_kv_pool.get_index_k_buffer(self.attn_mqa.layer_id)
         if index_k_cache is None:
             raise RuntimeError("GLM DSA top-k requires an index-K cache.")
@@ -588,31 +666,57 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             else seq_lens.unsqueeze(1)
         )
         placement = ctx.attn_backend.cache_placement(self.attn_mqa)
+        dcp_index = None
+        capturing = False
         if placement is not None:
-            page_size = ctx.token_to_kv_pool.arena.kv_page_size
-            requests = (
-                torch.arange(q.shape[0], device=q.device, dtype=torch.int32)
-                // q_len_per_req
+            if quantized is not None:
+                raise RuntimeError("the KV-parallel decode top-k scores BF16 queries")
+            page_size = ctx.token_to_kv_pool.index_k_page_size
+            capturing = is_current_stream_capturing(q.device)
+            dcp_index = self._reusable_dcp_index(
+                ctx,
+                metadata,
+                placement=placement,
+                page_table=page_table,
+                q_len_per_req=q_len_per_req,
+                rows=q.shape[0],
+                capturing=capturing,
             )
-            causal_lens = (
-                seq_lens[requests.long()]
-                - (q_len_per_req - 1)
-                + torch.arange(q.shape[0], device=q.device) % q_len_per_req
-            )
+            if dcp_index is None:
+                requests = (
+                    torch.arange(q.shape[0], device=q.device, dtype=torch.int32)
+                    // q_len_per_req
+                )
+                causal_lens = (
+                    seq_lens[requests.long()]
+                    - (q_len_per_req - 1)
+                    + torch.arange(q.shape[0], device=q.device) % q_len_per_req
+                )
+                dcp_index = build_dcp_index_metadata(
+                    q,
+                    weights,
+                    index_k_cache,
+                    page_table,
+                    requests,
+                    causal_lens,
+                    placement=placement,
+                    page_size=page_size,
+                )
             offsets, _ = select_dsa_topk(
                 q,
                 weights,
                 index_k_cache,
                 page_table,
-                requests,
-                causal_lens,
+                dcp_index.query_requests,
+                dcp_index.causal_lens,
                 placement=placement,
                 page_size=page_size,
                 topk=topk,
                 softmax_scale=self.indexer.weights_softmax_scale,
                 initial_tokens=0,
                 local_tokens=0,
-                max_logits_bytes=64 * 1024 * 1024,
+                max_logits_bytes=None,
+                metadata=dcp_index,
             )
             local_topk_to_global_slots(
                 local_topk_offsets=offsets,
@@ -625,27 +729,80 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 lens_out=topk_lens_slice,
             )
         else:
+            softmax_scale = self.indexer.weights_softmax_scale
+            if quantized is None:
+                q, q_scales = self._scorer_index_query(q, index_k_cache)
+            else:
+                # Unit query scales: the weights carry them and the score scale.
+                q_scales, softmax_scale = None, 1.0
             dsa_decode_topk(
                 q,
                 weights,
                 seq_lens,
                 page_table,
-                page_size=ctx.token_to_kv_pool.arena.kv_page_size,
+                page_size=ctx.token_to_kv_pool.index_k_page_size,
                 topk=topk,
-                softmax_scale=self.indexer.weights_softmax_scale,
+                softmax_scale=softmax_scale,
                 batch_invariant=False,
                 q_len_per_req=q_len_per_req,
                 index_k_cache=index_k_cache,
+                q_scales=q_scales,
                 seq_lens_2d=seq_lens_2d,
                 plan=metadata._dsa_plan,
                 out=topk_slice,
                 lens_out=topk_lens_slice,
                 slot_order=global_server_args_dict["dsa_slot_order"],
+                solution=self.decode_topk_solution,
             )
         return GlmDsaDecodeTopK(
             topk_indices=topk_indices,
             topk_lens=topk_lens,
+            dcp_index=dcp_index,
+            dcp_source=None if dcp_index is None else metadata,
+            dcp_q_len=q_len_per_req,
+            dcp_capturing=capturing,
         )
+
+    @staticmethod
+    def _reusable_dcp_index(
+        ctx: ForwardContext,
+        metadata: Any,
+        *,
+        placement: Any,
+        page_table: torch.Tensor,
+        q_len_per_req: int,
+        rows: int,
+        capturing: bool,
+    ) -> Any:
+        """The DCP index metadata of this forward's previous indexer layer.
+
+        The shared top-k is cleared whenever a forward's metadata is built,
+        so its decode record is this forward's. Its metadata is reused when
+        it was built from the same decode metadata, page table and rows, in
+        the same capture state: an eager step followed by a capture on the
+        same metadata (as a graph runner's warm-up does when the share is not
+        cleared in between) must not bake the eager build into the graph,
+        whose replays refresh lengths in place. A draft backend carries the
+        share across draft steps whose lengths advance in place, so it always
+        rebuilds.
+        """
+        if getattr(ctx.attn_backend, "is_draft", False):
+            return None
+        prev = ctx.attn_backend.sparse_topk.decode
+        index = getattr(prev, "dcp_index", None)
+        if (
+            index is None
+            or prev.dcp_source is not metadata
+            or prev.dcp_capturing != capturing
+            or prev.dcp_q_len != q_len_per_req
+            or index.placement != placement
+            or index.query_requests.shape[0] != rows
+            or index.page_table.data_ptr() != page_table.data_ptr()
+            or index.page_table.shape != page_table.shape
+            or index.page_table.stride() != page_table.stride()
+        ):
+            return None
+        return index
 
     def _compute_prefill_topk_indices(
         self,
@@ -674,6 +831,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 max_seq_len=cached.max_seq_len,
                 num_prefill_tokens=num_prefill_tokens,
                 topk=self.index_topk,
+                dcp_index=cached.dcp_index,
             )
 
         chunk_meta = ctx.attn_backend.chunked_prefill_metadata
@@ -703,23 +861,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
 
         device = indexer_output.query.device
         seq_lens_cpu = prefix_lens_cpu + extend_lens_cpu
-        seq_lens = seq_lens_cpu.to(device=device, dtype=torch.int32)
         max_seq_len = int(seq_lens_cpu.max().item())
-        page_size = ctx.token_to_kv_pool.arena.kv_page_size
-        max_pages = (max_seq_len + page_size - 1) // page_size
-        page_table = chunk_meta.page_table[:, :max_pages].to(
-            device=device,
-            dtype=torch.int32,
-        )
-        kv_workspace_slots = build_prefill_kv_workspace_slots(
-            page_table=page_table,
-            seq_lens=seq_lens,
-            max_seq_len=max_seq_len,
-            page_size=page_size,
-            device=device,
-            num_tokens=int(seq_lens_cpu.sum().item()),
-        )
-
         req_ids_cpu = torch.arange(seq_lens_cpu.numel(), dtype=torch.int64)
         token_req_cpu = torch.repeat_interleave(
             req_ids_cpu,
@@ -737,6 +879,23 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         torch.cumsum(seq_lens_cpu, dim=0, out=seq_cu_cpu[1:])
         row_starts_cpu = seq_cu_cpu.index_select(0, token_req_cpu)
         row_ends_cpu = row_starts_cpu + candidate_lens_cpu
+        seq_lens, row_starts, row_ends, kv_seq_lens = _int32_to_device(
+            (seq_lens_cpu, row_starts_cpu, row_ends_cpu, candidate_lens_cpu), device
+        )
+        page_size = ctx.token_to_kv_pool.index_k_page_size
+        max_pages = (max_seq_len + page_size - 1) // page_size
+        page_table = chunk_meta.page_table[:, :max_pages].to(
+            device=device,
+            dtype=torch.int32,
+        )
+        kv_workspace_slots = build_prefill_kv_workspace_slots(
+            page_table=page_table,
+            seq_lens=seq_lens,
+            max_seq_len=max_seq_len,
+            page_size=page_size,
+            device=device,
+            num_tokens=int(seq_lens_cpu.sum().item()),
+        )
 
         return self._compute_prefill_topk_indices_portable(
             indexer_output=indexer_output,
@@ -744,16 +903,124 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             seq_lens=seq_lens,
             page_table=page_table,
             kv_workspace_slots=kv_workspace_slots,
-            row_starts=row_starts_cpu.to(device=device, dtype=torch.int32),
-            row_ends=row_ends_cpu.to(device=device, dtype=torch.int32),
+            row_starts=row_starts,
+            row_ends=row_ends,
             candidate_lens_cpu=candidate_lens_cpu,
-            kv_seq_lens=candidate_lens_cpu.to(
-                device=device, dtype=torch.int32
-            ).contiguous(),
+            kv_seq_lens=kv_seq_lens,
             max_seq_len=max_seq_len,
             num_prefill_tokens=num_prefill_tokens,
             topk=self.index_topk,
+            dcp_index=None,
         )
+
+    def _select_prefill_topk_rows(
+        self,
+        *,
+        q: torch.Tensor,
+        weights: torch.Tensor,
+        kv_workspace_slots: torch.Tensor,
+        row_starts: torch.Tensor,
+        row_ends: torch.Tensor,
+        candidate_lens_cpu: torch.Tensor,
+        index_k_cache: torch.Tensor,
+        page_size: int,
+        max_logits_bytes: int,
+        topk: int,
+        query_proj: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Prefill top-k over the whole index-K plane, rows split over TP.
+
+        Without the split (or with too few rows to pay for the gather) every
+        rank selects for every row. With it, rank ``r`` selects for rows
+        ``[r * per_rank, (r + 1) * per_rank)`` and the ranks all-gather the
+        ``[rows, topk]`` selection and the per-row lengths. A workspace of
+        fewer than 65535 rows gathers the selection as int16 (unsigned 16-bit
+        indices, ``-1`` where empty), which halves the gathered bytes.
+        With ``query_proj`` set, ``q`` holds its input rows and each rank
+        projects (and, see :meth:`_scorer_index_query`, quantizes) only the
+        rows it selects for.
+        """
+
+        def select(rows: slice, out=None, lens_out=None):
+            query, q_scales = self._scorer_index_query(
+                q[rows] if query_proj is None else query_proj(q[rows]),
+                index_k_cache,
+            )
+            return dsa_prefill_topk(
+                query,
+                weights[rows],
+                kv_workspace_slots,
+                row_starts[rows],
+                row_ends[rows],
+                topk=topk,
+                softmax_scale=self.indexer.weights_softmax_scale,
+                batch_invariant=False,
+                index_k_cache=index_k_cache,
+                page_size=page_size,
+                q_scales=q_scales,
+                max_logits_bytes=max_logits_bytes,
+                candidate_lens_cpu=candidate_lens_cpu[rows],
+                slot_order=global_server_args_dict["dsa_slot_order"],
+                out=out,
+                lens_out=lens_out,
+            )
+
+        num_rows = q.shape[0]
+        tp_size = self.mapping.attn.tp_size
+        if (
+            not self.prefill_topk_tp_split
+            or tp_size == 1
+            or num_rows < _PREFILL_TOPK_TP_SPLIT_MIN_ROWS
+        ):
+            return select(slice(0, num_rows))
+        # 16-row slices stay 64-byte aligned, so Triton never recompiles during serving.
+        per_rank = -(-num_rows // (tp_size * _PREFILL_TOPK_ROW_ALIGN)) * (
+            _PREFILL_TOPK_ROW_ALIGN
+        )
+        begin = min(num_rows, self.mapping.attn.tp_rank * per_rank)
+        end = min(num_rows, begin + per_rank)
+        gather_dtype = (
+            torch.int16 if kv_workspace_slots.numel() < 0xFFFF else torch.int32
+        )
+        local = torch.empty((per_rank, topk), dtype=torch.int32, device=q.device)
+        local_lens = torch.zeros((per_rank,), dtype=torch.int32, device=q.device)
+        if end > begin:
+            select(
+                slice(begin, end),
+                out=local[: end - begin],
+                lens_out=local_lens[: end - begin],
+            )
+        gathered, gathered_lens = self._gather_prefill_topk_rows(
+            local, local_lens, gather_dtype
+        )
+        return gathered[:num_rows], gathered_lens[:num_rows]
+
+    def _gather_prefill_topk_rows(
+        self, local: torch.Tensor, local_lens: torch.Tensor, gather_dtype: torch.dtype
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """All-gather every rank's int32 selection rows (as ``gather_dtype``) and lengths."""
+        tp_size = self.mapping.attn.tp_size
+        per_rank = local.shape[0]
+        gathered = torch.empty(
+            (tp_size * per_rank, local.shape[1]),
+            dtype=gather_dtype,
+            device=local.device,
+        )
+        gathered_lens = torch.empty(
+            (tp_size * per_rank,), dtype=torch.int32, device=local.device
+        )
+        group = self.mapping.attn.tp_group
+        # The int32 -> int16 cast keeps the low 16 bits, so -1 stays 0xFFFF.
+        local = local.to(gather_dtype)
+        if gather_dtype == torch.int16:
+            # NCCL has no int16; the gather copies bytes, so ship bf16 bit patterns.
+            all_gather_single(
+                gathered.view(torch.bfloat16), local.view(torch.bfloat16), group
+            )
+        else:
+            all_gather_single(gathered, local, group)
+        all_gather_single(gathered_lens, local_lens, group)
+        return gathered, gathered_lens
 
     def _compute_prefill_topk_indices_portable(
         self,
@@ -770,7 +1037,10 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         max_seq_len: int,
         num_prefill_tokens: int,
         topk: int,
+        dcp_index: DCPIndexMetadata | None,
     ) -> GlmDsaPrefillTopK:
+        """Prefill top-k of the round's rows. ``dcp_index`` is this forward's
+        previous indexer layer's DCP index metadata, or ``None``."""
         q = indexer_output.query[:num_prefill_tokens].contiguous()
         # Raw BF16 weights view (may be column-split and noncompact); the top-k
         # scorer consumes the row/head strides and upcasts weights in-kernel.
@@ -782,45 +1052,66 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
 
         max_logits_mb = int(global_server_args_dict[_INDEXER_PREFILL_MAX_LOGITS_MB_ARG])
         placement = ctx.attn_backend.cache_placement(self.attn_mqa)
+        owned_index = None
         if placement is not None:
+            if indexer_output.query_proj is not None:
+                q = indexer_output.query_proj(q)
+            # Both gates read host values equal on every KVP rank, so the ranks issue the same collectives.
+            row_owner = q.shape[0] >= _KVP_PREFILL_ROW_OWNER_MIN_ROWS
             global_starts, global_ends = row_starts, row_ends
+            owned_index = self._owned_width_dcp_index(
+                ctx,
+                dcp_index,
+                q,
+                weights,
+                index_k_cache,
+                page_table,
+                seq_lens,
+                row_starts,
+                row_ends,
+                placement=placement,
+            )
             offsets, topk_lens = select_dsa_topk(
                 q,
                 weights,
                 index_k_cache,
                 page_table,
-                torch.searchsorted(
-                    torch.cumsum(seq_lens.to(device=q.device, dtype=torch.int64), 0),
-                    row_starts.long(),
-                    right=True,
-                ).to(torch.int32),
-                global_ends - global_starts,
+                (
+                    _prefill_query_requests(seq_lens, row_starts)
+                    if owned_index is None
+                    else owned_index.query_requests
+                ),
+                (
+                    global_ends - global_starts
+                    if owned_index is None
+                    else owned_index.causal_lens
+                ),
                 placement=placement,
-                page_size=ctx.token_to_kv_pool.arena.kv_page_size,
+                page_size=ctx.token_to_kv_pool.index_k_page_size,
                 topk=topk,
                 softmax_scale=self.indexer.weights_softmax_scale,
                 initial_tokens=0,
                 local_tokens=0,
                 max_logits_bytes=max(1, max_logits_mb) * 1024 * 1024,
+                metadata=owned_index,
+                row_owner=row_owner,
             )
             workspace_indices = torch.where(
                 offsets >= 0, offsets + global_starts.unsqueeze(1), -1
             ).to(torch.int32)
         else:
-            workspace_indices, topk_lens = dsa_prefill_topk(
-                q,
-                weights,
-                kv_workspace_slots,
-                row_starts.to(torch.int32).contiguous(),
-                row_ends.to(torch.int32).contiguous(),
-                topk=topk,
-                softmax_scale=self.indexer.weights_softmax_scale,
-                batch_invariant=False,
-                index_k_cache=index_k_cache,
-                page_size=ctx.token_to_kv_pool.arena.kv_page_size,
-                max_logits_bytes=max(1, max_logits_mb) * 1024 * 1024,
+            workspace_indices, topk_lens = self._select_prefill_topk_rows(
+                q=q,
+                weights=weights,
+                kv_workspace_slots=kv_workspace_slots,
+                row_starts=row_starts.to(torch.int32).contiguous(),
+                row_ends=row_ends.to(torch.int32).contiguous(),
                 candidate_lens_cpu=candidate_lens_cpu,
-                slot_order=global_server_args_dict["dsa_slot_order"],
+                index_k_cache=index_k_cache,
+                page_size=ctx.token_to_kv_pool.index_k_page_size,
+                max_logits_bytes=max(1, max_logits_mb) * 1024 * 1024,
+                topk=topk,
+                query_proj=indexer_output.query_proj,
             )
         return GlmDsaPrefillTopK(
             workspace_indices=workspace_indices,
@@ -833,54 +1124,153 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             row_starts=row_starts,
             row_ends=row_ends,
             candidate_lens_cpu=candidate_lens_cpu,
+            dcp_index=owned_index,
         )
 
-    @break_point
-    def forward(
+    def _owned_width_dcp_index(
+        self,
+        ctx: ForwardContext,
+        previous: DCPIndexMetadata | None,
+        q: torch.Tensor,
+        weights: torch.Tensor,
+        index_k_cache: torch.Tensor,
+        page_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        row_starts: torch.Tensor,
+        row_ends: torch.Tensor,
+        *,
+        placement: CachePlacement,
+    ) -> DCPIndexMetadata | None:
+        """This forward's DCP index metadata at the leaf's owned width, or
+        ``None`` to keep the page table's width.
+
+        The leaf plans the width per forward from the host page table, the
+        same on every rank (``prefill_index_columns``). Every indexer layer
+        of a forward scores the same rows against the same page table, so the
+        first builds the local table, the row geometry and, within the memory
+        cap, the owned-width pages; later layers reuse ``previous``, the
+        shared prefill record that every forward's metadata build clears.
+        """
+        columns = ctx.attn_backend.prefill_index_columns()
+        if columns is None:
+            return None
+        if (
+            previous is not None
+            and previous.placement == placement
+            and previous.page_table is page_table
+            and previous.query_requests.shape[0] == q.shape[0]
+        ):
+            return previous
+        return build_dcp_index_metadata(
+            q,
+            weights,
+            index_k_cache,
+            page_table,
+            _prefill_query_requests(seq_lens, row_starts),
+            row_ends - row_starts,
+            placement=placement,
+            page_size=ctx.token_to_kv_pool.index_k_page_size,
+            columns=columns,
+        )
+
+    def forward_dsa_core(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        q_norm: torch.Tensor,
+        latent_cache: torch.Tensor,
         ctx: ForwardContext,
         comm_manager: CommManager,
-        block_scale: torch.Tensor | None = None,
+        output_gate: torch.Tensor | None = None,
+        projected_q: torch.Tensor | None = None,
+        index_query: torch.Tensor | None = None,
+        index_key_weights: torch.Tensor | None = None,
+        written_index_query: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        """GLM-5 DSA attention, one COARSE breakable-graph break point.
+        """DSA sparse MLA after the a-projections.
 
-        Like DeepSeek V4.1 it does cache-group writes, a data-dependent indexer
-        -> top-k stage and the FlashMLA sparse kernel (plus pre-attn
-        collectives), none capturable. Under a prefill-graph capture the whole
-        attention runs eager (reading the live ``ctx``) while the layer's
-        norms + MoE stay graphed; direct call otherwise (see ``break_point``).
+        It runs the indexer and its index-K write, the shared prefill/decode
+        top-k, then the sparse prefill and decode cores over the round's rows.
+
+        Args:
+            positions: ``[T]`` token positions.
+            hidden_states: ``[T, hidden]`` attention input (the indexer's
+                ``wk`` / ``weights_proj`` input).
+            q_norm: ``[T, q_lora_rank]`` normalized q latent (the indexer's
+                ``wq_b`` input and the ``q_b_proj`` input).
+            latent_cache: ``[T, kv_lora_rank + qk_rope_head_dim]`` latent rows,
+                the latent part already normalized.
+            ctx: The forward context; ``ctx.attn_backend`` is the DSA router.
+            comm_manager: The layer's attention communication.
+            output_gate: Optional raw ``[T, num_local_heads * v_head_dim]``
+                sigmoid gate the value projection applies; decode rounds only.
+            projected_q: Optional ``q_b_proj(q_norm)`` rows a caller projected
+                ahead; None projects them here.
+            index_query: Optional ``[T, index_heads, index_head_dim]`` index
+                query a caller projected ahead; None leaves the indexer's.
+            index_key_weights: Optional ``[T, index_head_dim + index_heads]``
+                pre-norm index keys then head weights a caller projected
+                ahead from the attention input, unit inner stride; the
+                indexer then skips its own projection of ``hidden_states``.
+                None projects them in the indexer.
+            written_index_query: Optional decode-round E4M3 index queries
+                ``[T, index_heads, index_head_dim]`` and FP32 head weights
+                ``[T, index_heads]`` (``quantize_index_query_weights``' outputs)
+                from a launch that also wrote the round's index keys
+                (``index_k_layernorm_fp8_scatter``'s bytes); the core then skips
+                its index-K write. Every row must decode, without KV
+                placement, under ``index_k_write_quantizes_query``, and the
+                keys must be the caller's ``index_key_weights``. None writes
+                the keys here.
+
+        Returns:
+            ``[T, num_local_heads * v_head_dim]`` attention output before
+            ``o_proj`` (gated when ``output_gate`` is given).
         """
-        # Empty (idle / DP-idle) batch: explicit skip, like the sibling MLP/MoE forwards.
-        if hidden_states.shape[0] == 0:
-            return hidden_states
-        qkv = self.fused_qkv_a_proj_with_mqa(
-            hidden_states,
-            block_scale,
-            torch.bfloat16,
-        )
-        # The fused QKV-A weight may be zero-padded on its output dim to a
-        # multiple of 128 so the FP8 block-scale GEMM stays numerically valid
-        # (see GlmMoeDsaForCausalLM._pad_fused_qkv_a_proj_for_fp8_blockscale).
-        # Drop the padding columns before the split / comm. No-op when the
-        # projection output already matches the logical width.
-        _qkv_width = self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim
-        if qkv.shape[-1] != _qkv_width:
-            qkv = qkv[..., :_qkv_width]
-        qkv = comm_manager.pre_attn_comm(qkv, ctx)
-
-        q_a, latent_cache = qkv.split(
-            [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
-            dim=-1,
-        )
-        kv_a = latent_cache[..., : self.kv_lora_rank]
-        q_norm = torch.empty_like(q_a)
-        if q_a.size(0) > 0:
-            self.fused_qk_layernorm(input_q_a=q_a, input_kv_a=kv_a, output_q_a=q_norm)
-
+        if output_gate is not None and ctx.num_extends > 0:
+            raise ValueError("the DSA value projection gates decode rounds only")
+        if written_index_query is not None and (
+            ctx.num_extends > 0
+            or not self.index_k_write_quantizes_query
+            or index_key_weights is None
+        ):
+            raise ValueError(
+                "a written index query serves decode rounds whose index-K write "
+                "quantizes the query (index_k_write_quantizes_query) over the "
+                "keys the caller projected (index_key_weights)"
+            )
         decode_metadata = getattr(ctx.attn_backend, "forward_decode_metadata", None)
         num_attn_tokens = int(q_norm.shape[0])
+        # Narrow padded-replay inputs to live rows; _land_in restores the bucket shape.
+        valid_rows = current_valid_rows()
+        if valid_rows is not None and valid_rows < num_attn_tokens:
+            if written_index_query is not None:
+                raise RuntimeError("a written index query cannot be narrowed")
+            if positions.dim() != 1:
+                raise RuntimeError("padded DSA replay expects 1-D positions")
+            if comm_manager.needs_pre_attn_all_gather():
+                raise RuntimeError(
+                    "padded DSA replay needs an identity pre-attention comm"
+                )
+            (
+                positions,
+                q_norm,
+                latent_cache,
+                output_gate,
+                projected_q,
+                index_query,
+                index_key_weights,
+            ) = slice_to_real_tokens(
+                valid_rows,
+                positions,
+                q_norm,
+                latent_cache,
+                output_gate,
+                projected_q,
+                index_query,
+                index_key_weights,
+            )
+            num_attn_tokens = valid_rows
         decode_window = self._resolve_decode_window(
             ctx,
             decode_metadata,
@@ -894,7 +1284,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         # The round's KV write slots, by sub-mode: the extend span for the
         # prefill rows, the decode rows' verify window behind them. The
         # indexer's full-round index_k write consumes the concatenation
-        # (eager-only here: this break never runs inside a captured graph).
+        # (an eager break; under a padded replay the rows were narrowed above).
         backend = ctx.attn_backend
         # The forward's shared top-k: an indexer layer publishes, "shared"
         # layers (and the MTP head reusing the target's) consume.
@@ -917,6 +1307,12 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             out_cache_loc = decode_locs
         else:
             out_cache_loc = torch.empty(0, dtype=torch.int64, device=q_norm.device)
+        if valid_rows is not None and out_cache_loc.numel() != num_attn_tokens:
+            # Host metadata only, checked before the first cache write.
+            raise RuntimeError(
+                f"padded DSA replay: write span {out_cache_loc.numel()} "
+                f"!= live rows {num_attn_tokens}"
+            )
 
         should_compute_indexer = not self.skip_indexer_topk or (
             self.is_nextn
@@ -925,18 +1321,60 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 or (num_decode_tokens > 0 and shared_topk.decode is None)
             )
         )
+        if written_index_query is not None and not should_compute_indexer:
+            raise RuntimeError("a written index query needs the layer's own top-k")
         if should_compute_indexer:
-            hidden_states = comm_manager.pre_attn_comm(hidden_states, ctx)
-            indexer_output = self.indexer(hidden_states, q_norm, positions)
-            index_slots, index_mask = resolve_cache_slots(
-                out_cache_loc, ctx.attn_backend.cache_placement(self.attn_mqa)
-            )
-            ctx.token_to_kv_pool.set_index_k_buffer(
-                self.attn_mqa.layer_id,
-                index_slots,
-                indexer_output.key,
-                write_mask=index_mask,
-            )
+            if index_key_weights is None:
+                hidden_states = comm_manager.pre_attn_comm(hidden_states, ctx)
+                if valid_rows is not None:
+                    (hidden_states,) = slice_to_real_tokens(
+                        num_attn_tokens, hidden_states
+                    )
+                indexer_output = self.indexer(hidden_states, q_norm, positions)
+            else:
+                indexer_output = self.indexer.from_key_weights(
+                    q_norm, index_key_weights
+                )
+            if index_query is not None:
+                indexer_output = replace(
+                    indexer_output, query=index_query, query_proj=None
+                )
+            placement = ctx.attn_backend.cache_placement(self.attn_mqa)
+            index_slots, index_mask = resolve_cache_slots(out_cache_loc, placement)
+            if written_index_query is not None:
+                if num_prefill_tokens > 0 or placement is not None:
+                    raise RuntimeError(
+                        "a written index query needs a decode round without KV "
+                        "placement"
+                    )
+                indexer_output = replace(
+                    indexer_output, quantized_query=written_index_query
+                )
+            # Decode rounds only (every row decodes); the KV-parallel top-k scores BF16 queries.
+            elif (
+                self.index_k_write_quantizes_query
+                and num_prefill_tokens == 0
+                and placement is None
+            ):
+                quantized = ctx.token_to_kv_pool.set_index_k_buffer_and_quantize_query(
+                    self.attn_mqa.layer_id,
+                    index_slots,
+                    indexer_output.key,
+                    write_mask=index_mask,
+                    key_norm=indexer_output.key_norm,
+                    query=indexer_output.query_rows(0, num_attn_tokens),
+                    query_weights=indexer_output.weights,
+                    softmax_scale=self.indexer.weights_softmax_scale,
+                )
+                indexer_output = replace(indexer_output, quantized_query=quantized)
+            else:
+                ctx.token_to_kv_pool.set_index_k_buffer(
+                    self.attn_mqa.layer_id,
+                    index_slots,
+                    indexer_output.key,
+                    write_mask=index_mask,
+                    key_norm=indexer_output.key_norm,
+                )
             if ctx.num_extends > 0:
                 shared_topk.prefill = self._compute_prefill_topk_indices(
                     indexer_output,
@@ -949,7 +1387,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                     ctx,
                 )
 
-        q = self.q_b_proj(q_norm)[0]
+        q = self.q_b_proj(q_norm)[0] if projected_q is None else projected_q
         attn_output = torch.empty(
             q.size(0),
             self.num_local_heads * self.v_head_dim,
@@ -1004,12 +1442,14 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 attn_output[decode_start:decode_end],
                 topk_indices=topk_indices,
                 topk_lens=topk_lens,
+                output_gate=(
+                    None
+                    if output_gate is None
+                    else output_gate[decode_start:decode_end]
+                ),
             )
 
-        if ctx.draft_narrowing is not None:
-            attn_output = attn_output.index_select(0, ctx.gather_ids)
-        output, _ = self.o_proj(attn_output)
-        return output
+        return attn_output
 
     def forward_dsa_sparse_prefill(
         self,
@@ -1056,6 +1496,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         output: torch.Tensor,
         topk_indices: torch.Tensor | None = None,
         topk_lens: torch.Tensor | None = None,
+        output_gate: torch.Tensor | None = None,
     ) -> torch.Tensor:
         Q = self.forward_absorb_qkv_proj(
             q,
@@ -1070,6 +1511,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             output,
             topk_indices=topk_indices,
             topk_lens=topk_lens,
+            output_gate=output_gate,
         )
 
     def forward_absorb_attn_v_proj(
@@ -1079,6 +1521,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         output: torch.Tensor,
         topk_indices: torch.Tensor | None = None,
         topk_lens: torch.Tensor | None = None,
+        output_gate: torch.Tensor | None = None,
     ) -> torch.Tensor:
         attn_output = self.attn_mqa(
             Q,
@@ -1090,173 +1533,188 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             topk_lens=topk_lens,
         )
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
-        output_view = output.view(-1, self.num_local_heads, self.v_head_dim)
+        self.project_latent_values(attn_output, output, output_gate)
+        return output
+
+    def project_latent_values(
+        self,
+        attn_output: torch.Tensor,
+        output: torch.Tensor,
+        gate: torch.Tensor | None,
+    ) -> None:
+        """``output = (attn_output @ w_vc) * sigmoid(gate)`` per local head.
+
+        ``attn_output`` is ``[T, heads, kv_lora_rank]``; ``output`` and the
+        optional raw ``gate`` are ``[T, heads * v_head_dim]``.
+        """
         torch.bmm(
             attn_output.transpose(0, 1),
             self.w_vc,
-            out=output_view.transpose(0, 1),
+            out=output.view(-1, self.num_local_heads, self.v_head_dim).transpose(0, 1),
         )
-        return output
+        if gate is not None:
+            sigmoid_mul(output, gate)
 
 
-class GlmMoeDsaDecoderLayer(DeepseekV3DecoderLayer):
+class GlmMoeDsaAttention(GlmDsaSparseAttentionMixin, DeepseekV3AttentionMLA):
+    _RAGGED_PREFILL_BACKENDS = ("trtllm_mla", "tokenspeed_mla", "dsa")
+    rope_is_neox_style = False
+
     def __init__(
         self,
         config: PretrainedConfig,
-        layer_id: int,
         mapping: Mapping,
+        hidden_size: int,
+        num_heads: int,
+        qk_nope_head_dim: int,
+        qk_rope_head_dim: int,
+        v_head_dim: int,
+        q_lora_rank: int,
+        kv_lora_rank: int,
+        rope_theta: float = 10000,
+        rope_scaling: dict[str, Any] | None = None,
+        max_position_embeddings: int = 8192,
         quant_config: QuantizationConfig | None = None,
-        is_nextn: bool = False,
+        layer_id=None,
         prefix: str = "",
+        reduce_attn_results=True,
         alt_stream: torch.cuda.Stream | None = None,
+        skip_rope: bool = False,
+        is_nextn: bool = False,
     ) -> None:
-        nn.Module.__init__(self)
-        self.mapping = mapping
-        self.hidden_size = config.hidden_size
-        rope_theta = get_rope_theta(config)
-        rope_scaling = getattr(config, "rope_scaling", None)
-        max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-
-        self.self_attn = GlmMoeDsaAttention(
+        rope_scaling = _glm_dsa_rope_scaling(rope_scaling)
+        super().__init__(
             config=config,
-            hidden_size=self.hidden_size,
-            num_heads=config.num_attention_heads,
-            qk_nope_head_dim=config.qk_nope_head_dim,
-            qk_rope_head_dim=config.qk_rope_head_dim,
-            v_head_dim=config.v_head_dim,
-            q_lora_rank=(
-                config.q_lora_rank if hasattr(config, "q_lora_rank") else None
-            ),
-            kv_lora_rank=config.kv_lora_rank,
+            mapping=mapping,
+            hidden_size=hidden_size,
+            num_heads=num_heads,
+            qk_nope_head_dim=qk_nope_head_dim,
+            qk_rope_head_dim=qk_rope_head_dim,
+            v_head_dim=v_head_dim,
+            q_lora_rank=q_lora_rank,
+            kv_lora_rank=kv_lora_rank,
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
-            quant_config=(
-                None
-                if "self_attn" in getattr(config, "disable_quant_module", [])
-                else quant_config
-            ),
+            quant_config=quant_config,
             layer_id=layer_id,
-            prefix=add_prefix("self_attn", prefix),
-            reduce_attn_results=False,
+            prefix=prefix,
+            reduce_attn_results=reduce_attn_results,
             alt_stream=alt_stream,
-            mapping=self.mapping,
-            is_nextn=is_nextn,
+            skip_rope=skip_rope,
         )
-
-        self.layer_id = layer_id
-        self.is_moe_layer = self._is_moe_layer(layer_id, is_nextn, config)
-        if self.is_moe_layer:
-            self.mlp = DeepseekV3MoE(
-                config=config,
-                mapping=self.mapping,
-                quant_config=quant_config,
-                layer_index=layer_id,
-                prefix=add_prefix("mlp", prefix),
-                alt_stream=alt_stream,
-            )
+        if q_lora_rank is None:
+            raise ValueError("GLM DSA requires q_lora_rank.")
+        # process_weights picks DeepGEMM only after converting FP8 block scales for it.
+        self.q_a_layernorm = RMSNorm(q_lora_rank, eps=1e-6)
+        self.kv_a_layernorm = RMSNorm(kv_lora_rank, eps=1e-6)
+        self.fused_qk_layernorm = FusedRMSNorm(
+            self.q_a_layernorm,
+            self.kv_a_layernorm,
+        )
+        self.index_topk = config.index_topk
+        self.is_nextn = is_nextn
+        # Every rank selects every prefill row (validated configuration).
+        self.prefill_topk_tp_split = False
+        # NextN may reuse the prior draft's top-k; shared layers lack indexer weights.
+        self.skip_indexer_topk = (
+            True if is_nextn else _glm_dsa_skip_indexer_topk(config, layer_id)
+        )
+        if self.skip_indexer_topk and not self.is_nextn:
+            self.indexer = None
         else:
-            self.mlp = DeepseekV3MLP(
-                hidden_size=config.hidden_size,
-                intermediate_size=(
-                    config.ffn_hidden_size
-                    if hasattr(config, "ffn_hidden_size")
-                    else config.intermediate_size
-                ),
-                hidden_act=config.hidden_act,
-                mapping=self.mapping,
-                quant_config=(
-                    None
-                    if "dense_mlp" in getattr(config, "disable_quant_module", [])
-                    else quant_config
-                ),
-                prefix=add_prefix("mlp", prefix),
-                is_shared_expert=False,
-                batch_invariant=False,
+            self.indexer = GlmDsaIndexer(
+                config=config,
+                hidden_size=hidden_size,
+                q_lora_rank=q_lora_rank,
+                qk_rope_head_dim=qk_rope_head_dim,
+                rope_theta=rope_theta,
+                rope_scaling=rope_scaling,
+                max_position_embeddings=max_position_embeddings,
+                quant_config=quant_config,
+                prefix=add_prefix("indexer", prefix),
             )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.comm_manager = CommManager(
-            mapping=self.mapping,
-            layer_id=self.layer_id,
-            is_moe=self.is_moe_layer,
-            prev_is_moe=self._is_moe_layer(layer_id - 1, is_nextn, config),
-            dense_batch_invariant=False,
-            input_layernorm=self.input_layernorm,
-            post_attn_layernorm=self.post_attention_layernorm,
-            query_sharded=False,
-        )
+        self._decode_topk_indices_buffer: torch.Tensor | None = None
+        self._decode_topk_lens_buffer: torch.Tensor | None = None
+        self._retired_decode_workspaces: list[torch.Tensor] = []
 
+    @break_point
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        residual: torch.Tensor | None,
-        aux_hidden_states: list[torch.Tensor] | None = None,
+        comm_manager: CommManager,
+        block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
-            ctx
+        """GLM-5 DSA attention, one COARSE breakable-graph break point.
+
+        Like DeepSeek V4.1 it does cache-group writes, a data-dependent indexer
+        -> top-k stage and the FlashMLA sparse kernel (plus pre-attn
+        collectives), none capturable. Under a prefill-graph capture the whole
+        attention runs eager (reading the live ``ctx``) while the layer's
+        norms + MoE stay graphed; direct call otherwise (see ``break_point``).
+        """
+        # Empty (idle / DP-idle) batch: explicit skip, like the sibling MLP/MoE forwards.
+        if hidden_states.shape[0] == 0:
+            return hidden_states
+        qkv = self.fused_qkv_a_proj_with_mqa(
+            hidden_states,
+            block_scale,
+            torch.bfloat16,
         )
+        # Drop the FP8 block-scale padding columns of the fused QKV-A output, if any.
+        _qkv_width = self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim
+        if qkv.shape[-1] != _qkv_width:
+            qkv = qkv[..., :_qkv_width]
+        qkv = comm_manager.pre_attn_comm(qkv, ctx)
 
-        if not ctx.forward_mode.is_idle():
-            hidden_states, residual = self.comm_manager.input_reduce_norm(
-                hidden_states, residual
-            )
-            capture_layer_input(self.comm_manager, residual, ctx, aux_hidden_states)
-            hidden_states = self.self_attn(
-                positions=positions,
-                hidden_states=hidden_states,
-                ctx=ctx,
-                comm_manager=self.comm_manager,
-            )
-            if ctx.draft_narrowing is not None:
-                residual = residual.index_select(0, ctx.gather_ids)
-            hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
-                hidden_states, residual, ctx
-            )
-            hidden_states = self.forward_mlp(
-                hidden_states,
-                residual,
-                ctx,
-                num_global_tokens,
-                max_num_tokens_per_gpu,
-            )
-        else:
-            # No rows, but the tap and its gather stay aligned across ranks.
-            capture_layer_input(
-                self.comm_manager, hidden_states, ctx, aux_hidden_states
-            )
-            hidden_states = self.forward_mlp(
-                hidden_states,
-                residual,
-                ctx,
-                num_global_tokens,
-                max_num_tokens_per_gpu,
-            )
-        return hidden_states, residual
+        q_a, latent_cache = qkv.split(
+            [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+            dim=-1,
+        )
+        kv_a = latent_cache[..., : self.kv_lora_rank]
+        q_norm = torch.empty_like(q_a)
+        if q_a.size(0) > 0:
+            self.fused_qk_layernorm(input_q_a=q_a, input_kv_a=kv_a, output_q_a=q_norm)
 
-    def forward_mlp(
+        attn_output = self.forward_dsa_core(
+            positions, hidden_states, q_norm, latent_cache, ctx, comm_manager
+        )
+        if ctx.draft_narrowing is not None:
+            attn_output = attn_output.index_select(0, ctx.gather_ids)
+        output, _ = self.o_proj(attn_output)
+        return output
+
+
+class GlmMoeDsaDecoderLayer(DeepseekV3DecoderLayer):
+    @property
+    def attention_cls(self) -> type[nn.Module]:
+        return GlmMoeDsaAttention
+
+    @property
+    def dense_batch_invariant(self) -> bool:
+        return False
+
+    def attention_kwargs(self, prefix: str) -> dict:
+        return {**super().attention_kwargs(prefix), "is_nextn": self.is_nextn}
+
+    def narrow_residual(
+        self, residual: torch.Tensor, ctx: ForwardContext
+    ) -> torch.Tensor:
+        if ctx.draft_narrowing is None:
+            return residual
+        return residual.index_select(0, ctx.gather_ids)
+
+    def forward_idle_attn(
         self,
-        hidden_states,
-        residual,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        num_global_tokens,
-        max_num_tokens_per_gpu,
-    ):
-        hidden_states = self.comm_manager.pre_mlp_comm(hidden_states, ctx)
-        if self.is_moe_layer:
-            hidden_states = self.mlp(
-                hidden_states, num_global_tokens, max_num_tokens_per_gpu
-            )
-        else:
-            hidden_states = self.mlp(hidden_states)
-        hidden_states, residual = self.comm_manager.post_mlp_fused(
-            hidden_states, residual, ctx
-        )
-        return hidden_states
+        aux_hidden_states: list[torch.Tensor] | None,
+    ) -> None:
+        # No rows, but the tap and its gather stay aligned across ranks.
+        capture_layer_input(self.comm_manager, hidden_states, ctx, aux_hidden_states)
 
 
 class GlmMoeDsaModel(DeepseekV3Model):
@@ -1335,6 +1793,57 @@ def pad_fused_qkv_a_proj_weight_for_fp8_blockscale(attn) -> None:
     proj.weight = padded
 
 
+def load_fused_indexer_projection(
+    name: str,
+    loaded_weight: torch.Tensor,
+    *,
+    params_dict: dict[str, torch.Tensor],
+    modules_dict: dict[str, nn.Module],
+    pending_fp8_wk: dict[str, dict[str, torch.Tensor]],
+    loaded_shards: dict[str, set[int]],
+    weight_block_size: list[int] | None,
+) -> None:
+    """Copy an indexer ``wk`` / ``weights_proj`` checkpoint tensor into shard
+    0 / 1 of the bf16 fused ``wk_weights_proj``.
+
+    An FP8 ``wk`` and its ``weight_scale_inv`` wait in ``pending_fp8_wk`` for
+    each other, then load block-dequantized. Once both shards of a module have
+    loaded, its indexer switches to the fused projection.
+    """
+    if ".indexer.weights_proj.weight" in name:
+        module_name, shard_id = name.rsplit(".weights_proj.weight", 1)[0], 1
+    elif ".indexer.wk." in name:
+        module_name, shard_id = name.rsplit(".wk.", 1)[0], 0
+        is_fp8_weight = name.endswith(".weight") and loaded_weight.dtype in (
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fnuz,
+        )
+        if is_fp8_weight or "weight_scale_inv" in name:
+            entry = pending_fp8_wk.setdefault(module_name, {})
+            entry["weight" if is_fp8_weight else "scale"] = loaded_weight
+            if len(entry) < 2 or weight_block_size is None:
+                return
+            del pending_fp8_wk[module_name]
+            loaded_weight = block_dequant(
+                entry["weight"], entry["scale"], list(weight_block_size)
+            ).to(torch.bfloat16)
+        elif not name.endswith(".weight"):
+            return
+    else:
+        return
+
+    param = params_dict.get(f"{module_name}.wk_weights_proj.weight")
+    if param is None:
+        return
+    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+    weight_loader(param, loaded_weight, shard_id)
+    shards = loaded_shards.setdefault(module_name, set())
+    shards.add(shard_id)
+    module = modules_dict.get(module_name)
+    if shards == {0, 1} and isinstance(module, GlmDsaIndexer):
+        module.set_wk_weights_proj_loaded()
+
+
 class GlmMoeDsaForCausalLM(DeepseekV3ForCausalLM):
     model_cls = GlmMoeDsaModel
 
@@ -1392,144 +1901,6 @@ class GlmMoeDsaForCausalLM(DeepseekV3ForCausalLM):
             )
         super().end_weight_update()
 
-    def _record_fused_indexer_projection_shard(
-        self,
-        *,
-        module_name: str,
-        shard_id: int,
-        loaded_shards: dict[str, set[int]],
-        modules_dict: dict[str, nn.Module],
-    ) -> None:
-        shards = loaded_shards.setdefault(module_name, set())
-        shards.add(int(shard_id))
-        if shards != {0, 1}:
-            return
-
-        module = modules_dict.get(module_name)
-        if isinstance(module, GlmDsaIndexer):
-            module.set_wk_weights_proj_loaded()
-
-    def _load_fused_indexer_projection_shard(
-        self,
-        *,
-        module_name: str,
-        shard_id: int,
-        loaded_weight: torch.Tensor,
-        params_dict: dict[str, torch.Tensor],
-        modules_dict: dict[str, nn.Module],
-        loaded_shards: dict[str, set[int]],
-    ) -> bool:
-        param = params_dict.get(f"{module_name}.wk_weights_proj.weight")
-        if param is None:
-            return False
-
-        weight_loader = getattr(param, "weight_loader", default_weight_loader)
-        weight_loader(param, loaded_weight, shard_id)
-        self._record_fused_indexer_projection_shard(
-            module_name=module_name,
-            shard_id=shard_id,
-            loaded_shards=loaded_shards,
-            modules_dict=modules_dict,
-        )
-        return True
-
-    def _flush_fused_indexer_fp8_wk(
-        self,
-        *,
-        module_name: str,
-        pending_fp8_wk: dict[str, dict[str, torch.Tensor]],
-        params_dict: dict[str, torch.Tensor],
-        modules_dict: dict[str, nn.Module],
-        loaded_shards: dict[str, set[int]],
-    ) -> None:
-        entry = pending_fp8_wk.get(module_name)
-        if not entry or "weight" not in entry or "scale" not in entry:
-            return
-        weight_block_size = getattr(self.quant_config, "weight_block_size", None)
-        if weight_block_size is None:
-            return
-
-        weight_fp8 = entry["weight"]
-        scale = entry["scale"]
-        weight_bf16 = block_dequant(
-            weight_fp8,
-            scale,
-            list(weight_block_size),
-        ).to(torch.bfloat16)
-        if self._load_fused_indexer_projection_shard(
-            module_name=module_name,
-            shard_id=0,
-            loaded_weight=weight_bf16,
-            params_dict=params_dict,
-            modules_dict=modules_dict,
-            loaded_shards=loaded_shards,
-        ):
-            del pending_fp8_wk[module_name]
-
-    def _try_load_fused_indexer_projection(
-        self,
-        *,
-        name: str,
-        loaded_weight: torch.Tensor,
-        params_dict: dict[str, torch.Tensor],
-        modules_dict: dict[str, nn.Module],
-        pending_fp8_wk: dict[str, dict[str, torch.Tensor]],
-        loaded_shards: dict[str, set[int]],
-    ) -> None:
-        if ".indexer.wk_weights_proj." in name:
-            return
-
-        if ".indexer.weights_proj.weight" in name:
-            module_name = name.rsplit(".weights_proj.weight", 1)[0]
-            self._load_fused_indexer_projection_shard(
-                module_name=module_name,
-                shard_id=1,
-                loaded_weight=loaded_weight,
-                params_dict=params_dict,
-                modules_dict=modules_dict,
-                loaded_shards=loaded_shards,
-            )
-            return
-
-        if ".indexer.wk." not in name:
-            return
-
-        module_name = name.rsplit(".wk.", 1)[0]
-        if name.endswith(".weight") and loaded_weight.dtype in (
-            torch.float8_e4m3fn,
-            torch.float8_e4m3fnuz,
-        ):
-            pending_fp8_wk.setdefault(module_name, {})["weight"] = loaded_weight
-            self._flush_fused_indexer_fp8_wk(
-                module_name=module_name,
-                pending_fp8_wk=pending_fp8_wk,
-                params_dict=params_dict,
-                modules_dict=modules_dict,
-                loaded_shards=loaded_shards,
-            )
-            return
-
-        if name.endswith(".weight"):
-            self._load_fused_indexer_projection_shard(
-                module_name=module_name,
-                shard_id=0,
-                loaded_weight=loaded_weight,
-                params_dict=params_dict,
-                modules_dict=modules_dict,
-                loaded_shards=loaded_shards,
-            )
-            return
-
-        if "weight_scale_inv" in name:
-            pending_fp8_wk.setdefault(module_name, {})["scale"] = loaded_weight
-            self._flush_fused_indexer_fp8_wk(
-                module_name=module_name,
-                pending_fp8_wk=pending_fp8_wk,
-                params_dict=params_dict,
-                modules_dict=modules_dict,
-                loaded_shards=loaded_shards,
-            )
-
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params_dict = dict(self.named_parameters())
         modules_dict = dict(self.named_modules())
@@ -1558,13 +1929,16 @@ class GlmMoeDsaForCausalLM(DeepseekV3ForCausalLM):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
                 loaded.add(param_names[id(param)])
-                self._try_load_fused_indexer_projection(
-                    name=name,
-                    loaded_weight=loaded_weight,
+                load_fused_indexer_projection(
+                    name,
+                    loaded_weight,
                     params_dict=params_dict,
                     modules_dict=modules_dict,
                     pending_fp8_wk=pending_fp8_wk,
                     loaded_shards=loaded_fused_indexer_shards,
+                    weight_block_size=getattr(
+                        self.quant_config, "weight_block_size", None
+                    ),
                 )
 
         loaded |= super().load_weights(base_weights())

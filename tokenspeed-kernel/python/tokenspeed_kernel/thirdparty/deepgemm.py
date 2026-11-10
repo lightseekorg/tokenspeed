@@ -49,3 +49,71 @@ def block_fp8_mm(
         disable_ue8m0_cast=True,
     )
     return out
+
+
+def grouped_fp8_weight_scales(scales: torch.Tensor, groups: int) -> torch.Tensor:
+    """Pack 1x32 UE8M0 weight scales ``[groups * n, k / 32]`` for ``grouped_fp8_mm``."""
+    import deep_gemm
+
+    rows, blocks = scales.shape
+    exponents = scales.to(torch.int32) << 23
+    return deep_gemm.transform_sf_into_required_layout(
+        exponents.view(torch.float32).view(groups, rows // groups, blocks),
+        rows // groups,
+        blocks * 32,
+        (1, 1, 32),
+        num_groups=groups,
+        is_sfa=False,
+    )
+
+
+def grouped_fp8_mm(
+    x: torch.Tensor,
+    x_scales: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scales: torch.Tensor,
+    out: torch.Tensor,
+    out_scales: torch.Tensor | None,
+) -> torch.Tensor:
+    """``einsum('tgk,gnk->tgn')`` of E4M3 operands with 1x32 UE8M0 scales.
+
+    With ``out_scales``, ``out`` receives E4M3 codes of the BF16-rounded result
+    and ``out_scales`` their packed 1x32 UE8M0 scales over ``out.flatten(1)``.
+    """
+    import deep_gemm
+
+    deep_gemm.fp8_einsum(
+        "bhr,hdr->bhd",
+        (x, x_scales),
+        (weight, weight_scales),
+        out if out_scales is None else (out, out_scales),
+        recipe=(1, 1, 32),
+    )
+    return out
+
+
+def fp8_weight_scales(scales: torch.Tensor) -> torch.Tensor:
+    """Pack 1x32 UE8M0 weight scales ``[n, k / 32]`` for ``fp8_mm``."""
+    import deep_gemm
+
+    rows, blocks = scales.shape
+    exponents = scales.to(torch.int32) << 23
+    return deep_gemm.transform_sf_into_required_layout(
+        exponents.view(torch.float32), rows, blocks * 32, (1, 1, 32), is_sfa=False
+    )
+
+
+def fp8_mm(
+    x: torch.Tensor,
+    x_scales: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scales: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """``x @ weight.T`` of E4M3 operands with 1x32 UE8M0 scales into BF16 ``out``."""
+    import deep_gemm
+
+    deep_gemm.fp8_gemm_nt(
+        (x, x_scales), (weight, weight_scales), out, recipe=(1, 1, 32)
+    )
+    return out

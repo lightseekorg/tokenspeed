@@ -18,13 +18,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Paged latent-KV and KDA-state cache."""
+"""Paged latent-KV and KDA-state cache, with Kimi-K3.1's DSA index-K planes."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from functools import cached_property
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 import numpy as np
 import torch
@@ -32,10 +32,14 @@ import torch
 from tokenspeed.runtime.layers.attention.kv_cache.base import (
     derive_state_groups_by_layer,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.dsa import DSATokenToKVPool
 from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     STATE_LAYER_TYPES,
 )
+
+if TYPE_CHECKING:
+    from tokenspeed.runtime.layers.layernorm import LayerNorm
 
 
 class HybridKDATokenToKVPool(MLATokenToKVPool):
@@ -126,3 +130,57 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
 
     def get_kv_size_bytes(self):
         return self.arena.buffer.nbytes
+
+
+class HybridKDADSATokenToKVPool(HybridKDATokenToKVPool, DSATokenToKVPool):
+    """Kimi-K3.1: the K3 latent-KV/KDA-state view plus one index-K plane per
+    DSA layer.
+
+    The index-K rows are companion fields of the MLA layer's full-attention
+    pages (``KimiK3Recipe``), so they are allocated, prefix-matched,
+    transferred and freed with the latent rows. The write, the packed-row
+    gather and the top-k scorers address the plane in DSA kernel pages
+    (``index_k_page_size``), which subdivide K3's 128-token cache blocks the
+    same way the router subdivides the latent pages. KDA layers and draft
+    MLA layers have no index-K plane.
+    """
+
+    layer_plane_bindings: ClassVar[dict[str, str]] = {
+        **HybridKDATokenToKVPool.layer_plane_bindings,
+        **DSATokenToKVPool.layer_plane_bindings,
+    }
+
+    def __init__(self, *, index_k_page_size: int, **kwargs):
+        self._index_k_page_size = int(index_k_page_size)
+        super().__init__(**kwargs)
+        page = self._index_k_page_size
+        if page <= 0 or self.arena.kv_page_size % page:
+            raise ValueError(
+                f"index-K page size {page} must divide the {self.arena.kv_page_size}"
+                "-token cache page"
+            )
+
+    @property
+    def index_k_page_size(self) -> int:
+        return self._index_k_page_size
+
+    def get_index_k_buffer(self, layer_id: int) -> torch.Tensor:
+        buffer = super().get_index_k_buffer(layer_id)
+        if buffer is None:
+            raise ValueError(f"layer {layer_id} has no DSA index-K plane")
+        return buffer
+
+    def set_index_k_buffer(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        index_k: torch.Tensor,
+        *,
+        write_mask: torch.Tensor | None,
+        key_norm: LayerNorm | None = None,
+    ) -> None:
+        if self.index_k_buffer[layer_id] is None:
+            raise ValueError(f"layer {layer_id} has no DSA index-K plane")
+        super().set_index_k_buffer(
+            layer_id, loc, index_k, write_mask=write_mask, key_norm=key_norm
+        )

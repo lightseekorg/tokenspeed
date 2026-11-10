@@ -191,10 +191,20 @@ void Scheduler::prepareStorage(Request& request) {
     auto query = coordinator_.MissingStorageKeys(prompt(), limits.max_keys_per_operation);
     setBound(query.max_tokens);
     auto keys = std::move(query.keys);
+    auto key_tokens = std::move(query.key_tokens);
     if (bound - local < limits.min_prefetch_tokens || keys.empty()) return;
+    _assert(key_tokens.size() == keys.size(), "Each storage query key needs a token span");
     // A known failed immutable object remains unavailable for this attempt.
-    std::erase_if(keys, [this](const auto& key) { return storage_transfers_->IsNegative(key); });
-    StorageLease query_lease = storage_transfers_->StartQuery(std::move(keys));
+    std::size_t kept = 0;
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        if (storage_transfers_->IsNegative(keys[i])) continue;
+        keys[kept] = keys[i];
+        key_tokens[kept] = key_tokens[i];
+        ++kept;
+    }
+    keys.resize(kept);
+    key_tokens.resize(kept);
+    StorageLease query_lease = storage_transfers_->StartQuery(std::move(keys), std::move(key_tokens));
     if (!query_lease) return;
     const auto deadline =
         storage_now_us_ + std::min(limits.wait_timeout_us, std::numeric_limits<std::int64_t>::max() - storage_now_us_);

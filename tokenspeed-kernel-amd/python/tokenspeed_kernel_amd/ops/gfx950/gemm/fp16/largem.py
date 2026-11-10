@@ -30,6 +30,7 @@ large-M dense16 projection shapes.
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel_amd._extern import extern_compile_options, wait_vmem
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 
 cdna4 = gl.amd.cdna4
@@ -500,6 +501,246 @@ def gluon_mm_a16w16_prefill_gfx950(
         WARPS_N=WARPS_N,
     )
 
+    _largem_store_tile(
+        c_ptr,
+        acc_tl,
+        acc_bl,
+        acc_tr,
+        acc_br,
+        row_base,
+        col_base,
+        M,
+        N,
+        stride_cm,
+        stride_cn,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        WARPS_M=WARPS_M,
+        WARPS_N=WARPS_N,
+        CACHE="",
+    )
+
+
+# M, GRID_MN and the skipped range follow the token count, so they stay runtime args.
+@gluon.jit(
+    launch_metadata=_dense16_mm_launch_metadata,
+    do_not_specialize=("M", "GRID_MN", "SKIP_TILE", "SKIP_TILES"),
+)
+def gluon_mm_a16w16_prefill_skip_rows_gfx950(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    SKIP_TILE,
+    SKIP_TILES,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    WARPS_M: gl.constexpr,
+    WARPS_N: gl.constexpr,
+    GRID_MN,
+    NUM_XCDS: gl.constexpr,
+    GROUP_SIZE_M: gl.constexpr,
+):
+    """``gluon_mm_a16w16_prefill_gfx950`` on every row tile but a skipped range.
+
+    Every computed tile does the work, in the order, of the full GEMM's tile, so
+    its output bits match.
+    """
+    pid_m, pid_n = largem_get_pids(
+        M - SKIP_TILES * BLOCK_M,
+        N,
+        BLOCK_M,
+        BLOCK_N,
+        GRID_MN,
+        NUM_XCDS,
+        GROUP_SIZE_M,
+    )
+    if pid_m >= SKIP_TILE:
+        pid_m += SKIP_TILES
+    row_base = pid_m * BLOCK_M
+    col_base = pid_n * BLOCK_N
+    acc_tl, acc_bl, acc_tr, acc_br = largem_mfma_lds_tile(
+        a_ptr,
+        b_ptr,
+        row_base,
+        col_base,
+        M - 1 - row_base,
+        N - 1 - col_base,
+        BLOCK_N // 2,
+        stride_am,
+        stride_ak,
+        stride_bk,
+        stride_bn,
+        K,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        WARPS_M=WARPS_M,
+        WARPS_N=WARPS_N,
+    )
+    _largem_store_tile(
+        c_ptr,
+        acc_tl,
+        acc_bl,
+        acc_tr,
+        acc_br,
+        row_base,
+        col_base,
+        M,
+        N,
+        stride_cm,
+        stride_cn,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        WARPS_M=WARPS_M,
+        WARPS_N=WARPS_N,
+        CACHE="",
+    )
+
+
+# M and the owners' tile count follow the token count and stay runtime arguments.
+@gluon.jit(
+    launch_metadata=_dense16_mm_launch_metadata,
+    do_not_specialize=("M", "TILES_PER_OWNER"),
+)
+def gluon_mm_a16w16_prefill_publish_rows_gfx950(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    counters,
+    heap_base_0,
+    heap_base_1,
+    heap_base_2,
+    heap_base_3,
+    heap_base_4,
+    heap_base_5,
+    heap_base_6,
+    heap_base_7,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    TILES_PER_OWNER,
+    RANK: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    WARPS_M: gl.constexpr,
+    WARPS_N: gl.constexpr,
+):
+    """``gluon_mm_a16w16_prefill_gfx950`` publishing each row tile to its owner.
+
+    The rows form 8 consecutive owner ranges of ``TILES_PER_OWNER`` row tiles.
+    Workgroups take tile ``c`` of every owner before tile ``c + 1``, a row's
+    column tiles consecutively, so each round finishes whole row tiles. After
+    its write-through stores complete, a workgroup adds 1 to ``counters[c]`` on
+    the owner's symmetric heap (``heap_base_q``; ``counters`` is this rank's
+    copy). Every tile does the full GEMM's work for it, so the bits match.
+    """
+    pid = gl.program_id(0)
+    num_pid_n = gl.cdiv(N, BLOCK_N)
+    order_m = pid // num_pid_n
+    pid_n = pid % num_pid_n
+    owner = order_m % 8
+    owner_tile = order_m // 8
+    pid_m = owner * TILES_PER_OWNER + owner_tile
+    row_base = pid_m * BLOCK_M
+    col_base = pid_n * BLOCK_N
+    acc_tl, acc_bl, acc_tr, acc_br = largem_mfma_lds_tile(
+        a_ptr,
+        b_ptr,
+        row_base,
+        col_base,
+        M - 1 - row_base,
+        N - 1 - col_base,
+        BLOCK_N // 2,
+        stride_am,
+        stride_ak,
+        stride_bk,
+        stride_bn,
+        K,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        WARPS_M=WARPS_M,
+        WARPS_N=WARPS_N,
+    )
+    _largem_store_tile(
+        c_ptr,
+        acc_tl,
+        acc_bl,
+        acc_tr,
+        acc_br,
+        row_base,
+        col_base,
+        M,
+        N,
+        stride_cm,
+        stride_cn,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        WARPS_M=WARPS_M,
+        WARPS_N=WARPS_N,
+        CACHE=".wt",
+    )
+    heaps = (
+        heap_base_0,
+        heap_base_1,
+        heap_base_2,
+        heap_base_3,
+        heap_base_4,
+        heap_base_5,
+        heap_base_6,
+        heap_base_7,
+    )
+    offset = counters.to(gl.uint64) - heaps[RANK]
+    # Every subgroup's write-through stores land before the tile is published.
+    wait_vmem()
+    gl.barrier()
+    for peer in gl.static_range(8):
+        if owner == peer:
+            gl.atomic_add(
+                (heaps[peer] + offset).to(gl.pointer_type(gl.int32)) + owner_tile,
+                1,
+                sem="relaxed",
+                scope="sys",
+            )
+
+
+@gluon.jit
+def _largem_store_tile(
+    c_ptr,
+    acc_tl,
+    acc_bl,
+    acc_tr,
+    acc_br,
+    row_base,
+    col_base,
+    M,
+    N,
+    stride_cm,
+    stride_cn,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    WARPS_M: gl.constexpr,
+    WARPS_N: gl.constexpr,
+    CACHE: gl.constexpr,
+):
+    """Store the four quadrant accumulators of one tile, masking partial tiles."""
     # Spread all warps along M so a 128x128 quadrant is covered exactly once;
     # a [WARPS_M, WARPS_N] split would replicate it across the N warps and
     # store every element several times.
@@ -525,6 +766,7 @@ def gluon_mm_a16w16_prefill_gfx950(
         offsets=c_quad_offsets,
         stored_value=c_tl,
         mask=top_rows & left_cols,
+        cache=CACHE,
     )
     c_bl = gl.convert_layout(acc_bl.to(c_ptr.dtype.element_ty), layout=gStoreLayoutC)
     cdna4.buffer_store(
@@ -532,6 +774,7 @@ def gluon_mm_a16w16_prefill_gfx950(
         offsets=c_quad_offsets,
         stored_value=c_bl,
         mask=bot_rows & left_cols,
+        cache=CACHE,
     )
     c_tr = gl.convert_layout(acc_tr.to(c_ptr.dtype.element_ty), layout=gStoreLayoutC)
     cdna4.buffer_store(
@@ -539,6 +782,7 @@ def gluon_mm_a16w16_prefill_gfx950(
         offsets=c_quad_offsets,
         stored_value=c_tr,
         mask=top_rows & right_cols,
+        cache=CACHE,
     )
     c_br = gl.convert_layout(acc_br.to(c_ptr.dtype.element_ty), layout=gStoreLayoutC)
     cdna4.buffer_store(
@@ -546,6 +790,7 @@ def gluon_mm_a16w16_prefill_gfx950(
         offsets=c_quad_offsets,
         stored_value=c_br,
         mask=bot_rows & right_cols,
+        cache=CACHE,
     )
 
 
@@ -608,6 +853,145 @@ def _resolve_largem_output(
             "large-M dense16 output must be contiguous in the last dimension"
         )
     return out
+
+
+def launch_gluon_mm_a16w16_prefill_skip_rows_gfx950(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    skip_start: int,
+    skip_rows: int,
+) -> torch.Tensor | None:
+    """Compute ``out = A @ B.T`` except rows ``[skip_start, skip_start + skip_rows)``.
+
+    Both bounds are multiples of ``LARGEM_BLOCK_M``; the computed rows carry the
+    full large-M GEMM's bits. Returns None (launching nothing) for unsupported
+    operands.
+    """
+    if (
+        A.ndim != 2
+        or B.ndim != 2
+        or A.dtype not in _SUPPORTED_DTYPES
+        or B.dtype != A.dtype
+        or not A.is_cuda
+        or not B.is_cuda
+    ):
+        return None
+    M, K = A.shape
+    N, K_b = B.shape
+    if (
+        K_b != K
+        or not _supports_largem_shape(M, N, K)
+        or skip_start % LARGEM_BLOCK_M
+        or skip_rows % LARGEM_BLOCK_M
+        or skip_rows <= 0
+        or skip_start < 0
+        or skip_start + skip_rows > M
+        or skip_rows == M
+    ):
+        return None
+    C = _resolve_largem_output(A, M, N, A.dtype, out)
+    grid_mn = triton.cdiv(M - skip_rows, LARGEM_BLOCK_M) * triton.cdiv(
+        N, LARGEM_BLOCK_N
+    )
+    gluon_mm_a16w16_prefill_skip_rows_gfx950[(grid_mn,)](
+        A,
+        B,
+        C,
+        M,
+        N,
+        K,
+        A.stride(0),
+        A.stride(1),
+        B.stride(1),
+        B.stride(0),
+        C.stride(0),
+        C.stride(1),
+        skip_start // LARGEM_BLOCK_M,
+        skip_rows // LARGEM_BLOCK_M,
+        BLOCK_M=LARGEM_BLOCK_M,
+        BLOCK_N=LARGEM_BLOCK_N,
+        BLOCK_K=LARGEM_BLOCK_K,
+        WARPS_M=LARGEM_WARPS_M,
+        WARPS_N=LARGEM_WARPS_N,
+        GRID_MN=grid_mn,
+        NUM_XCDS=LARGEM_NUM_XCDS,
+        GROUP_SIZE_M=LARGEM_GROUP_SIZE_M,
+        num_warps=LARGEM_NUM_WARPS,
+        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
+    )
+    return C
+
+
+def launch_gluon_mm_a16w16_prefill_publish_rows_gfx950(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out: torch.Tensor,
+    counters: torch.Tensor,
+    heap_bases: tuple[int, ...],
+    *,
+    rank: int,
+) -> torch.Tensor | None:
+    """Compute ``out = A @ B.T`` with the large-M GEMM's bits, publishing row tiles.
+
+    Rows split into 8 owner ranges of whole ``LARGEM_BLOCK_M`` tiles; owner
+    ``q``'s tile ``c`` adds one per column tile to ``counters[c]`` on heap
+    ``heap_bases[q]``, where ``counters`` is this rank's symmetric int32 copy.
+    Returns None (launching nothing) for unsupported operands.
+    """
+    if (
+        A.ndim != 2
+        or B.ndim != 2
+        or A.dtype not in _SUPPORTED_DTYPES
+        or B.dtype != A.dtype
+        or not A.is_cuda
+        or not B.is_cuda
+        or len(heap_bases) != 8
+        or not 0 <= rank < 8
+        or counters.dtype != torch.int32
+        or counters.device != A.device
+    ):
+        return None
+    M, K = A.shape
+    N, K_b = B.shape
+    tiles_per_owner = M // (8 * LARGEM_BLOCK_M)
+    if (
+        K_b != K
+        or not _supports_largem_shape(M, N, K)
+        or M % (8 * LARGEM_BLOCK_M)
+        or counters.numel() < tiles_per_owner
+    ):
+        return None
+    C = _resolve_largem_output(A, M, N, A.dtype, out)
+    grid_mn = triton.cdiv(M, LARGEM_BLOCK_M) * triton.cdiv(N, LARGEM_BLOCK_N)
+    gluon_mm_a16w16_prefill_publish_rows_gfx950[(grid_mn,)](
+        A,
+        B,
+        C,
+        counters,
+        *heap_bases,
+        M,
+        N,
+        K,
+        A.stride(0),
+        A.stride(1),
+        B.stride(1),
+        B.stride(0),
+        C.stride(0),
+        C.stride(1),
+        tiles_per_owner,
+        RANK=rank,
+        BLOCK_M=LARGEM_BLOCK_M,
+        BLOCK_N=LARGEM_BLOCK_N,
+        BLOCK_K=LARGEM_BLOCK_K,
+        WARPS_M=LARGEM_WARPS_M,
+        WARPS_N=LARGEM_WARPS_N,
+        num_warps=LARGEM_NUM_WARPS,
+        **extern_compile_options(),
+        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
+    )
+    return C
 
 
 def launch_gluon_mm_a16w16_prefill_gfx950(

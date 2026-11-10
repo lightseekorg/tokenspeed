@@ -45,8 +45,8 @@ tile's copy into the P @ V MFMAs.
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel_amd._scheduling import (
-    sched_compile_options,
+from tokenspeed_kernel_amd._extern import (
+    extern_compile_options,
     sched_group,
     wave_uniform_i32,
 )
@@ -1183,7 +1183,7 @@ def launch_gluon_mla_extend_gfx950(
         IS_CAUSAL=is_causal,
         SPLIT=split,
         num_warps=_NUM_WARPS,
-        **sched_compile_options(),
+        **extern_compile_options(),
         # At 512 registers and one wave, iterative-minreg schedules this best;
         # the default strategy is ~10% slower on long cached prefixes.
         llvm_fn_attrs=(("amdgpu-sched-strategy", "iterative-minreg"),),

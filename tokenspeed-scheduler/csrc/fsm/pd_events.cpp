@@ -26,6 +26,8 @@
 #include "core/token_container.h"
 #include "fsm/pd_states.h"
 #include "fsm/storage_states.h"
+#include "scheduler/operations/cache.h"
+#include "utils.h"
 
 namespace tokenspeed {
 namespace fsm {
@@ -49,6 +51,14 @@ PrefillDone RemotePrefillDoneEvent::operator()(RemotePrefilling&& state) {
     PrefillDone prefill_done{std::move(state.resources), state.window, state.ReserveNumTokensInNextScheduleEvent()};
     prefill_done.ExtendResultTokens({bootstrap_token});
     return prefill_done;
+}
+
+Finished TransferStoppedEvent::operator()(PdTransferring&& state) {
+    _assert(coordinator_ != nullptr, "TransferStoppedEvent requires a cache coordinator");
+    // A local forward still out against the pages is ordered ahead of any
+    // reuse on the device stream, as at an abort; only the transfer was not.
+    FreeRequest(*coordinator_, state.resources.block_tables);
+    return Finished{};
 }
 
 }  // namespace fsm

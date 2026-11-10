@@ -25,33 +25,6 @@ from tokenspeed.runtime.distributed.process_group_manager import (
 )
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.utils import get_available_gpu_memory
-from tokenspeed.runtime.utils.triton import tl, triton
-
-
-@triton.jit
-def create_flashinfer_kv_indices_triton(
-    page_table_ptr,  # [bs, max_context_len] per-token slot table, row i == batch position i
-    page_kernel_lens_ptr,
-    kv_indptr,
-    kv_indices_ptr,
-    page_table_stride: tl.constexpr,
-):
-    BLOCK_SIZE: tl.constexpr = 512
-    pid = tl.program_id(axis=0)
-
-    kv_indices_offset = tl.load(kv_indptr + pid)
-    kv_len = tl.load(page_kernel_lens_ptr + pid).to(tl.int32)
-
-    num_loop = tl.cdiv(kv_len, BLOCK_SIZE)
-    for i in range(num_loop):
-        offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
-        mask = offset < kv_len
-        data = tl.load(
-            page_table_ptr + pid * page_table_stride + offset,
-            mask=mask,
-        )
-        tl.store(kv_indices_ptr + kv_indices_offset + offset, data, mask=mask)
-
 
 # --- Page-based memory profiling ---
 

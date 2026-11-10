@@ -64,6 +64,8 @@ pub struct OutputChunk {
     pub completion_tokens: i64,
     /// Prompt tokens served from the prefix cache.
     pub cached_tokens: i64,
+    /// Reasoning tokens generated so far, excluding structural markers.
+    pub reasoning_tokens: i64,
     /// Logprobs of this step's tokens; empty when not requested.
     pub output_token_logprobs: Vec<f64>,
     /// Selected tokens' cumulative probability diagnostics, parallel to
@@ -98,6 +100,7 @@ impl From<&RequestOutput<'_>> for OutputChunk {
             prompt_tokens: row.prompt_tokens,
             completion_tokens: row.completion_tokens,
             cached_tokens: row.cached_tokens,
+            reasoning_tokens: row.reasoning_tokens,
             output_token_logprobs: row.output_token_logprobs.to_vec(),
             output_token_cumulative_probs: row.output_token_cumulative_probs.to_vec(),
             finish_details: row.finish_details.cloned(),

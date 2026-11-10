@@ -32,19 +32,19 @@ import inspect
 from pathlib import Path
 from typing import Literal
 
-_VERSION = "0.7.2.post1"
+_VERSION = "0.7.3"
 # SHA256 of the official PyPI wheel sources. Update with ABI review and GPU
 # validation; a version string alone does not identify locally patched code.
 _SOURCES = {
     "prefill": {
-        "gdn_prefill": "9a3e122b2dc24c1f834f7d9b7df6e54aa7c23b6bdb1cfdf29987684c7e6ae17d",
+        "gdn_prefill": "56eea898c26ead1bb5e2b00ea0f75eb09448c88bf092dbd2414f17bdebd11c42",
         "api_logging": "8bda6aba04be7eb5891a7fd07c88346d2282ecf2d2bf2f68787033f0e231b884",
-        "gdn_kernels.blackwell.gdn_prefill": "3a3e4158ec04c8fc144998975f72c7a5828c0cffa8c44e911af8e69f44259266",
-        "gdn_kernels.blackwell.gated_delta_net_chunked": "7970d5e755b38acd558d2041f9f1d3764f42976532d7209110bb8984fdb81e28",
+        "gdn_kernels.blackwell.gdn_prefill": "0068d71f55cc5028f91fe1537e9d7b42143f4ab1cb089ded2d1307ee73438ae6",
+        "gdn_kernels.blackwell.gated_delta_net_chunked": "906173728b8134af20808e64cefe4a200839831d21d03dc8ab04565d5af96016",
         "gdn_kernels.blackwell.gated_delta_net_chunked_sm107": "bb62ffeb6d1f428ee5df03dabc0da609d74d0597e5ed214081b0e015d5955e1e",
     },
     "decode": {
-        "gdn_kernels.gdn_decode_bf16_state_rubin": "e1ae8dec1cb5636b40d3c6bd075f16538a6cff816932a9f2f19c6711a0780b49",
+        "gdn_kernels.gdn_decode_bf16_state_rubin": "4c9a841b1ed82afca447b649f9b3120de57c70ebd50479e54aeb87d56e0b481c",
     },
 }
 

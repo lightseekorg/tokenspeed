@@ -159,7 +159,12 @@ def test_cache_batch_metadata_accepts_npu_tables():
         group_packing={"full_attention": 1},
     )
     forward_op = SimpleNamespace(
-        block_tables_arrays=lambda: {"full_attention": np.array([[1]], dtype=np.int32)}
+        block_table_windows=lambda: {
+            "full_attention": (np.array([[1]], dtype=np.int32), 1)
+        },
+        block_table_spans=lambda: {
+            "full_attention": np.array([[0, 1]], dtype=np.int32)
+        },
     )
 
     metadata = CacheBatchMetadata.from_forward_op(
@@ -168,6 +173,7 @@ def test_cache_batch_metadata_accepts_npu_tables():
         contract=contract,
         num_requests=1,
         validate_page_ids=True,
+        host_tables=False,
     )
     table = metadata.tables(active_forward_op=forward_op)["full_attention"]
 

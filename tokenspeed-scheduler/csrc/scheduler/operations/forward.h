@@ -24,6 +24,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <variant>
@@ -92,6 +94,72 @@ struct DecodeOperation : public ForwardOperationBase {
 
 using ForwardOperation = std::variant<PrefillOperation, DecodeOperation>;
 
+// Immutable row windows owned by the batch. The full absolute table is only
+// materialized for a consumer that needs it, and its buffer never moves after
+// publication. Copies share the snapshot and its thread-safe materialization.
+class ForwardBlockTableRows {
+public:
+    ForwardBlockTableRows(std::size_t columns, std::vector<std::int32_t> spans, std::vector<std::int32_t> windows)
+        : data_(std::make_shared<Data>(columns, std::move(spans), std::move(windows))) {
+        _assert(data_->spans.size() % 2 == 0, "block-table spans must contain pairs");
+        _assert(Rows() == 0 ? data_->windows.empty() : data_->windows.size() % Rows() == 0,
+                "block-table windows must contain complete rows");
+        _assert(WindowColumns() <= Columns(), "block-table window exceeds its table");
+        for (std::size_t row = 0; row < Rows(); ++row) {
+            const auto released = data_->spans[2 * row];
+            const auto pages = data_->spans[2 * row + 1];
+            _assert(0 <= released && released <= pages && static_cast<std::size_t>(pages) <= Columns(),
+                    "block-table span exceeds its table");
+            _assert(static_cast<std::size_t>(pages - released) <= WindowColumns(),
+                    "block-table window must cover every live entry");
+        }
+    }
+
+    std::size_t Rows() const { return data_->spans.size() / 2; }
+    std::size_t Columns() const { return data_->columns; }
+    std::size_t WindowColumns() const { return Rows() == 0 ? 0 : data_->windows.size() / Rows(); }
+    const std::vector<std::int32_t>& Spans() const { return data_->spans; }
+    const std::vector<std::int32_t>& WindowRows() const { return data_->windows; }
+
+    const std::vector<std::int32_t>& AbsoluteRows() const {
+        if (WindowColumns() == Columns()) return data_->windows;
+        std::call_once(data_->materialize, [&] {
+            // call_once may retry after an allocation failure.
+            data_->absolute.clear();
+            data_->absolute.reserve(Rows() * Columns());
+            for (std::size_t row = 0; row < Rows(); ++row) {
+                const auto pages = static_cast<std::size_t>(data_->spans[2 * row + 1]);
+                const auto first = pages > WindowColumns() ? pages - WindowColumns() : 0;
+                data_->absolute.insert(data_->absolute.end(), first, 0);
+                if (WindowColumns() != 0) {
+                    const auto begin = data_->windows.begin() + row * WindowColumns();
+                    data_->absolute.insert(data_->absolute.end(), begin, begin + WindowColumns());
+                }
+                data_->absolute.insert(data_->absolute.end(), Columns() - first - WindowColumns(), -1);
+            }
+        });
+        return data_->absolute;
+    }
+
+    bool operator==(const ForwardBlockTableRows& other) const {
+        return data_ == other.data_ ||
+               (Columns() == other.Columns() && Spans() == other.Spans() && WindowRows() == other.WindowRows());
+    }
+
+private:
+    struct Data {
+        Data(std::size_t columns, std::vector<std::int32_t> spans, std::vector<std::int32_t> windows)
+            : columns(columns), spans(std::move(spans)), windows(std::move(windows)) {}
+
+        std::size_t columns;
+        std::vector<std::int32_t> spans;
+        std::vector<std::int32_t> windows;
+        mutable std::once_flag materialize;
+        mutable std::vector<std::int32_t> absolute;
+    };
+    std::shared_ptr<const Data> data_;
+};
+
 struct ForwardBatch {
     std::vector<std::string> request_ids;
     std::vector<std::int32_t> request_pool_indices;
@@ -113,11 +181,9 @@ struct ForwardBatch {
     // candidates hold an empty vector.
     std::vector<std::vector<std::int32_t>> spec_candidate_ids;
 
-    // Per-group block tables: dict[group_id] =
-    // [num_reqs, max_pages_in_batch] padded with -1. Each row is absolute
-    // (null hole = 0, no compaction); there is no base-offset companion.
-    // One owned row-major buffer per group, exposed zero-copy to Python.
-    std::map<std::string, std::vector<std::int32_t>> block_tables_contig;
+    // Logical indexing stays absolute: released prefixes are zero and row
+    // padding is -1. The owned transport windows omit the long zero prefixes.
+    std::map<std::string, ForwardBlockTableRows> block_tables;
     explicit ForwardBatch(std::vector<ForwardOperation> ops) {
         std::stable_partition(ops.begin(), ops.end(),
                               [](const ForwardOperation& a) { return std::holds_alternative<PrefillOperation>(a); });
@@ -143,13 +209,16 @@ struct ForwardBatch {
                 spec_candidate_ids.push_back(std::move(decode->spec_candidate_ids));
             }
         }
-        std::map<std::string, std::size_t> columns_by_group;
+        std::map<std::string, std::pair<std::size_t, std::size_t>> columns_by_group;
         for (auto& op : ops) {
             std::visit(
                 [&](auto& inner) {
                     for (const auto& [gid, source] : inner.block_tables) {
-                        auto& columns = columns_by_group[gid];
-                        columns = std::max(columns, source.NumPages());
+                        auto& [columns, window_columns] = columns_by_group[gid];
+                        const auto pages = source.NumPages();
+                        columns = std::max(columns, pages);
+                        window_columns = std::max(
+                            window_columns, pages - static_cast<std::size_t>(source.table.ReclaimedPrefixBlocks()));
                     }
                 },
                 op);
@@ -157,34 +226,44 @@ struct ForwardBatch {
         for (const auto& group_columns : columns_by_group) {
             // Named rather than structured bindings: the lambda below captures them.
             const std::string& gid = group_columns.first;
-            const std::size_t columns = group_columns.second;
-            auto& contiguous = block_tables_contig[gid];
-            contiguous.reserve(request_ids.size() * columns);
+            const auto [columns, window_columns] = group_columns.second;
+            std::vector<std::int32_t> windows;
+            windows.reserve(request_ids.size() * window_columns);
+            std::vector<std::int32_t> spans;
+            spans.reserve(2 * request_ids.size());
             for (const auto& op : ops) {
                 std::visit(
                     [&](const auto& inner) {
+                        std::int32_t released = 0;
                         std::size_t pages = 0;
+                        std::size_t first = 0;
                         if (const auto it = inner.block_tables.find(gid); it != inner.block_tables.end()) {
                             const auto& source = it->second;
-                            source.allocator.AppendBlockTablePageIds(source.table, contiguous);
-                            if (source.checkpoint_page_id != 0) {
-                                contiguous.push_back(source.checkpoint_page_id);
-                            }
+                            released = source.table.ReclaimedPrefixBlocks();
                             pages = source.NumPages();
+                            first = pages > window_columns ? pages - window_columns : 0;
+                            source.allocator.AppendBlockTablePageIds(source.table, windows, first);
+                            if (source.checkpoint_page_id != 0) {
+                                windows.push_back(source.checkpoint_page_id);
+                            }
                         }
-                        contiguous.insert(contiguous.end(), columns - pages, -1);
+                        windows.insert(windows.end(), window_columns - (pages - first), -1);
+                        spans.push_back(released);
+                        spans.push_back(static_cast<std::int32_t>(pages));
                     },
                     op);
             }
+            block_tables.emplace(gid, ForwardBlockTableRows(columns, std::move(spans), std::move(windows)));
         }
     }
 
     // The legacy nested representation is materialized only when requested.
     std::map<std::string, std::vector<std::vector<std::int32_t>>> BlockTables() const {
         std::map<std::string, std::vector<std::vector<std::int32_t>>> out;
-        for (const auto& [gid, contiguous] : block_tables_contig) {
+        for (const auto& [gid, table] : block_tables) {
+            const auto& contiguous = table.AbsoluteRows();
             auto& rows = out[gid];
-            const std::size_t columns = request_ids.empty() ? 0 : contiguous.size() / request_ids.size();
+            const std::size_t columns = table.Columns();
             rows.reserve(request_ids.size());
             for (std::size_t row = 0; row < request_ids.size(); ++row) {
                 const auto begin = contiguous.begin() + row * columns;

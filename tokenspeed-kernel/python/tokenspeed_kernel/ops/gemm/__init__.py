@@ -30,6 +30,10 @@ from types import MappingProxyType
 
 import torch
 from tokenspeed_kernel.compile_monitor import is_serving
+from tokenspeed_kernel.ops.gemm._cute_dsl.nvfp4_gemm_swiglu_layout import (
+    interleave_linear_and_gate,
+    swizzle_blockscale_2d,
+)
 from tokenspeed_kernel.ops.gemm._flashinfer.fp8_quant import (
     flashinfer_fp8_blockscale_quantize_prepacked,
 )
@@ -85,19 +89,34 @@ __all__ = [
     # NVFP4 x BF16 weight preparation
     "has_flashinfer_cute_dsl_nvfp4_a16",
     "prepare_nvfp4_a16_weights",
+    # NVFP4 GEMM+SwiGLU weight layout
+    "interleave_linear_and_gate",
+    "swizzle_blockscale_2d",
     # DeepSeek V4.1 projections
     "dsv4_linear_fp32",
     "grouped_bf16_projection",
     "grouped_bf16_projection_quantize_fp8",
+    "fp8_projection",
+    "grouped_fp8_projection",
+    "grouped_fp8_projection_quantize_fp8",
+    "has_grouped_fp8_projection",
+    "prepare_fp8_projection",
+    "prepare_grouped_fp8_projection",
+    "warmup_fp8_projection",
+    "warmup_fp8_projections",
     # MV: small-M dense projection
     "mv",
+    "MV_FP8_WEIGHT_MAX_M",
+    "mv_fp8_weight",
     "mv_weightless_rmsnorm_gated_sigmoid",
     "mv_weightless_rmsnorm_gated_sigmoid_supported",
     # Linear AttnRes partials
     "fp32_router_gemv",
     "fp32_router_gemv_counters",
     "fp32_router_gemv_execute",
+    "fp32_router_gemv_execute_with_mm",
     "fp32_router_gemv_plan",
+    "fp32_router_gemv_with_mm_supported",
     "fp32_router_gemv_process_weight",
     "has_flashinfer_cute_dsl_nvfp4_a16",
     "linear_attnres_partials",
@@ -432,11 +451,17 @@ def _mm_mxfp8_prepacked(
             "unit inner stride"
         )
     if quantized and (
-        A_scales.dtype != torch.uint8 or tuple(A_scales.shape) != (A.shape[0], k // 32)
+        A_scales.dtype != torch.uint8
+        or tuple(A_scales.shape)
+        not in (
+            (A.shape[0], k // 32),
+            (_mxfp8_swizzled_scale_count(A.shape[0], k),),
+        )
+        or (A_scales.ndim == 1 and A_scales.stride(0) != 1)
     ):
         raise ValueError(
-            "mm(prepacked_scales=True) requires canonical [M, K/32] UE8M0 "
-            "activation scales with E4M3 codes"
+            "mm(prepacked_scales=True) requires canonical [M, K/32] or dense "
+            "F8_128x4 UE8M0 activation scales with E4M3 codes"
         )
     if (
         B_scales is None
@@ -454,8 +479,7 @@ def _mm_mxfp8_prepacked(
     if A.shape[0] == 0:
         return out if out is not None else A.new_empty((0, n), dtype=out_dtype)
     if quantized:
-        # Pre-quantized codes keep their canonical scales; the native kernel
-        # swizzles these per call, which is small next to the weight scales.
+        # Canonical scales are swizzled per call; F8_128x4 ones pass through.
         values, activation_scales = A, A_scales
     else:
         # Same codes and scales as the reference 1x32 quantizer, written
@@ -565,7 +589,9 @@ def mm(
             ``[128, 128]`` they come from
             ``prepare_flashinfer_fp8_blockscale_weight_scales``; with
             ``[1, 32]`` from ``prepare_mxfp8_weight_scales``, and ``A`` may
-            also be E4M3 codes with canonical ``[M, K/32]`` UE8M0 ``A_scales``.
+            also be E4M3 codes with UE8M0 ``A_scales``, canonical
+            ``[M, K/32]`` or already in the 1-D F8_128x4 layout (such as
+            ``rmsnorm_quantize_fp8_group32(scale_layout="swizzled")`` writes).
     """
     if plan is not None and prepacked_scales:
         raise ValueError("A GEMM plan cannot use prepacked online quantization")
@@ -671,6 +697,7 @@ def mm(
         # the same bias-free tuning branch for FI's timing collectives, even
         # when this rank's actual GEMM retains the generic biased path.
         autotune_bf16_gemm(A, B)
+        warm_tgv_decode_gemm(A, B)
         if (
             bias is None
             and M <= BF16_GEMM_MAX_M
@@ -690,6 +717,36 @@ def mm(
                 has_out=out is not None,
             ):
                 return flashinfer_bf16_gemm(A, B, out)
+        # Decode rows on small weights take one pinned TGV tile on SM100/103
+        # under PDL (README "Decode GEMMs on small weights"). Like the joint
+        # path, only before serving: CUDA graphs captured at startup keep the
+        # tile, and eager calls while serving keep cuBLASLt. Registering the
+        # tile kernel instead (m bounds, a K-window, weight-size, and one-wave
+        # mnk_problem_filter, plus serving, bias, and 32-byte alignment traits
+        # that mm() does not pass today) was considered; it stays a shortcut
+        # like the joint path so both serving-gated FlashInfer routes sit
+        # here. So override= and solution= skip it, it cannot be benchmarked
+        # by name, and for the GEMMs it routes it precedes every registered
+        # BF16 gemm.mm kernel, plugins included.
+        tgv_tactic = (
+            flashinfer_tgv_decode_tactic(A, B, out)
+            if bias is None and not is_serving()
+            else None
+        )
+        if tgv_tactic is not None:
+            shape_params = {"M": M, "N": N, "K": K}
+            ShapeCapture.get().record(
+                "gemm", "mm", "flashinfer_tgv_decode_gemm", A.dtype, shape_params
+            )
+            with kernel_scope(
+                "gemm",
+                "mm",
+                A.dtype,
+                kernel_name="flashinfer_tgv_decode_gemm",
+                **shape_params,
+                has_out=out is not None,
+            ):
+                return flashinfer_tgv_decode_gemm(A, B, out, tgv_tactic)
         if bias is None and _use_mv(A, B):
             return mv(A, B, out)
 
@@ -1243,7 +1300,9 @@ def grouped_bf16_projection_quantize_fp8(
         ``[tokens, groups * output_dim / 32]`` of the BF16 projection, as
         ``quantize_fp8(granularity="token_group", group_size=32,
         scale_encoding="ue8m0")`` produces them. A kernel that quantizes in
-        its epilogue is used when one is registered for the geometry.
+        its epilogue is used when one is registered for the geometry; it may
+        split K differently from ``grouped_bf16_projection``, so a BF16 value
+        it quantizes can differ from that projection's by one ulp.
     """
     try:
         kernel = select_kernel(
@@ -1274,6 +1333,350 @@ def grouped_bf16_projection_quantize_fp8(
             solution=None,
         )
     return kernel(x, weight)
+
+
+def _fp8_projection_kernel(
+    mode: str, device: torch.device, output_dim: int, input_dim: int
+) -> SelectedKernel:
+    return select_kernel(
+        "gemm",
+        mode,
+        format_signature(
+            x=dense_tensor_format(_fp8_dtype),
+            weight=dense_tensor_format(_fp8_dtype),
+        ),
+        traits={
+            "aligned": output_dim % 64 == 0 and input_dim % 128 == 0,
+            "is_cuda": device.type == "cuda",
+        },
+    )
+
+
+def _prepared_fp8_scales(
+    mode: str, weight: torch.Tensor, weight_scales: torch.Tensor, groups: int | None
+) -> torch.Tensor | None:
+    if (
+        weight.ndim != 2
+        or weight.dtype != _fp8_dtype
+        or not weight.is_contiguous()
+        or (groups is not None and (groups <= 0 or weight.shape[0] % groups))
+        or weight.shape[1] % 32
+    ):
+        raise ValueError(
+            "FP8 projection weights must be contiguous E4M3 [groups * N, K], K % 32 == 0"
+        )
+    if (
+        weight_scales.dtype != torch.uint8
+        or tuple(weight_scales.shape) != (weight.shape[0], weight.shape[1] // 32)
+        or weight_scales.device != weight.device
+    ):
+        raise ValueError(
+            "FP8 projection weights require canonical UE8M0 [N, K/32] scales"
+        )
+    rows = weight.shape[0] if groups is None else weight.shape[0] // groups
+    try:
+        kernel = _fp8_projection_kernel(mode, weight.device, rows, weight.shape[1])
+    except NoKernelFoundError:
+        return None
+    preprocess = KernelRegistry.get().get_by_name(kernel.name).weight_preprocessor
+    if groups is None:
+        return preprocess(weight_scales)
+    return preprocess(weight_scales, groups)
+
+
+def _packed_fp8_scales(tokens: int, words: int, device: torch.device) -> torch.Tensor:
+    """Int32 [tokens, words] packed UE8M0 scales, MN-major with tokens padded to 4."""
+    aligned = (tokens + 3) // 4 * 4
+    storage = torch.empty(words * aligned, dtype=torch.int32, device=device)
+    return storage.as_strided((tokens, words), (1, aligned))
+
+
+def has_grouped_fp8_projection(
+    device: torch.device, output_dim: int, input_dim: int
+) -> bool:
+    """Whether a registered kernel serves ``grouped_fp8_projection`` on ``device``.
+
+    Lets a caller choose FP8 weight storage before any weight exists; given
+    such weights, ``prepare_grouped_fp8_projection`` then returns scales.
+
+    Args:
+        device: Device the weights will live on.
+        output_dim: Output channels per group (N).
+        input_dim: Input channels (K).
+
+    Returns:
+        True when a kernel serves ``[groups, output_dim, input_dim]`` E4M3
+        weights on ``device``.
+    """
+    try:
+        _fp8_projection_kernel("grouped_fp8_projection", device, output_dim, input_dim)
+    except NoKernelFoundError:
+        return False
+    return True
+
+
+def prepare_grouped_fp8_projection(
+    weight: torch.Tensor, weight_scales: torch.Tensor, groups: int
+) -> torch.Tensor | None:
+    """Prepare E4M3 grouped projection scales once for ``grouped_fp8_projection``.
+
+    The same scales serve ``grouped_fp8_projection_quantize_fp8``.
+
+    Args:
+        weight: E4M3 ``[groups * output_dim, input_dim]`` codes; group ``g``
+            owns rows ``[g * output_dim, (g + 1) * output_dim)``.
+        weight_scales: Canonical uint8 UE8M0 scales
+            ``[groups * output_dim, input_dim // 32]``; left unchanged.
+        groups: Number of groups.
+
+    Returns:
+        New scales in the serving kernel's layout, or None when no registered
+        kernel serves these weights on their device; callers then keep their
+        dequantized path.
+    """
+    return _prepared_fp8_scales("grouped_fp8_projection", weight, weight_scales, groups)
+
+
+def _check_grouped_fp8_operands(x: torch.Tensor, weight: torch.Tensor) -> None:
+    if x.ndim != 3 or weight.ndim != 3 or x.dtype != _fp8_dtype:
+        raise ValueError("grouped FP8 projection takes E4M3 [tokens, groups, K] input")
+    if weight.dtype != _fp8_dtype or x.shape[1:] != (weight.shape[0], weight.shape[2]):
+        raise ValueError("grouped FP8 projection operands must share groups and K")
+
+
+def grouped_fp8_projection(
+    x: torch.Tensor,
+    x_scales: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scales: torch.Tensor,
+    out: torch.Tensor | None,
+) -> torch.Tensor:
+    """Compute ``einsum('tgk,gnk->tgn')`` of E4M3 operands with 1x32 UE8M0 scales.
+
+    Args:
+        x: E4M3 ``[tokens, groups, input_dim]`` codes with unit inner stride,
+            as ``rope_quantize_fp8_grouped`` returns them.
+        x_scales: Int32 ``[tokens, groups, input_dim // 128]`` packed UE8M0
+            scales in DeepGEMM's SM100 MN-major, TMA-aligned layout, as
+            ``rope_quantize_fp8_grouped`` returns them.
+        weight: E4M3 ``[groups, output_dim, input_dim]`` codes, the weight
+            given to ``prepare_grouped_fp8_projection`` viewed per group.
+        weight_scales: Scales from ``prepare_grouped_fp8_projection``.
+        out: Optional contiguous BF16 ``[tokens, groups, output_dim]`` result.
+            None allocates a fresh result.
+
+    Returns:
+        BF16 ``[tokens, groups, output_dim]``; ``out`` when provided.
+    """
+    _check_grouped_fp8_operands(x, weight)
+    expected = (x.shape[0], weight.shape[0], weight.shape[1])
+    if out is None:
+        out = torch.empty(expected, dtype=torch.bfloat16, device=x.device)
+    elif (
+        tuple(out.shape) != expected
+        or out.dtype != torch.bfloat16
+        or out.device != x.device
+        or not out.is_contiguous()
+    ):
+        raise ValueError("grouped FP8 projection out must be contiguous BF16")
+    if x.shape[0] == 0:
+        return out
+    kernel = _fp8_projection_kernel(
+        "grouped_fp8_projection", x.device, weight.shape[1], weight.shape[2]
+    )
+    return kernel(x, x_scales, weight, weight_scales, out)
+
+
+def grouped_fp8_projection_quantize_fp8(
+    x: torch.Tensor,
+    x_scales: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scales: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``grouped_fp8_projection`` flattened and cast to E4M3 for ``fp8_projection``.
+
+    Args:
+        x, x_scales, weight, weight_scales: As for ``grouped_fp8_projection``;
+            output_dim must be a multiple of 128.
+
+    Returns:
+        E4M3 codes ``[tokens, groups * output_dim]`` of the BF16-rounded
+        projection and int32 ``[tokens, groups * output_dim // 128]`` scales,
+        each packing four UE8M0 exponents of 32 columns (byte j for block
+        4w+j), MN-major with tokens padded to 4. Exponents round
+        ``amax / 448`` up to a power of two with amax floored at 1e-4.
+    """
+    _check_grouped_fp8_operands(x, weight)
+    tokens, groups, output_dim = x.shape[0], weight.shape[0], weight.shape[1]
+    if output_dim % 128:
+        raise ValueError("FP8 projection output needs whole 128-column scale words")
+    codes = torch.empty((tokens, groups, output_dim), dtype=_fp8_dtype, device=x.device)
+    scales = _packed_fp8_scales(tokens, groups * output_dim // 128, x.device)
+    if tokens:
+        kernel = _fp8_projection_kernel(
+            "grouped_fp8_projection_fp8", x.device, output_dim, weight.shape[2]
+        )
+        kernel(x, x_scales, weight, weight_scales, codes, scales)
+    return codes.flatten(1), scales
+
+
+def prepare_fp8_projection(
+    weight: torch.Tensor, weight_scales: torch.Tensor
+) -> torch.Tensor | None:
+    """Prepare E4M3 projection scales once for ``fp8_projection``.
+
+    Args:
+        weight: E4M3 ``[output_dim, input_dim]`` codes.
+        weight_scales: Canonical uint8 UE8M0 scales
+            ``[output_dim, input_dim // 32]``; left unchanged.
+
+    Returns:
+        New scales in the serving kernel's layout, or None when no registered
+        kernel serves these weights on their device; callers then keep their
+        current path.
+    """
+    return _prepared_fp8_scales("fp8_projection", weight, weight_scales, None)
+
+
+def fp8_projection(
+    x: torch.Tensor,
+    x_scales: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scales: torch.Tensor,
+    out: torch.Tensor | None,
+) -> torch.Tensor:
+    """Compute ``x @ weight.T`` of E4M3 operands with 1x32 UE8M0 scales.
+
+    Args:
+        x: E4M3 ``[tokens, input_dim]`` codes with unit inner stride.
+        x_scales: Packed scales as ``grouped_fp8_projection_quantize_fp8``
+            returns them.
+        weight: E4M3 ``[output_dim, input_dim]`` codes given to
+            ``prepare_fp8_projection``.
+        weight_scales: Scales from ``prepare_fp8_projection``.
+        out: Optional BF16 ``[tokens, output_dim]`` destination with unit inner
+            stride; other row strides or a base not 16-byte aligned are
+            written through a temporary. None allocates a fresh result.
+
+    Returns:
+        BF16 ``[tokens, output_dim]``; ``out`` when provided.
+    """
+    if x.ndim != 2 or weight.ndim != 2 or x.dtype != _fp8_dtype:
+        raise ValueError("FP8 projection takes E4M3 [tokens, K] input")
+    if weight.dtype != _fp8_dtype or x.shape[1] != weight.shape[1]:
+        raise ValueError("FP8 projection operands must share K")
+    expected = (x.shape[0], weight.shape[0])
+    if out is not None and (
+        tuple(out.shape) != expected
+        or out.dtype != torch.bfloat16
+        or out.device != x.device
+        or out.stride(-1) != 1
+    ):
+        raise ValueError(
+            "FP8 projection out must be BF16 [tokens, N], unit inner stride"
+        )
+    direct = out is not None and out.is_contiguous() and out.data_ptr() % 16 == 0
+    result = (
+        out if direct else torch.empty(expected, dtype=torch.bfloat16, device=x.device)
+    )
+    if x.shape[0]:
+        kernel = _fp8_projection_kernel(
+            "fp8_projection", x.device, weight.shape[0], weight.shape[1]
+        )
+        kernel(x, x_scales, weight, weight_scales, result)
+    if out is None or direct:
+        return result
+    return out.copy_(result)
+
+
+def _warmup_token_counts(max_tokens: int) -> list[int]:
+    # The registered kernels choose a tile configuration per 16 tokens (each
+    # candidate block M is a multiple of 16), so one count per 16 reaches all.
+    return [min(tokens, max_tokens) for tokens in range(16, max_tokens + 16, 16)]
+
+
+def warmup_fp8_projections(
+    grouped_weight: torch.Tensor,
+    grouped_weight_scales: torch.Tensor,
+    weight: torch.Tensor | None,
+    weight_scales: torch.Tensor | None,
+    max_tokens: int,
+) -> None:
+    """Launch the FP8 projections once per tile configuration up to max_tokens.
+
+    The kernels JIT-compile a tile configuration on its first launch; running
+    every reachable one at startup keeps compilation out of serving.
+
+    Args:
+        grouped_weight, grouped_weight_scales: The grouped projection's
+            ``[groups, output_dim, input_dim]`` codes and prepared scales.
+        weight, weight_scales: The following ``fp8_projection``'s codes and
+            prepared scales when it reads the grouped projection's E4M3 output
+            (``grouped_fp8_projection_quantize_fp8``); both None when the
+            grouped projection's output is BF16.
+        max_tokens: Largest token count a forward can carry.
+    """
+    if (weight is None) != (weight_scales is None):
+        raise ValueError("weight and weight_scales must be given together")
+    groups, output_dim, input_dim = grouped_weight.shape
+    device = grouped_weight.device
+    # One buffer per operand at the largest count; each launch views it with
+    # the strides the serving producers use for that count.
+    padded = (max_tokens + 3) // 4 * 4
+    codes = torch.zeros(
+        groups * max_tokens * input_dim, dtype=_fp8_dtype, device=device
+    )
+    words = groups * input_dim // 128
+    scale_storage = torch.zeros(words * padded, dtype=torch.int32, device=device)
+    # Largest first, so the outputs each launch allocates reuse cached blocks.
+    for tokens in reversed(_warmup_token_counts(max_tokens)):
+        aligned = (tokens + 3) // 4 * 4
+        x = codes[: groups * tokens * input_dim].view(groups, tokens, input_dim)
+        x_scales = scale_storage.as_strided(
+            (tokens, groups, input_dim // 128),
+            (1, input_dim // 128 * aligned, aligned),
+        )
+        x = x.transpose(0, 1)
+        if weight is None:
+            grouped_fp8_projection(
+                x, x_scales, grouped_weight, grouped_weight_scales, None
+            )
+            continue
+        z, z_scales = grouped_fp8_projection_quantize_fp8(
+            x, x_scales, grouped_weight, grouped_weight_scales
+        )
+        fp8_projection(z, z_scales, weight, weight_scales, None)
+    torch.cuda.synchronize(device)
+
+
+def warmup_fp8_projection(
+    weight: torch.Tensor, weight_scales: torch.Tensor, max_tokens: int
+) -> None:
+    """Launch ``fp8_projection`` once per tile configuration up to max_tokens.
+
+    The kernel JIT-compiles a tile configuration on its first launch; running
+    every reachable one at startup keeps compilation out of serving.
+
+    Args:
+        weight: E4M3 ``[output_dim, input_dim]`` codes given to
+            ``prepare_fp8_projection``.
+        weight_scales: Scales from ``prepare_fp8_projection``.
+        max_tokens: Largest token count a forward can carry.
+    """
+    output_dim, input_dim = weight.shape
+    device = weight.device
+    codes = torch.zeros(max_tokens * input_dim, dtype=_fp8_dtype, device=device)
+    padded = (max_tokens + 3) // 4 * 4
+    scale_storage = torch.zeros(
+        input_dim // 128 * padded, dtype=torch.int32, device=device
+    )
+    # Largest first, so the outputs each launch allocates reuse cached blocks.
+    for tokens in reversed(_warmup_token_counts(max_tokens)):
+        aligned = (tokens + 3) // 4 * 4
+        x = codes[: tokens * input_dim].view(tokens, input_dim)
+        x_scales = scale_storage.as_strided((tokens, input_dim // 128), (1, aligned))
+        fp8_projection(x, x_scales, weight, weight_scales, None)
+    torch.cuda.synchronize(device)
 
 
 def dsv4_linear_fp32(
@@ -1388,9 +1791,9 @@ def dsv4_linear_fp32(
 # activations first. A layer that keeps the weight split from
 # :func:`mv_weight_split` passes it to :func:`mv`, and the
 # registry can then run the product on BF16 tensor cores
-# (``triton_bf16x3_gemm_fp32``). From 17 to 96 rows, for weights of up to 256
-# rows (a multiple of 4) with K a multiple of 512 up to 8192, the registry runs
-# it on CUDA cores from the FP32 weight instead, with or without the split
+# (``triton_bf16x3_gemm_fp32``). Without a split, from 17 to 96 rows, for
+# weights of up to 256 rows (a multiple of 4) with K a multiple of 512 up to
+# 8192, the registry runs it on CUDA cores from the FP32 weight
 # (``gluon_simt_gemm_fp32``).
 
 # Registry signature of each served (x dtype, weight dtype) pair.
@@ -1581,6 +1984,57 @@ def mv_weight_split(weight: torch.Tensor) -> torch.Tensor | None:
     ):
         return None
     return split_fp32_weight_bf16x3(weight)
+
+
+# Rows one weight-only FP8 GEMV launch takes; larger calls run in chunks.
+MV_FP8_WEIGHT_MAX_M = 32
+
+
+def mv_fp8_weight(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """``(x @ weight.T) * weight_scale`` with a weight-only FP8 weight.
+
+    The weight is E4M3 with one FP32 scale per row (output channel), as a
+    16-bit weight quantizes once at load. Up to ``MV_FP8_WEIGHT_MAX_M`` rows
+    take a registered GEMV that reads the weight once, or the Torch
+    reference, which upcasts the weight in chunks; more rows run as chunks of
+    that many.
+
+    Args:
+        x: ``[M, K]`` 16-bit activations.
+        weight: Contiguous ``[N, K]`` ``float8_e4m3fn`` weight.
+        weight_scale: Contiguous FP32 scale of each weight row, ``N``
+            elements.
+        out: Optional ``[M, N]`` destination in ``x``'s dtype with a unit
+            inner stride.
+
+    Returns:
+        ``[M, N]`` output in ``x``'s dtype.
+    """
+    m, k = x.shape
+    n = weight.shape[0]
+    if out is None:
+        out = x.new_empty((m, n))
+    if not x.is_contiguous():
+        x = x.contiguous()
+    if m > MV_FP8_WEIGHT_MAX_M:
+        # Each chunk re-reads the weight: past this many rows the one-launch
+        # GEMV measured slower than chunks of it (and than a BF16 GEMM).
+        for start in range(0, m, MV_FP8_WEIGHT_MAX_M):
+            stop = min(start + MV_FP8_WEIGHT_MAX_M, m)
+            mv_fp8_weight(x[start:stop], weight, weight_scale, out[start:stop])
+        return out
+    kernel = select_kernel(
+        "gemm",
+        "mv_fp8_weight",
+        mv_fp8_weight_signature(x.dtype),
+        traits={"m": m, "n": n, "k": k},
+    )
+    return kernel(x, weight, weight_scale, out)
 
 
 def _select_mv_weightless_rmsnorm_gated_sigmoid(
@@ -2520,6 +2974,21 @@ def kimi3_mla_qkv_gate_projection(
     if gate is None:
         gate = torch.nn.functional.linear(hidden_states, gate_weight)
     return Kimi3MLAQKVGateProjection(qkv=qkv, gate=gate, packed=None)
+
+
+def kimi3_mla_gate_projection(
+    hidden_states: torch.Tensor, weight: torch.Tensor, qkv_width: int
+) -> torch.Tensor:
+    """The gate rows of ``kimi3_mla_qkv_gate_projection``'s split schedule alone.
+
+    For callers that already hold the QKV-a rows; the gate keeps the split
+    schedule's kernel, so its bits do not change.
+    """
+    gate_weight = weight[qkv_width:]
+    gate = _try_gluon_largem_gfx950(hidden_states, gate_weight)
+    if gate is None:
+        gate = torch.nn.functional.linear(hidden_states, gate_weight)
+    return gate
 
 
 # Retained fused add3 tile configurations, independent of ordinary GEMV tuning.
@@ -3533,11 +4002,14 @@ from tokenspeed_kernel.ops.gemm.flashinfer import (  # noqa: E402
     autotune_bf16_gemm,
     flashinfer_bf16_gemm,
     flashinfer_joint_bf16_supported,
+    flashinfer_tgv_decode_gemm,
+    flashinfer_tgv_decode_tactic,
     gemm_fp8_nt_groupwise,
     has_flashinfer_cute_dsl_nvfp4_a16,
     has_flashinfer_mxfp8,
     prepare_nvfp4_a16_weights,
     swizzle_mxfp8_scale,
+    warm_tgv_decode_gemm,
 )
 
 if has_flashinfer_mxfp8():
@@ -3548,7 +4020,10 @@ from tokenspeed_kernel.ops.gemm.gluon import (  # noqa: E402
     MXFP4_LINEAR_MFMA_LAYOUT,
     prepare_mxfp4_linear_mfma_weight,
 )
-from tokenspeed_kernel.ops.gemm.native import torch_decode_gemv  # noqa: E402
+from tokenspeed_kernel.ops.gemm.native import (  # noqa: E402
+    mv_fp8_weight_signature,
+    torch_decode_gemv,
+)
 from tokenspeed_kernel.ops.gemm.triton import (  # noqa: E402
     MXFP4_LINEAR_LINEAR_LAYOUT,
     MXFP4_LINEAR_SIGNATURE,
@@ -3598,6 +4073,7 @@ class _FP32RouterGEMVPlan:
     hidden_size: int
     output_size: int
     dtype: torch.dtype
+    batch_invariant: bool
 
 
 def fp32_router_gemv_plan(
@@ -3642,6 +4118,7 @@ def fp32_router_gemv_plan(
         hidden_size=hidden_size,
         output_size=output_size,
         dtype=dtype,
+        batch_invariant=batch_invariant,
     )
 
 
@@ -3713,3 +4190,126 @@ def fp32_router_gemv_execute(
         counters,
         enable_pdl,
     )
+
+
+def _select_fp32_router_gemv_with_mm(
+    plan: _FP32RouterGEMVPlan,
+    x: torch.Tensor,
+    mm_a: torch.Tensor,
+    mm_b: torch.Tensor,
+) -> SelectedKernel | None:
+    """Select the launch that runs the router next to a decode GEMM, or None."""
+    if (
+        plan.batch_invariant
+        or x.ndim != 2
+        or x.shape[1] != plan.hidden_size
+        or x.dtype != plan.dtype
+        or not x.is_contiguous()
+        or not x.is_cuda
+        or mm_a.ndim != 2
+        or mm_b.ndim != 2
+        or mm_a.shape != (x.shape[0], mm_b.shape[1])
+        or not mm_a.is_contiguous()
+        or not mm_b.is_contiguous()
+        or mm_a.device != x.device
+        or mm_b.device != x.device
+        or resolve_kernel_override("gemm", "mm", None) is not None
+    ):
+        return None
+    rows, (mm_n, mm_k) = x.shape[0], mm_b.shape
+    try:
+        kernel = select_kernel(
+            "gemm",
+            "prepared_fp32_router_gemv_with_mm",
+            dense_format_signature(
+                ("x", "weight", "mm_a", "mm_b"),
+                (x.dtype, plan.dtype, mm_a.dtype, mm_b.dtype),
+            ),
+            traits={
+                "m": rows,
+                "n": mm_n,
+                "k": mm_k,
+                "router_n": plan.output_size,
+                "router_k": plan.hidden_size,
+            },
+        )
+    except NoKernelFoundError:
+        return None
+    registry = KernelRegistry.get()
+    spec = registry.get_by_name(kernel.name)
+    # The launch reads the plan's prepared weight and writes the bits mm would
+    # write, so it only stands in where both match.
+    if (
+        spec is None
+        or spec.weight_preprocessor is not plan.weight_preprocessor
+        or not _use_mv(mm_a, mm_b)
+        or _select_mv(rows, mm_n, mm_k, True, mm_a.dtype, mm_b.dtype, False)
+        is not registry.get_impl("gluon_mm_a16w16_decode_gfx950")
+    ):
+        return None
+    return kernel
+
+
+def fp32_router_gemv_with_mm_supported(
+    plan: object,
+    x: torch.Tensor,
+    mm_a: torch.Tensor,
+    mm_b: torch.Tensor,
+) -> bool:
+    """Return whether :func:`fp32_router_gemv_execute_with_mm` serves these operands.
+
+    Args:
+        plan: Opaque router GEMV plan.
+        x: FP32 router rows.
+        mm_a: ``[rows, K]`` activations of the independent GEMM.
+        mm_b: ``[N, K]`` weight of the independent GEMM.
+
+    Returns:
+        ``True`` when one launch can run the router and ``mm(mm_a, mm_b)``.
+    """
+    return (
+        _select_fp32_router_gemv_with_mm(
+            _require_fp32_router_gemv_plan(plan), x, mm_a, mm_b
+        )
+        is not None
+    )
+
+
+def fp32_router_gemv_execute_with_mm(
+    plan: object,
+    x: torch.Tensor,
+    prepared_weight: torch.Tensor,
+    multiplier: float,
+    mm_a: torch.Tensor,
+    mm_b: torch.Tensor,
+    mm_out: torch.Tensor,
+) -> torch.Tensor:
+    """Project router rows and compute an independent GEMM in one launch.
+
+    Where :func:`fp32_router_gemv_with_mm_supported` holds, the two share a
+    launch instead of paying a kernel boundary each. ``mm_out`` receives
+    ``mm(mm_a, mm_b)`` bit for bit; the router runs its split-K GEMM at every
+    supported row count, so its logits may differ from the plan's single-row
+    GEMV in the last bits.
+
+    Args:
+        plan: Opaque router GEMV plan.
+        x: Contiguous FP32 router rows.
+        prepared_weight: Result of :func:`fp32_router_gemv_process_weight`.
+        multiplier: Scale applied to the router logits.
+        mm_a: Contiguous ``[rows, K]`` BF16 activations.
+        mm_b: Contiguous ``[N, K]`` BF16 weight.
+        mm_out: ``[rows, N]`` BF16 destination.
+
+    Returns:
+        FP32 router logits in ``[rows, outputs]`` layout.
+    """
+    typed_plan = _require_fp32_router_gemv_plan(plan)
+    kernel = _select_fp32_router_gemv_with_mm(typed_plan, x, mm_a, mm_b)
+    if kernel is None:
+        raise ValueError(
+            "fp32_router_gemv_execute_with_mm needs supported operands "
+            "(see fp32_router_gemv_with_mm_supported), got router rows "
+            f"{tuple(x.shape)} and a {tuple(mm_b.shape)} GEMM"
+        )
+    return kernel(x, prepared_weight, multiplier, mm_a, mm_b, mm_out)

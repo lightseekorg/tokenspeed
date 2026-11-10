@@ -168,7 +168,7 @@ def _store_latent_input_half(
     )
 
 
-@gluon.jit(launch_metadata=_prefill_launch_metadata)
+@gluon.jit(launch_metadata=_prefill_launch_metadata, do_not_specialize=("M", "GRID_MN"))
 def gluon_latent_input_largem_gfx950(
     a_ptr,
     b_ptr,
@@ -422,26 +422,59 @@ def launch_gluon_latent_input_largem_gfx950(
     shared_raw = torch.empty(
         (tokens, _K3_SHARED_RAW), dtype=torch.bfloat16, device=device
     )
-    shared_out = torch.empty((tokens, _K3_SHARED), dtype=torch.bfloat16, device=device)
-
-    grid_mn = triton.cdiv(tokens, _BLOCK_M) * triton.cdiv(_K3_TOTAL, _BLOCK_N)
-    gluon_latent_input_largem_gfx950[(grid_mn,)](
+    _launch_packed_projection(
         hidden_states,
         packed_weight,
+        router_out,
+        routed_out,
+        shared_raw,
+        router_n=_K3_ROUTER,
+        routed_n=_K3_ROUTED,
+        shared_n=_K3_SHARED_RAW,
+    )
+    return (
+        router_out,
+        routed_out,
+        _launch_situ(shared_raw, beta=beta, linear_beta=linear_beta),
+    )
+
+
+def _launch_packed_projection(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    router_out: torch.Tensor,
+    routed_out: torch.Tensor,
+    shared_raw: torch.Tensor,
+    *,
+    router_n: int,
+    routed_n: int,
+    shared_n: int,
+) -> None:
+    """Project consecutive packed weight rows split into the three regions.
+
+    Each output element depends only on its row and column, so any row subset
+    or consecutive region run reproduces the full projection's values.
+    """
+    tokens = hidden_states.shape[0]
+    total_n = router_n + routed_n + shared_n
+    grid_mn = triton.cdiv(tokens, _BLOCK_M) * triton.cdiv(total_n, _BLOCK_N)
+    gluon_latent_input_largem_gfx950[(grid_mn,)](
+        hidden_states,
+        weight,
         router_out,
         routed_out,
         shared_raw,
         tokens,
         hidden_states.stride(0),
         hidden_states.stride(1),
-        packed_weight.stride(1),
-        packed_weight.stride(0),
+        weight.stride(1),
+        weight.stride(0),
         router_out.stride(0),
         routed_out.stride(0),
         shared_raw.stride(0),
-        TOTAL_N=_K3_TOTAL,
-        ROUTER_N=_K3_ROUTER,
-        ROUTED_N=_K3_ROUTED,
+        TOTAL_N=total_n,
+        ROUTER_N=router_n,
+        ROUTED_N=routed_n,
         K=_K3_HIDDEN,
         BLOCK_M=_BLOCK_M,
         BLOCK_N=_BLOCK_N,
@@ -453,6 +486,15 @@ def launch_gluon_latent_input_largem_gfx950(
         GROUP_SIZE_M=_GROUP_SIZE_M,
         num_warps=_NUM_WARPS,
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
+    )
+
+
+def _launch_situ(
+    shared_raw: torch.Tensor, *, beta: float, linear_beta: float | None
+) -> torch.Tensor:
+    tokens = shared_raw.shape[0]
+    shared_out = torch.empty(
+        (tokens, _K3_SHARED), dtype=torch.bfloat16, device=shared_raw.device
     )
     situ_grid = (triton.cdiv(tokens, _SITU_BLOCK_M), _K3_SHARED // _SITU_BLOCK_N)
     gluon_latent_input_largem_situ_gfx950[situ_grid](
@@ -471,7 +513,83 @@ def launch_gluon_latent_input_largem_gfx950(
         HAS_LINEAR_BETA=linear_beta is not None,
         num_warps=_SITU_NUM_WARPS,
     )
-    return router_out, routed_out, shared_out
+    return shared_out
 
 
-__all__ = ["launch_gluon_latent_input_largem_gfx950"]
+def launch_gluon_latent_input_largem_routed_gfx950(
+    hidden_states: torch.Tensor,
+    packed_weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Project only the router and routed-latent rows of the packed K3 weight.
+
+    The values match the corresponding outputs of
+    ``launch_gluon_latent_input_largem_gfx950`` for the same rows bit for bit.
+    """
+    _validate_packed_rows(hidden_states, packed_weight)
+    tokens = hidden_states.shape[0]
+    device = hidden_states.device
+    router_out = torch.empty((tokens, _K3_ROUTER), dtype=torch.float32, device=device)
+    routed_out = torch.empty((tokens, _K3_ROUTED), dtype=torch.bfloat16, device=device)
+    _launch_packed_projection(
+        hidden_states,
+        packed_weight,
+        router_out,
+        routed_out,
+        torch.empty((1, 8), dtype=torch.bfloat16, device=device),
+        router_n=_K3_ROUTER,
+        routed_n=_K3_ROUTED,
+        shared_n=0,
+    )
+    return router_out, routed_out
+
+
+def launch_gluon_latent_input_largem_shared_gfx950(
+    hidden_states: torch.Tensor,
+    packed_weight: torch.Tensor,
+    *,
+    beta: float,
+    linear_beta: float | None,
+) -> torch.Tensor:
+    """Project only the shared gate/up rows of the packed K3 weight and apply SiTU.
+
+    The values match the shared output of
+    ``launch_gluon_latent_input_largem_gfx950`` for the same rows bit for bit.
+    """
+    _validate_packed_rows(hidden_states, packed_weight)
+    if beta <= 0.0 or (linear_beta is not None and linear_beta <= 0.0):
+        raise ValueError("SiTU beta values must be positive")
+    tokens = hidden_states.shape[0]
+    device = hidden_states.device
+    shared_raw = torch.empty(
+        (tokens, _K3_SHARED_RAW), dtype=torch.bfloat16, device=device
+    )
+    _launch_packed_projection(
+        hidden_states,
+        packed_weight[_K3_ROUTER + _K3_ROUTED :],
+        torch.empty((1, 8), dtype=torch.float32, device=device),
+        torch.empty((1, 8), dtype=torch.bfloat16, device=device),
+        shared_raw,
+        router_n=0,
+        routed_n=0,
+        shared_n=_K3_SHARED_RAW,
+    )
+    return _launch_situ(shared_raw, beta=beta, linear_beta=linear_beta)
+
+
+def _validate_packed_rows(hidden_states: torch.Tensor, packed_weight: torch.Tensor):
+    validate_k3_latent_input_gfx950(
+        hidden_states,
+        packed_weight[:_K3_ROUTER],
+        packed_weight[_K3_ROUTER : _K3_ROUTER + _K3_ROUTED],
+        packed_weight[_K3_ROUTER + _K3_ROUTED :],
+        packed_weight,
+        beta=1.0,
+        linear_beta=None,
+    )
+
+
+__all__ = [
+    "launch_gluon_latent_input_largem_gfx950",
+    "launch_gluon_latent_input_largem_routed_gfx950",
+    "launch_gluon_latent_input_largem_shared_gfx950",
+]

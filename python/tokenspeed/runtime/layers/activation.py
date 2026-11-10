@@ -28,6 +28,9 @@ from dataclasses import dataclass
 
 import torch
 from tokenspeed_kernel.ops.activation import silu_and_mul
+
+# SwiGLU-OAI has only the portable Triton solution.
+from tokenspeed_kernel.ops.activation.triton import swiglu_oai
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.utils import (
@@ -166,6 +169,22 @@ class SituAndMul(torch.nn.Module):
         if self.linear_beta is not None:
             up = self.linear_beta * torch.tanh(up / self.linear_beta)
         return (gate * up).to(x.dtype)
+
+
+class SwigluOAI(torch.nn.Module):
+    """SwiGLU-OAI gated activation: ``gate * sigmoid(alpha * gate) * (up + 1)``.
+
+    The gate is upper-clamped to ``limit`` and up is clamped to
+    ``[-limit, limit]``.
+    """
+
+    def __init__(self, alpha: float, limit: float) -> None:
+        super().__init__()
+        self.alpha = alpha
+        self.limit = limit
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return swiglu_oai(x, alpha=self.alpha, limit=self.limit)
 
 
 @triton.jit

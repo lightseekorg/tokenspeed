@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Explicit planning bounds for capacity-based CuTeDSL KDA prefill."""
+"""Explicit planning bounds for capacity-based KDA prefill."""
 
 from dataclasses import dataclass
 

@@ -36,7 +36,7 @@ from typing import Protocol
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.ops.activation.triton import rmsnorm_gated_sigmoid, silu_and_mul
+from tokenspeed_kernel.ops.activation.triton import rmsnorm_gated_sigmoid
 from tokenspeed_kernel.ops.residual import mhc_post, mhc_pre
 from tokenspeed_kernel.ops.transform import hadamard_transform
 from tokenspeed_kernel.platform import pdl_enabled
@@ -66,11 +66,13 @@ from tokenspeed.runtime.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
+from tokenspeed.runtime.layers.mlp import GatedMLP, gated_activation
 from tokenspeed.runtime.layers.moe import (
     ExpertCheckpointSchema,
     MoELayer,
     build_moe_checkpoint_loader,
 )
+from tokenspeed.runtime.layers.moe.block import MoEBlock, MoEBlockFusion
 from tokenspeed.runtime.layers.moe.topk import TopK
 from tokenspeed.runtime.layers.moe.utils import RoutingMethodType
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
@@ -84,7 +86,6 @@ from tokenspeed.runtime.model_loader.weight_utils import (
 from tokenspeed.runtime.models.base import BaseCausalLM
 from tokenspeed.runtime.models.deepseek_v3 import (
     DeepseekV3AttentionMLA,
-    DeepseekV3MoE,
     MoEGate,
     absorb_mla_kv_b_proj,
 )
@@ -93,6 +94,7 @@ from tokenspeed.runtime.models.glm5 import (
     GlmDsaIndexer,
     GlmDsaPrefillTopK,
     GlmMoeDsaAttention,
+    load_fused_indexer_projection,
 )
 from tokenspeed.runtime.multimodal.embedder import (
     EncoderSpec,
@@ -103,7 +105,6 @@ from tokenspeed.runtime.multimodal.inputs import (
     MultimodalDataItem,
 )
 from tokenspeed.runtime.utils import add_prefix
-from tokenspeed.runtime.utils.cuda_stream import StreamFork
 
 # ===----------------------------------------------------------------------=== #
 # Multimodal vision path
@@ -391,61 +392,7 @@ class Glm53FlashIndexerOutput:
     gate: torch.Tensor
 
 
-class Glm53FlashMLP(nn.Module):
-    """GLM-5.3-Flash SwiGLU with the checkpoint's activation clamp."""
-
-    def __init__(
-        self,
-        config: Glm53FlashTextConfig,
-        intermediate_size: int,
-        mapping: Mapping,
-        quant_config: QuantizationConfig | None = None,
-        prefix: str = "",
-        *,
-        is_shared_expert: bool = False,
-    ) -> None:
-        super().__init__()
-        if is_shared_expert:
-            tp_rank = mapping.moe.tp_ep_rank
-            tp_size = mapping.moe.tp_ep_size
-            tp_group = mapping.moe.tp_ep_group
-        else:
-            tp_rank = mapping.dense.tp_rank
-            tp_size = mapping.dense.tp_size
-            tp_group = mapping.dense.tp_group
-        self.gate_up_proj = MergedColumnParallelLinear(
-            config.hidden_size,
-            [intermediate_size, intermediate_size],
-            bias=False,
-            quant_config=quant_config,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
-            tp_group=tp_group,
-            prefix=add_prefix("gate_up_proj", prefix),
-        )
-        self.down_proj = RowParallelLinear(
-            intermediate_size,
-            config.hidden_size,
-            bias=False,
-            reduce_results=False,
-            quant_config=quant_config,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
-            tp_group=tp_group,
-            prefix=add_prefix("down_proj", prefix),
-        )
-        self.swiglu_limit = config.swiglu_limit
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if hidden_states.shape[0] == 0:
-            return hidden_states
-        gate_up, _ = self.gate_up_proj(hidden_states)
-        activated = silu_and_mul(gate_up, limit=self.swiglu_limit)
-        output, _ = self.down_proj(activated)
-        return output
-
-
-class Glm53FlashMoE(DeepseekV3MoE):
+class Glm53FlashMoE(MoEBlock):
     """DeepSeek routing with GLM-5.3-Flash's clamped SwiGLU experts."""
 
     def __init__(
@@ -457,20 +404,13 @@ class Glm53FlashMoE(DeepseekV3MoE):
         prefix: str = "",
         alt_stream: torch.cuda.Stream | None = None,
     ) -> None:
-        nn.Module.__init__(self)
-        self.mapping = mapping
-        self.layer_index = layer_index
-        self.n_shared_experts = config.n_shared_experts
-        self.routed_scaling_factor = config.routed_scaling_factor
-        self.stream_fork = StreamFork(alt_stream)
-
         if mapping.moe.ep_size > config.n_routed_experts:
             raise ValueError(
                 f"EP size {mapping.moe.ep_size} is greater than the number of "
                 f"experts {config.n_routed_experts}."
             )
-        self.gate = MoEGate(config=config, prefix=add_prefix("gate", prefix))
-        self.experts = MoELayer(
+        gate = MoEGate(config=config, prefix=add_prefix("gate", prefix))
+        experts = MoELayer(
             top_k=config.num_experts_per_tok,
             num_experts=config.n_routed_experts,
             hidden_size=config.hidden_size,
@@ -490,28 +430,40 @@ class Glm53FlashMoE(DeepseekV3MoE):
                 "topk_group": config.topk_group,
                 "routed_scaling_factor": config.routed_scaling_factor,
                 "normalize_topk_weights": config.norm_topk_prob,
-                "correction_bias": self.gate.e_score_correction_bias,
+                "correction_bias": gate.e_score_correction_bias,
                 "routing_method_type": RoutingMethodType.DeepSeekV3,
             },
         )
-        self.topk = TopK(
+        topk = TopK(
             top_k=config.num_experts_per_tok,
             renormalize=config.norm_topk_prob,
             use_grouped_topk=True,
             num_expert_group=config.n_group,
             num_fused_shared_experts=0,
             topk_group=config.topk_group,
-            correction_bias=self.gate.e_score_correction_bias,
+            correction_bias=gate.e_score_correction_bias,
             routed_scaling_factor=config.routed_scaling_factor,
-            output_format=self.experts.topk_output_format,
+            output_format=experts.topk_output_format,
         )
-        self.shared_experts = Glm53FlashMLP(
-            config=config,
+        shared_experts = GatedMLP.tensor_parallel(
+            hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size * config.n_shared_experts,
-            mapping=mapping,
+            activation=gated_activation(config.hidden_act, config.swiglu_limit),
+            tp_rank=mapping.moe.tp_ep_rank,
+            tp_size=mapping.moe.tp_ep_size,
+            tp_group=mapping.moe.tp_ep_group,
+            reduce_results=False,
+            fusions=(),
             quant_config=quant_config,
             prefix=add_prefix("shared_experts", prefix),
-            is_shared_expert=True,
+        )
+        super().__init__(
+            gate,
+            topk,
+            experts,
+            shared_experts,
+            alt_stream,
+            fusions=(MoEBlockFusion.FINALIZE_ADD_SHARED,),
         )
 
 
@@ -932,6 +884,8 @@ class Glm53FlashAttention(GlmMoeDsaAttention):
         self.index_topk = config.index_topk
         self.index_kpool = config.index_kpool
         self.is_nextn = False
+        # Every rank selects every prefill row (validated configuration).
+        self.prefill_topk_tp_split = False
         self.skip_indexer_topk = config.indexer_types[layer_id] == "shared"
         self.indexer = (
             None
@@ -1285,10 +1239,15 @@ class Glm53FlashDecoderLayer(nn.Module):
                 alt_stream=alt_stream,
             )
         else:
-            self.mlp = Glm53FlashMLP(
-                config=config,
+            self.mlp = GatedMLP.tensor_parallel(
+                hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
-                mapping=mapping,
+                activation=gated_activation(config.hidden_act, config.swiglu_limit),
+                tp_rank=mapping.dense.tp_rank,
+                tp_size=mapping.dense.tp_size,
+                tp_group=mapping.dense.tp_group,
+                reduce_results=False,
+                fusions=(),
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
             )
@@ -1577,6 +1536,7 @@ def load_glm53_flash_text_weights(
     params_dict = dict(owner.named_parameters())
     modules_dict = dict(owner.named_modules())
     loaded_indexer_shards: dict[str, set[int]] = {}
+    pending_fp8_wk: dict[str, dict[str, torch.Tensor]] = {}
     moe_loader = build_moe_checkpoint_loader(
         params_dict=params_dict,
         expert_schema=ExpertCheckpointSchema(),
@@ -1621,25 +1581,17 @@ def load_glm53_flash_text_weights(
                     direct_param.weight_loader(direct_param, loaded_weight)
                 else:
                     default_weight_loader(direct_param, loaded_weight)
-            if name.endswith(".weight"):
-                if ".indexer.wk." in name:
-                    module_name = name.rsplit(".wk.", 1)[0]
-                    shard_id = 0
-                else:
-                    module_name = name.rsplit(".weights_proj.", 1)[0]
-                    shard_id = 1
-                fused_param = params_dict.get(f"{module_name}.wk_weights_proj.weight")
-                if fused_param is not None:
-                    fused_param.weight_loader(
-                        fused_param,
-                        loaded_weight,
-                        shard_id,
-                    )
-                    shards = loaded_indexer_shards.setdefault(module_name, set())
-                    shards.add(shard_id)
-                    module = modules_dict.get(module_name)
-                    if shards == {0, 1} and hasattr(module, "_wk_weights_proj_loaded"):
-                        module._wk_weights_proj_loaded = True
+            load_fused_indexer_projection(
+                name,
+                loaded_weight,
+                params_dict=params_dict,
+                modules_dict=modules_dict,
+                pending_fp8_wk=pending_fp8_wk,
+                loaded_shards=loaded_indexer_shards,
+                weight_block_size=getattr(
+                    owner.quant_config, "weight_block_size", None
+                ),
+            )
             continue
 
         if moe_loader.matches(name):
@@ -1700,6 +1652,12 @@ def load_glm53_flash_text_weights(
             param.weight_loader(param, loaded_weight)
         else:
             default_weight_loader(param, loaded_weight)
+
+    if pending_fp8_wk:
+        raise RuntimeError(
+            "FP8 indexer wk weight or weight_scale_inv is missing its partner "
+            f"for {sorted(pending_fp8_wk)}"
+        )
 
 
 class Glm53FlashForCausalLM(BaseCausalLM):

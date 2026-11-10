@@ -67,6 +67,7 @@ from tokenspeed.runtime.layers.linear import (  # noqa: E402
 )
 from tokenspeed.runtime.layers.moe.expert import MoELayer  # noqa: E402
 from tokenspeed.runtime.model_loader import loader as loader_module  # noqa: E402
+from tokenspeed.runtime.models.deepseek_v41_moe import DeepseekV4MoE  # noqa: E402
 
 
 class _TinyModel(torch.nn.Module):
@@ -287,8 +288,9 @@ class TestRealCheckpoint:
 def _bare(cls: type[torch.nn.Module]) -> torch.nn.Module:
     """An instance of ``cls`` built without its constructor.
 
-    The post-load check reads only a module's class, its ``quant_method`` and
-    an MoE layer's ``plan``, so no layer needs real weights or a mapping.
+    The post-load check reads only a module's class, its ``quant_method``, an
+    MoE layer's ``plan`` and whether a DeepSeek V4 MoE block fused its shared
+    expert, so no layer needs real weights or a mapping.
     """
     module = cls.__new__(cls)
     torch.nn.Module.__init__(module)
@@ -343,6 +345,16 @@ class TestPostLoadTransforms:
         # The unquantized gfx950 MoE kernels plan no weight preprocessor, so
         # their experts keep the checkpoint layout.
         assert (self._transformed(experts=_moe(None))) == ([])
+
+    def test_deepseek_v4_moe_is_a_transform_once_it_fuses_its_shared_expert(self):
+        # Its hook rewrites the shared expert in place only when MegaMoE takes
+        # it; the routed experts are judged by their own MoE layer.
+        unfused, fused = _bare(DeepseekV4MoE), _bare(DeepseekV4MoE)
+        unfused.shared_expert_fused = False
+        fused.shared_expert_fused = True
+        assert (self._transformed(unfused=unfused, fused=fused)) == (
+            ["fused (DeepseekV4MoE)"]
+        )
 
     def test_unknown_hook_is_a_transform(self):
         # A hook nobody has shown to be a no-op is treated as one that is not.

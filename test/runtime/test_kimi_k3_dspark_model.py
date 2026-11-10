@@ -2,9 +2,9 @@
 
 The weight manifest below is the real one from `Inferact/Kimi-K3-DSpark
 <https://huggingface.co/Inferact/Kimi-K3-DSpark>`_ (68 tensors, 3.56B
-parameters). Building the model needs a distributed mapping and a GPU, so these
-tests check the pieces that can be checked without one: the config contract and
-the exact set of checkpoint keys the loader must route, skip, or reject.
+parameters). Most tests check what needs no GPU: the config contract and the
+exact set of checkpoint keys the loader must route, skip, or reject; the
+context-write tests build a small draft on the GPU.
 """
 
 from __future__ import annotations
@@ -30,6 +30,8 @@ from tokenspeed.runtime.configs.kimi_k3_dspark_config import (
     validate_k3_dspark_config,
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.layers.attention.configs.base import block_draft_is_causal
+from tokenspeed.runtime.layers.rotary_embedding import yarn_get_mscale
 from tokenspeed.runtime.models import kimi_k3_dspark as dspark_model_module
 from tokenspeed.runtime.models.kimi_k3_dspark import K3DSparkModel
 
@@ -149,6 +151,124 @@ def test_non_yarn_rope_yields_no_scaling() -> None:
     )
     assert config.rope_scaling_dict() is None
     assert config.resolved_rope_theta() == 10000.0
+
+
+# The published Inferact/Kimi-K3.1-Pro-DSpark-preview config.json.
+INFERACT_K31_CONFIG = {
+    "attention_bias": False,
+    "attention_dropout": 0.0,
+    "bos_token_id": 163584,
+    "eos_token_id": 163586,
+    "head_dim": 64,
+    "hidden_act": "silu",
+    "hidden_size": 7168,
+    "initializer_range": 0.02,
+    "intermediate_size": 14336,
+    "kv_lora_rank": 512,
+    "layer_types": [
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+        "full_attention",
+    ],
+    "num_attention_heads": 96,
+    "num_hidden_layers": 5,
+    "num_key_value_heads": 96,
+    "pad_token_id": 163839,
+    "q_lora_rank": 1536,
+    "qk_head_dim": 192,
+    "qk_nope_head_dim": 128,
+    "qk_rope_head_dim": 64,
+    "rms_norm_eps": 1e-05,
+    "rope_interleave": True,
+    "rope_parameters": {
+        "rope_type": "yarn",
+        "rope_theta": 1000000.0,
+        "factor": 32.0,
+        "original_max_position_embeddings": 32768,
+        "beta_fast": 32,
+        "beta_slow": 1,
+        "mscale": 1.0,
+        "mscale_all_dim": 0.0,
+        "attn_factor": 0.7426255848312643,
+    },
+    "sliding_window": None,
+    "tie_word_embeddings": False,
+    "use_cache": True,
+    "use_sliding_window": False,
+    "v_head_dim": 128,
+    "vocab_size": 163840,
+    "architectures": ["K3DSparkModel"],
+    "model_type": "k3_dspark",
+    "max_position_embeddings": 1048576,
+    "rope_theta": 1000000.0,
+    "num_target_layers": 5,
+    "target_hidden_size": 7168,
+    "target_num_hidden_layers": 93,
+    "target_layer_ids": [75, 79, 83, 87, 91],
+    "mask_token_id": 163839,
+    "markov_rank": 512,
+    "markov_head_type": "vanilla",
+    "enable_confidence_head": True,
+    "confidence_head_with_markov": True,
+    "sample_from_anchor": True,
+    "block_size": 7,
+    "sliding_window_non_causal": False,
+    "full_attention_causal": True,
+    "dflash_config": {"causal": True},
+    "draft_vocab_size": 163840,
+    "torch_dtype": "bfloat16",
+}
+
+
+def test_k31_published_config_validates() -> None:
+    config = KimiK3DSparkConfig(**INFERACT_K31_CONFIG)
+    validate_k3_dspark_config(config)
+    assert config.qk_head_dim == 192
+    assert config.kv_latent_dim == 576
+
+
+def test_k31_block_attends_causally_and_k3_block_does_not() -> None:
+    assert block_draft_is_causal(KimiK3DSparkConfig(**INFERACT_K31_CONFIG))
+    assert not block_draft_is_causal(make_config())
+
+
+def test_block_causality_is_declared_by_is_causal_then_dflash_config() -> None:
+    config = SimpleNamespace(is_causal=False, dflash_config={"causal": True})
+    assert not block_draft_is_causal(config)
+    assert block_draft_is_causal(SimpleNamespace(dflash_config={"causal": True}))
+    # Sliding layers bound the window, not the block's causality (DFlash2).
+    sliding = SimpleNamespace(layer_types=["sliding_attention"] * 2)
+    assert not block_draft_is_causal(sliding)
+
+
+def test_k31_yarn_attn_factor_keeps_unit_rope_magnitude() -> None:
+    """K3.1 pairs mscale_all_dim 0 with attn_factor 0.743, so the cos/sin cache
+    is unscaled; dropping attn_factor would scale it by yarn_get_mscale(32)."""
+    scaling = KimiK3DSparkConfig(**INFERACT_K31_CONFIG).rope_scaling_dict()
+    assert scaling["attn_factor"] == pytest.approx(0.7426255848312643)
+    magnitude = (
+        yarn_get_mscale(scaling["factor"], scaling["mscale"])
+        / yarn_get_mscale(scaling["factor"], scaling["mscale_all_dim"])
+        * scaling["attn_factor"]
+    )
+    assert magnitude == pytest.approx(1.0, abs=1e-6)
+
+
+def test_k31_qk_head_dim_must_be_the_sum_of_its_parts() -> None:
+    with pytest.raises(ValueError, match="qk_head_dim=191"):
+        KimiK3DSparkConfig(**{**INFERACT_K31_CONFIG, "qk_head_dim": 191})
+
+
+def test_a_draft_rotating_half_split_rope_is_rejected() -> None:
+    with pytest.raises(ValueError, match="rope_interleave"):
+        KimiK3DSparkConfig(**{**INFERACT_K31_CONFIG, "rope_interleave": False})
+
+
+def test_a_draft_not_sampling_from_its_anchor_is_rejected() -> None:
+    with pytest.raises(ValueError, match="sample_from_anchor"):
+        KimiK3DSparkConfig(**{**INFERACT_K31_CONFIG, "sample_from_anchor": False})
 
 
 # --------------------------------------------------------------------------
@@ -370,40 +490,154 @@ def test_k3_per_tap_projection_uses_local_checkpoint_columns(capture_idx, with_n
         model.project_target_tap(1, hidden)
 
 
+def _tiny_draft(mapping) -> K3DSparkModel:
+    """A small real draft in bf16 on the GPU, with K3's 512 + 64 latent rows."""
+    config = make_config(
+        hidden_size=256,
+        intermediate_size=256,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        q_lora_rank=128,
+        qk_nope_head_dim=64,
+        v_head_dim=64,
+        vocab_size=1024,
+        draft_vocab_size=1024,
+        max_position_embeddings=4096,
+        rope_theta=10000.0,
+        rope_parameters=None,
+        num_target_layers=3,
+        target_hidden_size=256,
+        target_num_hidden_layers=8,
+        target_layer_ids=[1, 4, 6],
+        mask_token_id=1023,
+        markov_rank=16,
+    )
+    default_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        with torch.device("cuda"):
+            model = K3DSparkModel(config, mapping)
+    finally:
+        torch.set_default_dtype(default_dtype)
+    # A cached RoPE table may predate the device scope.
+    model.cuda()
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    for param in model.parameters():
+        param.data.normal_(0.0, 0.05, generator=generator)
+    for layer in model.layers:
+        layer.self_attn.kv_a_layernorm.weight.data.add_(1.0)
+    model.post_load_weights()
+    return model
+
+
+class _LatentPool:
+    """The MLA pool's write target over plain latent planes."""
+
+    def __init__(self, planes: list[torch.Tensor], sanitize: bool) -> None:
+        self.planes = planes
+        self.sanitize = sanitize
+
+    def kv_write_target(self, layer_id, slots, write_mask):
+        from tokenspeed_kernel.ops.attention.prologue import LatentKVCache
+
+        return LatentKVCache(self.planes[layer_id], self.sanitize, slots, write_mask)
+
+
+def _chain_write(model, rows, positions, slots, planes, placement, sanitize):
+    """The per-layer context write the fused one replaced.
+
+    It runs F.linear over the KV rows, kv_a_layernorm, RoPE, then the latent
+    store.
+    """
+    from tokenspeed_kernel.ops.kvcache.triton import set_mla_kv_buffer_triton
+
+    from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
+
+    for layer, plane in zip(model.layers, planes, strict=True):
+        attn = layer.self_attn
+        rank = attn.kv_lora_rank
+        weight = attn.fused_qkv_a_proj_with_mqa.weight
+        latent = torch.nn.functional.linear(rows, weight[attn.q_lora_rank :])
+        latent = torch.cat(
+            (attn.kv_a_layernorm(latent[:, :rank].contiguous()), latent[:, rank:]),
+            dim=-1,
+        )
+        latent = attn.apply_latent_rope(positions, latent)
+        local, owned = resolve_cache_slots(slots, placement)
+        set_mla_kv_buffer_triton(
+            plane,
+            local,
+            latent[:, :rank].contiguous(),
+            latent[:, rank:].contiguous(),
+            sanitize=sanitize,
+            write_mask=owned,
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA kernels")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("sanitize", [False, True])
+@pytest.mark.parametrize("rows", [1, 8, 40])
+def test_the_one_launch_context_write_stores_the_per_layer_chains_bytes(
+    dtype, sanitize, rows
+):
+    from tokenspeed.runtime.distributed.mapping import Mapping
+
+    model = _tiny_draft(Mapping(rank=0, world_size=1))
+    generator = torch.Generator(device="cuda").manual_seed(rows)
+    hidden = (torch.randn(rows, 256, device="cuda", generator=generator)).bfloat16()
+    positions = torch.randint(4096, (rows,), device="cuda", generator=generator)
+    slots = torch.randperm(127, device="cuda", generator=generator)[:rows] + 1
+
+    def planes():
+        return [
+            torch.full((128, 1, 576), 3.0, device="cuda").to(dtype)
+            for _ in model.layers
+        ]
+
+    expected, actual = planes(), planes()
+    _chain_write(model, hidden, positions, slots, expected, None, sanitize)
+    backend = SimpleNamespace(cache_placement=lambda layer: None)
+    model.write_context_kv(
+        hidden, positions, slots, _LatentPool(actual, sanitize), attn_backend=backend
+    )
+    for got, want in zip(actual, expected, strict=True):
+        assert torch.equal(got.view(torch.uint8), want.view(torch.uint8))
+        assert not torch.equal(got.float(), torch.full_like(got.float(), 3.0))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA kernels")
 def test_context_kv_write_respects_dcp_ownership():
+    """Under KV parallelism each rank stores only the rows it owns.
+
+    A rank writes the rows whose pages it owns, at its local slots; padding
+    rows (slot -1) are stored nowhere.
+    """
+    from tokenspeed.runtime.distributed.mapping import Mapping
     from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
 
-    slots = torch.tensor([0, 128, 129, 256, 384, 512, 896, 1024, -1])
-    latent = torch.arange(slots.numel() * 6).reshape(-1, 6).float()
-    attn = SimpleNamespace(
-        attn_mqa=object(),
-        kv_lora_rank=4,
-        project_latent_kv=lambda hidden: hidden,
-        apply_latent_rope=lambda positions, hidden: hidden,
-    )
-    model = SimpleNamespace(layers=[SimpleNamespace(self_attn=attn)])
-    owner_counts = torch.zeros_like(slots)
+    model = _tiny_draft(Mapping(rank=0, world_size=1))
+    slots = torch.tensor([0, 128, 129, 256, 384, 512, 896, 1024, -1], device="cuda")
+    hidden = torch.randn(slots.numel(), 256, device="cuda").bfloat16()
+    positions = torch.arange(slots.numel(), device="cuda")
+    owned_rows = 0
     for rank in range(4):
-
-        def write(layer, local, key, rope, *, write_mask):
-            expected = (
-                (slots >= 128) & (slots < 1024) & (((slots // 128 - 1) % 4) == rank)
-            )
-            torch.testing.assert_close(write_mask, expected)
-            expected_local = ((slots // 128 - 1) // 4 + 1) * 128 + slots % 128
-            torch.testing.assert_close(local[expected], expected_local[expected])
-            torch.testing.assert_close(torch.cat((key, rope), dim=-1), latent)
-            owner_counts.add_(write_mask)
-
-        backend = SimpleNamespace(
-            cache_placement=lambda layer: CachePlacement(128, 8, (0, 1, 2, 3), rank)
-        )
-        K3DSparkModel.write_context_kv(
-            model,
-            latent,
-            torch.arange(slots.numel()),
+        placement = CachePlacement(128, 8, (0, 1, 2, 3), rank)
+        expected = [
+            torch.zeros((512, 1, 576), device="cuda").bfloat16() for _ in range(2)
+        ]
+        actual = [torch.zeros_like(plane) for plane in expected]
+        _chain_write(model, hidden, positions, slots, expected, placement, True)
+        model.write_context_kv(
+            hidden,
+            positions,
             slots,
-            SimpleNamespace(set_mla_kv_buffer=write),
-            attn_backend=backend,
+            _LatentPool(actual, True),
+            attn_backend=SimpleNamespace(cache_placement=lambda layer: placement),
         )
-    torch.testing.assert_close(owner_counts, ((slots >= 128) & (slots < 1024)).long())
+        for got, want in zip(actual, expected, strict=True):
+            assert torch.equal(got.view(torch.int16), want.view(torch.int16))
+        owned_rows += int(actual[0].abs().sum(dim=(1, 2)).gt(0).sum())
+    # Rows 128..896 are owned by exactly one rank each; 0, 1024 and -1 by none.
+    assert owned_rows == 6

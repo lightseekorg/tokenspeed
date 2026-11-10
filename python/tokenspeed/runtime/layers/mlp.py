@@ -86,11 +86,11 @@ def _supports(
     raise ValueError(f"Not a fused gated MLP kernel: {fusion}")
 
 
-def gated_activation(hidden_act: str) -> nn.Module:
-    """The gated activation for a checkpoint's ``hidden_act``."""
+def gated_activation(hidden_act: str, swiglu_limit: float | None) -> nn.Module:
+    """The gated activation for a checkpoint's ``hidden_act`` and SwiGLU clamp."""
     if hidden_act != "silu":
         raise ValueError(f"Unsupported gated MLP activation: {hidden_act}")
-    return SiluAndMul()
+    return SiluAndMul(swiglu_limit)
 
 
 class GatedMLP(nn.Module):

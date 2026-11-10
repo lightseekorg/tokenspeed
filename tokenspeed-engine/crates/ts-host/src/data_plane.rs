@@ -117,6 +117,11 @@ enum Op {
         payload: Bytes,
         reply: mpsc::SyncSender<Result<(bool, String), String>>,
     },
+    /// A forward reload, as its msgpack control struct.
+    ReloadForward {
+        payload: Bytes,
+        reply: mpsc::SyncSender<Result<(bool, String), String>>,
+    },
     ReleaseMemory {
         tags: Vec<String>,
         reply: mpsc::SyncSender<Result<(), String>>,
@@ -463,6 +468,11 @@ impl DataPlane for PythonDataPlane {
         self.ask(|reply| Op::Profile { payload, reply })
     }
 
+    fn reload_forward(&mut self, op: &ControlRequest) -> Result<(bool, String), DataPlaneError> {
+        let payload = control_payload(op)?;
+        self.ask(|reply| Op::ReloadForward { payload, reply })
+    }
+
     fn release_memory(&mut self, tags: &[String]) -> Result<(), DataPlaneError> {
         let tags = tags.to_vec();
         self.ask(|reply| Op::ReleaseMemory { tags, reply })
@@ -599,7 +609,8 @@ fn forward_loop(
                 }
                 Op::CheckWeightUpdate { reply, .. }
                 | Op::UpdateWeights { reply, .. }
-                | Op::Profile { reply, .. } => {
+                | Op::Profile { reply, .. }
+                | Op::ReloadForward { reply, .. } => {
                     let _ = reply.send(Err(failure));
                 }
                 Op::SnapshotExpertLoad { reply } => {
@@ -772,6 +783,13 @@ fn run(
         Op::Profile { payload, reply } => {
             let done = plane
                 .call_method1("profile", (PyBytes::new(py, &payload),))
+                .and_then(|result| result.extract())
+                .map_err(python);
+            answer(reply, done)?;
+        }
+        Op::ReloadForward { payload, reply } => {
+            let done = plane
+                .call_method1("reload_forward", (PyBytes::new(py, &payload),))
                 .and_then(|result| result.extract())
                 .map_err(python);
             answer(reply, done)?;
@@ -1091,7 +1109,7 @@ result = (Plane(), ts.Scheduler(cfg))
         };
         let mut data_plane = start(&plane);
         let forward = data_plane
-            .execute(scheduler.next_execution_plan(), &dispatch)
+            .execute(scheduler.next_execution_plan(true, false), &dispatch)
             .unwrap()
             .unwrap();
         let result = data_plane.complete(forward).unwrap();
@@ -1109,7 +1127,7 @@ result = (Plane(), ts.Scheduler(cfg))
         };
         let mut data_plane = start(&plane);
         let forward = data_plane
-            .execute(scheduler.next_execution_plan(), &dispatch)
+            .execute(scheduler.next_execution_plan(true, false), &dispatch)
             .unwrap()
             .unwrap();
         assert_eq!(data_plane.complete(forward).unwrap().output_tokens, [100]);
@@ -1162,12 +1180,12 @@ result = (Plane(), ts.Scheduler(cfg))
         set(&plane, "held", 101);
         let mut data_plane = start(&plane);
         let first = data_plane
-            .execute(scheduler.next_execution_plan(), &dispatch)
+            .execute(scheduler.next_execution_plan(true, false), &dispatch)
             .unwrap()
             .unwrap();
         // The forward thread will sit in this launch until released.
         let second = data_plane
-            .execute(scheduler.next_execution_plan(), &dispatch)
+            .execute(scheduler.next_execution_plan(true, false), &dispatch)
             .unwrap()
             .unwrap();
         // A commit queued behind it would wait forever; release the held
@@ -1199,7 +1217,7 @@ result = (Plane(), ts.Scheduler(cfg))
         Python::attach(|py| plane.setattr(py, "failing", true).unwrap());
         let mut data_plane = start(&plane);
         let forward = data_plane
-            .execute(scheduler.next_execution_plan(), &dispatch)
+            .execute(scheduler.next_execution_plan(true, false), &dispatch)
             .unwrap()
             .unwrap();
         let error = data_plane.complete(forward).unwrap_err();

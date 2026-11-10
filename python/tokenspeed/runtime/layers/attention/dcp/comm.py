@@ -32,10 +32,25 @@ from tokenspeed_kernel.ops.attention.dsv4._triton.dcp import (
 
 from tokenspeed.runtime.distributed.comm_ops import (
     all_gather,
+    all_gather_single,
     all_reduce,
     all_to_all_single,
     reduce_scatter,
 )
+
+
+def _query_payload(query: torch.Tensor) -> torch.Tensor:
+    """``[tokens, heads, dim]`` as contiguous ``[tokens, heads * dim]`` rows.
+
+    NCCL wrappers need not expose FP8 dtypes for a byte-preserving gather, so
+    FP8 is reinterpreted as bytes rather than cast: quantized values must
+    retain their bits.
+    """
+    tokens, heads, dim = query.shape
+    payload = query.reshape(tokens, heads * dim).contiguous()
+    if query.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        payload = payload.view(torch.uint8)
+    return payload
 
 
 def gather_query_heads(query: torch.Tensor, group: tuple[int, ...]) -> torch.Tensor:
@@ -48,13 +63,114 @@ def gather_query_heads(query: torch.Tensor, group: tuple[int, ...]) -> torch.Ten
     # symmetric buffer is sized for the prefill token budget although decode
     # only ever gathers max_decode_bs * spec_tokens rows; a per-collective
     # capacity needs the symmetric buffers managed in one place first.
-    payload = query.reshape(tokens, heads * dim).contiguous()
-    # NCCL wrappers need not expose FP8 dtypes for a byte-preserving gather.
-    # Reinterpret rather than cast: quantized values must retain their bits.
-    if query.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-        payload = payload.view(torch.uint8)
-    gathered = all_gather(payload, group, dim=-1).view(query.dtype)
+    gathered = all_gather(_query_payload(query), group, dim=-1).view(query.dtype)
     return gathered.reshape(tokens, heads * len(group), dim)
+
+
+def gather_query_heads_rank_major(
+    query: torch.Tensor, group: tuple[int, ...]
+) -> torch.Tensor:
+    """Gather the group's TP query heads rank-major, as the collective lands them.
+
+    :func:`gather_query_heads` returns gathered head ``r * heads + h`` of a
+    token at ``[token, r * heads + h]``, which costs a relayout copy of the
+    gathered rows; here it stays at ``[r, token, h]``, for a core that reads
+    that layout (``dsa_prefill_dcp_records``).
+
+    Args:
+        query: This rank's ``[tokens, heads, dim]`` TP heads.
+        group: The KVP subgroup gathering them; every rank holds the same
+            tokens.
+
+    Returns:
+        ``[len(group), tokens, heads, dim]`` in ``query``'s dtype, a view of
+        the gathered buffer (no copy).
+    """
+    tokens, heads, dim = query.shape
+    if len(group) == 1:
+        return query.unsqueeze(0)
+    payload = _query_payload(query)
+    gathered = payload.new_empty((len(group) * tokens, heads * dim))
+    all_gather_single(gathered, payload, group)
+    return gathered.view(query.dtype).view(len(group), tokens, heads, dim)
+
+
+def gather_query_heads_padded(
+    query: torch.Tensor, group: tuple[int, ...], padded_heads: int
+) -> torch.Tensor:
+    """Gather the group's TP query heads token-major into a zero-padded query.
+
+    A core that runs only some head counts (trtllm-gen sparse MLA: 64 or 128)
+    pads :func:`gather_query_heads`' result with a second copy of every row;
+    here the rank-major gather lands in the leading heads with one copy and
+    only the padding heads are zeroed.
+
+    Args:
+        query: This rank's ``[tokens, heads, dim]`` TP heads.
+        group: The KVP subgroup gathering them; every rank holds the same
+            tokens.
+        padded_heads: The core's head count, at least the gathered heads.
+
+    Returns:
+        ``[tokens, padded_heads, dim]`` in ``query``'s dtype: gathered head
+        ``r * heads + h`` at ``[token, r * heads + h]`` as
+        :func:`gather_query_heads` places it, zeros after.
+    """
+    tokens, heads, dim = query.shape
+    total = heads * len(group)
+    if padded_heads < total:
+        raise ValueError("padded query heads must hold every gathered head")
+    padded = query.new_empty((tokens, padded_heads, dim))
+    gathered = gather_query_heads_rank_major(query, group)
+    rows = padded.view(torch.uint8).view(tokens, padded_heads * dim * query.itemsize)
+    src = gathered.view(torch.uint8).view(len(group), tokens, -1)
+    width = src.shape[-1]
+    if width % 8 == 0 and rows.shape[-1] % 8 == 0:
+        # Copy whole 8-byte words: a strided byte copy of an FP8 query is far slower.
+        rows, src, width = rows.view(torch.int64), src.view(torch.int64), width // 8
+    rows[:, len(group) * width :].zero_()
+    rows[:, : len(group) * width].view(tokens, len(group), width).copy_(
+        src.transpose(0, 1)
+    )
+    return padded
+
+
+def combine_attention_records(
+    records: torch.Tensor,
+    *,
+    group: tuple[int, ...],
+    head_dim: int,
+    partial_dtype: torch.dtype,
+    output_dtype: torch.dtype,
+    sink: torch.Tensor | None,
+) -> torch.Tensor:
+    """Send packed partial records to their head owners and combine them there.
+
+    The head-sharded exchange of :func:`combine_attention_partials`, from
+    records already packed (``dispatch_dcp_attention_partials``, or a core
+    writing that layout, ``dsa_prefill_dcp_records``).
+
+    Args:
+        records: Contiguous int32 ``[len(group), tokens, local_heads, words + 1]``:
+            row ``r`` goes to group rank ``r``.
+        group: The KVP subgroup exchanging them.
+        head_dim: Unpadded partial head dimension.
+        partial_dtype: The dtype the records pack (FP16, BF16 or FP32).
+        output_dtype: Desired output dtype; weighting and summation use FP32.
+        sink: Required keyword: TP-local sink logits, or explicitly None.
+
+    Returns:
+        Contiguous ``[tokens, local_heads, head_dim]`` of this rank's heads.
+    """
+    received = torch.empty_like(records)
+    all_to_all_single(received.flatten(), records.flatten(), group)
+    return combine_dcp_attention_partials(
+        received,
+        head_dim=head_dim,
+        partial_dtype=partial_dtype,
+        output_dtype=output_dtype,
+        sink=sink,
+    )
 
 
 def combine_attention_partials(
@@ -111,10 +227,9 @@ def combine_attention_partials(
         packed = dispatch_dcp_attention_partials(
             local_output, local_lse.float(), degree=degree
         )
-        received = torch.empty_like(packed)
-        all_to_all_single(received.flatten(), packed.flatten(), group)
-        return combine_dcp_attention_partials(
-            received,
+        return combine_attention_records(
+            packed,
+            group=group,
             head_dim=local_output.shape[-1],
             partial_dtype=local_output.dtype,
             output_dtype=local_output.dtype,

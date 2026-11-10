@@ -2,13 +2,10 @@
 # Run the test suite as several concurrent rocJITsu workers on one runner.
 #
 # A single emulator saturates about two cores, so running the suite serially
-# leaves most of a 32-core runner idle. Six pytest-xdist workers under one
-# shared daemon are no faster than serial, because the daemon serialises their
-# kernels; on one directory that measured 207s against 80s. Pointing xdist's
-# --tx gateway at a wrapper that starts its own daemon gives each worker a
-# private emulator, which recovers the speed (83s on the same directory) while
-# leaving the scheduling to xdist, so no per-file cost table has to be kept in
-# step with the tests as they are added and removed.
+# leaves most of a 32-core runner idle. Start pytest under mirage's in-process
+# mode: every xdist process inherits the emulator environment and initializes a
+# private emulator without nesting rocJITsu daemons. This leaves scheduling to
+# xdist, so no per-file cost table has to be kept in step with the tests.
 set -uo pipefail
 
 if [ "$#" -eq 0 ]; then
@@ -80,15 +77,11 @@ report_log="${log_dir}/reports.jsonl"
 # One cache for all workers: a kernel compiled while one file runs is then
 # reused when a later file lands on a different worker.
 export TRITON_CACHE_DIR="${log_dir}/triton-cache"
-# The wrapper has to launch the controller's interpreter, not whichever
-# python3 the emulator's environment puts first on PATH.
-MI450_SIM_WORKER_PYTHON="$(python3 -c 'import sys; print(sys.executable)')"
-export MI450_SIM_WORKER_PYTHON
 
 # rocJITsu warns once per unsupported hardware register access, and kernels that
 # poll one produce millions of identical lines: a single run reached 18 GB of log
 # in ten minutes. Keep a few examples of each warning and tally the rest. The
-# daemons share this stream, so a warning can land mid-line on top of a test
+# workers share this stream, so a warning can land mid-line on top of a test
 # result; dropping such a line is safe because the digest, not the console, is
 # what reports results.
 collapse_emulator_warnings() {
@@ -111,7 +104,7 @@ timeout -k 30 "${run_timeout}" \
     bash "${here}/run_mi450_rocjitsu.sh" python3 -m pytest \
     -p no:cacheprovider \
     --dist loadfile \
-    --tx "${workers}*popen//python=${here}/mi450_rocjitsu_worker_python.sh" \
+    -n "${workers}" \
     --report-log="${report_log}" \
     "${test_root}" "$@" 2>&1 | collapse_emulator_warnings
 status="${PIPESTATUS[0]}"

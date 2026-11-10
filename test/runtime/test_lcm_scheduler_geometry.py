@@ -32,6 +32,37 @@ def test_lcm_scheduler_geometry_counts_parents_not_child_pages():
     assert geometry.token_capacity == 37 * 8 * 128
 
 
+@pytest.mark.parametrize("capacity", [37 * 8 * 128, 10_000])
+def test_packed_pool_reports_effective_capacity_in_token_gauges(capacity):
+    from prometheus_client import CollectorRegistry
+
+    from tokenspeed.runtime.metrics.collector import EngineMetrics
+
+    geometry = scheduler_cache_geometry_from_pool(
+        _pool(num_lcm_blocks=37, prefix_granularity=128, token_capacity=capacity)
+    )
+    registry = CollectorRegistry()
+    labels = {"model_name": "packed", "app_key": "", "dp_rank": "0"}
+    metrics = EngineMetrics(
+        labels, enabled=True, reporters=["prometheus"], registry=registry
+    )
+    for used, active in [(0, 0), (17, 11), (37, 37)]:
+        metrics.record_cache_occupancy(
+            used_pages=used,
+            active_pages=active,
+            total_pages=geometry.num_usable_pages,
+            token_capacity=geometry.token_capacity,
+        )
+        assert (
+            registry.get_sample_value("tokenspeed:num_used_tokens", labels)
+            == used * capacity // 37
+        )
+        assert (
+            registry.get_sample_value("tokenspeed:num_free_tokens", labels)
+            == (37 - active) * capacity // 37
+        )
+
+
 def test_lcm_scheduler_geometry_uses_contract_token_capacity():
     # Capacity comes from the contract, never re-derived from parents times a
     # packing guess.

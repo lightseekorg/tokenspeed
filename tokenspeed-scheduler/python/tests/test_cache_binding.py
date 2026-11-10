@@ -352,6 +352,7 @@ def test_host_cache_stats_count_publication_and_finish_stores():
         == fresh.eviction_stores.recopied
         == fresh.eviction_stores.cancelled
         == fresh.dead_entries_not_written_back
+        == fresh.demoted_entries_not_written_back
         == 0
     )
     assert (

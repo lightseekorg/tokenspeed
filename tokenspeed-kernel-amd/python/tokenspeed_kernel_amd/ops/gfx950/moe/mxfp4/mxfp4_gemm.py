@@ -52,6 +52,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
+from tokenspeed_kernel_amd._extern import extern_compile_options, wait_vmem
 from tokenspeed_kernel_amd._triton import cdna4_async_copy, gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.moe_sorting import gluon_moe_sorting
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.n16_weights import (
@@ -214,14 +215,7 @@ def _sort_routes_one_program(
         )
     # The padding and the cursors must be in place before any wave claims a
     # slot: every wave drains its stores, then all meet.
-    gl.inline_asm_elementwise(
-        asm="s_waitcnt vmcnt(0)",
-        constraints="=v,0",
-        args=[route],
-        dtype=gl.int32,
-        is_pure=False,
-        pack=1,
-    )
+    wait_vmem()
     gl.barrier()
     slot = gl.atomic_add(
         cursor_ptr + expert_id,
@@ -874,6 +868,7 @@ def launch_gluon_mxfp4_a4w4_moe_apply_gfx950(
             cfg.block_m,
             use_minimum_route_chunks=False,
             runtime_rows=False,
+            deterministic_order=False,
             out=out,
         )
         padded_rows = int(sorted_ids.shape[0])
@@ -904,6 +899,7 @@ def launch_gluon_mxfp4_a4w4_moe_apply_gfx950(
         ),
         EXPERT_PAD=triton.next_power_of_2(num_experts + 1),
         num_warps=4,
+        **extern_compile_options(),
     )
 
     iq = torch.empty((padded_rows, inter // 2), dtype=torch.uint8, device=device)

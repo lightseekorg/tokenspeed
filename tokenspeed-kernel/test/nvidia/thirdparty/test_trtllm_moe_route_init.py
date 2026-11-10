@@ -26,12 +26,15 @@ import inspect
 import pytest
 import torch
 from tokenspeed_kernel.thirdparty.flashinfer.trtllm_moe import (
+    _CLUSTER_POLICY_TAG,
     _clone,
+    _cluster_persistent_configs,
     _entrypoints,
     _prefer_qwen38_decode_tile_32,
     _register_private,
     _require_runner_rebinding,
     _require_tactic_hooks,
+    _without_cluster_persistent,
 )
 
 _CLONE_VALUE = object()
@@ -86,6 +89,10 @@ def _moe_runner_and_inputs(num_tokens, hidden_size, weight_dtype):
         def trtllm_get_valid_moe_configs(self, *query_key):
             return tactics
 
+        def trtllm_get_valid_moe_factorizations(self, *query_key):
+            # No batched-GEMM config has index -1, so the cluster filter keeps all.
+            return [[int(t[0]), int(t[1]), -1, -1, 1] for t in tactics]
+
     runner = _entrypoints()["TrtllmMoERunner"](
         MoeOp(),
         top_k=10,
@@ -134,12 +141,89 @@ def test_tactic_cache_key_changes_only_for_target_shape(
         autotuner.TuningConfig(),
         upstream_extras,
     )
+    policy = (*upstream_extras, _CLUSTER_POLICY_TAG)
     if targeted:
-        assert key.extras == (*upstream_extras, "tokenspeed-qwen38-tile32-v1")
-        assert runner.get_valid_tactics(inputs, None) == [tactics[1]]
+        assert key.extras == (*policy, "tokenspeed-qwen38-tile32-v1")
     else:
-        assert key.extras == upstream_extras
-        assert runner.get_valid_tactics(inputs, None) is tactics
+        assert key.extras == policy
+
+
+def _is_blackwell():
+    from tokenspeed_kernel.platform import current_platform
+
+    platform = current_platform()
+    return platform.is_nvidia and platform.arch_version.major == 10
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not _is_blackwell(),
+    reason="the cluster filter reads the Blackwell TRT-LLM MoE module's kernel list",
+)
+@pytest.mark.parametrize(
+    ("num_tokens", "hidden_size", "targeted"),
+    [(4, 2560, True), (33, 2560, False), (4, 4096, False)],
+)
+def test_valid_tactics_apply_the_target_policy(num_tokens, hidden_size, targeted):
+    _, runner, inputs, tactics, _ = _moe_runner_and_inputs(
+        num_tokens, hidden_size, "E2m1"
+    )
+    expected = [tactics[1]] if targeted else tactics
+    assert runner.get_valid_tactics(inputs, None) == expected
+
+
+def _metainfo(*entries, length=None):
+    body = "".join(
+        '{nullptr, 0, 1, "bmm", 512, "hash", 0\n'
+        f", /* mClusterDimX */ {x}\n, /* mClusterDimY */ {y}\n"
+        f", /* mClusterDimZ */ {z}\n, /* mFallbackClusterDimX */ 1\n"
+        f", /* mTileScheduler */ gemm::TileScheduler({scheduler})\n"
+        " }, gemm::SmVersion::Sm100f},\n"
+        for x, y, z, scheduler in entries
+    )
+    count = len(entries) if length is None else length
+    return (
+        f"static constexpr size_t tllmGenBatchedGemmListLen = {count};\n"
+        "static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {\n"
+        f"{body}}};\n"
+    )
+
+
+def test_cluster_persistent_configs_need_a_cluster_and_the_dynamic_scheduler():
+    header = _metainfo(
+        (1, 1, 1, 1),  # one CTA, dynamic persistent
+        (2, 1, 1, 0),  # 2-CTA cluster, static
+        (2, 1, 1, 1),  # 2-CTA cluster, dynamic persistent
+        (1, 1, 4, 1),  # cluster along z, dynamic persistent
+    )
+    assert _cluster_persistent_configs(header) == {2, 3}
+    with pytest.raises(RuntimeError, match="list"):
+        _cluster_persistent_configs(_metainfo((2, 1, 1, 1), length=2))
+    with pytest.raises(RuntimeError, match="entry"):
+        _cluster_persistent_configs(
+            _metainfo((2, 1, 1, 1)).replace("mTileScheduler", "mOther")
+        )
+
+
+def test_cluster_filter_drops_tactics_with_either_gemm_in_the_set():
+    da_tuner = pytest.importorskip("flashinfer.fused_moe.da_tuner")
+    tvm_ffi = pytest.importorskip("tvm_ffi")
+
+    def tactic(tile, config, fc1, fc2):
+        return da_tuner.FactorizedTactic((tile, config), tile, fc1, fc2)
+
+    space = da_tuner.FactorizedTacticSpace(
+        [
+            tactic(8, 0, 10, 20),
+            tactic(8, 1, 11, 20),
+            tactic(8, 2, 10, 21),
+            tactic(32, 3, 12, 22),
+        ],
+        {8: (8, 0), 32: (32, 3)},
+    )
+    tactics = [tvm_ffi.Array([8, 0]), tvm_ffi.Array([8, 1]), tvm_ffi.Array([8, 2])]
+    kept = _without_cluster_persistent(tactics, space, frozenset({11, 21}))
+    assert kept == [tactics[0]]
+    assert _without_cluster_persistent(tactics, space, frozenset()) == tactics
 
 
 @pytest.mark.parametrize(
@@ -275,10 +359,9 @@ def test_upstream_dispatch_and_caches_are_unchanged():
         assert inspect.signature(private[name]) == inspect.signature(
             getattr(core, name)
         )
-    factory = private.get("_get_trtllm_moe_sm100_module_impl")
-    if factory is not None:
-        assert isinstance(factory, functools._lru_cache_wrapper)
-        assert factory is not core._get_trtllm_moe_sm100_module_impl
+    factory = private["_get_trtllm_moe_sm100_module_impl"]
+    assert isinstance(factory, functools._lru_cache_wrapper)
+    assert factory is not core._get_trtllm_moe_sm100_module_impl
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

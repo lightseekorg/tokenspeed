@@ -30,6 +30,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "python"))
 
+from kernel_test_selection import selection_from_env
 from tokenspeed_kernel.platform import (
     ArchVersion,
     InterconnectInfo,
@@ -42,6 +43,46 @@ from tokenspeed_kernel.selection import (
     _oracles,
 )
 from utils import make_sample_specs
+
+# On pull requests CI lists the changed paths; run only the test files they name.
+_SELECTION = selection_from_env(Path(__file__).resolve().parents[2])
+# Whether the selection deselected every collected test of this run.
+_SELECTION_EMPTIED_RUN = pytest.StashKey[bool]()
+
+
+def pytest_report_header(config: pytest.Config) -> str | None:
+    if _SELECTION is None:
+        return None
+    if _SELECTION.run_all:
+        return "kernel test selection: every test (a change names no family)"
+    families = ", ".join(sorted(_SELECTION.families)) or "none"
+    return f"kernel test selection: families {families}"
+
+
+def pytest_collection_modifyitems(
+    config: pytest.Config, items: list[pytest.Item]
+) -> None:
+    if _SELECTION is None:
+        return
+    selected = {}
+    kept, deselected = [], []
+    for item in items:
+        if item.path not in selected:
+            selected[item.path] = _SELECTION.selects(item.path)
+        (kept if selected[item.path] else deselected).append(item)
+    config.stash[_SELECTION_EMPTIED_RUN] = bool(deselected) and not kept
+    if deselected:
+        config.hook.pytest_deselected(items=deselected)
+        items[:] = kept
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    # A change that names none of this run's test files leaves nothing to run;
+    # a run that collected nothing by itself still fails.
+    if exitstatus == pytest.ExitCode.NO_TESTS_COLLECTED and session.config.stash.get(
+        _SELECTION_EMPTIED_RUN, False
+    ):
+        session.exitstatus = pytest.ExitCode.OK
 
 
 @pytest.fixture

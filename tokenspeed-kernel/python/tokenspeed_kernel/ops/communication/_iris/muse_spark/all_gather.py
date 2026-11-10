@@ -22,10 +22,20 @@
 """Pack and gather Muse's 4096-feature, eight-route expert inputs."""
 
 from tokenspeed_kernel._triton import gl, gluon
+from tokenspeed_kernel.ops.communication._iris.all_gather import (
+    iris_fused_lamport_allgather_rmsnorm_mxfp4,
+)
 from tokenspeed_kernel.ops.communication._iris.all_reduce import (
     _iris_peer_pointers,
     _iris_rendezvous,
 )
+from tokenspeed_kernel.platform import current_platform
+
+if current_platform().is_cdna4:
+    # Route programs run the gfx950 top-k kernel's per-token body.
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.routing import (
+        sigmoid_bias_topk_row_gfx950,
+    )
 
 
 @gluon.jit
@@ -134,7 +144,7 @@ def iris_pull_allgather_moe_inputs(
         )
         + 1
     )
-    WAIT_VMEM(args=[], constraints="=r,~{memory}")
+    WAIT_VMEM()
     gl.barrier()
     _iris_rendezvous(ready_flags, heaps, program, epoch, RANK, NUM_WARPS, False)
     local_rows = gl.cdiv(rows, WORLD_SIZE)
@@ -174,7 +184,7 @@ def iris_pull_allgather_moe_inputs(
                 row * 32 + route_byte - 32,
                 valid & (route_byte >= 32) & (route_byte < 64),
             )
-    WAIT_VMEM(args=[], constraints="=r,~{memory}")
+    WAIT_VMEM()
     gl.barrier()
     _iris_rendezvous(
         ready_flags + FLAG_ROWS * WORLD_SIZE,
@@ -185,3 +195,56 @@ def iris_pull_allgather_moe_inputs(
         NUM_WARPS,
         False,
     )
+
+
+@gluon.jit(do_not_specialize=["rows"])
+def iris_fused_lamport_allgather_rmsnorm_mxfp4_topk(
+    local_input,
+    weight,
+    packed_output,
+    scale_output,
+    region,
+    epochs,
+    regions,
+    scale_stride_linear,
+    scale_stride_mblock,
+    logits,
+    bias,
+    topk_ids,
+    topk_weights,
+    rows,
+    rank: gl.constexpr,
+    local_width: gl.constexpr,
+    total_width: gl.constexpr,
+    eps: gl.constexpr,
+    weight_offset: gl.constexpr,
+    max_elements: gl.constexpr,
+    PEER_SIGNAL_STORE_CACHE: gl.constexpr,
+    WAIT_STORES: gl.constexpr,
+    EXPERTS: gl.constexpr,
+    TOPK: gl.constexpr,
+    ROUTED_SCALING_FACTOR: gl.constexpr,
+):
+    """Gather, normalize and quantize the expert inputs, and route the same rows.
+
+    Programs ``[0, rows)`` are ``iris_fused_lamport_allgather_rmsnorm_mxfp4``
+    for their row; programs ``[rows, 2 * rows)`` select row ``program - rows``'s
+    biased-sigmoid top-k from ``logits`` as the gfx950 top-k kernel does
+    (normalized weights scaled by ``ROUTED_SCALING_FACTOR``). The two halves
+    share nothing, so routing costs no launch of its own. Single-subgroup
+    programs.
+    """
+    program = gl.program_id(0)
+    if program < rows:
+        iris_fused_lamport_allgather_rmsnorm_mxfp4(
+            local_input, weight, packed_output, scale_output, region, epochs,
+            regions, rank, local_width, total_width, eps, weight_offset,
+            scale_stride_linear, scale_stride_mblock, max_elements,
+            PEER_SIGNAL_STORE_CACHE, WAIT_STORES
+        )  # fmt: skip
+    else:
+        sigmoid_bias_topk_row_gfx950(
+            program - rows, logits, bias, topk_ids, topk_weights, EXPERTS, 1, 1,
+            TOPK, 1, TOPK, 1, EXPERTS, TOPK, EXPERTS, TOPK, True,
+            ROUTED_SCALING_FACTOR, gl.float32, 1
+        )  # fmt: skip

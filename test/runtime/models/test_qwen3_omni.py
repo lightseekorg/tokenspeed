@@ -282,7 +282,6 @@ class _IdentityDecoderLayer(nn.Module):
         hidden_states,
         ctx,
         residual,
-        cos_sin=None,
     ):
         # The layer contributes nothing; the residual stream carries its input.
         stream = hidden_states if residual is None else hidden_states + residual

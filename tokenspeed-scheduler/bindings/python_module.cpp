@@ -29,7 +29,9 @@
 #include <nanobind/stl/variant.h>
 #include <nanobind/stl/vector.h>
 
+#include <cstdint>
 #include <stdexcept>
+#include <vector>
 
 #include "scheduler/outside_events/inc.h"
 #include "scheduler/operations/inc.h"
@@ -56,6 +58,18 @@ not need writable properties.
 namespace nb = nanobind;
 
 namespace {
+
+const std::int32_t* Int32ViewData(const std::vector<std::int32_t>& values) {
+    // NumPy treats a null data pointer as a request for writable storage,
+    // even for an empty array. A non-null sentinel preserves read-only views.
+    static constexpr std::int32_t empty = 0;
+    return values.empty() ? &empty : values.data();
+}
+
+nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<1>> ReadonlyTokenView(const std::vector<std::int32_t>& tokens,
+                                                                          nb::handle owner) {
+    return {Int32ViewData(tokens), {tokens.size()}, owner};
+}
 
 template <typename Op, typename Cls>
 void BindForwardCommonFields(Cls& cls) {
@@ -144,6 +158,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
     scheduler_config.def(nb::init<>())
         .def_rw("prefix_granularity", &tokenspeed::SchedulerConfig::prefix_granularity)
         .def_rw("max_scheduled_tokens", &tokenspeed::SchedulerConfig::max_scheduled_tokens)
+        .def_rw("enable_short_prefill_first", &tokenspeed::SchedulerConfig::enable_short_prefill_first)
         .def_rw("max_kv_page_num", &tokenspeed::SchedulerConfig::max_kv_page_num)
         .def_rw("max_batch_size", &tokenspeed::SchedulerConfig::max_batch_size)
         .def_rw("decode_input_tokens", &tokenspeed::SchedulerConfig::decode_input_tokens)
@@ -169,11 +184,19 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("enable_l3_storage", &tokenspeed::SchedulerConfig::enable_l3_storage)
         .def_rw("enable_kv_cache_events", &tokenspeed::SchedulerConfig::enable_kv_cache_events)
         .def_rw("enable_mixed_prefill_decode", &tokenspeed::SchedulerConfig::enable_mixed_prefill_decode)
+        .def_rw("prefill_decode_interval", &tokenspeed::SchedulerConfig::prefill_decode_interval)
         .def_rw("disable_prefix_cache", &tokenspeed::SchedulerConfig::disable_prefix_cache)
         .def_rw("prefix_replay_tokens", &tokenspeed::SchedulerConfig::prefix_replay_tokens)
         .def_rw("state_checkpoint_in_forward", &tokenspeed::SchedulerConfig::state_checkpoint_in_forward)
+        .def_rw("drop_short_prompt_end_checkpoints", &tokenspeed::SchedulerConfig::drop_short_prompt_end_checkpoints)
+        .def_rw("demote_superseded_state_checkpoints",
+                &tokenspeed::SchedulerConfig::demote_superseded_state_checkpoints)
         .def_rw("checkpoint_retention_requests", &tokenspeed::SchedulerConfig::checkpoint_retention_requests)
-        .def_rw("checkpoint_retention_leaf_distance", &tokenspeed::SchedulerConfig::checkpoint_retention_leaf_distance);
+        .def_rw("checkpoint_retention_leaf_distance", &tokenspeed::SchedulerConfig::checkpoint_retention_leaf_distance)
+        // P role: the most tokens a prefill chunk that cannot finish gives up
+        // for whole prompts behind it; 0 is off, at most half of
+        // max_scheduled_tokens.
+        .def_rw("prefill_chunk_yield_tokens", &tokenspeed::SchedulerConfig::prefill_chunk_yield_tokens);
 
     // The config-only sizing model. Python builds it from a SchedulerConfig
     // whose page counts are still zero, sizes the pool from its answers, and
@@ -325,6 +348,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("host_evictions", &tokenspeed::HostCacheStats::host_evictions)
         .def_ro("store_candidates_dropped_by_flush", &tokenspeed::HostCacheStats::store_candidates_dropped_by_flush)
         .def_ro("dead_entries_not_written_back", &tokenspeed::HostCacheStats::dead_entries_not_written_back)
+        .def_ro("demoted_entries_not_written_back", &tokenspeed::HostCacheStats::demoted_entries_not_written_back)
         .def_ro("device_evictions", &tokenspeed::HostCacheStats::device_evictions)
         .def_ro("checkpoint_resume_gaps", &tokenspeed::HostCacheStats::checkpoint_resume_gaps);
 
@@ -417,6 +441,10 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def(nb::init<std::string>(), nb::arg("request_id"))
         .def_ro("request_id", &tokenspeed::pd::FailedEvent::request_id);
 
+    nb::class_<tokenspeed::pd::TransferStoppedEvent>(pd, "TransferStoppedEvent")
+        .def(nb::init<std::string>(), nb::arg("request_id"))
+        .def_ro("request_id", &tokenspeed::pd::TransferStoppedEvent::request_id);
+
     nb::class_<tokenspeed::pd::SucceededEvent>(pd, "SucceededEvent")
         .def(nb::init<std::string>(), nb::arg("request_id"))
         .def_ro("request_id", &tokenspeed::pd::SucceededEvent::request_id);
@@ -439,8 +467,19 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
 
     auto forward_batch = nb::class_<tokenspeed::ForwardBatch>(forward, "Batch");
     BindForwardCommonFields<tokenspeed::ForwardBatch>(forward_batch);
-    forward_batch.def_ro("input_ids", &tokenspeed::ForwardBatch::input_ids)
-        .def_ro("shifted_input_ids", &tokenspeed::ForwardBatch::shifted_input_ids)
+    // Token views avoid boxing every prefill token on each property read.
+    // As with block_tables_arrays, `self` keeps the backing batch alive.
+    forward_batch
+        .def_prop_ro("input_ids",
+                     [](nb::handle self) {
+                         auto& op = nb::cast<tokenspeed::ForwardBatch&>(self);
+                         return ReadonlyTokenView(op.input_ids, self);
+                     })
+        .def_prop_ro("shifted_input_ids",
+                     [](nb::handle self) {
+                         auto& op = nb::cast<tokenspeed::ForwardBatch&>(self);
+                         return ReadonlyTokenView(op.shifted_input_ids, self);
+                     })
         .def_ro("extend_prefix_lens", &tokenspeed::ForwardBatch::extend_prefix_lens)
         .def_ro("extend_replay_lens", &tokenspeed::ForwardBatch::extend_replay_lens)
         // Per extend row (the D role's remote admission only): every State
@@ -464,13 +503,39 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                  // ForwardBatch alive for the lifetime of each ndarray.
                  auto& op = nb::cast<tokenspeed::ForwardBatch&>(self);
                  nb::dict out;
-                 for (auto& [gid, buf] : op.block_tables_contig) {
-                     const std::size_t rows = op.request_ids.size();
-                     tokenspeed::FatalCheck(rows == 0 || buf.size() % rows == 0,
-                                            "block-table buffer must contain complete rows");
-                     const std::size_t columns = rows == 0 ? 0 : buf.size() / rows;
-                     out[nb::str(gid.c_str())] =
-                         nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<2>>(buf.data(), {rows, columns}, self);
+                 for (const auto& [gid, table] : op.block_tables) {
+                     const auto& buf = table.AbsoluteRows();
+                     out[nb::str(gid.c_str())] = nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<2>>(
+                         Int32ViewData(buf), {table.Rows(), table.Columns()}, self);
+                 }
+                 return out;
+             })
+        .def(
+            "block_table_windows",
+            [](nb::handle self) {
+                auto& op = nb::cast<tokenspeed::ForwardBatch&>(self);
+                nb::dict out;
+                for (const auto& [gid, table] : op.block_tables) {
+                    const auto& buf = table.WindowRows();
+                    out[nb::str(gid.c_str())] =
+                        nb::make_tuple(nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<2>>(
+                                           Int32ViewData(buf), {table.Rows(), table.WindowColumns()}, self),
+                                       table.Columns());
+                }
+                return out;
+            },
+            "Return read-only row windows and the absolute column count for each group. "
+            "Each window starts at max(pages - window_width, 0); the batch owns its data.")
+        .def("block_table_spans",
+             [](nb::handle self) {
+                 // Zero-copy [rows, 2] int32 (released, pages) views parallel
+                 // to block_tables_arrays; `self` keeps the batch alive too.
+                 auto& op = nb::cast<tokenspeed::ForwardBatch&>(self);
+                 nb::dict out;
+                 for (const auto& [gid, table] : op.block_tables) {
+                     const auto& buf = table.Spans();
+                     out[nb::str(gid.c_str())] = nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<2>>(
+                         Int32ViewData(buf), {table.Rows(), 2}, self);
                  }
                  return out;
              })
@@ -617,7 +682,14 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
              nb::overload_cast<const std::vector<tokenspeed::RequestSpec>&>(&tokenspeed::Scheduler::SubmitRequests),
              nb::arg("request_specs"))
         .def(
-            "next_execution_plan", [](tokenspeed::Scheduler& s) { return s.NextExecutionPlan(); },
+            "next_execution_plan",
+            [](tokenspeed::Scheduler& s) {
+                // Python deliberately fixes ordinary scheduling for this API.
+                // Only the Rust host drives the serving prefill gate, passing
+                // both options explicitly for each plan.
+                return s.NextExecutionPlan(
+                    tokenspeed::Scheduler::PlanOptions{.allow_prefill = true, .apply_prefill_watermark = false});
+            },
             nb::call_guard<nb::gil_scoped_release>())
         .def("advance", &tokenspeed::Scheduler::Advance, nb::arg("event"))
         .def("drain_kv_events",

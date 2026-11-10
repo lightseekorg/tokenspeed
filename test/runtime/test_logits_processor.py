@@ -67,6 +67,7 @@ def test_cpu_tp_logits_do_not_query_an_accelerator_capture(monkeypatch, do_argma
         tp_size=2,
         tp_group=(0, 1),
         do_argmax=do_argmax,
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
     hidden = torch.tensor([[1, 2], [-2, 1]], dtype=torch.bfloat16)
@@ -112,6 +113,7 @@ def test_dist_argmax_ineligibility_uses_the_device_collective(monkeypatch, tmp_p
             tp_rank=0,
             tp_size=2,
             tp_group=(0, 1),
+            attn_tp_size=1,
             dp_lm_head_tp=False,
         )
         head = ParallelLMHead(
@@ -151,7 +153,9 @@ def test_logits_processor_only_uses_fused_lm_head_for_kimi(monkeypatch):
     )
 
     non_kimi = LogitsProcessor(
-        config=SimpleNamespace(model_type="test", vocab_size=2), dp_lm_head_tp=False
+        config=SimpleNamespace(model_type="test", vocab_size=2),
+        attn_tp_size=1,
+        dp_lm_head_tp=False,
     )
     non_kimi(
         input_ids=None,
@@ -162,7 +166,9 @@ def test_logits_processor_only_uses_fused_lm_head_for_kimi(monkeypatch):
     assert calls["fused"] == 0
 
     kimi = LogitsProcessor(
-        config=SimpleNamespace(model_type="kimi_k2", vocab_size=2), dp_lm_head_tp=False
+        config=SimpleNamespace(model_type="kimi_k2", vocab_size=2),
+        attn_tp_size=1,
+        dp_lm_head_tp=False,
     )
     kimi(
         input_ids=None,
@@ -179,6 +185,7 @@ def test_tp_logits_all_gather_handles_zero_rows(monkeypatch):
         tp_rank=0,
         tp_size=2,
         tp_group=(0, 1),
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
     hidden_states = torch.empty((0, 2), dtype=torch.float32)
@@ -220,6 +227,7 @@ def test_tp_logits_gather_preserves_dtype(monkeypatch, nvidia_logits, dtype, cac
         tp_rank=0,
         tp_size=2,
         tp_group=(0, 1),
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
     state = object()
@@ -287,6 +295,7 @@ def test_tp_logits_collective_gather_lays_rank_shards_side_by_side(monkeypatch, 
         tp_rank=0,
         tp_size=tp,
         tp_group=(0, 1, 2),
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
     processor._all_gather_state = None  # no multicast gather: the collective path
@@ -344,6 +353,7 @@ def test_force_deterministic_rsag_disables_logits_symm_mem(
         tp_rank=0,
         tp_size=2,
         tp_group=(0, 1),
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
 
@@ -378,6 +388,7 @@ def test_tp_logits_custom_collectives_skip_host_spread_group_without_fabric(
         tp_rank=0,
         tp_size=8,
         tp_group=tuple(range(8)),
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
     lm_head = SimpleNamespace(
@@ -419,6 +430,7 @@ def test_a_strided_tp_group_smaller_than_one_host_is_still_probed(monkeypatch):
         tp_rank=0,
         tp_size=2,
         tp_group=(0, 4),
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
     assert not processor._tp_group_multicast_reachable()
@@ -443,6 +455,7 @@ def test_a_peer_without_fabric_takes_the_whole_group_off_the_gather(monkeypatch)
         tp_rank=0,
         tp_size=8,
         tp_group=tuple(range(8)),
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
     assert not processor._tp_group_multicast_reachable()
@@ -456,6 +469,7 @@ def test_tp_logits_custom_collectives_serve_host_spread_group_with_fabric(monkey
         tp_rank=0,
         tp_size=8,
         tp_group=tuple(range(8)),
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
     lm_head = SimpleNamespace(
@@ -492,6 +506,7 @@ def test_logits_gather_state_spans_the_vocab_of_a_transposed_quantized_head(
         tp_rank=0,
         tp_size=2,
         tp_group=(0, 1),
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
     lm_head = SimpleNamespace(
@@ -562,6 +577,7 @@ def test_dist_argmax_probe_failure_falls_back_and_latches(monkeypatch):
         tp_rank=0,
         tp_size=2,
         tp_group=(0, 4),
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
     lm_head = SimpleNamespace(
@@ -623,6 +639,7 @@ def test_dist_argmax_state_cache_separates_logits_dtypes(monkeypatch):
         tp_rank=0,
         tp_size=2,
         tp_group=(0, 1),
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
     lm_head = SimpleNamespace(
@@ -709,6 +726,7 @@ def test_dist_argmax_state_serves_the_bf16_logits_of_a_transposed_quantized_head
         tp_size=2,
         tp_group=(0, 1),
         do_argmax=True,
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
     lm_head = SimpleNamespace(
@@ -774,11 +792,126 @@ def test_fused_softcap_handles_large_logits_without_nan():
     )
     expected = cap * torch.tanh(logits / cap)
 
-    out = fused_softcap(logits.clone(), cap)
+    out = fused_softcap(logits.clone(), cap, 1.0)
     torch.cuda.synchronize()
 
     assert torch.isfinite(out).all()
     torch.testing.assert_close(out, expected, rtol=1e-5, atol=2e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_fused_softcap_scale_rounds_like_an_in_place_multiply(dtype):
+    torch.manual_seed(0)
+    logits = (torch.randn(7, 4099, device="cuda") * 40).to(dtype)
+    scale, cap = 0.1767766952966369, 20.0
+
+    fused = fused_softcap(logits.clone(), cap, scale)
+    separate = fused_softcap(logits.clone().mul_(scale), cap, 1.0)
+
+    assert torch.equal(fused, separate)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_scaled_softcapped_tp_logits_match_scaling_before_the_gather(
+    monkeypatch, nvidia_logits
+):
+    """The softcap kernel applies the logit scale after the vocab gather; the
+    result is bit for bit what scaling each rank's shard first gives."""
+    scale, cap = 0.1767766952966369, 20.0
+
+    def processor(softcap):
+        config = SimpleNamespace(
+            model_type="test", vocab_size=64, final_logit_softcapping=softcap
+        )
+        proc = LogitsProcessor(
+            attn_tp_size=2,
+            config=config,
+            skip_all_gather=False,
+            do_argmax=False,
+            logit_scale=scale,
+            tp_rank=0,
+            tp_size=2,
+            tp_group=(0, 1),
+            dp_lm_head_tp=False,
+        )
+        proc._all_gather_state = None  # the collective gather path
+        return proc
+
+    def collective(output, logits, group):
+        output.copy_(torch.cat((logits, logits.flip(-1)), dim=0))
+
+    monkeypatch.setattr(logits_processor_module, "all_gather_single", collective)
+    torch.manual_seed(1)
+    hidden = torch.randn(5, 16, device="cuda", dtype=torch.bfloat16) * 4
+    head = SimpleNamespace(
+        weight=torch.randn(32, 16, device="cuda", dtype=torch.bfloat16)
+    )
+
+    def logits(proc):
+        return proc._get_logits(
+            hidden,
+            head,
+            logits_metadata=None,
+            embedding_bias=None,
+            plan=None,
+            require_full_vocab=False,
+        )
+
+    fused = logits(processor(cap))
+    expected = fused_softcap(logits(processor(None)), cap, 1.0)
+
+    assert torch.equal(fused, expected)
+
+
+@pytest.mark.parametrize("sink_armed", [False, True])
+def test_a_forward_whose_taps_went_to_the_sink_returns_no_capture(
+    nvidia_logits, sink_armed
+):
+    """With the drafter's sink attached, the drafter already has every tap:
+    the processor neither concatenates them nor stores a hidden capture."""
+    from tokenspeed.runtime.execution.context import ForwardContext
+    from tokenspeed.runtime.execution.forward_batch_info import CaptureHiddenMode
+    from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+
+    processor = LogitsProcessor(
+        attn_tp_size=1,
+        config=SimpleNamespace(model_type="test", vocab_size=4),
+        skip_all_gather=True,
+        do_argmax=False,
+        logit_scale=None,
+        tp_rank=0,
+        tp_size=1,
+        tp_group=(0,),
+        dp_lm_head_tp=False,
+    )
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=1,
+        num_extends=0,
+        output_layout=ForwardOutputLayout(0, 0, 1, 3),
+        input_num_tokens=3,
+        forward_mode=ForwardMode.DECODE,
+        capture_hidden_mode=CaptureHiddenMode.FULL,
+        target_capture_sink=object() if sink_armed else None,
+    )
+    hidden = torch.randn(3, 2)
+    taps = [torch.randn(3, 2), torch.randn(3, 2)]
+
+    output = processor(
+        None,
+        hidden,
+        SimpleNamespace(weight=torch.randn(4, 2)),
+        LogitsMetadata.from_forward_context(ctx),
+        taps,
+    )
+
+    assert output.next_token_logits.shape == (3, 4)
+    if sink_armed:
+        assert output.hidden_states is None
+    else:
+        assert torch.equal(output.hidden_states, torch.cat(taps, dim=-1))
 
 
 def test_argmax_routes_sharded_to_kernel(monkeypatch):
@@ -788,6 +921,7 @@ def test_argmax_routes_sharded_to_kernel(monkeypatch):
         tp_rank=0,
         tp_size=2,
         tp_group=(0, 1),
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
     proc._dist_argmax_state = DistArgmaxPrepared(
@@ -817,6 +951,7 @@ def test_argmax_falls_back_without_state(monkeypatch):
         tp_rank=0,
         tp_size=2,
         tp_group=(0, 1),
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
     proc._dist_argmax_state = None  # gate failed (draft vocab != target vocab)
@@ -844,6 +979,7 @@ def test_get_logits_skips_gather_when_dist_argmax_active(monkeypatch, nvidia_log
         tp_size=2,
         tp_group=(0, 1),
         do_argmax=True,
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
     monkeypatch.setattr(
@@ -879,6 +1015,7 @@ def test_startup_prepares_shared_head_before_first_forward(monkeypatch, mode, ve
         tp_rank=0,
         tp_size=2,
         tp_group=(0, 1),
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
     language = torch.nn.Module()
@@ -929,6 +1066,7 @@ def test_prepared_argmax_reuses_weight_updates_and_rebinds_padded_head(monkeypat
         tp_rank=0,
         tp_size=2,
         tp_group=(0, 1),
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
     head = torch.nn.Linear(2, 4, bias=False)
@@ -979,6 +1117,7 @@ def test_inactive_argmax_preserves_weightless_quantized_head():
 
     processor = LogitsProcessor(
         config=SimpleNamespace(model_type="test", vocab_size=2),
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
     model = torch.nn.Module()
@@ -1007,6 +1146,7 @@ def test_require_full_vocab_logits_turns_the_fused_draft_argmax_off(monkeypatch)
         tp_size=2,
         tp_group=(0, 1),
         do_argmax=True,
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
     assert proc.do_argmax
@@ -1051,6 +1191,7 @@ def test_capture_takes_the_plain_gather_and_leaves_the_gate_for_later(
         tp_size=2,
         tp_group=(0, 1),
         do_argmax=True,
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
     monkeypatch.setattr(
@@ -1124,6 +1265,7 @@ def test_get_logits_softcap_disables_fused_argmax(monkeypatch, nvidia_logits):
         tp_size=2,
         tp_group=(0, 1),
         do_argmax=True,
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
     # Fused state is otherwise eligible; softcap must still force the gather.
@@ -1163,7 +1305,14 @@ def _logprob_device() -> str:
 
 
 def _input_logprob_rows(
-    rows, targets, *, num_input_rows, chunk_tokens, device, rows_per_rank=None
+    rows,
+    targets,
+    *,
+    num_input_rows,
+    chunk_tokens,
+    device,
+    rows_per_rank=None,
+    gathered_to_rows=None,
 ):
     return InputLogprobRows(
         rows=torch.tensor(rows, dtype=torch.int64, device=device),
@@ -1176,6 +1325,11 @@ def _input_logprob_rows(
         num_input_rows=num_input_rows,
         chunk_tokens=chunk_tokens,
         rows_per_rank=rows_per_rank,
+        gathered_to_rows=(
+            None
+            if gathered_to_rows is None
+            else torch.tensor(gathered_to_rows, dtype=torch.int64, device=device)
+        ),
     )
 
 
@@ -1219,6 +1373,7 @@ def test_input_logprobs_match_the_output_logprob_arithmetic(chunk_tokens):
     rows, targets = [1, 2, 3], [5, 2, 3]
     processor = LogitsProcessor(
         config=SimpleNamespace(model_type="test", vocab_size=vocab),
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
     metadata = LogitsMetadata(
@@ -1255,7 +1410,9 @@ def test_input_logprobs_are_gathered_from_prefill_rows_of_a_mixed_batch():
     hidden = torch.randn(6, 4, device=device)  # 4 prefill rows + 2 decode rows
     weight = torch.randn(vocab, 4, device=device)
     processor = LogitsProcessor(
-        config=SimpleNamespace(model_type="test", vocab_size=vocab), dp_lm_head_tp=False
+        config=SimpleNamespace(model_type="test", vocab_size=vocab),
+        attn_tp_size=1,
+        dp_lm_head_tp=False,
     )
     seen = []
     original = processor._get_logits
@@ -1294,7 +1451,9 @@ def test_input_logprobs_are_gathered_from_prefill_rows_of_a_mixed_batch():
 def test_input_logprobs_refuse_a_model_that_narrowed_its_logits_rows():
     device = _logprob_device()
     processor = LogitsProcessor(
-        config=SimpleNamespace(model_type="test", vocab_size=4), dp_lm_head_tp=False
+        config=SimpleNamespace(model_type="test", vocab_size=4),
+        attn_tp_size=1,
+        dp_lm_head_tp=False,
     )
     lm_head = SimpleNamespace(weight=torch.randn(4, 2, device=device))
     rows = _input_logprob_rows(
@@ -1354,6 +1513,7 @@ def test_input_logprobs_bypass_the_sharded_argmax_shortcut(monkeypatch, nvidia_l
         tp_size=2,
         tp_group=(0, 1),
         do_argmax=True,
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
     monkeypatch.setattr(
@@ -1413,6 +1573,7 @@ def test_input_logprob_chunks_never_take_the_multicast_gather(
         tp_rank=0,
         tp_size=2,
         tp_group=(0, 1),
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
     multicast_state = object()
@@ -1472,6 +1633,7 @@ def _sharded_processor(monkeypatch, size: int, rank: int) -> LogitsProcessor:
         tp_rank=rank,
         tp_size=size,
         tp_group=tuple(range(size)),
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
     monkeypatch.setattr(proc, "_init_all_gather_state", lambda lm_head: None)
@@ -1498,19 +1660,43 @@ def test_a_sharded_forward_gathers_the_planned_rows_then_the_sampled_rows(
     from tokenspeed.runtime.execution.forward_batch_info import CaptureHiddenMode
     from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 
-    lengths = [4, 1, 5]  # rows 0..9; sampled rows 3, 4, 9; shards [3, 3, 2, 2]
+    # Rows 0..9, one per zigzag segment: rank 0 holds rows 0, 4, 5, rank 1
+    # rows 1, 6, rank 2 rows 2, 7, rank 3 rows 3, 8, 9. Sampled rows 3, 4, 9.
+    lengths = [4, 1, 5]
     total = sum(lengths)
     gather_ids = torch.cumsum(torch.tensor(lengths), 0) - 1
     torch.manual_seed(0)
     hidden = torch.randn(total, 2)
     lm_head = SimpleNamespace(weight=torch.randn(8, 2))
-    # The plan: rows 1..3 of request 0 and rows 5..7 of request 2; rank 3
-    # (rows 8, 9) holds none of them.
-    plan_rows = torch.tensor([1, 2, 3, 5, 6, 7])
-    plan_targets = torch.tensor([3, 1, 7, 2, 2, 5])
-    reference = torch.log_softmax((hidden @ lm_head.weight.T).float(), -1)[
-        plan_rows, plan_targets
+    # The plan: rows 0..2 of request 0, request 1's row and rows 5..7 of
+    # request 2; rank 3 holds none of them.
+    plan_rows = torch.tensor([0, 1, 2, 4, 5, 6, 7])
+    plan_targets = torch.tensor([3, 1, 7, 4, 2, 2, 5])
+    plans = [
+        QueryShardPlan.from_forward(
+            total_tokens=total, input_lengths=lengths, size=4, rank=rank, device="cpu"
+        )
+        for rank in range(4)
     ]
+    # What each collective returns: every rank's rows, rank by rank.
+    in_gather_order = {
+        "planned": torch.cat(
+            [p.local_row_ids[p.split_rows(plan_rows).local_ids] for p in plans]
+        ),
+        "sampled": torch.cat([p.local_row_ids[p.local_sampled_index] for p in plans]),
+    }
+    assert in_gather_order["planned"].tolist() == [0, 4, 5, 1, 6, 2, 7]
+    assert in_gather_order["sampled"].tolist() == [4, 3, 9]
+    # The unsharded chunk loop (two rows per chunk, plan order): CPU GEMMs
+    # round by shape, so the reference runs the same chunks.
+    reference = torch.cat(
+        [
+            torch.log_softmax(
+                (hidden[plan_rows[i : i + 2]] @ lm_head.weight.T).float(), -1
+            )[torch.arange(len(plan_rows[i : i + 2])), plan_targets[i : i + 2]]
+            for i in range(0, len(plan_rows), 2)
+        ]
+    )
     gathers: list[tuple[int, str, list[int]]] = []
 
     def fake_gather(kind):
@@ -1518,9 +1704,8 @@ def test_a_sharded_forward_gathers_the_planned_rows_then_the_sampled_rows(
             assert group == (0, 1, 2, 3)
             gathers.append((len(gathers), kind, list(counts)))
             # Stand in for the collective: the rows every rank would
-            # contribute, in rank order.
-            rows = plan_rows if kind == "planned" else gather_ids
-            return hidden[rows]
+            # contribute, rank by rank.
+            return hidden[in_gather_order[kind]]
 
         return gather
 
@@ -1535,27 +1720,27 @@ def test_a_sharded_forward_gathers_the_planned_rows_then_the_sampled_rows(
 
     for rank in range(4):
         plan = QueryShardPlan.from_forward(
-            total_tokens=total, input_lengths=lengths, size=4, rank=rank
+            total_tokens=total, input_lengths=lengths, size=4, rank=rank, device="cpu"
         )
         proc = _sharded_processor(monkeypatch, 4, rank)
-        rows_per_rank = plan.rows_per_rank(plan_rows)
-        assert rows_per_rank == (2, 2, 2, 0)
-        local = plan.local_rows_run(rows_per_rank)
+        split = plan.split_rows(plan_rows)
+        assert split.rows_per_rank == (3, 2, 2, 0)
         md = LogitsMetadata(
             forward_mode=ForwardMode.EXTEND,
             capture_hidden_mode=CaptureHiddenMode.FULL,
             gather_ids=gather_ids,
             query_shard=plan,
             input_logprob_rows=InputLogprobRows(
-                rows=plan_rows[local] - plan.local_start,
+                rows=split.local_ids,
                 targets=plan_targets,
                 slots=torch.zeros(plan_rows.shape[0], dtype=torch.int64),
                 num_input_rows=plan.local_rows,
                 chunk_tokens=2,
-                rows_per_rank=rows_per_rank,
+                rows_per_rank=split.rows_per_rank,
+                gathered_to_rows=split.to_rows_order,
             ),
         )
-        shard = hidden[plan.local_slice]
+        shard = hidden[plan.local_row_ids]
         out = proc(
             input_ids=None, hidden_states=shard, lm_head=lm_head, logits_metadata=md
         )
@@ -1563,17 +1748,9 @@ def test_a_sharded_forward_gathers_the_planned_rows_then_the_sampled_rows(
         # The planned rows leave before the sampled rows; rank 3 contributes
         # no planned row and still joins.
         assert [g[1] for g in gathers[2 * rank :]] == ["planned", "sampled"]
-        assert gathers[2 * rank][2] == [2, 2, 2, 0]
-        assert (
-            gathers[2 * rank + 1][2]
-            == list(plan.sampled_rows_per_rank)
-            == [
-                0,
-                2,
-                0,
-                1,
-            ]
-        )
+        assert gathers[2 * rank][2] == [3, 2, 2, 0]
+        assert gathers[2 * rank + 1][2] == list(plan.sampled_rows_per_rank)
+        assert list(plan.sampled_rows_per_rank) == [1, 0, 0, 2]
         # Every rank ends with the whole plan's logprobs and the batch's logits.
         torch.testing.assert_close(out.input_token_logprobs, reference, rtol=0, atol=0)
         torch.testing.assert_close(
@@ -1595,7 +1772,9 @@ def test_a_last_capture_under_a_shard_is_the_gathered_sampled_rows(monkeypatch, 
     from tokenspeed.runtime.execution.forward_batch_info import CaptureHiddenMode
     from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 
-    lengths = [4, 1, 5]  # rows 0..9; sampled rows 3, 4, 9; shards [3, 3, 2, 2]
+    # Rows 0..9, one per zigzag segment; sampled rows 3 and 9 on rank 3, 4 on
+    # rank 0.
+    lengths = [4, 1, 5]
     total = sum(lengths)
     gather_ids = torch.cumsum(torch.tensor(lengths), 0) - 1
     torch.manual_seed(1)
@@ -1606,27 +1785,27 @@ def test_a_last_capture_under_a_shard_is_the_gathered_sampled_rows(monkeypatch, 
     current: dict[str, QueryShardPlan] = {}
 
     def fake_gather(tensor, group, counts):
-        assert group == (0, 1, 2, 3) and list(counts) == [0, 2, 0, 1]
+        assert group == (0, 1, 2, 3) and list(counts) == [1, 0, 0, 2]
         # The final rows are gathered first, then each tap in order; this
         # rank contributes its sampled rows of that source, and the collective
-        # hands back every rank's in rank order: the batch's sampled rows.
+        # hands back every rank's, rank by rank (rows 4, 3, 9).
         source = (hidden, *aux)[len(gathered)]
         plan = current["plan"]
-        local = source[plan.local_slice][plan.local_sampled_ids(gather_ids)]
+        local = source[plan.local_row_ids][plan.local_sampled_index]
         assert torch.equal(tensor, local)
         gathered.append(tensor)
-        return source[gather_ids]
+        return source[torch.tensor([4, 3, 9])]
 
     monkeypatch.setattr(comm_manager_module, "token_all_gather_rows", fake_gather)
 
     modes = (CaptureHiddenMode.LAST, CaptureHiddenMode.FULL, CaptureHiddenMode.NULL)
     for rank in range(4):
         plan = QueryShardPlan.from_forward(
-            total_tokens=total, input_lengths=lengths, size=4, rank=rank
+            total_tokens=total, input_lengths=lengths, size=4, rank=rank, device="cpu"
         )
         current["plan"] = plan
-        shard = hidden[plan.local_slice]
-        aux_shard = [a[plan.local_slice] for a in aux] or None
+        shard = hidden[plan.local_row_ids]
+        aux_shard = [a[plan.local_row_ids] for a in aux] or None
         for mode in modes:
             gathered.clear()
             proc = _sharded_processor(monkeypatch, 4, rank)
@@ -1675,7 +1854,7 @@ def test_a_shard_refuses_pre_selected_rows_and_a_mismatched_head(monkeypatch):
     from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 
     plan = QueryShardPlan.from_forward(
-        total_tokens=4, input_lengths=[4], size=2, rank=0
+        total_tokens=4, input_lengths=[4], size=2, rank=0, device="cpu"
     )
     lm_head = SimpleNamespace(weight=torch.randn(8, 2))
     rows = _input_logprob_rows(
@@ -1685,6 +1864,7 @@ def test_a_shard_refuses_pre_selected_rows_and_a_mismatched_head(monkeypatch):
         chunk_tokens=8,
         device="cpu",
         rows_per_rank=(2, 1),
+        gathered_to_rows=[0, 1, 2],
     )
     proc = _sharded_processor(monkeypatch, 2, 0)
     with pytest.raises(ValueError, match="narrowed"):
@@ -1718,6 +1898,7 @@ def test_a_shard_refuses_pre_selected_rows_and_a_mismatched_head(monkeypatch):
         tp_rank=0,
         tp_size=4,
         tp_group=(0, 1, 2, 3),
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
     with pytest.raises(ValueError, match="vocab-shard group"):
@@ -1737,6 +1918,7 @@ def test_a_shard_refuses_pre_selected_rows_and_a_mismatched_head(monkeypatch):
         tp_rank=0,
         tp_size=2,
         tp_group=(0, 1),
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
     with pytest.raises(ValueError, match="replicated LM head"):
@@ -1773,6 +1955,7 @@ def test_rocm_keeps_the_portable_sharded_argmax(monkeypatch):
         tp_size=2,
         tp_group=(0, 1),
         do_argmax=True,
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
     hidden = torch.arange(8, dtype=torch.float32).reshape(4, 2)
@@ -1786,3 +1969,254 @@ def test_rocm_keeps_the_portable_sharded_argmax(monkeypatch):
         require_full_vocab=False,
     )
     torch.testing.assert_close(actual, hidden @ head.weight.T, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("rows", [1, 512, 513])
+def test_dp_head_vocab_gather_bounded_workspace(monkeypatch, rows):
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    monkeypatch.setitem(global_server_args_dict, "max_num_seqs", 128)
+    monkeypatch.setitem(global_server_args_dict, "speculative_algorithm", "MTP")
+    monkeypatch.setitem(global_server_args_dict, "speculative_num_draft_tokens", 4)
+    proc = LogitsProcessor(
+        config=SimpleNamespace(model_type="test", vocab_size=32),
+        tp_rank=0,
+        tp_size=8,
+        tp_group=tuple(range(8)),
+        attn_tp_size=2,
+        dp_lm_head_tp=True,
+        skip_all_gather=True,
+    )
+    # CPU tests replace only the GPU collectives; the processor owns sizing,
+    # dispatch, and the NCCL output's shard-to-vocabulary layout conversion.
+    state = SimpleNamespace(max_token_num=proc._logits_ag_max_tokens)
+    assert state.max_token_num == 512
+    proc._all_gather_state = state
+    x = torch.arange(rows * 4, dtype=torch.float32).reshape(rows, 4).bfloat16()
+    expected = torch.cat([x + rank for rank in range(8)], dim=1)
+
+    def multicast(state, tensor, **kwargs):
+        assert tensor.shape[0] <= state.max_token_num
+        return torch.cat([tensor + rank for rank in range(8)], dim=1)
+
+    def nccl(output, tensor, group):
+        output.copy_(torch.cat([tensor + rank for rank in range(8)], dim=0))
+
+    monkeypatch.setattr(logits_processor_module, "all_gather_inner", multicast)
+    monkeypatch.setattr(logits_processor_module, "all_gather_single", nccl)
+    actual = proc._gather_vocab_logits(x, None, require_full_vocab=False)
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("local_dp_rows", [None, slice(1, 3), slice(2, 2)])
+def test_finish_logits_preserves_dp_rows(monkeypatch, local_dp_rows):
+    from transformers import PretrainedConfig
+
+    processor = LogitsProcessor(
+        PretrainedConfig(vocab_size=8),
+        tp_rank=0,
+        tp_size=2,
+        tp_group=(0, 1),
+        attn_tp_size=1,
+        dp_lm_head_tp=False,
+    )
+    head = ParallelLMHead(
+        8,
+        2,
+        params_dtype=torch.float32,
+        padding_size=1,
+        tp_rank=0,
+        tp_size=2,
+        tp_group=(0, 1),
+    )
+    logits = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+
+    def collective(output, shard, group):
+        output.copy_(torch.cat((shard, shard + 100), dim=0))
+
+    monkeypatch.setattr(logits_processor_module, "all_gather_single", collective)
+    actual = processor._finish_logits(
+        logits,
+        head,
+        None,
+        None,
+        local_dp_rows=local_dp_rows,
+        require_full_vocab=True,
+    )
+    expected = torch.cat((logits, logits + 100), dim=1)
+    if local_dp_rows is not None:
+        expected = expected[local_dp_rows]
+    torch.testing.assert_close(actual, expected)
+
+
+def test_sampled_vocab_fallback_finishes_all_rows(monkeypatch):
+    from transformers import PretrainedConfig
+
+    processor = LogitsProcessor(
+        PretrainedConfig(vocab_size=8),
+        tp_rank=0,
+        tp_size=2,
+        tp_group=(0, 1),
+        attn_tp_size=1,
+        dp_lm_head_tp=False,
+    )
+    head = ParallelLMHead(
+        8,
+        2,
+        params_dtype=torch.bfloat16,
+        padding_size=1,
+        tp_rank=0,
+        tp_size=2,
+        tp_group=(0, 1),
+    )
+    # A sampler that takes shards of any geometry; the processor asks it, not the kernels.
+    assert processor.keep_sampled_logits_vocab_sharded(
+        head, lambda dtype, columns, tp_size: True
+    )
+
+    def collective(output, shard, group):
+        output.copy_(torch.cat((shard, shard + 100), dim=0))
+
+    monkeypatch.setattr(logits_processor_module, "all_gather_single", collective)
+    logits = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    shard = processor.sampled_vocab_shard(logits, head)
+    actual = shard.gather_full(logits)
+    torch.testing.assert_close(actual, torch.cat((logits, logits + 100), dim=1))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("attn_tp,head_tp", [(2, 8), (2, 2), (4, 2), (1, 8)])
+@pytest.mark.parametrize("rank", range(8))
+@pytest.mark.parametrize(
+    "mode", ["greedy", "full", "empty", "padded", "limit", "softcap"]
+)
+def test_dp_head_argmax_and_local_head_input(monkeypatch, attn_tp, head_tp, rank, mode):
+    """Real projections/argmax keys, with only the missing peers simulated."""
+    from transformers import PretrainedConfig
+
+    group = tuple(range(rank // head_tp * head_tp, (rank // head_tp + 1) * head_tp))
+    local_rank = group.index(rank)
+    vocab = 32 if mode != "padded" else 31
+    counts = [
+        0 if mode == "empty" else (2, 0, 3, 1)[r // attn_tp % 4] for r in range(8)
+    ]
+    hidden = [
+        torch.arange(n * 4, device="cuda", dtype=torch.float32).reshape(n, 4) / 8
+        + r // attn_tp
+        for r, n in enumerate(counts)
+    ]
+    weights = (
+        torch.arange(128, device="cuda", dtype=torch.float32).reshape(32, 4) / 16 - 4
+    )
+    # Equal maxima in different vocabulary shards must select the lowest ID.
+    weights[0] = weights[-1]
+    if mode == "padded":
+        weights[-1] = 1000  # This padded token must never win.
+    processor = LogitsProcessor(
+        PretrainedConfig(
+            vocab_size=vocab, final_logit_softcapping=3.0 if mode == "softcap" else None
+        ),
+        tp_rank=local_rank,
+        tp_size=head_tp,
+        tp_group=group,
+        attn_tp_size=attn_tp,
+        dp_lm_head_tp=True,
+        skip_all_gather=True,
+        do_argmax=True,
+        logit_scale=2.0,
+    )
+    head = ParallelLMHead(
+        vocab,
+        4,
+        params_dtype=torch.float32,
+        padding_size=32,
+        tp_rank=local_rank,
+        tp_size=head_tp,
+        tp_group=group,
+    )
+    head = head.to("cuda").requires_grad_(False)
+    width = 32 // head_tp
+    with torch.no_grad():
+        head.weight.copy_(weights[local_rank * width : (local_rank + 1) * width])
+    if mode == "full":
+        processor.require_full_vocab_logits()
+    if mode == "limit":
+        monkeypatch.setattr(processor, "_LOGITS_DIST_ARGMAX_MAX_TOKENS", 0)
+    processor.prepare_communication(head)
+    replicas = min(attn_tp, head_tp)
+    all_hidden = torch.cat([hidden[r] for r in group[::replicas]])
+    fast = mode in ("greedy", "empty") or (mode == "limit" and all_hidden.shape[0] == 0)
+
+    def reduce(tensor, ranks, op=torch.distributed.ReduceOp.SUM):
+        assert ranks == group
+        if tensor.dtype != torch.int64:
+            # Within one attention group no hidden-state collective is legal.
+            assert head_tp > attn_tp
+            expected = torch.zeros_like(all_hidden)
+            if local_rank % replicas == 0:
+                offset = sum(counts[r] for r in group[:local_rank:replicas])
+                expected[offset : offset + counts[rank]] = hidden[rank]
+            torch.testing.assert_close(tensor, expected)
+            return all_hidden.clone()
+        assert fast and op == torch.distributed.ReduceOp.MAX
+        keys = []
+        for i in range(head_tp):
+            peer_logits = (all_hidden @ weights[i * width : (i + 1) * width].T) * 2.0
+            out = torch.empty(all_hidden.shape[0], dtype=torch.int64, device="cuda")
+            logits_processor_module.vocab_parallel_argmax_keys(
+                peer_logits, vocab_offset=i * width, out=out
+            )
+            keys.append(out)
+        torch.testing.assert_close(tensor, keys[local_rank])
+        return torch.stack(keys).max(dim=0).values
+
+    def gather_rows(tensor, ranks, row_counts):
+        assert attn_tp == 1 and ranks == group
+        return all_hidden.clone()
+
+    comm_scale = 1.0 if mode == "softcap" else 2.0
+
+    def gather_vocab(output, tensor, ranks):
+        assert not fast and ranks == group
+        expected = all_hidden @ head.weight.T * comm_scale
+        torch.testing.assert_close(tensor, expected)
+        output.copy_(
+            torch.cat(
+                [all_hidden @ w.T * comm_scale for w in weights.split(width)], dim=0
+            )
+        )
+
+    def transpose(tensor, ranks, *, input_split_sizes):
+        assert not fast and attn_tp == 1 and ranks == group
+        return hidden[rank] @ weights.T * comm_scale
+
+    def gather_counts(tensor, ranks, dim):
+        assert head_tp > attn_tp and ranks == group
+        return tensor.new_tensor([counts[r] for r in group])
+
+    monkeypatch.setattr(logits_processor_module, "all_gather", gather_counts)
+    monkeypatch.setattr(logits_processor_module, "all_reduce", reduce)
+    monkeypatch.setattr(logits_processor_module, "token_all_gather", gather_rows)
+    monkeypatch.setattr(logits_processor_module, "all_gather_single", gather_vocab)
+    monkeypatch.setattr(logits_processor_module, "all_to_all_transpose", transpose)
+    metadata = LogitsMetadata(
+        forward_mode=ForwardMode.DECODE,
+        query_shard=None,
+        global_num_tokens=counts,
+        all_decode_or_idle=True,
+        logits_rows_selected=True,
+    )
+    result = processor(None, hidden[rank], head, metadata)
+    expected = (hidden[rank] @ weights[:vocab].T) * 2.0
+    if mode == "softcap":
+        expected = 3.0 * torch.tanh(expected / 3.0)
+    if mode == "full":
+        assert result.next_token_ids is None
+    else:
+        torch.testing.assert_close(result.next_token_ids, expected.argmax(dim=-1))
+    if not fast:
+        torch.testing.assert_close(result.next_token_logits, expected)
+    else:
+        torch.testing.assert_close(
+            result.next_token_logits, hidden[rank] @ head.weight.T * 2.0
+        )

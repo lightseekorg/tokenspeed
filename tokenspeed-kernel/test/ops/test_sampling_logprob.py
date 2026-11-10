@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""``sampling.vocab_parallel_logprobs`` and its portable block-sumexp leaf.
+"""``sampling.blockwise_logprobs`` and its portable block-sumexp leaf.
 
 The tree is what matters: one row's result must depend only on the vocab
 size and that row's own values, never on the batch it shares. Equality with
@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.sampling import vocab_parallel_logprobs
+from tokenspeed_kernel.ops.sampling import blockwise_logprobs
 from tokenspeed_kernel.ops.sampling.torch import torch_block_sumexp
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import select_kernel
@@ -91,17 +91,19 @@ def test_block_sumexp_is_a_fixed_pairwise_tree():
 def test_logprobs_do_not_depend_on_the_batch():
     logits = _logits(6, 2)
     targets = torch.randint(0, VOCAB, (6,), generator=torch.Generator().manual_seed(3))
-    full = vocab_parallel_logprobs(logits, targets, vocab_block=BLOCK)
-    solo = vocab_parallel_logprobs(logits[2:3], targets[2:3], vocab_block=BLOCK)
+    full = blockwise_logprobs(logits, targets, vocab_block=BLOCK, form="direct")
+    solo = blockwise_logprobs(
+        logits[2:3], targets[2:3], vocab_block=BLOCK, form="direct"
+    )
     assert torch.equal(full[2], solo[0])
     permutation = torch.tensor([5, 0, 3, 1, 4, 2])
-    shuffled = vocab_parallel_logprobs(
-        logits[permutation], targets[permutation], vocab_block=BLOCK
+    shuffled = blockwise_logprobs(
+        logits[permutation], targets[permutation], vocab_block=BLOCK, form="direct"
     )
     assert torch.equal(shuffled, full[permutation])
     # Run invariance, and the dtype contract.
     assert torch.equal(
-        full, vocab_parallel_logprobs(logits, targets, vocab_block=BLOCK)
+        full, blockwise_logprobs(logits, targets, vocab_block=BLOCK, form="direct")
     )
     assert full.dtype == torch.float32
     assert full.shape == (6,)
@@ -110,14 +112,14 @@ def test_logprobs_do_not_depend_on_the_batch():
 def test_logprobs_match_log_softmax_up_to_tree_rounding():
     logits = _logits(4, 5)
     targets = torch.randint(0, VOCAB, (4,), generator=torch.Generator().manual_seed(6))
-    got = vocab_parallel_logprobs(logits, targets, vocab_block=BLOCK)
+    got = blockwise_logprobs(logits, targets, vocab_block=BLOCK, form="direct")
     ref = torch.log_softmax(logits, dim=-1).gather(1, targets.unsqueeze(1)).squeeze(1)
     # Different association orders in the denominator: equal to ~1e-6
     # relative, not bitwise — the leaf's tree is the contract, not torch's.
     torch.testing.assert_close(got, ref, rtol=1e-5, atol=1e-5)
     # bf16 logits are promoted exactly as torch would promote them.
-    bf16 = vocab_parallel_logprobs(
-        logits.to(torch.bfloat16), targets, vocab_block=BLOCK
+    bf16 = blockwise_logprobs(
+        logits.to(torch.bfloat16), targets, vocab_block=BLOCK, form="direct"
     )
     torch.testing.assert_close(
         bf16,
@@ -128,7 +130,10 @@ def test_logprobs_match_log_softmax_up_to_tree_rounding():
         atol=1e-5,
     )
     assert torch.equal(
-        vocab_parallel_logprobs(logits, targets.to(torch.int32), vocab_block=BLOCK), got
+        blockwise_logprobs(
+            logits, targets.to(torch.int32), vocab_block=BLOCK, form="direct"
+        ),
+        got,
     )
 
 
@@ -136,23 +141,34 @@ def test_logprobs_refuse_misshaped_inputs():
     logits = _logits(2, 7)
     targets = torch.zeros(2, dtype=torch.int64)
     with pytest.raises(ValueError, match="multiple of vocab_block"):
-        vocab_parallel_logprobs(logits[:, :-1], targets, vocab_block=BLOCK)
+        blockwise_logprobs(logits[:, :-1], targets, vocab_block=BLOCK, form="direct")
     with pytest.raises(ValueError, match="target_ids must have shape"):
-        vocab_parallel_logprobs(logits, targets[:1], vocab_block=BLOCK)
+        blockwise_logprobs(logits, targets[:1], vocab_block=BLOCK, form="direct")
     with pytest.raises(ValueError, match="int32 or int64"):
-        vocab_parallel_logprobs(logits, targets.float(), vocab_block=BLOCK)
+        blockwise_logprobs(logits, targets.float(), vocab_block=BLOCK, form="direct")
     with pytest.raises(ValueError, match=r"logits must be \[rows, vocab\]"):
-        vocab_parallel_logprobs(logits[0], targets[:1], vocab_block=BLOCK)
+        blockwise_logprobs(logits[0], targets[:1], vocab_block=BLOCK, form="direct")
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_certain_token_has_positive_zero_logprob(dtype):
-    logits = torch.full((2, VOCAB), -1000.0, dtype=dtype)
-    targets = torch.tensor([0, BLOCK], dtype=torch.int64)
-    logits[torch.arange(2), targets] = 0.0
-    actual = vocab_parallel_logprobs(
-        logits, targets, vocab_block=BLOCK, solution="torch"
+@pytest.mark.parametrize("form", ["negative-cross-entropy", "direct"])
+def test_logprob_form_controls_zero_sign(dtype, form):
+    logits = torch.full((3, VOCAB), -1000.0, dtype=dtype)
+    targets = torch.tensor([0, BLOCK, 1], dtype=torch.int64)
+    logits[torch.arange(3), targets] = 0.0
+    logits[2, 0] = 1.0
+    actual = blockwise_logprobs(
+        logits, targets, vocab_block=BLOCK, form=form, solution="torch"
     )
-    # Float equality cannot distinguish +0.0 from -0.0; the trainer's
-    # target - log(sum_exp) yields the all-zero FP32 bit pattern.
-    assert torch.equal(actual.view(torch.int32), torch.zeros(2, dtype=torch.int32))
+    expected_zero = -0.0 if form == "negative-cross-entropy" else 0.0
+    assert torch.equal(
+        actual[:2].view(torch.int32),
+        torch.full((2,), expected_zero).view(torch.int32),
+    )
+    direct = blockwise_logprobs(
+        logits, targets, vocab_block=BLOCK, form="direct", solution="torch"
+    )
+    assert actual[2] < 0
+    assert torch.equal(actual[2:].view(torch.int32), direct[2:].view(torch.int32))
+    with pytest.raises(ValueError, match="logprob form"):
+        blockwise_logprobs(logits, targets, vocab_block=BLOCK, form="invalid")
