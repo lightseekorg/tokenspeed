@@ -75,6 +75,7 @@ __all__ = [
     "gluon_gated_norm_gemv_a16w16_tiling_gfx950",
     "gluon_gated_norm_gemv_tile_gfx950",
     "gluon_gemv_a16w16_gfx950",
+    "gluon_gemv_a16w16_gfx950_buckets",
     "gluon_gemv_a16w8_gfx950",
     "gluon_rmsnorm_gemv_a16w16_gfx950",
     "launch_gluon_gated_norm_gemv_a16w16_gfx950",
@@ -83,6 +84,7 @@ __all__ = [
     "launch_gluon_rmsnorm_gemv_a16w16_gfx950",
     "prefers_gluon_gemv_a16w16_gfx950",
     "prefers_gluon_rmsnorm_gemv_a16w16_gfx950",
+    "set_gluon_gemv_a16w16_gfx950_buckets",
     "supports_gluon_gated_norm_gemv_a16w16_gfx950",
     "supports_gluon_gemv_a16w16_gfx950",
     "supports_gluon_gemv_a16w8_gfx950",
@@ -1049,6 +1051,27 @@ def prefers_gluon_gemv_a16w16_gfx950(m: int, n: int, k: int) -> bool:
     return bucket in _PREFERRED_BUCKETS.get(
         (n, k), frozenset()
     ) and m <= _PREFERRED_LAST_M.get((n, k), MAX_M)
+
+
+def gluon_gemv_a16w16_gfx950_buckets(n: int, k: int) -> frozenset[int]:
+    """Row buckets (1, 2-4 as 4, 5-16 as 16) ``gemm.mm`` sends here for ``[N, K]``."""
+    return _PREFERRED_BUCKETS.get((n, k), frozenset())
+
+
+def set_gluon_gemv_a16w16_gfx950_buckets(
+    n: int, k: int, buckets: frozenset[int]
+) -> None:
+    """Route the row ``buckets`` of ``[N, K]`` here, as a measured entry would.
+
+    An empty set removes the entry. Callers that cache ``gemm.mv`` selections
+    must drop them afterwards.
+    """
+    if not buckets <= {1, 4, 16}:
+        raise ValueError(f"Row buckets must be among 1, 4 and 16, got {buckets}")
+    if buckets:
+        _PREFERRED_BUCKETS[(n, k)] = frozenset(buckets)
+    else:
+        _PREFERRED_BUCKETS.pop((n, k), None)
 
 
 def launch_gluon_gemv_a16w16_gfx950(
