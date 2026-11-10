@@ -289,8 +289,10 @@ def _gather_kernel(
     FORMAT: tl.constexpr,
     GATHER: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    slot = tl.load(Slots + row).to(tl.int64) if GATHER else row.to(tl.int64)
+    # A batch's gathered history can pass 2**31 / D output rows (the prefill
+    # workspace near a 1M-token context), so the row offset is 64-bit.
+    row = tl.program_id(0).to(tl.int64)
+    slot = tl.load(Slots + row).to(tl.int64) if GATHER else row
     valid = (slot >= 0) & (slot < CAPACITY)
     slot = tl.where(valid, slot, 0)
     d = tl.arange(0, D)
