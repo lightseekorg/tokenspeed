@@ -28,11 +28,12 @@ shared expert, and publishes the output row. The shared expert runs on a side
 stream, which the forward rejoins at its end (:meth:`KimiK3DecodeMoE.join`).
 Either a ring kernel adds that row to the residual, or the next layer's
 AttnRes entry reads it: per decoder layer, the entry mixes the residual into
-the attention input, a split-K GEMM runs the input projection, and the
-o-projection exit all-reduces the partials through a mailbox and applies the
-post-attention AttnRes. At a few rows a side stream prefetches the weights the
-next kernels read into L2 (``k3_decode_prefetch``). Every rank must run the
-chain for the same row counts, since the mailboxes are collective.
+the attention input, a split-K GEMM runs the input projection (warp split-K up
+to 16 rows, cluster split-K above), and the o-projection exit all-reduces the
+partials through a mailbox and applies the post-attention AttnRes. At a few
+rows a side stream prefetches the weights the next kernels read into L2
+(``k3_decode_prefetch``). Every rank must run the chain for the same row
+counts, since the mailboxes are collective.
 """
 
 from __future__ import annotations
@@ -86,8 +87,8 @@ from tokenspeed_kernel.thirdparty.cute_dsl.k3_decode.common.primitives import (
     unpack_bf16,
 )
 from tokenspeed_kernel.thirdparty.cute_dsl.k3_decode.common.twoshot import TwoShot
-from tokenspeed_kernel.thirdparty.cute_dsl.k3_decode.gemm.projection import (
-    PreparedProjection,
+from tokenspeed_kernel.thirdparty.cute_dsl.k3_decode.gemm.decode import (
+    DecodeProjection,
 )
 from tokenspeed_kernel.thirdparty.cute_dsl.k3_decode.moe.experts import PREFETCH_ROWS
 from tokenspeed_kernel.thirdparty.cute_dsl.k3_decode.moe.experts_runtime import (
@@ -524,8 +525,12 @@ class KimiK3DecodeMoELayer:
 
 
 def _projection_tactics(rows: int, batches) -> dict[int, tuple[int, int, int, int]]:
-    """Split-K (M tile, N tile, split, stages) per batch, by its next tested bin;
-    GB300 TP8 sweeps of the vendored kernels (KDA 6288 rows, MLA 3648)."""
+    """Cluster split-K tactics (M tile, N tile, split, stages) per batch.
+
+    Each batch takes its next tested bin's, from GB300 TP8 sweeps of the vendored
+    kernels (KDA 6288 rows, MLA 3648). Every batch gets one: the projection falls
+    back to it for operands the warp split-K cannot take.
+    """
     tactics = {}
     for batch in batches:
         n = next(b for b in (8, 16, 32, 64) if batch <= b)
@@ -590,7 +595,9 @@ class KimiK3DecodeAttention:
             mla: Whether the attention is MLA (else KDA).
             first: Whether this is the first layer, whose entry has no prefix.
             projection_weight: The attention's packed BF16 input projection
-                [rows, 7168] (row pitch kept).
+                [rows, 7168] (row pitch kept). Up to 16 rows a contiguous,
+                32-byte aligned weight runs the warp split-K, any other the
+                cluster split-K.
             moe: The layer's MoE chain, whose weights (and the o-projection
                 shard) are prefetched into L2 while the attention runs; None
                 for a dense layer.
@@ -620,9 +627,10 @@ class KimiK3DecodeAttentionLayer:
 
     def __init__(self, owner, decoder, layer_idx, mla, first, weight, moe) -> None:
         rows = weight.shape[0]
-        self.projection = PreparedProjection(
-            weight, _projection_tactics(rows, owner.batches)
-        ).prepare()
+        # Compiles every row count's engine now, before any graph capture.
+        self.projection = DecodeProjection(
+            weight, owner.batches, _projection_tactics(rows, owner.batches)
+        )
         # The owner's mailbox and two-shot buffers back this layer's exit.
         self.owner, self.rows = owner, rows
         self.entry = PreparedAttnRes.for_target(decoder, has_delta=not first)
