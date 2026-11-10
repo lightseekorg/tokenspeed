@@ -179,7 +179,7 @@ def test_qwen4_exp_nextn_preserves_quantized_mtp_config() -> None:
     assert qwen4_exp_nextn._resolve_mtp_quant_config(excluded) is None
 
 
-def test_qwen4_exp_nextn_drops_quark_quantization_for_excluded_mtp() -> None:
+def test_qwen4_exp_nextn_resolves_mtp_linear_exclusions() -> None:
     mtp_linear_modules = [
         f"mtp.layers.0.{module}"
         for module in (
@@ -193,10 +193,15 @@ def test_qwen4_exp_nextn_drops_quark_quantization_for_excluded_mtp() -> None:
         )
     ]
     # Quark lists linear modules only; the fused MTP experts are never named.
-    excluded = Mxfp4Config(ignored_layers=["lm_head", *mtp_linear_modules])
+    excluded = Mxfp4Config(
+        quant_method="quark", ignored_layers=["lm_head", *mtp_linear_modules]
+    )
     assert qwen4_exp_nextn._resolve_mtp_quant_config(excluded) is None
 
-    quantized = Mxfp4Config(ignored_layers=["lm_head"])
+    # An MXFP4 export can keep the linears BF16 and pack only routed experts.
+    quantized = Mxfp4Config.from_config(
+        {"quant_method": "mxfp4", "ignored_layers": ["lm_head", *mtp_linear_modules]}
+    )
     assert qwen4_exp_nextn._resolve_mtp_quant_config(quantized) is quantized
 
 

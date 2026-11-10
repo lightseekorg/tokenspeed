@@ -45,6 +45,12 @@ arguments or bucketed, never `constexpr`.
 
 ## FlashInfer adapters (`flashinfer.py`)
 
+### TRT-LLM MXFP4 activation
+
+FlashInfer TRT-LLM MXFP4 defaults to standard SwiGLU (`silu(gate) * up`)
+when the layer supplies no activation parameters. Explicit SwiGLU and SiTU
+parameters come from the model.
+
 ### Opt-in SM90 block-FP8 grouped MoE
 
 `prepare_sm90_fp8_moe(mode=...)` prepares a callable before warmup and graph
@@ -650,3 +656,48 @@ o-projection shard). Each layer then does the following:
 A closing AttnRes reads the last MoE row and applies the final norm. A layer's
 output exists as the residual prefix once the next entry (or the closing
 AttnRes) has added its feed-forward row, so drafter captures are taken there.
+
+
+## Qwen4 MXFP4 MegaMoE
+
+Qwen4 MXFP4 checkpoints can use `--moe-backend mega_moe` (or its
+`deep_gemm_mega_moe` alias) with the existing `tokenspeed-deepgemm` package.
+No SGLang fork is needed: this is the existing FP8-activation / MXFP4-weight
+kernel, not W4A4. Standard SiLU and standard SwiGLU select the same fused
+expert arithmetic. The checkpoint loader preserves packed E2M1 bytes and
+per-32 UE8M0 scales and shards routed experts across EP ranks.
+
+Use MoE TP=1, EP>1, attention DP and `--all2all-backend none`, for example
+DP4/TP2/EP8. Qwen computes top-k on each rank's scattered rows; DeepGEMM stages
+FP8 activations and routes, then owns dispatch, both expert GEMMs and combine.
+The routed output is complete and must not be all-reduced again. Shared
+experts remain independent, with replicated weights over scattered token
+rows, followed by Qwen's sigmoid-gated addition. Attention communication and
+its fusion remain unchanged.
+
+The persistent per-rank token capacity covers chunked prefill (or the
+unchunked prefill bound), prefill graphs, and the maximum decode batch times
+the speculative verification width. It does not depend on the first batch.
+Unchunked prefill requires an explicit positive `--max-model-len` and
+reserves for `max_prefill_tokens + max_model_len`. Chunked prefill bounds the
+workspace and startup work for long contexts.
+Post-quantization warmup reserves the planned workspace and compiles tiles up
+to its per-rank token capacity before capture. Matching layers reuse the
+backend's workspace and warmup cache.
+Set `TOKENSPEED_DISABLE_MEGA_MOE_WARMUP=1` to defer this work to the first
+forward. An empty owner still enters the collective with zero-row inputs and
+output, using DeepGEMM's native empty-rank support.
+
+Qwen4 NextN can also load MXFP4 routed experts when the checkpoint leaves its
+attention and shared expert in BF16. For a draft with packed MXFP4 weights, use
+`--speculative-draft-model-quantization mxfp4`.
+
+`test/runtime/test_qwen4_mxfp4_mega_moe.py` checks model planning, EP checkpoint
+loading, capacity bounds, and (under torch.distributed.run) independent shared
+expert execution. The Blackwell numerical and graph regression can
+also exercise uneven/empty owners over multiple GPUs:
+
+```bash
+python -m torch.distributed.run --standalone --nproc-per-node=2 -m pytest -q \
+  tokenspeed-kernel/test/nvidia/ops/moe/test_deep_gemm_mxfp4_mega_moe.py
+```
