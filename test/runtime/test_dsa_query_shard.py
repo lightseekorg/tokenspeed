@@ -76,6 +76,9 @@ WORLD = 4
 EXTEND = [4, 1, 5]
 PREFIX = [2, 4, 0]
 HISTORY = [p + e for p, e in zip(PREFIX, EXTEND)]  # [6, 5, 5]
+# The formats query context parallelism hands the top-k as workspace rows;
+# no top-k leaf takes mxfp4 rows.
+ROW_INDEX_K_FORMATS = ("fp8_scaled", "bf16")
 
 
 def _backend(
@@ -691,7 +694,17 @@ def _written_index_k_pool(index_k_format: str, page_size: int, pages: int):
     return pool, expected_index_k_rows(index_k_format, keys)
 
 
-@pytest.mark.parametrize("index_k_format", INDEX_K_FORMATS)
+def _paged_index_k_pool(index_k_format: str, page_size: int, pages: int):
+    """A pool over a plane of ``pages`` pages for a gather that moves whole
+    pages as bytes: written keys, or random codes for ``mxfp4``."""
+    if index_k_format != "mxfp4":
+        return _written_index_k_pool(index_k_format, page_size, pages)[0]
+    row_bytes = index_k_row_bytes(INDEX_HEAD_DIM, index_k_format)
+    plane = torch.randint(0, 256, (pages * page_size, row_bytes), dtype=torch.uint8)
+    return index_k_pool(plane, head_dim=INDEX_HEAD_DIM, page_size=page_size)
+
+
+@pytest.mark.parametrize("index_k_format", ROW_INDEX_K_FORMATS)
 def test_the_index_k_gather_reads_back_what_the_pool_wrote(index_k_format):
     """``gather_index_k_rows`` is the read side of ``set_index_k_buffer``: the
     packed row of a slot is the bytes the write stored for it (FP8 bytes then
@@ -732,7 +745,7 @@ def test_the_index_k_gather_reads_back_what_the_pool_wrote(index_k_format):
         pool.gather_index_k_rows(0, slots, index_k_format=other)
 
 
-@pytest.mark.parametrize("index_k_format", INDEX_K_FORMATS)
+@pytest.mark.parametrize("index_k_format", ROW_INDEX_K_FORMATS)
 def test_the_index_k_history_is_one_gather_per_group(monkeypatch, index_k_format):
     """``gather_history_index_k`` moves the packed rows in one collective and
     hands the indexer views of the workspace in the plane's format: FP8 bytes
@@ -783,7 +796,7 @@ def test_the_history_index_k_pages_read_like_the_pools_plane(
     _init_history(backend)
     plan = backend.history_prefill_plan()
     _gather_one_owner(monkeypatch)
-    pool, _ = _written_index_k_pool(index_k_format, PAGE, 10)
+    pool = _paged_index_k_pool(index_k_format, PAGE, 10)
     workspace = backend._history_workspace.index_k
     first = 0
     for group in plan.groups:
@@ -799,7 +812,7 @@ def test_the_history_index_k_pages_read_like_the_pools_plane(
         want = pool.gather_index_k_rows(0, history, index_k_format=index_k_format)
         assert torch.equal(got, want)
     # The gather moves kernel pages: a plane paged otherwise is refused.
-    wide_pool, _ = _written_index_k_pool(index_k_format, 8, 3)
+    wide_pool = _paged_index_k_pool(index_k_format, 8, 3)
     with pytest.raises(RuntimeError, match="index-K plane pages 8"):
         backend.gather_history_index_k_pages(0, wide_pool, plan.groups[0])
 
@@ -918,7 +931,7 @@ def test_the_workspace_reservation_matches_the_recipe_plan(
     monkeypatch, index_k_format, history_prefill
 ):
     """The recipe's plan (``dsa_history_gather_workspace_bytes``) and the
-    leaf's allocation are the same bytes in either index-K format: the
+    leaf's allocation are the same bytes in every index-K format: the
     index-K rows are packed in the plane's own row width, beside the latent
     rows or, under a KVP prefill over gathered histories, in their buffer."""
     from tokenspeed.runtime.layers.attention.configs import dsa as dsa_configs
@@ -945,7 +958,7 @@ def test_the_workspace_reservation_matches_the_recipe_plan(
     # One whole history, padded to kernel pages.
     rows = 38
     row_bytes = index_k_row_bytes(INDEX_HEAD_DIM, index_k_format)
-    assert row_bytes == (132 if index_k_format == "fp8_scaled" else 256)
+    assert row_bytes == {"fp8_scaled": 132, "bf16": 256, "mxfp4": 68}[index_k_format]
 
     def planned(rows):
         if history_prefill:
@@ -1199,7 +1212,7 @@ def _register_rows_leaf(name: str, *, index_k_format: str, takes_rows: bool):
     return spec.name
 
 
-@pytest.mark.parametrize("index_k_format", INDEX_K_FORMATS)
+@pytest.mark.parametrize("index_k_format", ROW_INDEX_K_FORMATS)
 def test_construction_probes_the_rows_leaf_the_sharded_prefill_will_need(
     index_k_format,
 ):
@@ -1235,3 +1248,10 @@ def test_construction_probes_the_rows_leaf_the_sharded_prefill_will_need(
     finally:
         for name in (rows, plane, foreign):
             KernelRegistry.get()._unregister(name)
+
+
+def test_construction_refuses_mxfp4_under_query_context_parallelism():
+    backend = _backend(0, workspace_rows=0, index_k_format="mxfp4")
+    backend.batch_invariant = True
+    with pytest.raises(ValueError, match="workspace-row order .* 'mxfp4'"):
+        backend._probe_history_gather_topk_leaf(SimpleNamespace(index_n_heads=16))
