@@ -357,27 +357,18 @@ trainer-side contract below) when that matters.
 
 ### Mooncake weight updates
 
-The runtime includes the independent WeightStore receiver at
-`tokenspeed.runtime.execution.weight_store`. Select it with
-`--model-update-sdk-module tokenspeed.runtime.execution.weight_store` and
-`--model-update-engine-type TOKENSPEED`, supply the standalone SDK's flat
-`backend=weight_store` configuration and use `--model-update-draft-weights retain`.
-This optional path requires the independent `weight_store` and `data_dist_hub`
-packages in the scheduler environment. It does not import a rollout framework or
-the previous weight-update SDK.
-
-The update request carries a complete publication directory in `snapshot`,
-encoded as `{version, zlib_base64}`. Tensor contents remain in the Store.
-The receiver validates the publication version, declares the target's logical HF
-regions and calls the standalone SDK on the Store device's current CUDA stream.
-The SDK reads and assembles the tensors; the native loader owns physical TP/EP
-layout and the surrounding weight-update session owns finalization. This path
-supports one unquantized target and retains draft checkpoint weights.
+Install a Model Updater SDK provider in every scheduler environment and select
+its import path with `--model-update-sdk-module`. TokenSpeed supplies the update
+session and control-plane coordination; the provider owns store access, model
+support and publication metadata. The standalone WeightStore receiver is supplied
+by an external plugin rather than bundled with the runtime. Follow that
+provider's documentation for its module path, dependencies and configuration.
 
 `UpdateWeightsFromMooncakeReqInput` loads one committed checkpoint version
 that the RL trainer published to a Mooncake weight store through the Model
 Updater SDK. Fields: `version` (an integer), `flush_cache` (default true),
-and `weight_version` (optional). Every scheduler process reads its own shard
+`weight_version` (optional), and `snapshot` (optional SDK publication metadata
+passed unchanged to the provider). Every scheduler process reads its own shard
 with its global rank as the SDK reader rank, on the forward thread, ordered
 against forwards like the distributed update. The reply arrives only after
 every worker finished its read.
@@ -1104,7 +1095,7 @@ derives every field from host-side timestamps and counters it already has —
 the line adds **no GPU sync** and so no engine slowdown. Example:
 
 ```
-Req: chatcmpl-019ef6b7 Finish! RequestStats(status='finished', reason='stop', prompt_tokens=28684, cache_tokens=832, output_tokens=33, cache_hit_rate=0.029, queue_ms=13.8, prefill_ms=15.8, ttft_ms=42.1, total_ms=58.0, preempt_ms=0.0, preempt_count=0, decode_tps=210.4, acc_len=None, acc_rate=None, recv_ts=1782255696.726, commit_ts=1782255696.74, finish_ts=1782255696.784)
+Req: chatcmpl-019ef6b7 Finish! RequestStats(status='finished', reason='stop', prompt_tokens=28684, cache_tokens=832, output_tokens=33, cache_hit_rate=0.029, queue_ms=13.8, prefill_ms=15.8, decode_wait_ms=0.0, ttft_ms=42.1, total_ms=58.0, preempt_ms=0.0, preempt_count=0, decode_tps=210.4, acc_len=None, acc_rate=None, recv_ts=1782255696.726, commit_ts=1782255696.74, finish_ts=1782255696.784)
 ```
 
 | Field | Meaning |
@@ -1113,8 +1104,9 @@ Req: chatcmpl-019ef6b7 Finish! RequestStats(status='finished', reason='stop', pr
 | `prompt_tokens` / `cache_tokens` / `output_tokens` | Prompt tokens, prefix-cache-hit tokens, generated tokens. |
 | `cache_hit_rate` | `cache_tokens / prompt_tokens` (0–1). |
 | `queue_ms` | Received → first scheduled into a forward batch. |
-| `prefill_ms` | Scheduled → prefill complete. |
-| `ttft_ms` | Received → first output token (always ≥ `prefill_ms`; it also spans the queue). |
+| `prefill_ms` | Scheduled → prefill complete. Always `0` on a decode node, whose prompt is prefilled on the prefill node. |
+| `decode_wait_ms` | Decode nodes only: KV (with the bootstrap token) landed → first decode batch dispatch. `0` elsewhere. |
+| `ttft_ms` | Received → first output token. On a decode node the first token is the prefill node's bootstrap token, so `ttft_ms` spans received → KV landed. |
 | `total_ms` | Received → finished/aborted. |
 | `preempt_ms` / `preempt_count` | Wall-clock this request's decode was delayed by prefilling other requests, and the number of such interruptions. Host-side best-effort. |
 | `decode_tps` | Decode throughput (generated tokens / decode window). |
