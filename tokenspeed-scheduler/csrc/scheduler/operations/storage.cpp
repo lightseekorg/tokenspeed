@@ -82,7 +82,9 @@ Scheduler::SharedPrefixPublication Scheduler::GetSharedPrefixPublication(std::sp
     const auto dependencies = coordinator_.SharedPrefixKeys(
         {.prefix_hashes = hashes, .tokens = input, .max_tokens = max_prefix_tokens, .tail = tail},
         static_cast<std::size_t>(storage_transfers_->Config().metadata_entries));
-    if (dependencies.max_tokens < 0)
+    if (dependencies.max_tokens == 0)
+        result.status = "unsupported";
+    else if (dependencies.max_tokens < 0)
         result.status = "too_large";
     else if (dependencies.max_tokens > 0 && !dependencies.keys.empty() &&
              std::ranges::all_of(dependencies.keys,

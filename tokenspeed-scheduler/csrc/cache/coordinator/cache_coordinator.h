@@ -406,7 +406,7 @@ public:
                                          std::optional<CopyInPoint> copy_in_point,
                                          std::optional<std::uint64_t> request_access_epoch,
                                          bool evict_blocks_past_segments, const std::string& session_id,
-                                         const std::string& cache_group_id = {});
+                                         const std::string& cache_group_id);
 
     // The data slots of a retracted request are the non-null slots covering
     // [0, num_tokens) in every group -- the unaligned tail block included;

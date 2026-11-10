@@ -920,6 +920,43 @@ fn shared_prefix_publication_exposes_pressure_and_flush_epoch() {
 }
 
 #[test]
+fn shared_prefix_publication_rejects_unsupported_state_boundaries() {
+    interpreter();
+    for checkpoint_granularity in [1, 4] {
+        let code = STORAGE_SCHEDULER.replace(
+            "result = ts.Scheduler(cfg)",
+            &format!(
+                "cfg.state_checkpoint_in_forward = True\ncfg.cache_groups = [*cfg.cache_groups, ts.CacheGroupConfig('state', 0, 32, ts.AttnKind.State, transfer_policy=ts.CacheTransferPolicy.LatestSnapshot, checkpoint_granularity={checkpoint_granularity})]\ncfg.host_group_packing = [1, 1]\nresult = ts.Scheduler(cfg)"
+            ),
+        );
+        let mut scheduler = Python::attach(|py| Scheduler::from_python(&run(py, &code)).unwrap());
+        assert!(scheduler.shared_prefix_storage_enabled());
+        for pressure in [false, true] {
+            let mut round = tick(if pressure { 2 } else { 1 });
+            round.tick.as_mut().unwrap().queued_operations = if pressure { 100 } else { 0 };
+            scheduler.advance_head(&round, &[]).unwrap();
+            for boundary in [4, 5] {
+                let result = scheduler
+                    .shared_prefix_publication(&[1, 2, 3, 4, 5, 6], boundary)
+                    .unwrap();
+                let expected = if boundary % checkpoint_granularity != 0 {
+                    "unsupported"
+                } else if pressure {
+                    "pressure"
+                } else {
+                    "pending"
+                };
+                assert_eq!(
+                    result.status, expected,
+                    "grain={checkpoint_granularity}, boundary={boundary}, pressure={pressure}"
+                );
+                assert_eq!(result.confirmed_prefix_tokens, 0);
+            }
+        }
+    }
+}
+
+#[test]
 fn shared_prefix_publication_follows_real_prefill_host_copy_and_put() {
     interpreter();
     for state_group in [false, true] {

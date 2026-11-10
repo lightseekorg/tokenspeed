@@ -263,7 +263,7 @@ inline std::optional<CacheCoordinator::AdmissionResult> AdmitForTest(
     }
     return coordinator.Admit(std::move(prefix), demands, progress, copy_in_blocks, copy_in_point,
                              /*request_access_epoch=*/std::nullopt, /*evict_blocks_past_segments=*/false,
-                             /*session_id=*/{});
+                             /*session_id=*/{}, /*cache_group_id=*/{});
 }
 
 inline std::optional<CacheCoordinator::AdmissionResult> AdmitForTest(

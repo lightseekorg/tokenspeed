@@ -2827,18 +2827,20 @@ do not count. This lets a later producer reuse confirmed historical objects
 without writing them back merely to manufacture a receipt. The query uses the normal chained token
 hashes and checkpoint geometry; a group identifier cannot establish a hit.
 `confirmed_prefix_tokens` equals the requested boundary only for `published`,
-and is zero otherwise. Restricted checkpoint geometries may leave an arbitrary
-cut boundary `pending`; this query neither creates intermediate checkpoints nor
-changes model numerics.
+and is zero otherwise. A boundary that violates restricted State checkpoint
+geometry is `unsupported`, not `pending`: retrying cannot make it publishable.
+This query neither creates intermediate checkpoints nor changes model numerics.
 
 Receipts have the storage metadata budget, hold no block references, and are
 forgotten on all-tier cache flush, which increments `cache_epoch`. The reply
 also includes the executor's actual `storage_namespace`, including weight
 versions. Known object failures invalidate matching receipts. `pressure` reports
 blocked storage progress, `too_large` reports a complete dependency larger than
-the metadata budget, and `unsupported` reports a missing publication path. A
-router must bound its polling deadline and fall back to ordinary execution on
-these conditions or cancellation; queries keep no per-request wait state.
+the metadata budget, and `unsupported` reports a missing publication path or an
+unsupported checkpoint boundary. A router must not retry `unsupported` or
+`too_large`; it must bound its polling deadline for `pending` and fall back to
+ordinary execution on unavailable storage or cancellation. Queries keep no
+per-request wait state.
 
 A receipt proves past publication, not permanent residency: shared-store
 eviction can occur after the reply, and bounded receipt eviction can produce

@@ -117,6 +117,8 @@ control_struct! {
         /// Attention-DP rank, assigned by the transport.
         dp_rank: i64,
         /// published, pending, pressure, unsupported, or too_large.
+        /// unsupported includes boundaries disallowed by checkpoint geometry;
+        /// unsupported and too_large are terminal for this query.
         status: String,
         /// The exact requested prefix for published, otherwise zero.
         confirmed_prefix_tokens: i64,
