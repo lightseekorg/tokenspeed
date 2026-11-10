@@ -33,6 +33,8 @@ BF16 step and outputs and corrections by what that step propagates.
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -254,6 +256,21 @@ def test_far_pages_of_a_pool_past_int32_verify_like_near_ones():
 def test_fused_step_without_metadata_records_by_request():
     x = _inputs(4, seed=40, metadata=False)
     _assert_matches(_split(x), _fused(x))
+
+
+@pytest.mark.parametrize("strided", ["metadata", "stamps"])
+def test_strided_replay_records_are_rejected(strided):
+    """The kernel reads the record metadata and stamps as dense INT64 rows."""
+    x = _inputs(3, seed=42)
+    records = _records(x, original=True)[0]
+    dense = records.metadata if strided == "metadata" else records.stamps
+    wide = dense.new_zeros(*dense.shape[:-1], 2 * dense.shape[-1])
+    view = wide[..., ::2]
+    view.copy_(dense)
+    assert not view.is_contiguous() and torch.equal(view, dense)
+    records = dataclasses.replace(records, **{strided: view})
+    with pytest.raises(ValueError, match="contiguous INT64"):
+        _verify(x, records)
 
 
 @pytest.mark.parametrize("unaligned", ["f_a rows", "conv weights"])

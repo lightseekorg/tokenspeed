@@ -158,6 +158,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
     scheduler_config.def(nb::init<>())
         .def_rw("prefix_granularity", &tokenspeed::SchedulerConfig::prefix_granularity)
         .def_rw("max_scheduled_tokens", &tokenspeed::SchedulerConfig::max_scheduled_tokens)
+        .def_rw("enable_short_prefill_first", &tokenspeed::SchedulerConfig::enable_short_prefill_first)
         .def_rw("max_kv_page_num", &tokenspeed::SchedulerConfig::max_kv_page_num)
         .def_rw("max_batch_size", &tokenspeed::SchedulerConfig::max_batch_size)
         .def_rw("decode_input_tokens", &tokenspeed::SchedulerConfig::decode_input_tokens)
@@ -681,7 +682,14 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
              nb::overload_cast<const std::vector<tokenspeed::RequestSpec>&>(&tokenspeed::Scheduler::SubmitRequests),
              nb::arg("request_specs"))
         .def(
-            "next_execution_plan", [](tokenspeed::Scheduler& s) { return s.NextExecutionPlan(); },
+            "next_execution_plan",
+            [](tokenspeed::Scheduler& s) {
+                // Python deliberately fixes ordinary scheduling for this API.
+                // Only the Rust host drives the serving prefill gate, passing
+                // both options explicitly for each plan.
+                return s.NextExecutionPlan(
+                    tokenspeed::Scheduler::PlanOptions{.allow_prefill = true, .apply_prefill_watermark = false});
+            },
             nb::call_guard<nb::gil_scoped_release>())
         .def("advance", &tokenspeed::Scheduler::Advance, nb::arg("event"))
         .def("drain_kv_events",

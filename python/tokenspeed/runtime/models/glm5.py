@@ -41,7 +41,6 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
-from tokenspeed.runtime.configs.utils import get_rope_theta
 from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.comm_ops import all_gather_single
@@ -80,9 +79,7 @@ from tokenspeed.runtime.models.deepseek_v3 import (
     DeepseekV3AttentionMLA,
     DeepseekV3DecoderLayer,
     DeepseekV3ForCausalLM,
-    DeepseekV3MLP,
     DeepseekV3Model,
-    DeepseekV3MoE,
 )
 from tokenspeed.runtime.utils import add_prefix, set_weight_attrs
 from tokenspeed.runtime.utils.device_stream import is_current_stream_capturing
@@ -1632,163 +1629,33 @@ class GlmMoeDsaAttention(GlmDsaSparseAttentionMixin, DeepseekV3AttentionMLA):
 
 
 class GlmMoeDsaDecoderLayer(DeepseekV3DecoderLayer):
-    def __init__(
-        self,
-        config: PretrainedConfig,
-        layer_id: int,
-        mapping: Mapping,
-        quant_config: QuantizationConfig | None = None,
-        is_nextn: bool = False,
-        prefix: str = "",
-        alt_stream: torch.cuda.Stream | None = None,
-    ) -> None:
-        nn.Module.__init__(self)
-        self.mapping = mapping
-        self.hidden_size = config.hidden_size
-        rope_theta = get_rope_theta(config)
-        rope_scaling = getattr(config, "rope_scaling", None)
-        max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
+    @property
+    def attention_cls(self) -> type[nn.Module]:
+        return GlmMoeDsaAttention
 
-        self.self_attn = GlmMoeDsaAttention(
-            config=config,
-            hidden_size=self.hidden_size,
-            num_heads=config.num_attention_heads,
-            qk_nope_head_dim=config.qk_nope_head_dim,
-            qk_rope_head_dim=config.qk_rope_head_dim,
-            v_head_dim=config.v_head_dim,
-            q_lora_rank=(
-                config.q_lora_rank if hasattr(config, "q_lora_rank") else None
-            ),
-            kv_lora_rank=config.kv_lora_rank,
-            rope_theta=rope_theta,
-            rope_scaling=rope_scaling,
-            max_position_embeddings=max_position_embeddings,
-            quant_config=(
-                None
-                if "self_attn" in getattr(config, "disable_quant_module", [])
-                else quant_config
-            ),
-            layer_id=layer_id,
-            prefix=add_prefix("self_attn", prefix),
-            reduce_attn_results=False,
-            alt_stream=alt_stream,
-            mapping=self.mapping,
-            is_nextn=is_nextn,
-        )
+    @property
+    def dense_batch_invariant(self) -> bool:
+        return False
 
-        self.layer_id = layer_id
-        self.is_moe_layer = self._is_moe_layer(layer_id, is_nextn, config)
-        if self.is_moe_layer:
-            self.mlp = DeepseekV3MoE(
-                config=config,
-                mapping=self.mapping,
-                quant_config=quant_config,
-                layer_index=layer_id,
-                prefix=add_prefix("mlp", prefix),
-                alt_stream=alt_stream,
-            )
-        else:
-            self.mlp = DeepseekV3MLP(
-                hidden_size=config.hidden_size,
-                intermediate_size=(
-                    config.ffn_hidden_size
-                    if hasattr(config, "ffn_hidden_size")
-                    else config.intermediate_size
-                ),
-                hidden_act=config.hidden_act,
-                mapping=self.mapping,
-                quant_config=(
-                    None
-                    if "dense_mlp" in getattr(config, "disable_quant_module", [])
-                    else quant_config
-                ),
-                prefix=add_prefix("mlp", prefix),
-                is_shared_expert=False,
-                batch_invariant=False,
-            )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.comm_manager = CommManager(
-            mapping=self.mapping,
-            layer_id=self.layer_id,
-            is_moe=self.is_moe_layer,
-            prev_is_moe=self._is_moe_layer(layer_id - 1, is_nextn, config),
-            dense_batch_invariant=False,
-            input_layernorm=self.input_layernorm,
-            post_attn_layernorm=self.post_attention_layernorm,
-            query_sharded=False,
-        )
+    def attention_kwargs(self, prefix: str) -> dict:
+        return {**super().attention_kwargs(prefix), "is_nextn": self.is_nextn}
 
-    def forward(
+    def narrow_residual(
+        self, residual: torch.Tensor, ctx: ForwardContext
+    ) -> torch.Tensor:
+        if ctx.draft_narrowing is None:
+            return residual
+        return residual.index_select(0, ctx.gather_ids)
+
+    def forward_idle_attn(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        residual: torch.Tensor | None,
-        aux_hidden_states: list[torch.Tensor] | None = None,
-    ) -> torch.Tensor:
-        num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
-            ctx
-        )
-
-        if not ctx.forward_mode.is_idle():
-            hidden_states, residual = self.comm_manager.input_reduce_norm(
-                hidden_states, residual
-            )
-            capture_layer_input(self.comm_manager, residual, ctx, aux_hidden_states)
-            hidden_states = self.self_attn(
-                positions=positions,
-                hidden_states=hidden_states,
-                ctx=ctx,
-                comm_manager=self.comm_manager,
-            )
-            if ctx.draft_narrowing is not None:
-                residual = residual.index_select(0, ctx.gather_ids)
-            hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
-                hidden_states, residual, ctx
-            )
-            hidden_states = self.forward_mlp(
-                hidden_states,
-                residual,
-                ctx,
-                num_global_tokens,
-                max_num_tokens_per_gpu,
-            )
-        else:
-            # No rows, but the tap and its gather stay aligned across ranks.
-            capture_layer_input(
-                self.comm_manager, hidden_states, ctx, aux_hidden_states
-            )
-            hidden_states = self.forward_mlp(
-                hidden_states,
-                residual,
-                ctx,
-                num_global_tokens,
-                max_num_tokens_per_gpu,
-            )
-        return hidden_states, residual
-
-    def forward_mlp(
-        self,
-        hidden_states,
-        residual,
-        ctx: ForwardContext,
-        num_global_tokens,
-        max_num_tokens_per_gpu,
-    ):
-        hidden_states = self.comm_manager.pre_mlp_comm(hidden_states, ctx)
-        if self.is_moe_layer:
-            hidden_states = self.mlp(
-                hidden_states, num_global_tokens, max_num_tokens_per_gpu
-            )
-        else:
-            hidden_states = self.mlp(hidden_states)
-        hidden_states, residual = self.comm_manager.post_mlp_fused(
-            hidden_states, residual, ctx
-        )
-        return hidden_states
+        aux_hidden_states: list[torch.Tensor] | None,
+    ) -> None:
+        # No rows, but the tap and its gather stay aligned across ranks.
+        capture_layer_input(self.comm_manager, hidden_states, ctx, aux_hidden_states)
 
 
 class GlmMoeDsaModel(DeepseekV3Model):

@@ -4,6 +4,19 @@ type: eval
 workflow_stage: model-test
 triggers:
   - per-commit
+# The model modules this task serves; pull requests changing only other models skip it.
+model_sources:
+  - python/tokenspeed/runtime/models/deepseek_v3.py
+  - python/tokenspeed/runtime/models/dflash.py
+  - python/tokenspeed/runtime/models/dspark.py
+  - python/tokenspeed/runtime/models/glm5.py
+  - python/tokenspeed/runtime/models/kimi_k3.py
+  - python/tokenspeed/runtime/models/kimi_k31.py
+  - python/tokenspeed/runtime/models/kimi_k3_comm.py
+  - python/tokenspeed/runtime/models/kimi_k3_deepep.py
+  - python/tokenspeed/runtime/models/kimi_k3_dspark.py
+  - python/tokenspeed/runtime/models/kimi_k3_projection.py
+  - python/tokenspeed/runtime/models/moonvit.py
 runner:
   labels:
     - slurm-gb300-4gpu
