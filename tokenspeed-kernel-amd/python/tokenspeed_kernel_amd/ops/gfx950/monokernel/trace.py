@@ -87,10 +87,14 @@ def allocate(buf):
 def _stamp_asm(outputs, inputs):
     (stamp_v,), (address,), (stamp_s,) = outputs
     (base,), (offset,) = inputs
-    # Every lane of the wave writes the wave's stamp to the wave's slot.
+    # Every lane of the wave writes the wave's stamp to the wave's slot. The
+    # compiler pads wait states for its own instructions only: an SGPR input
+    # written just before the asm (e.g. by a v_readlane_b32 spill restore)
+    # needs 2 before a VALU reads it, and s_memrealtime gives only 1.
     return "\n".join(
         [
             f"s_memrealtime {stamp_s}",
+            "s_nop 0",
             f"v_add_u32 {address}, {base}, {offset}",
             "s_waitcnt lgkmcnt(0)",
             f"v_mov_b64 {stamp_v}, {stamp_s}",
