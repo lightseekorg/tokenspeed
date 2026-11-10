@@ -340,12 +340,6 @@ class GlmDsaIndexer(nn.Module):
         )
 
 
-def _index_k_format(pool) -> str | None:
-    """The pool's index-K plane format for the top-k facades, or ``None`` to
-    let them read it off the plane's dtype (pools that do not name one)."""
-    return getattr(pool, "index_k_format", None)
-
-
 class GlmDsaSparseAttentionMixin:
     """DSA sparse MLA shared by the GLM-DSA and Kimi-K3.1 attention layers.
 
@@ -407,8 +401,8 @@ class GlmDsaSparseAttentionMixin:
         With ``index_query_mxfp4`` set, the query is quantized to mxfp4 by
         the plane's own row codec (:func:`dsa_quantize_index_query_mxfp4`):
         uint8 ``[tokens, index_heads, head_dim / 2]`` E2M1 codes and int32
-        ``[tokens, index_heads]`` UE8M0 scale words. That codec encodes each
-        (token, head) alone, so it holds under bitwise numerics too.
+        ``[tokens, index_heads]`` UE8M0 scale words (K3.1 refuses an mxfp4
+        plane under bitwise numerics).
         With ``index_query_fp8`` set and an ``fp8_scaled`` (uint8) plane, the
         query is quantized to FP8 E4M3 with one FP32 scale
         ``max(amax, 1e-10) / 448`` per (token, head) over ``head_dim``.
@@ -765,7 +759,7 @@ class GlmDsaSparseAttentionMixin:
                     causal_lens,
                     placement=placement,
                     page_size=page_size,
-                    index_k_format=_index_k_format(ctx.token_to_kv_pool),
+                    index_k_format=ctx.token_to_kv_pool.index_k_format,
                 )
             if (
                 self.owned_decode_topk
@@ -813,7 +807,7 @@ class GlmDsaSparseAttentionMixin:
                     metadata=dcp_index,
                     q_scales=q_scales,
                     query_group_size=q_len_per_req,
-                    index_k_format=_index_k_format(ctx.token_to_kv_pool),
+                    index_k_format=ctx.token_to_kv_pool.index_k_format,
                 )
                 local_topk_to_global_slots(
                     local_topk_offsets=offsets,
@@ -843,7 +837,7 @@ class GlmDsaSparseAttentionMixin:
                 out=topk_slice,
                 lens_out=topk_lens_slice,
                 slot_order=global_server_args_dict["dsa_slot_order"],
-                index_k_format=_index_k_format(ctx.token_to_kv_pool),
+                index_k_format=ctx.token_to_kv_pool.index_k_format,
                 solution=self.decode_topk_solution,
             )
         return GlmDsaDecodeTopK(
@@ -1210,7 +1204,7 @@ class GlmDsaSparseAttentionMixin:
                 metadata=owned_index,
                 row_owner=row_owner,
                 q_scales=q_scales,
-                index_k_format=_index_k_format(ctx.token_to_kv_pool),
+                index_k_format=ctx.token_to_kv_pool.index_k_format,
             )
             workspace_indices = torch.where(
                 offsets >= 0, offsets + global_starts.unsqueeze(1), -1
@@ -1228,7 +1222,7 @@ class GlmDsaSparseAttentionMixin:
                 max_logits_bytes=max_logits_bytes,
                 topk=topk,
                 query_proj=indexer_output.query_proj,
-                index_k_format=_index_k_format(ctx.token_to_kv_pool),
+                index_k_format=ctx.token_to_kv_pool.index_k_format,
             )
         return GlmDsaPrefillTopK(
             workspace_indices=workspace_indices,
@@ -1284,7 +1278,7 @@ class GlmDsaSparseAttentionMixin:
                 max_logits_bytes=max_logits_bytes,
                 topk=topk,
                 query_proj=query_proj,
-                index_k_format=_index_k_format(pool),
+                index_k_format=pool.index_k_format,
             )
             indices.append(selected)
             lens.append(selected_lens)
@@ -1336,7 +1330,7 @@ class GlmDsaSparseAttentionMixin:
             placement=placement,
             page_size=ctx.token_to_kv_pool.index_k_page_size,
             columns=columns,
-            index_k_format=_index_k_format(ctx.token_to_kv_pool),
+            index_k_format=ctx.token_to_kv_pool.index_k_format,
         )
 
     def forward_dsa_core(

@@ -175,9 +175,17 @@ def configure_kimi_k31_attention(model_config, server_args: ServerArgs) -> None:
     up to 45K tokens) score the same on both formats within run-to-run
     noise. The checkpoint's BF16 indexer weights (``KimiK3Config`` rejects
     ``indexer_use_fp8: true``) do not pin the serving format of the keys.
+    ``--dsa-index-k-format mxfp4`` stores 68-byte rows instead, refused under
+    bitwise numerics.
     """
-    configure_dsa_attention(model_config, server_args)
-    model_config.index_k_format = server_args.dsa_index_k_format or "fp8_scaled"
+    _configure_dsa_geometry(model_config)
+    index_k_format = server_args.dsa_index_k_format or "fp8_scaled"
+    if index_k_format == "mxfp4" and server_args.numerics in BITWISE_ENVELOPES:
+        raise ValueError(
+            "--dsa-index-k-format mxfp4 is not supported under --numerics "
+            f"{server_args.numerics}"
+        )
+    model_config.index_k_format = index_k_format
     # K3.1 keeps all DSA ops in one eager break narrowing padded replays to live rows.
     model_config.dsa_padded_prefill_replay = True
 
@@ -187,9 +195,19 @@ def configure_dsa_attention(model_config, server_args: ServerArgs) -> None:
 
     Every attention hook takes the resolved launch so a hook can key a choice
     on it (``ModelProfile.configure_attention``); the in-tree ones plan the
-    same geometry under every launch.
+    same geometry under every launch. These models store ``fp8_scaled``
+    index keys, so another ``--dsa-index-k-format`` is refused.
     """
-    del server_args
+    if server_args.dsa_index_k_format not in (None, "fp8_scaled"):
+        raise ValueError(
+            f"--dsa-index-k-format {server_args.dsa_index_k_format} is not "
+            "supported by this model, which stores fp8_scaled index keys"
+        )
+    _configure_dsa_geometry(model_config)
+
+
+def _configure_dsa_geometry(model_config) -> None:
+    """The MLA latent plus DSA indexer geometry, with ``fp8_scaled`` keys."""
     mla_config = (
         model_config.hf_text_config
         if hasattr(model_config.hf_text_config, "kv_lora_rank")

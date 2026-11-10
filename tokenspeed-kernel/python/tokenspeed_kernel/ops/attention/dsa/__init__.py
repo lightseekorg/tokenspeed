@@ -1431,6 +1431,10 @@ def dsa_index_candidates(
     scores, -inf for every invalid (-1) offset and NaN score, which are
     returned as it, and the offsets come back as their own contiguous
     matrix.
+    ``q_scales`` are FP32 per-head scales for FP8 queries, or int32 UE8M0
+    scale words for mxfp4 (uint8) ones. ``index_k_format`` names the plane's
+    format; None reads ``fp8_scaled`` or ``bf16`` off its dtype, so an
+    ``mxfp4`` plane must be named.
     The caller validates that topk is a positive power of two during setup.
     """
     if scores_out is not None and (
@@ -1774,7 +1778,9 @@ def dsa_prefill_topk(
 
     Args:
         q: BF16 or FP8 E4M3 indexer query with shape
-            [tokens, index_heads, head_dim]. FP8 queries require q_scales.
+            [tokens, index_heads, head_dim], or mxfp4 uint8 E2M1 codes
+            [tokens, index_heads, head_dim / 2] (``MXFP4_INDEX_QUERY_FORMAT``)
+            for an ``mxfp4`` plane. FP8 and mxfp4 queries require q_scales.
         weights: Per-token/head weights with shape [tokens, index_heads],
             FP32 or raw BF16 (implementations upcast on the fly).
         kv_workspace_slots: Global KV slot for each workspace row, shape
@@ -1791,10 +1797,12 @@ def dsa_prefill_topk(
             declaring the ``batch_invariant`` feature are eligible.
         index_k_cache: Index-K plane, used with kv_workspace_slots to resolve
             workspace rows inside the selected implementation. Its dtype
-            selects the ``index_k_format`` trait: uint8 is FP8 with scales
-            (``"fp8_scaled"``, packed or page-planar; page-planar caches may
-            have a padded outer page stride), bfloat16 is the unquantized
-            ``[slots, head_dim]`` plane (``"bf16"``, packed). The index keys
+            selects the ``index_k_format`` trait unless ``index_k_format``
+            names it: uint8 is FP8 with scales (``"fp8_scaled"``, packed or
+            page-planar; page-planar caches may have a padded outer page
+            stride), bfloat16 is the unquantized ``[slots, head_dim]`` plane
+            (``"bf16"``, packed). A named ``"mxfp4"`` uint8 plane holds
+            page-planar 68-byte rows of E2M1 codes and UE8M0 scales. The index keys
             come either as this plane or as rows in workspace-row order
             (below), exactly one of the two.
         page_size: KV cache page size for index_k_cache. Passed to selection
@@ -1817,7 +1825,8 @@ def dsa_prefill_topk(
             (:func:`select_dsa_prefill_topk_for_rows` probes the selection).
         q_scales: Optional positive FP32 scale per token/head for FP8 queries,
             defining ``dequant(q[token, head]) = q[token, head].float() *
-            q_scales[token, head]``.
+            q_scales[token, head]``; for mxfp4 queries, int32
+            [tokens, index_heads] words of each head's four UE8M0 scales.
         max_logits_bytes: Optional temporary logits memory cap.
         candidate_lens_cpu: Optional CPU mirror of ``row_ends - row_starts``,
             handed to every implementation registered with the
@@ -1844,6 +1853,9 @@ def dsa_prefill_topk(
         override: Optional exact kernel override name.
         kernel_plan: Optional initialization-time provider, validated without reselection.
         solution: Optional kernel solution to force through normal selection.
+        index_k_format: The plane's format: ``"fp8_scaled"``, ``"bf16"`` or
+            ``"mxfp4"``. None reads it off ``index_k_cache``'s dtype as above;
+            an ``mxfp4`` plane, uint8 too, must be named.
 
     Implementations may accept a strided outer weight dimension, including the
     fused model projection view. q, kv_workspace_slots, row_starts, and row_ends
@@ -2051,8 +2063,11 @@ def dsa_decode_topk(
 
     Args:
         q: BF16 or FP8 E4M3 indexer query with shape
-            [tokens, index_heads, head_dim]. FP8 queries take q_scales, or
-            unit scales where a leaf accepts them (see q_scales).
+            [tokens, index_heads, head_dim], or mxfp4 uint8 E2M1 codes
+            [tokens, index_heads, head_dim / 2] (``MXFP4_INDEX_QUERY_FORMAT``)
+            for an ``mxfp4`` plane. FP8 queries take q_scales, or unit scales
+            where a leaf accepts them (see q_scales); mxfp4 queries require
+            them.
         weights: Per-token/head weights with shape [tokens, index_heads],
             FP32 or raw BF16 (implementations upcast on the fly).
         seq_lens: Per-request full KV length, shape [num_reqs] (= tokens /
@@ -2076,15 +2091,19 @@ def dsa_decode_topk(
         block_table_base_offsets: Optional compact-table base page per request.
             Used only with ``topk_layout="logical_offsets"``.
         index_k_cache: Index-K plane. Its dtype selects the ``index_k_format``
-            trait: uint8 is FP8 with scales (``"fp8_scaled"``, packed or
-            page-planar; page-planar caches may have a padded outer page
-            stride), bfloat16 is the unquantized ``[slots, head_dim]`` plane
-            (``"bf16"``, packed).
+            trait unless ``index_k_format`` names it: uint8 is FP8 with
+            scales (``"fp8_scaled"``, packed or page-planar; page-planar
+            caches may have a padded outer page stride), bfloat16 is the
+            unquantized ``[slots, head_dim]`` plane (``"bf16"``, packed). A
+            named ``"mxfp4"`` uint8 plane holds page-planar 68-byte rows of
+            E2M1 codes and UE8M0 scales.
         q_scales: Optional positive FP32 scale per token/head for FP8 queries,
             defining ``dequant(q[token, head]) = q[token, head].float() *
             q_scales[token, head]``. None gives FP8 queries unit scales, for
             weights that already carry the query scales and the score scale
             (``quantize_index_query_weights``' output, ``softmax_scale=1``).
+            For mxfp4 queries, int32 [tokens, index_heads] words of each
+            head's four UE8M0 scales.
         seq_lens_2d: Optional per-token rows of the request's full KV length
             (``[tokens, 1]``, every row of a request carrying ``seq_lens[req]``),
             the scoring extent the ``plan`` was built from (:func:`dsa_plan`).
@@ -2102,6 +2121,9 @@ def dsa_decode_topk(
         override: Optional exact kernel override name.
         kernel_plan: Optional initialization-time provider, validated without reselection.
         solution: Optional kernel solution to force through normal selection.
+        index_k_format: The plane's format: ``"fp8_scaled"``, ``"bf16"`` or
+            ``"mxfp4"``. None reads it off ``index_k_cache``'s dtype as above;
+            an ``mxfp4`` plane, uint8 too, must be named.
 
     Implementations may accept a strided outer weight dimension, including the
     fused model projection view. q, seq_lens, and block_table must be contiguous

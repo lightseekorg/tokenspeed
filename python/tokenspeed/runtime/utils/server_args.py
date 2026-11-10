@@ -4821,8 +4821,9 @@ class ServerArgs:
             "attention hook takes the choice (Kimi-K3.1). 'fp8_scaled' (the "
             "default): FP8 keys with one fp32 scale per 128 elements, 132 "
             "bytes per token per layer. 'mxfp4': E2M1 keys with one UE8M0 "
-            "scale per 32 elements, 68 bytes, scored against FP8 queries on "
-            "AMD CDNA4; refused under bitwise numerics.",
+            "scale per 32 elements, 68 bytes, scored against MXFP4 queries "
+            "on AMD CDNA4; refused under bitwise numerics. Other DSA models "
+            "refuse any format but fp8_scaled.",
         )
         parser.add_argument(
             "--disable-sampling-tp-sync",
