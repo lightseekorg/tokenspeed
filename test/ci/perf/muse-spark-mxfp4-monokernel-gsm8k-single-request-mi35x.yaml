@@ -10,7 +10,7 @@ api_version: ci.tokenspeed.io/v1
 #
 # One server start gates both: the benchmark exits with status 1 below
 # --min-accuracy, and perf_reference (set from this runner's runs) gates the
-# decode rate. Optional until those runs set it.
+# decode rate: a run whose decode steps leave the monokernels falls below it.
 name: perf-muse-spark-mxfp4-monokernel-gsm8k-single-request-mi35x
 type: perf
 workflow_stage: model-test
@@ -26,7 +26,6 @@ model_sources:
 runner:
   labels:
     - amd-mi35x-8gpu-test
-optional: true
 env:
   CI: "true"
   # main compiles kernels while serving under this recipe (gaps in the startup warmups); set this to error once those warmups cover them.
@@ -90,3 +89,11 @@ perf:
     --output .ci-artifacts/published/gsm8k-single-request/requests.jsonl
 report:
   github_step_summary: true
+perf_threshold: 0.9
+# Values are [Latency (tps/user), Throughput (tps/gpu)].
+#
+# Rounded down from the median of three runs on this runner (771.7 tok/s per
+# request, 79.4 tok/s per GPU, 125 / 128 correct). The regular path decodes
+# about 20% slower on this recipe, below 0.9 of the reference.
+perf_reference:
+  1: [770, 79]

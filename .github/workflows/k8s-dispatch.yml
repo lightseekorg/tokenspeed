@@ -68,6 +68,7 @@ on:
           - test/ci/ut/ut-tokenspeed-kernel-part-i.yaml
           - test/ci/ut/ut-tokenspeed-kernel-part-ii.yaml
           - test/ci/ut/ut-tokenspeed-kernel-post-submit.yaml
+          - test/ci/ut/ut-tokenspeed-kernel-amd-8gpu.yaml
           - test/ci/ut/ut-tokenspeed-kernel.yaml
       runner_pool:
         description: "Runner pool selected from the YAML labels"
