@@ -1522,6 +1522,7 @@ class BeamLogitsProcessor(LogitsProcessor):
             tp_rank=tp.tp_rank,
             tp_size=tp.tp_size,
             tp_group=tp.tp_group,
+            attn_tp_size=tp.tp_size,
             dp_lm_head_tp=False,
         )
         self.beam_softcap = config.final_logit_softcapping

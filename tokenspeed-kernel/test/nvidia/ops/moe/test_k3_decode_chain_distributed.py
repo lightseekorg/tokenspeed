@@ -452,8 +452,9 @@ def test_reverted_scheduling_matches_bit_for_bit(reverted, chain, reverted_chain
         _assert_equal(outputs, expected, f"step {step} ({batch} rows)")
 
 
-# Per-rank o-projection input width (12 heads of 128) and the input projections.
-K_ATTN, MLA_ROWS, KDA_ROWS = 1536, 3648, 6288
+# Per-rank o-projection input width (12 heads of 128) and the input projections;
+# a Kimi-K3.1 DSA layer's adds its indexer's 160 key and head-weight rows to MLA's.
+K_ATTN, MLA_ROWS, DSA_ROWS, KDA_ROWS = 1536, 3648, 3808, 6288
 
 
 def _decoder(device, seed, *, layer_idx, prev_valid_blocks, write, rows):
@@ -527,12 +528,13 @@ def _close(actual, expected, rows, what, tol=0.02):
 
 
 # (prev_valid_blocks, writes a snapshot, input projection rows) per decoder layer:
-# the first writes block 0, the fourth block 1; KDA and MLA projections alternate.
+# the first writes block 0, the fourth block 1; KDA and MLA-family (MLA, then
+# DSA) projections alternate.
 DECODERS = (
     (0, True, KDA_ROWS),
     (1, False, MLA_ROWS),
     (1, False, KDA_ROWS),
-    (1, True, MLA_ROWS),
+    (1, True, DSA_ROWS),
     (2, False, KDA_ROWS),
 )
 NUM_BLOCKS = 2
@@ -573,7 +575,7 @@ def _layer_chain(moe_chain, decoders):
         attention.layer(
             decoder,
             layer_idx=decoder.layer_idx,
-            mla=decoder.in_proj.shape[0] == MLA_ROWS,
+            mla=decoder.in_proj.shape[0] in (MLA_ROWS, DSA_ROWS),
             first=decoder.layer_idx == 0,
             projection_weight=decoder.in_proj,
             moe=moe,

@@ -528,8 +528,9 @@ def _projection_tactics(rows: int, batches) -> dict[int, tuple[int, int, int, in
     """Cluster split-K tactics (M tile, N tile, split, stages) per batch.
 
     Each batch takes its next tested bin's, from GB300 TP8 sweeps of the vendored
-    kernels (KDA 6288 rows, MLA 3648). Every batch gets one: the projection falls
-    back to it for operands the warp split-K cannot take.
+    kernels (KDA 6288 rows, MLA 3648). The Kimi-K3.1 DSA projection
+    (``DSA_ROWS``, 3808) and any other width take MLA's. Every batch gets one: the
+    projection falls back to it for operands the warp split-K cannot take.
     """
     tactics = {}
     for batch in batches:
@@ -539,6 +540,7 @@ def _projection_tactics(rows: int, batches) -> dict[int, tuple[int, int, int, in
                 (64, 64, 1, 6) if n == 64 else (128, n, 2, 5 if n == 32 else 6)
             )
         else:
+            # Unswept at DSA_ROWS: 60 M tiles (the last half full) for MLA's 57.
             stages = {8: 8, 16: 10, 32: 8, 64: 5}[n]
             tactics[batch] = (64, n, 4 if n == 8 else 2, stages)
     return tactics
