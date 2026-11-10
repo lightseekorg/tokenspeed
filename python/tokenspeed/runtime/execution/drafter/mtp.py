@@ -341,6 +341,7 @@ class Mtp(BaseDrafter):
     shares_target_embed_head = True
     supports_pd_layerwise_finalization = True
     supports_speculative_sampling = True
+    drafts_from_vocab_shard = True
 
     def __init__(
         self,

@@ -430,6 +430,16 @@ class SamplingBackend(ABC):
             and vocab_topk_merge_supports(tp_size, top_k)
         )
 
+    def verifies_vocab_shard_draft_probs(self) -> bool:
+        """Whether ``verify`` takes ``draft_probs`` over each rank's vocabulary shard.
+
+        Under ``enable_speculative_sampling`` with sharded target logits, a
+        drafter whose head is sharded alike can then record each rank's
+        columns of ``q`` only (``[P, N, V / tp]``), and never gather its
+        logits. The default reads whole-vocabulary rows.
+        """
+        return False
+
     def warmup_vocab_shard_sampling(
         self,
         shard: SampledVocabShard,
@@ -437,6 +447,7 @@ class SamplingBackend(ABC):
         *,
         draft_q: DraftTreeQ | None,
         with_vocab_mask: bool,
+        draft_probs: torch.Tensor | None,
     ) -> None:
         """Compile what ``sample`` and ``verify`` run on vocabulary shards.
 
@@ -451,6 +462,8 @@ class SamplingBackend(ABC):
             draft_q: The draft q every verify reads, or None when the server
                 verifies without one.
             with_vocab_mask: Whether the server applies grammar masks.
+            draft_probs: The runtime's dense draft distributions every verify
+                reads (whole rows, or this rank's columns), or None.
 
         Raises:
             NotImplementedError: This backend reads whole rows only.

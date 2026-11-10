@@ -371,6 +371,7 @@ def test_warmup_compiles_every_candidate_count(monkeypatch, with_q, shard) -> No
         torch.zeros((1, N), dtype=torch.int32, device="cuda"),
         draft_q=q,
         with_vocab_mask=True,
+        draft_probs=None,
     )
     # Every token allowed.
     mask = torch.full(

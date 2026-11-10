@@ -258,9 +258,10 @@ class VocabShard:
     vocab_start: int  # Global token id of shard column 0.
     logit_scale: float | None  # The logits processor's multiplier, or None.
     softcap: float | None  # The processor's final logit softcap, or None.
-    # This rank's [rows, 2 * MAX_K] pairs to every rank's [W, rows, 2 * MAX_K], W a power of two.
+    # This rank's contiguous [rows, w] pairs to every rank's [W, rows, w], W a power of two.
     gather: Callable[[Tensor], Tensor]
-    pairs: Tensor  # [>= rows, 2 * MAX_K] fp32: this rank's candidates.
+    # Contiguous fp32 scratch of >= rows * 3 * MAX_K: this rank's candidates, w = 2 * MAX_K wide (3 * MAX_K with shard-local draft probabilities).
+    pairs: Tensor
 
 
 def _exact(logits: Tensor) -> bool:
@@ -347,6 +348,7 @@ def shard_candidates(
     shard: VocabShard,
     config: SonicConfig,
     enable_pdl: bool,
+    draft_probs: Tensor | None = None,
 ) -> Tensor:
     """This rank's best ``MAX_K`` candidates per logits row, for the ranks' gather.
 
@@ -359,13 +361,17 @@ def shard_candidates(
         shard: This rank's slice; its ``pairs`` receive the candidates.
         config: The launch config (``pick`` over the shard's columns).
         enable_pdl: Launch with programmatic dependent launch.
+        draft_probs: ``[P, >= g, V_s]`` fp32 draft probabilities this rank
+            recorded over its shard's columns, for a verify launch, or None.
 
     Returns:
-        ``[rows, 2 * MAX_K]`` fp32 view of ``shard.pairs``: each row's candidate
-        values in descending order (bf16 values for bf16 logits, fp32 for
-        fp32), the lower token id first among equal values, then their global
-        token ids as exact fp32 integers; a greedy row keeps only its first
-        maximum, the rest -inf.
+        Contiguous ``[rows, 2 * MAX_K]`` fp32 view of ``shard.pairs``: each
+        row's candidate values in descending order (bf16 values for bf16
+        logits, fp32 for fp32), the lower token id first among equal values,
+        then their global token ids as exact fp32 integers; a greedy row keeps
+        only its first maximum, the rest -inf. With ``draft_probs``,
+        ``[rows, 3 * MAX_K]``: then the probability the row's draft recorded
+        at each candidate (zero on greedy rows and on each request's last row).
 
     Raises:
         ValueError: The logits are neither bf16 nor fp32, or a row offset
@@ -377,7 +383,8 @@ def shard_candidates(
     rows, vocab_size = logits.shape
     blocks = triton.cdiv(vocab_size, config.block_n)
     block_v = next_power_of_2(blocks)
-    pairs = shard.pairs[:rows]
+    width = (2 if draft_probs is None else 3) * MAX_K
+    pairs = shard.pairs.view(-1)[: rows * width].view(rows, width)
     if drafted is None:
         gamma, block_g, stride_g = 0, None, state.grammar.stride(0)
     else:
@@ -417,6 +424,9 @@ def shard_candidates(
         exact,
         shard.logit_scale,
         shard.softcap,
+        d_ptr=draft_probs,
+        stride_d=None if draft_probs is None else draft_probs.stride(0),
+        stride_dg=None if draft_probs is None else draft_probs.stride(1),
         num_warps=config.second_warps,
     )
     return pairs
@@ -431,14 +441,23 @@ def _merged(
     shard: VocabShard | None,
     config: SonicConfig,
     enable_pdl: bool,
+    draft_probs: Tensor | None = None,
 ) -> dict:
-    """The selection kernels' candidate arguments: none for whole rows, else every rank's gathered candidates, which they merge."""
+    """The selection kernels' candidate arguments: none for whole rows, else every rank's gathered candidates (with ``draft_probs``, carrying them), which they merge."""
     if shard is None:
         _reduce(logits, state, slots, drafted, scratchpad, config, enable_pdl, None)
         return {}
     pairs = shard.gather(
         shard_candidates(
-            logits, state, slots, drafted, scratchpad, shard, config, enable_pdl
+            logits,
+            state,
+            slots,
+            drafted,
+            scratchpad,
+            shard,
+            config,
+            enable_pdl,
+            draft_probs,
         )
     )
     ranks = pairs.shape[0]
@@ -580,6 +599,7 @@ def verify(
     shard: VocabShard | None = None,
     draft_probs: Tensor | None = None,
     reject_threshold: float | None = None,
+    candidate_drafts: Tensor | None = None,
 ) -> None:
     """Verify each request's drafts against its slot's distribution by rejection sampling.
 
@@ -609,15 +629,23 @@ def verify(
             every rank must launch with the same rows.
         draft_probs: ``[P, >= g, V]`` fp32 draft distributions by slot, row
             ``j`` the ``q`` draft ``j`` was sampled from (the runtime's
-            ``draft_probs``), or None for point-draw drafts.
+            ``draft_probs``), or None for point-draw drafts. With ``shard``
+            it may instead be ``[P, >= g, V_s]``, the distributions over this
+            rank's columns only: each rank's candidates then carry their
+            probabilities through the gather.
         reject_threshold: Recorded probabilities above it mark a slot with
             no proposal: its draft is rejected and the token drawn from ``p``.
             Required with ``draft_probs``.
+        candidate_drafts: ``[B * (g + 1), MAX_K]`` fp32 scratch for the
+            candidates' carried draft probabilities; required with
+            shard-local ``draft_probs``.
 
     Raises:
         ValueError: The logits are neither bf16 nor fp32, a row offset
             would pass ``MAX_OFFSET``, or ``draft_probs`` rows are not dense
-            whole-vocabulary rows or come without ``reject_threshold``.
+            rows over the whole vocabulary or this rank's shard, come without
+            ``reject_threshold``, or are shard-local without
+            ``candidate_drafts``.
     """
     _check_offsets(logits, scratchpad)
     exact = _exact(logits)
@@ -628,16 +656,35 @@ def verify(
         raise ValueError(
             "sonic reads draft_probs with the no-proposal sentinel: pass reject_threshold"
         )
+    # A shard's columns are fewer than the vocabulary's, so the width tells a shard-local table.
+    local = (
+        draft_probs is not None
+        and shard is not None
+        and draft_probs.shape[2] == vocab_size != stride_c
+    )
+    columns = vocab_size if local else stride_c
     if draft_probs is not None and (
         draft_probs.dtype != torch.float32
         or draft_probs.shape[1] < timesteps - 1
-        or draft_probs.stride(1) != stride_c
+        or draft_probs.shape[2] != columns
+        or draft_probs.stride(1) != columns
         or draft_probs.stride(2) != 1
     ):
         raise ValueError(
-            f"sonic reads draft_probs as fp32 [P, >= {timesteps - 1}, {stride_c}] "
+            f"sonic reads draft_probs as fp32 [P, >= {timesteps - 1}, {columns}] "
             f"dense rows, got {draft_probs.dtype} {tuple(draft_probs.shape)} "
             f"strides {draft_probs.stride()}"
+        )
+    if local and (
+        candidate_drafts is None
+        or candidate_drafts.dtype != torch.float32
+        or candidate_drafts.shape[0] < rows
+        or candidate_drafts.shape[1] != MAX_K
+        or not candidate_drafts.is_contiguous()
+    ):
+        raise ValueError(
+            f"shard-local draft_probs need a contiguous fp32 [>= {rows}, {MAX_K}] "
+            "candidate_drafts scratch"
         )
     gamma = timesteps - 1
     blocks = triton.cdiv(vocab_size, config.block_n)
@@ -646,8 +693,18 @@ def verify(
     stride_g = state.grammar.flatten(0, -2).stride(0)
 
     merged = _merged(
-        logits, state, slots, drafted, scratchpad, shard, config, enable_pdl
+        logits,
+        state,
+        slots,
+        drafted,
+        scratchpad,
+        shard,
+        config,
+        enable_pdl,
+        draft_probs if local else None,
     )
+    if local:
+        merged["m_ptr"] = candidate_drafts
     cumulative_unpack_kernel[(rows,)](
         scratchpad,
         state.indicators,
@@ -706,7 +763,7 @@ def verify(
         slots,
         None,
         drafted,
-        draft_probs,
+        None if local else draft_probs,
         None,
         None,
         state.seeds,
@@ -725,7 +782,7 @@ def verify(
         enable_pdl,
         True,
         False,
-        None if draft_probs is None else draft_probs.stride(0),
+        None if draft_probs is None or local else draft_probs.stride(0),
         None,
         None,
         stride_c,
@@ -733,6 +790,7 @@ def verify(
         block_g,
         _LOGPROB_BLOCK,
         reject_threshold=None if draft_probs is None else reject_threshold,
+        m_ptr=candidate_drafts if local else None,
         num_warps=next_power_of_2(timesteps),
     )
 
