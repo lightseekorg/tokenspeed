@@ -232,3 +232,24 @@ because no compatible baseline exists.
 
 See the [CI documentation](../../test/ci/README.md#registration-level-kernel-benchmarks)
 for GitHub Actions triggers, artifacts, pull request comments, and runner setup.
+
+## Tuning the gfx950 BF16 GEMV tables
+
+`gemm.mm` sends 1-16 BF16 rows on gfx950 to the Gluon dense or row-CTA GEMV
+only for the `(N, K)` weights in their measured tables (see the AMD
+[ops README](../../tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/README.md)).
+`tune_gluon_gemv_gfx950` derives the projections of one tensor-parallel rank
+from model configs (Qwen3.5-style hybrid, Llama-style dense and their EAGLE
+drafts) or explicit `--shape N,K`, times each routing through `gemm.mm` in
+graph replay with cold weights, and writes the tables' entries as JSON and as
+a Python snippet to paste:
+
+```bash
+python3 -m tokenspeed_kernel.benchmark.tune_gluon_gemv_gfx950 \
+  --model-config config.json --model-config draft/config.json --tp 1 \
+  --output tuned.json --min-weight-bytes 2e9 --repeats 20 --replays 7 --seed 0
+```
+
+A routing replaces the one before it only when it leads by 1.5% in each of
+three sweeps, each the median of six alternating runs. Run it on an idle GPU;
+about a minute per weight shape.
