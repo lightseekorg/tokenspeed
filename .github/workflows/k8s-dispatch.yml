@@ -51,6 +51,7 @@ on:
           - test/ci/eval/qwen3.8-flash-next-mxfp4-evalscope-gsm8k-amd.yaml
           - test/ci/perf/kernel-benchmark-amd-gfx950.yaml
           - test/ci/perf/kimi-k2.5-nvfp4-evalscope-agentic.yaml
+          - test/ci/perf/muse-spark-mxfp4-monokernel-gsm8k-single-request-mi35x.yaml
           - test/ci/perf/qwen3.5-397b-a17b-nvfp4-evalscope-agentic-b200-8gpu.yaml
           - test/ci/perf/qwen3.5-397b-a17b-nvfp4-evalscope-agentic.yaml
           - test/ci/perf/qwen3.5-397b-a17b-nvfp4-evalscope-longctx.yaml
