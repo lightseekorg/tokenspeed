@@ -313,7 +313,7 @@ def _launch_metadata(grid, kernel, args):
     expert_bytes = w13.nbytes + w13s.nbytes + w2.nbytes + w2s.nbytes
     weight += expert_bytes * experts // all_experts
     if plan.has_stage("warm"):
-        weight += 16 * args["warm_quads"]
+        weight += 16 * args["warm_quads"]  # 16 bytes a quad
     if plan.has_stage("qnext"):
         weight += args["w_next"].nbytes * qkv_rows // qkvg_rows
     return {"name": f"{kernel.name} (rows={plan.rows})", "bytes": weight}
@@ -367,8 +367,8 @@ def gluon_muse_spark_layer_gfx950(
 
     ``attn_ops`` (tensors only): (QKVG weight, attention input ``a``,
     ``seq_len``, KV write slot, page table, K cache, V cache, cos / sin,
-    o_proj weight, residual
-    slice ``h``, attention gate ``alpha``, ``beta``, pre-FFN gain).
+    o_proj weight, residual slice ``h``, attention gate ``alpha``, ``beta``,
+    pre-FFN gain).
     ``table_stride``: the page-table row stride, passed separately so changing
     request lengths cannot specialize the kernel.
     ``moe_ops``: (router columns, router bias, pooler rows, w13, w13 scales,
