@@ -2074,8 +2074,10 @@ reads the staged `InputBuffers.query_shard` into the shared `HiddenDraftInput`
 for Eagle and MTP; their contexts carry only its `plan`. Extend metadata
 receives those same inputs, and QCP backends expose them through
 `require_query_shard_inputs()`. The router retains these forward-wide inputs
-independently of its cache-group leaves and clears them on decode; the executor
-also clears its staged inputs when a fully cached prefill has no rows.
+independently of its cache-group leaves. A draft decode refresh within an
+extend/mixed round preserves them for that round's prefill; a pure decode
+clears them. The executor also clears its staged inputs when a fully cached
+prefill has no rows.
 `LogitsMetadata.from_forward_context` reads this
 backend accessor, so model, logits-exit and drafter forward signatures do not
 carry another QCP argument. V4.1 retains both encoder and narrowed CED inputs in

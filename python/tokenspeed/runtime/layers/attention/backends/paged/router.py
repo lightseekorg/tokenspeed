@@ -774,7 +774,10 @@ class CacheGroupRouter(AttentionBackend):
         """The single decode path: fill the stacks from this step's tables,
         derive the decode write window, refresh every leaf in place."""
         del kwargs
-        self._query_shard_inputs = None
+        # Draft extend preparation stages decode metadata before its prefill
+        # runs. Keep that round's query inputs until a pure decode replaces it.
+        if num_extends == 0:
+            self._query_shard_inputs = None
         self.sparse_topk.clear()
         if forward_mode.is_extend_or_mixed():
             raise RuntimeError(

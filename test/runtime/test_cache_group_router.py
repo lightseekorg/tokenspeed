@@ -664,6 +664,18 @@ class TestCacheGroupRouterTest:
         )
         router.init_forward_metadata(**kwargs, query_shard=inputs)
         assert router.require_query_shard_inputs() is inputs
+        # Draft extend preparation also stages later decode steps before the
+        # first MTP prefill executes; those steps share this forward's inputs.
+        router.refresh_decode_metadata(
+            2,
+            2,
+            torch.arange(2),
+            prefix + lengths,
+            forward_mode=ForwardMode.DECODE,
+            block_tables=self._tables(),
+            num_extends=2,
+        )
+        assert router.require_query_shard_inputs() is inputs
         if next_forward == "extend":
             router.init_forward_metadata(**kwargs, query_shard=None)
         else:
