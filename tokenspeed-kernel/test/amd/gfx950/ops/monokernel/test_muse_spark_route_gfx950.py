@@ -29,12 +29,12 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from monokernel_testing import fill, payloads
 from utils import is_cdna4
 
 if not is_cdna4():
     pytest.skip("AMD CDNA4 is required", allow_module_level=True)
 
+from monokernel_testing import fill, payloads  # noqa: E402
 from tokenspeed_kernel.ops.communication._iris import (  # noqa: E402
     IrisGroup,
     get_or_create_context,

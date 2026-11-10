@@ -33,12 +33,12 @@ import test_muse_spark_draft_mlp_gfx950 as mlp_t
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from monokernel_testing import payloads
 from utils import assert_no_triton_compile, is_cdna4
 
 if not is_cdna4():
     pytest.skip("AMD CDNA4 is required", allow_module_level=True)
 
+from monokernel_testing import payloads  # noqa: E402
 from tokenspeed_kernel.ops.communication._iris import (  # noqa: E402
     IrisGroup,
     get_or_create_context,

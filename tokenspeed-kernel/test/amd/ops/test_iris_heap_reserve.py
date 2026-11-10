@@ -21,7 +21,11 @@
 """The Iris heap's headroom covers what its users reserve before it exists."""
 
 import pytest
-from tokenspeed_kernel.ops.communication import _iris
+
+# The Iris heap ships only with AMD's communication stack.
+pytest.importorskip("iris")
+
+from tokenspeed_kernel.ops.communication import _iris  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
