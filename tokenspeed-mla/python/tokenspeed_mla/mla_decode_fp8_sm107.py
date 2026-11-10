@@ -1594,6 +1594,11 @@ class _Sm107FallbackBlackwellBase:
         correction_factor = rCor[2]
         no_correction = rCor_int[3]
 
+        # The tcgen05.ld above completes asynchronously. Wait for it before the
+        # stage is released, or the softmax warps may overwrite the record
+        # while it is still being read; its values are first used after the
+        # release (the vote and the rescale in the caller).
+        cute.arch.fence_view_async_tmem_load()
         common_params.p_cor_pipeline.consumer_release(p_cor_consumer_state)
         p_cor_consumer_state.advance()
         return p_cor_consumer_state, row_sum, row_max, correction_factor, no_correction
