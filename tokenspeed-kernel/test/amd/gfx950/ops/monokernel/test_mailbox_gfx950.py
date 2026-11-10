@@ -37,6 +37,7 @@ pytest.importorskip("tokenspeed_kernel_amd")
 from tokenspeed_kernel_amd.ops.gfx950.monokernel import stuck  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import (  # noqa: E402
     LAYER_SLOTS,
+    POLL_TIMEOUT_MANTISSA,
     Plan,
     Stage,
     launch_tag,
@@ -337,7 +338,7 @@ if is_cdna4():
         assert stuck.locate(plan, pair) == ("want", 1, 37, 0)
         assert stuck.stages_at(plan, 1, "want") == ["s"]
         # The wait ran past the 0.11 ms timeout, by the realtime clock.
-        assert rec["trap"] - rec["start"] >= 11 << 10
+        assert rec["trap"] - rec["start"] >= POLL_TIMEOUT_MANTISSA << 10
         (line,) = stuck.decode(t, lambda layer: [plan] if layer == 3 else [])
         assert "rank 3 CTA 1: stage s waited for region want row 1 pair 37" in line
         assert "step 4 layer 3" in line and "step 5 layer 3" in line
@@ -423,7 +424,7 @@ if is_cdna4():
         assert rec["payload"] == 0
         pair = (rec["address"] - head["scratch_ptr"]) // 8
         assert stuck.locate(plan, pair) == ("flag", 1, 37, 0)
-        assert rec["trap"] - rec["start"] >= 11 << 10
+        assert rec["trap"] - rec["start"] >= POLL_TIMEOUT_MANTISSA << 10
 
     # Mailbox.check_parity: a launch fails stop when its peer-region parity
     # repeats the last launch's (the copies must alternate, see Peers).

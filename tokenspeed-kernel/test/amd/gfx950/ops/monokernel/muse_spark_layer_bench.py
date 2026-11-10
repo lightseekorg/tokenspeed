@@ -669,7 +669,10 @@ def main() -> None:
         "--poll-timeout-shift",
         type=int,
         default=plan_mod.DEFAULT_POLL_TIMEOUT_SHIFT,
-        help="poll timeout: 11 << shift ticks at 100 MHz (compile-time)",
+        help=(
+            f"poll timeout: {plan_mod.POLL_TIMEOUT_MANTISSA} << shift ticks at"
+            " 100 MHz (compile-time)"
+        ),
     )
     p.add_argument("--replays", type=int, default=15)
     p.add_argument(

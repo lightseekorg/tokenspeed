@@ -53,7 +53,10 @@ from dataclasses import asdict, dataclass, field
 # never write the same cache line.
 REGION_ALIGN_PAIRS = 32
 
-# Production poll bound: check every ~0.5 ms and trap after about 59 s.
+# Production poll bound: check every ~0.5 ms and trap after about 59 s. The
+# timeout is POLL_TIMEOUT_MANTISSA << shift ticks of the 100 MHz clock: the
+# mantissa is fixed, so the bound is one compile-time shift.
+POLL_TIMEOUT_MANTISSA = 11
 DEFAULT_POLL_CHECK = 4096
 DEFAULT_POLL_TIMEOUT_SHIFT = 29
 
@@ -114,7 +117,8 @@ class Plan:
             bench) knows which pairs to write with that payload.
         poll_check: Retries between realtime clock checks in tagged polls.
             Omission selects the production interval (4096 retries).
-        poll_timeout_shift: Poll timeout in 100 MHz ticks is ``11 << shift``.
+        poll_timeout_shift: Poll timeout in 100 MHz ticks is
+            ``POLL_TIMEOUT_MANTISSA << shift``.
             Omission selects the production bound (29, about 59 seconds).
             Both bounds are compile-time choices included in the plan key.
     """

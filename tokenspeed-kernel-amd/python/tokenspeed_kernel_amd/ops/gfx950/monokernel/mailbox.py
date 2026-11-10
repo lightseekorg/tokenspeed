@@ -45,8 +45,8 @@ system-scope (``sc0 sc1``), so the local L2 never serves a stale line of
 it.
 
 Fail-stop: a poll gives up after about a minute of waiting (the realtime
-clock, read every ``Plan.poll_check`` retries only) and executes ``s_trap 2``. The
-runtime then reports a GPU exception and the process stops. A deadlock or a
+clock, read every ``Plan.poll_check`` retries only) and executes
+``s_trap 2``. The runtime then reports a GPU exception and the process stops. A deadlock or a
 missing producer thus stops the server with an error instead of hanging it.
 
 Stuck-poll record: a mailbox made with a ``stuck`` buffer (``int64 [grid,
@@ -65,6 +65,7 @@ from tokenspeed_kernel_amd import _extern
 from tokenspeed_kernel_amd._triton import aggregate, gl, gluon
 from tokenspeed_kernel_amd.ops.gfx950.monokernel import schedule, trace
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import LAYER_SLOTS as _SLOTS
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import POLL_TIMEOUT_MANTISSA
 
 LAYER_SLOTS = gl.constexpr(_SLOTS)  # the device copy of plan.LAYER_SLOTS
 # int64 words of a CTA's stuck-poll record: expected tag, observed pair, stale
@@ -182,10 +183,10 @@ def _poll_asm(outputs, inputs, cache, stuck):
     after about a minute of waiting. A wave whose ``spin`` flag is zero skips
     the loop (``pre_poll`` keeps one wave per CTA spinning).
 
-    Every ``Plan.poll_check`` retries the wave reads the realtime clock:
-    the first reading starts the wait's clock, a later one past the timeout traps (the
-    64-bit compare runs on the VALU, whose 64-bit add and compare take the
-    SGPR pairs whole).
+    Every ``Plan.poll_check`` retries the wave reads the realtime clock: the
+    first reading starts the wait's clock, a later one past the timeout traps
+    (the 64-bit compare runs on the VALU, whose 64-bit add and compare take
+    the SGPR pairs whole).
     """
     (poll_check,), (timeout_shift,) = inputs[-3:-1]
     inputs = inputs[:-3] + inputs[-1:]
@@ -227,7 +228,7 @@ def _poll_asm(outputs, inputs, cache, stuck):
         f"s_mov_b64 {start}, {acc}",
         "s_branch 4f",
         "5:",
-        f"s_mov_b64 {save}, 11",
+        f"s_mov_b64 {save}, {POLL_TIMEOUT_MANTISSA}",
         f"s_lshl_b64 {save}, {save}, {timeout_shift}",
         f"v_mov_b64 {tmp}, {start}",
         f"v_lshl_add_u64 {tmp}, {save}, 0, {tmp}",
@@ -309,7 +310,7 @@ def _stuck_record(pairs, ptrs, tmp, lane, mask, tag, start, now, rec, slot, fail
 @gluon.constexpr_function
 def _poll_timeout_ns(plan):
     """The compiled plan's tagged-poll time bound, in ns, for flag polls."""
-    return (11 << plan.plan.poll_timeout_shift) * trace.TICK_NS
+    return (POLL_TIMEOUT_MANTISSA << plan.plan.poll_timeout_shift) * trace.TICK_NS
 
 
 @gluon.constexpr_function
@@ -549,10 +550,10 @@ def pre_poll(scratch, hints, tag, plan: gl.constexpr):
     Every thread must call it.
 
     Args:
-        plan: Compile-time plan key, including the poll bound.
         hints: Pair indices in the one-element-per-thread layout of
             :func:`lane_layout`. The function ignores the lanes of waves
             other than 0.
+        plan: Compile-time plan key, including the poll bound.
     """
     _pre_poll(scratch, hints, tag, "agent", None, plan)
 

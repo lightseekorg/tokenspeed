@@ -320,7 +320,7 @@ def _issue_kv(
 
 
 @gluon.jit
-def _softmax_step(
+def softmax_step(
     q, keys, values, valid, m, l, acc, p_layout: gl.constexpr, scale: gl.constexpr
 ):
     """One chunk of the online base-2 softmax: ``keys [D, N]`` and
@@ -365,7 +365,7 @@ def _group_layouts(nw):
 def _group_softmax_step(
     q, keys, values, valid, m, l, acc, p_layout: gl.constexpr, MASK: gl.constexpr
 ):
-    """:func:`_softmax_step` of every key group's own keys: ``q [G, QM, 64]``,
+    """:func:`softmax_step` of every key group's own keys: ``q [G, QM, 64]``,
     ``keys [G, 64, KW]``, ``values [G, KW, 64]``, ``valid [G, QM, KW]`` (used
     only when ``MASK``)."""
     pv3: gl.constexpr = acc.type.layout
@@ -628,7 +628,7 @@ def _ring_keys(
         gl.barrier()
         keys = k_ring.index(i % NBUF).permute([1, 0]).load(k_layout)
         values = v_ring.index(i % NBUF).load(v_layout)
-        m, l, acc = _softmax_step(
+        m, l, acc = softmax_step(
             q,
             keys.to(gl.bfloat16),
             values.to(gl.bfloat16),
@@ -925,7 +925,7 @@ def attn_stage(
     gl.barrier()
     u = gl.arange(0, KT, gl.SliceLayout(0, qk_mma))
     own = (u[None, :] <= qi_tok[:, None]) & (u[None, :] < C) & (s == SPLITS - 1)
-    m, l, acc = _softmax_step(
+    m, l, acc = softmax_step(
         q,
         cur_k.permute([1, 0]).load(gl.DotOperandLayout(1, qk_mma, 8)),
         cur_v.load(v_layout),

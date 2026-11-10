@@ -65,7 +65,7 @@ from tokenspeed_kernel_amd._triton import gl, gluon
 from tokenspeed_kernel_amd.ops.gfx950.monokernel import mx, schedule, trace
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import draft_mlp
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.attention import (
-    _softmax_step,
+    softmax_step,
 )
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.dims import (
     DRAFT_BLOCK,
@@ -425,7 +425,7 @@ def attn_stage(
     # A split's cached keys fit one chunk (see the static assert): no loop,
     # and no second chunk's registers.
     gl.barrier()
-    m, l, acc = _softmax_step(
+    m, l, acc = softmax_step(
         q, keys, v_smem.load(v_layout), valid, m, l, acc, p_layout, QK_SCALE
     )
     # The block's keys, for every row (the block is non-causal).
@@ -433,7 +433,7 @@ def attn_stage(
     qi = gl.arange(0, QM, gl.SliceLayout(1, qk_mma))
     u = gl.arange(0, KT, gl.SliceLayout(0, qk_mma))
     own = (u[None, :] < R) & (qi >= 0)[:, None] & (s == SPLITS - 1)
-    m, l, acc = _softmax_step(
+    m, l, acc = softmax_step(
         q,
         cur_k.permute([1, 0]).load(gl.DotOperandLayout(1, qk_mma, 8)),
         cur_v.load(v_layout),

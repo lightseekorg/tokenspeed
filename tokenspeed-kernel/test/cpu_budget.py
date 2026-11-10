@@ -30,7 +30,6 @@ test slows down by orders of magnitude.
 from __future__ import annotations
 
 import math
-import os
 from pathlib import Path
 
 CGROUP_ROOT = Path("/sys/fs/cgroup")
@@ -61,17 +60,3 @@ def cpu_budget(affinity: set[int], quota: int | None) -> int:
     """Threads a process should run: its allowed cores, capped by its quota."""
     cores = len(affinity)
     return max(1, min(cores, quota) if quota is not None else cores)
-
-
-def apply_cpu_budget(torch_module, environ, root: Path = CGROUP_ROOT) -> int:
-    """Cap torch's intra-op threads at the budget, and give child processes
-    the same cap through ``OMP_NUM_THREADS`` unless the caller set it.
-
-    Returns:
-        The budget.
-    """
-    budget = cpu_budget(os.sched_getaffinity(0), cgroup_cpu_quota(root))
-    if torch_module.get_num_threads() > budget:
-        torch_module.set_num_threads(budget)
-    environ.setdefault("OMP_NUM_THREADS", str(budget))
-    return budget

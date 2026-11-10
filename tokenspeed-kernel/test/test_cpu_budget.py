@@ -25,8 +25,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-import torch
-from cpu_budget import apply_cpu_budget, cgroup_cpu_quota, cpu_budget
+from cpu_budget import cgroup_cpu_quota, cpu_budget
 
 
 def _write(root: Path, name: str, text: str) -> None:
@@ -61,22 +60,3 @@ def test_the_budget_is_the_allowed_cores_capped_by_the_quota():
     assert cpu_budget(cores, 8) == 8
     assert cpu_budget({0, 1}, 8) == 2
     assert cpu_budget(set(), None) == 1
-
-
-def test_applying_the_budget_caps_torch_and_children_but_keeps_explicit_settings(
-    tmp_path,
-):
-    _write(tmp_path, "cpu.max", "100000 100000\n")  # one CPU
-    before = torch.get_num_threads()
-    try:
-        torch.set_num_threads(4)
-        environ = {}
-        assert apply_cpu_budget(torch, environ, tmp_path) == 1
-        assert torch.get_num_threads() == 1
-        assert environ == {"OMP_NUM_THREADS": "1"}
-        # A caller's OMP_NUM_THREADS stays.
-        environ = {"OMP_NUM_THREADS": "3"}
-        apply_cpu_budget(torch, environ, tmp_path)
-        assert environ["OMP_NUM_THREADS"] == "3"
-    finally:
-        torch.set_num_threads(before)

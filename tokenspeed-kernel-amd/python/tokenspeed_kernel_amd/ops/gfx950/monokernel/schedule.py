@@ -52,7 +52,8 @@ def poll_check(plan):
 
 @gluon.constexpr_function
 def poll_timeout_shift(plan):
-    """Shift of the poll timeout's fixed mantissa (11), in 100 MHz ticks."""
+    """Shift of the poll timeout's fixed mantissa
+    (``plan.POLL_TIMEOUT_MANTISSA``), in 100 MHz ticks."""
     return plan.plan.poll_timeout_shift
 
 

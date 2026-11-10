@@ -167,9 +167,10 @@ Memory rules on gfx950 (coarse-grained VRAM):
   submits a launch seconds late only stalls its peers. Given a stuck-poll
   record buffer, the poll first writes what it waited for (tag, address,
   observed pair, clocks) for the host to decode. `Plan.poll_timeout_shift`
-  sets the bound to `11 << shift` ticks at 100 MHz. Both fields are part of
-  the compile-time plan key; tests can shorten the production defaults
-  (4096 retries, shift 29) without reusing binaries with a different bound.
+  sets the bound to `POLL_TIMEOUT_MANTISSA << shift` (11 << shift) ticks at
+  100 MHz. Both fields are part of the compile-time plan key; tests can
+  shorten the production defaults (4096 retries, shift 29) without reusing
+  binaries with a different bound.
 - A CTA reads another CTA's plain global store from the same launch only
   behind a flag: the producer stores plain words past the caches, waits
   until they land, then raises one tagged flag (`store_words`,
