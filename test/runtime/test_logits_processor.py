@@ -2050,7 +2050,6 @@ def test_finish_logits_preserves_dp_rows(monkeypatch, local_dp_rows):
 
 
 def test_sampled_vocab_fallback_finishes_all_rows(monkeypatch):
-    from tokenspeed_kernel.ops import sampling
     from transformers import PretrainedConfig
 
     processor = LogitsProcessor(
@@ -2070,10 +2069,10 @@ def test_sampled_vocab_fallback_finishes_all_rows(monkeypatch):
         tp_size=2,
         tp_group=(0, 1),
     )
-    # CPU hosts lack the sampler kernels and the second process.
-    monkeypatch.setattr(sampling, "vocab_shard_topk_supports", lambda *args: True)
-    monkeypatch.setattr(sampling, "vocab_topk_merge_supports", lambda *args: True)
-    assert processor.keep_sampled_logits_vocab_sharded(head, top_k=2)
+    # A sampler that takes shards of any geometry; the processor asks it, not the kernels.
+    assert processor.keep_sampled_logits_vocab_sharded(
+        head, lambda dtype, columns, tp_size: True
+    )
 
     def collective(output, shard, group):
         output.copy_(torch.cat((shard, shard + 100), dim=0))
