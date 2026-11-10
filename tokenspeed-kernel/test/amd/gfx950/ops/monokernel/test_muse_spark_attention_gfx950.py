@@ -130,10 +130,6 @@ def _plan(splits: int, rows: int, chain: int) -> Plan:
         (6, 0, FULL_SPLITS),
         (3000, 0, FULL_SPLITS),
         (9000, 0, FULL_SPLITS),
-        # Several key chunks a split.
-        (50000, 0, FULL_SPLITS),
-        # A long agentic context: ~14 chunks a split.
-        (230000, 0, FULL_SPLITS),
     ],
 )
 def test_attention_matches_the_regular_path_math(
@@ -144,6 +140,22 @@ def test_attention_matches_the_regular_path_math(
     tokens' keys from the projection. An FP8 cache holds the regular path's
     unit-scale e4m3 bytes: the rows' K and V round once to it."""
     _check_attention(length, window, splits, rows, requests, kv_dtype, page_base=0)
+
+
+# Long contexts, whose reference is slow: the served shape (one request's
+# verify on the FP8 cache) at a long agentic context (~14 key chunks a
+# split), and two requests over several key chunks a split.
+@pytest.mark.parametrize(
+    "length,rows,requests,kv_dtype",
+    [
+        (230000, 8, 1, torch.float8_e4m3fn),
+        (50000, 8, 2, torch.bfloat16),
+    ],
+)
+def test_long_context_attention_matches_the_regular_path_math(
+    length, rows, requests, kv_dtype
+):
+    _check_attention(length, 0, FULL_SPLITS, rows, requests, kv_dtype, page_base=0)
 
 
 # The first page whose first element lies past 2^31 elements of a cache.
