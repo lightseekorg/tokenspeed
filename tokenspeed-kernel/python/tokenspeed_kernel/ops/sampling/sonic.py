@@ -832,13 +832,28 @@ def synthetic_targets(
 
     Returns:
         ``tokens``.
+
+    Raises:
+        ValueError: The candidates are not dense ``[B * T, MAX_K]`` rows, or
+            their offsets would pass ``MAX_OFFSET``.
     """
     batch = slots.shape[0]
     rows = values.shape[0]
-    if rows % batch or indices.shape[0] != rows:
+    if (
+        rows % batch
+        or indices.shape != values.shape
+        or values.shape[1] != MAX_K
+        or values.stride() != (MAX_K, 1)
+        or indices.stride() != (MAX_K, 1)
+    ):
         raise ValueError(
-            f"sonic synthetic targets need [B * T, MAX_K] candidates for {batch} "
-            f"requests, got {tuple(values.shape)} and {tuple(indices.shape)}"
+            f"sonic synthetic targets need dense [B * T, {MAX_K}] candidates for "
+            f"{batch} requests, got {tuple(values.shape)} and {tuple(indices.shape)}"
+        )
+    # The kernel keeps (request * T + position) * MAX_K in int32.
+    if rows * MAX_K > MAX_OFFSET:
+        raise ValueError(
+            f"sonic synthetic targets offsets pass {MAX_OFFSET}: {rows} rows"
         )
     _synthetic_target_kernel[(batch,)](
         values,

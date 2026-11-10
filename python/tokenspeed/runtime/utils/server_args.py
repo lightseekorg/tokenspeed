@@ -1845,10 +1845,11 @@ class ServerArgs:
             )
 
         # Block verification, and synthetic rejection over sampled drafts, run
-        # the sampled-chain verify on the flashinfer backend.
+        # the sampled-chain verify on the flashinfer backend; greedy and sonic
+        # force the synthetic length over their own verify.
         sampled_chain_verify = self.speculative_rejection_sample_method == "block" or (
             self.speculative_rejection_sample_method == "synthetic"
-            and self.sampling_backend != "greedy"
+            and self.sampling_backend not in ("greedy", "sonic")
         )
         if sampled_chain_verify:
             if (

@@ -1136,6 +1136,37 @@ def test_synthetic_full_length_draws_the_verify_bonus_token():
     torch.testing.assert_close(outputs[1], outputs[0])
 
 
+@pytest.mark.parametrize("length", range(1, MAX_N))
+def test_synthetic_stochastic_cutoff_draws_from_its_own_position(length):
+    """A stochastic row's cutoff token comes from position L - 1's candidates.
+
+    Each verify position's top candidates sit in its own token range, so a draw
+    that read another position's candidates or noise would land outside it.
+    """
+    torch.manual_seed(40 + length)
+    n = MAX_N
+    span = VOCAB // n
+    logits = torch.randn(MAX_BS, n, VOCAB, device="cuda")
+    for position in range(n):
+        logits[:, position, position * span : (position + 1) * span] += 8.0
+    logits = logits.view(MAX_BS * n, VOCAB).bfloat16()
+    backend = _make_synthetic_backend(float(length))
+    req = _prepare(
+        backend, [_sp(f"m{i}", temperature=1.0, top_k=16) for i in range(MAX_BS)], n=n
+    )
+    candidates = torch.randint(0, VOCAB, (MAX_BS, n), dtype=torch.int32, device="cuda")
+
+    predict, accept = backend.verify(
+        _logits_output(logits), _info(req), candidates, tree=None
+    )
+    predict = predict.view(MAX_BS, n).cpu()
+    assert accept.tolist() == [length] * MAX_BS
+    torch.testing.assert_close(predict[:, : length - 1], candidates[:, 1:length].cpu())
+    cutoff = predict[:, length - 1]
+    low, high = (length - 1) * span, length * span
+    assert ((cutoff >= low) & (cutoff < high)).all(), cutoff.tolist()
+
+
 def test_fractional_synthetic_lengths_take_the_floor_or_the_ceiling():
     torch.manual_seed(33)
     n = MAX_N
