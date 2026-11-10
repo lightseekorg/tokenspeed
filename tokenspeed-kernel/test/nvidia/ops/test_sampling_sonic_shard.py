@@ -53,6 +53,7 @@ VOCAB = 32768
 RANKS = 4
 GAMMA = 3
 STEPS = 6
+THRESHOLD = 2.0
 
 # One request per sampling setting; the last slot is the padding sentinel.
 PARAMS = (
@@ -115,17 +116,36 @@ def _logits(dtype: torch.dtype, rows: int, seed: int) -> torch.Tensor:
 
 
 class _Ranks:
-    """Rank 0's ``VocabShard`` over ``logits`` split in ``RANKS`` column slices; its gather runs every other rank's selection."""
+    """Rank 0's ``VocabShard`` over ``logits`` split in ``RANKS`` column slices; its gather runs every other rank's selection.
 
-    def __init__(self, logits, state, slots, drafted, logit_scale=None, softcap=None):
+    With ``draft_probs`` each rank holds its own columns of the table, as a drafter recording q per shard leaves them.
+    """
+
+    def __init__(
+        self,
+        logits,
+        state,
+        slots,
+        drafted,
+        logit_scale=None,
+        softcap=None,
+        draft_probs=None,
+    ):
         rows = logits.shape[0]
         self.width = VOCAB // RANKS
         self.shards = [
             logits[:, r * self.width : (r + 1) * self.width].contiguous()
             for r in range(RANKS)
         ]
+        self.draft_probs = None
+        if draft_probs is not None:
+            self.draft_probs = [
+                draft_probs[:, :, r * self.width : (r + 1) * self.width].contiguous()
+                for r in range(RANKS)
+            ]
         self.config = pick(self.width, rows)
-        self.landing = torch.empty((RANKS, rows, 2 * MAX_K), device="cuda")
+        pairs = (2 if draft_probs is None else 3) * MAX_K
+        self.landing = torch.empty((RANKS, rows, pairs), device="cuda")
         self.scale, self.softcap = logit_scale, softcap
         self.state, self.slots, self.drafted = state, slots, drafted
 
@@ -151,6 +171,7 @@ class _Ranks:
                 self.shard(rank),
                 self.config,
                 False,
+                None if self.draft_probs is None else self.draft_probs[rank],
             )
         return self.landing
 
@@ -258,6 +279,75 @@ def test_sharded_verify_accepts_what_whole_rows_accept(dtype):
         assert torch.equal(sharded.decode_counts, whole.decode_counts)
         accepted_any |= bool((accepted > 0).any())
     assert accepted_any
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_shard_local_draft_probs_verify_as_the_whole_table_does(dtype):
+    """Each rank's candidates carry q over its own columns: verify accepts and draws what whole rows reading the dense table do."""
+    exact = dtype == torch.float32
+    timesteps = GAMMA + 1
+    rows = REQUESTS * timesteps
+    slots = torch.arange(REQUESTS, dtype=torch.int64, device="cuda")
+    generator = torch.Generator(device="cuda").manual_seed(5)
+    accepted_any = rejected_any = False
+    for step in range(STEPS):
+        logits = _logits(dtype, rows, 200 + step)
+        if exact:
+            logits = _separated(logits)
+        whole = _state(timesteps, logits)
+        sharded = _copy(whole)
+        offsets = torch.full((SLOTS,), step, dtype=torch.int64, device="cuda")
+        # A drafter near the target at each draft position, drafts sampled from its q.
+        target = logits.float().view(REQUESTS, timesteps, VOCAB)[:, :GAMMA]
+        noise = torch.randn(target.shape, generator=generator, device="cuda")
+        q = torch.softmax(target + noise * 0.5, dim=2)
+        drafts = torch.multinomial(q.view(-1, VOCAB), 1, generator=generator)
+        draft_probs = torch.zeros((SLOTS, GAMMA, VOCAB), device="cuda")
+        draft_probs[:REQUESTS] = q
+        # Request 2's slot has no proposal (the runtime's sentinel).
+        draft_probs[2] = THRESHOLD + 1
+        results = []
+        for state, local in ((whole, False), (sharded, True)):
+            drafted = torch.zeros(
+                (REQUESTS, timesteps), dtype=torch.int32, device="cuda"
+            )
+            drafted[:, :GAMMA] = drafts.view(REQUESTS, GAMMA)
+            accepted = torch.empty((REQUESTS, 1), dtype=torch.int32, device="cuda")
+            values = torch.empty((rows, MAX_K), device="cuda")
+            indices = torch.empty((rows, MAX_K), dtype=torch.int32, device="cuda")
+            if local:
+                ranks = _Ranks(logits, state, slots, drafted, draft_probs=draft_probs)
+                launch, config, shard = ranks.shards[0], ranks.config, ranks.shard(0)
+                table = ranks.draft_probs[0]
+            else:
+                launch, config, shard = logits, pick(VOCAB, rows), None
+                table = draft_probs
+            sonic.verify(
+                launch,
+                state,
+                slots,
+                offsets,
+                drafted,
+                accepted,
+                _scratchpad(launch),
+                values,
+                indices,
+                config,
+                False,
+                shard=shard,
+                draft_probs=table,
+                reject_threshold=THRESHOLD,
+                candidate_drafts=torch.empty((rows, MAX_K), device="cuda"),
+            )
+            results.append((drafted, accepted))
+        (expected, expected_accepted), (drafted, accepted) = results
+        assert torch.equal(accepted, expected_accepted), step
+        assert torch.equal(drafted, expected), step
+        assert torch.equal(sharded.decode_counts, whole.decode_counts)
+        assert int(accepted[2]) == 0
+        accepted_any |= bool((accepted[1:] > 0).any())
+        rejected_any |= bool((accepted[1:] < GAMMA).any())
+    assert accepted_any and rejected_any
 
 
 def _separated(logits: torch.Tensor) -> torch.Tensor:
