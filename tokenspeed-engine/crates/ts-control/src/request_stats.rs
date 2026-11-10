@@ -177,16 +177,23 @@ pub fn stats_line(
         0.0
     };
     let created = state.created_time;
+    // A decode worker's remote prefill stamps `prefill_done` when the KV
+    // lands, before its first decode dispatch stamps `scheduled`; the gap is
+    // then decode admission wait, not prefill time. Keep each direction under
+    // its own name so no role prints a misleading negative.
+    let gap = ms(timings.prefill_done, timings.scheduled);
+    let (prefill_ms, decode_wait_ms) = if gap >= 0.0 { (gap, 0.0) } else { (0.0, -gap) };
     format!(
         "Req: {rid} Finish! RequestStats(status='{status}', reason='{reason}', \
          prompt_tokens={prompt}, cache_tokens={}, output_tokens={output}, cache_hit_rate={}, \
-         queue_ms={}, prefill_ms={}, ttft_ms={}, total_ms={}, preempt_ms={}, preempt_count={}, \
-         decode_tps={}, acc_len={acc_len}, acc_rate={acc_rate}, recv_ts={}, commit_ts={}, \
-         finish_ts={})",
+         queue_ms={}, prefill_ms={}, decode_wait_ms={}, ttft_ms={}, total_ms={}, \
+         preempt_ms={}, preempt_count={}, decode_tps={}, acc_len={acc_len}, \
+         acc_rate={acc_rate}, recv_ts={}, commit_ts={}, finish_ts={})",
         state.cached_tokens,
         py_float(hit_rate),
         py_float(ms(timings.scheduled, created)),
-        py_float(ms(timings.prefill_done, timings.scheduled)),
+        py_float(prefill_ms),
+        py_float(decode_wait_ms),
         py_float(ms(timings.first_token, created)),
         py_float(ms(finish, created)),
         py_float(round(timings.preempt_time * 1e3, 2)),
@@ -223,13 +230,37 @@ mod tests {
             stats_line("r", &state, &timings, 101.0, Some(4)),
             "Req: r Finish! RequestStats(status='finished', reason='length', prompt_tokens=4, \
              cache_tokens=2, output_tokens=3, cache_hit_rate=0.5, queue_ms=500.0, \
-             prefill_ms=250.0, ttft_ms=750.0, total_ms=1000.0, preempt_ms=500.0, \
-             preempt_count=1, decode_tps=8.0, acc_len=1.0, acc_rate=0.0, recv_ts=100.0, \
-             commit_ts=100.5, finish_ts=101.0)"
+             prefill_ms=250.0, decode_wait_ms=0.0, ttft_ms=750.0, total_ms=1000.0, \
+             preempt_ms=500.0, preempt_count=1, decode_tps=8.0, acc_len=1.0, \
+             acc_rate=0.0, recv_ts=100.0, commit_ts=100.5, finish_ts=101.0)"
         );
         assert_eq!(
             accept_length_line("r", &state),
             "Req: r Finish! Accept_num_tokens_avg: 1.0"
+        );
+    }
+
+    #[test]
+    fn decode_stats_report_the_kv_ready_gap_as_decode_wait() {
+        let mut state = RequestState::new(vec![1, 2, 3, 4], 8, BTreeSet::new(), true, None, false);
+        state.created_time = 100.0;
+        state.cached_tokens = 2;
+        state.output_ids = vec![5, 6, 7];
+        state.spec_verify_ct = 2;
+        state.finished_reason = Some(FinishReason::Length(3));
+        let mut timings = RequestTimings::default();
+        // D role: the KV lands — prefill done, first token — before the first
+        // decode dispatch.
+        timings.mark_scheduled(100.5);
+        timings.mark_prefill_done(100.25);
+        timings.mark_first_token(100.25);
+        assert_eq!(
+            stats_line("r", &state, &timings, 101.25, Some(4)),
+            "Req: r Finish! RequestStats(status='finished', reason='length', prompt_tokens=4, \
+             cache_tokens=2, output_tokens=3, cache_hit_rate=0.5, queue_ms=500.0, \
+             prefill_ms=0.0, decode_wait_ms=250.0, ttft_ms=250.0, total_ms=1250.0, \
+             preempt_ms=0.0, preempt_count=0, decode_tps=2.0, acc_len=1.0, acc_rate=0.0, \
+             recv_ts=100.0, commit_ts=100.5, finish_ts=101.25)"
         );
     }
 }

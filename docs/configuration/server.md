@@ -1094,7 +1094,7 @@ derives every field from host-side timestamps and counters it already has —
 the line adds **no GPU sync** and so no engine slowdown. Example:
 
 ```
-Req: chatcmpl-019ef6b7 Finish! RequestStats(status='finished', reason='stop', prompt_tokens=28684, cache_tokens=832, output_tokens=33, cache_hit_rate=0.029, queue_ms=13.8, prefill_ms=15.8, ttft_ms=42.1, total_ms=58.0, preempt_ms=0.0, preempt_count=0, decode_tps=210.4, acc_len=None, acc_rate=None, recv_ts=1782255696.726, commit_ts=1782255696.74, finish_ts=1782255696.784)
+Req: chatcmpl-019ef6b7 Finish! RequestStats(status='finished', reason='stop', prompt_tokens=28684, cache_tokens=832, output_tokens=33, cache_hit_rate=0.029, queue_ms=13.8, prefill_ms=15.8, decode_wait_ms=0.0, ttft_ms=42.1, total_ms=58.0, preempt_ms=0.0, preempt_count=0, decode_tps=210.4, acc_len=None, acc_rate=None, recv_ts=1782255696.726, commit_ts=1782255696.74, finish_ts=1782255696.784)
 ```
 
 | Field | Meaning |
@@ -1103,8 +1103,9 @@ Req: chatcmpl-019ef6b7 Finish! RequestStats(status='finished', reason='stop', pr
 | `prompt_tokens` / `cache_tokens` / `output_tokens` | Prompt tokens, prefix-cache-hit tokens, generated tokens. |
 | `cache_hit_rate` | `cache_tokens / prompt_tokens` (0–1). |
 | `queue_ms` | Received → first scheduled into a forward batch. |
-| `prefill_ms` | Scheduled → prefill complete. |
-| `ttft_ms` | Received → first output token (always ≥ `prefill_ms`; it also spans the queue). |
+| `prefill_ms` | Scheduled → prefill complete. Always `0` on a decode worker, whose prompt is prefilled on the prefill node. |
+| `decode_wait_ms` | Decode workers only: KV (with the bootstrap token) landed → first decode batch dispatch. `0` elsewhere. |
+| `ttft_ms` | Received → first output token. On a decode worker the first token is the prefill node's bootstrap token, so this is received → KV landed. |
 | `total_ms` | Received → finished/aborted. |
 | `preempt_ms` / `preempt_count` | Wall-clock this request's decode was delayed by prefilling other requests, and the number of such interruptions. Host-side best-effort. |
 | `decode_tps` | Decode throughput (generated tokens / decode window). |
