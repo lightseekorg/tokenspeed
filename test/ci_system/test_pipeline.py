@@ -1458,6 +1458,8 @@ _MODEL_FILES = {
     f"{_MODELS}/alpha_vision.py": "",
     f"{_MODELS}/beta.py": "EntryClass = [Beta]\n",
     f"{_MODELS}/gamma.py": "EntryClass = Gamma\n",
+    # A draft model, shared by every target it can serve.
+    f"{_MODELS}/gamma_nextn.py": "EntryClass = [GammaNextN]\n",
     f"{_MODELS}/utils.py": "",
     f"{_MODELS}/base/layer.py": "",
 }
@@ -1476,6 +1478,7 @@ _MODEL_FILES = {
             ["other"],
         ),
         (f"{_MODELS}/utils.py\n", "per-commit", ["alpha", "beta", "other"]),
+        (f"{_MODELS}/gamma_nextn.py\n", "per-commit", ["alpha", "beta", "other"]),
         (f"{_MODELS}/base/layer.py\n", "per-commit", ["alpha", "beta", "other"]),
         (f"{_MODELS}/deleted.py\n", "per-commit", ["alpha", "beta", "other"]),
         (
@@ -1611,6 +1614,20 @@ def test_validate_task_rejects_malformed_model_sources(tmp_path, sources):
     import yaml as _yaml
 
     with pytest.raises(ValueError, match=r"model_sources must be"):
+        validate_task(_yaml.safe_load(path.read_text()), path)
+
+
+@pytest.mark.parametrize(
+    "module", ["gamma_nextn", "llama_eagle3", "dflash2", "minimax_m3_dspark"]
+)
+def test_validate_task_rejects_speculative_model_sources(tmp_path, module):
+    body = _default_body(
+        "ut-a", ["b300-1gpu"], extra=f"model_sources: [{_MODELS}/{module}.py]\n"
+    )
+    path = _write_task_yaml(tmp_path, "bad.yaml", body)
+    import yaml as _yaml
+
+    with pytest.raises(ValueError, match=r"speculative-decoding modules"):
         validate_task(_yaml.safe_load(path.read_text()), path)
 
 

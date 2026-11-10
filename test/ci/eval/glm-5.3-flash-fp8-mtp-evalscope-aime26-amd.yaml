@@ -10,7 +10,6 @@ model_sources:
   - python/tokenspeed/runtime/models/deepseek_v3.py
   - python/tokenspeed/runtime/models/glm5.py
   - python/tokenspeed/runtime/models/glm53_flash.py
-  - python/tokenspeed/runtime/models/glm53_flash_nextn.py
 runner:
   labels:
     - amd-mi35x-4gpu-test

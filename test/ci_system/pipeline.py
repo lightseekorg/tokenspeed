@@ -57,6 +57,8 @@ WORKFLOW_STAGE_TYPES = {
 SUPPORTED_WORKFLOW_STAGES = tuple(WORKFLOW_STAGE_TYPES)
 # Model modules sit directly under this package; `model_sources` lists them.
 MODEL_DIRECTORY = "python/tokenspeed/runtime/models"
+# Speculative-decoding draft modules (NextN, EAGLE, DFlash, DSpark) are shared code.
+SPECULATIVE_MODULE = re.compile(r"(?:^|_)(?:nextn|eagle\d*|dflash\d*|dspark)(?:_|$)")
 # Test sources cannot change what a served model computes.
 TEST_DIRECTORIES = ("test/runtime", "tokenspeed-kernel/test")
 # Kernel benchmark suite definitions are read only by `kernel-benchmark` tasks.
@@ -349,6 +351,12 @@ def validate_task(data: Dict[str, Any], path: Path) -> None:
             raise ValueError(
                 f"{path}: model_sources must be a non-empty list of modules "
                 f"directly under {MODEL_DIRECTORY}"
+            )
+        speculative = [source for source in sources if is_speculative_module(source)]
+        if speculative:
+            raise ValueError(
+                f"{path}: model_sources lists speculative-decoding modules "
+                f"{speculative}, which every model task shares"
             )
     if "changed_paths" in data and not isinstance(data["changed_paths"], bool):
         raise ValueError(f"{path}: changed_paths must be a boolean")
@@ -2358,11 +2366,17 @@ def path_is_ignored(path: str, prefixes: List[str]) -> bool:
     )
 
 
+def is_speculative_module(path: str) -> bool:
+    """Return whether ``path`` is a speculative-decoding draft module."""
+    return bool(SPECULATIVE_MODULE.search(Path(path).stem))
+
+
 def model_specific_modules(root: Path, repo_root: Path) -> frozenset[str]:
     """Return the modules directly under the models package that belong to one model.
 
-    They define ``EntryClass`` or a task lists them in ``model_sources``. Every
-    other module there, such as ``utils.py``, is shared by all models.
+    They define ``EntryClass`` or a task lists them in ``model_sources``, and
+    are not speculative-decoding modules. Every other module there, such as
+    ``utils.py`` or a draft model, is shared by all models.
     """
     listed: set[str] = set()
     for path in find_task_files(root):
@@ -2371,6 +2385,7 @@ def model_specific_modules(root: Path, repo_root: Path) -> frozenset[str]:
         path.relative_to(repo_root).as_posix()
         for path in (repo_root / MODEL_DIRECTORY).glob("*.py")
         if re.search(r"^EntryClass\s*=", path.read_text(encoding="utf-8"), re.M)
+        and not is_speculative_module(path.name)
     }
     return frozenset(listed | defining)
 
