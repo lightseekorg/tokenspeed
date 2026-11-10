@@ -835,8 +835,36 @@ pages are released. A timeout can trigger diagnostics or recovery but cannot
 authorize page reuse; the current protocol provides no forced retirement
 for an uncertain room.
 
-**PD** (`pd`, `ts-pd`). Requests register with the transfer peer at
-admission, and every round the replica agrees on which transfers changed
+**PD failure isolation.** Control messages use one bounded FIFO per destination
+endpoint. Connect and send each have a five-second deadline; a failed endpoint
+cannot hold another endpoint's registration, manifest or cancellation. An
+identical cancellation or status occupies at most one queued/in-flight entry.
+Queue refusal fails registration/manifest publication; partial publication
+still uses the cancellation fence. Cancellation polling retries refused or
+undelivered notifications. Network delivery itself remains best effort: a
+locally accepted message is not a remote acknowledgment.
+
+Decode bootstrap lookups are serialized per bootstrap address, with independent
+workers for other addresses. Cache registration on prefill fences only the
+cache identities being replaced. A replacement waits off the control receive
+path for those native writes, while unrelated registrations and cancellations
+continue. Manifests for the replacement wait until it is installed; queued
+old writes recheck their identity before reaching native I/O. Synchronous data
+writes still use the configured transfer worker pool, and heartbeat probes are
+still sequential; these bounds do not provide native write cancellation or
+writer incarnation discovery.
+
+Bootstrap timeout and other prefill failures retain the same terminal room
+record as explicit cancellation. A late manifest is rejected immediately,
+without another unclaimed timeout. Before manifest publication, decode bounds
+bootstrap and scheduler admission waiting by `waiting_timeout`. Publication
+starts a separate receive budget of the same duration. These phase budgets do
+not constitute an upstream end-to-end deadline. Before publication a failed
+receiver retires locally and notifies known targets; after publication it must
+obtain the normal retirement acknowledgments.
+
+**PD** (`pd`, `ts-pd`). Requests register with the transfer peer when submitted
+to the scheduler, before cache admission. Every round the replica agrees on which transfers changed
 state; their scheduler events join the round's tail feedback, and a failed
 transfer aborts its request on every rank together. A peer keeps state only
 for the rooms of requests the loop tracks (a sleep waits for those alone),

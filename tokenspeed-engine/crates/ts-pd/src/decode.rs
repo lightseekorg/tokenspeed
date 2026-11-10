@@ -88,8 +88,8 @@ pub struct DecodeConfig {
     pub tp_size: i64,
     /// See `arena_base`.
     pub tp_rank: i64,
-    /// A request whose manifest went out this long ago without its KV
-    /// landing fails.
+    /// Maximum wait in each phase: registration through manifest publication,
+    /// then publication through KV arrival. Failure still waits for write retirement.
     pub waiting_timeout: Duration,
     /// How often the Prefill nodes' health is checked.
     pub heartbeat_interval: Duration,
@@ -387,15 +387,14 @@ impl Shared {
             return;
         }
         cancellation.sent = Some(Instant::now());
-        if state.admissions.contains_key(&room) {
-            if let Some(targets) = state.targets.get(&room) {
-                for target in targets.iter() {
-                    self.transport.sockets.send(
-                        &target.host,
-                        target.port,
-                        wire::cancellation_frames(room, &state.cache_id),
-                    );
-                }
+        if let Some(targets) = state.targets.get(&room) {
+            for target in targets.iter() {
+                // A full queue is retried on the next cancellation poll.
+                let _ = self.transport.sockets.send_coalesced(
+                    &target.host,
+                    target.port,
+                    wire::cancellation_frames(room, &state.cache_id),
+                );
             }
         }
     }
@@ -488,20 +487,23 @@ impl Shared {
             // room's pre-allocation follows on this same socket.
             let session_id = self.transport.session_id();
             for target in targets.iter() {
-                self.transport.sockets.send(
-                    &target.host,
-                    target.port,
-                    wire::registration_frames(
-                        &self.local_ip,
-                        self.transport.sockets.port(),
-                        &session_id,
-                        &state.cache_id,
-                        self.arena_base,
-                        &self.layout_wire,
-                        self.tp_size,
-                        self.tp_rank,
-                    ),
-                );
+                self.transport
+                    .sockets
+                    .send(
+                        &target.host,
+                        target.port,
+                        wire::registration_frames(
+                            &self.local_ip,
+                            self.transport.sockets.port(),
+                            &session_id,
+                            &state.cache_id,
+                            self.arena_base,
+                            &self.layout_wire,
+                            self.tp_size,
+                            self.tp_rank,
+                        ),
+                    )
+                    .map_err(|error| error.to_string())?;
             }
             state.connections.insert(key, targets.clone());
         }
@@ -670,7 +672,7 @@ impl DecodeOutbox {
             return;
         };
         for target in targets.iter() {
-            self.shared.transport.sockets.send(
+            if let Err(error) = self.shared.transport.sockets.send(
                 &target.host,
                 target.port,
                 wire::preallocation_frames(
@@ -678,7 +680,12 @@ impl DecodeOutbox {
                     &state.cache_id,
                     (!target.is_dummy).then_some(manifest),
                 ),
-            );
+            ) {
+                // Some targets may already have their manifest: keep the
+                // admission and let the usual cancellation fence retire it.
+                state.fail(room, error.to_string());
+                return;
+            }
         }
         tracing::debug!(rid, room, "pre-allocation sent");
     }
@@ -688,6 +695,7 @@ impl DecodeOutbox {
 struct Receiver {
     room: u64,
     addr: String,
+    started: Instant,
     local: TransferPoll,
     concluded: Option<TransferPoll>,
     draining: Option<Draining>,
@@ -696,7 +704,7 @@ struct Receiver {
 /// A Decode rank's PD transfer peer.
 pub struct DecodePeer {
     shared: Arc<Shared>,
-    connect: mpsc::Sender<(u64, String)>,
+    connect: HashMap<String, mpsc::Sender<u64>>,
     stop: Arc<AtomicBool>,
     _heartbeat_stop: mpsc::Sender<()>,
     waiting_timeout: Duration,
@@ -763,19 +771,6 @@ impl DecodePeer {
                     }
                 })?;
         }
-        let (connect, rooms) = mpsc::channel::<(u64, String)>();
-        {
-            let shared = shared.clone();
-            thread::Builder::new()
-                .name("ts-pd-connect".to_owned())
-                .spawn(move || {
-                    while let Ok((room, addr)) = rooms.recv() {
-                        if let Err(reason) = shared.connect(room, &addr) {
-                            shared.state().fail(room, reason);
-                        }
-                    }
-                })?;
-        }
         let (heartbeat_stop, stopped) = mpsc::channel();
         {
             let shared = shared.clone();
@@ -792,7 +787,7 @@ impl DecodePeer {
         Ok((
             Self {
                 shared,
-                connect,
+                connect: HashMap::new(),
                 stop,
                 _heartbeat_stop: heartbeat_stop,
                 waiting_timeout: config.waiting_timeout,
@@ -863,6 +858,7 @@ impl TransferPeer for DecodePeer {
                 Receiver {
                     room,
                     addr: addr.clone(),
+                    started: Instant::now(),
                     local: TransferPoll::Bootstrapping,
                     concluded: None,
                     draining: None,
@@ -872,8 +868,24 @@ impl TransferPeer for DecodePeer {
         {
             self.order.push(rid.to_owned());
         }
-        self.connect
-            .send((room, addr))
+        if !self.connect.contains_key(&addr) {
+            let (sender, rooms) = mpsc::channel();
+            let shared = self.shared.clone();
+            let endpoint = addr.clone();
+            thread::Builder::new()
+                .name("ts-pd-connect".to_owned())
+                .spawn(move || {
+                    while let Ok(room) = rooms.recv() {
+                        if let Err(reason) = shared.connect(room, &endpoint) {
+                            shared.state().fail(room, reason);
+                        }
+                    }
+                })
+                .map_err(|error| PdError::Peer(error.to_string()))?;
+            self.connect.insert(addr.clone(), sender);
+        }
+        self.connect[&addr]
+            .send(room)
             .map_err(|_| PdError::Peer("the PD connect thread stopped".to_owned()))
     }
 
@@ -897,6 +909,19 @@ impl TransferPeer for DecodePeer {
                         status @ (TransferPoll::Success | TransferPoll::Failed) => {
                             receiver.concluded = Some(status);
                             status
+                        }
+                        TransferPoll::Bootstrapping | TransferPoll::Bootstrapped
+                            if now - receiver.started >= self.waiting_timeout =>
+                        {
+                            state.rooms.record_failure(
+                                receiver.room,
+                                "Decode timed out before publishing its cache manifest".to_owned(),
+                            );
+                            if let Some(metrics) = &self.shared.metrics {
+                                metrics.record_timeout("waiting_for_admission");
+                            }
+                            receiver.concluded = Some(TransferPoll::Failed);
+                            TransferPoll::Failed
                         }
                         TransferPoll::WaitingForInput => {
                             let waited = state
