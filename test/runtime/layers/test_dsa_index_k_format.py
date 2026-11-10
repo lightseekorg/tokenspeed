@@ -117,7 +117,10 @@ def test_recipe_plans_the_declared_plane(index_k_format, dtype_name, width):
 def test_the_configure_attention_hook_names_the_plane():
     from types import SimpleNamespace
 
-    from tokenspeed.runtime.configs.model_config import configure_dsa_attention
+    from tokenspeed.runtime.configs.model_config import (
+        configure_dsa_attention,
+        configure_kimi_k31_attention,
+    )
 
     text_config = SimpleNamespace(
         kv_lora_rank=512,
@@ -135,6 +138,20 @@ def test_the_configure_attention_hook_names_the_plane():
     # The in-tree hook keeps the FP8-with-scale plane; a plugin hook that
     # scores the checkpoint's bf16 keys overrides it after.
     assert model_config.index_k_format == "fp8_scaled"
+    # A format the model's hook does not take is refused, not ignored.
+    with pytest.raises(ValueError, match="mxfp4"):
+        configure_dsa_attention(
+            model_config, ServerArgs(model="x", dsa_index_k_format="mxfp4")
+        )
+    configure_kimi_k31_attention(
+        model_config, ServerArgs(model="x", dsa_index_k_format="mxfp4")
+    )
+    assert model_config.index_k_format == "mxfp4"
+    with pytest.raises(ValueError, match="mxfp4"):
+        configure_kimi_k31_attention(
+            model_config,
+            ServerArgs(model="x", dsa_index_k_format="mxfp4", numerics="rl-bitwise"),
+        )
     # A hook that named no plane is a construction error, not a fallback.
     with pytest.raises(ValueError, match="index_k_format"):
         _dsa_spec(None)
