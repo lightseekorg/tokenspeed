@@ -80,6 +80,7 @@ from tokenspeed.runtime.models.kimi_k3 import (
     KimiLinearMLAAttention,
 )
 from tokenspeed.runtime.utils import add_prefix
+from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 if TYPE_CHECKING:
@@ -433,6 +434,8 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
         self._decode_topk_indices_buffer: torch.Tensor | None = None
         self._decode_topk_lens_buffer: torch.Tensor | None = None
         self._retired_decode_workspaces: list[torch.Tensor] = []
+        # Decode rounds select top-k on the alternate stream while the query absorbs.
+        self.decode_topk_fork = StreamFork(alt_stream)
         # The attention group's K3 Iris state, once communication is prepared.
         self.topk_iris_state: K3IrisState | None = None
         # [q_b_proj; indexer wq_b] stacked after load: one GEMM over q_norm.
@@ -868,19 +871,20 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
             q_latent, projected_q, index_query, written_index_query = (
                 self._decode_front(q_latent, latent_cache, index_key_weights, ctx)
             )
-        return self.forward_dsa_core(
-            positions,
-            hidden_states,
-            q_latent,
-            latent_cache,
-            ctx,
-            comm_manager,
-            output_gate=output_gate,
-            projected_q=projected_q,
-            index_query=index_query,
-            index_key_weights=index_key_weights,
-            written_index_query=written_index_query,
-        )
+        with self.decode_topk_fork.scope(enable=ctx.num_extends == 0):
+            return self.forward_dsa_core(
+                positions,
+                hidden_states,
+                q_latent,
+                latent_cache,
+                ctx,
+                comm_manager,
+                output_gate=output_gate,
+                projected_q=projected_q,
+                index_query=index_query,
+                index_key_weights=index_key_weights,
+                written_index_query=written_index_query,
+            )
 
 
 class KimiK31ForConditionalGeneration(KimiK3ForConditionalGeneration):
