@@ -634,14 +634,15 @@ INLINE_ASM_ON_MAIN = {
     ),
     "_iris_subgroup_any": (
         "tokenspeed_kernel.ops.communication._iris.all_reduce:_iris_subgroup_any",
-        "a wave vote in Iris kernels, which link no library for"
-        " llvm.amdgcn.ballot",
+        "a wave vote whose result is one scalar per lane, which an extern"
+        " (elementwise) call cannot return",
         "a Gluon ballot (wave vote) op",
     ),
-    "wait_vmem": (
-        "tokenspeed_kernel.ops.communication._iris.synchronization:wait_vmem",
-        "s_waitcnt vmcnt(0) in Iris kernels, which link no library",
-        "a release fence that waits for stores without an L2 write-back",
+    "_wait": (
+        "tokenspeed_kernel.ops.communication._iris.synchronization:_wait",
+        "Iris waits: as intrinsics, they make the backend add a wait after"
+        " each rendezvous flag store",
+        "a backend that adds no wait there for a visible s_waitcnt",
     ),
 }  # fmt: skip
 # Known input hazards, by helper, until their fix lands: the reason.
