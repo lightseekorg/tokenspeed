@@ -142,13 +142,15 @@ def test_attention_matches_the_regular_path_math(
     _check_attention(length, window, splits, rows, requests, kv_dtype, page_base=0)
 
 
-# Long contexts, whose reference is slow: the served shape (one request's
-# verify on the FP8 cache) at a long agentic context (~14 key chunks a
-# split), and two requests over several key chunks a split.
+# Long contexts, once each: the served shape (one request's verify on the
+# FP8 cache, the key groups) at a long agentic context (~14 key chunks a
+# split), a single decode row there (the splits without key groups), and two
+# requests over several key chunks a split.
 @pytest.mark.parametrize(
     "length,rows,requests,kv_dtype",
     [
         (230000, 8, 1, torch.float8_e4m3fn),
+        (230000, 1, 1, torch.float8_e4m3fn),
         (50000, 8, 2, torch.bfloat16),
     ],
 )
