@@ -257,6 +257,7 @@ def test_candidate_logits_processor_is_created_after_target_wiring() -> None:
         tp_size=1,
         tp_group=None,
         skip_all_gather=False,
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
 

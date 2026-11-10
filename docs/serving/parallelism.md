@@ -67,7 +67,7 @@ instead. Three knobs shard those weights over contiguous groups of DP ranks
 | Parameter | Use |
 | --- | --- |
 | `--attn-head-tp-size W` | Shard `q_b_proj`, `kv_b_proj`, and `o_proj` by heads over `W` contiguous ranks that hold different rows. Over DP ranks: requires attention TP 1, attention DP, `W` dividing the stage world, `num_heads % W == 0`, and a decode engine (`--disaggregation-mode decode`). Over the query shards of a prefill engine: `W` equal to `--query-context-parallel-size` (see [Query context parallelism](#query-context-parallelism-on-the-prefill-role)). |
-| `--lm-head-tp-size W` | Vocab-shard the LM head over `W` contiguous ranks. Under attention DP the default is 1 (replicated); without attention DP it must equal the attention TP size (today's layout). |
+| `--lm-head-tp-size W` | Vocab-shard the LM head over `W` contiguous ranks. Under attention DP the default is 1 (replicated); a wider group gathers distinct DP groups' rows before the logits GEMM and transposes the vocabulary shards back. Attention TP greater than one is supported; LM-head and attention TP widths must tile each other. Without attention DP it must equal the attention TP size. |
 | `--dense-tp-size W` | Already shards the dense MLPs over `W` ranks (token all-gather in, token reduce-scatter out). |
 | `--tp-batch-invariant {none,attn,attn+dense}` | Make the sharded `o_proj` (`attn`) and dense `down_proj` (`attn+dense`) column-parallel on hidden so no cross-rank sum remains outside MoE; see below. |
 
@@ -131,10 +131,33 @@ path:
 A prefill row reaching the attention is then an invariant violation and
 raises, not a configuration the operator can hit.
 
-`--lm-head-tp-size` under attention DP gathers the ranks' logits rows,
+`--lm-head-tp-size` under attention DP gathers distinct DP groups' logits rows,
 runs the vocab-shard GEMM and transposes the shards back to each rank's own
 rows (`[T_own, V]`), so sampling and logprobs downstream see the same
-full-vocab rows as a replicated head. On the decode path the row counts come
+full-vocab rows as a replicated head. With attention TP greater than one,
+only one peer writes each DP slot into a zeroed hidden-state buffer, which
+is all-reduced across the LM-head group. The vocabulary shards are gathered
+and each attention TP peer reads its DP slot. This avoids multiplying the
+LM-head GEMM rows by attention TP. LM-head and attention TP widths must tile
+each other. For example, DP4/TP2 supports an explicit LM-head TP8 while its
+default stays replicated. A shared MTP head uses the same row layout.
+When the LM-head group stays within a single attention TP group (including
+when LM-head TP equals attention TP), its peers already hold identical
+hidden states, so the input row exchange is skipped. The output still
+gathers the vocabulary unless the consumer requests greedy token IDs.
+
+For greedy heads, eligible cross-DP layouts reduce each row's vocabulary
+maximum and global token ID before selecting the owning DP rows. They use
+fused distributed argmax with alternating slot bands when supported, and
+otherwise the packed-key argmax collective, instead of gathering full logits.
+The alternating bands allow consecutive target/draft calls without an extra
+group barrier; calls sharing a state must still be ordered across streams. Returned
+logits remain vocabulary-sharded and are not a full distribution. Sampled
+draft distributions and consumers requiring full logits keep the vocabulary
+exchange; padded vocabularies, softcapping, and other argmax eligibility
+limits also retain the full-logit fallback.
+
+On the decode path the row counts come
 from the per-rank token tables (every rank's logits rows are its decode
 tokens, or the live rows a narrowing draft step reported), so the step has
 no host sync. The shapes without a table -- a prefill's one row per request
@@ -146,6 +169,13 @@ TokenSpeed refuses the others with a clear error). It cannot combine with
 (`logprob_start_len`): that path pushes the prompt rows through the LM head
 in per-request chunks, a per-rank number of row exchanges the group cannot
 agree on.
+
+LM-head vocabulary gathering uses a separate communication buffer sized for
+sampling and speculative verification rows, rather than the attention prefill
+chunk. With attention DP, its capacity covers the global request limit times
+the number of speculative verification tokens (at least 128 rows). Larger
+batches, including prompt-logprob batches, fall back to NCCL without growing
+the persistent multicast buffer.
 
 `--tp-batch-invariant` replaces the two reduce-scatters of these layouts
 (after `o_proj`, after the dense `down_proj`) with column-parallel GEMMs on

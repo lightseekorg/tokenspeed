@@ -36,8 +36,8 @@ if not (
 ):
     pytest.skip("DeepGEMM MegaMoE needs an SM100-family GPU", allow_module_level=True)
 
-from tokenspeed_kernel.ops.activation import silu_and_mul  # noqa: E402
-from tokenspeed_kernel.ops.moe import deep_gemm as mega_moe  # noqa: E402
+from tokenspeed_kernel.ops.activation import silu_and_mul
+from tokenspeed_kernel.ops.moe import deep_gemm as mega_moe
 
 EXPERTS, HIDDEN, INTER, TOP_K, LIMIT = 16, 2048, 512, 4, 10.0
 
@@ -62,6 +62,7 @@ class _Experts(nn.Module):
         self.w13_weight_scale = tensor((e, 2 * i, h // 32), 118, 122)
         self.w2_weight = tensor((e, h, i // 2), 0, 256)
         self.w2_weight_scale = tensor((e, h, i // 32), 118, 122)
+        self.tp_size = 1
         self.num_local_experts = self.num_experts = e
         self.hidden_size, self.intermediate_size, self.top_k = h, i, TOP_K
         self.swiglu_arg = type("SwigluArg", (), {"limit": LIMIT})()

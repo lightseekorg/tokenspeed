@@ -2091,9 +2091,9 @@ if platform.is_nvidia:
             )
             limit = None
         elif (swiglu_arg := getattr(w, "swiglu_arg", None)) is None:
-            alpha = 1.702
-            limit = 7.0
-            beta = 1.0
+            alpha = 1.0
+            limit = None
+            beta = 0.0
         else:
             alpha = swiglu_arg.alpha
             limit = swiglu_arg.limit
