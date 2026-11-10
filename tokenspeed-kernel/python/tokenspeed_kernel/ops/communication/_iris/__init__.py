@@ -190,6 +190,22 @@ def get_or_create_context(*, heap_size: int):
     return _context
 
 
+def existing_context():
+    """The shared context, which the communication preparation created.
+
+    Raises:
+        RuntimeError: The heap does not exist yet. Buffers taken from it are
+            reserved beforehand (``reserve_heap``); the heap itself is sized
+            only by the preparation that creates it.
+    """
+    if _context is None:
+        raise RuntimeError(
+            "The Iris heap does not exist yet: prepare the communication "
+            "buffers first"
+        )
+    return _context
+
+
 class IrisGroup:
     """Retain the context and the ordered heap addresses for one process group."""
 

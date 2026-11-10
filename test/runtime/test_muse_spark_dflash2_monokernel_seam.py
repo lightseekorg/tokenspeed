@@ -294,12 +294,10 @@ def test_the_draft_reserves_every_iris_heap_buffer_it_allocates(
         def finish_prepare(self) -> None:
             pass
 
-    monkeypatch.setattr(_iris, "get_or_create_context", lambda heap_size: Heap())
+    monkeypatch.setattr(_iris, "existing_context", Heap)
     monkeypatch.setattr(_iris, "IrisGroup", Group)
-    state = draft.monokernel_state
-    for pairs in (state.scratch_pairs, state.context.scratch_pairs, state.head_pairs):
-        if pairs:
-            seam.mailbox_scratch(None, 0, pairs)
+    # The layers', the context write's and the head's scratch, in one group.
+    draft.monokernel_state.prepare(None, None, 0)
     assert len(allocated) == 3
     assert sum(allocated) == reserved
 

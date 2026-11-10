@@ -274,20 +274,24 @@ def request_seq_lens(leaf, bs: int) -> torch.Tensor:
     return lengths[:, 0].contiguous()
 
 
-def mailbox_scratch(
-    group: dist.ProcessGroup, rank: int, scratch_pairs: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """``scratch_pairs`` mailbox pairs on the Iris symmetric heap of
-    ``group`` (``rank`` this process's rank in it), and the group's heap
-    bases. Nothing clears the scratch: the tags make old pairs stale."""
+def mailbox_scratches(
+    group: dist.ProcessGroup, rank: int, scratch_pairs: tuple[int, ...]
+) -> tuple[list[torch.Tensor | None], torch.Tensor]:
+    """A mailbox scratch of each of ``scratch_pairs`` pairs (None for 0) on
+    the Iris symmetric heap of ``group`` (``rank`` this process's rank in
+    it), and the group's heap bases: one group preparation for all of them.
+    Nothing clears the scratch: the tags make old pairs stale."""
     from tokenspeed_kernel.ops.communication.iris import iris_symmetric_heap
 
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
     context, iris_group = iris_symmetric_heap(group, rank, device)
-    scratch = context.zeros((scratch_pairs,), dtype=torch.int64)
+    scratches = [
+        context.zeros((pairs,), dtype=torch.int64) if pairs else None
+        for pairs in scratch_pairs
+    ]
     bases = iris_group.bases.to(device)
     iris_group.finish_prepare()
-    return scratch, bases
+    return scratches, bases
 
 
 class DFlash2MonokernelState(MonokernelState):
@@ -328,6 +332,8 @@ class DFlash2MonokernelState(MonokernelState):
         head_pairs: The mailbox pairs reserved on the Iris heap for the
             head's scratch (0 when no head monokernel serves here);
             :meth:`enable_head` refuses a head that needs more.
+        head_scratch: The head's scratch, from :meth:`prepare` (None before
+            it, or when no head monokernel serves here).
     """
 
     def __init__(
@@ -358,6 +364,7 @@ class DFlash2MonokernelState(MonokernelState):
         # The current block's positions as int32 (start_step resets it).
         self.positions: torch.Tensor | None = None
         self.head: DraftHeadMonokernel | None = None
+        self.head_scratch: torch.Tensor | None = None
         # What prepare() and enable_head() allocate on the Iris heap, reserved
         # before the heap exists (enable_head runs after it exists).
         from tokenspeed_kernel.ops.communication.iris import reserve_iris_heap
@@ -378,13 +385,17 @@ class DFlash2MonokernelState(MonokernelState):
     def prepare(
         self, group: dist.ProcessGroup, cpu_group: dist.ProcessGroup, rank: int
     ) -> None:
-        """Allocate the scratch on the Iris heap of ``group`` (the TP8 device
+        """Allocate the layers', the context write's and the head's scratch on
+        the Iris heap of ``group`` (the TP8 device
         process group; ``cpu_group`` its CPU twin, ``rank`` this process's
         rank in it). Call once, before graph capture."""
         if self.bases is None:
-            self.scratch, self.bases = mailbox_scratch(group, rank, self.scratch_pairs)
-            self.context_scratch, _ = mailbox_scratch(
-                group, rank, self.context.scratch_pairs
+            (self.scratch, self.context_scratch, self.head_scratch), self.bases = (
+                mailbox_scratches(
+                    group,
+                    rank,
+                    (self.scratch_pairs, self.context.scratch_pairs, self.head_pairs),
+                )
             )
             self.device_group = group
             self.cpu_group = cpu_group
@@ -515,7 +526,7 @@ class DFlash2MonokernelState(MonokernelState):
                 f"{self.head_pairs} were reserved on the Iris heap"
             )
         self.head = DraftHeadMonokernel(
-            fused, self.device_group, self.cpu_group, self.rank, self.step[:1]
+            fused, self.head_scratch, self.bases, self.cpu_group, self.step[:1]
         )
         logger.info("Decode monokernel: the DFlash2 draft head (top 16 and selector)")
 
@@ -658,8 +669,9 @@ def takes_head(rows: int) -> bool:
 
 
 class DraftHeadMonokernel:
-    """The draft head's launch: its packed weights, its own mailbox scratch,
-    and the TP8 group's CPU group for the compile-ahead.
+    """The draft head's launch: its packed weights, its own mailbox scratch
+    (:meth:`DFlash2MonokernelState.prepare` allocates it), and the TP8 group's
+    CPU group for the compile-ahead.
 
     It keeps no step counter of its own: it reads the draft layers', which
     their launches advance once a block forward, before the head runs (the
@@ -679,13 +691,14 @@ class DraftHeadMonokernel:
     def __init__(
         self,
         fused: FusedDecodeLayer,
-        group: dist.ProcessGroup,
+        scratch: torch.Tensor,
+        bases: torch.Tensor,
         cpu_group: dist.ProcessGroup,
-        rank: int,
         step: torch.Tensor,
     ) -> None:
         self.fused = fused
-        self.scratch, self.bases = mailbox_scratch(group, rank, fused.scratch_pairs)
+        self.scratch = scratch
+        self.bases = bases
         self.step = step
         self.cpu_group = cpu_group
         self.compiled: set[int] = set()
@@ -832,7 +845,7 @@ __all__ = [
     "DraftHeadMonokernel",
     "enable_draft_monokernels",
     "head_reasons",
-    "mailbox_scratch",
+    "mailbox_scratches",
     "layer_tensors",
     "config_reasons",
     "model_reasons",

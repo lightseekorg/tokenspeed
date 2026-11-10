@@ -337,7 +337,7 @@ def test_the_state_allocates_what_it_reserved_on_the_iris_heap(
         def finish_prepare(self) -> None:
             pass
 
-    monkeypatch.setattr(_iris, "get_or_create_context", lambda heap_size: Heap())
+    monkeypatch.setattr(_iris, "existing_context", Heap)
     monkeypatch.setattr(_iris, "IrisGroup", Group)
     monkeypatch.setitem(global_server_args_dict, "monokernel_stuck_record_dir", None)
     fused = {i: layer.fused for i, layer in enumerate(model.layers) if layer.fused}

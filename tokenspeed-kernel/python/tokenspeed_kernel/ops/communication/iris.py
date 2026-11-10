@@ -102,22 +102,22 @@ def iris_heap_bytes(shape: tuple[int, ...], dtype: torch.dtype) -> int:
 
 def iris_symmetric_heap(group: dist.ProcessGroup, rank: int, device: torch.device):
     """The shared Iris context and the heap addresses of ``group``'s ranks
-    (``rank`` this process's rank in it). Buffers allocated from the context
-    must have been reserved (``reserve_iris_heap``) before the heap exists.
+    (``rank`` this process's rank in it), once the communication preparation
+    has created the heap. Buffers allocated from the context must have been
+    reserved (``reserve_iris_heap``) before the heap existed.
 
     Returns:
         ``(context, iris_group)``: ``context.zeros(shape, dtype=)`` allocates
         at the same heap offset on every rank; ``iris_group.bases`` holds each
         rank's heap base, and ``iris_group.finish_prepare()`` ends the group's
         preparation.
-    """
-    from tokenspeed_kernel.ops.communication._iris import (
-        MIN_HEAP_BYTES,
-        IrisGroup,
-        get_or_create_context,
-    )
 
-    context = get_or_create_context(heap_size=MIN_HEAP_BYTES)
+    Raises:
+        RuntimeError: The heap does not exist yet.
+    """
+    from tokenspeed_kernel.ops.communication._iris import IrisGroup, existing_context
+
+    context = existing_context()
     return context, IrisGroup(context, group, rank, device)
 
 

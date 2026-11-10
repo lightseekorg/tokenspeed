@@ -83,3 +83,11 @@ def test_a_live_heap_takes_no_reservation() -> None:
     _iris.get_or_create_context(heap_size=300 * MiB)
     with pytest.raises(RuntimeError, match="late_owner reserved 1048576 bytes"):
         _iris.reserve_heap("late_owner", 1 * MiB)
+
+
+def test_only_the_preparation_creates_the_heap(created_sizes) -> None:
+    with pytest.raises(RuntimeError, match="does not exist yet"):
+        _iris.existing_context()
+    context = _iris.get_or_create_context(heap_size=300 * MiB)
+    assert _iris.existing_context() is context
+    assert created_sizes == [300 * MiB]
