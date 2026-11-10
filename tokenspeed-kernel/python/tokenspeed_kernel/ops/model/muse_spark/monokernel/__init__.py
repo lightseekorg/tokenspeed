@@ -121,9 +121,10 @@ def prepare_muse_spark_layer(
             scales)`` as the regular gluon MXFP4 MoE prepared them; the
             kernel reads their storage in place. ``experts_kernel`` names
             the regular MoE's apply kernel, whose weight layout that is.
-        max_rows: The most token rows of one request a launch will serve:
-            1 for decode, ``k + 1`` for a speculative verify of ``k`` draft
-            tokens. The scratch is sized for it.
+        max_rows: The most token rows a launch will serve: up to two
+            requests' rows, each 1 (decode) or ``k + 1`` (a speculative
+            verify of ``k`` draft tokens), one request's after the other's.
+            The scratch is sized for it.
         solution: Optional registered solution (such as ``"gluon"``) to
             force; its kernels must serve ``max_rows`` here, else this
             raises ``NoKernelFoundError``.
