@@ -584,7 +584,7 @@ class MuseSparkMonokernelLayer(MonokernelLayer):
         it, else the input rows unchanged (the next launch reads the owned
         columns this one wrote)."""
         if owned_global_rows is not None:
-            # The owned-row path starts at _MUSE_OWNED_MIN_ROWS rows, far past
+            # The owned-row path starts at MUSE_OWNED_ROWS_MIN_TOKENS rows, far past
             # a launch's MAX_ROWS.
             raise RuntimeError("Muse Spark monokernel: an owned-row forward")
         state = self.monokernel_state
