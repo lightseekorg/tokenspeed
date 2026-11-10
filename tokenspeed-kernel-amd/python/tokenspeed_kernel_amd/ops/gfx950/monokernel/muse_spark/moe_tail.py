@@ -374,7 +374,6 @@ def unpool_stages(
         # one wave spins on hints first (unthrottled, the flood of polls
         # starves the producers' stores across ranks and the grid livelocks).
         mb.row(R - 1).pre_poll_spread("cmb", POOLED // 2)
-    x_smem, _ = bf16.load_rows(mb, "cmb", 0, POOLED, R)
     # Every row's h' of the task's pairs, in the epilogue's [row, pair] layout.
     RPP: gl.constexpr = triton.next_power_of_2(R)
     hl: gl.constexpr = gl.SliceLayout(
@@ -383,7 +382,9 @@ def unpool_stages(
     hr = gl.arange(0, RPP, gl.SliceLayout(1, hl))[:, None]
     hc = task * UNPOOL_COLS + 2 * gl.arange(0, UNPOOL_COLS // 2, gl.SliceLayout(0, hl))
     hat = mb.row_offset(hr) + hc[None, :]
-    hp = mb.poll_many(("hp", "hp"), (hat, hat + 1))
+    # hp is polled with cmb's first row group, so on the launch's critical
+    # path it costs no round trip of its own.
+    x_smem, hp = bf16.load_rows(mb, "cmb", 0, POOLED, R, ("hp", "hp"), (hat, hat + 1))
     mb.stamp("unpool", trace.READY)
     out = bf16.gemv(x_smem, tiles, FIRST=0, ROWS=R)  # [RP, 16]
     mb.stamp("unpool", trace.COMPUTED)
