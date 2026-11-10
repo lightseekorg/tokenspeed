@@ -139,7 +139,7 @@ def experts_kernel(
         )
     task, active = schedule.stage_task(PLAN, "exr")
     if active:
-        moe_experts.exr_stage(mb, task, union, table, False, "exr")
+        moe_experts.exr_stage(mb, task, union, table, "exr")
     if active2:
         moe_experts.ex2_finish(
             mb,
