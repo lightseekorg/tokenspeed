@@ -206,6 +206,24 @@ def wave_uniform_i32(value, _semantic):
 
 
 @tl.core.extern
+def wave_inclusive_sum_i32(value, _semantic):
+    """Return the inclusive sum of int32 ``value`` over this lane and the
+    lanes below it in the wave (DPP row shifts and row broadcasts). Every
+    lane of the wave must be active. Launch with
+    :func:`extern_compile_options`.
+    """
+    return _call(
+        "wave",
+        "inclusive_sum_i32",
+        [value],
+        (tl.int32,),
+        tl.int32,
+        is_pure=True,
+        _semantic=_semantic,
+    )
+
+
+@tl.core.extern
 def wave_all_equal(a, b, _semantic):
     """1 where ``a == b`` (FP32, ordered) holds in every active lane of the
     wave, else 0, as an int32 tensor whose value is the same across the

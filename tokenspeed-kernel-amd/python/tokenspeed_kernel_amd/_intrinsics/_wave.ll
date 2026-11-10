@@ -49,3 +49,27 @@ entry:
   %r = zext i1 %all to i32
   ret i32 %r
 }
+
+; Inclusive int32 sum over the 64 lanes of a wave (every lane active): DPP
+; row shifts by 1, 2, 4 and 8 sum within each row of 16 lanes (lanes shifted
+; in from outside the row read 0), then row broadcasts 15 and 31 carry each
+; row's total into the next rows (rows the row mask leaves out add 0). The
+; backend inserts the wait states each DPP read of a just-written VGPR needs.
+declare i32 @llvm.amdgcn.update.dpp.i32(i32, i32, i32 immarg, i32 immarg, i32 immarg, i1 immarg)
+
+define i32 @__tokenspeed_wave_inclusive_sum_i32(i32 %x) alwaysinline {
+entry:
+  %d1 = call i32 @llvm.amdgcn.update.dpp.i32(i32 0, i32 %x, i32 273, i32 15, i32 15, i1 true)
+  %s1 = add i32 %x, %d1
+  %d2 = call i32 @llvm.amdgcn.update.dpp.i32(i32 0, i32 %s1, i32 274, i32 15, i32 15, i1 true)
+  %s2 = add i32 %s1, %d2
+  %d4 = call i32 @llvm.amdgcn.update.dpp.i32(i32 0, i32 %s2, i32 276, i32 15, i32 15, i1 true)
+  %s4 = add i32 %s2, %d4
+  %d8 = call i32 @llvm.amdgcn.update.dpp.i32(i32 0, i32 %s4, i32 280, i32 15, i32 15, i1 true)
+  %s8 = add i32 %s4, %d8
+  %b15 = call i32 @llvm.amdgcn.update.dpp.i32(i32 0, i32 %s8, i32 322, i32 10, i32 15, i1 false)
+  %s15 = add i32 %s8, %b15
+  %b31 = call i32 @llvm.amdgcn.update.dpp.i32(i32 0, i32 %s15, i32 323, i32 12, i32 15, i1 false)
+  %r = add i32 %s15, %b31
+  ret i32 %r
+}
