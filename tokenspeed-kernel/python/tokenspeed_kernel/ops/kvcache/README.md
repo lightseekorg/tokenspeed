@@ -34,7 +34,7 @@ them); build it outside graph capture, once per bound pool.
 It stores the bytes of the per-layer chain it replaces on NVIDIA. The norm
 gives each of FlashInfer's CuTe DSL RMSNorm lanes its columns in the same order
 (lane `t` sums the squares of columns `b * vec * lanes + t * vec + e` in
-sequence) and adds the lane sums neighbour by neighbour, as the warp butterfly
+sequence) and adds the lane sums neighbor by neighbor, as the warp butterfly
 does; the RoPE pair is `fma(x1, cos, -x2 * sin)` and `fma(x2, cos, x1 * sin)`;
 both round to bf16 with integer round-to-nearest-even (a float round trip can
 be folded away), and the store then sanitizes and converts like
