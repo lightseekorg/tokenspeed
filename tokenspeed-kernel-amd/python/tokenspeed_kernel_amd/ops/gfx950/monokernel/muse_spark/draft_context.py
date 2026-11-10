@@ -95,6 +95,7 @@ PEERS = ("css", "chin")
 
 
 def regions() -> tuple[tuple[str, int], ...]:
+    """The context write's regions as (name, int64 pairs): fpart, css, chin, kvpart."""
     return (
         ("fpart", int(FC_KPARTS) * int(OWNED)),  # FP32 [K part][owned column]
         ("css", int(WORLD) * int(SUM_TASKS)),  # FP32 sums of squares [rank][task]
@@ -107,6 +108,8 @@ BASES = {"fc": 0, "fsum": 0, "kv": 96, "kvout": 0}
 
 
 def stages(bases: dict[str, int], rows: int) -> tuple[Stage, ...]:
+    """The stages of ``rows`` verify rows, placed by ``bases`` (stage name to
+    first CTA)."""
     fc, fsum, kv, kvout = placement(bases, ("fc", "fsum", "kv", "kvout"))
     tasks = int(SUM_TASKS) * rows
     return (

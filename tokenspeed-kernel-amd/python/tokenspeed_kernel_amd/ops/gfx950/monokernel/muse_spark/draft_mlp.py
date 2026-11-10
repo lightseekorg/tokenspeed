@@ -116,6 +116,8 @@ PEERS = ("red", "ss", "hin")
 
 
 def regions() -> tuple[tuple[str, int], ...]:
+    """The MLP half's regions as (name, int64 pairs): red, ss, hin, cpart, hc,
+    gpart, act, dpart."""
     world, owned, tasks = int(WORLD), int(OWNED), int(SUM_TASKS)
     return (
         ("red", world * owned // 2),  # BF16 pairs [source rank][owned column]

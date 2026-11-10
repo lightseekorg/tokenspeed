@@ -76,6 +76,9 @@ CODE_TASKS = 64
 
 
 def regions(splits: int) -> tuple[tuple[str, int], ...]:
+    """The layer's regions as (name, int64 pairs): the attention half's for
+    ``splits`` attention splits, then the MLP half's, then the final norm's
+    (fred, fss, fhin)."""
     world, owned, tasks = int(WORLD), int(draft_mlp.OWNED), int(draft_mlp.SUM_TASKS)
     final = (
         ("fred", world * owned // 2),
@@ -162,7 +165,7 @@ BASES = {
 @functools.lru_cache(maxsize=None)
 def layer_plan(rows: int, last: bool) -> Plan:
     """The plan of a draft layer for ``rows`` token rows (one block); the
-    ``last`` layer's ends in the draft's final norm."""
+    ``last`` layer's launch ends in the draft's final norm."""
     return Plan(
         grid=256,
         stages=(Stage("code", CODE_TASKS, 0),) + stages(BASES, SPLITS, rows, last),

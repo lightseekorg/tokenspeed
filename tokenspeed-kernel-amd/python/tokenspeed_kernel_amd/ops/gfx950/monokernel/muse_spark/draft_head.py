@@ -93,6 +93,7 @@ PEERS = ("rk",)
 
 
 def regions() -> tuple[tuple[str, int], ...]:
+    """The draft head's regions as (name, int64 pairs): tk, rk, cid, hpart."""
     return (
         ("tk", int(LMH_TASKS) * int(TOPK)),  # packed (value, shard row) [task][16]
         ("rk", int(WORLD) * int(TOPK)),  # packed (value, shard row) [rank][16]
@@ -105,6 +106,8 @@ BASES = {"lmh": 0, "hproj": 226, "merge": 242}
 
 
 def stages(bases: dict[str, int], rows: int) -> tuple[Stage, ...]:
+    """The stages of ``rows`` draft steps, placed by ``bases`` (stage name to
+    first CTA)."""
     lmh, hproj, merge = placement(bases, ("lmh", "hproj", "merge"))
     return (
         Stage("lmh", int(LMH_TASKS), lmh, writes=("tk",)),

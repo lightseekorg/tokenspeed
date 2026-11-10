@@ -271,8 +271,8 @@ def _check_attention(length, window, splits, rows, requests, kv_dtype, page_base
 
 
 def _cache_from(cache: torch.Tensor, page_base: int) -> torch.Tensor:
-    """``cache``'s pages on the device as pages ``page_base`` on of a cache
-    that large; the pages below stay unwritten."""
+    """``cache``'s pages on the device as pages from ``page_base`` on of a
+    cache that large; the pages below stay unwritten."""
     if not page_base:
         return cache.clone().cuda()
     out = torch.empty(
