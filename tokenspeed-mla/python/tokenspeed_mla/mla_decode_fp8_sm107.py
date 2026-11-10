@@ -70,6 +70,7 @@ import cutlass.utils.rubin_helpers as sm107_utils
 from cutlass.cute.arch import Arch
 from cutlass.cute.nvgpu import OperandMajorMode, tcgen05
 from cutlass.cutlass_dsl import BaseDSL, if_generate
+from cutlass.experimental import primitives as prims
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from tokenspeed_mla.mla_helpers import LOG2_E, MAX_SPLITS, ceil_div
 from tokenspeed_mla.mla_helpers_sm107 import (
@@ -162,9 +163,31 @@ def _wait_cluster_mbarrier(mbar_ptr: cute.Pointer, phase: cutlass.Int32) -> None
     mechanism, same as every PipelineTmaUmma consumer in this kernel), so the
     pair-rendezvous vote only needs the barrier COUNT — no cluster-acquire
     fence. The earlier CLUSTER/ACQUIRE variant emitted a MEMBAR.ALL.GPU per
-    wait (SASS has no cluster membar scope).
+    wait (SASS has no cluster membar scope). Not for a word whose payload this
+    CTA then reads with generic loads; see _wait_cluster_mbarrier_acquire.
     """
     cute.arch.mbarrier_wait(mbar_ptr, phase)
+
+
+@cute.jit
+def _wait_cluster_mbarrier_acquire(
+    mbar_ptr: cute.Pointer, phase: cutlass.Int32
+) -> None:
+    """Block on a local mbarrier that a peer CTA's st.async completes.
+
+    The complete_tx of the peer's store (the corr STAS into this CTA's
+    smem_corr) releases at cluster scope; a CTA-scope wait does not
+    synchronize with it, so the generic reads of the delivered words after the
+    wait would be unordered against the store. A relaxed cluster-scope
+    try_wait followed by fence.acquire.sync_restrict::shared::cluster.cluster
+    gives the acquire; unlike the CLUSTER/ACQUIRE try_wait it adds no L1
+    invalidate per poll, and the restricted fence costs no SASS instruction.
+    """
+    while not prims.mbarrier_try_wait_parity(
+        mbar_ptr, phase, scope=prims.MBarrierScope.CLUSTER, order=prims.MemOrder.RELAXED
+    ):
+        pass
+    prims.fence_sync_restrict(prims.MemOrder.ACQUIRE)
 
 
 @cute.jit
@@ -6660,8 +6683,11 @@ class Sm107MultiHeadLatentAttentionForwardFP8:
                 common_params.cor_full_mbar.arrive_mbarrier(p_cor_consumer_state.index)
 
         if_generate(is_sync_warp, _arrive_cor_full)
-        common_params.cor_full_mbar.wait(
-            p_cor_consumer_state.index, p_cor_consumer_state.phase
+        # The peer's STAS completes this word at cluster scope; acquire at
+        # cluster scope before reading smem_corr.
+        _wait_cluster_mbarrier_acquire(
+            common_params.cor_full_mbar.get_barrier(p_cor_consumer_state.index),
+            p_cor_consumer_state.phase,
         )
 
         # Each thread reads its own row's metadata from the corr SMEM stage.
