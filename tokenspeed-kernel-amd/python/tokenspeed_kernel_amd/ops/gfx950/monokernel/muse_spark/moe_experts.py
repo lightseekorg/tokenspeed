@@ -35,9 +35,9 @@ once for every row that picked it. Row ``r``'s result for slot ``i`` goes to
 row ``r``'s entry of the pick that chose that expert, so the combine reads
 each row's 8 picks as for one row.
 
-* xq, a task a K quarter of a group of up to 4 rows: polls the group's
-  whole pooled rows, applies the pre-expert RMS norm, and quantizes the
-  quarter to MXFP4 (the regular path's "even" rule), then publishes the
+* xq, a task a K quarter of a group of up to 2 rows (:func:`xq_rows`):
+  polls the group's whole pooled rows, applies the pre-expert RMS norm, and
+  quantizes the quarter to MXFP4 (the regular path's "even" rule), then publishes the
   E2M1 bytes and E8M0 scales as plain words under one flag.
 * ex1, 256 tasks: lane ``l``, 128 of the 1024 interleaved gate / up columns,
   a quarter of K (64 KiB of weights a slot). A task issues its first slot's
@@ -121,10 +121,10 @@ W13_N = gl.constexpr(1024)  # interleaved gate / up columns
 BLOCK_N = gl.constexpr(128)
 M_DUP = gl.constexpr(16)  # MFMA rows; the activation row repeats in each
 KSPLIT = gl.constexpr(4)
-K_SLICE = gl.constexpr(1024)  # POOLED // KSPLIT
-NB1 = gl.constexpr(8)  # W13_N // BLOCK_N
-NB2 = gl.constexpr(32)  # POOLED // BLOCK_N
-EX1_TASKS = gl.constexpr(256)  # LANES * NB1 * KSPLIT
+K_SLICE = gl.constexpr(POOLED // KSPLIT)
+NB1 = gl.constexpr(W13_N // BLOCK_N)
+NB2 = gl.constexpr(POOLED // BLOCK_N)
+EX1_TASKS = gl.constexpr(LANES * NB1 * KSPLIT)
 # Past one row each lane's slots split over EXR_PARTS exr tasks (a slot of
 # every EXR_PARTS-th round each), one task a CTA: an exr task then holds its
 # CTA's ex2 task back by about one slot, whatever the slot count. On CTAs
@@ -133,65 +133,28 @@ EX1_TASKS = gl.constexpr(256)  # LANES * NB1 * KSPLIT
 # for it. One row has one slot a lane: one part. A launch
 # that ends with qnext splits exr in 2 parts instead (layer.NEXT_BASES).
 EXR_PARTS = gl.constexpr(4)
-EXR_LANE_TASKS = gl.constexpr(64)  # LANES * NB1: one part
+EXR_LANE_TASKS = gl.constexpr(LANES * NB1)  # one part
 # An intermediate row in MXFP4 words: 64 of E2M1 values, then a word per
 # ex1 block holding its 2 scale bytes.
-H1_WORDS = gl.constexpr(72)  # INTER // 8 + NB1
+H1_WORDS = gl.constexpr(INTER // 8 + NB1)
 # h1's room a pick, past the H1_WORDS it holds. The scratch layout (each
-# region's offset and the row stride) affects the launch time: at 72 words a
-# pick the regions after h1 moved 512 bytes within their 4 KiB page, the row
-# stride shrank, and an 8-row launch ran slower. Keep the measured layout's
-# sizing; change it only with a layer perf A/B.
+# region's offset within its 4 KiB page, and the row stride) affects the
+# launch time, and this sizing sets the offsets of the regions after h1 and
+# the row stride: change it only with a layer perf A/B.
 H1_REGION_WORDS = 256
-EX2_BLOCKS = gl.constexpr(1)  # 128-column blocks of an ex2 task
-EX2_TASKS = gl.constexpr(256)  # LANES * NB2 // EX2_BLOCKS
+EX2_TASKS = gl.constexpr(LANES * NB2)  # a 128-column block each
 # An ex2 task's first slots (all of them up to 64 distinct experts) are
 # gathered in one poll and run unrolled (:func:`ex2_finish`).
 EX2_GATHER = gl.constexpr(8)
 # Slots whose weights an ex2 task issues before that gather (then one more
 # a slot). The gather waits for them anyway (vmcnt counts in order), and it
 # waits on exr too, so up to 4 slots a lane (32 distinct experts) stream
-# while exr finishes instead of after the gather. 3 gained about half as much.
+# while exr finishes instead of after the gather.
 EX2_AHEAD = gl.constexpr(4)
-OWNED_OUT = gl.constexpr(512)  # output columns a rank reduces: POOLED / WORLD
+OWNED_OUT = gl.constexpr(POOLED // WORLD)  # output columns a rank reduces
 
-# The lane each group of 32 expert CTAs serves, per plan: slot i runs on
-# lane i % 8, so when U % 8 != 0 lanes 0 .. U % 8 - 1 carry one slot more.
-# A permutation (lane_order) moves those slots to the CTAs whose expert
-# tasks end earliest; which CTAs a slot runs on does not change its math (its
-# partials are keyed by pick), so outputs stay bit-identical. Identity until
-# a served stage trace picks one.
-LANE_IDENTITY = (0, 1, 2, 3, 4, 5, 6, 7)
-
-
-@gluon.constexpr_function
-def lane_order(plan):
-    """The lane permutation of ``plan``: CTA group ``g`` (of 32 CTAs) serves
-    lane ``lane_order(plan)[g]``."""
-    return LANE_IDENTITY
-
-
-@gluon.constexpr_function
-def _lane_bits(plan):
-    order = lane_order(plan)
-    if sorted(order) != list(LANE_IDENTITY):
-        raise ValueError(f"lane order must permute 0 .. 7, got {order}")
-    return sum(lane << (4 * g) for g, lane in enumerate(order))
-
-
-@gluon.constexpr_function
-def _lane_is_identity(plan):
-    return tuple(lane_order(plan)) == LANE_IDENTITY
-
-
-@gluon.jit
-def lane_of(plan: gl.constexpr, group):
-    """The lane that CTA group ``group`` serves (:func:`lane_order`)."""
-    if _lane_is_identity(plan):
-        out = group
-    else:
-        out = (_lane_bits(plan) >> (group * 4)) & 7
-    return out
+# Group ``g`` of 32 expert CTAs serves lane ``g``: slot i runs on lane
+# i % 8, so when U % 8 != 0 lanes 0 .. U % 8 - 1 carry one slot more.
 
 
 PEERS = ("rr",)
@@ -215,7 +178,7 @@ SLT_WORDS = gl.constexpr(128 + 128 * 16)
 # group the xq CTAs' ex1 falls behind the others at 1 x 8. With one row a
 # group at 16 rows, the 64 tasks would wrap onto the heaviest ex1 lanes'
 # CTAs.
-XQ_QUARTER_WORDS = gl.constexpr(136)  # K_SLICE // 8 + K_SLICE // 128
+XQ_QUARTER_WORDS = gl.constexpr(K_SLICE // 8 + K_SLICE // 128)
 XQ_GROUPS = gl.constexpr(8)
 
 
@@ -289,9 +252,11 @@ def _pick_layout(NP, num_warps):
 @gluon.jit
 def slots(ids):
     """The slots of the launch's picks ``ids [NP]`` (from :func:`ex1_poll_routes`, a
-    lane each, rows major). Returns ``(ids, owner, slot, count)``: the ids,
-    whether each pick owns its expert, and its slot (a lane each), and the
-    number of slots. Only a wave's lanes talk.
+    lane each, rows major). Returns ``(ids, owner, slot, count, table)``:
+    the ids, whether each pick owns its expert, and its slot (a lane each),
+    the number of slots, and each pick's row picks ``[NP, rows]`` (for row
+    ``r``, the pick of ``r`` that chose the same expert, or -1). Only a
+    wave's lanes talk.
 
     It issues no global load: it runs while the first slots' weights
     stream."""
@@ -545,7 +510,8 @@ def _ballot_slots2(ids, RP: gl.constexpr):
     NP: gl.constexpr = ids.shape[0]
     nw: gl.constexpr = gl.num_warps()
     gl.static_assert(RP == 2 * nw, "two rows a wave")
-    # asm: 37 instructions vs 103-106 with the _wave.ll intrinsics.
+    # asm: by hand, the compares and ballots take fewer instructions than
+    # with the _wave.ll intrinsics.
     # [pick, row]: two picks a lane, two rows a wave.
     la: gl.constexpr = gl.BlockedLayout([2, 2], [64, 1], [1, nw], [1, 0])
     mine = gl.convert_layout(ids, gl.SliceLayout(1, la))[:, None]
@@ -595,7 +561,8 @@ def _ballot_slots(ids, RP: gl.constexpr):
     tt: gl.constexpr = gl.distributed_type(
         gl.int32, [NP, RP], _table_lanes_layout(RP, nw)
     )
-    # asm: 307 instructions vs 330 with the _wave.ll intrinsics (rows 8).
+    # asm: by hand, the compares and ballots take fewer instructions than
+    # with the _wave.ll intrinsics.
     out = gl.inline_asm(
         _slots_asm,
         (
@@ -695,6 +662,8 @@ def _load_b(
             _gluon_dot_preshuffled_w_offset(w_off, kt * 64 + bk, bn, N_PHYS).to(
                 gl.int32
             ),
+            # (bk >= 0) is always true: it broadcasts the scalar ``on`` to
+            # the tile's shape (the masks below use the same idiom).
             mask=(bk >= 0) & on,
             # sc0 nt on gfx950: a slot's weights stream once a launch, so
             # they must not evict what the launch reuses from L2 and the
@@ -839,8 +808,8 @@ def ex1_poll_routes(mb, task, task2, active, STAGE: gl.constexpr):
     i = gl.arange(0, 2, lanes)
     first = gl.where(
         i == 0,
-        lane_of(mb.plan, task // (NB1 * KSPLIT)),
-        lane_of(mb.plan, task2 // (NB2 // EX2_BLOCKS)),
+        task // (NB1 * KSPLIT),
+        task2 // NB2,
     )
     # One tagged poll for the routes and the table's flag: two polls in a
     # row would add a round trip on ex1's critical path.
@@ -1124,12 +1093,12 @@ def cta_slots(PLAN: gl.constexpr, union):
             "the slot table serves the lane of CTA t: t // 32",
         )
         # The table is the lane of ex1's task on this CTA; ex2 reads it for
-        # its own task's lane, task // (NB2 // EX2_BLOCKS): the two must agree.
+        # its own task's lane, task // NB2: the two must agree.
         gl.static_assert(
-            NB2 // EX2_BLOCKS == NB1 * KSPLIT,
+            NB2 == NB1 * KSPLIT,
             "ex1 and ex2 tasks of a CTA must be of one lane",
         )
-        table = lane_slots(union, lane_of(PLAN, gl.program_id(0) // (NB1 * KSPLIT)))
+        table = lane_slots(union, gl.program_id(0) // (NB1 * KSPLIT))
     else:
         table = (0, 0)
     return table
@@ -1144,20 +1113,6 @@ def lane_slot_expert(experts_smem, k):
     k = gl.to_tensor(k)
     row = experts_smem.index(gl.minimum(k, M_DUP - 1)).load(whole)
     return gl.where(k < M_DUP, gl.max(row, axis=0), -1)
-
-
-@gluon.jit
-def table_row_picks(picks_row, R: gl.constexpr):
-    """:func:`_row_picks` of a slot's row picks from LDS (``picks_row``
-    ``[16]``, :func:`lane_slots`): the same ``R`` scalars, each a reduction
-    within the thread (every thread loads the whole row)."""
-    whole: gl.constexpr = gl.BlockedLayout([M_DUP], [64], [gl.num_warps()], [0])
-    w = picks_row.load(whole)
-    iw = gl.arange(0, M_DUP, whole)
-    picks = ()
-    for r in gl.static_range(R):
-        picks += (gl.max(gl.where(iw == r, w, -1), axis=0),)
-    return picks
 
 
 @gluon.jit
@@ -1220,7 +1175,7 @@ def ex1_finish(
     for the lane's other slots. ``table``: past 8 rows, the CTA's
     :func:`lane_slots`; ``pre``: past 8 rows, the second slot's B tiles in LDS
     (:func:`ex1_prefetch`)."""
-    lane = lane_of(mb.plan, task // (NB1 * KSPLIT))
+    lane = task // (NB1 * KSPLIT)
     count = union[3]
     R: gl.constexpr = schedule.rows(mb.plan)
     if R > 8:
@@ -1277,9 +1232,9 @@ def ex1_finish(
             _ex1_slot_picked(mb, task, a, tiles, picks_smem.index(k))
     else:
         # Each slot's loads go out before the previous slot's product. With
-        # one row the loop never runs, yet this form schedules faster than
-        # one without it (a backend schedule effect). Past one row
-        # it fits the registers since the slots' ids sit a lane each.
+        # one row the loop never runs; it stays there too, since the backend
+        # schedules the slot's code around it better than without it. Past
+        # one row it fits the registers since the slots' ids sit a lane each.
         following = _slot_expert(union, lane + LANES)
         more = ex1_issue(
             task,
@@ -1348,27 +1303,20 @@ def _ex2_loads(
     task, active, expert, w2, w2s, stride_we, stride_se, stride_slin, stride_snb
 ):
     """:func:`ex2_issue`'s loads, without the trace point."""
-    TASKS_PER_LANE: gl.constexpr = NB2 // EX2_BLOCKS
-    blk0 = (task % TASKS_PER_LANE) * EX2_BLOCKS
-    loads = ()
-    for i in gl.static_range(EX2_BLOCKS):
-        loads += (
-            _load_b(
-                w2,
-                w2s,
-                expert,
-                stride_we,
-                stride_se,
-                stride_slin,
-                stride_snb,
-                (blk0 + i) * BLOCK_N,
-                0,
-                INTER // 128,
-                POOLED,
-                active,
-            ),
-        )
-    return loads
+    return _load_b(
+        w2,
+        w2s,
+        expert,
+        stride_we,
+        stride_se,
+        stride_slin,
+        stride_snb,
+        (task % NB2) * BLOCK_N,
+        0,
+        INTER // 128,
+        POOLED,
+        active,
+    )
 
 
 @gluon.jit
@@ -1426,7 +1374,7 @@ def exr_stage(mb, task, union, table, STAGE: gl.constexpr):
         gl.static_assert(
             EXR_PARTS == KSPLIT, "exr's lane must be the CTA's slot-table lane"
         )
-    lane = lane_of(mb.plan, task // (NB1 * PARTS))
+    lane = task // (NB1 * PARTS)
     blk = task // PARTS % NB1
     first = lane + LANES * (task % PARTS)
     count = union[3]
@@ -1624,60 +1572,28 @@ def _ex2_compute_picked(mb, task, loads, a, picks_smem, RANK: gl.constexpr):
     """:func:`_ex2_compute` past one row, with the slot's row picks from LDS
     (``picks_smem`` ``[1, 16]``, kept by :func:`_ex2_gather_lane`): MFMA row ``r`` is
     row ``r``, as there."""
-    TASKS_PER_LANE: gl.constexpr = NB2 // EX2_BLOCKS
-    blk0 = (task % TASKS_PER_LANE) * EX2_BLOCKS
+    blk = task % NB2
     p_smem, s_smem = a
-    owner = (blk0 * BLOCK_N) // OWNED_OUT
-    for b in gl.static_range(EX2_BLOCKS):
-        acc = _mma_rows(p_smem, s_smem, loads[b])
-        out = gl.reshape(acc.to(gl.bfloat16), [M_DUP, BLOCK_N // 2, 2])
-        word = mx.pack_bf16_pairs(out)
-        wl: gl.constexpr = word.type.layout
-        mm = gl.arange(0, M_DUP, gl.SliceLayout(1, wl))[:, None]
-        p = gl.arange(0, BLOCK_N // 2, gl.SliceLayout(0, wl))[None, :]
-        rl: gl.constexpr = gl.BlockedLayout(
-            [1, 1], [1, 64], [gl.num_warps(), 1], [1, 0]
-        )
-        pick_of = gl.convert_layout(
-            gl.reshape(picks_smem.load(rl), [M_DUP]), gl.SliceLayout(1, wl)
-        )[:, None]
-        col = ((blk0 + b) * BLOCK_N) % OWNED_OUT
-        at = ((RANK * TOP_K + pick_of) * OWNED_OUT + col) // 2 + p
-        mb.put_peer(
-            "rr",
-            owner,
-            mb.row_offset(mm) + at,
-            word,
-            mask=(pick_of >= 0) & (p >= 0),
-        )
-
-
-@gluon.jit
-def _mfma_rows(
-    picks,
-    order,
-    count,
-    M0: gl.constexpr,
-    G: gl.constexpr,
-    R: gl.constexpr,
-    layout: gl.constexpr,
-):
-    """``(row, pick, routed)`` ``[G]`` of MFMA rows ``M0 ..``: the routed row
-    whose order is the MFMA row, else MFMA row 0's."""
-    m = M0 + gl.arange(0, G, layout)
-    row = gl.full([G], -1, gl.int32, layout)
-    pick = gl.full([G], -1, gl.int32, layout)
-    row0 = gl.to_tensor(-1)
-    pick0 = gl.to_tensor(-1)
-    for r in gl.static_range(R):
-        hit = (picks[r] >= 0) & (m == order[r])
-        row = gl.where(hit, r, row)
-        pick = gl.where(hit, picks[r], pick)
-        first = (picks[r] >= 0) & (order[r] == 0)
-        row0 = gl.where(first, r, row0)
-        pick0 = gl.where(first, picks[r], pick0)
-    routed = m < count
-    return gl.where(routed, row, row0), gl.where(routed, pick, pick0), routed
+    owner = (blk * BLOCK_N) // OWNED_OUT
+    acc = _mma_rows(p_smem, s_smem, loads)
+    out = gl.reshape(acc.to(gl.bfloat16), [M_DUP, BLOCK_N // 2, 2])
+    word = mx.pack_bf16_pairs(out)
+    wl: gl.constexpr = word.type.layout
+    mm = gl.arange(0, M_DUP, gl.SliceLayout(1, wl))[:, None]
+    p = gl.arange(0, BLOCK_N // 2, gl.SliceLayout(0, wl))[None, :]
+    rl: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [gl.num_warps(), 1], [1, 0])
+    pick_of = gl.convert_layout(
+        gl.reshape(picks_smem.load(rl), [M_DUP]), gl.SliceLayout(1, wl)
+    )[:, None]
+    col = (blk * BLOCK_N) % OWNED_OUT
+    at = ((RANK * TOP_K + pick_of) * OWNED_OUT + col) // 2 + p
+    mb.put_peer(
+        "rr",
+        owner,
+        mb.row_offset(mm) + at,
+        word,
+        mask=(pick_of >= 0) & (p >= 0),
+    )
 
 
 @gluon.jit
@@ -1685,34 +1601,32 @@ def _ex2_compute(mb, task, loads, gathered, RANK: gl.constexpr):
     """One ex2 slot after :func:`_ex2_gather_lane` (one row): the MXFP4 intermediate times
     the slot's w2 ``loads``, the BF16 partials put to the owner rank."""
     R: gl.constexpr = schedule.rows(mb.plan)
-    TASKS_PER_LANE: gl.constexpr = NB2 // EX2_BLOCKS
-    blk0 = (task % TASKS_PER_LANE) * EX2_BLOCKS
+    blk = task % NB2
     a, picks, order = gathered
     p_smem, s_smem = a
-    owner = (blk0 * BLOCK_N) // OWNED_OUT
-    for b in gl.static_range(EX2_BLOCKS):
-        acc = _mma_rows(p_smem, s_smem, loads[b])
-        out = gl.reshape(acc.to(gl.bfloat16), [M_DUP, BLOCK_N // 2, 2])
-        word = mx.pack_bf16_pairs(out)
-        wl: gl.constexpr = word.type.layout
-        mm = gl.arange(0, M_DUP, gl.SliceLayout(1, wl))[:, None]
-        p = gl.arange(0, BLOCK_N // 2, gl.SliceLayout(0, wl))[None, :]
-        # The row and pick of each MFMA row.
-        row_of = gl.full([M_DUP, 1], 0, gl.int32, wl)
-        pick_of = gl.full([M_DUP, 1], -1, gl.int32, wl)
-        for r in gl.static_range(R):
-            mine = (mm == order[r]) & (picks[r] >= 0)
-            row_of = gl.where(mine, r, row_of)
-            pick_of = gl.where(mine, picks[r], pick_of)
-        col = ((blk0 + b) * BLOCK_N) % OWNED_OUT
-        at = ((RANK * TOP_K + pick_of) * OWNED_OUT + col) // 2 + p
-        mb.put_peer(
-            "rr",
-            owner,
-            mb.row_offset(row_of) + at,
-            word,
-            mask=(pick_of >= 0) & (p >= 0),
-        )
+    owner = (blk * BLOCK_N) // OWNED_OUT
+    acc = _mma_rows(p_smem, s_smem, loads)
+    out = gl.reshape(acc.to(gl.bfloat16), [M_DUP, BLOCK_N // 2, 2])
+    word = mx.pack_bf16_pairs(out)
+    wl: gl.constexpr = word.type.layout
+    mm = gl.arange(0, M_DUP, gl.SliceLayout(1, wl))[:, None]
+    p = gl.arange(0, BLOCK_N // 2, gl.SliceLayout(0, wl))[None, :]
+    # The row and pick of each MFMA row.
+    row_of = gl.full([M_DUP, 1], 0, gl.int32, wl)
+    pick_of = gl.full([M_DUP, 1], -1, gl.int32, wl)
+    for r in gl.static_range(R):
+        mine = (mm == order[r]) & (picks[r] >= 0)
+        row_of = gl.where(mine, r, row_of)
+        pick_of = gl.where(mine, picks[r], pick_of)
+    col = (blk * BLOCK_N) % OWNED_OUT
+    at = ((RANK * TOP_K + pick_of) * OWNED_OUT + col) // 2 + p
+    mb.put_peer(
+        "rr",
+        owner,
+        mb.row_offset(row_of) + at,
+        word,
+        mask=(pick_of >= 0) & (p >= 0),
+    )
 
 
 @gluon.jit
@@ -1815,7 +1729,7 @@ def ex2_finish(
     RP: gl.constexpr = triton.next_power_of_2(R)
     S: gl.constexpr = min(RP, EX2_GATHER)
     A: gl.constexpr = max(2, min(S, EX2_AHEAD))
-    lane = lane_of(mb.plan, task // (NB2 // EX2_BLOCKS))
+    lane = task // NB2
     count = union[3]
     TABLE: gl.constexpr = R > 8
     tiles = (loads,)

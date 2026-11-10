@@ -45,7 +45,7 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.dims import (
 )
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import Stage, placement
 
-POOL_ROWS = gl.constexpr(512)  # pooled columns a rank computes: POOLED / WORLD
+POOL_ROWS = gl.constexpr(POOLED // WORLD)  # pooled columns a rank computes
 POOL_TASKS = gl.constexpr(32)
 
 PEERS = ("cg",)
@@ -78,7 +78,7 @@ def pool_stage(mb, task, w, RANK: gl.constexpr, STAGE: gl.constexpr):
         K=HIDDEN,
         kit0=0,
         KITS=HIDDEN // 32,
-        SPLIT=8,
+        SPLIT=gl.num_warps(),
         NW=1,
         GROUP=1,
         GROUP_STRIDE=0,
@@ -116,5 +116,6 @@ def _pool_pass(mb, tiles, p0: gl.constexpr, n: gl.constexpr, task, RANK: gl.cons
     p = gl.arange(0, 8, gl.SliceLayout(0, wl))[None, :]
     at = mb.row_offset(p0 + row) + RANK * (POOL_ROWS // 2) + task * 8 + p
     for r in gl.static_range(WORLD):
-        # The padding rows past n are masked.
+        # The padding rows past n are masked; (p >= 0) is always true and
+        # broadcasts the row mask to the words' shape.
         mb.put_peer("cg", r, at, word, mask=(row < n) & (p >= 0))

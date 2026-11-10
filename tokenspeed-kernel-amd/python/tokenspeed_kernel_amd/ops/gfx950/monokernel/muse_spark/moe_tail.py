@@ -41,22 +41,23 @@ columns ``1024 r ..`` of the residual.
   h')^2``, into every rank's ``ffn``, in one store per rank. The puts of all
   64 tasks to 8 ranks are bound by the links between the GPUs, so ``p``
   goes in 3 pairs per 2 columns instead of 4.
-* out, 16 tasks of 512 hidden columns per row: the row's 512 x 4 partial
+* out, ``PER_ROW`` tasks a row (16, or 8 when the launch ends with qnext),
+  each of ``8192 / PER_ROW`` hidden columns: the row's 512 x 4 partial
   sums from every rank's ``ffn``, summed into the inverse RMS of the post-FFN
   norm (over 8192 columns) and of the next layer's input norm, whose sum of
   squares is the expansion of ``(beta y inv + alpha h')^2`` in the four sums;
   then the residual gate ``h'' = beta y inv + alpha h'`` and the next layer's
-  input norm. Each task reads only its own row's sums, 16 KB: a separate
-  stage that summed each row once (rnorm) cost one more hand-off at the end
-  of the layer, and polling every row's sums (fin, before) 128 KB a CTA.
-  The result is rounded to BF16 and stored as the next attention input, for
-  the next launch. Every rank computes the whole row from the ``ffn`` of
-  all ranks: putting the owned slice of the result to the other ranks instead
-  would add a second exchange to the end of the layer. The 2 tasks of a row
-  that cover the rank's owned columns also store ``h''`` (FP32, the launch's
-  residual output) and the draft's tap, not unpool's CTAs: a poll waits for
-  every earlier store of its wave, so after their ``ffn`` puts unpool's wait
-  for the scales would also wait for those 8 remote stores.
+  input norm. Each task sums its own row's sums (16 KB) itself, rather than
+  reading them from a stage that sums each row once: such a stage would add
+  one more hand-off at the end of the layer. The result is rounded to BF16
+  and stored as the next attention input, for the next launch. Every rank
+  computes the whole row from the ``ffn`` of all ranks: putting the owned
+  slice of the result to the other ranks instead would add a second
+  exchange to the end of the layer. The tasks of a row that cover the
+  rank's owned columns (``PER_ROW / 8``) also store ``h''`` (FP32, the
+  launch's residual output) and the draft's tap, not unpool's CTAs: a poll
+  waits for every earlier store of its wave, so after their ``ffn`` puts
+  unpool's wait for the scales would also wait for those 8 remote stores.
 """
 
 from __future__ import annotations
@@ -99,7 +100,7 @@ PEERS = ("ss3", "cmb", "ffn")
 # flag per task in ``ffnf``: the link is the limit there (1.8 MB a launch
 # out of each GPU as tagged pairs). Up to 8 rows it keeps tagged pairs: a
 # flag waits for the remote stores' acknowledgments, on the tail's
-# critical path (measured: the same words + flag hand-off lost on cmb).
+# critical path.
 WORDS_PEERS = ("ffnf",)
 
 
@@ -187,6 +188,10 @@ def _put_all(mb, region: gl.constexpr, index, values):
 
 @gluon.jit
 def _bf16_word(lo, hi):
+    """FP32 ``lo`` and ``hi`` rounded to BF16, as one int32 pair word
+    (``lo`` in the low half), in ``lo``'s layout: ``mx.pack_bf16_pairs``
+    builds the same word from a ``[..., 2]`` pair tensor, whose split
+    would leave the word in another layout."""
     return (lo.to(gl.bfloat16).to(gl.int16, bitcast=True).to(gl.int32) & 0xFFFF) | (
         hi.to(gl.bfloat16).to(gl.int16, bitcast=True).to(gl.int32) << 16
     )
@@ -348,7 +353,7 @@ def unpool_stages(
         K=POOLED,
         kit0=0,
         KITS=POOLED // 32,
-        SPLIT=8,
+        SPLIT=gl.num_warps(),
         NW=1,
         GROUP=1,
         GROUP_STRIDE=0,

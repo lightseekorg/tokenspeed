@@ -45,7 +45,7 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.weights import bf16_tiles
 # The kernels' dimensions as host integers.
 WORLD = int(dims.WORLD)
 HIDDEN = int(dims.HIDDEN)
-OWNED = HIDDEN // WORLD  # hidden columns a rank owns
+OWNED = int(dims.OWNED)  # hidden columns a rank owns
 QKVG = int(dims.QKVG)  # q | k | v | gate rows of a rank
 Q = int(dims.Q)  # q (and attention output) width of a rank
 POOLED = int(dims.POOLED)

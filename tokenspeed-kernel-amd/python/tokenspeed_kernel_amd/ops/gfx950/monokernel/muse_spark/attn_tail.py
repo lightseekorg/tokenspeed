@@ -134,7 +134,8 @@ def oproj_stage(mb, task, w, RANK: gl.constexpr, STAGE: gl.constexpr):
     cols_per_rank: gl.constexpr = OWNED // OPROJ_COLS
     owner = task // cols_per_rank
     at = RANK * (OWNED // 2) + (task % cols_per_rank) * (OPROJ_COLS // 2) + p
-    # One put serves every row; the padding rows past R are masked.
+    # One put serves every row; the padding rows past R are masked ((p >= 0)
+    # is always true: it broadcasts the row mask to the words' shape).
     mb.put_peer("red", owner, mb.row_offset(r) + at, word, mask=(r < R) & (p >= 0))
     mb.stamp(STAGE, trace.END)
 

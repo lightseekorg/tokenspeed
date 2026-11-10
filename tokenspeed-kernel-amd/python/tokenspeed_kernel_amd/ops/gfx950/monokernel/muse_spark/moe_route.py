@@ -378,7 +378,8 @@ def topk_stage(mb, task, bias, STAGE: gl.constexpr):
     one: gl.constexpr = gl.BlockedLayout([1], [64], [nw], [0])
     slot = gl.arange(0, 64 * nw, one)
     vt: gl.constexpr = slot.type.with_element_ty(gl.float32)
-    # asm: 94 instructions vs 154-156 with the _wave.ll intrinsics.
+    # asm: by hand, the passes take fewer instructions than with the
+    # _wave.ll intrinsics.
     res = gl.inline_asm(
         _top8_asm,
         _TOP8_CONSTRAINTS,

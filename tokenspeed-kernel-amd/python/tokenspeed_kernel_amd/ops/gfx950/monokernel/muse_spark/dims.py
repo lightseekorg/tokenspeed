@@ -27,17 +27,17 @@ PRE_EPS = gl.constexpr(1e-5)
 
 WORLD = gl.constexpr(8)
 HIDDEN = gl.constexpr(8192)
-OWNED = gl.constexpr(1024)  # HIDDEN / WORLD: hidden columns a rank owns
+OWNED = gl.constexpr(HIDDEN // WORLD)  # hidden columns a rank owns
 HEAD_DIM = gl.constexpr(64)
 Q_HEADS = gl.constexpr(16)  # 128 / 8
 KV_HEADS = gl.constexpr(2)  # 16 / 8
-Q = gl.constexpr(1024)  # Q_HEADS * HEAD_DIM: the q, output gate and attention widths
-KV = gl.constexpr(128)  # KV_HEADS * HEAD_DIM
+Q = gl.constexpr(Q_HEADS * HEAD_DIM)  # the q, output gate and attention widths
+KV = gl.constexpr(KV_HEADS * HEAD_DIM)
 # The fused projection's rows, in QKVOGateParallelLinear's order: q | k | v | gate.
-K_ROW = gl.constexpr(1024)
-V_ROW = gl.constexpr(1152)
-GATE_ROW = gl.constexpr(1280)
-QKVG = gl.constexpr(2304)
+K_ROW = gl.constexpr(Q)
+V_ROW = gl.constexpr(K_ROW + KV)
+GATE_ROW = gl.constexpr(V_ROW + KV)
+QKVG = gl.constexpr(GATE_ROW + Q)
 POOLED = gl.constexpr(4096)  # the pooled (pre-expert) width
 EXPERTS = gl.constexpr(256)  # routed experts
 # The DFlash2 draft model, a rank of its TP8 group.

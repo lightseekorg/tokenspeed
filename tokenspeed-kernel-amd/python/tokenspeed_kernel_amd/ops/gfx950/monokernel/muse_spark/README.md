@@ -126,6 +126,7 @@ docstring gives its math and task split):
 | `moe_route.py`, `moe_pool.py`, `moe_experts.py`, `moe_tail.py` | The MoE stages and the layer boundary. |
 | `draft_mlp.py`, `draft_attn.py`, `draft_layer.py`, `draft_head.py`, `draft_context.py` | The DFlash2 draft layer's MLP and attention halves, the whole layer in one plan, the draft head and the context write. |
 | `weights.py` | Host packing of the layer weights. |
+| `stuck_report.py` | Decodes a file-backed stuck-poll record of layer launches under the plans they ran, from the sidecar next to it (usage in its docstring). |
 
 ## Tests
 

@@ -39,7 +39,7 @@ as fast as the memory can, so the q | k | v blocks spread over 160 CTAs.
 A task issues its weight loads first, then reads its K half of the
 attention input rows that the previous launch wrote, and publishes its 16
 FP32 partial sums per row. A consumer adds the two halves and rounds the
-sum to BF16 (:func:`rows`), as the regular path rounds its FP32 sums.
+sum to BF16, as the regular path rounds its FP32 sums.
 """
 
 from __future__ import annotations
@@ -87,9 +87,7 @@ def next_stages(bases: dict[str, int]) -> tuple[Stage, ...]:
 
 
 @gluon.jit
-def _block_stage(
-    mb, task, w, a, a_stride, FIRST: gl.constexpr, N: gl.constexpr, region: gl.constexpr
-):
+def _block_stage(mb, task, w, a, a_stride, FIRST: gl.constexpr, N: gl.constexpr):
     """Task ``task`` of a stage of ``N`` rows from block ``FIRST``: block
     ``FIRST + task // 2``, K half ``task % 2``."""
     R: gl.constexpr = schedule.rows(mb.plan)
@@ -102,7 +100,7 @@ def _block_stage(
         K=HIDDEN,
         kit0=half * KITS,
         KITS=KITS,
-        SPLIT=8,
+        SPLIT=gl.num_warps(),
         NW=1,
         GROUP=1,
         GROUP_STRIDE=0,
@@ -135,7 +133,7 @@ def qkvg_stage(mb, task, w, a, a_stride, STAGE: gl.constexpr):
             ``a_stride`` (the previous launch's output).
     """
     mb.stamp(STAGE, trace.START)
-    out, at = _block_stage(mb, task, w, a, a_stride, 0, GATE_ROW, "qkvg")
+    out, at = _block_stage(mb, task, w, a, a_stride, 0, GATE_ROW)
     mb.stamp(STAGE, trace.COMPUTED)
     _put_rows(mb, "qkvg", out, at)
     mb.stamp(STAGE, trace.END)
@@ -146,9 +144,7 @@ def gate_stage(mb, task, w, a, a_stride, STAGE: gl.constexpr):
     """Gate task ``task``: half ``task % 2`` of K of gate rows ``16 (task //
     2) ..`` (rows ``1280 + 16 (task // 2) ..`` of ``w``), as :func:`qkvg_stage`."""
     mb.stamp(STAGE, trace.START)
-    out, at = _block_stage(
-        mb, task, w, a, a_stride, QKV_BLOCKS, QKVG - GATE_ROW, "gate"
-    )
+    out, at = _block_stage(mb, task, w, a, a_stride, QKV_BLOCKS, QKVG - GATE_ROW)
     mb.stamp(STAGE, trace.COMPUTED)
     _put_rows(mb, "gate", out, at)
     mb.stamp(STAGE, trace.END)
@@ -185,7 +181,7 @@ def qnext_tiles(w, task):
         K=HIDDEN,
         kit0=(task % KSPLIT) * KITS,
         KITS=KITS,
-        SPLIT=8,
+        SPLIT=gl.num_warps(),
         NW=1,
         GROUP=1,
         GROUP_STRIDE=0,
@@ -215,13 +211,6 @@ def qnext_finish(mb, task, tiles, proj, OUT_PER_ROW: gl.constexpr, STAGE: gl.con
     r = gl.arange(0, out.shape[0], gl.SliceLayout(1, ol))[:, None]
     i = gl.arange(0, 16, gl.SliceLayout(0, ol))[None, :]
     at = r * PROJ_WORDS + half * GATE_ROW + blk * 16 + i
+    # (i >= 0) is always true: it broadcasts the row mask to the tile's shape.
     gl.store(proj + at, out.to(gl.int32, bitcast=True), mask=(r < R) & (i >= 0))
     mb.stamp(STAGE, trace.END)
-
-
-@gluon.jit
-def rows(got, AXIS: gl.constexpr):
-    """The BF16-rounded projection values (FP32) from the polled partial
-    sums ``got``, whose ``AXIS`` holds (half 0, half 1)."""
-    halves = got.to(gl.float32, bitcast=True)
-    return gl.sum(halves, axis=AXIS).to(gl.bfloat16).to(gl.float32)

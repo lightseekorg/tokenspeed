@@ -62,6 +62,7 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.dims import (
     EXPERTS,
     GATE_ROW,
     HIDDEN,
+    OWNED,
     QKVG,
     WORLD,
 )
@@ -193,9 +194,12 @@ WARM_TASKS = 64
 CODE_TASKS = 64
 
 
+# The launch's grid (CTAs) and waves a CTA (num_warps).
+GRID = 256
+WAVES = 8
 # Rows of a launch's stuck-poll record buffer: a record per wave of the
-# layer's 256 CTAs of 8 waves (its grid and num_warps), then the header.
-STUCK_ROWS = stuck.buffer_rows(256, 8)
+# layer's CTAs, then the header.
+STUCK_ROWS = stuck.buffer_rows(GRID, WAVES)
 
 
 def layer_plan(
@@ -279,7 +283,7 @@ def layer_plan(
         + moe_tail.peers(rows)
     )
     return Plan(
-        grid=256,
+        grid=GRID,
         stages=stages,
         regions=regions,
         rows=rows,
@@ -788,7 +792,7 @@ def _launch_layer(
     # The device libraries of _extern.wave_uniform_i32 (attention.py).
     kernel = gluon_muse_spark_layer_gfx950.warmup(
         *kernel_args((0, 0)),
-        num_warps=8,
+        num_warps=WAVES,
         grid=(plan.grid,),
         **extern_compile_options(),
     )
@@ -797,7 +801,7 @@ def _launch_layer(
     # The code range is a runtime argument: the same binary.
     gluon_muse_spark_layer_gfx950[(plan.grid,)](
         *kernel_args(code_warm.text_range(kernel)),
-        num_warps=8,
+        num_warps=WAVES,
         **extern_compile_options(),
     )
 
@@ -892,15 +896,18 @@ def launch_gluon_muse_spark_layer_gfx950(
             so the ranks compile before any of them launches.
     """
     rows = h.shape[0] if h.dim() == 2 else 0
+    owned, hidden = int(OWNED), int(HIDDEN)
     # The launch reads h and a while other CTAs already write the outputs.
     if (
         h.dtype != torch.float32
-        or h.shape != (rows, 1024)
+        or h.shape != (rows, owned)
         or not h.is_contiguous()
         or h.data_ptr() == h_out.data_ptr()
     ):
-        raise ValueError("h: contiguous FP32 [rows, 1024] that does not alias h_out")
-    width = 8192 if whole_rows else 1024
+        raise ValueError(
+            f"h: contiguous FP32 [rows, {owned}] that does not alias h_out"
+        )
+    width = hidden if whole_rows else owned
     if (
         h_out.dtype != torch.float32
         or h_out.shape != (rows, width)
@@ -909,11 +916,13 @@ def launch_gluon_muse_spark_layer_gfx950(
         raise ValueError(f"h_out: contiguous FP32 [rows, {width}]")
     if (
         a.dtype != torch.bfloat16
-        or a.shape != (rows, 8192)
+        or a.shape != (rows, hidden)
         or not a.is_contiguous()
         or a.data_ptr() == a_out.data_ptr()
     ):
-        raise ValueError("a: contiguous BF16 [rows, 8192] that does not alias a_out")
+        raise ValueError(
+            f"a: contiguous BF16 [rows, {hidden}] that does not alias a_out"
+        )
     for name, t in (("seq_len", seq_len), ("slot", slot)):
         if t.dtype != torch.int32 or t.numel() != rows:
             raise ValueError(f"{name}: int32 [{rows}], one per row")
@@ -929,7 +938,7 @@ def launch_gluon_muse_spark_layer_gfx950(
         or page_table.stride(1) != 1
     ):
         raise ValueError(
-            f"page_table: int32 [{rows // chain if chain else '?'}, pages], one "
+            f"page_table: int32 [{rows // chain}, pages], one "
             f"row a request of {chain} tokens"
         )
     if (tap is None) != (tap_slot is None):
@@ -957,11 +966,13 @@ def launch_gluon_muse_spark_layer_gfx950(
         tap.dtype != torch.bfloat16
         or tap.dim() != 3
         or tap.shape[0] < rows
-        or tap.shape[2] != 8192
+        or tap.shape[2] != hidden
         or not tap.is_contiguous()
         or not 0 <= tap_slot < tap.shape[1]
     ):
-        raise ValueError(f"tap: contiguous BF16 [>={rows}, slots, 8192], a slot in it")
+        raise ValueError(
+            f"tap: contiguous BF16 [>={rows}, slots, {hidden}], a slot in it"
+        )
     if stuck_rec is not None and stuck_rec.shape[0] < STUCK_ROWS:
         raise ValueError(f"stuck_rec: int64 [>= {STUCK_ROWS}, STUCK_WORDS]")
     attn_ops, table_stride, moe_ops = weights.kernel_args(

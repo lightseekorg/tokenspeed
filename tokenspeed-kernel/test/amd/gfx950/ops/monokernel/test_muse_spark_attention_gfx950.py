@@ -171,14 +171,22 @@ FAR_PAGE = (1 << 31) // (PAGE * KV_HEADS * HEAD) + 1
 @pytest.mark.parametrize("kv_dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize(
     "length,window,splits",
-    [(3000, 2048, SLIDING_SPLITS), (9000, 0, FULL_SPLITS)],
+    [
+        (3000, 2048, SLIDING_SPLITS),
+        (9000, 0, FULL_SPLITS),
+        # From LONG_KEYS cached keys a full layer's 8-token chains take the
+        # key groups: a BF16 cache's whole-page copies (_issue_page), an FP8
+        # cache's FP8 scores.
+        (int(attention.LONG_KEYS) + 1000, 0, FULL_SPLITS),
+    ],
 )
 def test_attention_reaches_pages_past_2_31_cache_elements(
     length, window, splits, kv_dtype
 ):
     """Pages and slots at the far end of a large cache: every page of the
     launch starts past 2^31 elements, so a page or slot offset computed in
-    int32 reads and writes the wrong place. Only the far end is filled."""
+    int32 reads and writes the wrong place. Only the far end is filled.
+    Each launch is two requests of 8 chained tokens."""
     _check_attention(
         length, window, splits, 8, 2, kv_dtype, page_base=FAR_PAGE, position_base=0
     )

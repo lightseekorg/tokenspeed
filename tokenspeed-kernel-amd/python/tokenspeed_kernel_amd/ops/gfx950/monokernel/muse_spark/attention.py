@@ -71,6 +71,7 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.dims import (
     GATE_ROW,
     HEAD_DIM,
     K_ROW,
+    KV,
     KV_HEADS,
     Q_HEADS,
     QKVG,
@@ -84,9 +85,9 @@ cdna4 = gl.amd.cdna4
 HEAD = HEAD_DIM
 GROUP = gl.constexpr(8)  # q heads per KV head
 PAGE = gl.constexpr(64)  # tokens a KV page
-KV_STRIDE = gl.constexpr(128)  # cache elements a slot: 2 KV heads x 64
-# Keys a chunk, for either cache dtype: 256 FP8 keys (the bytes of 128 BF16
-# ones) made a full layer slower below ~200k cached keys (8-GPU bench).
+KV_STRIDE = KV  # cache elements a slot: its 2 KV heads
+# Keys a chunk, the same for either cache dtype: an FP8 chunk takes half the
+# LDS bytes of a BF16 one.
 BN = gl.constexpr(128)
 # Chunks of K and V in LDS: two in flight while one is computed.
 NBUF = gl.constexpr(3)
@@ -394,8 +395,7 @@ def _group_softmax_step(
 def _k_ring_layout(bits):
     """The K ring's layout. A lane reads 8 dims of one key for the QK MFMA,
     so with 64-byte FP8 rows the lanes of keys ``j``, ``j + 4``, ``j + 8``,
-    ``j + 12`` hit the same LDS banks (4-way conflicts: two thirds of a full
-    layer's attention time at 200k). The FP8 rows' 16-byte blocks are
+    ``j + 12`` hit the same LDS banks (4-way conflicts). The FP8 rows' 16-byte blocks are
     XOR-swizzled by ``(key // 4) % 4``; the copies place them so. A BF16 row
     is 128 bytes and keeps the plain layout (its whole-page copies)."""
     if bits == 8:
@@ -427,7 +427,8 @@ def _issue_page(ring, cache, page, c, hi, g, offs, half: gl.constexpr, slot):
     # would loop over the lanes' descriptors.
     n = wave_uniform_i32(gl.minimum(gl.maximum(hi - c, 0), PAGE))
     at = cache + wave_uniform_i32(page).to(gl.int64) * (PAGE * KV_STRIDE)
-    desc = cdna4.buffer.make_buffer_descriptor(at, n * (KV_STRIDE * 2))
+    ELEM_BYTES: gl.constexpr = cache.dtype.element_ty.primitive_bitwidth // 8
+    desc = cdna4.buffer.make_buffer_descriptor(at, n * (KV_STRIDE * ELEM_BYTES))
     cdna4.buffer.load_to_shared(
         ring.index(slot).slice(half * PAGE, PAGE), desc, offs, soffset=g * HEAD
     )
@@ -661,7 +662,7 @@ def attn_stage(
     ROPE: gl.constexpr,
     OWN: gl.constexpr,
     SPLITS: gl.constexpr,
-    WINDOW: gl.constexpr,
+    LAYER_WINDOW: gl.constexpr,
     STAGE: gl.constexpr,
 ):
     """Attn task ``task`` = (request ``task // (2 SPLITS)``, KV head, split)
@@ -674,7 +675,8 @@ def attn_stage(
         table: int32 page tables of the requests, one row each (``PAGE``
             tokens a page), ``table_stride`` apart.
         cos_sin, ROPE: As head_stage takes them.
-        WINDOW: Attended positions of a sliding layer, 0 on a full layer.
+        LAYER_WINDOW: Attended positions of a sliding layer (``WINDOW``), 0 on
+            a full layer.
     """
     C: gl.constexpr = schedule.chain(mb.plan)
     gl.static_assert(C <= 16, "the launch's keys are one chunk of 16")
@@ -698,14 +700,14 @@ def attn_stage(
 
     L0 = gl.load(seq_len + base) - 1
     # The cached keys of the splits: from row 0's first key, before L0.
-    if WINDOW == 0:
+    if LAYER_WINDOW == 0:
         first = 0
     else:
-        first = gl.maximum(L0 - WINDOW + 1, 0)
+        first = gl.maximum(L0 - LAYER_WINDOW + 1, 0)
     per = (L0 - first + SPLITS - 1) // SPLITS
     # Key groups (_group_keys): 16 MFMA rows a warp, so 64 rows (8 token
     # rows) at 8 warps, on a full layer.
-    GROUPED: gl.constexpr = (WINDOW == 0) and (QM == 16 * (nw // 2))
+    GROUPED: gl.constexpr = (LAYER_WINDOW == 0) and (QM == 16 * (nw // 2))
     # A BF16 cache's chunks copy a page at a time (whole-page splits).
     PAGES: gl.constexpr = k_cache.dtype.element_ty.primitive_bitwidth == 16
     if GROUPED:
@@ -824,8 +826,8 @@ def attn_stage(
     q_hi = q_hi * inv_q * Q_GAIN
     k_lo, k_hi = _pair_values(got_k, eq, 2)
     inv_k = gl.rsqrt(gl.sum(k_lo * k_lo + k_hi * k_hi, axis=1) / HEAD + EPS)[:, None]
-    k_lo = k_lo * inv_k * 1.0
-    k_hi = k_hi * inv_k * 1.0
+    k_lo = k_lo * inv_k
+    k_hi = k_hi * inv_k
     if ROPE:
         q_lo, q_hi = gl.fma(q_lo, cq, -(q_hi * sq)), gl.fma(q_hi, cq, q_lo * sq)
         k_lo, k_hi = gl.fma(k_lo, ck, -(k_hi * sk)), gl.fma(k_hi, ck, k_lo * sk)
@@ -851,10 +853,10 @@ def attn_stage(
     # Row t's first attended key (a sliding layer's window).
     qi = gl.arange(0, QM, gl.SliceLayout(1, qk_mma))
     qi_tok = gl.minimum(qi // GROUP, C - 1)
-    if WINDOW == 0:
+    if LAYER_WINDOW == 0:
         row_first = gl.zeros_like(qi_tok)
     else:
-        row_first = L0 + qi_tok - WINDOW + 1
+        row_first = L0 + qi_tok - LAYER_WINDOW + 1
     m = gl.full([QM], float("-inf"), gl.float32, gl.SliceLayout(1, qk_mma))
     l = gl.zeros([QM], gl.float32, gl.SliceLayout(1, qk_mma))
     acc = gl.zeros([QM, HEAD], gl.float32, pv_mma)
@@ -953,6 +955,7 @@ def attn_stage(
         "part",
         2 * mb.row_offset(base + r[:, None] // GROUP) + part,
         out,
+        # (c >= 0) is always true: it broadcasts the row mask to the tile.
         mask=(r < C * GROUP)[:, None] & (c >= 0)[None, :],
     )
     mb.store_words(
