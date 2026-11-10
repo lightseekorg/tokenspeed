@@ -21,15 +21,19 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include <gtest/gtest.h>
+#include <spdlog/sinks/stdout_color_sinks.h>
+#include <spdlog/spdlog.h>
 
 #include "cache/cache_group.h"
 #include "cache/coordinator/cache_coordinator.h"
 #include "cache/coordinator/shadow_occupancy.h"
+#include "cache/core/active_parents.h"
 #include "cache/core/cache_types.h"
 #include "cache/prefix/prefix_hasher.h"
 #include "cache_test_access.h"
@@ -272,6 +276,31 @@ TEST(BlockTableAccounting, FromBlocksTableCountsNowhere) {
         EXPECT_EQ(coordinator.NumActiveLcmBlocks(), 0) << "a table built outside the allocator counts nowhere";
     }
     EXPECT_EQ(coordinator.NumActiveLcmBlocks(), 0);
+}
+
+TEST(BlockTableAccounting, ATableIsBoundBeforeItHoldsABlock) {
+    BlockPool pool(8, {1});
+    ActiveParents parents{pool};
+    const auto blocks = pool.AcquireBlocks(/*group_id=*/0, /*num=*/2);
+    ASSERT_EQ(blocks.size(), 2u);
+    BlockTable table = BlockTable::FromBlocks(/*group_id=*/0, blocks, 0);
+    EXPECT_THROW(table.CountActiveParentsIn(&parents), std::runtime_error);
+    EXPECT_EQ(parents.Count(), 0) << "a rejected binding counts nothing";
+}
+
+TEST(BlockTableAccountingDeathTest, AParentRefRejectsABlockOfAnotherPool) {
+    BlockPool pool(8, {1});
+    BlockPool other_pool(8, {1});
+    ActiveParents parents{pool};
+    const CacheBlockRef block = other_pool.AcquireBlock(/*group_id=*/0);
+    ASSERT_TRUE(block);
+    EXPECT_DEATH(
+        {
+            // The default logger writes to stdout; the death test reads stderr.
+            spdlog::set_default_logger(spdlog::stderr_color_mt("fatal-check-test"));
+            [[maybe_unused]] const ParentRef ref(&parents, block);
+        },
+        "a bound table holds a block of another pool");
 }
 
 TEST(BlockTableAccounting, PublicationDedupeReplacesLosingTableBlockInPlace) {

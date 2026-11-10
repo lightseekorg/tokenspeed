@@ -25,6 +25,7 @@
 #include <utility>
 #include <vector>
 
+#include "cache/core/block_pool.h"
 #include "cache/core/cache_block_ref.h"
 #include "utils.h"
 
@@ -38,12 +39,13 @@ namespace tokenspeed {
 // the BlockPool never sees it.
 class ActiveParents {
 public:
-    explicit ActiveParents(std::int32_t num_lcm_blocks) : refs_(static_cast<std::size_t>(num_lcm_blocks) + 1, 0) {}
+    explicit ActiveParents(const BlockPool& pool)
+        : pool_{&pool}, refs_(static_cast<std::size_t>(pool.NumLcmBlocks()) + 1, 0) {}
     ActiveParents(const ActiveParents&) = delete;
     ActiveParents& operator=(const ActiveParents&) = delete;
 
     // Distinct parents with at least one live ParentRef.
-    std::int32_t Count() const noexcept { return active_; }
+    std::int32_t Count() const noexcept { return num_active_; }
 
 private:
     friend class ParentRef;
@@ -54,9 +56,11 @@ private:
         return refs_[static_cast<std::size_t>(lcm_block_id)];
     }
 
+    // The pool whose parents are counted; a bound table holds its blocks only.
+    const BlockPool* pool_;
     // refs_[id]: live ParentRefs to LCM parent `id`.
     std::vector<std::uint32_t> refs_;
-    std::int32_t active_{0};
+    std::int32_t num_active_{0};
 };
 
 // One table slot's share in its block's LCM parent: the parent counts as
@@ -67,6 +71,7 @@ public:
     ParentRef() noexcept = default;
     ParentRef(ActiveParents* parents, const CacheBlockRef& block) noexcept {
         if (parents != nullptr && block) {
+            FatalCheck(&block->OwnerPool() == parents->pool_, "a bound table holds a block of another pool");
             parents_ = parents;
             lcm_block_id_ = block->Location().lcm_block_id;
             retain();
@@ -86,17 +91,17 @@ public:
         if (parents_ == nullptr) {
             return;
         }
-        std::uint32_t& refs = parents_->refs(lcm_block_id_);
-        FatalCheck(refs > 0, "a ParentRef outlived its parent's count");
-        if (--refs == 0) {
-            --parents_->active_;
+        std::uint32_t& count = parents_->refs(lcm_block_id_);
+        FatalCheck(count > 0, "a ParentRef outlived its parent's count");
+        if (--count == 0) {
+            --parents_->num_active_;
         }
     }
 
 private:
     void retain() noexcept {
         if (parents_ != nullptr && parents_->refs(lcm_block_id_)++ == 0) {
-            ++parents_->active_;
+            ++parents_->num_active_;
         }
     }
 

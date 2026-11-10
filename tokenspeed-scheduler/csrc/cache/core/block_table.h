@@ -74,19 +74,16 @@ public:
     std::int32_t AvailableTokens() const { return available_tokens_; }
     std::int32_t ReclaimedPrefixBlocks() const { return reclaimed_prefix_blocks_; }
 
-    // From now on this table's slots count their parents in `active_parents`
-    // (the coordinator binds the tables it admits or restores into).
+    // From now on this table's slots count their parents in `active_parents`.
+    // The coordinator binds every table it admits or restores into before
+    // the table holds a block, so no slot is ever counted late.
     void CountActiveParentsIn(ActiveParents* active_parents) {
         if (active_parents_ == active_parents) {
             return;
         }
         _assert(active_parents_ == nullptr, "a table counts its parents in one gauge for life");
+        _assert(blocks_.empty(), "a table is bound before it holds a block");
         active_parents_ = active_parents;
-        parents_.clear();
-        parents_.reserve(blocks_.size());
-        for (const CacheBlockRef& block : blocks_) {
-            parents_.emplace_back(active_parents_, block);
-        }
     }
 
     CacheBlockRef EvictToNull(std::int32_t index) {

@@ -482,7 +482,9 @@ std::int32_t Scheduler::ActiveLcmBlocks() const {
     const std::int32_t active = coordinator_.NumActiveLcmBlocks();
 #ifndef NDEBUG
     // Debug builds walk the live requests' tables, as the count was taken
-    // before the tables kept it, and fail on any drift.
+    // before the tables kept it, and fail on any drift. The walk sees only
+    // page-holding requests, so this must not be read while a bound table
+    // is still outside one (between Admit and the FSM event that takes it).
     std::vector<std::span<const BlockTable>> request_tables;
     request_tables.reserve(requests_.size());
     for (const auto& request : requests_) {
