@@ -374,6 +374,10 @@ mod ffi {
     /// Request and page counts.
     #[derive(Debug, Clone, PartialEq)]
     struct SchedulerSizes {
+        /// Requests in the running batch: local prefill forwards, prompts
+        /// whose prefill is done, and decodes. Remote prefilling, waiting and
+        /// retracted requests are not running.
+        running: usize,
         /// Requests awaiting admission or restore.
         waiting: usize,
         /// Requests prefilling.

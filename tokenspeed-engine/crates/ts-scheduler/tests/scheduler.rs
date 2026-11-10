@@ -234,11 +234,13 @@ fn a_request_runs_from_prefill_to_finish() {
     scheduler
         .submit_requests(&[spec("r1", (1..=10).collect())])
         .unwrap();
-    assert_eq!(scheduler.sizes().waiting, 1);
+    let sizes = scheduler.sizes();
+    assert_eq!((sizes.waiting, sizes.running), (1, 0));
 
     let plan = scheduler.next_execution_plan(true, false);
     let batches = plan.forward_batches();
     assert_eq!(batches.len(), 1);
+    assert_eq!(scheduler.sizes().running, 1);
     let prefill = &batches[0];
     assert_eq!(prefill.request_ids, ["r1"]);
     assert_eq!(
@@ -258,6 +260,7 @@ fn a_request_runs_from_prefill_to_finish() {
         (0, vec![1])
     );
     assert_eq!(scheduler.sizes().decoding, 1);
+    assert_eq!(scheduler.sizes().running, 1);
 
     // The data plane reads the same plan the control thread saw.
     Python::attach(|py| {
@@ -292,7 +295,15 @@ result = (list(batch.request_ids), list(batch.input_lengths), list(batch.request
     // Finishing settles once the next plan is built.
     scheduler.next_execution_plan(true, false);
     let sizes = scheduler.sizes();
-    assert_eq!((sizes.waiting, sizes.prefilling, sizes.decoding), (0, 0, 0));
+    assert_eq!(
+        (
+            sizes.waiting,
+            sizes.prefilling,
+            sizes.decoding,
+            sizes.running
+        ),
+        (0, 0, 0, 0)
+    );
 }
 
 #[test]
@@ -637,6 +648,11 @@ fn a_remote_prefill_carries_what_the_data_plane_reads() {
     assert_eq!(table.blocks.len(), table.columns);
     assert!(table.blocks[..3].iter().all(|&block| block > 0));
     assert!(plan.remote_decode_transfer().is_none());
+    let sizes = scheduler.sizes();
+    assert_eq!(
+        (sizes.remote_prefilling, sizes.prefilling, sizes.running),
+        (1, 1, 0)
+    );
     assert_eq!(python_transfer_view(plan, "remote_prefill"), rows);
 }
 
