@@ -485,8 +485,8 @@ class SamplingBackend(ABC):
         """
         raise NotImplementedError(
             f"{type(self).__name__} has no draft-prob verify; "
-            "--enable-speculative-sampling needs the flashinfer or "
-            "flashinfer_full sampling backend (triton for DFLASH)"
+            "--enable-speculative-sampling needs the flashinfer, "
+            "flashinfer_full or sonic sampling backend (triton for DFLASH)"
         )
 
     def maybe_broadcast(self, *tensors: torch.Tensor) -> None:

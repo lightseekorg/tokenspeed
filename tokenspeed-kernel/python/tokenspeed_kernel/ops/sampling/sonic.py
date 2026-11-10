@@ -578,12 +578,18 @@ def verify(
     config: SonicConfig,
     enable_pdl: bool,
     shard: VocabShard | None = None,
+    draft_probs: Tensor | None = None,
+    reject_threshold: float | None = None,
 ) -> None:
-    """Verify each request's point-draw drafts against its slot's distribution by masked rejection.
+    """Verify each request's drafts against its slot's distribution by rejection sampling.
 
-    Accepts draft ``j`` with probability ``p(draft)``, draws the rejected
-    position from ``p`` without the draft, counting emitted tokens in the
-    slot's decode counts.
+    Point-draw drafts (``draft_probs`` None, or a slot's ``Indicator``
+    greedy-draft bit set): accepts draft ``j`` with probability ``p(draft)``
+    and draws the rejected position from ``p`` without the draft. Drafts
+    sampled from a recorded ``q``: accepts with probability
+    ``min(1, p(draft) / q(draft))`` and draws the rejected position from
+    ``max(p - q, 0)``, which leaves the target ``p``. Emitted tokens count in
+    the slot's decode counts.
 
     Args:
         logits: ``[B * (g + 1), V]`` bf16 or fp32 logits, request-major, or
@@ -601,21 +607,43 @@ def verify(
         enable_pdl: Launch with programmatic dependent launch.
         shard: This rank's vocabulary slice when the logits are sharded;
             every rank must launch with the same rows.
+        draft_probs: ``[P, >= g, V]`` fp32 draft distributions by slot, row
+            ``j`` the ``q`` draft ``j`` was sampled from (the runtime's
+            ``draft_probs``), or None for point-draw drafts.
+        reject_threshold: Recorded probabilities above it mark a slot with
+            no proposal: its draft is rejected and the token drawn from ``p``.
+            Required with ``draft_probs``.
 
     Raises:
-        ValueError: The logits are neither bf16 nor fp32, or a row offset
-            would pass ``MAX_OFFSET``.
+        ValueError: The logits are neither bf16 nor fp32, a row offset
+            would pass ``MAX_OFFSET``, or ``draft_probs`` rows are not dense
+            whole-vocabulary rows or come without ``reject_threshold``.
     """
     _check_offsets(logits, scratchpad)
     exact = _exact(logits)
     rows, vocab_size = logits.shape
     batch_size, timesteps = drafted.shape
+    stride_c = state.decode_counts.stride(0)
+    if draft_probs is not None and reject_threshold is None:
+        raise ValueError(
+            "sonic reads draft_probs with the no-proposal sentinel: pass reject_threshold"
+        )
+    if draft_probs is not None and (
+        draft_probs.dtype != torch.float32
+        or draft_probs.shape[1] < timesteps - 1
+        or draft_probs.stride(1) != stride_c
+        or draft_probs.stride(2) != 1
+    ):
+        raise ValueError(
+            f"sonic reads draft_probs as fp32 [P, >= {timesteps - 1}, {stride_c}] "
+            f"dense rows, got {draft_probs.dtype} {tuple(draft_probs.shape)} "
+            f"strides {draft_probs.stride()}"
+        )
     gamma = timesteps - 1
     blocks = triton.cdiv(vocab_size, config.block_n)
     block_v, block_g = next_power_of_2(blocks), next_power_of_2(timesteps)
     stride_x, stride_y = logits.stride(0), scratchpad.stride(0)
     stride_g = state.grammar.flatten(0, -2).stride(0)
-    stride_c = state.decode_counts.stride(0)
 
     merged = _merged(
         logits, state, slots, drafted, scratchpad, shard, config, enable_pdl
@@ -678,7 +706,7 @@ def verify(
         slots,
         None,
         drafted,
-        None,
+        draft_probs,
         None,
         None,
         state.seeds,
@@ -697,13 +725,14 @@ def verify(
         enable_pdl,
         True,
         False,
-        None,
+        None if draft_probs is None else draft_probs.stride(0),
         None,
         None,
         stride_c,
         None,
         block_g,
         _LOGPROB_BLOCK,
+        reject_threshold=None if draft_probs is None else reject_threshold,
         num_warps=next_power_of_2(timesteps),
     )
 
