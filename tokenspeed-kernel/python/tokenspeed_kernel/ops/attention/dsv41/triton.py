@@ -4179,7 +4179,8 @@ def _copy_attention_heads_kernel(
     BLOCK: tl.constexpr,
 ):
     # A flat index over the destination, which grows with the step's tokens, so
-    # it is 64-bit: a wrapped index would pass the row < tokens mask negative.
+    # it is 64-bit: a wrapped index would go negative and still pass the
+    # row < tokens mask.
     i = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     row, head, col = i // (HY * 512), i // 512 % HY, i % 512
     x = tl.load(X + row * X0 + head * X1 + col * X2, (row < tokens) & (head < HX), 0)
