@@ -20,13 +20,13 @@ These coefficients are illustrative assumptions, not a measured GPU profile.
 The default time budget equals the model's cost for an 8192-token chunk with
 a 16384-token prefix; `--budget-ms` overrides it. The report includes the
 estimated sum of per-round slowest-rank costs, useful compute fraction,
-round count and measured CPU planner time. A lower max/mean alone is not a
+round count, and measured CPU planner time. A lower max/mean alone is not a
 performance win: extra rounds and per-chunk overhead also count.
 
 ## Synchronized GPU component experiment
 
 Use exclusively allocated SM100/SM103/SM107 GPUs with this checkout's
-`tokenspeed-kernel`, `tokenspeed-mla` and scheduler installed:
+`tokenspeed-kernel`, `tokenspeed-mla`, and scheduler installed:
 
 ```bash
 torchrun --standalone --nproc-per-node=4 \
@@ -40,13 +40,20 @@ It checks split/unsplit attention outputs, measures calibration shapes on
 every GPU, fits non-negative coefficients, and warms each scheduled shape
 before timing. Each actual DP round executes the local scheduler's attention
 shape and a common all-reduce; an idle rank joins the same collective. The
-report contains raw calibration samples, fit error, kernel-time imbalance and
+report contains raw calibration samples, fit error, kernel-time imbalance, and
 median synchronized wall time. The same token limit is used in both arms.
 
 This is a GPU **attention component** benchmark, not K3 serving: projection,
-KV expansion/transfers, KDA, MoE and HTTP are excluded. Scheduler plans are
+KV expansion/transfers, KDA, MoE, and HTTP are excluded. Scheduler plans are
 prepared before GPU timing; CPU planner time is reported separately. Confirm
-whole-model correctness, throughput and TTFT under the actual deployment
+whole-model correctness, throughput, and TTFT under the actual deployment
 before drawing a serving-performance conclusion. Keep uniformly sized and
 low-concurrency workloads as regressions, and repeat trials with both arm
 orders when measuring small differences.
+
+## Single-GPU measurements and benefit limits
+
+The [B300 measurement report](results/prefill_compute_b300.md) includes raw
+attention timings, derived four-rank estimates, and negative controls with
+persistent rank skew or already balanced work. Its measurements use one GPU;
+they do not replace the synchronized experiment above or a serving A/B.

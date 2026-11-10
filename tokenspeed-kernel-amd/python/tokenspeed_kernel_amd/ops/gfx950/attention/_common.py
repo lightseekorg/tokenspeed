@@ -20,12 +20,24 @@
 
 from __future__ import annotations
 
+from tokenspeed_kernel_amd._extern import wave_all_equal
 from tokenspeed_kernel_amd._triton import gl, gluon, gluon_builtin, tl
 
 _INV_LN2_VALUE = 1.4426950408889634
 _INV_LN2 = tl.constexpr(_INV_LN2_VALUE)
 _LN2_VALUE = 0.6931471805599453
 _LN2 = tl.constexpr(_LN2_VALUE)
+
+# An FP8 attention kernel converts its softmax probabilities to FP8 for the
+# P @ V MFMA. Probabilities lie in [0, 1], where e4m3 has 3 mantissa bits only
+# down to 2^-6 and rounds anything at or below 2^-10 to zero, while the row
+# sum that normalizes the output keeps them in fp32. So the kernels subtract
+# this from the running max before exponentiating, making each base-2 exponent
+# 8 larger and each probability 2^8 times larger: the largest is 256, and the
+# row sum carries the same factor, so the normalized output is unchanged.
+# Base-2 LSE outputs and sinks account for it (fp8_lse_shift). e5m2 has more
+# range, so the same scale is safe for it.
+FP8_PROBABILITY_LOG2_SCALE = tl.constexpr(8.0)
 
 # Upper bound of select_kv_splits. Reduce kernels take the split count at
 # runtime and must handle any value up to this bound.
@@ -51,6 +63,17 @@ def _mfma_unscaled_fp8(a, b, acc, *, _semantic):
         out_dtype=gl.float32,
     )
     return gl.tensor(output.handle, acc.type)
+
+
+def reject_block_scales(kernel: str, **scales) -> None:
+    """Raise if block scales reach a kernel that reads FP8 at unit scale.
+
+    The registry never routes a block-scaled cache to these kernels; this
+    keeps a direct caller from having its scales ignored.
+    """
+    names = [name for name, scale in scales.items() if scale is not None]
+    if names:
+        raise ValueError(f"{kernel} reads FP8 at unit scale, got {', '.join(names)}")
 
 
 def select_kv_splits(
@@ -90,6 +113,24 @@ def select_kv_splits(
 
 
 @gluon.jit
+def fp8_probability_shift(m_scaled, IS_FP8: gl.constexpr):
+    """What to subtract from the base-2 logits before exp2: the running max
+    m_scaled (base-2 units), less FP8_PROBABILITY_LOG2_SCALE for FP8 so the
+    probabilities come out 2^8 larger."""
+    if IS_FP8:
+        return m_scaled - FP8_PROBABILITY_LOG2_SCALE
+    return m_scaled
+
+
+@gluon.jit
+def fp8_lse_shift(m_i, SM_SCALE: gl.constexpr, IS_FP8: gl.constexpr):
+    """The running max m_i in base-2 units, less the FP8 probability scale
+    the row sum l_i carries, so that fp8_lse_shift(m_i) + log2(l_i) is the
+    base-2 LSE."""
+    return fp8_probability_shift(m_i * SM_SCALE, IS_FP8)
+
+
+@gluon.jit
 def maximum(a, b, propagate_nan: gl.constexpr = tl.PropagateNan.ALL):
     return gl.maximum(a, b, propagate_nan=propagate_nan)
 
@@ -97,6 +138,62 @@ def maximum(a, b, propagate_nan: gl.constexpr = tl.PropagateNan.ALL):
 @gluon.jit
 def max(input, axis=None, keep_dims=False):
     return gl.reduce(input, axis, maximum, keep_dims=keep_dims)
+
+
+# ===-----------------------------------------------------------------------===#
+# Warp-pipeline helpers
+#
+# Shared by the 8-wave kernels that split their loop into
+# gl.amd.warp_pipeline_stage clusters.
+# ===-----------------------------------------------------------------------===#
+
+
+@gluon.jit
+def _keep_in_cluster(x):
+    # An empty side-effecting asm that reads and redefines x. Neither the IR
+    # optimizer nor MachineSink moves it across the cluster barriers, so the
+    # ops producing x stay in the cluster that computes them instead of drifting
+    # toward their consumer in a later cluster. "=v,0" ties the result to the
+    # input register, so no instruction is emitted; narrower values go in
+    # groups that fill one 32-bit VGPR per asm operand.
+    pack: gl.constexpr = 32 // x.dtype.primitive_bitwidth
+    return gl.inline_asm_elementwise(
+        asm="",
+        constraints="=v,0",
+        args=[x],
+        dtype=x.dtype,
+        is_pure=False,
+        pack=pack,
+    )
+
+
+@gluon.jit
+def _split_columns(x):
+    # Register-only column halves: each half keeps x's MFMA layout.
+    half: gl.constexpr = x.shape[1] // 2
+    lo = gl.amd.slice(x, [x.shape[0], half], [0, 0])
+    hi = gl.amd.slice(x, [x.shape[0], half], [0, half])
+    return lo, hi
+
+
+@gluon.jit
+def _join_columns(lo, hi):
+    # Inverse of _split_columns, also register-only. join/permute/reshape
+    # places lo's columns before hi's; assert_trivial fails the build if the
+    # result would need data movement.
+    layout: gl.constexpr = lo.type.layout
+    shape: gl.constexpr = [lo.shape[0], lo.shape[1] + hi.shape[1]]
+    x = gl.join(lo, hi).permute([0, 2, 1]).reshape(shape)
+    return gl.convert_layout(x, layout, assert_trivial=True)
+
+
+@gluon.jit
+def _wave_maxima_unchanged(m_old, m_new):
+    # Returns 1 when no row of the wave moved its maximum, else 0, as one
+    # wave-uniform SGPR value, so a branch on it is a scalar branch that skips
+    # the rescale for the whole wave (v_cmp_eq_f32 into a lane mask, compared
+    # with EXEC). Kernels calling it launch with extern_compile_options().
+    return wave_all_equal(m_old, m_new)
 
 
 @gluon.constexpr_function

@@ -85,6 +85,10 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
+    o_k_ptr=None,
+    o_v_ptr=None,
+    # K > 0: split channels at K, 2K into o_ptr, o_k_ptr, o_v_ptr (BLOCK_N multiples).
+    SPLIT_KEY_DIM: tl.constexpr = 0,
 ):
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
@@ -353,6 +357,19 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         w_ptrs = w_base + (3 * stride_w_width)  # [BLOCK_N] tensor
         w_col3 = tl.load(w_ptrs, mask_w, other=0.0)
     mask_x_1d = idx_feats < dim
+    if SPLIT_KEY_DIM > 0:
+        # Each program's channel block lies inside one of q, k and v.
+        block_start = tl.program_id(1) * BLOCK_N
+        if block_start < SPLIT_KEY_DIM:
+            o_cols = o_ptr + idx_feats
+        elif block_start < 2 * SPLIT_KEY_DIM:
+            o_cols = o_k_ptr + (idx_feats - SPLIT_KEY_DIM)
+        else:
+            o_cols = o_v_ptr + (idx_feats - 2 * SPLIT_KEY_DIM)
+        if block_start < 2 * SPLIT_KEY_DIM:
+            o_row_stride = SPLIT_KEY_DIM
+        else:
+            o_row_stride = dim - 2 * SPLIT_KEY_DIM
     for idx_token in range(segment_len):
         acc = acc_preload
 
@@ -402,11 +419,17 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         mask_1d = (idx_token < segment_len) & (
             idx_feats < dim
         )  # token-index  # feature-index
-        o_ptrs = (
-            o_ptr
-            + (sequence_start_index + token_offset + idx_token) * stride_o_token
-            + (idx_feats * stride_o_dim)
-        )
+        if SPLIT_KEY_DIM > 0:
+            o_ptrs = (
+                o_cols
+                + (sequence_start_index + token_offset + idx_token) * o_row_stride
+            )
+        else:
+            o_ptrs = (
+                o_ptr
+                + (sequence_start_index + token_offset + idx_token) * stride_o_token
+                + (idx_feats * stride_o_dim)
+            )
 
         tl.store(o_ptrs, acc, mask=mask_1d)
 

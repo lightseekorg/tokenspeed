@@ -60,8 +60,8 @@ def test_rmsnorm_nvfp4_quant_matches_norm_then_flashinfer_bitwise(
     )
     assert torch.equal(packed, ref_packed.view(rows, width // 2))
     assert torch.equal(scales, ref_scales.view(rows, width // 16))
-    # The MoE kernel reads scale rows up to a multiple of 16, like flashinfer.
-    assert scales.untyped_storage().nbytes() == ref_scales.untyped_storage().nbytes()
+    # The scale storage keeps the round_up(rows, 16) tail an MoE consumer may read.
+    assert scales.untyped_storage().nbytes() == (rows + 15) // 16 * width
     pdl_packed, pdl_scales = rmsnorm_nvfp4_quant(x, *args, True)
     assert torch.equal(pdl_packed, packed) and torch.equal(pdl_scales, scales)
     assert rmsnorm_nvfp4_quant(x[:0], *args, False)[0].shape == (0, width // 2)

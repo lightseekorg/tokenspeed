@@ -50,6 +50,7 @@ public:
                 // Never allocated: no bound parent.
                 holes_by_bucket_[i].assign(static_cast<std::size_t>(groups_[i].Allocator().ShardCount()), 0);
             }
+            pair_scratch_.resize(std::max(pair_scratch_.size(), holes_by_bucket_[i].size()));
         }
     }
 
@@ -105,19 +106,29 @@ public:
 
     // One fit formula for every demand (ParentsNeededForBuckets): per group the
     // bucket-constrained blocks need_by_bucket[i] share the parents they open,
-    // the dense_need[i] blocks take any hole, and a demand with no bucket
-    // constraint reduces to holes plus parents times packing.
-    bool Fits(std::span<const std::vector<std::int64_t>> need_by_bucket,
-              std::span<const std::int64_t> dense_need) const {
-        _assert(need_by_bucket.size() == groups_.size() && dense_need.size() == groups_.size(),
+    // the pair_need[i] same-bucket pairs take the buckets NextPairBucket
+    // gives them against this shadow's holes, the dense_need[i] blocks take any
+    // hole, and a demand with no bucket constraint reduces to holes plus
+    // parents times packing.
+    bool Fits(std::span<const std::vector<std::int64_t>> need_by_bucket, std::span<const std::int64_t> dense_need,
+              std::span<const std::int64_t> pair_need) const {
+        _assert(need_by_bucket.size() == groups_.size() && dense_need.size() == groups_.size() &&
+                    pair_need.size() == groups_.size(),
                 "a shadow fit takes one demand per group");
         std::int64_t parents_needed = 0;
         for (std::size_t i = 0; i < groups_.size(); ++i) {
-            parents_needed += ParentsNeededForBuckets(need_by_bucket[i], holes_by_bucket_[i], dense_need[i],
-                                                      pool_.Packing(static_cast<std::uint32_t>(i)));
+            const std::span<std::int64_t> scratch =
+                pair_need[i] == 0 ? std::span<std::int64_t>{}
+                                  : std::span<std::int64_t>(pair_scratch_).first(holes_by_bucket_[i].size());
+            parents_needed +=
+                ParentsNeededForBucketsAndPairs(need_by_bucket[i], holes_by_bucket_[i], dense_need[i], pair_need[i],
+                                                pool_.Packing(static_cast<std::uint32_t>(i)), scratch);
         }
         return parents_needed <= empty_parent_count_;
     }
+
+    // Group i's holes per bucket as the tentative victims would leave them.
+    std::span<const std::int64_t> HolesByBucket(std::size_t i) const { return holes_by_bucket_[i]; }
 
     std::size_t TouchedParents() const { return remaining_occupied_.size(); }
 
@@ -129,6 +140,9 @@ private:
     std::unordered_map<std::int32_t, std::int32_t> remaining_occupied_;
     std::vector<std::vector<std::int64_t>> holes_by_bucket_;
     std::int64_t empty_parent_count_{0};
+    // The demand with a fit's pairs in place, as wide as the widest group's
+    // buckets (ParentsNeededForBucketsAndPairs).
+    mutable std::vector<std::int64_t> pair_scratch_;
 };
 
 }  // namespace tokenspeed

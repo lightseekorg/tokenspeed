@@ -114,11 +114,13 @@ class NGramInputs:
 class RequestHistorySeeds:
     """Immutable committed prefixes that rebuild request-token history rows.
 
-    Row ``i`` restores the first ``prefix_lengths[i]`` tokens of request-pool
-    slot ``slots[i]`` from ``tokens[i]``: an extend that resumes a prefix it
-    did not compute on this slot (a prefix-cache hit, a later chunk, a PD
-    landing) must see that prefix before its own inputs are appended. No
-    request objects or device tensors cross this boundary.
+    Row ``i`` restores the committed prefix of request-pool slot ``slots[i]``,
+    ``prefix_lengths[i]`` tokens long, from ``tokens[i]``: an extend that
+    resumes a prefix it did not compute on this slot (a prefix-cache hit, a
+    later chunk, a PD landing) must see that prefix before its own inputs are
+    appended. For a model with a bounded history lookback ``tokens[i]`` is
+    only the prefix's tail, ending at ``prefix_lengths[i]``. No request
+    objects or device tensors cross this boundary.
     """
 
     slots: tuple[int, ...]
@@ -129,7 +131,7 @@ class RequestHistorySeeds:
         if not len(self.slots) == len(self.prefix_lengths) == len(self.tokens):
             raise ValueError("request history seed fields must have equal lengths")
         for prefix_length, tokens in zip(self.prefix_lengths, self.tokens):
-            if len(tokens) != prefix_length:
+            if len(tokens) > prefix_length:
                 raise ValueError(
                     f"request history seed has {len(tokens)} tokens for a "
                     f"{prefix_length}-token prefix"

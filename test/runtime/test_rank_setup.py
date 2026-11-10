@@ -30,11 +30,13 @@ here rather than at the binding on startup.
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
 import re
 import sys
 from types import SimpleNamespace
 
+import huggingface_hub.constants
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -49,9 +51,11 @@ from test.runtime.cache_pool_test_utils import (  # noqa: E402
     specs_for_layers,
 )
 
+import tokenspeed.runtime.engine.rank_setup as rank_setup  # noqa: E402
 from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig  # noqa: E402
 from tokenspeed.runtime.distributed.mapping import Mapping  # noqa: E402
 from tokenspeed.runtime.engine.rank_setup import (  # noqa: E402
+    load_model_config,
     rank_process_title,
     scheduler_config_from_args,
 )
@@ -108,6 +112,54 @@ def test_an_engine_without_l3_passes_no_prefetch_threshold():
     assert (cfg.num_snapshot_pages, cfg.max_retracted_requests) == (5, 8)
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("role,interval", [("null", 0), ("null", 2), ("prefill", 0)])
+def test_short_prefill_flag_controls_real_scheduler_order(enabled, role, interval):
+    flags = ["--enable-short-prefill-first"] if enabled else []
+    args = prepare_server_args(
+        [
+            "--model",
+            "x",
+            "--max-num-seqs",
+            "8",
+            "--chunked-prefill-size",
+            "64",
+            "--disaggregation-mode",
+            role,
+            "--prefill-decode-interval",
+            str(interval),
+            *flags,
+        ]
+    )
+    cfg = _config(args, _specs(num_host_pages=0, num_snapshot_pages=1, max_retracted=0))
+    cfg.cache_groups = [
+        ts.CacheGroupConfig(
+            group_id="full",
+            block_granularity=16,
+            total_pages=64,
+            attn_kind=ts.AttnKind.Full,
+            transfer_policy=ts.CacheTransferPolicy.FullSuffix,
+        )
+    ]
+    scheduler = ts.Scheduler(cfg)
+    requests = []
+    for request_id, tokens in [("long", list(range(128))), ("short", [501])]:
+        request = ts.RequestSpec()
+        request.request_id = request_id
+        request.tokens = tokens
+        request.max_new_tokens = 1
+        requests.append(request)
+    scheduler.submit_requests(requests)
+    if role == "prefill":
+        event = ts.ExecutionEvent()
+        for request in requests:
+            event.add_event(ts.PD.BootstrappedEvent(request.request_id))
+        scheduler.advance(event)
+    plan = scheduler.next_execution_plan()
+    assert plan.forward[0].request_ids == (["short", "long"] if enabled else ["long"])
+    assert plan.forward[0].input_lengths == ([1, 63] if enabled else [64])
+
+
 def test_make_config_requires_and_maps_the_host_write_policy():
     fields = dict(
         num_device_pages=32,
@@ -123,6 +175,7 @@ def test_make_config_requires_and_maps_the_host_write_policy():
         max_retracted_requests=0,
         storage_config=None,
         prefill_compute_budget=None,
+        prefill_decode_interval=0,
     )
     # Keyword-only and required, with or without a Host tier.
     with pytest.raises(TypeError, match="host_write_policy"):
@@ -133,6 +186,97 @@ def test_make_config_requires_and_maps_the_host_write_policy():
     # Mapped as given: the scheduler, not make_config, decides what it runs.
     cfg = make_config(**fields, host_write_policy="write_back")
     assert cfg.host_write_policy == policy.WriteBack
+
+
+def test_the_prefill_decode_interval_reaches_the_scheduler():
+    args = prepare_server_args(
+        ["--model", "x", "--max-num-seqs", "8", "--prefill-decode-interval", "64"]
+    )
+    cfg = _config(
+        args, _specs(num_host_pages=17, num_snapshot_pages=5, max_retracted=8)
+    )
+    assert cfg.prefill_decode_interval == 64
+
+
+@pytest.mark.parametrize(
+    "flags,error",
+    [
+        (["--prefill-decode-interval", "-1"], "must be non-negative"),
+        (
+            ["--prefill-decode-interval", "64", "--disaggregation-mode", "prefill"],
+            "needs --disaggregation-mode null",
+        ),
+        (
+            ["--prefill-decode-interval", "64", "--disaggregation-mode", "decode"],
+            "needs --disaggregation-mode null",
+        ),
+    ],
+)
+def test_server_args_refuse_a_prefill_decode_interval_it_cannot_honor(flags, error):
+    with pytest.raises(ValueError, match=error):
+        prepare_server_args(["--model", "x", "--max-num-seqs", "8", *flags])
+
+
+@pytest.mark.parametrize(
+    "flags,gate,interval",
+    [
+        ([], None, 0),
+        (["--prefill-decode-interval", "64"], None, 64),
+        (
+            ["--prefill-attempt-interval", "4", "--prefill-any-attempt-interval", "64"],
+            (4, 64),
+            0,
+        ),
+    ],
+)
+def test_prefill_delay_policies_can_be_selected_independently(flags, gate, interval):
+    args = prepare_server_args(["--model", "x", "--max-num-seqs", "8", *flags])
+    assert args.prefill_delay == gate
+    assert args.prefill_decode_interval == interval
+
+
+@pytest.mark.parametrize("attempt,any_attempt", [(4, None), (None, 64)])
+def test_prefill_delay_rejects_an_incomplete_pair_after_configuration_changes(
+    attempt, any_attempt
+):
+    args = ServerArgs(model="x", max_num_seqs=8)
+    args.prefill_attempt_interval = attempt
+    args.prefill_any_attempt_interval = any_attempt
+    with pytest.raises(ValueError, match="must be set together"):
+        _ = args.prefill_delay
+
+
+@pytest.mark.parametrize("attempt,any_attempt", [(4, None), (None, 64)])
+def test_prefill_delay_rejects_an_incomplete_pair_at_construction(attempt, any_attempt):
+    with pytest.raises(ValueError, match="must be set together"):
+        ServerArgs(
+            model="x",
+            max_num_seqs=8,
+            prefill_attempt_interval=attempt,
+            prefill_any_attempt_interval=any_attempt,
+        )
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_prefill_delay_refuses_a_conflicting_local_interval(mixed):
+    flags = [
+        "--model",
+        "x",
+        "--max-num-seqs",
+        "8",
+        "--prefill-decode-interval",
+        "64",
+        "--prefill-attempt-interval",
+        "4",
+        "--prefill-any-attempt-interval",
+        "64",
+    ]
+    if mixed:
+        flags.append("--enable-mixed-batch")
+    with pytest.raises(
+        ValueError, match="--prefill-decode-interval cannot be combined"
+    ):
+        prepare_server_args(flags)
 
 
 @pytest.mark.parametrize("tokens,pages", [(None, 0), (1, 1), (16, 1), (17, 2)])
@@ -194,6 +338,93 @@ def test_the_in_forward_state_checkpoint_is_off_unless_the_flag_is_given(
     assert cfg.state_checkpoint_in_forward is enabled
 
 
+@pytest.mark.parametrize(
+    "flags, requests",
+    [
+        ([], None),
+        (["--checkpoint-retention-requests", "0"], 0),
+        (["--checkpoint-retention-requests", "300"], 300),
+    ],
+)
+def test_checkpoint_retention_is_passed_only_when_given(flags, requests):
+    # Unset keeps the scheduler's default, 16 times the rank's batch size.
+    args = prepare_server_args(["--model", "x", "--max-num-seqs", "8", *flags])
+    cfg = _config(
+        args, _specs(num_host_pages=17, num_snapshot_pages=5, max_retracted=8)
+    )
+    assert cfg.checkpoint_retention_requests == requests
+
+
+@pytest.mark.parametrize(
+    "flags, leaf_distance",
+    [([], 0), (["--checkpoint-retention-leaf-distance", "1"], 1)],
+)
+def test_checkpoint_retention_leaf_distance_is_passed_when_given(flags, leaf_distance):
+    args = prepare_server_args(["--model", "x", "--max-num-seqs", "8", *flags])
+    cfg = _config(
+        args, _specs(num_host_pages=17, num_snapshot_pages=5, max_retracted=8)
+    )
+    assert cfg.checkpoint_retention_leaf_distance == leaf_distance
+
+
+@pytest.mark.parametrize(
+    "flags, enabled",
+    [([], False), (["--enable-state-checkpoint-in-forward"], True)],
+)
+def test_a_prefill_server_drops_short_prompt_ends_with_in_forward_checkpoints(
+    flags, enabled
+):
+    args = prepare_server_args(
+        [
+            "--model",
+            "x",
+            "--max-num-seqs",
+            "8",
+            "--disaggregation-mode",
+            "prefill",
+            "--disaggregation-transfer-backend",
+            "mooncake",
+            *flags,
+        ]
+    )
+    cfg = _config(
+        args, _specs(num_host_pages=17, num_snapshot_pages=1, max_retracted=0)
+    )
+    assert cfg.state_checkpoint_in_forward is enabled
+    assert cfg.drop_short_prompt_end_checkpoints is enabled
+
+
+def test_a_fused_server_keeps_short_prompt_ends():
+    # The drop is a prefill-server policy: fused serving keeps its short
+    # prompt ends with in-forward checkpoints on.
+    args = ServerArgs(
+        model="x", max_num_seqs=8, enable_state_checkpoint_in_forward=True
+    )
+    cfg = _config(
+        args, _specs(num_host_pages=17, num_snapshot_pages=5, max_retracted=8)
+    )
+    assert cfg.state_checkpoint_in_forward
+    assert not cfg.drop_short_prompt_end_checkpoints
+
+
+@pytest.mark.parametrize("role, pool", [("decode", (5, 8)), ("encode", (1, 0))])
+def test_decode_and_encode_servers_drop_no_short_prompt_end(role, pool):
+    # A PD launcher may pass the prefill flags to every role; the scheduler
+    # refuses the drop outside the P role, so these servers never set it.
+    args = ServerArgs(
+        model="x",
+        max_num_seqs=8,
+        disaggregation_mode=role,
+        disaggregation_transfer_backend="mooncake",
+        enable_state_checkpoint_in_forward=True,
+    )
+    cfg = _config(
+        args,
+        _specs(num_host_pages=17, num_snapshot_pages=pool[0], max_retracted=pool[1]),
+    )
+    assert not cfg.drop_short_prompt_end_checkpoints
+
+
 def test_the_in_forward_state_checkpoint_is_refused_without_prefix_caching():
     # Its checkpoint is only reachable through a prefix hit.
     with pytest.raises(ValueError, match="requires prefix caching"):
@@ -204,6 +435,74 @@ def test_the_in_forward_state_checkpoint_is_refused_without_prefix_caching():
             enable_prefix_caching=False,
             enable_state_checkpoint_in_forward=True,
         )
+
+
+@pytest.mark.parametrize(
+    "flags, enabled",
+    [([], False), (["--enable-state-checkpoint-in-forward"], True)],
+)
+def test_superseded_checkpoint_demotion_comes_with_in_forward_checkpoints(
+    flags, enabled
+):
+    # Only in-forward checkpoints are ever demoted.
+    args = prepare_server_args(["--model", "x", "--max-num-seqs", "8", *flags])
+    cfg = _config(
+        args, _specs(num_host_pages=17, num_snapshot_pages=5, max_retracted=8)
+    )
+    assert cfg.demote_superseded_state_checkpoints is enabled
+
+
+def test_a_decode_server_demotes_no_checkpoint():
+    # A decode server computes no prompt and writes no in-forward checkpoint,
+    # so a PD launcher may pass the flag to both roles.
+    args = ServerArgs(
+        model="x",
+        max_num_seqs=8,
+        disaggregation_mode="decode",
+        disaggregation_transfer_backend="mooncake",
+        disable_kvstore=True,
+        enable_state_checkpoint_in_forward=True,
+    )
+    cfg = _config(args, _specs(num_host_pages=0, num_snapshot_pages=5, max_retracted=8))
+    assert not cfg.state_checkpoint_in_forward
+    assert not cfg.demote_superseded_state_checkpoints
+
+
+def test_an_older_scheduler_wheel_starts_without_the_implied_policies(monkeypatch):
+    # tokenspeed-scheduler 0.1.49 has neither field, so setting them would
+    # raise AttributeError: a prefill server with in-forward checkpoints on
+    # starts without the demotion and the short prompt-end drop instead.
+    class OldSchedulerConfig:
+        state_checkpoint_in_forward = False
+
+    warnings = []
+    monkeypatch.setattr(rank_setup, "SchedulerConfig", OldSchedulerConfig)
+    monkeypatch.setattr(
+        rank_setup, "logger", SimpleNamespace(warning=lambda *a: warnings.append(a))
+    )
+    args = prepare_server_args(
+        [
+            "--model",
+            "x",
+            "--max-num-seqs",
+            "8",
+            "--disaggregation-mode",
+            "prefill",
+            "--disaggregation-transfer-backend",
+            "mooncake",
+            "--enable-state-checkpoint-in-forward",
+        ]
+    )
+    cfg = _config(
+        args, _specs(num_host_pages=17, num_snapshot_pages=1, max_retracted=0)
+    )
+    assert cfg.state_checkpoint_in_forward
+    # Read as such a wheel would hold them: absent, or left at their default.
+    assert not getattr(cfg, "demote_superseded_state_checkpoints", False)
+    assert not getattr(cfg, "drop_short_prompt_end_checkpoints", False)
+    assert len(warnings) == 2
+    assert "SchedulerConfig.demote_superseded_state_checkpoints" in warnings[0][0]
+    assert "SchedulerConfig.drop_short_prompt_end_checkpoints" in warnings[1][0]
 
 
 @pytest.mark.parametrize(
@@ -592,6 +891,117 @@ def test_a_decode_server_takes_the_in_forward_state_checkpoint_flag_as_a_no_op()
     assert not cfg.state_checkpoint_in_forward
 
 
+def test_the_prefill_chunk_yield_is_off_by_default():
+    args = prepare_server_args(["--model", "x", "--max-num-seqs", "8"])
+    assert args.prefill_chunk_yield_tokens == 0
+    assert args.scheduler_prefill_chunk_yield_tokens == 0
+    cfg = _config(
+        args, _specs(num_host_pages=17, num_snapshot_pages=5, max_retracted=8)
+    )
+    assert cfg.prefill_chunk_yield_tokens == 0
+
+
+@pytest.mark.parametrize("tokens", [1024, 4096])
+def test_the_prefill_chunk_yield_reaches_a_prefill_servers_scheduler(tokens):
+    # Up to half of the chunk budget.
+    args = prepare_server_args(
+        [
+            "--model",
+            "x",
+            "--max-num-seqs",
+            "8",
+            "--disaggregation-mode",
+            "prefill",
+            "--chunked-prefill-size",
+            "8192",
+            "--prefill-chunk-yield-tokens",
+            str(tokens),
+        ]
+    )
+    assert args.scheduler_prefill_chunk_yield_tokens == tokens
+    cfg = _config(
+        args, _specs(num_host_pages=17, num_snapshot_pages=1, max_retracted=0)
+    )
+    assert cfg.prefill_chunk_yield_tokens == tokens
+
+
+def test_a_decode_server_takes_the_prefill_chunk_yield_as_a_no_op():
+    # A decode server computes no prompt, so a PD launcher may pass the flag
+    # to both roles.
+    args = ServerArgs(
+        model="x",
+        max_num_seqs=8,
+        disaggregation_mode="decode",
+        disaggregation_transfer_backend="mooncake",
+        disable_kvstore=True,
+        prefill_chunk_yield_tokens=4096,
+    )
+    assert args.scheduler_prefill_chunk_yield_tokens == 0
+    cfg = _config(args, _specs(num_host_pages=0, num_snapshot_pages=5, max_retracted=8))
+    assert cfg.prefill_chunk_yield_tokens == 0
+
+
+@pytest.mark.parametrize(
+    "flags, match",
+    [
+        (["--prefill-chunk-yield-tokens", "1024"], "for prefill servers"),
+        (
+            [
+                "--disaggregation-mode",
+                "prefill",
+                "--prefill-chunk-yield-tokens",
+                "-1",
+            ],
+            "non-negative",
+        ),
+        (
+            [
+                "--disaggregation-mode",
+                "prefill",
+                "--chunked-prefill-size",
+                "8192",
+                "--prefill-chunk-yield-tokens",
+                "4097",
+            ],
+            "at most half",
+        ),
+    ],
+    ids=["fused", "negative", "above_half_the_chunk_budget"],
+)
+def test_the_prefill_chunk_yield_is_refused_where_it_cannot_run(flags, match):
+    # The fused scheduler retracts the largest incomplete prefill first, which
+    # a carried prompt could make the yielding one.
+    with pytest.raises(ValueError, match=match):
+        prepare_server_args(["--model", "x", "--max-num-seqs", "8", *flags])
+
+
+def test_make_config_sets_the_prefill_chunk_yield_only_when_on():
+    fields = dict(
+        num_device_pages=32,
+        max_scheduled_tokens=64,
+        max_batch_size=8,
+        prefix_granularity=2,
+        num_host_pages=0,
+        disable_l2_cache=True,
+        enable_l3_storage=False,
+        role="prefill",
+        num_snapshot_pages=1,
+        host_group_packing=(),
+        max_retracted_requests=0,
+        storage_config=None,
+        host_write_policy="write_through",
+        prefill_decode_interval=0,
+        prefill_compute_budget=None,
+    )
+    assert make_config(**fields).prefill_chunk_yield_tokens == 0
+    assert (
+        make_config(**fields, prefill_chunk_yield_tokens=16).prefill_chunk_yield_tokens
+        == 16
+    )
+    with pytest.raises(ValueError, match="non-negative"):
+        make_config(**fields, prefill_chunk_yield_tokens=-1)
+
+
 @pytest.mark.parametrize(
     ("mapping", "title"),
     [
@@ -610,3 +1020,109 @@ def test_a_rank_is_titled_by_its_parallel_ranks(mapping, title):
     # The attention TP rank always shows; another dimension only when it
     # has more than one rank.
     assert rank_process_title(mapping) == title
+
+
+_TINY_LLAMA = {
+    "model_type": "llama",
+    "architectures": ["LlamaForCausalLM"],
+    "hidden_size": 64,
+    "intermediate_size": 128,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 4,
+    "num_hidden_layers": 1,
+    "vocab_size": 128,
+    "max_position_embeddings": 256,
+}
+
+
+def _cache_repo(cache, repo: str, refs: dict[str, int]) -> None:
+    """Caches one snapshot per ref. Each snapshot's hidden size identifies it."""
+    repo_dir = cache / f"models--{repo.replace('/', '--')}"
+    (repo_dir / "refs").mkdir(parents=True)
+    for index, (ref, hidden_size) in enumerate(refs.items()):
+        commit = f"{index + 1}" * 40
+        snapshot = repo_dir / "snapshots" / commit
+        snapshot.mkdir(parents=True)
+        config = dict(_TINY_LLAMA, hidden_size=hidden_size)
+        (snapshot / "config.json").write_text(json.dumps(config))
+        (repo_dir / "refs" / ref).write_text(commit)
+
+
+@pytest.fixture
+def offline_hub(tmp_path, monkeypatch):
+    """An offline Hugging Face cache with a target and a separate draft repo.
+
+    Only the target repo has the ref ``pinned``. Repo names are unique per
+    test because loaded configs are cached.
+    """
+    repo = tmp_path.name
+    target, draft = f"org/{repo}-target", f"org/{repo}-draft"
+    _cache_repo(tmp_path, target, {"main": 64, "pinned": 48})
+    _cache_repo(tmp_path, draft, {"main": 32, "v2": 16})
+    monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_OFFLINE", True)
+    monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_CACHE", str(tmp_path))
+    return target, draft
+
+
+def _target_and_draft(server_args: ServerArgs):
+    target = load_model_config(server_args, server_args.model, draft_of=None)
+    draft = load_model_config(
+        server_args, server_args.speculative_draft_model_path, draft_of=target
+    )
+    return target, draft
+
+
+@pytest.mark.parametrize("draft_revision, draft_hidden_size", [(None, 32), ("v2", 16)])
+def test_a_draft_repository_resolves_its_own_revision(
+    offline_hub, draft_revision, draft_hidden_size
+):
+    # The target's revision is a ref of the target repository only.
+    target_repo, draft_repo = offline_hub
+    args = ServerArgs(
+        model=target_repo,
+        revision="pinned",
+        speculative_algorithm="DFLASH",
+        speculative_draft_model_path=draft_repo,
+        speculative_draft_model_revision=draft_revision,
+    )
+    target, draft = _target_and_draft(args)
+    assert target.hf_config.hidden_size == 48
+    assert draft.hf_config.hidden_size == draft_hidden_size
+
+
+def test_a_draft_inside_the_target_checkpoint_shares_its_revision(offline_hub):
+    target_repo, _ = offline_hub
+    args = ServerArgs(
+        model=target_repo,
+        revision="pinned",
+        speculative_algorithm="EAGLE3",
+        speculative_draft_model_path=target_repo,
+    )
+    _, draft = _target_and_draft(args)
+    assert draft.hf_config.hidden_size == 48
+
+
+@pytest.mark.parametrize(
+    "draft, error",
+    [
+        # The draft is the target checkpoint.
+        (
+            dict(speculative_algorithm="EAGLE3", speculative_draft_model_path="org/t"),
+            "target checkpoint",
+        ),
+        # No draft model is loaded at all.
+        ({}, "no draft model is set"),
+        (
+            dict(speculative_algorithm="DUMMY", speculative_num_draft_tokens=4),
+            "no draft model is set",
+        ),
+    ],
+)
+def test_server_args_refuse_a_draft_revision_nothing_uses(draft, error):
+    with pytest.raises(ValueError, match=error):
+        ServerArgs(
+            model="org/t",
+            revision="pinned",
+            speculative_draft_model_revision="v2",
+            **draft,
+        )

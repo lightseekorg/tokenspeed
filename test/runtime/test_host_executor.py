@@ -36,11 +36,19 @@ class _LoadEvents(SimpleNamespace):
 
 
 def _replicated_contract(layout, *, num_lcm_blocks=None):
-    """An arena contract for ``layout`` with every group replicated (shard 1)."""
+    """An arena contract for ``layout`` with every group replicated (shard 1).
+
+    Every group is a KV group, so the Host parent is the largest payload.
+    """
     if num_lcm_blocks is None:
         num_lcm_blocks = layout.num_lcm_blocks
     specs = tuple(
-        SimpleNamespace(group_id=group.group_id, shard_count=1)
+        SimpleNamespace(
+            group_id=group.group_id,
+            attn_kind="full_history",
+            shard_count=1,
+            replayable=False,
+        )
         for group in layout.groups
     )
     return SimpleNamespace(
@@ -98,7 +106,7 @@ def _load_executor_module_without_triton(*, force_isolated=False):
     lanes.HostTransferLane = Mock
     lanes.build_transfer_geometry = Mock()
     lanes.check_host_memory = Mock()
-    lanes.host_memory_share = Mock(return_value=10**12)
+    lanes.host_memory_share = Mock(return_value=(10**12, "host (psutil)"))
     lanes.largest_pinned_fit = Mock(
         side_effect=lambda room_bytes, *, block_bytes: (
             max(room_bytes, 0) // block_bytes * block_bytes
@@ -957,6 +965,7 @@ class TestGroupAwareWireTest:
                 "virtual_memory",
                 return_value=SimpleNamespace(available=10**12),
             ),
+            patch.object(lanes_module, "cgroup_memory_headroom", return_value=None),
             patch.object(
                 executor_module, "LayerwiseLoadTracker", side_effect=make_tracker
             ),
@@ -1016,7 +1025,14 @@ class TestGroupAwareWireTest:
 
         pool = Mock()
         pool.arena.runtime_contract = SimpleNamespace(
-            group_specs=(SimpleNamespace(group_id="group", shard_count=1),),
+            group_specs=(
+                SimpleNamespace(
+                    group_id="group",
+                    attn_kind="full_history",
+                    shard_count=1,
+                    replayable=False,
+                ),
+            ),
             virtual_block_counts={"group": 3},
         )
         storage = SimpleNamespace(
@@ -1042,6 +1058,7 @@ class TestGroupAwareWireTest:
                 "virtual_memory",
                 return_value=SimpleNamespace(available=10**12),
             ),
+            patch.object(lanes_module, "cgroup_memory_headroom", return_value=None),
             patch.object(executor_module, "LayerwiseLoadTracker", return_value=tracker),
             patch.object(
                 executor_module,
@@ -1377,7 +1394,14 @@ class TestHostMemoryShareTest:
             consumers=(("field",),),
         )
         pool.arena.runtime_contract = SimpleNamespace(
-            group_specs=(SimpleNamespace(group_id="group", shard_count=1),),
+            group_specs=(
+                SimpleNamespace(
+                    group_id="group",
+                    attn_kind="full_history",
+                    shard_count=1,
+                    replayable=False,
+                ),
+            ),
             virtual_block_counts={"group": 1 + device_lcm_blocks},
         )
         storage = SimpleNamespace(
@@ -1400,6 +1424,7 @@ class TestHostMemoryShareTest:
             ),
             patch.object(executor_module, "HostCacheStorage", return_value=storage),
             patch.object(lanes_module.psutil, "virtual_memory", return_value=available),
+            patch.object(lanes_module, "cgroup_memory_headroom", return_value=None),
             patch.object(executor_module, "LayerwiseLoadTracker", return_value=tracker),
             patch.object(
                 executor_module,
@@ -1662,6 +1687,296 @@ class TestHostMemoryShareTest:
             assert (pinned(fit(room) + 1)) > (room)
 
 
+class TestCgroupMemoryHeadroom:
+    """Inside a container or a Slurm step psutil reports the whole host, so
+    the share is bounded by what this process's memory cgroups still allow."""
+
+    GB = 10**9
+
+    @pytest.fixture(autouse=True)
+    def _fake_procfs(self, tmp_path, monkeypatch):
+        try:
+            self.lanes = _lanes_module()
+        except (ImportError, ModuleNotFoundError) as exc:
+            pytest.skip(f"needs runtime dependencies: {exc}")
+        self.root = tmp_path
+        self.proc_cgroup = tmp_path / "cgroup"
+        self.mountinfo = tmp_path / "mountinfo"
+        self.mounts = []
+        monkeypatch.setattr(self.lanes, "_PROC_SELF_CGROUP", self.proc_cgroup)
+        monkeypatch.setattr(self.lanes, "_PROC_SELF_MOUNTINFO", self.mountinfo)
+
+    def _mount(self, fs_type, super_options, *, root="/", name=None):
+        """Mount a fake cgroup hierarchy; returns the mount directory."""
+        mount = self.root / (name or fs_type)
+        mount.mkdir(exist_ok=True)
+        self.mounts.append(
+            f"{30 + len(self.mounts)} 1 0:{len(self.mounts)} {root} {mount} rw "
+            f"shared:1 - {fs_type} {fs_type} {super_options}"
+        )
+        self.mountinfo.write_text("\n".join(self.mounts) + "\n")
+        return mount
+
+    def _cgroup(self, directory, *, stat="", **files):
+        directory.mkdir(parents=True, exist_ok=True)
+        for name, value in files.items():
+            (directory / name.replace("__", ".")).write_text(f"{value}\n")
+        (directory / "memory.stat").write_text(stat)
+        return directory
+
+    def test_no_procfs_means_no_cgroup_limit(self):
+        assert self.lanes.cgroup_memory_headroom() is None
+
+    def test_v2_counts_page_cache_as_free(self):
+        # Right after an earlier run: 281 GB charged, 275 GB of it file cache.
+        mount = self._mount("cgroup2", "rw,nsdelegate")
+        self.proc_cgroup.write_text("0::/\n")
+        self._cgroup(
+            mount,
+            memory__max=287 * self.GB,
+            memory__current=281 * self.GB,
+            stat=f"anon 6\nactive_file {100 * self.GB}\ninactive_file {175 * self.GB}\n",
+        )
+        headroom, source = self.lanes.cgroup_memory_headroom()
+        assert headroom == 281 * self.GB
+        assert "cgroup v2" in source
+
+    def test_v2_without_a_limit_is_not_a_bound(self):
+        mount = self._mount("cgroup2", "rw")
+        self.proc_cgroup.write_text("0::/\n")
+        self._cgroup(mount, memory__max="max", memory__high="max", memory__current=1)
+        assert self.lanes.cgroup_memory_headroom() is None
+
+    def test_v2_high_is_a_limit_too(self):
+        mount = self._mount("cgroup2", "rw")
+        self.proc_cgroup.write_text("0::/\n")
+        self._cgroup(
+            mount,
+            memory__max=200 * self.GB,
+            memory__high=100 * self.GB,
+            memory__current=10 * self.GB,
+        )
+        assert self.lanes.cgroup_memory_headroom()[0] == 90 * self.GB
+
+    def test_tightest_ancestor_binds(self):
+        # A Slurm job limit above a looser step limit, seen from the host root.
+        mount = self._mount("cgroup2", "rw")
+        self.proc_cgroup.write_text("0::/job_1/step_0\n")
+        job = self._cgroup(
+            mount / "job_1", memory__max=100 * self.GB, memory__current=10 * self.GB
+        )
+        self._cgroup(
+            job / "step_0", memory__max=200 * self.GB, memory__current=10 * self.GB
+        )
+        headroom, source = self.lanes.cgroup_memory_headroom()
+        assert headroom == 90 * self.GB
+        assert source.endswith("job_1"), source
+
+    def test_container_mount_and_cgroup_namespace(self):
+        # The container's own cgroup is mounted; /proc/self/cgroup names it by
+        # its host path, or as "/" under a cgroup namespace.
+        mount = self._mount("cgroup2", "rw", root="/kubepods/pod1/abc")
+        self._cgroup(mount, memory__max=50 * self.GB, memory__current=10 * self.GB)
+        for path in ("/kubepods/pod1/abc", "/"):
+            self.proc_cgroup.write_text(f"0::{path}\n")
+            assert self.lanes.cgroup_memory_headroom()[0] == 40 * self.GB
+
+    def test_v1_limit_and_unlimited_sentinel(self):
+        self._mount("cgroup", "rw,cpu,cpuacct", name="cpu")
+        memory = self._mount("cgroup", "rw,memory", name="memory")
+        self.proc_cgroup.write_text("9:memory:/\n2:cpu,cpuacct:/\n")
+        self._cgroup(
+            memory,
+            memory__limit_in_bytes=287 * self.GB,
+            memory__usage_in_bytes=12 * self.GB,
+            stat=f"active_file 1\ntotal_active_file {self.GB}\n"
+            f"total_inactive_file {self.GB}\n",
+        )
+        headroom, source = self.lanes.cgroup_memory_headroom()
+        assert headroom == 277 * self.GB
+        assert "cgroup v1" in source
+
+        (memory / "memory.limit_in_bytes").write_text("9223372036854771712\n")
+        assert self.lanes.cgroup_memory_headroom() is None
+
+    def test_share_takes_the_smaller_of_host_and_cgroup(self):
+        # A 2 GB cgroup headroom is below what any test host has free.
+        mount = self._mount("cgroup2", "rw")
+        self.proc_cgroup.write_text("0::/\n")
+        self._cgroup(mount, memory__max=3 * self.GB, memory__current=self.GB)
+        share, source = self.lanes.host_memory_share(
+            nprocs_per_node=2, headroom_bytes=0
+        )
+        assert share == self.GB
+        assert source == f"cgroup v2 {mount}"
+
+        (mount / "memory.max").write_text("max\n")
+        share, source = self.lanes.host_memory_share(
+            nprocs_per_node=1, headroom_bytes=0
+        )
+        assert source == "host (psutil)"
+        assert share > 0
+
+
+class TestCompactHostParentTest:
+    """Every reader of the compact Host geometry sees one parent size: both
+    tiers, their byte budgets, the scheduler's packing, the owner translation
+    and the transfer geometry."""
+
+    def test_both_tiers_use_the_parent_rounded_to_whole_kv_pages(self, monkeypatch):
+        try:
+            executor_module = import_module("tokenspeed.runtime.cache.l2.executor")
+        except (ImportError, ModuleNotFoundError) as exc:
+            pytest.skip(f"needs runtime dependencies: {exc}")
+        torch = import_module("torch")
+        lanes_module = _lanes_module()
+        from tokenspeed.runtime.cache.transfer.layout import (
+            CacheField,
+            CacheGroupLayout,
+            CacheTransferLayout,
+        )
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
+            CacheRuntimeContract,
+        )
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+            CacheGroupSpec,
+        )
+
+        allocate = torch.empty
+
+        def empty(*args, **kwargs):
+            # Pinned Host buffers need a GPU; plain CPU tensors stand in.
+            if kwargs.get("pin_memory", False):
+                kwargs["pin_memory"] = False
+            return allocate(*args, **kwargs)
+
+        monkeypatch.setattr(torch, "empty", empty)
+        # Qwen3.8-Flash-Next's full-attention page, recurrent-state checkpoint
+        # and QSA page; full attention is dealt to two KV-parallel owners.
+        groups = (
+            (
+                CacheGroupSpec(
+                    "full_attention",
+                    "full_history",
+                    rows_per_page=256,
+                    entry_stride_tokens=1,
+                    replayable=False,
+                    shard_count=2,
+                ),
+                3_407_872,
+            ),
+            (CacheGroupSpec("linear_attention", "state", replayable=False), 29_417_472),
+            (
+                CacheGroupSpec(
+                    "qwen4_exp_qsa",
+                    "full_history",
+                    rows_per_page=64,
+                    entry_stride_tokens=4,
+                    replayable=False,
+                ),
+                212_992,
+            ),
+        )
+        specs = tuple(spec for spec, _ in groups)
+        layout = CacheTransferLayout(
+            num_lcm_blocks=2,
+            groups=tuple(
+                CacheGroupLayout(
+                    spec.group_id,
+                    1,
+                    (CacheField(f"{spec.group_id}.0", 0, 0, payload, payload),),
+                )
+                for spec, payload in groups
+            ),
+            buffers=(torch.zeros(1, dtype=torch.uint8),),
+            consumers=tuple((f"{spec.group_id}.0",) for spec in specs),
+        )
+        contract = CacheRuntimeContract(
+            prefix_granularity=256,
+            num_lcm_blocks=2,
+            token_capacity=512,
+            group_specs=specs,
+            group_page_counts={spec.group_id: 3 for spec in specs},
+            group_packing={spec.group_id: 1 for spec in specs},
+        )
+        pool = _SyntheticPool(
+            layout,
+            SimpleNamespace(cache_group_specs=specs, runtime_contract=contract),
+        )
+        tracker = Mock()
+        tracker.event_sets = [object()]
+        with (
+            patch.object(
+                lanes_module.psutil,
+                "virtual_memory",
+                return_value=SimpleNamespace(available=10**12),
+            ),
+            patch.object(lanes_module, "cgroup_memory_headroom", return_value=None),
+            patch.object(executor_module, "LayerwiseLoadTracker", return_value=tracker),
+            patch.object(
+                executor_module,
+                "new_cache_stream",
+                side_effect=lambda _priority: Mock(),
+            ),
+            patch.object(
+                executor_module.device_module, "stream", return_value=nullcontext()
+            ),
+            patch.object(executor_module, "HostTransferWorkspace", side_effect=Mock),
+            patch.object(lanes_module, "HostTransferWorkspace", side_effect=Mock),
+        ):
+            executor = executor_module.HostCacheExecutor(
+                pool,
+                l2_tier=True,
+                host_ratio=2.0,
+                # Byte budgets count whole parents: 0.245 GB holds 7 and 0.06 GB
+                # one, where parents of the largest payload alone fit 8 and 2.
+                host_size_gb=0.245,
+                snapshot_pool=RetractionPoolRequest(
+                    host_gb=0.06,
+                    ratio=None,
+                    max_retracted_requests=2,
+                    tail_lcm_blocks_per_request=0,
+                ),
+                slot_state_exporters=(),
+                io_backend="direct",
+                attn_tp_rank=0,
+                kvp_rank=0,
+                nprocs_per_node=1,
+                world_cpu_group=None,
+            )
+
+        parent = 9 * 3_407_872
+        packing = (9, 1, 144)
+        # The scheduler's virtual children per parent count both owners.
+        virtual_packing = (18, 1, 144)
+        assert executor.host_group_packing == virtual_packing
+        # Both counts include the scheduler's null page.
+        assert (executor.num_host_pages, executor.num_snapshot_pages) == (8, 2)
+        for storage, geometry, owners, parents in (
+            (
+                executor.host_storage,
+                executor._transfer_geometry,
+                executor.block_owners,
+                7,
+            ),
+            (
+                executor.snapshot_storage,
+                executor._snapshot_geometry,
+                executor.snapshot_block_owners,
+                1,
+            ),
+        ):
+            assert storage.host_lcm_block_bytes == parent
+            assert storage.group_packing == packing
+            assert storage.host_buffer_bytes == parents * parent
+            assert geometry.host_lcm_block_bytes == parent
+            assert geometry.host_group_packing == packing
+            assert geometry.num_host_lcm_blocks == parents
+            assert owners.host_virtual_counts == tuple(
+                1 + parents * count for count in virtual_packing
+            )
+
+
 class TestL3FlatKvExecutorTest:
 
     def test_load_with_every_row_owned_elsewhere_acks_without_h2d(self):
@@ -1880,20 +2195,18 @@ class TestCompactLayoutRoundTripTest:
             )
 
     @pytest.mark.parametrize("io_backend", ["kernel", "direct"])
-    @pytest.mark.parametrize(
-        "source_pinned", [False, True], ids=["stream_ordered", "pinned_control"]
-    )
-    def test_a_stream_ordered_write_back_reads_blocks_the_plan_reuses(
-        self, io_backend, source_pinned
-    ):
+    def test_a_stream_ordered_write_back_reads_blocks_the_plan_reuses(self, io_backend):
         """An eviction's store reads what the evicted block held, though the
         same plan overwrites the block right after submitting the store.
 
         The copy is held back on the write stream, so the overwrite, enqueued
         on the fence stream right after the submission, would land first
-        unless the fence orders it behind the copy. The control submits the
-        same row as a pinned store, which fences nothing: its copy reads the
-        overwritten bytes, so the test tells the two apart.
+        unless the fence orders it behind the copy.
+
+        There is no unfenced negative control: nothing orders an unfenced
+        overwrite against the held copy. ROCm can run several streams on one
+        hardware queue, so the overwrite can wait behind the copy, and the
+        copy then reads the original bytes.
         """
         torch = self.torch
         device = torch.zeros((128,), dtype=torch.uint8, device="cuda")
@@ -1912,7 +2225,7 @@ class TestCompactLayoutRoundTripTest:
                 self.group_ids = [[0]]
                 self.src_pages = [[1]]
                 self.dst_pages = [[2]]
-                self.source_pinned = [source_pinned]
+                self.source_pinned = [False]
 
         def submit(op_id: int) -> None:
             with patch.object(self.executor_module.Cache, "WriteBackOp", WriteBackOp):
@@ -1953,10 +2266,7 @@ class TestCompactLayoutRoundTripTest:
         pool.load_tracker.wait_for_layer(0)
         torch.cuda.synchronize()
         assert [int(event.op_id) for event in executor.poll_results()] == [9]
-        expected = (
-            torch.full((4,), 0xEE, dtype=torch.uint8) if source_pinned else evicted
-        )
-        assert torch.equal(device[32:36].cpu(), expected)  # block 3
+        assert torch.equal(device[32:36].cpu(), evicted)  # block 3
         assert torch.equal(
             device[16:20].cpu(), torch.full((4,), 0xEE, dtype=torch.uint8)
         )
@@ -1986,7 +2296,14 @@ class TestCompactLayoutRoundTripTest:
         # local block (v - 1) // 2 + 1, on the Device and on the Host. Rank
         # 0's local blocks 1 to 4 (bytes 16, 24, 32, 40) are virtual 1, 3, 5, 7.
         contract = SimpleNamespace(
-            group_specs=(SimpleNamespace(group_id="full", shard_count=2),),
+            group_specs=(
+                SimpleNamespace(
+                    group_id="full",
+                    attn_kind="full_history",
+                    shard_count=2,
+                    replayable=False,
+                ),
+            ),
             virtual_block_counts={"full": 1 + 4 * 2},
             num_lcm_blocks=4,
             token_capacity=4,

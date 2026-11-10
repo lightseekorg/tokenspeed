@@ -102,7 +102,7 @@ def test_context_growth_reduces_chunk_and_preserves_all_tokens(state):
         batch = forward(scheduler)
         (q,) = batch.input_lengths
         assert batch.extend_prefix_lens == [cursor]
-        assert batch.input_ids == tokens[cursor : cursor + q]
+        assert batch.input_ids.tolist() == tokens[cursor : cursor + q]
         assert compute.cost(q, cursor) <= compute.budget_ns
         # The next token would exceed the cost or complete the prompt.
         assert (
@@ -128,6 +128,62 @@ def test_budget_is_shared_across_requests_and_resets_each_plan():
     assert forward(scheduler).request_ids == ["c"]
 
 
+@pytest.mark.parametrize("resident", [False, True])
+@pytest.mark.parametrize(
+    "budget,carry,chunk", [(32, True, 24), (28, False, 24), (12, False, 12)]
+)
+def test_yielded_whole_prompts_share_the_holders_compute_budget(
+    resident, budget, carry, chunk
+):
+    compute = PrefillComputeConfig(budget, 1, 0, 0)
+    cfg = config(compute, mixed=False, state=False, replay_window=0)
+    cfg.role = SchedulerConfig.Role.P
+    cfg.prefill_chunk_yield_tokens = 8
+    groups = cfg.cache_groups
+    groups[0].transfer_policy = CacheTransferPolicy.FullSuffix
+    cfg.cache_groups = groups
+    scheduler = Scheduler(cfg)
+    submit(scheduler, "long", list(range(96)))
+    scheduler.advance(ExecutionEvent().add_event(PD.BootstrappedEvent("long")))
+    if resident:
+        forward(scheduler)
+        complete(scheduler, "long", finish=False)
+    submit(scheduler, "short", list(range(100, 108)))
+    scheduler.advance(ExecutionEvent().add_event(PD.BootstrappedEvent("short")))
+    batch = forward(scheduler)
+    # A carried prompt must finish within the remaining shared budget. The
+    # incomplete holder runs last, even though it was admitted first.
+    assert batch.request_ids == (["short", "long"] if carry else ["long"])
+    assert batch.input_lengths == ([8, chunk] if carry else [chunk])
+    assert (
+        sum(
+            compute.cost(q, c)
+            for q, c in zip(batch.input_lengths, batch.extend_prefix_lens)
+        )
+        <= budget
+    )
+
+
+def test_short_prefill_order_and_resident_priority_share_the_compute_budget():
+    compute = PrefillComputeConfig(12, 1, 0, 0)
+    cfg = config(compute, mixed=False, state=True, replay_window=0)
+    cfg.enable_short_prefill_first = True
+    scheduler = Scheduler(cfg)
+    submit(scheduler, "long", list(range(32)))
+    submit(scheduler, "short-a", list(range(100, 104)))
+    submit(scheduler, "short-b", list(range(200, 204)))
+    batch = forward(scheduler)
+    assert batch.request_ids == ["short-a", "short-b", "long"]
+    assert batch.input_lengths == [4, 4, 4]
+    for rid in batch.request_ids:
+        complete(scheduler, rid, finish=rid != "long")
+    submit(scheduler, "new-short", list(range(300, 304)))
+    batch = forward(scheduler)
+    assert batch.request_ids == ["long"]
+    assert batch.extend_prefix_lens == [4]
+    assert batch.input_lengths == [12]
+
+
 @pytest.mark.parametrize("state", [False, True])
 def test_first_admission_uses_actual_prefix_hit(state):
     compute = PrefillComputeConfig(136, 0, 1, 0)
@@ -140,7 +196,7 @@ def test_first_admission_uses_actual_prefix_hit(state):
     batch = forward(scheduler)
     assert batch.extend_prefix_lens == [16]
     assert batch.input_lengths == [6]
-    assert batch.input_ids == list(range(100, 106))
+    assert batch.input_ids.tolist() == list(range(100, 106))
 
 
 def test_tiny_budget_makes_progress_but_only_once_per_round():
@@ -171,7 +227,7 @@ def test_replay_cost_and_final_window_do_not_stall():
     assert batch.extend_prefix_lens == [4]
     assert batch.extend_replay_lens == [4]
     assert batch.input_lengths == [8]
-    assert batch.input_ids == list(range(4, 12))
+    assert batch.input_ids.tolist() == list(range(4, 12))
 
 
 def test_replay_tokens_are_charged_to_shared_budget():
@@ -260,13 +316,13 @@ def test_restricted_checkpoints_progress_under_a_small_compute_budget(budget):
         batch = forward(scheduler)
         assert batch.extend_prefix_lens == [c]
         assert batch.input_lengths == [q]
-        assert batch.input_ids == tokens[c : c + q]
+        assert batch.input_ids.tolist() == tokens[c : c + q]
         complete(scheduler, "seed", finish=c + q == len(tokens))
     submit(scheduler, "hit", list(range(16)) + [100, 101, 102])
     batch = forward(scheduler)
     assert batch.extend_prefix_lens == [16]
     assert batch.input_lengths == [3]
-    assert batch.input_ids == [100, 101, 102]
+    assert batch.input_ids.tolist() == [100, 101, 102]
 
 
 @pytest.mark.parametrize("budget,kv_pages,first_length", [(10, 0, 8), (100, 4, 9)])
@@ -365,7 +421,7 @@ def test_checkpoint_in_forward_remains_valid_with_smaller_compute_chunks():
     while cursor < len(tokens):
         batch = forward(scheduler)
         (q,) = batch.input_lengths
-        assert batch.input_ids == tokens[cursor : cursor + q]
+        assert batch.input_ids.tolist() == tokens[cursor : cursor + q]
         assert compute.cost(q, cursor) <= compute.budget_ns
         (checkpoint,) = batch.extend_state_checkpoint_lens
         assert checkpoint == 0 or (

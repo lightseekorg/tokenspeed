@@ -301,7 +301,7 @@ def test_a_non_nvidia_platform_fills_the_map_without_a_collective() -> None:
             mock.patch.object(
                 fabric,
                 "current_platform",
-                return_value=mock.Mock(is_nvidia=False, is_cdna5=False),
+                return_value=mock.Mock(is_nvidia=False),
             ),
             mock.patch.object(
                 fabric.torch.distributed, "get_world_size", return_value=8
@@ -317,56 +317,9 @@ def test_a_non_nvidia_platform_fills_the_map_without_a_collective() -> None:
             # Distinct hosts, so every span declines rather than being admitted
             # as node-local on a platform that has no fabric to map.
             assert fabric.group_host_span([0, 1]) == 2
-            assert fabric.world_in_one_fabric_domain() is False
     finally:
         fabric._fabric_map = None
         fabric._host_map = None
-
-
-@pytest.mark.parametrize("one_domain", [True, False])
-def test_gfx1250_records_whether_the_world_is_in_one_fabric_domain(
-    one_domain: bool,
-) -> None:
-    """gfx1250 records Iris's fabric-domain verdict at the same initialization.
-
-    Iris and a process group are replaced, since the verdict itself needs
-    fabric hardware across hosts.
-    """
-    import sys
-    from unittest import mock
-
-    import tokenspeed_kernel.ops.communication as communication
-    import tokenspeed_kernel.ops.communication.fabric as fabric
-
-    fake_iris = mock.Mock(world_in_one_fabric_domain=lambda: one_domain)
-    fabric._fabric_map = None
-    try:
-        with (
-            mock.patch.object(
-                fabric,
-                "current_platform",
-                return_value=mock.Mock(is_nvidia=False, is_cdna5=True),
-            ),
-            mock.patch.dict(
-                sys.modules,
-                {"tokenspeed_kernel.ops.communication._iris": fake_iris},
-            ),
-            mock.patch.object(communication, "_iris", fake_iris, create=True),
-            mock.patch.object(
-                fabric.torch.distributed, "get_world_size", return_value=8
-            ),
-            mock.patch.object(
-                fabric.torch.distributed,
-                "all_gather",
-                side_effect=AssertionError("no NCCL gather off NVIDIA"),
-            ),
-        ):
-            assert fabric.gather_fabric_map() == [False] * 8
-            assert fabric.world_in_one_fabric_domain() is one_domain
-    finally:
-        fabric._fabric_map = None
-        fabric._host_map = None
-        fabric._one_fabric_domain = False
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the gather needs a device")
@@ -405,7 +358,7 @@ def test_the_gather_keeps_every_rank_its_own_host() -> None:
             ),
             mock.patch.object(fabric, "fabric_allocation_supported", return_value=True),
             mock.patch.object(
-                fabric, "_host_identity", return_value=100
+                fabric, "host_identity", return_value=100
             ) as host_identity,
             mock.patch.object(torch.cuda, "current_device", return_value=0),
         ):
@@ -432,9 +385,9 @@ def test_the_host_id_is_stable_across_processes() -> None:
     import subprocess
     import sys
 
-    from tokenspeed_kernel.ops.communication.fabric import _host_identity
+    from tokenspeed_kernel.ops.communication.fabric import host_identity
 
-    here = _host_identity()
+    here = host_identity()
     # int64 is what the gather carries it in; a wider id would wrap to another
     # host's value and merge two machines.
     assert 0 <= here < 2**63
@@ -443,8 +396,8 @@ def test_the_host_id_is_stable_across_processes() -> None:
         [
             sys.executable,
             "-c",
-            "from tokenspeed_kernel.ops.communication.fabric import _host_identity;"
-            "print(_host_identity())",
+            "from tokenspeed_kernel.ops.communication.fabric import host_identity;"
+            "print(host_identity())",
         ],
         capture_output=True,
         text=True,
@@ -467,7 +420,7 @@ def test_two_hosts_do_not_share_one_identity() -> None:
     identities = []
     for boot in ("11111111-1111-1111-1111-111111111111", "22222222-2222"):
         with mock.patch.object(fabric.Path, "read_text", return_value=boot):
-            identities.append(fabric._host_identity())
+            identities.append(fabric.host_identity())
     assert len(set(identities)) == 2
 
 
@@ -485,7 +438,7 @@ def test_a_high_digest_bit_still_fits_the_gathered_int64() -> None:
     with mock.patch.object(
         fabric.hashlib, "blake2b", return_value=mock.Mock(digest=lambda: b"\xff" * 8)
     ):
-        assert fabric._host_identity() < 2**63
+        assert fabric.host_identity() < 2**63
 
 
 def test_a_missing_map_raises_instead_of_gathering_from_dispatch() -> None:

@@ -36,8 +36,10 @@ from torch import nn
 
 from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.layers.activation import SwigluOAI
 from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm
 from tokenspeed.runtime.layers.linear import QKVParallelLinear, RowParallelLinear
+from tokenspeed.runtime.layers.mlp import GatedMLP
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
@@ -47,7 +49,6 @@ from tokenspeed.runtime.models.dflash import (
     _get_dflash_layer_sliding_window,
 )
 from tokenspeed.runtime.models.dspark import DSparkDraftModel
-from tokenspeed.runtime.models.minimax_m3 import MiniMaxM3MLP
 from tokenspeed.runtime.models.utils import validate_attention_partition
 from tokenspeed.runtime.utils import add_prefix
 
@@ -123,35 +124,31 @@ class MiniMaxM3DSparkAttention(DFlashAttention):
 class MiniMaxM3DSparkDecoderLayer(DFlashDecoderLayer):
     """DFlash block-draft layer with MiniMax-M3's dense-layer modules."""
 
-    def __init__(
-        self,
-        config,
-        mapping: Mapping,
-        layer_id: int,
-        quant_config: QuantizationConfig | None = None,
-        prefix: str = "",
-    ) -> None:
-        # DFlashDecoderLayer.forward owns the residual stream and the TP
-        # reductions; only the modules differ from its Qwen3-shaped ones.
-        nn.Module.__init__(self)
-        self.mapping = mapping
-        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.self_attn = MiniMaxM3DSparkAttention(
-            config=config,
-            mapping=mapping,
-            layer_id=layer_id,
-            quant_config=quant_config,
-            prefix=add_prefix("self_attn", prefix),
+    def resolve_norm(self) -> nn.Module:
+        return GemmaRMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
+
+    def resolve_attn(self, prefix: str) -> nn.Module:
+        return MiniMaxM3DSparkAttention(
+            config=self.config,
+            mapping=self.mapping,
+            layer_id=self.layer_id,
+            quant_config=self.quant_config,
+            prefix=prefix,
         )
-        self.post_attention_layernorm = GemmaRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.mlp = MiniMaxM3MLP(
-            config=config,
+
+    def resolve_mlp(self, prefix: str) -> nn.Module:
+        config, mapping = self.config, self.mapping
+        return GatedMLP.tensor_parallel(
+            hidden_size=config.hidden_size,
             intermediate_size=config.dense_intermediate_size,
-            mapping=mapping,
-            quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
+            activation=SwigluOAI(config.swiglu_alpha, config.swiglu_limit),
+            tp_rank=mapping.dense.tp_rank,
+            tp_size=mapping.dense.tp_size,
+            tp_group=mapping.dense.tp_group,
+            reduce_results=False,
+            fusions=(),
+            quant_config=self.quant_config,
+            prefix=prefix,
         )
 
 

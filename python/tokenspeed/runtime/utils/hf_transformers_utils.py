@@ -31,6 +31,7 @@ import warnings
 from collections.abc import Callable
 from typing import Any
 
+import huggingface_hub
 import torch
 from huggingface_hub import snapshot_download
 from transformers import (
@@ -51,6 +52,7 @@ from tokenspeed.runtime.configs import (
     KimiK3Config,
     KimiK3DSparkConfig,
     KimiK25Config,
+    KimiK31Config,
     MiniMaxM3Config,
     MuseSparkConfig,
     Qwen3_5Config,
@@ -91,6 +93,7 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     KimiK2Config.model_type: KimiK2Config,
     KimiK25Config.model_type: KimiK25Config,
     KimiK3Config.model_type: KimiK3Config,
+    KimiK31Config.model_type: KimiK31Config,
     KimiK3DSparkConfig.model_type: KimiK3DSparkConfig,
     InklingModelConfig.model_type: InklingModelConfig,
     InklingMMConfig.model_type: InklingMMConfig,
@@ -374,6 +377,7 @@ def get_config(
                 model,
                 revision=revision,
                 ignore_patterns=["*.pt", "*.safetensors", "*.bin"],
+                local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
             )
 
         with get_lock(model):
@@ -515,7 +519,9 @@ def get_config(
         "KimiK25Config",
         "KimiK3ForConditionalGeneration",
         "KimiK3ForConditionalGenerationNextN",
+        "KimiK31ForConditionalGeneration",
         "KimiK3Config",
+        "KimiK31Config",
         "Glm53FlashForConditionalGeneration",
         "Glm53FlashForConditionalGenerationNextN",
         "Glm53FlashConfig",
@@ -578,6 +584,7 @@ def get_generation_config(
                     model,
                     revision=revision,
                     ignore_patterns=["*.pt", "*.safetensors", "*.bin"],
+                    local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
                 )
 
             with get_lock(model):
@@ -862,6 +869,7 @@ def get_tokenizer(
                 tokenizer_name,
                 revision=tokenizer_revision,
                 ignore_patterns=["*.pt", "*.safetensors", "*.bin"],
+                local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
             )
 
         with get_lock(tokenizer_name):

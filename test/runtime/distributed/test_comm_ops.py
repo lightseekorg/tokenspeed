@@ -262,15 +262,27 @@ class TestAutoBackendTopology:
         backend._iris.can_run.assert_not_called()
 
     @pytest.mark.parametrize(
-        ("cdna5", "one_fabric_domain", "expected"),
-        [(True, True, "iris"), (True, False, "nccl"), (False, True, "nccl")],
-        ids=["gfx1250-one-domain", "gfx1250-two-domains", "gfx950"],
+        ("cdna5", "maps_world", "group", "expected"),
+        [
+            (True, True, tuple(range(8)), "iris"),
+            (True, False, tuple(range(8)), "nccl"),
+            (True, None, tuple(range(8)), "nccl"),
+            (False, True, tuple(range(8)), "nccl"),
+            (False, False, (0, 1, 2, 3), "nccl"),
+            (False, None, (0, 1, 2, 3), "iris"),
+        ],
+        ids=[
+            "gfx1250-mapped-world",
+            "gfx1250-unmapped-world",
+            "gfx1250-undecided",
+            "gfx950-across-nodes",
+            "unmapped-world-node-local",
+            "undecided-node-local",
+        ],
     )
-    def test_cross_node_all_reduce_routing_by_arch(
-        self, backend, monkeypatch, cdna5, one_fabric_domain, expected
+    def test_all_reduce_uses_iris_only_where_the_heap_maps_the_group(
+        self, backend, monkeypatch, cdna5, maps_world, group, expected
     ):
-        import tokenspeed_kernel.ops.communication.fabric as fabric
-
         import tokenspeed.runtime.distributed.comm_backend.auto as auto
 
         monkeypatch.setattr(
@@ -278,17 +290,53 @@ class TestAutoBackendTopology:
             "current_platform",
             lambda: SimpleNamespace(is_amd=True, is_cdna5=cdna5),
         )
-        monkeypatch.setattr(fabric, "_one_fabric_domain", one_fabric_domain)
+        # The verdict needs a process group spanning real hosts.
+        monkeypatch.setattr(backend, "_iris_maps_world", lambda: maps_world)
         backend._iris.can_reduce_outputs.return_value = False
         backend._iris.can_run.return_value = True
         backend._iris.all_reduce.return_value = "iris"
         backend._nccl.all_reduce.return_value = "nccl"
-        group = tuple(range(8))
+
+        backend._iris.can_acquire_outputs.return_value = True
+        backend._iris.acquire_all_reduce_outputs.return_value = "iris"
 
         assert backend.can_prepare_all_reduce_buffers(group, torch.bfloat16) is (
             expected == "iris"
         )
         assert backend.all_reduce(torch.empty(1), group) == expected
+        # Producer-direct outputs create the heap on first use, and stay
+        # node-local even where Iris reduces across nodes.
+        acquires = expected == "iris" and group == (0, 1, 2, 3)
+        like = torch.empty(1)
+        assert backend.can_acquire_all_reduce_outputs(((1,),), like, group) is acquires
+        assert (
+            backend.acquire_all_reduce_outputs(((1,),), like, group) == "iris"
+        ) is acquires
+
+    def test_routing_off_amd_leaves_the_iris_module_unloaded(
+        self, backend, monkeypatch
+    ):
+        import sys
+
+        import tokenspeed_kernel.ops.communication.iris as kernel_iris
+
+        import tokenspeed.runtime.distributed.comm_backend.auto as auto
+
+        monkeypatch.setattr(
+            auto,
+            "current_platform",
+            lambda: SimpleNamespace(is_amd=False, is_cdna5=False),
+        )
+        monkeypatch.delitem(sys.modules, kernel_iris.__name__)
+        backend._iris.can_reduce_outputs.return_value = False
+        backend._iris.can_run.return_value = True
+        backend._iris.all_reduce.return_value = "iris"
+        backend._nccl.all_reduce.return_value = "nccl"
+
+        # Node-local groups keep their path; groups spanning nodes stay on NCCL.
+        assert backend.all_reduce(torch.empty(1), (0, 1, 2, 3)) == "iris"
+        assert backend.all_reduce(torch.empty(1), tuple(range(8))) == "nccl"
+        assert kernel_iris.__name__ not in sys.modules
 
 
 def test_fabric_map_gathers_world_once_and_serves_groups_locally(monkeypatch):
@@ -344,8 +392,13 @@ def test_a_missing_fabric_map_is_a_wiring_error_capturing_or_not(
         fabric.group_has_fabric((0, 1))
 
 
-def test_distributed_initializer_gathers_fabric_after_groups(monkeypatch):
+@pytest.mark.parametrize("amd", [True, False], ids=["amd", "not-amd"])
+def test_distributed_initializer_gathers_fabric_after_groups(monkeypatch, amd):
+    import sys
+
     import tokenspeed_kernel.ops.communication.fabric as fabric
+    import tokenspeed_kernel.ops.communication.iris as kernel_iris
+    import tokenspeed_kernel.platform as kernel_platform
 
     import tokenspeed.runtime.execution.distributed_initializer as initializer
 
@@ -387,12 +440,26 @@ def test_distributed_initializer_gathers_fabric_after_groups(monkeypatch):
         initializer.pg_manager, "get_process_group", lambda backend, group: "pg"
     )
     monkeypatch.setattr(fabric, "gather_fabric_map", lambda: events.append("fabric"))
+    monkeypatch.setattr(
+        kernel_platform, "current_platform", lambda: SimpleNamespace(is_amd=amd)
+    )
+    monkeypatch.setattr(
+        kernel_iris, "discover_iris_world", lambda: events.append("iris")
+    )
+    if not amd:
+        # NPU builds cannot import the Iris module, so it must stay unloaded.
+        monkeypatch.delitem(sys.modules, kernel_iris.__name__)
 
     initializer.DistributedInitializer.initialize(config)
 
     assert events[0] == "distributed"
-    assert events[-1] == "fabric"
-    assert events.count("fabric") == 1
+    if amd:
+        # Iris decides whether its heap maps the world once every group exists.
+        assert events[-2:] == ["fabric", "iris"]
+        assert events.count("fabric") == events.count("iris") == 1
+    else:
+        assert events[-1] == "fabric" and "iris" not in events
+        assert kernel_iris.__name__ not in sys.modules
 
 
 def get_open_port() -> int:

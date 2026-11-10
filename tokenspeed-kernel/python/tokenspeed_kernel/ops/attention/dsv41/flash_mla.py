@@ -26,6 +26,7 @@ from types import ModuleType
 
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel._optional import has_optional_package
 from tokenspeed_kernel.ops.attention.dsv41.triton import (
     _PAGED_FORMATS,
     _copy_attention_heads,
@@ -39,9 +40,20 @@ from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 _FLASH_MLA_API: ModuleType | None = None
-if current_platform().is_hopper_plus:
+if current_platform().is_hopper_plus and has_optional_package("flash_mla"):
     import flash_mla.flash_mla_interface as _FLASH_MLA_API
-    from flash_mla import fused_norm_rope_attn_rope_cast as _fused_v41  # noqa: F401
+
+_FUSED_DECODE_CAPABILITY = CapabilityRequirement(
+    min_arch_version=ArchVersion(10, 0),
+    max_arch_version=ArchVersion(10, 3),
+    vendors=frozenset({"nvidia"}),
+)
+_FUSED_FLASH_MLA_API: ModuleType | None = None
+if _FUSED_DECODE_CAPABILITY.satisfied_by(current_platform()):
+    try:
+        from flash_mla import fused_norm_rope_attn_rope_cast as _FUSED_FLASH_MLA_API
+    except ImportError:
+        pass
 
 
 def flash_mla_api() -> ModuleType:
@@ -56,6 +68,11 @@ def flash_mla_api() -> ModuleType:
 def is_flash_mla_v41_available() -> bool:
     """Return whether the optional V4.1 API and native extension are available."""
     return _FLASH_MLA_API is not None
+
+
+def is_flash_mla_fused_decode_available() -> bool:
+    """Return whether the native fused decode API is available on this target."""
+    return _FUSED_FLASH_MLA_API is not None
 
 
 def new_flashmla_schedule() -> object:
@@ -141,6 +158,260 @@ def _slots(slots, lengths, tokens):
     if width != slots.shape[1]:
         slots = F.pad(slots, (0, width - slots.shape[1]), value=-1)
     return slots.contiguous().unsqueeze(1), lengths.to(torch.int32).contiguous()
+
+
+@register_kernel(
+    "attention",
+    "dsv41_prepare_fused_decode_weights",
+    name="flashmla_prepare_fused_decode_weights",
+    solution="flashmla",
+    capability=_FUSED_DECODE_CAPABILITY,
+    signatures=frozenset(
+        {format_signature(x=dense_tensor_format(torch.float8_e4m3fn))}
+    ),
+    priority=Priority.SPECIALIZED,
+)
+def flashmla_prepare_fused_decode_weights(
+    q_weight: torch.Tensor,
+    q_scales: torch.Tensor,
+    wo_a_weight: torch.Tensor,
+    wo_a_scales: torch.Tensor,
+    num_heads: int,
+    num_groups: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    """Prepare load-time projection weights for fused decode without mutating inputs.
+
+    Q weights are E4M3 [heads * 512, K] with canonical uint8 UE8M0 [heads *
+    512, K/32] scales. O weights are E4M3 [groups * N, heads/groups * 512]
+    with packed int32 scales from prepare_grouped_fp8_projection.
+
+    Return the permuted Q codes and canonical scales, then the permuted O
+    codes [groups, N, heads/groups * 512] and their packed int32 scales.
+    """
+    from tokenspeed_kernel.ops.gemm import prepare_fp8_projection
+
+    if _FUSED_FLASH_MLA_API is None:
+        raise ImportError("Fused decode requires the native FlashMLA fused API")
+    # The native output epilogue fixes WV_GROUP_SIZE to eight query heads.
+    if num_heads not in (64, 128) or num_heads != 8 * num_groups:
+        raise ValueError(
+            "Fused decode requires 64 or 128 heads with 8 heads per output group"
+        )
+    if (
+        q_weight.ndim != 2
+        or q_weight.shape[0] != num_heads * 512
+        or q_weight.shape[1] == 0
+        or q_weight.shape[1] % 128
+    ):
+        raise ValueError("Fused decode Q weight must be [heads * 512, K], K % 128 == 0")
+    group_width = num_heads // num_groups * 512
+    if (
+        wo_a_weight.ndim != 2
+        or wo_a_weight.shape[0] == 0
+        or wo_a_weight.shape[0] % (num_groups * 64)
+        or wo_a_weight.shape[1] != group_width
+        or wo_a_weight.dtype != torch.float8_e4m3fn
+    ):
+        raise ValueError(
+            "Fused decode O weight must be E4M3 [groups * N, heads/groups * 512], N % 64 == 0"
+        )
+    if (
+        wo_a_scales.dtype != torch.int32
+        or wo_a_scales.shape
+        != (num_groups, wo_a_weight.shape[0] // num_groups, group_width // 128)
+        or wo_a_scales.device != q_weight.device
+        or wo_a_weight.device != q_weight.device
+    ):
+        raise ValueError(
+            "Fused decode O weights require packed per-32 scales on the Q weight device"
+        )
+
+    q_weight = q_weight.contiguous()
+    packed = prepare_fp8_projection(q_weight, q_scales.contiguous())
+    if packed is None:
+        return None
+    q_permuted, q_packed = _FUSED_FLASH_MLA_API.permute_q_b_proj(
+        (q_weight, packed), num_heads, 512
+    )
+    # Each packed word contains four consecutive UE8M0 bytes. Copy the
+    # logical words before viewing their bytes. A singleton packed K axis
+    # can be "contiguous" while retaining a non-unit stride, so force a copy.
+    q_canonical = q_packed.clone(memory_format=torch.contiguous_format).view(
+        torch.uint8
+    )
+    wo_a_permuted, wo_a_packed = _FUSED_FLASH_MLA_API.permute_wv_proj(
+        (wo_a_weight.contiguous().view(num_groups, -1, group_width), wo_a_scales),
+        num_heads // num_groups,
+        512,
+    )
+    return q_permuted, q_canonical, wo_a_permuted, wo_a_packed
+
+
+@register_kernel(
+    "attention",
+    "dsv41_selected_attention_fp8",
+    name="flashmla_selected_attention_fp8",
+    solution="flashmla",
+    capability=_FUSED_DECODE_CAPABILITY,
+    signatures=frozenset({format_signature(x=dense_tensor_format(torch.bfloat16))}),
+    priority=Priority.SPECIALIZED,
+)
+def flashmla_selected_attention_fp8(
+    q: torch.Tensor,
+    swa_cache: torch.Tensor | None,
+    swa_slots: torch.Tensor | None,
+    swa_lens: torch.Tensor | None,
+    global_cache: torch.Tensor | None,
+    global_slots: torch.Tensor | None,
+    global_lens: torch.Tensor | None,
+    attn_sink: torch.Tensor | None,
+    softmax_scale: float,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    num_groups: int,
+    prefill_kv: torch.Tensor | None,
+    prefill_indices: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Rotate permuted BF16 Q [T,H,512], attend selected cache rows, and inverse-RoPE O.
+
+    SWA and optional global cache inputs are page-planar fields with physical
+    slots [T,capacity] and lengths [T]. Alternatively, pass a BF16 workspace
+    [rows,1,512] and its indices [T,capacity] with all paged inputs set to None.
+    The optional FP32 sink has shape [H]. Positions [T] index the FP32
+    [max_positions,64] cosine/sine table, with negative padding positions using
+    row zero. Empty selections produce zero.
+
+    The caller supplies bounded metadata: nonnegative slots address their
+    cache field, lengths are within the selection capacity, and nonnegative
+    positions are within the RoPE table. Paged fields include a readable null
+    page. These are the runtime producers' invariants, not device-side scans.
+
+    Return E4M3 output [T,groups,H/groups*512] in the permuted O layout and
+    int32 packed per-32 scales [T,groups,H/groups*4] for the grouped projection.
+    """
+    if _FUSED_FLASH_MLA_API is None:
+        raise ImportError("Fused decode requires the native FlashMLA fused API")
+    if q.ndim != 3 or q.shape[-1] != 512 or q.dtype != torch.bfloat16:
+        raise ValueError("V4.1 query must be BF16 [tokens, heads, 512]")
+    tokens, heads, _ = q.shape
+    if heads not in (64, 128) or heads != 8 * num_groups:
+        raise ValueError(
+            "Fused decode requires 64 or 128 heads with 8 heads per output group"
+        )
+    paged_inputs = (
+        swa_cache,
+        swa_slots,
+        swa_lens,
+        global_cache,
+        global_slots,
+        global_lens,
+    )
+    if (prefill_kv is None) != (prefill_indices is None):
+        raise ValueError("workspace and indices must be supplied together")
+    if any(
+        tensor is not None and tensor.device != q.device
+        for tensor in (
+            *paged_inputs,
+            positions,
+            cos_sin_cache,
+            prefill_kv,
+            prefill_indices,
+        )
+    ):
+        raise ValueError("all selected-attention tensors must share the query device")
+    if positions.shape != (tokens,) or positions.dtype not in (
+        torch.int32,
+        torch.int64,
+    ):
+        raise ValueError("Fused decode positions must be integer [tokens]")
+    if (
+        cos_sin_cache.ndim != 2
+        or cos_sin_cache.shape[0] == 0
+        or cos_sin_cache.shape[1] != 64
+        or cos_sin_cache.dtype != torch.float32
+    ):
+        raise ValueError("Fused decode RoPE table must be FP32 [max_positions,64]")
+
+    q, attn_sink = _native_query(q, attn_sink)
+    if prefill_kv is not None:
+        if any(tensor is not None for tensor in paged_inputs):
+            raise ValueError("workspace attention does not take paged inputs")
+        if (
+            prefill_kv.ndim != 3
+            or prefill_kv.shape[1:] != (1, 512)
+            or prefill_kv.dtype != torch.bfloat16
+        ):
+            raise ValueError("workspace must be BF16 [rows, 1, 512]")
+        if (
+            prefill_indices.ndim != 2
+            or prefill_indices.shape[0] != tokens
+            or prefill_indices.dtype not in (torch.int32, torch.int64)
+        ):
+            raise ValueError("workspace indices must be integer [tokens, capacity]")
+    else:
+        if swa_cache is None:
+            raise ValueError("paged attention requires a SWA cache")
+        if (global_cache is None) != (global_slots is None) or (
+            global_cache is None
+        ) != (global_lens is None):
+            raise ValueError(
+                "global cache, slots and lengths must be supplied together"
+            )
+        indices, lengths = _slots(swa_slots, swa_lens, tokens)
+        k_cache = _paged(swa_cache, "swa", 512)
+        extra_cache, extra_indices, extra_lengths = None, None, None
+        if global_cache is not None:
+            extra_cache = _paged(global_cache, "global", 256)
+            extra_indices, extra_lengths = _slots(global_slots, global_lens, tokens)
+    if tokens == 0:
+        width = heads // num_groups * 512
+        return (
+            q.new_empty((0, num_groups, width), dtype=torch.float8_e4m3fn),
+            q.new_empty((0, num_groups, width // 128), dtype=torch.int32),
+        )
+
+    common = dict(
+        enable_q_norm=False,
+        rms_norm_eps=0.0,
+        token_positions=positions.clamp_min(0).to(torch.int32).contiguous(),
+        is_rope_neox_style=False,
+        rope_dim=64,
+        cos_sin_cache=cos_sin_cache.contiguous(),
+        n_wv_group=num_groups,
+        num_per_channels=32,
+        use_tma_aligned_col_major_sf=True,
+        round_sf=True,
+        use_packed_ue8m0=True,
+        q=q,
+        sm_scale=softmax_scale,
+        d_v=512,
+        attn_sink=attn_sink,
+    )
+    if prefill_kv is not None:
+        indices = prefill_indices.to(torch.int32)
+        width = max(64, (indices.shape[1] + 63) // 64 * 64)
+        if width != indices.shape[1]:
+            indices = F.pad(indices, (0, width - indices.shape[1]), value=-1)
+        codes, scales, _, _ = _FUSED_FLASH_MLA_API.prefill(
+            kv=prefill_kv.contiguous(),
+            indices=indices.contiguous().unsqueeze(1),
+            topk_length=None,
+            **common,
+        )
+        return codes, scales
+
+    codes, scales, _ = _FUSED_FLASH_MLA_API.decode(
+        k_cache=k_cache,
+        indices_in_kvcache=indices.squeeze(1),
+        topk_length=lengths,
+        extra_k_cache=extra_cache,
+        extra_indices_in_kvcache=(
+            None if extra_indices is None else extra_indices.squeeze(1)
+        ),
+        extra_topk_length=extra_lengths,
+        **common,
+    )
+    return codes, scales
 
 
 @register_kernel(

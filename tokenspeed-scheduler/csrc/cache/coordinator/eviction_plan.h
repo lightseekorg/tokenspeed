@@ -24,6 +24,7 @@
 #include <limits>
 #include <optional>
 #include <span>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -41,8 +42,11 @@ public:
     CacheEvictionPlan(const BlockPool& pool, const std::vector<CacheGroup>& groups)
         : pool_{pool}, groups_{groups}, shadow_{pool, groups} {}
 
-    void StartCandidates(const LocationSet* protected_locations, const LocationSet* request_reclaim_locations) {
-        candidates_.emplace(groups_, pool_, protected_locations, request_reclaim_locations);
+    void StartCandidates(const LocationSet* protected_locations, const LocationSet* request_reclaim_locations,
+                         CheckpointAging aging) {
+        tracks_checkpoints_ = aging.tree != nullptr;
+        candidates_.emplace(groups_, pool_, protected_locations, request_reclaim_locations, aging,
+                            &removed_checkpoints_);
     }
 
     CacheEvictionCandidates& Candidates() { return *candidates_; }
@@ -52,8 +56,7 @@ public:
         const Candidate* request =
             next_request_ < request_candidates.size() ? &request_candidates[next_request_] : nullptr;
         if (!next_cached_) {
-            next_cached_ =
-                candidates_->Next(request ? request->last_access_epoch : std::numeric_limits<std::uint64_t>::max());
+            next_cached_ = candidates_->Next(request ? request->rank_epoch : std::numeric_limits<std::uint64_t>::max());
         }
         if (request && (!next_cached_ || CacheEvictionCandidates::Before(*request, *next_cached_))) {
             ++next_request_;
@@ -62,18 +65,30 @@ public:
         return std::exchange(next_cached_, std::nullopt);
     }
 
-    bool Fits(std::span<const std::vector<std::int64_t>> needed, std::span<const std::int64_t> dense) const {
-        return shadow_.Fits(needed, dense);
+    // A demand per group: blocks in named buckets, blocks in any bucket, and
+    // same-bucket pairs whose bucket the fit chooses (ShadowOccupancy::Fits).
+    bool Fits(std::span<const std::vector<std::int64_t>> needed, std::span<const std::int64_t> dense,
+              std::span<const std::int64_t> pairs) const {
+        return shadow_.Fits(needed, dense, pairs);
     }
 
-    void Remove(std::uint32_t group_id, CacheBlockLocation location) { shadow_.Remove(group_id, location); }
-    void Restore(std::uint32_t group_id, CacheBlockLocation location) { shadow_.Restore(group_id, location); }
+    void Remove(std::uint32_t group_id, CacheBlockLocation location) {
+        shadow_.Remove(group_id, location);
+        trackCheckpoint(group_id, location, 1);
+    }
+    void Restore(std::uint32_t group_id, CacheBlockLocation location) {
+        shadow_.Restore(group_id, location);
+        trackCheckpoint(group_id, location, -1);
+    }
     std::size_t TouchedParents() const { return shadow_.TouchedParents(); }
+    std::span<const std::int64_t> HolesByBucket(std::size_t group_index) const {
+        return shadow_.HolesByBucket(group_index);
+    }
 
     template <typename SelectNext>
     bool SelectUntilFits(std::span<const std::vector<std::int64_t>> needed, std::span<const std::int64_t> dense,
-                         SelectNext&& select_next) {
-        while (!Fits(needed, dense)) {
+                         std::span<const std::int64_t> pairs, SelectNext&& select_next) {
+        while (!Fits(needed, dense, pairs)) {
             if (!select_next()) return false;
         }
         return true;
@@ -82,13 +97,13 @@ public:
     // Newer sets are returned first; a failed demand must not cost useful cache.
     template <typename VictimSet>
     void Minimize(std::vector<VictimSet>& victims, std::span<const std::vector<std::int64_t>> needed,
-                  std::span<const std::int64_t> dense) {
+                  std::span<const std::int64_t> dense, std::span<const std::int64_t> pairs) {
         std::vector<VictimSet> required;
         required.reserve(victims.size());
         for (auto it = victims.rbegin(); it != victims.rend(); ++it) {
             if (it->members.empty()) continue;
             for (const auto& member : it->members) Restore(member.group_id, member.location);
-            if (!Fits(needed, dense)) {
+            if (!Fits(needed, dense, pairs)) {
                 for (const auto& member : it->members) Remove(member.group_id, member.location);
                 required.push_back(std::move(*it));
             }
@@ -98,9 +113,28 @@ public:
     }
 
 private:
+    // The checkpoints whose State the plan took from this pool, for the aged
+    // candidates' recheck.
+    void trackCheckpoint(std::uint32_t group_id, CacheBlockLocation location, std::int32_t delta) {
+        if (!tracks_checkpoints_ || groups_[group_id].Spec().attn_kind != AttnKind::kState) {
+            return;
+        }
+        const std::optional<CacheKey> key = groups_[group_id].Index().KeyOf(pool_, location);
+        if (!key) {
+            return;
+        }
+        const auto it = removed_checkpoints_.try_emplace(key->content_hash, 0).first;
+        it->second += delta;
+        if (it->second <= 0) {
+            removed_checkpoints_.erase(it);
+        }
+    }
+
     const BlockPool& pool_;
     const std::vector<CacheGroup>& groups_;
     ShadowOccupancy shadow_;
+    bool tracks_checkpoints_{false};
+    CacheEvictionCandidates::RemovedCheckpoints removed_checkpoints_;
     std::optional<CacheEvictionCandidates> candidates_;
     std::optional<Candidate> next_cached_;
     std::size_t next_request_{0};

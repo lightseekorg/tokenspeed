@@ -82,6 +82,34 @@ void SchedulerConfig::Validate() const {
     if (state_checkpoint_in_forward && disable_prefix_cache && role != Role::kD) {
         throw std::invalid_argument("Scheduler: state_checkpoint_in_forward requires prefix caching");
     }
+    if (drop_short_prompt_end_checkpoints && role != Role::kP) {
+        throw std::invalid_argument("Scheduler: drop_short_prompt_end_checkpoints applies to the P role only");
+    }
+    if (drop_short_prompt_end_checkpoints && !state_checkpoint_in_forward) {
+        throw std::invalid_argument(
+            "Scheduler: drop_short_prompt_end_checkpoints requires state_checkpoint_in_forward");
+    }
+    // Only in-forward checkpoints are ever demoted.
+    if (demote_superseded_state_checkpoints && !state_checkpoint_in_forward && role != Role::kD) {
+        throw std::invalid_argument(
+            "Scheduler: demote_superseded_state_checkpoints requires state_checkpoint_in_forward");
+    }
+    if (prefill_chunk_yield_tokens < 0) {
+        throw std::invalid_argument(
+            "Scheduler: prefill_chunk_yield_tokens (--prefill-chunk-yield-tokens) must be >= 0");
+    }
+    // The fused role retracts the largest incomplete prefill first, which a
+    // carried prompt could make the yielding request itself; the D role
+    // computes no prompt.
+    if (prefill_chunk_yield_tokens > 0 && role != Role::kP) {
+        throw std::invalid_argument(
+            "Scheduler: prefill_chunk_yield_tokens (--prefill-chunk-yield-tokens) is for the P role only");
+    }
+    if (prefill_chunk_yield_tokens > max_scheduled_tokens / 2) {
+        throw std::invalid_argument(
+            "Scheduler: prefill_chunk_yield_tokens (--prefill-chunk-yield-tokens) must be at most half of "
+            "max_scheduled_tokens (--chunked-prefill-size)");
+    }
     if (!enable_l3_storage && storage_config) {
         throw std::invalid_argument("StorageConfig requires L3 storage to be enabled");
     }
@@ -151,6 +179,15 @@ void SchedulerConfig::Validate() const {
             "Scheduler: debug_force_retraction_interval (--debug-force-retraction-interval) requires a snapshot "
             "pool (--retraction-snapshot-host-gb > 0): without one nothing can be retracted");
     }
+    if (prefill_decode_interval < 0) {
+        throw std::invalid_argument("Scheduler: prefill_decode_interval (--prefill-decode-interval) must be >= 0");
+    }
+    // Only the fused role runs local prefill rounds and decodes on one engine.
+    if (prefill_decode_interval != 0 && role != Role::kFused) {
+        throw std::invalid_argument(
+            "Scheduler: prefill_decode_interval (--prefill-decode-interval) applies to the fused role only: a P "
+            "node runs no decodes and a D node no local prefill");
+    }
     if (HasHostCache() || HasSnapshotPool()) {
         if (host_group_packing.size() != cache_groups.size()) {
             throw std::invalid_argument("Scheduler: Host pools require explicit packing for every cache group");
@@ -180,6 +217,15 @@ void SchedulerConfig::ValidateCapacityInputs() const {
     }
     if (max_batch_size < 0) {
         throw std::invalid_argument("Scheduler: max_batch_size must be >= 0");
+    }
+    if (checkpoint_retention_requests &&
+        (*checkpoint_retention_requests < 0 || *checkpoint_retention_requests > kMaxCheckpointRetentionRequests)) {
+        throw std::invalid_argument("Scheduler: checkpoint_retention_requests must be in [0, " +
+                                    std::to_string(kMaxCheckpointRetentionRequests) + "]");
+    }
+    if (checkpoint_retention_leaf_distance < 0 || checkpoint_retention_leaf_distance >= kMaxCheckpointDistance) {
+        throw std::invalid_argument("Scheduler: checkpoint_retention_leaf_distance must be in [0, " +
+                                    std::to_string(kMaxCheckpointDistance - 1) + "]");
     }
     if (decode_input_tokens < 0) {
         throw std::invalid_argument("Scheduler: decode_input_tokens must be >= 0");

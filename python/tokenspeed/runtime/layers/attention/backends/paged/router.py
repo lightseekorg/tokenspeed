@@ -696,9 +696,11 @@ class CacheGroupRouter(AttentionBackend):
         expands the device tables), so a leaf that gathers history by page
         owner can split the gather without a device sync. A page-sharded
         group's leaf gets the mirror for an extend with a prefix too, to split
-        its prefix-chunk gathers the same way. Bounded native prefill also uses
-        it for cold batches to keep the receive pages within the scheduler's
-        budget; other forwards read nothing from the mirror.
+        its prefix-chunk gathers the same way, and for any pure extend, to
+        bound the pages each rank owns (the DSA leaf's owned-width index
+        tiles). Bounded native prefill also uses it for cold batches to keep
+        the receive pages within the scheduler's budget; other forwards read
+        nothing from the mirror.
         """
         del extend_prompt_lens_cpu
         reject_bounded_replay(extend_replay_lens_cpu, "CacheGroupRouter")
@@ -744,7 +746,10 @@ class CacheGroupRouter(AttentionBackend):
                 page_table_cpu=(
                     self.stacks.host_table(gid, block_tables_cpu[gid], num_extends)
                     if sharded
-                    or (extend_with_prefix and gid in self._page_sharded_groups)
+                    or (
+                        gid in self._page_sharded_groups
+                        and (extend_with_prefix or forward_mode.is_extend())
+                    )
                     or (num_extends > 0 and leaf.prefill_needs_host_page_table)
                     else None
                 ),
@@ -917,7 +922,7 @@ class CacheGroupRouter(AttentionBackend):
             return out
         # CPU reference (unit tests): same slot rule, overflow/holes -> 0.
         bs = cache_start.shape[0]
-        steps = torch.arange(num_tokens, dtype=torch.int64)
+        steps = torch.arange(num_tokens, dtype=torch.int64, device=view.table.device)
         pos = cache_start.to(torch.int64).unsqueeze(1) + steps
         max_num_pages = view.table.shape[1]
         page_idx = (pos // view.page_size).clamp_max(max_num_pages - 1)
@@ -993,6 +998,12 @@ class CacheGroupRouter(AttentionBackend):
 
     def reads_fp8_kv_scales(self, layer):
         return self._leaf_for(layer).reads_fp8_kv_scales(layer)
+
+    def decode_kv_view(self, layer, token_to_kv_pool):
+        return self._leaf_for(layer).decode_kv_view(layer, token_to_kv_pool)
+
+    def query_dtype(self, layer, forward_mode, activation):
+        return self._leaf_for(layer).query_dtype(layer, forward_mode, activation)
 
     @break_point
     def forward(
@@ -1176,6 +1187,11 @@ class CacheGroupRouter(AttentionBackend):
         return self._sole_leaf("gather_history_index_k").gather_history_index_k(
             layer_id, token_to_kv_pool, group
         )
+
+    # DSA KVP prefill: top-k over KVP pages tiles by the leaf's planned owned width.
+
+    def prefill_index_columns(self) -> int | None:
+        return self._sole_leaf("prefill_index_columns").prefill_index_columns()
 
     # ------------------------------------------------------------------
     # DSA KPool surface (GLM-5.3-Flash): the model drives the leaf's pooled

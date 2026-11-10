@@ -55,7 +55,22 @@ for a token that came without one, so the column never misaligns with the
 tokens. An older producer defaults this column to empty; older readers skip
 it.
 
+The appended `reasoning_tokens` column is cumulative per request, like
+`completion_tokens`, and excludes reasoning-block delimiters. The control plane
+counts committed token ids before detokenization, including a PD prefill's
+bootstrap token. An older producer defaults the column to empty and its output
+rows report zero; older readers skip the appended column. `ts-client` output
+chunks, the Python chunk dictionaries, and `WireDriver.Completion` expose the
+same cumulative count.
+
 ## Building
+
+Snapshot SDK updates carry a complete publication directory in the optional
+`UpdateWeightsFromMooncakeReqInput.snapshot` map. The native host and Python
+runtime must be built together to transport this field. The existing global
+commit and memory-saver rules still apply. The configured SDK updater receives
+`update_weights(models, version=..., snapshot=...)`. Tensor data remains in the
+SDK's store. Requests without a snapshot retain the existing SDK protocol.
 
 The native crates target Linux and need a C++ compiler, CMake, OpenSSL
 development headers, and Python development headers. Set `PYO3_PYTHON` to

@@ -200,6 +200,14 @@ class _LinearAttn:
         return hidden_states
 
 
+class _Mlp:
+    def nvfp4_global_scale(self):
+        return None
+
+    def __call__(self, hidden_states, fp4):
+        return hidden_states
+
+
 def _attn(**kwargs):
     return kwargs["hidden_states"] if kwargs else None
 
@@ -209,10 +217,6 @@ def _stub_layer(cls):
     layer = cls.__new__(cls)
     nn.Module.__init__(layer)
     comm = _Comm()
-    mlp = SimpleNamespace(
-        nvfp4_global_scale=lambda: None,
-        forward_prequantized=lambda hidden_states, fp4: hidden_states,
-    )
     if cls is _RuntimeLongcatDecoderLayer:
         layer.moe_comm = comm
         layer.branch_comm = [comm, comm]
@@ -233,8 +237,14 @@ def _stub_layer(cls):
     layer.comm_manager = comm
     layer.input_layernorm = None
     layer.post_attention_layernorm = None
-    layer.mlp = mlp if cls.__name__.startswith("Qwen3_5") else (lambda h, *_: h)
-    layer.is_moe_layer = False
+    layer.mlp = _Mlp() if cls.__name__.startswith("Qwen3_5") else (lambda h, *_: h)
+    if issubclass(cls, DeepseekV3DecoderLayer):
+        # A dense layer: the config routes no experts.
+        layer.config = SimpleNamespace(n_routed_experts=None)
+        layer.layer_id = 0
+        layer.is_nextn = False
+    else:
+        layer.is_moe_layer = False
     layer.linear_attn = _LinearAttn()
     layer.qkv_proj = SimpleNamespace(
         quant_method=SimpleNamespace(static_fp8_input_scale=lambda proj: None)
@@ -311,6 +321,24 @@ def test_idle_layer_appends_one_empty_gathered_tap(layer_cls):
     assert len(aux) == 1 and aux[0].shape == (0, 8)
 
 
+@pytest.mark.parametrize(
+    ("layer_cls", "attends"),
+    [(DeepseekV3DecoderLayer, True), (GlmMoeDsaDecoderLayer, False)],
+)
+def test_idle_layer_runs_attention_only_when_it_joins_collectives(layer_cls, attends):
+    layer, comm = _stub_layer(layer_cls)
+    calls = []
+    layer.self_attn = lambda **kwargs: calls.append(kwargs["comm_manager"])
+    ctx = SimpleNamespace(
+        forward_mode=SimpleNamespace(is_idle=lambda: True), draft_narrowing=None
+    )
+
+    _call(layer, torch.empty(0, 8), None, ctx, None)
+
+    # The DeepSeek-V3 attention joins its group's collectives on an idle rank.
+    assert calls == ([comm] if attends else [])
+
+
 def _bare(model_cls):
     """A real causal LM without its weights; the capture setters touch only ``model``."""
     lm = object.__new__(model_cls)
@@ -326,7 +354,6 @@ def _bare(model_cls):
         Qwen3MoeForCausalLM,
         Qwen3OmniMoeForConditionalGeneration,
         DeepseekV41ForCausalLM,
-        MuseSparkForConditionalGeneration,
         Qwen4ExpForConditionalGeneration,
     ],
 )
@@ -341,7 +368,13 @@ def test_capture_is_refused_where_forward_returns_no_taps(model_cls):
 
 
 @pytest.mark.parametrize(
-    "model_cls", [LlamaForCausalLM, GptOssForCausalLM, NemotronHForCausalLM]
+    "model_cls",
+    [
+        LlamaForCausalLM,
+        GptOssForCausalLM,
+        NemotronHForCausalLM,
+        MuseSparkForConditionalGeneration,
+    ],
 )
 def test_capture_is_accepted_where_forward_returns_taps(model_cls):
     lm = _bare(model_cls)

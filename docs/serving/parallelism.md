@@ -67,7 +67,7 @@ instead. Three knobs shard those weights over contiguous groups of DP ranks
 | Parameter | Use |
 | --- | --- |
 | `--attn-head-tp-size W` | Shard `q_b_proj`, `kv_b_proj`, and `o_proj` by heads over `W` contiguous ranks that hold different rows. Over DP ranks: requires attention TP 1, attention DP, `W` dividing the stage world, `num_heads % W == 0`, and a decode engine (`--disaggregation-mode decode`). Over the query shards of a prefill engine: `W` equal to `--query-context-parallel-size` (see [Query context parallelism](#query-context-parallelism-on-the-prefill-role)). |
-| `--lm-head-tp-size W` | Vocab-shard the LM head over `W` contiguous ranks. Under attention DP the default is 1 (replicated); without attention DP it must equal the attention TP size (today's layout). |
+| `--lm-head-tp-size W` | Vocab-shard the LM head over `W` contiguous ranks. Under attention DP the default is 1 (replicated); a wider group gathers distinct DP groups' rows before the logits GEMM and transposes the vocabulary shards back. Attention TP greater than one is supported; LM-head and attention TP widths must tile each other. Without attention DP it must equal the attention TP size. |
 | `--dense-tp-size W` | Already shards the dense MLPs over `W` ranks (token all-gather in, token reduce-scatter out). |
 | `--tp-batch-invariant {none,attn,attn+dense}` | Make the sharded `o_proj` (`attn`) and dense `down_proj` (`attn+dense`) column-parallel on hidden so no cross-rank sum remains outside MoE; see below. |
 
@@ -131,10 +131,33 @@ path:
 A prefill row reaching the attention is then an invariant violation and
 raises, not a configuration the operator can hit.
 
-`--lm-head-tp-size` under attention DP gathers the ranks' logits rows,
+`--lm-head-tp-size` under attention DP gathers distinct DP groups' logits rows,
 runs the vocab-shard GEMM and transposes the shards back to each rank's own
 rows (`[T_own, V]`), so sampling and logprobs downstream see the same
-full-vocab rows as a replicated head. On the decode path the row counts come
+full-vocab rows as a replicated head. With attention TP greater than one,
+only one peer writes each DP slot into a zeroed hidden-state buffer, which
+is all-reduced across the LM-head group. The vocabulary shards are gathered
+and each attention TP peer reads its DP slot. This avoids multiplying the
+LM-head GEMM rows by attention TP. LM-head and attention TP widths must tile
+each other. For example, DP4/TP2 supports an explicit LM-head TP8 while its
+default stays replicated. A shared MTP head uses the same row layout.
+When the LM-head group stays within a single attention TP group (including
+when LM-head TP equals attention TP), its peers already hold identical
+hidden states, so the input row exchange is skipped. The output still
+gathers the vocabulary unless the consumer requests greedy token IDs.
+
+For greedy heads, eligible cross-DP layouts reduce each row's vocabulary
+maximum and global token ID before selecting the owning DP rows. They use
+fused distributed argmax with alternating slot bands when supported, and
+otherwise the packed-key argmax collective, instead of gathering full logits.
+The alternating bands allow consecutive target/draft calls without an extra
+group barrier; calls sharing a state must still be ordered across streams. Returned
+logits remain vocabulary-sharded and are not a full distribution. Sampled
+draft distributions and consumers requiring full logits keep the vocabulary
+exchange; padded vocabularies, softcapping, and other argmax eligibility
+limits also retain the full-logit fallback.
+
+On the decode path the row counts come
 from the per-rank token tables (every rank's logits rows are its decode
 tokens, or the live rows a narrowing draft step reported), so the step has
 no host sync. The shapes without a table -- a prefill's one row per request
@@ -146,6 +169,13 @@ TokenSpeed refuses the others with a clear error). It cannot combine with
 (`logprob_start_len`): that path pushes the prompt rows through the LM head
 in per-request chunks, a per-rank number of row exchanges the group cannot
 agree on.
+
+LM-head vocabulary gathering uses a separate communication buffer sized for
+sampling and speculative verification rows, rather than the attention prefill
+chunk. With attention DP, its capacity covers the global request limit times
+the number of speculative verification tokens (at least 128 rows). Larger
+batches, including prompt-logprob batches, fall back to NCCL without growing
+the persistent multicast buffer.
 
 `--tp-batch-invariant` replaces the two reduce-scatters of these layouts
 (after `o_proj`, after the dense `down_proj`) with column-parallel GEMMs on
@@ -333,7 +363,7 @@ python -m tokenspeed.cli serve \
   --attn-tp-size 1 --data-parallel-size 16 --dense-tp-size 1 \
   --moe-tp-size 1 --expert-parallel-size 16 \
   --all2all-backend flashinfer --moe-backend flashinfer_trtllm \
-  --attention-backend tokenspeed_mla --kda-backend cutedsl_kda \
+  --attention-backend tokenspeed_mla --kda-backend cudnn \
   --dist-init-addr HEAD_NODE:29500 \
   --max-num-seqs 256 --max-model-len 4096 \
   --chunked-prefill-size 1024 --max-prefill-tokens 1024 \
@@ -688,13 +718,41 @@ query against that query's local causal length, so a width-`w` window reads
 each request's owned pages `w` times instead of once. The full rule set is in
 `docs/configuration/server.md`.
 
+The chunked prefill of an MLA model reads each prefix chunk's history from its
+page owners, a window of chunks per all-gather. On SM100 and SM103 GPUs (GB200,
+GB300) a KVP group of 2, 4, or 8 ranks (on one host, or across hosts over an
+NVLink fabric) gathers these windows with a fused all-gather kernel instead of
+a pack copy plus an NCCL all-gather: each owner stores its rows straight from
+its cache into every rank's receive slot, over NVLink multicast where the group
+has it, else with one store per peer. There is no flag; startup picks it for
+the whole group and reserves two receive slots per GPU before the KV cache is
+sized, each holding one chunk's history capacity (`--chunked-prefill-size` x
+`--mla-chunk-multiplier` rows) from every rank: `2 x kvp_size x capacity x row
+bytes`, 288 MiB at KVP 8 with the defaults (8192 x 4) and an FP8 MLA cache
+(576-byte rows). The group keeps NCCL on other GPUs and group sizes, for
+DeepSeek V4.1 (which gathers its own history), on a PD decode engine, without
+chunked prefill, when one receive slot would take 2 GiB or more (such as at
+KVP 8 with an FP8 cache and `--chunked-prefill-size 131072`), with
+`--kv-cache-quant-method per_token_head` (an FP8 `--kv-cache-dtype` cache is
+gathered fused), and when a configured kernel waits on other ranks inside a
+kernel that needs the whole GPU (MegaMoE, DeepEP or any other all-to-all
+backend, fused DP projections, or any MoE backend or solution the runtime does
+not list as safe). A reader whose cache rows differ from the target's
+(another row width or dtype) uses NCCL. The fused kernel's waits end 30 s
+before `--distributed-timeout-seconds` (at half of it when it is under 90 s).
+The group's first rank logs the choice: `KVP history group ... gathers through
+the fused all-gather`, or `... keeps its NCCL all-gather:` with the reason.
+
 ## Query context parallelism on the prefill role
 
 `--query-context-parallel-size N` (QCP) splits every extend forward's rows
-over the attention TP group of a PD prefill engine: rank `r` computes the
-batch-global contiguous rows `[sum(c[:r]), sum(c[:r+1]))` of the chunk, with
-`c` the same uneven split the reduce-scatter / all-gather communication path
-uses, against the full KV history of its requests. It is a layout of the
+over the attention TP group of a PD prefill engine, request by request in
+zigzag: every request's new rows are cut into `2N` near-equal segments and
+rank `r` computes segments `r` and `2N - 1 - r` of every request, against
+the full KV history of the request. For sufficiently long requests, each
+rank holds an early and a late part, balancing causal attention and letting
+the ranks compute each history group in parallel. Short requests can leave
+some ranks empty; they still participate in all collectives. It is a layout of the
 `Mapping` (`mapping.attn.qcp_size / qcp_rank / qcp_group`), not a mode: the
 scheduler plans the same chunk on every rank, cache allocation and the P->D
 transfer see page ownership only, and `--chunked-prefill-size` keeps counting
@@ -710,6 +768,14 @@ history of each request group, and the model exit gathers only the sampled
 rows (one per request) before the LM head. Every QCP collective is data
 movement, so a row's bits do not depend on which rank computes it
 (`docs/design/numerics.md`).
+
+DSA packs whole request histories into contiguous groups within its reserved
+history workspace. It keeps the minimum group count that fits the workspace,
+then minimizes the largest group's history row count. Request order and query
+ownership stay unchanged. This reduces the peak rows presented to the indexer
+without adding history gathers; latency still depends on query distribution
+and the selected kernels. A request whose history exceeds the workspace is
+rejected.
 
 Requirements: `--disaggregation-mode prefill` with `--kv-parallel-size N`
 (the query shard is a layout over the sharded pages; the engine keeps the
@@ -975,7 +1041,7 @@ for ordinary token-based scheduling. Build `tokenspeed-scheduler` from the
 same checkout to use this experimental option.
 
 Fit non-negative coefficients from timings on the intended model, GPU,
-attention backend and parallel mapping:
+attention backend, and parallel mapping:
 
 ```
 cost_ns(q, c) = REQUEST_NS + TOKEN_NS*q + PAIR_NS*q*(c + (q+1)/2)
@@ -984,7 +1050,7 @@ cost_ns(q, c) = REQUEST_NS + TOKEN_NS*q + PAIR_NS*q*(c + (q+1)/2)
 `q` includes replay input, and `c` is the prefix preceding that input. Use
 identical calibration and budget on ranks that synchronize together. The
 scheduler makes chunks smaller for longer prefixes; it preserves actual
-cache hits, junction checkpoints, final replay windows and capacity admission.
+cache hits, junction checkpoints, final replay windows, and capacity admission.
 The `--chunk-prefill-kv-size` limit also applies when configured. One
 minimum-sized prefill may exceed the soft time budget to reach a required
 checkpoint boundary or carry the final window, while obeying the hard token
@@ -993,14 +1059,22 @@ prefill budget, so it is not a latency cap for a mixed prefill/decode round.
 
 Calibrate the rank-local work being balanced, including projection and linear
 attention costs when applicable. A K3 MLA-only kernel fit does not measure
-KDA, MoE or communication, and must not be presented as a full-model fit.
+KDA, MoE, or communication, and must not be presented as a full-model fit.
 Sparse attention and backend switches may require a different model. There
-is no online fitting, cross-rank minimum-budget negotiation, request migration
+is no online fitting, cross-rank minimum-budget negotiation, request migration,
 or compute-aware ingress routing in this option. Under low load, smaller
 chunks can increase total steps and hurt latency. Compare throughput and
 TTFT as well as rank imbalance before enabling it for a workload.
 
+This balances work within a round; it does not redistribute a persistent
+backlog on one rank. Single-GPU attention measurements composed into DP
+plans showed benefits when ranks had equal total work in different orders,
+but regressions when long-prefix work stayed on one rank or every rank was
+already balanced. These are derived component estimates, not measured
+distributed or full-model serving speedups. See the benchmark's
+[measured results and limits](https://github.com/lightseekorg/tokenspeed/blob/main/tokenspeed-scheduler/benchmarks/results/prefill_compute_b300.md).
+
 The [reproduction benchmark](https://github.com/lightseekorg/tokenspeed/blob/main/tokenspeed-scheduler/benchmarks/README.md)
-compares identical token workloads with uniform contexts, mixed contexts and
+compares identical token workloads with uniform contexts, mixed contexts, and
 prefix-length skew. Model estimates and synchronized GPU component timings
 are reported separately.

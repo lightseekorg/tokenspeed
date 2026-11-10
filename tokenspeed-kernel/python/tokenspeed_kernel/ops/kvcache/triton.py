@@ -3143,6 +3143,349 @@ def index_k_block_split_scatter(
     )
 
 
+# Kimi-K3.1 DSA bf16 index-K write with the key LayerNorm
+
+
+@triton.jit
+def _index_k_layernorm_scatter_kernel(
+    buf_ptr,  # bf16 [slots, HD] plane
+    x_ptr,  # [tokens, HD] pre-norm keys, unit inner stride
+    weight_ptr,  # [HD] LayerNorm weight
+    bias_ptr,  # [HD] LayerNorm bias
+    loc_ptr,  # int [tokens] slot index
+    write_mask_ptr,
+    x_row_stride,
+    buf_row_stride,
+    eps,
+    HAS_WRITE_MASK: tl.constexpr,
+    HD: tl.constexpr,
+    BLOCK_HD: tl.constexpr,  # next_pow2(HD); masked so HD need not be pow2
+):
+    t = tl.program_id(0).to(tl.int64)
+    d = tl.arange(0, BLOCK_HD)
+    hd_mask = d < HD
+    x = tl.load(x_ptr + t * x_row_stride + d, mask=hd_mask, other=0.0).to(tl.float32)
+    mean = tl.sum(x, axis=0) / HD
+    centered = tl.where(hd_mask, x - mean, 0.0)
+    rstd = 1.0 / tl.sqrt(tl.sum(centered * centered, axis=0) / HD + eps)
+    weight = tl.load(weight_ptr + d, mask=hd_mask, other=0.0).to(tl.float32)
+    bias = tl.load(bias_ptr + d, mask=hd_mask, other=0.0).to(tl.float32)
+    y = centered * rstd * weight + bias
+
+    store_mask = hd_mask
+    if HAS_WRITE_MASK:
+        store_mask = store_mask & tl.load(write_mask_ptr + t).to(tl.int1)
+    loc = tl.load(loc_ptr + t).to(tl.int64)
+    tl.store(
+        buf_ptr + loc * buf_row_stride + d,
+        y.to(buf_ptr.dtype.element_ty),
+        mask=store_mask,
+    )
+
+
+def index_k_layernorm_scatter(
+    buf: torch.Tensor,
+    index_k: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    loc: torch.Tensor,
+    *,
+    eps: float,
+    write_mask: torch.Tensor | None,
+) -> None:
+    """LayerNorm pre-norm index keys into a bf16 index-K plane in one launch.
+
+    Equivalent to ``buf[loc] = layer_norm(index_k.float(), weight, bias,
+    eps).to(buf.dtype)``: statistics and affine run in FP32 and only the
+    normalized row is rounded.
+
+    Args:
+        buf: ``[slots, head_dim]`` bf16 plane with unit inner stride.
+        index_k: ``[tokens, head_dim]`` pre-norm keys with unit inner stride;
+            the row stride may be padded (a view of a wider projection).
+        weight: ``[head_dim]`` LayerNorm weight.
+        bias: ``[head_dim]`` LayerNorm bias.
+        loc: ``[tokens]`` non-negative integer slot indices (any integer
+            dtype).
+        eps: Positive LayerNorm epsilon.
+        write_mask: Optional bool ``[tokens]`` ownership mask; False rows are
+            not written. None writes every row.
+
+    Returns:
+        None; ``buf`` is written in place.
+    """
+    tokens = index_k.shape[0]
+    if buf.dtype != torch.bfloat16 or buf.ndim != 2 or buf.stride(-1) != 1:
+        raise ValueError("Index-K plane must be a bf16 [slots, head_dim] matrix")
+    head_dim = buf.shape[1]
+    if index_k.ndim != 2 or index_k.shape[1] != head_dim or index_k.stride(-1) != 1:
+        raise ValueError(
+            f"index_k must be [tokens, {head_dim}] with unit inner stride, got "
+            f"shape {tuple(index_k.shape)} strides {tuple(index_k.stride())}"
+        )
+    if weight.shape != (head_dim,) or bias.shape != (head_dim,):
+        raise ValueError(f"LayerNorm weight and bias must be [{head_dim}]")
+    if loc.numel() != tokens:
+        raise ValueError(f"loc must hold {tokens} slots, got {loc.numel()}")
+    if write_mask is not None and (
+        write_mask.shape != (tokens,)
+        or write_mask.dtype != torch.bool
+        or write_mask.device != loc.device
+    ):
+        raise ValueError("Index-K write mask must be bool [tokens] on the slot device")
+    if tokens == 0:
+        return
+    _index_k_layernorm_scatter_kernel[(tokens,)](
+        buf,
+        index_k,
+        weight.contiguous(),
+        bias.contiguous(),
+        loc.reshape(-1),
+        write_mask,
+        index_k.stride(0),
+        buf.stride(0),
+        float(eps),
+        HAS_WRITE_MASK=write_mask is not None,
+        HD=head_dim,
+        BLOCK_HD=_next_power_of_two(head_dim),
+        num_warps=1,
+    )
+
+
+@triton.jit
+def _index_k_layernorm_fp8_scatter_row(
+    fp8_buf_ptr,  # uint8 flat view of the paged plane
+    scale_buf_ptr,  # float32 flat view of the same storage
+    x_ptr,  # [tokens, HD] pre-norm keys, unit inner stride
+    weight_ptr,  # [HD] LayerNorm weight
+    bias_ptr,  # [HD] LayerNorm bias
+    loc_ptr,  # int [tokens] slot index
+    write_mask_ptr,
+    t,  # int64 row
+    x_row_stride,
+    page_bytes,  # bytes per page (page stride)
+    scale_base_off,  # float32 offset of a page's scales ((ps*hd)//4)
+    eps,
+    HAS_WRITE_MASK: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    HD: tl.constexpr,
+    GROUP: tl.constexpr,
+    NG: tl.constexpr,
+    BLOCK_NG: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+):
+    g = tl.arange(0, BLOCK_NG)[:, None]
+    c = tl.arange(0, GROUP)[None, :]
+    d = g * GROUP + c
+    mask = g < NG
+    x = tl.load(x_ptr + t * x_row_stride + d, mask=mask, other=0.0).to(tl.float32)
+    mean = tl.sum(tl.sum(x, axis=1), axis=0) / HD
+    centered = tl.where(mask, x - mean, 0.0)
+    var = tl.sum(tl.sum(centered * centered, axis=1), axis=0) / HD
+    rstd = 1.0 / tl.sqrt(var + eps)
+    weight = tl.load(weight_ptr + d, mask=mask, other=0.0).to(tl.float32)
+    bias = tl.load(bias_ptr + d, mask=mask, other=0.0).to(tl.float32)
+    # The keys are model-dtype rows before they are quantized.
+    y = (centered * rstd * weight + bias).to(x_ptr.dtype.element_ty).to(tl.float32)
+    scale = tl.maximum(tl.max(tl.abs(y), axis=1), 1e-10) / FP8_MAX
+    codes = tl.clamp(y / scale[:, None], -FP8_MAX, FP8_MAX).to(tl.float8e4nv)
+
+    store_mask = mask
+    if HAS_WRITE_MASK:
+        store_mask = store_mask & tl.load(write_mask_ptr + t).to(tl.int1)
+    loc = tl.load(loc_ptr + t).to(tl.int64)
+    page = loc // PAGE_SIZE
+    slot = loc % PAGE_SIZE
+    tl.store(
+        fp8_buf_ptr + page * page_bytes + slot * HD + d,
+        codes.to(tl.uint8, bitcast=True),
+        mask=store_mask,
+    )
+    tl.store(
+        scale_buf_ptr + page * (page_bytes // 4) + scale_base_off + slot * NG + g,
+        scale[:, None],
+        mask=store_mask,
+    )
+
+
+@triton.jit
+def _index_k_layernorm_fp8_scatter_kernel(
+    fp8_buf_ptr,
+    scale_buf_ptr,
+    x_ptr,
+    weight_ptr,
+    bias_ptr,
+    loc_ptr,
+    write_mask_ptr,
+    x_row_stride,
+    page_bytes,
+    scale_base_off,
+    eps,
+    HAS_WRITE_MASK: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    HD: tl.constexpr,
+    GROUP: tl.constexpr,
+    NG: tl.constexpr,
+    BLOCK_NG: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+):
+    _index_k_layernorm_fp8_scatter_row(
+        fp8_buf_ptr,
+        scale_buf_ptr,
+        x_ptr,
+        weight_ptr,
+        bias_ptr,
+        loc_ptr,
+        write_mask_ptr,
+        tl.program_id(0).to(tl.int64),
+        x_row_stride,
+        page_bytes,
+        scale_base_off,
+        eps,
+        HAS_WRITE_MASK,
+        PAGE_SIZE,
+        HD,
+        GROUP,
+        NG,
+        BLOCK_NG,
+        FP8_MAX,
+    )
+
+
+def _index_k_layernorm_fp8_scatter_args(
+    buf: torch.Tensor,
+    index_k: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    loc: torch.Tensor,
+    *,
+    eps: float,
+    page_size: int,
+    group_size: int,
+    write_mask: torch.Tensor | None,
+) -> tuple[tuple, dict[str, object]]:
+    """Validate an :func:`index_k_layernorm_fp8_scatter` write (same arguments).
+
+    Returns ``(args, constexprs)``: the runtime arguments and the constexprs
+    ``_index_k_layernorm_fp8_scatter_kernel`` takes for it.
+    """
+    tokens = index_k.shape[0]
+    head_dim = index_k.shape[1] if index_k.ndim == 2 else -1
+    if index_k.ndim != 2 or index_k.stride(-1) != 1:
+        raise ValueError(
+            f"index_k must be [tokens, head_dim] with unit inner stride, got "
+            f"shape {tuple(index_k.shape)} strides {tuple(index_k.stride())}"
+        )
+    if group_size <= 0 or head_dim % group_size or group_size & (group_size - 1):
+        raise ValueError(
+            f"group_size {group_size} must be a power of two dividing {head_dim}"
+        )
+    if weight.shape != (head_dim,) or bias.shape != (head_dim,):
+        raise ValueError(f"LayerNorm weight and bias must be [{head_dim}]")
+    if loc.numel() != tokens:
+        raise ValueError(f"loc must hold {tokens} slots, got {loc.numel()}")
+    if write_mask is not None and (
+        write_mask.shape != (tokens,)
+        or write_mask.dtype != torch.bool
+        or write_mask.device != loc.device
+    ):
+        raise ValueError("Index-K write mask must be bool [tokens] on the slot device")
+    ng = head_dim // group_size
+    row_bytes = head_dim + ng * 4
+    page_bytes = page_size * row_bytes
+    if buf.ndim == 3:
+        buf = buf.view(buf.shape[0], -1)
+    if buf.dtype != torch.uint8 or buf.ndim != 2 or buf.stride(-1) != 1:
+        raise ValueError("Index-K cache must be a uint8 slot or page matrix")
+    if buf.shape[1] == row_bytes and buf.is_contiguous():
+        if buf.shape[0] % page_size:
+            raise ValueError("Index-K slot count must contain whole pages")
+    elif buf.shape[1] == page_bytes and buf.stride(0) >= page_bytes:
+        page_bytes = buf.stride(0)
+    else:
+        raise ValueError("Index-K cache requires dense rows within each page")
+    if buf.storage_offset() % 4 or page_bytes % 4:
+        raise ValueError("Index-K pages must be float32 aligned")
+    args = (
+        buf,
+        buf.view(torch.float32),
+        index_k,
+        weight.contiguous(),
+        bias.contiguous(),
+        loc.reshape(-1),
+        write_mask,
+        index_k.stride(0),
+        page_bytes,
+        (page_size * head_dim) // 4,
+        float(eps),
+    )
+    constexprs = {
+        "HAS_WRITE_MASK": write_mask is not None,
+        "PAGE_SIZE": page_size,
+        "HD": head_dim,
+        "GROUP": group_size,
+        "NG": ng,
+        "BLOCK_NG": _next_power_of_two(ng),
+        "FP8_MAX": float(torch.finfo(torch.float8_e4m3fn).max),
+    }
+    return args, constexprs
+
+
+def index_k_layernorm_fp8_scatter(
+    buf: torch.Tensor,
+    index_k: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    loc: torch.Tensor,
+    *,
+    eps: float,
+    page_size: int,
+    group_size: int,
+    write_mask: torch.Tensor | None,
+) -> None:
+    """LayerNorm pre-norm index keys and write them as fp8_scaled rows.
+
+    One launch equivalent of ``index_k_block_split_scatter(buf, *fp8(ln(x)),
+    loc, ...)`` where ``ln`` is the FP32 LayerNorm rounded to ``index_k``'s
+    dtype and ``fp8`` gives each ``group_size`` group the scale
+    ``max(amax, 1e-10) / 448`` and the E4M3 codes of the clamped quotient.
+
+    Args:
+        buf: uint8 ``index_k_block_split_scatter`` plane: a ``[slots,
+            row_bytes]`` slot matrix or a ``[pages, page_bytes]`` page view
+            whose pages may sit further apart.
+        index_k: ``[tokens, head_dim]`` pre-norm keys with unit inner stride;
+            the row stride may be padded.
+        weight: ``[head_dim]`` LayerNorm weight.
+        bias: ``[head_dim]`` LayerNorm bias.
+        loc: ``[tokens]`` non-negative integer slot indices.
+        eps: Positive LayerNorm epsilon.
+        page_size: Rows per page of the plane.
+        group_size: Elements per scale; divides ``head_dim``.
+        write_mask: Optional bool ``[tokens]`` ownership mask; False rows are
+            not written. None writes every row.
+
+    Returns:
+        None; ``buf`` is written in place.
+    """
+    args, constexprs = _index_k_layernorm_fp8_scatter_args(
+        buf,
+        index_k,
+        weight,
+        bias,
+        loc,
+        eps=eps,
+        page_size=page_size,
+        group_size=group_size,
+        write_mask=write_mask,
+    )
+    if index_k.shape[0] == 0:
+        return
+    _index_k_layernorm_fp8_scatter_kernel[(index_k.shape[0],)](
+        *args, **constexprs, num_warps=1
+    )
+
+
 # -----------------------------------------------------------------------------
 # Draft-tree window compaction
 # -----------------------------------------------------------------------------

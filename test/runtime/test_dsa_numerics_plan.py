@@ -194,3 +194,19 @@ def test_sparse_plans_decide_decode_graph_capture(registry, graph):
     assert support.decode_graph is graph
     # DSA keeps prefills eager whatever the planned leaf declares.
     assert not support.prefill_graph
+
+
+def test_pinned_prefill_plan_keeps_its_core_for_kvp_prefill(registry):
+    _register(registry, True, graph=False)
+    backend = _backend()
+    assert backend.prefill_kernel_plan is not None
+    # The rank-major query layout would replace the pinned plan's sparse core.
+    assert backend.kvp_prefill_query_layout is False
+
+
+def test_unplanned_leaf_takes_the_kvp_prefill_query_layout(registry, monkeypatch):
+    monkeypatch.setitem(global_server_args_dict, "numerics", "auto")
+    monkeypatch.setitem(global_server_args_dict, "dsa_slot_order", "selection")
+    backend = _backend()
+    assert backend.prefill_kernel_plan is None
+    assert backend.kvp_prefill_query_layout is True

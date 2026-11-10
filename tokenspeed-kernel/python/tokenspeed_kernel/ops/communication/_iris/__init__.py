@@ -20,33 +20,37 @@
 
 """One process-wide Iris heap; operations retain their own group and buffers."""
 
-import itertools
+import logging
 import math
+import socket
 
 import torch
 import torch.distributed as dist
 from tokenspeed_kernel._triton import redirect_triton_to_tokenspeed_triton
-from tokenspeed_kernel.ops.communication.fabric import _host_identity
+from tokenspeed_kernel.ops.communication.fabric import host_identity
 from tokenspeed_kernel.platform import current_platform
 
 with redirect_triton_to_tokenspeed_triton():
     import iris
     from iris.host.distributed.topology import TopologyDiscovery
 
+logger = logging.getLogger(__name__)
+
 MIN_HEAP_BYTES = 256 << 20
 HEAP_HEADROOM_BYTES = 16 << 20
 _context = None
 _heap_size: int | None = None
 _allocator_type: str | None = None
-_store_exchanges = itertools.count(1)
+_spans_hosts: bool | None = None
+_unmapped_reason: str | None = None
 
 
 def configure_iris(*, heap_size: int | None, allocator_type: str | None) -> None:
     """Set heap options before preparation; None picks the allocator.
 
-    None means vmem_chunked when a gfx1250 job spans hosts and Iris's torch
-    default otherwise. A name is passed unchanged to Iris, whose IRIS_ALLOCATOR
-    override takes precedence. Neither option may change a live heap.
+    None means vmem_chunked when the world spans hosts and Iris's torch default
+    otherwise. A name is passed unchanged to Iris, whose IRIS_ALLOCATOR override
+    takes precedence. Neither option may change a live heap.
     """
     global _heap_size, _allocator_type
     if _context is not None and (heap_size, allocator_type) != (
@@ -59,62 +63,98 @@ def configure_iris(*, heap_size: int | None, allocator_type: str | None) -> None
 
 
 def allocation_bytes(shape: tuple[int, ...], dtype: torch.dtype) -> int:
-    """Estimate storage using Iris's Torch allocator's 1024-byte alignment."""
+    """Estimate storage using Iris's Torch allocator's 1024-byte alignment.
+
+    vmem_chunked rounds larger allocations up to a power of two and grows the
+    heap instead, so the estimate is only its initial capacity.
+    """
     return (math.prod(shape) * dtype.itemsize + 1023) // 1024 * 1024
 
 
-def _gather_through_store(name: str, value: str) -> list[str]:
-    """Every world rank's ``value``, exchanged through the c10d store as Iris does.
+def _gather_hosts() -> list[tuple[str, str]]:
+    """Every world rank's (host identity, hostname), through the c10d store.
 
-    Every rank must call it, in the same order, since each call takes the next key.
+    Iris exchanges hostnames the same way, without an NCCL collective. The key
+    is fixed, so only ``discover_world`` calls this, once per process.
     """
     store = dist.distributed_c10d._get_default_store()
-    prefix = f"tokenspeed_iris_{name}_v{next(_store_exchanges)}/"
-    store.set(f"{prefix}{dist.get_rank()}", value)
+    prefix = "tokenspeed_iris_hosts/"
+    store.set(f"{prefix}{dist.get_rank()}", f"{host_identity()} {socket.gethostname()}")
     return [
-        store.get(f"{prefix}{rank}").decode() for rank in range(dist.get_world_size())
+        tuple(store.get(f"{prefix}{rank}").decode().split(" ", 1))
+        for rank in range(dist.get_world_size())
     ]
 
 
-def _job_spans_hosts() -> bool:
-    """Whether the world spans hosts, told apart by boot id rather than hostname."""
-    if dist.get_world_size() == 1:
-        return False
-    return len(set(_gather_through_store("host", str(_host_identity())))) > 1
-
-
-def world_in_one_fabric_domain() -> bool:
-    """Whether one Iris heap can map every world rank; every rank must call it.
-
-    A world on one host qualifies. Across hosts, every GPU must report the same
-    fabric domain (the same pod), which is what vmem_chunked requires.
-    """
-    if not _job_spans_hosts():
-        return True
+def _unmapped(hosts: list[tuple[str, str]]) -> str | None:
+    """Why one heap cannot map ranks on ``hosts``, or None when it can."""
+    pairs = set(hosts)
+    identities = {identity for identity, _ in pairs}
+    if not len(identities) == len({hostname for _, hostname in pairs}) == len(pairs):
+        # Iris tells hosts apart by hostname, so it would map remote peers as
+        # local ones, or local peers over the fabric.
+        return "hostnames and boot ids disagree on which ranks share a host"
+    if len(identities) == 1:
+        return None
+    if not current_platform().is_cdna5:
+        return "only gfx1250 maps peers on other hosts"
     topology = TopologyDiscovery().discover()
     domains = {info.fabric_info.domain_key for info in topology.gpu_info.values()}
-    return len(domains) == 1 and "" not in domains
+    if len(domains) != 1 or "" in domains:
+        return "the GPUs are not all in one fabric domain"
+    return None
+
+
+def discover_world() -> bool:
+    """Decide once whether one Iris heap can map every world rank.
+
+    The heap spans the world, so a world on one host qualifies; across hosts
+    only gfx1250 does, with every GPU in one fabric domain (the same pod). Hosts
+    are told apart by boot id, and Iris's hostnames must agree. The first call
+    is a world collective; later calls return the cached answer.
+    """
+    global _spans_hosts, _unmapped_reason
+    if _spans_hosts is None:
+        if dist.get_world_size() == 1:
+            _spans_hosts = False
+        else:
+            hosts = _gather_hosts()
+            # Set together, so a failed discovery leaves the world undecided.
+            _unmapped_reason = _unmapped(hosts)
+            _spans_hosts = len({identity for identity, _ in hosts}) > 1
+        verdict = "yes" if _unmapped_reason is None else f"no, {_unmapped_reason}"
+        logger.info(
+            f"Iris heap maps the world: {verdict} (spans hosts: {_spans_hosts!s})"
+        )
+    return _unmapped_reason is None
+
+
+def maps_world() -> bool | None:
+    """``discover_world``'s answer, or None before it ran."""
+    return None if _spans_hosts is None else _unmapped_reason is None
 
 
 def get_or_create_context(*, heap_size: int):
     """Create the shared context at its initial capacity, or return it unchanged.
 
     Configured heap capacity takes precedence over the caller's initial size.
-    Iris enforces capacity as states allocate their buffers.
+    The torch allocator enforces capacity as states allocate their buffers;
+    vmem_chunked grows the heap on demand instead. A world left undecided, as
+    when the heap is used without distributed initialization, is decided here:
+    creating the heap is already a world collective, so this adds no new wait.
     """
     global _context
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError("Prepare Iris communication buffers before graph capture")
     if _context is None:
+        if not discover_world():
+            raise RuntimeError(
+                f"One Iris heap cannot map this world: {_unmapped_reason}"
+            )
         size = _heap_size if _heap_size is not None else heap_size
         allocator_type = _allocator_type
-        if (
-            allocator_type is None
-            and current_platform().is_cdna5
-            and _job_spans_hosts()
-        ):
-            # Only vmem_chunked maps peers on other hosts, and only gfx1250
-            # routes groups across hosts to Iris.
+        if allocator_type is None and _spans_hosts:
+            # Only vmem_chunked maps peers on other hosts.
             allocator_type = "vmem_chunked"
         options = {} if allocator_type is None else {"allocator_type": allocator_type}
         _context = iris.iris(

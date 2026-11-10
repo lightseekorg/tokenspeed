@@ -40,9 +40,16 @@ def require_gfx950():
         pytest.skip("AMD gfx950 is required for Gluon grouped MHA device tests")
 
 
-@pytest.mark.parametrize("group", [1, 2, 4, 5, 6, 8, 12])
-@pytest.mark.parametrize("query_rows", [1, 16, 64, 848, 896, 8192])
-def test_select_extend_tile(group, query_rows):
+@pytest.mark.parametrize(
+    "group,query_rows,warp_pipeline",
+    [
+        (group, query_rows, False)
+        for group in (1, 2, 4, 5, 6, 8, 12)
+        for query_rows in (1, 16, 64, 848, 896, 8192)
+    ]
+    + [(6, 848, True), (8, 8192, True)],
+)
+def test_select_extend_tile(group, query_rows, warp_pipeline):
     # Tile selection is CPU-only; the AMD kernel package is optional on other hosts.
     if not is_amd():
         pytest.importorskip(
@@ -52,12 +59,19 @@ def test_select_extend_tile(group, query_rows):
         _select_extend_tile,
     )
 
-    block_m, block_q, block_n, warps = _select_extend_tile(query_rows, group)
+    block_m, block_q, block_n, warps = _select_extend_tile(
+        query_rows, group, warp_pipeline
+    )
     padded_group = 1 << (group - 1).bit_length()
     assert block_m & (block_m - 1) == 0
     assert block_q & (block_q - 1) == 0
     assert block_m == block_q * padded_group
-    assert block_n == 64 and warps in (2, 4)
+    assert block_n == 64
+    if warp_pipeline:
+        # The warp-pipelined loop needs 8 waves of 32 rows each.
+        assert (block_m, warps) == (256, 8)
+    else:
+        assert warps in (2, 4)
     # The tile must cover each real (position, head) exactly once.
     actual = [
         (row // padded_group, row % padded_group)
@@ -65,6 +79,54 @@ def test_select_extend_tile(group, query_rows):
         if row % padded_group < group
     ]
     assert actual == [(pos, head) for pos in range(block_q) for head in range(group)]
+
+
+@pytest.mark.parametrize(
+    "max_q,prefix,total_q,window,expected",
+    [
+        # Full attention: a cached prefix of 8192 keys, at any row count past
+        # the 64-row tile.
+        (128, 8192, 128, -1, True),
+        (8192, 65536, 8192, -1, True),
+        (128, 8191, 128, -1, False),
+        (64, 65536, 64, -1, False),
+        # Short prefixes, as in serving's fresh and short-prefix extends.
+        (1024, 0, 1024, -1, False),
+        (4096, 512, 8192, -1, False),
+        # A 2047-key window: a prefix of one window and one to four rounds of
+        # work-groups.
+        (1024, 2047, 4 * 1024, 2047, True),
+        (4096, 65536, 4 * 4096, 2047, True),
+        (4096, 2046, 4096, 2047, False),
+        (512, 65536, 512, 2047, False),
+        (4096, 65536, 8 * 4096, 2047, False),
+        # Narrower windows keep the 4-wave tiles.
+        (4096, 65536, 4096, 511, False),
+    ],
+)
+def test_warp_pipeline_selection(max_q, prefix, total_q, window, expected):
+    # Tile selection is CPU-only; the AMD kernel package is optional on other hosts.
+    if not is_amd():
+        pytest.importorskip(
+            "tokenspeed_kernel_amd", reason="AMD kernel package is optional"
+        )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mha.extend import (
+        _use_warp_pipeline,
+    )
+
+    assert (
+        _use_warp_pipeline(
+            max_seqlen_q=max_q,
+            max_seqlen_k=max_q + prefix,
+            total_q=total_q,
+            group_size=8,
+            n_kv_heads=2,
+            head_dim=64,
+            element_size=2,
+            window_left=window,
+        )
+        == expected
+    )
 
 
 @dataclass
@@ -192,10 +254,14 @@ def assert_reference(case: PagedCase):
         expected, expected_lse = reference(case)
         actual, actual_lse = case.invoke("gluon", return_lse=True)
         ordinary = case.invoke("gluon", return_lse=False)
-        # The public MHA LSE tests use these existing output/LSE tolerances.
+        # The output goes through BF16 probabilities and keeps the public MHA
+        # tolerance. The LSE is summed in FP32 from FP32 scores and stays
+        # within 2e-4 of the FP32 oracle even over 50k keys; a page of keys
+        # wrongly in or out of a window of up to a few thousand keys moves it
+        # further.
         torch.testing.assert_close(actual.float(), expected, rtol=8e-2, atol=8e-2)
         torch.testing.assert_close(ordinary.float(), expected, rtol=8e-2, atol=8e-2)
-        torch.testing.assert_close(actual_lse, expected_lse, rtol=8e-2, atol=8e-2)
+        torch.testing.assert_close(actual_lse, expected_lse, rtol=0, atol=2e-4)
         assert torch.isfinite(actual).all() and torch.isfinite(actual_lse).all()
     finally:
         torch.backends.cuda.matmul.allow_tf32 = previous
@@ -275,11 +341,12 @@ def test_draft_and_multiple_kv_head_groups(heads, kv_heads, causal, window):
         pytest.param([32], [300 * 64 + 17], -1, id="split-pipelined"),
         # An empty prefix, a split with fewer pages than buffers and a long row.
         pytest.param([5, 64, 33], [0, 4 * 64, 1000 * 64 + 33], -1, id="split-ragged"),
-        # 128-row tiles: 1000 rows take five splits of about 65 pages.
-        pytest.param([1000], [20000 + 3], -1, id="split-pipelined-128"),
+        # 128-row tiles: 1000 rows take five splits of about 28 pages; a
+        # prefix under 8192 keys keeps the 4-wave tile.
+        pytest.param([1000], [8000 + 3], -1, id="split-pipelined-128"),
         # 4096 rows fill the grid unsplit; pipelining adds no round of
         # workgroups.
-        pytest.param([4096], [10000 + 11], -1, id="pipelined"),
+        pytest.param([4096], [7000 + 11], -1, id="pipelined"),
         # 6144 rows: pipelining would add a round of workgroups, so pages
         # load single-buffered.
         pytest.param([6144], [3000 + 7], -1, id="single-buffer"),
@@ -302,9 +369,106 @@ def test_kv_stream(queries, prefixes, window):
     assert_reference(case)
 
 
-@pytest.mark.parametrize("window", [-1, 511])
+@pytest.mark.parametrize(
+    "queries,prefixes",
+    [
+        # 63 tiles of 16 positions: the K/V page loads are pipelined.
+        pytest.param([1000], [5000 + 13], id="pipelined"),
+        # 768 work-groups: the page loads are single-buffered. A cached
+        # prefix shorter than a 2047-key window keeps the 4-wave tile.
+        pytest.param([6144], [1500 + 7], id="single-buffer"),
+        # A tile straddling the prefix end, and windows longer than the context.
+        pytest.param([37, 300], [9, 700], id="short-context"),
+    ],
+)
+@pytest.mark.parametrize("window", [100, 511, 2047])
 @pytest.mark.usefixtures("require_gfx950")
-def test_changed_metadata_graph_replay_without_recompile(window):
+def test_sliding_window_sees_exactly_its_keys(queries, prefixes, window):
+    # Only the pages that hold some row's window edge or its causal diagonal
+    # are masked; the pages between are visible to every row of a tile.
+    case = make_case(
+        queries,
+        prefixes,
+        heads=16,
+        kv_heads=2,
+        window=window,
+        causal=True,
+        sinks=False,
+        head_dim=64,
+    )
+    assert_reference(case)
+
+
+def uses_warp_pipeline(case: PagedCase) -> bool:
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mha import extend
+
+    return extend._use_warp_pipeline(
+        max_seqlen_q=case.max_q,
+        max_seqlen_k=case.max_k,
+        total_q=case.q.shape[0],
+        group_size=case.q.shape[1] // case.k.shape[2],
+        n_kv_heads=case.k.shape[2],
+        head_dim=case.q.shape[2],
+        element_size=case.k.element_size(),
+        window_left=case.window,
+    )
+
+
+@pytest.mark.parametrize(
+    "queries,prefixes,heads,kv_heads,window,sinks",
+    [
+        # 256-row tiles of 32 positions x 8 heads. 1024 rows split the KV
+        # stream; the last page is partial.
+        pytest.param([1024], [20000 + 3], 16, 2, -1, False, id="split"),
+        # 4096 rows fill every CU unsplit; the last tile ends mid-page.
+        pytest.param([4096], [10000 + 11], 16, 2, -1, False, id="unsplit"),
+        # One request under a page past its rows, one with a prefix shorter
+        # than the copy distance, one long; the short ones get empty splits.
+        pytest.param(
+            [65, 200, 900], [9000, 3 * 64, 700 * 64 + 5], 16, 2, -1, True, id="ragged"
+        ),
+        # A group of 6 heads padded to 8, and a group of 8 with one KV head.
+        pytest.param([1024], [9000 + 7], 12, 2, -1, True, id="group-6"),
+        pytest.param([2048], [30000 + 9], 8, 1, -1, True, id="group-8"),
+        # Sliding windows: 4096 rows give a work-group to every CU. The pages
+        # that hold some row's window edge or its diagonal are masked, the
+        # pages between are not.
+        pytest.param([4096], [5000 + 13], 16, 2, 2047, False, id="window"),
+        pytest.param([8192], [6000 + 1], 16, 2, 4095, True, id="window-4095"),
+        # A tile straddling the prefix end, and windows longer than the
+        # context of the second request.
+        pytest.param([4096, 37], [3000, 9], 16, 2, 2047, False, id="window-ragged"),
+    ],
+)
+@pytest.mark.usefixtures("require_gfx950")
+def test_warp_pipeline(queries, prefixes, heads, kv_heads, window, sinks):
+    case = make_case(
+        queries,
+        prefixes,
+        heads=heads,
+        kv_heads=kv_heads,
+        window=window,
+        causal=True,
+        sinks=sinks,
+        head_dim=64,
+    )
+    assert uses_warp_pipeline(case)
+    assert_reference(case)
+    first, first_lse = case.invoke("gluon", return_lse=True)
+    # Tighter than the public tolerance: guards P of up to 2**8 before BF16 rounding.
+    expected, _ = reference(case)
+    torch.testing.assert_close(first.float(), expected, rtol=2e-2, atol=1e-2)
+    # Each work-group sums its pages in a fixed order: the result does not
+    # change between launches.
+    second, second_lse = case.invoke("gluon", return_lse=True)
+    torch.testing.assert_close(first, second, rtol=0, atol=0)
+    torch.testing.assert_close(first_lse, second_lse, rtol=0, atol=0)
+
+
+def assert_graph_replay_follows_metadata(case: PagedCase, updates):
+    """Capture case once, then for each (queries, lengths) rewrite the
+    metadata in place and check the replay against eager and the oracle,
+    without compiling."""
     from tokenspeed_kernel_amd.ops.gfx950.attention.mha.extend import (
         gluon_mha_extend_gfx950,
         gluon_mha_extend_reduce_gfx950,
@@ -312,17 +476,6 @@ def test_changed_metadata_graph_replay_without_recompile(window):
     )
     from utils import assert_no_triton_compile
 
-    case = make_case(
-        [16, 16],
-        [1001, 977],
-        heads=6,
-        kv_heads=1,
-        window=window,
-        causal=True,
-        sinks=True,
-    )
-    case.max_q = 32
-    case.max_k = 2048
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
@@ -333,10 +486,12 @@ def test_changed_metadata_graph_replay_without_recompile(window):
     with torch.cuda.graph(graph, stream=stream):
         output, lse = case.invoke("gluon", return_lse=True)
     torch.cuda.synchronize()
-    for queries, lengths in [([9, 23], [1021, 997]), ([21, 11], [1007, 1013])]:
+    for queries, lengths in updates:
         case.queries = queries
         case.cu_q.copy_(
-            torch.tensor([0, queries[0], 32], device="cuda", dtype=torch.int32)
+            torch.tensor(
+                [0, queries[0], sum(queries)], device="cuda", dtype=torch.int32
+            )
         )
         case.lengths.copy_(torch.tensor(lengths, device="cuda", dtype=torch.int32))
         case.cu_kv.copy_(
@@ -357,6 +512,53 @@ def test_changed_metadata_graph_replay_without_recompile(window):
         torch.testing.assert_close(lse, eager_lse, rtol=0, atol=0)
         assert_reference(case)
     graph.reset()
+
+
+@pytest.mark.parametrize("window", [-1, 2047])
+@pytest.mark.usefixtures("require_gfx950")
+def test_warp_pipeline_graph_replay(window):
+    # Full attention splits 1024 rows of two requests; a window gets 4096
+    # rows so every CU has a work-group. Every length below needs all 146
+    # pages of its table row, so the flipped table holds only valid pages.
+    rows = 1024 if window < 0 else 4096
+    case = make_case(
+        [rows // 2, rows // 2],
+        [9300 - rows // 2, 9340 - rows // 2],
+        heads=16,
+        kv_heads=2,
+        window=window,
+        causal=True,
+        sinks=True,
+        head_dim=64,
+    )
+    case.max_q = rows
+    assert uses_warp_pipeline(case)
+    assert_graph_replay_follows_metadata(
+        case,
+        [
+            ([rows // 4 + 3, rows - rows // 4 - 3], [9330, 9290]),
+            ([rows - 37, 37], [9344, 9281]),
+        ],
+    )
+
+
+@pytest.mark.parametrize("window", [-1, 511])
+@pytest.mark.usefixtures("require_gfx950")
+def test_changed_metadata_graph_replay_without_recompile(window):
+    case = make_case(
+        [16, 16],
+        [1001, 977],
+        heads=6,
+        kv_heads=1,
+        window=window,
+        causal=True,
+        sinks=True,
+    )
+    case.max_q = 32
+    case.max_k = 2048
+    assert_graph_replay_follows_metadata(
+        case, [([9, 23], [1021, 997]), ([21, 11], [1007, 1013])]
+    )
 
 
 @pytest.mark.parametrize("query_rows", [848, 896, 8192])

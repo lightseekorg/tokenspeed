@@ -1,0 +1,97 @@
+# MIT License
+#
+# Copyright (c) 2026 LightSeek Foundation <contact@lightseek.org>
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""Native contracts for the shared AMD extern intrinsic libraries."""
+
+import pytest
+import torch
+from utils import is_cdna4
+
+if not is_cdna4():
+    pytest.skip("AMD CDNA4 is required", allow_module_level=True)
+
+from tokenspeed_kernel_amd._extern import (  # noqa: E402
+    arithmetic_fence,
+    extern_compile_options,
+    release_drain,
+    sched_group,
+    wave_all_equal,
+    wave_uniform_i32,
+)
+from tokenspeed_kernel_amd._triton import gl, gluon  # noqa: E402
+
+
+@gluon.jit
+def _sched_group_probe(x, out):
+    offset = gl.arange(0, 256, layout=gl.BlockedLayout([1], [64], [4], [0]))
+    y = gl.exp2(gl.load(x + offset))
+    sched_group(("trans",), 2)
+    sched_group("mfma", 1)
+    sched_group("valu", 4)
+    gl.store(out + offset, y)
+
+
+def test_sched_group_accepts_class_names():
+    x = torch.randn(256, device="cuda")
+    out = torch.empty_like(x)
+    compiled = _sched_group_probe[(1,)](x, out, num_warps=4, **extern_compile_options())
+    llir = compiled.asm["llir"]
+    assert "@llvm.amdgcn.sched.group.barrier(i32 1024, i32 2, i32 0)" in llir
+    assert "@llvm.amdgcn.sched.group.barrier(i32 8, i32 1, i32 0)" in llir
+    assert "@llvm.amdgcn.sched.group.barrier(i32 2, i32 4, i32 0)" in llir
+    torch.testing.assert_close(out, torch.exp2(x), atol=0, rtol=0)
+
+
+@gluon.jit
+def _multi_library_probe(a, b, first_lane, all_equal, fenced):
+    # Element i belongs to lane i % 64 of wave i // 64.
+    offset = gl.arange(0, 256, layout=gl.BlockedLayout([1], [64], [4], [0]))
+    gl.store(first_lane + offset, wave_uniform_i32(offset))
+    x = gl.load(a + offset)
+    equal = wave_all_equal(x, gl.load(b + offset))
+    gl.store(all_equal + offset, equal)
+    gl.store(fenced + offset, arithmetic_fence(x) * 2.0)
+    release_drain()
+
+
+def test_one_kernel_links_several_libraries():
+    a = torch.randn(256, device="cuda")
+    b = a.clone()
+    # Waves 1 and 3 differ in one lane each; waves 0 and 2 match.
+    b[64 + 17] += 1
+    b[192 + 63] = float("nan")
+    first_lane = torch.empty(256, dtype=torch.int32, device="cuda")
+    all_equal = torch.empty_like(first_lane)
+    fenced = torch.empty_like(a)
+    compiled = _multi_library_probe[(1,)](
+        a, b, first_lane, all_equal, fenced, num_warps=4, **extern_compile_options()
+    )
+    llir = compiled.asm["llir"]
+    assert "@llvm.amdgcn.readfirstlane" in llir
+    assert "@llvm.amdgcn.ballot.i64" in llir
+    assert "@llvm.arithmetic.fence.f32" in llir
+    assert "@llvm.amdgcn.s.waitcnt(i32 3952)" in llir
+    wave = torch.arange(256, device="cuda") // 64
+    torch.testing.assert_close(first_lane, (wave * 64).to(torch.int32))
+    expected = torch.tensor([1, 0, 1, 0], dtype=torch.int32, device="cuda")
+    torch.testing.assert_close(all_equal, expected[wave])
+    torch.testing.assert_close(fenced, a * 2.0, atol=0, rtol=0)

@@ -22,12 +22,13 @@
 
 from __future__ import annotations
 
-import ctypes as C
 import os
 
 import torch
+import torch.distributed as dist
 import torch_npu
 from tokenspeed_kernel_npu._triton import tl, triton
+from tokenspeed_kernel_npu.ops.prefill import AscendDSAPrefill
 
 
 @triton.jit
@@ -266,16 +267,12 @@ class AscendDSAKernels:
         self._attention = getattr(
             torch.ops.custom, "npu_sparse_flash_attention_decode", None
         )
-        self._select_local = getattr(
-            torch.ops.custom, "npu_select_local_topk_indices", None
-        )
         if self._index is None or self._attention is None:
             raise RuntimeError(
                 "LongCatDSA needs LightningIndexer and "
                 "SparseFlashAttentionDecode operators"
             )
         self._full_scan_chunks = {}
-        self._identity_rotary = {}
 
     @staticmethod
     def prepare_prefill(
@@ -283,21 +280,17 @@ class AscendDSAKernels:
         index_cache,
         *,
         ranks,
-        bootstrap_group,
+        history_group,
         max_current_rows,
-        max_history_rows=0,
-        history_null_rows=0,
-        workspace=None,
+        history_null_rows,
     ):
         return AscendDSAPrefill(
             kv_cache,
             index_cache,
             ranks=ranks,
-            bootstrap_group=bootstrap_group,
+            history_group=history_group,
             max_current_rows=max_current_rows,
-            max_history_rows=max_history_rows,
             history_null_rows=history_null_rows,
-            workspace=workspace,
         )
 
     @staticmethod
@@ -454,38 +447,58 @@ class AscendDSAKernels:
         finally:
             torch.npu.config.allow_internal_format = False
 
-    def fused_prolog(self, *args, rotary=None):
-        """Fused projections/store, optionally GPT-J RoPE (MLA=1, Indexer=2).
-
-        ``rotary`` carries int64 positions, an FP32 [P,64] cos/sin table,
-        and the explicit bit mask. Omitting it leaves projections unrotated.
-        """
-        if rotary is None:
-            x = args[0]
-            key = (x.device, x.shape[0])
-            if key not in self._identity_rotary:
-                self._identity_rotary[key] = (
-                    torch.zeros(x.shape[0], dtype=torch.int64, device=x.device),
-                    torch.zeros((1, 64), dtype=torch.float32, device=x.device),
-                    0,
-                )
-            rotary = self._identity_rotary[key]
-        return torch.ops.custom.npu_dsa_prolog_fused(*args, *rotary)
-
-    def initialize_prolog_window(self, rank, rendezvous, *, rank_size):
-        name = "dsa_prolog_fused"
-        torch.ops.custom.initialize_group_first_rdma(
-            name, rank, rank_size, rendezvous, 32 << 20
+    def fused_prolog(
+        self,
+        x,
+        down,
+        gamma_q,
+        gamma_kv,
+        gamma_index,
+        score_weight,
+        qb,
+        uk,
+        window,
+        kv_cache,
+        index_cache,
+        slots,
+        *,
+        eps_q,
+        eps_kv,
+        eps_index,
+        positions,
+        cos_sin,
+        rotary_mode,
+        out,
+    ):
+        """Fused projections and cache writes with operator-owned workspace."""
+        return torch.ops.custom.npu_dsa_prolog_fused.out(
+            x,
+            down,
+            gamma_q,
+            gamma_kv,
+            gamma_index,
+            score_weight,
+            qb,
+            uk,
+            window,
+            kv_cache,
+            index_cache,
+            slots,
+            eps_q,
+            eps_kv,
+            eps_index,
+            positions,
+            cos_sin,
+            rotary_mode,
+            query=out[0],
+            index_query=out[1],
+            score=out[2],
         )
-        return torch.ops.custom.dsa_prolog_window(name)
-
-    def finalize_prolog_window(self):
-        torch.ops.custom.finalize_group_first_rdma("dsa_prolog_fused")
 
     def select_local(self, indices, positions, rank):
-        if self._select_local is None:
-            raise RuntimeError("Ascend DSA CP requires SelectLocalTopkIndices")
-        return self._select_local(indices, positions, rank)
+        from tokenspeed_kernel_npu.ops.dcp_tensors import select_local_topk
+
+        return select_local_topk(indices, positions, rank=rank)
 
     def merge_partials(self, output, lse):
         """Merge normalized O[P,N,D] with natural-log LSE[P,N].
@@ -503,11 +516,9 @@ class AscendDSAKernels:
             indices, values, group=group, rank_size=rank_size, sorted_input=True
         )
 
-    def merge_lse_direct(
-        self, output, maximum, total, peer_inputs, *, group, rank_size, setup_mode
-    ):
+    def merge_lse_direct(self, output, maximum, total, *, group, rank_size):
         return torch.ops.custom.npu_dsa_merge_lse_direct(
-            output, maximum, total, peer_inputs, group, rank_size, setup_mode
+            output, maximum, total, group, rank_size
         )
 
     def output_projection_partial(self, output, w_vc, w_o):
@@ -520,8 +531,6 @@ class AscendDSAKernels:
             for name in (
                 "npu_dcp_merge_topk",
                 "npu_dsa_merge_lse_direct",
-                "npu_select_local_topk_indices",
-                "npu_kvp_attention_merge",
             )
             if getattr(torch.ops.custom, name, None) is None
         ]
@@ -539,17 +548,14 @@ class AscendDSAKernels:
         statistics = torch.empty(
             (1, rows, num_heads), dtype=torch.float32, device="meta"
         )
-        peers = torch.empty(rank_size, dtype=torch.int64, device="meta")
         try:
             self.merge_topk_fused(indices, scores, group=group, rank_size=rank_size)
             self.merge_lse_direct(
                 output,
                 statistics,
                 statistics,
-                peers,
                 group=group,
                 rank_size=rank_size,
-                setup_mode=0,
             )
         except NotImplementedError as exc:
             raise RuntimeError(
@@ -611,7 +617,7 @@ class AscendDSAKernels:
         result, _ = self._index(
             query.contiguous(),
             key,
-            weights.to(torch.bfloat16).contiguous(),
+            weights.float().contiguous(),
             actual_seq_lengths_query=q_ends,
             actual_seq_lengths_key=kv_lengths,
             block_table=table,
@@ -648,7 +654,7 @@ class AscendDSAKernels:
         result, values = self._index(
             query.contiguous(),
             key,
-            weights.to(torch.bfloat16).contiguous(),
+            weights.float().contiguous(),
             actual_seq_lengths_query=q_ends,
             actual_seq_lengths_key=kv_lengths,
             block_table=table,
@@ -817,7 +823,7 @@ def dsa_cp_metadata(
 
     if page_size <= 0 or block_granularity % page_size:
         raise ValueError("DSA ownership blocks must contain whole kernel pages")
-    torch.ops.custom.npu_kvp_metadata.dsa_out(
+    torch.ops.custom.npu_dsa_cp_metadata.out(
         table,
         lengths,
         page_size,
@@ -841,479 +847,3 @@ def dsa_cp_metadata(
         index_query_ends=index_query_ends,
         local_slots=local_slots,
     )
-
-
-class AscendDSAPrefill:
-    """One fixed receive workspace and AICPU communicator for successive layers.
-
-    Construction is collective on the supplied CPU bootstrap group, outside
-    forward. Cache rows stay owner-sharded; both receive planes remain at fixed
-    addresses and are consumed directly by the Indexer and sparse attention.
-    """
-
-    def __init__(
-        self,
-        kv_cache,
-        index_cache,
-        *,
-        ranks,
-        bootstrap_group,
-        max_current_rows,
-        max_history_rows=0,
-        history_null_rows=0,
-        workspace=None,
-    ):
-        import torch.distributed as dist
-
-        self.degree = len(ranks)
-        self.rank = ranks.index(dist.get_rank())
-        self.device = kv_cache.device
-        self.local_rows = kv_cache.numel() // 576
-        if self.degree < 1 or self.local_rows < 1:
-            raise ValueError("DSA Prefill needs nonempty cache geometry")
-        self._has_index = index_cache is not None
-        planes = [(kv_cache, 576)]
-        if self._has_index:
-            planes.append((index_cache, 128))
-        for value, width in planes:
-            if (
-                value.device != self.device
-                or value.dtype != torch.bfloat16
-                or not value.is_contiguous()
-                or value.numel() != self.local_rows * width
-            ):
-                raise ValueError(
-                    "DSA Prefill needs contiguous matching BF16 cache planes"
-                )
-        path = os.environ.get("TOKENSPEED_DSA_CP_LIBRARY")
-        if not path:
-            raise RuntimeError("Set TOKENSPEED_DSA_CP_LIBRARY to libdsa_cp_prefill.so")
-        self.lib = C.CDLL(path)
-        self.lib.DsaCpPrefillAbiVersion.restype = C.c_uint32
-        if self.lib.DsaCpPrefillAbiVersion() != 2:
-            raise RuntimeError("DSA CP native ABI does not match this runtime")
-        self.lib.DsaCpRootInfoBytes.restype = C.c_uint64
-        signatures = {
-            "DsaCpGetRootInfo": [C.c_void_p],
-            "DsaCpCreateComm": [
-                C.c_void_p,
-                C.c_uint32,
-                C.c_uint32,
-                C.POINTER(C.c_void_p),
-            ],
-            "DsaCpDestroyComm": [C.c_void_p],
-            "DsaCpAllGather": [
-                C.c_void_p,
-                C.c_void_p,
-                C.c_void_p,
-                C.c_void_p,
-                C.c_uint64,
-            ],
-            "DsaCpPatch": [C.c_void_p] * 6 + [C.c_uint64] * 4 + [C.c_uint32] * 4,
-        }
-        if max_history_rows:
-            signatures["DsaCpAllGatherV"] = (
-                [C.c_void_p] * 4 + [C.c_uint64] + [C.c_void_p] * 2
-            )
-            signatures["DsaCpPatchMapped"] = (
-                [C.c_void_p] * 7 + [C.c_uint64] * 5 + [C.c_uint32] * 4
-            )
-        for name, arguments in signatures.items():
-            function = getattr(self.lib, name)
-            function.argtypes = arguments
-            function.restype = C.c_int
-        self.comm = C.c_void_p()
-        if self.degree > 1:
-            root = C.create_string_buffer(self.lib.DsaCpRootInfoBytes())
-            if self.rank == 0:
-                self._check(self.lib.DsaCpGetRootInfo(root), "root info")
-            objects = [root.raw if self.rank == 0 else None]
-            dist.broadcast_object_list(objects, src=ranks[0], group=bootstrap_group)
-            root = C.create_string_buffer(objects[0], len(objects[0]))
-            self._check(
-                self.lib.DsaCpCreateComm(
-                    root, self.degree, self.rank, C.byref(self.comm)
-                ),
-                "create AICPU communicator",
-            )
-        if max_current_rows < 1:
-            raise ValueError("DSA Prefill needs a positive current-token capacity")
-        self.max_current_rows = max_current_rows
-        self.send_capacity = (
-            (max_current_rows + self.degree * 128 - 1) // (self.degree * 128)
-        ) * 128
-        if (
-            max_history_rows < 0
-            or history_null_rows < 0
-            or (max_history_rows and not 0 < history_null_rows < max_history_rows)
-        ):
-            raise ValueError("Invalid bounded Prefill history capacity")
-        self.history_rows = max_history_rows or self.local_rows * self.degree
-        self.history_null_rows = history_null_rows
-        self._bounded_history = max_history_rows > 0
-        rows = self.history_rows + self.send_capacity * self.degree
-        index_width = 128 if self._has_index else 0
-        sizes = (
-            rows * (576 + index_width),
-            self.send_capacity * (576 + index_width),
-            self.history_rows * (576 + index_width) if self._bounded_history else 0,
-        )
-        if workspace is None:
-            workspace = tuple(
-                torch.empty(n, dtype=torch.bfloat16, device=self.device) for n in sizes
-            )
-        if len(workspace) != 3 or any(
-            value.dtype != torch.bfloat16
-            or value.device != self.device
-            or not value.is_contiguous()
-            or value.ndim != 1
-            or value.numel() != n
-            for value, n in zip(workspace, sizes, strict=True)
-        ):
-            raise ValueError("Prefill requires matching caller-owned workspace buffers")
-        self.storage, self.send_storage, history_send = workspace
-        self.index = self.storage[: rows * index_width].view(rows, index_width)
-        self.kv = self.storage[rows * index_width :].view(rows, 576)
-        self.send_index = self.send_storage[: self.send_capacity * index_width].view(
-            self.send_capacity, index_width
-        )
-        self.send_kv = self.send_storage[self.send_capacity * index_width :].view(
-            -1, 576
-        )
-        self.history_send = history_send if self._bounded_history else None
-        if self._bounded_history:
-            self.index[:history_null_rows].zero_()
-            self.kv[:history_null_rows].zero_()
-        self._history_slots = None
-        self._history_counts = ()
-        self._history_arguments = []
-        self._patch_slots = None
-        self.stream = torch.npu.Stream(device=self.device)
-        self.index_ready = torch.npu.Event(enable_timing=True)
-        self.kv_ready = torch.npu.Event(enable_timing=True)
-        self.consumed = torch.npu.Event(enable_timing=True)
-        self.source_ready = torch.npu.Event(enable_timing=True)
-        self.index_produced = torch.npu.Event(enable_timing=True)
-        self.kv_produced = torch.npu.Event(enable_timing=True)
-        self.index_current_ready = torch.npu.Event(enable_timing=True)
-        self.kv_current_ready = torch.npu.Event(enable_timing=True)
-        self._current_rows = 0
-        self._send_rows = 0
-        self._started = {128: False, 576: False}
-        self.layer_id = None
-        self._consumed_recorded = False
-        self._sources = None
-        self._closed = False
-
-    @staticmethod
-    def _check(status, operation):
-        if status:
-            raise RuntimeError(f"DSA CP {operation} failed: {status}")
-
-    @property
-    def workspace_bytes(self):
-        return (
-            self.storage.numel()
-            + self.send_storage.numel()
-            + (0 if self.history_send is None else self.history_send.numel())
-        ) * self.storage.element_size()
-
-    def prefetch(
-        self,
-        layer_id,
-        kv_cache,
-        index_cache,
-        *,
-        has_history,
-        history_slots=None,
-        history_counts=None,
-    ):
-        """Enqueue both gathers directly into the prepared receive planes."""
-        if self._closed or self.layer_id is not None:
-            raise RuntimeError(
-                "DSA Prefill workspace is closed or still being consumed"
-            )
-        if (index_cache is not None) != self._has_index:
-            raise ValueError("Prefill index-cache presence changed after preparation")
-        planes = [(kv_cache, 576)]
-        if self._has_index:
-            planes.append((index_cache, 128))
-        for value, width in planes:
-            if (
-                value.dtype != torch.bfloat16
-                or value.device != self.device
-                or not value.is_contiguous()
-                or value.numel() != self.local_rows * width
-            ):
-                raise ValueError("DSA Prefill cache geometry changed after preparation")
-        self.layer_id = layer_id
-        self._sources = (kv_cache, index_cache)
-        self._started = {128: False, 576: False}
-        if self._bounded_history:
-            if (
-                history_slots is None
-                or history_counts is None
-                or len(history_counts) != self.degree
-            ):
-                raise ValueError("Bounded Prefill needs its batch page-gather plan")
-            if (
-                history_slots.dtype != torch.int64
-                or history_slots.device != self.device
-                or history_slots.numel() != history_counts[self.rank]
-                or min(history_counts) < 0
-                or sum(history_counts) + self.history_null_rows > self.history_rows
-            ):
-                raise ValueError(
-                    "Prefill page gather exceeds the prepared history capacity"
-                )
-        self._history_slots = history_slots
-        self._history_counts = () if history_counts is None else tuple(history_counts)
-        self._history_arguments = []
-        self.source_ready.record(torch.npu.current_stream(self.device))
-        with torch.npu.stream(self.stream):
-            self.stream.wait_event(self.source_ready)
-            if self._consumed_recorded:
-                self.stream.wait_event(self.consumed)
-            gathers = [(kv_cache, self.kv[: self.history_rows], self.kv_ready)]
-            if self._has_index:
-                gathers.insert(
-                    0, (index_cache, self.index[: self.history_rows], self.index_ready)
-                )
-            for source, target, ready in gathers:
-                source.record_stream(self.stream)
-                target.record_stream(self.stream)
-                if not has_history:
-                    pass
-                elif self._bounded_history:
-                    # Cache views can include singleton head/page dimensions.
-                    width = 128 if source is index_cache else 576
-                    count = self._history_counts[self.rank]
-                    packed = self.history_send[: count * width].view(count, width)
-                    torch.index_select(
-                        source.view(-1, width), 0, self._history_slots, out=packed
-                    )
-                    self._history_slots.record_stream(self.stream)
-                    receive = target[
-                        self.history_null_rows : self.history_null_rows
-                        + sum(self._history_counts)
-                    ]
-                    if self.degree == 1:
-                        receive.copy_(packed)
-                    elif sum(self._history_counts):
-                        counts = (C.c_uint64 * self.degree)(
-                            *(n * width for n in self._history_counts)
-                        )
-                        offsets = (C.c_uint64 * self.degree)(
-                            *(
-                                sum(self._history_counts[:r]) * width
-                                for r in range(self.degree)
-                            )
-                        )
-                        self._history_arguments.append((counts, offsets))
-                        self._check(
-                            self.lib.DsaCpAllGatherV(
-                                self.comm,
-                                self.stream.npu_stream,
-                                self.history_send.data_ptr(),
-                                receive.data_ptr(),
-                                packed.numel(),
-                                counts,
-                                offsets,
-                            ),
-                            "bounded AICPU AllGatherV",
-                        )
-                elif self.degree == 1:
-                    target.copy_(source.view_as(target))
-                else:
-                    self._check(
-                        self.lib.DsaCpAllGather(
-                            self.comm,
-                            self.stream.npu_stream,
-                            source.data_ptr(),
-                            target.data_ptr(),
-                            source.numel(),
-                        ),
-                        "AICPU AllGather",
-                    )
-                ready.record(self.stream)
-
-    def gather_current(self, layer_id, value, *, width, total_rows):
-        """Start an incremental gather immediately after this plane's producer.
-
-        Both phases use the same communication stream. Complete aligned pages
-        are read directly from this receive region; only boundary pages need
-        stitching into the historical page layout.
-        """
-        if (
-            layer_id != self.layer_id
-            or self._sources is None
-            or width not in (128, 576)
-            or (width == 128 and not self._has_index)
-        ):
-            raise RuntimeError("DSA Prefill current gather has no matching layer")
-        if self._started[width] or not 0 <= total_rows <= self.max_current_rows:
-            raise ValueError(
-                "DSA Prefill current gather is repeated or exceeds capacity"
-            )
-        local_count = total_rows // self.degree + (self.rank < total_rows % self.degree)
-        if (
-            value.device != self.device
-            or value.dtype != torch.bfloat16
-            or not value.is_contiguous()
-            or value.numel() != local_count * width
-        ):
-            raise ValueError(
-                "Current DSA keys must contain only this rank's token rows"
-            )
-        send_rows = ((total_rows + self.degree * 128 - 1) // (self.degree * 128)) * 128
-        if any(self._started.values()) and total_rows != self._current_rows:
-            raise ValueError("DSA Prefill key planes disagree on current-token count")
-        self._current_rows, self._send_rows = total_rows, send_rows
-        target = self.index if width == 128 else self.kv
-        receive = target[
-            self.history_rows : self.history_rows + self.degree * send_rows
-        ]
-        producer = self.index_produced if width == 128 else self.kv_produced
-        ready = self.index_current_ready if width == 128 else self.kv_current_ready
-        source = value.view(-1, width)
-        compute = torch.npu.current_stream(self.device)
-        if local_count != send_rows:
-            padded = (self.send_index if width == 128 else self.send_kv)[:send_rows]
-            padded.zero_()
-            padded[:local_count].copy_(source)
-            source = padded
-        producer.record(compute)
-        with torch.npu.stream(self.stream):
-            self.stream.wait_event(producer)
-            for tensor in (value, source, target):
-                tensor.record_stream(self.stream)
-            if send_rows:
-                if self.degree == 1:
-                    receive.copy_(source)
-                else:
-                    self._check(
-                        self.lib.DsaCpAllGather(
-                            self.comm,
-                            self.stream.npu_stream,
-                            source.data_ptr(),
-                            receive.data_ptr(),
-                            source.numel(),
-                        ),
-                        "current AICPU AllGather",
-                    )
-            ready.record(self.stream)
-        self._started[width] = True
-
-    def patch(
-        self,
-        layer_id,
-        slots,
-        direct,
-        *,
-        slots_workspace,
-        mapped_slots=None,
-        width,
-        block_rows,
-        virtual_blocks,
-    ):
-        """Commit rows using caller-owned, main-stream int64 slot scratch.
-
-        ``slots_workspace`` must hold at least ``slots.numel()`` entries and
-        remain alive until the compute stream consumes the native commit.
-        """
-        if (
-            layer_id != self.layer_id
-            or self._sources is None
-            or not self._started[width]
-        ):
-            raise RuntimeError("DSA Prefill update has no matching current gather")
-        if (
-            slots.dtype not in (torch.int32, torch.int64)
-            or not slots.is_contiguous()
-            or slots.device != self.device
-            or slots.numel() != self._current_rows
-            or direct.dtype != torch.uint8
-            or not direct.is_contiguous()
-            or direct.device != self.device
-            or direct.numel() != slots.numel()
-            or slots_workspace.dtype != torch.int64
-            or slots_workspace.device != self.device
-            or not slots_workspace.is_contiguous()
-            or slots_workspace.numel() < slots.numel()
-            or block_rows <= 0
-            or self.local_rows % block_rows
-        ):
-            raise ValueError("DSA Prefill update has incompatible slots or layout")
-        if self._bounded_history and (
-            mapped_slots is None
-            or mapped_slots.dtype != torch.int64
-            or mapped_slots.device != self.device
-            or not mapped_slots.is_contiguous()
-            or mapped_slots.numel() != slots.numel()
-        ):
-            raise ValueError(
-                "Bounded Prefill commit needs matching compact write slots"
-            )
-        self._patch_slots = mapped_slots
-        # The router publishes int32 slots; the native transport ABI reads int64.
-        committed_slots = slots_workspace[: slots.numel()]
-        committed_slots.copy_(slots)
-        slots = committed_slots
-        stream = torch.npu.current_stream(self.device)
-        target, cache, ready = (
-            (self.index, self._sources[1], self.index_current_ready)
-            if width == 128
-            else (self.kv, self._sources[0], self.kv_current_ready)
-        )
-        # The communication stream already orders history before current.
-        stream.wait_event(ready)
-        for tensor in (slots, direct, target, cache):
-            tensor.record_stream(stream)
-        if mapped_slots is not None:
-            mapped_slots.record_stream(stream)
-        self._check(
-            (
-                self.lib.DsaCpPatchMapped
-                if self._bounded_history
-                else self.lib.DsaCpPatch
-            )(
-                stream.npu_stream,
-                target[self.history_rows :].data_ptr(),
-                slots.data_ptr(),
-                cache.data_ptr(),
-                target.data_ptr(),
-                direct.data_ptr(),
-                *([mapped_slots.data_ptr()] if self._bounded_history else []),
-                slots.numel(),
-                self.local_rows,
-                virtual_blocks,
-                self._send_rows,
-                *([self.history_rows] if self._bounded_history else []),
-                block_rows,
-                self.degree,
-                self.rank,
-                width,
-            ),
-            "current-row commit",
-        )
-        return target
-
-    def finish(self, layer_id):
-        """Release the workspace after SFA, ordered by a device event."""
-        if self.layer_id != layer_id:
-            raise RuntimeError("DSA Prefill completion differs from its active layer")
-        self.consumed.record(torch.npu.current_stream(self.device))
-        self._consumed_recorded = True
-        self.layer_id = None
-        self._sources = None
-
-    def close(self):
-        """Drain owned work and release the communicator at shutdown."""
-        if self._closed:
-            return
-        torch.npu.current_stream(self.device).synchronize()
-        self.stream.synchronize()
-        if self.comm.value:
-            self._check(self.lib.DsaCpDestroyComm(self.comm), "destroy communicator")
-            self.comm = C.c_void_p()
-        self._closed = True

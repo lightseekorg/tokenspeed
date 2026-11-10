@@ -101,6 +101,23 @@ def infer_multimodal_encoder_dtype(model: torch.nn.Module) -> str | None:
     return None
 
 
+def validate_output_vocabulary(model: torch.nn.Module, vocab_size: int) -> None:
+    """Check the loaded target's logical logits width before allocating samplers."""
+    # Models without logits (encoder workers and intermediate PP stages) have
+    # no output vocabulary. Inspect the model interface, not padded/sharded weights.
+    processor = getattr(model, "logits_processor", None)
+    if processor is None:
+        return
+    actual = processor.config.vocab_size
+    if actual != vocab_size:
+        raise ValueError(
+            f"{type(model).__name__} produces a logical output vocabulary of "
+            f"{actual}, but the runtime vocab_size is {vocab_size}. "
+            "The model must construct its output head and logits processor "
+            "with the checkpoint's output_vocab_size."
+        )
+
+
 class ModelRunner:
     def __init__(
         self,
@@ -229,6 +246,8 @@ class ModelRunner:
             checkpoint_load_group=self.checkpoint_load_group,
             is_draft_worker=self.is_draft_worker,
         )
+        if not self.is_draft_worker:
+            validate_output_vocabulary(self.model, self.model_config.vocab_size)
         self._model_forward_accepts_spec_step_idx = self._forward_accepts_kwarg(
             self.model, "spec_step_idx"
         )
@@ -327,7 +346,6 @@ class ModelRunner:
         input_embeds: torch.Tensor | None = None,
         multimodal_context: MultimodalForwardContext | None = None,
         spec_step_idx: int | None = None,
-        kv_sync_event: "torch.cuda.Event | None" = None,
         pp_inbound=None,
         **kwargs,
     ) -> LogitsProcessorOutput:
@@ -343,8 +361,6 @@ class ModelRunner:
             kwargs["multimodal_context"] = multimodal_context
         if spec_step_idx is not None and self.forward_accepts_spec_step_idx:
             kwargs["spec_step_idx"] = spec_step_idx
-        if kv_sync_event is not None:
-            kwargs["kv_sync_event"] = kv_sync_event
 
         return self.model.forward(
             ctx,
@@ -486,7 +502,12 @@ class ModelRunner:
             return False, str(e)
 
     def update_weights_from_mooncake(
-        self, version: int, models: list[torch.nn.Module], *, require_complete: bool
+        self,
+        version: int,
+        models: list[torch.nn.Module],
+        *,
+        require_complete: bool,
+        snapshot: dict | None = None,
     ) -> tuple[bool, str]:
         """Read one committed weight-store version into ``models`` in place.
 
@@ -502,6 +523,7 @@ class ModelRunner:
                 ``--model-update-draft-weights`` is ``refresh``.
             require_complete: Validate the entire canonical source inventory;
                 required whenever old model weights were discarded.
+            snapshot: Optional SDK publication directory for this version.
 
         Returns:
             ``(ok, message)`` for the control plane.
@@ -519,7 +541,7 @@ class ModelRunner:
                     "gloo", self.mapping.world_group
                 ),
             ):
-                result = self.model_update.update(models, version)
+                result = self.model_update.update(models, version, snapshot=snapshot)
             torch.cuda.synchronize(torch.device(f"cuda:{self.gpu_id}"))
             return True, f"applied model version {version}: {result}"
         except Exception as e:  # noqa: BLE001 - surface to the control plane

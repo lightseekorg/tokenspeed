@@ -30,6 +30,7 @@ from tokenspeed_kernel.ops.attention.gdn import (
     GDN_TREE_VERIFY_CHUNKED_MAX_NODES,
     gdn_chain_verify_supported,
 )
+from tokenspeed_kernel.ops.tuning import is_warming_up
 from tokenspeed_kernel.platform import pdl_enabled
 
 
@@ -311,7 +312,7 @@ def launch_gdn_chain_verify(
     if B == 0:
         return o
     enable_pdl = pdl_enabled()
-    gdn_chain_verify_kernel[(triton.cdiv(V, BV), B, HV)](
+    args = (
         q,
         k,
         v,
@@ -330,18 +331,43 @@ def launch_gdn_chain_verify(
         a.stride(1),
         b.stride(1),
         initial_state.stride(0),
+    )
+    common = dict(
         H=H,
         HV=HV,
         K=K,
         V=V,
-        BV=BV,
         BS=BS,
         LOG2_BS=BS.bit_length() - 1,
-        BK=K // nk,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm,
         ENABLE_PDL=enable_pdl,
+        **({"launch_pdl": True} if enable_pdl else {}),
+    )
+    if is_warming_up():
+        # Compile every reachable tier using the actual operand types, pointer
+        # alignment and strides. Warmup does not launch or touch caller buffers.
+        batches = {
+            max(1, triton.cdiv(min_heads, HV))
+            for min_heads, *_ in _CHAIN_VERIFY_LAUNCH_TIERS[BS]
+        }
+        for batch in gdn_chain_verify_warm_batch_sizes(sorted(batches), HV, T):
+            warm_cfg = gdn_chain_verify_launch(batch, HV, T)
+            warm_bv = min(warm_cfg["block_v"], V)
+            gdn_chain_verify_kernel.warmup(
+                *args,
+                **common,
+                BV=warm_bv,
+                BK=K // warm_cfg["nk"],
+                num_warps=warm_cfg["num_warps"],
+                num_stages=warm_cfg["num_stages"],
+                grid=(triton.cdiv(V, warm_bv), B, HV),
+            )
+    gdn_chain_verify_kernel[(triton.cdiv(V, BV), B, HV)](
+        *args,
+        **common,
+        BV=BV,
+        BK=K // nk,
         num_warps=cfg["num_warps"],
         num_stages=cfg["num_stages"],
-        **({"launch_pdl": True} if enable_pdl else {}),
     )
     return o

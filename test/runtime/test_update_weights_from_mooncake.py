@@ -104,19 +104,21 @@ def _executor(*, draft_policy, with_draft: bool):
         ("refresh", False, ["target"]),
     ],
 )
+@pytest.mark.parametrize("snapshot", [None, {"version": 3, "publishers": []}])
 def test_device_dispatches_the_model_list_by_draft_policy(
-    draft_policy, with_draft, expected
+    draft_policy, with_draft, expected, snapshot
 ):
     executor = _executor(draft_policy=draft_policy, with_draft=with_draft)
     handle = DeviceHandle(executor)
     req = _mooncake_req(3)
+    req.snapshot = snapshot
 
     assert handle.update_weights(req) == (True, "applied")
 
     (call,) = executor.model_runner.update_weights_from_mooncake.call_args_list
     version, models = call.args
     assert version == 3
-    assert call.kwargs == {"require_complete": False}
+    assert call.kwargs == {"require_complete": False, "snapshot": snapshot}
     assert [model.name for model in models] == expected
     if with_draft:
         executor.drafter.on_target_weights_updated.assert_called_once_with()
@@ -255,6 +257,38 @@ def test_adapter_reports_a_missing_sdk_module_clearly():
     adapter = _adapter(module="definitely_not_installed_sdk")
     with pytest.raises(ImportError, match="--model-update-sdk-module"):
         adapter.update([mock.MagicMock()], 1)
+
+
+def test_adapter_forwards_snapshot_metadata_to_the_selected_sdk(sdk):
+    class SnapshotUpdater:
+        def __init__(self):
+            self.received = None
+
+        def update_weights(self, models, *, version, snapshot):
+            self.received = (models, version, snapshot)
+            return "loaded"
+
+    updater = SnapshotUpdater()
+    adapter = _adapter()
+    adapter._updater = updater
+    models = []
+    snapshot = {"version": 7, "publishers": [{"offset": (1 << 63) + 99}]}
+    assert adapter.update(models, 7, snapshot=snapshot) == "loaded"
+    assert updater.received == (models, 7, snapshot)
+    assert updater.received[2] is snapshot
+
+
+def test_adapter_rejects_non_dictionary_snapshot_before_creating_the_sdk(sdk):
+    adapter = _adapter()
+    with pytest.raises(TypeError, match="snapshot must be a dictionary"):
+        adapter.update([], 7, snapshot=[])
+    assert sdk.stores == []
+
+
+def test_version_only_sdk_cannot_silently_ignore_explicit_snapshot(sdk):
+    adapter = _adapter()
+    with pytest.raises(TypeError, match="snapshot"):
+        adapter.update([], 7, snapshot={"version": 7})
 
 
 def test_adapter_rejects_an_unknown_engine_type(sdk):
@@ -485,6 +519,51 @@ def test_discarded_device_waits_for_global_commit_before_kv_wake(sdk, monkeypatc
     handle.before_kv_resume()
     state.require_usable()
     assert sdk.updates[0][1] == 11
+
+
+@pytest.mark.parametrize("fail_load", [False, True])
+def test_snapshot_update_obeys_the_discard_commit_boundary(sdk, monkeypatch, fail_load):
+    snapshot = {"version": 11, "zlib_base64": "opaque-publication-directory"}
+
+    class SnapshotUpdater:
+        def update_weights(self, models, *, version, snapshot):
+            if snapshot != {
+                "version": version,
+                "zlib_base64": "opaque-publication-directory",
+            }:
+                raise ValueError("publication metadata was changed")
+            if fail_load:
+                raise RuntimeError("snapshot store unavailable")
+            for model in models:
+                model.load_weights([("a", torch.tensor([2.0]))])
+                model.load_weights([("b", torch.tensor([3.0]))])
+            return "loaded snapshot"
+
+    monkeypatch.setattr(
+        sdk, "make_model_updater", lambda config, *, weight_store: SnapshotUpdater()
+    )
+    handle, state, model = _discard_device(monkeypatch)
+    address = model.a.data_ptr()
+    _lose_weight_pages(state, model)
+    state.resume(lambda: None)
+    request = _mooncake_req(11)
+    request.snapshot = snapshot
+
+    success, message = handle.update_weights(request)
+    assert success is not fail_load, message
+    with pytest.raises(RuntimeError, match="restart" if fail_load else "unavailable"):
+        handle.before_kv_resume()
+    handle.commit_weight_update(success)
+    if fail_load:
+        assert "snapshot store unavailable" in message
+        with pytest.raises(RuntimeError, match="restart"):
+            handle.before_kv_resume()
+    else:
+        handle.before_kv_resume()
+        state.require_usable()
+        assert (model.a.item(), model.b.item(), model.total.item()) == (2, 3, 5)
+        assert model.constant.item() == 7
+        assert model.a.data_ptr() == address
 
 
 @pytest.mark.parametrize("remote_failure", [False, True])

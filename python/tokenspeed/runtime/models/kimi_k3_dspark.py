@@ -67,7 +67,7 @@ from tokenspeed.runtime.models.deepseek_v3 import (
     DeepseekV3AttentionMLA,
     absorb_mla_kv_b_proj,
 )
-from tokenspeed.runtime.models.dflash import DFlashMLP
+from tokenspeed.runtime.models.dflash import DFlashDecoderLayer
 from tokenspeed.runtime.models.dspark import VanillaMarkov
 from tokenspeed.runtime.models.target_capture import TargetCaptureConfigurator
 from tokenspeed.runtime.utils import add_prefix, get_colorful_logger
@@ -202,7 +202,7 @@ class K3DSparkAttention(DeepseekV3AttentionMLA):
         return latent
 
 
-class K3DSparkDecoderLayer(nn.Module):
+class K3DSparkDecoderLayer(DFlashDecoderLayer):
     def __init__(
         self,
         config,
@@ -211,36 +211,7 @@ class K3DSparkDecoderLayer(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
-        super().__init__()
-        hidden_size = int(config.hidden_size)
-        eps = float(config.rms_norm_eps)
-        self.mapping = mapping
-        self.input_layernorm = RMSNorm(hidden_size, eps=eps)
-        self.self_attn = K3DSparkAttention(
-            config=config,
-            mapping=mapping,
-            hidden_size=hidden_size,
-            num_heads=int(config.num_attention_heads),
-            qk_nope_head_dim=int(config.qk_nope_head_dim),
-            qk_rope_head_dim=int(config.qk_rope_head_dim),
-            v_head_dim=int(config.v_head_dim),
-            q_lora_rank=int(config.q_lora_rank),
-            kv_lora_rank=int(config.kv_lora_rank),
-            rope_theta=config.resolved_rope_theta(),
-            rope_scaling=config.rope_scaling_dict(),
-            max_position_embeddings=int(config.max_position_embeddings),
-            quant_config=quant_config,
-            layer_id=layer_id,
-            prefix=add_prefix("self_attn", prefix),
-        )
-        self.layer_id = layer_id
-        self.post_attention_layernorm = RMSNorm(hidden_size, eps=eps)
-        self.mlp = DFlashMLP(
-            config=config,
-            mapping=mapping,
-            quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
-        )
+        super().__init__(config, mapping, layer_id, quant_config, prefix)
         # o_proj and down_proj both leave their row-parallel output un-reduced;
         # the next norm reduces it, fused where the token count allows.
         self.self_attn.o_proj.reduce_results = False
@@ -253,6 +224,26 @@ class K3DSparkDecoderLayer(nn.Module):
             input_layernorm=self.input_layernorm,
             post_attn_layernorm=self.post_attention_layernorm,
             query_sharded=False,
+        )
+
+    def resolve_attn(self, prefix: str) -> nn.Module:
+        config = self.config
+        return K3DSparkAttention(
+            config=config,
+            mapping=self.mapping,
+            hidden_size=int(config.hidden_size),
+            num_heads=int(config.num_attention_heads),
+            qk_nope_head_dim=int(config.qk_nope_head_dim),
+            qk_rope_head_dim=int(config.qk_rope_head_dim),
+            v_head_dim=int(config.v_head_dim),
+            q_lora_rank=int(config.q_lora_rank),
+            kv_lora_rank=int(config.kv_lora_rank),
+            rope_theta=config.resolved_rope_theta(),
+            rope_scaling=config.rope_scaling_dict(),
+            max_position_embeddings=int(config.max_position_embeddings),
+            quant_config=self.quant_config,
+            layer_id=self.layer_id,
+            prefix=prefix,
         )
 
     def forward(
@@ -553,7 +544,6 @@ class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
         positions: torch.Tensor,
         input_lengths: torch.Tensor | None = None,
         input_embeds: torch.Tensor | None = None,
-        kv_sync_event=None,
         **kwargs,
     ) -> LogitsProcessorOutput:
         if input_embeds is None:
@@ -575,9 +565,6 @@ class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
         # A zero residual rather than None: the drafter hands over an un-reduced
         # embedding, so the first layer must take the all-reduce path too.
         residual = torch.zeros_like(hidden_states)
-
-        if kv_sync_event is not None:
-            torch.cuda.current_stream().wait_event(kv_sync_event)
 
         for layer in self.layers:
             hidden_states, residual = layer(

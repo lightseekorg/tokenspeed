@@ -104,6 +104,8 @@ class MLADecodeMetadata:
     # kernel needs none); the dense leaf itself never reads them.
     _dsa_seq_lens_2d: torch.Tensor | None = None
     _dsa_plan: object | None = None
+    # Per-token causal KV lengths ([bs * spec_num_tokens] int32) for sparse decode.
+    _dsa_kv_seq_lens: torch.Tensor | None = None
 
     @property
     def seq_lens_k(self) -> torch.Tensor:
@@ -138,6 +140,12 @@ class MLAAttnBackend(PagedAttentionBackend):
         # seq_len, so every block query sees the whole block including its own
         # future. Target verify and ordinary decode are untouched.
         self.draft_block_decode = bool(config.draft_block_decode)
+        if config.draft_block_causal:
+            raise NotImplementedError(
+                f"{type(self).__name__} attends a draft block as a whole; a causal "
+                "block draft (Kimi-K3.1 DSpark) needs --drafter-attention-backend "
+                "tokenspeed_mla"
+            )
 
         backend_name = spec.backend_name or "mla"
         self.kernel_solution = {"mla": None, "gluon": "gluon"}[backend_name]
@@ -355,12 +363,16 @@ class MLAAttnBackend(PagedAttentionBackend):
             cum_seq_lens_kv = torch.zeros_like(cum_extend_seq_lens)
             torch.cumsum(seq_lens, dim=0, out=cum_seq_lens_kv[1:])
 
+        # The host chunk boundaries only feed the distributed prefix-history
+        # gather (KVP), which this backend does not support: it reads every
+        # history row from its own pool, so the boundaries are not needed here.
         (
             chunked_loop_num,
             chunk_kv_indices_list,
             chunked_seq_len,
             cu_chunked_seq_len,
             max_chunk_len_per_loop,
+            _chunk_bounds_cpu,
         ) = build_chunked_prefill_metadata_arrays(
             extend_prefix_lens,
             extend_prefix_lens_cpu,

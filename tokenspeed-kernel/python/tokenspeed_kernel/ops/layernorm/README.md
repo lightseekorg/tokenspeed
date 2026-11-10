@@ -38,7 +38,7 @@ CUDA-graph capture).
 | kernel | solution / band | admits | body |
 | --- | --- | --- | --- |
 | `torch_qk_rmsnorm_ssmax` | `torch`, PORTABLE | every shape of the BF16 q/k/weights x int32/int64 positions signatures, any device the shared kernel runs on | `BeamRMSNorm.forward` for `residual=None, out=None` on the q heads and on the k heads (the same `rmsnorm(...)` call with the module's weight and eps), then the three statements of `apply_ssmax_root10` with Beam's constants -- the NoPE branch transcribed; 2-D views of the fresh 3-D tensors |
-| `triton_fused_qk_rmsnorm_ssmax` | `triton`, SPECIALIZED, NVIDIA SM90 to SM103 | traits `tokens_min {1}`, `head_dim {128}`, `heads {(48, 8), (6, 1)}`, `ndim {2}`, `unit_stride`, `rows_disjoint`, `weights_contiguous`, `positions_contiguous`, `eps_ok`, `is_cuda`: BF16 rank-2 `q`/`k` with a contiguous last axis and token strides covering the row (Beam's `qkv.split` column views or contiguous), the pair `(48, 8)` or `(6, 1)`, contiguous BF16 `[128]` weights, contiguous int32/int64 `[tokens]` positions, a finite positive `eps`, `tokens > 0`, every tensor on one CUDA device; a by-name call outside them raises (`qk_rmsnorm_ssmax_rejection`) | `qk_rmsnorm(q, k, q_weight, k_weight, eps, weight_offset=0.0, ssmax_positions=positions)`: one launch of `_fused_qk_rmsnorm_kernel` with `ROUND_AFTER_AFFINE=True, SSMAX_INKERNEL=True` |
+| `triton_fused_qk_rmsnorm_ssmax` | `triton`, SPECIALIZED, NVIDIA SM90 to SM103 | traits `tokens_min {1}`, `head_dim {128}`, `heads {(48, 8), (24, 4), (12, 2), (6, 1)}`, `ndim {2}`, `unit_stride`, `rows_disjoint`, `weights_contiguous`, `positions_contiguous`, `eps_ok`, `is_cuda`: BF16 rank-2 `q`/`k` with a contiguous last axis and token strides covering the row (Beam's `qkv.split` column views or contiguous), the pair `(48, 8)`, `(24, 4)`, `(12, 2)`, or `(6, 1)`, contiguous BF16 `[128]` weights, contiguous int32/int64 `[tokens]` positions, a finite positive `eps`, `tokens > 0`, every tensor on one CUDA device; a by-name call outside them raises (`qk_rmsnorm_ssmax_rejection`) | `qk_rmsnorm(q, k, q_weight, k_weight, eps, weight_offset=0.0, ssmax_positions=positions)`: one launch of `_fused_qk_rmsnorm_kernel` with `ROUND_AFTER_AFFINE=True, SSMAX_INKERNEL=True` |
 
 The keyword `ssmax_positions` of `triton.qk_rmsnorm` (default `None`) maps to
 the two kernel constexprs `ROUND_AFTER_AFFINE` and `SSMAX_INKERNEL` (last,
@@ -59,8 +59,8 @@ safety of the in-kernel load); the operator guard states the full admission.
 The admission of the Triton kernel is declared twice on purpose: as spec traits
 and a capability for ranked selection, and as the host guard for a by-name
 override. The selection is a real choice on SM100 to SM103: the fused kernel
-serves the per-rank head pairs `(48, 8)` (TP1) and `(6, 1)` (TP8); other tensor
-parallel sizes (TP2, TP4, TP16) keep the torch kernel.
+serves the per-rank head pairs `(48, 8)` (TP1), `(24, 4)` (TP2), `(12, 2)`
+(TP4), and `(6, 1)` (TP8); TP16 keeps the torch kernel.
 
 The fused kernel's scale equals Torch's CUDA result bit for bit on every position
 of `[0, 2^20]` for int32 and int64 positions (measured, zero mismatches), and the
@@ -69,3 +69,19 @@ two kernels agree byte for byte on `q_out` and `k_out`. Tests:
 `test/nvidia/ops/layernorm/test_beam_norms_cuda.py` (NVIDIA SM90 to SM103: the
 bytes). No
 timing claim is made for the fused kernel in this record.
+
+## `layernorm.gemma_rmsnorm` operator
+
+`gemma_rmsnorm(x, weight, eps, residual=None)` is `GemmaRMSNorm.forward`: the
+norm scaled by `1 + weight` in FP32, and with `residual` the fused add that
+normalizes the FP32 sum, writes the norm into `x` and the rounded sum into
+`residual`, and returns both. The facade selects by the dtype of `x` and calls
+the kernel with `(x, weight, eps, residual)`.
+
+| kernel | solution / band | admits | body |
+| --- | --- | --- | --- |
+| `flashinfer_gemma_rmsnorm` | `flashinfer`, PERFORMANT, NVIDIA | BF16, FP16 | FlashInfer's `gemma_rmsnorm` / `gemma_fused_add_rmsnorm` |
+| `triton_gemma_rmsnorm` | `triton`, PORTABLE | BF16, FP16, FP32 | `grouped_gemma_rmsnorm` with one group per row / `add_rmsnorm(gemma=True)` on `[rows, N]` views (strided column slices stay views) |
+
+Tests: `test/ops/test_layernorm.py` (both kernels, and no recompilation of the
+Triton kernels across batch sizes).

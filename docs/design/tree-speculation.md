@@ -66,10 +66,12 @@ over the `(S - 1) * K`-key lane window (below). There is no size-dependent
 second path.
 
 The `mha` leaf (the AMD path) runs the same cascade with a portable prefix
-half: the Triton extend, causal over `q_len = R` rows with its log-sum-exp
-(scaled to base 2 for the merge). It is pinned to Triton because its causal
-mask keeps row `r` at key `P - R + r` even when `P < R`, which the window
-kernel's merge assumes.
+half: the Triton decode, causal over `q_len = R` rows with its log-sum-exp
+(scaled to base 2 for the merge). It folds a request's `R` rows and the query
+heads of each KV head into one program per key split, so the prefix keys are
+read once per request rather than once per row. It is pinned to Triton
+because its causal mask keeps row `r` at key `P - R + r` even when `P < R`,
+which the window kernel's merge assumes.
 
 Lanes that carry per-row tables (`TreeCascadeRows.row_page_table`) let a
 sliding-window draft layer see in every lane row the window frozen at the
@@ -116,9 +118,26 @@ never writes the state pool. The verify runs a GDN tree of 8 to 16 nodes
 the chunked form of the delta rule, every node at once with the ancestor mask
 in place of the causal one, and keeps no node states; it also writes each
 node's replay payload row (`[k | v | a | b]`) as it reads them, so that verify
-skips the q/k/v split. In other
-trees the state of every branch point (a node with a child other than the next
-node) goes to one workspace shared by all layers
+skips the q/k/v split.
+On supported NVIDIA geometry, the kernel registry prefers the CuTe DSL WY leaf
+for short chains and 8–16-node output-only trees. Head dimensions, token count,
+output-only execution and tree support are selection traits shared by runtime
+capability queries and the actual verify call; the runtime does not choose a
+WY-specific solution. It computes the same operation with native TF32 MMA and
+can fill the same replay payload; state ownership and replay commit stay the
+same. Chains and trees enter through `gdn_decode_mtp`; the runtime passes no
+ancestor mask for a chain. The kernel package owns selection between CuTe WY,
+the Triton chunked chain and general MTP, including any one-path mask used
+internally by the fallback. Capability queries use that same selection
+contract, including the pool's state dtype. Selected implementations prepare
+their finite compilation variants during the normal startup forward under
+`kernel_warmup`; the runtime neither dispatches a vendor solution nor builds
+special warmup launches. Unsupported geometry or platforms use normal registry
+fallback. Automatic BF16 state writes require the kernel package's
+`padding_safe` capability; read-only verify leaves the
+null page untouched and ignores padded outputs. In other trees the state of
+every branch point (a node with a child other than the next node) goes to one
+workspace shared by all layers
 (`gdn_decode_mtp(intermediate_states_buffer=...)`, one layer's worth per node),
 and a branch reloads its parent from there. Mamba2 has no such workspace: its
 elementwise update lets a branch replay the parent's ancestors over the read
@@ -210,6 +229,17 @@ The flashinfer backend instead accepts every tree by recursive rejection
 sampling (`TreeRejectionSampler`), against the draft q that drew a sampled
 node's children (`RuntimeStates.future_draft_q`), exact in distribution rather
 than the plain-decoding draw.
+The Triton backend's chain verify (DFLASH with a DFlash2 draft under
+`--enable-speculative-sampling`) gives up the plain-decoding draw the same way
+for rows that carry a recorded q (`future_draft_q`, chain layout: node `i`
+reads slot `i - 1`): it accepts by rejection sampling against the filtered
+target and resamples from the residual, so the accepted token is an exact
+sample from the same distribution but not the token plain decoding draws there.
+Its random streams stay disjoint: the residual and bonus draws reuse the plain
+stream's position keys, while the walk's draft noise and the accept coins
+use their own salted offsets. Greedy rows, rows without a q (slot `-1`) and
+routes without an exact filtered distribution (top-p only, mixed batches)
+keep the plain-decoding draw.
 Backends that can do neither keep `supports_tree_verify = False` and the
 executor refuses tree drafting with them at startup.
 

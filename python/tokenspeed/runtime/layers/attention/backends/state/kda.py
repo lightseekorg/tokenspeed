@@ -32,6 +32,7 @@ from tokenspeed_kernel.ops.attention.gdn import GdnStateCheckpoints
 from tokenspeed_kernel.ops.attention.kda import (
     KdaPrefillCapacity,
     KdaReplayRecords,
+    kda_fused_paged_verify_fuses_producers,
     kda_fused_paged_verify_uses_split_producers,
     kda_paged_decode,
     kda_paged_prefill,
@@ -69,7 +70,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 
 
-KDA_PREFILL_BACKENDS = ("auto", "fla", "flashkda", "cutedsl_kda")
+KDA_PREFILL_BACKENDS = ("auto", "fla", "flashkda", "cutedsl_kda", "cudnn")
 
 
 def resolve_kda_backend(kda_backend: str) -> str:
@@ -107,6 +108,13 @@ def resolve_kda_backend(kda_backend: str) -> str:
         raise ValueError(
             "--kda-backend cutedsl_kda requires an NVIDIA sm_100 or sm_103 device"
         )
+    if kda_backend == "cudnn":
+        from tokenspeed_kernel.ops.attention.kda.cudnn import cudnn_kda_supported
+
+        if not cudnn_kda_supported():
+            raise ValueError(
+                "--kda-backend cudnn requires an NVIDIA sm_100 or sm_103 device"
+            )
     return kda_backend
 
 
@@ -179,8 +187,19 @@ class KdaAttnBackend(CapacityPrefillBackend):
             "platform-selected kernels",
         )
 
+    @override
+    def _prefill_state_dtype(self, cache_dtype: torch.dtype) -> torch.dtype:
+        return torch.float32
+
+    @override
+    def _prefill_supports_strided_qkv(self) -> bool:
+        return self.kda_backend == "cudnn"
+
     def _admits_capacity_prefill(self) -> bool:
-        return self._prefill_graph_enabled and self.kda_backend == "cutedsl_kda"
+        return self._prefill_graph_enabled and self.kda_backend in (
+            "cutedsl_kda",
+            "cudnn",
+        )
 
     def _reset_replay_state(self) -> None:
         self._verify_producer_stream: torch.cuda.Stream | None = None
@@ -836,8 +855,20 @@ class KdaAttnBackend(CapacityPrefillBackend):
             qkv, f_a, beta, gate = self._replay_payload(layer_id)
             rows = batch_size * draft_token_num
             heads = value_dim // attn_tp_size // head_v_dim
+            # One-token windows project the gate and convolve inside verify.
+            split = self._verify_split_producers and not (
+                g_raw is None
+                and bias is None
+                and kda_fused_paged_verify_fuses_producers(
+                    self.dtype,
+                    recurrent_layout=self.kda_recurrent_layout,
+                    num_heads=heads,
+                    head_dim=head_v_dim,
+                    draft_token_num=draft_token_num,
+                )
+            )
             split_producers = {}
-            if self._verify_split_producers:
+            if split:
                 fork = self._verify_producer_forks[layer_id]
                 with fork.scope(enable=True) as producer_fork:
                     with producer_fork.branch():
@@ -870,11 +901,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
             assert self._replay_record_metadata is not None
             assert self._replay_record_stamps is not None
             replay_records = KdaReplayRecords(
-                original_qkv=(
-                    None
-                    if self._verify_split_producers
-                    else qkv[:rows, : mixed_qkv.shape[-1]]
-                ),
+                original_qkv=None if split else qkv[:rows, : mixed_qkv.shape[-1]],
                 metadata=self._replay_record_metadata[:batch_size],
                 stamps=self._replay_record_stamps[
                     self._descriptor_row_by_layer[layer_id], :batch_size

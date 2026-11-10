@@ -77,6 +77,8 @@ def _is_sampling_backend_available(backend_name: str) -> bool:
         return True
     if backend_name == "triton_full":
         return True
+    if backend_name == "sonic":
+        return platform.is_nvidia
     if backend_name == "ascend_full":
         if not platform.is_npu:
             return False
@@ -97,17 +99,8 @@ def register_backend(name: str, cls: type[SamplingBackend]) -> None:
     _BACKEND_REGISTRY[name] = cls
 
 
-def create_sampling_backend(
-    server_args: ServerArgs,
-    *,
-    max_bs: int,
-    max_draft_tokens_per_req: int,
-    device: str,
-    random_seed: int = DEFAULT_RANDOM_SEED,
-    max_req_pool_size: int = 0,
-    vocab_size: int = 0,
-    tp_group: tuple[int, ...] | None = None,
-) -> SamplingBackend:
+def get_sampling_backend_class(server_args: ServerArgs) -> type[SamplingBackend]:
+    """Resolve the selected implementation and its admission capabilities."""
     # Trigger concrete-backend registration on first use.
     from tokenspeed.runtime.sampling.backends import flashinfer as _fi  # noqa: F401
     from tokenspeed.runtime.sampling.backends import (  # noqa: F401
@@ -116,6 +109,10 @@ def create_sampling_backend(
     from tokenspeed.runtime.sampling.backends import greedy as _g  # noqa: F401
     from tokenspeed.runtime.sampling.backends import triton as _t  # noqa: F401
     from tokenspeed.runtime.sampling.backends import triton_full as _tf  # noqa: F401
+
+    # sonic's kernels use NVIDIA's libdevice; other platforms never import them.
+    if current_platform().is_nvidia:
+        from tokenspeed.runtime.sampling.backends import sonic as _so  # noqa: F401
 
     name = _resolve_backend_name(server_args)
     if current_platform().is_npu and name == "ascend_full":
@@ -127,7 +124,21 @@ def create_sampling_backend(
         raise ValueError(
             f"Unknown sampling backend: {name!r}. Available: {list(_BACKEND_REGISTRY)}"
         )
-    cls = _BACKEND_REGISTRY[name]
+    return _BACKEND_REGISTRY[name]
+
+
+def create_sampling_backend(
+    server_args: ServerArgs,
+    *,
+    max_bs: int,
+    max_draft_tokens_per_req: int,
+    device: str,
+    random_seed: int = DEFAULT_RANDOM_SEED,
+    max_req_pool_size: int = 0,
+    vocab_size: int = 0,
+    tp_group: tuple[int, ...] | None = None,
+) -> SamplingBackend:
+    cls = get_sampling_backend_class(server_args)
 
     return cls(
         SamplingBackendConfig.from_server_args(

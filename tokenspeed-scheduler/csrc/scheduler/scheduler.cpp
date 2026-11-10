@@ -100,7 +100,8 @@ Scheduler::Scheduler(SchedulerConfig config)
                                    config_.enable_l3_storage, hostPoolBlocks(config_) > 0 ? &host_pool_ : nullptr,
                                    snapshotPoolBlocks(config_) > 0 ? &snapshot_pool_ : nullptr,
                                    config_.StreamsDeviceCacheToHost(),
-                                   config_.host_write_policy == SchedulerConfig::HostWritePolicy::kWriteBack)},
+                                   config_.host_write_policy == SchedulerConfig::HostWritePolicy::kWriteBack,
+                                   config_.CheckpointRetentionRequests(), config_.checkpoint_retention_leaf_distance)},
       tier_transfers_{coordinator_},
       storage_transfers_{config_.enable_l3_storage
                              ? std::make_unique<StorageTransferManager>(coordinator_, *config_.storage_config)
@@ -118,6 +119,18 @@ Scheduler::Scheduler(SchedulerConfig config)
         });
     }
 
+    // Validate requires in-forward checkpoints, and with them prefix caching,
+    // outside the D role, which computes no prompt; without a State group
+    // there is no checkpoint to demote.
+    bool has_state_group = false;
+    for (std::int32_t i = 0; i < coordinator_.NumGroups(); ++i) {
+        has_state_group = has_state_group || coordinator_.GroupIsState(static_cast<std::size_t>(i));
+    }
+    if (config_.demote_superseded_state_checkpoints && config_.role != Role::kD && has_state_group) {
+        checkpoint_lineage_.emplace();
+    }
+    coordinator_.SetCheckpointDemotion(checkpoint_lineage_.has_value());
+
     if (const char* level = std::getenv("SPDLOG_LEVEL")) {
         spdlog::set_level(spdlog::level::from_str(level));
     }
@@ -131,10 +144,11 @@ Request* Scheduler::findRequest(const std::string& request_id) {
 bool Scheduler::pdTransferInFlight(const Request& request) const {
     switch (config_.role) {
         case Role::kD:
-            return request.Is<fsm::RemotePrefilling>();
+            return request.IsAnyOf<fsm::RemotePrefilling, fsm::PdTransferring>();
         case Role::kP:
-            // Every page-holding state but Finishing: SucceededEvent moves a
-            // request there once the peer has read its pages.
+            // Every page-holding state but Finishing, PdTransferring
+            // included: SucceededEvent moves a request to Finishing once the
+            // peer has read its pages.
             return request.HoldsPages() && !request.Is<fsm::Finishing>();
         case Role::kFused:
             return false;
@@ -259,18 +273,19 @@ void Scheduler::registerKvEventPrefixPages(Request& request, std::span<const std
     }
     _assert(first_page >= 0 && static_cast<std::size_t>(first_page) <= prefix_hashes.size(),
             "KV event page range is invalid");
-    const std::vector<std::span<const std::int32_t>> token_pages = request.FullPrefixPages(false);
-    _assert(prefix_hashes.size() <= token_pages.size(), "KV event hashes exceed the request's complete pages");
+    const std::vector<std::span<const std::int32_t>> token_pages =
+        request.PrefixPages(first_page, static_cast<std::int32_t>(prefix_hashes.size()));
     const std::span<const std::uint64_t> block_hashes = request.KvEventBlockHashes(prefix_hashes.size());
 
     for (std::size_t i = static_cast<std::size_t>(first_page); i < prefix_hashes.size(); ++i) {
+        const std::span<const std::int32_t> tokens = token_pages[i - static_cast<std::size_t>(first_page)];
         CacheKey key{.content_hash = prefix_hashes[i]};
         const std::optional<std::uint64_t> parent_hash =
             i == 0 ? std::nullopt : std::optional<std::uint64_t>{block_hashes[i - 1]};
         KvBlockStoredEvent event{
             .block_hashes = {block_hashes[i]},
             .parent_block_hash = parent_hash,
-            .token_ids = std::vector<std::int32_t>(token_pages[i].begin(), token_pages[i].end()),
+            .token_ids = std::vector<std::int32_t>(tokens.begin(), tokens.end()),
             .block_size = config_.prefix_granularity,
         };
         const auto [it, inserted] = kv_event_boundaries_.try_emplace(
@@ -285,8 +300,60 @@ void Scheduler::registerKvEventPrefixPages(Request& request, std::span<const std
 
 void Scheduler::registerKvEventPublication(Request& request, std::span<const std::string> prefix_hashes,
                                            const CompletedPages& completed) {
-    registerKvEventPrefixPages(request, prefix_hashes, completed.first_new_prefix_page);
-    if (!config_.enable_kv_cache_events || !completed.tail) {
+    if (!config_.enable_kv_cache_events) {
+        return;
+    }
+    // Pages below the new ones keep their descriptors while the request's own
+    // published blocks hold them on the Device -- not after a restore brought
+    // the request back on unpublished copies -- so the range starts at the
+    // first page the publication registers an entry under.
+    registerKvEventPrefixPages(request, prefix_hashes, coordinator_.FirstPublishedPage(completed));
+    if (completed.tail) {
+        registerKvEventTail(request, prefix_hashes, *completed.tail);
+    }
+}
+
+std::vector<std::int32_t> Scheduler::kvEventTailsOf(const RetractionImage& image) const {
+    std::vector<std::int32_t> tails;
+    if (!config_.enable_kv_cache_events) {
+        return tails;
+    }
+    for (const ImageTable& table : image.tables) {
+        for (const ImageSlot& slot : table.slots) {
+            if (!slot.InHostCache()) {
+                continue;
+            }
+            // A published slot's boundary is on the Device, so it has its
+            // descriptor; one with fewer tokens than a page is a tail's.
+            const auto it = kv_event_boundaries_.find(eventKey(slot.key));
+            FatalCheck(it != kv_event_boundaries_.end(), "an imaged published slot has no KV event descriptor");
+            const auto tail_tokens = static_cast<std::int32_t>(it->second.stored.token_ids.size());
+            const std::int32_t boundary = it->second.depth * config_.prefix_granularity + tail_tokens;
+            if (tail_tokens < config_.prefix_granularity && std::ranges::find(tails, boundary) == tails.end()) {
+                tails.push_back(boundary);
+            }
+        }
+    }
+    return tails;
+}
+
+void Scheduler::registerKvEventRestore(Request& request, std::span<const std::string> prefix_hashes,
+                                       std::span<const std::int32_t> tails) {
+    registerKvEventPrefixPages(request, prefix_hashes, 0);
+    for (const std::int32_t boundary : tails) {
+        const auto full_pages = static_cast<std::size_t>(boundary / config_.prefix_granularity);
+        _assert(full_pages <= prefix_hashes.size(), "an imaged tail lies inside the request's computed pages");
+        const std::span<const std::string> pages = prefix_hashes.first(full_pages);
+        const std::optional<TailPublication> tail =
+            request.TailPublicationAt(boundary, pages.empty() ? std::string{} : pages.back());
+        _assert(tail.has_value(), "an imaged tail lies strictly inside a page");
+        registerKvEventTail(request, pages, *tail);
+    }
+}
+
+void Scheduler::registerKvEventTail(Request& request, std::span<const std::string> prefix_hashes,
+                                    const TailPublication& tail) {
+    if (!config_.enable_kv_cache_events) {
         return;
     }
     const auto full_pages = static_cast<std::int32_t>(prefix_hashes.size());
@@ -294,8 +361,8 @@ void Scheduler::registerKvEventPublication(Request& request, std::span<const std
     const std::optional<std::uint64_t> parent_hash =
         full_pages == 0 ? std::nullopt : std::optional<std::uint64_t>{block_hashes[full_pages - 1]};
     const std::span<const std::int32_t> tail_tokens =
-        request.TokenSlice(full_pages * config_.prefix_granularity, completed.tail->tail_tokens);
-    const CacheKey key{.content_hash = completed.tail->hash};
+        request.TokenSlice(full_pages * config_.prefix_granularity, tail.tail_tokens);
+    const CacheKey key{.content_hash = tail.hash};
     KvBlockStoredEvent event{
         .block_hashes = {HashKvBlock(tail_tokens, parent_hash)},
         .parent_block_hash = parent_hash,
@@ -395,6 +462,12 @@ std::size_t Scheduler::PrefillSize() const {
     }));
 }
 
+std::size_t Scheduler::RunningSize() const {
+    return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const std::unique_ptr<Request>& request) {
+        return request->IsAnyOf<fsm::Prefilling, fsm::PrefillAwaitingResult, fsm::PrefillDone, fsm::Decoding>();
+    }));
+}
+
 std::size_t Scheduler::RemotePrefillSize() const {
     return static_cast<std::size_t>(std::ranges::count_if(
         requests_, [](const std::unique_ptr<Request>& request) { return request->Is<fsm::RemotePrefilling>(); }));
@@ -420,6 +493,7 @@ std::int32_t Scheduler::ActiveLcmBlocks() const {
 HostCacheStats Scheduler::GetHostCacheStats() const {
     return HostCacheStats{
         .prefix_hits = prefix_hit_stats_,
+        .storage_query_hit_tokens = storage_transfers_ ? storage_transfers_->QueryHitTokens() : std::uint64_t{0},
         .publication_stores = tier_transfers_.WriteBackStatsFor(HostStoreCause::kPublication),
         .finish_stores = tier_transfers_.WriteBackStatsFor(HostStoreCause::kFinish),
         .retraction_stores = tier_transfers_.WriteBackStatsFor(HostStoreCause::kRetraction),
@@ -429,7 +503,9 @@ HostCacheStats Scheduler::GetHostCacheStats() const {
         .host_evictions = coordinator_.HostEvictions(),
         .store_candidates_dropped_by_flush = coordinator_.StoreCandidatesDroppedByFlush(),
         .dead_entries_not_written_back = coordinator_.DeadEntriesNotWrittenBack(),
+        .demoted_entries_not_written_back = coordinator_.DemotedEntriesNotWrittenBack(),
         .device_evictions = coordinator_.DeviceEvictions(),
+        .checkpoint_resume_gaps = coordinator_.CheckpointResumeGaps(),
     };
 }
 
@@ -476,7 +552,38 @@ std::vector<std::int64_t> Scheduler::AdmissionCapacityCurve(std::int32_t token_s
     return curve;
 }
 
-ExecutionPlan Scheduler::NextExecutionPlan() {
+Scheduler::PrefillGateProbe Scheduler::ProbePrefillGate() const {
+    PrefillGateProbe probe{.wants_prefill = false, .has_decode_work = false};
+    if (config_.role != Role::kFused) {
+        // Only the fused role has both kinds of work to choose between: a P
+        // node is all prefill and a D node's prompts are its peer's.
+        return probe;
+    }
+    bool pending_prefill = false;
+    bool resident_prefill = false;
+    for (const auto& request : requests_) {
+        // Storage preparation has not admitted Device pages yet. Resident
+        // chunks, however, must be able to consume their own reservations.
+        if (request->Is<fsm::Prefilling>()) {
+            resident_prefill = true;
+        } else if (request->IsAnyOf<fsm::Submitted, fsm::Prefetching>()) {
+            pending_prefill = true;
+        } else if (request->IsAnyOf<fsm::PrefillDone, fsm::Decoding>()) {
+            probe.has_decode_work = true;
+        }
+    }
+    probe.wants_prefill = resident_prefill || (pending_prefill && belowPrefillWatermark());
+    return probe;
+}
+
+bool Scheduler::belowPrefillWatermark() const {
+    const std::int32_t total_pages = coordinator_.TotalLcmBlocks();
+    const float used_ratio =
+        total_pages > 0 ? static_cast<float>(ActiveLcmBlocks()) / static_cast<float>(total_pages) : 0.0F;
+    return used_ratio <= kPrefillWatermark;
+}
+
+ExecutionPlan Scheduler::NextExecutionPlan(PlanOptions options) {
     std::vector<WriteBackOperation> write_back_operations = std::exchange(pending_write_back_operations_, {});
     // Dropping a finished request drops what it still holds elsewhere -- its
     // session's registration under its access epoch -- with it.
@@ -509,7 +616,7 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
     BuiltOperations built;
     bool builds_work = false;
     if (forward_allowed_) {
-        built = buildForwardOperations(plan, std::move(candidates), write_back_operations);
+        built = buildForwardOperations(plan, std::move(candidates), write_back_operations, options);
         builds_work = !built.forward.empty() || plan.remote_decode.has_value() || plan.remote_prefill.has_value();
         plan.With(ForwardBatch{std::move(built.forward)});
     }

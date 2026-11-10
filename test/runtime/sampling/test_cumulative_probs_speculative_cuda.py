@@ -181,7 +181,7 @@ def _reference_target_mass(logits, tokens):
     [
         ("batch", "torch", "auto"),
         ("per-request", "torch", "auto"),
-        ("per-request", "megatron", "rl-bitwise"),
+        ("per-request", "blockwise", "rl-bitwise"),
     ],
 )
 @pytest.mark.parametrize("use_graph", [False, True], ids=["eager", "cuda_graph"])

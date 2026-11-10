@@ -286,10 +286,11 @@ def test_an_eviction_store_is_stream_ordered_and_published_at_its_ack():
 def test_device_evictions_count_a_requests_own_reclaim_apart():
     """K3 shape on twelve Device parents, a block each, a page per chunk. a
     publishes two pages and its checkpoint at 4 (five parents); b resumes
-    there, its first chunk takes four parents more. b's second chunk rotates
-    a's checkpoint out of slot 0 and needs four parents with three free: its
-    own released checkpoint funds the fourth, counted as the request's
-    reclaim, not as an admission's victim."""
+    there, its first chunk takes four parents more. b's second chunk, its
+    prompt's last token, rotates a's checkpoint out of slot 0 and needs five
+    parents -- its page, a State slot per group and the copy-in block of its
+    prompt end at 7 -- with three free: its own released checkpoint funds the
+    rest, counted as the request's reclaim, not as an admission's victim."""
     cfg = _make_k3_config()
     cfg.num_device_pages = 13  # page 0 = null sentinel, 12 usable parents
     cfg.max_scheduled_tokens = PAGE
@@ -297,7 +298,7 @@ def test_device_evictions_count_a_requests_own_reclaim_apart():
         group.total_pages = cfg.num_device_pages
     scheduler = ts.Scheduler(cfg)
     a = list(range(1, 2 * PAGE + 1))
-    for rid, tokens in (("a", a), ("b", a + list(range(50, 50 + 2 * PAGE)))):
+    for rid, tokens in (("a", a), ("b", a + list(range(50, 50 + 2 * PAGE - 1)))):
         spec = _spec(rid, tokens)
         spec.max_new_tokens = 1
         scheduler.submit_requests([spec])
@@ -351,6 +352,7 @@ def test_host_cache_stats_count_publication_and_finish_stores():
         == fresh.eviction_stores.recopied
         == fresh.eviction_stores.cancelled
         == fresh.dead_entries_not_written_back
+        == fresh.demoted_entries_not_written_back
         == 0
     )
     assert (

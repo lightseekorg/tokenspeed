@@ -89,3 +89,38 @@ def test_the_envelope_imports_no_cutlass():
         elif isinstance(node, ast.ImportFrom):
             imported.add(node.module.split(".")[0])
     assert imported <= {"__future__", "torch"}
+
+
+ATTENTION_SERVED = dict(
+    projection_rows=6288,
+    o_proj_width=1536,
+    projection_dtype=torch.bfloat16,
+    o_proj_dtype=torch.bfloat16,
+)
+
+
+def _attention_supports(**overrides) -> bool:
+    from tokenspeed_kernel.ops.moe._cute_dsl.k3_decode_support import (
+        attention_supports,
+    )
+
+    return attention_supports(**{**ATTENTION_SERVED, **overrides})
+
+
+@pytest.mark.parametrize("rows", [6288, 3648, 3808], ids=["kda", "mla", "dsa"])
+def test_the_kimi_k3_tp8_attention_layers_are_served(rows):
+    assert _attention_supports(projection_rows=rows)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"projection_rows": 4096},
+        {"o_proj_width": 1024},
+        {"projection_dtype": torch.float8_e4m3fn},
+        {"o_proj_dtype": torch.float32},
+    ],
+    ids=lambda overrides: "-".join(f"{k}={v}" for k, v in overrides.items()),
+)
+def test_other_attention_layers_are_declined(overrides):
+    assert not _attention_supports(**overrides)

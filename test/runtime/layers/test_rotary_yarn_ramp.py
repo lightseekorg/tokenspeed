@@ -30,9 +30,9 @@ import torch
 import tokenspeed.runtime.layers.rotary_embedding as rotary_module
 from tokenspeed.runtime.layers.rotary_embedding import (
     DeepseekScalingRotaryEmbedding,
-    _yarn_find_correction_range,
-    _yarn_linear_ramp_mask,
     get_rope,
+    yarn_find_correction_range,
+    yarn_linear_ramp_mask,
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
@@ -52,7 +52,7 @@ def _cpu_reference_ramp(low: float, high: float, dim: int) -> torch.Tensor:
 
 def _cpu_reference_inv_freq() -> torch.Tensor:
     pos_freqs = BASE ** (torch.arange(0, ROTARY_DIM, 2, dtype=torch.float) / ROTARY_DIM)
-    low, high = _yarn_find_correction_range(
+    low, high = yarn_find_correction_range(
         32, 1, ROTARY_DIM, BASE, ORIGINAL_MAX_POSITION
     )
     mask = 1 - _cpu_reference_ramp(low, high, ROTARY_DIM // 2)
@@ -61,10 +61,10 @@ def _cpu_reference_inv_freq() -> torch.Tensor:
 
 def test_cpu_ramp_matches_the_pure_cpu_reference():
     low, high = 3, 29
-    ramp = _yarn_linear_ramp_mask(low, high, ROTARY_DIM // 2, torch.float, device="cpu")
+    ramp = yarn_linear_ramp_mask(low, high, ROTARY_DIM // 2, torch.float, device="cpu")
     assert torch.equal(ramp, _cpu_reference_ramp(low, high, ROTARY_DIM // 2))
     # The degenerate range is widened, not divided by zero.
-    flat = _yarn_linear_ramp_mask(5, 5, 8, torch.float, device=None)
+    flat = yarn_linear_ramp_mask(5, 5, 8, torch.float, device=None)
     assert torch.isfinite(flat).all()
 
 
@@ -169,7 +169,7 @@ def test_gpu_frequencies_with_cpu_ramp_match_mixed_device_trainer(monkeypatch):
     freq = BASE ** (
         torch.arange(0, ROTARY_DIM, 2, device="cuda", dtype=torch.float32) / ROTARY_DIM
     )
-    low, high = _yarn_find_correction_range(
+    low, high = yarn_find_correction_range(
         32, 1, ROTARY_DIM, BASE, ORIGINAL_MAX_POSITION
     )
     mask = 1 - _cpu_reference_ramp(low, high, ROTARY_DIM // 2).cuda()

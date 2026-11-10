@@ -75,6 +75,7 @@ import torch
 from tokenspeed_kernel_amd._triton import cdna4_async_copy, gl, gluon, triton
 
 _USES_FP32_ATOMIC: Optional[bool] = None
+_NUM_XCDS = 8
 
 
 def _b_preshuffle_3d(b: torch.Tensor) -> torch.Tensor:
@@ -179,6 +180,7 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
     APPLY_ROUTED_WEIGHT: gl.constexpr = True,
     INPUT_SORTED: gl.constexpr = False,
     A_FORMAT: gl.constexpr = "e2m1",
+    NUM_XCDS: gl.constexpr = 1,
 ):
     """Stage 2 1x2 kernel: 2 waves/CTA, BLOCK_N=256, 2-stage v3 pipeline.
 
@@ -410,6 +412,29 @@ def gluon_mxfp4_moe_stage2_1x2_kernel(
                 # instead of having every expert update the same N tile.
                 pid_m = flat_tile // num_pid_n
                 pid_n = flat_tile % num_pid_n
+            elif NUM_XCDS != 1:
+                # Keep an expert's N-tile weights in one XCD's L2; empty tiles exit.
+                valid_pid_m = gl.minimum(
+                    gl.cdiv(num_tokens_post_padded, BLOCK_M), num_pid_m
+                )
+                grid_mn = valid_pid_m * num_pid_n
+                pids_per_xcd = (grid_mn + NUM_XCDS - 1) // NUM_XCDS
+                tall_xcds = grid_mn % NUM_XCDS
+                tall_xcds = gl.where(tall_xcds == 0, NUM_XCDS, tall_xcds)
+                xcd = flat_tile % NUM_XCDS
+                local_pid = flat_tile // NUM_XCDS
+                logical = gl.where(
+                    xcd < tall_xcds,
+                    xcd * pids_per_xcd + local_pid,
+                    tall_xcds * pids_per_xcd
+                    + (xcd - tall_xcds) * (pids_per_xcd - 1)
+                    + local_pid,
+                )
+                in_valid = flat_tile < grid_mn
+                pid_m = gl.where(
+                    in_valid, logical % gl.maximum(valid_pid_m, 1), num_pid_m
+                )
+                pid_n = gl.where(in_valid, logical // gl.maximum(valid_pid_m, 1), 0)
             else:
                 pid_m = flat_tile % num_pid_m
                 pid_n = flat_tile // num_pid_m
@@ -2003,6 +2028,7 @@ def invoke_gluon_mxfp4_moe_stage2_1x2(
         APPLY_ROUTED_WEIGHT=do_finalize,
         INPUT_SORTED=bool(input_sorted),
         A_FORMAT=a_format,
+        NUM_XCDS=_NUM_XCDS if _use_reduce else 1,
         num_warps=NUM_WARPS,
     )
 
