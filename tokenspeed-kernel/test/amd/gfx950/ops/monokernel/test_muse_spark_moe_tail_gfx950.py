@@ -132,12 +132,23 @@ def _reference(parts, w, hp, pen, w_post, post, alpha, beta, ing):
     p = r.to(torch.bfloat16).float() * pen
     inv = torch.rsqrt(p.pow(2).mean(1, keepdim=True) + 1e-8)
     combined = ((p * inv) * w[:, None]).sum(0).to(torch.bfloat16)
+    # The combined row in FP64 from the same BF16 route sums (the kernel sums
+    # the ranks in the same order), and a bound on the kernel's FP32 steps:
+    # p's product, the norm's 4096-term sum of squares (6 standard deviations
+    # of its roundings: ~2^-18.4 relative), rsqrt and the 8-term weighted sum
+    # stay under 2^-17 of the terms' size; twice that, then one BF16 rounding.
+    p64 = r.to(torch.bfloat16).double() * pen.double()
+    terms = p64 * torch.rsqrt(p64.pow(2).mean(1, keepdim=True) + 1e-8)
+    terms = terms * w[:, None].double()
+    exact = terms.sum(0)
+    sums = 2**-16 * terms.abs().sum(0)
+    combined_check = (exact, sums + 2**-8 * (exact.abs() + sums))
     y = (combined.float() @ w_post.float().T).to(torch.bfloat16).float() * post
     y = y * torch.rsqrt(y.pow(2).mean() + 1e-8)
     h2 = beta * y + alpha * hp
     scale = torch.rsqrt(h2.pow(2).mean() + 1e-5)
     a = (h2 * scale * ing).to(torch.bfloat16)
-    return combined, h2, a, (beta * y).abs(), scale
+    return combined, combined_check, h2, a, (beta * y).abs(), scale
 
 
 def _worker(rank: int, port: int, rows: int, source_rows: int, out: str) -> None:
@@ -225,18 +236,14 @@ def _worker(rank: int, port: int, rows: int, source_rows: int, out: str) -> None
             torch.cuda.synchronize()
             dist.barrier()
             for row in range(rows):
-                combined, h2, a, gated, scale = _reference(
+                combined, (cmb_exact, cmb_bound), h2, a, gated, scale = _reference(
                     parts[row], w[row], hp[row], pen, w_post, post, alpha, beta, ing
                 )
                 cmb = payloads(
                     scratch, plan, "cmb", POOLED // 2, tag, row=row, copy=step & 1
                 )
-                torch.testing.assert_close(
-                    cmb.view(torch.bfloat16).float().cpu(),
-                    combined.float(),
-                    rtol=2**-7,
-                    atol=1e-3,
-                )
+                err = (cmb.view(torch.bfloat16).cpu().double() - cmb_exact).abs()
+                assert torch.all(err <= cmb_bound), float((err / cmb_bound).max())
                 # The projection output is BF16: a sum next to a rounding
                 # boundary can round to the neighbour, one BF16 step of beta y
                 # (up to 2^-7 of it, at the bottom of a binade).
