@@ -30,12 +30,16 @@ from tokenspeed_kernel.platform import (
     current_platform,
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.selection import traits_problem_filter
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 if current_platform().is_amd:
     _DSA_FULL_TOPK_WIDTHS = frozenset({512, 1024, 2048, 2049, 2050, 2051})
     _DSA_PREFILL_TOPK_WIDTHS = _DSA_FULL_TOPK_WIDTHS
 
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (
+        gluon_dsa_decode_dcp_records_supported_gfx950,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (
         launch_gluon_dsa_decode_dcp_records_gfx950 as _dsa_decode_records_impl,
     )
@@ -44,6 +48,10 @@ if current_platform().is_amd:
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (
         launch_gluon_dsa_prefill_gfx950 as _dsa_prefill_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.owned_selection import (
+        gathered_owned_selection_supported,
+        gluon_dsa_select_owned_from_gathered_gfx950,
     )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (
         launch_gluon_dsa_decode_topk_bf16_gfx950 as _dsa_decode_topk_bf16_impl,
@@ -487,6 +495,20 @@ if current_platform().is_amd:
             "topk": _DSA_FULL_TOPK_WIDTHS,
             "logit_cap": frozenset({False}),
             "topk_layout": frozenset({"global_slots"}),
+            "problem_filter": frozenset(
+                {
+                    traits_problem_filter(
+                        gluon_dsa_decode_dcp_records_supported_gfx950,
+                        "tokens",
+                        "heads",
+                        "topk",
+                        "q_dtype",
+                        "kv_dtype",
+                        "kv_lora_rank",
+                        "qk_rope_head_dim",
+                    )
+                }
+            ),
         },
     )
     def gluon_dsa_decode_dcp_records_gfx950(**kwargs):
@@ -972,7 +994,20 @@ if current_platform().is_amd:
         signatures=frozenset(
             {format_signature(scores=dense_tensor_format(torch.float32))}
         ),
-        traits={"topk": frozenset({512, 1024, 2048})},
+        traits={
+            "topk": frozenset({512, 1024, 2048}),
+            "problem_filter": frozenset(
+                {
+                    traits_problem_filter(
+                        gathered_owned_selection_supported,
+                        "ranks",
+                        "rows",
+                        "topk",
+                        "rank_stride",
+                    )
+                }
+            ),
+        },
         priority=Priority.SPECIALIZED,
     )
     def gluon_dsa_select_owned_candidates_gfx950(
@@ -989,10 +1024,6 @@ if current_platform().is_amd:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """``dsa_select_owned_candidates`` in one launch over the gathered
         scores, for sizes ``dsa_select_owned_candidates_supported`` admits."""
-        from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.owned_selection import (
-            gluon_dsa_select_owned_from_gathered_gfx950,
-        )
-
         return gluon_dsa_select_owned_from_gathered_gfx950(
             scores,
             positions,

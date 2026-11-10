@@ -1898,9 +1898,7 @@ def _records_split_tiles(
     the launch's rows and head groups fill under three quarters of the CUs,
     into as many parts as reach that; longer rows split proportionally more,
     and a full-width row into all ``num_kv_splits``. Splitting a launch that
-    already fills the CUs only adds the reduction: on MI350X, 32 to 64 rows
-    of 96 heads and 256 keys take 20-25 us unsplit against 29-37 us in two
-    splits.
+    already fills the CUs only adds the reduction.
     """
     typical_tiles = triton.cdiv(triton.cdiv(topk, ranks), tile_k)
     base_ctas = tokens * triton.cdiv(heads, 16)

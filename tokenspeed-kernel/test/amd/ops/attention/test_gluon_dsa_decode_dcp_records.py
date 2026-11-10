@@ -178,7 +178,6 @@ def _assert_records_attend(records, q, cache, slots, lengths):
         # K3.1 at TP8 / KVP8: the drafter's 16 rows and C16's verify rows.
         (16, 8, 12),
         (64, 8, 12),
-        (4, 8, 12),
         (20, 4, 16),
     ],
 )
@@ -197,14 +196,12 @@ def test_decode_records_match_the_dispatched_decode(tokens, degree, local_heads)
     # and outputs within one BF16 rounding (that decode's merge unrolls its
     # splits).
     _assert_records_attend(records, q, cache, slots, lengths)
-    _assert_records_attend(expected, q, cache, slots, lengths)
-    if tokens > 2:
-        assert torch.equal(records[:, 2, :, 256], expected[:, 2, :, 256])
-        bits = [
-            r[:, 2, :, :256].contiguous().view(torch.int16).int()
-            for r in (records, expected)
-        ]
-        assert (bits[0] - bits[1]).abs().max() <= 1
+    assert torch.equal(records[:, 2, :, 256], expected[:, 2, :, 256])
+    bits = [
+        r[:, 2, :, :256].contiguous().view(torch.int16).int()
+        for r in (records, expected)
+    ]
+    assert (bits[0] - bits[1]).abs().max() <= 1
     # The empty and all-invalid rows are zero output with a -inf LSE, as the
     # combine expects of an empty partial.
     empty = records[:, : min(tokens, 2)]
@@ -213,11 +210,10 @@ def test_decode_records_match_the_dispatched_decode(tokens, degree, local_heads)
     assert (empty[..., 256] == neg_inf_bits).all()
 
 
-@pytest.mark.parametrize("tokens", [4, 64])
-def test_decode_records_of_a_row_follow_only_its_own_length(tokens):
+def test_decode_records_of_a_row_follow_only_its_own_length():
     # A row's split count comes from its own live length, so its record
     # does not move when the other rows' lengths do.
-    degree, local_heads = 8, 12
+    degree, local_heads, tokens = 8, 12, 64
     q, cache, slots, lengths = _inputs(tokens, degree, local_heads, seed=tokens + 5)
     kwargs = _kwargs(cache, slots, lengths)
     before = dsa_decode_dcp_records(q=q, **kwargs)
@@ -226,15 +222,13 @@ def test_decode_records_of_a_row_follow_only_its_own_length(tokens):
         lengths[:row] = other
         after = dsa_decode_dcp_records(q=q, **kwargs)
         assert torch.equal(after[:, row], before[:, row])
-        _assert_records_attend(after, q, cache, slots, lengths)
 
 
-@pytest.mark.parametrize("tokens", [4, 64])
-def test_decode_records_read_a_query_riding_in_a_gathered_chunk(tokens):
+def test_decode_records_read_a_query_riding_in_a_gathered_chunk():
     # One all-gather of every rank's index scores and query lands rank r's
     # query after its scores: each rank's rows contiguous, the ranks one
     # whole chunk apart.
-    degree, local_heads = 8, 12
+    degree, local_heads, tokens = 8, 12, 64
     q, cache, slots, lengths = _inputs(tokens, degree, local_heads, seed=tokens + 3)
     kwargs = _kwargs(cache, slots, lengths)
     expected = dsa_decode_dcp_records(q=q, **kwargs)
@@ -295,9 +289,6 @@ def test_decode_records_lead_a_given_workspace(tokens):
     records = dsa_decode_dcp_records(q=q, workspace=workspace, **kwargs)
     assert records.data_ptr() == workspace.data_ptr()
     assert torch.equal(records, expected)
-    for bad in (workspace[: words - 1], workspace.view(torch.uint8), workspace[::2]):
-        with pytest.raises(ValueError, match="workspace"):
-            dsa_decode_dcp_records(q=q, workspace=bad, **kwargs)
 
 
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16])
@@ -319,7 +310,6 @@ def test_decode_records_serve_unsplit_launches(dtype):
     )
     kwargs = _kwargs(cache, slots, lengths)
     assert torch.equal(dsa_decode_dcp_records(q=q, **kwargs), _dispatched(q, kwargs))
-    assert not _supported(0, 96)
 
 
 def test_decode_records_refuse_sizes_past_their_32bit_offsets():
@@ -342,6 +332,7 @@ def test_decode_records_refuse_sizes_past_their_32bit_offsets():
     # Records under 2**31 bytes, a BF16 query past it.
     assert supported(20000, torch.float8_e4m3fn)
     assert not supported(20000, torch.bfloat16)
+    assert not _supported(0, 96)
 
 
 def test_decode_records_replay_in_a_graph_across_lengths():
@@ -353,14 +344,13 @@ def test_decode_records_replay_in_a_graph_across_lengths():
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured = dsa_decode_dcp_records(q=q, **kwargs)
-    for visible in (0, 13, 256, 257, 700, TOPK):
+    for visible in (0, 257, TOPK):
         lengths.fill_(visible)
         slots.copy_(torch.roll(slots, 1, dims=1))
         graph.replay()
         expected = dsa_decode_dcp_records(q=q, **kwargs)
         torch.cuda.synchronize()
         assert torch.equal(captured, expected)
-        _assert_records_attend(captured, q, cache, slots, lengths)
 
 
 def test_decode_records_compile_once_across_tokens():

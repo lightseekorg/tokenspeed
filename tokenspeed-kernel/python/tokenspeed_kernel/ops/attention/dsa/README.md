@@ -308,6 +308,48 @@ served only by cores declaring `slot_order={"sorted", ...}`, which receive
 the choice as the `slot_order` keyword. Asking a silent core for `sorted`
 is a `ValueError`, not a silent fallback.
 
+## Fused decode top-k (`cute_dsl_dsa_decode_topk`)
+
+On SM100-SM103 the `cute_dsl` leaf runs a decode step's indexer tail in two
+PDL-chained launches (`thirdparty/cute_dsl/k3_decode/dsa/indexer.py`) after the
+shared query quantization: a persistent tcgen05 scorer and a one-CTA-per-row
+select. It replaces the DeepGEMM leaf's block-table expansion, paged MQA logits,
+non-finite scrub, radix top-k and slot mapping, and ignores the `dsa_plan`.
+
+- Logits are bit-identical to `deep_gemm.fp8_paged_mqa_logits` on the same FP8
+  query and FP32 weights: the same FP8 MMA (K 128 in four K 32 steps, FP32
+  accumulator, keys as operand A) and DeepGEMM's FP32 head sum (`x + |x|`, two
+  FMA chains over the head pairs, their sum halved, times the key's scale), with
+  NaN and `+inf` stored as `-inf` as the scrub would. They live in a
+  request-compact FP32 scratch no larger than DeepGEMM's `[tokens, block-table
+  capacity]` output.
+- Selection is exact over FP32 order keys (`-0` ranks as `+0`): a row's top-k is
+  the head of the stable descending sort of its causal window, so ties at the
+  threshold go to the lowest positions (the `batch_invariant` contract), and the
+  slots come out in ascending position, which serves both `slot_order` values.
+  A row of at most `topk` keys takes all of them; a request whose rows all fit
+  is not scored. Rows whose request length leaves no keys come out empty.
+- Rows, requests, pages and the block-table width are runtime values: one
+  compile per `q_len_per_req`. At most 4096 requests per call.
+- The select never releases its dependents early: trtllm-gen sparse attention
+  reads the counts before its PDL wait.
+- It also takes queries quantized ahead: contiguous E4M3 queries with unit
+  scales (`q_scales=None`) and the FP32 weights that carry their scales and
+  the score scale (`softmax_scale=1`), which it scores without its own
+  quantization launch.
+
+The leaf registers below every other `dsa_decode_topk` leaf, so only
+`solution="cute_dsl"` selects it. Kimi-K3.1 pins it where it is registered;
+other models with the same indexer geometry keep their leaf.
+
+A Kimi-K3.1 decode round quantizes those queries in the launch that writes
+its index keys: `index_k_layernorm_fp8_scatter_and_quantize_query`
+(`_triton/topk.py`) runs, per row, the row functions of
+`index_k_layernorm_fp8_scatter` (one warp, so the key's LayerNorm sums in the
+same order) and of `quantize_index_query_weights`, so the plane's bytes and
+the query and weights are bit-identical to the two separate launches. Mixed
+rounds, prefill, and KV-parallel decode keep the separate write.
+
 ## Row top-k selection in CuTe DSL (`_cute_dsl/deep_select.py`)
 
 `deepselect_topk(scores, ends, topk, capacity=..., cluster_size=...)` selects
@@ -493,10 +535,15 @@ the Triton leaf registers it. A `dsa_prefill` registration would make it a
 candidate for ordinary calls. The leaf runs `_dsa_dense_kv_kernel`'s
 single-split program over dense KV, with the same jitted body
 (`_dsa_dense_kv_attend`) and launch configuration. The token count is a
-runtime argument (`do_not_specialize`). `dsa_prefill_dcp_records_supported`
-accepts a size only when `dsa_prefill` would not split the keys either: the
-launch needs at least about one program per SM. Any other size raises.
-Callers check this from host sizes before they gather the query.
+runtime argument (`do_not_specialize`). The leaf accepts a size only when
+`dsa_prefill` would not split the keys either: the launch needs at least
+about one program per SM. The records ops pass their sizes (rows, every
+rank's heads, the selection width and the dtypes) as selection traits, and
+each leaf states its size rule as a `problem_filter` over them, so selection
+refuses any other size. `dsa_prefill_dcp_records_supported` and
+`dsa_decode_dcp_records_supported` are that selection, which callers make
+from host sizes before they gather the query; `dsa_select_owned_candidates`
+does the same over its gathered scores' sizes.
 
 `dsa_decode_dcp_records` is the decode counterpart, with the same layouts and
 bit-identity to `dispatch_dcp_attention_partials` over

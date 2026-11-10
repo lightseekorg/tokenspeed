@@ -22,12 +22,18 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.ops.kvcache.triton import (
+    _index_k_layernorm_fp8_scatter_args,
+    _index_k_layernorm_fp8_scatter_row,
+)
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 
 _is_nvidia = current_platform().is_nvidia
 
 _RADIX_TOPK_MIN_COLS = 32768
 _RADIX_TOPK_BLOCK_N = 4096
+# Query heads per program of the fused index-K write; the row's key rides on the first block.
+_FUSED_QUERY_HEADS_PER_PROGRAM = 8
 
 
 @triton.jit
@@ -466,11 +472,13 @@ def workspace_topk_to_global_slots(
 
 
 @triton.jit
-def _quantize_index_query_weights_kernel(
+def _quantize_index_query_heads(
     q_ptr,
     weights_ptr,
     q_out_ptr,
     weights_out_ptr,
+    row,  # int64 token row
+    head,  # [HEADS_PER_PROGRAM] head indices
     softmax_scale,
     fp8_max,
     amax_floor,
@@ -479,10 +487,7 @@ def _quantize_index_query_weights_kernel(
     weights_row_stride,
     heads,
     DIM: tl.constexpr,
-    HEADS_PER_PROGRAM: tl.constexpr,
 ):
-    row = tl.program_id(0).to(tl.int64)
-    head = tl.program_id(1) * HEADS_PER_PROGRAM + tl.arange(0, HEADS_PER_PROGRAM)
     head_mask = head < heads
     cols = tl.arange(0, DIM)
     y = tl.load(
@@ -508,6 +513,73 @@ def _quantize_index_query_weights_kernel(
     )
 
 
+@triton.jit
+def _quantize_index_query_weights_kernel(
+    q_ptr,
+    weights_ptr,
+    q_out_ptr,
+    weights_out_ptr,
+    softmax_scale,
+    fp8_max,
+    amax_floor,
+    q_row_stride,
+    q_head_stride,
+    weights_row_stride,
+    heads,
+    DIM: tl.constexpr,
+    HEADS_PER_PROGRAM: tl.constexpr,
+):
+    _quantize_index_query_heads(
+        q_ptr,
+        weights_ptr,
+        q_out_ptr,
+        weights_out_ptr,
+        tl.program_id(0).to(tl.int64),
+        tl.program_id(1) * HEADS_PER_PROGRAM + tl.arange(0, HEADS_PER_PROGRAM),
+        softmax_scale,
+        fp8_max,
+        amax_floor,
+        q_row_stride,
+        q_head_stride,
+        weights_row_stride,
+        heads,
+        DIM,
+    )
+
+
+def _quantize_index_query_weights_args(
+    q: torch.Tensor, weights: torch.Tensor, softmax_scale: float
+) -> tuple[tuple, torch.Tensor, torch.Tensor]:
+    """Validate :func:`quantize_index_query_weights`' inputs (same arguments).
+
+    Returns ``(args, q_fp8, folded)``: the runtime arguments
+    ``_quantize_index_query_weights_kernel`` takes and its two outputs.
+    """
+    tokens, heads, dim = q.shape
+    if dim != 128 or q.stride(-1) != 1 or weights.stride(-1) != 1:
+        raise ValueError("expects [tokens, heads, 128] queries and unit-stride rows")
+    if weights.shape != (tokens, heads):
+        raise ValueError(f"weights must have shape {(tokens, heads)}")
+    q_fp8 = torch.empty(
+        (tokens, heads, dim), dtype=torch.float8_e4m3fn, device=q.device
+    )
+    folded = torch.empty((tokens, heads), dtype=torch.float32, device=q.device)
+    args = (
+        q,
+        weights,
+        q_fp8,
+        folded,
+        float(softmax_scale),
+        float(torch.finfo(torch.float8_e4m3fn).max),
+        float(torch.tensor(1e-10, dtype=q.dtype)),
+        q.stride(0),
+        q.stride(1),
+        weights.stride(0),
+        heads,
+    )
+    return args, q_fp8, folded
+
+
 def quantize_index_query_weights(
     q: torch.Tensor, weights: torch.Tensor, softmax_scale: float
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -526,34 +598,183 @@ def quantize_index_query_weights(
         ``[tokens, heads, 128]`` contiguous E4M3 queries and ``[tokens, heads]``
         contiguous FP32 combined weights.
     """
-    tokens, heads, dim = q.shape
-    if dim != 128 or q.stride(-1) != 1 or weights.stride(-1) != 1:
-        raise ValueError("expects [tokens, heads, 128] queries and unit-stride rows")
-    if weights.shape != (tokens, heads):
-        raise ValueError(f"weights must have shape {(tokens, heads)}")
-    q_fp8 = torch.empty(
-        (tokens, heads, dim), dtype=torch.float8_e4m3fn, device=q.device
-    )
-    folded = torch.empty((tokens, heads), dtype=torch.float32, device=q.device)
+    args, q_fp8, folded = _quantize_index_query_weights_args(q, weights, softmax_scale)
+    tokens, heads = q.shape[:2]
     if tokens:
         # One head per program while the grid is small, eight once rows fill the GPU.
         per_program = 1 if tokens * heads <= 4096 else 8
         _quantize_index_query_weights_kernel[(tokens, triton.cdiv(heads, per_program))](
-            q,
-            weights,
-            q_fp8,
-            folded,
-            float(softmax_scale),
-            float(torch.finfo(torch.float8_e4m3fn).max),
-            float(torch.tensor(1e-10, dtype=q.dtype)),
-            q.stride(0),
-            q.stride(1),
-            weights.stride(0),
-            heads,
-            DIM=dim,
+            *args,
+            DIM=q.shape[2],
             HEADS_PER_PROGRAM=per_program,
             num_warps=1 if per_program == 1 else 4,
             num_stages=1,
+        )
+    return q_fp8, folded
+
+
+@triton.jit
+def _index_k_write_quantize_query_kernel(
+    fp8_buf_ptr,
+    scale_buf_ptr,
+    x_ptr,
+    norm_weight_ptr,
+    norm_bias_ptr,
+    loc_ptr,
+    write_mask_ptr,
+    x_row_stride,
+    page_bytes,
+    scale_base_off,
+    eps,
+    q_ptr,
+    weights_ptr,
+    q_out_ptr,
+    weights_out_ptr,
+    softmax_scale,
+    fp8_max,
+    amax_floor,
+    q_row_stride,
+    q_head_stride,
+    weights_row_stride,
+    heads,
+    HAS_WRITE_MASK: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    HD: tl.constexpr,
+    GROUP: tl.constexpr,
+    NG: tl.constexpr,
+    BLOCK_NG: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    MXFP4: tl.constexpr,
+    DIM: tl.constexpr,
+    HEADS_PER_PROGRAM: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+    row = tl.program_id(0).to(tl.int64)
+    block = tl.program_id(1)
+    _quantize_index_query_heads(
+        q_ptr,
+        weights_ptr,
+        q_out_ptr,
+        weights_out_ptr,
+        row,
+        block * HEADS_PER_PROGRAM + tl.arange(0, HEADS_PER_PROGRAM),
+        softmax_scale,
+        fp8_max,
+        amax_floor,
+        q_row_stride,
+        q_head_stride,
+        weights_row_stride,
+        heads,
+        DIM,
+    )
+    # The first head block of a row also writes its key.
+    if block == 0:
+        _index_k_layernorm_fp8_scatter_row(
+            fp8_buf_ptr,
+            scale_buf_ptr,
+            x_ptr,
+            norm_weight_ptr,
+            norm_bias_ptr,
+            loc_ptr,
+            write_mask_ptr,
+            row,
+            x_row_stride,
+            page_bytes,
+            scale_base_off,
+            eps,
+            HAS_WRITE_MASK,
+            PAGE_SIZE,
+            HD,
+            GROUP,
+            NG,
+            BLOCK_NG,
+            FP8_MAX,
+            MXFP4,
+        )
+
+
+def index_k_layernorm_fp8_scatter_and_quantize_query(
+    buf: torch.Tensor,
+    index_k: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_bias: torch.Tensor,
+    loc: torch.Tensor,
+    q: torch.Tensor,
+    head_weights: torch.Tensor,
+    *,
+    eps: float,
+    page_size: int,
+    group_size: int,
+    write_mask: torch.Tensor | None,
+    softmax_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Write index keys and quantize the same rows' index queries in one launch.
+
+    The plane's bytes are exactly those of ``index_k_layernorm_fp8_scatter(buf,
+    index_k, norm_weight, norm_bias, loc, ...)`` and the outputs exactly
+    ``quantize_index_query_weights(q, head_weights, softmax_scale)``: each
+    program quantizes one block of a row's query heads with that kernel's row
+    function, and a row's first block also writes its key with the key
+    kernel's, the LayerNorm in one warp as there. CUDA-graph safe; no
+    per-batch constexpr.
+
+    Args:
+        buf: uint8 ``fp8_scaled`` index-K plane (a slot matrix or a page
+            view), as for ``index_k_layernorm_fp8_scatter``.
+        index_k: ``[tokens, head_dim]`` pre-norm keys with unit inner stride.
+        norm_weight: ``[head_dim]`` LayerNorm weight.
+        norm_bias: ``[head_dim]`` LayerNorm bias.
+        loc: ``[tokens]`` non-negative integer slot indices.
+        q: ``[tokens, heads, 128]`` BF16 index queries, unit last stride.
+        head_weights: ``[tokens, heads]`` head weights, unit last stride.
+        eps: Positive LayerNorm epsilon.
+        page_size: Rows per page of the plane.
+        group_size: Key elements per scale; divides ``head_dim``.
+        write_mask: Optional bool ``[tokens]`` ownership mask; False rows'
+            keys are not written. None writes every row.
+        softmax_scale: Score scale folded into the head weights.
+
+    Returns:
+        ``[tokens, heads, 128]`` contiguous E4M3 queries and ``[tokens,
+        heads]`` contiguous FP32 head weights carrying each query's scale and
+        ``softmax_scale``; ``buf`` is written in place.
+    """
+    key_args, key_constexprs = _index_k_layernorm_fp8_scatter_args(
+        buf,
+        index_k,
+        norm_weight,
+        norm_bias,
+        loc,
+        eps=eps,
+        page_size=page_size,
+        group_size=group_size,
+        write_mask=write_mask,
+    )
+    query_args, q_fp8, folded = _quantize_index_query_weights_args(
+        q, head_weights, softmax_scale
+    )
+    tokens, heads = q.shape[:2]
+    if index_k.shape[0] != tokens:
+        raise ValueError(
+            f"index_k has {index_k.shape[0]} rows and q has {tokens}; the "
+            "fused write quantizes the queries of its own rows"
+        )
+    if tokens:
+        enable_pdl = pdl_enabled()
+        grid = (tokens, triton.cdiv(heads, _FUSED_QUERY_HEADS_PER_PROGRAM))
+        _index_k_write_quantize_query_kernel[grid](
+            *key_args,
+            *query_args,
+            **key_constexprs,
+            DIM=q.shape[2],
+            HEADS_PER_PROGRAM=_FUSED_QUERY_HEADS_PER_PROGRAM,
+            ENABLE_PDL=enable_pdl,
+            # One warp: the key's LayerNorm sums in the order of the scatter kernel's.
+            num_warps=1,
+            **({"launch_pdl": True} if enable_pdl else {}),
         )
     return q_fp8, folded
 
@@ -1700,6 +1921,7 @@ __all__ = [
     "combine_topk_weights",
     "dsa_decode_topk_fp8",
     "dsa_prefill_topk_fp8",
+    "index_k_layernorm_fp8_scatter_and_quantize_query",
     "triton_topk_from_logits",
     "local_topk_to_global_slots",
     "mark_forced_initial_local_logits",

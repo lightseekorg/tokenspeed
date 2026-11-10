@@ -568,8 +568,9 @@ class DSABackend(PagedAttentionBackend):
         it stands in only where the forward's own ``dsa_prefill`` selection
         (the selection inputs ``_sparse_leaf_probes`` mirrors, solution pin
         and kernel override included) picks ``triton_dsa_prefill`` without a
-        plan, and where the records op selects for the same inputs. Boot
-        configuration only, so every rank of the group agrees.
+        plan. Boot configuration only, so every rank of the group agrees; the
+        records op selects per prefill size
+        (``dsa_prefill_dcp_records_supported``).
 
         Only an FP8 cache's query qualifies: its bytes take the NCCL
         inner-dimension gather (``gather_query_heads``), whose relayout copy
@@ -593,13 +594,6 @@ class DSABackend(PagedAttentionBackend):
             try:
                 core = select_kernel(
                     "attention", mode, signature, traits=traits, solution=solution
-                )
-                select_kernel(
-                    "attention",
-                    "dsa_prefill_dcp_records",
-                    signature,
-                    traits=traits,
-                    solution=solution,
                 )
             except NoKernelFoundError:
                 return False
@@ -646,9 +640,9 @@ class DSABackend(PagedAttentionBackend):
         partials exchange's records, so it stands in only where every decode
         selection the forward makes (``_sparse_leaf_probes``: one row per
         request and the verify rows) picks ``gluon_dsa_decode_gfx950``
-        without a plan, and where the records op selects for the same inputs.
-        An FP8 cache only, as :meth:`_probe_dcp_records_core`. Boot
-        configuration only, so every rank of the group agrees.
+        without a plan. An FP8 cache only, as :meth:`_probe_dcp_records_core`.
+        Boot configuration only, so every rank of the group agrees; the
+        records op selects per decode size (``dsa_decode_dcp_records_supported``).
         """
         if (
             len(self.kvp_group) <= 1
@@ -664,13 +658,6 @@ class DSABackend(PagedAttentionBackend):
             try:
                 core = select_kernel(
                     "attention", mode, signature, traits=traits, solution=solution
-                )
-                select_kernel(
-                    "attention",
-                    "dsa_decode_dcp_records",
-                    signature,
-                    traits=traits,
-                    solution=solution,
                 )
             except NoKernelFoundError:
                 return False
@@ -984,6 +971,7 @@ class DSABackend(PagedAttentionBackend):
                 kv_dtype=kv_dtype,
                 kv_lora_rank=self.kv_lora_rank,
                 qk_rope_head_dim=self.qk_rope_head_dim,
+                solution=self.kernel_solution,
             )
         )
 
@@ -2004,6 +1992,8 @@ class DSABackend(PagedAttentionBackend):
                     tokens=q_view.shape[0],
                     heads=heads * len(self.kvp_group),
                     topk=topk_slots.shape[1],
+                    q_dtype=q_view.dtype,
+                    solution=self.kernel_solution,
                 )
             ):
                 out = self._forward_dcp_records_prefill(

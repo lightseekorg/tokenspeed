@@ -7,14 +7,20 @@ if [ "$#" -eq 0 ]; then
 fi
 
 SIM_ROOT=${TOKENSPEED_MI450_SIM_ROOT:-${RUNNER_TEMP:-/tmp}/tokenspeed-mi450-sim}
-ROCJITSU_SOURCE_DIR="${SIM_ROOT}/rocm-systems/emulation/rocjitsu"
-ROCJITSU_BUILD_DIR="${SIM_ROOT}/rocjitsu-build"
-launcher="${ROCJITSU_BUILD_DIR}/tools/rocjitsu/rocjitsu"
-config="${ROCJITSU_SOURCE_DIR}/configs/gfx1250_mi455x.json"
+config="${SIM_ROOT}/gfx1250_mi455x.json"
 rocm_root="$(rocm-sdk path --root)"
+mirage="${rocm_root}/bin/mirage"
 libhip_path="${rocm_root}/lib/libamdhip64.so"
+thread_budget="${MI450_SIM_THREADS_PER_WORKER:-2}"
 
-test -x "${launcher}"
+case "${thread_budget}" in
+    "" | *[!0-9]* | 0)
+        echo "MI450_SIM_THREADS_PER_WORKER must be a positive integer" >&2
+        exit 2
+        ;;
+esac
+
+test -x "${mirage}"
 test -f "${config}"
 test -f "${libhip_path}"
 
@@ -32,4 +38,7 @@ export ROCPROFILER_REGISTER_ENABLED=0
 # Preserve the rejected code-object details when HIP cannot load a kernel.
 export CUDA_LOG_FILE=${CUDA_LOG_FILE:-stderr}
 
-exec "${launcher}" --daemon --config "${config}" -- "$@"
+exec "${mirage}" run --in-process \
+    --config "${config}" \
+    --cpu-thread-budget "${thread_budget}" -- \
+    "$@"

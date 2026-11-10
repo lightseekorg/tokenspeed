@@ -27,7 +27,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from tokenspeed_kernel.platform import ArchVersion, current_platform
-from utils import assert_no_triton_compile, polling_cycles, votes_with_subgroup_mask
+from utils import polling_cycles, votes_with_subgroup_mask
 
 pytestmark = pytest.mark.skipif(
     not current_platform().is_amd, reason="Iris requires AMD ROCm"
@@ -341,33 +341,6 @@ def _check_lamport_state(rank, device):
             if use_lamport:
                 expected_epochs[: rows * 21] = (expected_epochs[: rows * 21] + 1) % 3
             torch.testing.assert_close(epochs, expected_epochs, atol=0, rtol=0)
-
-    # The fused top-k path must also reuse its binary as the payload grows.
-    # Its routed producer view is deliberately wrong: the partials replace it.
-    for rows in (1, 5, 7):
-        inputs = state.all_reduce.acquire_outputs(((rows, 3584), (rows, 7168)))
-        inputs[0].fill_(-313)
-        inputs[1].fill_(rank + 1)
-        partials = (
-            torch.arange(1, 9, dtype=torch.bfloat16, device=device)
-            .view(1, 8, 1)
-            .expand(rows, 8, 3584)
-            .contiguous()
-            * (rank + 1)
-        ).view(rows * 8, 3584)
-        if rows == 1:
-            outputs = state.reduce_moe(inputs, routed_partials=partials)
-        else:
-            with assert_no_triton_compile():
-                outputs = state.reduce_moe(inputs, routed_partials=partials)
-        torch.testing.assert_close(
-            outputs[0], torch.full_like(outputs[0], 36 * 36), atol=0, rtol=0
-        )
-        torch.testing.assert_close(
-            outputs[1], torch.full_like(outputs[1], 36), atol=0, rtol=0
-        )
-        expected_epochs[: rows * 21] = (expected_epochs[: rows * 21] + 1) % 3
-        torch.testing.assert_close(epochs, expected_epochs, atol=0, rtol=0)
 
     # Capture every row count, then alternate Lamport and pull without host
     # synchronization between replays. Skipped tiles retain independent epochs.

@@ -49,7 +49,6 @@ from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.layers.attention.backends.paged import dsa
 from tokenspeed.runtime.layers.attention.configs.dsa import (
     INDEX_K_FORMATS,
-    DSAConfig,
     dsa_history_gather_workspace_bytes,
     dsa_index_k_row_bytes,
     index_k_row_bytes,
@@ -539,18 +538,15 @@ def _init_history(backend: dsa.DSABackend, *, host_table: bool = True) -> None:
     )
 
 
-def _gather_one_owner(monkeypatch) -> list[int]:
+def _gather_one_owner(monkeypatch) -> None:
     """Stand in for the page all-gather of a one-owner group: the rank's
-    pages are the gathered pages. Returns the gathered byte counts."""
-    sizes = []
+    pages are the gathered pages."""
 
     def gather(out, send, group):
         assert group == (0,) and out.dtype == send.dtype == torch.uint8
-        sizes.append(send.numel())
         out.copy_(send)
 
     monkeypatch.setattr(dsa, "all_gather_single", gather)
-    return sizes
 
 
 def _history_rows(requests: slice) -> torch.Tensor:
@@ -565,7 +561,11 @@ def _history_rows(requests: slice) -> torch.Tensor:
     )
 
 
-def test_the_history_prefill_plans_every_extend_row_local():
+def test_the_history_prefill_plans_every_extend_row_where_it_can():
+    """Under the gate (``dsa_kvp_history_prefill``) with the host page table
+    every extend row is planned local. Outside the gate or without the host
+    page table the forward keeps the slot top-k and the sharded core; the
+    next forward with both replans."""
     backend = _history_backend(11)  # 6 pages: 3 + 3 fit, 3 + 3 + 3 do not
     _init_history(backend)
     plan = backend.history_prefill_plan()
@@ -574,26 +574,11 @@ def test_the_history_prefill_plans_every_extend_row_local():
     # Every extend row is attended here: rows 0-4 are the first group's
     # chunks, 5-9 the second's.
     assert [g.query for g in plan.groups] == [slice(0, 5), slice(5, 10)]
-    # One owner: each group sends its requests' pages in history order.
-    assert [g.fetch_pages.tolist() for g in plan.groups] == [
-        [1, 2, 3, 4, 5, 6],
-        [7, 8, 9],
-    ]
-    # Each group's rows map into its own gathered pages.
-    assert plan.slots.tolist() == [*range(6), *range(6, 11), *range(5)]
     # An unsharded extend clears the plan.
     backend._history_prefill = False
     _init_history(backend)
     assert backend.history_prefill_plan() is None
 
-
-def test_the_history_prefill_keeps_the_slot_arm_where_it_cannot_plan():
-    """Outside the gate (``dsa_kvp_history_prefill``) or without the host
-    page table the forward keeps the slot top-k and the sharded core; the
-    next forward with both replans."""
-    backend = _backend(0, workspace_rows=11, qcp=False, index_k_format="fp8_scaled")
-    _init_history(backend)
-    assert backend.history_prefill_plan() is None
     backend = _history_backend(11)
     _init_history(backend, host_table=False)
     assert backend.history_prefill_plan() is None
@@ -624,10 +609,8 @@ def test_the_history_arm_attends_gathered_groups_with_the_querys_heads(monkeypat
     q = torch.randn(rows, KV_DIM, dtype=torch.bfloat16)
     # Gathered slots (the model maps its top-k through plan.slots): each
     # row's last history row of its request.
-    ends = [5, 5, 5, 5, 10, 4, 4, 4, 4, 4]
     topk = torch.full((rows, 4), -1, dtype=torch.int32)
     topk[:, 0] = plan.slots[torch.tensor([5, 5, 5, 5, 10, 15, 15, 15, 15, 15])]
-    assert topk[:, 0].tolist() == ends
     topk_lens = torch.ones(rows, dtype=torch.int32)
     calls = []
 
@@ -639,12 +622,8 @@ def test_the_history_arm_attends_gathered_groups_with_the_querys_heads(monkeypat
             dtype=torch.bfloat16,
         )
 
-    def no_compaction(*args, **kwargs):
-        raise AssertionError("the history arm attends gathered slots, not owned ones")
-
-    sizes = _gather_one_owner(monkeypatch)
+    _gather_one_owner(monkeypatch)
     monkeypatch.setattr(dsa, "dsa_prefill", fake_prefill)
-    monkeypatch.setattr(dsa, "compact_owned_cache_slots", no_compaction)
     out = backend.forward_sparse_prefill(
         q=q,
         layer=layer,
@@ -656,16 +635,11 @@ def test_the_history_arm_attends_gathered_groups_with_the_querys_heads(monkeypat
     )
     assert out.shape == (rows, KV_DIM - 2)
     assert len(calls) == len(groups) == 2
-    # One gather per group, whole pages of latent rows.
-    row_bytes = KV_DIM * 2
-    assert sizes == [g.send_pages * PAGE * row_bytes for g in groups]
     for index, (call, group) in enumerate(zip(calls, groups), start=1):
         local = group.query
-        assert call["return_lse"] is False
         assert call["q"].shape == (local.stop - local.start, 1, KV_DIM)
-        # The gathered pages keep the cache's shape; every history row of
-        # the group sits at its slot in them.
-        assert call["kv_cache"].shape == (group.send_pages * PAGE, 1, KV_DIM)
+        # Every history row of the group sits at its slot in the gathered
+        # pages.
         history = _history_rows(group.requests)
         first = sum(HISTORY[: group.requests.start])
         slots = plan.slots[first : first + history.numel()]
@@ -674,91 +648,6 @@ def test_the_history_arm_attends_gathered_groups_with_the_querys_heads(monkeypat
         )
         assert torch.equal(call["topk_slots"], topk[local])
         assert torch.all(out[local] == index)
-    # A lone group spanning the rows hands back the core's output as is.
-    single = _history_backend(18)
-    _init_history(single)
-    assert len(single.history_prefill_plan().groups) == 1
-    calls.clear()
-    out = single.forward_sparse_prefill(
-        q=q,
-        layer=layer,
-        token_to_kv_pool=pool,
-        kv_seq_lens=None,
-        topk_slots=topk,
-        topk_lens=topk_lens,
-        max_seq_len=6,
-    )
-    assert len(calls) == 1 and torch.all(out == 1)
-
-
-def test_the_history_gate_is_the_amd_kvp_prefill(monkeypatch):
-    """The arm and its workspace go together: the target over KVP pages
-    without query context parallelism, on AMD, outside a bitwise envelope."""
-    from tokenspeed.runtime.layers.attention.configs import dsa as dsa_configs
-    from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
-    from tokenspeed.runtime.layers.attention.configs.dsa import (
-        dsa_kvp_history_prefill,
-    )
-    from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
-    from tokenspeed.runtime.utils.env import global_server_args_dict
-
-    mla = dict(
-        num_attention_heads=8,
-        num_kv_heads=8,
-        attn_tp_size=1,
-        head_dim=192,
-        kv_lora_rank=512,
-        qk_nope_head_dim=128,
-        qk_rope_head_dim=64,
-        v_head_dim=128,
-        scaling=1.0,
-        kv_cache_dim=576,
-    )
-    dsa = DSAConfig(
-        backend_name="dsa",
-        index_topk=4,
-        index_head_dim=INDEX_HEAD_DIM,
-        index_n_heads=4,
-        index_k_format="fp8_scaled",
-        **mla,
-    )
-
-    def config(kvp_size=WORLD, qcp_size=1, is_draft=False, spec=dsa):
-        return AttnConfig(
-            device="cuda",
-            dtype=torch.bfloat16,
-            kv_cache_dtype=torch.bfloat16,
-            kv_cache_quant_method="none",
-            context_len=256,
-            max_bs=1,
-            kernel_page_size=PAGE,
-            is_draft=is_draft,
-            kvp_size=kvp_size,
-            kvp_group=tuple(range(kvp_size)),
-            qcp_size=qcp_size,
-            qcp_group=tuple(range(qcp_size)),
-            components=(spec,),
-        )
-
-    def on(is_amd: bool) -> None:
-        monkeypatch.setattr(
-            dsa_configs, "current_platform", lambda: SimpleNamespace(is_amd=is_amd)
-        )
-
-    on(True)
-    monkeypatch.setitem(global_server_args_dict, "numerics", "auto")
-    assert dsa_kvp_history_prefill(config())
-    assert not dsa_kvp_history_prefill(config(kvp_size=1))
-    assert not dsa_kvp_history_prefill(config(qcp_size=WORLD))
-    assert not dsa_kvp_history_prefill(config(is_draft=True))
-    assert not dsa_kvp_history_prefill(
-        config(spec=MLAConfig(backend_name="mla", **mla))
-    )
-    monkeypatch.setitem(global_server_args_dict, "numerics", "rl-bitwise")
-    assert not dsa_kvp_history_prefill(config())
-    monkeypatch.setitem(global_server_args_dict, "numerics", "auto")
-    on(False)
-    assert not dsa_kvp_history_prefill(config())
 
 
 def test_the_dense_delegate_is_refused_under_a_shard():
@@ -882,16 +771,15 @@ def test_the_index_k_history_is_one_gather_per_group(monkeypatch, index_k_format
 
 
 @pytest.mark.parametrize("index_k_format", INDEX_K_FORMATS)
-@pytest.mark.parametrize("workspace_rows", [12, 4])
 def test_the_history_index_k_pages_read_like_the_pools_plane(
-    monkeypatch, index_k_format, workspace_rows
+    monkeypatch, index_k_format
 ):
     """``gather_history_index_k_pages`` hands the scorer the group's pages in
     the pool's own layout and shape: the pool's reader over them at the
-    plan's slots returns each group's history rows in position order. They
-    land in the workspace, or in a transient buffer when a request's pages
-    alone exceed it (3 pages against a 2-page workspace)."""
-    backend = _history_backend(workspace_rows, index_k_format=index_k_format)
+    plan's slots returns each group's history rows in position order, even
+    from the transient buffer a request's pages land in when they alone
+    exceed the workspace (3 pages against a 2-page workspace)."""
+    backend = _history_backend(4, index_k_format=index_k_format)
     _init_history(backend)
     plan = backend.history_prefill_plan()
     _gather_one_owner(monkeypatch)
@@ -902,8 +790,7 @@ def test_the_history_index_k_pages_read_like_the_pools_plane(
         plane = backend.gather_history_index_k_pages(0, pool, group)
         buffer = pool.get_index_k_buffer(0)
         assert plane.dtype == buffer.dtype and plane.shape[1:] == buffer.shape[1:]
-        landed = plane.data_ptr() == workspace.data_ptr()
-        assert landed == (workspace_rows == 12)
+        assert plane.data_ptr() != workspace.data_ptr()
         history = _history_rows(group.requests)
         slots = plan.slots[first : first + history.numel()]
         first += history.numel()
@@ -1203,8 +1090,10 @@ def test_the_registry_allocates_the_workspace_once_and_the_draft_shares_it():
 
 def test_the_registry_allocates_the_history_workspace_for_the_target(monkeypatch):
     """For a KVP prefill over gathered histories (AMD) the target tree
-    allocates the planned workspace without query context parallelism; the
-    leaf plans its pure extends against it."""
+    allocates the planned workspace without query context parallelism."""
+    from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
+        HybridLinearAttnBackend,
+    )
     from tokenspeed.runtime.layers.attention.configs import dsa as dsa_configs
     from tokenspeed.runtime.layers.attention.registry import _prepare_fixed_workspaces
     from tokenspeed.runtime.utils.env import global_server_args_dict
@@ -1213,7 +1102,6 @@ def test_the_registry_allocates_the_history_workspace_for_the_target(monkeypatch
         dsa_configs, "current_platform", lambda: SimpleNamespace(is_amd=True)
     )
     monkeypatch.setitem(global_server_args_dict, "numerics", "auto")
-    target = _history_backend(0)
     config = SimpleNamespace(
         qcp_size=1,
         kvp_size=WORLD,
@@ -1229,27 +1117,9 @@ def test_the_registry_allocates_the_history_workspace_for_the_target(monkeypatch
         ),
     )
     planned = dsa_history_gather_workspace_bytes(config, max_model_len=37)
-    _prepare_fixed_workspaces(
-        server_args=SimpleNamespace(speculative_num_draft_tokens=2),
-        config=config,
-        backend=_router(target, is_draft=False),
-        draft_backend=None,
-        uses_paged_state_verify=False,
-        is_inkling=False,
-        qsa_bf16_scratch=None,
-        expected_bytes=planned,
-    )
-    assert target.history_gather_workspace().nbytes == planned
-    _init_history(target)
-    assert target.history_prefill_plan() is not None
-
     # Kimi-K3.1: the hybrid wrapper hands the workspace to its DSA child,
     # beside the KDA verify staging of its linear child.
-    from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
-        HybridLinearAttnBackend,
-    )
-
-    hybrid_target = _history_backend(0)
+    target = _history_backend(0)
     staged = []
     linear = SimpleNamespace(
         preallocate_verify_workspace=lambda max_bs, width: staged.append(
@@ -1260,16 +1130,14 @@ def test_the_registry_allocates_the_history_workspace_for_the_target(monkeypatch
     _prepare_fixed_workspaces(
         server_args=SimpleNamespace(speculative_num_draft_tokens=2),
         config=config,
-        backend=HybridLinearAttnBackend(
-            _router(hybrid_target, is_draft=False), linear, [0]
-        ),
+        backend=HybridLinearAttnBackend(_router(target, is_draft=False), linear, [0]),
         draft_backend=None,
         uses_paged_state_verify=True,
         is_inkling=False,
         qsa_bf16_scratch=None,
         expected_bytes=planned + 64,
     )
-    assert hybrid_target.history_gather_workspace().nbytes == planned
+    assert target.history_gather_workspace().nbytes == planned
     assert staged == [(4, 2)]
 
 

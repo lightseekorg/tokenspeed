@@ -3254,7 +3254,7 @@ def index_k_layernorm_scatter(
 
 
 @triton.jit
-def _index_k_layernorm_fp8_scatter_kernel(
+def _index_k_layernorm_fp8_scatter_row(
     fp8_buf_ptr,  # uint8 flat view of the paged plane
     scale_buf_ptr,  # float32 (int32 for MXFP4) flat view of the same storage
     x_ptr,  # [tokens, HD] pre-norm keys, unit inner stride
@@ -3262,6 +3262,7 @@ def _index_k_layernorm_fp8_scatter_kernel(
     bias_ptr,  # [HD] LayerNorm bias
     loc_ptr,  # int [tokens] slot index
     write_mask_ptr,
+    t,  # int64 row
     x_row_stride,
     page_bytes,  # bytes per page (page stride)
     scale_base_off,  # 4-byte offset of a page's scales (code bytes // 4)
@@ -3273,10 +3274,9 @@ def _index_k_layernorm_fp8_scatter_kernel(
     NG: tl.constexpr,
     BLOCK_NG: tl.constexpr,
     FP8_MAX: tl.constexpr,
-    MXFP4: tl.constexpr = False,
+    MXFP4: tl.constexpr,
 ):
     tl.static_assert(not MXFP4 or (HD == 128 and GROUP == 32))
-    t = tl.program_id(0).to(tl.int64)
     g = tl.arange(0, BLOCK_NG)[:, None]
     c = tl.arange(0, GROUP)[None, :]
     d = g * GROUP + c
@@ -3335,7 +3335,53 @@ def _index_k_layernorm_fp8_scatter_kernel(
         )
 
 
-def index_k_layernorm_fp8_scatter(
+@triton.jit
+def _index_k_layernorm_fp8_scatter_kernel(
+    fp8_buf_ptr,
+    scale_buf_ptr,
+    x_ptr,
+    weight_ptr,
+    bias_ptr,
+    loc_ptr,
+    write_mask_ptr,
+    x_row_stride,
+    page_bytes,
+    scale_base_off,
+    eps,
+    HAS_WRITE_MASK: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    HD: tl.constexpr,
+    GROUP: tl.constexpr,
+    NG: tl.constexpr,
+    BLOCK_NG: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    MXFP4: tl.constexpr,
+):
+    _index_k_layernorm_fp8_scatter_row(
+        fp8_buf_ptr,
+        scale_buf_ptr,
+        x_ptr,
+        weight_ptr,
+        bias_ptr,
+        loc_ptr,
+        write_mask_ptr,
+        tl.program_id(0).to(tl.int64),
+        x_row_stride,
+        page_bytes,
+        scale_base_off,
+        eps,
+        HAS_WRITE_MASK,
+        PAGE_SIZE,
+        HD,
+        GROUP,
+        NG,
+        BLOCK_NG,
+        FP8_MAX,
+        MXFP4,
+    )
+
+
+def _index_k_layernorm_fp8_scatter_args(
     buf: torch.Tensor,
     index_k: torch.Tensor,
     weight: torch.Tensor,
@@ -3347,36 +3393,11 @@ def index_k_layernorm_fp8_scatter(
     group_size: int,
     write_mask: torch.Tensor | None,
     index_k_format: str = "fp8_scaled",
-) -> None:
-    """LayerNorm pre-norm index keys and write them as fp8_scaled rows.
+) -> tuple[tuple, dict[str, object]]:
+    """Validate an :func:`index_k_layernorm_fp8_scatter` write (same arguments).
 
-    One launch equivalent of ``index_k_block_split_scatter(buf, *fp8(ln(x)),
-    loc, ...)`` where ``ln`` is the FP32 LayerNorm rounded to ``index_k``'s
-    dtype and ``fp8`` gives each ``group_size`` group the scale
-    ``max(amax, 1e-10) / 448`` and the E4M3 codes of the clamped quotient.
-
-    Args:
-        buf: uint8 ``index_k_block_split_scatter`` plane: a ``[slots,
-            row_bytes]`` slot matrix or a ``[pages, page_bytes]`` page view
-            whose pages may sit further apart.
-        index_k: ``[tokens, head_dim]`` pre-norm keys with unit inner stride;
-            the row stride may be padded.
-        weight: ``[head_dim]`` LayerNorm weight.
-        bias: ``[head_dim]`` LayerNorm bias.
-        loc: ``[tokens]`` non-negative integer slot indices.
-        eps: Positive LayerNorm epsilon.
-        page_size: Rows per page of the plane.
-        group_size: Elements per scale; divides ``head_dim``.
-        write_mask: Optional bool ``[tokens]`` ownership mask; False rows are
-            not written. None writes every row.
-        index_k_format: ``"fp8_scaled"``, or ``"mxfp4"`` for DSV4.1's index
-            codec: 64 nibble-packed E2M1 code bytes per row (even element in
-            the low nibble) and then each row's four UE8M0 exponents of
-            ``2**ceil(log2(max(amax, 6 * 2**-126) / 6))``. mxfp4 needs
-            ``head_dim`` 128 and ``group_size`` 32.
-
-    Returns:
-        None; ``buf`` is written in place.
+    Returns ``(args, constexprs)``: the runtime arguments and the constexprs
+    ``_index_k_layernorm_fp8_scatter_kernel`` takes for it.
     """
     if index_k_format not in ("fp8_scaled", "mxfp4"):
         raise ValueError(f"unsupported index_k_format {index_k_format!r}")
@@ -3421,9 +3442,7 @@ def index_k_layernorm_fp8_scatter(
         raise ValueError("Index-K cache requires dense rows within each page")
     if buf.storage_offset() % 4 or page_bytes % 4:
         raise ValueError("Index-K pages must be float32 aligned")
-    if tokens == 0:
-        return
-    _index_k_layernorm_fp8_scatter_kernel[(tokens,)](
+    args = (
         buf,
         buf.view(torch.int32 if mxfp4 else torch.float32),
         index_k,
@@ -3435,15 +3454,79 @@ def index_k_layernorm_fp8_scatter(
         page_bytes,
         (page_size * code_bytes) // 4,
         float(eps),
-        HAS_WRITE_MASK=write_mask is not None,
-        PAGE_SIZE=page_size,
-        HD=head_dim,
-        GROUP=group_size,
-        NG=ng,
-        BLOCK_NG=_next_power_of_two(ng),
-        FP8_MAX=float(torch.finfo(torch.float8_e4m3fn).max),
-        MXFP4=mxfp4,
-        num_warps=1,
+    )
+    constexprs = {
+        "HAS_WRITE_MASK": write_mask is not None,
+        "PAGE_SIZE": page_size,
+        "HD": head_dim,
+        "GROUP": group_size,
+        "NG": ng,
+        "BLOCK_NG": _next_power_of_two(ng),
+        "FP8_MAX": float(torch.finfo(torch.float8_e4m3fn).max),
+        "MXFP4": mxfp4,
+    }
+    return args, constexprs
+
+
+def index_k_layernorm_fp8_scatter(
+    buf: torch.Tensor,
+    index_k: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    loc: torch.Tensor,
+    *,
+    eps: float,
+    page_size: int,
+    group_size: int,
+    write_mask: torch.Tensor | None,
+    index_k_format: str = "fp8_scaled",
+) -> None:
+    """LayerNorm pre-norm index keys and write them as fp8_scaled rows.
+
+    One launch equivalent of ``index_k_block_split_scatter(buf, *fp8(ln(x)),
+    loc, ...)`` where ``ln`` is the FP32 LayerNorm rounded to ``index_k``'s
+    dtype and ``fp8`` gives each ``group_size`` group the scale
+    ``max(amax, 1e-10) / 448`` and the E4M3 codes of the clamped quotient.
+
+    Args:
+        buf: uint8 ``index_k_block_split_scatter`` plane: a ``[slots,
+            row_bytes]`` slot matrix or a ``[pages, page_bytes]`` page view
+            whose pages may sit further apart.
+        index_k: ``[tokens, head_dim]`` pre-norm keys with unit inner stride;
+            the row stride may be padded.
+        weight: ``[head_dim]`` LayerNorm weight.
+        bias: ``[head_dim]`` LayerNorm bias.
+        loc: ``[tokens]`` non-negative integer slot indices.
+        eps: Positive LayerNorm epsilon.
+        page_size: Rows per page of the plane.
+        group_size: Elements per scale; divides ``head_dim``.
+        write_mask: Optional bool ``[tokens]`` ownership mask; False rows are
+            not written. None writes every row.
+        index_k_format: ``"fp8_scaled"``, or ``"mxfp4"`` for DSV4.1's index
+            codec: 64 nibble-packed E2M1 code bytes per row (even element in
+            the low nibble) and then each row's four UE8M0 exponents of
+            ``2**ceil(log2(max(amax, 6 * 2**-126) / 6))``. mxfp4 needs
+            ``head_dim`` 128 and ``group_size`` 32.
+
+    Returns:
+        None; ``buf`` is written in place.
+    """
+    args, constexprs = _index_k_layernorm_fp8_scatter_args(
+        buf,
+        index_k,
+        weight,
+        bias,
+        loc,
+        eps=eps,
+        page_size=page_size,
+        group_size=group_size,
+        write_mask=write_mask,
+        index_k_format=index_k_format,
+    )
+    if index_k.shape[0] == 0:
+        return
+    _index_k_layernorm_fp8_scatter_kernel[(index_k.shape[0],)](
+        *args, **constexprs, num_warps=1
     )
 
 

@@ -669,7 +669,6 @@ def test_dsa_sparse_leaf_log_names_the_real_selection(monkeypatch, caplog, kv_dt
         "triton",
         "trtllm_core",
         "other_core",
-        "no_records_leaf",
         "planned",
         "no_kvp",
         "bf16_cache",
@@ -680,11 +679,12 @@ def test_dcp_records_core_follows_the_ordinary_prefill_selection(monkeypatch, ca
     its padded query for the trtllm-gen one only.
 
     configure_runtime, once the solution pin has landed, asks the forward's
-    own LSE prefill selection (an FP8 query on the FP8 cache) and the records
-    op for the same inputs. A planned leaf keeps its core and a leaf without
-    KVP runs no head-sharded prefill, so neither asks. Nor does a BF16 cache,
-    although its selection here is the Triton core: its query keeps the
-    ordinary gather, which takes the multicast kernels where they reach.
+    own LSE prefill selection (an FP8 query on the FP8 cache); the records op
+    selects per prefill size instead. A planned leaf keeps its core and a
+    leaf without KVP runs no head-sharded prefill, so neither asks. Nor does a
+    BF16 cache, although its selection here is the Triton core: its query
+    keeps the ordinary gather, which takes the multicast kernels where they
+    reach.
     """
     dsa = backends.dsa
     backend, _ = _sparse_leaf_backend(
@@ -705,8 +705,6 @@ def test_dcp_records_core_follows_the_ordinary_prefill_selection(monkeypatch, ca
                 "trtllm_core": "flashinfer_trtllm_dsa_prefill",
             }.get(case, "triton_dsa_prefill")
             return SimpleNamespace(name=core)
-        if mode == "dsa_prefill_dcp_records" and case == "no_records_leaf":
-            raise NoKernelFoundError("no records leaf")
         return SimpleNamespace(name=f"fake_{mode}")
 
     monkeypatch.setattr(dsa, "select_kernel", select)
@@ -717,14 +715,12 @@ def test_dcp_records_core_follows_the_ordinary_prefill_selection(monkeypatch, ca
     )
     assert backend._dcp_records_core is (case == "triton")
     assert backend._dcp_padded_query is (case == "trtllm_core")
-    records = [call for call in calls if call[0] == "dsa_prefill_dcp_records"]
+    assert not [call for call in calls if call[0] == "dsa_prefill_dcp_records"]
     if case in ("planned", "no_kvp", "bf16_cache"):
-        assert not records
         return
-    # The probe precedes the startup log and asks the records op what it asked prefill.
-    prefill, records_call = calls[:2]
-    assert records == [records_call]
-    assert prefill[0] == "dsa_prefill" and prefill[1:] == records_call[1:]
+    # The probe precedes the startup log.
+    prefill = calls[0]
+    assert prefill[0] == "dsa_prefill"
     _, signature, traits, solution = prefill
     assert signature == format_signature(q=dense_tensor_format(torch.float8_e4m3fn))
     assert traits["return_lse"] is True and traits["topk"] == 2048
@@ -736,39 +732,31 @@ def test_dcp_records_core_follows_the_ordinary_prefill_selection(monkeypatch, ca
     [
         "gfx950",
         "verify_other_core",
-        "other_core",
-        "no_records_leaf",
         "planned",
-        "no_kvp",
         "bf16_cache",
     ],
 )
 def test_dcp_decode_records_core_follows_every_decode_selection(monkeypatch, case):
     """The decode records core stands in for gfx950's dense decode core only,
     and only where both decode selections pick it: one row per request and
-    the verify rows. A planned decode keeps its core, a leaf without KVP runs
-    no head-sharded decode and a BF16 cache's query keeps the ordinary
-    gather.
+    the verify rows. A planned decode keeps its core and a BF16 cache's query
+    keeps the ordinary gather.
     """
     dsa = backends.dsa
     backend, _ = _sparse_leaf_backend(
         monkeypatch,
         data_type=torch.bfloat16 if case == "bf16_cache" else torch.float8_e4m3fn,
-        kvp_group=(0,) if case == "no_kvp" else (0, 1, 2, 3),
+        kvp_group=(0, 1, 2, 3),
         decode_kernel_plan=_plan("planned_decode", []) if case == "planned" else None,
     )
 
     def select(family, mode, signature, *, traits, solution):
         assert family == "attention"
         if mode == "dsa_decode":
-            other = case == "other_core" or (
-                case == "verify_other_core" and traits["q_len"] > 1
-            )
+            other = case == "verify_other_core" and traits["q_len"] > 1
             return SimpleNamespace(
                 name="triton_dsa_decode" if other else "gluon_dsa_decode_gfx950"
             )
-        if mode == "dsa_decode_dcp_records" and case == "no_records_leaf":
-            raise NoKernelFoundError("no records leaf")
         return SimpleNamespace(name=f"fake_{mode}")
 
     monkeypatch.setattr(dsa, "select_kernel", select)
@@ -863,7 +851,7 @@ def test_dcp_records_core_on_the_real_k31_selection(monkeypatch, solution):
     or current_platform().arch_version != ArchVersion(9, 5),
     reason="the gfx950 DSA decode core registers on AMD gfx950 GPUs",
 )
-@pytest.mark.parametrize("solution", [None, "gluon", "triton"])
+@pytest.mark.parametrize("solution", [None, "triton"])
 def test_dcp_decode_records_core_on_the_real_k31_selection(monkeypatch, solution):
     # K3.1's FP8 cache at KVP8 with its 4 verify rows (the 3.1 drafter's three
     # tokens) against the real registry: gfx950's dense core decodes both

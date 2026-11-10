@@ -450,6 +450,22 @@ class ProfileReqOutput(BaseReq, kw_only=True):
     message: str
 
 
+class ReloadForwardReqInput(BaseReq, kw_only=True):
+    # How a drain treats running requests: "wait" lets them finish, "abort" ends them.
+    mode: str = "wait"
+    # Modules to re-execute; None reloads every module whose source changed.
+    modules: list[str] | None = None
+    # The caller's id, the same on every engine; the gate runs the reload once all hold it.
+    id: str | None = None
+    # Seconds to wait for the drain and every attention-DP engine; None waits until cancelled.
+    timeout_s: float | None = None
+
+
+class ReloadForwardReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+
+
 # ============================================================================
 # msgpack codec for engine IPC.
 #

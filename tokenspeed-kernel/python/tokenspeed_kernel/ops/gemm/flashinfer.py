@@ -578,6 +578,9 @@ if mm_fp4 is not error_fn:
         if alpha is None or alpha.numel() != 1:
             raise ValueError("NVFP4 GEMM takes a one-element global alpha")
         m, n, k = A.shape[0], B.shape[1], A.shape[1] * 2
+        if m == 0:
+            # The kernel cannot launch an empty grid, as on an idle data-parallel rank.
+            return out if out is not None else A.new_empty((0, n), dtype=out_dtype)
         direct = out is not None and out.is_contiguous() and out.data_ptr() % 16 == 0
         result = (
             out if direct else torch.empty((m, n), dtype=out_dtype, device=A.device)

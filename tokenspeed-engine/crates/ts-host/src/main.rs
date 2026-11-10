@@ -56,11 +56,12 @@ use ts_control::{
     batch_log::BatchLogConfig,
     control::ControlConfig,
     eplb::{Algorithm, Controller, EplbConfig, EplbSpecs, COMMIT_DELAY_FORWARDS},
-    event_loop::{EventLoop, LoopConfig, LoopError, Ranks, Subsystems},
+    event_loop::{EventLoop, LoopConfig, LoopError, PrefillDelay, Ranks, Subsystems},
     grammar::{GrammarConfig, Grammars, ReasoningGrammar},
     ingress::{IngressLimits, LogprobServability},
     kv_events::{KvEventPublisher, KvEventsConfig},
     output::{FinishLog, OutputProcessor, Role},
+    startup,
     transport::{EngineTransport, TransportError},
 };
 use ts_metrics::{
@@ -224,6 +225,9 @@ struct HostConfig {
     kv_total_pages: i64,
     /// Effective token capacity of the usable KV pool.
     kv_token_capacity: i64,
+    /// With `--enable-startup-requests`, what sizes the requests the engine
+    /// serves itself before it registers.
+    startup: Option<startup::Limits>,
     rank: usize,
     replica_ranks: Vec<usize>,
     pp_ranks: Option<Vec<usize>>,
@@ -250,6 +254,9 @@ struct HostConfig {
     grammar: Option<GrammarConfig>,
     /// The data plane fills bitmasks from the matchers' committed state.
     eager_grammar: bool,
+    /// The fused role's prefill-delay gate, `(attempt_interval,
+    /// any_interval)` in rounds, when `--prefill-attempt-interval` is set.
+    prefill_delay: Option<PrefillDelay>,
 }
 
 /// `rust_host.HostConfig.eplb`.
@@ -448,6 +455,22 @@ impl HostConfig {
             physical_context_len: config.getattr("physical_context_len")?.extract()?,
             kv_total_pages: config.getattr("kv_total_pages")?.extract()?,
             kv_token_capacity: config.getattr("kv_token_capacity")?.extract()?,
+            startup: if config.getattr("startup_requests")?.extract()? {
+                Some(startup::Limits {
+                    max_batch_size: config.getattr("max_batch_size")?.extract()?,
+                    chunk_tokens: config.getattr("chunked_prefill_size")?.extract()?,
+                    max_prompt_len: config.getattr("max_req_input_len")?.extract()?,
+                    max_model_len: config.getattr("max_model_len")?.extract()?,
+                    token_capacity: config.getattr("kv_token_capacity")?.extract()?,
+                    page_tokens: config.getattr("prefix_granularity")?.extract()?,
+                    decode_width: config
+                        .getattr("spec_num_tokens")?
+                        .extract::<Option<usize>>()?
+                        .unwrap_or(1),
+                })
+            } else {
+                None
+            },
             rank: config.getattr("rank")?.extract()?,
             replica_ranks: config.getattr("replica_ranks")?.extract()?,
             pp_ranks: config.getattr("pp_ranks")?.extract()?,
@@ -458,6 +481,7 @@ impl HostConfig {
                 memory_regions: config.getattr("memory_regions")?.extract()?,
                 // With L3, the namespace's weight version.
                 l3_weight_version: l3.as_ref().map(|l3| l3.weight_version.clone()),
+                allow_reload_forward: config.getattr("allow_reload_forward")?.extract()?,
             },
             l3,
             eplb: Eplb::from_python(&config.getattr("eplb")?)?,
@@ -478,6 +502,24 @@ impl HostConfig {
                 }
             },
             eager_grammar: config.getattr("eager_grammar")?.extract()?,
+            prefill_delay: match config
+                .getattr("prefill_delay")?
+                .extract::<Option<(u64, u64)>>()?
+            {
+                None => None,
+                Some((attempt_interval, any_interval)) => {
+                    if attempt_interval < 1 || any_interval < attempt_interval {
+                        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                            "prefill delay needs 1 <= attempt_interval <= any_interval, got \
+                             {attempt_interval} and {any_interval}"
+                        )));
+                    }
+                    Some(PrefillDelay {
+                        attempt_interval,
+                        any_interval,
+                    })
+                }
+            },
             metrics: Metrics::from_python(config)?,
             batch_log: BatchLogConfig {
                 enabled: config.getattr("batch_log")?.extract()?,
@@ -648,18 +690,7 @@ fn serve(args: &Args) -> Result<(), HostError> {
     };
 
     // The replica's first member speaks for it.
-    let transport = if ranks.replica.index() == 0 {
-        let mut ready: EngineCoreReadyResponse = ts_wire::decode_bytes(&config.ready_response)?;
-        ready.declare_scheduler();
-        Some(EngineTransport::connect(
-            &config.handshake_address,
-            config.engine_index,
-            ready,
-            HANDSHAKE_TIMEOUT,
-        )?)
-    } else {
-        None
-    };
+    let speaks = ranks.replica.index() == 0;
     let call = |method: &str| {
         Python::attach(|py| {
             bootstrap
@@ -668,8 +699,6 @@ fn serve(args: &Args) -> Result<(), HostError> {
                 .map_err(|error| python_error(py, error))
         })
     };
-    call("report_ready")?;
-    call("enter_serving")?;
 
     if config.grammar.is_some() {
         // The data plane drives the matchers through these.
@@ -733,6 +762,7 @@ fn serve(args: &Args) -> Result<(), HostError> {
         kv_events: config.kv_events,
         epd_receive_enabled: config.epd_receive_enabled,
         eager_grammar: config.eager_grammar,
+        prefill_delay: config.prefill_delay,
     };
     tracing::info!(
         rank = config.rank,
@@ -765,7 +795,7 @@ fn serve(args: &Args) -> Result<(), HostError> {
     let mut event_loop = EventLoop::new(
         scheduler,
         data_plane,
-        transport,
+        None::<EngineTransport>,
         outputs,
         loop_config,
         ranks,
@@ -780,11 +810,40 @@ fn serve(args: &Args) -> Result<(), HostError> {
             l3,
         },
     );
-    let served = event_loop.run(&stop);
+    let served = (|| -> Result<(), HostError> {
+        // The engine registers only once its own requests ran: no client
+        // request can reach it before then.
+        if let Some(limits) = config.startup {
+            let phases = limits.phases();
+            let started = std::time::Instant::now();
+            let requests = startup::requests(&phases, limits.output_tokens());
+            if event_loop.warm_up(requests, &stop)? {
+                return Ok(());
+            }
+            tracing::info!(
+                ?phases,
+                elapsed_ms = started.elapsed().as_millis(),
+                "served the startup requests"
+            );
+        }
+        if speaks {
+            let mut ready: EngineCoreReadyResponse = ts_wire::decode_bytes(&config.ready_response)?;
+            ready.declare_scheduler();
+            *event_loop.frontend_mut() = Some(EngineTransport::connect(
+                &config.handshake_address,
+                config.engine_index,
+                ready,
+                HANDSHAKE_TIMEOUT,
+            )?);
+        }
+        call("report_ready")?;
+        call("enter_serving")?;
+        Ok(event_loop.run(&stop)?)
+    })();
     // Stops the forward thread and tells the frontend the engine is gone.
     drop(event_loop);
     call("close")?;
-    Ok(served?)
+    served
 }
 
 fn main() -> ExitCode {

@@ -206,6 +206,7 @@ if TYPE_CHECKING:
     from tokenspeed_kernel.ops.communication._iris.kimi_k3 import K3IrisState
     from tokenspeed_kernel.ops.moe._cute_dsl.k3_decode import (
         KimiK3DecodeAttentionLayer,
+        KimiK3DecodeMoE,
         KimiK3DecodeMoELayer,
     )
     from tokenspeed_kernel.thirdparty.cute_dsl.k3_decode.attn_res.prepared import (
@@ -892,6 +893,30 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
             absorbed_query=absorbed_query,
         )
         return attn_output if fused else sigmoid_mul(attn_output, gate)
+
+    def decode_weights(self) -> tuple[torch.Tensor, ...]:
+        """The weights one decode step reads, in reading order.
+
+        The packed [q_a | kv_a | gate] projection, q_b, the absorbed key and
+        value projections (once derived) and the o-projection.
+        """
+        absorbed = tuple(w for w in (self.w_kc, self.w_vc) if w is not None)
+        projection = self.fused_qkv_a_proj_with_mqa.weight
+        return (projection, self.q_b_proj.weight, *absorbed, self.o_proj.weight)
+
+    def decode_projection_parts(self) -> tuple[torch.Tensor, ...]:
+        """The weights stacked row-wise into the decode chain's input projection.
+
+        In output order: the packed [q_a | kv_a | gate] projection alone.
+        """
+        return (self.fused_qkv_a_proj_with_mqa.weight,)
+
+    def pack_decode_projection(self) -> torch.Tensor:
+        """The decode chain's input projection weight.
+
+        It is the [q_a | kv_a | gate] projection as loaded.
+        """
+        return self.fused_qkv_a_proj_with_mqa.weight
 
 
 def _sliced_scratch(like: torch.Tensor, slot: int, n_tokens: int):
@@ -1843,6 +1868,28 @@ class KimiLinearKDA(nn.Module):
         )
         core_out = self._recurrent_core(mixed_qkv, f_a_out, beta, ctx)
         return self._gated_norm(core_out, out_gate)
+
+    def decode_weights(self) -> tuple[torch.Tensor, ...]:
+        """The weights one decode step reads, in reading order.
+
+        The merged input projection, the decay gate's up projection and the
+        o-projection.
+        """
+        return (self.qkvgb_proj.weight, self.f_b_proj.weight, self.o_proj.weight)
+
+    def decode_projection_parts(self) -> tuple[torch.Tensor, ...]:
+        """The weights stacked row-wise into the decode chain's input projection.
+
+        In output order: the merged input projection alone.
+        """
+        return (self.qkvgb_proj.weight,)
+
+    def pack_decode_projection(self) -> torch.Tensor:
+        """The decode chain's input projection weight.
+
+        It is the merged input projection as loaded.
+        """
+        return self.qkvgb_proj.weight
 
     def _recurrent_core(
         self,
@@ -4261,6 +4308,9 @@ class KimiLinearModel(nn.Module):
         # by prepare_communication_runtime.
         self.decode_final: PreparedAttnRes | None = None
         self.decode_batches: tuple[int, ...] = ()
+        # The decode MoE chain's owner, whose side streams rejoin at the end of
+        # every forward; bound by prepare_communication_runtime.
+        self.decode_chain: KimiK3DecodeMoE | None = None
 
         # DFLASH/DSpark speculative decoding: layer indices whose *output*
         # stream is captured for the draft. Populated by
@@ -4498,6 +4548,8 @@ class KimiLinearModel(nn.Module):
                     if stream is not None and stream.sharded
                     else prefix_sum.clone()
                 )
+        if self.decode_chain is not None:
+            self.decode_chain.join()
         if stream is not None and stream.activation is not None:
             # Mix and norm already applied; the activation borrows collective storage.
             return stream.activation.clone(), aux_hidden_states
@@ -4661,6 +4713,7 @@ class KimiLinearModel(nn.Module):
             self.decode_final.run_ring(prefix, blocks, out)
         else:
             self.decode_final.run(delta, prefix, blocks, out)
+        self.decode_chain.join()
         capture(self.pp_end_layer - 1)
         if dspark_context is not None:
             self._write_dspark_context(ctx, positions, projected_context)
@@ -4839,6 +4892,40 @@ class KimiLinearForCausalLM(BaseCausalLM):
             return False
         from tokenspeed_kernel.ops.moe._cute_dsl.k3_decode import KimiK3DecodeMoE
 
+        decoders = [
+            layer
+            for layer in self.model.layers
+            if isinstance(layer, KimiLinearDecoderLayer)
+        ]
+
+        def attention_served(layer) -> bool:
+            # The chain owns the o-projection's reduction and gates MLA outputs.
+            attn = layer.self_attn
+            kda = isinstance(attn, KimiLinearKDA)
+            parts = attn.decode_projection_parts()
+            return (
+                attn.qkv_parallel is None
+                and attn.output_parallel is None
+                and not attn.o_proj.supports_fp8_group128_input
+                and (kda or attn.use_output_gate)
+                and len({part.dtype for part in parts}) == 1
+                and attention_supports(
+                    projection_rows=sum(part.shape[0] for part in parts),
+                    o_proj_width=attn.o_proj.weight.shape[1],
+                    projection_dtype=parts[0].dtype,
+                    o_proj_dtype=attn.o_proj.weight.dtype,
+                )
+            )
+
+        serve_attention = len(decoders) == self.config.num_hidden_layers and all(
+            attention_served(layer) for layer in decoders
+        )
+        # Packed before the MoE layers record the next attention's weights.
+        projections = (
+            [layer.self_attn.pack_decode_projection() for layer in decoders]
+            if serve_attention
+            else []
+        )
         beta, linear_beta = _situ_betas(self.config)
         owner = KimiK3DecodeMoE(
             group=group,
@@ -4851,6 +4938,8 @@ class KimiLinearForCausalLM(BaseCausalLM):
         for ordinal, layer in enumerate(layers):
             moe = layer.block_sparse_moe
             norm = moe.routed_expert_norm
+            # The chain prefetches the next attention's weights while the experts run.
+            following = decoders[decoders.index(layer) + 1 :]
             moe.decode_moe = owner.layer(
                 ordinal=ordinal,
                 layer_idx=layer.layer_id,
@@ -4868,38 +4957,15 @@ class KimiLinearForCausalLM(BaseCausalLM):
                 norm_weight=norm.weight,
                 norm_eps=norm.variance_epsilon,
                 up_shard=moe.routed_expert_up_proj.weight,
+                next_attention=(
+                    following[0].self_attn.decode_weights() if following else ()
+                ),
             )
+        self.model.decode_chain = owner
         logger.info(
             f"K3 decode MoE chain bound to {len(layers)} layers for batches {batches}"
         )
-
-        decoders = [
-            layer
-            for layer in self.model.layers
-            if isinstance(layer, KimiLinearDecoderLayer)
-        ]
-
-        def attention_served(layer) -> bool:
-            # The chain owns the o-projection's reduction and gates MLA outputs.
-            attn = layer.self_attn
-            kda = isinstance(attn, KimiLinearKDA)
-            projection = attn.qkvgb_proj if kda else attn.fused_qkv_a_proj_with_mqa
-            return (
-                attn.qkv_parallel is None
-                and attn.output_parallel is None
-                and not attn.o_proj.supports_fp8_group128_input
-                and (kda or attn.use_output_gate)
-                and attention_supports(
-                    projection_rows=projection.weight.shape[0],
-                    o_proj_width=attn.o_proj.weight.shape[1],
-                    projection_dtype=projection.weight.dtype,
-                    o_proj_dtype=attn.o_proj.weight.dtype,
-                )
-            )
-
-        if len(decoders) != self.config.num_hidden_layers or not all(
-            attention_served(layer) for layer in decoders
-        ):
+        if not serve_attention:
             return True
         from tokenspeed_kernel.ops.moe._cute_dsl.k3_decode import (
             KimiK3DecodeAttention,
@@ -4910,19 +4976,14 @@ class KimiLinearForCausalLM(BaseCausalLM):
             batches=batches,
             moe=owner,
         )
-        for layer in decoders:
-            mla = isinstance(layer.self_attn, KimiLinearMLAAttention)
-            projection = (
-                layer.self_attn.fused_qkv_a_proj_with_mqa
-                if mla
-                else layer.self_attn.qkvgb_proj
-            )
+        for layer, projection in zip(decoders, projections, strict=True):
             layer.decode_attention = attention.layer(
                 layer,
                 layer_idx=layer.layer_id,
-                mla=mla,
+                mla=isinstance(layer.self_attn, KimiLinearMLAAttention),
                 first=layer is decoders[0],
-                projection_weight=projection.weight,
+                projection_weight=projection,
+                moe=layer.block_sparse_moe.decode_moe if layer.is_moe_layer else None,
             )
         self.model.decode_final = attention.final(
             res_norm=self.model.output_attn_res_norm,

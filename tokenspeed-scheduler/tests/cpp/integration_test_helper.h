@@ -95,7 +95,10 @@ protected:
 
     void Submit(const std::vector<RequestSpec>& specs) { scheduler_->SubmitRequests(specs); }
 
-    ExecutionPlan PlanOnce() { return scheduler_->NextExecutionPlan(); }
+    ExecutionPlan PlanOnce() {
+        return scheduler_->NextExecutionPlan(
+            Scheduler::PlanOptions{.allow_prefill = true, .apply_prefill_watermark = false});
+    }
 
     static std::vector<CacheOperation> ExtractCacheOps(const ExecutionPlan& plan) {
         std::vector<CacheOperation> result;
@@ -170,6 +173,15 @@ protected:
     void SendAbortEvent(const std::string& request_id) {
         ExecutionEvent event;
         event.With(forward::Abort{.request_id = request_id});
+        scheduler_->Advance(std::move(event));
+    }
+
+    // The PD transport's report that a failed or cancelled transfer stopped:
+    // a request an abort or a failure parked in PdTransferring returns its
+    // pages. Ignored for any other request.
+    void SendTransferStopped(const std::string& request_id) {
+        ExecutionEvent event;
+        event.With(pd::TransferStoppedEvent{request_id});
         scheduler_->Advance(std::move(event));
     }
 

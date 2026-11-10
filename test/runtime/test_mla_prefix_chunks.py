@@ -153,12 +153,17 @@ def test_page_indices_and_graph_replay(monkeypatch, page_size):
         torch.testing.assert_close(actual, reference)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_page_table_width_does_not_compile_a_new_kernel():
+def _kernel_test_utils():
     helper = Path(__file__).resolve().parents[2] / "tokenspeed-kernel/test/utils.py"
     spec = importlib.util.spec_from_file_location("kernel_test_utils", helper)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_page_table_width_does_not_compile_a_new_kernel():
+    module = _kernel_test_utils()
     starts = torch.tensor([0, 0], device="cuda", dtype=torch.int32)
     sizes = torch.tensor([64, 64], device="cuda", dtype=torch.int32)
     cumulative = torch.tensor([0, 64, 128], device="cuda", dtype=torch.int32)
@@ -183,8 +188,38 @@ def test_page_table_width_does_not_compile_a_new_kernel():
 
     fill(16)
     with module.assert_no_triton_compile(create_chunked_cache_kv_indices_paged):
-        for width in (17, 31, 32, 47):
+        for width in (1, 17, 31, 32, 47):
             fill(width)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_prefix_slices_at_any_request_reuse_one_kernel():
+    table = torch.empty(16, 1024, device="cuda", dtype=torch.int32)
+    lengths = torch.empty(128, device="cuda", dtype=torch.int32)
+    cumulative = torch.empty(128, device="cuda", dtype=torch.int32)
+    output = torch.empty(8192, device="cuda", dtype=torch.int32)
+
+    # Compile only. A prefix chunk's per-request arrays start at any request
+    # of the batch's, so their pointers lose 16-byte alignment.
+    def compile_for(offsets):
+        offset, cumulative_offset = offsets
+        create_chunked_cache_kv_indices_paged.warmup(
+            table,
+            lengths[offset : offset + 16],
+            lengths[offset : offset + 16],
+            cumulative[cumulative_offset : cumulative_offset + 17],
+            output,
+            page_table_ptr_stride=1024,
+            PAGE_SIZE=64,
+            grid=(1,),
+        )
+
+    _kernel_test_utils().assert_warmup_covers(
+        (create_chunked_cache_kv_indices_paged,),
+        lambda: compile_for((0, 0)),
+        compile_for,
+        ((1, 1), (1, 4)),
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

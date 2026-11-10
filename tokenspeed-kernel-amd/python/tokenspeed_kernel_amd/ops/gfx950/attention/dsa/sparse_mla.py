@@ -3344,9 +3344,8 @@ def gluon_dsa_row_bounded_logical_topk_gfx950(
 
     One workgroup selects each row over its own range, so the cost follows
     the rows' lengths, not the buffer's width; the width-planned kernels
-    scan the whole width (MI350X, 64 rows over 1M columns: 25 us at 6K-token
-    rows against 86 us, 78 against 99 at 128K). Past about 200K-token rows
-    the persistent kernel's split rows are faster.
+    scan the whole width. For very long rows the persistent kernel's split
+    rows are faster.
 
     Args and returns as :func:`gluon_dsa_logical_topk_gfx950`, except that
     ``row_starts`` may be None: every row then starts at column 0, without

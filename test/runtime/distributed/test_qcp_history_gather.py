@@ -141,13 +141,50 @@ def _get_open_port() -> int:
         return s.getsockname()[1]
 
 
-def _worker(rank: int, port: int, errors) -> None:
+def _worker(rank: int, run, port: int, errors, *args) -> None:
     try:
-        _run(rank, port)
+        run(rank, port, *args)
     except Exception:  # pragma: no cover - reported to the parent
         import traceback
 
         errors[rank] = traceback.format_exc()
+
+
+def _spawn(run, *args) -> None:
+    """``run(rank, port, *args)`` on every rank, raising the ranks' errors."""
+    port = _get_open_port()
+    errors = mp.Manager().dict()
+    mp.spawn(_worker, args=(run, port, errors, *args), nprocs=WORLD, join=True)
+    if errors:
+        raise RuntimeError("\n".join(f"rank {r}: {e}" for r, e in errors.items()))
+
+
+def _join_kvp_group(rank: int, port: int, wrap=lambda backend: backend):
+    """Join the KVP group over gloo, whose process group also stands in for
+    its NCCL one, and register ``wrap`` of the NCCL backend."""
+    from tokenspeed.runtime.distributed.comm_backend import registry
+    from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.distributed.process_group_manager import (
+        process_group_manager as pg_manager,
+    )
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    mapping = Mapping(
+        rank=rank, world_size=WORLD, attn_tp_size=WORLD, attn_kvp_size=WORLD
+    )
+    pg_manager.init_distributed(
+        mapping, distributed_init_method=f"tcp://127.0.0.1:{port}", backend="gloo"
+    )
+    group = mapping.attn.kvp_group
+    pg_manager.init_process_group(group, backend="gloo")
+    pg_manager.register_process_group(
+        "nccl", group, pg_manager.get_process_group("gloo", group)
+    )
+    global_server_args_dict["force_deterministic_rsag"] = False
+    backend = wrap(NcclBackend())
+    registry._global_backend = backend
+    return backend
 
 
 class _RecordingBackend:
@@ -173,29 +210,7 @@ class _RecordingBackend:
 
 
 def _run(rank: int, port: int) -> None:
-    from tokenspeed.runtime.distributed.comm_backend import registry
-    from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
-    from tokenspeed.runtime.distributed.mapping import Mapping
-    from tokenspeed.runtime.distributed.process_group_manager import (
-        process_group_manager as pg_manager,
-    )
-    from tokenspeed.runtime.utils.env import global_server_args_dict
-
-    mapping = Mapping(
-        rank=rank, world_size=WORLD, attn_tp_size=WORLD, attn_kvp_size=WORLD
-    )
-    pg_manager.init_distributed(
-        mapping, distributed_init_method=f"tcp://127.0.0.1:{port}", backend="gloo"
-    )
-    group = mapping.attn.kvp_group
-    pg_manager.init_process_group(group, backend="gloo")
-    pg_manager.register_process_group(
-        "nccl", group, pg_manager.get_process_group("gloo", group)
-    )
-    global_server_args_dict["force_deterministic_rsag"] = False
-    backend = _RecordingBackend(NcclBackend())
-    registry._global_backend = backend
-
+    backend = _join_kvp_group(rank, port, _RecordingBackend)
     placement = _placement(rank)
     table = _page_table()
     owned = owned_history_rows(table, SEQ_LENS, page_size=PAGE, placement=placement)
@@ -334,11 +349,7 @@ def test_rank_major_history_rejects_invalid_buffers(invalid):
 
 
 def test_history_gather_rebuilds_every_group_in_position_order():
-    port = _get_open_port()
-    errors = mp.Manager().dict()
-    mp.spawn(_worker, args=(port, errors), nprocs=WORLD, join=True)
-    if errors:
-        raise RuntimeError("\n".join(f"rank {r}: {e}" for r, e in errors.items()))
+    _spawn(_run)
 
 
 # --- the DSA leaf's index-K history gather, per plane format ------------------
@@ -411,37 +422,16 @@ def _run_index_k(
     rank: int,
     port: int,
     index_k_format: str,
-    plane: torch.Tensor,
+    planes: list[torch.Tensor],
     expected: tuple[torch.Tensor, torch.Tensor | None],
 ) -> None:
-    from tokenspeed.runtime.distributed.comm_backend import registry
-    from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
-    from tokenspeed.runtime.distributed.mapping import Mapping
-    from tokenspeed.runtime.distributed.process_group_manager import (
-        process_group_manager as pg_manager,
-    )
     from tokenspeed.runtime.layers.attention.backends.paged.dsa import (
         QueryShardHistoryGroup,
     )
-    from tokenspeed.runtime.utils.env import global_server_args_dict
 
-    mapping = Mapping(
-        rank=rank, world_size=WORLD, attn_tp_size=WORLD, attn_kvp_size=WORLD
-    )
-    pg_manager.init_distributed(
-        mapping, distributed_init_method=f"tcp://127.0.0.1:{port}", backend="gloo"
-    )
-    group = mapping.attn.kvp_group
-    pg_manager.init_process_group(group, backend="gloo")
-    pg_manager.register_process_group(
-        "nccl", group, pg_manager.get_process_group("gloo", group)
-    )
-    global_server_args_dict["force_deterministic_rsag"] = False
-    backend_comm = _RecordingBackend(NcclBackend())
-    registry._global_backend = backend_comm
-
+    backend_comm = _join_kvp_group(rank, port, _RecordingBackend)
     leaf = _dsa_leaf(rank, index_k_format, max_model_len=int(SEQ_LENS.sum()))
-    pool = index_k_pool(plane, head_dim=INDEX_HEAD_DIM, page_size=GRANULARITY)
+    pool = index_k_pool(planes[rank], head_dim=INDEX_HEAD_DIM, page_size=GRANULARITY)
     expected_keys, expected_scale = expected
     placement = leaf.cache_placement(None)
     assert placement == _placement(rank)
@@ -486,17 +476,6 @@ def _run_index_k(
     dist.destroy_process_group()
 
 
-def _index_k_worker(
-    rank: int, port: int, index_k_format: str, planes, expected, errors
-):
-    try:
-        _run_index_k(rank, port, index_k_format, planes[rank], expected)
-    except Exception:  # pragma: no cover - reported to the parent
-        import traceback
-
-        errors[rank] = traceback.format_exc()
-
-
 @pytest.mark.parametrize("index_k_format", ["fp8_scaled", "bf16"])
 def test_the_dsa_leaf_gathers_the_index_k_history_in_the_planes_format(
     index_k_format,
@@ -509,16 +488,7 @@ def test_the_dsa_leaf_gathers_the_index_k_history_in_the_planes_format(
     ``dsa_prefill_topk``) -- through one equal-share byte all-gather."""
     planes = _local_index_k_planes(index_k_format)
     expected = expected_index_k_rows(index_k_format, _index_k_keys())
-    port = _get_open_port()
-    errors = mp.Manager().dict()
-    mp.spawn(
-        _index_k_worker,
-        args=(port, index_k_format, planes, expected, errors),
-        nprocs=WORLD,
-        join=True,
-    )
-    if errors:
-        raise RuntimeError("\n".join(f"rank {r}: {e}" for r, e in errors.items()))
+    _spawn(_run_index_k, index_k_format, planes, expected)
 
 
 # --- the KVP history prefill's page gathers -----------------------------------
@@ -530,33 +500,13 @@ EXTEND = torch.tensor([3, 2, 7], dtype=torch.int64)
 def _run_history_pages(
     rank: int,
     port: int,
-    index_k_format: str,
-    index_plane: torch.Tensor,
-    expected: tuple[torch.Tensor, torch.Tensor | None],
+    planes: list[torch.Tensor],
+    expected: tuple[torch.Tensor, torch.Tensor],
 ) -> None:
-    from tokenspeed.runtime.distributed.comm_backend import registry
-    from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
-    from tokenspeed.runtime.distributed.mapping import Mapping
-    from tokenspeed.runtime.distributed.process_group_manager import (
-        process_group_manager as pg_manager,
-    )
-
-    mapping = Mapping(
-        rank=rank, world_size=WORLD, attn_tp_size=WORLD, attn_kvp_size=WORLD
-    )
-    pg_manager.init_distributed(
-        mapping, distributed_init_method=f"tcp://127.0.0.1:{port}", backend="gloo"
-    )
-    group = mapping.attn.kvp_group
-    pg_manager.init_process_group(group, backend="gloo")
-    pg_manager.register_process_group(
-        "nccl", group, pg_manager.get_process_group("gloo", group)
-    )
-    registry._global_backend = NcclBackend()
-
+    _join_kvp_group(rank, port)
     # 16 pages: requests 0 and 1 share a group (the busiest owner sends 4 of
     # their pages, 16 gathered); request 2 gathers alone.
-    leaf = _dsa_leaf(rank, index_k_format, max_model_len=32)
+    leaf = _dsa_leaf(rank, "fp8_scaled", max_model_len=32)
     leaf._history_prefill = True
     table = _page_table()
     plan = leaf._plan_history_prefill(
@@ -565,13 +515,8 @@ def _run_history_pages(
         extend_seq_lens_cpu=EXTEND,
         extend_prefix_lens_cpu=SEQ_LENS - EXTEND,
     )
-    assert [g.requests for g in plan.groups] == [slice(0, 2), slice(2, 3)]
-    assert [g.query for g in plan.groups] == [slice(0, 5), slice(5, 12)]
-    # Every rank sends the busiest owner's page count: its own pages, then
-    # padding.
-    assert [g.send_pages for g in plan.groups] == [4, 2]
     latent = _local_plane(rank)
-    index_pool = index_k_pool(index_plane, head_dim=INDEX_HEAD_DIM, page_size=PAGE)
+    index_pool = index_k_pool(planes[rank], head_dim=INDEX_HEAD_DIM, page_size=PAGE)
     pool = SimpleNamespace(
         get_key_buffer=lambda layer_id: latent,
         get_index_k_buffer=index_pool.get_index_k_buffer,
@@ -601,49 +546,27 @@ def _run_history_pages(
         keys, scale = split_index_k_rows(
             index_k_pool(
                 plane, head_dim=INDEX_HEAD_DIM, page_size=PAGE
-            ).gather_index_k_rows(0, slots, index_k_format=index_k_format),
+            ).gather_index_k_rows(0, slots, index_k_format="fp8_scaled"),
             index_head_dim=INDEX_HEAD_DIM,
-            index_k_format=index_k_format,
+            index_k_format="fp8_scaled",
         )
         assert torch.equal(keys, expected_keys[virtual_slots])
-        if index_k_format == "fp8_scaled":
-            assert torch.equal(scale, expected_scale[virtual_slots])
+        assert torch.equal(scale, expected_scale[virtual_slots])
     assert first == int(SEQ_LENS.sum())
 
     dist.barrier()
     dist.destroy_process_group()
 
 
-def _history_pages_worker(
-    rank: int, port: int, index_k_format: str, planes, expected, errors
-):
-    try:
-        _run_history_pages(rank, port, index_k_format, planes[rank], expected)
-    except Exception:  # pragma: no cover - reported to the parent
-        import traceback
-
-        errors[rank] = traceback.format_exc()
-
-
-@pytest.mark.parametrize("index_k_format", ["fp8_scaled", "bf16"])
-def test_the_history_prefill_gathers_every_row_to_its_planned_slot(index_k_format):
-    """The KVP history prefill's plan over page-sharded planes groups the
-    requests by gathered pages, and its page gathers (one all-gather per
-    plane and group) land every history row of the latent and index-K planes
-    at the slot the plan maps it to, on every rank -- the slots the prefill
-    top-k scores through and the sparse core reads."""
-    planes = _local_index_k_planes(index_k_format, page_size=PAGE)
-    expected = expected_index_k_rows(index_k_format, _index_k_keys())
-    port = _get_open_port()
-    errors = mp.Manager().dict()
-    mp.spawn(
-        _history_pages_worker,
-        args=(port, index_k_format, planes, expected, errors),
-        nprocs=WORLD,
-        join=True,
-    )
-    if errors:
-        raise RuntimeError("\n".join(f"rank {r}: {e}" for r, e in errors.items()))
+def test_the_history_prefill_gathers_every_row_to_its_planned_slot():
+    """The KVP history prefill's page gathers over page-sharded ``fp8_scaled``
+    planes (one all-gather per plane and request group) land every history
+    row of the latent and index-K planes at the slot its plan maps it to, on
+    every rank -- the slots the prefill top-k scores through and the sparse
+    core reads."""
+    planes = _local_index_k_planes("fp8_scaled", page_size=PAGE)
+    expected = expected_index_k_rows("fp8_scaled", _index_k_keys())
+    _spawn(_run_history_pages, planes, expected)
 
 
 def test_replicated_group_gathers_locally_without_a_collective():

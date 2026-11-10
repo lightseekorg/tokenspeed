@@ -73,12 +73,13 @@ from tokenspeed.runtime.utils.spec_block_geometry import (
 
 logger = get_colorful_logger(__name__)
 
-# Sampling backends whose verify runs the draft-prob chain kernel
-# (--enable-speculative-sampling) for the step drafters (EAGLE3, MTP).
+# Sampling backends whose verify runs a draft-prob chain kernel
+# (--enable-speculative-sampling) for the step drafters (EAGLE3, MTP): the
+# FlashInfer backends over whole rows, sonic over its top-128 candidates.
 # greedy verifies by exact match and the Triton backends by target-sampled
 # exact match; the step drafters' dense recorded distribution never enters
 # either.
-SPECULATIVE_SAMPLING_BACKENDS = frozenset({"flashinfer", "flashinfer_full"})
+SPECULATIVE_SAMPLING_BACKENDS = frozenset({"flashinfer", "flashinfer_full", "sonic"})
 # The one backend whose verify reads the DFlash2 candidate selector's sparse
 # draft q (RuntimeStates.future_draft_q): DFLASH under the flag needs it.
 DFLASH_SPECULATIVE_SAMPLING_BACKEND = "triton"
@@ -155,13 +156,6 @@ def expert_placement_requested(server_args) -> bool:
         or server_args.expert_distribution_recorder_mode is not None
         or server_args.enable_eplb
     )
-
-
-# Kimi-K3's prefill runs Iris side kernels on high-priority streams, so its
-# launches cap ROCm's hardware queues (launcher.set_rocm_hw_queue_default).
-_KIMI_K3_ARCHITECTURES = frozenset(
-    {"KimiK3ForConditionalGeneration", "KimiK31ForConditionalGeneration"}
-)
 
 
 def _checkpoint_architectures(
@@ -427,6 +421,20 @@ class ServerArgs:
     # chunked_prefill_size; a decode server ignores it.
     prefill_chunk_yield_tokens: int = 0
     enable_mixed_batch: bool = False
+    # Decode rounds owed to the running decodes after each prefill round; 0 is
+    # off (docs/design/scheduler.md §3.3).
+    prefill_decode_interval: int = 0
+    enable_short_prefill_first: bool = False
+    # The fused engine's prefill-delay gate (docs/design/prefill-delay.md):
+    # prefill work is held for a window of decode rounds and then batched, so
+    # a scattered prompt does not interrupt every rank's decode. Unset keeps
+    # the engine planning prefill every round.
+    # Rounds between ALL attempt points: every rank that would decode also
+    # has prefill work, so the group's prefills land in the same rounds.
+    prefill_attempt_interval: int | None = None
+    # Rounds between ANY attempt points: one rank's backlog opens the gate,
+    # bounding how long a prefill waits. Must be >= prefill_attempt_interval.
+    prefill_any_attempt_interval: int | None = None
     # Opt-in: the prefill forward that spans a long prompt's last prefix-page
     # boundary before its replay tail (normally the final token) also writes
     # the recurrent state there, where hybrid models publish a checkpoint;
@@ -660,6 +668,7 @@ class ServerArgs:
     speculative_config: str | None = None
     speculative_algorithm: str | None = None
     speculative_draft_model_path: str | None = None
+    speculative_draft_model_revision: str | None = None
     speculative_draft_model_quantization: str | None = "unquant"
     speculative_num_steps: int = 3
     speculative_eagle_topk: int = 1
@@ -711,6 +720,7 @@ class ServerArgs:
     enforce_eager: bool = False
     disable_cuda_graph_padding: bool = False
     disable_autotune: bool = False
+    enable_startup_requests: bool = False
     enable_cudagraph_gc: bool = False
     disable_nccl_nvls: bool = False
     disable_symm_mem: bool = False
@@ -776,6 +786,8 @@ class ServerArgs:
     weight_loader_prefetch_checkpoints: bool = True
     weight_loader_prefetch_num_threads: int = 8
     enable_memory_saver: bool = False
+    # Dev: permit the reload_forward control call; nothing reloads until it arrives.
+    allow_reload_forward: bool = False
     weight_memory_policy: Literal["cpu_backup", "discard"] | None = None
     disable_cudagraph_memory_reserve: bool = False
     mla_disable_ragged: bool = False
@@ -826,9 +838,6 @@ class ServerArgs:
     _beam_checkpoint: bool | None = dataclasses.field(
         default=False, init=False, repr=False
     )
-    _kimi_k3_checkpoint: bool | None = dataclasses.field(
-        default=False, init=False, repr=False
-    )
     _beam_grammar_none_warned: bool = dataclasses.field(
         default=False, init=False, repr=False
     )
@@ -851,6 +860,7 @@ class ServerArgs:
 
     def __post_init__(self):
         self.validate_weight_memory_policy()
+        self.validate_forward_reload()
         self.resolve_basic_defaults()
         self.resolve_model_defaults()
         self.resolve_launcher_topology()
@@ -923,14 +933,13 @@ class ServerArgs:
         """Model defaults that must be known before any process starts.
 
         ModelConfig applies a model's other defaults in the scheduler, but TF32
-        and Kimi-K3's ROCm hardware queues follow the environment the launch
-        exports before it starts the scheduler (``engine._set_envs_and_config``),
-        so the checkpoint is read here (``_checkpoint_architectures``). Beam
-        serves without TF32: its FP32 router hands rows past the decode GEMV
-        leaf's 16 to a Torch FP32 matmul, which TF32 would run with a 10-bit
-        mantissa. Without the network, ``_beam_checkpoint`` and
-        ``_kimi_k3_checkpoint`` are None for a hub id the cache does not hold
-        yet; engine setup calls this again with ``download``.
+        follows the environment the launch exports before it starts the
+        scheduler (``engine._set_envs_and_config``), so the checkpoint is read
+        here (``_checkpoint_architectures``). Beam serves without TF32: its FP32
+        router hands rows past the decode GEMV leaf's 16 to a Torch FP32
+        matmul, which TF32 would run with a 10-bit mantissa. Without the
+        network, ``_beam_checkpoint`` is None for a hub id the cache does not
+        hold yet; engine setup calls this again with ``download``.
         """
         architectures = _checkpoint_architectures(self.model, self.revision, download)
         if self.decode_monokernel and architectures is not None:
@@ -939,11 +948,6 @@ class ServerArgs:
                 raise ValueError(refusal)
         self._beam_checkpoint = (
             None if architectures is None else "BeamForCausalLM" in architectures
-        )
-        self._kimi_k3_checkpoint = (
-            None
-            if architectures is None
-            else not _KIMI_K3_ARCHITECTURES.isdisjoint(architectures)
         )
         if self._beam_checkpoint and not self.disable_tf32:
             self.disable_tf32 = True
@@ -1498,6 +1502,7 @@ class ServerArgs:
         # Handle KVStore settings.
         self._handle_kvstore()
         self.validate_cache_options()
+        self.validate_startup_requests()
         self.resolve_retraction_snapshot_options()
 
     @property
@@ -1793,6 +1798,20 @@ class ServerArgs:
 
         if self.speculative_draft_model_path == self.model:
             self.draft_model_path_use_base = True
+
+        draft_revision = self.speculative_draft_model_revision
+        if draft_revision is not None and self.speculative_draft_model_path is None:
+            raise ValueError(
+                "--speculative-draft-model-revision applies only to a draft in its "
+                "own repository, but no draft model is set. Pass "
+                f"--speculative-draft-model-path (got {draft_revision!r})."
+            )
+        if draft_revision is not None and self.draft_model_path_use_base:
+            raise ValueError(
+                "--speculative-draft-model-revision applies only to a draft in its "
+                "own repository, but this draft is the target checkpoint. Set "
+                f"--revision instead (got {draft_revision!r})."
+            )
 
         if self.speculative_draft_model_quantization == "unquant":
             self.speculative_draft_model_quantization = None
@@ -2352,6 +2371,22 @@ class ServerArgs:
                 "unset --disable-kvstore"
             )
 
+    def validate_startup_requests(self):
+        if not self.enable_startup_requests:
+            return
+        # A disaggregated node's requests need a peer node, and dropping the
+        # startup prefixes would delete an L3 store's shared namespace.
+        if self.disaggregation_mode != "null":
+            raise ValueError(
+                "--enable-startup-requests is not supported with "
+                "--disaggregation-mode"
+            )
+        if self.kvstore_storage_backend is not None:
+            raise ValueError(
+                "--enable-startup-requests is not supported with "
+                "--kvstore-storage-backend"
+            )
+
     def validate_cache_options(self):
         if self.kvstore_storage_backend is not None and self.pipeline_parallel_size > 1:
             raise ValueError(
@@ -2441,6 +2476,22 @@ class ServerArgs:
                     f"--chunked-prefill-size ({self.chunked_prefill_size}); got "
                     f"{self.prefill_chunk_yield_tokens}"
                 )
+
+    def validate_forward_reload(self):
+        """A forward reload recaptures graphs, which tagged pools cannot, and spans one engine, which PD roles are not."""
+        if not self.allow_reload_forward:
+            return
+        if self.enable_memory_saver:
+            raise ValueError(
+                "--allow-reload-forward cannot be combined with --enable-memory-saver: "
+                "a tagged CUDA-graph pool cannot be discarded and captured again"
+            )
+        if self.disaggregation_mode != "null":
+            raise ValueError(
+                "--allow-reload-forward does not support prefill/decode disaggregation: "
+                "each role would reload and resume on its own, mixing code versions in "
+                "one request"
+            )
 
     def validate_weight_memory_policy(self):
         """Memory saving chooses its weight semantics explicitly."""
@@ -2709,12 +2760,21 @@ class ServerArgs:
 
     def validate(self):
         self.validate_weight_memory_policy()
+        self.validate_forward_reload()
         if self.low_latency_max_num_tokens_per_gpu <= 0:
             raise ValueError("--low-latency-max-num-tokens-per-gpu must be positive")
         if self.input_logprob_chunk_tokens <= 0:
             raise ValueError("--input-logprob-chunk-tokens must be positive")
         if self.chunk_prefill_kv_size is not None and self.chunk_prefill_kv_size <= 0:
             raise ValueError("--chunk-prefill-kv-size must be positive")
+        if self.prefill_decode_interval < 0:
+            raise ValueError("--prefill-decode-interval must be non-negative")
+        if self.prefill_decode_interval and self.disaggregation_mode != "null":
+            raise ValueError(
+                "--prefill-decode-interval needs --disaggregation-mode null: a "
+                "prefill engine runs no decodes and a decode engine no local "
+                "prefill rounds"
+            )
         if self.device == "npu":
             if not self.disable_prefill_graph:
                 raise ValueError("NPU execution requires --disable-prefill-graph")
@@ -2723,6 +2783,7 @@ class ServerArgs:
 
         self.validate_petit_moe_options()
         self.validate_rank_emulation()
+        self.validate_prefill_delay()
 
         if (
             self.max_num_seqs is not None
@@ -2778,6 +2839,45 @@ class ServerArgs:
             # Enable PDL for fused attention kernels.
             os.environ.setdefault("TRTLLM_ENABLE_PDL", "1")
         os.environ.setdefault("TLLM_LOG_LEVEL", "INFO")
+
+    def validate_prefill_delay(self) -> None:
+        intervals = self.prefill_delay
+        if intervals is None:
+            return
+        attempt, any_attempt = intervals
+        if attempt < 1:
+            raise ValueError(f"--prefill-attempt-interval must be >= 1, got {attempt}")
+        if any_attempt < attempt:
+            raise ValueError(
+                "--prefill-any-attempt-interval must be >= --prefill-attempt-interval "
+                f"(got {any_attempt} < {attempt})"
+            )
+        if self.disaggregation_mode != "null":
+            raise ValueError(
+                "the prefill delay gate applies to a fused engine "
+                "(--disaggregation-mode null) only"
+            )
+        if self.prefill_decode_interval:
+            raise ValueError(
+                "--prefill-decode-interval cannot be combined with "
+                "--prefill-attempt-interval and --prefill-any-attempt-interval: "
+                "local decode intervals and the attention-DP gate use different "
+                "prefill windows"
+            )
+
+    @property
+    def prefill_delay(self) -> tuple[int, int] | None:
+        """The gate intervals, or None; reject an incompletely configured pair."""
+        attempt = self.prefill_attempt_interval
+        any_attempt = self.prefill_any_attempt_interval
+        if attempt is None and any_attempt is None:
+            return None
+        if attempt is None or any_attempt is None:
+            raise ValueError(
+                "--prefill-attempt-interval and --prefill-any-attempt-interval "
+                "must be set together"
+            )
+        return (attempt, any_attempt)
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -3019,12 +3119,31 @@ class ServerArgs:
             "docs/design/scheduler.md section 1.1.",
         )
         parser.add_argument(
+            "--enable-short-prefill-first",
+            action="store_true",
+            default=ServerArgs.enable_short_prefill_first,
+            help="Prefer new local prefill requests with less uncached work, with "
+            "oldest-request starvation protection. Off by default; resident "
+            "chunks retain priority. Applies to fused and prefill roles.",
+        )
+        parser.add_argument(
             "--enable-mixed-batch",
             action="store_true",
             dest="enable_mixed_batch",
             default=ServerArgs.enable_mixed_batch,
             help="Allow the scheduler to issue prefill and decode requests in the "
             "same iteration. Not supported with aggregated DCP.",
+        )
+        parser.add_argument(
+            "--prefill-decode-interval",
+            type=int,
+            default=ServerArgs.prefill_decode_interval,
+            help="After a round that runs a prefill chunk, run this many decode "
+            "rounds before the next prefill round, unless no decode can run. "
+            "Every chunk starts a new interval, but no prompt is held back "
+            "more than this many decode rounds in total. Trades TTFT for "
+            "fewer decode stalls. Aggregated serving only. 0 (the default) is "
+            "off.",
         )
         parser.add_argument(
             "--enable-state-checkpoint-in-forward",
@@ -3246,6 +3365,27 @@ class ServerArgs:
                 "prompt length; an undersized budget fails startup. Omit to keep "
                 "the existing unbounded batch policy."
             ),
+        )
+        parser.add_argument(
+            "--prefill-attempt-interval",
+            metavar="ROUNDS",
+            type=int,
+            default=ServerArgs.prefill_attempt_interval,
+            help="Prefill delay: rounds between ALL attempt points. On an "
+            "ALL point the attention-DP ranks that would decode and also "
+            "have prefill work open the group's prefill gate together, so "
+            "the group batches prefills instead of each rank interrupting "
+            "the others' decode rounds alone. Unset plans prefill every "
+            "round. Requires --prefill-any-attempt-interval.",
+        )
+        parser.add_argument(
+            "--prefill-any-attempt-interval",
+            metavar="ROUNDS",
+            type=int,
+            default=ServerArgs.prefill_any_attempt_interval,
+            help="Prefill delay: rounds between ANY attempt points, where "
+            "one rank's backlog opens the gate, bounding how long a prefill "
+            "waits. Must be >= --prefill-attempt-interval.",
         )
         # Other runtime options
         parser.add_argument(
@@ -3707,6 +3847,7 @@ class ServerArgs:
                 "triton",
                 "triton_full",
                 "ascend_full",
+                "sonic",
             ],
             default=ServerArgs.sampling_backend,
             help="Sampling backend. "
@@ -3722,7 +3863,17 @@ class ServerArgs:
             "'ascend_full': graph-safe Ascend top-k/top-p/min-p sampling and chain verify. "
             "Allocates a counts[max_req_pool_size, vocab_size] int32 buffer (substantial memory). "
             "ascend_full caps finite top_k at 4096; larger values use 4096. "
-            "Other backends require finite top_k < 128. -1 disables top-k.",
+            "Other backends require finite top_k < 128. -1 disables top-k. "
+            "'sonic': one fused Triton pipeline per step (vendored sonic-sampler; two kernels "
+            "for sampling, three for chain verification) covering greedy, "
+            "temperature/top_k/top_p/min_p, penalties, logit_bias and grammar for both "
+            "single-step sampling and chain verification; top_k=-1 is realized as bounded "
+            "top-128 truncation. bf16 logits are ranked at bf16 resolution; fp32 logits "
+            "(soft-capped heads) are sampled exactly in fp32 among the top-128 candidates. "
+            "Its kernel config per batch size comes from a table measured on "
+            "Blackwell, so nothing is tuned at startup. Allocates slot-indexed "
+            "[max_req_pool_size, vocab_size] token counts and logit bias: about 10 bytes "
+            "per element on device (substantial memory).",
         )
         parser.add_argument(
             "--sampling-stream",
@@ -3921,6 +4072,15 @@ class ServerArgs:
             "--speculative-draft-model-path",
             type=str,
             help="The path of the draft model weights. This can be a local folder or a Hugging Face repo ID.",
+        )
+        parser.add_argument(
+            "--speculative-draft-model-revision",
+            type=str,
+            default=None,
+            help="The draft model version to use when the draft has its own "
+            "repository: a branch name, a tag name, or a commit id. If "
+            "unspecified, the draft uses its repository's default version. A "
+            "draft inside the target checkpoint uses --revision.",
         )
         parser.add_argument(
             "--speculative-draft-model-quantization",
@@ -4123,6 +4283,16 @@ class ServerArgs:
             "the library's heuristic fallback.",
         )
         parser.add_argument(
+            "--enable-startup-requests",
+            action="store_true",
+            default=ServerArgs.enable_startup_requests,
+            help="Before registering with the frontend, serve a few requests of "
+            "the engine's own (one short, one of a full prefill chunk, then a "
+            "full batch) through the ordinary serving path, so the first client "
+            "requests do not compile what that path reaches. Not supported with "
+            "--disaggregation-mode or --kvstore-storage-backend.",
+        )
+        parser.add_argument(
             "--enable-cudagraph-gc",
             action="store_true",
             help="Enable garbage collection during CUDA graph capture. If disabled (default), GC is frozen during capture to speed up the process.",
@@ -4285,6 +4455,14 @@ class ServerArgs:
             help="Allow saving memory using release_memory_occupation and resume_memory_occupation",
         )
         parser.add_argument(
+            "--allow-reload-forward",
+            action="store_true",
+            help="Development: allow the reload_forward control call (ts reload-forward), "
+            "which drains the engine, re-executes edited model, layer and kernel modules "
+            "in place, warms their kernels and recaptures the CUDA graphs. Nothing "
+            "reloads until the call arrives.",
+        )
+        parser.add_argument(
             "--weight-memory-policy",
             choices=["cpu_backup", "discard"],
             default=None,
@@ -4375,8 +4553,8 @@ class ServerArgs:
             type=int,
             default=ServerArgs.lm_head_tp_size,
             help="Vocab-shard the LM head over this many contiguous ranks. "
-            "Under attention DP (which needs attention TP 1) the default 1 "
-            "keeps the head replicated; a wider group gathers the ranks' rows "
+            "Under attention DP the default 1 "
+            "keeps the head replicated; a wider group gathers distinct DP rows "
             "before the logits GEMM and transposes the vocab shards back. "
             "Without attention DP it must equal the attention TP size.",
         )

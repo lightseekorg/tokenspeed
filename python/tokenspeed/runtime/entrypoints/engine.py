@@ -64,7 +64,6 @@ from tokenspeed.runtime.utils import (
 from tokenspeed.runtime.utils.launcher import (
     interface_for_host,
     set_pinned_allocator_default,
-    set_rocm_hw_queue_default,
     set_rocm_tool_registration_default,
 )
 from tokenspeed.runtime.utils.process import (
@@ -154,8 +153,6 @@ def _set_envs_and_config(server_args: ServerArgs):
         # exported.
         for key in ("NVIDIA_TF32_OVERRIDE", "TORCH_ALLOW_TF32_CUBLAS_OVERRIDE"):
             _force_env("Beam (no TF32)", key, "0")
-    if server_args._kimi_k3_checkpoint:
-        set_rocm_hw_queue_default()
     if server_args.numerics in BITWISE_ENVELOPES:
         # Bitwise envelopes: no TF32 anywhere, and pin NCCL to one
         # algorithm/protocol so the reduction association order cannot switch

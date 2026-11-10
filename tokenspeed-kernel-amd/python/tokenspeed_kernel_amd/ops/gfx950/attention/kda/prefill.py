@@ -61,7 +61,7 @@ from __future__ import annotations
 import functools
 
 import torch
-from tokenspeed_kernel_amd._triton import gl, gluon
+from tokenspeed_kernel_amd._triton import compile_ahead, gl, gluon
 
 _CHUNK_SIZE = 64
 _SUBCHUNK_SIZE = 16
@@ -966,6 +966,7 @@ def launch_gluon_kda_paged_prefill_gfx950(
     cu_seqlens: torch.Tensor,
     lower_bound: float | None,
     cu_seqlens_cpu: torch.Tensor | None = None,
+    warm_variants: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run chunk-parallel KDA prefill on packed GFX950 inputs.
 
@@ -984,6 +985,8 @@ def launch_gluon_kda_paged_prefill_gfx950(
         cu_seqlens_cpu: Host copy of ``cu_seqlens``, from which the chunk
             schedule is planned once per forward. Without it, ``cu_seqlens``
             is read back on every call.
+        warm_variants: Also compile the state-walk configurations other
+            batches pick, for startup warmup.
 
     Returns:
         The packed output ``[1,T,H,V]`` and final state ``[N,H,V,K]``.
@@ -1088,6 +1091,7 @@ def launch_gluon_kda_paged_prefill_gfx950(
         key_dim=key_dim,
         value_dim=value_dim,
         chunk_size=chunk_size,
+        warm_variants=warm_variants,
     )
     return output.unsqueeze(0), final_state
 
@@ -1152,6 +1156,13 @@ def _scan_groups(
     return groups
 
 
+def _walk_warps(block: int, value_dim: int, split: bool) -> int:
+    """Warps of a walk over ``block`` value rows: one per 16 rows unsplit."""
+    if split:
+        return 8 if block == value_dim else 4
+    return max(block // 16, 2)
+
+
 def _launch_state_walk(
     *,
     w: torch.Tensor,
@@ -1170,12 +1181,15 @@ def _launch_state_walk(
     key_dim: int,
     value_dim: int,
     chunk_size: int,
+    warm_variants: bool = False,
 ) -> None:
     """Walk the chunk recurrence into ``output`` and ``final_state``.
 
     When too few sequences would idle the GPU, each sequence is split into
     time groups: every group is summarized at once, the summaries are chained
     into each group's entry state, and every group is then walked at once.
+    The row blocks, warps and split depend on the batch, so ``warm_variants``
+    first compiles every configuration another batch may pick.
     """
     planes = num_sequences * heads
     cus = _num_cus(torch.cuda.current_device())
@@ -1188,8 +1202,55 @@ def _launch_state_walk(
         H=heads, K=key_dim, V=value_dim, BT=chunk_size, num_stages=1, waves_per_eu=1
     )
     walk_args = (w, u, kg, qg, aqk, decay, initial_state, output, final_state)
+    # A summary walks value rows and transfer rows; it halves its row block
+    # while that still fits on the CUs.
+    summary_blocks = (value_dim + key_dim, (value_dim + key_dim) // 2)
+    unsplit_blocks = (32, 64, value_dim)
 
-    def walk(block: int, warps: int, group_entry: torch.Tensor) -> None:
+    if warm_variants:
+        entry = torch.empty(1, dtype=torch.float32, device=initial_state.device)
+        transfer = torch.empty(1, dtype=torch.bfloat16, device=initial_state.device)
+        walks = [(block, False) for block in unsplit_blocks]
+        walks += [(block, True) for block in (value_dim // 2, value_dim)]
+        for block, split in walks:
+            compile_ahead(
+                gluon_kda_paged_prefill_state_walk_gfx950,
+                *walk_args,
+                entry if split else initial_state,
+                cu_seqlens,
+                2,
+                BV=block,
+                NW=_walk_warps(block, value_dim, split),
+                FROM_GROUP_ENTRY=split,
+                num_warps=_walk_warps(block, value_dim, split),
+                **common,
+            )
+        summary_args = (w, u, kg, decay, initial_state, entry, entry, transfer)
+        for block in summary_blocks:
+            compile_ahead(
+                gluon_kda_paged_prefill_group_summary_gfx950,
+                *summary_args,
+                cu_seqlens,
+                2,
+                BV=block,
+                NW=4,
+                num_warps=4,
+                **common,
+            )
+        compile_ahead(
+            gluon_kda_paged_prefill_chain_groups_gfx950,
+            entry,
+            entry,
+            transfer,
+            2,
+            K=key_dim,
+            V=value_dim,
+            BV=16,
+            num_warps=4,
+        )
+
+    def walk(block: int, group_entry: torch.Tensor) -> None:
+        warps = _walk_warps(block, value_dim, groups > 1)
         gluon_kda_paged_prefill_state_walk_gfx950[(value_dim // block, planes, groups)](
             *walk_args,
             group_entry,
@@ -1205,12 +1266,12 @@ def _launch_state_walk(
     if groups == 1:
         # The narrowest row block that still keeps every program on its own
         # CU, with a warp per 16 rows.
-        block = value_dim
-        for width in (32, 64):
-            if planes * (value_dim // width) <= cus:
-                block = width
-                break
-        walk(block, max(block // 16, 2), initial_state)
+        block = next(
+            width
+            for width in unsplit_blocks
+            if width == value_dim or planes * (value_dim // width) <= cus
+        )
+        walk(block, initial_state)
         return
     group_entry = torch.empty(
         (groups, planes, value_dim, key_dim),
@@ -1223,11 +1284,7 @@ def _launch_state_walk(
         dtype=torch.bfloat16,
         device=initial_state.device,
     )
-    # A summary walks value rows and transfer rows; it halves its row block
-    # while that still fits on the CUs.
-    summary_block = value_dim + key_dim
-    if 2 * planes * (groups - 1) <= cus:
-        summary_block //= 2
+    summary_block = summary_blocks[1 if 2 * planes * (groups - 1) <= cus else 0]
     gluon_kda_paged_prefill_group_summary_gfx950[
         ((value_dim + key_dim) // summary_block, planes, groups - 1)
     ](
@@ -1257,7 +1314,7 @@ def _launch_state_walk(
             BV=16,
             num_warps=4,
         )
-    walk(split_block, 8 if split_block == value_dim else 4, group_entry)
+    walk(split_block, group_entry)
 
 
 __all__ = ["launch_gluon_kda_paged_prefill_gfx950"]

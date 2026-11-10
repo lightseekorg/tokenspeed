@@ -252,7 +252,7 @@ def test_the_amd_kvp_prefill_reserves_its_gather_workspace(monkeypatch) -> None:
     """Kimi-K3.1 over KVP pages on AMD (a prefill over gathered histories,
     ``dsa_kvp_history_prefill``): the recipe plans the DSA history gather
     workspace beside the KDA verify staging, and alone on a prefill-only
-    engine; elsewhere the verify staging alone."""
+    engine; off AMD or in a bitwise envelope the verify staging alone."""
     from dataclasses import replace
     from types import SimpleNamespace
 
@@ -299,6 +299,10 @@ def test_the_amd_kvp_prefill_reserves_its_gather_workspace(monkeypatch) -> None:
     )
     assert history > 0
     assert recipe.workspace_bytes() == verify + history
+    # A bitwise envelope keeps the sharded arm, which gathers no history.
+    monkeypatch.setitem(global_server_args_dict, "numerics", "rl-bitwise")
+    assert recipe.workspace_bytes() == verify
+    monkeypatch.setitem(global_server_args_dict, "numerics", "auto")
     recipe.server_args.disaggregation_mode = "prefill"
     assert recipe.workspace_bytes() == history
 

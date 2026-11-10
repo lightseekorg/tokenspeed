@@ -179,7 +179,7 @@ def test_qwen4_exp_nextn_preserves_quantized_mtp_config() -> None:
     assert qwen4_exp_nextn._resolve_mtp_quant_config(excluded) is None
 
 
-def test_qwen4_exp_nextn_drops_quark_quantization_for_excluded_mtp() -> None:
+def test_qwen4_exp_nextn_resolves_mtp_linear_exclusions() -> None:
     mtp_linear_modules = [
         f"mtp.layers.0.{module}"
         for module in (
@@ -193,10 +193,15 @@ def test_qwen4_exp_nextn_drops_quark_quantization_for_excluded_mtp() -> None:
         )
     ]
     # Quark lists linear modules only; the fused MTP experts are never named.
-    excluded = Mxfp4Config(ignored_layers=["lm_head", *mtp_linear_modules])
+    excluded = Mxfp4Config(
+        quant_method="quark", ignored_layers=["lm_head", *mtp_linear_modules]
+    )
     assert qwen4_exp_nextn._resolve_mtp_quant_config(excluded) is None
 
-    quantized = Mxfp4Config(ignored_layers=["lm_head"])
+    # An MXFP4 export can keep the linears BF16 and pack only routed experts.
+    quantized = Mxfp4Config.from_config(
+        {"quant_method": "mxfp4", "ignored_layers": ["lm_head", *mtp_linear_modules]}
+    )
     assert qwen4_exp_nextn._resolve_mtp_quant_config(quantized) is quantized
 
 
@@ -272,6 +277,32 @@ def test_qwen4_exp_decoder_policies_are_model_local() -> None:
     assert Qwen4ExpAttentionDecoderLayer._uses_sparse_moe(moe_qwen38)
     assert Qwen4ExpAttentionDecoderLayer._uses_attention_output_gate(moe_qwen38)
     assert moe_qwen38.model_type == "qwen4_exp_text"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_qwen4_exp_attention_layer_gates_its_output_whatever_the_config_says() -> None:
+    config = Qwen4ExpTextConfig(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=32,
+        layer_types=["linear_attention", "full_attention"],
+        hc_count=2,
+        hc_lowrank=8,
+        num_experts=None,
+        attn_output_gate=False,
+    )
+    with torch.device("cuda"):
+        layer = Qwen4ExpAttentionDecoderLayer(
+            config, Mapping(rank=0, world_size=1), 1, prefix="model.layers.1.self_attn"
+        )
+
+    # The query projection carries a gate per head on top of q, k and v.
+    assert layer.attn_output_gate
+    assert layer.qkv_proj.weight.shape[0] == (2 * 2 + 1 + 1) * 32
 
 
 def test_qwen4_exp_config_normalizes_layer_and_ple_geometry() -> None:
@@ -1602,9 +1633,16 @@ def test_attention_dp_mtp_shares_target_head_layout(monkeypatch, rank, attn_tp):
 
 
 @pytest.mark.parametrize("rank", range(8))
-def test_attention_dp_mtp_shares_vocab_sharded_head(monkeypatch, rank):
+@pytest.mark.parametrize("attn_tp,head_tp", [(1, 2), (2, 8)])
+def test_attention_dp_mtp_shares_vocab_sharded_head(
+    monkeypatch, rank, attn_tp, head_tp
+):
     mapping = Mapping(
-        rank=rank, world_size=8, attn_tp_size=1, attn_dp_size=8, lm_head_tp_size=2
+        rank=rank,
+        world_size=8,
+        attn_tp_size=attn_tp,
+        attn_dp_size=8 // attn_tp,
+        lm_head_tp_size=head_tp,
     )
     config = PretrainedConfig(
         hc_count=4,
@@ -1625,10 +1663,11 @@ def test_attention_dp_mtp_shares_vocab_sharded_head(monkeypatch, rank):
     start = mapping.lm_head.tp_rank * width
     with torch.no_grad():
         target.lm_head.weight.copy_(full_weight[start : start + width])
-    draft.set_embed_and_head(target.model.embed_tokens.weight, target.lm_head.weight)
-    rows = [1 + r % 3 for r in range(8)]
+    draft.set_embed_and_head_module(target.model.embed_tokens.weight, target.lm_head)
+    assert draft.lm_head is target.lm_head
+    rows = [1 + (r // attn_tp) % 3 for r in range(8)]
     hidden = [
-        torch.arange(n * 4, dtype=torch.float32).reshape(n, 4) / 7 + r
+        torch.arange(n * 4, dtype=torch.float32).reshape(n, 4) / 7 + r // attn_tp
         for r, n in enumerate(rows)
     ]
 
@@ -1659,6 +1698,34 @@ def test_attention_dp_mtp_shares_vocab_sharded_head(monkeypatch, rank):
             dim=1,
         )
 
+    def reduce_hidden(local, group):
+        assert group == mapping.lm_head.tp_group
+        distinct = torch.cat(hidden[::attn_tp])
+        expected = torch.zeros_like(distinct)
+        if rank % attn_tp == 0:
+            start = sum(rows[:rank:attn_tp])
+            expected[start : start + rows[rank]] = hidden[rank]
+        torch.testing.assert_close(local, expected)
+        return distinct
+
+    def gather_vocab(output, local, group):
+        assert group == mapping.lm_head.tp_group
+        all_hidden = torch.cat(hidden[::attn_tp])
+        torch.testing.assert_close(
+            local, torch.nn.functional.linear(all_hidden, draft.lm_head.weight)
+        )
+        output.copy_(
+            torch.cat(
+                [
+                    torch.nn.functional.linear(all_hidden, shard)
+                    for shard in full_weight.split(width, dim=0)
+                ],
+                dim=0,
+            )
+        )
+
+    monkeypatch.setattr(logits_module, "all_reduce", reduce_hidden)
+    monkeypatch.setattr(logits_module, "all_gather_single", gather_vocab)
     monkeypatch.setattr(logits_module, "token_all_gather", gather)
     monkeypatch.setattr(logits_module, "all_to_all_transpose", transpose)
     metadata = LogitsMetadata(
@@ -1673,6 +1740,35 @@ def test_attention_dp_mtp_shares_vocab_sharded_head(monkeypatch, rank):
     torch.testing.assert_close(
         actual, torch.nn.functional.linear(hidden[rank], full_weight)
     )
+
+    # Exercise the model wrapper too: MTP step zero receives four verify rows
+    # per request but the transformer narrows them before the LM head. Only
+    # transformer weights/GPU input fusion and collective transport are mocked.
+    def transformer_forward(input_ids, positions, ctx, *, input_embeds):
+        return input_embeds[::4], None
+
+    monkeypatch.setattr(draft.model, "forward", transformer_forward)
+    expanded = hidden[rank].repeat_interleave(4, dim=0)
+    monkeypatch.setattr(draft, "_fuse_inputs", lambda embedding, captured: expanded)
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=rows[rank],
+        num_extends=0,
+        input_num_tokens=4 * rows[rank],
+        output_layout=None,
+        forward_mode=ForwardMode.DECODE,
+        all_decode_or_idle=True,
+        global_num_tokens=[4 * n for n in rows],
+        global_bs=rows,
+        gather_ids=4 * torch.arange(rows[rank]) + 3,
+    )
+    ids = torch.zeros(4 * rows[rank], dtype=torch.int64)
+    result = draft(ctx, ids, torch.arange(ids.numel()), captured_hidden_states=expanded)
+    torch.testing.assert_close(
+        result.next_token_logits, torch.nn.functional.linear(hidden[rank], full_weight)
+    )
+    assert ctx.collective_global_num_tokens is None
 
 
 def test_qwen4_exp_nextn_reads_nested_mtp_index_sharing_config() -> None:

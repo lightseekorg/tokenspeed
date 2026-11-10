@@ -237,7 +237,8 @@ start in that round, not the next.
 before the prefill phases and takes its token budget first (§3.3), so a round
 is *all decodes + the completing prefills + at most one truncated prefill*.
 Outside mixed mode, prefill and decode never share a round at all — decodes
-get the round only when no prefill scheduled — so head-of-line only ever
+get the round only when no prefill scheduled, or ahead of the prefills while
+a prefill/decode interval is owed (§3.3) — so head-of-line only ever
 orders prefills against each other, never a decode behind a prefill.
 
 **A chunk that cannot finish may give way (P role, opt-in).** With
@@ -276,6 +277,33 @@ it, and the chunk that gave way is admitted first again next round. Off (the
 default), the plans are the ones built without the option. The fused role
 does not offer it: there, retraction picks the largest incomplete prefill
 first, and a carried prompt could make the yielding request that victim.
+
+
+**New prompts retain submission order by default.**
+`--enable-short-prefill-first` opts in to ordering by prompt tokens minus
+currently reusable Device or Host prefixes, plus any tokens replayed to
+regenerate replayable groups; equal work preserves submission order. Resident chunks retain priority. The policy applies to P and fused
+local prefill; D's remote admission and decode ordering are unchanged.
+
+Only the oldest waiting prompt counts successful later first admissions.
+After eight, it receives selection priority; once it starts or leaves, the
+next oldest gets its own allowance. Priority is reevaluated after each
+admission, including within one batch. Failed admissions and resident chunks
+do not count. When chunk yielding is also enabled, carried first admissions
+count toward the same allowance; the bounded carry scan retains FIFO order.
+On the fused role, a first admission granted after capacity retraction also
+counts; a resident chunk granted capacity does not.
+Priority cannot bypass resource or transfer dependencies, and
+an inadmissible protected prompt does not block other admissible requests.
+
+Both policies share the same admission and execution path. Ranking does not
+reserve pages or replace the admission-time cache check. With the option
+disabled, there are no extra prefix probes for ranking or bypass counts.
+When the new-prompt phase runs with the option enabled, ranking probes every
+eligible submitted candidate, without a fixed scan window. This finds short
+work beyond the front of a deep queue, but adds prefix-index lookup cost on
+each such round. Request hashes and keys are reused; cache matches are not
+cached across rounds because publication, eviction and transfers can change them.
 
 ### 1.2 State groups: two slots, natural checkpoints
 
@@ -741,6 +769,19 @@ few pages a request alone can still wait for good, when its hit holds the
 only cache left and its copy of the tail needs a page in a bucket that is
 full.
 
+A request's expired slots and released State input are different from live
+pins: `Admit` releases their table references before evicting those blocks. Once the plan
+selects their reclaim set, a later segment may absorb that set even though
+the table still holds its references during planning. Segments rejected before
+that selection are reconsidered before any block-by-block fallback: a cached
+rejection is valid only while the selected reclaim blocks remain unchanged.
+Another retry requires newly selected reclaim blocks, so an unchanged pin
+cannot cause an endless scan. The merge counts each physical block once,
+and minimization keeps or restores the combined set whole. This lets a P
+request rotate past a junction and evict its unpinned
+canonical KV duplicates in the same admission. Another reader's reference,
+or a prefix hit this admission keeps, still prevents reclaim.
+
 The `CapacityModel` is deliberately **config-only**: it reads every
 `SchedulerConfig` field that is known before a pool exists and no
 `total_pages`, validating that subset through
@@ -837,7 +878,7 @@ cost of a retraction is the image's bytes (proportional to the pages held)
 plus the client-visible pause; nothing is recomputed.
 
 **Retract-and-grant, in one round.** The retraction serves a specific request —
-the first candidate whose admission failed for capacity
+the first eligible candidate whose admission failed for capacity
 (`AdmissionFeedback::capacity_blocker`). Victims are retracted and the blocked
 admission is **retried in the same plan build**, looping (retract → retry →
 retract) until it fits or the victims run out. The freed capacity therefore
@@ -851,7 +892,16 @@ wait for whoever asks first next round. A D-role round full by batch count
 retracts nothing either, although its remote admission takes no batch slot:
 the batch already runs as many requests as it can hold, so retracting a
 resident for the admission would add no throughput and cost an image and a
-restore. Two edges of the loop:
+restore.
+
+With the fused [prefill gate](prefill-delay.md#4-what-the-gate-does-not-hold),
+a prefill excluded by the current window or watermark is ineligible both as
+a capacity blocker and as a grant recipient. The blocker-redirect order below
+filters every prefill alternative through that same live eligibility check.
+Such a prefill cannot cause a retraction or acquire its freed pages through a
+retry; decode-driven retraction and readmission restores are unchanged.
+
+Two edges of the loop:
 
 - **The victim may BE the blocker** (a resident request blocked on its own
   next page is the preferred victim). It comes back through the restore
@@ -1209,26 +1259,43 @@ prompt whose KV is mid-transfer would strand the decode side.
 While P holds a request, prefix publication uses a copy of its block table.
 Deduplication may redirect that copy to canonical cache blocks, but the real
 request keeps the physical source blocks named by queued layerwise transfers.
-A client abort waits for the transfer terminal event; a failed transfer also
+A client abort waits for the transfer retirement event; a failed transfer also
 waits for outstanding local forward results before freeing its tables. Failed
 requests waiting for those results receive no further forward work. Successful
 and failed terminal paths both release the source references, without an extra
 long-lived copy of the tables.
 
-P-role prefix publication keeps the physical source table unchanged while a
-transfer can still read it, even when the prefix index already holds a
-canonical duplicate. Publication uses copied references. Copy-in capacity
-follows the ordinary pre-reserved-block contract; it does not revive the old
-best-effort owner-tail capacity calculation or canonical-tail protection.
+This preservation is limited to P publications while the request owns its
+transfer sources (`CompletedPages::preserve_source_blocks`). Fused and D
+requests use ordinary canonical deduplication once their publication is safe.
+A fused owner that keeps writing past its tail retains the existing copy-in
+rule: register its own tail without taking another owner's canonical block,
+then copy any tail block the index took into its pre-reserved private block.
 
 The PD pin is a function of the FSM
 (`Scheduler::pdTransferInFlight`). On this role every page-holding state is
 pinned — the peer's decode reads the pages from the first scheduled chunk until
-the PD ACK finishes or aborts the request. On the D role the pin is exactly
-`RemotePrefilling`: the peer's prefill is writing the destination pages, and
-`RemotePrefillDone` ends it by leaving that state. A fused engine never
-transfers. Because the pin is the state, no event handler can forget to clear
-it, and `Abort`/`Finish`/`RemotePrefillDone` release it by transitioning.
+the PD ACK finishes the request. On the D role the pin is `RemotePrefilling`:
+the peer's prefill is writing the destination pages, and `RemotePrefillDone`
+ends it by leaving that state. A fused engine never transfers. Because the pin
+is the state, no event handler can forget to clear it.
+
+A transfer reads and writes pages through the page IDs its operations
+exported, so while the pin holds, a pinned table loses no block a transfer may
+still address. P publication keeps its source references, including State
+checkpoints, and D publishes its landing table after successful receive.
+The owner-tail copy-in runs only on the fused role, which never transfers.
+
+A pinned request that ends — an abort, or a failed transfer — does not free
+its pages: the transfer may still be reading or writing them. It parks whole in
+`PdTransferring`, which is pinned on both roles, until the transport reports
+`pd::TransferStoppedEvent` once every reader and writer on every rank stopped
+(or the transfer's success lands first), and every outstanding local forward
+result has landed. Observing transport retirement before a local result records
+that fact in `PdTransferring`; a repeated abort preserves it and cannot restart
+the transfer wait. The state owns this record along with the retained resources,
+so leaving it needs no separate abort-marker cleanup. Nothing is scheduled,
+published or retracted from that state.
 
 **Restore: n/a.** Nothing on this role is ever `Retracted`, so the restore
 phase does not exist in its grammar; `Validate` refuses a snapshot pool on it.
@@ -1320,6 +1387,33 @@ that failed for capacity seals new-prompt admission for the round
 **Phases, non-mixed:** after the restore, the prefill phases run first and
 alone; decodes get the round only when no prefill scheduled. No prefill
 reserve is needed — scheduling order is the capacity priority.
+
+**Prefill/decode interval** (`prefill_decode_interval` `N`, either mode; `0`
+is off): a round that schedules a local prefill chunk owes the running decodes
+`N` decode rounds. Until they have run, decodes are scheduled first, and a
+round that scheduled any skips the prefill phases. Every chunk starts a new
+interval, but no prompt is held back more than `N` rounds in total. Each
+`Submitted` or `Prefilling` request that a round does not schedule counts the
+rounds in which the interval skipped the prefill phases while it waited
+(`Request::PrefillDeferredRounds`). The count is never reset: a victim
+retracted in such a round counts the round, and the count survives the
+restore. While any request has counted `N`, the scheduler suspends the
+interval and plans the round as if no decode rounds were owed. So the interval
+adds at most `N` decode steps to a prompt's time to first token, whatever its
+number of chunks and however many other prompts' intervals it waits through. A
+round that the prompt would have waited anyway, for a request slot, for
+capacity, or behind an older chunk, counts too.
+
+A suspended round runs without the interval: outside mixed mode, the overdue
+prompt's remaining chunks, and any older chunk ahead of it in the line (§1.1),
+run back to back while the decodes stall. A round with no decode to schedule
+runs prefill work as usual, so the engine never idles for the interval. A
+deferred prefill tries no admission, so it never blocks on capacity; a
+deferred resident chunk holds its pages idle and is the first victim (§2) when
+a decode blocks. A capacity grant that admits a prompt (mixed mode) still runs
+and starts a new interval. The counters follow the plans alone, so mirrored
+ranks agree; under attention DP each replica counts its own rounds. The P and
+D roles refuse the knob: neither runs local prefill and decode on one engine.
 
 **Retraction:** the shared victim rule (§2): incomplete prefills first, then
 decode work. The Host cache decides the image's split, not whether there is
@@ -1741,6 +1835,6 @@ must use matching contracts; releases follow the sequence in AGENTS.md.
 
 Deferred PD cancellation belongs to the request: it first waits for transfer
 retirement, then for any outstanding local forward. Repeated cancellation
-cannot restart a transfer wait after its terminal event has arrived. Destroying
+cannot restart a transfer wait after its retirement event has arrived. Destroying
 the request destroys this state, so reusing a client request ID cannot inherit
 an old abort.

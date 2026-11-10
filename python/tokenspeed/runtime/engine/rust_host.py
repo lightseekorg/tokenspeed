@@ -63,6 +63,7 @@ import msgspec
 import torch
 import torch.distributed as dist
 from tokenspeed_kernel.compile_monitor import compile_stats
+from tokenspeed_kernel.ops.tuning import kernel_warmup
 from tokenspeed_scheduler import Scheduler
 
 from tokenspeed.runtime.cache.l3.config import L3Settings
@@ -143,7 +144,10 @@ from tokenspeed.runtime.plugins.registry import (
 )
 from tokenspeed.runtime.sampling.registry import get_sampling_backend_class
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
-from tokenspeed.runtime.utils import configure_logger, get_colorful_logger
+from tokenspeed.runtime.utils import (
+    configure_logger,
+    get_colorful_logger,
+)
 from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.hf_transformers_utils import get_tokenizer
 from tokenspeed.runtime.utils.jit_compile_check import (
@@ -412,6 +416,13 @@ class HostConfig:
             the whole prefix.
         physical_context_len: Tokens a request's buffers hold.
         kv_total_pages: Usable cache pages, reported with the load.
+        startup_requests: ``--enable-startup-requests``: the engine serves
+            requests of its own before it registers, sized from
+            ``max_batch_size``, ``chunked_prefill_size``, the cache and the
+            context limits (``EventLoop::warm_up``).
+        max_batch_size: The most requests a forward runs.
+        chunked_prefill_size: The most prompt tokens a forward runs.
+        prefix_granularity: Tokens per cache page.
         rank: This rank.
         replica_ranks: The ranks that mirror this rank's scheduler: its
             attention-TP group, across every pipeline stage. The first owns
@@ -426,6 +437,7 @@ class HostConfig:
             multimodal inputs.
         memory_saver: ``--enable-memory-saver``: memory can be released.
         memory_regions: The regions this engine can release.
+        allow_reload_forward: ``--allow-reload-forward``: the reload_forward control call is served.
         metrics_prometheus_dir: ``PROMETHEUS_MULTIPROC_DIR``, where the host
             writes its Prometheus series, when the Prometheus reporter is
             on; else None.
@@ -476,6 +488,9 @@ class HostConfig:
             ``--grammar-backend none``.
         eager_grammar: The forward fills grammar bitmasks from the
             matchers' committed state (``DeviceSpecs.uses_eager_grammar``).
+        prefill_delay: The fused engine's prefill-delay gate intervals,
+            (attempt, any) rounds; None plans prefill every round
+            (``ServerArgs.prefill_delay``).
     """
 
     handshake_address: str
@@ -497,6 +512,10 @@ class HostConfig:
     physical_context_len: int
     kv_total_pages: int
     kv_token_capacity: int
+    startup_requests: bool
+    max_batch_size: int
+    chunked_prefill_size: int
+    prefix_granularity: int
     rank: int
     replica_ranks: tuple[int, ...]
     pp_ranks: tuple[int, ...] | None
@@ -505,6 +524,7 @@ class HostConfig:
     multimodal: bool
     memory_saver: bool
     memory_regions: tuple[str, ...]
+    allow_reload_forward: bool
     metrics_prometheus_dir: str | None
     metrics_relay_endpoint: str | None
     engine_metrics: bool
@@ -533,6 +553,10 @@ class HostConfig:
     reasoning: ReasoningGrammar | None
     grammar: GrammarSettings | None
     eager_grammar: bool
+    # The fused engine's prefill-delay gate, (attempt, any) intervals in
+    # rounds; None plans prefill every round. See
+    # ``ServerArgs.prefill_delay``.
+    prefill_delay: tuple[int, int] | None
 
 
 def host_in_flight_depth(server_args: ServerArgs) -> int:
@@ -616,8 +640,12 @@ class HostDataPlane:
         max_encoder_tokens: int | None,
         attn_tp_cpu_group,
         epd_publisher,
+        starting: bool,
     ) -> None:
         self._device = handle
+        # The engine serves its own startup requests (``HostConfig``'s
+        # ``startup_requests``) until ``finish_startup``.
+        self._starting = starting
         # The control plane exports the serving-time compilations.
         self._report_compiles = report_compiles
         self._profiler = profiler
@@ -652,6 +680,10 @@ class HostDataPlane:
         operation."""
         threading.current_thread().name = "tokenspeed::forward"
         self._device.bind_forward_thread()
+
+    def finish_startup(self) -> None:
+        """End the startup requests: the forwards from here on serve."""
+        self._starting = False
 
     def exit_forward_thread(self) -> None:
         """The forward thread's last call, once nothing more is queued:
@@ -797,9 +829,12 @@ class HostDataPlane:
         # go to the device; the host's L3 executor took the storage
         # operations.
         cache_ops = cache_ops_from_plan(plan)
-        results = self._device.execute(plan, planned, cache_ops=cache_ops.device)
-        if idle_forward:
-            self._device.run_idle_forward(dp_metadata)
+        # The engine's own startup requests let the kernels they reach
+        # prepare their compile variants, as model-only warmup does.
+        with kernel_warmup(enabled=self._starting):
+            results = self._device.execute(plan, planned, cache_ops=cache_ops.device)
+            if idle_forward:
+                self._device.run_idle_forward(dp_metadata)
         self._gc_hooks.note_round(forwarded=results is not None or idle_forward)
         if results is None:
             return None
@@ -964,6 +999,13 @@ class HostDataPlane:
         ]
         output = self._profiler.profile(request)
         return bool(output.success), str(output.message)
+
+    def reload_forward(self, payload: bytes) -> tuple[bool, str]:
+        """Reload edited forward code and recapture the graphs (a msgpack ``ReloadForwardReqInput``); the engine drained and flushed."""
+        ok, message = self._device.reload_forward(
+            zmq_wire.decode_request_frames([zmq_wire.REQ_TYPE_CONTROL, payload])[0]
+        )
+        return bool(ok), str(message)
 
     def release_memory(self, tags: list[str]) -> None:
         """Free memory regions, in order; the scheduler has drained."""
@@ -1259,52 +1301,6 @@ class HostBootstrap:
                     draft_model_config=draft_model_config,
                 ),
             )
-            # The model-only warmup ran on the temporary cache. Rehearse
-            # actual request preparation and accepted-state commits against
-            # the final cache before the live scheduler owns any pages.
-            # This bounds startup coverage for the AMD eager-prefill path;
-            # all kernel selection still follows the ordinary registry.
-            from tokenspeed_kernel.platform import current_platform
-
-            if (
-                current_platform().is_cdna4
-                and model_config.dsa_padded_prefill_replay
-                and spec_algorithm == "EAGLE3"
-                and server_args.disable_kvstore
-                and not server_args.enable_mixed_batch
-                and not mapping.has_pp
-                and not mapping.has_attn_dp
-                and server_args.disaggregation_mode == "null"
-                and server_args.sampling_backend == "greedy"
-                and server_args.chunked_prefill_size > 0
-            ):
-                from tokenspeed.runtime.execution.startup_warmup import (
-                    request_path_phases,
-                    warmup_request_path,
-                )
-                from tokenspeed.runtime.utils import set_random_seed
-
-                with startup_phase("kernels.request_path"):
-                    forwards = warmup_request_path(
-                        device.handle,
-                        scheduler_config,
-                        phases=request_path_phases(
-                            chunk_tokens=server_args.chunked_prefill_size,
-                            context_len=model_config.context_len,
-                            token_capacity=geometry.token_capacity,
-                            prefix_granularity=geometry.prefix_granularity,
-                            max_batch_size=max_batch_size,
-                            decode_width=decode_input_tokens,
-                            attn_tp_size=mapping.attn.tp_size,
-                        ),
-                        decode_width=decode_input_tokens,
-                        decode_steps=2,
-                    )
-                set_random_seed(48)
-                logger.info(
-                    f"Startup request-path warmup completed {forwards} forwards; "
-                    f"free device memory {torch.cuda.mem_get_info(gpu_id)[0] / 2**30:.2f} GiB"
-                )
 
             #: Driven by the control thread only, once the host takes it.
             self.scheduler = Scheduler(scheduler_config)
@@ -1423,6 +1419,10 @@ class HostBootstrap:
                 ),
                 kv_total_pages=geometry.num_usable_pages,
                 kv_token_capacity=geometry.token_capacity,
+                startup_requests=server_args.enable_startup_requests,
+                max_batch_size=max_batch_size,
+                chunked_prefill_size=server_args.chunked_prefill_size,
+                prefix_granularity=geometry.prefix_granularity,
                 rank=global_rank,
                 # Every stage runs the same plan, so with a pipeline the replica
                 # is the world (ServerArgs refuses attention DP with one). Under
@@ -1445,6 +1445,7 @@ class HostBootstrap:
                 multimodal=model_config.is_multimodal_active,
                 memory_saver=server_args.enable_memory_saver,
                 memory_regions=tuple(regions),
+                allow_reload_forward=server_args.allow_reload_forward,
                 metrics_prometheus_dir=(
                     os.environ["PROMETHEUS_MULTIPROC_DIR"]
                     if metrics_enabled(server_args, "prometheus")
@@ -1505,6 +1506,7 @@ class HostBootstrap:
                     else None
                 ),
                 eager_grammar=specs.uses_eager_grammar,
+                prefill_delay=server_args.prefill_delay,
                 eplb=(
                     EplbSettings(
                         specs=specs.expert_rebalance,
@@ -1563,6 +1565,7 @@ class HostBootstrap:
                 epd_publisher=(
                     epd_receive.publisher if epd_receive is not None else None
                 ),
+                starting=server_args.enable_startup_requests,
             )
             self._device = device.handle
 
@@ -1633,6 +1636,7 @@ class HostBootstrap:
     def enter_serving(self) -> None:
         """End startup: from here on a host synchronization or a kernel
         compilation on the data plane is a stall."""
+        self.data_plane.finish_startup()
         arm_data_plane_sync_debug(self._server_args.device)
         mark_jit_compile_serving()
         freeze_startup_heap()

@@ -36,7 +36,13 @@ below it need not be resident together, which would not fit in LDS.
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel_amd._triton import cdna4_async_copy, gl, gluon, triton
+from tokenspeed_kernel_amd._triton import (
+    cdna4_async_copy,
+    compile_ahead,
+    gl,
+    gluon,
+    triton,
+)
 
 # The MFMA instruction is 16 rows tall, so a decode tile any shorter pays for
 # rows it does not have. Past that the weight would be re-read once per token
@@ -66,7 +72,7 @@ def _split_k(tokens: int, total_n: int, hidden: int, block_m: int) -> int:
     return split
 
 
-@gluon.jit
+@gluon.jit(do_not_specialize=("tokens",))
 def gluon_latent_input_small_batch_gfx950(
     a_ptr,
     b_ptr,
@@ -300,6 +306,7 @@ def launch_gluon_latent_input_small_batch_gfx950(
     *,
     beta: float,
     linear_beta: float | None,
+    warm_max_tokens: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Project router, routed latent, and shared input from one weight pass.
 
@@ -312,6 +319,9 @@ def launch_gluon_latent_input_small_batch_gfx950(
             consecutive row views of.
         beta: Positive SiTU gate clipping scale.
         linear_beta: Optional positive SiTU linear-branch clipping scale.
+        warm_max_tokens: Also compile the row tile and K split of every
+            token count up to this, for startup warmup; 0 compiles only this
+            call's.
 
     Returns:
         FP32 router logits, the BF16 routed latent, and the BF16 activated
@@ -327,38 +337,22 @@ def launch_gluon_latent_input_small_batch_gfx950(
     device = hidden_states.device
     dtype = hidden_states.dtype
     total_n = router_n + latent_n + 2 * shared_n
-    block_m, warps_m = (_BLOCK_M, 1) if tokens <= _BLOCK_M else (_LARGE_BLOCK_M, 2)
-    split_k = _split_k(tokens, total_n, hidden, block_m)
+
+    def tiling(rows: int) -> tuple[int, int, int]:
+        block_m, warps_m = (_BLOCK_M, 1) if rows <= _BLOCK_M else (_LARGE_BLOCK_M, 2)
+        return block_m, warps_m, _split_k(rows, total_n, hidden, block_m)
+
+    block_m, warps_m, split_k = tiling(tokens)
     partials = torch.empty(
         (split_k, tokens, total_n), dtype=torch.float32, device=device
     )
     split_stride = tokens * total_n
-
-    grid = (triton.cdiv(tokens, block_m) * split_k * (total_n // _BLOCK_N),)
-    gluon_latent_input_small_batch_gfx950[grid](
-        hidden_states,
-        packed_weight,
-        partials,
-        tokens,
-        split_stride,
-        HIDDEN=hidden,
-        TOTAL_N=total_n,
-        BLOCK_M=block_m,
-        BLOCK_N=_BLOCK_N,
-        BLOCK_K=_BLOCK_K,
-        SPLIT_K=split_k,
-        NUM_WARPS=_NUM_WARPS,
-        WARPS_M=warps_m,
-        num_warps=_NUM_WARPS,
-    )
-
     router_out = torch.empty((tokens, router_n), dtype=torch.float32, device=device)
     routed_out = torch.empty((tokens, latent_n), dtype=dtype, device=device)
     shared_out = torch.empty((tokens, shared_n), dtype=dtype, device=device)
     emitted_n = router_n + latent_n + shared_n
-    gluon_latent_input_small_batch_epilogue_gfx950[
-        (tokens, triton.cdiv(emitted_n, _EPILOGUE_BLOCK_N))
-    ](
+    project_args = (hidden_states, packed_weight, partials, tokens, split_stride)
+    epilogue_args = (
         partials,
         router_out,
         routed_out,
@@ -366,15 +360,57 @@ def launch_gluon_latent_input_small_batch_gfx950(
         float(beta),
         1.0 if linear_beta is None else float(linear_beta),
         split_stride,
-        SPLIT_K=split_k,
-        TOTAL_N=total_n,
-        ROUTER_N=router_n,
-        LATENT_N=latent_n,
-        SHARED_N=shared_n,
-        HAS_LINEAR_BETA=linear_beta is not None,
-        BLOCK_N=_EPILOGUE_BLOCK_N,
-        num_warps=4,
     )
+
+    def project_kwargs(block_m: int, warps_m: int, split_k: int) -> dict:
+        return dict(
+            HIDDEN=hidden,
+            TOTAL_N=total_n,
+            BLOCK_M=block_m,
+            BLOCK_N=_BLOCK_N,
+            BLOCK_K=_BLOCK_K,
+            SPLIT_K=split_k,
+            NUM_WARPS=_NUM_WARPS,
+            WARPS_M=warps_m,
+            num_warps=_NUM_WARPS,
+        )
+
+    def epilogue_kwargs(split_k: int) -> dict:
+        return dict(
+            SPLIT_K=split_k,
+            TOTAL_N=total_n,
+            ROUTER_N=router_n,
+            LATENT_N=latent_n,
+            SHARED_N=shared_n,
+            HAS_LINEAR_BETA=linear_beta is not None,
+            BLOCK_N=_EPILOGUE_BLOCK_N,
+            num_warps=4,
+        )
+
+    for other in dict.fromkeys(tiling(rows) for rows in range(1, warm_max_tokens + 1)):
+        if other == (block_m, warps_m, split_k):
+            continue
+        for kernel, args, kwargs in (
+            (
+                gluon_latent_input_small_batch_gfx950,
+                project_args,
+                project_kwargs(*other),
+            ),
+            (
+                gluon_latent_input_small_batch_epilogue_gfx950,
+                epilogue_args,
+                epilogue_kwargs(other[2]),
+            ),
+        ):
+            compile_ahead(kernel, *args, **kwargs)
+
+    grid = (triton.cdiv(tokens, block_m) * split_k * (total_n // _BLOCK_N),)
+    gluon_latent_input_small_batch_gfx950[grid](
+        *project_args, **project_kwargs(block_m, warps_m, split_k)
+    )
+    gluon_latent_input_small_batch_epilogue_gfx950[
+        (tokens, triton.cdiv(emitted_n, _EPILOGUE_BLOCK_N))
+    ](*epilogue_args, **epilogue_kwargs(split_k))
     return router_out, routed_out, shared_out
 
 

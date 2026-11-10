@@ -23,7 +23,7 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel_amd._triton import gl, gluon, tl
+from tokenspeed_kernel_amd._triton import compile_ahead, gl, gluon, tl
 
 cdna4 = gl.amd.cdna4
 _BLOCK_H = gl.constexpr(8192)
@@ -295,13 +295,11 @@ def attn_res_rmsnorm_gfx950(
         # small-batch kernel that an eager serving tail reaches later.
         warp_counts = (4,) if num_valid_blocks <= 1 else (4, 8)
         for warps in warp_counts:
-            compiled = gluon_attn_res_fwd_gfx950.warmup(
+            compile_ahead(
+                gluon_attn_res_fwd_gfx950,
                 *launch_args,
                 **(launch_kwargs | {"NUM_WARPS": warps, "num_warps": warps}),
-                grid=(1,),
             )
-            if compiled is not None:
-                compiled._init_handles()
     gluon_attn_res_fwd_gfx950[(tokens,)](*launch_args, **launch_kwargs)
     return output
 
