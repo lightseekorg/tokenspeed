@@ -89,6 +89,11 @@ then run the lane's other slots, one after another.
 
 from __future__ import annotations
 
+from tokenspeed_kernel_amd._extern import (
+    wave_ballot_i64,
+    wave_mbcnt,
+    wave_popcount_i64,
+)
 from tokenspeed_kernel_amd._triton import cdna4_async_copy, gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_common import (
     _cdna4_swizzled_mxfp4_scale_offset,
@@ -521,49 +526,10 @@ def _slots2_rows_asm(outputs, inputs):
 
 
 @gluon.constexpr_function
-def _slots2_ballot_asm(outputs, inputs):
-    """Each pick's slot and the slot count from the owner flags of 128 picks,
-    two a lane (``2 l``, ``2 l + 1``): a pick's slot is the owner picks below
-    it, those of the lanes below (both ballots) and for ``2 l + 1`` also
-    ``2 l``."""
-    slot = outputs[0]
-    (count,) = outputs[1]
-    t = outputs[2]
-    (sq,) = outputs[3]
-    (owner,) = inputs
-    a = [
-        # Even picks' owners: their count and the ones below each lane.
-        f"v_cmp_ne_u32_e32 vcc, 0, {owner[0]}",
-        # CDNA4 ISA Table 11: VALU VCC -> mbcnt constant; s_bcnt fills state 2.
-        "s_nop 0",
-        f"s_bcnt1_i32_b64 {count}, vcc",
-        f"v_mbcnt_lo_u32_b32 {t[0]}, vcc_lo, 0",
-        f"v_mbcnt_hi_u32_b32 {t[0]}, vcc_hi, {t[0]}",
-        # Odd picks' owners: added to both.
-        f"v_cmp_ne_u32_e32 vcc, 0, {owner[1]}",
-        # s_bcnt and s_add fill the two VALU VCC -> mbcnt constant wait states.
-        f"s_bcnt1_i32_b64 {sq}, vcc",
-        f"s_add_u32 {count}, {count}, {sq}",
-        f"v_mbcnt_lo_u32_b32 {t[0]}, vcc_lo, {t[0]}",
-        f"v_mbcnt_hi_u32_b32 {slot[0]}, vcc_hi, {t[0]}",
-        f"v_add_u32 {slot[1]}, {slot[0]}, {owner[0]}",
-    ]
-    return "\n".join(a)
-
-
-@gluon.constexpr_function
 def _slots2_rows_constraints():
     """:func:`_slots2_rows_asm`'s constraints, one entry an element: the
     entries and a scratch of 4 a thread, 7 SGPRs, then the picks and rows."""
     return ",".join(["=&v"] * 8 + ["=&s"] * 7 + ["v"] * 8 + ["~{vcc}", "~{scc}"])
-
-
-@gluon.constexpr_function
-def _slots2_ballot_constraints():
-    """:func:`_slots2_ballot_asm`'s constraints, one entry an element."""
-    return ",".join(
-        ["=&v"] * 2 + ["=&s"] + ["=&v"] * 2 + ["=&s"] + ["v"] * 2 + ["~{vcc}", "~{scc}"]
-    )
 
 
 @gluon.jit
@@ -573,14 +539,13 @@ def _ballot_slots2(ids, RP: gl.constexpr):
     (:func:`_slots2_rows_asm`), a pick's ``seen`` (an earlier row picked its
     expert) is a reduction of the entries across the waves, and the whole
     table goes to every wave in LDS. Every wave then holds the same owner,
-    slot and count (:func:`_slots2_ballot_asm`) and table. Built in every
+    slot and count from wave ballots and the table. Built in every
     wave, the 16 rows would take ~900 VALU instructions a wave.
     Returns the same ``(ids, owner, slot, count, table)``."""
     NP: gl.constexpr = ids.shape[0]
     nw: gl.constexpr = gl.num_warps()
     gl.static_assert(RP == 2 * nw, "two rows a wave")
-    # asm: lane reads (v_readlane) and lane masks (ballots, v_mbcnt) in
-    # SGPRs, which the extern library (_wave.ll) does not provide yet.
+    # asm: 37 instructions vs 103-106 with the _wave.ll intrinsics.
     # [pick, row]: two picks a lane, two rows a wave.
     la: gl.constexpr = gl.BlockedLayout([2, 2], [64, 1], [1, nw], [1, 0])
     mine = gl.convert_layout(ids, gl.SliceLayout(1, la))[:, None]
@@ -597,16 +562,22 @@ def _ballot_slots2(ids, RP: gl.constexpr):
     p = gl.arange(0, NP, gl.SliceLayout(1, la))[:, None]
     seen = gl.max(gl.where((entries >= 0) & (r < p // TOP_K), 1, 0), axis=1)
     owner = gl.convert_layout(1 - seen, ids.type.layout)
-    ballot = gl.inline_asm(
-        _slots2_ballot_asm,
-        _slots2_ballot_constraints(),
-        [owner],
-        [ids.type, gl.int32, ids.type, gl.int32],
-        is_pure=True,
-    )
+    # Separate the two register elements so each ballot counts one pick per lane.
+    pair: gl.constexpr = gl.BlockedLayout([1, 2], [64, 1], [nw, 1], [0, 1])
+    owners = gl.reshape(owner, [64, 2])
+    owners = gl.convert_layout(owners, pair)
+    even, odd = gl.split(owners)
+    even_mask = wave_ballot_i64(even)
+    odd_mask = wave_ballot_i64(odd)
+    below = wave_mbcnt(even_mask) + wave_mbcnt(odd_mask)
+    count = wave_popcount_i64(even_mask) + wave_popcount_i64(odd_mask)
+    slot = gl.reshape(gl.join(below, below + even), [NP])
+    slot = gl.convert_layout(slot, ids.type.layout)
+    # Every lane has the same count; select one instead of reducing the wave.
+    count = gl.sum(gl.gather(count, gl.full([1], 0, gl.int32, count.type.layout), 0), 0)
     tt: gl.constexpr = gl.BlockedLayout([2, RP], [64, 1], [nw, 1], [1, 0])
     table = gl.convert_layout(entries, tt)
-    return ids, owner, ballot[0], ballot[1], table
+    return ids, owner, slot, count, table
 
 
 @gluon.constexpr_function
@@ -624,8 +595,7 @@ def _ballot_slots(ids, RP: gl.constexpr):
     tt: gl.constexpr = gl.distributed_type(
         gl.int32, [NP, RP], _table_lanes_layout(RP, nw)
     )
-    # asm: lane reads (v_readlane) and lane masks (ballots, v_mbcnt) in
-    # SGPRs, which the extern library (_wave.ll) does not provide yet.
+    # asm: 307 instructions vs 330 with the _wave.ll intrinsics (rows 8).
     out = gl.inline_asm(
         _slots_asm,
         (

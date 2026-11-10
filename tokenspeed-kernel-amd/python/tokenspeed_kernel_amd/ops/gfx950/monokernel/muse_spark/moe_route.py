@@ -378,9 +378,7 @@ def topk_stage(mb, task, bias, STAGE: gl.constexpr):
     one: gl.constexpr = gl.BlockedLayout([1], [64], [nw], [0])
     slot = gl.arange(0, 64 * nw, one)
     vt: gl.constexpr = slot.type.with_element_ty(gl.float32)
-    # asm: a loop of 8 passes keeps lane masks in SGPRs (v_cmp, s_ff1,
-    # v_readlane by an SGPR lane) across its iterations, which the extern
-    # library (_wave.ll) does not provide yet.
+    # asm: 94 instructions vs 154-156 with the _wave.ll intrinsics.
     res = gl.inline_asm(
         _top8_asm,
         _TOP8_CONSTRAINTS,

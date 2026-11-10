@@ -30,6 +30,7 @@ from utils import is_cdna4
 if not is_cdna4():
     pytest.skip("AMD CDNA4 is required", allow_module_level=True)
 
+from tokenspeed_kernel_amd._extern import extern_compile_options  # noqa: E402
 from tokenspeed_kernel_amd._triton import gl, gluon  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import (  # noqa: E402
     moe_experts,
@@ -80,7 +81,7 @@ def test_ballot_slots_match_slots(rows: int):
         ids = torch.stack(picks).flatten().to(torch.int32).cuda()
         size = 3 * rp * 8 + rp * 8 * rp + 1
         out = torch.full((2 * size,), -7, dtype=torch.int32, device="cuda")
-        _slots_kernel[(1,)](ids, out, rp, num_warps=8)
+        _slots_kernel[(1,)](ids, out, rp, num_warps=8, **extern_compile_options())
         torch.cuda.synchronize()
         assert torch.equal(out[:size].cpu(), out[size:].cpu()), (rows, trial)
 

@@ -2837,3 +2837,13 @@ Each CTA walks the stages in plan order and runs its tasks of each stage. A
 stage reads only regions that earlier stages write, so the launch cannot
 deadlock. A task issues its weight loads before it polls its
 inputs. Thus weights stream while earlier stages compute.
+
+### Muse Spark wave slot counts (gfx950)
+
+The 128-pick expert table holds even and odd picks in separate registers of
+one wave64. Ballot each register's owner flags; each pick's slot is the sum
+of both masks' set bits below its lane, plus its lane's even owner for an
+odd pick. The count is the sum of both masks' population counts. These wave
+operations use `_extern.py` and `_intrinsics/_wave.ll`, including an inline
+`llvm.ctpop` to avoid an out-of-line device-library count. Callers must launch
+with `extern_compile_options()`. Lane-read indices must be wave-uniform.

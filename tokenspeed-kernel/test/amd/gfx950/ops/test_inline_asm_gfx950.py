@@ -868,17 +868,17 @@ INLINE_ASM = {
     "topk_stage": (
         _MONO + "muse_spark.moe_route:topk_stage",
         "a wave's top 8 by lane masks in SGPRs (v_cmp, s_ff1, v_readlane)",
-        "Gluon ballot and lane-read ops, or the extern library's",
+        "compiler lowering matching the measured asm code size",
     ),
     "_ballot_slots": (
         _MONO + "muse_spark.moe_experts:_ballot_slots",
         "the picks' slots by lane reads and ballots (up to 64 picks)",
-        "Gluon ballot and lane-read ops, or the extern library's",
+        "compiler lowering matching the measured asm code size",
     ),
     "_ballot_slots2": (
         _MONO + "muse_spark.moe_experts:_ballot_slots2",
         "the picks' slots by lane reads and ballots (128 picks)",
-        "Gluon ballot and lane-read ops, or the extern library's",
+        "compiler lowering matching the measured asm code size",
     ),
 }
 # Inline asm that existed before this gate, which the kernels above compile in.

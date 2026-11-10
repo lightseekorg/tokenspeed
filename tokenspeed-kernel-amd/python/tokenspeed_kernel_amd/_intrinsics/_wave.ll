@@ -49,3 +49,35 @@ entry:
   %r = zext i1 %all to i32
   ret i32 %r
 }
+
+; A ballot bit is set for each active lane whose int32 predicate is nonzero.
+define i64 @__tokenspeed_wave_ballot_i64(i32 %predicate) alwaysinline {
+entry:
+  %p = icmp ne i32 %predicate, 0
+  %mask = call i64 @llvm.amdgcn.ballot.i64(i1 %p)
+  ret i64 %mask
+}
+
+; Count set bits below this lane in a wave64 mask.
+declare i32 @llvm.amdgcn.mbcnt.lo(i32, i32)
+declare i32 @llvm.amdgcn.mbcnt.hi(i32, i32)
+
+define i32 @__tokenspeed_wave_mbcnt(i64 %mask) alwaysinline {
+entry:
+  %lo = trunc i64 %mask to i32
+  %shifted = lshr i64 %mask, 32
+  %hi = trunc i64 %shifted to i32
+  %low_count = call i32 @llvm.amdgcn.mbcnt.lo(i32 %lo, i32 0)
+  %count = call i32 @llvm.amdgcn.mbcnt.hi(i32 %hi, i32 %low_count)
+  ret i32 %count
+}
+
+; Keep population count visible to LLVM so a uniform mask uses s_bcnt1.
+declare i64 @llvm.ctpop.i64(i64)
+
+define i32 @__tokenspeed_wave_popcount_i64(i64 %mask) alwaysinline {
+entry:
+  %count = call i64 @llvm.ctpop.i64(i64 %mask)
+  %r = trunc i64 %count to i32
+  ret i32 %r
+}

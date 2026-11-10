@@ -201,6 +201,57 @@ def wave_uniform_i32(value, _semantic):
 
 
 @tl.core.extern
+def wave_ballot_i64(predicate, _semantic):
+    """Return an int64 mask of active lanes with nonzero int32 ``predicate``.
+
+    Bit l represents lane l. Launch with :func:`extern_compile_options`.
+    """
+    return _call(
+        "wave",
+        "ballot_i64",
+        [predicate],
+        (tl.int32,),
+        tl.int64,
+        is_pure=False,
+        _semantic=_semantic,
+    )
+
+
+@tl.core.extern
+def wave_popcount_i64(mask, _semantic):
+    """Return the int32 number of set bits in int64 ``mask``.
+
+    Uses ``llvm.ctpop``. Launch with :func:`extern_compile_options`.
+    """
+    return _call(
+        "wave",
+        "popcount_i64",
+        [mask],
+        (tl.int64,),
+        tl.int32,
+        is_pure=True,
+        _semantic=_semantic,
+    )
+
+
+@tl.core.extern
+def wave_mbcnt(mask, _semantic):
+    """Return the int32 count of set bits in int64 ``mask`` below this lane.
+
+    Counts across a wave of 64 lanes. Launch with :func:`extern_compile_options`.
+    """
+    return _call(
+        "wave",
+        "mbcnt",
+        [mask],
+        (tl.int64,),
+        tl.int32,
+        is_pure=True,
+        _semantic=_semantic,
+    )
+
+
+@tl.core.extern
 def wave_all_equal(a, b, _semantic):
     """1 where ``a == b`` (FP32, ordered) holds in every active lane of the
     wave, else 0, as an int32 tensor whose value is the same across the
