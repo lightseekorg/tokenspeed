@@ -47,7 +47,6 @@ from tokenspeed.runtime.execution.output_layout import (  # noqa: E402
 )
 from tokenspeed.runtime.layers.paged_attention import PagedAttention  # noqa: E402
 from tokenspeed.runtime.models.muse_spark_monokernel import (  # noqa: E402
-    MAX_REQUESTS,
     MAX_ROWS,
     NOT_TP8,
     OTHER_CONSTANTS,
@@ -80,19 +79,20 @@ def _ctx(mode: ForwardMode, bs: int, rows: int) -> ForwardContext:
     )
 
 
-def test_decode_steps_of_up_to_max_requests_take_the_kernels() -> None:
-    """A launch computes the rows of up to MAX_REQUESTS requests: a decode
-    token each, or a speculative verify's tokens each, MAX_ROWS rows at
-    most. Prefill, more requests and wider verifies keep the regular path."""
+def test_decode_steps_of_up_to_two_requests_take_the_kernels() -> None:
+    """A launch computes the rows of one or two requests: a decode token
+    each, or a speculative verify's tokens each, 16 rows at most. Prefill,
+    more requests and wider verifies keep the regular path."""
     assert takes_monokernels(1, _ctx(ForwardMode.DECODE, 1, 1))
     assert takes_monokernels(4, _ctx(ForwardMode.DECODE, 1, 4))
     assert takes_monokernels(8, _ctx(ForwardMode.DECODE, 1, 8))
-    # Two requests' rows only while MAX_REQUESTS allows them.
-    two = MAX_REQUESTS >= 2
-    assert takes_monokernels(2, _ctx(ForwardMode.DECODE, 2, 2)) == two
-    assert takes_monokernels(MAX_ROWS, _ctx(ForwardMode.DECODE, 2, MAX_ROWS)) == two
+    # Two requests: two decode rows, or two 8-token verifies.
+    assert takes_monokernels(2, _ctx(ForwardMode.DECODE, 2, 2))
+    assert takes_monokernels(MAX_ROWS, _ctx(ForwardMode.DECODE, 2, MAX_ROWS))
     assert not takes_monokernels(MAX_ROWS + 2, _ctx(ForwardMode.DECODE, 2, 18))
     assert not takes_monokernels(3, _ctx(ForwardMode.DECODE, 3, 3))
+    # One request's chain is at most CHAIN_ROWS: 16 rows of one request don't.
+    assert not takes_monokernels(MAX_ROWS, _ctx(ForwardMode.DECODE, 1, MAX_ROWS))
     assert not takes_monokernels(1, _ctx(ForwardMode.EXTEND, 1, 1))
     assert not takes_monokernels(1, _ctx(ForwardMode.IDLE, 1, 1))
 

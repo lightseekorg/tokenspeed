@@ -36,11 +36,13 @@ layers 1 to 60 as one persistent launch each per TP8 rank, from
   after them, and calls :meth:`MuseSparkMonokernelState.claim_taps`, which
   decides whether the launches store a draft's taps.
 
-A step serves one token row, or the rows of a speculative verify (the
-request's draft tokens, one row each; row ``t`` has length ``seq - rows + t +
-1`` for the step's ``seq_lens``). A draft model that taps the residual
-entering a layer (``layers_to_capture``) gets the whole row there: the fused
-run before that layer gathers it, as before a regular layer.
+A step serves one or two requests of equal rows: a token row each, or the
+rows of a speculative verify each (a request's draft tokens, one row each;
+row ``t`` of a request of ``chain`` rows has length ``seq - chain + t + 1``
+for its entry of the step's ``seq_lens``), one request's rows after the
+other's. A draft model that taps the residual entering a layer
+(``layers_to_capture``) gets the whole row there: the fused run before that
+layer gathers it, as before a regular layer.
 
 The served MoE split is MoE TP8 / EP1: each rank holds its slice of every
 expert, which the kernel reads in place. Other splits keep the regular path.
@@ -87,11 +89,11 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 
 logger = logging.getLogger(__name__)
 
-# Token rows of one launch: one request's decode row, or its verify of up to
-# 7 draft tokens (the DFlash2 drafters' block of 8). The kernels take up to
-# two requests' rows (16); serving them is left to a later change, so a step
-# of more requests keeps the regular path.
-MAX_REQUESTS = 1
+# Token rows of one launch: a decode row a request, or a verify of up to 7
+# draft tokens (the DFlash2 drafters' block of 8) a request, for up to
+# MAX_REQUESTS requests, their rows one request after another (16 at most).
+# A step of more requests keeps the regular path.
+MAX_REQUESTS = 2
 CHAIN_ROWS = 8  # a request's rows at most
 MAX_ROWS = MAX_REQUESTS * CHAIN_ROWS
 WORLD = 8
@@ -315,13 +317,15 @@ class CompiledLaunches:
 def takes_monokernels(rows: int, ctx: ForwardContext) -> bool:
     """Whether a forward of ``rows`` token rows takes the monokernels: a
     decode step of 1 to ``MAX_REQUESTS`` requests of equal rows (one token
-    each, or a speculative verify), at most ``MAX_ROWS`` rows in all. Prefill
-    and more requests keep the regular path."""
+    each, or a speculative verify), at most ``CHAIN_ROWS`` rows a request and
+    ``MAX_ROWS`` rows in all. Prefill, more requests and longer chains keep
+    the regular path: the kernels compile per chain up to ``CHAIN_ROWS``."""
     return (
         ctx.forward_mode.is_decode()
         and 1 <= ctx.bs <= MAX_REQUESTS
         and 1 <= rows <= MAX_ROWS
         and rows % ctx.bs == 0
+        and rows // ctx.bs <= CHAIN_ROWS
     )
 
 
