@@ -329,7 +329,12 @@ def test_fp8_prefill_rejects_unaligned_vector_reads():
         _call((shifted_q, k, v, slots, metadata), scales=(1.0, 1.0), override=NAME)
 
 
-def test_fp8_prefill_int32_positions_keep_fallback():
+def test_fp8_prefill_int32_positions_keep_fallback(monkeypatch):
+    import tokenspeed_kernel.ops.attention.qsa._flashinfer.runner as runner_module
+
+    # Other tests pin the process runner's metadata capacity during graph capture.
+    # Keep this fallback geometry independent of their execution order.
+    monkeypatch.setattr(runner_module, "_runners", {})
     q, k, v, slots, metadata = _case(0, 2)
     metadata = replace(metadata, query_positions=metadata.query_positions.int())
     case = q, k, v, slots, metadata
