@@ -111,12 +111,16 @@ def _shared_inputs(launch: int, rows: int):
 
 
 def _reference_b(launch: int, rows: int):
-    """The reduced, BF16-rounded ``o_proj`` output ``b``, ``[rows, 8192]``."""
+    """The reduced, BF16-rounded ``o_proj`` output ``b``, and the sum of the
+    ranks' partials' magnitudes, both ``[rows, 8192]``."""
     b = torch.zeros(rows, HIDDEN)
+    spread = torch.zeros(rows, HIDDEN)
     for r in range(WORLD):
         z, w = _rank_inputs(r, launch, rows)
-        b = b + (z.float() @ w.float().T).to(torch.bfloat16).float()
-    return b.to(torch.bfloat16).float()
+        part = (z.float() @ w.float().T).to(torch.bfloat16).float()
+        b = b + part
+        spread = spread + part.abs()
+    return b.to(torch.bfloat16).float(), spread
 
 
 def _rank_order_sum(red: torch.Tensor) -> torch.Tensor:
@@ -130,12 +134,17 @@ def _rank_order_sum(red: torch.Tensor) -> torch.Tensor:
 
 
 def _reference_tail(launch: int, b: torch.Tensor):
-    """``(h', u)`` of ``b [rows, 8192]``."""
-    h, alpha, beta, pre_gain = _shared_inputs(launch, b.shape[0])
+    """``(h', u)`` of ``b [rows, 8192]`` in FP64, and the size of each one's
+    terms: ``|beta * b'| + |alpha * h|`` for h' (where the two cancel, FP32
+    rounding is an absolute error at that size), carried through the norm
+    for u."""
+    h, alpha, beta, pre_gain = (x.double() for x in _shared_inputs(launch, b.shape[0]))
+    b = b.double()
     inv = torch.rsqrt(b.pow(2).mean(-1, keepdim=True) + 1e-8)
     hp = beta * b * inv + alpha * h
-    u = hp * torch.rsqrt(hp.pow(2).mean(-1, keepdim=True) + 1e-5) * pre_gain
-    return hp, u
+    hp_size = (beta * b * inv).abs() + (alpha * h).abs()
+    inv_hp = torch.rsqrt(hp.pow(2).mean(-1, keepdim=True) + 1e-5)
+    return hp, hp * inv_hp * pre_gain, hp_size, hp_size * inv_hp * pre_gain.abs()
 
 
 def _worker(rank: int, port: int, rows: int) -> None:
@@ -189,8 +198,8 @@ def _worker(rank: int, port: int, rows: int) -> None:
             # b, the reduced, BF16-rounded o_proj columns: the 8 ranks'
             # BF16 partials this rank received, summed in rank order as tail1
             # (and the router) sum them. A rank's BF16 partial can be one step
-            # off the reference's (its FP32 sums run in another order); with
-            # the final rounding the sum is then up to two BF16 steps off.
+            # (2^-7 of its size) off the reference's, as its FP32 sums run in
+            # another order; the sum's own rounding adds one more step.
             b = torch.stack(
                 [
                     _rank_order_sum(
@@ -207,22 +216,23 @@ def _worker(rank: int, port: int, rows: int) -> None:
                     for row in range(rows)
                 ]
             )
-            torch.testing.assert_close(
-                b, _reference_b(k, rows)[:, own], rtol=2**-6, atol=1e-3
-            )
+            want_b, spread = _reference_b(k, rows)
+            err = (b - want_b[:, own]).abs()
+            bound = 2**-7 * (spread[:, own] + want_b[:, own].abs())
+            assert torch.all(err <= bound), float((err / bound).max())
             # h' and u follow from the kernel's b: the residual gate can
-            # cancel, and would amplify b's rounding steps.
+            # cancel, and would amplify b's rounding steps. h' is FP32: a few
+            # FP32 roundings and the norm's reordered sum, well within 2^-16
+            # of its terms' size.
             parts = [torch.empty_like(b) for _ in range(WORLD)]
             dist.all_gather(parts, b)
-            want_hp, want_u = _reference_tail(k, torch.cat(parts, dim=1))
+            want_hp, want_u, hp_size, u_size = _reference_tail(
+                k, torch.cat(parts, dim=1)
+            )
             for row in range(rows):
                 hp = payloads(scratch, plan, "hp", OWNED, tag, row=row)
-                torch.testing.assert_close(
-                    hp.view(torch.float32).cpu(),
-                    want_hp[row, own],
-                    rtol=2**-7,
-                    atol=1e-3,
-                )
+                err = (hp.view(torch.float32).cpu().double() - want_hp[row, own]).abs()
+                assert torch.all(err <= 2**-16 * hp_size[row, own]), float(err.max())
                 # Every rank holds the whole BF16 MoE input, rank-major, as
                 # words, and every tail task's flag.
                 payloads(
@@ -235,12 +245,10 @@ def _worker(rank: int, port: int, rows: int) -> None:
                     copy=step & 1,
                 )
                 xin = words(scratch, plan, "xin", HIDDEN // 2, row=row, copy=step & 1)
-                torch.testing.assert_close(
-                    xin.view(torch.bfloat16).float().cpu(),
-                    want_u[row],
-                    rtol=2**-7,
-                    atol=1e-3,
-                )
+                # u rounds once to BF16 from h''s FP32 error: one step.
+                err = (xin.view(torch.bfloat16).cpu().double() - want_u[row]).abs()
+                bound = 2**-7 * want_u[row].abs() + 2**-16 * u_size[row]
+                assert torch.all(err <= bound), float((err / bound).max())
             dist.barrier()
     finally:
         dist.destroy_process_group()
