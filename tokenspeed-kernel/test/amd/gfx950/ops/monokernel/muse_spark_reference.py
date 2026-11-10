@@ -254,3 +254,98 @@ def expert_partials(rank: int, experts: int, pooled, gain, ids) -> torch.Tensor:
             hq = fake_quantize_mxfp4_even(h.to(torch.bfloat16).float().view(1, -1))
             out[row, k] = down @ hq.view(-1)
     return out.to(torch.bfloat16)
+
+
+def _blocks(t: torch.Tensor) -> torch.Tensor:
+    return t.reshape(*t.shape[:-1], -1, 32)
+
+
+def _mx_exponent(t: torch.Tensor) -> torch.Tensor:
+    """``fake_quantize_mxfp4_even``'s scale exponent of each 32-value block."""
+    amax = _blocks(t.float()).abs().amax(dim=-1, keepdim=True)
+    return ((amax.view(torch.int32) + 0x200000) >> 23) - 2
+
+
+def mxfp4_flip_bound(ref, lo, hi) -> torch.Tensor:
+    """A bound on ``|q(v) - q(ref)|`` for every ``v`` with ``lo <= v <= hi``
+    elementwise, ``q`` = ``fake_quantize_mxfp4_even`` (FP32, last dimension in
+    32-value blocks).
+
+    Within a block whose scale cannot change over the interval (the block's
+    smallest and largest possible amax give ``ref``'s scale exponent), ``q``
+    is monotone in each element, so the endpoints bound it exactly: elements
+    away from a rounding boundary get 0. Elsewhere one code step of the
+    larger scale is allowed (2 * scale covers the widest E2M1 step and the
+    saturation above 6)."""
+    qr, ql, qh = (fake_quantize_mxfp4_even(t) for t in (ref, lo, hi))
+    exact = _blocks(torch.maximum((ql - qr).abs(), (qh - qr).abs()))
+    big = torch.maximum(lo.abs(), hi.abs())
+    small = torch.where(lo * hi > 0, torch.minimum(lo.abs(), hi.abs()), 0.0)
+    e = torch.stack([_mx_exponent(t) for t in (ref, big, small)])
+    same = (e[0] == e[1]) & (e[0] == e[2])
+    scale = torch.exp2(e.amax(0).clamp(0, 254).float() - 127)
+    loose = _blocks(torch.maximum(hi - ref, ref - lo)) + 2 * scale
+    return torch.where(same, exact, torch.maximum(exact, loose)).reshape(ref.shape)
+
+
+def _bf16_interval(x: torch.Tensor, dx: torch.Tensor):
+    """BF16 of ``x`` and of its interval's ends, as FP32: round-to-nearest is
+    monotone, so a value within ``dx`` of ``x`` rounds between them."""
+    return tuple(
+        t.to(torch.float32).to(torch.bfloat16).float() for t in (x, x - dx, x + dx)
+    )
+
+
+# FP32 sums of K exact products: 6 standard deviations of K independent
+# roundings of at most 2^-24 of the sum of magnitudes.
+def _sums(k: int) -> float:
+    return 6 / math.sqrt(3) * math.sqrt(k) * 2**-24
+
+
+def expert_partials_bounded(raw, pooled, gain, ids, cols):
+    """One rank's expert route partials in FP64 and a bound on its kernel's
+    BF16 ones, ``[rows, 8, cols]`` each, from the raw MXFP4 shards ``raw``
+    (``raw_experts``' tuple), ``pooled [rows, 4096]`` and each row's picks
+    ``ids [rows, 8]`` (output columns ``cols``, a slice), on their device.
+
+    The kernel norms the pooled row in FP32 (within 2^-16 of it), rounds it to
+    BF16 and quantizes to MXFP4, sums the up projection in FP32, applies
+    SiLU (FP32 exp and divide: 2^-20), rounds to BF16, quantizes again, sums
+    the down projection in FP32 and rounds to BF16. Each step's error carries
+    into the next; a quantization can step one code where the error reaches
+    a rounding boundary (:func:`mxfp4_flip_bound`).
+    """
+    w13, s13, w2, s2 = raw
+    x = pooled.double()
+    x = (
+        x
+        * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-5)
+        * gain.double().to(x.device)
+    )
+    xb, xlo, xhi = _bf16_interval(x, 2**-16 * x.abs())
+    xq = fake_quantize_mxfp4_even(xb).double()
+    dxq = mxfp4_flip_bound(xb, xlo, xhi).double()
+    rows = ids.shape[0]
+    exact = torch.empty(
+        rows, TOP_K, cols.stop - cols.start, dtype=torch.float64, device=x.device
+    )
+    bound = torch.empty_like(exact)
+    for e in ids.unique().tolist():
+        up = dequantize_mxfp4(w13[e], s13[e]).double()
+        down = dequantize_mxfp4(w2[e][cols], s2[e][cols]).double()
+        for row, k in (ids == e).nonzero().tolist():
+            acc = up @ xq[row]
+            dacc = up.abs() @ dxq[row] + _sums(up.shape[1]) * (up.abs() @ xq[row].abs())
+            g, u, dg, du = acc[0::2], acc[1::2], dacc[0::2], dacc[1::2]
+            silu = g / (1.0 + torch.exp(-g))
+            h = silu * u
+            # |SiLU'(g)| stays below 1.0998, so 1.1 bounds how far g's error moves it.
+            dh = 1.1 * dg * (u.abs() + du) + silu.abs() * du + 2**-20 * h.abs()
+            hb, hlo, hhi = _bf16_interval(h.view(1, -1), dh.view(1, -1))
+            hq = fake_quantize_mxfp4_even(hb).double().view(-1)
+            dhq = mxfp4_flip_bound(hb, hlo, hhi).double().view(-1)
+            out = down @ hq
+            dout = down.abs() @ dhq + _sums(down.shape[1]) * (down.abs() @ hq.abs())
+            exact[row, k] = out
+            bound[row, k] = dout + 2**-8 * (out.abs() + dout)
+    return exact, bound

@@ -25,35 +25,25 @@ from __future__ import annotations
 
 import socket
 from datetime import timedelta
-from types import SimpleNamespace
 
+import muse_spark_reference as ref
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from tokenspeed_kernel.benchmark import muse_spark_monokernel_gluon as gluon_inputs
 from utils import is_cdna4
 
 if not is_cdna4():
     pytest.skip("AMD CDNA4 is required", allow_module_level=True)
 
 from monokernel_testing import fill, payloads  # noqa: E402
-from tokenspeed_kernel.numerics.torch.quantization import (  # noqa: E402
-    dequantize_mxfp4,
-    fake_quantize_mxfp4_even,
-)
 from tokenspeed_kernel.ops.communication._iris import (  # noqa: E402
     IrisGroup,
     get_or_create_context,
 )
 from tokenspeed_kernel_amd._extern import extern_compile_options  # noqa: E402
 from tokenspeed_kernel_amd._triton import gl, gluon  # noqa: E402
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused._common import (  # noqa: E402
-    _extract_gluon_raw_s,
-    _extract_gluon_raw_w,
-)
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.weight_preprocess import (  # noqa: E402
-    preprocess_gluon_mxfp4_gfx950_moe_weights,
-)
 from tokenspeed_kernel_amd.ops.gfx950.monokernel import mailbox, schedule  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import (  # noqa: E402
     moe_experts,
@@ -173,24 +163,7 @@ def _raw_experts(rank: int, device: torch.device):
 
 
 def _preprocessed(rank: int, device: torch.device):
-    w13, s13, w2, s2 = _raw_experts(rank, device)
-    module = torch.nn.Module()
-    module.w13_input_layout = "interleaved"
-    module.quant_config = SimpleNamespace(use_dynamic_mxfp4_activations=True)
-    for name, t in (
-        ("w13_weight", w13),
-        ("w13_weight_scale", s13),
-        ("w2_weight", w2),
-        ("w2_weight_scale", s2),
-    ):
-        setattr(module, name, torch.nn.Parameter(t, requires_grad=False))
-    preprocess_gluon_mxfp4_gfx950_moe_weights({}, module)
-    return (
-        _extract_gluon_raw_w(module.w13_weight_triton_tensor),
-        _extract_gluon_raw_s(module.w13_precision_config.b_mx_scale),
-        _extract_gluon_raw_w(module.w2_weight_triton_tensor),
-        _extract_gluon_raw_s(module.w2_precision_config.b_mx_scale),
-    )
+    return gluon_inputs.preprocess_experts(_raw_experts(rank, device))
 
 
 def _inputs(launch: int, rows: int, distinct: int | None):
@@ -217,26 +190,6 @@ def _picks(g: torch.Generator, rows: int, distinct: int | None) -> torch.Tensor:
     deal = torch.arange(rows * TOP_K).view(rows, TOP_K) % distinct
     order = torch.argsort(torch.rand(rows, TOP_K, generator=g), dim=1)
     return chosen[deal.gather(1, order)].to(torch.int32)
-
-
-def _reference(rank: int, pooled, gain, ids, cols, device):
-    """Rank ``rank``'s BF16 partials ``[rows, 8, cols]`` of every row's 8
-    picks (output columns ``cols``), computed on ``device``. Each picked
-    expert is dequantized once."""
-    x = pooled.float().to(device)
-    x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-5) * gain.to(device)
-    xq = fake_quantize_mxfp4_even(x.to(torch.bfloat16).float())
-    w13, s13, w2, s2 = _raw_experts(rank, device)
-    out = torch.empty(ids.shape[0], TOP_K, cols.stop - cols.start, device=device)
-    for e in ids.unique().tolist():
-        up = dequantize_mxfp4(w13[e], s13[e]).float()
-        down = dequantize_mxfp4(w2[e][cols], s2[e][cols]).float()
-        for row, k in (ids == e).nonzero().tolist():
-            acc = up @ xq[row]
-            h = acc[0::2] / (1.0 + torch.exp(-acc[0::2])) * acc[1::2]
-            hq = fake_quantize_mxfp4_even(h.to(torch.bfloat16).float().view(1, -1))
-            out[row, k] = down @ hq.view(-1)
-    return out.to(torch.bfloat16).cpu()
 
 
 def _worker(
@@ -318,8 +271,21 @@ def _worker(
             )
             torch.cuda.synchronize()
             dist.barrier()
+            # Each source rank's partials in FP64 and a bound on the kernel's
+            # (its two MXFP4 quantizations can step a code where the FP32 error
+            # reaches a rounding boundary: ref.expert_partials_bounded).
             want = [
-                _reference(src, pooled, gain, ids, own, device) for src in range(WORLD)
+                tuple(
+                    t.cpu()
+                    for t in ref.expert_partials_bounded(
+                        _raw_experts(src, device),
+                        pooled.to(device),
+                        gain.to(device),
+                        ids.long().to(device),
+                        own,
+                    )
+                )
+                for src in range(WORLD)
             ]
             for row in range(rows):
                 got = payloads(
@@ -333,10 +299,9 @@ def _worker(
                 )
                 got = got.view(torch.bfloat16).float().view(WORLD, TOP_K, OWNED).cpu()
                 for src in range(WORLD):
-                    w = want[src][row].float()
-                    torch.testing.assert_close(
-                        got[src], w, rtol=2**-6, atol=2**-6 * float(w.abs().max())
-                    )
+                    exact, bound = (t[row] for t in want[src])
+                    err = (got[src].double() - exact).abs()
+                    assert torch.all(err <= bound), float((err / bound).max())
             dist.barrier()
     finally:
         dist.destroy_process_group()

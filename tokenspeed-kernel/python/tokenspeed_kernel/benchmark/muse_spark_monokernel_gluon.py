@@ -62,12 +62,13 @@ class _MoEWeights(torch.nn.Module):
         self.w2_weight_scale = torch.nn.Parameter(s2, requires_grad=False)
 
 
-def preprocessed_experts(rank: int, experts: int, device: torch.device):
-    """:func:`raw_experts` through the regular path's MoE weight
-    preprocessing (the gfx950 Gluon MXFP4 layout the monokernel reads).
+def preprocess_experts(raw):
+    """Raw MXFP4 expert shards (``(w13, s13, w2, s2)``, as :func:`raw_experts`
+    makes them) through the regular path's MoE weight preprocessing: the
+    gfx950 Gluon MXFP4 layout the monokernel reads, on the shards' device.
 
     Returns:
-        ``(w13, s13, w2, s2)`` on ``device``.
+        ``(w13, s13, w2, s2)``.
     """
     # The gfx950 Gluon MoE preprocessing has no registry entry: it is the
     # layout this AMD-only monokernel bakes in.
@@ -79,7 +80,7 @@ def preprocessed_experts(rank: int, experts: int, device: torch.device):
         preprocess_gluon_mxfp4_gfx950_moe_weights,
     )
 
-    module = _MoEWeights(*(t.to(device) for t in raw_experts(rank, experts)))
+    module = _MoEWeights(*raw)
     preprocess_gluon_mxfp4_gfx950_moe_weights({}, module)
     return (
         _extract_gluon_raw_w(module.w13_weight_triton_tensor),
@@ -87,6 +88,12 @@ def preprocessed_experts(rank: int, experts: int, device: torch.device):
         _extract_gluon_raw_w(module.w2_weight_triton_tensor),
         _extract_gluon_raw_s(module.w2_precision_config.b_mx_scale),
     )
+
+
+def preprocessed_experts(rank: int, experts: int, device: torch.device):
+    """:func:`raw_experts` of ``rank`` on ``device`` through
+    :func:`preprocess_experts`."""
+    return preprocess_experts(tuple(t.to(device) for t in raw_experts(rank, experts)))
 
 
 # A launch with fewer GPUs than ranks (the layer bench's --gpus 1, 2 or 4):
