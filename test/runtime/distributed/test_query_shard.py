@@ -556,7 +556,7 @@ def test_the_mtp_extend_depths_run_the_target_shard(monkeypatch):
 
     def draft_input(plan):
         shard = target_hidden[plan.local_row_ids] if plan is not None else target_hidden
-        return mtp.MtpDraftInput(
+        return mtp.HiddenDraftInput(
             input_num_tokens=total,
             num_extends=bs,
             forward_mode=ForwardMode.EXTEND,
@@ -621,7 +621,7 @@ def test_the_mtp_extend_depths_run_the_target_shard(monkeypatch):
         make_drafter(plan)._run_decode_depths(
             bs,
             torch.zeros(bs, steps + 1, dtype=torch.int32),
-            mtp.MtpDraftInput(
+            mtp.HiddenDraftInput(
                 input_num_tokens=bs * k,
                 num_extends=0,
                 forward_mode=ForwardMode.DECODE,

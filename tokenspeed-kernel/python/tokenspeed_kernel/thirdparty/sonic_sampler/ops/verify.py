@@ -138,6 +138,7 @@ def verify_drafted(
     stride_c: tl.constexpr,
     stride_d: tl.constexpr,
     stride_u: tl.constexpr,
+    reject_threshold,
 ):
 
     # Extract the selected target probabilities via masked-sum HFMA reduction tree.
@@ -174,9 +175,16 @@ def verify_drafted(
 
         uniform *= sources
 
+        if reject_threshold is not None:
+
+            # A probability above the threshold marks a slot with no proposal; a draft the target cannot emit is never accepted either.
+            rejected = (sources > reject_threshold) | (targets <= 0)
+            uniform = tl.where(rejected, float("inf"), uniform)
+
     # Compute the rejection offset(s) i.e. total accepted.
 
     marked = (uniform <= targets) & mask
+
     accepted = tl.argmin(marked, axis=0)
 
     return accepted, targets, matches
@@ -205,6 +213,7 @@ def rejection_sample(
     stride_c: tl.constexpr,
     stride_d: tl.constexpr,
     stride_e: tl.constexpr,
+    reject_threshold,
 ):
 
     # Gather the rejected row from the target probabilities and indices.
@@ -247,6 +256,11 @@ def rejection_sample(
         # Load the draft probabilities for the corresponding position(s).
 
         marginals = tl.load(d_ptr + (batch_id * stride_d) + shifts)
+
+        if reject_threshold is not None:
+
+            # A sentinel row (no recorded proposal) contributes nothing: the residual is the target.
+            marginals = tl.where(marginals > reject_threshold, 0.0, marginals)
         residuals = tl.clamp(scores - marginals, 0.0, 1.0)
 
     # Apply rejection sampling to surface the next token.
@@ -307,6 +321,7 @@ def chain_speculative_verification_kernel(
     # Kernel Specific(s).
     block_g: tl.constexpr,  # Next Power-of-2 Timesteps (γ + 1) -> T.
     block_z: tl.constexpr,  # Next Power-of-2 Top-K Log-Probabilities Targets -> Z'.
+    reject_threshold=None,  # Draft Probabilities above this mark a Slot with no Proposal.
 ) -> None:
 
     block_id = tl.program_id(axis=0)
@@ -386,6 +401,7 @@ def chain_speculative_verification_kernel(
             stride_c,
             stride_d,
             stride_u,
+            reject_threshold,
         )
 
         # Rejection-sample the next token and conditionally update selected token(s) and score(s).
@@ -412,6 +428,7 @@ def chain_speculative_verification_kernel(
             stride_c,
             stride_d,
             stride_e,
+            reject_threshold,
         )
 
         if logprobs:

@@ -206,6 +206,32 @@ def decode_counts(
 
 
 @jit
+def head_logits(logits, mask, logit_scale, softcap):
+    """A vocabulary shard's raw head logits scaled and softcapped as the logits processor stores them, in their dtype."""
+
+    if logit_scale is not None or softcap is not None:
+
+        dtype: tl.constexpr = logits.dtype
+        values = logits.to(tl.float32)
+
+        if logit_scale is not None:
+
+            # Rounded to the logits' dtype, as the processor's in-place multiply.
+            values = (values * logit_scale).to(dtype).to(tl.float32)
+
+        if softcap is not None:
+
+            # The processor's stable tanh form.
+            values = values / softcap
+            values = 2 * tl.sigmoid(2 * values) - 1
+            values = values * softcap
+
+        logits = tl.where(mask, values.to(dtype), -float("inf"))
+
+    return logits
+
+
+@jit
 def transform(
     logits,
     indicator,
@@ -402,6 +428,8 @@ def exact_candidates(
     stride_t: tl.constexpr,
     block_t: tl.constexpr,
     max_k: tl.constexpr,
+    logit_scale,
+    softcap,
 ):
     """The candidates' exact fp32 values, recomputed from the logits, sorted descending with the lower column first on ties."""
 
@@ -413,6 +441,7 @@ def exact_candidates(
     logits = tl.load(
         x_ptr + (row_id * stride_x) + columns, mask=mask, other=-float("inf")
     )
+    logits = head_logits(logits, mask, logit_scale, softcap)
 
     logits = transform(
         logits,
@@ -584,6 +613,8 @@ def bitpacked_reduction_kernel(
     block_t: tl.constexpr,  # Block Size of Token(s).
     exact: tl.constexpr,  # Exact fp32 Logits Flag (bf16 keys only pick candidates).
     value_dtype: tl.constexpr,  # Dtype the logit manipulators keep.
+    logit_scale=None,  # Logit Scale of a Vocabulary Shard's Raw Head Logits.
+    softcap=None,  # Final Logit Softcap of a Vocabulary Shard's Raw Head Logits.
 ) -> None:
     """
     Note that the value of L and T in the above shapes differ as follows:
@@ -643,6 +674,7 @@ def bitpacked_reduction_kernel(
     # Load the logits and the bit-indicator(s).
 
     logits = tl.load(x_ptr + offsets, mask=mask, other=-float("inf"))
+    logits = head_logits(logits, mask, logit_scale, softcap)
     indicator = tl.load(z_ptr + batch_id)
 
     logits = transform(

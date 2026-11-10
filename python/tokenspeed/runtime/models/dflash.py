@@ -185,6 +185,12 @@ class DFlashAttention(nn.Module):
 
 
 class DFlashDecoderLayer(nn.Module):
+    """A block-draft layer.
+
+    Subclasses swap its norms, attention or MLP through ``resolve_norm``,
+    ``resolve_attn`` and ``resolve_mlp``.
+    """
+
     def __init__(
         self,
         config,
@@ -194,31 +200,43 @@ class DFlashDecoderLayer(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        hidden_size = int(config.hidden_size)
-        eps = float(getattr(config, "rms_norm_eps", 1e-6))
+        self.config = config
         self.mapping = mapping
-        self.input_layernorm = RMSNorm(hidden_size, eps=eps)
-        self.self_attn = DFlashAttention(
-            config=config,
-            mapping=mapping,
-            layer_id=layer_id,
-            quant_config=quant_config,
-            prefix=add_prefix("self_attn", prefix),
+        self.layer_id = layer_id
+        self.quant_config = quant_config
+        self.input_layernorm = self.resolve_norm()
+        self.self_attn = self.resolve_attn(add_prefix("self_attn", prefix))
+        self.post_attention_layernorm = self.resolve_norm()
+        self.mlp = self.resolve_mlp(add_prefix("mlp", prefix))
+
+    def resolve_norm(self) -> nn.Module:
+        eps = float(getattr(self.config, "rms_norm_eps", 1e-6))
+        return RMSNorm(int(self.config.hidden_size), eps=eps)
+
+    def resolve_attn(self, prefix: str) -> nn.Module:
+        return DFlashAttention(
+            config=self.config,
+            mapping=self.mapping,
+            layer_id=self.layer_id,
+            quant_config=self.quant_config,
+            prefix=prefix,
         )
-        self.post_attention_layernorm = RMSNorm(hidden_size, eps=eps)
-        self.mlp = GatedMLP.tensor_parallel(
-            hidden_size=hidden_size,
-            intermediate_size=int(config.intermediate_size),
+
+    def resolve_mlp(self, prefix: str) -> nn.Module:
+        mapping = self.mapping
+        return GatedMLP.tensor_parallel(
+            hidden_size=int(self.config.hidden_size),
+            intermediate_size=int(self.config.intermediate_size),
             activation=gated_activation(
-                getattr(config, "hidden_act", "silu"), swiglu_limit=None
+                getattr(self.config, "hidden_act", "silu"), swiglu_limit=None
             ),
             tp_rank=mapping.dense.tp_rank,
             tp_size=mapping.dense.tp_size,
             tp_group=mapping.dense.tp_group,
             reduce_results=False,
             fusions=(),
-            quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
+            quant_config=self.quant_config,
+            prefix=prefix,
         )
 
     def forward(

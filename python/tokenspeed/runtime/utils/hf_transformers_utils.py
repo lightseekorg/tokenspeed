@@ -31,6 +31,7 @@ import warnings
 from collections.abc import Callable
 from typing import Any
 
+import huggingface_hub
 import torch
 from huggingface_hub import snapshot_download
 from transformers import (
@@ -376,6 +377,7 @@ def get_config(
                 model,
                 revision=revision,
                 ignore_patterns=["*.pt", "*.safetensors", "*.bin"],
+                local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
             )
 
         with get_lock(model):
@@ -582,6 +584,7 @@ def get_generation_config(
                     model,
                     revision=revision,
                     ignore_patterns=["*.pt", "*.safetensors", "*.bin"],
+                    local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
                 )
 
             with get_lock(model):
@@ -866,6 +869,7 @@ def get_tokenizer(
                 tokenizer_name,
                 revision=tokenizer_revision,
                 ignore_patterns=["*.pt", "*.safetensors", "*.bin"],
+                local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
             )
 
         with get_lock(tokenizer_name):

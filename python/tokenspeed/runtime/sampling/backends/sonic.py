@@ -43,6 +43,20 @@ of at least one, so that case resolves through ``sample``: the same
 kernel ``sample()`` uses, reading the same slot state and noise, so the two
 paths are bitwise identical (pinned by ``test_sonic_backend.py``).
 
+Under TP with a vocabulary-parallel head the sampled rows can stay
+vocab-sharded (``vocab_shard_top_k``): each rank selects its shard's best
+``MAX_K`` candidates with the slot state applied at global token ids, the ranks
+gather only those (``gather_topk_pairs``), and every rank draws from their merge
+what it would draw from the gathered rows (bf16 bit for bit; fp32 among the
+exact fp32 top-``MAX_K``). Every rank merges the same gathered bytes with the
+same slot state and noise, so sharded draws agree across ranks without the TP
+sync broadcast.
+
+Synthetic acceptance (``--synthetic-acceptance-length``, benchmarking only)
+runs the verify for its cost and then forces each request's length; the
+token at the cutoff comes from the candidates the verify selected
+(``_synthetic_outputs``).
+
 Not yet supported: DP-sampling, draft trees, top-k output logprobs, EAGLE3
 ``d2t`` cross-vocab.
 
@@ -54,10 +68,11 @@ nothing tunes at startup.
 
 from __future__ import annotations
 
+import functools
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel.ops.sampling import sonic
+from tokenspeed_kernel.ops.sampling import sonic, vocab_topk_merge_supports
 from tokenspeed_kernel.ops.sampling.sonic import (
     MAX_K,
     MAX_OFFSET,
@@ -70,9 +85,11 @@ from tokenspeed_kernel.ops.sampling.sonic import (
 from tokenspeed_kernel.platform import pdl_enabled
 from typing_extensions import override
 
+from tokenspeed.runtime.layers.sampled_vocab_shard import gather_topk_pairs
 from tokenspeed.runtime.sampling.backends.base import (
     SamplingBackend,
     SamplingBackendConfig,
+    SpeculativeSamplingPools,
 )
 from tokenspeed.runtime.sampling.registry import register_backend
 from tokenspeed.runtime.sampling.sampling_params import _SAMPLING_EPS, SamplingParams
@@ -82,8 +99,9 @@ from tokenspeed.runtime.utils.nvtx import nvtx_range
 if TYPE_CHECKING:
 
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
+    from tokenspeed.runtime.layers.sampled_vocab_shard import SampledVocabShard
     from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
-    from tokenspeed.runtime.sampling.tree_verify import TreeVerifyBatch
+    from tokenspeed.runtime.sampling.tree_verify import DraftTreeQ, TreeVerifyBatch
 
 
 # Logits sonic ranks: bf16, or fp32 (soft-capped heads) sampled exactly at the candidates bf16 keys pick.
@@ -153,14 +171,19 @@ class SonicSamplingBackend(SamplingBackend):
     pick the top-128 candidates, whose fp32 values are re-read and given fp32
     temperature, top_p, min_p and penalties (logit bias stays bf16), and
     greedy is the first exact fp32 maximum. Under TP, decode counts for
-    penalties accumulate in-kernel from each rank's own draw, before the
-    rank-0 broadcast that decides the emitted token.
+    penalties accumulate in-kernel from each rank's own draw. Sharded draws
+    are the emitted tokens (every rank draws the same, no broadcast); draws
+    from gathered whole rows (output logprobs, cumulative probabilities, NaN
+    detection) are followed by the rank-0 broadcast that decides the emitted
+    token.
 
     Requires bf16 or fp32 logits and ``vocab_size >= 512`` (its top-k
     reduction's minimum)."""
 
     _HAS_POOL_STATE = True
     _SUPPORTS_DP_VERIFY = False
+    # Forced lengths over sonic's verify; see ``_synthetic_outputs``.
+    _SUPPORTS_SYNTHETIC_ACCEPTANCE = True
 
     # Prompt token counts the runtime never fills: every slot reads zeros.
     constant_slot_state = ("state.context_counts", "_exact_state.context_counts")
@@ -220,6 +243,16 @@ class SonicSamplingBackend(SamplingBackend):
                 self.accept_buf = torch.empty((self.max_bs,), dtype=torch.int32)
                 self.values = torch.empty((rows, MAX_K), dtype=torch.float32)
                 self.indices = torch.empty((rows, MAX_K), dtype=torch.int32)
+                # Synthetic acceptance's target token per request.
+                self.synthetic_tokens = torch.empty((self.max_bs,), dtype=torch.int32)
+
+            # Vocabulary-sharded rows: this rank's candidates and every rank's.
+            self._shard_ranks = self._vocab_shard_ranks(config)
+            if self._shard_ranks is not None:
+                self._shard_pairs = torch.empty((rows, 2 * MAX_K), dtype=torch.float32)
+                self._shard_landing = torch.empty(
+                    (self._shard_ranks * rows, 2 * MAX_K), dtype=torch.float32
+                )
 
             # fp32 temperature, top-p, min-p and penalties, read with fp32 logits so none rounds to bf16.
             self.exact_scalars = (
@@ -246,8 +279,134 @@ class SonicSamplingBackend(SamplingBackend):
             self._warmup(torch.bfloat16)
 
     # ------------------------------------------------------------------ #
+    # Vocabulary-sharded rows
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _vocab_shard_ranks(config: SamplingBackendConfig) -> int | None:
+        """Ranks a vocabulary-parallel head shards the sampled rows over, or None to read whole rows.
+
+        Output logprobs, cumulative probabilities and NaN detection read whole rows.
+        """
+        tp_size = 1 if config.tp_group is None else len(config.tp_group)
+        if (
+            tp_size <= 1
+            or config.enable_output_logprobs
+            or config.enable_output_cumulative_probs
+            or config.enable_nan_detection
+        ):
+            return None
+        return tp_size
+
+    @override
+    def vocab_shard_top_k(self) -> int | None:
+        return None if self._shard_ranks is None else MAX_K
+
+    @override
+    def supports_vocab_shard(
+        self, dtype: torch.dtype, columns: int, tp_size: int
+    ) -> bool:
+        # sonic's reduction tiles at least 512 columns.
+        return (
+            self._shard_ranks == tp_size
+            and dtype in _LOGITS_DTYPES
+            and columns >= 512
+            # The draw merges a power-of-two count of ranks' candidates.
+            and tp_size & (tp_size - 1) == 0
+            and columns * tp_size == self.vocab_size
+            and vocab_topk_merge_supports(tp_size, MAX_K)
+        )
+
+    @override
+    def speculative_sampling_pools(self) -> SpeculativeSamplingPools:
+        """The slot state's own rows, which the drafter samples its proposals with.
+
+        The fp32 rows hold each request's temperature and top-p, and the slot
+        state its top-k (1 for greedy requests) and Philox seed, all written
+        on admission and part of the slot image.
+        """
+        return SpeculativeSamplingPools(
+            temperature=self._exact_state.temperature,
+            top_k=self.state.top_k,
+            top_p=self._exact_state.top_p,
+            seed=self.state.seeds,
+        )
+
+    def _vocab_shard(self, shard: SampledVocabShard, rows: int) -> sonic.VocabShard:
+        """The launch's view of ``shard``: its slice of the vocabulary and the gather of every rank's candidates."""
+        landing = self._shard_landing[: shard.tp_size * rows]
+        return sonic.VocabShard(
+            vocab_start=shard.vocab_start,
+            logit_scale=shard.logit_scale,
+            softcap=shard.softcap,
+            gather=functools.partial(
+                gather_topk_pairs,
+                landing=landing,
+                tp_size=shard.tp_size,
+                tp_group=shard.tp_group,
+            ),
+            pairs=self._shard_pairs,
+        )
+
+    @override
+    def warmup_vocab_shard_sampling(
+        self,
+        shard: SampledVocabShard,
+        candidates: torch.Tensor,
+        *,
+        draft_q: DraftTreeQ | None,
+        with_vocab_mask: bool,
+    ) -> None:
+        """Launch every batch size once over dummy shard logits, as ``_warmup`` does over whole rows.
+
+        Every rank runs the same launches, so their gathers pair up. Grammar
+        masks change no sonic kernel (they are slot state); sonic reads the
+        dense ``draft_probs``, not the sparse ``draft_q``.
+        """
+        del candidates, draft_q, with_vocab_mask
+        with torch.device(self.device):
+            logits = torch.zeros(
+                (self.max_bs * self.n_max, shard.logits.shape[1]),
+                dtype=shard.logits.dtype,
+            )
+            slot = torch.zeros((self.max_bs,), dtype=torch.int64)
+            shifted = torch.zeros((self.max_bs + 1,), dtype=torch.int64)[1:]
+            offsets = torch.zeros((self.pool_rows,), dtype=torch.int64)
+            cand = torch.zeros((self.max_bs, self.n_max), dtype=torch.int32)
+        for slots in (slot, shifted):
+            for bs in range(1, self.max_bs + 1):
+                self._fused_singular(logits[:bs], slots[:bs], offsets, shard=shard)
+                if self.spec:
+                    for draft_probs in self._warmup_draft_tables():
+                        verified = self._fused_multistep(
+                            logits[: bs * self.n_max],
+                            slots[:bs],
+                            offsets,
+                            cand[:bs],
+                            shard=shard,
+                            draft_probs=draft_probs,
+                        )
+                        if self._synthetic_lengths is not None:
+                            self._synthetic_outputs(
+                                cand[:bs], slots[:bs], offsets, *verified, row_offset=0
+                            )
+        self.reset_capture_state()
+
+    # ------------------------------------------------------------------ #
     # JIT warm-up
     # ------------------------------------------------------------------ #
+    def _warmup_draft_tables(self) -> tuple[torch.Tensor | None, ...]:
+        """The draft-probability tables serving verifies with: none, and a one-slot table under ``enable_speculative_sampling`` (its strides are the runtime's)."""
+
+        if not self.config.enable_speculative_sampling:
+
+            return (None,)
+
+        table = torch.zeros(
+            (1, self.n_max, self.vocab_size), dtype=torch.float32, device=self.device
+        )
+
+        return (None, table)
+
     def _warmup(self, dtype: torch.dtype) -> None:
         """Launch every batch size once on dummy logits gathering slot 0.
 
@@ -279,9 +438,21 @@ class SonicSamplingBackend(SamplingBackend):
 
                 if self.spec:
 
-                    self._fused_multistep(
-                        logits[: bs * self.n_max], slots[:bs], offsets, cand[:bs]
-                    )
+                    for draft_probs in self._warmup_draft_tables():
+
+                        verified = self._fused_multistep(
+                            logits[: bs * self.n_max],
+                            slots[:bs],
+                            offsets,
+                            cand[:bs],
+                            draft_probs=draft_probs,
+                        )
+
+                        if self._synthetic_lengths is not None:
+
+                            self._synthetic_outputs(
+                                cand[:bs], slots[:bs], offsets, *verified, row_offset=0
+                            )
 
         # The warm-up gathered slot 0 with counting on; leave it clean.
         self.reset_capture_state()
@@ -302,7 +473,8 @@ class SonicSamplingBackend(SamplingBackend):
         the GRAMMAR bit comes from ``sp.has_grammar`` (the masks arrive per
         step through ``_scatter_grammar``). ``greedy_draft``: drafts are point
         draws (chain EAGLE, topk=1), so stochastic rows verify under sonic's
-        masked-rejection regime."""
+        masked-rejection regime, unless the drafter samples from and records
+        its q (``enable_speculative_sampling``)."""
 
         temperature, top_k, top_p, min_p = _sanitize(sp)
 
@@ -322,7 +494,7 @@ class SonicSamplingBackend(SamplingBackend):
             top_k=top_k,
             top_p=top_p,
             min_p=min_p,
-            greedy_draft=True,
+            greedy_draft=not self.config.enable_speculative_sampling,
         )
 
         state = self.state
@@ -449,21 +621,30 @@ class SonicSamplingBackend(SamplingBackend):
     # ------------------------------------------------------------------ #
     # Tuned dispatch
     # ------------------------------------------------------------------ #
-    def _check_logits(self, logits: torch.Tensor) -> SlotState:
+    def _check_logits(
+        self, logits: torch.Tensor, shard: SampledVocabShard | None
+    ) -> SlotState:
         """The slot state these logits launch with: fp32 logits read the fp32 scalars."""
 
-        if logits.dtype not in _LOGITS_DTYPES or logits.shape[-1] != self.vocab_size:
+        width = self.vocab_size if shard is None else self.vocab_size // shard.tp_size
+
+        if logits.dtype not in _LOGITS_DTYPES or logits.shape[-1] != width:
 
             raise ValueError(
                 f"SonicSamplingBackend requires bf16 or fp32 logits of width "
-                f"{self.vocab_size}, got {logits.dtype} x {logits.shape[-1]}"
+                f"{width}, got {logits.dtype} x {logits.shape[-1]}"
             )
 
         if logits.dtype == torch.bfloat16:
 
             return self.state
 
-        if not self._fp32_warm and not torch.cuda.is_current_stream_capturing():
+        # Sharded launches warm in ``warmup_vocab_shard_sampling``; whole rows warm on first use.
+        if (
+            shard is None
+            and not self._fp32_warm
+            and not torch.cuda.is_current_stream_capturing()
+        ):
 
             self._fp32_warm = True
             self._warmup(torch.float32)
@@ -479,12 +660,16 @@ class SonicSamplingBackend(SamplingBackend):
         slot_mapping: torch.Tensor,
         offsets: torch.Tensor,
         config: SonicConfig | None = None,
+        shard: SampledVocabShard | None = None,
     ) -> torch.Tensor:
-        """One draw per row into ``out_tok``, counted for penalties; returns the ``[bs, 1]`` tokens."""
+        """One draw per row into ``out_tok``, counted for penalties; returns the ``[bs, 1]`` tokens.
 
-        state = self._check_logits(logits)
+        With ``shard``, ``logits`` are this rank's raw head logits of its shard.
+        """
 
-        bs = logits.shape[0]
+        state = self._check_logits(logits, shard)
+
+        bs, width = logits.shape
 
         return sonic.sample(
             logits,
@@ -493,8 +678,9 @@ class SonicSamplingBackend(SamplingBackend):
             offsets,
             self.out_tok[:bs],
             self.scratchpad[:bs],
-            config or pick(self.vocab_size, bs),
+            config or pick(width, bs),
             enable_pdl=pdl_enabled(),
+            shard=None if shard is None else self._vocab_shard(shard, bs),
         )
 
     def _sample_rows(
@@ -505,7 +691,8 @@ class SonicSamplingBackend(SamplingBackend):
         """One fused single-step draw per row: the body shared by ``sample()``
         and the ``N == 1`` (non-speculative decode) case of ``verify()``."""
 
-        logits = logits_output.next_token_logits
+        shard = logits_output.vocab_shard
+        logits = logits_output.next_token_logits if shard is None else shard.logits
 
         bs = logits.shape[0]
 
@@ -518,11 +705,15 @@ class SonicSamplingBackend(SamplingBackend):
             self._scatter_grammar(sampling_info.vocab_mask, slot_mapping, bs, 1)
 
         sampled = self._fused_singular(
-            logits, slot_mapping, self._prepare_sampling_offsets(sampling_info)
+            logits,
+            slot_mapping,
+            self._prepare_sampling_offsets(sampling_info),
+            shard=shard,
         ).view(-1)
 
-        # TP-rank sync (rank 0 wins): gathered logits are not bit-identical across ranks.
-        self.maybe_broadcast(sampled)
+        # TP-rank sync (rank 0 wins) of draws from gathered rows; sharded draws merge the same gathered candidates on every rank.
+        if shard is None:
+            self.maybe_broadcast(sampled)
 
         self._write_logprob_outputs(logits_output, logits, sampling_info, sampled)
 
@@ -574,6 +765,8 @@ class SonicSamplingBackend(SamplingBackend):
         offsets: torch.Tensor,
         candidates: torch.Tensor,
         config: SonicConfig | None = None,
+        shard: SampledVocabShard | None = None,
+        draft_probs: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """One ``verify`` launch over ``[bs * n, V]`` logits; returns ``(drafted, accepted)``.
 
@@ -583,11 +776,13 @@ class SonicSamplingBackend(SamplingBackend):
         this keeps sonic's in-place semantics with a stable captured pointer
         (the default would clone-allocate). The trailing bonus column is
         output-only: the kernel masks it out of the draft load and
-        short-circuits the residual correction there. No draft probabilities:
-        sonic's masked-rejection regime natively verifies point-draw drafts
-        (accept iff u <= p(draft), residual = p with the drafted token zeroed)."""
+        short-circuits the residual correction there. Without ``draft_probs``
+        (point-draw drafts) sonic's masked-rejection regime accepts iff
+        u <= p(draft), residual = p with the drafted token zeroed; with the
+        drafter's recorded ``draft_probs`` it accepts iff u * q(draft) <=
+        p(draft), residual = max(p - q, 0)."""
 
-        state = self._check_logits(logits)
+        state = self._check_logits(logits, shard)
 
         bs, n = candidates.shape
         gamma = n - 1
@@ -607,11 +802,56 @@ class SonicSamplingBackend(SamplingBackend):
             self.scratchpad[: bs * n],
             self.values[: bs * n],
             self.indices[: bs * n],
-            config or pick(self.vocab_size, bs * n),
+            config or pick(logits.shape[1], bs * n),
             enable_pdl=pdl_enabled(),
+            shard=None if shard is None else self._vocab_shard(shard, bs * n),
+            draft_probs=draft_probs,
+            reject_threshold=self.config.spec_reject_draft_prob_threshold,
         )
 
         return drafted, accepted
+
+    def _synthetic_outputs(
+        self,
+        candidates: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        offsets: torch.Tensor,
+        drafted: torch.Tensor,
+        accepted: torch.Tensor,
+        *,
+        row_offset: int,
+    ) -> None:
+        """Replace a verify's outcome with the synthetic acceptance lengths.
+
+        Each request keeps its first ``L - 1`` drafts and then the target's
+        token at position ``L - 1`` (``sonic.synthetic_targets``, drawn from
+        the candidates the verify just left), as the greedy and flashinfer
+        backends override theirs. The decode counts that penalties read keep
+        the verify's own tokens: synthetic output is for benchmarking only.
+
+        Args:
+            candidates: ``[bs, n]`` the verified window (last token, drafts).
+            slot_mapping: ``[bs]`` slot of each request.
+            offsets: The verify's per-slot Philox offsets.
+            drafted: ``[bs, n]`` the verify's output tokens; rewritten.
+            accepted: ``[bs, 1]`` the verify's accepted drafts; rewritten.
+            row_offset: The requests' first row in the step's full batch.
+        """
+        bs, n = candidates.shape
+        lengths = self.synthetic_lengths(candidates, row_offset)
+        tokens = sonic.synthetic_targets(
+            self.values[: bs * n],
+            self.indices[: bs * n],
+            self.state,
+            slot_mapping,
+            offsets,
+            lengths,
+            self.synthetic_tokens[:bs],
+            enable_pdl=pdl_enabled(),
+        )
+        drafted[:, : n - 1].copy_(candidates[:, 1:])
+        drafted.scatter_(1, (lengths - 1).long()[:, None], tokens[:, None])
+        accepted.copy_((lengths - 1)[:, None])
 
     @override
     @nvtx_range("sampling:verify", color="yellow")
@@ -656,7 +896,9 @@ class SonicSamplingBackend(SamplingBackend):
                 f"verify candidates width {n} != configured n_max {self.n_max}"
             )
 
-        logits = logits_output.next_token_logits  # flat [bs * n, V]
+        # Flat [bs * n, V], or this rank's [bs * n, V_s] shard.
+        shard = logits_output.vocab_shard
+        logits = logits_output.next_token_logits if shard is None else shard.logits
 
         slot_mapping = sampling_info.req_pool_indices[:bs]
 
@@ -665,18 +907,34 @@ class SonicSamplingBackend(SamplingBackend):
 
             self._scatter_grammar(sampling_info.vocab_mask, slot_mapping, bs, n)
 
+        offsets = self._prepare_sampling_offsets(sampling_info)
         predict, accepted = self._fused_multistep(
             logits,
             slot_mapping,
-            self._prepare_sampling_offsets(sampling_info),
+            offsets,
             candidates,
+            shard=shard,
+            draft_probs=sampling_info.draft_probs,
         )
+
+        # Benchmark acceptance replaces the outcome after the verify ran for its cost.
+        if self._synthetic_lengths is not None:
+
+            self._synthetic_outputs(
+                candidates,
+                slot_mapping,
+                offsets,
+                predict,
+                accepted,
+                row_offset=sampling_info.batch_row_offset,
+            )
 
         predict = predict.view(-1)
         accept_lengths = torch.add(accepted.view(-1), 1, out=self.accept_buf[:bs])
 
-        # TP-rank sync — see sample().
-        self.maybe_broadcast(predict, accept_lengths)
+        # TP-rank sync of gathered rows only — see sample().
+        if shard is None:
+            self.maybe_broadcast(predict, accept_lengths)
 
         self._write_logprob_outputs(logits_output, logits, sampling_info, predict)
 

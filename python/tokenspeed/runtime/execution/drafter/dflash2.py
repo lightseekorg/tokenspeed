@@ -144,6 +144,7 @@ class DFlash2(DFlash):
             tp_rank=self.logits_processor.tp_rank,
             tp_size=self.logits_processor.tp_size,
             tp_group=self.logits_processor.tp_group,
+            attn_tp_size=self.logits_processor.attn_tp_size,
             dp_lm_head_tp=self.logits_processor.dp_lm_head_tp,
         )
         self.candidate_logits_processor.final_logit_softcapping = (

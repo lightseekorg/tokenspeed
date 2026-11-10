@@ -330,6 +330,8 @@ class DFlash2DecoderLayer(DFlashDecoderLayer):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
+        # Set before the base constructor, whose resolve_attn() reads it.
+        self._uses_mla = _dflash2_uses_mla(config)
         super().__init__(
             config=config,
             mapping=mapping,
@@ -337,40 +339,10 @@ class DFlash2DecoderLayer(DFlashDecoderLayer):
             quant_config=quant_config,
             prefix=prefix,
         )
-        self.layer_id = int(layer_id)
-        self._uses_mla = _dflash2_uses_mla(config)
         self.comm_manager = None
         # The draft's prepared reduce + norm, bound by the draft model.
         self.fused_reduce_norm: LamportResidualRMSNorm | None = None
         if self._uses_mla:
-            rope_theta, rope_scaling = _dflash2_mla_rope(config)
-            self.self_attn = K3DSparkAttention(
-                config=config,
-                mapping=mapping,
-                hidden_size=int(config.hidden_size),
-                num_heads=int(config.num_attention_heads),
-                qk_nope_head_dim=int(config.qk_nope_head_dim),
-                qk_rope_head_dim=int(config.qk_rope_head_dim),
-                v_head_dim=int(config.v_head_dim),
-                q_lora_rank=int(config.q_lora_rank),
-                kv_lora_rank=int(config.kv_lora_rank),
-                rope_theta=rope_theta,
-                rope_scaling=rope_scaling,
-                # Match training: grow the YaRN cache on demand instead of
-                # materializing K3's one-million-token limit in every layer.
-                max_position_embeddings=min(
-                    int(getattr(config, "max_position_embeddings", 32768)), 32768
-                ),
-                quant_config=quant_config,
-                layer_id=layer_id,
-                prefix=add_prefix("self_attn", prefix),
-                reduce_attn_results=False,
-            )
-            # The draft's window is its compute visibility; storage is the
-            # cache plan's (bound at startup, the target's full-history group).
-            sliding_window = _get_dflash_layer_sliding_window(config, layer_id)
-            for attention in (self.self_attn.attn_mqa, self.self_attn.attn_mha):
-                attention.sliding_window_size = sliding_window
             self.comm_manager = CommManager(
                 mapping=mapping,
                 layer_id=layer_id,
@@ -393,6 +365,40 @@ class DFlash2DecoderLayer(DFlashDecoderLayer):
         self.mlp_conv = DFlashGroupedConv(
             **conv_args, prefix=add_prefix("mlp_conv", prefix)
         )
+
+    def resolve_attn(self, prefix: str) -> nn.Module:
+        if not self._uses_mla:
+            return super().resolve_attn(prefix)
+        config = self.config
+        rope_theta, rope_scaling = _dflash2_mla_rope(config)
+        attention = K3DSparkAttention(
+            config=config,
+            mapping=self.mapping,
+            hidden_size=int(config.hidden_size),
+            num_heads=int(config.num_attention_heads),
+            qk_nope_head_dim=int(config.qk_nope_head_dim),
+            qk_rope_head_dim=int(config.qk_rope_head_dim),
+            v_head_dim=int(config.v_head_dim),
+            q_lora_rank=int(config.q_lora_rank),
+            kv_lora_rank=int(config.kv_lora_rank),
+            rope_theta=rope_theta,
+            rope_scaling=rope_scaling,
+            # Match training: grow the YaRN cache on demand instead of
+            # materializing K3's one-million-token limit in every layer.
+            max_position_embeddings=min(
+                int(getattr(config, "max_position_embeddings", 32768)), 32768
+            ),
+            quant_config=self.quant_config,
+            layer_id=self.layer_id,
+            prefix=prefix,
+            reduce_attn_results=False,
+        )
+        # The draft's window is its compute visibility; storage is the
+        # cache plan's (bound at startup, the target's full-history group).
+        sliding_window = _get_dflash_layer_sliding_window(config, self.layer_id)
+        for paged in (attention.attn_mqa, attention.attn_mha):
+            paged.sliding_window_size = sliding_window
+        return attention
 
     def forward(
         self,

@@ -103,5 +103,31 @@ def test_launches_past_the_int32_row_offsets_are_refused():
         )
 
 
+def test_draft_probs_without_their_sentinel_threshold_are_refused():
+    """Recorded draft probabilities carry the no-proposal sentinel, so verify refuses them without its threshold."""
+    vocab, requests, timesteps = 1024, 2, 3
+    rows = requests * timesteps
+    state = sonic.SlotState.allocate(requests + 1, timesteps, vocab, 0, "meta")
+    logits = torch.empty((rows, vocab), dtype=torch.bfloat16, device="meta")
+    drafted = torch.empty((requests, timesteps), dtype=torch.int32, device="meta")
+    scratchpad = torch.empty((rows, 1), dtype=torch.uint32, device="meta")
+    draft_probs = torch.empty((requests + 1, timesteps, vocab), device="meta")
+    with pytest.raises(ValueError, match="reject_threshold"):
+        sonic.verify(
+            logits,
+            state,
+            None,
+            None,
+            drafted,
+            None,
+            scratchpad,
+            None,
+            None,
+            pick(vocab, rows),
+            False,
+            draft_probs=draft_probs,
+        )
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

@@ -459,13 +459,14 @@ def iris_lamport_residual_rmsnorm_supported(
     Returns:
         Whether this device has the kernel for this group size, width and dtype.
     """
+    # Iris is installed only on ROCm, so check the device before importing it.
+    if dtype != torch.bfloat16 or not _platform.is_cdna4:
+        return False
     from tokenspeed_kernel.ops.communication._iris.residual_rmsnorm import (
         LamportResidualRMSNorm,
     )
 
-    return dtype == torch.bfloat16 and LamportResidualRMSNorm.supported(
-        world_size, hidden_size
-    )
+    return LamportResidualRMSNorm.supported(world_size, hidden_size)
 
 
 def iris_lamport_residual_rmsnorm_heap_bytes(

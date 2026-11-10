@@ -7,8 +7,10 @@ from torch import nn
 from transformers import PretrainedConfig
 
 import tokenspeed.runtime.layers.logits_processor as logits_module
+import tokenspeed.runtime.models.deepseek_nextn as deepseek_nextn_module
 import tokenspeed.runtime.models.qwen3_5_nextn as nextn_module
 from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.factory import _check_shared_head_layout
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.dense.nvfp4 import Nvfp4W4A16LinearMethod
@@ -134,10 +136,18 @@ def test_attention_dp_mtp_shares_target_head_layout(monkeypatch, rank, attn_tp, 
     torch.testing.assert_close(actual, expected)
 
 
+@pytest.mark.parametrize("model_kind", ["qwen35", "deepseek"])
+@pytest.mark.parametrize("attn_tp", [1, 2])
 @pytest.mark.parametrize("rank", range(8))
-def test_attention_dp_mtp_shares_vocab_sharded_head(monkeypatch, rank):
+def test_attention_dp_mtp_shares_vocab_sharded_head(
+    monkeypatch, rank, attn_tp, model_kind
+):
     mapping = Mapping(
-        rank=rank, world_size=8, attn_tp_size=1, attn_dp_size=8, lm_head_tp_size=2
+        rank=rank,
+        world_size=8,
+        attn_tp_size=attn_tp,
+        attn_dp_size=8 // attn_tp,
+        lm_head_tp_size=8,
     )
     config = PretrainedConfig(
         hidden_size=4,
@@ -150,17 +160,29 @@ def test_attention_dp_mtp_shares_vocab_sharded_head(monkeypatch, rank):
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
     target = _HeadOnlyTarget(config, mapping)
-    draft = Qwen3_5ForConditionalGenerationNextN(config, mapping)
+    if model_kind == "qwen35":
+        draft = Qwen3_5ForConditionalGenerationNextN(config, mapping)
+        draft.pre_fc_norm_embedding = nn.Identity()
+        draft.pre_fc_norm_hidden = nn.Identity()
+    else:
+        monkeypatch.setattr(
+            deepseek_nextn_module,
+            "DeepseekModelNextN",
+            lambda config, mapping, quant_config: _EmbeddingOnlyDraft(
+                config, mapping, quant_config, ""
+            ),
+        )
+        draft = deepseek_nextn_module.DeepseekV3ForCausalLMNextN(config, mapping)
     _check_shared_head_layout(target, draft)
     full_weight = torch.arange(128 * 4, dtype=torch.float32).reshape(128, 4) / 100
     width = target.lm_head.weight.shape[0]
     start = mapping.lm_head.tp_rank * width
     with torch.no_grad():
         target.lm_head.weight.copy_(full_weight[start : start + width])
-    draft.set_embed_and_head_module(target.model.embed_tokens.weight, target.lm_head)
-    rows = [1 + r % 3 for r in range(8)]
+    draft.lm_head = target.lm_head
+    rows = [(r // attn_tp) % 3 for r in range(8)]
     hidden = [
-        torch.arange(n * 4, dtype=torch.float32).reshape(n, 4) / 7 + r
+        torch.arange(n * 4, dtype=torch.float32).reshape(n, 4) / 7 + r // attn_tp
         for r, n in enumerate(rows)
     ]
 
@@ -193,18 +215,67 @@ def test_attention_dp_mtp_shares_vocab_sharded_head(monkeypatch, rank):
 
     monkeypatch.setattr(logits_module, "token_all_gather", gather)
     monkeypatch.setattr(logits_module, "all_to_all_transpose", transpose)
-    metadata = LogitsMetadata(
-        forward_mode=ForwardMode.DECODE,
-        query_shard=None,
-        global_num_tokens=rows,
+
+    def reduce_hidden(local, group):
+        assert group == mapping.lm_head.tp_group
+        distinct = torch.cat(hidden[::attn_tp])
+        expected = torch.zeros_like(distinct)
+        if rank % attn_tp == 0:
+            offset = sum(rows[:rank:attn_tp])
+            expected[offset : offset + rows[rank]] = hidden[rank]
+        torch.testing.assert_close(local, expected)
+        return distinct
+
+    def gather_vocab(output, local, group):
+        assert group == mapping.lm_head.tp_group
+        distinct = torch.cat(hidden[::attn_tp])
+        torch.testing.assert_close(
+            local, torch.nn.functional.linear(distinct, draft.lm_head.weight)
+        )
+        output.copy_(
+            torch.cat(
+                [
+                    torch.nn.functional.linear(distinct, shard)
+                    for shard in full_weight.split(width)
+                ],
+                dim=0,
+            )
+        )
+
+    monkeypatch.setattr(logits_module, "all_reduce", reduce_hidden)
+    monkeypatch.setattr(logits_module, "all_gather_single", gather_vocab)
+
+    # Replace only the transformer: its first draft step selects one row per
+    # request from the verification input. The wrapper and logits path are real.
+    def transformer_forward(input_ids, positions, ctx, **kwargs):
+        return hidden[rank], None
+
+    monkeypatch.setattr(draft.model, "forward", transformer_forward)
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=rows[rank],
+        num_extends=0,
+        input_num_tokens=4 * rows[rank],
+        output_layout=None,
+        forward_mode=ForwardMode.DECODE if rows[rank] else ForwardMode.IDLE,
         all_decode_or_idle=True,
+        global_num_tokens=[4 * n for n in rows],
+        global_bs=rows,
+        gather_ids=4 * torch.arange(rows[rank]) + 3,
     )
-    actual = draft.logits_processor._get_logits(
-        hidden[rank], draft.lm_head, metadata, require_full_vocab=False
+    ids = torch.zeros(4 * rows[rank], dtype=torch.int64)
+    result = draft(
+        ctx,
+        ids,
+        torch.arange(ids.numel()),
+        captured_hidden_states=hidden[rank].repeat_interleave(4, dim=0),
     )
     torch.testing.assert_close(
-        actual, torch.nn.functional.linear(hidden[rank], full_weight)
+        result.next_token_logits, torch.nn.functional.linear(hidden[rank], full_weight)
     )
+    assert ctx.collective_global_num_tokens is None
+    assert ctx.collective_num_tokens is None
 
 
 class _DraftModel(nn.Module):
@@ -253,6 +324,7 @@ def test_mtp_shares_complete_quantized_lm_head(monkeypatch, tied):
 
     processor = LogitsProcessor(
         config=SimpleNamespace(model_type="qwen3_5", vocab_size=4),
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
     hidden_states = torch.ones((1, 4), dtype=torch.bfloat16)

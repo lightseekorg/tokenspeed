@@ -749,12 +749,13 @@ class ModelExecutor:
             self._pp_is_last_stage
             and shard_top_k is not None
             and self.model_runner.model.logits_processor.keep_sampled_logits_vocab_sharded(
-                self.model_runner.model.lm_head, shard_top_k
+                self.model_runner.model.lm_head,
+                self.sampling_backend.supports_vocab_shard,
             )
         )
         if self._samples_from_vocab_shard:
             logger.info(
-                f"Sampled rows stay vocab-sharded: the top-k routes select "
+                f"Sampled rows stay vocab-sharded: the sampler selects "
                 f"{shard_top_k} candidates per shard instead of gathering logits"
             )
         self._simulated_accept_length = parse_simulated_accept_length(
