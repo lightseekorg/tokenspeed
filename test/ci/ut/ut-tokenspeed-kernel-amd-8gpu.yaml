@@ -1,12 +1,13 @@
 api_version: ci.tokenspeed.io/v1
-# The gfx950 monokernel tests that need eight GPUs: the TP8 launches of the
-# Muse Spark layer, its stages and its draft, which the one-GPU kernel task
-# (ut-tokenspeed-kernel, amd-mi355-1gpu) skips. The files below also hold
-# one-GPU tests, which run here a second time.
+# The gfx950 monokernel tests on eight GPUs: the directory, so a new
+# multi-rank test runs without being listed. The one-GPU kernel task
+# (ut-tokenspeed-kernel, amd-mi355-1gpu) skips the TP8 launches of the Muse
+# Spark layer, its stages and its draft; the directory's one-GPU tests run
+# here a second time.
 #
-# On one MI355X host these files take about 12 minutes (the layer test about
-# 9 of them). A pull request's changed paths select the files
-# (changed_paths): a change outside the monokernel family runs none of them.
+# A pull request's changed paths select the files (changed_paths): a change
+# naming another op family runs none of them; a change naming no family
+# (core modules, conftest, packaging) runs them all.
 name: ut-tokenspeed-kernel-amd-8gpu
 type: ut
 workflow_stage: unit-test
@@ -29,17 +30,6 @@ ut:
   commands:
     - >-
       python3 -m pytest -v
-      tokenspeed-kernel/test/amd/gfx950/ops/monokernel/test_peer_mailbox_gfx950.py
-      tokenspeed-kernel/test/amd/gfx950/ops/monokernel/test_muse_spark_attn_tail_gfx950.py
-      tokenspeed-kernel/test/amd/gfx950/ops/monokernel/test_muse_spark_pool_gfx950.py
-      tokenspeed-kernel/test/amd/gfx950/ops/monokernel/test_muse_spark_route_gfx950.py
-      tokenspeed-kernel/test/amd/gfx950/ops/monokernel/test_muse_spark_experts_gfx950.py
-      tokenspeed-kernel/test/amd/gfx950/ops/monokernel/test_muse_spark_moe_tail_gfx950.py
-      tokenspeed-kernel/test/amd/gfx950/ops/monokernel/test_muse_spark_layer_gfx950.py
-      tokenspeed-kernel/test/amd/gfx950/ops/monokernel/test_muse_spark_draft_attn_gfx950.py
-      tokenspeed-kernel/test/amd/gfx950/ops/monokernel/test_muse_spark_draft_mlp_gfx950.py
-      tokenspeed-kernel/test/amd/gfx950/ops/monokernel/test_muse_spark_draft_context_gfx950.py
-      tokenspeed-kernel/test/amd/gfx950/ops/monokernel/test_muse_spark_draft_head_gfx950.py
-      tokenspeed-kernel/test/amd/gfx950/ops/monokernel/test_muse_spark_draft_layer_gfx950.py
+      tokenspeed-kernel/test/amd/gfx950/ops/monokernel
 report:
   github_step_summary: true
