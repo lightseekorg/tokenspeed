@@ -45,13 +45,14 @@ class MonokernelState:
     launches pass on. One step is one forward of the model.
 
     Args:
-        device: The device of the launches.
-        scratch_pairs: The int64 mailbox pairs of the scratch buffer, the
-            most that one layer's launch needs.
+        scratch: The int64 mailbox pairs, at least as many as one layer's
+            launch needs, on the device of the launches (a device buffer, or
+            a symmetric heap's).
     """
 
-    def __init__(self, device: torch.device, scratch_pairs: int) -> None:
-        self.scratch = torch.zeros(scratch_pairs, dtype=torch.int64, device=device)
+    def __init__(self, scratch: torch.Tensor) -> None:
+        device = scratch.device
+        self.scratch = scratch
         # The launches' tag and a count of a launch's finished CTAs (0
         # between launches).
         self.step = torch.zeros(2, dtype=torch.int32, device=device)

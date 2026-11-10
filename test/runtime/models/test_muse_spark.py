@@ -413,7 +413,7 @@ class _StepState(MonokernelState):
     store the taps when ``stores_taps``."""
 
     def __init__(self, stores_taps: bool, taps: torch.Tensor | None) -> None:
-        super().__init__(torch.device("cpu"), 0)
+        super().__init__(torch.zeros(0, dtype=torch.int64))
         self.stores_taps = stores_taps
         self.taps = taps
         self.calls: list[str] = []

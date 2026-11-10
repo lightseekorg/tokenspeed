@@ -362,8 +362,9 @@ class DFlash2MonokernelState(MonokernelState):
         context: FusedDecodeLayer,
     ) -> None:
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
-        # The scratch is the Iris heap's (prepare), not a device buffer.
-        super().__init__(device, 0)
+        # prepare allocates the scratch on the Iris heap, which does not exist
+        # yet; until then it is empty.
+        super().__init__(torch.empty(0, dtype=torch.int64, device=device))
         self.layers = model.layers
         self.scratch_pairs = scratch_pairs
         self.context = context

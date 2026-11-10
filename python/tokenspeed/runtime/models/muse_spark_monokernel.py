@@ -398,8 +398,12 @@ class MuseSparkMonokernelState(MonokernelState):
         from tokenspeed_kernel.ops.communication.iris import iris_symmetric_heap
 
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
-        # The scratch is the Iris heap's (below), not a device buffer.
-        super().__init__(device, 0)
+        context, iris_group = iris_symmetric_heap(group, rank, device)
+        # The scratch is on the Iris heap. Nothing clears it: the tags make old
+        # pairs stale. Every layer's plan lays the regions out alike
+        # (layer.layer_plan), so one scratch serves both kinds of layer.
+        scratch_pairs = max(f.scratch_pairs for f in fused.values())
+        super().__init__(context.zeros((scratch_pairs,), dtype=torch.int64))
         self.fused = fused
         self.cpu_group = cpu_group
         # The layers whose entering residual a draft reads.
@@ -413,12 +417,6 @@ class MuseSparkMonokernelState(MonokernelState):
             if ordered and all(t - 1 in fused for t in ordered)
             else {}
         )
-        context, iris_group = iris_symmetric_heap(group, rank, device)
-        # Nothing clears the scratch: the tags make old pairs stale. Every
-        # layer's plan lays the regions out alike (layer.layer_plan), so one
-        # scratch serves both kinds of layer.
-        scratch_pairs = max(f.scratch_pairs for f in fused.values())
-        self.scratch = context.zeros((scratch_pairs,), dtype=torch.int64)
         # Where a launch's poll that gives up writes what it waited for
         # before the trap: a file per rank with a record directory (it
         # outlives the process), else pinned memory.
