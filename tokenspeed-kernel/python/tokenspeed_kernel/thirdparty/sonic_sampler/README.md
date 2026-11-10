@@ -49,6 +49,13 @@ The vendored sources differ from `src/sonic_sampler` at that commit only by:
   `head_logits`, the logits processor's logit scale and softcap, which
   `bitpacked_reduction_kernel` (new trailing `logit_scale` and `softcap`) and
   `exact_candidates` apply to a shard's raw head logits;
+- draft-probability verify under tokenspeed's runtime contract:
+  `ops/verify.py`'s `chain_speculative_verification_kernel` takes a trailing
+  `reject_threshold`. With draft probabilities, a recorded probability above
+  it marks a slot with no proposal yet (fresh admission, PD landing): its
+  draft is rejected and the rejected position is drawn from the target, as
+  the q of that row counts as zero. A draft the target gives no mass is never
+  accepted;
 - the msgspec host layer is not vendored: `base/`, `core/buffer.py`,
   `interface/` (the `fused_singular`/`fused_multistep` wrappers, the tiling
   and warp-config structs, the class-based interfaces), the packaged dispatch
