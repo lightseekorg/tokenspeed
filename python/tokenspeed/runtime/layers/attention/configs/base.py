@@ -277,8 +277,10 @@ class AttnConfig:
             elif softmax.backend_name in ("mla", "gluon") and not softmax.is_dsa:
                 # The leaf refuses a platform without a decode kernel that
                 # returns the LSE (MLABackend.configure_runtime).
-                if self.draft_block_decode:
-                    raise ValueError("MLA DCP decode does not support block drafts")
+                if self.draft_block_decode and not self.draft_block_causal:
+                    raise ValueError(
+                        "MLA DCP decode does not support non-causal block drafts"
+                    )
             elif softmax.is_dsa and softmax.backend_name in (None, "dsa"):
                 device_type = torch.device(self.device).type
                 if device_type not in ("cuda", "npu"):
