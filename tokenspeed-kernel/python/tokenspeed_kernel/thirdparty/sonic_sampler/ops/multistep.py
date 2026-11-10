@@ -35,6 +35,7 @@ from tokenspeed_kernel.thirdparty.sonic_sampler.ops.prologue import (
 )
 from tokenspeed_kernel.thirdparty.sonic_sampler.ops.shard import (
     merged_candidates,
+    merged_candidates_with_drafts,
     merged_first,
 )
 from tokenspeed_kernel.thirdparty.sonic_sampler.ops.singular import greedy_maximum
@@ -146,6 +147,8 @@ def cumulative_unpack_kernel(
     ranks: tl.constexpr = None,  # Ranks -> W.
     stride_mr=None,  # Rank Stride of Gathered Candidate Pairs.
     stride_mb: tl.constexpr = None,  # Batch Stride of Gathered Candidate Pairs.
+    # Draft Probabilities the Pairs Carry as a Third Block (with ``cand_ptr``).
+    m_ptr=None,  # Candidate Draft Probabilities -> [ B • (γ + 1), M ].
 ) -> None:
 
     # Extract the batch id from program id and load the indicator.
@@ -217,7 +220,13 @@ def cumulative_unpack_kernel(
 
         # Load, reduce, and unpack top-k stochastic subset.
 
-        if cand_ptr is not None:
+        if m_ptr is not None:
+
+            values, indices, proposals = merged_candidates_with_drafts(
+                cand_ptr, row_id, ranks, stride_mr, stride_mb, exact, enable_pdl, max_k
+            )
+
+        elif cand_ptr is not None:
 
             values, indices = merged_candidates(
                 cand_ptr, row_id, ranks, stride_mr, stride_mb, exact, enable_pdl, max_k
@@ -320,3 +329,7 @@ def cumulative_unpack_kernel(
 
         tl.store(v_ptr + positions, values)
         tl.store(j_ptr + positions, indices)
+
+        if m_ptr is not None:
+
+            tl.store(m_ptr + positions, proposals)

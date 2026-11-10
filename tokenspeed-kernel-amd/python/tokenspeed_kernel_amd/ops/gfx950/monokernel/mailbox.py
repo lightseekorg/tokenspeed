@@ -794,7 +794,7 @@ class Mailbox:
         thread puts the pair. A consumer polls the flag, then loads the
         words."""
         # Wait for this wave's stores before the CTA publishes the flag.
-        _extern.release_drain()
+        _extern.release_wait_vmem()
         gl.barrier()
         lanes = gl.arange(0, 64 * gl.num_warps(), lane_layout(gl.num_warps()))
         _put(
@@ -832,7 +832,7 @@ class Mailbox:
             "raise_flag_peers needs a peer region declared in Plan.flags",
         )
         # Wait for this wave's peer stores before the CTA publishes the flags.
-        _extern.release_drain()
+        _extern.release_wait_vmem()
         gl.barrier()
         W: gl.constexpr = schedule.world(self.plan)
         lanes = gl.arange(0, 64 * gl.num_warps(), lane_layout(gl.num_warps()))

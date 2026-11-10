@@ -40,6 +40,7 @@ arithmetic, applying activation then weight scales to each unscaled partial.
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel_amd._extern import extern_compile_options, wait_vmem
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.gemm.splitk import check_splitk_counters
 
@@ -561,14 +562,7 @@ def gluon_mm_mxfp8_decode_gfx950(
         # invalidate cost more than the GEMM: ".wt" writes through to memory,
         # every wave waits for its stores to complete (vmcnt), and the barrier
         # orders all waves' stores before the counter bump.
-        gl.inline_asm_elementwise(
-            asm="s_waitcnt vmcnt(0)",
-            constraints="=v,0",
-            args=[offs_cm],
-            dtype=gl.int32,
-            is_pure=False,
-            pack=1,
-        )
+        wait_vmem()
         gl.barrier()
         old = gl.atomic_add(counter_ptr + tile, 1, sem="relaxed", scope="gpu")
         if old != SPLIT_K - 1:
@@ -675,6 +669,7 @@ def _launch(A, B, A_scales, B_scales, C, config, counters):
             value.stride(0) % 16 == 0 and value.data_ptr() % 16 == 0 for value in (A, B)
         ),
         num_warps=warps_m * warps_n,
+        **extern_compile_options(),
     )
     return C
 

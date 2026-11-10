@@ -773,7 +773,13 @@ reads `q` at its top-128 target candidates; `greedy` verifies by exact match,
 the Triton backends by target-sampled exact match; neither reads the dense
 `q`). The drafter switches its draft model's fused TP-sharded argmax off so
 the full-vocab logits reach it, which adds the logits all-gather to every
-draft step under tensor parallelism.
+draft step under tensor parallelism. With `sonic` sampling vocabulary shards
+(the server logs `Sampled rows stay vocab-sharded`) and an MTP or EAGLE3 draft
+head spanning the target vocabulary, the draft steps stay sharded too (`Draft
+steps stay vocab-sharded`): each rank samples its shard of the draft logits,
+the ranks exchange a few values per request instead of the logits, every rank
+draws the same token, and each records `q` over its own vocabulary columns;
+its verify candidates carry that `q` through their gather.
 
 Known limits, kept as in the reference engine for now: a landed PD request's
 first verify always rejects its shipped candidates (sentinel rows) rather than

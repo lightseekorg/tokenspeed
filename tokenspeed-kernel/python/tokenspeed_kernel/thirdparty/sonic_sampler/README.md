@@ -56,6 +56,14 @@ The vendored sources differ from `src/sonic_sampler` at that commit only by:
   draft is rejected and the rejected position is drawn from the target, as
   the q of that row counts as zero. A draft the target gives no mass is never
   accepted;
+- draft probabilities recorded over each rank's vocabulary shard:
+  `shard_candidates_kernel` takes trailing `d_ptr`, `stride_d` and `stride_dg`
+  and writes each candidate's recorded probability as a third block of its
+  pairs; `merged_candidates_with_drafts` (beside `merged_candidates`, both on
+  the new `merged_selection`) merges them, `cumulative_unpack_kernel` writes
+  them for its candidates (new trailing `m_ptr`), and
+  `chain_speculative_verification_kernel` reads them there (new trailing
+  `m_ptr`, in place of `d_ptr`) for the accept test and the residual;
 - the msgspec host layer is not vendored: `base/`, `core/buffer.py`,
   `interface/` (the `fused_singular`/`fused_multistep` wrappers, the tiling
   and warp-config structs, the class-based interfaces), the packaged dispatch

@@ -124,6 +124,7 @@ def load_targets(
 @jit
 def verify_drafted(
     d_ptr,
+    proposals,
     u_ptr,
     h_ptr,
     l_ptr,
@@ -164,7 +165,21 @@ def verify_drafted(
             block_g,
         )
 
-    if d_ptr is not None and (indicator & 0x800) == 0:
+    if proposals is not None:
+
+        if (indicator & 0x800) == 0:
+
+            # The candidates carry the draft probabilities; a draft outside them has no target mass and is rejected below.
+            sources = tl.sum(proposals * matches, axis=1)
+
+            uniform *= sources
+
+            if reject_threshold is not None:
+
+                rejected = (sources > reject_threshold) | (targets <= 0)
+                uniform = tl.where(rejected, float("inf"), uniform)
+
+    elif d_ptr is not None and (indicator & 0x800) == 0:
 
         # Load the drafted token source probabilities.
 
@@ -193,6 +208,7 @@ def verify_drafted(
 @jit
 def rejection_sample(
     d_ptr,
+    proposals,
     e_ptr,
     h_ptr,
     l_ptr,
@@ -243,7 +259,7 @@ def rejection_sample(
 
         residuals = scores
 
-    elif d_ptr is None or (indicator & 0x800) > 0:
+    elif (d_ptr is None and proposals is None) or (indicator & 0x800) > 0:
 
         # Masked rejection sampling under the stochastic-verify-greedy-draft regime.
 
@@ -255,7 +271,13 @@ def rejection_sample(
 
         # Load the draft probabilities for the corresponding position(s).
 
-        marginals = tl.load(d_ptr + (batch_id * stride_d) + shifts)
+        if proposals is not None:
+
+            marginals = tl.gather(proposals, rejected, axis=0).reshape((max_k,))
+
+        else:
+
+            marginals = tl.load(d_ptr + (batch_id * stride_d) + shifts)
 
         if reject_threshold is not None:
 
@@ -322,6 +344,7 @@ def chain_speculative_verification_kernel(
     block_g: tl.constexpr,  # Next Power-of-2 Timesteps (γ + 1) -> T.
     block_z: tl.constexpr,  # Next Power-of-2 Top-K Log-Probabilities Targets -> Z'.
     reject_threshold=None,  # Draft Probabilities above this mark a Slot with no Proposal.
+    m_ptr=None,  # Candidate Draft Probabilities -> [ B • (γ + 1), M ], in place of ``d_ptr``.
 ) -> None:
 
     block_id = tl.program_id(axis=0)
@@ -383,10 +406,21 @@ def chain_speculative_verification_kernel(
             v_ptr, j_ptr, margin, span, cols, steps_mask, max_k
         )
 
+        if m_ptr is not None:
+
+            # Each candidate's draft probability, carried from the rank that holds its column.
+            offsets = ((margin + span) * max_k)[:, None] + cols[None, :]
+            proposals = tl.load(m_ptr + offsets, mask=steps_mask[:, None], other=0)
+
+        else:
+
+            proposals = None
+
         # Verify the drafted tokens against the target probabilities.
 
         accepted, targets, matches = verify_drafted(
             d_ptr,
+            proposals,
             u_ptr,
             h_ptr,
             l_ptr,
@@ -408,6 +442,7 @@ def chain_speculative_verification_kernel(
 
         token, targets, selections = rejection_sample(
             d_ptr,
+            proposals,
             e_ptr,
             h_ptr,
             l_ptr,

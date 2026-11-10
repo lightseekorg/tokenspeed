@@ -32,8 +32,9 @@ if not is_cdna4():
 from tokenspeed_kernel_amd._extern import (  # noqa: E402
     arithmetic_fence,
     extern_compile_options,
-    release_drain,
+    release_wait_vmem,
     sched_group,
+    wait_vmem,
     wave_all_equal,
     wave_ballot_i64,
     wave_mbcnt,
@@ -73,7 +74,7 @@ def _multi_library_probe(a, b, first_lane, all_equal, fenced):
     equal = wave_all_equal(x, gl.load(b + offset))
     gl.store(all_equal + offset, equal)
     gl.store(fenced + offset, arithmetic_fence(x) * 2.0)
-    release_drain()
+    wait_vmem()
 
 
 def test_one_kernel_links_several_libraries():
@@ -98,6 +99,30 @@ def test_one_kernel_links_several_libraries():
     expected = torch.tensor([1, 0, 1, 0], dtype=torch.int32, device="cuda")
     torch.testing.assert_close(all_equal, expected[wave])
     torch.testing.assert_close(fenced, a * 2.0, atol=0, rtol=0)
+
+
+@gluon.jit
+def _publish_probe(data, flag):
+    offset = gl.arange(0, 256, layout=gl.BlockedLayout([1], [64], [4], [0]))
+    gl.store(data + offset, offset)
+    release_wait_vmem()
+    gl.barrier()
+    gl.store(flag + offset, offset * 0 + 1, mask=offset == 0)
+
+
+def test_the_release_wait_keeps_stores_above_it():
+    """The wait before a flag is published orders the data stores before it
+    in the IR too: a release fence comes before the vmcnt wait."""
+    data = torch.empty(256, dtype=torch.int32, device="cuda")
+    flag = torch.zeros(1, dtype=torch.int32, device="cuda")
+    compiled = _publish_probe[(1,)](data, flag, num_warps=4, **extern_compile_options())
+    llir = compiled.asm["llir"]
+    fence = llir.index('fence syncscope("workgroup") release')
+    assert fence < llir.index("@llvm.amdgcn.s.waitcnt(i32 3952)", fence)
+    torch.testing.assert_close(
+        data, torch.arange(256, dtype=torch.int32, device="cuda")
+    )
+    assert int(flag) == 1
 
 
 @gluon.jit
