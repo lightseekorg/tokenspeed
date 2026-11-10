@@ -785,8 +785,8 @@ draft step under tensor parallelism. With `sonic` sampling vocabulary shards
 head spanning the target vocabulary, the draft steps stay sharded too (`Draft
 steps stay vocab-sharded`): each rank samples its shard of the draft logits,
 the ranks exchange a few values per request instead of the logits, every rank
-draws the same token, and each records `q` over its own vocabulary columns,
-which its verify candidates carry through their gather.
+draws the same token, and each records `q` over its own vocabulary columns;
+its verify candidates carry that `q` through their gather.
 
 Known limits, kept as in the reference engine for now: a landed PD request's
 first verify always rejects its shipped candidates (sentinel rows) rather than
