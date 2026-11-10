@@ -479,10 +479,11 @@ def test_the_kernel_boundary_packs_a_layer_for_its_launches(full):
 @pytest.mark.parametrize("full", [False, True])
 def test_one_binary_serves_every_layer_step_and_length(full):
     """What serving changes from launch to launch (the layer index, the step,
-    the lengths and the KV slots) reaches the kernel at runtime: compiling
-    the launches for one GPU's rank finds the first launch's binary. A new
-    row count is a new plan, which the guard must see compile."""
-    rows, length = 8, 3000
+    the lengths, page-table widths and the KV slots) reaches the kernel at
+    runtime: compiling the launches for one GPU's rank finds the first
+    launch's binary. A new row count is a new plan, which the guard must
+    see compile."""
+    rows, length = 8, 900
     end = length + rows - 1
     dev = torch.device("cuda:0")
     sh = _shared(42, length, rows)
@@ -503,9 +504,13 @@ def test_one_binary_serves_every_layer_step_and_length(full):
     scratch = torch.zeros(widest.scratch_pairs, dtype=torch.int64, device=dev)
     peer_bases = torch.zeros(WORLD, dtype=torch.int64, device=dev)
 
-    def compile_launch(index: int, step: int, seq_len: int, rows: int) -> None:
+    def compile_launch(
+        index: int, step: int, seq_len: int, rows: int, width: int
+    ) -> None:
         pos = torch.arange(seq_len - 1, seq_len - 1 + rows)
         slots = sh["table"][pos // 64].long() * 64 + pos % 64
+        table = torch.zeros(1, width, dtype=torch.int32)
+        table[0, : len(sh["table"])] = sh["table"]
         layer.launch_gluon_muse_spark_layer_gfx950(
             weights,
             h=torch.zeros(rows, OWNED, device=dev),
@@ -514,7 +519,7 @@ def test_one_binary_serves_every_layer_step_and_length(full):
             a_out=torch.empty(rows, HIDDEN, dtype=torch.bfloat16, device=dev),
             seq_len=(pos + 1).to(torch.int32).to(dev),
             slot=slots.to(torch.int32).to(dev),
-            page_table=sh["table"].to(dev),
+            page_table=table.to(dev),
             k_cache=k_cache,
             v_cache=v_cache,
             cos_sin=ref.rope_table(end + 1).to(dev),
@@ -536,17 +541,23 @@ def test_one_binary_serves_every_layer_step_and_length(full):
         )
 
     lay = 1 if full else 2
-    compile_launch(lay, 3, length, rows)
+    compile_launch(lay, 3, length, rows, 16)
+    # Widths cross Triton's divisibility-by-16 specialization boundary.
     with assert_no_triton_compile(layer.gluon_muse_spark_layer_gfx950):
-        for step, (index, seq_len) in enumerate(
-            ((lay + 1, length), (lay + 18, length - 1), (lay + 35, length - 70)),
+        for step, (index, seq_len, width) in enumerate(
+            (
+                (lay + 1, length, 16),
+                (lay + 18, length - 1, 17),
+                (lay + 35, length - 70, 31),
+                (lay + 36, length, 48),
+            ),
             start=4,
         ):
-            compile_launch(index, step, seq_len, rows)
+            compile_launch(index, step, seq_len, rows, width)
     # The guard is live: a row count the server did not warm compiles.
     with pytest.raises(AssertionError, match="compiled 1 new"):
         with assert_no_triton_compile(layer.gluon_muse_spark_layer_gfx950):
-            compile_launch(lay, 7, length, rows - 1)
+            compile_launch(lay, 8, length, rows - 1, 16)
 
 
 @pytest.mark.parametrize("rows", [1, 8])

@@ -132,7 +132,7 @@ def test_layer_reports_its_rows_and_the_weight_bytes_it_reads(
         check_parity=False,
     )
     weights = _layer_weights()
-    attn_ops, moe_ops = weights.kernel_args(
+    attn_ops, _, moe_ops = weights.kernel_args(
         h=_meta(rows, 1024, dtype=torch.float32),
         a=_meta(rows, 8192),
         seq_len=_meta(rows, dtype=torch.int32),

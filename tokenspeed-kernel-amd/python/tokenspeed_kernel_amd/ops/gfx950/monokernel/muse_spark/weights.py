@@ -97,16 +97,16 @@ class LayerWeights:
         cos_sin: torch.Tensor,
         h_out: torch.Tensor,
         a_out: torch.Tensor,
-    ) -> tuple[tuple, tuple]:
-        """The launch's ``(attn_ops, moe_ops)`` with this step's operands (see
-        ``gluon_muse_spark_layer_gfx950``)."""
+    ) -> tuple[tuple, int, tuple]:
+        """Return ``(attn_ops, table_stride, moe_ops)`` for this step (see
+        ``gluon_muse_spark_layer_gfx950``). The page-table row stride is a
+        top-level runtime argument, outside the operand tuples."""
         attn_ops = (
             self.qkvg,
             a,
             seq_len,
             slot,
             page_table,
-            page_table.stride(0),
             k_cache,
             v_cache,
             cos_sin,
@@ -140,7 +140,7 @@ class LayerWeights:
             h_out,
             a_out,
         )
-        return attn_ops, moe_ops
+        return attn_ops, page_table.stride(0), moe_ops
 
 
 def _mismatch(name: str, t: torch.Tensor, shape: tuple, dtype: torch.dtype) -> list:

@@ -295,7 +295,7 @@ def _launch_metadata(grid, kernel, args):
     plan = args["PLAN"].plan
     attn_ops, moe_ops = args["attn_ops"], args["moe_ops"]
     # Unpacked as gluon_muse_spark_layer_gfx950 unpacks them.
-    w_qkvg, w_o = attn_ops[0], attn_ops[9]
+    w_qkvg, w_o = attn_ops[0], attn_ops[8]
     router_w, w_pool, w13, w13s = moe_ops[0], moe_ops[2], moe_ops[3], moe_ops[4]
     w2, w2s, w_post = moe_ops[9], moe_ops[10], moe_ops[17]
     qkvg_rows, qkv_rows, all_experts = int(QKVG), int(GATE_ROW), int(EXPERTS)
@@ -317,9 +317,16 @@ def _launch_metadata(grid, kernel, args):
 # multiple of 16) would compile new binaries while serving. The warm word
 # count is the next layer's, a runtime value too. The code range is the
 # compiled binary's own, known only after the compile.
+# The page-table row stride varies with request lengths, so keep it runtime.
 @gluon.jit(
     launch_metadata=_launch_metadata,
-    do_not_specialize=("layer", "warm_quads", "code_offset", "code_quads"),
+    do_not_specialize=(
+        "layer",
+        "table_stride",
+        "warm_quads",
+        "code_offset",
+        "code_quads",
+    ),
 )
 def gluon_muse_spark_layer_gfx950(
     scratch,
@@ -327,6 +334,7 @@ def gluon_muse_spark_layer_gfx950(
     layer,
     bases,
     attn_ops,
+    table_stride,
     moe_ops,
     tap,
     tap_col,
@@ -351,9 +359,12 @@ def gluon_muse_spark_layer_gfx950(
 ):
     """One decode step of one layer on rank ``RANK``.
 
-    ``attn_ops``: (QKVG weight, attention input ``a``, ``seq_len``, KV write
-    slot, page table, K cache, V cache, cos / sin, o_proj weight, residual
+    ``attn_ops`` (tensors only): (QKVG weight, attention input ``a``,
+    ``seq_len``, KV write slot, page table, K cache, V cache, cos / sin,
+    o_proj weight, residual
     slice ``h``, attention gate ``alpha``, ``beta``, pre-FFN gain).
+    ``table_stride``: the page-table row stride, passed separately so changing
+    request lengths cannot specialize the kernel.
     ``moe_ops``: (router columns, router bias, pooler rows, w13, w13 scales,
     their 4 strides, w2, w2 scales, their 4 strides, pre-expert gain,
     post-expert gain, post-expert projection rows, post-FFN gain, FFN gate
@@ -397,7 +408,6 @@ def gluon_muse_spark_layer_gfx950(
         seq_len,
         slot,
         page_table,
-        table_stride,
         k_cache,
         v_cache,
         cos_sin,
@@ -681,6 +691,7 @@ def launch_layer(
     layer,
     bases,
     attn_ops,
+    table_stride,
     moe_ops,
     tap,
     tap_slot,
@@ -749,6 +760,7 @@ def launch_layer(
             layer,
             bases,
             attn_ops,
+            table_stride,
             moe_ops,
             *tap_args,
             *warm_args,
@@ -940,7 +952,7 @@ def launch_gluon_muse_spark_layer_gfx950(
         or not 0 <= tap_slot < tap.shape[1]
     ):
         raise ValueError(f"tap: contiguous BF16 [>={rows}, slots, 8192], a slot in it")
-    attn_ops, moe_ops = weights.kernel_args(
+    attn_ops, table_stride, moe_ops = weights.kernel_args(
         h=h,
         a=a,
         seq_len=seq_len,
@@ -958,6 +970,7 @@ def launch_gluon_muse_spark_layer_gfx950(
         layer,
         peer_bases,
         attn_ops,
+        table_stride,
         moe_ops,
         tap,
         tap_slot,

@@ -254,7 +254,6 @@ def _operands(
         (pos + 1).to(torch.int32).to(dev),
         slots.to(torch.int32).to(dev),
         table.to(dev),
-        width,  # the page table row stride
         w["k_cache"].to(kv_dtype).to(dev),
         w["v_cache"].to(kv_dtype).to(dev),
         ref.rope_table(end + 1).to(dev),
@@ -286,7 +285,7 @@ def _operands(
         h_next,
         a_out,
     )
-    return attn_ops, moe_ops, h_next, a_out
+    return attn_ops, width, moe_ops, h_next, a_out
 
 
 def _median_us(graph, replays: int) -> float:
@@ -359,7 +358,7 @@ def worker(rank: int, port: int, args) -> None:
     bases = torch.empty(TP, dtype=torch.int64, device=dev)
     bases[:gpus] = group.bases.to(dev)
     bases[gpus:] = int(group.bases[rank]) + (ghost.data_ptr() - scratch.data_ptr())
-    attn_ops, moe_ops, h_next, a_out = _operands(
+    attn_ops, table_stride, moe_ops, h_next, a_out = _operands(
         rank,
         args.length,
         args.rows,
@@ -430,6 +429,7 @@ def worker(rank: int, port: int, args) -> None:
             lay,
             bases,
             attn_ops,
+            table_stride,
             moe_ops,
             None,
             None,

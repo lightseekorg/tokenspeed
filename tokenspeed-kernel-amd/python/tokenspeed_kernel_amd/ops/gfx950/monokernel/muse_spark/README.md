@@ -113,7 +113,8 @@ docstring gives its math and task split):
   views of the regular path's tensors.
 - `pack_layer` checks every tensor's shape and dtype and reports all
   mismatches in one error. `LayerWeights.kernel_args()` gives the launch's
-  operand tuples in order.
+  `(attn_ops, table_stride, moe_ops)` in order. The page-table row stride
+  stays outside the operand tuples so request lengths cannot specialize it.
 
 ## Files
 
