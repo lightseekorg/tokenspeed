@@ -81,7 +81,8 @@ def _prep_tape_kernel(descs_ptr, regs_ptr, BLOCK: tl.constexpr):
             v = tl.load(src + r * m + c, mask=mask & (c < m), other=0)
             tl.store(dst + o, tl.where(c < m, v, scalar.to(tl.int32)), mask=mask)
     elif opcode == 4:  # FILLTAIL: dst[n:m] = scalar
-        for base in range(0, m, BLOCK):
+        start = tl.maximum(n, 0) // BLOCK * BLOCK
+        for base in range(start, m, BLOCK):
             o = base + offs
             mask = (o >= n) & (o < m)
             if stride == 0:
