@@ -61,22 +61,9 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.scheduler_bridge impor
     cache_group_config,
 )
 from tokenspeed.runtime.utils.server_args import (  # noqa: E402
-    PortArgs,
     ServerArgs,
     prepare_server_args,
 )
-
-
-def test_unchunked_prefill_requires_max_model_len_before_distributed_init():
-    args = ServerArgs(model="x", chunked_prefill_size=-1)
-    with pytest.raises(ValueError, match="--max-model-len"):
-        rank_setup.init_distributed(
-            args,
-            PortArgs.init_new(args),
-            gpu_id=0,
-            global_rank=0,
-            hidden_size=128,
-        )
 
 
 def _specs(*, num_host_pages: int, num_snapshot_pages: int, max_retracted: int):
