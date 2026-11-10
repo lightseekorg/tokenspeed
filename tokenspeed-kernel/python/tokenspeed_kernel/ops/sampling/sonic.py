@@ -776,6 +776,13 @@ def _synthetic_target_kernel(
     max_k: tl.constexpr,
     enable_pdl: tl.constexpr,
 ):
+    """One program per request: its target token at the forced position ``lengths - 1``.
+
+    A greedy request (indicator bit 0x40) reads the argmax ``verify`` stored at
+    its first row. Any other request takes the Gumbel-max over that position's
+    ``MAX_K`` candidates, keyed by the slot's seed and offset and the position,
+    which is the draw ``verify`` makes past an all-accepted window.
+    """
     request = tl.program_id(axis=0)
     if enable_pdl:
         gdc_wait()
