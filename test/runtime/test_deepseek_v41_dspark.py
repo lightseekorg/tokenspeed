@@ -1624,8 +1624,6 @@ def test_small_or_padded_batches_keep_full_verification(actual, padded):
 
     drafter = object.__new__(DeepseekV41DSpark)
     drafter.spec_num_tokens = 6
-    drafter._verify_step_id = 0
-    drafter._active_verify_timing = None
     drafter.verify_budget_policy = VerifyBudgetPolicy(True, 32, 6, 0.02)
     drafter.draft_model = SimpleNamespace(mapping=_mapping(0, 1, 1))
     ctx = ForwardContext(
@@ -1748,17 +1746,9 @@ def test_budget_allocation_graphs_are_prepared_and_reused(tmp_path, monkeypatch)
     drafter.tp_group = mapping.attn.tp_group
     drafter.verify_feedback = VerifyFeedback(draft_width=5)
     drafter._pending_verify_feedback = []
-    drafter._verify_step_id = 0
-    drafter._verify_timing_epoch = 0
-    drafter._active_verify_timing = None
-    drafter._verify_step_samples = []
-    drafter._aligned_verify_samples = ()
-    drafter._verify_startup_ready = False
-    drafter._verify_collecting = True
     drafter._verify_cache_initialized = True
     drafter._verify_cache = None
     drafter._cached_verify_profiles = ()
-    drafter._verify_collectors = {}
     drafter._verify_calibrations = ()
     drafter._verify_policy_ms = None
     drafter.device = "cuda"
@@ -1847,62 +1837,36 @@ def test_budget_allocation_graphs_are_prepared_and_reused(tmp_path, monkeypatch)
     drafter.finish_round(ctx, graph_bs=4)
     torch.cuda.synchronize()
     drafter._poll_verify_feedback()
-    assert len(drafter._verify_step_samples) == 1
-    sample = drafter._verify_step_samples[0]
-    assert (sample.step, sample.batch_size, sample.query_capacity) == (1, 4, 24)
-    assert (sample.min_context, sample.max_context) == (120, 120)
-    assert sample.elapsed_ms > 0
-    drafter._synchronize_verify_samples(drafter._verify_budget_buffers[4])
-    assert len(drafter._aligned_verify_samples) == 1
-    aligned = drafter._aligned_verify_samples[0]
-    assert (aligned.step, aligned.batch_size, aligned.query_capacity) == (1, 4, 24)
-    assert aligned.elapsed_ms >= sample.elapsed_ms
-    # Padded rounds do not contribute measurements for an exact-BS profile.
+    for _ in range(2):
+        drafter.verify_feedback.prepare(ids, slots, num_extends=0)
+    assert drafter.verify_feedback.scores() == ((1.0,) * 5,) * 4
+    # N-2 feedback bounds include two possible full-width decode advances.
+    assert drafter.verify_feedback.context_bounds() == (120, 132)
+    # Padded rounds do not publish feedback for an exact-BS allocation.
     assert (
         drafter.prepare_decode_graph_token_layout(ctx, actual_bs=4, padded_bs=8) == 48
     )
-    assert drafter._active_verify_timing is None
     drafter.finish_round(ctx, graph_bs=8)
     assert not drafter._pending_verify_feedback
-    # Aligned real-step metadata drives the same collector on every rank.
-    # Synthetic durations test the installation/probing protocol, not speed.
-    from tokenspeed.runtime.execution.drafter.verify_calibration import VerifyStepSample
-
-    drafter._verify_calibrations = ()
-    drafter._verify_startup_ready = False
-    drafter._verify_collecting = True
-    for tier, capacity in enumerate((24, 20, 16, 12, 8, 4)):
-        drafter._aligned_verify_samples = tuple(
-            VerifyStepSample(
-                100 + tier * 10 + index,
-                4,
-                capacity,
-                120,
-                120,
-                1000.0 if index < 2 else float(capacity),
-            )
-            for index in range(10)
-        )
-        drafter._update_verify_calibration()
-        if tier == 0:
-            assert drafter._prepare_calibrated_budget(actual_bs=4, padded_bs=4) == 20
-            assert drafter._verify_collecting
-    assert len(drafter._verify_calibrations) == 1
-    automatic = drafter._verify_calibrations[0]
-    assert automatic.native_step_ms == 24.0
-    assert automatic.sample_count == 8
-    assert automatic.adaptive_step_ms == tuple(
-        (q, float(q)) for q in (4, 8, 12, 16, 20)
+    # Startup-installed costs survive cache reload; no request-side profiling.
+    automatic = VerifyCalibration(
+        4,
+        1,
+        16384,
+        6,
+        24.0,
+        tuple((q, float(q)) for q in (4, 8, 12, 16, 20)),
+        8,
     )
-    assert not drafter._verify_collecting
-    # Rebuilding graphs invalidates already queued timing and score feedback.
+    drafter.install_verify_calibration((automatic,), policy_ms=0.0)
+    drafter._save_verify_calibration()
+    # Rebuilding graphs invalidates already queued score feedback.
     drafter.prepare_decode_graph_token_layout(ctx, actual_bs=4, padded_bs=4)
     drafter.finish_round(ctx, graph_bs=4)
     old_snapshot = drafter.verify_feedback.snapshot()
     drafter.release_round_graphs()
     torch.cuda.synchronize()
     drafter._poll_verify_feedback()
-    assert not drafter._verify_step_samples
     assert drafter.verify_feedback.snapshot() == ()
     drafter.verify_feedback.prepare(ids, slots, num_extends=0)
     drafter.verify_feedback.publish(
@@ -1941,12 +1905,10 @@ def test_budget_allocation_graphs_are_prepared_and_reused(tmp_path, monkeypatch)
     drafter._verify_cache_initialized = False
     drafter._restore_verify_calibration(4)
     assert drafter._verify_calibrations == (automatic,)
-    assert not drafter._verify_collecting
     drafter.on_target_weights_updated()
     assert not drafter._verify_calibrations
     assert not drafter._cached_verify_profiles
     assert drafter._verify_cache is None
-    assert drafter._verify_collecting
 
     if tp > 1:
         torch.distributed.destroy_process_group()

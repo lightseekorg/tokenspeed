@@ -34,7 +34,6 @@ from tokenspeed.runtime.execution.drafter.deepseek_v41_dspark import DeepseekV41
 from tokenspeed.runtime.execution.drafter.verify_budget import VerifyBudgetPolicy
 from tokenspeed.runtime.execution.drafter.verify_calibration import (
     VerifyCalibration,
-    VerifyStepSample,
 )
 from tokenspeed.runtime.execution.drafter.verify_feedback import VerifyFeedback
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -53,17 +52,9 @@ def _make_drafter(mapping):
     drafter.tp_group = mapping.attn.tp_group
     drafter.verify_feedback = VerifyFeedback(draft_width=5)
     drafter._pending_verify_feedback = []
-    drafter._verify_step_id = 0
-    drafter._verify_timing_epoch = 0
-    drafter._active_verify_timing = None
-    drafter._verify_step_samples = []
-    drafter._aligned_verify_samples = ()
-    drafter._verify_startup_ready = False
-    drafter._verify_collecting = True
     drafter._verify_cache_initialized = True
     drafter._verify_cache = None
     drafter._cached_verify_profiles = ()
-    drafter._verify_collectors = {}
     drafter._verify_calibrations = ()
     drafter._verify_policy_ms = None
     drafter.device = "cuda"
@@ -185,7 +176,6 @@ def test_dp_budget_agreement_and_native_fallback():
             drafter.prepare_decode_graph_token_layout(ctx, actual_bs=4, padded_bs=4)
             == 24
         )
-        assert drafter._active_verify_timing is None
     # Exercise each peer with its actual local admission size, including idle.
     for peer_bs in (0, 3):
         ctx.global_bs[-1] = ctx.global_num_decodes[-1] = peer_bs
@@ -196,7 +186,6 @@ def test_dp_budget_agreement_and_native_fallback():
             )
             == 24
         )
-        assert drafter._active_verify_timing is None
     # Equal graph padding and batches below the local threshold stay native.
     for actual_bs, padded_bs in ((3, 4), (2, 2)):
         ctx.global_bs = [actual_bs] * world
@@ -207,7 +196,6 @@ def test_dp_budget_agreement_and_native_fallback():
             )
             == padded_bs * 6
         )
-        assert drafter._active_verify_timing is None
     ctx.global_bs = ctx.global_num_decodes = [4] * world
     assert (
         drafter.prepare_decode_graph_token_layout(ctx, actual_bs=4, padded_bs=4) == 12
@@ -215,35 +203,13 @@ def test_dp_budget_agreement_and_native_fallback():
     # Startup owns profiling: an uncovered serving shape must remain native,
     # without starting online collection or allocating step timing events.
     profiles = drafter._verify_calibrations
-    drafter._verify_startup_ready = True
     drafter._verify_calibrations = ()
     for _ in range(3):
         assert (
             drafter.prepare_decode_graph_token_layout(ctx, actual_bs=4, padded_bs=4)
             == 24
         )
-        assert not drafter._verify_collecting
-        assert drafter._active_verify_timing is None
-    assert not drafter._verify_collectors
     drafter._verify_calibrations = profiles
-    drafter._verify_startup_ready = False
-    # Different local lengths within a region can share a synchronized cost.
-    drafter._verify_step_samples = [
-        VerifyStepSample(20, 4, 12, 120 + rank, 125 + rank, float(rank + 1))
-    ]
-    drafter._synchronize_verify_samples(drafter._verify_budget_buffers[4])
-    assert len(drafter._aligned_verify_samples) == 1
-    sample = drafter._aligned_verify_samples[0]
-    assert (sample.min_context, sample.max_context, sample.elapsed_ms) == (
-        1,
-        16384,
-        float(world),
-    )
-    # A peer in another context region must not contaminate the profile.
-    if rank == world - 1:
-        drafter._verify_step_samples = [VerifyStepSample(20, 4, 12, 20000, 20005, 1.0)]
-    drafter._synchronize_verify_samples(drafter._verify_budget_buffers[4])
-    assert drafter._aligned_verify_samples == ()
     # CED prefill may narrow each rank to a different count, including zero.
     from tokenspeed.runtime.models.deepseek_v41 import _exchange_decoder_counts
 
@@ -272,7 +238,7 @@ def _strict_serving_sync():
 )
 @pytest.mark.parametrize("topology", ["dp", "tp", "mixed"])
 @torch.inference_mode()
-def test_budget_and_calibration_without_forward_thread_sync(topology):
+def test_budget_without_forward_thread_sync(topology):
     world = int(os.environ["WORLD_SIZE"])
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -335,11 +301,4 @@ def test_budget_and_calibration_without_forward_thread_sync(topology):
         rtol=0,
         atol=0,
     )
-    drafter._verify_step_samples = [
-        VerifyStepSample(17, 4, 12, 120, 125, float(rank + 1))
-    ]
-    with _strict_serving_sync():
-        drafter._synchronize_verify_samples(drafter._verify_budget_buffers[4])
-    assert len(drafter._aligned_verify_samples) == 1
-    assert drafter._aligned_verify_samples[0].elapsed_ms == float(world)
     torch.distributed.barrier()

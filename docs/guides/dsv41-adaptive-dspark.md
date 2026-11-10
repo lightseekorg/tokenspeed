@@ -58,3 +58,8 @@ The implementation does not perform active recovery probes or online reward
 calibration. It does not yet passively correct startup curves from serving
 measurements. Keep this limitation separate from confidence-head prediction:
 a cost cache does not establish that predicted acceptance is well calibrated.
+
+Cost profiling runs only at startup. Serving keeps asynchronous confidence
+feedback for budget selection, but does not collect or synchronize per-step
+timing samples. Weight reload invalidates costs and falls back to full
+verification until a new compatible startup profile is available.

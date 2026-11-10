@@ -194,6 +194,9 @@ def profile_dsv41_startup(executor) -> None:
     import numpy as np
 
     from tokenspeed.runtime.execution.drafter.verify_calibration import (
+        STARTUP_CONTEXT_ENDPOINTS,
+        STARTUP_MEASURED_REPLAYS,
+        STARTUP_WARMUP_REPLAYS,
         VerifyCalibration,
     )
     from tokenspeed.runtime.execution.drafter.verify_feedback import VerifyFeedback
@@ -207,8 +210,6 @@ def profile_dsv41_startup(executor) -> None:
     if drafter is None or runner.disable:
         return
     if not drafter._verify_budget_buffers:
-        drafter._verify_startup_ready = True
-        drafter._verify_collecting = False
         return
     arena = runner.token_to_kv_pool.arena
     device = torch.device(runner.device)
@@ -219,12 +220,9 @@ def profile_dsv41_startup(executor) -> None:
     )
     width = drafter.spec_num_tokens
     maximum = int(executor.config.context_len)
-    endpoints = sorted(
-        {min(n, maximum) for n in (8192, 32768, 131072, 524288, maximum)}
-    )
+    endpoints = sorted({min(n, maximum) for n in (*STARTUP_CONTEXT_ENDPOINTS, maximum)})
     ib = runner.input_buffers
     old_feedback = drafter.verify_feedback
-    old_collecting = drafter._verify_collecting
     installed = drafter._verify_calibrations
     old_policy_ms = drafter._verify_policy_ms
     try:
@@ -381,8 +379,8 @@ def profile_dsv41_startup(executor) -> None:
                                 prepare,
                                 device=device,
                                 host_group=group,
-                                warmup=2,
-                                samples=8,
+                                warmup=STARTUP_WARMUP_REPLAYS,
+                                samples=STARTUP_MEASURED_REPLAYS,
                             )
                             flags = executor.nan_guard.flags_cpu
                             torch.cuda.synchronize(device)
@@ -414,7 +412,7 @@ def profile_dsv41_startup(executor) -> None:
                     adaptive_samples={
                         q: values for q, values in measured.items() if q != bs * width
                     },
-                    minimum_samples=8,
+                    minimum_samples=STARTUP_MEASURED_REPLAYS,
                 )
                 installed = (*installed, profile)
                 drafter.install_verify_calibration(installed, policy_ms=0.0)
@@ -431,6 +429,3 @@ def profile_dsv41_startup(executor) -> None:
         drafter.verify_feedback = old_feedback
         drafter._verify_calibrations = installed
         drafter._verify_policy_ms = 0.0 if installed else old_policy_ms
-        drafter._verify_collecting = old_collecting
-    drafter._verify_startup_ready = True
-    drafter._verify_collecting = False
