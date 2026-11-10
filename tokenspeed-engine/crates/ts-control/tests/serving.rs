@@ -1409,6 +1409,7 @@ fn run_rank<F: Frontend>(
         FinishLog {
             enabled: true,
             request_stats: true,
+            ttft_percentage: 0,
         },
         false,
         None,

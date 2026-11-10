@@ -26,6 +26,105 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::request::{FinishReason, RequestState};
 
+/// Local milestones until the first engine output of a sampled PD request.
+#[derive(Debug, Clone)]
+pub(crate) struct TtftTrace {
+    bootstrap: ts_pd::BootstrapInfo,
+    role: crate::output::Role,
+    start: std::time::Instant,
+    received_wall: f64,
+    percentage: u8,
+    pub(crate) prefill_chunks: usize,
+    bootstrap_ms: Option<f64>,
+    pub(crate) scheduled_ms: Option<f64>,
+    pub(crate) prompt_done_ms: Option<f64>,
+    pub(crate) transfer_done_ms: Option<f64>,
+}
+
+impl TtftTrace {
+    pub(crate) fn sample(
+        percentage: u8,
+        role: crate::output::Role,
+        bootstrap: &ts_pd::BootstrapInfo,
+    ) -> Option<Box<Self>> {
+        if percentage == 0
+            || role == crate::output::Role::Plain
+            || crc32fast::hash(bootstrap.room.to_string().as_bytes()) % 1000
+                >= u32::from(percentage) * 10
+        {
+            return None;
+        }
+        Some(Box::new(Self {
+            bootstrap: bootstrap.clone(),
+            role,
+            start: std::time::Instant::now(),
+            received_wall: wall_seconds(),
+            percentage,
+            prefill_chunks: 0,
+            bootstrap_ms: None,
+            scheduled_ms: None,
+            prompt_done_ms: None,
+            transfer_done_ms: None,
+        }))
+    }
+
+    pub(crate) fn ms(&self) -> f64 {
+        self.start.elapsed().as_secs_f64() * 1000.0
+    }
+
+    pub(crate) fn bootstrapped(&mut self, rid: &str) {
+        self.bootstrap_ms = Some(self.ms());
+        if self.role == crate::output::Role::Prefill {
+            tracing::info!(
+                "TTFTBootstrap {}",
+                serde_json::json!({
+                    "schema": "ts-engine-v1", "rid": rid, "role": "prefill", "room": self.bootstrap.room,
+                    "endpoint": format!("{}:{}", self.bootstrap.host, self.bootstrap.port),
+                    "sampling_percentage": self.percentage, "bootstrap_ms": self.bootstrap_ms,
+                    "registered_wall_s": self.received_wall,
+                })
+            );
+        }
+    }
+
+    pub(crate) fn finish(&self, rid: &str, state: &RequestState) {
+        use crate::output::Role;
+
+        let end = self.ms();
+        let delta = |end: Option<f64>, begin: Option<f64>| end.zip(begin).map(|(b, a)| b - a);
+        let phases = match self.role {
+            Role::Prefill => serde_json::json!({
+                "bootstrap": self.bootstrap_ms,
+                "admission": delta(self.scheduled_ms, self.bootstrap_ms),
+                "prefill": delta(self.prompt_done_ms, self.scheduled_ms),
+                "transfer_observe": delta(self.transfer_done_ms, self.prompt_done_ms),
+                "output_pack": delta(Some(end), self.transfer_done_ms),
+            }),
+            Role::Decode => serde_json::json!({
+                "bootstrap": self.bootstrap_ms,
+                "transfer_observe": delta(self.transfer_done_ms, self.bootstrap_ms),
+                "output_after_landing": delta(Some(end), self.transfer_done_ms),
+            }),
+            Role::Plain => return,
+        };
+        let aborted = matches!(state.finished_reason, Some(FinishReason::Abort { .. }));
+        tracing::info!(
+            "TTFTBreakdown {}",
+            serde_json::json!({
+                "schema": "ts-engine-v1", "rid": rid, "room": self.bootstrap.room,
+                "role": if self.role == Role::Prefill { "prefill" } else { "decode" },
+                "endpoint": format!("{}:{}", self.bootstrap.host, self.bootstrap.port),
+                "sampling_percentage": self.percentage, "status": if aborted { "abort" } else { "first_output" },
+                "prompt_tokens": state.prompt_len, "cached_tokens": state.cached_tokens,
+                "engine_elapsed_ms": end, "phases_ms": phases, "prefill_chunks": self.prefill_chunks,
+                "registered_wall_s": self.received_wall,
+                "first_dispatch_ms": self.scheduled_ms,
+                "total_ms": (state.created_time > 0.0).then(|| (wall_seconds() - state.created_time).max(0.0)*1000.0),
+            })
+        );
+    }
+}
+
 /// Wall-clock seconds, the clock the request's `created_time` uses.
 pub fn wall_seconds() -> f64 {
     SystemTime::now()

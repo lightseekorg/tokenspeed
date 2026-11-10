@@ -33,6 +33,7 @@
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
+    ops::Range,
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc, Arc, Condvar, Mutex, MutexGuard, RwLock,
@@ -202,11 +203,39 @@ enum Chunk {
         selection: Arc<Selection>,
         /// The producer step each interval's KV is complete at.
         target_steps: Vec<u64>,
-        is_last: bool,
+        final_window: Option<Range<i64>>,
     },
 }
 
 impl Chunk {
+    /// The final queued token window and its block count across cache groups.
+    fn final_transfer(&self) -> Option<(Range<i64>, usize)> {
+        match self {
+            Self::Full { source, .. } => {
+                let source = source.as_ref()?;
+                let pages = source
+                    .groups
+                    .iter()
+                    .map(|group| group.block_ids.len())
+                    .sum();
+                Some((source.prefix_len..source.prompt_len, pages))
+            }
+            Self::Layerwise {
+                selection,
+                final_window,
+                ..
+            } => {
+                let window = final_window.clone()?;
+                let pages = selection
+                    .groups
+                    .iter()
+                    .map(|group| group.source_block_ids.len())
+                    .sum();
+                Some((window, pages))
+            }
+        }
+    }
+
     fn room(&self) -> u64 {
         match self {
             Chunk::Full { room, .. } | Chunk::Layerwise { room, .. } => *room,
@@ -890,8 +919,8 @@ impl Shared {
                 room,
                 selection,
                 target_steps,
-                is_last,
-            } => self.transfer_layerwise(*room, selection, target_steps, *is_last),
+                final_window,
+            } => self.transfer_layerwise(*room, selection, target_steps, final_window.is_some()),
         }
     }
 
@@ -1195,11 +1224,14 @@ impl Shared {
             let chunk = &queued.chunk;
             let room = chunk.room();
             if !self.state().ended(room) {
+                tracing::debug!(room, "PD transfer worker received chunk");
                 if let Err(reason) = self.transfer(chunk) {
                     if !self.state().ended(room) {
                         tracing::error!(room, reason, "CachePD transfer failed");
                         self.abort_room(room, &format!("CachePD transfer failed: {reason}"));
                     }
+                } else {
+                    tracing::debug!(room, "PD transfer worker finished chunk");
                 }
             }
         }
@@ -1369,8 +1401,8 @@ impl PrefillOutbox {
             begin
         };
         let targets = interval_targets(begin, step_count, layerwise.interval.max(1) as u64);
-        for (rid, room, is_last, selection) in chunks {
-            self.send_layerwise(&rid, room, Arc::new(selection), targets.clone(), is_last);
+        for chunk in chunks {
+            self.send_layerwise(chunk, targets.clone());
         }
         Ok(())
     }
@@ -1395,10 +1427,23 @@ impl PrefillOutbox {
                         .prefill_metadata
                         .insert(room, (bootstrap_token, spec_candidate_ids));
                     self.shared.metadata_ready.notify_all();
+                    drop(state);
+                    tracing::debug!(
+                        rid,
+                        room,
+                        "bootstrap metadata ready for final layerwise chunk"
+                    );
                 }
                 return;
             }
         }
+        tracing::debug!(
+            rid,
+            room,
+            prefix_tokens = source.as_ref().map(|m| m.prefix_len),
+            prompt_tokens = source.as_ref().map(|m| m.prompt_len),
+            "submitting full KV transfer"
+        );
         self.enqueue(
             rid,
             Chunk::Full {
@@ -1412,28 +1457,27 @@ impl PrefillOutbox {
 
     /// Layerwise streaming: queue one armed chunk of `room`'s request; its
     /// intervals are complete at `target_steps`.
-    fn send_layerwise(
-        &self,
-        rid: &str,
-        room: u64,
-        selection: Arc<Selection>,
-        target_steps: Vec<u64>,
-        is_last: bool,
-    ) {
+    fn send_layerwise(&self, chunk: LayerwiseChunk, target_steps: Vec<u64>) {
         {
             let mut state = self.shared.state();
-            if state.ended(room) {
+            if state.ended(chunk.room) {
                 return;
             }
-            state.layerwise_rooms.insert(room);
+            state.layerwise_rooms.insert(chunk.room);
         }
+        tracing::debug!(
+            rid = chunk.rid,
+            room = chunk.room,
+            final_chunk = chunk.final_window.is_some(),
+            "submitting layerwise KV chunk"
+        );
         self.enqueue(
-            rid,
+            &chunk.rid,
             Chunk::Layerwise {
-                room,
-                selection,
+                room: chunk.room,
+                selection: Arc::new(chunk.selection),
                 target_steps,
-                is_last,
+                final_window: chunk.final_window,
             },
         );
     }
@@ -1467,9 +1511,20 @@ impl PrefillOutbox {
             };
             ((ports % self.queues.len() as u64) as usize, queued)
         };
+        let final_transfer = queued.chunk.final_transfer();
         if self.queues[shard].send(queued).is_err() {
             self.shared
                 .abort_room(room, "the PD transfer workers stopped");
+        } else if let Some((window, pages)) = final_transfer {
+            tracing::info!(
+                rid,
+                bootstrap_room = room,
+                rank = self.shared.status_rank,
+                start_idx = window.start,
+                end_idx = window.end,
+                pages,
+                "event=ts_prefill_kv_transfer_queued"
+            );
         }
     }
 
@@ -1486,6 +1541,14 @@ impl PrefillOutbox {
     }
 }
 
+#[derive(Debug)]
+struct LayerwiseChunk {
+    rid: String,
+    room: u64,
+    selection: Selection,
+    final_window: Option<Range<i64>>,
+}
+
 /// One forward's layerwise chunks: for each extend row whose request has a
 /// destination, the blocks its chunk makes ready and whether it ends the
 /// prompt. A room's first chunk also carries the blocks this rank found in
@@ -1496,7 +1559,7 @@ fn layerwise_chunks(
     state: &State,
     layout: &Contract,
     forward: &BatchRows,
-) -> Result<Vec<(String, u64, bool, Selection)>, String> {
+) -> Result<Vec<LayerwiseChunk>, String> {
     let mut chunks = Vec::new();
     for index in 0..forward.num_extends {
         let rid = &forward.request_ids[index];
@@ -1546,7 +1609,13 @@ fn layerwise_chunks(
         {
             continue;
         }
-        chunks.push((rid.clone(), room, is_last, selection));
+        let final_window = is_last.then_some(selection_start.max(window.prefix_len)..chunk_end);
+        chunks.push(LayerwiseChunk {
+            rid: rid.clone(),
+            room,
+            selection,
+            final_window,
+        });
     }
     Ok(chunks)
 }
@@ -2138,12 +2207,12 @@ mod tests {
         let chunks = layerwise_chunks(&state, &layout, &chunk_forward(&rows, &tables)).unwrap();
         let armed: Vec<(&str, u64, bool, Vec<i64>)> = chunks
             .iter()
-            .map(|(rid, room, is_last, selection)| {
+            .map(|chunk| {
                 (
-                    rid.as_str(),
-                    *room,
-                    *is_last,
-                    selection.groups[1].source_block_ids.clone(),
+                    chunk.rid.as_str(),
+                    chunk.room,
+                    chunk.final_window.is_some(),
+                    chunk.selection.groups[1].source_block_ids.clone(),
                 )
             })
             .collect();
@@ -2174,19 +2243,23 @@ mod tests {
         ];
         let history = |state: &State, begin, length| {
             let forward = chunk_forward(&[("request-0", begin, length)], &tables);
-            let (_, _, is_last, selection) = layerwise_chunks(state, &layout, &forward)
+            let chunk = layerwise_chunks(state, &layout, &forward)
                 .unwrap()
                 .pop()
                 .unwrap();
-            let group = selection.groups[0].clone();
-            (is_last, group.source_block_ids, group.destination_positions)
+            let group = chunk.selection.groups[0].clone();
+            (
+                chunk.final_window,
+                group.source_block_ids,
+                group.destination_positions,
+            )
         };
         // The first chunk, [4, 7), also sends the history blocks of [2, 4)
         // Decode lacks.
-        assert_eq!(history(&state, 4, 3), (false, vec![2, 3], vec![0, 1]));
+        assert_eq!(history(&state, 4, 3), (None, vec![2, 3], vec![0, 1]));
         state.layerwise_rooms.insert(9);
         // The last starts at its own boundary.
-        assert_eq!(history(&state, 7, 2), (true, vec![4, 5], vec![2, 3]));
+        assert_eq!(history(&state, 7, 2), (Some(7..9), vec![4, 5], vec![2, 3]));
     }
 
     #[test]

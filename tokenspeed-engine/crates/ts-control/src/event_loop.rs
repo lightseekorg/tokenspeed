@@ -2360,6 +2360,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             tracing::debug!(?event, "transfer event");
             match event {
                 PdEvent::Bootstrapped(rid) => {
+                    self.outputs.bootstrapped(&rid);
                     events.push(pd_event(ForwardEventKind::PdBootstrapped, &rid, -1));
                 }
                 PdEvent::Succeeded(rid) => {
@@ -2588,6 +2589,12 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                                     admission.state,
                                 ));
                             } else {
+                                if self.owns_frontend() {
+                                    self.outputs.sample_ttft(
+                                        &mut admission.state,
+                                        admission.bootstrap.as_ref(),
+                                    );
+                                }
                                 admissions.push(*admission);
                             }
                         }

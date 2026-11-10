@@ -690,14 +690,15 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     _assert(std::max(admission->device_prefix_tokens, admission->host_prefix_tokens) == hit_tokens,
             "an admission claims exactly the prefix it probed");
     _assert(admission->junction_tokens == junction_tokens, "the junction changed between probe and admission");
-    if (!match.prefix_diagnostic.empty()) {
-        spdlog::info("[PrefixCacheDiagnostic] {}", match.prefix_diagnostic);
-    }
     recordAdmittedPages(plan, *admission);
     // host_prefix_tokens is a boundary: the Host loads the KV that lies beyond
     // the Device's prefix (0 when only checkpoints come from Host), and
     // nothing when the Device won.
     const std::int32_t host_hit_tokens = std::max(admission->host_prefix_tokens - admission->device_prefix_tokens, 0);
+    if (!match.prefix_diagnostic.empty()) {
+        spdlog::info("[PrefixCacheDiagnostic] {} device_hit_tokens={} host_hit_tokens={} host_gain_tokens={}",
+                     match.prefix_diagnostic, hit_tokens - host_hit_tokens, host_hit_tokens, host_gain_tokens);
+    }
     prefix_hit_stats_.prompt_tokens += request->PrefillSize();
     prefix_hit_stats_.device_hit_tokens += hit_tokens - host_hit_tokens;
     prefix_hit_stats_.host_hit_tokens += host_hit_tokens;
@@ -1622,6 +1623,7 @@ bool Scheduler::scheduleRestore(AdmissionFeedback& feedback, PlanBuild& build, R
     _assert(retracted != nullptr && retracted->ImageLanded(),
             "a restore resumes a Retracted request whose image landed");
     if (req_pool_allocator_.AvailableSlots() == 0) {
+        spdlog::debug("[Scheduler] restore blocked: rid={} no free request slot", request->Id());
         return false;
     }
     const auto* resumes_prefilling = std::get_if<fsm::ResumePrefilling>(&retracted->shape);
@@ -1656,6 +1658,8 @@ bool Scheduler::scheduleRestore(AdmissionFeedback& feedback, PlanBuild& build, R
     std::optional<CacheCoordinator::AdmissionResult> result =
         coordinator_.Restore(retracted->image, demands, copy_in_point, retracted->cache_progress.access_epoch);
     if (!result) {
+        spdlog::debug("[Scheduler] restore blocked: rid={} reserve_tokens={} headroom_tokens={}", request->Id(),
+                      reserve.decode_input_tokens, reserve.prompt_headroom_tokens);
         feedback.admission_failed = true;
         return false;
     }
@@ -2073,6 +2077,8 @@ void Scheduler::buildDecodeWorkerPlan(AdmissionFeedback& feedback, PlanBuild& bu
                 break;
             }
             if (feedback.admission_failed) {
+                spdlog::debug("[Scheduler] decode preallocation blocked: rid={} prompt_tokens={}", request->Id(),
+                              request->PrefillSize());
                 feedback.NoteCapacityBlocked(request);
             }
         }
