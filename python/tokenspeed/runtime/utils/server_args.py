@@ -2775,6 +2775,11 @@ class ServerArgs:
                 "prefill engine runs no decodes and a decode engine no local "
                 "prefill rounds"
             )
+        if self.monokernel_stuck_record_dir is not None and not self.decode_monokernel:
+            raise ValueError(
+                "--monokernel-stuck-record-dir needs --decode-monokernel: only "
+                "the monokernel launches write stuck-poll records"
+            )
         if self.device == "npu":
             if not self.disable_prefill_graph:
                 raise ValueError("NPU execution requires --disable-prefill-graph")
@@ -3989,8 +3994,11 @@ class ServerArgs:
                 "layouts its kernels serve). Models: "
                 f"{', '.join(DECODE_MONOKERNEL_ARCHITECTURES)} on gfx950. "
                 "Startup fails when a layer cannot be packed for its "
-                "monokernel, the speculative draft's layers, context write "
-                "and head included. Other steps keep the regular path."
+                "monokernel. The speculative draft of a target in "
+                f"{', '.join(DRAFT_MONOKERNEL_TARGET_ARCHITECTURES)} takes the "
+                "switch too, and startup fails when its layers, context write "
+                "or head cannot be packed; other targets' drafts keep the "
+                "regular path. Other steps keep the regular path."
             ),
         )
         parser.add_argument(

@@ -460,12 +460,15 @@ class DFlash2DraftModel(DFlashDraftModel):
     @property
     def decoder_layer_cls(self) -> type:
         """The layer class: the monokernel class when the draft's config has
-        ``decode_monokernel``, which load_model_config sets under
-        --decode-monokernel for the draft of a target with draft monokernels
-        (Muse Spark). Such a draft packs every piece after loading or startup
-        fails and names why (:func:`enable_draft_monokernels`); other
-        targets' DFlash2 drafts keep the regular class."""
-        if _dflash2_config_value(self.config, "decode_monokernel", False):
+        ``decode_monokernel``, which load_model_config declares on every
+        draft's config: True under --decode-monokernel for the draft of a
+        target with draft monokernels (Muse Spark). Such a draft packs every
+        piece after loading or startup fails and names why
+        (:func:`enable_draft_monokernels`); other drafts keep the regular
+        class."""
+        # No default: load_model_config declares the field on every draft's
+        # config, so a config that lacks it was not built for serving.
+        if self.config.decode_monokernel:
             return DFlash2MonokernelDecoderLayer
         return DFlash2DecoderLayer
 
@@ -491,6 +494,13 @@ class DFlash2DraftModel(DFlashDraftModel):
             _dflash2_config_value(config, "input_embedding_scale", 1.0)
         )
         self.block_size = int(_dflash2_config_value(config, "block_size"))
+        nested = getattr(config, "dflash_config", {}) or {}
+        # The candidate logits' scale and softcap (0: none): the drafter
+        # applies them, and the head monokernel bakes them in.
+        self.output_multiplier = float(nested.get("output_multiplier", 1.0))
+        self.final_logit_softcapping = float(
+            nested.get("final_logit_softcapping") or 0.0
+        )
         # The draft's prepared reduce + norm (prepare_communication_runtime).
         self.fused_reduce_norm: LamportResidualRMSNorm | None = None
         self.candidate_selector = CandidateSelector(
@@ -533,14 +543,26 @@ class DFlash2DraftModel(DFlashDraftModel):
         return self.final_norm(hidden_states, residual)
 
     def configure_target(self, target_model, target_config) -> None:
-        """Install the capture inputs, and the FP8 head copy if quantized.
+        """Install the capture inputs, the packed head monokernel under
+        --decode-monokernel, and the FP8 head copy if quantized.
 
-        Under ``fp8_weight_only`` the draft's candidate GEMM reads an FP8
-        copy of the target's (16-bit) head shard: the head is the largest
-        weight a draft step streams. It is made here, before the KV-cache
-        budget is profiled, so the copy's memory is counted.
+        Both head copies are made here, before the KV-cache budget is
+        profiled, so the copy's memory is counted. Under
+        --decode-monokernel the head monokernel packs a tiled copy of the
+        target's head shard (``DFlash2MonokernelState.pack_head``; the
+        drafter enables its launch when wired). Under ``fp8_weight_only``
+        the draft's candidate GEMM reads an FP8 copy of the target's
+        (16-bit) head shard: the head is the largest weight a draft step
+        streams.
         """
         super().configure_target(target_model, target_config)
+        if self.monokernel_state is not None:
+            self.monokernel_state.pack_head(
+                target_model.lm_head,
+                self.candidate_selector,
+                scale=self.output_multiplier,
+                softcap=self.final_logit_softcapping,
+            )
         if not isinstance(self.quant_config, Fp8WeightOnlyConfig):
             return
         head = target_model.lm_head
@@ -696,7 +718,7 @@ class DFlash2DraftModel(DFlashDraftModel):
         else:
             loaded = super().load_weights(weights)
         # Packs every piece or fails startup naming why, an MLA draft too.
-        if self.decoder_layer_cls is DFlash2MonokernelDecoderLayer:
+        if self.config.decode_monokernel:
             enable_draft_monokernels(self)
         return loaded
 

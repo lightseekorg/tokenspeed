@@ -50,6 +50,13 @@ def test_without_the_switch_the_model_launches(checkpoints) -> None:
     assert not server_args(checkpoints["other"]).decode_monokernel
 
 
+def test_a_stuck_record_dir_without_the_switch_fails(checkpoints, tmp_path) -> None:
+    """Only the monokernel launches write stuck-poll records: the directory
+    without the switch is refused, not silently ignored."""
+    with pytest.raises(ValueError, match="needs --decode-monokernel"):
+        server_args(checkpoints["other"], monokernel_stuck_record_dir=str(tmp_path))
+
+
 @pytest.mark.parametrize("switch", [False, True])
 def test_the_switch_reaches_the_model_config(tmp_path, switch) -> None:
     """A Qwen4-Exp model builds its monokernel layers when its text config

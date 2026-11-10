@@ -1177,9 +1177,11 @@ def test_ordinary_block_models_declare_capture_setup(family):
     draft = model_class.__new__(model_class)
     torch.nn.Module.__init__(draft)
     draft.config = SimpleNamespace(dflash_config={"target_layer_ids": [2, 7]})
-    # An unquantized draft: DFlash2 also makes its FP8 head copy here when
-    # quantized, which needs the target's real LM head.
+    # An unquantized draft without --decode-monokernel: DFlash2 also makes
+    # its FP8 head copy here when quantized, and packs its head monokernel
+    # under the switch, both from the target's real LM head.
     draft.quant_config = None
+    draft.monokernel_state = None
     target = SimpleNamespace(set_dflash_layers_to_capture=mock.Mock())
     assert isinstance(draft, TargetCaptureConfigurator)
     draft.configure_target(target, None)

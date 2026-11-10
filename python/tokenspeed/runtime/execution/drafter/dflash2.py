@@ -42,10 +42,7 @@ from tokenspeed.runtime.execution.drafter.dflash import DFlash
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from tokenspeed.runtime.layers.vocab_parallel_topk import VocabParallelTopK
-from tokenspeed.runtime.models.muse_spark_dflash2_monokernel import (
-    takes_head,
-    unserved_draft_error,
-)
+from tokenspeed.runtime.models.muse_spark_dflash2_monokernel import takes_head
 from tokenspeed.runtime.sampling.backends.base import SpeculativeSamplingPools
 from tokenspeed.runtime.sampling.tree_verify import DraftTreeQ
 from tokenspeed.runtime.utils.nvtx import nvtx_range
@@ -76,10 +73,9 @@ class DFlash2(DFlash):
         nested = getattr(config, "dflash_config", {}) or {}
         self.selector_top_k = int(nested.get("selector_top_k"))
         self.draft_vocab_size = int(config.vocab_size)
-        self.output_multiplier = float(nested.get("output_multiplier", 1.0))
-        self.final_logit_softcapping = float(
-            nested.get("final_logit_softcapping") or 0.0
-        )
+        # The draft model's, which the head monokernel bakes in.
+        self.output_multiplier = self.model.output_multiplier
+        self.final_logit_softcapping = self.model.final_logit_softcapping
         self.candidate_logits_processor: LogitsProcessor | None = None
         self.candidate_topk: VocabParallelTopK | None = None
 
@@ -166,24 +162,12 @@ class DFlash2(DFlash):
             fp8_weight=self.model.fp8_head,
         )
         monokernels = self.model.monokernel_state
-        if monokernels is not None and monokernels.bases is None:
-            raise ValueError(
-                unserved_draft_error(
-                    "DFlash2",
-                    {
-                        "head": [
-                            "the draft's collectives were not prepared before "
-                            "the drafter (prepare_communication_runtime)"
-                        ]
-                    },
-                )
-            )
         if monokernels is not None:
             # --decode-monokernel: the top 16 and the selector of the blocks
-            # of up to MAX_REQUESTS requests as one launch.
+            # of up to MAX_REQUESTS requests as one launch. The draft's
+            # configure_target packed the head before the KV-cache budget was
+            # profiled; this makes it a launch, or fails startup.
             monokernels.enable_head(
-                self.lm_head,
-                self.candidate_selector,
                 top_k_exact=self.candidate_topk.enabled,
                 scale=self.output_multiplier,
                 softcap=self.final_logit_softcapping,
@@ -246,11 +230,9 @@ class DFlash2(DFlash):
         batch_size, num_steps, _ = hidden_states.shape
         top_k = self.selector_top_k
         monokernels = self.model.monokernel_state
-        if (
-            monokernels is not None
-            and monokernels.head is not None
-            and takes_head(batch_size * num_steps)
-        ):
+        # A wired drafter has the head launch whenever the draft has
+        # monokernels (wire_target enables it or fails startup).
+        if monokernels is not None and takes_head(batch_size * num_steps):
             # The launch also clamps each request's anchor token for the walk.
             # One request's first token is contiguous already: no copy.
             candidate_ids, scores, anchor_token_ids = monokernels.run_head(

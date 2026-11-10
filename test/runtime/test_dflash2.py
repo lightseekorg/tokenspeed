@@ -172,6 +172,7 @@ def test_mla_draft_layers_build_windowed_mla_attention() -> None:
         rope_theta=10000.0,
         layer_types=["sliding_attention", "full_attention"],
         sliding_window=1024,
+        decode_monokernel=False,
         dflash_config={
             "attention_mode": "mla",
             "block_size": 16,
@@ -730,7 +731,8 @@ def test_the_drafts_config_switch_picks_the_monokernel_layer_class(
     switch: bool, muse_draft: bool
 ) -> None:
     """With ``decode_monokernel`` on the draft's config (load_model_config
-    sets it for the draft of a Muse Spark target) the draft builds its layers
+    declares it on every draft's, True for the draft of a Muse Spark target
+    under --decode-monokernel) the draft builds its layers
     from the monokernel class whatever its shape: a draft the kernels don't
     serve then fails at packing and names why, never falls back silently."""
     from transformers import PretrainedConfig
@@ -740,9 +742,9 @@ def test_the_drafts_config_switch_picks_the_monokernel_layer_class(
     shape = dict(seam.KERNEL_SHAPE)
     if not muse_draft:
         shape["num_hidden_layers"] = 3
-    config = PretrainedConfig(**shape, dflash_config=dict(seam.KERNEL_DFLASH))
-    if switch:
-        config.decode_monokernel = True
+    config = PretrainedConfig(
+        **shape, dflash_config=dict(seam.KERNEL_DFLASH), decode_monokernel=switch
+    )
     model = DFlash2DraftModel.__new__(DFlash2DraftModel)
     torch.nn.Module.__init__(model)
     model.config = config

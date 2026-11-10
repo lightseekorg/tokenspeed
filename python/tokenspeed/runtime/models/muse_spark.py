@@ -2472,7 +2472,7 @@ class MuseSparkModel(BaseTransformerModel):
         launch_taps = (
             state is not None
             and owned_global_rows is None
-            and state.serves_taps(rows, ctx)
+            and state.claim_taps(rows, ctx)
         )
         for layer_index, layer in enumerate(self.layers):
             if taps_live and not launch_taps and layer_index in self.layers_to_capture:

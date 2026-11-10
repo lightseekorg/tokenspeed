@@ -147,13 +147,15 @@ def load_model_config(
         server_args=server_args,
         is_draft_worker=draft_of is not None,
     )
-    if draft_of is not None and draft_takes_decode_monokernel(
-        bool(server_args.decode_monokernel),
-        list(getattr(draft_of.hf_config, "architectures", None) or []),
-    ):
-        # The draft of a target with draft monokernels takes them, and packs
-        # every piece or startup fails (enable_draft_monokernels).
-        config.hf_text_config.decode_monokernel = True
+    if draft_of is not None:
+        # Declared on every draft's config (a draft has no config class that
+        # declares it). Only the draft of a target with draft monokernels
+        # takes them, and packs every piece or startup fails
+        # (enable_draft_monokernels).
+        config.hf_text_config.decode_monokernel = draft_takes_decode_monokernel(
+            bool(server_args.decode_monokernel),
+            list(getattr(draft_of.hf_config, "architectures", None) or []),
+        )
     return config
 
 

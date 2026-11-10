@@ -426,8 +426,8 @@ class _StepState(MonokernelState):
         self.calls.append("finish")
         return super().finish_step()
 
-    def serves_taps(self, rows, ctx) -> bool:
-        self.calls.append("serves_taps")
+    def claim_taps(self, rows, ctx) -> bool:
+        self.calls.append("claim_taps")
         return self.stores_taps
 
     def tap_rows(self, rows: int) -> torch.Tensor:
@@ -445,7 +445,7 @@ def test_a_monokernel_step_brackets_the_layers_and_keeps_the_regular_capture() -
 
     model.forward(torch.tensor([0, 1]), torch.tensor([0, 1]), ctx, hidden)
 
-    assert state.calls == ["start", "serves_taps", "finish"]
+    assert state.calls == ["start", "claim_taps", "finish"]
     # A sink gets full rows unrounded (it rounds as it copies).
     torch.testing.assert_close(sink.captures[0][1], hidden + 1.0, rtol=0, atol=0)
 

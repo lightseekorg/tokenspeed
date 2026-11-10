@@ -104,8 +104,8 @@ def test_the_blocks_of_up_to_max_requests_take_the_kernels() -> None:
 
 
 def _config(**overrides) -> PretrainedConfig:
-    """Muse Spark Open's DFlash2 draft. ``decode_monokernel=True`` is what
-    ModelConfig sets on it under --decode-monokernel."""
+    """Muse Spark Open's DFlash2 draft. ``decode_monokernel`` is what
+    load_model_config declares on it: True under --decode-monokernel."""
     layers = overrides.pop("num_hidden_layers", 5)
     config = {
         "architectures": ["DFlash2DraftModel"],
@@ -125,6 +125,7 @@ def _config(**overrides) -> PretrainedConfig:
         "rope_theta": 500000,
         "sliding_window": 2048,
         "vocab_size": 1024,
+        "decode_monokernel": False,
         "dflash_config": {
             "attention_mode": "gqa",
             "block_size": 8,
@@ -324,18 +325,40 @@ def _packed_draft() -> DFlash2DraftModel:
 def test_decode_monokernel_refuses_a_head_it_cannot_pack() -> None:
     """A draft head over an LM head that is not an 8-way vocabulary shard
     (here the whole 1024-token head on one rank, and the test config's
-    1024-token selector) fails startup and names the head's reasons."""
+    1024-token selector) fails startup in the draft's configure_target, before
+    the KV-cache budget is profiled, and names the head's reasons."""
     draft = _packed_draft()
     lm_head = ParallelLMHead(1024, 8192, params_dtype=torch.bfloat16).to("cuda")
+
+    class Target(torch.nn.Module):
+        """A target that installs the draft's captures and owns the head."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.lm_head = lm_head
+            self.captured: list[int] = []
+
+        def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
+            self.captured = layer_ids
+
     with pytest.raises(ValueError, match="draft's head have no monokernel") as error:
-        draft.monokernel_state.enable_head(
-            lm_head,
-            draft.candidate_selector,
-            top_k_exact=True,
-            scale=1.0,
-            softcap=20.0,
-        )
+        draft.configure_target(Target(), None)
     assert f"head: {HEAD_NOT_SHARDED}, {HEAD_OTHER_SHAPES}" in str(error.value)
+    assert draft.monokernel_state.packed_head is None
+    assert draft.monokernel_state.head is None
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not current_platform().is_cdna4,
+    reason="the draft monokernels are gfx950 kernels",
+)
+def test_a_drafter_wired_before_the_head_is_packed_fails_as_an_ordering_error() -> None:
+    """The drafter enables the head launch only after configure_target packed
+    it and prepare_communication_runtime allocated its scratch; wired before
+    either, it raises an internal ordering error, not an unserved head."""
+    draft = _packed_draft()
+    with pytest.raises(RuntimeError, match="configure_target packed its head"):
+        draft.monokernel_state.enable_head(top_k_exact=True, scale=1.0, softcap=20.0)
     assert draft.monokernel_state.head is None
 
 

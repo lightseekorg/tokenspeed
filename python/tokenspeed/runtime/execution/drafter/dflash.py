@@ -108,6 +108,12 @@ def _resolve_draft_query_width(verify_width: int, sample_from_anchor: bool) -> i
 
 _UNSET = object()
 
+# A short context projection that warmup_extend also compiles: the column
+# all-gather picks its subgroup layout by the rank-local payload size, so a
+# short chunk (here one 8-row draft block's verify rows) takes another
+# layout than a long extend's.
+_SHORT_CONTEXT_PROJECTION_ROWS = 8
+
 
 class DFlash(BaseDrafter):
     """DFlash block drafter backed by a native TokenSpeed draft model."""
@@ -685,8 +691,8 @@ class DFlash(BaseDrafter):
         )
         with torch.inference_mode():
             model.project_target_hidden(taps)
-            if num_tokens > 8:
-                model.project_target_hidden(taps[:8])
+            if num_tokens > _SHORT_CONTEXT_PROJECTION_ROWS:
+                model.project_target_hidden(taps[:_SHORT_CONTEXT_PROJECTION_ROWS])
 
     def set_cache_pool(self, token_to_kv_pool: CachePool | None) -> None:
         """The stacked KV views and their raw pointers name the old arena."""

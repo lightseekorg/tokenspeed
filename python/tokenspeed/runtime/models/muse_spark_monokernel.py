@@ -33,8 +33,8 @@ layers 1 to 60 as one persistent launch each per TP8 rank, from
   one :class:`MuseSparkMonokernelState` (the mailbox scratch on the Iris
   symmetric heap);
 * the model calls ``start_step()`` before its layers and ``finish_step()``
-  after them, and asks :meth:`MuseSparkMonokernelState.serves_taps` whether
-  the launches store a draft's taps.
+  after them, and calls :meth:`MuseSparkMonokernelState.claim_taps`, which
+  decides whether the launches store a draft's taps.
 
 A step serves one token row, or the rows of a speculative verify (the
 request's draft tokens, one row each; row ``t`` has length ``seq - rows + t +
@@ -384,7 +384,7 @@ class MuseSparkMonokernelState(MonokernelState):
         rank: This process's rank in ``group``.
         taps: The layers whose entering residual a draft reads (the model's
             ``layers_to_capture``). When the layer before each launches, the
-            launches store them (:meth:`serves_taps`).
+            launches store them (:meth:`claim_taps`).
     """
 
     def __init__(
@@ -510,11 +510,12 @@ class MuseSparkMonokernelState(MonokernelState):
         collectives that order the launches' stores."""
         return bool(self.tap_slots) and takes_monokernels(rows, ctx)
 
-    def serves_taps(self, rows: int, ctx: ForwardContext) -> bool:
-        """Whether this step's launches store every tap: the model then skips
-        its captures and hands the draft :meth:`tap_rows`. The model asks
-        before its first layer. A step with a capture sink keeps the regular
-        capture."""
+    def claim_taps(self, rows: int, ctx: ForwardContext) -> bool:
+        """Claim the taps for this step's launches when they can store every
+        tap (sets ``store_taps``), and return whether they do: the model then
+        skips its captures and hands the draft :meth:`tap_rows`. The model
+        calls it once a step, before its first layer. A step with a capture
+        sink keeps the regular capture."""
         self.store_taps = ctx.target_capture_sink is None and self.stores_taps(
             rows, ctx
         )

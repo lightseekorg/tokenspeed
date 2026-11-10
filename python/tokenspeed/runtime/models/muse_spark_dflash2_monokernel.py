@@ -40,13 +40,17 @@ on every rank of the TP8 group (``docs/design/monokernel.md``):
   :meth:`DFlash2MonokernelState.write_context` in place of its context write
   (``fc`` and ``hidden_norm`` of the target's taps, then every layer's K and
   V of the verify rows into the draft cache);
-* once the drafter is wired to the target's LM head,
-  :meth:`DFlash2MonokernelState.enable_head` packs the draft head (the
+* the draft's ``configure_target`` calls
+  :meth:`DFlash2MonokernelState.pack_head`, which packs the draft head (the
   vocabulary-parallel top 16 of each draft step and the candidate selector's
-  scores) as one more launch, :class:`DraftHeadMonokernel`, which the
-  drafter runs in place of its top-k and selector for one request. It keeps
-  a tiled copy of the rank's LM-head shard (414 MB a GPU): the tiles stream
-  faster than the row-major weight the target's verify reads.
+  scores) from the target's LM head. It keeps a tiled copy of the rank's
+  LM-head shard (414 MB a GPU): the tiles stream faster than the row-major
+  weight the target's verify reads. The copy is made before the KV-cache
+  budget is profiled, so the budget counts it;
+* once the drafter is wired to the target,
+  :meth:`DFlash2MonokernelState.enable_head` makes the packed head one more
+  launch, :class:`DraftHeadMonokernel`, which the drafter runs in place of
+  its top-k and selector for one request.
 
 The draft follows the target's rule (``docs/design/monokernel.md``): the
 switch never serves a piece without its kernel. When the layers, the context
@@ -317,21 +321,27 @@ class DFlash2MonokernelState(MonokernelState):
         final_gain: FP32 ``[1024]``: the final norm's gain of the rank's
             owned columns (the last launch runs the final norm).
         bases: The TP8 group's heap bases, from :meth:`prepare` (None
-            before it: the layers keep their regular code).
+            before it; a launch then raises: a startup ordering error).
         cpu_group: The TP8 group's CPU (gloo) process group, from
             :meth:`prepare` (None before it).
-        device_group, rank: The TP8 device group and this process's rank in
-            it, from :meth:`prepare` (None before it).
+        device_group: The TP8 device group, from :meth:`prepare` (None
+            before it).
+        rank: This process's rank in the TP8 group, which every piece is
+            packed for.
         compiled: Which binaries every rank compiled, by ``(last, rows)``:
             the last layer's (True) and the others' (False), at each row
             count.
         block_pending: Whether the layers' launches ran a block whose head
             has not run yet (the head reads their step counter).
+        packed_head: The packed draft head, from :meth:`pack_head` (None
+            before it).
+        head_scale, head_softcap: The logits' multiplier and final softcap
+            that :meth:`pack_head` packed the head with (None before it).
         head: The draft head's launch, from :meth:`enable_head` (None
             before it).
         head_pairs: The mailbox pairs reserved on the Iris heap for the
             head's scratch (0 when no head monokernel serves here);
-            :meth:`enable_head` refuses a head that needs more.
+            :meth:`pack_head` refuses a head that needs more.
         head_scratch: The head's scratch, from :meth:`prepare` (None before
             it, or when no head monokernel serves here).
     """
@@ -357,16 +367,19 @@ class DFlash2MonokernelState(MonokernelState):
         self.bases: torch.Tensor | None = None
         self.device_group: dist.ProcessGroup | None = None
         self.cpu_group: dist.ProcessGroup | None = None
-        self.rank: int | None = None
+        self.rank = rank
         self.compiled: set[tuple[bool, int]] = set()
         self.block_pending = False
         self.context_compiled: set[int] = set()
         # The current block's positions as int32 (start_step resets it).
         self.positions: torch.Tensor | None = None
+        self.packed_head: FusedDecodeLayer | None = None
+        self.head_scale: float | None = None
+        self.head_softcap: float | None = None
         self.head: DraftHeadMonokernel | None = None
         self.head_scratch: torch.Tensor | None = None
-        # What prepare() and enable_head() allocate on the Iris heap, reserved
-        # before the heap exists (enable_head runs after it exists).
+        # What prepare() allocates on the Iris heap (the head's scratch too),
+        # reserved before the heap exists.
         from tokenspeed_kernel.ops.communication.iris import reserve_iris_heap
 
         self.head_pairs = muse_spark_draft_head_scratch_pairs(max_rows=HEAD_ROWS) or 0
@@ -376,7 +389,7 @@ class DFlash2MonokernelState(MonokernelState):
         """The Iris heap bytes the draft's monokernels allocate, at the heap
         allocator's alignment: the int64 mailbox scratch of the layers
         (:meth:`prepare`), the context write (:meth:`prepare`) and the head
-        (:meth:`enable_head`; none when no head monokernel serves here)."""
+        (:meth:`prepare`; none when no head monokernel serves here)."""
         from tokenspeed_kernel.ops.communication.iris import iris_heap_bytes
 
         pairs = (self.scratch_pairs, self.context.scratch_pairs, self.head_pairs)
@@ -388,7 +401,13 @@ class DFlash2MonokernelState(MonokernelState):
         """Allocate the layers', the context write's and the head's scratch on
         the Iris heap of ``group`` (the TP8 device
         process group; ``cpu_group`` its CPU twin, ``rank`` this process's
-        rank in it). Call once, before graph capture."""
+        rank in it, the rank every piece was packed for). Call once, before
+        graph capture."""
+        if rank != self.rank:
+            raise RuntimeError(
+                f"the draft monokernels were packed for TP8 rank {self.rank}, "
+                f"but prepared on rank {rank}"
+            )
         if self.bases is None:
             (self.scratch, self.context_scratch, self.head_scratch), self.bases = (
                 mailbox_scratches(
@@ -399,7 +418,6 @@ class DFlash2MonokernelState(MonokernelState):
             )
             self.device_group = group
             self.cpu_group = cpu_group
-            self.rank = rank
 
     def start_step(self) -> None:
         super().start_step()
@@ -484,25 +502,24 @@ class DFlash2MonokernelState(MonokernelState):
         self.block_pending = False
         return self.head(hidden_states, first_token)
 
-    def enable_head(
+    def pack_head(
         self,
         lm_head: torch.nn.Module,
         selector: torch.nn.Module,
         *,
-        top_k_exact: bool,
         scale: float,
         softcap: float,
     ) -> None:
-        """Pack the draft head once the drafter holds the target's LM head
-        (``lm_head``, vocabulary-parallel) and the draft's candidate
-        ``selector``, after :meth:`prepare`. ``top_k_exact``: whether the
-        shard-local top-k is exact for the head's shard geometry
-        (``VocabParallelTopK.enabled``).
+        """Pack the draft head from the target's LM head (``lm_head``,
+        vocabulary-parallel) and the draft's candidate ``selector``, with the
+        logits' multiplier ``scale`` and final ``softcap``. Called by the
+        draft's ``configure_target``, before the KV-cache budget is profiled,
+        so the budget counts the head's tiled LM-head copy.
 
         Raises:
             ValueError: The head cannot be packed (:func:`unserved_draft_error`).
         """
-        reasons = head_reasons(lm_head, selector, top_k_exact, softcap)
+        reasons = head_reasons(lm_head, selector, softcap)
         if not reasons:
             fused = prepare_muse_spark_draft_head(
                 tensors={
@@ -525,8 +542,47 @@ class DFlash2MonokernelState(MonokernelState):
                 f"the draft head needs {fused.scratch_pairs} mailbox pairs but "
                 f"{self.head_pairs} were reserved on the Iris heap"
             )
+        self.packed_head = fused
+        self.head_scale = scale
+        self.head_softcap = softcap
+
+    def enable_head(self, *, top_k_exact: bool, scale: float, softcap: float) -> None:
+        """Make the packed head (:meth:`pack_head`) a launch once the drafter
+        is wired to the target, after :meth:`prepare`. ``top_k_exact``:
+        whether the shard-local top-k is exact for the head's shard geometry
+        (``VocabParallelTopK.enabled``); ``scale`` and ``softcap``: the
+        drafter's, which must be the ones the head was packed with.
+
+        Raises:
+            RuntimeError: The head was not packed or its scratch not
+                allocated before the drafter was wired, or the drafter's
+                scale or softcap differ from the packed head's (internal
+                ordering or wiring errors).
+            ValueError: The head's top-k is not exact for its shard geometry
+                (:func:`unserved_draft_error`).
+        """
+        if self.packed_head is None or self.bases is None:
+            raise RuntimeError(
+                "the DFlash2 drafter was wired before the draft's "
+                "configure_target packed its head monokernel and "
+                "prepare_communication_runtime allocated its scratch"
+            )
+        if (scale, softcap) != (self.head_scale, self.head_softcap):
+            raise RuntimeError(
+                f"the DFlash2 drafter's logit scale {scale} and softcap {softcap} "
+                f"differ from the head monokernel's ({self.head_scale}, "
+                f"{self.head_softcap})"
+            )
+        if not top_k_exact:
+            raise ValueError(
+                unserved_draft_error("DFlash2", {"head": [HEAD_NOT_SHARDED]})
+            )
         self.head = DraftHeadMonokernel(
-            fused, self.head_scratch, self.bases, self.cpu_group, self.step[:1]
+            self.packed_head,
+            self.head_scratch,
+            self.bases,
+            self.cpu_group,
+            self.step[:1],
         )
         logger.info("Decode monokernel: the DFlash2 draft head (top 16 and selector)")
 
@@ -541,7 +597,9 @@ class DFlash2MonokernelLayer(MonokernelLayer):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         # This layer's packed launch, set after loading by
-        # enable_draft_monokernels. None keeps the regular code.
+        # enable_draft_monokernels. None keeps the regular code (only a draft
+        # built without packing: --decode-monokernel packs every layer or
+        # startup fails).
         self.fused: FusedDecodeLayer | None = None
         # Whether the layer is the draft's last (its launch runs the final
         # norm).
@@ -632,16 +690,15 @@ HEAD_NO_SOFTCAP = "no final logit softcap"
 def head_reasons(
     lm_head: torch.nn.Module,
     selector: torch.nn.Module,
-    top_k_exact: bool,
     softcap: float,
 ) -> list[str]:
     """Why the draft head (``lm_head``, ``selector``) cannot have its
-    monokernel; empty when it can."""
+    monokernel; empty when it can. Whether its shard-local top-k is exact is
+    checked once the drafter is wired (:meth:`DFlash2MonokernelState.enable_head`)."""
     reasons = []
     weight = lm_head.weight
     if (
-        not top_k_exact
-        or should_apply_lm_head_quant_method(lm_head, lm_head.quant_method)
+        should_apply_lm_head_quant_method(lm_head, lm_head.quant_method)
         or weight.dtype != torch.bfloat16
         or weight.shape[0] < SHARD
         or weight.shape[1] != HIDDEN
