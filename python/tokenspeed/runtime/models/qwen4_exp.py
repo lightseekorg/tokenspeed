@@ -68,6 +68,7 @@ from tokenspeed.runtime.models.qwen3_5 import (
     _gdn_in_proj_stacked_mapping,
     build_qwen3_5_mlp,
 )
+from tokenspeed.runtime.models.qwen3_5_moe import Qwen3_5MoeSparseMoeBlock
 from tokenspeed.runtime.models.qwen4_exp_monokernel import (
     DeltaMonokernelLayer,
     QSAMonokernelLayer,
