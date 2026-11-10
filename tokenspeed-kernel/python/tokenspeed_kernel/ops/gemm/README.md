@@ -197,18 +197,6 @@ GEMM consumes these packed scales without per-call copies or packing.
 The quantizer and DeepGEMM follow the global PDL setting and work in CUDA
 Graphs and on auxiliary streams. Default FP32-scale dispatch is unchanged.
 
-### FlashInfer block-FP8 tuning
-
-The canonical K-major CUTLASS path tunes `mma_sm=1/2` through FlashInfer's
-native AutoTuner during startup. One large input also profiles power-of-two
-decode/prefill sizes up to that input, excluding the unsupported M=32.
-Entries use exact tensor shapes, strides,
-dtypes, device capability and the global PDL setting, and participate in the
-existing FlashInfer cache persistence. Untuned shapes use `mma_sm=1`; CUDA
-Graph capture only looks up cached choices, even inside a tuning context.
-The FP8 GEMM API has no PDL argument; activation quantization and the BF16 BA
-branch retain their own PDL settings. BA overlap keeps its event dependencies.
-
 ## Grouped FP8 projection
 
 `grouped_fp8_projection` computes `einsum('tgk,gnk->tgn')` from E4M3
