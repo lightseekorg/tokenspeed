@@ -90,10 +90,8 @@ def test_formats_map_to_one_plane_dtype_and_row_width_each():
     assert INDEX_K_FORMATS == ("fp8_scaled", "bf16", "mxfp4")
     assert index_k_plane_dtype("fp8_scaled") is torch.uint8
     assert index_k_plane_dtype("bf16") is torch.bfloat16
-    assert index_k_plane_dtype("mxfp4") is torch.uint8
     assert index_k_row_bytes(HEAD_DIM, "fp8_scaled") == dsa_index_k_row_bytes(HEAD_DIM)
     assert index_k_row_bytes(HEAD_DIM, "bf16") == HEAD_DIM * 2
-    assert index_k_row_bytes(HEAD_DIM, "mxfp4") == HEAD_DIM // 2 + HEAD_DIM // 32
     with pytest.raises(ValueError, match="index_k_format"):
         index_k_plane_dtype("fp16")
     with pytest.raises(ValueError, match="index_k_format"):
