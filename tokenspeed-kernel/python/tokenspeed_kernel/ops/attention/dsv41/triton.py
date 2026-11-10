@@ -583,7 +583,7 @@ def _compressor_tail_scatter_kernel(
     # track the batch, so it stays a runtime bound.
     CAPACITY,
 ):
-    row = tl.program_id(0)
+    row = tl.program_id(0).to(tl.int64)
     slot = tl.load(Slots + row * LS).to(tl.int64)
     if slot >= 0 and slot < CAPACITY:
         d = tl.arange(0, 512)
@@ -1359,10 +1359,11 @@ def _compressor_pool(
     O1: tl.constexpr,
     PAGES,
 ):
-    row = tl.program_id(0)
+    row = tl.program_id(0).to(tl.int64)
     channels = tl.arange(0, 512)
     live = tl.load(ACTIVE + row * A0)
-    previous = tl.load(PREVIOUS + row * P0)
+    # Both rows index the caller's projections, so they are 64-bit as well.
+    previous = tl.load(PREVIOUS + row * P0).to(tl.int64)
     slot = tl.load(SLOTS + row * S0).to(tl.int64)
     in_current = live & (previous >= 0) & (previous < N)
     # Pool capacity changes when startup replaces the probe arena. Widen
