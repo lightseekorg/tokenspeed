@@ -24,9 +24,16 @@ rounding points) for the monokernel tests, one TP8 rank at a time."""
 from __future__ import annotations
 
 import math
-from types import SimpleNamespace
 
 import torch
+from tokenspeed_kernel.benchmark.muse_spark_monokernel import (
+    raw_experts,
+    rope_rows,
+    rope_table,
+)
+from tokenspeed_kernel.benchmark.muse_spark_monokernel_gluon import (
+    preprocessed_experts,
+)
 from tokenspeed_kernel.numerics.torch.attention.mha import (
     torch_dense_attention,
     torch_merge_attention_states,
@@ -58,18 +65,6 @@ def bf16_gemm(x: torch.Tensor, w: torch.Tensor):
         x.double().abs() @ w.double().abs().T
     )
     return exact, sums + 2**-8 * (exact.abs() + sums)
-
-
-def rope_table(positions: int) -> torch.Tensor:
-    """FP32 ``[positions, 64]``: cos of the 32 pairs, then sin (theta 500000)."""
-    return rope_rows(0, positions)
-
-
-def rope_rows(first: int, count: int) -> torch.Tensor:
-    """Rows ``first .. first + count`` of the RoPE table (:func:`rope_table`)."""
-    inv = 1.0 / 500000.0 ** (torch.arange(0, HEAD, 2, dtype=torch.float32) / HEAD)
-    t = torch.arange(first, first + count, dtype=torch.float32)[:, None] * inv[None, :]
-    return torch.cat([t.cos(), t.sin()], dim=1)
 
 
 def norm_rope(
@@ -159,7 +154,8 @@ def attention_z(qkvg, k_cache, v_cache, table, length, window, cs):
     ``k_cache`` / ``v_cache``: ``[slots, 2, 64]`` before the rows' writes, BF16
     or FP8 e4m3 at unit scale: the rows' K and V round once to that dtype,
     and attention reads them (and the cache) exactly widened. ``cs``: FP32
-    ``[rows, 64]``, the RoPE rows of the rows' positions.
+    ``[rows, 64]``, the RoPE rows of the rows' positions (row ``t``: position
+    ``length - 1 + t``).
 
     Returns ``(z, k, v, slots, z_exact, z_error)``. ``z`` has the regular
     path's BF16 roundings (the attention output and z). ``z_exact`` is z
@@ -237,54 +233,6 @@ def attention_z(qkvg, k_cache, v_cache, table, length, window, cs):
         slots,
         z_exact.reshape(rows, -1),
         z_error.reshape(rows, -1),
-    )
-
-
-def raw_experts(rank: int, experts: int):
-    """Random MXFP4 expert shards of ``rank``: w13 rows interleave gate / up."""
-    g = torch.Generator().manual_seed(500 + rank)
-    w13 = torch.randint(
-        0, 256, (experts, 2 * INTER, POOLED // 2), dtype=torch.uint8, generator=g
-    )
-    s13 = torch.randint(
-        122, 127, (experts, 2 * INTER, POOLED // 32), dtype=torch.uint8, generator=g
-    )
-    w2 = torch.randint(
-        0, 256, (experts, POOLED, INTER // 2), dtype=torch.uint8, generator=g
-    )
-    s2 = torch.randint(
-        118, 123, (experts, POOLED, INTER // 32), dtype=torch.uint8, generator=g
-    )
-    return w13, s13, w2, s2
-
-
-def preprocessed_experts(rank: int, experts: int, device: torch.device):
-    """``raw_experts`` through the regular path's MoE weight preprocessing."""
-    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused._common import (
-        _extract_gluon_raw_s,
-        _extract_gluon_raw_w,
-    )
-    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.weight_preprocess import (
-        preprocess_gluon_mxfp4_gfx950_moe_weights,
-    )
-
-    w13, s13, w2, s2 = raw_experts(rank, experts)
-    module = torch.nn.Module()
-    module.w13_input_layout = "interleaved"
-    module.quant_config = SimpleNamespace(use_dynamic_mxfp4_activations=True)
-    for name, t in (
-        ("w13_weight", w13),
-        ("w13_weight_scale", s13),
-        ("w2_weight", w2),
-        ("w2_weight_scale", s2),
-    ):
-        setattr(module, name, torch.nn.Parameter(t.to(device), requires_grad=False))
-    preprocess_gluon_mxfp4_gfx950_moe_weights({}, module)
-    return (
-        _extract_gluon_raw_w(module.w13_weight_triton_tensor),
-        _extract_gluon_raw_s(module.w13_precision_config.b_mx_scale),
-        _extract_gluon_raw_w(module.w2_weight_triton_tensor),
-        _extract_gluon_raw_s(module.w2_precision_config.b_mx_scale),
     )
 
 

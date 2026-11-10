@@ -36,6 +36,8 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from tokenspeed_kernel.benchmark import muse_spark_monokernel as inputs
+from tokenspeed_kernel.benchmark import muse_spark_monokernel_gluon as gluon_inputs
 from utils import assert_no_triton_compile, is_cdna4
 
 if not is_cdna4():
@@ -65,58 +67,6 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.weights import (  # noqa: E402
 
 WORLD, HIDDEN, POOLED, OWNED, EXPERTS = 8, 8192, 4096, 1024, 16
 QKVG, Q = 2304, 1024
-
-
-def _shared(seed: int, length: int, rows: int):
-    """Inputs every rank shares: ``a_in`` and ``h`` of each row (``[rows,
-    8192]``; row ``t`` at position ``length - 1 + t``), the weights of the
-    norms and the router, and the page table."""
-    g = torch.Generator().manual_seed(seed)
-
-    def gain(n):
-        return (1.0 + 0.1 * torch.randn(n, generator=g)).to(torch.bfloat16).float()
-
-    a_in = torch.randn(rows, HIDDEN, generator=g).to(torch.bfloat16)
-    h = torch.randn(rows, HIDDEN, generator=g) * 2
-    gates = [torch.rand(HIDDEN, generator=g) + 0.5 for _ in range(4)]
-    router = torch.randn(256, HIDDEN, generator=g) / HIDDEN**0.5
-    bias = torch.randn(256, generator=g) * 0.1
-    bias[EXPERTS:] = -1e4  # the test holds 16 experts per rank
-    pages = (length + rows - 1 + 63) // 64
-    table = (torch.randperm(pages + 3, generator=g)[:pages] + 1).to(torch.int32)
-    return dict(
-        a_in=a_in,
-        h=h,
-        alpha1=gates[0],
-        beta1=gates[1],
-        alpha2=gates[2],
-        beta2=gates[3],
-        pre_gain=gain(HIDDEN),
-        pre_exp_gain=gain(POOLED),
-        pen_gain=gain(POOLED),
-        post_gain=gain(HIDDEN),
-        in_gain=gain(HIDDEN),
-        router=router,
-        bias=bias,
-        table=table,
-    )
-
-
-def _rank_weights(rank: int, length: int):
-    g = torch.Generator().manual_seed(1000 + rank)
-
-    def bf(*shape, k):
-        return (torch.randn(*shape, generator=g) / k**0.5).to(torch.bfloat16)
-
-    slots = ((length + 63) // 64 + 5) * 64
-    return dict(
-        w_qkvg=bf(QKVG, HIDDEN, k=HIDDEN),
-        w_o=bf(HIDDEN, Q, k=Q),
-        w_pool=bf(512, HIDDEN, k=HIDDEN),
-        w_post=bf(OWNED, POOLED, k=POOLED),
-        k_cache=torch.randn(slots, 2, 64, generator=g).to(torch.bfloat16),
-        v_cache=torch.randn(slots, 2, 64, generator=g).to(torch.bfloat16),
-    )
 
 
 def _all_experts(t: torch.Tensor) -> torch.Tensor:
@@ -150,7 +100,7 @@ def _reference(sh, length, full, kernel_pooled, kernel_hp, dev):
     cs = ref.rope_table(end + 1)
     b = torch.zeros(rows, HIDDEN)
     for r in range(WORLD):
-        w = _rank_weights(r, end)
+        w = inputs.layer_rank_weights(r, end)
         qkvg = (sh["a_in"].float() @ w["w_qkvg"].float().T).to(torch.bfloat16)
         z, _, _, _, _, _ = ref.attention_z(
             qkvg,
@@ -166,9 +116,13 @@ def _reference(sh, length, full, kernel_pooled, kernel_hp, dev):
     b = b * torch.rsqrt(b.pow(2).mean(-1, keepdim=True) + 1e-8)
     hp = sh["beta1"] * b + sh["alpha1"] * sh["h"]
     u = hp * torch.rsqrt(hp.pow(2).mean(-1, keepdim=True) + 1e-5) * sh["pre_gain"]
-    w_pool = torch.cat([_rank_weights(r, end)["w_pool"] for r in range(WORLD)])
+    w_pool = torch.cat(
+        [inputs.layer_rank_weights(r, end)["w_pool"] for r in range(WORLD)]
+    )
     pooled = (u.to(torch.bfloat16).float() @ w_pool.float().T).to(torch.bfloat16)
-    w_post = torch.cat([_rank_weights(r, end)["w_post"] for r in range(WORLD)])
+    w_post = torch.cat(
+        [inputs.layer_rank_weights(r, end)["w_post"] for r in range(WORLD)]
+    )
     h2 = torch.empty(rows, HIDDEN)
     a = torch.empty(rows, HIDDEN, dtype=torch.bfloat16)
     gated = torch.empty(rows, HIDDEN)
@@ -221,7 +175,7 @@ def _layer_tensors(
 ) -> dict:
     """The packer's tensors by role (:func:`pack_layer`'s arguments, which the
     kernel boundary's ``prepare_muse_spark_layer`` takes as ``tensors``)."""
-    w = _rank_weights(rank, length)
+    w = inputs.layer_rank_weights(rank, length)
     w13, w13s, w2, w2s = ref.preprocessed_experts(rank, EXPERTS, dev)
     experts = tuple(_all_experts(t) for t in (w13, w13s, w2, w2s))
     # The packer takes the regular path's tensors: the replicated pooler
@@ -237,15 +191,15 @@ def _layer_tensors(
         pre_gain=sh["pre_gain"].to(dev),
         router=sh["router"].t().to(dev),
         router_bias=sh["bias"].to(dev),
-        pool=torch.cat([_rank_weights(r, length)["w_pool"] for r in range(WORLD)]).to(
-            dev
-        ),
+        pool=torch.cat(
+            [inputs.layer_rank_weights(r, length)["w_pool"] for r in range(WORLD)]
+        ).to(dev),
         experts=experts,
         pre_exp_gain=sh["pre_exp_gain"].to(dev),
         pen_gain=sh["pen_gain"].to(dev),
-        post=torch.cat([_rank_weights(r, length)["w_post"] for r in range(WORLD)]).to(
-            dev
-        ),
+        post=torch.cat(
+            [inputs.layer_rank_weights(r, length)["w_post"] for r in range(WORLD)]
+        ).to(dev),
         post_gain=sh["post_gain"].to(dev),
         alpha2=sh["alpha2"].to(dev),
         beta2=sh["beta2"].to(dev),
@@ -280,8 +234,8 @@ def _worker(rank: int, port: int, length: int, full: bool, rows: int) -> None:
         # every rank's copy.
         tap = ctx.zeros((rows, 5, HIDDEN), dtype=torch.bfloat16)
         end = length + rows - 1
-        sh = _shared(42, length, rows)
-        w = _rank_weights(rank, end)
+        sh = inputs.layer_shared(42, length, rows)
+        w = inputs.layer_rank_weights(rank, end)
         weights = _pack(rank, dev, sh, end, full)
         own = slice(rank * OWNED, (rank + 1) * OWNED)
         k_cache, v_cache = w["k_cache"].to(dev), w["v_cache"].to(dev)
@@ -438,7 +392,7 @@ def test_the_kernel_boundary_refuses_experts_of_another_layout():
     )
 
     dev = torch.device("cuda:0")
-    tensors = _layer_tensors(0, dev, _shared(42, 3000, 1), 3000, False)
+    tensors = _layer_tensors(0, dev, inputs.layer_shared(42, 3000, 1), 3000, False)
     tensors["experts_kernel"] = "triton_mxfp4_precomputed_moe_apply"
     with pytest.raises(ValueError, match="triton_mxfp4_precomputed_moe_apply"):
         prepare_muse_spark_layer(tensors=tensors, max_rows=layer.MAX_ROWS)
@@ -456,7 +410,7 @@ def test_the_kernel_boundary_packs_a_layer_for_its_launches(full):
     )
 
     dev = torch.device("cuda:0")
-    tensors = _layer_tensors(0, dev, _shared(42, 3000, 1), 3000, full)
+    tensors = _layer_tensors(0, dev, inputs.layer_shared(42, 3000, 1), 3000, full)
     tensors["experts_kernel"] = "gluon_mxfp4_precomputed_moe_apply"
     fused = prepare_muse_spark_layer(tensors=tensors, max_rows=layer.MAX_ROWS)
 
@@ -484,8 +438,8 @@ def test_one_binary_serves_every_layer_step_and_length(full):
     rows, length = 8, 900
     end = length + rows - 1
     dev = torch.device("cuda:0")
-    sh = _shared(42, length, rows)
-    w = _rank_weights(0, end)
+    sh = inputs.layer_shared(42, length, rows)
+    w = inputs.layer_rank_weights(0, end)
     weights = _pack(0, dev, sh, end, full)
     k_cache, v_cache = w["k_cache"].to(dev), w["v_cache"].to(dev)
     # Compiling alone reads none of these: plain device memory stands in for
@@ -596,8 +550,8 @@ def _two_requests_worker(rank: int, port: int, full: bool) -> None:
         own = slice(rank * OWNED, (rank + 1) * OWNED)
         lengths = (3000, 3100)
         ends = [n + rows - 1 for n in lengths]
-        # Request 0 is _shared's; request 1 has inputs and pages of its own.
-        sh = _shared(42, lengths[0], rows)
+        # Request 0 is layer_shared's; request 1 has inputs and pages of its own.
+        sh = inputs.layer_shared(42, lengths[0], rows)
         g = torch.Generator().manual_seed(7)
         reqs = [
             dict(a=sh["a_in"], h=sh["h"], table=sh["table"]),
@@ -611,7 +565,7 @@ def _two_requests_worker(rank: int, port: int, full: bool) -> None:
                 ).to(torch.int32),
             ),
         ]
-        w = _rank_weights(rank, 3 * max(ends))
+        w = inputs.layer_rank_weights(rank, 3 * max(ends))
         weights = _pack(rank, dev, sh, ends[1], full)
         cos_sin = ref.rope_table(max(ends) + 1).to(dev)
         for b, r in enumerate(reqs):
@@ -721,8 +675,8 @@ def _shift_worker(rank: int, port: int, kinds: tuple[bool, ...]) -> None:
             check_parity=True,
         )
         scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
-        sh = _shared(42, length, rows)
-        w = _rank_weights(rank, end)
+        sh = inputs.layer_shared(42, length, rows)
+        w = inputs.layer_rank_weights(rank, end)
         packed = _pack(rank, dev, sh, end, kinds[0])
         # Each layer its own kind and q | k | v | gate weights: a launch
         # must project with the next layer's weights, not its own.
@@ -848,9 +802,9 @@ def _graph_worker(rank: int, port: int, length: int) -> None:
             check_parity=False,
         )
         scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
-        sh = _shared(42, length, 1)
+        sh = inputs.layer_shared(42, length, 1)
         weights = _pack(rank, dev, sh, length, False)
-        w = _rank_weights(rank, length)
+        w = inputs.layer_rank_weights(rank, length)
         own = slice(rank * OWNED, (rank + 1) * OWNED)
         k_cache, v_cache = w["k_cache"].to(dev), w["v_cache"].to(dev)
         h_in = sh["h"][:, own].contiguous().to(dev)
@@ -1024,12 +978,10 @@ def test_the_bench_stands_in_for_the_absent_ranks_flags_as_raised(
     gpus: int, full: bool, rows: int, requests: int
 ):
     """The layer bench writes ``payload | tag << 32`` into the absent ranks'
-    segments of every peer region before a launch. A flag pair there must
+    segments (``tokenspeed_kernel.benchmark.muse_spark_monokernel_gluon``) of every peer region before a launch. A flag pair there must
     read exactly ``(tag << 32) | 1``, as ``raise_flag_peers`` writes it, from
     the first launch on: ``Mailbox.poll_flags`` waits for that value, so a
     ghost flag of payload 0 stops the launch."""
-    import muse_spark_layer_bench as bench
-
     plan = layer.layer_plan(
         full=full,
         rows=rows,
@@ -1047,10 +999,10 @@ def test_the_bench_stands_in_for_the_absent_ranks_flags_as_raised(
         # The fill kernel's store, before the first launch and after settling.
         for payloads in (
             None,
-            torch.full_like(bench.absent_index(plan, parity, gpus), 7),
+            torch.full_like(gluon_inputs.absent_index(plan, parity, gpus), 7),
         ):
-            ghost = bench.ghost_payloads(plan, parity, gpus, payloads)
-            scratch[bench.absent_index(plan, parity, gpus)] = ghost | (tag << 32)
+            ghost = gluon_inputs.ghost_payloads(plan, parity, gpus, payloads)
+            scratch[gluon_inputs.absent_index(plan, parity, gpus)] = ghost | (tag << 32)
             for name in plan.flags:
                 for row in range(rows):
                     base = (
@@ -1076,10 +1028,10 @@ def test_the_bench_stands_in_for_the_absent_ranks_flags_as_raised(
 _ONE_GPU_BENCH = textwrap.dedent("""
     import sys
     if __name__ == "__main__":
-        import muse_spark_layer_bench
+        import layer_bench
 
-        sys.argv = ["muse_spark_layer_bench", *sys.argv[1:]]
-        muse_spark_layer_bench.main()
+        sys.argv = ["layer_bench", *sys.argv[1:]]
+        layer_bench.main()
     """)
 
 
@@ -1100,13 +1052,12 @@ def test_one_gpu_bench_launches_find_every_absent_rank_segment(
     args += ["--distinct", "0", "--replays", "1", "--stuck-dir", str(tmp_path)]
     args += ["--full"] if full else []
     # The short timeout is part of the plan key, safe in a shared cache. The
-    # script runs from tmp_path, so this directory (the bench and its
-    # helpers) and the test utilities go on its path.
-    here = os.path.dirname(os.path.abspath(__file__))
-    utils_dir = os.path.dirname(sys.modules["utils"].__file__)
-    path = os.pathsep.join(
-        p for p in (here, utils_dir, os.environ.get("PYTHONPATH")) if p
+    # script runs from tmp_path, so the bench's directory goes on its path.
+    kernel_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), *[".."] * 5)
+    bench_dir = os.path.normpath(
+        os.path.join(kernel_root, "benchmarks/amd/gfx950/muse_spark/monokernel")
     )
+    path = os.pathsep.join(p for p in (bench_dir, os.environ.get("PYTHONPATH")) if p)
     env = dict(os.environ, PYTHONPATH=path)
     result = subprocess.run(
         [sys.executable, str(script), *args],
