@@ -44,6 +44,15 @@ a system-scope store over the GPU links. A poll of a peer region is
 system-scope (``sc0 sc1``), so the local L2 never serves a stale line of
 it.
 
+Data under a flag: words that a flag publishes are stored write-through
+(:meth:`Mailbox.store_words`, :meth:`Mailbox.store_words_peer`), so the L2
+holds nothing dirty that a release would have to write back, and loaded past
+the caches (:meth:`Mailbox.load_words`). A plain store under a flag would
+need a real release (an L2 write-back), and a plain load could hit a stale L2
+line. Data that a later launch reads from another GPU (a draft's taps, for
+example) follows the same rule: write-through stores, loads past the
+caches.
+
 Fail-stop: a poll gives up after about a minute of waiting (the realtime
 clock, read every ``Plan.poll_check`` retries only) and executes
 ``s_trap 2``. The runtime then reports a GPU exception and the process stops. A deadlock or a

@@ -206,7 +206,12 @@ def _x_round(x, words, row_stride, k0, KS: gl.constexpr, R: gl.constexpr):
     row = gl.minimum(p // (KP * 16), R - 1)
     at = p % (KP * 16)
     words_ptr = x.to(gl.pointer_type(gl.int32), bitcast=True)
-    got = gl.load(words_ptr + row * (row_stride // 2) + k0 // 2 + at)
+    # The taps come from every rank's layer launches (write-through stores
+    # over the GPU links), and a peer's store does not update this GPU's L2:
+    # load past the caches (sc0 sc1), or an earlier step's line could serve.
+    got = gl.load(
+        words_ptr + row * (row_stride // 2) + k0 // 2 + at, cache_modifier=".cv"
+    )
     # The previous round's MFMAs have read the buffer.
     gl.barrier()
     words.store(gl.reshape(got, [RP, KP, 16]))
