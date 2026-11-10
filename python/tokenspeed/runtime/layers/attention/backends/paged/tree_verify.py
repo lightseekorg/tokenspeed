@@ -29,6 +29,8 @@ and the service refuses tree drafting for them.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -90,6 +92,15 @@ class TreeDraftInputs:
         # Committed draft keys per request, and those plus the lane window.
         self.frontier = torch.zeros((max_bs,), dtype=torch.int32, device=device)
         self.window_seq_lens = torch.zeros((max_bs,), dtype=torch.int32, device=device)
+
+    @contextmanager
+    def lane_forward(self) -> Iterator[None]:
+        """Mark a lane forward for its duration; a raising forward must not leave later forwards on the lane cascade."""
+        self.active = True
+        try:
+            yield
+        finally:
+            self.active = False
 
     def set_frontier(self, bs: int, frontier: torch.Tensor) -> None:
         self.frontier[:bs].copy_(frontier[:bs])

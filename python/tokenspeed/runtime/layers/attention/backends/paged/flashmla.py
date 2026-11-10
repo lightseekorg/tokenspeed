@@ -62,9 +62,6 @@ from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     FLASH_MLA_PAGE_SIZE as PAGE_SIZE,
 )
 from tokenspeed.runtime.layers.attention.registry import register_backend
-from tokenspeed.runtime.layers.attention.utils import (
-    create_flashinfer_kv_indices_triton,
-)
 from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.flashinfer_config import get_flashinfer_workspace_size
 
@@ -103,30 +100,22 @@ class _ChunkedPrefillMetadata:
     max_chunk_len_per_loop: list
 
 
-def _per_token_slot_table(
-    table: torch.Tensor,
-    *,
-    batch_size: int,
-    page_size: int,
-    max_context_len: int,
+def _per_token_kv_indices(
+    table_cpu: torch.Tensor, kv_lens_cpu: torch.Tensor, *, page_size: int
 ) -> torch.Tensor:
-    """Per-token absolute latent slots from a kernel-page table.
+    """Flat per-token absolute latent slots of each request's first
+    ``kv_lens_cpu[req]`` tokens, from its host kernel-page table.
 
-    flashinfer's paged prefill (``plan(page_size=1)``) reads a
-    ``[bs, max_context]`` table indexed per token: slot(req, t) =
-    ``table[req, t // p] * p + t % p``. Columns past a request's live range
-    resolve through the table's null pages and are never read (the kernel
-    walks only ``seq_len`` tokens per request).
+    flashinfer's paged prefill (``plan(page_size=1)``) reads one slot per
+    token: slot(req, t) = ``table[req, t // p] * p + t % p``. Host indices let
+    the planner bound the pages it reads without a device download.
     """
-    table = table[:batch_size]
-    num_columns = table.shape[1]
-    columns = torch.arange(max_context_len, device=table.device)
-    page_index = torch.div(columns, page_size, rounding_mode="floor").clamp_max(
-        num_columns - 1
-    )
-    offset = columns % page_size
-    pages = table[:, page_index].clamp_min(0).to(torch.int64)
-    return pages * page_size + offset
+    kv_lens = kv_lens_cpu.to(torch.int64)
+    rows = torch.repeat_interleave(torch.arange(kv_lens.numel()), kv_lens)
+    starts = torch.cumsum(kv_lens, dim=0) - kv_lens
+    positions = torch.arange(rows.numel()) - starts[rows]
+    pages = table_cpu[rows, positions // page_size].clamp_min(0).to(torch.int64)
+    return (pages * page_size + positions % page_size).to(torch.int32)
 
 
 # Shared across all flashinfer prefill wrappers used by FlashMLABackend.
@@ -143,6 +132,7 @@ class FlashMLABackend(PagedAttentionBackend):
 
     supports_mla_dcp = True
     default_kernel_page_size = PAGE_SIZE
+    prefill_needs_host_page_table = True
 
     def __init__(self, config: AttnConfig, spec: MLAConfig, *, kernel_page_size: int):
         if kernel_page_size != PAGE_SIZE:
@@ -215,10 +205,6 @@ class FlashMLABackend(PagedAttentionBackend):
             )
         self.workspace_buffer = _global_workspace_buffer
 
-        max_bs = config.max_bs
-        self.kv_indptr = torch.zeros(
-            (max_bs + 1,), dtype=torch.int32, device=config.device
-        )
         self._build_prefill_wrappers()
         self.indices_updater_prefill = _PrefillIndicesUpdater(config, spec, self)
 
@@ -522,25 +508,15 @@ class FlashMLABackend(PagedAttentionBackend):
             not global_server_args_dict["mla_disable_ragged"] and extend_no_prefix
         )
 
-        # Two differently-shaped views of the kernel page table:
-        #   * flashinfer paged prefill (plan page_size=1) walks a PER-TOKEN slot
-        #     table, so expand each token to its absolute latent slot;
-        #   * chunked prefix replay (create_chunked_cache_kv_indices_paged) walks
-        #     the PAGE table directly, deriving slot = page_id*p + pos%p
-        #     in-kernel.
-        prefill_table = _per_token_slot_table(
-            page_table,
-            batch_size=seq_lens.shape[0],
-            page_size=self.kernel_page_size,
-            max_context_len=self.max_context_len,
-        ).to(torch.int32)
-
+        if page_table_cpu is None:
+            raise RuntimeError(
+                "FlashMLA plans its paged prefill from the host page table"
+            )
         self.indices_updater_prefill.update(
-            seq_lens,
-            extend_prefix_lens,
             extend_seq_lens_cpu=extend_seq_lens_cpu,
             prefix_lens_cpu=extend_prefix_lens_cpu,
-            page_table=prefill_table,
+            page_table_cpu=page_table_cpu,
+            page_size=self.kernel_page_size,
             prefill_wrapper_paged=self.prefill_wrapper_paged,
             use_ragged=use_ragged,
         )
@@ -940,54 +916,23 @@ class _PrefillIndicesUpdater:
         self.data_type = config.kv_cache_dtype
         self.q_data_type = config.dtype
 
-        self.kv_indptr = attn_backend.kv_indptr
         self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
 
     def update(
         self,
-        seq_lens: torch.Tensor,
-        prefix_lens: torch.Tensor,
         *,
         extend_seq_lens_cpu: torch.Tensor,
         prefix_lens_cpu: torch.Tensor,
-        page_table: torch.Tensor,
+        page_table_cpu: torch.Tensor,
+        page_size: int,
         prefill_wrapper_paged: BatchMLAPagedAttentionWrapper,
         use_ragged: bool,
     ):
-        if use_ragged:
-            paged_kernel_lens = prefix_lens
-            paged_kernel_lens_cpu = prefix_lens_cpu
-        else:
-            paged_kernel_lens = seq_lens
-            paged_kernel_lens_cpu = prefix_lens_cpu + extend_seq_lens_cpu
-
-        self._call_begin_forward(
-            self.prefill_wrapper_ragged,
-            prefill_wrapper_paged,
-            paged_kernel_lens,
-            seq_lens,
-            self.kv_indptr,
-            use_ragged,
-            page_table,
-            paged_kernel_lens_cpu=paged_kernel_lens_cpu,
-            extend_seq_lens_cpu=extend_seq_lens_cpu,
-        )
-
-    def _call_begin_forward(
-        self,
-        wrapper_ragged: BatchPrefillWithRaggedKVCacheWrapper,
-        wrapper_paged: BatchMLAPagedAttentionWrapper,
-        paged_kernel_lens: torch.Tensor,
-        seq_lens: torch.Tensor,
-        kv_indptr: torch.Tensor,
-        use_ragged: bool,
-        page_table: torch.Tensor,
-        *,
-        paged_kernel_lens_cpu: torch.Tensor,
-        extend_seq_lens_cpu: torch.Tensor,
-    ):
-        bs = len(seq_lens)
+        bs = extend_seq_lens_cpu.shape[0]
         sm_scale = self.scaling
+        paged_kernel_lens_cpu = (
+            prefix_lens_cpu if use_ragged else prefix_lens_cpu + extend_seq_lens_cpu
+        )
 
         # FlashInfer plans on the host. Derive its CSR metadata from the
         # runner's mirrors instead of downloading stream-ordered device lengths.
@@ -1002,23 +947,8 @@ class _PrefillIndicesUpdater:
         kv_len_arr_cpu.copy_(paged_kernel_lens_cpu)
         torch.cumsum(extend_seq_lens_cpu, dim=0, out=qo_indptr_cpu[1:])
         torch.cumsum(kv_len_arr_cpu, dim=0, out=kv_indptr_cpu[1:])
-
-        torch.cumsum(paged_kernel_lens, dim=0, out=kv_indptr[1 : bs + 1])
-        kv_indptr = kv_indptr[: bs + 1]
-        kv_indices = torch.empty(
-            int(kv_indptr_cpu[-1]),
-            dtype=torch.int32,
-            device=seq_lens.device,
-        )
-        create_flashinfer_kv_indices_triton[(bs,)](
-            page_table,
-            paged_kernel_lens,
-            kv_indptr,
-            kv_indices,
-            page_table.shape[1],
-        )
         if use_ragged:
-            wrapper_ragged.begin_forward(
+            self.prefill_wrapper_ragged.begin_forward(
                 qo_indptr=qo_indptr_cpu,
                 kv_indptr=qo_indptr_cpu,
                 num_qo_heads=self.num_local_heads,
@@ -1029,10 +959,18 @@ class _PrefillIndicesUpdater:
                 non_blocking=True,
             )
         else:
-            wrapper_paged.plan(
+            kv_indices_cpu = torch.empty(
+                int(kv_indptr_cpu[-1]), dtype=torch.int32, pin_memory=True
+            )
+            kv_indices_cpu.copy_(
+                _per_token_kv_indices(
+                    page_table_cpu, kv_len_arr_cpu, page_size=page_size
+                )
+            )
+            prefill_wrapper_paged.plan(
                 qo_indptr_cpu,
                 kv_indptr_cpu,
-                kv_indices,
+                kv_indices_cpu,
                 kv_len_arr_cpu,
                 self.num_local_heads,
                 self.kv_lora_rank,

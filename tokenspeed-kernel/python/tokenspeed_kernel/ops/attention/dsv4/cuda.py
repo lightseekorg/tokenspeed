@@ -20,9 +20,8 @@
 
 """CUDA DeepSeek V4 attention kernels."""
 
-import importlib.util
-
 import torch
+from tokenspeed_kernel._optional import has_optional_package
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -49,11 +48,7 @@ except ImportError:
     persistent_topk = error_fn
 
 
-if (
-    platform.is_nvidia
-    and platform.is_hopper_plus
-    and importlib.util.find_spec("flash_mla") is not None
-):
+if platform.is_nvidia and platform.is_hopper_plus and has_optional_package("flash_mla"):
 
     @register_kernel(
         "attention",

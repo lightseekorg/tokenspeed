@@ -17,6 +17,9 @@ people and average people is more than tenfold.
 * Before any work, check for a local Python venv and, if one exists, activate
   it.
 * If a local Python venv exists, don't install pip packages outside it.
+* For kernel or forward-path iteration, serve with `--allow-reload-forward` and
+  run `ts reload-forward` after each edit instead of restarting; validate the
+  final change on a freshly started server before opening a PR.
 
 ## Code changes
 
@@ -94,6 +97,8 @@ change.
   between prefix matching, allocation, and page geometry.
 * `docs/design/scheduler.md` — the C++ scheduler's admission granularity,
   what triggers retraction in each engine role, and the recovery protocol.
+* `docs/design/prefill-delay.md` — the fused prefill gate: attention-DP
+  agreement, ALL/ANY windows, live admission watermarks, and resident progress.
 * `docs/design/unified_path.md` — the unified decode path: one
   refresh-in-place metadata contract for eager and CUDA-graph decode, the
   padding contract, buffer sizing, and what stays graph-only.
@@ -107,6 +112,10 @@ change.
   parameter of the chain path (compaction), position vs slot, one tree
   attention path (trtllm-gen prefix plus window cascade), and position-keyed
   sampled verify.
+* `docs/design/monokernel.md` — decode monokernels: one persistent launch
+  per decoder layer, stages handing off through tagged mailboxes, every
+  layer of a forward launching or none, the per-step state, shared cache
+  layouts, and the deadlock rule.
 
 ## Public pull requests
 

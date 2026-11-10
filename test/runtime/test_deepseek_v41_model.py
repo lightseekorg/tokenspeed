@@ -336,6 +336,7 @@ class _Backend:
         swa_rope_cache,
         swa_norm_weight,
         swa_norm_eps,
+        fused_decode_groups,
         out_rope_cache,
         key_rows=None,
     ):
@@ -386,8 +387,11 @@ class _Backend:
     [(0, 1, 1), (0, 4, 4), (3, 4, 4), (0, 1, 4)],
 )
 def test_lm_head_checkpoint_and_logits_follow_model_dtype(
-    device, fused, dtype, rank, tp_size, world_size
+    device, fused, dtype, rank, tp_size, world_size, monkeypatch
 ):
+    monkeypatch.setitem(
+        global_server_args_dict, "disable_deepseek_v41_token_blacklist", True
+    )
     if device != "cpu" and not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     config = _config()
@@ -409,8 +413,8 @@ def test_lm_head_checkpoint_and_logits_follow_model_dtype(
     checkpoint = torch.zeros(
         config.vocab_size, config.hidden_size, dtype=torch.bfloat16, device="cpu"
     )
-    checkpoint[start : start + 2, 0] = 1
-    checkpoint[start + 1, 1] = 2**-9
+    checkpoint[start + 3 : start + 5, 0] = 1
+    checkpoint[start + 4, 1] = 2**-9
     adapter.load_weights([("head.weight", checkpoint)])
     local = checkpoint[start : start + head.weight.shape[0]].to(
         device=device, dtype=dtype
@@ -421,7 +425,7 @@ def test_lm_head_checkpoint_and_logits_follow_model_dtype(
     hidden = torch.ones(1, config.hidden_size, dtype=torch.bfloat16, device=device)
     expected = F.linear(hidden.to(dtype), local, bias=None)
     # BF16 rounds the near tie; wider dtypes retain the second token's margin.
-    expected_token = 0 if dtype == torch.bfloat16 else 1
+    expected_token = 3 if dtype == torch.bfloat16 else 4
     assert expected.argmax(-1).item() == expected_token
 
     processor = adapter.resolve_logits_processor(SimpleNamespace(text_config=config))
@@ -442,6 +446,104 @@ def test_lm_head_checkpoint_and_logits_follow_model_dtype(
     assert output.next_token_logits.dtype == dtype
     torch.testing.assert_close(output.next_token_logits, expected, rtol=0, atol=0)
     assert output.next_token_logits.argmax(-1).item() == expected_token
+
+
+@pytest.mark.parametrize("disable_blacklist", [False, True])
+@pytest.mark.parametrize("fuse_argmax", [False, True])
+def test_generation_token_blacklist_precedes_argmax(
+    fuse_argmax, disable_blacklist, monkeypatch
+):
+    monkeypatch.setitem(
+        global_server_args_dict,
+        "disable_deepseek_v41_token_blacklist",
+        disable_blacklist,
+    )
+    config = _config()
+    config.vocab_size = 129280
+    config.hidden_size = 1
+    adapter = DeepseekV41ForCausalLM.__new__(DeepseekV41ForCausalLM)
+    nn.Module.__init__(adapter)
+    adapter.mapping = _mapping(0, 1, 1)
+    with torch.device("cpu"):
+        adapter.lm_head = adapter.resolve_lm_head(
+            SimpleNamespace(text_config=config), None, ""
+        )
+    blocked = [0, 2, 129262, 129263, 129264]
+    with torch.no_grad():
+        adapter.lm_head.weight.zero_()
+        adapter.lm_head.weight[blocked, 0] = 4
+        adapter.lm_head.weight[3, 0] = 2
+    processor = adapter.resolve_logits_processor(SimpleNamespace(text_config=config))
+    if fuse_argmax:
+        processor.fuse_argmax()
+
+    hidden = torch.ones(1, 1)
+    output = processor(
+        input_ids=torch.zeros(1, dtype=torch.int64),
+        hidden_states=hidden,
+        lm_head=adapter.lm_head,
+        logits_metadata=LogitsMetadata.from_forward_context(
+            _ctx(None, 1, ForwardMode.DECODE)
+        ),
+        aux_hidden_states=None,
+    )
+
+    expected = F.linear(hidden, adapter.lm_head.weight)
+    expected_token = 3
+    if not disable_blacklist:
+        expected[0, blocked] = float("-inf")
+    else:
+        expected_token = 0
+    torch.testing.assert_close(output.next_token_logits, expected, rtol=0, atol=0)
+    assert output.next_token_logits.argmax(-1).item() == expected_token
+    if fuse_argmax:
+        assert output.next_token_ids.item() == expected_token
+
+
+@pytest.mark.parametrize("rank", [0, 3])
+def test_generation_token_blacklist_uses_global_ids_on_vocab_shards(rank, monkeypatch):
+    monkeypatch.setitem(
+        global_server_args_dict, "disable_deepseek_v41_token_blacklist", False
+    )
+    config = _config()
+    config.vocab_size = 129280
+    config.hidden_size = 1
+    adapter = DeepseekV41ForCausalLM.__new__(DeepseekV41ForCausalLM)
+    nn.Module.__init__(adapter)
+    adapter.mapping = _mapping(rank, 4, 4)
+    with torch.device("cpu"):
+        adapter.lm_head = adapter.resolve_lm_head(
+            SimpleNamespace(text_config=config), None, ""
+        )
+    width = adapter.lm_head.weight.shape[0]
+    start = rank * width
+    blocked = [0, 2, 129262, 129263, 129264]
+    local_blocked = [
+        token_id - start for token_id in blocked if start <= token_id < start + width
+    ]
+    with torch.no_grad():
+        adapter.lm_head.weight.zero_()
+        adapter.lm_head.weight[local_blocked, 0] = 4
+        adapter.lm_head.weight[3, 0] = 2
+    processor = adapter.resolve_logits_processor(SimpleNamespace(text_config=config))
+    # Exercise the real local shard without substituting a four-rank collective.
+    processor.skip_all_gather = True
+
+    hidden = torch.ones(1, 1)
+    output = processor(
+        input_ids=torch.zeros(1, dtype=torch.int64),
+        hidden_states=hidden,
+        lm_head=adapter.lm_head,
+        logits_metadata=LogitsMetadata.from_forward_context(
+            _ctx(None, 1, ForwardMode.DECODE)
+        ),
+        aux_hidden_states=None,
+    )
+
+    expected = F.linear(hidden, adapter.lm_head.weight)
+    expected[0, local_blocked] = float("-inf")
+    torch.testing.assert_close(output.next_token_logits, expected, rtol=0, atol=0)
+    assert output.next_token_logits.argmax(-1).item() == 3
 
 
 def test_hc_post_rejects_unfinished_reduction():
@@ -2373,7 +2475,8 @@ def test_cuda_swizzled_query_scales_match_canonical(monkeypatch, layer_id, rows)
         for module in attn.modules():
             if isinstance(module, LinearBase):
                 module.quant_method.process_weights_after_loading(module)
-        assert v41._reads_swizzled_scales(attn.wq_b)
+        # Prepared for at least one layout its GEMM reads without a repack.
+        assert v41._scale_layouts(attn.wq_b) != frozenset({"canonical"})
         positions = torch.arange(6, device="cuda:0")
         requests = torch.zeros(6, dtype=torch.int64, device="cuda:0")
         x = torch.randn(6, 128, dtype=torch.bfloat16, device="cuda:0")
@@ -2381,7 +2484,7 @@ def test_cuda_swizzled_query_scales_match_canonical(monkeypatch, layer_id, rows)
         quantize = v41.rmsnorm_quantize_fp8_group32
 
         def recording(*args, **kwargs):
-            layouts.append(kwargs["swizzled_scales"])
+            layouts.append(kwargs["scale_layout"])
             return quantize(*args, **kwargs)
 
         monkeypatch.setattr(v41, "rmsnorm_quantize_fp8_group32", recording)
@@ -2404,9 +2507,13 @@ def test_cuda_swizzled_query_scales_match_canonical(monkeypatch, layer_id, rows)
             return out, [*backend.calls[-1][1:5], *sum(selections, ())]
 
         actual, actual_inputs = run()
-        monkeypatch.setattr(v41, "_reads_swizzled_scales", lambda layer: False)
+        monkeypatch.setattr(
+            v41, "_scale_layouts", lambda layer: frozenset({"canonical"})
+        )
         expected, expected_inputs = run()
-        assert layouts == [rows != "narrowed", False]
+        # Narrowing selects rows of the scales, which only canonical allows.
+        assert (layouts[0] == "canonical") == (rows == "narrowed")
+        assert layouts[1] == "canonical"
         if rows == "partitioned" and attn.indexer is not None:
             assert len(actual_inputs) == 6
         assert torch.equal(actual, expected)
@@ -2516,6 +2623,9 @@ def test_cuda_fp8_weight_update_preserves_graph(monkeypatch):
     "execution_mode", ["eager", "decode", "prefill", "split_prefill_graph"]
 )
 def test_cuda_40_layer_real_flatkv_and_moe(monkeypatch, tmp_path, execution_mode):
+    monkeypatch.setitem(
+        global_server_args_dict, "disable_deepseek_v41_token_blacklist", True
+    )
     config = _config()
     config.hidden_size = 256
     config.moe_intermediate_size = 256
@@ -4002,7 +4112,7 @@ def test_model_qcp_ced_communication_and_outputs(
             model = DeepseekV41Model(config, mapping, _quant(), "model", False, "gpu")
         backend = _backend("cpu", 2)
         plan = QueryShardPlan.from_forward(
-            total_tokens=total, input_lengths=lengths, size=4, rank=rank
+            total_tokens=total, input_lengths=lengths, size=4, rank=rank, device="cpu"
         )
         meta = _extend(
             backend,
@@ -4047,18 +4157,22 @@ def test_model_qcp_ced_communication_and_outputs(
             view.metadata.request_indices[samples], meta.request_indices[sample_encoder]
         )
         expected = full_hidden[samples]
-        counts = plan.rows_per_rank(sample_encoder)
+        split = local.decoder_plan.split_rows(samples)
+        counts = split.rows_per_rank
+        gathered_samples = expected[torch.argsort(split.to_rows_order)]
 
         def gather(payload, group, row_counts, backend=None):
             assert group == mapping.attn.qcp_group
             assert row_counts == list(counts)
             first = sum(counts[:rank])
-            torch.testing.assert_close(payload, expected[first : first + counts[rank]])
-            return expected.clone()
+            torch.testing.assert_close(
+                payload, gathered_samples[first : first + counts[rank]]
+            )
+            return gathered_samples.clone()
 
         monkeypatch.setattr(comm_ops, "token_all_gather", gather)
         actual, captured = model.finish_forward(
-            full_hidden[local.decoder_plan.local_slice], [], ctx
+            full_hidden[local.decoder_plan.local_row_ids], [], ctx
         )
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         assert actual.shape[0] == sum(complete)
@@ -4074,9 +4188,9 @@ def test_model_qcp_ced_communication_and_outputs(
             assert row_counts == list(local.decoder_plan.row_counts)
             expected_taps = torch.cat(taps, dim=-1)
             torch.testing.assert_close(
-                payload, expected_taps[local.decoder_plan.local_slice], rtol=0, atol=0
+                payload, expected_taps[local.decoder_plan.local_row_ids], rtol=0, atol=0
             )
-            return expected_taps.clone()
+            return local.decoder_plan.to_gather_order(expected_taps)
 
         monkeypatch.setattr(
             "tokenspeed.runtime.models.deepseek_v41.token_all_gather_rows",
@@ -4084,8 +4198,8 @@ def test_model_qcp_ced_communication_and_outputs(
         )
         ctx.capture_hidden_mode = CaptureHiddenMode.FULL
         actual, captured = model.finish_forward(
-            full_hidden[local.decoder_plan.local_slice],
-            [tap[local.decoder_plan.local_slice] for tap in taps],
+            full_hidden[local.decoder_plan.local_row_ids],
+            [tap[local.decoder_plan.local_row_ids] for tap in taps],
             ctx,
         )
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
@@ -4217,6 +4331,7 @@ def test_distributed_model_qcp_four_way(monkeypatch, tmp_path):
                         input_lengths=[length],
                         size=4,
                         rank=rank,
+                        device=device,
                     )
                     if sharded
                     else None
@@ -4232,7 +4347,7 @@ def test_distributed_model_qcp_four_way(monkeypatch, tmp_path):
                 )
                 ctx = _ctx(backend, length, ForwardMode.EXTEND)
                 ctx.query_shard = plan
-                rows = plan.local_slice if plan is not None else slice(None)
+                rows = plan.local_row_ids if plan is not None else slice(None)
                 result, _ = adapter.model(
                     ids[rows],
                     meta.positions[rows],
@@ -4272,8 +4387,8 @@ def test_distributed_model_qcp_four_way(monkeypatch, tmp_path):
             taps = [full, -full]
             ctx.capture_hidden_mode = CaptureHiddenMode.FULL
             actual, captured = adapter.model.finish_forward(
-                full[local.decoder_plan.local_slice],
-                [tap[local.decoder_plan.local_slice] for tap in taps],
+                full[local.decoder_plan.local_row_ids],
+                [tap[local.decoder_plan.local_row_ids] for tap in taps],
                 ctx,
             )
             expected = full[torch.tensor(view.logits_rows_cpu, device=device)]

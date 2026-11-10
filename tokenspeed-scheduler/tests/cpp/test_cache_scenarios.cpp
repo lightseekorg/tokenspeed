@@ -97,6 +97,7 @@ void RetractForTest(Request& request, CacheCoordinator& coordinator, SnapshotSlo
     ASSERT_TRUE(taken) << "the test's snapshot pool must hold the image";
     taken->store_pairs.clear();
     request.Apply(fsm::SnapshotRetractEvent{&coordinator, epoch, request.HasGeneratedOutput(), std::move(taken->image),
+                                            /*kv_event_tails=*/{},
                                             std::make_shared<SnapshotSlotIndex>(slots.Allocate()),
                                             /*image_stores=*/{}});
 }
@@ -4045,6 +4046,102 @@ TEST_F(PrefillHeadOfLineSuite, BlockedLaterChunkDoesNotStartSubmittedRequest) {
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 12) << "the incomplete prefill released its pages";
     EXPECT_EQ(scheduler_->WaitingSize(), 2u) << "the retracted prefill and the untouched submitted request wait";
     EXPECT_EQ(scheduler_->DecodingSize(), 1u) << "the completed request keeps its pages";
+}
+
+// The head of line on the P role with prefill_chunk_yield_tokens, in a tight
+// pool: 33 physical pages -> 32 usable, two full-attention groups of 2-token
+// pages (a page of prompt takes a block of each), 8-token chunks and at most
+// 4 tokens yielded; two completed prompts whose transfers are never
+// acknowledged pin 16 blocks. The resident chunk that gives way is admitted
+// before the prompts it carries, though its row runs after theirs; a carried
+// prompt that does not fit ends the fill; and when the chunk itself does not
+// fit, nothing behind it is admitted.
+class PrefillChunkYieldCapacitySuite : public RetractSuite {
+protected:
+    using Rows = std::vector<std::tuple<std::string, std::int32_t, std::int32_t>>;
+
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = RetractSuite::MakeConfig();
+        cfg.role = Role::kP;
+        cfg.device_allocator.total_pages = 33;
+        cfg.max_scheduled_tokens = 8;
+        cfg.prefill_chunk_yield_tokens = 4;
+        for (CacheGroupConfig& group : cfg.cache_groups) {
+            group.total_pages = cfg.device_allocator.total_pages;
+            group.transfer_policy = CacheTransferPolicy::FullSuffix;
+        }
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+
+    void SubmitBootstrapped(const std::string& id, std::vector<std::int32_t> tokens) {
+        Submit(RequestSpec{.request_id = id, .tokens = std::move(tokens)});
+        ExecutionEvent event;
+        event.With(pd::BootstrappedEvent{id});
+        scheduler_->Advance(std::move(event));
+    }
+
+    void SendPdSucceeded(const std::string& request_id) {
+        ExecutionEvent event;
+        event.With(pd::SucceededEvent{request_id});
+        scheduler_->Advance(std::move(event));
+    }
+
+    // The plan's prefill rows: the request and the prompt positions computed.
+    // The completing ones come first.
+    static Rows PrefillRows(const ExecutionPlan& plan) {
+        Rows rows;
+        if (const ForwardBatch* batch = FindForwardBatch(plan)) {
+            for (std::size_t i = 0; i < batch->NumExtends(); ++i) {
+                rows.emplace_back(batch->request_ids[i], batch->extend_prefix_lens[i],
+                                  batch->extend_prefix_lens[i] + batch->input_lengths[i]);
+            }
+            EXPECT_TRUE(CompletingPrefillsFormAPrefix(*batch));
+        }
+        return rows;
+    }
+};
+
+TEST_F(PrefillChunkYieldCapacitySuite, AFailedCarriedPromptEndsTheFillAndTheChunkThatGaveWayIsAdmittedFirst) {
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 32);
+    // Each 7-token prompt holds 4 pages (with the decode slot) until its
+    // transfer is acknowledged.
+    for (const std::string id : {"pinned0", "pinned1"}) {
+        SubmitBootstrapped(id, MakeTokens(7, id == "pinned0" ? 500 : 600));
+        EXPECT_EQ(PrefillRows(PlanOnce()), (Rows{{id, 0, 7}}));
+        SendForwardDone(id, {900});
+    }
+    SubmitBootstrapped("long", MakeTokens(24, 1000));
+    EXPECT_EQ(PrefillRows(PlanOnce()), (Rows{{"long", 0, 8}}));
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 8);
+    SendForwardDone("long");
+
+    // s1, s2 and s3 take 1, 2 and 1 tokens, the 4 the long chunk gives up:
+    // [8, 12) takes 2 pages and s1 one (its token and the decode slot), and
+    // then s2's 2 pages do not fit. That ends the fill: the page s3 would take
+    // stays free. s1 runs ahead of the long chunk.
+    SubmitBootstrapped("s1", {2001});
+    SubmitBootstrapped("s2", {2101, 2102});
+    SubmitBootstrapped("s3", {2201});
+    EXPECT_EQ(PrefillRows(PlanOnce()), (Rows{{"s1", 0, 1}, {"long", 8, 12}}));
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 2);
+    SendForwardDone("long");
+    SendForwardDone("s1", {900});
+
+    // The long chunk is admitted first again, giving s2 and s3 their 3
+    // tokens: [12, 16) needs 2 pages while s1's transfer still pins its page,
+    // so nothing is admitted, s3 included, though its page would fit.
+    const ExecutionPlan blocked = PlanOnce();
+    ASSERT_TRUE(blocked.remote_decode.has_value());
+    EXPECT_EQ(blocked.remote_decode->request_ids, std::vector<std::string>{"s1"});
+    EXPECT_TRUE(PrefillRows(blocked).empty());
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 2);
+
+    // The ACK frees s1's page: the long chunk is admitted first and takes the
+    // pool, and s2 waits again.
+    SendPdSucceeded("s1");
+    EXPECT_EQ(PrefillRows(PlanOnce()), (Rows{{"long", 12, 16}}));
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 0);
 }
 
 // Two prompts mid-prefill hold every Device page while a retracted request

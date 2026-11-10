@@ -136,6 +136,7 @@ def _selector(rank, world_size, device, group, quantized=False):
         softcapping=None,
         skip_all_gather=False,
         dp_sampling_enabled=False,
+        fp8_weight=None,
     )
     assert selector.enabled, "this shard geometry must reach the packed gather"
     return selector

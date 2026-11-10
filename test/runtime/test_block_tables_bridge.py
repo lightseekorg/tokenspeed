@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
-from test.runtime.conftest import whole_row_spans
+from test.runtime.conftest import whole_row_spans, whole_row_windows
 from types import SimpleNamespace
 
 import pytest
@@ -109,7 +109,7 @@ class TestBlockTablesBridgeTest:
         )
         return SimpleNamespace(
             block_tables=block_tables,
-            block_tables_arrays=lambda: arrays,
+            block_table_windows=lambda: whole_row_windows(arrays),
             block_table_spans=lambda: spans,
         )
 
@@ -145,7 +145,7 @@ class TestBlockTablesBridgeTest:
         assert out["full"].tolist() == [[11, 12], [13, 0]]
         assert out["swa"].tolist() == [[21], [0]]
 
-    def test_array_export_is_consumed(self):
+    def test_window_export_is_consumed(self):
         op = self._make_op({"full": [[1]]})
         out = self.bridge(op, device="cpu", num_reqs=1)
         assert (out["full"].tolist()) == ([[1]])
@@ -190,9 +190,9 @@ class TestBlockTablesBridgeTest:
         import numpy as np
 
         collision = SimpleNamespace(
-            block_tables_arrays=lambda: {
-                1: np.array([[1]], dtype=np.int32),
-                "1": np.array([[2]], dtype=np.int32),
+            block_table_windows=lambda: {
+                1: (np.array([[1]], dtype=np.int32), 1),
+                "1": (np.array([[2]], dtype=np.int32), 1),
             },
             # Never reached: the "collide" ValueError below raises before any
             # group's spans are read. block_table_spans must still exist and
@@ -207,7 +207,7 @@ class TestBlockTablesBridgeTest:
         import numpy as np
 
         wrong_dtype = SimpleNamespace(
-            block_tables_arrays=lambda: {"full": np.array([[1]], dtype=np.int64)},
+            block_table_windows=lambda: {"full": (np.array([[1]], dtype=np.int64), 1)},
             # Same note as above: not reached before the dtype check raises.
             block_table_spans=lambda: {},
         )
@@ -293,8 +293,8 @@ def test_packed_tables_keep_independent_host_staging(device_type):
                 "state": np.array([[value, -1], [0, value + 1]], dtype=np.int32)
             }
 
-        def block_tables_arrays(self):
-            return self.arrays
+        def block_table_windows(self):
+            return whole_row_windows(self.arrays)
 
         def block_table_spans(self):
             return whole_row_spans(self.arrays)
@@ -323,7 +323,7 @@ def test_packed_tables_host_tables_false_copies_nothing():
 
     arrays = {"full": np.array([[1, 2], [3, 4]], dtype=np.int32)}
     op = SimpleNamespace(
-        block_tables_arrays=lambda: arrays,
+        block_table_windows=lambda: whole_row_windows(arrays),
         block_table_spans=lambda: whole_row_spans(arrays),
     )
     result = packed_block_tables_from_forward_op(
@@ -376,7 +376,8 @@ def test_cache_batch_metadata_tables_cpu_raises_without_host_tables():
     arrays = {"full": np.array([[1, 2]], dtype=np.int32)}
     spans = {"full": np.array([[0, 2]], dtype=np.int32)}
     forward_op = SimpleNamespace(
-        block_tables_arrays=lambda: arrays, block_table_spans=lambda: spans
+        block_table_windows=lambda: whole_row_windows(arrays),
+        block_table_spans=lambda: spans,
     )
     metadata = CacheBatchMetadata.from_forward_op(
         forward_op,
@@ -402,7 +403,8 @@ def test_cache_batch_metadata_tables_cpu_available_with_host_tables():
     arrays = {"full": np.array([[1, 2]], dtype=np.int32)}
     spans = {"full": np.array([[0, 2]], dtype=np.int32)}
     forward_op = SimpleNamespace(
-        block_tables_arrays=lambda: arrays, block_table_spans=lambda: spans
+        block_table_windows=lambda: whole_row_windows(arrays),
+        block_table_spans=lambda: spans,
     )
     metadata = CacheBatchMetadata.from_forward_op(
         forward_op,
@@ -458,7 +460,7 @@ def _malformed_fuzz_arrays(seed: int):
 
 
 class _MalformedForwardOp:
-    """Exposes block_tables_arrays()/block_table_spans() like a scheduler
+    """Exposes block_table_windows()/block_table_spans() like a scheduler
     forward op, but with rows the real scheduler cannot produce (see module
     docstring above)."""
 
@@ -466,8 +468,19 @@ class _MalformedForwardOp:
         self._arrays = arrays
         self._spans = spans
 
-    def block_tables_arrays(self):
-        return self._arrays
+    def block_table_windows(self):
+        import numpy as np
+
+        windows = {}
+        for group, table in self._arrays.items():
+            released, pages = self._spans[group].T
+            width = int((pages - released).max())
+            first = np.maximum(pages - width, 0)
+            window = table[
+                np.arange(table.shape[0])[:, None], first[:, None] + np.arange(width)
+            ]
+            windows[group] = (window, table.shape[1])
+        return windows
 
     def block_table_spans(self):
         return self._spans
@@ -541,7 +554,8 @@ def _span_op(spans):
 
     arr = np.array([[1, 2, -1]], dtype=np.int32)
     return SimpleNamespace(
-        block_tables_arrays=lambda: {"g": arr}, block_table_spans=lambda: spans
+        block_table_windows=lambda: {"g": (arr, arr.shape[1])},
+        block_table_spans=lambda: spans,
     )
 
 

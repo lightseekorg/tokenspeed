@@ -25,7 +25,6 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel.ops.attention.dsa import dsa_decode, dsa_prefill
-from tokenspeed_kernel.ops.attention.dsa.flashinfer_prims import has_prims_sparse_mla
 from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed_kernel.workspace import capture_session
 
@@ -33,10 +32,6 @@ pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
     or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
     reason="requires SM100 or SM103",
-)
-requires_prims = pytest.mark.skipif(
-    not has_prims_sparse_mla(),
-    reason="requires a FlashInfer build with PR #7984",
 )
 
 
@@ -116,7 +111,6 @@ def _check_fp8_output(actual, reference, bound):
     )
 
 
-@requires_prims
 @pytest.mark.parametrize("heads", [12, 96])
 @pytest.mark.parametrize(
     ("mode", "width"), [("decode", 1), ("decode", 6), ("decode", 8), ("prefill", 1)]
@@ -187,7 +181,6 @@ def test_prims_sparse_attention_graph_and_reference(heads, mode, width, with_len
     check(captured, captured_lse)
 
 
-@requires_prims
 @pytest.mark.parametrize("layout", ["flat", "latent", "nhd", "hnd"])
 def test_prims_cache_layout_and_optional_output(layout):
     torch.manual_seed(79)
@@ -219,7 +212,6 @@ def test_prims_cache_layout_and_optional_output(layout):
     _check_fp8_output(actual, expected, bound)
 
 
-@requires_prims
 def test_prims_separate_streams_keep_independent_scratch():
     torch.manual_seed(84)
     q = (torch.randn(8, 12, 576, device="cuda") * 0.5).to(torch.float8_e4m3fn)
@@ -271,7 +263,6 @@ def test_prims_separate_streams_keep_independent_scratch():
         _check_fp8_output(output, expected, bound)
 
 
-@requires_prims
 def test_prims_rejects_disabled_pdl():
     q = torch.zeros(1, 12, 576, device="cuda", dtype=torch.float8_e4m3fn)
     kv = torch.zeros(64, 576, device="cuda", dtype=q.dtype)

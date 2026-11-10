@@ -66,7 +66,7 @@ expert_apply = prepare_sm90_fp8_moe(
 ```
 
 Private modes apply `sm90_moe.patch` to a cached source copy of FlashInfer
-0.7.2.post1 and compile isolated modules, operators, and tuning caches. They require
+0.7.3 and compile isolated modules, operators, and tuning caches. They require
 matching upstream sources, JIT enabled, and both CUDA toolkit and runtime
 12.8 or newer. Initialization reports unsupported sources or build settings.
 Private cold JIT compilations bind their include path to that versioned source
@@ -331,6 +331,12 @@ channel and quantize activations per token. FP32 routing weights remain FP32
 during combination. Native FP8 matrix arithmetic uses FP32 accumulators but
 need not match sequential FP32 arithmetic.
 
+On SM90 the Triton kernel stays at 32 rows per tile. A 64-row FP8 tile lowers
+to wgmma, whose accumulator is coarser than FP32, and misses the FP64 reference
+by 5e-3 to 7e-3. The smaller tiles stay within 5e-4 but give up wgmma's
+throughput: from 2048 tokens, and on wide experts at every size above 512, they
+run slower than 64-row tiles would.
+
 ## Shared MoE precision policies
 
 The unquantized Triton MoE normally keeps GEMM1 accumulators in FP32 through
@@ -577,6 +583,28 @@ CUDA graph. Every rank must run the same batches, since each mailbox is shared
 by the group. Other row counts and every non-decode forward keep the TRT-LLM
 MoE.
 
+At 5-8 rows the routing kernel lets the experts launch as it starts, and the
+shared expert runs on a highest-priority side stream that the tail never waits
+for: the tail polls the shared rows from their mailbox. Those tails keep their
+release after the output multicast: a release at entry lets kernels in that can
+hold the SMs the side stream still needs. The forward rejoins that side stream once
+at its end (`KimiK3DecodeMoE.join`), since a CUDA graph capture fails while a
+forked stream is not joined. These only reorder work; the outputs are the same
+bit for bit.
+
+Up to 8 rows a decode step is bound by HBM bandwidth, which the attention core
+and the all-reduces leave idle, so the chain prefetches weights into L2
+(`_cute_dsl/k3_decode_prefetch.py` has the row counts and caps). A side stream
+prefetches the MoE front's packed weight after the o-projection exit; the
+o-projection shard and the MoE layer's front, shared-expert and up-projection
+weights after the KDA input projection or the MLA core; and, once the routed
+experts launch, the next layer's attention weights up to a cap. At 4-7 rows the
+routed experts instead prefetch the up-projection shard and the next attention's
+weights themselves, once their last weight load is issued. The forward rejoins
+the prefetch stream at its end as well. The prefetch tables hold weight
+addresses, so the weights must not move after binding. Prefetching changes no
+result.
+
 Three places decide where the chain runs. The Kimi-K3 MoE execution plan
 allows it for one tensor-parallel group shared by attention and MoE on
 Blackwell TRT-LLM. `supports()` in `_cute_dsl/k3_decode_support.py` (no
@@ -601,7 +629,16 @@ o-projection shard). Each layer then does the following:
 1. Add the previous feed-forward output to the residual prefix and mix it
    with the block snapshots (AttnRes), reading a MoE layer's output row
    straight from the tail's ring.
-2. Run the packed input projection as a split-K GEMM with per-batch tactics.
+2. Run the packed input projection as a split-K GEMM with per-batch tactics:
+   up to 16 rows a warp split-K (many small CTAs whose four compute warps
+   each sum a quarter of K, reduced in shared memory), above 16 rows a cluster
+   split-K (each CTA of a cluster sums a K slice, reduced over distributed
+   shared memory). A weight that is not contiguous and 32-byte aligned, or
+   strided or misaligned activations or outputs, take the cluster split-K at
+   every row count. Both multiply BF16, accumulate in FP32 and round the
+   output once to BF16; only the order in which they sum the K partials
+   differs, so their outputs can differ by one BF16 rounding step. Both
+   compile when the layer is bound, before graph capture.
 3. Run the attention core as usual, through the attention's `o_proj_input`
    (Kimi-K3.1's DSA layers select their indexer's top-k there, as in their
    `forward`).

@@ -243,6 +243,66 @@ def test_fp8_channel_moe_matches_fp64(
     assert error < 2e-3
 
 
+@pytest.mark.parametrize(
+    "hidden,ispp", [(256, 32), (256, 64), (2048, 768), (5120, 320), (5120, 2560)]
+)
+@pytest.mark.parametrize("num_tokens", [1, 16, 512, 513, 1024, 1025, 8192])
+def test_fp8_channel_sm90_tiles_fit_and_stay_at_32_rows(
+    hidden: int, ispp: int, num_tokens: int
+) -> None:
+    from tokenspeed_kernel.ops.moe._triton import fp8_channel
+
+    config = fp8_channel._launch_config(num_tokens, hidden, ispp, sm90=True)
+    assert config["fc1_block_m"] <= 32
+    assert config["fc2_block_m"] <= 32
+    assert hidden % config["fc1_block_k"] == 0
+    assert hidden % config["fc2_block_n"] == 0
+    assert ispp % config["fc1_block_n"] == 0
+    assert ispp % config["fc2_block_k"] == 0
+
+
+@pytest.mark.parametrize(
+    "hidden,ispp", [(256, 96), (2048, 768), (5120, 320), (5120, 2560)]
+)
+@pytest.mark.parametrize("num_tokens", [513, 1025])
+def test_fp8_channel_moe_above_512_tokens_matches_fp64(
+    hidden: int, ispp: int, num_tokens: int
+) -> None:
+    _skip_unless_supported()
+    num_experts, top_k = 4, 2
+    layer = _layer(num_experts, hidden, ispp, 0, 1, seed=9)
+    generator = torch.Generator(device="cuda").manual_seed(num_tokens)
+    x = (torch.randn(num_tokens, hidden, device="cuda", generator=generator) * 2).to(
+        torch.bfloat16
+    )
+    logits = torch.randn(num_tokens, num_experts, device="cuda", generator=generator)
+    topk_weights, topk_ids = torch.topk(logits.softmax(dim=-1), top_k, dim=-1)
+    topk_weights = topk_weights.contiguous()
+    topk_ids = topk_ids.to(torch.int32).contiguous()
+
+    actual = kernel_moe_apply(
+        _plan(ispp=ispp, hidden=hidden),
+        x,
+        layer,
+        None,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+    )
+    expected = _moe_reference(
+        x,
+        layer.w13_weight,
+        layer.w13_weight_scale,
+        layer.w2_weight,
+        layer.w2_weight_scale,
+        topk_weights,
+        topk_ids,
+        0,
+    )
+    error = (actual.double() - expected).norm() / expected.norm().clamp(min=1e-30)
+    # FP32 accumulation order may flip a rare BF16 or E4M3 rounding.
+    assert error < 2e-3
+
+
 def test_fp8_channel_moe_graph_replay_matches_eager() -> None:
     _skip_unless_supported()
     hidden, ispp, num_experts, top_k, num_tokens = 256, 64, 4, 2, 7
@@ -297,7 +357,8 @@ def test_fp8_channel_moe_token_count_does_not_recompile() -> None:
         max_tokens, top_k, device="cuda", dtype=torch.float32, generator=generator
     )
     plan = _plan(ispp=ispp, hidden=hidden)
-    num_sms = torch.cuda.get_device_properties(x.device).multi_processor_count
+    device = torch.cuda.get_device_properties(x.device)
+    num_sms = device.multi_processor_count
 
     def run(tokens):
         return kernel_moe_apply(
@@ -311,7 +372,9 @@ def test_fp8_channel_moe_token_count_does_not_recompile() -> None:
 
     def key(tokens):
         routes = tokens * top_k
-        config = fp8_channel._launch_config(tokens, hidden, ispp)
+        config = fp8_channel._launch_config(
+            tokens, hidden, ispp, sm90=device.major == 9
+        )
         programs = (
             min(
                 config[f"{stage}_ctas_per_sm"] * num_sms,
