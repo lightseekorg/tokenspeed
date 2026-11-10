@@ -190,9 +190,14 @@ if _muse_spark_layer is not None:
         (``muse_spark_stuck_record``)."""
 
         def __init__(
-            self, grid: int, path: str | None, scratch: torch.Tensor, rank: int
+            self,
+            grid: int,
+            waves: int,
+            path: str | None,
+            scratch: torch.Tensor,
+            rank: int,
         ) -> None:
-            self._buf = _stuck.stuck_buffer(grid, path, scratch.data_ptr(), rank)
+            self._buf = _stuck.stuck_buffer(grid, waves, path, scratch.data_ptr(), rank)
             self.path = path
 
         @property
@@ -225,9 +230,9 @@ if _muse_spark_layer is not None:
         traits=_MUSE_TRAITS,
     )
     def gluon_muse_spark_stuck_record_gfx950(
-        *, grid: int, path: str | None, scratch: torch.Tensor, rank: int
+        *, grid: int, waves: int, path: str | None, scratch: torch.Tensor, rank: int
     ) -> _MuseSparkStuckRecord:
-        return _MuseSparkStuckRecord(grid, path, scratch, rank)
+        return _MuseSparkStuckRecord(grid, waves, path, scratch, rank)
 
 
 if _muse_spark_draft_layer is not None:

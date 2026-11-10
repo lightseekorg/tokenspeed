@@ -704,7 +704,7 @@ def _layer(rows, chain, full, tap=False, trace=False):
         trace_buf=(
             _zeros(plan.grid, int(trace_module.EVENTS), 8, dtype=_I64) if trace else None
         ),
-        stuck_rec=_zeros(256, 8, dtype=_I64), check_parity=False,
+        stuck_rec=_zeros(layer.STUCK_ROWS, 8, dtype=_I64), check_parity=False,
     )  # fmt: skip
 
 

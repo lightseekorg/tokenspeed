@@ -49,11 +49,12 @@ clock, read every ``Plan.poll_check`` retries only) and executes
 ``s_trap 2``. The runtime then reports a GPU exception and the process stops. A deadlock or a
 missing producer thus stops the server with an error instead of hanging it.
 
-Stuck-poll record: a mailbox made with a ``stuck`` buffer (``int64 [grid,
-STUCK_WORDS]``, host-visible) has each poll write, only when it gives up and
-before the trap, one record into its CTA's slot: the expected tag, the stale
-pair as observed and its address, the clock at the poll's first check and at
-the trap, the stale operand's index in the poll, and the record's offset. The host
+Stuck-poll record: a mailbox made with a ``stuck`` buffer (``int64
+[grid * waves + 1, STUCK_WORDS]``, host-visible) has each poll write, only
+when it gives up and before the trap, one record into its wave's slot: the
+expected tag, the stale pair as observed and its address, the clock at the
+poll's first check and at the trap, the stale operand's index in the poll,
+and the record's offset. The host
 decodes the region, row and offset from the address and the plan, and the
 step and layer from the tag (``stuck.decode``). Without a ``stuck`` buffer
 a poll writes nothing.
@@ -68,9 +69,9 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import LAYER_SLOTS as _SLO
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import POLL_TIMEOUT_MANTISSA
 
 LAYER_SLOTS = gl.constexpr(_SLOTS)  # the device copy of plan.LAYER_SLOTS
-# int64 words of a CTA's stuck-poll record: expected tag, observed pair, stale
+# int64 words of a wave's stuck-poll record: expected tag, observed pair, stale
 # pair address, clock at the first check, clock at the trap, the stale
-# operand's index in the poll, the record's byte offset (CTA * 64), unused.
+# operand's index in the poll, the record's byte offset (wave slot * 64), unused.
 STUCK_WORDS = 8
 STUCK_RECORD_BYTES = gl.constexpr(STUCK_WORDS * 8)  # the device copy
 
@@ -136,9 +137,8 @@ def _poll_constraints(groups):
 @gluon.constexpr_function
 def _poll_constraints_stuck(groups):
     """:func:`_poll_constraints` of a poll that writes a stuck-poll record:
-    the record buffer's address and the CTA's record offset in it (SGPR
-    pairs) come in before the spin flag, and the record's stores clobber
-    EXEC."""
+    the record buffer's address and the wave's record offset (SGPR pairs)
+    come in before the spin flag, and the record's stores clobber EXEC."""
     return (
         ("=&v",) * groups
         + ("=&v", "=&s", "=&s", "=&s", "=&s")
@@ -264,8 +264,8 @@ def _stuck_record(pairs, ptrs, tmp, lane, mask, tag, start, now, rec, slot, fail
     """The lines that write a stuck poll's record (see the module docstring)
     from the first lane of the first operand whose pair is stale, then wait
     for the stores to land: only the trap branch runs them. ``now`` holds the
-    clock of the check that trapped; ``slot`` is the CTA's record offset in
-    bytes (the kernel scales the CTA: v_lshl_add_u64 shifts by 4 at most).
+    clock of the check that trapped; ``slot`` is the wave's record offset in
+    bytes (the kernel scales the slot: v_lshl_add_u64 shifts by 4 at most).
     ``failed`` is None for tag checks, or per-pair atomic_poll failure bits."""
     lines = []
     for j, p in enumerate(pairs):
@@ -330,6 +330,17 @@ def _flag_stuck_asm(outputs, inputs):
 
 
 @gluon.jit
+def _stuck_slot():
+    # The wave's record offset in bytes. This layout gives each wave 64
+    # consecutive indices, so the value is wave-uniform: the compiler passes
+    # it to the asm's SGPR operand without a per-lane copy.
+    lanes = gl.arange(0, 64 * gl.num_warps(), lane_layout(gl.num_warps()))
+    return (
+        gl.program_id(0).to(gl.int64) * gl.num_warps() + lanes // 64
+    ) * STUCK_RECORD_BYTES
+
+
+@gluon.jit
 def _record_flag_timeout(ptrs, failed, tag, start, now, stuck):
     # asm: reuse the tagged poll's lane selection and ordered record stores.
     # Save EXEC separately: _stuck_record narrows it to the recording lane.
@@ -356,7 +367,7 @@ def _record_flag_timeout(ptrs, failed, tag, start, now, stuck):
             start,
             now,
             stuck.to(gl.int64, bitcast=True),
-            gl.program_id(0).to(gl.int64) * STUCK_RECORD_BYTES,
+            _stuck_slot(),
         ),
         (
             ptrs.type.with_element_ty(gl.int64),
@@ -446,8 +457,8 @@ def _poll_n(
             + (
                 tag.to(gl.int64) & 0xFFFFFFFF,
                 stuck.to(gl.int64, bitcast=True),
-                # The CTA's record, in bytes from the buffer's start.
-                gl.program_id(0).to(gl.int64) * STUCK_RECORD_BYTES,
+                # The wave's record, in bytes from the buffer's start.
+                _stuck_slot(),
                 schedule.poll_check(plan),
                 schedule.poll_timeout_shift(plan),
                 spin,

@@ -286,7 +286,7 @@ if is_cdna4():
             poll_timeout_shift=10,
         )
         scratch = torch.zeros(plan.scratch_pairs, dtype=torch.int64, device="cuda")
-        buf = stuck.stuck_buffer(plan.grid, sys.argv[1], scratch.data_ptr(), 3)
+        buf = stuck.stuck_buffer(plan.grid, 4, sys.argv[1], scratch.data_ptr(), 3)
         tag, old = launch_tag(5, 3), launch_tag(4, 3)
         for row in range(2):
             at = row * plan.row_pairs + plan.offset("want")
@@ -340,8 +340,66 @@ if is_cdna4():
         # The wait ran past the 0.11 ms timeout, by the realtime clock.
         assert rec["trap"] - rec["start"] >= POLL_TIMEOUT_MANTISSA << 10
         (line,) = stuck.decode(t, lambda layer: [plan] if layer == 3 else [])
-        assert "rank 3 CTA 1: stage s waited for region want row 1 pair 37" in line
+        assert (
+            "rank 3 CTA 1 wave 0: stage s waited for region want row 1 pair 37" in line
+        )
         assert "step 4 layer 3" in line and "step 5 layer 3" in line
+
+    # A trap may abort other waves before they record, even with a shared
+    # deadline. Exercise the real flag timeout recorder, then join the waves
+    # before the trap, so both completed records are guaranteed to survive.
+    _TWO_WAVE_RECORD = textwrap.dedent("""
+        import sys
+        import torch
+        from tokenspeed_kernel_amd._triton import gl, gluon
+        from tokenspeed_kernel_amd.ops.gfx950.monokernel import mailbox, stuck, trace
+
+        @gluon.jit
+        def _two_wave_kernel(scratch, rec):
+            lanes = gl.arange(0, 128, mailbox.lane_layout(2))
+            ptrs = scratch + lanes // 64
+            start = trace.now()
+            ready = gl.atomic_poll(
+                ptrs, gl.full((128,), (7 << 32) | 1, gl.int64, lanes.type.layout),
+                sem="relaxed", scope="gpu",
+                timeout_ns=gl.full((), 112640, gl.int64),
+            )
+            now = trace.now()
+            mailbox._record_flag_timeout(
+                ptrs, ~ready, gl.full((), 7, gl.int32), start, now, rec
+            )
+            # The recorder drains system-scope stores; all waves must finish
+            # their records before any wave stops the process.
+            gl.barrier()
+            mailbox._trap()
+
+        scratch = torch.zeros(2, dtype=torch.int64, device="cuda")
+        buf = stuck.stuck_buffer(1, 2, sys.argv[1], scratch.data_ptr(), 0)
+        _two_wave_kernel[(1,)](scratch, buf.tensor, num_warps=2)
+        torch.cuda.synchronize()
+        print("the poll returned")
+        """)
+
+    def test_two_stuck_waves_keep_distinct_records_before_trapping(tmp_path):
+        script = tmp_path / "two_wave_record.py"
+        script.write_text(_TWO_WAVE_RECORD)
+        path = tmp_path / "two_wave.bin"
+        result = subprocess.run(
+            [sys.executable, str(script), str(path)],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        assert result.returncode != 0
+        assert "the poll returned" not in result.stdout
+        assert _trapped(result.stderr), result.stderr
+        t = stuck.read_file(str(path))
+        head = stuck.header(t)
+        recs = stuck.records(t)
+        assert [(r["cta"], r["wave"]) for r in recs] == [(0, 0), (0, 1)]
+        assert [(r["address"] - head["scratch_ptr"]) // 8 for r in recs] == [0, 1]
+        assert all(r["expected"] == 7 and r["observed"] == 0 for r in recs)
+        assert all(r["trap"] > r["start"] for r in recs)
 
     # Flags have a known payload as well as a tag. One never-raised flag
     # retains either zero or the current tag with a zero payload.
@@ -376,7 +434,7 @@ if is_cdna4():
             poll_timeout_shift=10,
         )
         scratch = torch.zeros(plan.scratch_pairs, dtype=torch.int64, device="cuda")
-        buf = stuck.stuck_buffer(plan.grid, sys.argv[1], scratch.data_ptr(), 3)
+        buf = stuck.stuck_buffer(plan.grid, 4, sys.argv[1], scratch.data_ptr(), 3)
         tag = launch_tag(5, 3)
         for row in range(2):
             at = row * plan.row_pairs + plan.offset("flag")

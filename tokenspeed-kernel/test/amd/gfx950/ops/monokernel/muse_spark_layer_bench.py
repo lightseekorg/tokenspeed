@@ -406,7 +406,7 @@ def worker(rank: int, port: int, args) -> None:
     # With --stuck-dir it is a file, which outlives a trap, and a sidecar
     # describes the launches for ``muse_spark.stuck_report``.
     path = f"{args.stuck_dir}/rank{rank}.rec" if args.stuck_dir else None
-    stuck_rec = stuck.stuck_buffer(256, path, scratch.data_ptr(), rank).tensor
+    stuck_rec = stuck.stuck_buffer(256, 8, path, scratch.data_ptr(), rank).tensor
     if path is not None:
         kind = {"full": args.full}
         with open(f"{path}.json", "w") as f:

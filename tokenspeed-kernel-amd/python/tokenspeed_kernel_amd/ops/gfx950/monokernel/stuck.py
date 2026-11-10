@@ -21,18 +21,18 @@
 """Stuck-poll records (see ``mailbox``): the host-visible buffer a launch's
 polls write into when they give up, and their decoding.
 
-A record is ``mailbox.STUCK_WORDS`` int64 words a CTA: the expected tag, the
+A record is ``mailbox.STUCK_WORDS`` int64 words a wave: the expected tag, the
 stale pair as observed, the pair's address, the realtime clock at the
 poll's first check and at the trap, the stale operand's index in the poll,
-and its CTA's record offset. A record whose tag word is zero is empty (a tag is
-never zero).
+and its wave's record offset. A record whose tag word is zero is empty
+(a tag is never zero).
 
 The buffer is pinned host memory, or a file mapped and registered as host
 memory (``path``): the GPU's system-scope stores land in the file's pages,
-so a record outlives a process that the trap took down. Its row ``grid``
-(past the CTAs' records) is a header the host writes: a magic number, the
-scratch buffer's address, the rank and the process id, so a file decodes
-on its own (with the plan).
+so a record outlives a process that the trap took down. Its final row
+(past ``grid * waves`` record rows) is a header the host writes: a magic
+number, the scratch buffer's address, the rank, the process id and the
+waves per CTA, so a file decodes on its own (with the plan).
 """
 
 from __future__ import annotations
@@ -54,27 +54,37 @@ MAGIC = int.from_bytes(b"STUCKREC", "little")
 
 @dataclass
 class StuckBuffer:
-    """A stuck-poll record buffer: ``tensor`` (int64 ``[grid, STUCK_WORDS]``,
-    CPU, device-accessible) and, for a file-backed buffer, its ``path``."""
+    """A stuck-poll record buffer: ``tensor`` (int64
+    ``[grid * waves + 1, STUCK_WORDS]``, CPU, device-accessible) and, for a
+    file-backed buffer, its ``path``."""
 
     tensor: torch.Tensor
     path: str | None
     _map: mmap.mmap | None
 
 
+def buffer_rows(grid: int, waves: int) -> int:
+    """Rows of a record buffer for ``grid`` CTAs of ``waves`` waves: a record per
+    wave, then the header row."""
+    return grid * waves + 1
+
+
 def stuck_buffer(
-    grid: int, path: str | None, scratch_ptr: int, rank: int
+    grid: int, waves: int, path: str | None, scratch_ptr: int, rank: int
 ) -> StuckBuffer:
-    """A zeroed record buffer for launches of up to ``grid`` CTAs with the
-    header row (``scratch_ptr``: the mailbox scratch's address, ``rank``):
+    """A zeroed record buffer for up to ``grid`` CTAs, ``waves`` waves per CTA
+    (the launch's ``num_warps``), plus a final header row (``scratch_ptr``:
+    the mailbox scratch's address, ``rank``: the process's rank):
     pinned host memory, or (``path``) a file of that name mapped and
     registered as host memory, which keeps the records after the process
     dies. Pass ``tensor`` to the launches whole."""
-    rows = grid + 1
+    if waves < 1:
+        raise ValueError("waves must be positive")
+    rows = buffer_rows(grid, waves)
     nbytes = rows * STUCK_WORDS * 8
     if path is None:
         t = torch.zeros((rows, STUCK_WORDS), dtype=torch.int64, pin_memory=True)
-        t[grid, :4] = torch.tensor([MAGIC, scratch_ptr, rank, os.getpid()])
+        t[-1, :5] = torch.tensor([MAGIC, scratch_ptr, rank, os.getpid(), waves])
         return StuckBuffer(t, None, None)
     with open(path, "wb") as f:
         f.truncate(nbytes)
@@ -84,7 +94,7 @@ def stuck_buffer(
     finally:
         os.close(fd)
     t = torch.frombuffer(m, dtype=torch.int64).view(rows, STUCK_WORDS)
-    t[grid, :4] = torch.tensor([MAGIC, scratch_ptr, rank, os.getpid()])
+    t[-1, :5] = torch.tensor([MAGIC, scratch_ptr, rank, os.getpid(), waves])
     ptr = ctypes.c_void_p(t.data_ptr())
     err = torch.cuda.cudart().cudaHostRegister(ptr.value, nbytes, 0)
     if int(err) != 0:
@@ -112,22 +122,28 @@ def read_file(path: str) -> torch.Tensor:
 
 
 def header(t: torch.Tensor) -> dict:
-    """The header row of buffer ``t``: ``scratch_ptr``, ``rank``, ``pid``."""
+    """The header row of buffer ``t``: ``scratch_ptr``, ``rank``, ``pid``,
+    ``waves``."""
     w = t[-1].tolist()
     if w[0] != MAGIC:
         raise ValueError("not a stuck-poll record buffer")
-    return {"scratch_ptr": w[1], "rank": w[2], "pid": w[3]}
+    waves = w[4]
+    if waves < 1 or (len(t) - 1) % waves:
+        raise ValueError("invalid stuck-poll wave count")
+    return {"scratch_ptr": w[1], "rank": w[2], "pid": w[3], "waves": waves}
 
 
 def records(t: torch.Tensor) -> list[dict]:
-    """The non-empty records of buffer ``t``, by CTA."""
+    """The non-empty records of buffer ``t``, by CTA and wave."""
+    waves = header(t)["waves"]
     out = []
-    for cta, w in enumerate(t[:-1].tolist()):
+    for slot, w in enumerate(t[:-1].tolist()):
         if w[0] == 0:
             continue
         out.append(
             {
-                "cta": cta,
+                "cta": slot // waves,
+                "wave": slot % waves,
                 "expected": w[0] & 0xFFFFFFFF,
                 "observed": (w[1] >> 32) & 0xFFFFFFFF,
                 "payload": w[1] & 0xFFFFFFFF,
@@ -222,7 +238,7 @@ def describe(rec: dict, plan: Plan | None, scratch_ptr: int, rank: int) -> str:
         else f"tag {rec['observed']} (step {ostep} layer {olayer}), payload {rec['payload']:#x}"
     )
     return (
-        f"rank {rank} CTA {rec['cta']}: stage {stage} waited for "
+        f"rank {rank} CTA {rec['cta']} wave {rec['wave']}: stage {stage} waited for "
         f"{place}: expected tag {rec['expected']} (step {step} layer {layer}, "
         f"parity {layer & 1}), saw {seen}; waited {waited:.1f} s from clock "
         f"{rec['start']} (operand {rec['operand']})"
@@ -263,7 +279,7 @@ def _ranges(values: list[int]) -> str:
 def summarize(t: torch.Tensor, plan_of) -> list[str]:
     """:func:`decode` with the records of one wait grouped: the same plan,
     stage, region, copy and tags (any rows). A group prints its earliest
-    record, then how many CTAs waited there in all, on which rows and
+    record, then how many waves and CTAs waited there in all, on which rows and
     pairs.
 
     Groups come in plan order of their stages, then of their first check:
@@ -301,7 +317,8 @@ def summarize(t: torch.Tensor, plan_of) -> list[str]:
             located = [m[2] for m in members if m[2] is not None]
             span = (members[-1][0]["start"] - rec["start"]) / TICKS_PER_SECOND * 1e6
             lines.append(
-                f"  {len(members)} CTAs in all ({ctas})"
+                f"  {len(members)} waves on {len(set(m[0]['cta'] for m in members))} "
+                f"CTAs in all ({ctas})"
                 + (
                     f" on rows {_ranges([w[1] for w in located])}, pairs "
                     f"{_ranges([w[2] for w in located])}"

@@ -44,6 +44,7 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel import (
     code_warm,
     mailbox,
     schedule,
+    stuck,
     trace,
     warm,
 )
@@ -189,6 +190,11 @@ WARM_TASKS = 64
 # CTAs 0 .. CODE_TASKS - 1 first read the launch's own code into the L2s
 # (code_warm.py): 8 tasks on each XCD.
 CODE_TASKS = 64
+
+
+# Rows of a launch's stuck-poll record buffer: a record per wave of the
+# layer's 256 CTAs of 8 waves (its grid and num_warps), then the header.
+STUCK_ROWS = stuck.buffer_rows(256, 8)
 
 
 def layer_plan(
@@ -871,9 +877,12 @@ def launch_gluon_muse_spark_layer_gfx950(
             q | k | v projection of its output rows, stored there for the
             next launch's ``proj_in``.
         trace_buf: None, or a trace buffer (``trace.py``).
-        stuck_rec: None, or a host-visible ``int64 [256, mailbox.STUCK_WORDS]``
-            stuck-poll record buffer: a poll that gives up writes what it
-            waited for there before it traps (``stuck.decode`` reads it).
+        stuck_rec: None, or a host-visible ``int64 [STUCK_ROWS,
+            mailbox.STUCK_WORDS]`` stuck-poll record buffer (a record per wave
+            of the 256 CTAs of 8 waves, then the header;
+            ``stuck.stuck_buffer(256, 8, ...)``): a poll that gives up writes
+            what it waited for there before it traps (``stuck.decode`` reads
+            it).
         check_parity: Trap when this launch's parity (``layer & 1``) repeats
             the last launch's on this rank (tests and benches; serving may
             run a regular layer between two same-parity launches).
@@ -952,6 +961,8 @@ def launch_gluon_muse_spark_layer_gfx950(
         or not 0 <= tap_slot < tap.shape[1]
     ):
         raise ValueError(f"tap: contiguous BF16 [>={rows}, slots, 8192], a slot in it")
+    if stuck_rec is not None and stuck_rec.shape[0] < STUCK_ROWS:
+        raise ValueError(f"stuck_rec: int64 [>= {STUCK_ROWS}, STUCK_WORDS]")
     attn_ops, table_stride, moe_ops = weights.kernel_args(
         h=h,
         a=a,

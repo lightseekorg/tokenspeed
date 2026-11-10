@@ -95,8 +95,10 @@ MAX_REQUESTS = 1
 CHAIN_ROWS = 8  # a request's rows at most
 MAX_ROWS = MAX_REQUESTS * CHAIN_ROWS
 WORLD = 8
-# CTAs of a layer launch (layer.layer_plan), each with a stuck-poll record.
+# CTAs of a layer launch (layer.layer_plan) and waves of each (its num_warps):
+# one stuck-poll record per wave.
 GRID = 256
+WAVES = 8
 HIDDEN = 8192
 OWNED = HIDDEN // WORLD
 PAGE_SIZE = 64
@@ -429,7 +431,7 @@ class MuseSparkMonokernelState(MonokernelState):
         if path is not None:
             os.makedirs(record_dir, exist_ok=True)
         self.stuck = muse_spark_stuck_record(
-            grid=GRID, path=path, scratch=self.scratch, rank=rank
+            grid=GRID, waves=WAVES, path=path, scratch=self.scratch, rank=rank
         )
         # A draft's taps: the residual entering each captured layer, BF16, in
         # the layout of the concatenated captures (row, tap, column). The

@@ -210,9 +210,11 @@ def muse_spark_layer_decode(
             the launch ends with ``warm_next``'s q | k | v projection of the
             rows it outputs, for the next launch's ``proj_in`` (in place of
             warming its weights). The results are the same bits either way.
-        stuck_rec: None, or a host-visible int64 ``[256, 8]`` buffer (pinned
-            or host-registered memory): a poll that gives up writes what it
-            waited for there before the launch traps.
+        stuck_rec: None, or a host-visible int64 ``[256 * 8 + 1, 8]`` buffer
+            (a record per wave of the 256 CTAs of 8 waves, then a header; in
+            pinned or host-registered memory, ``muse_spark_stuck_record``): a
+            poll that gives up writes what it waited for there before the
+            launch traps.
         compile_only: Only compile the launch for these operands, without
             running it. A launch polls its peers' values for about a minute
             before it traps, so a rank that compiles much longer than its
@@ -586,6 +588,7 @@ import tokenspeed_kernel.ops.model.muse_spark.monokernel.gluon  # noqa: E402,F40
 def muse_spark_stuck_record(
     *,
     grid: int,
+    waves: int,
     path: str | None,
     scratch: torch.Tensor,
     rank: int,
@@ -597,6 +600,7 @@ def muse_spark_stuck_record(
 
     Args:
         grid: The launches' CTAs (at most).
+        waves: Waves per CTA (the launches' num_warps).
         path: None (pinned memory, readable while the process lives), or a
             file to map, which keeps the records after the process dies.
         scratch: The launches' mailbox scratch (its address goes into the
@@ -613,4 +617,4 @@ def muse_spark_stuck_record(
         launches they ran).
     """
     make = _select("muse_spark_stuck_record", 1, override)
-    return make(grid=grid, path=path, scratch=scratch, rank=rank)
+    return make(grid=grid, waves=waves, path=path, scratch=scratch, rank=rank)

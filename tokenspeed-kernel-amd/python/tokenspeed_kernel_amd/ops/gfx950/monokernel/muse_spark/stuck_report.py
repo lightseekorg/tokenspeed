@@ -73,8 +73,9 @@ def plans_of(
 def describe(
     t: torch.Tensor, layers: dict[int, dict], launches, check_parity: bool
 ) -> list[str]:
-    """The records of buffer ``t`` decoded under the launches' plans, one
-    group a wait, the first stalled wait first (:func:`stuck.summarize`)."""
+    """The records of buffer ``t`` (by CTA and wave) decoded under the
+    launches' plans, one group a wait, the first stalled wait first
+    (:func:`stuck.summarize`)."""
     return stuck.summarize(
         t, plans_of(layers, [tuple(x) for x in launches], check_parity)
     )

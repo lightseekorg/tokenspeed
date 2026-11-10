@@ -42,6 +42,7 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import (  # noqa: E402
 
 SCRATCH = 1 << 20
 GRID = 8
+WAVES = 8
 
 
 def _plan() -> Plan:
@@ -61,15 +62,16 @@ def _plan() -> Plan:
 
 
 def _buffer(plan: Plan, waits) -> torch.Tensor:
-    """A record buffer of ``waits``: (cta, region, row, pair, first check)."""
-    t = torch.zeros(GRID + 1, STUCK_WORDS, dtype=torch.int64)
-    t[GRID, :4] = torch.tensor([stuck.MAGIC, SCRATCH, 0, 1])
-    for cta, region, row, pair, start in waits:
+    """A record buffer of ``waits``: (cta, wave, region, row, pair, first check)."""
+    t = torch.zeros(GRID * WAVES + 1, STUCK_WORDS, dtype=torch.int64)
+    t[-1, :5] = torch.tensor([stuck.MAGIC, SCRATCH, 0, 1, WAVES])
+    for cta, wave, region, row, pair, start in waits:
+        slot = cta * WAVES + wave
         at = plan.offset(region) + row * plan.row_pairs + pair
-        t[cta, 0] = launch_tag(5, 3)
-        t[cta, 2] = SCRATCH + 8 * at
-        t[cta, 3] = start
-        t[cta, 4] = start + 60 * stuck.TICKS_PER_SECOND
+        t[slot, 0] = launch_tag(5, 3)
+        t[slot, 2] = SCRATCH + 8 * at
+        t[slot, 3] = start
+        t[slot, 4] = start + 60 * stuck.TICKS_PER_SECOND
     return t
 
 
@@ -80,28 +82,62 @@ def test_summary_groups_a_wait_and_leads_with_the_earliest_stage():
     t = _buffer(
         plan,
         [
-            (6, "y", 0, 1, 100),
-            (7, "y", 1, 1, 101),
-            (2, "x", 0, 3, 200),
-            (3, "x", 1, 5, 201),
+            (6, 0, "y", 0, 1, 100),
+            (7, 0, "y", 1, 1, 101),
+            (2, 0, "x", 0, 3, 200),
+            (3, 0, "x", 1, 5, 201),
         ],
     )
     lines = stuck.summarize(t, lambda layer: [plan] if layer == 3 else [])
     assert len(lines) == 4
-    assert lines[0].startswith("rank 0 CTA 2: stage b waited for region x row 0 pair 3")
-    assert lines[1].startswith("  2 CTAs in all (2-3) on rows 0-1, pairs 3, 5")
-    assert lines[2].startswith("rank 0 CTA 6: stage c waited for region y row 0 pair 1")
-    assert lines[3].startswith("  2 CTAs in all (6-7) on rows 0-1, pairs 1")
+    assert lines[0].startswith(
+        "rank 0 CTA 2 wave 0: stage b waited for region x row 0 pair 3"
+    )
+    assert lines[1].startswith(
+        "  2 waves on 2 CTAs in all (2-3) on rows 0-1, pairs 3, 5"
+    )
+    assert lines[2].startswith(
+        "rank 0 CTA 6 wave 0: stage c waited for region y row 0 pair 1"
+    )
+    assert lines[3].startswith("  2 waves on 2 CTAs in all (6-7) on rows 0-1, pairs 1")
 
 
 def test_a_wait_with_no_reading_stage_names_the_cta_tasks():
     plan = _plan()
     # CTA 0 runs only a, which reads nothing: a record there decoded under
     # this plan (another launch's layout, say) names the CTA's tasks.
-    t = _buffer(plan, [(0, "y", 1, 2, 100)])
+    t = _buffer(plan, [(0, 0, "y", 1, 2, 100)])
     (line,) = stuck.summarize(t, lambda layer: [plan])
     assert line.startswith(
-        "rank 0 CTA 0: stage ? (no stage that reads y runs on CTA 0; its tasks "
+        "rank 0 CTA 0 wave 0: stage ? (no stage that reads y runs on CTA 0; its tasks "
         f"under the plan of 2 rows, chain 1, {plan.row_pairs} pairs a row: a#0) "
         "waited for region y row 1 pair 2"
     )
+
+
+def test_two_waves_of_one_cta_decode_distinct_pairs_and_use_cta_for_stage(tmp_path):
+    plan = _plan()
+    t = _buffer(plan, [(2, 1, "x", 0, 3, 200), (2, 7, "x", 1, 5, 201)])
+    path = tmp_path / "waves.bin"
+    path.write_bytes(t.numpy().tobytes())
+    t = stuck.read_file(str(path))
+    assert stuck.header(t)["waves"] == WAVES
+    recs = stuck.records(t)
+    assert [(r["cta"], r["wave"]) for r in recs] == [(2, 1), (2, 7)]
+    assert [stuck.locate(plan, (r["address"] - SCRATCH) // 8) for r in recs] == [
+        ("x", 0, 3, 0),
+        ("x", 1, 5, 0),
+    ]
+    lines = stuck.decode(t, lambda layer: [plan])
+    assert "CTA 2 wave 1: stage b waited for region x row 0 pair 3" in lines[0]
+    assert "CTA 2 wave 7: stage b waited for region x row 1 pair 5" in lines[1]
+    summary = stuck.summarize(t, lambda layer: [plan])
+    assert summary[1].startswith("  2 waves on 1 CTAs in all (2) on rows 0-1")
+
+
+@pytest.mark.parametrize("waves", [-1, 0, 3])
+def test_invalid_header_wave_count_is_rejected(waves):
+    t = _buffer(_plan(), [])
+    t[-1, 4] = waves
+    with pytest.raises(ValueError, match="wave count"):
+        stuck.records(t)

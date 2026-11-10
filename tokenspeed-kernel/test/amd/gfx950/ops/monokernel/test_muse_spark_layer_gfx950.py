@@ -1206,3 +1206,40 @@ def test_the_packer_refuses_experts_past_a_buffer_loads_offset():
 
     assert "w13 spans past 2^31 bytes" in refusal(past)
     assert "w13" not in refusal(at_bound)
+
+
+@pytest.mark.parametrize("rows", [layer.STUCK_ROWS - 1, 256 + 1])
+def test_the_launcher_refuses_a_stuck_buffer_without_a_record_per_wave(rows):
+    """A stuck-poll buffer must hold a record for every wave of the launch
+    (256 CTAs of 8 waves) and the header row: a per-CTA buffer is refused
+    before anything compiles."""
+    f32, bf16, i32 = torch.float32, torch.bfloat16, torch.int32
+    with pytest.raises(ValueError, match="stuck_rec"):
+        layer.launch_gluon_muse_spark_layer_gfx950(
+            None,
+            h=torch.zeros(1, 1024, dtype=f32),
+            a=torch.zeros(1, 8192, dtype=bf16),
+            h_out=torch.zeros(1, 1024, dtype=f32),
+            a_out=torch.zeros(1, 8192, dtype=bf16),
+            seq_len=torch.ones(1, dtype=i32),
+            slot=torch.zeros(1, dtype=i32),
+            page_table=torch.zeros(1, 16, dtype=i32),
+            k_cache=torch.zeros(16, 64, 2, 64, dtype=bf16),
+            v_cache=torch.zeros(16, 64, 2, 64, dtype=bf16),
+            cos_sin=torch.zeros(64, 64, dtype=f32),
+            scratch=None,
+            step=None,
+            peer_bases=None,
+            layer=1,
+            chain=1,
+            whole_rows=False,
+            tap=None,
+            tap_slot=None,
+            warm_next=None,
+            proj_in=None,
+            proj_out=None,
+            trace_buf=None,
+            stuck_rec=torch.zeros(rows, 8, dtype=torch.int64),
+            check_parity=False,
+            compile_only=True,
+        )
