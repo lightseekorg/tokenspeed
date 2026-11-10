@@ -45,6 +45,18 @@ def rows(plan):
 
 
 @gluon.constexpr_function
+def poll_check(plan):
+    """Retries between tagged-poll clock checks."""
+    return plan.plan.poll_check
+
+
+@gluon.constexpr_function
+def poll_timeout_shift(plan):
+    """Shift of the poll timeout's fixed mantissa (11), in 100 MHz ticks."""
+    return plan.plan.poll_timeout_shift
+
+
+@gluon.constexpr_function
 def chain(plan):
     """Consecutive rows that are one request's tokens (``Plan.chain``)."""
     return plan.plan.chain
@@ -182,6 +194,8 @@ __all__ = [
     "head_sleep",
     "is_peer",
     "peer_copy",
+    "poll_check",
+    "poll_timeout_shift",
     "region",
     "row_pairs",
     "row_task",

@@ -54,6 +54,7 @@ if is_cdna4():
         PRODUCERS: gl.constexpr,
         PER: gl.constexpr,
         CONSUMERS: gl.constexpr,
+        PLAN: gl.constexpr,
     ):
         # Producers sit on the highest CTAs, consumers on the lowest: a
         # consumer waits on CTAs that start after it.
@@ -71,14 +72,14 @@ if is_cdna4():
             )
             # One hint per producer: its last pair.
             hint = gl.minimum(lanes, PRODUCERS - 1) * PER + PER - 1
-            mailbox.pre_poll(scratch, hint, tag)
+            mailbox.pre_poll(scratch, hint, tag, PLAN)
             total: gl.constexpr = PRODUCERS * PER
             per_thread: gl.constexpr = total // (64 * gl.num_warps())
             layout2: gl.constexpr = gl.BlockedLayout(
                 [per_thread], [64], [gl.num_warps()], [0]
             )
             j = gl.arange(0, total, layout2)
-            got = mailbox.poll(scratch, j, tag)
+            got = mailbox.poll(scratch, j, tag, PLAN)
             expect = (j // PER) * 65536 + j % PER + tag
             gl.store(bad + pid, gl.sum((got != expect).to(gl.int32), axis=0))
 
@@ -107,7 +108,14 @@ if is_cdna4():
             step.fill_(value)
             bad.fill_(-1)
             _exchange_kernel[(grid,)](
-                scratch, step, bad, producers, per, consumers, num_warps=8
+                scratch,
+                step,
+                bad,
+                producers,
+                per,
+                consumers,
+                Plan(grid=grid, stages=(), regions=(), rows=1, chain=1).key,
+                num_warps=8,
             )
             torch.cuda.synchronize()
             assert bad[:consumers].tolist() == [0] * consumers
@@ -124,14 +132,21 @@ if is_cdna4():
         assert launch_tag(value, 3) >= 1 << 31
         step = torch.full((1,), value, dtype=torch.int32, device="cuda")
         _exchange_kernel[(grid,)](
-            scratch, step, bad, producers, per, consumers, num_warps=8
+            scratch,
+            step,
+            bad,
+            producers,
+            per,
+            consumers,
+            Plan(grid=grid, stages=(), regions=(), rows=1, chain=1).key,
+            num_warps=8,
         )
         torch.cuda.synchronize()
         assert bad[:consumers].tolist() == [0] * consumers
         assert (int(scratch[0].item()) >> 32) & 0xFFFFFFFF == launch_tag(value, 3)
 
     @gluon.jit
-    def _waves_kernel(scratch, step_ptr, out, SPIN: gl.constexpr):
+    def _waves_kernel(scratch, step_ptr, out, SPIN: gl.constexpr, PLAN: gl.constexpr):
         # CTA 1 publishes pairs 0 .. 1023. CTA 0's waves below SPIN poll two
         # tensors of them; the other waves point at pairs that no one writes.
         pid = gl.program_id(0)
@@ -150,6 +165,7 @@ if is_cdna4():
                 ),
                 tag,
                 spin.to(gl.int32),
+                PLAN,
             )
             gl.store(out + lanes, first, mask=spin)
             gl.store(out + 512 + lanes, second, mask=spin)
@@ -159,7 +175,14 @@ if is_cdna4():
         out = torch.full((1024,), -1, dtype=torch.int32, device="cuda")
         step = torch.full((1,), 5, dtype=torch.int32, device="cuda")
         # The waves past 3 would wait for ever on pairs that no CTA writes.
-        _waves_kernel[(2,)](scratch, step, out, 3, num_warps=8)
+        _waves_kernel[(2,)](
+            scratch,
+            step,
+            out,
+            3,
+            Plan(grid=2, stages=(), regions=(), rows=1, chain=1).key,
+            num_warps=8,
+        )
         torch.cuda.synchronize()
         tag = launch_tag(5, 3)
         lanes = torch.arange(192)
@@ -175,22 +198,22 @@ if is_cdna4():
         import torch
         from tokenspeed_kernel_amd._triton import gl, gluon
         from tokenspeed_kernel_amd.ops.gfx950.monokernel import mailbox
-
-        mailbox.POLL_CHECK = 64
-        mailbox.POLL_TIMEOUT_SHIFT = 10
+        from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import Plan
 
         @gluon.jit
-        def _stuck_kernel(scratch, step_ptr, out):
+        def _stuck_kernel(scratch, step_ptr, out, PLAN: gl.constexpr):
             tag = mailbox.launch_tag(step_ptr, 0)
             lanes = gl.arange(
                 0, 64 * gl.num_warps(), mailbox.lane_layout(gl.num_warps())
             )
-            gl.store(out + lanes, mailbox.poll(scratch, lanes, tag))
+            gl.store(out + lanes, mailbox.poll(scratch, lanes, tag, PLAN))
 
         scratch = torch.zeros(256, dtype=torch.int64, device="cuda")
         step = torch.zeros(1, dtype=torch.int32, device="cuda")
         out = torch.zeros(256, dtype=torch.int32, device="cuda")
-        _stuck_kernel[(1,)](scratch, step, out, num_warps=4)
+        plan = Plan(grid=1, stages=(), regions=(), rows=1, chain=1,
+                    poll_check=64, poll_timeout_shift=10)
+        _stuck_kernel[(1,)](scratch, step, out, plan.key, num_warps=4)
         torch.cuda.synchronize()
         print("the poll returned")
         """)
@@ -240,9 +263,6 @@ if is_cdna4():
             launch_tag,
         )
 
-        mailbox.POLL_CHECK = 64
-        mailbox.POLL_TIMEOUT_SHIFT = 10
-
         @gluon.jit
         def _stuck_kernel(scratch, step_ptr, rec, out, PLAN: gl.constexpr):
             mb = mailbox.Mailbox(
@@ -261,6 +281,8 @@ if is_cdna4():
             rows=2,
             chain=1,
             external=("want",),
+            poll_check=64,
+            poll_timeout_shift=10,
         )
         scratch = torch.zeros(plan.scratch_pairs, dtype=torch.int64, device="cuda")
         buf = stuck.stuck_buffer(plan.grid, sys.argv[1], scratch.data_ptr(), 3)
@@ -299,6 +321,8 @@ if is_cdna4():
             rows=2,
             chain=1,
             external=("want",),
+            poll_check=64,
+            poll_timeout_shift=10,
         )
         t = stuck.read_file(str(path))
         head = stuck.header(t)
@@ -331,8 +355,6 @@ if is_cdna4():
             launch_tag,
         )
 
-        mailbox.POLL_TIMEOUT_SHIFT = 10
-
         @gluon.jit
         def _stuck_flag_kernel(scratch, step_ptr, rec, PLAN: gl.constexpr):
             mb = mailbox.Mailbox(
@@ -350,6 +372,7 @@ if is_cdna4():
             rows=2,
             chain=1,
             external=("flag",),
+            poll_timeout_shift=10,
         )
         scratch = torch.zeros(plan.scratch_pairs, dtype=torch.int64, device="cuda")
         buf = stuck.stuck_buffer(plan.grid, sys.argv[1], scratch.data_ptr(), 3)
@@ -388,6 +411,7 @@ if is_cdna4():
             rows=2,
             chain=1,
             external=("flag",),
+            poll_timeout_shift=10,
         )
         t = stuck.read_file(str(path))
         head = stuck.header(t)

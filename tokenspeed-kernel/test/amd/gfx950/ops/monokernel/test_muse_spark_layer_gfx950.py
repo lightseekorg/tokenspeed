@@ -1056,14 +1056,9 @@ def test_the_bench_stands_in_for_the_absent_ranks_flags_as_raised(
 # after ~14 ms (11 << 17 ticks of the 100 MHz clock), far past any wait of a
 # ~100 us launch, so a segment the bench misses fails the run at once
 # instead of after a minute. The mp.spawn worker runs this file as its main
-# module, so it shortens the timeout too, before it compiles.
+# module; the CLI carries the bound into each worker's compile-time plan.
 _ONE_GPU_BENCH = textwrap.dedent("""
     import sys
-    from tokenspeed_kernel_amd.ops.gfx950.monokernel import mailbox
-
-    mailbox.POLL_CHECK = 64
-    mailbox.POLL_TIMEOUT_SHIFT = 17
-
     if __name__ == "__main__":
         import muse_spark_layer_bench
 
@@ -1084,10 +1079,11 @@ def test_one_gpu_bench_launches_find_every_absent_rank_segment(
     script = tmp_path / "one_gpu_bench.py"  # a spawned worker needs a file
     script.write_text(_ONE_GPU_BENCH)
     args = ["--gpus", "1", "--kv-dtype", "fp8", "--length", "3000"]
+    args += ["--poll-check", "64", "--poll-timeout-shift", "17"]
     args += ["--rows", str(rows), "--requests", str(requests)]
     args += ["--distinct", "0", "--replays", "1", "--stuck-dir", str(tmp_path)]
     args += ["--full"] if full else []
-    # A cache of its own: the short timeout is in the compiled code. The
+    # The short timeout is part of the plan key, safe in a shared cache. The
     # script runs from tmp_path, so this directory (the bench and its
     # helpers) and the test utilities go on its path.
     here = os.path.dirname(os.path.abspath(__file__))
@@ -1095,7 +1091,7 @@ def test_one_gpu_bench_launches_find_every_absent_rank_segment(
     path = os.pathsep.join(
         p for p in (here, utils_dir, os.environ.get("PYTHONPATH")) if p
     )
-    env = dict(os.environ, TRITON_CACHE_DIR=str(tmp_path / "cache"), PYTHONPATH=path)
+    env = dict(os.environ, PYTHONPATH=path)
     result = subprocess.run(
         [sys.executable, str(script), *args],
         capture_output=True,

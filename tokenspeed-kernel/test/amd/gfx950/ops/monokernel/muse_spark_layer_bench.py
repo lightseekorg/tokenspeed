@@ -349,6 +349,8 @@ def worker(rank: int, port: int, args) -> None:
         warm_next=False,
         own_qkvg=not args.shift,
         next_qkvg=args.shift,
+        poll_check=args.poll_check,
+        poll_timeout_shift=args.poll_timeout_shift,
         check_parity=True,  # as the launches
     )
     proj = torch.zeros(2, R, int(PROJ_WORDS), dtype=torch.int32, device=dev)
@@ -657,6 +659,18 @@ def main() -> None:
         "18-56); 0 keeps --route-seed",
     )
     p.add_argument("--route-seed", type=int, default=7, help="router bias seed")
+    p.add_argument(
+        "--poll-check",
+        type=int,
+        default=plan_mod.DEFAULT_POLL_CHECK,
+        help="retries between tagged-poll clock checks (compile-time)",
+    )
+    p.add_argument(
+        "--poll-timeout-shift",
+        type=int,
+        default=plan_mod.DEFAULT_POLL_TIMEOUT_SHIFT,
+        help="poll timeout: 11 << shift ticks at 100 MHz (compile-time)",
+    )
     p.add_argument("--replays", type=int, default=15)
     p.add_argument(
         "--shift",

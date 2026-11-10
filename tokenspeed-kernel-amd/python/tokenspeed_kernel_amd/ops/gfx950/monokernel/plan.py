@@ -53,6 +53,10 @@ from dataclasses import asdict, dataclass, field
 # never write the same cache line.
 REGION_ALIGN_PAIRS = 32
 
+# Production poll bound: check every ~0.5 ms and trap after about 59 s.
+DEFAULT_POLL_CHECK = 4096
+DEFAULT_POLL_TIMEOUT_SHIFT = 29
+
 
 def _aligned(pairs: int) -> int:
     return -(-pairs // REGION_ALIGN_PAIRS) * REGION_ALIGN_PAIRS
@@ -108,6 +112,11 @@ class Plan:
             ``raise_flag_peers`` and ``Mailbox.poll_flags`` on a peer region
             require it, so a host that stands in for absent ranks (the layer
             bench) knows which pairs to write with that payload.
+        poll_check: Retries between realtime clock checks in tagged polls.
+            Omission selects the production interval (4096 retries).
+        poll_timeout_shift: Poll timeout in 100 MHz ticks is ``11 << shift``.
+            Omission selects the production bound (29, about 59 seconds).
+            Both bounds are compile-time choices included in the plan key.
     """
 
     grid: int
@@ -119,6 +128,8 @@ class Plan:
     world: int = 1
     peers: tuple[str, ...] = ()
     flags: tuple[str, ...] = ()
+    poll_check: int = DEFAULT_POLL_CHECK
+    poll_timeout_shift: int = DEFAULT_POLL_TIMEOUT_SHIFT
     # __post_init__ derives these fields: the pairs of one row of every
     # region, and the pair offset of each region in row 0.
     row_pairs: int = field(init=False)
@@ -137,6 +148,10 @@ class Plan:
         self._check()
 
     def _check(self) -> None:
+        if not 1 <= self.poll_check <= 0xFFFFFFFF:
+            raise ValueError("poll_check must fit a positive uint32")
+        if not 0 <= self.poll_timeout_shift <= 56:
+            raise ValueError("poll_timeout_shift must be between 0 and 56 (int64 ns)")
         if self.rows < 1:
             raise ValueError("a plan serves one row at least")
         if self.chain < 1 or self.rows % self.chain:
@@ -198,6 +213,8 @@ class Plan:
             world=self.world,
             peers=self.peers,
             flags=self.flags,
+            poll_check=self.poll_check,
+            poll_timeout_shift=self.poll_timeout_shift,
         )
 
     def stage(self, name: str) -> Stage:
@@ -248,6 +265,8 @@ class Plan:
             "world": self.world,
             "peers": self.peers,
             "flags": self.flags,
+            "poll_check": self.poll_check,
+            "poll_timeout_shift": self.poll_timeout_shift,
         }
         return PlanKey(json.dumps(fields, separators=(",", ":")), self)
 

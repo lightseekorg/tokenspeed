@@ -45,7 +45,7 @@ system-scope (``sc0 sc1``), so the local L2 never serves a stale line of
 it.
 
 Fail-stop: a poll gives up after about a minute of waiting (the realtime
-clock, read every ``POLL_CHECK`` retries only) and executes ``s_trap 2``. The
+clock, read every ``Plan.poll_check`` retries only) and executes ``s_trap 2``. The
 runtime then reports a GPU exception and the process stops. A deadlock or a
 missing producer thus stops the server with an error instead of hanging it.
 
@@ -67,15 +67,6 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel import schedule, trace
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import LAYER_SLOTS as _SLOTS
 
 LAYER_SLOTS = gl.constexpr(_SLOTS)  # the device copy of plan.LAYER_SLOTS
-# A waiting poll reads the realtime clock (100 MHz on gfx950) every POLL_CHECK
-# retries (a retry is at least about 0.12 us: one check per ~0.5 ms, never in
-# a launch's normal waits) and traps once it has waited POLL_TIMEOUT_MANT <<
-# POLL_TIMEOUT_SHIFT ticks (59 s). Time, not a retry count: a rank whose host
-# submits the launch ~10 s late must stall its peers, not crash them. Tests
-# shrink POLL_TIMEOUT_SHIFT (formatted into the asm when the kernel compiles).
-POLL_CHECK = 4096
-POLL_TIMEOUT_MANT = 11
-POLL_TIMEOUT_SHIFT = 29
 # int64 words of a CTA's stuck-poll record: expected tag, observed pair, stale
 # pair address, clock at the first check, clock at the trap, the stale
 # operand's index in the poll, the record's byte offset (CTA * 64), unused.
@@ -128,15 +119,16 @@ def _poll_constraints(groups):
     Outputs: every group's pairs, one scratch VGPR pair, one SGPR pair, the
     retry count (one SGPR), the saved EXEC mask (one SGPR pair), the clock at
     the first check (one SGPR pair). Inputs: every group's pointers, the tag,
-    the wave's "spin" flag. The spin flag is one value per thread, so its
-    entry also names the clobbers. A retry reloads only the late pairs' lanes
+    the poll check interval and timeout shift (immediates), then the wave's
+    "spin" flag. The spin flag is one value per thread, so its entry also
+    names the clobbers. A retry reloads only the late pairs' lanes
     (EXEC narrowed, then restored), so EXEC is among them.
     """
     return (
         ("=&v",) * groups
         + ("=&v", "=&s", "=&s", "=&s", "=&s")
         + ("v",) * groups
-        + ("s", "v,~{vcc},~{scc},~{exec}")
+        + ("s", "n", "n", "v,~{vcc},~{scc},~{exec}")
     )
 
 
@@ -150,7 +142,7 @@ def _poll_constraints_stuck(groups):
         ("=&v",) * groups
         + ("=&v", "=&s", "=&s", "=&s", "=&s")
         + ("v",) * groups
-        + ("s", "s", "s", "v,~{vcc},~{scc},~{exec}")
+        + ("s", "s", "s", "n", "n", "v,~{vcc},~{scc},~{exec}")
     )
 
 
@@ -161,12 +153,12 @@ _POLL_CACHE = {"agent": "sc1", "system": "sc0 sc1"}
 
 @gluon.constexpr_function
 def _poll_asm_agent(outputs, inputs):
-    return _poll_asm(outputs, inputs, _POLL_CACHE["agent"])
+    return _poll_asm(outputs, inputs, _POLL_CACHE["agent"], False)
 
 
 @gluon.constexpr_function
 def _poll_asm_system(outputs, inputs):
-    return _poll_asm(outputs, inputs, _POLL_CACHE["system"])
+    return _poll_asm(outputs, inputs, _POLL_CACHE["system"], False)
 
 
 @gluon.constexpr_function
@@ -180,7 +172,7 @@ def _poll_asm_stuck_system(outputs, inputs):
 
 
 @gluon.constexpr_function
-def _poll_asm(outputs, inputs, cache, stuck=False):
+def _poll_asm(outputs, inputs, cache, stuck):
     """One wave-uniform retry loop over all of a thread's pairs.
 
     All loads issue before one ``vmcnt`` wait. While any lane's tag differs,
@@ -190,11 +182,13 @@ def _poll_asm(outputs, inputs, cache, stuck=False):
     after about a minute of waiting. A wave whose ``spin`` flag is zero skips
     the loop (``pre_poll`` keeps one wave per CTA spinning).
 
-    Every ``POLL_CHECK`` retries the wave reads the realtime clock: the first
-    reading starts the wait's clock, a later one past the timeout traps (the
+    Every ``Plan.poll_check`` retries the wave reads the realtime clock:
+    the first reading starts the wait's clock, a later one past the timeout traps (the
     64-bit compare runs on the VALU, whose 64-bit add and compare take the
     SGPR pairs whole).
     """
+    (poll_check,), (timeout_shift,) = inputs[-3:-1]
+    inputs = inputs[:-3] + inputs[-1:]
     groups = len(inputs) - (4 if stuck else 2)
     pairs = [p for group in outputs[:groups] for p in group]
     ptrs = [p for group in inputs[:groups] for p in group]
@@ -220,10 +214,10 @@ def _poll_asm(outputs, inputs, cache, stuck=False):
         ]
     lines += [f"s_cmp_eq_u64 {acc}, 0", "s_cbranch_scc1 2f"]
     # Only a retry counts, so a poll that succeeds at once costs nothing more,
-    # and only every POLL_CHECK-th retry reads the clock.
+    # and only every plan.poll_check-th retry reads the clock.
     lines += [
         f"s_add_u32 {retries}, {retries}, 1",
-        f"s_cmp_lt_u32 {retries}, {POLL_CHECK}",
+        f"s_cmp_lt_u32 {retries}, {poll_check}",
         "s_cbranch_scc1 4f",
         f"s_mov_b32 {retries}, 0",
         f"s_memrealtime {acc}",
@@ -233,8 +227,8 @@ def _poll_asm(outputs, inputs, cache, stuck=False):
         f"s_mov_b64 {start}, {acc}",
         "s_branch 4f",
         "5:",
-        f"s_mov_b64 {save}, {POLL_TIMEOUT_MANT}",
-        f"s_lshl_b64 {save}, {save}, {POLL_TIMEOUT_SHIFT}",
+        f"s_mov_b64 {save}, 11",
+        f"s_lshl_b64 {save}, {save}, {timeout_shift}",
         f"v_mov_b64 {tmp}, {start}",
         f"v_lshl_add_u64 {tmp}, {save}, 0, {tmp}",
         f"v_cmp_lt_u64 vcc, {tmp}, {acc}",
@@ -314,10 +308,9 @@ def _stuck_record(pairs, ptrs, tmp, lane, mask, tag, start, now, rec, slot, fail
 
 
 @gluon.constexpr_function
-def _poll_timeout_ns():
-    """The tagged poll's time bound (``_poll_asm``) in ns, read when the kernel
-    compiles, as the asm reads it (tests shrink ``POLL_TIMEOUT_SHIFT``)."""
-    return (POLL_TIMEOUT_MANT << POLL_TIMEOUT_SHIFT) * trace.TICK_NS
+def _poll_timeout_ns(plan):
+    """The compiled plan's tagged-poll time bound, in ns, for flag polls."""
+    return (11 << plan.plan.poll_timeout_shift) * trace.TICK_NS
 
 
 @gluon.constexpr_function
@@ -413,7 +406,9 @@ def _poll_types(offsets, num_warps):
 
 
 @gluon.jit
-def _poll_n(scratch, offsets, tag, spin, SCOPE: gl.constexpr, stuck):
+def _poll_n(
+    scratch, offsets, tag, spin, SCOPE: gl.constexpr, stuck, plan: gl.constexpr
+):
     """Spin until every pair at the index tensors ``offsets`` (a tuple, any
     layouts) carries ``tag``, in one round trip. Return the tuple of their
     pairs. Waves whose ``spin`` is zero skip the loop. ``stuck``: None, or
@@ -425,6 +420,8 @@ def _poll_n(scratch, offsets, tag, spin, SCOPE: gl.constexpr, stuck):
     # down zero-extended, so compare with the zero-extended tag. A
     # sign-extended tag never matches once the tag wraps past bit 31.
     gl.static_assert(SCOPE == "agent" or SCOPE == "system", "scope: agent or system")
+    # The bound travels as immediate operands from PLAN, so it is keyed and
+    # the asm callback never depends on mutable module state.
     # asm: a poll is a loop of uncached loads that retries only the late
     # pairs' lanes until every tag matches; Gluon has no volatile load, and
     # a load in a loop is hoisted or merged.
@@ -432,7 +429,13 @@ def _poll_n(scratch, offsets, tag, spin, SCOPE: gl.constexpr, stuck):
         out = gl.inline_asm(
             _poll_asm_system if SCOPE == "system" else _poll_asm_agent,
             _poll_constraints(len(offsets)),
-            ptrs + (tag.to(gl.int64) & 0xFFFFFFFF, spin),
+            ptrs
+            + (
+                tag.to(gl.int64) & 0xFFFFFFFF,
+                schedule.poll_check(plan),
+                schedule.poll_timeout_shift(plan),
+                spin,
+            ),
             _poll_types(offsets.type, gl.num_warps()),
         )
     else:
@@ -445,6 +448,8 @@ def _poll_n(scratch, offsets, tag, spin, SCOPE: gl.constexpr, stuck):
                 stuck.to(gl.int64, bitcast=True),
                 # The CTA's record, in bytes from the buffer's start.
                 gl.program_id(0).to(gl.int64) * STUCK_RECORD_BYTES,
+                schedule.poll_check(plan),
+                schedule.poll_timeout_shift(plan),
                 spin,
             ),
             _poll_types(offsets.type, gl.num_warps()),
@@ -456,9 +461,10 @@ def _poll_n(scratch, offsets, tag, spin, SCOPE: gl.constexpr, stuck):
 
 
 @gluon.jit
-def poll(scratch, offsets, tag):
+def poll(scratch, offsets, tag, plan: gl.constexpr):
     """Spin until every pair at ``offsets`` carries ``tag``. Return the payloads.
 
+    ``plan`` is the compile-time plan key, including the poll bound.
     Every thread polls the pairs that it holds in ``offsets``'s layout. Keep a
     thread's pairs few (about 12) to bound live registers. For few pairs per
     CTA, a direct poll is faster than :func:`pre_poll` first (one round trip
@@ -467,28 +473,32 @@ def poll(scratch, offsets, tag):
     Returns:
         ``int32`` payloads in ``offsets``'s layout.
     """
-    return _payload(_poll_n(scratch, (offsets,), tag, _spin_all(), "agent", None)[0])
+    return _payload(
+        _poll_n(scratch, (offsets,), tag, _spin_all(), "agent", None, plan)[0]
+    )
 
 
 @gluon.jit
-def poll_waves(scratch, offsets, tag, spin):
+def poll_waves(scratch, offsets, tag, spin, plan: gl.constexpr):
     """:func:`poll` by the waves whose ``spin`` (one value per thread, in
     :func:`lane_layout`) is non-zero. The other waves skip the loop, and
     their payloads are undefined."""
-    return _payload(_poll_n(scratch, (offsets,), tag, spin, "agent", None)[0])
+    return _payload(_poll_n(scratch, (offsets,), tag, spin, "agent", None, plan)[0])
 
 
 @gluon.jit
-def poll_many_waves(scratch, offsets, tag, spin):
+def poll_many_waves(scratch, offsets, tag, spin, plan: gl.constexpr):
     """:func:`poll_waves` of a tuple of at most four index tensors (any
     layouts) in one round trip. Returns the tuple of their payloads."""
-    return _poll_many_waves(scratch, offsets, tag, spin, "agent", None)
+    return _poll_many_waves(scratch, offsets, tag, spin, "agent", None, plan)
 
 
 @gluon.jit
-def _poll_many_waves(scratch, offsets, tag, spin, SCOPE: gl.constexpr, stuck):
+def _poll_many_waves(
+    scratch, offsets, tag, spin, SCOPE: gl.constexpr, stuck, plan: gl.constexpr
+):
     gl.static_assert(len(offsets) <= 4, "one round trip polls four tensors")
-    pairs = _poll_n(scratch, offsets, tag, spin, SCOPE, stuck)
+    pairs = _poll_n(scratch, offsets, tag, spin, SCOPE, stuck, plan)
     payloads = ()
     for k in gl.static_range(len(offsets)):
         payloads += (_payload(pairs[k]),)
@@ -496,20 +506,20 @@ def _poll_many_waves(scratch, offsets, tag, spin, SCOPE: gl.constexpr, stuck):
 
 
 @gluon.jit
-def poll_many(scratch, offsets, tag):
+def poll_many(scratch, offsets, tag, plan: gl.constexpr):
     """:func:`poll` of a tuple of index tensors (any layouts), four per round
     trip. Returns the tuple of their payloads."""
-    return _poll_many(scratch, offsets, tag, "agent", None)
+    return _poll_many(scratch, offsets, tag, "agent", None, plan)
 
 
 @gluon.jit
-def _poll_many(scratch, offsets, tag, SCOPE: gl.constexpr, stuck):
+def _poll_many(scratch, offsets, tag, SCOPE: gl.constexpr, stuck, plan: gl.constexpr):
     payloads = ()
     for first in gl.static_range(0, len(offsets), 4):
         group = ()
         for k in gl.static_range(first, _group_end(first, len(offsets))):
             group += (offsets[k],)
-        pairs = _poll_n(scratch, group, tag, _spin_all(), SCOPE, stuck)
+        pairs = _poll_n(scratch, group, tag, _spin_all(), SCOPE, stuck, plan)
         for k in gl.static_range(len(group)):
             payloads += (_payload(pairs[k]),)
     return payloads
@@ -532,7 +542,7 @@ def _row_indices(indices, ROWS: gl.constexpr, plan: gl.constexpr):
 
 
 @gluon.jit
-def pre_poll(scratch, hints, tag):
+def pre_poll(scratch, hints, tag, plan: gl.constexpr):
     """Wave 0 spins on ``hints`` (one pair per producer), then the CTA waits at a
     barrier.
 
@@ -540,17 +550,18 @@ def pre_poll(scratch, hints, tag):
     Every thread must call it.
 
     Args:
+        plan: Compile-time plan key, including the poll bound.
         hints: Pair indices in the one-element-per-thread layout of
             :func:`lane_layout`. The function ignores the lanes of waves
             other than 0.
     """
-    _pre_poll(scratch, hints, tag, "agent", None)
+    _pre_poll(scratch, hints, tag, "agent", None, plan)
 
 
 @gluon.jit
-def _pre_poll(scratch, hints, tag, SCOPE: gl.constexpr, stuck):
+def _pre_poll(scratch, hints, tag, SCOPE: gl.constexpr, stuck, plan: gl.constexpr):
     lanes = gl.arange(0, 64 * gl.num_warps(), lane_layout(gl.num_warps()))
-    _poll_n(scratch, (hints,), tag, (lanes < 64).to(gl.int32), SCOPE, stuck)
+    _poll_n(scratch, (hints,), tag, (lanes < 64).to(gl.int32), SCOPE, stuck, plan)
     gl.barrier()
 
 
@@ -848,7 +859,7 @@ class Mailbox:
             expected,
             sem="relaxed",
             scope="sys" if schedule.is_peer(self.plan, region) else "gpu",
-            timeout_ns=gl.full((), _poll_timeout_ns(), gl.int64),
+            timeout_ns=gl.full((), _poll_timeout_ns(self.plan), gl.int64),
         )
         failed = (~ready).to(gl.int32)
         for _ in gl.static_range(len(indices.shape)):
@@ -869,6 +880,7 @@ class Mailbox:
                 _spin_all(),
                 _scope(self.plan, region),
                 self.stuck,
+                self.plan,
             )[0]
         )
 
@@ -882,6 +894,7 @@ class Mailbox:
                 spin,
                 _scope(self.plan, region),
                 self.stuck,
+                self.plan,
             )[0]
         )
 
@@ -899,6 +912,7 @@ class Mailbox:
             spin,
             _scopes(self.plan, regions),
             self.stuck,
+            self.plan,
         )
 
     @gluon.jit
@@ -910,7 +924,12 @@ class Mailbox:
         for k in gl.static_range(len(regions)):
             offsets += (self.pairs(regions[k], indices[k]),)
         return _poll_many(
-            self.scratch, offsets, self.tag, _scopes(self.plan, regions), self.stuck
+            self.scratch,
+            offsets,
+            self.tag,
+            _scopes(self.plan, regions),
+            self.stuck,
+            self.plan,
         )
 
     @gluon.jit
@@ -923,7 +942,9 @@ class Mailbox:
     def poll_pairs(self, offsets):
         """Poll a tuple of tensors of :meth:`pairs` offsets of local regions,
         four per round trip. Poll peer regions with :meth:`poll_many`."""
-        return _poll_many(self.scratch, offsets, self.tag, "agent", self.stuck)
+        return _poll_many(
+            self.scratch, offsets, self.tag, "agent", self.stuck, self.plan
+        )
 
     @gluon.jit
     def poll_rows(self, regions: gl.constexpr, indices, ROWS: gl.constexpr):
@@ -961,6 +982,7 @@ class Mailbox:
             self.tag,
             _scope(self.plan, region),
             self.stuck,
+            self.plan,
         )
 
 

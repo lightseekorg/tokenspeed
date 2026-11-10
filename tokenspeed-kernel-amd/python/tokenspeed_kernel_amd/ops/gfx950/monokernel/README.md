@@ -162,11 +162,14 @@ Memory rules on gfx950 (coarse-grained VRAM):
 - The 64-bit store and load are single-copy atomic. Thus a pair never holds
   an old payload with a new tag.
 - A poll traps (`s_trap 2`) after about a minute of waiting, timed with the
-  realtime clock (read every `POLL_CHECK` retries only). A deadlock then
+  realtime clock (read every `Plan.poll_check` retries only). A deadlock then
   stops the process with a GPU error, not a hang, while a rank whose host
   submits a launch seconds late only stalls its peers. Given a stuck-poll
   record buffer, the poll first writes what it waited for (tag, address,
-  observed pair, clocks) for the host to decode.
+  observed pair, clocks) for the host to decode. `Plan.poll_timeout_shift`
+  sets the bound to `11 << shift` ticks at 100 MHz. Both fields are part of
+  the compile-time plan key; tests can shorten the production defaults
+  (4096 retries, shift 29) without reusing binaries with a different bound.
 - A CTA reads another CTA's plain global store from the same launch only
   behind a flag: the producer stores plain words past the caches, waits
   until they land, then raises one tagged flag (`store_words`,

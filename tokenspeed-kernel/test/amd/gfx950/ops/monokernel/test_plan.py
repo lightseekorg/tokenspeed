@@ -194,3 +194,46 @@ def test_plan_flags_are_peer_regions_and_part_of_the_key():
     assert flagged.only(("sum",)).flags == ("part",)
     with pytest.raises(ValueError, match="not peer regions"):
         replace(plain, flags=("local",))
+
+
+@pytest.mark.parametrize(
+    "poll_check,poll_timeout_shift", [(64, 29), (4096, 10), (64, 10)]
+)
+def test_poll_bound_changes_the_key_without_changing_layout(
+    poll_check, poll_timeout_shift
+):
+    production = Plan(
+        grid=2,
+        stages=(Stage("s", 1, 0, writes=("a",)),),
+        regions=(("a", 33),),
+        rows=2,
+        chain=1,
+    )
+    explicit = replace(production, poll_check=4096, poll_timeout_shift=29)
+    short = replace(
+        production, poll_check=poll_check, poll_timeout_shift=poll_timeout_shift
+    )
+    assert production == explicit
+    assert production.key == explicit.key
+    assert short.key != production.key
+    assert short.offset("a") == production.offset("a")
+    assert short.row_pairs == production.row_pairs
+    assert short.scratch_pairs == production.scratch_pairs
+    sliced = short.only(("s",))
+    assert sliced.poll_check == poll_check
+    assert sliced.poll_timeout_shift == poll_timeout_shift
+    assert sliced.key == short.key
+
+
+@pytest.mark.parametrize(
+    "bounds",
+    [
+        dict(poll_check=0),
+        dict(poll_check=2**32),
+        dict(poll_timeout_shift=-1),
+        dict(poll_timeout_shift=57),
+    ],
+)
+def test_plan_rejects_poll_bounds_that_do_not_fit(bounds):
+    with pytest.raises(ValueError, match="poll_"):
+        Plan(grid=1, stages=(), regions=(), rows=1, chain=1, **bounds)

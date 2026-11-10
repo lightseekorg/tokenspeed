@@ -57,7 +57,12 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import (
     qkvg,
 )
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.dims import HIDDEN, WORLD
-from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import Plan, Stage
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import (
+    DEFAULT_POLL_CHECK,
+    DEFAULT_POLL_TIMEOUT_SHIFT,
+    Plan,
+    Stage,
+)
 
 SLIDING_SPLITS = 16
 # A full layer's attention splits: one request's tasks (2 KV heads x splits)
@@ -189,6 +194,8 @@ def layer_plan(
     own_qkvg: bool,
     next_qkvg: bool,
     check_parity: bool,
+    poll_check: int = DEFAULT_POLL_CHECK,
+    poll_timeout_shift: int = DEFAULT_POLL_TIMEOUT_SHIFT,
 ) -> Plan:
     """The plan of a full-attention (``full``) or sliding-window layer for
     ``rows`` token rows: requests of ``chain`` tokens each, 1 for decode,
@@ -201,7 +208,9 @@ def layer_plan(
     projection (qnext), which replaces the warm stage; past one row only.
     ``check_parity``: the scratch keeps the last
     launch's parity (``Mailbox.check_parity``); without it, serving's layout
-    is the same as with no check at all."""
+    is the same as with no check at all.
+    ``poll_check`` and ``poll_timeout_shift`` select the plan's poll bound;
+    omission uses the production bound."""
     if not 1 <= rows <= MAX_ROWS or rows % chain:
         raise ValueError(
             f"a launch serves 1 to {MAX_ROWS} rows of requests of {chain}, got {rows}"
@@ -265,6 +274,8 @@ def layer_plan(
         world=int(WORLD),
         peers=peers,
         flags=attn_tail.FLAGS + moe_tail.flags(rows),
+        poll_check=poll_check,
+        poll_timeout_shift=poll_timeout_shift,
     )
 
 
