@@ -426,17 +426,6 @@ def attn_half_kernel(
         )
 
 
-def _close(got: torch.Tensor, want: torch.Tensor) -> None:
-    """Within one BF16 step, or a step of the largest value where a sum
-    cancels to near zero."""
-    torch.testing.assert_close(
-        got.float(),
-        want.float(),
-        rtol=2**-7,
-        atol=want.float().abs().max().item() * 2**-9,
-    )
-
-
 def _close_chained(got: torch.Tensor, want: torch.Tensor) -> None:
     """Within two BF16 steps: the reference projects with one FP32 product,
     the kernel sums 16 K parts, so the projection can round one step apart
@@ -530,15 +519,15 @@ def _half_worker(rank: int, port: int, prefix: int) -> None:
         want_h, want_res = ref.tp_sum_norm(parts, residual, gain, round_tp_sum=True)
         assert torch.equal(residual_out[:, own].cpu(), want_res[:, own])
         h = bf("ahin", HIDDEN // 2, copy=step & 1)
-        _close(h, want_h)
+        ref.assert_bf16_close(h, want_h)
         cpart = words("acpart", 2 * ref.COEFFICIENTS).view(torch.float32)
         dl = (cpart[:, : ref.COEFFICIENTS] + cpart[:, ref.COEFFICIENTS :]).to(
             torch.bfloat16
         )
-        _close(dl, (h.float() @ coef_w.float().T).to(torch.bfloat16))
+        ref.assert_bf16_close(dl, (h.float() @ coef_w.float().T).to(torch.bfloat16))
         delta = dl.view(rows, 2, ref.TAPS, ref.GROUPS)
         hc = bf("ahc", HIDDEN // 2)
-        _close(hc, ref.grouped_conv(h, delta[:, 0], base[0]))
+        ref.assert_bf16_close(hc, ref.grouped_conv(h, delta[:, 0], base[0]))
         proj = hc.float() @ qkv_w.float().T  # [rows, 1280]
         q = bf("qh", Q_HEADS * HALF).view(rows, Q_HEADS, HEAD)
         kb = bf("kb", HALF)
@@ -573,7 +562,9 @@ def _half_worker(rank: int, port: int, prefix: int) -> None:
             err = (ao[r].double() - want).abs()
             assert torch.all(err <= bound), float((err / bound).max())
         partial = (ao.reshape(rows, -1).float() @ o_w.float().T).to(torch.bfloat16)
-        _close(out.cpu(), ref.grouped_conv(partial, delta[:, 1], base[1]))
+        ref.assert_bf16_close(
+            out.cpu(), ref.grouped_conv(partial, delta[:, 1], base[1])
+        )
         dist.barrier()
     finally:
         dist.destroy_process_group()

@@ -66,8 +66,9 @@ def _meta(*shape, dtype=torch.bfloat16):
 
 
 def _kernel(fn):
-    """The launch's compiled kernel as launch metadata sees it: its name
-    (a real one needs a GPU compile)."""
+    """The launch's compiled kernel as launch metadata sees it: its name."""
+    # A stand-in: a real compiled kernel needs a GPU compile, and launch
+    # metadata reads only its name.
     return SimpleNamespace(name=fn.__name__)
 
 

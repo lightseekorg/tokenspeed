@@ -231,17 +231,6 @@ def _plan(rows: int) -> Plan:
     )
 
 
-def _close(got: torch.Tensor, want: torch.Tensor) -> None:
-    """Within one BF16 step, or a step of the row's largest value where a
-    sum cancels to near zero."""
-    torch.testing.assert_close(
-        got.float(),
-        want.float(),
-        rtol=2**-7,
-        atol=want.float().abs().max().item() * 2**-9,
-    )
-
-
 def _worker(rank: int, port: int, rows: int) -> None:
     torch.cuda.set_device(rank)
     dist.init_process_group(
@@ -310,17 +299,17 @@ def _worker(rank: int, port: int, rows: int) -> None:
             # names the stage. The norm scale sums its squares in another
             # order; the projections sum their K parts in another order.
             h = region("hin", HIDDEN // 2, copy=step & 1)
-            _close(h, want_h)
+            ref.assert_bf16_close(h, want_h)
             # The convolutions read a coefficient as its two K parts' sum,
             # rounded to BF16.
             cpart = words("cpart", 2 * ref.COEFFICIENTS).view(torch.float32)
             dl = (cpart[:, : ref.COEFFICIENTS] + cpart[:, ref.COEFFICIENTS :]).to(
                 torch.bfloat16
             )
-            _close(dl, (h.float() @ coef_w.float().T).to(torch.bfloat16))
+            ref.assert_bf16_close(dl, (h.float() @ coef_w.float().T).to(torch.bfloat16))
             delta = dl.view(rows, 2, ref.TAPS, ref.GROUPS)
             hc = region("hc", HIDDEN // 2)
-            _close(hc, ref.grouped_conv(h, delta[:, 0], base[0]))
+            ref.assert_bf16_close(hc, ref.grouped_conv(h, delta[:, 0], base[0]))
             act = region("act", ref.INTER_RANK // 2)
             gate, up = (
                 (hc.float() @ gu_w.float().T)
@@ -328,9 +317,13 @@ def _worker(rank: int, port: int, rows: int) -> None:
                 .float()
                 .split(ref.INTER_RANK, dim=-1)
             )
-            _close(act, (torch.nn.functional.silu(gate) * up).to(torch.bfloat16))
+            ref.assert_bf16_close(
+                act, (torch.nn.functional.silu(gate) * up).to(torch.bfloat16)
+            )
             partial = (act.float() @ down_w.float().T).to(torch.bfloat16)
-            _close(out.cpu(), ref.grouped_conv(partial, delta[:, 1], base[1]))
+            ref.assert_bf16_close(
+                out.cpu(), ref.grouped_conv(partial, delta[:, 1], base[1])
+            )
             dist.barrier()
     finally:
         dist.destroy_process_group()

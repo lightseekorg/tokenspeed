@@ -77,15 +77,40 @@ class FusedDecodeLayer:
     late_weights: torch.Tensor | None
 
 
-def _select(mode: str, max_rows: int, override: str | None):
+def _select(mode: str, max_rows: int, solution: str | None):
+    # One forced solution selects both the ``*_prepare`` and the ``*_decode``
+    # op of a layer, each among that solution's kernels of its own mode; a
+    # kernel name matches no solution and raises.
     signature = format_signature(h=dense_tensor_format(torch.bfloat16))
     return select_kernel(
-        "monokernel", mode, signature, traits={"rows": max_rows}, override=override
+        "monokernel", mode, signature, traits={"rows": max_rows}, solution=solution
+    )
+
+
+def _prepare(
+    kind: str, max_rows: int, solution: str | None, **prepare_args: Any
+) -> FusedDecodeLayer | None:
+    """Select ``kind``'s prepare and decode kernels and pack the layer with
+    ``prepare_args``; None when no kernel serves ``max_rows`` here and no
+    solution was forced."""
+    try:
+        prepare = _select(f"{kind}_prepare", max_rows, solution)
+        decode = _select(f"{kind}_decode", max_rows, solution)
+    except NoKernelFoundError:
+        if solution is not None:
+            raise
+        return None
+    weights, scratch_pairs, late_weights = prepare(max_rows=max_rows, **prepare_args)
+    return FusedDecodeLayer(
+        decode=decode,
+        weights=weights,
+        scratch_pairs=scratch_pairs,
+        late_weights=late_weights,
     )
 
 
 def prepare_muse_spark_layer(
-    *, tensors: dict[str, Any], max_rows: int, override: str | None = None
+    *, tensors: dict[str, Any], max_rows: int, solution: str | None = None
 ) -> FusedDecodeLayer | None:
     """Pack one TP8 rank's Muse Spark decoder layer for its monokernel.
 
@@ -99,7 +124,9 @@ def prepare_muse_spark_layer(
         max_rows: The most token rows of one request a launch will serve:
             1 for decode, ``k + 1`` for a speculative verify of ``k`` draft
             tokens. The scratch is sized for it.
-        override: Optional registered kernel name to force.
+        solution: Optional registered solution (such as ``"gluon"``) to
+            force; its kernels must serve ``max_rows`` here, else this
+            raises ``NoKernelFoundError``.
 
     Returns:
         The packed layer, or None when no monokernel serves ``max_rows``
@@ -108,20 +135,7 @@ def prepare_muse_spark_layer(
     Raises:
         ValueError: A tensor, or the experts' layout, is not the kernel's.
     """
-    try:
-        prepare = _select("muse_spark_layer_prepare", max_rows, override)
-        decode = _select("muse_spark_layer_decode", max_rows, override)
-    except NoKernelFoundError:
-        if override is not None:
-            raise
-        return None
-    weights, scratch_pairs, late_weights = prepare(tensors=tensors, max_rows=max_rows)
-    return FusedDecodeLayer(
-        decode=decode,
-        weights=weights,
-        scratch_pairs=scratch_pairs,
-        late_weights=late_weights,
-    )
+    return _prepare("muse_spark_layer", max_rows, solution, tensors=tensors)
 
 
 # int32 words of one token row's q | k | v projection that a Muse Spark
@@ -210,11 +224,11 @@ def muse_spark_layer_decode(
             the launch ends with ``warm_next``'s q | k | v projection of the
             rows it outputs, for the next launch's ``proj_in`` (in place of
             warming its weights). The results are the same bits either way.
-        stuck_rec: None, or a host-visible int64 ``[256 * 8 + 1, 8]`` buffer
-            (a record per wave of the 256 CTAs of 8 waves, then a header; in
-            pinned or host-registered memory, ``muse_spark_stuck_record``): a
-            poll that gives up writes what it waited for there before the
-            launch traps.
+        stuck_rec: None, or the ``tensor`` of a
+            :func:`muse_spark_stuck_record` record (host-visible int64, a
+            record per wave of the launch's CTAs, then a header): a poll that
+            gives up writes what it waited for there before the launch
+            traps.
         compile_only: Only compile the launch for these operands, without
             running it. A launch polls its peers' values for about a minute
             before it traps, so a rank that compiles much longer than its
@@ -254,7 +268,7 @@ def prepare_muse_spark_draft_context(
     tensors: dict[str, torch.Tensor],
     rank: int,
     max_rows: int,
-    override: str | None = None,
+    solution: str | None = None,
 ) -> FusedDecodeLayer | None:
     """Pack one TP8 rank's DFlash2 context write (``fc`` and ``hidden_norm``
     of the target's taps, then every draft layer's K and V into the draft
@@ -267,27 +281,16 @@ def prepare_muse_spark_draft_context(
         rank: The rank in the TP8 group.
         max_rows: The most verify rows of one launch: those of up to two
             requests, 8 each.
-        override: Optional registered kernel name to force.
+        solution: Optional registered solution (such as ``"gluon"``) to
+            force; its kernels must serve ``max_rows`` here, else this
+            raises ``NoKernelFoundError``.
 
     Returns:
         The packed write, or None when no monokernel serves ``max_rows``
         here.
     """
-    try:
-        prepare = _select("muse_spark_draft_context_prepare", max_rows, override)
-        decode = _select("muse_spark_draft_context_decode", max_rows, override)
-    except NoKernelFoundError:
-        if override is not None:
-            raise
-        return None
-    weights, scratch_pairs, late_weights = prepare(
-        tensors=tensors, rank=rank, max_rows=max_rows
-    )
-    return FusedDecodeLayer(
-        decode=decode,
-        weights=weights,
-        scratch_pairs=scratch_pairs,
-        late_weights=late_weights,
+    return _prepare(
+        "muse_spark_draft_context", max_rows, solution, tensors=tensors, rank=rank
     )
 
 
@@ -346,7 +349,7 @@ def prepare_muse_spark_draft_head(
     max_rows: int,
     scale: float,
     softcap: float,
-    override: str | None = None,
+    solution: str | None = None,
 ) -> FusedDecodeLayer | None:
     """Pack one TP8 rank's DFlash2 draft head (the vocabulary-parallel top 16
     of each draft step and the candidate selector's scores) for its
@@ -360,31 +363,26 @@ def prepare_muse_spark_draft_head(
             requests' blocks, 7 each.
         scale: The logits' multiplier.
         softcap: The final logit softcap.
-        override: Optional registered kernel name to force.
+        solution: Optional registered solution (such as ``"gluon"``) to
+            force; its kernels must serve ``max_rows`` here, else this
+            raises ``NoKernelFoundError``.
 
     Returns:
         The packed head, or None when no monokernel serves ``max_rows`` here.
     """
-    try:
-        prepare = _select("muse_spark_draft_head_prepare", max_rows, override)
-        decode = _select("muse_spark_draft_head_decode", max_rows, override)
-    except NoKernelFoundError:
-        if override is not None:
-            raise
-        return None
-    weights, scratch_pairs, late_weights = prepare(
-        tensors=tensors, rank=rank, max_rows=max_rows, scale=scale, softcap=softcap
-    )
-    return FusedDecodeLayer(
-        decode=decode,
-        weights=weights,
-        scratch_pairs=scratch_pairs,
-        late_weights=late_weights,
+    return _prepare(
+        "muse_spark_draft_head",
+        max_rows,
+        solution,
+        tensors=tensors,
+        rank=rank,
+        scale=scale,
+        softcap=softcap,
     )
 
 
 def muse_spark_draft_head_scratch_pairs(
-    *, max_rows: int, override: str | None = None
+    *, max_rows: int, solution: str | None = None
 ) -> int | None:
     """The int64 mailbox pairs that :func:`prepare_muse_spark_draft_head`'s
     head of ``max_rows`` draft steps needs, without packing it: for reserving
@@ -393,15 +391,17 @@ def muse_spark_draft_head_scratch_pairs(
     Args:
         max_rows: The most draft steps of one launch: those of up to two
             requests' blocks, 7 each.
-        override: Optional registered kernel name to force.
+        solution: Optional registered solution (such as ``"gluon"``) to
+            force; its kernels must serve ``max_rows`` here, else this
+            raises ``NoKernelFoundError``.
 
     Returns:
         The pairs, or None when no monokernel serves ``max_rows`` here.
     """
     try:
-        scratch = _select("muse_spark_draft_head_scratch", max_rows, override)
+        scratch = _select("muse_spark_draft_head_scratch", max_rows, solution)
     except NoKernelFoundError:
-        if override is not None:
+        if solution is not None:
             raise
         return None
     return scratch(max_rows=max_rows)
@@ -464,7 +464,7 @@ def prepare_muse_spark_draft_layer(
     tensors: dict[str, torch.Tensor],
     rank: int,
     max_rows: int,
-    override: str | None = None,
+    solution: str | None = None,
 ) -> FusedDecodeLayer | None:
     """Pack one TP8 rank's layer of Muse Spark's DFlash2 draft for its
     monokernel.
@@ -475,27 +475,16 @@ def prepare_muse_spark_draft_layer(
         rank: The rank in the TP8 group.
         max_rows: The most rows of one draft block forward: the blocks of
             up to two requests, 8 rows each.
-        override: Optional registered kernel name to force.
+        solution: Optional registered solution (such as ``"gluon"``) to
+            force; its kernels must serve ``max_rows`` here, else this
+            raises ``NoKernelFoundError``.
 
     Returns:
         The packed layer, or None when no monokernel serves ``max_rows``
         here.
     """
-    try:
-        prepare = _select("muse_spark_draft_layer_prepare", max_rows, override)
-        decode = _select("muse_spark_draft_layer_decode", max_rows, override)
-    except NoKernelFoundError:
-        if override is not None:
-            raise
-        return None
-    weights, scratch_pairs, late_weights = prepare(
-        tensors=tensors, rank=rank, max_rows=max_rows
-    )
-    return FusedDecodeLayer(
-        decode=decode,
-        weights=weights,
-        scratch_pairs=scratch_pairs,
-        late_weights=late_weights,
+    return _prepare(
+        "muse_spark_draft_layer", max_rows, solution, tensors=tensors, rank=rank
     )
 
 
@@ -592,7 +581,7 @@ def muse_spark_stuck_record(
     path: str | None,
     scratch: torch.Tensor,
     rank: int,
-    override: str | None = None,
+    solution: str | None = None,
 ) -> Any:
     """A host-visible stuck-poll record buffer for Muse Spark layer launches:
     a poll that gives up writes what it waited for there before the launch
@@ -606,7 +595,8 @@ def muse_spark_stuck_record(
         scratch: The launches' mailbox scratch (its address goes into the
             buffer's header, for decoding).
         rank: This process's rank.
-        override: Optional registered kernel name to force.
+        solution: Optional registered solution (such as ``"gluon"``) to
+            force; without a kernel here, this raises ``NoKernelFoundError``.
 
     Returns:
         The record: ``tensor`` (the launches' ``stuck_rec``), ``path``,
@@ -616,5 +606,7 @@ def muse_spark_stuck_record(
         the served layers by index, ``launches`` the ``(rows, chain)`` of the
         launches they ran).
     """
-    make = _select("muse_spark_stuck_record", 1, override)
+    # One record serves launches of every row count; selection matches the
+    # kernel by a row count, and every layer kernel serves a single row.
+    make = _select("muse_spark_stuck_record", 1, solution)
     return make(grid=grid, waves=waves, path=path, scratch=scratch, rank=rank)

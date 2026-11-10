@@ -31,7 +31,7 @@ if not is_cdna4():
     pytest.skip("AMD CDNA4 is required", allow_module_level=True)
 
 from tokenspeed_kernel_amd._extern import extern_compile_options  # noqa: E402
-from tokenspeed_kernel_amd._triton import gl, gluon  # noqa: E402
+from tokenspeed_kernel_amd._triton import gl, gluon, triton  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import (  # noqa: E402
     moe_experts,
 )
@@ -69,7 +69,7 @@ def _slots_kernel(ids_ptr, out_ptr, RP: gl.constexpr):
 
 @pytest.mark.parametrize("rows", [1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 16])
 def test_ballot_slots_match_slots(rows: int):
-    rp = triton_next_power_of_2(rows)
+    rp = triton.next_power_of_2(rows)
     g = torch.Generator().manual_seed(rows)
     for trial in range(24):
         # Each row's 8 distinct picks, from a small pool so rows share
@@ -84,7 +84,3 @@ def test_ballot_slots_match_slots(rows: int):
         _slots_kernel[(1,)](ids, out, rp, num_warps=8, **extern_compile_options())
         torch.cuda.synchronize()
         assert torch.equal(out[:size].cpu(), out[size:].cpu()), (rows, trial)
-
-
-def triton_next_power_of_2(n: int) -> int:
-    return 1 << (n - 1).bit_length()

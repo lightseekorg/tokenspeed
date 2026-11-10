@@ -20,10 +20,13 @@
 
 """Time the DFlash2 draft layer (one launch a layer) on 8 GPUs at 8 rows.
 
-Five layers' weights rotate, as a draft forward streams them from HBM; the
-launches replay in a CUDA graph with the step bumped inside it. Then one
-traced launch prints each stage's first start, last ready, last computed and
-last end (us from the launch's first stamp).
+Five layers' weights rotate, as a draft forward streams them from HBM, and
+the fifth launch is the last layer's (with the draft's final norm). The
+launches replay in a CUDA graph with the step bumped once per five launches
+inside it, as serving bumps it once per draft forward: the launches then
+alternate their peer copy. The time is the mean of the five layers. Then one
+traced launch (layer 0) prints each stage's first start, last ready, last
+computed and last end (us from the launch's first stamp).
 
     python tokenspeed-kernel/benchmarks/amd/gfx950/muse_spark/monokernel/draft_layer_bench.py [--prefix 8000] [--trace]
 """
@@ -38,6 +41,8 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 WORLD, LAYERS, LAUNCHES, REPS, ROWS = 8, 5, 20, 20, 8
+# Whole draft forwards: the step bumps once per LAYERS launches.
+assert LAUNCHES % LAYERS == 0
 
 
 def worker(rank: int, port: int, args) -> None:
@@ -60,17 +65,33 @@ def worker(rank: int, port: int, args) -> None:
     device = torch.device(f"cuda:{rank}")
     ctx = get_or_create_context(heap_size=256 << 20)
     group = IrisGroup(ctx, dist.group.WORLD, rank, device)
-    plan = draft_layer.layer_plan(ROWS, True)
-    scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
+    # The last layer's plan (with the final norm) needs the larger scratch.
+    last_plan = draft_layer.layer_plan(ROWS, True)
+    scratch = ctx.zeros((last_plan.scratch_pairs,), dtype=torch.int64)
     group.finish_prepare()
     layers = [
         gluon_inputs.draft_layer_inputs(args.prefix + i, rank, ROWS, device)[1:]
         for i in range(LAYERS)
     ]
+    # The last layer stores the final norm's whole rows in place of its
+    # output partial.
+    weights, rt = layers[-1]
+    rt = dict(
+        rt,
+        out=None,
+        final_gain=torch.ones(gluon_inputs.OWNED, device=device),
+        normed=torch.zeros(
+            ROWS, gluon_inputs.HIDDEN, dtype=torch.bfloat16, device=device
+        ),
+    )
+    layers[-1] = (weights, rt)
     step = torch.full((1,), 1, dtype=torch.int32, device=device)
 
     def launch(i, trace_buf=None):
-        step.add_(1)
+        # The kernel's peer copy is (step * LAYERS + layer) & 1: one bump a
+        # forward makes every launch's copy differ from the launch before.
+        if i % LAYERS == 0:
+            step.add_(1)
         weights, rt = layers[i % LAYERS]
         draft_layer.launch_gluon_muse_spark_draft_layer_gfx950(
             weights,
@@ -83,7 +104,8 @@ def worker(rank: int, port: int, args) -> None:
             compile_only=False,
         )
 
-    for i in range(3):
+    # Compile both binaries (the last layer's is another) before the capture.
+    for i in range(LAYERS):
         launch(i)
     torch.cuda.synchronize()
     dist.barrier()
@@ -97,7 +119,7 @@ def worker(rank: int, port: int, args) -> None:
         for i in range(LAUNCHES):
             launch(i)
     with torch.cuda.graph(bump):
-        for i in range(LAUNCHES):
+        for i in range(LAUNCHES // LAYERS):
             step.add_(1)
     times, bumps = [], []
     for _ in range(REPS):
@@ -119,12 +141,14 @@ def worker(rank: int, port: int, args) -> None:
         b = statistics.median(x[1].item() for x in every)
         print(
             f"draft layer, 8 GPUs, {ROWS} rows, prefix {args.prefix}: "
-            f"{max(per) - b:.1f} us a launch (ranks "
+            f"{max(per) - b:.1f} us a launch, the mean of {LAYERS} layers (ranks "
             + " ".join(f"{v:.1f}" for v in per)
             + f", step bump {b:.1f})",
             flush=True,
         )
     if args.trace:
+        # The traced launch (LAUNCHES % LAYERS == 0) is layer 0's.
+        plan = draft_layer.layer_plan(ROWS, False)
         buf = torch.zeros(
             (plan.grid, int(trace.EVENTS), 8), dtype=torch.int64, device=device
         )

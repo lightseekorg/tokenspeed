@@ -28,8 +28,6 @@ from datetime import timedelta
 
 import dflash2_draft_reference as ref
 import pytest
-import test_muse_spark_draft_attn_gfx950 as attn_t
-import test_muse_spark_draft_mlp_gfx950 as mlp_t
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -64,22 +62,11 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.weights import (  # noqa: E402
 )
 
 WORLD, HIDDEN, OWNED, HEAD, HALF, Q_HEADS = 8, ref.HIDDEN, 1024, 128, 64, 8
-SPLITS, PAGE, WINDOW_KEYS = attn_t.SPLITS, attn_t.PAGE, attn_t.WINDOW_KEYS
+PAGE = int(draft_attn.PAGE)
 
 
 def plan(rows: int, last: bool) -> Plan:
     return draft_layer.layer_plan(rows, last)
-
-
-def _close(got: torch.Tensor, want: torch.Tensor) -> None:
-    """Within one BF16 step, or a step of the largest value where a sum
-    cancels to near zero."""
-    torch.testing.assert_close(
-        got.float(),
-        want.float(),
-        rtol=2**-7,
-        atol=want.float().abs().max().item() * 2**-9,
-    )
 
 
 def _worker(rank: int, port: int, prefix: int) -> None:
@@ -150,7 +137,7 @@ def _check(p, scratch, step, layer, host, rt, rank, rows) -> None:
     """Every stage of one launch on the kernel's own input."""
     own = slice(rank * OWNED, (rank + 1) * OWNED)
     tag = launch_tag(step, layer)
-    copy = (step * 5 + layer) & 1
+    copy = (step * int(draft_layer.DRAFT_LAYERS) + layer) & 1
     residual_out = rt["residual_out"]
 
     def words(name, width, copy=0):
@@ -174,7 +161,9 @@ def _check(p, scratch, step, layer, host, rt, rank, rows) -> None:
     adl = (cpart[:, : ref.COEFFICIENTS] + cpart[:, ref.COEFFICIENTS :]).to(
         torch.bfloat16
     )
-    _close(adl, (h.float() @ host["a_coef"].float().T).to(torch.bfloat16))
+    ref.assert_bf16_close(
+        adl, (h.float() @ host["a_coef"].float().T).to(torch.bfloat16)
+    )
     a_delta = adl.view(rows, 2, ref.TAPS, ref.GROUPS)
     ao = bf("ao", Q_HEADS * HALF).view(rows, -1)
     attn_part = ref.grouped_conv(
@@ -188,16 +177,18 @@ def _check(p, scratch, step, layer, host, rt, rank, rows) -> None:
     want_h, want_res = ref.tp_sum_norm(
         gathered, res1, host["post_gain"], round_tp_sum=True
     )
-    _close(residual_out[:, own].cpu(), want_res[:, own])
+    ref.assert_bf16_close(residual_out[:, own].cpu(), want_res[:, own])
     hin = bf("hin", HIDDEN // 2, copy=copy)
-    _close(hin, want_h)
+    ref.assert_bf16_close(hin, want_h)
     # The MLP half's stages on the kernel's own input.
     mcp = words("cpart", 2 * ref.COEFFICIENTS).view(torch.float32)
     mdl = (mcp[:, : ref.COEFFICIENTS] + mcp[:, ref.COEFFICIENTS :]).to(torch.bfloat16)
-    _close(mdl, (hin.float() @ host["m_coef"].float().T).to(torch.bfloat16))
+    ref.assert_bf16_close(
+        mdl, (hin.float() @ host["m_coef"].float().T).to(torch.bfloat16)
+    )
     m_delta = mdl.view(rows, 2, ref.TAPS, ref.GROUPS)
     hc = bf("hc", HIDDEN // 2)
-    _close(hc, ref.grouped_conv(hin, m_delta[:, 0], host["m_base"][0]))
+    ref.assert_bf16_close(hc, ref.grouped_conv(hin, m_delta[:, 0], host["m_base"][0]))
     act = bf("act", ref.INTER_RANK // 2)
     gate, up = (
         (hc.float() @ host["gu_w"].float().T)
@@ -205,11 +196,11 @@ def _check(p, scratch, step, layer, host, rt, rank, rows) -> None:
         .float()
         .split(ref.INTER_RANK, dim=-1)
     )
-    _close(act, (torch.nn.functional.silu(gate) * up).to(torch.bfloat16))
+    ref.assert_bf16_close(act, (torch.nn.functional.silu(gate) * up).to(torch.bfloat16))
     partial = (act.float() @ host["down_w"].float().T).to(torch.bfloat16)
     mlp_part = ref.grouped_conv(partial, m_delta[:, 1], host["m_base"][1])
     if rt["normed"] is None:
-        _close(rt["out"].cpu(), mlp_part)
+        ref.assert_bf16_close(rt["out"].cpu(), mlp_part)
         return
     # The last layer: the final norm of the ranks' MLP partials and the
     # residual after the attention sublayer, the whole rows on every rank.
@@ -218,7 +209,7 @@ def _check(p, scratch, step, layer, host, rt, rank, rows) -> None:
     want_normed, _ = ref.tp_sum_norm(
         parts, want_res, host["final_w"], round_tp_sum=True
     )
-    _close(rt["normed"].cpu(), want_normed)
+    ref.assert_bf16_close(rt["normed"].cpu(), want_normed)
 
 
 @pytest.mark.parametrize("prefix", [3000])

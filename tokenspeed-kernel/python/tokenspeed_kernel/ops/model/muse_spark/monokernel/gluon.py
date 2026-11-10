@@ -26,7 +26,7 @@ from typing import Any
 
 import torch
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
-from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.registry import KernelRegistry, Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 try:
@@ -70,19 +70,7 @@ if _muse_spark_layer is not None:
         vendors=frozenset({"amd"}),
     )
     # The rows of a launch: one request's decode or verify (up to 8 rows), or
-    # two requests' (up to 16), a compile-time row count; the runtime serves
-    # one request a launch (MAX_REQUESTS).
-    # The regular MoE kernels whose prepared expert weights
-    # (``gluon_mxfp4_gfx950_moe_weights``) the layer kernel reads in place.
-    _MUSE_SPARK_EXPERT_KERNELS = frozenset(
-        {
-            "gluon_mxfp4_a4w4_ep_deferred_precomputed_moe_apply",
-            "gluon_mxfp4_a8w4_situ_precomputed_moe_apply",
-            "gluon_mxfp4_dynamic_moe_apply",
-            "gluon_mxfp4_precomputed_moe_apply",
-            "gluon_mxfp4_moe_apply",
-        }
-    )
+    # two requests' (up to 16), a compile-time row count.
     _MUSE_TRAITS = {"rows": frozenset(range(1, _muse_spark_layer.MAX_ROWS + 1))}
 
     @register_kernel(
@@ -99,11 +87,18 @@ if _muse_spark_layer is not None:
         *, tensors: dict[str, Any], max_rows: int
     ) -> tuple[Any, int, None]:
         # The routed experts as the regular gluon MXFP4 MoE prepared them: the
-        # kernel reads their raw storage in place, so only these kernels'
-        # weight layout serves.
+        # kernel reads their raw storage in place, so it serves only the MoE
+        # kernels whose weight preprocessor is the gfx950 gluon MXFP4 one.
+        # Imported here: that module defines it only on AMD platforms.
+        from tokenspeed_kernel.ops.moe.gluon import gluon_mxfp4_gfx950_moe_weights
+
         tensors = dict(tensors)
         experts_kernel = tensors.pop("experts_kernel")
-        if experts_kernel not in _MUSE_SPARK_EXPERT_KERNELS:
+        spec = KernelRegistry.get().get_by_name(experts_kernel)
+        preprocessor = None if spec is None else spec.weight_preprocessor
+        if isinstance(preprocessor, tuple):
+            preprocessor = preprocessor[1]
+        if preprocessor is not gluon_mxfp4_gfx950_moe_weights:
             raise ValueError(
                 f"experts: the monokernel reads the gfx950 gluon MXFP4 layout, "
                 f"not {experts_kernel}'s"
@@ -218,7 +213,7 @@ if _muse_spark_layer is not None:
         def describe(self, layers: dict, launches: list) -> list[str]:
             # Serving's launches do not check the peer parity (see the launch).
             return _muse_spark_stuck_report.describe(
-                self._buf.tensor, self.layer_kinds(layers), launches, False
+                self._buf.tensor, self.layer_kinds(layers), launches, False, None
             )
 
     @register_kernel(

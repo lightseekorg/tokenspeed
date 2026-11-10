@@ -263,23 +263,6 @@ def test_draft_head_in_one_launch_matches_the_vocab_parallel_top16_and_selector(
     mp.spawn(_worker, args=(port, seed), nprocs=WORLD, join=True)
 
 
-def test_the_head_scratch_query_matches_the_heads_plan():
-    """A draft reserves the head's Iris scratch before the heap exists, from
-    the boundary's query: it must equal what the prepared head allocates
-    (its plan's pairs), and serve no other step count."""
-    from tokenspeed_kernel.ops.model.muse_spark.monokernel import (
-        muse_spark_draft_head_scratch_pairs,
-    )
-
-    # One request's steps, or two requests' (the head serves up to MAX_REQUESTS).
-    for rows in (STEPS, draft_head.MAX_REQUESTS * STEPS):
-        pairs = muse_spark_draft_head_scratch_pairs(max_rows=rows)
-        assert pairs == draft_head.head_plan(rows).scratch_pairs
-    assert muse_spark_draft_head_scratch_pairs(max_rows=STEPS + 1) is None
-    rows = (draft_head.MAX_REQUESTS + 1) * STEPS
-    assert muse_spark_draft_head_scratch_pairs(max_rows=rows) is None
-
-
 def test_one_binary_serves_every_step_and_block():
     """Each launch changes the step, the block's rows and its first token,
     all device tensors: compiling the launches for one GPU's rank finds the

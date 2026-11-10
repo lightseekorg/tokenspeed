@@ -42,6 +42,17 @@ COEFFICIENTS = 2 * TAPS * GROUPS  # side x tap x group: 2048
 EPS = 1e-5
 
 
+def assert_bf16_close(got: torch.Tensor, want: torch.Tensor) -> None:
+    """Assert ``got`` is within one BF16 step of ``want``, or a step of
+    ``want``'s largest value where a sum cancels to near zero."""
+    torch.testing.assert_close(
+        got.float(),
+        want.float(),
+        rtol=2**-7,
+        atol=want.float().abs().max().item() * 2**-9,
+    )
+
+
 def grouped_conv(
     x: torch.Tensor, delta: torch.Tensor, base: torch.Tensor
 ) -> torch.Tensor:

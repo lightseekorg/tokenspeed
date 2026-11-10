@@ -19,7 +19,7 @@ function returns `None` when the platform has no kernel for the layer.
 | Op | Packs or runs |
 |---|---|
 | `prepare_muse_spark_layer(tensors=, max_rows=)`, `muse_spark_layer_decode(layer, *, h, a, h_out, a_out, ...)` | One target decoder layer for the rows of one or more requests: a decode row each, or a speculative verify's consecutive tokens (`chain`). `h` is the rank's owned FP32 residual columns and `a` the whole BF16 attention input. A launch can end with the next layer's q / k / v projection (`proj_out`, read as the next launch's `proj_in`). |
-| `prepare_muse_spark_draft_layer`, `muse_spark_draft_layer_decode` | One DFlash2 draft layer for one request's block of rows. |
+| `prepare_muse_spark_draft_layer`, `muse_spark_draft_layer_decode` | One DFlash2 draft layer for the blocks of one or two requests (8 rows each). |
 | `prepare_muse_spark_draft_head`, `muse_spark_draft_head_decode` | The draft head: the vocabulary-parallel top 16 of each draft step and the candidate selector's scores. |
 | `prepare_muse_spark_draft_context`, `muse_spark_draft_context_decode` | The context write: `fc` and `hidden_norm` of the target's taps, then every draft layer's K and V into the draft cache. |
 
@@ -29,9 +29,11 @@ The caller owns the values that every launch of a step shares:
   `scratch_pairs` int64 pairs, at the same offset of the Iris symmetric heap
   on every rank. Nothing clears it.
 - The device step counter, which changes once per forward inside the CUDA
-  graph. The launches of one forward alternate the parity of
+  graph. The target layers' launches of one forward alternate the parity of
   `layer_index`, so a launch's peer writes never land in the buffers of the
-  launch before it.
+  launch before it. A draft layer's launch takes its peer copy from the
+  parity of `step * 5 + layer_index`, so every draft forward launches all
+  five draft layers and changes the step once.
 
 `compile_only=True` compiles a launch without running it, so every rank
 compiles each binary before the first launch that needs all ranks.

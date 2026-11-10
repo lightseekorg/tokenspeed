@@ -22,8 +22,9 @@
 weights in the Gluon MXFP4 layout the kernels read, and the stand-in for
 absent ranks that lets a bench or test launch the TP8 kernels on fewer GPUs.
 
-The kernels have no registry entry to dispatch through: they are this
-solution's own, so the imports below name it directly.
+The kernels are registered (``ops/model/muse_spark/monokernel/gluon.py``),
+but the registry hands out only their launches: these helpers build the
+inputs in the layouts of this one AMD solution, so they import it directly.
 """
 
 from __future__ import annotations

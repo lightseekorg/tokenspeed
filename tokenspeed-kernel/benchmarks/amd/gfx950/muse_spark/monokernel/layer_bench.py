@@ -36,19 +36,18 @@ logical ranks ``--gpus`` to 7 are absent:
 The numbers are for iteration, not for claims: 1 GPU has no link latency,
 and the absent ranks never arrive late. Confirm a kept change on 8 GPUs.
 
-Run from the repository root (each line is one example):
+Run from the repository root (each line is one example; ``B`` stands for
+``tokenspeed-kernel/benchmarks/amd/gfx950/muse_spark/monokernel``):
 
-    HIP_VISIBLE_DEVICES=1 python \\
-        tokenspeed-kernel/benchmarks/amd/gfx950/muse_spark/monokernel/layer_bench.py --gpus 1
-    HIP_VISIBLE_DEVICES=0,1,2,3 python \\
-        tokenspeed-kernel/benchmarks/amd/gfx950/muse_spark/monokernel/layer_bench.py --gpus 4 \\
-        --trace-out /tmp/trace --out-save /tmp/new.pt
+    HIP_VISIBLE_DEVICES=1 python $B/layer_bench.py --gpus 1 --kv-dtype bf16
+    HIP_VISIBLE_DEVICES=0,1,2,3 python $B/layer_bench.py --gpus 4 \\
+        --kv-dtype bf16 --trace-out /tmp/trace --out-save /tmp/new.pt
 
-The rows' routing picks ``--distinct`` experts (4 a row by default: 32 at 8
-rows, the median of served 8-row verifies, which pick 18 to 56). Expert
-stages scale with that count, and rows that agree on their experts (the
-earlier default, 17 at 8 rows) understate them by about half. The bench
-redraws the router bias until the count matches, before it times anything.
+The rows' routing picks ``--distinct`` experts (by default 4 a row, capped
+by ``--experts``). Expert stages scale with that count: served verify rows
+mostly pick different experts, so rows that agree on their experts would
+understate the expert stages. The bench redraws the router bias until the
+count matches, before it times anything.
 
 The first line of the output is the time per launch. The table after it is the
 trace of rank 0: for each stage, the first and last time (us, relative to the
@@ -76,6 +75,7 @@ from tokenspeed_kernel.ops.communication._iris import (
 from tokenspeed_kernel_amd.ops.gfx950.monokernel import plan as plan_mod
 from tokenspeed_kernel_amd.ops.gfx950.monokernel import stuck
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import (
+    dims,
     layer,
 )
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.qkvg import (
@@ -85,9 +85,13 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.weights import (
     bf16_tiles,
 )
 
-TP, HIDDEN, OWNED, POOL_OWNED, EXPERTS = 8, 8192, 1024, 512, 16
+TP, HIDDEN, OWNED = int(dims.WORLD), int(dims.HIDDEN), int(dims.OWNED)
+POOL_OWNED = int(dims.POOLED) // TP  # pooled columns a rank owns
+# The experts the routing picks among by default (--experts).
+EXPERTS = 16
 KV_DTYPES = {"bf16": torch.bfloat16, "fp8": torch.float8_e4m3fn}
-# Launches per graph: one per layer copy, so the timings average over them.
+# Launches per graph (layers 1 .. LAUNCHES, all with the same operands):
+# the timings average over them.
 LAUNCHES = 40
 # The trace buffer: [CTA, 4 points per stage, wave] in 10 ns ticks.
 TRACE_SHAPE, TICK_US = (256, 128, 8), 0.01
@@ -151,10 +155,10 @@ def _operands(
     # its length, so one request keeps the cache it always had).
     w = inputs.layer_rank_weights(rank, max(end, 64 * (int(table.max()) - 4)))
     # Each row picks 8 of the held experts. The bias spread sets how much
-    # the rows agree: the router scores vary by ~0.04 across experts, so a
-    # bias spread of 0.1 makes 8 rows pick about the same experts (12-18
-    # distinct of 40), and 0.01 about as many as served 8-row verifies do
-    # (median 32 distinct; each run prints its count).
+    # the rows agree: the router scores vary little across experts, so a
+    # wide spread (0.1) makes the rows pick about the same experts, and a
+    # narrow one (0.01) spreads them as served verifies do (each run prints
+    # its count).
     g = torch.Generator().manual_seed(route_seed)
     sh["bias"] = torch.full((256,), -1e4)
     sh["bias"][:experts] = torch.randn(experts, generator=g) * bias_std
@@ -295,7 +299,6 @@ def worker(rank: int, port: int, args) -> None:
         # The tag of this launch on the absent ranks' slots of copy ``lay & 1``.
         if gpus == TP:
             return
-        n = idx[lay & 1].numel()
         gluon_inputs.fill_absent_ranks(scratch, idx[lay & 1], bits[lay & 1], step, lay)
 
     # 512 MiB: more than L2 and the 256 MB MALL, so a cold launch reads HBM.
@@ -323,6 +326,13 @@ def worker(rank: int, port: int, args) -> None:
                     "launches": [[R, args.rows]],
                     # The bench's launches alternate the copies and check it.
                     "check_parity": True,
+                    # The bench's plan flags, which serving's rule would not
+                    # give its launches.
+                    "flags": {
+                        "warm_next": False,
+                        "own_qkvg": not args.shift,
+                        "next_qkvg": args.shift,
+                    },
                 },
                 f,
             )
@@ -333,28 +343,29 @@ def worker(rank: int, port: int, args) -> None:
         # The packed-operand launcher, so that every launch reuses the
         # operands packed once above (the public launcher packs per call).
         layer._launch_layer(
-            scratch,
-            step,
-            lay,
-            bases,
-            attn_ops,
-            table_stride,
-            moe_ops,
-            None,
-            None,
-            None,
-            proj[lay & 1] if args.shift else None,
-            proj[(lay + 1) & 1] if args.shift else None,
-            attn_ops[0] if args.shift else None,  # the next layer's: this one's
-            trace_buf,
-            stuck_rec,
-            rank,
-            args.full,
-            R,
-            args.rows,
-            False,  # whole_rows: the owned residual columns
-            True,  # check_parity: the bench's launches alternate
-            False,  # compile_only
+            scratch=scratch,
+            step=step,
+            layer=lay,
+            bases=bases,
+            attn_ops=attn_ops,
+            table_stride=table_stride,
+            moe_ops=moe_ops,
+            tap=None,
+            tap_slot=None,
+            warm_next=None,
+            proj_in=proj[lay & 1] if args.shift else None,
+            proj_out=proj[(lay + 1) & 1] if args.shift else None,
+            # The next layer's QKVG: this one's (every launch has the same).
+            next_qkvg=attn_ops[0] if args.shift else None,
+            trace_buf=trace_buf,
+            stuck_rec=stuck_rec,
+            rank=rank,
+            full=args.full,
+            rows=R,
+            chain=args.rows,
+            whole_rows=False,  # the owned residual columns
+            check_parity=True,  # the bench's launches alternate
+            compile_only=False,
         )
 
     def run(cold: bool) -> None:
@@ -384,7 +395,7 @@ def worker(rank: int, port: int, args) -> None:
                 # must alternate from one launch to the next (mailbox.Peers).
                 # With layer 1 every time, a fast rank's next launch could
                 # overwrite the copy a slow rank still polled, and every rank
-                # then spun until the fail-stop trap (~1 run in 100).
+                # then spun until the fail-stop trap.
                 lay = 2 - len(seen) % 2
                 launch(lay)
                 torch.cuda.synchronize()
@@ -558,17 +569,16 @@ def main() -> None:
         "--bias-std",
         type=float,
         default=0.01,
-        help="router bias spread: 0.01 spreads 8 rows over ~32 of 40 experts "
-        "like served verifies; 0.1 makes them agree (12-18)",
+        help="router bias spread: 0.01 spreads the rows over distinct experts "
+        "like served verifies; 0.1 makes them agree",
     )
     p.add_argument(
         "--distinct",
         type=int,
         default=-1,
         help="redraw the router bias until the rows pick exactly this many "
-        "experts; -1: 4 a row, at least 8, at most 3/4 of --experts (served "
-        "8-row verifies: median 32, "
-        "18-56); 0 keeps --route-seed",
+        "experts; -1: 4 a row, at least 8, at most 3/4 of --experts; 0 keeps "
+        "--route-seed",
     )
     p.add_argument("--route-seed", type=int, default=7, help="router bias seed")
     p.add_argument(

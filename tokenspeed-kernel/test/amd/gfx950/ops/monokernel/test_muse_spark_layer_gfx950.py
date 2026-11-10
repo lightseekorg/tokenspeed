@@ -51,7 +51,6 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel import stuck  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import (  # noqa: E402
     layer,
     moe_tail,
-    stuck_report,
 )
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.qkvg import (  # noqa: E402
     PROJ_WORDS,
@@ -423,12 +422,13 @@ def test_the_kernel_boundary_refuses_experts_of_another_layout():
         prepare_muse_spark_layer(tensors=tensors, max_rows=layer.MAX_ROWS)
 
 
+@pytest.mark.parametrize("solution", [None, "gluon"])
 @pytest.mark.parametrize("full", [False, True])
-def test_the_kernel_boundary_packs_a_layer_for_its_launches(full):
+def test_the_kernel_boundary_packs_a_layer_for_its_launches(full, solution):
     """The runtime packs a layer through the kernel boundary
-    (``prepare_muse_spark_layer``): it returns the packed layer and the
-    mailbox scratch that the plans of every row count up to the launch's
-    rows need."""
+    (``prepare_muse_spark_layer``). A forced solution selects the layer's
+    prepare and decode kernels each of its own op: the gluon prepare packs
+    the layer, and the gluon layer launch runs it."""
     from tokenspeed_kernel.ops.model.muse_spark.monokernel import (
         FusedDecodeLayer,
         prepare_muse_spark_layer,
@@ -437,20 +437,33 @@ def test_the_kernel_boundary_packs_a_layer_for_its_launches(full):
     dev = torch.device("cuda:0")
     tensors = _layer_tensors(0, dev, inputs.layer_shared(42, 3000, 1), 3000, full)
     tensors["experts_kernel"] = "gluon_mxfp4_precomputed_moe_apply"
-    fused = prepare_muse_spark_layer(tensors=tensors, max_rows=layer.MAX_ROWS)
+    fused = prepare_muse_spark_layer(
+        tensors=tensors, max_rows=layer.MAX_ROWS, solution=solution
+    )
 
     assert isinstance(fused, FusedDecodeLayer)
     assert fused.weights.full is full and fused.weights.rank == 0
-    widest = layer.layer_plan(
-        full=full,
-        rows=layer.MAX_ROWS,
-        chain=layer.MAX_ROWS,
-        warm_next=True,
-        own_qkvg=True,
-        next_qkvg=False,
-        check_parity=False,
+    assert fused.decode.name == "gluon_muse_spark_layer_gfx950"
+
+
+def test_the_kernel_boundary_refuses_a_kernel_name_as_its_solution():
+    """One forced solution selects both the prepare and the decode op: a
+    kernel name (here the decode's) would hand the prepare op the decode
+    kernel, and raises instead."""
+    from tokenspeed_kernel.ops.model.muse_spark.monokernel import (
+        prepare_muse_spark_layer,
     )
-    assert fused.scratch_pairs >= widest.scratch_pairs
+    from tokenspeed_kernel.selection import NoKernelFoundError
+
+    dev = torch.device("cuda:0")
+    tensors = _layer_tensors(0, dev, inputs.layer_shared(42, 3000, 1), 3000, False)
+    tensors["experts_kernel"] = "gluon_mxfp4_precomputed_moe_apply"
+    with pytest.raises(NoKernelFoundError):
+        prepare_muse_spark_layer(
+            tensors=tensors,
+            max_rows=layer.MAX_ROWS,
+            solution="gluon_muse_spark_layer_gfx950",
+        )
 
 
 @pytest.mark.parametrize("full", [False, True])
@@ -1140,8 +1153,9 @@ def test_the_bench_stands_in_for_the_absent_ranks_flags_as_raised(
     gpus: int, full: bool, rows: int, requests: int
 ):
     """The layer bench writes ``payload | tag << 32`` into the absent ranks'
-    segments (``tokenspeed_kernel.benchmark.muse_spark_monokernel_gluon``) of every peer region before a launch. A flag pair there must
-    read exactly ``(tag << 32) | 1``, as ``raise_flag_peers`` writes it, from
+    segments (``tokenspeed_kernel.benchmark.muse_spark_monokernel_gluon``)
+    of every peer region before a launch. A flag pair there must read
+    exactly ``(tag << 32) | 1``, as ``raise_flag_peers`` writes it, from
     the first launch on: ``Mailbox.poll_flags`` waits for that value, so a
     ghost flag of payload 0 stops the launch."""
     plan = layer.layer_plan(
@@ -1181,6 +1195,19 @@ def test_the_bench_stands_in_for_the_absent_ranks_flags_as_raised(
                             ), (name, row, rank)
 
 
+def _absent_ranks_plan(full: bool, rows: int, requests: int):
+    """The plan of :func:`_absent_ranks_worker`'s launches."""
+    return layer.layer_plan(
+        full=full,
+        rows=requests * rows,
+        chain=rows,
+        warm_next=False,
+        own_qkvg=True,
+        next_qkvg=False,
+        check_parity=False,
+    )
+
+
 def _absent_ranks_worker(
     rank: int, port: int, full: bool, rows: int, requests: int, record: str
 ) -> None:
@@ -1202,15 +1229,7 @@ def _absent_ranks_worker(
         ctx = get_or_create_context(heap_size=256 << 20)
         group = IrisGroup(ctx, dist.group.WORLD, rank, dev)
         n = requests * rows
-        plan = layer.layer_plan(
-            full=full,
-            rows=n,
-            chain=rows,
-            warm_next=False,
-            own_qkvg=True,
-            next_qkvg=False,
-            check_parity=False,
-        )
+        plan = _absent_ranks_plan(full, rows, requests)
         scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
         ghost = torch.zeros_like(scratch)
         bases = torch.empty(WORLD, dtype=torch.int64, device=dev)
@@ -1306,8 +1325,10 @@ def test_one_gpu_launches_find_every_absent_rank_segment(
         )
     finally:
         if os.path.exists(record):
-            assert not stuck.records(stuck.read_file(record)), "\n".join(
-                stuck_report.describe_file(record)
+            t = stuck.read_file(record)
+            plan = _absent_ranks_plan(full, rows, requests)
+            assert not stuck.records(t), "\n".join(
+                stuck.summarize(t, lambda index: [plan])
             )
 
 
