@@ -561,11 +561,12 @@ def out_stage(
             gl.store(at + 1, h_hi)
         if TAP:
             # Rounded once to BF16 as the regular capture rounds the FP32
-            # stream, into every rank's buffer. Its reader runs after later
-            # collectives of the forward, which order these stores before it.
+            # stream, into every rank's buffer: the stores to other GPUs write
+            # through, and the reader runs after later collectives of the
+            # forward.
             t_at = tap + row.to(gl.int64) * tap_row + tap_col + c
             for p in gl.static_range(WORLD):
                 peer_at = mb.peers.translate(t_at, p)
-                gl.store(peer_at, h_lo.to(gl.bfloat16))
-                gl.store(peer_at + 1, h_hi.to(gl.bfloat16))
+                gl.store(peer_at, h_lo.to(gl.bfloat16), cache_modifier=".wt")
+                gl.store(peer_at + 1, h_hi.to(gl.bfloat16), cache_modifier=".wt")
     mb.stamp(STAGE, trace.END)
