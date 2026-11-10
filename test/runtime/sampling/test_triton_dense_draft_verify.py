@@ -23,10 +23,13 @@
 distributions (``SamplingBatchInfo.draft_probs``) and a sampled draft tree
 against its draft q (``DraftTreeQ``) both emit exactly the target
 distribution p' of the batch's route, and greedy requests stay deterministic.
+A chain whose drafts come from the drafter's own proposal sampler, with q cut
+to the request's top-k / top-p, emits p' too.
 """
 
 import os
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -34,6 +37,10 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 from ci_system.ci_register import register_cuda_ci
 
+from tokenspeed.runtime.execution.drafter.speculative_sampling import (
+    DraftProposalSampler,
+)
+from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 from tokenspeed.runtime.sampling.backends.base import SamplingBackendConfig
 from tokenspeed.runtime.sampling.backends.triton import TritonSamplingBackend
@@ -184,6 +191,127 @@ def test_chain_with_recorded_draft_probs_emits_the_target_distribution(route):
     want = float(torch.minimum(p_rows[0], q_rows[0].double()).sum())
     total = rounds * BS
     assert abs(accepted / total - want) < 4 * (want * (1 - want) / total) ** 0.5
+
+
+@pytest.mark.parametrize("route", list(ROUTES))
+def test_chain_drafted_by_the_proposal_sampler_emits_the_target_distribution(
+    route,
+):
+    """Drafts from DraftProposalSampler on its own logits: q is recorded cut
+    to the route's top-k / top-p (the softmax at the temperature without a
+    cut), the drafts follow it, the first emitted token follows p' of row 0
+    and the first draft is accepted with probability sum(min(p', q))."""
+    n, rounds = 3, 160
+    generator = torch.Generator().manual_seed(3)
+    params = ROUTES[route]
+    backend = _backend(n, [params] * BS, f"proposal_{route}", tree=False)
+    states = RuntimeStates(BS, VOCAB, VOCAB, n, "cuda")
+    states.init_draft_probs(spec_num_tokens=n, reject_threshold=THRESHOLD)
+    slots = torch.arange(1, BS + 1, device="cuda")
+    sampler = DraftProposalSampler(
+        pools=backend.speculative_sampling_pools(),
+        runtime_states=states,
+        # The executor's batch-ordered pool index buffers.
+        input_buffers=SimpleNamespace(
+            max_bs=BS,
+            req_pool_indices_buf=slots,
+            state_write_req_pool_indices_buf=slots,
+        ),
+        spec_num_tokens=n,
+        vocab_map=None,
+        device="cuda",
+    )
+    row_logits = torch.randn(n, VOCAB, generator=generator) * 2
+    p_rows = torch.stack([_route_probs(row_logits[r], params) for r in range(n)])
+    # The draft head disagrees with the target, so q's cut differs from p''s.
+    draft_logits = row_logits[: n - 1] + torch.randn(n - 1, VOCAB, generator=generator)
+    q_rows = torch.stack([_route_probs(draft_logits[s], params) for s in range(n - 1)])
+    if route == "top_k_top_p":
+        assert bool((q_rows == 0).any(dim=1).all())
+    logits = row_logits.repeat(BS, 1).cuda()
+    first, drafts, accepted = [], [], 0
+    for step in range(rounds):
+        states.valid_cache_lengths[slots] = 16 * step
+        candidates = torch.zeros(BS, n, dtype=torch.int64, device="cuda")
+        for s in range(n - 1):
+            candidates[:, s + 1] = sampler.propose(
+                draft_logits[s].repeat(BS, 1).cuda(), step=s
+            )
+        if step == 0:
+            for s in range(n - 1):
+                torch.testing.assert_close(
+                    states.draft_probs[slots, s].cpu(),
+                    q_rows[s].float().expand(BS, -1),
+                )
+        predict, accept_length = backend.verify(
+            LogitsProcessorOutput(next_token_logits=logits.clone()),
+            _info(16 * step, states.draft_probs),
+            candidates,
+            tree=None,
+        )
+        predict = predict.view(BS, n).cpu()
+        lengths = accept_length.cpu()
+        assert ((lengths >= 1) & (lengths <= n)).all()
+        first.append(predict[:, 0])
+        drafts.append(candidates[:, 1].cpu())
+        accepted += int((lengths >= 2).sum())
+    _assert_follows(torch.cat(drafts), q_rows[0], "first draft")
+    _assert_follows(torch.cat(first), p_rows[0], "first token")
+    want = float(torch.minimum(p_rows[0], q_rows[0]).sum())
+    total = rounds * BS
+    assert abs(accepted / total - want) < 4 * (want * (1 - want) / total) ** 0.5
+
+
+def test_proposal_sampler_keeps_at_most_the_best_128_tokens():
+    """Over a vocab wider than the cut's 128 tokens, q is the softmax over a
+    row's best min(top_k, 128) logits, then top-p, as the verifier's top-k
+    routes cut the target: a row without a top-k keeps its best 128 tokens."""
+    vocab, pad = 1000, 128
+    params = [
+        dict(temperature=0.7, top_k=-1, top_p=1.0),
+        dict(temperature=1.0, top_k=200, top_p=1.0),
+        dict(temperature=0.8, top_k=-1, top_p=0.9),
+        dict(temperature=0.6, top_k=20, top_p=0.95),
+    ]
+    bs, n = len(params), 2
+    pools = SimpleNamespace(
+        temperature=torch.tensor([1.0] + [p["temperature"] for p in params]),
+        top_k=torch.tensor(
+            [1 << 30] + [p["top_k"] if p["top_k"] > 0 else 1 << 30 for p in params],
+            dtype=torch.int32,
+        ),
+        top_p=torch.tensor([1.0] + [p["top_p"] for p in params]),
+        seed=torch.arange(bs + 1, dtype=torch.int64),
+    )
+    pools = SimpleNamespace(**{k: v.cuda() for k, v in vars(pools).items()})
+    states = RuntimeStates(bs, vocab, vocab, n, "cuda")
+    states.init_draft_probs(spec_num_tokens=n, reject_threshold=THRESHOLD)
+    slots = torch.arange(1, bs + 1, device="cuda")
+    sampler = DraftProposalSampler(
+        pools=pools,
+        runtime_states=states,
+        input_buffers=SimpleNamespace(
+            max_bs=bs,
+            req_pool_indices_buf=slots,
+            state_write_req_pool_indices_buf=slots,
+        ),
+        spec_num_tokens=n,
+        vocab_map=None,
+        device="cuda",
+    )
+    # Flat logits, so the mass past the best 128 tokens is far from negligible.
+    logits = torch.randn(bs, vocab, generator=torch.Generator().manual_seed(4)) * 0.5
+
+    sampler.propose(logits.cuda(), step=0)
+
+    for r, p in enumerate(params):
+        top_k = min(p["top_k"] if p["top_k"] > 0 else vocab, pad)
+        want = _route_probs(logits[r], dict(p, top_k=top_k))
+        torch.testing.assert_close(
+            states.draft_probs[r + 1, 0].cpu(), want.float(), msg=f"row {r}"
+        )
+    kept = (states.draft_probs[1 : bs + 1, 0] > 0).sum(dim=1).tolist()
+    assert kept[0] == kept[1] == pad and kept[2] < pad and kept[3] <= 20
 
 
 def test_greedy_requests_accept_the_argmax_chain():

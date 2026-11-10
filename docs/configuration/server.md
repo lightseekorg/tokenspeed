@@ -748,8 +748,14 @@ round's verify accepts with `coin * q(x) < p(x)` and resamples from
 `norm(relu(p - q))`. Both rules serve `p`. The draft-prob rule accepts
 `1 - TV(p, q)` of the drafts, which is markedly higher than `p(argmax q)` when
 requests sample at temperature. Greedy requests behave identically under both
-rules. `top_k`, `top_p`, `min_p`, penalties, and `logit_bias` stay on the
-verifier's side. `q` only follows the temperature.
+rules. `q` also takes the request's `top_k` and `top_p` cut, the way the
+triton verifier's top-k routes cut `p`: the softmax at `temperature` over the
+best `min(top_k, 128)` draft logits, then the tokens whose mass above them is
+below `top_p`, renormalized. The step drafts from that cut `q` and records it.
+Mass outside the cut could never be accepted, so the cut raises the acceptance
+rate; the rule stays exact for any recorded `q`. A request without a `top_k`
+keeps its best 128 draft tokens. `min_p`, penalties, and `logit_bias` stay on
+the verifier's side.
 
 A request admitted has no
 recorded `q` for its first chain: its rows hold a sentinel above
