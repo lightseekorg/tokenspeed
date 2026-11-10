@@ -289,18 +289,21 @@ def _pack(model, index, window, qkvg, o, pool, post, gains, experts):
 
 class CompiledLaunches:
     """The layer launches every rank has compiled. A launch's binary is set by
-    its layer, its rows, the rows of each request (chain) and whether it hands
-    whole rows on; one not compiled yet must compile on every rank before
+    its layer, its rows, the rows of each request (chain), whether it hands
+    whole rows on and whether it stores a draft's tap (both compile-time
+    arguments of the kernel); one not compiled yet must compile on every rank before
     any rank runs it (a first launch that compiles inside the real launch
     leaves the faster ranks polling for it)."""
 
     def __init__(self) -> None:
-        self._done: set[tuple[int, int, int, bool]] = set()
+        self._done: set[tuple[int, int, int, bool, bool]] = set()
 
-    def first(self, index: int, rows: int, chain: int, whole_rows: bool) -> bool:
+    def first(
+        self, index: int, rows: int, chain: int, whole_rows: bool, tap: bool
+    ) -> bool:
         """Whether this is the first launch of its binary, which the caller
         then compiles on every rank. Records it as compiled."""
-        key = (index, rows, chain, whole_rows)
+        key = (index, rows, chain, whole_rows, tap)
         if key in self._done:
             return False
         self._done.add(key)
@@ -650,10 +653,12 @@ class MuseSparkMonokernelLayer(MonokernelLayer):
             operands["tap"] = state.taps
             operands["tap_slot"] = slot_of_next
         # A forward with a capture sink and one without differ in whole_rows
-        # before a tapped layer, and the same rows can be requests of
-        # different chains (2 rows: two decodes or one 2-token verify): each
-        # variant compiles on every rank first.
-        if state.compiled.first(index, rows, chain, whole_rows):
+        # before a tapped layer and in whether the launch stores the tap, and
+        # the same rows can be requests of different chains (2 rows: two
+        # decodes or one 2-token verify): each variant compiles on every rank
+        # first.
+        tap = operands["tap"] is not None
+        if state.compiled.first(index, rows, chain, whole_rows, tap):
             # A launch traps when its peers' values do not come within about
             # a minute, and a first launch compiles for longer on some ranks
             # than on others: every rank compiles, then the ranks meet.

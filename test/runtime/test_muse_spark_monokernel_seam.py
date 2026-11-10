@@ -105,11 +105,21 @@ def test_each_request_split_of_the_same_rows_compiles_ahead_once() -> None:
     # compiled on every rank before its first launch, and only then.
     compiled = CompiledLaunches()
     for rows, chain in ((2, 1), (2, 2), (8, 8), (8, 4)):
-        assert compiled.first(5, rows, chain, False)
+        assert compiled.first(5, rows, chain, False, False)
     for rows, chain in ((2, 1), (2, 2), (8, 8), (8, 4)):
-        assert not compiled.first(5, rows, chain, False)
-    assert compiled.first(5, 2, 1, True)
-    assert compiled.first(6, 2, 1, False)
+        assert not compiled.first(5, rows, chain, False, False)
+    assert compiled.first(5, 2, 1, True, False)
+    assert compiled.first(6, 2, 1, False, False)
+
+
+def test_a_launch_that_stores_a_tap_compiles_ahead_once() -> None:
+    # Storing a draft's tap is a compile-time argument of the kernel (TAP):
+    # the same layer and rows with and without a tap are two binaries, so the
+    # tapped one compiles on every rank before its first launch too.
+    compiled = CompiledLaunches()
+    assert compiled.first(60, 8, 8, False, False)
+    assert compiled.first(60, 8, 8, False, True)
+    assert not compiled.first(60, 8, 8, False, True)
 
 
 def test_launches_between_fused_layers_hand_the_projection_on() -> None:
