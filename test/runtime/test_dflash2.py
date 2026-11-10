@@ -146,6 +146,49 @@ def test_dflash2_mla_model_mode_and_yarn_config() -> None:
     }
 
 
+@_CUDA_ONLY
+def test_mla_draft_layers_build_windowed_mla_attention() -> None:
+    from transformers import PretrainedConfig
+
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.models.kimi_k3_dspark import K3DSparkAttention
+
+    config = PretrainedConfig(
+        vocab_size=64,
+        hidden_size=256,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        q_lora_rank=64,
+        kv_lora_rank=64,
+        qk_nope_head_dim=32,
+        qk_rope_head_dim=16,
+        v_head_dim=32,
+        rms_norm_eps=1e-6,
+        max_position_embeddings=4096,
+        rope_theta=10000.0,
+        layer_types=["sliding_attention", "full_attention"],
+        sliding_window=1024,
+        dflash_config={
+            "attention_mode": "mla",
+            "block_size": 16,
+            "conv_group_size": 16,
+            "conv_kernel_size": 2,
+            "selector_rank": 8,
+            "selector_top_k": 4,
+            "target_layer_ids": [0],
+        },
+    )
+    with torch.device("cuda"):
+        model = DFlash2DraftModel(config, Mapping(rank=0, world_size=1))
+
+    for layer, window in zip(model.layers, (1023, -1), strict=True):
+        assert isinstance(layer.self_attn, K3DSparkAttention)
+        assert layer.self_attn.attn_mqa.sliding_window_size == window
+        assert layer.self_attn.attn_mha.sliding_window_size == window
+        assert layer.comm_manager is not None
+
+
 @pytest.mark.parametrize(
     ("attention_config", "expected_sliding_window"),
     (

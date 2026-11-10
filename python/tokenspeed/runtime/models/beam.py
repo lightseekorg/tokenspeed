@@ -1534,7 +1534,19 @@ class BeamLogitsProcessor(LogitsProcessor):
             super().fuse_argmax()
 
     def _get_logits(self, *args, **kwargs):
-        logits = super()._get_logits(*args, **kwargs)
+        return self._capped(super()._get_logits(*args, **kwargs))
+
+    def sampled_shard_dtype(self, lm_head: Any) -> torch.dtype:
+        # The cap turns a shard fp32, as it turns whole rows.
+        if self.beam_softcap is None:
+            return super().sampled_shard_dtype(lm_head)
+        return torch.float32
+
+    def sampled_vocab_shard(self, logits: torch.Tensor, lm_head: Any):
+        # The cap acts per token: each rank caps its shard as the whole rows would be.
+        return super().sampled_vocab_shard(self._capped(logits), lm_head)
+
+    def _capped(self, logits: torch.Tensor) -> torch.Tensor:
         cap = self.beam_softcap
         if cap is None:
             return logits

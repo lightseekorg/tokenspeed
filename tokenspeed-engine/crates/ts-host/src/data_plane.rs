@@ -1109,7 +1109,7 @@ result = (Plane(), ts.Scheduler(cfg))
         };
         let mut data_plane = start(&plane);
         let forward = data_plane
-            .execute(scheduler.next_execution_plan(), &dispatch)
+            .execute(scheduler.next_execution_plan(true, false), &dispatch)
             .unwrap()
             .unwrap();
         let result = data_plane.complete(forward).unwrap();
@@ -1127,7 +1127,7 @@ result = (Plane(), ts.Scheduler(cfg))
         };
         let mut data_plane = start(&plane);
         let forward = data_plane
-            .execute(scheduler.next_execution_plan(), &dispatch)
+            .execute(scheduler.next_execution_plan(true, false), &dispatch)
             .unwrap()
             .unwrap();
         assert_eq!(data_plane.complete(forward).unwrap().output_tokens, [100]);
@@ -1180,12 +1180,12 @@ result = (Plane(), ts.Scheduler(cfg))
         set(&plane, "held", 101);
         let mut data_plane = start(&plane);
         let first = data_plane
-            .execute(scheduler.next_execution_plan(), &dispatch)
+            .execute(scheduler.next_execution_plan(true, false), &dispatch)
             .unwrap()
             .unwrap();
         // The forward thread will sit in this launch until released.
         let second = data_plane
-            .execute(scheduler.next_execution_plan(), &dispatch)
+            .execute(scheduler.next_execution_plan(true, false), &dispatch)
             .unwrap()
             .unwrap();
         // A commit queued behind it would wait forever; release the held
@@ -1217,7 +1217,7 @@ result = (Plane(), ts.Scheduler(cfg))
         Python::attach(|py| plane.setattr(py, "failing", true).unwrap());
         let mut data_plane = start(&plane);
         let forward = data_plane
-            .execute(scheduler.next_execution_plan(), &dispatch)
+            .execute(scheduler.next_execution_plan(true, false), &dispatch)
             .unwrap()
             .unwrap();
         let error = data_plane.complete(forward).unwrap_err();
