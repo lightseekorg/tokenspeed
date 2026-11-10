@@ -1148,3 +1148,47 @@ def test_the_packer_names_every_tensor_of_another_layout():
         f"({WORLD * QKVG}, {HIDDEN}); router: expected torch.float32 ({HIDDEN}, "
         f"256), got torch.float32 (256, {HIDDEN})"
     )
+
+
+def test_the_packer_refuses_experts_past_a_buffer_loads_offset():
+    """The expert stages address the expert tensors with 32-bit buffer-load
+    offsets: a tensor whose bytes reach past 2^31 is refused, the last byte
+    of one that ends exactly there is accepted."""
+    f32, bf16, u8 = torch.float32, torch.bfloat16, torch.uint8
+    row = torch.empty(HIDDEN, dtype=f32)
+    pooled = torch.empty(POOLED, dtype=f32)
+    small = torch.empty(256, 1, dtype=u8, device="meta")
+    # 256 experts of 2^23 bytes end exactly at 2^31; one more byte is past it.
+    at_bound = torch.empty(256, 1 << 23, dtype=u8, device="meta")
+    past = torch.empty(256, (1 << 23) + 1, dtype=u8, device="meta")
+
+    def refusal(w13):
+        try:
+            pack_layer(
+                rank=0,
+                full=False,
+                qkvg=torch.empty(QKVG, HIDDEN, dtype=bf16, device="meta"),
+                o=torch.empty(HIDDEN, Q, dtype=bf16, device="meta"),
+                alpha1=row,
+                beta1=row,
+                pre_gain=row,
+                # Transposed on purpose: the packer always refuses, before it
+                # tiles anything, and lists every tensor it refuses.
+                router=torch.empty(256, HIDDEN, dtype=f32),
+                router_bias=torch.empty(256, dtype=f32),
+                pool=torch.empty(POOLED, HIDDEN, dtype=bf16, device="meta"),
+                experts=(w13, small, small, small),
+                pre_exp_gain=pooled,
+                pen_gain=pooled,
+                post=torch.empty(HIDDEN, POOLED, dtype=bf16, device="meta"),
+                post_gain=row,
+                alpha2=row,
+                beta2=row,
+                in_gain=row,
+            )
+        except ValueError as error:
+            return str(error)
+        return ""
+
+    assert "w13 spans past 2^31 bytes" in refusal(past)
+    assert "w13" not in refusal(at_bound)

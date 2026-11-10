@@ -224,6 +224,15 @@ def pack_layer(
         errors.append(
             f"experts: expected {EXPERTS} experts, got {w13.shape[0]} and {w2.shape[0]}"
         )
+    # The expert stages read these with buffer loads, whose byte offset (the
+    # expert's offset plus the in-expert one) is 32-bit: every byte of each
+    # tensor must lie below 2^31.
+    for name, t in (("w13", w13), ("w13 scales", w13s), ("w2", w2), ("w2 scales", w2s)):
+        end = 1 + sum((n - 1) * st for n, st in zip(t.shape, t.stride()))
+        if end * t.element_size() > 2**31:
+            errors.append(
+                f"experts: {name} spans past 2^31 bytes, past a buffer load's offset"
+            )
     if errors:
         raise ValueError("; ".join(errors))
     own = slice(rank * OWNED, (rank + 1) * OWNED)
