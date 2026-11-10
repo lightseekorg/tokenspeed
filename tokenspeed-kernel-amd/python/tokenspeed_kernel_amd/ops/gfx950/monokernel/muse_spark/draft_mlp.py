@@ -338,8 +338,8 @@ def _sum_norm(
         (RED,), (src[:, None] * (OWNED // 2) + task * (SUM_COLS // 2) + j[None, :],)
     )
     mb.stamp(SUM, trace.READY)
-    lo_all = (got << 16).to(gl.float32, bitcast=True)
-    hi_all = (got & -65536).to(gl.float32, bitcast=True)
+    lo_all = mx.bf16_half(got, 0)
+    hi_all = mx.bf16_half(got, 1)
     # The rank order of the regular path's reduction: 0, then 1, ...
     lo = gl.zeros([SUM_COLS // 2], gl.float32, gl.SliceLayout(0, rl))
     hi = gl.zeros([SUM_COLS // 2], gl.float32, gl.SliceLayout(0, rl))
@@ -532,10 +532,10 @@ def conv0_stage(
     d1 = coefficient(mb, rc, GROUPS + g, CPART)
     mb.stamp(STAGE, trace.READY)
     live = (rc % BLOCK) >= 1  # tap 1 stays within the row's block
-    h_lo = (h_w << 16).to(gl.float32, bitcast=True)
-    h_hi = (h_w & -65536).to(gl.float32, bitcast=True)
-    p_lo = (hp_w << 16).to(gl.float32, bitcast=True)
-    p_hi = (hp_w & -65536).to(gl.float32, bitcast=True)
+    h_lo = mx.bf16_half(h_w, 0)
+    h_hi = mx.bf16_half(h_w, 1)
+    p_lo = mx.bf16_half(hp_w, 0)
+    p_hi = mx.bf16_half(hp_w, 1)
     y_lo = (b0_lo + d0) * h_lo + gl.where(live, (b1_lo + d1) * p_lo, 0.0)
     y_hi = (b0_hi + d0) * h_hi + gl.where(live, (b1_hi + d1) * p_hi, 0.0)
     word = (y_lo.to(gl.bfloat16).to(gl.int16, bitcast=True).to(gl.int32) & 0xFFFF) | (

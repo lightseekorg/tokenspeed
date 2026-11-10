@@ -22,6 +22,9 @@
 
 from tokenspeed_kernel_amd._triton import gl
 
+POST_EPS = gl.constexpr(1e-8)
+PRE_EPS = gl.constexpr(1e-5)
+
 WORLD = gl.constexpr(8)
 HIDDEN = gl.constexpr(8192)
 OWNED = gl.constexpr(1024)  # HIDDEN / WORLD: hidden columns a rank owns

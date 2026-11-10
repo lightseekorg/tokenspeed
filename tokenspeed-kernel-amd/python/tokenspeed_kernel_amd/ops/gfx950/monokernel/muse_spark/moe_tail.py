@@ -65,13 +65,18 @@ from tokenspeed_kernel_amd._triton import gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.monokernel import (
     bf16,
     mailbox,
+    mx,
     schedule,
     trace,
 )
-from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.attn_tail import OWNED
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.attn_tail import (
+    OWNED,
+    norm_scales,
+)
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.dims import (
     HIDDEN,
     POOLED,
+    POST_EPS,
     WORLD,
 )
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.moe_experts import (
@@ -86,8 +91,6 @@ UNPOOL_TASKS = gl.constexpr(64)
 UNPOOL_COLS = gl.constexpr(16)
 SUMS = gl.constexpr(4)
 OUT_TASKS = gl.constexpr(16)
-POST_EPS = gl.constexpr(1e-8)
-PRE_EPS = gl.constexpr(1e-5)
 AH_AT = gl.constexpr(int(HIDDEN) // 2)  # where ``alpha h'`` starts in ``ffn``
 SUMS_AT = gl.constexpr(3 * int(HIDDEN) // 2)  # where the sums start in ``ffn``
 
@@ -222,8 +225,8 @@ def comb_stages(mb, task, pen_gain, RANK: gl.constexpr):
         ("rr",), (((src * TOP_K + k) * OWNED_OUT + task * COMB_COLS) // 2 + j,)
     )
     mb.stamp("comb1", trace.READY)
-    lo_all = (got << 16).to(gl.float32, bitcast=True)
-    hi_all = (got & -65536).to(gl.float32, bitcast=True)
+    lo_all = mx.bf16_half(got, 0)
+    hi_all = mx.bf16_half(got, 1)
     # The rank order of the regular path's reduction: 0, then 1, ...
     lo = gl.zeros([TOP_K, COMB_COLS // 2], gl.float32, L2)
     hi = gl.zeros([TOP_K, COMB_COLS // 2], gl.float32, L2)
@@ -265,7 +268,7 @@ def _ffn_norms(mb):
     norm of ``mb``'s row, from every rank's sums in ``ffn``."""
     _pre_poll_sums(mb)
     (got,) = mb.poll_many(("ffn",), (_ffn_sums_index(),))
-    return _ffn_scales(got)
+    return norm_scales(got)
 
 
 @gluon.jit
@@ -299,23 +302,6 @@ def _ffn_sums_index():
     rt = gl.arange(0, WORLD * UNPOOL_TASKS, gl.SliceLayout(1, sl))[:, None]
     qt = gl.arange(0, SUMS, gl.SliceLayout(0, sl))[None, :]
     return SUMS_AT + rt * SUMS + qt
-
-
-@gluon.jit
-def _ffn_scales(got):
-    """:func:`_ffn_norms` from the polled sums (:func:`_ffn_sums_index`)."""
-    nw: gl.constexpr = gl.num_warps()
-    sl: gl.constexpr = gl.BlockedLayout([1, SUMS], [64, 1], [nw, 1], [1, 0])
-    qt = gl.arange(0, SUMS, gl.SliceLayout(0, sl))
-    total = gl.sum(got.to(gl.float32, bitcast=True), axis=0)  # [4 sums]
-    ss_y = gl.sum(gl.where(qt == 0, total, 0.0), axis=0)
-    ss_by = gl.sum(gl.where(qt == 1, total, 0.0), axis=0)
-    ss_x = gl.sum(gl.where(qt == 2, total, 0.0), axis=0)
-    ss_ah = gl.sum(gl.where(qt == 3, total, 0.0), axis=0)
-    inv = gl.rsqrt(ss_y / HIDDEN + POST_EPS)
-    # The sum of h''^2 over all columns: inv^2 ss_by + 2 inv ss_x + ss_ah.
-    ss_h = gl.maximum(inv * inv * ss_by + 2.0 * inv * ss_x + ss_ah, 0.0)
-    return inv, gl.rsqrt(ss_h / HIDDEN + PRE_EPS)
 
 
 @gluon.constexpr_function
@@ -529,7 +515,7 @@ def out_stage(
             schedule.rows(mb.plan)
         )
         _ffn_word_flags(mb, (row // G) * G - row)
-        inv, inv2 = _ffn_scales(mb.load_words("ffn", _ffn_sums_index()))
+        inv, inv2 = norm_scales(mb.load_words("ffn", _ffn_sums_index()))
         pw = mb.load_words("ffn", i)
         ah_lo = mb.load_words("ffn", AH_AT + c)
         ah_hi = mb.load_words("ffn", AH_AT + c + 1)
@@ -542,8 +528,8 @@ def out_stage(
         )
     mb.stamp(STAGE, trace.READY)
     # y as unpool computed it: the BF16 projection times the gain.
-    y_lo = (pw << 16).to(gl.float32, bitcast=True) * post_lo
-    y_hi = (pw & -65536).to(gl.float32, bitcast=True) * post_hi
+    y_lo = mx.bf16_half(pw, 0) * post_lo
+    y_hi = mx.bf16_half(pw, 1) * post_hi
     h_lo = gl.fma(b_lo, y_lo * inv, ah_lo.to(gl.float32, bitcast=True))
     h_hi = gl.fma(b_hi, y_hi * inv, ah_hi.to(gl.float32, bitcast=True))
     word = _bf16_word(h_lo * inv2 * in_lo, h_hi * inv2 * in_hi)

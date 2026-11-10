@@ -285,10 +285,7 @@ def norm_stages(mb, task, gain, RANK: gl.constexpr):
     inv = gl.rsqrt(gl.sum(ss.to(gl.float32, bitcast=True), axis=0) / HIDDEN + EPS)
     h = (v * inv * g).to(gl.bfloat16)
     pl: gl.constexpr = gl.BlockedLayout([2], [64], [nw], [0])
-    lo, hi = gl.split(gl.reshape(gl.convert_layout(h, pl), [SUM_COLS // 2, 2]))
-    hw = (lo.to(gl.int16, bitcast=True).to(gl.int32) & 0xFFFF) | (
-        hi.to(gl.int16, bitcast=True).to(gl.int32) << 16
-    )
+    hw = mx.pack_bf16_pairs(gl.reshape(gl.convert_layout(h, pl), [SUM_COLS // 2, 2]))
     j = gl.arange(0, SUM_COLS // 2, hw.type.layout)
     at = RANK * (OWNED // 2) + t * (SUM_COLS // 2) + j
     for p in gl.static_range(WORLD):

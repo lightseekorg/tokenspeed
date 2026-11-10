@@ -47,7 +47,7 @@ bits, without a hop through tail1.
 from __future__ import annotations
 
 from tokenspeed_kernel_amd._triton import gl, gluon
-from tokenspeed_kernel_amd.ops.gfx950.monokernel import schedule, trace
+from tokenspeed_kernel_amd.ops.gfx950.monokernel import mx, schedule, trace
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.attn_tail import (
     OWNED,
     norm_scales,
@@ -98,8 +98,8 @@ def _owned_b(mb, row, src, j):
     broadcast to the poll's shape; returns ``(lo, hi)`` without the ``src``
     axis."""
     (got,) = mb.poll_many(("red",), (mb.row_offset(row) + src * (OWNED // 2) + j,))
-    lo_all = (got << 16).to(gl.float32, bitcast=True)
-    hi_all = (got & -65536).to(gl.float32, bitcast=True)
+    lo_all = mx.bf16_half(got, 0)
+    hi_all = mx.bf16_half(got, 1)
     AX: gl.constexpr = len(got.shape) - 2
     # tail1 starts from zeros; 0 + x is x (and +0 for -0), as is rank 0's
     # sum with zeros, so rank 0's term starts the sum here.

@@ -102,7 +102,11 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.quantize_gluon import (
     scaled_downcast_layout,
 )
 from tokenspeed_kernel_amd.ops.gfx950.monokernel import mx, schedule, trace
-from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.dims import POOLED, WORLD
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.dims import (
+    POOLED,
+    PRE_EPS,
+    WORLD,
+)
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import Stage, placement
 
 TOP_K = gl.constexpr(8)
@@ -145,7 +149,6 @@ EX2_GATHER = gl.constexpr(8)
 # while exr finishes instead of after the gather. 3 gained about half as much.
 EX2_AHEAD = gl.constexpr(4)
 OWNED_OUT = gl.constexpr(512)  # output columns a rank reduces: POOLED / WORLD
-PRE_EPS = gl.constexpr(1e-5)
 
 # The lane each group of 32 expert CTAs serves, per plan: slot i runs on
 # lane i % 8, so when U % 8 != 0 lanes 0 .. U % 8 - 1 carry one slot more.
@@ -771,8 +774,8 @@ def _xq_quantize(got, ks, gain_lo, gain_hi):
     nw: gl.constexpr = gl.num_warps()
     cl: gl.constexpr = _cg_layout(nw)
     q = gl.arange(0, KSPLIT, gl.SliceLayout(0, gl.SliceLayout(2, cl)))[None, :, None]
-    lo = (got << 16).to(gl.float32, bitcast=True)
-    hi = (got & -65536).to(gl.float32, bitcast=True)
+    lo = mx.bf16_half(got, 0)
+    hi = mx.bf16_half(got, 1)
     inv = gl.rsqrt(
         gl.sum(gl.sum(lo * lo + hi * hi, axis=1), axis=1) / POOLED + PRE_EPS
     )[:, None]

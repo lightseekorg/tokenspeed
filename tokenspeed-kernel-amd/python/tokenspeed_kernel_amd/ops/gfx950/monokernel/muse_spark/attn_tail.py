@@ -54,6 +54,8 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel import bf16, mx, schedule, trac
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.dims import (
     HIDDEN,
     OWNED,
+    POST_EPS,
+    PRE_EPS,
     WORLD,
     Q,
 )
@@ -64,8 +66,6 @@ OPROJ_COLS = gl.constexpr(64)
 TAIL_TASKS = gl.constexpr(8)
 TAIL_COLS = gl.constexpr(128)
 SUMS = gl.constexpr(4)  # partial sums a tail task puts (see tail_stages)
-POST_EPS = gl.constexpr(1e-8)
-PRE_EPS = gl.constexpr(1e-5)
 
 PEERS = ("red", "ss1", "xin", "xflag")
 # The peer regions that hold flags (Plan.flags).
@@ -156,8 +156,8 @@ def sums_index(num_warps: gl.constexpr):
 
 @gluon.jit
 def norm_scales(got):
-    """The post-attention and pre-FFN norm scales ``(inv, inv2)`` from the
-    polled ``ss1`` pairs (:func:`sums_index`)."""
+    """Post-projection and next-input norm scales from four partial sums:
+    projection squares, gated squares, cross term, and residual squares."""
     total = gl.sum(got.to(gl.float32, bitcast=True), axis=0)  # [SUMS]
     q = gl.arange(0, SUMS, total.type.layout)
     ss_b = gl.sum(gl.where(q == 0, total, 0.0), axis=0)
@@ -202,8 +202,8 @@ def tail_stages(mb, task, h, alpha, beta, pre_gain, RANK: gl.constexpr):
         ("red",), (src[:, None] * (OWNED // 2) + task * (TAIL_COLS // 2) + j[None, :],)
     )
     mb.stamp("tail1", trace.READY)
-    lo_all = (got << 16).to(gl.float32, bitcast=True)
-    hi_all = (got & -65536).to(gl.float32, bitcast=True)
+    lo_all = mx.bf16_half(got, 0)
+    hi_all = mx.bf16_half(got, 1)
     # The rank order of the regular path's reduction: 0, then 1, ...
     lo = gl.zeros([TAIL_COLS // 2], gl.float32, gl.SliceLayout(0, rl))
     hi = gl.zeros([TAIL_COLS // 2], gl.float32, gl.SliceLayout(0, rl))

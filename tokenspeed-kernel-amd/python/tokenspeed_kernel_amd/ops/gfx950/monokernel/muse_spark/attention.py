@@ -320,13 +320,15 @@ def _issue_kv(
 
 
 @gluon.jit
-def _softmax_step(q, keys, values, valid, m, l, acc, p_layout: gl.constexpr):
-    """One chunk of the online base-2 softmax: ``keys [64, N]`` and
-    ``values [N, 64]`` (an operand layout and LDS), where ``valid [QM, N]``."""
+def _softmax_step(
+    q, keys, values, valid, m, l, acc, p_layout: gl.constexpr, scale: gl.constexpr
+):
+    """One chunk of the online base-2 softmax: ``keys [D, N]`` and
+    ``values [N, D]`` (an operand layout and LDS), where ``valid [QM, N]``."""
     pv_mma: gl.constexpr = acc.type.layout
     scores = gl.zeros([q.shape[0], keys.shape[1]], gl.float32, valid.type.layout)
     scores = gl.amd.cdna4.mfma(q, keys, scores)
-    scores = gl.where(valid, scores * QK_SCALE, float("-inf"))
+    scores = gl.where(valid, scores * scale, float("-inf"))
     m_new = gl.maximum(m, gl.max(scores, axis=1))
     m_safe = gl.where(m_new == float("-inf"), 0.0, m_new)
     alpha = gl.exp2(m - m_safe)
@@ -635,6 +637,7 @@ def _ring_keys(
             l,
             acc,
             p_layout,
+            QK_SCALE,
         )
         i += 1
     # No copy may still write LDS when the launch moves on.
@@ -931,6 +934,7 @@ def attn_stage(
         l,
         acc,
         p_layout,
+        QK_SCALE,
     )
     mb.stamp(STAGE, trace.COMPUTED)
     l_acc = gl.convert_layout(l, gl.SliceLayout(1, pv_mma))

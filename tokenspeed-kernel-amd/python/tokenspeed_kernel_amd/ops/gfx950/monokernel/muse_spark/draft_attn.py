@@ -64,6 +64,9 @@ from __future__ import annotations
 from tokenspeed_kernel_amd._triton import gl, gluon
 from tokenspeed_kernel_amd.ops.gfx950.monokernel import mx, schedule, trace
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import draft_mlp
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.attention import (
+    _softmax_step,
+)
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.dims import (
     DRAFT_BLOCK,
     DRAFT_HEAD_DIM,
@@ -253,10 +256,7 @@ def head_stage(
     pl: gl.constexpr = gl.BlockedLayout([2], [64], [nw], [0])
     vals = gl.convert_layout(vals, pl)
     pair = gl.reshape(vals, [HALF, 2])
-    lo, hi = gl.split(pair)
-    word = (lo.to(gl.int16, bitcast=True).to(gl.int32) & 0xFFFF) | (
-        hi.to(gl.int16, bitcast=True).to(gl.int32) << 16
-    )
+    word = mx.pack_bf16_pairs(pair)
     p = gl.arange(0, HALF, word.type.layout)
     if is_q:
         mb.put("qh", head * (HEAD // 2) + p, word)
@@ -317,28 +317,10 @@ def _load_kv(
 
 
 @gluon.jit
-def _softmax_step(q, keys, values, valid, m, l, acc, p_layout: gl.constexpr):
-    """One chunk of the online base-2 softmax (as the target layer's)."""
-    pv_mma: gl.constexpr = acc.type.layout
-    scores = gl.zeros([q.shape[0], keys.shape[1]], gl.float32, valid.type.layout)
-    scores = gl.amd.cdna4.mfma(q, keys, scores)
-    scores = gl.where(valid, scores * QK_SCALE, float("-inf"))
-    m_new = gl.maximum(m, gl.max(scores, axis=1))
-    m_safe = gl.where(m_new == float("-inf"), 0.0, m_new)
-    alpha = gl.exp2(m - m_safe)
-    p = gl.exp2(scores - m_safe[:, None])
-    l = l * alpha + gl.sum(p, axis=1)
-    pv = gl.zeros(acc.shape, gl.float32, pv_mma)
-    pv = gl.amd.cdna4.mfma(gl.convert_layout(p.to(gl.bfloat16), p_layout), values, pv)
-    acc = acc * gl.convert_layout(alpha, gl.SliceLayout(1, pv_mma))[:, None] + pv
-    return m_new, l, acc
-
-
-@gluon.jit
 def _bf16_rows(got):
     """``[N, 128]`` FP32 of polled BF16 pairs ``[N, 64]``."""
-    lo = (got << 16).to(gl.float32, bitcast=True)
-    hi = (got & -65536).to(gl.float32, bitcast=True)
+    lo = mx.bf16_half(got, 0)
+    hi = mx.bf16_half(got, 1)
     return gl.reshape(gl.join(lo, hi), [got.shape[0], HEAD])
 
 
@@ -444,7 +426,7 @@ def attn_stage(
     # and no second chunk's registers.
     gl.barrier()
     m, l, acc = _softmax_step(
-        q, keys, v_smem.load(v_layout), valid, m, l, acc, p_layout
+        q, keys, v_smem.load(v_layout), valid, m, l, acc, p_layout, QK_SCALE
     )
     # The block's keys, for every row (the block is non-causal).
     gl.barrier()
@@ -460,6 +442,7 @@ def attn_stage(
         l,
         acc,
         p_layout,
+        QK_SCALE,
     )
     mb.stamp(STAGE, trace.COMPUTED)
     l_acc = gl.convert_layout(l, gl.SliceLayout(1, pv_mma))
