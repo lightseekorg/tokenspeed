@@ -139,6 +139,7 @@ def _worker(rank: int, port: int, seed: int) -> None:
                 start, start + ROWS, dtype=torch.int32, device=device
             )
             slots = far + torch.randperm(slots_n, generator=g, device=device)[:ROWS]
+            slots = slots.to(torch.int32)
             # The second launch, at other rows, runs the first one's binary.
             with (
                 assert_no_triton_compile(
@@ -182,7 +183,9 @@ def _worker(rank: int, port: int, seed: int) -> None:
                 torch.arange(64000, 64000 + ROWS, dtype=torch.int32, device=device),
             ]
         )
-        slots = torch.randperm(slots_n, generator=g, device=device)[: 2 * ROWS]
+        slots = torch.randperm(slots_n, generator=g, device=device, dtype=torch.int32)[
+            : 2 * ROWS
+        ]
         caches = {}
         for name, rows, step in (
             ("a", slice(0, ROWS), 5),
@@ -272,7 +275,9 @@ def test_one_binary_serves_every_step_position_and_slot():
             positions=torch.arange(
                 start, start + rows, dtype=torch.int32, device=device
             ),
-            slots=torch.randperm(4096, generator=g, device=device)[:rows],
+            slots=torch.randperm(4096, generator=g, device=device, dtype=torch.int32)[
+                :rows
+            ],
             k_caches=caches[:LAYERS],
             v_caches=caches[LAYERS:],
             cos_sin=cos_sin,
