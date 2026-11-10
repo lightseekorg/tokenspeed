@@ -515,6 +515,7 @@ def test_kda_fused_verify_selects_all_layout_traits(
         "num_heads": 1,
         "head_dim": 1,
         "spec_query_len": 1,
+        "batch_size": 1,
         "split_producers": False,
     }
     assert selected == expected

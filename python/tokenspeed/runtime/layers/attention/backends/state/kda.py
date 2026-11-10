@@ -857,7 +857,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
             qkv, f_a, beta, gate = self._replay_payload(layer_id)
             rows = batch_size * draft_token_num
             heads = value_dim // attn_tp_size // head_v_dim
-            # One-token windows project the gate and convolve inside verify.
+            # Small batches project the gate and convolve inside verify.
             split = self._verify_split_producers and not (
                 g_raw is None
                 and bias is None
@@ -867,6 +867,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
                     num_heads=heads,
                     head_dim=head_v_dim,
                     draft_token_num=draft_token_num,
+                    batch_size=batch_size,
                 )
             )
             split_producers = {}

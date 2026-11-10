@@ -443,8 +443,8 @@ if current_platform().is_nvidia and has_optional_package("cutlass", "quack"):
             vendors=frozenset({"nvidia"}),
         ),
         signatures=format_signatures(("q", "k", "v"), "dense", {torch.bfloat16}),
-        # Above the split producers, which multi-token windows still take.
-        priority=Priority.SPECIALIZED + 2,
+        # Above the window kernel, which also admits one-token windows.
+        priority=Priority.SPECIALIZED + 3,
         traits={
             # A bound, so callers that do not state the window never select it.
             "spec_query_len_max": frozenset({1}),
@@ -576,6 +576,159 @@ if current_platform().is_nvidia and has_optional_package("cutlass", "quack"):
             read_indices,
             num_heads,
             head_dim,
+            out.view(rows, num_heads * head_dim),
+            replay_records.metadata,
+            replay_records.stamps,
+            output_norm,
+        )
+        return out if output_norm is None else out.view(rows, num_heads * head_dim)
+
+    @register_kernel(
+        "attention",
+        "kda_fused_paged_verify",
+        name="cute_dsl_kda_fused_paged_verify_window",
+        solution="cute_dsl",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 3),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=format_signatures(("q", "k", "v"), "dense", {torch.bfloat16}),
+        # Below the one-token kernel, above the split producers.
+        priority=Priority.SPECIALIZED + 2,
+        traits={
+            # Past 16 requests the split producers' GEMM outruns the per-head
+            # CUDA-core projection (GB300 W=8: 0.86x at 16, 1.05x at 32).
+            "batch_size_max": frozenset({16}),
+            "spec_query_len_max": frozenset({16}),
+            "paged_state": frozenset({True}),
+            "recurrent_layout": frozenset({"v_major"}),
+            "replay_records": frozenset({True}),
+            "split_producers": frozenset({False}),
+            "store_states": frozenset({False}),
+        },
+    )
+    def cute_dsl_kda_fused_paged_verify_window(
+        mixed_qkv: torch.Tensor,
+        conv_weights: torch.Tensor,
+        conv_states: torch.Tensor,
+        conv_scratch: torch.Tensor,
+        f_a_out: torch.Tensor,
+        f_b_weight: torch.Tensor,
+        beta_logits: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        *,
+        state_pool: torch.Tensor,
+        state_scratch: torch.Tensor | None,
+        read_indices: torch.Tensor,
+        write_indices: torch.Tensor,
+        num_heads: int,
+        head_dim: int,
+        draft_token_num: int,
+        lower_bound: float | None,
+        replay_records: KdaReplayRecords | None,
+        output_norm: KdaOutputNorm | None,
+    ) -> torch.Tensor:
+        """Run multi-token record verify with the gate and convolution producers fused.
+
+        Same results as the split producers (``f_a_out @ f_b_weight.T`` and
+        ``kda_verify_conv_update``) followed by ``kda_recoverssm_verify`` for
+        windows of 2 to 16 tokens: outputs, correction and key/gate records,
+        stamps, and the pre-convolution rows in ``replay_records.original_qkv``.
+        The recurrent and convolution states are read only. Inputs the CuTe
+        DSL kernel cannot address run those split producers instead.
+        ``output_norm`` is applied before the store.
+
+        Returns the verify output as ``[1, tokens, num_heads, head_dim]``, or
+        with ``output_norm`` the normed ``[tokens, num_heads * head_dim]``.
+        """
+        from tokenspeed_kernel.ops.attention.kda._cute_dsl.fused_verify_window import (
+            fused_verify_window,
+            fused_verify_window_supported,
+        )
+
+        if replay_records is None or replay_records.original_qkv is None:
+            raise ValueError("fused verify window requires records with original rows")
+        batch = read_indices.shape[0]
+        rows = batch * draft_token_num
+        mixed_qkv = mixed_qkv[:rows]
+        f_a_out = f_a_out[:rows]
+        beta_logits = beta_logits[:rows]
+        query_start_loc = replay_records.query_start_loc[: batch + 1]
+        if not fused_verify_window_supported(
+            mixed_qkv,
+            conv_weights,
+            conv_states,
+            f_a_out,
+            f_b_weight,
+            beta_logits,
+            A_log,
+            dt_bias,
+            state_pool,
+            query_start_loc,
+            read_indices,
+            num_heads,
+            head_dim,
+            draft_token_num,
+            lower_bound,
+        ):
+            g_raw = torch.nn.functional.linear(f_a_out, f_b_weight)
+            conv_qkv = kda_verify_conv_update(
+                mixed_qkv,
+                conv_weights,
+                conv_states,
+                read_indices,
+                num_heads=num_heads,
+                head_dim=head_dim,
+                draft_token_num=draft_token_num,
+                recurrent_layout="v_major",
+            )
+            return triton_nvidia_kda_fused_paged_verify_split(
+                mixed_qkv,
+                conv_weights,
+                conv_states,
+                conv_scratch,
+                f_a_out,
+                f_b_weight,
+                beta_logits,
+                A_log,
+                dt_bias,
+                state_pool=state_pool,
+                state_scratch=state_scratch,
+                read_indices=read_indices,
+                write_indices=write_indices,
+                num_heads=num_heads,
+                head_dim=head_dim,
+                draft_token_num=draft_token_num,
+                lower_bound=lower_bound,
+                replay_records=replay_records,
+                output_norm=output_norm,
+                g_raw=g_raw,
+                conv_qkv=conv_qkv,
+            )
+        out = torch.empty(
+            1, rows, num_heads, head_dim, dtype=mixed_qkv.dtype, device=mixed_qkv.device
+        )
+        fused_verify_window(
+            mixed_qkv,
+            conv_weights,
+            conv_states,
+            f_a_out,
+            f_b_weight,
+            beta_logits,
+            A_log,
+            dt_bias,
+            lower_bound,
+            state_pool[:, :num_heads],
+            replay_records.correction,
+            replay_records.key_gate,
+            replay_records.original_qkv,
+            query_start_loc,
+            read_indices,
+            num_heads,
+            head_dim,
+            draft_token_num,
             out.view(rows, num_heads * head_dim),
             replay_records.metadata,
             replay_records.stamps,

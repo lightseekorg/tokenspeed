@@ -559,6 +559,7 @@ def try_kda_fused_paged_verify(
                 "recurrent_layout": recurrent_layout,
                 "replay_records": replay_records is not None,
                 "spec_query_len": draft_token_num,
+                "batch_size": read_indices.shape[0],
                 "split_producers": split_producers,
                 "store_states": store_states,
             },
@@ -655,6 +656,7 @@ def kda_fused_paged_verify_fuses_producers(
     num_heads: int,
     head_dim: int,
     draft_token_num: int,
+    batch_size: int,
 ) -> bool:
     """Whether record verify runs its gate and convolution producers inline.
 
@@ -664,6 +666,7 @@ def kda_fused_paged_verify_fuses_producers(
         num_heads: Per-rank KDA head count.
         head_dim: KDA head width.
         draft_token_num: Tokens per request window.
+        batch_size: Requests in the batch (padding included).
 
     Returns:
         True when the selected record verify for these windows computes the gate
@@ -679,6 +682,7 @@ def kda_fused_paged_verify_fuses_producers(
         "recurrent_layout": recurrent_layout,
         "replay_records": True,
         "spec_query_len": draft_token_num,
+        "batch_size": batch_size,
         "store_states": False,
     }
     try:

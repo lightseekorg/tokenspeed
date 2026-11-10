@@ -309,17 +309,14 @@ def test_unaligned_inputs_fall_back_to_split_producers(unaligned):
         assert torch.equal(ref, got)
 
 
-@pytest.mark.parametrize(("window", "fused"), [(1, True), (2, False), (8, False)])
-def test_one_token_windows_fuse_their_producers(window, fused):
-    assert (
-        kda_fused_paged_verify_fuses_producers(
-            torch.bfloat16,
-            recurrent_layout="v_major",
-            num_heads=HEADS,
-            head_dim=DIM,
-            draft_token_num=window,
-        )
-        is fused
+def test_one_token_windows_fuse_their_producers():
+    assert kda_fused_paged_verify_fuses_producers(
+        torch.bfloat16,
+        recurrent_layout="v_major",
+        num_heads=HEADS,
+        head_dim=DIM,
+        draft_token_num=1,
+        batch_size=64,
     )
 
 
