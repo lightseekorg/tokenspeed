@@ -406,7 +406,12 @@ impl Shared {
             }
             let target_count = targets.len();
             drop(state);
-            tracing::debug!(room, acknowledged, targets = target_count, "attempted KV cancellation");
+            tracing::debug!(
+                room,
+                acknowledged,
+                targets = target_count,
+                "attempted KV cancellation"
+            );
         }
     }
 
