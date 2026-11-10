@@ -84,7 +84,9 @@ def discover_iris_world() -> bool:
 
 def reserve_iris_heap(owner: str, nbytes: int) -> None:
     """Reserve ``nbytes`` of the shared Iris heap for ``owner``, replacing its
-    earlier reservation. Call before the heap exists: a live heap does not grow."""
+    earlier reservation. The heap is created with every reservation on top of
+    the size its creator planned, so call this before the heap exists: a live
+    heap does not grow."""
     from tokenspeed_kernel.ops.communication._iris import reserve_heap
 
     reserve_heap(owner, nbytes)
@@ -100,7 +102,8 @@ def iris_heap_bytes(shape: tuple[int, ...], dtype: torch.dtype) -> int:
 
 def iris_symmetric_heap(group: dist.ProcessGroup, rank: int, device: torch.device):
     """The shared Iris context and the heap addresses of ``group``'s ranks
-    (``rank`` this process's rank in it).
+    (``rank`` this process's rank in it). Buffers allocated from the context
+    must have been reserved (``reserve_iris_heap``) before the heap exists.
 
     Returns:
         ``(context, iris_group)``: ``context.zeros(shape, dtype=)`` allocates
@@ -398,10 +401,10 @@ def create_iris_state(
     if min(staged_max_numel, producer_direct_max_numel) < 0:
         raise ValueError("Iris all-reduce capacities must be non-negative")
     from tokenspeed_kernel.ops.communication._iris import (
+        HEAP_HEADROOM_BYTES,
         MIN_HEAP_BYTES,
         IrisGroup,
         get_or_create_context,
-        heap_headroom_bytes,
     )
 
     device = device or torch.device(f"cuda:{torch.cuda.current_device()}")
@@ -411,7 +414,7 @@ def create_iris_state(
             IrisAllReduce.heap_bytes(
                 staged_max_numel, producer_direct_max_numel, group.size(), dtype
             )
-            + heap_headroom_bytes(),
+            + HEAP_HEADROOM_BYTES,
         )
     ctx = get_or_create_context(heap_size=heap_size)
     peers = IrisGroup(ctx, group, rank_in_group, device)
@@ -467,30 +470,6 @@ def iris_lamport_residual_rmsnorm_supported(
     )
 
     return LamportResidualRMSNorm.supported(world_size, hidden_size)
-
-
-def iris_lamport_residual_rmsnorm_heap_bytes(
-    world_size: int, max_rows: int, hidden_size: int
-) -> int:
-    """The Iris heap bytes ``prepare_iris_lamport_residual_rmsnorm`` allocates.
-
-    Its mailboxes come from the heap's headroom. A caller whose own heap
-    reservations set that headroom (``_iris.reserve_heap``) reserves these
-    bytes too, so the preparation keeps room after the reserved buffers.
-
-    Args:
-        world_size: Number of ranks in the group.
-        max_rows: Most rows one call reduces.
-        hidden_size: Row width in elements.
-
-    Returns:
-        The bytes of both mailboxes at the heap allocator's alignment.
-    """
-    from tokenspeed_kernel.ops.communication._iris.residual_rmsnorm import (
-        LamportResidualRMSNorm,
-    )
-
-    return LamportResidualRMSNorm.heap_bytes(world_size, max_rows, hidden_size)
 
 
 def prepare_iris_lamport_residual_rmsnorm(

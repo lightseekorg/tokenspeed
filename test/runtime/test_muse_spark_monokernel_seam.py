@@ -30,6 +30,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from tokenspeed_kernel.platform import current_platform
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
@@ -59,11 +60,13 @@ from tokenspeed.runtime.models.muse_spark_monokernel import (  # noqa: E402
     OTHER_SHAPES,
     SCALED_KV,
     CompiledLaunches,
+    MuseSparkMonokernelState,
     enable_decode_monokernels,
     hands_whole_rows,
     kv_reasons,
     model_reasons,
     projection_hand_off,
+    reserve_monokernel_heap,
     row_lengths,
     takes_monokernels,
 )
@@ -286,6 +289,62 @@ def test_a_model_the_kernels_cannot_pack_fails_startup() -> None:
     model.layers = torch.nn.ModuleList(_UnpackedLayer() for _ in range(4))
     with pytest.raises(ValueError, match=re.escape(f"{NOT_TP8}: layers 0, 1, 2, 3")):
         enable_decode_monokernels(model)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not current_platform().is_cdna4,
+    reason="the stuck-poll record is a gfx950 kernel's",
+)
+@pytest.mark.parametrize(
+    "taps, stored",
+    [([], 0), ([2, 31, 58], 3), ([1, 31], 0)],
+    ids=["no-draft", "launches-store-taps", "a-tap-after-layer-0"],
+)
+def test_the_state_allocates_what_it_reserved_on_the_iris_heap(
+    monkeypatch, taps, stored
+) -> None:
+    """The model reserves its state's Iris heap buffers before the heap
+    exists, and the heap is created with only those bytes on top of the
+    communication buffers: what the state allocates once it exists is
+    exactly what was reserved, with and without the draft's taps."""
+    from tokenspeed_kernel.ops.communication import _iris
+    from tokenspeed_kernel.ops.model.muse_spark.monokernel import FusedDecodeLayer
+
+    model = torch.nn.Module()
+    model.layers = torch.nn.ModuleList(_UnpackedLayer() for _ in range(62))
+    # Sliding and full layers' plans differ in size; the largest serves all.
+    for index in range(1, 61):
+        model.layers[index].fused = FusedDecodeLayer(
+            decode=None, weights=None, scratch_pairs=4096 + index, late_weights=None
+        )
+    model.layers_to_capture = taps
+    monkeypatch.setattr(_iris, "_reserved", {})
+    reserve_monokernel_heap(model)
+    reserved = _iris._reserved["muse_spark_monokernel"]
+
+    # A heap that records each allocation at the Torch allocator's alignment.
+    allocated: list[int] = []
+
+    class Heap:
+        def zeros(self, shape, dtype):
+            allocated.append(_iris.allocation_bytes(tuple(shape), dtype))
+            return torch.zeros(shape, dtype=dtype, device="cuda")
+
+    class Group:
+        def __init__(self, ctx, group=None, rank=0, device=None):
+            self.bases = torch.zeros(8, dtype=torch.int64)
+
+        def finish_prepare(self) -> None:
+            pass
+
+    monkeypatch.setattr(_iris, "get_or_create_context", lambda heap_size: Heap())
+    monkeypatch.setattr(_iris, "IrisGroup", Group)
+    monkeypatch.setitem(global_server_args_dict, "monokernel_stuck_record_dir", None)
+    fused = {i: layer.fused for i, layer in enumerate(model.layers) if layer.fused}
+    state = MuseSparkMonokernelState(fused, None, None, 0, taps)
+    assert state.scratch.numel() == 4096 + 60
+    assert len(state.tap_slots) == stored
+    assert sum(allocated) == reserved
 
 
 def test_an_fp8_kv_cache_takes_the_kernels(monkeypatch) -> None:

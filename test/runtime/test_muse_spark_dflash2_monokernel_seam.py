@@ -245,17 +245,14 @@ def test_decode_monokernel_packs_a_bf16_tp8_draft() -> None:
 def test_the_draft_reserves_every_iris_heap_buffer_it_allocates(
     monkeypatch, requests
 ) -> None:
-    """What the draft allocates on the Iris heap once it exists (the
-    monokernels' mailbox scratch and the regular layers' fused reduce + norm)
-    is exactly what it reserved before, since the heap's headroom is sized from
-    the reservations: at one and two requests a launch."""
+    """What the draft's monokernels allocate on the Iris heap once it exists
+    (the layers', the context write's and the head's mailbox scratch) is
+    exactly what the draft reserved before, since the heap is created with
+    only the reservations on top of its planned size: at one and two
+    requests a launch."""
     from tokenspeed_kernel.ops.communication import _iris
-    from tokenspeed_kernel.ops.communication._iris.residual_rmsnorm import (
-        LamportResidualRMSNorm,
-    )
 
     from tokenspeed.runtime.models import muse_spark_dflash2_monokernel as seam
-    from tokenspeed.runtime.models.dflash2 import FUSED_REDUCE_NORM_MAX_ROWS
 
     monkeypatch.setattr(seam, "MAX_REQUESTS", requests)
     monkeypatch.setattr(seam, "LAYER_ROWS", requests * seam.BLOCK_ROWS)
@@ -273,12 +270,8 @@ def test_the_draft_reserves_every_iris_heap_buffer_it_allocates(
             allocated.append(_iris.allocation_bytes(tuple(shape), dtype))
             return torch.zeros(shape, dtype=dtype)
 
-        empty = zeros
-
     class Group:
         def __init__(self, ctx, group=None, rank=0, device=None):
-            self.ctx = ctx
-            self.world_size = 8
             self.bases = torch.zeros(8, dtype=torch.int64)
 
         def finish_prepare(self) -> None:
@@ -290,10 +283,7 @@ def test_the_draft_reserves_every_iris_heap_buffer_it_allocates(
     for pairs in (state.scratch_pairs, state.context.scratch_pairs, state.head_pairs):
         if pairs:
             seam.mailbox_scratch(None, 0, pairs)
-    LamportResidualRMSNorm(
-        Group(Heap()), FUSED_REDUCE_NORM_MAX_ROWS, int(draft.config.hidden_size)
-    )
-    assert len(allocated) == 5
+    assert len(allocated) == 3
     assert sum(allocated) == reserved
 
 

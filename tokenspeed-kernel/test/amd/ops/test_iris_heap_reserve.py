@@ -18,41 +18,68 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""The Iris heap's headroom covers what its users reserve before it exists."""
+"""The Iris heap is created with what its users reserved before it existed
+on top of the size its creator planned."""
 
 import pytest
+import torch
 
 # The Iris heap ships only with AMD's communication stack.
 pytest.importorskip("iris")
 
 from tokenspeed_kernel.ops.communication import _iris  # noqa: E402
 
+MiB = 1 << 20
+
 
 @pytest.fixture(autouse=True)
-def no_reservations(monkeypatch):
+def created_sizes(monkeypatch) -> list[int]:
+    """A world of one rank whose heap records the size it is created at
+    (creating a real heap needs a GPU)."""
+    sizes: list[int] = []
+
+    def create(heap_size, device, **options):
+        sizes.append(heap_size)
+        return object()
+
     monkeypatch.setattr(_iris, "_reserved", {})
     monkeypatch.setattr(_iris, "_context", None)
+    monkeypatch.setattr(_iris, "_heap_size", None)
+    monkeypatch.setattr(_iris, "_spans_hosts", False)
+    monkeypatch.setattr(_iris, "_unmapped_reason", None)
+    monkeypatch.setattr(_iris.iris, "iris", create)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    return sizes
 
 
-def test_small_reservations_keep_the_floor() -> None:
-    _iris.reserve_heap("a", 1 << 20)
-    assert _iris.heap_headroom_bytes() == _iris.HEAP_HEADROOM_BYTES
+def test_without_reservations_the_heap_is_the_planned_size(created_sizes) -> None:
+    _iris.get_or_create_context(heap_size=300 * MiB)
+    assert created_sizes == [300 * MiB]
 
 
-def test_the_headroom_covers_every_owner_plus_the_margin() -> None:
-    _iris.reserve_heap("a", 40 << 20)
-    _iris.reserve_heap("b", 22 << 20)
-    assert _iris.heap_headroom_bytes() == (62 << 20) + _iris.HEAP_MARGIN_BYTES
+def test_reservations_add_to_the_planned_size(created_sizes) -> None:
+    _iris.reserve_heap("a", 40 * MiB)
+    _iris.reserve_heap("b", 22 * MiB)
+    _iris.get_or_create_context(heap_size=300 * MiB)
+    _iris.get_or_create_context(heap_size=500 * MiB)
+    assert created_sizes == [362 * MiB]
 
 
-def test_an_owner_reserving_again_replaces_its_reservation() -> None:
-    _iris.reserve_heap("a", 60 << 20)
-    _iris.reserve_heap("a", 50 << 20)
-    assert _iris.heap_headroom_bytes() == (50 << 20) + _iris.HEAP_MARGIN_BYTES
+def test_an_owner_reserving_again_replaces_its_reservation(created_sizes) -> None:
+    _iris.reserve_heap("a", 60 * MiB)
+    _iris.reserve_heap("a", 50 * MiB)
+    _iris.get_or_create_context(heap_size=300 * MiB)
+    assert created_sizes == [350 * MiB]
 
 
-def test_a_live_heap_takes_no_reservation(monkeypatch) -> None:
-    # Stands in for a created heap (creating one needs the GPUs' group).
-    monkeypatch.setattr(_iris, "_context", object())
+def test_a_configured_heap_is_the_total(created_sizes) -> None:
+    _iris.configure_iris(heap_size=1024 * MiB, allocator_type=None)
+    _iris.reserve_heap("a", 40 * MiB)
+    _iris.get_or_create_context(heap_size=300 * MiB)
+    assert created_sizes == [1024 * MiB]
+
+
+def test_a_live_heap_takes_no_reservation() -> None:
+    _iris.get_or_create_context(heap_size=300 * MiB)
     with pytest.raises(RuntimeError, match="late_owner reserved 1048576 bytes"):
-        _iris.reserve_heap("late_owner", 1 << 20)
+        _iris.reserve_heap("late_owner", 1 * MiB)

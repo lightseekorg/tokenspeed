@@ -88,12 +88,10 @@ rank runs the same stages, and a stage can put into another rank's copy of
 a peer region. The deadlock rule then holds across ranks: the earliest
 unfinished stage on any rank reads only regions that earlier stages on every
 rank wrote, and all CTAs of all ranks are resident. The scratch lives on a
-symmetric heap, so a region has the same offset on every rank. The scratch is
-reserved before the heap exists, and the reservations set the heap's
-headroom, so a model that runs monokernels also reserves every other buffer
-it later takes from that headroom; otherwise those buffers have only the
-small margin. A rank can
-start its next launch while another still reads this one, but not two
+symmetric heap, so a region has the same offset on every rank. Each state
+sizes its heap buffers and reserves them before the heap exists; the heap is
+created once, with the reservations on top of its communication buffers and
+headroom. A rank can start its next launch while another still reads this one, but not two
 launches ahead, because finishing the next launch needs every rank's part of
 it. So a peer region holds two copies, which the launches pick by a parity
 that alternates on every rank. Puts and polls of a peer region use system

@@ -70,7 +70,7 @@ if TYPE_CHECKING:
 # Most rows one fused reduce + norm serves (16 requests of 8 block rows), the
 # most the row-owned kernel keeps resident; larger draft forwards keep the
 # unfused reduction.
-FUSED_REDUCE_NORM_MAX_ROWS = 128
+_FUSED_REDUCE_NORM_MAX_ROWS = 128
 
 
 def _dflash2_config_value(config: Any, key: str, default: Any = None) -> Any:
@@ -608,7 +608,7 @@ class DFlash2DraftModel(DFlashDraftModel):
 
         Args:
             max_num_tokens: Most rows a forward carries; unused, the fused
-                path serves at most ``FUSED_REDUCE_NORM_MAX_ROWS``.
+                path serves at most ``_FUSED_REDUCE_NORM_MAX_ROWS``.
 
         Returns:
             Whether the draft prepared anything.
@@ -642,7 +642,7 @@ class DFlash2DraftModel(DFlashDraftModel):
         if all_reduce_state is None:
             return False
         self.fused_reduce_norm = prepare_iris_lamport_residual_rmsnorm(
-            all_reduce_state, FUSED_REDUCE_NORM_MAX_ROWS, hidden_size
+            all_reduce_state, _FUSED_REDUCE_NORM_MAX_ROWS, hidden_size
         )
         for layer in self.layers:
             layer.fused_reduce_norm = self.fused_reduce_norm
