@@ -21,6 +21,30 @@ and scanning and uses zero carry in the same placement kernel. The runtime
 grid check does not add a shape specialization or allocate scratch for that
 case. The CPU fallback keeps the same layout contract.
 
+## MLA context injection write
+
+`mla_latent_norm_rope_scatter` is a draft's whole context-KV write for every
+MLA layer in one launch: each layer's pre-norm latent row is RMSNormed over
+`kv_lora_rank`, its RoPE tail rotated, and the row stored into that layer's
+plane at the row's slot, skipping rows whose `write_mask` entry is False. The
+planes are addressed through `LatentPlanes`, a device table of their pointers
+plus their shared geometry (dense `[slots, 1, width]` rows or a paged view of
+them); build it outside graph capture, once per bound pool.
+
+It stores the bytes of the per-layer chain it replaces on NVIDIA. The norm
+gives each of FlashInfer's CuTe DSL RMSNorm lanes its columns in the same order
+(lane `t` sums the squares of columns `b * vec * lanes + t * vec + e` in
+sequence) and adds the lane sums neighbour by neighbour, as the warp butterfly
+does; the RoPE pair is `fma(x1, cos, -x2 * sin)` and `fma(x2, cos, x1 * sin)`;
+both round to bf16 with integer round-to-nearest-even (a float round trip can
+be folded away), and the store then sanitizes and converts like
+`set_mla_kv_buffer_triton`. FlashInfer's row geometry covers rows up to 3072
+wide in one warp, which is what the kernel reproduces. The CUDA RoPE flushes
+subnormals and canonicalizes NaN payloads; this kernel keeps subnormals, so
+outputs below `2**-126` can differ. The AMD per-layer chain normalizes with the
+Triton RMSNorm, whose reduction order differs, so the fused write there matches
+it to rounding only.
+
 ## Range clearing
 
 `kvcache.zero_byte_ranges` dispatches by physical placement. Device allocations
