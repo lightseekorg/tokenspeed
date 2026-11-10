@@ -97,6 +97,7 @@ def _graph(buckets, *, sizes, query, command, dp_size=1, narrowing=False):
     graph.input_buffers = SimpleNamespace(
         input_ids_buf=torch.zeros(max(buckets), dtype=torch.int32)
     )
+    graph._prefill_input_embeds = None
     graph._embed_tokens = lambda ids: ids
     graph._land_input_embeds = lambda _embeds, _bucket: None
     graph.make_dummy_batch = lambda _bucket, _bs: SimpleNamespace(
