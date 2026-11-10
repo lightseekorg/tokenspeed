@@ -614,12 +614,12 @@ scaling so a fully free pool reports its full capacity, including packed or
 capacity-limited layouts.
 `available_lcm_blocks()` scans the pool and prefix indexes for reclaimability
 and belongs in diagnostics and leak checks, never in the per-round sampler.
-`active_lcm_blocks()` walks every live request's block tables, which at long
-contexts costs more than the rest of a round, so the loop takes it at most
-once per 100 ms and the frontend's load report, the metrics and the batch line
-share that value; a round with no request running takes it again (it then
-costs nothing), so an engine that goes idle reports none active at once, and
-does not keep it, so the first round with requests takes a fresh one. The
+`active_lcm_blocks()` is O(1): the block tables keep the count as they change
+(see cache-concepts.md). The loop takes it at most once per 100 ms and the
+frontend's load report, the metrics and the batch line share that value; a
+round with no request running takes it again, so an engine that goes idle
+reports none active at once, and does not keep it, so the first round with
+requests takes a fresh one. The
 scheduler's other counts (`sizes()`) are a pass over its requests per state:
 a round takes them for the load report, and as it planned only when the
 metrics or a batch line read them (they share that read); the idle check takes

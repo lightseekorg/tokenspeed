@@ -2388,7 +2388,7 @@ events (wire-format constrained; unify deliberately if ever).
 ### Principle 2 — scheduler perceives only logical quantities: fixed, now with hard vocabulary rules
 
 Scheduling and FSM code do no geometry arithmetic. The coordinator exposes
-capacity views — `NumActiveLcmBlocks(request_tables)`,
+capacity views — `NumActiveLcmBlocks()`,
 `NumAvailableLcmBlocks`, `TotalLcmBlocks`, `GroupAvailablePages(group)` — and
 the config-only `CapacityModel` (`csrc/scheduler/capacity_model.h`) folds
 page demand into LCM blocks (`LcmBlocksNeededFor(group_pages)`); the
