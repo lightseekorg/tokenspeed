@@ -1590,6 +1590,26 @@ def _flashinfer_row_geometry(width: int) -> tuple[int, int, int]:
     return threads, vec, max(1, -(-(width // vec) // threads))
 
 
+def check_mla_latent_geometry(kv_lora_rank: int, rope_dim: int) -> None:
+    """Raise unless ``mla_latent_norm_rope_scatter`` writes this latent geometry.
+
+    Args:
+        kv_lora_rank: Columns of the RMSNormed latent half.
+        rope_dim: Columns of the rotated RoPE tail.
+
+    Raises:
+        ValueError: ``rope_dim / 2`` is not a power of two, or the latent half
+            spans more than one FlashInfer warp.
+    """
+    if (
+        rope_dim <= 0
+        or rope_dim % 2
+        or rope_dim // 2 != triton.next_power_of_2(rope_dim // 2)
+    ):
+        raise ValueError(f"rope_dim/2 must be a power of two, got {rope_dim / 2}")
+    _flashinfer_row_geometry(kv_lora_rank)
+
+
 @triton.jit
 def _bf16_rne_bits(x):
     """Round fp32 to bf16 bits to nearest even; NaN becomes the canonical 0x7FFF.
@@ -1807,8 +1827,7 @@ def mla_latent_norm_rope_scatter(
             f"cos_sin_cache last dim {cos_sin_cache.shape[-1]} must equal the "
             f"{rope_dim}-wide RoPE tail"
         )
-    if rope_dim % 2 or rope_dim // 2 != triton.next_power_of_2(rope_dim // 2):
-        raise ValueError(f"rope_dim/2 must be a power of two, got {rope_dim / 2}")
+    check_mla_latent_geometry(kv_lora_rank, rope_dim)
     if positions.shape != (total_ctx,) or loc.shape != (total_ctx,):
         raise ValueError(f"positions and loc must hold {total_ctx} rows")
     if total_ctx > 1 and (positions.stride(0) != 1 or loc.stride(0) != 1):

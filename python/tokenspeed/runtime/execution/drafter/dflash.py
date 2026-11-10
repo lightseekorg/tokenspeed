@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 import torch
 from tokenspeed_kernel.ops.kvcache.triton import (
     LatentPlanes,
+    check_mla_latent_geometry,
     mla_latent_norm_rope_scatter,
 )
 from tokenspeed_kernel.ops.sampling.cute_dsl import distributed_argmax as _dist_argmax
@@ -870,6 +871,7 @@ class DFlash(BaseDrafter):
             # The fused write rounds as the bf16 per-layer chain does.
             return decline(f"the latent projection is {ws_dtype}, not bf16")
         try:
+            check_mla_latent_geometry(kv_lora_rank, rope_dim)
             planes = LatentPlanes.from_buffers(latent_buffers)
         except ValueError as error:
             return decline(str(error))

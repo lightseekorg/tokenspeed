@@ -30,6 +30,7 @@ from tokenspeed_kernel.ops.embedding import apply_k_rope
 from tokenspeed_kernel.ops.kvcache.triton import (
     LatentPlanes,
     _mla_latent_norm_rope_scatter_kernel,
+    check_mla_latent_geometry,
     mla_latent_norm_rope_scatter,
     set_mla_kv_buffer_triton,
 )
@@ -269,6 +270,18 @@ def test_slots_past_int32_offsets_land_in_place():
     )
     assert torch.equal(plane[-4:].view(torch.uint8), expected.view(torch.uint8))
     assert not torch.any(plane[: slots - 4].view(torch.uint8)[:4096])
+
+
+@pytest.mark.parametrize(
+    "kv_lora_rank,rope_dim,message",
+    [(4096, 64, "one FlashInfer warp"), (512, 48, "power of two")],
+)
+def test_the_geometry_check_refuses_rows_the_kernel_cannot_write(
+    kv_lora_rank, rope_dim, message
+):
+    check_mla_latent_geometry(512, 64)
+    with pytest.raises(ValueError, match=message):
+        check_mla_latent_geometry(kv_lora_rank, rope_dim)
 
 
 def test_planes_must_share_one_geometry():
