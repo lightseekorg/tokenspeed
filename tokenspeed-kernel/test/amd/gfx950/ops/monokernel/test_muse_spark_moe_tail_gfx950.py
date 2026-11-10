@@ -22,9 +22,11 @@
 
 from __future__ import annotations
 
+import math
 import socket
 from datetime import timedelta
 
+import muse_spark_reference as ref
 import pytest
 import torch
 import torch.distributed as dist
@@ -125,13 +127,12 @@ def _inputs(launch: int, rows: int):
     return parts, w, hp, pen, w_post, post, alpha, beta, ing
 
 
-def _reference(parts, w, hp, pen, w_post, post, alpha, beta, ing):
+def _reference(parts, w, pen):
+    """The combined row of one row's route partials in FP64, and a bound on
+    the kernel's BF16 row's difference from it."""
     r = torch.zeros(TOP_K, POOLED)
     for s in range(WORLD):
         r = r + parts[s].float()
-    p = r.to(torch.bfloat16).float() * pen
-    inv = torch.rsqrt(p.pow(2).mean(1, keepdim=True) + 1e-8)
-    combined = ((p * inv) * w[:, None]).sum(0).to(torch.bfloat16)
     # The combined row in FP64 from the same BF16 route sums (the kernel sums
     # the ranks in the same order), and a bound on the kernel's FP32 steps:
     # p's product, the norm's 4096-term sum of squares (6 standard deviations
@@ -142,13 +143,53 @@ def _reference(parts, w, hp, pen, w_post, post, alpha, beta, ing):
     terms = terms * w[:, None].double()
     exact = terms.sum(0)
     sums = 2**-16 * terms.abs().sum(0)
-    combined_check = (exact, sums + 2**-8 * (exact.abs() + sums))
-    y = (combined.float() @ w_post.float().T).to(torch.bfloat16).float() * post
-    y = y * torch.rsqrt(y.pow(2).mean() + 1e-8)
-    h2 = beta * y + alpha * hp
-    scale = torch.rsqrt(h2.pow(2).mean() + 1e-5)
-    a = (h2 * scale * ing).to(torch.bfloat16)
-    return combined, combined_check, h2, a, (beta * y).abs(), scale
+    return exact, sums + 2**-8 * (exact.abs() + sums)
+
+
+# Independent per-element errors move a norm's mean square by a sum of
+# independent terms, each at most its bound (a standard deviation of at most
+# bound / sqrt(3)): allow 6 standard deviations.
+_SIGMAS = 6 / math.sqrt(3)
+
+
+def _rms_error(x, dx):
+    """The relative error of ``rms(x)`` from independent element errors of at
+    most ``dx``, plus 2^-16 for the FP32 sum of squares (8192 terms: ~2^-17.6
+    at 6 standard deviations) and rsqrt."""
+    ms = x.pow(2).mean()
+    return _SIGMAS * (x * dx).pow(2).sum().sqrt() / (x.numel() * ms) + 2**-16
+
+
+def _downstream(cmb, hp, w_post, post, alpha, beta, ing):
+    """From the kernel's BF16 combined row ``cmb``: ``h''`` (FP32 in the
+    kernel) and ``a`` (BF16), each in FP64 with a bound on the kernel's
+    difference.
+
+    The post-expert projection is a BF16 GEMM (``ref.bf16_gemm``), whose
+    errors are independent per element. Its norm's scale error is shared by
+    every element of ``beta * y``, so it is carried as one signed term through
+    the next norm. ``h''``'s two terms add a few FP32 roundings (2^-22 of
+    their size); ``a`` rounds once to BF16.
+    """
+    y, dy = ref.bf16_gemm(cmb[None], w_post)
+    x, dx = y[0] * post.double(), dy[0] * post.double().abs()
+    inv = torch.rsqrt(x.pow(2).mean() + 1e-8)
+    shared = _rms_error(x, dx)  # y's error: dx * inv, and +-shared * y
+    y = x * inv
+    h2 = beta.double() * y + alpha.double() * hp.double()
+    v = beta.double() * y  # the shared error's direction in h''
+    own = beta.double() * dx * inv + 2**-22 * (
+        v.abs() + (alpha.double() * hp.double()).abs()
+    )
+    dh2 = own + shared * v.abs()
+    # a = h'' / rms(h'') * ing: the independent part, then the shared one
+    # (``v - a' * sum(h'' v) / (n rms)``, exact for a signed scale error).
+    rms = torch.sqrt(h2.pow(2).mean() + 1e-5)
+    a = h2 / rms
+    common = (v - a * (h2 * v).sum() / (h2.numel() * rms)).abs() / rms
+    da = own / rms + a.abs() * _rms_error(h2, own) + shared * common
+    a, da = a * ing.double(), da * ing.double().abs()
+    return h2, dh2, a, da + 2**-8 * (a.abs() + da)
 
 
 def _worker(rank: int, port: int, rows: int, source_rows: int, out: str) -> None:
@@ -236,29 +277,22 @@ def _worker(rank: int, port: int, rows: int, source_rows: int, out: str) -> None
             torch.cuda.synchronize()
             dist.barrier()
             for row in range(rows):
-                combined, (cmb_exact, cmb_bound), h2, a, gated, scale = _reference(
-                    parts[row], w[row], hp[row], pen, w_post, post, alpha, beta, ing
-                )
+                cmb_exact, cmb_bound = _reference(parts[row], w[row], pen)
                 cmb = payloads(
                     scratch, plan, "cmb", POOLED // 2, tag, row=row, copy=step & 1
                 )
-                err = (cmb.view(torch.bfloat16).cpu().double() - cmb_exact).abs()
+                cmb = cmb.view(torch.bfloat16).cpu()
+                err = (cmb.double() - cmb_exact).abs()
                 assert torch.all(err <= cmb_bound), float((err / cmb_bound).max())
-                # The projection output is BF16: a sum next to a rounding
-                # boundary can round to the neighbour, one BF16 step of beta y
-                # (up to 2^-7 of it, at the bottom of a binade).
-                err = (h_next[row].cpu() - h2[own]).abs()
-                bound = 2**-7 * h2[own].abs() + 2**-7 * gated[own] + 1e-4
-                assert torch.all(err <= bound), row
-                # Four BF16 roundings lie between the route partials and this
-                # output: one step in an early one can make two here. A few
-                # elements may also carry the projection's one-step flip
-                # (bounded as for h_next, through the norm) plus one of a's.
-                err = (a_out[row].float().cpu() - a.float()).abs()
-                tight = 2e-3 + 2**-6 * a.float().abs()
-                flip = 2**-7 * (scale * ing * gated + a.float().abs())
-                assert torch.all(err <= tight + flip), row
-                assert int((err > tight).sum()) <= 4, row
+                # h'' and a follow from the kernel's combined row, so that a
+                # BF16 step there is not carried through the projection.
+                h2, dh2, a, da = _downstream(
+                    cmb, hp[row], w_post, post, alpha, beta, ing
+                )
+                err = (h_next[row].cpu().double() - h2[own]).abs()
+                assert torch.all(err <= dh2[own]), float((err / dh2[own]).max())
+                err = (a_out[row].cpu().double() - a).abs()
+                assert torch.all(err <= da), float((err / da).max())
             torch.save(
                 (a_out.cpu(), h_next.cpu()), f"{out}/rank{rank}-launch{launch}.pt"
             )
