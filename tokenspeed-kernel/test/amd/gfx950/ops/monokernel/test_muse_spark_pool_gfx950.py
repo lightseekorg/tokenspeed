@@ -25,6 +25,7 @@ from __future__ import annotations
 import socket
 from datetime import timedelta
 
+import muse_spark_reference as ref
 import pytest
 import torch
 import torch.distributed as dist
@@ -129,17 +130,14 @@ def _worker(rank: int, port: int, rows: int) -> None:
             )
             torch.cuda.synchronize()
             dist.barrier()
-            want = (x.double() @ w.double().T).to(torch.bfloat16)
+            # FP32 sums in another order, then one BF16 rounding.
+            want, bound = ref.bf16_gemm(x, w)
             for row in range(rows):
                 got = payloads(
                     scratch, plan, "cg", POOLED // 2, tag, row=row, copy=step & 1
                 )
-                torch.testing.assert_close(
-                    got.view(torch.bfloat16).float().cpu(),
-                    want[row].float(),
-                    rtol=2**-7,
-                    atol=1e-3,
-                )
+                err = (got.view(torch.bfloat16).cpu().double() - want[row]).abs()
+                assert torch.all(err <= bound[row]), float((err / bound[row]).max())
             dist.barrier()
     finally:
         dist.destroy_process_group()

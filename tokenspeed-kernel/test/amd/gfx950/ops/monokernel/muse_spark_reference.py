@@ -42,6 +42,24 @@ HIDDEN, POOLED, INTER, TOP_K, OWNED = 8192, 4096, 512, 8, 1024
 K_ROW, V_ROW, GATE_ROW = 1024, 1152, 1280
 
 
+def bf16_gemm(x: torch.Tensor, w: torch.Tensor):
+    """``x @ w.T`` in FP64, and a bound on a kernel's difference from it after
+    FP32 sums (in any order) and one rounding to BF16.
+
+    The products of BF16 values are exact in FP32; each of the ``K`` FP32
+    additions rounds by at most 2^-24 of ``|x| @ |w|.T``, and independent
+    roundings stay within 6 standard deviations (2^-24 / sqrt(3) each). The
+    BF16 rounding then adds its unit roundoff 2^-8.
+
+    Returns ``(exact, bound)``, both FP64 ``[rows, N]``.
+    """
+    exact = x.double() @ w.double().T
+    sums = (6 / math.sqrt(3) * math.sqrt(x.shape[-1]) * 2**-24) * (
+        x.double().abs() @ w.double().abs().T
+    )
+    return exact, sums + 2**-8 * (exact.abs() + sums)
+
+
 def rope_table(positions: int) -> torch.Tensor:
     """FP32 ``[positions, 64]``: cos of the 32 pairs, then sin (theta 500000)."""
     return rope_rows(0, positions)

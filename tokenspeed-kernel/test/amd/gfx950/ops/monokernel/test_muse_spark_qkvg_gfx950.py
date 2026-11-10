@@ -23,6 +23,7 @@ of one rank, in two K halves."""
 
 from __future__ import annotations
 
+import muse_spark_reference as ref
 import pytest
 import torch
 from utils import is_cdna4
@@ -87,7 +88,7 @@ def test_qkvg_halves_sum_to_the_bf16_rounded_fp32_projection(rows):
         num_warps=8,
     )
     torch.cuda.synchronize()
-    want = (a.double() @ w.double().T).to(torch.bfloat16)
+    want, bound = ref.bf16_gemm(a, w)
     tag = launch_tag(step, 0)
     for r in range(rows):
         halves = []
@@ -96,5 +97,7 @@ def test_qkvg_halves_sum_to_the_bf16_rounded_fp32_projection(rows):
             halves.append(got.view(torch.float32).cpu().view(2, n))
         # The consumers' value: the FP32 sum of the halves, rounded to BF16.
         got = torch.cat(halves, dim=1).sum(0).to(torch.bfloat16)
-        # FP32 sums in another order than FP64: at most one BF16 rounding step.
-        torch.testing.assert_close(got.float(), want[r].float(), rtol=2**-7, atol=1e-3)
+        # FP32 sums in another order (the halves' sum one more), then one
+        # BF16 rounding.
+        err = (got.double() - want[r]).abs()
+        assert torch.all(err <= bound[r]), float((err / bound[r]).max())
