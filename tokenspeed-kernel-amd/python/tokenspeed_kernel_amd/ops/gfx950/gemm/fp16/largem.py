@@ -1357,6 +1357,7 @@ def launch_gluon_mm_a16w16_prefill_gather_rows_gfx950(
         or local_rows % LARGEM_BLOCK_M
         or local_rows > LARGEM_GATHER_MAX_TILES * LARGEM_BLOCK_M
         or not _supports_largem_shape(M, N, K)
+        # Int32 element offsets: 2-byte elements keep byte offsets under 2^31.
         or M * K >= 1 << 30
     ):
         return None
