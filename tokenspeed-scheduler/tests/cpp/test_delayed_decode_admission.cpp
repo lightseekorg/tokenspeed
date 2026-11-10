@@ -145,6 +145,24 @@ TEST_F(IndependentAdmissionTest, FinalResultRetainsEveryGroupUntilGrant) {
     EXPECT_TRUE(scheduler_->ClearCache());
 }
 
+// A computed prompt waiting for its destination holds its pages and request
+// slot, as one awaiting its transfer does: both count as running.
+TEST_F(IndependentAdmissionTest, AComputedPromptWaitingForItsDestinationIsRunning) {
+    SubmitPrompt("r", 4);
+    Admit("r");
+    EXPECT_EQ(scheduler_->RunningSize(), 0u);
+    PlanOnce();
+    SendForwardDone("r", {42});
+    ASSERT_EQ(scheduler_->AwaitingDestinationSize(), 1u);
+    EXPECT_EQ(scheduler_->RunningSize(), 1u);
+    Grant("r");
+    EXPECT_EQ(scheduler_->AwaitingDestinationSize(), 0u);
+    EXPECT_EQ(scheduler_->RunningSize(), 1u);
+    ASSERT_TRUE(PlanOnce().remote_decode.has_value());
+    Ack("r");
+    EXPECT_EQ(scheduler_->RunningSize(), 0u);
+}
+
 // A prompt that holds no pages yet, admitted or not, ends at once.
 TEST_F(IndependentAdmissionTest, CancellingBeforeTheFirstChunkHoldsNothing) {
     SubmitPrompt("held", 4);
