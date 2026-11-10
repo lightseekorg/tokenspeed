@@ -27,6 +27,7 @@
 #include <utility>
 #include <vector>
 
+#include "cache/core/active_parents.h"
 #include "cache/core/block_pool.h"
 #include "cache/core/cache_block_ref.h"
 #include "utils.h"
@@ -52,14 +53,16 @@ inline std::int32_t ResolvedPageId(std::uint32_t group_id, const CacheBlockRef& 
 // the table keeps the block's kernel page id, resolved when the block enters
 // the slot: a forward batch exports every scheduled row each round, and
 // resolving every block of a long context again each round was most of the
-// round's work.
+// round's work. It also keeps the slot's ParentRef, which counts the block's
+// LCM parent as active for as long as the slot holds it, so the active-page
+// gauge needs no walk over the tables.
 class BlockTable {
 public:
     static BlockTable FromBlocks(std::uint32_t group_id, std::vector<CacheBlockRef> blocks,
                                  std::int32_t available_tokens) {
         _assert(available_tokens >= 0, "BlockTable available_tokens must be non-negative");
         BlockTable table;
-        table.assignAll(group_id, std::move(blocks));
+        table.assignAll(TableWriter{.group_id = group_id}, std::move(blocks));
         table.available_tokens_ = available_tokens;
         return table;
     }
@@ -86,7 +89,7 @@ public:
         PublishWindow& operator=(const PublishWindow&) = delete;
         PublishWindow(PublishWindow&&) = delete;
         PublishWindow& operator=(PublishWindow&&) = delete;
-        ~PublishWindow() { table_.refresh(group_id_, first_, count_); }
+        ~PublishWindow() { table_.refresh(writer_, first_, count_); }
 
         std::span<CacheBlockRef> Blocks() noexcept {
             return std::span<CacheBlockRef>{table_.blocks_}.subspan(first_, count_);
@@ -95,10 +98,10 @@ public:
     private:
         friend class GroupAllocator;
 
-        PublishWindow(std::uint32_t group_id, BlockTable& table, std::size_t first, std::size_t count) noexcept
-            : group_id_{group_id}, table_{table}, first_{first}, count_{count} {}
+        PublishWindow(TableWriter writer, BlockTable& table, std::size_t first, std::size_t count) noexcept
+            : writer_{writer}, table_{table}, first_{first}, count_{count} {}
 
-        std::uint32_t group_id_;
+        TableWriter writer_;
         BlockTable& table_;
         std::size_t first_;
         std::size_t count_;
@@ -108,49 +111,60 @@ private:
     // The allocator is the only component that changes a table; anything
     // else that needs to write blocks (publishing them to a prefix index)
     // receives a window from it. Every write goes through the members below,
-    // which keep page_ids_ in step with blocks_.
+    // which keep page_ids_ and parents_ in step with blocks_.
     friend class GroupAllocator;
 
-    void assign(std::uint32_t group_id, std::size_t slot, CacheBlockRef block) {
-        page_ids_[slot] = ResolvedPageId(group_id, block);
+    void assign(TableWriter writer, std::size_t slot, CacheBlockRef block) {
+        page_ids_[slot] = ResolvedPageId(writer.group_id, block);
+        parents_[slot] = ParentRef{writer.active_parents, block};
         blocks_[slot] = std::move(block);
     }
-    CacheBlockRef exchange(std::uint32_t group_id, std::size_t slot, CacheBlockRef block) {
-        page_ids_[slot] = ResolvedPageId(group_id, block);
+    CacheBlockRef exchange(TableWriter writer, std::size_t slot, CacheBlockRef block) {
+        page_ids_[slot] = ResolvedPageId(writer.group_id, block);
+        parents_[slot] = ParentRef{writer.active_parents, block};
         return std::exchange(blocks_[slot], std::move(block));
     }
     // Empties the slot, returning its block.
     CacheBlockRef take(std::size_t slot) noexcept {
         page_ids_[slot] = 0;
+        parents_[slot] = ParentRef{};
         return std::exchange(blocks_[slot], {});
     }
-    void append(std::uint32_t group_id, CacheBlockRef block) {
-        page_ids_.push_back(ResolvedPageId(group_id, block));
+    void append(TableWriter writer, CacheBlockRef block) {
+        page_ids_.push_back(ResolvedPageId(writer.group_id, block));
+        parents_.emplace_back(writer.active_parents, block);
         blocks_.push_back(std::move(block));
     }
-    void appendAll(std::uint32_t group_id, std::vector<CacheBlockRef>&& blocks) {
+    void appendAll(TableWriter writer, std::vector<CacheBlockRef>&& blocks) {
         page_ids_.reserve(page_ids_.size() + blocks.size());
+        parents_.reserve(parents_.size() + blocks.size());
         for (const CacheBlockRef& block : blocks) {
-            page_ids_.push_back(ResolvedPageId(group_id, block));
+            page_ids_.push_back(ResolvedPageId(writer.group_id, block));
+            parents_.emplace_back(writer.active_parents, block);
         }
         blocks_.insert(blocks_.end(), std::make_move_iterator(blocks.begin()), std::make_move_iterator(blocks.end()));
     }
-    void assignAll(std::uint32_t group_id, std::vector<CacheBlockRef>&& blocks) {
+    void assignAll(TableWriter writer, std::vector<CacheBlockRef>&& blocks) {
         blocks_ = std::move(blocks);
         page_ids_.clear();
         page_ids_.reserve(blocks_.size());
+        parents_.clear();
+        parents_.reserve(blocks_.size());
         for (const CacheBlockRef& block : blocks_) {
-            page_ids_.push_back(ResolvedPageId(group_id, block));
+            page_ids_.push_back(ResolvedPageId(writer.group_id, block));
+            parents_.emplace_back(writer.active_parents, block);
         }
     }
     // New slots are null.
     void resize(std::size_t slots) {
         blocks_.resize(slots);
         page_ids_.resize(slots, 0);
+        parents_.resize(slots);
     }
     void reserve(std::size_t slots) {
         blocks_.reserve(slots);
         page_ids_.reserve(slots);
+        parents_.reserve(slots);
     }
     // Releases the logical suffix first, so newly emptied LCM parents enter
     // the FIFO free queue in deterministic table order.
@@ -160,16 +174,21 @@ private:
         }
         blocks_.clear();
         page_ids_.clear();
+        parents_.clear();
     }
-    void refresh(std::uint32_t group_id, std::size_t first, std::size_t count) {
+    void refresh(TableWriter writer, std::size_t first, std::size_t count) {
         for (std::size_t slot = first; slot < first + count; ++slot) {
-            page_ids_[slot] = ResolvedPageId(group_id, blocks_[slot]);
+            page_ids_[slot] = ResolvedPageId(writer.group_id, blocks_[slot]);
+            parents_[slot] = ParentRef{writer.active_parents, blocks_[slot]};
         }
     }
 
     std::vector<CacheBlockRef> blocks_{};
     // page_ids_[i] is blocks_[i]'s kernel page id, 0 for a null slot.
     std::vector<std::int32_t> page_ids_{};
+    // parents_[i] counts blocks_[i]'s LCM parent active; empty for a null slot.
+    // Slots below the released prefix are null, so they count nothing either.
+    std::vector<ParentRef> parents_{};
     // Unconsumed capacity at the logical tail. This may span multiple blocks
     // when admission preallocates a later decode/MTP step.
     std::int32_t available_tokens_{0};

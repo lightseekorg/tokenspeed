@@ -34,6 +34,7 @@
 #include <utility>
 #include <vector>
 
+#include "cache/core/active_parents.h"
 #include "cache/core/block_pool.h"
 #include "cache/core/cache_block_ref.h"
 #include "cache/coordinator/group_geometry.h"
@@ -498,8 +499,12 @@ public:
     std::int32_t NumEmptyLcmBlocks() const { return pool_.NumEmptyLcmBlocks(); }
     std::int32_t TotalLcmBlocks() const { return pool_.NumLcmBlocks(); }
     std::int32_t NumFreeHostLcmBlocks() const { return host_pool_ == nullptr ? 0 : host_pool_->NumEmptyLcmBlocks(); }
-    // Distinct LCM blocks referenced by the given per-request table sets.
-    std::int32_t NumActiveLcmBlocks(std::span<const std::span<const BlockTable>> request_tables) const;
+    // Distinct LCM blocks the request tables hold, counted by the tables'
+    // own ParentRefs as they change, so reading it walks nothing.
+    std::int32_t NumActiveLcmBlocks() const noexcept { return active_parents_.Count(); }
+    // The same count taken by walking the given per-request table sets:
+    // the reference debug builds check NumActiveLcmBlocks against.
+    std::int32_t CountActiveLcmBlocks(std::span<const std::span<const BlockTable>> request_tables) const;
     // Free pages (group page units) this group could still place, counting its
     // partially filled parents and every empty parent.
     std::int32_t GroupAvailablePages(std::int32_t group_index) const;
@@ -1298,6 +1303,9 @@ private:
     // Replayable groups are absent: they neither constrain nor claim a hit.
     std::vector<std::size_t> match_order_;
     BlockPool& pool_;
+    // The Device parents request tables hold; the allocators and the tables'
+    // ParentRefs point at it, which is safe as the coordinator never moves.
+    ActiveParents active_parents_;
     BlockPool* host_pool_{nullptr};
     // Request-private retraction images: never prefix-indexed, never evicted.
     BlockPool* snapshot_pool_{nullptr};
