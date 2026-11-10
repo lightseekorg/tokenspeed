@@ -59,6 +59,10 @@ def disabled(buf):
 @gluon.jit
 def now():
     """Wave-uniform ``s_memrealtime`` value."""
+    # asm: llvm.amdgcn.s.memrealtime would come through the extern library,
+    # which every kernel that polls a flag (Mailbox.poll_flags reads the
+    # clock for its timeout record) would then have to link, including the
+    # stage tests' kernels that poll flags but raise none.
     return gl.inline_asm(
         "s_memrealtime $0\ns_waitcnt lgkmcnt(0)", "=s", [], gl.int64, is_pure=False
     )
