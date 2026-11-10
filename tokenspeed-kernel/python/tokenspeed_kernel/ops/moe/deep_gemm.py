@@ -167,6 +167,8 @@ def deep_gemm_mxfp4_mega_moe_process_weights(
     plan: dict,
     w: torch.nn.Module,
 ) -> object:
+    if w.tp_size != 1:
+        raise ValueError("DeepGEMM MXFP4 MegaMoE requires MoE TP=1")
     w13_weight = w.w13_weight.data
     w13_weight_scale = w.w13_weight_scale.data
     w2_weight = w.w2_weight.data
@@ -324,7 +326,7 @@ def _get_symm_buffer(
 
 
 def _warmup_m_values(max_tokens: int) -> list[int]:
-    """Return token counts covering every DeepGEMM tile reachable at runtime."""
+    """Return token counts covering DeepGEMM tiles up to ``max_tokens``."""
     dense = min(max_tokens, 2048)
     values: set[int] = set(range(1, dense + 1))
     values.update(range(dense, max_tokens + 1, 16))
@@ -515,7 +517,7 @@ if _HAS_DEEP_GEMM:
         ),
         traits={
             "weight_dtype": frozenset({"mxfp4"}),
-            "activation": frozenset({"swiglu"}),
+            "activation": frozenset({"silu", "swiglu"}),
             "routing_mode": frozenset({"precomputed_topk"}),
             "supports_deferred_finalize": frozenset({False}),
             "supports_ep": frozenset({True}),

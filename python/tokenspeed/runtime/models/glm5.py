@@ -360,6 +360,11 @@ class GlmDsaSparseAttentionMixin:
     index query in the launch of its index-K write (an ``fp8_scaled`` plane,
     keys with ``key_norm``) and hands the decode top-k E4M3 queries with unit
     scales; a host sets it only where its ``decode_topk_solution`` takes them.
+
+    A host that hands ``forward_dsa_core`` the index keys and head weights it
+    projected itself (``index_key_weights``) gives its indexer
+    ``from_key_weights(q_lora, key_weights)``, which returns the indexer
+    output over them without projecting the attention input.
     """
 
     index_query_fp8: bool = False
@@ -1179,10 +1184,12 @@ class GlmDsaSparseAttentionMixin:
         output_gate: torch.Tensor | None = None,
         projected_q: torch.Tensor | None = None,
         index_query: torch.Tensor | None = None,
+        index_key_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """DSA sparse MLA after the a-projections: the indexer and its index-K
-        write, the shared prefill/decode top-k, then the sparse prefill and
-        decode cores over the round's rows.
+        """DSA sparse MLA after the a-projections.
+
+        It runs the indexer and its index-K write, the shared prefill/decode
+        top-k, then the sparse prefill and decode cores over the round's rows.
 
         Args:
             positions: ``[T]`` token positions.
@@ -1200,6 +1207,11 @@ class GlmDsaSparseAttentionMixin:
                 ahead; None projects them here.
             index_query: Optional ``[T, index_heads, index_head_dim]`` index
                 query a caller projected ahead; None leaves the indexer's.
+            index_key_weights: Optional ``[T, index_head_dim + index_heads]``
+                pre-norm index keys then head weights a caller projected
+                ahead from the attention input, unit inner stride; the
+                indexer then skips its own projection of ``hidden_states``.
+                None projects them in the indexer.
 
         Returns:
             ``[T, num_local_heads * v_head_dim]`` attention output before
@@ -1218,16 +1230,23 @@ class GlmDsaSparseAttentionMixin:
                 raise RuntimeError(
                     "padded DSA replay needs an identity pre-attention comm"
                 )
-            positions, q_norm, latent_cache, output_gate, projected_q, index_query = (
-                slice_to_real_tokens(
-                    valid_rows,
-                    positions,
-                    q_norm,
-                    latent_cache,
-                    output_gate,
-                    projected_q,
-                    index_query,
-                )
+            (
+                positions,
+                q_norm,
+                latent_cache,
+                output_gate,
+                projected_q,
+                index_query,
+                index_key_weights,
+            ) = slice_to_real_tokens(
+                valid_rows,
+                positions,
+                q_norm,
+                latent_cache,
+                output_gate,
+                projected_q,
+                index_query,
+                index_key_weights,
             )
             num_attn_tokens = valid_rows
         decode_window = self._resolve_decode_window(
@@ -1281,10 +1300,17 @@ class GlmDsaSparseAttentionMixin:
             )
         )
         if should_compute_indexer:
-            hidden_states = comm_manager.pre_attn_comm(hidden_states, ctx)
-            if valid_rows is not None:
-                (hidden_states,) = slice_to_real_tokens(num_attn_tokens, hidden_states)
-            indexer_output = self.indexer(hidden_states, q_norm, positions)
+            if index_key_weights is None:
+                hidden_states = comm_manager.pre_attn_comm(hidden_states, ctx)
+                if valid_rows is not None:
+                    (hidden_states,) = slice_to_real_tokens(
+                        num_attn_tokens, hidden_states
+                    )
+                indexer_output = self.indexer(hidden_states, q_norm, positions)
+            else:
+                indexer_output = self.indexer.from_key_weights(
+                    q_norm, index_key_weights
+                )
             if index_query is not None:
                 indexer_output = replace(
                     indexer_output, query=index_query, query_proj=None
