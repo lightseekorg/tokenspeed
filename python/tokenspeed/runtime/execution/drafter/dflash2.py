@@ -42,7 +42,7 @@ from tokenspeed.runtime.execution.drafter.dflash import DFlash
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from tokenspeed.runtime.layers.vocab_parallel_topk import VocabParallelTopK
-from tokenspeed.runtime.models.dflash2_monokernel import (
+from tokenspeed.runtime.models.muse_spark_dflash2_monokernel import (
     takes_head,
     unserved_draft_error,
 )

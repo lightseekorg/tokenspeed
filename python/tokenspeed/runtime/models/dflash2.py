@@ -54,14 +54,14 @@ from tokenspeed.runtime.models.dflash import (
     DFlashDraftModel,
     _get_dflash_layer_sliding_window,
 )
-from tokenspeed.runtime.models.dflash2_monokernel import (
+from tokenspeed.runtime.models.kimi_k3_dspark import K3DSparkAttention
+from tokenspeed.runtime.models.muse_spark_dflash2_monokernel import (
     DFlash2MonokernelLayer,
     DFlash2MonokernelState,
+    config_reasons,
     enable_draft_monokernels,
 )
-from tokenspeed.runtime.models.kimi_k3_dspark import K3DSparkAttention
 from tokenspeed.runtime.utils import add_prefix
-from tokenspeed.runtime.utils.env import global_server_args_dict
 
 if TYPE_CHECKING:
     from tokenspeed_kernel.ops.communication._iris.residual_rmsnorm import (
@@ -454,8 +454,14 @@ class DFlash2DraftModel(DFlashDraftModel):
 
     @property
     def decoder_layer_cls(self) -> type:
-        """The layer class: the monokernel class with --decode-monokernel."""
-        if global_server_args_dict["decode_monokernel"]:
+        """The layer class: the monokernel class when the launch turns on
+        --decode-monokernel (ModelConfig sets ``decode_monokernel`` on the
+        draft's config as on the target's) and the draft is the one the
+        kernels bake in (Muse Spark's, :func:`config_reasons`); else the
+        regular class, which another DFlash2 draft keeps under the switch."""
+        if _dflash2_config_value(
+            self.config, "decode_monokernel", False
+        ) and not config_reasons(self.config):
             return DFlash2MonokernelDecoderLayer
         return DFlash2DecoderLayer
 
@@ -683,7 +689,7 @@ class DFlash2DraftModel(DFlashDraftModel):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         if not self._uses_mla:
             loaded = super().load_weights(weights)
-            if global_server_args_dict["decode_monokernel"]:
+            if self.decoder_layer_cls is DFlash2MonokernelDecoderLayer:
                 enable_draft_monokernels(self)
             return loaded
 
@@ -754,10 +760,6 @@ class DFlash2DraftModel(DFlashDraftModel):
             )
         for layer in self.layers:
             absorb_mla_kv_b_proj(layer.self_attn)
-        if global_server_args_dict["decode_monokernel"]:
-            # Refuses an MLA draft: the switch never serves a draft without
-            # its kernels.
-            enable_draft_monokernels(self)
 
     @torch.no_grad()
     def forward(self, *args, input_embeds: torch.Tensor | None = None, **kwargs):

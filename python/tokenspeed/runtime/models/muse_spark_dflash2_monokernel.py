@@ -148,6 +148,20 @@ def _config_value(config, key: str):
     return nested.get(key, getattr(config, key, None))
 
 
+def config_reasons(config) -> list[str]:
+    """Why a draft of ``config`` is not the one the kernels bake in (Muse
+    Spark's DFlash2 draft: its dimensions and GQA attention); empty when it
+    is. The draft builds its layers from the monokernel class only then."""
+    reasons = []
+    if any(getattr(config, k, None) != v for k, v in KERNEL_SHAPE.items()) or any(
+        _config_value(config, k) != v for k, v in KERNEL_DFLASH.items()
+    ):
+        reasons.append(OTHER_SHAPES)
+    if str(_config_value(config, "attention_mode") or "gqa").lower() != "gqa":
+        reasons.append(MLA_DRAFT)
+    return reasons
+
+
 def model_reasons(model: torch.nn.Module) -> list[str]:
     """Why the layers of ``model`` (a ``DFlash2DraftModel``) cannot have
     draft monokernels; empty when they can."""
@@ -162,13 +176,10 @@ def model_reasons(model: torch.nn.Module) -> list[str]:
         and mapping.pp_size == 1
     ):
         reasons.append(NOT_TP8)
-    if any(getattr(config, k, None) != v for k, v in KERNEL_SHAPE.items()) or any(
-        _config_value(config, k) != v for k, v in KERNEL_DFLASH.items()
-    ):
-        reasons.append(OTHER_SHAPES)
+    # An MLA draft returned above, so only the dimensions can differ here.
+    reasons += config_reasons(config)
     if (
-        str(_config_value(config, "attention_mode") or "gqa").lower() != "gqa"
-        or any(not _attention_matches(layer) for layer in model.layers)
+        any(not _attention_matches(layer) for layer in model.layers)
         # The last launch runs the final norm.
         or abs(model.norm.variance_epsilon - RMS_NORM_EPS) >= 1e-12
     ):
@@ -389,7 +400,7 @@ class DFlash2MonokernelState(MonokernelState):
 
         self.head_pairs = muse_spark_draft_head_scratch_pairs(max_rows=HEAD_ROWS) or 0
         reserve_iris_heap(
-            "dflash2_monokernel",
+            "muse_spark_dflash2_monokernel",
             draft_heap_bytes(
                 (scratch_pairs, context.scratch_pairs, self.head_pairs),
                 tp_size=model.mapping.attn.tp_size,
@@ -856,6 +867,7 @@ __all__ = [
     "head_reasons",
     "mailbox_scratch",
     "layer_tensors",
+    "config_reasons",
     "model_reasons",
     "takes_head",
     "takes_monokernels",

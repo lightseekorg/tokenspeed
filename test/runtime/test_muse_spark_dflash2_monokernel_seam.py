@@ -49,8 +49,11 @@ from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig  # noqa: E
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (  # noqa: E402
     ParallelLMHead,
 )
-from tokenspeed.runtime.models.dflash2 import DFlash2DraftModel  # noqa: E402
-from tokenspeed.runtime.models.dflash2_monokernel import (  # noqa: E402
+from tokenspeed.runtime.models.dflash2 import (  # noqa: E402
+    DFlash2DecoderLayer,
+    DFlash2DraftModel,
+)
+from tokenspeed.runtime.models.muse_spark_dflash2_monokernel import (  # noqa: E402
     BLOCK_ROWS,
     CONTEXT_OTHER,
     HEAD_NOT_SHARDED,
@@ -61,6 +64,7 @@ from tokenspeed.runtime.models.dflash2_monokernel import (  # noqa: E402
     NOT_TP8,
     OTHER_ATTENTION,
     OTHER_SHAPES,
+    config_reasons,
     enable_draft_monokernels,
     model_reasons,
     request_seq_lens,
@@ -99,7 +103,8 @@ def test_the_blocks_of_up_to_max_requests_take_the_kernels() -> None:
 
 
 def _config(**overrides) -> PretrainedConfig:
-    """Muse Spark Open's DFlash2 draft."""
+    """Muse Spark Open's DFlash2 draft. ``decode_monokernel=True`` is what
+    ModelConfig sets on it under --decode-monokernel."""
     layers = overrides.pop("num_hidden_layers", 5)
     config = {
         "architectures": ["DFlash2DraftModel"],
@@ -177,12 +182,11 @@ def test_a_tp4_draft_has_no_layer_monokernels() -> None:
     assert model_reasons(_draft(_config(), tp=4)) == [NOT_TP8]
 
 
-def test_decode_monokernel_refuses_a_draft_it_cannot_pack(monkeypatch) -> None:
+def test_decode_monokernel_refuses_a_draft_it_cannot_pack() -> None:
     """--decode-monokernel never serves a draft piece without its kernel:
     loading a TP4 draft fails and names its layers and context write and
     why, instead of drafting with the regular code."""
-    monkeypatch.setitem(global_server_args_dict, "decode_monokernel", True)
-    draft = _draft(_config(), tp=4)
+    draft = _draft(_config(decode_monokernel=True), tp=4)
     with pytest.raises(ValueError, match="--decode-monokernel") as error:
         draft.load_weights(iter(()))
     message = str(error.value)
@@ -191,9 +195,11 @@ def test_decode_monokernel_refuses_a_draft_it_cannot_pack(monkeypatch) -> None:
     assert draft.monokernel_state is None
 
 
-def test_decode_monokernel_refuses_an_mla_draft(monkeypatch) -> None:
-    monkeypatch.setitem(global_server_args_dict, "decode_monokernel", True)
+def test_an_mla_draft_keeps_the_regular_layers_under_decode_monokernel() -> None:
+    """An MLA draft is not the one the kernels bake in: under the switch it
+    builds the regular layers, and packing it directly refuses."""
     mla = _config(
+        decode_monokernel=True,
         qk_nope_head_dim=128,
         qk_rope_head_dim=64,
         v_head_dim=128,
@@ -202,13 +208,14 @@ def test_decode_monokernel_refuses_an_mla_draft(monkeypatch) -> None:
     )
     mla.dflash_config = {**mla.dflash_config, "attention_mode": "mla"}
     draft = _draft(mla)
+    assert config_reasons(mla) == [MLA_DRAFT]
+    assert draft.decoder_layer_cls is DFlash2DecoderLayer
     assert model_reasons(draft) == [MLA_DRAFT]
     with pytest.raises(ValueError, match=f"layers: {MLA_DRAFT}"):
         enable_draft_monokernels(draft)
 
 
-def test_without_decode_monokernel_the_same_draft_loads(monkeypatch) -> None:
-    monkeypatch.setitem(global_server_args_dict, "decode_monokernel", False)
+def test_without_decode_monokernel_the_same_draft_loads() -> None:
     draft = _draft(_config(), tp=4)
     draft.load_weights(iter(()))
     assert draft.monokernel_state is None
@@ -218,10 +225,9 @@ def test_without_decode_monokernel_the_same_draft_loads(monkeypatch) -> None:
     not torch.cuda.is_available() or not current_platform().is_cdna4,
     reason="the draft monokernels are gfx950 kernels",
 )
-def test_decode_monokernel_packs_a_bf16_tp8_draft(monkeypatch) -> None:
+def test_decode_monokernel_packs_a_bf16_tp8_draft() -> None:
     """Muse Spark Open's BF16 draft at TP8 loads with every layer and the
     context write packed."""
-    monkeypatch.setitem(global_server_args_dict, "decode_monokernel", True)
     draft = _packed_draft()
     state = draft.monokernel_state
     assert state is not None
@@ -246,17 +252,16 @@ def test_the_draft_reserves_every_iris_heap_buffer_it_allocates(
         LamportResidualRMSNorm,
     )
 
-    from tokenspeed.runtime.models import dflash2_monokernel as seam
+    from tokenspeed.runtime.models import muse_spark_dflash2_monokernel as seam
     from tokenspeed.runtime.models.dflash2 import FUSED_REDUCE_NORM_MAX_ROWS
 
-    monkeypatch.setitem(global_server_args_dict, "decode_monokernel", True)
     monkeypatch.setattr(seam, "MAX_REQUESTS", requests)
     monkeypatch.setattr(seam, "LAYER_ROWS", requests * seam.BLOCK_ROWS)
     monkeypatch.setattr(seam, "HEAD_ROWS", requests * seam.STEPS)
     monkeypatch.setattr(seam, "CONTEXT_WRITE_ROWS", requests * seam.CONTEXT_ROWS)
     monkeypatch.setattr(_iris, "_reserved", {})
     draft = _packed_draft()
-    reserved = _iris._reserved["dflash2_monokernel"]
+    reserved = _iris._reserved["muse_spark_dflash2_monokernel"]
 
     # A heap that records each allocation at the Torch allocator's alignment.
     allocated: list[int] = []
@@ -298,7 +303,7 @@ def _packed_draft() -> DFlash2DraftModel:
     torch.set_default_dtype(torch.bfloat16)
     try:
         with torch.device("cuda"):
-            draft = DFlash2DraftModel(_config(), _mapping(8))
+            draft = DFlash2DraftModel(_config(decode_monokernel=True), _mapping(8))
     finally:
         torch.set_default_dtype(previous)
     draft.load_weights(iter(()))
@@ -309,11 +314,10 @@ def _packed_draft() -> DFlash2DraftModel:
     not torch.cuda.is_available() or not current_platform().is_cdna4,
     reason="the draft monokernels are gfx950 kernels",
 )
-def test_decode_monokernel_refuses_a_head_it_cannot_pack(monkeypatch) -> None:
+def test_decode_monokernel_refuses_a_head_it_cannot_pack() -> None:
     """A draft head over an LM head that is not an 8-way vocabulary shard
     (here the whole 1024-token head on one rank, and the test config's
     1024-token selector) fails startup and names the head's reasons."""
-    monkeypatch.setitem(global_server_args_dict, "decode_monokernel", True)
     draft = _packed_draft()
     lm_head = ParallelLMHead(1024, 8192, params_dtype=torch.bfloat16).to("cuda")
     with pytest.raises(ValueError, match="draft's head have no monokernel") as error:

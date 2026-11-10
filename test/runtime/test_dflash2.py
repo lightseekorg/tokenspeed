@@ -609,7 +609,7 @@ def test_the_context_write_monokernel_takes_the_column_parallel_fc(
 ) -> None:
     """The context write's monokernel reads each rank's own fc rows, the shard
     the column-parallel ``fc`` holds; a replicated ``fc`` is not its layout."""
-    from tokenspeed.runtime.models import dflash2_monokernel
+    from tokenspeed.runtime.models import muse_spark_dflash2_monokernel as seam
 
     model = SimpleNamespace(
         fc=SimpleNamespace(
@@ -619,10 +619,10 @@ def test_the_context_write_monokernel_takes_the_column_parallel_fc(
         ),
         hidden_norm=SimpleNamespace(
             weight=torch.empty(8192, dtype=torch.bfloat16, device="meta"),
-            variance_epsilon=dflash2_monokernel.RMS_NORM_EPS,
+            variance_epsilon=seam.RMS_NORM_EPS,
         ),
     )
-    assert (dflash2_monokernel.context_reasons(model) == []) is served
+    assert (seam.context_reasons(model) == []) is served
 
 
 class _Layer(torch.nn.Module):
@@ -680,15 +680,28 @@ def test_a_draft_block_takes_the_last_launchs_final_norm(launches: str) -> None:
     assert int(state.step[0]) == (0 if launches == "none" else 1)
 
 
+@pytest.mark.parametrize("muse_draft", [False, True])
 @pytest.mark.parametrize("switch", [False, True])
-def test_the_switch_builds_the_draft_from_the_monokernel_layer_class(
-    monkeypatch, switch: bool
+def test_the_switch_builds_only_muse_sparks_draft_from_the_monokernel_layer_class(
+    switch: bool, muse_draft: bool
 ) -> None:
-    """With --decode-monokernel the draft builds its layers from the
-    monokernel class (which keeps the regular code until they are packed)."""
-    from tokenspeed.runtime.utils.env import global_server_args_dict
+    """With --decode-monokernel (the ``decode_monokernel`` that ModelConfig
+    sets on the draft's config) the draft builds its layers from the
+    monokernel class only when it is the draft the kernels bake in; another
+    DFlash2 draft keeps the regular layers under the switch."""
+    from transformers import PretrainedConfig
 
-    monkeypatch.setitem(global_server_args_dict, "decode_monokernel", switch)
+    from tokenspeed.runtime.models import muse_spark_dflash2_monokernel as seam
+
+    shape = dict(seam.KERNEL_SHAPE)
+    if not muse_draft:
+        shape["num_hidden_layers"] = 3
+    config = PretrainedConfig(**shape, dflash_config=dict(seam.KERNEL_DFLASH))
+    if switch:
+        config.decode_monokernel = True
     model = DFlash2DraftModel.__new__(DFlash2DraftModel)
-    expected = DFlash2MonokernelDecoderLayer if switch else DFlash2DecoderLayer
+    torch.nn.Module.__init__(model)
+    model.config = config
+    monokernel = switch and muse_draft
+    expected = DFlash2MonokernelDecoderLayer if monokernel else DFlash2DecoderLayer
     assert model.decoder_layer_cls is expected
