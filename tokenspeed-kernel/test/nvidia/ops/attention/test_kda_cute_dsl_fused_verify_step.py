@@ -206,8 +206,9 @@ def _assert_matches(expected, actual):
     assert torch.equal(kg[:, 2 * WIDTH :], kg_ref[:, 2 * WIDTH :])
     gate_cols = key_cols + DIM
     gates, gates_ref = kg[:, gate_cols].float(), kg_ref[:, gate_cols].float()
-    # One BF16 step of the larger gate at most.
+    # One BF16 step of the larger gate, plus a floor for sums that cancel to near zero.
     step = torch.maximum(gates.abs(), gates_ref.abs()) * 2.0**-7
+    step = step + gates_ref.abs().max() * 2.0**-16
     assert ((gates - gates_ref).abs() <= step).all()
     assert torch.equal(corr[:, WIDTH:], corr_ref[:, WIDTH:])
     written = corr_ref != CORRECTION_FILL
