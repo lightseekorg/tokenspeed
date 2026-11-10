@@ -30,6 +30,7 @@ from unittest import mock
 import pytest
 
 from tokenspeed.runtime.cache.l3.config import (
+    Hf3fsStoreSettings,
     MooncakeStoreConfig,
     MooncakeStoreSettings,
     StorageRuntimeConfig,
@@ -1516,3 +1517,72 @@ class TestStorageRuntimeConfigTest:
         )
         assert config.scheduler.pressure_high.queued_operations == 1
         assert config.scheduler.pressure_low.queued_operations == 0
+
+
+class TestHf3fsConfig:
+    def test_defaults_and_explicit_limits(self):
+        config = {
+            "directory": "/mnt/3fs/cache",
+            "library": "/opt/3fs/libhf3fs_api_shared.so",
+        }
+        resolved = Hf3fsStoreSettings.resolve({"hf3fs": config})
+        assert resolved == Hf3fsStoreSettings(**config)
+        config.update(
+            entries=8,
+            buffer_bytes=4096,
+            timeout_ms=500,
+            segment_bytes=8192,
+            read_rings=1,
+        )
+        assert Hf3fsStoreSettings.resolve({"hf3fs": config}) == Hf3fsStoreSettings(
+            **config
+        )
+
+    @pytest.mark.parametrize("field", ["directory", "library"])
+    @pytest.mark.parametrize("value", [None, "relative/path", "", 1])
+    def test_paths_must_be_absolute(self, field, value):
+        config = {
+            "directory": "/mnt/3fs/cache",
+            "library": "/opt/3fs/libhf3fs_api_shared.so",
+            field: value,
+        }
+        with pytest.raises(ValueError, match="absolute"):
+            Hf3fsStoreSettings.resolve({"hf3fs": config})
+
+    @pytest.mark.parametrize(
+        "field,maximum",
+        [
+            ("entries", 4096),
+            ("buffer_bytes", 1 << 30),
+            ("timeout_ms", 3600000),
+            ("segment_bytes", (1 << 63) - 1),
+            ("read_rings", 8),
+        ],
+    )
+    def test_resource_bounds(self, field, maximum):
+        config = {
+            "directory": "/mnt/3fs/cache",
+            "library": "/opt/3fs/libhf3fs_api_shared.so",
+            "buffer_bytes": 1,
+        }
+        for invalid in (0, -1, True, 1.5, "1", maximum + 1):
+            with pytest.raises(ValueError, match=field):
+                Hf3fsStoreSettings.resolve({"hf3fs": {**config, field: invalid}})
+        for valid in (1, maximum):
+            resolved = Hf3fsStoreSettings.resolve({"hf3fs": {**config, field: valid}})
+            assert resolved == Hf3fsStoreSettings(**{**config, field: valid})
+
+    def test_invalid_backend_shape_and_options(self):
+        for value in (None, [], "path"):
+            with pytest.raises(ValueError, match="must be an object"):
+                Hf3fsStoreSettings.resolve({"hf3fs": value})
+        config = {
+            "directory": "/mnt/3fs/cache",
+            "library": "/opt/3fs/libhf3fs_api_shared.so",
+        }
+        with pytest.raises(ValueError, match="Unsupported"):
+            Hf3fsStoreSettings.resolve({"hf3fs": {**config, "io_backend": "posix"}})
+        with pytest.raises(ValueError, match="segment_bytes must be >= buffer_bytes"):
+            Hf3fsStoreSettings.resolve(
+                {"hf3fs": {**config, "buffer_bytes": 8192, "segment_bytes": 4096}}
+            )

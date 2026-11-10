@@ -327,6 +327,59 @@ class MooncakeStoreSettings:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class Hf3fsStoreSettings:
+    """Native USRBIO access to a dedicated 3FS directory."""
+
+    directory: str
+    library: str
+    entries: int = 16
+    buffer_bytes: int = 16 * 1024 * 1024
+    timeout_ms: int = 10000
+    segment_bytes: int = 1024 * 1024 * 1024
+    read_rings: int = 2
+
+    @classmethod
+    def resolve(cls, extra_config: dict[str, Any]) -> Hf3fsStoreSettings:
+        config = extra_config.get("hf3fs")
+        if not isinstance(config, dict):
+            raise ValueError("L3 hf3fs config must be an object")
+        allowed = {
+            "directory",
+            "library",
+            "entries",
+            "buffer_bytes",
+            "timeout_ms",
+            "segment_bytes",
+            "read_rings",
+        }
+        if config.keys() - allowed:
+            raise ValueError(
+                f"Unsupported L3 hf3fs options: {sorted(config.keys() - allowed)}"
+            )
+        directory = config.get("directory")
+        if not isinstance(directory, str) or not os.path.isabs(directory):
+            raise ValueError("L3 hf3fs directory must be an absolute path")
+        library = config.get("library")
+        if not isinstance(library, str) or not os.path.isabs(library):
+            raise ValueError("L3 hf3fs requires an absolute USRBIO library path")
+        result = cls(**config)
+        for name, value, maximum in (
+            ("entries", result.entries, 4096),
+            ("buffer_bytes", result.buffer_bytes, 1 << 30),
+            ("timeout_ms", result.timeout_ms, 3600000),
+            ("segment_bytes", result.segment_bytes, (1 << 63) - 1),
+            ("read_rings", result.read_rings, 8),
+        ):
+            if type(value) is not int or not 1 <= value <= maximum:
+                raise ValueError(
+                    f"L3 USRBIO {name} must be an integer in [1, {maximum}]"
+                )
+        if result.segment_bytes < result.buffer_bytes:
+            raise ValueError("L3 USRBIO segment_bytes must be >= buffer_bytes")
+        return result
+
+
 @dataclass(frozen=True)
 class L3Settings:
     """What the engine host starts the rank's L3 executor from (``ts-l3``'s
@@ -350,8 +403,9 @@ class L3Settings:
         num_lcm_blocks: LCM blocks in the pool, the null block excluded.
         owner_rank: This rank among a sharded group's owners (KV parallel).
         tp_rank: This rank's attention-TP rank.
-        backend: ``memory`` (in process, for tests) or ``mooncake``.
+        backend: ``memory`` (in process, for tests) or ``mooncake`` or ``hf3fs``.
         mooncake: The Mooncake client, with that backend; else None.
+        hf3fs: The 3FS directory, with that backend; else None.
     """
 
     runtime: StorageRuntimeConfig
@@ -367,3 +421,4 @@ class L3Settings:
     tp_rank: int
     backend: str
     mooncake: MooncakeStoreSettings | None
+    hf3fs: Hf3fsStoreSettings | None

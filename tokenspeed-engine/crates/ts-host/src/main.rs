@@ -116,7 +116,7 @@ enum HostError {
     #[error(transparent)]
     KvEvents(#[from] ts_control::kv_events::KvEventsError),
     #[error("the L3 store: {0}")]
-    Storage(#[from] ts_mooncake::Error),
+    Storage(#[from] ts_l3::StoreError),
     #[error(transparent)]
     Loop(#[from] LoopError),
     #[error("the EPD embedding sender: {0}")]
