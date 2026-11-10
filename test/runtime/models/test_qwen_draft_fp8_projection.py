@@ -31,10 +31,22 @@ from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
 from tokenspeed.runtime.layers.quantization.modelopt_mixed import ModelOptMixedConfig
 from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config
-from tokenspeed.runtime.models.qwen3_5 import Qwen3_5AttentionDecoderLayer
-from tokenspeed.runtime.models.qwen3_5_nextn import Qwen3_5DraftAttentionDecoderLayer
-from tokenspeed.runtime.models.qwen4_exp import Qwen4ExpAttentionDecoderLayer
-from tokenspeed.runtime.models.qwen4_exp_nextn import Qwen4ExpDraftAttentionDecoderLayer
+from tokenspeed.runtime.models.qwen3_5 import (
+    Qwen3_5AttentionDecoderLayer,
+    Qwen3_5ForCausalLM,
+)
+from tokenspeed.runtime.models.qwen3_5_nextn import (
+    Qwen3_5DraftAttentionDecoderLayer,
+    Qwen3_5DraftForCausalLM,
+)
+from tokenspeed.runtime.models.qwen4_exp import (
+    Qwen4ExpAttentionDecoderLayer,
+    Qwen4ExpModel,
+)
+from tokenspeed.runtime.models.qwen4_exp_nextn import (
+    Qwen4ExpDraftAttentionDecoderLayer,
+    Qwen4ExpDraftModel,
+)
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 
@@ -53,7 +65,7 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 def test_draft_keeps_checkpoint_projections(
     monkeypatch, enabled, checkpoint, config_cls, layer_cls, draft
 ):
-    monkeypatch.setitem(global_server_args_dict, "enable_fp8_attn_proj", enabled)
+    monkeypatch.setitem(global_server_args_dict, "enable_fp8_attn_proj", not enabled)
     config = config_cls(
         hidden_size=512,
         intermediate_size=512,
@@ -90,6 +102,7 @@ def test_draft_keeps_checkpoint_projections(
                 Mapping(rank=0, world_size=1),
                 0,
                 quant_config=quant,
+                enable_fp8_attn_proj=enabled and not draft,
                 prefix=(
                     "mtp.layers.0.self_attn" if draft else "model.layers.0.self_attn"
                 ),
@@ -108,3 +121,45 @@ def test_draft_keeps_checkpoint_projections(
             assert layer.o_proj.weight.dtype == torch.bfloat16
     finally:
         torch.set_default_dtype(old_dtype)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize(
+    "config_cls,model_cls,draft",
+    [
+        (Qwen3_5TextConfig, Qwen3_5ForCausalLM, False),
+        (Qwen3_5TextConfig, Qwen3_5DraftForCausalLM, True),
+        (Qwen4ExpTextConfig, Qwen4ExpModel, False),
+        (Qwen4ExpTextConfig, Qwen4ExpDraftModel, True),
+    ],
+)
+def test_model_entry_sets_projection_policy(
+    monkeypatch, enabled, config_cls, model_cls, draft
+):
+    monkeypatch.setitem(global_server_args_dict, "enable_fp8_attn_proj", enabled)
+    config = config_cls(
+        hidden_size=512,
+        intermediate_size=512,
+        vocab_size=128,
+        full_attention_interval=1,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=128,
+        max_position_embeddings=128,
+        layer_types=["full_attention"],
+        num_experts=None,
+    )
+    config.dtype = torch.bfloat16
+    previous_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        with torch.device("cuda"):
+            model = model_cls(config, Mapping(rank=0, world_size=1))
+        expected = Fp8LinearMethod if enabled and not draft else UnquantizedLinearMethod
+        layer = model.layers[0]
+        assert isinstance(layer.qkv_proj.quant_method, expected)
+        assert isinstance(layer.o_proj.quant_method, expected)
+    finally:
+        torch.set_default_dtype(previous_dtype)

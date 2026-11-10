@@ -230,7 +230,9 @@ def test_online_block_fp8_gdn_projects_normalized_rows(
     )
     config.dtype = torch.bfloat16
     mapping = Mapping(rank=0, world_size=1)
-    gdn = Qwen3_5GatedDeltaNet(config, mapping, 1, quant_config=None).cuda()
+    gdn = Qwen3_5GatedDeltaNet(
+        config, mapping, 1, quant_config=None, enable_fp8_attn_proj=True
+    ).cuda()
     qkvz, ba = gdn.in_proj_qkvz, gdn.in_proj_ba
     qkvz.weight.normal_(std=0.02)
     ba.weight.normal_(std=0.02)
@@ -299,6 +301,7 @@ def test_gdn_projection_fp8_requires_opt_in(
         Mapping(rank=0, world_size=1),
         0,
         quant_config=quant_config,
+        enable_fp8_attn_proj=enabled,
         prefix="model.layers.0.linear_attn",
     )
     assert gdn._split_in_proj == split
@@ -345,6 +348,7 @@ def _decoder_layer(kind: str, split_gdn: bool):
         Mapping(rank=0, world_size=1),
         1,
         quant_config=ModelOptMixedConfig(quantized_layers=quantized),
+        enable_fp8_attn_proj=False,
         prefix=f"model.layers.1.{attn}",
     ).cuda()
 

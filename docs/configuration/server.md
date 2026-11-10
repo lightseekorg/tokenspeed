@@ -101,6 +101,10 @@ For an NVFP4 checkpoint with floating attention projections, use
 --quantization nvfp4 --enable-fp8-attn-proj
 ```
 
+Target models resolve the projection switch once and pass it to their layers.
+MTP backbones explicitly disable additional online FP8 projection quantization
+and retain their checkpoint quantization policy.
+
 GDN splits its input into an FP8 QKVZ GEMM and a floating BA GEMM. Any split
 QKVZ/BA projection uses BA overlap when an auxiliary stream is available,
 regardless of quantization format. The streams join before the attention boundary.

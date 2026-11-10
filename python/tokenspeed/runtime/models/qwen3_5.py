@@ -150,7 +150,6 @@ def _uses_packed_fp8_output(projection: RowParallelLinear) -> bool:
     method = projection.quant_method
     return (
         envs.TOKENSPEED_FUSE_FP8_OUTPUT_QUANT.get()
-        and global_server_args_dict["enable_fp8_attn_proj"]
         and isinstance(method, Fp8LinearMethod)
         and method.block_quant
         and method.quant_config.weight_block_size[1] == 128
@@ -257,9 +256,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         alt_stream: torch.cuda.Stream | None = None,
+        *,
+        enable_fp8_attn_proj: bool,
     ) -> None:
         super().__init__()
         self.config = config
+        self.enable_fp8_attn_proj = enable_fp8_attn_proj
         self.mapping = mapping
         self.attn_tp_rank = mapping.attn.tp_rank
         self.attn_tp_size = mapping.attn.tp_size
@@ -291,7 +293,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
 
-        fp8_proj = global_server_args_dict["enable_fp8_attn_proj"]
+        fp8_proj = enable_fp8_attn_proj
         if (
             not fp8_proj
             and isinstance(quant_config, Fp8Config)
@@ -655,7 +657,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         core_attn_out = core_attn_out.reshape(seq_len, -1)
         z = z.reshape(seq_len, -1)
         if (
-            _uses_packed_fp8_output(self.out_proj)
+            self.enable_fp8_attn_proj
+            and _uses_packed_fp8_output(self.out_proj)
             and core_attn_out.dtype == torch.bfloat16
         ):
             codes, scales = output_fp8_quant_pack(
@@ -685,6 +688,8 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         alt_stream: torch.cuda.Stream | None = None,
+        *,
+        enable_fp8_attn_proj: bool,
     ) -> None:
         super().__init__()
         self.config = config
@@ -698,6 +703,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             quant_config,
             prefix=prefix,
             alt_stream=alt_stream,
+            enable_fp8_attn_proj=enable_fp8_attn_proj,
         )
 
         #  Determine the MLP type based on the model type
@@ -826,8 +832,6 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
 class Qwen3_5AttentionDecoderLayer(nn.Module):
     """Qwen3.5 Decoder Layer with Full Attention."""
 
-    ALLOW_FP8_ATTN_PROJ = True
-
     def __init__(
         self,
         config: Qwen3_5TextConfig,
@@ -836,9 +840,12 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         alt_stream: torch.cuda.Stream | None = None,
+        *,
+        enable_fp8_attn_proj: bool,
     ) -> None:
         super().__init__()
         self.config = config
+        self.enable_fp8_attn_proj = enable_fp8_attn_proj
         self.mapping = mapping
         self.hidden_size = config.hidden_size
         self.attn_tp_rank = mapping.attn.tp_rank
@@ -880,9 +887,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             dtype=torch.get_default_dtype(),
         )
 
-        fp8_proj = (
-            self.ALLOW_FP8_ATTN_PROJ and global_server_args_dict["enable_fp8_attn_proj"]
-        )
+        fp8_proj = enable_fp8_attn_proj
         attn_quant_config = _get_attn_proj_quant_config(
             quant_config,
             enabled=fp8_proj,
@@ -1001,7 +1006,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
     def _should_fuse_output_quant(self, gate: torch.Tensor | None) -> bool:
         return (
-            self.ALLOW_FP8_ATTN_PROJ
+            self.enable_fp8_attn_proj
             and gate is not None
             and gate.dtype == torch.bfloat16
             and _uses_packed_fp8_output(self.o_proj)
@@ -1149,11 +1154,15 @@ class Qwen3_5ForCausalLM(nn.Module):
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        *,
+        enable_fp8_attn_proj: bool | None = None,
     ) -> None:
         super().__init__()
         self.config = config
         self.mapping = mapping
         self.hidden_size = config.hidden_size
+        if enable_fp8_attn_proj is None:
+            enable_fp8_attn_proj = global_server_args_dict["enable_fp8_attn_proj"]
 
         # The shared expert overlaps the routed experts on this stream. In a
         # ROCm HIP graph, each cross-stream edge costs microseconds of queue
@@ -1186,6 +1195,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                 quant_config=quant_config,
                 prefix=prefix,
                 alt_stream=alt_stream,
+                enable_fp8_attn_proj=enable_fp8_attn_proj,
             )
 
         self.layers = make_layers(

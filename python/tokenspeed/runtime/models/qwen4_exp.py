@@ -306,6 +306,8 @@ class Qwen4ExpLinearDecoderLayer(_Qwen4ExpDecoderMixin, Qwen3_5LinearDecoderLaye
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         alt_stream: torch.cuda.Stream | None = None,
+        *,
+        enable_fp8_attn_proj: bool,
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
@@ -318,6 +320,7 @@ class Qwen4ExpLinearDecoderLayer(_Qwen4ExpDecoderMixin, Qwen3_5LinearDecoderLaye
             quant_config,
             prefix=prefix,
             alt_stream=alt_stream,
+            enable_fp8_attn_proj=enable_fp8_attn_proj,
         )
         self.mlp, self.is_moe = _build_qwen4_exp_mlp(
             config,
@@ -376,9 +379,12 @@ class Qwen4ExpAttentionDecoderLayer(
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         alt_stream: torch.cuda.Stream | None = None,
+        *,
+        enable_fp8_attn_proj: bool,
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
+        self.enable_fp8_attn_proj = enable_fp8_attn_proj
         self.mapping = mapping
         self.hidden_size = config.hidden_size
         self.attn_tp_rank = mapping.attn.tp_rank
@@ -415,9 +421,7 @@ class Qwen4ExpAttentionDecoderLayer(
             is_neox_style=True,
             dtype=torch.get_default_dtype(),
         )
-        fp8_proj = (
-            self.ALLOW_FP8_ATTN_PROJ and global_server_args_dict["enable_fp8_attn_proj"]
-        )
+        fp8_proj = enable_fp8_attn_proj
         attn_quant_config = _get_attn_proj_quant_config(
             quant_config,
             enabled=fp8_proj,
@@ -575,8 +579,16 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        *,
+        enable_fp8_attn_proj: bool | None = None,
     ) -> None:
-        super().__init__(config, mapping, quant_config, prefix)
+        super().__init__(
+            config,
+            mapping,
+            quant_config,
+            prefix,
+            enable_fp8_attn_proj=enable_fp8_attn_proj,
+        )
         self.norm = None
         hc_config = HyperConnectionConfig(
             hc_count=int(config.hc_count),

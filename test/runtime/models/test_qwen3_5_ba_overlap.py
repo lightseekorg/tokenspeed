@@ -55,6 +55,7 @@ def make_gdn(*, hidden_size, overlap):
             Mapping(rank=0, world_size=1),
             0,
             prefix="model.layers.0.linear_attn",
+            enable_fp8_attn_proj=True,
             alt_stream=torch.cuda.Stream() if overlap else None,
         ).cuda()
     finally:

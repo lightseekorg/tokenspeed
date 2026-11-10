@@ -77,9 +77,6 @@ class Qwen3_5DraftAttentionDecoderLayer(Qwen3_5AttentionDecoderLayer):
     that assert ``not is_mixed()`` at metadata init are not supported.
     """
 
-    # Draft projections retain the checkpoint quantization policy.
-    ALLOW_FP8_ATTN_PROJ = False
-
     def _attn(
         self,
         positions: torch.Tensor,
@@ -129,7 +126,13 @@ class Qwen3_5DraftForCausalLM(Qwen3_5ForCausalLM):
                 f"(got {config.num_hidden_layers}); the draft row narrowing "
                 "happens once, at the single layer's attention."
             )
-        super().__init__(config, mapping, quant_config=quant_config, prefix=prefix)
+        super().__init__(
+            config,
+            mapping,
+            quant_config=quant_config,
+            prefix=prefix,
+            enable_fp8_attn_proj=False,
+        )
 
 
 class Qwen3_5ForConditionalGenerationNextN(nn.Module):
