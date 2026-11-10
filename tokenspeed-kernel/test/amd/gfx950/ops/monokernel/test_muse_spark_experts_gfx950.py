@@ -261,7 +261,6 @@ def _worker(
                 {"slt": 255, "xq": 240, "ex1": 0, "exr": exr, "ex2": 0},
                 rows,
                 exr_parts,
-                False,
             ),
             regions=(("route", 2 * TOP_K), ("cg", POOLED // 2)) + moe_experts.regions(),
             rows=rows,
