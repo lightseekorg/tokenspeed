@@ -889,7 +889,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 metrics.record_capacity_abort();
             }
             // A pre-dispatch snapshot: the running count still holds what
-            // this round's commits end.
+            // this round's commits end. `sizes.running` is the batch;
+            // `outputs.num_running()` is every request this rank holds,
+            // including the PD transfer and waiting states the batch excludes.
             let sizes = planned_sizes.insert(self.scheduler.sizes());
             let iteration_tokens: i64 = forward.as_ref().map_or(0, |batch| {
                 batch.input_lengths.iter().map(|&n| i64::from(n)).sum()
@@ -899,6 +901,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 .active_pages
                 .read(Instant::now(), idle, || scheduler.active_lcm_blocks());
             metrics.record_scheduler_iteration(
+                sizes.running as i64,
                 self.outputs.num_running() as i64,
                 sizes.waiting as i64,
                 i64::from(active_pages),
@@ -919,8 +922,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                     sizes.retracted as i64,
                 ),
                 crate::output::Role::Decode => metrics.record_decode_queues(
-                    sizes.bootstrapping as i64,
-                    sizes.pd_transfer as i64,
+                    sizes.bootstrapping as i64,     // prealloc: waiting for the peer
+                    sizes.remote_prefilling as i64, // kv_wait: waiting for its KV
+                    sizes.pd_transfer as i64,       // transfer pins pages
                     sizes.retracted as i64,
                 ),
                 crate::output::Role::Plain => {}

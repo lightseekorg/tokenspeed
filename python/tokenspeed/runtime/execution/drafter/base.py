@@ -24,10 +24,11 @@ from abc import abstractmethod
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
+from typing_extensions import override
 
 from tokenspeed.runtime.execution.drafter.speculative_sampling import (
     DraftProposalSampler,
@@ -39,12 +40,15 @@ from tokenspeed.runtime.execution.slot_state import (
     unpack_slot_rows,
 )
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.context import ForwardContext
     from tokenspeed.runtime.execution.cudagraph_memory import CapturedLadder
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
     from tokenspeed.runtime.execution.memory_delta import MemoryDeltaObserver
+    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
     from tokenspeed.runtime.execution.tree_spec import TreeSpec
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
@@ -476,3 +480,97 @@ class BaseDrafter:
     @abstractmethod
     def draft(self, *args, **kwargs) -> torch.Tensor | None:
         raise NotImplementedError
+
+
+DsaTopKState = tuple[Any | None, Any | None]
+
+
+@dataclass
+class HiddenDraftInput:
+    """The target round a hidden-state drafter drafts from."""
+
+    input_num_tokens: int
+    num_extends: int
+    forward_mode: ForwardMode
+    base_model_output: torch.Tensor  # [bs] (extend) / [bs * k] (decode verify outputs)
+    accept_lengths: torch.Tensor  # [bs]
+    # The target's full hidden rows: the whole span, or this rank's shard of it.
+    base_out_hidden_states: torch.Tensor
+    global_num_tokens: list[int] | None = None
+    global_bs: list[int] | None = None
+    all_decode_or_idle: bool = False
+    # The target's DSA top-k selection, for a draft head that shares it.
+    dsa_topk: DsaTopKState = (None, None)
+    # The target forward's query shard, which the draft's extend rows follow.
+    query_shard: QueryShardPlan | None = None
+
+
+class HiddenStateDrafter(BaseDrafter):
+    """A drafter that drafts from the target round's accepted tokens and hidden
+    states, with the target's embedding and LM head."""
+
+    shares_target_embed_head = True
+    supports_pd_layerwise_finalization = True
+    supports_speculative_sampling = True
+    drafts_from_vocab_shard = True
+
+    def __init__(
+        self,
+        spec_num_tokens: int,
+        spec_num_steps: int,
+        draft_model_runner: ModelRunner,
+        attn_backend: AttentionBackend | None = None,
+        token_to_kv_pool: CachePool | None = None,
+        runtime_states: RuntimeStates | None = None,
+        input_buffers: InputBuffers | None = None,
+        vocab_size: int | None = None,
+    ) -> None:
+        super().__init__(
+            spec_num_tokens,
+            spec_num_steps,
+            draft_model_runner,
+            runtime_states=runtime_states,
+            input_buffers=input_buffers,
+            attn_backend=attn_backend,
+            token_to_kv_pool=token_to_kv_pool,
+            vocab_size=vocab_size,
+        )
+        self.device = draft_model_runner.device
+        # Drafter-owned seq_lens the draft metadata aliases; draft steps advance it.
+        self.draft_seq_lens_buf = torch.zeros_like(self.input_buffers.seq_lens_buf)
+        # gather_ids = these offsets + accept_lengths: each request's last accepted row.
+        self.padded_gather_ids_offsets_buf = (
+            torch.arange(
+                self.input_buffers.max_bs, dtype=torch.int64, device=self.device
+            )
+            * spec_num_tokens
+            - 1
+        )
+
+    def _target_dsa_topk(self, base_ctx: ForwardContext) -> DsaTopKState:
+        """The target's DSA top-k selection the draft shares; none by default."""
+        return (None, None)
+
+    @override
+    @nvtx_range("drafter", color="purple")
+    def run(
+        self,
+        base_ctx: ForwardContext,
+        logits_output: LogitsProcessorOutput,
+        output_tokens: torch.Tensor,
+        accept_lengths: torch.Tensor,
+    ) -> torch.Tensor:
+        draft_input = HiddenDraftInput(
+            input_num_tokens=base_ctx.input_num_tokens,
+            num_extends=base_ctx.num_extends,
+            forward_mode=base_ctx.forward_mode,
+            base_model_output=output_tokens,
+            accept_lengths=accept_lengths,
+            base_out_hidden_states=logits_output.hidden_states,
+            global_num_tokens=base_ctx.global_num_tokens,
+            global_bs=base_ctx.global_bs,
+            all_decode_or_idle=base_ctx.all_decode_or_idle,
+            dsa_topk=self._target_dsa_topk(base_ctx),
+            query_shard=base_ctx.query_shard,
+        )
+        return self.draft(draft_input)

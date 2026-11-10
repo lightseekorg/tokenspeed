@@ -1027,11 +1027,42 @@ Where the endpoint lives depends on the launch mode:
 ### Request metrics
 
 The engine exports the scheduler's view of a request: the queue wait above
-(`tokenspeed:request_queue_time_seconds`), the running and waiting gauges,
-and the preemption and abort counters. Latency from the client's side
+(`tokenspeed:request_queue_time_seconds`), the running, waiting, and inflight
+gauges, and the preemption and abort counters. Latency from the client's side
 (time to first token, inter-token latency, end-to-end latency) and the
 per-request finish counts are the frontend's: under `ts serve`, SMG's router
 metrics on its `--prometheus-port`.
+
+`tokenspeed:num_requests_running` counts the rank's running batch: local
+prefill forwards, prompts whose prefill is done (about to decode on a fused
+rank, or awaiting the PD transfer on a prefill rank), and decode rows. On a
+decode rank that is the decode batch, bounded by the rank's
+`max_num_seqs / attention-DP size`; it excludes `RemotePrefilling` requests
+waiting for the prefill peer's KV.
+`tokenspeed:num_requests_inflight` counts every request the rank admitted and
+has not finished, including the scheduler's waiting and retracted requests and
+the PD states the batch excludes — a decode rank's `RemotePrefilling` and
+`PdTransferring` requests wait for the prefill node's KV and take no batch row.
+On a PD decode rank the inflight gauge therefore exceeds the running gauge while
+prompts wait for transfer; use `num_requests_running` for batch saturation and
+`num_requests_inflight` for how much work the rank holds.
+
+The decode role splits that PD wait into its own gauges.
+`tokenspeed:num_decode_kv_wait_reqs` counts `RemotePrefilling` requests: the
+prefill peer is working, this rank already holds their destination pages, and
+nothing here is schedulable until the bootstrap token arrives.
+`tokenspeed:num_decode_prealloc_queue_reqs` counts the earlier wait for the peer
+to connect. `tokenspeed:num_decode_transfer_queue_reqs` counts requests whose
+pages a transfer still pins, including requests that already ended (aborted or
+failed) and are only waiting for the transport to report stopped; it is a
+resource count, not a queue depth. The transfer gauge is a superset of
+`num_decode_kv_wait_reqs`: every waiting request's destination pages are pinned
+by its inbound transfer, so do not add the two. Use `num_decode_kv_wait_reqs`
+for "waiting for KV", and `num_requests_inflight` for the rank's total held
+requests.
+`tokenspeed:num_requests_waiting` is the scheduler's narrower waiting queue,
+without the PD bootstrapping share (see `#queue-req` above). All of these carry
+the `dp_rank` label and are per scheduler rank.
 
 The scheduler process exports `tokenspeed:num_preemptions_total`: requests
 preempted by a capacity retraction — suspended
