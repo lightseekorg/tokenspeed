@@ -68,6 +68,38 @@ if current_platform().is_nvidia:
     except ImportError:
         pass
 
+    try:
+        from tokenspeed_kernel.thirdparty.cuda.flashinfer_softmax import (
+            softmax as _flashinfer_softmax,
+        )
+    except ImportError:
+        pass
+    else:
+
+        @register_kernel(
+            "sampling",
+            "softmax",
+            name="cuda_softmax",
+            solution="cuda",
+            capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+            signatures=format_signatures(
+                "logits", "dense", {torch.float32, torch.float16, torch.bfloat16}
+            ),
+            priority=Priority.PERFORMANT,
+        )
+        def cuda_softmax(
+            logits: torch.Tensor,
+            *,
+            temperature: torch.Tensor,
+            out: torch.Tensor | None,
+        ) -> torch.Tensor:
+            """fp32 ``softmax(logits / temperature)`` per row; see the family op."""
+            return _flashinfer_softmax(
+                logits.contiguous(),
+                temperature=temperature.reshape(-1).contiguous(),
+                out=out,
+            )
+
     # Its tvm-ffi library loads on the first launch, not on import.
     from tokenspeed_kernel.thirdparty.cuda.eagle4_candidate import (
         eagle4_candidate_tail as _eagle4_candidate_tail_impl,

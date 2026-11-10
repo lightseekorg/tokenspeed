@@ -86,11 +86,13 @@ class TestEagleHarnessConfig:
             "EAGLE4", 1, 15, 16, **{**chain, "speculative_exec_mode": 1}
         )
         assert sa.eagle_harness
-        sa = self._resolve_tree("EAGLE4", 4, 12, 16, **harness, **sampled)
-        assert sa.eagle_harness and sa.enable_speculative_sampling
-        # A sampled chain draws each node's one child, as a tree its children.
-        sa = self._resolve_tree("EAGLE4", 1, 15, 16, **chain, **sampled)
-        assert sa.eagle_harness and sa.enable_speculative_sampling
+        for backend in ("flashinfer", "triton"):
+            backend_sampled = {**sampled, "sampling_backend": backend}
+            sa = self._resolve_tree("EAGLE4", 4, 12, 16, **harness, **backend_sampled)
+            assert sa.eagle_harness and sa.enable_speculative_sampling
+            # A sampled chain draws each node's one child, as a tree its children.
+            sa = self._resolve_tree("EAGLE4", 1, 15, 16, **chain, **backend_sampled)
+            assert sa.eagle_harness and sa.enable_speculative_sampling
         tree = ("EAGLE4", 4, 12, 16)
         # Only exec mode 2 (up to 64 steps) meets the lane limit below the node limit.
         measure = {**harness, "speculative_exec_mode": 2}
@@ -104,10 +106,14 @@ class TestEagleHarnessConfig:
             (("EAGLE4", 1, 16, 16), chain, "at most 15 steps"),
             (
                 ("EAGLE4", 1, 15, 16),
-                {**chain, **sampled, "sampling_backend": "triton"},
-                "flashinfer",
+                {**chain, **sampled, "sampling_backend": "triton_full"},
+                "flashinfer or triton",
             ),
-            (tree, {**harness, **sampled, "sampling_backend": "triton"}, "flashinfer"),
+            (
+                tree,
+                {**harness, **sampled, "sampling_backend": "greedy"},
+                "flashinfer or triton",
+            ),
             (("EAGLE3", 4, 5, 16), sampled, "only the topk=1 chain"),
         ]
         for (algorithm, topk, steps, nodes), overrides, message in cases:

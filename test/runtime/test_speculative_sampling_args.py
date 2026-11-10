@@ -53,7 +53,7 @@ def test_default_is_off_and_the_flags_travel_by_config_not_global_dict():
 
 
 @pytest.mark.parametrize("algorithm", ["EAGLE3", "MTP"])
-@pytest.mark.parametrize("backend", ["flashinfer", "flashinfer_full"])
+@pytest.mark.parametrize("backend", ["flashinfer", "flashinfer_full", "triton"])
 def test_chain_drafters_with_a_draft_prob_verifier_resolve(algorithm, backend):
     args = _args(
         speculative_algorithm=algorithm,
@@ -227,10 +227,9 @@ def test_refuses_the_greedy_verifier():
         _args(sampling_backend="greedy")
 
 
-@pytest.mark.parametrize("backend", ["triton", "triton_full"])
-def test_refuses_the_triton_verifiers(backend):
+def test_refuses_the_triton_full_verifier():
     with pytest.raises(ValueError, match="target-sampled exact match"):
-        _args(sampling_backend=backend)
+        _args(sampling_backend="triton_full")
 
 
 def test_threshold_must_lie_in_the_fp32_sentinel_range():

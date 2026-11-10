@@ -28,9 +28,10 @@ launch captured in a graph once is replayed for every round. Kernels run
 without FMA contraction in a fixed reduction order: results are
 deterministic bit for bit.
 
-Not built here: the sampled-tree ops (``sample_children``,
-``tree_reject_sample``, ``residual_sample``, ``publish_draft_q``) and the
-device-chain ops, which need device-side graph launch.
+The sampled-tree ops (``sample_children``, ``tree_reject_sample``,
+``residual_sample``, ``publish_draft_q``) register here too; the CUDA build
+takes precedence on NVIDIA. Not built here: the device-chain ops, which need
+device-side graph launch.
 ``policy_select_verify`` registers for AMD only; its fixed summation order
 (column means, then a blocked prefix sum) is spelled out on
 ``triton_eagle_harness_policy_select_verify``.
@@ -43,6 +44,7 @@ import struct
 import torch
 from tokenspeed_kernel._triton import triton
 from tokenspeed_kernel.ops.sampling.eagle_harness._triton import policy as _policy
+from tokenspeed_kernel.ops.sampling.eagle_harness._triton import sampled as _sampled
 from tokenspeed_kernel.ops.sampling.eagle_harness._triton import tree as _tree
 from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
@@ -59,6 +61,10 @@ __all__ = [
     "triton_eagle_harness_policy_decide_tree",
     "triton_eagle_harness_policy_decide_chain",
     "triton_eagle_harness_policy_select_verify",
+    "triton_eagle_harness_sample_children",
+    "triton_eagle_harness_tree_reject_sample",
+    "triton_eagle_harness_residual_sample",
+    "triton_eagle_harness_publish_draft_q",
 ]
 
 _PORTABLE = CapabilityRequirement(vendors=frozenset({"nvidia", "amd"}))
@@ -796,4 +802,396 @@ def triton_eagle_harness_policy_select_verify(
         max_widths,
         exec_mode,
         **_EXACT,
+    )
+
+
+@register_kernel(
+    "sampling",
+    "eagle_harness_sample_children",
+    name="triton_eagle_harness_sample_children",
+    solution="triton",
+    capability=_PORTABLE,
+    signatures=frozenset({format_signature()}),
+    priority=Priority.PORTABLE,
+)
+def triton_eagle_harness_sample_children(
+    logits: torch.Tensor,
+    candidates: torch.Tensor,
+    tokens: torch.Tensor,
+    scores: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    q_store: torch.Tensor,
+    qid_store: torch.Tensor,
+    node_slot: torch.Tensor,
+    node_pos: torch.Tensor,
+    width: torch.Tensor | None,
+    slot_base: int,
+    cumu_start: torch.Tensor,
+    vocab_limit: int,
+    seed: int,
+    round_counter: torch.Tensor,
+    launch: int,
+) -> None:
+    """Redraws each expanded row's ``K`` children from its draft
+    distribution, in place.
+
+    ``logits`` / ``candidates`` (``[requests, rows, NC]`` fp32 / int64) and
+    ``tokens`` / ``scores`` (``[requests, rows, K]`` int64 / fp32) are views
+    with unit last stride; request ``b`` expands its first ``width[0]`` rows
+    (int32 ``[1]``; None: all). Per request, ``temperatures`` (fp32),
+    ``top_ks`` (int32) and ``top_ps`` (fp32); a temperature <= 0 keeps the
+    row's children and marks them drawn without q. Row ``w``'s q (softmax of
+    ``logits / T`` over the candidates below ``vocab_limit``, cut to top-k /
+    top-p and renormalized) and candidate ids go to slot ``slot_base + w``
+    of ``q_store`` / ``qid_store`` (contiguous ``[requests, slots, NC]``
+    fp32 / int32), its children's (slot, position) to nodes ``cumu_start[0]
+    + w * K ..`` of ``node_slot`` / ``node_pos`` (int32 ``[requests,
+    nodes]``). The Gumbel noise is keyed by ``seed``, ``round_counter[0]``
+    (int64), ``launch`` (``< 64``, one per launch of a round), the expanded
+    row and the position. Constraints: ``NC <= 1024``, at most 1024 rows.
+    Grid: one program per row.
+    """
+    if not (
+        logits.dim() == 3
+        and candidates.dim() == 3
+        and tokens.dim() == 3
+        and scores.dim() == 3
+        and logits.stride(2) == 1
+        and candidates.stride(2) == 1
+        and tokens.stride(2) == 1
+        and scores.stride(2) == 1
+    ):
+        raise ValueError("eagle_harness_sample_children: [requests, rows, *] views")
+    nc = q_store.size(2)
+    requests, rows_per_req, k = tokens.shape
+    rows = requests * rows_per_req
+    if not (
+        logits.size(2) == nc and candidates.size(2) == nc and qid_store.size(2) == nc
+    ):
+        raise ValueError("eagle_harness_sample_children: candidate width")
+    if not (
+        logits.shape[:2] == (requests, rows_per_req)
+        and candidates.shape[:2] == (requests, rows_per_req)
+        and scores.shape == tokens.shape
+    ):
+        raise ValueError("eagle_harness_sample_children: expanded rows")
+    if not (
+        node_slot.size(1) == node_pos.size(1)
+        and node_slot.stride(0) == node_pos.stride(0)
+        and node_slot.stride(1) == 1
+        and node_pos.stride(1) == 1
+    ):
+        raise ValueError("eagle_harness_sample_children: node tables")
+    if not (q_store.is_contiguous() and qid_store.is_contiguous()):
+        raise ValueError("eagle_harness_sample_children: contiguous q stores")
+    # The caller keeps cumu_start + width * K within the node tables.
+    if not (rows_per_req > 0 and slot_base + rows_per_req <= q_store.size(1)):
+        raise ValueError("eagle_harness_sample_children: slot range")
+    # The noise key packs the expanded row and the position into 10 bits each.
+    if not (
+        nc <= _sampled.MAX_KEYED
+        and rows <= _sampled.MAX_KEYED
+        and 0 <= launch < 64
+        and 1 <= k <= nc
+    ):
+        raise ValueError("eagle_harness_sample_children: counter layout")
+    if rows == 0:
+        return
+    block_nc = triton.next_power_of_2(nc)
+    _sampled._sample_children_kernel[(rows,)](
+        logits,
+        logits.stride(0),
+        logits.stride(1),
+        candidates,
+        candidates.stride(0),
+        candidates.stride(1),
+        tokens,
+        tokens.stride(0),
+        tokens.stride(1),
+        scores,
+        scores.stride(0),
+        scores.stride(1),
+        temperatures,
+        top_ks,
+        top_ps,
+        q_store,
+        qid_store,
+        node_slot,
+        node_pos,
+        rows_per_req,
+        width if width is not None else cumu_start,
+        slot_base,
+        cumu_start,
+        q_store.size(1),
+        node_slot.stride(0),
+        nc,
+        vocab_limit,
+        seed,
+        round_counter,
+        launch,
+        K=k,
+        K_PAD=triton.next_power_of_2(k),
+        HAS_WIDTH=width is not None,
+        BLOCK_NC=block_nc,
+        CHUNK=max(1, min(block_nc, 4096 // block_nc)),
+    )
+
+
+@register_kernel(
+    "sampling",
+    "eagle_harness_tree_reject_sample",
+    name="triton_eagle_harness_tree_reject_sample",
+    solution="triton",
+    capability=_PORTABLE,
+    signatures=frozenset({format_signature()}),
+    priority=Priority.PORTABLE,
+)
+def triton_eagle_harness_tree_reject_sample(
+    probas: torch.Tensor,
+    tokens: torch.Tensor,
+    parents: torch.Tensor,
+    q_rows: torch.Tensor | None,
+    q_slot: torch.Tensor,
+    q_pos: torch.Tensor,
+    q_store: torch.Tensor,
+    qid_store: torch.Tensor,
+    coins: torch.Tensor,
+    top_ks: torch.Tensor,
+    argmax: torch.Tensor,
+    path: torch.Tensor,
+    predicts: torch.Tensor,
+    accept_length: torch.Tensor,
+    last_row: torch.Tensor,
+) -> None:
+    """Accepts each request's draft tree against its target rows by
+    rejection sampling, rewriting rejected rows into their residuals.
+
+    ``tokens`` / ``parents`` (int32 ``[bs, N]``, ``N <= 64``, parent before
+    child) hold the trees; ``probas`` (fp32, rows ``b * N + node``) the
+    target probabilities at every node; ``coins`` (fp32 ``[bs, >= N]``) a
+    uniform coin per child; ``top_ks`` (int32) and ``argmax`` (int64) one
+    entry per probas row, a top-k of 1 marking a greedy row. A node's
+    children come with a draft q when ``q_rows`` (int64 ``[bs]``, the
+    requests' rows of the q tables; None: no q) names a row whose
+    ``q_slot`` (int32 ``[pool, N]``) of the first child is not -1: ``q_store``
+    / ``qid_store`` (contiguous ``[pool, slots, NC]``) hold the slot's q and
+    candidate ids and ``q_pos`` each child's position. Writes ``path``
+    (int32 ``[bs, N]``, the accepted nodes from the root, -1 past them),
+    ``predicts`` (int32 ``[bs * N]``, the accepted tokens),
+    ``accept_length`` (int32 ``[bs]``) and ``last_row`` (int64 ``[bs]``, the
+    last accepted node's probas row). Grid: one program per node, then one
+    per request for the path.
+    """
+    if not (probas.stride(1) == 1 and coins.stride(1) == 1):
+        raise ValueError("eagle_harness_tree_reject_sample: unit column strides")
+    batch_size, num_nodes = tokens.shape
+    if num_nodes > _sampled.MAX_TREE_NODES:
+        raise ValueError("eagle_harness_tree_reject_sample: at most 64 nodes")
+    # The kernels index the trees and their q tables with the trees' row width.
+    if not (
+        tokens.stride(0) == num_nodes
+        and parents.size(1) == num_nodes
+        and parents.stride(0) == num_nodes
+        and coins.size(1) >= num_nodes
+        and probas.size(0) >= batch_size * num_nodes
+        and path.is_contiguous()
+        and path.shape == tokens.shape
+    ):
+        raise ValueError("eagle_harness_tree_reject_sample: row widths")
+    if not (
+        top_ks.dim() == 1
+        and top_ks.stride(0) == 1
+        and argmax.dim() == 1
+        and argmax.stride(0) == 1
+        and top_ks.size(0) >= batch_size * num_nodes
+        and argmax.size(0) >= batch_size * num_nodes
+    ):
+        raise ValueError(
+            "eagle_harness_tree_reject_sample: one top-k and argmax per row"
+        )
+    if q_rows is not None and not (
+        q_slot.size(1) == num_nodes
+        and q_pos.size(1) == num_nodes
+        and q_slot.stride(0) == num_nodes
+        and q_pos.stride(0) == num_nodes
+        and q_store.is_contiguous()
+        and qid_store.is_contiguous()
+    ):
+        raise ValueError("eagle_harness_tree_reject_sample: q table row widths")
+    if batch_size == 0:
+        return
+    n_pad = max(triton.next_power_of_2(num_nodes), 2)
+    # Each node's accepted child goes to the path rows, which the walk then rewrites.
+    _sampled._tree_reject_nodes_kernel[(batch_size, num_nodes)](
+        probas,
+        probas.stride(0),
+        tokens,
+        parents,
+        q_rows if q_rows is not None else last_row,
+        q_slot,
+        q_pos,
+        q_store,
+        qid_store,
+        coins,
+        coins.stride(0),
+        top_ks,
+        argmax,
+        path,
+        num_nodes,
+        q_store.size(1),
+        q_store.size(2),
+        probas.size(1),
+        HAS_Q=q_rows is not None,
+        N_PAD=n_pad,
+        BLOCK_NC=max(triton.next_power_of_2(q_store.size(2)), 2),
+        BLOCK_V=1024,
+    )
+    _sampled._tree_reject_path_kernel[(batch_size,)](
+        tokens,
+        path,
+        predicts,
+        accept_length,
+        last_row,
+        num_nodes,
+        N_PAD=n_pad,
+    )
+
+
+@register_kernel(
+    "sampling",
+    "eagle_harness_residual_sample",
+    name="triton_eagle_harness_residual_sample",
+    solution="triton",
+    capability=_PORTABLE,
+    signatures=frozenset({format_signature()}),
+    priority=Priority.PORTABLE,
+)
+def triton_eagle_harness_residual_sample(
+    probas: torch.Tensor,
+    last_row: torch.Tensor,
+    coins: torch.Tensor,
+    top_ks: torch.Tensor,
+    argmax: torch.Tensor,
+    accept_length: torch.Tensor,
+    predicts: torch.Tensor,
+    num_nodes: int,
+) -> None:
+    """Writes each request's bonus token to ``predicts[b * num_nodes +
+    accept_length[b] - 1]`` (int32): the argmax (int64, per probas row) of a
+    greedy row (top-k 1, int32 per row), else the first positive entry of
+    probas row ``last_row[b]`` (int64) whose cumulative mass passes
+    ``coins[b] * sum(row)`` (fp32 coins; the row needs no normalization).
+    Grid: one program per request, two passes over the row.
+    """
+    if probas.stride(1) != 1:
+        raise ValueError("eagle_harness_residual_sample: unit column stride")
+    batch_size = last_row.size(0)
+    if not (
+        predicts.size(0) >= batch_size * num_nodes
+        and accept_length.size(0) >= batch_size
+    ):
+        raise ValueError("eagle_harness_residual_sample: output rows")
+    # last_row indexes probas rows, and so the per-row top-k and argmax.
+    if not (
+        top_ks.dim() == 1
+        and top_ks.stride(0) == 1
+        and argmax.dim() == 1
+        and argmax.stride(0) == 1
+        and top_ks.size(0) >= probas.size(0)
+        and argmax.size(0) >= probas.size(0)
+    ):
+        raise ValueError("eagle_harness_residual_sample: one top-k and argmax per row")
+    if batch_size == 0:
+        return
+    _sampled._residual_sample_kernel[(batch_size,)](
+        probas,
+        probas.stride(0),
+        last_row,
+        coins,
+        top_ks,
+        argmax,
+        accept_length,
+        predicts,
+        num_nodes,
+        probas.size(1),
+        BLOCK_V=4096,
+    )
+
+
+@register_kernel(
+    "sampling",
+    "eagle_harness_publish_draft_q",
+    name="triton_eagle_harness_publish_draft_q",
+    solution="triton",
+    capability=_PORTABLE,
+    signatures=frozenset({format_signature()}),
+    priority=Priority.PORTABLE,
+)
+def triton_eagle_harness_publish_draft_q(
+    ranked: torch.Tensor,
+    node_slot: torch.Tensor,
+    node_pos: torch.Tensor,
+    q_round: torch.Tensor,
+    qid_round: torch.Tensor,
+    rows: torch.Tensor,
+    q_tab: torch.Tensor,
+    qid_tab: torch.Tensor,
+    slot_tab: torch.Tensor,
+    pos_tab: torch.Tensor,
+    live_rows: torch.Tensor,
+    verify_num: torch.Tensor,
+) -> None:
+    """Copies each of the first ``live_rows[0]`` requests' round q stores
+    (``q_round`` / ``qid_round``, contiguous ``[bs, slots, NC]``) to row
+    ``rows[b]`` (int64) of ``q_tab`` / ``qid_tab``, and the (slot, position)
+    of its ranked nodes ``ranked[b, i]`` (int64), ``0 < i < verify_num[0]``,
+    from ``node_slot`` / ``node_pos`` to ``slot_tab`` / ``pos_tab`` (int32
+    ``[pool, N]``); the root and the slots past the verify width get slot
+    -1. Grid: one program per request.
+    """
+    if not (ranked.stride(1) == 1 and node_slot.stride(1) == 1):
+        raise ValueError("eagle_harness_publish_draft_q: unit column strides")
+    if node_slot.stride(0) != node_pos.stride(0):
+        raise ValueError("eagle_harness_publish_draft_q: node table strides")
+    # The caller keeps verify_num within the ranked columns and the table slots.
+    if not (
+        slot_tab.size(1) == pos_tab.size(1)
+        and slot_tab.is_contiguous()
+        and pos_tab.is_contiguous()
+    ):
+        raise ValueError("eagle_harness_publish_draft_q: node tables")
+    batch_size = ranked.size(0)
+    store_size = q_round.size(1) * q_round.size(2)
+    if not (
+        q_tab.size(1) * q_tab.size(2) == store_size
+        and q_round.is_contiguous()
+        and qid_round.is_contiguous()
+        and q_tab.is_contiguous()
+        and qid_tab.is_contiguous()
+    ):
+        raise ValueError("eagle_harness_publish_draft_q: q stores")
+    if batch_size == 0:
+        return
+    num_nodes = slot_tab.size(1)
+    _sampled._publish_draft_q_kernel[(batch_size,)](
+        ranked,
+        ranked.stride(0),
+        node_slot,
+        node_pos,
+        node_slot.stride(0),
+        q_round,
+        qid_round,
+        rows,
+        q_tab,
+        qid_tab,
+        slot_tab,
+        pos_tab,
+        live_rows,
+        verify_num,
+        num_nodes,
+        store_size,
+        N_PAD=max(triton.next_power_of_2(num_nodes), 2),
+        BLOCK=1024,
     )

@@ -262,8 +262,9 @@ class EagleHarness(Eagle4):
         if self.harness.sampled_trees:
             if not eagle_harness_sampled_trees_available():
                 raise ValueError(
-                    "EAGLE-Harness sampled trees need the CUDA build of the "
-                    "sampled-tree kernels; this platform runs greedy trees only"
+                    "EAGLE-Harness sampled trees need the sampled-tree kernels, "
+                    "which this platform does not register; it runs greedy "
+                    "trees only"
                 )
             self._allocate_sampled(max_bs, topk, depth, config.num_nodes, pool_nodes)
 

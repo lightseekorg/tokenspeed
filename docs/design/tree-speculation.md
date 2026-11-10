@@ -228,7 +228,16 @@ walk over those draws, accepting a child when it equals its parent's draw.
 The flashinfer backend instead accepts every tree by recursive rejection
 sampling (`TreeRejectionSampler`), against the draft q that drew a sampled
 node's children (`RuntimeStates.future_draft_q`), exact in distribution rather
-than the plain-decoding draw.
+than the plain-decoding draw. The Triton backend does the same for a sampled
+tree (`tree.draft_q` set) on the routes with an exact filtered distribution
+(no filter, finite top-k with any top-p): each backend computes its own target
+p' (the distribution it samples plain rows from) and hands it to the shared
+sampler. Its uniforms are keyed by position too, salted apart from the
+plain stream: a node at depth `d` takes lane `i` (its node index) of row
+`max(d - 1, 0)`, the bonus lane `N` of row 0, and the next round's offsets
+start past every row consulted. The same backend's dense chain rule (the step
+drafters' recorded `draft_probs`) keys its accept coin on lane 0 and its
+residual draw on lane 1 of the verified row.
 The Triton backend's chain verify (DFLASH with a DFlash2 draft under
 `--enable-speculative-sampling`) gives up the plain-decoding draw the same way
 for rows that carry a recorded q (`future_draft_q`, chain layout: node `i`

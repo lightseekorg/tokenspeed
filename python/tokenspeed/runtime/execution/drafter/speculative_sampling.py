@@ -22,13 +22,19 @@
 
 Under ``--enable-speculative-sampling`` a chain drafter no longer proposes the
 argmax of its logits: each step's token is drawn from the drafter's own
-distribution ``q = softmax(logits / T)`` at the request's temperature, and
-``q`` is recorded per request and step so the next round's verify can run
-the standard accept test ``coin * q(x) < p(x)`` with residual
-``norm(relu(p - q))``. The output law is the target's ``p`` as long as the
-proposal really follows the recorded ``q``; the temperature only aligns ``q``
-with ``p`` for a higher acceptance rate (top-k / top-p / penalties are the
-verifier's business and stay out of ``q``).
+distribution ``q`` and ``q`` is recorded per request and step so the next
+round's verify can run the standard accept test ``coin * q(x) < p(x)`` with
+residual ``norm(relu(p - q))``. The output law is the target's ``p`` as long
+as the proposal really follows the recorded ``q``, whatever ``q`` is. The
+request's sampling parameters only align ``q`` with ``p`` for a higher
+acceptance rate ``sum(min(p, q))``. ``q`` is cut the way the triton
+verifier's top-k routes cut the target: the softmax at the request's
+temperature over the row's best ``min(top_k, _CUT_PAD)`` draft logits, then
+the tokens whose mass above them is below top_p, renormalized. Mass ``q``
+puts on tokens the target cut has removed could never be accepted. A row
+without a top-k keeps its best ``_CUT_PAD`` tokens, which leaves out only a
+draft tail too thin to matter for acceptance. ``min_p``, penalties and logit
+bias stay on the verifier's side.
 
 Greedy requests (``top_k == 1``) keep the canonical lowest-index argmax and
 record a one-hot ``q``, so their verify stays exactly greedy. Everything here
@@ -46,12 +52,18 @@ from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
-from tokenspeed_kernel.ops.sampling.flashinfer import softmax
 from tokenspeed_kernel.ops.sampling.triton import (
     DRAFT_SAMPLE_OFFSET_SALT,
     gumbel_sample_from_pools,
     gumbel_scratch_shape,
+    target_probs_from_pools,
 )
+
+# The most tokens q keeps (a power of two), as the triton verifier's top-k
+# routes cut the target.
+_CUT_PAD = 128
+# The cut kernel's vocabulary block.
+_CUT_BLOCK_SIZE = 1024
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
@@ -74,7 +86,8 @@ class DraftProposalSampler:
     ) -> None:
         """
         Args:
-            pools: The verifier's pool-indexed temperature / top-k / seed.
+            pools: The verifier's pool-indexed temperature / top-k / top-p /
+                seed.
             runtime_states: Owner of ``draft_probs`` (must be allocated) and
                 ``valid_cache_lengths``.
             input_buffers: The executor's batch-ordered pool index buffers.
@@ -111,6 +124,21 @@ class DraftProposalSampler:
         # logits, which a hot-token head keeps narrower than the full vocab.
         draft_vocab_size = vocab_size if vocab_map is None else vocab_map.shape[0]
         scratch_shape = gumbel_scratch_shape(max_bs, draft_vocab_size)
+        # q's top-k / top-p cut: per-block candidate scratch and the cut q.
+        cut_candidates = -(-draft_vocab_size // _CUT_BLOCK_SIZE) * _CUT_PAD
+        self._cut_candidate_ids = torch.empty(
+            (max_bs, cut_candidates), dtype=torch.int32, device=device
+        )
+        self._cut_candidate_logits = torch.empty(
+            (max_bs, cut_candidates), dtype=torch.float32, device=device
+        )
+        self._cut_q = torch.empty(
+            (max_bs, draft_vocab_size), dtype=torch.float32, device=device
+        )
+        # The draw runs over log(q), already at the request's temperature.
+        self._unit_temperature = torch.ones(
+            (pool_rows,), dtype=torch.float32, device=device
+        )
         self._gumbel_local_ids = torch.empty(
             scratch_shape, dtype=torch.int32, device=device
         )
@@ -155,14 +183,31 @@ class DraftProposalSampler:
         pool_indices = self._req_pool_indices_buf[:bs]
         pool_indices_i32 = self._pool_indices_i32[:bs]
         pool_indices_i32.copy_(pool_indices)
-        temperature = self._pools.temperature.index_select(0, pool_indices)
         greedy_rows = (self._pools.top_k.index_select(0, pool_indices) == 1).view(-1, 1)
 
-        # q at the request's temperature, fp32 like the verifier's target probs.
-        q = softmax(logits, temperature=temperature.view(-1, 1))
-        # A row whose logits give no finite distribution (all NaN, or an
-        # overflow) proposes nothing: it is recorded as the sentinel below.
-        no_proposal = ~torch.isfinite(q).all(dim=1, keepdim=True)
+        # q at the request's temperature and top-k / top-p cut, fp32 like the
+        # verifier's target probs.
+        q = target_probs_from_pools(
+            logits,
+            pool_indices_i32,
+            self._pools.temperature,
+            self._pools.top_k,
+            self._pools.top_p,
+            self._cut_candidate_ids[:bs],
+            self._cut_candidate_logits[:bs],
+            self._cut_q[:bs],
+            top_k_filter=True,
+            block_size=_CUT_BLOCK_SIZE,
+            top_k_pad=_CUT_PAD,
+            num_tokens_per_req=1,
+        )
+        # A row whose logits give no distribution (a NaN, or an overflow, which
+        # the kernel leaves with nothing kept) proposes nothing: it is recorded
+        # as the sentinel below. NaN > 0.5 is False too.
+        no_proposal = ~(q.sum(dim=1, keepdim=True) > 0.5)
+        # Gumbel-max over log(q) at unit temperature draws exactly
+        # Categorical(q); the cut tokens sit at -inf.
+        log_q = torch.log(q)
         # The argmax kernel marks an all-NaN row with -1; clamp it to a real
         # column so the one-hot scatter below stays in bounds.
         canonical = sampling_argmax(logits).to(torch.int64).clamp_min_(0).view(-1, 1)
@@ -176,26 +221,27 @@ class DraftProposalSampler:
         # relu(p - q) the replacement token is drawn from.
         q.masked_fill_(no_proposal, self._sentinel)
 
-        # Gumbel-max over logits / T draws exactly Categorical(q); the noise is
-        # keyed by the request's seed and this (round, step) offset.
+        # The noise is keyed by the request's seed and this (round, step)
+        # offset.
         torch.add(
             self._valid_cache_lengths.to(torch.int64) * self._spec_num_tokens,
             DRAFT_SAMPLE_OFFSET_SALT + step,
             out=self._offsets_pool,
         )
         sampled = gumbel_sample_from_pools(
-            logits,
+            log_q,
             pool_indices_i32,
-            self._pools.temperature,
+            self._unit_temperature,
             self._pools.seed,
             self._offsets_pool,
             self._gumbel_local_ids[:bs],
             self._gumbel_local_scores[:bs],
             self._gumbel_out[:bs],
         )
-        # An all-NaN row has no maximum; the kernel resolves it to the first
-        # masked column (vocab_size). Keep the id a real column so the hot-token
-        # map and the verify gather stay in bounds; its sentinel q rejects it.
+        # A row with nothing kept draws column 0 and its sentinel q rejects it.
+        # The kernel would resolve a NaN row to the masked column vocab_size;
+        # the clamp keeps any id a real column so the hot-token map and the
+        # verify gather stay in bounds.
         sampled.clamp_(0, logits.shape[1] - 1)
         tokens = torch.where(
             greedy_rows.view(-1), canonical.view(-1).to(sampled.dtype), sampled

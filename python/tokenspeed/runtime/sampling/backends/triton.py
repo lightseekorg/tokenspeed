@@ -32,6 +32,8 @@ import torch
 from tokenspeed_kernel.ops.sampling.triton import (
     _QRITA_PERCENTILE_TO_STD_TABLE,
     TOP_K_DISABLED,
+    chain_verify_draft_probs,
+    gather_and_expand_scalars,
     gumbel_sample_from_pools,
     gumbel_sample_from_pools_compact,
     gumbel_sample_from_pools_generic,
@@ -41,6 +43,8 @@ from tokenspeed_kernel.ops.sampling.triton import (
     gumbel_sample_top_p_parallel_from_pools,
     gumbel_scratch_shape,
     selected_token_logprobs,
+    target_probs_from_pools,
+    tree_verify_coins,
     verify_chain_row_decisions,
     verify_chain_target_sampled,
     verify_rows_no_filter_from_pools,
@@ -50,6 +54,9 @@ from tokenspeed_kernel.ops.sampling.triton import (
     verify_tree,
 )
 
+from tokenspeed.runtime.execution.drafter.eagle_harness.tree_verify import (
+    TreeRejectionSampler,
+)
 from tokenspeed.runtime.layers.logits_processor_output import LogitsProcessorOutput
 from tokenspeed.runtime.sampling.backends.base import (
     CUDA_GRAPH_VARIANT_DEFAULT,
@@ -98,6 +105,13 @@ _SAMPLE_ROUTE_GUMBEL_NO_FILTER = 1
 _SAMPLE_ROUTE_GUMBEL_TOP_K = 2
 _SAMPLE_ROUTE_GUMBEL_TOP_K_TOP_P = 3
 _SAMPLE_ROUTE_GUMBEL_TOP_P = 4
+# The routes whose target distribution p' is exact (no-filter, finite top-k
+# with any top-p): the rejection rules against a draft q run on these only.
+_EXACT_TARGET_ROUTES = (
+    _SAMPLE_ROUTE_GUMBEL_NO_FILTER,
+    _SAMPLE_ROUTE_GUMBEL_TOP_K,
+    _SAMPLE_ROUTE_GUMBEL_TOP_K_TOP_P,
+)
 CUDA_GRAPH_VARIANT_TRITON_NO_FILTER = "triton_no_filter"
 CUDA_GRAPH_VARIANT_TRITON_TOP_K = "triton_top_k"
 CUDA_GRAPH_VARIANT_TRITON_TOP_K_TOP_P = "triton_top_k_top_p"
@@ -424,8 +438,29 @@ class TritonSamplingBackend(SamplingBackend):
         self._row_token: torch.Tensor | None = None
         self._no_filter_verify_scores: torch.Tensor | None = None
         self._no_filter_verify_ids: torch.Tensor | None = None
+        # The dense rules (a chain's recorded draft_probs, a sampled draft
+        # tree's q): each verify row's target p', the tree's position-keyed
+        # uniforms, and the tree rejection sampler.
+        self._target_probs: torch.Tensor | None = None
+        self._tree_coins: torch.Tensor | None = None
+        self._tree_final_coins: torch.Tensor | None = None
+        self._tree_sampler: TreeRejectionSampler | None = None
+        verify_rows = max(config.max_bs * config.max_draft_tokens_per_req, 1)
+        if config.enable_speculative_sampling or config.sampled_draft_trees:
+            self._target_probs = torch.empty(
+                (verify_rows, vocab_size), dtype=torch.float32, device=config.device
+            )
+        if config.sampled_draft_trees:
+            self._tree_coins = torch.empty(
+                (config.max_bs, max(config.max_draft_tokens_per_req, 1)),
+                dtype=torch.float32,
+                device=config.device,
+            )
+            self._tree_final_coins = torch.empty(
+                (config.max_bs,), dtype=torch.float32, device=config.device
+            )
+            self._tree_sampler = TreeRejectionSampler(config.max_bs, config.device)
         if config.enable_speculative_sampling:
-            verify_rows = max(config.max_bs * config.max_draft_tokens_per_req, 1)
             self._row_accept = torch.empty(
                 (verify_rows,), dtype=torch.int32, device=config.device
             )
@@ -1008,6 +1043,93 @@ class TritonSamplingBackend(SamplingBackend):
             )
         return row_accept, row_token
 
+    def _verify_target_probs(
+        self,
+        logits: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        num_tokens_per_req: int,
+    ) -> torch.Tensor:
+        """Each verify row's target p': the distribution this route samples
+        plain rows from (``target_probs_from_pools``)."""
+        if self._target_probs is None:
+            raise RuntimeError(
+                "verify received a draft distribution but the triton sampling "
+                "backend was built without enable_speculative_sampling or "
+                "sampled_draft_trees"
+            )
+        rows = logits.shape[0]
+        return target_probs_from_pools(
+            logits,
+            req_pool_indices,
+            self._temperature_pool,
+            self._top_k_pool,
+            self._top_p_pool,
+            self._topk_verify_candidate_ids[:rows],
+            self._topk_verify_candidate_logits[:rows],
+            self._target_probs[:rows],
+            top_k_filter=self._sample_route != _SAMPLE_ROUTE_GUMBEL_NO_FILTER,
+            block_size=_TOP_K_TOP_P_SMALL_BLOCK_SIZE,
+            top_k_pad=self._top_k_top_p_pad,
+            num_tokens_per_req=num_tokens_per_req,
+        )
+
+    def _verify_tree_with_draft_q(
+        self,
+        logits: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        offsets_pool: torch.Tensor,
+        candidates: torch.Tensor,
+        tree: TreeVerifyBatch,
+        *,
+        path: torch.Tensor,
+        predict: torch.Tensor,
+        accept_length: torch.Tensor,
+    ) -> None:
+        """Rejection-sampling verify of a sampled draft tree
+        (``TreeRejectionSampler``) against this route's p', with uniforms
+        keyed by the request's seed and each node's position."""
+        if (
+            self._tree_sampler is None
+            or self._tree_coins is None
+            or self._tree_final_coins is None
+        ):
+            raise RuntimeError(
+                "verify received a sampled draft tree but the triton sampling "
+                "backend was built without sampled_draft_trees"
+            )
+        bs, n = candidates.shape
+        target_probs = self._verify_target_probs(logits, req_pool_indices, n)
+        _, top_ks, _, _, _, _ = gather_and_expand_scalars(
+            req_pool_indices,
+            temperature=self._temperature_pool,
+            top_k=self._top_k_pool,
+            top_p=self._top_p_pool,
+            n=n,
+        )
+        coins = self._tree_coins[:bs, :n]
+        final_coins = self._tree_final_coins[:bs]
+        tree_verify_coins(
+            req_pool_indices,
+            self._seed_pool,
+            offsets_pool,
+            tree.depths,
+            coins,
+            final_coins,
+        )
+        self._tree_sampler(
+            target_probs,
+            logits,
+            candidates,
+            tree,
+            req_pool_indices,
+            top_ks,
+            coins=coins,
+            final_coins=final_coins,
+            path=path,
+            predict=predict,
+            accept_length=accept_length,
+        )
+
     @nvtx_range("sampling:verify", color="yellow")
     def verify(
         self,
@@ -1028,8 +1150,21 @@ class TritonSamplingBackend(SamplingBackend):
         )
         accept_length = self._accept_length_buf[:bs]
 
+        # The dense rules read whole rows of p': a sampled draft tree's q
+        # (tree.draft_q), or a chain's recorded per-vocab q (draft_probs; the
+        # DFlash2 sparse q takes the row rule below instead).
+        exact_route = self._sample_route in _EXACT_TARGET_ROUTES
+        dense_tree = tree is not None and tree.draft_q is not None and exact_route
+        dense_chain = (
+            tree is None
+            and sampling_info.draft_probs is not None
+            and sampling_info.draft_q is None
+            and exact_route
+        )
         logits = selected = None
-        if self._selects_from_vocab_shard(logits_output):
+        if self._selects_from_vocab_shard(logits_output) and not (
+            dense_tree or dense_chain
+        ):
             # The top-k routes read each row's presorted best candidates only;
             # the shard selection applies the vocabulary mask itself.
             selected = self._vocab_shard_candidates(
@@ -1050,7 +1185,18 @@ class TritonSamplingBackend(SamplingBackend):
         req_pool_indices = self._req_pool_indices_for_kernels(
             sampling_info.req_pool_indices, bs
         )
-        if tree is not None:
+        if dense_tree:
+            self._verify_tree_with_draft_q(
+                logits,
+                req_pool_indices,
+                offsets_pool,
+                candidates,
+                tree,
+                path=accept_index,
+                predict=predict,
+                accept_length=accept_length,
+            )
+        elif tree is not None:
             target_sampled = self._sample_tree_targets(
                 logits, selected, req_pool_indices, offsets_pool, tree, bs
             )
@@ -1083,6 +1229,23 @@ class TritonSamplingBackend(SamplingBackend):
                 candidates=candidates,
                 row_accept=row_accept,
                 row_token=row_token,
+            )
+            accept_length += 1
+        elif dense_chain:
+            target_probs = self._verify_target_probs(
+                logits, req_pool_indices, num_tokens_per_req
+            )
+            chain_verify_draft_probs(
+                target_probs,
+                sampling_info.draft_probs,
+                candidates.to(torch.int32),
+                req_pool_indices,
+                self._seed_pool,
+                offsets_pool,
+                predict,
+                accept_index,
+                accept_length,
+                reject_threshold=self.config.spec_reject_draft_prob_threshold,
             )
             accept_length += 1
         else:

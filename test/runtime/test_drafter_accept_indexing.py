@@ -746,6 +746,18 @@ def _kernel_argmax(logits: torch.Tensor) -> torch.Tensor:
     return torch.where(torch.isnan(logits).all(-1), torch.full_like(idx, -1), idx)
 
 
+def _cut_q(logits: torch.Tensor, temperature: float, top_k: int, top_p: float):
+    """The cut q from its definition: the softmax at the temperature over the
+    top_k best logits, then the tokens whose mass above them is below top_p,
+    renormalized. A NaN or an overflow leaves nothing kept."""
+    order = torch.sort(logits, descending=True, stable=True).indices[:top_k]
+    probs = torch.softmax(logits[order].double() / temperature, -1)
+    kept = order[torch.cumsum(probs, 0) - probs < top_p]
+    out = torch.zeros(logits.shape[0], dtype=torch.float64)
+    out[kept] = torch.softmax(logits[kept].double() / temperature, -1)
+    return out.float()
+
+
 def _draft_buffers():
     return SimpleNamespace(
         max_bs=MAX_BS,
@@ -756,7 +768,9 @@ def _draft_buffers():
     )
 
 
-def _draft_sampler(monkeypatch, *, top_k_rows, temperatures, vocab_map=None):
+def _draft_sampler(
+    monkeypatch, *, top_k_rows, temperatures, vocab_map=None, top_p_rows=None
+):
     from tokenspeed.runtime.execution.drafter import speculative_sampling as spec
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
     from tokenspeed.runtime.sampling.backends.base import SpeculativeSamplingPools
@@ -767,14 +781,43 @@ def _draft_sampler(monkeypatch, *, top_k_rows, temperatures, vocab_map=None):
     pools = SpeculativeSamplingPools(
         temperature=torch.tensor(temperatures, dtype=torch.float32),
         top_k=torch.tensor(top_k_rows, dtype=torch.int32),
-        top_p=torch.ones(POOL + 1),
+        top_p=(
+            torch.ones(POOL + 1)
+            if top_p_rows is None
+            else torch.tensor(top_p_rows, dtype=torch.float32)
+        ),
         seed=torch.arange(POOL + 1, dtype=torch.int64) * 11,
     )
-    monkeypatch.setattr(
-        spec,
-        "softmax",
-        lambda logits, temperature: torch.softmax(logits.float() / temperature, -1),
-    )
+
+    def fake_target_probs(
+        logits,
+        req_pool_indices,
+        temperature_pool,
+        top_k_pool,
+        top_p_pool,
+        candidate_ids,
+        candidate_logits,
+        out,
+        *,
+        top_k_filter,
+        block_size,
+        top_k_pad,
+        num_tokens_per_req,
+    ):
+        # The verifier's top-k route p' (draft_prob_verify.py) in torch.
+        assert top_k_filter and num_tokens_per_req == 1
+        assert candidate_ids.shape[0] == logits.shape[0] == out.shape[0]
+        for row, slot in enumerate(req_pool_indices.tolist()):
+            top_k = min(max(int(top_k_pool[slot]), 1), logits.shape[1], top_k_pad)
+            out[row] = _cut_q(
+                logits[row],
+                float(temperature_pool[slot]),
+                top_k,
+                float(top_p_pool[slot]),
+            )
+        return out
+
+    monkeypatch.setattr(spec, "target_probs_from_pools", fake_target_probs)
     monkeypatch.setattr(spec, "sampling_argmax", _kernel_argmax)
     calls = []
 
@@ -799,15 +842,18 @@ def _draft_sampler(monkeypatch, *, top_k_rows, temperatures, vocab_map=None):
                 offsets=offsets_pool.clone(),
                 seed=seed_pool,
                 temperature=temperature_pool,
+                logits=logits.clone(),
             )
         )
         # A stand-in draw: the second-highest logit, so it differs from argmax.
         # Like the kernel, an all-NaN row resolves to the first masked column
-        # (vocab_size), one past the last real token.
+        # (vocab_size), one past the last real token, and an all -inf row to
+        # column 0.
         draw = logits.nan_to_num(-float("inf")).topk(2, dim=-1).indices[:, 1]
         draw = torch.where(
             torch.isnan(logits).all(-1), torch.full_like(draw, logits.shape[1]), draw
         )
+        draw = torch.where(torch.isneginf(logits).all(-1), torch.zeros_like(draw), draw)
         out[:rows].copy_(draw.to(torch.int32))
         return out[:rows]
 
@@ -861,10 +907,12 @@ def test_propose_samples_rows_by_request_and_records_q(monkeypatch):
     mask = torch.ones_like(probs, dtype=torch.bool)
     mask[slots, 1] = False
     assert torch.equal(probs[mask], sentinel_before[mask])
-    # The Gumbel draw is keyed by pool slot and a salted (position, step).
+    # The Gumbel draw runs over log(q) at unit temperature, keyed by pool
+    # slot and a salted (position, step).
     (call,) = calls
     assert call["pool_indices"].tolist() == slots.tolist()
-    assert call["seed"] is pools.seed and call["temperature"] is pools.temperature
+    assert call["seed"] is pools.seed
+    assert torch.equal(call["temperature"], torch.ones(POOL + 1))
     expected_offsets = (
         DRAFT_SAMPLE_OFFSET_SALT + states.valid_cache_lengths.long() * N + 1
     )
@@ -873,9 +921,9 @@ def test_propose_samples_rows_by_request_and_records_q(monkeypatch):
 
 def test_propose_records_a_non_finite_row_as_no_proposal(monkeypatch):
     # The argmax kernel marks an all-NaN row with -1 (a device assert as a
-    # scatter index) and the Gumbel kernel resolves it to vocab_size (out of
-    # range for the hot-token map and the verify gather). Both are clamped
-    # into the vocab, and the row records the sentinel: verify then rejects
+    # scatter index); it is clamped into the vocab. The cut leaves a NaN row
+    # with nothing kept, so the draw over log(q) sees an all -inf row and
+    # resolves it to column 0. The row records the sentinel: verify then rejects
     # the token and samples from the full target, as for an unrecorded slot.
     # A NaN q would also be rejected but would poison the residual
     # relu(p - q), and NaN * 0 would survive the greedy one-hot.
@@ -890,12 +938,12 @@ def test_propose_records_a_non_finite_row_as_no_proposal(monkeypatch):
     logits = torch.randn(4, VOCAB)
     logits[0] = float("nan")
     logits[1] = float("nan")
-    logits[3, 2] = float("inf")  # softmax overflows to NaN
+    logits[3, 2] = float("inf")  # the softmax overflows: nothing is kept
 
     tokens = sampler.propose(logits, step=0)
 
     assert tokens.shape == (4,) and tokens.dtype == torch.int32
-    assert tokens[0].item() == VOCAB - 1  # the sampled NaN row, clamped in range
+    assert tokens[0].item() == 0  # the sampled NaN row: nothing kept to draw
     assert tokens[1].item() == 0  # the greedy NaN row, clamped from -1
     assert 0 <= tokens[2].item() < VOCAB
     probs = states.draft_probs
@@ -921,8 +969,9 @@ def test_propose_sentinel_covers_only_the_mapped_hot_token_columns(monkeypatch):
 
     tokens = sampler.propose(logits, step=1)
 
-    # The draw is clamped into the draft vocab, so the hot-token map is in range.
-    assert tokens.item() == 2
+    # The draw over an empty q stays in the draft vocab, so the hot-token map
+    # is in range.
+    assert tokens.item() == 0
     row = states.draft_probs[2, 1]
     expected = torch.zeros(VOCAB)
     expected[vocab_map.long()] = states.draft_probs_sentinel
@@ -984,6 +1033,70 @@ def test_propose_sends_padding_rows_to_the_reserved_slot(monkeypatch):
     assert torch.equal(probs[0, 0], torch.full((VOCAB,), states.draft_probs_sentinel))
     assert torch.equal(probs[3, 0], torch.full((VOCAB,), states.draft_probs_sentinel))
     assert torch.isclose(probs[RESERVED_SLOT, 0].sum(), torch.tensor(1.0))
+
+
+def test_propose_records_the_cut_q_and_draws_over_its_support(monkeypatch):
+    """Each sampling row records q cut to its top-k then top-p at its
+    temperature, and the draw runs over log(q): the kept tokens at their log
+    probability and the cut ones at -inf, so it follows the recorded q."""
+    top_k = [3, 1 << 30, 4, 1 << 30, 1 << 30]
+    top_p = [1.0, 0.6, 0.8, 1.0, 1.0]
+    temps = [0.7, 1.0, 1.3, 1.0, 1.0]
+    sampler, states, buffers, _, calls = _draft_sampler(
+        monkeypatch, top_k_rows=top_k, temperatures=temps, top_p_rows=top_p
+    )
+    slots = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
+    bs = slots.numel()
+    buffers.req_pool_indices_buf[:bs] = slots
+    buffers.state_write_req_pool_indices_buf[:bs] = slots
+    logits = torch.tensor(
+        [
+            [0.3, 2.0, -1.0, 1.1, 0.0, 1.9, -0.4, 0.8],
+            [1.5, 0.2, 1.4, -0.3, 0.9, 0.1, -2.0, 0.6],
+            [-0.5, 0.4, 2.2, 1.0, 0.7, -1.2, 1.6, 0.0],
+            [0.1, -0.2, 0.3, 1.2, -0.7, 0.5, 0.9, -1.1],
+        ]
+    )
+
+    tokens = sampler.propose(logits, step=0)
+
+    probs = states.draft_probs[:, 0]
+    want = [
+        _cut_q(logits[r], temps[r], min(top_k[r], VOCAB), top_p[r]) for r in range(bs)
+    ]
+    for r in range(bs):
+        torch.testing.assert_close(probs[r], want[r], msg=f"row {r}")
+    # The cuts are real: top-k, top-p, top-k then top-p, and none.
+    assert [int((w > 0).sum()) for w in want] == [3, 3, 3, VOCAB]
+    (call,) = calls
+    for r in range(bs):
+        kept = want[r] > 0
+        torch.testing.assert_close(call["logits"][r, kept], want[r][kept].log())
+        assert bool((call["logits"][r, ~kept] == -float("inf")).all())
+        assert bool(kept[tokens[r].long()]), f"row {r} drew a cut token"
+
+
+def test_propose_cuts_a_hot_token_head_in_its_own_vocab(monkeypatch):
+    """A hot-token head cuts over its own columns and records the cut q at
+    the mapped full-vocab ids."""
+    vocab_map = torch.tensor([5, 2, 7, 0], dtype=torch.int32)
+    top_k = [2] * (POOL + 1)
+    sampler, states, buffers, _, _ = _draft_sampler(
+        monkeypatch,
+        top_k_rows=top_k,
+        temperatures=[1.0] * (POOL + 1),
+        vocab_map=vocab_map,
+    )
+    buffers.req_pool_indices_buf[:1] = 2
+    buffers.state_write_req_pool_indices_buf[:1] = 2
+    logits = torch.tensor([[0.0, 1.0, 2.0, -1.0]])
+
+    tokens = sampler.propose(logits, step=0)
+
+    assert tokens.tolist() == [1]  # the second-best kept token
+    expected = torch.zeros(VOCAB)
+    expected[vocab_map.long()] = _cut_q(logits[0], 1.0, 2, 1.0)
+    torch.testing.assert_close(states.draft_probs[2, 0], expected)
 
 
 def test_propose_refuses_a_step_without_a_verify_column(monkeypatch):
