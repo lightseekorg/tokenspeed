@@ -692,6 +692,7 @@ def test_the_ordinary_forward_rejoins_the_moe_chain_after_its_layers(monkeypatch
         output_attn_res_proj=None,
         output_attn_res_norm=None,
         norm=None,
+        peer_weights=None,
     )
     _model_forward(model)
     assert log == [("layer", 0), ("layer", 1), ("join",), ("final",)]

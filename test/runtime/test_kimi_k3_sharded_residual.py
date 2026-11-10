@@ -276,6 +276,7 @@ def test_backbone_captures_gathered_rows_and_returns_the_premixed_output():
         eagle3_layers_to_capture=(2,),
         decode_final=None,
         decode_chain=None,
+        peer_weights=None,
         _output_attn_res_mix=lambda block_residual: SimpleNamespace(
             name=("output",), block_write_idx=-1
         ),

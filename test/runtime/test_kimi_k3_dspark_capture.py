@@ -199,6 +199,7 @@ def test_attnres_capture_runs_at_owner_entry_across_pipeline_boundaries(
             output_attn_res_norm=None,
             norm=None,
             decode_final=None,
+            peer_weights=None,
         )
         for name in ("_dspark_capture_stream", "_capture_tap", "_write_dspark_context"):
             setattr(model, name, getattr(kimi_k3.KimiLinearModel, name).__get__(model))
