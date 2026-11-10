@@ -90,7 +90,7 @@ def test_off_by_default_everywhere():
     ],
 )
 def test_the_roles_that_take_the_flags(kwargs):
-    validate_context_parallel_roles(**kwargs, enable_mixed_batch=False)
+    validate_context_parallel_roles(**kwargs)
 
 
 @pytest.mark.parametrize(
@@ -147,7 +147,7 @@ def test_the_roles_that_take_the_flags(kwargs):
 )
 def test_the_roles_that_refuse_the_flags(kwargs, match):
     with pytest.raises(ValueError, match=match):
-        validate_context_parallel_roles(**kwargs, enable_mixed_batch=False)
+        validate_context_parallel_roles(**kwargs)
 
 
 def test_the_decode_role_reads_the_shards_with_dcp():
@@ -169,8 +169,7 @@ def test_an_aggregated_engine_reads_shards_with_dcp(backend):
     assert args.disaggregation_mode == "null"
     assert args.mapping.attn.kvp_size == args.decode_context_parallel_size == 2
     assert not args.enable_mixed_batch
-    with pytest.raises(ValueError, match="Aggregated DCP.*--enable-mixed-batch"):
-        prepare_server_args(argv + ["--enable-mixed-batch"])
+    assert prepare_server_args(argv + ["--enable-mixed-batch"]).enable_mixed_batch
 
 
 @pytest.mark.parametrize("argv", [["--model", "x", "--attn-tp-size", "2"], DECODE])
@@ -434,10 +433,9 @@ def test_v41_aggregated_kvp_requires_explicit_matching_dcp(size):
     args = prepare_server_args(argv + ["--decode-context-parallel-size", str(size)])
     assert args.mapping.attn.kvp_size == args.decode_context_parallel_size == size
     assert not args.mapping.attn.has_qcp
-    with pytest.raises(ValueError, match="Aggregated DCP.*--enable-mixed-batch"):
-        prepare_server_args(
-            argv + ["--decode-context-parallel-size", str(size), "--enable-mixed-batch"]
-        )
+    assert prepare_server_args(
+        argv + ["--decode-context-parallel-size", str(size), "--enable-mixed-batch"]
+    ).enable_mixed_batch
     with pytest.raises(ValueError, match="must equal --kv-parallel-size"):
         prepare_server_args(argv + ["--decode-context-parallel-size", str(size * 2)])
     with pytest.raises(ValueError, match="requires --disaggregation-mode prefill"):

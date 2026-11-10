@@ -192,14 +192,14 @@ def dsa_padded_prefill_replay(
     operation sits in one eager break that narrows a padded replay to its live
     rows). The target admits it without pipeline stages, on the PD prefill role
     with layerwise KV transfer off (its step counter turns the inline KDA route
-    off), and on the aggregated role with ``--enable-mixed-batch`` off, so
-    every replayed round is a pure extend (no test covers decode rows inside
-    the narrowed break). ``--disable-prefill-graph`` turns it off.
+    off), and on the aggregated role, where a mixed round's decode rows ride in
+    the narrowed break with the extend's. ``--disable-prefill-graph`` turns it
+    off.
     """
     if server_args.disaggregation_mode == "prefill":
         role_admits = server_args.disaggregation_layerwise_interval <= 0
     elif server_args.disaggregation_mode == "null":
-        role_admits = not server_args.enable_mixed_batch
+        role_admits = True
     else:
         role_admits = False
     return (
