@@ -212,6 +212,21 @@ DECODE_MONOKERNEL_ARCHITECTURES = (
     "Qwen4ExpForCausalLM",
     "Qwen4ExpForConditionalGeneration",
 )
+# Target architectures whose speculative draft (DFlash2) has decode
+# monokernels too. Under --decode-monokernel such a target's draft must pack
+# them or startup fails; other targets' drafts keep their regular layers.
+DRAFT_MONOKERNEL_TARGET_ARCHITECTURES = ("MuseSparkForConditionalGeneration",)
+
+
+def draft_takes_decode_monokernel(
+    switch: bool, target_architectures: list[str]
+) -> bool:
+    """Whether a draft under ``--decode-monokernel`` (``switch``) builds its
+    layers from its monokernel class: only the draft of a target in
+    DRAFT_MONOKERNEL_TARGET_ARCHITECTURES."""
+    return switch and any(
+        a in DRAFT_MONOKERNEL_TARGET_ARCHITECTURES for a in target_architectures
+    )
 
 
 def decode_monokernel_refusal(architectures: list[str]) -> str | None:

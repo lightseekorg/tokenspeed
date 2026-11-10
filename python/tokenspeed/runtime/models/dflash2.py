@@ -58,7 +58,6 @@ from tokenspeed.runtime.models.kimi_k3_dspark import K3DSparkAttention
 from tokenspeed.runtime.models.muse_spark_dflash2_monokernel import (
     DFlash2MonokernelLayer,
     DFlash2MonokernelState,
-    config_reasons,
     enable_draft_monokernels,
 )
 from tokenspeed.runtime.utils import add_prefix
@@ -460,14 +459,13 @@ class DFlash2DraftModel(DFlashDraftModel):
 
     @property
     def decoder_layer_cls(self) -> type:
-        """The layer class: the monokernel class when the launch turns on
-        --decode-monokernel (ModelConfig sets ``decode_monokernel`` on the
-        draft's config as on the target's) and the draft is the one the
-        kernels bake in (Muse Spark's, :func:`config_reasons`); else the
-        regular class, which another DFlash2 draft keeps under the switch."""
-        if _dflash2_config_value(
-            self.config, "decode_monokernel", False
-        ) and not config_reasons(self.config):
+        """The layer class: the monokernel class when the draft's config has
+        ``decode_monokernel``, which load_model_config sets under
+        --decode-monokernel for the draft of a target with draft monokernels
+        (Muse Spark). Such a draft packs every piece after loading or startup
+        fails and names why (:func:`enable_draft_monokernels`); other
+        targets' DFlash2 drafts keep the regular class."""
+        if _dflash2_config_value(self.config, "decode_monokernel", False):
             return DFlash2MonokernelDecoderLayer
         return DFlash2DecoderLayer
 

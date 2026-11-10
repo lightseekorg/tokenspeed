@@ -726,13 +726,13 @@ def test_a_draft_block_takes_the_last_launchs_final_norm(launches: str) -> None:
 
 @pytest.mark.parametrize("muse_draft", [False, True])
 @pytest.mark.parametrize("switch", [False, True])
-def test_the_switch_builds_only_muse_sparks_draft_from_the_monokernel_layer_class(
+def test_the_drafts_config_switch_picks_the_monokernel_layer_class(
     switch: bool, muse_draft: bool
 ) -> None:
-    """With --decode-monokernel (the ``decode_monokernel`` that ModelConfig
-    sets on the draft's config) the draft builds its layers from the
-    monokernel class only when it is the draft the kernels bake in; another
-    DFlash2 draft keeps the regular layers under the switch."""
+    """With ``decode_monokernel`` on the draft's config (load_model_config
+    sets it for the draft of a Muse Spark target) the draft builds its layers
+    from the monokernel class whatever its shape: a draft the kernels don't
+    serve then fails at packing and names why, never falls back silently."""
     from transformers import PretrainedConfig
 
     from tokenspeed.runtime.models import muse_spark_dflash2_monokernel as seam
@@ -746,6 +746,20 @@ def test_the_switch_builds_only_muse_sparks_draft_from_the_monokernel_layer_clas
     model = DFlash2DraftModel.__new__(DFlash2DraftModel)
     torch.nn.Module.__init__(model)
     model.config = config
-    monokernel = switch and muse_draft
-    expected = DFlash2MonokernelDecoderLayer if monokernel else DFlash2DecoderLayer
+    expected = DFlash2MonokernelDecoderLayer if switch else DFlash2DecoderLayer
     assert model.decoder_layer_cls is expected
+
+
+@pytest.mark.parametrize("switch", [False, True])
+def test_only_a_muse_spark_targets_draft_takes_the_decode_monokernels(
+    switch: bool,
+) -> None:
+    """Under --decode-monokernel only the draft of a target with draft
+    monokernels (Muse Spark) gets the switch; a Qwen3.8 target's DFlash2 draft
+    keeps its regular layers."""
+    from tokenspeed.runtime.utils.server_args import draft_takes_decode_monokernel
+
+    muse = ["MuseSparkForConditionalGeneration"]
+    assert draft_takes_decode_monokernel(switch, muse) is switch
+    assert not draft_takes_decode_monokernel(switch, ["Qwen4ExpForCausalLM"])
+    assert not draft_takes_decode_monokernel(switch, [])

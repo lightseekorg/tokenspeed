@@ -33,7 +33,11 @@ from tokenspeed.runtime.execution.distributed_initializer import (
 )
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.env import envs, global_server_args_dict_update
-from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
+from tokenspeed.runtime.utils.server_args import (
+    PortArgs,
+    ServerArgs,
+    draft_takes_decode_monokernel,
+)
 from tokenspeed.runtime.utils.startup_timing import startup_phase
 
 logger = get_colorful_logger(__name__)
@@ -132,7 +136,7 @@ def load_model_config(
             # A draft is fed the target's hidden states and borrows its
             # embedding and LM head, so the two dtypes have to agree.
             dtype = draft_of.dtype
-    return ModelConfig(
+    config = ModelConfig(
         model_path,
         trust_remote_code=server_args.trust_remote_code,
         revision=revision,
@@ -143,6 +147,14 @@ def load_model_config(
         server_args=server_args,
         is_draft_worker=draft_of is not None,
     )
+    if draft_of is not None and draft_takes_decode_monokernel(
+        bool(server_args.decode_monokernel),
+        list(getattr(draft_of.hf_config, "architectures", None) or []),
+    ):
+        # The draft of a target with draft monokernels takes them, and packs
+        # every piece or startup fails (enable_draft_monokernels).
+        config.hf_text_config.decode_monokernel = True
+    return config
 
 
 @startup_phase("distributed.init")

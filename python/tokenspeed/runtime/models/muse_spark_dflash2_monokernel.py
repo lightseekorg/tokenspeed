@@ -151,7 +151,7 @@ def _config_value(config, key: str):
 def config_reasons(config) -> list[str]:
     """Why a draft of ``config`` is not the one the kernels bake in (Muse
     Spark's DFlash2 draft: its dimensions and GQA attention); empty when it
-    is. The draft builds its layers from the monokernel class only then."""
+    is (part of :func:`model_reasons`)."""
     reasons = []
     if any(getattr(config, k, None) != v for k, v in KERNEL_SHAPE.items()) or any(
         _config_value(config, k) != v for k, v in KERNEL_DFLASH.items()

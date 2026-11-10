@@ -52,6 +52,7 @@ from tokenspeed.runtime.layers.vocab_parallel_embedding import (  # noqa: E402
 from tokenspeed.runtime.models.dflash2 import (  # noqa: E402
     DFlash2DecoderLayer,
     DFlash2DraftModel,
+    DFlash2MonokernelDecoderLayer,
 )
 from tokenspeed.runtime.models.muse_spark_dflash2_monokernel import (  # noqa: E402
     BLOCK_ROWS,
@@ -195,9 +196,10 @@ def test_decode_monokernel_refuses_a_draft_it_cannot_pack() -> None:
     assert draft.monokernel_state is None
 
 
-def test_an_mla_draft_keeps_the_regular_layers_under_decode_monokernel() -> None:
+def test_an_mla_draft_under_decode_monokernel_fails_at_packing() -> None:
     """An MLA draft is not the one the kernels bake in: under the switch it
-    builds the regular layers, and packing it directly refuses."""
+    still builds the monokernel layer class, and packing refuses it with the
+    reason, so startup fails instead of serving it on the regular path."""
     mla = _config(
         decode_monokernel=True,
         qk_nope_head_dim=128,
@@ -209,7 +211,7 @@ def test_an_mla_draft_keeps_the_regular_layers_under_decode_monokernel() -> None
     mla.dflash_config = {**mla.dflash_config, "attention_mode": "mla"}
     draft = _draft(mla)
     assert config_reasons(mla) == [MLA_DRAFT]
-    assert draft.decoder_layer_cls is DFlash2DecoderLayer
+    assert draft.decoder_layer_cls is DFlash2MonokernelDecoderLayer
     assert model_reasons(draft) == [MLA_DRAFT]
     with pytest.raises(ValueError, match=f"layers: {MLA_DRAFT}"):
         enable_draft_monokernels(draft)
