@@ -82,8 +82,8 @@ def _resolve_block_geometry(
         ``(verify_width, draft_block_size)``.
 
     Raises:
-        ValueError: The verify width leaves no room for a draft, or the
-            checkpoint was trained at a different block size.
+        ValueError: The verify width leaves no room for a draft, or drafts
+            more than the checkpoint's block.
     """
     verify_width = int(spec_num_tokens)
     if verify_width < 2:
@@ -96,7 +96,11 @@ def _resolve_block_geometry(
     ckpt_block_size = read_checkpoint_block_size(cfg)
     if ckpt_block_size is not None:
         validate_block_widths(
-            spec_algorithm, ckpt_block_size, draft_block_size, verify_width
+            spec_algorithm,
+            ckpt_block_size,
+            draft_block_size,
+            verify_width,
+            allow_shorter=True,
         )
     return verify_width, draft_block_size
 

@@ -670,10 +670,12 @@ Notes:
   out of the KV cache, and adds about 7 minutes to startup;
   `--prefill-graph-capture-token-sizes` captures fewer buckets for less.
 - The Kimi-K3.1 DSpark draft (`Inferact/Kimi-K3.1-Pro-DSpark-preview`)
-  proposes 7 tokens per step, so it takes
-  `--speculative-num-draft-tokens 8`. Unlike Kimi-K3's draft, it attends
-  causally within its block (its config sets `dflash_config.causal`).
-  `--drafter-attention-backend tokenspeed_mla` runs causal blocks; the other
+  proposes up to 7 tokens per step: its checkpoint sets 7 drafts with
+  `--speculative-num-draft-tokens 8` by default, and explicit widths draft
+  fewer (`--speculative-num-steps 3 --speculative-num-draft-tokens 4`).
+  Unlike Kimi-K3's draft, it attends causally within its block (its config
+  sets `dflash_config.causal`). `--drafter-attention-backend tokenspeed_mla`,
+  `mla` and `gluon` run causal blocks, the last two under KVP too; the other
   MLA drafter backends refuse the draft at startup.
 - A checkpoint with a Python XTML encoder and no Jinja chat template needs
   its tokenizer's `apply_chat_template` to encode messages. Pass the token

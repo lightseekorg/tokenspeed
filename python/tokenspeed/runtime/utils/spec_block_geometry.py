@@ -163,6 +163,8 @@ def validate_block_widths(
     block_size: int,
     num_steps: int,
     num_draft_tokens: int,
+    *,
+    allow_shorter: bool = False,
 ) -> None:
     """Reject launch widths that disagree with the checkpoint block size.
 
@@ -171,10 +173,12 @@ def validate_block_widths(
         block_size: The checkpoint's block size.
         num_steps: The requested ``speculative_num_steps``.
         num_draft_tokens: The requested ``speculative_num_draft_tokens``.
+        allow_shorter: Also accept fewer steps than the checkpoint drafts, for
+            drafters that size their block from the launch width.
 
     Raises:
         ValueError: The requested widths are not the ones the checkpoint was
-            trained at.
+            trained at, or with ``allow_shorter`` draft more than it does.
     """
     expected_steps, expected_draft_tokens = resolve_block_widths(algorithm, block_size)
     if (
@@ -182,6 +186,21 @@ def validate_block_widths(
         and int(num_draft_tokens) == expected_draft_tokens
     ):
         return
+    if (
+        allow_shorter
+        and 1 <= int(num_steps) < expected_steps
+        and int(num_draft_tokens) == int(num_steps) + 1
+    ):
+        return
+    if allow_shorter:
+        raise ValueError(
+            f"{algorithm} checkpoint block_size={int(block_size)} drafts at most "
+            f"--speculative-num-steps {expected_steps}, with "
+            "--speculative-num-draft-tokens one more than the steps; got "
+            f"--speculative-num-steps {int(num_steps)} and "
+            f"--speculative-num-draft-tokens {int(num_draft_tokens)}. "
+            f"{BLOCK_SPEC_RULES}"
+        )
     raise ValueError(
         f"{algorithm} checkpoint block_size={int(block_size)} requires "
         f"--speculative-num-steps {expected_steps} and "

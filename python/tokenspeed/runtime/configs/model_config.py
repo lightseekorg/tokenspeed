@@ -588,7 +588,9 @@ def _apply_block_spec_widths(
 
     Args:
         server_args: Server args whose speculative widths are checked, or set
-            when they were left at their defaults.
+            when they were left at their defaults. Explicit widths may draft
+            fewer tokens than the checkpoint's block, except for DeepSeek V4.1
+            DSpark, whose drafter always drafts the whole block.
         hf_config: The draft checkpoint's config.
         hf_text_config: Its text config, searched first.
 
@@ -607,7 +609,10 @@ def _apply_block_spec_widths(
             block_size,
             server_args.speculative_num_steps,
             server_args.speculative_num_draft_tokens,
+            allow_shorter=resolve_architecture(hf_config)
+            != "DeepseekV41ForCausalLMDSpark",
         )
+        return block_size
     num_steps, num_draft_tokens = resolve_block_widths(algorithm, block_size)
     server_args.speculative_num_steps = num_steps
     server_args.speculative_num_draft_tokens = num_draft_tokens

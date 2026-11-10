@@ -201,6 +201,39 @@ def test_geometry_applies_the_family_convention() -> None:
         )
 
 
+def test_geometry_drafts_a_shorter_block_than_the_checkpoint() -> None:
+    """The block drafters size their block from the launch width."""
+    assert _resolve_block_geometry(
+        SimpleNamespace(block_size=7), spec_num_tokens=4, spec_algorithm="DSPARK"
+    ) == (4, 3)
+    assert _resolve_block_geometry(SimpleNamespace(block_size=8), 4, "DFLASH") == (4, 3)
+
+    with pytest.raises(ValueError, match=r"at most --speculative-num-steps 7"):
+        _resolve_block_geometry(
+            SimpleNamespace(block_size=7), spec_num_tokens=9, spec_algorithm="DSPARK"
+        )
+
+
+def test_validate_shorter_widths_only_when_allowed() -> None:
+    validate_block_widths(
+        "DSPARK", 7, num_steps=3, num_draft_tokens=4, allow_shorter=True
+    )
+    validate_block_widths(
+        "DFLASH", 8, num_steps=1, num_draft_tokens=2, allow_shorter=True
+    )
+
+    with pytest.raises(ValueError, match=r"--speculative-num-steps 7"):
+        validate_block_widths("DSPARK", 7, num_steps=3, num_draft_tokens=4)
+    with pytest.raises(ValueError, match=r"at most"):
+        validate_block_widths(
+            "DSPARK", 7, num_steps=3, num_draft_tokens=5, allow_shorter=True
+        )
+    with pytest.raises(ValueError, match=r"at most"):
+        validate_block_widths(
+            "DSPARK", 7, num_steps=8, num_draft_tokens=9, allow_shorter=True
+        )
+
+
 def test_geometry_rejects_degenerate_verify_width() -> None:
     """A verify window with no room for a draft is not block decoding."""
     with pytest.raises(ValueError, match=r">= 2"):
@@ -249,6 +282,32 @@ def test_model_config_checks_explicit_widths_against_the_checkpoint() -> None:
     with pytest.raises(ValueError, match=r"--speculative-num-steps 7"):
         _apply_block_spec_widths(
             _spec_args("DFLASH", steps=8, draft_tokens=9, explicit=True), cfg, cfg
+        )
+
+
+def test_model_config_keeps_explicit_widths_shorter_than_the_checkpoint() -> None:
+    """K3.1 DSpark (block 7) launches at 3 drafts, as vLLM runs it."""
+    cfg = SimpleNamespace(block_size=7)
+    args = _spec_args("DSPARK", steps=3, draft_tokens=4, explicit=True)
+
+    assert _apply_block_spec_widths(args, cfg, cfg) == 7
+    assert (args.speculative_num_steps, args.speculative_num_draft_tokens) == (3, 4)
+
+    with pytest.raises(ValueError, match=r"at most --speculative-num-steps 7"):
+        _apply_block_spec_widths(
+            _spec_args("DSPARK", steps=8, draft_tokens=9, explicit=True), cfg, cfg
+        )
+
+
+def test_model_config_holds_deepseek_v41_dspark_to_its_block() -> None:
+    """Its drafter always drafts the whole checkpoint block."""
+    cfg = SimpleNamespace(
+        dspark_block_size=7, architectures=["DeepseekV41ForCausalLMDSpark"]
+    )
+
+    with pytest.raises(ValueError, match=r"requires --speculative-num-steps 7"):
+        _apply_block_spec_widths(
+            _spec_args("DSPARK", steps=3, draft_tokens=4, explicit=True), cfg, cfg
         )
 
 
