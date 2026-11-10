@@ -261,12 +261,10 @@ def validate_context_parallel_roles(
     dcp_size: int,
     qcp_size: int,
     disaggregation_mode: str,
-    enable_mixed_batch: bool,
 ) -> None:
     """Validate KVP/DCP roles and the PD-prefill-only QCP layout.
 
     Aggregated and PD decode engines require explicit DCP matching KVP.
-    Aggregated DCP requires separate prefill and decode rounds.
     """
     if dcp_size < 1:
         raise ValueError(
@@ -304,11 +302,6 @@ def validate_context_parallel_roles(
                 f"(got dcp={dcp_size}, kvp={kvp_size}): every rank of the KVP "
                 "group owns pages of every request, so all of them merge the "
                 "partials"
-            )
-        if disaggregation_mode == "null" and enable_mixed_batch:
-            raise ValueError(
-                "Aggregated DCP does not support --enable-mixed-batch; "
-                "remove it to schedule prefill and decode separately"
             )
     elif kvp_size > 1 and disaggregation_mode in ("null", "decode"):
         raise ValueError(
@@ -1352,7 +1345,6 @@ class ServerArgs:
             dcp_size=self.decode_context_parallel_size,
             qcp_size=self.mapping.attn.qcp_size,
             disaggregation_mode=self.disaggregation_mode,
-            enable_mixed_batch=self.enable_mixed_batch,
         )
         validate_qcp(
             qcp_size=self.mapping.attn.qcp_size,
@@ -4521,7 +4513,7 @@ class ServerArgs:
             "rank attends the KV pages it owns under --kv-parallel-size and the "
             "partials are merged across the KVP group by their log-sum-exp. "
             "Requires --disaggregation-mode null or decode and must equal "
-            "--kv-parallel-size. Aggregated DCP does not support --enable-mixed-batch.",
+            "--kv-parallel-size.",
         )
         parser.add_argument(
             "--attn-head-tp-size",

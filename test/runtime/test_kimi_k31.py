@@ -281,8 +281,8 @@ def test_kvp_launch_passes_the_full_attention_dcp_check(tmp_path) -> None:
             False,
             True,
         ),
-        # A MIXED round would replay with decode rows in the narrowed break.
-        ({"disaggregation_mode": "null", "enable_mixed_batch": True}, False, False),
+        # A MIXED round replays with its decode rows in the narrowed break.
+        ({"disaggregation_mode": "null", "enable_mixed_batch": True}, False, True),
         ({"disaggregation_mode": "null"}, True, False),
         # --disable-prefill-graph turns it off.
         ({"disaggregation_mode": "null", "disable_prefill_graph": True}, False, False),
@@ -320,14 +320,14 @@ def test_dsa_spec_carries_the_padded_prefill_replay_admission(tmp_path) -> None:
     assert server_args.enable_mixed_batch is False
     spec = DSAConfig._spec_kwargs(server_args, model_config, False)
     assert spec["padded_prefill_replay"] is True
-    # The disable flag or a mixed batch turns it off.
+    # The disable flag turns it off; a mixed batch keeps it.
     server_args.disable_prefill_graph = True
     spec = DSAConfig._spec_kwargs(server_args, model_config, False)
     assert spec["padded_prefill_replay"] is False
     server_args.disable_prefill_graph = False
     server_args.enable_mixed_batch = True
     spec = DSAConfig._spec_kwargs(server_args, model_config, False)
-    assert spec["padded_prefill_replay"] is False
+    assert spec["padded_prefill_replay"] is True
     server_args.enable_mixed_batch = False
     # The prefill role keeps its layerwise condition.
     server_args.disaggregation_mode = "prefill"

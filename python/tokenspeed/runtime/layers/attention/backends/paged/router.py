@@ -748,7 +748,7 @@ class CacheGroupRouter(AttentionBackend):
                     if sharded
                     or (
                         gid in self._page_sharded_groups
-                        and (extend_with_prefix or forward_mode.is_extend())
+                        and (extend_with_prefix or forward_mode.is_extend_or_mixed())
                     )
                     or (num_extends > 0 and leaf.prefill_needs_host_page_table)
                     else None

@@ -1277,7 +1277,7 @@ class DSABackend(PagedAttentionBackend):
         self.history_prefill = None
         if (
             self._history_prefill
-            and forward_mode.is_extend()
+            and forward_mode.is_extend_or_mixed()
             and num_extends > 0
             and page_table_cpu is not None
         ):

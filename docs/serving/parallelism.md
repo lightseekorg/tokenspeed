@@ -706,9 +706,9 @@ ts serve --model MODEL --attention-backend flashmla \
   --attn-tp-size 8 --kv-parallel-size 8 --decode-context-parallel-size 8
 ```
 
-Keep `--disaggregation-mode` at `null` and QCP at 1. Aggregated DCP requires
-separate prefill/decode rounds and rejects `--enable-mixed-batch` for all
-backends, including MLA/DSA. MLA decode remains absorbed; MLA/KDA hybrids
+Keep `--disaggregation-mode` at `null` and QCP at 1. With
+`--enable-mixed-batch`, a mixed round runs its KVP extend rows and DCP decode
+rows in one forward. MLA decode remains absorbed; MLA/KDA hybrids
 shard only MLA history. Ordinary TP with KVP = DCP = 1 is unaffected.
 
 Speculative decoding runs on a sharded cache with the backends whose DCP
