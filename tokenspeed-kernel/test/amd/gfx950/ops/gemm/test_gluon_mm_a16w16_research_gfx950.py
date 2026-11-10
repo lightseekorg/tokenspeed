@@ -22,6 +22,8 @@
 
 from __future__ import annotations
 
+import re
+
 import pytest
 import torch
 from utils import assert_no_triton_compile, is_cdna4
@@ -51,6 +53,7 @@ from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm_streamk import (  # noqa: E40
     config_fits as sk_config_fits,
 )
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm_streamk import (  # noqa: E402
+    gluon_mm_a16w16_streamk_gfx950,
     launch_gluon_mm_a16w16_streamk_gfx950,
 )
 
@@ -109,6 +112,49 @@ def _inputs(m: int, n: int, k: int):
             "sched+pin",
             id="sched-pin-splitk",
         ),
+        # Non-power-of-two tiles: BM / BN = lo + hi, run as separate MFMA chains.
+        pytest.param(
+            (100, 1100, 2048),
+            (64, 144, 128, 4, 1, 2, 1, 8),
+            False,
+            "base",
+            id="split-n-ragged",
+        ),
+        pytest.param(
+            (300, 1000, 1024),
+            (192, 128, 64, 4, 2, 3, 1, 8),
+            False,
+            "base",
+            id="split-m-ragged",
+        ),
+        pytest.param(
+            (200, 1000, 1024),
+            (192, 160, 64, 4, 1, 3, 2, 8),
+            False,
+            "base",
+            id="split-mn-splitk2",
+        ),
+        pytest.param(
+            (200, 1000, 1024),
+            (192, 160, 64, 4, 1, 3, 1, 8),
+            True,
+            "base",
+            id="split-mn-warp-pipe",
+        ),
+        pytest.param(
+            (64, 600, 1536),
+            (64, 80, 128, 4, 1, 3, 3, 8),
+            False,
+            "sched",
+            id="split-n-splitk3",
+        ),
+        pytest.param(
+            (130, 1000, 2048),
+            (96, 96, 128, 2, 2, 3, 4, 8),
+            False,
+            "sched+pin",
+            id="split-mn-pin-splitk4",
+        ),
     ],
 )
 def test_3stage_matches_reference(mnk, cfg, warp_pipe, variant) -> None:
@@ -164,11 +210,49 @@ def test_streamk_matches_reference(mnk, cfg) -> None:
         torch.testing.assert_close(c, ref, atol=_ATOL, rtol=_RTOL)
 
 
-def test_3stage_row_count_does_not_recompile() -> None:
+# Configs whose kernel used scratch (52-320 bytes per lane) while the Stream-K
+# reduction ran inside the main loop. N is unique per case and ragged (masked
+# B loads) except for 256x128-w4x2-pin, which keeps 12 bytes of segment-end
+# spills with a ragged N.
+@pytest.mark.parametrize(
+    "n,cfg,pin_acc",
+    [
+        pytest.param(2144, (256, 128, 64, 4, 1, 3, 24, 8), True, id="256x128-w4x1-pin"),
+        pytest.param(2272, (128, 256, 64, 2, 2, 3, 24, 8), True, id="128x256-w2x2-pin"),
+        pytest.param(2304, (256, 128, 64, 4, 2, 3, 24, 8), True, id="256x128-w4x2-pin"),
+        pytest.param(2528, (256, 128, 64, 4, 2, 3, 24, 8), False, id="256x128-w4x2"),
+        pytest.param(2656, (128, 128, 64, 2, 2, 4, 24, 8), False, id="128x128-w2x2"),
+    ],
+)
+def test_streamk_does_not_spill(n, cfg, pin_acc) -> None:
+    """Stream-K kernels with large accumulators keep everything in registers."""
+    torch.manual_seed(0)
+    m, k = 256, 2048
+    a, w, ref = _inputs(m, n, k)
+    c = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+    cache = gluon_mm_a16w16_streamk_gfx950.device_caches[torch.cuda.current_device()][0]
+    before = set(cache)
+    launch_gluon_mm_a16w16_streamk_gfx950(a, w, c, cfg, pin_acc=pin_acc)
+    torch.testing.assert_close(c, ref, atol=_ATOL, rtol=_RTOL)
+    # N is compile-time and unique per case, so this launch compiled one kernel.
+    (kernel,) = [cache[key] for key in cache if key not in before]
+    scratch = re.search(
+        r"\.private_segment_fixed_size:\s+(\d+)", kernel.asm["amdgcn"]
+    ).group(1)
+    assert int(scratch) == 0
+
+
+@pytest.mark.parametrize(
+    "cfg",
+    [
+        pytest.param((64, 128, 64, 2, 2, 3, 2, 8), id="pow2"),
+        pytest.param((192, 160, 64, 4, 1, 3, 2, 8), id="split-mn"),
+    ],
+)
+def test_3stage_row_count_does_not_recompile(cfg) -> None:
     """M is a runtime argument: new row counts reuse the compiled kernel."""
     torch.manual_seed(0)
     n, k = 512, 1024
-    cfg = (64, 128, 64, 2, 2, 3, 2, 8)
     w = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
 
     def run(m: int) -> None:
@@ -180,6 +264,17 @@ def test_3stage_row_count_does_not_recompile() -> None:
     with assert_no_triton_compile(gluon_mm_a16w16_3stage_gfx950):
         for m in (16, 33, 100, 128, 200):
             run(m)
+
+
+@pytest.mark.parametrize(
+    "block,legal",
+    [(192, True), (144, True), (80, True), (96, True), (224, False), (176, False)],
+)
+def test_split_tile_sizes(block, legal) -> None:
+    """A tile is legal when it is lo + hi with both parts powers of two."""
+    cfg = (64, block, 128, 4, 1, 2, 1, 8)
+    assert gl3_config_fits(cfg, 64, 4096, 4096) == legal
+    assert pers_config_fits(cfg[:6] + (256, 8), 64, 4096, 4096) == legal
 
 
 # cfg = (BM, BN, BK, WM, WN, NS, GRID, XCD). A small GRID gives several
@@ -205,6 +300,28 @@ def test_3stage_row_count_does_not_recompile() -> None:
         ),
         pytest.param(
             (64, 1152, 1024), (64, 64, 64, 2, 2, 3, 16, 8), 1, 1, id="tail-unsplit"
+        ),
+        # Non-power-of-two tiles in the rounds and in the split-K tail.
+        pytest.param(
+            (300, 1000, 2048),
+            (192, 160, 64, 4, 1, 3, 12, 4),
+            32,
+            6,
+            id="split-mn-round+tail",
+        ),
+        pytest.param(
+            (200, 1100, 2048),
+            (64, 144, 128, 4, 1, 2, 24, 8),
+            32,
+            3,
+            id="split-n-ragged-round+tail",
+        ),
+        pytest.param(
+            (130, 900, 1024),
+            (96, 96, 128, 2, 2, 3, 8, 8),
+            32,
+            2,
+            id="split-mn-2rounds+tail",
         ),
     ],
 )

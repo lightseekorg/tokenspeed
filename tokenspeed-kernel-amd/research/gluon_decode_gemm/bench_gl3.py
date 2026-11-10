@@ -29,6 +29,7 @@ Modes:
   --mode gl3                      Gluon 3-stage kernel, config sweep (or --cfgs JSON)
   --mode sk                       Gluon Stream-K kernel, config sweep (or --cfgs JSON)
   --mode pers                     Gluon persistent rounds + split-K tail kernel, sweep (or --cfgs JSON)
+  --tiles split                   sweep lo + hi (non-power-of-two) BM/BN tiles instead of powers of two
   --compile-only                  launch every candidate once (fills the Triton cache)
 
 Each record is one JSON line: shape, M, method, us, relerr (max error / max |ref|).
@@ -60,23 +61,70 @@ SHAPES = {
 ROWS = (64, 128, 192, 256, 384, 512)
 
 
-def gl3_candidates(M, N, K, ns_list, wp_list, xcd_list=(1, 8)):
+POW2_BM = (64, 128, 256)
+POW2_BN = (64, 128, 256)
+# lo + hi tiles (mm_3stage.split_pow2); the sweep keeps those that waste
+# little of M and fill the CUs.
+SPLIT_BM = (96, 192, 320)
+SPLIT_BN = (80, 96, 144, 160, 192, 272, 288, 320)
+
+
+def tile_sizes(M, tiles):
+    """(BM list, BN list) for --tiles pow2 | split (split: at least one lo + hi side)."""
+    if tiles == "pow2":
+        return [(bm, bn) for bm in POW2_BM for bn in POW2_BN]
+    bms = POW2_BM + SPLIT_BM
+    # Padding rows are wasted MFMA work and A traffic: keep it below 25% of M.
+    bms = [b for b in bms if b == 64 or math.ceil(M / b) * b - M <= M // 4]
+    return [
+        (bm, bn)
+        for bm in bms
+        for bn in POW2_BN + SPLIT_BN
+        if bm in SPLIT_BM or bn in SPLIT_BN
+    ]
+
+
+def round_fill(programs, cus=256):
+    """Busy fraction of the CU slots over all rounds of a one-WG-per-CU grid."""
+    return programs / (math.ceil(programs / cus) * cus)
+
+
+def fitting_stages(fits, ns_list):
+    """The stage counts in ns_list that fit; else the deepest smaller one that does
+    (lo + hi tiles often only fit LDS with 2 stages)."""
+    ok = [ns for ns in ns_list if fits(ns)]
+    if ok:
+        return ok
+    for ns in range(min(ns_list) - 1, 1, -1):
+        if fits(ns):
+            return [ns]
+    return []
+
+
+def gl3_candidates(M, N, K, ns_list, wp_list, xcd_list=(1, 8), tiles="pow2"):
     out = []
-    bms = [b for b in (64, 128, 256) if b < 2 * M or b == 64]
-    for bm, bn, bk in itertools.product(bms, (64, 128, 256), (64, 128)):
+    for (bm, bn), bk in itertools.product(tile_sizes(M, tiles), (64, 128)):
+        if tiles == "pow2" and not (bm < 2 * M or bm == 64):
+            continue
         for wm, wn in ((2, 4), (4, 2), (2, 2), (1, 4), (4, 1)):
-            tiles = math.ceil(M / bm) * math.ceil(N / bn)
+            ntiles = math.ceil(M / bm) * math.ceil(N / bn)
             # SPLIT_K=3 fits K=6144 (o): 80 tiles x 3 = 240 programs, one round on 256 CUs.
             for sk in (1, 2, 3, 4):
-                if sk > 1 and tiles >= 256:
+                if sk > 1 and ntiles >= 256:
                     continue
-                if tiles * sk < 64:
+                if ntiles * sk < 64:
                     continue
-                for ns in ns_list:
+                # Split tiles exist to fill the rounds: drop poorly filled grids.
+                if tiles == "split" and (
+                    round_fill(ntiles * sk) < 0.7 or ntiles * sk > 512
+                ):
+                    continue
+                for ns in fitting_stages(
+                    lambda ns: G3.config_fits((bm, bn, bk, wm, wn, ns, sk, 8), M, N, K),
+                    ns_list,
+                ):
                     for xcd in xcd_list:
                         cfg = (bm, bn, bk, wm, wn, ns, sk, xcd)
-                        if not G3.config_fits(cfg, M, N, K):
-                            continue
                         # acc registers per lane (fp32); keep below ~128
                         if bm * bn // (64 * wm * wn) > 128:
                             continue
@@ -118,15 +166,18 @@ def sk_candidates(M, N, K, ns_list, grids, xcds):
     return out
 
 
-def pers_candidates(M, N, K, ns_list, grids, xcds):
+def pers_candidates(M, N, K, ns_list, grids, xcds, tiles="pow2"):
     out = []
-    for bm, bn, bk in itertools.product((64, 128, 256), (64, 128, 256), (64, 128)):
-        if bm > 64 and bm >= 2 * M:
+    for (bm, bn), bk in itertools.product(tile_sizes(M, tiles), (64, 128)):
+        if tiles == "pow2" and bm > 64 and bm >= 2 * M:
             continue
         for wm, wn in ((2, 4), (4, 2), (2, 2), (1, 4), (4, 1)):
             if bm * bn // (64 * wm * wn) > 128:
                 continue
-            for ns in ns_list:
+            for ns in fitting_stages(
+                lambda ns: PS.config_fits((bm, bn, bk, wm, wn, ns, 256, 8), M, N, K),
+                ns_list,
+            ):
                 for gr in grids:
                     for x in xcds:
                         c = (bm, bn, bk, wm, wn, ns, gr, x)
@@ -178,6 +229,12 @@ def main():
     ap.add_argument("--wp", default="0,1")
     ap.add_argument("--xcd", default="8")
     ap.add_argument("--grid", default="256,512")
+    ap.add_argument(
+        "--tiles",
+        default="pow2",
+        choices=("pow2", "split"),
+        help="sweep power-of-two tiles or lo + hi (non-power-of-two) tiles",
+    )
     ap.add_argument("--compile-only", action="store_true")
     ap.add_argument("--part", default="0/1")
     ap.add_argument("--out", required=True)
@@ -297,6 +354,7 @@ def main():
                         ns_list,
                         tuple(map(int, args.grid.split(","))),
                         tuple(map(int, args.xcd.split(","))),
+                        args.tiles,
                     )
                 for cfg in cfgs:
                     cfg = tuple(cfg)
@@ -322,7 +380,13 @@ def main():
                     cfgs = explicit
                 else:
                     cfgs = gl3_candidates(
-                        M, N, K, ns_list, wp_list, tuple(map(int, args.xcd.split(",")))
+                        M,
+                        N,
+                        K,
+                        ns_list,
+                        wp_list,
+                        tuple(map(int, args.xcd.split(","))),
+                        args.tiles,
                     )
                 for cfg in cfgs:
                     cfg = tuple(cfg)

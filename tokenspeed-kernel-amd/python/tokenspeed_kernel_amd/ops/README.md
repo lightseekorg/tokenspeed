@@ -147,13 +147,21 @@ All compute `C[M, N] = A[M, K] @ W[N, K].T` in BF16/FP16 with FP32 accumulate:
 - `M` is a runtime argument.
 - `N`, `K` and the tile configuration are compile-time.
 - `C` may be a column slice of a wider tensor.
+- In the 3-stage and persistent kernels, `BLOCK_M` and `BLOCK_N` may be the
+  sum of two powers of two (such as 160 = 128 + 32). Each part has its own LDS
+  ring and the tile runs up to four MFMA chains, one accumulator each.
 
 Split-K and Stream-K reduce FP32 partials through per-tile counters, which the
-last arriving program resets. The persistent kernel runs one program per CU:
-full data-parallel rounds of one tile per program, plus the leftover tiles
-split along K. Its tail reduction spins on a per-tile counter, so the grid
-must not exceed the CU count (the launcher checks this). Benchmarks, best
-configs and findings are in `tokenspeed-kernel-amd/research/gluon_decode_gemm/`.
+last arriving program resets. Stream-K never reduces inside its main loop,
+where a second FP32 tile would spill large tiles to scratch: a program that
+arrives last at its first tile in the loop marks the counter and reduces
+after the loop, and its last tile arrives after the loop.
+
+The persistent kernel runs one program per CU: full data-parallel rounds of
+one tile per program, plus the leftover tiles split along K. Its tail
+reduction spins on a per-tile counter, so the grid must not exceed the CU
+count (the launcher checks this). Benchmarks, best configs and findings are in
+`tokenspeed-kernel-amd/research/gluon_decode_gemm/`.
 
 ### gfx950 single- and few-row BF16 GEMV
 

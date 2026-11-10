@@ -34,6 +34,9 @@ loads for the next tile are already in flight while the current one finishes,
 so tile boundaries cost no pipeline refill. A tile computed by one program is
 stored directly. A tile shared by several programs is reduced by the last
 arriver from FP32 partials, ordered by a per-tile counter that it resets.
+The reduction runs after the main loop, never inside it: inside, it keeps a
+second FP32 tile live next to the accumulator and the operand registers, and
+large tiles spilled to scratch inside the MFMA loop.
 
 LDS layout, global-load layout and MFMA operand layouts are those of
 mm_3stage.py (tutorial padding [[512, 16]]).
@@ -88,6 +91,69 @@ def _addr(
         cols = gl.minimum(offs_bn, N - 1 - pid_n * BLOCK_N)
         b_offs = offs_bk[:, None] + cols[None, :] * stride_bn
     return a_base, a_offs, b_base, b_offs
+
+
+@gluon.jit
+def _reduce(
+    tile,
+    c_ptr,
+    partial_ptr,
+    counter_ptr,
+    M,
+    N: gl.constexpr,
+    stride_cm,
+    num_pid_m,
+    per,
+    KT: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    mfma: gl.constexpr,
+):
+    """Sum the FP32 partials of a tile into C and reset its counter."""
+    TILE_ELEMS: gl.constexpr = BLOCK_M * BLOCK_N
+    pid_m = tile % num_pid_m
+    pid_n = tile // num_pid_m
+    tile_start = tile * KT
+    offs_cm = gl.arange(0, BLOCK_M, gl.SliceLayout(1, mfma))
+    offs_cn = gl.arange(0, BLOCK_N, gl.SliceLayout(0, mfma))
+    p_offs = offs_cm[:, None] * BLOCK_N + offs_cn[None, :]
+    out = gl.zeros((BLOCK_M, BLOCK_N), gl.float32, mfma)
+    for w in range(tile_start // per, (tile_start + KT - 1) // per + 1):
+        # Slot 0 holds a program's first segment, slot 1 its last.
+        ws = (w * per < tile_start).to(gl.int32)
+        out += cdna4.buffer_load(
+            ptr=partial_ptr + ((w * 2 + ws) * TILE_ELEMS).to(gl.int64),
+            offsets=p_offs,
+            cache=".cv",
+        )
+    gl.store(counter_ptr + tile, 0)
+    sm = pid_m * BLOCK_M + offs_cm
+    sn = pid_n * BLOCK_N + offs_cn
+    cdna4.buffer_store(
+        stored_value=out.to(c_ptr.dtype.element_ty),
+        ptr=c_ptr + (pid_m * BLOCK_M).to(gl.int64) * stride_cm + pid_n * BLOCK_N,
+        offsets=offs_cm[:, None] * stride_cm + offs_cn[None, :],
+        mask=(sm[:, None] < M) & (sn[None, :] < N),
+    )
+
+
+@gluon.jit
+def _is_last_arrival(tile, counter_ptr, per, KT: gl.constexpr, dep):
+    """Count one partial of a tile; true for the last of its programs."""
+    gl.inline_asm_elementwise(
+        asm="s_waitcnt vmcnt(0)",
+        constraints="=v,0",
+        args=[dep],
+        dtype=gl.int32,
+        is_pure=False,
+        pack=1,
+    )
+    gl.barrier()
+    tile_start = tile * KT
+    w_lo = tile_start // per
+    w_hi = (tile_start + KT - 1) // per
+    old = gl.atomic_add(counter_ptr + tile, 1, sem="relaxed", scope="gpu")
+    return old == w_hi - w_lo
 
 
 @gluon.jit(launch_metadata=_launch_metadata, do_not_specialize=("M",))
@@ -285,35 +351,61 @@ def gluon_mm_a16w16_streamk_gfx950(
                     offsets=p_offs,
                     cache=".wt",
                 )
-                gl.inline_asm_elementwise(
-                    asm="s_waitcnt vmcnt(0)",
-                    constraints="=v,0",
-                    args=[offs_cm],
-                    dtype=gl.int32,
-                    is_pure=False,
-                    pack=1,
-                )
-                gl.barrier()
-                w_lo = tile_start // per
-                w_hi = (tile_start + KT - 1) // per
-                old = gl.atomic_add(counter_ptr + tile, 1, sem="relaxed", scope="gpu")
-                if old == w_hi - w_lo:
-                    out = gl.zeros((BLOCK_M, BLOCK_N), gl.float32, mfma)
-                    for w in range(w_lo, w_hi + 1):
-                        ws = (w * per < tile_start).to(gl.int32)
-                        out += cdna4.buffer_load(
-                            ptr=partial_ptr + ((w * 2 + ws) * TILE_ELEMS).to(gl.int64),
-                            offsets=p_offs,
-                            cache=".cv",
+                # A program's first segment arrives now, so the program before
+                # it, which finishes that tile at the end of its range, is
+                # usually the last arriver. In the rare case this program is,
+                # it marks the counter with -(pid + 1) and reduces the tile
+                # after the loop, so no extra state is carried by the loop.
+                if slot == 0:
+                    if _is_last_arrival(tile, counter_ptr, per, KT, offs_cm):
+                        gl.atomic_xchg(
+                            counter_ptr + tile, -(pid + 1), sem="relaxed", scope="gpu"
                         )
-                    gl.store(counter_ptr + tile, 0)
-                    cdna4.buffer_store(
-                        stored_value=out.to(c_ptr.dtype.element_ty),
-                        ptr=c_base,
-                        offsets=c_offs,
-                        mask=c_mask,
-                    )
             acc = gl.zeros((BLOCK_M, BLOCK_N), gl.float32, mfma)
+
+    # Reduce the first tile if this program marked it in the loop.
+    first = start // KT
+    first_partial = (start > first * KT) | (end < (first + 1) * KT)
+    if first_partial:
+        mark = gl.atomic_add(counter_ptr + first, 0, sem="relaxed", scope="gpu")
+    else:
+        mark = 0
+    if mark == -(pid + 1):
+        _reduce(
+            first,
+            c_ptr,
+            partial_ptr,
+            counter_ptr,
+            M,
+            N,
+            stride_cm,
+            num_pid_m,
+            per,
+            KT,
+            BLOCK_M,
+            BLOCK_N,
+            mfma,
+        )
+    # The last segment is partial when the range ends inside a tile that
+    # started before it; it arrives here, after the loop.
+    last = (end - 1) // KT
+    if (last != first) & (end < (last + 1) * KT):
+        if _is_last_arrival(last, counter_ptr, per, KT, offs_cm):
+            _reduce(
+                last,
+                c_ptr,
+                partial_ptr,
+                counter_ptr,
+                M,
+                N,
+                stride_cm,
+                num_pid_m,
+                per,
+                KT,
+                BLOCK_M,
+                BLOCK_N,
+                mfma,
+            )
 
 
 def config_fits(cfg: tuple, M: int, N: int, K: int) -> bool:

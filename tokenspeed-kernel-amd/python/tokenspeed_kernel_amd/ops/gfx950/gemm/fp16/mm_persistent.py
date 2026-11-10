@@ -42,6 +42,10 @@ One launch of ``GRID`` programs (one per CU) runs three steps:
 The wait is a spin on the counter, so it needs every piece of a tail tile to
 be resident at the same time: ``GRID`` must not exceed the number of
 workgroups that fit on the GPU at once. The launcher caps it at the CU count.
+
+``BLOCK_M`` and ``BLOCK_N`` may be the sum of two powers of two (e.g. 192 =
+128 + 64), run as up to four MFMA chains exactly as in mm_3stage.py, so the
+tile count can match ``GRID`` more closely.
 """
 
 from __future__ import annotations
@@ -51,14 +55,62 @@ from tokenspeed_kernel_amd._triton import gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm_3stage import (
     LDS_BYTES,
     _gload_layout,
+    _issue_tile,
     _launch_metadata,
-    _log2,
+    _mfma_tile,
     _pids,
+    _pow2_lo,
+    _read_tile,
     _shared_layout,
+    tile_parts_fit,
 )
 
 cdna4 = gl.amd.cdna4
 async_copy = gl.amd.cdna4.async_copy
+
+
+@gluon.jit
+def _store_mfma_part(
+    acc,
+    c_ptr,
+    partial_ptr,
+    p_tile,
+    M,
+    N,
+    m0,
+    n0,
+    stride_cm,
+    BM_PART: gl.constexpr,
+    BN_PART: gl.constexpr,
+    M_OFF: gl.constexpr,
+    N_OFF: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    mfma: gl.constexpr,
+    TO_PARTIAL: gl.constexpr,
+):
+    """Store one [BM_PART, BN_PART] part at (M_OFF, N_OFF) straight from the MFMA layout.
+
+    TO_PARTIAL: FP32 into the row-major [BLOCK_M, BLOCK_N] partial at
+    ``p_tile``; otherwise cast and store into C with the M/N mask.
+    """
+    offs_cm = gl.arange(0, BM_PART, gl.SliceLayout(1, mfma))
+    offs_cn = gl.arange(0, BN_PART, gl.SliceLayout(0, mfma))
+    if TO_PARTIAL:
+        cdna4.buffer_store(
+            stored_value=acc,
+            ptr=partial_ptr + p_tile,
+            offsets=(M_OFF + offs_cm)[:, None] * BLOCK_N + (N_OFF + offs_cn)[None, :],
+            cache=".wt",
+        )
+    else:
+        sm = m0 + M_OFF + offs_cm
+        sn = n0 + N_OFF + offs_cn
+        cdna4.buffer_store(
+            stored_value=acc.to(c_ptr.dtype.element_ty),
+            ptr=c_ptr + (m0 + M_OFF).to(gl.int64) * stride_cm + n0 + N_OFF,
+            offsets=offs_cm[:, None] * stride_cm + offs_cn[None, :],
+            mask=(sm[:, None] < M) & (sn[None, :] < N),
+        )
 
 
 @gluon.jit(launch_metadata=_launch_metadata, do_not_specialize=("M", "PIECES"))
@@ -89,6 +141,13 @@ def gluon_mm_a16w16_persistent_gfx950(
     NUM_WARPS: gl.constexpr = WARPS_M * WARPS_N
     KT: gl.constexpr = K // BLOCK_K
     TILE_ELEMS: gl.constexpr = BLOCK_M * BLOCK_N
+    # Row and column parts as in mm_3stage: BLOCK = LO + HI, HI 0 or a power of two.
+    BM_LO: gl.constexpr = _pow2_lo(BLOCK_M)
+    BM_HI: gl.constexpr = BLOCK_M - BM_LO
+    BN_LO: gl.constexpr = _pow2_lo(BLOCK_N)
+    BN_HI: gl.constexpr = BLOCK_N - BN_LO
+    SPLIT_M: gl.constexpr = BM_HI > 0
+    SPLIT_N: gl.constexpr = BN_HI > 0
     gl.static_assert(K % BLOCK_K == 0, "K must be a multiple of BLOCK_K")
     gl.static_assert(KT >= NUM_STAGES, "need at least NUM_STAGES K tiles")
     gl.static_assert(NUM_STAGES >= 2, "pipeline needs two or more stages")
@@ -106,10 +165,10 @@ def gluon_mm_a16w16_persistent_gfx950(
     tail = num_tiles - rounds * GRID
     n_items = rounds + (pid < tail * PIECES).to(gl.int32)
 
-    gLoadA: gl.constexpr = _gload_layout(BLOCK_M, BLOCK_K, NUM_WARPS, False)
-    gLoadB: gl.constexpr = _gload_layout(BLOCK_N, BLOCK_K, NUM_WARPS, True)
-    sharedA: gl.constexpr = _shared_layout(BLOCK_M, BLOCK_K, NUM_WARPS, False)
-    sharedB: gl.constexpr = _shared_layout(BLOCK_N, BLOCK_K, NUM_WARPS, True)
+    gLoadA: gl.constexpr = _gload_layout(BM_LO, BLOCK_K, NUM_WARPS, False)
+    gLoadB: gl.constexpr = _gload_layout(BN_LO, BLOCK_K, NUM_WARPS, True)
+    sharedA: gl.constexpr = _shared_layout(BM_LO, BLOCK_K, NUM_WARPS, False)
+    sharedB: gl.constexpr = _shared_layout(BN_LO, BLOCK_K, NUM_WARPS, True)
     mfma: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
         instr_shape=[16, 16, 32],
@@ -125,19 +184,36 @@ def gluon_mm_a16w16_persistent_gfx950(
     FIX_UNROLL: gl.constexpr = 16
 
     smemA = gl.allocate_shared_memory(
-        a_ptr.dtype.element_ty, [NUM_STAGES, BLOCK_M, BLOCK_K], sharedA
+        a_ptr.dtype.element_ty, [NUM_STAGES, BM_LO, BLOCK_K], sharedA
     )
     smemB = gl.allocate_shared_memory(
-        b_ptr.dtype.element_ty, [NUM_STAGES, BLOCK_K, BLOCK_N], sharedB
+        b_ptr.dtype.element_ty, [NUM_STAGES, BLOCK_K, BN_LO], sharedB
     )
-    offs_am = gl.arange(0, BLOCK_M, gl.SliceLayout(1, gLoadA))
+    offs_am = gl.arange(0, BM_LO, gl.SliceLayout(1, gLoadA))
     offs_ak = gl.arange(0, BLOCK_K, gl.SliceLayout(0, gLoadA))
     offs_bk = gl.arange(0, BLOCK_K, gl.SliceLayout(1, gLoadB))
-    offs_bn = gl.arange(0, BLOCK_N, gl.SliceLayout(0, gLoadB))
-    offs_cm = gl.arange(0, BLOCK_M, gl.SliceLayout(1, mfma))
-    offs_cn = gl.arange(0, BLOCK_N, gl.SliceLayout(0, mfma))
-    c_offs = offs_cm[:, None] * stride_cm + offs_cn[None, :]
-    p_offs = offs_cm[:, None] * BLOCK_N + offs_cn[None, :]
+    offs_bn = gl.arange(0, BN_LO, gl.SliceLayout(0, gLoadB))
+    # Hi parts: own LDS ring; when unsplit they alias the lo part and are
+    # never touched.
+    smemAh = smemA
+    smemBh = smemB
+    if SPLIT_M:
+        gLoadAh: gl.constexpr = _gload_layout(BM_HI, BLOCK_K, NUM_WARPS, False)
+        sharedAh: gl.constexpr = _shared_layout(BM_HI, BLOCK_K, NUM_WARPS, False)
+        smemAh = gl.allocate_shared_memory(
+            a_ptr.dtype.element_ty, [NUM_STAGES, BM_HI, BLOCK_K], sharedAh
+        )
+        offs_ahm = gl.arange(0, BM_HI, gl.SliceLayout(1, gLoadAh))
+        offs_ahk = gl.arange(0, BLOCK_K, gl.SliceLayout(0, gLoadAh))
+    if SPLIT_N:
+        gLoadBh: gl.constexpr = _gload_layout(BN_HI, BLOCK_K, NUM_WARPS, True)
+        sharedBh: gl.constexpr = _shared_layout(BN_HI, BLOCK_K, NUM_WARPS, True)
+        smemBh = gl.allocate_shared_memory(
+            b_ptr.dtype.element_ty, [NUM_STAGES, BLOCK_K, BN_HI], sharedBh
+        )
+        offs_bhk = gl.arange(0, BLOCK_K, gl.SliceLayout(1, gLoadBh))
+        offs_bhn = gl.arange(0, BN_HI, gl.SliceLayout(0, gLoadBh))
+    offs_cm = gl.arange(0, BM_LO, gl.SliceLayout(1, mfma))
     offs_f = gl.arange(0, FIX_BLOCK, fixL)
 
     # The tail piece (if any) runs first and only publishes its partial; the
@@ -161,57 +237,104 @@ def gluon_mm_a16w16_persistent_gfx950(
         # Rows past M and weight rows past N clamp onto the last valid one
         # (the store mask drops them), so no load needs a mask.
         k0 = k_lo * BLOCK_K
-        a_base = a_ptr + (pid_m * BLOCK_M).to(gl.int64) * stride_am + k0
-        b_base = b_ptr + (pid_n * BLOCK_N).to(gl.int64) * stride_bn + k0
-        rows = gl.minimum(offs_am, M - 1 - pid_m * BLOCK_M)
+        m0 = pid_m * BLOCK_M
+        n0 = pid_n * BLOCK_N
+        a_base = a_ptr + m0.to(gl.int64) * stride_am + k0
+        b_base = b_ptr + n0.to(gl.int64) * stride_bn + k0
+        rows = gl.minimum(offs_am, M - 1 - m0)
         a_offs = rows[:, None] * stride_am + offs_ak[None, :]
         if N % BLOCK_N == 0:
             b_offs = offs_bk[:, None] + offs_bn[None, :] * stride_bn
         else:
-            cols = gl.minimum(offs_bn, N - 1 - pid_n * BLOCK_N)
+            cols = gl.minimum(offs_bn, N - 1 - n0)
             b_offs = offs_bk[:, None] + cols[None, :] * stride_bn
+        ah_offs = a_offs
+        bh_offs = b_offs
+        if SPLIT_M:
+            rows_h = gl.minimum(BM_LO + offs_ahm, M - 1 - m0)
+            ah_offs = rows_h[:, None] * stride_am + offs_ahk[None, :]
+        if SPLIT_N:
+            if N % BLOCK_N == 0:
+                bh_offs = offs_bhk[:, None] + (BN_LO + offs_bhn)[None, :] * stride_bn
+            else:
+                cols_h = gl.minimum(BN_LO + offs_bhn, N - 1 - n0)
+                bh_offs = offs_bhk[:, None] + cols_h[None, :] * stride_bn
 
         # Every wave must be done reading the previous item's LDS slots
         # before this item's prologue overwrites them.
         gl.barrier()
         for s in gl.static_range(NUM_STAGES):
-            async_copy.buffer_load_to_shared(
-                smemA.index(s), a_base, a_offs + s * BLOCK_K
-            )
-            async_copy.buffer_load_to_shared(
-                smemB.index(s), b_base, b_offs + s * BLOCK_K
-            )
-            async_copy.commit_group()
+            _issue_tile(
+                smemA, smemAh, smemB, smemBh, s, a_base, b_base,
+                a_offs, ah_offs, b_offs, bh_offs, s * BLOCK_K, SPLIT_M, SPLIT_N,
+            )  # fmt: skip
         async_copy.wait_group(NUM_STAGES - 1)
-        a = smemA.index(0).load(dotA)
-        b = smemB.index(0).load(dotB)
-        acc = gl.zeros((BLOCK_M, BLOCK_N), gl.float32, mfma)
+        a, ah, b, bh = _read_tile(
+            smemA, smemAh, smemB, smemBh, 0, dotA, dotB, SPLIT_M, SPLIT_N
+        )
+        acc = gl.zeros((BM_LO, BN_LO), gl.float32, mfma)
+        acc_lh = acc
+        acc_hl = acc
+        acc_hh = acc
+        if SPLIT_N:
+            acc_lh = gl.zeros((BM_LO, BN_HI), gl.float32, mfma)
+        if SPLIT_M:
+            acc_hl = gl.zeros((BM_HI, BN_LO), gl.float32, mfma)
+            if SPLIT_N:
+                acc_hh = gl.zeros((BM_HI, BN_HI), gl.float32, mfma)
         for i in range(0, n_k - NUM_STAGES):
             cur = i % NUM_STAGES
             nxt = (i + 1) % NUM_STAGES
             kofs = (i + NUM_STAGES) * BLOCK_K
-            acc = cdna4.mfma(a, b, acc, cd_regclass=CD_REGCLASS)
+            acc, acc_lh, acc_hl, acc_hh = _mfma_tile(
+                a, ah, b, bh, acc, acc_lh, acc_hl, acc_hh,
+                CD_REGCLASS, SPLIT_M, SPLIT_N,
+            )  # fmt: skip
             async_copy.wait_group(NUM_STAGES - 2)
-            a = smemA.index(nxt).load(dotA)
-            b = smemB.index(nxt).load(dotB)
-            async_copy.buffer_load_to_shared(smemA.index(cur), a_base, a_offs + kofs)
-            async_copy.buffer_load_to_shared(smemB.index(cur), b_base, b_offs + kofs)
-            async_copy.commit_group()
+            a, ah, b, bh = _read_tile(
+                smemA, smemAh, smemB, smemBh, nxt, dotA, dotB, SPLIT_M, SPLIT_N
+            )
+            _issue_tile(
+                smemA, smemAh, smemB, smemBh, cur, a_base, b_base,
+                a_offs, ah_offs, b_offs, bh_offs, kofs, SPLIT_M, SPLIT_N,
+            )  # fmt: skip
         for j in gl.static_range(1, NUM_STAGES):
-            acc = cdna4.mfma(a, b, acc, cd_regclass=CD_REGCLASS)
+            acc, acc_lh, acc_hl, acc_hh = _mfma_tile(
+                a, ah, b, bh, acc, acc_lh, acc_hl, acc_hh,
+                CD_REGCLASS, SPLIT_M, SPLIT_N,
+            )  # fmt: skip
             async_copy.wait_group(NUM_STAGES - 1 - j)
             slot = (n_k - NUM_STAGES + j) % NUM_STAGES
-            a = smemA.index(slot).load(dotA)
-            b = smemB.index(slot).load(dotB)
-        acc = cdna4.mfma(a, b, acc, cd_regclass=CD_REGCLASS)
-
-        if has_tail & (w == 0) & (PIECES > 1):
-            cdna4.buffer_store(
-                stored_value=acc,
-                ptr=partial_ptr + (tt * PIECES + piece).to(gl.int64) * TILE_ELEMS,
-                offsets=p_offs,
-                cache=".wt",
+            a, ah, b, bh = _read_tile(
+                smemA, smemAh, smemB, smemBh, slot, dotA, dotB, SPLIT_M, SPLIT_N
             )
+        acc, acc_lh, acc_hl, acc_hh = _mfma_tile(
+            a, ah, b, bh, acc, acc_lh, acc_hl, acc_hh, CD_REGCLASS, SPLIT_M, SPLIT_N
+        )
+
+        to_partial = has_tail & (w == 0) & (PIECES > 1)
+        # Casting the factor first keeps the offset in int64.
+        p_tile = (tt * PIECES + piece).to(gl.int64) * TILE_ELEMS
+        if to_partial:
+            _store_mfma_part(
+                acc, c_ptr, partial_ptr, p_tile, M, N, m0, n0, stride_cm,
+                BM_LO, BN_LO, 0, 0, BLOCK_N, mfma, True,
+            )  # fmt: skip
+            if SPLIT_N:
+                _store_mfma_part(
+                    acc_lh, c_ptr, partial_ptr, p_tile, M, N, m0, n0, stride_cm,
+                    BM_LO, BN_HI, 0, BN_LO, BLOCK_N, mfma, True,
+                )  # fmt: skip
+            if SPLIT_M:
+                _store_mfma_part(
+                    acc_hl, c_ptr, partial_ptr, p_tile, M, N, m0, n0, stride_cm,
+                    BM_HI, BN_LO, BM_LO, 0, BLOCK_N, mfma, True,
+                )  # fmt: skip
+                if SPLIT_N:
+                    _store_mfma_part(
+                        acc_hh, c_ptr, partial_ptr, p_tile, M, N, m0, n0, stride_cm,
+                        BM_HI, BN_HI, BM_LO, BN_LO, BLOCK_N, mfma, True,
+                    )  # fmt: skip
             # Publish the partial: wait for this wave's stores, then order all
             # waves' stores before the arrival.
             gl.inline_asm_elementwise(
@@ -225,25 +348,31 @@ def gluon_mm_a16w16_persistent_gfx950(
             gl.barrier()
             gl.atomic_add(counter_ptr + tt, 1, sem="relaxed", scope="gpu")
         else:
-            sm = pid_m * BLOCK_M + offs_cm
-            sn = pid_n * BLOCK_N + offs_cn
-            c_base = (
-                c_ptr + (pid_m * BLOCK_M).to(gl.int64) * stride_cm + pid_n * BLOCK_N
-            )
-            cdna4.buffer_store(
-                stored_value=acc.to(c_ptr.dtype.element_ty),
-                ptr=c_base,
-                offsets=c_offs,
-                mask=(sm[:, None] < M) & (sn[None, :] < N),
-            )
+            _store_mfma_part(
+                acc, c_ptr, partial_ptr, p_tile, M, N, m0, n0, stride_cm,
+                BM_LO, BN_LO, 0, 0, BLOCK_N, mfma, False,
+            )  # fmt: skip
+            if SPLIT_N:
+                _store_mfma_part(
+                    acc_lh, c_ptr, partial_ptr, p_tile, M, N, m0, n0, stride_cm,
+                    BM_LO, BN_HI, 0, BN_LO, BLOCK_N, mfma, False,
+                )  # fmt: skip
+            if SPLIT_M:
+                _store_mfma_part(
+                    acc_hl, c_ptr, partial_ptr, p_tile, M, N, m0, n0, stride_cm,
+                    BM_HI, BN_LO, BM_LO, 0, BLOCK_N, mfma, False,
+                )  # fmt: skip
+                if SPLIT_N:
+                    _store_mfma_part(
+                        acc_hh, c_ptr, partial_ptr, p_tile, M, N, m0, n0, stride_cm,
+                        BM_HI, BN_HI, BM_LO, BN_LO, BLOCK_N, mfma, False,
+                    )  # fmt: skip
 
     if has_tail & (PIECES > 1):
         arrived = gl.atomic_add(counter_ptr + tt, 0, sem="acquire", scope="gpu")
         while arrived < PIECES:
             arrived = gl.atomic_add(counter_ptr + tt, 0, sem="acquire", scope="gpu")
-        pid_m, pid_n = _pids(
-            rounds * GRID + tt, num_pid_m, num_pid_n, 1, GROUP_SIZE_M
-        )
+        pid_m, pid_n = _pids(rounds * GRID + tt, num_pid_m, num_pid_n, 1, GROUP_SIZE_M)
         c_base = c_ptr + (pid_m * BLOCK_M).to(gl.int64) * stride_cm + pid_n * BLOCK_N
         p_tile = partial_ptr + (tt * PIECES).to(gl.int64) * TILE_ELEMS
         for blk in range(piece, FIX_BLOCKS, PIECES):
@@ -276,19 +405,20 @@ def gluon_mm_a16w16_persistent_gfx950(
 
 
 def config_fits(cfg: tuple, M: int, N: int, K: int) -> bool:
-    """Whether a (BM, BN, BK, WM, WN, NS, GRID, XCD) config is legal."""
+    """Whether a (BM, BN, BK, WM, WN, NS, GRID, XCD) config is legal.
+
+    BM and BN may be a power of two or the sum of two (see mm_3stage.split_pow2).
+    """
     bm, bn, bk, wm, wn, ns, grid, xcd = cfg[:8]
     nw = wm * wn
-    if nw not in (4, 8) or bm % (16 * wm) or bn % (16 * wn):
+    if nw not in (4, 8):
+        return False
+    if not (tile_parts_fit(bm, wm, bk, nw) and tile_parts_fit(bn, wn, bk, nw)):
         return False
     if K % bk or K // bk < ns or grid % xcd:
         return False
     if ns * (bm + bn) * bk * 2 * 33 // 32 > LDS_BYTES:
         return False
-    lane_row_bits = 6 - (_log2(bk) - 3)
-    for rows in (bm, bn):
-        if _log2(rows) < _log2(nw) + lane_row_bits:
-            return False
     return True
 
 

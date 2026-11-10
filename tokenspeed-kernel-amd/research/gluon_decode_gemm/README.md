@@ -34,6 +34,7 @@ The persistent kernel needs `GRID` <= the CU count, so sweep it with `--grid 256
 ```bash
 python bench_gl3.py --mode gl3 --cfgs "$(cat gl3_best_cfgs.json)" --variants base,sched --out gl3.jsonl
 python bench_gl3.py --mode pers --cfgs "$(cat pers_best_cfgs.json)" --out pers.jsonl
+python bench_gl3.py --mode gl3 --tiles split --shapes gate_up --rows 128 --out split.jsonl
 python bench_gl3.py --mode torch --out torch.jsonl
 python stress_gemm.py gl3 gl3_best_cfgs.json 200
 ```
@@ -191,8 +192,183 @@ What this shows:
   hipBLASLt avoids the tail by using non-power-of-two macro tiles that tile N
   into one even round.
 
+## Non-power-of-two tiles (split tiles)
+
+`BLOCK_M` and `BLOCK_N` of the 3-stage and persistent kernels may now be the
+sum of two powers of two, such as 160 = 128 + 32 or 192 = 128 + 64. Each part
+gets its own LDS ring, and the tile runs as up to four MFMA chains (row part x
+column part), one accumulator each. This gives hipBLASLt-like tiles: gate_up
+M=64 with 64x160 is 218 programs instead of 136 or 272. `--tiles split` sweeps
+these tiles; it keeps grids that fill at least 70% of their last round.
+
+Best of the power-of-two and split configs per (shape, M), µs per call, median
+of 3 passes, all methods in one session. "old best" is the faster of gl3 and
+the persistent kernel before this change. aiter is aiter's Triton a16w16 GEMM,
+measured in an earlier session. The best configs are in `gl3_best_cfgs.json`
+and `pers_best_cfgs.json`.
+
+| shape | M | tuned | torch | aiter | old best | new best | new config |
+|---|---|---|---|---|---|---|---|
+| qkv | 64 | 32.6 | 32.9 | 32.1 | 34.0 | 33.9 | gl3 64x64 |
+| qkv | 128 | 41.5 | 46.1 | 54.6 | 43.5 | 43.5 | gl3 |
+| qkv | 192 | 50.1 | 48.8 | 76.4 | 51.8 | 52.0 | gl3 |
+| qkv | 256 | 52.4 | 63.4 | 72.1 | 57.6 | 57.6 | gl3 |
+| qkv | 384 | 68.9 | 77.3 | 102.4 | 72.4 | 66.8 | gl3 192x128 |
+| qkv | 512 | 75.3 | 84.9 | 132.2 | 79.2 | 76.9 | gl3 192x192 |
+| o | 64 | 20.0 | 20.2 | 18.9 | 19.8 | 19.6 | gl3 |
+| o | 128 | 24.1 | 24.8 | 29.7 | 25.8 | 24.6 | gl3 |
+| o | 192 | 28.1 | 30.9 | 41.5 | 30.2 | 28.8 | gl3 96x96, split-K 2 |
+| o | 256 | 30.8 | 35.9 | 39.0 | 37.2 | 32.5 | gl3 64x80 |
+| o | 384 | 36.6 | 52.3 | 41.4 | 38.7 | 38.7 | gl3 |
+| o | 512 | 43.3 | 49.4 | 72.2 | 53.7 | 50.3 | gl3 192x128, split-K 2 |
+| gdn_in | 64 | 38.5 | 38.4 | 55.2 | 40.8 | 39.5 | gl3 |
+| gdn_in | 128 | 44.2 | 52.9 | 80.3 | 49.5 | 49.8 | persistent |
+| gdn_in | 192 | 57.3 | 61.8 | 108.1 | 67.3 | 58.9 | gl3 96x160 |
+| gdn_in | 256 | 63.9 | 68.0 | 110.9 | 70.5 | 63.4 | gl3 128x160 |
+| gdn_in | 384 | 75.0 | 91.6 | 144.9 | 81.3 | 77.3 | gl3 192x160 |
+| gdn_in | 512 | 86.0 | 86.4 | 178.7 | 97.2 | 97.4 | persistent 192x192 |
+| gate_up | 64 | 65.0 | 67.1 | 88.7 | 72.7 | 71.4 | gl3 64x160 |
+| gate_up | 128 | 75.0 | 81.7 | 132.0 | 93.6 | 84.1 | gl3 128x160 |
+| gate_up | 192 | 90.4 | 108.2 | 187.1 | 116.8 | 96.2 | gl3 192x160 |
+| gate_up | 256 | 108.1 | 105.9 | 176.7 | 121.8 | 122.0 | persistent |
+| gate_up | 384 | 127.5 | 129.9 | 240.8 | 164.3 | 153.1 | persistent 192x192 |
+| gate_up | 512 | 154.0 | 171.3 | 299.3 | 194.1 | 195.1 | persistent |
+| down | 64 | 38.6 | 40.8 | 49.0 | 47.0 | 40.6 | gl3 64x80, split-K 4 |
+| down | 128 | 50.1 | 48.3 | 78.7 | 63.3 | 56.5 | gl3 128x96, split-K 4 |
+| down | 192 | 53.8 | 65.0 | 105.2 | 70.3 | 65.3 | gl3 |
+| down | 256 | 62.5 | 70.0 | 104.5 | 83.7 | 72.2 | gl3 |
+| down | 384 | 79.0 | 82.4 | 109.8 | 93.7 | 92.0 | gl3 |
+| down | 512 | 97.2 | 97.1 | 193.5 | 119.2 | 112.9 | gl3 |
+
+Summed over one verify step (weights as above), µs:
+
+| M | tuned | torch | aiter | old best | new best | new vs tuned | new vs old |
+|---|---|---|---|---|---|---|---|
+| 64 | 10279 | 10569 | 13184 | 11428 | 10858 | +5.6% | -5.0% |
+| 128 | 12325 | 13184 | 20112 | 14765 | 13659 | +10.8% | -7.5% |
+| 192 | 14577 | 16811 | 27771 | 17967 | 15836 | +8.6% | -11.9% |
+| 256 | 16791 | 17835 | 26964 | 19839 | 18468 | +10.0% | -6.9% |
+| 384 | 20262 | 22570 | 33680 | 24053 | 22938 | +13.2% | -4.6% |
+| 512 | 24182 | 25844 | 46854 | 29415 | 28832 | +19.2% | -2.0% |
+
+- Split tiles close most of the gap where the power-of-two grid was short:
+  gate_up M=128/192 (10-18% faster), gdn_in M=192/256 (10-13%), down M=64
+  (14%) and qkv M=384, which now beats tuned.
+- Power-of-two configs run within -0.6% to +0.4% of their earlier times, so
+  the split support costs nothing when unused.
+- The remaining gap is at M >= 256 on gate_up, gdn_in and down, where the
+  best Gluon tile still needs a second partial round or split-K.
+
+## Stream-K register spills
+
+With large tiles (128x256, 256x128) the Stream-K kernel spilled to scratch,
+up to 1156 bytes per lane without `pin_acc` and 52-232 bytes with it. Some
+configs ran 5-9x slower than with `pin_acc` (gate_up M=256: 1395 µs).
+
+Cause, from the ISA: the shared-tile reduction ran inside the main loop. At
+the end of a partial segment, the program bumped the tile's counter and, if it
+arrived last, loaded and summed the FP32 partials into a second
+`BLOCK_M x BLOCK_N` tile. That tile was live at the same time as the
+accumulator and the operand registers of the next tile's pipeline, so the
+register allocator spilled values used inside the MFMA loop.
+
+Fix: no reduction inside the loop.
+
+- The first segment still arrives in the loop, right after storing its
+  partial. The program before it usually finishes that tile last; in the
+  rare case this program arrives last, it marks the counter with
+  `-(pid + 1)` and reduces the tile after the loop.
+- The last segment arrives after the loop, once the accumulator and operand
+  registers are dead.
+
+ISA of the `sk_best_cfgs.json` kernels, scratch bytes per lane and
+VGPR/AGPR count:
+
+| config (shape, M) | before, `pin_acc` | after, `pin_acc` | before | after |
+|---|---|---|---|---|
+| 128x256 w1x4 (qkv 384) | 68, 512/256 | 0, 437/189 | 1112 | 240 |
+| 256x128 w2x2 (qkv 512) | 84, 512/256 | 0, 445/197 | 1156 | 276 |
+| 256x128 w4x1 (gate_up, down 256) | 68, 512/256 | 0, 437/193 | 1128 | 292 |
+| 256x128 w4x2 (gate_up 192/384/512) | 232, 256/4 | 0, 252/4 | 280 | 0 |
+| 128x256 w2x2 (down 384/512) | 52, 512/256 | 0, 433/185 | 1096 | 236 |
+| 128x128 w2x2 (gdn_in 256, gate_up 128) | 0 | 0 | 288-300 | 0 |
+
+Every other config had no scratch before and has none after. Without
+`pin_acc`, the remaining scratch of the 128x256 and 256x128 kernels holds
+loop-invariant values: they are stored before the loop and reloaded only in
+the segment-end paths, not in the MFMA loop. With `pin_acc` and a ragged N
+(masked weight loads), 256x128 w4x2 still keeps 12 bytes of such spills.
+
+Stream-K µs per call with the same configs, median of 3 passes:
+
+| shape | M | before | after | before, `pin_acc` | after, `pin_acc` |
+|---|---|---|---|---|---|
+| qkv | 384 | 901.3 | 116.2 | 100.3 | 99.3 |
+| qkv | 512 | 1173.7 | 129.0 | 119.6 | 116.5 |
+| gate_up | 128 | 106.5 | 99.6 | 98.1 | 98.8 |
+| gate_up | 192 | 136.4 | 126.4 | 360.0 | 169.3 |
+| gate_up | 256 | 1395.4 | 161.3 | 144.6 | 143.4 |
+| gate_up | 384 | 238.1 | 226.5 | 677.8 | 306.2 |
+| gate_up | 512 | 250.8 | 239.1 | 708.3 | 311.2 |
+| gdn_in | 256 | 82.2 | 77.6 | 75.6 | 77.0 |
+| down | 256 | 742.1 | 116.7 | 102.1 | 101.2 |
+| down | 384 | 1051.4 | 174.9 | 150.8 | 149.9 |
+| down | 512 | 1356.2 | 207.8 | 183.7 | 181.9 |
+
+The other 19 (shape, M) points change by -6% to +2%, with and without
+`pin_acc`. Moving both arrivals after the loop also removed
+the spills, but it made small configs 3-8% slower: a program then reduces its
+first tile at the end of its range instead of leaving that to the program
+before it. Stream-K remains slower than gl3 and the persistent kernel at
+every point.
+
+## aiter's BF16 GEMM solutions
+
+aiter's `tuned_gemm` picks a BF16 a16w16 GEMM per shape from tuned CSVs.
+Its solutions are torch (hipBLASLt), hipBLASLt by solution index, skinny
+(small-M HIP kernels), asm, Triton, FlyDSL and opus. None is CK.
+
+- Lookup key: (arch, CU count, padded M, N, K, dtypes, bias, ...). With no
+  tuned row, a preshuffled weight goes to asm, a skinny shape to the skinny
+  kernels, and anything else to torch.
+- aiter's tuned CSV for Qwen3.8-27B (`qwen3_8_27b_bf16_tuned_gemm.csv`) has
+  rows only for M = 16, 32, 48, 64 and 1024-8192. At M=64 it picks torch for
+  qkv, gdn_in, gate_up and down and Triton for o. M = 128-512 falls back to
+  torch.
+- FlyDSL's a16w16 kernel is a pipelined MFMA GEMM with BM/BN tiles that need
+  not be powers of two (BM 48/80/96, BN 80/96), 2-9 stages, split-K, and a
+  tuner that prunes configs by tile-quantization efficiency and occupancy.
+  Its decode variant streams weights with non-temporal loads and staggers K
+  starts across workgroups; it is tuned only for two other models' shapes at
+  M <= 128.
+
+FlyDSL a16w16 measured with this README's timing (cold weights, HIP-graph
+replay), best of up to 200 configs per point from its tuner space (`k_waves`
+1, no `group_m`, at most 5 stages, 160-1024 programs), µs per call:
+
+| shape | M=64 | 128 | 192 | 256 | 384 | 512 |
+|---|---|---|---|---|---|---|
+| qkv | 32.0 | 38.9 | 55.3 | 56.9 | 75.7 | 83.7 |
+| o | 15.5 | 21.0 | 25.4 | 28.7 | 37.1 | 45.1 |
+| gdn_in | 38.1 | 53.9 | 70.2 | 77.8 | 94.4 | 135.0 |
+| gate_up | 77.0 | 100.3 | 131.3 | 154.7 | 198.0 | 212.5 |
+| down | 36.8 | 48.8 | 67.6 | 78.2 | 86.8 | 121.1 |
+
+- FlyDSL beats tuned hipBLASLt on o at M = 64-256 (o M=64: 15.5 vs 20.0 µs,
+  split-K 6 on 64x128 tiles), on qkv and down at M = 64 and 128, and on
+  gdn_in at M=64. Elsewhere it is slower, and at M >= 192 on gate_up and
+  gdn_in it is 9-39% slower than the best Gluon kernel.
+- Summed over a verify step it is 3% (M=64) to 33% (M=512) slower than
+  tuned. The faster of Gluon and FlyDSL per shape is 0.2% faster than tuned
+  at M=64 and 4-18% slower at M = 128-512.
+- What Gluon can borrow: deeper split-K on o at small M (FlyDSL's o wins use
+  split-K 3-6 with 128-wide N tiles; gl3's best o configs use split-K 1-3),
+  and its tuner's pruning of configs by tile-quantization efficiency.
+
 ## Next step
 
-Non-power-of-two `BLOCK_N` (such as 80, 160, 192) for the dense 3-stage kernel,
-so the grid is one even round without a tail. This needs MFMA layouts and
-loads that handle an N tile that is not a power of two.
+- Close the M >= 256 gap on gate_up, gdn_in and down: wider split tiles with
+  `BLOCK_K` 128, or split tiles in a split-K tail of the persistent kernel.
+- Sweep gl3 split-K 4-6 on o at M <= 256, where FlyDSL is 12-21% faster.
+- Try FlyDSL's decode tricks (non-temporal weight loads, staggered K starts)
+  in gl3.
