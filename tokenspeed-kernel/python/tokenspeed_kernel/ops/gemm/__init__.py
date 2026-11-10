@@ -339,7 +339,9 @@ def _online_quantize_mxfp8(
         group_size=block_size[1],
         scale_encoding=scale_encoding,
         enable_pdl=False if gfx1250_gluon else enable_pdl,
-        solution=None if gfx1250_gluon else "triton",
+        solution=(
+            None if gfx1250_gluon or scale_encoding == "packed_ue8m0" else "triton"
+        ),
     )
 
 

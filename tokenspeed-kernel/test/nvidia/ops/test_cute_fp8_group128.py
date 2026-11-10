@@ -130,28 +130,6 @@ def test_leading_dimensions_and_empty(shape):
         assert s.shape == (0, 5)
 
 
-@pytest.mark.parametrize(
-    "dtype,encoding,expected",
-    [
-        (torch.bfloat16, "packed_ue8m0", "cute_dsl_quantize_fp8_group128_packed"),
-        (torch.float16, "packed_ue8m0", "triton_quantize_fp8_group128_packed"),
-        (torch.bfloat16, "float32", "triton_quantize_fp8_group128"),
-    ],
-)
-def test_default_quantizer_selection(dtype, encoding, expected):
-    from tokenspeed_kernel.ops.quantization import _select_fp8_dynamic
-
-    selected = _select_fp8_dynamic(
-        dtype,
-        128,
-        "token_group_128",
-        encoding,
-        solution=None,
-        override=None,
-    )
-    assert selected.name == expected
-
-
 def test_unaligned_contiguous_slice():
     storage = torch.randn(4 * 2560 + 1, device="cuda", dtype=torch.bfloat16)
     x = storage[1:].view(4, 2560)

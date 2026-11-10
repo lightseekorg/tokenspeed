@@ -77,10 +77,9 @@ def quant(x, pdl):
         (16384, 1536),
     ],
 )
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_packed_codes_scales_and_padding(m, k, dtype):
+def test_packed_codes_scales_and_padding(m, k):
     torch.manual_seed(42)
-    x = torch.randn(m, k, device="cuda", dtype=dtype) * 0.1
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) * 0.1
     x[:, :128] = 0
     if k >= 384:
         x[:, 128:256] = 0.4375  # Exact power-of-two scale, no log2 bump.
@@ -180,16 +179,3 @@ def test_registered_deepgemm_values_out_graph(m, n, k, pdl):
     finally:
         pdl_enabled(previous)
         torch.backends.cuda.matmul.allow_tf32 = previous_tf32
-
-
-def test_packed_rows_reuse_compilation():
-    from tokenspeed_kernel.ops.quantization.triton import (
-        _fp8_group128_quantize_packed_kernel,
-    )
-    from utils import assert_no_triton_compile
-
-    for m in [1, 8, 129]:
-        quant(torch.zeros(m, 640, device="cuda", dtype=torch.bfloat16), False)
-    with assert_no_triton_compile(_fp8_group128_quantize_packed_kernel):
-        for m in [2, 3, 4, 9, 16, 31, 32, 64, 128, 130, 256]:
-            quant(torch.zeros(m, 640, device="cuda", dtype=torch.bfloat16), False)

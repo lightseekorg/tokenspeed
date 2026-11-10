@@ -96,9 +96,8 @@ PDL and CUDA Graph replay use the same implementation.
 ### CuTe DSL implementation
 
 The BF16/group128/packed-UE8M0 path selects CuTe DSL by default on
-SM100/SM103. FP16 and ordinary FP32-scale quantization keep their existing
-implementations. An individual call can select the previous packed quantizer
-with `override="triton_quantize_fp8_group128_packed"`.
+SM100/SM103. Ordinary FP32-scale quantization uses the existing registered
+quantizers.
 Eight lanes quantize each group of 128, using packed BF16 arithmetic and
 FP8x2 conversion. The scale recipe floors absmax at FP32 `1e-10`, multiplies
 by FP32 `1/448`, and rounds the exponent upward, matching SGLang's BF16
