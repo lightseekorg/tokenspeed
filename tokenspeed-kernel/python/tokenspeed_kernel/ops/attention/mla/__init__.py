@@ -35,6 +35,7 @@ from tokenspeed_kernel.selection import (
 )
 from tokenspeed_kernel.signature import (
     MXFP8_BLOCK_SCALE,
+    ScaleFormat,
     dense_tensor_format,
     format_signature,
     tensor_format,
@@ -1404,11 +1405,103 @@ def mla_decode_with_kvcache(
         return kernel(**kernel_kwargs)
 
 
+def mla_expand_kv_fp8(
+    latent: torch.Tensor,
+    latent_scales: torch.Tensor,
+    kv_b_weight: torch.Tensor,
+    kv_b_scales: torch.Tensor,
+    k_pe: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    solution: str | None = None,
+) -> None:
+    """Expand MLA latent rows into the FP8 per-head keys and values of mla_prefill.
+
+    The result equals projecting the latent through kv_b into BF16 and packing
+    that with mla_kv_pack_quantize_fp8: key = [k_nope, k_pe] and value, both
+    cast to E4M3.
+
+    Args:
+        latent: E4M3 latent rows [T, L] quantized per 128 columns.
+        latent_scales: FP32 latent scales [T, L/128].
+        kv_b_weight: E4M3 kv_b projection [H * (N + V), L]; per head, N key
+            rows followed by V value rows.
+        kv_b_scales: FP32 128x128 block scales [H * (N + V) / 128, L/128].
+        k_pe: Shared RoPE keys [T, R] or [T, 1, R].
+        key: E4M3 output [T, H, N + R].
+        value: E4M3 output [T, H, V].
+        solution: Restrict selection to one registered solution.
+    """
+    if latent_scales.dtype != torch.float32 or kv_b_scales.dtype != torch.float32:
+        raise ValueError("mla_expand_kv_fp8 requires FP32 block scales")
+    kernel = select_kernel(
+        "attention",
+        "mla_expand_kv",
+        _mla_expand_kv_signature(latent.dtype, kv_b_weight.dtype),
+        traits={
+            "nope_head_dim": key.shape[-1] - k_pe.shape[-1],
+            "value_head_dim": value.shape[-1],
+        },
+        solution=solution,
+    )
+    kernel(latent, latent_scales, kv_b_weight, kv_b_scales, k_pe, key, value)
+
+
+def supports_mla_expand_kv_fp8(
+    kv_b_weight: torch.Tensor,
+    kv_b_scales: torch.Tensor | None,
+    *,
+    nope_head_dim: int,
+    value_head_dim: int,
+) -> bool:
+    """Whether mla_expand_kv_fp8 has a kernel for this kv_b projection here.
+
+    Args:
+        kv_b_weight: The kv_b projection weight.
+        kv_b_scales: Its block scales, or None for an unquantized weight.
+        nope_head_dim: Key rows per head in kv_b (the non-RoPE key width).
+        value_head_dim: Value rows per head in kv_b.
+    Returns:
+        True when the weight is block-FP8 with FP32 128x128 scales and a
+        registered kernel matches the platform and head widths.
+    """
+    if (
+        kv_b_weight.dtype != torch.float8_e4m3fn
+        or kv_b_scales is None
+        or kv_b_scales.dtype != torch.float32
+        or kv_b_scales.shape
+        != (kv_b_weight.shape[0] // 128, kv_b_weight.shape[1] // 128)
+    ):
+        return False
+    try:
+        select_kernel(
+            "attention",
+            "mla_expand_kv",
+            _mla_expand_kv_signature(torch.float8_e4m3fn, kv_b_weight.dtype),
+            traits={"nope_head_dim": nope_head_dim, "value_head_dim": value_head_dim},
+        )
+    except NoKernelFoundError:
+        return False
+    return True
+
+
+def _mla_expand_kv_signature(latent_dtype: torch.dtype, weight_dtype: torch.dtype):
+    scale = ScaleFormat(
+        storage_dtype=torch.float32, granularity="block", block_shape=(128, 128)
+    )
+    return format_signature(
+        a=tensor_format("mxfp8", latent_dtype, scale=scale),
+        b=tensor_format("mxfp8", weight_dtype, scale=scale),
+    )
+
+
 # Backend registration (side-effect imports)
 # isort: off
 import tokenspeed_kernel.ops.attention.mla.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.mla.tokenspeed_mla  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.mla.triton  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.mla.trtllm  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.mla.gluon  # noqa: E402,F401
 
 if current_platform().is_npu:
@@ -1422,6 +1515,8 @@ __all__ = [
     "mla_project_value",
     "mla_normalize_project_query",
     "validate_mla_query_projection",
+    "mla_expand_kv_fp8",
+    "supports_mla_expand_kv_fp8",
     "mla_prefill",
     "mla_prefill_traits",
     "mla_use_absorbed_extend",

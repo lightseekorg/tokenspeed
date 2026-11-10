@@ -179,3 +179,72 @@ def triton_mla_kv_pack_quantize_fp8(
         **({"launch_pdl": True} if enable_pdl else {}),
     )
     return k_out, v_out
+
+
+@triton.jit(do_not_specialize=["rows"], do_not_specialize_on_alignment=["rows"])
+def _mla_rope_broadcast_rows(
+    k_rope,
+    key_rope,
+    rows,
+    kr_stride_t,
+    ko_stride_t,
+    ko_stride_h,
+    HEADS: tl.constexpr,
+    ROPE: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    t = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
+    first_head = tl.program_id(1) * BLOCK_H
+    r = tl.arange(0, ROPE)
+    mask = t[:, None] < rows
+    token = t.to(tl.int64)[:, None]
+    rope = tl.load(k_rope + token * kr_stride_t + r[None, :], mask).to(tl.float32)
+    out = key_rope + token * ko_stride_t + r[None, :]
+    for h in tl.static_range(BLOCK_H):
+        head = first_head + h
+        tl.store(out + head * ko_stride_h, rope, mask & (head < HEADS))
+
+
+def triton_mla_rope_broadcast_fp8(k_pe: torch.Tensor, key_rope: torch.Tensor) -> None:
+    """Write the shared RoPE key into every head of an FP8 key buffer.
+
+    Args:
+        k_pe: Floating RoPE keys [T,R] or [T,1,R] with unit inner stride.
+        key_rope: E4M3 or E5M2 destination [T,H,R] with unit inner stride, such
+            as the RoPE columns key[..., nope:] of a packed key buffer.
+
+    Values convert to FP32 and then to the destination type, as in
+    triton_mla_kv_pack_quantize_fp8.
+    """
+    if k_pe.ndim == 3:
+        if k_pe.shape[1] != 1:
+            raise ValueError("MLA RoPE keys must have one shared head")
+        k_pe = k_pe[:, 0]
+    tokens, heads, rope = key_rope.shape
+    if (
+        k_pe.shape != (tokens, rope)
+        or key_rope.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2)
+        or k_pe.stride(-1) != 1
+        or key_rope.stride(-1) != 1
+        or k_pe.device != key_rope.device
+    ):
+        raise ValueError("MLA RoPE broadcast shapes, dtypes or strides are invalid")
+    if tokens == 0:
+        return
+    block_t, block_h = 16, heads
+    _mla_rope_broadcast_rows[
+        (triton.cdiv(tokens, block_t), triton.cdiv(heads, block_h))
+    ](
+        k_pe,
+        key_rope,
+        tokens,
+        k_pe.stride(0),
+        key_rope.stride(0),
+        key_rope.stride(1),
+        HEADS=heads,
+        ROPE=rope,
+        BLOCK_T=block_t,
+        BLOCK_H=block_h,
+        num_warps=8,
+    )

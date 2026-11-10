@@ -1863,6 +1863,9 @@ class Sm100BlockwiseGemmKernel:
                     # Convert to C type
                     #
                     acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
+                    if cutlass.const_expr(self.c_dtype.width == 8):
+                        # FP8 output is the BF16 output cast to FP8, bit for bit.
+                        acc_vec = acc_vec.to(cutlass.BFloat16).to(self.acc_dtype)
                     acc_vec = epilogue_op(acc_vec.to(self.c_dtype))
                     tRS_rC.store(acc_vec)
 
@@ -2417,7 +2420,12 @@ class Sm100BlockwiseGemmKernel:
             is_valid = False
         if acc_dtype not in {cutlass.Float32}:
             is_valid = False
-        if c_dtype not in {cutlass.Float32, cutlass.Float16, cutlass.BFloat16}:
+        if c_dtype not in {
+            cutlass.Float32,
+            cutlass.Float16,
+            cutlass.BFloat16,
+            cutlass.Float8E4M3FN,
+        }:
             is_valid = False
         return is_valid
 
@@ -2663,6 +2671,76 @@ class Sm100BlockwiseGemmKernel:
             ),
         )
 
+        self(
+            a_tensor,
+            b_tensor,
+            c_tensor,
+            sfa_tensor,
+            sfb_tensor,
+            max_active_clusters,
+            stream,
+        )
+
+    @cute.jit
+    def wrapper_heads(
+        self,
+        m: cutlass.Int32,
+        heads: cutlass.Int32,
+        k: cutlass.Int32,
+        sf_m: cutlass.Int32,
+        sf_k: cutlass.Int32,
+        a_ptr: cute.Pointer,
+        b_ptr: cute.Pointer,
+        a_sf_ptr: cute.Pointer,
+        b_sf_ptr: cute.Pointer,
+        c_ptr: cute.Pointer,
+        b_head_rows: cutlass.Int32,
+        c_row_stride: cutlass.Int32,
+        c_head_stride: cutlass.Int32,
+        max_active_clusters: cutlass.Constexpr,
+        stream: cuda.CUstream,
+    ):
+        """Per-head GEMM: C[:, h, :128] = A @ B[h * b_head_rows : h * b_head_rows + 128].T.
+
+        Args:
+            m, k: Rows and reduction length of A ([m, k], k innermost).
+            heads: Number of 128-row weight groups, one per output head.
+            sf_m, sf_k: A scale extents (sf_m = m, sf_k = k / 128); A scales are MN-major.
+            a_ptr, a_sf_ptr: A and its FP32 1x128 scales.
+            b_ptr, b_sf_ptr: The first head's 128 rows of B and their FP32 128x128 scales;
+                B rows are k-contiguous and head h starts b_head_rows rows later.
+            c_ptr: C[0, 0, 0]; C[i, h, j] is at i * c_row_stride + h * c_head_stride + j.
+            b_head_rows: B rows between consecutive heads, a multiple of 128.
+            c_row_stride, c_head_stride: C strides in elements.
+            max_active_clusters: Maximum number of active clusters.
+            stream: CUDA stream for the operation.
+        """
+        a_tensor = cute.make_tensor(
+            a_ptr,
+            layout=cute.make_ordered_layout((m, k, 1), order=(1, 0, 2)),
+        )
+        b_tensor = cute.make_tensor(
+            b_ptr,
+            layout=cute.make_layout(
+                ((128, heads), k, 1), stride=((k, b_head_rows * k), 1, 0)
+            ),
+        )
+        sfa_tensor = cute.make_tensor(
+            a_sf_ptr,
+            layout=cute.make_ordered_layout((sf_m, sf_k, 1), order=(0, 1, 2)),
+        )
+        sfb_tensor = cute.make_tensor(
+            b_sf_ptr,
+            layout=cute.make_layout(
+                (heads, sf_k, 1), stride=((b_head_rows // 128) * sf_k, 1, 0)
+            ),
+        )
+        c_tensor = cute.make_tensor(
+            c_ptr,
+            layout=cute.make_layout(
+                (m, (128, heads), 1), stride=(c_row_stride, (1, c_head_stride), 0)
+            ),
+        )
         self(
             a_tensor,
             b_tensor,

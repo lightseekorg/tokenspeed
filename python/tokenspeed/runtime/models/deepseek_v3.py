@@ -35,8 +35,10 @@ import torch.nn.functional as F
 from compressed_tensors.quantization import QuantizationStrategy
 from tokenspeed_kernel.ops.attention import attn_merge_state
 from tokenspeed_kernel.ops.attention.mla import (
+    mla_expand_kv_fp8,
     mla_project_value,
     mla_project_value_prefers_contiguous_weight,
+    supports_mla_expand_kv_fp8,
 )
 from tokenspeed_kernel.ops.attention.mla.tokenspeed_mla import mla_kv_pack_quantize_fp8
 from tokenspeed_kernel.ops.attention.prologue import MLAExpandedKV, MLAPrologueOutput
@@ -47,6 +49,7 @@ from tokenspeed_kernel.ops.gemm._cute_dsl.nvfp4_gemm_swiglu import (
 from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
 from tokenspeed_kernel.ops.gemm.trtllm import dsv3_fused_a_gemm
 from tokenspeed_kernel.ops.moe.cuda import moe_finalize_fuse_shared
+from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
 from tokenspeed_kernel.ops.tuning import autotune_max_rows, is_autotuning
 from tokenspeed_kernel.platform import current_platform
@@ -95,6 +98,7 @@ from tokenspeed.runtime.execution.forward_step import (
 )
 from tokenspeed.runtime.layers.activation import SiluAndMul
 from tokenspeed.runtime.layers.attention.chunk import get_max_chunk_capacity
+from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
 from tokenspeed.runtime.layers.dense.nvfp4 import Nvfp4LinearMethod
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
 from tokenspeed.runtime.layers.linear import (
@@ -749,6 +753,19 @@ class DeepseekV3AttentionMLA(nn.Module):
             tp_rank=self.head_tp_rank,
             tp_size=self.head_tp_size,
             tp_group=self.head_tp_group,
+        )
+        kv_b_method = self.kv_b_proj.quant_method
+        # FP8 prefix attention projects history straight into its key/value
+        # buffers where a kernel supports this kv_b format.
+        self.expand_prefix_kv_fp8 = supports_mla_expand_kv_fp8(
+            self.kv_b_proj.weight,
+            (
+                self.kv_b_proj.weight_scale_inv
+                if isinstance(kv_b_method, Fp8LinearMethod) and kv_b_method.block_quant
+                else None
+            ),
+            nope_head_dim=self.qk_nope_head_dim,
+            value_head_dim=self.v_head_dim,
         )
         self.o_proj = self._make_output_projection(
             quant_config=quant_config,
@@ -1609,6 +1626,33 @@ class DeepseekV3AttentionMLA(nn.Module):
         with tuning:
             return self.kv_b_proj(latent)[0]
 
+    def _expand_prefix_kv_fp8(
+        self, latent: torch.Tensor, k_pe: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """FP8 keys [T, H, nope + rope] and values [T, H, v] of history rows: the
+        bytes kv_b_proj followed by mla_kv_pack_quantize_fp8 produces."""
+        latent, latent_scales = quantize_fp8(
+            latent.view(-1, self.kv_lora_rank),
+            granularity="token_group",
+            group_size=128,
+            scale_encoding="float32",
+        )
+        rows = latent.shape[0]
+        key = latent.new_empty(
+            (rows, self.num_local_heads, self.qk_nope_head_dim + self.qk_rope_head_dim)
+        )
+        value = latent.new_empty((rows, self.num_local_heads, self.v_head_dim))
+        mla_expand_kv_fp8(
+            latent,
+            latent_scales,
+            self.kv_b_proj.weight,
+            self.kv_b_proj.weight_scale_inv,
+            k_pe,
+            key,
+            value,
+        )
+        return key, value
+
     def forward_normal_chunked_kv_prepare(
         self,
         positions: torch.Tensor,
@@ -1692,23 +1736,30 @@ class DeepseekV3AttentionMLA(nn.Module):
             chunk_meta.chunk_kv_indices_list,
             dst_dtype=read_dtype,
         )
+        expand_fp8 = q.dtype == torch.float8_e4m3fn and self.expand_prefix_kv_fp8
+        if expand_fp8 and is_autotuning():
+            # Tuning forwards carry no history: compile the expansion before serving.
+            self._expand_prefix_kv_fp8(
+                q.new_zeros((1, self.kv_lora_rank), dtype=torch.bfloat16),
+                q.new_zeros((1, self.qk_rope_head_dim), dtype=torch.bfloat16),
+            )
         for loop_idx, (kv_a_normed, k_pe) in enumerate(history):
             kv_a_normed = kv_a_normed.squeeze(1)
-            kv = self._project_expanded_kv(kv_a_normed)
-            kv = kv.view(
-                -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
-            )
-            v = kv[..., self.qk_nope_head_dim :]
-            k_nope = kv[..., : self.qk_nope_head_dim]
-
-            if q.dtype == torch.float8_e4m3fn:
-                # FP8 Attention
-                k, v = mla_kv_pack_quantize_fp8(k_nope, k_pe, v)
+            if expand_fp8:
+                k, v = self._expand_prefix_kv_fp8(kv_a_normed, k_pe)
             else:
-                # BF16 Attention
-                k = torch.cat(
-                    [k_nope, k_pe.expand(-1, self.num_local_heads, -1)], dim=-1
+                kv = self._project_expanded_kv(kv_a_normed)
+                kv = kv.view(
+                    -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
                 )
+                v = kv[..., self.qk_nope_head_dim :]
+                k_nope = kv[..., : self.qk_nope_head_dim]
+                if q.dtype == torch.float8_e4m3fn:
+                    k, v = mla_kv_pack_quantize_fp8(k_nope, k_pe, v)
+                else:
+                    k = torch.cat(
+                        [k_nope, k_pe.expand(-1, self.num_local_heads, -1)], dim=-1
+                    )
 
             chunk_output, lse = attn_backend.forward_extend_chunked(
                 q,
