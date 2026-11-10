@@ -37,22 +37,23 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
     run_eager,
 )
 from tokenspeed.runtime.execution.context import ForwardContext
-from tokenspeed.runtime.execution.drafter.base import BaseDrafter
+from tokenspeed.runtime.execution.drafter.base import (
+    DsaTopKState,
+    HiddenDraftInput,
+    HiddenStateDrafter,
+)
 from tokenspeed.runtime.execution.drafter.tree import DraftTree
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
-from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
     TreeDraftInputs,
 )
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.common import maybe_inference_mode
 from tokenspeed.runtime.utils.nvtx import nvtx_range
-
-DsaTopKState = tuple[Any | None, Any | None]
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.drafter.base import DrafterExtendCapture
@@ -102,21 +103,7 @@ class AcceptedPrefixPublisher:
         self.attn_backend.advance_draft_forward_metadata(self.frontier)
 
 
-@dataclass
-class EagleDraftInput:
-    input_num_tokens: int
-    num_extends: int
-    forward_mode: ForwardMode
-    base_model_output: torch.Tensor  # [bs]
-    accept_lengths: torch.Tensor  # [bs]
-    base_out_hidden_states: torch.Tensor
-    global_num_tokens: list[int] | None = None
-    global_bs: list[int] | None = None
-    all_decode_or_idle: bool = False
-    dsa_topk: DsaTopKState = (None, None)
-    # The target forward's query shard: the draft's extend rows (step 0) are
-    # the same shard of the same span, its decode steps run every row.
-    query_shard: QueryShardPlan | None = None
+EagleDraftInput = HiddenDraftInput
 
 
 @dataclass
@@ -166,15 +153,12 @@ class _ExtendRoute(NamedTuple):
     decode_steps: bool
 
 
-class Eagle(BaseDrafter):
+class Eagle(HiddenStateDrafter):
     """
     Draft model runner that implements the Eagle/Eagle3 algorithm.
     """
 
-    shares_target_embed_head = True
-    supports_pd_layerwise_finalization = True
     supports_request_token_history = True
-    supports_speculative_sampling = True
 
     def __init__(
         self,
@@ -199,7 +183,6 @@ class Eagle(BaseDrafter):
             vocab_size=vocab_size,
         )
 
-        self.device = draft_model_runner.device
         hot_token_ids = draft_model_runner.model.get_hot_token_id()
 
         if hot_token_ids is not None:
@@ -210,10 +193,6 @@ class Eagle(BaseDrafter):
         # For constructing fallback global_num_tokens during CUDA graph capture.
         self.dp_size = draft_model_runner.mapping.attn.dp_size
         self.world_size = draft_model_runner.mapping.world_size
-
-        # Drafter-owned alias source for the draft attn backend; advanced in
-        # place during multi-step decode.
-        self.draft_seq_lens_buf = torch.zeros_like(self.input_buffers.seq_lens_buf)
 
         # Draft-side request-token history (e.g. a draft with its own n-gram
         # over-embedding). The drafter owns the per-slot write frontier: it
@@ -251,16 +230,6 @@ class Eagle(BaseDrafter):
         self._tree_seed_lane_mask: torch.Tensor | None = None
         # Width of the full draft vocabulary the tree ranks (bind_tree).
         self.tree_vocab_size: int | None = None
-
-        # Precomputed `arange(max_bs) * spec_num_tokens - 1`
-        # gather_ids = gather_ids_offsets + accept_lengths
-        self.padded_gather_ids_offsets_buf = (
-            torch.arange(
-                self.input_buffers.max_bs, dtype=torch.int64, device=self.device
-            )
-            * spec_num_tokens
-            - 1
-        )
 
         # Extend-round graphs (capture_extend_graphs): step 0 per (token
         # bucket, requests), the decode steps per request count, sharing one
@@ -1331,30 +1300,3 @@ class Eagle(BaseDrafter):
         graph = self._decode_steps_graphs[bs]
         with active_forward(graph.ctx):
             graph.capture.replay()
-
-    @override
-    @nvtx_range("drafter", color="purple")
-    def run(
-        self,
-        base_ctx: ForwardContext,
-        logits_output: LogitsProcessorOutput,
-        output_tokens: torch.Tensor,
-        accept_lengths: torch.Tensor,
-    ) -> torch.Tensor:
-
-        draft_input = EagleDraftInput(
-            input_num_tokens=base_ctx.input_num_tokens,
-            num_extends=base_ctx.num_extends,
-            forward_mode=base_ctx.forward_mode,
-            base_model_output=output_tokens,
-            accept_lengths=accept_lengths,
-            base_out_hidden_states=logits_output.hidden_states,
-            global_num_tokens=base_ctx.global_num_tokens,
-            global_bs=base_ctx.global_bs,
-            all_decode_or_idle=base_ctx.all_decode_or_idle,
-            dsa_topk=self._target_dsa_topk(base_ctx),
-            query_shard=base_ctx.query_shard,
-        )
-
-        # next_tokens layout: column 0 = last verified id, columns 1.. = drafter tokens.
-        return self.draft(draft_input)
