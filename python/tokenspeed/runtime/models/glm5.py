@@ -1219,7 +1219,8 @@ class GlmDsaSparseAttentionMixin:
                 from a launch that also wrote the round's index keys
                 (``index_k_layernorm_fp8_scatter``'s bytes); the core then skips
                 its index-K write. Every row must decode, without KV
-                placement, under ``index_k_write_quantizes_query``. None writes
+                placement, under ``index_k_write_quantizes_query``, and the
+                keys must be the caller's ``index_key_weights``. None writes
                 the keys here.
 
         Returns:
@@ -1229,11 +1230,14 @@ class GlmDsaSparseAttentionMixin:
         if output_gate is not None and ctx.num_extends > 0:
             raise ValueError("the DSA value projection gates decode rounds only")
         if written_index_query is not None and (
-            ctx.num_extends > 0 or not self.index_k_write_quantizes_query
+            ctx.num_extends > 0
+            or not self.index_k_write_quantizes_query
+            or index_key_weights is None
         ):
             raise ValueError(
                 "a written index query serves decode rounds whose index-K write "
-                "quantizes the query (index_k_write_quantizes_query)"
+                "quantizes the query (index_k_write_quantizes_query) over the "
+                "keys the caller projected (index_key_weights)"
             )
         decode_metadata = getattr(ctx.attn_backend, "forward_decode_metadata", None)
         num_attn_tokens = int(q_norm.shape[0])

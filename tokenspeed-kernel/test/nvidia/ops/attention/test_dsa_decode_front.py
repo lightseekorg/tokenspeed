@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from utils import assert_no_cute_compile, is_nvidia
+from utils import assert_no_cute_compile, is_nvidia, move_pages_past_int32
 
 if not is_nvidia():
     pytest.skip("requires an NVIDIA GPU", allow_module_level=True)
@@ -220,6 +220,25 @@ def test_the_front_matches_the_launches_it_replaces(rows, positive) -> None:
 def test_the_front_takes_either_slot_and_key_norm_dtype(slot_dtype, norm_dtype) -> None:
     case = _case(13, seed=7, slot_dtype=slot_dtype, norm_dtype=norm_dtype)
     _check(case, positive=False)
+
+
+@pytest.mark.parametrize("slot_dtype", [torch.int32, torch.int64])
+def test_far_pages_past_int32_offsets(slot_dtype) -> None:
+    """Slots in pages past 2**31 bytes of the plane write as near slots do."""
+    near = _case(8, seed=19, slot_dtype=slot_dtype, norm_dtype=torch.float32)
+    far = _case(8, seed=19, slot_dtype=slot_dtype, norm_dtype=torch.float32)
+    page_bytes = PAGE * (DIM + 4)
+    (pool,), first = move_pages_past_int32(
+        (far["plane"].view(PAGES, page_bytes),), torch.zeros(1, dtype=torch.int64)
+    )
+    first = int(first)
+    assert first * page_bytes > 2**31
+    far["plane"] = pool.view(-1, DIM + 4)
+    far["slots"] = far["slots"] + first * PAGE
+    for got, want in zip(_front(far), _front(near)):
+        assert torch.equal(got.view(torch.uint8), want.view(torch.uint8))
+    assert torch.equal(pool[first:].view(-1, DIM + 4), near["plane"])
+    assert torch.equal(_bits(far["kv_a"]), _bits(near["kv_a"]))
 
 
 def test_the_front_replays_in_a_cuda_graph_without_tracing() -> None:

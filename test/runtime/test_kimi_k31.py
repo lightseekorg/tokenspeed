@@ -2747,15 +2747,18 @@ def test_only_a_decode_chain_round_takes_the_decode_front(monkeypatch, case) -> 
 
 
 @pytest.mark.parametrize(
-    "num_extends, quantizes", [(1, True), (0, False)], ids=["extend", "separate"]
+    "num_extends, quantizes, caller_keys",
+    [(1, True, True), (0, False, True), (0, True, False)],
+    ids=["extend", "separate", "indexer_keys"],
 )
 def test_dsa_core_refuses_a_written_index_query_it_cannot_take(
-    num_extends, quantizes
+    num_extends, quantizes, caller_keys
 ) -> None:
     """A written index query is refused outside the rounds it serves.
 
     It serves decode rounds of a layer whose index-K write quantizes the
-    query; anything else fails before touching the cache.
+    query, over keys the caller projected (the writing launch scattered
+    them); anything else fails before touching the cache.
     """
     from tokenspeed.runtime.models.glm5 import GlmDsaSparseAttentionMixin
 
@@ -2770,6 +2773,7 @@ def test_dsa_core_refuses_a_written_index_query_it_cannot_take(
             rows,
             SimpleNamespace(num_extends=num_extends),
             None,
+            index_key_weights=rows if caller_keys else None,
             written_index_query=(rows, rows),
         )
 
