@@ -67,8 +67,10 @@ struct CacheProgress {
     std::vector<CacheBlockRef> state_checkpoint_blocks;
     // The blocks of the checkpoint the latest publication point published,
     // held until the next one so the publication's spans stay valid; the
-    // index keeps them cached. A retraction drops them once its publication
-    // is applied (a Retracted request holds no Device block).
+    // index keeps them cached, unless another request published the
+    // checkpoint first and these are the request's private copies. A
+    // retraction drops them once its publication is applied (a Retracted
+    // request holds no Device block).
     std::vector<CacheBlockRef> published_state_checkpoint_blocks;
     // The boundary of the in-forward State checkpoint the request published
     // -- from its block, or from the live slot of a chunk that ended there --
@@ -90,6 +92,12 @@ struct CacheProgress {
     // the finish (Scheduler::demoteSupersededCheckpoint). Neither reads it on
     // the D role, the only one whose first admission is a remote landing.
     std::int32_t resume_tokens{0};
+    // Whether the first decode published the prompt end and rotated the
+    // State slots (PublicationPoint::kOwnerContinues). Until a forward past
+    // the prompt end lands, the state there sits in slot 0, and slot 1 is a
+    // block no forward wrote: a finish at the prompt end, whose first decode
+    // ran as a padding row, publishes slot 0 (CompletedPages::state_slot).
+    bool prompt_end_rotated{false};
 };
 
 inline std::vector<std::int32_t> ComputeShiftedInputIds(const TokenContainer* token_container,
@@ -136,6 +144,8 @@ struct Submitted {
     TokenContainer* TokenContainerPtr() const { return admission.token_container; }
     std::int32_t PrefixGranularity() const { return admission.prefix_granularity; }
 
+    // Successful later first admissions while this is the oldest waiting prompt.
+    std::int32_t prefill_bypasses{0};
     AdmissionResources admission;
 };
 

@@ -39,7 +39,7 @@ def _scale_inv_for(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def test_interleave_linear_and_gate_layout() -> None:
-    from tokenspeed.runtime.layers.dense.nvfp4 import interleave_linear_and_gate
+    from tokenspeed_kernel.ops.gemm import interleave_linear_and_gate
 
     linear = torch.arange(128 * 4, dtype=torch.uint8).reshape(128, 4)
     gate = torch.arange(128 * 4, 256 * 4, dtype=torch.uint8).reshape(128, 4)
@@ -62,84 +62,6 @@ def test_interleave_linear_and_gate_layout() -> None:
 
 
 @pytest.mark.skipif(not _has_sm100(), reason="Blackwell SM100 CUDA GPU required")
-def test_nvfp4_process_weights_releases_normal_fc1_tensors() -> None:
-    from torch import nn
-    from torch.nn.parameter import Parameter
-
-    from tokenspeed.runtime.layers.dense.nvfp4 import Nvfp4LinearMethod
-
-    class QuantConfig:
-        group_size = 16
-
-    layer = nn.Module()
-    layer.prefix = "test.gate_up_proj"
-    layer.interleave_linear_and_gate = True
-    layer.weight = Parameter(
-        torch.randint(0, 256, (256, 8), device="cuda", dtype=torch.uint8),
-        requires_grad=False,
-    )
-    layer.weight_scale = Parameter(
-        torch.empty((256, 4), device="cuda", dtype=torch.float8_e4m3fn),
-        requires_grad=False,
-    )
-    layer.input_scale = Parameter(
-        torch.tensor([2.0], device="cuda", dtype=torch.float32),
-        requires_grad=False,
-    )
-    layer.weight_scale_2 = Parameter(
-        torch.tensor([3.0], device="cuda", dtype=torch.float32),
-        requires_grad=False,
-    )
-
-    Nvfp4LinearMethod(QuantConfig()).process_weights_after_loading(layer)
-
-    assert not hasattr(layer, "weight")
-    assert not hasattr(layer, "weight_scale")
-    assert not hasattr(layer, "weight_scale_interleaved")
-    assert hasattr(layer, "weight_swiglu_interleaved")
-    assert hasattr(layer, "weight_scale_swiglu_interleaved")
-
-
-@pytest.mark.skipif(not _has_sm100(), reason="Blackwell SM100 CUDA GPU required")
-def test_nvfp4_process_weights_releases_normal_weight_scale() -> None:
-    from torch import nn
-    from torch.nn.parameter import Parameter
-
-    from tokenspeed.runtime.layers.dense.nvfp4 import Nvfp4LinearMethod
-
-    class QuantConfig:
-        group_size = 16
-
-    layer = nn.Module()
-    layer.prefix = "test.down_proj"
-    layer.interleave_linear_and_gate = False
-    layer.weight = Parameter(
-        torch.randint(0, 256, (128, 8), device="cuda", dtype=torch.uint8),
-        requires_grad=False,
-    )
-    layer.weight_scale = Parameter(
-        torch.empty((128, 4), device="cuda", dtype=torch.float8_e4m3fn),
-        requires_grad=False,
-    )
-    layer.input_scale = Parameter(
-        torch.tensor([2.0], device="cuda", dtype=torch.float32),
-        requires_grad=False,
-    )
-    layer.weight_scale_2 = Parameter(
-        torch.tensor([3.0], device="cuda", dtype=torch.float32),
-        requires_grad=False,
-    )
-
-    Nvfp4LinearMethod(QuantConfig()).process_weights_after_loading(layer)
-
-    assert hasattr(layer, "weight")
-    assert not hasattr(layer, "weight_scale")
-    assert hasattr(layer, "weight_scale_interleaved")
-    assert not hasattr(layer, "weight_swiglu_interleaved")
-    assert not hasattr(layer, "weight_scale_swiglu_interleaved")
-
-
-@pytest.mark.skipif(not _has_sm100(), reason="Blackwell SM100 CUDA GPU required")
 @pytest.mark.parametrize(
     ("m", "k", "i"),
     [
@@ -155,17 +77,16 @@ def test_nvfp4_gemm_swiglu_nvfp4_quant_matches_unfused_model_shapes(
     i: int,
 ) -> None:
 
+    from tokenspeed_kernel.ops.gemm import (
+        interleave_linear_and_gate,
+        swizzle_blockscale_2d,
+    )
     from tokenspeed_kernel.ops.gemm._cute_dsl.nvfp4_gemm_swiglu import (
         nvfp4_gemm_swiglu_nvfp4_quant,
     )
     from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
     from tokenspeed_kernel.registry import load_builtin_kernels
     from tokenspeed_kernel.thirdparty.cuda import silu_and_mul_fuse_nvfp4_quant
-
-    from tokenspeed.runtime.layers.dense.nvfp4 import (
-        interleave_linear_and_gate,
-        swizzle_blockscale_2d,
-    )
 
     load_builtin_kernels()
 

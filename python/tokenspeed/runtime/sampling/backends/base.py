@@ -405,6 +405,31 @@ class SamplingBackend(ABC):
         """
         return None
 
+    def supports_vocab_shard(
+        self, dtype: torch.dtype, columns: int, tp_size: int
+    ) -> bool:
+        """Whether this backend selects candidates from vocabulary shards of this geometry.
+
+        The default fits the shared shard selection (``vocab_shard_topk``) and
+        merge at ``vocab_shard_top_k`` candidates.
+
+        Args:
+            dtype: The shard logits' dtype, as the processor hands them over.
+            columns: Vocabulary columns per shard.
+            tp_size: Ranks the vocabulary is sharded over.
+        """
+        from tokenspeed_kernel.ops.sampling import (
+            vocab_shard_topk_supports,
+            vocab_topk_merge_supports,
+        )
+
+        top_k = self.vocab_shard_top_k()
+        return (
+            top_k is not None
+            and vocab_shard_topk_supports(dtype, columns, top_k)
+            and vocab_topk_merge_supports(tp_size, top_k)
+        )
+
     def warmup_vocab_shard_sampling(
         self,
         shard: SampledVocabShard,
@@ -460,8 +485,8 @@ class SamplingBackend(ABC):
         """
         raise NotImplementedError(
             f"{type(self).__name__} has no draft-prob verify; "
-            "--enable-speculative-sampling needs the flashinfer or "
-            "flashinfer_full sampling backend (triton for DFLASH)"
+            "--enable-speculative-sampling needs the flashinfer, "
+            "flashinfer_full or sonic sampling backend (triton for DFLASH)"
         )
 
     def maybe_broadcast(self, *tensors: torch.Tensor) -> None:

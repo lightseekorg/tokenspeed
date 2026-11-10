@@ -841,9 +841,9 @@ impl OutputProcessor {
         committed
     }
 
-    /// A request's PD transfer failed. The scheduler already released it
-    /// on the event; the client gets an abort, unless it ended before and
-    /// tore down its stream.
+    /// A request's PD transfer failed. The client gets an abort unless it
+    /// already ended and tore down its stream. The scheduler keeps the
+    /// request's pages until the transfer and local forwards retire.
     pub fn fail_transfer(&mut self, rid: &str) -> Committed {
         let mut committed = Committed::default();
         let Some(mut state) = self.states.remove(rid) else {

@@ -1952,7 +1952,8 @@ def dsa_decode_topk(
 
     Args:
         q: BF16 or FP8 E4M3 indexer query with shape
-            [tokens, index_heads, head_dim]. FP8 queries require q_scales.
+            [tokens, index_heads, head_dim]. FP8 queries take q_scales, or
+            unit scales where a leaf accepts them (see q_scales).
         weights: Per-token/head weights with shape [tokens, index_heads],
             FP32 or raw BF16 (implementations upcast on the fly).
         seq_lens: Per-request full KV length, shape [num_reqs] (= tokens /
@@ -1982,7 +1983,9 @@ def dsa_decode_topk(
             (``"bf16"``, packed).
         q_scales: Optional positive FP32 scale per token/head for FP8 queries,
             defining ``dequant(q[token, head]) = q[token, head].float() *
-            q_scales[token, head]``.
+            q_scales[token, head]``. None gives FP8 queries unit scales, for
+            weights that already carry the query scales and the score scale
+            (``quantize_index_query_weights``' output, ``softmax_scale=1``).
         seq_lens_2d: Optional per-token rows of the request's full KV length
             (``[tokens, 1]``, every row of a request carrying ``seq_lens[req]``),
             the scoring extent the ``plan`` was built from (:func:`dsa_plan`).

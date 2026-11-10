@@ -144,10 +144,11 @@ Request* Scheduler::findRequest(const std::string& request_id) {
 bool Scheduler::pdTransferInFlight(const Request& request) const {
     switch (config_.role) {
         case Role::kD:
-            return request.Is<fsm::RemotePrefilling>();
+            return request.IsAnyOf<fsm::RemotePrefilling, fsm::PdTransferring>();
         case Role::kP:
-            // Every page-holding state but Finishing: SucceededEvent moves a
-            // request there once the peer has read its pages.
+            // Every page-holding state but Finishing, PdTransferring
+            // included: SucceededEvent moves a request to Finishing once the
+            // peer has read its pages.
             return request.HoldsPages() && !request.Is<fsm::Finishing>();
         case Role::kFused:
             return false;
@@ -461,6 +462,12 @@ std::size_t Scheduler::PrefillSize() const {
     }));
 }
 
+std::size_t Scheduler::RunningSize() const {
+    return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const std::unique_ptr<Request>& request) {
+        return request->IsAnyOf<fsm::Prefilling, fsm::PrefillAwaitingResult, fsm::PrefillDone, fsm::Decoding>();
+    }));
+}
+
 std::size_t Scheduler::RemotePrefillSize() const {
     return static_cast<std::size_t>(std::ranges::count_if(
         requests_, [](const std::unique_ptr<Request>& request) { return request->Is<fsm::RemotePrefilling>(); }));
@@ -545,7 +552,38 @@ std::vector<std::int64_t> Scheduler::AdmissionCapacityCurve(std::int32_t token_s
     return curve;
 }
 
-ExecutionPlan Scheduler::NextExecutionPlan() {
+Scheduler::PrefillGateProbe Scheduler::ProbePrefillGate() const {
+    PrefillGateProbe probe{.wants_prefill = false, .has_decode_work = false};
+    if (config_.role != Role::kFused) {
+        // Only the fused role has both kinds of work to choose between: a P
+        // node is all prefill and a D node's prompts are its peer's.
+        return probe;
+    }
+    bool pending_prefill = false;
+    bool resident_prefill = false;
+    for (const auto& request : requests_) {
+        // Storage preparation has not admitted Device pages yet. Resident
+        // chunks, however, must be able to consume their own reservations.
+        if (request->Is<fsm::Prefilling>()) {
+            resident_prefill = true;
+        } else if (request->IsAnyOf<fsm::Submitted, fsm::Prefetching>()) {
+            pending_prefill = true;
+        } else if (request->IsAnyOf<fsm::PrefillDone, fsm::Decoding>()) {
+            probe.has_decode_work = true;
+        }
+    }
+    probe.wants_prefill = resident_prefill || (pending_prefill && belowPrefillWatermark());
+    return probe;
+}
+
+bool Scheduler::belowPrefillWatermark() const {
+    const std::int32_t total_pages = coordinator_.TotalLcmBlocks();
+    const float used_ratio =
+        total_pages > 0 ? static_cast<float>(ActiveLcmBlocks()) / static_cast<float>(total_pages) : 0.0F;
+    return used_ratio <= kPrefillWatermark;
+}
+
+ExecutionPlan Scheduler::NextExecutionPlan(PlanOptions options) {
     std::vector<WriteBackOperation> write_back_operations = std::exchange(pending_write_back_operations_, {});
     // Dropping a finished request drops what it still holds elsewhere -- its
     // session's registration under its access epoch -- with it.
@@ -563,9 +601,6 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
     std::vector<Request*> candidates;
     candidates.reserve(requests_.size());
     for (const auto& request : requests_) {
-        if (request->PdFailureRetired()) {
-            continue;  // local forward results still own the failed request's pages
-        }
         if (request->IsAnyOf<fsm::Submitted, fsm::Prefilling, fsm::RemotePrefilling, fsm::PrefillDone, fsm::Decoding,
                              fsm::Retracted>()) {
             candidates.push_back(request.get());
@@ -581,7 +616,7 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
     BuiltOperations built;
     bool builds_work = false;
     if (forward_allowed_) {
-        built = buildForwardOperations(plan, std::move(candidates), write_back_operations);
+        built = buildForwardOperations(plan, std::move(candidates), write_back_operations, options);
         builds_work = !built.forward.empty() || plan.remote_decode.has_value() || plan.remote_prefill.has_value();
         plan.With(ForwardBatch{std::move(built.forward)});
     }

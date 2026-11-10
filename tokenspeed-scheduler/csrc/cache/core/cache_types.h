@@ -239,10 +239,14 @@ struct CompletedPages {
     bool preserve_source_blocks{false};
     // This point is a natural checkpoint of the recurrent state (prompt end,
     // finish, retraction, a junction-cut chunk end): every State group
-    // publishes slot 1 -- the block the forward that ended here wrote --
+    // publishes the block the forward that ended here wrote (state_slot)
     // under the point's hash (the chain hash when aligned, the tail hash
     // otherwise). Ordinary chunk ends and decode steps publish no state.
     bool publish_state{false};
+    // The State slot holding that block: slot 1, unless the first decode
+    // rotated it into slot 0 and kept no token, having run as a padding row
+    // behind a finish at the prompt end (CacheProgress::prompt_end_rotated).
+    std::int32_t state_slot{1};
     // An in-forward State checkpoint an earlier forward wrote at the page
     // boundary prefix_hashes[state_checkpoint_pages - 1]: every State group
     // publishes its block from state_checkpoint_blocks (indexed by group, null

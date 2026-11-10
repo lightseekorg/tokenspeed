@@ -409,6 +409,15 @@ def _template_tokenizer(gateway_args: list[str]) -> str | None:
     )
 
 
+def _gateway_args_with_forward_reload(
+    engine_args: list[str], gateway_args: list[str]
+) -> list[str]:
+    """Serve the RL control routes that carry reload_forward when the engine enables it."""
+    if "--allow-reload-forward" in engine_args and "--enable-rl" not in gateway_args:
+        return [*gateway_args, "--enable-rl"]
+    return gateway_args
+
+
 def _gateway_args_with_engine_identity(
     engine_args: list[str], gateway_args: list[str]
 ) -> list[str]:
@@ -1074,6 +1083,7 @@ def run_smg_from_args(args: argparse.Namespace, raw_argv: list[str]) -> None:
             _prewarm_hf_tokenizer(model_id)
         tokenizer = _template_tokenizer(gateway_args)
     gateway_args = _gateway_args_with_defaults(gateway_args, tokenizer)
+    gateway_args = _gateway_args_with_forward_reload(engine_args, gateway_args)
     user_host = _get_from_args(gateway_args, "--host", DEFAULT_GATEWAY_HOST)
     user_port = int(_get_from_args(gateway_args, "--port", str(DEFAULT_GATEWAY_PORT)))
 

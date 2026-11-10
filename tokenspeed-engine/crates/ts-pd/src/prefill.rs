@@ -32,7 +32,7 @@
 //! transfer contract ([`crate::layout`]).
 
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc, Arc, Condvar, Mutex, MutexGuard, RwLock,
@@ -46,7 +46,7 @@ use ts_collective::{Group, Mesh, Reduce};
 
 use crate::{
     batch::{BatchRows, Staged},
-    control::{BootstrapInfo, PdError, PdEvent, TransferPeer},
+    control::{stalled_drains, BootstrapInfo, Draining, PdError, PdEvent, TransferPeer},
     http,
     layout::{
         contract::Contract,
@@ -93,6 +93,27 @@ struct Registration {
 impl Registration {
     fn is_dummy(&self) -> bool {
         self.planned.is_dummy
+    }
+}
+
+/// A replacement waits only for writers to the identities it supersedes.
+/// Manifests stay queued until the registration can be applied.
+#[derive(Clone)]
+struct PendingRegistration {
+    frames: Vec<Bytes>,
+    cache_id: String,
+    registration: Option<Registration>,
+}
+
+impl PendingRegistration {
+    fn conflicts(&self, other: &Self) -> bool {
+        self.cache_id == other.cache_id
+            || match (&self.registration, &other.registration) {
+                (Some(a), Some(b)) => {
+                    (a.endpoint == b.endpoint && a.port == b.port) || a.session_id == b.session_id
+                }
+                _ => false,
+            }
     }
 }
 
@@ -219,9 +240,14 @@ struct State {
     tracked: HashSet<u64>,
     // Queued and executing jobs that can still read source pages.
     pending_chunks: HashMap<u64, usize>,
+    /// A native write error does not establish a remote DMA fence. Such a
+    /// room must never acknowledge cancellation and release its destinations.
+    uncertain: HashSet<u64>,
     /// Cancelled room ids, retained until their associated cache identities
     /// retire. An empty set has not received a manifest yet: no TTL proves
-    /// that a delayed manifest can no longer arrive.
+    /// that a delayed manifest can no longer arrive. Failures/timeouts also
+    /// add records: with a long-lived cache this metadata can grow without
+    /// bound. See the cancellation contract in docs/design/event-loop.md.
     cancelled: HashMap<u64, HashSet<String>>,
     /// Reply only after this room's queued and executing jobs have retired.
     cancellation_replies: HashMap<(u64, String), (String, u16)>,
@@ -233,6 +259,9 @@ struct State {
     /// still unclaimed after the bootstrap timeout is dropped.
     unclaimed: HashMap<u64, Instant>,
     registrations: HashMap<String, Registration>,
+    registration_gates: HashMap<String, Arc<RwLock<()>>>,
+    pending_registrations: VecDeque<PendingRegistration>,
+    pending_manifests: HashMap<String, Vec<Vec<Bytes>>>,
     /// Rejected or retired cache identities: their reply route. Never revive them.
     rejected: HashMap<String, (String, u16)>,
     destinations: HashMap<u64, Vec<Destination>>,
@@ -246,10 +275,41 @@ struct State {
 }
 
 impl State {
+    /// Take cancellation replies only after all writers retired with no
+    /// uncertain native write. Failure notices alone never release D pages.
+    #[allow(clippy::type_complexity)]
+    fn take_cancellation_replies(&mut self) -> Vec<((u64, String), (String, u16))> {
+        let ready: Vec<_> = self
+            .cancellation_replies
+            .keys()
+            .filter(|(room, _)| {
+                !self.pending_chunks.contains_key(room) && !self.uncertain.contains(room)
+            })
+            .cloned()
+            .collect();
+        ready
+            .into_iter()
+            .map(|key| {
+                let route = self
+                    .cancellation_replies
+                    .remove(&key)
+                    .expect("pending reply");
+                (key, route)
+            })
+            .collect()
+    }
+
     fn route_of(&self, cache_id: &str) -> Option<(String, u16)> {
         self.registrations
             .get(cache_id)
             .map(|registration| (registration.endpoint.clone(), registration.port))
+            .or_else(|| {
+                self.pending_registrations
+                    .iter()
+                    .find(|pending| pending.cache_id == cache_id)
+                    .and_then(|pending| pending.registration.as_ref())
+                    .map(|registration| (registration.endpoint.clone(), registration.port))
+            })
             .or_else(|| self.rejected.get(cache_id).cloned())
     }
 
@@ -305,6 +365,7 @@ impl State {
                         .map(|route| (route, room)),
                 );
             }
+            self.cancel_room(room, None);
             self.clear(room);
         }
         (expired, notices)
@@ -358,8 +419,6 @@ struct Shared {
     transport: Arc<Transport>,
     layout: PrefillLayout,
     state: Mutex<State>,
-    /// Retirement waits for native writes; queued writes recheck their cache id.
-    registration_gate: RwLock<()>,
     status_rank: i64,
     failed_session_ttl: Duration,
     metrics: Option<Arc<ts_metrics::KvTransferMetrics>>,
@@ -376,9 +435,10 @@ impl Shared {
     }
 
     fn notify(&self, (endpoint, port): (String, u16), message: &StatusMessage) {
-        self.transport
+        let _ = self
+            .transport
             .sockets
-            .send(&endpoint, port, message.to_frames());
+            .send_coalesced(&endpoint, port, message.to_frames());
     }
 
     fn notify_failed(&self, route: (String, u16), room: u64) {
@@ -399,6 +459,9 @@ impl Shared {
             if let (false, Some(metrics)) = (counted, &self.metrics) {
                 metrics.record_failure();
             }
+            // Timeout/failure must reject manifests arriving after this
+            // request is forgotten, just like an explicit cancellation.
+            state.cancel_room(room, None);
             state.rooms.record_failure(room, reason);
             state.rooms.update(room, TransferPoll::Failed);
             state.touch(room);
@@ -448,7 +511,11 @@ impl Shared {
                 tracing::error!(room, cache_id, "cancellation names an unregistered cache");
                 return;
             };
-            let active = state.registrations.contains_key(&cache_id);
+            let active = state.registrations.contains_key(&cache_id)
+                || state
+                    .pending_registrations
+                    .iter()
+                    .any(|pending| pending.cache_id == cache_id);
             if active {
                 state.cancel_room(room, Some(&cache_id));
             }
@@ -466,27 +533,9 @@ impl Shared {
     /// This also runs without any registered Prefill request: an unclaimed
     /// room's cancellation must not wait for the bootstrap TTL or a forward.
     fn flush_cancellations(&self) {
-        let replies = {
-            let mut state = self.state();
-            let ready: Vec<_> = state
-                .cancellation_replies
-                .keys()
-                .filter(|(room, _)| !state.pending_chunks.contains_key(room))
-                .cloned()
-                .collect();
-            ready
-                .into_iter()
-                .map(|key| {
-                    let route = state
-                        .cancellation_replies
-                        .remove(&key)
-                        .expect("pending reply");
-                    (key, route)
-                })
-                .collect::<Vec<_>>()
-        };
+        let replies = self.state().take_cancellation_replies();
         for ((room, cache_id), (endpoint, port)) in replies {
-            self.transport.sockets.send(
+            let _ = self.transport.sockets.send_coalesced(
                 &endpoint,
                 port,
                 wire::cancellation_ack_frames(room, &cache_id, self.status_rank),
@@ -512,10 +561,80 @@ impl Shared {
     }
 
     fn handle_registration(&self, frames: &[Bytes]) {
-        let _gate = self
-            .registration_gate
-            .write()
-            .expect("the registration gate is poisoned");
+        let Ok((_, _, cache_id)) = wire::registration_route(frames) else {
+            tracing::error!("rejecting a malformed CachePD registration");
+            return;
+        };
+        self.state()
+            .pending_registrations
+            .push_back(PendingRegistration {
+                frames: frames.to_vec(),
+                cache_id,
+                registration: self.plan_registration(frames).ok(),
+            });
+        self.flush_registrations();
+    }
+
+    fn flush_registrations(&self) {
+        // Keep deferred routes visible to cancellation and worker failures.
+        // Only the control receiver mutates the registration queue.
+        let pending = self.state().pending_registrations.clone();
+        let mut waiting: VecDeque<PendingRegistration> = VecDeque::new();
+        for registration in pending {
+            if waiting
+                .iter()
+                .any(|earlier| earlier.conflicts(&registration))
+                || !self.try_registration(&registration)
+            {
+                waiting.push_back(registration);
+                continue;
+            }
+            let manifests = {
+                let mut state = self.state();
+                let index = state
+                    .pending_registrations
+                    .iter()
+                    .position(|item| item.frames == registration.frames)
+                    .expect("registration is still pending");
+                state.pending_registrations.remove(index);
+                state
+                    .pending_manifests
+                    .remove(&registration.cache_id)
+                    .unwrap_or_default()
+            };
+            for frames in manifests {
+                self.handle_preallocation(&frames);
+            }
+        }
+    }
+
+    /// Never wait for a native write on the control receiver. The guards
+    /// fence replacement against the affected cache's writes, not other D ranks.
+    fn try_registration(&self, pending: &PendingRegistration) -> bool {
+        let gates: Vec<_> = {
+            let state = self.state();
+            state
+                .registrations
+                .values()
+                .filter(|previous| {
+                    previous.cache_id == pending.cache_id
+                        || pending.registration.as_ref().is_some_and(|next| {
+                            (previous.endpoint == next.endpoint && previous.port == next.port)
+                                || previous.session_id == next.session_id
+                        })
+                })
+                .map(|previous| state.registration_gates[&previous.cache_id].clone())
+                .collect()
+        };
+        let mut guards = Vec::with_capacity(gates.len());
+        for gate in &gates {
+            match gate.try_write() {
+                Ok(guard) => guards.push(guard),
+                Err(std::sync::TryLockError::WouldBlock) => return false,
+                Err(std::sync::TryLockError::Poisoned(error)) => guards.push(error.into_inner()),
+            }
+        }
+        let frames = &pending.frames;
         let registered = self.plan_registration(frames).and_then(|registration| {
             let state = self.state();
             let cache_id = registration.cache_id.clone();
@@ -556,6 +675,10 @@ impl Shared {
             }
             let mut state = self.state();
             state.failed_sessions.remove(&cache_id);
+            state
+                .registration_gates
+                .entry(cache_id.clone())
+                .or_insert_with(|| Arc::new(RwLock::new(())));
             state.registrations.insert(cache_id, registration);
             Ok(())
         });
@@ -568,6 +691,7 @@ impl Shared {
                 }
             }
         }
+        true
     }
 
     /// Invalidate a session and fail the rooms that reference it.
@@ -591,6 +715,7 @@ impl Shared {
         }
         let mut state = self.state();
         state.registrations.remove(cache_id);
+        state.registration_gates.remove(cache_id);
         state.rejected.insert(cache_id.to_owned(), (endpoint, port));
         state.cancelled.retain(|_, identities| {
             // Unbound cancellations have no cache lifetime to retire yet.
@@ -608,6 +733,21 @@ impl Shared {
                 return;
             }
         };
+        {
+            let mut state = self.state();
+            if state
+                .pending_registrations
+                .iter()
+                .any(|pending| pending.cache_id == cache_id)
+            {
+                state
+                    .pending_manifests
+                    .entry(cache_id)
+                    .or_default()
+                    .push(frames.to_vec());
+                return;
+            }
+        }
         if let Err(reason) = self.accept_preallocation(room, &cache_id, frames) {
             tracing::error!(room, reason, "rejecting CachePD pre-allocation metadata");
             self.abort_room(room, &format!("invalid pre-allocation metadata: {reason}"));
@@ -814,10 +954,13 @@ impl Shared {
         registration: &Registration,
         copies: &[Copy],
     ) -> Result<(), String> {
-        let _gate = self
-            .registration_gate
-            .read()
-            .expect("the registration gate is poisoned");
+        let gate = self
+            .state()
+            .registration_gates
+            .get(&registration.cache_id)
+            .cloned()
+            .ok_or("CachePD transfer references a retired cache instance")?;
+        let _gate = gate.read().unwrap_or_else(|error| error.into_inner());
         // A worker can hold a planned registration across a cache replacement.
         // Checking under the gate prevents its stale copies from reaching the
         // new memory at a reused transport address.
@@ -836,6 +979,7 @@ impl Shared {
             self.transport
                 .write_cache(&registration.session_id, &registration.cache_id, copies)
         {
+            self.state().uncertain.insert(room);
             self.mark_session_failed(&registration.cache_id);
             return Err(format!(
                 "Mooncake transfer failed for {}:{}: {error}",
@@ -1437,6 +1581,7 @@ struct Sender {
     started: Instant,
     local: TransferPoll,
     concluded: Option<TransferPoll>,
+    draining: Option<Draining>,
 }
 
 /// A Prefill rank's PD transfer peer.
@@ -1449,6 +1594,7 @@ pub struct PrefillPeer {
     order: Vec<String>,
     senders: HashMap<String, Sender>,
     stall_logged_at: Option<Instant>,
+    drain_logged_at: Option<Instant>,
     timeout_logged: bool,
 }
 
@@ -1468,7 +1614,6 @@ impl PrefillPeer {
             transport,
             layout: config.layout,
             state: Mutex::new(State::default()),
-            registration_gate: RwLock::new(()),
             status_rank: config.status_rank,
             failed_session_ttl: config.failed_session_ttl,
             metrics: config.peer.metrics.clone(),
@@ -1499,6 +1644,7 @@ impl PrefillPeer {
                             swept = Instant::now();
                             shared.drop_unclaimed(unclaimed_ttl);
                         }
+                        shared.flush_registrations();
                         shared.flush_cancellations();
                     }
                 })?;
@@ -1537,6 +1683,7 @@ impl PrefillPeer {
                 order: Vec::new(),
                 senders: HashMap::new(),
                 stall_logged_at: None,
+                drain_logged_at: None,
                 timeout_logged: false,
             },
             outbox,
@@ -1632,6 +1779,7 @@ impl TransferPeer for PrefillPeer {
                     started: Instant::now(),
                     local: TransferPoll::Bootstrapping,
                     concluded: None,
+                    draining: None,
                 },
             )
             .is_none()
@@ -1741,16 +1889,27 @@ impl TransferPeer for PrefillPeer {
             if sender.local == TransferPoll::Bootstrapping && poll == TransferPoll::Bootstrapped {
                 sender.local = TransferPoll::Bootstrapped;
                 events.push(PdEvent::Bootstrapped(rid.clone()));
-            } else if poll == TransferPoll::Failed && retired != 0 {
-                let reason = self
-                    .shared
-                    .state()
-                    .rooms
-                    .failure(sender.room)
-                    .map(str::to_owned);
-                tracing::warn!(rid, room = sender.room, reason, "KV transfer failed");
-                events.push(PdEvent::Failed(rid.clone()));
-                ended.push(rid.clone());
+            } else if poll == TransferPoll::Failed {
+                if sender.local != TransferPoll::Failed {
+                    sender.local = TransferPoll::Failed;
+                    sender.draining = Some(Draining {
+                        rid: rid.clone(),
+                        room: sender.room,
+                        since: now,
+                    });
+                    let reason = self
+                        .shared
+                        .state()
+                        .rooms
+                        .failure(sender.room)
+                        .map(str::to_owned);
+                    tracing::warn!(rid, room = sender.room, reason, "KV transfer failed");
+                    events.push(PdEvent::Failed(rid.clone()));
+                }
+                if retired != 0 {
+                    events.push(PdEvent::Stopped(rid.clone()));
+                    ended.push(rid.clone());
+                }
             } else if sender.local == TransferPoll::Bootstrapped
                 && poll == TransferPoll::Success
                 && retired != 0
@@ -1762,6 +1921,19 @@ impl TransferPeer for PrefillPeer {
         }
         for rid in ended {
             self.forget(&rid);
+        }
+        let stalled = stalled_drains(
+            self.order
+                .iter()
+                .filter_map(|rid| self.senders[rid].draining.as_ref()),
+            &mut self.drain_logged_at,
+            now,
+        );
+        if !stalled.is_empty() {
+            tracing::warn!(
+                ?stalled,
+                "PD source pages are waiting for transfers to stop"
+            );
         }
         Ok(events)
     }
@@ -2027,6 +2199,42 @@ mod tests {
             interval_targets(STEP_COUNT_MAX - 1, 2, 1),
             [STEP_COUNT_MAX - 1, 0]
         );
+    }
+
+    #[test]
+    fn cancellation_ack_waits_for_the_last_pending_chunk() {
+        let mut state = State::default();
+        let key = (4, "cache".to_owned());
+        let route = ("decode".to_owned(), 7000);
+        state.cancel_room(4, Some("cache"));
+        state
+            .cancellation_replies
+            .insert(key.clone(), route.clone());
+        state.pending_chunks.insert(4, 2);
+        assert!(state.take_cancellation_replies().is_empty());
+        *state.pending_chunks.get_mut(&4).unwrap() -= 1;
+        assert!(state.take_cancellation_replies().is_empty());
+        state.pending_chunks.remove(&4);
+        assert_eq!(state.take_cancellation_replies(), [(key, route)]);
+        assert!(state.take_cancellation_replies().is_empty());
+    }
+
+    #[test]
+    fn uncertain_writes_never_acknowledge_cancellation() {
+        let mut state = State::default();
+        let key = (5, "cache".to_owned());
+        state.cancel_room(5, Some("cache"));
+        state
+            .cancellation_replies
+            .insert(key.clone(), ("decode".to_owned(), 7000));
+        state.uncertain.insert(5);
+        state.pending_chunks.insert(5, 1);
+        assert!(state.take_cancellation_replies().is_empty());
+        state.pending_chunks.remove(&5);
+        assert!(state.take_cancellation_replies().is_empty());
+        state.clear(5);
+        assert!(state.take_cancellation_replies().is_empty());
+        assert!(state.cancellation_replies.contains_key(&key));
     }
 }
 

@@ -90,7 +90,7 @@ def _head_layout(**overrides) -> SimpleNamespace:
     """The LM-head layout the factory compares between a target and the draft
     sharing its head (``_check_shared_head_layout``): the logits processor's
     group, width and attention-DP flag. Default: one replicated head."""
-    layout = dict(tp_group=None, tp_size=1, dp_lm_head_tp=False)
+    layout = dict(tp_group=None, tp_size=1, attn_tp_size=1, dp_lm_head_tp=False)
     layout.update(overrides)
     return SimpleNamespace(**layout)
 
@@ -334,7 +334,7 @@ def test_wire_rejects_a_draft_head_in_another_layout():
         SimpleNamespace(
             get_embed_and_head=mock.Mock(side_effect=AssertionError("bound")),
             logits_processor=_head_layout(
-                tp_group=(0, 1), tp_size=2, dp_lm_head_tp=True
+                tp_group=(0, 1), tp_size=2, attn_tp_size=1, dp_lm_head_tp=True
             ),
         )
     )

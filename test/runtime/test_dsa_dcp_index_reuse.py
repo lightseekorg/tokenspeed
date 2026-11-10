@@ -135,6 +135,7 @@ def _decode_layer(layer, ctx, page_table, seq_lens, q_len):
     output = SimpleNamespace(
         query_rows=lambda start, end: query[start:end],
         weights=torch.zeros(rows, 4),
+        quantized_query=None,
     )
     record = layer._compute_decode_topk_indices_portable(
         indexer_output=output,
