@@ -22,8 +22,8 @@
 //! bootstrap server, registers with them once per route, sends each
 //! admitted request's page manifest, and collects their completions.
 //!
-//! Threads: one connects requests to their routes (the bootstrap server's
-//! HTTP lookups), one handles the status socket, one watches the Prefill
+//! Threads: one per bootstrap address connects its requests to their routes
+//! (HTTP lookups), one handles the status socket, one watches the Prefill
 //! nodes' health. The scheduling loop only registers requests and polls;
 //! the forward thread hands over each plan's remote prefill
 //! ([`DecodeOutbox`]). Routes and manifests are planned here, over the
@@ -161,6 +161,12 @@ impl State {
         self.rooms.update(room, TransferPoll::Failed);
     }
 
+    fn awaiting_connection(&self, room: u64) -> bool {
+        self.tracked.contains(&room)
+            && self.rooms.get(room) == Some(TransferPoll::Bootstrapping)
+            && !self.cancellations.contains_key(&room)
+    }
+
     /// Apply one Prefill rank's report.
     fn apply(&mut self, message: StatusMessage) {
         let room = message.room;
@@ -259,7 +265,7 @@ impl State {
         route: &PrefillRoute,
         targets: Arc<Vec<Target>>,
     ) -> bool {
-        if !self.tracked.contains(&room) || self.cancellations.contains_key(&room) {
+        if !self.awaiting_connection(room) {
             return false;
         }
         self.expected
@@ -425,7 +431,7 @@ impl Shared {
     fn connect(&self, room: u64, addr: &str) -> Result<(), String> {
         let cache_id = {
             let state = self.state();
-            if !state.tracked.contains(&room) || state.cancellations.contains_key(&room) {
+            if !state.awaiting_connection(room) {
                 return Ok(());
             }
             state.cache_id.clone()
@@ -439,6 +445,11 @@ impl Shared {
             None => {
                 let mut targets = Vec::with_capacity(route.target_tp_ranks.len());
                 for &rank in &route.target_tp_ranks {
+                    // A retired worker only finishes the HTTP call already
+                    // in progress; do not start another lookup for an ended room.
+                    if !self.state().awaiting_connection(room) {
+                        return Ok(());
+                    }
                     let lookup_failed = || {
                         format!(
                             "Could not fetch bootstrap info for engine rank: {} and \
@@ -476,10 +487,7 @@ impl Shared {
         let mut state = self.state();
         // The HTTP lookup may outlive a cancelled request or a cache release.
         // Do not repopulate the new cache's connections with that old work.
-        if !state.tracked.contains(&room)
-            || state.cancellations.contains_key(&room)
-            || state.cache_id != cache_id
-        {
+        if !state.awaiting_connection(room) || state.cache_id != cache_id {
             return Ok(());
         }
         if !state.connections.contains_key(&key) {
@@ -531,7 +539,11 @@ impl Shared {
     fn watch(&self, interval: Duration, max_failures: u32, stop: &mpsc::Receiver<()>) {
         let mut failures: HashMap<String, u32> = HashMap::new();
         while !sleep_or_stop(stop, interval) {
-            let addrs: Vec<String> = self.state().routes.keys().cloned().collect();
+            let addrs: Vec<String> = {
+                let state = self.state();
+                failures.retain(|addr, _| state.routes.contains_key(addr));
+                state.routes.keys().cloned().collect()
+            };
             for addr in addrs {
                 let count = failures.entry(addr.clone()).or_insert(0);
                 if http::healthy(
@@ -815,6 +827,23 @@ impl DecodePeer {
         self.shared.state().cache_id.clone()
     }
 
+    /// Dropping a lost address's sender lets its worker drain terminal rooms
+    /// and exit. A first lookup has no route yet, so retain its worker until
+    /// the pending request settles; otherwise each poll could fork its FIFO.
+    fn reap_connect_workers(&mut self) {
+        let state = self.shared.state();
+        let pending: HashSet<&str> = self
+            .receivers
+            .values()
+            .filter(|receiver| {
+                receiver.concluded.is_none() && state.awaiting_connection(receiver.room)
+            })
+            .map(|receiver| receiver.addr.as_str())
+            .collect();
+        self.connect
+            .retain(|addr, _| state.routes.contains_key(addr) || pending.contains(addr.as_str()));
+    }
+
     fn forget(&mut self, rid: &str) {
         let Some(receiver) = self.receivers.remove(rid) else {
             return;
@@ -843,6 +872,7 @@ fn join_host_port(host: &str, port: u16) -> String {
 
 impl TransferPeer for DecodePeer {
     fn register(&mut self, rid: &str, bootstrap: &BootstrapInfo) -> Result<(), PdError> {
+        self.reap_connect_workers();
         let room = bootstrap.room;
         let addr = join_host_port(&bootstrap.host, bootstrap.port);
         {
@@ -891,6 +921,7 @@ impl TransferPeer for DecodePeer {
 
     fn poll(&mut self, mesh: &mut Mesh, replica: &Group) -> Result<Vec<PdEvent>, PdError> {
         if self.order.is_empty() {
+            self.reap_connect_workers();
             return Ok(Vec::new());
         }
         let now = Instant::now();
@@ -1049,6 +1080,7 @@ impl TransferPeer for DecodePeer {
         for rid in ended {
             self.forget(&rid);
         }
+        self.reap_connect_workers();
         let stalled = stalled_drains(
             self.order
                 .iter()
@@ -1151,6 +1183,17 @@ mod tests {
         assert!(state.expected.is_empty());
         assert!(state.targets.is_empty());
         assert!(state.pending.is_empty() && state.landed.is_empty());
+    }
+
+    #[test]
+    fn a_late_connection_does_not_revive_a_failed_room() {
+        let mut state = State::default();
+        state.tracked.insert(1);
+        state.rooms.update(1, TransferPoll::Bootstrapping);
+        state.fail(1, "bootstrap failed");
+        assert!(!state.attach(1, "prefill:80", &route(), Arc::new(Vec::new())));
+        assert_eq!(state.rooms.get(1), Some(TransferPoll::Failed));
+        assert!(state.targets.is_empty());
     }
 
     #[test]
@@ -1259,3 +1302,7 @@ mod tests {
         assert_eq!(kept, ["host:8000"]);
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/decode_lifecycle.rs"]
+mod lifecycle_tests;

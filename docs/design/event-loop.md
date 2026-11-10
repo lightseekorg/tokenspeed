@@ -821,6 +821,18 @@ identities. A prefill cancellation that never learns a destination identity
 must retain its room tombstone until that peer exits, since an arbitrarily
 late manifest must not revive the transfer.
 
+These records include every prefill failure and bootstrap timeout, not just
+explicit client cancellation. There is currently no count or age limit:
+unbound records last for the prefill peer's lifetime, and bound records can
+last just as long when a healthy decode cache is never superseded. Sustained
+timeouts therefore grow metadata with the number of failed rooms, even after
+all associated jobs and network workers retire. Request timeout bounds do not
+bound this memory. An age or size eviction would allow a delayed manifest to
+revive an ended room; the wire has no enforced message lifetime or retired
+attempt epoch to reject it. Bounded retention needs such a protocol guarantee
+(or a fail-closed admission policy), rather than assuming that a multiple of
+the bootstrap timeout rules out late messages.
+
 A native write error does not prove that its remote DMA stopped. The prefill
 peer marks that room uncertain and withholds cancellation acknowledgments even
 after its queued and executing calls return. Failure notices may still reach
@@ -842,10 +854,24 @@ identical cancellation or status occupies at most one queued/in-flight entry.
 Queue refusal fails registration/manifest publication; partial publication
 still uses the cancellation fence. Cancellation polling retries refused or
 undelivered notifications. Network delivery itself remains best effort: a
-locally accepted message is not a remote acknowledgment.
+locally accepted message is not a remote acknowledgment. A connect or send
+failure discards that endpoint's queued backlog and retires its task; it does
+not spend another I/O timeout on every queued message. Requests still use
+their failure/timeout and cancellation paths. After 60 seconds with no queued
+or in-flight message, even a healthy endpoint retires its socket, task and
+registry entry. The next send recreates them. Idle retirement and enqueue
+share a lock so a new message cannot be stranded on a closing FIFO; an old
+task's teardown cannot erase its replacement. Socket retirement does not
+retire cache identities, room tombstones or possible remote writes.
 
 Decode bootstrap lookups are serialized per bootstrap address, with independent
-workers for other addresses. Cache registration on prefill fences only the
+workers for other addresses. Polling (including idle polls) and registration
+release a lost address's sender once its route is gone and no live request is
+still looking it up. The worker finishes any bounded in-flight HTTP call,
+skips terminal queued requests and exits; a later request creates another
+worker. A first lookup with no route yet keeps its worker so concurrent
+requests for that address stay serialized. Heartbeat failure counters expire
+with the routes too. Cache registration on prefill fences only the
 cache identities being replaced. A replacement waits off the control receive
 path for those native writes, while unrelated registrations and cancellations
 continue. Manifests for the replacement wait until it is installed; queued
@@ -864,8 +890,8 @@ receiver retires locally and notifies known targets; after publication it must
 obtain the normal retirement acknowledgments.
 
 **PD** (`pd`, `ts-pd`). Requests register with the transfer peer when submitted
-to the scheduler, before cache admission. Every round the replica agrees on which transfers changed
-state; their scheduler events join the round's tail feedback, and a failed
+to the scheduler, before cache admission. Every round the replica agrees on
+which transfers changed state; their scheduler events join the round's tail feedback, and a failed
 transfer aborts its request on every rank together. A peer keeps state only
 for the rooms of requests the loop tracks (a sleep waits for those alone),
 with one exception on the prefill side: a room the decode node pre-allocated

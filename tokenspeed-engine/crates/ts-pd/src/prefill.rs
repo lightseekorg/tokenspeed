@@ -245,7 +245,9 @@ struct State {
     uncertain: HashSet<u64>,
     /// Cancelled room ids, retained until their associated cache identities
     /// retire. An empty set has not received a manifest yet: no TTL proves
-    /// that a delayed manifest can no longer arrive.
+    /// that a delayed manifest can no longer arrive. Failures/timeouts also
+    /// add records: with a long-lived cache this metadata can grow without
+    /// bound. See the cancellation contract in docs/design/event-loop.md.
     cancelled: HashMap<u64, HashSet<String>>,
     /// Reply only after this room's queued and executing jobs have retired.
     cancellation_replies: HashMap<(u64, String), (String, u16)>,
