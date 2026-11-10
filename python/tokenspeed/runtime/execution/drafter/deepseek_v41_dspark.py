@@ -50,11 +50,11 @@ from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.drafter.base import BaseDrafter
 from tokenspeed.runtime.execution.drafter.verify_budget import VerifyBudgetPolicy
 from tokenspeed.runtime.execution.drafter.verify_calibration import (
+    STARTUP_CONTEXT_ENDPOINTS,
+    STARTUP_MEASURED_REPLAYS,
+    STARTUP_WARMUP_REPLAYS,
     VerifyCalibration,
     VerifyCalibrationCache,
-    VerifyCalibrationCollector,
-    VerifyStepSample,
-    align_verify_samples,
     calibration_source_fingerprint,
 )
 from tokenspeed.runtime.execution.drafter.verify_feedback import (
@@ -95,18 +95,6 @@ class _VerifyBudgetBuffers:
     valid: torch.Tensor
     packet: torch.Tensor
     peers: torch.Tensor
-    timing_packet: torch.Tensor
-    timing_peers: torch.Tensor
-
-
-@dataclass
-class _VerifyStepTiming:
-    step: int
-    epoch: int
-    batch_size: int
-    query_capacity: int
-    start: torch.cuda.Event
-    end: torch.cuda.Event
 
 
 @dataclass
@@ -115,7 +103,6 @@ class _PendingVerifyFeedback:
     scores: torch.Tensor
     contexts: torch.Tensor
     snapshot: tuple[FeedbackSnapshot, ...]
-    timing: _VerifyStepTiming | None
 
 
 class DeepseekV41DSpark(BaseDrafter):
@@ -177,7 +164,6 @@ class DeepseekV41DSpark(BaseDrafter):
         self.verify_graph_token_step: int | None = None
         self._verify_calibrations: tuple[VerifyCalibration, ...] = ()
         self._verify_policy_ms: float | None = None
-        self._verify_startup_ready = False
         self.verify_budget_policy: VerifyBudgetPolicy | None = None
         if global_server_args_dict.get("enable_dsv41_adaptive_dspark", False):
             self.verify_budget_policy = VerifyBudgetPolicy(
@@ -195,18 +181,9 @@ class DeepseekV41DSpark(BaseDrafter):
         self._verify_budget_buffers: dict[int, _VerifyBudgetBuffers] = {}
         self._verify_budget_graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
         self._pending_verify_feedback: list[_PendingVerifyFeedback] = []
-        self._verify_step_id = 0
-        self._verify_timing_epoch = 0
-        self._active_verify_timing: _VerifyStepTiming | None = None
-        self._verify_step_samples: list[VerifyStepSample] = []
-        self._aligned_verify_samples: tuple[VerifyStepSample, ...] = ()
-        self._verify_collecting = True
         self._verify_cache_initialized = False
         self._verify_cache: VerifyCalibrationCache | None = None
         self._cached_verify_profiles: tuple[VerifyCalibration, ...] = ()
-        self._verify_collectors: dict[
-            tuple[int, int, int], VerifyCalibrationCollector
-        ] = {}
         self.confidence_scores: torch.Tensor | None = None
         self.confidence_features: torch.Tensor | None = None
         self._confidence_request_ids: list[object | None] = []
@@ -274,12 +251,6 @@ class DeepseekV41DSpark(BaseDrafter):
         self._cached_verify_profiles = ()
         self._verify_cache_initialized = True
         self._verify_calibrations = ()
-        self._verify_collectors.clear()
-        self._verify_collecting = True
-        self._verify_timing_epoch += 1
-        self._active_verify_timing = None
-        self._verify_step_samples.clear()
-        self._aligned_verify_samples = ()
         if self.verify_feedback is not None:
             self.verify_feedback.invalidate()
         if self.confidence_scores is not None:
@@ -314,8 +285,6 @@ class DeepseekV41DSpark(BaseDrafter):
         self, ctx: ForwardContext, *, actual_bs: int, padded_bs: int
     ) -> int:
         if self.verify_budget_policy is not None:
-            self._active_verify_timing = None
-            self._verify_step_id += 1
             if self.draft_model.mapping.attn.dp_size > 1:
                 # Admission must use global metadata before entering collectives.
                 # An empty, unequal or graph-padded peer makes every rank native.
@@ -332,28 +301,9 @@ class DeepseekV41DSpark(BaseDrafter):
                 batch_size=actual_bs, graph_batch_size=padded_bs
             ):
                 return padded_bs * self.spec_num_tokens
-            if self._verify_startup_ready:
-                return self._prepare_calibrated_budget(
-                    actual_bs=actual_bs, padded_bs=padded_bs
-                )
-            if self._verify_collecting and actual_bs in self._verify_budget_buffers:
-                self._poll_verify_feedback()
-                self._synchronize_verify_samples(self._verify_budget_buffers[actual_bs])
-                self._update_verify_calibration()
-            start = torch.cuda.Event(enable_timing=True)
-            start.record()
-            capacity = self._prepare_calibrated_budget(
+            return self._prepare_calibrated_budget(
                 actual_bs=actual_bs, padded_bs=padded_bs
             )
-            self._active_verify_timing = _VerifyStepTiming(
-                self._verify_step_id,
-                self._verify_timing_epoch,
-                actual_bs,
-                capacity,
-                start,
-                torch.cuda.Event(enable_timing=True),
-            )
-            return capacity
         return padded_bs * self.spec_num_tokens
 
     def set_decode_graph_query_extent(self, num_tokens: int | None) -> None:
@@ -522,7 +472,6 @@ class DeepseekV41DSpark(BaseDrafter):
                     raise ValueError("ambiguous calibration context coverage")
         self._verify_calibrations = tuple(profiles)
         self._verify_policy_ms = policy_ms
-        self._verify_collecting = False
 
     @property
     def _verification_group(self) -> tuple[int, ...]:
@@ -561,7 +510,6 @@ class DeepseekV41DSpark(BaseDrafter):
         )
         peers = buffers.peers.tolist()
         selected = full
-        collecting = True
         if all(math.isfinite(value) for peer in peers for value in peer):
             lower = min(int(peer[0]) for peer in peers)
             upper = max(int(peer[1]) for peer in peers)
@@ -578,7 +526,6 @@ class DeepseekV41DSpark(BaseDrafter):
                 if profile.covers(
                     batch_size=batch_size, min_context=lower, max_context=upper
                 ):
-                    collecting = False
                     selected = self.verify_budget_policy.select_distributed(
                         rank_scores,
                         graph_batch_size=batch_size,
@@ -587,16 +534,6 @@ class DeepseekV41DSpark(BaseDrafter):
                         policy_ms=self._verify_policy_ms,
                     )
                     break
-            if collecting and not self._verify_startup_ready:
-                region = self._verify_context_region((lower, upper))
-                collector = (
-                    self._verify_collectors.get((batch_size, *region))
-                    if region is not None
-                    else None
-                )
-                if collector is not None:
-                    selected = collector.next_capacity() or full
-        self._verify_collecting = collecting and not self._verify_startup_ready
         if selected != full:
             # Keep the pinned H2D source step-local; peers is CPU-only storage.
             buffers.packet.copy_(packet, non_blocking=True)
@@ -622,7 +559,6 @@ class DeepseekV41DSpark(BaseDrafter):
         tp = int(self.draft_model.mapping.attn.tp_size)
         rank = int(self.draft_model.mapping.attn.tp_rank)
         selected = full
-        collecting = True
         scores = None
         if rank == 0:
             scores = self.verify_feedback.scores()
@@ -634,7 +570,6 @@ class DeepseekV41DSpark(BaseDrafter):
                         min_context=bounds[0],
                         max_context=bounds[1],
                     ):
-                        collecting = False
                         selected = self.verify_budget_policy.select(
                             scores,
                             graph_batch_size=padded_bs,
@@ -643,27 +578,17 @@ class DeepseekV41DSpark(BaseDrafter):
                             policy_ms=self._verify_policy_ms,
                         )
                         break
-                if collecting and not self._verify_startup_ready:
-                    region = self._verify_context_region(bounds)
-                    if region is not None:
-                        collector = self._verify_collectors.get((actual_bs, *region))
-                        if collector is not None:
-                            selected = collector.next_capacity() or full
         # One authoritative packet aligns graph choice and allocation scores.
         # All TP ranks participate even when their local async feedback is late.
         packet = torch.zeros(buffers.packet.shape, dtype=torch.float32, pin_memory=True)
         packet[0] = selected
-        packet[1] = int(collecting)
         if rank == 0 and selected != full:
             packet[2:].copy_(torch.tensor(scores, dtype=torch.float32).flatten())
         if tp > 1:
             torch.distributed.broadcast(
                 packet, src=self.tp_group[0], group=self._verification_host_group
             )
-            selected_value, collecting_value = packet[:2].tolist()
-            selected = int(selected_value)
-            collecting = bool(collecting_value)
-        self._verify_collecting = collecting and not self._verify_startup_ready
+            selected = int(packet[0].item())
         if selected != full:
             buffers.packet.copy_(packet, non_blocking=True)
             source = buffers.packet[2:].view(actual_bs, self.block_size)
@@ -671,132 +596,6 @@ class DeepseekV41DSpark(BaseDrafter):
                 source, batch_size=actual_bs, query_capacity=selected
             )
         return selected
-
-    @staticmethod
-    def _verify_context_region(bounds: tuple[int, int]) -> tuple[int, int] | None:
-        # Do not fit one cost to a batch spanning different context regions.
-        # Fixed nonoverlapping ranges make profile lookup and cache validation
-        # unambiguous; crossing a boundary falls back until the batch fits again.
-        lo, hi = bounds
-        step = 16384
-        lower = ((lo - 1) // step) * step + 1
-        upper = lower + step - 1
-        return (lower, upper) if 1 <= lo <= hi <= upper else None
-
-    def _update_verify_calibration(self) -> None:
-        # All ranks consume the same aligned history and install the same
-        # profiles. No rank may independently skip the calibration collective.
-        tp = len(self._verification_group)
-        for sample in self._aligned_verify_samples:
-            region = self._verify_context_region(
-                (sample.min_context, sample.max_context)
-            )
-            if region is None or sample.batch_size not in self._verify_budget_buffers:
-                continue
-            if any(
-                profile.covers(
-                    batch_size=sample.batch_size,
-                    min_context=sample.min_context,
-                    max_context=sample.max_context,
-                )
-                for profile in self._verify_calibrations
-            ):
-                continue
-            key = (sample.batch_size, *region)
-            collector = self._verify_collectors.get(key)
-            if collector is None:
-                collector = VerifyCalibrationCollector(
-                    batch_size=sample.batch_size,
-                    verify_width=self.spec_num_tokens,
-                    context_bounds=region,
-                    capacities=self.decode_graph_query_capacities(sample.batch_size),
-                    world_size=tp,
-                    minimum_samples=8,
-                    warmup_samples=2,
-                )
-                self._verify_collectors[key] = collector
-                if self._verification_rank == 0:
-                    logger.info(
-                        f"Adaptive DSpark calibration started: "
-                        f"local_bs={sample.batch_size}, context={region}, "
-                        f"query_capacities={collector.capacities}, "
-                        f"warmup_per_capacity={collector.warmup_samples}, "
-                        f"samples_per_capacity={collector.minimum_samples}. "
-                        "Only aligned valid steps count; progress is retained "
-                        "across requests in the same batch/context region."
-                    )
-            # The alignment step already verified every rank and reduced max.
-            collector.observe(
-                step=sample.step,
-                query_capacity=sample.query_capacity,
-                context_bounds=(sample.min_context, sample.max_context),
-                rank_steps=[sample.step] * tp,
-                rank_ms=[sample.elapsed_ms] * tp,
-            )
-            profile = collector.result()
-            if profile is not None:
-                # Complete-step timings already include policy/packet overhead.
-                self.install_verify_calibration(
-                    (*self._verify_calibrations, profile), policy_ms=0.0
-                )
-                self._save_verify_calibration()
-                if self._verification_rank == 0:
-                    logger.info(
-                        f"Adaptive DSpark calibration complete: BS={profile.batch_size}, "
-                        f"context=[{profile.min_context}, {profile.max_context}], "
-                        f"samples_per_capacity={profile.sample_count}, "
-                        f"full_step_ms={profile.native_step_ms:.3f}, "
-                        f"adaptive_step_ms={dict(profile.adaptive_step_ms)}"
-                    )
-
-    def _synchronize_verify_samples(self, buffers: _VerifyBudgetBuffers) -> None:
-        # Calibration only: never equate each rank's latest completion with the
-        # same step. A short history accommodates asynchronous completion skew.
-        samples = self._verify_step_samples[-buffers.timing_packet.shape[0] :]
-        packet = torch.zeros(
-            buffers.timing_packet.shape, dtype=torch.float64, pin_memory=True
-        )
-        for index, sample in enumerate(samples):
-            bounds = (sample.min_context, sample.max_context)
-            if self.draft_model.mapping.attn.dp_size > 1:
-                region = self._verify_context_region(bounds)
-                if region is None:
-                    continue
-                bounds = region
-            packet[index].copy_(
-                torch.tensor(
-                    [
-                        sample.step,
-                        sample.batch_size,
-                        sample.query_capacity,
-                        bounds[0],
-                        bounds[1],
-                        sample.elapsed_ms,
-                    ],
-                    dtype=torch.float64,
-                )
-            )
-        tp = len(self._verification_group)
-        if tp > 1:
-            torch.distributed.all_gather_into_tensor(
-                buffers.timing_peers.flatten(),
-                packet.flatten(),
-                group=self._verification_host_group,
-            )
-            peers = buffers.timing_peers.tolist()
-        else:
-            peers = [packet.tolist()]
-        histories = []
-        for peer in peers:
-            history = []
-            for row in peer:
-                if not all(math.isfinite(value) for value in row):
-                    continue
-                if row[5] <= 0 or any(value != int(value) for value in row[:5]):
-                    continue
-                history.append(VerifyStepSample(*(int(v) for v in row[:5]), row[5]))
-            histories.append(history)
-        self._aligned_verify_samples = align_verify_samples(histories)
 
     def capture_round_graphs(
         self, graph_bs: int, *, stream: torch.cuda.Stream, pool: tuple[int, int]
@@ -827,11 +626,6 @@ class DeepseekV41DSpark(BaseDrafter):
                 ),
                 dtype=torch.float32,
                 device="cpu",
-            ),
-            timing_packet=torch.empty((8, 6), dtype=torch.float64),
-            timing_peers=torch.empty(
-                (len(self._verification_group), 8, 6),
-                dtype=torch.float64,
             ),
         )
         self._verify_budget_buffers[graph_bs] = buffers
@@ -938,7 +732,12 @@ class DeepseekV41DSpark(BaseDrafter):
                     "draft_moe_backend": args.draft_moe_backend,
                     "graph_step": self.verify_graph_token_step,
                     "verify_width": self.spec_num_tokens,
-                    "calibration": {"context_step": 16384, "warmup": 2, "samples": 8},
+                    "calibration": {
+                        "context_endpoints": STARTUP_CONTEXT_ENDPOINTS,
+                        "include_context_limit": True,
+                        "warmup": STARTUP_WARMUP_REPLAYS,
+                        "samples": STARTUP_MEASURED_REPLAYS,
+                    },
                     "software": calibration_source_fingerprint(
                         [
                             Path(tokenspeed.__file__).parent,
@@ -1018,12 +817,6 @@ class DeepseekV41DSpark(BaseDrafter):
             self.verify_feedback.invalidate()
         self._verify_calibrations = ()
         self._verify_policy_ms = None
-        self._verify_timing_epoch += 1
-        self._active_verify_timing = None
-        self._verify_step_samples.clear()
-        self._aligned_verify_samples = ()
-        self._verify_collectors.clear()
-        self._verify_collecting = True
         self._verify_budget_graphs.clear()
         self._verify_budget_buffers.clear()
 
@@ -1062,36 +855,10 @@ class DeepseekV41DSpark(BaseDrafter):
                 self.verify_feedback.publish(
                     pending.snapshot, pending.scores.tolist(), context_lengths=lengths
                 )
-                timing = pending.timing
-                if timing is not None and timing.epoch == self._verify_timing_epoch:
-                    elapsed = timing.start.elapsed_time(timing.end)
-                    if math.isfinite(elapsed) and elapsed > 0:
-                        self._verify_step_samples.append(
-                            VerifyStepSample(
-                                timing.step,
-                                timing.batch_size,
-                                timing.query_capacity,
-                                min(lengths),
-                                max(lengths),
-                                elapsed,
-                            )
-                        )
-                        # Keep enough history for asynchronous rank alignment,
-                        # without retaining unbounded per-step measurements.
-                        del self._verify_step_samples[:-64]
 
     def finish_round(self, ctx: ForwardContext, graph_bs: int | None) -> None:
         # Runs on the forward thread, outside capture, after draft writes.
         # Do not wait for feedback; a busy copy queue means native fallback.
-        timing = self._active_verify_timing
-        self._active_verify_timing = None
-        if timing is not None:
-            if ctx.num_extends or timing.batch_size != ctx.bs or graph_bs != ctx.bs:
-                timing = None
-            else:
-                # Same stream as graph replay and output copies. The ready
-                # event below guarantees both timing events have completed.
-                timing.end.record()
         if (
             self.verify_feedback is None
             or ctx.num_extends
@@ -1121,7 +888,7 @@ class DeepseekV41DSpark(BaseDrafter):
         event = torch.cuda.Event()
         event.record()
         self._pending_verify_feedback.append(
-            _PendingVerifyFeedback(event, host, contexts, snapshot, timing)
+            _PendingVerifyFeedback(event, host, contexts, snapshot)
         )
 
     def _draft_decode_rows(

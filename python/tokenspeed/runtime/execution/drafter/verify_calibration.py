@@ -32,6 +32,10 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from statistics import median
 
+STARTUP_CONTEXT_ENDPOINTS = (8192, 32768, 131072, 524288)
+STARTUP_WARMUP_REPLAYS = 2
+STARTUP_MEASURED_REPLAYS = 8
+
 
 def calibration_source_fingerprint(roots: Sequence[Path]) -> str:
     """Fingerprint installed Python code and native build artifacts once at boot.
@@ -64,74 +68,6 @@ def calibration_source_fingerprint(roots: Sequence[Path]) -> str:
                 digest.update(path.read_bytes())
             digest.update(b"\0")
     return digest.hexdigest()
-
-
-@dataclass(frozen=True)
-class VerifyStepSample:
-    step: int
-    batch_size: int
-    query_capacity: int
-    min_context: int
-    max_context: int
-    elapsed_ms: float
-
-
-def align_verify_samples(
-    rank_samples: Sequence[Sequence[VerifyStepSample]],
-) -> tuple[VerifyStepSample, ...]:
-    """Intersect completed step histories and retain the slowest rank time.
-
-    Metadata must agree exactly. A missing, duplicated or mismatched observation
-    cannot calibrate another rank's step, even when its elapsed time is valid.
-    """
-    if not rank_samples:
-        return ()
-    histories = []
-    for samples in rank_samples:
-        history = {}
-        duplicates = set()
-        for sample in samples:
-            if sample.step in history:
-                duplicates.add(sample.step)
-            history[sample.step] = sample
-        for step in duplicates:
-            del history[step]
-        histories.append(history)
-    common = set(histories[0]).intersection(*(set(h) for h in histories[1:]))
-    aligned = []
-    for step in sorted(common):
-        samples = [history[step] for history in histories]
-        first = samples[0]
-        metadata = (
-            first.step,
-            first.batch_size,
-            first.query_capacity,
-            first.min_context,
-            first.max_context,
-        )
-        if (
-            any(type(value) is not int for value in metadata)
-            or first.step < 0
-            or first.batch_size < 1
-            or first.query_capacity < first.batch_size
-            or not 1 <= first.min_context <= first.max_context
-            or any(
-                (
-                    sample.step,
-                    sample.batch_size,
-                    sample.query_capacity,
-                    sample.min_context,
-                    sample.max_context,
-                )
-                != metadata
-                or not math.isfinite(sample.elapsed_ms)
-                or sample.elapsed_ms <= 0
-                for sample in samples
-            )
-        ):
-            continue
-        aligned.append(VerifyStepSample(*metadata, max(s.elapsed_ms for s in samples)))
-    return tuple(aligned)
 
 
 @dataclass(frozen=True)
@@ -298,114 +234,3 @@ class VerifyCalibrationCache:
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
-
-
-class VerifyCalibrationCollector:
-    """Collect aligned rank timings for one prepared batch/context region.
-
-    Callers exclude warmup and must report every TP rank for the same step.
-    The collector never turns a partial rank observation into a cost record.
-    """
-
-    def __init__(
-        self,
-        *,
-        batch_size: int,
-        verify_width: int,
-        context_bounds: tuple[int, int],
-        capacities: tuple[int, ...],
-        world_size: int,
-        minimum_samples: int,
-        warmup_samples: int,
-    ):
-        if any(
-            type(n) is not int or n < 1
-            for n in (batch_size, verify_width, world_size, minimum_samples)
-        ):
-            raise ValueError("calibration dimensions must be positive integers")
-        if type(warmup_samples) is not int or warmup_samples < 0:
-            raise ValueError("warmup_samples must be a nonnegative integer")
-        self.warmup_samples = warmup_samples
-        self.warmed: dict[int, int] = {q: 0 for q in capacities}
-        lo, hi = context_bounds
-        if lo < 1 or hi < lo:
-            raise ValueError("invalid calibration context region")
-        full = batch_size * verify_width
-        if (
-            not capacities
-            or len(set(capacities)) != len(capacities)
-            or full not in capacities
-            or any(
-                type(q) is not int or not batch_size <= q <= full for q in capacities
-            )
-        ):
-            raise ValueError(
-                "calibration must include valid unique capacities and full width"
-            )
-        self.batch_size = batch_size
-        self.verify_width = verify_width
-        self.context_bounds = context_bounds
-        self.capacities = tuple(sorted(capacities))
-        self.world_size = world_size
-        self.minimum_samples = minimum_samples
-        self.samples: dict[int, list[float]] = {q: [] for q in capacities}
-        self.last_step = -1
-
-    def next_capacity(self) -> int | None:
-        """Measure the full path first, then the least-sampled prepared tier."""
-        full = self.batch_size * self.verify_width
-        if len(self.samples[full]) < self.minimum_samples:
-            return full
-        missing = [
-            q for q in self.capacities if len(self.samples[q]) < self.minimum_samples
-        ]
-        return (
-            min(missing, key=lambda q: (len(self.samples[q]), -q)) if missing else None
-        )
-
-    def observe(
-        self,
-        *,
-        step: int,
-        query_capacity: int,
-        context_bounds: tuple[int, int],
-        rank_steps: Sequence[int],
-        rank_ms: Sequence[float],
-    ) -> bool:
-        if (
-            step <= self.last_step
-            or query_capacity not in self.samples
-            or len(rank_steps) != self.world_size
-            or len(rank_ms) != self.world_size
-            or any(value != step for value in rank_steps)
-            or any(not math.isfinite(value) or value <= 0 for value in rank_ms)
-        ):
-            return False
-        lo, hi = context_bounds
-        if not self.context_bounds[0] <= lo <= hi <= self.context_bounds[1]:
-            return False
-        self.last_step = step
-        if self.warmed[query_capacity] < self.warmup_samples:
-            self.warmed[query_capacity] += 1
-            return False
-        values = self.samples[query_capacity]
-        if len(values) >= self.minimum_samples:
-            return False
-        values.append(max(rank_ms))
-        return True
-
-    def result(self) -> VerifyCalibration | None:
-        if self.next_capacity() is not None:
-            return None
-        full = self.batch_size * self.verify_width
-        return VerifyCalibration.measure(
-            batch_size=self.batch_size,
-            verify_width=self.verify_width,
-            min_context=self.context_bounds[0],
-            max_context=self.context_bounds[1],
-            native_samples=self.samples[full],
-            adaptive_samples={
-                q: values for q, values in self.samples.items() if q != full
-            },
-            minimum_samples=self.minimum_samples,
-        )
