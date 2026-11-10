@@ -324,6 +324,69 @@ def test_decode_monokernel_refuses_a_head_it_cannot_pack() -> None:
     assert draft.monokernel_state.head is None
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not current_platform().is_cdna4,
+    reason="the draft monokernels are gfx950 kernels",
+)
+def test_the_draft_launches_in_serving_order_never_repeat_a_tag(monkeypatch) -> None:
+    """Each verify writes the draft's context, runs the draft block's layer
+    launches, then the head. The context write and the head launch under the
+    draft's step counter, which the block moves: every context write gets a
+    new tag, and a second context write before the block (it would repeat
+    the tag) or a head without a block before it fails before launching."""
+    from tokenspeed.runtime.models import muse_spark_dflash2_monokernel as seam
+
+    draft = _packed_draft()
+    state = draft.monokernel_state
+    # The launches need the TP8 group; these record each one's tag.
+    context_tags: list[int] = []
+    head_tags: list[int] = []
+
+    def context_launch(fused, *, compile_only, step, **operands) -> None:
+        if not compile_only:
+            context_tags.append(int(step))
+
+    def head_launch(hidden, first_token):
+        head_tags.append(int(state.step[0]))
+        return hidden, first_token, first_token
+
+    monkeypatch.setattr(seam, "muse_spark_draft_context_decode", context_launch)
+    monkeypatch.setattr(seam.dist, "barrier", lambda group=None: None)
+    state.head = head_launch
+
+    class Pool:
+        """The draft's KV pool: one cache page for each layer."""
+
+        def get_kv_buffer(self, layer_id):
+            kv = torch.zeros(64, 128, dtype=torch.bfloat16, device="cuda")
+            return kv, kv
+
+    rows = seam.CONTEXT_ROWS
+    # write_context reads the target's five tapped layers, 8192 columns each.
+    taps = torch.zeros(rows, 5 * 8192, dtype=torch.bfloat16, device="cuda")
+    positions = torch.arange(rows, device="cuda")
+    hidden = torch.zeros(
+        seam.STEPS, int(draft.config.hidden_size), dtype=torch.bfloat16, device="cuda"
+    )
+    first = torch.zeros(1, dtype=torch.int64, device="cuda")
+
+    with pytest.raises(RuntimeError, match="after the draft layers' launches"):
+        state.run_head(hidden, first)
+    for verify in range(3):
+        state.write_context(taps, positions, positions, Pool())
+        with pytest.raises(RuntimeError, match="would repeat its launch's tag"):
+            state.write_context(taps, positions, positions, Pool())
+        # The block forward: its layers launch, and the step moves after them.
+        state.start_step()
+        state.launched = True
+        state.finish_step()
+        state.run_head(hidden, first)
+        with pytest.raises(RuntimeError, match="after the draft layers' launches"):
+            state.run_head(hidden, first)
+    assert context_tags == [0, 1, 2]
+    assert head_tags == [1, 2, 3]
+
+
 @pytest.mark.parametrize(
     "overrides, reason",
     [

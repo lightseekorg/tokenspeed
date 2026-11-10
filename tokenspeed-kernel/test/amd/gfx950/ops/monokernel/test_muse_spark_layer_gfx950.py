@@ -804,6 +804,143 @@ def test_launches_that_project_the_next_layer_match_the_regular_order(kinds):
     mp.spawn(_shift_worker, args=(port, kinds), nprocs=WORLD, join=True)
 
 
+def _serving_order_worker(rank: int, port: int) -> None:
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        "gloo",
+        init_method=f"tcp://localhost:{port}",
+        rank=rank,
+        world_size=WORLD,
+        timeout=timedelta(seconds=900),
+    )
+    try:
+        dev = torch.device(f"cuda:{rank}")
+        ctx = get_or_create_context(heap_size=256 << 20)
+        group = IrisGroup(ctx, dist.group.WORLD, rank, dev)
+        rows, length = 8, 3000
+        end = length + rows - 1
+        plan = layer.layer_plan(
+            full=False,
+            rows=rows,
+            chain=rows,
+            warm_next=False,
+            own_qkvg=True,
+            next_qkvg=False,
+            check_parity=True,
+        )
+        scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
+        sh = inputs.layer_shared(42, length, rows)
+        w = inputs.layer_rank_weights(rank, end)
+        packed = _pack(rank, dev, sh, end, False)
+        # A step's last two launching layers, then the next step's first two:
+        # (layer index, step offset, full). Serving launches layers 1-60
+        # every step, so the parity (layer & 1) alternates across the step
+        # boundary too: 59, 60, then 1, 2.
+        order = [(59, 0, False), (60, 0, True), (1, 1, False), (2, 1, False)]
+        layers = []
+        for i, (_, _, full) in enumerate(order):
+            g = torch.Generator().manual_seed(3000 + 10 * rank + i)
+            qkvg = (torch.randn(QKVG, HIDDEN, generator=g) / HIDDEN**0.5).to(
+                torch.bfloat16
+            )
+            layers.append(
+                dataclasses.replace(packed, full=full, qkvg=bf16_tiles(qkvg.to(dev)))
+            )
+        own = slice(rank * OWNED, (rank + 1) * OWNED)
+        pos = torch.arange(length - 1, length - 1 + rows)
+        slots = (sh["table"][pos // 64].long() * 64 + pos % 64).to(torch.int32)
+        seq_len = (pos + 1).to(torch.int32).to(dev)
+        slot = slots.to(dev)
+        page_table = sh["table"].to(dev)
+        cos_sin = ref.rope_table(end + 1).to(dev)
+        proj = torch.zeros(2, rows, int(PROJ_WORDS), dtype=torch.int32, device=dev)
+        fused = {index for index, _, _ in order}
+
+        def run(first_step: int, caches, barriered: bool):
+            # The step counter is a device tensor that moves once per step on
+            # the stream, after the step's last launch, as in serving.
+            step = torch.full((1,), first_step, dtype=torch.int32, device=dev)
+            h, a = sh["h"][:, own].contiguous().to(dev), sh["a_in"].to(dev)
+            out = []
+            for i, (index, offset, _) in enumerate(order):
+                if i and offset != order[i - 1][1]:
+                    step.add_(1)
+                # The serving hand-off of the next layer's projection.
+                proj_in = proj[index & 1] if index - 1 in fused else None
+                proj_out = proj[(index + 1) & 1] if index + 1 in fused else None
+                h_out = torch.empty(rows, OWNED, device=dev)
+                a_out = torch.empty(rows, HIDDEN, dtype=torch.bfloat16, device=dev)
+                layer.launch_gluon_muse_spark_layer_gfx950(
+                    layers[i],
+                    h=h,
+                    a=a,
+                    h_out=h_out,
+                    a_out=a_out,
+                    seq_len=seq_len,
+                    slot=slot,
+                    page_table=page_table,
+                    k_cache=caches[i][0],
+                    v_cache=caches[i][1],
+                    cos_sin=cos_sin,
+                    scratch=scratch,
+                    step=step,
+                    peer_bases=group.bases,
+                    layer=index,
+                    chain=rows,
+                    whole_rows=False,
+                    tap=None,
+                    tap_slot=None,
+                    warm_next=None if proj_out is None else layers[i + 1],
+                    proj_in=proj_in,
+                    proj_out=proj_out,
+                    trace_buf=None,
+                    stuck_rec=None,
+                    # Traps if two launches in a row share a parity.
+                    check_parity=True,
+                    compile_only=False,
+                )
+                if barriered:
+                    torch.cuda.synchronize()
+                    dist.barrier()
+                out.append((h_out, a_out))
+                h, a = h_out, a_out
+            torch.cuda.synchronize()
+            dist.barrier()
+            return [(h.cpu(), a.cpu()) for h, a in out]
+
+        group.finish_prepare()
+        caches = [[w["k_cache"].to(dev), w["v_cache"].to(dev)] for _ in order]
+        barriered = [[c.clone() for c in cs] for cs in caches]
+        unbarriered = [[c.clone() for c in cs] for cs in caches]
+        want = run(3, barriered, True)
+        # The same launches back to back with nothing between them, under the
+        # next steps' tags: a rank may start the next step's first launch
+        # while its peers still finish the last one.
+        got = run(5, unbarriered, False)
+        for i, (index, _, _) in enumerate(order):
+            assert torch.equal(got[i][0], want[i][0]), f"layer {index}: residual"
+            assert torch.equal(got[i][1], want[i][1]), f"layer {index}: next input"
+            for c in range(2):
+                assert torch.equal(
+                    unbarriered[i][c], barriered[i][c]
+                ), f"layer {index}: cache {c}"
+    finally:
+        dist.destroy_process_group()
+
+
+def test_launches_across_a_step_boundary_run_unbarriered():
+    """Serving runs the launches back to back, with no synchronization
+    between them: layer 60 of one step and layer 1 of the next run under
+    alternating parity and give the same bits as the same launches with a
+    barrier after each (the parity check traps on a repeated parity)."""
+    if torch.cuda.device_count() < WORLD:
+        pytest.skip(f"requires {WORLD} GPUs")
+    with socket.socket() as sock:
+        sock.bind(("", 0))
+        port = sock.getsockname()[1]
+    mp.spawn(_serving_order_worker, args=(port,), nprocs=WORLD, join=True)
+
+
 def _graph_worker(rank: int, port: int, length: int) -> None:
     torch.cuda.set_device(rank)
     dist.init_process_group(
