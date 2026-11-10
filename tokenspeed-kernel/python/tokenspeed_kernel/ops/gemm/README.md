@@ -170,6 +170,14 @@ retain their semantics; small-M BF16 keeps its existing bound.
 
 ## Block-FP8 DeepGEMM
 
+Explicit block-FP8 solutions prepare loaded weights through
+`prepare_fp8_block_weight`, which calls the selected kernel's
+`weight_preprocessor`. Dense layers pin that solution only when preprocessing replaces weight tensors.
+Solutions without a preprocessor retain their existing parameters and forward
+dispatch, without load-time kernel selection.
+Automatic dispatch retains canonical weights for shape-dependent selection.
+
+
 `deepgemm_mm_fp8_blockscale` supports explicit `mm(..., override=...)` or
 `solution="deepgemm"` selection. Serving can opt in with
 `--dense-gemm-backend deepgemm` for standard block-FP8 dense linears. The

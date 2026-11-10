@@ -104,6 +104,7 @@ def prepare_deepgemm_fp8_weight(
         "out_contiguous": frozenset({True}),
         "out_dtype": frozenset({torch.bfloat16}),
     },
+    weight_preprocessor=prepare_deepgemm_fp8_weight,
     # Below the existing Triton block-FP8 leaf: auto keeps its current choice.
     priority=Priority.PERFORMANT,
 )

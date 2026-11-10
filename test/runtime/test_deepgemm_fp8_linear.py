@@ -59,6 +59,8 @@ def test_loaded_linear_and_graph(monkeypatch, serialized, rows):
     else:
         layer.weight.data.copy_(original)
     method.process_weights_after_loading(layer)
+    # A later global option change must not reinterpret prepared weight storage.
+    monkeypatch.setitem(global_server_args_dict, "dense_gemm_backend", "auto")
     x = torch.randn(rows, k, device="cuda", dtype=torch.bfloat16) * 0.1
     actual = method.apply(layer, x)
     graph = torch.cuda.CUDAGraph()

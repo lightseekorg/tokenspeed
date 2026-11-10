@@ -52,7 +52,7 @@ from tokenspeed_kernel.platform import (
     pdl_enabled,
 )
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
-from tokenspeed_kernel.registry import KernelRegistry
+from tokenspeed_kernel.registry import KernelRegistry, load_builtin_kernels
 from tokenspeed_kernel.selection import (
     KernelPlan,
     NoKernelFoundError,
@@ -132,6 +132,7 @@ __all__ = [
     "mm",
     "prepare_mxfp8_weight_scales",
     "prepare_deepgemm_fp8_weight",
+    "prepare_fp8_block_weight",
     "prepare_nvfp4_a16_weights",
 ]
 
@@ -1343,6 +1344,57 @@ def _fp8_projection_kernel(
             "is_cuda": device.type == "cuda",
         },
     )
+
+
+def prepare_fp8_block_weight(
+    weight: torch.Tensor,
+    scales: torch.Tensor,
+    *,
+    block_size: list[int],
+    solution: str | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply a pinned block-FP8 solution's load-time weight preprocessor.
+
+    Automatic dispatch retains canonical weights because its kernel selection
+    can depend on the activation row count. Callers must use the same solution
+    in subsequent mm calls when preprocessing replaces their tensors. Solutions
+    without a preprocessor leave validation to forward dispatch.
+    """
+    if solution is None:
+        return weight, scales
+    load_builtin_kernels()
+    registry = KernelRegistry.get()
+    if not any(
+        spec.weight_preprocessor is not None
+        for spec in registry.get_for_operator("gemm", "mm", solution=solution)
+    ):
+        return weight, scales
+    kernel = select_kernel(
+        "gemm",
+        "mm",
+        _gemm_format_signature(
+            weight, weight, None, scales, torch.bfloat16, "mxfp8", block_size
+        ),
+        traits={
+            "n": weight.shape[0],
+            "k": weight.shape[1],
+            "a_contiguous": True,
+            "b_contiguous": weight.is_contiguous(),
+            "block_scale_layout": (
+                "canonical_blackwell"
+                if Platform.get().is_blackwell_plus
+                else "canonical"
+            ),
+            "out_dtype": torch.bfloat16,
+            "out_contiguous": True,
+            "has_alpha": False,
+        },
+        solution=solution,
+    )
+    preprocessor = KernelRegistry.get().get_by_name(kernel.name).weight_preprocessor
+    if preprocessor is None:
+        return weight, scales
+    return preprocessor(weight, scales)
 
 
 def _prepared_fp8_scales(
