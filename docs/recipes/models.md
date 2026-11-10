@@ -730,6 +730,7 @@ GPU_MAX_HW_QUEUES=2 tokenspeed serve moonshotai/Kimi-K3.1-Pro \
   --max-num-seqs 64 \
   --disable-kvstore \
   --enable-startup-requests \
+  --prefill-graph-max-tokens 3072 \
   --host 0.0.0.0 \
   --port 8000
 ```
@@ -742,8 +743,9 @@ GPU_MAX_HW_QUEUES=2 tokenspeed serve moonshotai/Kimi-K3.1-Pro \
 - `--drafter-attention-backend gluon` pins the draft's MLA layers to the Gluon
   kernels and fails fast where none is registered; leaving it unset lets the
   `mla` backend select the kernels.
-- Prefill runs eager on gfx950: the DSA backend replays prefill CUDA graphs on
-  NVIDIA only.
+- Prefill CUDA graphs replay under KV parallelism too, with the DSA attention
+  and the KV history gather at eager breaks. `--prefill-graph-max-tokens 3072`
+  captures only chunks of up to 3072 new tokens; longer chunks run faster eager.
 - `GPU_MAX_HW_QUEUES=2` gives each stream priority one hardware queue per
   compute pipe. With ROCm's default of 4, two queues share a pipe, so
   prefill's high-priority side kernels can wait behind the forward's GEMMs.
