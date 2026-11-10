@@ -205,13 +205,15 @@ under `test/runtime/` or `tokenspeed-kernel/test/`; a unit-test task keeps the
 tests its definition names, as files or directories, and every test helper. A
 module there belongs to one model when it defines `EntryClass` or a task lists
 it; any other module, such as `utils.py`, is shared, and a change to it runs
-every task. The scan fails when a listed module does not exist, or imports a
+every task. Speculative-decoding draft modules (file names with `nextn`,
+`eagle`, `dflash` or `dspark`) are shared too, and `model_sources` may not list
+them. The scan fails when a listed module does not exist, or imports a
 module that belongs to one model without the task listing it too.
 
 ```yaml
 model_sources:
+  - python/tokenspeed/runtime/models/llama.py
   - python/tokenspeed/runtime/models/minimax_m3.py
-  - python/tokenspeed/runtime/models/llama_eagle3.py
 ```
 
 `changed_paths: true` hands a pull request's changed paths to the task's

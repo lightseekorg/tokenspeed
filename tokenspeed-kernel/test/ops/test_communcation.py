@@ -31,6 +31,7 @@ from tokenspeed_kernel.ops.communication import triton as triton_communication
 from tokenspeed_kernel.ops.communication.iris import (
     create_iris_state,
     iris_all_reduce,
+    iris_lamport_residual_rmsnorm_supported,
 )
 from tokenspeed_kernel.ops.communication.triton import (
     all_gather,
@@ -44,6 +45,12 @@ def get_open_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("", 0))
         return sock.getsockname()[1]
+
+
+def test_lamport_residual_rmsnorm_supported_only_on_cdna4():
+    """The predicate answers on every platform, though only ROCm installs Iris."""
+    supported = iris_lamport_residual_rmsnorm_supported(4, 8192, torch.bfloat16)
+    assert supported == current_platform().is_cdna4
 
 
 def test_alloc_symm_escapes_inference_mode(monkeypatch):
