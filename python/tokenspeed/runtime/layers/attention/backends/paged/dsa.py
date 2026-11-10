@@ -443,8 +443,8 @@ class DSABackend(PagedAttentionBackend):
             # replay explicitly in its model code, so the class-level DSA
             # restriction does not apply to it.
             self.cuda_graph_support = CudaGraphSupport(prefill_graph=True)
-        elif spec.padded_prefill_replay and (platform.is_nvidia or platform.is_cdna4):
-            # K3.1 narrows padded replays to live rows; validated on NVIDIA and gfx950.
+        elif spec.padded_prefill_replay:
+            # K3.1 narrows padded replays to live rows.
             self.cuda_graph_support = CudaGraphSupport(prefill_graph=True)
             padded_replay_opt_in = True
         if len(self.qcp_group) > 1:

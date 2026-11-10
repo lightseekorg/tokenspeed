@@ -1955,16 +1955,12 @@ def test_dsa_leaf_admits_prefill_graphs_only_under_padded_replay(
 ) -> None:
     import logging
 
-    from tokenspeed_kernel.platform import current_platform
-
     from tokenspeed.runtime.layers.attention.backends.paged.dsa import DSABackend
     from tokenspeed.runtime.layers.attention.backends.support import (
         resolve_cuda_graph_support,
     )
 
-    # The leaf opts in on NVIDIA and gfx950, the platforms validated.
-    platform = current_platform()
-    admits = padded_prefill_replay and bool(platform.is_nvidia or platform.is_cdna4)
+    admits = padded_prefill_replay
     dsa_logger = "tokenspeed.runtime.layers.attention.backends.paged.dsa"
     support_logger = "tokenspeed.runtime.layers.attention.backends.support"
     for name in (dsa_logger, support_logger):
