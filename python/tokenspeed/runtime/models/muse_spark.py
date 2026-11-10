@@ -61,6 +61,7 @@ from tokenspeed_kernel.ops.moe import (
     prepare_nvfp4_routing,
     routed_input_scale_rmsnorm_sum,
     routed_input_scale_rmsnorm_sum_gathered,
+    routed_sum_reduces_mailbox,
     warmup_moe_sorted_prefill,
 )
 from tokenspeed_kernel.ops.moe._cute_dsl.latent_down import (
@@ -732,6 +733,30 @@ def _bind_mailbox(
     )
 
 
+def _no_route_sum_gemm(
+    x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    raise RuntimeError("the routed-sum kernel stores its own partial into this mailbox")
+
+
+def _bind_ep_all_reduce(
+    group: Group, width: int, layer_id: int, config: MuseSparkConfig, prefix: str
+) -> KimiK3LatentDownOp | None:
+    """Bind a pooled NVLS mailbox holding one routed-sum partial per EP rank, or None."""
+    return KimiK3LatentDownOp.initialize(
+        group=process_group_manager.get_device_process_group(group),
+        hidden_size=width,
+        latent_size=width * len(group),
+        device=torch.device("cuda", torch.cuda.current_device()),
+        block_index=layer_id,
+        layer_count=config.num_hidden_layers,
+        # Mailboxes pool across layers, so the scope excludes the layer index.
+        model_scope=f"{prefix.split('.layers.')[0]}.ep_all_reduce",
+        max_m=_GATHER_WORKSPACE_ROWS,
+        publish_gemm=_no_route_sum_gemm,
+    )
+
+
 class _ScaledHeadNorm(nn.Module):
     """A weightless per-head RMSNorm whose heads scale by a constant, for the attention prologue.
 
@@ -1322,6 +1347,14 @@ class MuseSparkMoE(nn.Module):
         # Decode-sized batches route in the top-k kernel; each token count keeps its own GEMM workspace.
         self.prepared_routing: dict[int, PreparedNvfp4Routing] = {}
         self.iris_state: MuseIrisState | None = None
+        # On NVIDIA the routed-sum kernel all-reduces decode batches over EP through this mailbox.
+        self.ep_all_reduce = (
+            _bind_ep_all_reduce(
+                self.ep_group, compressed_size, layer_id, config, prefix
+            )
+            if self.ep_size > 1 and not current_platform().is_cdna4
+            else None
+        )
 
     def _reduce_expert_routes(
         self,
@@ -1481,6 +1514,17 @@ class MuseSparkMoE(nn.Module):
                     norm.eps,
                     norm.weight_offset,
                 )
+            ep_mailbox = (
+                self.ep_all_reduce.all_reduce_mailbox(num_tokens)
+                if self.ep_all_reduce is not None
+                and not owned_rows
+                and output is None
+                and self.ep_all_reduce.handles(num_tokens)
+                and routed_sum_reduces_mailbox(
+                    routes, route_map, num_tokens, self.topk, route_weights, norm.weight
+                )
+                else None
+            )
             combined = routed_input_scale_rmsnorm_sum_gathered(
                 routes,
                 route_map,
@@ -1492,7 +1536,11 @@ class MuseSparkMoE(nn.Module):
                 norm.weight_offset,
                 pdl_enabled(),
                 output,
+                ep_mailbox,
             )
+            if ep_mailbox is not None:
+                # The kernel already summed over the EP ranks.
+                return combined
             if owned_rows:
                 return iris.reduce_scatter_owned_rows(combined)
         if not owned_rows and self.ep_size <= 1:
