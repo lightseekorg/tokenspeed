@@ -281,7 +281,7 @@ class FusedVerifyStep:
         state_indices,
         metadata,
         stamps,
-        gate,
+        norm_gate,
         norm_weight,
         lower_bound: Float32,
         norm_eps: Float32,
@@ -512,7 +512,7 @@ class FusedVerifyStep:
                     # x^2 + eps) w sigmoid(gate), multiplied left to right.
                     output = _bf16(output)
                     logit = _load(
-                        gate, token_start * gate_token_stride + head * V + tidx
+                        norm_gate, token_start * gate_token_stride + head * V + tidx
                     ).to(Float32)
                     square = cute.arch.warp_reduction_sum(output * output)
                     if lane == 0:
