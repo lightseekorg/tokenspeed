@@ -185,8 +185,11 @@ class DFlashAttention(nn.Module):
 
 
 class DFlashDecoderLayer(nn.Module):
-    """A block-draft layer; subclasses swap its norms, attention or MLP through
-    ``resolve_norm``, ``resolve_attn`` and ``resolve_mlp``."""
+    """A block-draft layer.
+
+    Subclasses swap its norms, attention or MLP through ``resolve_norm``,
+    ``resolve_attn`` and ``resolve_mlp``.
+    """
 
     def __init__(
         self,
