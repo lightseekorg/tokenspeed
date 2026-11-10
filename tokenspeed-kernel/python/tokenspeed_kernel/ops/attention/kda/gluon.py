@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel.ops.attention.kda import KdaPrefillResult, KdaReplayRecords
+from tokenspeed_kernel.ops.tuning import is_warming_up
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -83,7 +84,7 @@ if current_platform().is_amd:
     )
     def gluon_kda_paged_prefill_gfx950(**kwargs) -> KdaPrefillResult:
         """Run specialized gfx950 KDA prefill with V-major state."""
-        output, final_state = _kda_prefill_impl(**kwargs)
+        output, final_state = _kda_prefill_impl(**kwargs, warm_variants=is_warming_up())
         return KdaPrefillResult(out=output, final_state=final_state)
 
     @register_kernel(

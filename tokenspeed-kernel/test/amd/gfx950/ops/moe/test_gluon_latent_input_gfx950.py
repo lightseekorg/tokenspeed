@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from utils import is_cdna4
+from utils import assert_no_triton_compile, is_cdna4
 
 pytest.importorskip(
     "tokenspeed_kernel_amd.ops.gfx950.moe.fp16",
@@ -197,3 +197,94 @@ def test_prefill_routes_packed_projection_and_applies_situ(
     torch.testing.assert_close(actual[0], expected[0], atol=2e-3, rtol=2e-3)
     torch.testing.assert_close(actual[1], expected[1], atol=8e-3, rtol=8e-3)
     torch.testing.assert_close(actual[2], expected[2], atol=1.5e-4, rtol=1e-3)
+
+
+def _packed_k3_weights() -> tuple[torch.Tensor, ...]:
+    packed = torch.randn(896 + 3584 + 1536, 7168, dtype=torch.bfloat16, device="cuda")
+    return (*packed.split((896, 3584, 1536)), packed)
+
+
+@requires_cdna4
+def test_projection_row_counts_reuse_one_binary() -> None:
+    torch.manual_seed(7)
+    weights = _packed_k3_weights()
+    hidden = torch.randn(2048, 7168, dtype=torch.bfloat16, device="cuda")
+
+    def run(tokens: int) -> None:
+        latent_input_mediumm.launch_gluon_latent_input_mediumm_gfx950(
+            hidden[: tokens // 2], *weights, beta=4.0, linear_beta=None
+        )
+        latent_input_largem.launch_gluon_latent_input_largem_gfx950(
+            hidden[:tokens], *weights, beta=4.0, linear_beta=None
+        )
+
+    kernels = (
+        latent_input_mediumm.gluon_latent_input_mediumm_gfx950,
+        latent_input_largem.gluon_latent_input_largem_situ_gfx950,
+    )
+    for kernel in kernels:
+        kernel.device_caches.clear()
+    run(1536)
+    with assert_no_triton_compile(*kernels):
+        for tokens in (1282, 1301, 1999, 2048):
+            run(tokens)
+
+
+@requires_cdna4
+def test_small_batch_warmup_compiles_every_tile_and_split() -> None:
+    torch.manual_seed(7)
+    kernels = (
+        latent_input_small_batch.gluon_latent_input_small_batch_gfx950,
+        latent_input_small_batch.gluon_latent_input_small_batch_epilogue_gfx950,
+    )
+    for kernel in kernels:
+        kernel.device_caches.clear()
+    weights = _packed_k3_weights()
+    hidden = torch.randn(320, 7168, dtype=torch.bfloat16, device="cuda")
+    latent_input_small_batch.launch_gluon_latent_input_small_batch_gfx950(
+        hidden[:8], *weights, beta=4.0, linear_beta=None, warm_max_tokens=320
+    )
+    with assert_no_triton_compile(*kernels):
+        for tokens in (1, 16, 17, 64, 65, 130, 200, 320):
+            latent_input_small_batch.launch_gluon_latent_input_small_batch_gfx950(
+                hidden[:tokens], *weights, beta=4.0, linear_beta=None
+            )
+
+
+@requires_cdna4
+def test_projection_warmup_compiles_both_row_tiles() -> None:
+    torch.manual_seed(7)
+    kernel = latent_input_mediumm.gluon_latent_input_mediumm_gfx950
+    kernel.device_caches.clear()
+    weights = _packed_k3_weights()
+    hidden = torch.randn(1024, 7168, dtype=torch.bfloat16, device="cuda")
+    latent_input_mediumm.launch_gluon_latent_input_mediumm_gfx950(
+        hidden[:512], *weights, beta=4.0, linear_beta=None, warm_variants=True
+    )
+    with assert_no_triton_compile(kernel):
+        for tokens in (64, 848, 1024):
+            latent_input_mediumm.launch_gluon_latent_input_mediumm_gfx950(
+                hidden[:tokens], *weights, beta=4.0, linear_beta=None
+            )
+
+
+@requires_cdna4
+def test_prefill_warmup_compiles_every_region_split() -> None:
+    torch.manual_seed(7)
+    kernel = latent_input_largem.gluon_latent_input_largem_gfx950
+    kernel.device_caches.clear()
+    weights = _packed_k3_weights()
+    packed = weights[-1]
+    hidden = torch.randn(1300, 7168, dtype=torch.bfloat16, device="cuda")
+    # The row-sharded prefill warms with its routed rows; an unaligned batch
+    # later takes the one-pass projection.
+    latent_input_largem.launch_gluon_latent_input_largem_routed_gfx950(
+        hidden[:256], packed, warm_variants=True
+    )
+    with assert_no_triton_compile(kernel):
+        latent_input_largem.launch_gluon_latent_input_largem_gfx950(
+            hidden, *weights, beta=4.0, linear_beta=None
+        )
+        latent_input_largem.launch_gluon_latent_input_largem_shared_gfx950(
+            hidden, packed, beta=4.0, linear_beta=None
+        )

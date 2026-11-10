@@ -508,12 +508,38 @@ def test_decode_gemm_row_count_does_not_recompile(n: int, k: int) -> None:
         out = _decode(a[:rows], b, torch.bfloat16)
         torch.testing.assert_close(out, torch.mm(a[:rows], b.T), atol=1e-4, rtol=_RTOL)
 
-    # Warm both integer classes (divisible by 16 or not) of each bucket.
-    for rows in (3, 4, 5, 8, 9, 16, 17, 32, 33, 64):
+    gluon_mm_a16w16_medium_gfx950.device_caches.clear()
+    # One row count per bucket; the row count itself does not specialize, so
+    # multiples of 16 reuse those binaries.
+    for rows in (3, 4, 5, 8, 9, 17, 33):
         run(rows)
     with assert_no_triton_compile(gluon_mm_a16w16_medium_gfx950):
-        for rows in (2, 6, 7, 12, 14, 20, 27, 40, 48, 61):
+        for rows in (2, 6, 7, 12, 14, 16, 20, 27, 32, 40, 48, 61, 64):
             run(rows)
+
+
+# The indexer wq_b has a 32-row and a 64-row tile; the other shape splits K.
+@pytest.mark.parametrize("n,k", [(4096, 1536), (1536, 7168)])
+def test_decode_gemm_warmup_compiles_every_row_bucket(n: int, k: int) -> None:
+    torch.manual_seed(0)
+    a = torch.randn((64, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    gluon_mm_a16w16_medium_gfx950.device_caches.clear()
+    counters = zeroed_state(
+        gluon_mm_a16w16_decode_num_counters_gfx950(64, n, k),
+        dtype=torch.int32,
+        device=a.device,
+    )
+    launch_gluon_mm_a16w16_decode_gfx950(
+        a, b, torch.bfloat16, counters=counters, warm_variants=True
+    )
+    with assert_no_triton_compile(gluon_mm_a16w16_medium_gfx950):
+        for rows in (2, 5, 9, 17, 33, 64):
+            if supports_gluon_mm_a16w16_decode_gfx950(rows, n, k):
+                out = _decode(a[:rows], b, torch.bfloat16)
+                torch.testing.assert_close(
+                    out, torch.mm(a[:rows], b.T), atol=1e-4, rtol=_RTOL
+                )
 
 
 @pytest.mark.parametrize("m", [2, 4, 7, 8, 16, 24, 32])
@@ -556,10 +582,11 @@ def test_decode_add3_row_count_does_not_recompile() -> None:
             a[:rows], b, addend[:rows], addend[:rows]
         )
 
-    for rows in (3, 4, 5, 8, 9, 16, 17, 32):
+    gluon_mm_a16w16_medium_gfx950.device_caches.clear()
+    for rows in (3, 4, 5, 8, 9, 17):
         run(rows)
     with assert_no_triton_compile(gluon_mm_a16w16_medium_gfx950):
-        for rows in (2, 6, 7, 12, 14, 20, 27, 31):
+        for rows in (2, 6, 7, 12, 14, 16, 20, 27, 31, 32):
             run(rows)
 
 

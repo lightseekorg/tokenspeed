@@ -176,44 +176,57 @@ def test_kda_prefill_matches_packed_recurrent_reference(
     assert actual_state.stride()[-2:] == (dim, 1)
 
 
-def test_kda_prefill_new_batches_reuse_compiled_kernels() -> None:
-    torch.manual_seed(41)
+_KERNELS = [
+    getattr(_prefill, f"gluon_kda_paged_prefill_{stage}_{_ARCH}")
+    for stage in ("prepare", "state_walk", "group_summary", "chain_groups")
+]
+
+
+def _run_prefill(lengths: list[int], **options) -> None:
     heads = 2
     dim = 128
-    a_log = torch.randn(heads, device="cuda", dtype=torch.float32) * 0.1 - 2.0
-    dt_bias = torch.randn(heads, dim, device="cuda", dtype=torch.float32)
+    total_tokens = sum(lengths)
+    q = torch.randn(1, total_tokens, heads, dim, device="cuda", dtype=torch.bfloat16)
+    cu_seqlens_cpu = torch.tensor([0, *accumulate(lengths)], dtype=torch.int64)
+    launch_kda_prefill(
+        q,
+        torch.randn_like(q),
+        torch.randn_like(q),
+        torch.randn_like(q),
+        torch.randn(1, total_tokens, heads, device="cuda", dtype=torch.bfloat16),
+        torch.randn(heads, device="cuda", dtype=torch.float32) * 0.1 - 2.0,
+        torch.randn(heads, dim, device="cuda", dtype=torch.float32),
+        initial_state=torch.zeros(
+            len(lengths), heads, dim, dim, device="cuda", dtype=torch.float32
+        ),
+        cu_seqlens=cu_seqlens_cpu.cuda(),
+        lower_bound=-5.0,
+        cu_seqlens_cpu=cu_seqlens_cpu,
+        **options,
+    )
 
-    def run(lengths: list[int]) -> None:
-        total_tokens = sum(lengths)
-        q = torch.randn(
-            1, total_tokens, heads, dim, device="cuda", dtype=torch.bfloat16
-        )
-        cu_seqlens_cpu = torch.tensor([0, *accumulate(lengths)], dtype=torch.int64)
-        launch_kda_prefill(
-            q,
-            torch.randn_like(q),
-            torch.randn_like(q),
-            torch.randn_like(q),
-            torch.randn(1, total_tokens, heads, device="cuda", dtype=torch.bfloat16),
-            a_log,
-            dt_bias,
-            initial_state=torch.zeros(
-                len(lengths), heads, dim, dim, device="cuda", dtype=torch.float32
-            ),
-            cu_seqlens=cu_seqlens_cpu.cuda(),
-            lower_bound=-5.0,
-            cu_seqlens_cpu=cu_seqlens_cpu,
-        )
 
-    kernels = [
-        getattr(_prefill, f"gluon_kda_paged_prefill_{stage}_{_ARCH}")
-        for stage in ("prepare", "state_walk", "group_summary", "chain_groups")
-    ]
-    run([0, 1, 15, 16, 17, 63, 64, 65])
-    run([1700, 1600])
+def test_kda_prefill_new_batches_reuse_compiled_kernels() -> None:
+    torch.manual_seed(41)
+    _run_prefill([0, 1, 15, 16, 17, 63, 64, 65])
+    _run_prefill([1700, 1600])
     # New token, chunk, sequence and time-group counts in the same block
     # buckets. The last batch takes 16 time groups, a multiple of 16, which
     # Triton would otherwise compile separately.
-    with assert_no_triton_compile(*kernels):
+    with assert_no_triton_compile(*_KERNELS):
         for lengths in ([5, 70, 200], [2100, 2000], [4200, 4100]):
-            run(lengths)
+            _run_prefill(lengths)
+
+
+@pytest.mark.skipif(not is_cdna4(), reason="gfx950 warms its walk configurations")
+def test_kda_prefill_warmup_compiles_every_walk_configuration() -> None:
+    torch.manual_seed(43)
+    for kernel in _KERNELS:
+        kernel.device_caches.clear()
+    # One short sequence takes the narrowest unsplit walk.
+    _run_prefill([64], warm_variants=True)
+    # Unsplit walks over 64 and 128 rows, then split walks over half and full
+    # rows, the latter with the full-width summary.
+    with assert_no_triton_compile(*_KERNELS):
+        for lengths in ([16] * 40, [16] * 80, [1700, 1600], [20000], [4096] * 8):
+            _run_prefill(lengths)

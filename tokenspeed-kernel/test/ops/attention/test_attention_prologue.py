@@ -2513,6 +2513,39 @@ def test_mla_token_count_needs_one_binary_per_token_tile():
             run(count)
 
 
+def test_mla_warmup_compiles_every_token_tile():
+    """One launch under kernel warmup prepares the tiles of every batch size."""
+    from tokenspeed_kernel.ops.embedding.triton import _mla_rope_set_kv_buffer_kernel
+    from tokenspeed_kernel.ops.tuning import kernel_warmup
+    from utils import assert_no_triton_compile
+
+    heads, rank, rope = 4, 512, 64
+    table = cos_sin_cache(rope)
+    cache = poisoned_latent(2048, rank + rope, BF16)
+
+    def run(count):
+        q_nope, q_pe, latent = mla_inputs(count, heads, rank, rope, seed=205)
+        mla_prologue(
+            mla_query(q_nope, rope),
+            q_pe,
+            latent,
+            expanded=None,
+            rotary=Rotary(
+                table, torch.arange(count, device="cuda"), RopeStyle.NEOX, None
+            ),
+            cache=latent_target(cache, torch.arange(count, device="cuda")),
+            solution="triton",
+            override=None,
+        )
+
+    _mla_rope_set_kv_buffer_kernel.device_caches.clear()
+    with kernel_warmup(enabled=True):
+        run(33)
+    with assert_no_triton_compile(_mla_rope_set_kv_buffer_kernel):
+        for count in (7, 48, 320, 555, 960, 1483):
+            run(count)
+
+
 @pytest.mark.parametrize("fused", ["composite", "triton"])
 @pytest.mark.parametrize("masked", [False, True])
 def test_the_storeless_prologue_and_latent_store_write_the_fused_bytes(masked, fused):

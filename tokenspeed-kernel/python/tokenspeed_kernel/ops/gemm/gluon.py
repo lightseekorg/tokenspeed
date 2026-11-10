@@ -33,6 +33,7 @@ from tokenspeed_kernel.ops.gemm._gluon.gemv import gluon_simt_gemm_fp32
 from tokenspeed_kernel.ops.gemm.native import MV_FP8_WEIGHT_SIGNATURES
 from tokenspeed_kernel.ops.gemm.triton import MXFP4_LINEAR_SIGNATURES
 from tokenspeed_kernel.ops.quantization import quantize_fp8
+from tokenspeed_kernel.ops.tuning import is_warming_up
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -431,7 +432,14 @@ if platform.is_amd:
             dtype=torch.int32,
             device=x.device,
         )
-        return _mm_a16w16_decode_impl(x, weight, x.dtype, counters=counters, out=out)
+        return _mm_a16w16_decode_impl(
+            x,
+            weight,
+            x.dtype,
+            counters=counters,
+            out=out,
+            warm_variants=is_warming_up(),
+        )
 
     @register_kernel(
         "gemm",
