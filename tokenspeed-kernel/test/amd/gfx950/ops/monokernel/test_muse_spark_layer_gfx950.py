@@ -1039,9 +1039,12 @@ def test_one_gpu_bench_launches_find_every_absent_rank_segment(
     args += ["--full"] if full else []
     # A cache of its own: the short timeout is in the compiled code. The
     # script runs from tmp_path, so this directory (the bench and its
-    # helpers) goes on its path.
+    # helpers) and the test utilities go on its path.
     here = os.path.dirname(os.path.abspath(__file__))
-    path = os.pathsep.join(p for p in (here, os.environ.get("PYTHONPATH")) if p)
+    utils_dir = os.path.dirname(sys.modules["utils"].__file__)
+    path = os.pathsep.join(
+        p for p in (here, utils_dir, os.environ.get("PYTHONPATH")) if p
+    )
     env = dict(os.environ, TRITON_CACHE_DIR=str(tmp_path / "cache"), PYTHONPATH=path)
     result = subprocess.run(
         [sys.executable, str(script), *args],
@@ -1052,9 +1055,12 @@ def test_one_gpu_bench_launches_find_every_absent_rank_segment(
         cwd=os.path.dirname(__file__),
     )
     record = str(tmp_path / "rank0.rec")
-    assert not stuck.records(stuck.read_file(record)), "\n".join(
-        stuck_report.describe_file(record)
-    )
+    # Report early crashes through stderr, but prefer any stuck-poll record.
+    assert os.path.exists(record) or result.returncode == 0, result.stderr[-2000:]
+    if os.path.exists(record):
+        assert not stuck.records(stuck.read_file(record)), "\n".join(
+            stuck_report.describe_file(record)
+        )
     assert result.returncode == 0, result.stderr[-2000:]
 
 
