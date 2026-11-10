@@ -34,7 +34,7 @@
 //! and item budgets. Each batched item leases a slot of the send ring, which
 //! the data plane copies its rows into; once the copy finished, the rows go
 //! to the sender with the slot's lease ([`SendSlot`]), which returns the slot
-//! when the sender drops them, written or failed. Only what is the same on
+//! when the sender drops the chunk, written or failed. Only what is the same on
 //! every rank decides a batch: a slot's return, which each rank sees at its
 //! own time, only frees it.
 

@@ -68,7 +68,7 @@ struct Node {
     sender: Sender,
     /// The send slot the rows are read from.
     ring: Vec<u8>,
-    /// Its lease: back once the sender dropped the chunk.
+    /// The send ring: its slot is back once the sender dropped the chunk.
     slots: SendRing,
 }
 
