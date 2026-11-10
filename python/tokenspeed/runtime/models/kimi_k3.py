@@ -2999,12 +2999,18 @@ class KimiLinearMoE(nn.Module):
             # The optimized tail declined before consuming the producers.
             # Every ordinary projection epilogue requires a replicated prefix.
             prefix_sum = all_gather(prefix_sum, group, dim=0, backend=None)
+        # The gathered tail reads only this rank's column block of the shared rows.
+        shared_owned_columns = gather_tail
         reduced = None
         if slot_rows:
             # The MoE left its top-k slot rows (_situ_defer_topk_reduce).
             if shared_partial.data_ptr() != shared_out.data_ptr():
                 shared_out.copy_(shared_partial)
-            reduced = self.iris_state.reduce_moe(outputs, routed_partials=routed)
+            reduced = self.iris_state.reduce_moe(
+                outputs,
+                routed_partials=routed,
+                shared_owned_columns=shared_owned_columns,
+            )
         # A producer may return its own tensor instead of filling its destination.
         elif outputs is not None and all(
             partial.shape == output.shape and partial.data_ptr() == output.data_ptr()
@@ -3017,7 +3023,9 @@ class KimiLinearMoE(nn.Module):
             joined = torch.cat((routed, shared_partial), dim=-1)
         if reduced is None:
             reduced = (
-                self.iris_state.reduce_moe(joined)
+                self.iris_state.reduce_moe(
+                    joined, shared_owned_columns=shared_owned_columns
+                )
                 if isinstance(joined, tuple)
                 and self.iris_state is not None
                 and self.iris_state.all_reduce.owns_outputs(joined)
@@ -3032,12 +3040,16 @@ class KimiLinearMoE(nn.Module):
             self.iris_state is not None
             and not up_proj.narrowed
             and up_proj.solution == "auto"
-            and self.iris_state.can_moe_gather_tail(
-                routed,
-                shared,
-                prefix_sum,
-                up_proj.weight,
-                norm.weight if norm is not None else None,
+            and (
+                # Other shared columns may be undefined; the tail asserts support.
+                shared_owned_columns
+                or self.iris_state.can_moe_gather_tail(
+                    routed,
+                    shared,
+                    prefix_sum,
+                    up_proj.weight,
+                    norm.weight if norm is not None else None,
+                )
             )
         ):
             # Decode: each rank projects its weight column block, then gathers.
