@@ -537,11 +537,26 @@ class DeepseekV41DSpark(BaseDrafter):
         if selected != full:
             # Keep the pinned H2D source step-local; peers is CPU-only storage.
             buffers.packet.copy_(packet, non_blocking=True)
-            source = buffers.packet[2:].view(batch_size, self.block_size)
+            history = buffers.packet[2:].view(batch_size, self.block_size)
+            # Capacity uses completed N-2 feedback. Allocation reads N-1
+            # predictions in current request order on the forward stream,
+            # before this round can overwrite them with its next draft.
+            slots = self.input_buffers.req_pool_indices_buf[:batch_size]
+            source = self._allocation_scores(slots, history)
             self.prepare_verify_budget_layout(
                 source, batch_size=batch_size, query_capacity=selected
             )
         return selected
+
+    def _allocation_scores(
+        self, slots: torch.Tensor, history: torch.Tensor
+    ) -> torch.Tensor:
+        # Startup profiling and restored slots can lack a valid GPU prediction.
+        # Retain admitted history for those rows without a device readback.
+        latest = self.confidence_scores.index_select(0, slots)
+        return torch.where(
+            torch.isfinite(latest).all(dim=1, keepdim=True), latest, history
+        )
 
     def _prepare_calibrated_budget(self, *, actual_bs: int, padded_bs: int) -> int:
         full = padded_bs * self.spec_num_tokens
