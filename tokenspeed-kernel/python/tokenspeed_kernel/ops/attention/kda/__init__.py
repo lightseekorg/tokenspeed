@@ -764,16 +764,22 @@ def resolve_kda_batched_replay_commit(
     *,
     num_heads: int | None = None,
     head_dim: int | None = None,
+    spec_query_len: int | None = None,
+    state_dtype: torch.dtype | None = None,
 ):
     """Resolve the all-layer replay kernel once, or return ``None``.
 
     NVIDIA records recovery accepts BF16 and FP16 activations, with history
     stored in the bound pool dtype. Other vendors use their registered dtypes.
+    Kernels bounded to a window or a state dtype need those stated to be
+    selected; the commit every caller can take remains otherwise.
 
     Args:
         dtype: Activation dtype used by the replay payload.
         num_heads: Local KDA head count, when known.
         head_dim: KDA head dimension, when known.
+        spec_query_len: The verify window the commit replays, when known.
+        state_dtype: Element type of the recurrent-state pools, when known.
     """
     if dtype not in (torch.bfloat16, torch.float16):
         return None
@@ -784,18 +790,12 @@ def resolve_kda_batched_replay_commit(
         traits["num_heads"] = num_heads
     if head_dim is not None:
         traits["head_dim"] = head_dim
+    if spec_query_len is not None:
+        traits["spec_query_len"] = spec_query_len
+    if state_dtype is not None:
+        traits["state_dtype"] = state_dtype
     try:
-        return select_kernel(
-            "attention",
-            "kda_replay_commit",
-            signature,
-            traits=traits,
-            override=(
-                "triton_nvidia_kda_batched_replay_commit"
-                if current_platform().is_nvidia
-                else None
-            ),
-        )
+        return select_kernel("attention", "kda_replay_commit", signature, traits=traits)
     except NoKernelFoundError:
         return None
 

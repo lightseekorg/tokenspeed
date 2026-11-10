@@ -735,3 +735,143 @@ if current_platform().is_nvidia and has_optional_package("cutlass", "quack"):
             output_norm,
         )
         return out if output_norm is None else out.view(rows, num_heads * head_dim)
+
+    @register_kernel(
+        "attention",
+        "kda_replay_commit",
+        name="cute_dsl_kda_batched_replay_commit",
+        solution="cute_dsl",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 3),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=format_signatures(("q", "k", "v"), "dense", {torch.bfloat16}),
+        # Above the Triton commit, which longer windows and BF16 state keep.
+        priority=Priority.SPECIALIZED + 1,
+        traits={
+            "batched_layers": frozenset({True}),
+            "flat_state": frozenset({True}),
+            "head_dim": frozenset({128}),
+            "recurrent_layout": frozenset({"v_major"}),
+            # The Triton commit's CUDA-core windows, which this kernel matches bit for bit.
+            "spec_query_len_max": frozenset({15}),
+            "state_dtype": frozenset({torch.float32}),
+        },
+    )
+    def cute_dsl_kda_batched_replay_commit(
+        descriptors: torch.Tensor,
+        *,
+        group_indices: torch.Tensor,
+        read_indices: torch.Tensor,
+        write_indices: torch.Tensor,
+        accepted_length: torch.Tensor,
+        activation_dtype: torch.dtype,
+        conv_state_dtype: torch.dtype,
+        draft_token_num: int,
+        num_heads: int,
+        head_dim: int,
+        qkv_stride: int,
+        conv_stride: int,
+        correction_stride: int,
+        key_gate_stride: int,
+        state_stride: int,
+        conv_width: int,
+        lower_bound: float | None,
+        record_metadata: torch.Tensor,
+        record_stamps: torch.Tensor,
+        state_dtype: torch.dtype,
+    ) -> None:
+        """Commit every KDA layer's accepted tokens, the states in one CuTe DSL launch.
+
+        Same contract and results as ``batched_recoverssm_commit``: the
+        recurrent states fold the accepted records bit for bit as its
+        CUDA-core path does (``commit_states``), and the convolution
+        histories take the same window commit. Inputs the CuTe DSL kernel
+        does not take (the unbounded gate, other record or state dtypes,
+        longer windows) run ``batched_recoverssm_commit`` instead.
+        """
+        from tokenspeed_kernel.ops.attention.kda._cute_dsl.commit_state import (
+            commit_states,
+            commit_states_supported,
+        )
+        from tokenspeed_kernel.ops.attention.kda.vllm_recoverssm import (
+            batched_recoverssm_commit,
+            check_batched_commit,
+            commit_kda_conv_windows,
+        )
+
+        arguments = dict(
+            group_indices=group_indices,
+            read_indices=read_indices,
+            write_indices=write_indices,
+            accepted_length=accepted_length,
+            activation_dtype=activation_dtype,
+            conv_state_dtype=conv_state_dtype,
+            draft_token_num=draft_token_num,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            qkv_stride=qkv_stride,
+            conv_stride=conv_stride,
+            correction_stride=correction_stride,
+            key_gate_stride=key_gate_stride,
+            state_stride=state_stride,
+            conv_width=conv_width,
+            lower_bound=lower_bound,
+            record_metadata=record_metadata,
+            record_stamps=record_stamps,
+            state_dtype=state_dtype,
+        )
+        if not commit_states_supported(
+            activation_dtype=activation_dtype,
+            state_dtype=state_dtype,
+            draft_token_num=draft_token_num,
+            head_dim=head_dim,
+            lower_bound=lower_bound,
+            record_metadata=record_metadata,
+        ):
+            batched_recoverssm_commit(descriptors, **arguments)
+            return
+        if not check_batched_commit(
+            descriptors,
+            group_indices,
+            read_indices,
+            write_indices,
+            accepted_length,
+            draft_token_num=draft_token_num,
+            head_dim=head_dim,
+            conv_width=conv_width,
+            record_metadata=record_metadata,
+            record_stamps=record_stamps,
+            state_dtype=state_dtype,
+        ):
+            return
+        commit_states(
+            descriptors,
+            group_indices,
+            read_indices,
+            write_indices,
+            accepted_length,
+            draft_token_num=draft_token_num,
+            num_heads=num_heads,
+            correction_stride=correction_stride,
+            key_gate_stride=key_gate_stride,
+            state_stride=state_stride,
+            lower_bound=lower_bound,
+            record_metadata=record_metadata,
+            record_stamps=record_stamps,
+        )
+        commit_kda_conv_windows(
+            descriptors,
+            group_indices,
+            read_indices,
+            write_indices,
+            accepted_length,
+            activation_dtype=activation_dtype,
+            conv_state_dtype=conv_state_dtype,
+            draft_token_num=draft_token_num,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            qkv_stride=qkv_stride,
+            conv_stride=conv_stride,
+        )
