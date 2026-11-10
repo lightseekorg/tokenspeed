@@ -64,8 +64,17 @@ git -C "$BUILD_ROOT/smg" apply \
   "$SOURCE_ROOT/test/agentic_benchmark/kimi_k3/tokenspeed_agentx/smg-gateway-dp-rank-loads.patch"
 python3 -m pip uninstall -y smg-grpc-servicer smg-grpc-proto tokenspeed-smg-grpc-servicer tokenspeed-smg-grpc-proto
 python3 -m pip install --no-deps "$BUILD_ROOT/smg/crates/grpc_client/python" "$BUILD_ROOT/smg/grpc_servicer"
-# Uses the Rust toolchain named in rust-toolchain.toml and protoc on PATH.
-cargo build --manifest-path "$BUILD_ROOT/smg/Cargo.toml" -p smg --locked --release
+
+# The gateway build needs rustup (cargo picks the toolchain pinned in the SMG
+# checkout's rust-toolchain.toml, so run it there) and protoc 31.1 with its
+# well-known type includes, which distribution protoc packages lack.
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+source "$HOME/.cargo/env"
+curl -fsSL -o "$BUILD_ROOT/protoc-31.1.zip" \
+  https://github.com/protocolbuffers/protobuf/releases/download/v31.1/protoc-31.1-linux-aarch_64.zip
+python3 -m zipfile -e "$BUILD_ROOT/protoc-31.1.zip" "$BUILD_ROOT/protoc-31.1"
+chmod +x "$BUILD_ROOT/protoc-31.1/bin/protoc"
+(cd "$BUILD_ROOT/smg" && PROTOC="$BUILD_ROOT/protoc-31.1/bin/protoc" cargo build -p smg --locked --release)
 SMG_BINARY="$BUILD_ROOT/smg/target/release/smg"
 ```
 
@@ -80,6 +89,12 @@ hf download nvidia/Kimi-K3-NVFP4 --revision b2428a0b83a8b712ff2e1a8448a103d41753
 hf download lightseekorg/kimi-k3-eagle3-mla --revision 4c48d2bb72134094340067e3012ebe0e822fac37 --cache-dir "$MODEL_CACHE"
 MODEL_PATH="$MODEL_CACHE/models--nvidia--Kimi-K3-NVFP4/snapshots/b2428a0b83a8b712ff2e1a8448a103d4175341f1"
 DRAFT_MODEL_PATH="$MODEL_CACHE/models--lightseekorg--kimi-k3-eagle3-mla/snapshots/4c48d2bb72134094340067e3012ebe0e822fac37"
+
+# The tokenizer must load from real files: its code imports a sibling module,
+# which transformers cannot resolve through the cache's blob symlinks.
+TOKENIZER_PATH=/path/to/shared/kimi-k3-tokenizer
+mkdir -p "$TOKENIZER_PATH"
+cp -L "$MODEL_PATH"/*.py "$MODEL_PATH"/*.json "$MODEL_PATH"/tiktoken.model "$TOKENIZER_PATH"/
 
 CLIENT_CACHE=/path/to/shared/client-cache
 hf download --repo-type dataset semianalysisai/cc-traces-weka-062126 \
@@ -107,6 +122,10 @@ python -m pip install -e "$CLIENT_ROOT/aiperf" \
   'xlsxwriter>=3.2.1' 'tqdm>=4.66' 'datasets>=4.7' tiktoken matplotlib \
   'huggingface_hub[cli]>=0.25' urllib3 requests
 python -m pip check
+
+# The client reads the trace offline; build its datasets cache once, pinned.
+HF_HUB_CACHE="$CLIENT_CACHE/hub" HF_DATASETS_CACHE="$CLIENT_CACHE/datasets" python -c \
+  "import datasets; datasets.load_dataset('semianalysisai/cc-traces-weka-062126', revision='23f152f6f0f9399a85901b89a6458def0ef16729')"
 ```
 
 The AIPerf patch adds `AIPERF_HTTP_X_SMG_ROUTING_KEY_SOURCE`, which selects
@@ -123,7 +142,8 @@ and keep it in the foreground:
 SLURM_JOB_ID=YOUR_HELD_JOB_ID \
 CONTAINER_IMAGE=/path/to/tokenspeed-agentx.sqsh CONTAINER_NAME=ts \
 CONTAINER_MOUNTS="/path/to/shared:/path/to/shared" \
-MODEL_PATH="$MODEL_PATH" DRAFT_MODEL_PATH="$DRAFT_MODEL_PATH" SMG_BINARY="$SMG_BINARY" \
+MODEL_PATH="$MODEL_PATH" TOKENIZER_PATH="$TOKENIZER_PATH" DRAFT_MODEL_PATH="$DRAFT_MODEL_PATH" \
+SMG_BINARY="$SMG_BINARY" \
 bash serve_dwdp16_dep16.sh
 ```
 

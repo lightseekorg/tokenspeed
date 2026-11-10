@@ -24,7 +24,7 @@
 # SMG gateway on the head node: prefill rank by least load, decode rank by
 # power-of-two least requests. Launched by serve_dwdp16_dep16.sh.
 set -euo pipefail
-: "${AGENTX_HEAD:?}" "${MODEL_PATH:?}" "${SMG_BINARY:?}"
+: "${AGENTX_HEAD:?}" "${MODEL_PATH:?}" "${TOKENIZER_PATH:?}" "${SMG_BINARY:?}"
 
 export NO_PROXY='*' no_proxy='*'
 export RUST_LOG=info,smg::routers::grpc::common::stages::helpers=debug
@@ -32,7 +32,7 @@ exec "$SMG_BINARY" launch --pd-disaggregation \
     --prefill "grpc://$AGENTX_HEAD:18446" 8998 \
     --decode "grpc://$AGENTX_HEAD:18447" \
     --host 0.0.0.0 --port 8002 --prometheus-port 29002 \
-    --model-path "$MODEL_PATH" --tokenizer-path "$MODEL_PATH" \
+    --model-path "$MODEL_PATH" --tokenizer-path "$TOKENIZER_PATH" \
     --reasoning-parser passthrough --tool-call-parser passthrough \
     --prefill-policy least_load --decode-policy power_of_two --power-of-two-load-metric least_requests \
     --least-load-kv-pressure-weight 0.15 --load-monitor-interval 1 --assignment-mode min_load --dp-aware \

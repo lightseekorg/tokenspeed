@@ -24,7 +24,7 @@
 # One node of the DWDP16 prefill role (GPUs 0 and 2 of eight four-GPU nodes).
 # Launched on every node by serve_dwdp16_dep16.sh.
 set -euo pipefail
-: "${AGENTX_HEAD:?}" "${MODEL_PATH:?}" "${DRAFT_MODEL_PATH:?}" "${DISAGGREGATION_IB_DEVICE:?}"
+: "${AGENTX_HEAD:?}" "${MODEL_PATH:?}" "${TOKENIZER_PATH:?}" "${DRAFT_MODEL_PATH:?}" "${DISAGGREGATION_IB_DEVICE:?}"
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 shared_l2_config=$(sed "s/@HEAD@/$AGENTX_HEAD/" "$SCRIPT_DIR/shared_l2.json")
 
@@ -40,12 +40,15 @@ export LD_LIBRARY_PATH=/usr/local/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
 export NO_PROXY='*' no_proxy='*'
 export MOONCAKE_LOCAL_HOSTNAME="$(hostname -s)"
 export OMP_NUM_THREADS=4
+# Bounds FlashInfer's JIT builds at first start, which otherwise run one compiler
+# per core beside the shared L2 pool's host memory.
+export MAX_JOBS=8
 ulimit -c 0
 
 # --max-num-seqs is global: 64 request slots per attention-DP rank.
 exec python3 -m smg_grpc_servicer.tokenspeed \
     --model "$MODEL_PATH" \
-    --tokenizer "$MODEL_PATH" \
+    --tokenizer "$TOKENIZER_PATH" \
     --served-model-name kimi-k3-agentx-pd \
     --world-size 16 --nprocs-per-node 2 --nnodes 8 --node-rank "$SLURM_NODEID" --base-gpu-id 0 --gpu-id-step 2 \
     --dist-init-addr "$AGENTX_HEAD:29401" \

@@ -24,7 +24,7 @@
 # One node of the DEP16 decode role (GPUs 1 and 3 of eight four-GPU nodes).
 # Launched on every node by serve_dwdp16_dep16.sh.
 set -euo pipefail
-: "${AGENTX_HEAD:?}" "${MODEL_PATH:?}" "${DRAFT_MODEL_PATH:?}" "${DISAGGREGATION_IB_DEVICE:?}"
+: "${AGENTX_HEAD:?}" "${MODEL_PATH:?}" "${TOKENIZER_PATH:?}" "${DRAFT_MODEL_PATH:?}" "${DISAGGREGATION_IB_DEVICE:?}"
 
 export TOKENSPEED_KIMI_K3_QKV_PROJ_TP_SIZE=4
 export TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE=4
@@ -37,13 +37,16 @@ unset PYTORCH_CUDA_ALLOC_CONF TOKENSPEED_SPEC_SIMULATED_ACCEPT_LEN
 export LD_LIBRARY_PATH=/usr/local/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
 export NO_PROXY='*' no_proxy='*'
 export OMP_NUM_THREADS=4
+# Bounds FlashInfer's JIT builds at first start, which otherwise run one compiler
+# per core beside the shared L2 pool's host memory.
+export MAX_JOBS=8
 ulimit -c 0
 
 # --max-num-seqs is global: 64 request slots per attention-DP rank. The
 # synthetic acceptance length fixes EAGLE3 acceptance at 3.0 tokens per step.
 exec python3 -m smg_grpc_servicer.tokenspeed \
     --model "$MODEL_PATH" \
-    --tokenizer "$MODEL_PATH" \
+    --tokenizer "$TOKENIZER_PATH" \
     --served-model-name kimi-k3-agentx-pd \
     --world-size 16 --nprocs-per-node 2 --nnodes 8 --node-rank "$SLURM_NODEID" --base-gpu-id 1 --gpu-id-step 2 \
     --dist-init-addr "$AGENTX_HEAD:29601" \

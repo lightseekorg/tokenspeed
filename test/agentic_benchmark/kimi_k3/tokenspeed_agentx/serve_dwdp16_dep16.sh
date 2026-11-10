@@ -32,6 +32,7 @@ CONTAINER_IMAGE="${CONTAINER_IMAGE:?set the TokenSpeed container image}"
 CONTAINER_NAME="${CONTAINER_NAME:-ts}"
 CONTAINER_MOUNTS="${CONTAINER_MOUNTS:?mount the repository, models and gateway binary}"
 export MODEL_PATH="${MODEL_PATH:?local nvidia/Kimi-K3-NVFP4 snapshot}"
+export TOKENIZER_PATH="${TOKENIZER_PATH:?real-file copy of the model tokenizer, see README.md}"
 export DRAFT_MODEL_PATH="${DRAFT_MODEL_PATH:?local lightseekorg/kimi-k3-eagle3-mla snapshot}"
 export SMG_BINARY="${SMG_BINARY:?SMG gateway built as in README.md}"
 export DISAGGREGATION_IB_DEVICE="${DISAGGREGATION_IB_DEVICE:-mlx5_0,mlx5_1,mlx5_2,mlx5_3}"
@@ -111,6 +112,12 @@ wait_for_engines() {
                 return 1
             fi
         done
+        # A failed head-node server can leave its step alive behind engine subprocesses.
+        if grep -qs '^Traceback' "$RUN_DIR"/prefill-*.log "$RUN_DIR"/decode-*.log; then
+            kill -TERM "$ready" 2>/dev/null || true
+            echo 'An engine failed while starting; see its log' >&2
+            return 1
+        fi
         sleep 10
     done
     wait "$ready"
@@ -126,6 +133,10 @@ trap 'exit 143' TERM
 
 mkdir -p "$RUN_DIR"
 echo "Serving on $NODELIST; logs in $RUN_DIR"
+# pyxis creates the named container on a node's first step; create it on every
+# node at once, so that later steps sharing a node only attach to it.
+"${SRUN[@]}" --nodes=8 --ntasks=8 --ntasks-per-node=1 --nodelist="$NODELIST" --job-name="${STEP_PREFIX}_init" \
+    "${SRUN_ARGS[@]}" true
 launch shared_l2_owner "$AGENTX_HEAD" "$RUN_DIR/shared_l2_owner.log" bash configs/shared_l2_services.sh owner
 launch shared_l2_providers "$NODELIST" "$RUN_DIR/shared_l2_provider-%N.log" bash configs/shared_l2_services.sh provider
 wait_for 'shared L2 providers' 1800 providers_joined
@@ -144,6 +155,7 @@ PREFILL_GRPC=$AGENTX_HEAD:18446
 DECODE_GRPC=$AGENTX_HEAD:18447
 SHARED_L2_OWNER=tcp://$AGENTX_HEAD:47100
 MODEL_PATH=$MODEL_PATH
+TOKENIZER_PATH=$TOKENIZER_PATH
 ENDPOINTS
 echo "Ready: http://$AGENTX_HEAD:8002; run bench_agentx.sh with SERVE_DIR=$RUN_DIR"
 wait -n "${STEP_PIDS[@]}"

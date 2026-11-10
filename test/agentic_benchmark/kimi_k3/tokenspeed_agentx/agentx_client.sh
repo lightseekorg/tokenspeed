@@ -24,12 +24,12 @@
 # One AgentX point through InferenceX and AIPerf, inside the container on the
 # head node. Launched by bench_agentx.sh.
 set -euo pipefail
-: "${CLIENT_ROOT:?}" "${CLIENT_CACHE:?}" "${GATEWAY_URL:?}" "${MODEL_PATH:?}"
+: "${CLIENT_ROOT:?}" "${CLIENT_CACHE:?}" "${GATEWAY_URL:?}" "${TOKENIZER_PATH:?}"
 : "${RESULT_DIR:?}" "${CONCURRENCY:?}" "${DURATION:?}" "${WARMUP_REQUESTS_PER_LANE:?}"
 
 mkdir "$RESULT_DIR"
 source "$CLIENT_ROOT/venv/bin/activate"
-export INFMAX_CONTAINER_WORKSPACE="$CLIENT_ROOT/inferencex"
+export INFMAX_CONTAINER_WORKSPACE="$CLIENT_ROOT/inferencex/inferencex-e2e"
 export AIPERF_RUNTIME_DIR="$CLIENT_ROOT" PYTHONPATH="$CLIENT_ROOT/aiperf/src:$INFMAX_CONTAINER_WORKSPACE"
 export CONC="$CONCURRENCY" DURATION AIPERF_SERVER_URL="$GATEWAY_URL" PORT=8002
 export MODEL=kimi-k3-agentx-pd SERVED_MODEL_NAME=kimi-k3-agentx-pd MODEL_PREFIX=kimik3
@@ -70,7 +70,7 @@ source "$INFMAX_CONTAINER_WORKSPACE/benchmarks/benchmark_lib.sh"
 AIPERF_DEPS_READY=1
 # The pinned trace is already in CLIENT_CACHE; no revision lookup.
 TRACE_SOURCE_FLAG='--public-dataset semianalysis_cc_traces_weka_062126'
-MODEL="$MODEL_PATH" build_replay_cmd "$RESULT_DIR"
+MODEL="$TOKENIZER_PATH" build_replay_cmd "$RESULT_DIR"
 REPLAY_CMD+=" --benchmark-grace-period 900 --request-timeout-seconds 21600 --random-seed 42 --no-server-metrics"
 printf '%s\n' "$REPLAY_CMD" > "$RESULT_DIR/client-command.txt"
 run_agentic_replay_and_write_outputs "$RESULT_DIR"
