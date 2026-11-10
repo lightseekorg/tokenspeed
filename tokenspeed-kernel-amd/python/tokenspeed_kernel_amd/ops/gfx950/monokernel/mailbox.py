@@ -288,7 +288,7 @@ def _stuck_record(pairs, ptrs, tmp, lane, mask, tag, start, now, rec, slot, fail
             f"v_lshl_add_u64 {tmp}, {slot}, 0, {tmp}",
             f"global_store_dwordx2 {tmp}, {p}, off offset:8 sc0 sc1",
             f"global_store_dwordx2 {tmp}, {a}, off offset:16 sc0 sc1",
-            "s_nop 1",
+            # X2 stores have no Table 11 writedata VGPR overwrite hazard.
         ]
         for offset, value in (
             (24, start),
@@ -300,7 +300,6 @@ def _stuck_record(pairs, ptrs, tmp, lane, mask, tag, start, now, rec, slot, fail
             lines += [
                 f"v_mov_b64 {p}, {value}",
                 f"global_store_dwordx2 {tmp}, {p}, off offset:{offset} sc0 sc1",
-                "s_nop 1",
             ]
         lines += ["s_waitcnt vmcnt(0)", "s_branch 9f"]
     lines += ["9:"]

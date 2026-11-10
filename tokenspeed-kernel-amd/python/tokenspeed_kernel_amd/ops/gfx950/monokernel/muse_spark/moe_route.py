@@ -251,6 +251,7 @@ def _top8_asm(outputs, inputs):
     lane, j, k, best, sid, spick = (o[0] for o in outputs[9:15])
     r = [o[0] for o in outputs[15:19]]
     c_in, score = inputs
+    # CDNA4 ISA Table 11: VALU VGPR -> DPP read needs two wait states.
     nop = "s_nop 1"
     a = [f"v_mov_b32 {d}, {x}" for d, x in zip(cw, c_in)]
     a += [
@@ -272,7 +273,8 @@ def _top8_asm(outputs, inputs):
         a += [nop, f"v_max_f32_dpp {t}, {t}, {t} {ctrl}"]
     # A VALU reads an SGPR that a VALU (v_readlane) wrote only 2 wait states
     # later, so the compares read a SALU copy (sid, set again below).
-    a += [nop, f"v_readlane_b32 {best}, {t}, 63", f"s_mov_b32 {sid}, {best}"]
+    # CDNA4 ISA Table 11: VALU VGPR -> v_readlane needs one wait state.
+    a += ["s_nop 0", f"v_readlane_b32 {best}, {t}, 63", f"s_mov_b32 {sid}, {best}"]
     for jj in range(4):
         a += [f"v_cmp_eq_f32_e64 {masks[jj]}, {cw[jj]}, {sid}"]
     a += [
@@ -284,7 +286,8 @@ def _top8_asm(outputs, inputs):
     ]
     for jj in (2, 1, 0):
         a += [f"s_bitcmp1_b64 {masks[jj]}, {lane}", f"s_cselect_b32 {j}, {jj}, {j}"]
-    a += [f"s_lshl_b32 {sid}, {lane}, 2", f"s_add_u32 {sid}, {sid}, {j}", "s_nop 3"]
+    # SALU-written lane selects need no software wait.
+    a += [f"s_lshl_b32 {sid}, {lane}, 2", f"s_add_u32 {sid}, {sid}, {j}"]
     for jj in range(4):
         a += [f"v_readlane_b32 {r[jj]}, {score[jj]}, {lane}"]
     a += [f"s_mov_b32 {spick}, {r[3]}"]
@@ -315,7 +318,9 @@ def _top8_asm(outputs, inputs):
     ]
     # The total: ((p0 + p1) + (p2 + p3)) + ((p4 + p5) + (p6 + p7)).
     p = r + [best, sid, spick, j]
-    a += [nop] + [f"v_readlane_b32 {p[i]}, {picks}, {i}" for i in range(8)]
+    # CDNA4 ISA Table 11: VALU VGPR -> v_readlane needs one wait state (kept
+    # rather than relying on the loop tail's distance from the picks write).
+    a += ["s_nop 0"] + [f"v_readlane_b32 {p[i]}, {picks}, {i}" for i in range(8)]
     a += [
         f"v_mov_b32 {t}, {p[0]}",
         f"v_add_f32 {t}, {p[1]}, {t}",

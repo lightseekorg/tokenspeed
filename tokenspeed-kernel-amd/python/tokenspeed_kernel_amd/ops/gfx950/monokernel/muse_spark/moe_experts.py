@@ -402,7 +402,7 @@ def _slots_asm(outputs, inputs):
     RP = len(table)
     NP = RP * 8
     a = [
-        "s_nop 4",
+        # Five independent VALUs precede the first input lane read.
         f"v_mbcnt_lo_u32_b32 {lane}, -1, 0",
         f"v_mbcnt_hi_u32_b32 {lane}, -1, {lane}",
         # Past NP lanes repeat the picks: lane l holds pick l % NP.
@@ -439,7 +439,8 @@ def _slots_asm(outputs, inputs):
     ]
     if NP == 64:
         a += [
-            "s_nop 4",
+            # CDNA4 ISA Table 11: VALU VCC -> mbcnt constant; s_bcnt fills state 2.
+            "s_nop 0",
             f"s_bcnt1_i32_b64 {count}, vcc",
             f"v_mbcnt_lo_u32_b32 {slot}, vcc_lo, 0",
             f"v_mbcnt_hi_u32_b32 {slot}, vcc_hi, {slot}",
@@ -448,7 +449,7 @@ def _slots_asm(outputs, inputs):
         # A slot counts the owners below its pick: the ballot's bits below
         # l % NP (a mask of the first NP <= 32 lanes).
         a += [
-            "s_nop 4",
+            # VALU -> SALU is interlocked; later VALUs read SALU-written VCC.
             f"s_and_b32 vcc_lo, vcc_lo, {(1 << NP) - 1:#x}",
             f"s_bcnt1_i32_b32 {count}, vcc_lo",
             f"v_bfm_b32 {t}, {lane}, 0",
@@ -476,9 +477,12 @@ def _slots2_rows_asm(outputs, inputs):
     kv = (tmp[0], tmp[1])
     a = [
         # rows[0] holds 2 w in every lane: the wave's first row pick 2 w * 8
-        # sits in lane 8 w.
+        # sits in lane 8 w. CDNA4 ISA Table 11: a VALU write of a VGPR needs one
+        # wait state before a lane read of it, and the compiler's write of
+        # rows[0] may be the instruction just before this block.
+        "s_nop 0",
         f"v_readfirstlane_b32 {sb}, {rows[0]}",
-        "s_nop 4",
+        # VALU -> SALU is interlocked.
         f"s_lshl_b32 {sb}, {sb}, 2",
     ]
     a += [f"v_mov_b32 {x}, -1" for x in tab]
@@ -530,13 +534,14 @@ def _slots2_ballot_asm(outputs, inputs):
     a = [
         # Even picks' owners: their count and the ones below each lane.
         f"v_cmp_ne_u32_e32 vcc, 0, {owner[0]}",
-        "s_nop 4",
+        # CDNA4 ISA Table 11: VALU VCC -> mbcnt constant; s_bcnt fills state 2.
+        "s_nop 0",
         f"s_bcnt1_i32_b64 {count}, vcc",
         f"v_mbcnt_lo_u32_b32 {t[0]}, vcc_lo, 0",
         f"v_mbcnt_hi_u32_b32 {t[0]}, vcc_hi, {t[0]}",
         # Odd picks' owners: added to both.
         f"v_cmp_ne_u32_e32 vcc, 0, {owner[1]}",
-        "s_nop 4",
+        # s_bcnt and s_add fill the two VALU VCC -> mbcnt constant wait states.
         f"s_bcnt1_i32_b64 {sq}, vcc",
         f"s_add_u32 {count}, {count}, {sq}",
         f"v_mbcnt_lo_u32_b32 {t[0]}, vcc_lo, {t[0]}",
