@@ -23,7 +23,6 @@ model_sources:
   - python/tokenspeed/runtime/models/muse_spark_audio.py
   - python/tokenspeed/runtime/models/muse_spark_vision.py
   - python/tokenspeed/runtime/models/muse_spark_monokernel.py
-  - python/tokenspeed/runtime/models/muse_spark_dflash2_monokernel.py
 runner:
   labels:
     - amd-mi35x-8gpu-test
