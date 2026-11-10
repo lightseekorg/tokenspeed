@@ -375,8 +375,18 @@ def kvout_stage(
     mb.stamp("kvout", trace.END)
 
 
+def _launch_metadata(grid, kernel, args):
+    """Report the launch's rows and the weight bytes it reads to Proton: the
+    fc and K / V projection shards (the norm gains are a few KiB)."""
+    rows = args["PLAN"].plan.rows
+    weight = args["fc_w"].nbytes + args["kv_w"].nbytes
+    return {"name": f"{kernel.name} (rows={rows})", "bytes": weight}
+
+
 # The code range is the compiled binary's own, known only after the compile.
-@gluon.jit(do_not_specialize=("code_offset", "code_quads"))
+@gluon.jit(
+    launch_metadata=_launch_metadata, do_not_specialize=("code_offset", "code_quads")
+)
 def gluon_muse_spark_draft_context_gfx950(
     scratch,
     step,

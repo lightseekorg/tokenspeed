@@ -435,8 +435,19 @@ def score_stage(mb, row, ids, u, first_token, anchor, pred_cb, succ_cb, scores):
     mb.stamp("score", trace.END)
 
 
+def _launch_metadata(grid, kernel, args):
+    """Report the launch's rows (draft steps) and the weight bytes it reads
+    to Proton: the LM head and hidden projection shards (the codebook rows
+    it gathers are a few KiB)."""
+    rows = args["PLAN"].plan.rows
+    weight = args["lmh_w"].nbytes + args["hproj_w"].nbytes
+    return {"name": f"{kernel.name} (rows={rows})", "bytes": weight}
+
+
 # The code range is the compiled binary's own, known only after the compile.
-@gluon.jit(do_not_specialize=("code_offset", "code_quads"))
+@gluon.jit(
+    launch_metadata=_launch_metadata, do_not_specialize=("code_offset", "code_quads")
+)
 def gluon_muse_spark_draft_head_gfx950(
     scratch,
     step,

@@ -56,7 +56,13 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import (
     moe_tail,
     qkvg,
 )
-from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.dims import HIDDEN, WORLD
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark.dims import (
+    EXPERTS,
+    GATE_ROW,
+    HIDDEN,
+    QKVG,
+    WORLD,
+)
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import (
     DEFAULT_POLL_CHECK,
     DEFAULT_POLL_TIMEOUT_SHIFT,
@@ -279,11 +285,42 @@ def layer_plan(
     )
 
 
+def _launch_metadata(grid, kernel, args):
+    """Report the launch's rows and the weight bytes it reads to Proton (the
+    norm gains and gate coefficients, a few KiB, are left out).
+
+    The experts count each row's 8 picks as distinct experts (at most all
+    256): the launch's distinct experts are known only on the device, so
+    this is an upper bound."""
+    plan = args["PLAN"].plan
+    attn_ops, moe_ops = args["attn_ops"], args["moe_ops"]
+    # Unpacked as gluon_muse_spark_layer_gfx950 unpacks them.
+    w_qkvg, w_o = attn_ops[0], attn_ops[9]
+    router_w, w_pool, w13, w13s = moe_ops[0], moe_ops[2], moe_ops[3], moe_ops[4]
+    w2, w2s, w_post = moe_ops[9], moe_ops[10], moe_ops[17]
+    qkvg_rows, qkv_rows, all_experts = int(QKVG), int(GATE_ROW), int(EXPERTS)
+    # The gate rows, and the q | k | v rows when the launch projects them.
+    rows_read = qkvg_rows if plan.has_stage("qkvg") else qkvg_rows - qkv_rows
+    weight = w_qkvg.nbytes * rows_read // qkvg_rows
+    weight += w_o.nbytes + router_w.nbytes + w_pool.nbytes + w_post.nbytes
+    experts = min(all_experts, plan.rows * int(moe_experts.TOP_K))
+    expert_bytes = w13.nbytes + w13s.nbytes + w2.nbytes + w2s.nbytes
+    weight += expert_bytes * experts // all_experts
+    if plan.has_stage("warm"):
+        weight += 16 * args["warm_quads"]
+    if plan.has_stage("qnext"):
+        weight += args["w_next"].nbytes * qkv_rows // qkvg_rows
+    return {"name": f"{kernel.name} (rows={plan.rows})", "bytes": weight}
+
+
 # The layer index changes every launch: a specialization on it (1, or a
 # multiple of 16) would compile new binaries while serving. The warm word
 # count is the next layer's, a runtime value too. The code range is the
 # compiled binary's own, known only after the compile.
-@gluon.jit(do_not_specialize=("layer", "warm_quads", "code_offset", "code_quads"))
+@gluon.jit(
+    launch_metadata=_launch_metadata,
+    do_not_specialize=("layer", "warm_quads", "code_offset", "code_quads"),
+)
 def gluon_muse_spark_layer_gfx950(
     scratch,
     step,
