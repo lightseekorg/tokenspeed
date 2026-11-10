@@ -433,9 +433,11 @@ def _poll_n(
     gl.static_assert(SCOPE == "agent" or SCOPE == "system", "scope: agent or system")
     # The bound travels as immediate operands from PLAN, so it is keyed and
     # the asm callback never depends on mutable module state.
-    # asm: a poll is a loop of uncached loads that retries only the late
-    # pairs' lanes until every tag matches; Gluon has no volatile load, and
-    # a load in a loop is hoisted or merged.
+    # asm: one loop over up to four pairs a lane that compares only their
+    # tag halves, reloads only the late lanes (one round trip a retry), and
+    # exits per wave under its own time bound and stuck record; data pairs
+    # have no known payload, so gl.atomic_poll (whole-value compare) does
+    # not apply.
     if stuck is None:
         out = gl.inline_asm(
             _poll_asm_system if SCOPE == "system" else _poll_asm_agent,

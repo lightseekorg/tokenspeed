@@ -579,8 +579,8 @@ def _ballot_slots2(ids, RP: gl.constexpr):
     NP: gl.constexpr = ids.shape[0]
     nw: gl.constexpr = gl.num_warps()
     gl.static_assert(RP == 2 * nw, "two rows a wave")
-    # asm: the per-pick compares need a lane read (v_readlane) and lane
-    # masks (ballots, v_mbcnt); Gluon has neither.
+    # asm: lane reads (v_readlane) and lane masks (ballots, v_mbcnt) in
+    # SGPRs, which the extern library (_wave.ll) does not provide yet.
     # [pick, row]: two picks a lane, two rows a wave.
     la: gl.constexpr = gl.BlockedLayout([2, 2], [64, 1], [1, nw], [1, 0])
     mine = gl.convert_layout(ids, gl.SliceLayout(1, la))[:, None]
@@ -624,8 +624,8 @@ def _ballot_slots(ids, RP: gl.constexpr):
     tt: gl.constexpr = gl.distributed_type(
         gl.int32, [NP, RP], _table_lanes_layout(RP, nw)
     )
-    # asm: the per-pick compares need a lane read (v_readlane) and lane
-    # masks (ballots, v_mbcnt); Gluon has neither.
+    # asm: lane reads (v_readlane) and lane masks (ballots, v_mbcnt) in
+    # SGPRs, which the extern library (_wave.ll) does not provide yet.
     out = gl.inline_asm(
         _slots_asm,
         (
