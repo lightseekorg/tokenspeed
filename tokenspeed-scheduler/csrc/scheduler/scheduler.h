@@ -667,7 +667,8 @@ private:
     // the runtime's arena, released by the FSM transition that drops the image.
     SnapshotSlotAllocator snapshot_slots_;
 
-    // Pools outlive every CacheBlockRef stored below.
+    // Pools outlive every CacheBlockRef stored below, and the coordinator
+    // every BlockTable it binds (the requests' tables, in requests_ below).
     BlockPool block_pool_;
     BlockPool host_pool_;
     BlockPool snapshot_pool_;

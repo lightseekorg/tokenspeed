@@ -80,6 +80,7 @@ public:
         if (active_parents_ == active_parents) {
             return;
         }
+        _assert(active_parents_ == nullptr, "a table counts its parents in one gauge for life");
         active_parents_ = active_parents;
         parents_.clear();
         parents_.reserve(blocks_.size());

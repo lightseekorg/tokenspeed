@@ -1479,6 +1479,7 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Restore(const
     _assert(request_access_epoch > 0 && request_access_epoch <= next_access_epoch_,
             "request access epoch was not issued by this coordinator");
     for (const GroupDemand& demand : demands) {
+        _assert(demand.table != nullptr, "group demand requires a block table");
         demand.table->CountActiveParentsIn(&active_parents_);
     }
     // The rebuilt slots among the copy-in slots, each in its imaged block's

@@ -1304,7 +1304,8 @@ private:
     std::vector<std::size_t> match_order_;
     BlockPool& pool_;
     // The Device parents request tables hold. Admit and Restore bind every
-    // table they fill to it; the coordinator never moves, so the pointer holds.
+    // table they fill to it; the coordinator never moves, so the pointer holds
+    // as long as every bound table is destroyed before the coordinator.
     ActiveParents active_parents_;
     BlockPool* host_pool_{nullptr};
     // Request-private retraction images: never prefix-indexed, never evicted.
