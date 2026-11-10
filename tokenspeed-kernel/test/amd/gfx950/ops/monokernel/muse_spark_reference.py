@@ -107,7 +107,7 @@ _WEIGHT_STEP_SIGMAS = 6 * 2**-9 / math.sqrt(3)
 _FP32_SLACK = 2**-16
 
 
-def verify_attention(q, q_cached, keys, values, own_k, own_v):
+def verify_attention(q, q_cached, keys, values, own_k, own_v, scale):
     """Attention of one row's q heads ``q [heads, 64]`` (of one KV head) over
     its visible cached keys ``keys`` / ``values`` ``[n, 64]`` and the launch's
     keys up to its own ``own_k`` / ``own_v`` ``[t + 1, 64]``, in FP64 by the
@@ -118,9 +118,10 @@ def verify_attention(q, q_cached, keys, values, own_k, own_v):
     cache's dtype where the kernel's long full-layer path multiplies in FP8);
     ``q`` scores the launch's keys. That path is not the regular path's math
     exactly: the regular path scores every key of an FP8 cache with the FP8
-    q, and here the launch's own keys still take the BF16 q.
+    q, and here the launch's own keys still take the BF16 q. ``scale`` is
+    the logit scale (``head_dim ** -0.5``).
 
-    Returns ``(out, error)``, both FP64 ``[heads, 64]``: ``error`` bounds the
+    Returns ``(out, error)``, both FP64 ``[heads, head_dim]``: ``error`` bounds the
     kernel's difference from ``out`` (its BF16 softmax weights and FP32 sums).
     """
 
@@ -129,7 +130,7 @@ def verify_attention(q, q_cached, keys, values, own_k, own_v):
             query.double()[None],
             k.double()[:, None],
             v.double()[:, None],
-            scale=0.125,
+            scale=scale,
             causal_offset=None,
             window_left=None,
             sinks=None,
@@ -144,7 +145,7 @@ def verify_attention(q, q_cached, keys, values, own_k, own_v):
     scores = torch.cat(
         [q_cached.double() @ keys.double().T, q.double() @ own_k.double().T], 1
     )
-    w = torch.softmax(scores * 0.125, dim=-1)
+    w = torch.softmax(scores * scale, dim=-1)
     v = torch.cat([values, own_v]).double()
     error = _WEIGHT_STEP_SIGMAS * (w.pow(2) @ v.pow(2)).sqrt()
     return out[0], error + _FP32_SLACK * (w @ v.abs())
@@ -214,6 +215,7 @@ def attention_z(qkvg, k_cache, v_cache, table, length, window, cs):
                 values[seen:, kv],
                 k[: t + 1, kv].float(),
                 v[: t + 1, kv].float(),
+                HEAD**-0.5,
             )
             exact = a / torch.sqrt(a.pow(2).mean(-1, keepdim=True) + 1e-5)
             z_exact[t, heads] = (exact * gate[heads]).float()

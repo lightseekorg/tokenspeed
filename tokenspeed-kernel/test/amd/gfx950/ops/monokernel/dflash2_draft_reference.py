@@ -29,6 +29,7 @@ around each sublayer, blocks of 8 rows a request.
 
 from __future__ import annotations
 
+import muse_spark_reference
 import torch
 from tokenspeed_kernel.numerics.torch.conv import torch_block_grouped_conv
 from tokenspeed_kernel.numerics.torch.layernorm import torch_rmsnorm
@@ -54,6 +55,23 @@ def grouped_conv(
         base: BF16 ``[TAPS, HIDDEN]`` (the same side of ``base_kernel``).
     """
     return torch_block_grouped_conv(x, delta, base, BLOCK, GROUP_SIZE)
+
+
+def draft_attention(q, keys, values):
+    """The draft layer's attention of one row (``q [heads, 128]``, one KV
+    head ``keys`` / ``values`` ``[n, 128]``, every row seeing the same keys)
+    in FP64 with logit scale ``128 ** -0.5``, and a bound on the kernel's
+    BF16 output's difference from it: the error of its BF16 softmax weights
+    and FP32 sums (``verify_attention``), then one BF16 rounding (unit
+    roundoff 2^-8).
+
+    Returns ``(exact, bound)``, both FP64 ``[heads, 128]``.
+    """
+    empty = keys[:0]
+    exact, error = muse_spark_reference.verify_attention(
+        q, q, empty, empty, keys, values, q.shape[-1] ** -0.5
+    )
+    return exact, error + 2**-8 * (exact.abs() + error)
 
 
 def tp_sum_norm(

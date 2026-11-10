@@ -294,14 +294,15 @@ def test_attention_takes_the_window_and_the_whole_block_for_every_row(
     first = max(end - WINDOW_KEYS, 0)
     keys = torch.cat([ctx_k[first:prefix], kb]).float()
     values = torch.cat([ctx_v[first:prefix], vb]).float()
-    scores = q.float() @ keys.T / HEAD**0.5  # [rows, heads, keys]
-    want = torch.softmax(scores, dim=-1) @ values
     for row in range(rows):
         ao = payloads(scratch, plan, "ao", Q_HEADS * HALF, tag, row=row)
-        got = ao.view(torch.bfloat16).cpu().view(Q_HEADS, HEAD).float()
+        got = ao.view(torch.bfloat16).cpu().view(Q_HEADS, HEAD).double()
         # The PV product takes the probabilities in BF16, as the target
-        # layer's attention does.
-        torch.testing.assert_close(got, want[row], rtol=2**-6, atol=2e-3)
+        # layer's attention does: the bound covers that and the output's
+        # rounding.
+        want, bound = ref.draft_attention(q[row], keys, values)
+        err = (got - want).abs()
+        assert torch.all(err <= bound), float((err / bound).max())
 
 
 def _far(cache: torch.Tensor, first: int, device) -> torch.Tensor:
@@ -601,11 +602,11 @@ def _half_worker(rank: int, port: int, prefix: int) -> None:
         first = max(end - WINDOW_KEYS, 0)
         keys = torch.cat([ctx_k[first:prefix], kb]).float()
         values = torch.cat([ctx_v[first:prefix], vb]).float()
-        scores = q.float() @ keys.T / HEAD**0.5
         ao = bf("ao", Q_HEADS * HALF).view(rows, Q_HEADS, HEAD)
-        torch.testing.assert_close(
-            ao.float(), torch.softmax(scores, dim=-1) @ values, rtol=2**-6, atol=2e-3
-        )
+        for r in range(rows):
+            want, bound = ref.draft_attention(q[r], keys, values)
+            err = (ao[r].double() - want).abs()
+            assert torch.all(err <= bound), float((err / bound).max())
         partial = (ao.reshape(rows, -1).float() @ o_w.float().T).to(torch.bfloat16)
         _close(out.cpu(), ref.grouped_conv(partial, delta[:, 1], base[1]))
         dist.barrier()
