@@ -220,6 +220,9 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
     nb::class_<tokenspeed::RequestSpec>(m, "RequestSpec")
         .def(nb::init<>())
         .def_rw("request_id", &tokenspeed::RequestSpec::request_id)
+        .def_rw("session_id", &tokenspeed::RequestSpec::session_id)
+        .def_rw("cache_group_id", &tokenspeed::RequestSpec::cache_group_id)
+        .def_rw("shared_prefix_tokens", &tokenspeed::RequestSpec::shared_prefix_tokens)
         .def_rw("tokens", &tokenspeed::RequestSpec::tokens)
         .def_rw("max_new_tokens", &tokenspeed::RequestSpec::max_new_tokens)
         .def_rw("max_cached_prefix_tokens", &tokenspeed::RequestSpec::max_cached_prefix_tokens);

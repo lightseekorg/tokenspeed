@@ -109,8 +109,9 @@ public:
     CacheCoordinator& operator=(CacheCoordinator&&) = delete;
     std::size_t DemoteSession(const std::string& session_id, bool ended);
     std::size_t DemoteSessions(const std::vector<std::string>& ids, bool ended);
+    std::size_t DemoteCacheGroups(const std::vector<std::string>& ids, bool ended);
 
-    // A request's session, registered under its access epoch for every
+    // A request's cache owner (group or session), registered under its epoch for every
     // admission, publication and restore that epoch dates
     // (SessionForAccess). The first admission of a request with a session id
     // registers it and returns this handle; dropping the handle unregisters
@@ -222,6 +223,8 @@ public:
         // Optional precomputation for exactly prefix_hashes and this
         // coordinator. Omission expands those identities for this probe.
         PreparedPrefixKeys prepared_keys;
+        // Bounded request-local remote hints; no global tail-table mutation.
+        std::span<const std::int32_t> shared_prefix_tokens;
     };
 
     struct PrefixProbe {
@@ -402,7 +405,8 @@ public:
                                          std::span<std::vector<CacheBlockRef>> copy_in_blocks,
                                          std::optional<CopyInPoint> copy_in_point,
                                          std::optional<std::uint64_t> request_access_epoch,
-                                         bool evict_blocks_past_segments, const std::string& session_id);
+                                         bool evict_blocks_past_segments, const std::string& session_id,
+                                         const std::string& cache_group_id = {});
 
     // The data slots of a retracted request are the non-null slots covering
     // [0, num_tokens) in every group -- the unaligned tail block included;
@@ -859,6 +863,10 @@ public:
         std::int32_t max_tokens{0};
     };
     StorageQuery MissingStorageKeys(const PromptPrefix& prompt, std::size_t max_keys) const;
+    // All immutable objects needed at exactly this boundary, including objects
+    // already in Device/Host. max_tokens is 0 for an illegal boundary and -1
+    // when the bounded key budget cannot describe the complete dependency.
+    StorageQuery SharedPrefixKeys(const PromptPrefix& prompt, std::size_t max_keys) const;
     StorageReservation ReserveStoragePrefix(const PromptPrefix& prompt, std::span<const CacheKey> hits,
                                             std::size_t max_blocks);
 
@@ -1321,10 +1329,14 @@ private:
     // Some group is prefix-closed, and needs every page below a boundary: a
     // State or sliding group resumes past a page that holds nothing.
     bool has_prefix_closed_groups_{false};
-    SessionCacheOwner sessionTag(const std::string& id);
+    using CacheOwnerTags = std::unordered_map<std::string, std::weak_ptr<SessionCacheTag>>;
+    SessionCacheOwner cacheOwnerTag(const std::string& id, CacheOwnerTags& registry);
+    std::size_t demoteCacheOwners(const std::vector<std::string>& ids, bool ended, CacheOwnerTags& registry);
     // One entry per live SessionAccess handle, which adds and erases it.
     std::unordered_map<std::uint64_t, SessionCacheOwner> session_access_;
-    std::unordered_map<std::string, std::weak_ptr<SessionCacheTag>> session_tags_;
+    CacheOwnerTags session_tags_;
+    // A separate namespace prevents a group id from colliding with a session id.
+    CacheOwnerTags cache_group_tags_;
     std::size_t session_tags_since_sweep_{0};
     std::uint64_t next_access_epoch_{0};
     // Issued access epochs start at 1. A superseded input is re-registered

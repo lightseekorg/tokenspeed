@@ -43,16 +43,16 @@ use std::{
 use bytes::Bytes;
 use tokio::runtime::Runtime;
 use ts_wire::{
+    BatchTokenIDOutSlim, ControlOutput, ControlRequest, EngineCoreReadyResponse, EngineOutput,
+    EngineRequest, HandshakeInitMessage, ReadyMessage,
     control::ControlReplySlim,
     decode_frames, encode_frames,
     frames::{REQ_TYPE_CONTROL, REQ_TYPE_ENCODE},
     handshake::{STATUS_HELLO, STATUS_READY},
-    BatchTokenIDOutSlim, ControlOutput, ControlRequest, EngineCoreReadyResponse, EngineOutput,
-    EngineRequest, HandshakeInitMessage, ReadyMessage,
 };
 use zeromq::{
-    util::PeerIdentity, DealerSocket, PushSocket, Socket, SocketOptions, SocketRecv, SocketSend,
-    ZmqMessage,
+    DealerSocket, PushSocket, Socket, SocketOptions, SocketRecv, SocketSend, ZmqMessage,
+    util::PeerIdentity,
 };
 
 use crate::{
@@ -503,6 +503,9 @@ impl Frontend for EngineTransport {
         if let ControlOutput::GetAdmission(snapshot) = &mut output {
             snapshot.dp_rank = i64::from(self.engine_index);
         }
+        if let ControlOutput::GetSharedPrefixPublication(publication) = &mut output {
+            publication.dp_rank = i64::from(self.engine_index);
+        }
         let asker = self
             .askers
             .get_mut(output.tag())
@@ -641,8 +644,8 @@ impl Drop for EncodeIntake {
 #[cfg(test)]
 mod tests {
     use ts_wire::{
-        control::{ControlCall, FlushCacheReqInput, FlushCacheReqOutput, ProfileReqOutput},
         Value,
+        control::{ControlCall, FlushCacheReqInput, FlushCacheReqOutput, ProfileReqOutput},
     };
 
     use super::*;

@@ -2761,6 +2761,40 @@ complete normally. Reusing an ended ID creates a new owner generation. The
 returned demotion count includes only blocks whose LRU epoch actually changed.
 Already-demoted blocks are not counted again unless later access promotes them.
 
+An independent set of requests may additionally carry `cache_group_id`. When
+nonempty, it owns the request's cached prefixes instead of `cache_session_id`;
+the session still identifies only its own request lifecycle. Cache group and
+session IDs are separate namespaces, so ending a cut or a session whose ID
+happens to equal the group ID cannot age that group's cache. Prefix matching
+continues to use token content and the normal model/cache namespace: the group
+ID never proves a hit, changes request tokens, or enables implicit appends.
+
+`demote_cache_groups([{cache_group_ids, ended}])` applies the same bounded LRU
+hint to explicit group owners. Callers must not translate each member's
+completion into group completion. With no reliable group-end notification,
+omitting the hint is safe: group caches remain subject to ordinary eviction,
+without a group-wide pin or retention promise. Reuse across different groups
+or by an ungrouped request removes exclusive group ownership, as for sessions.
+The existing state-checkpoint and replay constraints are unchanged. Restricted
+State models still require the P/fused role's in-forward checkpoint flag and
+legal model-defined grain; the D role does not publish those checkpoints.
+A group tag does not synthesize missing intermediate states, pin every cut's
+prefix, or guarantee a hit. See `scheduler.md` for the input-checkpoint boundary
+and retention rules.
+
+Owner registries hold weak references. Request access handles and live cache
+entries own the tags; reclamation releases them. Periodic sweeping bounds
+expired registry keys, including workloads that create a new group per batch.
+Both group ingress and the group demotion API enforce the existing 4096-byte
+ID bound, and control batches contain at most 4096 nonempty IDs. Group identity
+must include the caller's model/weight epoch when IDs can repeat across weight
+updates; normal cache flushing and storage-version isolation still apply.
+
+`GetAdmission.cache_group_contract` advertises this ownership contract as `1`.
+The appended field defaults to `0` when an older native engine omits it; callers
+requiring group ownership must verify support on every participating rank before
+sending grouped requests. A newer wire crate alone does not prove engine support.
+
 `GetAdmission` reports live request slots, available/total physical LCM blocks,
 Host capacity, waiting/retracted counts, and a contract-versioned capacity curve.
 Contract version 1 rounds token lengths up to 1024-token buckets and uses the
@@ -2770,3 +2804,56 @@ must not derive physical demand by dividing token counts by a page size. Snapsho
 collection is an explicit control operation; the allocator scan is not added to
 each forward.
 The transport identifies each reply's DP rank, independent of reply arrival order.
+
+### Shared-store publication receipts
+
+`get_shared_prefix_publication` is a bounded, read-only control query. Its body
+contains a nonempty `query_id` (at most 256 UTF-8 bytes), actual `input_ids` (at
+most 1,048,576 i32 tokens), and an exact positive `max_prefix_tokens` no larger
+than that input. Each attention-DP reply echoes the nonce and identifies
+`dp_rank`; a router must select the DP that actually processed the producer and
+reject a late reply with a different nonce. Capability is advertised separately
+as `GetAdmissionReqOutput.shared_prefix_publication_contract == 1` and
+`shared_prefix_storage_enabled == true`; absent fields on an older engine mean
+unsupported, not successful publication.
+
+A `published` result requires successful **retired PUT or accepted GET** receipts, agreed across
+the producer's cache-owning replica ranks, for every immutable object needed at
+that exact prefix: full KV history, each non-replayable window, and every State
+checkpoint. Device hits, Host hits, prefill completion, pending D2H and queued
+PUTs are not publication evidence. A GET counts only after replica agreement,
+native retirement, and acceptance into Host cache; detached or cancelled reads
+do not count. This lets a later producer reuse confirmed historical objects
+without writing them back merely to manufacture a receipt. The query uses the normal chained token
+hashes and checkpoint geometry; a group identifier cannot establish a hit.
+`confirmed_prefix_tokens` equals the requested boundary only for `published`,
+and is zero otherwise. Restricted checkpoint geometries may leave an arbitrary
+cut boundary `pending`; this query neither creates intermediate checkpoints nor
+changes model numerics.
+
+Receipts have the storage metadata budget, hold no block references, and are
+forgotten on all-tier cache flush, which increments `cache_epoch`. The reply
+also includes the executor's actual `storage_namespace`, including weight
+versions. Known object failures invalidate matching receipts. `pressure` reports
+blocked storage progress, `too_large` reports a complete dependency larger than
+the metadata budget, and `unsupported` reports a missing publication path. A
+router must bound its polling deadline and fall back to ordinary execution on
+these conditions or cancellation; queries keep no per-request wait state.
+
+A receipt proves past publication, not permanent residency: shared-store
+eviction can occur after the reply, and bounded receipt eviction can produce
+conservative misses. Consumers still perform the ordinary storage query/GET and
+validate complete dependencies before using any cache. This protocol requires
+a real shared KV Store with compatible key namespaces and cache layouts;
+Mooncake PD transport or weight transport alone is insufficient.
+
+Cross-instance discovery of a non-page-aligned checkpoint also needs its token
+boundary: an empty consumer cannot infer another instance's tail index from a
+content-addressed store. `shared_prefix_tokens` supplies at most 64 positive
+candidate boundaries shorter than this request. The native matcher hashes each
+candidate from this request's actual input and considers it only within the
+ordinary replay/logprob cacheable bound. Hints are request-local, do not insert
+global tail metadata, do not limit an existing longer local hit, and confer no
+ownership or residency. Query/GET still requires all Full, State and window
+objects; diverging prompts therefore cannot reuse a checkpoint solely because
+they share a group or boundary length.

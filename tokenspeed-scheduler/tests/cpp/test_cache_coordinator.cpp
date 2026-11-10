@@ -16735,4 +16735,86 @@ TEST(CacheCoordinatorSessionAccess, TheRegistrationLivesAsLongAsItsHandle) {
     coordinator.Free(untagged_tables);
 }
 
+TEST(CacheCoordinatorCacheGroups, EndingACutPreservesItsGroupCacheAndStores) {
+    BlockPool pool(8, {1});
+    BlockPool host_pool(4, {1});
+    const std::array specs{CacheGroupSpec{.attn_kind = AttnKind::kSlidingWindow,
+                                          .sliding_window = 4,
+                                          .cache_blocks_per_lcm_block = 1,
+                                          .block_granularity = 2}};
+    auto coordinator = MakeCoordinator(specs, 2, pool, false, &host_pool, nullptr, true, false,
+                                       /*checkpoint_retention_requests=*/0);
+    std::vector<BlockTable> tables(1);
+    const std::array demands{GroupDemand{.table = &tables[0], .extent = DenseGrowth{4}}};
+    auto admitted = coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{}, {}, std::nullopt,
+                                      std::nullopt, false, "cut", "teacher-group");
+    ASSERT_TRUE(admitted);
+    const auto owner = coordinator.SessionForAccess(admitted->access_epoch);
+    ASSERT_NE(owner, nullptr);
+    EXPECT_EQ(owner->id, "teacher-group");
+    const auto hashes = ContentHashes({{1, 2}, {3, 4}});
+    coordinator.CacheFullBlocks(tables, hashes, admitted->access_epoch, 0, CacheBoundaryKind::kChunk);
+    EXPECT_EQ(coordinator.DemoteSessions({"cut", "teacher-group"}, true), 0u);
+    EXPECT_FALSE(owner->ended) << "session and group identifiers have separate namespaces";
+    EXPECT_FALSE(owner->demoted);
+    EXPECT_EQ(coordinator.TakePendingStores().size(), 2u);
+    // A group hint cannot free blocks that its active cut still owns.
+    EXPECT_EQ(coordinator.DemoteCacheGroups({"teacher-group"}, false), 0u);
+    EXPECT_EQ(tables[0].NumBlocks(), 2);
+    coordinator.Free(tables);
+    admitted.reset();
+    EXPECT_EQ(coordinator.DemoteCacheGroups({"teacher-group"}, true), 2u);
+    EXPECT_TRUE(owner->ended);
+    EXPECT_EQ(coordinator.ProbePrefix(hashes).device.num_common_tokens, 4);
+}
+
+TEST(CacheCoordinatorCacheGroups, SharedPrefixesStayMatchableAcrossGroupsAndIndividualSessions) {
+    BlockPool pool(8, {1});
+    const std::array specs{
+        CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2}};
+    auto coordinator = MakeCoordinator(specs, 2, pool, false, nullptr, nullptr, false, false,
+                                       /*checkpoint_retention_requests=*/0);
+    const auto hashes = ContentHashes({{1, 2}});
+    for (const std::string group : {"one", "two", ""}) {
+        std::vector<BlockTable> tables(1);
+        const std::array demands{GroupDemand{.table = &tables[0], .extent = DenseGrowth{2}}};
+        auto admitted = coordinator.Admit(coordinator.ProbePrefix(hashes), demands, RequestProgress{}, {}, std::nullopt,
+                                          std::nullopt, false, "cut-" + group, group);
+        ASSERT_TRUE(admitted);
+        EXPECT_EQ(admitted->device_prefix_tokens, group == "one" ? 0 : 2);
+        coordinator.CacheFullBlocks(tables, hashes, admitted->access_epoch, 0, CacheBoundaryKind::kChunk);
+        coordinator.Free(tables);
+    }
+    EXPECT_EQ(coordinator.DemoteCacheGroups({"one", "two"}, true), 0u);
+    EXPECT_EQ(coordinator.ProbePrefix(hashes).device.num_common_tokens, 2);
+}
+
+TEST(CacheCoordinatorCacheGroups, OrdinaryEvictionReclaimsGroupsAndTheirOwnerMetadata) {
+    BlockPool pool(1, {1});
+    const std::array specs{
+        CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2}};
+    auto coordinator = MakeCoordinator(specs, 2, pool, false, nullptr, nullptr, false, false,
+                                       /*checkpoint_retention_requests=*/0);
+    std::weak_ptr<SessionCacheTag> previous;
+    std::vector<std::string> previous_hashes;
+    for (int i = 0; i < 10000; ++i) {
+        std::vector<BlockTable> tables(1);
+        const std::array demands{GroupDemand{.table = &tables[0], .extent = DenseGrowth{2}}};
+        auto admitted = coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{}, {}, std::nullopt,
+                                          std::nullopt, false, "cut", "group-" + std::to_string(i));
+        ASSERT_TRUE(admitted) << "a group owner must not pin cached blocks";
+        if (i > 0) {
+            EXPECT_TRUE(previous.expired()) << "eviction must release the old group's last strong owner";
+            EXPECT_EQ(coordinator.ProbePrefix(previous_hashes).device.num_common_tokens, 0);
+        }
+        previous = coordinator.SessionForAccess(admitted->access_epoch);
+        previous_hashes = ContentHashes({{i, i + 1}});
+        coordinator.CacheFullBlocks(tables, previous_hashes, admitted->access_epoch, 0, CacheBoundaryKind::kChunk);
+        coordinator.Free(tables);
+    }
+    EXPECT_LT(CacheCoordinatorTestAccess::CacheGroupRegistrySize(coordinator), 4096u)
+        << "stale weak owners must be swept instead of growing for every completed group";
+    EXPECT_FALSE(previous.expired()) << "the surviving cache entry still owns its group";
+}
+
 }  // namespace tokenspeed::test

@@ -142,6 +142,128 @@ TEST_P(StorageQueryHighestTest, RestoresTheHighestCheckpointWithinTheActualKeyBu
 
 INSTANTIATE_TEST_SUITE_P(KeyBudgets, StorageQueryHighestTest, ::testing::Values(40u, 256u));
 
+TEST(SharedPrefixPublicationTest, DependenciesIncludeLocalFullHistoryStateAndWindow) {
+    auto specs = FullAndStates(4, 2, 2);
+    specs.push_back({.attn_kind = AttnKind::kSlidingWindow,
+                     .sliding_window = 4,
+                     .cache_blocks_per_lcm_block = 2,
+                     .block_granularity = 2});
+    QueryCache cache(4, specs, 64);
+    const QueryPrompt prompt(11, 4);
+    const auto prefix = prompt.Prefix(11, true);
+    const auto required = cache.coordinator.SharedPrefixKeys(prefix, 256);
+    ASSERT_EQ(required.max_tokens, 11);
+    // Full: four full blocks + two tail blocks; two endpoint states;
+    // window [8,11): two blocks under the tail hash.
+    EXPECT_EQ(required.keys.size(), 10u);
+    cache.Warm(required.keys);
+    cache.coordinator.CacheHostTail(prompt.hashes.back(), *prefix.tail);
+    EXPECT_TRUE(cache.coordinator.MissingStorageKeys(prefix, 256).keys.empty());
+    EXPECT_EQ(cache.coordinator.SharedPrefixKeys(prefix, 256).keys, required.keys);
+    EXPECT_EQ(cache.coordinator.SharedPrefixKeys(prefix, 9).max_tokens, -1);
+    for (const auto& key : required.keys) EXPECT_FALSE(cache.storage.WasPublished(key));
+}
+
+TEST(SharedPrefixPublicationTest, RequestLocalHintsDiscoverRemoteTailsWithoutInventingHits) {
+    QueryCache producer(4, FullAndStates(4, 2, 1), 32);
+    QueryCache consumer(4, FullAndStates(4, 2, 1), 32);
+    const QueryPrompt short_prompt(7, 4);
+    const auto producer_prefix = short_prompt.Prefix(7, true);
+    const auto objects = producer.coordinator.SharedPrefixKeys(producer_prefix, 256).keys;
+    const CacheKey checkpoint{.group_id = 1, .content_hash = producer_prefix.tail->hash, .page_offset = 0};
+    QueryPrompt long_prompt(13, 4);
+    auto prefix = long_prompt.Prefix(12, false);
+    EXPECT_FALSE(Has(consumer.coordinator.MissingStorageKeys(prefix, 256).keys, checkpoint));
+    const std::array<std::int32_t, 1> hints{7};
+    prefix.shared_prefix_tokens = hints;
+    const auto candidates = consumer.coordinator.MissingStorageKeys(prefix, 256);
+    EXPECT_TRUE(Has(candidates.keys, checkpoint));
+    EXPECT_EQ(consumer.coordinator.ProbePromptPrefix(prefix).host.num_common_tokens, 0);
+    std::vector<CacheKey> hits;
+    for (const auto& key : candidates.keys)
+        if (Has(objects, key)) hits.push_back(key);
+    consumer.Restore(prefix, hits);
+    EXPECT_EQ(consumer.coordinator.ProbePromptPrefix(prefix).host.num_common_tokens, 7);
+    EXPECT_TRUE(consumer.storage.WasPublished(checkpoint));
+
+    QueryCache divergent(4, FullAndStates(4, 2, 1), 32);
+    long_prompt.tokens[6] = 999;
+    EXPECT_FALSE(Has(divergent.coordinator.MissingStorageKeys(prefix, 256).keys, checkpoint));
+}
+
+TEST(SharedPrefixPublicationTest, RespectsRestrictedCheckpointGeometry) {
+    auto specs = FullAndStates(4, 2, 1);
+    specs.back().checkpoint_granularity = 4;
+    QueryCache cache(4, specs, 16);
+    const QueryPrompt prompt(11, 4);
+    EXPECT_EQ(cache.coordinator.SharedPrefixKeys(prompt.Prefix(11, true), 256).max_tokens, 0);
+    EXPECT_EQ(cache.coordinator.SharedPrefixKeys(prompt.Prefix(8, false), 256).max_tokens, 8);
+}
+
+TEST(SharedPrefixPublicationTest, OnlySuccessfulRetiredPutsCreateReceiptsAndFlushClearsThem) {
+    QueryCache cache(4, FullAndStates(4, 4, 0), 16);
+    const QueryPrompt prompt(8, 4);
+    const auto keys = cache.coordinator.SharedPrefixKeys(prompt.Prefix(8, false), 256).keys;
+    cache.Warm(keys);
+    cache.storage.QueueBackups(keys);
+    cache.storage.StartBackups();
+    const auto commands = cache.storage.TakeCommands();
+    ASSERT_EQ(commands.size(), 1u);
+    const auto put = std::get<StoragePutOperation>(commands[0]);
+    ASSERT_EQ(put.keys.size(), 2u);
+    EXPECT_FALSE(cache.storage.WasPublished(keys[0]));
+    cache.storage.Complete({put.op_id, {1, 0}, true, {0, 0}});
+    EXPECT_TRUE(cache.storage.WasPublished(put.keys[0]));
+    EXPECT_FALSE(cache.storage.WasPublished(put.keys[1]));
+    EXPECT_EQ(cache.storage.NumHeldBlocks(), 0u);
+    const auto epoch = cache.storage.PublicationEpoch();
+    cache.storage.ClearMetadata();
+    EXPECT_FALSE(cache.storage.WasPublished(put.keys[0]));
+    EXPECT_GT(cache.storage.PublicationEpoch(), epoch);
+
+    cache.storage.QueueBackups(keys);
+    cache.storage.StartBackups();
+    const auto unretired = std::get<StoragePutOperation>(cache.storage.TakeCommands()[0]);
+    cache.storage.Complete({unretired.op_id, {1, 1}, false, {0, 0}});
+    EXPECT_FALSE(cache.storage.WasPublished(keys[0]));
+    EXPECT_FALSE(cache.storage.WasPublished(keys[1]));
+    EXPECT_EQ(cache.storage.NumQuarantined(), 1u);
+}
+
+TEST(SharedPrefixPublicationTest, DetachedOrUnretiredGetsCannotConfirmSharedObjects) {
+    for (const bool detached : {false, true}) {
+        QueryCache cache(4, FullAndStates(4, 4, 0), 16);
+        const QueryPrompt prompt(4, 4);
+        const auto prefix = prompt.Prefix(4, false);
+        const auto keys = cache.coordinator.SharedPrefixKeys(prefix, 256).keys;
+        auto lease = cache.storage.StartRead(prefix, keys);
+        ASSERT_TRUE(lease);
+        const auto operation = std::get<StorageGetOperation>(cache.storage.TakeCommands()[0]);
+        if (detached) lease.reset();
+        cache.storage.Complete({operation.op_id, {1}, detached, {0}});
+        EXPECT_FALSE(cache.storage.WasPublished(keys[0]));
+    }
+}
+
+TEST(SharedPrefixPublicationTest, ReceiptMetadataRemainsBoundedAfterHostEviction) {
+    QueryCache cache(4, FullAndStates(4, 4, 0), 8);
+    const CacheKey oldest{.group_id = 0, .content_hash = "receipt-0", .page_offset = 0};
+    for (int i = 0; i < 300; ++i) {
+        const CacheKey key{.group_id = 0, .content_hash = "receipt-" + std::to_string(i), .page_offset = 0};
+        cache.Warm(std::span{&key, 1});
+        cache.storage.QueueBackups(std::span{&key, 1});
+        cache.storage.StartBackups();
+        const auto commands = cache.storage.TakeCommands();
+        ASSERT_EQ(commands.size(), 1u);
+        const auto put = std::get<StoragePutOperation>(commands[0]);
+        cache.storage.Complete({put.op_id, {1}, true, {0}});
+        EXPECT_LE(cache.storage.NumPublishedKeys(), 256u);
+        EXPECT_EQ(cache.storage.NumHeldBlocks(), 0u);
+    }
+    EXPECT_FALSE(cache.storage.WasPublished(oldest));
+    EXPECT_EQ(cache.storage.NumPublishedKeys(), 256u);
+}
+
 TEST(StorageQueryTest, MissingHighestStateFallsBackToTheNextCompleteCheckpoint) {
     QueryCache cache(4, FullAndStates(4, 4, 1), 64);
     QueryPrompt prompt(11, 4);

@@ -90,6 +90,8 @@ result = ts.Scheduler(cfg)
 fn spec(request_id: &str, tokens: Vec<i32>) -> RequestSpec {
     RequestSpec {
         session_id: String::new(),
+        cache_group_id: String::new(),
+        shared_prefix_tokens: Vec::new(),
         request_id: request_id.to_owned(),
         tokens,
         max_new_tokens: 4,
@@ -204,11 +206,13 @@ fn delayed_prefill_drains_its_reservation_and_holds_new_admissions() {
             .unwrap();
         if prefix == 0 {
             assert_eq!(scheduler.active_lcm_blocks(), 28);
-            assert!(scheduler
-                .next_execution_plan(false, true)
-                .forward_batches()
-                .iter()
-                .all(|batch| batch.request_ids.is_empty()));
+            assert!(
+                scheduler
+                    .next_execution_plan(false, true)
+                    .forward_batches()
+                    .iter()
+                    .all(|batch| batch.request_ids.is_empty())
+            );
         }
     }
     assert!(!scheduler.probe_prefill_gate().wants_prefill);
@@ -359,10 +363,11 @@ fn a_forced_retraction_stores_and_restores_through_cache_events() {
         if let Some(op) = ops.first() {
             assert_eq!(ops.len(), 1);
             assert_eq!(op.kind, CacheOpKind::SnapshotStore);
-            assert!(plan
-                .forward_batches()
-                .iter()
-                .all(|b| b.request_ids.is_empty()));
+            assert!(
+                plan.forward_batches()
+                    .iter()
+                    .all(|b| b.request_ids.is_empty())
+            );
             store = Some(op.op_id);
             break;
         }
@@ -471,10 +476,11 @@ fn storage_operations_stay_out_of_the_device_cache_ops() {
     assert!(ops[0].keys.iter().all(|key| key.group_id == 0));
     assert_ne!(ops[0].keys[0].content_hash, ops[0].keys[1].content_hash);
     assert!(ops[0].host_blocks.is_empty());
-    assert!(plan
-        .forward_batches()
-        .iter()
-        .all(|b| b.request_ids.is_empty()));
+    assert!(
+        plan.forward_batches()
+            .iter()
+            .all(|b| b.request_ids.is_empty())
+    );
     assert!(scheduler.storage_pending());
 
     // No owner holds a key: the request admits without a stored prefix.
@@ -490,10 +496,11 @@ fn storage_operations_stay_out_of_the_device_cache_ops() {
     };
     scheduler.advance_head(&done, &[]).unwrap();
     let plan = scheduler.next_execution_plan(true, false);
-    assert!(plan
-        .forward_batches()
-        .iter()
-        .any(|b| b.request_ids == ["waiting"]));
+    assert!(
+        plan.forward_batches()
+            .iter()
+            .any(|b| b.request_ids == ["waiting"])
+    );
 }
 
 #[test]
@@ -799,6 +806,34 @@ fn session_demotion_counts_only_newly_aged_idle_pages() {
 }
 
 #[test]
+fn cache_group_ownership_survives_cut_end_and_keeps_content_matching() {
+    interpreter();
+    let mut scheduler =
+        Python::attach(|py| Scheduler::from_python(&run(py, NEW_SCHEDULER)).unwrap());
+    let mut request = spec("cut-one", (1..=40).collect());
+    request.session_id = "cut-session".into();
+    request.cache_group_id = "teacher-group".into();
+    scheduler.submit_requests(&[request]).unwrap();
+    scheduler.next_execution_plan(true, false);
+    scheduler
+        .advance(&[event(ForwardEventKind::ExtendResult, "cut-one", vec![42])])
+        .unwrap();
+    scheduler
+        .advance(&[event(ForwardEventKind::Finish, "cut-one", vec![])])
+        .unwrap();
+    scheduler.next_execution_plan(true, false);
+    assert_eq!(scheduler.demote_session("cut-session", true), 0);
+    assert_eq!(scheduler.demote_session("teacher-group", true), 0);
+    assert!(scheduler.demote_cache_groups(&["teacher-group".into()], true) > 0);
+    let mut resumed = spec("cut-two", (1..=40).collect());
+    resumed.session_id = "different-session".into();
+    resumed.cache_group_id = "teacher-group".into();
+    scheduler.submit_requests(&[resumed]).unwrap();
+    let plan = scheduler.next_execution_plan(true, false);
+    assert!(plan.forward_batches()[0].extend_prefix_lens[0] > 0);
+}
+
+#[test]
 fn admission_capacity_uses_native_geometry_and_live_slots() {
     interpreter();
     let mut scheduler =
@@ -807,10 +842,12 @@ fn admission_capacity_uses_native_geometry_and_live_slots() {
     assert_eq!(initial.free_slots, initial.total_slots);
     assert_eq!(initial.available_blocks, initial.total_blocks);
     assert!(!initial.capacity_blocks.is_empty());
-    assert!(initial
-        .capacity_blocks
-        .windows(2)
-        .all(|pair| pair[0] <= pair[1]));
+    assert!(
+        initial
+            .capacity_blocks
+            .windows(2)
+            .all(|pair| pair[0] <= pair[1])
+    );
     assert!(*initial.capacity_blocks.last().unwrap() <= i64::from(initial.total_blocks));
     scheduler
         .submit_requests(&[spec("capacity", (1..=10).collect())])
@@ -819,4 +856,307 @@ fn admission_capacity_uses_native_geometry_and_live_slots() {
     let active = scheduler.admission_snapshot(8);
     assert_eq!(active.free_slots, initial.free_slots - 1);
     assert!(active.available_blocks < initial.available_blocks);
+}
+
+#[test]
+fn shared_prefix_publication_without_storage_is_explicit_and_bounded() {
+    interpreter();
+    Python::attach(|py| {
+        let object = run(py, NEW_SCHEDULER);
+        let scheduler = Scheduler::from_python(&object).unwrap();
+        assert!(!scheduler.shared_prefix_storage_enabled());
+        let result = scheduler.shared_prefix_publication(&[1, 2, 3], 2).unwrap();
+        assert_eq!(result.status, "unsupported");
+        assert_eq!(result.confirmed_prefix_tokens, 0);
+        assert!(scheduler.shared_prefix_publication(&[1, 2, 3], 4).is_err());
+        assert!(scheduler.shared_prefix_publication(&[1, 2, 3], 0).is_err());
+    });
+}
+
+#[test]
+fn shared_prefix_publication_exposes_pressure_and_flush_epoch() {
+    interpreter();
+    let mut scheduler =
+        Python::attach(|py| Scheduler::from_python(&run(py, STORAGE_SCHEDULER)).unwrap());
+    assert!(scheduler.shared_prefix_storage_enabled());
+    let first = scheduler
+        .shared_prefix_publication(&[1, 2, 3, 4], 4)
+        .unwrap();
+    assert_eq!(first.status, "pending");
+    assert_eq!(first.confirmed_prefix_tokens, 0);
+    let mut pressure = tick(1);
+    pressure.tick.as_mut().unwrap().queued_operations = 100;
+    scheduler.advance_head(&pressure, &[]).unwrap();
+    assert_eq!(
+        scheduler
+            .shared_prefix_publication(&[1, 2, 3, 4], 4)
+            .unwrap()
+            .status,
+        "pressure"
+    );
+    assert!(scheduler.clear_cache());
+    assert!(
+        scheduler
+            .shared_prefix_publication(&[1, 2, 3, 4], 4)
+            .unwrap()
+            .cache_epoch
+            > first.cache_epoch
+    );
+    scheduler.advance_head(&tick(2), &[]).unwrap();
+    assert_eq!(
+        scheduler
+            .shared_prefix_publication(&[1, 2, 3, 4], 4)
+            .unwrap()
+            .status,
+        "pending"
+    );
+    assert_eq!(
+        scheduler
+            .shared_prefix_publication(&[1; 12], 12)
+            .unwrap()
+            .status,
+        "too_large"
+    );
+}
+
+#[test]
+fn shared_prefix_publication_follows_real_prefill_host_copy_and_put() {
+    interpreter();
+    for state_group in [false, true] {
+        let state = if state_group {
+            "cfg.cache_groups = [*cfg.cache_groups, ts.CacheGroupConfig('state', 0, 32, ts.AttnKind.State, transfer_policy=ts.CacheTransferPolicy.LatestSnapshot)]\ncfg.host_group_packing = [1, 1]\n"
+        } else {
+            ""
+        };
+        let code = STORAGE_SCHEDULER.replace("result = ts.Scheduler(cfg)", &format!(
+            "cfg.role = ts.SchedulerConfig.Role.P\ncfg.num_host_pages = 32\ncfg.cache_groups = [ts.CacheGroupConfig('full', 2, 32, ts.AttnKind.Full, transfer_policy=ts.CacheTransferPolicy.FullSuffix)]\ncfg.storage_config = ts.StorageConfig(8, 64, 16, 64, 32, 1, 1000, 1000, ts.StoragePressure(8, 65536, 1000), ts.StoragePressure(4, 32768, 500))\n{state}result = ts.Scheduler(cfg)"));
+        let mut scheduler = Python::attach(|py| Scheduler::from_python(&run(py, &code)).unwrap());
+        let tokens = vec![1, 2, 3, 4, 5]; // Includes a real partial-page prompt endpoint.
+        scheduler.advance_head(&tick(1), &[]).unwrap();
+        scheduler
+            .submit_requests(&[spec("producer", tokens.clone())])
+            .unwrap();
+        let initial = scheduler.next_execution_plan(true, false);
+        let mut initial_done = tick(1);
+        for op in initial.storage_ops() {
+            assert_eq!(op.kind, StorageOpKind::Query);
+            initial_done.done.push(StorageDoneView {
+                op_id: op.op_id,
+                success: vec![0; op.keys.len()],
+                retired: true,
+                object_failures: vec![0; op.keys.len()],
+            });
+        }
+        scheduler.advance_head(&initial_done, &[]).unwrap();
+        scheduler
+            .advance(&[event(ForwardEventKind::PdBootstrapped, "producer", vec![])])
+            .unwrap();
+        let (mut prefills, mut pd, mut stores, mut puts) = (0, 0, 0, 0);
+        let mut stored_keys = Vec::new();
+        for step in 2..30 {
+            let plan = scheduler.next_execution_plan(true, false);
+            let mut round = tick(step);
+            let mut copies = Vec::new();
+            for op in plan.cache_ops() {
+                assert_eq!(op.kind, CacheOpKind::WriteBack);
+                stores += 1;
+                assert_ne!(
+                    scheduler
+                        .shared_prefix_publication(&tokens, 5)
+                        .unwrap()
+                        .status,
+                    "published"
+                );
+                copies.push(CacheEvent {
+                    kind: CacheEventKind::WriteBackDone,
+                    op_id: op.op_id,
+                });
+            }
+            for op in plan.storage_ops() {
+                let succeeded = match op.kind {
+                    StorageOpKind::Query => false,
+                    StorageOpKind::Put => {
+                        puts += 1;
+                        stored_keys.extend(op.keys.clone());
+                        assert_ne!(
+                            scheduler
+                                .shared_prefix_publication(&tokens, 5)
+                                .unwrap()
+                                .status,
+                            "published"
+                        );
+                        true
+                    }
+                    other => panic!("unexpected operation {other:?}"),
+                };
+                round.done.push(StorageDoneView {
+                    op_id: op.op_id,
+                    success: vec![u8::from(succeeded); op.keys.len()],
+                    retired: true,
+                    object_failures: vec![0; op.keys.len()],
+                });
+            }
+            for batch in plan.forward_batches() {
+                for id in batch.request_ids {
+                    prefills += 1;
+                    scheduler
+                        .advance(&[event(ForwardEventKind::ExtendResult, &id, vec![42])])
+                        .unwrap();
+                }
+            }
+            if let Some(batch) = plan.remote_decode_transfer() {
+                for id in batch.request_ids {
+                    pd += 1;
+                    scheduler
+                        .advance(&[event(ForwardEventKind::PdSucceeded, &id, vec![])])
+                        .unwrap();
+                }
+            }
+            scheduler.advance_head(&round, &copies).unwrap();
+            let receipt = scheduler.shared_prefix_publication(&tokens, 5).unwrap();
+            if receipt.status == "published" {
+                assert_eq!(receipt.confirmed_prefix_tokens, 5);
+                break;
+            }
+        }
+        assert!(
+            prefills > 0 && pd > 0 && stores > 0 && puts > 0,
+            "prefill={prefills}, pd={pd}, d2h={stores}, put={puts}"
+        );
+        assert_eq!(
+            scheduler
+                .shared_prefix_publication(&tokens, 5)
+                .unwrap()
+                .status,
+            "published",
+            "state={state_group}"
+        );
+        assert_eq!(
+            scheduler
+                .shared_prefix_publication(&[1, 2, 3, 4, 9], 5)
+                .unwrap()
+                .status,
+            "pending"
+        );
+
+        // A separate P has no producer-local tail table. The hint discovers
+        // the actual unaligned checkpoint through its own Query/GET/load path.
+        let mut consumer = Python::attach(|py| Scheduler::from_python(&run(py, &code)).unwrap());
+        let mut request = spec("consumer", vec![1, 2, 3, 4, 5, 6, 7]);
+        request.shared_prefix_tokens = vec![5];
+        consumer.advance_head(&tick(1), &[]).unwrap();
+        consumer.submit_requests(&[request]).unwrap();
+        let mut initial = Some(consumer.next_execution_plan(true, false));
+        consumer
+            .advance(&[event(ForwardEventKind::PdBootstrapped, "consumer", vec![])])
+            .unwrap();
+        let (mut got, mut loaded, mut hit) = (false, false, 0);
+        for step in 2..30 {
+            let plan = initial
+                .take()
+                .unwrap_or_else(|| consumer.next_execution_plan(true, false));
+            let mut round = tick(step);
+            let mut copies = Vec::new();
+            for op in plan.storage_ops() {
+                assert!(matches!(op.kind, StorageOpKind::Query | StorageOpKind::Get));
+                let success: Vec<u8> = op
+                    .keys
+                    .iter()
+                    .map(|key| u8::from(stored_keys.contains(key)))
+                    .collect();
+                if op.kind == StorageOpKind::Get {
+                    got = true;
+                    assert!(success.iter().all(|&value| value == 1));
+                }
+                round.done.push(StorageDoneView {
+                    op_id: op.op_id,
+                    success,
+                    retired: true,
+                    object_failures: vec![0; op.keys.len()],
+                });
+            }
+            for op in plan.cache_ops() {
+                assert_eq!(op.kind, CacheOpKind::LoadBack);
+                loaded = true;
+                copies.push(CacheEvent {
+                    kind: CacheEventKind::LoadBackDone,
+                    op_id: op.op_id,
+                });
+            }
+            for batch in plan.forward_batches() {
+                if !batch.request_ids.is_empty() {
+                    hit = batch.extend_prefix_lens[0];
+                }
+            }
+            consumer.advance_head(&round, &copies).unwrap();
+            if hit > 0 {
+                break;
+            }
+        }
+        assert!(
+            got && loaded,
+            "consumer must perform a real GET and Host load"
+        );
+        assert_eq!(
+            hit, 5,
+            "separate P must resume at the hinted partial tail, state={state_group}"
+        );
+        // Accepted GETs are evidence for the old shared history. Publishing
+        // the longer prompt must not require re-PUT of every inherited page.
+        assert_eq!(
+            consumer
+                .shared_prefix_publication(&tokens, 5)
+                .unwrap()
+                .status,
+            "published"
+        );
+        consumer
+            .advance(&[event(ForwardEventKind::ExtendResult, "consumer", vec![42])])
+            .unwrap();
+        for step in 30..60 {
+            let plan = consumer.next_execution_plan(true, false);
+            let mut round = tick(step);
+            let mut copies = Vec::new();
+            if let Some(batch) = plan.remote_decode_transfer() {
+                for id in batch.request_ids {
+                    consumer
+                        .advance(&[event(ForwardEventKind::PdSucceeded, &id, vec![])])
+                        .unwrap();
+                }
+            }
+            for op in plan.cache_ops() {
+                assert_eq!(op.kind, CacheOpKind::WriteBack);
+                copies.push(CacheEvent {
+                    kind: CacheEventKind::WriteBackDone,
+                    op_id: op.op_id,
+                });
+            }
+            for op in plan.storage_ops() {
+                assert_eq!(op.kind, StorageOpKind::Put);
+                round.done.push(StorageDoneView {
+                    op_id: op.op_id,
+                    success: vec![1; op.keys.len()],
+                    retired: true,
+                    object_failures: vec![0; op.keys.len()],
+                });
+            }
+            consumer.advance_head(&round, &copies).unwrap();
+            if consumer
+                .shared_prefix_publication(&[1, 2, 3, 4, 5, 6, 7], 7)
+                .unwrap()
+                .status
+                == "published"
+            {
+                break;
+            }
+        }
+        assert_eq!(
+            consumer
+                .shared_prefix_publication(&[1, 2, 3, 4, 5, 6, 7], 7)
+                .unwrap()
+                .status,
+            "published",
+            "next producer state={state_group}"
+        );
+    }
 }

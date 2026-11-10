@@ -36,6 +36,10 @@
 namespace tokenspeed {
 
 struct CacheCoordinatorTestAccess {
+    static std::size_t CacheGroupRegistrySize(const CacheCoordinator& coordinator) {
+        return coordinator.cache_group_tags_.size();
+    }
+
     static auto MatchPrefix(CacheCoordinator& coordinator, std::span<const std::string> content_hashes) {
         return coordinator.acquirePrefix(coordinator.ProbePrefix(content_hashes), ++coordinator.next_access_epoch_);
     }

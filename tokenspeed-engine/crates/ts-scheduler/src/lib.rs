@@ -47,6 +47,10 @@ mod ffi {
         request_id: String,
         /// Router-only cache retention identity, empty when untracked.
         session_id: String,
+        /// Shared cache owner, empty to retain session ownership.
+        cache_group_id: String,
+        /// Candidate shared-store checkpoints within this prompt.
+        shared_prefix_tokens: Vec<i32>,
         /// Prompt token ids.
         tokens: Vec<i32>,
         /// Generation limit the scheduler reserves for.
@@ -371,6 +375,14 @@ mod ffi {
         has_decode_work: bool,
     }
 
+    /// Bounded historical shared-store publication proof.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct SharedPrefixPublication {
+        status: String,
+        confirmed_prefix_tokens: i32,
+        cache_epoch: u64,
+    }
+
     /// Request and page counts.
     #[derive(Debug, Clone, PartialEq)]
     struct SchedulerSizes {
@@ -450,7 +462,18 @@ mod ffi {
             ended: bool,
         ) -> usize;
         fn demote_session(scheduler: Pin<&mut Scheduler>, session_id: &str, ended: bool) -> usize;
+        fn demote_cache_groups(
+            scheduler: Pin<&mut Scheduler>,
+            cache_group_ids: &[String],
+            ended: bool,
+        ) -> usize;
         fn admission_snapshot(scheduler: &Scheduler, token_step: i32) -> AdmissionSnapshot;
+        fn shared_prefix_storage_enabled(scheduler: &Scheduler) -> bool;
+        fn shared_prefix_publication(
+            scheduler: &Scheduler,
+            input_ids: &[i32],
+            max_prefix_tokens: i32,
+        ) -> Result<SharedPrefixPublication>;
         fn sizes(scheduler: &Scheduler) -> SchedulerSizes;
         fn active_lcm_blocks(scheduler: &Scheduler) -> i32;
         fn probe_prefill_gate(scheduler: &Scheduler) -> PrefillGateProbe;
@@ -632,9 +655,28 @@ impl Scheduler {
         ffi::demote_sessions(self.pinned(), session_ids, ended)
     }
 
+    /// Lower only these groups' exclusive cache entries; never invalidates active blocks.
+    pub fn demote_cache_groups(&mut self, cache_group_ids: &[String], ended: bool) -> usize {
+        ffi::demote_cache_groups(self.pinned(), cache_group_ids, ended)
+    }
+
     /// Lower only this session's exclusive cache entries in the eviction order.
     pub fn demote_session(&mut self, session_id: &str, ended: bool) -> usize {
         ffi::demote_session(self.pinned(), session_id, ended)
+    }
+
+    /// Whether this rank has the complete prefix publication path configured.
+    pub fn shared_prefix_storage_enabled(&self) -> bool {
+        ffi::shared_prefix_storage_enabled(self.get())
+    }
+
+    /// Query exact prefix receipts without waiting or acquiring cache references.
+    pub fn shared_prefix_publication(
+        &self,
+        input_ids: &[i32],
+        max_prefix_tokens: i32,
+    ) -> Result<ffi::SharedPrefixPublication, cxx::Exception> {
+        ffi::shared_prefix_publication(self.get(), input_ids, max_prefix_tokens)
     }
 
     /// Poll native capacity; token_step must be positive.
