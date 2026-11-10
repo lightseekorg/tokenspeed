@@ -41,6 +41,7 @@ import math
 import torch
 from tokenspeed_kernel._optional import has_optional_package
 from tokenspeed_kernel.ops.attention.kda import (
+    KdaOutputNorm,
     KdaPrefillResult,
     KdaReplayRecords,
     kda_verify_conv_update,
@@ -474,6 +475,7 @@ if current_platform().is_nvidia and has_optional_package("cutlass", "quack"):
         draft_token_num: int,
         lower_bound: float | None,
         replay_records: KdaReplayRecords | None,
+        output_norm: KdaOutputNorm | None,
     ) -> torch.Tensor:
         """Run one-token record verify with the gate and convolution producers fused.
 
@@ -482,9 +484,11 @@ if current_platform().is_nvidia and has_optional_package("cutlass", "quack"):
         outputs, correction and key/gate records, stamps, and the
         pre-convolution rows in ``replay_records.original_qkv``. The recurrent
         and convolution states are read only. Inputs the CuTe DSL kernel
-        cannot address run those split producers instead.
+        cannot address run those split producers instead. ``output_norm``
+        is applied before the store.
 
-        Returns the verify output as ``[1, tokens, num_heads, head_dim]``.
+        Returns the verify output as ``[1, tokens, num_heads, head_dim]``, or
+        with ``output_norm`` the normed ``[tokens, num_heads * head_dim]``.
         """
         from tokenspeed_kernel.ops.attention.kda._cute_dsl.fused_verify_step import (
             fused_verify_step,
@@ -547,6 +551,7 @@ if current_platform().is_nvidia and has_optional_package("cutlass", "quack"):
                 draft_token_num=draft_token_num,
                 lower_bound=lower_bound,
                 replay_records=replay_records,
+                output_norm=output_norm,
                 g_raw=g_raw,
                 conv_qkv=conv_qkv,
             )
@@ -574,5 +579,6 @@ if current_platform().is_nvidia and has_optional_package("cutlass", "quack"):
             out.view(rows, num_heads * head_dim),
             replay_records.metadata,
             replay_records.stamps,
+            output_norm,
         )
-        return out
+        return out if output_norm is None else out.view(rows, num_heads * head_dim)

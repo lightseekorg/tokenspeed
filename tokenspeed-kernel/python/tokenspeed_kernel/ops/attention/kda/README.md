@@ -78,3 +78,17 @@ warp-wide load reads one contiguous row, and a transposing butterfly leaves
 each row's total in the lane of the matching thread. Weights load (or are
 prefetched into L2) before the programmatic dependency wait, activations and
 state after it.
+
+### Output norm
+
+A KDA layer feeds its o-projection the gated RMSNorm of the attention output,
+`rmsnorm(out) * w * sigmoid(gate)` per head. `try_kda_fused_paged_verify`
+takes it as `output_norm` (`KdaOutputNorm`: the gate view, the weight, eps)
+and then returns the normed `[tokens, heads * head_dim]` rows. The one-token
+step applies it before its store: the thread of each channel holds the BF16
+output, a warp sum and four shared-memory partials give the head's sum of
+squares, and the rest is the norm kernel's math in its order. Only the order
+of that sum differs from `rmsnorm_gated_sigmoid` on the stored output, so an
+element may move by one BF16 step. Every other verify kernel, and the
+backend's non-verify paths, run `rmsnorm_gated_sigmoid` after the attention
+(`apply_kda_output_norm`).

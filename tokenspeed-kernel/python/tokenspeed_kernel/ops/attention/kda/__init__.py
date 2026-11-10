@@ -25,8 +25,9 @@ from dataclasses import dataclass
 
 import torch
 from tokenspeed_kernel._optional import has_optional_package
+from tokenspeed_kernel.ops.activation.triton import rmsnorm_gated_sigmoid
 from tokenspeed_kernel.ops.attention.kda._prefill_capacity import KdaPrefillCapacity
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import (
     NoKernelFoundError,
@@ -106,6 +107,58 @@ class KdaPrefillResult:
 
     out: torch.Tensor
     final_state: torch.Tensor
+
+
+@dataclass(frozen=True)
+class KdaOutputNorm:
+    """The gated RMSNorm a KDA layer applies to its attention output.
+
+    ``out = rmsnorm(core) * weight * sigmoid(gate)`` per head over ``head_dim``,
+    in FP32 on the BF16 core output, rounded once to the output dtype.
+
+    Attributes:
+        gate: ``[tokens, heads * head_dim]`` raw output-gate logits with unit
+            inner stride; a column view of the input projection is fine.
+        weight: ``[head_dim]`` RMSNorm weight.
+        eps: RMSNorm epsilon.
+    """
+
+    gate: torch.Tensor
+    weight: torch.Tensor
+    eps: float
+
+    def rows(self, begin: int, end: int) -> KdaOutputNorm:
+        """The norm of token rows ``[begin, end)``."""
+        return KdaOutputNorm(self.gate[begin:end], self.weight, self.eps)
+
+
+def apply_kda_output_norm(
+    out: torch.Tensor, output_norm: KdaOutputNorm | None
+) -> torch.Tensor:
+    """``out`` gated-RMSNormed as a ``[tokens, heads * head_dim]`` tensor, or as is.
+
+    Args:
+        out: KDA attention output whose leading dimensions flatten to the
+            gate's token rows and whose last dimension is ``head_dim`` or
+            ``heads * head_dim``.
+        output_norm: The layer's output norm, or None to return ``out``.
+
+    Returns:
+        ``out`` when ``output_norm`` is None, else the normed output.
+    """
+    if output_norm is None:
+        return out
+    tokens, width = output_norm.gate.shape
+    head_dim = output_norm.weight.shape[0]
+    return rmsnorm_gated_sigmoid(
+        out.reshape(tokens, width).contiguous(),
+        output_norm.gate,
+        output_norm.weight,
+        output_norm.eps,
+        width // head_dim,
+        head_dim,
+        enable_pdl=pdl_enabled(),
+    )
 
 
 @dataclass(frozen=True)
@@ -464,6 +517,7 @@ def try_kda_fused_paged_verify(
     solution: str | None = None,
     store_states: bool = True,
     replay_records: KdaReplayRecords | None,
+    output_norm: KdaOutputNorm | None,
     g_raw: torch.Tensor | None = None,
     conv_qkv: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
@@ -478,7 +532,9 @@ def try_kda_fused_paged_verify(
     activation-dtype unnormalized keys and raw gates, and query boundaries
     for same-round recovery. Commit recomputes key normalization and gate decay.
     A raw gate may be supplied to fused-convolution verification; supplying
-    ``conv_qkv`` additionally selects split producers.
+    ``conv_qkv`` additionally selects split producers. With ``output_norm``
+    the result is the layer's gated-RMSNormed ``[tokens, heads * head_dim]``
+    output; kernels apply it in their epilogue where they can.
     Returns ``None`` only when no implementation
     supports the current platform.
     """
@@ -536,6 +592,7 @@ def try_kda_fused_paged_verify(
         head_dim=head_dim,
         draft_token_num=draft_token_num,
         lower_bound=lower_bound,
+        output_norm=output_norm,
         **kwargs,
     )
 
@@ -818,7 +875,9 @@ import tokenspeed_kernel.ops.attention.kda.gluon  # noqa: E402,F401
 # isort: on
 
 __all__ = [
+    "KdaOutputNorm",
     "KdaPrefillResult",
+    "apply_kda_output_norm",
     "kda_replay_payload_specs",
     "kda_recurrent_layout",
     "kda_paged_prefill",

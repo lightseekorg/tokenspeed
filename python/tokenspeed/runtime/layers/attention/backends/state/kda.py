@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING
 import torch
 from tokenspeed_kernel.ops.attention.gdn import GdnStateCheckpoints
 from tokenspeed_kernel.ops.attention.kda import (
+    KdaOutputNorm,
     KdaPrefillCapacity,
     KdaReplayRecords,
     kda_fused_paged_verify_fuses_producers,
@@ -849,6 +850,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
         attn_tp_size: int,
         head_v_dim: int,
         lower_bound: float | None,
+        output_norm: KdaOutputNorm | None,
     ) -> torch.Tensor | None:
         """Keep live state read-only; acceptance commits the selected prefix."""
         if self._replay_active:
@@ -948,6 +950,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
                 store_states=False,
                 recurrent_layout=self.kda_recurrent_layout,
                 replay_records=replay_records,
+                output_norm=output_norm,
                 **split_producers,
             )
             if fused_out is None:
@@ -980,6 +983,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
                 lower_bound=lower_bound,
                 recurrent_layout=self.kda_recurrent_layout,
                 replay_records=None,
+                output_norm=output_norm,
             )
 
     @override
