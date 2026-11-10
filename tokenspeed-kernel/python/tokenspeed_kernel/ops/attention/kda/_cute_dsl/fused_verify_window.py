@@ -35,12 +35,14 @@ cluster that shares the producers. CTA r convolves q and k channels
 store them, into the token rows of every CTA of the cluster. With the output
 norm, each warp of 32 value channels stores its tokens' sums of squares to
 every CTA of the cluster, and each CTA adds the head's four sums in order,
-as the one-token kernel does.
+as the one-token kernel does. Both exchanges are asynchronous stores that
+the receiving CTA's mbarrier counts, so a CTA waits only for its own rows.
 
 Before the programmatic dependency wait a CTA reads only what the previous
-launch does not write: the batch layout, its checkpoint tile (bulk copy),
-the convolution taps and history, and the gate and norm parameters. The
-projection rows are read after it.
+launch does not write: the batch layout, its checkpoint tile and f_b rows
+(bulk copies into shared memory), the convolution taps and history, and the
+gate and norm parameters. Those loads are first used after the wait, and
+every read of the projection rows is issued right after it.
 """
 
 from __future__ import annotations
@@ -51,7 +53,8 @@ import cutlass
 import torch
 from cuda.bindings.driver import CUstream
 from cutlass import BFloat16, Float32, Int32, Int64, const_expr, cute
-from cutlass.cutlass_dsl import dsl_user_op
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import T, dsl_user_op
 from quack.compile_utils import make_fake_tensor
 from tokenspeed_kernel.ops.attention.kda import KdaOutputNorm
 from tokenspeed_kernel.ops.attention.kda._cute_dsl.fused_verify_step import (
@@ -60,8 +63,6 @@ from tokenspeed_kernel.ops.attention.kda._cute_dsl.fused_verify_step import (
     _bf16,
     _check_output_norm,
     _check_records,
-    _ldg_bf16x4,
-    _prefetch_l2,
     _silu,
     _transpose_sum,
     fused_verify_step_supported,
@@ -74,6 +75,7 @@ from tokenspeed_kernel.ops.attention.kda._cute_dsl.recoverssm_verify import (
     _bulk_load,
     _div,
     _exp,
+    _lds_bf16x4,
     _load,
     _round_up,
     _rsqrt,
@@ -91,6 +93,42 @@ NORM_GROUPS = DIM // 32
 
 
 @dsl_user_op
+def _ldg_b32x2(byte_addr: Int64, *, loc=None, ip=None):
+    """Two 32-bit words from an 8-byte aligned global address, left packed."""
+    value = _asm(
+        llvm.StructType.get_literal([T.i32()] * 2),
+        [Int64(byte_addr)],
+        "ld.global.v2.b32 {$0, $1}, [$2];",
+        "=r,=r,l",
+        True,
+        loc,
+        ip,
+    )
+    return [
+        Int32(llvm.extractvalue(T.i32(), value, [i], loc=loc, ip=ip)) for i in range(2)
+    ]
+
+
+@dsl_user_op
+def _unpack_bf16x4(words, *, loc=None, ip=None):
+    """The four BF16 values of two packed words, as FP32."""
+    value = _asm(
+        llvm.StructType.get_literal([T.f32()] * 4),
+        [Int32(words[0]), Int32(words[1])],
+        "shl.b32 $0, $4, 16; and.b32 $1, $4, 0xffff0000; "
+        "shl.b32 $2, $5, 16; and.b32 $3, $5, 0xffff0000;",
+        "=f,=f,=f,=f,r,r",
+        False,
+        loc,
+        ip,
+    )
+    return [
+        Float32(llvm.extractvalue(T.f32(), value, [i], loc=loc, ip=ip))
+        for i in range(4)
+    ]
+
+
+@dsl_user_op
 def _store_shared_bf16(byte_addr: Int32, value: Float32, *, loc=None, ip=None):
     """Store an FP32 value that is already a BF16 number as BF16 in shared memory."""
     _asm(
@@ -105,19 +143,74 @@ def _store_shared_bf16(byte_addr: Int32, value: Float32, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def _store_peer_bf16(
-    byte_addr: Int32, peer: Int32, value: Float32, *, loc=None, ip=None
+def _push_peer_f32(
+    byte_addr: Int32,
+    peer: Int32,
+    value: Float32,
+    barrier_addr: Int32,
+    *,
+    loc=None,
+    ip=None,
 ):
-    """Store a BF16 number at this shared-memory address of cluster CTA ``peer``."""
+    """Store an FP32 value into cluster CTA ``peer``, counted on its mbarrier.
+
+    ``byte_addr`` and ``barrier_addr`` are this CTA's shared-memory addresses
+    of the destination and of the mbarrier that counts its four bytes.
+    """
     _asm(
         None,
-        [Int32(byte_addr), Int32(peer), Float32(value)],
-        "{ .reg .b32 a; .reg .b16 x; mapa.shared::cluster.u32 a, $0, $1; "
-        "cvt.rn.bf16.f32 x, $2; st.shared::cluster.b16 [a], x; }",
-        "r,r,f,~{memory}",
+        [Int32(byte_addr), Int32(peer), Float32(value), Int32(barrier_addr)],
+        "{ .reg .b32 a, m, v; mapa.shared::cluster.u32 a, $0, $1; "
+        "mapa.shared::cluster.u32 m, $3, $1; mov.b32 v, $2; "
+        "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [a], v, [m]; }",
+        "r,r,f,r,~{memory}",
         True,
         loc,
         ip,
+    )
+
+
+@dsl_user_op
+def _push_peer_b32(
+    byte_addr: Int32,
+    peer: Int32,
+    word: Int32,
+    barrier_addr: Int32,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Store a 32-bit word into cluster CTA ``peer``, counted on its mbarrier.
+
+    ``byte_addr`` and ``barrier_addr`` are this CTA's shared-memory addresses
+    of the destination and of the mbarrier that counts its four bytes.
+    """
+    _asm(
+        None,
+        [Int32(byte_addr), Int32(peer), Int32(word), Int32(barrier_addr)],
+        "{ .reg .b32 a, m; mapa.shared::cluster.u32 a, $0, $1; "
+        "mapa.shared::cluster.u32 m, $3, $1; "
+        "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [a], $2, [m]; }",
+        "r,r,r,r,~{memory}",
+        True,
+        loc,
+        ip,
+    )
+
+
+@dsl_user_op
+def _pack_bf16x2(low: Float32, high: Float32, *, loc=None, ip=None) -> Int32:
+    """Two FP32 values that are BF16 numbers, packed low first."""
+    return Int32(
+        _asm(
+            T.i32(),
+            [Float32(high), Float32(low)],
+            "cvt.rn.bf16x2.f32 $0, $1, $2;",
+            "=r,f,f",
+            False,
+            loc,
+            ip,
+        )
     )
 
 
@@ -134,25 +227,12 @@ def _store_shared_f32(byte_addr: Int32, value: Float32, *, loc=None, ip=None):
     )
 
 
-@dsl_user_op
-def _store_peer_f32(
-    byte_addr: Int32, peer: Int32, value: Float32, *, loc=None, ip=None
-):
-    """Store an FP32 value at this shared-memory address of cluster CTA ``peer``."""
-    _asm(
-        None,
-        [Int32(byte_addr), Int32(peer), Float32(value)],
-        "{ .reg .b32 a; mapa.shared::cluster.u32 a, $0, $1; "
-        "st.shared::cluster.f32 [a], $2; }",
-        "r,r,f,~{memory}",
-        True,
-        loc,
-        ip,
-    )
-
-
 class FusedVerifyWindow(RecoverSsmVerify):
-    """Multi-token verify with fused producers for one head count, window and value tile."""
+    """Multi-token verify with fused producers for one head count, window and value tile.
+
+    ``smem_floor`` is the least shared memory a CTA claims, which bounds how
+    many CTAs share an SM (0 for what the kernel needs).
+    """
 
     def __init__(
         self,
@@ -164,6 +244,7 @@ class FusedVerifyWindow(RecoverSsmVerify):
         factored: bool,
         has_metadata: bool,
         gated_norm: bool,
+        smem_floor: int,
     ) -> None:
         super().__init__(
             DIM,
@@ -181,36 +262,49 @@ class FusedVerifyWindow(RecoverSsmVerify):
         self.gated_norm = gated_norm
         # Channel c < 3 VT of a CTA: q, k, then v channels value_start + c % VT.
         self.conv_items = (3 * value_tile_rows + THREADS - 1) // THREADS
+        # The CTA's f_b rows, staged before the dependency wait past the
+        # checkpoint rows of the tile, which phase 1 fills only after the
+        # gate projection.
+        weight_words = value_tile_rows * GATE_RANK // 2
+        tile_words = max(self.tile_words, value_tile_rows * DIM + weight_words)
+        self.smem_bytes += 4 * (tile_words - self.tile_words)
+        self.tile_words = tile_words
+        self.smem_bytes = max(self.smem_bytes, smem_floor)
         if gated_norm:
             self.norm_words = _round_up(NORM_GROUPS * window, 4)
             self.smem_bytes += 4 * self.norm_words + 16
 
     @cute.jit
-    def _publish_bf16(self, byte_addr: Int32, value: Float32):
-        """Store a BF16 number at this shared-memory address of every CTA in the cluster."""
-        if const_expr(self.cluster == 1):
-            _store_shared_bf16(byte_addr, value)
-        else:
-            for peer in cutlass.range_constexpr(self.cluster):
-                _store_peer_bf16(byte_addr, Int32(peer), value)
+    def _publish_pairs(self, row_addr: Int32, values, lane: Int32, barrier_addr: Int32):
+        """Publish a lane pair's BF16 values of each token to every CTA of the cluster.
 
-    @cute.jit
-    def _publish_f32(self, byte_addr: Int32, value: Float32):
-        """Store an FP32 value at this shared-memory address of every CTA in the cluster."""
-        if const_expr(self.cluster == 1):
-            _store_shared_f32(byte_addr, value)
-        else:
-            for peer in cutlass.range_constexpr(self.cluster):
-                _store_peer_f32(byte_addr, Int32(peer), value)
-
-    @cute.jit
-    def _cluster_sync(self):
-        """Make every CTA's shared-memory stores so far visible to the whole cluster."""
-        if const_expr(self.cluster == 1):
-            cute.arch.barrier()
-        else:
-            cute.arch.cluster_arrive()
-            cute.arch.cluster_wait()
+        ``values[t]`` belongs at element ``t * K`` past ``row_addr`` (which
+        includes this lane's element), and lane ``l ^ 1`` holds the adjacent
+        element; the lane whose parity matches the token's stores the pair as
+        one word, counted on the receiving CTA's mbarrier.
+        """
+        K = self.key_dim
+        odd = lane % 2
+        pair_addr = row_addr - odd * 2
+        partners = [
+            cute.arch.shuffle_sync_bfly(v, offset=1, mask=-1, mask_and_clamp=31)
+            for v in values
+        ]
+        for j in cutlass.range_constexpr((len(values) + 1) // 2):
+            t = 2 * j + odd
+            own = values[2 * j]
+            partner = partners[2 * j]
+            if const_expr(2 * j + 1 < len(values)):
+                own = values[2 * j + 1] if odd != 0 else values[2 * j]
+                partner = partners[2 * j + 1] if odd != 0 else partners[2 * j]
+            low = partner if odd != 0 else own
+            high = own if odd != 0 else partner
+            word = _pack_bf16x2(low, high)
+            if t < len(values):
+                for peer in cutlass.range_constexpr(self.cluster):
+                    _push_peer_b32(
+                        pair_addr + t * K * 2, Int32(peer), word, barrier_addr
+                    )
 
     @cute.jit
     def __call__(
@@ -347,9 +441,6 @@ class FusedVerifyWindow(RecoverSsmVerify):
         lane = tidx % 32
         shared = self._allocate_shared()
         value_start = value_tile * VT
-        if const_expr(self.cluster > 1):
-            # Pairs with the wait before the first store into a peer.
-            cute.arch.cluster_arrive_relaxed()
 
         # The batch layout, the checkpoint, the convolution history and the
         # weights were written before this forward, not by the previous launch.
@@ -359,10 +450,36 @@ class FusedVerifyWindow(RecoverSsmVerify):
         live = (page > 0) & (valid_tokens > 0)
         if tidx == 0:
             cute.arch.mbarrier_init(shared.state_barrier, 1)
+            cute.arch.mbarrier_init(shared.weight_barrier, 1)
+            if const_expr(self.cluster > 1):
+                cute.arch.mbarrier_init(shared.token_barrier, 1)
+                # The cluster's q, k and gate rows of every token land on it.
+                cute.arch.mbarrier_arrive_and_expect_tx(
+                    shared.token_barrier, 3 * W * K * 2
+                )
+            if const_expr(self.gated_norm and self.cluster > 1):
+                cute.arch.mbarrier_init(shared.norm_barrier, 1)
+                # Every peer's group sums of every token land on it.
+                cute.arch.mbarrier_arrive_and_expect_tx(
+                    shared.norm_barrier, NORM_GROUPS * W * 4
+                )
         cute.arch.mbarrier_init_fence()
+        if const_expr(self.cluster > 1):
+            # Pairs with the wait before the first store into a peer.
+            cute.arch.cluster_arrive_relaxed()
         cute.arch.barrier()
         if live:
             if tidx == 0:
+                # The gate weights first: the projection reads them before the tile.
+                cute.arch.mbarrier_arrive_and_expect_tx(
+                    shared.weight_barrier, VT * GATE_RANK * 2
+                )
+                _bulk_load(
+                    shared.tile_addr + VT * K * 4,
+                    (f_b + (head * K + value_start) * GATE_RANK).toint(),
+                    VT * GATE_RANK * 2,
+                    Int32(shared.weight_barrier.toint()),
+                )
                 cute.arch.mbarrier_arrive_and_expect_tx(
                     shared.state_barrier, VT * K * 4
                 )
@@ -377,31 +494,28 @@ class FusedVerifyWindow(RecoverSsmVerify):
                     VT * K * 4,
                     Int32(shared.state_barrier.toint()),
                 )
-                f_b_slice = f_b + (head * K + value_start) * GATE_RANK
-                _prefetch_l2(f_b_slice.toint(), VT * GATE_RANK * 2)
 
+        # Issued here and first used after the wait, so no load stalls before it.
         channels = []
-        taps = []
-        pasts = []
-        history = conv_states + page * conv_page_stride
+        tap_words = []
+        past_values = []
+        # Padding pages see a zero history, as the split producer's do.
+        has_history = (valid_tokens > 0) & (page >= 0)
+        history = conv_states + cutlass.max(page, Int64(0)) * conv_page_stride
         for item in cutlass.range_constexpr(self.conv_items):
             c = cutlass.min(item * THREADS + tidx, 3 * VT - 1)
             kind = c // VT
             channel = kind * P + head * K + value_start + c % VT
             channels.append(channel)
-            taps.append(_ldg_bf16x4((conv_weights + channel * CONV_TAPS).toint()))
-            # Padding pages see a zero history, as the split producer's do.
+            tap_words.append(_ldg_b32x2((conv_weights + channel * CONV_TAPS).toint()))
             for i in cutlass.range_constexpr(CONV_TAPS - 1):
-                past = Float32(0.0)
-                if (valid_tokens > 0) & (page >= 0):
-                    past = _load(history, channel * 3 + i).to(Float32)
-                pasts.append(past)
-        gate_scale = _exp(_load(a_log, head).to(Float32))
-        gate_bias = _load(dt_bias, head * K + tidx).to(Float32)
+                past_values.append(_load(history, channel * 3 + i))
+        a_log_value = _load(a_log, head)
+        gate_bias_value = _load(dt_bias, head * K + tidx)
         channel = cutlass.min(tidx, VT - 1)
-        norm_scale = Float32(0.0)
+        norm_scale_value = None
         if const_expr(self.gated_norm):
-            norm_scale = _load(norm_weight, value_start + channel).to(Float32)
+            norm_scale_value = _load(norm_weight, value_start + channel)
 
         cute.arch.griddepcontrol_wait()
         if const_expr(self.cluster > 1):
@@ -409,11 +523,53 @@ class FusedVerifyWindow(RecoverSsmVerify):
         cute.arch.griddepcontrol_launch_dependents()
 
         if valid_tokens > 0:
+            # Every read of the previous launch's rows is issued before any is used.
+            raws = []
+            for item in cutlass.range_constexpr(self.conv_items):
+                for t in cutlass.range_constexpr(W):
+                    token = token_start + cutlass.min(t, valid_tokens - 1)
+                    raws.append(_load(qkv, token * qkv_token_stride + channels[item]))
+            gate_inputs = self._load_gate_inputs(
+                f_a, f_a_token_stride, token_start, valid_tokens, warp, lane
+            )
+            token = token_start + cutlass.min(
+                cutlass.min(tidx, W - 1), valid_tokens - 1
+            )
+            raw_beta = _load(beta, token * beta_token_stride + head)
+            logits = []
+            if const_expr(self.gated_norm):
+                for t in cutlass.range_constexpr(W):
+                    token = token_start + cutlass.min(t, valid_tokens - 1)
+                    logits.append(
+                        _load(
+                            gate,
+                            token * gate_token_stride
+                            + head * V
+                            + value_start
+                            + channel,
+                        )
+                    )
+            slot = Int64(request)
+            generation = Int64(0)
+            start = Int64(0)
+            if const_expr(self.has_metadata):
+                slot = Int64(_load(metadata, request * 3))
+                generation = Int64(_load(metadata, request * 3 + 1))
+                start = Int64(_load(metadata, request * 3 + 2))
+            gate_scale = _exp(a_log_value.to(Float32))
+            gate_bias = gate_bias_value.to(Float32)
+            norm_scale = Float32(0.0)
+            if const_expr(self.gated_norm):
+                norm_scale = norm_scale_value.to(Float32)
+
+            taps = [_unpack_bf16x4(words) for words in tap_words]
+            pasts = [
+                value.to(Float32) if has_history else Float32(0.0)
+                for value in past_values
+            ]
             self._convolve(
                 shared,
-                qkv,
                 original,
-                qkv_token_stride,
                 original_token_stride,
                 token_start,
                 valid_tokens,
@@ -423,125 +579,144 @@ class FusedVerifyWindow(RecoverSsmVerify):
                 channels,
                 taps,
                 pasts,
+                raws,
             )
             if live:
-                self._project_gate(
-                    shared,
-                    f_a,
-                    f_b,
-                    f_a_token_stride,
-                    token_start,
-                    valid_tokens,
-                    head,
-                    value_start,
-                    warp,
-                    lane,
-                )
-
-        if live:
-            self._cluster_sync()
-            slot = Int64(request)
-            generation = Int64(0)
-            start = Int64(0)
-            if const_expr(self.has_metadata):
-                slot = Int64(_load(metadata, request * 3))
-                generation = Int64(_load(metadata, request * 3 + 1))
-                start = Int64(_load(metadata, request * 3 + 2))
-            # Reduce the 64-bit start before narrowing so ring positions stay exact.
-            ring_start = Int32(start % self.capacity)
-            if tidx < W:
-                token = token_start + cutlass.min(tidx, valid_tokens - 1)
-                raw_beta = _load(beta, token * beta_token_stride + head).to(Float32)
-                shared.sums[self.sums.beta + tidx] = _div(
-                    Float32(1.0), Float32(1.0) + _exp(-raw_beta)
-                )
-            if const_expr(self.has_metadata):
-                # One CTA per request stamps the positions this window records.
-                if (value_tile == 0) & (head == 0) & (tidx < W) & (tidx < valid_tokens):
-                    stamp = cute.make_tensor(
-                        stamps
-                        + (slot * self.capacity + (ring_start + tidx) % self.capacity)
-                        * 2,
-                        cute.make_layout((2,)),
+                self._project_gate(shared, gate_inputs, value_start, warp, lane)
+                if const_expr(self.cluster == 1):
+                    cute.arch.barrier()
+                else:
+                    cute.arch.mbarrier_wait(shared.token_barrier, 0)
+                    # The v tile is this CTA's own plain stores.
+                    cute.arch.barrier()
+                # Reduce the 64-bit start before narrowing so ring positions stay exact.
+                ring_start = Int32(start % self.capacity)
+                if tidx < W:
+                    shared.sums[self.sums.beta + tidx] = _div(
+                        Float32(1.0), Float32(1.0) + _exp(-raw_beta.to(Float32))
                     )
-                    stamp[0] = start + tidx
-                    stamp[1] = generation
-            self._project_window(
-                shared,
-                tidx,
-                warp,
-                lane,
-                gate_bias,
-                gate_scale,
-                lower_bound,
-                key_gate + (slot * key_gate_slot_stride + head * key_gate_head_stride),
-                key_gate_position_stride,
-                Int32(value_tile == 0),
-                valid_tokens,
-                ring_start,
-            )
-
-            # Phase 3, one thread per value channel; the surplus warps repeat
-            # the last channel so the norm's warp sums see full warps.
-            corrections, outputs = self._solve_window(shared, channel)
-            owner = Int32(tidx < VT)
-            if const_expr(self.gated_norm):
-                outputs = self._normalize(
+                if const_expr(self.has_metadata):
+                    # One CTA per request stamps the positions this window records.
+                    if (
+                        (value_tile == 0)
+                        & (head == 0)
+                        & (tidx < W)
+                        & (tidx < valid_tokens)
+                    ):
+                        stamp = cute.make_tensor(
+                            stamps
+                            + (
+                                slot * self.capacity
+                                + (ring_start + tidx) % self.capacity
+                            )
+                            * 2,
+                            cute.make_layout((2,)),
+                        )
+                        stamp[0] = start + tidx
+                        stamp[1] = generation
+                self._project_window(
                     shared,
-                    outputs,
-                    gate,
-                    gate_token_stride,
-                    token_start,
-                    valid_tokens,
-                    head,
-                    value_start + channel,
-                    value_tile,
+                    tidx,
                     warp,
                     lane,
-                    owner,
-                    norm_scale,
-                    norm_eps,
+                    gate_bias,
+                    gate_scale,
+                    lower_bound,
+                    key_gate
+                    + (slot * key_gate_slot_stride + head * key_gate_head_stride),
+                    key_gate_position_stride,
+                    Int32(value_tile == 0),
+                    valid_tokens,
+                    ring_start,
                 )
-            out_row = out + (
-                token_start * out_token_stride + head * V + value_start + channel
-            )
-            correction_row = correction + (
-                slot * correction_slot_stride
-                + head * correction_head_stride
-                + value_start
-                + channel
-            )
-            for t in cutlass.range_constexpr(W):
-                stored = owner & Int32(t < valid_tokens)
-                position = (ring_start + t) % self.capacity
-                _store_if(
-                    stored, (out_row + t * out_token_stride).toint(), outputs[t], True
+
+                # Phase 3, one thread per value channel; the surplus warps repeat
+                # the last channel so the norm's warp sums see full warps.
+                corrections, outputs = self._solve_window(shared, channel)
+                owner = Int32(tidx < VT)
+                if const_expr(self.gated_norm):
+                    outputs = self._normalize(
+                        shared,
+                        outputs,
+                        logits,
+                        value_tile,
+                        warp,
+                        lane,
+                        owner,
+                        norm_scale,
+                        norm_eps,
+                    )
+                out_row = out + (
+                    token_start * out_token_stride + head * V + value_start + channel
                 )
-                _store_if(
-                    stored,
-                    (correction_row + position * correction_position_stride).toint(),
-                    corrections[t],
-                    False,
+                correction_row = correction + (
+                    slot * correction_slot_stride
+                    + head * correction_head_stride
+                    + value_start
+                    + channel
                 )
-        else:
-            # Padding requests: zero outputs for their tokens, no records.
-            if tidx < VT:
                 for t in cutlass.range_constexpr(W):
-                    row = out + (
-                        (token_start + t) * out_token_stride
-                        + head * V
-                        + value_start
-                        + tidx
+                    stored = owner & Int32(t < valid_tokens)
+                    position = (ring_start + t) % self.capacity
+                    _store_if(
+                        stored,
+                        (out_row + t * out_token_stride).toint(),
+                        outputs[t],
+                        True,
                     )
-                    _store_if(Int32(t < valid_tokens), row.toint(), Float32(0.0), True)
+                    _store_if(
+                        stored,
+                        (
+                            correction_row + position * correction_position_stride
+                        ).toint(),
+                        corrections[t],
+                        False,
+                    )
+            else:
+                # Padding requests: zero outputs for their tokens, no records.
+                if tidx < VT:
+                    for t in cutlass.range_constexpr(W):
+                        row = out + (
+                            (token_start + t) * out_token_stride
+                            + head * V
+                            + value_start
+                            + tidx
+                        )
+                        _store_if(
+                            Int32(t < valid_tokens), row.toint(), Float32(0.0), True
+                        )
+
+    @cute.jit
+    def _load_gate_inputs(
+        self,
+        f_a,
+        f_a_token_stride: Int64,
+        token_start: Int64,
+        valid_tokens: Int32,
+        warp: Int32,
+        lane: Int32,
+    ):
+        """This lane's f_a elements for each gate item ``_project_gate`` gives its warp."""
+        W = self.window
+        pairs = (W + 1) // 2
+        items = (self.value_tile_rows // 32) * pairs
+        inputs = []
+        for step in cutlass.range_constexpr((items + 3) // 4):
+            # Surplus warps load the last item; their projection is skipped.
+            item = cutlass.min(step * 4 + warp, items - 1)
+            first = 2 * (item % pairs)
+            for r in cutlass.range_constexpr(2):
+                token = token_start + cutlass.min(first + r, valid_tokens - 1)
+                inputs.append(
+                    _ldg_b32x2((f_a + token * f_a_token_stride + 4 * lane).toint())
+                )
+        return inputs
 
     @cute.jit
     def _convolve(
         self,
         shared,
-        qkv,
         original,
-        qkv_token_stride: Int64,
         original_token_stride: Int64,
         token_start: Int64,
         valid_tokens: Int32,
@@ -551,11 +726,13 @@ class FusedVerifyWindow(RecoverSsmVerify):
         channels,
         taps,
         pasts,
+        window_rows,
     ):
         """Retain this CTA's pre-convolution channels and publish their convolved rows.
 
-        The q and k channels go to every CTA of the cluster, the v tile to this
-        one; the window's last valid row stands in for the rows past it.
+        ``window_rows`` holds each item's W pre-convolution values. The q and k
+        channels go to every CTA of the cluster, the v tile to this one; the
+        window's last valid row stands in for the rows past it.
         """
         K = self.key_dim
         W = self.window
@@ -565,12 +742,7 @@ class FusedVerifyWindow(RecoverSsmVerify):
             in_range = Int32(c < 3 * VT)
             kind = cutlass.min(c, 3 * VT - 1) // VT
             within = cutlass.min(c, 3 * VT - 1) % VT
-            raws = []
-            for t in cutlass.range_constexpr(W):
-                token = token_start + cutlass.min(t, valid_tokens - 1)
-                raws.append(
-                    _load(qkv, token * qkv_token_stride + channels[item]).to(Float32)
-                )
+            raws = [x.to(Float32) for x in window_rows[item * W : (item + 1) * W]]
             kept = original + (token_start * original_token_stride + channels[item])
             for t in cutlass.range_constexpr(W):
                 _store_if(
@@ -580,6 +752,7 @@ class FusedVerifyWindow(RecoverSsmVerify):
                     True,
                 )
             if live & (in_range != 0):
+                convolved = []
                 for t in cutlass.range_constexpr(W):
                     # Taps t .. t + 3 of the history followed by the window.
                     acc = Float32(0.0)
@@ -589,24 +762,33 @@ class FusedVerifyWindow(RecoverSsmVerify):
                         else:
                             term = raws[t + i - (CONV_TAPS - 1)]
                         acc = acc + term * taps[item][i]
-                    convolved = _bf16(_silu(acc))
-                    if kind < 2:
-                        offset = kind * W * K + t * K + value_start + within
-                        self._publish_bf16(shared.tokens_addr + offset * 2, convolved)
+                    convolved.append(_bf16(_silu(acc)))
+                if kind < 2:
+                    offset = kind * W * K + value_start + within
+                    if const_expr(self.cluster == 1):
+                        for t in cutlass.range_constexpr(W):
+                            _store_shared_bf16(
+                                shared.tokens_addr + (offset + t * K) * 2, convolved[t]
+                            )
                     else:
+                        self._publish_pairs(
+                            shared.tokens_addr + offset * 2,
+                            convolved,
+                            tidx % 32,
+                            Int32(shared.token_barrier.toint()),
+                        )
+                else:
+                    for t in cutlass.range_constexpr(W):
                         offset = self.token_v + t * VT + within
-                        _store_shared_bf16(shared.tokens_addr + offset * 2, convolved)
+                        _store_shared_bf16(
+                            shared.tokens_addr + offset * 2, convolved[t]
+                        )
 
     @cute.jit
     def _project_gate(
         self,
         shared,
-        f_a,
-        f_b,
-        f_a_token_stride: Int64,
-        token_start: Int64,
-        valid_tokens: Int32,
-        head: Int32,
+        gate_inputs,
         value_start: Int32,
         warp: Int32,
         lane: Int32,
@@ -614,53 +796,72 @@ class FusedVerifyWindow(RecoverSsmVerify):
         """Project the raw gate of this CTA's keys and publish it to the cluster.
 
         An item is 32 keys and two tokens; warp w takes items w, w + 4, ...
-        and lane l elements [4l, 4l + 4) of each f_a and f_b row, so a
-        transposing butterfly leaves key 32 g + l in lane l, as in the
-        one-token kernel.
+        and lane l elements [4l, 4l + 4) of each f_a row (``gate_inputs``) and
+        staged f_b row, so a transposing butterfly leaves key 32 g + l in lane
+        l, as in the one-token kernel.
         """
         K = self.key_dim
         W = self.window
         pairs = (W + 1) // 2
         items = (self.value_tile_rows // 32) * pairs
+        cute.arch.mbarrier_wait(shared.weight_barrier, 0)
         for step in cutlass.range_constexpr((items + 3) // 4):
             item = step * 4 + warp
             if item < items:
                 group = item // pairs
                 first = 2 * (item % pairs)
-                rows = []
-                for r in cutlass.range_constexpr(2):
-                    token = token_start + cutlass.min(first + r, valid_tokens - 1)
-                    rows.append(
-                        _ldg_bf16x4((f_a + token * f_a_token_stride + 4 * lane).toint())
-                    )
-                weights = f_b + (head * K + value_start + 32 * group) * GATE_RANK
+                rows = [
+                    _unpack_bf16x4(words)
+                    for words in gate_inputs[2 * step : 2 * step + 2]
+                ]
+                weights = (
+                    shared.tile_addr
+                    + self.value_tile_rows * K * 4
+                    + (32 * group * GATE_RANK + 4 * lane) * 2
+                )
                 parts = [[], []]
                 for j in cutlass.range_constexpr(32):
-                    w = _ldg_bf16x4((weights + j * GATE_RANK + 4 * lane).toint())
+                    w = _lds_bf16x4(weights + j * GATE_RANK * 2)
                     for r in cutlass.range_constexpr(2):
                         part = Float32(0.0)
                         for e in cutlass.range_constexpr(4):
                             part = part + rows[r][e] * w[e]
                         parts[r].append(part)
                 key = value_start + 32 * group + lane
-                for r in cutlass.range_constexpr(2):
-                    raw_gate = _bf16(_transpose_sum(parts[r], lane))
-                    t = first + r
-                    if t < W:
-                        offset = self.token_gate + t * K + key
-                        self._publish_bf16(shared.tokens_addr + offset * 2, raw_gate)
+                raw_gates = [_bf16(_transpose_sum(parts[r], lane)) for r in range(2)]
+                if const_expr(self.cluster == 1):
+                    for r in cutlass.range_constexpr(2):
+                        t = first + r
+                        if t < W:
+                            offset = self.token_gate + t * K + key
+                            _store_shared_bf16(
+                                shared.tokens_addr + offset * 2, raw_gates[r]
+                            )
+                else:
+                    # A pair past the window's end (odd W) is not sent.
+                    if first + 1 < W:
+                        self._publish_pairs(
+                            shared.tokens_addr
+                            + (self.token_gate + first * K + key) * 2,
+                            raw_gates,
+                            lane,
+                            Int32(shared.token_barrier.toint()),
+                        )
+                    else:
+                        self._publish_pairs(
+                            shared.tokens_addr
+                            + (self.token_gate + first * K + key) * 2,
+                            raw_gates[:1],
+                            lane,
+                            Int32(shared.token_barrier.toint()),
+                        )
 
     @cute.jit
     def _normalize(
         self,
         shared,
         outputs,
-        gate,
-        gate_token_stride: Int64,
-        token_start: Int64,
-        valid_tokens: Int32,
-        head: Int32,
-        channel: Int32,
+        logits,
         value_tile: Int32,
         warp: Int32,
         lane: Int32,
@@ -668,32 +869,44 @@ class FusedVerifyWindow(RecoverSsmVerify):
         norm_scale: Float32,
         norm_eps: Float32,
     ):
-        """The norm kernel's x rsqrt(mean x^2 + eps) w sigmoid(gate) on the BF16 outputs."""
+        """The norm kernel's x rsqrt(mean x^2 + eps) w sigmoid(gate) on the BF16 outputs.
+
+        ``logits`` are this channel's gate values of the window's tokens.
+        """
         W = self.window
         V = self.value_dim
-        logits = []
-        for t in cutlass.range_constexpr(W):
-            token = token_start + cutlass.min(t, valid_tokens - 1)
-            logits.append(
-                _load(gate, token * gate_token_stride + head * V + channel).to(Float32)
-            )
         norm_addr = Int32(shared.norm.iterator.toint())
         group = value_tile * (self.value_tile_rows // 32) + warp
         rounded = []
+        squares = []
         for t in cutlass.range_constexpr(W):
             output = _bf16(outputs[t])
             rounded.append(output)
-            square = cute.arch.warp_reduction_sum(output * output)
+            squares.append(cute.arch.warp_reduction_sum(output * output))
+        if const_expr(self.cluster == 1):
             if (lane == 0) & (owner != 0):
-                self._publish_f32(norm_addr + (group * W + t) * 4, square)
-        self._cluster_sync()
+                for t in cutlass.range_constexpr(W):
+                    _store_shared_f32(norm_addr + (group * W + t) * 4, squares[t])
+            cute.arch.barrier()
+        else:
+            if (lane == 0) & (owner != 0):
+                barrier_addr = Int32(shared.norm_barrier.toint())
+                for peer in cutlass.range_constexpr(self.cluster):
+                    for t in cutlass.range_constexpr(W):
+                        _push_peer_f32(
+                            norm_addr + (group * W + t) * 4,
+                            Int32(peer),
+                            squares[t],
+                            barrier_addr,
+                        )
+            cute.arch.mbarrier_wait(shared.norm_barrier, 0)
         normed = []
         for t in cutlass.range_constexpr(W):
             total = shared.norm[t]
             for g in cutlass.range_constexpr(1, NORM_GROUPS):
                 total = total + shared.norm[g * W + t]
             inverse_rms = _rsqrt(_div(total, Float32(V)) + norm_eps)
-            sigmoid = _div(Float32(1.0), Float32(1.0) + _exp(-logits[t]))
+            sigmoid = _div(Float32(1.0), Float32(1.0) + _exp(-logits[t].to(Float32)))
             normed.append(rounded[t] * inverse_rms * norm_scale * sigmoid)
         return normed
 
@@ -713,6 +926,7 @@ def _compile(
     bias_dtype: torch.dtype,
     start_dtype: torch.dtype,
     index_dtype: torch.dtype,
+    smem_floor: int,
 ):
     tokens = cute.sym_int()
     slots = cute.sym_int()
@@ -752,6 +966,7 @@ def _compile(
         factored,
         has_metadata,
         norm_dtype is not None,
+        smem_floor,
     )
     return cute.compile(
         kernel,
@@ -779,6 +994,24 @@ def _compile(
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
     )
+
+
+@functools.cache
+def _two_per_sm(device_index: int) -> tuple[int, int]:
+    """The device's SM count and the CTA shared memory that leaves room for two per SM."""
+    props = torch.cuda.get_device_properties(device_index)
+    return props.multi_processor_count, props.shared_memory_per_multiprocessor // 3 + 1
+
+
+def _smem_floor(ctas: int, device: torch.device) -> int:
+    """Shared memory per CTA that spreads a grid of one to two CTAs per SM over all SMs.
+
+    Left to fill SMs, the scheduler packs such a grid onto fewer of them (GB300,
+    W = 8, 8 requests: 12.5 us packed, 10.3 us at two per SM); other grids
+    keep the kernel's own footprint.
+    """
+    sms, floor = _two_per_sm(device.index)
+    return floor if sms < ctas <= 2 * sms else 0
 
 
 def fused_verify_window_supported(
@@ -945,10 +1178,14 @@ def fused_verify_window(
     )
     _check_output_norm(output_norm, out, head_dim)
     bounded = lower_bound is not None
+    value_tile_rows = _value_tile_rows(
+        state_indices.shape[0], num_heads, window, head_dim
+    )
+    ctas = state_indices.shape[0] * num_heads * (head_dim // value_tile_rows)
     kernel = _compile(
         num_heads,
         window,
-        _value_tile_rows(state_indices.shape[0], num_heads, window, head_dim),
+        value_tile_rows,
         correction_cache.shape[2],
         bounded,
         bounded and window * abs(lower_bound) <= FACTORED_DECAY,
@@ -959,6 +1196,7 @@ def fused_verify_window(
         dt_bias.dtype,
         query_start_loc.dtype,
         state_indices.dtype,
+        _smem_floor(ctas, mixed_qkv.device),
     )
     kernel(
         mixed_qkv,

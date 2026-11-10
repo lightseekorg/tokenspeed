@@ -282,6 +282,8 @@ class _Shared(NamedTuple):
     norm: cute.Tensor | None
     token_barrier: object
     state_barrier: object
+    weight_barrier: object
+    norm_barrier: object
 
 
 class RecoverSsmVerify:
@@ -338,7 +340,7 @@ class RecoverSsmVerify:
         self.token_elems = window * (3 * key_dim + value_tile_rows)
         self.gate_step_words = 0 if factored else window * key_dim
         self.norm_words = 0
-        # 512 bytes cover alignment padding between regions and the two mbarriers.
+        # 512 bytes cover alignment padding between regions and the four mbarriers.
         self.smem_bytes = (
             4 * self.tile_words
             + 4 * key_dim * self.padded_columns
@@ -705,7 +707,7 @@ class RecoverSsmVerify:
             norm = smem.allocate_tensor(
                 Float32, cute.make_layout((self.norm_words,)), byte_alignment=16
             )
-        barriers = smem.allocate_array(Int64, num_elems=2)
+        barriers = smem.allocate_array(Int64, num_elems=4)
         return _Shared(
             tile=tile,
             tile_addr=Int32(tile.iterator.toint()),
@@ -718,6 +720,8 @@ class RecoverSsmVerify:
             norm=norm,
             token_barrier=barriers,
             state_barrier=barriers + 1,
+            weight_barrier=barriers + 2,
+            norm_barrier=barriers + 3,
         )
 
     @cute.jit

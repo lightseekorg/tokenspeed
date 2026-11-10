@@ -90,10 +90,17 @@ producers. CTA r convolves q and k channels [r VT, (r + 1) VT) and its own v
 tile, projects the gate for keys [r VT, (r + 1) VT) (the one-token kernel's
 lane mapping, two tokens per pass), and stores the BF16 rows, rounded as the
 split producers store them, into the token rows of every CTA of the cluster
-over distributed shared memory. One cluster barrier publishes them; the
-window math then runs as in `kda_recoverssm_verify`. The CTA's checkpoint
-tile, the convolution taps and history, and the gate and norm parameters load
-before the programmatic dependency wait, as in the one-token kernel.
+over distributed shared memory. The rows travel as asynchronous BF16-pair
+stores that the receiving CTA's mbarrier counts, so a CTA waits only until
+its own rows have landed; the window math then runs as in
+`kda_recoverssm_verify`. Before the programmatic dependency wait the CTA
+bulk-copies its checkpoint tile and f_b rows (into tile rows that phase 1
+fills only after the gate projection) into shared memory and issues the
+loads of the convolution taps and history and the gate and norm parameters,
+first using any of them after the wait; every read of the projection rows
+is issued right after it. A grid of one to two CTAs per SM claims enough
+shared memory per CTA that two at most share an SM; left alone, the
+scheduler packs it onto fewer SMs.
 
 ### Output norm
 
@@ -105,7 +112,8 @@ step applies it before its store: the thread of each channel holds the BF16
 output, a warp sum and four shared-memory partials give the head's sum of
 squares, and the rest is the norm kernel's math in its order. The window
 kernel does the same per token, with each warp storing its partial to every
-CTA of the cluster, so the four partials add up in the same order. Only the order
+CTA of the cluster (counted on an mbarrier like the rows), so the four
+partials add up in the same order. Only the order
 of that sum differs from `rmsnorm_gated_sigmoid` on the stored output, so an
 element may move by one BF16 step. Every other verify kernel, and the
 backend's non-verify paths, run `rmsnorm_gated_sigmoid` after the attention

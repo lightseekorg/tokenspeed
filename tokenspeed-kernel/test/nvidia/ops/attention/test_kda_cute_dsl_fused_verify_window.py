@@ -56,6 +56,9 @@ from tokenspeed_kernel.ops.attention.kda import (  # noqa: E402
     kda_fused_paged_verify_fuses_producers,
     try_kda_fused_paged_verify,
 )
+from tokenspeed_kernel.ops.attention.kda._cute_dsl import (  # noqa: E402
+    fused_verify_window as window_kernel,
+)
 from tokenspeed_kernel.ops.attention.kda._cute_dsl.fused_verify_window import (  # noqa: E402
     fused_verify_window_supported,
 )
@@ -335,13 +338,24 @@ def test_windows_up_to_sixteen_tokens_and_requests_fuse_their_producers(
 
 
 def test_serving_batches_reuse_one_compiled_kernel():
-    # One compile per value tile: batches of 1-3 and 4-16 requests.
-    for batch in (1, 9):
+    # One compile per value tile and spread: on 108 to 167 SMs, batches of 1-3
+    # requests, then 7-10 (one to two CTAs per SM) and the rest of 4-16.
+    for batch in (1, 9, 16):
         _fused(_inputs(batch, 8, seed=50 + batch), 8)
     with assert_no_cute_compile():
-        for batch in (2, 3, 7, 16):
+        for batch in (2, 3, 4, 7, 10, 14):
             _fused(_inputs(batch, 8, seed=60 + batch), 8)
     torch.cuda.synchronize()
+
+
+def test_grids_of_one_to_two_ctas_per_sm_spread_over_all_sms():
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    capacity = torch.cuda.get_device_properties(0).shared_memory_per_multiprocessor
+    floor = window_kernel._smem_floor(2 * sms, torch.device("cuda", 0))
+    # A CTA claiming the floor plus the 1 KiB per-CTA reserve fits twice, not three times.
+    assert 2 * (floor + 1024) <= capacity < 3 * (floor + 1024)
+    for ctas in (sms, 2 * sms + 1):
+        assert window_kernel._smem_floor(ctas, torch.device("cuda", 0)) == 0
 
 
 def _output_norm(x, weight_dtype):
@@ -381,6 +395,27 @@ def test_fused_output_norm_matches_the_norm_kernel(batch, weight_dtype):
     assert (normed != expected).float().mean() < 0.01
     if batch > 2:
         assert not normed[8:24].any()
+
+
+@pytest.mark.parametrize("batch", [1, 3])
+@pytest.mark.parametrize("window", [3, 8])
+def test_every_value_tile_gives_the_same_bits(batch, window, monkeypatch):
+    """The value tile only decides which CTAs share the producers and norm sums.
+
+    Every tile, down to one unclustered CTA per head, must store the same
+    outputs and records, padding requests included.
+    """
+    x = _inputs(batch, window, seed=70 + batch + window)
+    norm = _output_norm(x, torch.bfloat16)
+    results = []
+    for rows in (32, 64, 128):
+        monkeypatch.setattr(window_kernel, "_value_tile_rows", lambda *_, n=rows: n)
+        results.append(_fused(x, window, norm))
+    out, records = results[0]
+    for other_out, other_records in results[1:]:
+        assert torch.equal(other_out, out)
+        for got, want in zip(other_records, records):
+            assert torch.equal(got, want)
 
 
 def test_unaligned_inputs_apply_the_output_norm_after_the_split_producers():
