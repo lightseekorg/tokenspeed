@@ -389,6 +389,9 @@ def _no_buffer(buf):
 @gluon.jit
 def _trap():
     """The fail-stop of a stuck poll (``s_trap 2``), for a broken invariant."""
+    # asm: llvm.trap is noreturn, which reshapes the whole layer's code
+    # (rows 16: 20 more VGPR spills); this s_trap returns to the compiler.
+    # The dummy SGPR output is there because inline_asm needs a result.
     gl.inline_asm("s_trap 2\ns_mov_b32 $0, 0", "=s", [], gl.int32, is_pure=False)
 
 

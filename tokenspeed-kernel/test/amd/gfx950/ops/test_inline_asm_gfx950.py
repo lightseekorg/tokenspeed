@@ -664,12 +664,13 @@ def _layer_weights(full):
     )  # fmt: skip
 
 
-def _layer(rows, chain, full, tap=False, trace=False):
+def _layer(rows, chain, full, tap=False, trace=False, parity=False):
     """A target layer launch of ``rows`` rows, requests of ``chain`` tokens,
     as serving launches a layer between two fused ones: past one row it reads
     its q | k | v projection from the previous launch and ends with the next
     layer's; at one row it warms the next layer's weights. ``tap``: it also
-    stores a draft's tap; ``trace``: a bench's traced launch."""
+    stores a draft's tap; ``trace``: a bench's traced launch; ``parity``:
+    a test's or bench's launch that checks the peer copy alternates."""
     from tokenspeed_kernel_amd.ops.gfx950.monokernel import trace as trace_module
     from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import layer, qkvg
 
@@ -683,7 +684,7 @@ def _layer(rows, chain, full, tap=False, trace=False):
         warm_next=one,
         own_qkvg=one,
         next_qkvg=not one,
-        check_parity=False,
+        check_parity=parity,
     )
     proj = _zeros(2, layer.MAX_ROWS, int(qkvg.PROJ_WORDS), dtype=_I32)
     cache = _zeros(1 << 16, 2, 64, dtype=torch.float8_e4m3fn)
@@ -704,7 +705,7 @@ def _layer(rows, chain, full, tap=False, trace=False):
         trace_buf=(
             _zeros(plan.grid, int(trace_module.EVENTS), 8, dtype=_I64) if trace else None
         ),
-        stuck_rec=_zeros(layer.STUCK_ROWS, 8, dtype=_I64), check_parity=False,
+        stuck_rec=_zeros(layer.STUCK_ROWS, 8, dtype=_I64), check_parity=parity,
     )  # fmt: skip
 
 
@@ -813,6 +814,7 @@ VARIANTS = {
     "muse_layer-rows16-full": lambda: _layer(16, 8, True),
     "muse_layer-rows8-sliding-tap": lambda: _layer(8, 8, False, tap=True),
     "muse_layer-rows8-sliding-trace": lambda: _layer(8, 8, False, trace=True),
+    "muse_layer-rows8-sliding-parity": lambda: _layer(8, 8, False, parity=True),
     # The DFlash2 draft: its layers, head (7 steps a request) and context write.
     "muse_draft_layer-rows8": lambda: _draft_layer(8, False),
     "muse_draft_layer-rows16": lambda: _draft_layer(16, False),
@@ -888,8 +890,9 @@ INLINE_ASM_ON_MAIN = {
     ),
     "_trap": (
         _MONO + "mailbox:_trap",
-        "stops the kernel on a stuck poll or broken invariant",
-        "a Gluon trap op",
+        "stops the kernel on a stuck poll or broken invariant; llvm.trap is"
+        " noreturn and reshapes the layer's code (rows-16 VGPR spills)",
+        "a trap intrinsic that leaves the code after it reachable",
     ),
     "_keep_in_cluster": (
         _AMD + "attention._common:_keep_in_cluster",
