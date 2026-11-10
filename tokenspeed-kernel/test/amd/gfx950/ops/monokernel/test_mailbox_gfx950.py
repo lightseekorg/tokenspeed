@@ -318,6 +318,89 @@ if is_cdna4():
         assert "rank 3 CTA 1: stage s waited for region want row 1 pair 37" in line
         assert "step 4 layer 3" in line and "step 5 layer 3" in line
 
+    # Flags have a known payload as well as a tag. One never-raised flag
+    # retains either zero or the current tag with a zero payload.
+    _STUCK_FLAG = textwrap.dedent("""
+        import sys
+        import torch
+        from tokenspeed_kernel_amd._triton import gl, gluon
+        from tokenspeed_kernel_amd.ops.gfx950.monokernel import mailbox, stuck
+        from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import (
+            Plan,
+            Stage,
+            launch_tag,
+        )
+
+        mailbox.POLL_TIMEOUT_SHIFT = 10
+
+        @gluon.jit
+        def _stuck_flag_kernel(scratch, step_ptr, rec, PLAN: gl.constexpr):
+            mb = mailbox.Mailbox(
+                scratch, mailbox.launch_tag(step_ptr, 3), PLAN, None, None, rec
+            )
+            layout: gl.constexpr = gl.BlockedLayout([1, 1], [8, 8], [2, 2], [1, 0])
+            r = gl.arange(0, 16, gl.SliceLayout(1, layout))[:, None]
+            c = gl.arange(0, 32, gl.SliceLayout(0, layout))[None, :]
+            mb.row(gl.program_id(0)).poll_flags("flag", r * 32 + c)
+
+        plan = Plan(
+            grid=2,
+            stages=(Stage("s", 2, 0, reads=("flag",)),),
+            regions=(("pad", 5), ("flag", 512)),
+            rows=2,
+            chain=1,
+            external=("flag",),
+        )
+        scratch = torch.zeros(plan.scratch_pairs, dtype=torch.int64, device="cuda")
+        buf = stuck.stuck_buffer(plan.grid, sys.argv[1], scratch.data_ptr(), 3)
+        tag = launch_tag(5, 3)
+        for row in range(2):
+            at = row * plan.row_pairs + plan.offset("flag")
+            scratch[at : at + 512] = (tag << 32) | 1
+        at = plan.row_pairs + plan.offset("flag") + 37
+        scratch[at] = int(sys.argv[2])
+        step = torch.full((1,), 5, dtype=torch.int32, device="cuda")
+        _stuck_flag_kernel[(2,)](scratch, step, buf.tensor, plan.key, num_warps=4)
+        torch.cuda.synchronize()
+        print("the poll returned")
+        """)
+
+    @pytest.mark.parametrize("matching_tag", [False, True])
+    def test_a_flag_that_is_never_raised_stops_and_records(tmp_path, matching_tag):
+        """A missing flag traps and records its pair, even if its tag matches."""
+        script = tmp_path / "stuck_flag.py"
+        script.write_text(_STUCK_FLAG)
+        path = tmp_path / "stuck_flag.bin"
+        observed = launch_tag(5, 3) << 32 if matching_tag else 0
+        result = subprocess.run(
+            [sys.executable, str(script), str(path), str(observed)],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        assert result.returncode != 0
+        assert "the poll returned" not in result.stdout
+        assert _trapped(result.stderr), result.stderr
+        plan = Plan(
+            grid=2,
+            stages=(Stage("s", 2, 0, reads=("flag",)),),
+            regions=(("pad", 5), ("flag", 512)),
+            rows=2,
+            chain=1,
+            external=("flag",),
+        )
+        t = stuck.read_file(str(path))
+        head = stuck.header(t)
+        assert head["rank"] == 3
+        (rec,) = stuck.records(t)
+        assert rec["cta"] == 1
+        assert rec["expected"] == launch_tag(5, 3)
+        assert rec["observed"] == observed >> 32
+        assert rec["payload"] == 0
+        pair = (rec["address"] - head["scratch_ptr"]) // 8
+        assert stuck.locate(plan, pair) == ("flag", 1, 37, 0)
+        assert rec["trap"] - rec["start"] >= 11 << 10
+
     # Mailbox.check_parity: a launch fails stop when its peer-region parity
     # repeats the last launch's (the copies must alternate, see Peers).
     def _parity_plan():

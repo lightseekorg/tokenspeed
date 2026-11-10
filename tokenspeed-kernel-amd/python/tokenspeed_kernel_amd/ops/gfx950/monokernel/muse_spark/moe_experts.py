@@ -864,6 +864,8 @@ def ex1_poll_routes(mb, task, task2, active, STAGE: gl.constexpr):
         lane_of(mb.plan, task // (NB1 * KSPLIT)),
         lane_of(mb.plan, task2 // (NB2 // EX2_BLOCKS)),
     )
+    # One tagged poll for the routes and the table's flag: two polls in a
+    # row would add a round trip on ex1's critical path.
     firsts, _ = mb.poll_many(("route", "sltf"), (first, i * 0))
     # The table's flag is in: its words load after the poll returned.
     gl.barrier()
@@ -886,7 +888,7 @@ def ex1_xq(mb, task, active, STAGE: gl.constexpr):
     nw: gl.constexpr = gl.num_warps()
     lanes: gl.constexpr = gl.BlockedLayout([1], [64], [nw], [0])
     f = gl.arange(0, XQ_GROUPS, lanes)
-    mb.poll_many(("xqf",), (ks * XQ_GROUPS + gl.minimum(f, NG - 1),))
+    mb.poll_flags("xqf", ks * XQ_GROUPS + gl.minimum(f, NG - 1))
     gl.barrier()
     if active:
         mb.stamp(STAGE, trace.READY)

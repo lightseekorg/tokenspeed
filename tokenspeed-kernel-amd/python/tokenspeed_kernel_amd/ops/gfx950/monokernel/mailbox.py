@@ -258,27 +258,30 @@ def _poll_asm(outputs, inputs, cache, stuck=False):
     if stuck:
         (rec,), (slot,) = inputs[groups + 1], inputs[groups + 2]
         lines += _stuck_record(
-            pairs, ptrs, tmp, retries, save, tag, start, acc, rec, slot
+            pairs, ptrs, tmp, retries, save, tag, start, acc, rec, slot, None
         )
     lines += ["s_trap 2", "2:"]
     return "\n".join(lines)
 
 
 @gluon.constexpr_function
-def _stuck_record(pairs, ptrs, tmp, lane, mask, tag, start, now, rec, slot):
+def _stuck_record(pairs, ptrs, tmp, lane, mask, tag, start, now, rec, slot, failed):
     """The lines that write a stuck poll's record (see the module docstring)
     from the first lane of the first operand whose pair is stale, then wait
     for the stores to land: only the trap branch runs them. ``now`` holds the
     clock of the check that trapped; ``slot`` is the CTA's record offset in
-    bytes (the kernel scales the CTA: v_lshl_add_u64 shifts by 4 at most)."""
+    bytes (the kernel scales the CTA: v_lshl_add_u64 shifts by 4 at most).
+    ``failed`` is None for tag checks, or per-pair atomic_poll failure bits."""
     lines = []
     for j, p in enumerate(pairs):
-        lines += [
-            f"v_lshrrev_b64 {tmp}, 32, {p}",
-            f"v_cmp_ne_u64 vcc, {tag}, {tmp}",
-            "s_cmp_eq_u64 vcc, 0",
-            f"s_cbranch_scc0 {10 + j}f",
-        ]
+        if failed is None:
+            lines += [
+                f"v_lshrrev_b64 {tmp}, 32, {p}",
+                f"v_cmp_ne_u64 vcc, {tag}, {tmp}",
+            ]
+        else:
+            lines += [f"v_cmp_ne_u32 vcc, 0, {failed[j]}"]
+        lines += ["s_cmp_eq_u64 vcc, 0", f"s_cbranch_scc0 {10 + j}f"]
     lines += ["s_branch 9f"]
     for j, (p, a) in enumerate(zip(pairs, ptrs)):
         lines += [
@@ -308,6 +311,69 @@ def _stuck_record(pairs, ptrs, tmp, lane, mask, tag, start, now, rec, slot):
         lines += ["s_waitcnt vmcnt(0)", "s_branch 9f"]
     lines += ["9:"]
     return lines
+
+
+@gluon.constexpr_function
+def _poll_timeout_ns():
+    """The tagged poll's time bound (``_poll_asm``) in ns, read when the kernel
+    compiles, as the asm reads it (tests shrink ``POLL_TIMEOUT_SHIFT``)."""
+    return (POLL_TIMEOUT_MANT << POLL_TIMEOUT_SHIFT) * trace.TICK_NS
+
+
+@gluon.constexpr_function
+def _flag_stuck_asm(outputs, inputs):
+    pairs, (tmp,), (lane,), (mask,), (saved_exec,) = outputs
+    ptrs, failed, (tag,), (start,), (now,), (rec,), (slot,) = inputs
+    # Reload once after timeout: atomic_poll returns only success bits.
+    lines = [f"s_mov_b64 {saved_exec}, exec"]
+    lines += [f"global_load_dwordx2 {p}, {a}, off sc0 sc1" for p, a in zip(pairs, ptrs)]
+    lines += ["s_waitcnt vmcnt(0)"]
+    lines += _stuck_record(
+        pairs, ptrs, tmp, lane, mask, tag, start, now, rec, slot, failed
+    )
+    # _stuck_record narrows EXEC to the recording lane; restore it before _trap.
+    lines += [f"s_mov_b64 exec, {saved_exec}"]
+    return "\n".join(lines)
+
+
+@gluon.jit
+def _record_flag_timeout(ptrs, failed, tag, start, now, stuck):
+    # asm: reuse the tagged poll's lane selection and ordered record stores.
+    # Save EXEC separately: _stuck_record narrows it to the recording lane.
+    gl.inline_asm(
+        _flag_stuck_asm,
+        (
+            "=&v",
+            "=&v",
+            "=&s",
+            "=&s",
+            "=&s",
+            "v",
+            "v",
+            "s",
+            "s",
+            "s",
+            "s",
+            "s,~{vcc},~{scc},~{exec}",
+        ),
+        (
+            ptrs,
+            failed.to(gl.int32),
+            tag.to(gl.int64) & 0xFFFFFFFF,
+            start,
+            now,
+            stuck.to(gl.int64, bitcast=True),
+            gl.program_id(0).to(gl.int64) * STUCK_RECORD_BYTES,
+        ),
+        (
+            ptrs.type.with_element_ty(gl.int64),
+            _lane_type(gl.num_warps()),
+            gl.int32,
+            gl.int64,
+            gl.int64,
+        ),
+        is_pure=False,
+    )
 
 
 @gluon.constexpr_function
@@ -734,7 +800,8 @@ class Mailbox:
         meets at a barrier, then thread ``p`` puts rank ``p``'s flag at
         system scope."""
         gl.static_assert(
-            schedule.is_peer(self.plan, region), "raise_flag_peers needs a peer region"
+            schedule.is_flag(self.plan, region),
+            "raise_flag_peers needs a peer region declared in Plan.flags",
         )
         # Wait for this wave's peer stores before the CTA publishes the flags.
         _extern.release_drain()
@@ -759,6 +826,38 @@ class Mailbox:
         (``sc0 sc1``). Call it after the CTA polled the flags and met at a
         barrier, so no load issues before the poll returns."""
         return gl.amd.cdna4.buffer_load(self._words(region), index, cache=".cv")
+
+    @gluon.jit
+    def poll_flags(self, region: gl.constexpr, indices):
+        """Wait for all flag pairs at ``indices`` of ``region`` (any layout).
+
+        Flags carry exactly ``(tag << 32) | 1``. A timeout records the failed
+        pair, when a stuck buffer is supplied, and stops the kernel. A peer
+        region must be declared in ``Plan.flags``.
+        """
+        gl.static_assert(
+            not schedule.is_peer(self.plan, region)
+            or schedule.is_flag(self.plan, region),
+            "poll_flags on a peer region needs it declared in Plan.flags",
+        )
+        ptrs = self.scratch + self._base(region) + indices
+        expected = (self.tag.to(gl.int64) << 32) | 1
+        start = trace.now()
+        ready = gl.atomic_poll(
+            ptrs,
+            expected,
+            sem="relaxed",
+            scope="sys" if schedule.is_peer(self.plan, region) else "gpu",
+            timeout_ns=gl.full((), _poll_timeout_ns(), gl.int64),
+        )
+        failed = (~ready).to(gl.int32)
+        for _ in gl.static_range(len(indices.shape)):
+            failed = gl.sum(failed, 0)
+        if failed != 0:
+            now = trace.now()
+            if self.stuck is not None:
+                _record_flag_timeout(ptrs, ~ready, self.tag, start, now, self.stuck)
+            _trap()
 
     @gluon.jit
     def poll(self, region: gl.constexpr, index):

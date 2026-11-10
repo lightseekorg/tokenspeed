@@ -848,6 +848,11 @@ INLINE_ASM = {
         "a loop of uncached loads that retries only the late pairs' lanes",
         "a volatile load that a loop keeps, and a Gluon ballot (wave vote) op",
     ),
+    "_record_flag_timeout": (
+        _MONO + "mailbox:_record_flag_timeout",
+        "reuses the tagged poll's lane selection and ordered stuck-record stores",
+        "a Gluon ballot (wave vote) op and ordered system-scope stores",
+    ),
     "code_pointer": (
         _MONO + "code_warm:code_pointer",
         "reads the program counter (s_getpc_b64)",
@@ -876,6 +881,16 @@ INLINE_ASM = {
 }
 # Inline asm that existed before this gate, which the kernels above compile in.
 INLINE_ASM_ON_MAIN = {
+    "now": (
+        _MONO + "trace:now",
+        "reads the realtime clock for the flag poll's timeout record",
+        "a Gluon realtime clock op",
+    ),
+    "_trap": (
+        _MONO + "mailbox:_trap",
+        "stops the kernel on a stuck poll or broken invariant",
+        "a Gluon trap op",
+    ),
     "_keep_in_cluster": (
         _AMD + "attention._common:_keep_in_cluster",
         "keeps the ops producing a value in its warp-pipeline cluster",

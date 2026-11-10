@@ -75,6 +75,12 @@ def is_peer(plan, name):
 
 
 @gluon.constexpr_function
+def is_flag(plan, name):
+    """Whether peer region ``name`` holds flags (``Plan.flags``)."""
+    return plan.plan.is_flag(name)
+
+
+@gluon.constexpr_function
 def peer_copy(plan, name):
     """Pairs between the two copies of peer region ``name``."""
     return plan.plan.peer_copy(name)

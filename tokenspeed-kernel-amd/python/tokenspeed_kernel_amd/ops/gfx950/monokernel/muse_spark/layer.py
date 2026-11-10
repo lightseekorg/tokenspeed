@@ -264,6 +264,7 @@ def layer_plan(
         chain=chain,
         world=int(WORLD),
         peers=peers,
+        flags=attn_tail.FLAGS + moe_tail.flags(rows),
     )
 
 

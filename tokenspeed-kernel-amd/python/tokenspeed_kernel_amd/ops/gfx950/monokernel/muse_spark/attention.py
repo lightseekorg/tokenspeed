@@ -976,6 +976,8 @@ def merge_stage(mb, task, SPLITS: gl.constexpr, STAGE: gl.constexpr):
     gl2: gl.constexpr = gl.BlockedLayout([1, 2], [64, 1], [nw, 1], [1, 0])
     gc = gl.arange(0, HEAD, gl.SliceLayout(1, gl2))[:, None]
     gh = gl.arange(0, 2, gl.SliceLayout(0, gl2))[None, :]
+    # One tagged poll for the flags and the gate words: two polls in a row
+    # would add a round trip on the merge's critical path.
     _, got_g = mb.poll_many(
         ("pflag", "gate"),
         (flag0 + g * SPLITS + s, gh * (QKVG - GATE_ROW) + h * HEAD + gc),

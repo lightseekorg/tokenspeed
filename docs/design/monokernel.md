@@ -123,6 +123,13 @@ the producers' stores. A poll issues all its loads, waits once, and retries
 after a short sleep. A retry loads only the pairs whose tag differs, so a wide
 poll sees its last pairs one round trip after they land.
 
+Flag polls use `gl.atomic_poll` with the same time bound and fail-stop. They
+wait for the whole pair, `(tag << 32) | 1`, not the tag alone, so the plan
+names its peer flag regions (`Plan.flags`), and a host that stands in for
+absent ranks (the layer bench) writes those pairs as raised flags. A stage
+that waits for a flag together with data pairs keeps one tagged poll for
+both: two polls in a row cost a round trip on its critical path.
+
 **A stuck poll stops the process.** A poll stops the kernel with an error
 after a bounded wait, which is far longer than a launch. A deadlock or a
 missing producer then gives a GPU error and the process stops, instead of a

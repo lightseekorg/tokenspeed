@@ -117,6 +117,11 @@ def _peer_slices(plan, parity: int):
     """(offset, segment) of copy ``parity`` of each rank-ordered block of
     each peer region (:func:`moe_tail.rank_blocks`), in every row: rank
     ``r`` writes segment ``r`` of a block."""
+    return [(off, seg) for _, off, seg in _named_peer_slices(plan, parity)]
+
+
+def _named_peer_slices(plan, parity: int):
+    """:func:`_peer_slices` with each slice's region name first."""
     sizes = dict(plan.regions)
     out = []
     for r in plan.peers:
@@ -126,7 +131,7 @@ def _peer_slices(plan, parity: int):
             base = plan.offset(r) + parity * plan.peer_copy(r) + row * plan.row_pairs
             for start, n in blocks:
                 assert n % TP == 0, (r, start, n)
-                out.append((base + start, n // TP))
+                out.append((r, base + start, n // TP))
     return out
 
 
@@ -138,6 +143,27 @@ def absent_index(plan, parity: int, gpus: int) -> torch.Tensor:
             for off, seg in _peer_slices(plan, parity)
         ]
     )
+
+
+def absent_flags(plan, parity: int, gpus: int) -> torch.Tensor:
+    """Which of :func:`absent_index`'s pairs are flags (``Plan.flags``)."""
+    return torch.cat(
+        [
+            torch.full(((TP - gpus) * seg,), plan.is_flag(r))
+            for r, _, seg in _named_peer_slices(plan, parity)
+        ]
+    )
+
+
+def ghost_payloads(plan, parity: int, gpus: int, payloads=None) -> torch.Tensor:
+    """The low words the fill writes into :func:`absent_index`'s pairs:
+    ``payloads`` (zeros when None), with every flag pair 1, the payload of
+    a raised flag (``Mailbox.poll_flags`` waits for exactly that)."""
+    flags = absent_flags(plan, parity, gpus)
+    out = torch.zeros(len(flags), dtype=torch.int64) if payloads is None else payloads
+    out = out.clone()
+    out[flags.to(out.device)] = 1
+    return out
 
 
 def rank0_payloads(plan, parity: int, gpus: int, scratch) -> torch.Tensor:
@@ -344,7 +370,9 @@ def worker(rank: int, port: int, args) -> None:
     )
     step = torch.full((1,), 100, dtype=torch.int32, device=dev)
     idx = [absent_index(plan, p, gpus).to(dev) for p in (0, 1)]
-    bits = [torch.zeros(len(i), dtype=torch.int64, device=dev) for i in idx]
+    # The absent ranks' flags read as raised from the first launch on, before
+    # the settle passes copy rank 0's payloads.
+    bits = [ghost_payloads(plan, p, gpus).to(dev) for p in (0, 1)]
 
     def fill(lay: int) -> None:
         # The tag of this launch on the absent ranks' slots of copy ``lay & 1``.
@@ -488,7 +516,11 @@ def worker(rank: int, port: int, args) -> None:
                     torch.cuda.synchronize()
                 snapshot = scratch.clone()
                 for p in (0, 1):
-                    bits[p].copy_(rank0_payloads(plan, p, gpus, snapshot))
+                    bits[p].copy_(
+                        ghost_payloads(
+                            plan, p, gpus, rank0_payloads(plan, p, gpus, snapshot)
+                        )
+                    )
         run(False)
         torch.cuda.synchronize()
         for name, cold in (("warm", False), ("cold", True)):

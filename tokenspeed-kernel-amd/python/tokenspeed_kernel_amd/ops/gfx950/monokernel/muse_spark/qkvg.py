@@ -203,7 +203,7 @@ def qnext_finish(mb, task, tiles, proj, OUT_PER_ROW: gl.constexpr, STAGE: gl.con
     lanes: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
     n = gl.arange(0, 64 * gl.num_warps(), lanes)
     flag = mb.row_offset(gl.minimum(n // F, R - 1)) + half * F + n % F
-    mb.poll_many(("anxf",), (flag,))
+    mb.poll_flags("anxf", flag)
     gl.barrier()
     mb.stamp(STAGE, trace.READY)
     x_smem = bf16.load_local_word_rows(

@@ -502,7 +502,7 @@ def merge_stage(mb, task, SPLITS: gl.constexpr, STAGE: gl.constexpr):
     ml: gl.constexpr = gl.BlockedLayout([1, 1], [2, 32], [nw, 1], [1, 0])
     s = gl.arange(0, SPLITS, gl.SliceLayout(1, ml))
     c = gl.arange(0, HEAD, gl.SliceLayout(0, ml))
-    mb.poll_many(("aflag",), (flag0 + s,))
+    mb.poll_flags("aflag", flag0 + s)
     # Every split's flag is in: the words load after the poll returned.
     gl.barrier()
     got_p = mb.load_words("apart", (s[:, None] * Q_HEADS + h) * HEAD + c[None, :])

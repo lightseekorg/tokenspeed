@@ -90,6 +90,7 @@ def _plan(rows: int) -> Plan:
         external=("z",),
         world=WORLD,
         peers=attn_tail.PEERS,
+        flags=attn_tail.FLAGS,
     )
 
 

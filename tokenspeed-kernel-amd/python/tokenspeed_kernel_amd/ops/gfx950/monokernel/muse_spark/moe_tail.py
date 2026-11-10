@@ -123,7 +123,12 @@ def rank_blocks(region: str, pairs: int) -> tuple[tuple[int, int], ...]:
 
 def peers(rows: int) -> tuple[str, ...]:
     """The peer regions of ``rows`` token rows."""
-    return PEERS + (WORDS_PEERS if ffn_words(rows) else ())
+    return PEERS + flags(rows)
+
+
+def flags(rows: int) -> tuple[str, ...]:
+    """The peer regions of ``rows`` token rows that hold flags (Plan.flags)."""
+    return WORDS_PEERS if ffn_words(rows) else ()
 
 
 def regions(rows: int) -> tuple[tuple[str, int], ...]:
@@ -273,7 +278,7 @@ def _ffn_word_flags(mb, first):
     at = first * schedule.row_pairs(mb.plan)
     mb.pre_poll("ffnf", at + gl.minimum(lanes * N // 64, N - 1))
     f = gl.arange(0, N, lanes.type.layout)
-    mb.poll_many(("ffnf",), (at + f,))
+    mb.poll_flags("ffnf", at + f)
     gl.barrier()
 
 

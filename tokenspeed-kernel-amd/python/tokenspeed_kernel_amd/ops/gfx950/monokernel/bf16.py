@@ -253,7 +253,7 @@ def load_word_rows(
     nw: gl.constexpr = gl.num_warps()
     lanes: gl.constexpr = gl.BlockedLayout([1], [64], [nw], [0])
     f = gl.arange(0, triton.next_power_of_2(R * FLAGS), lanes)
-    mb.poll_many((flags,), (mb.row_offset(gl.minimum(f // FLAGS, R - 1)) + f % FLAGS,))
+    mb.poll_flags(flags, mb.row_offset(gl.minimum(f // FLAGS, R - 1)) + f % FLAGS)
     # No load may issue before every wave's poll returned.
     gl.barrier()
     G: gl.constexpr = _poll_group_rows(RP, KP, nw)

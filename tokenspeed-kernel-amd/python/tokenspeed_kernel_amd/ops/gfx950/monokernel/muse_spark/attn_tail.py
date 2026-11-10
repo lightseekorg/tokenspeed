@@ -68,6 +68,8 @@ POST_EPS = gl.constexpr(1e-8)
 PRE_EPS = gl.constexpr(1e-5)
 
 PEERS = ("red", "ss1", "xin", "xflag")
+# The peer regions that hold flags (Plan.flags).
+FLAGS = ("xflag",)
 
 
 def regions() -> tuple[tuple[str, int], ...]:

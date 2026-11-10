@@ -172,6 +172,7 @@ def _worker(rank: int, port: int, rows: int, source_rows: int, out: str) -> None
             external=("route", "hp", "rr"),
             world=WORLD,
             peers=("rr",) + moe_tail.peers(rows),
+            flags=moe_tail.flags(rows),
         )
         scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
         group.finish_prepare()

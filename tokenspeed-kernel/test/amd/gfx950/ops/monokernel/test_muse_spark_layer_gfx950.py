@@ -1001,6 +1001,56 @@ def test_peer_regions_split_into_rank_ordered_blocks_without_gaps(
         assert at == sizes[name], (name, at, sizes[name])
 
 
+@pytest.mark.parametrize("gpus", [1, 2, 4])
+@pytest.mark.parametrize("full", [False, True])
+@pytest.mark.parametrize("rows, requests", [(1, 1), (8, 1), (16, 2)])
+def test_the_bench_stands_in_for_the_absent_ranks_flags_as_raised(
+    gpus: int, full: bool, rows: int, requests: int
+):
+    """The layer bench writes ``payload | tag << 32`` into the absent ranks'
+    segments of every peer region before a launch. A flag pair there must
+    read exactly ``(tag << 32) | 1``, as ``raise_flag_peers`` writes it, from
+    the first launch on: ``Mailbox.poll_flags`` waits for that value, so a
+    ghost flag of payload 0 stops the launch."""
+    import muse_spark_layer_bench as bench
+
+    plan = layer.layer_plan(
+        full=full,
+        rows=rows,
+        chain=rows // requests,
+        warm_next=False,
+        own_qkvg=True,
+        next_qkvg=False,
+        check_parity=False,
+    )
+    assert "xflag" in plan.flags and ("ffnf" in plan.flags) == (rows > 8)
+    tag = 0x1234ABCD
+    sizes = dict(plan.regions)
+    for parity in (0, 1):
+        scratch = torch.zeros(plan.scratch_pairs, dtype=torch.int64)
+        # The fill kernel's store, before the first launch and after settling.
+        for payloads in (
+            None,
+            torch.full_like(bench.absent_index(plan, parity, gpus), 7),
+        ):
+            ghost = bench.ghost_payloads(plan, parity, gpus, payloads)
+            scratch[bench.absent_index(plan, parity, gpus)] = ghost | (tag << 32)
+            for name in plan.flags:
+                for row in range(rows):
+                    base = (
+                        plan.offset(name)
+                        + parity * plan.peer_copy(name)
+                        + row * plan.row_pairs
+                    )
+                    for start, pairs in moe_tail.rank_blocks(name, sizes[name]):
+                        seg = pairs // WORLD
+                        for rank in range(gpus, WORLD):
+                            at = base + start + rank * seg
+                            assert torch.all(
+                                scratch[at : at + seg] == (tag << 32) | 1
+                            ), (name, row, rank)
+
+
 # The layer bench with one present rank (--gpus 1): it writes the absent
 # ranks' segments of every peer region before each launch. Polls give up
 # after ~14 ms (11 << 17 ticks of the 100 MHz clock), far past any wait of a

@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -180,3 +181,16 @@ def test_plan_rejects_peer_regions_on_one_rank_or_unknown_names():
         _peer_plan(1, ("part",))
     with pytest.raises(ValueError, match="unknown peer regions"):
         _peer_plan(8, ("nope",))
+
+
+def test_plan_flags_are_peer_regions_and_part_of_the_key():
+    """Flag regions (Plan.flags) are peer regions a host stands in for with
+    raised flags; they tell plans apart."""
+    plain = _peer_plan(8, ("part",))
+    flagged = replace(plain, flags=("part",))
+    assert flagged.is_flag("part") and not plain.is_flag("part")
+    assert json.loads(flagged.key)["flags"] == ["part"]
+    assert flagged.key != plain.key
+    assert flagged.only(("sum",)).flags == ("part",)
+    with pytest.raises(ValueError, match="not peer regions"):
+        replace(plain, flags=("local",))

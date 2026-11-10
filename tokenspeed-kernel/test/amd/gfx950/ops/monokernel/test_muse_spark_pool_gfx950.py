@@ -42,6 +42,7 @@ from tokenspeed_kernel.ops.communication._iris import (  # noqa: E402
 from tokenspeed_kernel_amd._triton import gl, gluon  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.monokernel import mailbox, schedule  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import (  # noqa: E402
+    attn_tail,
     moe_pool,
 )
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import (  # noqa: E402
@@ -87,6 +88,7 @@ def _worker(rank: int, port: int, rows: int) -> None:
             external=("xin", "xflag"),
             world=WORLD,
             peers=("xin", "xflag") + moe_pool.PEERS,
+            flags=attn_tail.FLAGS,
         )
         scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
         group.finish_prepare()

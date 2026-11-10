@@ -103,6 +103,11 @@ class Plan:
             start its next launch while another rank still reads this one,
             but it cannot get two launches ahead, because finishing the next
             launch needs every rank's part of it.
+        flags: The peer regions whose pairs are flags
+            (``Mailbox.raise_flag_peers``: exactly ``(tag << 32) | 1``).
+            ``raise_flag_peers`` and ``Mailbox.poll_flags`` on a peer region
+            require it, so a host that stands in for absent ranks (the layer
+            bench) knows which pairs to write with that payload.
     """
 
     grid: int
@@ -113,6 +118,7 @@ class Plan:
     external: tuple[str, ...] = ()
     world: int = 1
     peers: tuple[str, ...] = ()
+    flags: tuple[str, ...] = ()
     # __post_init__ derives these fields: the pairs of one row of every
     # region, and the pair offset of each region in row 0.
     row_pairs: int = field(init=False)
@@ -144,6 +150,9 @@ class Plan:
             raise ValueError(f"unknown peer regions {unknown}")
         if self.peers and self.world == 1:
             raise ValueError("peer regions need a plan of more than one rank")
+        not_peers = [r for r in self.flags if r not in self.peers]
+        if not_peers:
+            raise ValueError(f"flag regions {not_peers} are not peer regions")
         written = set(self.external)
         names = set()
         for stage in self.stages:
@@ -188,6 +197,7 @@ class Plan:
             external=tuple(dict.fromkeys(external)),
             world=self.world,
             peers=self.peers,
+            flags=self.flags,
         )
 
     def stage(self, name: str) -> Stage:
@@ -211,6 +221,10 @@ class Plan:
         """Whether other ranks write ``region``."""
         return region in self.peers
 
+    def is_flag(self, region: str) -> bool:
+        """Whether peer region ``region`` holds flags (``flags``)."""
+        return region in self.flags
+
     def peer_copy(self, region: str) -> int:
         """Pairs between the two copies of peer region ``region``."""
         assert region in self.peers, region
@@ -233,6 +247,7 @@ class Plan:
             "external": self.external,
             "world": self.world,
             "peers": self.peers,
+            "flags": self.flags,
         }
         return PlanKey(json.dumps(fields, separators=(",", ":")), self)
 
