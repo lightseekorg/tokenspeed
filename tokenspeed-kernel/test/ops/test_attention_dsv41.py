@@ -195,6 +195,39 @@ def test_paged_field_strides_padding_and_invalid_slots(device, fmt):
     torch.testing.assert_close(direct.cpu(), decoded[:1].bfloat16(), rtol=0, atol=0)
 
 
+def test_cache_gather_output_rows_past_int32(device):
+    """Gather output rows whose offsets pass 2**31 elements land in place.
+
+    The prefill workspace gathers a batch's whole owner history, more than
+    2**31 / 512 rows near a 1M-token context.
+    """
+    fmt, dim, tail = "global", 512, 3
+    rows = 2**31 // dim + tail
+    guard = 2**31
+    required_bytes = (guard + rows * dim) * torch.bfloat16.itemsize
+    if torch.cuda.mem_get_info(device)[0] < required_bytes + (256 << 20):
+        pytest.skip("requires 9 GiB of free device memory")
+    torch.manual_seed(43)
+    values = torch.randn((tail, dim), dtype=torch.float32, device=device)
+    cache = _make_cache(values, fmt)
+    slots = torch.full((rows,), -1, dtype=torch.int64, device=device)
+    slots[-tail:] = torch.arange(tail, device=device)
+    # Row 2**31 / dim + k wrapped to 32 bits lands k * dim elements past the
+    # storage base, inside the guard, where it would overwrite the sentinel.
+    storage = torch.empty(guard + rows * dim, dtype=torch.bfloat16, device=device)
+    storage[: tail * dim].fill_(-7.0)
+    out = storage[guard:].view(rows, dim)
+    out[-tail:].fill_(float("nan"))
+
+    assert dsv41.cache_gather(cache, slots, fmt, out) is out
+    _, decoded = torch_dsv41_cache_quantize(values, fmt)
+    torch.testing.assert_close(
+        out[-tail:].cpu(), decoded.bfloat16().cpu(), rtol=0, atol=0
+    )
+    sentinel = storage[: tail * dim]
+    torch.testing.assert_close(sentinel, torch.full_like(sentinel, -7.0))
+
+
 @pytest.mark.parametrize("heads", [1, 7, 16])
 @pytest.mark.parametrize("with_global", [False, True])
 def test_selected_attention_joint_sink_masking_and_chunking(device, heads, with_global):

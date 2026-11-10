@@ -90,6 +90,7 @@ def test_logits_processor_dp_layout_threshold_and_modes():
         tp_rank=0,
         tp_size=4,
         tp_group=(0, 1, 2, 3),
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
     processor.configure_dp_logits_layout(_dp_runtime_config(min_bs=16))
@@ -221,6 +222,7 @@ def test_configure_dp_sampling_sets_state():
         tp_rank=0,
         tp_size=4,
         tp_group=(0, 1, 2, 3),
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
 
@@ -278,6 +280,7 @@ def test_logits_processor_derives_dp_layout_from_effective_hidden_states(
         tp_rank=0,
         tp_size=4,
         tp_group=(0, 1, 2, 3),
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
     processor.configure_dp_logits_layout(_dp_runtime_config(min_bs=5))
@@ -325,6 +328,7 @@ def test_skip_all_gather_dp_sampling_slices_hidden_states_before_lm_head():
         tp_rank=1,
         tp_size=4,
         tp_group=(0, 1, 2, 3),
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
     processor.configure_dp_logits_layout(
@@ -359,6 +363,7 @@ def test_dp_sampling_slices_graph_effective_hidden_states_before_lm_head():
         tp_rank=2,
         tp_size=4,
         tp_group=(0, 1, 2, 3),
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
     processor.configure_dp_logits_layout(
