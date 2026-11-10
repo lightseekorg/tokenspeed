@@ -26,9 +26,6 @@ from __future__ import annotations
 import dataclasses
 import os
 import socket
-import subprocess
-import sys
-import textwrap
 from datetime import timedelta
 
 import muse_spark_reference as ref
@@ -1019,62 +1016,134 @@ def test_the_bench_stands_in_for_the_absent_ranks_flags_as_raised(
                             ), (name, row, rank)
 
 
-# The layer bench with one present rank (--gpus 1): it writes the absent
-# ranks' segments of every peer region before each launch. Polls give up
-# after ~14 ms (11 << 17 ticks of the 100 MHz clock), far past any wait of a
-# ~100 us launch, so a segment the bench misses fails the run at once
-# instead of after a minute. The mp.spawn worker runs this file as its main
-# module; the CLI carries the bound into each worker's compile-time plan.
-_ONE_GPU_BENCH = textwrap.dedent("""
-    import sys
-    if __name__ == "__main__":
-        import layer_bench
-
-        sys.argv = ["layer_bench", *sys.argv[1:]]
-        layer_bench.main()
-    """)
+def _absent_ranks_worker(
+    rank: int, port: int, full: bool, rows: int, requests: int, record: str
+) -> None:
+    """One process (rank 0) launches the TP8 layer through the public
+    launcher while the host stands in for ranks 1 to 7: their heap bases
+    point at a local ghost buffer, and before each launch their segment of
+    every peer region holds the launch's tag (flags raised), as
+    ``muse_spark_monokernel_gluon`` writes it for the layer bench."""
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        "gloo",
+        init_method=f"tcp://localhost:{port}",
+        rank=rank,
+        world_size=1,
+        timeout=timedelta(seconds=900),
+    )
+    try:
+        dev = torch.device(f"cuda:{rank}")
+        ctx = get_or_create_context(heap_size=256 << 20)
+        group = IrisGroup(ctx, dist.group.WORLD, rank, dev)
+        n = requests * rows
+        plan = layer.layer_plan(
+            full=full,
+            rows=n,
+            chain=rows,
+            warm_next=False,
+            own_qkvg=True,
+            next_qkvg=False,
+            check_parity=False,
+        )
+        scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
+        ghost = torch.zeros_like(scratch)
+        bases = torch.empty(WORLD, dtype=torch.int64, device=dev)
+        bases[:1] = group.bases.to(dev)
+        bases[1:] = int(group.bases[rank]) + (ghost.data_ptr() - scratch.data_ptr())
+        index = [gluon_inputs.absent_index(plan, p, 1).to(dev) for p in (0, 1)]
+        bits = [gluon_inputs.ghost_payloads(plan, p, 1).to(dev) for p in (0, 1)]
+        buf = stuck.stuck_buffer(256, 8, record, scratch.data_ptr(), rank)
+        own = slice(rank * OWNED, (rank + 1) * OWNED)
+        # Request b at length 3000 + 100 b, each with pages of its own.
+        lengths = [3000 + 100 * b for b in range(requests)]
+        ends = [length + rows - 1 for length in lengths]
+        sh = inputs.layer_shared(42, lengths[0], n)
+        tables, first = [], 1
+        for end in ends:
+            pages = (end + 63) // 64
+            tables.append(torch.arange(first, first + pages, dtype=torch.int32))
+            first += pages
+        table = torch.zeros(requests, max(len(t) for t in tables), dtype=torch.int32)
+        for b, t in enumerate(tables):
+            table[b, : len(t)] = t
+        pos = torch.cat([torch.arange(m - 1, m - 1 + rows) for m in lengths])
+        slot = torch.cat(
+            [
+                t[q // 64].long() * 64 + q % 64
+                for t, q in zip(tables, pos.view(requests, rows))
+            ]
+        )
+        w = inputs.layer_rank_weights(rank, 64 * first)
+        weights = _pack(rank, dev, sh, max(ends), full)
+        step = torch.full((1,), 5, dtype=torch.int32, device=dev)
+        group.finish_prepare()
+        # Two launches, so both copies of the peer regions are read.
+        for lay in (1, 2):
+            step.add_(1)
+            gluon_inputs.fill_absent_ranks(
+                scratch, index[lay & 1], bits[lay & 1], step, lay
+            )
+            layer.launch_gluon_muse_spark_layer_gfx950(
+                weights,
+                h=sh["h"][:, own].contiguous().to(dev),
+                a=sh["a_in"].to(dev),
+                h_out=torch.empty(n, OWNED, device=dev),
+                a_out=torch.empty(n, HIDDEN, dtype=torch.bfloat16, device=dev),
+                seq_len=(pos + 1).to(torch.int32).to(dev),
+                slot=slot.to(torch.int32).to(dev),
+                page_table=table.to(dev),
+                k_cache=w["k_cache"].to(dev),
+                v_cache=w["v_cache"].to(dev),
+                cos_sin=inputs.rope_table(max(ends) + 1).to(dev),
+                scratch=scratch,
+                step=step,
+                peer_bases=bases,
+                layer=lay,
+                chain=rows,
+                whole_rows=False,
+                tap=None,
+                tap_slot=None,
+                warm_next=None,
+                proj_in=None,
+                proj_out=None,
+                trace_buf=None,
+                stuck_rec=buf.tensor,
+                check_parity=False,
+                compile_only=False,
+            )
+            torch.cuda.synchronize()
+        stuck.close(buf, remove=False)
+    finally:
+        dist.destroy_process_group()
 
 
 @pytest.mark.parametrize("full", [False, True])
 @pytest.mark.parametrize("rows, requests", [(1, 1), (8, 1), (8, 2)])
-def test_one_gpu_bench_launches_find_every_absent_rank_segment(
+def test_one_gpu_launches_find_every_absent_rank_segment(
     tmp_path, full: bool, rows: int, requests: int
 ):
-    """With fewer GPUs than ranks the bench stands in for the absent ranks:
-    a launch must find every pair they would have written (each of ffn's
-    rank-ordered blocks, every row), or a poll gives up and records what
-    it waited for."""
-    script = tmp_path / "one_gpu_bench.py"  # a spawned worker needs a file
-    script.write_text(_ONE_GPU_BENCH)
-    args = ["--gpus", "1", "--kv-dtype", "fp8", "--length", "3000"]
-    args += ["--poll-check", "64", "--poll-timeout-shift", "17"]
-    args += ["--rows", str(rows), "--requests", str(requests)]
-    args += ["--distinct", "0", "--replays", "1", "--stuck-dir", str(tmp_path)]
-    args += ["--full"] if full else []
-    # The short timeout is part of the plan key, safe in a shared cache. The
-    # script runs from tmp_path, so the bench's directory goes on its path.
-    kernel_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), *[".."] * 5)
-    bench_dir = os.path.normpath(
-        os.path.join(kernel_root, "benchmarks/amd/gfx950/muse_spark/monokernel")
-    )
-    path = os.pathsep.join(p for p in (bench_dir, os.environ.get("PYTHONPATH")) if p)
-    env = dict(os.environ, PYTHONPATH=path)
-    result = subprocess.run(
-        [sys.executable, str(script), *args],
-        capture_output=True,
-        text=True,
-        timeout=1200,
-        env=env,
-        cwd=os.path.dirname(__file__),
-    )
+    """With one GPU standing in for the TP8 group, a launch must find every
+    pair the absent ranks would have written (each peer region's
+    rank-ordered blocks, the flags past 8 rows, every row), or a poll gives
+    up, records what it waited for and stops the kernel."""
+    with socket.socket() as sock:
+        sock.bind(("", 0))
+        port = sock.getsockname()[1]
     record = str(tmp_path / "rank0.rec")
-    # Report early crashes through stderr, but prefer any stuck-poll record.
-    assert os.path.exists(record) or result.returncode == 0, result.stderr[-2000:]
-    if os.path.exists(record):
-        assert not stuck.records(stuck.read_file(record)), "\n".join(
-            stuck_report.describe_file(record)
+    # A poll that gives up stops the worker; its record outlives it.
+    try:
+        mp.spawn(
+            _absent_ranks_worker,
+            args=(port, full, rows, requests, record),
+            nprocs=1,
+            join=True,
         )
-    assert result.returncode == 0, result.stderr[-2000:]
+    finally:
+        if os.path.exists(record):
+            assert not stuck.records(stuck.read_file(record)), "\n".join(
+                stuck_report.describe_file(record)
+            )
 
 
 def test_the_packer_names_every_tensor_of_another_layout():
