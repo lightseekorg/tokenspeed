@@ -163,13 +163,13 @@ public:
     std::size_t DecodingSize() const;
     std::size_t PrefillSize() const;
     // Requests in the running batch: local prefill forwards, prompts whose
-    // prefill is done (about to decode or to transfer), and decodes.
-    // RemotePrefilling (waiting for the peer's KV), waiting and retracted
-    // requests are not running.
+    // prefill is done (about to decode or to transfer, or waiting for their
+    // Decode destination), and decodes. RemotePrefilling (waiting for the
+    // peer's KV), waiting and retracted requests are not running.
     std::size_t RunningSize() const;
     // P role, independent admission: computed prompts waiting for their
     // Decode destination (PrefillAwaitingDestination, a subset of
-    // PrefillSize(), not running), and the Device parents in their block
+    // PrefillSize() and RunningSize()), and the Device parents in their block
     // tables, counted as ActiveLcmBlocks() counts them; blocks held outside the
     // tables (e.g. a pending in-forward State checkpoint) are not included.
     std::size_t AwaitingDestinationSize() const;

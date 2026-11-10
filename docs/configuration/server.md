@@ -1205,8 +1205,8 @@ with the scheduler's metrics, which carry the `dp_rank` label too:
 Under `independent` no prefill request waits for its decode peer before it
 computes: `tokenspeed:num_prefill_prealloc_queue_reqs` stays 0, and a request
 not yet computed counts in `tokenspeed:num_requests_waiting`. A computed prompt
-waiting for its destination takes no batch row: `tokenspeed:num_requests_inflight`
-counts it, `tokenspeed:num_requests_running` does not.
+waiting for its destination counts in `tokenspeed:num_requests_running`, as one
+awaiting its PD transfer does: both hold their pages and request slot.
 
 ## TokenSpeed-specific runtime knobs
 
