@@ -731,6 +731,7 @@ GPU_MAX_HW_QUEUES=2 tokenspeed serve moonshotai/Kimi-K3.1-Pro \
   --disable-kvstore \
   --enable-startup-requests \
   --prefill-graph-max-tokens 3072 \
+  --prefill-graph-capture-token-sizes 256 512 1024 1536 2048 3072 \
   --host 0.0.0.0 \
   --port 8000
 ```
@@ -746,6 +747,9 @@ GPU_MAX_HW_QUEUES=2 tokenspeed serve moonshotai/Kimi-K3.1-Pro \
 - Prefill CUDA graphs replay under KV parallelism too, with the DSA attention
   and the KV history gather at eager breaks. `--prefill-graph-max-tokens 3072`
   captures only chunks of up to 3072 new tokens; longer chunks run faster eager.
+  `--prefill-graph-capture-token-sizes` captures 6 buckets instead of the
+  default ladder's 44, which reserves about 10 GB per GPU at startup and
+  leaves too few KV cache blocks with KV parallelism at a 1M-token context.
 - `GPU_MAX_HW_QUEUES=2` gives each stream priority one hardware queue per
   compute pipe. With ROCm's default of 4, two queues share a pipe, so
   prefill's high-priority side kernels can wait behind the forward's GEMMs.
