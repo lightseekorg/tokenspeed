@@ -326,6 +326,7 @@ class Eagle(HiddenStateDrafter):
         share = self.attn_backend.sparse_topk
         return share.prefill, share.decode
 
+    @override
     def _target_dsa_topk(self, base_ctx: ForwardContext) -> DsaTopKState:
         """The target's last indexer layer left its selection on the target
         backend; the MTP head that shares it starts from there."""
