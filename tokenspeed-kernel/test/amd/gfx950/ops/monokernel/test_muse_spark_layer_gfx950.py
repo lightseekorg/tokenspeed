@@ -35,6 +35,8 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from tokenspeed_kernel.benchmark import muse_spark_monokernel as inputs
 from tokenspeed_kernel.benchmark import muse_spark_monokernel_gluon as gluon_inputs
+from tokenspeed_kernel.numerics.torch.moe import torch_grouped_sigmoid_topk
+from tokenspeed_kernel.numerics.torch.residual import torch_post_norm_residual_pre_norm
 from utils import assert_no_triton_compile, is_cdna4
 
 if not is_cdna4():
@@ -109,10 +111,11 @@ def _reference(sh, length, full, kernel_pooled, kernel_hp, dev):
             cs[length - 1 : end],
         )
         b = b + (z.float() @ w["w_o"].float().T).to(torch.bfloat16).float()
-    b = b.to(torch.bfloat16).float()
-    b = b * torch.rsqrt(b.pow(2).mean(-1, keepdim=True) + 1e-8)
-    hp = sh["beta1"] * b + sh["alpha1"] * sh["h"]
-    u = hp * torch.rsqrt(hp.pow(2).mean(-1, keepdim=True) + 1e-5) * sh["pre_gain"]
+    # The attention boundary: h' = alpha1 h + beta1 norm(b), then the
+    # pre-expert norm u (the shared reference, FP64).
+    hp, u, _ = _boundary(sh, "1", sh["h"], b.to(torch.bfloat16), None, sh["pre_gain"])
+    gated1 = (hp - sh["alpha1"].double() * sh["h"].double()).abs().float()
+    hp, u = hp.float(), u.float()
     w_pool = torch.cat(
         [inputs.layer_rank_weights(r, end)["w_pool"] for r in range(WORLD)]
     )
@@ -123,8 +126,9 @@ def _reference(sh, length, full, kernel_pooled, kernel_hp, dev):
     h2 = torch.empty(rows, HIDDEN)
     a = torch.empty(rows, HIDDEN, dtype=torch.bfloat16)
     gated = torch.empty(rows, HIDDEN)
-    score = torch.sigmoid((u.double() @ sh["router"].double().T) * 0.17677669529663687)
-    ids = torch.topk(score + sh["bias"].double(), 8).indices  # [rows, 8]
+    # The router: sigmoid scores, the bias picks, unbiased weights (one group).
+    logits = (u.double() @ sh["router"].double().T) * 0.17677669529663687
+    ids, route_weights = torch_grouped_sigmoid_topk(logits, sh["bias"], 8, 1, 1, 1.0)
     # The experts on the worker's GPU, every row at once.
     routes = torch.zeros(rows, 8, POOLED)
     for r in range(WORLD):
@@ -136,19 +140,43 @@ def _reference(sh, length, full, kernel_pooled, kernel_hp, dev):
             .cpu()
         )
     for t in range(rows):
-        weights = (score[t, ids[t]] / score[t, ids[t]].sum()).float()
+        weights = route_weights[t]
         p = routes[t].to(torch.bfloat16).float() * sh["pen_gain"]
         p = p * torch.rsqrt(p.pow(2).mean(1, keepdim=True) + 1e-8)
         combined = (p * weights[:, None]).sum(0).to(torch.bfloat16)
-        y = (combined.float() @ w_post.float().T).to(torch.bfloat16).float()
-        y = y * sh["post_gain"]
-        y = y * torch.rsqrt(y.pow(2).mean() + 1e-8)
-        h2[t] = sh["beta2"] * y + sh["alpha2"] * kernel_hp[t]
-        a[t] = (h2[t] * torch.rsqrt(h2[t].pow(2).mean() + 1e-5) * sh["in_gain"]).to(
-            torch.bfloat16
+        y = (combined.float() @ w_post.float().T).to(torch.bfloat16)
+        # The FFN boundary from the kernel's h' (the shared reference).
+        stream, _, a_t = _boundary(
+            sh, "2", kernel_hp[t : t + 1], y[None], sh["post_gain"], sh["in_gain"]
         )
-        gated[t] = (sh["beta2"] * y).abs()
-    return pooled, hp, (sh["beta1"] * b).abs(), h2, a, gated
+        h2[t], a[t] = stream[0].float(), a_t[0]
+        gated[t] = (stream[0] - sh["alpha2"].double() * kernel_hp[t].double()).abs()
+    return pooled, hp, gated1, h2, a, gated
+
+
+def _boundary(sh, which, stream, branch, post_gain, pre_gain):
+    """A layer boundary of the shared inputs ``sh`` with gate ``which`` ("1":
+    attention, "2": FFN), by the shared reference: ``alpha stream + beta
+    norm(branch * post_gain)``, then its norm times ``pre_gain``.
+
+    Returns:
+        ``(stream FP64, pre FP64, pre BF16)``.
+    """
+    return torch_post_norm_residual_pre_norm(
+        stream=stream,
+        branch=branch,
+        post_weight=post_gain,
+        post_eps=1e-8,
+        post_weight_offset=0.0,
+        alpha=sh["alpha" + which],
+        beta=sh["beta" + which],
+        pre_weight=pre_gain,
+        pre_eps=1e-5,
+        pre_weight_offset=0.0,
+        enable_pdl=False,
+        branch_sentinel=None,
+        branch_ranks=1,
+    )
 
 
 def _pack(
