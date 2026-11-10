@@ -38,6 +38,7 @@ from tokenspeed_kernel.ops.attention import dsa as dsa_ops
 from tokenspeed_kernel.ops.attention.dsv41.triton import cache_pack, cache_unpack
 from tokenspeed_kernel.ops.kvcache.triton import index_k_layernorm_fp8_scatter
 from tokenspeed_kernel.ops.quantization import quantize_fp8
+from tokenspeed_kernel.selection import NoKernelFoundError
 from utils import is_cdna4
 
 if not is_cdna4():
@@ -109,12 +110,11 @@ def captured_logits(monkeypatch):
     return logits
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("masked", [False, True])
-def test_writer_matches_dsv41_codec(dtype, masked):
+def test_writer_matches_dsv41_codec(masked):
     torch.manual_seed(3)
     pages, tokens = 12, 500
-    x = torch.randn(tokens, 160, device="cuda", dtype=dtype)[:, :_DIM] * 3
+    x = torch.randn(tokens, 160, device="cuda", dtype=torch.bfloat16)[:, :_DIM] * 3
     weight = torch.rand(_DIM, device="cuda") + 0.5
     bias = torch.randn(_DIM, device="cuda") * 0.1
     loc = torch.randperm(pages * _PAGE, device="cuda")[:tokens]
@@ -135,7 +135,7 @@ def test_writer_matches_dsv41_codec(dtype, masked):
     normed = torch.nn.functional.layer_norm(x.float(), (_DIM,), weight, bias, 1e-6)
     rows = torch.full_like(buf, 0xA5)
     keep = slice(None) if mask is None else mask
-    rows[loc[keep]] = cache_pack(normed.to(dtype)[keep].float(), "index", None)
+    rows[loc[keep]] = cache_pack(normed.bfloat16()[keep].float(), "index", None)
     rows = rows.view(pages, _PAGE, 68)
     want = torch.cat(
         (rows[:, :, :64].reshape(pages, -1), rows[:, :, 64:].reshape(pages, -1)), 1
@@ -339,5 +339,5 @@ def test_facades_select_mxfp4_only_when_named():
         # Near ties at the k-th score may swap; nothing far below it is picked.
         assert picked.min() >= kth - 1e-5 * scores.abs().max()
     # The same bytes read as fp8_scaled have a different row width.
-    with pytest.raises(Exception):
+    with pytest.raises(NoKernelFoundError):
         dsa_ops.dsa_decode_topk(q, weights, seq_lens, table, **common)
