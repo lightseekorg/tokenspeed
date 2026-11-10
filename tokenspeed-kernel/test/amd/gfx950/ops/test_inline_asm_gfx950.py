@@ -850,10 +850,16 @@ INLINE_ASM = {
         "a loop of uncached loads that retries only the late pairs' lanes",
         "a volatile load that a loop keeps, and a Gluon ballot (wave vote) op",
     ),
+    "_trap": (
+        _MONO + "mailbox:_trap",
+        "stops the kernel on a stuck poll or broken invariant; llvm.trap is"
+        " noreturn, so the compiler reshapes the code around it",
+        "a trap intrinsic that leaves the code after it reachable",
+    ),
     "_record_flag_timeout": (
         _MONO + "mailbox:_record_flag_timeout",
         "reuses the tagged poll's lane selection and ordered stuck-record stores",
-        "a Gluon ballot (wave vote) op and ordered system-scope stores",
+        "a Gluon ballot (wave vote) op that links no extern library",
     ),
     "code_pointer": (
         _MONO + "code_warm:code_pointer",
@@ -885,14 +891,9 @@ INLINE_ASM = {
 INLINE_ASM_ON_MAIN = {
     "now": (
         _MONO + "trace:now",
-        "reads the realtime clock for the flag poll's timeout record",
+        "reads the realtime clock; the extern library's s.memrealtime would"
+        " make every kernel that polls flags link that library",
         "a Gluon realtime clock op",
-    ),
-    "_trap": (
-        _MONO + "mailbox:_trap",
-        "stops the kernel on a stuck poll or broken invariant; llvm.trap is"
-        " noreturn and reshapes the layer's code (rows-16 VGPR spills)",
-        "a trap intrinsic that leaves the code after it reachable",
     ),
     "_keep_in_cluster": (
         _AMD + "attention._common:_keep_in_cluster",

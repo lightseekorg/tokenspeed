@@ -353,6 +353,12 @@ if is_cdna4():
         import torch
         from tokenspeed_kernel_amd._triton import gl, gluon
         from tokenspeed_kernel_amd.ops.gfx950.monokernel import mailbox, stuck, trace
+        from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import (
+            POLL_TIMEOUT_MANTISSA,
+        )
+
+        # The tagged polls' bound at poll_timeout_shift 10, in ns.
+        TIMEOUT_NS = gl.constexpr((POLL_TIMEOUT_MANTISSA << 10) * trace.TICK_NS)
 
         @gluon.jit
         def _two_wave_kernel(scratch, rec):
@@ -362,7 +368,7 @@ if is_cdna4():
             ready = gl.atomic_poll(
                 ptrs, gl.full((128,), (7 << 32) | 1, gl.int64, lanes.type.layout),
                 sem="relaxed", scope="gpu",
-                timeout_ns=gl.full((), 112640, gl.int64),
+                timeout_ns=gl.full((), TIMEOUT_NS, gl.int64),
             )
             now = trace.now()
             mailbox._record_flag_timeout(

@@ -55,8 +55,9 @@ caches.
 
 Fail-stop: a poll gives up after about a minute of waiting (the realtime
 clock, read every ``Plan.poll_check`` retries only) and executes
-``s_trap 2``. The runtime then reports a GPU exception and the process stops. A deadlock or a
-missing producer thus stops the server with an error instead of hanging it.
+``s_trap 2``. The runtime then reports a GPU exception and the process
+stops. A deadlock or a missing producer thus stops the server with an error
+instead of hanging it.
 
 Stuck-poll record: a mailbox made with a ``stuck`` buffer (``int64
 [grid * waves + 1, STUCK_WORDS]``, host-visible) has each poll write, only
@@ -351,7 +352,12 @@ def _stuck_slot():
 
 @gluon.jit
 def _record_flag_timeout(ptrs, failed, tag, start, now, stuck):
-    # asm: reuse the tagged poll's lane selection and ordered record stores.
+    # asm: reuse the tagged poll's lane selection and ordered record stores
+    # (_stuck_record), so a flag poll writes the same record as a tagged
+    # poll. _extern.wave_ballot_i64 could select the lane, but then every
+    # kernel that polls flags with a stuck buffer would have to link the
+    # extern library, including kernels that poll flags but raise none
+    # (see trace.now).
     # Save EXEC separately: _stuck_record narrows it to the recording lane.
     gl.inline_asm(
         _flag_stuck_asm,
@@ -398,8 +404,10 @@ def _no_buffer(buf):
 @gluon.jit
 def _trap():
     """The fail-stop of a stuck poll (``s_trap 2``), for a broken invariant."""
-    # asm: llvm.trap is noreturn, which reshapes the whole layer's code
-    # (rows 16: 20 more VGPR spills); this s_trap returns to the compiler.
+    # asm: llvm.trap is noreturn, so the compiler treats the code after it
+    # as unreachable and reshapes the surrounding control flow and register
+    # allocation; this s_trap returns to the compiler, which keeps the
+    # caller's code as written.
     # The dummy SGPR output is there because inline_asm needs a result.
     gl.inline_asm("s_trap 2\ns_mov_b32 $0, 0", "=s", [], gl.int32, is_pure=False)
 
@@ -423,7 +431,7 @@ def _group_end(first, count):
 @gluon.constexpr_function
 def _poll_types(offsets, num_warps):
     """Result types of a poll of the index tensors of tuple type
-    ``offsets``: their pairs, then the poll's four scratch operands."""
+    ``offsets``: their pairs, then the poll's five scratch operands."""
     pairs = [t.with_element_ty(gl.int64) for t in offsets.types]
     return pairs + [_lane_type(num_warps), gl.int64, gl.int32, gl.int64, gl.int64]
 
@@ -609,13 +617,11 @@ class Peers:
     """
 
     deltas: gl.tensor
-    rank: gl.constexpr
     parity: gl.tensor
 
     @gluon.constexpr_function
-    def __init__(self, deltas, rank, parity):
+    def __init__(self, deltas, parity):
         self.deltas = deltas
-        self.rank = gl.constexpr(rank)
         self.parity = parity
 
     @gluon.jit
@@ -643,7 +649,7 @@ def load_peers(bases, rank: gl.constexpr, parity, WORLD: gl.constexpr):
     """:class:`Peers` from the ``int64 [WORLD]`` heap bases of the group."""
     layout: gl.constexpr = gl.BlockedLayout([WORLD], [64], [gl.num_warps()], [0])
     b = gl.load(bases + gl.arange(0, WORLD, layout))
-    return Peers(b - gl.load(bases + rank), rank, parity)
+    return Peers(b - gl.load(bases + rank), parity)
 
 
 @gluon.constexpr_function
@@ -755,12 +761,22 @@ class Mailbox:
         )
 
     @gluon.jit
+    def _check_world(self):
+        """The :class:`Peers` cover the plan's ranks (``load_peers``'s
+        ``WORLD`` is ``Plan.world``)."""
+        gl.static_assert(
+            self.peers.deltas.shape[0] == schedule.world(self.plan),
+            "load_peers WORLD must equal the plan's world",
+        )
+
+    @gluon.jit
     def put_peer(self, region: gl.constexpr, peer, index, payload, mask=None):
         """Publish ``payload`` at ``index`` of rank ``peer``'s copy of peer
         region ``region`` (a system-scope store; ``peer`` may be this rank)."""
         gl.static_assert(
             schedule.is_peer(self.plan, region), "put_peer needs a peer region"
         )
+        self._check_world()
         ptrs = self.peers.translate(self.scratch + self._base(region) + index, peer)
         _put(ptrs, payload, self.tag, mask, "sys")
 
@@ -802,6 +818,10 @@ class Mailbox:
         gfx9 ``vmcnt`` counts stores), the CTA meets at a barrier, then one
         thread puts the pair. A consumer polls the flag, then loads the
         words."""
+        gl.static_assert(
+            not schedule.is_peer(self.plan, region),
+            "raise_flag is local: use raise_flag_peers",
+        )
         # Wait for this wave's stores before the CTA publishes the flag.
         _extern.release_wait_vmem()
         gl.barrier()
@@ -823,6 +843,7 @@ class Mailbox:
         gl.static_assert(
             schedule.is_peer(self.plan, region), "store_words_peer needs a peer region"
         )
+        self._check_world()
         base = self.peers.translate(self._words(region), peer)
         gl.amd.cdna4.buffer_store(
             values.to(gl.int32, bitcast=True), base, index, mask=mask, cache=".wt"
@@ -840,6 +861,7 @@ class Mailbox:
             schedule.is_flag(self.plan, region),
             "raise_flag_peers needs a peer region declared in Plan.flags",
         )
+        self._check_world()
         # Wait for this wave's peer stores before the CTA publishes the flags.
         _extern.release_wait_vmem()
         gl.barrier()
@@ -879,7 +901,10 @@ class Mailbox:
         )
         ptrs = self.scratch + self._base(region) + indices
         expected = (self.tag.to(gl.int64) << 32) | 1
-        start = trace.now()
+        # The clock reads serve only the stuck record: a mailbox without a
+        # stuck buffer skips them.
+        if self.stuck is not None:
+            start = trace.now()
         ready = gl.atomic_poll(
             ptrs,
             expected,
@@ -891,8 +916,8 @@ class Mailbox:
         for _ in gl.static_range(len(indices.shape)):
             failed = gl.sum(failed, 0)
         if failed != 0:
-            now = trace.now()
             if self.stuck is not None:
+                now = trace.now()
                 _record_flag_timeout(ptrs, ~ready, self.tag, start, now, self.stuck)
             _trap()
 

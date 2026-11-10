@@ -203,7 +203,9 @@ read once a launch, and `parity` alternates from launch to launch.
 - Polls of a peer region load with `sc0 sc1`. `poll_pairs` serves local
   regions only; poll peer regions by name.
 
-`Mailbox(scratch, tag, plan, trace_table)` is the view that a stage gets:
+`Mailbox(scratch, tag, plan, trace_table, peers, stuck)` is the view that a
+stage gets (`peers` for a plan of `world` > 1, `stuck` for a stuck-poll
+record buffer; both default to none):
 
 | Method | Use |
 |---|---|
@@ -215,6 +217,13 @@ read once a launch, and `parity` alternates from launch to launch.
 | `pre_poll(region, hints)`, `pre_poll_spread(region, N)` | Let wave 0 spin on hint pairs before a wide poll. |
 | `stamp(stage, point)` | Records a trace point. |
 | `put_peer(region, peer, index, payload, mask)` | Publishes into another rank's copy of a peer region. |
+| `store_words(region, index, values, mask)` | Stores untagged 32-bit words write-through, for `raise_flag` to publish. |
+| `raise_flag(region, index)` | Waits for the CTA's `store_words`, then puts one flag pair. |
+| `store_words_peer(region, peer, index, values, mask)` | `store_words` into another rank's copy of a peer region. |
+| `raise_flag_peers(region, index)` | Waits for the CTA's `store_words_peer`, then puts the flag on every rank. |
+| `poll_flags(region, indices)` | Waits for flag pairs; traps on timeout. |
+| `load_words(region, index)` | Loads flag-published words past the caches. |
+| `check_parity(parity)` | Traps unless the peer copy alternates from the last launch (tests, benches). |
 
 `mx.load_mxfp4_rows` polls the MXFP4 rows of a GEMV input in one round trip.
 

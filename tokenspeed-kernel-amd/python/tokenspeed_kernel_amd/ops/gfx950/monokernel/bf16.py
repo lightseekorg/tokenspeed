@@ -320,6 +320,11 @@ def load_global_rows(x, row_stride, k0, KS: gl.constexpr, R: gl.constexpr):
     wrote (row ``r`` at ``x + r * row_stride``), values ``k0 .. k0 + KS - 1``.
     ``row_stride`` and ``k0`` are even.
 
+    The loads are plain (cacheable), so this GPU must have written the rows
+    in an earlier launch: a launch boundary makes its own writes visible to
+    them. Rows that another GPU wrote need loads past the caches (``.cv``),
+    which a stale line in this GPU's L2 cannot serve.
+
     Returns:
         ``x_smem [RP, KP, 32] bf16``, as :func:`load_rows`.
     """

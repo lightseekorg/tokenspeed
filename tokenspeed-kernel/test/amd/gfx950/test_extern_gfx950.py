@@ -110,19 +110,17 @@ def _publish_probe(data, flag):
     gl.store(flag + offset, offset * 0 + 1, mask=offset == 0)
 
 
-def test_the_release_wait_keeps_stores_above_it():
-    """The wait before a flag is published orders the data stores before it
-    in the IR too: a release fence comes before the vmcnt wait."""
+def test_the_release_wait_links_a_fence_before_the_wait():
+    """``release_wait_vmem`` links a workgroup-scope release fence before
+    its ``vmcnt(0)`` wait, so LLVM cannot move the earlier data stores below
+    the wait. The check is on the IR: a run's results cannot show whether
+    a store was moved past the wait."""
     data = torch.empty(256, dtype=torch.int32, device="cuda")
     flag = torch.zeros(1, dtype=torch.int32, device="cuda")
     compiled = _publish_probe[(1,)](data, flag, num_warps=4, **extern_compile_options())
     llir = compiled.asm["llir"]
     fence = llir.index('fence syncscope("workgroup") release')
     assert fence < llir.index("@llvm.amdgcn.s.waitcnt(i32 3952)", fence)
-    torch.testing.assert_close(
-        data, torch.arange(256, dtype=torch.int32, device="cuda")
-    )
-    assert int(flag) == 1
 
 
 @gluon.jit

@@ -45,9 +45,10 @@ from dataclasses import dataclass
 import torch
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.mailbox import STUCK_WORDS
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import LAYER_SLOTS, Plan
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.trace import TICK_NS
 
-# The realtime clock that the polls read (s_memrealtime): 100 MHz on gfx950.
-TICKS_PER_SECOND = 100_000_000
+# Ticks a second of the realtime clock that the polls read (s_memrealtime).
+TICKS_PER_SECOND = 1_000_000_000 // TICK_NS
 # The header row's first word: b"STUCKREC".
 MAGIC = int.from_bytes(b"STUCKREC", "little")
 
@@ -239,8 +240,8 @@ def describe(rec: dict, plan: Plan | None, scratch_ptr: int, rank: int) -> str:
     )
     return (
         f"rank {rank} CTA {rec['cta']} wave {rec['wave']}: stage {stage} waited for "
-        f"{place}: expected tag {rec['expected']} (step {step} layer {layer}, "
-        f"parity {layer & 1}), saw {seen}; waited {waited:.1f} s from clock "
+        f"{place}: expected tag {rec['expected']} (step {step} layer {layer}), "
+        f"saw {seen}; waited {waited:.1f} s from clock "
         f"{rec['start']} (operand {rec['operand']})"
     )
 
@@ -286,8 +287,9 @@ def summarize(t: torch.Tensor, plan_of) -> list[str]:
     by the deadlock rule (``Plan``) the earliest stage that waits reads only
     regions that earlier stages, on every rank, should have written, so it
     names the cause, and the later groups wait downstream of it. The first
-    check alone would not: a stage that polls from the launch's start (an
-    expert stage on ``route``) checks first but waits on the stall."""
+    check alone would not: a stage that polls from the launch's start (one
+    whose CTAs run nothing before it) checks first but waits
+    on the stall."""
     h = header(t)
     groups: dict[tuple, list] = {}
     for rec in records(t):

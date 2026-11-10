@@ -248,7 +248,8 @@ class Plan:
 
     def peer_copy(self, region: str) -> int:
         """Pairs between the two copies of peer region ``region``."""
-        assert region in self.peers, region
+        if region not in self.peers:
+            raise ValueError(f"{region} is not a peer region")
         return _aligned(dict(self.regions)[region])
 
     @property

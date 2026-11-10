@@ -28,8 +28,8 @@ import pytest
 import torch
 from cpu_budget import CGROUP_ROOT, cgroup_cpu_quota, cpu_budget
 
-# The Muse Spark references (attention over long contexts, the experts) run
-# FP32 math on the host. Torch and OpenMP start a thread per visible core,
+# The stage tests' references (attention over long contexts, the experts)
+# run FP32 math on the host. Torch and OpenMP start a thread per visible core,
 # which on a CI pod with a small CPU quota, or a busy host, oversubscribes the
 # CPUs and slows the references by orders of magnitude. A few threads keep
 # them fast.

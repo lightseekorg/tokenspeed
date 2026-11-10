@@ -72,8 +72,9 @@ def fill(
     region: str,
     payload: torch.Tensor,
     tag: int,
-    copy: int = 0,
+    *,
     row: int = 0,
+    copy: int = 0,
 ) -> None:
     """Publish ``payload`` (32-bit words) in row ``row`` of ``region`` with
     ``tag``, as the stage that writes the region would (``copy``: the launch
@@ -105,8 +106,9 @@ def fill_words(
     plan: Plan,
     region: str,
     payload: torch.Tensor,
-    copy: int = 0,
+    *,
     row: int = 0,
+    copy: int = 0,
 ) -> None:
     """Store ``payload`` (32-bit words) as plain words in row ``row`` of
     ``region``, as a producer's ``store_words`` would (2 words a pair)."""
@@ -120,6 +122,7 @@ def words(
     plan: Plan,
     region: str,
     count: int,
+    *,
     row: int = 0,
     copy: int = 0,
 ) -> torch.Tensor:
