@@ -423,7 +423,9 @@ def worker(rank: int, port: int, args) -> None:
 
     def launch(lay: int, trace_buf=None) -> None:
         fill(lay)
-        layer.launch_layer(
+        # The packed-operand launcher, so that every launch reuses the
+        # operands packed once above (the public launcher packs per call).
+        layer._launch_layer(
             scratch,
             step,
             lay,

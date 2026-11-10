@@ -21,7 +21,7 @@
 """Weight packing of one Muse Spark TP8 rank's layer launch.
 
 The packer takes the regular path's tensors of one rank and returns the
-operands that :func:`layer.launch_layer` reads:
+operands that :func:`layer._launch_layer` reads:
 
 * BF16 N16 tiles (``bf16_tiles``) of the QKVG, o_proj, pooler and
   post-expert weights. The pooler and post-expert weights are replicated on

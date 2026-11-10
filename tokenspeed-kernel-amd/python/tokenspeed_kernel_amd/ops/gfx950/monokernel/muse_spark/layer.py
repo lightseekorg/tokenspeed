@@ -30,9 +30,10 @@ in plan order (see each module):
 * routing, pooler, experts, combine, post-expert projection and boundary
   (``moe_route``, ``moe_pool``, ``moe_experts``, ``moe_tail``).
 
-The peer regions' copy of a launch is ``layer & 1``: 62 layers are an even
-count, so it alternates from one monokernel launch to the next, across
-steps too (layers 0 and 61 keep the regular path).
+The peer regions' copy of a launch is ``layer & 1``. The monokernel launches
+layers 1 to 60 (layers 0 and 61 keep the regular path), an even count, so the
+copy alternates from one launch to the next, across steps too: layer 60
+uses copy 0 and the next step's layer 1 copy 1.
 """
 
 from __future__ import annotations
@@ -691,7 +692,7 @@ def gluon_muse_spark_layer_gfx950(
     trace.flush(table, trace_buf)
 
 
-def launch_layer(
+def _launch_layer(
     scratch,
     step,
     layer,
@@ -975,7 +976,7 @@ def launch_gluon_muse_spark_layer_gfx950(
         h_out=h_out,
         a_out=a_out,
     )
-    launch_layer(
+    _launch_layer(
         scratch,
         step,
         layer,
@@ -1009,6 +1010,5 @@ __all__ = [
     "KV_DTYPES",
     "SLIDING_SPLITS",
     "gluon_muse_spark_layer_gfx950",
-    "launch_layer",
     "layer_plan",
 ]

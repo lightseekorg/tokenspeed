@@ -1168,9 +1168,6 @@ class MuseSparkMoE(nn.Module):
             raise ValueError("the expert count must divide evenly across EP ranks")
         if config.moe_intermediate_size % mapping.moe.tp_size:
             raise ValueError("the expert intermediate size must divide across TP ranks")
-        self.config = config
-        self.mapping = mapping
-        self.layer_id = layer_id
         self.num_experts = config.num_local_experts
         self.topk = config.num_experts_per_tok
         self.route_scale = config.routed_scaling_factor
