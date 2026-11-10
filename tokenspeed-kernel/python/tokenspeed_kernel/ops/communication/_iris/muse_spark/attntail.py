@@ -142,7 +142,7 @@ def iris_fused_pull_allgather_muse_attntail(
         + 1
     )
     # Attention scatter uses write-through stores; no cache writeback is needed at entry.
-    WAIT_VMEM(args=[], constraints="=r,~{memory}")
+    WAIT_VMEM()
     gl.barrier()
     _iris_rendezvous(ready_flags, heaps, program, epoch, RANK, NUM_WARPS, False)
     layout: gl.constexpr = gl.BlockedLayout(
@@ -185,7 +185,7 @@ def iris_fused_pull_allgather_muse_attntail(
                 False,
             )
     # Every rank consumed these rows before the next producer reuses its shard.
-    WAIT_VMEM(args=[], constraints="=r,~{memory}")
+    WAIT_VMEM()
     gl.barrier()
     _iris_rendezvous(
         ready_flags + FLAG_ROWS * WORLD_SIZE,
