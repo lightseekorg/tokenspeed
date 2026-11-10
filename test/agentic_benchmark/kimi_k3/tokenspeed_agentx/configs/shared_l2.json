@@ -1,0 +1,6 @@
+{"owner": "tcp://@HEAD@:47100",
+ "namespace": "kimi-k3-nvfp4@b2428a0b+eagle3-mla@4c48d2bb",
+ "device_names": ["mlx5_0,mlx5_1", "mlx5_0,mlx5_1", "mlx5_0,mlx5_1", "mlx5_0,mlx5_1"],
+ "request_timeout_ms": 30000, "connect_timeout_s": 1800,
+ "load_workers": 16, "write_workers": 4,
+ "scheduler": {"max_writes": 4, "max_write_keys": 512}}

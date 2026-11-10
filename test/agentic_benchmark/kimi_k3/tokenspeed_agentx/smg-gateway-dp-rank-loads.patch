@@ -1,0 +1,98 @@
+diff --git a/model_gateway/src/worker/monitor.rs b/model_gateway/src/worker/monitor.rs
+index 4b87cbd0c..c48368940 100644
+--- a/model_gateway/src/worker/monitor.rs
++++ b/model_gateway/src/worker/monitor.rs
+@@ -57,7 +57,8 @@ use std::{
+ use dashmap::DashMap;
+ use futures::future;
+ use openai_protocol::worker::{
+-    RuntimeType, SchedulerLoadSnapshot, WorkerGroupKey, WorkerLoadResponse, WorkerStatus,
++    EngineAggregateMetricsSnapshot, RuntimeType, SchedulerLoadSnapshot, WorkerGroupKey,
++    WorkerLoadResponse, WorkerStatus,
+ };
+ use parking_lot::{Mutex, RwLock};
+ use reqwest::StatusCode;
+@@ -1214,6 +1215,26 @@ impl WorkerMonitor {
+         }
+     }
+
++    fn load_for_rank(
++        mut load: WorkerLoadResponse,
++        rank: Option<usize>,
++    ) -> Option<WorkerLoadResponse> {
++        let Some(rank) = rank else {
++            return Some(load);
++        };
++        if !load.ranks_are_dp_ranks() {
++            return None;
++        }
++        load.loads
++            .retain(|entry| usize::try_from(entry.dp_rank) == Ok(rank));
++        if load.loads.len() != 1 {
++            return None;
++        }
++        load.dp_rank_count = 1;
++        load.aggregate = EngineAggregateMetricsSnapshot::from_ranks(&load.loads);
++        Some(load)
++    }
++
+     /// Fetch load via the backend client's `GetLoads` (gRPC RPC or the ZMQ
+     /// engine's pushed scheduler stats). Returns `None` on missing client,
+     /// error, or empty `loads` array.
+@@ -1237,7 +1258,8 @@ impl WorkerMonitor {
+         match tokio::time::timeout(LOAD_POLL_DEADLINE, backend_client.get_loads()).await {
+             Ok(Ok(load)) if !load.loads.is_empty() => {
+                 liveness::on_contact(worker);
+-                Some(load)
++                // A virtual worker competes as one rank, just like its pushed record.
++                Self::load_for_rank(load, worker.dp_rank())
+             }
+             Ok(Ok(_)) => {
+                 liveness::on_contact(worker);
+@@ -1772,6 +1794,46 @@ mod worker_monitor_tests {
+         (registry, monitor)
+     }
+
++    #[test]
++    fn polled_load_has_the_same_rank_scope_as_a_pushed_record() {
++        let loads = vec![
++            SchedulerLoadSnapshot {
++                dp_rank: 0,
++                num_running_reqs: 8,
++                num_waiting_reqs: 20,
++                num_total_reqs: 28,
++                num_waiting_uncached_tokens: 64000,
++                ..Default::default()
++            },
++            SchedulerLoadSnapshot {
++                dp_rank: 1,
++                num_running_reqs: 1,
++                num_waiting_reqs: 2,
++                num_total_reqs: 3,
++                num_waiting_uncached_tokens: 4000,
++                ..Default::default()
++            },
++        ];
++        let report = WorkerLoadResponse {
++            dp_rank_count: 2,
++            aggregate: EngineAggregateMetricsSnapshot::from_ranks(&loads),
++            loads,
++            ..Default::default()
++        };
++        let scoped = WorkerMonitor::load_for_rank(report.clone(), Some(1)).unwrap();
++        assert_eq!(scoped.dp_rank_count, 1);
++        assert_eq!(scoped.loads.len(), 1);
++        assert_eq!(scoped.loads[0].dp_rank, 1);
++        assert_eq!(scoped.total_running_reqs(), 1);
++        assert_eq!(scoped.total_waiting_reqs(), 2);
++        assert_eq!(scoped.total_waiting_uncached_tokens(), 4000);
++        assert_eq!(scoped.aggregate.unwrap().total_reqs, 3);
++        assert!(WorkerMonitor::load_for_rank(report.clone(), Some(2)).is_none());
++        let whole = WorkerMonitor::load_for_rank(report, None).unwrap();
++        assert_eq!(whole.loads.len(), 2);
++        assert_eq!(whole.total_waiting_reqs(), 22);
++    }
++
+     /// Backend-wide pushes only refresh the matching virtual rank; quiet ranks keep polling.
+     #[tokio::test]
+     async fn dp8_pushes_cannot_redirect_virtual_workers_to_active_ranks() {

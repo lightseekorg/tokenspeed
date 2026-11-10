@@ -1,0 +1,50 @@
+diff --git a/src/aiperf/common/environment.py b/src/aiperf/common/environment.py
+index 51cd5a5..5c32fee 100644
+--- a/src/aiperf/common/environment.py
++++ b/src/aiperf/common/environment.py
+@@ -778,9 +778,15 @@ class _HTTPSettings(BaseSettings):
+     )
+     X_SMG_ROUTING_KEY_FROM_CORRELATION_ID: bool = Field(
+         default=False,
+-        description="Also send X-SMG-Routing-Key with the stable X-Correlation-ID value. "
+-        "This transport setting is the supported affinity path for the SGLang Model "
+-        "Gateway manual routing policy.",
++        description="Send a derived X-SMG-Routing-Key for SGLang Model Gateway affinity. "
++        "When enabled, explicitly select X_SMG_ROUTING_KEY_SOURCE as branch or root.",
++    )
++    X_SMG_ROUTING_KEY_SOURCE: Literal["branch", "root"] | None = Field(
++        default=None,
++        description="Identity used by the enabled SMG affinity header. branch selects "
++        "x_correlation_id; root selects root_correlation_id and co-locates descendants. "
++        "Required when X_SMG_ROUTING_KEY_FROM_CORRELATION_ID is enabled; omission "
++        "is valid only when that header is disabled.",
+     )
+     X_DYNAMO_SESSION_ID_FROM_CORRELATION_ID: bool = Field(
+         default=False,
+diff --git a/src/aiperf/transports/base_transports.py b/src/aiperf/transports/base_transports.py
+index ecb99e3..f2e981b 100644
+--- a/src/aiperf/transports/base_transports.py
++++ b/src/aiperf/transports/base_transports.py
+@@ -150,8 +150,21 @@ class BaseTransport(AIPerfLifecycleMixin, ABC):
+             # Additive SGLang Model Gateway routing key: co-locate a session's
+             # requests on one worker via the stable correlation ID.
+             if Environment.HTTP.X_SMG_ROUTING_KEY_FROM_CORRELATION_ID:
++                source = Environment.HTTP.X_SMG_ROUTING_KEY_SOURCE
++                if source == "branch":
++                    routing_key = request_info.x_correlation_id
++                elif source == "root":
++                    if not request_info.root_correlation_id:
++                        raise ValueError(
++                            "SMG root affinity requires root_correlation_id"
++                        )
++                    routing_key = request_info.root_correlation_id
++                else:
++                    raise ValueError(
++                        "Set AIPERF_HTTP_X_SMG_ROUTING_KEY_SOURCE to branch or root"
++                    )
+                 _remove_headers_case_insensitive(headers, ("X-SMG-Routing-Key",))
+-                headers["X-SMG-Routing-Key"] = request_info.x_correlation_id
++                headers["X-SMG-Routing-Key"] = routing_key
+
+         # Apply derived Dynamo session headers last so they are authoritative
+         # and cannot be overwritten by endpoint, extra, or transport headers.
