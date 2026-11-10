@@ -624,8 +624,8 @@ draft model, and token count together.
 
 The greedy and sonic sampling backends accept it, and the flashinfer backend
 only over sampled drafts (`--enable-speculative-sampling`). Speculative
-decoding must be enabled, and `--dp-sampling`, `--enable-output-logprobs` and
-draft trees are rejected at startup, as are the other sampling backends.
+decoding must be enabled, and `--dp-sampling`, `--enable-output-logprobs`,
+and draft trees are rejected at startup, as are the other sampling backends.
 On the greedy backend, token selection is always argmax, so stochastic sampling
 and penalties do not apply there; use unconstrained greedy requests
 (`temperature: 0`) with it.
