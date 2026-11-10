@@ -58,7 +58,7 @@ SUPPORTED_WORKFLOW_STAGES = tuple(WORKFLOW_STAGE_TYPES)
 # Model modules sit directly under this package; `model_sources` lists them.
 MODEL_DIRECTORY = "python/tokenspeed/runtime/models"
 # Speculative-decoding draft modules (NextN, EAGLE, DFlash, DSpark) are shared code.
-SPECULATIVE_MODULE = re.compile(r"(?:^|_)(?:nextn|eagle\d*|dflash\d*|dspark)(?:_|$)")
+SPECULATIVE_MODULE = re.compile(r"(?:^|_)(?:nextn|eagle|dflash|dspark)\d*(?:_|$)")
 # Test sources cannot change what a served model computes.
 TEST_DIRECTORIES = ("test/runtime", "tokenspeed-kernel/test")
 # Kernel benchmark suite definitions are read only by `kernel-benchmark` tasks.

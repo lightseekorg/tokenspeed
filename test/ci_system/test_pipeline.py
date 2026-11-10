@@ -1618,7 +1618,8 @@ def test_validate_task_rejects_malformed_model_sources(tmp_path, sources):
 
 
 @pytest.mark.parametrize(
-    "module", ["gamma_nextn", "llama_eagle3", "dflash2", "minimax_m3_dspark"]
+    "module",
+    ["gamma_nextn", "llama_eagle3", "dflash2", "minimax_m3_dspark", "dspark2"],
 )
 def test_validate_task_rejects_speculative_model_sources(tmp_path, module):
     body = _default_body(
