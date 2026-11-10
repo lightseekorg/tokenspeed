@@ -741,3 +741,163 @@ def test_attn_merge_state(
     assert lse.shape == lse_a.shape
     torch.testing.assert_close(out.float(), out_ref, rtol=1e-2, atol=1e-2)
     torch.testing.assert_close(lse, lse_ref, rtol=1e-5, atol=1e-5)
+
+
+def _paged_decode_problem(
+    seq_lens: list[int],
+    rows: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    page_size: int,
+    device: str,
+):
+    """Random queries and a paged cache whose pages are shuffled across requests."""
+    pages = [max(1, -(-seq_len // page_size)) for seq_len in seq_lens]
+    page_ids = torch.randperm(sum(pages), device=device, dtype=torch.int64).int()
+    page_table = torch.zeros(
+        len(seq_lens), max(pages), device=device, dtype=torch.int32
+    )
+    start = 0
+    for req, count in enumerate(pages):
+        page_table[req, :count] = page_ids[start : start + count]
+        start += count
+    shape = (sum(pages), page_size, num_kv_heads, head_dim)
+    k_cache = torch.randn(shape, device=device, dtype=torch.bfloat16)
+    v_cache = torch.randn(shape, device=device, dtype=torch.bfloat16)
+    q = torch.randn(
+        len(seq_lens) * rows, num_q_heads, head_dim, device=device, dtype=torch.bfloat16
+    )
+    cache_seqlens = torch.tensor(seq_lens, device=device, dtype=torch.int32)
+    return q, k_cache, v_cache, page_table, cache_seqlens
+
+
+def _causal_decode_reference(
+    q, k_cache, v_cache, page_table, cache_seqlens, rows, window_left, sinks, scale
+):
+    """fp32 ``(out, natural-log lse)``: row ``t`` of ``rows`` sees the first
+    ``seq_len - (rows - 1 - t)`` keys (the last ``window_left + 1`` of them)."""
+    _, page_size, num_kv_heads, head_dim = k_cache.shape
+    group = q.shape[1] // num_kv_heads
+    outs, lses = [], []
+    for req, seq_len in enumerate(cache_seqlens.tolist()):
+        pages = page_table[req, : max(1, -(-seq_len // page_size))].long()
+        keys = k_cache[pages].reshape(-1, num_kv_heads, head_dim)[:seq_len]
+        values = v_cache[pages].reshape(-1, num_kv_heads, head_dim)[:seq_len]
+        keys = keys.float().repeat_interleave(group, dim=1)
+        values = values.float().repeat_interleave(group, dim=1)
+        scores = (
+            torch.einsum("rhd,khd->hrk", q[req * rows : (req + 1) * rows].float(), keys)
+            * scale
+        )
+        pos = torch.arange(seq_len, device=q.device)
+        end = seq_len - (rows - 1 - torch.arange(rows, device=q.device))
+        visible = pos[None, :] < end[:, None]
+        if window_left >= 0:
+            visible &= pos[None, :] >= end[:, None] - (window_left + 1)
+        scores = scores.masked_fill(~visible[None], float("-inf"))
+        lse = torch.logsumexp(scores, dim=-1)
+        if sinks is not None:
+            scores = torch.cat(
+                [scores, sinks.float()[:, None, None].expand(-1, rows, 1)], dim=-1
+            )
+            values = torch.cat([values, values.new_zeros(1, *values.shape[1:])])
+        probs = torch.softmax(scores, dim=-1).nan_to_num(0.0)
+        outs.append(torch.einsum("hrk,khd->rhd", probs, values))
+        lses.append(lse.transpose(0, 1))
+    return torch.cat(outs), torch.cat(lses)
+
+
+@pytest.mark.parametrize(
+    "rows,num_q_heads,num_kv_heads,head_dim",
+    [
+        pytest.param(8, 24, 4, 256, id="r8-gqa6-d256"),
+        pytest.param(16, 24, 4, 256, id="r16-gqa6-d256"),
+        pytest.param(4, 8, 8, 128, id="r4-mha-d128"),
+        pytest.param(1, 8, 2, 128, id="r1-gqa4-d128"),
+    ],
+)
+@pytest.mark.parametrize("window_left", [-1, 100], ids=["full", "sliding"])
+@pytest.mark.parametrize("has_sink", [False, True], ids=["no-sink", "sink"])
+def test_triton_mha_decode_folds_query_rows(
+    device: str,
+    rows: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    window_left: int,
+    has_sink: bool,
+    require,
+) -> None:
+    """Every query row of a request decoded in one pass over its keys matches
+    per-row causal attention, including rows whose prefix is empty."""
+    require("attention", "mha_decode_with_kvcache", "triton", torch.bfloat16, "q")
+    # Shorter than the rows (empty leading rows), page-aligned, and long ones.
+    seq_lens = [3, rows, 64, 333, 2049]
+    q, k_cache, v_cache, page_table, cache_seqlens = _paged_decode_problem(
+        seq_lens, rows, num_q_heads, num_kv_heads, head_dim, 64, device
+    )
+    sinks = torch.randn(num_q_heads, device=device) if has_sink else None
+    scale = head_dim**-0.5
+    expected_out, expected_lse = _causal_decode_reference(
+        q, k_cache, v_cache, page_table, cache_seqlens, rows, window_left, sinks, scale
+    )
+    result = mha_decode_with_kvcache(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        max_seqlen_k=max(seq_lens),
+        max_seqlen_q=rows,
+        window_left=window_left,
+        sinks=sinks,
+        return_lse=not has_sink,
+        softmax_scale=scale,
+        solution="triton",
+    )
+    out, lse = result if not has_sink else (result, None)
+    torch.testing.assert_close(out.float(), expected_out, rtol=2e-2, atol=2e-2)
+    if lse is not None:
+        # Rows with no key in reach report -inf, so a later merge drops them.
+        torch.testing.assert_close(lse, expected_lse, rtol=1e-4, atol=1e-4)
+
+
+def test_triton_mha_decode_folded_no_recompile_across_batches(
+    device: str, require
+) -> None:
+    """The folded decode's split count follows the batch size; it is a runtime
+    value, so serving's batch sizes share the compiled kernels."""
+    from tokenspeed_kernel.ops.attention.mha._triton.decode import (
+        _fwd_folded_kernel_stage1,
+        _fwd_folded_kernel_stage2,
+    )
+    from utils import assert_no_triton_compile
+
+    require("attention", "mha_decode_with_kvcache", "triton", torch.bfloat16, "q")
+    # One KV pool for every batch, as in serving (the pool size is part of the
+    # AMD pointer specialization; the batch must not be).
+    max_bs = 256
+    q_all, k_cache, v_cache, page_table, cache_seqlens = _paged_decode_problem(
+        [17 + 29 * i % 700 for i in range(max_bs)], 16, 24, 4, 256, 64, device
+    )
+
+    def run(bs: int, rows: int) -> None:
+        mha_decode_with_kvcache(
+            q=q_all[: bs * rows],
+            k_cache=k_cache,
+            v_cache=v_cache,
+            page_table=page_table[:bs],
+            cache_seqlens=cache_seqlens[:bs],
+            max_seqlen_k=page_table.shape[1] * 64,
+            max_seqlen_q=rows,
+            return_lse=True,
+            solution="triton",
+        )
+
+    for rows in (8, 16):
+        run(1, rows)
+    with assert_no_triton_compile(_fwd_folded_kernel_stage1, _fwd_folded_kernel_stage2):
+        for bs in (2, 3, 8, 17, 32, 64, 256):
+            for rows in (8, 16):
+                run(bs, rows)

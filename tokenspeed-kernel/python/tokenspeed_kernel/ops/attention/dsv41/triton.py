@@ -177,8 +177,10 @@ def _pack_kernel(
     FORMAT: tl.constexpr,
     SCATTER: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    slot = tl.load(Slots + row * SS).to(tl.int64) if SCATTER else row.to(tl.int64)
+    # The row reads a caller-sized input, so its offset is 64-bit like the
+    # gather's output offset; the cache side is already 64-bit through slot.
+    row = tl.program_id(0).to(tl.int64)
+    slot = tl.load(Slots + row * SS).to(tl.int64) if SCATTER else row
     if slot >= 0 and slot < CAPACITY:
         # V4 rows keep their trailing RoPE dims unquantized, so the scale groups
         # past QUANTIZED cover BF16 data. Their scale bytes are never read back;
@@ -581,7 +583,7 @@ def _compressor_tail_scatter_kernel(
     # track the batch, so it stays a runtime bound.
     CAPACITY,
 ):
-    row = tl.program_id(0)
+    row = tl.program_id(0).to(tl.int64)
     slot = tl.load(Slots + row * LS).to(tl.int64)
     if slot >= 0 and slot < CAPACITY:
         d = tl.arange(0, 512)
@@ -1357,10 +1359,11 @@ def _compressor_pool(
     O1: tl.constexpr,
     PAGES,
 ):
-    row = tl.program_id(0)
+    row = tl.program_id(0).to(tl.int64)
     channels = tl.arange(0, 512)
     live = tl.load(ACTIVE + row * A0)
-    previous = tl.load(PREVIOUS + row * P0)
+    # Both rows index the caller's projections, so they are 64-bit as well.
+    previous = tl.load(PREVIOUS + row * P0).to(tl.int64)
     slot = tl.load(SLOTS + row * S0).to(tl.int64)
     in_current = live & (previous >= 0) & (previous < N)
     # Pool capacity changes when startup replaces the probe arena. Widen
@@ -4175,7 +4178,10 @@ def _copy_attention_heads_kernel(
     S0: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    # A flat index over the destination, which grows with the step's tokens, so
+    # it is 64-bit: a wrapped index would go negative and still pass the
+    # row < tokens mask.
+    i = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     row, head, col = i // (HY * 512), i // 512 % HY, i % 512
     x = tl.load(X + row * X0 + head * X1 + col * X2, (row < tokens) & (head < HX), 0)
     tl.store(Y + row * Y0 + head * Y1 + col * Y2, x, row < tokens)
