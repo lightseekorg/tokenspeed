@@ -232,6 +232,7 @@ def test_draft_prob_verify_compiles_nothing_after_warm_up():
     draft_probs = torch.full((POOL + 1, N, VOCAB), 1.0 / VOCAB, device="cuda")
     kernels = (
         prologue.bitpacked_reduction_kernel,
+        prologue.whole_reduction_kernel,
         multistep.cumulative_unpack_kernel,
         verify.chain_speculative_verification_kernel,
     )

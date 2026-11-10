@@ -31,12 +31,16 @@ from tokenspeed_kernel.thirdparty.sonic_sampler.ops.base import (
 )
 from tokenspeed_kernel.thirdparty.sonic_sampler.ops.prologue import (
     exact_candidates,
+    exact_first,
     exact_greedy,
+    whole_normalizer,
+    whole_row,
 )
 from tokenspeed_kernel.thirdparty.sonic_sampler.ops.shard import (
     merged_candidates,
     merged_candidates_with_drafts,
     merged_first,
+    merged_whole,
 )
 from tokenspeed_kernel.thirdparty.sonic_sampler.ops.singular import greedy_maximum
 from tokenspeed_kernel.thirdparty.sonic_sampler.ops.topk.unpack import unpack_top_k
@@ -84,6 +88,59 @@ def resolve_indices(
         batch_id = tl.load(f_ptr + batch_id)
 
     return batch_id, margin, step_id
+
+
+@jit
+def whole_targets(
+    v_ptr,
+    j_ptr,
+    t_ptr,
+    row_id,
+    margin,
+    step_id,
+    score,
+    winner,
+    maximum,
+    total,
+    draft_value,
+    draft_score,
+    lookahead: tl.constexpr,
+    max_k: tl.constexpr,
+):
+    """
+    Writes a whole-vocabulary row as the chain verification reads a
+    candidate row. A draft row holds its draft at ``p(draft)`` over the whole
+    vocabulary, then the draw without the draft at probability one, so a
+    rejection takes it; the bonus row holds its draw at probability one.
+
+    Note(s):
+
+        • Slot 2 holds the row's draw with its draft included at probability
+          zero, which ``verify`` never takes and a forced cutoff reads.
+
+    """
+    offsets = tl.arange(0, max_k)
+    positions = (row_id * max_k) + offsets
+
+    if step_id < lookahead:
+
+        draft = tl.load(t_ptr + margin + step_id)
+        target = tl.where(
+            draft_value > -float("inf"), fast_expf(draft_value - maximum) / total, 0.0
+        )
+        drawn = tl.where(draft_score > score, draft, winner)
+
+        values = tl.where(offsets == 0, target, tl.where(offsets == 1, 1.0, 0.0))
+        indices = tl.where(offsets == 0, draft, tl.where(offsets == 1, winner, -1))
+        indices = tl.where(offsets == 2, drawn, indices)
+
+    else:
+
+        values = tl.where(offsets == 0, 1.0, 0.0)
+        indices = tl.where((offsets == 0) | (offsets == 2), winner, -1)
+
+    tl.store(v_ptr + positions, values)
+    tl.store(j_ptr + positions, indices)
 
 
 @jit
@@ -149,6 +206,7 @@ def cumulative_unpack_kernel(
     stride_mb: tl.constexpr = None,  # Batch Stride of Gathered Candidate Pairs.
     # Draft Probabilities the Pairs Carry as a Third Block (with ``cand_ptr``).
     m_ptr=None,  # Candidate Draft Probabilities -> [ B • (γ + 1), M ].
+    whole: tl.constexpr = False,  # Whole-Vocabulary Rows Flag (``whole_block``).
 ) -> None:
 
     # Extract the batch id from program id and load the indicator.
@@ -172,7 +230,47 @@ def cumulative_unpack_kernel(
 
     indicator = tl.load(z_ptr + batch_id)
 
-    if (indicator & 0x40) > 0:
+    if whole_row(indicator, whole, False):
+
+        # Whole-vocabulary Gumbel-max, and the draft's probability over the whole vocabulary.
+
+        if cand_ptr is not None:
+
+            score, winner, maximum, total, draft_value, draft_score = merged_whole(
+                cand_ptr, row_id, ranks, stride_mr, stride_mb, enable_pdl, max_k
+            )
+
+        else:
+
+            score, winner = exact_first(
+                s_ptr, row_id, vocab_blocks, enable_pdl, stride_s, block_v
+            )
+            maximum, total, draft_value, draft_score = whole_normalizer(
+                s_ptr, row_id, vocab_blocks, stride_s, block_v
+            )
+
+        if enable_pdl:
+
+            gdc_launch_dependents()
+
+        whole_targets(
+            v_ptr,
+            j_ptr,
+            tr_ptr,
+            row_id,
+            margin,
+            step_id,
+            score,
+            winner,
+            maximum,
+            total,
+            draft_value,
+            draft_score,
+            lookahead,
+            max_k,
+        )
+
+    elif (indicator & 0x40) > 0:
 
         # Load, reduce, and unpack greedy i.e. top-1 maximum.
 
