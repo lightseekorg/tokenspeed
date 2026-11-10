@@ -656,9 +656,13 @@ AL `2.6`:
 
 Conflicting values between the flag and JSON configuration are rejected.
 The value must be finite and speculative decoding must be enabled.
-It selects the `synthetic` rejection method. The flashinfer backend accepts it
-only over sampled drafts (`--enable-speculative-sampling`); see
-[Block verification](#block-verification-experimental).
+It selects the `synthetic` rejection method. The greedy and sonic backends
+accept it; the flashinfer backend only over sampled drafts
+(`--enable-speculative-sampling`); see
+[Block verification](#block-verification-experimental). On sonic the token at
+the cutoff is the target's draw there, taken from the candidates the verify
+kernel already selected: a greedy request's argmax, otherwise the draw sonic
+makes past a fully accepted window, with the same per-request noise.
 For block drafters with implicit widths, the upper bound is checked against
 the checkpoint's resolved verify width when the sampler is initialized.
 

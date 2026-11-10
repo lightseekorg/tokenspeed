@@ -1740,14 +1740,15 @@ class ServerArgs:
                 )
             # With sampled drafts (vLLM's draft_sample_method=probabilistic) the
             # drafter stays on the path and only the verify outcome is forced,
-            # so it uses the flashinfer verifier.
-            if self.sampling_backend != "greedy" and not (
+            # so it uses the flashinfer verifier; sonic forces either kind.
+            if self.sampling_backend not in ("greedy", "sonic") and not (
                 self.enable_speculative_sampling
                 and self.sampling_backend == "flashinfer"
             ):
                 raise ValueError(
-                    "--synthetic-acceptance-length requires --sampling-backend greedy, "
-                    "or --sampling-backend flashinfer with --enable-speculative-sampling"
+                    "--synthetic-acceptance-length requires --sampling-backend greedy "
+                    "or sonic, or --sampling-backend flashinfer with "
+                    "--enable-speculative-sampling"
                 )
             if self.speculative_eagle_topk != 1:
                 raise ValueError(
@@ -4133,7 +4134,7 @@ class ServerArgs:
             "target token, in [1, speculative_num_draft_tokens]. Forces a "
             "floor/ceil acceptance distribution; generated text is not valid "
             "for correctness evaluation. Selects the synthetic rejection method. "
-            "Requires --sampling-backend greedy (or flashinfer with "
+            "Requires --sampling-backend greedy or sonic (or flashinfer with "
             "--enable-speculative-sampling for sampled drafts) without "
             "--dp-sampling or --enable-output-logprobs. Unset disables it.",
         )
