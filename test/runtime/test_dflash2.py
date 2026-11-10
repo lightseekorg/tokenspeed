@@ -625,85 +625,59 @@ def test_the_context_write_monokernel_takes_the_column_parallel_fc(
     assert (dflash2_monokernel.context_reasons(model) == []) is served
 
 
-@pytest.mark.parametrize("fused_reduce_norm", [False, True])
-def test_preparing_the_draft_prepares_its_monokernels(fused_reduce_norm: bool) -> None:
-    """With --decode-monokernel the draft's collectives include the
-    monokernels' mailbox scratch, whether or not the regular layers' fused
-    reduce + norm is also prepared: unprepared, the monokernels never serve and
-    every draft step falls back to the layers."""
-    from tokenspeed.runtime.models import dflash2 as dflash2_model
+class _Layer(torch.nn.Module):
+    """A draft layer that adds one, and as a monokernel launch would, marks
+    the state launched; the last one may also run the final norm (it writes
+    ``lm_head_input`` and moves the step counter itself)."""
 
-    group = [0, 1, 2, 3, 4, 5, 6, 7]
-    prepared = []
-    model = DFlash2DraftModel.__new__(DFlash2DraftModel)
-    torch.nn.Module.__init__(model)
-    model.mapping = SimpleNamespace(attn=SimpleNamespace(tp_group=group))
-    # A prepared fused reduce + norm answers at once. Declining it needs an
-    # Iris group this test lacks, so that case declines without the device.
-    model.fused_reduce_norm = object() if fused_reduce_norm else None
-    if not fused_reduce_norm:
-        model._prepare_fused_reduce_norm = lambda max_num_tokens: False
-    model.monokernel_state = SimpleNamespace(
-        prepare=lambda *args: prepared.append(args)
-    )
-    with (
-        mock.patch.object(
-            dflash2_model.process_group_manager,
-            "get_device_process_group",
-            return_value="device",
-        ),
-        mock.patch.object(
-            dflash2_model.process_group_manager,
-            "get_process_group",
-            return_value="gloo",
-        ),
-        mock.patch.object(dflash2_model.dist, "get_rank", return_value=3),
-    ):
-        assert model.prepare_communication_runtime(64)
-
-    assert prepared == [("device", "gloo", 3)]
-
-
-class _BlockState(MonokernelState):
-    """A draft monokernel state whose 'last launch' wrote ``normed``."""
-
-    def __init__(self, normed: torch.Tensor | None) -> None:
-        super().__init__(torch.device("cpu"), 0)
+    def __init__(
+        self, state: MonokernelState, launches: bool, normed: torch.Tensor | None
+    ) -> None:
+        super().__init__()
+        self.state = state
+        self.launches = launches
         self.normed = normed
-        self.calls: list[str] = []
 
-    def start_step(self) -> None:
-        super().start_step()
-        self.calls.append("start")
-        self.lm_head_input = self.normed
-
-    def finish_step(self) -> torch.Tensor | None:
-        self.calls.append("finish")
-        return super().finish_step()
-
-
-class _AddOne(torch.nn.Module):
     def forward(self, *, positions, hidden_states, ctx, residual):
+        if self.launches:
+            self.state.launched = True
+        if self.normed is not None:
+            self.state.lm_head_input = self.normed
+            self.state.step[:1].add_(1)
         return hidden_states + 1, residual
 
 
-@pytest.mark.parametrize("launched", [False, True])
-def test_a_draft_block_takes_the_last_launchs_final_norm(launched: bool) -> None:
-    """The draft's run_decoder brackets its layers with start_step and
-    finish_step; when the last launch ran the final norm, finish_step's
-    output is the block's, else the model's own final norm runs."""
+@pytest.mark.parametrize("launches", ["none", "layers", "final norm"])
+def test_a_draft_block_takes_the_last_launchs_final_norm(launches: str) -> None:
+    """The draft's run_decoder resets the state before its layers and ends the
+    step after them: when the last launch ran the final norm, its output is
+    the block's, else the model's own final norm runs; the step counter moves
+    once for a block with launches, and not for one without."""
     model = DFlash2DraftModel.__new__(DFlash2DraftModel)
     torch.nn.Module.__init__(model)
-    model.layers = torch.nn.ModuleList([_AddOne(), _AddOne()])
+    state = MonokernelState(torch.zeros(1, dtype=torch.int64))
+    # A previous block's leftovers, which the reset must clear.
+    state.launched = True
+    state.lm_head_input = torch.full((2, 3), -7.0)
     normed = torch.full((2, 3), 9.0)
-    model.monokernel_state = _BlockState(normed if launched else None)
+    model.monokernel_state = state
+    model.layers = torch.nn.ModuleList(
+        [
+            _Layer(state, launches != "none", None),
+            _Layer(
+                state, launches != "none", normed if launches == "final norm" else None
+            ),
+        ]
+    )
     model.final_norm = lambda hidden_states, residual: -hidden_states
     hidden = torch.zeros(2, 3)
 
     out = model.run_decoder(torch.zeros(2), hidden, torch.zeros(2, 3), None)
 
-    assert model.monokernel_state.calls == ["start", "finish"]
-    torch.testing.assert_close(out, normed if launched else -(hidden + 2))
+    want = normed if launches == "final norm" else -(hidden + 2)
+    torch.testing.assert_close(out, want)
+    assert state.lm_head_input is None
+    assert int(state.step[0]) == (0 if launches == "none" else 1)
 
 
 @pytest.mark.parametrize("switch", [False, True])
