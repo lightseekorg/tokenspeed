@@ -101,8 +101,9 @@ For an NVFP4 checkpoint with floating attention projections, use
 --quantization nvfp4 --enable-fp8-attn-proj
 ```
 
-GDN splits its input into an FP8 QKVZ GEMM and a floating BA GEMM. With an
-auxiliary stream, BA overlaps QKVZ and joins before the attention boundary.
+GDN splits its input into an FP8 QKVZ GEMM and a floating BA GEMM. Any split
+QKVZ/BA projection uses BA overlap when an auxiliary stream is available,
+regardless of quantization format. The streams join before the attention boundary.
 The standard FP8 exclusions cover BA, convolution, Mamba mixer projections,
 grouped `wo_a` and explicit checkpoint exclusions.
 With the switch off, floating GDN checkpoint projections stay floating even

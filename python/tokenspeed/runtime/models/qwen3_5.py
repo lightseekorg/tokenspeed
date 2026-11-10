@@ -368,18 +368,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             self._ba_dim = (self.num_v_heads * 2) // self.attn_tp_size
             self._bind_packed_weight_loaders(self.in_proj_qkvzba)
 
-        self._ba_fork = StreamFork(
-            alt_stream
-            if (
-                fp8_proj
-                and self._split_in_proj
-                and isinstance(quant_config, Fp8Config)
-                and quant_config.weight_block_size is not None
-                and not qkvz_unquant
-                and ba_unquant
-            )
-            else None
-        )
+        self._ba_fork = StreamFork(alt_stream if self._split_in_proj else None)
 
         # Conv1d weight loader setup
         query_key_settings = (self.key_dim, 0, False)
@@ -583,16 +572,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
     ):
         projection_input = hidden_states if hidden_fp8 is None else hidden_fp8
         if self._split_in_proj:
-            if self._ba_fork.aux_stream is None:
-                projected_states_qkvz, _ = self.in_proj_qkvz(projection_input)
-                projected_states_ba, _ = self.in_proj_ba(hidden_states)
-                return projected_states_qkvz, projected_states_ba
             main_stream = torch.cuda.current_stream(hidden_states.device)
-            hidden_states.record_stream(self._ba_fork.aux_stream)
             # Events fork after input production and join before either output
             # is consumed. PDL remains local to each stream, including in graphs.
             with self._ba_fork.scope(enable=True, overlap=True) as fork:
                 with fork.branch():
+                    hidden_states.record_stream(
+                        torch.cuda.current_stream(hidden_states.device)
+                    )
                     projected_states_ba, _ = self.in_proj_ba(hidden_states)
                 projected_states_qkvz, _ = self.in_proj_qkvz(projection_input)
             # BA is allocated on aux but consumed on main after the join.
