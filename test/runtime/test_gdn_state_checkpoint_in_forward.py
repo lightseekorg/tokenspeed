@@ -130,6 +130,7 @@ def _scheduler(ts, make_config, *, in_forward: bool):
             host_write_policy="write_through",
             prefill_decode_interval=0,
             storage_config=None,
+            prefill_compute_budget=None,
             cache_groups=groups,
             state_checkpoint_in_forward=in_forward,
         )

@@ -304,11 +304,12 @@ private:
     FirstChunkOutcome schedulePrefillFirstChunk(ExecutionPlan& plan, AdmissionFeedback& feedback, Request* request,
                                                 std::int32_t remaining, std::int32_t decode_input_tokens,
                                                 std::int64_t kv_token_limit, std::int32_t yield_tokens,
-                                                bool must_complete);
+                                                bool must_complete, double compute_spent_ns);
     std::optional<fsm::SchedulePrefillEvent> schedulePrefill(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                              Request* request, std::int32_t remaining,
                                                              std::int32_t reserve_num_tokens_in_next_schedule_event,
-                                                             std::int64_t kv_token_limit, std::int32_t yield_tokens);
+                                                             std::int64_t kv_token_limit, std::int32_t yield_tokens,
+                                                             double compute_spent_ns);
     std::optional<fsm::ScheduleDecodeEvent> scheduleDecode(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                            Request* request);
 
@@ -470,6 +471,7 @@ private:
         std::unordered_set<const Request*> scheduled;
         std::int32_t token_budget{0};
         std::int32_t kv_page_budget{0};
+        double prefill_compute_spent_ns{0};
         // Budget the decode batch must leave untouched for a pending local
         // prefill that cannot advance in smaller chunks (MinPrefillChunkTokens;
         // fused mixed mode only).
@@ -505,6 +507,10 @@ private:
                     static_cast<std::int32_t>((end + config_.prefix_granularity - 1) / config_.prefix_granularity);
             }
             build.pushed_prefill = true;
+            if (config_.prefill_compute) {
+                build.prefill_compute_spent_ns +=
+                    config_.prefill_compute->Cost(operation.input_length, operation.extend_prefix_len);
+            }
         } else if (config_.role != Role::kD) {
             build.token_budget -= operation.input_length;
         }
@@ -523,7 +529,7 @@ private:
                                                              std::int32_t decode_reserve,
                                                              std::vector<LoadBackOperation>& load_backs,
                                                              std::int32_t kv_page_budget, std::int32_t yield_tokens,
-                                                             bool must_complete);
+                                                             bool must_complete, double compute_spent_ns);
 
     // SchedulerConfig::prefill_chunk_yield_tokens (docs/design/scheduler.md
     // §1.1): a Submitted prompt a chunk that cannot finish may carry in its

@@ -473,6 +473,7 @@ def _decode_batch(bs: int, width: int):
             host_write_policy="write_through",
             prefill_decode_interval=0,
             storage_config=None,
+            prefill_compute_budget=None,
             decode_input_tokens=width,
             cache_groups=[
                 ts.CacheGroupConfig(

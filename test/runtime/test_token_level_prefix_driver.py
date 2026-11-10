@@ -84,6 +84,7 @@ def _scheduler(*, with_state: bool = False) -> ts.Scheduler:
             host_write_policy="write_through",
             prefill_decode_interval=0,
             storage_config=None,
+            prefill_compute_budget=None,
             cache_groups=groups,
         )
     )

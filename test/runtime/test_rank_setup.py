@@ -174,6 +174,7 @@ def test_make_config_requires_and_maps_the_host_write_policy():
         host_group_packing=(),
         max_retracted_requests=0,
         storage_config=None,
+        prefill_compute_budget=None,
         prefill_decode_interval=0,
     )
     # Keyword-only and required, with or without a Host tier.
@@ -990,6 +991,7 @@ def test_make_config_sets_the_prefill_chunk_yield_only_when_on():
         storage_config=None,
         host_write_policy="write_through",
         prefill_decode_interval=0,
+        prefill_compute_budget=None,
     )
     assert make_config(**fields).prefill_chunk_yield_tokens == 0
     assert (

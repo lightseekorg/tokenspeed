@@ -1029,3 +1029,52 @@ Before benchmarking:
 - confirm GPU visibility and process placement
 - compare output correctness before tuning throughput
 - keep the full launch command with benchmark results
+
+## Prefill compute budget
+
+For attention-DP prefill, equal token counts can hide very different work:
+each new token attends to its request's entire available prefix. The opt-in
+`--prefill-compute-budget BUDGET_MS TOKEN_NS PAIR_NS REQUEST_NS` limits each
+rank's scheduled prefill by predicted compute time as well as
+`--chunked-prefill-size`. All four values must be supplied. Omit the option
+for ordinary token-based scheduling. Build `tokenspeed-scheduler` from the
+same checkout to use this experimental option.
+
+Fit non-negative coefficients from timings on the intended model, GPU,
+attention backend, and parallel mapping:
+
+```
+cost_ns(q, c) = REQUEST_NS + TOKEN_NS*q + PAIR_NS*q*(c + (q+1)/2)
+```
+
+`q` includes replay input, and `c` is the prefix preceding that input. Use
+identical calibration and budget on ranks that synchronize together. The
+scheduler makes chunks smaller for longer prefixes; it preserves actual
+cache hits, junction checkpoints, final replay windows, and capacity admission.
+The `--chunk-prefill-kv-size` limit also applies when configured. One
+minimum-sized prefill may exceed the soft time budget to reach a required
+checkpoint boundary or carry the final window, while obeying the hard token
+and KV-page limits. Decodes retain their scheduling priority and do not consume this
+prefill budget, so it is not a latency cap for a mixed prefill/decode round.
+
+Calibrate the rank-local work being balanced, including projection and linear
+attention costs when applicable. A K3 MLA-only kernel fit does not measure
+KDA, MoE, or communication, and must not be presented as a full-model fit.
+Sparse attention and backend switches may require a different model. There
+is no online fitting, cross-rank minimum-budget negotiation, request migration,
+or compute-aware ingress routing in this option. Under low load, smaller
+chunks can increase total steps and hurt latency. Compare throughput and
+TTFT as well as rank imbalance before enabling it for a workload.
+
+This balances work within a round; it does not redistribute a persistent
+backlog on one rank. Single-GPU attention measurements composed into DP
+plans showed benefits when ranks had equal total work in different orders,
+but regressions when long-prefix work stayed on one rank or every rank was
+already balanced. These are derived component estimates, not measured
+distributed or full-model serving speedups. See the benchmark's
+[measured results and limits](https://github.com/lightseekorg/tokenspeed/blob/main/tokenspeed-scheduler/benchmarks/results/prefill_compute_b300.md).
+
+The [reproduction benchmark](https://github.com/lightseekorg/tokenspeed/blob/main/tokenspeed-scheduler/benchmarks/README.md)
+compares identical token workloads with uniform contexts, mixed contexts, and
+prefix-length skew. Model estimates and synchronized GPU component timings
+are reported separately.

@@ -411,6 +411,7 @@ class ServerArgs:
     max_num_seqs: int | None = None
     max_total_tokens: int | None = None
     chunked_prefill_size: int | None = None
+    prefill_compute_budget: list[float] | None = None
     max_prefill_tokens: int = 8192
     # Optional bound on summed per-request KV pages in a local prefill batch.
     chunk_prefill_kv_size: int | None = None
@@ -3083,6 +3084,18 @@ class ServerArgs:
             type=int,
             default=ServerArgs.chunked_prefill_size,
             help="Maximum number of tokens the scheduler may issue in a single iteration. Setting this to -1 disables chunked prefill.",
+        )
+        parser.add_argument(
+            "--prefill-compute-budget",
+            type=float,
+            nargs=4,
+            metavar=("BUDGET_MS", "TOKEN_NS", "PAIR_NS", "REQUEST_NS"),
+            default=ServerArgs.prefill_compute_budget,
+            help="Experimental per-rank prefill time budget and fitted cost coefficients: "
+            "request_ns + token_ns*q + pair_ns*q*(c+(q+1)/2). "
+            "Use the same hardware/model/backend calibration on all attention-DP ranks. "
+            "The first prefill may exceed this soft budget to make progress; "
+            "--chunked-prefill-size remains a hard limit.",
         )
         parser.add_argument(
             "--prefill-chunk-yield-tokens",
