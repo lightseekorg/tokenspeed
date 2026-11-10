@@ -19,6 +19,7 @@ from tokenspeed.runtime.execution.drafter.mtp import (
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.input_buffer import InputBuffers
+from tokenspeed.runtime.layers.logits_processor_output import LogitsProcessorOutput
 from tokenspeed.runtime.multimodal.inputs import (
     Modality,
     MultimodalDataItem,
@@ -1063,11 +1064,11 @@ def test_sample_draft_step_keeps_argmax_when_the_flag_is_off():
     logits = torch.tensor([[0.0, 3.0, 1.0], [2.0, 0.0, 1.0]])
     fused = torch.tensor([7, 8], dtype=torch.int32)
     out = drafter.sample_draft_step(
-        SimpleNamespace(next_token_logits=logits, next_token_ids=fused), step=0
+        LogitsProcessorOutput(next_token_logits=logits, next_token_ids=fused), step=0
     )
     assert out is fused
     out = drafter.sample_draft_step(
-        SimpleNamespace(next_token_logits=logits, next_token_ids=None), step=0
+        LogitsProcessorOutput(next_token_logits=logits, next_token_ids=None), step=0
     )
     assert out.tolist() == [1, 0]
     # The verifier's pools are not consulted without draft_probs.
@@ -1101,7 +1102,7 @@ def test_bind_refuses_block_drafters_and_arms_chain_drafters(monkeypatch):
     # Forgetting to bind is loud, not a silent all-reject verifier.
     with pytest.raises(RuntimeError, match="bind_sampling_backend"):
         block.sample_draft_step(
-            SimpleNamespace(
+            LogitsProcessorOutput(
                 next_token_logits=torch.zeros(1, VOCAB), next_token_ids=None
             ),
             step=0,
@@ -1140,7 +1141,7 @@ def test_bind_refuses_block_drafters_and_arms_chain_drafters(monkeypatch):
 
     monkeypatch.setattr(eagle.draft_sampler, "propose", fake_propose)
     eagle.sample_draft_step(
-        SimpleNamespace(next_token_logits=torch.zeros(2, 3), next_token_ids=None),
+        LogitsProcessorOutput(next_token_logits=torch.zeros(2, 3), next_token_ids=None),
         step=1,
     )
     assert seen == dict(step=1, rows=2)
@@ -1158,7 +1159,9 @@ def test_bind_refuses_block_drafters_and_arms_chain_drafters(monkeypatch):
     assert len(full_vocab_requests) == 2
     monkeypatch.setattr(mtp.draft_sampler, "propose", fake_propose)
     mtp.sample_draft_step(
-        SimpleNamespace(next_token_logits=torch.zeros(3, VOCAB), next_token_ids=None),
+        LogitsProcessorOutput(
+            next_token_logits=torch.zeros(3, VOCAB), next_token_ids=None
+        ),
         step=1,
     )
     assert seen == dict(step=1, rows=3)

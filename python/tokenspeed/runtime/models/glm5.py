@@ -1324,6 +1324,7 @@ class GlmDsaSparseAttentionMixin:
         projected_q: torch.Tensor | None = None,
         index_query: torch.Tensor | None = None,
         index_key_weights: torch.Tensor | None = None,
+        written_index_query: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """DSA sparse MLA after the a-projections.
 
@@ -1351,6 +1352,15 @@ class GlmDsaSparseAttentionMixin:
                 ahead from the attention input, unit inner stride; the
                 indexer then skips its own projection of ``hidden_states``.
                 None projects them in the indexer.
+            written_index_query: Optional decode-round E4M3 index queries
+                ``[T, index_heads, index_head_dim]`` and FP32 head weights
+                ``[T, index_heads]`` (``quantize_index_query_weights``' outputs)
+                from a launch that also wrote the round's index keys
+                (``index_k_layernorm_fp8_scatter``'s bytes); the core then skips
+                its index-K write. Every row must decode, without KV
+                placement, under ``index_k_write_quantizes_query``, and the
+                keys must be the caller's ``index_key_weights``. None writes
+                the keys here.
 
         Returns:
             ``[T, num_local_heads * v_head_dim]`` attention output before
@@ -1358,11 +1368,23 @@ class GlmDsaSparseAttentionMixin:
         """
         if output_gate is not None and ctx.num_extends > 0:
             raise ValueError("the DSA value projection gates decode rounds only")
+        if written_index_query is not None and (
+            ctx.num_extends > 0
+            or not self.index_k_write_quantizes_query
+            or index_key_weights is None
+        ):
+            raise ValueError(
+                "a written index query serves decode rounds whose index-K write "
+                "quantizes the query (index_k_write_quantizes_query) over the "
+                "keys the caller projected (index_key_weights)"
+            )
         decode_metadata = getattr(ctx.attn_backend, "forward_decode_metadata", None)
         num_attn_tokens = int(q_norm.shape[0])
         # Narrow padded-replay inputs to live rows; _land_in restores the bucket shape.
         valid_rows = current_valid_rows()
         if valid_rows is not None and valid_rows < num_attn_tokens:
+            if written_index_query is not None:
+                raise RuntimeError("a written index query cannot be narrowed")
             if positions.dim() != 1:
                 raise RuntimeError("padded DSA replay expects 1-D positions")
             if comm_manager.needs_pre_attn_all_gather():
@@ -1438,6 +1460,8 @@ class GlmDsaSparseAttentionMixin:
                 or (num_decode_tokens > 0 and shared_topk.decode is None)
             )
         )
+        if written_index_query is not None and not should_compute_indexer:
+            raise RuntimeError("a written index query needs the layer's own top-k")
         decode_ctx = None
         if num_decode_tokens > 0:
             decode_ctx = replace(
@@ -1486,9 +1510,18 @@ class GlmDsaSparseAttentionMixin:
             index_slots, index_mask = resolve_write_slots(
                 out_cache_loc, placement, shared_topk
             )
+            if written_index_query is not None:
+                if num_prefill_tokens > 0 or placement is not None:
+                    raise RuntimeError(
+                        "a written index query needs a decode round without KV "
+                        "placement"
+                    )
+                indexer_output = replace(
+                    indexer_output, quantized_query=written_index_query
+                )
             # Decode rounds only (every row decodes); the KV-parallel top-k
             # quantizes its own index queries.
-            if (
+            elif (
                 self.index_k_write_quantizes_query
                 and num_prefill_tokens == 0
                 and placement is None

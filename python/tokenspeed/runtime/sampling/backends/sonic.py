@@ -52,6 +52,11 @@ exact fp32 top-``MAX_K``). Every rank merges the same gathered bytes with the
 same slot state and noise, so sharded draws agree across ranks without the TP
 sync broadcast.
 
+Synthetic acceptance (``--synthetic-acceptance-length``, benchmarking only)
+runs the verify for its cost and then forces each request's length; the
+token at the cutoff comes from the candidates the verify selected
+(``_synthetic_outputs``).
+
 Not yet supported: DP-sampling, draft trees, top-k output logprobs, EAGLE3
 ``d2t`` cross-vocab.
 
@@ -177,6 +182,8 @@ class SonicSamplingBackend(SamplingBackend):
 
     _HAS_POOL_STATE = True
     _SUPPORTS_DP_VERIFY = False
+    # Forced lengths over sonic's verify; see ``_synthetic_outputs``.
+    _SUPPORTS_SYNTHETIC_ACCEPTANCE = True
 
     # Prompt token counts the runtime never fills: every slot reads zeros.
     constant_slot_state = ("state.context_counts", "_exact_state.context_counts")
@@ -236,13 +243,23 @@ class SonicSamplingBackend(SamplingBackend):
                 self.accept_buf = torch.empty((self.max_bs,), dtype=torch.int32)
                 self.values = torch.empty((rows, MAX_K), dtype=torch.float32)
                 self.indices = torch.empty((rows, MAX_K), dtype=torch.int32)
+                # Synthetic acceptance's target token per request.
+                self.synthetic_tokens = torch.empty((self.max_bs,), dtype=torch.int32)
 
             # Vocabulary-sharded rows: this rank's candidates and every rank's.
             self._shard_ranks = self._vocab_shard_ranks(config)
+            # Candidates carry draft probabilities recorded over each rank's shard: a third block, and their merged copy.
+            self._candidate_drafts: torch.Tensor | None = None
             if self._shard_ranks is not None:
-                self._shard_pairs = torch.empty((rows, 2 * MAX_K), dtype=torch.float32)
+                width = 2 * MAX_K
+                if self.spec and config.enable_speculative_sampling:
+                    width = 3 * MAX_K
+                    self._candidate_drafts = torch.empty(
+                        (rows, MAX_K), dtype=torch.float32
+                    )
+                self._shard_pairs = torch.empty((rows * width,), dtype=torch.float32)
                 self._shard_landing = torch.empty(
-                    (self._shard_ranks * rows, 2 * MAX_K), dtype=torch.float32
+                    (self._shard_ranks * rows * width,), dtype=torch.float32
                 )
 
             # fp32 temperature, top-p, min-p and penalties, read with fp32 logits so none rounds to bf16.
@@ -308,6 +325,11 @@ class SonicSamplingBackend(SamplingBackend):
         )
 
     @override
+    def verifies_vocab_shard_draft_probs(self) -> bool:
+        # Each rank's candidates carry q over its own columns through the gather.
+        return self._shard_ranks is not None
+
+    @override
     def speculative_sampling_pools(self) -> SpeculativeSamplingPools:
         """The slot state's own rows, which the drafter samples its proposals with.
 
@@ -322,18 +344,24 @@ class SonicSamplingBackend(SamplingBackend):
             seed=self.state.seeds,
         )
 
-    def _vocab_shard(self, shard: SampledVocabShard, rows: int) -> sonic.VocabShard:
+    def _gather_pairs(
+        self, staged: torch.Tensor, tp_size: int, tp_group: tuple[int, ...]
+    ) -> torch.Tensor:
+        """Every rank's ``[rows, w]`` candidate pairs as ``[tp_size, rows, w]``, landing in this backend's buffer."""
+        rows, width = staged.shape
+        landing = self._shard_landing[: tp_size * rows * width]
+        return gather_topk_pairs(
+            staged, landing.view(tp_size * rows, width), tp_size, tp_group
+        )
+
+    def _vocab_shard(self, shard: SampledVocabShard) -> sonic.VocabShard:
         """The launch's view of ``shard``: its slice of the vocabulary and the gather of every rank's candidates."""
-        landing = self._shard_landing[: shard.tp_size * rows]
         return sonic.VocabShard(
             vocab_start=shard.vocab_start,
             logit_scale=shard.logit_scale,
             softcap=shard.softcap,
             gather=functools.partial(
-                gather_topk_pairs,
-                landing=landing,
-                tp_size=shard.tp_size,
-                tp_group=shard.tp_group,
+                self._gather_pairs, tp_size=shard.tp_size, tp_group=shard.tp_group
             ),
             pairs=self._shard_pairs,
         )
@@ -346,14 +374,17 @@ class SonicSamplingBackend(SamplingBackend):
         *,
         draft_q: DraftTreeQ | None,
         with_vocab_mask: bool,
+        draft_probs: torch.Tensor | None,
     ) -> None:
         """Launch every batch size once over dummy shard logits, as ``_warmup`` does over whole rows.
 
         Every rank runs the same launches, so their gathers pair up. Grammar
         masks change no sonic kernel (they are slot state); sonic reads the
-        dense ``draft_probs``, not the sparse ``draft_q``.
+        runtime's ``draft_probs`` (whole rows or this rank's columns), not the
+        sparse ``draft_q``.
         """
         del candidates, draft_q, with_vocab_mask
+        columns = self.vocab_size if draft_probs is None else draft_probs.shape[2]
         with torch.device(self.device):
             logits = torch.zeros(
                 (self.max_bs * self.n_max, shard.logits.shape[1]),
@@ -367,29 +398,37 @@ class SonicSamplingBackend(SamplingBackend):
             for bs in range(1, self.max_bs + 1):
                 self._fused_singular(logits[:bs], slots[:bs], offsets, shard=shard)
                 if self.spec:
-                    for draft_probs in self._warmup_draft_tables():
-                        self._fused_multistep(
+                    for table in self._warmup_draft_tables(columns):
+                        verified = self._fused_multistep(
                             logits[: bs * self.n_max],
                             slots[:bs],
                             offsets,
                             cand[:bs],
                             shard=shard,
-                            draft_probs=draft_probs,
+                            draft_probs=table,
                         )
+                        if self._synthetic_lengths is not None:
+                            self._synthetic_outputs(
+                                cand[:bs], slots[:bs], offsets, *verified, row_offset=0
+                            )
         self.reset_capture_state()
 
     # ------------------------------------------------------------------ #
     # JIT warm-up
     # ------------------------------------------------------------------ #
-    def _warmup_draft_tables(self) -> tuple[torch.Tensor | None, ...]:
-        """The draft-probability tables serving verifies with: none, and a one-slot table under ``enable_speculative_sampling`` (its strides are the runtime's)."""
+    def _warmup_draft_tables(
+        self, columns: int | None = None
+    ) -> tuple[torch.Tensor | None, ...]:
+        """The draft-probability tables serving verifies with: none, and a one-slot table of ``columns`` (default the vocabulary) under ``enable_speculative_sampling``, its strides the runtime's."""
 
         if not self.config.enable_speculative_sampling:
 
             return (None,)
 
         table = torch.zeros(
-            (1, self.n_max, self.vocab_size), dtype=torch.float32, device=self.device
+            (1, self.n_max, columns or self.vocab_size),
+            dtype=torch.float32,
+            device=self.device,
         )
 
         return (None, table)
@@ -427,13 +466,19 @@ class SonicSamplingBackend(SamplingBackend):
 
                     for draft_probs in self._warmup_draft_tables():
 
-                        self._fused_multistep(
+                        verified = self._fused_multistep(
                             logits[: bs * self.n_max],
                             slots[:bs],
                             offsets,
                             cand[:bs],
                             draft_probs=draft_probs,
                         )
+
+                        if self._synthetic_lengths is not None:
+
+                            self._synthetic_outputs(
+                                cand[:bs], slots[:bs], offsets, *verified, row_offset=0
+                            )
 
         # The warm-up gathered slot 0 with counting on; leave it clean.
         self.reset_capture_state()
@@ -661,7 +706,7 @@ class SonicSamplingBackend(SamplingBackend):
             self.scratchpad[:bs],
             config or pick(width, bs),
             enable_pdl=pdl_enabled(),
-            shard=None if shard is None else self._vocab_shard(shard, bs),
+            shard=None if shard is None else self._vocab_shard(shard),
         )
 
     def _sample_rows(
@@ -785,12 +830,55 @@ class SonicSamplingBackend(SamplingBackend):
             self.indices[: bs * n],
             config or pick(logits.shape[1], bs * n),
             enable_pdl=pdl_enabled(),
-            shard=None if shard is None else self._vocab_shard(shard, bs * n),
+            shard=None if shard is None else self._vocab_shard(shard),
             draft_probs=draft_probs,
             reject_threshold=self.config.spec_reject_draft_prob_threshold,
+            candidate_drafts=self._candidate_drafts,
         )
 
         return drafted, accepted
+
+    def _synthetic_outputs(
+        self,
+        candidates: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        offsets: torch.Tensor,
+        drafted: torch.Tensor,
+        accepted: torch.Tensor,
+        *,
+        row_offset: int,
+    ) -> None:
+        """Replace a verify's outcome with the synthetic acceptance lengths.
+
+        Each request keeps its first ``L - 1`` drafts and then the target's
+        token at position ``L - 1`` (``sonic.synthetic_targets``, drawn from
+        the candidates the verify just left), as the greedy and flashinfer
+        backends override theirs. The decode counts that penalties read keep
+        the verify's own tokens: synthetic output is for benchmarking only.
+
+        Args:
+            candidates: ``[bs, n]`` the verified window (last token, drafts).
+            slot_mapping: ``[bs]`` slot of each request.
+            offsets: The verify's per-slot Philox offsets.
+            drafted: ``[bs, n]`` the verify's output tokens; rewritten.
+            accepted: ``[bs, 1]`` the verify's accepted drafts; rewritten.
+            row_offset: The requests' first row in the step's full batch.
+        """
+        bs, n = candidates.shape
+        lengths = self.synthetic_lengths(candidates, row_offset)
+        tokens = sonic.synthetic_targets(
+            self.values[: bs * n],
+            self.indices[: bs * n],
+            self.state,
+            slot_mapping,
+            offsets,
+            lengths,
+            self.synthetic_tokens[:bs],
+            enable_pdl=pdl_enabled(),
+        )
+        drafted[:, : n - 1].copy_(candidates[:, 1:])
+        drafted.scatter_(1, (lengths - 1).long()[:, None], tokens[:, None])
+        accepted.copy_((lengths - 1)[:, None])
 
     @override
     @nvtx_range("sampling:verify", color="yellow")
@@ -846,14 +934,27 @@ class SonicSamplingBackend(SamplingBackend):
 
             self._scatter_grammar(sampling_info.vocab_mask, slot_mapping, bs, n)
 
+        offsets = self._prepare_sampling_offsets(sampling_info)
         predict, accepted = self._fused_multistep(
             logits,
             slot_mapping,
-            self._prepare_sampling_offsets(sampling_info),
+            offsets,
             candidates,
             shard=shard,
             draft_probs=sampling_info.draft_probs,
         )
+
+        # Benchmark acceptance replaces the outcome after the verify ran for its cost.
+        if self._synthetic_lengths is not None:
+
+            self._synthetic_outputs(
+                candidates,
+                slot_mapping,
+                offsets,
+                predict,
+                accepted,
+                row_offset=sampling_info.batch_row_offset,
+            )
 
         predict = predict.view(-1)
         accept_lengths = torch.add(accepted.view(-1), 1, out=self.accept_buf[:bs])

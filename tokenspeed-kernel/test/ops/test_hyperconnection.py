@@ -55,13 +55,21 @@ WIDE = HC_COUNT * HIDDEN_SIZE
 def _fused_diagnostic_workspace(device: torch.device, projection_rows: int):
     from tokenspeed_kernel.ops.residual.cute_fused import _workspace_for_plan
 
-    return _workspace_for_plan(
+    clusters = (projection_rows + 63) // 64
+    activation, _, epochs = _workspace_for_plan(
         device,
         projection_rows,
+        ((projection_rows + 31) // 32) * 32,
         1,
-        (projection_rows + 63) // 64,
+        clusters,
+        clusters,
         16,
+        LOWRANK,
+        1,
+        16,
+        1,
     )
+    return activation, epochs
 
 
 @pytest.fixture(autouse=True)
@@ -1188,6 +1196,36 @@ def test_fused_cluster_split_k_does_not_exceed_sixteen():
 
     with pytest.raises(ValueError, match="split-K"):
         FusedGatedResidualKernel(
+            hc_count=4,
+            hidden_size=2560,
+            lowrank=320,
+            up_k=128,
+            down_k_order="interleaved",
+            down_token_parts=1,
+            epilogue_threads=128,
+            token_major_up=False,
+            up_token_tail_overlap=False,
+            up_output_parts=1,
+            up_token_parts=1,
+            up_stage_counts=None,
+            rotate_up_k=False,
+            partial_stride=352,
+            reduction_groups=1,
+            token_tile_batches=1,
+            up_clusters=0,
+            pin_up_activation=False,
+            reuse_down_storage=False,
+            evict_up_weights_first=True,
+            evict_down_weights_first=False,
+            pipelines_per_cta=1,
+            up_columns=256,
+            pipeline_shared_budget=227 * 1024,
+            down_pair_reduction="auto",
+            down_producer_mode="auto",
+            up_activation_ready_mode="auto",
+            up_l2_prefetch_k=0,
+            up_sigmoid_mode="exp_rcp",
+            down_x_cache_mode="native",
             projection_tile=64,
             token_tile=8,
             projection_rows=324,
