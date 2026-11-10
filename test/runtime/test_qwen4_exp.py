@@ -1628,9 +1628,16 @@ def test_attention_dp_mtp_shares_target_head_layout(monkeypatch, rank, attn_tp):
 
 
 @pytest.mark.parametrize("rank", range(8))
-def test_attention_dp_mtp_shares_vocab_sharded_head(monkeypatch, rank):
+@pytest.mark.parametrize("attn_tp,head_tp", [(1, 2), (2, 8)])
+def test_attention_dp_mtp_shares_vocab_sharded_head(
+    monkeypatch, rank, attn_tp, head_tp
+):
     mapping = Mapping(
-        rank=rank, world_size=8, attn_tp_size=1, attn_dp_size=8, lm_head_tp_size=2
+        rank=rank,
+        world_size=8,
+        attn_tp_size=attn_tp,
+        attn_dp_size=8 // attn_tp,
+        lm_head_tp_size=head_tp,
     )
     config = PretrainedConfig(
         hc_count=4,
@@ -1651,10 +1658,11 @@ def test_attention_dp_mtp_shares_vocab_sharded_head(monkeypatch, rank):
     start = mapping.lm_head.tp_rank * width
     with torch.no_grad():
         target.lm_head.weight.copy_(full_weight[start : start + width])
-    draft.set_embed_and_head(target.model.embed_tokens.weight, target.lm_head.weight)
-    rows = [1 + r % 3 for r in range(8)]
+    draft.set_embed_and_head_module(target.model.embed_tokens.weight, target.lm_head)
+    assert draft.lm_head is target.lm_head
+    rows = [1 + (r // attn_tp) % 3 for r in range(8)]
     hidden = [
-        torch.arange(n * 4, dtype=torch.float32).reshape(n, 4) / 7 + r
+        torch.arange(n * 4, dtype=torch.float32).reshape(n, 4) / 7 + r // attn_tp
         for r, n in enumerate(rows)
     ]
 
@@ -1685,6 +1693,34 @@ def test_attention_dp_mtp_shares_vocab_sharded_head(monkeypatch, rank):
             dim=1,
         )
 
+    def reduce_hidden(local, group):
+        assert group == mapping.lm_head.tp_group
+        distinct = torch.cat(hidden[::attn_tp])
+        expected = torch.zeros_like(distinct)
+        if rank % attn_tp == 0:
+            start = sum(rows[:rank:attn_tp])
+            expected[start : start + rows[rank]] = hidden[rank]
+        torch.testing.assert_close(local, expected)
+        return distinct
+
+    def gather_vocab(output, local, group):
+        assert group == mapping.lm_head.tp_group
+        all_hidden = torch.cat(hidden[::attn_tp])
+        torch.testing.assert_close(
+            local, torch.nn.functional.linear(all_hidden, draft.lm_head.weight)
+        )
+        output.copy_(
+            torch.cat(
+                [
+                    torch.nn.functional.linear(all_hidden, shard)
+                    for shard in full_weight.split(width, dim=0)
+                ],
+                dim=0,
+            )
+        )
+
+    monkeypatch.setattr(logits_module, "all_reduce", reduce_hidden)
+    monkeypatch.setattr(logits_module, "all_gather_single", gather_vocab)
     monkeypatch.setattr(logits_module, "token_all_gather", gather)
     monkeypatch.setattr(logits_module, "all_to_all_transpose", transpose)
     metadata = LogitsMetadata(
@@ -1699,6 +1735,35 @@ def test_attention_dp_mtp_shares_vocab_sharded_head(monkeypatch, rank):
     torch.testing.assert_close(
         actual, torch.nn.functional.linear(hidden[rank], full_weight)
     )
+
+    # Exercise the model wrapper too: MTP step zero receives four verify rows
+    # per request but the transformer narrows them before the LM head. Only
+    # transformer weights/GPU input fusion and collective transport are mocked.
+    def transformer_forward(input_ids, positions, ctx, *, input_embeds):
+        return input_embeds[::4], None
+
+    monkeypatch.setattr(draft.model, "forward", transformer_forward)
+    expanded = hidden[rank].repeat_interleave(4, dim=0)
+    monkeypatch.setattr(draft, "_fuse_inputs", lambda embedding, captured: expanded)
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=rows[rank],
+        num_extends=0,
+        input_num_tokens=4 * rows[rank],
+        output_layout=None,
+        forward_mode=ForwardMode.DECODE,
+        all_decode_or_idle=True,
+        global_num_tokens=[4 * n for n in rows],
+        global_bs=rows,
+        gather_ids=4 * torch.arange(rows[rank]) + 3,
+    )
+    ids = torch.zeros(4 * rows[rank], dtype=torch.int64)
+    result = draft(ctx, ids, torch.arange(ids.numel()), captured_hidden_states=expanded)
+    torch.testing.assert_close(
+        result.next_token_logits, torch.nn.functional.linear(hidden[rank], full_weight)
+    )
+    assert ctx.collective_global_num_tokens is None
 
 
 def test_qwen4_exp_nextn_reads_nested_mtp_index_sharing_config() -> None:
