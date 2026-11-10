@@ -1103,9 +1103,9 @@ Req: chatcmpl-019ef6b7 Finish! RequestStats(status='finished', reason='stop', pr
 | `prompt_tokens` / `cache_tokens` / `output_tokens` | Prompt tokens, prefix-cache-hit tokens, generated tokens. |
 | `cache_hit_rate` | `cache_tokens / prompt_tokens` (0–1). |
 | `queue_ms` | Received → first scheduled into a forward batch. |
-| `prefill_ms` | Scheduled → prefill complete. Always `0` on a decode worker, whose prompt is prefilled on the prefill node. |
-| `decode_wait_ms` | Decode workers only: KV (with the bootstrap token) landed → first decode batch dispatch. `0` elsewhere. |
-| `ttft_ms` | Received → first output token. On a decode worker the first token is the prefill node's bootstrap token, so this is received → KV landed. |
+| `prefill_ms` | Scheduled → prefill complete. Always `0` on a decode node, whose prompt is prefilled on the prefill node. |
+| `decode_wait_ms` | Decode nodes only: KV (with the bootstrap token) landed → first decode batch dispatch. `0` elsewhere. |
+| `ttft_ms` | Received → first output token. On a decode node the first token is the prefill node's bootstrap token, so ttft_ms spans received → KV landed. |
 | `total_ms` | Received → finished/aborted. |
 | `preempt_ms` / `preempt_count` | Wall-clock this request's decode was delayed by prefilling other requests, and the number of such interruptions. Host-side best-effort. |
 | `decode_tps` | Decode throughput (generated tokens / decode window). |

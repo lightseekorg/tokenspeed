@@ -177,12 +177,16 @@ pub fn stats_line(
         0.0
     };
     let created = state.created_time;
-    // A decode worker's remote prefill stamps `prefill_done` when the KV
+    // A decode node's remote prefill stamps `prefill_done` when the KV
     // lands, before its first decode dispatch stamps `scheduled`; the gap is
     // then decode admission wait, not prefill time. Keep each direction under
     // its own name so no role prints a misleading negative.
     let gap = ms(timings.prefill_done, timings.scheduled);
-    let (prefill_ms, decode_wait_ms) = if gap >= 0.0 { (gap, 0.0) } else { (0.0, -gap) };
+    let (prefill_ms, decode_wait_ms) = if gap >= 0.0 {
+        (gap.abs(), 0.0)
+    } else {
+        (0.0, -gap)
+    };
     format!(
         "Req: {rid} Finish! RequestStats(status='{status}', reason='{reason}', \
          prompt_tokens={prompt}, cache_tokens={}, output_tokens={output}, cache_hit_rate={}, \
@@ -262,5 +266,20 @@ mod tests {
              preempt_ms=0.0, preempt_count=0, decode_tps=2.0, acc_len=1.0, acc_rate=0.0, \
              recv_ts=100.0, commit_ts=100.5, finish_ts=101.25)"
         );
+    }
+
+    #[test]
+    fn a_sub_rounding_gap_prints_zero_not_negative_zero() {
+        let mut state = RequestState::new(vec![1, 2, 3, 4], 8, BTreeSet::new(), true, None, false);
+        state.created_time = 100.0;
+        state.output_ids = vec![5];
+        let mut timings = RequestTimings::default();
+        // The KV lands a fraction of a microsecond before the dispatch: the
+        // gap rounds to -0.0, which must still print as 0.0.
+        timings.mark_scheduled(100.5);
+        timings.mark_prefill_done(100.5 - 1e-9);
+        let line = stats_line("r", &state, &timings, 101.0, None);
+        assert!(line.contains("prefill_ms=0.0,"), "{line}");
+        assert!(!line.contains("-0.0"), "{line}");
     }
 }
