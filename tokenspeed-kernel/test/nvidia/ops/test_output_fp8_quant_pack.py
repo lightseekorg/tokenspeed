@@ -134,10 +134,7 @@ def test_output_quant_graph(rows, width, head, kind, pdl):
 
 
 def test_output_quant_reuses_compilation():
-    from tokenspeed_kernel.ops.quantization._triton.output_fp8 import (
-        _output_fp8_quant_pack_kernel,
-    )
-    from utils import assert_no_triton_compile
+    from tokenspeed_kernel.thirdparty.cute_dsl.fp8_group128 import compile_output_kernel
 
     def run(rows):
         x = torch.randn(rows, 640, device="cuda", dtype=torch.bfloat16)
@@ -153,9 +150,10 @@ def test_output_quant_reuses_compilation():
 
     for rows in (1, 4, 16, 17):
         run(rows)
-    with assert_no_triton_compile(_output_fp8_quant_pack_kernel):
-        for rows in (2, 3, 5, 8, 15, 31, 32, 129, 256):
-            run(rows)
+    misses = compile_output_kernel.cache_info().misses
+    for rows in (2, 3, 5, 8, 15, 31, 32, 129, 256):
+        run(rows)
+    assert compile_output_kernel.cache_info().misses == misses
 
 
 @pytest.mark.parametrize("normalize", [False, True])

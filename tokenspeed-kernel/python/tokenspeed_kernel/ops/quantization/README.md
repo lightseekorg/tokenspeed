@@ -118,7 +118,10 @@ quantizers and copies unaligned inputs when needed.
 
 ## Output gate and packed UE8M0
 
-`output_fp8_quant_pack` fuses a BF16 sigmoid gate or per-head RMSNorm with a
+The CuTe DSL `output_fp8_quant_pack` implementation fuses a BF16 sigmoid gate or per-head RMSNorm with a
 SiLU/sigmoid gate into group128 quantization on SM100/SM103. The
 kernel rounds the gated result to BF16 before quantizing and writes packed
-UE8M0 scales with zero padding.
+UE8M0 scales with zero padding. Each warp owns one head-row and uses a
+hardware warp-max reduction for group absmax; inverse scales are built from
+exponent bits. Static norm weights load before the PDL wait, while activation
+and gate loads follow it. Rows and tensor strides remain runtime arguments.

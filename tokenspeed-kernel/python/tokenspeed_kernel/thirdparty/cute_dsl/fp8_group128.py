@@ -226,3 +226,296 @@ def launch(x, q, s, *, threads, use_pdl):
             cutlass.Int32(s.stride(1)),
             cuda.CUstream(torch.cuda.current_stream().cuda_stream),
         )
+
+
+@dsl_user_op
+def scale_exponent(value: cutlass.Float32, *, loc=None, ip=None):
+    return cutlass.Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [value.ir_value()],
+            "{ .reg .b32 bits; mov.b32 bits, $1; add.u32 bits, bits, 0x7fffff; shr.u32 $0, bits, 23; }",
+            "=r,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def reciprocal_full(value: cutlass.Float32, *, loc=None, ip=None):
+    """Use the same division instruction as the materialized Triton operations."""
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [value.ir_value()],
+            "div.full.f32 $0, 0f3F800000, $1;",
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def warp_max(value: cutlass.Float32, *, loc=None, ip=None):
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [value.ir_value()],
+            "redux.sync.max.f32 $0, $1, -1;",
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def inverse_exponent(exponent: cutlass.Uint32, *, loc=None, ip=None):
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [exponent.ir_value()],
+            "{ .reg .b32 b; sub.u32 b, 254, $1; shl.b32 b, b, 23; mov.b32 $0, b; }",
+            "=f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+class OutputQuantPack:
+    """Four head-rows per CTA, with one warp reducing each head."""
+
+    def __init__(self, width, head, normalize, sigmoid_gate, eps, use_pdl):
+        self.width = width
+        self.head = head
+        self.normalize = normalize
+        self.sigmoid_gate = sigmoid_gate
+        self.eps = eps
+        self.use_pdl = use_pdl
+
+    @cute.jit
+    def __call__(
+        self, x, z, w, q, s, rows, padded_rows, stride_x, stride_z, stride_head, stream
+    ):
+        self.kernel(
+            x, z, w, q, s, rows, padded_rows, stride_x, stride_z, stride_head
+        ).launch(
+            grid=(cute.ceil_div(rows, 4), self.width // self.head, 1),
+            block=(128, 1, 1),
+            stream=stream,
+            use_pdl=self.use_pdl,
+        )
+
+    @cute.kernel
+    def kernel(
+        self, xp, zp, wp, qp, sp, rows, padded_rows, stride_x, stride_z, stride_head
+    ):
+        tid, _, _ = cute.arch.thread_idx()
+        block, head, _ = cute.arch.block_idx()
+        row = cutlass.Int64(block * 4 + tid // 32)
+        lane = tid % 32
+        x = cute.make_tensor(
+            cute.recast_ptr(xp, dtype=cutlass.BFloat16),
+            cute.make_layout((rows, self.width), stride=(stride_x, 1)),
+        )
+        z = cute.make_tensor(
+            cute.recast_ptr(zp, dtype=cutlass.BFloat16),
+            cute.make_layout(
+                (rows, self.width // self.head, self.head),
+                stride=(stride_z, stride_head, 1),
+            ),
+        )
+        w = cute.make_tensor(
+            cute.recast_ptr(wp, dtype=cutlass.BFloat16),
+            cute.make_layout((self.head,), stride=(1,)),
+        )
+        q = cute.make_tensor(
+            cute.recast_ptr(qp, dtype=cutlass.Float8E4M3FN),
+            cute.make_layout((rows, self.width), stride=(self.width, 1)),
+        )
+        s = cute.make_tensor(
+            sp,
+            cute.make_layout(
+                (cutlass.Int64(padded_rows) * ((self.width + 511) // 512) * 4,),
+                stride=(1,),
+            ),
+        )
+        weights = cute.make_rmem_tensor((self.head // 32,), cutlass.Float32)
+        if cutlass.const_expr(self.normalize):
+            for i in cutlass.range_constexpr(self.head // 32):
+                weights[i] = cutlass.Float32(w[(i // 4) * 128 + lane * 4 + i % 4])
+        if cutlass.const_expr(self.use_pdl):
+            cute.arch.griddepcontrol_wait()
+            cute.arch.griddepcontrol_launch_dependents()
+        if row < rows:
+            values = cute.make_rmem_tensor((self.head // 32,), cutlass.Float32)
+            squares = cute.make_rmem_tensor((self.head // 32,), cutlass.Float32)
+            for i in cutlass.range_constexpr(self.head // 32):
+                value = cutlass.Float32(
+                    x[row, head * self.head + (i // 4) * 128 + lane * 4 + i % 4]
+                )
+                values[i] = value
+                squares[i] = value * value
+            if cutlass.const_expr(self.normalize):
+                # Match Triton's four-contiguous-elements-per-lane reduction.
+                for group in cutlass.range_constexpr(self.head // 128):
+                    squares[group * 4] = squares[group * 4] + squares[group * 4 + 2]
+                    squares[group * 4 + 1] = (
+                        squares[group * 4 + 1] + squares[group * 4 + 3]
+                    )
+                for stage in cutlass.range_constexpr(
+                    (self.head // 128).bit_length() - 1
+                ):
+                    for group in cutlass.range_constexpr(
+                        (self.head // 128) >> (stage + 1)
+                    ):
+                        for parity in cutlass.range_constexpr(2):
+                            squares[group * 4 + parity] = (
+                                squares[group * 4 + parity]
+                                + squares[
+                                    (group + ((self.head // 128) >> (stage + 1))) * 4
+                                    + parity
+                                ]
+                            )
+                total = squares[0] + squares[1]
+                for offset in (16, 8, 4, 2, 1):
+                    total = total + cute.arch.shuffle_sync_bfly(total, offset=offset)
+                inverse_rms = reciprocal_full(
+                    cute.math.sqrt(
+                        total * cutlass.Float32(1.0 / self.head)
+                        + cutlass.Float32(self.eps),
+                        fastmath=True,
+                    )
+                )
+            for i in cutlass.range_constexpr(self.head // 32):
+                column = (i // 4) * 128 + lane * 4 + i % 4
+                gate = cutlass.Float32(z[row, head, column])
+                sigmoid = reciprocal_full(
+                    cutlass.Float32(1.0) + cute.math.exp(-gate, fastmath=True)
+                )
+                value = values[i]
+                if cutlass.const_expr(self.normalize):
+                    value = value * inverse_rms * weights[i]
+                    if cutlass.const_expr(not self.sigmoid_gate):
+                        sigmoid = gate * sigmoid
+                values[i] = cutlass.Float32(cutlass.BFloat16(value * sigmoid))
+            for group in cutlass.range_constexpr(self.head // 128):
+                maximum = cutlass.Float32(1.0e-10)
+                for i in cutlass.range_constexpr(4):
+                    maximum = cute.arch.fmax(
+                        maximum, cute.math.abs(values[group * 4 + i])
+                    )
+                # One warp owns a complete group, including for partial rows.
+                maximum = warp_max(maximum)
+                exponent = scale_exponent(maximum * cutlass.Float32(1.0 / 448.0))
+                inverse = inverse_exponent(exponent)
+                for i in cutlass.range_constexpr(4):
+                    value = cutlass.BFloat16(values[group * 4 + i] * inverse)
+                    q[row, head * self.head + group * 128 + lane * 4 + i] = (
+                        cutlass.Float8E4M3FN(value)
+                    )
+                if lane == 0:
+                    column = head * (self.head // 128) + group
+                    offset = (
+                        column // 4 * cutlass.Int64(padded_rows) + row
+                    ) * 4 + column % 4
+                    s[offset] = cutlass.Uint8(exponent)
+        # Each head owns its scale bytes, including the padded rows.
+        if row < padded_rows:
+            if row >= rows:
+                for group in cutlass.range_constexpr(self.head // 128):
+                    if lane == 0:
+                        column = head * (self.head // 128) + group
+                        s[
+                            (column // 4 * cutlass.Int64(padded_rows) + row) * 4
+                            + column % 4
+                        ] = cutlass.Uint8(0)
+            if cutlass.const_expr((self.width // 128) % 4 != 0):
+                if head == self.width // self.head - 1 and lane == 0:
+                    for tail in cutlass.range_constexpr((self.width // 128) % 4, 4):
+                        s[
+                            (
+                                (self.width // 128) // 4 * cutlass.Int64(padded_rows)
+                                + row
+                            )
+                            * 4
+                            + tail
+                        ] = cutlass.Uint8(0)
+
+
+@functools.cache
+def compile_output_kernel(width, head, normalize, sigmoid_gate, eps, use_pdl, device):
+    with torch.cuda.device(device):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("warm output FP8 quantization before CUDA Graph capture")
+        p = make_ptr(cutlass.Uint8, 0, cute.AddressSpace.gmem, assumed_align=2)
+        return cute.compile(
+            OutputQuantPack(width, head, normalize, sigmoid_gate, eps, use_pdl),
+            p,
+            p,
+            p,
+            p,
+            p,
+            cutlass.Int32(1),
+            cutlass.Int32(4),
+            cutlass.Int64(width),
+            cutlass.Int64(width),
+            cutlass.Int64(head),
+            cuda.CUstream(0),
+        )
+
+
+def launch_output(
+    x, z, weight, output, scales, *, head_dim, eps, sigmoid_gate, use_pdl
+):
+    """Fuse gate and optional per-head RMSNorm into Group128 quant-pack."""
+    rows, width = x.shape
+    if rows == 0:
+        return
+    with torch.cuda.device(x.device):
+        compiled = compile_output_kernel(
+            width,
+            head_dim,
+            weight is not None,
+            sigmoid_gate,
+            eps,
+            use_pdl,
+            x.device.index,
+        )
+
+        def pointer(tensor):
+            return make_ptr(
+                cutlass.Uint8,
+                tensor.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=2,
+            )
+
+        compiled(
+            pointer(x),
+            pointer(z),
+            pointer(x if weight is None else weight),
+            pointer(output),
+            pointer(scales),
+            cutlass.Int32(rows),
+            cutlass.Int32(scales.stride(1)),
+            cutlass.Int64(x.stride(0)),
+            cutlass.Int64(z.stride(0)),
+            cutlass.Int64(z.stride(1) if z.ndim == 3 else head_dim),
+            cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+        )

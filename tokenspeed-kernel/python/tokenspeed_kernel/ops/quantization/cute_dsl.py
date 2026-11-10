@@ -97,3 +97,43 @@ def cute_dsl_quantize_fp8_group128_packed(
         threads = 32 if rows == 1 else 128 if rows <= 512 else 256
         launch(x, output, scales, threads=threads, use_pdl=enable_pdl)
     return output, scales
+
+
+@register_kernel(
+    "quantization",
+    "output_fp8_packed",
+    name="cute_dsl_output_fp8_packed",
+    solution="cute_dsl",
+    capability=CapabilityRequirement(
+        vendors=frozenset({"nvidia"}),
+        min_arch_version=ArchVersion(10, 0),
+        max_arch_version=ArchVersion(10, 3),
+    ),
+    signatures=format_signatures("x", "dense", {torch.bfloat16}),
+    priority=Priority.PERFORMANT,
+)
+def cute_dsl_output_fp8_packed(
+    x, z, weight, *, head_dim, eps, sigmoid_gate, enable_pdl
+):
+    from tokenspeed_kernel.thirdparty.cute_dsl.fp8_group128 import launch_output
+
+    rows, width = x.shape
+    output = torch.empty_like(
+        x, dtype=torch.float8_e4m3fn, memory_format=torch.contiguous_format
+    )
+    storage = torch.empty(
+        ((width + 511) // 512, (rows + 3) // 4 * 4), device=x.device, dtype=torch.int32
+    )
+    scales = storage.t()[:rows]
+    launch_output(
+        x,
+        z,
+        weight,
+        output,
+        scales,
+        head_dim=head_dim,
+        eps=eps,
+        sigmoid_gate=sigmoid_gate,
+        use_pdl=enable_pdl,
+    )
+    return output, scales
