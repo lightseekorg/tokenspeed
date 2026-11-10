@@ -117,19 +117,6 @@ stores. The low-level `launch` accepts preallocated outputs for benchmarks
 or graph owners; the registry wrapper allocates outputs like the existing
 quantizers and copies unaligned inputs when needed.
 
-## Residual add, GemmaRMSNorm and block FP8
-
-`add_rmsnorm_quantize_fp8_block` updates the BF16 residual in place, normalizes
-using the unrounded FP32 sum and the FP32 `1 + weight` multiplier, and writes
-both BF16 normalized rows and FP8 codes. The BF16 result can independently feed
-GDN BA on an auxiliary stream. FP8 quantization uses that same BF16 boundary.
-Group128 FP32 scales follow the reciprocal-scaling recipe of
-`triton_quantize_fp8_group128`. Packed UE8M0 follows the CuTe
-quantizer's exponent rounding and BF16 power-of-two multiply, and writes the
-DeepGEMM layout directly, including zero padding. PDL waits precede activation
-loads; dependent launches are signalled after normalization. Shape-dependent
-row counts and strides remain runtime arguments for CUDA Graph and warmup reuse.
-
 ## Output gate and packed UE8M0
 
 `output_fp8_quant_pack` fuses a BF16 sigmoid gate or per-head RMSNorm with a

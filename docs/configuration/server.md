@@ -117,14 +117,6 @@ SiLU/sigmoid gate. This path preserves the BF16 rounding boundary and supports
 group128, CUDA Graph and PDL. Set `TOKENSPEED_FUSE_FP8_OUTPUT_QUANT=0`
 to use separate launches.
 
-Set `TOKENSPEED_FUSE_FP8_INPUT_QUANT=1` to opt into Qwen3.5 residual add,
-GemmaRMSNorm and FP8 activation quantization for QKV/QKVZ. The fused path
-requires an existing residual, a fused layer boundary and attention TP size 1.
-It writes packed UE8M0 scales for DeepGEMM or group128 FP32 scales for
-FlashInfer/TRTLLM, plus BF16 normalized rows for BA. Qwen4-Exp computes
-hyper-connection mixing between normalization and projection and uses
-separate input quantization.
-
 ## Numerics
 
 `--numerics` names the numerical contract a deployment promises. The design

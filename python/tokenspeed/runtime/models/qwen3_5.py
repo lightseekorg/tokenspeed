@@ -28,11 +28,7 @@ from collections.abc import Iterable
 import torch
 import torch.nn as nn
 from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
-from tokenspeed_kernel.ops.quantization import (
-    add_rmsnorm_quantize_fp8_block,
-    has_add_rmsnorm_quantize_fp8_block,
-    output_fp8_quant_pack,
-)
+from tokenspeed_kernel.ops.quantization import output_fp8_quant_pack
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 
 from tokenspeed.runtime.configs.qwen3_5_config import (
@@ -114,8 +110,6 @@ from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.env import envs, global_server_args_dict
 
 logger = logging.getLogger(__name__)
-
-_ProjectionInput = torch.Tensor | tuple[torch.Tensor, torch.Tensor]
 
 
 def _is_ignored_checkpoint_param(model, name: str) -> bool:
@@ -212,14 +206,12 @@ def _input_norm(
     hidden_states: torch.Tensor,
     residual: torch.Tensor | None,
     fp8_scale: torch.Tensor | None,
-    *,
-    projection: ColumnParallelLinear | None = None,
-) -> tuple[torch.Tensor, _ProjectionInput | None, torch.Tensor]:
-    """Layer-opening add + norm, with the projection's static or block FP8 copy.
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    """Layer-opening add + norm, with an optional static-FP8 copy.
 
-    Past the first layer, without attention TP and with the fused layer boundary, one
-    kernel adds, normalizes and quantizes; otherwise the communication policy runs the
-    norm and the projection quantizes for itself.
+    With a residual, no attention TP, and a fused layer boundary, a static scale
+    lets the norm also write an FP8 copy. Other layer boundaries use the
+    communication policy to run the norm.
     """
     if (
         residual is None
@@ -230,28 +222,6 @@ def _input_norm(
             hidden_states, residual
         )
         return hidden_states, None, residual
-    if (
-        projection is not None
-        and envs.TOKENSPEED_FUSE_FP8_INPUT_QUANT.get()
-        and global_server_args_dict["enable_fp8_attn_proj"]
-        and hidden_states.dtype == torch.bfloat16
-        and isinstance(projection.quant_method, Fp8LinearMethod)
-        and projection.quant_method.block_quant
-        and projection.quant_method.quant_config.weight_block_size[1] == 128
-        and projection.weight_scale_inv.dtype in (torch.int32, torch.float32)
-        and hidden_states.shape[1] % 128 == 0
-        and has_add_rmsnorm_quantize_fp8_block()
-    ):
-        packed = projection.weight_scale_inv.dtype == torch.int32
-        hidden_states, codes, scales, residual = add_rmsnorm_quantize_fp8_block(
-            hidden_states,
-            residual,
-            norm.weight,
-            eps=norm.variance_epsilon,
-            scale_encoding="packed_ue8m0" if packed else "float32",
-            enable_pdl=pdl_enabled(),
-        )
-        return hidden_states, (codes, scales), residual
     return norm.add_norm_with_fp8(hidden_states, residual, fp8_scale)
 
 
@@ -603,33 +573,18 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         return query, key, value, z, b, a
 
-    def input_projection(self) -> ColumnParallelLinear:
-        return self.in_proj_qkvz if self._split_in_proj else self.in_proj_qkvzba
-
     def input_fp8_scale(self) -> torch.Tensor | None:
         """The static-FP8 input scale of the projection that may take FP8 rows."""
-        proj = self.input_projection()
+        proj = self.in_proj_qkvz if self._split_in_proj else self.in_proj_qkvzba
         return proj.quant_method.static_fp8_input_scale(proj)
 
     def _forward_input_proj(
-        self,
-        hidden_states: torch.Tensor,
-        hidden_fp8: _ProjectionInput | None,
+        self, hidden_states: torch.Tensor, hidden_fp8: torch.Tensor | None
     ):
         projection_input = hidden_states if hidden_fp8 is None else hidden_fp8
-        if isinstance(projection_input, tuple):
-            projection_input, scales = projection_input
-            projection_kwargs = {
-                "block_scale": scales,
-                "output_dtype": hidden_states.dtype,
-            }
-        else:
-            projection_kwargs = {}
         if self._split_in_proj:
             if self._ba_fork.aux_stream is None:
-                projected_states_qkvz, _ = self.in_proj_qkvz(
-                    projection_input, **projection_kwargs
-                )
+                projected_states_qkvz, _ = self.in_proj_qkvz(projection_input)
                 projected_states_ba, _ = self.in_proj_ba(hidden_states)
                 return projected_states_qkvz, projected_states_ba
             main_stream = torch.cuda.current_stream(hidden_states.device)
@@ -639,13 +594,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             with self._ba_fork.scope(enable=True, overlap=True) as fork:
                 with fork.branch():
                     projected_states_ba, _ = self.in_proj_ba(hidden_states)
-                projected_states_qkvz, _ = self.in_proj_qkvz(
-                    projection_input, **projection_kwargs
-                )
+                projected_states_qkvz, _ = self.in_proj_qkvz(projection_input)
             # BA is allocated on aux but consumed on main after the join.
             projected_states_ba.record_stream(main_stream)
             return projected_states_qkvz, projected_states_ba
-        projected_all, _ = self.in_proj_qkvzba(projection_input, **projection_kwargs)
+        projected_all, _ = self.in_proj_qkvzba(projection_input)
         projected_states_qkvz, projected_states_ba = projected_all.split(
             [self._qkvz_dim, self._ba_dim], dim=-1
         )
@@ -654,7 +607,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        hidden_fp8: _ProjectionInput | None,
+        hidden_fp8: torch.Tensor | None,
         ctx: ForwardContext,
     ):
         seq_len, _ = hidden_states.shape
@@ -824,7 +777,6 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 hidden_states,
                 residual,
                 self.linear_attn.input_fp8_scale(),
-                projection=self.linear_attn.input_projection(),
             )
             capture_layer_input(self.comm_manager, residual, ctx, aux_hidden_states)
             hidden_states = self.comm_manager.pre_attn_comm(hidden_states, ctx)
@@ -1032,16 +984,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         )
 
     def _project_qkv(
-        self, hidden_states: _ProjectionInput
+        self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """qkv_proj split into views; ``gate`` is ``None`` without ``attn_output_gate``."""
-        if isinstance(hidden_states, tuple):
-            codes, scales = hidden_states
-            qkv, _ = self.qkv_proj(
-                codes, block_scale=scales, output_dtype=torch.bfloat16
-            )
-        else:
-            qkv, _ = self.qkv_proj(hidden_states)
+        qkv, _ = self.qkv_proj(hidden_states)
         if not self.attn_output_gate:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             return q, k, v, None
@@ -1095,10 +1041,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
     def self_attention(
         self,
         positions: torch.Tensor,
-        hidden_states: _ProjectionInput,
+        hidden_states: torch.Tensor,
         ctx: ForwardContext,
     ) -> torch.Tensor:
-        """Run full attention using floating or prequantized QKV inputs."""
+        """Run full attention using the input rows or their static-FP8 copy."""
         q, k, v, gate = self._project_qkv(hidden_states)
         fuse_output_quant = self._should_fuse_output_quant(gate)
         attn_output = self._attn(
@@ -1136,7 +1082,6 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 hidden_states,
                 residual,
                 self.qkv_proj.quant_method.static_fp8_input_scale(self.qkv_proj),
-                projection=self.qkv_proj,
             )
             capture_layer_input(self.comm_manager, residual, ctx, aux_hidden_states)
             hidden_states = self.comm_manager.pre_attn_comm(hidden_states, ctx)

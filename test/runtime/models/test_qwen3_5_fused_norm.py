@@ -38,6 +38,7 @@ from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.qwen3_5_config import Qwen3_5TextConfig
+from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.layers import layernorm
 from tokenspeed.runtime.layers import mlp as gated_mlp
@@ -210,6 +211,48 @@ class _StubGDNBackend:
     def forward(self, q, k, v, layer, token_to_kv_pool, forward_mode, bs, **kwargs):
         values = kwargs["mixed_qkv"][:, -kwargs["value_dim"] :]
         return torch.tanh(values).unflatten(1, (-1, kwargs["head_v_dim"]))
+
+
+@pytest.mark.skipif(not _IS_BLACKWELL, reason="block FP8 projections need Blackwell")
+@torch.no_grad()
+def test_online_block_fp8_gdn_projects_normalized_rows(
+    monkeypatch, bf16_default_dtype
+) -> None:
+    monkeypatch.setitem(global_server_args_dict, "enable_fp8_attn_proj", True)
+    monkeypatch.setitem(global_server_args_dict, "dense_gemm_backend", "auto")
+    monkeypatch.setitem(global_server_args_dict, "layer_boundary_norm", "fused")
+    config = Qwen3_5TextConfig(
+        hidden_size=512,
+        linear_num_key_heads=4,
+        linear_num_value_heads=8,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+    )
+    config.dtype = torch.bfloat16
+    mapping = Mapping(rank=0, world_size=1)
+    gdn = Qwen3_5GatedDeltaNet(config, mapping, 1, quant_config=None).cuda()
+    qkvz, ba = gdn.in_proj_qkvz, gdn.in_proj_ba
+    qkvz.weight.normal_(std=0.02)
+    ba.weight.normal_(std=0.02)
+    qkvz.quant_method.process_weights_after_loading(qkvz)
+    norm, x, residual = _norm_and_rows(4, config.hidden_size, torch.bfloat16)
+    manager = CommManager(
+        mapping, 1, False, False, False, input_layernorm=norm, query_sharded=False
+    )
+
+    expected, _, expected_residual = norm.add_norm_with_fp8(
+        x.clone(), residual.clone(), None
+    )
+    expected_qkvz, _ = qkvz(expected)
+    expected_ba, _ = ba(expected)
+    normalized, fp8_copy, updated_residual = _input_norm(
+        manager, norm, x, residual, gdn.input_fp8_scale()
+    )
+    actual_qkvz, actual_ba = gdn._forward_input_proj(normalized, fp8_copy)
+
+    torch.testing.assert_close(updated_residual, expected_residual, rtol=0, atol=0)
+    torch.testing.assert_close(actual_qkvz, expected_qkvz, rtol=0, atol=0)
+    torch.testing.assert_close(actual_ba, expected_ba, rtol=0, atol=0)
 
 
 @pytest.fixture

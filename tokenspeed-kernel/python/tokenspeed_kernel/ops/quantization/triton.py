@@ -2146,31 +2146,3 @@ def triton_output_fp8_packed(x, z, weight, *, head_dim, eps, sigmoid_gate, enabl
         sigmoid_gate=sigmoid_gate,
         enable_pdl=enable_pdl,
     )
-
-
-@register_kernel(
-    "quantization",
-    "add_rmsnorm_fp8_block",
-    name="triton_add_rmsnorm_fp8_block",
-    solution="triton",
-    capability=CapabilityRequirement(
-        vendors=frozenset({"nvidia"}),
-        min_arch_version=ArchVersion(10, 0),
-        max_arch_version=ArchVersion(10, 3),
-    ),
-    signatures=format_signatures("x", "dense", {torch.bfloat16}),
-    priority=Priority.PERFORMANT,
-)
-def triton_add_rmsnorm_fp8_block(
-    x, residual, weight, *, eps, scale_encoding, enable_pdl
-):
-    from tokenspeed_kernel.ops.quantization._triton.input_fp8 import launch
-
-    return launch(
-        x,
-        residual,
-        weight,
-        eps=eps,
-        scale_encoding=scale_encoding,
-        enable_pdl=enable_pdl,
-    )
