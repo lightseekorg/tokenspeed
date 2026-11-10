@@ -123,8 +123,17 @@ class DraftProposalSampler:
             (max_bs,), dtype=torch.int32, device=device
         )
         self._gumbel_out = torch.empty((max_bs,), dtype=torch.int32, device=device)
-        # A table narrower than the vocabulary holds this rank's shard of q: proposals come from vocab shards.
+        # Shard scratch when the table holds this rank's columns of q, else the whole-row scratch; the other stays None.
         self._shard_ranks: int | None = None
+        self._shard_stats: torch.Tensor | None = None
+        self._shard_landing: torch.Tensor | None = None
+        self._gumbel_local_ids: torch.Tensor | None = None
+        self._gumbel_local_scores: torch.Tensor | None = None
+        # Hot-token heads: q over the draft vocab is scattered into a
+        # full-vocab row before it is recorded. The scatter only ever writes
+        # the mapped columns, so the others stay zero from allocation.
+        self._vocab_map: torch.Tensor | None = None
+        self._full_q: torch.Tensor | None = None
         if vocab_size != runtime_states.vocab_size:
             if vocab_map is not None or runtime_states.vocab_size % vocab_size:
                 raise ValueError(
@@ -142,32 +151,27 @@ class DraftProposalSampler:
                 dtype=torch.float32,
                 device=device,
             )
-            return
-        # Sized by the draft head's width: the Gumbel draw runs over the draft
-        # logits, which a hot-token head keeps narrower than the full vocab.
-        draft_vocab_size = vocab_size if vocab_map is None else vocab_map.shape[0]
-        scratch_shape = gumbel_scratch_shape(max_bs, draft_vocab_size)
-        self._gumbel_local_ids = torch.empty(
-            scratch_shape, dtype=torch.int32, device=device
-        )
-        self._gumbel_local_scores = torch.empty(
-            scratch_shape, dtype=torch.float32, device=device
-        )
-        # Hot-token heads: q over the draft vocab is scattered into a
-        # full-vocab row before it is recorded. The scatter only ever writes
-        # the mapped columns, so the others stay zero from allocation.
-        self._vocab_map: torch.Tensor | None = None
-        self._full_q: torch.Tensor | None = None
-        if vocab_map is not None:
-            if vocab_map.ndim != 1 or vocab_map.shape[0] > vocab_size:
-                raise ValueError(
-                    f"vocab_map must be a [V_draft <= {vocab_size}] vector, got "
-                    f"{tuple(vocab_map.shape)}"
-                )
-            self._vocab_map = vocab_map.to(device=device, dtype=torch.int64)
-            self._full_q = torch.zeros(
-                (max_bs, vocab_size), dtype=torch.float32, device=device
+        else:
+            # Sized by the draft head's width: the Gumbel draw runs over the draft
+            # logits, which a hot-token head keeps narrower than the full vocab.
+            draft_vocab_size = vocab_size if vocab_map is None else vocab_map.shape[0]
+            scratch_shape = gumbel_scratch_shape(max_bs, draft_vocab_size)
+            self._gumbel_local_ids = torch.empty(
+                scratch_shape, dtype=torch.int32, device=device
             )
+            self._gumbel_local_scores = torch.empty(
+                scratch_shape, dtype=torch.float32, device=device
+            )
+            if vocab_map is not None:
+                if vocab_map.ndim != 1 or vocab_map.shape[0] > vocab_size:
+                    raise ValueError(
+                        f"vocab_map must be a [V_draft <= {vocab_size}] vector, got "
+                        f"{tuple(vocab_map.shape)}"
+                    )
+                self._vocab_map = vocab_map.to(device=device, dtype=torch.int64)
+                self._full_q = torch.zeros(
+                    (max_bs, vocab_size), dtype=torch.float32, device=device
+                )
 
     def _check_step(self, step: int) -> None:
         """Refuse a draft step without a verify column."""
