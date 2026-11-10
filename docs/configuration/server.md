@@ -622,13 +622,13 @@ draft model, and token count together.
 
 ### Synthetic acceptance length
 
-The supported benchmark configuration is `--sampling-backend greedy`, with
-speculative decoding enabled and `--dp-sampling` and `--enable-output-logprobs`
-disabled. Draft trees are unsupported. Other sampling backends and these options
-are rejected at startup.
-As with ordinary greedy sampling, token selection is always argmax; stochastic
-sampling and penalties are not supported. Use unconstrained greedy requests
-(`temperature: 0`) for this benchmark.
+The greedy and sonic sampling backends accept it, and the flashinfer backend
+only over sampled drafts (`--enable-speculative-sampling`). Speculative
+decoding must be enabled, and `--dp-sampling`, `--enable-output-logprobs` and
+draft trees are rejected at startup, as are the other sampling backends.
+On the greedy backend, token selection is always argmax, so stochastic sampling
+and penalties do not apply there; use unconstrained greedy requests
+(`temperature: 0`) with it.
 
 Use `--synthetic-acceptance-length L` to benchmark speculative execution at a
 fixed mean acceptance length (AL). AL includes the guaranteed target token,

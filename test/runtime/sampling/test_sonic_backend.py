@@ -1071,10 +1071,6 @@ def test_rejects_a_batch_past_the_int32_row_offsets():
         _backend_cls()(config)
 
 
-if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__, "-v"]))
-
-
 # --------------------------------------------------------------------- #
 # synthetic acceptance
 # --------------------------------------------------------------------- #
@@ -1254,3 +1250,7 @@ def test_synthetic_launches_compile_nothing_after_warm_up():
                 drafts[:bs], req[:bs], offsets, *verified, row_offset=0
             )
     torch.cuda.synchronize()
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
