@@ -2035,8 +2035,9 @@ def _attnres_scratch(
 _IRIS_MAX_TOKENS = 8192
 _IRIS_BASELINE_PRODUCER_DIRECT_MAX_TOKENS = 48
 _IRIS_MOE_ROW_SHARD_MIN_TOKENS = 40
-# Through this many rows a replicated residual takes the Lamport reduce and gather tail.
-_IRIS_MOE_GATHER_TAIL_MAX_TOKENS = 64
+# Through this many rows a replicated residual takes the Lamport reduce and gather
+# tail; the Iris K3 fused decode row limit.
+_IRIS_MOE_GATHER_TAIL_MAX_TOKENS = 192
 # Below this, row-sharded router/latent projection idles CUs and loses (8x MI350X).
 _IRIS_MOE_ROW_INPUT_MIN_TOKENS = 4096
 

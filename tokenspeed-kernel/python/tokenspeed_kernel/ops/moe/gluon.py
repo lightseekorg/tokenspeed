@@ -42,6 +42,9 @@ from tokenspeed_kernel.signature import (
     format_signatures,
 )
 
+# The SiTU warp decode serves through these rows (gfx950 moe.py); prefill tiles above.
+_SITU_WARP_DECODE_MAX_M = 192
+
 platform = current_platform()
 
 GLUON_FP8_CHANNEL_APPLY = "gluon_fp8_channel_bf16_precomputed_moe_apply"
@@ -1969,7 +1972,11 @@ if platform.is_amd:
         x_quantized = getattr(w, "_situ_input_fp8", None)
         w._situ_input_fp8 = None
         rows = int(x[0].shape[0] if isinstance(x, tuple) else x.shape[0])
-        if situ_linear_beta is not None and is_warming_up() and rows > 64:
+        if (
+            situ_linear_beta is not None
+            and is_warming_up()
+            and rows > _SITU_WARP_DECODE_MAX_M
+        ):
             # Serving chunks pick tiles by row count, up to this warmup prefill's rows.
             warm_gluon_mxfp4_situ_prefill_rows(
                 w.w13_weight_triton_tensor,

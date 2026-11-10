@@ -226,7 +226,7 @@ def _check_gather_tail(
         )
 
     # Reductions and gathers share mailbox tile epochs: interleave them at varied rows.
-    row_counts = (4, 1, 3, 2, 8, 5, 16, 17, 4, 32, 64, 3, 47)
+    row_counts = (4, 1, 3, 2, 8, 5, 16, 17, 4, 32, 64, 3, 47, 192, 128, 136)
     for seed, rows in enumerate(row_counts):
         routed, shared = (t.clone() for t in reduce(rows, seed))
         prefix = torch.randn((rows, _HIDDEN), generator=generator, device=device).to(
@@ -278,7 +278,7 @@ def _check_gather_tail(
     dist.barrier(group=group, device_ids=[rank])
 
     # Captured layers alternate reduce and gather, one rank late, without recompiling.
-    layer_rows = (4, 3, 8, 16, 32, 64, 13, 2)
+    layer_rows = (4, 3, 8, 16, 32, 64, 192, 13, 128, 2)
     for rows in layer_rows:
         routed, shared = reduce(rows, 200 + rows)
         gathered(routed, shared, torch.zeros_like(shared))

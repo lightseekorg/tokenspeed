@@ -2734,9 +2734,8 @@ def test_sorted_situ_dispatch_and_compilation_gfx950(monkeypatch, intermediate_s
         generator=generator,
     )
     preprocess_gluon_mxfp4_gfx950_moe_weights({}, module, preshuffle=True)
-    # Exercise the low-level sorted kernels at changing M beyond the production
-    # dispatch bound, which admits M from 8 through 64.
-    monkeypatch.setattr(moe, "_SITU_WARP_DECODE_MAX_M", 130)
+    # Exercise the low-level sorted kernels at changing M within the production
+    # dispatch bound, which admits M from 8 through 192.
     if intermediate_size != 384:
 
         class UnexpectedSortedKernel:
