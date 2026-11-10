@@ -52,6 +52,11 @@ exact fp32 top-``MAX_K``). Every rank merges the same gathered bytes with the
 same slot state and noise, so sharded draws agree across ranks without the TP
 sync broadcast.
 
+Synthetic acceptance (``--synthetic-acceptance-length``, benchmarking only)
+runs the verify for its cost and then forces each request's length; the
+token at the cutoff comes from the candidates the verify selected
+(``_synthetic_outputs``).
+
 Not yet supported: DP-sampling, draft trees, top-k output logprobs, EAGLE3
 ``d2t`` cross-vocab.
 
@@ -177,6 +182,8 @@ class SonicSamplingBackend(SamplingBackend):
 
     _HAS_POOL_STATE = True
     _SUPPORTS_DP_VERIFY = False
+    # Forced lengths over sonic's verify; see ``_synthetic_outputs``.
+    _SUPPORTS_SYNTHETIC_ACCEPTANCE = True
 
     # Prompt token counts the runtime never fills: every slot reads zeros.
     constant_slot_state = ("state.context_counts", "_exact_state.context_counts")
@@ -236,6 +243,8 @@ class SonicSamplingBackend(SamplingBackend):
                 self.accept_buf = torch.empty((self.max_bs,), dtype=torch.int32)
                 self.values = torch.empty((rows, MAX_K), dtype=torch.float32)
                 self.indices = torch.empty((rows, MAX_K), dtype=torch.int32)
+                # Synthetic acceptance's target token per request.
+                self.synthetic_tokens = torch.empty((self.max_bs,), dtype=torch.int32)
 
             # Vocabulary-sharded rows: this rank's candidates and every rank's.
             self._shard_ranks = self._vocab_shard_ranks(config)
@@ -390,7 +399,7 @@ class SonicSamplingBackend(SamplingBackend):
                 self._fused_singular(logits[:bs], slots[:bs], offsets, shard=shard)
                 if self.spec:
                     for table in self._warmup_draft_tables(columns):
-                        self._fused_multistep(
+                        verified = self._fused_multistep(
                             logits[: bs * self.n_max],
                             slots[:bs],
                             offsets,
@@ -398,6 +407,10 @@ class SonicSamplingBackend(SamplingBackend):
                             shard=shard,
                             draft_probs=table,
                         )
+                        if self._synthetic_lengths is not None:
+                            self._synthetic_outputs(
+                                cand[:bs], slots[:bs], offsets, *verified, row_offset=0
+                            )
         self.reset_capture_state()
 
     # ------------------------------------------------------------------ #
@@ -453,13 +466,19 @@ class SonicSamplingBackend(SamplingBackend):
 
                     for draft_probs in self._warmup_draft_tables():
 
-                        self._fused_multistep(
+                        verified = self._fused_multistep(
                             logits[: bs * self.n_max],
                             slots[:bs],
                             offsets,
                             cand[:bs],
                             draft_probs=draft_probs,
                         )
+
+                        if self._synthetic_lengths is not None:
+
+                            self._synthetic_outputs(
+                                cand[:bs], slots[:bs], offsets, *verified, row_offset=0
+                            )
 
         # The warm-up gathered slot 0 with counting on; leave it clean.
         self.reset_capture_state()
@@ -819,6 +838,48 @@ class SonicSamplingBackend(SamplingBackend):
 
         return drafted, accepted
 
+    def _synthetic_outputs(
+        self,
+        candidates: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        offsets: torch.Tensor,
+        drafted: torch.Tensor,
+        accepted: torch.Tensor,
+        *,
+        row_offset: int,
+    ) -> None:
+        """Replace a verify's outcome with the synthetic acceptance lengths.
+
+        Each request keeps its first ``L - 1`` drafts and then the target's
+        token at position ``L - 1`` (``sonic.synthetic_targets``, drawn from
+        the candidates the verify just left), as the greedy and flashinfer
+        backends override theirs. The decode counts that penalties read keep
+        the verify's own tokens: synthetic output is for benchmarking only.
+
+        Args:
+            candidates: ``[bs, n]`` the verified window (last token, drafts).
+            slot_mapping: ``[bs]`` slot of each request.
+            offsets: The verify's per-slot Philox offsets.
+            drafted: ``[bs, n]`` the verify's output tokens; rewritten.
+            accepted: ``[bs, 1]`` the verify's accepted drafts; rewritten.
+            row_offset: The requests' first row in the step's full batch.
+        """
+        bs, n = candidates.shape
+        lengths = self.synthetic_lengths(candidates, row_offset)
+        tokens = sonic.synthetic_targets(
+            self.values[: bs * n],
+            self.indices[: bs * n],
+            self.state,
+            slot_mapping,
+            offsets,
+            lengths,
+            self.synthetic_tokens[:bs],
+            enable_pdl=pdl_enabled(),
+        )
+        drafted[:, : n - 1].copy_(candidates[:, 1:])
+        drafted.scatter_(1, (lengths - 1).long()[:, None], tokens[:, None])
+        accepted.copy_((lengths - 1)[:, None])
+
     @override
     @nvtx_range("sampling:verify", color="yellow")
     def verify(
@@ -873,14 +934,27 @@ class SonicSamplingBackend(SamplingBackend):
 
             self._scatter_grammar(sampling_info.vocab_mask, slot_mapping, bs, n)
 
+        offsets = self._prepare_sampling_offsets(sampling_info)
         predict, accepted = self._fused_multistep(
             logits,
             slot_mapping,
-            self._prepare_sampling_offsets(sampling_info),
+            offsets,
             candidates,
             shard=shard,
             draft_probs=sampling_info.draft_probs,
         )
+
+        # Benchmark acceptance replaces the outcome after the verify ran for its cost.
+        if self._synthetic_lengths is not None:
+
+            self._synthetic_outputs(
+                candidates,
+                slot_mapping,
+                offsets,
+                predict,
+                accepted,
+                row_offset=sampling_info.batch_row_offset,
+            )
 
         predict = predict.view(-1)
         accept_lengths = torch.add(accepted.view(-1), 1, out=self.accept_buf[:bs])

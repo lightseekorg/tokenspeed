@@ -22,8 +22,8 @@
 //! bootstrap server, registers with them once per route, sends each
 //! admitted request's page manifest, and collects their completions.
 //!
-//! Threads: one connects requests to their routes (the bootstrap server's
-//! HTTP lookups), one handles the status socket, one watches the Prefill
+//! Threads: one per bootstrap address connects its requests to their routes
+//! (HTTP lookups), one handles the status socket, one watches the Prefill
 //! nodes' health. The scheduling loop only registers requests and polls;
 //! the forward thread hands over each plan's remote prefill
 //! ([`DecodeOutbox`]). Routes and manifests are planned here, over the
@@ -88,8 +88,8 @@ pub struct DecodeConfig {
     pub tp_size: i64,
     /// See `arena_base`.
     pub tp_rank: i64,
-    /// A request whose manifest went out this long ago without its KV
-    /// landing fails.
+    /// Maximum wait in each phase: registration through manifest publication,
+    /// then publication through KV arrival. Failure still waits for write retirement.
     pub waiting_timeout: Duration,
     /// How often the Prefill nodes' health is checked.
     pub heartbeat_interval: Duration,
@@ -159,6 +159,12 @@ impl State {
         }
         self.rooms.record_failure(room, reason);
         self.rooms.update(room, TransferPoll::Failed);
+    }
+
+    fn awaiting_connection(&self, room: u64) -> bool {
+        self.tracked.contains(&room)
+            && self.rooms.get(room) == Some(TransferPoll::Bootstrapping)
+            && !self.cancellations.contains_key(&room)
     }
 
     /// Apply one Prefill rank's report.
@@ -259,7 +265,7 @@ impl State {
         route: &PrefillRoute,
         targets: Arc<Vec<Target>>,
     ) -> bool {
-        if !self.tracked.contains(&room) || self.cancellations.contains_key(&room) {
+        if !self.awaiting_connection(room) {
             return false;
         }
         self.expected
@@ -387,15 +393,14 @@ impl Shared {
             return;
         }
         cancellation.sent = Some(Instant::now());
-        if state.admissions.contains_key(&room) {
-            if let Some(targets) = state.targets.get(&room) {
-                for target in targets.iter() {
-                    self.transport.sockets.send(
-                        &target.host,
-                        target.port,
-                        wire::cancellation_frames(room, &state.cache_id),
-                    );
-                }
+        if let Some(targets) = state.targets.get(&room) {
+            for target in targets.iter() {
+                // A full queue is retried on the next cancellation poll.
+                let _ = self.transport.sockets.send_coalesced(
+                    &target.host,
+                    target.port,
+                    wire::cancellation_frames(room, &state.cache_id),
+                );
             }
         }
     }
@@ -426,7 +431,7 @@ impl Shared {
     fn connect(&self, room: u64, addr: &str) -> Result<(), String> {
         let cache_id = {
             let state = self.state();
-            if !state.tracked.contains(&room) || state.cancellations.contains_key(&room) {
+            if !state.awaiting_connection(room) {
                 return Ok(());
             }
             state.cache_id.clone()
@@ -440,6 +445,11 @@ impl Shared {
             None => {
                 let mut targets = Vec::with_capacity(route.target_tp_ranks.len());
                 for &rank in &route.target_tp_ranks {
+                    // A retired worker only finishes the HTTP call already
+                    // in progress; do not start another lookup for an ended room.
+                    if !self.state().awaiting_connection(room) {
+                        return Ok(());
+                    }
                     let lookup_failed = || {
                         format!(
                             "Could not fetch bootstrap info for engine rank: {} and \
@@ -477,10 +487,7 @@ impl Shared {
         let mut state = self.state();
         // The HTTP lookup may outlive a cancelled request or a cache release.
         // Do not repopulate the new cache's connections with that old work.
-        if !state.tracked.contains(&room)
-            || state.cancellations.contains_key(&room)
-            || state.cache_id != cache_id
-        {
+        if !state.awaiting_connection(room) || state.cache_id != cache_id {
             return Ok(());
         }
         if !state.connections.contains_key(&key) {
@@ -488,20 +495,23 @@ impl Shared {
             // room's pre-allocation follows on this same socket.
             let session_id = self.transport.session_id();
             for target in targets.iter() {
-                self.transport.sockets.send(
-                    &target.host,
-                    target.port,
-                    wire::registration_frames(
-                        &self.local_ip,
-                        self.transport.sockets.port(),
-                        &session_id,
-                        &state.cache_id,
-                        self.arena_base,
-                        &self.layout_wire,
-                        self.tp_size,
-                        self.tp_rank,
-                    ),
-                );
+                self.transport
+                    .sockets
+                    .send(
+                        &target.host,
+                        target.port,
+                        wire::registration_frames(
+                            &self.local_ip,
+                            self.transport.sockets.port(),
+                            &session_id,
+                            &state.cache_id,
+                            self.arena_base,
+                            &self.layout_wire,
+                            self.tp_size,
+                            self.tp_rank,
+                        ),
+                    )
+                    .map_err(|error| error.to_string())?;
             }
             state.connections.insert(key, targets.clone());
         }
@@ -529,7 +539,11 @@ impl Shared {
     fn watch(&self, interval: Duration, max_failures: u32, stop: &mpsc::Receiver<()>) {
         let mut failures: HashMap<String, u32> = HashMap::new();
         while !sleep_or_stop(stop, interval) {
-            let addrs: Vec<String> = self.state().routes.keys().cloned().collect();
+            let addrs: Vec<String> = {
+                let state = self.state();
+                failures.retain(|addr, _| state.routes.contains_key(addr));
+                state.routes.keys().cloned().collect()
+            };
             for addr in addrs {
                 let count = failures.entry(addr.clone()).or_insert(0);
                 if http::healthy(
@@ -670,7 +684,7 @@ impl DecodeOutbox {
             return;
         };
         for target in targets.iter() {
-            self.shared.transport.sockets.send(
+            if let Err(error) = self.shared.transport.sockets.send(
                 &target.host,
                 target.port,
                 wire::preallocation_frames(
@@ -678,7 +692,12 @@ impl DecodeOutbox {
                     &state.cache_id,
                     (!target.is_dummy).then_some(manifest),
                 ),
-            );
+            ) {
+                // Some targets may already have their manifest: keep the
+                // admission and let the usual cancellation fence retire it.
+                state.fail(room, error.to_string());
+                return;
+            }
         }
         tracing::debug!(rid, room, "pre-allocation sent");
     }
@@ -688,6 +707,7 @@ impl DecodeOutbox {
 struct Receiver {
     room: u64,
     addr: String,
+    started: Instant,
     local: TransferPoll,
     concluded: Option<TransferPoll>,
     draining: Option<Draining>,
@@ -696,7 +716,7 @@ struct Receiver {
 /// A Decode rank's PD transfer peer.
 pub struct DecodePeer {
     shared: Arc<Shared>,
-    connect: mpsc::Sender<(u64, String)>,
+    connect: HashMap<String, mpsc::Sender<u64>>,
     stop: Arc<AtomicBool>,
     _heartbeat_stop: mpsc::Sender<()>,
     waiting_timeout: Duration,
@@ -763,19 +783,6 @@ impl DecodePeer {
                     }
                 })?;
         }
-        let (connect, rooms) = mpsc::channel::<(u64, String)>();
-        {
-            let shared = shared.clone();
-            thread::Builder::new()
-                .name("ts-pd-connect".to_owned())
-                .spawn(move || {
-                    while let Ok((room, addr)) = rooms.recv() {
-                        if let Err(reason) = shared.connect(room, &addr) {
-                            shared.state().fail(room, reason);
-                        }
-                    }
-                })?;
-        }
         let (heartbeat_stop, stopped) = mpsc::channel();
         {
             let shared = shared.clone();
@@ -792,7 +799,7 @@ impl DecodePeer {
         Ok((
             Self {
                 shared,
-                connect,
+                connect: HashMap::new(),
                 stop,
                 _heartbeat_stop: heartbeat_stop,
                 waiting_timeout: config.waiting_timeout,
@@ -818,6 +825,23 @@ impl DecodePeer {
     /// The current cache incarnation, independent of its transfer address.
     pub fn cache_id(&self) -> String {
         self.shared.state().cache_id.clone()
+    }
+
+    /// Dropping a lost address's sender lets its worker drain terminal rooms
+    /// and exit. A first lookup has no route yet, so retain its worker until
+    /// the pending request settles; otherwise each poll could fork its FIFO.
+    fn reap_connect_workers(&mut self) {
+        let state = self.shared.state();
+        let pending: HashSet<&str> = self
+            .receivers
+            .values()
+            .filter(|receiver| {
+                receiver.concluded.is_none() && state.awaiting_connection(receiver.room)
+            })
+            .map(|receiver| receiver.addr.as_str())
+            .collect();
+        self.connect
+            .retain(|addr, _| state.routes.contains_key(addr) || pending.contains(addr.as_str()));
     }
 
     fn forget(&mut self, rid: &str) {
@@ -848,6 +872,7 @@ fn join_host_port(host: &str, port: u16) -> String {
 
 impl TransferPeer for DecodePeer {
     fn register(&mut self, rid: &str, bootstrap: &BootstrapInfo) -> Result<(), PdError> {
+        self.reap_connect_workers();
         let room = bootstrap.room;
         let addr = join_host_port(&bootstrap.host, bootstrap.port);
         {
@@ -863,6 +888,7 @@ impl TransferPeer for DecodePeer {
                 Receiver {
                     room,
                     addr: addr.clone(),
+                    started: Instant::now(),
                     local: TransferPoll::Bootstrapping,
                     concluded: None,
                     draining: None,
@@ -872,13 +898,30 @@ impl TransferPeer for DecodePeer {
         {
             self.order.push(rid.to_owned());
         }
-        self.connect
-            .send((room, addr))
+        if !self.connect.contains_key(&addr) {
+            let (sender, rooms) = mpsc::channel();
+            let shared = self.shared.clone();
+            let endpoint = addr.clone();
+            thread::Builder::new()
+                .name("ts-pd-connect".to_owned())
+                .spawn(move || {
+                    while let Ok(room) = rooms.recv() {
+                        if let Err(reason) = shared.connect(room, &endpoint) {
+                            shared.state().fail(room, reason);
+                        }
+                    }
+                })
+                .map_err(|error| PdError::Peer(error.to_string()))?;
+            self.connect.insert(addr.clone(), sender);
+        }
+        self.connect[&addr]
+            .send(room)
             .map_err(|_| PdError::Peer("the PD connect thread stopped".to_owned()))
     }
 
     fn poll(&mut self, mesh: &mut Mesh, replica: &Group) -> Result<Vec<PdEvent>, PdError> {
         if self.order.is_empty() {
+            self.reap_connect_workers();
             return Ok(Vec::new());
         }
         let now = Instant::now();
@@ -897,6 +940,19 @@ impl TransferPeer for DecodePeer {
                         status @ (TransferPoll::Success | TransferPoll::Failed) => {
                             receiver.concluded = Some(status);
                             status
+                        }
+                        TransferPoll::Bootstrapping | TransferPoll::Bootstrapped
+                            if now - receiver.started >= self.waiting_timeout =>
+                        {
+                            state.rooms.record_failure(
+                                receiver.room,
+                                "Decode timed out before publishing its cache manifest".to_owned(),
+                            );
+                            if let Some(metrics) = &self.shared.metrics {
+                                metrics.record_timeout("waiting_for_admission");
+                            }
+                            receiver.concluded = Some(TransferPoll::Failed);
+                            TransferPoll::Failed
                         }
                         TransferPoll::WaitingForInput => {
                             let waited = state
@@ -1024,6 +1080,7 @@ impl TransferPeer for DecodePeer {
         for rid in ended {
             self.forget(&rid);
         }
+        self.reap_connect_workers();
         let stalled = stalled_drains(
             self.order
                 .iter()
@@ -1126,6 +1183,17 @@ mod tests {
         assert!(state.expected.is_empty());
         assert!(state.targets.is_empty());
         assert!(state.pending.is_empty() && state.landed.is_empty());
+    }
+
+    #[test]
+    fn a_late_connection_does_not_revive_a_failed_room() {
+        let mut state = State::default();
+        state.tracked.insert(1);
+        state.rooms.update(1, TransferPoll::Bootstrapping);
+        state.fail(1, "bootstrap failed");
+        assert!(!state.attach(1, "prefill:80", &route(), Arc::new(Vec::new())));
+        assert_eq!(state.rooms.get(1), Some(TransferPoll::Failed));
+        assert!(state.targets.is_empty());
     }
 
     #[test]
@@ -1234,3 +1302,7 @@ mod tests {
         assert_eq!(kept, ["host:8000"]);
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/decode_lifecycle.rs"]
+mod lifecycle_tests;
