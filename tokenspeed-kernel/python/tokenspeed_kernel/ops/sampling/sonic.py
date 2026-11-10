@@ -44,9 +44,16 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
-from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel._triton import libdevice, tl, triton
 from tokenspeed_kernel.thirdparty.sonic_sampler.core.flags import Indicator
-from tokenspeed_kernel.thirdparty.sonic_sampler.ops.base import MAX_K, next_power_of_2
+from tokenspeed_kernel.thirdparty.sonic_sampler.ops.base import (
+    MAX_K,
+    gdc_launch_dependents,
+    gdc_wait,
+    next_power_of_2,
+    philox_gumbel,
+    philox_key,
+)
 from tokenspeed_kernel.thirdparty.sonic_sampler.ops.multistep import (
     cumulative_unpack_kernel,
 )
@@ -750,5 +757,123 @@ __all__ = [
     "sample",
     "scratchpad_columns",
     "shard_candidates",
+    "synthetic_targets",
     "verify",
 ]
+
+
+@triton.jit
+def _synthetic_target_kernel(
+    values_ptr,
+    indices_ptr,
+    indicators_ptr,
+    slots_ptr,
+    seeds_ptr,
+    offsets_ptr,
+    lengths_ptr,
+    tokens_ptr,
+    timesteps: tl.constexpr,
+    max_k: tl.constexpr,
+    enable_pdl: tl.constexpr,
+):
+    """One program per request: its target token at the forced position ``lengths - 1``.
+
+    A greedy request (indicator bit 0x40) reads the argmax ``verify`` stored at
+    its first row. Any other request takes the Gumbel-max over that position's
+    ``MAX_K`` candidates, keyed by the slot's seed and offset and the position,
+    which is the draw ``verify`` makes past an all-accepted window.
+    """
+    request = tl.program_id(axis=0)
+    if enable_pdl:
+        gdc_wait()
+    slot = tl.load(slots_ptr + request)
+    indicator = tl.load(indicators_ptr + slot)
+    step = tl.load(lengths_ptr + request) - 1
+    margin = request * timesteps
+    if (indicator & 0x40) > 0:
+        # Greedy requests: ``verify`` stores each position's argmax at the first row.
+        token = tl.load(indices_ptr + margin * max_k + step)
+    else:
+        # The draw ``verify`` makes past an all-accepted window: Gumbel-max over the
+        # position's candidates, keyed by the slot's seed, offset and the position.
+        columns = tl.arange(0, max_k)
+        row = (margin + step) * max_k
+        probabilities = tl.load(values_ptr + row + columns)
+        indices = tl.load(indices_ptr + row + columns)
+        gumbel = philox_gumbel(philox_key(seeds_ptr, offsets_ptr, slot, step), indices)
+        selection = tl.argmax(libdevice.fast_logf(probabilities) - gumbel, axis=0)
+        token = tl.sum(tl.where(columns == selection, indices, 0))
+    if enable_pdl:
+        gdc_launch_dependents()
+    tl.store(tokens_ptr + request, token)
+
+
+def synthetic_targets(
+    values: Tensor,
+    indices: Tensor,
+    state: SlotState,
+    slots: Tensor,
+    offsets: Tensor,
+    lengths: Tensor,
+    tokens: Tensor,
+    enable_pdl: bool,
+) -> Tensor:
+    """Draw each request's target token at a forced verify position.
+
+    Synthetic acceptance replaces ``verify``'s outcome with a forced length
+    ``L``: the first ``L - 1`` drafts, then a token drawn from the target at
+    position ``L - 1``. This draws that token from the candidates ``verify``
+    left in its scratch, as ``verify`` itself draws past an all-accepted
+    window: a greedy request's argmax, otherwise Gumbel-max over the
+    position's candidates with the slot's Philox noise for that position.
+
+    Args:
+        values: ``[B * T, MAX_K]`` fp32 candidate probabilities ``verify`` wrote.
+        indices: ``[B * T, MAX_K]`` int32 candidate tokens ``verify`` wrote.
+        state: The slot state ``verify`` ran with.
+        slots: ``[B]`` int64 slot of each request.
+        offsets: ``[P]`` int64 Philox offset of each slot, as passed to ``verify``.
+        lengths: ``[B]`` int32 forced lengths in ``[1, T]``.
+        tokens: ``[B]`` int32 output.
+        enable_pdl: Launch with programmatic dependent launch.
+
+    Returns:
+        ``tokens``.
+
+    Raises:
+        ValueError: The candidates are not dense ``[B * T, MAX_K]`` rows, or
+            their offsets would pass ``MAX_OFFSET``.
+    """
+    batch = slots.shape[0]
+    rows = values.shape[0]
+    if (
+        rows % batch
+        or indices.shape != values.shape
+        or values.shape[1] != MAX_K
+        or values.stride() != (MAX_K, 1)
+        or indices.stride() != (MAX_K, 1)
+    ):
+        raise ValueError(
+            f"sonic synthetic targets need dense [B * T, {MAX_K}] candidates for "
+            f"{batch} requests, got {tuple(values.shape)} and {tuple(indices.shape)}"
+        )
+    # The kernel keeps (request * T + position) * MAX_K in int32.
+    if rows * MAX_K > MAX_OFFSET:
+        raise ValueError(
+            f"sonic synthetic targets offsets pass {MAX_OFFSET}: {rows} rows"
+        )
+    _synthetic_target_kernel[(batch,)](
+        values,
+        indices,
+        state.indicators,
+        slots,
+        state.seeds,
+        offsets,
+        lengths,
+        tokens,
+        rows // batch,
+        MAX_K,
+        enable_pdl,
+        num_warps=1,
+    )
+    return tokens
