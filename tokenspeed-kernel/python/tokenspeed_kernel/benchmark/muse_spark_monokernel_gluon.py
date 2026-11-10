@@ -30,7 +30,20 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.benchmark.muse_spark_monokernel import WORLD, raw_experts
+from tokenspeed_kernel.benchmark.muse_spark_monokernel import (
+    DRAFT_HEAD,
+    HIDDEN,
+    OWNED,
+    WORLD,
+    draft_attn_rank,
+    draft_attn_shared,
+    draft_mlp_rank,
+    draft_mlp_shared,
+    draft_rope_table,
+    raw_experts,
+)
+
+_PAGE = 64  # KV cache tokens a page
 
 
 class _MoEWeights(torch.nn.Module):
@@ -178,3 +191,98 @@ def rank0_payloads(plan, parity: int, gpus: int, scratch) -> torch.Tensor:
         )
         & 0xFFFFFFFF
     )
+
+
+def draft_layer_inputs(prefix: int, rank: int, rows: int, device):
+    """Every input of one draft layer launch on ``rank`` at ``prefix``
+    context tokens: the host tensors (the attention and MLP halves' inputs,
+    the context, positions, slots and rotary table), the packed
+    ``DraftLayerWeights`` on ``device``, and the launch's runtime tensors.
+
+    Returns:
+        ``(host, weights, runtime)``.
+    """
+    from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import draft_layer
+
+    parts, residual, in_gain, a_coef, a_base, q_norm, k_norm = draft_attn_shared(
+        prefix, rows
+    )
+    qkv_w, o_w, ctx_k, ctx_v = draft_attn_rank(prefix, rank, rows)
+    _, _, post_gain, m_coef, m_base = draft_mlp_shared(prefix, rows)
+    gu_w, down_w = draft_mlp_rank(prefix, rank)
+    end = prefix + rows
+    pages = (end + _PAGE - 1) // _PAGE
+    g = torch.Generator().manual_seed(prefix)
+    table = torch.randperm(4 * pages + 8, generator=g)[: pages + 1].to(torch.int32)
+    k_cache = torch.zeros((4 * pages + 8) * _PAGE, 1, DRAFT_HEAD, dtype=torch.bfloat16)
+    v_cache = torch.zeros_like(k_cache)
+    tok = torch.arange(prefix)
+    cslot = table[tok // _PAGE].long() * _PAGE + tok % _PAGE
+    k_cache[cslot, 0] = ctx_k[:prefix]
+    v_cache[cslot, 0] = ctx_v[:prefix]
+    btok = prefix + torch.arange(rows)
+    slots = table[btok // _PAGE].long() * _PAGE + btok % _PAGE
+    own = slice(rank * OWNED, (rank + 1) * OWNED)
+    host = dict(
+        parts=parts,
+        residual=residual,
+        in_gain=in_gain,
+        post_gain=post_gain,
+        a_coef=a_coef,
+        a_base=a_base,
+        m_coef=m_coef,
+        m_base=m_base,
+        q_norm=q_norm,
+        k_norm=k_norm,
+        qkv_w=qkv_w,
+        o_w=o_w,
+        gu_w=gu_w,
+        down_w=down_w,
+        ctx_k=ctx_k,
+        ctx_v=ctx_v,
+        positions=btok.to(torch.int32),
+        slots=slots,
+        cos_sin=draft_rope_table(end + 8),
+        end=end,
+    )
+    weights = draft_layer.pack_draft_layer(
+        {
+            "input_norm": in_gain,
+            "post_norm": post_gain,
+            "attn_coef": a_coef,
+            "mlp_coef": m_coef,
+            "attn_base": a_base,
+            "mlp_base": m_base,
+            "qkv": qkv_w,
+            "q_norm": q_norm,
+            "k_norm": k_norm,
+            "o_proj": o_w,
+            "gate_up": gu_w,
+            "down": down_w,
+        },
+        rank,
+    )
+    weights = draft_layer.DraftLayerWeights(
+        rank=rank,
+        **{
+            f: getattr(weights, f).to(device)
+            for f in weights.__dataclass_fields__
+            if f != "rank"
+        },
+    )
+    runtime = dict(
+        x=parts[rank].to(device),
+        residual=residual.to(device),
+        residual_out=torch.zeros(rows, HIDDEN, dtype=torch.bfloat16, device=device),
+        out=torch.zeros(rows, HIDDEN, dtype=torch.bfloat16, device=device),
+        final_gain=None,
+        normed=None,
+        seq_len=torch.full((1,), end, dtype=torch.int32, device=device),
+        positions=host["positions"].to(device),
+        slots=slots.to(device),
+        page_table=table.to(device)[None],  # one request's row
+        k_cache=k_cache.to(device),
+        v_cache=v_cache.to(device),
+        cos_sin=host["cos_sin"].to(device),
+    )
+    return host, weights, runtime

@@ -9,6 +9,9 @@ scratch and every rank's process.
 - `layer_bench.py`: one target decoder layer (sliding or full attention,
   1 to 16 rows). With `--gpus` 1, 2 or 4 it stands in for the absent ranks;
   the numbers are for iteration, so confirm a kept change on 8 GPUs.
+- `draft_layer_bench.py`: the DFlash2 draft layer (one launch a layer, five
+  layers' weights rotating) on 8 GPUs at 8 rows.
+- `draft_head_bench.py`: the draft head's candidate selection on 8 GPUs.
 
 The inputs are `tokenspeed_kernel.benchmark.muse_spark_monokernel`'s (and its `_gluon` module's gfx950 layouts), the
 same the kernel tests in `tokenspeed-kernel/test/amd/gfx950/ops/monokernel`

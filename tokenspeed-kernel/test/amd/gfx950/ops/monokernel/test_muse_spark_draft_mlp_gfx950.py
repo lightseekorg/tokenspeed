@@ -30,6 +30,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from tokenspeed_kernel.benchmark import muse_spark_monokernel as inputs
 from utils import is_cdna4
 
 if not is_cdna4():
@@ -230,35 +231,6 @@ def _plan(rows: int) -> Plan:
     )
 
 
-def _shared(launch: int, rows: int):
-    """Every rank's BF16 attention partial, the residual, and the replicated
-    weights: the norm gain, the coefficient projection and base_kernel."""
-    g = torch.Generator().manual_seed(4100 + launch)
-    parts = [
-        (torch.randn(rows, HIDDEN, generator=g) * 0.5).to(torch.bfloat16)
-        for _ in range(WORLD)
-    ]
-    residual = (torch.randn(rows, HIDDEN, generator=g) * 2).to(torch.bfloat16)
-    gain = (1 + 0.1 * torch.randn(HIDDEN, generator=g)).to(torch.bfloat16)
-    coef_w = (torch.randn(ref.COEFFICIENTS, HIDDEN, generator=g) * 0.01).to(
-        torch.bfloat16
-    )
-    base = (0.5 + 0.1 * torch.randn(2, ref.TAPS, HIDDEN, generator=g)).to(
-        torch.bfloat16
-    )
-    return parts, residual, gain, coef_w, base
-
-
-def _rank_weights(launch: int, rank: int):
-    """This rank's gate/up rows and down columns."""
-    g = torch.Generator().manual_seed(5200 + 10 * launch + rank)
-    gu = (torch.randn(2 * ref.INTER_RANK, HIDDEN, generator=g) * 0.02).to(
-        torch.bfloat16
-    )
-    down = (torch.randn(HIDDEN, ref.INTER_RANK, generator=g) * 0.02).to(torch.bfloat16)
-    return gu, down
-
-
 def _close(got: torch.Tensor, want: torch.Tensor) -> None:
     """Within one BF16 step, or a step of the row's largest value where a
     sum cancels to near zero."""
@@ -291,8 +263,8 @@ def _worker(rank: int, port: int, rows: int) -> None:
         # copies alternate).
         for k in range(LAUNCHES):
             step = 11 + k
-            parts, residual, gain, coef_w, base = _shared(k, rows)
-            gu_w, down_w = _rank_weights(k, rank)
+            parts, residual, gain, coef_w, base = inputs.draft_mlp_shared(k, rows)
+            gu_w, down_w = inputs.draft_mlp_rank(k, rank)
             residual_out = torch.zeros(
                 rows, HIDDEN, dtype=torch.bfloat16, device=device
             )

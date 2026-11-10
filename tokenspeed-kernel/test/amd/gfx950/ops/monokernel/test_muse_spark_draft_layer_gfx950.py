@@ -33,6 +33,7 @@ import test_muse_spark_draft_mlp_gfx950 as mlp_t
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from tokenspeed_kernel.benchmark import muse_spark_monokernel_gluon as gluon_inputs
 from utils import assert_no_triton_compile, is_cdna4
 
 if not is_cdna4():
@@ -70,93 +71,6 @@ def plan(rows: int, last: bool) -> Plan:
     return draft_layer.layer_plan(rows, last)
 
 
-def layer_inputs(prefix: int, rank: int, rows: int, device):
-    """Every input of one launch on ``rank``: the shared tensors from the two
-    halves' tests, this rank's weights, and the paged context cache."""
-    parts, residual, in_gain, a_coef, a_base, q_norm, k_norm = attn_t._half_shared(
-        prefix, rows
-    )
-    qkv_w, o_w, ctx_k, ctx_v = attn_t._half_rank(prefix, rank, rows)
-    _, _, post_gain, m_coef, m_base = mlp_t._shared(prefix, rows)
-    gu_w, down_w = mlp_t._rank_weights(prefix, rank)
-    end = prefix + rows
-    pages = (end + PAGE - 1) // PAGE
-    g = torch.Generator().manual_seed(prefix)
-    table = torch.randperm(4 * pages + 8, generator=g)[: pages + 1].to(torch.int32)
-    k_cache = torch.zeros((4 * pages + 8) * PAGE, 1, HEAD, dtype=torch.bfloat16)
-    v_cache = torch.zeros_like(k_cache)
-    tok = torch.arange(prefix)
-    cslot = table[tok // PAGE].long() * PAGE + tok % PAGE
-    k_cache[cslot, 0] = ctx_k[:prefix]
-    v_cache[cslot, 0] = ctx_v[:prefix]
-    btok = prefix + torch.arange(rows)
-    slots = table[btok // PAGE].long() * PAGE + btok % PAGE
-    own = slice(rank * OWNED, (rank + 1) * OWNED)
-    host = dict(
-        parts=parts,
-        residual=residual,
-        in_gain=in_gain,
-        post_gain=post_gain,
-        a_coef=a_coef,
-        a_base=a_base,
-        m_coef=m_coef,
-        m_base=m_base,
-        q_norm=q_norm,
-        k_norm=k_norm,
-        qkv_w=qkv_w,
-        o_w=o_w,
-        gu_w=gu_w,
-        down_w=down_w,
-        ctx_k=ctx_k,
-        ctx_v=ctx_v,
-        positions=btok.to(torch.int32),
-        slots=slots,
-        cos_sin=attn_t.rope_table(end + 8),
-        end=end,
-    )
-    weights = draft_layer.pack_draft_layer(
-        {
-            "input_norm": in_gain,
-            "post_norm": post_gain,
-            "attn_coef": a_coef,
-            "mlp_coef": m_coef,
-            "attn_base": a_base,
-            "mlp_base": m_base,
-            "qkv": qkv_w,
-            "q_norm": q_norm,
-            "k_norm": k_norm,
-            "o_proj": o_w,
-            "gate_up": gu_w,
-            "down": down_w,
-        },
-        rank,
-    )
-    weights = draft_layer.DraftLayerWeights(
-        rank=rank,
-        **{
-            f: getattr(weights, f).to(device)
-            for f in weights.__dataclass_fields__
-            if f != "rank"
-        },
-    )
-    runtime = dict(
-        x=parts[rank].to(device),
-        residual=residual.to(device),
-        residual_out=torch.zeros(rows, HIDDEN, dtype=torch.bfloat16, device=device),
-        out=torch.zeros(rows, HIDDEN, dtype=torch.bfloat16, device=device),
-        final_gain=None,
-        normed=None,
-        seq_len=torch.full((1,), end, dtype=torch.int32, device=device),
-        positions=host["positions"].to(device),
-        slots=slots.to(device),
-        page_table=table.to(device)[None],  # one request's row
-        k_cache=k_cache.to(device),
-        v_cache=v_cache.to(device),
-        cos_sin=host["cos_sin"].to(device),
-    )
-    return host, weights, runtime
-
-
 def _close(got: torch.Tensor, want: torch.Tensor) -> None:
     """Within one BF16 step, or a step of the largest value where a sum
     cancels to near zero."""
@@ -189,7 +103,9 @@ def _worker(rank: int, port: int, prefix: int) -> None:
         group.finish_prepare()
         step = 31
         for layer in (2, 3, 4):
-            host, weights, rt = layer_inputs(prefix + layer, rank, rows, device)
+            host, weights, rt = gluon_inputs.draft_layer_inputs(
+                prefix + layer, rank, rows, device
+            )
             last = layer == 4
             if last:
                 # The last layer runs the draft's final norm in place of
@@ -342,8 +258,12 @@ def _two_requests_worker(rank: int, port: int, prefixes: tuple[int, int]) -> Non
             last = layer == 4
             # One layer's weights; each request its own rows, context and
             # pages of one cache (request b's pages after request a's).
-            _, weights, a = layer_inputs(prefixes[0] + layer, rank, rows, device)
-            _, _, b = layer_inputs(prefixes[1] + layer, rank, rows, device)
+            _, weights, a = gluon_inputs.draft_layer_inputs(
+                prefixes[0] + layer, rank, rows, device
+            )
+            _, _, b = gluon_inputs.draft_layer_inputs(
+                prefixes[1] + layer, rank, rows, device
+            )
             pages_a = a["k_cache"].shape[0] // PAGE
             b["page_table"] = b["page_table"] + pages_a
             b["slots"] = b["slots"] + pages_a * PAGE
@@ -437,7 +357,7 @@ def test_one_binary_serves_every_layer_step_and_length():
     peer_bases = torch.zeros(WORLD, dtype=torch.int64, device=device)
 
     def compile_launch(layer: int, step: int, prefix: int) -> None:
-        _, weights, rt = layer_inputs(prefix, 0, rows, device)
+        _, weights, rt = gluon_inputs.draft_layer_inputs(prefix, 0, rows, device)
         if layer == 4:
             rt["out"] = None
             rt["final_gain"] = torch.ones(OWNED, device=device)

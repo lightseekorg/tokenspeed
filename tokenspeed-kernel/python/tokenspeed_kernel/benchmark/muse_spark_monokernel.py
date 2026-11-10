@@ -127,3 +127,111 @@ def raw_experts(rank: int, experts: int):
         118, 123, (experts, POOLED, INTER // 32), dtype=torch.uint8, generator=g
     )
     return w13, s13, w2, s2
+
+
+# The DFlash2 draft (5 layers, head_dim 128, NeoX RoPE, 2-tap block conv).
+DRAFT_HEAD, DRAFT_Q_HEADS, DRAFT_QKV = 128, 8, 1280
+DRAFT_INTER_RANK = 28672 // WORLD  # gate rows and up rows a rank
+DRAFT_TAPS, DRAFT_GROUP_SIZE = 2, 16
+DRAFT_COEFFICIENTS = 2 * DRAFT_TAPS * (HIDDEN // DRAFT_GROUP_SIZE)
+# The draft head: a vocabulary shard a rank, the candidate selector's rank,
+# the candidates a step, the logit scale and softcap.
+HEAD_VOCAB, HEAD_SHARD, HEAD_RANK_DIM, HEAD_TOPK = 202048, 25256, 256, 16
+# The logit scale is the draft config's output_multiplier, the softcap its
+# final_logit_softcapping.
+HEAD_SCALE, HEAD_SOFTCAP = 0.1767766952966369, 20.0
+
+
+def draft_rope_table(positions: int) -> torch.Tensor:
+    """FP32 ``[positions, 128]``: cos then sin of the draft's 64 NeoX
+    frequencies."""
+    inv = 1.0 / 500000.0 ** (
+        torch.arange(0, DRAFT_HEAD, 2, dtype=torch.float64) / DRAFT_HEAD
+    )
+    angles = torch.arange(positions, dtype=torch.float64)[:, None] * inv[None, :]
+    return torch.cat([angles.cos(), angles.sin()], dim=1).float()
+
+
+def _draft_half(g: torch.Generator, rows: int):
+    parts = [
+        (torch.randn(rows, HIDDEN, generator=g) * 0.5).to(torch.bfloat16)
+        for _ in range(WORLD)
+    ]
+    residual = (torch.randn(rows, HIDDEN, generator=g) * 2).to(torch.bfloat16)
+    gain = (1 + 0.1 * torch.randn(HIDDEN, generator=g)).to(torch.bfloat16)
+    coef_w = (torch.randn(DRAFT_COEFFICIENTS, HIDDEN, generator=g) * 0.01).to(
+        torch.bfloat16
+    )
+    base = (0.5 + 0.1 * torch.randn(2, DRAFT_TAPS, HIDDEN, generator=g)).to(
+        torch.bfloat16
+    )
+    return parts, residual, gain, coef_w, base
+
+
+def draft_attn_shared(prefix: int, rows: int):
+    """The draft attention half's replicated inputs: every rank's BF16 MLP
+    partial of the previous layer, the residual, the norm gain, the
+    coefficient projection, base_kernel, and the q / k norm gains."""
+    g = torch.Generator().manual_seed(7100 + prefix)
+    parts, residual, gain, coef_w, base = _draft_half(g, rows)
+    q_norm = (1 + 0.1 * torch.randn(DRAFT_HEAD, generator=g)).to(torch.bfloat16)
+    k_norm = (1 + 0.1 * torch.randn(DRAFT_HEAD, generator=g)).to(torch.bfloat16)
+    return parts, residual, gain, coef_w, base, q_norm, k_norm
+
+
+def draft_attn_rank(prefix: int, rank: int, rows: int):
+    """``rank``'s qkv rows and o_proj columns, and its KV head's ``prefix``
+    context keys and values."""
+    g = torch.Generator().manual_seed(8300 + 10 * prefix + rank)
+    qkv = (torch.randn(DRAFT_QKV, HIDDEN, generator=g) * 0.02).to(torch.bfloat16)
+    o = (torch.randn(HIDDEN, DRAFT_Q_HEADS * DRAFT_HEAD, generator=g) * 0.03).to(
+        torch.bfloat16
+    )
+    ctx_k = torch.randn(max(prefix, 1), DRAFT_HEAD, generator=g).to(torch.bfloat16)
+    ctx_v = torch.randn(max(prefix, 1), DRAFT_HEAD, generator=g).to(torch.bfloat16)
+    return qkv, o, ctx_k, ctx_v
+
+
+def draft_mlp_shared(launch: int, rows: int):
+    """The draft MLP half's replicated inputs: every rank's BF16 attention
+    partial, the residual, the norm gain, the coefficient projection and
+    base_kernel."""
+    return _draft_half(torch.Generator().manual_seed(4100 + launch), rows)
+
+
+def draft_mlp_rank(launch: int, rank: int):
+    """``rank``'s gate / up rows and down columns."""
+    g = torch.Generator().manual_seed(5200 + 10 * launch + rank)
+    gu = (torch.randn(2 * DRAFT_INTER_RANK, HIDDEN, generator=g) * 0.02).to(
+        torch.bfloat16
+    )
+    down = (torch.randn(HIDDEN, DRAFT_INTER_RANK, generator=g) * 0.02).to(
+        torch.bfloat16
+    )
+    return gu, down
+
+
+def draft_head_shared(seed: int, steps: int, device):
+    """The draft head's replicated inputs: the normed hidden rows of the
+    ``steps`` draft steps, the selector's projections, and the anchor token."""
+    g = torch.Generator(device=device).manual_seed(seed)
+
+    def randn(*shape, std):
+        return (torch.randn(*shape, generator=g, device=device) * std).to(
+            torch.bfloat16
+        )
+
+    x = randn(steps, HIDDEN, std=1.0)
+    hidden_proj = randn(HEAD_RANK_DIM, HIDDEN, std=0.01)
+    pred = randn(HEAD_VOCAB, HEAD_RANK_DIM, std=0.1)
+    succ = randn(HEAD_VOCAB, HEAD_RANK_DIM, std=0.1)
+    anchor = torch.randint(0, HEAD_VOCAB, (1,), generator=g, device=device)
+    return x, hidden_proj, pred, succ, anchor
+
+
+def draft_head_shard(seed: int, rank: int, device) -> torch.Tensor:
+    """``rank``'s BF16 vocabulary shard of the LM head."""
+    g = torch.Generator(device=device).manual_seed(seed * 100 + rank + 1)
+    return (torch.randn(HEAD_SHARD, HIDDEN, generator=g, device=device) * 0.05).to(
+        torch.bfloat16
+    )

@@ -30,6 +30,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from tokenspeed_kernel.benchmark import muse_spark_monokernel as inputs
 from utils import is_cdna4
 
 if not is_cdna4():
@@ -116,13 +117,6 @@ def _plan(rows: int, world: int = 1) -> Plan:
     )
 
 
-def rope_table(positions: int) -> torch.Tensor:
-    """FP32 ``[positions, 128]``: cos then sin of the 64 NeoX frequencies."""
-    inv_freq = 1.0 / THETA ** (torch.arange(0, HEAD, 2, dtype=torch.float64) / HEAD)
-    angles = torch.arange(positions, dtype=torch.float64)[:, None] * inv_freq[None, :]
-    return torch.cat([angles.cos(), angles.sin()], dim=1).float()
-
-
 def reference_head(parts, w, cos, sin, rotated: bool) -> torch.Tensor:
     """One head of one row: the K parts' sum rounded to BF16, then (q and k)
     RMSNorm and NeoX RoPE in FP32, rounded once."""
@@ -146,7 +140,7 @@ def test_head_norms_rotates_and_writes_the_block_rows(rows: int):
     device = torch.device("cuda")
     plan = _plan(rows).only(("head",))
     scratch = torch.zeros(plan.scratch_pairs, dtype=torch.int64, device=device)
-    table = rope_table(70000)
+    table = inputs.draft_rope_table(70000)
     q_norm = (1 + 0.1 * torch.randn(HEAD, generator=g)).to(torch.bfloat16)
     k_norm = (1 + 0.1 * torch.randn(HEAD, generator=g)).to(torch.bfloat16)
     # The block of a request at 52 000 tokens: positions past 2^15 and slots
@@ -432,37 +426,6 @@ def attn_half_kernel(
         )
 
 
-def _half_shared(prefix: int, rows: int):
-    """The ranks' MLP partials of the previous layer, the residual, and the
-    replicated weights and context cache."""
-    g = torch.Generator().manual_seed(7100 + prefix)
-    parts = [
-        (torch.randn(rows, HIDDEN, generator=g) * 0.5).to(torch.bfloat16)
-        for _ in range(WORLD)
-    ]
-    residual = (torch.randn(rows, HIDDEN, generator=g) * 2).to(torch.bfloat16)
-    gain = (1 + 0.1 * torch.randn(HIDDEN, generator=g)).to(torch.bfloat16)
-    coef_w = (torch.randn(ref.COEFFICIENTS, HIDDEN, generator=g) * 0.01).to(
-        torch.bfloat16
-    )
-    base = (0.5 + 0.1 * torch.randn(2, ref.TAPS, HIDDEN, generator=g)).to(
-        torch.bfloat16
-    )
-    q_norm = (1 + 0.1 * torch.randn(HEAD, generator=g)).to(torch.bfloat16)
-    k_norm = (1 + 0.1 * torch.randn(HEAD, generator=g)).to(torch.bfloat16)
-    return parts, residual, gain, coef_w, base, q_norm, k_norm
-
-
-def _half_rank(prefix: int, rank: int, rows: int):
-    """This rank's qkv rows and o_proj columns, and its KV head's context."""
-    g = torch.Generator().manual_seed(8300 + 10 * prefix + rank)
-    qkv = (torch.randn(QKV, HIDDEN, generator=g) * 0.02).to(torch.bfloat16)
-    o = (torch.randn(HIDDEN, Q_HEADS * HEAD, generator=g) * 0.03).to(torch.bfloat16)
-    ctx_k = torch.randn(max(prefix, 1), HEAD, generator=g).to(torch.bfloat16)
-    ctx_v = torch.randn(max(prefix, 1), HEAD, generator=g).to(torch.bfloat16)
-    return qkv, o, ctx_k, ctx_v
-
-
 def _close(got: torch.Tensor, want: torch.Tensor) -> None:
     """Within one BF16 step, or a step of the largest value where a sum
     cancels to near zero."""
@@ -499,8 +462,10 @@ def _half_worker(rank: int, port: int, prefix: int) -> None:
         scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
         own = slice(rank * OWNED, (rank + 1) * OWNED)
         group.finish_prepare()
-        parts, residual, gain, coef_w, base, q_norm, k_norm = _half_shared(prefix, rows)
-        qkv_w, o_w, ctx_k, ctx_v = _half_rank(prefix, rank, rows)
+        parts, residual, gain, coef_w, base, q_norm, k_norm = inputs.draft_attn_shared(
+            prefix, rows
+        )
+        qkv_w, o_w, ctx_k, ctx_v = inputs.draft_attn_rank(prefix, rank, rows)
         end = prefix + rows
         pages = (end + PAGE - 1) // PAGE
         g = torch.Generator().manual_seed(prefix)
@@ -515,7 +480,7 @@ def _half_worker(rank: int, port: int, prefix: int) -> None:
         slots = table[btok // PAGE].long() * PAGE + btok % PAGE
         positions = btok.to(torch.int32)
         table_d, k_d, v_d = table.to(device), k_cache.to(device), v_cache.to(device)
-        cos_sin = rope_table(end + 8)
+        cos_sin = inputs.draft_rope_table(end + 8)
         residual_out = torch.zeros(rows, HIDDEN, dtype=torch.bfloat16, device=device)
         out = torch.zeros(rows, HIDDEN, dtype=torch.bfloat16, device=device)
         step = 21

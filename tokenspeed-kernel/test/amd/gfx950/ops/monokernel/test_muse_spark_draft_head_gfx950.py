@@ -31,6 +31,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from tokenspeed_kernel.benchmark import muse_spark_monokernel as inputs
 from utils import assert_no_triton_compile, is_cdna4
 
 if not is_cdna4():
@@ -44,33 +45,15 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import (  # noqa: E4
     draft_head,
 )
 
-WORLD, HIDDEN, SHARD, VOCAB, RANK_DIM, TOPK = 8, 8192, 25256, 202048, 256, 16
+WORLD, HIDDEN = inputs.WORLD, inputs.HIDDEN
+SHARD, VOCAB, RANK_DIM, TOPK = (
+    inputs.HEAD_SHARD,
+    inputs.HEAD_VOCAB,
+    inputs.HEAD_RANK_DIM,
+    inputs.HEAD_TOPK,
+)
 STEPS = draft_head.STEPS
-SCALE, SOFTCAP = 0.1767766952966369, 20.0
-
-
-def _shared(seed: int, device):
-    """The inputs every rank holds: the normed hidden rows, the selector."""
-    g = torch.Generator(device=device).manual_seed(seed)
-
-    def randn(*shape, std):
-        return (torch.randn(*shape, generator=g, device=device) * std).to(
-            torch.bfloat16
-        )
-
-    x = randn(STEPS, HIDDEN, std=1.0)
-    hidden_proj = randn(RANK_DIM, HIDDEN, std=0.01)
-    pred = randn(VOCAB, RANK_DIM, std=0.1)
-    succ = randn(VOCAB, RANK_DIM, std=0.1)
-    anchor = torch.randint(0, VOCAB, (1,), generator=g, device=device)
-    return x, hidden_proj, pred, succ, anchor
-
-
-def _shard(seed: int, rank: int, device) -> torch.Tensor:
-    g = torch.Generator(device=device).manual_seed(seed * 100 + rank + 1)
-    return (torch.randn(SHARD, HIDDEN, generator=g, device=device) * 0.05).to(
-        torch.bfloat16
-    )
+SCALE, SOFTCAP = inputs.HEAD_SCALE, inputs.HEAD_SOFTCAP
 
 
 def _reference_candidates(x, shard, rank):
@@ -120,8 +103,10 @@ def _worker(rank: int, port: int, seed: int) -> None:
         plan = draft_head.head_plan(2 * STEPS)
         scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
         group.finish_prepare()
-        x, hidden_proj, pred, succ, anchor = _shared(seed, device)
-        shard = _shard(seed, rank, device)
+        x, hidden_proj, pred, succ, anchor = inputs.draft_head_shared(
+            seed, STEPS, device
+        )
+        shard = inputs.draft_head_shard(seed, rank, device)
         weights = draft_head.pack_draft_head(
             {
                 "lm_head": shard,
@@ -163,7 +148,7 @@ def _worker(rank: int, port: int, seed: int) -> None:
         # Two requests' steps in one launch: each request's outputs are the
         # bits of its own launch (the rows are independent, the anchor and
         # step 0's predecessors per request).
-        xb, _, _, _, anchor_b = _shared(seed + 1, device)
+        xb, _, _, _, anchor_b = inputs.draft_head_shared(seed + 1, STEPS, device)
         one = {}
         for name, xs, first, step in (("a", x, anchor, 7), ("b", xb, anchor_b, 8)):
             one[name] = {k: torch.empty_like(v) for k, v in outs.items()}
@@ -301,10 +286,10 @@ def test_one_binary_serves_every_step_and_block():
     first launch's binary. Another request count is another plan, which the
     guard must see compile."""
     dev = torch.device("cuda:0")
-    x, hidden_proj, pred, succ, anchor = _shared(0, dev)
+    x, hidden_proj, pred, succ, anchor = inputs.draft_head_shared(0, STEPS, dev)
     weights = draft_head.pack_draft_head(
         {
-            "lm_head": _shard(0, 0, dev),
+            "lm_head": inputs.draft_head_shard(0, 0, dev),
             "hidden_proj": hidden_proj,
             "pred_codebook": pred,
             "succ_codebook": succ,
