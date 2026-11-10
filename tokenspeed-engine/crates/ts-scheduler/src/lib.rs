@@ -648,8 +648,9 @@ impl Scheduler {
         ffi::sizes(self.get())
     }
 
-    /// Distinct LCM blocks held by running requests' block tables. The
-    /// tables keep the count as they change, so reading it walks nothing.
+    /// Cache blocks held by running requests. Taking the count walks every
+    /// live request's block tables, so its cost grows with the batch's
+    /// context; a caller on the round's path reuses it.
     pub fn active_lcm_blocks(&self) -> i32 {
         ffi::active_lcm_blocks(self.get())
     }

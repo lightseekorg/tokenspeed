@@ -183,14 +183,9 @@ The hash tables retain computed key hashes where the standard library supports
 it: walking a bucket or erasing an entry must not repeatedly hash its full
 content digest. Key equality and eviction order remain unchanged.
 
-The per-step page gauge composes two O(1) quantities the same way: empty
-parents come from the pool, active parents from the live requests' block
+The per-step page gauge composes two O(1)-or-cheaper quantities the same way:
+empty parents come from the pool, active parents from the live requests' block
 tables, and cache-only residency is the remainder `total - empty - active`.
-The tables keep the active count themselves: each slot holding a block owns a
-`ParentRef` (`cache/core/active_parents.h`) that counts the block's parent in
-the coordinator's `ActiveParents` for as long as the slot holds it, so reading
-the gauge walks nothing. The count is a holder fact kept by the holders; the
-pool never sees it. Debug builds check it against a walk of the tables.
 
 ## Who is allowed to see what
 
@@ -271,8 +266,7 @@ entry *values*, however, are **`CacheBlock` ids** — handles to the physical
 storage the cache layer allocated. The scheduler owns allocation, so its output names that storage directly.
 Consumers outside the cache layer treat the ids as opaque.
 Export preserves every logical slot, including holes in a released prefix.
-Every slot below the released prefix is null, so export skips reading those
-slots and they hold no active parent.
+Export and active-parent accounting skip reading those released references.
 On PD decode admission, a partial leading history block is a landing slot
 for the prefill peer. Installing its private writable block also rewinds
 the released-prefix frontier to include that slot: the outgoing destination
