@@ -149,8 +149,7 @@ def _get_attn_proj_quant_config(
 def _uses_packed_fp8_output(projection: RowParallelLinear) -> bool:
     method = projection.quant_method
     return (
-        envs.TOKENSPEED_FUSE_FP8_OUTPUT_QUANT.get()
-        and isinstance(method, Fp8LinearMethod)
+        isinstance(method, Fp8LinearMethod)
         and method.block_quant
         and method.quant_config.weight_block_size[1] == 128
         and projection.weight_scale_inv.dtype == torch.int32
@@ -293,9 +292,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
 
-        fp8_proj = enable_fp8_attn_proj
         if (
-            not fp8_proj
+            not enable_fp8_attn_proj
             and isinstance(quant_config, Fp8Config)
             and not quant_config.is_checkpoint_fp8_serialized
         ):
@@ -304,7 +302,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             quant_config = None
         quant_config = _get_attn_proj_quant_config(
             quant_config,
-            enabled=fp8_proj,
+            enabled=enable_fp8_attn_proj,
         )
         qkvz_unquant = _gdn_group_unquantized(
             prefix, ("in_proj_qkv", "in_proj_z"), quant_config
@@ -887,12 +885,15 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             dtype=torch.get_default_dtype(),
         )
 
-        fp8_proj = enable_fp8_attn_proj
         attn_quant_config = _get_attn_proj_quant_config(
             quant_config,
-            enabled=fp8_proj,
+            enabled=enable_fp8_attn_proj,
         )
-        if not fp8_proj and quant_config and quant_config.get_name() == "nvfp4":
+        if (
+            not enable_fp8_attn_proj
+            and quant_config
+            and quant_config.get_name() == "nvfp4"
+        ):
             attn_quant_config = None
 
         self.qkv_proj = QKVParallelLinear(

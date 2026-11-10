@@ -420,12 +420,15 @@ class Qwen4ExpAttentionDecoderLayer(
             is_neox_style=True,
             dtype=torch.get_default_dtype(),
         )
-        fp8_proj = enable_fp8_attn_proj
         attn_quant_config = _get_attn_proj_quant_config(
             quant_config,
-            enabled=fp8_proj,
+            enabled=enable_fp8_attn_proj,
         )
-        if not fp8_proj and quant_config and quant_config.get_name() == "nvfp4":
+        if (
+            not enable_fp8_attn_proj
+            and quant_config
+            and quant_config.get_name() == "nvfp4"
+        ):
             attn_quant_config = None
         self.qkv_proj = QKVParallelLinear(
             config.hidden_size,

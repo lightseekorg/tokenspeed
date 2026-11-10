@@ -119,8 +119,7 @@ checkpoint config.
 With packed DeepGEMM scales, eligible BF16 output projections fuse activation
 quantization with the full-attention sigmoid gate or GDN per-head RMSNorm and
 SiLU/sigmoid gate. This path preserves the BF16 rounding boundary and supports
-group128, CUDA Graph and PDL. Set `TOKENSPEED_FUSE_FP8_OUTPUT_QUANT=0`
-to use separate launches.
+group128, CUDA Graph and PDL.
 
 ## Numerics
 

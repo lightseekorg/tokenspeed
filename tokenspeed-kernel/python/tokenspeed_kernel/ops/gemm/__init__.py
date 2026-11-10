@@ -1354,23 +1354,26 @@ def prepare_fp8_block_weight(
     *,
     block_size: list[int],
     solution: str | None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, bool]:
     """Apply a pinned block-FP8 solution's load-time weight preprocessor.
 
     Automatic dispatch retains canonical weights because its kernel selection
     can depend on the activation row count. Callers must use the same solution
     in subsequent mm calls when preprocessing replaces their tensors. Solutions
     without a preprocessor leave validation to forward dispatch.
+
+    Returns (weight, scales, replaced), where replaced is true if the
+    preprocessor returned a different object for either tensor.
     """
     if solution is None:
-        return weight, scales
+        return weight, scales, False
     load_builtin_kernels()
     registry = KernelRegistry.get()
     if not any(
         spec.weight_preprocessor is not None
         for spec in registry.get_for_operator("gemm", "mm", solution=solution)
     ):
-        return weight, scales
+        return weight, scales, False
     kernel = select_kernel(
         "gemm",
         "mm",
@@ -1395,8 +1398,10 @@ def prepare_fp8_block_weight(
     )
     preprocessor = KernelRegistry.get().get_by_name(kernel.name).weight_preprocessor
     if preprocessor is None:
-        return weight, scales
-    return preprocessor(weight, scales)
+        return weight, scales, False
+    prepared_weight, prepared_scales = preprocessor(weight, scales)
+    replaced = prepared_weight is not weight or prepared_scales is not scales
+    return prepared_weight, prepared_scales, replaced
 
 
 def _prepared_fp8_scales(

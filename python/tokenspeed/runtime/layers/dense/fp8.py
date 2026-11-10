@@ -197,13 +197,13 @@ class Fp8LinearMethod(LinearMethodBase):
                 )
                 layer.input_scale = None
             solution = self._get_block_solution()
-            weight, scales = prepare_fp8_block_weight(
+            weight, scales, replaced = prepare_fp8_block_weight(
                 layer.weight,
                 layer.weight_scale_inv,
                 block_size=self.quant_config.weight_block_size,
                 solution=solution,
             )
-            if weight is not layer.weight or scales is not layer.weight_scale_inv:
+            if replaced:
                 layer.weight = Parameter(weight, requires_grad=False)
                 layer.weight_scale_inv = Parameter(scales, requires_grad=False)
                 self.block_solution = solution

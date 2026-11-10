@@ -172,7 +172,8 @@ retain their semantics; small-M BF16 keeps its existing bound.
 
 Explicit block-FP8 solutions prepare loaded weights through
 `prepare_fp8_block_weight`, which calls the selected kernel's
-`weight_preprocessor`. Dense layers pin that solution only when preprocessing replaces weight tensors.
+`weight_preprocessor` and reports whether it replaced either tensor. Dense
+layers use that flag to write back the tensors and pin the solution.
 Solutions without a preprocessor retain their existing parameters and forward
 dispatch, without load-time kernel selection.
 Automatic dispatch retains canonical weights for shape-dependent selection.

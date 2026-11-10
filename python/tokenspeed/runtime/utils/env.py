@@ -357,7 +357,6 @@ class Envs:
 
     # Quantization
     TOKENSPEED_NVFP4_GEMM_SWIGLU_NVFP4_QUANT = EnvBool(True)
-    TOKENSPEED_FUSE_FP8_OUTPUT_QUANT = EnvBool(True)
 
     # Communication
     # InfiniBand traffic class for NVSHMEM (DeepEP all-to-all). Read in every
