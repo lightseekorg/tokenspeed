@@ -550,7 +550,7 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
             return self.decode_projection
         parts = self.decode_projection_parts()
         if len({part.dtype for part in parts}) != 1:
-            raise TypeError(
+            raise ValueError(
                 "the decode projection packs one dtype, got "
                 f"{[part.dtype for part in parts]}"
             )
