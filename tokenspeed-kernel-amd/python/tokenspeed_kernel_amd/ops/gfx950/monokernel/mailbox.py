@@ -61,6 +61,7 @@ a poll writes nothing.
 
 from __future__ import annotations
 
+from tokenspeed_kernel_amd import _extern
 from tokenspeed_kernel_amd._triton import aggregate, gl, gluon
 from tokenspeed_kernel_amd.ops.gfx950.monokernel import schedule, trace
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import LAYER_SLOTS as _SLOTS
@@ -698,9 +699,8 @@ class Mailbox:
         gfx9 ``vmcnt`` counts stores), the CTA meets at a barrier, then one
         thread puts the pair. A consumer polls the flag, then loads the
         words."""
-        # asm: waits for this wave's stores; _extern.release_drain does the
-        # same once every launch of a mailbox kernel links its library.
-        gl.inline_asm("s_waitcnt vmcnt(0)")
+        # Wait for this wave's stores before the CTA publishes the flag.
+        _extern.release_drain()
         gl.barrier()
         lanes = gl.arange(0, 64 * gl.num_warps(), lane_layout(gl.num_warps()))
         _put(
@@ -736,8 +736,8 @@ class Mailbox:
         gl.static_assert(
             schedule.is_peer(self.plan, region), "raise_flag_peers needs a peer region"
         )
-        # asm: as in raise_flag.
-        gl.inline_asm("s_waitcnt vmcnt(0)")
+        # Wait for this wave's peer stores before the CTA publishes the flags.
+        _extern.release_drain()
         gl.barrier()
         W: gl.constexpr = schedule.world(self.plan)
         lanes = gl.arange(0, 64 * gl.num_warps(), lane_layout(gl.num_warps()))

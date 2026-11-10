@@ -40,6 +40,7 @@ from tokenspeed_kernel.ops.communication._iris import (  # noqa: E402
     IrisGroup,
     get_or_create_context,
 )
+from tokenspeed_kernel_amd._extern import extern_compile_options  # noqa: E402
 from tokenspeed_kernel_amd._triton import gl, gluon  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.monokernel import mailbox, schedule  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import (  # noqa: E402
@@ -286,6 +287,7 @@ def test_attention_takes_the_window_and_the_whole_block_for_every_row(
         plan.key,
         SPLITS,
         num_warps=8,
+        **extern_compile_options(),
     )
     torch.cuda.synchronize()
     # Every row sees the same keys: [max(end - 2048, 0), end), the block last.
@@ -542,6 +544,7 @@ def _half_worker(rank: int, port: int, prefix: int) -> None:
             rank,
             SPLITS,
             num_warps=8,
+            **extern_compile_options(),
         )
         torch.cuda.synchronize()
         tag = launch_tag(step, 0)

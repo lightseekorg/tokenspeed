@@ -39,6 +39,7 @@ from tokenspeed_kernel.ops.communication._iris import (  # noqa: E402
     IrisGroup,
     get_or_create_context,
 )
+from tokenspeed_kernel_amd._extern import extern_compile_options  # noqa: E402
 from tokenspeed_kernel_amd._triton import gl, gluon  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.monokernel import mailbox, schedule  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import (  # noqa: E402
@@ -218,6 +219,7 @@ def _worker(rank: int, port: int, rows: int, source_rows: int, out: str) -> None
                 plan.key,
                 rank,
                 num_warps=8,
+                **extern_compile_options(),
             )
             torch.cuda.synchronize()
             dist.barrier()

@@ -76,6 +76,10 @@ read the outputs with `payloads`.
 
 ## Launch contract
 
+- Kernels that call `Mailbox.raise_flag` or `raise_flag_peers`, including
+  through a stage, must pass `**extern_compile_options()` from
+  `tokenspeed_kernel_amd._extern` to both warmup and launch. It links the
+  release drain that waits for stores before the CTA publishes its flag.
 - The host builds a `plan.Plan` and passes `Plan.key` as the compile-time
   `PLAN`. A kernel compiles once for each plan, thus once for each row count
   and chain length.

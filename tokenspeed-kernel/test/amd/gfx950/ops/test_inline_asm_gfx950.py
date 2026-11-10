@@ -848,16 +848,6 @@ INLINE_ASM = {
         "a loop of uncached loads that retries only the late pairs' lanes",
         "a volatile load that a loop keeps, and a Gluon ballot (wave vote) op",
     ),
-    "raise_flag": (
-        _MONO + "mailbox:Mailbox.raise_flag",
-        "waits for this wave's stores before the CTA publishes them",
-        "_extern.release_drain, once every mailbox kernel links its library",
-    ),
-    "raise_flag_peers": (
-        _MONO + "mailbox:Mailbox.raise_flag_peers",
-        "waits for this wave's peer stores before the CTA publishes them",
-        "_extern.release_drain, once every mailbox kernel links its library",
-    ),
     "code_pointer": (
         _MONO + "code_warm:code_pointer",
         "reads the program counter (s_getpc_b64)",

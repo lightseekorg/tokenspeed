@@ -39,6 +39,7 @@ import functools
 from dataclasses import dataclass
 
 import torch
+from tokenspeed_kernel_amd._extern import extern_compile_options
 from tokenspeed_kernel_amd._triton import gl, gluon
 from tokenspeed_kernel_amd.ops.gfx950.monokernel import (
     code_warm,
@@ -719,13 +720,18 @@ def launch_gluon_muse_spark_draft_layer_gfx950(
         )
 
     kernel = gluon_muse_spark_draft_layer_gfx950.warmup(
-        *kernel_args((0, 0)), num_warps=8, grid=(plan.grid,)
+        *kernel_args((0, 0)),
+        num_warps=8,
+        grid=(plan.grid,),
+        **extern_compile_options(),
     )
     if compile_only:
         return
     # The code range is a runtime argument: the same binary.
     gluon_muse_spark_draft_layer_gfx950[(plan.grid,)](
-        *kernel_args(code_warm.text_range(kernel)), num_warps=8
+        *kernel_args(code_warm.text_range(kernel)),
+        num_warps=8,
+        **extern_compile_options(),
     )
 
 

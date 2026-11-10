@@ -45,6 +45,7 @@ from tokenspeed_kernel.ops.communication._iris import (  # noqa: E402
     IrisGroup,
     get_or_create_context,
 )
+from tokenspeed_kernel_amd._extern import extern_compile_options  # noqa: E402
 from tokenspeed_kernel_amd._triton import gl, gluon  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused._common import (  # noqa: E402
     _extract_gluon_raw_s,
@@ -313,6 +314,7 @@ def _worker(
                 plan.key,
                 rank,
                 num_warps=8,
+                **extern_compile_options(),
             )
             torch.cuda.synchronize()
             dist.barrier()
