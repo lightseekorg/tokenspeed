@@ -777,6 +777,49 @@ TEST_F(IndependentAdmissionRequeueTest, AStreamOfSmallerGrantedPromptsWaitsBehin
     }
 }
 
+// Under short-prefill-first ordering a granted prompt a requeue lets in is a
+// first admission like any other: it counts toward the oldest waiting
+// prompt's bypass allowance. Seven short prompts pass the old one, an eighth
+// after a requeue, so the old prompt goes before a later short one.
+TEST_F(IndependentAdmissionRequeueTest, ARequeuedAdmissionCountsTowardTheOldestPromptsBypasses) {
+    auto config = MakeConfig();
+    config.enable_short_prefill_first = true;
+    config.device_allocator.total_pages = 12;
+    config.cache_groups.front().total_pages = 12;
+    config.max_batch_size = 10;
+    SetTestSnapshotPool(config);
+    config_ = WithHostPackingFromDevice(config);
+    scheduler_ = std::make_unique<Scheduler>(config_);
+    SubmitReady("waiting", 7);  // with its decode reserve, 4 of the 11 pages
+    ASSERT_EQ(FindForwardBatch(PlanOnce())->request_ids, std::vector<std::string>{"waiting"});
+    SendForwardDone("waiting", {42});
+
+    SubmitReady("old", 9, 100);
+    Grant("old");
+    std::vector<std::string> shorts;
+    for (int k = 0; k < 7; ++k) {
+        shorts.push_back("short" + std::to_string(k));
+        SubmitReady(shorts.back(), 1, 1000 + 10 * k);  // 1 page
+        Grant(shorts.back());
+    }
+    // The short prompts fill the pool; the old one does not fit beside them.
+    ASSERT_EQ(FindForwardBatch(PlanOnce())->request_ids, shorts);
+    for (const auto& id : shorts) SendForwardDone(id, {7});
+
+    SubmitReady("requeued", 1, 2000);
+    Grant("requeued");
+    const auto requeue = PlanOnce();
+    ASSERT_EQ(FindForwardBatch(requeue)->request_ids, std::vector<std::string>{"requeued"});
+    ASSERT_EQ(scheduler_->Requeues(), 1u);
+    ASSERT_TRUE(requeue.remote_decode.has_value());
+    for (const auto& id : requeue.remote_decode->request_ids) Ack(id);
+    SendForwardDone("requeued", {7});
+
+    SubmitReady("late", 1, 3000);
+    Grant("late");
+    EXPECT_EQ(FindForwardBatch(PlanOnce())->request_ids, (std::vector<std::string>{"old", "late"}));
+}
+
 // With no computed prompt waiting for its destination, the pages a granted
 // prompt needs come back at transfer ACKs, as under early admission, and a
 // smaller granted prompt that fits still goes ahead of it.

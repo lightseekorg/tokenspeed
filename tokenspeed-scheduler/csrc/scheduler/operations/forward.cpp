@@ -2128,10 +2128,14 @@ void Scheduler::buildPrefillWorkerPlan(AdmissionFeedback& feedback, PlanBuild& b
         spdlog::info("[Scheduler] requeue: request {} ({} tokens) gives its pages to granted work", victim->Id(),
                      victim->TokenSize());
         feedback.admission_failed = false;
+        const bool first_admission = blocked->Is<fsm::Submitted>();
         if (auto admitted =
                 schedulePrefillCandidate(build.plan, feedback, blocked, build.token_budget, config_.decode_input_tokens,
                                          build.load_backs, build.kv_page_budget, /*yield_tokens=*/0,
                                          /*must_complete=*/false)) {
+            if (config_.enable_short_prefill_first && first_admission) {
+                recordPrefillBypass(first, blocked);
+            }
             pushOperation(build, *blocked, std::move(*admitted));
             blocked->TrackScheduledForward();
             return;

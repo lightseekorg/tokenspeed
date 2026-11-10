@@ -294,7 +294,8 @@ admission, including within one batch. Failed admissions and resident chunks
 do not count. When chunk yielding is also enabled, carried first admissions
 count toward the same allowance; the bounded carry scan retains FIFO order.
 On the fused role, a first admission granted after capacity retraction also
-counts; a resident chunk granted capacity does not.
+counts, and so does one a requeue lets in on the prefill role (§3.1); a
+resident chunk granted capacity does not.
 Priority cannot bypass resource or transfer dependencies, and
 an inadmissible protected prompt does not block other admissible requests.
 
