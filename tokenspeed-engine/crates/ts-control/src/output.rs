@@ -1854,6 +1854,7 @@ mod tests {
             None,
         );
         assert!(line.contains("ttft_ms=1000.0,"), "{line}");
+        assert!(line.contains("prefill_ms=0.0,"), "{line}");
         assert!(line.contains("decode_tps=0.5,"), "{line}");
     }
 
