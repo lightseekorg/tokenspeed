@@ -827,6 +827,51 @@ def test_prefill_topk_splits_from_384_rows(
     assert len(gathers) == (2 if split else 0)
 
 
+@pytest.mark.parametrize("gather_dtype", [torch.int16, torch.int32])
+@pytest.mark.parametrize("num_rows", [10, 8])
+def test_the_overlapped_prefill_topk_gathers_rows_in_their_order(
+    monkeypatch: pytest.MonkeyPatch, num_rows: int, gather_dtype: torch.dtype
+) -> None:
+    """The two-pass split hands back every row's selection in row order,
+    with the last rank's rows clipped (10 rows) or absent from the second
+    pass (8 rows), as one rank selecting every row would."""
+    from tokenspeed.runtime.distributed import Mapping
+    from tokenspeed.runtime.models import glm5
+
+    topk, per_rank = 4, 6
+
+    def select(rows, *, out, lens_out):
+        ids = torch.arange(rows.start, rows.stop, dtype=torch.int32)
+        out.copy_(ids.unsqueeze(1) * topk + torch.arange(topk, dtype=torch.int32))
+        lens_out.copy_(ids + 1)
+
+    # Two TP ranks, no process group: rank 1 runs first, rank 0 gathers its inputs.
+    sent = {0: [], 1: []}
+
+    def all_gather_single_async(output, input, group, *, backend):
+        assert backend == "comm" and output.dtype == input.dtype
+        sent[rank].append(input.clone())
+        if rank == 0:
+            output.copy_(torch.cat((input, sent[1][len(sent[0]) - 1])))
+        return SimpleNamespace(wait=lambda: None)
+
+    monkeypatch.setattr(glm5, "all_gather_single_async", all_gather_single_async)
+    for rank in (1, 0):
+        core = SimpleNamespace(mapping=Mapping(rank=rank, world_size=2, attn_tp_size=2))
+        selected, lens = (
+            glm5.GlmDsaSparseAttentionMixin._select_prefill_topk_rows_overlapped(
+                core, select, num_rows, per_rank, topk, gather_dtype, "cpu", "comm"
+            )
+        )
+
+    expected = torch.empty((num_rows, topk), dtype=torch.int32)
+    expected_lens = torch.empty((num_rows,), dtype=torch.int32)
+    select(slice(0, num_rows), out=expected, lens_out=expected_lens)
+    assert selected.dtype == gather_dtype
+    assert torch.equal(selected.to(torch.int32), expected)
+    assert torch.equal(lens, expected_lens)
+
+
 @requires_gpu
 def test_prefill_topk_rows_gather_through_the_k3_iris_state(
     monkeypatch: pytest.MonkeyPatch,

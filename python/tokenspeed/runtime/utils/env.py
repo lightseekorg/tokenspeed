@@ -313,6 +313,9 @@ class Envs:
     TOKENSPEED_K31_DSA_HISTORY_PREFETCH = EnvBool(False)
     # Experiment: gather half of the split prefill top-k while the other half selects.
     TOKENSPEED_K31_DSA_TOPK_GATHER_OVERLAP = EnvBool(False)
+    # Experiment TOKENSPEED_K31_GATHER_ROWS_GEMM (gather the KDA input
+    # projection's rows inside the GEMM) is read by the kernel package's
+    # ops/communication/_iris/kimi_k3/allreduce_sharded.py.
     TOKENSPEED_DP_SAMPLING_BACKEND = EnvStr(None)
 
     # Shared-expert parallelism.

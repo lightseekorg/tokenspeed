@@ -20,7 +20,9 @@
 
 """The KDA input projection that gathers its row-sharded input inside the GEMM."""
 
+import os
 import socket
+from contextlib import nullcontext
 from datetime import timedelta
 
 import pytest
@@ -28,7 +30,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from tokenspeed_kernel.platform import current_platform
-from utils import is_amd
+from utils import assert_no_triton_compile, is_amd
 
 pytestmark = pytest.mark.skipif(not is_amd(), reason="Iris requires AMD ROCm")
 
@@ -51,14 +53,14 @@ def _gather_rows_worker(rank: int, port: int) -> None:
     )
     group = dist.new_group(backend="nccl", timeout=timedelta(seconds=180))
     from tokenspeed_kernel.ops.communication._iris.kimi_k3 import (
-        allreduce_sharded,
         prepare_k3_communication,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (
+        gluon_mm_a16w16_prefill_gather_rows_gfx950,
         launch_gluon_mm_a16w16_prefill_gfx950,
     )
 
-    allreduce_sharded._GATHER_ROWS_GEMM = True
+    os.environ["TOKENSPEED_K31_GATHER_ROWS_GEMM"] = "1"
     k3_state = prepare_k3_communication(
         group=group,
         rank_in_group=rank,
@@ -94,12 +96,19 @@ def _gather_rows_worker(rank: int, port: int) -> None:
             gathered, weight, torch.bfloat16
         )
         output = sharded.output[:rows]
-        # Cache the buffer's previous rows, then delay one rank's call.
-        assert sharded._gather_rows_project(previous, output, weight) is not None
-        dist.all_reduce(fence, group=group)
-        if rank == step % 8:
-            torch.cuda._sleep(200_000)
-        result = sharded._gather_rows_project(mixed, output, weight)
+        # The first step compiles; later row counts reuse that binary.
+        no_compile = (
+            assert_no_triton_compile(gluon_mm_a16w16_prefill_gather_rows_gfx950)
+            if step
+            else nullcontext()
+        )
+        with no_compile:
+            # Cache the buffer's previous rows, then delay one rank's call.
+            assert sharded._gather_rows_project(previous, output, weight) is not None
+            dist.all_reduce(fence, group=group)
+            if rank == step % 8:
+                torch.cuda._sleep(200_000)
+            result = sharded._gather_rows_project(mixed, output, weight)
         assert result is not None and result.shape == (rows, 6288)
         dist.all_reduce(fence, group=group)
         torch.cuda.synchronize()

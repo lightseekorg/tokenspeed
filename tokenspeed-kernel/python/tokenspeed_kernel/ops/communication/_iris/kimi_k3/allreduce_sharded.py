@@ -62,14 +62,20 @@ _LARGEM_ROW_TILE = 256
 PUBLISHED_MIN_ROWS = 2 * 8 * _LARGEM_ROW_TILE
 # Owned row tiles of an 8192-row chunk (LARGEM_GATHER_MAX_TILES).
 _GATHER_ROW_TILES = 4
-# The KDA input projection gathers its rows inside the GEMM (experiment, default off).
-_GATHER_ROWS_GEMM = os.environ.get("TOKENSPEED_K31_GATHER_ROWS_GEMM", "").lower() in (
-    "1",
-    "true",
-    "yes",
-    "on",
-)
+
 _attn_res_mix_gfx950 = None
+
+
+def _gather_rows_gemm_enabled() -> bool:
+    """Whether the KDA input projection gathers its rows inside the GEMM
+    (experiment, default off; listed with the K3.1 switches in the runtime's
+    ``utils/env.py``)."""
+    return os.environ.get("TOKENSPEED_K31_GATHER_ROWS_GEMM", "").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
 
 @gluon.jit
@@ -2045,7 +2051,7 @@ class IrisAllReduceShardedState:
         local_rows = mixed.shape[0]
         tiles = local_rows // _LARGEM_ROW_TILE
         if (
-            not _GATHER_ROWS_GEMM
+            not _gather_rows_gemm_enabled()
             or torch.cuda.is_current_stream_capturing()
             or local_rows % _LARGEM_ROW_TILE
             or not 0 < tiles <= len(self._gather_row_counts)

@@ -74,9 +74,11 @@ class HistoryGatherWorkspace:
     draft's extend step follows the target's forward on the same stream.
 
     Under a KVP prefill over gathered histories (``dsa_kvp_history_prefill``)
-    ``kv`` and ``index_k`` view the same leading bytes: a layer's top-k
-    consumes its gathered index-K rows before the layer gathers its latent
-    rows, on the same stream, so the buffer holds the wider of the two.
+    ``kv`` and ``index_k`` share one buffer, the wider of the two: ``kv`` at
+    its head and ``index_k`` at its tail. A layer's top-k consumes its
+    gathered index-K rows before the layer gathers its latent rows on the
+    same stream, and a prefetched latent gather that stays clear of the
+    index-K rows can land during the top-k.
 
     Attributes:
         rows: Row capacity, a whole number of kernel pages.
