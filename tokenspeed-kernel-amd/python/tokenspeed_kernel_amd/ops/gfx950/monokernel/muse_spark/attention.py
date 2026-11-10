@@ -177,8 +177,10 @@ def _norm_rope(lo, hi, gain, cos_sin, pos, j, ROPE: gl.constexpr):
     lo = lo * inv * gain
     hi = hi * inv * gain
     if ROPE:
-        c = gl.load(cos_sin + pos * HEAD + j)
-        s = gl.load(cos_sin + pos * HEAD + HEAD // 2 + j)
+        # The row's offset grows with the position: int64.
+        rope = cos_sin + pos.to(gl.int64) * HEAD
+        c = gl.load(rope + j)
+        s = gl.load(rope + HEAD // 2 + j)
         lo, hi = gl.fma(lo, c, -(hi * s)), gl.fma(hi, c, lo * s)
     return lo, hi
 
@@ -790,10 +792,13 @@ def attn_stage(
     if ROPE:
         # The RoPE rows load before the poll: a load after a poll would
         # start only when the poll returns.
-        cq = gl.load(cos_sin + (L0 + q_tok) * HEAD + qp)
-        sq = gl.load(cos_sin + (L0 + q_tok) * HEAD + HEAD // 2 + qp)
-        ck = gl.load(cos_sin + (L0 + k_tok) * HEAD + qp)
-        sk = gl.load(cos_sin + (L0 + k_tok) * HEAD + HEAD // 2 + qp)
+        # Row L0's offset grows with the position (int64); the launch's
+        # rows past it are in-tile offsets.
+        rope = cos_sin + L0.to(gl.int64) * HEAD
+        cq = gl.load(rope + q_tok * HEAD + qp)
+        sq = gl.load(rope + q_tok * HEAD + HEAD // 2 + qp)
+        ck = gl.load(rope + k_tok * HEAD + qp)
+        sk = gl.load(rope + k_tok * HEAD + HEAD // 2 + qp)
     q_at = _pair_index(
         qp[:, :, None], eq, GATE_ROW, ((g * GROUP + q_head) * HEAD)[:, :, None]
     )

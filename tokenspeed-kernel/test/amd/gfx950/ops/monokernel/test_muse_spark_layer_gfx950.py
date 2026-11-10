@@ -154,7 +154,14 @@ def _reference(sh, length, full, kernel_pooled, kernel_hp, dev):
         w = _rank_weights(r, end)
         qkvg = (sh["a_in"].float() @ w["w_qkvg"].float().T).to(torch.bfloat16)
         z, _, _, _ = ref.attention_z(
-            qkvg, w["k_cache"], w["v_cache"], sh["table"], length, window, splits, cs
+            qkvg,
+            w["k_cache"],
+            w["v_cache"],
+            sh["table"],
+            length,
+            window,
+            splits,
+            cs[length - 1 : end],
         )
         b = b + (z.float() @ w["w_o"].float().T).to(torch.bfloat16).float()
     b = b.to(torch.bfloat16).float()

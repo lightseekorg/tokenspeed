@@ -39,8 +39,13 @@ K_ROW, V_ROW, GATE_ROW = 1024, 1152, 1280
 
 def rope_table(positions: int) -> torch.Tensor:
     """FP32 ``[positions, 64]``: cos of the 32 pairs, then sin (theta 500000)."""
+    return rope_rows(0, positions)
+
+
+def rope_rows(first: int, count: int) -> torch.Tensor:
+    """Rows ``first .. first + count`` of the RoPE table (:func:`rope_table`)."""
     inv = 1.0 / 500000.0 ** (torch.arange(0, HEAD, 2, dtype=torch.float32) / HEAD)
-    t = torch.arange(positions, dtype=torch.float32)[:, None] * inv[None, :]
+    t = torch.arange(first, first + count, dtype=torch.float32)[:, None] * inv[None, :]
     return torch.cat([t.cos(), t.sin()], dim=1)
 
 
@@ -137,7 +142,8 @@ def attention_z(qkvg, k_cache, v_cache, table, length, window, splits, cs):
 
     ``k_cache`` / ``v_cache``: ``[slots, 2, 64]`` before the rows' writes, BF16
     or FP8 e4m3 at unit scale: the rows' K and V round once to that dtype,
-    and attention reads them (and the cache) exactly widened.
+    and attention reads them (and the cache) exactly widened. ``cs``: FP32
+    ``[rows, 64]``, the RoPE rows of the rows' positions.
     """
     rope = window != 0
     kv_dtype = k_cache.dtype
@@ -148,7 +154,7 @@ def attention_z(qkvg, k_cache, v_cache, table, length, window, splits, cs):
             norm_rope(
                 qkvg[t, K_ROW:V_ROW].view(KV_HEADS, HEAD),
                 1.0,
-                cs[L0 + t],
+                cs[t],
                 rope,
                 kv_dtype,
             )
@@ -170,7 +176,7 @@ def attention_z(qkvg, k_cache, v_cache, table, length, window, splits, cs):
     groups = window == 0 and rows == 8 and L0 >= 32768
     fp8_qk = groups and kv_dtype != torch.bfloat16
     for t in range(rows):
-        q_args = (qkvg[t, :K_ROW].view(HEADS, HEAD), 5.473006248474121, cs[L0 + t])
+        q_args = (qkvg[t, :K_ROW].view(HEADS, HEAD), 5.473006248474121, cs[t])
         q = norm_rope(*q_args, rope, torch.bfloat16)
         q_cached = norm_rope(*q_args, rope, kv_dtype) if fp8_qk else q
         gate = qkvg[t, GATE_ROW:].view(HEADS, HEAD).float()

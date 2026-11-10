@@ -139,7 +139,9 @@ def test_attention_matches_the_regular_path_math(
     attends its own cache (its length and page table) and takes its own
     tokens' keys from the projection. An FP8 cache holds the regular path's
     unit-scale e4m3 bytes: the rows' K and V round once to it."""
-    _check_attention(length, window, splits, rows, requests, kv_dtype, page_base=0)
+    _check_attention(
+        length, window, splits, rows, requests, kv_dtype, page_base=0, position_base=0
+    )
 
 
 # Long contexts, once each: the served shape (one request's verify on the
@@ -157,7 +159,9 @@ def test_attention_matches_the_regular_path_math(
 def test_long_context_attention_matches_the_regular_path_math(
     length, rows, requests, kv_dtype
 ):
-    _check_attention(length, 0, FULL_SPLITS, rows, requests, kv_dtype, page_base=0)
+    _check_attention(
+        length, 0, FULL_SPLITS, rows, requests, kv_dtype, page_base=0, position_base=0
+    )
 
 
 # The first page whose first element lies past 2^31 elements of a cache.
@@ -175,26 +179,59 @@ def test_attention_reaches_pages_past_2_31_cache_elements(
     """Pages and slots at the far end of a large cache: every page of the
     launch starts past 2^31 elements, so a page or slot offset computed in
     int32 reads and writes the wrong place. Only the far end is filled."""
-    _check_attention(length, window, splits, 8, 2, kv_dtype, page_base=FAR_PAGE)
+    _check_attention(
+        length, window, splits, 8, 2, kv_dtype, page_base=FAR_PAGE, position_base=0
+    )
 
 
-def _check_attention(length, window, splits, rows, requests, kv_dtype, page_base):
+# The first position whose RoPE row lies past 2^31 elements of the table.
+FAR_POSITION = (1 << 31) // HEAD
+
+
+@pytest.mark.parametrize("kv_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_sliding_attention_reaches_rope_rows_past_2_31_elements(kv_dtype):
+    """Positions at the far end of a large RoPE table: every row's RoPE row
+    (read by the head and attn stages) starts past 2^31 elements, so a row
+    offset computed in int32 reads the wrong place. A sliding layer reads
+    only its window's pages; only those and the rows' RoPE rows are filled."""
+    _check_attention(
+        3000,
+        2048,
+        SLIDING_SPLITS,
+        8,
+        2,
+        kv_dtype,
+        page_base=0,
+        position_base=FAR_POSITION,
+    )
+
+
+def _check_attention(
+    length, window, splits, rows, requests, kv_dtype, page_base, position_base
+):
     """One launch of ``requests`` requests of ``rows`` tokens against the
     regular path's math; the cache's pages are numbered from ``page_base``
-    (the pages below it are allocated and never touched)."""
+    (the pages below it are allocated and never touched). The requests'
+    positions start at ``position_base`` (a multiple of ``PAGE``): the
+    positions below it have no pages and no RoPE rows, so a layer that
+    attends them is not checked."""
+    assert position_base % PAGE == 0
+    assert position_base == 0 or (window and length >= window)
     rope = window != 0
     g = torch.Generator().manual_seed(length + window)
     # The second request is longer and has pages of its own.
-    lengths = [length + 37 * b for b in range(requests)]
+    lengths = [position_base + length + 37 * b for b in range(requests)]
     ends = [n + rows - 1 for n in lengths]
-    used = [(e + PAGE - 1) // PAGE for e in ends]
+    skip = position_base // PAGE
+    used = [(e + PAGE - 1) // PAGE - skip for e in ends]
     pages = sum(used) + 3
     perm = torch.randperm(pages, generator=g) + 1
     tables, at = [], 0
     for u in used:
-        tables.append(perm[at : at + u].to(torch.int32))
+        live = perm[at : at + u].to(torch.int32)
+        tables.append(torch.cat([torch.zeros(skip, dtype=torch.int32), live]))
         at += u
-    width = max(used)
+    width = skip + max(used)
     table = torch.zeros(requests, width, dtype=torch.int32)
     for b, t in enumerate(tables):
         table[b, : len(t)] = t
@@ -202,7 +239,7 @@ def _check_attention(length, window, splits, rows, requests, kv_dtype, page_base
     v_cache = torch.randn(pages + 2, PAGE, KV_HEADS, HEAD, generator=g).to(kv_dtype)
     R = requests * rows
     qkvg = torch.randn(R, QKVG, generator=g).to(torch.bfloat16)
-    cs = ref.rope_table(max(ends) + 1)
+    cs = ref.rope_rows(position_base, max(ends) + 1 - position_base)
     positions = torch.cat([torch.arange(n - 1, n - 1 + rows) for n in lengths])
     slots = torch.cat(
         [
@@ -225,7 +262,7 @@ def _check_attention(length, window, splits, rows, requests, kv_dtype, page_base
         ):
             half = (part.float() / 2).view(torch.int32)
             fill(scratch, plan, region, torch.cat([half, half]).cuda(), tag, row=row)
-    kc, vc = (_cache_from(c, page_base) for c in (k_cache, v_cache))
+    kc, vc = (_placed_at(c, page_base) for c in (k_cache, v_cache))
     attention_kernel[(plan.grid,)](
         scratch,
         torch.full((1,), step, dtype=torch.int32, device="cuda"),
@@ -235,7 +272,7 @@ def _check_attention(length, window, splits, rows, requests, kv_dtype, page_base
         width,
         kc,
         vc,
-        cs.cuda(),
+        _placed_at(cs, position_base),
         scratch.view(torch.int32),
         plan.key,
         splits,
@@ -258,7 +295,7 @@ def _check_attention(length, window, splits, rows, requests, kv_dtype, page_base
             lengths[b],
             window,
             splits,
-            cs,
+            cs[lengths[b] - 1 - position_base :],
         )
         for t in range(rows):
             row = b * rows + t
@@ -284,13 +321,12 @@ def _check_attention(length, window, splits, rows, requests, kv_dtype, page_base
             assert torch.equal(got_v.view(torch.uint8), v[t].view(torch.uint8))
 
 
-def _cache_from(cache: torch.Tensor, page_base: int) -> torch.Tensor:
-    """``cache``'s pages on the device as pages from ``page_base`` on of a
-    cache that large; the pages below stay unwritten."""
-    if not page_base:
-        return cache.clone().cuda()
-    out = torch.empty(
-        (page_base + cache.shape[0], *cache.shape[1:]), dtype=cache.dtype, device="cuda"
-    )
-    out[page_base:] = cache.cuda()
+def _placed_at(t: torch.Tensor, first: int) -> torch.Tensor:
+    """``t``'s rows (a cache's pages, a RoPE table's rows) on the device as
+    rows from ``first`` on of a tensor that large; the rows below stay
+    unwritten."""
+    if not first:
+        return t.clone().cuda()
+    out = torch.empty((first + t.shape[0], *t.shape[1:]), dtype=t.dtype, device="cuda")
+    out[first:] = t.cuda()
     return out
