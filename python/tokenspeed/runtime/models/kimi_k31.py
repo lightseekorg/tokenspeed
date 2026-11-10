@@ -93,6 +93,9 @@ _PRECOMPUTED_QKV_A_WIDTH = 2112
 # The checkpoint names no epsilon for the index-key LayerNorm; 1e-6 is DeepSeek-V3.2's.
 _INDEX_K_NORM_EPS = 1e-6
 
+# GB300 AL8: the front saves 2 us/DSA layer at 8-32 rows and costs 7 at 64.
+_DECODE_FRONT_MAX_ROWS = 32
+
 
 class KimiK31Indexer(nn.Module):
     """K3.1 lightning indexer: projections only, no RoPE, no Hadamard.
@@ -733,12 +736,14 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
         with the a-projection) qualifies where the front was selected, the
         layer computes its own top-k, the stacked [q_b; wq_b] weight exists,
         the round's index-K write quantizes its query, its KV is not placed
-        across ranks, the front addresses the rows, and no breakable capture
-        records the round (its eager break would replay the capture-time choice
-        over padded rows).
+        across ranks, the front addresses the rows, there are at most
+        ``_DECODE_FRONT_MAX_ROWS`` of them, and no breakable capture records
+        the round (its eager break would replay the capture-time choice over
+        padded rows).
         """
         if (
             ctx.num_extends != 0
+            or q_a.shape[0] > _DECODE_FRONT_MAX_ROWS
             or self.skip_indexer_topk
             or self.decode_front is None
             or self.q_b_wq_b_weight is None

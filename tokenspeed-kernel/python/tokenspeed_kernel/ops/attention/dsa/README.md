@@ -343,6 +343,8 @@ its packed input projection, one cluster launch
 `dsa_decode_front` operator (`solution="cute_dsl"`; traits q_lora_rank 1536,
 kv_lora_rank 512, 2304 q_b rows, 32 index heads of 128, 64-slot packed
 `fp8_scaled` planes) and serves 1-64 rows (`decode_front_rows_supported`).
+Kimi-K3.1 takes it up to 32 rows: on GB300 it saves about 2 us per DSA layer
+at 8-32 rows, while at 64 rows the stacked GEMM path is faster.
 
 - Grid (4, 32), clusters of 4, one CTA per SM. Cluster `h` owns index head `h`
   (128 wq_b rows) and q_b rows `[72 h, 72 h + 72)`; CTA `p` holds K columns

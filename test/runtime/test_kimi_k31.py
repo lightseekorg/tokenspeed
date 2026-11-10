@@ -2705,6 +2705,8 @@ def test_a_decode_round_quantizes_its_query_in_the_index_k_write(
         "breakable_capture",
         "placed",
         "unsupported_rows",
+        "most_rows",
+        "past_most_rows",
     ],
 )
 def test_only_a_decode_chain_round_takes_the_decode_front(monkeypatch, case) -> None:
@@ -2712,7 +2714,7 @@ def test_only_a_decode_chain_round_takes_the_decode_front(monkeypatch, case) -> 
 
     It serves decode rounds whose keys and head weights come from the
     a-projection and whose index-K write quantizes the query, without KV
-    placement or a breakable capture, over rows it addresses.
+    placement or a breakable capture, over at most 32 rows it addresses.
     """
     from tokenspeed.runtime.models import kimi_k31
 
@@ -2727,8 +2729,9 @@ def test_only_a_decode_chain_round_takes_the_decode_front(monkeypatch, case) -> 
     placement = object() if case == "placed" else None
     backend = SimpleNamespace(cache_placement=lambda layer: placement)
     ctx = SimpleNamespace(num_extends=int(case == "extend"), attn_backend=backend)
-    q_a, kv_a = torch.zeros(4, 1536), torch.zeros(4, 512)
-    keys = None if case == "indexer_projects_keys" else torch.zeros(4, 160)
+    rows = {"most_rows": 32, "past_most_rows": 33}.get(case, 4)
+    q_a, kv_a = torch.zeros(rows, 1536), torch.zeros(rows, 512)
+    keys = None if case == "indexer_projects_keys" else torch.zeros(rows, 160)
     supported = []
 
     def rows_supported(*tensors):
@@ -2741,9 +2744,10 @@ def test_only_a_decode_chain_round_takes_the_decode_front(monkeypatch, case) -> 
     monkeypatch.setattr(
         kimi_k31, "is_breakable_capture_active", lambda: case == "breakable_capture"
     )
-    assert attention._takes_decode_front(ctx, q_a, kv_a, keys) == (case == "takes")
-    if case in ("takes", "unsupported_rows"):
-        assert supported == [((4, 1536), (4, 512), (4, 128), (4, 32))]
+    takes = case in ("takes", "most_rows")
+    assert attention._takes_decode_front(ctx, q_a, kv_a, keys) == takes
+    if case in ("takes", "unsupported_rows", "most_rows"):
+        assert supported == [((rows, 1536), (rows, 512), (rows, 128), (rows, 32))]
 
 
 @pytest.mark.parametrize(
