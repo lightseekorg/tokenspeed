@@ -177,8 +177,10 @@ def _pack_kernel(
     FORMAT: tl.constexpr,
     SCATTER: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    slot = tl.load(Slots + row * SS).to(tl.int64) if SCATTER else row.to(tl.int64)
+    # The row reads a caller-sized input, so its offset is 64-bit like the
+    # gather's output offset; the cache side is already 64-bit through slot.
+    row = tl.program_id(0).to(tl.int64)
+    slot = tl.load(Slots + row * SS).to(tl.int64) if SCATTER else row
     if slot >= 0 and slot < CAPACITY:
         # V4 rows keep their trailing RoPE dims unquantized, so the scale groups
         # past QUANTIZED cover BF16 data. Their scale bytes are never read back;
@@ -4175,7 +4177,9 @@ def _copy_attention_heads_kernel(
     S0: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    # A flat index over the destination, which grows with the step's tokens, so
+    # it is 64-bit: a wrapped index would pass the row < tokens mask negative.
+    i = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     row, head, col = i // (HY * 512), i // 512 % HY, i % 512
     x = tl.load(X + row * X0 + head * X1 + col * X2, (row < tokens) & (head < HX), 0)
     tl.store(Y + row * Y0 + head * Y1 + col * Y2, x, row < tokens)
