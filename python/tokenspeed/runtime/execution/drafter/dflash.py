@@ -21,7 +21,11 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel.ops.kvcache.triton import mla_latent_norm_rope_scatter
+from tokenspeed_kernel.ops.kvcache.triton import (
+    LatentPlanes,
+    check_mla_latent_geometry,
+    mla_latent_norm_rope_scatter,
+)
 from tokenspeed_kernel.ops.sampling.cute_dsl import distributed_argmax as _dist_argmax
 from tokenspeed_kernel.ops.sampling.cute_dsl import (
     supports_dist_argmax_shape as _supports_dist_argmax_shape,
@@ -710,6 +714,7 @@ class DFlash(BaseDrafter):
         self._fused_kv_workspace_capacity = 0
         self._fused_kv_workspace_dtype = None
         self._fused_kv_proj_workspace = None
+        self._fused_kv_latent_planes: LatentPlanes | None = None
         # torch.mm(out=...) is always used; workspace pre-allocated at warmup.
         self._fused_kv_k_buffers = []
         self._fused_kv_v_buffers = []
@@ -886,17 +891,16 @@ class DFlash(BaseDrafter):
             eps_values.append(float(attn.kv_a_layernorm.variance_epsilon))
             latent_buffers.append(pool.get_key_buffer(attn.attn_mqa.layer_id))
 
-        plane = latent_buffers[0]
-        if plane.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
-            return decline(f"latent cache dtype {plane.dtype} is not writable here")
-        if any(
-            buffer.shape[-1] != kv_width
-            or buffer.stride(-1) != 1
-            or buffer.numel() // buffer.shape[0] != kv_width
-            or buffer.stride(0) != plane.stride(0)
-            for buffer in latent_buffers
-        ):
-            return decline("latent cache planes are not uniform dense rows")
+        if ws_dtype != torch.bfloat16:
+            # The fused write rounds as the bf16 per-layer chain does.
+            return decline(f"the latent projection is {ws_dtype}, not bf16")
+        try:
+            check_mla_latent_geometry(kv_lora_rank, rope_dim)
+            planes = LatentPlanes.from_buffers(latent_buffers)
+        except ValueError as error:
+            return decline(str(error))
+        if planes.width != kv_width:
+            return decline(f"latent cache rows are {planes.width} wide, not {kv_width}")
 
         n_layers = len(layers)
         self._fused_kv_n_layers = n_layers
@@ -909,13 +913,7 @@ class DFlash(BaseDrafter):
         self._fused_kv_cos_sin_cache = rotary.cos_sin_cache.to(self.device)
         self._fused_kv_is_neox = bool(getattr(rotary, "is_neox_style", True))
         self._fused_kv_sanitize = bool(pool.latent_write_sanitizes)
-        self._fused_kv_latent_dtype = plane.dtype
-        self._fused_kv_latent_row_stride = int(plane.stride(0))
-        self._fused_kv_latent_ptrs = torch.tensor(
-            [buffer.data_ptr() for buffer in latent_buffers],
-            dtype=torch.int64,
-            device=self.device,
-        )
+        self._fused_kv_latent_planes = planes
 
         max_total_ctx = self.input_buffers.max_bs * self.spec_num_tokens
         self._fused_kv_proj_workspace = torch.empty(
@@ -928,7 +926,7 @@ class DFlash(BaseDrafter):
         logger.info(
             "DFLASH fused MLA KV write enabled. "
             f"n_layers={n_layers:d}, kv_lora_rank={kv_lora_rank:d}, rope_dim="
-            f"{rope_dim:d}, cache_dtype={plane.dtype!s}",
+            f"{rope_dim:d}, cache_dtype={planes.dtype!s}",
         )
 
     def _write_native_cache_fused_mla(
@@ -951,9 +949,8 @@ class DFlash(BaseDrafter):
             self._fused_kv_cos_sin_cache,
             target_positions,
             target_cache_locs,
-            self._fused_kv_latent_ptrs,
-            self._fused_kv_latent_row_stride,
-            self._fused_kv_latent_dtype,
+            self._fused_kv_latent_planes,
+            write_mask=None,
             is_neox=self._fused_kv_is_neox,
             sanitize=self._fused_kv_sanitize,
         )

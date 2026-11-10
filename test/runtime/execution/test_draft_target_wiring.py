@@ -543,7 +543,7 @@ def test_wire_eagle3_explicit_capture_ids_override_checkpoint():
 class _ContextDraft:
     """A draft implementing the DSparkContextModel protocol on one stage."""
 
-    hidden_size = 8
+    projection_width = 8
 
     def __init__(self, is_last_pp_rank: bool):
         self.mapping = SimpleNamespace(
@@ -1117,6 +1117,7 @@ def test_k3_setup_capture_survives_resource_binding(monkeypatch, has_pp):
     draft.config = SimpleNamespace(aux_hidden_stream="attn_res")
     draft.target_capture_layer_ids = (2, 5)
     draft.hidden_size = 8
+    draft.projection_width = 8
     # Only a pipeline splits the taps across stages; off the pipeline the
     # drafter keeps projecting and writing the context itself.
     draft.mapping = SimpleNamespace(has_pp=has_pp)
