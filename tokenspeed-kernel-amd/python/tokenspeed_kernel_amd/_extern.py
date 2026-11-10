@@ -209,7 +209,8 @@ def wave_uniform_i32(value, _semantic):
 def wave_inclusive_sum_i32(value, _semantic):
     """Return the inclusive sum of int32 ``value`` over this lane and the
     lanes below it in the wave (DPP row shifts and row broadcasts). Every
-    lane of the wave must be active. Launch with
+    lane of the wave must be active. Only gfx9 wave64 targets such as gfx950:
+    gfx10 and later have no DPP row broadcasts. Launch with
     :func:`extern_compile_options`.
     """
     return _call(

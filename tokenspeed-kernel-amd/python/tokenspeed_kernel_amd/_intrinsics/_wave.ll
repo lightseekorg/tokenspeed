@@ -50,6 +50,7 @@ entry:
   ret i32 %r
 }
 
+; gfx9 wave64 only (gfx10 and later have no DPP row broadcasts).
 ; Inclusive int32 sum over the 64 lanes of a wave (every lane active): DPP
 ; row shifts by 1, 2, 4 and 8 sum within each row of 16 lanes (lanes shifted
 ; in from outside the row read 0), then row broadcasts 15 and 31 carry each
