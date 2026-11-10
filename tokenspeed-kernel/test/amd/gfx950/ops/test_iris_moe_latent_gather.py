@@ -78,7 +78,7 @@ def test_latent_input_gather_codegen(rank, quantize, tmp_path):
         "QUANTIZE": quantize,
         "MIN_AMAX": 1.0e-12,
         "FP8_MAX": 448.0,
-        "MAX_ROWS": 64,
+        "MAX_ROWS": 256,
     }
     signature = {}
     attrs = {}
@@ -234,7 +234,7 @@ def _check_latent_gather(
 
     # Interleave with the MoE all-reduce, which shares the mailbox tiles.
     producer = state.all_reduce
-    for seed, rows in enumerate((4, 2, 64, 6, 16, 17, 3, 8, 32, 5, 4, 64, 32)):
+    for seed, rows in enumerate((4, 2, 64, 6, 16, 17, 3, 8, 192, 32, 5, 128, 4, 64, 32)):
         hidden = hidden_for(rows, seed)
         quantize = seed % 3 != 1
         assert same(sharded(hidden, quantize), replicated(hidden, quantize))
@@ -249,7 +249,7 @@ def _check_latent_gather(
 
     single = hidden_for(1, 100)
     assert not state.can_latent_input_gather(single, weight)
-    assert not state.can_latent_input_gather(hidden_for(65, 101), weight)
+    assert not state.can_latent_input_gather(hidden_for(193, 101), weight)
     assert not state.can_latent_input_gather(hidden_for(4, 4).float(), weight)
     torch.cuda.synchronize()
     dist.barrier(group=group, device_ids=[rank])

@@ -30,8 +30,13 @@ if TYPE_CHECKING:
     from tokenspeed_kernel.ops.communication.iris import IrisAllReduce
 
 
+# Decode rows served by the fused replicated paths: the latent input gather,
+# the Lamport two-shot reduce and the gathered MoE tail. Above it, rows shard.
+# 192 covers 48 requests' 4-token verify; the model's gather-tail and SiTU
+# warp-decode bounds and the comm's sharded-prefix floor follow it.
+K3_FUSED_DECODE_MAX_ROWS = 192
 # Decode rows with a gathered column-parallel MoE up-projection; GEMV senders to 4 rows.
-_K3_GATHER_MAX_ROWS = 64
+_K3_GATHER_MAX_ROWS = K3_FUSED_DECODE_MAX_ROWS
 _K3_GATHER_GEMV_MAX_ROWS = 4
 _K3_GATHER_LATENT = 3584
 _K3_GATHER_LOCAL_WIDTH = 896
@@ -48,10 +53,12 @@ _K3_PACKED_INPUT_ROWS = _K3_ROUTER + _K3_LATENT + 2 * _K3_SHARED
 _K3_LATENT_GEMM_NUM_WARPS = 2
 # One-shot Lamport window (it also sums MoE top-k slots) and latent gather row limits.
 _K3_LAMPORT_MAX_ROWS = 7
-_K3_LATENT_GATHER_MAX_ROWS = 64
+_K3_LATENT_GATHER_MAX_ROWS = K3_FUSED_DECODE_MAX_ROWS
+# The FP8 scale rendezvous spans its slots with gl.arange, so a power of two.
+_K3_LATENT_SYNC_ROWS = 1 << (_K3_LATENT_GATHER_MAX_ROWS - 1).bit_length()
 # From 8 rows the Lamport two-shot all-reduce wins; 1024-element tiles need even rows.
 _K3_TWO_SHOT_MIN_ROWS = 8
-_K3_TWO_SHOT_MAX_ROWS = 64
+_K3_TWO_SHOT_MAX_ROWS = K3_FUSED_DECODE_MAX_ROWS
 _K3_TWO_SHOT_ALIGN = 8 * 128
 
 
@@ -62,12 +69,13 @@ def _k3_lamport_numel(producer_direct_max_numel: int) -> int:
     rows = min(producer_direct_max_numel // (3584 + 7168), _K3_LAMPORT_MAX_ROWS)
     if not rows:
         return 0
+    gather = max(
+        _K3_LATENT_GATHER_MAX_ROWS * 1024,
+        -(-_K3_GATHER_MAX_ROWS // 16) * 16 * _K3_GATHER_LOCAL_WIDTH,
+    )
     return max(
         rows * (3584 + 7168),
-        min(
-            _K3_LATENT_GATHER_MAX_ROWS * 1024,
-            producer_direct_max_numel // 512 * 512,
-        ),
+        min(gather, producer_direct_max_numel // 512 * 512),
     )
 
 
@@ -189,7 +197,7 @@ class K3IrisState:
             torch.cat(
                 (
                     torch.full(
-                        (_K3_LATENT_GATHER_MAX_ROWS,),
+                        (_K3_LATENT_SYNC_ROWS,),
                         -1,
                         dtype=torch.int32,
                         device=all_reduce.device,
@@ -681,7 +689,7 @@ class K3IrisState:
             QUANTIZE=quantize,
             MIN_AMAX=_DYNAMIC_FP8_MIN_AMAX,
             FP8_MAX=_DYNAMIC_FP8_E4M3_MAX,
-            MAX_ROWS=_K3_LATENT_GATHER_MAX_ROWS,
+            MAX_ROWS=_K3_LATENT_SYNC_ROWS,
             num_warps=4,
         )
         if quantize:

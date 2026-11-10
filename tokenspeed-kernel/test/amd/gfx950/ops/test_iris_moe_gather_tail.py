@@ -178,7 +178,7 @@ def _check_gather_tail(
         group=group,
         rank_in_group=rank,
         staged_max_numel=0,
-        producer_direct_max_numel=72 * (_LATENT + _HIDDEN),
+        producer_direct_max_numel=192 * (_LATENT + _HIDDEN),
         attnres_max_numel=0,
         attnres_max_rows=0,
         enable_lamport=True,
@@ -226,7 +226,7 @@ def _check_gather_tail(
         )
 
     # Reductions and gathers share mailbox tile epochs: interleave them at varied rows.
-    row_counts = (4, 1, 3, 2, 8, 5, 16, 17, 4, 32, 64, 3, 47)
+    row_counts = (4, 1, 3, 2, 8, 5, 16, 17, 4, 32, 64, 3, 47, 192, 128, 136)
     for seed, rows in enumerate(row_counts):
         routed, shared = (t.clone() for t in reduce(rows, seed))
         prefix = torch.randn((rows, _HIDDEN), generator=generator, device=device).to(
@@ -265,8 +265,9 @@ def _check_gather_tail(
         )
 
     # Wider batches and misaligned rows take the ordinary tail.
-    routed, shared = reduce(65, 99)
-    prefix = torch.zeros((65, _HIDDEN), dtype=torch.bfloat16, device=device)
+    routed = torch.zeros((193, _LATENT), dtype=torch.bfloat16, device=device)
+    shared = torch.zeros((193, _HIDDEN), dtype=torch.bfloat16, device=device)
+    prefix = torch.zeros_like(shared)
     assert not state.can_moe_gather_tail(routed, shared, prefix, weight, norm_weight)
     odd_rows = torch.zeros((4, _LATENT + 1), dtype=torch.bfloat16, device=device)[
         :, :_LATENT
@@ -278,7 +279,7 @@ def _check_gather_tail(
     dist.barrier(group=group, device_ids=[rank])
 
     # Captured layers alternate reduce and gather, one rank late, without recompiling.
-    layer_rows = (4, 3, 8, 16, 32, 64, 13, 2)
+    layer_rows = (4, 3, 8, 16, 32, 64, 192, 13, 128, 2)
     for rows in layer_rows:
         routed, shared = reduce(rows, 200 + rows)
         gathered(routed, shared, torch.zeros_like(shared))
