@@ -413,8 +413,8 @@ mod ffi {
         /// PD: requests whose pages a transfer still pins.
         pd_transfer: usize,
         /// PD, P role, independent admission: computed prompts waiting for
-        /// their decode destination; also counted in `prefilling` and
-        /// `pd_transfer`, not in `running`.
+        /// their decode destination; also counted in `running`, `prefilling`
+        /// and `pd_transfer`.
         awaiting_destination: usize,
         /// Cache blocks holding nothing.
         empty_lcm_blocks: i32,

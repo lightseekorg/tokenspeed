@@ -1332,8 +1332,8 @@ with the scheduler's metrics, which carry the `dp_rank` label too:
 Under `independent`, `tokenspeed:num_prefill_prealloc_queue_reqs` counts the
 requests the prefill server has not admitted yet, and an admitted request not
 yet computed counts in `tokenspeed:num_requests_waiting`. A computed prompt
-waiting for its destination takes no batch row: `tokenspeed:num_requests_inflight`
-counts it, `tokenspeed:num_requests_running` does not.
+waiting for its destination counts in `tokenspeed:num_requests_running`, as one
+awaiting its PD transfer does: both hold their pages and request slot.
 
 ## TokenSpeed-specific runtime knobs
 
