@@ -178,8 +178,10 @@ if _muse_spark_layer is not None:
             proj_out=proj_out,
             trace_buf=None,
             stuck_rec=stuck_rec,
-            # Serving may order two same-parity launches by a regular
-            # layer's collectives in between (a layer that is not fused).
+            # Serving's launches alternate parity by construction: every
+            # layer 1-60 launches each decode step, and layer 60 is followed
+            # by the next step's layer 1. The check would cost CTA 0 a load,
+            # a barrier and a store before each launch's first put.
             check_parity=False,
             compile_only=compile_only,
             **operands,

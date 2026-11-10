@@ -704,8 +704,9 @@ class Mailbox:
         launch's on this rank: the peer regions' copy must alternate from one
         launch to the next (:class:`Peers`). The plan's one-pair region
         ``parity`` keeps it (plus one; 0: no launch yet). Call it from CTA 0
-        before any put. Serving may let a regular layer's collectives order
-        two same-parity launches, so only tests and benches turn it on."""
+        before any put. It costs CTA 0 a load, a barrier and a store before
+        the launch's first put, so callers whose launches alternate by
+        construction (serving) leave it off; tests and benches turn it on."""
         at = self.scratch + schedule.region(self.plan, "parity")
         prev = gl.load(at)
         # Every wave reads the last launch's value before any wave writes

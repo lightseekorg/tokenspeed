@@ -885,8 +885,8 @@ def launch_gluon_muse_spark_layer_gfx950(
             what it waited for there before it traps (``stuck.decode`` reads
             it).
         check_parity: Trap when this launch's parity (``layer & 1``) repeats
-            the last launch's on this rank (tests and benches; serving may
-            run a regular layer between two same-parity launches).
+            the last launch's on this rank (tests and benches; serving's
+            launches alternate by construction, so it leaves the check off).
         compile_only: Only compile the launch for these operands. A rank's
             launch polls its peers' values for about a minute before it traps,
             so the ranks compile before any of them launches.
