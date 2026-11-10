@@ -76,8 +76,9 @@ v. For the gate projection and the checkpoint product, warp w takes 32 keys or
 32 checkpoint rows and lane l elements [4l, 4l + 4) of each, so every
 warp-wide load reads one contiguous row, and a transposing butterfly leaves
 each row's total in the lane of the matching thread. Weights load (or are
-prefetched into L2) before the programmatic dependency wait, activations and
-state after it.
+prefetched into L2) before the programmatic dependency wait, and so do the
+checkpoint copy and the convolution history, which the forward never writes
+(acceptance commits them after it); the projection's rows load after it.
 
 ### Output norm
 

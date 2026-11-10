@@ -45,8 +45,9 @@ checkpoint into shared memory while thread t convolves channel t of q, k and
 v. For the gate projection and the checkpoint product, warp w takes 32 keys
 or 32 checkpoint rows and lane l elements [4l, 4l + 4) of each row, so every
 warp-wide load reads one contiguous row, and a transposing butterfly leaves
-each row's total in one lane. Weights are read before the programmatic
-dependency wait; activations and state after it.
+each row's total in one lane. Weights, the checkpoint and the convolution
+history are read before the programmatic dependency wait (none is written by
+the previous launch); the projection's rows after it.
 """
 
 from __future__ import annotations
@@ -353,9 +354,9 @@ class FusedVerifyStep:
         if const_expr(self.gated_norm):
             norm_scale = _load(norm_weight, tidx).to(Float32)
 
-        cute.arch.griddepcontrol_wait()
-        cute.arch.griddepcontrol_launch_dependents()
-
+        # The batch layout, the checkpoint and the convolution history were
+        # written before this forward, not by the previous launch: the
+        # checkpoint copy and the history loads overlap the projection too.
         token_start = Int64(_load(query_start_loc, request))
         valid = Int32(Int64(_load(query_start_loc, request + 1)) - token_start)
         page = Int64(_load(state_indices, request))
@@ -372,23 +373,30 @@ class FusedVerifyStep:
                 _bulk_load(
                     tile_addr, tile_src.toint(), V * K * 4, Int32(barrier.toint())
                 )
+        # Padding pages see a zero history, as the split producer's do.
+        history = conv_states + page * conv_page_stride
+        channels = [q_channel, k_channel, v_channel]
+        pasts = []
+        for c in cutlass.range_constexpr(3):
+            for i in cutlass.range_constexpr(CONV_TAPS - 1):
+                past = Float32(0.0)
+                if (valid > 0) & (page >= 0):
+                    past = _load(history, channels[c] * 3 + i).to(Float32)
+                pasts.append(past)
+
+        cute.arch.griddepcontrol_wait()
+        cute.arch.griddepcontrol_launch_dependents()
 
         if valid > 0:
-            # Convolution over the committed window and this row; padding pages
-            # see a zero history, as the split producer's do.
-            history = conv_states + page * conv_page_stride
+            # Convolution over the committed window and this row.
             row = qkv + token_start * qkv_token_stride
-            raw = [_load(row, channel) for channel in (q_channel, k_channel, v_channel)]
+            raw = [_load(row, channel) for channel in channels]
             taps = [q_taps, k_taps, v_taps]
-            channels = [q_channel, k_channel, v_channel]
             convolved = []
             for c in cutlass.range_constexpr(3):
                 acc = Float32(0.0)
                 for i in cutlass.range_constexpr(CONV_TAPS - 1):
-                    past = Float32(0.0)
-                    if page >= 0:
-                        past = _load(history, channels[c] * 3 + i).to(Float32)
-                    acc = acc + past * taps[c][i]
+                    acc = acc + pasts[c * (CONV_TAPS - 1) + i] * taps[c][i]
                 acc = acc + raw[c].to(Float32) * taps[c][CONV_TAPS - 1]
                 convolved.append(_bf16(_silu(acc)))
             query, key_value, value = convolved
