@@ -505,6 +505,7 @@ def _model(**overrides):
         layers_to_capture=[],
         eagle3_layers_to_capture=(),
         config=_NoConfig(),
+        peer_weights=None,
         _forward_decode_chain=mock.Mock(return_value=("chain", "aux")),
     )
     for name, value in overrides.items():
