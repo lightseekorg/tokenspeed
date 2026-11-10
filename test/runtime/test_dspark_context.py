@@ -67,7 +67,7 @@ def test_pipeline_projection_matches_concatenated_reference(stage_taps, with_tap
             writes.append((rows, pos, loc))
 
         model = SimpleNamespace(
-            hidden_size=4,
+            projection_width=4,
             mapping=SimpleNamespace(
                 is_first_pp_rank=stage == 0,
                 is_last_pp_rank=stage == len(stage_taps) - 1,
@@ -106,7 +106,7 @@ def test_pipeline_projection_matches_concatenated_reference(stage_taps, with_tap
 
 def test_context_accumulators_do_not_alias_between_inflight_chunks():
     model = SimpleNamespace(
-        hidden_size=4,
+        projection_width=4,
         mapping=SimpleNamespace(is_first_pp_rank=True, is_last_pp_rank=True),
     )
     producer = DSparkContextProducer(model, object(), attn_backend=object())

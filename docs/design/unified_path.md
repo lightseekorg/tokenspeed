@@ -1016,7 +1016,11 @@ cache contract, so the target allocates its write-location buffer
 unconditionally and drafts are gated structurally on `is_draft`.)
 
 K3 DSpark pipeline prefill distributes target-tap projection across stages,
-while the final stage owns the proposal network and draft cache. After
+while the final stage owns the proposal network and draft cache. Within a
+stage each attention-TP rank projects only its own `context_proj` output
+columns, so the partial sum crosses the stage boundary per rank at
+`hidden / attention TP` columns, and the final stage gathers the columns
+before the context norm. After
 target prefill sampling, that stage runs the ordinary drafter; its completed
 call publishes the final cache producer barrier. PD transfers the sampled
 anchor and real draft candidates with the target and draft caches. Decode
