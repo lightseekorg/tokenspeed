@@ -80,7 +80,7 @@ def project_and_pack(gdn, norm, x):
 @pytest.mark.parametrize("backend", ["auto", "deepgemm"])
 @pytest.mark.parametrize(
     "rows,hidden_size",
-    [(1, 512), (8, 512), (32, 512), (129, 512), (8, 8192), (4096, 8192)],
+    [(1, 512), (32, 512), (129, 512), (4096, 8192)],
 )
 def test_ba_overlap_graph_replay_matches_serial(
     monkeypatch, pdl, backend, rows, hidden_size

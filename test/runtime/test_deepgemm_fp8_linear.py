@@ -22,9 +22,13 @@
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.quantization import quantize_fp8
+from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
+from tokenspeed_kernel.ops.layernorm import gated_rmsnorm
+from tokenspeed_kernel.ops.quantization import output_fp8_quant_pack, quantize_fp8
+from tokenspeed_kernel.platform import pdl_enabled
 
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
+from tokenspeed.runtime.layers.linear import RowParallelLinear
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
@@ -75,3 +79,82 @@ def test_loaded_linear_and_graph(monkeypatch, serialized, rows):
     assert error < 0.06
     assert actual.dtype == torch.bfloat16
     assert layer.weight_scale_inv.dtype == torch.int32
+
+
+@pytest.mark.parametrize("rows", [4, 32])
+@pytest.mark.parametrize("normalize", [False, True])
+@pytest.mark.parametrize("pdl", [False, True])
+def test_output_projection_graph(monkeypatch, rows, normalize, pdl):
+    monkeypatch.setitem(global_server_args_dict, "dense_gemm_backend", "deepgemm")
+    torch.manual_seed(43)
+    width, head = 6144, 128 if normalize else 256
+    config = Fp8Config(
+        is_checkpoint_fp8_serialized=False,
+        weight_block_size=[128, 128],
+    )
+    layer = RowParallelLinear(
+        width,
+        2560,
+        bias=False,
+        params_dtype=torch.bfloat16,
+        quant_config=config,
+        prefix="projection",
+    ).cuda()
+    with torch.no_grad():
+        layer.weight.normal_(std=0.03)
+    layer.quant_method.process_weights_after_loading(layer)
+    x = torch.randn(rows, width, device="cuda", dtype=torch.bfloat16)
+    backing = torch.randn(
+        rows, width // head, 2, head, device="cuda", dtype=torch.bfloat16
+    )
+    z = (
+        backing[:, :, 1, :]
+        if not normalize
+        else torch.randn(rows, width * 2, device="cuda", dtype=torch.bfloat16)[
+            :, width:
+        ]
+    )
+    weight = (
+        torch.ones(head, device="cuda", dtype=torch.bfloat16) if normalize else None
+    )
+
+    def fused(value):
+        codes, scales = output_fp8_quant_pack(
+            value,
+            z,
+            weight,
+            head_dim=head,
+            eps=1e-6,
+            sigmoid_gate=True,
+            enable_pdl=pdl,
+        )
+        return layer(codes, scale=scales)[0]
+
+    old_pdl = pdl_enabled()
+    pdl_enabled(pdl)
+    try:
+        fused(x)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual = fused(x * 1.0)
+        for magnitude in (0.01, 1.0, 16.0):
+            x.normal_().mul_(magnitude)
+            graph.replay()
+            if normalize:
+                value = gated_rmsnorm(
+                    x,
+                    weight,
+                    z,
+                    eps=1e-6,
+                    group_size=head,
+                    norm_before_gate=True,
+                    sigmoid_gate=True,
+                    fp8_scale=None,
+                    weights_independent=True,
+                )
+            else:
+                value = sigmoid_mul(x.clone(), z)
+            expected = layer(value)[0]
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    finally:
+        pdl_enabled(old_pdl)
