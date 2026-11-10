@@ -101,14 +101,24 @@ def _rows_config(m: int, n: int, k: int) -> tuple[int, int, int, int] | None:
     outputs_per_wave, num_warps = config
     # This runs inside the selection predicate: a geometry the program does
     # not tile completely falls back to the default selection.
-    if (
+    if not gluon_rowcta_bf16_gemv_rows_tile_fits_gfx950(
+        n, k, outputs_per_wave, num_warps
+    ):
+        return None
+    return block_k, waves, outputs_per_wave, num_warps
+
+
+def gluon_rowcta_bf16_gemv_rows_tile_fits_gfx950(
+    n: int, k: int, outputs_per_wave: int, num_warps: int
+) -> bool:
+    """Whether a few-row tile covers ``[N, K]`` with the single-row geometry."""
+    block_k, waves = _rowcta_config(n, k)
+    return not (
         num_warps % waves
         or block_k % (_SUBGROUP_SIZE * waves)
         or k % block_k
         or n % (num_warps // waves * outputs_per_wave)
-    ):
-        return None
-    return block_k, waves, outputs_per_wave, num_warps
+    )
 
 
 def supports_gluon_rowcta_bf16_gemv_gfx950(m: int, n: int, k: int) -> bool:
@@ -792,17 +802,58 @@ def prefers_gluon_rowcta_bf16_gemv_gfx950(n: int, k: int) -> bool:
     return (n, k) in _PREFERRED_SHAPES
 
 
+def gluon_rowcta_bf16_gemv_gfx950_routing(
+    n: int, k: int
+) -> tuple[dict[int, tuple[int, int]], bool]:
+    """``(_ROWS_CONFIGS entry, whether mm sends a single row here)`` of ``[N, K]``."""
+    return dict(_ROWS_CONFIGS.get((n, k), {})), (n, k) in _PREFERRED_SHAPES
+
+
+def set_gluon_rowcta_bf16_gemv_gfx950_routing(
+    n: int,
+    k: int,
+    *,
+    rows: dict[int, tuple[int, int]],
+    single_row: bool,
+) -> None:
+    """Route ``[N, K]`` here, as measured entries in both tables would.
+
+    Args:
+        n: Output features.
+        k: Input features.
+        rows: Row bucket (2 or 4) -> (outputs per wave, waves per program);
+            empty removes the ``_ROWS_CONFIGS`` entry.
+        single_row: Whether ``gemm.mm`` sends a single row here.
+
+    Callers that cache ``gemm.mv`` selections must drop them afterwards.
+    """
+    global _PREFERRED_SHAPES
+    if not rows.keys() <= {2, 4}:
+        raise ValueError(f"Row buckets must be 2 or 4, got {sorted(rows)}")
+    if rows:
+        _ROWS_CONFIGS[(n, k)] = dict(rows)
+    else:
+        _ROWS_CONFIGS.pop((n, k), None)
+    if single_row:
+        _PREFERRED_SHAPES = _PREFERRED_SHAPES | {(n, k)}
+    else:
+        _PREFERRED_SHAPES = _PREFERRED_SHAPES - {(n, k)}
+
+
 __all__ = [
     "launch_gluon_gated_rowcta_bf16_gemv_gfx950",
     "gluon_rowcta_bf16_gemv_geometry_gfx950",
     "gluon_rowcta_bf16_gemv_gfx950",
+    "gluon_rowcta_bf16_gemv_gfx950_routing",
     "gluon_rowcta_bf16_gemv_rows_finish_gfx950",
     "gluon_rowcta_bf16_gemv_rows_finish_lds_gfx950",
     "gluon_rowcta_bf16_gemv_rows_stage_x_gfx950",
     "gluon_rowcta_bf16_gemv_rows_sums_gfx950",
+    "gluon_rowcta_bf16_gemv_rows_tile_fits_gfx950",
     "gluon_rowcta_bf16_gemv_rows_weights_gfx950",
     "gluon_rowcta_bf16_gemv_rows_x_ahead_gfx950",
     "prefers_gluon_rowcta_bf16_gemv_gfx950",
+    "set_gluon_rowcta_bf16_gemv_gfx950_routing",
     "supports_gluon_gated_rowcta_bf16_gemv_gfx950",
     "supports_gluon_rowcta_bf16_gemv_gfx950",
 ]

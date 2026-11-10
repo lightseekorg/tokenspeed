@@ -81,6 +81,16 @@ On CDNA4, ordinary GEMM dispatch admits the measured single-row
 Callers that publish directly into a collective buffer pass that buffer as
 `out` to the same `mv` operation.
 
+On CDNA4, `mm` sends 1-16 BF16 rows to the Gluon GEMVs only for the weight
+shapes in their measured tables. With `TOKENSPEED_GEMV_AUTOTUNE=1` (off by
+default), `ops/gemm/gluon_gemv_autotune.py` measures a weight below 2 GiB that
+no table lists the first time `mm` meets it during kernel warmup: one row on
+the dense or row-CTA GEMV against mm's own path, 2 and 3-4 rows on the
+row-CTA GEMV's (4, 4) tile against the decode GEMM, then the dense GEMV over
+2-4 and 5-16 rows, each needing a 1.5% lead on the median of seven
+alternating cold-weight graph replays. The routing enters the tables and the
+kernel autotune cache; capture and later processes only read the cache.
+
 `mv_fp8_weight` projects 16-bit rows through a weight-only FP8 weight: E4M3
 with one FP32 scale per output channel, as a 16-bit checkpoint quantizes at
 load. Activations stay 16-bit, so the only roundings past the weight's are
