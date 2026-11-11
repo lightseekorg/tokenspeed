@@ -104,6 +104,11 @@ jobs:
             work_dir="$NPU_CI_WORK/checkout"
           fi
           echo "WORK_DIR=$work_dir" >> "$GITHUB_ENV"
+          # Correctness jobs must be able to compile on full shared volumes.
+          # Performance jobs retain their established warm kernel cache.
+          if [ "${{ matrix.type }}" = "ut" ] || [ "${{ matrix.type }}" = "eval" ]; then
+            echo "TRITON_CACHE_DIR=$work_dir/.triton-cache" >> "$GITHUB_ENV"
+          fi
           # Keep project dependencies job-local, but reuse EvalScope downloads
           # from the model cache when the runner provides one.
           if [ "${{ matrix.workflow_stage }}" = "model-test" ]; then
@@ -115,11 +120,6 @@ jobs:
               echo "EVALSCOPE_UV_CACHE_DIR=$evalscope_uv_cache_dir" >> "$GITHUB_ENV"
             fi
             echo "UV_CACHE_DIR=$work_dir/.uv-cache" >> "$GITHUB_ENV"
-            # Accuracy jobs must be able to compile on full shared volumes.
-            # Performance jobs retain their established warm kernel cache.
-            if [ "${{ matrix.type }}" = "eval" ]; then
-              echo "TRITON_CACHE_DIR=$work_dir/.triton-cache" >> "$GITHUB_ENV"
-            fi
             # MIOpen's writable SQLite databases also need job-local storage.
             mkdir -p "$work_dir/.miopen-db" "$work_dir/.miopen-kernels"
             echo "MIOPEN_USER_DB_PATH=$work_dir/.miopen-db" >> "$GITHUB_ENV"
