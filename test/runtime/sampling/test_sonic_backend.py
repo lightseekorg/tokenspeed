@@ -719,9 +719,10 @@ def _chi2_deviate(counts: torch.Tensor, probs: torch.Tensor, n: int) -> float:
 
 @pytest.mark.parametrize("scale", [2.0, 6.0], ids=["moderate", "peaked"])
 def test_stochastic_sample_matches_softmax(scale):
-    """Empirical draw vs fp32 softmax over the top-128 bf16 logits (sonic's
-    bounded support). The peaked row is where a bf16 Gumbel-max score
-    inflates the mode by several sd at this sample size."""
+    """Empirical draw vs fp32 softmax over the whole row of bf16 logits: a row
+    without top-k, top-p or min-p draws from its whole vocabulary, the tokens
+    past its top 128 included. The peaked row is where a bf16 Gumbel-max
+    score inflates the mode by several sd at this sample size."""
     torch.manual_seed(3)
     iters = 8000
     backend = _make_backend(max_n=1)
@@ -743,14 +744,17 @@ def test_stochastic_sample_matches_softmax(scale):
         counts.scatter_add_(
             0, sampled.long(), torch.ones_like(sampled, dtype=torch.long)
         )
-    vals, idx = row.float().topk(128)
-    probs = torch.zeros(VOCAB)
-    probs[idx] = torch.softmax(vals, -1)
-    counts = counts.cpu()
-    assert counts.sum().item() == iters * MAX_BS
-    assert counts[probs == 0].sum().item() == 0, "a draw left the top-128 support"
-    dev = _chi2_deviate(counts, probs, iters * MAX_BS)
+    probs = torch.softmax(row.float(), -1)
+    counts, total = counts.cpu(), iters * MAX_BS
+    assert counts.sum().item() == total
+    dev = _chi2_deviate(counts, probs, total)
     assert abs(dev) < 5.0, dev
+    # The tokens past the top 128 are drawn at their probability.
+    past = torch.ones(VOCAB, dtype=torch.bool)
+    past[row.float().topk(128).indices] = False
+    tail = probs[past].sum().item()
+    spread = 5 * math.sqrt(tail * (1 - tail) * total) + 1
+    assert abs(counts[past].sum().item() - tail * total) < spread
 
 
 def test_rejects_logits_other_than_bf16_or_fp32():
@@ -793,22 +797,20 @@ def test_logprobs_match_log_softmax_and_leave_logits_untouched():
     )
 
 
-@pytest.mark.parametrize("draft_rank", [0, 3, 40])
+@pytest.mark.parametrize("draft_rank", [0, 3, 40, 150])
 def test_verify_first_token_marginal_matches_the_target(draft_rank):
     """Masked rejection with a point-draw draft d emits d with probability
     p(d) and otherwise draws from p without d, so the first emitted token's
-    marginal is the target law regardless of d, and the acceptance rate is
-    p(d)."""
+    marginal is the target law over the whole vocabulary regardless of d
+    (past the top 128 too), and the acceptance rate is p(d)."""
     torch.manual_seed(200)
     iters = 6000
     n = 2
     backend = _make_backend(max_n=n)
     row = (torch.randn(VOCAB) * 2.0).to(torch.bfloat16)
     row[300:] = -40.0
-    vals, idx = row.float().topk(128)
-    probs = torch.zeros(VOCAB)
-    probs[idx] = torch.softmax(vals, -1)
-    draft = int(idx[draft_rank].item())
+    probs = torch.softmax(row.float(), -1)
+    draft = int(row.float().topk(draft_rank + 1).indices[draft_rank].item())
     req = _prepare(backend, [_sp(f"sv{i}") for i in range(MAX_BS)], n=n)
     logits = row.cuda().expand(MAX_BS * n, VOCAB).contiguous()
     candidates = torch.zeros(MAX_BS, n, dtype=torch.int32, device="cuda")
@@ -832,7 +834,6 @@ def test_verify_first_token_marginal_matches_the_target(draft_rank):
         accepted += int((accept == 2).sum().item())
     counts = counts.cpu()
     total = iters * MAX_BS
-    assert counts[probs == 0].sum().item() == 0
     dev = _chi2_deviate(counts, probs, total)
     assert abs(dev) < 5.0, dev
     p_draft = probs[draft].item()
@@ -1050,6 +1051,7 @@ def test_serving_launches_compile_nothing_after_warm_up(dtype):
     shifted = torch.cat([req[:1], req])[1:]
     kernels = (
         prologue.bitpacked_reduction_kernel,
+        prologue.whole_reduction_kernel,
         singular.cumulative_selection_kernel,
         multistep.cumulative_unpack_kernel,
         verify.chain_speculative_verification_kernel,
@@ -1132,11 +1134,12 @@ def test_synthetic_full_length_draws_the_verify_bonus_token():
     torch.testing.assert_close(outputs[1], outputs[0])
 
 
+@pytest.mark.parametrize("top_k", [16, -1], ids=["candidates", "whole"])
 @pytest.mark.parametrize("length", range(1, MAX_N))
-def test_synthetic_stochastic_cutoff_draws_from_its_own_position(length):
-    """A stochastic row's cutoff token comes from position L - 1's candidates.
+def test_synthetic_stochastic_cutoff_draws_from_its_own_position(length, top_k):
+    """A stochastic row's cutoff token is position L - 1's draw, from its candidates or its whole vocabulary.
 
-    Each verify position's top candidates sit in its own token range, so a draw
+    Each verify position's strongest tokens sit in its own token range, so a draw
     that read another position's candidates or noise would land outside it.
     """
     torch.manual_seed(40 + length)
@@ -1144,11 +1147,13 @@ def test_synthetic_stochastic_cutoff_draws_from_its_own_position(length):
     span = VOCAB // n
     logits = torch.randn(MAX_BS, n, VOCAB, device="cuda")
     for position in range(n):
-        logits[:, position, position * span : (position + 1) * span] += 8.0
+        logits[:, position, position * span : (position + 1) * span] += 12.0
     logits = logits.view(MAX_BS * n, VOCAB).bfloat16()
     backend = _make_synthetic_backend(float(length))
     req = _prepare(
-        backend, [_sp(f"m{i}", temperature=1.0, top_k=16) for i in range(MAX_BS)], n=n
+        backend,
+        [_sp(f"m{i}", temperature=1.0, top_k=top_k) for i in range(MAX_BS)],
+        n=n,
     )
     candidates = torch.randint(0, VOCAB, (MAX_BS, n), dtype=torch.int32, device="cuda")
 

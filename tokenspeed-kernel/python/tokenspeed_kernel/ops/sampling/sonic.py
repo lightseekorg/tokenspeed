@@ -31,9 +31,12 @@ than the FlashInfer backend. The other Blackwell GPUs share it; any other GPU
 uses it unmeasured.
 
 Every config draws the same tokens (the selection is exact; only its tiling
-and warps differ), so the table changes speed only. bf16 logits rank at bf16
-resolution; fp32 logits (soft-capped heads) are sampled exactly in fp32 among
-the top-128 candidates their bf16 keys pick.
+and warps differ), so the table changes speed only. A row with no top-k, top-p
+or min-p draws from its whole vocabulary: each block keeps its best logit plus
+the slot's Gumbel noise at each token, and the best over the blocks (or ranks)
+is the draw. The other sampled rows select among the top-128 candidates their
+bf16 keys pick. bf16 logits rank at bf16 resolution; fp32 logits (soft-capped
+heads) are sampled exactly in fp32.
 """
 
 from __future__ import annotations
@@ -59,6 +62,8 @@ from tokenspeed_kernel.thirdparty.sonic_sampler.ops.multistep import (
 )
 from tokenspeed_kernel.thirdparty.sonic_sampler.ops.prologue import (
     bitpacked_reduction_kernel,
+    whole_reduction_kernel,
+    whole_row,
 )
 from tokenspeed_kernel.thirdparty.sonic_sampler.ops.shard import (
     shard_candidates_kernel,
@@ -282,13 +287,14 @@ def _reduce(
     logits: Tensor,
     state: SlotState,
     slots: Tensor,
+    offsets: Tensor,
     drafted: Tensor | None,
     scratchpad: Tensor,
     config: SonicConfig,
     enable_pdl: bool,
     shard: VocabShard | None,
 ) -> None:
-    """The first stage: each block's keys (or greedy maximum) in ``scratchpad``; ``drafted`` is None for one row per request."""
+    """The first stage: each block's keys (greedy maximum, or best perturbed value of a whole-vocabulary row) in ``scratchpad``; ``drafted`` is None for one row per request."""
     exact = _exact(logits)
     rows, vocab_size = logits.shape
     blocks = triton.cdiv(vocab_size, config.block_n)
@@ -342,14 +348,66 @@ def _reduce(
         tl.float32 if exact else tl.bfloat16,
         logit_scale=None if shard is None else shard.logit_scale,
         softcap=None if shard is None else shard.softcap,
+        whole=True,
         num_warps=config.first_warps,
     )
+    # The whole-vocabulary rows, a few programs per row walking consecutive blocks.
+    group_blocks = triton.cdiv(
+        blocks, min(blocks, triton.cdiv(_whole_programs(logits.device), rows))
+    )
+    whole_reduction_kernel[(rows, triton.cdiv(blocks, group_blocks))](
+        logits,
+        state.indicators,
+        slots,
+        None,
+        state.grammar,
+        state.context_counts,
+        state.decode_counts,
+        drafted,
+        state.repetition,
+        state.frequency,
+        state.presence,
+        state.logit_bias,
+        state.temperature,
+        state.seeds,
+        offsets,
+        scratchpad,
+        vocab_size,
+        0 if shard is None else shard.vocab_start,
+        gamma,
+        batch_size,
+        blocks,
+        group_blocks,
+        False,
+        not singular,
+        True,
+        singular,
+        enable_pdl,
+        logits.stride(0),
+        stride_g,
+        state.decode_counts.stride(0),
+        None,
+        scratchpad.stride(0),
+        config.block_n,
+        block_g,
+        tl.float32 if exact else tl.bfloat16,
+        logit_scale=None if shard is None else shard.logit_scale,
+        softcap=None if shard is None else shard.softcap,
+        num_warps=4,
+    )
+
+
+@functools.cache
+def _whole_programs(device: torch.device) -> int:
+    """Programs the whole-vocabulary reduction spreads its rows over: eight per SM."""
+    return 8 * torch.cuda.get_device_properties(device).multi_processor_count
 
 
 def shard_candidates(
     logits: Tensor,
     state: SlotState,
     slots: Tensor,
+    offsets: Tensor,
     drafted: Tensor | None,
     scratchpad: Tensor,
     shard: VocabShard,
@@ -363,6 +421,7 @@ def shard_candidates(
         logits: ``[rows, V_s]`` bf16 or fp32 raw head logits of this rank's shard.
         state: The slot state; fp32 scalars with fp32 logits.
         slots: ``[B]`` int64 slot of each request.
+        offsets: ``[P]`` int64 Philox offset of each slot (its first row's position).
         drafted: ``[B, g + 1]`` int32 drafts of a verify launch (rows request-major), or None for one row per request.
         scratchpad: ``[rows, >= scratchpad_columns(V_s)]`` uint32 keys.
         shard: This rank's slice; its ``pairs`` receive the candidates.
@@ -376,7 +435,9 @@ def shard_candidates(
         row's candidate values in descending order (bf16 values for bf16
         logits, fp32 for fp32), the lower token id first among equal values,
         then their global token ids as exact fp32 integers; a greedy row keeps
-        only its first maximum, the rest -inf. With ``draft_probs``,
+        only its first maximum, the rest -inf, and a row drawing from its
+        whole vocabulary its best perturbed value (``merged_whole`` reads
+        it). With ``draft_probs``,
         ``[rows, 3 * MAX_K]``: then the probability the row's draft recorded
         at each candidate (zero on greedy rows and on each request's last row).
 
@@ -385,7 +446,9 @@ def shard_candidates(
             would pass ``MAX_OFFSET``.
     """
     _check_offsets(logits, scratchpad)
-    _reduce(logits, state, slots, drafted, scratchpad, config, enable_pdl, shard)
+    _reduce(
+        logits, state, slots, offsets, drafted, scratchpad, config, enable_pdl, shard
+    )
     exact = _exact(logits)
     rows, vocab_size = logits.shape
     blocks = triton.cdiv(vocab_size, config.block_n)
@@ -434,6 +497,7 @@ def shard_candidates(
         d_ptr=draft_probs,
         stride_d=None if draft_probs is None else draft_probs.stride(0),
         stride_dg=None if draft_probs is None else draft_probs.stride(1),
+        whole=True,
         num_warps=config.second_warps,
     )
     return pairs
@@ -443,6 +507,7 @@ def _merged(
     logits: Tensor,
     state: SlotState,
     slots: Tensor,
+    offsets: Tensor,
     drafted: Tensor | None,
     scratchpad: Tensor,
     shard: VocabShard | None,
@@ -452,13 +517,16 @@ def _merged(
 ) -> dict:
     """The selection kernels' candidate arguments: none for whole rows, else every rank's gathered candidates (with ``draft_probs``, carrying them), which they merge."""
     if shard is None:
-        _reduce(logits, state, slots, drafted, scratchpad, config, enable_pdl, None)
+        _reduce(
+            logits, state, slots, offsets, drafted, scratchpad, config, enable_pdl, None
+        )
         return {}
     pairs = shard.gather(
         shard_candidates(
             logits,
             state,
             slots,
+            offsets,
             drafted,
             scratchpad,
             shard,
@@ -519,7 +587,9 @@ def sample(
     stride_x, stride_y = logits.stride(0), scratchpad.stride(0)
     stride_g, stride_c = state.grammar.stride(0), state.decode_counts.stride(0)
 
-    merged = _merged(logits, state, slots, None, scratchpad, shard, config, enable_pdl)
+    merged = _merged(
+        logits, state, slots, offsets, None, scratchpad, shard, config, enable_pdl
+    )
     cumulative_selection_kernel[(rows,)](
         scratchpad,
         state.indicators,
@@ -586,6 +656,7 @@ def sample(
         None,
         exact,
         **merged,
+        whole=True,
         num_warps=config.second_warps,
     )
     return tokens
@@ -703,6 +774,7 @@ def verify(
         logits,
         state,
         slots,
+        offsets,
         drafted,
         scratchpad,
         shard,
@@ -747,7 +819,7 @@ def verify(
         state.grammar if exact else None,
         state.context_counts if exact else None,
         state.decode_counts if exact else None,
-        drafted if exact else None,
+        drafted,
         state.repetition if exact else None,
         state.frequency if exact else None,
         state.presence if exact else None,
@@ -761,6 +833,7 @@ def verify(
         block_g,
         exact,
         **merged,
+        whole=True,
         num_warps=config.second_warps,
     )
     chain_speculative_verification_kernel[(batch_size,)](
@@ -837,9 +910,11 @@ def _synthetic_target_kernel(
     """One program per request: its target token at the forced position ``lengths - 1``.
 
     A greedy request (indicator bit 0x40) reads the argmax ``verify`` stored at
-    its first row. Any other request takes the Gumbel-max over that position's
-    ``MAX_K`` candidates, keyed by the slot's seed and offset and the position,
-    which is the draw ``verify`` makes past an all-accepted window.
+    its first row, and a request drawing from its whole vocabulary the draw
+    ``verify`` stored in its row's third slot. Any other request takes the
+    Gumbel-max over that position's ``MAX_K`` candidates, keyed by the slot's
+    seed and offset and the position, which is the draw ``verify`` makes past
+    an all-accepted window.
     """
     request = tl.program_id(axis=0)
     if enable_pdl:
@@ -851,6 +926,9 @@ def _synthetic_target_kernel(
     if (indicator & 0x40) > 0:
         # Greedy requests: ``verify`` stores each position's argmax at the first row.
         token = tl.load(indices_ptr + margin * max_k + step)
+    elif whole_row(indicator, True, False):
+        # The position's whole-vocabulary draw, its draft included.
+        token = tl.load(indices_ptr + (margin + step) * max_k + 2)
     else:
         # The draw ``verify`` makes past an all-accepted window: Gumbel-max over the
         # position's candidates, keyed by the slot's seed, offset and the position.
@@ -882,8 +960,9 @@ def synthetic_targets(
     ``L``: the first ``L - 1`` drafts, then a token drawn from the target at
     position ``L - 1``. This draws that token from the candidates ``verify``
     left in its scratch, as ``verify`` itself draws past an all-accepted
-    window: a greedy request's argmax, otherwise Gumbel-max over the
-    position's candidates with the slot's Philox noise for that position.
+    window: a greedy request's argmax, a whole-vocabulary request's draw
+    there, otherwise Gumbel-max over the position's candidates with the
+    slot's Philox noise for that position.
 
     Args:
         values: ``[B * T, MAX_K]`` fp32 candidate probabilities ``verify`` wrote.

@@ -1072,8 +1072,9 @@ graph records. `SamplingBatchInfo.is_all_greedy` and the eager-only argmax
 branches were deleted. Equivalence (top_k=1 == argmax, ties excepted) is
 pinned by `test/runtime/sampling/test_greedy_route_equivalence.py` (for
 `sonic`, whose kernels rank candidates at bf16 resolution -- a penalized
-greedy pick lies within one bf16 ulp of the maximum -- and realize `top_k=-1`
-as bounded top-128 truncation, by `test_sonic_backend.py`).
+greedy pick lies within one bf16 ulp of the maximum -- and draw a request
+without top-k, top-p or min-p from its whole vocabulary, by
+`test_sonic_backend.py`).
 
 Admission uses the selected sampling backend's finite top-k bound. GPU
 backends retain the exclusive 128 bound. `ascend_full` accepts positive
