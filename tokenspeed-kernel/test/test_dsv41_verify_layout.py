@@ -32,6 +32,7 @@ def reference_layout(
     valid_out,
     latest_scores=None,
     request_slots=None,
+    active_count=None,
 ):
     if latest_scores is not None:
         latest = latest_scores.index_select(0, request_slots)
@@ -40,6 +41,9 @@ def reference_layout(
         )
     batch_size, draft_width = scores.shape
     width = draft_width + 1
+    live = torch.arange(batch_size, device=scores.device) < (
+        batch_size if active_count is None else int(active_count.item())
+    )
     finite = torch.isfinite(scores).all(dim=1)
     survival = torch.sigmoid(scores.clamp(-60, 60)).cumprod(dim=1)
     gains = torch.where(
@@ -47,11 +51,15 @@ def reference_layout(
     ).flatten()
     # Stable ties preserve a prefix within each request, including underflowed
     # probabilities and unknown-score rows requiring their complete draft.
+    gains = torch.where(
+        live[:, None].expand(-1, draft_width).flatten(), gains, -torch.inf
+    )
     order = torch.argsort(gains, descending=True, stable=True)
     extra = torch.zeros_like(gains, dtype=torch.int64)
     extra.scatter_(0, order[: query_capacity - batch_size], 1)
+    extra *= live[:, None].expand(-1, draft_width).flatten()
     counts = 1 + extra.reshape(batch_size, draft_width).sum(dim=1)
-    valid = (~finite).sum() * draft_width <= query_capacity - batch_size
+    valid = ((~finite) & live).sum() * draft_width <= query_capacity - batch_size
     counts = torch.where(valid, counts, torch.ones_like(counts))
     indptr = torch.cat((counts.new_zeros(1), counts.cumsum(0)))
     positions = torch.arange(query_capacity, device=scores.device, dtype=torch.int64)
@@ -247,7 +255,7 @@ def test_latest_layout_runtime_shapes_do_not_compile():
             query_capacity=capacity,
             latest_scores=latest[:table_rows],
             request_slots=slots[:bs],
-            **out
+            **out,
         )
         assert out["indptr_out"][-1].item() == capacity
 
@@ -280,3 +288,58 @@ def test_cpu_layout_rejected():
     scores = torch.zeros(4, 5)
     with pytest.raises(ValueError, match="GPU"):
         verify_layout(scores, query_capacity=12, **outputs(scores, 12))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+def test_padded_layout_replay_tracks_live_count_without_compiling():
+    from tokenspeed_kernel.ops.attention.dsv41.triton import _verify_layout_kernel
+    from utils import assert_no_triton_compile
+
+    history = torch.randn(8, 5, device="cuda")
+    latest = torch.randn(16, 5, device="cuda")
+    slots = torch.arange(8, device="cuda")
+    active = torch.tensor([8], dtype=torch.float32, device="cuda")
+    out = outputs(history, 24)
+
+    def run():
+        verify_layout(
+            history,
+            query_capacity=24,
+            latest_scores=latest,
+            request_slots=slots,
+            active_count=active,
+            **out,
+        )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            run()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        run()
+    # Request churn includes an idle rank. Poison padding to ensure neither
+    # stale confidence nor an unknown padding row receives draft allocation.
+    with assert_no_triton_compile(_verify_layout_kernel):
+        for count in (8, 7, 1, 0, 4, 8):
+            active.fill_(count)
+            history.normal_()
+            latest.normal_()
+            history[count:] = float("nan")
+            latest[count:8] = float("nan")
+            graph.replay()
+            expected = outputs(history, 24)
+            reference_layout(
+                history,
+                24,
+                **expected,
+                latest_scores=latest,
+                request_slots=slots,
+                active_count=active,
+            )
+            for name in expected:
+                torch.testing.assert_close(out[name], expected[name], atol=0, rtol=0)
+            assert out["counts_out"][count:].tolist() == [1] * (8 - count)
+    graph.reset()

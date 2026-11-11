@@ -74,6 +74,8 @@ class VerifyBudgetPolicy:
         overhead. Missing measurements or non-finite feedback retain full width.
         Full width denotes native execution, not the adaptive full-width graph.
         """
+        if not self.admits(batch_size=len(scores), graph_batch_size=graph_batch_size):
+            return len(scores) * self.verify_width
         return self.select_distributed(
             (scores,),
             graph_batch_size=graph_batch_size,
@@ -95,15 +97,17 @@ class VerifyBudgetPolicy:
 
         Each rank allocates its own capacity among its own requests. Costs must
         measure the synchronized distributed step, not isolated rank execution.
-        Unequal local batches are ineligible for this uniform-capacity graph.
+        Real request counts may differ; padded rows contribute no reward.
         """
         if not rank_scores:
             raise ValueError("distributed verification requires rank scores")
-        bs = len(rank_scores[0])
-        if any(len(scores) != bs for scores in rank_scores):
-            raise ValueError("distributed verification requires equal local batches")
-        full = bs * self.verify_width
-        if not self.admits(batch_size=bs, graph_batch_size=graph_batch_size):
+        sizes = [len(scores) for scores in rank_scores]
+        bs = max(sizes)
+        padded = bs if graph_batch_size is None else graph_batch_size
+        if padded < bs:
+            raise ValueError("graph batch must cover every rank")
+        full = padded * self.verify_width
+        if not self.enabled or bs < self.min_batch_size or graph_batch_size is None:
             return full
         if any(
             len(row) != self.verify_width - 1
@@ -123,14 +127,17 @@ class VerifyBudgetPolicy:
         ):
             return full
         for q, cost in adaptive_step_ms.items():
-            if type(q) is not int or not bs <= q <= full:
+            if type(q) is not int or not padded <= q <= full:
                 raise ValueError(
                     "query capacity must fit the active verification window"
                 )
             if not math.isfinite(cost) or cost <= 0:
                 raise ValueError("adaptive step costs must be finite and positive")
 
-        rewards = [float(bs * len(rank_scores))] * (full - bs + 1)
+        # Costs describe the shared physical graph; rewards count only live
+        # requests. Padding retains a physical anchor, but earns no reward.
+        # An idle rank contributes neither anchors nor draft gains.
+        rewards = [float(sum(sizes))] * (full + 1)
         for scores in rank_scores:
             gains = []
             for row in scores:
@@ -140,17 +147,18 @@ class VerifyBudgetPolicy:
                     survival *= 1 / (1 + exp) if score >= 0 else exp / (1 + exp)
                     gains.append(survival)
             gains.sort(reverse=True)
-            reward = 0.0
-            for index, gain in enumerate(gains, 1):
-                reward += gain
-                rewards[index] += reward
+            prefix = [0.0]
+            for gain in gains:
+                prefix.append(prefix[-1] + gain)
+            for q in range(padded, full + 1):
+                rewards[q] += prefix[min(q - padded, len(gains))]
         native_rate = rewards[-1] / native_step_ms
         best_q = full
         best_rate = native_rate * (1 + self.min_gain)
         for q, step_ms in sorted(adaptive_step_ms.items(), reverse=True):
             if q == full:
                 continue
-            rate = rewards[q - bs] / (step_ms + policy_ms)
+            rate = rewards[q] / (step_ms + policy_ms)
             if rate > best_rate:
                 best_q, best_rate = q, rate
         return best_q

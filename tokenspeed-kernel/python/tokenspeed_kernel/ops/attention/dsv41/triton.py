@@ -4874,6 +4874,7 @@ def _verify_layout_kernel(
     Scores,
     Latest,
     Slots,
+    ActiveCount,
     Rows,
     Indptr,
     Counts,
@@ -4886,13 +4887,16 @@ def _verify_layout_kernel(
     DRAFT: tl.constexpr,
     BLOCK: tl.constexpr,
     USE_LATEST: tl.constexpr,
+    HAS_ACTIVE_COUNT: tl.constexpr,
 ):
     index = tl.arange(0, BLOCK).to(tl.int64)
     request = index // DRAFT
     column = index % DRAFT
+    active_bs = tl.load(ActiveCount).to(tl.int32) if HAS_ACTIVE_COUNT else BS
+    live = request < active_bs
     if USE_LATEST:
         slot = tl.load(Slots + request, request < BS, 0).to(tl.int64)
-        slot_valid = (request < BS) & (slot >= 0) & (slot < LATEST_ROWS)
+        slot_valid = live & (slot >= 0) & (slot < LATEST_ROWS)
         latest_finite = slot_valid
         for j in tl.static_range(DRAFT):
             value = tl.load(Latest + slot * LATEST_STRIDE + j, slot_valid, 0)
@@ -4914,12 +4918,12 @@ def _verify_layout_kernel(
     key = (gain.to(tl.uint32, bitcast=True).to(tl.uint64) << 32) | (
         0xFFFFFFFF - index.to(tl.uint64)
     )
-    key = tl.where(index < BS * DRAFT, key, 0)
+    key = tl.where(live, key, 0)
     ordered = tl.sort(key, descending=True)
     extra = CAPACITY - BS
     cutoff = tl.sum(tl.where(index == extra - 1, ordered, 0), 0)
-    selected = (index < BS * DRAFT) & (extra > 0) & (key >= cutoff)
-    unknown = tl.sum(((index < BS * DRAFT) & ~finite & (column == 0)).to(tl.int32), 0)
+    selected = live & (extra > 0) & (key >= cutoff)
+    unknown = tl.sum((live & ~finite & (column == 0)).to(tl.int32), 0)
     valid = unknown * DRAFT <= extra
     counts = tl.full((BLOCK,), 1, tl.int32)
     for j in tl.static_range(DRAFT):
@@ -4968,6 +4972,7 @@ def triton_dsv41_verify_layout(
     valid_out,
     latest_scores=None,
     request_slots=None,
+    active_count=None,
 ):
     bs, draft = scores.shape
     block = triton.next_power_of_2(bs * (draft + 1))
@@ -4975,6 +4980,7 @@ def triton_dsv41_verify_layout(
         scores,
         latest_scores,
         request_slots,
+        active_count,
         rows_out,
         indptr_out,
         counts_out,
@@ -4987,5 +4993,6 @@ def triton_dsv41_verify_layout(
         DRAFT=draft,
         BLOCK=block,
         USE_LATEST=latest_scores is not None,
+        HAS_ACTIVE_COUNT=active_count is not None,
         num_warps=4,
     )
