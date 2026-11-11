@@ -1552,6 +1552,78 @@ TEST(CacheCoordinatorAdmissionTest, RetriesWithFreshCursorsAfterPinnedAdmissionF
     EXPECT_TRUE(coordinator.GroupPrefixIndex(2).Contains(pool, Key(hashes[2], 2, 0)));
 }
 
+// The feasibility walk stops releasing at the block that completes the fit,
+// yet reads that block's epoch whole: a pin later in the epoch is found and
+// leaves the available order. The fit can complete at the walk's last
+// unpinned block; one block more walks every epoch, fails, and finds every
+// pin.
+TEST(CacheCoordinatorAdmissionTest, AFitPartwayThroughAnEpochStillFindsThatEpochsPins) {
+    for (const std::int32_t blocks : {5, 7, 8}) {
+        SCOPED_TRACE(blocks);
+        BlockPool pool(8, {1});
+        const std::array specs{
+            CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 4}};
+        CacheCoordinator coordinator =
+            MakeCoordinator(specs, 4, pool, false, nullptr, nullptr, false, false, /*checkpoint_retention_requests=*/0);
+        std::vector<std::string> hashes;
+        for (std::int32_t i = 0; i < 8; ++i) {
+            hashes.push_back(ContentHashes({{i, i, i, i}}).front());
+            // Two epochs of four; in each, location order is registration order.
+            CacheBoundaryForGroup(coordinator, pool, hashes.back(), /*group_id=*/0, /*access_epoch=*/i / 4 + 1,
+                                  /*logical_block_index=*/0);
+        }
+        const PrefixCacheIndex& index = coordinator.GroupPrefixIndex(0);
+        CacheBlockRef pinned = index.Find(pool, Key(hashes[7], 0));
+        ASSERT_TRUE(pinned);
+        ASSERT_EQ(index.PotentiallyEvictableEntries(pool), 8u);
+
+        std::vector<BlockTable> tables(1);
+        const bool fits = blocks < 8;
+        const auto admitted = AdmitForTest(coordinator, tables, /*num_tokens=*/blocks * 4);
+        ASSERT_EQ(admitted.has_value(), fits);
+        for (std::int32_t i = 0; i < 8; ++i) {
+            EXPECT_EQ(index.Contains(pool, Key(hashes[i], 0)), !fits || i >= blocks) << i;
+        }
+        EXPECT_EQ(tables[0].NumBlocks(), fits ? blocks : 0);
+        // The unpinned entries no victim took stay available; the pin does not.
+        const std::size_t untaken = fits ? 7 - blocks : 7;
+        EXPECT_EQ(index.PotentiallyEvictableEntries(pool), untaken);
+        pinned.reset();
+        EXPECT_EQ(index.PotentiallyEvictableEntries(pool), untaken + 1);
+    }
+}
+
+// Two blocks per parent: releasing a block's partner empties a parent but
+// takes its hole away, so the fit can complete well after the walk last
+// asked. The walk still ends with the epoch the fit completes in, and never
+// reads the next one: a pin there stays unfound.
+TEST(CacheCoordinatorAdmissionTest, AFitCompletedLateInAnEpochEndsTheWalkThere) {
+    BlockPool pool(4, {2});
+    const std::array specs{
+        CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 4}};
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, 4, pool, false, nullptr, nullptr, false, false, /*checkpoint_retention_requests=*/0);
+    std::vector<std::string> hashes;
+    for (std::int32_t i = 0; i < 8; ++i) {
+        hashes.push_back(ContentHashes({{i, i, i, i}}).front());
+        // Two epochs of two parents each.
+        CacheBoundaryForGroup(coordinator, pool, hashes.back(), /*group_id=*/0, /*access_epoch=*/i / 4 + 1,
+                              /*logical_block_index=*/0);
+    }
+    const PrefixCacheIndex& index = coordinator.GroupPrefixIndex(0);
+    CacheBlockRef pinned = index.Find(pool, Key(hashes[7], 0));
+    ASSERT_TRUE(pinned);
+
+    std::vector<BlockTable> tables(1);
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/3 * 4));
+    for (std::int32_t i = 0; i < 8; ++i) {
+        EXPECT_EQ(index.Contains(pool, Key(hashes[i], 0)), i >= 3) << i;
+    }
+    // Four entries of the second epoch, the pin among them, and the first
+    // epoch's untaken one.
+    EXPECT_EQ(index.PotentiallyEvictableEntries(pool), 5u);
+}
+
 TEST(CacheCoordinatorAdmissionTest, AReleasedCheckpointCanLeaveWithItsCanonicalPrefix) {
     for (const auto [reverse_access_order, allow_block_eviction, state_groups] :
          {std::tuple{false, false, 1}, std::tuple{false, true, 1}, std::tuple{false, false, 3},

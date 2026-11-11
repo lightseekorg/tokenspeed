@@ -31,6 +31,14 @@ retained snapshots. Each snapshot owns the policy metadata selection ranks by
 replay, the live cursor seeks past the last saved epoch by key: a saved next
 iterator could point at a pinned node extracted by the pre-scan.
 
+A demand short by n parents cannot fit before n more blocks are released:
+one release closes at most one parent of the shortfall
+(`ShadowOccupancy::ParentShortfall`). The pre-scan and selection therefore ask
+the fit again only then. Selection stops exactly where asking after every
+selection would. The pre-scan ends at the same epoch with the same answer and
+still reads that epoch whole: it finds the same pinned entries and saves the
+same snapshots.
+
 ## 1. Admission is per chunk
 
 An optional `--chunk-prefill-kv-size` also bounds the KV read by a local

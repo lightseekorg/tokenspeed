@@ -20,6 +20,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <memory_resource>
@@ -117,6 +118,19 @@ public:
     // parents times packing.
     bool Fits(std::span<const std::vector<std::int64_t>> need_by_bucket, std::span<const std::int64_t> dense_need,
               std::span<const std::int64_t> pair_need) const {
+        return ParentShortfall(need_by_bucket, dense_need, pair_need) == 0;
+    }
+
+    // The empty parents the demand needs beyond those the shadow has: zero
+    // exactly when it fits. A Remove lowers it by at most one. It either adds
+    // one hole, which shortens any bucket's and the total shortfall by at
+    // most one block, or it empties its parent: one more empty parent, and
+    // only holes leave. With pairs too, as NextPairBucket's buckets need the
+    // fewest parents of any choice. So a demand short by n parents cannot fit
+    // before n more Removes, and a planner need not ask again before then.
+    std::int64_t ParentShortfall(std::span<const std::vector<std::int64_t>> need_by_bucket,
+                                 std::span<const std::int64_t> dense_need,
+                                 std::span<const std::int64_t> pair_need) const {
         _assert(need_by_bucket.size() == groups_.size() && dense_need.size() == groups_.size() &&
                     pair_need.size() == groups_.size(),
                 "a shadow fit takes one demand per group");
@@ -129,7 +143,7 @@ public:
                 ParentsNeededForBucketsAndPairs(need_by_bucket[i], holes_by_bucket_[i], dense_need[i], pair_need[i],
                                                 pool_.Packing(static_cast<std::uint32_t>(i)), scratch);
         }
-        return parents_needed <= empty_parent_count_;
+        return std::max<std::int64_t>(parents_needed - empty_parent_count_, 0);
     }
 
     // Group i's holes per bucket as the tentative victims would leave them.

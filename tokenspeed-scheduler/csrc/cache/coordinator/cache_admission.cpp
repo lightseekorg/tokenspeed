@@ -996,18 +996,40 @@ private:
         for (const VictimCandidate& candidate : request_reclaim_candidates_) {
             maximum.Remove(candidate.group_id, candidate.location);
         }
-        if (maximum.Fits(shape_need_, blocks_needed_, pair_need_)) {
+        // The fit is asked again only once enough blocks have left to close
+        // the shortfall (ShadowOccupancy::ParentShortfall): at most once
+        // before an epoch's end and once at it, never in an epoch too short
+        // to complete the fit. The walk thus usually stops releasing at the
+        // block that completes the fit; that block's epoch is still read
+        // whole.
+        std::int64_t removals_until_fit = maximum.ParentShortfall(shape_need_, blocks_needed_, pair_need_);
+        if (removals_until_fit == 0) {
             return true;
         }
         return eviction_plan_.Candidates().PreScanUntil(
             [&](std::uint32_t group_id, std::span<const PrefixCacheIndex::EvictionCandidate> entries) {
+                bool asked = false;
                 for (const auto& entry : entries) {
-                    if (!protected_locations_.contains(entry.location) &&
-                        !request_reclaim_locations_.contains(entry.location)) {
-                        maximum.Remove(group_id, entry.location);
+                    if (protected_locations_.contains(entry.location) ||
+                        request_reclaim_locations_.contains(entry.location)) {
+                        continue;
+                    }
+                    maximum.Remove(group_id, entry.location);
+                    if (removals_until_fit > 0) {
+                        --removals_until_fit;
+                    }
+                    if (removals_until_fit == 0 && !asked) {
+                        asked = true;
+                        removals_until_fit = maximum.ParentShortfall(shape_need_, blocks_needed_, pair_need_);
+                        if (removals_until_fit == 0) {
+                            return true;
+                        }
                     }
                 }
-                return maximum.Fits(shape_need_, blocks_needed_, pair_need_);
+                if (removals_until_fit == 0) {
+                    removals_until_fit = maximum.ParentShortfall(shape_need_, blocks_needed_, pair_need_);
+                }
+                return removals_until_fit == 0;
             });
     }
 

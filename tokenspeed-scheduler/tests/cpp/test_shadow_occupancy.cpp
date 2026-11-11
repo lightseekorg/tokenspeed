@@ -26,7 +26,9 @@
 #include <list>
 #include <limits>
 #include <numeric>
+#include <optional>
 #include <random>
+#include <set>
 #include <span>
 #include <string>
 #include <tuple>
@@ -38,6 +40,7 @@
 #include "cache/cache_group.h"
 #include "cache/coordinator/cache_coordinator.h"
 #include "cache/coordinator/eviction_candidates.h"
+#include "cache/coordinator/eviction_plan.h"
 #include "cache/coordinator/parent_occupancy.h"
 #include "cache/coordinator/shadow_occupancy.h"
 
@@ -334,6 +337,151 @@ TEST(ShadowOccupancy, ConcurrentPlansAndReusedScratchHaveIndependentCapacity) {
         EXPECT_FALSE(third.Fits(needed, zero, zero));
         EXPECT_EQ(pool.NumOccupiedSlots(), 4);
     }
+}
+
+// Two groups on one pool, some parents part full and some empty: a 4-slot
+// group in two buckets and a 2-slot group.
+struct MixedPackingPool {
+    MixedPackingPool() : pool{12, {4, 2}} {
+        const CacheGroupSpec sharded{.cache_blocks_per_lcm_block = 4, .block_granularity = 4};
+        const CacheGroupSpec single{.cache_blocks_per_lcm_block = 2, .block_granularity = 4};
+        groups.emplace_back(sharded, std::make_unique<GroupAllocator>(4, 0, 2), MakePrefixMatcher(sharded));
+        groups.emplace_back(single, std::make_unique<GroupAllocator>(2, 1, 1), MakePrefixMatcher(single));
+        pool.RegisterGroup(0, 4, 2);
+        pool.RegisterGroup(1, 2, 1);
+        const std::vector<std::int32_t> buckets{0, 0, 0, 1, 1, 0, 1, 0, 0};
+        for (CacheBlockRef& block : pool.AcquireBlocksInBuckets(0, buckets)) held.emplace_back(0, std::move(block));
+        for (CacheBlockRef& block : pool.AcquireBlocks(1, 5)) held.emplace_back(1, std::move(block));
+    }
+
+    BlockPool pool;
+    std::vector<CacheGroup> groups;
+    std::vector<std::pair<std::uint32_t, CacheBlockRef>> held;
+};
+
+// Per group: blocks by bucket, dense blocks, pairs.
+struct MixedDemand {
+    std::vector<std::vector<std::int64_t>> need;
+    std::vector<std::int64_t> dense;
+    std::vector<std::int64_t> pairs;
+};
+
+// MixedDemands' entries whose fit is known without the formula.
+constexpr std::size_t kMoreThanThePool = 4;
+constexpr std::size_t kFitsAsThePoolIs = 5;
+
+std::vector<MixedDemand> MixedDemands() {
+    return {
+        {{{3, 1}, {1}}, {14, 6}, {0, 0}},  // bucket and dense blocks
+        {{{0, 0}, {0}}, {20, 9}, {0, 0}},  // dense blocks only
+        {{{6, 2}, {0}}, {9, 0}, {3, 2}},   // pairs
+        {{{6, 6}, {3}}, {4, 5}, {1, 1}},   // all three
+        {{{0, 0}, {0}}, {60, 0}, {0, 0}},  // more than the whole pool
+        {{{1, 0}, {0}}, {0, 0}, {0, 0}},   // fits as the pool is
+    };
+}
+
+// A Remove lowers the shortfall by at most one parent and a Restore never
+// lowers it.
+TEST(ShadowOccupancy, ARemoveClosesAtMostOneParentOfTheShortfall) {
+    MixedPackingPool setup;
+    std::size_t removes_closing_one_parent = 0;
+    const std::vector<MixedDemand> demands = MixedDemands();
+    for (std::size_t d = 0; d < demands.size(); ++d) {
+        const MixedDemand& demand = demands[d];
+        for (std::uint32_t seed = 0; seed < 4; ++seed) {
+            SCOPED_TRACE(testing::Message() << "demand " << d << ", seed " << seed);
+            std::vector<std::size_t> order(setup.held.size());
+            std::iota(order.begin(), order.end(), 0);
+            std::mt19937 random(seed);
+            std::ranges::shuffle(order, random);
+            ShadowOccupancy shadow{setup.pool, setup.groups};
+            const std::int64_t initial = shadow.ParentShortfall(demand.need, demand.dense, demand.pairs);
+            if (d == kFitsAsThePoolIs) {
+                // An empty parent takes the one bucket-0 block.
+                EXPECT_EQ(initial, 0);
+            }
+            std::int64_t shortfall = initial;
+            for (const std::size_t i : order) {
+                shadow.Remove(setup.held[i].first, setup.held[i].second->Location());
+                const std::int64_t next = shadow.ParentShortfall(demand.need, demand.dense, demand.pairs);
+                ASSERT_GE(next, std::max<std::int64_t>(shortfall - 1, 0));
+                removes_closing_one_parent += next == shortfall - 1 ? 1 : 0;
+                shortfall = next;
+            }
+            if (d == kMoreThanThePool) {
+                // 60 blocks of a 4-slot group need 15 parents; the pool has 12.
+                EXPECT_EQ(shortfall, 3);
+            }
+            std::ranges::shuffle(order, random);
+            for (const std::size_t i : order) {
+                shadow.Restore(setup.held[i].first, setup.held[i].second->Location());
+                const std::int64_t next = shadow.ParentShortfall(demand.need, demand.dense, demand.pairs);
+                ASSERT_GE(next, shortfall);
+                shortfall = next;
+            }
+            // Every block is back: the pool's own shortfall again.
+            EXPECT_EQ(shortfall, initial);
+        }
+    }
+    EXPECT_GT(removes_closing_one_parent, 0u);
+    EXPECT_EQ(setup.pool.NumOccupiedSlots(), 14);
+}
+
+// Selection stops after the first selection the demand fits after -- one
+// that removes no block, one or several -- and fails once they run out.
+TEST(CacheEvictionPlan, SelectionStopsAtTheFirstSelectionAfterWhichTheDemandFits) {
+    MixedPackingPool setup;
+    const std::vector<std::vector<std::size_t>> scripts{
+        {1, 1, 0, 1, 1, 1, 2, 1, 1, 1, 1, 0, 1, 1, 1},
+        {1, 0, 3, 1, 2, 0, 1, 4, 1, 1},
+    };
+    std::set<std::optional<std::size_t>> stops;
+    for (int permutation = 0; permutation < 4; ++permutation) {
+        // Fixed removal orders: as held, reversed, rotated and interleaved.
+        std::vector<std::size_t> order(setup.held.size());
+        std::iota(order.begin(), order.end(), 0);
+        if (permutation == 1) std::ranges::reverse(order);
+        if (permutation == 2) std::ranges::rotate(order, order.begin() + static_cast<std::ptrdiff_t>(order.size() / 2));
+        if (permutation == 3) std::ranges::stable_partition(order, [](std::size_t i) { return i % 2 == 0; });
+        for (const std::vector<std::size_t>& removed_per_selection : scripts) {
+            for (const MixedDemand& demand : MixedDemands()) {
+                SCOPED_TRACE(permutation);
+                // Reference: ask the fit after every selection.
+                ShadowOccupancy reference{setup.pool, setup.groups};
+                std::optional<std::size_t> fits_after;
+                std::size_t next_block = 0;
+                for (std::size_t selection = 0;; ++selection) {
+                    if (reference.Fits(demand.need, demand.dense, demand.pairs)) {
+                        fits_after = selection;
+                        break;
+                    }
+                    if (selection == removed_per_selection.size()) break;
+                    for (std::size_t k = 0; k < removed_per_selection[selection]; ++k, ++next_block) {
+                        const auto& [group_id, block] = setup.held[order[next_block]];
+                        reference.Remove(group_id, block->Location());
+                    }
+                }
+                stops.insert(fits_after);
+                CacheEvictionPlan plan{setup.pool, setup.groups};
+                std::size_t selections = 0;
+                next_block = 0;
+                const bool fits = plan.SelectUntilFits(demand.need, demand.dense, demand.pairs, [&] {
+                    if (selections == removed_per_selection.size()) return false;
+                    for (std::size_t k = 0; k < removed_per_selection[selections]; ++k, ++next_block) {
+                        const auto& [group_id, block] = setup.held[order[next_block]];
+                        plan.Remove(group_id, block->Location());
+                    }
+                    ++selections;
+                    return true;
+                });
+                EXPECT_EQ(fits, fits_after.has_value());
+                EXPECT_EQ(selections, fits_after.value_or(removed_per_selection.size()));
+                EXPECT_EQ(plan.Fits(demand.need, demand.dense, demand.pairs), fits);
+            }
+        }
+    }
+    EXPECT_GT(stops.size(), 4u) << "the demands stop at many different selections";
 }
 
 TEST(PlanningScratch, AlignedOverflowAndNestedLeasesKeepTheirOwnValues) {
