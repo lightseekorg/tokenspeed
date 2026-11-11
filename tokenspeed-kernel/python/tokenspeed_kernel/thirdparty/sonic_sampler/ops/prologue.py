@@ -726,7 +726,7 @@ def nucleus_blocks(
     logit_scale,
     softcap,
 ):
-    """Store each of blocks ``[first, last)``'s maximum value and its exp-sum below that maximum past the row's ``blocks`` keys, for a top-p nucleus over the whole softmax; one pipelined walk over their tiles of at most 4096 columns."""
+    """Store the maximum value and the exp-sum below it of each block in ``[first, last)`` past the row's ``blocks`` keys, for a top-p nucleus over the whole softmax; one pipelined walk over their tiles of at most 4096 columns."""
 
     minima: tl.constexpr = -float("inf")
     tile: tl.constexpr = 4096 if block_n > 4096 else block_n
