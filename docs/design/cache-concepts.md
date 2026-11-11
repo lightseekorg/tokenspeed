@@ -301,8 +301,10 @@ column count preserve logical indexing without writing long zero prefixes.
 No borrowed table escapes into an execution plan. The runtime uploads these
 windows and reconstructs absolute rows, including zero holes and `-1`
 padding, with the existing row-expansion kernel; a host mirror is built only
-when requested. The legacy absolute-table accessors materialize a stable,
-thread-safe cached buffer on demand. Copies share the immutable snapshot,
+when requested. CUDA and NPU use the same Triton row-expansion kernel through
+their respective vendor backends; other devices use the tensor fallback.
+The legacy absolute-table accessors materialize a stable, thread-safe cached
+buffer on demand. Copies share the immutable snapshot,
 and NumPy views keep their owning batch alive. Pinned staging remains
 runtime-owned; the scheduler neither allocates nor borrows a Torch buffer.
 
