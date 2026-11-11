@@ -30,6 +30,8 @@
 #include <string_view>
 #include <variant>
 
+#include "cache/core/hex_codec.h"
+
 namespace tokenspeed {
 
 // Complete internal identity. Canonical SHA-256 text has an allocation-free
@@ -42,20 +44,8 @@ public:
     ContentHash() : value_{std::string{}} {}
     ContentHash(const char* text) : ContentHash(std::string_view{text}) {}
     ContentHash(const std::string& text) : ContentHash(std::string_view{text}) {}
-    ContentHash(std::string_view text) : value_{std::string{}} {
-        Digest digest;
-        if (decode(text, digest))
-            value_ = digest;
-        else
-            value_ = std::string(text);
-    }
-    ContentHash(std::string&& text) : value_{std::string{}} {
-        Digest digest;
-        if (decode(text, digest))
-            value_ = digest;
-        else
-            value_ = std::move(text);
-    }
+    ContentHash(std::string_view text) : value_{parse(text)} {}
+    ContentHash(std::string&& text) : value_{parse(std::move(text))} {}
     explicit ContentHash(Digest digest) : value_{digest} {}
 
     bool empty() const noexcept {
@@ -64,13 +54,8 @@ public:
     }
     std::string ToString() const {
         if (const auto* text = std::get_if<std::string>(&value_)) return *text;
-        static constexpr char hex[] = "0123456789abcdef";
         std::string text(64, '0');
-        const auto& digest = std::get<Digest>(value_);
-        for (std::size_t i = 0; i < digest.size(); ++i) {
-            text[2 * i] = hex[digest[i] >> 4];
-            text[2 * i + 1] = hex[digest[i] & 15];
-        }
+        WriteLowercaseHex(std::get<Digest>(value_), text.data());
         return text;
     }
     operator std::string() const { return ToString(); }
@@ -103,28 +88,21 @@ public:
     friend std::ostream& operator<<(std::ostream& out, const ContentHash& hash) { return out << hash.ToString(); }
 
 private:
-    static bool decode(std::string_view text, Digest& digest) noexcept {
-        if (text.size() != 64) return false;
-        // Random hex digits make per-nibble branches unpredictable. Decode
-        // through one table and validate once, retaining opaque bytes exactly.
-        static constexpr auto nibbles = [] {
-            std::array<std::uint8_t, 256> table{};
-            table.fill(255);
-            for (unsigned i = 0; i < 10; ++i) table['0' + i] = i;
-            for (unsigned i = 0; i < 6; ++i) table['a' + i] = 10 + i;
-            return table;
-        }();
-        unsigned invalid = 0;
-        for (std::size_t i = 0; i < digest.size(); ++i) {
-            const auto hi = nibbles[static_cast<unsigned char>(text[2 * i])];
-            const auto lo = nibbles[static_cast<unsigned char>(text[2 * i + 1])];
-            invalid |= hi | lo;
-            digest[i] = static_cast<std::uint8_t>(hi * 16 + lo);
-        }
-        return invalid < 16;
+    using Value = std::variant<Digest, std::string>;
+
+    // Built in place: a key is constructed for every prompt page.
+    static Value parse(std::string_view text) {
+        Digest digest;
+        if (ReadLowercaseHex(text, digest)) return digest;
+        return std::string(text);
+    }
+    static Value parse(std::string&& text) {
+        Digest digest;
+        if (ReadLowercaseHex(text, digest)) return digest;
+        return std::move(text);
     }
 
-    std::variant<Digest, std::string> value_;
+    Value value_;
 };
 
 }  // namespace tokenspeed

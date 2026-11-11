@@ -31,17 +31,16 @@
 
 #include <openssl/sha.h>
 
+#include "cache/core/hex_codec.h"
 #include "utils.h"
 
 namespace tokenspeed {
 
 // Append each byte of [bytes, bytes+n) to out as two lowercase hex characters.
 inline void AppendHexBytes(std::string& out, const uint8_t* bytes, std::size_t n) {
-    static constexpr char kHex[] = "0123456789abcdef";
-    for (std::size_t i = 0; i < n; ++i) {
-        out.push_back(kHex[bytes[i] >> 4]);
-        out.push_back(kHex[bytes[i] & 0xf]);
-    }
+    const std::size_t size = out.size();
+    out.resize(size + 2 * n);
+    WriteLowercaseHex({bytes, n}, out.data() + size);
 }
 
 // Absorb a uint32_t into the hash as 4 little-endian bytes. Encodes each token id
@@ -76,9 +75,8 @@ inline void Sha256UpdateTokensExplicitLE(SHA256_CTX& ctx, std::span<const std::i
 
 // Encode a 32-byte SHA-256 digest as a 64-char lowercase hex string.
 inline std::string DigestToHex(const unsigned char* digest) {
-    std::string out;
-    out.reserve(SHA256_DIGEST_LENGTH * 2);
-    AppendHexBytes(out, digest, SHA256_DIGEST_LENGTH);
+    std::string out(SHA256_DIGEST_LENGTH * 2, '0');
+    WriteLowercaseHex({digest, SHA256_DIGEST_LENGTH}, out.data());
     return out;
 }
 
@@ -149,15 +147,17 @@ inline std::string HashPrefixPage(std::span<const std::int32_t> tokens, const st
     return DigestToHex(HashPrefixPageDigest(tokens, prior_bytes, extra_keys).data());
 }
 
-inline std::vector<std::string> ComputePrefixHashes(
-    std::span<const std::span<const std::int32_t>> prefix_pages, const std::string& prior,
-    std::span<const std::span<const std::string>> extra_keys_per_page = {}) {
-    std::vector<std::string> hashes;
-    hashes.reserve(prefix_pages.size());
-    if (prefix_pages.empty()) return hashes;
-    // Decode the caller's seed once. Later pages chain the raw digest;
-    // an empty seed remains distinct from a 32-byte all-zero digest.
-    const auto seed = HexToBytes(prior);
+// Appends the hashes of prefix_pages to hashes, chained on the raw seed
+// bytes. Later pages chain the raw digest; an empty seed remains distinct
+// from a 32-byte all-zero digest.
+inline void AppendPrefixHashChain(std::vector<std::string>& hashes,
+                                  std::span<const std::span<const std::int32_t>> prefix_pages,
+                                  std::span<const uint8_t> seed,
+                                  std::span<const std::span<const std::string>> extra_keys_per_page) {
+    // Grow as a range insert would: a chain may also be extended a few pages
+    // at a time.
+    const std::size_t size = hashes.size() + prefix_pages.size();
+    if (size > hashes.capacity()) hashes.reserve(std::max(size, 2 * hashes.size()));
     std::span<const uint8_t> current_prior = seed;
     PrefixDigest digest;
     for (std::size_t i = 0; i < prefix_pages.size(); ++i) {
@@ -167,7 +167,28 @@ inline std::vector<std::string> ComputePrefixHashes(
         hashes.push_back(DigestToHex(digest.data()));
         current_prior = digest;
     }
+}
+
+inline std::vector<std::string> ComputePrefixHashes(
+    std::span<const std::span<const std::int32_t>> prefix_pages, const std::string& prior,
+    std::span<const std::span<const std::string>> extra_keys_per_page = {}) {
+    std::vector<std::string> hashes;
+    if (prefix_pages.empty()) return hashes;
+    // Decode the caller's seed once.
+    const auto seed = HexToBytes(prior);
+    AppendPrefixHashChain(hashes, prefix_pages, seed, extra_keys_per_page);
     return hashes;
+}
+
+// Extends hashes, the chain of a token sequence's leading pages, in place by
+// next_pages, the pages that follow them. A throw leaves a valid, shorter
+// chain (basic guarantee).
+inline void ExtendPrefixHashes(std::vector<std::string>& hashes,
+                               std::span<const std::span<const std::int32_t>> next_pages) {
+    if (next_pages.empty()) return;
+    // Decoded before hashes grows: the seed is its own last element.
+    const auto seed = hashes.empty() ? std::vector<uint8_t>{} : HexToBytes(hashes.back());
+    AppendPrefixHashChain(hashes, next_pages, seed, {});
 }
 
 }  // namespace tokenspeed

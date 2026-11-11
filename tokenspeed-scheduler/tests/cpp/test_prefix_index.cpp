@@ -28,6 +28,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "cache/core/block_pool.h"
@@ -197,6 +198,93 @@ TEST(ContentHash, PreservesOpaqueBytesEmptyIdentityAndLexicalOrder) {
     std::ranges::sort(hashes);
     for (std::size_t i = 0; i < hashes.size(); ++i) EXPECT_EQ(hashes[i].ToString(), ordered_text[i]);
     EXPECT_EQ(ContentHash(ContentHash::Digest{}), ContentHash(std::string(64, '0')));
+}
+
+TEST(ContentHash, CanonicalTextIsTheDigestFromEveryConstructor) {
+    std::mt19937 random(41);
+    for (int trial = 0; trial < 32; ++trial) {
+        ContentHash::Digest digest;
+        for (auto& byte : digest) byte = static_cast<std::uint8_t>(random());
+        const ContentHash expected(digest);
+        const std::string text = expected.ToString();
+        ASSERT_EQ(text.size(), 64u);
+        EXPECT_TRUE(std::ranges::all_of(text, [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); }));
+        for (const ContentHash& hash : {ContentHash(text), ContentHash(std::string(text)), ContentHash(text.c_str()),
+                                        ContentHash(std::string_view(text))}) {
+            EXPECT_EQ(hash, expected);
+            EXPECT_EQ(hash.Hash(), expected.Hash());
+            EXPECT_EQ(hash.ToString(), text);
+            EXPECT_FALSE(hash.empty());
+        }
+    }
+}
+
+TEST(ContentHash, OpaqueKeysKeepTheirBytesAndEquality) {
+    const std::string canonical =
+        ContentHash(ContentHash::Digest{0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef}).ToString();
+    std::string uppercase = canonical;
+    std::ranges::transform(uppercase, uppercase.begin(), [](char c) { return c >= 'a' ? c - 'a' + 'A' : c; });
+    std::string high_bit = canonical;
+    high_bit[5] = static_cast<char>('0' | 0x80);
+    const std::vector<std::string> opaque{"",
+                                          "0",
+                                          canonical.substr(0, 63),
+                                          canonical + "0",
+                                          canonical.substr(0, 62),
+                                          uppercase,
+                                          canonical.substr(0, 63) + "G",
+                                          canonical.substr(0, 63) + "g",
+                                          high_bit,
+                                          std::string(64, '\0'),
+                                          "not a digest"};
+    for (const auto& text : opaque) {
+        for (const ContentHash& hash :
+             {ContentHash(text), ContentHash(std::string(text)), ContentHash(std::string_view(text))}) {
+            EXPECT_EQ(hash.ToString(), text);
+            EXPECT_EQ(hash, ContentHash(text));
+            EXPECT_NE(hash, ContentHash(canonical));
+            EXPECT_EQ(hash.empty(), text.empty());
+        }
+    }
+    EXPECT_NE(ContentHash(uppercase), ContentHash(canonical)) << "uppercase text is not the digest";
+}
+
+TEST(ContentHash, OneChangedCharacterStaysCanonicalExactlyForLowercaseDigits) {
+    const ContentHash::Digest digest{0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10, 0x0f, 0x1e, 0x2d,
+                                     0x3c, 0x4b, 0x5a, 0x69, 0x78, 0x87, 0x96, 0xa5, 0xb4, 0xc3, 0xd2,
+                                     0xe1, 0xf0, 0x00, 0xff, 0x11, 0xee, 0x22, 0xdd, 0x33, 0xcc};
+    const std::string canonical = ContentHash(digest).ToString();
+    for (std::size_t position = 0; position < canonical.size(); ++position) {
+        for (unsigned value = 0; value < 256; ++value) {
+            auto text = canonical;
+            text[position] = static_cast<char>(value);
+            const ContentHash hash(text);
+            const auto with_nibble = [&](int nibble) {
+                auto changed = digest;
+                auto& byte = changed[position / 2];
+                byte =
+                    static_cast<std::uint8_t>(position % 2 == 0 ? (byte & 0x0f) | nibble << 4 : (byte & 0xf0) | nibble);
+                return changed;
+            };
+            int nibble = -1;
+            if (value >= '0' && value <= '9') nibble = static_cast<int>(value - '0');
+            if (value >= 'a' && value <= 'f') nibble = static_cast<int>(value - 'a' + 10);
+            if (nibble < 0) {
+                // Opaque: it keeps its bytes and equals no digest, not even
+                // the one an uppercase digit would spell.
+                EXPECT_EQ(hash.ToString(), text) << position << " " << value;
+                EXPECT_NE(hash, ContentHash(digest)) << position << " " << value;
+                if (value >= 'A' && value <= 'F') {
+                    EXPECT_NE(hash, ContentHash(with_nibble(static_cast<int>(value - 'A' + 10))))
+                        << position << " " << value;
+                }
+                continue;
+            }
+            const auto changed = with_nibble(nibble);
+            EXPECT_EQ(hash, ContentHash(changed)) << position << " " << value;
+            EXPECT_EQ(hash.Hash(), ContentHash(changed).Hash());
+        }
+    }
 }
 
 TEST(ContentHash, EveryNoncanonicalByteRemainsOpaqueAtEveryPosition) {

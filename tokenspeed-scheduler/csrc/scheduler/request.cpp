@@ -50,8 +50,7 @@ std::span<const std::string> Request::PromptPrefixHashes(std::int32_t num_pages)
     auto& hashes = *prompt_prefix_hashes_;
     const auto first = static_cast<std::int32_t>(hashes.size());
     if (num_pages > first) {
-        auto added = ComputePrefixHashes(PrefixPages(first, num_pages), hashes.empty() ? std::string{} : hashes.back());
-        hashes.insert(hashes.end(), std::make_move_iterator(added.begin()), std::make_move_iterator(added.end()));
+        ExtendPrefixHashes(hashes, PrefixPages(first, num_pages));
     }
     return std::span<const std::string>(hashes).first(num_pages);
 }
@@ -69,8 +68,7 @@ void Request::AppendPrefixHashes(std::vector<std::string>& hashes, std::int32_t 
     }
     const auto first = static_cast<std::int32_t>(hashes.size());
     if (first < num_pages) {
-        auto added = ComputePrefixHashes(PrefixPages(first, num_pages), hashes.empty() ? std::string{} : hashes.back());
-        hashes.insert(hashes.end(), std::make_move_iterator(added.begin()), std::make_move_iterator(added.end()));
+        ExtendPrefixHashes(hashes, PrefixPages(first, num_pages));
     }
 }
 

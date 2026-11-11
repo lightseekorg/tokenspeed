@@ -29,6 +29,7 @@
 #include <string>
 #include <vector>
 
+#include "cache/core/hex_codec.h"
 #include "cache/prefix/prefix_hasher.h"
 #include "core/token_container.h"
 #include "scheduler/request.h"
@@ -134,6 +135,76 @@ TEST(PageHasherHexTest, HexToBytesIsInverseOfAppend) {
 
 TEST(PageHasherHexTest, HexToBytesAcceptsUppercase) {
     EXPECT_EQ(HexToBytes("ABCDEF"), HexToBytes("abcdef"));
+}
+
+// Per-character spelling the word-at-a-time codec must reproduce.
+std::string ReferenceLowercaseHex(std::span<const std::uint8_t> bytes) {
+    std::string text;
+    for (const std::uint8_t byte : bytes) {
+        text += "0123456789abcdef"[byte >> 4];
+        text += "0123456789abcdef"[byte & 15];
+    }
+    return text;
+}
+
+TEST(PageHasherHexTest, EveryByteValueAndShortTailEncodesLikeTheReference) {
+    std::vector<std::uint8_t> all(256);
+    for (std::size_t i = 0; i < all.size(); ++i) all[i] = static_cast<std::uint8_t>(i);
+    std::string text(2 * all.size(), '?');
+    WriteLowercaseHex(all, text.data());
+    EXPECT_EQ(text, ReferenceLowercaseHex(all));
+    // Every length, so each short last word is covered, written in place
+    // without touching the characters after it.
+    for (std::size_t length = 0; length <= 9; ++length) {
+        const std::span<const std::uint8_t> bytes = std::span<const std::uint8_t>(all).subspan(250 - length, length);
+        std::string out(2 * length + 3, '?');
+        WriteLowercaseHex(bytes, out.data());
+        EXPECT_EQ(out, ReferenceLowercaseHex(bytes) + "???") << "length " << length;
+        std::string appended = "ab";
+        AppendHexBytes(appended, bytes.data(), bytes.size());
+        EXPECT_EQ(appended, "ab" + ReferenceLowercaseHex(bytes)) << "length " << length;
+    }
+}
+
+TEST(PageHasherHexTest, DecodingAcceptsExactlyLowercaseDigitsOfTheExpectedLength) {
+    std::mt19937 random(9137);
+    for (std::size_t length = 0; length <= 9; ++length) {
+        std::vector<std::uint8_t> bytes(length);
+        for (auto& byte : bytes) byte = static_cast<std::uint8_t>(random());
+        const std::string text = ReferenceLowercaseHex(bytes);
+        std::vector<std::uint8_t> decoded(length);
+        ASSERT_TRUE(ReadLowercaseHex(text, decoded)) << "length " << length;
+        EXPECT_EQ(decoded, bytes);
+        std::vector<std::uint8_t> longer(length + 1);
+        EXPECT_FALSE(ReadLowercaseHex(text, longer));
+        EXPECT_FALSE(ReadLowercaseHex(text + "0", decoded)) << "odd length";
+        for (std::size_t position = 0; position < text.size(); ++position) {
+            for (unsigned value = 0; value < 256; ++value) {
+                auto changed = text;
+                changed[position] = static_cast<char>(value);
+                const bool digit = (value >= '0' && value <= '9') || (value >= 'a' && value <= 'f');
+                ASSERT_EQ(ReadLowercaseHex(changed, decoded), digit)
+                    << "length " << length << " position " << position << " byte " << value;
+                if (digit) {
+                    EXPECT_EQ(ReferenceLowercaseHex(decoded), changed);
+                }
+            }
+        }
+    }
+}
+
+TEST(PageHasherHexTest, DigestTextRoundTripsThroughBothDirections) {
+    std::mt19937 random(5);
+    for (int trial = 0; trial < 64; ++trial) {
+        PrefixDigest digest;
+        for (auto& byte : digest) byte = static_cast<unsigned char>(random());
+        const std::string text = DigestToHex(digest.data());
+        EXPECT_EQ(text, ReferenceLowercaseHex(digest));
+        PrefixDigest decoded;
+        ASSERT_TRUE(ReadLowercaseHex(text, decoded));
+        EXPECT_EQ(decoded, digest);
+        EXPECT_EQ(HexToBytes(text), std::vector<std::uint8_t>(digest.begin(), digest.end()));
+    }
 }
 
 // ---- HashPrefixPage -----------------------------------------------------------
@@ -379,6 +450,32 @@ TEST(ComputePrefixHashesTest, IncrementalChainEqualsOneShot) {
     incremental.insert(incremental.end(), rest.begin(), rest.end());
 
     EXPECT_EQ(incremental, one_shot);
+}
+
+TEST(ComputePrefixHashesTest, ExtendingInPlaceEqualsOneShotAcrossReallocation) {
+    std::vector<std::int32_t> tokens(14);
+    for (std::int32_t i = 0; i < 14; ++i) {
+        tokens[i] = -7 * i;
+    }
+    std::vector<token_span> pages;
+    for (std::size_t start = 0; start < tokens.size(); start += 2) {
+        pages.push_back(token_span(tokens.data() + start, 2));
+    }
+    const std::vector<std::string> one_shot = ComputePrefixHashes(pages, "");
+
+    // From nothing, the chain starts with the empty prior.
+    std::vector<std::string> chain;
+    ExtendPrefixHashes(chain, std::span(pages).first(1));
+    EXPECT_EQ(chain, std::vector<std::string>{one_shot[0]});
+    ExtendPrefixHashes(chain, {});
+    EXPECT_EQ(chain.size(), 1u);
+    // Each extension seeds from the chain's own last element, also when
+    // growing the vector moves that element.
+    for (const auto [begin, end] : {std::pair{1, 2}, std::pair{2, 5}, std::pair{5, 7}}) {
+        chain.shrink_to_fit();
+        ExtendPrefixHashes(chain, std::span(pages).subspan(begin, end - begin));
+        EXPECT_EQ(chain, std::vector<std::string>(one_shot.begin(), one_shot.begin() + end));
+    }
 }
 
 // A step hashes the pages it completed, sliced alone rather than out of a view
