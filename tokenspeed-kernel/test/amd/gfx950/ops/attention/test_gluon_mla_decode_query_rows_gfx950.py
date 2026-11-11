@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from utils import is_cdna4
+from utils import assert_no_triton_compile, is_cdna4
 
 if not is_cdna4():
     pytest.skip("AMD CDNA4 is required for Gluon MLA tests", allow_module_level=True)
@@ -181,3 +181,56 @@ def test_split_count_fills_whole_waves():
     assert select(batch=1, row_tiles=6, max_seqlen_k=_MAX_K) == 32
     assert select(batch=16, row_tiles=6, max_seqlen_k=1024) == 2
     assert select(batch=64, row_tiles=6, max_seqlen_k=_MAX_K) == 2
+
+
+@pytest.mark.parametrize("q_dtype", [torch.bfloat16, _FP8])
+def test_large_pool_uses_safe_64_bit_addresses(q_dtype):
+    """Pages past the first 2^31 bytes of the pool read the right rows."""
+    q, kv, table, row_lengths = _inputs(
+        [[2049, 2050, 2051], [130, 130, 131]], 96, q_dtype, seed=5
+    )
+    pool_pages = 0x80000000 // (kv[0].numel() * kv.element_size()) + 1
+    large_kv = torch.empty((pool_pages, *kv.shape[1:]), dtype=kv.dtype, device="cuda")
+    large_kv[-kv.shape[0] :].copy_(kv)
+    high_table = table + (pool_pages - kv.shape[0])
+    out, lse = mla_decode_query_rows(
+        q,
+        large_kv,
+        high_table,
+        row_lengths,
+        _MAX_K,
+        _SCALE,
+        kv_lora_rank=512,
+        return_lse=True,
+    )
+    ref_out, ref_lse = _reference(q, kv, table, row_lengths)
+    torch.testing.assert_close(out.float(), ref_out, **_out_tol(q_dtype))
+    torch.testing.assert_close(lse, ref_lse, atol=1e-3, rtol=1e-4)
+
+
+@pytest.mark.parametrize("q_dtype", [torch.bfloat16, _FP8])
+def test_batch_and_table_width_reuse_one_binary(q_dtype, monkeypatch):
+    """Serving varies the batch and the page-table width at a fixed split count."""
+    monkeypatch.setattr(decode, "_select_num_kv_splits_query_rows", lambda **_: 4)
+
+    def run(batch, table_pages, seed):
+        q, kv, table, row_lengths = _inputs(
+            [[257 + 64 * i, 300 + 64 * i] for i in range(batch)], 32, q_dtype, seed=seed
+        )
+        wide = torch.zeros((batch, table_pages), dtype=torch.int32, device="cuda")
+        wide[:, : table.shape[1]] = table
+        decode.launch_gluon_mla_decode_query_rows_gfx950(
+            q, kv, wide, row_lengths, _MAX_K, _SCALE, return_lse=True
+        )
+
+    run(2, 16, 0)
+    torch.cuda.synchronize()
+    with assert_no_triton_compile(
+        decode.gluon_mla_decode_query_rows_gfx950,
+        decode.gluon_mla_decode_query_rows_reduce_gfx950,
+    ):
+        for step, (batch, table_pages) in enumerate(
+            ((1, 9), (3, 17), (8, 32), (5, 33))
+        ):
+            run(batch, table_pages, step + 1)
+        torch.cuda.synchronize()
