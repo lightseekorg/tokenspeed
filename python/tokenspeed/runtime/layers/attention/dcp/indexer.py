@@ -424,6 +424,9 @@ def select_dsa_topk(
     consecutive rows are one request's verify window and share key tiles,
     each row keeping its own causal length. A tile whose first or end row is
     not a multiple of it scores its rows in groups of one.
+    ``index_k_format`` names the plane's format where its dtype does not
+    (``"mxfp4"``), as :class:`DCPIndexMetadata`'s does; ``metadata`` must
+    carry the same.
     """
     if q.shape[0] == 0:
         return (
@@ -663,7 +666,8 @@ def select_owned_dsa_topk(
         q: Index queries ``[rows, index_heads, head_dim]``, BF16, or FP8 E4M3
             with ``q_scales``.
         weights: Per-head weights ``[rows, index_heads]``.
-        index_k_cache: This rank's packed FP8 Index-K pages (uint8).
+        index_k_cache: This rank's packed Index-K pages (uint8), in
+            ``metadata``'s ``index_k_format``.
         metadata: :func:`build_dcp_index_metadata` for these rows; its
             placement names the KVP group and this rank.
         page_size: Tokens per cache page.
