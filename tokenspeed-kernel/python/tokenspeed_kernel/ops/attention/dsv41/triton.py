@@ -2606,12 +2606,14 @@ def triton_dsv41_dspark_block(
     return ids, positions, pre_mix, request_indices, page, row, indices
 
 
-@triton.jit(do_not_specialize=["X0", "X1"])
-def _pack_index_queries(X, V, S, X0, X1):
+@triton.jit(do_not_specialize=["X0", "X1", "X2"])
+def _pack_index_queries(X, V, S, X0, X1, X2, HEADS: tl.constexpr):
     row = tl.program_id(0).to(tl.int64)
     d = tl.arange(0, 128)
     # Widen before multiplication: large inner strides overflow int32 offsets.
-    x = tl.load(X + row * X0 + d.to(tl.int64) * X1).to(tl.float32)
+    x = tl.load(
+        X + (row // HEADS) * X0 + (row % HEADS) * X1 + d.to(tl.int64) * X2
+    ).to(tl.float32)
     grouped = tl.reshape(x, (1, 4, 32))
     amax = tl.maximum(tl.max(tl.abs(grouped), 2), 6 * 2.0**-126)
     packed, exponent = _mxfp4_index_rows(grouped, tl.div_rn(amax, 6.0), 1)
@@ -2685,18 +2687,21 @@ def quantize_index_queries(index_q, weights):
 
 
 def pack_index_queries(values):
-    flat = values.reshape(-1, 128)
     data = torch.empty(
         (*values.shape[:-1], 64), dtype=torch.uint8, device=values.device
     )
     scales = torch.empty(values.shape[:-1], dtype=torch.int32, device=values.device)
-    if flat.shape[0]:
-        _pack_index_queries[(flat.shape[0],)](
-            flat,
+    if values.numel():
+        # Token and head strides stay separate: a column slice of a wider
+        # projection would not flatten to rows without a copy.
+        heads = values.shape[-2] if values.ndim > 2 else 1
+        rows = values.reshape(-1, heads, 128)
+        _pack_index_queries[(rows.shape[0] * heads,)](
+            rows,
             data,
             scales,
-            flat.stride(0),
-            flat.stride(1),
+            *rows.stride(),
+            HEADS=heads,
             num_warps=4,
             enable_fp_fusion=False,
         )
