@@ -175,6 +175,7 @@ def _boundary(sh, which, stream, branch, post_gain, pre_gain):
         enable_pdl=False,
         branch_sentinel=None,
         branch_ranks=1,
+        branch_publish=None,
     )
 
 
