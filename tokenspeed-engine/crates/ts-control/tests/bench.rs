@@ -52,6 +52,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 const NO_FINISH_LOG: FinishLog = FinishLog {
     enabled: false,
     request_stats: false,
+    ttft_percentage: 0,
 };
 
 /// (rid, input_length, extend_prefix_len, prefill_length)
