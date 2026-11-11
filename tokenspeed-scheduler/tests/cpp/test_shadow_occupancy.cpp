@@ -40,29 +40,31 @@ namespace tokenspeed::test {
 namespace {
 
 TEST(ParentOccupancy, SparseParentsKeepZeroAndRestoredCountsAcrossGrowthAndUnwind) {
-    PlanningScratch storage;
-    for (int round = 0; round < 3; ++round) {
-        try {
-            auto lease = storage.Acquire();
-            ParentOccupancy counts{&lease};
-            EXPECT_EQ(counts.Find(1), nullptr);
-            for (int i = 1; i <= 16384; ++i) {
-                const auto parent = static_cast<std::int32_t>(static_cast<std::int64_t>(i) * 104729);
-                counts.GetOrInsert(parent, i % 4 + 1) -= 1;
-                EXPECT_EQ(counts.GetOrInsert(parent, 99), i % 4);
+    for (const std::int32_t stride : {4096, 104729}) {
+        PlanningScratch storage;
+        for (int round = 0; round < 3; ++round) {
+            try {
+                auto lease = storage.Acquire();
+                ParentOccupancy counts{&lease};
+                EXPECT_EQ(counts.Find(1), nullptr);
+                for (int i = 1; i <= 16384; ++i) {
+                    const auto parent = static_cast<std::int32_t>(static_cast<std::int64_t>(i) * stride);
+                    counts.GetOrInsert(parent, i % 4 + 1) -= 1;
+                    EXPECT_EQ(counts.GetOrInsert(parent, 99), i % 4);
+                }
+                EXPECT_EQ(counts.size(), 16384u);
+                for (int i = 16384; i > 0; --i) {
+                    const auto parent = static_cast<std::int32_t>(static_cast<std::int64_t>(i) * stride);
+                    auto* occupied = counts.Find(parent);
+                    ASSERT_NE(occupied, nullptr);
+                    EXPECT_EQ(*occupied, i % 4);
+                    ++*occupied;
+                    EXPECT_EQ(counts.GetOrInsert(parent, 99), i % 4 + 1);
+                }
+                EXPECT_EQ(counts.Find(1), nullptr);
+                throw 1;
+            } catch (int) {
             }
-            EXPECT_EQ(counts.size(), 16384u);
-            for (int i = 16384; i > 0; --i) {
-                const auto parent = static_cast<std::int32_t>(static_cast<std::int64_t>(i) * 104729);
-                auto* occupied = counts.Find(parent);
-                ASSERT_NE(occupied, nullptr);
-                EXPECT_EQ(*occupied, i % 4);
-                ++*occupied;
-                EXPECT_EQ(counts.GetOrInsert(parent, 99), i % 4 + 1);
-            }
-            EXPECT_EQ(counts.Find(1), nullptr);
-            throw 1;
-        } catch (int) {
         }
     }
 }

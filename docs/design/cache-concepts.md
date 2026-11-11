@@ -209,6 +209,8 @@ with cache groups and request demand rather than total cache capacity.
 Each shadow's occupancy table stores parent/count pairs in contiguous slots,
 growing only with touched parents. Restoring a parent keeps its slot until the
 shadow dies, so repeated Remove/Restore does not allocate individual nodes.
+Dense parent ranges initially use nearby slots; clustered probes trigger one
+rehash with mixed integer hashes, so regular strides do not produce long scans.
 Each shadow owns an independent RAII scratch lease. The pool lazily retains at
 most two 256 KiB banks; larger allocations and further simultaneous leases use
 the ordinary allocator and free that overflow with their containers. Only
