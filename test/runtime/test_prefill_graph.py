@@ -863,7 +863,7 @@ class TestDummyGroupTablesTest:
 
     def test_the_drafter_dummy_batch_prepares_the_draft_from_the_same_tables(self):
         """The drafter's prefill-graph capture runs over a dummy extend whose
-        draft metadata comes from the same tables and lengths as the target's,
+        unsharded draft metadata comes from the same tables and lengths as the target's,
         through the live extend's two-step prep."""
         import torch
 
@@ -877,6 +877,7 @@ class TestDummyGroupTablesTest:
 
         calls = []
         draft_backend = _backend(
+            query_sharded=False,
             init_forward_metadata=lambda **kwargs: calls.append(("init", kwargs)),
             refresh_decode_metadata=lambda *args, **kwargs: calls.append(
                 ("refresh", args, kwargs)
