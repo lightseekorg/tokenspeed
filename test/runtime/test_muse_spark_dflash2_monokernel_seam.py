@@ -339,7 +339,9 @@ def test_decode_monokernel_refuses_a_head_it_cannot_pack() -> None:
         def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
             self.captured = layer_ids
 
-    with pytest.raises(ValueError, match="draft's head have no monokernel") as error:
+    with pytest.raises(
+        ValueError, match="no monokernel for the DFlash2 draft's head"
+    ) as error:
         draft.configure_target(Target(), None)
     assert f"head: {HEAD_NOT_SHARDED}, {HEAD_OTHER_SHAPES}" in str(error.value)
     assert draft.monokernel_state.packed_head is None

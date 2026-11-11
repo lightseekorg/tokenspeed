@@ -805,8 +805,8 @@ def unserved_draft_error(name: str, unserved: dict[str, list[str]]) -> str:
     monokernel."""
     report = "; ".join(f"{piece}: {', '.join(r)}" for piece, r in unserved.items())
     return (
-        f"--decode-monokernel: the {name} draft's {' and '.join(unserved)} have "
-        f"no monokernel ({report}). The draft follows the target's rule: the "
+        f"--decode-monokernel: no monokernel for the {name} draft's "
+        f"{' and '.join(unserved)} ({report}). The draft follows the target's rule: the "
         "switch never serves a piece without its kernel. Serve without "
         "--decode-monokernel."
     )
@@ -859,7 +859,7 @@ def enable_draft_monokernels(model: torch.nn.Module) -> None:
     model.layers[-1].last = True
     model.monokernel_state = state
     logger.info(
-        f"Decode monokernel: {len(fused)} of {len(fused)} {name} layers, and the "
+        f"Decode monokernel: {len(fused)} of {len(model.layers)} {name} layers, and the "
         "context write"
     )
 
