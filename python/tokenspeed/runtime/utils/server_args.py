@@ -212,20 +212,27 @@ DECODE_MONOKERNEL_ARCHITECTURES = (
     "Qwen4ExpForCausalLM",
     "Qwen4ExpForConditionalGeneration",
 )
-# Target architectures whose speculative draft (DFlash2) has decode
-# monokernels too. Under --decode-monokernel such a target's draft must pack
-# them or startup fails; other targets' drafts keep their regular layers.
+# Target architectures whose speculative draft has decode monokernels too,
+# and the draft architectures those monokernels serve. Under
+# --decode-monokernel such a target's draft of such an architecture must pack
+# them or startup fails; any other draft keeps its regular layers.
 DRAFT_MONOKERNEL_TARGET_ARCHITECTURES = ("MuseSparkForConditionalGeneration",)
+DRAFT_MONOKERNEL_ARCHITECTURES = ("DFlash2DraftModel",)
 
 
 def draft_takes_decode_monokernel(
-    switch: bool, target_architectures: list[str]
+    switch: bool, target_architectures: list[str], draft_architectures: list[str]
 ) -> bool:
     """Whether a draft under ``--decode-monokernel`` (``switch``) builds its
-    layers from its monokernel class: only the draft of a target in
+    layers from its monokernel class: only a draft in
+    DRAFT_MONOKERNEL_ARCHITECTURES (DFlash2) of a target in
     DRAFT_MONOKERNEL_TARGET_ARCHITECTURES."""
-    return switch and any(
-        a in DRAFT_MONOKERNEL_TARGET_ARCHITECTURES for a in target_architectures
+    return (
+        switch
+        and any(
+            a in DRAFT_MONOKERNEL_TARGET_ARCHITECTURES for a in target_architectures
+        )
+        and any(a in DRAFT_MONOKERNEL_ARCHITECTURES for a in draft_architectures)
     )
 
 
@@ -3995,7 +4002,9 @@ class ServerArgs:
                 "layouts its kernels serve). Models: "
                 f"{', '.join(DECODE_MONOKERNEL_ARCHITECTURES)} on gfx950. "
                 "Startup fails when a layer cannot be packed for its "
-                "monokernel. The speculative draft of a target in "
+                "monokernel. A "
+                f"{', '.join(DRAFT_MONOKERNEL_ARCHITECTURES)} speculative "
+                "draft of a target in "
                 f"{', '.join(DRAFT_MONOKERNEL_TARGET_ARCHITECTURES)} takes the "
                 "switch too, and startup fails when its layers, context write "
                 "or head cannot be packed; other targets' drafts keep the "

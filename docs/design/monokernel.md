@@ -63,11 +63,12 @@ serve as one launch, and every other forward (prefill, larger steps) with the
 regular layer's code. Startup fails when the checkpoint's architecture has
 no monokernel (`DECODE_MONOKERNEL_ARCHITECTURES` in `server_args.py`), or
 when a layer other than a boundary layer cannot be packed after loading. The
-switch never serves such a layer without its kernel. The draft model of a
-target in `DRAFT_MONOKERNEL_TARGET_ARCHITECTURES` (`server_args.py`) takes
-the switch too and follows the same rule: when its layers, context write
+switch never serves such a layer without its kernel. A draft model in
+`DRAFT_MONOKERNEL_ARCHITECTURES` (DFlash2) of a target in
+`DRAFT_MONOKERNEL_TARGET_ARCHITECTURES` (`server_args.py`) takes the switch
+too and follows the same rule: when its layers, context write
 or head cannot be packed, startup fails and names each piece and why.
-Other targets' drafts keep the regular path. The model's layer loop is the
+Every other draft keeps the regular path. The model's layer loop is the
 same with and without the switch.
 
 **Deadlock freedom comes from the plan.** Each stage reads only regions that
