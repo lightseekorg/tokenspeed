@@ -102,6 +102,9 @@ class DeepseekV41Config(SoftmaxAttnConfig):
             kv_cache_mxfp8=False,
             draft_block_decode=False,
             speculative_num_draft_tokens=verify_width,
+            # V4.1 publishes packed KV from gathered projections, so its
+            # draft computes the target's query-context shard too.
+            shards_query_context=True,
         )
         hf = getattr(model_config.hf_config, "text_config", model_config.hf_config)
         ratios = tuple(

@@ -482,6 +482,7 @@ impl EngineClient {
         }
         self.shared.require(REQUEST_ADD)?;
         let engine = self.shared.route(&request)?;
+        debug!(rid, engine, routing = ?self.shared.routing, bootstrap_room = request.bootstrap_room, "generate request routed");
         let (tx, rx) = mpsc::unbounded_channel();
         {
             // Register before sending: outputs can arrive before `send`

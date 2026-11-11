@@ -171,6 +171,7 @@ impl State {
     fn apply(&mut self, message: StatusMessage) {
         let room = message.room;
         if !self.tracked.contains(&room) || self.cancellations.contains_key(&room) {
+            tracing::debug!(room, prefill_rank = message.prefill_rank, status = ?message.status, "ignoring late transfer status");
             return;
         }
         match message.status {
@@ -393,6 +394,7 @@ impl Shared {
             return;
         }
         cancellation.sent = Some(Instant::now());
+        let acknowledged = cancellation.acknowledged.len();
         if let Some(targets) = state.targets.get(&room) {
             for target in targets.iter() {
                 // A full queue is retried on the next cancellation poll.
@@ -402,6 +404,14 @@ impl Shared {
                     wire::cancellation_frames(room, &state.cache_id),
                 );
             }
+            let target_count = targets.len();
+            drop(state);
+            tracing::debug!(
+                room,
+                acknowledged,
+                targets = target_count,
+                "attempted KV cancellation"
+            );
         }
     }
 
@@ -652,6 +662,14 @@ impl DecodeOutbox {
                 manifest.to_wire()
             })
             .map_err(|error| error.0)?;
+            tracing::debug!(
+                rid,
+                room,
+                prefix_tokens = rows.extend_prefix_lens[index],
+                prompt_tokens = rows.prefill_lengths[index],
+                request_pool_index = rows.request_pool_indices[index],
+                "decode landing manifest prepared"
+            );
             pending.push((rid, room, rows.request_pool_indices[index], manifest));
         }
         for (rid, room, request_pool_index, manifest) in pending {
@@ -699,7 +717,15 @@ impl DecodeOutbox {
                 return;
             }
         }
-        tracing::debug!(rid, room, "pre-allocation sent");
+        drop(state);
+        tracing::debug!(
+            rid,
+            room,
+            request_pool_index,
+            targets = targets.len(),
+            manifest_bytes = manifest.len(),
+            "pre-allocation sent"
+        );
     }
 }
 
@@ -1045,7 +1071,14 @@ impl TransferPeer for DecodePeer {
                         .rooms
                         .failure(receiver.room)
                         .map(str::to_owned);
-                    tracing::warn!(rid, room = receiver.room, reason, "KV transfer failed");
+                    tracing::warn!(
+                        rid,
+                        room = receiver.room,
+                        bootstrap_room = receiver.room,
+                        rank = self.shared.engine_rank,
+                        reason,
+                        "event=ts_decode_kv_transfer_failed"
+                    );
                     events.push(PdEvent::Failed(rid.clone()));
                 }
                 if retired != 0 {
@@ -1066,6 +1099,15 @@ impl TransferPeer for DecodePeer {
                 let bootstrap_token = landed.bootstrap_token.ok_or_else(|| {
                     PdError::Peer(format!("{rid}'s KV landed without its first token"))
                 })?;
+                drop(state);
+                tracing::info!(
+                    rid,
+                    bootstrap_room = receiver.room,
+                    rank = self.shared.engine_rank,
+                    cached_tokens,
+                    output_tokens = 1,
+                    "event=ts_decode_kv_transfer_success"
+                );
                 events.push(PdEvent::RemotePrefillDone(RemotePrefill {
                     rid: rid.clone(),
                     bootstrap_token,

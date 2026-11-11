@@ -200,6 +200,47 @@ def test_the_launcher_hands_a_host_its_rank_and_hears_it_ready(
     assert proc.exitcode == -signal.SIGTERM
 
 
+@pytest.mark.parametrize(
+    "level, override, expected",
+    [
+        ("DEBUG", {}, ("debug", "debug")),
+        ("WARNING", {}, ("warn", "warning")),
+        ("CRITICAL", {}, ("error", "critical")),
+        ("FATAL", {}, ("error", "critical")),
+        (
+            "error",
+            {"TS_HOST_LOG": "ts_pd=debug", "SPDLOG_LEVEL": "off"},
+            ("ts_pd=debug", "off"),
+        ),
+    ],
+)
+def test_spawned_host_inherits_engine_log_level(
+    tmp_path, monkeypatch, level, override, expected
+):
+    for key in ("TS_HOST_LOG", "SPDLOG_LEVEL"):
+        monkeypatch.delenv(key, raising=False)
+    for key, value in override.items():
+        monkeypatch.setenv(key, value)
+    binary = _fake_host(
+        tmp_path,
+        """
+        import os
+        connection.recv()
+        connection.send({"status": "ready", "levels": (os.environ["TS_HOST_LOG"], os.environ["SPDLOG_LEVEL"])})
+        time.sleep(600)
+    """,
+    )
+    args, ports = _rank_args(0)
+    args.log_level = level
+    proc, reader = start_rust_host(binary, args, ports, nullcontext(), None, False)
+    try:
+        (ready,) = receive_ready_messages([reader], [proc])
+        assert ready["levels"] == expected
+    finally:
+        proc.terminate()
+        proc.join(timeout=10)
+
+
 def test_a_host_that_dies_before_ready_fails_the_launch(tmp_path):
     binary = _fake_host(tmp_path, "connection.recv()\nsys.exit(3)\n")
     proc, reader = start_rust_host(binary, *_rank_args(0), nullcontext(), None, False)

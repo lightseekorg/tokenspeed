@@ -301,8 +301,10 @@ column count preserve logical indexing without writing long zero prefixes.
 No borrowed table escapes into an execution plan. The runtime uploads these
 windows and reconstructs absolute rows, including zero holes and `-1`
 padding, with the existing row-expansion kernel; a host mirror is built only
-when requested. The legacy absolute-table accessors materialize a stable,
-thread-safe cached buffer on demand. Copies share the immutable snapshot,
+when requested. CUDA and NPU use the same Triton row-expansion kernel through
+their respective vendor backends; other devices use the tensor fallback.
+The legacy absolute-table accessors materialize a stable, thread-safe cached
+buffer on demand. Copies share the immutable snapshot,
 and NumPy views keep their owning batch alive. Pinned staging remains
 runtime-owned; the scheduler neither allocates nor borrows a Torch buffer.
 
@@ -1082,7 +1084,11 @@ Its responsibilities:
   phase leaves the partial block a hole: the peer's transfer starts at the
   block containing `hit_tokens` and fills a fresh page whole, so the D role
   never copies it; a tail's full blocks below that page are copied like on
-  every role ([Scheduler §3.2](scheduler.md#32-d--decode-worker)).
+  every role ([Scheduler §3.2](scheduler.md#32-d--decode-worker)). Like any
+  copy destination, a block the transfer fills whole is not zeroed
+  (`GroupDemand::landed_tokens`, `StateStep::kLand`): the landing zeroes
+  only the block holding an unaligned prompt end and the reserve pages
+  beyond it.
 
   `Admit` takes two inputs of different scope and tense. One `GroupDemand`
   per group says what that group needs for the round ahead: an extent and a

@@ -1585,6 +1585,7 @@ class ModelExecutor:
                 ctx,
                 input_ids,
                 self._active_multimodal_context,
+                request_token_history=model_kwargs.get("request_token_history"),
             )
         if (
             mode is not None

@@ -806,7 +806,11 @@ def test_eagle_tree_drafting_ranks_full_vocab_logits():
 def test_block_drafter_wire_target_only_binds_resources(drafter_class):
     drafter = drafter_class.__new__(drafter_class)
     drafter.model = SimpleNamespace()
-    embedding, head, processor = object(), object(), object()
+    embedding, head = object(), object()
+    # wire_target asks the processor whether the target's head is vocab-sharded
+    # over attention-DP ranks (DFlash replicates it for drafting only then);
+    # _head_layout's default is the ordinary head, which is left alone.
+    processor = _head_layout()
     target = SimpleNamespace(
         get_input_embeddings=lambda: embedding,
         lm_head=head,
@@ -831,7 +835,9 @@ def test_block_drafter_binds_local_embedding_on_last_pipeline_stage():
     embedding = object()
     drafter.model = SimpleNamespace(embed_tokens=embedding)
     target = SimpleNamespace(
-        get_input_embeddings=lambda: None, lm_head=object(), logits_processor=object()
+        get_input_embeddings=lambda: None,
+        lm_head=object(),
+        logits_processor=_head_layout(),
     )
     drafter.wire_target(target)
     assert drafter.embed_tokens is embedding
@@ -903,10 +909,20 @@ def test_device_weight_update_notifies_drafter_before_returning():
 # --------------------------------------------------------------------------
 
 
+def _draft_locations(num_tokens: int) -> SimpleNamespace:
+    """The draft router's decode window: the draft writes its KV through its
+    OWN router, because the pages belong to its cache group."""
+    return SimpleNamespace(
+        group_ids=("full_attention",),
+        decode_window_locations=lambda: torch.arange(100, 100 + 2 * num_tokens),
+    )
+
+
 def _target_ctx(num_extends: int, num_tokens: int) -> ForwardContext:
     return ForwardContext(
         attn_backend=SimpleNamespace(
-            decode_window_locations=lambda: torch.arange(100, 100 + 2 * num_tokens)
+            group_ids=("full_attention",),
+            decode_window_locations=lambda: torch.arange(100, 100 + 2 * num_tokens),
         ),
         token_to_kv_pool=None,
         bs=2,
@@ -939,6 +955,7 @@ def _sink_dflash(
     drafter._context_written = True  # stale from a previous round
     drafter._sink_tokens = 0
     drafter.input_buffers = SimpleNamespace(positions_buf=torch.arange(16))
+    drafter.attn_backend = _draft_locations(4)
     return drafter
 
 
@@ -1009,7 +1026,9 @@ def test_dflash_sink_concatenates_the_taps_and_writes_the_context_once():
         writes.append((rows.clone(), positions, locs, decode_only))
     )
     ctx = _target_ctx(num_extends=0, num_tokens=num_tokens)
-    # FP32 rows a BF16 copy has to round.
+    # Shared cache group: the taps are the target's rows, so the TARGET's
+    # router owns the window they are written through -- _target_ctx supplies
+    # that backend. FP32 rows a BF16 copy has to round.
     tap_rows = [
         torch.randn(num_tokens, hidden, dtype=torch.float32) for _ in range(taps)
     ]
@@ -1068,13 +1087,18 @@ def test_context_cache_ownership_preserves_prefix_lengths(
         ),
         extend_span_locations=lambda: locations,
     )
+    # The write locations come from the DRAFT's own router: the pages belong
+    # to the draft's cache group, which is a group of its own when its
+    # attention family declares pages of another shape than the target's.
+    # Shared cache group: the taps are addressed by the TARGET's vector.
+    shared = SimpleNamespace(group_ids=("full_attention",), **vars(backend))
+    drafter.attn_backend = object() if producer_owned else shared
     ctx = SimpleNamespace(
         dspark_context_producer=object() if producer_owned else None,
         bs=1,
         num_extends=num_extends,
         input_num_tokens=4,
-        # A producer-owned update must not inspect write locations again.
-        attn_backend=object() if producer_owned else backend,
+        attn_backend=object() if producer_owned else shared,
     )
     hidden = torch.zeros(4, 8)
     logits = object() if producer_owned else SimpleNamespace(hidden_states=hidden)
@@ -1099,7 +1123,13 @@ def test_drafter_owned_context_requires_matching_target_hidden(hidden, error):
     drafter = DFlash.__new__(DFlash)
     drafter._update_draft_prefix_lengths = mock.Mock()
     drafter._write_native_cache = mock.Mock()
-    ctx = SimpleNamespace(dspark_context_producer=None, input_num_tokens=4)
+    # The width mismatch names the expected shape, which separates "taps
+    # collected but rows narrowed" from "no taps at all".
+    drafter.model = SimpleNamespace(num_context_features=4)
+    drafter.hidden_size = 8
+    ctx = SimpleNamespace(
+        dspark_context_producer=None, input_num_tokens=4, bs=1, num_extends=0
+    )
     with pytest.raises(RuntimeError, match=error):
         drafter._update_native_cache_from_target(
             ctx, SimpleNamespace(hidden_states=hidden), torch.tensor([1])
@@ -1126,7 +1156,7 @@ def test_k3_setup_capture_survives_resource_binding(monkeypatch, has_pp):
     target = SimpleNamespace(
         get_input_embeddings=lambda: "embedding",
         lm_head="head",
-        logits_processor="processor",
+        logits_processor=_head_layout(),
         set_target_context_capture=mock.Mock(),
         set_dflash_layers_to_capture=mock.Mock(),
         set_dflash_aux_hidden_stream=mock.Mock(),

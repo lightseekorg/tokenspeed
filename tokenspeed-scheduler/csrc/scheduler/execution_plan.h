@@ -69,9 +69,11 @@ public:
 
     const std::vector<Operation>& Operations() const { return operations_; }
 
-    // Cache child pages newly assigned in this plan. Group identity is
-    // required because one LCM parent can still contain live sibling children.
-    // The runtime clears these exact byte ranges before transfers/forward.
+    // Cache child pages newly assigned in this plan that nothing fills whole
+    // (a copy destination or a remote landing's block is left out). Group
+    // identity is required because one LCM parent can still contain live
+    // sibling children. The runtime clears these exact byte ranges before
+    // transfers/forward.
     std::map<std::string, std::vector<std::int32_t>> pages_to_zero;
     // Device -> Device whole-block copies, per cache group id, as (source,
     // destination) scheduler virtual block ids: a hitter's private copy of
