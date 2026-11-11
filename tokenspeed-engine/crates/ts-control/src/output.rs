@@ -841,23 +841,18 @@ impl OutputProcessor {
         committed
     }
 
-    /// A request's PD transfer failed. The client gets an abort unless it
-    /// already ended and tore down its stream. The scheduler keeps the
-    /// request's pages until the transfer and local forwards retire.
+    /// A request's PD transfer failed. A computed prefill still needs its
+    /// final output; only a client abort or an already-sent final stays silent.
+    /// The scheduler keeps its pages until the transfer and local forwards retire.
     pub fn fail_transfer(&mut self, rid: &str) -> Committed {
         let mut committed = Committed::default();
         let Some(mut state) = self.states.remove(rid) else {
             return committed;
         };
-        if !state.finished() {
-            state.abort("PD/EPD remote transfer failed or timed out", false, None);
-            state.finished_output = false;
-            committed.outputs =
-                Self::stream_state(rid, &mut state, self.stream_interval, self.spec_num_tokens)
-                    .into_iter()
-                    .collect();
-        } else if state.abort_notify_client {
-            state.finished_output = false;
+        if !state.to_abort && !state.finished_output {
+            state.abort("PD/EPD remote transfer failed or timed out", true, None);
+        }
+        if state.abort_notify_client {
             committed.outputs =
                 Self::stream_state(rid, &mut state, self.stream_interval, self.spec_num_tokens)
                     .into_iter()
@@ -2223,6 +2218,62 @@ mod tests {
             c.outputs[0].input_logprobs.as_ref().unwrap().values,
             [None, Some(0.0), Some(-1.0)]
         );
+    }
+
+    #[test]
+    fn a_failed_transfer_ends_a_prefill_that_finished_computing() {
+        let mut p = OutputProcessor::new(None, 1, None, Role::Prefill, NO_FINISH_LOG, true, None);
+        register(&mut p, "r", 3, 1, &[]);
+        let committed = p
+            .commit(&batch(&[("r", 3, 0, 3)], 1), None, &result(&[9], &[1]))
+            .unwrap();
+        assert!(committed.outputs.is_empty());
+        let state = p.state("r").unwrap();
+        assert!(state.finished());
+        assert!(!state.finished_output);
+        assert!(!state.to_abort);
+
+        // The transfer can fail before the next round applies pause(abort).
+        let failed = p.fail_transfer("r");
+        assert_eq!(failed.outputs.len(), 1);
+        assert_eq!(failed.outputs[0].finish_reason, Some("abort"));
+        assert_eq!(failed.outputs[0].output_ids, [9]);
+        assert_eq!(failed.released, ["r"]);
+        assert!(p.state("r").is_none());
+        assert!(p.fail_transfer("r").outputs.is_empty());
+        assert!(p.finish_prefill("r").outputs.is_empty());
+    }
+
+    #[test]
+    fn a_failed_transfer_aborts_an_unfinished_request() {
+        let mut p = processor(None);
+        register(&mut p, "r", 3, 4, &[]);
+        let failed = p.fail_transfer("r");
+        assert_eq!(failed.outputs.len(), 1);
+        assert_eq!(failed.outputs[0].finish_reason, Some("abort"));
+        assert_eq!(failed.released, ["r"]);
+    }
+
+    #[test]
+    fn a_failed_transfer_preserves_client_and_pause_abort_notifications() {
+        for max_new in [1, 4] {
+            for notify in [false, true] {
+                let mut p =
+                    OutputProcessor::new(None, 1, None, Role::Prefill, NO_FINISH_LOG, true, None);
+                register(&mut p, "r", 3, max_new, &[]);
+                p.commit(&batch(&[("r", 3, 0, 3)], 1), None, &result(&[9], &[1]))
+                    .unwrap();
+                p.mark_abort("r", notify);
+
+                let failed = p.fail_transfer("r");
+                assert_eq!(failed.outputs.len(), usize::from(notify));
+                if notify {
+                    assert_eq!(failed.outputs[0].finish_reason, Some("abort"));
+                }
+                assert_eq!(failed.released, ["r"]);
+                assert!(p.state("r").is_none());
+            }
+        }
     }
 
     #[test]
