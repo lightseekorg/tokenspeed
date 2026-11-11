@@ -162,7 +162,8 @@ struct StateStep {
         kKeep,
         // The D role's remote landing, on an empty table: slot 0 the claimed
         // prompt-end checkpoint or null (nothing here reads a zero state),
-        // slot 1 a fresh block the peer's transfer fills.
+        // slot 1 a fresh block the peer's transfer fills whole, so it is not
+        // listed for zeroing (a claimed checkpoint is copied into it instead).
         kLand,
     };
     Kind kind{Kind::kKeep};
@@ -185,6 +186,13 @@ struct GroupDemand {
     BlockTable* table{nullptr};
     GroupExtent extent{DenseGrowth{}};
     std::int32_t reserve_tokens{0};
+    // The D role's remote landing: the peer's transfer fills this group's
+    // blocks whole up to this absolute token count (the prompt end), so a
+    // fresh block of a DenseGrowth that ends at or below it is left out of
+    // AdmissionResult::new_page_ids like a copy destination. The block
+    // holding the prompt end when it is not block-aligned, and the reserve
+    // blocks beyond, are zeroed as usual. 0 everywhere else.
+    std::int32_t landed_tokens{0};
 };
 
 // A publication point that is not page-aligned: the partial page holding rows

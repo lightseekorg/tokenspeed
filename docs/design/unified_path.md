@@ -712,6 +712,26 @@ configuration, so every DP rank derives the same answer
 only. `decode_graph=False` still requires `refresh_decode_metadata` and
 `init_cuda_graph_state` — eager decode runs the same unified path.
 
+Models whose embedding reads request-token history may implement
+`HistoryEmbeddingModel` on the inner model. Its
+`compute_input_embeddings(input_ids, ctx, *, request_token_history)` method is
+shared by ordinary forward and graph replay. At construction the graph owner
+resolves one embedding callable: this method, or a plain token lookup for models
+that do not require history. Argument preparation must preserve supplied
+`input_embeds` so the inner model skips embedding computation when they are present.
+The executor supplies its live `RequestTokenHistoryView`; the graph
+owner calls this method eagerly, before padding, and copies its result into
+the same static embedding buffer used by ordinary text and multimodal
+prefills. The method must return all input rows, and every history-dependent
+operation must finish there. The captured inner stack consumes the supplied
+`input_embeds` without requiring or appending history, including during
+`prepare_model_kwargs`. Decode keeps its existing embedding path. Capture uses
+zero dummy embeddings and does not access live history. Models requiring history
+without this protocol remain eager. Multimodal forwards of history-embedding
+models also remain eager because the multimodal embedding seam does not receive
+history.
+Request history retains its existing runtime owner and lifetime.
+
 Prefill graph warmup runs on the same side stream as capture. Some kernels
 cache occupancy by stream and reject a cold CUDA graph capture; warming on the
 default stream does not prepare their capture-stream state. The capture stream
@@ -829,11 +849,13 @@ static buffers (the target's hidden rows with a zero tail, the gather rows,
 the frontier), and its outputs land in static buffers the decode steps read.
 The draft prologue writes K/V inside a captured segment, which holds no
 per-layer Host-load wait, so a step-0 replay first waits for the draft pool's
-whole Host load, as the target's replay does. These captures run each segment
-as soon as it is captured (`run_segments_while_capturing`): their breaks index
-with values a segment computes (the top-k rows the narrowing gathers, the
-decode steps' positions), which a capture alone leaves unwritten when the
-break runs.
+whole Host load, as the target's replay does on a pool that does not declare
+`layer_accesses_wait_for_load`, and skips the per-layer waits its capture
+noted; the decode-step replays, behind step 0, skip theirs too. These captures
+run each segment as soon as it is captured (`run_segments_while_capturing`):
+their breaks index with values a segment computes (the top-k rows the
+narrowing gathers, the decode steps' positions), which a capture alone leaves
+unwritten when the break runs.
 
 A round replays only what the graphs baked: a pure extend (MIXED rounds run
 eager), no attention DP or query shard, a fitting bucket at the exact request

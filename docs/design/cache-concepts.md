@@ -301,8 +301,10 @@ column count preserve logical indexing without writing long zero prefixes.
 No borrowed table escapes into an execution plan. The runtime uploads these
 windows and reconstructs absolute rows, including zero holes and `-1`
 padding, with the existing row-expansion kernel; a host mirror is built only
-when requested. The legacy absolute-table accessors materialize a stable,
-thread-safe cached buffer on demand. Copies share the immutable snapshot,
+when requested. CUDA and NPU use the same Triton row-expansion kernel through
+their respective vendor backends; other devices use the tensor fallback.
+The legacy absolute-table accessors materialize a stable, thread-safe cached
+buffer on demand. Copies share the immutable snapshot,
 and NumPy views keep their owning batch alive. Pinned staging remains
 runtime-owned; the scheduler neither allocates nor borrows a Torch buffer.
 
@@ -528,12 +530,7 @@ the pool's layerwise load tracker before their first read or write. A wait in a
 later attention-buffer accessor is too late: the side-cache kernels would
 already be racing the asynchronous H2D restore. Place the fence immediately
 before the first cache-field access so independent projections can still
-overlap the load. The fences are eager calls, so a captured prefill graph
-segment holds none: the latent rows an attention prologue writes there (into a
-page a tail hit loads) and the State checkpoint an inline KDA layer reads there
-would race the load. `PrefillGraph.replay` therefore waits for the plan's whole
-Host load before the first segment; a replayed forward overlaps only its
-embedding with that load.
+overlap the load.
 
 A write needs the fence as much as a read: a Host tail hit
 loads its partially filled last block whole, and the forward appends its new
@@ -542,6 +539,27 @@ overwritten by it. A pool's setters must therefore wait as its getters do. A
 draft view has its own tracker, and its layers land after all of the target's
 on either copy path, so no per-layer wait of the target forward covers a draft
 layer: the context rows a draft writes before its forward must wait themselves.
+
+A captured prefill graph segment cannot hold a fence: the latent rows an
+attention prologue writes there (into a page a tail hit loads) and the State
+checkpoint an inline KDA layer reads there would race the load. The fence call
+made during the capture instead notes its layer on the capture, and every
+replay waits, before each segment, for the highest layer that segment noted
+(the layers of a load land in order). The Host cache executor, which registers
+the load trackers the fences call, is therefore built before the graphs are
+captured. An access that no fence covers notes nothing: in a segment it would
+race the load, and in an eager break it would no longer run after the whole
+load. So a replay relies on the noted waits only on a pool whose class declares
+`layer_accesses_wait_for_load` (a subclass does not inherit it), set after
+auditing its accessors and the code that reaches them in a replay (the Kimi-K3
+pool). A replay on any other pool, or of a graph captured against another
+tracker than the pool's current one, or none, waits for the pool's whole Host
+load (its tracker's last layer) before the first segment instead, and skips the
+noted waits. A replay that relies on the noted waits has, like an eager forward,
+waited only for the layers it touched, not for a draft view's, which the
+whole-load wait covers on the Triton copy path (one kernel copies both): what
+touches a draft layer after the forward waits on the draft's tracker, as the
+context writes do.
 
 A batched post-verification commit is the one side-cache writer that issues no
 fence of its own. It moves every bound layer's fields in a single launch, so it
@@ -594,8 +612,12 @@ forwards and RDMA triggers behind it inherit the fence (the forward by
 waiting on the default stream in its prologue; that wait is one-way, the
 zeroing's and the writeback's own waits are what order the default and write
 streams behind the forwards). A load-back's prerequisite stream is the
-default stream that zeroed its destinations; its start event is recorded
-there rather than on whatever stream is current. Every stream the Host
+default stream, where its start event is recorded rather than on whatever
+stream is current. Load-back destinations are never zeroed, and an abort
+frees its request's blocks while that request's forward may still be in
+flight, so the device handle orders the default stream behind the
+execution stream before every plan's loads and restores: the zeroing and
+the block copies, which wait there too, are absent from many plans. Every stream the Host
 cache executor orders against is an argument, never ambient thread state.
 Each submission kind uses its own staging lane (`cache/transfer/lanes.py`:
 the stream-ordered and pinned write-backs, the snapshot store, and the
@@ -1062,7 +1084,11 @@ Its responsibilities:
   phase leaves the partial block a hole: the peer's transfer starts at the
   block containing `hit_tokens` and fills a fresh page whole, so the D role
   never copies it; a tail's full blocks below that page are copied like on
-  every role ([Scheduler §3.2](scheduler.md#32-d--decode-worker)).
+  every role ([Scheduler §3.2](scheduler.md#32-d--decode-worker)). Like any
+  copy destination, a block the transfer fills whole is not zeroed
+  (`GroupDemand::landed_tokens`, `StateStep::kLand`): the landing zeroes
+  only the block holding an unaligned prompt end and the reserve pages
+  beyond it.
 
   `Admit` takes two inputs of different scope and tense. One `GroupDemand`
   per group says what that group needs for the round ahead: an extent and a
