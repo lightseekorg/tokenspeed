@@ -35,7 +35,9 @@ Pins the seams the runtime relies on:
 * CUDA-graph replay of ``sample()``/``verify()`` matches eager;
 * the in-graph noise draw is a function of (seed, position) only;
 * fp32 logits (soft-capped heads) are sampled exactly: greedy is the first
-  fp32 argmax and draws follow the fp32 softmax.
+  fp32 argmax and draws follow the fp32 softmax;
+* synthetic acceptance forces the verify's lengths and draws the cutoff token
+  as the verify draws past an all-accepted window.
 
 Logits are bf16 unless a test says fp32.
 The kernels and indicator bits are sonic-sampler's, vendored in
@@ -48,6 +50,7 @@ narrow bitonic tiles.
 
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import math
 import os
@@ -716,9 +719,10 @@ def _chi2_deviate(counts: torch.Tensor, probs: torch.Tensor, n: int) -> float:
 
 @pytest.mark.parametrize("scale", [2.0, 6.0], ids=["moderate", "peaked"])
 def test_stochastic_sample_matches_softmax(scale):
-    """Empirical draw vs fp32 softmax over the top-128 bf16 logits (sonic's
-    bounded support). The peaked row is where a bf16 Gumbel-max score
-    inflates the mode by several sd at this sample size."""
+    """Empirical draw vs fp32 softmax over the whole row of bf16 logits: a row
+    without top-k, top-p or min-p draws from its whole vocabulary, the tokens
+    past its top 128 included. The peaked row is where a bf16 Gumbel-max
+    score inflates the mode by several sd at this sample size."""
     torch.manual_seed(3)
     iters = 8000
     backend = _make_backend(max_n=1)
@@ -740,14 +744,87 @@ def test_stochastic_sample_matches_softmax(scale):
         counts.scatter_add_(
             0, sampled.long(), torch.ones_like(sampled, dtype=torch.long)
         )
-    vals, idx = row.float().topk(128)
-    probs = torch.zeros(VOCAB)
-    probs[idx] = torch.softmax(vals, -1)
-    counts = counts.cpu()
-    assert counts.sum().item() == iters * MAX_BS
-    assert counts[probs == 0].sum().item() == 0, "a draw left the top-128 support"
-    dev = _chi2_deviate(counts, probs, iters * MAX_BS)
+    probs = torch.softmax(row.float(), -1)
+    counts, total = counts.cpu(), iters * MAX_BS
+    assert counts.sum().item() == total
+    dev = _chi2_deviate(counts, probs, total)
     assert abs(dev) < 5.0, dev
+    # The tokens past the top 128 are drawn at their probability.
+    past = torch.ones(VOCAB, dtype=torch.bool)
+    past[row.float().topk(128).indices] = False
+    tail = probs[past].sum().item()
+    spread = 5 * math.sqrt(tail * (1 - tail) * total) + 1
+    assert abs(counts[past].sum().item() - tail * total) < spread
+
+
+def _nucleus_law(row: torch.Tensor, top_k: int, top_p: float) -> torch.Tensor:
+    """A logit row's law after top-k, then top-p: the nucleus keeps a token while the mass ranked above it is below top_p."""
+    values, columns = row.float().sort(descending=True)
+    if top_k > 0:
+        values, columns = values[:top_k], columns[:top_k]
+    probs = torch.softmax(values, -1)
+    keep = probs.cumsum(-1) - probs < top_p
+    law = torch.zeros(row.numel())
+    law[columns[keep]] = probs[keep] / probs[keep].sum()
+    return law
+
+
+@pytest.mark.parametrize("verify", [False, True], ids=["sample", "verify"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("top_k, top_p", [(-1, 0.75), (-1, 0.85), (2, 0.7)])
+def test_top_p_keeps_the_token_crossing_it(top_k, top_p, dtype, verify):
+    """Draws, and the first token a verify emits, follow the nucleus that keeps the token crossing top_p, whose point draft is accepted at its nucleus probability."""
+    torch.manual_seed(5)
+    iters = 4000
+    n = 2 if verify else 1
+    backend = _make_backend(max_n=n)
+    # Probabilities 0.5, 0.3, 0.1 and 60 tokens sharing 0.1, so the nucleus ends at the 0.3 or the 0.1 token.
+    probs = torch.tensor([0.5, 0.3, 0.1] + [0.1 / 60] * 60)
+    row = torch.full((VOCAB,), -40.0)
+    columns = torch.randperm(VOCAB)[: probs.numel()]
+    row[columns] = probs.log()
+    row = row.to(dtype)
+    law = _nucleus_law(row, top_k, top_p)
+    draft = int(columns[1])
+    req = _prepare(
+        backend,
+        [_sp(f"np{i}", top_k=top_k, top_p=top_p) for i in range(MAX_BS)],
+        n=n,
+    )
+    logits = row.cuda().expand(MAX_BS * n, VOCAB).contiguous()
+    candidates = torch.zeros(MAX_BS, n, dtype=torch.int32, device="cuda")
+    candidates[:, n - 1] = draft
+    offsets = torch.zeros(POOL + 1, dtype=torch.int32, device="cuda")
+    info = SamplingBatchInfo(
+        req_pool_indices=req,
+        valid_cache_lengths=offsets,
+        vocab_size=VOCAB,
+        device="cuda",
+    )
+    counts = torch.zeros(VOCAB, dtype=torch.long, device="cuda")
+    accepted = 0
+    for step in range(iters):
+        offsets.fill_(step * n)
+        if verify:
+            predict, accept = backend.verify(
+                _logits_output(logits), info, candidates, tree=None
+            )
+            first = predict.view(MAX_BS, n)[:, 0]
+            accepted += int((accept == 2).sum().item())
+        else:
+            first, _ = backend.sample(_logits_output(logits), info)
+        counts.scatter_add_(0, first.long(), torch.ones_like(first, dtype=torch.long))
+    counts = counts.cpu()
+    total = iters * MAX_BS
+    assert counts[law == 0].sum().item() == 0, "a draw left the nucleus"
+    dev = _chi2_deviate(counts, law, total)
+    assert abs(dev) < 5.0, dev
+    if verify:
+        p_draft = law[draft].item()
+        assert (
+            abs(accepted / total - p_draft)
+            < 4 * math.sqrt(p_draft * (1 - p_draft) / total) + 0.01
+        )
 
 
 def test_rejects_logits_other_than_bf16_or_fp32():
@@ -790,22 +867,20 @@ def test_logprobs_match_log_softmax_and_leave_logits_untouched():
     )
 
 
-@pytest.mark.parametrize("draft_rank", [0, 3, 40])
+@pytest.mark.parametrize("draft_rank", [0, 3, 40, 150])
 def test_verify_first_token_marginal_matches_the_target(draft_rank):
     """Masked rejection with a point-draw draft d emits d with probability
     p(d) and otherwise draws from p without d, so the first emitted token's
-    marginal is the target law regardless of d, and the acceptance rate is
-    p(d)."""
+    marginal is the target law over the whole vocabulary regardless of d
+    (past the top 128 too), and the acceptance rate is p(d)."""
     torch.manual_seed(200)
     iters = 6000
     n = 2
     backend = _make_backend(max_n=n)
     row = (torch.randn(VOCAB) * 2.0).to(torch.bfloat16)
     row[300:] = -40.0
-    vals, idx = row.float().topk(128)
-    probs = torch.zeros(VOCAB)
-    probs[idx] = torch.softmax(vals, -1)
-    draft = int(idx[draft_rank].item())
+    probs = torch.softmax(row.float(), -1)
+    draft = int(row.float().topk(draft_rank + 1).indices[draft_rank].item())
     req = _prepare(backend, [_sp(f"sv{i}") for i in range(MAX_BS)], n=n)
     logits = row.cuda().expand(MAX_BS * n, VOCAB).contiguous()
     candidates = torch.zeros(MAX_BS, n, dtype=torch.int32, device="cuda")
@@ -829,7 +904,6 @@ def test_verify_first_token_marginal_matches_the_target(draft_rank):
         accepted += int((accept == 2).sum().item())
     counts = counts.cpu()
     total = iters * MAX_BS
-    assert counts[probs == 0].sum().item() == 0
     dev = _chi2_deviate(counts, probs, total)
     assert abs(dev) < 5.0, dev
     p_draft = probs[draft].item()
@@ -1047,6 +1121,7 @@ def test_serving_launches_compile_nothing_after_warm_up(dtype):
     shifted = torch.cat([req[:1], req])[1:]
     kernels = (
         prologue.bitpacked_reduction_kernel,
+        prologue.whole_reduction_kernel,
         singular.cumulative_selection_kernel,
         multistep.cumulative_unpack_kernel,
         verify.chain_speculative_verification_kernel,
@@ -1066,6 +1141,190 @@ def test_rejects_a_batch_past_the_int32_row_offsets():
     config.max_bs = 1 << 13
     with pytest.raises(ValueError, match="max_bs"):
         _backend_cls()(config)
+
+
+# --------------------------------------------------------------------- #
+# synthetic acceptance
+# --------------------------------------------------------------------- #
+def _make_synthetic_backend(length: float, vocab: int = VOCAB):
+    config = dataclasses.replace(
+        _make_config(vocab), synthetic_acceptance_length=length
+    )
+    return _backend_cls()(config)
+
+
+@pytest.mark.parametrize("length", range(1, MAX_N + 1))
+def test_synthetic_length_keeps_the_drafts_then_the_greedy_target(length):
+    """Greedy rows emit the first L - 1 drafts, then the argmax at position L - 1."""
+    torch.manual_seed(20 + length)
+    n = MAX_N
+    backend = _make_synthetic_backend(float(length))
+    req = _prepare(backend, [_greedy_sp(f"s{i}") for i in range(MAX_BS)], n=n)
+    logits = _tie_free_logits(MAX_BS * n)
+    argmax = logits.argmax(-1).int().view(MAX_BS, n)
+    candidates = torch.randint(0, VOCAB, (MAX_BS, n), dtype=torch.int32, device="cuda")
+
+    predict, accept = backend.verify(
+        _logits_output(logits.clone()), _info(req), candidates, tree=None
+    )
+    predict = predict.view(MAX_BS, n).cpu()
+    assert accept.tolist() == [length] * MAX_BS
+    torch.testing.assert_close(predict[:, : length - 1], candidates[:, 1:length].cpu())
+    torch.testing.assert_close(predict[:, length - 1], argmax[:, length - 1].cpu())
+
+
+def test_synthetic_full_length_draws_the_verify_bonus_token():
+    """Forcing every draft draws what the verify draws past an all-accepted window.
+
+    The leading rows put all their mass on the drafts, so the plain verify
+    accepts them all; the last row is flat, so its bonus token is a real draw
+    from the same candidates and per-request noise.
+    """
+    torch.manual_seed(31)
+    n = MAX_N
+    logits = torch.randn(MAX_BS, n, VOCAB, device="cuda")
+    drafts = torch.randint(0, VOCAB, (MAX_BS, n - 1), device="cuda")
+    logits[:, : n - 1].scatter_(2, drafts[..., None], 60.0)
+    logits = logits.view(MAX_BS * n, VOCAB).bfloat16()
+    candidates = torch.cat(
+        [torch.zeros(MAX_BS, 1, dtype=torch.long, device="cuda"), drafts], 1
+    ).int()
+
+    def make(rid):
+        return _sp(rid, temperature=1.0, top_k=50)
+
+    outputs = []
+    for backend in (_make_backend(), _make_synthetic_backend(float(n))):
+        req = _prepare(backend, [make(f"b{i}") for i in range(MAX_BS)], n=n)
+        predict, accept = backend.verify(
+            _logits_output(logits.clone()), _info(req), candidates, tree=None
+        )
+        assert accept.tolist() == [n] * MAX_BS
+        outputs.append(predict.view(MAX_BS, n).cpu().clone())
+    torch.testing.assert_close(outputs[1], outputs[0])
+
+
+@pytest.mark.parametrize("top_k", [16, -1], ids=["candidates", "whole"])
+@pytest.mark.parametrize("length", range(1, MAX_N))
+def test_synthetic_stochastic_cutoff_draws_from_its_own_position(length, top_k):
+    """A stochastic row's cutoff token is position L - 1's draw, from its candidates or its whole vocabulary.
+
+    Each verify position's strongest tokens sit in its own token range, so a draw
+    that read another position's candidates or noise would land outside it.
+    """
+    torch.manual_seed(40 + length)
+    n = MAX_N
+    span = VOCAB // n
+    logits = torch.randn(MAX_BS, n, VOCAB, device="cuda")
+    for position in range(n):
+        logits[:, position, position * span : (position + 1) * span] += 12.0
+    logits = logits.view(MAX_BS * n, VOCAB).bfloat16()
+    backend = _make_synthetic_backend(float(length))
+    req = _prepare(
+        backend,
+        [_sp(f"m{i}", temperature=1.0, top_k=top_k) for i in range(MAX_BS)],
+        n=n,
+    )
+    candidates = torch.randint(0, VOCAB, (MAX_BS, n), dtype=torch.int32, device="cuda")
+
+    predict, accept = backend.verify(
+        _logits_output(logits), _info(req), candidates, tree=None
+    )
+    predict = predict.view(MAX_BS, n).cpu()
+    assert accept.tolist() == [length] * MAX_BS
+    torch.testing.assert_close(predict[:, : length - 1], candidates[:, 1:length].cpu())
+    cutoff = predict[:, length - 1]
+    low, high = (length - 1) * span, length * span
+    assert ((cutoff >= low) & (cutoff < high)).all(), cutoff.tolist()
+
+
+def test_fractional_synthetic_lengths_take_the_floor_or_the_ceiling():
+    torch.manual_seed(33)
+    n = MAX_N
+    backend = _make_synthetic_backend(2.5)
+    sps = [_greedy_sp(f"f{i}") for i in range(MAX_BS)]
+    seen = set()
+    for _ in range(16):
+        req = _prepare(backend, sps, n=n)
+        candidates = torch.randint(
+            0, VOCAB, (MAX_BS, n), dtype=torch.int32, device="cuda"
+        )
+        _, accept = backend.verify(
+            _logits_output(_tie_free_logits(MAX_BS * n)),
+            _info(req),
+            candidates,
+            tree=None,
+        )
+        seen.update(accept.tolist())
+    assert seen == {2, 3}
+
+
+def test_synthetic_cuda_graph_replay_matches_eager():
+    torch.manual_seed(35)
+    n = MAX_N
+    backend = _make_synthetic_backend(3.0)
+    sps = [
+        _greedy_sp("yg0"),
+        _sp("ys1", top_k=16),
+        _greedy_sp("yg2"),
+        _sp("ys3", top_p=0.9),
+    ]
+    backend.prepare_capture(bs=MAX_BS, num_tokens_per_req=n)
+    logits_buf = torch.zeros(MAX_BS * n, VOCAB, device="cuda", dtype=torch.bfloat16)
+    cand_buf = torch.zeros(MAX_BS, n, dtype=torch.int32, device="cuda")
+    req_buf = torch.zeros(MAX_BS, dtype=torch.int64, device="cuda")
+    info = _info(req_buf)
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        for _ in range(2):
+            backend.verify(_logits_output(logits_buf), info, cand_buf, tree=None)
+    torch.cuda.current_stream().wait_stream(stream)
+    backend.reset_capture_state()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        g_predict, g_accept = backend.verify(
+            _logits_output(logits_buf), info, cand_buf, tree=None
+        )
+
+    req = _prepare(backend, sps, n=n)
+    logits = _tie_free_logits(MAX_BS * n)
+    candidates = torch.randint(0, VOCAB, (MAX_BS, n), dtype=torch.int32, device="cuda")
+    e_predict, e_accept = backend.verify(
+        _logits_output(logits.clone()), _info(req), candidates, tree=None
+    )
+    e_predict, e_accept = e_predict.clone(), e_accept.clone()
+    assert e_accept.tolist() == [3] * MAX_BS
+
+    logits_buf.copy_(logits)
+    cand_buf.copy_(candidates)
+    req_buf.copy_(req)
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(g_predict.cpu(), e_predict.cpu())
+    torch.testing.assert_close(g_accept.cpu(), e_accept.cpu())
+
+
+def test_synthetic_launches_compile_nothing_after_warm_up():
+    from tokenspeed_kernel.ops.sampling import sonic as sonic_ops
+
+    utils = _kernel_test_utils()
+    backend = _make_synthetic_backend(2.0, REAL_VOCAB)
+    sps = [_sp(f"y{i}", REAL_VOCAB, temperature=0.7) for i in range(MAX_BS)]
+    req = _prepare(backend, sps, n=MAX_N)
+    offsets = torch.zeros(POOL + 1, dtype=torch.int64, device="cuda")
+    logits = torch.randn(MAX_BS * MAX_N, REAL_VOCAB, device="cuda").bfloat16()
+    drafts = torch.randint(
+        0, REAL_VOCAB, (MAX_BS, MAX_N), dtype=torch.int32, device="cuda"
+    )
+    with utils.assert_no_triton_compile(sonic_ops._synthetic_target_kernel):
+        for bs in range(1, MAX_BS + 1):
+            verified = backend._fused_multistep(
+                logits[: bs * MAX_N], req[:bs], offsets, drafts[:bs]
+            )
+            backend._synthetic_outputs(
+                drafts[:bs], req[:bs], offsets, *verified, row_offset=0
+            )
+    torch.cuda.synchronize()
 
 
 if __name__ == "__main__":

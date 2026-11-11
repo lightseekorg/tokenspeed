@@ -794,6 +794,13 @@ synchronous transport call before retiring. Client cancellation keeps the
 request's source ownership until that retirement event. The retirement agreement
 is needed only in rounds with a terminal status.
 
+**PD output completion.** A prefill's computed finish is not its client's
+final output: the output waits for the transfer's result. A transfer failure
+must publish an abort even after computation finished, unless the client
+already cancelled its stream or a final output was sent. A pause abort still
+notifies the client; repeated transfer events do not repeat the final output.
+This output fence does not retire source pages.
+
 **PD cancellation.** Client aborts and `pause(abort)` cancel the tracked
 transfer as well as marking the request's output. A decode receiver sends a
 cancellation to every prefill target that could write its landing pages.
@@ -1006,12 +1013,15 @@ For orientation, one `EventLoop::round`:
    every pair reading those byte ranges; a destination is never zeroed;
    no op id, no ACK), then
    page zeroing (the new owner's sanitization), then the Device-bound copies
-   -- `LoadBackOp` and `RestoreOp`, ordered behind the zeroing: a load-back
-   lands on zeroed pages and the forward reads it layer by layer behind the
-   layerwise fences (a prefill graph replay waits for the whole load before
-   its first segment, which holds no fence), so the loads start first on the
-   load stream, and every plan, with cache ops or without, points the fences
-   at its own load or at none; a restore
+   -- `LoadBackOp` and `RestoreOp`, ordered behind the zeroing and the
+   forwards in flight, which may still write a block an abort freed and this
+   plan granted (load-back destinations are never zeroed): the forward reads
+   a load-back layer by layer behind the
+   layerwise fences (a prefill graph replay waits on them before each
+   captured segment, which holds none, or, on a pool that does not declare
+   every access fenced, for the whole load instead), so the loads start first
+   on the load stream, and every plan, with cache ops or without, points
+   the fences at its own load or at none; a restore
    queues behind them, overwrites its destination blocks whole (the
    scheduler lists none of them for zeroing), reads both Host tiers under one
    event and arms no layerwise fence, its request being unschedulable until

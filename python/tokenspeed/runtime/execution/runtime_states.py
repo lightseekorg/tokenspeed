@@ -150,13 +150,20 @@ class RuntimeStates:
         self.stopped = torch.zeros(req_pool_size + 1, dtype=torch.bool, device=device)
 
     def init_draft_probs(
-        self, *, spec_num_tokens: int, reject_threshold: float
+        self,
+        *,
+        spec_num_tokens: int,
+        reject_threshold: float,
+        columns: int | None = None,
     ) -> None:
         """Allocate the drafter's recorded proposal distributions.
 
         ``draft_probs[slot, s]`` (fp32 ``[pool + 1, spec_num_tokens, vocab]``)
         is the distribution the chain drafter sampled its step-``s`` token
         from, which the next round verifies as candidate column ``s + 1``.
+        With ``columns`` (this rank's vocabulary shard) each rank holds the
+        distribution over its own columns only, ``[pool + 1,
+        spec_num_tokens, columns]``.
         Rows start at the sentinel ``reject_threshold + 1``: a slot whose
         drafter has not recorded this round (fresh admission, PD landing)
         rejects every candidate and samples its first token from the full
@@ -173,7 +180,7 @@ class RuntimeStates:
         pool_size = self.valid_cache_lengths.shape[0]
         self.draft_probs_sentinel = float(reject_threshold) + 1.0
         self.draft_probs = torch.full(
-            (pool_size, spec_num_tokens, self.vocab_size),
+            (pool_size, spec_num_tokens, columns or self.vocab_size),
             self.draft_probs_sentinel,
             dtype=torch.float32,
             device=self.device,

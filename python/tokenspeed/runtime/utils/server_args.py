@@ -1745,14 +1745,15 @@ class ServerArgs:
                 )
             # With sampled drafts (vLLM's draft_sample_method=probabilistic) the
             # drafter stays on the path and only the verify outcome is forced,
-            # so it uses the flashinfer verifier.
-            if self.sampling_backend != "greedy" and not (
+            # so it uses the flashinfer verifier; sonic forces either kind.
+            if self.sampling_backend not in ("greedy", "sonic") and not (
                 self.enable_speculative_sampling
                 and self.sampling_backend == "flashinfer"
             ):
                 raise ValueError(
-                    "--synthetic-acceptance-length requires --sampling-backend greedy, "
-                    "or --sampling-backend flashinfer with --enable-speculative-sampling"
+                    "--synthetic-acceptance-length requires --sampling-backend greedy "
+                    "or sonic, or --sampling-backend flashinfer with "
+                    "--enable-speculative-sampling"
                 )
             if self.speculative_eagle_topk != 1:
                 raise ValueError(
@@ -1849,10 +1850,11 @@ class ServerArgs:
             )
 
         # Block verification, and synthetic rejection over sampled drafts, run
-        # the sampled-chain verify on the flashinfer backend.
+        # the sampled-chain verify on the flashinfer backend; greedy and sonic
+        # force the synthetic length over their own verify.
         sampled_chain_verify = self.speculative_rejection_sample_method == "block" or (
             self.speculative_rejection_sample_method == "synthetic"
-            and self.sampling_backend != "greedy"
+            and self.sampling_backend not in ("greedy", "sonic")
         )
         if sampled_chain_verify:
             if (
@@ -3867,9 +3869,10 @@ class ServerArgs:
             "'sonic': one fused Triton pipeline per step (vendored sonic-sampler; two kernels "
             "for sampling, three for chain verification) covering greedy, "
             "temperature/top_k/top_p/min_p, penalties, logit_bias and grammar for both "
-            "single-step sampling and chain verification; top_k=-1 is realized as bounded "
-            "top-128 truncation. bf16 logits are ranked at bf16 resolution; fp32 logits "
-            "(soft-capped heads) are sampled exactly in fp32 among the top-128 candidates. "
+            "single-step sampling and chain verification; a request with no top_k, top_p "
+            "or min_p samples its whole vocabulary, the others select among its top-128 "
+            "candidates. bf16 logits are ranked at bf16 resolution; fp32 logits "
+            "(soft-capped heads) are sampled exactly in fp32. "
             "Its kernel config per batch size comes from a table measured on "
             "Blackwell, so nothing is tuned at startup. Allocates slot-indexed "
             "[max_req_pool_size, vocab_size] token counts and logit bias: about 10 bytes "
@@ -4154,7 +4157,7 @@ class ServerArgs:
             "target token, in [1, speculative_num_draft_tokens]. Forces a "
             "floor/ceil acceptance distribution; generated text is not valid "
             "for correctness evaluation. Selects the synthetic rejection method. "
-            "Requires --sampling-backend greedy (or flashinfer with "
+            "Requires --sampling-backend greedy or sonic (or flashinfer with "
             "--enable-speculative-sampling for sampled drafts) without "
             "--dp-sampling or --enable-output-logprobs. Unset disables it.",
         )

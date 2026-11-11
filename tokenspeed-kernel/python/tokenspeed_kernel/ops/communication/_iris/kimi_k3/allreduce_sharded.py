@@ -73,7 +73,7 @@ def _row_partition_store_completion(
     WAIT_STORES: gl.constexpr,
 ):
     """Complete local stores, update ready flags, and wait for peer completion."""
-    WAIT_STORES(args=[], constraints="=r,~{memory}")
+    WAIT_STORES()
     gl.barrier()
     layout: gl.constexpr = gl.BlockedLayout([1], [64], [NUM_WARPS], [0])
     peers = gl.arange(0, 8, layout=layout)
@@ -1166,7 +1166,7 @@ def iris_k3_pull_gather_topk_rows(
             gl.amd.cdna4.buffer_store(
                 value, lens_publish_ptr, offsets, mask, cache=".wt"
             )
-    WAIT_STORES(args=[], constraints="=r,~{memory}")
+    WAIT_STORES()
     gl.barrier()
     _row_partition_entry_barrier(flags, peer_flags, pid, epoch, RANK, NUM_WARPS)
     publishes = _peer_buffers_like(publish_ptr, heaps, RANK)

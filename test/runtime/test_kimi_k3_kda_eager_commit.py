@@ -1732,12 +1732,13 @@ def test_mixed_decode_commit_matches_separate_forwards(draft_tokens):
             )
 
 
-def test_standard_decode_fuses_producers_and_commits_like_split(monkeypatch):
-    """One-token decode projects the gate and convolves inside verify, as split would."""
+@pytest.mark.parametrize("draft_tokens", [None, T])
+def test_verify_fuses_producers_and_commits_like_split(monkeypatch, draft_tokens):
+    """Verify projects the gate and convolves inside its kernel, as split would."""
     import tokenspeed.runtime.layers.attention.backends.state.kda as kda_backend
 
-    fused = _Harness(draft_tokens=None, eager_replay=True, seed=1201)
-    split = _Harness(draft_tokens=None, eager_replay=True, seed=1201)
+    fused = _Harness(draft_tokens=draft_tokens, eager_replay=True, seed=1201)
+    split = _Harness(draft_tokens=draft_tokens, eager_replay=True, seed=1201)
     if not fused.backend._verify_split_producers:
         pytest.skip("split verify producers unavailable")
     convolutions = []
@@ -1753,14 +1754,14 @@ def test_standard_decode_fuses_producers_and_commits_like_split(monkeypatch):
         group_id: [2 + group * len(rpis) + i for i in range(len(rpis))]
         for group, group_id in enumerate(_STATE_GROUPS)
     }
-    seq_lens = [9] * len(rpis)
-    accepted = torch.ones(len(rpis), dtype=torch.int32, device=DEV)
+    width = fused.width
+    seq_lens = [8 + width] * len(rpis)
+    accepted = [1, width]
     for round_index in range(3):
         outputs = {}
         for name, harness in (("fused", fused), ("split", split)):
             with monkeypatch.context() as patch:
                 if name == "split":
-                    # The arrangement multi-token windows still use.
                     patch.setattr(
                         kda_backend,
                         "kda_fused_paged_verify_fuses_producers",
@@ -1770,7 +1771,10 @@ def test_standard_decode_fuses_producers_and_commits_like_split(monkeypatch):
                 outputs[name] = harness.forward(
                     harness.inputs(len(rpis), 1300 + round_index), len(rpis)
                 )
-                harness.backend.commit_verified_state(accepted, accepted_path=None)
+                harness.backend.commit_verified_state(
+                    torch.tensor(accepted, dtype=torch.int32, device=DEV),
+                    accepted_path=None,
+                )
         for got, want in zip(outputs["fused"], outputs["split"]):
             # The gate projection may round one raw gate a BF16 step apart.
             torch.testing.assert_close(
@@ -1779,7 +1783,7 @@ def test_standard_decode_fuses_producers_and_commits_like_split(monkeypatch):
                 atol=1e-3 * want.float().abs().max().item(),
                 rtol=2.0**-7,
             )
-        seq_lens = [length + 1 for length in seq_lens]
+        seq_lens = [length + count for length, count in zip(seq_lens, accepted)]
     # Only the split harness ran the separate convolution producer.
-    assert convolutions == [1] * (3 * len(split.layer_ids))
+    assert convolutions == [width] * (3 * len(split.layer_ids))
     _assert_committed_pages_equal(fused, split, pages)
