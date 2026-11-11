@@ -774,6 +774,47 @@ TEST(PrefixCacheIndexEvictionOrderTest, SkipsKnownPinnedEpochsUntilTheirOwnersRe
     EXPECT_EQ(DrainEvictionOrder(index, pool), (std::vector<CacheBlockLocation>{held, other}));
 }
 
+TEST(PrefixCacheIndexEvictionOrderTest, AnEpochBatchRanksAMovedEntryAtItsNewLocationWithoutHoldingItsSession) {
+    BlockPool pool(4, {1});
+    PrefixCacheIndex index(kGroupId);
+    const auto session = std::make_shared<SessionCacheTag>();
+    CacheBlockRef block = pool.AcquireBlock(kGroupId);
+    const CacheBlockLocation from = block->Location();
+    index.Register(pool, block, KeyOf("moved"), /*access_epoch=*/5, /*logical_block_index=*/3,
+                   CacheBoundaryKind::kEndpoint, /*newly_cached=*/nullptr, session);
+    block.reset();
+    const CacheBlockLocation older = Cache(index, pool, "older", /*access_epoch=*/2);
+    // Acquired at a newer epoch and released, then moved while no traversal
+    // has set it aside: its order node is re-keyed in the live order.
+    index.AcquireMatched(pool, std::vector<CacheKey>{KeyOf("moved")}, 0, GroupPrefixProbe{.hits = {1}},
+                         /*access_epoch=*/7, session);
+    CacheBlockRef copy = pool.AcquireBlock(kGroupId);
+    const CacheBlockLocation to = copy->Location();
+    index.Relocate(pool, from, copy);
+    copy.reset();
+    ASSERT_FALSE(pool.IsOccupied(from));
+
+    const long session_owners = session.use_count();
+    PrefixCacheIndex::EvictionCursor cursor;
+    std::vector<PrefixCacheIndex::EvictionCandidate> batch;
+    ASSERT_TRUE(index.NextEvictionEpoch(pool, cursor, std::numeric_limits<std::uint64_t>::max(), batch));
+    ASSERT_EQ(batch.size(), 1u);
+    EXPECT_EQ(batch[0].location, older);
+    EXPECT_EQ(batch[0].metadata.last_access_epoch, 2u);
+    EXPECT_EQ(batch[0].metadata.logical_block_index, -1);
+    EXPECT_FALSE(batch[0].metadata.was_acquired);
+    ASSERT_TRUE(index.NextEvictionEpoch(pool, cursor, std::numeric_limits<std::uint64_t>::max(), batch));
+    ASSERT_EQ(batch.size(), 2u);
+    EXPECT_EQ(batch[1].location, to);
+    EXPECT_EQ(batch[1].metadata.last_access_epoch, 7u);
+    EXPECT_EQ(batch[1].metadata.logical_block_index, 3);
+    EXPECT_EQ(batch[1].metadata.boundary_kind, CacheBoundaryKind::kEndpoint);
+    EXPECT_TRUE(batch[1].metadata.was_acquired);
+    EXPECT_EQ(session.use_count(), session_owners) << "a retained batch keeps no session alive";
+    EXPECT_EQ(index.MetadataFor(pool, to)->session, session);
+    EXPECT_EQ(index.Evict(pool, to), KeyOf("moved"));
+}
+
 TEST(PrefixCacheIndexCommonOrderTest, TracksBothTiersAndUsesOnlySourceRecency) {
     BlockPool source(4, {1});
     BlockPool peer(4, {1});

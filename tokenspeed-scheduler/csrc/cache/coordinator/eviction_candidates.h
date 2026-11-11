@@ -77,6 +77,19 @@ public:
 
     Candidate MakeCandidate(std::uint32_t group_id, CacheBlockLocation location,
                             const std::optional<PrefixCacheIndex::CachedBlockMetadata>& metadata) const {
+        return MakeCandidate(group_id, location, metadata ? &*metadata : nullptr);
+    }
+
+    // `metadata` is an entry's CachedBlockMetadata or the EvictionMetadata a
+    // traversal copied, null when no entry is at `location`.
+    template <typename Metadata>
+        requires requires(const Metadata& metadata) {
+            metadata.last_access_epoch;
+            metadata.logical_block_index;
+            metadata.boundary_kind;
+            metadata.was_acquired;
+        }
+    Candidate MakeCandidate(std::uint32_t group_id, CacheBlockLocation location, const Metadata* metadata) const {
         Candidate candidate{.last_access_epoch = metadata ? metadata->last_access_epoch : 0,
                             .location = location,
                             .group_id = group_id};
@@ -107,9 +120,10 @@ public:
 
     // Run the feasibility walk without policy reordering. Retain a bounded
     // prefix of raw epochs for the later policy walk, which still filters,
-    // ranks and sorts them normally. Snapshots own metadata, never blocks,
-    // and die with this planner. Impossible admissions cannot retain the
-    // entire cache: the cap counts vector capacity, not just live entries.
+    // ranks and sorts them normally. Snapshots own policy metadata, never
+    // blocks or sessions, and die with this planner. Impossible admissions
+    // cannot retain the entire cache: the cap counts vector capacity, not
+    // just live entries.
     template <typename EnoughCapacity>
     bool PreScanUntil(EnoughCapacity&& enough_capacity) {
         constexpr std::size_t max_retained_entries = 8192;
@@ -299,7 +313,7 @@ private:
             if (excluded(entry.location) || aged(group.group_id, entry)) {
                 continue;
             }
-            group.candidates.push_back(MakeCandidate(group.group_id, entry.location, entry.metadata));
+            group.candidates.push_back(MakeCandidate(group.group_id, entry.location, &entry.metadata));
         }
         Sort(group.candidates);
     }
@@ -321,7 +335,7 @@ private:
                     entry->metadata.last_access_epoch < aging_.cutoff_epoch) {
                     continue;
                 }
-                Candidate candidate = MakeCandidate(group_id, entry->location, entry->metadata);
+                Candidate candidate = MakeCandidate(group_id, entry->location, &entry->metadata);
                 candidate.rank_epoch = aging_.cutoff_epoch;
                 candidate.aged_distance = distance;
                 aged_.emplace_back(candidate, &hash);

@@ -60,6 +60,9 @@ private:
     using ConstCacheEntryIterator = CacheEntryList::const_iterator;
 
     // Index key: oldest access epoch first, with location as a stable tie-break.
+    // The key's location is the entry's block location: every change of
+    // block_ref or last_access_epoch re-keys through reorderEntry, and
+    // NextEvictionEpoch reports the key's location as the candidate's.
     struct EvictionOrder {
         std::uint64_t last_access_epoch{0};
         std::int32_t lcm_block_id{0};
@@ -221,10 +224,21 @@ public:
         EvictionOrderMap::const_reverse_iterator next_{};
     };
 
+    // The part of CachedBlockMetadata an eviction policy ranks an entry by.
+    // Epoch traversals copy it for every entry they scan; the session owner
+    // would cost each one another cache line and a reference count. A field
+    // the policy starts ranking by belongs in both structs.
+    struct EvictionMetadata {
+        std::uint64_t last_access_epoch{0};
+        std::int32_t logical_block_index{-1};
+        CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
+        bool was_acquired{false};
+    };
+
     // One unpinned entry, paired with the metadata an eviction policy reads.
     struct EvictionCandidate {
         CacheBlockLocation location;
-        CachedBlockMetadata metadata;
+        EvictionMetadata metadata;
     };
 
     // A read-only policy snapshot; inspecting it neither pins nor touches the
@@ -492,9 +506,12 @@ public:
                 const auto current = cursor.next_++;
                 CacheEntry& cache_entry = *current->second;
                 if (cache_entry.block_ref.unique()) {
+                    // The order key holds the entry's location (EvictionOrder),
+                    // so the block is read only for its owner count.
                     out.push_back(EvictionCandidate{
-                        .location = cache_entry.block_ref->Location(),
-                        .metadata = metadataOf(cache_entry),
+                        .location = {.lcm_block_id = current->first.lcm_block_id,
+                                     .slot_index = current->first.slot_index},
+                        .metadata = evictionMetadataOf(cache_entry),
                     });
                 } else {
                     // Keep the node for allocation-free restoration when the
@@ -589,7 +606,7 @@ public:
             if (cache_entry.block_ref.unique()) {
                 candidates.push_back(EvictionCandidate{
                     .location = cache_entry.block_ref->Location(),
-                    .metadata = metadataOf(cache_entry),
+                    .metadata = evictionMetadataOf(cache_entry),
                 });
             }
         }
@@ -897,6 +914,14 @@ private:
             .max_access_epoch = cache_entry.max_access_epoch,
             .session = cache_entry.session,
             .demoted = cache_entry.demoted,
+        };
+    }
+    static EvictionMetadata evictionMetadataOf(const CacheEntry& cache_entry) noexcept {
+        return EvictionMetadata{
+            .last_access_epoch = cache_entry.last_access_epoch,
+            .logical_block_index = cache_entry.logical_block_index,
+            .boundary_kind = cache_entry.boundary_kind,
+            .was_acquired = cache_entry.was_acquired,
         };
     }
     static EvictionOrder evictionOrder(const CacheEntry& cache_entry) {
