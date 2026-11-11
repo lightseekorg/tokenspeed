@@ -185,6 +185,9 @@ struct Submission {
     embeddings: Vec<EmbeddingItem>,
 }
 
+/// `control::gate_code` of a forward reload.
+const RELOAD_GATE_CODE: i64 = 7;
+
 /// How long a frozen round sleeps, so a `keep` pause does not spin a core.
 const PAUSED_IDLE_SLEEP: Duration = Duration::from_millis(1);
 
@@ -258,6 +261,9 @@ pub trait DataPlane {
 
     /// Free these memory regions, in order, once the scheduler drained.
     fn release_memory(&mut self, tags: &[String]) -> Result<(), DataPlaneError>;
+
+    /// Development: reload edited forward code and recapture the graphs on a drained, flushed engine; returns success and a report.
+    fn reload_forward(&mut self, op: &ControlRequest) -> Result<(bool, String), DataPlaneError>;
 
     /// Restore these memory regions, in order.
     fn resume_memory(&mut self, tags: &[String]) -> Result<(), DataPlaneError>;
@@ -472,6 +478,26 @@ pub struct LoopConfig {
     /// matchers' state, which only a commit advances: a grammar batch
     /// cannot overlap a pending forward (`uses_eager_grammar`).
     pub eager_grammar: bool,
+    /// The fused role's prefill-delay gate (`--prefill-attempt-interval` and
+    /// `--prefill-any-attempt-interval`); `None` plans prefill every round.
+    pub prefill_delay: Option<PrefillDelay>,
+}
+
+/// The prefill-delay gate's two vote intervals, in rounds since the last
+/// round that scheduled prefill work. Every attention-DP rank runs the same
+/// counter and the same vote, so the intervals count the same rounds
+/// everywhere. See `docs/design/prefill-delay.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrefillDelay {
+    /// Rounds between ALL attempt points: the gate opens when every rank
+    /// that would decode also has prefill work to batch into the round, so
+    /// one rank's prefill does not interrupt the others' decodes alone.
+    pub attempt_interval: u64,
+    /// Rounds between ANY attempt points: one rank's backlog opens the gate,
+    /// which bounds how long a prefill can be held. At least
+    /// `attempt_interval`, otherwise the ALL points could never be reached
+    /// consecutively.
+    pub any_interval: u64,
 }
 
 /// The optional subsystems a loop coordinates; each is `None` on an engine
@@ -544,6 +570,15 @@ pub struct EventLoop<D: DataPlane, F: Frontend> {
     reported_load: Option<Load>,
     /// The scheduler's active page count, reused across rounds.
     active_pages: ActivePages,
+    /// Rounds since the last round in which any rank scheduled prefill work:
+    /// the prefill-delay gate's counter. Reset by an all-idle round too, so
+    /// a prompt arriving at an idle engine sees an ALL attempt point.
+    rounds_since_prefill: u64,
+    /// The last gathered prefill-delay probe, one entry per attention-DP
+    /// rank (one local entry without attention DP): whether the rank has
+    /// prefill work to schedule, and whether it would decode this round.
+    dp_wants_prefill: Vec<bool>,
+    dp_has_decode_work: Vec<bool>,
 }
 
 /// What a round starts from, the same on every replica member.
@@ -571,6 +606,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         ranks: Ranks,
         subsystems: Subsystems,
     ) -> Self {
+        if let Some(delay) = &config.prefill_delay {
+            tracing::info!(?delay, "prefill delay gate on");
+        }
         Self {
             controls: Controls::new(config.controls.clone()),
             batch_logger: BatchLogger::new(config.batch_log.clone()),
@@ -602,6 +640,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             last_load_report: None,
             reported_load: None,
             active_pages: ActivePages::default(),
+            rounds_since_prefill: 0,
+            dp_wants_prefill: Vec::new(),
+            dp_has_decode_work: Vec::new(),
         }
     }
 
@@ -666,6 +707,13 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         self.apply_pause_transitions(&mut outputs, &mut released)?;
         self.drain_grammar_queue(&mut outputs, &mut released)?;
         self.drain_staged(&mut outputs, &mut released)?;
+        // A reload past its timeout expires on every replica member in the same round.
+        if self.controls.reload_pending() {
+            let timed_out = self.controls.reload_timed_out(Instant::now());
+            if self.replica_any(timed_out)? {
+                self.controls.expire_reload();
+            }
+        }
         // Every round on every rank, so the attention-DP ranks agree on the
         // flushes and weight operations they run together.
         let (memory_resident, release_pending) = self.gate()?;
@@ -703,7 +751,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             self.commit_down_to(0, &mut events, &mut outputs, &mut released)?;
             // Cache and storage work still progresses: the tick forbade
             // forwards, so the plan carries nothing else.
-            let plan = self.scheduler.next_execution_plan();
+            let plan = self
+                .scheduler
+                .next_execution_plan(false, self.config.prefill_delay.is_some());
             if let Some(l3) = &self.l3 {
                 l3.submit(&plan)?;
             }
@@ -721,12 +771,28 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             self.note_forward(forwarded);
             std::thread::sleep(PAUSED_IDLE_SLEEP);
         } else {
-            self.plan_and_dispatch(&mut stop, &mut events, &mut outputs, &mut released)?;
+            let allow_prefill = self.prefill_delay_allows_prefill();
+            self.plan_and_dispatch(
+                &mut stop,
+                &mut events,
+                &mut outputs,
+                &mut released,
+                allow_prefill,
+            )?;
             self.poll_transfers(&mut events, &mut outputs, &mut released)?;
         }
         // The forward-result feedback point: everything committed this round
         // reaches the scheduler before the next round plans.
         if !events.is_empty() {
+            // An ended request's transfer stops; its pages wait for that
+            // (PdEvent::Stopped) unless it succeeds first.
+            if let Some(transfer) = self.transfer.as_mut() {
+                for event in &events {
+                    if event.kind == ForwardEventKind::Abort {
+                        transfer.cancel(&event.request_id);
+                    }
+                }
+            }
             self.scheduler
                 .advance(&events)
                 .map_err(|error| LoopError::Scheduler(error.what().to_owned()))?;
@@ -779,8 +845,11 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         events: &mut Vec<ForwardEvent>,
         outputs: &mut Vec<StreamedOutput>,
         released: &mut Vec<String>,
+        allow_prefill: bool,
     ) -> Result<(), LoopError> {
-        let plan = self.scheduler.next_execution_plan();
+        let plan = self
+            .scheduler
+            .next_execution_plan(allow_prefill, self.config.prefill_delay.is_some());
         if tracing::enabled!(tracing::Level::DEBUG) {
             if let Some(batch) = plan.remote_prefill() {
                 tracing::debug!(rids = ?batch.request_ids, "remote prefill planned");
@@ -820,7 +889,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 metrics.record_capacity_abort();
             }
             // A pre-dispatch snapshot: the running count still holds what
-            // this round's commits end.
+            // this round's commits end. `sizes.running` is the batch;
+            // `outputs.num_running()` is every request this rank holds,
+            // including the PD transfer and waiting states the batch excludes.
             let sizes = planned_sizes.insert(self.scheduler.sizes());
             let iteration_tokens: i64 = forward.as_ref().map_or(0, |batch| {
                 batch.input_lengths.iter().map(|&n| i64::from(n)).sum()
@@ -830,6 +901,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 .active_pages
                 .read(Instant::now(), idle, || scheduler.active_lcm_blocks());
             metrics.record_scheduler_iteration(
+                sizes.running as i64,
                 self.outputs.num_running() as i64,
                 sizes.waiting as i64,
                 i64::from(active_pages),
@@ -850,8 +922,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                     sizes.retracted as i64,
                 ),
                 crate::output::Role::Decode => metrics.record_decode_queues(
-                    sizes.bootstrapping as i64,
-                    sizes.pd_transfer as i64,
+                    sizes.bootstrapping as i64,     // prealloc: waiting for the peer
+                    sizes.remote_prefilling as i64, // kv_wait: waiting for its KV
+                    sizes.pd_transfer as i64,       // transfer pins pages
                     sizes.retracted as i64,
                 ),
                 crate::output::Role::Plain => {}
@@ -1499,14 +1572,21 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         let flushes = self.controls.take_flushes();
         let head = self.controls.weight_head().and_then(control::gate_code);
         let internal = self.controls.internal_head().map(InternalOp::gate_code);
+        // A reload heads the queue from its arrival; it runs once drained, with the same id, everywhere.
+        let reload_key = match self.controls.weight_head() {
+            Some(ControlRequest::ReloadForward(op)) => Some(control::reload_key(op)),
+            _ => None,
+        };
+        let reload_ready = reload_key.is_none() || self.controls.reload_ready();
         let mut want_flush = flushes > 0;
-        let mut all_have_head = head.is_some();
+        let mut all_have_head = head.is_some() && reload_ready;
         let mut all_have_internal = internal.is_some();
         let mut memory_resident = !self.controls.memory_released();
         let mut release_pending = matches!(self.controls.drain(), Some(Drain::Release(_)));
         if let Some(world) = &self.ranks.dp {
             let code = head.unwrap_or(0);
             let internal_code = internal.unwrap_or(0);
+            let key = reload_key.unwrap_or(0);
             let row = [
                 i64::from(want_flush),
                 if head.is_some() { -1 } else { 0 },
@@ -1517,6 +1597,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 -internal_code,
                 i64::from(!memory_resident),
                 i64::from(release_pending),
+                key,
+                -key,
+                if reload_ready { -1 } else { 0 },
             ];
             let reduced = self.ranks.mesh.all_reduce(world, &row, Reduce::Max)?;
             // A resume reaches DP engines independently. None may forward
@@ -1525,7 +1608,14 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             release_pending = reduced[8] != 0;
             want_flush = reduced[0] > 0;
             all_have_head = reduced[1] == -1;
-            if all_have_head && reduced[2] != -reduced[3] {
+            let reload_heads = reduced[2] == RELOAD_GATE_CODE || -reduced[3] == RELOAD_GATE_CODE;
+            if reload_heads {
+                // A reload some rank was not sent, cancelled, or not drained yet waits; it is never fatal.
+                all_have_head = all_have_head
+                    && reduced[2] == -reduced[3]
+                    && reduced[9] == -reduced[10]
+                    && reduced[11] == -1;
+            } else if all_have_head && reduced[2] != -reduced[3] {
                 return Err(LoopError::Control(
                     "attention-DP ranks hold different weight operations at their queue \
                      heads; the frontend must send every weight operation to every DP \
@@ -1592,6 +1682,18 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         Ok((memory_resident, release_pending))
     }
 
+    /// Whether any member of this rank's replica says yes.
+    fn replica_any(&mut self, local: bool) -> Result<bool, LoopError> {
+        if self.ranks.replica.size() == 1 {
+            return Ok(local);
+        }
+        let reduced =
+            self.ranks
+                .mesh
+                .all_reduce(&self.ranks.replica, &[i64::from(local)], Reduce::Max)?;
+        Ok(reduced[0] != 0)
+    }
+
     /// Whether every rank sharing this decision says yes: MIN over the
     /// replica, then over the attention-DP ranks.
     fn converge(&mut self, local: bool) -> Result<bool, LoopError> {
@@ -1644,6 +1746,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 };
                 (agreed, message)
             }
+            ControlRequest::ReloadForward(_) => self.complete_reload(&op, flushed)?,
             _ if flush_refused => (
                 false,
                 "cache flush failed; retry the update after in-flight Host cache ops drain \
@@ -1690,7 +1793,36 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         tracing::info!(op = op.tag(), success, message, "weight operation done");
         self.controls
             .reply(control::gated_reply(&op, success, message));
+        if matches!(op, ControlRequest::ReloadForward(_)) {
+            self.controls.finish_reload();
+        }
         Ok(())
+    }
+
+    /// Run a drained, gate-agreed forward reload; its result is agreed across the ranks.
+    fn complete_reload(
+        &mut self,
+        op: &ControlRequest,
+        flushed: bool,
+    ) -> Result<(bool, String), LoopError> {
+        if !flushed {
+            return Ok((
+                false,
+                "the prefix caches could not be flushed, so the forward code was not reloaded; \
+                 retry once in-flight Host cache operations drain"
+                    .to_owned(),
+            ));
+        }
+        let (local, message) = self.data_plane.reload_forward(op)?;
+        let agreed = self.converge(local)?;
+        Ok(if local && !agreed {
+            (
+                false,
+                format!("forward reload failed on another rank in the replica ({message})"),
+            )
+        } else {
+            (agreed, message)
+        })
     }
 
     /// Agree a weight load's device prerequisites before its flush and
@@ -1829,14 +1961,15 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 .is_none_or(|transfer| !transfer.has_in_flight())
     }
 
-    /// The local scheduler drained and no forward or cancelled embedding
-    /// receive can still finish a request.
+    /// The local scheduler, including parked PD transfers, drained and no
+    /// forward or cancelled embedding receive can still finish a request.
     fn drained(&self) -> bool {
         let sizes = self.scheduler.sizes();
         if sizes.waiting != 0
             || sizes.decoding != 0
             || sizes.prefilling != 0
             || sizes.retracted != 0
+            || sizes.pd_transfer != 0
         {
             return false;
         }
@@ -1871,6 +2004,12 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         if !drained {
             return Ok(());
         }
+        if matches!(drain, Drain::Reload)
+            && (!self.transfers_idle() || !self.scheduler.can_clear_cache())
+        {
+            // Capture writes KV pages a transfer or a Host write-back could still touch.
+            return Ok(());
+        }
         if let Drain::Release(tags) = drain {
             if !all_paused {
                 return Ok(());
@@ -1885,6 +2024,10 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 self.data_plane.release_memory(&tags)?;
                 tracing::info!(?tags, "memory released");
                 self.controls.finish_release(tags);
+            }
+            Drain::Reload => {
+                tracing::info!("drained for a forward reload");
+                self.controls.mark_reload_ready();
             }
         }
         Ok(())
@@ -2041,9 +2184,6 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         forward: Option<&ForwardBatchView>,
         stop: &mut bool,
     ) -> Result<Option<DpRound>, LoopError> {
-        let Some(world) = &self.ranks.dp else {
-            return Ok(None);
-        };
         let (num_tokens, batch_size, num_extends) = match forward {
             Some(batch) => {
                 let tokens: i64 = batch.input_lengths.iter().map(|&n| i64::from(n)).sum();
@@ -2059,17 +2199,129 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             }
             None => (0, 0, 0),
         };
-        let row = [num_tokens, batch_size, num_extends, i64::from(*stop)];
+        // What this rank publishes about the delay gate: whether it has
+        // prefill work the next round could take, and whether it would decode
+        // instead. Gathered with the batch counts so every rank votes on the
+        // same observations without a second collective. An engine without
+        // the gate publishes zeros and never pays the probe's scan.
+        let (wants_prefill, has_decode_work) = if self.config.prefill_delay.is_some() {
+            let probe = self.scheduler.probe_prefill_gate();
+            (probe.wants_prefill, probe.has_decode_work)
+        } else {
+            (false, false)
+        };
+        let Some(world) = &self.ranks.dp else {
+            self.dp_wants_prefill = vec![wants_prefill];
+            self.dp_has_decode_work = vec![has_decode_work];
+            self.note_prefill_round(num_extends, batch_size);
+            return Ok(None);
+        };
+        let row = [
+            num_tokens,
+            batch_size,
+            num_extends,
+            i64::from(*stop),
+            i64::from(wants_prefill),
+            i64::from(has_decode_work),
+        ];
         let rows = self.ranks.mesh.all_gather_i64(world, &row)?;
         *stop = rows.iter().any(|row| row[3] != 0);
         let any_work = rows.iter().any(|row| row[0] > 0);
         self.dp_idle = !any_work;
+        self.dp_wants_prefill = rows.iter().map(|row| row[4] != 0).collect();
+        self.dp_has_decode_work = rows.iter().map(|row| row[5] != 0).collect();
+        // The counter is rank-identical: it reads only the gathered rows.
+        self.rounds_since_prefill =
+            if rows.iter().any(|row| row[2] > 0) || !rows.iter().any(|row| row[1] > 0) {
+                0
+            } else {
+                self.rounds_since_prefill.saturating_add(1)
+            };
         Ok(Some(DpRound {
             num_tokens: rows.iter().map(|row| row[0]).collect(),
             batch_sizes: rows.iter().map(|row| row[1]).collect(),
             num_extends: rows.iter().map(|row| row[2]).collect(),
             idle_forward: num_tokens == 0 && any_work,
         }))
+    }
+
+    /// Without attention DP the counter advances on this rank's own plan.
+    fn note_prefill_round(&mut self, num_extends: i64, batch_size: i64) {
+        self.rounds_since_prefill = if num_extends > 0 || batch_size == 0 {
+            0
+        } else {
+            self.rounds_since_prefill.saturating_add(1)
+        };
+    }
+
+    /// Whether this round may schedule prefill work: the control plane's half
+    /// of the prefill-delay gate (`docs/design/prefill-delay.md`).
+    ///
+    /// Every attention-DP rank takes this decision from the same gathered
+    /// probes and the same counter, so the whole group opens its gate on the
+    /// same round: the prefills of all ranks batch into one window instead of
+    /// each rank interrupting the group's decode rounds on its own schedule.
+    ///
+    /// This is the group's permission. Whether *this* rank plans prefill is
+    /// [`Self::prefill_delay_allows_prefill`].
+    fn prefill_allowed(&self) -> bool {
+        let Some(delay) = self.config.prefill_delay.as_ref() else {
+            return true;
+        };
+        if self.dp_wants_prefill.is_empty() {
+            // Nothing gathered yet: the loop's first round plans what it
+            // would have planned without the gate.
+            return true;
+        }
+        let rounds = self.rounds_since_prefill;
+        let any_point = rounds != 0 && rounds % delay.any_interval == 0;
+        let all_point = rounds % delay.attempt_interval == 0;
+        if !any_point && !all_point {
+            return false;
+        }
+        let open = if any_point {
+            // Anti-starvation: one rank's backlog opens the group's gate, so
+            // eligible prefill waits at most `any_interval` rounds. New
+            // prompts above the watermark must also wait for capacity.
+            self.dp_wants_prefill.iter().any(|want| *want)
+        } else {
+            // ALL: a rank with nothing to decode protects nothing, so only a
+            // rank that would decode is a blocker. (A strict conjunction over
+            // `want` would hold a prompt in an idle engine for a whole
+            // `any_interval`, and would stall every rank at the tail of a
+            // batch whose other ranks already finished.)
+            self.dp_wants_prefill
+                .iter()
+                .zip(&self.dp_has_decode_work)
+                .all(|(want, decodes)| *want || !*decodes)
+        };
+        tracing::debug!(
+            rounds,
+            any_point,
+            all_point,
+            open,
+            wants = ?self.dp_wants_prefill,
+            decodes = ?self.dp_has_decode_work,
+            "prefill gate"
+        );
+        open
+    }
+
+    /// Whether this rank plans prefill this round: the group's permission
+    /// and this rank's own probe, read now rather than from the last round's
+    /// publication.
+    ///
+    /// A window its peers open must not drag a rank into an admission it
+    /// does not want: a resident chunk, or a new prompt at or below the
+    /// watermark, is the same condition the vote publishes. A resident
+    /// chunk must be able to consume its own reservation above the watermark;
+    /// the scheduler independently checks pressure before any new admission
+    /// in that window, including after the resident's final chunk.
+    fn prefill_delay_allows_prefill(&self) -> bool {
+        if self.config.prefill_delay.is_none() {
+            return true;
+        }
+        self.prefill_allowed() && self.scheduler.probe_prefill_gate().wants_prefill
     }
 
     /// The pipeline's last stage's results of a forward: only it sampled;
@@ -2115,9 +2367,13 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                     absorb(self.outputs.finish_prefill(&rid), events, outputs, released);
                 }
                 PdEvent::Failed(rid) => {
-                    // The scheduler releases the request on the event itself.
+                    // The scheduler ends the request on the event; its pages
+                    // wait for the transfer to stop.
                     events.push(pd_event(ForwardEventKind::PdFailed, &rid, -1));
                     absorb(self.outputs.fail_transfer(&rid), events, outputs, released);
+                }
+                PdEvent::Stopped(rid) => {
+                    events.push(pd_event(ForwardEventKind::PdTransferStopped, &rid, -1));
                 }
                 PdEvent::RemotePrefillDone(done) => {
                     let rid = done.rid.clone();

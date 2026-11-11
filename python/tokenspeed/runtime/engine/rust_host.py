@@ -426,6 +426,7 @@ class HostConfig:
             multimodal inputs.
         memory_saver: ``--enable-memory-saver``: memory can be released.
         memory_regions: The regions this engine can release.
+        allow_reload_forward: ``--allow-reload-forward``: the reload_forward control call is served.
         metrics_prometheus_dir: ``PROMETHEUS_MULTIPROC_DIR``, where the host
             writes its Prometheus series, when the Prometheus reporter is
             on; else None.
@@ -469,10 +470,16 @@ class HostConfig:
         epd_receive_enabled: An EPD prefill node: requests whose images an encode
             node embeds wait for the embeddings before they are scheduled;
             its first stage receives them (``HostBootstrap.epd_receive``).
+        reasoning: The reasoning parser's structural tags and token markers;
+            used for grammar deferral and reasoning usage, also when grammar
+            constraints are off. None without a supported parser.
         grammar: Grammar-constrained decoding's settings; None with
             ``--grammar-backend none``.
         eager_grammar: The forward fills grammar bitmasks from the
             matchers' committed state (``DeviceSpecs.uses_eager_grammar``).
+        prefill_delay: The fused engine's prefill-delay gate intervals,
+            (attempt, any) rounds; None plans prefill every round
+            (``ServerArgs.prefill_delay``).
     """
 
     handshake_address: str
@@ -502,6 +509,7 @@ class HostConfig:
     multimodal: bool
     memory_saver: bool
     memory_regions: tuple[str, ...]
+    allow_reload_forward: bool
     metrics_prometheus_dir: str | None
     metrics_relay_endpoint: str | None
     engine_metrics: bool
@@ -527,8 +535,13 @@ class HostConfig:
     engine_role: str
     eplb: EplbSettings | None
     epd_receive_enabled: bool
+    reasoning: ReasoningGrammar | None
     grammar: GrammarSettings | None
     eager_grammar: bool
+    # The fused engine's prefill-delay gate, (attempt, any) intervals in
+    # rounds; None plans prefill every round. See
+    # ``ServerArgs.prefill_delay``.
+    prefill_delay: tuple[int, int] | None
 
 
 def host_in_flight_depth(server_args: ServerArgs) -> int:
@@ -961,6 +974,13 @@ class HostDataPlane:
         output = self._profiler.profile(request)
         return bool(output.success), str(output.message)
 
+    def reload_forward(self, payload: bytes) -> tuple[bool, str]:
+        """Reload edited forward code and recapture the graphs (a msgpack ``ReloadForwardReqInput``); the engine drained and flushed."""
+        ok, message = self._device.reload_forward(
+            zmq_wire.decode_request_frames([zmq_wire.REQ_TYPE_CONTROL, payload])[0]
+        )
+        return bool(ok), str(message)
+
     def release_memory(self, tags: list[str]) -> None:
         """Free memory regions, in order; the scheduler has drained."""
         for tag in tags:
@@ -1328,6 +1348,11 @@ class HostBootstrap:
                 ),
                 pg_manager=pg_manager,
             )
+            reasoning = (
+                reasoning_grammar(server_args.reasoning_parser, tokenizer)
+                if server_args.reasoning_parser
+                else None
+            )
             self.config = HostConfig(
                 handshake_address=server_args.zmq_handshake_endpoint(),
                 engine_index=server_args.zmq_engine_index + dp_rank,
@@ -1389,6 +1414,7 @@ class HostBootstrap:
                 multimodal=model_config.is_multimodal_active,
                 memory_saver=server_args.enable_memory_saver,
                 memory_regions=tuple(regions),
+                allow_reload_forward=server_args.allow_reload_forward,
                 metrics_prometheus_dir=(
                     os.environ["PROMETHEUS_MULTIPROC_DIR"]
                     if metrics_enabled(server_args, "prometheus")
@@ -1430,6 +1456,7 @@ class HostBootstrap:
                     )
                     and model_config.is_multimodal_active
                 ),
+                reasoning=reasoning,
                 grammar=(
                     GrammarSettings(
                         tokenizer_info=grammar_tokenizer_info(
@@ -1442,16 +1469,13 @@ class HostBootstrap:
                             server_args.grammar_compile_timeout_secs
                         ),
                         max_retries=int(server_args.grammar_compile_max_retries),
-                        reasoning=(
-                            reasoning_grammar(server_args.reasoning_parser, tokenizer)
-                            if server_args.reasoning_parser
-                            else None
-                        ),
+                        reasoning=reasoning,
                     )
                     if server_args.grammar_backend == "xgrammar"
                     else None
                 ),
                 eager_grammar=specs.uses_eager_grammar,
+                prefill_delay=server_args.prefill_delay,
                 eplb=(
                     EplbSettings(
                         specs=specs.expert_rebalance,

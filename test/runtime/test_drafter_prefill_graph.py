@@ -342,7 +342,7 @@ def test_the_prefill_graph_reports_the_rows_a_full_capture_stores(taps) -> None:
     graph._reserve_outputs(prefill_graph_module._output_spec(outputs))
 
     processor = LogitsProcessor(
-        config=PretrainedConfig(vocab_size=VOCAB), dp_lm_head_tp=False
+        attn_tp_size=1, config=PretrainedConfig(vocab_size=VOCAB), dp_lm_head_tp=False
     )
     stored = processor(
         input_ids=None,
@@ -422,7 +422,11 @@ def test_rounds_a_graph_did_not_bake_run_eager(monkeypatch) -> None:
     assert drafter._extend_graph_route(1, dp) is None
     # A query shard of the span.
     shard = QueryShardPlan.from_forward(
-        total_tokens=8, input_lengths=[8], size=2, rank=0
+        total_tokens=8,
+        input_lengths=[8],
+        size=2,
+        rank=0,
+        device=drafter.input_buffers.seq_lens_buf.device,
     )
     sharded = extend_input(drafter, [8], query_shard=shard)
     assert drafter._extend_graph_route(1, sharded) is None

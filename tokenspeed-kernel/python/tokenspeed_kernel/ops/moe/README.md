@@ -45,6 +45,12 @@ arguments or bucketed, never `constexpr`.
 
 ## FlashInfer adapters (`flashinfer.py`)
 
+### TRT-LLM MXFP4 activation
+
+FlashInfer TRT-LLM MXFP4 defaults to standard SwiGLU (`silu(gate) * up`)
+when the layer supplies no activation parameters. Explicit SwiGLU and SiTU
+parameters come from the model.
+
 ### Opt-in SM90 block-FP8 grouped MoE
 
 `prepare_sm90_fp8_moe(mode=...)` prepares a callable before warmup and graph
@@ -583,6 +589,28 @@ CUDA graph. Every rank must run the same batches, since each mailbox is shared
 by the group. Other row counts and every non-decode forward keep the TRT-LLM
 MoE.
 
+At 5-8 rows the routing kernel lets the experts launch as it starts, and the
+shared expert runs on a highest-priority side stream that the tail never waits
+for: the tail polls the shared rows from their mailbox. Those tails keep their
+release after the output multicast: a release at entry lets kernels in that can
+hold the SMs the side stream still needs. The forward rejoins that side stream once
+at its end (`KimiK3DecodeMoE.join`), since a CUDA graph capture fails while a
+forked stream is not joined. These only reorder work; the outputs are the same
+bit for bit.
+
+Up to 8 rows a decode step is bound by HBM bandwidth, which the attention core
+and the all-reduces leave idle, so the chain prefetches weights into L2
+(`_cute_dsl/k3_decode_prefetch.py` has the row counts and caps). A side stream
+prefetches the MoE front's packed weight after the o-projection exit; the
+o-projection shard and the MoE layer's front, shared-expert and up-projection
+weights after the KDA input projection or the MLA core; and, once the routed
+experts launch, the next layer's attention weights up to a cap. At 4-7 rows the
+routed experts instead prefetch the up-projection shard and the next attention's
+weights themselves, once their last weight load is issued. The forward rejoins
+the prefetch stream at its end as well. The prefetch tables hold weight
+addresses, so the weights must not move after binding. Prefetching changes no
+result.
+
 Three places decide where the chain runs. The Kimi-K3 MoE execution plan
 allows it for one tensor-parallel group shared by attention and MoE on
 Blackwell TRT-LLM. `supports()` in `_cute_dsl/k3_decode_support.py` (no
@@ -601,16 +629,34 @@ decode step through the chain (`KimiK3DecodeAttention`). The model checks that
 the attention has no attention-side parallel communication, no FP8 o-projection
 input, and an output gate on MLA; `attention_supports()` in
 `_cute_dsl/k3_decode_support.py` checks the projections the kernels serve
-(BF16, this model's TP8 KDA and MLA input projections, and a 1536-wide
-o-projection shard). Each layer then does the following:
+(BF16, this model's TP8 KDA, MLA and Kimi-K3.1 DSA input projections, and a
+1536-wide o-projection shard). Each layer then does the following:
 
 1. Add the previous feed-forward output to the residual prefix and mix it
    with the block snapshots (AttnRes), reading a MoE layer's output row
    straight from the tail's ring.
-2. Run the packed input projection as a split-K GEMM with per-batch tactics.
+2. Run the packed input projection as a split-K GEMM with per-batch tactics:
+   up to 16 rows a warp split-K (many small CTAs whose four compute warps
+   each sum a quarter of K, reduced in shared memory), above 16 rows a cluster
+   split-K (each CTA of a cluster sums a K slice, reduced over distributed
+   shared memory). A weight that is not contiguous and 32-byte aligned, or
+   strided or misaligned activations or outputs, take the cluster split-K at
+   every row count. Both multiply BF16, accumulate in FP32, and round the
+   output once to BF16; only the order in which they sum the K partials
+   differs, so their outputs can differ by one BF16 rounding step. Both
+   compile when the layer is bound, before graph capture.
+   A Kimi-K3.1 DSA layer's projection also carries its indexer's `wk` and
+   `weights_proj` rows, which read the same attention input:
+   `[q_a | kv_a | gate | wk | weights_proj]`, 3808 rows per rank. The model
+   packs that weight once when it binds the chain (`pack_decode_projection`);
+   the parameters become views of its rows, so no weight is duplicated and
+   every other path reads the same values. The cluster split-K takes the MLA
+   tactics at 3808 rows (not yet swept).
 3. Run the attention core as usual, through the attention's `o_proj_input`
    (Kimi-K3.1's DSA layers select their indexer's top-k there, as in their
-   `forward`).
+   `forward`, with the index keys and head weights read from the packed
+   projection instead of the indexer's own GEMM; only the order in which
+   those 160 columns sum their K partials differs).
 4. Multiply by this rank's o-projection shard and multicast the partial;
    a consumer kernel sums the partials, updates the prefix, and applies the
    post-attention AttnRes. Above 32 rows each rank sums its column share and
@@ -619,3 +665,48 @@ o-projection shard). Each layer then does the following:
 A closing AttnRes reads the last MoE row and applies the final norm. A layer's
 output exists as the residual prefix once the next entry (or the closing
 AttnRes) has added its feed-forward row, so drafter captures are taken there.
+
+
+## Qwen4 MXFP4 MegaMoE
+
+Qwen4 MXFP4 checkpoints can use `--moe-backend mega_moe` (or its
+`deep_gemm_mega_moe` alias) with the existing `tokenspeed-deepgemm` package.
+No SGLang fork is needed: this is the existing FP8-activation / MXFP4-weight
+kernel, not W4A4. Standard SiLU and standard SwiGLU select the same fused
+expert arithmetic. The checkpoint loader preserves packed E2M1 bytes and
+per-32 UE8M0 scales and shards routed experts across EP ranks.
+
+Use MoE TP=1, EP>1, attention DP and `--all2all-backend none`, for example
+DP4/TP2/EP8. Qwen computes top-k on each rank's scattered rows; DeepGEMM stages
+FP8 activations and routes, then owns dispatch, both expert GEMMs and combine.
+The routed output is complete and must not be all-reduced again. Shared
+experts remain independent, with replicated weights over scattered token
+rows, followed by Qwen's sigmoid-gated addition. Attention communication and
+its fusion remain unchanged.
+
+The persistent per-rank token capacity covers chunked prefill (or the
+unchunked prefill bound), prefill graphs, and the maximum decode batch times
+the speculative verification width. It does not depend on the first batch.
+Unchunked prefill requires an explicit positive `--max-model-len` and
+reserves for `max_prefill_tokens + max_model_len`. Chunked prefill bounds the
+workspace and startup work for long contexts.
+Post-quantization warmup reserves the planned workspace and compiles tiles up
+to its per-rank token capacity before capture. Matching layers reuse the
+backend's workspace and warmup cache.
+Set `TOKENSPEED_DISABLE_MEGA_MOE_WARMUP=1` to defer this work to the first
+forward. An empty owner still enters the collective with zero-row inputs and
+output, using DeepGEMM's native empty-rank support.
+
+Qwen4 NextN can also load MXFP4 routed experts when the checkpoint leaves its
+attention and shared expert in BF16. For a draft with packed MXFP4 weights, use
+`--speculative-draft-model-quantization mxfp4`.
+
+`test/runtime/test_qwen4_mxfp4_mega_moe.py` checks model planning, EP checkpoint
+loading, capacity bounds, and (under torch.distributed.run) independent shared
+expert execution. The Blackwell numerical and graph regression can
+also exercise uneven/empty owners over multiple GPUs:
+
+```bash
+python -m torch.distributed.run --standalone --nproc-per-node=2 -m pytest -q \
+  tokenspeed-kernel/test/nvidia/ops/moe/test_deep_gemm_mxfp4_mega_moe.py
+```

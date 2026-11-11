@@ -177,31 +177,40 @@ def _processor(order: str, monkeypatch, vocab_size: int = VOCAB) -> LogitsProces
         SimpleNamespace(
             model_type="test", vocab_size=vocab_size, final_logit_softcapping=None
         ),
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
 
 
-def _prompt_rows(rows: list[int], targets: list[int], *, num_input_rows: int):
+def _prompt_rows(
+    rows: list[int], targets: list[int], *, num_input_rows: int, chunk_tokens: int
+):
     return InputLogprobRows(
         rows=torch.tensor(rows, dtype=torch.int64),
         targets=torch.tensor(targets, dtype=torch.int64),
         slots=torch.zeros(len(rows), dtype=torch.int64),
         num_input_rows=num_input_rows,
-        chunk_tokens=2,
+        chunk_tokens=chunk_tokens,
         rows_per_rank=None,
         gathered_to_rows=None,
     )
 
 
 @pytest.mark.parametrize("order,block,form", ORDER_CASES)
-def test_prompt_logprobs_follow_the_order(monkeypatch, order, block, form):
+@pytest.mark.parametrize("chunk_tokens", [1, 2, 3])
+def test_prompt_logprobs_follow_the_order(
+    monkeypatch, order, block, form, chunk_tokens
+):
     # Prompt rows take the sampler's gather in the launch's order, so a
     # token's prompt and output logprobs are the same number under either.
-    hidden = torch.randn(4, 8, generator=torch.Generator().manual_seed(2))
-    weight = torch.randn(VOCAB, 8, generator=torch.Generator().manual_seed(3))
+    # One-hot activations make the projection exact at every chunk size.
+    # Random CPU GEMMs can round differently for one row and several rows;
+    # that would test the BLAS implementation instead of logprob dispatch.
+    hidden = torch.eye(4, 8)
+    weight = torch.randn(VOCAB, 8, generator=torch.Generator().manual_seed(3)) * 3
     lm_head = SimpleNamespace(weight=weight)
-    rows, targets = [0, 1, 2], [3, 40000, 65535]
-    logits = (hidden @ weight.T)[rows]
+    rows, targets = [2, 0, 1], [3, 40000, 65535]
+    logits = weight[:, rows].T.contiguous()
     ids = torch.tensor(targets)
 
     def run(order: str) -> torch.Tensor:
@@ -209,7 +218,9 @@ def test_prompt_logprobs_follow_the_order(monkeypatch, order, block, form):
             forward_mode=ForwardMode.EXTEND,
             query_shard=None,
             gather_ids=torch.tensor([3]),
-            input_logprob_rows=_prompt_rows(rows, targets, num_input_rows=4),
+            input_logprob_rows=_prompt_rows(
+                rows, targets, num_input_rows=4, chunk_tokens=chunk_tokens
+            ),
         )
         return _processor(order, monkeypatch)(
             input_ids=None,

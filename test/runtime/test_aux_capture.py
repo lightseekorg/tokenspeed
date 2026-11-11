@@ -238,7 +238,13 @@ def _stub_layer(cls):
     layer.input_layernorm = None
     layer.post_attention_layernorm = None
     layer.mlp = _Mlp() if cls.__name__.startswith("Qwen3_5") else (lambda h, *_: h)
-    layer.is_moe_layer = False
+    if issubclass(cls, DeepseekV3DecoderLayer):
+        # A dense layer: the config routes no experts.
+        layer.config = SimpleNamespace(n_routed_experts=None)
+        layer.layer_id = 0
+        layer.is_nextn = False
+    else:
+        layer.is_moe_layer = False
     layer.linear_attn = _LinearAttn()
     layer.qkv_proj = SimpleNamespace(
         quant_method=SimpleNamespace(static_fp8_input_scale=lambda proj: None)
@@ -313,6 +319,24 @@ def test_idle_layer_appends_one_empty_gathered_tap(layer_cls):
 
     assert len(comm.gathered) == 1 and comm.gathered[0] is empty
     assert len(aux) == 1 and aux[0].shape == (0, 8)
+
+
+@pytest.mark.parametrize(
+    ("layer_cls", "attends"),
+    [(DeepseekV3DecoderLayer, True), (GlmMoeDsaDecoderLayer, False)],
+)
+def test_idle_layer_runs_attention_only_when_it_joins_collectives(layer_cls, attends):
+    layer, comm = _stub_layer(layer_cls)
+    calls = []
+    layer.self_attn = lambda **kwargs: calls.append(kwargs["comm_manager"])
+    ctx = SimpleNamespace(
+        forward_mode=SimpleNamespace(is_idle=lambda: True), draft_narrowing=None
+    )
+
+    _call(layer, torch.empty(0, 8), None, ctx, None)
+
+    # The DeepSeek-V3 attention joins its group's collectives on an idle rank.
+    assert calls == ([comm] if attends else [])
 
 
 def _bare(model_cls):

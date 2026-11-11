@@ -386,10 +386,10 @@ def _sconv_apply(
         checkpoint_group = "kvconv"
         checkpoint_buffers = ctx.token_to_kv_pool.kvconv_checkpoint_buffers(layer_id)
     elif conv_group in ("attnconv", "mlpconv"):
-        checkpoint_group = "hiddenconv"
-        checkpoint_buffers = (
-            ctx.token_to_kv_pool.hiddenconv_checkpoint_buffer(layer_id, conv_group),
+        checkpoint_group, buffer = ctx.token_to_kv_pool.hiddenconv_checkpoint(
+            layer_id, conv_group
         )
+        checkpoint_buffers = (buffer,)
     else:
         raise ValueError(f"unknown sconv stream group {conv_group!r}")
     backend.register_shortconv_checkpoint_stream(
@@ -1602,6 +1602,7 @@ class InklingForConditionalGeneration(nn.Module):
             tp_rank=mapping.attn.tp_rank,
             tp_size=mapping.attn.tp_size,
             tp_group=mapping.attn.tp_group,
+            attn_tp_size=mapping.attn.tp_size,
             dp_lm_head_tp=False,
         )
 

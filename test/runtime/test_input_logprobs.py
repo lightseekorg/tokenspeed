@@ -217,6 +217,7 @@ def test_prompt_top_k_rides_the_chunk_loop_of_the_prompt_logprobs(chunk_tokens):
     rows, targets = [0, 1, 3], [5, 2, 3]
     processor = LogitsProcessor(
         config=SimpleNamespace(model_type="test", vocab_size=vocab),
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
 
@@ -279,6 +280,7 @@ def test_prompt_rows_and_sampled_rows_take_the_same_top_k_of_the_same_logits():
     hidden[:, [3, 17, 40]] = 5.0
     processor = LogitsProcessor(
         config=SimpleNamespace(model_type="test", vocab_size=vocab),
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
     out = processor(

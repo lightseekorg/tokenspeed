@@ -281,6 +281,8 @@ pub struct StreamedOutput {
     pub completion_tokens: i64,
     /// Prompt tokens served from the prefix cache.
     pub cached_tokens: i64,
+    /// Reasoning tokens generated so far, excluding structural markers.
+    pub reasoning_tokens: i64,
     /// Logprobs of `output_ids`; empty when not requested.
     pub output_logprobs: Vec<f64>,
     /// Cumulative probability mass of `output_ids`; empty without diagnostics
@@ -775,6 +777,9 @@ impl OutputProcessor {
         };
         state.cached_tokens = cached_tokens;
         state.output_ids.push(bootstrap_token);
+        if let Some(tokens) = &mut state.reasoning_tokens {
+            tokens.push([bootstrap_token]);
+        }
         if (self.metrics_enabled || state.timings.is_some()) && state.first_token_time == 0.0 {
             // The decode node never samples this token; its arrival is the
             // decode role's first-token boundary.
@@ -836,23 +841,18 @@ impl OutputProcessor {
         committed
     }
 
-    /// A request's PD transfer failed. The scheduler already released it
-    /// on the event; the client gets an abort, unless it ended before and
-    /// tore down its stream.
+    /// A request's PD transfer failed. A computed prefill still needs its
+    /// final output; only a client abort or an already-sent final stays silent.
+    /// The scheduler keeps its pages until the transfer and local forwards retire.
     pub fn fail_transfer(&mut self, rid: &str) -> Committed {
         let mut committed = Committed::default();
         let Some(mut state) = self.states.remove(rid) else {
             return committed;
         };
-        if !state.finished() {
-            state.abort("PD/EPD remote transfer failed or timed out", false, None);
-            state.finished_output = false;
-            committed.outputs =
-                Self::stream_state(rid, &mut state, self.stream_interval, self.spec_num_tokens)
-                    .into_iter()
-                    .collect();
-        } else if state.abort_notify_client {
-            state.finished_output = false;
+        if !state.to_abort && !state.finished_output {
+            state.abort("PD/EPD remote transfer failed or timed out", true, None);
+        }
+        if state.abort_notify_client {
             committed.outputs =
                 Self::stream_state(rid, &mut state, self.stream_interval, self.spec_num_tokens)
                     .into_iter()
@@ -1332,6 +1332,9 @@ impl OutputProcessor {
             let before = state.output_ids.len();
             for (j, &token) in model_ids.iter().enumerate() {
                 state.output_ids.push(token);
+                if let Some(tokens) = &mut state.reasoning_tokens {
+                    tokens.push([token]);
+                }
                 if !hostfunc {
                     if let Some(grammar) = &state.grammar {
                         let mut matcher = grammar.matcher.lock().expect("matcher lock");
@@ -1554,6 +1557,7 @@ impl OutputProcessor {
             prompt_tokens: state.prompt_len,
             completion_tokens: state.output_ids.len() as i64,
             cached_tokens: state.cached_tokens,
+            reasoning_tokens: state.reasoning_tokens.map_or(0, |tokens| tokens.count()),
             output_logprobs,
             output_token_cumulative_probs,
             finish_details: state.finished_reason.as_ref().map(FinishReason::details),
@@ -1736,6 +1740,36 @@ mod tests {
     }
 
     #[test]
+    fn commits_accumulate_reasoning_usage() {
+        let grammar = crate::grammar::ReasoningGrammar {
+            continues: String::new(),
+            may_open: String::new(),
+            schema_slot: String::new(),
+            markers: Some((1, 2)),
+            implicit_closer: None,
+        };
+        let mut state = RequestState::new(vec![1], 10, BTreeSet::new(), true, None, false);
+        state.reasoning_tokens = Some(crate::request::ReasoningTokens::new(
+            &grammar,
+            &state.prompt_ids,
+        ));
+        let mut p = processor(None);
+        p.register("r".to_owned(), state);
+
+        for (i, (token, expected)) in [(10, 1), (11, 2), (2, 2), (12, 2)].into_iter().enumerate() {
+            let input_length = i as i32 + 1;
+            let committed = p
+                .commit(
+                    &batch(&[("r", input_length, 0, 1)], usize::from(i == 0)),
+                    None,
+                    &result(&[token], &[1]),
+                )
+                .unwrap();
+            assert_eq!(committed.outputs[0].reasoning_tokens, expected);
+        }
+    }
+
+    #[test]
     fn request_latency_samples_use_the_prefill_boundaries() {
         let mut p = OutputProcessor::new(
             None,
@@ -1763,14 +1797,27 @@ mod tests {
     }
 
     #[test]
-    fn a_decode_landing_sets_the_first_token_boundary() {
+    fn a_decode_landing_sets_the_first_token_boundary_and_reasoning_usage() {
         let mut p =
             OutputProcessor::new(None, 1, Some(4096), Role::Decode, NO_FINISH_LOG, true, None);
         register(&mut p, "a", 4, 8, &[]);
+        let grammar = crate::grammar::ReasoningGrammar {
+            continues: String::new(),
+            may_open: String::new(),
+            schema_slot: String::new(),
+            markers: Some((0, 2)),
+            implicit_closer: None,
+        };
+        let state = p.states.get_mut("a").unwrap();
+        state.reasoning_tokens = Some(crate::request::ReasoningTokens::new(
+            &grammar,
+            &state.prompt_ids,
+        ));
         p.remote_prefill_done("a", 7, 0, None);
         let state = p.state("a").expect("still registered");
         assert!(state.first_token_time > 0.0);
         assert_eq!(state.output_ids, vec![7]);
+        assert_eq!(state.reasoning_tokens.unwrap().count(), 1);
     }
 
     #[test]
@@ -1802,6 +1849,7 @@ mod tests {
             None,
         );
         assert!(line.contains("ttft_ms=1000.0,"), "{line}");
+        assert!(line.contains("prefill_ms=0.0,"), "{line}");
         assert!(line.contains("decode_tps=0.5,"), "{line}");
     }
 
@@ -2170,6 +2218,62 @@ mod tests {
             c.outputs[0].input_logprobs.as_ref().unwrap().values,
             [None, Some(0.0), Some(-1.0)]
         );
+    }
+
+    #[test]
+    fn a_failed_transfer_ends_a_prefill_that_finished_computing() {
+        let mut p = OutputProcessor::new(None, 1, None, Role::Prefill, NO_FINISH_LOG, true, None);
+        register(&mut p, "r", 3, 1, &[]);
+        let committed = p
+            .commit(&batch(&[("r", 3, 0, 3)], 1), None, &result(&[9], &[1]))
+            .unwrap();
+        assert!(committed.outputs.is_empty());
+        let state = p.state("r").unwrap();
+        assert!(state.finished());
+        assert!(!state.finished_output);
+        assert!(!state.to_abort);
+
+        // The transfer can fail before the next round applies pause(abort).
+        let failed = p.fail_transfer("r");
+        assert_eq!(failed.outputs.len(), 1);
+        assert_eq!(failed.outputs[0].finish_reason, Some("abort"));
+        assert_eq!(failed.outputs[0].output_ids, [9]);
+        assert_eq!(failed.released, ["r"]);
+        assert!(p.state("r").is_none());
+        assert!(p.fail_transfer("r").outputs.is_empty());
+        assert!(p.finish_prefill("r").outputs.is_empty());
+    }
+
+    #[test]
+    fn a_failed_transfer_aborts_an_unfinished_request() {
+        let mut p = processor(None);
+        register(&mut p, "r", 3, 4, &[]);
+        let failed = p.fail_transfer("r");
+        assert_eq!(failed.outputs.len(), 1);
+        assert_eq!(failed.outputs[0].finish_reason, Some("abort"));
+        assert_eq!(failed.released, ["r"]);
+    }
+
+    #[test]
+    fn a_failed_transfer_preserves_client_and_pause_abort_notifications() {
+        for max_new in [1, 4] {
+            for notify in [false, true] {
+                let mut p =
+                    OutputProcessor::new(None, 1, None, Role::Prefill, NO_FINISH_LOG, true, None);
+                register(&mut p, "r", 3, max_new, &[]);
+                p.commit(&batch(&[("r", 3, 0, 3)], 1), None, &result(&[9], &[1]))
+                    .unwrap();
+                p.mark_abort("r", notify);
+
+                let failed = p.fail_transfer("r");
+                assert_eq!(failed.outputs.len(), usize::from(notify));
+                if notify {
+                    assert_eq!(failed.outputs[0].finish_reason, Some("abort"));
+                }
+                assert_eq!(failed.released, ["r"]);
+                assert!(p.state("r").is_none());
+            }
+        }
     }
 
     #[test]

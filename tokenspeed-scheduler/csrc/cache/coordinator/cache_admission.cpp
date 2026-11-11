@@ -52,10 +52,10 @@ struct VictimSet {
         // set was chosen for, taken along so no Device page outlives its
         // parent (counted as a stranded suffix).
         bool in_stranded_suffix;
+        // Kept per block when a segment absorbs the request's released slots.
+        bool is_request_reclaim;
     };
     std::vector<Member> members;
-    // The admitted request's own released slots (counted apart).
-    bool is_request_reclaim{false};
 };
 
 // A copy-in block an admission reserves: the table slot it serves and the
@@ -166,12 +166,83 @@ public:
         return true;
     }
 
+    // The parents a dense layout of the request's blocks and this demand
+    // would take, every parent empty: per group ParentsNeededForBucketsAndPairs
+    // over the blocks that keep their bucket (bucket_pinned, by bucket) plus
+    // the bucket-exact demand, the blocks that may take any bucket
+    // (free_movers, a request's unwritten reserve) plus the dense demand, and
+    // the demand's same-bucket pairs (reserveCopyIns). The gate of
+    // CacheCoordinator::CompactLoneRequest, and what prepares the planner's
+    // capacity and candidate views for PlanBlockAlone.
+    std::int64_t DenseLayoutParents(std::span<const std::vector<std::int64_t>> bucket_pinned,
+                                    std::span<const std::int64_t> free_movers) {
+        _assert(bucket_pinned.size() == groups_.size() && free_movers.size() == groups_.size(),
+                "one bucket layout and one free-mover count per group");
+        if (!std::exchange(views_prepared_, true)) {
+            initializeCapacity();
+            collectCandidates();
+        }
+        std::int64_t parents = 0;
+        for (std::size_t i = 0; i < groups_.size(); ++i) {
+            _assert(bucket_pinned[i].size() == shape_need_[i].size(), "bucket layout must match the shard count");
+            std::vector<std::int64_t> need(shape_need_[i].size());
+            for (std::size_t b = 0; b < need.size(); ++b) {
+                need[b] = bucket_pinned[i][b] + shape_need_[i][b];
+            }
+            const std::vector<std::int64_t> holes(need.size(), 0);
+            std::vector<std::int64_t> scratch(need.size(), 0);
+            parents += ParentsNeededForBucketsAndPairs(need, holes, free_movers[i] + blocks_needed_[i], pair_need_[i],
+                                                       pool_.Packing(groups_[i].Id()), scratch);
+        }
+        return parents;
+    }
+
+    // The cache entry at `location`, expanded as the block-by-block pass
+    // takes it (expandVictimSet with blocks_alone): the entry alone, or under
+    // the write-back policy with everything the Device holds under its node;
+    // nullopt when no entry the index alone holds is there (a free slot, a
+    // block a table or a ticket holds), when a block under it is in use or
+    // kept, or when the entry itself is one this admission keeps -- a page,
+    // tail block or State checkpoint its probe hit, a restore's claim -- or
+    // a slot the retry reclaims as the request's own: the candidate pass
+    // never offers those (StartCandidates), so a compaction never clears
+    // them either.
+    std::optional<VictimSet> PlanBlockAlone(std::uint32_t group_id, CacheBlockLocation location) {
+        _assert(views_prepared_, "DenseLayoutParents prepares the planner's views before a slot is planned alone");
+        if (!groups_[group_id].Index().UnpinnedKeyAt(pool_, location) || protected_locations_.contains(location) ||
+            request_reclaim_locations_.contains(location)) {
+            return std::nullopt;
+        }
+        std::optional<ExpandedVictimSet> expanded =
+            expandVictimSet(eviction_plan_.Candidates().MakeCandidate(
+                                group_id, location, groups_[group_id].Index().MetadataFor(pool_, location)),
+                            /*blocks_alone=*/true, /*candidates_ran_out=*/true);
+        if (!expanded) {
+            return std::nullopt;
+        }
+        _assert(std::ranges::find(expanded->set.members, location, &VictimSet::Member::location) !=
+                    expanded->set.members.end(),
+                "a victim set holds the candidate it was chosen for");
+        return std::move(expanded->set);
+    }
+
+    // Whether `location` is one of the request's own slots the admission
+    // reclaims before it evicts (an expired window block, a released State
+    // input): the retry frees it, though PlanBlockAlone never takes it.
+    bool IsRequestReclaim(CacheBlockLocation location) const {
+        _assert(views_prepared_, "DenseLayoutParents prepares the planner's views before a slot is judged");
+        return request_reclaim_locations_.contains(location);
+    }
+
 private:
     using VictimCandidate = CacheEvictionCandidates::Candidate;
 
     bool fitWithEviction() {
         // Existing local holes plus empty parents are the zero-eviction
-        // capacity. Do not discard cache merely to make placement denser.
+        // capacity. Do not discard cache merely to make placement denser: a
+        // request's own scattered blocks are gathered by its compaction
+        // (CacheCoordinator::CompactLoneRequest) once it is alone and nothing
+        // else funds it, never here.
         if (eviction_plan_.Fits(shape_need_, blocks_needed_, pair_need_)) {
             return true;
         }
@@ -184,25 +255,15 @@ private:
             return false;
         }
         using NodeEntry = CacheCoordinator::NodeEntry;
-        // Whether a segment may take a Device entry: not in use, not a hit
-        // this admission keeps, not one of the request's own released slots.
-        const auto is_evictable = [&](const NodeEntry& entry) {
-            return !entry.in_use && !protected_locations_.contains(entry.location) &&
-                   !request_reclaim_locations_.contains(entry.location);
-        };
-        // The Device checkpoint boundaries at or under a node that no selected
-        // set takes whole: every one while candidates last, then those staying.
-        const auto num_staying_checkpoint_boundaries = [&](const BoundaryTree::Node& node) {
-            const auto it = leaving_checkpoint_boundary_counts_.find(&node);
-            return node.checkpoint_boundaries_in_subtree[BoundaryTree::kDevice] -
-                   (it == leaving_checkpoint_boundary_counts_.end() ? 0 : it->second);
-        };
         bool candidates_ran_out = false;
         std::size_t next_deferred_shared_page = 0;
         // Once the shared pages ran out as well: the candidates the segment
         // rules passed over, tried again block by block.
         bool blocks_alone = false;
         std::size_t next_passed_over = 0;
+        bool reclaim_selection_changed = false;
+        std::vector<VictimCandidate> retry_segments;
+        std::size_t next_retry_segment = 0;
         const bool fits = eviction_plan_.SelectUntilFits(shape_need_, blocks_needed_, pair_need_, [&] {
             while (true) {
                 std::optional<VictimCandidate> candidate = eviction_plan_.Next(request_reclaim_candidates_);
@@ -241,6 +302,19 @@ private:
                     }
                     candidate = deferred_shared_pages_[next_deferred_shared_page++];
                 }
+                if (!candidate && !blocks_alone && next_retry_segment == retry_segments.size() &&
+                    reclaim_selection_changed) {
+                    // A reclaim selected after a rejected segment can make that
+                    // segment evictable. Retry a fixed batch before block fallback;
+                    // another pass requires a newly selected reclaim block.
+                    reclaim_selection_changed = false;
+                    unevictable_locations_.clear();
+                    retry_segments = std::exchange(passed_over_, {});
+                    next_retry_segment = 0;
+                }
+                if (!candidate && next_retry_segment < retry_segments.size()) {
+                    candidate = retry_segments[next_retry_segment++];
+                }
                 if (!candidate && evicts_blocks_past_segments_ && next_passed_over < passed_over_.size()) {
                     blocks_alone = true;
                     candidate = passed_over_[next_passed_over++];
@@ -248,223 +322,13 @@ private:
                 if (!candidate) {
                     return false;
                 }
-                const std::uint32_t group_id = candidate->group_id;
+                std::optional<ExpandedVictimSet> expanded =
+                    expandVictimSet(*candidate, blocks_alone, candidates_ran_out);
+                if (!expanded) {
+                    continue;
+                }
+                auto& [set, num_taken_over_members, taken_over_set_index, segment_top] = *expanded;
                 const CacheBlockLocation location = candidate->location;
-                // Already leaving with an earlier set, or found unable to leave
-                // (passed over: tried again block by block).
-                if (set_member_by_location_.contains(location)) {
-                    continue;
-                }
-                if (!blocks_alone && unevictable_locations_.contains(location)) {
-                    passed_over_.push_back(*candidate);
-                    continue;
-                }
-                VictimSet set{.is_request_reclaim = request_reclaim_locations_.contains(location)};
-                // A segment that takes an earlier segment's lists over in place
-                // keeps them first (the first num_taken_over_members members, their
-                // set_member_by_location_ entries as they are).
-                std::size_t num_taken_over_members = 0;
-                std::optional<std::size_t> taken_over_set_index;
-                // The tree node a segment set starts at.
-                const BoundaryTree::Node* segment_top = nullptr;
-                const BoundaryTree::Node* candidate_node = nullptr;
-                if (evicts_segments_) {
-                    if (const std::optional<CacheKey> key = groups_[group_id].Index().KeyOf(pool_, location)) {
-                        candidate_node = boundary_tree_.Find(key->content_hash);
-                    }
-                }
-                const bool sliding =
-                    !groups_[group_id].Matcher().IsPrefixClosed() && !coordinator_.GroupIsState(group_id);
-                if (candidate_node == nullptr || (sliding && !set.is_request_reclaim)) {
-                    // Block by block; or a block with no tree node (never
-                    // published, or registered straight into an index); or a window
-                    // block, which only shortens the boundaries its prefix resumes
-                    // at.
-                    set.members.push_back(
-                        VictimSet::Member{.group_id = group_id, .location = location, .in_stranded_suffix = false});
-                } else if (set.is_request_reclaim) {
-                    // The request's released slots at this hash, and at a tail
-                    // the tail's other blocks, which their eviction takes along.
-                    for (const NodeEntry& entry : coordinator_.NodeEntries(pool_, *candidate_node)) {
-                        if (request_reclaim_locations_.contains(entry.location) ||
-                            (candidate_node->tail_tokens > 0 && is_evictable(entry))) {
-                            set.members.push_back(VictimSet::Member{
-                                .group_id = entry.group_id, .location = entry.location, .in_stranded_suffix = false});
-                        }
-                    }
-                } else if (blocks_alone ? coordinator_.GroupIsState(group_id)
-                                        : num_staying_checkpoint_boundaries(*candidate_node) >= 2) {
-                    // Deeper checkpoint boundaries still read this page. A nested
-                    // checkpoint leaves alone, every State group's at once; the
-                    // page leaves with the last checkpoint boundary under it, or is
-                    // tried again once the candidates run out. Block by block, every
-                    // checkpoint leaves so; at a tail its eviction takes the tail's
-                    // other unpinned blocks along (evictCachedBlock), uncounted here.
-                    if (!coordinator_.GroupIsState(group_id)) {
-                        (candidates_ran_out ? passed_over_ : deferred_shared_pages_).push_back(*candidate);
-                        continue;
-                    }
-                    bool evictable = true;
-                    for (const NodeEntry& entry : coordinator_.NodeEntries(pool_, *candidate_node)) {
-                        if (coordinator_.GroupIsState(entry.group_id)) {
-                            evictable = evictable && is_evictable(entry);
-                            set.members.push_back(VictimSet::Member{
-                                .group_id = entry.group_id, .location = entry.location, .in_stranded_suffix = false});
-                        }
-                    }
-                    if (!evictable) {
-                        for (const VictimSet::Member& member : set.members) {
-                            unevictable_locations_.insert(member.location);
-                        }
-                        continue;
-                    }
-                } else {
-                    // A segment: the one checkpoint boundary at or under this
-                    // boundary with the pages only it depends on -- the climb stops
-                    // below a page another checkpoint boundary shares, one in use
-                    // or a hit this admission keeps, or one the Device does not
-                    // hold -- and everything the Device holds under them, so no
-                    // Device page outlives its parent. The climb keeps the entries
-                    // of each node it passes, from the candidate's parent up. Block
-                    // by block, a page leaves with its boundary's blocks not in use
-                    // and everything under it, climbing nowhere.
-                    const BoundaryTree::Node* top = candidate_node;
-                    const std::vector<NodeEntry> candidate_entries = coordinator_.NodeEntries(pool_, *candidate_node);
-                    std::vector<std::pair<const BoundaryTree::Node*, std::vector<NodeEntry>>> climbed;
-                    if (!blocks_alone && num_staying_checkpoint_boundaries(*candidate_node) == 1) {
-                        while (top->parent != nullptr && top->parent->OnDevice() &&
-                               num_staying_checkpoint_boundaries(*top->parent) == 1) {
-                            std::vector<NodeEntry> entries = coordinator_.NodeEntries(pool_, *top->parent);
-                            if (!std::ranges::all_of(entries, is_evictable)) {
-                                break;
-                            }
-                            top = top->parent;
-                            climbed.emplace_back(top, std::move(entries));
-                        }
-                    }
-                    // Post-order: a node after the nodes under it, its own entries
-                    // in NodeEntries order. It completes the climbed nodes in climb
-                    // order. A child the Device does not hold has nothing on the
-                    // Device under it when the model has a prefix-closed group
-                    // (eviction keeps the Device's coverage closed from the root),
-                    // so the walk skips the Host's subtrees; without one, what such
-                    // a child keeps under it on the Device needs none of these pages
-                    // either. A page a restore republished below such a child stays
-                    // and leaves later as a segment of its own.
-                    struct Frame {
-                        const BoundaryTree::Node* node;
-                        const BoundaryTree::Node* next_child;
-                        bool in_stranded_suffix;
-                    };
-                    std::vector<Frame> stack{
-                        Frame{.node = top, .next_child = top->first_child, .in_stranded_suffix = false}};
-                    std::size_t next_climbed = 0;
-                    bool evictable = true;
-                    // A child an earlier segment starts at: that segment holds the
-                    // child's whole Device subtree in this order already, so it
-                    // goes where the walk reaches it, after the blocks walked so
-                    // far, and is not walked again (a chain reclaimed page by page
-                    // from its suffix would otherwise be walked once per page).
-                    std::vector<std::pair<std::size_t, const BoundaryTree::Node*>> spliced;
-                    while (!stack.empty()) {
-                        Frame& frame = stack.back();
-                        if (const BoundaryTree::Node* child = frame.next_child) {
-                            frame.next_child = child->next_sibling;
-                            if (segment_at_.contains(child)) {
-                                spliced.emplace_back(set.members.size(), child);
-                            } else if (child->OnDevice()) {
-                                const bool in_stranded_suffix =
-                                    frame.in_stranded_suffix || frame.node == candidate_node;
-                                stack.push_back(Frame{.node = child,
-                                                      .next_child = child->first_child,
-                                                      .in_stranded_suffix = in_stranded_suffix});
-                            }
-                            continue;
-                        }
-                        const bool climbed_node =
-                            next_climbed < climbed.size() && climbed[next_climbed].first == frame.node;
-                        std::vector<NodeEntry> subtree_entries;
-                        std::span<const NodeEntry> entries;
-                        if (climbed_node) {
-                            entries = climbed[next_climbed++].second;
-                        } else if (frame.node == candidate_node) {
-                            entries = candidate_entries;
-                        } else {
-                            subtree_entries = coordinator_.NodeEntries(pool_, *frame.node);
-                            entries = subtree_entries;
-                        }
-                        for (const NodeEntry& entry : entries) {
-                            if (blocks_alone && frame.node == candidate_node && !is_evictable(entry)) {
-                                continue;
-                            }
-                            if (!is_evictable(entry)) {
-                                evictable = false;
-                                break;
-                            }
-                            set.members.push_back(VictimSet::Member{.group_id = entry.group_id,
-                                                                    .location = entry.location,
-                                                                    .in_stranded_suffix = frame.in_stranded_suffix});
-                        }
-                        if (!evictable) {
-                            break;
-                        }
-                        stack.pop_back();
-                    }
-                    if (!evictable) {
-                        if (!blocks_alone) {
-                            passed_over_.push_back(*candidate);
-                        }
-                        // One unavailable member rejects this whole set; there is
-                        // no need to inspect the rest of its subtree. Remember
-                        // only candidates that would expand to the same set. A
-                        // descendant or sibling can still leave independently.
-                        const auto remember_same_set = [&](const BoundaryTree::Node& node,
-                                                           std::span<const NodeEntry> entries) {
-                            for (const NodeEntry& entry : entries) {
-                                if (blocks_alone && &node == candidate_node && !is_evictable(entry)) {
-                                    continue;
-                                }
-                                if (!request_reclaim_locations_.contains(entry.location) &&
-                                    (groups_[entry.group_id].Matcher().IsPrefixClosed() ||
-                                     coordinator_.GroupIsState(entry.group_id))) {
-                                    unevictable_locations_.insert(entry.location);
-                                }
-                            }
-                        };
-                        remember_same_set(*candidate_node, candidate_entries);
-                        for (const auto& [node, entries] : climbed) {
-                            remember_same_set(*node, entries);
-                        }
-                        continue;
-                    }
-                    if (!spliced.empty()) {
-                        VictimSet walked = std::exchange(set, VictimSet{});
-                        std::size_t next_walked = 0;
-                        for (const auto& [walked_before, child] : spliced) {
-                            set.members.insert(set.members.end(), walked.members.begin() + next_walked,
-                                               walked.members.begin() + walked_before);
-                            next_walked = walked_before;
-                            const auto it = segment_at_.find(child);
-                            VictimSet& earlier = victims_[it->second];
-                            _assert(!earlier.members.empty(), "a segment set still starts at its top");
-                            if (set.members.empty()) {
-                                // First in the order: its lists become this set's.
-                                set = std::exchange(earlier, VictimSet{});
-                                taken_over_set_index = it->second;
-                                num_taken_over_members = set.members.size();
-                            } else {
-                                // Moved in below like any other earlier set it holds.
-                                set.members.insert(set.members.end(), earlier.members.begin(), earlier.members.end());
-                            }
-                            segment_at_.erase(it);
-                        }
-                        set.members.insert(set.members.end(), walked.members.begin() + next_walked,
-                                           walked.members.end());
-                    }
-                    // A page leaving block by block may leave blocks in use at its
-                    // boundary: no later walk takes it for that node's subtree.
-                    segment_top = blocks_alone ? nullptr : top;
-                }
                 _assert(
                     std::ranges::find(set.members.begin() + static_cast<std::ptrdiff_t>(num_taken_over_members),
                                       set.members.end(), location, &VictimSet::Member::location) != set.members.end(),
@@ -481,6 +345,7 @@ private:
                     if (it == set_member_by_location_.end()) {
                         eviction_plan_.Remove(member.group_id, member.location);
                         set_member_by_location_.emplace(member.location, std::pair{set_index, j});
+                        reclaim_selection_changed = reclaim_selection_changed || member.is_request_reclaim;
                         continue;
                     }
                     // The set holding the block now, through the sets that took
@@ -490,7 +355,7 @@ private:
                         earlier = taken_by_[earlier] = taken_by_[taken_by_[earlier]];
                     }
                     const std::size_t position = it->second.second;
-                    member.in_stranded_suffix = victims_[earlier].members[position].in_stranded_suffix;
+                    member = victims_[earlier].members[position];
                     if (std::ranges::find(absorbed, earlier) == absorbed.end()) {
                         absorbed.push_back(earlier);
                     }
@@ -517,6 +382,265 @@ private:
         if (!fits) return false;
         eviction_plan_.Minimize(victims_, shape_need_, blocks_needed_, pair_need_);
         return true;
+    }
+
+    // What expandVictimSet returns beside the set: how many of its first
+    // members a segment took over in place from an earlier set (their
+    // set_member_by_location_ entries as they are) and that set's index, and
+    // the tree node a segment set starts at (nullptr block by block).
+    struct ExpandedVictimSet {
+        VictimSet set;
+        std::size_t num_taken_over_members{0};
+        std::optional<std::size_t> taken_over_set_index;
+        const BoundaryTree::Node* segment_top{nullptr};
+    };
+    // One candidate expanded to the set it leaves with -- as a segment, block
+    // by block, or as the request's own reclaim -- or nullopt when it is
+    // skipped this pass (a block in the set is in use or kept; the shared
+    // page is deferred). Pure apart from the pass's own memo lists
+    // (passed_over_, deferred_shared_pages_, unevictable_locations_) and,
+    // for a segment, the earlier sets it takes over in place.
+    std::optional<ExpandedVictimSet> expandVictimSet(const VictimCandidate& candidate, bool blocks_alone,
+                                                     bool candidates_ran_out) {
+        using NodeEntry = CacheCoordinator::NodeEntry;
+        // A selected request reclaim still has its table reference until Admit
+        // executes. A later segment may absorb that set; the merge in
+        // fitWithEviction keeps its capacity counted once and Minimize must
+        // restore them together.
+        const auto is_evictable = [&](const NodeEntry& entry) {
+            return set_member_by_location_.contains(entry.location) ||
+                   (!entry.in_use && !protected_locations_.contains(entry.location) &&
+                    !request_reclaim_locations_.contains(entry.location));
+        };
+        // The Device checkpoint boundaries at or under a node that no selected
+        // set takes whole: every one while candidates last, then those staying.
+        const auto num_staying_checkpoint_boundaries = [&](const BoundaryTree::Node& node) {
+            const auto it = leaving_checkpoint_boundary_counts_.find(&node);
+            return node.checkpoint_boundaries_in_subtree[BoundaryTree::kDevice] -
+                   (it == leaving_checkpoint_boundary_counts_.end() ? 0 : it->second);
+        };
+        const std::uint32_t group_id = candidate.group_id;
+        const CacheBlockLocation location = candidate.location;
+        // Already leaving with an earlier set, or found unable to leave
+        // (passed over: tried again block by block).
+        if (set_member_by_location_.contains(location)) {
+            return std::nullopt;
+        }
+        if (!blocks_alone && unevictable_locations_.contains(location)) {
+            passed_over_.push_back(candidate);
+            return std::nullopt;
+        }
+        const bool is_request_reclaim = request_reclaim_locations_.contains(location);
+        VictimSet set;
+        // A segment that takes an earlier segment's lists over in place
+        // keeps them first (the first num_taken_over_members members, their
+        // set_member_by_location_ entries as they are).
+        std::size_t num_taken_over_members = 0;
+        std::optional<std::size_t> taken_over_set_index;
+        // The tree node a segment set starts at.
+        const BoundaryTree::Node* segment_top = nullptr;
+        const BoundaryTree::Node* candidate_node = nullptr;
+        if (evicts_segments_) {
+            if (const std::optional<CacheKey> key = groups_[group_id].Index().KeyOf(pool_, location)) {
+                candidate_node = boundary_tree_.Find(key->content_hash);
+            }
+        }
+        const bool sliding = !groups_[group_id].Matcher().IsPrefixClosed() && !coordinator_.GroupIsState(group_id);
+        if (candidate_node == nullptr || (sliding && !is_request_reclaim)) {
+            // Block by block; or a block with no tree node (never
+            // published, or registered straight into an index); or a window
+            // block, which only shortens the boundaries its prefix resumes
+            // at.
+            set.members.push_back(VictimSet::Member{.group_id = group_id,
+                                                    .location = location,
+                                                    .in_stranded_suffix = false,
+                                                    .is_request_reclaim = is_request_reclaim});
+        } else if (is_request_reclaim) {
+            // The request's released slots at this hash, and at a tail
+            // the tail's other blocks, which their eviction takes along.
+            for (const NodeEntry& entry : coordinator_.NodeEntries(pool_, *candidate_node)) {
+                if (request_reclaim_locations_.contains(entry.location) ||
+                    (candidate_node->tail_tokens > 0 && is_evictable(entry))) {
+                    set.members.push_back(VictimSet::Member{.group_id = entry.group_id,
+                                                            .location = entry.location,
+                                                            .in_stranded_suffix = false,
+                                                            .is_request_reclaim = true});
+                }
+            }
+        } else if (blocks_alone ? coordinator_.GroupIsState(group_id)
+                                : num_staying_checkpoint_boundaries(*candidate_node) >= 2) {
+            // Deeper checkpoint boundaries still read this page. A nested
+            // checkpoint leaves alone, every State group's at once; the
+            // page leaves with the last checkpoint boundary under it, or is
+            // tried again once the candidates run out. Block by block, every
+            // checkpoint leaves so; at a tail its eviction takes the tail's
+            // other unpinned blocks along (evictCachedBlock), uncounted here.
+            if (!coordinator_.GroupIsState(group_id)) {
+                (candidates_ran_out ? passed_over_ : deferred_shared_pages_).push_back(candidate);
+                return std::nullopt;
+            }
+            bool evictable = true;
+            for (const NodeEntry& entry : coordinator_.NodeEntries(pool_, *candidate_node)) {
+                if (coordinator_.GroupIsState(entry.group_id)) {
+                    evictable = evictable && is_evictable(entry);
+                    set.members.push_back(VictimSet::Member{.group_id = entry.group_id,
+                                                            .location = entry.location,
+                                                            .in_stranded_suffix = false,
+                                                            .is_request_reclaim = false});
+                }
+            }
+            if (!evictable) {
+                for (const VictimSet::Member& member : set.members) {
+                    unevictable_locations_.insert(member.location);
+                }
+                return std::nullopt;
+            }
+        } else {
+            // A segment: the one checkpoint boundary at or under this
+            // boundary with the pages only it depends on -- the climb stops
+            // below a page another checkpoint boundary shares, one in use
+            // or a hit this admission keeps, or one the Device does not
+            // hold -- and everything the Device holds under them, so no
+            // Device page outlives its parent. The climb keeps the entries
+            // of each node it passes, from the candidate's parent up. Block
+            // by block, a page leaves with its boundary's blocks not in use
+            // and everything under it, climbing nowhere.
+            const BoundaryTree::Node* top = candidate_node;
+            const std::vector<NodeEntry> candidate_entries = coordinator_.NodeEntries(pool_, *candidate_node);
+            std::vector<std::pair<const BoundaryTree::Node*, std::vector<NodeEntry>>> climbed;
+            if (!blocks_alone && num_staying_checkpoint_boundaries(*candidate_node) == 1) {
+                while (top->parent != nullptr && top->parent->OnDevice() &&
+                       num_staying_checkpoint_boundaries(*top->parent) == 1) {
+                    std::vector<NodeEntry> entries = coordinator_.NodeEntries(pool_, *top->parent);
+                    if (!std::ranges::all_of(entries, is_evictable)) {
+                        break;
+                    }
+                    top = top->parent;
+                    climbed.emplace_back(top, std::move(entries));
+                }
+            }
+            // Post-order: a node after the nodes under it, its own entries
+            // in NodeEntries order. It completes the climbed nodes in climb
+            // order. A child the Device does not hold has nothing on the
+            // Device under it when the model has a prefix-closed group
+            // (eviction keeps the Device's coverage closed from the root),
+            // so the walk skips the Host's subtrees; without one, what such
+            // a child keeps under it on the Device needs none of these pages
+            // either. A page a restore republished below such a child stays
+            // and leaves later as a segment of its own.
+            struct Frame {
+                const BoundaryTree::Node* node;
+                const BoundaryTree::Node* next_child;
+                bool in_stranded_suffix;
+            };
+            std::vector<Frame> stack{Frame{.node = top, .next_child = top->first_child, .in_stranded_suffix = false}};
+            std::size_t next_climbed = 0;
+            bool evictable = true;
+            // A child an earlier segment starts at: that segment holds the
+            // child's whole Device subtree in this order already, so it
+            // goes where the walk reaches it, after the blocks walked so
+            // far, and is not walked again (a chain reclaimed page by page
+            // from its suffix would otherwise be walked once per page).
+            std::vector<std::pair<std::size_t, const BoundaryTree::Node*>> spliced;
+            while (!stack.empty()) {
+                Frame& frame = stack.back();
+                if (const BoundaryTree::Node* child = frame.next_child) {
+                    frame.next_child = child->next_sibling;
+                    if (segment_at_.contains(child)) {
+                        spliced.emplace_back(set.members.size(), child);
+                    } else if (child->OnDevice()) {
+                        const bool in_stranded_suffix = frame.in_stranded_suffix || frame.node == candidate_node;
+                        stack.push_back(Frame{
+                            .node = child, .next_child = child->first_child, .in_stranded_suffix = in_stranded_suffix});
+                    }
+                    continue;
+                }
+                const bool climbed_node = next_climbed < climbed.size() && climbed[next_climbed].first == frame.node;
+                std::vector<NodeEntry> subtree_entries;
+                std::span<const NodeEntry> entries;
+                if (climbed_node) {
+                    entries = climbed[next_climbed++].second;
+                } else if (frame.node == candidate_node) {
+                    entries = candidate_entries;
+                } else {
+                    subtree_entries = coordinator_.NodeEntries(pool_, *frame.node);
+                    entries = subtree_entries;
+                }
+                for (const NodeEntry& entry : entries) {
+                    if (blocks_alone && frame.node == candidate_node && !is_evictable(entry)) {
+                        continue;
+                    }
+                    if (!is_evictable(entry)) {
+                        evictable = false;
+                        break;
+                    }
+                    set.members.push_back(VictimSet::Member{.group_id = entry.group_id,
+                                                            .location = entry.location,
+                                                            .in_stranded_suffix = frame.in_stranded_suffix,
+                                                            .is_request_reclaim = false});
+                }
+                if (!evictable) {
+                    break;
+                }
+                stack.pop_back();
+            }
+            if (!evictable) {
+                if (!blocks_alone) {
+                    passed_over_.push_back(candidate);
+                }
+                // One unavailable member rejects this whole set; there is
+                // no need to inspect the rest of its subtree. Remember
+                // only candidates that would expand to the same set. A
+                // descendant or sibling can still leave independently.
+                const auto remember_same_set = [&](const BoundaryTree::Node& node, std::span<const NodeEntry> entries) {
+                    for (const NodeEntry& entry : entries) {
+                        if (blocks_alone && &node == candidate_node && !is_evictable(entry)) {
+                            continue;
+                        }
+                        if (!request_reclaim_locations_.contains(entry.location) &&
+                            (groups_[entry.group_id].Matcher().IsPrefixClosed() ||
+                             coordinator_.GroupIsState(entry.group_id))) {
+                            unevictable_locations_.insert(entry.location);
+                        }
+                    }
+                };
+                remember_same_set(*candidate_node, candidate_entries);
+                for (const auto& [node, entries] : climbed) {
+                    remember_same_set(*node, entries);
+                }
+                return std::nullopt;
+            }
+            if (!spliced.empty()) {
+                VictimSet walked = std::exchange(set, VictimSet{});
+                std::size_t next_walked = 0;
+                for (const auto& [walked_before, child] : spliced) {
+                    set.members.insert(set.members.end(), walked.members.begin() + next_walked,
+                                       walked.members.begin() + walked_before);
+                    next_walked = walked_before;
+                    const auto it = segment_at_.find(child);
+                    VictimSet& earlier = victims_[it->second];
+                    _assert(!earlier.members.empty(), "a segment set still starts at its top");
+                    if (set.members.empty()) {
+                        // First in the order: its lists become this set's.
+                        set = std::exchange(earlier, VictimSet{});
+                        taken_over_set_index = it->second;
+                        num_taken_over_members = set.members.size();
+                    } else {
+                        // Moved in below like any other earlier set it holds.
+                        set.members.insert(set.members.end(), earlier.members.begin(), earlier.members.end());
+                    }
+                    segment_at_.erase(it);
+                }
+                set.members.insert(set.members.end(), walked.members.begin() + next_walked, walked.members.end());
+            }
+            // A page leaving block by block may leave blocks in use at its
+            // boundary: no later walk takes it for that node's subtree.
+            segment_top = blocks_alone ? nullptr : top;
+        }
+        return ExpandedVictimSet{.set = std::move(set),
+                                 .num_taken_over_members = num_taken_over_members,
+                                 .taken_over_set_index = taken_over_set_index,
+                                 .segment_top = segment_top};
     }
 
     void initializeCapacity() {
@@ -954,6 +1078,10 @@ private:
     // in a known bucket -- a Device tail's copies, a Host tail's loads --
     // with that bucket, for a copy-in slot among them (reserveCopyIns).
     std::vector<std::vector<CopyInReservation>> prefix_tail_buckets_;
+    // Whether the capacity and candidate views Plan() collects before it
+    // selects are prepared for a compaction's calls: DenseLayoutParents
+    // prepares them once, PlanBlockAlone requires them.
+    bool views_prepared_{false};
     std::vector<VictimCandidate> request_reclaim_candidates_;
     std::pmr::unordered_set<CacheBlockLocation, CacheBlockLocationHash> protected_locations_{&scratch_};
     std::pmr::unordered_set<CacheBlockLocation, CacheBlockLocationHash> request_reclaim_locations_{&scratch_};
@@ -967,16 +1095,16 @@ private:
     // The selected segments by the tree node each starts at: every Device block
     // of that node's subtree, in post-order.
     std::pmr::unordered_map<const BoundaryTree::Node*, std::size_t> segment_at_{&scratch_};
-    // Blocks that, tried as candidates, would expand to a set found unable
-    // to leave this pass (a member in use or kept): skipped at once.
+    // Blocks that expand to a set found unable to leave under the current
+    // reclaim selection: skipped until a retry invalidates that decision.
     std::pmr::unordered_set<CacheBlockLocation, CacheBlockLocationHash> unevictable_locations_{&scratch_};
     // Pages two or more Device checkpoint boundaries depend on, passed over
     // while candidates last, oldest first: tried again once they run out.
     std::vector<VictimCandidate> deferred_shared_pages_;
     // Candidates no segment rule let leave (a set member in use or kept, or a
     // shared page still shared once the candidates ran out), in the order
-    // they were passed over: tried again block by block once the shared pages
-    // run out too.
+    // they were passed over: retried as segments after reclaim selection
+    // changes, then block by block if the admission permits it.
     std::vector<VictimCandidate> passed_over_;
     // Per tree node: how many checkpoint boundaries at or under it have every
     // Device checkpoint in a selected set, counted once the candidates run out.
@@ -1066,6 +1194,37 @@ PairedBlocks acquireCopyIns(BlockPool& pool, std::uint32_t group_id, const Group
 
 }  // namespace
 
+std::vector<GroupDemand> CacheCoordinator::replayedDemands(const PrefixProbe& prefix,
+                                                           std::span<const GroupDemand> demands) const {
+    // A replayable group claims no hit pages, so before a hit its table is
+    // empty: materialize it as a sparse private suffix from the replay
+    // window's first token -- the slots below stay null holes, as
+    // absolute-slot tables require -- and the model regenerates the rows.
+    // Closed groups keep their dense demand beyond the hit. A demand that
+    // already names a sparse suffix is a remote landing (the peer's retained
+    // tail) and is left alone: nothing is regenerated here.
+    std::vector<GroupDemand> replayed;
+    const std::int32_t hit_tokens = std::max(prefix.device.num_common_tokens, prefix.host.num_common_tokens);
+    if (replay_window_tokens_ > 0 && hit_tokens > 0) {
+        const std::int32_t replay_begin = hit_tokens - ReplayTokens(hit_tokens);
+        replayed.assign(demands.begin(), demands.end());
+        for (std::size_t i = 0; i < replayed.size(); ++i) {
+            const auto* dense = std::get_if<DenseGrowth>(&replayed[i].extent);
+            if (!GroupIsReplayable(static_cast<std::int32_t>(i)) || dense == nullptr) {
+                continue;
+            }
+            _assert(replayed[i].table->NumBlocks() == 0, "a replayable group holds no hit pages at admission");
+            // The dense growth was relative to an empty table, so the hit plus
+            // the growth is the absolute extent.
+            replayed[i].extent = SparseSuffix{
+                .extent_tokens = hit_tokens + dense->num_tokens,
+                .first_block = replay_begin / geometry_[i].BlockGranularity(),
+            };
+        }
+    }
+    return replayed;
+}
+
 bool CacheCoordinator::writableImageSlot(std::size_t group_index, const ImageTable& shape,
                                          std::int32_t slot_index) const {
     if (GroupIsState(group_index)) {
@@ -1104,31 +1263,8 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
     _assert(!copy_in_point || copy_in_point->tokens > progress.num_computed_tokens.value_or(0),
             "a copy-in point lies past the computed frontier");
 
-    // A replayable group claims no hit pages, so before a hit its table is
-    // empty: materialize it as a sparse private suffix from the replay
-    // window's first token -- the slots below stay null holes, as
-    // absolute-slot tables require -- and the model regenerates the rows.
-    // Closed groups keep their dense demand beyond the hit. A demand that
-    // already names a sparse suffix is a remote landing (the peer's retained
-    // tail) and is left alone: nothing is regenerated here.
-    std::vector<GroupDemand> replayed;
-    const std::int32_t hit_tokens = std::max(prefix.device.num_common_tokens, prefix.host.num_common_tokens);
-    if (replay_window_tokens_ > 0 && hit_tokens > 0) {
-        const std::int32_t replay_begin = hit_tokens - ReplayTokens(hit_tokens);
-        replayed.assign(demands.begin(), demands.end());
-        for (std::size_t i = 0; i < replayed.size(); ++i) {
-            const auto* dense = std::get_if<DenseGrowth>(&replayed[i].extent);
-            if (!GroupIsReplayable(static_cast<std::int32_t>(i)) || dense == nullptr) {
-                continue;
-            }
-            _assert(replayed[i].table->NumBlocks() == 0, "a replayable group holds no hit pages at admission");
-            // The dense growth was relative to an empty table, so the hit plus
-            // the growth is the absolute extent.
-            replayed[i].extent = SparseSuffix{
-                .extent_tokens = hit_tokens + dense->num_tokens,
-                .first_block = replay_begin / geometry_[i].BlockGranularity(),
-            };
-        }
+    const std::vector<GroupDemand> replayed = replayedDemands(prefix, demands);
+    if (!replayed.empty()) {
         demands = replayed;
     }
 
@@ -1227,7 +1363,8 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
     const auto privatize_slot = [&](std::size_t i, BlockTable& table, std::int32_t slot,
                                     std::int32_t available_tokens) {
         GroupAllocator& allocator = groups_[i].Allocator();
-        const CacheBlockRef replaced = allocator.SwapInFreshBlock(pool_, table, slot, available_tokens);
+        const CacheBlockRef replaced =
+            allocator.SwapInFreshBlock(pool_, table, slot, available_tokens, /*destination=*/std::nullopt);
         const std::int32_t destination = allocator.ResolveCacheBlockId(*table.Blocks()[static_cast<std::size_t>(slot)]);
         if (replaced) {
             result.pages_to_copy[i].emplace_back(allocator.ResolveCacheBlockId(*replaced), destination);
@@ -1246,11 +1383,11 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
     // retry the blocks whose request reference has just been released.
     for (const VictimSet& set : plan.victims) {
         EvictedSegment* segment = write_back_evictions_ ? &evicted_segments_.emplace_back() : nullptr;
-        for (const auto& [group_id, location, in_stranded_suffix] : set.members) {
+        for (const auto& [group_id, location, in_stranded_suffix, is_request_reclaim] : set.members) {
             DeviceEvictionCounts DeviceEvictionStats::*reason =
-                set.is_request_reclaim ? &DeviceEvictionStats::request_reclaim
-                : in_stranded_suffix   ? &DeviceEvictionStats::stranded_suffix
-                                       : &DeviceEvictionStats::admission;
+                is_request_reclaim   ? &DeviceEvictionStats::request_reclaim
+                : in_stranded_suffix ? &DeviceEvictionStats::stranded_suffix
+                                     : &DeviceEvictionStats::admission;
             if (!evictCachedBlock(group_id, location, reason, segment)) {
                 prospective_victims.emplace_back(group_id, location, reason, segment);
             }
@@ -1445,7 +1582,8 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
 std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Restore(const RetractionImage& image,
                                                                            std::span<const GroupDemand> demands,
                                                                            std::optional<CopyInPoint> copy_in_point,
-                                                                           std::uint64_t request_access_epoch) {
+                                                                           std::uint64_t request_access_epoch,
+                                                                           bool drop_claims_if_unfit) {
     _assert(demands.size() == groups_.size(), "demands/groups size mismatch");
     _assert(image.tables.size() == groups_.size(), "image/groups size mismatch");
     _assert(request_access_epoch > 0 && request_access_epoch <= next_access_epoch_,
@@ -1471,8 +1609,9 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Restore(const
     };
     // A Host L2 slot whose key still has a Device-cached canonical block is
     // claimed instead of copied: the same bytes by construction (the victim's
-    // own block, cache-only since it was freed, or the canonical block its
-    // table already pointed at). Those blocks are protected from the planner's
+    // own block, cache-only since it was freed, the canonical block its table
+    // already pointed at, or any block published under the key since, wherever
+    // it sits). Those blocks are protected from the planner's
     // eviction like prefix hits; every other slot is a bucket-constrained
     // fresh block.
     // A published slot the resumed request will never write again is claimed
@@ -1482,10 +1621,13 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Restore(const
     const auto claimable = [&](std::size_t i, const ImageTable& shape, const ImageSlot& slot) {
         return slot.InHostCache() && !writableImageSlot(i, shape, slot.slot_index);
     };
-    // Under segment eviction the claims can pin the only evictable cache
-    // (docs/design/cache-concepts.md, AdmissionPlanner): when a plan that
-    // claims fails, plan once more claiming nothing; every slot is then a fresh
-    // copy, an L2 slot republished at its ACK.
+    // When a plan that claims fails, plan once more claiming nothing; every
+    // slot is then a fresh copy, an L2 slot republished at its ACK
+    // (docs/design/cache-concepts.md, AdmissionPlanner). Under segment
+    // eviction the claims can pin the only evictable cache; with
+    // drop_claims_if_unfit (no other request holds pages), claimed blocks one
+    // per parent beside cached pages can bind more parents than a dense
+    // layout of the image needs, and no release will come.
     bool claim_cached_slots = true;
     std::optional<AdmissionPlan> candidate;
     for (const bool claim : {true, false}) {
@@ -1517,7 +1659,7 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Restore(const
             /*num_computed_tokens=*/std::nullopt,
             copy_in_point ? std::optional<std::int32_t>{copy_in_point->tokens} : std::nullopt, shapes,
             protected_locations, boundary_tree_, write_back_evictions_, /*evicts_blocks_past_segments=*/false);
-        if (candidate || protected_locations.empty() || !write_back_evictions_) {
+        if (candidate || protected_locations.empty() || !(write_back_evictions_ || drop_claims_if_unfit)) {
             break;
         }
     }
@@ -1551,9 +1693,9 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Restore(const
     // write-back policy each set is recorded whole as one segment for this
     // plan's drain, as Admit does.
     for (const VictimSet& set : candidate->victims) {
-        _assert(!set.is_request_reclaim, "a restore rebuilds empty tables and reclaims nothing of its own");
         EvictedSegment* segment = write_back_evictions_ ? &evicted_segments_.emplace_back() : nullptr;
         for (const VictimSet::Member& member : set.members) {
+            _assert(!member.is_request_reclaim, "a restore rebuilds empty tables and reclaims nothing of its own");
             if (!evictCachedBlock(member.group_id, member.location, &DeviceEvictionStats::restore, segment)) {
                 FatalCheck(!pool_.IsOccupied(member.location), "restore victim changed before acquisition");
             }
@@ -1624,6 +1766,470 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Restore(const
             result.new_page_ids[i].push_back(allocator.ResolveCacheBlockId(*blocks[static_cast<std::size_t>(block)]));
         }
     }
+    return result;
+}
+
+std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::CompactLoneRequest(
+    PrefixProbe&& prefix, std::span<const GroupDemand> demands, const RequestProgress& progress,
+    std::span<std::vector<CacheBlockRef>> copy_in_blocks, std::optional<CopyInPoint> copy_in_point) {
+    _assert(demands.size() == groups_.size(), "demands/groups size mismatch");
+    validateProgress(progress);
+    _assert(copy_in_blocks.empty() || copy_in_blocks.size() == groups_.size(),
+            "copy-in blocks are held per cache group");
+    _assert(copy_in_blocks.empty() || copy_in_point || progress.num_computed_tokens,
+            "held copy-in blocks serve the point an admission reserves for or the step publishes");
+    const std::vector<GroupDemand> replayed = replayedDemands(prefix, demands);
+    if (!replayed.empty()) {
+        demands = replayed;
+    }
+    const std::optional<std::int32_t> reserve_point =
+        copy_in_point ? std::optional<std::int32_t>{copy_in_point->tokens} : std::nullopt;
+    // Whether the retry admits now: Admit's plan.
+    const auto admission_fits = [&] {
+        return planAdmission(*this, groups_, geometry_, prefix_granularity_, pool_, host_pool_, PrefixProbe{prefix},
+                             demands, progress.num_computed_tokens, reserve_point, /*shapes=*/{}, /*claimed=*/{},
+                             boundary_tree_, write_back_evictions_, /*evicts_blocks_past_segments=*/true)
+            .has_value();
+    };
+
+    // The blocks of the request in each packed, token-spanned group -- the
+    // table's, and the copy-in blocks it holds beside them -- and at a first
+    // admission the Device pages and tail blocks its probe hits, by what may
+    // happen to them. An unwritten block moves anywhere and is zeroed, unless
+    // a copy-in block is held for its slot: the two share a bucket (the
+    // copy-in's contract), so each re-places within it. A written block moves
+    // by a same-bucket copy, a published one with its entry; a hit page or
+    // tail block moves like a published block. Fixed: a page this admission
+    // publishes (the runtime stores it before the plan's copies land), a
+    // block another holder pins (a store ticket, a retained checkpoint,
+    // another table), a hit another request pins. Slots the retry reclaims
+    // first (a released State input, expired window blocks) are not the
+    // request's footprint and are left out.
+    struct Member {
+        enum class Kind : std::uint8_t { kUnwritten, kCopyIn, kWritten, kPublished, kHit, kTail, kFixed };
+        Kind kind;
+        // Whether the block keeps its bucket: every one but a free unwritten
+        // block.
+        bool in_bucket;
+        CacheBlockLocation location;
+        std::int32_t slot;  // the table slot (a copy-in block: the slot it serves), -1 for a probe block
+        std::size_t hit;    // the probe block's pin in hit_pins (kHit, kTail; 0 otherwise)
+    };
+    // Every Device block the probe hits is held from here to the return --
+    // the pages and tail blocks of every group, compacted or not, and on the
+    // D role each State group's checkpoint at the prompt end: clearing a
+    // destination slot evicts what its entry takes along (a tail's
+    // companions, a page's checkpoints), and an unheld hit taken so would be
+    // gone when the retry acquires it. The slot itself may be a block the
+    // probe leaves a hole (the D role's partial tail block, the prompt's last
+    // page past its bound).
+    std::vector<CacheBlockRef> hit_pins;
+    std::vector<std::vector<Member>> members(groups_.size());
+    std::vector<std::vector<std::int64_t>> bucket_pinned(groups_.size());
+    std::vector<std::int64_t> free_movers(groups_.size(), 0);
+    // Per group, the slots the held copy-in blocks serve.
+    std::vector<BlockRange> copy_in_slots(groups_.size());
+    for (std::size_t i = 0; i < groups_.size(); ++i) {
+        const GroupAllocator& allocator = groups_[i].Allocator();
+        const PrefixCacheIndex& index = groups_[i].Index();
+        const BlockTable& table = *demands[i].table;
+        bucket_pinned[i].assign(static_cast<std::size_t>(allocator.ShardCount()), 0);
+        const bool compacts = geometry_[i].HasTokenSpan() && pool_.Packing(groups_[i].Id()) > 1;
+        // The copy-in blocks the request holds, each with the block it serves
+        // (Admit reserves them so): that block keeps its bucket as well.
+        std::vector<bool> copy_in_beside(static_cast<std::size_t>(table.NumBlocks()), false);
+        if (!copy_in_blocks.empty()) {
+            copy_in_slots[i] = CopyInSlots(i, copy_in_point ? copy_in_point->tokens : *progress.num_computed_tokens);
+            _assert(copy_in_blocks[i].size() ==
+                        static_cast<std::size_t>(copy_in_slots[i].past_end - copy_in_slots[i].first),
+                    "the request holds one copy-in block per copy-in slot");
+            for (std::size_t j = 0; j < copy_in_blocks[i].size(); ++j) {
+                const CacheBlockRef& block = copy_in_blocks[i][j];
+                if (!block) {
+                    continue;
+                }
+                const std::int32_t slot = copy_in_slots[i].first + static_cast<std::int32_t>(j);
+                _assert(slot < table.NumBlocks(), "a copy-in block is held with the block it serves");
+                copy_in_beside[static_cast<std::size_t>(slot)] = true;
+                ++bucket_pinned[i][static_cast<std::size_t>(allocator.BucketOf(block->Location()))];
+                if (compacts) {
+                    members[i].push_back(Member{.kind = Member::Kind::kCopyIn,
+                                                .in_bucket = true,
+                                                .location = block->Location(),
+                                                .slot = slot,
+                                                .hit = 0});
+                }
+            }
+        }
+        std::int32_t first_slot = table.ReclaimedPrefixBlocks();
+        if (GroupIsState(i)) {
+            first_slot = std::get<StateStep>(demands[i].extent).kind == StateStep::Kind::kKeep ? 0 : 1;
+        } else if (progress.num_computed_tokens) {
+            first_slot =
+                std::max(first_slot, geometry_[i].ExpiredBlocksAt(groups_[i].Spec(), *progress.num_computed_tokens));
+        }
+        std::vector<bool> publishing(static_cast<std::size_t>(table.NumBlocks()), false);
+        if (compacts && progress.completed_pages) {
+            for (const PublishedRange& range : completedBlockRanges(i, *progress.completed_pages)) {
+                for (std::size_t j = 0; j < range.keys.size(); ++j) {
+                    const std::int32_t slot = range.first_cache_block + static_cast<std::int32_t>(j);
+                    if (slot < table.NumBlocks()) {
+                        publishing[static_cast<std::size_t>(slot)] = true;
+                    }
+                }
+            }
+        }
+        for (std::int32_t slot = first_slot; slot < table.NumBlocks(); ++slot) {
+            const CacheBlockRef& block = table.Blocks()[static_cast<std::size_t>(slot)];
+            if (!block) {
+                continue;
+            }
+            const bool cached = index.Contains(block);
+            Member::Kind kind = Member::Kind::kFixed;
+            if (compacts && !publishing[static_cast<std::size_t>(slot)] &&
+                (cached ? block.use_count() == 2 : block.unique())) {
+                // Rows past the computed frontier are unwritten (a draft row a
+                // verify step rewrites counts as unwritten too).
+                kind = cached ? Member::Kind::kPublished
+                       : progress.num_computed_tokens &&
+                               static_cast<std::int64_t>(slot) * geometry_[i].BlockGranularity() >=
+                                   *progress.num_computed_tokens
+                           ? Member::Kind::kUnwritten
+                           : Member::Kind::kWritten;
+            }
+            const bool in_bucket = kind != Member::Kind::kUnwritten || copy_in_beside[static_cast<std::size_t>(slot)];
+            if (in_bucket) {
+                ++bucket_pinned[i][static_cast<std::size_t>(allocator.BucketOf(block->Location()))];
+            } else {
+                ++free_movers[i];
+            }
+            if (compacts) {
+                members[i].push_back(Member{
+                    .kind = kind, .in_bucket = in_bucket, .location = block->Location(), .slot = slot, .hit = 0});
+            }
+        }
+        if (prefix.group_keys == nullptr || i >= prefix.device.per_group.size()) {
+            continue;
+        }
+        // The probe's hit pages, then its Device tail's blocks: the retry
+        // claims the pages, and copies a tail block into the hitter's own
+        // fresh block from where it was before this plan moved it
+        // (Scheduler::recordAdmittedPages).
+        std::vector<CacheBlockLocation> probe_blocks =
+            index.MatchedLocations(pool_, (*prefix.group_keys)[i], /*begin_blocks=*/0, prefix.device.per_group[i]);
+        const std::size_t num_pages = probe_blocks.size();
+        if (const auto& tail = prefix.device.tail; tail && !tail->group_keys[i].empty()) {
+            const std::vector<CacheBlockLocation> tail_blocks =
+                index.MatchedLocations(pool_, tail->group_keys[i], /*begin_blocks=*/0, tail->per_group[i]);
+            probe_blocks.insert(probe_blocks.end(), tail_blocks.begin(), tail_blocks.end());
+        }
+        if (!compacts) {
+            // A group the compaction does not gather (a State group among
+            // them, with the prompt-end checkpoint the D role claims): its
+            // hits are held where they are.
+            if (const auto& state = prefix.state_at_prompt_end; state && !state->group_keys[i].empty()) {
+                const std::vector<CacheBlockLocation> state_blocks =
+                    index.MatchedLocations(pool_, state->group_keys[i], /*begin_blocks=*/0, state->per_group[i]);
+                probe_blocks.insert(probe_blocks.end(), state_blocks.begin(), state_blocks.end());
+            }
+            for (const CacheBlockLocation location : probe_blocks) {
+                hit_pins.push_back(index.Find(pool_, *index.KeyOf(pool_, location)));
+            }
+            continue;
+        }
+        for (std::size_t b = 0; b < probe_blocks.size(); ++b) {
+            const CacheBlockLocation location = probe_blocks[b];
+            const CacheKey key = *index.KeyOf(pool_, location);
+            Member::Kind kind = Member::Kind::kFixed;
+            std::size_t hit = 0;
+            if (!index.Inspect(pool_, key)->pinned) {
+                hit = hit_pins.size();
+                hit_pins.push_back(index.Find(pool_, key));
+                kind = b < num_pages ? Member::Kind::kHit : Member::Kind::kTail;
+            }
+            ++bucket_pinned[i][static_cast<std::size_t>(allocator.BucketOf(location))];
+            members[i].push_back(Member{.kind = kind, .in_bucket = true, .location = location, .slot = -1, .hit = hit});
+        }
+    }
+
+    std::vector<VictimSet> victims;
+    std::vector<std::vector<CopyInReservation>> copy_ins;
+    AdmissionPlanner planner{*this,
+                             groups_,
+                             geometry_,
+                             prefix_granularity_,
+                             pool_,
+                             host_pool_,
+                             demands,
+                             progress.num_computed_tokens,
+                             reserve_point,
+                             prefix,
+                             /*shapes=*/{},
+                             /*claimed=*/{},
+                             boundary_tree_,
+                             write_back_evictions_,
+                             /*evicts_blocks_past_segments=*/true,
+                             victims,
+                             copy_ins};
+    // Not fragmentation: the bound's own caveats, which compacting would
+    // only churn at. The request waits as before. The count covers the
+    // groups compaction gathers and the demand, not the parents the probe
+    // holds in the others (a hit page or tail block of a group of one block
+    // per parent, a State checkpoint), so passing it does not promise that
+    // the retry fits (docs/design/scheduler.md §1.4).
+    if (planner.DenseLayoutParents(bucket_pinned, free_movers) > pool_.NumLcmBlocks()) {
+        return std::nullopt;
+    }
+
+    AdmissionResult result{
+        .new_page_ids = std::vector<std::vector<std::int32_t>>(groups_.size()),
+        .pages_to_copy = std::vector<std::vector<std::pair<std::int32_t, std::int32_t>>>(groups_.size()),
+    };
+    const std::uint64_t moves_before = lone_compaction_moves_;
+    bool fits = false;
+    // At most one of the probe's tail blocks moves per compaction, in any
+    // group: the retry copies each from where it was (recordAdmittedPages),
+    // and two such copies landing on each other's old places would swap their
+    // bytes, which no order of the plan's copies can do.
+    std::int64_t tails_moved = 0;
+    for (std::size_t i = 0; i < groups_.size() && !fits; ++i) {
+        if (members[i].empty()) {
+            continue;
+        }
+        const std::uint32_t group_id = groups_[i].Id();
+        GroupAllocator& allocator = groups_[i].Allocator();
+        PrefixCacheIndex& index = groups_[i].Index();
+        BlockTable& table = *demands[i].table;
+        const std::int32_t packing = pool_.Packing(group_id);
+        const std::int32_t buckets = allocator.ShardCount();
+        // The parents holding the request's blocks: one with a block that
+        // cannot move is kept whatever it holds, then the densest, and of
+        // equally dense ones the one with more bucket-bound blocks. So a
+        // parent of free blocks alone is vacated before an equally dense one
+        // holding a bound block: its blocks re-place in any bucket, with no
+        // copy and no displacement. The order also keeps every kept parent
+        // bound through the moves. A free block gives its slot up (below)
+        // only to a bound block of a vacated parent, which ranks after every
+        // kept one. So a kept parent holding one block of the request, a
+        // free one (never a fixed parent), loses none: every parent ranked
+        // after it holds one free block alone. Any other kept parent keeps a
+        // block of the request (held, so no clearing evicts it) until the
+        // bound block takes the slot a free one gave up.
+        struct Parent {
+            std::int32_t id;
+            std::int32_t count{0};
+            std::int32_t bound{0};
+            bool fixed{false};
+            std::vector<std::size_t> members;
+        };
+        std::vector<Parent> parents;
+        std::unordered_map<std::int32_t, std::size_t> parent_index;
+        for (std::size_t m = 0; m < members[i].size(); ++m) {
+            const Member& member = members[i][m];
+            const auto [it, inserted] = parent_index.try_emplace(member.location.lcm_block_id, parents.size());
+            if (inserted) {
+                parents.push_back(Parent{.id = member.location.lcm_block_id});
+            }
+            Parent& parent = parents[it->second];
+            ++parent.count;
+            parent.bound += member.in_bucket ? 1 : 0;
+            parent.fixed = parent.fixed || member.kind == Member::Kind::kFixed;
+            parent.members.push_back(m);
+        }
+        std::ranges::sort(parents, [](const Parent& a, const Parent& b) {
+            return std::tuple(!a.fixed, -a.count, -a.bound, a.id) < std::tuple(!b.fixed, -b.count, -b.bound, b.id);
+        });
+        const std::vector<std::int64_t> holes(static_cast<std::size_t>(buckets), 0);
+        const std::size_t kept = static_cast<std::size_t>(
+            std::max<std::int64_t>(ParentsNeededForBuckets(bucket_pinned[i], holes, free_movers[i], packing),
+                                   std::ranges::count_if(parents, &Parent::fixed)));
+        // Vacated in the reverse order -- the sparsest first, of those the
+        // one with the fewest bucket-bound blocks -- a parent whole or not
+        // at all: a block moved out of a parent that keeps another of the
+        // request's blocks frees nothing.
+        for (std::size_t p = parents.size(); p-- > kept && !fits;) {
+            // Nor does one moved out of a parent the retry cannot empty:
+            // beside the request's blocks there, every occupant must be a
+            // slot the retry reclaims as the request's own or a cache entry
+            // its block-by-block pass takes. A held page keeps the parent
+            // bound, so it is skipped like a parent with a block that finds
+            // no slot. So is one whose moves would make a second tail block
+            // of the probe move: it waits for a later compaction when
+            // another moved first (tails_moved), and is never vacated when it
+            // holds two of them.
+            const auto tails_here = std::ranges::count_if(
+                parents[p].members, [&](std::size_t m) { return members[i][m].kind == Member::Kind::kTail; });
+            bool vacatable = tails_moved + tails_here <= 1;
+            for (std::int32_t child = 0; child < packing && vacatable; ++child) {
+                const CacheBlockLocation slot{.lcm_block_id = parents[p].id, .slot_index = child};
+                vacatable = !pool_.IsOccupied(slot) ||
+                            std::ranges::any_of(parents[p].members,
+                                                [&](std::size_t m) { return members[i][m].location == slot; }) ||
+                            planner.IsRequestReclaim(slot) || planner.PlanBlockAlone(group_id, slot).has_value();
+            }
+            if (!vacatable) {
+                continue;
+            }
+            struct Move {
+                std::size_t member{0};
+                CacheBlockLocation destination;
+                // The cache entry at the destination and what it takes along.
+                std::optional<VictimSet> clearing;
+            };
+            std::vector<Move> moves;
+            std::vector<CacheBlockLocation> reserved;
+            // A slot of a kept parent, in `bucket` or in any, `first_parent`'s
+            // before the others when given: free, or held by a cache entry
+            // nothing holds that the block-by-block pass may take. A block of
+            // the request's own, or one in use, never.
+            const auto find_destination = [&](std::optional<std::int32_t> bucket,
+                                              std::optional<std::int32_t> first_parent) -> std::optional<Move> {
+                std::vector<std::int32_t> searched;
+                searched.reserve(kept + 1);
+                if (first_parent) {
+                    searched.push_back(*first_parent);
+                }
+                for (std::size_t k = 0; k < kept; ++k) {
+                    if (parents[k].id != first_parent) {
+                        searched.push_back(parents[k].id);
+                    }
+                }
+                for (const std::int32_t parent : searched) {
+                    for (std::int32_t child = bucket.value_or(0); child < packing; child += bucket ? buckets : 1) {
+                        const CacheBlockLocation candidate{.lcm_block_id = parent, .slot_index = child};
+                        if (std::ranges::find(reserved, candidate) != reserved.end()) {
+                            continue;
+                        }
+                        if (!pool_.IsOccupied(candidate)) {
+                            return Move{.destination = candidate};
+                        }
+                        if (std::optional<VictimSet> clearing = planner.PlanBlockAlone(group_id, candidate)) {
+                            return Move{.destination = candidate, .clearing = std::move(clearing)};
+                        }
+                    }
+                }
+                return std::nullopt;
+            };
+            // Bucket-bound blocks first; a free block takes what is left, in
+            // any bucket.
+            std::vector<std::size_t> order = parents[p].members;
+            std::ranges::stable_partition(order, [&](std::size_t m) { return members[i][m].in_bucket; });
+            bool whole = true;
+            for (const std::size_t m : order) {
+                const Member& member = members[i][m];
+                const std::int32_t bucket = allocator.BucketOf(member.location);
+                std::optional<Move> move = find_destination(
+                    member.in_bucket ? std::optional<std::int32_t>{bucket} : std::nullopt, std::nullopt);
+                // No slot of its bucket left in the kept parents: one of the
+                // request's free blocks there gives its slot up and re-places
+                // anywhere (page-cyclic sharding keeps a written block's bytes
+                // with their owner) -- in its own parent first. It leaves
+                // before the member arrives, and a parent it left empty would
+                // be released (unbound from the group) in between. The parent
+                // order above leaves another of the request's blocks there in
+                // any case; re-placing in its own parent first keeps the block
+                // itself there whenever a free or clearable slot is left in it
+                // (in another bucket: none of this bucket is, in any kept
+                // parent), whatever the order.
+                for (std::size_t k = 0; k < kept && !move && member.in_bucket; ++k) {
+                    for (const std::size_t u : parents[k].members) {
+                        const Member& other = members[i][u];
+                        if (other.in_bucket || allocator.BucketOf(other.location) != bucket ||
+                            std::ranges::find(reserved, other.location) != reserved.end()) {
+                            continue;
+                        }
+                        std::optional<Move> displaced = find_destination(std::nullopt, other.location.lcm_block_id);
+                        if (!displaced) {
+                            break;
+                        }
+                        displaced->member = u;
+                        reserved.push_back(displaced->destination);
+                        moves.push_back(std::move(*displaced));
+                        move = Move{.destination = other.location};
+                        break;
+                    }
+                }
+                if (!move) {
+                    whole = false;
+                    break;
+                }
+                move->member = m;
+                reserved.push_back(move->destination);
+                moves.push_back(std::move(*move));
+            }
+            if (!whole) {
+                continue;
+            }
+            for (Move& move : moves) {
+                Member& member = members[i][move.member];
+                if (move.clearing && pool_.IsOccupied(move.destination)) {
+                    EvictedSegment* segment = write_back_evictions_ ? &evicted_segments_.emplace_back() : nullptr;
+                    for (const VictimSet::Member& victim : move.clearing->members) {
+                        evictCachedBlock(victim.group_id, victim.location, &DeviceEvictionStats::compaction, segment);
+                    }
+                }
+                FatalCheck(!pool_.IsOccupied(move.destination), "compaction destination changed before placement");
+                // A kept parent never empties before the moves into it
+                // (above): one released would read unoccupied and unbound.
+                _assert(pool_.BoundGroup(move.destination.lcm_block_id) == group_id,
+                        "a compaction destination lies in a parent bound to its group");
+                if (member.kind == Member::Kind::kHit || member.kind == Member::Kind::kTail) {
+                    // Pinned through the move: the entry follows its copy,
+                    // and the pin with it.
+                    CacheBlockRef& pin = hit_pins[member.hit];
+                    CacheBlockRef fresh = pool_.AcquireBlockAt(group_id, move.destination);
+                    _assert(allocator.BucketOf(fresh->Location()) == allocator.BucketOf(member.location),
+                            "a copied block keeps its bucket");
+                    result.pages_to_copy[i].emplace_back(allocator.ResolveCacheBlockId(*pin),
+                                                         allocator.ResolveCacheBlockId(*fresh));
+                    index.Relocate(pool_, member.location, fresh);
+                    pin = std::move(fresh);
+                } else if (member.kind == Member::Kind::kCopyIn) {
+                    // Held outside the table for the slot it serves: re-placed
+                    // in its bucket, never zeroed. The copy-in fills it whole,
+                    // in this very plan when the retry spends it, and the
+                    // runtime copies before it zeroes.
+                    CacheBlockRef fresh = pool_.AcquireBlockAt(group_id, move.destination);
+                    _assert(allocator.BucketOf(fresh->Location()) == allocator.BucketOf(member.location),
+                            "a copy-in block keeps its bucket");
+                    copy_in_blocks[i][static_cast<std::size_t>(member.slot - copy_in_slots[i].first)] =
+                        std::move(fresh);
+                } else {
+                    // The block the slot gives up is the entry's until the
+                    // entry has followed the copy; it leaves with `replaced`.
+                    const CacheBlockRef replaced = allocator.SwapInFreshBlock(
+                        pool_, table, member.slot, table.AvailableTokens(), move.destination);
+                    const CacheBlockRef& moved = table.Blocks()[static_cast<std::size_t>(member.slot)];
+                    _assert(!member.in_bucket ||
+                                allocator.BucketOf(moved->Location()) == allocator.BucketOf(member.location),
+                            "a block bound to its bucket keeps it");
+                    if (member.kind == Member::Kind::kUnwritten) {
+                        // A free block an earlier vacate round displaced
+                        // can be displaced again, and the page it leaves
+                        // can take a copy: it is no longer zeroed.
+                        std::erase(result.new_page_ids[i], allocator.ResolveCacheBlockId(*replaced));
+                        result.new_page_ids[i].push_back(allocator.ResolveCacheBlockId(*moved));
+                    } else {
+                        result.pages_to_copy[i].emplace_back(allocator.ResolveCacheBlockId(*replaced),
+                                                             allocator.ResolveCacheBlockId(*moved));
+                    }
+                    if (member.kind == Member::Kind::kPublished) {
+                        index.Relocate(pool_, member.location, moved);
+                    }
+                }
+                member.location = move.destination;
+                ++lone_compaction_moves_;
+            }
+            tails_moved += tails_here;
+            fits = admission_fits();
+        }
+    }
+    // A set whose every block was dropped records nothing.
+    std::erase_if(evicted_segments_, [](const EvictedSegment& segment) { return segment.members.empty(); });
+    if (lone_compaction_moves_ == moves_before) {
+        return std::nullopt;
+    }
+    ++lone_compactions_;
     return result;
 }
 

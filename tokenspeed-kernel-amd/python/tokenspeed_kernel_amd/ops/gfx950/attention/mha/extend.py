@@ -34,7 +34,7 @@ from __future__ import annotations
 import math
 
 import torch
-from tokenspeed_kernel_amd._scheduling import sched_compile_options
+from tokenspeed_kernel_amd._extern import extern_compile_options
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 from tokenspeed_kernel_amd.ops.gfx950.attention._common import (
     _INV_LN2,
@@ -1839,7 +1839,7 @@ def _extend(
         # Compiling needs only their dtype and alignment, not their size.
         mid_o, mid_lse = split_buffers(1, MAX_KV_SPLITS)
         for tile in sorted(tiles):
-            options = dict(grid=(1,), num_warps=tile[3], **sched_compile_options())
+            options = dict(grid=(1,), num_warps=tile[3], **extern_compile_options())
             stage_choices = _extend_stage_choices(num_warps=tile[3], **stage_args)
             split_stages = _extend_stages(
                 num_workgroups=1, split=True, num_warps=tile[3], **stage_args
@@ -1873,7 +1873,7 @@ def _extend(
         gluon_mha_extend_split_gfx950[split_grid](
             *split_args(tile, num_stages, use_ragged, num_kv_splits, mid_o, mid_lse),
             num_warps=num_warps,
-            **sched_compile_options(),
+            **extern_compile_options(),
         )
         reduce_grid = (total_q, n_heads)
         gluon_mha_extend_reduce_gfx950[reduce_grid](
@@ -1891,7 +1891,7 @@ def _extend(
     gluon_mha_extend_gfx950[grid](
         *unsplit_args(tile, num_stages, use_ragged),
         num_warps=num_warps,
-        **sched_compile_options(),
+        **extern_compile_options(),
     )
     if return_lse:
         return output, lse

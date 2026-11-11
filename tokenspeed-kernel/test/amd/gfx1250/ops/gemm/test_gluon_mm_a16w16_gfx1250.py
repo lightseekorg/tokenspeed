@@ -215,14 +215,47 @@ def test_grouped_bf16_projection_two_groups_match_reference(tokens: int) -> None
         _assert_bf16_close(actual[:, group], _reference(x[:, group], weight[group]))
 
 
+def _split_bf16_projection(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Return the BF16 grouped projection summed in the K split the quantizing
+    reduction uses, or the unquantized projection when it does not split."""
+    m, g, k = x.shape
+    n = weight.shape[1]
+    tiles = mm_mod._mm_a16w16_fp8_tiles(m, g * n, k)
+    unfused = grouped_bf16_projection(x, weight, None, None)
+    if tiles is None:
+        return unfused
+    block_m, block_n, block_k, num_buffers, warp_bases, split_k = tiles
+    projected = torch.empty((m, g, n), device=x.device, dtype=torch.bfloat16)
+    mm_mod._launch_wmma_tdm_dense_tiles(
+        x,
+        weight,
+        projected,
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+        num_buffers=num_buffers,
+        warp_bases=warp_bases,
+        split_k=split_k,
+    )
+    # Up to 32 rows the quantizing tiles split K where the unquantized ones
+    # do not. The FP32 sums then differ only in order, so each rounds to the
+    # same or an adjacent BF16 value (one ulp is at most 2**-7 relative).
+    torch.testing.assert_close(
+        projected.float(), unfused.float(), atol=_ATOL, rtol=2**-7
+    )
+    return projected
+
+
 @pytest.mark.parametrize("groups", [1, 2])
 @pytest.mark.parametrize("tokens", [1, 5, 40, 80, 300, 2048])
 def test_grouped_bf16_projection_fp8_matches_unfused(groups: int, tokens: int) -> None:
     x, weight = _two_group_operands(tokens, seed=tokens + 7)
     x, weight = x[:, :groups], weight[:groups]
     codes, scales = grouped_bf16_projection_quantize_fp8(x, weight)
+    # A different K split can move a BF16 sum by one ulp, which can cross an
+    # E4M3 rounding boundary, so compare against the same split's BF16 sum.
     expected_codes, expected_scales = quantize_fp8(
-        grouped_bf16_projection(x, weight, None, None).flatten(1),
+        _split_bf16_projection(x, weight).flatten(1),
         granularity="token_group",
         group_size=32,
         scale_encoding="ue8m0",

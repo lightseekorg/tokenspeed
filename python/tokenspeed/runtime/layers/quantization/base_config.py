@@ -97,6 +97,15 @@ class QuantizationConfig(ABC):
         """
         return True
 
+    def stores_fp8_embedding(self, prefix: str) -> bool:
+        """Whether the checkpoint stores the embedding table at ``prefix`` in FP8.
+
+        Such a table ships FP8 rows plus a per-tensor ``weight_scale``.
+        Linear layers are covered by ``get_quant_method``; this answers for
+        embedding tables that some exports quantize as well.
+        """
+        return False
+
     def get_moe_quant_config(self, prefix: str) -> "QuantizationConfig":
         """Return the concrete quantization config for a routed MoE layer."""
         return self

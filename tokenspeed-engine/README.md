@@ -55,6 +55,14 @@ for a token that came without one, so the column never misaligns with the
 tokens. An older producer defaults this column to empty; older readers skip
 it.
 
+The appended `reasoning_tokens` column is cumulative per request, like
+`completion_tokens`, and excludes reasoning-block delimiters. The control plane
+counts committed token ids before detokenization, including a PD prefill's
+bootstrap token. An older producer defaults the column to empty and its output
+rows report zero; older readers skip the appended column. `ts-client` output
+chunks, the Python chunk dictionaries, and `WireDriver.Completion` expose the
+same cumulative count.
+
 ## Building
 
 Snapshot SDK updates carry a complete publication directory in the optional
@@ -85,6 +93,30 @@ build instead, put `_native` on the Python path and point
 `TOKENSPEED_HOST_BINARY` at the binary. `TS_HOST_LOG` sets the Rust log
 filter (`info` by default; `ts_control=debug` logs admissions and cache-op
 acknowledgments).
+
+## Releasing Python wheels
+
+Use **Release TokenSpeed Engine** in GitHub Actions. Select `dry-run` to
+build and test wheels, or `publish` on `main` to upload them to PyPI. The
+workflow uses the version in `pyproject.toml`; merge a version bump before
+each release. An interrupted publication can be rerun to upload missing files.
+
+Wheels support Linux with glibc 2.28 or newer, x86_64 and aarch64, and
+CPython 3.10–3.13. They contain the Python extension, `ts-host`, and a private
+CPython shared library for the host process, including its built-in native
+stdlib modules. The host uses the launching interpreter's Python library
+paths and environment. Installing a wheel needs no
+Rust toolchain. Each wheel is tested in a separate Python container and venv
+by importing the extension and starting the embedded scheduler and Python.
+
+The build uses a full checkout because the engine also compiles the sibling
+scheduler source. No source distribution is published; source builds must
+use the repository checkout and the dependencies described above.
+
+Configure the `tokenspeed-engine` project's PyPI Trusted Publisher with
+owner `lightseekorg`, repository `tokenspeed`, workflow filename
+`release-tokenspeed-engine.yml`, and GitHub environment `pypi`. Publication
+uses GitHub OIDC and does not require a stored PyPI token.
 
 ## Releasing Rust crates
 

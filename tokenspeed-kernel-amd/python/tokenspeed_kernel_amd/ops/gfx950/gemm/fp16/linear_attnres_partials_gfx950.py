@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel_amd._extern import extern_compile_options
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16 import gemv
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
@@ -200,16 +201,18 @@ def gluon_linear_attnres_partials_gemv_gfx950(
             pid - num_tokens,
             hidden_ptr,
             weight_ptr,
-            output_ptr,
-            num_tokens,
-            output_size,
-            rows,
-            _INPUT_SIZE,
-            output_size,
+            s_ptr=weight_ptr,
+            y_ptr=output_ptr,
+            M=num_tokens,
+            N=output_size,
+            rows=rows,
+            stride_xm=_INPUT_SIZE,
+            stride_ym=output_size,
             K=_INPUT_SIZE,
             BLOCK_M=16,
             BLOCK_N=BLOCK_N,
             BLOCK_K=BLOCK_K,
+            W_FP8=False,
         )
 
 
@@ -590,6 +593,7 @@ def launch_gluon_linear_attnres_partials_gfx950(
             num_stages=1,
             waves_per_eu=1,
             llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
+            **extern_compile_options(),
         )
         return out
 

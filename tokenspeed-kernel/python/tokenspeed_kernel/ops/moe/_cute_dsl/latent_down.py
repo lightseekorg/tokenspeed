@@ -38,7 +38,10 @@ sentinels. Which producer serves them is chosen in one place, ``_wide_producer``
 
 A caller may instead arm its slot with ``HALF_POLLED_SENTINEL``, a NaN payload
 no GEMM emits: the gather then polls 16-bit halves, so a library GEMV may write
-its row straight into the mailbox one BF16 element at a time.
+its row straight into the mailbox one BF16 element at a time. A library GEMM
+that can only write contiguous rows leaves its block in local memory; either a
+copy kernel stores it, or ``publish_by_consumer`` hands it to the kernel that
+polls the mailbox, which stores it before polling.
 
 Every rank must construct in lockstep: the mailbox rendezvous is collective.
 """
@@ -180,6 +183,22 @@ def _lamport_geometry(m: int) -> tuple[int, int]:
 
 
 @dataclass
+class MailboxPublish:
+    """A projected block whose multicast store is left to the mailbox's consumer.
+
+    Attributes:
+        block: Contiguous BF16 ``[rows, width]`` GEMM output in local memory.
+        destination: The same-shaped view through the multicast address at
+            this rank's columns; its rows are mailbox rows apart.
+        column: Mailbox column ``block`` starts at.
+    """
+
+    block: torch.Tensor
+    destination: torch.Tensor
+    column: int
+
+
+@dataclass
 class _MailboxSlot:
     """One symmetric mailbox plus the kernels bound to it."""
 
@@ -219,6 +238,7 @@ class _MulticastVaGemm:
         publish_gemm: Callable[..., torch.Tensor] | None,
     ) -> None:
         self._publish_gemm = publish_gemm
+        self._column = rank * shard_dim
         with torch.inference_mode(False), torch.no_grad():
             self._block = bf16_tensor_on_pointer(
                 multicast_ptr + rank * shard_dim * _BF16_BYTES,
@@ -252,6 +272,24 @@ class _MulticastVaGemm:
         bitwise, so an accumulating publish would be byte-identical to this one.
         A witness would have to catch a peer reading mid-accumulation.
         """
+        pending = self.project(hidden_states, weight_block)
+        if pending is not None:
+            multicast_publish(pending.block, pending.destination)
+        return mailbox
+
+    def project(
+        self, hidden_states: torch.Tensor, weight_block: torch.Tensor
+    ) -> MailboxPublish | None:
+        """Run the GEMM; return its block when it still has to be stored into the mailbox.
+
+        Args:
+            hidden_states: Contiguous ``[tokens, hidden_size]`` activation.
+            weight_block: This rank's ``[shard_dim, hidden_size]`` weight rows.
+
+        Returns:
+            None when the GEMM wrote through the multicast address itself,
+            else the local block and where it belongs.
+        """
         tokens = hidden_states.shape[0]
         if not 1 <= tokens <= self._block.shape[0]:
             raise ValueError(
@@ -260,11 +298,11 @@ class _MulticastVaGemm:
         published = self._block[:tokens]
         if self._publish_gemm is None:
             torch.mm(hidden_states, weight_block.t(), out=published)
-        else:
-            block = self._publish_gemm(hidden_states, weight_block, published)
-            if block.data_ptr() != published.data_ptr():
-                multicast_publish(block, published)
-        return mailbox
+            return None
+        block = self._publish_gemm(hidden_states, weight_block, published)
+        if block.data_ptr() == published.data_ptr():
+            return None
+        return MailboxPublish(block, published, self._column)
 
 
 def _wide_producer(
@@ -745,6 +783,33 @@ class KimiK3LatentDownOp:
             slot.multicast_ptr,
         )
         return slot.mailbox[0, :tokens]
+
+    def publish_by_consumer(
+        self, hidden_states: torch.Tensor, weight: torch.Tensor
+    ) -> tuple[torch.Tensor, MailboxPublish | None]:
+        """Like :meth:`publish`, but a block still to be stored is returned, not copied.
+
+        The kernel that polls the mailbox stores the returned block before it
+        polls, which saves the copy launch between the GEMM and that kernel.
+
+        Args:
+            hidden_states: Contiguous ``[tokens, hidden_size]`` activation.
+            weight: This rank's ``[shard_dim, hidden_size]`` block.
+
+        Returns:
+            ``(rows, pending)``: this rank's mailbox rows ``[tokens,
+            latent_size]``, and the block the consumer must store, or None when
+            the producer already published it.
+        """
+        tokens = hidden_states.shape[0]
+        slot = self._slot
+        producer = slot.gemm_by_m[tokens]
+        if isinstance(producer, _MulticastVaGemm):
+            pending = producer.project(hidden_states, weight)
+        else:
+            producer(hidden_states, weight, slot.mailbox, slot.multicast_ptr)
+            pending = None
+        return slot.mailbox[0, :tokens], pending
 
     def __call__(
         self,

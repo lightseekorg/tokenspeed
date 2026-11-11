@@ -86,6 +86,8 @@ class Completion:
     finish_details: dict | None = None
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    # Reasoning tokens generated so far, excluding structural markers.
+    reasoning_tokens: int = 0
     # Prompt tokens served from the prefix cache.
     cached_tokens: int = 0
     output_token_logprobs: list[float] = dataclasses.field(default_factory=list)
@@ -113,6 +115,7 @@ class Completion:
         self.finish_details = chunk["finish_details"]
         self.prompt_tokens = chunk["prompt_tokens"]
         self.completion_tokens = chunk["completion_tokens"]
+        self.reasoning_tokens = chunk["reasoning_tokens"]
         self.cached_tokens = chunk["cached_tokens"]
         if chunk["input_token_logprobs"] is not None:
             self.input_token_logprobs = chunk["input_token_logprobs"]

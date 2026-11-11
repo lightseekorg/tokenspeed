@@ -41,7 +41,10 @@ from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.breakable_cuda_graph import slice_to_real_tokens
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan
-from tokenspeed.runtime.layers.attention.backends.base import reject_query_shard
+from tokenspeed.runtime.layers.attention.backends.base import (
+    DecodeKVView,
+    reject_query_shard,
+)
 from tokenspeed.runtime.layers.attention.backends.paged.base import (
     PagedAttentionBackend,
 )
@@ -197,6 +200,33 @@ class MHAAttnBackend(PagedAttentionBackend):
     def reads_fp8_kv_scales(self, layer: PagedAttention) -> bool:
         # Both reads hand them to the kernel (_fp8_scale_kwargs).
         return True
+
+    def decode_kv_view(
+        self, layer: PagedAttention, token_to_kv_pool
+    ) -> DecodeKVView | None:
+        # A sliding window reads the cache through the page table alone; full
+        # layers' verify decode takes a split schedule, and scaled caches more.
+        # A bound draft tree attends through its mask (forward_decode's tree
+        # cascade), which the view does not carry.
+        metadata = self.forward_decode_metadata
+        if (
+            metadata is None
+            or not self.is_fp8
+            or layer.fp8_kv_scales is not None
+            or layer.sliding_window_size < 0
+            or self.draft_block_decode
+            or self.tree_verify is not None
+            or self.tree_lane_step_active
+        ):
+            return None
+        k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
+        return DecodeKVView(
+            k_cache=k_cache,
+            v_cache=v_cache,
+            page_table=metadata.page_table,
+            seq_lens=metadata.seq_lens,
+            max_seqlen_k=self.max_context_len,
+        )
 
     def query_dtype(
         self, layer: PagedAttention, forward_mode: ForwardMode, activation: torch.dtype
@@ -522,14 +552,14 @@ class MHAAttnBackend(PagedAttentionBackend):
         sinks: torch.Tensor | None,
     ) -> torch.Tensor:
         """Draft-tree attention (verify nodes or drafting lanes): a causal
-        ``rows``-token extend over the committed prefix with its log-sum-exp,
+        ``rows``-token pass over the committed prefix with its log-sum-exp,
         then the tree window and the prefix tail merged into it
         (``tree_window_attention``); the trtllm leaf's cascade with a portable
         prefix half.
 
         A sliding-window draft layer sees the window frozen at the round's
-        prefix end: each lane row extends the prefix alone (its query placed at
-        the prefix's last key), so no prefix tail remains for the window kernel.
+        prefix end: each lane decodes the prefix alone (its query placed at the
+        prefix's last key), so no prefix tail remains for the window kernel.
         """
         causal_prefix = layer.sliding_window_size < 0
         # Only lane rows (their own tables) decode a sliding window.
@@ -539,34 +569,32 @@ class MHAAttnBackend(PagedAttentionBackend):
             )
         if layer.logit_cap:
             raise NotImplementedError("draft trees have no logit-cap path yet")
-        q_len = tree.rows if causal_prefix else 1
-        num_reqs = q.shape[0] // q_len
         k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
-        # Pinned to Triton, bypassing selection: its causal mask keeps row r at
-        # key P - R + r even when the prefix P is shorter than the R rows (the
-        # partial then covers fewer keys, or none), which the window kernel's
-        # merge assumes.
-        prefix_out, prefix_lse = mha_extend_with_kvcache(
-            q=q,
-            cu_seqlens_q=torch.arange(
-                0, (num_reqs + 1) * q_len, q_len, dtype=torch.int32, device=q.device
-            ),
-            # Unread by the Triton extend: it takes the keys from cache_seqlens.
-            cu_seqlens_kv=None,
-            k_cache=k_cache,
-            v_cache=v_cache,
-            page_table=tree.page_table if causal_prefix else tree.row_page_table,
-            cache_seqlens=tree.prefix_lens if causal_prefix else tree.row_prefix_lens,
-            max_seqlen_q=q_len,
-            max_seqlen_k=self.max_context_len,
-            is_causal=True,
-            window_left=layer.sliding_window_size,
-            logit_cap=0.0,
-            sinks=None,
-            return_lse=True,
-            softmax_scale=layer.scaling,
-            solution="triton",
-        )
+        if causal_prefix:
+            # Pinned to Triton, bypassing selection: its causal mask keeps row r
+            # at key P - R + r even when the prefix P is shorter than the R rows
+            # (the partial then covers fewer keys, or none), which the window
+            # kernel's merge assumes. Its decode folds a request's rows into one
+            # pass over the prefix, which every row shares.
+            prefix_out, prefix_lse = mha_decode_with_kvcache(
+                q=q,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                page_table=tree.page_table,
+                cache_seqlens=tree.prefix_lens,
+                max_seqlen_k=self.max_context_len,
+                max_seqlen_q=tree.rows,
+                window_left=-1,
+                logit_cap=0.0,
+                sinks=None,
+                return_lse=True,
+                softmax_scale=layer.scaling,
+                solution="triton",
+            )
+        else:
+            prefix_out, prefix_lse = self._lane_prefix_decode(
+                q, layer, k_cache, v_cache, tree
+            )
         dim = layer.qk_head_dim
         out = tree_window_attention(
             q,
@@ -585,6 +613,44 @@ class MHAAttnBackend(PagedAttentionBackend):
             sm_scale=layer.scaling,
         )
         return out.view(-1, layer.tp_q_head_num * dim)
+
+    def _lane_prefix_decode(
+        self,
+        q: torch.Tensor,
+        layer: PagedAttention,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        tree: TreeCascadeRows,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The drafting lanes' sliding-window prefix partial. Every lane of a
+        request queries the same keys (the window ending at the request's
+        prefix end), so the lanes ride as extra query heads of one decode per
+        request: head ``h * rows + r`` is lane ``r``'s head ``h``, a grouped
+        query of KV head ``h``, and each request's keys are read once instead
+        of once per lane."""
+        rows = tree.rows
+        num_reqs = q.shape[0] // rows
+        heads, dim = q.shape[1], q.shape[2]
+        folded = q.view(num_reqs, rows, heads, dim).transpose(1, 2)
+        # Pinned to Triton, bypassing selection: its folded decode returns the
+        # log-sum-exp the window kernel merges with, and one program per KV
+        # head and key split serves every lane's grouped heads.
+        out, lse = mha_decode_with_kvcache(
+            q=folded.reshape(num_reqs, heads * rows, dim),
+            k_cache=k_cache,
+            v_cache=v_cache,
+            page_table=tree.page_table,
+            cache_seqlens=tree.prefix_lens,
+            max_seqlen_k=self.max_context_len,
+            max_seqlen_q=1,
+            window_left=layer.sliding_window_size,
+            return_lse=True,
+            softmax_scale=layer.scaling,
+            solution="triton",
+        )
+        out = out.view(num_reqs, heads, rows, -1).transpose(1, 2)
+        lse = lse.view(num_reqs, heads, rows).transpose(1, 2)
+        return out.reshape(q.shape[0], heads, -1), lse.reshape(q.shape[0], heads)
 
     def forward_extend(
         self,

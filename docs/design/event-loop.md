@@ -397,7 +397,11 @@ library compiles once per batch shape with no key to bucket -- FlashInfer's
 joint BF16 GEMM and the ll_bf16 router's dot-product kernel compile once per
 exact row count -- runs only before it:
 graph capture records it, and eager calls after it take a GEMM that never
-compiles instead of compiling on the forward thread.
+compiles instead of compiling on the forward thread. The pinned FlashInfer
+TGV tiles for BF16 decode GEMMs on small weights run only before it too,
+though they compile once per tile, not per shape: their route was measured
+only inside captured graphs, so eager calls after the mark keep cuBLASLt
+(`tokenspeed-kernel/python/tokenspeed_kernel/ops/gemm/README.md`).
 
 A full garbage collection is a stall of the same kind, for every Python
 thread of the process at once. Startup leaves millions of long-lived Python
@@ -625,8 +629,10 @@ them only when the loop holds no request, in-flight forward or open cache op.
 
 **Pause and memory release** (`control`). A pause in `abort` mode aborts what
 runs, `wait` lets it finish; both stop admissions and answer once the
-scheduler drained. `keep` freezes everything and answers at once: a frozen
-round commits what is dispatched and still joins the attention-DP agreement
+scheduler drained, including requests parked for PD retirement: both the
+transfer and local forwards must finish even if the output already ended.
+`keep` freezes everything and answers at once: a frozen round commits what is
+dispatched and still joins the attention-DP agreement
 (an idle forward when a peer runs one, but not while memory is released: the
 weights are unmapped; idle forwards count toward the expert rebalance like
 real ones, so the ranks' rebalances stay in step). It plans like any round,
@@ -780,23 +786,36 @@ prefill peer.
 
 **PD source retirement.** A terminal status alone does not release source
 pages. The prefill peer counts queued and executing transfer jobs. A failure
-agreed by the replica first stops new work on every rank, then every rank must
-have retired its jobs before a terminal event reaches the scheduler. Queued
+agreed by the replica first stops new work on every rank and reports `Failed`,
+which parks the request without releasing its resources. Every rank must
+retire its jobs before `Stopped` reaches the scheduler. Queued
 jobs for failed rooms are dropped; executing jobs finish or return from the
 synchronous transport call before retiring. Client cancellation keeps the
-request's source ownership until that terminal event. The retirement agreement
+request's source ownership until that retirement event. The retirement agreement
 is needed only in rounds with a terminal status.
+
+**PD output completion.** A prefill's computed finish is not its client's
+final output: the output waits for the transfer's result. A transfer failure
+must publish an abort even after computation finished, unless the client
+already cancelled its stream or a final output was sent. A pause abort still
+notifies the client; repeated transfer events do not repeat the final output.
+This output fence does not retire source pages.
 
 **PD cancellation.** Client aborts and `pause(abort)` cancel the tracked
 transfer as well as marking the request's output. A decode receiver sends a
 cancellation to every prefill target that could write its landing pages.
 Each target stops accepting work for the room and acknowledges only after
 its queued and executing writes retire. The receiver waits for every target,
-then agrees retirement across its replica before reporting failure to the
-scheduler. Failure notifications and receive timeouts use the same fence:
+then agrees retirement across its replica before reporting `Stopped` to the
+scheduler; `Failed` may already have ended the client request. Failure
+notifications and receive timeouts use the same fence:
 neither proves that remote writes stopped. A receiver that never advertised
 landing pages can retire locally. Cancelled rooms reject delayed registration
 and manifests; repeated cancellation is safe.
+
+`Failed` precedes `Stopped`, but both may arrive in the same poll when the
+transfer has already retired. Consumers accept either one poll or separate
+polls and keep the pages until the retirement event and local forwards complete.
 
 The prefill control receiver handles cancellation even when no native request
 claimed the room or its scheduler is paused. Unclaimed rooms therefore need
@@ -809,9 +828,77 @@ identities. A prefill cancellation that never learns a destination identity
 must retain its room tombstone until that peer exits, since an arbitrarily
 late manifest must not revive the transfer.
 
-**PD** (`pd`, `ts-pd`). Requests register with the transfer peer at
-admission, and every round the replica agrees on which transfers changed
-state; their scheduler events join the round's tail feedback, and a failed
+These records include every prefill failure and bootstrap timeout, not just
+explicit client cancellation. There is currently no count or age limit:
+unbound records last for the prefill peer's lifetime, and bound records can
+last just as long when a healthy decode cache is never superseded. Sustained
+timeouts therefore grow metadata with the number of failed rooms, even after
+all associated jobs and network workers retire. Request timeout bounds do not
+bound this memory. An age or size eviction would allow a delayed manifest to
+revive an ended room; the wire has no enforced message lifetime or retired
+attempt epoch to reject it. Bounded retention needs such a protocol guarantee
+(or a fail-closed admission policy), rather than assuming that a multiple of
+the bootstrap timeout rules out late messages.
+
+A native write error does not prove that its remote DMA stopped. The prefill
+peer marks that room uncertain and withholds cancellation acknowledgments even
+after its queued and executing calls return. Failure notices may still reach
+the receiver, but cannot release its pages. An uncertain room or an unreachable
+writer can therefore keep the receiver's drain pending indefinitely; stalled
+drains are logged periodically. A parked request also keeps operations that
+require a drained engine, such as cache flush, weight replacement and sleep
+with memory release, from completing. Recovery requires verified retirement
+of the writers or transport invalidation that makes further access to these
+registrations impossible; local forwards must also have completed before
+pages are released. A timeout can trigger diagnostics or recovery but cannot
+authorize page reuse; the current protocol provides no forced retirement
+for an uncertain room.
+
+**PD failure isolation.** Control messages use one bounded FIFO per destination
+endpoint. Connect and send each have a five-second deadline; a failed endpoint
+cannot hold another endpoint's registration, manifest or cancellation. An
+identical cancellation or status occupies at most one queued/in-flight entry.
+Queue refusal fails registration/manifest publication; partial publication
+still uses the cancellation fence. Cancellation polling retries refused or
+undelivered notifications. Network delivery itself remains best effort: a
+locally accepted message is not a remote acknowledgment. A connect or send
+failure discards that endpoint's queued backlog and retires its task; it does
+not spend another I/O timeout on every queued message. Requests still use
+their failure/timeout and cancellation paths. After 60 seconds with no queued
+or in-flight message, even a healthy endpoint retires its socket, task and
+registry entry. The next send recreates them. Idle retirement and enqueue
+share a lock so a new message cannot be stranded on a closing FIFO; an old
+task's teardown cannot erase its replacement. Socket retirement does not
+retire cache identities, room tombstones or possible remote writes.
+
+Decode bootstrap lookups are serialized per bootstrap address, with independent
+workers for other addresses. Polling (including idle polls) and registration
+release a lost address's sender once its route is gone and no live request is
+still looking it up. The worker finishes any bounded in-flight HTTP call,
+skips terminal queued requests and exits; a later request creates another
+worker. A first lookup with no route yet keeps its worker so concurrent
+requests for that address stay serialized. Heartbeat failure counters expire
+with the routes too. Cache registration on prefill fences only the
+cache identities being replaced. A replacement waits off the control receive
+path for those native writes, while unrelated registrations and cancellations
+continue. Manifests for the replacement wait until it is installed; queued
+old writes recheck their identity before reaching native I/O. Synchronous data
+writes still use the configured transfer worker pool, and heartbeat probes are
+still sequential; these bounds do not provide native write cancellation or
+writer incarnation discovery.
+
+Bootstrap timeout and other prefill failures retain the same terminal room
+record as explicit cancellation. A late manifest is rejected immediately,
+without another unclaimed timeout. Before manifest publication, decode bounds
+bootstrap and scheduler admission waiting by `waiting_timeout`. Publication
+starts a separate receive budget of the same duration. These phase budgets do
+not constitute an upstream end-to-end deadline. Before publication a failed
+receiver retires locally and notifies known targets; after publication it must
+obtain the normal retirement acknowledgments.
+
+**PD** (`pd`, `ts-pd`). Requests register with the transfer peer when submitted
+to the scheduler, before cache admission. Every round the replica agrees on
+which transfers changed state; their scheduler events join the round's tail feedback, and a failed
 transfer aborts its request on every rank together. A peer keeps state only
 for the rooms of requests the loop tracks (a sleep waits for those alone),
 with one exception on the prefill side: a room the decode node pre-allocated
@@ -820,6 +907,11 @@ EPD embedding timeout), waits unclaimed; one still unclaimed after the
 bootstrap timeout is dropped, and the decode ranks that pre-allocated for it
 are told it failed. A decode room whose KV lands without the request's first
 token fails: the first decode feeds on it.
+
+`pd::TransferStoppedEvent` retires the transfer of the parked request. Its
+resources still wait for any outstanding local forward results before release:
+a transport fence does not fence this engine's execution stream. A late success
+retires a parked transfer under the same local-forward condition.
 
 **EPD prefill** (`--disaggregation-mode prefill` with encode nodes). A
 request whose images an encode node embeds is staged at admission; each
@@ -921,12 +1013,15 @@ For orientation, one `EventLoop::round`:
    every pair reading those byte ranges; a destination is never zeroed;
    no op id, no ACK), then
    page zeroing (the new owner's sanitization), then the Device-bound copies
-   -- `LoadBackOp` and `RestoreOp`, ordered behind the zeroing: a load-back
-   lands on zeroed pages and the forward reads it layer by layer behind the
-   layerwise fences (a prefill graph replay waits for the whole load before
-   its first segment, which holds no fence), so the loads start first on the
-   load stream, and every plan, with cache ops or without, points the fences
-   at its own load or at none; a restore
+   -- `LoadBackOp` and `RestoreOp`, ordered behind the zeroing and the
+   forwards in flight, which may still write a block an abort freed and this
+   plan granted (load-back destinations are never zeroed): the forward reads
+   a load-back layer by layer behind the
+   layerwise fences (a prefill graph replay waits on them before each
+   captured segment, which holds none, or, on a pool that does not declare
+   every access fenced, for the whole load instead), so the loads start first
+   on the load stream, and every plan, with cache ops or without, points
+   the fences at its own load or at none; a restore
    queues behind them, overwrites its destination blocks whole (the
    scheduler lists none of them for zeroing), reads both Host tiers under one
    event and arms no layerwise fence, its request being unschedulable until

@@ -146,6 +146,49 @@ def test_dflash2_mla_model_mode_and_yarn_config() -> None:
     }
 
 
+@_CUDA_ONLY
+def test_mla_draft_layers_build_windowed_mla_attention() -> None:
+    from transformers import PretrainedConfig
+
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.models.kimi_k3_dspark import K3DSparkAttention
+
+    config = PretrainedConfig(
+        vocab_size=64,
+        hidden_size=256,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        q_lora_rank=64,
+        kv_lora_rank=64,
+        qk_nope_head_dim=32,
+        qk_rope_head_dim=16,
+        v_head_dim=32,
+        rms_norm_eps=1e-6,
+        max_position_embeddings=4096,
+        rope_theta=10000.0,
+        layer_types=["sliding_attention", "full_attention"],
+        sliding_window=1024,
+        dflash_config={
+            "attention_mode": "mla",
+            "block_size": 16,
+            "conv_group_size": 16,
+            "conv_kernel_size": 2,
+            "selector_rank": 8,
+            "selector_top_k": 4,
+            "target_layer_ids": [0],
+        },
+    )
+    with torch.device("cuda"):
+        model = DFlash2DraftModel(config, Mapping(rank=0, world_size=1))
+
+    for layer, window in zip(model.layers, (1023, -1), strict=True):
+        assert isinstance(layer.self_attn, K3DSparkAttention)
+        assert layer.self_attn.attn_mqa.sliding_window_size == window
+        assert layer.self_attn.attn_mha.sliding_window_size == window
+        assert layer.comm_manager is not None
+
+
 @pytest.mark.parametrize(
     ("attention_config", "expected_sliding_window"),
     (
@@ -199,7 +242,9 @@ def test_block_drafter_declares_only_its_sliding_mask(
 
 def test_candidate_logits_processor_is_created_after_target_wiring() -> None:
     drafter = DFlash2.__new__(DFlash2)
-    drafter.model = SimpleNamespace(config=SimpleNamespace(vocab_size=32))
+    drafter.model = SimpleNamespace(
+        config=SimpleNamespace(vocab_size=32), fp8_head=None
+    )
     drafter.output_multiplier = 1.25
     drafter.final_logit_softcapping = 8.0
     drafter.candidate_logits_processor = None
@@ -212,6 +257,7 @@ def test_candidate_logits_processor_is_created_after_target_wiring() -> None:
         tp_size=1,
         tp_group=None,
         skip_all_gather=False,
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
 
@@ -473,7 +519,10 @@ def test_official_nodes_capture_and_replay_in_one_cuda_graph() -> None:
 @_CUDA_ONLY
 def test_the_fused_mla_context_write_reproduces_the_per_layer_chain() -> None:
     """One GEMM + one launch must land what norm -> RoPE -> scatter lands."""
-    from tokenspeed_kernel.ops.kvcache.triton import mla_latent_norm_rope_scatter
+    from tokenspeed_kernel.ops.kvcache.triton import (
+        LatentPlanes,
+        mla_latent_norm_rope_scatter,
+    )
 
     from tokenspeed.runtime.layers.layernorm import RMSNorm
     from tokenspeed.runtime.layers.rotary_embedding import get_rope
@@ -517,7 +566,7 @@ def test_the_fused_mla_context_write_reproduces_the_per_layer_chain() -> None:
         hidden_states,
         torch.cat([w[q_lora:] for w in weights], dim=0).t().contiguous(),
     ).view(tokens, layers, width)
-    actual = [torch.zeros_like(expected) for _ in range(layers)]
+    actual = [torch.zeros_like(expected).unsqueeze(1) for _ in range(layers)]
     mla_latent_norm_rope_scatter(
         stacked,
         torch.stack([norm.weight.data for norm in norms]),
@@ -525,16 +574,18 @@ def test_the_fused_mla_context_write_reproduces_the_per_layer_chain() -> None:
         rotary.cos_sin_cache,
         positions,
         loc,
-        torch.tensor([p.data_ptr() for p in actual], dtype=torch.int64, device=device),
-        actual[0].stride(0),
-        dtype,
+        LatentPlanes.from_buffers(actual),
+        write_mask=None,
         is_neox=rotary.is_neox_style,
         sanitize=False,
     )
 
     for index in range(layers):
         torch.testing.assert_close(
-            actual[index].float(), planes[index].float(), atol=2e-2, rtol=2e-2
+            actual[index].squeeze(1).float(),
+            planes[index].float(),
+            atol=2e-2,
+            rtol=2e-2,
         )
 
 

@@ -48,7 +48,7 @@ use ts_control::{
     eplb::{Algorithm, Controller, EplbConfig, EplbSpecs, SlotMoves},
     event_loop::{
         DataPlane, DataPlaneError, Dispatch, DpRound, EventLoop, Frontend, Load, LoopConfig,
-        LoopError, Ranks, Subsystems,
+        LoopError, PrefillDelay, Ranks, Subsystems,
     },
     grammar::{GrammarConfig, GrammarKey, Grammars},
     ingress::{Admission, IngressLimits, LogprobServability},
@@ -70,8 +70,9 @@ use ts_wire::{
     codec::Dict,
     control::{
         FlushCacheReqInput, IsSchedulerPausedReqInput, IsSleepingReqInput, PauseSchedulerReqInput,
-        ProfileReq, ReleaseMemoryOccupationReqInput, ResumeMemoryOccupationReqInput,
-        ResumeSchedulerReqInput, UpdateWeightFromDiskReqInput, PROFILE_START,
+        ProfileReq, ReleaseMemoryOccupationReqInput, ReloadForwardReqInput,
+        ResumeMemoryOccupationReqInput, ResumeSchedulerReqInput, UpdateWeightFromDiskReqInput,
+        PROFILE_START,
     },
     multimodal::{Modality, MultimodalDataItem, MultimodalInputs},
     ControlOutput, ControlRequest, EngineCoreReadyResponse, EngineRequest, SamplingParams,
@@ -127,7 +128,12 @@ enum Tiers {
 /// shard, so the Device keeps 512 usable Full blocks (64 on
 /// `HostL2WriteBackForcedRetraction`) and a tier with Host pages 1024, the
 /// counts the tests' numbers rely on.
-fn new_scheduler(tiers: Tiers, role: Role, kv_shard_count: usize) -> Scheduler {
+fn new_scheduler(
+    tiers: Tiers,
+    role: Role,
+    kv_shard_count: usize,
+    device_pages: usize,
+) -> Scheduler {
     interpreter();
     let role = match role {
         Role::Plain => "Fused",
@@ -178,10 +184,10 @@ cfg = ts.SchedulerConfig()
 cfg.prefix_granularity = 16
 cfg.max_scheduled_tokens = {MAX_SCHEDULED_TOKENS}
 cfg.max_batch_size = 8
-cfg.num_device_pages = 512 // {kv_shard_count} + 1
+cfg.num_device_pages = ({device_pages} - 1) // {kv_shard_count} + 1
 cfg.num_snapshot_pages = 1
 cfg.cache_groups = [ts.CacheGroupConfig(group_id="full_attention", block_granularity=16,
-                                        total_pages=513, attn_kind=ts.AttnKind.Full,
+                                        total_pages={device_pages}, attn_kind=ts.AttnKind.Full,
                                         cache_blocks_per_lcm_block={kv_shard_count},
                                         shard_count={kv_shard_count})]
 cfg.role = ts.SchedulerConfig.Role.{role}
@@ -417,8 +423,8 @@ struct FakePeer {
     role: Role,
     rank: usize,
     wire: Arc<Mutex<Wire>>,
-    /// Tracked requests: rid, room, bootstrapped.
-    tracked: Vec<(String, u64, bool)>,
+    /// Tracked requests: rid, room, bootstrapped, failure reported.
+    tracked: Vec<(String, u64, bool, bool)>,
 }
 
 impl TransferPeer for FakePeer {
@@ -432,7 +438,8 @@ impl TransferPeer for FakePeer {
                 .or_default()
                 .decode_registered = true;
         }
-        self.tracked.push((rid.to_owned(), bootstrap.room, false));
+        self.tracked
+            .push((rid.to_owned(), bootstrap.room, false, false));
         Ok(())
     }
 
@@ -450,10 +457,10 @@ impl TransferPeer for FakePeer {
             let prefill_ranks = wire.prefill_ranks;
             self.tracked
                 .iter()
-                .map(|(_, room, bootstrapped)| {
+                .flat_map(|(_, room, bootstrapped, _)| {
                     let room = wire.rooms.entry(*room).or_default();
                     let poll = if room.fails
-                        || (room.cancel_pending && !room.hold_cancel)
+                        || room.cancel_pending
                         || (role == Role::Prefill && room.fails_on_prefill_rank == Some(rank))
                     {
                         TransferPoll::Failed
@@ -480,7 +487,9 @@ impl TransferPeer for FakePeer {
                             TransferPoll::Bootstrapped
                         }
                     };
-                    poll as i64
+                    // Retirement must agree too: hold_cancel can change
+                    // between ranks polling the shared wire.
+                    [poll as i64, i64::from(!room.hold_cancel)]
                 })
                 .collect()
         };
@@ -492,41 +501,51 @@ impl TransferPeer for FakePeer {
 
         let mut wire = self.wire.lock().unwrap();
         let mut events = Vec::new();
-        let mut agreed = agreed.into_iter();
-        self.tracked.retain_mut(|(rid, room, bootstrapped)| {
-            let poll = agreed.next().expect("one state per tracked request");
-            let room = wire.rooms.entry(*room).or_default();
-            match TransferPoll::from_wire(poll).unwrap_or(TransferPoll::Failed) {
-                TransferPoll::Failed => {
-                    // The peer engine sees the failure only on the wire.
-                    room.fails = true;
-                    events.push(PdEvent::Failed(rid.clone()));
-                    false
+        let mut agreed = agreed.chunks_exact(2);
+        self.tracked
+            .retain_mut(|(rid, room, bootstrapped, failed)| {
+                let state = agreed.next().expect("one state per tracked request");
+                let (poll, retired) = (state[0], state[1]);
+                let room = wire.rooms.entry(*room).or_default();
+                match TransferPoll::from_wire(poll).unwrap_or(TransferPoll::Failed) {
+                    TransferPoll::Failed => {
+                        // Failure ends the output before held writes retire.
+                        room.fails = true;
+                        if !*failed {
+                            events.push(PdEvent::Failed(rid.clone()));
+                            *failed = true;
+                        }
+                        if retired == 0 {
+                            true
+                        } else {
+                            events.push(PdEvent::Stopped(rid.clone()));
+                            false
+                        }
+                    }
+                    TransferPoll::Bootstrapped if !*bootstrapped => {
+                        *bootstrapped = true;
+                        events.push(PdEvent::Bootstrapped(rid.clone()));
+                        true
+                    }
+                    TransferPoll::Success => {
+                        events.push(match role {
+                            Role::Prefill => PdEvent::Succeeded(rid.clone()),
+                            _ => PdEvent::RemotePrefillDone(RemotePrefill {
+                                rid: rid.clone(),
+                                bootstrap_token: room.sent.expect("sent with the KV"),
+                                cached_tokens: 0,
+                                bootstrap_logprob: None,
+                                spec_candidate_ids: None,
+                                request_pool_index: room
+                                    .preallocated
+                                    .expect("admitted before the KV moved"),
+                            }),
+                        });
+                        false
+                    }
+                    _ => true,
                 }
-                TransferPoll::Bootstrapped if !*bootstrapped => {
-                    *bootstrapped = true;
-                    events.push(PdEvent::Bootstrapped(rid.clone()));
-                    true
-                }
-                TransferPoll::Success => {
-                    events.push(match role {
-                        Role::Prefill => PdEvent::Succeeded(rid.clone()),
-                        _ => PdEvent::RemotePrefillDone(RemotePrefill {
-                            rid: rid.clone(),
-                            bootstrap_token: room.sent.expect("sent with the KV"),
-                            cached_tokens: 0,
-                            bootstrap_logprob: None,
-                            spec_candidate_ids: None,
-                            request_pool_index: room
-                                .preallocated
-                                .expect("admitted before the KV moved"),
-                        }),
-                    });
-                    false
-                }
-                _ => true,
-            }
-        });
+            });
         Ok(events)
     }
 
@@ -539,7 +558,7 @@ impl TransferPeer for FakePeer {
     fn abort_room(&mut self, _: &str, _: u64) {}
 
     fn cancel(&mut self, rid: &str) {
-        if let Some((_, room, _)) = self.tracked.iter().find(|(id, _, _)| id == rid) {
+        if let Some((_, room, _, _)) = self.tracked.iter().find(|(id, _, _, _)| id == rid) {
             self.wire
                 .lock()
                 .unwrap()
@@ -840,6 +859,11 @@ impl DataPlane for FakeDevice {
             .unwrap()
             .push(format!("release {}", tags.join(",")));
         Ok(())
+    }
+
+    fn reload_forward(&mut self, op: &ControlRequest) -> Result<(bool, String), DataPlaneError> {
+        self.device_ops.lock().unwrap().push(op.tag().to_owned());
+        Ok((!self.fail_weight_update, "reloaded".to_owned()))
     }
 
     fn resume_memory(&mut self, tags: &[String]) -> Result<(), DataPlaneError> {
@@ -1224,6 +1248,10 @@ struct Pd {
 struct Setup {
     /// Override the ingress context limit to exercise native capacity errors.
     context_limit: Option<i64>,
+    /// Override the Device pool size for capacity-pressure scenarios.
+    device_pages: Option<usize>,
+    /// Batch prefill in windows, with pressure checks for fresh admissions.
+    prefill_delay: Option<PrefillDelay>,
     /// Predecessors Engram reads per token.
     ngram_context_len: usize,
     /// PD: the engine's role and its peer's wire.
@@ -1272,6 +1300,7 @@ impl Layout {
 /// The loop's settings for `setup`.
 fn loop_config(in_flight_depth: usize, pipeline: bool, setup: &Setup) -> LoopConfig {
     let pd = setup.pd.as_ref();
+    let kv_total_pages = setup.device_pages.map_or(512, |pages| pages as i64 - 1);
     LoopConfig {
         in_flight_depth,
         limits: IngressLimits {
@@ -1285,6 +1314,7 @@ fn loop_config(in_flight_depth: usize, pipeline: bool, setup: &Setup) -> LoopCon
             multimodal: setup.epd_receive_enabled,
             grammar: setup.grammar,
             reasoning: None,
+            reasoning_usage: None,
             logprobs: LogprobServability {
                 supports_prompt_logprobs: true,
                 logprob_order: "torch".to_owned(),
@@ -1294,8 +1324,8 @@ fn loop_config(in_flight_depth: usize, pipeline: bool, setup: &Setup) -> LoopCon
                 computes_prompt_logprobs: pd.is_none_or(|pd| pd.role != Role::Decode),
             },
         },
-        kv_total_pages: 512,
-        kv_token_capacity: 512 * 16,
+        kv_total_pages,
+        kv_token_capacity: kv_total_pages * 16,
         ngram_context_len: setup.ngram_context_len,
         request_token_history: setup.request_token_history,
         request_token_history_lookback: setup.request_token_history_lookback,
@@ -1303,11 +1333,12 @@ fn loop_config(in_flight_depth: usize, pipeline: bool, setup: &Setup) -> LoopCon
             memory_saver: true,
             memory_regions: vec!["kv_cache".to_owned(), "weights".to_owned()],
             l3_weight_version: None,
+            allow_reload_forward: true,
         },
         batch_log: BatchLogConfig {
             enabled: true,
             decode_log_interval: 40,
-            num_total_pages: 512,
+            num_total_pages: kv_total_pages,
             spec_num_steps: 0,
             dp_rank: 0,
             disaggregated: pd.is_some(),
@@ -1319,6 +1350,7 @@ fn loop_config(in_flight_depth: usize, pipeline: bool, setup: &Setup) -> LoopCon
         // The fake device fills bitmasks from the committed matcher state,
         // as the eager path does.
         eager_grammar: setup.grammar,
+        prefill_delay: setup.prefill_delay,
     }
 }
 
@@ -1360,6 +1392,7 @@ fn run_rank<F: Frontend>(
     let dp = (num_engines > 1).then(|| Group::new(0, (0..world).collect(), rank).unwrap());
     let frontend = frontend();
     let Setup {
+        device_pages,
         pd,
         eplb,
         grammar,
@@ -1406,7 +1439,7 @@ fn run_rank<F: Frontend>(
         _ => 1,
     };
     let mut event_loop = EventLoop::new(
-        new_scheduler(tiers, role, kv_shard_count),
+        new_scheduler(tiers, role, kv_shard_count, device_pages.unwrap_or(513)),
         device,
         frontend,
         outputs,
@@ -1651,6 +1684,7 @@ struct ScriptedRank {
     cache_ops: Vec<CacheOpKind>,
     idle_forwards: usize,
     forwards: usize,
+    /// The device operations the rank ran (weight updates, reloads, ...).
     device_ops: Vec<String>,
 }
 
@@ -2159,6 +2193,37 @@ async fn a_long_prompt_is_prefilled_in_chunks() {
     .await;
     // The garbage tokens of the incomplete chunks never reach the client.
     assert_eq!(tokens(&chunks), [1000, 1001]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn delayed_long_prefill_completes_above_the_watermark() {
+    for layout in [Layout::Single, Layout::Dp(2)] {
+        for depth in [0, 1] {
+            let engine = start_ranks_with(
+                layout,
+                depth,
+                Tiers::DeviceOnly,
+                Setup {
+                    device_pages: Some(49),
+                    prefill_delay: Some(PrefillDelay {
+                        attempt_interval: 2,
+                        any_interval: 4,
+                    }),
+                    ..Setup::default()
+                },
+            )
+            .await;
+            // 720 prompt tokens + four output slots reserve 46 of 48 usable
+            // pages on the first 256-token chunk. Later chunks must drain
+            // through the actual local vote and (for DP) group collectives.
+            let chunks = run(&engine.client, request("long", 720, budget(4))).await;
+            assert_eq!(tokens(&chunks), [1000, 1001, 1002, 1003], "{chunks:?}");
+            assert_eq!(
+                chunks.last().unwrap().finish_reason.as_deref(),
+                Some("length")
+            );
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3489,6 +3554,15 @@ fn a_pd_abort_in_the_submission_round_retires_the_transfer() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_abort_pause_waits_for_pd_retirement_before_releasing_memory() {
+    assert_pause_waits_for_pd_retirement("abort").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wait_pause_waits_for_failed_pd_retirement_before_releasing_memory() {
+    assert_pause_waits_for_pd_retirement("wait").await;
+}
+
+async fn assert_pause_waits_for_pd_retirement(mode: &str) {
     let wire = Arc::new(Mutex::new(Wire {
         prefill_ranks: 2,
         ..Wire::default()
@@ -3534,23 +3608,47 @@ async fn an_abort_pause_waits_for_pd_retirement_before_releasing_memory() {
     .await
     .expect("decode allocated its KV landing pages");
 
-    let paused = control(&decode, pause("abort"));
+    let paused = control(&decode, pause(mode));
     tokio::pin!(paused);
+    if mode == "wait" {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut paused)
+                .await
+                .is_err()
+        );
+        wire.lock().unwrap().rooms.get_mut(&70).unwrap().fails = true;
+    }
+    let chunks = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            response = &mut paused => panic!("pause completed before PD retirement: {response:?}"),
+            chunks = collect(stream) => chunks,
+        }
+    })
+    .await
+    .expect("Failed ends the output while Stopped is withheld");
     assert!(
         tokio::time::timeout(Duration::from_millis(100), &mut paused)
             .await
             .is_err()
     );
-    assert!(wire.lock().unwrap().rooms[&70].cancel_pending);
-    for rank in 0..decode.ranks.len() {
-        assert!(
-            decode.released_on(rank).is_empty(),
-            "pages released before the peer retired"
-        );
+    if mode == "abort" {
+        assert!(wire.lock().unwrap().rooms[&70].cancel_pending);
     }
+    // Failed may already forget the request's output state; the scheduler's
+    // transfer pin must still prevent its pages from being flushed.
+    assert_eq!(
+        control(
+            &decode,
+            ControlRequest::FlushCache(FlushCacheReqInput {
+                rid: None,
+                http_worker_ipc: None,
+            })
+        )
+        .await,
+        [("FlushCacheReqOutput", false)]
+    );
     wire.lock().unwrap().rooms.get_mut(&70).unwrap().hold_cancel = false;
     assert_eq!(paused.await, [("PauseSchedulerReqOutput", true)]);
-    let chunks = collect(stream).await;
     assert!(tokens(&chunks).is_empty());
     assert_eq!(
         chunks.last().unwrap().finish_reason.as_deref(),
@@ -4147,6 +4245,7 @@ fn outcome(replies: Vec<ControlOutput>) -> Vec<(&'static str, bool)> {
                 ControlOutput::ResumeMemoryOccupation(r) => r.success,
                 ControlOutput::IsSleeping(r) => r.is_sleeping,
                 ControlOutput::Profile(r) => r.success,
+                ControlOutput::ReloadForward(r) => r.success,
                 other => panic!("unexpected {}", other.tag()),
             };
             (reply.tag(), flag)
@@ -4210,6 +4309,100 @@ async fn a_wait_pause_answers_once_drained_and_withholds_new_requests() {
         chunks.push(chunk.unwrap());
     }
     assert_eq!(tokens(&chunks), [1000, 1001, 1002]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forward_reload_drains_runs_once_on_every_rank_and_resumes() {
+    let engine = start_ranks(Layout::Tp(2), 1, Tiers::DeviceOnly).await;
+    let running = engine
+        .client
+        .generate(request("r1", 3, budget(40)))
+        .await
+        .unwrap();
+    let reload = ControlRequest::ReloadForward(ReloadForwardReqInput {
+        rid: None,
+        http_worker_ipc: None,
+        mode: "wait".to_owned(),
+        modules: None,
+        id: Some("tp".to_owned()),
+        timeout_s: None,
+    });
+    // The reload answers only after r1 finished, on the old code.
+    let (reloaded, chunks) = tokio::join!(control(&engine, reload), collect(running));
+    assert_eq!(reloaded, [("ReloadForwardReqOutput", true)]);
+    assert_eq!(tokens(&chunks).len(), 40);
+    for rank in &engine.ranks {
+        assert_eq!(*rank.device_ops.lock().unwrap(), ["ReloadForwardReqInput"]);
+    }
+    // It resumed on its own: a new request is served.
+    let served = collect(
+        engine
+            .client
+            .generate(request("r2", 3, budget(3)))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(tokens(&served), [1000, 1001, 1002]);
+}
+
+#[test]
+fn a_reload_runs_once_every_dp_engine_holds_the_same_one() {
+    let reload = |id: &str| {
+        EngineRequest::Control(Box::new(ControlRequest::ReloadForward(
+            ReloadForwardReqInput {
+                rid: None,
+                http_worker_ipc: None,
+                mode: "wait".to_owned(),
+                modules: None,
+                id: Some(id.to_owned()),
+                timeout_s: None,
+            },
+        )))
+    };
+    let mut first: Script = vec![Vec::new(); 14];
+    let mut second: Script = vec![Vec::new(); 14];
+    // Sent to one engine only, it waits there until a resume cancels it.
+    first[0].push(reload("lost"));
+    first[3].push(EngineRequest::Control(Box::new(resume())));
+    // Different reloads at the two heads wait, never fail the loop.
+    first[5].push(reload("a"));
+    second[5].push(reload("b"));
+    first[7].push(EngineRequest::Control(Box::new(resume())));
+    second[7].push(EngineRequest::Control(Box::new(resume())));
+    // The same one on both runs once on each, in the round both drained.
+    first[8].push(reload("both"));
+    second[9].push(reload("both"));
+    let ranks = run_scripted(
+        Layout::Dp(2),
+        1,
+        Tiers::DeviceOnly,
+        Setup::default(),
+        vec![first, second],
+        no_reaction,
+    );
+    for rank in &ranks {
+        assert_eq!(rank.outcome, Ok(()));
+        assert_eq!(rank.device_ops, ["ReloadForwardReqInput"]);
+    }
+    assert_eq!(
+        outcome(ranks[0].replies.clone()),
+        [
+            ("ReloadForwardReqOutput", false),
+            ("ResumeSchedulerReqOutput", true),
+            ("ReloadForwardReqOutput", false),
+            ("ResumeSchedulerReqOutput", true),
+            ("ReloadForwardReqOutput", true)
+        ]
+    );
+    assert_eq!(
+        outcome(ranks[1].replies.clone()),
+        [
+            ("ReloadForwardReqOutput", false),
+            ("ResumeSchedulerReqOutput", true),
+            ("ReloadForwardReqOutput", true)
+        ]
+    );
 }
 
 /// A JSON schema the toy vocabulary takes most of a second to compile.

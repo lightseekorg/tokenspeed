@@ -34,6 +34,7 @@ from tokenspeed_kernel.ops.communication._iris import (
 from tokenspeed_kernel.ops.communication._iris.all_gather import (
     IrisAllGather,
     all_gather_columns_can_run,
+    iris_fused_lamport_allgather_rmsnorm,
     iris_fused_lamport_allgather_rmsnorm_mxfp4,
     iris_fused_pull_allgather_rmsnorm_mxfp4,
     iris_pull_allgather_rows,
@@ -44,6 +45,7 @@ from tokenspeed_kernel.ops.communication._iris.all_reduce import (
 )
 from tokenspeed_kernel.ops.communication._iris.broadcast import IrisBroadcast
 from tokenspeed_kernel.ops.communication._iris.muse_spark.all_gather import (
+    iris_fused_lamport_allgather_rmsnorm_mxfp4_topk,
     iris_pack_moe_inputs,
     iris_pull_allgather_moe_inputs,
 )
@@ -54,12 +56,14 @@ from tokenspeed_kernel.ops.communication._iris.muse_spark.all_to_all import (
 from tokenspeed_kernel.ops.communication._iris.muse_spark.attntail import (
     iris_fused_lamport_allreduce_muse_attntail,
     iris_fused_pull_allgather_muse_attntail,
+    iris_fused_sliding_attention_twoshot_muse_attntail,
 )
 from tokenspeed_kernel.ops.communication._iris.muse_spark.column_split import (
     iris_column_routed_rmsnorm_sum_return,
     iris_pull_allgather_sorted_mxfp4_slices,
 )
 from tokenspeed_kernel.ops.communication._iris.muse_spark.moetail import (
+    iris_columns_lamport_allgather_muse_moetail,
     iris_fused_gemv_lamport_allgather_muse_moetail,
 )
 from tokenspeed_kernel.ops.communication._iris.muse_spark.routed_moe import (
@@ -77,8 +81,16 @@ from tokenspeed_kernel.ops.moe import gather_moe_routes
 from tokenspeed_kernel.platform import current_platform
 
 if current_platform().is_cdna4:
+    from tokenspeed_kernel_amd._extern import extern_compile_options
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mha.decode import (
+        get_config as mha_decode_config,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.decode_gemv import (
         gluon_rowcta_bf16_gemv_geometry_gfx950,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
+        launch_gluon_mm_a16w16_column_shard_gfx950,
+        supports_gluon_mm_a16w16_column_shard_gfx950,
     )
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (
         sorted_route_capacity,
@@ -109,11 +121,26 @@ _MUSE_INTERMEDIATE_GATHER_PROGRAMS = 64
 # The routed norm is latency bound: 256 programs were close to the best grid
 # from 192 to 8192 tokens.
 _MUSE_COLUMN_NORM_PROGRAMS = 256
-# Most decode rows for the fused post-expert tail at TP8; it lost to the
-# replicated projection plus boundary at 16 rows in 8-rank graph replay.
-# Rows match the single-row tail bit for bit within 1-8 rows; 16 rows take
-# the replicated path.
+# Decode rows whose post-expert tail projects in the gather's senders (column
+# GEMV) at TP8. Rows match the single-row tail bit for bit within 1-8 rows.
 _MUSE_MOETAIL_MAX_ROWS = 8
+# Most decode rows of the fused sliding attention tail: 8 and 16 verify rows
+# (one or two requests). Its two-shot shards rows, so rows are a multiple of 8.
+_MUSE_ATTNTAIL_MAX_ROWS = 16
+# The tail launch is one workgroup per compute unit; its LDS reservation
+# keeps the attention splits' units free of senders.
+_MUSE_ATTNTAIL_PROGRAMS = 256
+# Columns one owner workgroup of the attention tail reduces (8 per rank).
+_MUSE_ATTNTAIL_OWNER_COLUMNS = 128
+_MUSE_ATTNTAIL_RESERVED_LDS = 128 * 1024
+# Up to this many rows, a decode GEMM over the rank's column shard (bitwise
+# the replicated GEMM's columns) feeds the same gather. Measured in 8-rank
+# graph replay, it beats the replicated projection plus boundary at 9-16 rows,
+# where the column GEMV senders lose.
+_MUSE_MOETAIL_COLUMN_MAX_ROWS = 16
+# Columns each column-input sender pushes per row: 64 BF16 columns, so every
+# push instruction writes whole 128-byte lines.
+_MUSE_MOETAIL_COLUMN_OUTPUTS = 64
 
 
 class MuseIrisState:
@@ -123,7 +150,9 @@ class MuseIrisState:
     return borrowed activations. No borrowed producer-buffer or pull-scratch
     view, nor the ready flags guarding it, may be live across an ordinary
     reduction on the group, including one the backend runs for another
-    caller through ProducerAllReduce.reduce_ordinary.
+    caller through ProducerAllReduce.reduce_ordinary, or across a column
+    gather another caller runs through the installed gather (a draft's
+    capture sink gathers its context columns at a layer boundary).
     The generic all-reduce retains its independent-output contract.
     Expert TP and EP use the same owned-row token cutoffs; each owner
     holds ceil(global rows / world size) rows, with padding masked.
@@ -178,7 +207,30 @@ class MuseIrisState:
                 (MuseIrisState._column_routes_words(column_rows, world_size),),
                 torch.uint32,
             )
+        if MuseIrisState._attntail_supported(world_size, enable_lamport):
+            for shape, dtype in MuseIrisState._attntail_buffers(world_size):
+                size += allocation_bytes(shape, dtype)
         return size
+
+    @staticmethod
+    def _attntail_supported(world_size: int, enable_lamport: bool) -> bool:
+        """Whether the fused sliding attention tail is prepared (TP8 gfx950)."""
+        return current_platform().is_cdna4 and world_size == 8 and enable_lamport
+
+    @staticmethod
+    def _attntail_buffers(
+        world_size: int,
+    ) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
+        """Symmetric buffers of the fused attention tail, in allocation order:
+        the two-shot region [stage][reduce-scatter, all-gather][source][shard]
+        (column shards of [rows, 8192 / world_size]) and the tagged norm sums
+        [column owner][row][4]."""
+        shard = _MUSE_ATTNTAIL_MAX_ROWS * _MUSE_BOUNDARY_WIDTH // world_size
+        owners = _MUSE_BOUNDARY_WIDTH // _MUSE_ATTNTAIL_OWNER_COLUMNS
+        return (
+            ((3, 2, world_size, shard), torch.bfloat16),
+            ((owners, _MUSE_ATTNTAIL_MAX_ROWS, 4), torch.int64),
+        )
 
     @staticmethod
     def _column_routes_max_rows(
@@ -396,6 +448,47 @@ class MuseIrisState:
             offset = self.column_routes_region.data_ptr() - peers.addresses[peers.rank]
             self.column_routes_peer_addresses = tuple(
                 base + offset for base in peers.addresses[: self.world_size]
+            )
+        # The fused sliding attention tail (sliding_attention_boundary).
+        self.attntail_region = None
+        self.attntail_region_peers = None
+        self.attntail_sums = None
+        self.attntail_sums_peers = None
+        self.attention_buffer = None
+        self.attntail_epochs = None
+        self.attntail_counters = None
+        if self._attntail_supported(self.world_size, enable_lamport):
+            region_shape, sums_shape = (
+                shape for shape, _ in self._attntail_buffers(self.world_size)
+            )
+            self.attntail_region = peers.ctx.empty(region_shape, dtype=torch.bfloat16)
+            # Empty two-shot words: BF16 +0 below -0 (iris_lamport_twoshot_clear's marker).
+            self.attntail_region.view(torch.int32).fill_(-(2**31))
+            self.attntail_sums = peers.ctx.zeros(sums_shape, dtype=torch.int64)
+            base = peers.addresses[peers.rank]
+            self.attntail_region_peers = tuple(
+                address + self.attntail_region.data_ptr() - base
+                for address in peers.addresses[: self.world_size]
+            )
+            self.attntail_sums_peers = tuple(
+                address + self.attntail_sums.data_ptr() - base
+                for address in peers.addresses[: self.world_size]
+            )
+            # The merged attention rows of up to 16 tokens x 1024 columns as
+            # local Lamport BF16 words (empty: -0.0 in both halves).
+            self.attention_buffer = torch.full(
+                (_MUSE_ATTNTAIL_MAX_ROWS * 512,),
+                -2147450880,
+                dtype=torch.int32,
+                device=peers.device,
+            )
+            # One epoch word per workgroup; every launch advances all of them.
+            self.attntail_epochs = torch.zeros(
+                _MUSE_ATTNTAIL_PROGRAMS, dtype=torch.int32, device=peers.device
+            )
+            # Split arrival counters, reset by each row block's merging split.
+            self.attntail_counters = torch.zeros(
+                _MUSE_ATTNTAIL_MAX_ROWS // 8 * 2, dtype=torch.int32, device=peers.device
             )
 
     def reduce(self, tensor: torch.Tensor) -> torch.Tensor:
@@ -1290,6 +1383,197 @@ class MuseIrisState:
         )
         return out_stream, pre_fp32, pre_bf16
 
+    def _sliding_attention_config(
+        self,
+        rows: int,
+        requests: int,
+        k_cache: torch.Tensor,
+        max_seqlen_k: int,
+        window_left: int,
+        softmax_scale: float,
+    ):
+        """The sliding split-decode config the fused tail serves for rows FP8
+        query rows of 16 heads of 64 from requests requests, or None. The tail
+        serves 8 verify rows per request only: plain decode (one row per
+        request) declines."""
+        if (
+            self.attntail_region is None
+            or k_cache.dtype != torch.float8_e4m3fn
+            or rows != 8 * requests
+            or not 0 < rows <= _MUSE_ATTNTAIL_MAX_ROWS
+            or window_left < 0
+        ):
+            return None
+        config = mha_decode_config(
+            # Only the query's shape and dtype select the config.
+            q=torch.empty((rows, 16, 64), dtype=torch.float8_e4m3fn, device="meta"),
+            k_cache=k_cache,
+            max_seqlen_k=max_seqlen_k,
+            max_seqlen_q=8,
+            window_left=window_left,
+            softmax_scale=softmax_scale,
+        )
+        # The tail runs the 4-wave, one-row-block sliding split with the merge.
+        if (
+            not config.is_sliding
+            or config.num_row_blocks != 1
+            or config.num_warps != 4
+            or config.num_kv_splits < 2
+            or config.num_kv_heads != 2
+        ):
+            return None
+        return config
+
+    def can_sliding_attention_boundary(
+        self,
+        rows: int,
+        requests: int,
+        k_cache: torch.Tensor,
+        max_seqlen_k: int,
+        window_left: int,
+        softmax_scale: float,
+        weight: torch.Tensor,
+        stream: torch.Tensor,
+    ) -> bool:
+        """Whether sliding_attention_boundary serves rows decode rows of
+        requests requests (the length of the cache's seq_lens).
+
+        TP8 gfx950, FP8 KV, 8 or 16 verify rows of 16 query heads of 64, the
+        4-wave sliding split, and this rank's [8192, 1024] BF16 o_proj.
+        """
+        return (
+            self._sliding_attention_config(
+                rows, requests, k_cache, max_seqlen_k, window_left, softmax_scale
+            )
+            is not None
+            and weight.shape == (_MUSE_BOUNDARY_WIDTH, 1024)
+            and weight.dtype == torch.bfloat16
+            and weight.is_contiguous()
+            and stream.shape == (rows, _MUSE_BOUNDARY_WIDTH)
+            and stream.dtype == torch.float32
+            and stream.is_contiguous()
+        )
+
+    def sliding_attention_boundary(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        page_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        max_seqlen_k: int,
+        window_left: int,
+        softmax_scale: float,
+        gate: torch.Tensor,
+        weight: torch.Tensor,
+        stream: torch.Tensor,
+        post_weight: torch.Tensor | None,
+        alpha: torch.Tensor,
+        beta: torch.Tensor,
+        pre_weight: torch.Tensor,
+        gate_eps: float,
+        post_eps: float,
+        post_weight_offset: float,
+        pre_eps: float,
+        pre_weight_offset: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Sliding decode attention through the attention boundary in one launch.
+
+        Attends the prepared FP8 query over the cache, applies the gated
+        per-head norm, projects through this rank's o_proj, all-reduces the
+        partials (two-shot), updates the FP32 residual and normalizes it for
+        MoE. Returns the FP32 residual, the FP32 router input and the BF16
+        pre-expert input, as all_reduce_symmetric_boundary does after
+        attention, weightless_rmsnorm_gated_sigmoid and the projection.
+        gate is the [rows, 1024] gate logits (a strided view is fine).
+        """
+        rows = q.shape[0]
+        config = self._sliding_attention_config(
+            rows,
+            cache_seqlens.shape[0],
+            k_cache,
+            max_seqlen_k,
+            window_left,
+            softmax_scale,
+        )
+        assert config is not None and q.shape == (rows, 16, 64)
+        assert q.dtype == torch.float8_e4m3fn and gate.stride(1) == 1
+        splits = config.num_kv_splits
+        mid_o = torch.empty(
+            (rows, config.num_q_heads, splits, config.head_dim),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        mid_lse = torch.empty(
+            (rows, config.num_q_heads, splits), dtype=torch.float32, device=q.device
+        )
+        out_stream = torch.empty_like(stream)
+        pre_fp32 = torch.empty_like(stream)
+        pre_bf16 = torch.empty(stream.shape, dtype=torch.bfloat16, device=q.device)
+        iris_fused_sliding_attention_twoshot_muse_attntail[(_MUSE_ATTNTAIL_PROGRAMS,)](
+            q,
+            k_cache,
+            v_cache,
+            page_table,
+            cache_seqlens,
+            mid_o,
+            mid_lse,
+            self.attntail_counters,
+            gate,
+            gate.stride(0),
+            weight,
+            self.attention_buffer,
+            self.attntail_epochs,
+            self.attntail_region,
+            self.attntail_region_peers,
+            self.attntail_sums,
+            self.attntail_sums_peers,
+            stream,
+            post_weight if post_weight is not None else pre_weight,
+            alpha,
+            beta,
+            pre_weight,
+            out_stream,
+            pre_fp32,
+            pre_bf16,
+            rows,
+            Q_STRIDE_B=q.stride(0),
+            Q_STRIDE_H=q.stride(1),
+            Q_STRIDE_D=q.stride(2),
+            SM_SCALE=config.sm_scale,
+            PAGE_TABLE_STRIDE=page_table.stride(0),
+            PAGE_SIZE=config.page_size,
+            NUM_KV_SPLITS=splits,
+            MAX_SEQLEN_Q=8,
+            NUM_Q_HEADS=config.num_q_heads,
+            NUM_KV_HEADS=config.num_kv_heads,
+            HEAD_DIM=config.head_dim,
+            BLOCK_M=config.block_m,
+            BLOCK_N=config.block_n,
+            WINDOW_LEFT=config.window_left,
+            IS_FP8=True,
+            NUM_REQUESTS=config.num_requests,
+            WIDTH=_MUSE_BOUNDARY_WIDTH,
+            RANK=self.all_reduce.rank_in_group,
+            WORLD_SIZE=self.world_size,
+            MAX_SHARD_ELEMENTS=self.attntail_region.shape[-1],
+            MAX_ROWS=_MUSE_ATTNTAIL_MAX_ROWS,
+            # (row, part) finishers: 8 per row at 8 rows, 4 at 16 (CU budget).
+            PARTS=8 if rows <= 8 else 4,
+            GATE_EPS=gate_eps,
+            POST_EPS=post_eps,
+            POST_WEIGHT_OFFSET=post_weight_offset,
+            PRE_EPS=pre_eps,
+            PRE_WEIGHT_OFFSET=pre_weight_offset,
+            POST_HAS_WEIGHT=post_weight is not None,
+            RESERVED_LDS=_MUSE_ATTNTAIL_RESERVED_LDS,
+            NUM_STAGES=config.num_stages,
+            PEER_SIGNAL_STORE_CACHE=self._arch.peer_signal_store,
+            num_warps=config.num_warps,
+            **extern_compile_options(),
+        )
+        return out_stream, pre_fp32, pre_bf16
+
     def _moetail_geometry(
         self,
         rows: int,
@@ -1300,10 +1584,15 @@ class MuseIrisState:
         beta: torch.Tensor,
         pre_weight: torch.Tensor | None,
     ) -> tuple[int, int] | None:
-        """Return the senders' GEMV geometry if the fused tail applies, else None."""
+        """Return the senders' geometry if the fused tail applies, else None.
+
+        The geometry is the column GEMV's (BLOCK_K, WAVES_PER_OUTPUT); above
+        ``_MUSE_MOETAIL_MAX_ROWS`` rows a column-shard decode GEMM projects the
+        rows instead and the geometry is unused.
+        """
         reduction = self.reduction
         # TP4 takes one row: more rows were not measured there.
-        max_rows = _MUSE_MOETAIL_MAX_ROWS if self.world_size == 8 else 1
+        max_rows = _MUSE_MOETAIL_COLUMN_MAX_ROWS if self.world_size == 8 else 1
         if (
             not current_platform().is_cdna4
             or self.world_size not in (4, 8)
@@ -1334,6 +1623,15 @@ class MuseIrisState:
             for value, dtype in vectors
         ):
             return None
+        if rows > _MUSE_MOETAIL_MAX_ROWS:
+            # The replicated path would run the decode GEMM; its column shard
+            # keeps every output's reduction.
+            local_width = _MUSE_BOUNDARY_WIDTH // self.world_size
+            if not supports_gluon_mm_a16w16_column_shard_gfx950(
+                rows, weight.shape[0], local_width, weight.shape[1]
+            ):
+                return None
+            return 0, 0
         # Senders repeat the replicated GEMV's per-output reduction, each
         # storing an even number of outputs in its 16 subgroups.
         block_k, waves = gluon_rowcta_bf16_gemv_geometry_gfx950(*weight.shape)
@@ -1355,7 +1653,7 @@ class MuseIrisState:
 
         ``weight`` is the replicated ``[8192, 4096]`` projection; the rows are
         gathered through the Lamport one-shot mailbox. TP8 takes up to
-        ``_MUSE_MOETAIL_MAX_ROWS`` rows, TP4 one.
+        ``_MUSE_MOETAIL_COLUMN_MAX_ROWS`` rows, TP4 one.
         """
         return (
             self._moetail_geometry(
@@ -1381,8 +1679,9 @@ class MuseIrisState:
         """Project this rank's columns of each row, gather the rows, update the residual.
 
         Returns the FP32 residual and, with ``pre_weight``, the BF16 input of
-        the next layer; each row is the replicated single-row projection of
-        that row followed by the Triton boundary.
+        the next layer; each row is the replicated projection of that row (the
+        single-row GEMV up to ``_MUSE_MOETAIL_MAX_ROWS`` rows, the decode GEMM
+        beyond) followed by the Triton boundary.
         """
         geometry = self._moetail_geometry(
             x.shape[0], weight, stream, post_weight, alpha, beta, pre_weight
@@ -1401,13 +1700,52 @@ class MuseIrisState:
             if pre_weight is not None
             else None
         )
+        local_weight = weight[rank * local_width : (rank + 1) * local_width]
+        if rows > _MUSE_MOETAIL_MAX_ROWS:
+            columns = torch.empty(
+                rows, local_width, dtype=torch.bfloat16, device=x.device
+            )
+            launch_gluon_mm_a16w16_column_shard_gfx950(x, local_weight, columns)
+            outputs = _MUSE_MOETAIL_COLUMN_OUTPUTS
+            # Sixteen-subgroup senders of `outputs` columns each, then one
+            # reducer per row.
+            iris_columns_lamport_allgather_muse_moetail[
+                (local_width // outputs + rows,)
+            ](
+                columns,
+                reduction.lamport_region,
+                reduction.lamport_epochs,
+                reduction.lamport_peer_addresses[: self.world_size],
+                stream,
+                post_weight,
+                alpha,
+                beta,
+                pre_weight if pre_weight is not None else post_weight,
+                out_stream,
+                pre_bf16 if pre_bf16 is not None else x,
+                rows,
+                RANK=rank,
+                WORLD_SIZE=self.world_size,
+                LOCAL_WIDTH=local_width,
+                MAX_ELEMENTS=reduction.lamport_max_numel,
+                BLOCK_M=1 << (rows - 1).bit_length(),
+                OUTPUTS=outputs,
+                POST_EPS=post_eps,
+                POST_WEIGHT_OFFSET=post_weight_offset,
+                PRE_EPS=pre_eps,
+                PRE_WEIGHT_OFFSET=pre_weight_offset,
+                HAS_PRE=pre_weight is not None,
+                PEER_SIGNAL_STORE_CACHE=self._arch.peer_signal_store,
+                num_warps=16,
+            )
+            return out_stream, pre_bf16
         # Sixteen-subgroup programs of 16 // waves outputs each, then one
         # reducer per row.
         iris_fused_gemv_lamport_allgather_muse_moetail[
             (local_width * waves // 16 + rows,)
         ](
             x,
-            weight[rank * local_width : (rank + 1) * local_width],
+            local_weight,
             reduction.lamport_region,
             reduction.lamport_epochs,
             reduction.lamport_peer_addresses[: self.world_size],
@@ -1434,6 +1772,8 @@ class MuseIrisState:
             HAS_PRE=pre_weight is not None,
             PEER_SIGNAL_STORE_CACHE=self._arch.peer_signal_store,
             num_warps=16,
+            # The device library of the GEMV's per-step pin (_extern.arithmetic_fence).
+            **extern_compile_options(),
         )
         return out_stream, pre_bf16
 
@@ -1699,6 +2039,11 @@ class MuseIrisState:
         )
         return output
 
+    def warmup_reduce_outputs(self) -> None:
+        """Compile the two-shot pull that ``reduce_outputs`` takes between
+        the Lamport two-shot and owned-row windows, without running it."""
+        self.reduction.warmup_pull_two_shot(self.gather.output)
+
     def warmup_reduce_scatter_routed_rmsnorm_sum_all_gather(
         self, norm_weight: torch.Tensor, eps: float, weight_offset: float
     ) -> None:
@@ -1811,6 +2156,178 @@ class MuseIrisState:
             and total_width % 1024 == 0
             and rows * local_width <= self.reduction.lamport_max_numel
         )
+
+    def can_all_gather_rmsnorm(self, local: torch.Tensor, weight: torch.Tensor) -> bool:
+        """Check the TP4/TP8 gather-and-normalize contract (BF16 output)."""
+        return (
+            current_platform().is_cdna4
+            and self.world_size in (4, 8)
+            and local.ndim == 2
+            and local.dtype == torch.bfloat16
+            and local.device == self.all_reduce.device
+            and local.is_contiguous()
+            and weight.shape == (local.shape[1] * self.world_size,)
+            and weight.dtype == local.dtype
+            and weight.device == local.device
+            and weight.is_contiguous()
+            and self._lamport_gathers_rmsnorm_mxfp4(local)
+            # Four waves push one word of the shard each and poll whole
+            # 16-column runs of the row.
+            and local.shape[1] // 2 >= 256
+            and local.shape[1] * self.world_size % (16 * 256) == 0
+        )
+
+    def all_gather_rmsnorm(
+        self,
+        local: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        weight_offset: float,
+    ) -> torch.Tensor:
+        """Gather feature shards and return their RMSNorm as BF16 rows.
+
+        ``affine_rmsnorm`` of the gathered rows within one BF16 ulp (a rare
+        element rounds the other way), and a negative zero arrives as zero.
+
+        Args:
+            local: Contiguous BF16 ``[rows, width / world]`` shard.
+            weight: BF16 ``[width]`` norm weight.
+            eps: Epsilon added to the variance.
+            weight_offset: Center added to ``weight``.
+
+        Returns:
+            A new BF16 ``[rows, width]`` tensor.
+        """
+        if not self.can_all_gather_rmsnorm(local, weight):
+            raise RuntimeError("unsupported Iris gather-and-RMSNorm fusion")
+        if local.data_ptr() % 4:
+            # Rank-local fallback could split ranks across protocols.
+            raise ValueError(
+                "iris_fused_lamport_allgather_rmsnorm reads BF16 pairs as 32-bit "
+                f"words; local starts at byte {local.data_ptr() % 4} of a word"
+            )
+        rows, local_width = local.shape
+        total_width = local_width * self.world_size
+        output = local.new_empty((rows, total_width))
+        iris_fused_lamport_allgather_rmsnorm[(rows,)](
+            local,
+            weight,
+            output,
+            self.reduction.lamport_region,
+            self.reduction.lamport_epochs,
+            self.reduction.lamport_peer_addresses[: self.world_size],
+            rank=self.all_reduce.rank_in_group,
+            local_width=local_width,
+            total_width=total_width,
+            eps=eps,
+            weight_offset=weight_offset,
+            max_elements=self.reduction.lamport_max_numel,
+            PEER_SIGNAL_STORE_CACHE=self._arch.peer_signal_store,
+            WAIT_STORES=self._arch.wait_stores,
+            num_warps=4,
+        )
+        return output
+
+    def can_all_gather_rmsnorm_mxfp4_quant_topk(
+        self,
+        local: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor,
+        topk: int,
+    ) -> bool:
+        """Check the Lamport gather-and-quantize that also routes its rows.
+
+        The rows' FP32 logits must be contiguous ``[rows, bias.shape[0]]``.
+        """
+        experts = bias.shape[0] if bias.ndim == 1 else -1
+        return (
+            self.can_all_gather_rmsnorm_mxfp4_quant(local, weight)
+            and self._lamport_gathers_rmsnorm_mxfp4(local)
+            # The gfx950 top-k body takes power-of-two expert and top-k counts.
+            and triton.next_power_of_2(experts) == experts <= 1024
+            and triton.next_power_of_2(topk) == topk <= min(16, experts)
+            and bias.dtype == torch.float32
+            and bias.is_contiguous()
+            and bias.device == local.device
+        )
+
+    def all_gather_rmsnorm_mxfp4_quant_topk(
+        self,
+        local: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        weight_offset: float,
+        logits: torch.Tensor,
+        bias: torch.Tensor,
+        topk: int,
+        routed_scaling_factor: float,
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor]:
+        """Gather and quantize the expert inputs, and route the rows, in one launch.
+
+        Returns the MXFP4 rows and scales of :meth:`all_gather_rmsnorm_mxfp4_quant`
+        and the FP32 weights and int32 ids of the gfx950 biased-sigmoid top-k
+        (normalized, then scaled by ``routed_scaling_factor``).
+        """
+        if not self.can_all_gather_rmsnorm_mxfp4_quant_topk(
+            local, weight, bias, topk
+        ) or (
+            logits.shape != (local.shape[0], bias.shape[0])
+            or logits.dtype != torch.float32
+            or not logits.is_contiguous()
+            or logits.device != local.device
+        ):
+            raise RuntimeError("unsupported Iris gather, MXFP4 and top-k fusion")
+        if local.data_ptr() % 4:
+            # Rank-local fallback could split ranks across protocols.
+            raise ValueError(
+                "iris_fused_lamport_allgather_rmsnorm_mxfp4_topk reads BF16 pairs "
+                f"as 32-bit words; local starts at byte {local.data_ptr() % 4} of a word"
+            )
+        from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (
+            empty_swizzled_cdna4_mxfp4_scale,
+        )
+
+        rows, local_width = local.shape
+        total_width = local_width * self.world_size
+        packed = torch.empty(
+            (rows, total_width // 2), dtype=torch.uint8, device=local.device
+        )
+        scales = empty_swizzled_cdna4_mxfp4_scale(
+            rows, total_width // 32, device=local.device
+        )
+        topk_ids = torch.empty((rows, topk), dtype=torch.int32, device=local.device)
+        topk_weights = torch.empty(
+            (rows, topk), dtype=torch.float32, device=local.device
+        )
+        iris_fused_lamport_allgather_rmsnorm_mxfp4_topk[(2 * rows,)](
+            local,
+            weight,
+            packed,
+            scales,
+            self.reduction.lamport_region,
+            self.reduction.lamport_epochs,
+            self.reduction.lamport_peer_addresses[: self.world_size],
+            scales.stride(0),
+            scales.stride(1),
+            logits,
+            bias,
+            topk_ids,
+            topk_weights,
+            rows,
+            rank=self.all_reduce.rank_in_group,
+            local_width=local_width,
+            total_width=total_width,
+            eps=eps,
+            weight_offset=weight_offset,
+            max_elements=self.reduction.lamport_max_numel,
+            PEER_SIGNAL_STORE_CACHE=self._arch.peer_signal_store,
+            WAIT_STORES=self._arch.wait_stores,
+            EXPERTS=logits.shape[1],
+            TOPK=topk,
+            ROUTED_SCALING_FACTOR=float(routed_scaling_factor),
+            num_warps=1,
+        )
+        return (packed, scales), topk_weights, topk_ids
 
     def all_gather_rmsnorm_mxfp4_quant(
         self,

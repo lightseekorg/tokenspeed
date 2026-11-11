@@ -181,6 +181,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.cache.host_storage import HostCacheResources
     from tokenspeed.runtime.configs.model_config import ModelConfig
     from tokenspeed.runtime.engine.scheduler_utils import SchedulerCacheGeometry
+    from tokenspeed.runtime.execution.forward_reload import ForwardReloader
     from tokenspeed.runtime.execution.model_executor import ModelExecutor
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
@@ -393,6 +394,7 @@ class DeviceHandle:
         host_cache_executor=None,
         kv_transfer=None,
         weight_memory: WeightMemoryState | None = None,
+        forward_reloader: ForwardReloader | None = None,
     ) -> None:
         # Private by convention AND by absence: nothing below returns it.
         self._executor = executor
@@ -401,6 +403,8 @@ class DeviceHandle:
             if weight_memory is not None
             else WeightMemoryState(policy=None, models=())
         )
+        # Development only (--allow-reload-forward); None refuses reload_forward.
+        self._forward_reloader = forward_reloader
         # Resolved here, on the building thread, whose current device the
         # distributed init set: torch starts every new thread on device 0.
         self._forward_device = _thread_device(executor.device)
@@ -459,14 +463,18 @@ class DeviceHandle:
         whose sources the scheduler holds until the ACK -- rides the write
         stream and fences nothing), then the Device-to-Device block copies
         (``pages_to_copy``: a prefix hit's private copy of the block holding
-        its boundary, an owner's move off the block it just published; the
-        source may be re-granted by this very plan, so the copy precedes the
-        zeroing), then page zeroing (the new owner's
-        sanitization), then the Device-bound copies (``LoadBackOp`` and
-        ``RestoreOp``, ordered behind the zeroing: a load-back lands on
-        zeroed pages, a restore overwrites its destinations whole), the
-        transfer peer's remote streams, and finally the ``ForwardBatch``. The
-        loop hands the round over and does not branch on it.
+        its boundary, an owner's move off the block it just published, a
+        block a lone request's compaction moves; the source may be re-granted
+        by this very plan, so the copy precedes the zeroing; the execution
+        stream waits for the copies, so a later plan's stores, which order
+        behind it, read what they wrote even when no forward ran between),
+        then page zeroing (the new owner's sanitization), then the
+        Device-bound copies (``LoadBackOp`` and ``RestoreOp``, ordered behind
+        the zeroing and the forwards in flight, which may still write a
+        block freed by an abort and granted here; both overwrite their
+        destinations whole), the transfer peer's remote streams, and
+        finally the ``ForwardBatch``. The loop hands the round over and does
+        not branch on it.
 
         A store's ``request_pool_index`` names the victim's slot, which the
         scheduler frees in the same plan build: the slot's next owner first
@@ -553,9 +561,17 @@ class DeviceHandle:
             executor.copy_cache_pages(copies)
         zero_event = executor.zero_cache_pages(pages) if pages else None
         if l2 is not None:
-            # Behind the zeroing: the loads' destinations were zeroed on the
-            # default stream, so that is the prerequisite they order after.
-            # Every plan makes the call, with a load or not: it points the
+            if cache_ops:
+                # A load's or restore's destination may be a block that a
+                # forward still in flight writes: an abort frees its request's
+                # blocks at once, and this plan may grant one to a Host hit.
+                # The copies and the zeroing wait for those forwards, but a
+                # plan may have neither (a hit whose new tokens fit its tail
+                # block), so the loads wait for them here.
+                executor.default_stream.wait_stream(executor.execution_stream)
+            # Behind the store fence, the zeroing and the forwards in flight,
+            # all on the default stream, the prerequisite the loads order
+            # after. Every plan makes the call, with a load or not: it points the
             # layerwise load waits at this plan's load or at none, so neither
             # an eager layer nor a prefill graph replay of this plan waits on
             # an earlier plan's load. Without cache ops it enqueues nothing,
@@ -1046,6 +1062,33 @@ class DeviceHandle:
                 state.finish_update(success=False)
             return False, str(exc)
 
+    def reload_forward(self, req) -> tuple[bool, str]:
+        """Reload edited forward code with every peer, warm its kernels and recapture the graphs (``ReloadForwardReqInput``)."""
+        if self._forward_reloader is None:
+            return False, (
+                "forward reload is off: it is a development operation; start the "
+                "server with --allow-reload-forward"
+            )
+        self.settle()
+        executor = self._executor
+        server_args = executor.model_runner.server_args
+        # Startup warmed and captured from clean dummy inputs; serving left its own in them.
+        executor.forget_served_inputs()
+
+        def warm() -> None:
+            with current_platform().restore_stack_limit():
+                executor.autotune(keep_loaded_tactics=True)
+
+        def recapture() -> None:
+            # A rollback's recapture follows a failed capture, which left its own dummy inputs.
+            executor.forget_served_inputs()
+            recapture_graphs(executor, server_args)
+
+        with allow_host_sync("a forward reload warms kernels and captures graphs"):
+            return self._forward_reloader.reload(
+                req.modules, warm=warm, recapture=recapture
+            )
+
     def commit_weight_update(self, success: bool) -> None:
         """Apply the replica-wide result before KV wake or another forward."""
         if self._weight_memory is not None:
@@ -1127,6 +1170,91 @@ def arm_data_plane_sync_debug(device: str) -> None:
     logger.info(
         f"Data-plane sync debug armed ({mode!s}): host synchronizations on the "
         "serving path are reported"
+    )
+
+
+def _forward_reloader(server_args: ServerArgs, global_rank: int) -> ForwardReloader:
+    """The development reloader, planning on the first rank of the world group."""
+    from tokenspeed.runtime.distributed.process_group_manager import (
+        process_group_manager as pg_manager,
+    )
+    from tokenspeed.runtime.execution.forward_reload import ForwardReloader
+
+    mapping = server_args.mapping
+    world = mapping.world_group
+    planner_rank = world[0] if world else global_rank
+    if global_rank == planner_rank:
+        logger.warning(
+            "--allow-reload-forward: development mode, the reload_forward control "
+            "call re-executes edited code in this server; never use it in production"
+        )
+    return ForwardReloader(
+        group=(
+            pg_manager.get_process_group("gloo", world)
+            if mapping.world_size > 1
+            else None
+        ),
+        planner_rank=planner_rank,
+        is_planner=global_rank == planner_rank,
+    )
+
+
+def _replays_prefill_graphs(server_args: ServerArgs, model_config) -> bool:
+    """Whether breaks of the prefill graphs may run collectives; an instance-wide fact, so ranks agree."""
+    return server_args.disaggregation_mode == "prefill" or (
+        server_args.disaggregation_mode == "null"
+        and model_config.dsa_padded_prefill_replay
+    )
+
+
+def _warm_rebound_draft(executor, server_args: ServerArgs, *, has_draft: bool) -> None:
+    """Initialize the BLAS handle of the DFlash draft's auxiliary stream, which a rebind recreates, before capture."""
+    if (
+        has_draft
+        and server_args.speculative_algorithm == "DFLASH"
+        and not executor.config.prefill_only
+    ):
+        with torch.no_grad():
+            executor.forward_step.warmup_decode_path(
+                batch_sizes=(1,), graph_phase=False
+            )
+
+
+def _capture_serving_graphs(
+    executor, server_args: ServerArgs, replays_prefill_graphs: bool
+) -> None:
+    """Capture every graph and leave the generator and expert-load state serving starts from."""
+    from tokenspeed.runtime.execution.memory_delta import NULL_MEMORY_DELTA_OBSERVER
+    from tokenspeed.runtime.utils import set_random_seed
+
+    executor.capture_graphs(entries=None, observer=NULL_MEMORY_DELTA_OBSERVER)
+    if replays_prefill_graphs and not executor.prefill_graph.disable:
+        # Release capture-stream cache no forward reuses; graph pools are not freed.
+        device_module = torch.get_device_module(server_args.device)
+        before = device_module.memory_reserved() - device_module.memory_allocated()
+        device_module.empty_cache()
+        after = device_module.memory_reserved() - device_module.memory_allocated()
+        logger.info(
+            f"post-capture allocator cache: {before / 2**30:.2f} -> "
+            f"{after / 2**30:.2f} GiB"
+        )
+    # Tuning and capture draw from the generator; this is the state startup leaves.
+    set_random_seed(48)
+    start_expert_load_window(executor)
+
+
+def recapture_graphs(executor, server_args: ServerArgs) -> None:
+    """Drop the graphs and rebuild their owners on the bound pools, then capture again as startup does after its rebind."""
+    executor.release_graphs()
+    torch.get_device_module(server_args.device).empty_cache()
+    executor.set_cache_pool(executor.token_to_kv_pool, executor.draft_token_to_kv_pool)
+    _warm_rebound_draft(
+        executor, server_args, has_draft=executor.draft_model_runner is not None
+    )
+    _capture_serving_graphs(
+        executor,
+        server_args,
+        _replays_prefill_graphs(server_args, executor.model_runner.model_config),
     )
 
 
@@ -1379,7 +1507,6 @@ def build_device_side(
     from tokenspeed.runtime.layers.attention.registry import (
         create_attn_components,
     )
-    from tokenspeed.runtime.utils import set_random_seed
 
     target, draft = create_model_runner(
         server_args, model_config, draft_model_config, gpu_id, global_rank
@@ -1510,11 +1637,7 @@ def build_device_side(
             draft_attn_backend=attention.draft_attn_backend,
             draft_token_to_kv_pool=views.draft_token_to_kv_pool,
         )
-    # Breaks of these graphs may run collectives; an instance-wide fact, so ranks agree.
-    replays_prefill_graphs = server_args.disaggregation_mode == "prefill" or (
-        server_args.disaggregation_mode == "null"
-        and model_config.dsa_padded_prefill_replay
-    )
+    replays_prefill_graphs = _replays_prefill_graphs(server_args, model_config)
     if replays_prefill_graphs:
         # Ranks must plan alike: one rank eager while its peers replay hangs them.
         check_rank_uniform_prefill_plan(executor.prefill_graph, server_args)
@@ -1524,7 +1647,7 @@ def build_device_side(
         startup_phase("kernels.autotune"),
         current_platform().restore_stack_limit(),
     ):
-        executor.autotune()
+        executor.autotune(keep_loaded_tactics=False)
     if probing and current_platform().is_nvidia:
         # After empty_cache, reserved minus allocated is residue pinned by live buffers.
         device_module = torch.get_device_module(server_args.device)
@@ -1544,53 +1667,17 @@ def build_device_side(
                 requested_backends,
                 startup_resident_bytes=sum(startup_memory.samples.get("startup", ())),
             )
-        if (
-            draft is not None
-            and server_args.speculative_algorithm == "DFLASH"
-            and not executor.config.prefill_only
-        ):
-            # Rebinding recreates the draft's auxiliary stream. Graph-phase
-            # warmups bypass its overlap path, so initialize its BLAS handle
-            # eagerly again before the final capture uses that fresh stream.
-            with torch.no_grad():
-                executor.forward_step.warmup_decode_path(
-                    batch_sizes=(1,), graph_phase=False
-                )
-
-    with startup_phase("graph.capture"):
-        executor.capture_graphs(entries=None, observer=NULL_MEMORY_DELTA_OBSERVER)
-    if replays_prefill_graphs and not executor.prefill_graph.disable:
-        # Release capture-stream cache no forward reuses; graph pools are not freed.
-        device_module = torch.get_device_module(server_args.device)
-        before = device_module.memory_reserved() - device_module.memory_allocated()
-        device_module.empty_cache()
-        after = device_module.memory_reserved() - device_module.memory_allocated()
-        logger.info(
-            f"post-capture allocator cache: {before / 2**30:.2f} -> "
-            f"{after / 2**30:.2f} GiB"
-        )
-    # Tuning and capture draw from the generator; this is the state startup leaves.
-    set_random_seed(48)
-    start_expert_load_window(executor)
-
-    # Per-rank GPU memory breakdown (weights by group, KV/graph/non-torch).
-    if attn_tp_rank == 0:
-        log_gpu_memory_summary(
-            target.model,
-            gpu_id,
-            global_rank,
-            logger,
-            device=server_args.device,
-            draft_model=draft.model if draft is not None else None,
-            kv_pool=views.token_to_kv_pool,
-            draft_kv_pool=views.draft_token_to_kv_pool,
-        )
+        _warm_rebound_draft(executor, server_args, has_draft=draft is not None)
 
     # The compact Host cache: the L2 prefix tier (--enable-kvstore), the
     # retraction snapshot pool (on by default on the roles that retract), or
     # both in one executor over the same field geometry. The executor is the
     # model executor's peer: it lays out the slot-state exporters the model
-    # executor lists, so it is built after it.
+    # executor lists, so it is built after it. It is built before the graphs
+    # are captured, over the final pools: a prefill graph's capture notes,
+    # through the layerwise load trackers it registers on them, which layer
+    # each captured segment's cache accesses reach, for its replays to wait
+    # for (BreakableCapture.wait_before_segment).
     host_cache_executor = None
     host_cache = None
     host_tail_packing = {}
@@ -1657,6 +1744,23 @@ def build_device_side(
         logger.info(
             NO_POOL.describe(host_lcm_block_bytes=0, blob_bytes=0, l2_tier=False)
         )
+
+    with startup_phase("graph.capture"):
+        _capture_serving_graphs(executor, server_args, replays_prefill_graphs)
+
+    # Per-rank GPU memory breakdown (weights by group, KV/graph/non-torch).
+    if attn_tp_rank == 0:
+        log_gpu_memory_summary(
+            target.model,
+            gpu_id,
+            global_rank,
+            logger,
+            device=server_args.device,
+            draft_model=draft.model if draft is not None else None,
+            kv_pool=views.token_to_kv_pool,
+            draft_kv_pool=views.draft_token_to_kv_pool,
+        )
+
     if host_cache_executor is not None and host_cache_executor.host_storage is not None:
         from tokenspeed.runtime.cache.host_storage import HostCacheResources
 
@@ -1765,6 +1869,11 @@ def build_device_side(
             host_cache_executor=host_cache_executor,
             kv_transfer=kv_transfer,
             weight_memory=weight_memory,
+            forward_reloader=(
+                _forward_reloader(server_args, global_rank)
+                if server_args.allow_reload_forward
+                else None
+            ),
         ),
     )
 

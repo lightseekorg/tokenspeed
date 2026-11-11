@@ -394,6 +394,7 @@ const ENGINE_LABELS: [&str; 3] = ["model_name", "app_key", "dp_rank"];
 pub struct EngineMetrics {
     labels: [String; 3],
     num_requests_running: Metric,
+    num_requests_inflight: Metric,
     num_requests_waiting: Metric,
     kv_cache_usage: Metric,
     iteration_tokens: Metric,
@@ -415,6 +416,7 @@ pub struct EngineMetrics {
     num_prefill_prealloc_queue_reqs: Metric,
     num_prefill_inflight_queue_reqs: Metric,
     num_decode_prealloc_queue_reqs: Metric,
+    num_decode_kv_wait_reqs: Metric,
     num_decode_transfer_queue_reqs: Metric,
     num_retracted_queue_reqs: Metric,
     /// Request tokens: generated, prompt, and prompt tokens served from the
@@ -453,7 +455,13 @@ impl EngineMetrics {
             num_requests_running: Metric::gauge(
                 exporter,
                 "tokenspeed:num_requests_running",
-                "Requests with scheduler-side generation state (decode path).",
+                "Requests in the scheduler's running batch: prefill, prefill-done, and decode rows.",
+                names,
+            ),
+            num_requests_inflight: Metric::gauge(
+                exporter,
+                "tokenspeed:num_requests_inflight",
+                "Requests admitted and not finished, including PD transfer and waiting states.",
                 names,
             ),
             num_requests_waiting: Metric::gauge(
@@ -519,7 +527,8 @@ impl EngineMetrics {
                 exporter,
                 "tokenspeed:num_capacity_aborted_requests",
                 "Requests the scheduler aborted because a capacity retraction could not image its \
-                 victim (retraction snapshot pool, image rows or Host L2 exhausted); clients may \
+                 victim (retraction snapshot pool, image rows or Host L2 exhausted), or because a \
+                 lone request made no progress for 4096 consecutive scheduler plans; clients may \
                  resubmit them. Forced retractions from --debug-force-retraction-interval aborted \
                  the same way count too.",
                 names,
@@ -584,6 +593,12 @@ impl EngineMetrics {
                 exporter,
                 "tokenspeed:num_decode_prealloc_queue_reqs",
                 "Decode requests waiting for their prefill peer to connect.",
+                names,
+            ),
+            num_decode_kv_wait_reqs: Metric::gauge(
+                exporter,
+                "tokenspeed:num_decode_kv_wait_reqs",
+                "Decode requests waiting for the prefill peer's KV: admitted with destination pages held, with no schedulable work.",
                 names,
             ),
             num_decode_transfer_queue_reqs: Metric::gauge(
@@ -703,11 +718,12 @@ impl EngineMetrics {
     }
 
     /// One planning round's snapshot (`record_scheduler_iteration`):
-    /// requests running and waiting, the KV pages in use, and the tokens
-    /// the round forwards.
+    /// requests running and held, waiting, the KV pages in use, and the
+    /// tokens the round forwards.
     pub fn record_scheduler_iteration(
         &self,
         running: i64,
+        inflight: i64,
         waiting: i64,
         active_pages: i64,
         total_pages: i64,
@@ -720,6 +736,7 @@ impl EngineMetrics {
             0.0
         };
         self.num_requests_running.set(&labels, running as f64);
+        self.num_requests_inflight.set(&labels, inflight as f64);
         self.num_requests_waiting.set(&labels, waiting as f64);
         self.kv_cache_usage.set(&labels, ratio);
         if iteration_tokens > 0 {
@@ -823,12 +840,14 @@ impl EngineMetrics {
             .set(&labels, retracted.max(0) as f64);
     }
 
-    /// The decode role's PD queues: waiting for a prefill peer, transfer in
-    /// flight, and suspended requests.
-    pub fn record_decode_queues(&self, prealloc: i64, transfer: i64, retracted: i64) {
+    /// The decode role's PD queues: waiting for a prefill peer to connect,
+    /// waiting for its KV, transfer pins, and suspended requests.
+    pub fn record_decode_queues(&self, prealloc: i64, kv_wait: i64, transfer: i64, retracted: i64) {
         let labels = self.labels();
         self.num_decode_prealloc_queue_reqs
             .set(&labels, prealloc.max(0) as f64);
+        self.num_decode_kv_wait_reqs
+            .set(&labels, kv_wait.max(0) as f64);
         self.num_decode_transfer_queue_reqs
             .set(&labels, transfer.max(0) as f64);
         self.num_retracted_queue_reqs
