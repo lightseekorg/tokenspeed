@@ -4865,3 +4865,146 @@ register_triton_warmup(
     _selection_table_kernel,
     variants=lambda args: ({"RATIO": tuple(sorted({1, args["RATIO"]}))},),
 )
+
+
+@triton.jit(
+    do_not_specialize=["BS", "CAPACITY", "STRIDE", "LATEST_STRIDE", "LATEST_ROWS"]
+)
+def _verify_layout_kernel(
+    Scores,
+    Latest,
+    Slots,
+    Rows,
+    Indptr,
+    Counts,
+    Valid,
+    BS,
+    CAPACITY,
+    STRIDE,
+    LATEST_STRIDE,
+    LATEST_ROWS,
+    DRAFT: tl.constexpr,
+    BLOCK: tl.constexpr,
+    USE_LATEST: tl.constexpr,
+):
+    index = tl.arange(0, BLOCK).to(tl.int64)
+    request = index // DRAFT
+    column = index % DRAFT
+    if USE_LATEST:
+        slot = tl.load(Slots + request, request < BS, 0).to(tl.int64)
+        slot_valid = (request < BS) & (slot >= 0) & (slot < LATEST_ROWS)
+        latest_finite = slot_valid
+        for j in tl.static_range(DRAFT):
+            value = tl.load(Latest + slot * LATEST_STRIDE + j, slot_valid, 0)
+            latest_finite = latest_finite & (tl.abs(value) < float("inf"))
+    finite = tl.full((BLOCK,), True, tl.int1)
+    survival = tl.full((BLOCK,), 1.0, tl.float32)
+    for j in tl.static_range(DRAFT):
+        score = tl.load(Scores + request * STRIDE + j, request < BS, 0)
+        if USE_LATEST:
+            value = tl.load(Latest + slot * LATEST_STRIDE + j, slot_valid, 0)
+            score = tl.where(latest_finite, value, score)
+        finite = finite & (tl.abs(score) < float("inf"))
+        score = tl.minimum(tl.maximum(score, -60.0), 60.0)
+        probability = tl.div_rn(1.0, 1.0 + libdevice.exp(-score))
+        survival = survival * tl.where(j <= column, probability, 1.0)
+    gain = tl.where(finite, survival, float("inf"))
+    # Positive IEEE float bits sort in numeric order. The low word makes
+    # ties deterministic in request/token order, preserving each prefix.
+    key = (gain.to(tl.uint32, bitcast=True).to(tl.uint64) << 32) | (
+        0xFFFFFFFF - index.to(tl.uint64)
+    )
+    key = tl.where(index < BS * DRAFT, key, 0)
+    ordered = tl.sort(key, descending=True)
+    extra = CAPACITY - BS
+    cutoff = tl.sum(tl.where(index == extra - 1, ordered, 0), 0)
+    selected = (index < BS * DRAFT) & (extra > 0) & (key >= cutoff)
+    unknown = tl.sum(((index < BS * DRAFT) & ~finite & (column == 0)).to(tl.int32), 0)
+    valid = unknown * DRAFT <= extra
+    counts = tl.full((BLOCK,), 1, tl.int32)
+    for j in tl.static_range(DRAFT):
+        selected_index = tl.minimum(index * DRAFT + j, BLOCK - 1).to(tl.int32)
+        counts += tl.gather(selected.to(tl.int32), selected_index, axis=0)
+    counts = tl.where(index < BS, tl.where(valid, counts, 1), 0)
+    ends = tl.cumsum(counts, 0)
+    tl.store(Counts + index, counts.to(tl.int64), index < BS)
+    tl.store(Indptr + index + 1, ends.to(tl.int64), index < BS)
+    tl.store(Indptr, 0)
+    tl.store(Valid, valid)
+    # Upper bound over cumulative lengths maps each packed output to its owner.
+    lo = tl.full((BLOCK,), 0, tl.int32)
+    hi = tl.full((BLOCK,), BS, tl.int32)
+    while tl.sum((lo < hi).to(tl.int32), 0) > 0:
+        mid = (lo + hi) // 2
+        end = tl.gather(ends, tl.minimum(mid, BLOCK - 1), axis=0)
+        active = lo < hi
+        right = end <= index
+        lo = tl.where(active & right, mid + 1, lo)
+        hi = tl.where(active & ~right, mid, hi)
+    owner = tl.minimum(lo, BS - 1)
+    before = tl.gather(ends, tl.maximum(owner - 1, 0), axis=0)
+    before = tl.where(owner == 0, 0, before)
+    total = tl.sum(counts, 0)
+    rows = owner.to(tl.int64) * (DRAFT + 1) + index - before
+    tl.store(Rows + index, tl.where(index < total, rows, 0), index < CAPACITY)
+
+
+@register_kernel(
+    "attention",
+    "dsv41_verify_layout",
+    name="triton_dsv41_verify_layout",
+    solution="triton",
+    capability=_CAPABILITY,
+    signatures=[format_signature(x=dense_tensor_format(torch.float32))],
+    traits={},
+    priority=Priority.PORTABLE + 1,
+)
+def triton_dsv41_verify_layout(
+    scores,
+    query_capacity,
+    rows_out,
+    indptr_out,
+    counts_out,
+    valid_out,
+    latest_scores=None,
+    request_slots=None,
+):
+    bs, draft = scores.shape
+    block = triton.next_power_of_2(bs * (draft + 1))
+    if (
+        scores.stride(1) != 1
+        or (latest_scores is not None and latest_scores.stride(1) != 1)
+        or block > 4096
+    ):
+        from tokenspeed_kernel.ops.attention.dsv41.portable_torch import (
+            torch_dsv41_verify_layout,
+        )
+
+        return torch_dsv41_verify_layout(
+            scores,
+            query_capacity,
+            rows_out,
+            indptr_out,
+            counts_out,
+            valid_out,
+            latest_scores=latest_scores,
+            request_slots=request_slots,
+        )
+    _verify_layout_kernel[(1,)](
+        scores,
+        latest_scores,
+        request_slots,
+        rows_out,
+        indptr_out,
+        counts_out,
+        valid_out,
+        bs,
+        query_capacity,
+        scores.stride(0),
+        latest_scores.stride(0) if latest_scores is not None else 0,
+        latest_scores.shape[0] if latest_scores is not None else 0,
+        DRAFT=draft,
+        BLOCK=block,
+        USE_LATEST=latest_scores is not None,
+        num_warps=4,
+    )

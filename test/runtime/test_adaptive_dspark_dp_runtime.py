@@ -62,7 +62,11 @@ def _make_drafter(mapping):
     drafter.block_size = 5
     drafter.adaptive_min_batch_size = 4
     drafter.verify_budget_policy = VerifyBudgetPolicy(True, 4, 6, 0.02)
-    drafter.confidence_scores = torch.empty(1, device="cuda")
+    from tokenspeed.runtime.execution.input_buffer import InputBuffers
+
+    drafter.confidence_scores = torch.full((4, 5), float("inf"), device="cuda")
+    drafter.input_buffers = InputBuffers.__new__(InputBuffers)
+    drafter.input_buffers.req_pool_indices_buf = torch.arange(4, device="cuda")
     drafter.verify_graph_token_step = 4
     drafter._verify_rows = torch.empty(24, dtype=torch.int64, device="cuda")
     drafter._verify_indptr = torch.empty(5, dtype=torch.int64, device="cuda")
@@ -158,6 +162,16 @@ def test_dp_budget_agreement_and_native_fallback():
         counts = indptr.diff().cpu().tolist()
         assert counts[favored] == 6 and sum(counts) == 12
         torch.testing.assert_close(scores.cpu(), torch.tensor(expected), rtol=0, atol=0)
+    # The allocation graph reads current GPU confidence without recapture;
+    # its budget still comes from the completed host feedback.
+    for offset in range(3):
+        favored = (rank + offset) % 4
+        drafter.confidence_scores.fill_(-20)
+        drafter.confidence_scores[favored].fill_(20)
+        assert drafter._prepare_calibrated_budget(actual_bs=4, padded_bs=4) == 12
+        counts = drafter._verify_indptr.diff().tolist()
+        assert counts[favored] == 6 and sum(counts) == 12
+    drafter.confidence_scores.fill_(float("inf"))
     ctx = ForwardContext(
         attn_backend=None,
         token_to_kv_pool=None,

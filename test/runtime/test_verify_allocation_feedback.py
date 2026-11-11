@@ -18,48 +18,83 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import pytest
 import torch
+from tokenspeed_kernel.ops.attention import dsv41
+from tokenspeed_kernel.ops.attention.dsv41.portable_torch import (
+    torch_dsv41_verify_layout,
+)
 
 from tokenspeed.runtime.execution.drafter.deepseek_v41_dspark import DeepseekV41DSpark
 
 
-def make_drafter():
+def make_drafter(device):
     # Model initialization requires weights and GPUs. Exercise the real
     # request-state and allocation methods with their existing tensor state.
     drafter = object.__new__(DeepseekV41DSpark)
     drafter.verify_feedback = None
     drafter.confidence_scores = torch.tensor(
-        [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], dtype=torch.float32
+        [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], dtype=torch.float32, device=device
     )
     drafter._confidence_request_ids = ["a", "b", "c"]
     return drafter
 
 
-def test_allocation_uses_latest_scores_in_request_order():
-    drafter = make_drafter()
-    history = torch.zeros((2, 2))
-    result = drafter._allocation_scores(torch.tensor([2, 0]), history)
-    torch.testing.assert_close(result, torch.tensor([[5.0, 6.0], [1.0, 2.0]]))
-    torch.testing.assert_close(history, torch.zeros((2, 2)))
+@pytest.fixture(params=["cpu", "cuda"])
+def device(request):
+    if request.param == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    return request.param
 
 
-def test_reused_slot_and_extend_do_not_leak_previous_predictions():
-    drafter = make_drafter()
+def check_allocation(drafter, slots, history, expected):
+    device = drafter.confidence_scores.device
+    history = torch.tensor(history, dtype=torch.float32, device=device)
+    expected = torch.tensor(expected, dtype=torch.float32, device=device)
+    slots = torch.tensor(slots, dtype=torch.int64, device=device)
+    bs, width = history.shape
+
+    def outputs(q):
+        return dict(
+            rows_out=torch.empty(q, dtype=torch.int64, device=device),
+            indptr_out=torch.empty(bs + 1, dtype=torch.int64, device=device),
+            counts_out=torch.empty(bs, dtype=torch.int64, device=device),
+            valid_out=torch.empty((), dtype=torch.bool, device=device),
+        )
+
+    original = history.clone()
+    for q in range(bs, bs * (width + 1) + 1):
+        actual, reference = outputs(q), outputs(q)
+        dsv41.verify_layout(
+            history,
+            query_capacity=q,
+            latest_scores=drafter.confidence_scores,
+            request_slots=slots,
+            **actual
+        )
+        torch_dsv41_verify_layout(expected, q, **reference)
+        for name in reference:
+            torch.testing.assert_close(actual[name], reference[name], atol=0, rtol=0)
+    torch.testing.assert_close(history, original, atol=0, rtol=0)
+
+
+def test_allocation_uses_latest_scores_in_request_order(device):
+    drafter = make_drafter(device)
+    check_allocation(drafter, [2, 0], [[0, 0], [0, 0]], [[5, 6], [1, 2]])
+
+
+def test_reused_slot_and_extend_do_not_leak_previous_predictions(device):
+    drafter = make_drafter(device)
     drafter.prepare_request_state(["new", "b"], [0, 1], num_extends=0)
-    history = torch.tensor([[-1.0, -2.0], [-3.0, -4.0]])
-    result = drafter._allocation_scores(torch.tensor([0, 1]), history)
-    torch.testing.assert_close(result, torch.tensor([[-1.0, -2.0], [3.0, 4.0]]))
+    check_allocation(drafter, [0, 1], [[-1, -2], [-3, -4]], [[-1, -2], [3, 4]])
     drafter.prepare_request_state(["b"], [1], num_extends=1)
-    result = drafter._allocation_scores(torch.tensor([1]), history[:1])
-    torch.testing.assert_close(result, history[:1])
+    check_allocation(drafter, [1], [[-1, -2]], [[-1, -2]])
 
 
-def test_nonfinite_prediction_falls_back_as_a_whole_row():
-    drafter = make_drafter()
+def test_nonfinite_prediction_falls_back_as_a_whole_row(device):
+    drafter = make_drafter(device)
     drafter.confidence_scores[0, 1] = float("nan")
     drafter.confidence_scores[2, 0] = float("inf")
-    history = torch.tensor([[-1.0, -2.0], [-3.0, -4.0], [-5.0, -6.0]])
-    result = drafter._allocation_scores(torch.tensor([2, 1, 0]), history)
-    torch.testing.assert_close(
-        result, torch.tensor([[-1.0, -2.0], [3.0, 4.0], [-5.0, -6.0]])
+    check_allocation(
+        drafter, [2, 1, 0], [[-1, -2], [-3, -4], [-5, -6]], [[-1, -2], [3, 4], [-5, -6]]
     )
