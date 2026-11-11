@@ -4007,7 +4007,7 @@ class ServerArgs:
                 "draft of a target in "
                 f"{', '.join(DRAFT_MONOKERNEL_TARGET_ARCHITECTURES)} takes the "
                 "switch too, and startup fails when its layers, context write "
-                "or head cannot be packed; other targets' drafts keep the "
+                "or head cannot be packed; every other draft keeps the "
                 "regular path. Other steps keep the regular path."
             ),
         )
