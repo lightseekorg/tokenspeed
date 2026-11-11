@@ -119,7 +119,8 @@ def _sanitize(sp: SamplingParams) -> tuple[float, int, float, float]:
     sanitizing here keeps every bit agreeing with what the kernel reads:
     epsilon-neutral temperature stays ``1.0`` (bit off — skips a wasted
     ``logits / t`` vocab pass), and ``top_k`` is capped at MAX_K so the ``-1``
-    "disabled" sentinel lands on the bounded top-MAX_K path (bit off). The
+    "disabled" sentinel leaves the TOP_K bit off (a whole-vocabulary row
+    unless top-p or min-p is set). The
     greedy early return also pins temperature to 1.0, so the slot's indicator
     is exactly ``GREEDY`` and the kernel skips the temperature pass. ``min_p =
     1.0`` is remapped to 0.999 because ``from_params`` tests the open interval
@@ -154,14 +155,17 @@ class SonicSamplingBackend(SamplingBackend):
 
     top_k semantics: finite ``top_k >= 128`` never reaches the backend —
     ``SamplingParams.verify()`` rejects it at request time (same limit as the
-    flashinfer fused kernel). ``top_k = -1`` (full vocab) arrives as the
-    ``_TOP_K_DISABLED`` sentinel and is realized as **bounded top-128
-    truncation**: the kernel's bit-packed reduction keeps only the top-128
-    candidates per row, so mass beyond them is dropped (negligible for the
-    peaked distributions a model emits at temperature <= 1, but significant on
-    flat ones or at high temperature). flashinfer's ``-1``
-    samples the full vocab; this is the one distribution difference the
-    backend chooses. Inherited from sonic's 16-bit packed ranking: bf16 logits'
+    flashinfer fused kernel). A row with no top-k, top-p or min-p (``top_k =
+    -1``, the ``_TOP_K_DISABLED`` sentinel) draws from its **whole
+    vocabulary**: each vocabulary block keeps its best logit plus the Gumbel
+    noise the candidates' draw adds there, so the row's best is a draw from
+    the whole softmax, past the top 128 too; a verify accepts a point-draw
+    draft at its probability over the whole vocabulary and draws a rejected
+    position from the rest of it. Rows with top-k, top-p or min-p select among
+    the top-128 candidates their reduction keeps (top-p's nucleus over the
+    candidates' mass), as do verify rows under
+    ``--enable-speculative-sampling``. Inherited from sonic's 16-bit packed
+    ranking: bf16 logits'
     candidates are compared at bf16 resolution (temperature, penalties and
     logit bias are applied in bf16, and the scaled logits are re-rounded), so
     where the fp32 backends separate near-tied tokens sonic's greedy pick is

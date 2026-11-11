@@ -829,11 +829,13 @@ static buffers (the target's hidden rows with a zero tail, the gather rows,
 the frontier), and its outputs land in static buffers the decode steps read.
 The draft prologue writes K/V inside a captured segment, which holds no
 per-layer Host-load wait, so a step-0 replay first waits for the draft pool's
-whole Host load, as the target's replay does. These captures run each segment
-as soon as it is captured (`run_segments_while_capturing`): their breaks index
-with values a segment computes (the top-k rows the narrowing gathers, the
-decode steps' positions), which a capture alone leaves unwritten when the
-break runs.
+whole Host load, as the target's replay does on a pool that does not declare
+`layer_accesses_wait_for_load`, and skips the per-layer waits its capture
+noted; the decode-step replays, behind step 0, skip theirs too. These captures
+run each segment as soon as it is captured (`run_segments_while_capturing`):
+their breaks index with values a segment computes (the top-k rows the
+narrowing gathers, the decode steps' positions), which a capture alone leaves
+unwritten when the break runs.
 
 A round replays only what the graphs baked: a pure extend (MIXED rounds run
 eager), no attention DP or query shard, a fitting bucket at the exact request
@@ -1072,8 +1074,9 @@ graph records. `SamplingBatchInfo.is_all_greedy` and the eager-only argmax
 branches were deleted. Equivalence (top_k=1 == argmax, ties excepted) is
 pinned by `test/runtime/sampling/test_greedy_route_equivalence.py` (for
 `sonic`, whose kernels rank candidates at bf16 resolution -- a penalized
-greedy pick lies within one bf16 ulp of the maximum -- and realize `top_k=-1`
-as bounded top-128 truncation, by `test_sonic_backend.py`).
+greedy pick lies within one bf16 ulp of the maximum -- and draw a request
+without top-k, top-p or min-p from its whole vocabulary, by
+`test_sonic_backend.py`).
 
 Admission uses the selected sampling backend's finite top-k bound. GPU
 backends retain the exclusive 128 bound. `ascend_full` accepts positive
