@@ -359,6 +359,14 @@ FUSED, SPLIT = "9-64:1", "9-12:6,13-24:4,25-64:2"
 # q=1 B32: 3 SMs, -5.4% step). Verify steps (q > 1) share experts among a request's q
 # tokens: TP8 DL7 M16/32/64 -5.9/-12.9/-1.1%, TP16 M32 -5.9%.
 SPLITS = {8: ("25-32:3", "13-16:6,25-32:4,33-64:3"), 16: ("", "25-32:3")}
+# Split-K shared-expert batches whose routing kernel releases the persistent experts
+# at entry (``RouteSitu.early``): their launch and prologue (mbarriers, tensor maps,
+# TMEM, x image; ~3.8 us after a late release at TP8 B5, all after the ids exist)
+# overlap the cross-rank logit wait and the ranking. The routing kernel starts after
+# the shared expert's split-K gate/up GEMM has taken its SMs, so the early experts
+# do not starve it. GB300 TP8 K3.1 DSpark k=4 step, ms: DCP8 R1 136K 9.465 -> 9.371,
+# TP8 R1 32K 8.858 -> 8.794.
+EARLY_ROUTE = {8: "5-8:1", 16: ""}
 # Split batches whose front GEMM rows join the gate/up kernel as extra M-tiles (one
 # kernel instead of two that slow each other ~2x side by side).
 MERGED = {8: "41-64:1", 16: "33-64:1"}
@@ -404,8 +412,12 @@ def front_geometry(batch, n, ks, kb=None, tg=None, rt=None, ch=None):
 
 
 @functools.cache
-def compile_route(batch, shared, renorm, roles, device, polled=False, plan=False):
-    kernel = RouteSitu(batch, shared, renorm, batch <= 2, roles, polled, plan)
+def compile_route(
+    batch, shared, renorm, roles, device, polled=False, plan=False, early=None
+):
+    """``early`` (default: B<=2) releases the persistent experts at entry."""
+    early = batch <= 2 if early is None else early
+    kernel = RouteSitu(batch, shared, renorm, early, roles, polled, plan)
     f32 = c.Float32
     args: tuple = (fake((batch, 896), None, f32), fake((896,), None, f32))
     args += (fake((batch, 16), None, c.Int32), fake((batch, 16)), fake((1, 64, WIDTH)))
@@ -466,13 +478,18 @@ class SharedFront:
             self.merged_args = to_cute(self.merged_maps, 64), to_cute(self.unused)
             geometry = (n, n - shard, valid, box.buffer.shape[-1])
         self.plans: dict[int, tuple] = {}
+        early = batch_table(EARLY_ROUTE[tp])
+        self.early = {b for b in batches if early.get(b) and b <= 8 and b not in fused}
         for b in batches:
             views = tuple(t[:b] for t in storage)
             logits, gate, ids, weights, h, _, latent = map(to_cute, views)
             front = compile_publish(n, n - shard, valid, b, dev, front_ks(b, n))
             planned = plan is not None and b > 8
             roles = (True, True, False)
-            route = compile_route(b, shared, renorm, roles, dev, True, planned)
+            released = b in self.early or None
+            route = compile_route(
+                b, shared, renorm, roles, dev, True, planned, released
+            )
             situ = compile_route(b, shared, renorm, (False, False, True), dev)
             args = (logits, bias, ids, weights, self.box[0], latent, gate, h)
             extra = (to_cute(plan),) if planned else ()
@@ -508,6 +525,11 @@ class SharedFront:
 
     def planned(self, batch):
         return bool(self.plans[batch][5])
+
+    def gated(self, batch):
+        """``EARLY_ROUTE`` batches: their split-K shared expert runs on the urgent
+        side stream and their tail does not join it (``PreparedMoE.finish``)."""
+        return batch in self.early
 
     def shared_expert(self, x, tail):
         """The shared expert's rows into the tail's RS mailboxes (``tail.push``); the

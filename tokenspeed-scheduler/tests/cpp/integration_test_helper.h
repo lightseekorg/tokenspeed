@@ -37,6 +37,24 @@
 
 #include "unit_test_helper.h"
 
+namespace tokenspeed {
+
+// Reaches the coordinator and the pool behind a scheduler (its friend), so a
+// test can hold a cache entry's block as a store ticket or another holder
+// would (pinned: neither evictable nor cleared by a compaction), or read a
+// block's page id; and records an admission's pages on a plan as the plan
+// build does.
+struct SchedulerTestAccess {
+    static CacheCoordinator& Coordinator(Scheduler& scheduler) { return scheduler.coordinator_; }
+    static const BlockPool& Pool(const Scheduler& scheduler) { return scheduler.block_pool_; }
+    static void RecordAdmittedPages(Scheduler& scheduler, ExecutionPlan& plan,
+                                    const CacheCoordinator::AdmissionResult& result) {
+        scheduler.recordAdmittedPages(plan, result);
+    }
+};
+
+}  // namespace tokenspeed
+
 namespace tokenspeed::test {
 
 // Retraction capacity for a test config that does not exercise image-fit
@@ -95,7 +113,10 @@ protected:
 
     void Submit(const std::vector<RequestSpec>& specs) { scheduler_->SubmitRequests(specs); }
 
-    ExecutionPlan PlanOnce() { return scheduler_->NextExecutionPlan(); }
+    ExecutionPlan PlanOnce() {
+        return scheduler_->NextExecutionPlan(
+            Scheduler::PlanOptions{.allow_prefill = true, .apply_prefill_watermark = false});
+    }
 
     static std::vector<CacheOperation> ExtractCacheOps(const ExecutionPlan& plan) {
         std::vector<CacheOperation> result;

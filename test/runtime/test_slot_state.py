@@ -92,6 +92,9 @@ from tokenspeed.runtime.sampling.backends.flashinfer_full import (  # noqa: E402
 from tokenspeed.runtime.sampling.backends.greedy import (  # noqa: E402
     GreedySamplingBackend,
 )
+from tokenspeed.runtime.sampling.backends.sonic import (  # noqa: E402
+    SonicSamplingBackend,
+)
 from tokenspeed.runtime.sampling.backends.triton import (  # noqa: E402
     TritonSamplingBackend,
 )
@@ -107,7 +110,11 @@ SAMPLING_BACKENDS = (
     FlashInferFullSamplingBackend,
     TritonSamplingBackend,
     TritonFullSamplingBackend,
+    SonicSamplingBackend,
 )
+
+# The per-slot buffers each sampling backend's rid-flip reset must write.
+SCATTERED_SLOT_STATE = {SonicSamplingBackend: ("state.temperature", "state.seeds")}
 
 # One request-pool geometry for every owner: max_bs decode rows, one sink row
 # (max_req_pool_size = max_bs + 1) and the graph-padding row past it.
@@ -232,15 +239,18 @@ def _dsa(pool, *, is_draft: bool) -> DSABackend:
 
 def _sampling_backend(cls) -> SamplingBackend:
     """A sampling backend over the test pool geometry, on the CPU."""
+    sonic = cls is SonicSamplingBackend
+    draft_probs = cls is not GreedySamplingBackend
     config = SamplingBackendConfig(
         synthetic_acceptance_length=None,
-        enable_speculative_sampling=cls is not GreedySamplingBackend,
+        enable_speculative_sampling=draft_probs,
         sampling_stream="batch",
         logprob_order="torch",
         max_bs=MAX_BS,
         max_draft_tokens_per_req=SPEC_TOKENS,
         max_req_pool_size=MAX_REQ_POOL_SIZE,
-        vocab_size=VOCAB,
+        # sonic's top-k reduction needs at least 512 columns.
+        vocab_size=512 if sonic else VOCAB,
         device="cpu",
     )
     # The Triton backends size a scratch buffer by the SM count.
@@ -508,8 +518,14 @@ def test_sampling_backend_images_an_unprepared_slot_as_nobodys(cls, previous_occ
     reset.assert_called_once()
     assert reset.call_args.args[:2] == (dst_slot, params)
     assert backend._last_rid_per_slot[dst_slot] == victim
-    assert float(backend._temperature_pool[dst_slot]) == pytest.approx(0.3)
-    assert int(backend._seed_pool[dst_slot]) == int(params.seed)
+    per_slot = _per_slot_tensors(backend, {POOL_ROWS})
+    temperature, seed = (
+        per_slot[name]
+        for name in SCATTERED_SLOT_STATE.get(cls, ("_temperature_pool", "_seed_pool"))
+    )
+    # sonic keeps its temperature in bf16.
+    assert float(temperature[dst_slot]) == pytest.approx(0.3, abs=2**-8)
+    assert int(seed[dst_slot]) == int(params.seed)
     if isinstance(backend, FlashInferSamplingBackend):
         # The coin stream starts from the request's own seed: the step above
         # drew its coins from a generator seeded by the reset.
@@ -605,7 +621,7 @@ def _is_runtime_component(value) -> bool:
     return (
         not isinstance(value, (torch.Tensor, torch.nn.Module, SlotStateExporter))
         and hasattr(value, "__dict__")
-        and type(value).__module__.startswith("tokenspeed.")
+        and type(value).__module__.startswith(("tokenspeed.", "tokenspeed_kernel."))
     )
 
 
@@ -704,7 +720,7 @@ def test_sampling_backend_slot_state_is_complete(cls):
     _assert_slot_state_complete(backend, exporter=backend, slot_domains={POOL_ROWS})
     # The declared constant pools exist, are per-slot, and really are constant.
     per_slot = _per_slot_tensors(backend, {POOL_ROWS})
-    for name in SamplingBackend.constant_slot_state:
+    for name in cls.constant_slot_state:
         assert name in per_slot
         assert per_slot[name].abs().sum() == 0
     # Every per-slot thing the rid-flip reset writes is in the image.
@@ -712,9 +728,9 @@ def test_sampling_backend_slot_state_is_complete(cls):
         exported = _storage_ids(backend.slot_state_rows(0))
         written = []
         for name, tensor in per_slot.items():
-            if name in SamplingBackend.constant_slot_state:
+            if name in cls.constant_slot_state:
                 continue
-            if name in SamplingBackend.token_derived_slot_state:
+            if name in cls.token_derived_slot_state:
                 # Derived scratch is neither restored nor changed by admission.
                 tensor[2].fill_(197)
                 before = tensor.clone()
@@ -726,7 +742,8 @@ def test_sampling_backend_slot_state_is_complete(cls):
             if tensor[2].abs().sum() != 0:
                 written.append(name)
             assert tensor.untyped_storage().data_ptr() in exported, name
-        assert "_temperature_pool" in written and "_seed_pool" in written
+        expected = SCATTERED_SLOT_STATE.get(cls, ("_temperature_pool", "_seed_pool"))
+        assert set(expected) <= set(written), written
 
 
 def test_completeness_check_catches_an_unexported_buffer():

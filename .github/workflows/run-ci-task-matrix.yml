@@ -57,6 +57,8 @@ jobs:
       BASE_REF: ${{ inputs.comparison_base_ref }}
       CANDIDATE_REF: ${{ inputs.comparison_candidate_ref }}
       PR_NUMBER: ${{ github.event_name == 'pull_request' && github.event.pull_request.number || '' }}
+      # Set only for tasks that select their tests from a pull request's changes.
+      TOKENSPEED_CI_CHANGED_PATHS: ${{ matrix.changed_paths || '' }}
       MERGE_SHA: ${{ github.event_name == 'pull_request' && github.sha || '' }}
       # Authenticate model downloads so cold runners do not hit anonymous
       # Hugging Face rate limits while starting `ts serve`.

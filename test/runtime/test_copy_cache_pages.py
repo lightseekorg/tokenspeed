@@ -78,12 +78,23 @@ def _arena(device: str):
     return make_arena(plan, device)
 
 
-class _DefaultStream:
-    def __init__(self, trace):
+class _Stream:
+    def __init__(self, trace, name):
         self._trace = trace
+        self.name = name
 
     def wait_stream(self, stream):
-        self._trace.append(("wait", stream))
+        self._trace.append(("wait", self.name, stream.name))
+
+
+class _WriteBackOp:
+    # Cache.WriteBackOp has no Python constructor; stream-ordered.
+    def __init__(self, op_id, src_page, dst_page):
+        self.op_ids = [op_id]
+        self.group_ids = [[0]]
+        self.src_pages = [[src_page]]
+        self.dst_pages = [[dst_page]]
+        self.source_pinned = [False]
 
 
 def _contract(shard_counts: dict[str, int], virtual_block_count: int):
@@ -135,13 +146,15 @@ class TestCopyCachePagesContractTest:
         )
         return types.SimpleNamespace(
             token_to_kv_pool=types.SimpleNamespace(arena=arena),
-            default_stream=_DefaultStream(trace),
-            execution_stream="execution-stream",
+            default_stream=_Stream(trace, "default"),
+            execution_stream=_Stream(trace, "execution"),
             _cache_runtime_contract=_contract(shard_counts, 64),
             _cache_kvp_rank=rank,
         )
 
-    def test_copies_wait_on_the_execution_stream_then_reach_the_arena(self):
+    def test_copies_wait_on_the_execution_stream_which_then_waits_for_them(self):
+        # The execution stream's wait orders a later plan's stores, which
+        # wait on it, behind the copies when no forward runs between.
         from tokenspeed.runtime.execution.model_executor import ModelExecutor
 
         trace = []
@@ -150,7 +163,11 @@ class TestCopyCachePagesContractTest:
             fake, {"kv": np.asarray([[3, 8], [5, 9]], dtype=np.int32), "state": []}
         )
         assert (trace) == (
-            [("wait", "execution-stream"), ("copy", {"kv": [[3, 8], [5, 9]]})]
+            [
+                ("wait", "default", "execution"),
+                ("copy", {"kv": [[3, 8], [5, 9]]}),
+                ("wait", "execution", "default"),
+            ]
         )
 
     def test_a_rank_owning_no_pair_places_no_fence_and_copies_nothing(self):
@@ -267,6 +284,7 @@ class TestFinishTailHitCopyCudaTest:
                 host_group_packing=(),
                 max_retracted_requests=0,
                 host_write_policy="write_through",
+                prefill_decode_interval=0,
                 storage_config=None,
                 cache_groups=[
                     ts.CacheGroupConfig(
@@ -485,6 +503,7 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
                 max_retracted_requests=0,
                 storage_config=None,
                 host_write_policy="write_back",
+                prefill_decode_interval=0,
                 cache_groups=pool_to_cache_groups(pool),
             )
             scheduler = ts.Scheduler(scheduler_config)
@@ -779,15 +798,6 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
         handle = DeviceHandle(model_executor, host_cache_executor=executor)
         handle.bind_forward_thread()
 
-        class WriteBackOp:
-            # Cache.WriteBackOp has no Python constructor; stream-ordered.
-            def __init__(self, op_id, src_page, dst_page):
-                self.op_ids = [op_id]
-                self.group_ids = [[0]]
-                self.src_pages = [[src_page]]
-                self.dst_pages = [[dst_page]]
-                self.source_pinned = [False]
-
         x, y, z = 1, 2, 3
         x_segments, y_segments, z_segments = (
             arena.block_byte_segments(group, [int(local)])
@@ -810,7 +820,7 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
                 )
             )
             before = arena.buffer.clone()
-            with patch.object(ts.Cache, "WriteBackOp", WriteBackOp):
+            with patch.object(ts.Cache, "WriteBackOp", _WriteBackOp):
                 # Z's image into pool block 1, and a store and a restore on
                 # the lanes the round below takes, so that round loads no
                 # kernel and pins no staging memory: either would wait for the
@@ -826,7 +836,7 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
                             snapshot_slot=1,
                             transfers=(CacheTransfer(0, z, 1, "", 0),),
                         ),
-                        WriteBackOp(2, z, 2),
+                        _WriteBackOp(2, z, 2),
                     ],
                 )
                 torch.cuda.synchronize()
@@ -862,7 +872,7 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
                     plan,
                     None,
                     cache_ops=[
-                        WriteBackOp(4, x, 1),
+                        _WriteBackOp(4, x, 1),
                         RestoreOp(
                             op_id=5,
                             request_id="r",
@@ -907,6 +917,160 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
                 expected[x_off : x_off + size] = before[z_off : z_off + size]
                 expected[y_off : y_off + size] = before[x_off : x_off + size]
             torch.testing.assert_close(arena.buffer, expected, rtol=0, atol=0)
+        finally:
+            handle.shutdown_cache()
+
+    def test_a_later_plans_store_reads_what_a_copy_only_plan_wrote(self):
+        """A plan whose only Device work is its block copies -- a lone
+        request's compaction whose retry failed -- runs no forward, and the
+        next plan's stream-ordered store orders behind the execution stream
+        alone. ``copy_cache_pages`` makes the execution stream wait for the
+        copies, so the store still reads what they wrote: with the copy of
+        page X into page Y held back on the default stream, the next plan
+        writes Y back to Host block 1, and block 1 comes back into page Z
+        with X's bytes.
+        """
+        ts = pytest.importorskip("tokenspeed_scheduler")
+        from test.runtime.cache_pool_test_utils import (
+            make_mha_memory_plan,
+            make_pool,
+            specs_for_layers,
+        )
+
+        from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor
+        from tokenspeed.runtime.cache.l2.sizing import RetractionPoolRequest
+        from tokenspeed.runtime.cache.transfer.ops import (
+            CacheTransfer,
+            HostTier,
+            RestoreOp,
+        )
+        from tokenspeed.runtime.execution.device import DeviceHandle
+        from tokenspeed.runtime.execution.model_executor import ModelExecutor
+        from tokenspeed.runtime.layers.attention.kv_cache.hybrid_mha import (
+            HybridMHATokenToKVPool,
+        )
+
+        group = "full_attention"
+        layer_types = ("full_attention",) * 2
+        arena, pool = make_pool(
+            HybridMHATokenToKVPool,
+            make_mha_memory_plan(
+                size=6 * self.PAGE,
+                prefix_granularity=self.PAGE,
+                layer_num=2,
+                kv_heads=1,
+                head_dim=8,
+                dtype=torch.float16,
+            ),
+            device="cuda",
+            cache_group_specs=specs_for_layers(
+                layer_types=layer_types,
+                group_ids=(group,) * 2,
+                prefix_granularity=self.PAGE,
+            ),
+            dtype=torch.float16,
+            head_num=1,
+            head_dim=8,
+            layer_num=2,
+            rank=0,
+            layer_types=layer_types,
+        )
+        executor = HostCacheExecutor(
+            pool,
+            draft_pool=None,
+            l2_tier=True,
+            host_ratio=1.0,
+            host_size_gb=0,
+            # The restore below reads Host L2 back into a page.
+            snapshot_pool=RetractionPoolRequest(
+                host_gb=0.0,
+                ratio=1.0,
+                max_retracted_requests=1,
+                tail_lcm_blocks_per_request=0,
+            ),
+            slot_state_exporters=(),
+            io_backend="kernel",
+            attn_tp_rank=0,
+            kvp_rank=0,
+            nprocs_per_node=1,
+            world_cpu_group=None,
+        )
+        # A model executor without a model, as above.
+        model_executor = ModelExecutor.__new__(ModelExecutor)
+        model_executor.device = "cuda"
+        model_executor.device_module = torch.cuda
+        model_executor.default_stream = torch.cuda.default_stream()
+        model_executor.execution_stream = torch.cuda.Stream()
+        model_executor.token_to_kv_pool = pool
+        model_executor.draft_token_to_kv_pool = None
+        model_executor._cache_runtime_contract = arena.runtime_contract
+        model_executor._cache_kvp_rank = 0
+        model_executor.drafter = None
+        handle = DeviceHandle(model_executor, host_cache_executor=executor)
+        handle.bind_forward_thread()
+
+        x, y, z = 1, 2, 3
+        x_segments, y_segments, z_segments = (
+            arena.block_byte_segments(group, [int(local)])
+            for local in local_pages_by_group(
+                {group: [x, y, z]}, contract=arena.runtime_contract, rank=0
+            )[group]
+        )
+        # The plans' cache ops, nothing to zero.
+        plan = ts.ExecutionPlan()
+        generator = torch.Generator(device="cpu").manual_seed(37)
+        try:
+            with patch.object(ts.Cache, "WriteBackOp", _WriteBackOp):
+                # The trial twice: once to warm the copy, the store and the
+                # restore, then with the copy held back.
+                for op_id, held in ((1, False), (4, True)):
+                    arena.buffer.copy_(
+                        torch.randint(
+                            0,
+                            256,
+                            (arena.buffer.numel(),),
+                            dtype=torch.uint8,
+                            generator=generator,
+                        )
+                    )
+                    before = arena.buffer.clone()
+                    if held:
+                        torch.cuda._sleep(200_000_000)
+                    model_executor.copy_cache_pages(
+                        {group: np.asarray([[x, y]], dtype=np.int32)}
+                    )
+                    handle.execute(plan, None, cache_ops=[_WriteBackOp(op_id, y, 1)])
+                    if held:
+                        assert not executor.write_stream.query()
+                    torch.cuda.synchronize()
+                    assert [int(ack.op_id) for ack in handle.poll_cache_results()] == [
+                        op_id
+                    ]
+                    handle.execute(
+                        plan,
+                        None,
+                        cache_ops=[
+                            RestoreOp(
+                                op_id=op_id + 1,
+                                request_id="r",
+                                request_pool_index=1,
+                                snapshot_slot=1,
+                                transfers=(CacheTransfer(0, 1, z, "", 0),),
+                                source_tier=(HostTier.L2,),
+                            )
+                        ],
+                    )
+                    torch.cuda.synchronize()
+                    assert [int(ack.op_id) for ack in handle.poll_cache_results()] == [
+                        op_id + 1
+                    ]
+                    expected = before.clone()
+                    for (x_off, size), (y_off, _), (z_off, _) in zip(
+                        x_segments, y_segments, z_segments, strict=True
+                    ):
+                        expected[y_off : y_off + size] = before[x_off : x_off + size]
+                        expected[z_off : z_off + size] = before[x_off : x_off + size]
+                    torch.testing.assert_close(arena.buffer, expected, rtol=0, atol=0)
         finally:
             handle.shutdown_cache()
 

@@ -681,7 +681,6 @@ class ModelExecutor:
             if model_runner.model_config.requires_request_token_history
             else 0
         )
-        self._init_draft_probs(config, spec_num_tokens)
         # Sized like InputBuffers.max_bs so the padded graph-bucket bs fits.
         self.nan_guard = NanGuard.create(
             config.enable_nan_detection,
@@ -727,10 +726,6 @@ class ModelExecutor:
                 vocab_size=config.vocab_size,
             )
             self.drafter.wire_target(self.model_runner.model)
-            # Draft-prob sampling reads the request's temperature / top-k /
-            # seed from the verifier's pool buffers: one owner of per-request
-            # sampling state.
-            self.drafter.bind_sampling_backend(self.sampling_backend)
             MultimodalRuntime.wire_drafter(
                 self.input_buffers, self.model_runner.model_config
             )
@@ -749,14 +744,22 @@ class ModelExecutor:
             self._pp_is_last_stage
             and shard_top_k is not None
             and self.model_runner.model.logits_processor.keep_sampled_logits_vocab_sharded(
-                self.model_runner.model.lm_head, shard_top_k
+                self.model_runner.model.lm_head,
+                self.sampling_backend.supports_vocab_shard,
             )
         )
         if self._samples_from_vocab_shard:
             logger.info(
-                f"Sampled rows stay vocab-sharded: the top-k routes select "
+                f"Sampled rows stay vocab-sharded: the sampler selects "
                 f"{shard_top_k} candidates per shard instead of gathering logits"
             )
+        # After the target's shard decision: a drafter sharded alike records q over its shard.
+        self._init_draft_probs(config, spec_num_tokens)
+        if self.drafter is not None:
+            # Draft-prob sampling reads the request's temperature / top-k /
+            # seed from the verifier's pool buffers: one owner of per-request
+            # sampling state.
+            self.drafter.bind_sampling_backend(self.sampling_backend)
         self._simulated_accept_length = parse_simulated_accept_length(
             envs.TOKENSPEED_SPEC_SIMULATED_ACCEPT_LEN.get(),
             spec_algorithm=config.spec_algo,
@@ -935,6 +938,23 @@ class ModelExecutor:
             bind_cache_groups(draft_runner.model, self.draft_token_to_kv_pool)
             if is_block_drafter(self.config.spec_algo, is_draft=True):
                 check_block_drafter_storage(draft_runner.model, self.token_to_kv_pool)
+
+    def forget_served_inputs(self) -> None:
+        """Return what dummy forwards read to its startup state; call only while no request holds a slot."""
+        # Dummy batches index real slots, whose served lengths would place rows past the rope tables.
+        self._active_multimodal_context = None
+        self._active_positions_override = None
+        # A batch that ended mid-prefill leaves it set, and EAGLE captures would skip their later draft steps.
+        self.input_buffers.all_extends_mid_chunk = False
+        if self.tree_spec is not None:
+            # The last step's trees would make every warmup compact shift the positions again.
+            self.tree_spec.reset_to_chain()
+        slots = torch.arange(
+            self.config.max_req_pool_size + 1, dtype=torch.int64, device=self.device
+        )
+        self.runtime_states.reset_states(
+            slots, torch.zeros_like(slots, dtype=torch.int32)
+        )
 
     def release_graphs(self) -> None:
         """Drop the captured graphs and unfreeze the workspace they pinned.
@@ -1177,8 +1197,8 @@ class ModelExecutor:
             num_tokens, bs, self.draft_attn_backend
         )
 
-    def autotune(self) -> None:
-        """Warm encountered kernels and optionally tune missing FlashInfer tactics."""
+    def autotune(self, *, keep_loaded_tactics: bool) -> None:
+        """Warm encountered kernels and optionally tune missing FlashInfer tactics; a reload keeps the tactics this process holds."""
 
         per_rank_max_batch = max(
             1,
@@ -1219,7 +1239,8 @@ class ModelExecutor:
             if self.config.autotune_cache_key is not None
             else None
         )
-        load_autotune_cache(cache_path, cpu_group, owner_rank)
+        if not keep_loaded_tactics:
+            load_autotune_cache(cache_path, cpu_group, owner_rank)
 
         if self.config.pp_size > 1:
             # These dummy forwards do not perform pipeline stage transfers.
@@ -1340,6 +1361,7 @@ class ModelExecutor:
             candidates,
             draft_q=self.runtime_states.future_draft_q,
             with_vocab_mask=self.config.grammar_backend != "none",
+            draft_probs=self.runtime_states.draft_probs,
         )
 
     def _autotune_draft_experts(self, num_tokens: int) -> None:
@@ -2103,7 +2125,9 @@ class ModelExecutor:
         (DFlash2) records a sparse q over its selector's candidates
         (RuntimeStates.future_draft_q, allocated by its bind_sampling_backend).
         The step drafters and DSpark sample from full-vocab logits and need
-        the dense rows.
+        the dense rows: whole-vocabulary rows, or this rank's columns when
+        the drafter samples from its own vocabulary shard
+        (``_draft_probs_columns``).
         """
         if not config.enable_speculative_sampling or config.spec_draft_tree:
             return
@@ -2116,7 +2140,33 @@ class ModelExecutor:
             self.runtime_states.init_draft_probs(
                 spec_num_tokens=spec_num_tokens,
                 reject_threshold=config.spec_reject_draft_prob_threshold,
+                columns=self._draft_probs_columns(),
             )
+
+    def _draft_probs_columns(self) -> int | None:
+        """This rank's vocabulary columns when the drafter records q over its shard, else None for whole rows.
+
+        It does when the target's sampled rows stay vocab-sharded, the
+        verifier reads q per shard, and the drafter samples each step from a
+        head sharded alike; then no draft step gathers its logits.
+        """
+        if (
+            self.drafter is None
+            or not self._samples_from_vocab_shard
+            or not self.sampling_backend.verifies_vocab_shard_draft_probs()
+        ):
+            return None
+        shard = self.model_runner.model.lm_head.shard_indices
+        if not self.drafter.keep_draft_logits_vocab_sharded(
+            self.sampling_backend.supports_vocab_shard,
+            int(shard.org_vocab_start_index),
+        ):
+            return None
+        logger.info(
+            "Draft steps stay vocab-sharded: each rank samples its shard and "
+            "records q over its own columns"
+        )
+        return int(shard.num_org_elements)
 
     def _build_sampling_info(self, bs: int, num_extends: int) -> SamplingBatchInfo:
         return SamplingBatchInfo(
@@ -2310,7 +2360,10 @@ class ModelExecutor:
         ``execution_stream`` -- the source may have been written by the
         previous forward -- and ahead of this plan's zeroing: a source may be
         re-granted and zeroed in the same plan, and the next forward's prologue
-        waits on the default stream.
+        waits on the default stream. The execution stream waits for the
+        copies too: a later plan's stream-ordered stores order behind it, and
+        a plan whose only Device work is its copies (a lone request's
+        compaction whose retry failed) runs no forward that would.
 
         Args:
             pairs: Scheduler (virtual) ``(source, destination)`` block ids per
@@ -2330,6 +2383,7 @@ class ModelExecutor:
         self.default_stream.wait_stream(self.execution_stream)
         with nvtx_range("copy_cache_pages", color="purple"):
             self.token_to_kv_pool.arena.copy_blocks(local_pairs)
+        self.execution_stream.wait_stream(self.default_stream)
 
     def zero_cache_pages(self, pages: Mapping[str, Sequence[int]] | Sequence[int]):
         """Clear newly owned pages and return a CUDA completion event when needed.

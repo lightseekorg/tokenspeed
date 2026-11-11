@@ -62,7 +62,8 @@ def _dsv4_sparse_attention_kernel(
     BLOCK_TOPK: tl.constexpr,
     BLOCK_DIM: tl.constexpr,
 ):
-    token_idx = tl.program_id(0)
+    # Widen before multiplying: token row offsets can exceed 2**31 elements.
+    token_idx = tl.program_id(0).to(tl.int64)
     head_idx = tl.program_id(1)
     dim = tl.arange(0, BLOCK_DIM)
     dim_mask = dim < HEAD_DIM

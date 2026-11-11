@@ -39,6 +39,11 @@ __all__ = [
     "eagle4_shard_topk",
     "blockwise_logprobs",
     "prepare_sampling_offsets",
+    "VOCAB_SHARD_DRAFT_BLOCK",
+    "VOCAB_SHARD_DRAFT_FIELDS",
+    "vocab_shard_draft_record",
+    "vocab_shard_draft_stats",
+    "vocab_shard_draft_stats_width",
     "vocab_shard_topk",
     "vocab_shard_topk_supports",
     "vocab_topk_merge",
@@ -330,9 +335,148 @@ def vocab_topk_merge(
     kernel(pairs, k, softcap, ids_out, values_out)
 
 
+# Columns of a shard each draft-stats block reduces, and the fp32 partials it writes.
+VOCAB_SHARD_DRAFT_BLOCK = 2048
+VOCAB_SHARD_DRAFT_FIELDS = 8
+
+
+def vocab_shard_draft_stats_width(shard_columns: int) -> int:
+    """The fp32 columns per row of ``vocab_shard_draft_stats``' output for a shard of ``shard_columns``.
+
+    Args:
+        shard_columns: Columns in the shard.
+
+    Returns:
+        One block of ``VOCAB_SHARD_DRAFT_FIELDS`` partials per
+        ``VOCAB_SHARD_DRAFT_BLOCK`` columns.
+    """
+    blocks = -(-shard_columns // VOCAB_SHARD_DRAFT_BLOCK)
+    return blocks * VOCAB_SHARD_DRAFT_FIELDS
+
+
+def vocab_shard_draft_stats(
+    logits: _torch.Tensor,
+    vocab_start: int,
+    slots: _torch.Tensor,
+    temperature_pool: _torch.Tensor,
+    seed_pool: _torch.Tensor,
+    offsets_pool: _torch.Tensor,
+    out: _torch.Tensor,
+    *,
+    logit_scale: float | None,
+    softcap: float | None,
+) -> None:
+    """Reduce one rank's shard of draft logits to the partials every rank gathers.
+
+    The first half of sampling a draft token from ``q = softmax(logits / T)``
+    over a vocabulary-parallel head without gathering the logits: each block
+    of ``VOCAB_SHARD_DRAFT_BLOCK`` columns yields the maximum and exp-sum of
+    ``logits / T``, the best Gumbel-max score (noise keyed by slot seed,
+    slot offset and global token id, as ``gumbel_sample_from_pools``) and the
+    largest logit with their lowest global ids, and a count of non-finite
+    values. ``vocab_shard_draft_record`` combines the ranks' partials.
+
+    Args:
+        logits: ``[M, N]`` raw head logits of one vocabulary shard (before
+            the processor's scale and softcap), unit column stride.
+        vocab_start: Global token id of shard column 0.
+        slots: ``[>= M]`` int32 or int64 pool slot of each row.
+        temperature_pool: ``[P]`` temperature by slot (floored at 1e-20).
+        seed_pool: ``[P]`` int64 Philox seed by slot.
+        offsets_pool: ``[P]`` int64 Philox offset by slot.
+        out: ``[>= M, vocab_shard_draft_stats_width(N)]`` fp32 partials.
+        logit_scale: The logits processor's multiplier, rounded to the
+            logits' dtype, or None.
+        softcap: The processor's final logit softcap ``c * tanh(x / c)``,
+            after the scale and rounded to the logits' dtype, or None.
+    """
+    kernel = select_kernel(
+        "sampling",
+        "vocab_shard_draft_stats",
+        format_signature(logits=dense_tensor_format(logits.dtype)),
+    )
+    kernel(
+        logits,
+        vocab_start,
+        slots,
+        temperature_pool,
+        seed_pool,
+        offsets_pool,
+        out,
+        logit_scale=logit_scale,
+        softcap=softcap,
+    )
+
+
+def vocab_shard_draft_record(
+    logits: _torch.Tensor,
+    stats: _torch.Tensor,
+    vocab_start: int,
+    slots: _torch.Tensor,
+    write_slots: _torch.Tensor,
+    temperature_pool: _torch.Tensor,
+    top_k_pool: _torch.Tensor,
+    q_out: _torch.Tensor,
+    tokens_out: _torch.Tensor,
+    *,
+    logit_scale: float | None,
+    softcap: float | None,
+    sentinel: float,
+) -> None:
+    """Each row's draft token from every rank's partials, and its ``q`` over this rank's shard.
+
+    The second half after ``vocab_shard_draft_stats`` and the gather. Every
+    rank draws the same token: the one ``gumbel_sample_from_pools`` draws
+    from the whole row.
+
+    Args:
+        logits: ``[M, N]`` raw head logits of this rank's shard, as passed to
+            ``vocab_shard_draft_stats``.
+        stats: ``[R, M, >= vocab_shard_draft_stats_width(N)]`` fp32 view of
+            every rank's partials, rank-major, unit column stride; ``R * N``
+            is the vocabulary.
+        vocab_start: Global token id of shard column 0.
+        slots: ``[>= M]`` int32 or int64 pool slot of each row.
+        write_slots: ``[>= M]`` int32 or int64 row of ``q_out`` each row writes.
+        temperature_pool: ``[P]`` temperature by slot.
+        top_k_pool: ``[P]`` int32 top-k by slot; 1 marks a greedy request.
+        q_out: ``[P', N]`` fp32 with unit column stride. Each row writes
+            ``softmax(logits / T)`` over this shard's columns; a greedy row
+            one-hot at its lowest-id maximum logit; a row whose softmax is
+            not finite (a NaN or an overflow) ``sentinel`` everywhere.
+        tokens_out: ``[>= M]`` int32 global token ids: the Gumbel-max draw
+            of ``logits / T``, lowest id among equal scores, or the lowest-id
+            maximum for greedy rows; clamped into the vocabulary for rows
+            without a finite softmax.
+        logit_scale: As for ``vocab_shard_draft_stats``.
+        softcap: As for ``vocab_shard_draft_stats``.
+        sentinel: The recorded probability that marks no proposal.
+    """
+    kernel = select_kernel(
+        "sampling",
+        "vocab_shard_draft_record",
+        format_signature(logits=dense_tensor_format(logits.dtype)),
+    )
+    kernel(
+        logits,
+        stats,
+        vocab_start,
+        slots,
+        write_slots,
+        temperature_pool,
+        top_k_pool,
+        q_out,
+        tokens_out,
+        logit_scale=logit_scale,
+        softcap=softcap,
+        sentinel=sentinel,
+    )
+
+
 # Backend registration (side-effect imports).
 import tokenspeed_kernel.ops.sampling.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.cute_dsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.torch  # noqa: E402,F401
+import tokenspeed_kernel.ops.sampling.triton.vocab_shard_draft  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.triton.vocab_topk  # noqa: E402,F401

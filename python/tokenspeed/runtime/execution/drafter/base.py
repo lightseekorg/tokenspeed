@@ -24,10 +24,11 @@ from abc import abstractmethod
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
+from typing_extensions import override
 
 from tokenspeed.runtime.execution.drafter.speculative_sampling import (
     DraftProposalSampler,
@@ -38,12 +39,16 @@ from tokenspeed.runtime.execution.slot_state import (
     slot_state_image_bytes,
     unpack_slot_rows,
 )
+from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.context import ForwardContext
     from tokenspeed.runtime.execution.cudagraph_memory import CapturedLadder
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
     from tokenspeed.runtime.execution.memory_delta import MemoryDeltaObserver
+    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
     from tokenspeed.runtime.execution.tree_spec import TreeSpec
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
@@ -105,6 +110,11 @@ class BaseDrafter:
     # samples its candidate walk (sparse q over the selector's candidates).
     # Other block drafters propose a whole block greedily and leave this False.
     supports_speculative_sampling = False
+
+    # Whether every sampled proposal comes from ``sample_draft_step`` over the
+    # draft model's own head, which can then hand it this rank's vocabulary
+    # shard (``keep_draft_logits_vocab_sharded``).
+    drafts_from_vocab_shard = False
 
     def __init__(
         self,
@@ -180,6 +190,43 @@ class BaseDrafter:
         """Disable a proposal head argmax shortcut before stochastic drafting."""
         self.draft_model_runner.model.logits_processor.require_full_vocab_logits()
 
+    def keep_draft_logits_vocab_sharded(
+        self,
+        supports: Callable[[torch.dtype, int, int], bool],
+        vocab_start: int,
+    ) -> bool:
+        """Leave each draft step's logits as this rank's vocabulary shard, for sampled drafting.
+
+        ``sample_draft_step`` then samples the shard where it lies
+        (``DraftProposalSampler.propose_vocab_shard``) and records q over its
+        columns only. Called by the executor once, before
+        ``bind_sampling_backend`` and the first draft forward, when the
+        target's sampled rows stay sharded and the verifier reads q per shard.
+
+        Args:
+            supports: The verifier's ``supports_vocab_shard``.
+            vocab_start: Global token id of the target head's shard column 0
+                on this rank; the draft head's shard must start there too.
+
+        Returns:
+            Whether it is on: a drafter sampling every proposal through
+            ``sample_draft_step`` over a head spanning the target vocabulary,
+            whose shard the processor can hand over.
+        """
+        model = self.draft_model_runner.model
+        lm_head = model.lm_head
+        if (
+            not self.drafts_from_vocab_shard
+            or self.draft_vocab_map() is not None
+            or not isinstance(lm_head, VocabParallelEmbedding)
+            or int(lm_head.shard_indices.org_vocab_start_index) != vocab_start
+        ):
+            return False
+        self.require_full_draft_logits()
+        return model.logits_processor.keep_sampled_logits_vocab_sharded(
+            lm_head, supports
+        )
+
     def draft_vocab_map(self) -> torch.Tensor | None:
         """``[V_draft]`` int64 full-vocab id per draft logit column, or None
         when the draft head spans the target vocabulary. Eagle3 hot-token
@@ -219,6 +266,8 @@ class BaseDrafter:
             if logits_output.next_token_ids is not None:
                 return logits_output.next_token_ids
             return sampling_argmax(logits_output.next_token_logits)
+        if logits_output.vocab_shard is not None:
+            return sampler.propose_vocab_shard(logits_output.vocab_shard, step=step)
         return sampler.propose(logits_output.next_token_logits, step=step)
 
     def wire_target(self, target_model: torch.nn.Module) -> None:
@@ -431,3 +480,97 @@ class BaseDrafter:
     @abstractmethod
     def draft(self, *args, **kwargs) -> torch.Tensor | None:
         raise NotImplementedError
+
+
+DsaTopKState = tuple[Any | None, Any | None]
+
+
+@dataclass
+class HiddenDraftInput:
+    """The target round a hidden-state drafter drafts from."""
+
+    input_num_tokens: int
+    num_extends: int
+    forward_mode: ForwardMode
+    base_model_output: torch.Tensor  # [bs] (extend) / [bs * k] (decode verify outputs)
+    accept_lengths: torch.Tensor  # [bs]
+    # The target's full hidden rows: the whole span, or this rank's shard of it.
+    base_out_hidden_states: torch.Tensor
+    global_num_tokens: list[int] | None = None
+    global_bs: list[int] | None = None
+    all_decode_or_idle: bool = False
+    # The target's DSA top-k selection, for a draft head that shares it.
+    dsa_topk: DsaTopKState = (None, None)
+    # The target forward's query shard, which the draft's extend rows follow.
+    query_shard: QueryShardPlan | None = None
+
+
+class HiddenStateDrafter(BaseDrafter):
+    """A drafter that drafts from the target round's accepted tokens and hidden
+    states, with the target's embedding and LM head."""
+
+    shares_target_embed_head = True
+    supports_pd_layerwise_finalization = True
+    supports_speculative_sampling = True
+    drafts_from_vocab_shard = True
+
+    def __init__(
+        self,
+        spec_num_tokens: int,
+        spec_num_steps: int,
+        draft_model_runner: ModelRunner,
+        attn_backend: AttentionBackend | None = None,
+        token_to_kv_pool: CachePool | None = None,
+        runtime_states: RuntimeStates | None = None,
+        input_buffers: InputBuffers | None = None,
+        vocab_size: int | None = None,
+    ) -> None:
+        super().__init__(
+            spec_num_tokens,
+            spec_num_steps,
+            draft_model_runner,
+            runtime_states=runtime_states,
+            input_buffers=input_buffers,
+            attn_backend=attn_backend,
+            token_to_kv_pool=token_to_kv_pool,
+            vocab_size=vocab_size,
+        )
+        self.device = draft_model_runner.device
+        # Drafter-owned seq_lens the draft metadata aliases; draft steps advance it.
+        self.draft_seq_lens_buf = torch.zeros_like(self.input_buffers.seq_lens_buf)
+        # gather_ids = these offsets + accept_lengths: each request's last accepted row.
+        self.padded_gather_ids_offsets_buf = (
+            torch.arange(
+                self.input_buffers.max_bs, dtype=torch.int64, device=self.device
+            )
+            * spec_num_tokens
+            - 1
+        )
+
+    def _target_dsa_topk(self, base_ctx: ForwardContext) -> DsaTopKState:
+        """The target's DSA top-k selection the draft shares; none by default."""
+        return (None, None)
+
+    @override
+    @nvtx_range("drafter", color="purple")
+    def run(
+        self,
+        base_ctx: ForwardContext,
+        logits_output: LogitsProcessorOutput,
+        output_tokens: torch.Tensor,
+        accept_lengths: torch.Tensor,
+    ) -> torch.Tensor:
+        draft_input = HiddenDraftInput(
+            input_num_tokens=base_ctx.input_num_tokens,
+            num_extends=base_ctx.num_extends,
+            forward_mode=base_ctx.forward_mode,
+            base_model_output=output_tokens,
+            accept_lengths=accept_lengths,
+            base_out_hidden_states=logits_output.hidden_states,
+            global_num_tokens=base_ctx.global_num_tokens,
+            global_bs=base_ctx.global_bs,
+            all_decode_or_idle=base_ctx.all_decode_or_idle,
+            dsa_topk=self._target_dsa_topk(base_ctx),
+            query_shard=base_ctx.query_shard,
+        )
+        return self.draft(draft_input)

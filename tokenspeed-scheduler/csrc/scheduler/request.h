@@ -77,6 +77,12 @@ public:
     }
     void NoteRetracted() { ++retraction_count_; }
 
+    // Decode rounds in which the prefill/decode interval held this prompt
+    // back (Submitted or Prefilling). Never reset, so the interval's bound
+    // on it spans every chunk.
+    std::int32_t PrefillDeferredRounds() const { return prefill_deferred_rounds_; }
+    void NotePrefillDeferred() { ++prefill_deferred_rounds_; }
+
     // True when the last admission's headroom already covers every token
     // this request could still generate. Retracting such a request is pure
     // thrash -- its readmission must take back exactly what the retraction
@@ -348,6 +354,7 @@ private:
     std::int32_t max_new_tokens_{0};
     std::int32_t max_cached_prefix_tokens_{std::numeric_limits<std::int32_t>::max()};
     std::int32_t retraction_count_{0};
+    std::int32_t prefill_deferred_rounds_{0};
     // GeneratedTokens() when the current admission was granted.
     std::int32_t generated_tokens_at_admission_{0};
     std::vector<std::int32_t> spec_candidate_ids_;

@@ -117,6 +117,7 @@ def make_config(
     max_retracted_requests: int,
     storage_config: StorageConfig | None,
     host_write_policy: str,
+    prefill_decode_interval: int,
     debug_force_retraction_interval: int = 0,
     enable_kv_cache_events: bool = False,
     decode_input_tokens: int = 1,
@@ -124,6 +125,7 @@ def make_config(
     disable_prefix_cache: bool = False,
     cache_groups: Sequence[CacheGroupConfig] | None = None,
     enable_mixed_prefill_decode: bool = False,
+    enable_short_prefill_first: bool = False,
     prefix_replay_tokens: int = 0,
     state_checkpoint_in_forward: bool = False,
     demote_superseded_state_checkpoints: bool = False,
@@ -138,6 +140,8 @@ def make_config(
     Args:
         num_device_pages: Device LCM blocks including the null page.
         max_scheduled_tokens: Per-step prefill token budget.
+        enable_short_prefill_first: Opt in to remaining-work ordering with
+            oldest-request protection; False preserves submission order.
         max_batch_size: Per-rank batch slots -- the most requests this rank
             runs at once (``--max-num-seqs`` over the attention-DP ranks).
         prefix_granularity: Prefix-hash page size in tokens.
@@ -167,6 +171,10 @@ def make_config(
             refuses it where it cannot run). Required on every role; without a
             Host tier write_through has no effect, and the decode role's Host
             tier holds retraction images only.
+        prefill_decode_interval: ``--prefill-decode-interval``: decode rounds
+            owed to the running decodes after each round that schedules a
+            prefill chunk, unless no decode can run, and the most rounds it
+            holds any one prompt back in total; 0 is off. Fused role only.
         debug_force_retraction_interval: ``--debug-force-retraction-interval``:
             0 is off; every ``|N|`` plans the scheduler retracts the oldest
             quiescent Decoding (``N > 0``) or Prefilling (``N < 0``) request
@@ -289,6 +297,13 @@ def make_config(
     cfg.host_write_policy = _HOST_WRITE_POLICIES[host_write_policy]
 
     cfg.enable_mixed_prefill_decode = enable_mixed_prefill_decode
+    if prefill_decode_interval:
+        # Set only when on, like state_checkpoint_in_forward: a scheduler
+        # wheel without the field still runs the default.
+        cfg.prefill_decode_interval = prefill_decode_interval
+    if enable_short_prefill_first:
+        # Older scheduler wheels retain FIFO and reject an explicit opt-in.
+        cfg.enable_short_prefill_first = True
     if cache_groups:
         cfg.cache_groups = list(cache_groups)
     return cfg

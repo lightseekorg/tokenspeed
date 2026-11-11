@@ -183,6 +183,73 @@ optional:
   amd-mi355-1gpu: true
 ```
 
+`ignore_changes` lists directories whose changes cannot affect a task. On
+pull requests the scan drops the task when every changed file is Markdown or
+lies under one of them. Pushes to `main` and manual runs keep every task. The
+per-commit kernel unit-test tasks list the runtime sources and runtime tests,
+so a pull request that changes only the runtime skips them. That holds because
+the kernel tests never import the runtime: the `kernel-tests-without-runtime`
+pre-commit hook rejects such an import under `tokenspeed-kernel/test`.
+
+```yaml
+ignore_changes:
+  - python/tokenspeed
+  - test/runtime
+```
+
+`model_sources` lists the model modules (directly under
+`python/tokenspeed/runtime/models/`) that a model-test task serves, including
+those its model and draft model import. On pull requests the scan drops the
+task when every changed file is Markdown, another model's module, or a test
+under `test/runtime/` or `tokenspeed-kernel/test/`; a unit-test task keeps the
+tests its definition names, as files or directories, and every test helper. A
+module there belongs to one model when it defines `EntryClass` or a task lists
+it; any other module, such as `utils.py`, is shared, and a change to it runs
+every task. Speculative-decoding draft modules (file names with `nextn`,
+`eagle`, `dflash` or `dspark`) are shared too, and `model_sources` may not list
+them. The scan fails when a listed module does not exist, or imports a
+module that belongs to one model without the task listing it too.
+
+```yaml
+model_sources:
+  - python/tokenspeed/runtime/models/llama.py
+  - python/tokenspeed/runtime/models/minimax_m3.py
+```
+
+`changed_paths: true` hands a pull request's changed paths to the task's
+commands as `TOKENSPEED_CI_CHANGED_PATHS`, one path per line, so the suite can
+pick its own tests. The scan sets it only where it narrows tasks: pull
+requests with fewer than 300 changed files. The kernel unit-test tasks use it:
+`tokenspeed-kernel/test/kernel_test_selection.py` runs the test files whose
+op families a change names (`ops/<family>/`, an attention variant such as
+`ops/attention/mla/`, `thirdparty/<package>/`, and the AMD
+`ops/<arch>/<family>/`), the changed test files, and the tests that load every
+kernel. A change to a core module, `conftest.py`, packaging, or anything else
+that names no family runs every test. Dependencies between families are not
+followed; pushes to `main` run every test.
+
+The runtime unit-test tasks use it too: `test/runtime/run_ci_suite.py` keeps
+only the test files the changes reach before it partitions the suite
+(`test/ci_system/runtime_test_selection.py`). The suite narrows only when every
+change is Markdown, a test file, or a model module: a module directly under
+`python/tokenspeed/runtime/models/` that defines `EntryClass`. It then runs these
+test files:
+
+- The changed runtime test files.
+- The tests that import a changed model module or a module built on it, or that
+  name one of them, so `gpt_oss` matches a test serving `openai/gpt-oss-20b`.
+- The tests that import any of these, directly or through other test files.
+
+Any other change runs every test.
+
+A reviewer can widen a pull request's tests. The `ci-full-tests` label turns
+off every changed-path narrowing (vendor path filtering, `ignore_changes`,
+and `changed_paths`), and each `CI-Extra-Changes: <path>` line in the description
+counts as a changed path, such as a kernel family directory whose tests should
+also run. The scan job reads both from the pull request
+(`test/ci_system/pr_test_scope.py`), so re-run the workflows after adding the
+label or editing the description.
+
 The NVIDIA PR workflow routes `b200-<Ngpu>` task labels to
 `b200v2-<Ngpu>` by default. Set the `TOKENSPEED_B200_RUNNER_LABEL` repository
 variable in GitHub Actions (`Settings` -> `Secrets and variables` -> `Actions`

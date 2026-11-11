@@ -539,6 +539,31 @@ computes the stored width and consumes only logical columns, while CuTe gives
 TMA a logical view of that same storage. Eager and CUDA graph calls therefore
 share both the weight layout and its update semantics.
 
+CuTe gated residual mixing keeps model dimensions static and token rows dynamic
+within bounded full/tail and scheduling-round buckets. Scheduling-round
+boundaries depend on measured worker capacity, so one tile bucket can span
+several round buckets on a different device or stream. The cooperative grid
+must fit the selected function's measured resident capacity. Local pipelines
+share a physical CTA; their logical tiles are counted separately from that
+capacity. A rank-ordered FP32 merge completes Down before SiLU and publishes
+activation tiles through per-invocation epochs. Persistent scratch is allocated
+independently of the inference-mode context that first warms a layout.
+
+Down and Up reuse one shared-memory operand arena after Down's MMA completion.
+Up uses separate weight and activation rings when their stage counts differ;
+each ring waits for its last MMA reader before overwriting a slot. Large token
+tiles can retain two Up accumulators, publishing the first only after its final
+K tiles complete while the second continues. Readers acknowledge TMEM before
+reuse or deallocation. PDL, mutable weights and eager/graph calls use these same
+ownership and publication edges. Startup warms the bounded tactic variants
+through the ordinary operator. The validated model dimensions `(4, 2560, 320)`
+and `(4, 8192, 1024)` use the same parameterized implementation, with
+model-specific tile geometry, Up K width and cache policy. Token tiles for the
+existing model preserve resident parallelism and bound per-thread gate state
+for larger batches. Row-derived reduction groups and token pairing belong
+only to the wider model. Other dimensions keep ordinary kernel selection;
+the fused work budget still bounds automatic selection.
+
 Startup uses the ordinary dummy model traversal with `kernel_warmup` to
 prepare CuTe QSA, streaming top-k and gated residual configurations. It follows
 normal dispatch overrides and scratch budgets, independently of optional
@@ -991,7 +1016,11 @@ cache contract, so the target allocates its write-location buffer
 unconditionally and drafts are gated structurally on `is_draft`.)
 
 K3 DSpark pipeline prefill distributes target-tap projection across stages,
-while the final stage owns the proposal network and draft cache. After
+while the final stage owns the proposal network and draft cache. Within a
+stage each attention-TP rank projects only its own `context_proj` output
+columns, so the partial sum crosses the stage boundary per rank at
+`hidden / attention TP` columns, and the final stage gathers the columns
+before the context norm. After
 target prefill sampling, that stage runs the ordinary drafter; its completed
 call publishes the final cache producer barrier. PD transfers the sampled
 anchor and real draft candidates with the target and draft caches. Decode
@@ -1041,7 +1070,11 @@ Greedy requests normalize to `top_k=1` in `SamplingParams.__post_init__`; the
 pool-indexed sampling route serves them, which is exactly what the captured
 graph records. `SamplingBatchInfo.is_all_greedy` and the eager-only argmax
 branches were deleted. Equivalence (top_k=1 == argmax, ties excepted) is
-pinned by `test/runtime/sampling/test_greedy_route_equivalence.py`.
+pinned by `test/runtime/sampling/test_greedy_route_equivalence.py` (for
+`sonic`, whose kernels rank candidates at bf16 resolution -- a penalized
+greedy pick lies within one bf16 ulp of the maximum -- and draw a request
+without top-k, top-p or min-p from its whole vocabulary, by
+`test_sonic_backend.py`).
 
 Admission uses the selected sampling backend's finite top-k bound. GPU
 backends retain the exclusive 128 bound. `ascend_full` accepts positive
@@ -1082,8 +1115,11 @@ window that accepts nothing and resolves to exactly one sampled token
 through the same pool kernels, `accept_length == 1`
 (`test_decode_verify_n1_equivalence.py`; Triton and FlashInfer's
 `per-request` stream use the same draw in `sample()` and `verify(N=1)`;
-FlashInfer's legacy `batch` stream retains the coin route). `future_input_map` is `[pool, output_length]` for
-the same reason: single-token decode is a width-1 candidate window.
+FlashInfer's legacy `batch` stream retains the coin route; `sonic` resolves
+the width-1 window through its single-step kernel, bitwise equal to
+`sample()`, pinned by `test_sonic_backend.py`). `future_input_map` is
+`[pool, output_length]` for the same reason: single-token decode is a width-1
+candidate window.
 
 Backends express verify geometry as a **floor**, not a mode: seq_lens clamp
 to `clamp_min(q_len)` unconditionally (drafts and plain decode have floor 1,
@@ -1187,8 +1223,11 @@ the contract: ordering, masking, supported configurations and cost.
 persistent output buffers, on eager and replay alike. The FlashInfer backend
 packs tokens and accept lengths into one region (`_output_pack_buf`), so its
 `get_packed_output_d2h` collapses the two device-to-host copies into one; the
-Triton backends return separate token and length buffers and take the
-executor's two-copy path (`get_packed_output_d2h` returns None).
+Triton backends and `sonic` return separate token and length buffers and
+take the executor's two-copy path (`get_packed_output_d2h` returns None).
+The stop conditions cut the returned accept lengths in place (0 for a stopped
+request), so a backend whose decode rows return a buffer of ones refills it on
+every call, as `sonic` and FlashInfer do.
 
 ### Logits capture state follows the tensor's device
 

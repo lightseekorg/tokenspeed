@@ -23,6 +23,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, ClassVar
 
 import torch
+from tokenspeed_kernel.ops.attention.dsa.triton import (
+    index_k_layernorm_fp8_scatter_and_quantize_query,
+)
 from tokenspeed_kernel.ops.kvcache.triton import (
     index_k_block_split_scatter,
     index_k_layernorm_fp8_scatter,
@@ -246,4 +249,60 @@ class DSATokenToKVPool(MLATokenToKVPool):
             head_dim=self.index_head_dim,
             group_size=_INDEX_K_FP8_GROUP_SIZE,
             write_mask=write_mask,
+        )
+
+    def set_index_k_buffer_and_quantize_query(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        index_k: torch.Tensor,
+        *,
+        write_mask: torch.Tensor | None,
+        key_norm: LayerNorm,
+        query: torch.Tensor,
+        query_weights: torch.Tensor,
+        softmax_scale: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Write pre-norm index keys and quantize the same rows' queries in one launch.
+
+        The write is :meth:`set_index_k_buffer` of pre-norm keys into a uint8
+        (``fp8_scaled``) plane, and the same rows' index queries are quantized in
+        the write's launch. The plane receives exactly the bytes
+        ``set_index_k_buffer(..., key_norm=key_norm)`` writes, and the query
+        comes back exactly as ``quantize_index_query_weights`` returns it.
+
+        Args:
+            layer_id: The indexer layer whose plane to write.
+            loc: ``[rows]`` cache slots of the keys.
+            index_k: ``[rows, index_head_dim]`` pre-norm keys in the model dtype.
+            write_mask: Optional bool ``[rows]`` ownership mask of the keys.
+            key_norm: The LayerNorm the keys still need.
+            query: ``[rows, heads, index_head_dim]`` BF16 index queries.
+            query_weights: ``[rows, heads]`` head weights.
+            softmax_scale: The score scale folded into the head weights.
+
+        Returns:
+            ``[rows, heads, index_head_dim]`` E4M3 queries and ``[rows,
+            heads]`` FP32 head weights carrying each query's scale and
+            ``softmax_scale``.
+        """
+        buf = self.get_index_k_buffer(layer_id)
+        if buf.dtype != torch.uint8 or index_k.dtype != self.model_dtype:
+            raise ValueError(
+                f"the fused index-K write takes {self.model_dtype} keys into a "
+                f"uint8 plane, got {index_k.dtype} keys and a {buf.dtype} plane"
+            )
+        return index_k_layernorm_fp8_scatter_and_quantize_query(
+            buf,
+            index_k.view(-1, self.index_head_dim),
+            key_norm.weight,
+            key_norm.bias,
+            loc,
+            query,
+            query_weights,
+            eps=key_norm.variance_epsilon,
+            page_size=self.index_k_page_size,
+            group_size=_INDEX_K_FP8_GROUP_SIZE,
+            write_mask=write_mask,
+            softmax_scale=softmax_scale,
         )

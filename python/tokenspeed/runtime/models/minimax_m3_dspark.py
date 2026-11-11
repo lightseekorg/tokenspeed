@@ -124,30 +124,21 @@ class MiniMaxM3DSparkAttention(DFlashAttention):
 class MiniMaxM3DSparkDecoderLayer(DFlashDecoderLayer):
     """DFlash block-draft layer with MiniMax-M3's dense-layer modules."""
 
-    def __init__(
-        self,
-        config,
-        mapping: Mapping,
-        layer_id: int,
-        quant_config: QuantizationConfig | None = None,
-        prefix: str = "",
-    ) -> None:
-        # DFlashDecoderLayer.forward owns the residual stream and the TP
-        # reductions; only the modules differ from its Qwen3-shaped ones.
-        nn.Module.__init__(self)
-        self.mapping = mapping
-        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.self_attn = MiniMaxM3DSparkAttention(
-            config=config,
-            mapping=mapping,
-            layer_id=layer_id,
-            quant_config=quant_config,
-            prefix=add_prefix("self_attn", prefix),
+    def resolve_norm(self) -> nn.Module:
+        return GemmaRMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
+
+    def resolve_attn(self, prefix: str) -> nn.Module:
+        return MiniMaxM3DSparkAttention(
+            config=self.config,
+            mapping=self.mapping,
+            layer_id=self.layer_id,
+            quant_config=self.quant_config,
+            prefix=prefix,
         )
-        self.post_attention_layernorm = GemmaRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.mlp = GatedMLP.tensor_parallel(
+
+    def resolve_mlp(self, prefix: str) -> nn.Module:
+        config, mapping = self.config, self.mapping
+        return GatedMLP.tensor_parallel(
             hidden_size=config.hidden_size,
             intermediate_size=config.dense_intermediate_size,
             activation=SwigluOAI(config.swiglu_alpha, config.swiglu_limit),
@@ -156,8 +147,8 @@ class MiniMaxM3DSparkDecoderLayer(DFlashDecoderLayer):
             tp_group=mapping.dense.tp_group,
             reduce_results=False,
             fusions=(),
-            quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
+            quant_config=self.quant_config,
+            prefix=prefix,
         )
 
 

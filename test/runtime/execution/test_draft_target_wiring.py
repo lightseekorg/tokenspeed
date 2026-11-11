@@ -90,7 +90,7 @@ def _head_layout(**overrides) -> SimpleNamespace:
     """The LM-head layout the factory compares between a target and the draft
     sharing its head (``_check_shared_head_layout``): the logits processor's
     group, width and attention-DP flag. Default: one replicated head."""
-    layout = dict(tp_group=None, tp_size=1, dp_lm_head_tp=False)
+    layout = dict(tp_group=None, tp_size=1, attn_tp_size=1, dp_lm_head_tp=False)
     layout.update(overrides)
     return SimpleNamespace(**layout)
 
@@ -334,7 +334,7 @@ def test_wire_rejects_a_draft_head_in_another_layout():
         SimpleNamespace(
             get_embed_and_head=mock.Mock(side_effect=AssertionError("bound")),
             logits_processor=_head_layout(
-                tp_group=(0, 1), tp_size=2, dp_lm_head_tp=True
+                tp_group=(0, 1), tp_size=2, attn_tp_size=1, dp_lm_head_tp=True
             ),
         )
     )
@@ -543,7 +543,7 @@ def test_wire_eagle3_explicit_capture_ids_override_checkpoint():
 class _ContextDraft:
     """A draft implementing the DSparkContextModel protocol on one stage."""
 
-    hidden_size = 8
+    projection_width = 8
 
     def __init__(self, is_last_pp_rank: bool):
         self.mapping = SimpleNamespace(
@@ -1097,6 +1097,7 @@ def test_k3_setup_capture_survives_resource_binding(monkeypatch, has_pp):
     draft.config = SimpleNamespace(aux_hidden_stream="attn_res")
     draft.target_capture_layer_ids = (2, 5)
     draft.hidden_size = 8
+    draft.projection_width = 8
     # Only a pipeline splits the taps across stages; off the pipeline the
     # drafter keeps projecting and writing the context itself.
     draft.mapping = SimpleNamespace(has_pp=has_pp)

@@ -158,6 +158,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
     scheduler_config.def(nb::init<>())
         .def_rw("prefix_granularity", &tokenspeed::SchedulerConfig::prefix_granularity)
         .def_rw("max_scheduled_tokens", &tokenspeed::SchedulerConfig::max_scheduled_tokens)
+        .def_rw("enable_short_prefill_first", &tokenspeed::SchedulerConfig::enable_short_prefill_first)
         .def_rw("max_kv_page_num", &tokenspeed::SchedulerConfig::max_kv_page_num)
         .def_rw("max_batch_size", &tokenspeed::SchedulerConfig::max_batch_size)
         .def_rw("decode_input_tokens", &tokenspeed::SchedulerConfig::decode_input_tokens)
@@ -183,6 +184,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("enable_l3_storage", &tokenspeed::SchedulerConfig::enable_l3_storage)
         .def_rw("enable_kv_cache_events", &tokenspeed::SchedulerConfig::enable_kv_cache_events)
         .def_rw("enable_mixed_prefill_decode", &tokenspeed::SchedulerConfig::enable_mixed_prefill_decode)
+        .def_rw("prefill_decode_interval", &tokenspeed::SchedulerConfig::prefill_decode_interval)
         .def_rw("disable_prefix_cache", &tokenspeed::SchedulerConfig::disable_prefix_cache)
         .def_rw("prefix_replay_tokens", &tokenspeed::SchedulerConfig::prefix_replay_tokens)
         .def_rw("state_checkpoint_in_forward", &tokenspeed::SchedulerConfig::state_checkpoint_in_forward)
@@ -314,7 +316,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("restore", &tokenspeed::CacheCoordinator::DeviceEvictionStats::restore)
         .def_ro("flush", &tokenspeed::CacheCoordinator::DeviceEvictionStats::flush)
         .def_ro("tail_cap", &tokenspeed::CacheCoordinator::DeviceEvictionStats::tail_cap)
-        .def_ro("dead_entry_collection", &tokenspeed::CacheCoordinator::DeviceEvictionStats::dead_entry_collection);
+        .def_ro("dead_entry_collection", &tokenspeed::CacheCoordinator::DeviceEvictionStats::dead_entry_collection)
+        .def_ro("compaction", &tokenspeed::CacheCoordinator::DeviceEvictionStats::compaction);
     nb::class_<tokenspeed::TierTransferManager::WriteBackStats>(m, "WriteBackStats")
         .def_ro("ops", &tokenspeed::TierTransferManager::WriteBackStats::ops)
         .def_ro("blocks", &tokenspeed::TierTransferManager::WriteBackStats::blocks)
@@ -348,6 +351,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("dead_entries_not_written_back", &tokenspeed::HostCacheStats::dead_entries_not_written_back)
         .def_ro("demoted_entries_not_written_back", &tokenspeed::HostCacheStats::demoted_entries_not_written_back)
         .def_ro("device_evictions", &tokenspeed::HostCacheStats::device_evictions)
+        .def_ro("lone_compactions", &tokenspeed::HostCacheStats::lone_compactions)
+        .def_ro("lone_compaction_moves", &tokenspeed::HostCacheStats::lone_compaction_moves)
         .def_ro("checkpoint_resume_gaps", &tokenspeed::HostCacheStats::checkpoint_resume_gaps);
 
     // ─── ExecutionEvent ─────────────────────────────────────────────
@@ -607,10 +612,13 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
 
     // A request the scheduler finished on its own while building the plan:
     // the last resort of a capacity retraction whose victim's KV image did not
-    // fit the host budgets. Already Finished on every rank; the runtime fails
-    // it toward the client with `detail` as the message.
+    // fit the host budgets, or a lone request on the fused role that made no
+    // progress for Scheduler::kNoProgressAbortPlans consecutive plans. Already
+    // Finished on every rank; the runtime fails it toward the client with
+    // `detail` as the message.
     nb::enum_<tokenspeed::AbortReason>(m, "AbortReason", nb::is_arithmetic())
-        .value("ImageDoesNotFit", tokenspeed::AbortReason::kImageDoesNotFit);
+        .value("ImageDoesNotFit", tokenspeed::AbortReason::kImageDoesNotFit)
+        .value("NoProgress", tokenspeed::AbortReason::kNoProgress);
     nb::class_<tokenspeed::SchedulerAbort>(m, "SchedulerAbort")
         .def_ro("request_id", &tokenspeed::SchedulerAbort::request_id)
         .def_ro("reason", &tokenspeed::SchedulerAbort::reason)
@@ -680,7 +688,14 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
              nb::overload_cast<const std::vector<tokenspeed::RequestSpec>&>(&tokenspeed::Scheduler::SubmitRequests),
              nb::arg("request_specs"))
         .def(
-            "next_execution_plan", [](tokenspeed::Scheduler& s) { return s.NextExecutionPlan(); },
+            "next_execution_plan",
+            [](tokenspeed::Scheduler& s) {
+                // Python deliberately fixes ordinary scheduling for this API.
+                // Only the Rust host drives the serving prefill gate, passing
+                // both options explicitly for each plan.
+                return s.NextExecutionPlan(
+                    tokenspeed::Scheduler::PlanOptions{.allow_prefill = true, .apply_prefill_watermark = false});
+            },
             nb::call_guard<nb::gil_scoped_release>())
         .def("advance", &tokenspeed::Scheduler::Advance, nb::arg("event"))
         .def("drain_kv_events",
