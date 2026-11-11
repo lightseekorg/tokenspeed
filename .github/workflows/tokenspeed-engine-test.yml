@@ -6,12 +6,18 @@ on:
     paths:
       - "tokenspeed-engine/**"
       - "tokenspeed-scheduler/**"
+      - "test/ci_system/engine_cache.py"
+      - "test/ci_system/install_tokenspeed_engine.sh"
+      - "test/ci_system/test_engine_cache.py"
       - ".github/workflows/tokenspeed-engine-test.yml"
   pull_request:
     branches: [main]
     paths:
       - "tokenspeed-engine/**"
       - "tokenspeed-scheduler/**"
+      - "test/ci_system/engine_cache.py"
+      - "test/ci_system/install_tokenspeed_engine.sh"
+      - "test/ci_system/test_engine_cache.py"
       - ".github/workflows/tokenspeed-engine-test.yml"
   workflow_dispatch:
 
@@ -43,7 +49,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build libssl-dev
-          python -m pip install "nanobind>=2.13.0" tokenspeed-spdlog==1.15.1
+          mapfile -t build_requirements < <(python ../test/ci_system/engine_cache.py --build-requirements)
+          python -m pip install "${build_requirements[@]}" pytest
           echo "PYO3_PYTHON=$(which python)" >> "$GITHUB_ENV"
 
       - name: Install the Rust toolchain
@@ -51,8 +58,22 @@ jobs:
           rustup toolchain install stable --profile minimal --component rustfmt,clippy
           rustup default stable
 
+      - name: Identify native build environment
+        id: engine-environment
+        run: echo "key=$(python ../test/ci_system/engine_cache.py --environment-key)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tokenspeed-engine
+          cache-workspace-crates: true
+          key: ${{ steps.engine-environment.outputs.key }}-${{ hashFiles('tokenspeed-scheduler/**', 'tokenspeed-engine/crates/ts-scheduler/**', 'tokenspeed-engine/crates/ts-grammar/**') }}
+
       - name: Check formatting
         run: cargo fmt --all --check
+
+      - name: Test engine cache invalidation
+        run: python -m pytest -q ../test/ci_system/test_engine_cache.py
 
       - name: Lint
         run: cargo clippy --all-targets --locked -- -D warnings
@@ -63,6 +84,6 @@ jobs:
       # The wheel the engine installs: the extension module and ts-host.
       - name: Build the wheel
         run: |
-          python -m pip wheel . --no-deps -w dist
+          python -m pip wheel . --no-deps --no-build-isolation -w dist
           python -m pip install --no-deps dist/tokenspeed_engine-*.whl
           cd /tmp && python -c 'import os, tokenspeed_engine; assert os.access(tokenspeed_engine.host_binary(), os.X_OK)'
