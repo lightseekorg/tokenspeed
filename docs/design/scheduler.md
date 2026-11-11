@@ -262,9 +262,9 @@ round, `wholePromptsAfter` probes up to eight `Submitted` candidates (for a
 new prompt's chunk, only those behind it) the way admission would. A
 candidate qualifies when its first chunk could complete it: no eviction store
 pending on its prefix, no junction cut, no in-forward checkpoint spanned from
-inside a page, and — beside a resident chunk on a model with State groups —
-no page shared with what that chunk's admission is about to publish (its
-probe would be stale). What it takes is counted past its hit, replay
+inside a page, and — beside a resident chunk on a model with State groups,
+with prefix caching — no page shared with what that chunk's admission is
+about to publish (its probe would be stale). What it takes is counted past its hit, replay
 included: a 100k-token prompt with 1k uncached tokens takes 1k.
 `carriedPrompts` keeps them in FIFO order while they fit N, the batch, the
 free request slots and, with `max_kv_page_num`, the page budget. The chunk

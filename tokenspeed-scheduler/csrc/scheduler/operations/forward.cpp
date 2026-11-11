@@ -1921,7 +1921,8 @@ std::optional<std::int32_t> Scheduler::wholePromptTokens(Request& request, Reque
     // completed. With a State group, a prompt sharing the first page its KV
     // lacks with them would mostly reach a junction then -- KV further than
     // any State checkpoint -- so it waits for a probe after the publication.
-    if (resident_holder != nullptr && has_state_group) {
+    // Without prefix caching nothing it publishes can be hit.
+    if (resident_holder != nullptr && has_state_group && !config_.disable_prefix_cache) {
         const auto lacking = static_cast<std::size_t>(kv_tokens / coordinator_.PrefixGranularity());
         const std::span<const std::string> hashes = request.PromptPrefixHashes();
         const std::span<const std::string> holder_hashes = resident_holder->PromptPrefixHashes();
