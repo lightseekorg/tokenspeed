@@ -234,7 +234,9 @@ def _check_latent_gather(
 
     # Interleave with the MoE all-reduce, which shares the mailbox tiles.
     producer = state.all_reduce
-    for seed, rows in enumerate((4, 2, 64, 6, 16, 17, 3, 8, 192, 32, 5, 128, 4, 64, 32)):
+    for seed, rows in enumerate(
+        (4, 2, 64, 6, 16, 17, 3, 8, 192, 32, 5, 128, 4, 64, 32)
+    ):
         hidden = hidden_for(rows, seed)
         quantize = seed % 3 != 1
         assert same(sharded(hidden, quantize), replicated(hidden, quantize))
