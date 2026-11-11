@@ -155,32 +155,13 @@ the same inputs, eager or replayed, agree bit for bit.
 
 ## Offline-tuned BLAS solutions with TunableOp (ROCm)
 
-Dense BF16/FP16 projections that no registered kernel claims run `torch.mm`,
-which on ROCm takes hipBLASLt's heuristic solution. For skinny row counts, such
-as speculative-decoding verify steps, a measured solution can be much faster.
-TunableOp times both hipBLASLt and rocBLAS solutions, so a tuned file can list
-either kind (rocBLAS ones are named `Gemm_Rocblas_*`). `hipblaslt.py` replays
-such measurements read-only through PyTorch TunableOp
-when `TOKENSPEED_HIPBLASLT_TUNED_FILE` names a results file. The file is loaded
-once per process, before graph capture. GEMMs it does not list keep the
-default solution. Serving never tunes or rewrites the file.
-
-A results file is valid only for the PyTorch, HIP, hipBLASLt and rocBLAS
-versions and the GPU architecture stamped in its `Validator` rows. On any
-mismatch the whole file is ignored with a warning and every GEMM keeps the
-default. Regenerate the file after changing the stack, on an idle GPU of the
-serving type, for each weight shape `N x K` and each row count to cover
-(captured verify or decode token counts):
-
-```bash
-python -m tokenspeed_kernel.ops.gemm.hipblaslt --dtype bfloat16 \
-    --shapes 14336x5120,5120x6144,16480x5120,34816x5120,5120x17408 \
-    --rows 64,128,192,256,384,512 --out blas_tuned.csv
-```
-
-Tuning rotates weight copies through `--cold-bytes`, so each timing reads the
-weight from HBM as a serving step does. Another solution can sum K in another
-order, so results differ from the default within BF16 rounding.
+Dense BF16/FP16 projections that no registered kernel claims run `torch.mm`.
+On ROCm, `TOKENSPEED_HIPBLASLT_TUNED_FILE` names a PyTorch TunableOp results
+file whose measured hipBLASLt or rocBLAS solutions replace the heuristic ones
+for the GEMM shapes it lists. `hipblaslt.py` is the runtime entry point; the
+loader, the stack check and the tuning tool are in `tokenspeed-kernel-amd`
+(`tokenspeed_kernel_amd.ops.gemm.hipblaslt`, documented in that package's
+`ops/README.md`).
 
 ## Per-token/per-channel FP8
 

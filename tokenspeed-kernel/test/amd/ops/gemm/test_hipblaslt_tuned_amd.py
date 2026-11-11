@@ -33,9 +33,13 @@ from utils import is_amd
 if not is_amd() or torch.version.hip is None:
     pytest.skip("ROCm GPU required for TunableOp", allow_module_level=True)
 
+# Loading goes through the tokenspeed_kernel entry point that serving uses;
+# tuning and the file stamp are the AMD package's.
 from tokenspeed_kernel.ops.gemm.hipblaslt import (  # noqa: E402
-    hipblaslt_file_validators,
     load_hipblaslt_tuned_solutions,
+)
+from tokenspeed_kernel_amd.ops.gemm.hipblaslt import (  # noqa: E402
+    hipblaslt_file_validators,
     tune_hipblaslt_solutions,
 )
 
@@ -134,6 +138,7 @@ def test_off_unless_loaded(tmp_path):
     # TunableOp off and writes no results file.
     _run_fresh_process(
         "import torch, tokenspeed_kernel.ops.gemm.hipblaslt\n"
+        "import tokenspeed_kernel_amd.ops.gemm.hipblaslt\n"
         f"a = torch.randn({TUNED_M}, {K}, device='cuda', dtype=torch.bfloat16)\n"
         "torch.mm(a, a.t())\n"
         "assert not torch.cuda.tunable.is_enabled()\n",
