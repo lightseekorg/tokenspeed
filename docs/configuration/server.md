@@ -1271,6 +1271,22 @@ old-weight KV is never restored under new weights.
 `--debug-force-retraction-interval` exercises the path without pressure in
 tests (see the flag above).
 
+**When a lone request cannot progress.** On the fused role the scheduler's
+no-progress abort fails a request like the image-fit abort above (524), with
+the detail "no progress for 4096 consecutive plans ...", counted in
+`tokenspeed:num_capacity_aborted_requests` too: a request no
+other request holds KV pages beside, whose admission needs Device pages that
+neither eviction nor lone-request compaction can free, or whose restore does
+not fit even when it claims no cached page
+([scheduler §1.4](../design/scheduler.md#14-what-bounds-a-single-request)),
+is aborted after 4096 consecutive scheduler plans without progress (the
+scheduler warns about such a stall from its 1024th plan on) instead of
+waiting for good. On the prefill and decode roles of a disaggregated
+deployment such a request waits behind the warning instead: a scheduler
+abort would not conclude the PD transfer it has registered. A prefill
+request past its first admission is not counted as stalled at all, as its
+pages stay pinned for the transfer.
+
 ### Host L2 and Mooncake Store L3
 
 Host KVStore (`--kvstore-ratio` / `--kvstore-size`) is a compact pinned
