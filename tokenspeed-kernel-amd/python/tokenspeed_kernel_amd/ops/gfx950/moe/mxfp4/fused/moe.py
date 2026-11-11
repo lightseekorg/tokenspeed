@@ -1868,8 +1868,12 @@ def warm_gluon_mxfp4_situ_prefill_rows(
 
     Runs the prefill once per representative row count, from BF16 rows and
     from packed E2M1 rows, with zero activations and round-robin routes. Each
-    weight geometry is prepared once per process.
+    weight geometry is prepared once per process. Rows up to
+    ``_SITU_WARP_DECODE_MAX_M`` take the warp decode, so a ``max_rows`` within
+    it warms nothing and leaves the geometry unprepared.
     """
+    if max_rows <= _SITU_WARP_DECODE_MAX_M:
+        return
     package_w13 = getattr(w13_weight, "gluon_package_prefill_weight", None)
     package_w2 = getattr(w2_weight, "gluon_package_prefill_weight", None)
     if not isinstance(package_w13, torch.Tensor) or not isinstance(
