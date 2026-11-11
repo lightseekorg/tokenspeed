@@ -21,7 +21,8 @@
 """The block draft's attention-TP-split context projection (``fc``) matches
 the replicated one, through weight loading and the projection, and the
 target's capture sink writes exactly what the projection of the
-concatenated taps gives."""
+concatenated taps gives. The draft's final norm reduces the last layer's
+dense-TP MLP partial."""
 
 import importlib.util
 import os
@@ -97,9 +98,9 @@ def _open_port() -> int:
         return sock.getsockname()[1]
 
 
-def _worker(rank, world_size, port, error_dict):
+def _worker(rank, world_size, port, error_dict, check):
     try:
-        _check_projection(rank, world_size, port)
+        check(rank, world_size, port)
     except Exception:
         error_dict[rank] = traceback.format_exc()
     finally:
@@ -304,7 +305,60 @@ def test_split_context_projection_matches_the_replicated_one(world_size):
     error_dict = mp.Manager().dict()
     mp.spawn(
         _worker,
-        args=(world_size, _open_port(), error_dict),
+        args=(world_size, _open_port(), error_dict, _check_projection),
+        nprocs=world_size,
+        join=True,
+    )
+    if error_dict:
+        raise RuntimeError("\n".join(f"Rank {r}: {e}" for r, e in error_dict.items()))
+
+
+def _check_final_norm(rank, world_size, port):
+    from tokenspeed.runtime.distributed.process_group_manager import (
+        process_group_manager as pg_manager,
+    )
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    device = torch.device("cuda", rank)
+    torch.cuda.set_device(device)
+    # Attention DP 1: the draft keeps the target's dense TP width.
+    mapping = Mapping(
+        rank=rank, world_size=world_size, attn_tp_size=world_size
+    ).for_block_draft()
+    assert mapping.dense.tp_size == world_size
+    pg_manager.init_distributed(
+        mapping=mapping,
+        distributed_init_method=f"tcp://localhost:{port}",
+        backend="nccl",
+    )
+    pg_manager.init_process_group(mapping.dense.tp_group)
+    global_server_args_dict["mapping"] = mapping
+
+    hidden = 1024
+    model = _draft(mapping, hidden).to(device=device, dtype=torch.bfloat16)
+    torch.manual_seed(5)
+    model.load_weights([("model.norm.weight", torch.rand(hidden).bfloat16() + 0.5)])
+    # Small integers keep the cross-rank sum exact in BF16.
+    partials = torch.randint(-4, 5, (world_size, ROWS, hidden), device=device)
+    partials = partials.bfloat16()
+    residual = torch.randint(-4, 5, (ROWS, hidden), device=device).bfloat16()
+
+    out = model.final_norm(partials[rank].clone(), residual.clone())
+    reference = model.norm(partials.sum(dim=0), residual.clone())[0]
+    assert torch.equal(out, reference), (out - reference).abs().max()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU collective")
+@pytest.mark.parametrize("world_size", [4, 8])
+def test_final_norm_reduces_the_last_mlp_partial(world_size):
+    """The layers' MLPs hand back shard-local partials; the last one reaches
+    ``final_norm``, which must sum it over the dense group before the norm."""
+    if world_size > torch.cuda.device_count():
+        pytest.skip(f"Need {world_size} GPUs, have {torch.cuda.device_count()}")
+    error_dict = mp.Manager().dict()
+    mp.spawn(
+        _worker,
+        args=(world_size, _open_port(), error_dict, _check_final_norm),
         nprocs=world_size,
         join=True,
     )

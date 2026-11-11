@@ -582,13 +582,15 @@ class DFlashDraftModel(nn.Module, TargetCaptureConfigurator):
     def final_norm(
         self, hidden_states: torch.Tensor, residual: torch.Tensor | None
     ) -> torch.Tensor:
-        """Norm the last layer's output.
+        """Reduce the last layer's MLP partial over the dense group, then norm.
 
-        A draft whose layers hand back a shard-local partial overrides this to
-        reduce first.
+        The layers build their MLP with ``reduce_results=False``; each layer's
+        partial is reduced by the next layer's input norm, so the last one is
+        reduced here. Over a dense group of one rank the reduce is a no-op.
         """
         if residual is None:
             return self.norm(hidden_states)
+        hidden_states = all_reduce(hidden_states, self.mapping.dense.tp_group)
         return self.norm(hidden_states, residual)[0]
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
