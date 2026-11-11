@@ -152,7 +152,7 @@ impl LauncherFailure {
         let parent = unsafe { libc::getppid() };
         Self {
             reported: AtomicBool::new(false),
-            parent: (parent > 1).then_some(parent),
+            parent: (parent > 0).then_some(parent),
         }
     }
 
