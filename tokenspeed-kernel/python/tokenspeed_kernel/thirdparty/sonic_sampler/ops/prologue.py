@@ -432,6 +432,7 @@ def whole_row(indicator, whole: tl.constexpr, singular: tl.constexpr):
 
     else:
 
+        # Never true (the bits are non-negative): no row takes the whole path.
         plain = (indicator & 0x3C0) < 0
 
     return plain

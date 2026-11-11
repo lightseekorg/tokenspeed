@@ -39,6 +39,7 @@ from tokenspeed_kernel.ops.sampling.sonic import (
     MAX_K,
     Indicator,
     SlotState,
+    VocabShard,
     configs,
     pick,
     scratchpad_columns,
@@ -122,9 +123,9 @@ def _flat(
     return (logits * temperature).to(dtype)
 
 
-def _scratchpad(rows: int) -> torch.Tensor:
+def _scratchpad(rows: int, columns: int = VOCAB) -> torch.Tensor:
     return torch.empty(
-        (rows, scratchpad_columns(VOCAB)), dtype=torch.uint32, device="cuda"
+        (rows, scratchpad_columns(columns)), dtype=torch.uint32, device="cuda"
     )
 
 
@@ -179,6 +180,50 @@ def test_the_tail_past_the_top_128_is_drawn_at_its_probability():
         float(hits.sum()),
         expected,
     )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_a_shard_starting_off_a_multiple_of_four_draws_the_whole_rows_token(dtype):
+    """Two ranks split at an unaligned column: the second takes ``philox_gumbel`` per token, the first ``block_gumbel``, and the merge draws the whole row's token."""
+    split = VOCAB // 2 + 2
+    slots = torch.arange(1, SLOTS, dtype=torch.int64, device="cuda")
+    offsets = torch.arange(SLOTS, dtype=torch.int64, device="cuda") * 3 + 1
+    logits = _flat(ROWS, 5, dtype)
+    state = _state(1, dtype)
+    expected = _sample(logits, state, slots, offsets, pick(VOCAB, ROWS))
+    shards = [logits[:, :split].contiguous(), logits[:, split:].contiguous()]
+    landing = torch.empty((2, ROWS, 2 * MAX_K), device="cuda")
+
+    def gather(pairs: torch.Tensor) -> torch.Tensor:
+        """The second rank's candidates beside the first's, as the ranks' all-gather leaves them."""
+        sonic.shard_candidates(
+            shards[1],
+            state,
+            slots,
+            offsets,
+            None,
+            _scratchpad(ROWS, VOCAB - split),
+            VocabShard(split, None, None, None, landing[1]),
+            pick(VOCAB - split, ROWS),
+            False,
+        )
+        return landing
+
+    tokens = torch.empty((ROWS, 1), dtype=torch.int32, device="cuda")
+    sonic.sample(
+        shards[0],
+        state,
+        slots,
+        offsets,
+        tokens,
+        _scratchpad(ROWS, split),
+        pick(split, ROWS),
+        False,
+        shard=VocabShard(0, None, None, gather, landing[0]),
+    )
+    assert torch.equal(tokens.view(-1), expected)
+    # Some draws land in the second rank's columns.
+    assert bool((expected >= split).any())
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
