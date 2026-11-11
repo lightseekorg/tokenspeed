@@ -28,10 +28,14 @@
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <list>
+#include <memory_resource>
 #include <utility>
 
 #include "cache/core/cache_types.h"
+#include "cache/core/fixed_slot_resource.h"
 #include "cache/prefix/checkpoint_tree.h"
+#include "cache/prefix/flat_pointer_index.h"
 #include "cache/prefix/tail_table.h"
 #include "utils.h"
 
@@ -122,7 +126,7 @@ public:
         // settled yet.
         std::int32_t PendingHostStores() const noexcept { return pending_stores_; }
 
-        const ContentHash* hash{nullptr};  // the map key
+        const ContentHash* hash{nullptr};  // this node's owned key
         // Null for page 0, and for a node started without a known parent until
         // a publication through its hash links it (LinkPublication).
         Node* parent{nullptr};
@@ -172,6 +176,7 @@ public:
         std::int32_t pending_stores_{0};
         std::int32_t pending_checkpoint_stores_{0};
         std::int32_t publications_{0};
+        ContentHash owned_hash_;
         BoundaryTree* tree_{nullptr};
     };
 
@@ -283,12 +288,12 @@ public:
     }
 
     Node* Find(const ContentHash& hash) {
-        const auto it = nodes_.find(hash);
-        return it == nodes_.end() ? nullptr : &it->second;
+        const auto it = nodes_.Find(hash);
+        return it == NodeIterator{} ? nullptr : &*it;
     }
     const Node* Find(const ContentHash& hash) const {
-        const auto it = nodes_.find(hash);
-        return it == nodes_.end() ? nullptr : &it->second;
+        const auto it = nodes_.Find(hash);
+        return it == NodeIterator{} ? nullptr : &*it;
     }
 
     // The oldest root; next_sibling walks the rest.
@@ -510,8 +515,21 @@ private:
     // it its boundary and, past page 0, a parent, whose last child it becomes,
     // its subtree's checkpoint boundaries counted in every new ancestor.
     Node& findOrAdd(const ContentHash& hash, Node* parent, std::int32_t boundary_tokens, std::int32_t tail_tokens) {
-        auto [it, inserted] = nodes_.try_emplace(hash);
-        Node& node = it->second;
+        auto it = nodes_.Find(hash);
+        const bool inserted = it == NodeIterator{};
+        if (inserted) {
+            node_storage_.emplace_back();
+            it = std::prev(node_storage_.end());
+            try {
+                it->owned_hash_ = hash;
+                it->hash = &it->owned_hash_;
+                FatalCheck(nodes_.Insert(it), "a new boundary has a unique hash");
+            } catch (...) {
+                node_storage_.erase(it);
+                throw;
+            }
+        }
+        Node& node = *it;
         if (!inserted && (node.parent != nullptr || parent == nullptr)) {
             // Every real boundary is at least 1: only a node started without
             // a known parent has 0, and a registration passes 0.
@@ -522,7 +540,6 @@ private:
             return node;
         }
         if (inserted) {
-            node.hash = &it->first;
             node.tree_ = this;
         } else {
             // An existing root is about to acquire its known parent.
@@ -628,7 +645,9 @@ private:
         }
         // Erase by iterator: the node's own key must not be read after the
         // node is gone.
-        nodes_.erase(nodes_.find(*node.hash));
+        const auto entry = nodes_.Find(*node.hash);
+        FatalCheck(entry != NodeIterator{} && nodes_.Erase(*node.hash), "a removed boundary keeps its index entry");
+        node_storage_.erase(entry);
     }
 
     void queue(const ContentHash& hash) {
@@ -640,7 +659,17 @@ private:
     Config config_;
     CheckpointTree* checkpoints_;
     // Node-based, so nodes and keys keep their addresses across rehashes.
-    std::unordered_map<ContentHash, Node> nodes_;
+    using NodeList = std::pmr::list<Node>;
+    using NodeIterator = NodeList::iterator;
+    struct NodeKey {
+        const ContentHash& operator()(NodeIterator node) const noexcept { return *node->hash; }
+    };
+    // Both node and key live in stable pooled list storage. Index rehash and
+    // backward-shift erase move handles only; Holds and traversal links stay
+    // valid until their own node's ordinary last-holder removal.
+    FixedSlotResource node_memory_{256};
+    NodeList node_storage_{&node_memory_};
+    FlatPointerIndex<NodeIterator, ContentHash, NodeKey, std::hash<ContentHash>> nodes_;
     Node* first_root_{nullptr};
     Node* last_root_{nullptr};
     Node* first_host_leaf_{nullptr};

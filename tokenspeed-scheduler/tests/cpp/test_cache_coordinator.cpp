@@ -3276,7 +3276,7 @@ TEST(CacheCoordinatorHostReplacement, DeviceUseMergesSessionOwnershipOfExistingH
                 const std::optional<TailPublication> tail_publication =
                     tail ? std::optional<TailPublication>{{.tail_tokens = 3, .hash = HashPrefixPage(tokens, "")}}
                          : std::nullopt;
-                const CacheKey key = Key(tail ? tail_publication->hash : hashes[0], 0);
+                const CacheKey key = Key(tail ? tail_publication->hash : ContentHash{hashes[0]}, 0);
                 const RequestProgress completed{
                     .completed_pages = CompletedPages{.prefix_hashes = hashes,
                                                       .tail = tail_publication,
@@ -8192,7 +8192,7 @@ TEST_F(TailCapWriteBackTest, ACancelledTailInUseIsCollectedOnceReleased) {
     held.clear();
     const std::optional<WriteBackOperation> op = transfers.StartEvictionStores();
     ASSERT_TRUE(op.has_value());
-    ASSERT_EQ(std::ranges::count(op->transfers, tail.hash, &CacheTransfer::content_hash), 4)
+    ASSERT_EQ(std::ranges::count(op->transfers, tail.hash.ToString(), &CacheTransfer::content_hash), 4)
         << "all but the one the Host held";
     const CacheCoordinator::HostEvictionStats before = coordinator_.HostEvictions();
     CacheBlockRef load = coordinator_.AcquireHostCachedBlock(Key(tail.hash, 0, 0));
@@ -10664,7 +10664,7 @@ TEST(HostWindowDuplicateOracleTest, ReclaimOnlyWhenRemovingTheCopyPreservesThePr
                         };
                         for (const auto& hash : hashes) copy_boundary(hash, 0);
                         if (tail) copy_boundary(tail->hash, tail_tokens);
-                        const CacheKey state = Key(tail ? tail->hash : hashes.back(), 1);
+                        const CacheKey state = Key(tail ? tail->hash : ContentHash{hashes.back()}, 1);
                         const auto evict_device = [&](const CacheKey& key) {
                             const auto location =
                                 CacheCoordinatorTestAccess::DeviceLocationOf(coordinator, key.group_id, key);
@@ -11048,7 +11048,8 @@ TEST_F(HostSegmentPlanTest, AtOneDeviceEpochTheShallowerDuplicateGoesFirst) {
     std::vector<BlockTable> tables(4);
     const TailPublication tail = *PublishFinal(tables, MakeTokens(18));
     coordinator_.Free(tables);
-    for (const auto& [hash, tail_tokens] : {std::pair{hashes_[3], 0}, std::pair{tail.hash, tail.tail_tokens}}) {
+    for (const auto& [hash, tail_tokens] :
+         {std::pair{hashes_[3], 0}, std::pair{tail.hash.ToString(), tail.tail_tokens}}) {
         coordinator_.ForEachBoundaryKey(Key(hash, 0), tail_tokens,
                                         [&](std::size_t, const CacheKey& key) { StoreOnHost(key); });
     }
@@ -13595,7 +13596,7 @@ TEST_F(WriteBackTransactionTest, ATailPublishedAgainBeforeTheAckIsPublished) {
     EXPECT_EQ(coordinator_.NumHostCachedBlocks(), 8);
     EXPECT_EQ(coordinator_.NumPinnedHostCachedBlocks(), 0);
     EXPECT_EQ(host_pool_.NumEmptyLcmBlocks(), 32 - 5) << "two KV parents and three checkpoint parents";
-    for (const std::string& hash : {pages[0], pages[1], pages[2], pages[3], tail.hash}) {
+    for (const std::string& hash : {pages[0], pages[1], pages[2], pages[3], tail.hash.ToString()}) {
         EXPECT_EQ(NodeOf(hash).PendingHostStores(), 0);
     }
     EXPECT_TRUE(coordinator_.GroupPrefixIndex(0).Contains(pool_, Key(tail.hash, 0)))
@@ -15416,7 +15417,7 @@ TEST(RetractionImageSplitTest, ProbeAndCommitAgreeOnEveryImage) {
                 for (std::size_t i = 0; i < host_keys.size(); ++i) {
                     const bool is_pinned = std::ranges::any_of(
                         pinned, [&](const CacheBlockRef& block) { return block->Location() == before[i]; });
-                    const bool reused = host_keys[i].content_hash.rfind("other", 0) != 0;
+                    const bool reused = host_keys[i].content_hash.ToString().rfind("other", 0) != 0;
                     if (is_pinned || reused) {
                         EXPECT_EQ(after[i], before[i]) << host_keys[i].content_hash;
                     }
@@ -16324,7 +16325,7 @@ TEST_F(WriteBackTransactionTest, ADrainBorrowingAnEarlierWriteBackIssuesNoStore)
     EXPECT_EQ(coordinator_.NumHostCachedBlocks(), 8);
     EXPECT_EQ(host_pool_.NumEmptyLcmBlocks(), 32 - 5) << "two KV parents and three checkpoint parents";
     EXPECT_EQ(stats.cancelled, 0u);
-    for (const std::string& hash : {pages[0], pages[1], pages[2], pages[3], tail.hash}) {
+    for (const std::string& hash : {pages[0], pages[1], pages[2], pages[3], tail.hash.ToString()}) {
         EXPECT_EQ(NodeOf(hash).PendingHostStores(), 0);
     }
     EXPECT_EQ(coordinator_.NumPinnedHostCachedBlocks(), 0);

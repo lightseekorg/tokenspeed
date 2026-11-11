@@ -25,6 +25,8 @@
 #include <cstdint>
 #include <deque>
 #include <limits>
+#include <memory_resource>
+#include <new>
 #include <optional>
 #include <set>
 #include <span>
@@ -33,6 +35,8 @@
 #include <vector>
 
 #include "cache/core/cache_block_ref.h"
+#include "cache/core/planning_scratch.h"
+#include "cache/core/fixed_slot_resource.h"
 #include "utils.h"
 
 namespace tokenspeed {
@@ -143,6 +147,8 @@ public:
     BlockPool(const BlockPool&) = delete;
     BlockPool& operator=(const BlockPool&) = delete;
     ~BlockPool() noexcept { FatalCheck(NumOccupiedSlots() == 0, "BlockPool destroyed with live block references"); }
+
+    PlanningScratch::Lease AcquirePlanningScratch() const { return planning_scratch_.Acquire(); }
 
     // Number of physical LCM blocks. Kernel page 0 is reserved separately.
     std::int32_t NumLcmBlocks() const noexcept { return static_cast<std::int32_t>(lcm_blocks_.size()); }
@@ -516,7 +522,9 @@ private:
     }
 
     CacheBlockRef createBlockRef(std::uint32_t group_id, std::int32_t slots_per_parent, CacheBlockLocation location) {
-        auto* control = new internal_cache_block_ref::CacheBlockControl(*this, location);
+        using Control = internal_cache_block_ref::CacheBlockControl;
+        void* storage = control_memory_.allocate(sizeof(Control), alignof(Control));
+        auto* control = new (storage) Control(*this, location);
         // Allocate the control before mutating the pool, then commit the
         // location before publishing its RAII owner: CacheBlock destruction
         // releases this location and therefore requires it to be occupied.
@@ -575,6 +583,18 @@ private:
         addAvailability(group, parent, location.lcm_block_id);
     }
 
+    friend class internal_cache_block_ref::CacheBlockControl;
+    void destroyBlockControl(internal_cache_block_ref::CacheBlockControl* control) const noexcept {
+        using Control = internal_cache_block_ref::CacheBlockControl;
+        control->~Control();  // Releases its physical slot exactly once.
+        control_memory_.deallocate(control, sizeof(Control), alignof(Control));
+    }
+
+    // Stable slots allocated on demand, independent of physical page IDs.
+    // Last-owner release recycles the control only after cancelling observers
+    // and releasing its CacheBlock; no stale observer survives slot reuse.
+    mutable FixedSlotResource control_memory_{256};
+    PlanningScratch planning_scratch_;
     std::vector<LcmBlock> lcm_blocks_;
     // Free parents are interchangeable: release appends and allocation consumes
     // the front. Bound parents have per-group, per-bucket availability indices.

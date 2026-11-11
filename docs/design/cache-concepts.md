@@ -6,6 +6,57 @@ concepts are *logical* (token-based, storage-agnostic) and which are *physical*
 reference for naming, code placement, and layering decisions in both the C++
 scheduler (`tokenspeed-scheduler`) and the Python runtime.
 
+## Prefix hash bytes
+
+Prefix page identities use SHA-256 over the existing little-endian framed
+prior digest, token IDs and extra keys. On little-endian hosts a page's token
+payload is submitted to SHA in one update; other hosts encode bounded chunks
+explicitly. Batching must preserve the exact byte stream, including signed
+token IDs, empty priors and partial pages. It changes neither cache identity
+nor storage and KV-event formats.
+
+The synchronous chain carries raw prior digests between pages. Request-owned
+prompt hashes grow only as far as admission or a bounded storage query needs;
+publication reuses those already computed and hashes only its remaining complete
+pages. Tail hashing still uses the actual publication frontier and its prior.
+
+Cache keys and boundary indices store canonical lowercase SHA-256 identities as
+32 bytes. Opaque keys retain their exact string bytes; an empty prior and a
+zero digest remain distinct, as do uppercase and lowercase keys. Equality uses
+the complete identity and every namespace/group/page-offset field. Hash-table
+hashes may use a digest prefix, but never use it as identity. External storage,
+transfer and binding hash strings keep their existing format.
+
+Locations are indexed separately in each pool/group using its fixed packing.
+Two directory levels allocate only touched 1,024-entry segments; an empty
+segment is released. For N dense slots, values cost approximately 8N bytes on
+64-bit hosts, plus one directory pointer per segment and small size counters.
+Sparse tiers allocate no value array for untouched segments. Entries are found
+once for eviction: metadata is read before removal and the returned key owns
+its bytes through notifications and dependent-boundary cleanup. The ordered
+(epoch, location) index and its allocation-free pinned-node restoration remain
+unchanged.
+
+Key and boundary lookup use open-addressed tables containing cached hashes and
+stable handles. Per-tier entry lists and the boundary node list own their
+objects in pooled storage; each boundary node also owns its key. Rehash and
+backward-shift deletion move handles only. Root, child, sibling and Host order
+still come from the existing links, never from hash-slot iteration. Tables
+grow at 75% occupancy and retain their high-water capacity; at 16 bytes per
+slot, each lookup table costs between roughly 21 and 43 bytes per live key
+immediately before/after growth. Rehash temporarily holds both slot arrays.
+Each node shape has its own fixed-slot resource, allocating chunks of 256
+slots on demand. A freed slot stores the free-list link, so recycling needs no
+search through chunks. Retained slot bytes are
+`ceil(high_water_nodes / 256) * 256 * aligned_node_size`, plus chunk handles;
+resources retain freed slots until their owner is destroyed.
+
+Block control objects similarly occupy stable, on-demand pooled slots owned by
+their BlockPool. Last-owner destruction cancels observers, releases the physical
+child exactly once, then recycles control storage. Physical placement and the
+free-parent FIFO are unchanged; reusing a control address conveys no ownership
+of its previous block.
+
 ## Two worlds: logical tokens vs. physical storage
 
 ### Logical world (token units, storage-agnostic)
@@ -139,6 +190,12 @@ request fits, it does not enumerate eviction candidates. Under memory pressure,
 it enumerates candidates and keeps shadow occupancy only for the parents whose
 children it tentatively evicts. This makes the common zero-eviction path scale
 with cache groups and request demand rather than total cache capacity.
+Each shadow owns an independent RAII scratch lease. The pool lazily retains at
+most two 256 KiB banks; larger allocations and further simultaneous leases use
+the ordinary allocator and free that overflow with their containers. Only
+storage is reused: every shadow starts with fresh occupancy state, and its
+containers die before the lease returns. No array proportional to a sparse
+Host pool's theoretical slot count is initialized for planning.
 
 Replicated groups have one ownership bucket: every Host hit needs a Device
 destination in that bucket, without looking up or temporarily owning the Host
@@ -186,9 +243,9 @@ resource scoped to the plan; Host placement also uses it for snapshots.
 The returned victim list owns its storage;
 no snapshot or allocator survives the call. Every later plan observes fresh
 ownership, access epochs, and tree links.
-The hash tables retain computed key hashes where the standard library supports
-it: walking a bucket or erasing an entry must not repeatedly hash its full
-content digest. Key equality and eviction order remain unchanged.
+The lookup tables retain computed key hashes: walking a cluster or erasing an
+entry does not repeatedly hash its full content digest. Key equality and
+eviction order remain unchanged.
 
 The per-step page gauge composes two O(1)-or-cheaper quantities the same way:
 empty parents come from the pool, active parents from the live requests' block

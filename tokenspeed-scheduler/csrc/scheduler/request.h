@@ -240,6 +240,12 @@ public:
     // Immutable input-page identities, owned by this request. Admission may
     // retry against changing cache contents without hashing the input again.
     std::span<const std::string> PromptPrefixHashes();
+    // Compute only the requested prompt prefix; storage can be bounded below
+    // the admission frontier. Later calls extend the same immutable chain.
+    std::span<const std::string> PromptPrefixHashes(std::int32_t num_pages);
+    // Append complete pages, reusing prompt identities already computed by
+    // admission or storage. Does not force hashing an unfinished prompt.
+    void AppendPrefixHashes(std::vector<std::string>& hashes, std::int32_t num_pages) const;
     // The external KV-event hashes (HashKvBlock) of the first num_pages full
     // pages, each chained on the one before. A page is hashed once, the first
     // time it is asked for: its tokens never change.

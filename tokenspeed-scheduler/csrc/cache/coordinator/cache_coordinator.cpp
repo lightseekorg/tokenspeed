@@ -802,7 +802,7 @@ void CacheCoordinator::forEachCandidateBoundary(const PromptPrefix& prompt, std:
         const std::int32_t page_tokens = page * prefix_granularity_;
         if (static_cast<std::size_t>(page) <= prompt.prefix_hashes.size() && !prompt.tokens.empty()) {
             const ContentHash prior =
-                page == 0 ? ContentHash{} : prompt.prefix_hashes[static_cast<std::size_t>(page) - 1];
+                page == 0 ? ContentHash{} : ContentHash{prompt.prefix_hashes[static_cast<std::size_t>(page) - 1]};
             const std::span<const TailTable::Tail> published = boundary_tree_.Tails().Tails(prior);
             std::vector<TailTable::Tail> candidates(published.begin(), published.end());
             if (prompt.tail && page == prompt.max_tokens / prefix_granularity_) {
@@ -1306,7 +1306,7 @@ CacheCoordinator::PrefixProbe CacheCoordinator::ProbeDecodeDevicePrefix(const Pr
     if (prompt.tokens.empty() || pages > prompt.prefix_hashes.size()) {
         return probe;  // nothing to match: the prefix cache is off, or the last page is not hashed
     }
-    const ContentHash prior = pages == 0 ? ContentHash{} : prompt.prefix_hashes[pages - 1];
+    const ContentHash prior = pages == 0 ? ContentHash{} : ContentHash{prompt.prefix_hashes[pages - 1]};
     if (state_hit.tail_tokens > 0) {
         state_hit.hash = HashPrefixPage(prompt.tokens.subspan(static_cast<std::size_t>(page_tokens),
                                                               static_cast<std::size_t>(state_hit.tail_tokens)),
@@ -1882,71 +1882,68 @@ std::optional<CacheKey> CacheCoordinator::evictCachedBlockAlone(std::uint32_t gr
                                                                 DeviceEvictionCounts DeviceEvictionStats::*reason,
                                                                 EvictedSegment* write_back_segment) {
     PrefixCacheIndex& index = groups_[group_id].Index();
-    // Read while the entry is still there: the Host entry inherits it.
-    const std::optional<PrefixCacheIndex::CachedBlockMetadata> metadata = index.MetadataFor(pool_, location);
-    // A demoted entry never rides an eviction write-back, whatever evicts it
-    // -- an admission's or a restore's victim, a request's own released slot
-    // or a stranded suffix: it is dropped, counted under what evicted it. A
-    // demoted session's entry or a superseded input shares its epoch without
-    // being demoted: the rule below takes it.
-    const bool demoted = metadata && isDemotedEntry(*metadata);
-    const bool drops_demoted = demoted && write_back_segment != nullptr;
-    // A superseded input an admission, rotation or restore evicts leaves as the
-    // reclaim of the request that superseded it, under either write policy,
-    // and is never written back. It is never a stranded suffix: a tail at
-    // epoch 0 is a candidate of its own before any page above it.
-    if (demoted) {
-        write_back_segment = nullptr;
-    } else if (metadata && metadata->last_access_epoch == kSupersededAccessEpoch &&
-               (reason == &DeviceEvictionStats::admission || reason == &DeviceEvictionStats::restore ||
-                reason == &DeviceEvictionStats::compaction || reason == &DeviceEvictionStats::request_reclaim)) {
-        reason = &DeviceEvictionStats::request_reclaim;
-        write_back_segment = nullptr;
-    }
-    const std::optional<CacheKey> key = index.UnpinnedKeyAt(pool_, location);
-    if (!key) {
-        return key;  // pinned or gone: nothing to record
-    }
-    if (drops_demoted) {
-        ++demoted_entries_not_written_back_;
-        // A request's own released slot the drain would have considered is
-        // dropped like a dead one, and counted with them, so the drain's
-        // outcomes still add up to the evictions it considered.
-        if (reason == &DeviceEvictionStats::request_reclaim) {
-            ++device_evictions_.request_reclaim_for_write_back;
-        }
-    }
-    if (write_back_segment != nullptr) {
-        if (reason == &DeviceEvictionStats::request_reclaim) {
-            ++device_evictions_.request_reclaim_for_write_back;
-        }
-        BoundaryTree::Node* node = boundary_tree_.Find(key->content_hash);
-        _assert(node != nullptr, "an indexed entry has a tree node");
-        // Judged and recorded while the entry still holds the node, so the
-        // checkpoints of a checkpoint boundary are recorded and hold it on the
-        // Host before the pages above it are judged: no probe could resume
-        // from a tail whose hint the cap dropped, nor, with State groups, from
-        // a boundary with no checkpoint boundary at or under it on either tier
-        // and none on its way there.
-        const bool dead =
-            (node->tail_tokens > 0 && !boundary_tree_.Tails().Contains(key->content_hash)) ||
-            (num_state_groups_ > 0 && !node->HasCheckpointBoundaryInSubtree() && node->PendingHostStores() == 0);
-        if (dead) {
-            ++dead_entries_not_written_back_;
-        } else {
-            write_back_segment->members.push_back(
-                EvictedBlock{.key = *key,
-                             .device_location = location,
-                             .metadata = *metadata,
-                             .host_block = FindHostCachedBlock(*key),
-                             .written_back_before = (node->written_back_group_bits >> key->group_id & 1U) != 0,
-                             .pending = holdPendingStore(*node, *key, GroupIsState(group_id))});
-            write_back_segment->newest_access_epoch =
-                std::max(write_back_segment->newest_access_epoch, metadata->last_access_epoch);
-        }
-    }
-    // The entry's hold on its node goes with it.
-    FatalCheck(index.Evict(pool_, location).has_value(), "an unpinned cache entry stays evictable");
+    const auto key = index.EvictWithMetadata(
+        pool_, location, [&](const CacheKey& key, const PrefixCacheIndex::CachedBlockMetadata& metadata) {
+            // A demoted entry never rides an eviction write-back, whatever evicts it
+            // -- an admission's or a restore's victim, a request's own released slot
+            // or a stranded suffix: it is dropped, counted under what evicted it. A
+            // demoted session's entry or a superseded input shares its epoch without
+            // being demoted: the rule below takes it.
+            const bool demoted = isDemotedEntry(metadata);
+            const bool drops_demoted = demoted && write_back_segment != nullptr;
+            // A superseded input an admission, rotation or restore evicts leaves as the
+            // reclaim of the request that superseded it, under either write policy,
+            // and is never written back. It is never a stranded suffix: a tail at
+            // epoch 0 is a candidate of its own before any page above it.
+            if (demoted) {
+                write_back_segment = nullptr;
+            } else if (metadata.last_access_epoch == kSupersededAccessEpoch &&
+                       (reason == &DeviceEvictionStats::admission || reason == &DeviceEvictionStats::restore ||
+                        reason == &DeviceEvictionStats::compaction ||
+                        reason == &DeviceEvictionStats::request_reclaim)) {
+                reason = &DeviceEvictionStats::request_reclaim;
+                write_back_segment = nullptr;
+            }
+            if (drops_demoted) {
+                ++demoted_entries_not_written_back_;
+                // A request's own released slot the drain would have considered is
+                // dropped like a dead one, and counted with them, so the drain's
+                // outcomes still add up to the evictions it considered.
+                if (reason == &DeviceEvictionStats::request_reclaim) {
+                    ++device_evictions_.request_reclaim_for_write_back;
+                }
+            }
+            if (write_back_segment != nullptr) {
+                if (reason == &DeviceEvictionStats::request_reclaim) {
+                    ++device_evictions_.request_reclaim_for_write_back;
+                }
+                BoundaryTree::Node* node = boundary_tree_.Find(key.content_hash);
+                _assert(node != nullptr, "an indexed entry has a tree node");
+                // Judged and recorded while the entry still holds the node, so the
+                // checkpoints of a checkpoint boundary are recorded and hold it on the
+                // Host before the pages above it are judged: no probe could resume
+                // from a tail whose hint the cap dropped, nor, with State groups, from
+                // a boundary with no checkpoint boundary at or under it on either tier
+                // and none on its way there.
+                const bool dead = (node->tail_tokens > 0 && !boundary_tree_.Tails().Contains(key.content_hash)) ||
+                                  (num_state_groups_ > 0 && !node->HasCheckpointBoundaryInSubtree() &&
+                                   node->PendingHostStores() == 0);
+                if (dead) {
+                    ++dead_entries_not_written_back_;
+                } else {
+                    write_back_segment->members.push_back(
+                        EvictedBlock{.key = key,
+                                     .device_location = location,
+                                     .metadata = metadata,
+                                     .host_block = FindHostCachedBlock(key),
+                                     .written_back_before = (node->written_back_group_bits >> key.group_id & 1U) != 0,
+                                     .pending = holdPendingStore(*node, key, GroupIsState(group_id))});
+                    write_back_segment->newest_access_epoch =
+                        std::max(write_back_segment->newest_access_epoch, metadata.last_access_epoch);
+                }
+            }
+        });
+    if (!key) return key;
     if (cache_mutation_sink_) {
         cache_mutation_sink_(*key, CacheMutation::kRemoved);
     }
@@ -2405,7 +2402,7 @@ void CacheCoordinator::recordCheckpoints(const CompletedPages& completed, std::u
     }
     if (completed.publish_state &&
         checkpoints_.Observe(completed.tokens, completed.prefix_hashes, completed.tail, access_epoch)) {
-        syncCheckpoint(completed.tail ? completed.tail->hash : completed.prefix_hashes.back());
+        syncCheckpoint(completed.tail ? completed.tail->hash : ContentHash{completed.prefix_hashes.back()});
     }
 }
 
@@ -2460,7 +2457,8 @@ void CacheCoordinator::recordPublishedTail(const CompletedPages& completed) {
     if (!completed.tail) {
         return;
     }
-    const ContentHash prior = completed.prefix_hashes.empty() ? ContentHash{} : completed.prefix_hashes.back();
+    const ContentHash prior =
+        completed.prefix_hashes.empty() ? ContentHash{} : ContentHash{completed.prefix_hashes.back()};
     recordTail(prior, *completed.tail);
 }
 
@@ -2551,7 +2549,7 @@ std::vector<CacheCoordinator::PublishedRange> CacheCoordinator::completedBlockRa
         if (boundary_tokens % groups_[group_index].Spec().checkpoint_granularity != 0) {
             return ranges;
         }
-        const ContentHash hash = completed.tail ? completed.tail->hash : completed.prefix_hashes.back();
+        const ContentHash hash = completed.tail ? completed.tail->hash : ContentHash{completed.prefix_hashes.back()};
         ranges.push_back(PublishedRange{
             .first_cache_block = completed.state_slot,
             .keys = {CacheKey{.group_id = groups_[group_index].Id(), .content_hash = hash, .page_offset = 0}},
@@ -3281,9 +3279,10 @@ CacheCoordinator::StorageReservation CacheCoordinator::ReserveStoragePrefix(cons
         // stay evictable during I/O; ordinary admission matches the cache again.
         forEachStorageDependency(probe, group_keys, device.full_page_tokens, pin);
         if (probe.tail) {
-            result.tail_prior = probe.full_page_tokens == 0
-                                    ? ContentHash{}
-                                    : prompt.prefix_hashes[probe.full_page_tokens / prefix_granularity_ - 1];
+            result.tail_prior =
+                probe.full_page_tokens == 0
+                    ? ContentHash{}
+                    : ContentHash{prompt.prefix_hashes[probe.full_page_tokens / prefix_granularity_ - 1]};
             result.tail = TailPublication{.tail_tokens = probe.tail->tail_tokens, .hash = probe.tail->hash};
         }
         if (result.keys.empty()) return {};

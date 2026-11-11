@@ -20,6 +20,9 @@
 
 #pragma once
 
+#include <algorithm>
+#include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -51,6 +54,24 @@ inline void Sha256UpdateU32LE(SHA256_CTX& ctx, uint32_t v) {
         static_cast<uint8_t>(v >> 24),
     };
     SHA256_Update(&ctx, buf, 4);
+}
+
+// Feed token IDs as little-endian bytes using bounded stack storage.
+inline void Sha256UpdateTokensExplicitLE(SHA256_CTX& ctx, std::span<const std::int32_t> tokens) {
+    constexpr std::size_t kChunkTokens = 64;
+    uint8_t buffer[kChunkTokens * sizeof(std::uint32_t)];
+    for (std::size_t start = 0; start < tokens.size();) {
+        const std::size_t count = std::min<std::size_t>(kChunkTokens, tokens.size() - start);
+        for (std::size_t i = 0; i < count; ++i) {
+            const auto token = static_cast<std::uint32_t>(tokens[start + i]);
+            buffer[4 * i] = static_cast<uint8_t>(token);
+            buffer[4 * i + 1] = static_cast<uint8_t>(token >> 8);
+            buffer[4 * i + 2] = static_cast<uint8_t>(token >> 16);
+            buffer[4 * i + 3] = static_cast<uint8_t>(token >> 24);
+        }
+        SHA256_Update(&ctx, buffer, count * sizeof(std::uint32_t));
+        start += count;
+    }
 }
 
 // Encode a 32-byte SHA-256 digest as a 64-char lowercase hex string.
@@ -86,20 +107,25 @@ inline std::vector<uint8_t> HexToBytes(const std::string& hex) {
 // prior_len separates page 0 from a chained page, token_count keeps tokens from
 // bleeding into extra_keys, and per-key length prefixes prevent re-splitting.
 // Feed order is prior_hash -> tokens -> extra_keys.
-inline std::string HashPrefixPage(std::span<const std::int32_t> tokens, const std::string& prior_hash,
-                                  std::span<const std::string> extra_keys = {}) {
+using PrefixDigest = std::array<unsigned char, SHA256_DIGEST_LENGTH>;
+
+inline PrefixDigest HashPrefixPageDigest(std::span<const std::int32_t> tokens, std::span<const uint8_t> prior_bytes,
+                                         std::span<const std::string> extra_keys) {
     SHA256_CTX ctx;
     SHA256_Init(&ctx);
 
-    std::vector<uint8_t> prior_bytes = HexToBytes(prior_hash);
     Sha256UpdateU32LE(ctx, static_cast<uint32_t>(prior_bytes.size()));
     if (!prior_bytes.empty()) {
         SHA256_Update(&ctx, prior_bytes.data(), prior_bytes.size());
     }
 
     Sha256UpdateU32LE(ctx, static_cast<uint32_t>(tokens.size()));
-    for (std::int32_t t : tokens) {
-        Sha256UpdateU32LE(ctx, static_cast<uint32_t>(t));
+    if (!tokens.empty()) {
+        if constexpr (std::endian::native == std::endian::little) {
+            SHA256_Update(&ctx, tokens.data(), tokens.size_bytes());
+        } else {
+            Sha256UpdateTokensExplicitLE(ctx, tokens);
+        }
     }
 
     // extra_keys is the terminal block, so an empty list can be skipped without
@@ -112,9 +138,15 @@ inline std::string HashPrefixPage(std::span<const std::int32_t> tokens, const st
         }
     }
 
-    unsigned char digest[SHA256_DIGEST_LENGTH];
-    SHA256_Final(digest, &ctx);
-    return DigestToHex(digest);
+    PrefixDigest digest;
+    SHA256_Final(digest.data(), &ctx);
+    return digest;
+}
+
+inline std::string HashPrefixPage(std::span<const std::int32_t> tokens, const std::string& prior_hash,
+                                  std::span<const std::string> extra_keys = {}) {
+    const auto prior_bytes = HexToBytes(prior_hash);
+    return DigestToHex(HashPrefixPageDigest(tokens, prior_bytes, extra_keys).data());
 }
 
 inline std::vector<std::string> ComputePrefixHashes(
@@ -122,13 +154,18 @@ inline std::vector<std::string> ComputePrefixHashes(
     std::span<const std::span<const std::string>> extra_keys_per_page = {}) {
     std::vector<std::string> hashes;
     hashes.reserve(prefix_pages.size());
-    std::string current_prior = prior;
+    if (prefix_pages.empty()) return hashes;
+    // Decode the caller's seed once. Later pages chain the raw digest;
+    // an empty seed remains distinct from a 32-byte all-zero digest.
+    const auto seed = HexToBytes(prior);
+    std::span<const uint8_t> current_prior = seed;
+    PrefixDigest digest;
     for (std::size_t i = 0; i < prefix_pages.size(); ++i) {
         std::span<const std::string> extra =
             (i < extra_keys_per_page.size()) ? extra_keys_per_page[i] : std::span<const std::string>{};
-        std::string h = HashPrefixPage(prefix_pages[i], current_prior, extra);
-        hashes.push_back(h);
-        current_prior = h;
+        digest = HashPrefixPageDigest(prefix_pages[i], current_prior, extra);
+        hashes.push_back(DigestToHex(digest.data()));
+        current_prior = digest;
     }
     return hashes;
 }

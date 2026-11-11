@@ -55,7 +55,8 @@ struct VictimSet {
         // Kept per block when a segment absorbs the request's released slots.
         bool is_request_reclaim;
     };
-    std::vector<Member> members;
+    explicit VictimSet(std::pmr::memory_resource* resource) : members{resource} {}
+    std::pmr::vector<Member> members;
 };
 
 // A copy-in block an admission reserves: the table slot it serves and the
@@ -69,6 +70,9 @@ struct CopyInReservation {
 
 struct AdmissionPlan {
     CacheCoordinator::PrefixProbe prefix;
+    // Own all member storage through commit, after the planner has died.
+    // Declared before victims so their views die before the arena does.
+    std::unique_ptr<std::pmr::monotonic_buffer_resource> member_resource;
     std::vector<VictimSet> victims;
     // Per group, the copy-in blocks the admission reserves, in slot order
     // (AdmissionPlanner::reserveCopyIns). Empty without a copy-in point.
@@ -114,7 +118,8 @@ public:
                      const CacheCoordinator::PrefixProbe& prefix, std::span<const PlannedShape> shapes,
                      std::span<const std::pair<std::uint32_t, CacheBlockLocation>> claimed,
                      const BoundaryTree& boundary_tree, bool evicts_segments, bool evicts_blocks_past_segments,
-                     std::vector<VictimSet>& victims, std::vector<std::vector<CopyInReservation>>& copy_ins)
+                     std::vector<VictimSet>& victims, std::pmr::memory_resource* member_resource,
+                     std::vector<std::vector<CopyInReservation>>& copy_ins)
         : coordinator_{coordinator},
           groups_{groups},
           geometry_{geometry},
@@ -131,6 +136,7 @@ public:
           evicts_segments_{evicts_segments},
           evicts_blocks_past_segments_{evicts_blocks_past_segments},
           victims_{victims},
+          member_resource_{member_resource},
           copy_ins_{copy_ins},
           eviction_plan_{pool, groups},
           shape_need_(groups.size()),
@@ -364,7 +370,7 @@ private:
                 }
                 for (const std::size_t earlier : absorbed) {
                     absorbed_members -= victims_[earlier].members.size();
-                    victims_[earlier] = VictimSet{};
+                    victims_[earlier] = VictimSet{member_resource_};
                 }
                 _assert(absorbed_members == 0, "an earlier victim set lies whole inside the set that takes it");
                 if (taken_over_set_index) {
@@ -431,7 +437,7 @@ private:
             return std::nullopt;
         }
         const bool is_request_reclaim = request_reclaim_locations_.contains(location);
-        VictimSet set;
+        VictimSet set{member_resource_};
         // A segment that takes an earlier segment's lists over in place
         // keeps them first (the first num_taken_over_members members, their
         // set_member_by_location_ entries as they are).
@@ -611,7 +617,7 @@ private:
                 return std::nullopt;
             }
             if (!spliced.empty()) {
-                VictimSet walked = std::exchange(set, VictimSet{});
+                VictimSet walked = std::exchange(set, VictimSet{member_resource_});
                 std::size_t next_walked = 0;
                 for (const auto& [walked_before, child] : spliced) {
                     set.members.insert(set.members.end(), walked.members.begin() + next_walked,
@@ -622,7 +628,7 @@ private:
                     _assert(!earlier.members.empty(), "a segment set still starts at its top");
                     if (set.members.empty()) {
                         // First in the order: its lists become this set's.
-                        set = std::exchange(earlier, VictimSet{});
+                        set = std::exchange(earlier, VictimSet{member_resource_});
                         taken_over_set_index = it->second;
                         num_taken_over_members = set.members.size();
                     } else {
@@ -1057,6 +1063,7 @@ private:
     // leaves block by block (Admit's evict_blocks_past_segments).
     bool evicts_blocks_past_segments_;
     std::vector<VictimSet>& victims_;
+    std::pmr::memory_resource* member_resource_;
     // The plan's copy-in reservations (AdmissionPlan::copy_ins).
     std::vector<std::vector<CopyInReservation>>& copy_ins_;
     // Lookup nodes live for this plan; returned victim vectors own their
@@ -1120,6 +1127,7 @@ std::optional<AdmissionPlan> planAdmission(
     const BoundaryTree& boundary_tree, bool evicts_segments, bool evicts_blocks_past_segments) {
     _assert(demands.size() == groups.size(), "demands/groups size mismatch");
 
+    auto member_resource = std::make_unique<std::pmr::monotonic_buffer_resource>();
     std::vector<VictimSet> victims;
     std::vector<std::vector<CopyInReservation>> copy_ins;
     AdmissionPlanner planner{coordinator,
@@ -1138,11 +1146,15 @@ std::optional<AdmissionPlan> planAdmission(
                              evicts_segments,
                              evicts_blocks_past_segments,
                              victims,
+                             member_resource.get(),
                              copy_ins};
     if (!planner.Plan()) {
         return std::nullopt;
     }
-    return AdmissionPlan{.prefix = std::move(prefix), .victims = std::move(victims), .copy_ins = std::move(copy_ins)};
+    return AdmissionPlan{.prefix = std::move(prefix),
+                         .member_resource = std::move(member_resource),
+                         .victims = std::move(victims),
+                         .copy_ins = std::move(copy_ins)};
 }
 
 // Acquires the copy-in blocks an admission reserves in group `group_id`
@@ -1966,6 +1978,7 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::CompactLoneRe
         }
     }
 
+    auto member_resource = std::make_unique<std::pmr::monotonic_buffer_resource>();
     std::vector<VictimSet> victims;
     std::vector<std::vector<CopyInReservation>> copy_ins;
     AdmissionPlanner planner{*this,
@@ -1984,6 +1997,7 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::CompactLoneRe
                              write_back_evictions_,
                              /*evicts_blocks_past_segments=*/true,
                              victims,
+                             member_resource.get(),
                              copy_ins};
     // Not fragmentation: the bound's own caveats, which compacting would
     // only churn at. The request waits as before. The count covers the

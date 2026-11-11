@@ -65,7 +65,7 @@ private:
 
 namespace internal_cache_block_ref {
 
-// Dynamically allocated shared-ownership control. The embedded CacheBlock is
+// Pool-owned, stable shared-ownership control. The embedded CacheBlock is
 // destroyed together with the control when the last CacheBlockRef releases it.
 class CacheBlockControl {
 public:

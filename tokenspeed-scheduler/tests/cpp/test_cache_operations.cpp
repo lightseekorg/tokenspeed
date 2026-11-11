@@ -447,7 +447,7 @@ TEST(CacheOperationTest, HostDestinationCannotBeReusedBeforeWriteBackAck) {
 
     const CacheKey first_key{.group_id = 0, .content_hash = "first"};
     cache_device(first_key);
-    const std::array first_hashes{first_key.content_hash};
+    const std::array first_hashes{first_key.content_hash.ToString()};
     coordinator.QueueCachedBlocksForStore(first_hashes);
     auto first = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kPublication);
     ASSERT_TRUE(first);
@@ -456,7 +456,7 @@ TEST(CacheOperationTest, HostDestinationCannotBeReusedBeforeWriteBackAck) {
 
     const CacheKey second_key{.group_id = 0, .content_hash = "second"};
     cache_device(second_key);
-    const std::array second_hashes{second_key.content_hash};
+    const std::array second_hashes{second_key.content_hash.ToString()};
     coordinator.QueueCachedBlocksForStore(second_hashes);
     EXPECT_FALSE(transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kPublication));
     const TierTransferManager::WriteBackStats& publication_stores =
@@ -554,14 +554,15 @@ TEST(CacheOperationTest, PendingStoresAllocateInCandidateOrderAcrossGroups) {
 
     const CacheKey group_one{.group_id = 1, .content_hash = "new-1"};
     const std::int32_t group_one_source = cache_block(device_pool, group_one);
-    const std::array group_one_hashes{group_one.content_hash};
+    const std::array group_one_hashes{group_one.content_hash.ToString()};
     coordinator.QueueCachedBlocksForStore(group_one_hashes);
 
     const CacheKey group_zero_first{.group_id = 0, .content_hash = "new-0"};
     const CacheKey group_zero_second{.group_id = 0, .content_hash = "new-2"};
     cache_block(device_pool, group_zero_first);
     cache_block(device_pool, group_zero_second);
-    const std::array group_zero_hashes{group_zero_first.content_hash, group_zero_second.content_hash};
+    const std::array group_zero_hashes{group_zero_first.content_hash.ToString(),
+                                       group_zero_second.content_hash.ToString()};
     coordinator.QueueCachedBlocksForStore(group_zero_hashes);
 
     auto write_back = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kPublication);
@@ -617,18 +618,19 @@ TEST(CacheOperationTest, PendingStoreDrainCountsEachCandidateOnce) {
     coordinator.CacheHostBlock(host_copy, on_host, std::nullopt);
     host_copy.reset();
 
-    coordinator.QueueCachedBlocksForStore(std::array{travelling.content_hash});
+    coordinator.QueueCachedBlocksForStore(std::array{travelling.content_hash.ToString()});
     const auto earlier = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kFinish);
     ASSERT_TRUE(earlier);
 
-    coordinator.QueueCachedBlocksForStore(std::array{on_host.content_hash, stored.content_hash, stored.content_hash,
-                                                     travelling.content_hash, evicted.content_hash});
+    coordinator.QueueCachedBlocksForStore(std::array{on_host.content_hash.ToString(), stored.content_hash.ToString(),
+                                                     stored.content_hash.ToString(), travelling.content_hash.ToString(),
+                                                     evicted.content_hash.ToString()});
     const CacheBlockLocation evicted_location = coordinator.GroupPrefixIndex(0).Find(device_pool, evicted)->Location();
     ASSERT_TRUE(coordinator.GroupPrefixIndex(0).Evict(device_pool, evicted_location));
     const auto store = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kPublication);
     ASSERT_TRUE(store);
     ASSERT_EQ(store->transfers.size(), 1u);
-    EXPECT_EQ(store->transfers.front().content_hash, stored.content_hash);
+    EXPECT_EQ(store->transfers.front().content_hash, stored.content_hash.ToString());
 
     const TierTransferManager::WriteBackStats& publication_stores =
         transfers.WriteBackStatsFor(HostStoreCause::kPublication);
@@ -1000,7 +1002,8 @@ protected:
         CacheCoordinator::PromptPrefix result{
             .prefix_hashes = std::span{hashes}.first(bound / 4), .tokens = tokens, .max_tokens = bound};
         if (include_tail && bound % 4 != 0) {
-            const ContentHash prior = result.prefix_hashes.empty() ? ContentHash{} : result.prefix_hashes.back();
+            const ContentHash prior =
+                result.prefix_hashes.empty() ? ContentHash{} : ContentHash{result.prefix_hashes.back()};
             result.tail =
                 TailPublication{.tail_tokens = bound % 4,
                                 .hash = HashPrefixPage(std::span{tokens}.subspan(bound / 4 * 4, bound % 4), prior)};

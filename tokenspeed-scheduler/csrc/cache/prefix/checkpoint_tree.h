@@ -80,7 +80,7 @@ public:
         _assert(
             !tokens.empty() && tokens.size() == full_tokens + static_cast<std::size_t>(tail ? tail->tail_tokens : 0),
             "checkpoint tokens cover exactly its full pages and tail");
-        const ContentHash& hash = tail ? tail->hash : prefix_hashes.back();
+        const ContentHash& hash = tail ? tail->hash : ContentHash{prefix_hashes.back()};
         if (nodes_.contains(hash)) {
             return false;
         }
@@ -473,7 +473,8 @@ private:
                      std::size_t existing_pages) {
         const auto length = static_cast<std::int32_t>(tokens.size());
         for (auto full = static_cast<std::int32_t>(existing_pages); full >= 0; --full) {
-            const ContentHash prior = full == 0 ? ContentHash{} : prefix_hashes[static_cast<std::size_t>(full - 1)];
+            const ContentHash prior =
+                full == 0 ? ContentHash{} : ContentHash{prefix_hashes[static_cast<std::size_t>(full - 1)]};
             const std::int32_t page_start = full * prefix_granularity_;
             Node* best = nullptr;
             if (const auto it = tails_by_prior_.find(prior); it != tails_by_prior_.end()) {

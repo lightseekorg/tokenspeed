@@ -42,7 +42,7 @@ constexpr std::int32_t kPage = 4;
 // A State checkpoint at the end of `tokens`, hashed as a request publishes it.
 struct Checkpoint {
     std::vector<std::int32_t> tokens;
-    std::vector<ContentHash> hashes;
+    std::vector<std::string> hashes;
     std::optional<TailPublication> tail;
 
     explicit Checkpoint(std::vector<std::int32_t> input) : tokens{std::move(input)} {
@@ -56,7 +56,7 @@ struct Checkpoint {
                                    .hash = HashPrefixPage(std::span{tokens}.subspan(hashes.size() * kPage), prior)};
         }
     }
-    ContentHash Hash() const { return tail ? tail->hash : hashes.back(); }
+    ContentHash Hash() const { return tail ? tail->hash : ContentHash{hashes.back()}; }
     CompletedPages Publication() const {
         return CompletedPages{.tokens = tokens,
                               .prefix_hashes = hashes,

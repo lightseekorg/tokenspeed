@@ -297,7 +297,7 @@ TEST_P(HostSuffixHitInvariantsTest, HitsAreRestorableMaximalAndNeverReloadDevice
             const std::int32_t tail_page = page_dist(rng);
             const std::int32_t tail_page_tokens = tail_page * kP;
             const ContentHash tail_prior =
-                tail_page == 0 ? ContentHash{} : hashes[static_cast<std::size_t>(tail_page) - 1];
+                tail_page == 0 ? ContentHash{} : ContentHash{hashes[static_cast<std::size_t>(tail_page) - 1]};
             std::array<std::int32_t, kNumTails> tail_tokens{tail_dist(rng), other_tail_dist(rng)};
             if (tail_tokens[1] >= tail_tokens[0]) {
                 ++tail_tokens[1];
@@ -340,8 +340,9 @@ TEST_P(HostSuffixHitInvariantsTest, HitsAreRestorableMaximalAndNeverReloadDevice
                 for (std::size_t row = 0; row < kRows; ++row) {
                     for (std::uint32_t group = 0; group < 4; ++group) {
                         if (present[tier][row][group]) {
-                            CacheBlockFor(coordinator, pool,
-                                          row < kFirstTailRow ? hashes[row] : tail_hash[row - kFirstTailRow], group);
+                            CacheBlockFor(
+                                coordinator, pool,
+                                row < kFirstTailRow ? ContentHash{hashes[row]} : tail_hash[row - kFirstTailRow], group);
                         }
                     }
                 }
@@ -450,7 +451,7 @@ TEST_P(HostSuffixHitInvariantsTest, HitsAreRestorableMaximalAndNeverReloadDevice
                 }
                 EXPECT_FALSE(gapless_device) << "round " << round << ": a gapless Device prefix is asked for";
                 EXPECT_FALSE(coordinator.GroupIsState(key.group_id)) << "round " << round;
-                const auto page = std::ranges::find(hashes, key.content_hash) - hashes.begin();
+                const auto page = std::ranges::find(hashes, key.content_hash.ToString()) - hashes.begin();
                 EXPECT_FALSE(page < device_pages) << "round " << round << ": a page below L is asked for";
             }
         }

@@ -262,7 +262,7 @@ TEST(CheckpointDemotionCoordinatorTest, BoundaryKeysLeaveTheWindowAKeptBoundaryR
     const auto keys = [&](const std::vector<std::int32_t>& kept_boundaries) {
         std::vector<std::string> names;
         for (const CacheKey& key : coordinator.BoundaryCheckpointKeys(chain, kept_boundaries)) {
-            names.push_back(std::to_string(key.group_id) + ":" + key.content_hash + "/" +
+            names.push_back(std::to_string(key.group_id) + ":" + key.content_hash.ToString() + "/" +
                             std::to_string(key.page_offset));
         }
         return names;

@@ -53,7 +53,7 @@ struct QueryPrompt {
             .prefix_hashes = std::span{hashes}.first(bound / grain), .tokens = tokens, .max_tokens = bound};
         if (include_tail && bound % grain != 0) {
             const auto count = bound % grain;
-            const auto prior = result.prefix_hashes.empty() ? ContentHash{} : result.prefix_hashes.back();
+            const auto prior = result.prefix_hashes.empty() ? ContentHash{} : ContentHash{result.prefix_hashes.back()};
             result.tail = TailPublication{
                 .tail_tokens = count, .hash = HashPrefixPage(std::span{tokens}.subspan(bound - count, count), prior)};
         }

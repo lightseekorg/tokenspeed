@@ -22,6 +22,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory_resource>
 #include <span>
 #include <unordered_map>
 #include <vector>
@@ -42,7 +43,11 @@ namespace tokenspeed {
 class ShadowOccupancy {
 public:
     ShadowOccupancy(const BlockPool& pool, std::span<const CacheGroup> groups)
-        : pool_{pool}, groups_{groups}, holes_by_bucket_(groups.size()), empty_parent_count_{pool.NumEmptyLcmBlocks()} {
+        : pool_{pool},
+          groups_{groups},
+          scratch_{pool.AcquirePlanningScratch()},
+          holes_by_bucket_(groups.size()),
+          empty_parent_count_{pool.NumEmptyLcmBlocks()} {
         for (std::size_t i = 0; i < groups_.size(); ++i) {
             const std::span<const std::int64_t> holes = pool_.FreeSlotsByBucket(static_cast<std::uint32_t>(i));
             holes_by_bucket_[i].assign(holes.begin(), holes.end());
@@ -137,7 +142,8 @@ private:
     std::span<const CacheGroup> groups_;
     // Occupants left per parent a Remove touched; untouched parents keep the
     // pool's own count.
-    std::unordered_map<std::int32_t, std::int32_t> remaining_occupied_;
+    PlanningScratch::Lease scratch_;
+    std::pmr::unordered_map<std::int32_t, std::int32_t> remaining_occupied_{&scratch_};
     std::vector<std::vector<std::int64_t>> holes_by_bucket_;
     std::int64_t empty_parent_count_{0};
     // The demand with a fit's pairs in place, as wide as the widest group's

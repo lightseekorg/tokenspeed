@@ -98,18 +98,18 @@ public:
     template <typename VictimSet>
     void Minimize(std::vector<VictimSet>& victims, std::span<const std::vector<std::int64_t>> needed,
                   std::span<const std::int64_t> dense, std::span<const std::int64_t> pairs) {
-        std::vector<VictimSet> required;
-        required.reserve(victims.size());
         for (auto it = victims.rbegin(); it != victims.rend(); ++it) {
             if (it->members.empty()) continue;
             for (const auto& member : it->members) Restore(member.group_id, member.location);
             if (!Fits(needed, dense, pairs)) {
                 for (const auto& member : it->members) Remove(member.group_id, member.location);
-                required.push_back(std::move(*it));
+            } else {
+                it->members.clear();
             }
         }
-        std::ranges::reverse(required);
-        victims = std::move(required);
+        // Compact in original order after the reverse restore/fit pass.
+        // The capacity formula and checkpoint updates above are unchanged.
+        std::erase_if(victims, [](const auto& set) { return set.members.empty(); });
     }
 
 private:

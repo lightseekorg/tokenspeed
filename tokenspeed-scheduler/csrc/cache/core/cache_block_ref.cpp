@@ -48,7 +48,7 @@ void CacheBlockControl::release() noexcept {
         while (unique_observers_ != nullptr) {
             unique_observers_->Reset();
         }
-        delete this;
+        object_.OwnerPool().destroyBlockControl(this);
         return;
     }
     if (strong_count_ == 1 && unique_observers_ != nullptr) {

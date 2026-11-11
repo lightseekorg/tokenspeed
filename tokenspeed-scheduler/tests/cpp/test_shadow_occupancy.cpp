@@ -20,6 +20,8 @@
 
 #include <cstdint>
 #include <memory>
+#include <memory_resource>
+#include <list>
 #include <span>
 #include <vector>
 
@@ -31,6 +33,83 @@
 
 namespace tokenspeed::test {
 namespace {
+
+TEST(FixedSlotResource, AlignedNodesKeepTheirAddressAcrossGrowthAndReuse) {
+    struct alignas(256) Value {
+        int value;
+    };
+    FixedSlotResource storage{16};
+    std::pmr::list<Value> values{&storage};
+    values.push_back(Value{73});
+    const auto* anchor = &values.front();
+    for (int round = 0; round < 4; ++round) {
+        for (int i = 0; i < 4096; ++i) values.push_back(Value{i});
+        EXPECT_EQ(&values.front(), anchor);
+        EXPECT_EQ(anchor->value, 73);
+        auto it = std::next(values.begin());
+        for (int i = 0; i < 4096; ++i, ++it) {
+            EXPECT_EQ(it->value, i);
+            EXPECT_EQ(reinterpret_cast<std::uintptr_t>(&*it) % alignof(Value), 0);
+        }
+        values.erase(std::next(values.begin()), values.end());
+    }
+}
+
+TEST(ShadowOccupancy, ConcurrentPlansAndReusedScratchHaveIndependentCapacity) {
+    const CacheGroupSpec history{.cache_blocks_per_lcm_block = 2, .block_granularity = 4};
+    std::vector<CacheGroup> groups;
+    groups.emplace_back(history, std::make_unique<GroupAllocator>(2, 0, 1), MakePrefixMatcher(history));
+    BlockPool pool{2, {2}};
+    pool.RegisterGroup(0, 2, 1);
+    const auto held = pool.AcquireBlocks(0, 4);
+    const std::vector<std::vector<std::int64_t>> needed{{2}};
+    const std::vector<std::int64_t> zero{0};
+    for (int round = 0; round < 4; ++round) {
+        ShadowOccupancy first{pool, groups};
+        ShadowOccupancy second{pool, groups};
+        ShadowOccupancy third{pool, groups};
+        EXPECT_FALSE(first.Fits(needed, zero, zero));
+        EXPECT_FALSE(second.Fits(needed, zero, zero));
+        EXPECT_FALSE(third.Fits(needed, zero, zero));
+        first.Remove(0, held[0]->Location());
+        first.Remove(0, held[1]->Location());
+        EXPECT_TRUE(first.Fits(needed, zero, zero));
+        EXPECT_FALSE(second.Fits(needed, zero, zero));
+        second.Remove(0, held[2]->Location());
+        EXPECT_FALSE(second.Fits(needed, zero, zero));
+        second.Remove(0, held[3]->Location());
+        EXPECT_TRUE(second.Fits(needed, zero, zero));
+        first.Restore(0, held[0]->Location());
+        EXPECT_FALSE(first.Fits(needed, zero, zero));
+        EXPECT_TRUE(second.Fits(needed, zero, zero));
+        EXPECT_FALSE(third.Fits(needed, zero, zero));
+        EXPECT_EQ(pool.NumOccupiedSlots(), 4);
+    }
+}
+
+TEST(PlanningScratch, AlignedOverflowAndNestedLeasesKeepTheirOwnValues) {
+    struct alignas(512) Value {
+        int value;
+    };
+    PlanningScratch scratch;
+    for (int round = 0; round < 3; ++round) {
+        auto first = scratch.Acquire();
+        auto second = scratch.Acquire();
+        auto third = scratch.Acquire();
+        std::pmr::vector<Value> large{&first};
+        std::pmr::vector<Value> small{&second};
+        std::pmr::vector<Value> nested{&third};
+        for (int i = 0; i < 2048; ++i) large.push_back(Value{i});
+        small.push_back(Value{42});
+        nested.push_back(Value{99});
+        EXPECT_EQ(reinterpret_cast<std::uintptr_t>(large.data()) % alignof(Value), 0);
+        EXPECT_EQ(reinterpret_cast<std::uintptr_t>(small.data()) % alignof(Value), 0);
+        EXPECT_EQ(reinterpret_cast<std::uintptr_t>(nested.data()) % alignof(Value), 0);
+        for (int i = 0; i < 2048; ++i) EXPECT_EQ(large[i].value, i);
+        EXPECT_EQ(small[0].value, 42);
+        EXPECT_EQ(nested[0].value, 99);
+    }
+}
 
 TEST(ShadowOccupancy, AReleasedHostParentCannotAlsoLeaveHistorySlotsBehind) {
     const CacheGroupSpec history{.cache_blocks_per_lcm_block = 6, .block_granularity = 4};

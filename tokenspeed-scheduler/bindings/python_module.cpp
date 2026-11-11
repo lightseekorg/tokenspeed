@@ -362,7 +362,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
 
     const auto storage_keys = [](const std::vector<tokenspeed::CacheKey>& values) {
         nb::list keys;
-        for (const auto& key : values) keys.append(nb::make_tuple(key.group_id, key.content_hash, key.page_offset));
+        for (const auto& key : values)
+            keys.append(nb::make_tuple(key.group_id, key.content_hash.ToString(), key.page_offset));
         return keys;
     };
 

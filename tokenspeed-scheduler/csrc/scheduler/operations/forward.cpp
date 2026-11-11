@@ -109,17 +109,6 @@ void fillBlockTables(Operation& operation, Request& request, const CacheCoordina
     }
 }
 
-void appendCompletedPrefixHashes(std::vector<std::string>& prefix_hashes, const Request& request,
-                                 std::int32_t filled_prefix_pages) {
-    const std::int32_t first_new_prefix_page = static_cast<std::int32_t>(prefix_hashes.size());
-    _assert(filled_prefix_pages > first_new_prefix_page, "caller must pre-check page-hash progress");
-    const std::string previous_hash = prefix_hashes.empty() ? std::string{} : prefix_hashes.back();
-    std::vector<std::string> new_hashes =
-        ComputePrefixHashes(request.PrefixPages(first_new_prefix_page, filled_prefix_pages), previous_hash);
-    prefix_hashes.insert(prefix_hashes.end(), std::make_move_iterator(new_hashes.begin()),
-                         std::make_move_iterator(new_hashes.end()));
-}
-
 // The page boundary before a long prompt's replay tail where the forward that
 // spans it also writes the State checkpoint
 // (SchedulerConfig::state_checkpoint_in_forward); 0 means none. The D role
@@ -238,7 +227,7 @@ RequestProgress AdvanceRequestProgress(const Request& request, fsm::CacheProgres
     const std::int32_t first_new_prefix_page = static_cast<std::int32_t>(cache_progress.prefix_hashes.size());
     const std::int32_t filled_prefix_pages = num_computed_tokens / prefix_granularity;
     if (filled_prefix_pages > first_new_prefix_page) {
-        appendCompletedPrefixHashes(cache_progress.prefix_hashes, request, filled_prefix_pages);
+        request.AppendPrefixHashes(cache_progress.prefix_hashes, filled_prefix_pages);
     }
     RequestProgress progress{.num_computed_tokens = num_computed_tokens};
     std::optional<TailPublication> tail;
@@ -307,7 +296,7 @@ PrefillOperation applyPrefillEvent(Request& request, Event& event, const CacheCo
     operation.request_pool_index = request.RequestPoolIndex();
     operation.input_length = info.extend_len;
     operation.prefill_length = request.PrefillSize();
-    operation.input_ids.assign(info.input_ids.begin(), info.input_ids.end());
+    operation.input_ids = info.input_ids;
     operation.shifted_input_ids = info.shifted_input_ids;
     operation.extend_prefix_len = info.already_scheduled_len;
     operation.extend_replay_len = info.replay_len;

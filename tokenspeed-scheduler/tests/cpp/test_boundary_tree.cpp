@@ -134,6 +134,47 @@ TEST(BoundaryTreeTest, APublicationLinksPagesUnderTheirParentsAndTheTailUnderIts
     EXPECT_EQ(tree.Size(), 0u);
 }
 
+TEST(BoundaryTreeTest, NodesAndKeysStayStableAcrossIndexGrowthDeletionAndSlotReuse) {
+    BoundaryTree tree{TreeConfig(1, false), nullptr};
+    auto root_publication = Publish(tree, {"root"}, 0, std::nullopt);
+    auto root_hold = tree.HoldEntry("root", kDeviceKv);
+    root_publication.reset();
+    const Node* root = tree.Find("root");
+    const ContentHash* root_key = root->hash;
+    std::vector<BoundaryTree::Hold> holds;
+    for (int i = 0; i < 2048; ++i) {
+        const auto hash = "child-" + std::to_string(i);
+        auto publication = Publish(tree, {"root", hash}, 1, std::nullopt);
+        holds.push_back(tree.HoldEntry(hash, kDeviceKv));
+    }
+    const Node* survivor = tree.Find("child-1");
+    EXPECT_EQ(tree.Find("root"), root);
+    EXPECT_EQ(root->hash, root_key);
+    EXPECT_EQ(*root_key, ContentHash("root"));
+    std::vector<std::string> expected;
+    for (int i = 0; i < 2048; ++i) {
+        if (i % 2 == 0)
+            holds[i].reset();
+        else
+            expected.push_back("child-" + std::to_string(i));
+    }
+    EXPECT_EQ(Children(*root), expected);
+    for (int i = 0; i < 2048; i += 2) {
+        const auto hash = "child-" + std::to_string(i);
+        EXPECT_EQ(tree.Find(hash), nullptr);
+        auto publication = Publish(tree, {"root", hash}, 1, std::nullopt);
+        holds[i] = tree.HoldEntry(hash, kDeviceKv);
+        expected.push_back(hash);
+    }
+    EXPECT_EQ(tree.Find("child-1"), survivor);
+    EXPECT_EQ(survivor->parent, root);
+    EXPECT_EQ(Children(*root), expected);
+    holds.clear();
+    EXPECT_EQ(tree.Size(), 1);
+    root_hold.reset();
+    EXPECT_EQ(tree.Size(), 0);
+}
+
 // A node started without a known parent (a Host entry no publication linked)
 // is linked once a publication through its hash names its parent: it becomes
 // the parent's child with its boundary, and the parent counts the checkpoint

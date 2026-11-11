@@ -40,12 +40,38 @@ Request::Request(const RequestSpec& spec, std::int32_t prefix_granularity, Role 
                                   : fsm::State{fsm::Bootstrapping{&token_container_, prefix_granularity}}} {}
 
 std::span<const std::string> Request::PromptPrefixHashes() {
-    if (!prompt_prefix_hashes_) {
-        auto pages = FullPrefixPages(false);
-        pages.resize(static_cast<std::size_t>(submitted_prompt_size_ / prefix_granularity_));
-        prompt_prefix_hashes_ = ComputePrefixHashes(pages, "");
+    return PromptPrefixHashes(submitted_prompt_size_ / prefix_granularity_);
+}
+
+std::span<const std::string> Request::PromptPrefixHashes(std::int32_t num_pages) {
+    _assert(num_pages >= 0 && num_pages <= submitted_prompt_size_ / prefix_granularity_,
+            "prompt hashes stay within complete submitted pages");
+    if (!prompt_prefix_hashes_) prompt_prefix_hashes_.emplace();
+    auto& hashes = *prompt_prefix_hashes_;
+    const auto first = static_cast<std::int32_t>(hashes.size());
+    if (num_pages > first) {
+        auto added = ComputePrefixHashes(PrefixPages(first, num_pages), hashes.empty() ? std::string{} : hashes.back());
+        hashes.insert(hashes.end(), std::make_move_iterator(added.begin()), std::make_move_iterator(added.end()));
     }
-    return *prompt_prefix_hashes_;
+    return std::span<const std::string>(hashes).first(num_pages);
+}
+
+void Request::AppendPrefixHashes(std::vector<std::string>& hashes, std::int32_t num_pages) const {
+    _assert(num_pages >= static_cast<std::int32_t>(hashes.size()) && num_pages <= TokenSize() / prefix_granularity_,
+            "completed hashes append only full token pages");
+    hashes.reserve(num_pages);
+    if (prompt_prefix_hashes_) {
+        const auto& cached = *prompt_prefix_hashes_;
+        const auto end = std::min<std::size_t>(num_pages, cached.size());
+        if (hashes.size() < end) {
+            hashes.insert(hashes.end(), cached.begin() + hashes.size(), cached.begin() + end);
+        }
+    }
+    const auto first = static_cast<std::int32_t>(hashes.size());
+    if (first < num_pages) {
+        auto added = ComputePrefixHashes(PrefixPages(first, num_pages), hashes.empty() ? std::string{} : hashes.back());
+        hashes.insert(hashes.end(), std::make_move_iterator(added.begin()), std::make_move_iterator(added.end()));
+    }
 }
 
 std::span<const std::uint64_t> Request::KvEventBlockHashes(std::size_t num_pages) {

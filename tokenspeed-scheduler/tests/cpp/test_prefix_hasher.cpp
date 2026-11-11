@@ -21,6 +21,9 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <cstring>
+#include <limits>
+#include <random>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -73,6 +76,40 @@ TEST(RequestPromptHashesTest, AShortInputHasNoFullPageHashes) {
                     /*prefix_granularity=*/4, Role::kFused);
     EXPECT_TRUE(request.PromptPrefixHashes().empty());
     EXPECT_TRUE(request.PromptPrefixHashes().empty());
+}
+
+TEST(RequestPromptHashesTest, BoundedStorageThenAdmissionAndPublicationShareTheSameChain) {
+    Request request(RequestSpec{.request_id = "bounded", .tokens = {1, 2, 3, 4, 5, 6, 7, 8, 9}},
+                    /*prefix_granularity=*/2, Role::kFused);
+    const auto expected = ComputePrefixHashes(request.FullPrefixPages(false), "");
+    const auto bounded = request.PromptPrefixHashes(2);
+    EXPECT_EQ(std::vector<std::string>(bounded.begin(), bounded.end()),
+              (std::vector<std::string>{expected[0], expected[1]}));
+    std::vector<std::string> completed;
+    request.AppendPrefixHashes(completed, 1);
+    EXPECT_EQ(completed, (std::vector<std::string>{expected[0]}));
+    // Cross the cached prefix: publication computes just the missing suffix.
+    request.AppendPrefixHashes(completed, 3);
+    EXPECT_EQ(completed, (std::vector<std::string>{expected[0], expected[1], expected[2]}));
+    const auto admitted = request.PromptPrefixHashes();
+    EXPECT_EQ(std::vector<std::string>(admitted.begin(), admitted.end()), expected);
+    request.AppendPrefixHashes(completed, 4);
+    EXPECT_EQ(completed, expected);
+    const auto shorter = request.PromptPrefixHashes(1);
+    EXPECT_EQ(shorter.front(), expected.front());
+    EXPECT_EQ(request.PromptPrefixHashes().size(), 4);
+}
+
+TEST(RequestPromptHashesTest, PublicationWithoutAdmissionHashesOnlyCompletedPages) {
+    Request request(RequestSpec{.request_id = "uncached", .tokens = {1, 2, 3, 4, 5}},
+                    /*prefix_granularity=*/2, Role::kFused);
+    std::vector<std::string> completed;
+    request.AppendPrefixHashes(completed, 0);
+    EXPECT_TRUE(completed.empty());
+    request.AppendPrefixHashes(completed, 1);
+    EXPECT_EQ(completed, (std::vector<std::string>{HashPrefixPage(Tokens({1, 2}), "")}));
+    request.AppendPrefixHashes(completed, 2);
+    EXPECT_EQ(completed, ComputePrefixHashes(request.FullPrefixPages(false), ""));
 }
 
 // ---- hex helpers --------------------------------------------------------
@@ -216,7 +253,65 @@ TEST(HashPrefixPageTest, FramingDisambiguatesTokensFromExtraKeys) {
               HashPrefixPage(Tokens(long_toks), "", Keys(no_keys)));
 }
 
+// Serialize the framed bytes independently of the streaming implementation.
+TEST(HashPrefixPageTest, PreservesFramedBytesAndChainingAcrossTokenBatchBoundaries) {
+    std::mt19937 random(871923);
+    std::string prior;
+    for (const std::size_t length : {0u, 1u, 2u, 15u, 16u, 17u, 63u, 64u, 65u, 255u, 256u, 257u, 4096u}) {
+        std::vector<std::int32_t> tokens(length);
+        for (auto& token : tokens) {
+            const auto bits = static_cast<std::uint32_t>(random());
+            std::memcpy(&token, &bits, sizeof(token));
+        }
+        if (length >= 3) {
+            tokens[0] = std::numeric_limits<std::int32_t>::min();
+            tokens[1] = std::numeric_limits<std::int32_t>::max();
+            tokens[2] = -1;
+        }
+        for (const auto& keys : std::vector<std::vector<std::string>>{{}, {""}, {std::string("a\0b", 3), "salt"}}) {
+            std::vector<unsigned char> bytes;
+            const auto append_u32 = [&](std::uint32_t value) {
+                for (unsigned shift = 0; shift < 32; shift += 8) {
+                    bytes.push_back(static_cast<unsigned char>(value >> shift));
+                }
+            };
+            const auto prior_bytes = HexToBytes(prior);
+            append_u32(static_cast<std::uint32_t>(prior_bytes.size()));
+            bytes.insert(bytes.end(), prior_bytes.begin(), prior_bytes.end());
+            append_u32(static_cast<std::uint32_t>(tokens.size()));
+            const auto token_begin = bytes.size();
+            for (const auto token : tokens) {
+                append_u32(static_cast<std::uint32_t>(token));
+            }
+            const auto token_end = bytes.size();
+            if (!keys.empty()) {
+                append_u32(static_cast<std::uint32_t>(keys.size()));
+                for (const auto& key : keys) {
+                    append_u32(static_cast<std::uint32_t>(key.size()));
+                    bytes.insert(bytes.end(), key.begin(), key.end());
+                }
+            }
+            unsigned char digest[SHA256_DIGEST_LENGTH];
+            SHA256(bytes.data(), bytes.size(), digest);
+            const auto expected = DigestToHex(digest);
+            EXPECT_EQ(HashPrefixPage(tokens, prior, keys), expected) << "token count " << length;
+            SHA256_CTX explicit_ctx;
+            SHA256_Init(&explicit_ctx);
+            SHA256_Update(&explicit_ctx, bytes.data(), token_begin);
+            Sha256UpdateTokensExplicitLE(explicit_ctx, tokens);
+            SHA256_Update(&explicit_ctx, bytes.data() + token_end, bytes.size() - token_end);
+            SHA256_Final(digest, &explicit_ctx);
+            EXPECT_EQ(DigestToHex(digest), expected) << "explicit encoding, token count " << length;
+            prior = expected;
+        }
+    }
+}
+
 // ---- ComputePrefixHashes (chaining) -------------------------------------
+
+TEST(ComputePrefixHashesTest, EmptyPagesDoNotInspectAnUnusedPrior) {
+    EXPECT_TRUE(ComputePrefixHashes({}, "not a hexadecimal prior").empty());
+}
 
 TEST(ComputePrefixHashesTest, MatchesManualRollingChain) {
     std::vector<std::int32_t> p0 = {1, 2};

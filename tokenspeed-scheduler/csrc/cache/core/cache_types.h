@@ -33,6 +33,7 @@
 
 #include "cache/core/block_table.h"
 #include "cache/core/cache_config.h"
+#include "cache/core/content_hash.h"
 #include "utils.h"
 
 namespace tokenspeed {
@@ -54,7 +55,6 @@ inline constexpr std::int64_t kMaxCheckpointRetentionRequests{std::int64_t{1} <<
 inline constexpr std::int32_t kMaxCheckpointDistance{5};
 
 using CacheNamespaceId = std::uint32_t;
-using ContentHash = std::string;
 
 inline constexpr CacheNamespaceId kDefaultCacheNamespaceId = 0;
 

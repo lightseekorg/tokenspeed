@@ -50,7 +50,8 @@ struct RequestSpec {
 // `already_scheduled_len + extend_len` regardless of replay_len.
 struct PrefillInfo {
     std::span<const std::int32_t> input_ids;
-    std::vector<std::int32_t> shifted_input_ids;
+    // Borrowed prompt suffix; missing positions are padded by ForwardBatch.
+    std::span<const std::int32_t> shifted_input_ids;
     std::int32_t already_scheduled_len{0};
     std::int32_t extend_len{0};
     std::int32_t replay_len{0};

@@ -2244,7 +2244,7 @@ TEST_F(ImageFollowsCanonicalHostEntrySuite, ARedirectedStoreAckRePointsTheImageT
     std::vector<std::uint8_t> present;
     for (const auto& key : query.keys) {
         // This race stores complete pages only, not r3's unrelated tail.
-        present.push_back(std::ranges::find(hashes, key.content_hash) != hashes.end());
+        present.push_back(std::ranges::find(hashes, key.content_hash.ToString()) != hashes.end());
     }
     ExecutionEvent query_done;
     query_done.With(cache::StorageDone{query.op_id, present, true, std::vector<std::uint8_t>(query.keys.size(), 0)});

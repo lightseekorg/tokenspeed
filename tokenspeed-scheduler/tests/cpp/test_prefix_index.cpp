@@ -21,15 +21,18 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <limits>
 #include <memory>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "cache/core/block_pool.h"
 #include "cache/prefix/prefix_index.h"
+#include "cache/prefix/flat_pointer_index.h"
 
 namespace tokenspeed::test {
 namespace {
@@ -117,6 +120,158 @@ TEST(PrefixCacheIndexInspectionTest, KeepsPoolsSeparateAndDoesNotClaimMissingKey
     EXPECT_FALSE(index.Inspect(device, KeyOf("absent")));
 }
 
+TEST(PrefixCacheIndexInspectionTest, EvictionKeepsItsKeyAndMetadataAfterTheEntryIsGone) {
+    BlockPool pool(1, {1});
+    PrefixCacheIndex index(0);
+    const auto key = KeyOf(std::string(64, 'a'));
+    const auto location = Cache(index, pool, key.content_hash, 17);
+    EXPECT_THROW(index.EvictWithMetadata(
+                     pool, location, [](const auto&, const auto&) { throw std::runtime_error("publication refused"); }),
+                 std::runtime_error);
+    EXPECT_TRUE(index.Contains(pool, key));
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 0);
+    PrefixCacheIndex::CachedBlockMetadata recorded;
+    auto removed =
+        index.EvictWithMetadata(pool, location, [&](const auto&, const auto& metadata) { recorded = metadata; });
+    ASSERT_TRUE(removed);
+    EXPECT_EQ(*removed, key);
+    EXPECT_EQ(recorded.last_access_epoch, 17);
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 1);
+    EXPECT_FALSE(index.Contains(pool, location));
+    const auto replacement = Cache(index, pool, "replacement", 18);
+    EXPECT_EQ(replacement, location);
+    EXPECT_EQ(*removed, key);
+    EXPECT_EQ(index.KeyOf(pool, replacement), KeyOf("replacement"));
+}
+
+TEST(PrefixCacheIndexInspectionTest, PackedLocationsAcrossSegmentsSurviveEvictionAndReuse) {
+    BlockPool pool(600, {2});
+    PrefixCacheIndex index(0);
+    std::vector<CacheBlockLocation> locations;
+    for (int i = 0; i < 1200; ++i) locations.push_back(Cache(index, pool, std::to_string(i), 1));
+    for (int i = 0; i < 1200; i += 2) {
+        EXPECT_EQ(index.Evict(pool, locations[i]), KeyOf(std::to_string(i)));
+        EXPECT_FALSE(index.Contains(pool, locations[i]));
+        EXPECT_EQ(index.KeyOf(pool, locations[i + 1]), KeyOf(std::to_string(i + 1)));
+    }
+    for (int i = 0; i < 600; ++i) {
+        const auto location = Cache(index, pool, "new-" + std::to_string(i), 2);
+        EXPECT_EQ(index.KeyOf(pool, location), KeyOf("new-" + std::to_string(i)));
+    }
+    EXPECT_EQ(index.NumEntries(pool), 1200);
+}
+
+TEST(SegmentedLocationIndex, SparseLargeLocationsAndEmptySegmentsCanBeReused) {
+    SegmentedLocationIndex<int*> index(/*packing=*/64, /*parents=*/10000000);
+    int first = 1, last = 2;
+    const CacheBlockLocation low{1, 0}, high{9000000, 63};
+    index.Set(low, &first);
+    index.Set(high, &last);
+    EXPECT_EQ(index.Find(low), &first);
+    EXPECT_EQ(index.Find(high), &last);
+    EXPECT_EQ(index.Find({0, 0}), nullptr);
+    EXPECT_EQ(index.Find({9000000, 64}), nullptr);
+    EXPECT_EQ(index.Find({10000001, 0}), nullptr);
+    index.Erase(high);
+    EXPECT_EQ(index.Find(high), nullptr);
+    EXPECT_EQ(index.Find(low), &first);
+    index.Set(high, &first);
+    EXPECT_EQ(index.Find(high), &first);
+}
+
+TEST(ContentHash, PreservesOpaqueBytesEmptyIdentityAndLexicalOrder) {
+    const std::vector<std::string> text{"",      std::string(64, '0'),   std::string(64, 'a'), std::string(64, 'A'),
+                                        "entry", std::string("a\0b", 3), std::string(63, 'f'), std::string(64, 'x')};
+    std::vector<ContentHash> hashes;
+    for (const auto& value : text) {
+        ContentHash hash(value);
+        EXPECT_EQ(hash.ToString(), value);
+        EXPECT_EQ(hash.empty(), value.empty());
+        hashes.push_back(std::move(hash));
+    }
+    EXPECT_NE(hashes[0], hashes[1]);
+    EXPECT_NE(hashes[2], hashes[3]);
+    auto ordered_text = text;
+    std::ranges::sort(ordered_text);
+    std::ranges::sort(hashes);
+    for (std::size_t i = 0; i < hashes.size(); ++i) EXPECT_EQ(hashes[i].ToString(), ordered_text[i]);
+    EXPECT_EQ(ContentHash(ContentHash::Digest{}), ContentHash(std::string(64, '0')));
+}
+
+TEST(ContentHash, EveryNoncanonicalByteRemainsOpaqueAtEveryPosition) {
+    const std::string canonical(64, 'a');
+    for (std::size_t position = 0; position < canonical.size(); ++position) {
+        for (unsigned byte = 0; byte < 256; ++byte) {
+            auto text = canonical;
+            text[position] = static_cast<char>(byte);
+            EXPECT_EQ(ContentHash(text).ToString(), text);
+        }
+    }
+}
+
+TEST(FlatPointerIndex, CollidingKeysSurviveGrowthWrappedClustersAndChurn) {
+    struct Entry {
+        int key;
+    };
+    struct KeyOfEntry {
+        const int& operator()(const Entry* entry) const { return entry->key; }
+    };
+    struct CollisionHash {
+        std::size_t operator()(int) const { return 15; }
+    };
+    std::array<Entry, 256> entries;
+    FlatPointerIndex<const Entry*, int, KeyOfEntry, CollisionHash> index;
+    std::map<int, const Entry*> expected;
+    for (int i = 0; i < 256; ++i) {
+        entries[i].key = i;
+        ASSERT_TRUE(index.Insert(&entries[i]));
+        expected.emplace(i, &entries[i]);
+    }
+    std::mt19937 random(8731);
+    for (int step = 0; step < 4096; ++step) {
+        const int key = random() % entries.size();
+        if (random() % 2) {
+            EXPECT_EQ(index.Insert(&entries[key]), expected.emplace(key, &entries[key]).second);
+        } else {
+            EXPECT_EQ(index.Erase(key), expected.erase(key) != 0);
+        }
+        EXPECT_EQ(index.size(), expected.size());
+        if (step % 31 == 0) {
+            for (int i = 0; i < 256; ++i) {
+                const auto found = expected.find(i);
+                EXPECT_EQ(index.Find(i), found == expected.end() ? nullptr : found->second);
+            }
+        }
+    }
+    for (const auto& [key, entry] : expected) {
+        EXPECT_EQ(index.Find(key), entry);
+        EXPECT_TRUE(index.Erase(key));
+    }
+    EXPECT_TRUE(index.empty());
+    EXPECT_FALSE(index.Erase(0));
+    EXPECT_TRUE(index.Insert(&entries[0]));
+    EXPECT_EQ(index.Find(0), &entries[0]);
+}
+
+TEST(PrefixCacheIndexInspectionTest, CompleteDigestIdentitySurvivesCommonLeadingBytes) {
+    BlockPool pool(32, {1});
+    PrefixCacheIndex index(0);
+    std::vector<CacheBlockLocation> locations;
+    for (int i = 0; i < 16; ++i) {
+        std::string hash(64, '0');
+        hash.back() = "0123456789abcdef"[i];
+        locations.push_back(Cache(index, pool, hash, i + 1));
+    }
+    for (int i = 15; i >= 0; --i) {
+        std::string hash(64, '0');
+        hash.back() = "0123456789abcdef"[i];
+        EXPECT_EQ(index.KeyOf(pool, locations[i]), KeyOf(hash));
+        EXPECT_EQ(index.Evict(pool, locations[i]), KeyOf(hash));
+        EXPECT_FALSE(index.Contains(pool, KeyOf(hash)));
+    }
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 32);
+}
+
 TEST(PrefixCacheIndexInspectionTest, LongDigestsKeepNamespacesAndOffsetsDistinctAfterEviction) {
     constexpr std::int32_t count = 128;
     BlockPool pool(count, {1});
@@ -150,7 +305,9 @@ TEST(PrefixCacheIndexInspectionTest, LongDigestsKeepNamespacesAndOffsetsDistinct
         missing.page_offset += 4;
         EXPECT_FALSE(index.Contains(pool, missing));
         missing = keys[i];
-        missing.content_hash.front() = 'b';
+        auto missing_hash = missing.content_hash.ToString();
+        missing_hash.front() = 'b';
+        missing.content_hash = std::move(missing_hash);
         EXPECT_FALSE(index.Contains(pool, missing));
     }
 
