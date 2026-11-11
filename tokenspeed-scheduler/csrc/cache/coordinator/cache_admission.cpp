@@ -881,9 +881,9 @@ private:
         for (std::size_t i = 0; i < groups_.size(); ++i) {
             PrefixCacheIndex::EvictionCursor cursor;
             const auto& index = groups_[i].Index();
-            while (const auto epoch = index.PeekEvictionEpoch(pool_, cursor)) {
+            while (const auto rank = index.PeekEvictionRank(pool_, cursor)) {
                 entries.clear();
-                index.NextEvictionEpoch(pool_, cursor, *epoch, entries);
+                index.NextEvictionRank(pool_, cursor, *rank, entries);
                 for (const auto& entry : entries) {
                     if (!protected_locations_.contains(entry.location) &&
                         !request_reclaim_locations_.contains(entry.location)) {

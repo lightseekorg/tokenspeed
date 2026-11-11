@@ -59,7 +59,7 @@ std::vector<std::string> EvictionOrder(const PrefixCacheIndex& index, const Bloc
     std::vector<std::string> order;
     PrefixCacheIndex::EvictionCursor cursor;
     std::vector<PrefixCacheIndex::EvictionCandidate> batch;
-    while (index.NextEvictionEpoch(pool, cursor, std::numeric_limits<std::uint64_t>::max(), batch)) {
+    while (index.NextEvictionRank(pool, cursor, std::numeric_limits<std::uint64_t>::max(), batch)) {
         for (const auto& candidate : batch) {
             for (const auto& [location, name] : names) {
                 if (location == candidate.location) {

@@ -1086,6 +1086,33 @@ Its responsibilities:
   computed blocks into the prefix indexes for later requests. Prefix-closed
   groups match first; non-closed groups (SWA, State) match only within the
   boundary the closed groups settled (`match_order_` enforces this).
+  A sliding group publishes the windows behind its newest page boundary and
+  its tail, then every other newly hashed page its table still holds
+  (publication runs before retention reclaims the expired blocks), so a block
+  that slides out of its request's window stays cached and evictable instead
+  of being freed: any boundary whose window `[T − W + 1, T)` is still cached
+  resumes -- a resent page-aligned prompt, probed only up to `n − 1`, one page
+  below its end; a shared prefix at its last common page. Those slid-out pages
+  are **Device-only** entries (`host_eligible` false in the prefix index):
+  they never stream, register on Host, reach a finish store, join a
+  retraction image's published bulk or get written back on eviction, so
+  nothing pins them and the request recycles them as soon as they slide out.
+  Only the window entries reach Host, as before. A Device-only entry's key is
+  never on Host: a slid-out page whose key Host holds is published
+  Host-eligible, and a Host registration (store, L3 GET) or a later window
+  publication lifts it, a lifted entry streaming like a new one under
+  write-through. Otherwise Host eviction could drop a Host copy as backed by
+  the Device while the Device entry later leaves unwritten. Eviction takes an unproven
+  slid-out page (Device-only, published at an interior chunk point, never
+  hit -- in practice the interior pages of a prefill chunk) before any other
+  cached block: it can resume only a prefix that diverges at its page, and
+  keeping it like the rest roughly doubles a finished long-prompt request's
+  footprint and pushes whole older requests out first. Endpoint pages (prompt
+  end, finish, retraction) keep the old order, so a resent page-aligned
+  prompt's window survives; so do pages ever hit or lifted into a window.
+  Decode pages enter a window when published and are not covered. The cost:
+  under pressure, a shared prefix's first resume at an interior boundary can
+  miss (`PrefixCacheIndex::IsUnprovenSlidOut`, `PrefixCacheIndex::EvictionRank`).
   A publication point is the request's computed frontier `T`
   (`Request::NumComputedTokens()`); when `T` is not a multiple of
   `prefix_granularity` the partial page holding rows `[kP, T)` is published
@@ -1219,9 +1246,10 @@ Its responsibilities:
   the candidates are merged into a batched writeback. Ordinary decode
   publishes history-cache Device entries but streams none of them and
   publishes no state. At finish — and at the PD transfer ACK — every entry the
-  request published (pages, tail, state slot 1) is queued before request
-  ownership is released. Under write-through, ordinary sliding-window
-  entries stream whenever published. The queue is drained by
+  request published (pages, tail, state slot 1; not its Device-only slid-out
+  sliding pages) is queued before request ownership is released. Under
+  write-through, ordinary sliding-window entries (the windows) stream
+  whenever published. The queue is drained by
   `TierTransferManager::StartPendingStores(guard, cause)`, and every store it
   issues pins its Device sources until the ACK. A retraction does not use the
   queue: the scheduler publishes the victim's computed prefix the same way,
@@ -1541,8 +1569,13 @@ request reclaim. The groups' unread epochs are merged by access time before
 inspecting block owners: a newer epoch, even if every entry is pinned, is not
 scanned to select an older candidate from another group. Complete equal epochs
 still participate in every policy tie-break. Selection compares the next candidate from each group with
-the next request-reclaimable candidate using one policy: LRU access epoch (a
-aged State checkpoint at its retention rank), then tier (uncached request-only block → probationary boundary → established
+the next request-reclaimable candidate using one policy: eviction rank
+(`PrefixCacheIndex::EvictionRank`: the LRU access epoch, with unproven
+slid-out sliding-window pages ahead of every nonzero epoch, and an aged State
+checkpoint at its retention rank; the index keys its order by rank and
+re-keys an entry when it is hit, republished at an endpoint or lifted to a
+window, so one batch is one epoch of one class), then tier (uncached
+request-only block → probationary boundary → established
 boundary → suffix of a closed prefix). Each candidate expands into a
 *victim set* that is selected, restored and evicted whole. Finally, walk the
 selected sets in reverse and restore every set that is not strictly required,

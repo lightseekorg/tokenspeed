@@ -597,12 +597,13 @@ struct ClosedLoop {
             // The blocks evicted for the cache (by admission, stranded suffix
             // or restore, including reusable released inputs) add up to the drain's outcomes: a Host entry
             // already, carried by a store in flight, without Host room,
-            // copied, or dropped as dead or as demoted; recopied and
+            // copied, or dropped as dead, demoted or Device-only; recopied and
             // cancelled blocks are among the copied ones. The counts are
             // cumulative, so the first round they differ ends the run.
             const TierTransferManager::WriteBackStats& eviction = stats.eviction_stores;
             std::uint64_t outcomes = eviction.host_cached + eviction.in_flight + eviction.no_placement +
-                                     stats.dead_entries_not_written_back + stats.demoted_entries_not_written_back;
+                                     stats.dead_entries_not_written_back + stats.demoted_entries_not_written_back +
+                                     stats.device_only_entries_not_written_back;
             for (const std::uint64_t blocks : eviction.blocks) {
                 outcomes += blocks;
             }
