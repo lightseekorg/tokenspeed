@@ -166,14 +166,17 @@ def _assert_bitwise(out, scratch, expected_out, expected_scratch):
             assert torch.equal(a.view(torch.int32), e.view(torch.int32))
 
 
-@pytest.mark.parametrize("tokens", [5, 8, 16])
+@pytest.mark.parametrize("output_size", [3648, 6288])
+@pytest.mark.parametrize("tokens", [5, 8, 12, 16])
 @pytest.mark.parametrize("num_blocks", [1, 6, 11])
 def test_gemv_tokens_match_unfused_projection_and_partials_bitwise(
-    tokens: int, num_blocks: int
+    output_size: int, tokens: int, num_blocks: int
 ) -> None:
-    hidden, weight, blocks, scores = _inputs(tokens, 6288, num_blocks, seed=tokens)
+    hidden, weight, blocks, scores = _inputs(
+        tokens, output_size, num_blocks, seed=tokens
+    )
     scratch = _scratch(tokens)
-    out = torch.empty(tokens, 6288, device="cuda", dtype=torch.bfloat16)
+    out = torch.empty(tokens, output_size, device="cuda", dtype=torch.bfloat16)
 
     _run(hidden, weight, blocks, scores, scratch, out)
 
@@ -233,17 +236,18 @@ def test_gemv_tokens_share_one_compile_and_replay_in_a_graph() -> None:
 
 
 @pytest.mark.parametrize("tokens", [8, 16])
-def test_registry_fuses_only_the_kda_projection_above_four_tokens(tokens: int) -> None:
-    """The 3648-wide MLA projection runs hipBLASLt here, which no tile matches."""
+def test_registry_fuses_the_mla_and_kda_projections_above_four_tokens(
+    tokens: int,
+) -> None:
     available = {}
-    for output_size in (3648, 6288):
+    for output_size in (3648, 6288, 4096):
         hidden, weight, blocks, scores = _inputs(tokens, output_size, 2, seed=3)
         available[output_size] = linear_attnres_partials_available(
             hidden, weight, blocks, *scores, *_scratch(tokens), eps=_EPS
         )
-    assert available == {3648: False, 6288: True}
+    assert available == {3648: True, 6288: True, 4096: False}
 
-    hidden, weight, blocks, scores = _inputs(tokens, 3648, 2, seed=3)
-    out = torch.empty(tokens, 3648, device="cuda", dtype=torch.bfloat16)
+    hidden, weight, blocks, scores = _inputs(tokens, 4096, 2, seed=3)
+    out = torch.empty(tokens, 4096, device="cuda", dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="output size in"):
         _run(hidden, weight, blocks, scores, _scratch(tokens), out)
