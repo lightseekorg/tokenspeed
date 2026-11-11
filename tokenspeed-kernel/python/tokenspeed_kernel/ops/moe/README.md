@@ -715,7 +715,9 @@ symmetric memory instead of NCCL collectives:
 1. One GEMM computes this rank's 112 router logits and 448 latent-down rows
    and multicasts both to every rank.
 2. One kernel takes the top-16 experts (sigmoid plus correction bias,
-   renormalized, scaled) and gathers the full latent row.
+   renormalized, scaled) and gathers the full latent row. It reads the logits
+   from their mailbox as they land, without waiting for the GEMM to complete,
+   and every thread of a row's CTA ranks the candidates, at every row count.
 3. Persistent MXFP4 experts compute this rank's intermediate slice of the
    chosen experts and combine them into a weighted latent partial.
 4. One tail kernel all-reduces the partials, applies the latent RMSNorm, runs
