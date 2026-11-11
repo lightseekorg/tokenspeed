@@ -296,10 +296,7 @@ class GreedySamplingBackend(SamplingBackend):
         if query_start_loc is not None and (
             tree is not None
             or sampling_info.vocab_mask is not None
-            or (
-                self.config.synthetic_acceptance_length is not None
-                and not self._synthetic_is_integer
-            )
+            or self.config.synthetic_acceptance_length is not None
             or self.config.enable_output_logprobs
             or self.config.enable_output_cumulative_probs
         ):
@@ -339,27 +336,6 @@ class GreedySamplingBackend(SamplingBackend):
                 target_predict,
                 query_start_loc,
             )
-            if self.config.synthetic_acceptance_length is not None:
-                # Keep normal verification work, then force only a computed prefix.
-                available = (query_start_loc[1:] - query_start_loc[:-1]).to(torch.int32)
-                lengths = torch.minimum(
-                    self.synthetic_lengths(candidates, sampling_info.batch_row_offset),
-                    available,
-                )
-                safe_lengths = lengths.clamp_min(1)
-                rows = (
-                    query_start_loc[:-1].long() + safe_lengths.long() - 1
-                ).clamp_max(target_predict.numel() - 1)
-                self.write_synthetic_outputs(
-                    candidates,
-                    target_predict.index_select(0, rows),
-                    safe_lengths,
-                    predict,
-                    accept_index,
-                    accept_length,
-                )
-                accept_length.copy_(lengths)
-                accept_index.masked_fill_(available[:, None] == 0, -1)
         elif tree is not None:
             # The accepted path rides in accept_index so the TP broadcast below carries it.
             verify_tree(

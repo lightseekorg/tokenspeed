@@ -14,6 +14,9 @@ that shortening verification improves performance.
 The current execution contract requires greedy sampling, CUDA graphs, equal
 unpadded local decode batches, and the existing server-argument restrictions.
 Unsupported batches use full verification. Token acceptance checks are unchanged.
+Packed verification requires real acceptance; synthetic acceptance is rejected
+at both service validation and the packed sampler entry. Ordinary fixed-width
+verification retains its existing benchmark acceptance controls.
 
 ## Startup measurement
 

@@ -433,9 +433,8 @@ class ForwardStepRunner:
         self.output_buffers: dict[tuple[str, int], tuple] = {}
         # The padded batch the last call replayed a decode graph at (None: eager).
         self.last_graph_bs: int | None = None
-        self.last_graph_query_tokens: int | None = None
         self._reported_query_graphs: set[tuple[str, int, int | None]] = set()
-        self._decode_query_tokens = None
+        self._decode_query_tokens: int | None = None
         # TOKENSPEED_GRAPH_DEBUG=1: capture-time tensor-identity snapshots,
         # re-verified before every replay (graph_ptr_guard). Off by default —
         # replays then pay a single bool check.
@@ -1341,8 +1340,8 @@ class ForwardStepRunner:
             report_key = (*graph_key, self._decode_query_tokens)
             if (
                 self.drafter is not None
-                and len(self.drafter.decode_graph_query_capacities(padded_bs)) > 1
                 and report_key not in self._reported_query_graphs
+                and len(self.drafter.decode_graph_query_capacities(padded_bs)) > 1
             ):
                 self._reported_query_graphs.add(report_key)
                 logger.info(
@@ -1412,9 +1411,4 @@ class ForwardStepRunner:
             )
 
         self.last_graph_bs = padded_bs if use_graph else None
-        self.last_graph_query_tokens = (
-            (self._decode_query_tokens or padded_bs * self.max_tokens_per_req)
-            if use_graph
-            else None
-        )
         return result
