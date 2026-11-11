@@ -18,26 +18,40 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Run with torchrun --standalone --nproc-per-node=2 on two CUDA devices."""
+"""Run with pytest on two CUDA devices; registered in the runtime-2gpu CI suite."""
 
-import os
+import sys
 from datetime import timedelta
+from pathlib import Path
 
+import pytest
 import torch
 import torch.distributed as dist
+import torch.multiprocessing as mp
 
-from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
-from tokenspeed.runtime.distributed.process_group_manager import (
-    process_group_manager as groups,
-)
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=30, suite="runtime-2gpu")
 
 
-def run():
-    rank = int(os.environ["LOCAL_RANK"])
+def _worker(rank, rendezvous):
+    torch.set_num_threads(1)
     torch.cuda.set_device(rank)
+    # Runtime imports may initialize CUDA, so select the rank's device first.
+    from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
+    from tokenspeed.runtime.distributed.process_group_manager import (
+        process_group_manager as groups,
+    )
+
     group = (0, 1)
     dist.init_process_group(
-        "nccl", device_id=torch.device("cuda", rank), timeout=timedelta(seconds=30)
+        "nccl",
+        init_method=rendezvous,
+        rank=rank,
+        world_size=2,
+        device_id=torch.device("cuda", rank),
+        timeout=timedelta(seconds=30),
     )
     groups.register_process_group("nccl", group, dist.group.WORLD)
     groups.register_process_group("gloo", group, dist.new_group(backend="gloo"))
@@ -116,5 +130,12 @@ def run():
     ], "collective missed the writes queued on the calling CUDA stream"
 
 
-if __name__ == "__main__":
-    run()
+def test_pynccl_current_stream(tmp_path):
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+        pytest.skip("requires two GPUs")
+    mp.spawn(
+        _worker,
+        args=((tmp_path / "rendezvous").as_uri(),),
+        nprocs=2,
+        join=True,
+    )
