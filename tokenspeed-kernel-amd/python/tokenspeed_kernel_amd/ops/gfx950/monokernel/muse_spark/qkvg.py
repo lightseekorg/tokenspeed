@@ -116,11 +116,18 @@ def _block_stage(mb, task, w, a, a_stride, FIRST: gl.constexpr, N: gl.constexpr)
     return out, half * N + blk * 16
 
 
+@gluon.constexpr_function
+def gate_halves(plan):
+    """Gate tasks a 16-row block in ``plan``: 1, or 2 (two 8-row tasks,
+    :func:`stages` ``gate_halves``)."""
+    return schedule.stage_tasks(plan, "gate") // (int(KSPLIT) * int(GATE_BLOCKS))
+
+
 @gluon.jit
 def _half_block_stage(mb, task, w, a, a_stride, FIRST: gl.constexpr, N: gl.constexpr):
     """:func:`_block_stage` of half a block: task ``task`` takes rows ``8
-    (task % 2) ..`` of block ``FIRST + task // 4``, K half ``(task // 2) %
-    2``. Every row's sum is the whole-block task's (same K half, tiles and
+    (task % 2) ..`` of block ``FIRST + task // 2 // KSPLIT``, K half
+    ``task // 2 % KSPLIT``. Every row's sum is the whole-block task's (same K half, tiles and
     reduction order)."""
     R: gl.constexpr = schedule.rows(mb.plan)
     sub = task % 2
@@ -134,7 +141,7 @@ def _half_block_stage(mb, task, w, a, a_stride, FIRST: gl.constexpr, N: gl.const
         kit0=half * KITS,
         KITS=KITS,
         SPLIT=gl.num_warps(),
-        half=sub,
+        row_half=sub,
     )
     x_smem = bf16.load_global_rows(
         a, a_stride, half * (HIDDEN // KSPLIT), HIDDEN // KSPLIT, R
@@ -144,7 +151,7 @@ def _half_block_stage(mb, task, w, a, a_stride, FIRST: gl.constexpr, N: gl.const
 
 
 @gluon.jit
-def _put_rows(mb, region: gl.constexpr, out, at, cols=None):
+def _put_rows(mb, region: gl.constexpr, out, at, row_half=None):
     """Put the 16 partial sums of every row of ``out`` (FP32 ``[RP, 16]``)
     at ``at`` of each row's copy of ``region``, in one put. The put goes out
     from a blocked layout that holds each value in few lanes: the GEMV
@@ -160,8 +167,8 @@ def _put_rows(mb, region: gl.constexpr, out, at, cols=None):
     i = gl.arange(0, 16, gl.SliceLayout(0, cl))[None, :]
     # The padding rows repeat the last row; the mask skips their stores.
     # (i >= 0) is always true: it broadcasts the row mask to the tile's shape.
-    # ``cols`` (a half-block task's half: 0 or 1) keeps that half's 8 sums.
-    keep = (i >= 0) if cols is None else ((i // 8) == cols)
+    # ``row_half`` (a half-block task's rows: 0 or 1) keeps those 8 sums.
+    keep = (i >= 0) if row_half is None else ((i // 8) == row_half)
     mb.put(
         region,
         mb.row_offset(r) + at + i,
@@ -194,10 +201,7 @@ def gate_stage(mb, task, w, a, a_stride, STAGE: gl.constexpr):
     With two tasks a block (:func:`stages` ``gate_halves`` 2), task ``task``
     takes 8 of those rows: :func:`_half_block_stage`."""
     mb.stamp(STAGE, trace.START)
-    HALVES: gl.constexpr = schedule.stage_tasks(mb.plan, "gate") // (
-        KSPLIT * GATE_BLOCKS
-    )
-    if HALVES == 2:
+    if gate_halves(mb.plan) == 2:
         out, at, sub = _half_block_stage(
             mb, task, w, a, a_stride, QKV_BLOCKS, QKVG - GATE_ROW
         )

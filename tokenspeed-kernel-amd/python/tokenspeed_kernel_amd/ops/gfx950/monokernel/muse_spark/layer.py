@@ -181,7 +181,8 @@ def _head(
     ROPE: gl.constexpr,
     OWN: gl.constexpr,
 ):
-    """The head task ``task`` (:func:`attention.head_stage`)."""
+    """The head task ``task`` (:func:`attention.head_stage`). The kernel
+    calls it before or after gate (HEAD_FIRST): one call written once."""
     attention.head_stage(
         mb, task, seq_len, slot, k_cache, v_cache, cos_sin, proj_in, ROPE, OWN, "head"
     )
@@ -194,7 +195,7 @@ def _gate_halves(full: bool, rows: int, chain: int) -> int:
     two 8-row tasks a block on every CTA halve that wait. Otherwise gate
     stays off the attention's CTAs, a task a block."""
     one_task_a_cta = (
-        full and rows // chain * int(attention.KV_HEADS) * FULL_SPLITS == 256
+        full and rows // chain * int(attention.KV_HEADS) * FULL_SPLITS == GRID
     )
     return 2 if one_task_a_cta else 1
 
@@ -498,9 +499,7 @@ def gluon_muse_spark_layer_gfx950(
     # attention task waits on it: it runs before gate. Otherwise (its own
     # qkvg: the head waits on the projection, gate runs meanwhile; or gate
     # off the head's CTAs) the head runs after gate.
-    HEAD_FIRST: gl.constexpr = (not OWN) and schedule.stage_tasks(PLAN, "gate") > int(
-        qkvg.KSPLIT * qkvg.GATE_BLOCKS
-    )
+    HEAD_FIRST: gl.constexpr = (not OWN) and qkvg.gate_halves(PLAN) == 2
     if HEAD_FIRST:
         task, active = schedule.stage_task(PLAN, "head")
         if active:
