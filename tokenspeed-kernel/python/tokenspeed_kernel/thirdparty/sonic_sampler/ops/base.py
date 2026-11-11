@@ -147,7 +147,8 @@ def nucleus_masking(p_ptr, batch_id, logits, maximum, max_k: tl.constexpr):
         ladder, tl.full((1,), max_k - 1, dtype=tl.int32), axis=0
     ) * tl.load(p_ptr + batch_id).to(tl.float32)
 
-    return ladder <= scale
+    # Keep each token the mass ranked above it leaves short of p, so the one crossing p too.
+    return ladder - scores < scale
 
 
 @builtin

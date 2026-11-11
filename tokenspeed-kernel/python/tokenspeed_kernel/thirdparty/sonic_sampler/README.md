@@ -30,6 +30,11 @@ The vendored sources differ from `src/sonic_sampler` at that commit only by:
 - Triton imports: `from triton import ...`, `triton.language.extra.libdevice`
   and `triton.language.core.builtin` go through `tokenspeed_kernel._triton`,
   so the kernels compile with `tokenspeed-triton`;
+- the top-p nucleus: `ops/base.py`'s `nucleus_masking` keeps a candidate
+  while the mass of the candidates ranked above it is below `top_p` of their
+  total, so the one crossing `top_p` too; upstream kept one only if the mass
+  up to and including it was at most `top_p` (and always the first), which
+  drops the crossing one;
 - exact fp32 logits (soft-capped heads): `ops/prologue.py` gathers the logit
   manipulators into `transform`, which keeps the logits' dtype
   (`value_dtype`; bf16 logits compile as before), and adds `exact_maximum`,

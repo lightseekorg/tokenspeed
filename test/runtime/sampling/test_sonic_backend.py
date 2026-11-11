@@ -753,6 +753,76 @@ def test_stochastic_sample_matches_softmax(scale):
     assert abs(dev) < 5.0, dev
 
 
+def _nucleus_law(row: torch.Tensor, top_k: int, top_p: float) -> torch.Tensor:
+    """A logit row's law after top-k, then top-p: the nucleus keeps a token while the mass ranked above it is below top_p."""
+    values, columns = row.float().sort(descending=True)
+    if top_k > 0:
+        values, columns = values[:top_k], columns[:top_k]
+    probs = torch.softmax(values, -1)
+    keep = probs.cumsum(-1) - probs < top_p
+    law = torch.zeros(row.numel())
+    law[columns[keep]] = probs[keep] / probs[keep].sum()
+    return law
+
+
+@pytest.mark.parametrize("verify", [False, True], ids=["sample", "verify"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("top_k, top_p", [(-1, 0.75), (-1, 0.85), (2, 0.7)])
+def test_top_p_keeps_the_token_crossing_it(top_k, top_p, dtype, verify):
+    """Draws, and the first token a verify emits, follow the nucleus that keeps the token crossing top_p, whose point draft is accepted at its nucleus probability."""
+    torch.manual_seed(5)
+    iters = 4000
+    n = 2 if verify else 1
+    backend = _make_backend(max_n=n)
+    # Probabilities 0.5, 0.3, 0.1 and 60 tokens sharing 0.1, so the nucleus ends at the 0.3 or the 0.1 token.
+    probs = torch.tensor([0.5, 0.3, 0.1] + [0.1 / 60] * 60)
+    row = torch.full((VOCAB,), -40.0)
+    columns = torch.randperm(VOCAB)[: probs.numel()]
+    row[columns] = probs.log()
+    row = row.to(dtype)
+    law = _nucleus_law(row, top_k, top_p)
+    draft = int(columns[1])
+    req = _prepare(
+        backend,
+        [_sp(f"np{i}", top_k=top_k, top_p=top_p) for i in range(MAX_BS)],
+        n=n,
+    )
+    logits = row.cuda().expand(MAX_BS * n, VOCAB).contiguous()
+    candidates = torch.zeros(MAX_BS, n, dtype=torch.int32, device="cuda")
+    candidates[:, n - 1] = draft
+    offsets = torch.zeros(POOL + 1, dtype=torch.int32, device="cuda")
+    info = SamplingBatchInfo(
+        req_pool_indices=req,
+        valid_cache_lengths=offsets,
+        vocab_size=VOCAB,
+        device="cuda",
+    )
+    counts = torch.zeros(VOCAB, dtype=torch.long, device="cuda")
+    accepted = 0
+    for step in range(iters):
+        offsets.fill_(step * n)
+        if verify:
+            predict, accept = backend.verify(
+                _logits_output(logits), info, candidates, tree=None
+            )
+            first = predict.view(MAX_BS, n)[:, 0]
+            accepted += int((accept == 2).sum().item())
+        else:
+            first, _ = backend.sample(_logits_output(logits), info)
+        counts.scatter_add_(0, first.long(), torch.ones_like(first, dtype=torch.long))
+    counts = counts.cpu()
+    total = iters * MAX_BS
+    assert counts[law == 0].sum().item() == 0, "a draw left the nucleus"
+    dev = _chi2_deviate(counts, law, total)
+    assert abs(dev) < 5.0, dev
+    if verify:
+        p_draft = law[draft].item()
+        assert (
+            abs(accepted / total - p_draft)
+            < 4 * math.sqrt(p_draft * (1 - p_draft) / total) + 0.01
+        )
+
+
 def test_rejects_logits_other_than_bf16_or_fp32():
     backend = _make_backend(max_n=1)
     req = _prepare(backend, [_sp("h0", top_k=8)], slots=[1])
