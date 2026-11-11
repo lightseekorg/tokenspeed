@@ -96,6 +96,8 @@ class ToyBackend:
 
     def __init__(self, device: str) -> None:
         self.sparse_topk = SparseTopKShare()
+        # The toy draft attends whole extend spans; it takes no query shard.
+        self.query_sharded = False
         # Token-indexed cache: slot 0 is the dummy slot, request r's position
         # p lives at slot 1 + r * MAX_LEN + p.
         self.cache = torch.zeros(1 + MAX_BS * MAX_LEN, HIDDEN, device=device)
