@@ -20,6 +20,7 @@
 
 #include "cache/coordinator/cache_coordinator.h"
 
+#include "core/profile_span.h"
 #include "cache/coordinator/eviction_plan.h"
 
 #include <algorithm>
@@ -2088,6 +2089,7 @@ void CacheCoordinator::evictTailEntries(const ContentHash& hash, std::int32_t ta
 }
 
 void CacheCoordinator::CollectDeadEntries() {
+    ProfileSpan profile_span{"CacheCoordinator::CollectDeadEntries"};
     // A node's entries, the Device's before the Host's.
     const auto entries_of = [&](const BoundaryTree::Node& node) {
         std::vector<NodeEntry> entries = NodeEntries(pool_, node);

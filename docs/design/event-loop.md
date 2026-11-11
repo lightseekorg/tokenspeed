@@ -432,6 +432,17 @@ device events within each rank and process rather than clip GPU time to host
 timestamps. Profile startup rejects unsupported capture capabilities instead
 of silently producing an incomplete trace.
 
+The torch profiler sees only torch ops and Python, so a torch profile also
+records the host's own spans (`ts_scheduler::profile`): the round's phases,
+the scheduler calls and their C++ phases (`csrc/core/profile_span.h`), the
+data-plane calls and their waits for the GIL on the control thread, and each
+operation on the forward thread. The profiler merges them into the trace it
+exports, on their threads' lanes, so a forward thread's operation encloses
+the Python it ran. The recording follows the torch profiler's window and
+costs one atomic load per span outside it. A round that receives nothing,
+hands the data plane nothing, and commits, acknowledges or answers nothing
+leaves no spans: a loop waiting on a transfer spins through such rounds.
+
 ### The capture contract
 
 Information crosses to the data plane **only** as a queued operation's

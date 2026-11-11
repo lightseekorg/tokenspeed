@@ -28,6 +28,7 @@
 #include <variant>
 #include <vector>
 
+#include "core/profile_span.h"
 #include "scheduler/execution_event.h"
 #include "ts-scheduler/src/lib.rs.h"
 
@@ -47,6 +48,10 @@ rust::Vec<T> to_rust(const std::vector<T>& values) {
 
 std::vector<std::int32_t> to_std(rust::Slice<const std::int32_t> values) {
     return {values.begin(), values.end()};
+}
+
+void record_profile_span(const char* name, std::int64_t begin_ns, std::int64_t end_ns) {
+    record_scheduler_span(rust::Str(name), begin_ns, end_ns);
 }
 
 }  // namespace
@@ -546,6 +551,10 @@ rust::Vec<StorageOpView> plan_storage_ops(const tokenspeed::ExecutionPlan& plan)
             *storage);
     }
     return out;
+}
+
+void set_profile_span_sink(bool installed) {
+    tokenspeed::SetProfileSpanSink(installed ? &record_profile_span : nullptr);
 }
 
 }  // namespace ts_scheduler

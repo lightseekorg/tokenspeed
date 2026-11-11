@@ -31,12 +31,22 @@ counters, viztracer and Proton. Proton must be driven from the scheduler
 process, not the frontend: its GPU hooks are per process, and the process
 is torn down with SIGKILL, so an atexit-based finalize would never write the
 profile.
+
+A torch profile also records the host's spans (``ts_scheduler::profile``):
+the event loop's phases and the C++ scheduler's on the control thread, and
+the forward thread's operations, which run no torch op the profiler could
+see. They are merged into the exported trace, on their threads' lanes.
 """
 
 from __future__ import annotations
 
+import gzip
+import json
 import logging
 import os
+import re
+import shutil
+import tempfile
 from pathlib import Path
 
 import torch
@@ -73,6 +83,82 @@ def _profile_rank_tag(attn_mapping) -> str:
     return "-".join(parts)
 
 
+# Kineto writes the trace's base time right before its event array.
+_TRACE_HEAD = re.compile(rb'"baseTimeNanoseconds":\s*(\d+),\s*"traceEvents":\s*\[\s*')
+# Bytes searched for that head: the device and distributed metadata before it.
+_TRACE_HEAD_BYTES = 1 << 20
+
+
+def _export_with_host_spans(
+    torch_profiler, path: str, spans: list, threads: list, pid: int
+) -> None:
+    """Export ``torch_profiler``'s trace to ``path`` (gzipped JSON) with the
+    host's ``spans`` on it.
+
+    Kineto stamps CPU events with Unix time, as the host spans are, and
+    writes each ``ts`` in microseconds after the trace's
+    ``baseTimeNanoseconds``. The host's events go at the head of the event
+    array while the trace streams into its gzip file, so a large trace is
+    never held in memory.
+
+    Args:
+        torch_profiler: A stopped ``torch.profiler.profile``.
+        path: The trace file to write.
+        spans: ``(name, tid, begin_ns, end_ns)`` per span, in nanoseconds of
+            Unix time.
+        threads: ``(tid, name)`` per thread that recorded spans.
+        pid: This process's id, the pid of the trace's CPU events.
+    """
+    with tempfile.TemporaryDirectory(dir=os.path.dirname(path)) as scratch:
+        raw = os.path.join(scratch, "trace.json")
+        torch_profiler.export_chrome_trace(raw)
+        with open(raw, "rb") as source:
+            head = source.read(_TRACE_HEAD_BYTES)
+            match = _TRACE_HEAD.search(head)
+            if match is None:
+                raise ValueError(
+                    "the torch trace has no baseTimeNanoseconds right before "
+                    "its traceEvents"
+                )
+            base_ns = int(match.group(1))
+            events = [
+                {
+                    "ph": "X",
+                    "cat": "host",
+                    "name": name,
+                    "pid": pid,
+                    "tid": tid,
+                    "ts": (begin_ns - base_ns) / 1000,
+                    "dur": (end_ns - begin_ns) / 1000,
+                }
+                for name, tid, begin_ns, end_ns in spans
+            ]
+            # Named as torch names the threads it saw (by the kernel's thread
+            # name); the control thread runs no torch op, so only this names
+            # its lane.
+            recorded = {tid for _, tid, _, _ in spans}
+            events += [
+                {
+                    "ph": "M",
+                    "name": "thread_name",
+                    "pid": pid,
+                    "tid": tid,
+                    "args": {"name": f"thread {tid} ({thread})"},
+                }
+                for tid, thread in threads
+                if tid in recorded
+            ]
+            # What follows the array's opening: an event, or its end.
+            rest = (head[match.end() :] + source.read(64)).lstrip()
+            with gzip.open(path, "wb") as sink:
+                sink.write(head[: match.end()])
+                sink.write(b",".join(json.dumps(event).encode() for event in events))
+                if events and not rest.startswith(b"]"):
+                    sink.write(b",")
+                sink.write(rest)
+                shutil.copyfileobj(source, sink)
+
+
 def _all_thread_profile_config():
     # The process-global flag also covers workers created before profiling.
     if not isinstance(
@@ -96,13 +182,24 @@ class Profiler:
         sync_size: Ranks that rendezvous around a trace: attention TP, or
             the world with pipeline parallelism.
         sync_group: Their CPU group (unused with one rank).
+        host_spans: The host's span recording (ts-host's ``HostSpans``),
+            which runs with a torch profile and is merged into its trace;
+            None from a host binary that has none.
     """
 
     def __init__(
-        self, *, server_args, device, attn_mapping, sync_size: int, sync_group
+        self,
+        *,
+        server_args,
+        device,
+        attn_mapping,
+        sync_size: int,
+        sync_group,
+        host_spans,
     ) -> None:
         self.server_args = server_args
         self._device = device
+        self._host_spans = host_spans
         self.forward_ct = 0
         self.attn_tp_size = sync_size
         self.attn_tp_cpu_group = sync_group
@@ -291,6 +388,8 @@ class Profiler:
                 experimental_config=experimental_config,
             )
             self.torch_profiler.start()
+            if self._host_spans is not None:
+                self._host_spans.start()
 
         if "MEM" in activities:
             torch.cuda.memory._record_memory_history(max_entries=100000)
@@ -316,6 +415,8 @@ class Profiler:
                 if self.torch_profiler is not None:
                     self.torch_profiler.stop()
                     self.torch_profiler = None
+                    if self._host_spans is not None:
+                        self._host_spans.stop()
                 if "MEM" in activities:
                     torch.cuda.memory._record_memory_history(enabled=None)
                 return ProfileReqOutput(
@@ -378,12 +479,26 @@ class Profiler:
 
         if self.torch_profiler is not None:
             self.torch_profiler.stop()
-            self.torch_profiler.export_chrome_trace(
-                os.path.join(
-                    self.profiler_output_dir,
-                    f"{self.profile_id}-{self.profile_rank_tag}{stage_suffix}.trace.json.gz",
-                )
+            trace_path = os.path.join(
+                self.profiler_output_dir,
+                f"{self.profile_id}-{self.profile_rank_tag}{stage_suffix}.trace.json.gz",
             )
+            if self._host_spans is None:
+                self.torch_profiler.export_chrome_trace(trace_path)
+            else:
+                spans, threads = self._host_spans.stop()
+                try:
+                    _export_with_host_spans(
+                        self.torch_profiler, trace_path, spans, threads, os.getpid()
+                    )
+                except Exception:
+                    # A failed merge must not fail the forward thread, which
+                    # would end serving: keep the torch trace.
+                    logger.exception(
+                        "Could not merge the host spans; exporting the torch "
+                        "trace without them"
+                    )
+                    self.torch_profiler.export_chrome_trace(trace_path)
             self._profile_sync()
 
         if self.profiler_activities is not None and "MEM" in self.profiler_activities:

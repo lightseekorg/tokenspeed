@@ -26,9 +26,9 @@ use std::{ffi::CString, sync::Once};
 
 use pyo3::{prelude::*, types::PyDict};
 use ts_scheduler::{
-    BlockTableView, CacheEvent, CacheEventKind, CacheOpKind, ForwardEvent, ForwardEventKind,
-    RequestSpec, Scheduler, StorageCancellationView, StorageDoneView, StorageOpKind, StorageRound,
-    StorageTickView, TransferBatchView,
+    profile, BlockTableView, CacheEvent, CacheEventKind, CacheOpKind, ForwardEvent,
+    ForwardEventKind, RequestSpec, Scheduler, StorageCancellationView, StorageDoneView,
+    StorageOpKind, StorageRound, StorageTickView, TransferBatchView,
 };
 
 /// Start the interpreter once per test process, with the scheduler module
@@ -304,6 +304,60 @@ result = (list(batch.request_ids), list(batch.input_lengths), list(batch.request
         ),
         (0, 0, 0, 0)
     );
+}
+
+#[test]
+fn a_recording_sees_the_schedulers_phases_inside_its_calls() {
+    interpreter();
+    let mut scheduler =
+        Python::attach(|py| Scheduler::from_python(&run(py, NEW_SCHEDULER)).unwrap());
+    scheduler
+        .submit_requests(&[spec("r1", (1..=10).collect())])
+        .unwrap();
+
+    profile::start();
+    // Other tests share the process: this thread's spans are the marker's.
+    drop(profile::span("marker"));
+    scheduler.next_execution_plan(true, false);
+    scheduler
+        .advance(&[event(ForwardEventKind::ExtendResult, "r1", vec![42])])
+        .unwrap();
+    let recording = profile::stop();
+
+    let tid = recording
+        .spans
+        .iter()
+        .find(|span| span.name == "marker")
+        .expect("the marker span")
+        .tid;
+    let spans: Vec<_> = recording
+        .spans
+        .iter()
+        .filter(|span| span.tid == tid)
+        .collect();
+    let named = |name: &str| {
+        spans
+            .iter()
+            .find(|span| span.name == name)
+            .unwrap_or_else(|| panic!("no {name} span in {spans:#?}"))
+    };
+    let plan = named("Scheduler::next_execution_plan");
+    for phase in [
+        "Scheduler::buildForwardOperations",
+        "Scheduler::matchPrefixAtAdmission",
+        "CacheCoordinator::Admit",
+        "CacheCoordinator::CollectDeadEntries",
+    ] {
+        let phase = named(phase);
+        assert!(
+            plan.begin_ns <= phase.begin_ns && phase.end_ns <= plan.end_ns,
+            "{phase:?} outside {plan:?}"
+        );
+    }
+    let advance = named("Scheduler::advance");
+    let settle = named("Scheduler::settleFinishedRequests");
+    assert!(advance.begin_ns <= settle.begin_ns && settle.end_ns <= advance.end_ns);
+    assert!(recording.threads.iter().any(|(thread, _)| *thread == tid));
 }
 
 #[test]

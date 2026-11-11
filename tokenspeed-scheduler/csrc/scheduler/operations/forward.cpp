@@ -40,6 +40,7 @@
 
 #include "cache/core/cache_types.h"
 #include "cache/tier/transfer.h"
+#include "core/profile_span.h"
 #include "fsm/forward_events.h"
 #include "fsm/forward_states.h"
 #include "scheduler/capacity_model.h"
@@ -353,6 +354,7 @@ DecodeOperation applyDecodeEvent(Request& request, fsm::ScheduleDecodeEvent even
 }  // namespace
 
 Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
+    ProfileSpan profile_span{"Scheduler::matchPrefixAtAdmission"};
     // Only a first admission probes: a readmission copies the request's own
     // image back and matches nothing.
     _assert(request->Is<fsm::Submitted>(), "the admission probe is for a Submitted request");
@@ -1496,6 +1498,7 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
     if (tier_transfers_.HasLoadBacksInFlight() || tier_transfers_.HasPinnedStoresInFlight()) {
         return;
     }
+    ProfileSpan profile_span{"Scheduler::maybeRetractForCapacity"};
 
     // Only a resident this round has dispatched no work for is offered as a
     // victim, in both tiers. One with this round's forward out cannot quiesce
@@ -1781,6 +1784,7 @@ std::vector<Request*> Scheduler::rankedReadmissions(std::span<Request* const> ca
 // a newcomer.
 bool Scheduler::scheduleReadmission(AdmissionFeedback& feedback, PlanBuild& build,
                                     std::span<Request* const> candidates) {
+    ProfileSpan profile_span{"Scheduler::scheduleReadmission"};
     bool new_prompts_sealed = false;
     std::int32_t attempts = 0;
     for (Request* readmission : rankedReadmissions(candidates)) {
@@ -2074,6 +2078,7 @@ bool Scheduler::prefillAllowed(const Request& request, const PlanBuild& build) c
 void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild& build,
                                          std::span<Request* const> candidates, bool new_prompts_sealed,
                                          std::int32_t decode_reserve) {
+    ProfileSpan profile_span{"Scheduler::scheduleLocalPrefillWork"};
     std::optional<std::vector<WholePrompt>> whole_prompts;
     for (const bool resident : {true, false}) {
         if (build.Full(config_.max_batch_size) || build.token_budget <= 0 ||
@@ -2188,6 +2193,7 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
 // role decodes consume no budget, so it never binds there.
 void Scheduler::scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& build,
                                     std::span<Request* const> candidates) {
+    ProfileSpan profile_span{"Scheduler::scheduleDecodeBatch"};
     for (Request* request : candidates) {
         if (build.Full(config_.max_batch_size) ||
             build.token_budget < build.pending_prefill_reserve + config_.decode_input_tokens) {
@@ -2385,6 +2391,7 @@ bool Scheduler::prefillDeferralExhausted(std::span<Request* const> candidates) c
 Scheduler::BuiltOperations Scheduler::buildForwardOperations(ExecutionPlan& plan, std::vector<Request*> candidates,
                                                              std::vector<WriteBackOperation>& write_back_operations,
                                                              PlanOptions options) {
+    ProfileSpan profile_span{"Scheduler::buildForwardOperations"};
     // The candidates arrive in submission order (requests_ is the FIFO),
     // identical on every rank -- so within a phase, older requests win.
     AdmissionFeedback feedback;

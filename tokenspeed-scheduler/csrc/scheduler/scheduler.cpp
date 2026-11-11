@@ -37,6 +37,7 @@
 
 #include "core/token_container.h"
 #include "cache/tier/transfer.h"
+#include "core/profile_span.h"
 #include "fsm/forward_events.h"
 #include "fsm/forward_states.h"
 #include "scheduler/capacity_model.h"
@@ -594,6 +595,7 @@ ExecutionPlan Scheduler::NextExecutionPlan(PlanOptions options) {
     });
 
     if (storage_transfers_) {
+        ProfileSpan profile_span{"Scheduler::prepareStorage"};
         for (const auto& request : requests_) prepareStorage(*request);
     }
     std::vector<Request*> candidates;

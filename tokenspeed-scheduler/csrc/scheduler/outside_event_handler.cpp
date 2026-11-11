@@ -30,6 +30,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include "core/profile_span.h"
 #include "fsm/forward_events.h"
 #include "fsm/forward_states.h"
 #include "fsm/pd_events.h"
@@ -126,6 +127,7 @@ void Scheduler::handleEvent(const forward::Finish& event) {
 }
 
 void Scheduler::settleFinishedRequests() {
+    ProfileSpan profile_span{"Scheduler::settleFinishedRequests"};
     for (const std::unique_ptr<Request>& request : requests_) {
         const auto* transferring = request->GetIf<fsm::PdTransferring>();
         if (transferring != nullptr && transferring->transfer_stopped && request->ResultsInFlight() == 0) {

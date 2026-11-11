@@ -64,7 +64,7 @@ use ts_pd::{
     RemotePrefill, TransferPeer, TransferPoll,
 };
 use ts_scheduler::{
-    CacheEvent, CacheEventKind, CacheOpKind, CacheOpView, ExecutionPlan, Scheduler,
+    profile, CacheEvent, CacheEventKind, CacheOpKind, CacheOpView, ExecutionPlan, Scheduler,
 };
 use ts_wire::{
     codec::Dict,
@@ -5331,4 +5331,75 @@ fn a_flush_under_a_keep_pause_runs_once_the_cache_work_did() {
         ]
     );
     assert!(rank.cache_ops.contains(&CacheOpKind::WriteBack));
+}
+
+#[test]
+fn a_profile_keeps_the_spans_of_rounds_that_did_something() {
+    // One rank, run on this thread: its spans carry this thread's id.
+    let setup = Setup::default();
+    let config = loop_config(1, false, &setup);
+    let (mut mesh_listeners, addresses) = mesh_listeners(1);
+    let device = fake_device(Layout::Single, 0, &setup);
+    let plans = device.plans.clone();
+    // A request in the first round; the rounds after it finishes have
+    // nothing to do, as a loop waiting on a transfer.
+    const ROUNDS: usize = 40;
+    let mut script: Script = vec![Vec::new(); ROUNDS];
+    script[0] = vec![EngineRequest::Add(Box::new(request("r", 16, budget(3))))];
+    let finished = Arc::new(Mutex::new(Vec::new()));
+    let frontend = ScriptedFrontend {
+        script: script.into(),
+        react: no_reaction,
+        reacted: Vec::new(),
+        replies: Arc::new(Mutex::new(Vec::new())),
+        finished: finished.clone(),
+        outputs: Arc::new(Mutex::new(Vec::new())),
+    };
+    let spec = RankSpec {
+        rank: 0,
+        layout: Layout::Single,
+        tiers: Tiers::DeviceOnly,
+        config,
+        setup,
+        mesh_listener: mesh_listeners.pop().unwrap(),
+        addresses,
+    };
+
+    profile::start();
+    drop(profile::span("marker"));
+    let outcome = run_rank(spec, device, None, || frontend, &AtomicBool::new(false));
+    let recording = profile::stop();
+    outcome.unwrap();
+    assert_eq!(finished.lock().unwrap().len(), 1);
+
+    // Other tests share the process: count this thread's spans only.
+    let tid = recording
+        .spans
+        .iter()
+        .find(|span| span.name == "marker")
+        .unwrap()
+        .tid;
+    let count = |name: &str| {
+        recording
+            .spans
+            .iter()
+            .filter(|span| span.tid == tid && span.name == name)
+            .count()
+    };
+    let rounds = count("EventLoop::round");
+    let forwards = plans
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, rids, _)| !rids.is_empty())
+        .count();
+    assert!(forwards > 0);
+    // Every round that dispatched or committed a forward is kept, the empty
+    // rounds are not, and a dropped round takes its phases with it.
+    assert!(
+        forwards <= rounds && rounds < ROUNDS / 2,
+        "{rounds} rounds kept"
+    );
+    assert_eq!(count("Scheduler::next_execution_plan"), rounds);
+    assert!(count("EventLoop::commit") >= forwards);
 }

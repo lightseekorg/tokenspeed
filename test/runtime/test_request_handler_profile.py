@@ -6,6 +6,7 @@ import sys
 import tempfile
 import textwrap
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -41,6 +42,7 @@ def _make_handler(attn_mapping: SimpleNamespace | None = None) -> Profiler:
         # Two peers, so _profile_sync rendezvouses (tests patch it).
         sync_size=getattr(attn_mapping, "tp_size", 2),
         sync_group=None,
+        host_spans=None,
     )
 
 
@@ -130,6 +132,90 @@ class TestCanaryChildVisibility:
         assert (
             json.loads(child.stdout)["visibility_only_child"]["visibility"] == expected
         )
+
+
+class _HostSpans:
+    """ts-host's ``HostSpans``, which only the host binary embeds: a
+    recording the test fills with spans it timed itself."""
+
+    def __init__(self) -> None:
+        self.recording = False
+        self.spans: list[tuple[str, int, int, int]] = []
+        self.threads: list[tuple[int, str]] = []
+
+    def start(self) -> None:
+        self.recording = True
+
+    def stop(self) -> tuple[list, list]:
+        self.recording = False
+        return self.spans, self.threads
+
+
+class TestHostSpans:
+    def test_host_spans_join_the_torch_trace_on_their_threads(self, tmp_path):
+        host_spans = _HostSpans()
+        handler = Profiler(
+            server_args=SimpleNamespace(enable_eplb=False),
+            device=None,
+            attn_mapping=_attn_mapping(),
+            sync_size=1,
+            sync_group=None,
+            host_spans=host_spans,
+        )
+        req = _start_req(str(tmp_path), record_shapes=False, with_stack=False)
+        req.activities = ["CPU"]
+        with mock.patch.object(torch.cuda, "is_available", return_value=False):
+            assert handler.profile(req).success
+            assert host_spans.recording
+            # A host span around a torch range on this, the "forward", thread.
+            forward = threading.get_native_id()
+            begin_ns = time.time_ns()
+            with torch.profiler.record_function("forward_canary"):
+                torch.ones(4, device="cpu").add_(2)
+            host_spans.spans.append(("Op::Execute", forward, begin_ns, time.time_ns()))
+
+            # One on a thread no torch op runs on, as the control thread.
+            def control_round() -> int:
+                begin_ns = time.time_ns()
+                time.sleep(0.002)
+                tid = threading.get_native_id()
+                host_spans.spans.append(
+                    ("EventLoop::round", tid, begin_ns, time.time_ns())
+                )
+                return tid
+
+            with ThreadPoolExecutor(max_workers=1) as worker:
+                control = worker.submit(control_round).result(timeout=10)
+            host_spans.threads += [(forward, "ts-forward"), (control, "ts-host")]
+            assert handler.stop_profile().success
+        assert not host_spans.recording
+
+        trace = tmp_path / "test-profile-TP0.trace.json.gz"
+        with gzip.open(trace, "rt") as source:
+            events = json.load(source)["traceEvents"]
+
+        def only(name: str) -> dict:
+            (event,) = [event for event in events if event.get("name") == name]
+            return event
+
+        canary, execute = only("forward_canary"), only("Op::Execute")
+        assert (execute["pid"], execute["tid"]) == (canary["pid"], forward)
+        # Both are Unix time: the span holds the range it was timed around.
+        assert execute["ts"] <= canary["ts"]
+        assert canary["ts"] + canary["dur"] <= execute["ts"] + execute["dur"]
+        round_ = only("EventLoop::round")
+        assert (round_["pid"], round_["tid"]) == (canary["pid"], control)
+        assert round_["dur"] >= 2000
+        thread_names = [
+            (event["tid"], event["args"]["name"])
+            for event in events
+            if event.get("ph") == "M"
+            and event.get("name") == "thread_name"
+            and event.get("pid") == canary["pid"]
+        ]
+        # Torch names only the threads it saw: the control thread's lane is
+        # named after the host's thread.
+        assert (control, f"thread {control} (ts-host)") in thread_names
 
 
 class TestRequestHandlerProtonProfile:
