@@ -50,7 +50,6 @@ from tokenspeed.runtime.layers.vocab_parallel_embedding import (  # noqa: E402
     ParallelLMHead,
 )
 from tokenspeed.runtime.models.dflash2 import (  # noqa: E402
-    DFlash2DecoderLayer,
     DFlash2DraftModel,
     DFlash2MonokernelDecoderLayer,
 )
@@ -66,7 +65,6 @@ from tokenspeed.runtime.models.muse_spark_dflash2_monokernel import (  # noqa: E
     OTHER_ATTENTION,
     OTHER_SHAPES,
     config_reasons,
-    enable_draft_monokernels,
     model_reasons,
     request_seq_lens,
     takes_head,

@@ -42,23 +42,13 @@ from tokenspeed_kernel.ops.communication._iris import (  # noqa: E402
     IrisGroup,
     get_or_create_context,
 )
-from tokenspeed_kernel_amd._triton import gl, gluon  # noqa: E402
-from tokenspeed_kernel_amd.ops.gfx950.monokernel import (  # noqa: E402
-    mailbox,
-    schedule,
-    trace,
-)
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import (  # noqa: E402
     draft_attn,
     draft_layer,
-    draft_mlp,
 )
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import (  # noqa: E402
     Plan,
     launch_tag,
-)
-from tokenspeed_kernel_amd.ops.gfx950.monokernel.weights import (  # noqa: E402
-    bf16_tiles,
 )
 
 WORLD, HIDDEN, OWNED, HEAD, HALF, Q_HEADS = 8, ref.HIDDEN, 1024, 128, 64, 8

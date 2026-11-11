@@ -26,7 +26,6 @@ from __future__ import annotations
 import os
 import re
 import sys
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -45,10 +44,6 @@ from tokenspeed.runtime.execution.context import ForwardContext  # noqa: E402
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode  # noqa: E402
 from tokenspeed.runtime.execution.output_layout import (  # noqa: E402
     ForwardOutputLayout,
-)
-from tokenspeed.runtime.layers.moe.weights.loaders import (  # noqa: E402
-    load_w2,
-    load_w13,
 )
 from tokenspeed.runtime.layers.paged_attention import PagedAttention  # noqa: E402
 from tokenspeed.runtime.models.muse_spark_monokernel import (  # noqa: E402

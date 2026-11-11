@@ -31,7 +31,9 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.benchmark.muse_spark_monokernel import (
+
+# OWNED is re-exported for the draft-layer bench (gluon_inputs.OWNED).
+from tokenspeed_kernel.benchmark.muse_spark_monokernel import (  # noqa: F401
     DRAFT_HEAD,
     HIDDEN,
     OWNED,
@@ -230,7 +232,6 @@ def draft_layer_inputs(prefix: int, rank: int, rows: int, device):
     v_cache[cslot, 0] = ctx_v[:prefix]
     btok = prefix + torch.arange(rows)
     slots = table[btok // _PAGE].long() * _PAGE + btok % _PAGE
-    own = slice(rank * OWNED, (rank + 1) * OWNED)
     host = dict(
         parts=parts,
         residual=residual,

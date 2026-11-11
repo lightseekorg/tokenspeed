@@ -26,12 +26,15 @@ from __future__ import annotations
 import math
 
 import torch
-from tokenspeed_kernel.benchmark.muse_spark_monokernel import (
+
+# rope_rows, rope_table and preprocessed_experts are re-exported for the stage
+# tests, which use them as ``ref.<name>``.
+from tokenspeed_kernel.benchmark.muse_spark_monokernel import (  # noqa: F401
     raw_experts,
     rope_rows,
     rope_table,
 )
-from tokenspeed_kernel.benchmark.muse_spark_monokernel_gluon import (
+from tokenspeed_kernel.benchmark.muse_spark_monokernel_gluon import (  # noqa: F401
     preprocessed_experts,
 )
 from tokenspeed_kernel.numerics.torch.attention.mha import (
