@@ -1979,7 +1979,6 @@ if platform.is_nvidia:
         trtllm_fp4_block_scale_moe,
     )
     from flashinfer.cute_dsl import is_cute_dsl_available
-    from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe
     from flashinfer.fused_moe.core import (
         _maybe_get_cached_w3_w1_permute_indices as maybe_get_cached_w3_w1_permute_indices,
     )
@@ -1987,6 +1986,9 @@ if platform.is_nvidia:
         get_w2_permute_indices_with_cache,
     )
     from flashinfer.tllm_enums import ActivationType
+    from tokenspeed_kernel.thirdparty.flashinfer.trtllm_moe import (
+        trtllm_fp4_block_scale_routed_moe as tokenspeed_trtllm_fp4_block_scale_routed_moe,
+    )
 
     def _get_device_permute_indices(
         x: torch.Tensor,
@@ -2313,7 +2315,7 @@ if platform.is_nvidia:
             topk_ids.to(torch.int32).contiguous(),
             topk_weights.to(torch.bfloat16).contiguous(),
         )
-        result = trtllm_fp4_block_scale_routed_moe(
+        result = tokenspeed_trtllm_fp4_block_scale_routed_moe(
             topk_ids=topk,
             routing_bias=None,
             hidden_states=x,
@@ -3263,9 +3265,6 @@ if platform.is_nvidia:
     from flashinfer.utils import device_support_pdl
     from tokenspeed_kernel.thirdparty.flashinfer.trtllm_moe import (
         trtllm_fp4_block_scale_moe as tokenspeed_trtllm_fp4_block_scale_moe,
-    )
-    from tokenspeed_kernel.thirdparty.flashinfer.trtllm_moe import (
-        trtllm_fp4_block_scale_routed_moe as tokenspeed_trtllm_fp4_block_scale_routed_moe,
     )
 
     def _flashinfer_trtllm_nvfp4_moe_weights(
