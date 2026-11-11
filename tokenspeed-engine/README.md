@@ -97,9 +97,45 @@ acknowledgments).
 ## Releasing Python wheels
 
 Use **Release TokenSpeed Engine** in GitHub Actions. Select `dry-run` to
-build and test wheels, or `publish` on `main` to upload them to PyPI. The
-workflow uses the version in `pyproject.toml`; merge a version bump before
-each release. An interrupted publication can be rerun to upload missing files.
+build and test wheels, or `publish` on `main` to upload them. Choose a
+`release_type` (`post` by default):
+
+| Type | Example with base version `0.1.0` | Destination |
+| --- | --- | --- |
+| `release` | `0.1.0` | `lightseekorg/whl`, then PyPI |
+| `post` | `0.1.0.post20261111` | `lightseekorg/whl` by default |
+| `rc` | `0.1.0rc20261112` | `lightseekorg/whl` only |
+
+For a `post` release, explicitly enable `publish_post_to_pypi` to also upload
+the tested wheels to PyPI after the wheel repository publication succeeds.
+This option defaults to false and is accepted only for `post`. Post versions
+on PyPI sort above their base version and participate in normal pip upgrades.
+
+For `post` and `rc`, `version_date` defaults to the current UTC date
+(`YYYYMMDD`). A `post` run checks existing engine releases in `lightseekorg/whl`
+and advances by calendar days until it finds an unused post version. If
+`0.1.0.post20261111` exists, another run can publish `0.1.0.post20261112`
+on the same day. This date is a version identifier and can be ahead of the
+actual build date. Only an explicit `rc` selection produces an rc; it uses
+the requested date without automatic advancement.
+
+Leave `version_date` empty for a stable `release`. The workflow resolves the
+version once and changes the Python package version only in the build
+checkout. The committed base version and Rust crate versions stay unchanged.
+
+Wheels are attached to
+[`lightseekorg/whl` releases](https://github.com/lightseekorg/whl/releases)
+under `tokenspeed-engine-v<VERSION>`. `post` and `rc` releases are marked
+as GitHub prereleases. Download the matching wheel and install it with
+`pip install ./<wheel>.whl`. An rc sorts below the same base version's final
+release under Python version ordering; use an exact wheel/version when
+testing it. Merge a base version bump before the next stable release.
+
+Use **Re-run failed jobs** to upload missing files from the same source
+commit. **Re-run all jobs** resolves the version again and may allocate a
+new post date; use **Re-run failed jobs** to retain the original version.
+Existing assets are never overwritten. A different commit requires
+a new post run, an unused rc date, or a new base version for a stable release.
 
 Wheels support Linux with glibc 2.28 or newer, x86_64 and aarch64, and
 CPython 3.10–3.13. They contain the Python extension, `ts-host`, and a private
@@ -117,6 +153,8 @@ Configure the `tokenspeed-engine` project's PyPI Trusted Publisher with
 owner `lightseekorg`, repository `tokenspeed`, workflow filename
 `release-tokenspeed-engine.yml`, and GitHub environment `pypi`. Publication
 uses GitHub OIDC and does not require a stored PyPI token.
+The workflow also needs `LIGHTSEEK_BOT_TOKEN` with release write access to
+`lightseekorg/whl`, authenticated as `lightseek-bot`.
 
 ## Releasing Rust crates
 

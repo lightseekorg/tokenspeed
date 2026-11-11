@@ -1,10 +1,12 @@
 """Exercise an installed wheel and its embedded Python without GPU dependencies."""
 
+import argparse
 import json
 import os
 import subprocess
 import sys
 import tempfile
+from importlib.metadata import version
 from pathlib import Path
 
 import tokenspeed_engine
@@ -36,7 +38,9 @@ def notify_launcher_of_failure():
 """
 
 
-def main() -> None:
+def main(expected_version: str) -> None:
+    installed_version = version("tokenspeed-engine")
+    assert installed_version == expected_version, installed_version
     host = tokenspeed_engine.host_binary()
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
@@ -79,4 +83,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("expected_version")
+    main(parser.parse_args().expected_version)
