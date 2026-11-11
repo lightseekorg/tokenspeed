@@ -23,7 +23,8 @@
 Serving-shaped inputs: the gate is a column view of the packed projection row,
 ``w_vc`` is the latent-contiguous view the absorbed decode weights use, and
 row counts cover a partial 16-row tile. The projection sums in its own order,
-so an output may differ from the batched GEMM's by one BF16 step.
+so an output may differ from the batched GEMM's by one BF16 step; the gate then
+multiplies that projection exactly as ``sigmoid_mul`` does.
 """
 
 from __future__ import annotations
@@ -88,13 +89,18 @@ def _assert_close(got, want):
 
 @pytest.mark.parametrize("rows", [1, 3, 8, 16, 17, 64])
 @pytest.mark.parametrize("heads", [12, 16])
-@pytest.mark.parametrize("gated", [True, False])
-def test_value_projection_matches_the_batched_gemm(rows, heads, gated):
-    attention, w_vc, gate = _inputs(rows, heads, seed=rows * heads + gated)
-    gate = gate if gated else None
-    out = torch.full((rows, heads * VALUE), 7.0, device="cuda", dtype=torch.bfloat16)
-    cute_dsl_mla_project_value(attention, w_vc, gate, out)
-    _assert_close(out, _reference(attention, w_vc, gate))
+def test_value_projection_matches_the_batched_gemm(rows, heads):
+    attention, w_vc, gate = _inputs(rows, heads, seed=rows * heads)
+    projected, gated = (
+        torch.full((rows, heads * VALUE), 7.0, device="cuda", dtype=torch.bfloat16)
+        for _ in range(2)
+    )
+    cute_dsl_mla_project_value(attention, w_vc, None, projected)
+    _assert_close(projected, _reference(attention, w_vc, None))
+    # Comparing the gated rows with the gated GEMM instead would compound a
+    # projection step with a second rounding after the gate.
+    cute_dsl_mla_project_value(attention, w_vc, gate, gated)
+    assert torch.equal(gated, sigmoid_mul(projected.clone(), gate))
 
 
 def test_the_op_selects_it_for_the_latent_contiguous_weight():
