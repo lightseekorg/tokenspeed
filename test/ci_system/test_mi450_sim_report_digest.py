@@ -31,16 +31,17 @@ import pytest
 DIGEST = Path(__file__).resolve().parent / "mi450_sim_report_digest.py"
 
 
-def _digest(tmp_path: Path, events: list[dict], pytest_status: int) -> int:
+def _digest(
+    tmp_path: Path, events: list[dict], pytest_status: int
+) -> subprocess.CompletedProcess:
     log = tmp_path / "report.jsonl"
     log.write_text("".join(json.dumps(event) + "\n" for event in events))
-    run = subprocess.run(
+    return subprocess.run(
         [sys.executable, str(DIGEST), "--pytest-status", str(pytest_status), str(log)],
         capture_output=True,
         text=True,
         check=False,
     )
-    return run.returncode
 
 
 START = {"$report_type": "SessionStart", "pytest_version": "9.2.0"}
@@ -62,4 +63,21 @@ FINISH = {"$report_type": "SessionFinish", "exitstatus": 5}
 def test_a_run_without_results_passes_only_when_pytest_passed(
     tmp_path, events, pytest_status, expected
 ):
-    assert _digest(tmp_path, events, pytest_status) == expected
+    assert _digest(tmp_path, events, pytest_status).returncode == expected
+
+
+def test_the_digest_names_why_a_passing_run_has_no_results(tmp_path):
+    """A passing run without test results either had every collected module
+    skipped or had the changed-paths selection empty it: the digest says
+    which."""
+    skipped_module = {
+        "$report_type": "CollectReport",
+        "nodeid": "test_x.py",
+        "outcome": "skipped",
+    }
+    skipped = _digest(tmp_path, [START, skipped_module, FINISH], 0)
+    assert skipped.returncode == 0
+    assert "every collected module was skipped" in skipped.stdout
+    emptied = _digest(tmp_path, [START, FINISH], 0)
+    assert emptied.returncode == 0
+    assert "selection emptied the run" in emptied.stdout
