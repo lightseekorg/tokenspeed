@@ -116,7 +116,7 @@ def first_maximum(
 @jit
 def shard_candidates_kernel(
     # Input Data Pointer(s).
-    s_ptr,  # Scratch-Pad -> [ L, Z_v • M ] of this rank's vocab blocks.
+    s_ptr,  # Scratch-Pad -> [ L, Z_v • (M + 2) ] of this rank's vocab blocks: their keys, then their maxima and exp-sums.
     z_ptr,  # Indicators -> [ B ].
     f_ptr,  # Slot Mapping -> [ B ].
     # Output Data Pointer(s).
@@ -434,7 +434,7 @@ def merged_candidates_with_drafts(
     enable_pdl: tl.constexpr,
     max_k: tl.constexpr,
 ):
-    """``merged_candidates`` from pairs with a third block (``[ranks, rows, 3 • max_k]``), and the draft probabilities it holds for the merged candidates."""
+    """``merged_candidates`` from pairs with a third block (``[ranks, rows, >= 3 • max_k]``), and the draft probabilities it holds for the merged candidates."""
 
     values, slots, ids = merged_selection(
         cand_ptr, row_id, ranks, stride_mr, stride_mb, enable_pdl, max_k

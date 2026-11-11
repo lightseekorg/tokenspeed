@@ -149,7 +149,7 @@ def whole_targets(
 @jit
 def cumulative_unpack_kernel(
     # Input Data Pointer(s).
-    s_ptr,  # Scratch-Pad -> [ L, Z_v • M ].
+    s_ptr,  # Scratch-Pad -> [ L, Z_v • (M + 2) ]: the blocks' keys, then their maxima and exp-sums.
     z_ptr,  # Indicators -> [ B ].
     f_ptr,  # Slot Mapping -> [ B ].
     q_ptr,  # Cumulative Lengths -> [ B + 1 ].

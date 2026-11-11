@@ -1021,7 +1021,7 @@ def bitpacked_reduction_kernel(
     b_ptr,  # Logit Bias -> [ B, V_t ].
     e_ptr,  # Temperature -> [ B ].
     # Output Data Pointer(s).
-    y_ptr,  # Scratch-Pad -> [ L, Z_v • M ].
+    y_ptr,  # Scratch-Pad -> [ L, Z_v • (M + 2) ]: each block's M keys.
     # Model Specific(s).
     vocab_size: tl.constexpr,  # Local Vocab Size.
     shard_offset: tl.constexpr,  # Local Shard Offset.
@@ -1218,7 +1218,7 @@ def whole_reduction_kernel(
     h_ptr,  # Noise Seeds -> [ B ].
     l_ptr,  # Noise Offsets -> [ B ].
     # Output Data Pointer(s).
-    y_ptr,  # Scratch-Pad -> [ L, Z_v • M ].
+    y_ptr,  # Scratch-Pad -> [ L, Z_v • (M + 2) ]: the blocks' keys, then each block's maximum and exp-sum on nucleus rows.
     # Model Specific(s).
     vocab_size: tl.constexpr,  # Local Vocab Size.
     shard_offset: tl.constexpr,  # Local Shard Offset.

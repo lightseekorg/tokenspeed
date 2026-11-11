@@ -169,7 +169,7 @@ def decode_update(
 @jit
 def cumulative_selection_kernel(
     # Input Data Pointer(s).
-    s_ptr,  # Scratch-Pad -> [ L, Z_v • M ].
+    s_ptr,  # Scratch-Pad -> [ L, Z_v • (M + 2) ]: the blocks' keys, then their maxima and exp-sums.
     z_ptr,  # Indicators -> [ B ].
     f_ptr,  # Slot Mapping -> [ B ].
     m_ptr,  # D2T Mapping -> [ V_d ].
