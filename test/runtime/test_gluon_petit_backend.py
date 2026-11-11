@@ -363,10 +363,27 @@ def test_petit_shared_parallelism(petit_args, attn_tp, dense_tp) -> None:
             "requested fp8 activations are unsupported",
         ),
         ({"nnodes": 2}, {}, {}, {}, True, "supports one node only"),
-        ({"world_size": 4}, {}, {}, {}, True, "world_size=ep_size=8"),
-        ({}, {"ep_size": 4}, {}, {}, True, "world_size=ep_size=8"),
+        ({"world_size": 4}, {}, {}, {}, True, "world_size=ep_size in"),
+        ({}, {"ep_size": 4}, {}, {}, True, "world_size=ep_size in"),
+        (
+            {"world_size": 2},
+            {"ep_size": 2},
+            {},
+            {"ep_size": 2},
+            True,
+            "world_size=ep_size in",
+        ),
+        (
+            {"world_size": 16},
+            {"ep_size": 16},
+            {},
+            {"ep_size": 16},
+            True,
+            "world_size=ep_size in",
+        ),
+        ({"world_size": 4}, {"ep_size": 4}, {}, {"ep_size": 4}, True, None),
         ({}, {"tp_size": 2}, {}, {}, True, "MoE tensor parallel size 1"),
-        ({}, {}, {}, {"ep_size": 4}, True, "world_size=ep_size=8"),
+        ({}, {}, {}, {"ep_size": 4}, True, "world_size=ep_size in"),
         ({}, {}, {}, {"ep_size": 1, "tp_size": 2}, True, "MoE tensor parallel size 1"),
         ({}, {}, {"enable_eplb": True}, {}, True, "trivial expert placement"),
         ({}, {}, {"ep_num_redundant_experts": 8}, {}, True, "trivial expert placement"),
@@ -451,7 +468,7 @@ def test_petit_layer_constraints(
             weights.assert_not_called()
         else:
             plan.assert_called_once()
-            assert plan.call_args.kwargs["ep_size"] == 8
+            assert plan.call_args.kwargs["ep_size"] == layer_args["ep_size"]
             assert plan.call_args.kwargs["solution"] == "gluon"
             assert plan.call_args.kwargs["a2a_backend"] == "gluon_petit"
             assert plan.call_args.kwargs["activation"] == layer_args.get(

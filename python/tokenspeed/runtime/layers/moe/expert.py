@@ -313,8 +313,18 @@ class MoELayer(torch.nn.Module):
                 raise ValueError(
                     "Gluon Petit MegaMoE requires MoE tensor parallel size 1"
                 )
-            if mapping.world_size != 8 or mapping.moe.ep_size != 8 or self.ep_size != 8:
-                raise ValueError("Gluon Petit MegaMoE requires world_size=ep_size=8")
+            ep_world_sizes = (4, 8)
+            if (
+                mapping.world_size not in ep_world_sizes
+                or mapping.moe.ep_size != mapping.world_size
+                or self.ep_size != mapping.world_size
+            ):
+                raise ValueError(
+                    "Gluon Petit MegaMoE requires world_size=ep_size in "
+                    f"{ep_world_sizes}; got world_size="
+                    f"{mapping.world_size}, moe.ep_size={mapping.moe.ep_size}, "
+                    f"layer ep_size={self.ep_size}"
+                )
             if (
                 global_server_args_dict["enable_eplb"]
                 or self.ep_num_redundant_experts

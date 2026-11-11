@@ -2782,7 +2782,7 @@ if platform.is_amd:
 
 # TokenSpeed adapter for the vendored Gluon Petit MegaMoE kernels.
 
-_WORLD_SIZE = 8
+_WORLD_SIZES = frozenset({4, 8})  # Petit's MegaMoeConfig narrows this per model.
 _MAX_TOKENS_PER_RANK = 1024
 _GPT_OSS_SWIGLU_ALPHA = 1.702
 _GPT_OSS_SWIGLU_LIMIT = 7.0
@@ -2957,12 +2957,12 @@ def _validate_layer(w: torch.nn.Module) -> _Profile:
             f"hidden_size={w.hidden_size}, intermediate_size={w.intermediate_size}"
         )
     if (
-        w.ep_size != _WORLD_SIZE
+        w.ep_size not in _WORLD_SIZES
         or w.tp_size != 1
-        or w.num_local_experts != profile.num_experts // _WORLD_SIZE
+        or w.num_local_experts != profile.num_experts // w.ep_size
     ):
         raise ValueError(
-            "Gluon Petit MegaMoE requires EP8, TP1 and contiguous expert shards"
+            "Gluon Petit MegaMoE requires EP4 or EP8, TP1 and contiguous expert shards"
         )
 
     if profile is _GPT_OSS_120B_PROFILE:
@@ -3057,14 +3057,15 @@ def _get_workspace(device: torch.device, profile: _Profile) -> _Workspace:
         raise RuntimeError(
             "Gluon Petit MegaMoE requires torch.distributed initialization"
         )
-    if dist.get_world_size() != _WORLD_SIZE:
+    world_size = dist.get_world_size()
+    if world_size not in _WORLD_SIZES:
         raise RuntimeError(
-            "Gluon Petit MegaMoE requires the default distributed world size 8"
+            "Gluon Petit MegaMoE requires the default distributed world size 4 or 8"
         )
 
     petit_kernel = _import_petit_kernel()
     config = petit_kernel.MegaMoeConfig(
-        world_size=_WORLD_SIZE,
+        world_size=world_size,
         num_experts=profile.num_experts,
         topk=profile.top_k,
         model_dim=profile.model_dim,
@@ -3079,7 +3080,7 @@ def _get_workspace(device: torch.device, profile: _Profile) -> _Workspace:
         inter_dim=profile.inter_dim,
         has_bias=profile.has_bias,
     )
-    heap = petit_kernel.create_vmm_symmetric_heap(_WORLD_SIZE)
+    heap = petit_kernel.create_vmm_symmetric_heap(world_size)
     inputs = config.input_views(heap, _MAX_TOKENS_PER_RANK)
     workspace = _Workspace(config=config, heap=heap, inputs=inputs)
     _workspace_cache[key] = workspace
@@ -3201,7 +3202,7 @@ def gluon_petit_mxfp4_megamoe_weights(plan: dict, w: torch.nn.Module) -> None:
         "supports_ep": frozenset({True}),
         "supports_all_to_all_ep": frozenset({True}),
         "a2a_backend": frozenset({"gluon_petit"}),
-        "ep_size": frozenset({_WORLD_SIZE}),
+        "ep_size": _WORLD_SIZES,
         "ispp_alignment": frozenset({1}),
         "internal_activation_dtype": frozenset({"mxfp4"}),
         "supports_bias": frozenset({True}),
