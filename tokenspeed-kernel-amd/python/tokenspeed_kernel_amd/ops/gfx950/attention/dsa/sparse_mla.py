@@ -28,7 +28,11 @@ from threading import Lock
 from typing import NamedTuple
 
 import torch
-from tokenspeed_kernel_amd._extern import extern_compile_options, release_drain
+from tokenspeed_kernel_amd._extern import (
+    extern_compile_options,
+    wait_vmem,
+    wave_inclusive_sum_i32,
+)
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.indexing import (
     _check_packed_fp8_inputs,
@@ -485,7 +489,7 @@ def _dsa_persistent_radix_topk_kernel(
         # the whole program, and s_barrier does not wait for memory. So each
         # wave first waits until its no-return atomics reach L2 (vmcnt counts
         # them like stores).
-        release_drain()
+        wait_vmem()
         gl.barrier()
 
         row_pass_arrival = pass_arrivals + row * _PERSISTENT_COUNTER_STRIDE
@@ -808,34 +812,6 @@ def _physical_slots(block_table, req, block_table_cols, logical, mask, page_size
     return page * page_size + (logical - block_idx * page_size)
 
 
-# Inclusive int32 scan over a wave's 64 lanes via DPP row shifts and row broadcasts.
-_WAVE_SCAN_ASM = gl.constexpr(
-    "s_nop 1\n"
-    "v_mov_b32 $0, $1\n"
-    "s_nop 1\n"
-    "v_add_u32_dpp $0, $0, $0 row_shr:1 row_mask:0xf bank_mask:0xf bound_ctrl:1\n"
-    "s_nop 1\n"
-    "v_add_u32_dpp $0, $0, $0 row_shr:2 row_mask:0xf bank_mask:0xf bound_ctrl:1\n"
-    "s_nop 1\n"
-    "v_add_u32_dpp $0, $0, $0 row_shr:4 row_mask:0xf bank_mask:0xf bound_ctrl:1\n"
-    "s_nop 1\n"
-    "v_add_u32_dpp $0, $0, $0 row_shr:8 row_mask:0xf bank_mask:0xf bound_ctrl:1\n"
-    "s_nop 1\n"
-    "v_add_u32_dpp $0, $0, $0 row_bcast:15 row_mask:0xa bank_mask:0xf\n"
-    "s_nop 1\n"
-    "v_add_u32_dpp $0, $0, $0 row_bcast:31 row_mask:0xc bank_mask:0xf\n"
-    "s_nop 1"
-)
-
-
-@gluon.jit
-def _wave_inclusive_scan(x):
-    # Every wave scans its own lanes; all 64 lanes must be active.
-    return gl.inline_asm_elementwise(
-        _WAVE_SCAN_ASM, "=&v,v", [x], dtype=gl.int32, is_pure=True, pack=1
-    )
-
-
 @gluon.constexpr_function
 def _wave_bins_layout(num_warps, bins_per_lane):
     # Lane i holds bins [i * bins_per_lane, ...); every wave holds a full copy.
@@ -848,7 +824,7 @@ def _select_bins_in_wave(counts, remaining):
     V: gl.constexpr = counts.shape[1]
     layout: gl.constexpr = counts.type.layout
     lane_total = gl.sum(counts, axis=1)
-    lane_below = _wave_inclusive_scan(lane_total) - lane_total
+    lane_below = wave_inclusive_sum_i32(lane_total) - lane_total
     inclusive = gl.expand_dims(lane_below, 1) + gl.cumsum(counts, 1)
     below = inclusive - counts
     selected = (below < remaining) & (inclusive >= remaining)
@@ -906,7 +882,7 @@ def _block_exclusive_ranks(x, V: gl.constexpr):
     x4 = gl.convert_layout(x.reshape([R, W, 64, V]), L4)
     x3 = gl.convert_layout(gl.permute(x4, [1, 2, 0, 3]).reshape([W, 64, R * V]), L3)
     thread_total = gl.sum(x3, axis=2)
-    lane_inclusive = _wave_inclusive_scan(thread_total)
+    lane_inclusive = wave_inclusive_sum_i32(thread_total)
     wave_total = gl.max(lane_inclusive, axis=1)
     totals = gl.convert_layout(wave_total, gl.SliceLayout(0, LWW))
     waves = gl.arange(0, W, layout=gl.SliceLayout(1, LWW))
@@ -1008,11 +984,6 @@ def _dsa_multi_cta_histogram_kernel(
     _add_histogram_to_global(
         histograms + row * (NUM_BUCKETS + 64), shared_histogram, NUM_BUCKETS
     )
-
-
-@gluon.jit
-def _wait_vector_memory():
-    gl.inline_asm("s_waitcnt vmcnt(0)", "", [], (), is_pure=False)
 
 
 @gluon.jit
@@ -1487,7 +1458,7 @@ def _dsa_multi_cta_select_kernel(
         )
     gl.store(row_counts + tile, gl.minimum(listed_count, CHUNK), cache_modifier=".wt")
     # Write-through stores: arrival needs no writeback, only every wave's stores done.
-    _wait_vector_memory()
+    wait_vmem()
     gl.barrier()
     arrived = gl.atomic_add(
         row_arrival, 1 + ((totals & 0xFFFF) << 12), sem="relaxed", scope="gpu"
@@ -3119,6 +3090,7 @@ def _dsa_multi_cta_topk(
         CHUNK=chunk,
         TIE_CAP=_MULTI_CTA_TIE_CAP,
         num_warps=_MULTI_CTA_NUM_WARPS,
+        **extern_compile_options(),
     )
     return out, lens_out
 

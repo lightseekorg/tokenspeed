@@ -279,8 +279,11 @@ class _Shared(NamedTuple):
     tokens: cute.Tensor
     tokens_addr: Int32
     gate_steps: cute.Tensor | None
+    norm: cute.Tensor | None
     token_barrier: object
     state_barrier: object
+    weight_barrier: object
+    norm_barrier: object
 
 
 class RecoverSsmVerify:
@@ -295,6 +298,7 @@ class RecoverSsmVerify:
       sums: norms, pair sums and coefficients (see ``_SumsTable``).
       tokens: BF16 rows q, k, gate as [W, K] each, then this tile's v as [W, VT].
       gate_steps: (pairwise only) each token's FP32 gate as [W, K].
+      norm: (subclasses that set ``norm_words``) FP32 output-norm sums.
     """
 
     def __init__(
@@ -335,7 +339,8 @@ class RecoverSsmVerify:
         self.token_v = 3 * window * key_dim
         self.token_elems = window * (3 * key_dim + value_tile_rows)
         self.gate_step_words = 0 if factored else window * key_dim
-        # 512 bytes cover alignment padding between regions and the two mbarriers.
+        self.norm_words = 0
+        # 512 bytes cover alignment padding between regions and the four mbarriers.
         self.smem_bytes = (
             4 * self.tile_words
             + 4 * key_dim * self.padded_columns
@@ -571,44 +576,20 @@ class RecoverSsmVerify:
                     stamp[0] = start + tidx
                     stamp[1] = generation
             cute.arch.mbarrier_wait(shared.token_barrier, 0)
-
-            # Phase 1, one thread per key; every load precedes every store.
-            if tidx < K:
-                raw_gates, raw_keys, raw_queries = self._load_key_channel(shared, tidx)
-                steps, prefix_hi, prefix_lo = self._gate_prefix(
-                    raw_gates, gate_bias, gate_scale, lower_bound
-                )
-                self._store_key_channel(
-                    shared, tidx, raw_keys, raw_queries, steps, prefix_hi, prefix_lo
-                )
-                record = key_gate + (
-                    slot * key_gate_slot_stride + head * key_gate_head_stride + tidx
-                )
-                for t in cutlass.range_constexpr(W):
-                    live = Int32((value_tile == 0) & (t < valid_tokens))
-                    position = (ring_start + t) % self.capacity
-                    entry = record + position * key_gate_position_stride
-                    _store_if(live, entry.toint(), raw_keys[t], True)
-                    _store_if(live, (entry + K).toint(), raw_gates[t], True)
-            cute.arch.barrier()
-
-            if const_expr(not self.factored):
-                self._pairwise_sums(shared, tidx, lane)
-                cute.arch.barrier()
-                self._finalize_coefficients(shared.sums, tidx)
-
-            # Phase 2: tile @ M; the barrier after it frees the tile for partials.
-            cute.arch.mbarrier_wait(shared.state_barrier, 0)
-            products = self._tile_times_columns(shared, warp, lane)
-            cute.arch.barrier()
-            self._store_partials(shared, products, warp, lane)
-            cute.arch.barrier()
-
-            if const_expr(self.factored):
-                self._factored_sums(shared, tidx)
-                cute.arch.barrier()
-                self._finalize_coefficients(shared.sums, tidx)
-                cute.arch.barrier()
+            self._project_window(
+                shared,
+                tidx,
+                warp,
+                lane,
+                gate_bias,
+                gate_scale,
+                lower_bound,
+                key_gate + (slot * key_gate_slot_stride + head * key_gate_head_stride),
+                key_gate_position_stride,
+                Int32(value_tile == 0),
+                valid_tokens,
+                ring_start,
+            )
 
             # Phase 3, one thread per value channel.
             if tidx < VT:
@@ -640,6 +621,66 @@ class RecoverSsmVerify:
                         False,
                     )
 
+    @cute.jit
+    def _project_window(
+        self,
+        shared: _Shared,
+        tidx: Int32,
+        warp: Int32,
+        lane: Int32,
+        gate_bias: Float32,
+        gate_scale: Float32,
+        lower_bound: Float32,
+        key_record,
+        key_record_position_stride: Int64,
+        records_keys: Int32,
+        valid_tokens: Int32,
+        ring_start: Int32,
+    ):
+        """Phases 1 and 2 on the token rows in shared memory.
+
+        Leaves P's partials in the tile and the coefficients in the sums table
+        for ``_solve_window``. ``key_record`` is this (slot, head)'s key and
+        raw-gate record; a CTA stores its window positions when
+        ``records_keys`` is set.
+        """
+        K = self.key_dim
+        W = self.window
+        # Phase 1, one thread per key; every load precedes every store.
+        if tidx < K:
+            raw_gates, raw_keys, raw_queries = self._load_key_channel(shared, tidx)
+            steps, prefix_hi, prefix_lo = self._gate_prefix(
+                raw_gates, gate_bias, gate_scale, lower_bound
+            )
+            self._store_key_channel(
+                shared, tidx, raw_keys, raw_queries, steps, prefix_hi, prefix_lo
+            )
+            for t in cutlass.range_constexpr(W):
+                live = Int32((records_keys != 0) & (t < valid_tokens))
+                position = (ring_start + t) % self.capacity
+                entry = key_record + (position * key_record_position_stride + tidx)
+                _store_if(live, entry.toint(), raw_keys[t], True)
+                _store_if(live, (entry + K).toint(), raw_gates[t], True)
+        cute.arch.barrier()
+
+        if const_expr(not self.factored):
+            self._pairwise_sums(shared, tidx, lane)
+            cute.arch.barrier()
+            self._finalize_coefficients(shared.sums, tidx)
+
+        # Phase 2: tile @ M; the barrier after it frees the tile for partials.
+        cute.arch.mbarrier_wait(shared.state_barrier, 0)
+        products = self._tile_times_columns(shared, warp, lane)
+        cute.arch.barrier()
+        self._store_partials(shared, products, warp, lane)
+        cute.arch.barrier()
+
+        if const_expr(self.factored):
+            self._factored_sums(shared, tidx)
+            cute.arch.barrier()
+            self._finalize_coefficients(shared.sums, tidx)
+            cute.arch.barrier()
+
     def _allocate_shared(self) -> _Shared:
         smem = cutlass.memory.SmemAllocator()
         tile = smem.allocate_tensor(
@@ -661,7 +702,12 @@ class RecoverSsmVerify:
             gate_steps = smem.allocate_tensor(
                 Float32, cute.make_layout((self.gate_step_words,)), byte_alignment=128
             )
-        barriers = smem.allocate_array(Int64, num_elems=2)
+        norm = None
+        if const_expr(self.norm_words > 0):
+            norm = smem.allocate_tensor(
+                Float32, cute.make_layout((self.norm_words,)), byte_alignment=16
+            )
+        barriers = smem.allocate_array(Int64, num_elems=4)
         return _Shared(
             tile=tile,
             tile_addr=Int32(tile.iterator.toint()),
@@ -671,8 +717,11 @@ class RecoverSsmVerify:
             tokens=tokens,
             tokens_addr=Int32(tokens.iterator.toint()),
             gate_steps=gate_steps,
+            norm=norm,
             token_barrier=barriers,
             state_barrier=barriers + 1,
+            weight_barrier=barriers + 2,
+            norm_barrier=barriers + 3,
         )
 
     @cute.jit

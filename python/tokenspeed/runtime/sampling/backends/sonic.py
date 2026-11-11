@@ -119,7 +119,8 @@ def _sanitize(sp: SamplingParams) -> tuple[float, int, float, float]:
     sanitizing here keeps every bit agreeing with what the kernel reads:
     epsilon-neutral temperature stays ``1.0`` (bit off — skips a wasted
     ``logits / t`` vocab pass), and ``top_k`` is capped at MAX_K so the ``-1``
-    "disabled" sentinel lands on the bounded top-MAX_K path (bit off). The
+    "disabled" sentinel leaves the TOP_K bit off (a whole-vocabulary row
+    unless top-p or min-p is set). The
     greedy early return also pins temperature to 1.0, so the slot's indicator
     is exactly ``GREEDY`` and the kernel skips the temperature pass. ``min_p =
     1.0`` is remapped to 0.999 because ``from_params`` tests the open interval
@@ -154,14 +155,17 @@ class SonicSamplingBackend(SamplingBackend):
 
     top_k semantics: finite ``top_k >= 128`` never reaches the backend —
     ``SamplingParams.verify()`` rejects it at request time (same limit as the
-    flashinfer fused kernel). ``top_k = -1`` (full vocab) arrives as the
-    ``_TOP_K_DISABLED`` sentinel and is realized as **bounded top-128
-    truncation**: the kernel's bit-packed reduction keeps only the top-128
-    candidates per row, so mass beyond them is dropped (negligible for the
-    peaked distributions a model emits at temperature <= 1, but significant on
-    flat ones or at high temperature). flashinfer's ``-1``
-    samples the full vocab; this is the one distribution difference the
-    backend chooses. Inherited from sonic's 16-bit packed ranking: bf16 logits'
+    flashinfer fused kernel). A row with no top-k, top-p or min-p (``top_k =
+    -1``, the ``_TOP_K_DISABLED`` sentinel) draws from its **whole
+    vocabulary**: each vocabulary block keeps its best logit plus the Gumbel
+    noise the candidates' draw adds there, so the row's best is a draw from
+    the whole softmax, past the top 128 too; a verify accepts a point-draw
+    draft at its probability over the whole vocabulary and draws a rejected
+    position from the rest of it. Rows with top-k, top-p or min-p select among
+    the top-128 candidates their reduction keeps (top-p's nucleus over the
+    candidates' mass), as do verify rows under
+    ``--enable-speculative-sampling``. Inherited from sonic's 16-bit packed
+    ranking: bf16 logits'
     candidates are compared at bf16 resolution (temperature, penalties and
     logit bias are applied in bf16, and the scaled logits are re-rounded), so
     where the fp32 backends separate near-tied tokens sonic's greedy pick is
@@ -248,10 +252,18 @@ class SonicSamplingBackend(SamplingBackend):
 
             # Vocabulary-sharded rows: this rank's candidates and every rank's.
             self._shard_ranks = self._vocab_shard_ranks(config)
+            # Candidates carry draft probabilities recorded over each rank's shard: a third block, and their merged copy.
+            self._candidate_drafts: torch.Tensor | None = None
             if self._shard_ranks is not None:
-                self._shard_pairs = torch.empty((rows, 2 * MAX_K), dtype=torch.float32)
+                width = 2 * MAX_K
+                if self.spec and config.enable_speculative_sampling:
+                    width = 3 * MAX_K
+                    self._candidate_drafts = torch.empty(
+                        (rows, MAX_K), dtype=torch.float32
+                    )
+                self._shard_pairs = torch.empty((rows * width,), dtype=torch.float32)
                 self._shard_landing = torch.empty(
-                    (self._shard_ranks * rows, 2 * MAX_K), dtype=torch.float32
+                    (self._shard_ranks * rows * width,), dtype=torch.float32
                 )
 
             # fp32 temperature, top-p, min-p and penalties, read with fp32 logits so none rounds to bf16.
@@ -317,6 +329,11 @@ class SonicSamplingBackend(SamplingBackend):
         )
 
     @override
+    def verifies_vocab_shard_draft_probs(self) -> bool:
+        # Each rank's candidates carry q over its own columns through the gather.
+        return self._shard_ranks is not None
+
+    @override
     def speculative_sampling_pools(self) -> SpeculativeSamplingPools:
         """The slot state's own rows, which the drafter samples its proposals with.
 
@@ -331,18 +348,24 @@ class SonicSamplingBackend(SamplingBackend):
             seed=self.state.seeds,
         )
 
-    def _vocab_shard(self, shard: SampledVocabShard, rows: int) -> sonic.VocabShard:
+    def _gather_pairs(
+        self, staged: torch.Tensor, tp_size: int, tp_group: tuple[int, ...]
+    ) -> torch.Tensor:
+        """Every rank's ``[rows, w]`` candidate pairs as ``[tp_size, rows, w]``, landing in this backend's buffer."""
+        rows, width = staged.shape
+        landing = self._shard_landing[: tp_size * rows * width]
+        return gather_topk_pairs(
+            staged, landing.view(tp_size * rows, width), tp_size, tp_group
+        )
+
+    def _vocab_shard(self, shard: SampledVocabShard) -> sonic.VocabShard:
         """The launch's view of ``shard``: its slice of the vocabulary and the gather of every rank's candidates."""
-        landing = self._shard_landing[: shard.tp_size * rows]
         return sonic.VocabShard(
             vocab_start=shard.vocab_start,
             logit_scale=shard.logit_scale,
             softcap=shard.softcap,
             gather=functools.partial(
-                gather_topk_pairs,
-                landing=landing,
-                tp_size=shard.tp_size,
-                tp_group=shard.tp_group,
+                self._gather_pairs, tp_size=shard.tp_size, tp_group=shard.tp_group
             ),
             pairs=self._shard_pairs,
         )
@@ -355,14 +378,17 @@ class SonicSamplingBackend(SamplingBackend):
         *,
         draft_q: DraftTreeQ | None,
         with_vocab_mask: bool,
+        draft_probs: torch.Tensor | None,
     ) -> None:
         """Launch every batch size once over dummy shard logits, as ``_warmup`` does over whole rows.
 
         Every rank runs the same launches, so their gathers pair up. Grammar
         masks change no sonic kernel (they are slot state); sonic reads the
-        dense ``draft_probs``, not the sparse ``draft_q``.
+        runtime's ``draft_probs`` (whole rows or this rank's columns), not the
+        sparse ``draft_q``.
         """
         del candidates, draft_q, with_vocab_mask
+        columns = self.vocab_size if draft_probs is None else draft_probs.shape[2]
         with torch.device(self.device):
             logits = torch.zeros(
                 (self.max_bs * self.n_max, shard.logits.shape[1]),
@@ -376,14 +402,14 @@ class SonicSamplingBackend(SamplingBackend):
             for bs in range(1, self.max_bs + 1):
                 self._fused_singular(logits[:bs], slots[:bs], offsets, shard=shard)
                 if self.spec:
-                    for draft_probs in self._warmup_draft_tables():
+                    for table in self._warmup_draft_tables(columns):
                         verified = self._fused_multistep(
                             logits[: bs * self.n_max],
                             slots[:bs],
                             offsets,
                             cand[:bs],
                             shard=shard,
-                            draft_probs=draft_probs,
+                            draft_probs=table,
                         )
                         if self._synthetic_lengths is not None:
                             self._synthetic_outputs(
@@ -394,15 +420,19 @@ class SonicSamplingBackend(SamplingBackend):
     # ------------------------------------------------------------------ #
     # JIT warm-up
     # ------------------------------------------------------------------ #
-    def _warmup_draft_tables(self) -> tuple[torch.Tensor | None, ...]:
-        """The draft-probability tables serving verifies with: none, and a one-slot table under ``enable_speculative_sampling`` (its strides are the runtime's)."""
+    def _warmup_draft_tables(
+        self, columns: int | None = None
+    ) -> tuple[torch.Tensor | None, ...]:
+        """The draft-probability tables serving verifies with: none, and a one-slot table of ``columns`` (default the vocabulary) under ``enable_speculative_sampling``, its strides the runtime's."""
 
         if not self.config.enable_speculative_sampling:
 
             return (None,)
 
         table = torch.zeros(
-            (1, self.n_max, self.vocab_size), dtype=torch.float32, device=self.device
+            (1, self.n_max, columns or self.vocab_size),
+            dtype=torch.float32,
+            device=self.device,
         )
 
         return (None, table)
@@ -680,7 +710,7 @@ class SonicSamplingBackend(SamplingBackend):
             self.scratchpad[:bs],
             config or pick(width, bs),
             enable_pdl=pdl_enabled(),
-            shard=None if shard is None else self._vocab_shard(shard, bs),
+            shard=None if shard is None else self._vocab_shard(shard),
         )
 
     def _sample_rows(
@@ -804,9 +834,10 @@ class SonicSamplingBackend(SamplingBackend):
             self.indices[: bs * n],
             config or pick(logits.shape[1], bs * n),
             enable_pdl=pdl_enabled(),
-            shard=None if shard is None else self._vocab_shard(shard, bs * n),
+            shard=None if shard is None else self._vocab_shard(shard),
             draft_probs=draft_probs,
             reject_threshold=self.config.spec_reject_draft_prob_threshold,
+            candidate_drafts=self._candidate_drafts,
         )
 
         return drafted, accepted

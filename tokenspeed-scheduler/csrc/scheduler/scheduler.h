@@ -49,6 +49,8 @@
 
 namespace tokenspeed {
 
+class StagedCacheProgress;
+
 // The first admission's prefix hit by tier, per admitted request.
 // device_hit + host_hit is the hit: host_hit is the KV the Host loads (the
 // hit less the Device's prefix -- its full pages, and its KV tail when the
@@ -88,6 +90,11 @@ struct HostCacheStats {
     // back; counted under the eviction's cause.
     std::uint64_t demoted_entries_not_written_back{0};
     CacheCoordinator::DeviceEvictionStats device_evictions;
+    // CacheCoordinator::LoneCompactions and LoneCompactionMoves: lone-request
+    // compactions (docs/design/scheduler.md §1.4) and the blocks they moved,
+    // copied or re-placed.
+    std::uint64_t lone_compactions{0};
+    std::uint64_t lone_compaction_moves{0};
     // CacheCoordinator::CheckpointResumeGaps, the gaps an admission resumed
     // a State checkpoint after, on either tier.
     std::vector<std::uint64_t> checkpoint_resume_gaps;
@@ -96,6 +103,16 @@ struct HostCacheStats {
 class Scheduler {
 public:
     explicit Scheduler(SchedulerConfig config);
+
+    // The stall diagnostic (docs/design/scheduler.md §2): consecutive plans
+    // built empty with nothing in flight before the first warning, which
+    // repeats at every doubling of the streak (so a stall that never ends
+    // still logs only a few dozen lines), and the plan at which a lone
+    // request behind such a stall is aborted on the fused role (§1.4): two
+    // doublings after the first warning, so the warning precedes the abort
+    // in every log.
+    static constexpr std::int64_t kStalledRoundsBeforeWarning{1024};
+    static constexpr std::int64_t kNoProgressAbortPlans{4096};
 
     void SubmitRequests(const std::vector<RequestSpec>& request_specs);
 
@@ -236,6 +253,7 @@ public:
     }
 
 private:
+    friend struct SchedulerTestAccess;
     bool clearCache(bool include_host);
     bool cacheIsClearable(bool include_host) const;
     struct AdmissionMatch {
@@ -284,6 +302,12 @@ private:
         std::vector<LoadBackOperation> load_backs;
         std::vector<SnapshotStoreOperation> snapshot_stores;
         std::vector<SnapshotRestoreOperation> snapshot_restores;
+        // The request this build left blocked for capacity -- the first
+        // whose admission failed for it, else the landed image the restore
+        // phase tried first (rankedReadmissions) -- while no other request
+        // holds pages, so no release can fund it: the one the no-progress
+        // abort takes (NextExecutionPlan).
+        Request* blocked_alone{nullptr};
     };
     BuiltOperations buildForwardOperations(ExecutionPlan& plan, std::vector<Request*> candidates,
                                            std::vector<WriteBackOperation>& write_back_operations, PlanOptions options);
@@ -319,7 +343,10 @@ private:
     DecodeOperation applyEventAndBuildOperation(Request* request, fsm::ScheduleDecodeEvent event);
 
     AdmissionMatch matchPrefixAtAdmission(Request* request);
-    // Records an admission's fresh pages (to zero) and copies on the plan.
+    // Records an admission's fresh pages (to zero) and copies on the plan, a
+    // copy from a block an earlier copy of the plan fills reading that copy's
+    // source. Asserts that each copy destination is written once and never
+    // zeroed in the plan.
     void recordAdmittedPages(ExecutionPlan& plan, const CacheCoordinator::AdmissionResult& result);
     // copy_in_blocks and copy_in_point as for CacheCoordinator::Admit.
     std::optional<CacheCoordinator::AdmissionResult> admit(ExecutionPlan& plan, AdmissionFeedback& feedback,
@@ -331,12 +358,15 @@ private:
                                                            std::optional<std::uint64_t> request_access_epoch,
                                                            bool evict_blocks_past_segments);
     // Admits a scheduled request's next step against its live cache progress,
-    // which the caller has advanced for the step (StagedCacheProgress). The
-    // publication of a prompt end spends the copy-in blocks the request holds.
+    // which the caller has advanced for the step (`staged`, committed by the
+    // caller on success, or by publishCompletedPagesFirst when a lone
+    // request's completed pages are published ahead of a step that still
+    // does not fit). The publication of a prompt end spends the copy-in
+    // blocks the request holds.
     std::optional<CacheCoordinator::AdmissionResult> admitWithKvEventTracking(
-        ExecutionPlan& plan, AdmissionFeedback& feedback, Request& request, std::span<const GroupDemand> demands,
-        const RequestProgress& progress, std::optional<CacheCoordinator::CopyInPoint> copy_in_point,
-        bool evict_blocks_past_segments);
+        ExecutionPlan& plan, AdmissionFeedback& feedback, Request& request, StagedCacheProgress& staged,
+        std::span<const GroupDemand> demands, const RequestProgress& progress,
+        std::optional<CacheCoordinator::CopyInPoint> copy_in_point, bool evict_blocks_past_segments);
     void registerKvEventPrefixPages(Request& request, std::span<const std::string> prefix_hashes,
                                     std::int32_t first_page);
     // The descriptors a publication mutates: its full pages from the first it
@@ -563,12 +593,14 @@ private:
                                             std::int32_t holder_max_pages) const;
     // Admits the carried prompts behind a holder that kept the head of line
     // (its operation the last pushed), each only if its first chunk completes
-    // it on the budget left; stops at the first capacity failure. Nothing it
-    // admits holds the head of line, and the holder's operation then moves
-    // behind theirs: the completing prefills run first, the incomplete one
-    // last. candidates supplies the round's FIFO order. With
-    // enable_short_prefill_first, a successful carried first admission that
-    // overtakes the oldest waiting prompt increments that prompt's bypass count.
+    // it on the budget left; stops at the first capacity failure, and admits
+    // none once the plan is a lone-request compaction's (the holder's own;
+    // last_lone_compaction_plan_). Nothing it admits holds the head of line,
+    // and the holder's operation then moves behind theirs: the completing
+    // prefills run first, the incomplete one last. candidates supplies the
+    // round's FIFO order. With enable_short_prefill_first, a successful
+    // carried first admission that overtakes the oldest waiting prompt
+    // increments that prompt's bypass count.
     void carryWholePrompts(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                            std::span<const WholePrompt> carried, std::int32_t decode_reserve);
 
@@ -612,6 +644,21 @@ private:
     // The first half of a retraction: publishes the pages the victim completed
     // since its last admission (see forward.cpp).
     void publishCompletedPrefix(Request& victim);
+    // Lone-request compaction for the admission `retry` repeats, which just
+    // failed in its last variant: gathers the request's blocks, records the
+    // moves on the plan, stamps the plan as the compaction's and retries
+    // once (see forward.cpp).
+    template <typename Retry>
+    std::optional<CacheCoordinator::AdmissionResult> compactLoneRequestAndRetry(
+        ExecutionPlan& plan, const Request& request, CacheCoordinator::PrefixProbe&& prefix,
+        std::span<const GroupDemand> demands, const RequestProgress& progress,
+        std::span<std::vector<CacheBlockRef>> copy_in_blocks,
+        std::optional<CacheCoordinator::CopyInPoint> copy_in_point, const Retry& retry);
+    // Publishes a lone request's completed pages ahead of a step that does
+    // not fit, so the next plan's compaction can move them, and commits
+    // `staged` (see forward.cpp).
+    void publishCompletedPagesFirst(ExecutionPlan& plan, Request& request, StagedCacheProgress& staged,
+                                    const RequestProgress& progress);
     // Why the host budgets cannot hold the request's image right now
     // (projected, nothing mutated), unset when they can (see forward.cpp).
     std::optional<ImageShortfall> imageShortfall(const Request& request) const;
@@ -686,6 +733,11 @@ private:
     std::int32_t max_single_request_tokens_{0};
     // Accounting only (schedulePrefillFirstChunk); no decision reads it.
     PrefixHitStats prefix_hit_stats_;
+    // The plan the last lone-request compaction ran in, or published a
+    // request's completed pages first for the next plan's: at most one per
+    // plan, whichever admission of the build asks (plan_calls_ stamps it),
+    // and never a plan the no-progress abort takes.
+    std::int64_t last_lone_compaction_plan_{-1};
 
     // Stamped onto each retraction; the readmission order lives on the
     // Retracted states themselves (rankedReadmissions).
@@ -701,7 +753,8 @@ private:
     std::int32_t prefill_deferral_rounds_left_{0};
 
     // Consecutive stalled rounds (trackStalledRounds); 0 after any round
-    // that schedules work or leaves work in flight.
+    // that schedules work, leaves work in flight or aborts a request (the
+    // no-progress abort resets it itself, its plan judged stalled before).
     std::int64_t stalled_rounds_{0};
 
     // Submission order -- the FIFO every scheduling phase walks, identical

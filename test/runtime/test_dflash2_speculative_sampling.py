@@ -370,6 +370,8 @@ def test_dspark_keeps_the_dense_q_and_the_shared_sampler():
     # DSpark samples its Markov steps from full-vocab logits through the
     # shared draft sampler; only DFLASH (DFlash2) records a sparse q instead.
     executor = ModelExecutor.__new__(ModelExecutor)
+    # No drafter keeps its draft head sharded, so q stays over whole rows.
+    executor.drafter = None
     for spec_algo, dense in (("DFLASH", False), ("DSPARK", True)):
         executor.runtime_states = RuntimeStates(
             req_pool_size=POOL,

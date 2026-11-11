@@ -1900,7 +1900,7 @@ std::optional<CacheKey> CacheCoordinator::evictCachedBlockAlone(std::uint32_t gr
         write_back_segment = nullptr;
     } else if (metadata && metadata->last_access_epoch == kSupersededAccessEpoch &&
                (reason == &DeviceEvictionStats::admission || reason == &DeviceEvictionStats::restore ||
-                reason == &DeviceEvictionStats::request_reclaim)) {
+                reason == &DeviceEvictionStats::compaction || reason == &DeviceEvictionStats::request_reclaim)) {
         reason = &DeviceEvictionStats::request_reclaim;
         write_back_segment = nullptr;
     }

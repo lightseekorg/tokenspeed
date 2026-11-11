@@ -20,10 +20,17 @@
 
 """Norm-preserving gated residual entry points."""
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import torch
 from tokenspeed_kernel.ops.residual._cute_dsl import gated_boundary as _cute_dsl
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_format_signature
+
+if TYPE_CHECKING:
+    from tokenspeed_kernel.ops.moe._cute_dsl.latent_down import MailboxPublish
 
 # A producer asks this before publishing: only the cluster boundary gathers a mailbox.
 boundary_gathers_mailbox = _cute_dsl.mailbox_boundary_supported
@@ -68,6 +75,7 @@ def post_norm_residual_pre_norm(
     enable_pdl: bool,
     branch_sentinel: int | None,
     branch_ranks: int,
+    branch_publish: MailboxPublish | None,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Fuse a decoder-layer boundary: post-norm, gated residual, then pre-norm.
 
@@ -104,6 +112,8 @@ def post_norm_residual_pre_norm(
             mailbox, or None for an ordinary branch.
         branch_ranks: Partials per mailbox row to sum; 1 for an ordinary
             branch or a mailbox read as it stands.
+        branch_publish: This rank's block for the kernel to store into the
+            mailbox before it polls, or None when the producer stored it.
 
     Returns:
         ``(new_stream, pre_fp32, pre_bf16)``: the FP32 stream after the
@@ -141,6 +151,7 @@ def post_norm_residual_pre_norm(
         enable_pdl,
         branch_sentinel,
         branch_ranks,
+        branch_publish,
     )
 
 
@@ -158,6 +169,7 @@ def post_norm_residual_pre_norm_bf16(
     enable_pdl: bool,
     branch_sentinel: int | None,
     branch_ranks: int,
+    branch_publish: MailboxPublish | None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Return the residual stream and BF16 next input, using the same selection.
 
@@ -200,6 +212,7 @@ def post_norm_residual_pre_norm_bf16(
             enable_pdl,
             branch_sentinel,
             branch_ranks,
+            branch_publish,
             return_pre_fp32=False,
         )
     else:
@@ -217,6 +230,7 @@ def post_norm_residual_pre_norm_bf16(
             enable_pdl,
             branch_sentinel,
             branch_ranks,
+            branch_publish,
         )
     return stream_out, next_input
 

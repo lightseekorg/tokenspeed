@@ -141,7 +141,7 @@ def test_gate_coefficients_feed_the_fused_residual(
     torch.testing.assert_close(alpha, alpha_ref, atol=1e-6, rtol=1e-5)
     torch.testing.assert_close(beta, beta_ref, atol=1e-6, rtol=1e-5)
     post_norm = (stream, branch, None, 1e-5, 0.0)
-    no_pre_norm = (None, 0.0, 0.0, False, None, 1)
+    no_pre_norm = (None, 0.0, 0.0, False, None, 1, None)
     fused = triton_boundary(*post_norm, alpha, beta, *no_pre_norm)[0]
     # alpha=0, beta=1 hands back the kernel's own FP32 post-norm.
     ones = (torch.zeros_like(alpha), torch.ones_like(beta))
@@ -163,6 +163,7 @@ def test_gate_coefficients_feed_the_fused_residual(
             False,
             None,
             1,
+            None,
         )
 
 
@@ -195,6 +196,7 @@ def test_boundary_can_omit_router_output_during_replay(device: str) -> None:
             False,
             None,
             1,
+            None,
         )
 
     run(True, True)
@@ -286,6 +288,7 @@ def test_portable_kernels_capture_and_replay_with_fresh_inputs(device: str) -> N
             False,
             None,
             1,
+            None,
         )
         routes = bf16_moe_routes(pre, w13, w2, topk_ids, 1, batch_invariant=False)
         combined = routed_input_scale_rmsnorm_sum(
@@ -317,15 +320,17 @@ def test_fused_boundary_keeps_the_post_norm_in_fp32(
 ) -> None:
     """A BF16 round trip of the post-norm would show as ~2^-9; FP32 stays within 2^-20 of FP64."""
     args = boundary_case(boundary, 5, device)
-    outputs = triton_boundary(*args, enable_pdl, None, 1)
+    outputs = triton_boundary(*args, enable_pdl, None, 1, None)
     for got, plain in zip(
         outputs,
-        triton_boundary(*args, False, None, 1),
+        triton_boundary(*args, False, None, 1, None),
         strict=True,
     ):
         assert (got is None and plain is None) or torch.equal(got, plain)
     new_stream, pre_fp32, pre_bf16 = outputs
-    stream_ref, pre_ref, _ = torch_post_norm_residual_pre_norm(*args, False, None, 1)
+    stream_ref, pre_ref, _ = torch_post_norm_residual_pre_norm(
+        *args, False, None, 1, None
+    )
     ulps = 2.0**-20
     torch.testing.assert_close(new_stream.double(), stream_ref, atol=1e-6, rtol=ulps)
     if pre_ref is None:
