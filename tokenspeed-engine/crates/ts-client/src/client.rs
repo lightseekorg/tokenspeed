@@ -355,6 +355,12 @@ impl Shared {
             let waiter = controls.remove(tag).expect("present above");
             if let Some(done) = waiter.done {
                 let _ = done.send(waiter.replies);
+            } else {
+                warn!(
+                    tag,
+                    replies = waiter.replies.len(),
+                    "an abandoned control operation's replies all arrived; its kind runs again"
+                );
             }
         }
     }
@@ -521,10 +527,12 @@ impl EngineClient {
                 },
             );
         }
-        // A failed send, or this call dropped while sending, forgets it.
+        // A failed send, or this call dropped while sending, forgets the
+        // request and aborts it best-effort: a dropped send may still have
+        // reached the engine.
         let unsent = Unsent {
-            shared: &self.shared,
-            rid: Some(&rid),
+            shared: self.shared.clone(),
+            rid: Some(rid.clone()),
         };
         let frames = EngineRequest::Add(Box::new(request)).to_frames();
         self.shared.send(engine, frames).await?;
@@ -575,7 +583,13 @@ impl EngineClient {
         };
         let frames = EngineRequest::Control(Box::new(request)).to_frames();
         for engine in 0..engines {
-            // Dropped mid-send, the request may have reached the engine.
+            // Dropped mid-send, the request may have reached the engine, so
+            // count it: a late reply can never leak into the next operation
+            // of this kind. A failed send does not count. Both choices
+            // encode zeromq 0.6's send behavior — a send queues the message
+            // and completes in one poll, or waits on peer capacity without
+            // queuing — which the crate does not guarantee; recheck them if
+            // zeromq changes.
             outstanding.reached = engine + 1;
             if let Err(error) = self.shared.send(engine, frames.clone()).await {
                 outstanding.reached = engine;
@@ -627,25 +641,36 @@ impl Drop for EngineClient {
 
 /// A registered request whose Add has not gone out: dropped before
 /// [`Unsent::sent`] (the send failed, or the call adding it was dropped), it
-/// forgets the request. No abort follows, as the engine may never have seen
-/// it.
-struct Unsent<'a> {
-    shared: &'a Shared,
-    rid: Option<&'a str>,
+/// forgets the request and aborts it best-effort, since a dropped send may
+/// still have reached the engine. An engine tolerates an abort for a request
+/// it never saw: an abort can already race a natural finish.
+struct Unsent {
+    shared: Arc<Shared>,
+    rid: Option<String>,
 }
 
-impl Unsent<'_> {
+impl Unsent {
     /// The Add went out: the request's stream takes over.
     fn sent(mut self) {
         self.rid = None;
     }
 }
 
-impl Drop for Unsent<'_> {
+impl Drop for Unsent {
     fn drop(&mut self) {
-        if let Some(rid) = self.rid {
-            self.shared.forget(rid);
-        }
+        let Some(rid) = self.rid.take() else {
+            return;
+        };
+        let Some(engine) = self.shared.forget(&rid) else {
+            return;
+        };
+        let shared = self.shared.clone();
+        let frames = EngineRequest::Abort(vec![rid.clone()]).to_frames();
+        self.shared.runtime.spawn(async move {
+            if let Err(error) = shared.send(engine, frames).await {
+                warn!(rid, %error, "failed to abort a dropped request");
+            }
+        });
     }
 }
 
@@ -681,6 +706,12 @@ impl Drop for Outstanding<'_> {
         if waiter.replies.len() >= waiter.expected {
             controls.remove(self.tag);
         } else {
+            warn!(
+                tag = self.tag,
+                replies = waiter.replies.len(),
+                expected = waiter.expected,
+                "a control operation was abandoned with replies still due; its kind waits"
+            );
             waiter.turn = Some(turn);
         }
     }
@@ -780,5 +811,111 @@ async fn drain_input(mut input: RouterRecvHalf) {
                 return;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ts_wire::EngineCoreReadyResponse;
+    use zeromq::{util::PeerIdentity, DealerSocket, RouterSocket, Socket, SocketOptions};
+
+    /// One engine's worth of client state over the given input socket.
+    fn shared(input: RouterSendHalf) -> Arc<Shared> {
+        Arc::new(Shared {
+            engines: vec![Engine {
+                info: EngineInfo {
+                    index: 0,
+                    ready: EngineCoreReadyResponse::default(),
+                },
+                identity: Bytes::copy_from_slice(&ts_wire::engine_identity(0)),
+                in_flight: Arc::new(AtomicUsize::new(0)),
+                load: Mutex::new(EngineLoad::default()),
+            }],
+            first_engine_index: 0,
+            routing: Routing::Aggregated(LoadBalance::RoundRobin),
+            send_timeout: Duration::from_secs(5),
+            input,
+            requests: Mutex::new(HashMap::new()),
+            controls: Mutex::new(HashMap::new()),
+            control_turns: Mutex::new(HashMap::new()),
+            closed: Mutex::new(None),
+            round_robin: AtomicUsize::new(0),
+            runtime: Handle::current(),
+        })
+    }
+
+    /// Register `rid` on engine 0 the way `generate()` does.
+    fn register(shared: &Shared, rid: &str) {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let in_flight = InFlight::new(&shared.engines[0].in_flight);
+        lock(&shared.requests).insert(
+            rid.to_owned(),
+            Pending {
+                engine: 0,
+                tx,
+                _in_flight: in_flight,
+            },
+        );
+    }
+
+    /// An [`Unsent`] guard dropped before [`Unsent::sent`] forgets the
+    /// request and aborts it on its engine; one whose Add went out leaves
+    /// the request alone.
+    #[tokio::test]
+    async fn an_unsent_request_is_forgotten_and_aborted() {
+        let path = std::env::temp_dir().join(format!(
+            "ts-client-unsent-{}.sock",
+            std::process::id()
+        ));
+        let address = format!("ipc://{}", path.display());
+        let mut socket = RouterSocket::new();
+        socket.bind(&address).await.unwrap();
+        let (input, mut input_recv) = socket.split();
+        let shared = shared(input);
+        let mut options = SocketOptions::default();
+        options.peer_identity(PeerIdentity::try_from(0u16.to_le_bytes().to_vec()).unwrap());
+        let mut engine = DealerSocket::with_options(options);
+        engine.connect(&address).await.unwrap();
+        // Announce the engine, so the router learns its identity before the
+        // abort must route to it.
+        engine.send(ZmqMessage::from(Bytes::from_static(b"ready"))).await.unwrap();
+        timeout(Duration::from_secs(5), input_recv.recv())
+            .await
+            .expect("the engine announces itself in time")
+            .unwrap();
+
+        register(&shared, "r1");
+        assert_eq!(shared.engines[0].in_flight.load(Ordering::Relaxed), 1);
+        drop(Unsent {
+            shared: shared.clone(),
+            rid: Some("r1".to_owned()),
+        });
+        assert_eq!(shared.engines[0].in_flight.load(Ordering::Relaxed), 0);
+        assert!(!lock(&shared.requests).contains_key("r1"));
+        let frames = timeout(Duration::from_secs(5), engine.recv())
+            .await
+            .expect("abort in time")
+            .unwrap()
+            .into_vec();
+        assert_eq!(
+            EngineRequest::from_frames(&frames).unwrap(),
+            EngineRequest::Abort(vec!["r1".to_owned()])
+        );
+
+        // Once the Add went out, the request's stream takes over.
+        register(&shared, "r2");
+        Unsent {
+            shared: shared.clone(),
+            rid: Some("r2".to_owned()),
+        }
+        .sent();
+        assert_eq!(shared.engines[0].in_flight.load(Ordering::Relaxed), 1);
+        assert!(lock(&shared.requests).contains_key("r2"));
+        let stray = timeout(Duration::from_millis(200), engine.recv());
+        assert!(
+            stray.await.is_err(),
+            "a request whose Add went out was aborted"
+        );
     }
 }
