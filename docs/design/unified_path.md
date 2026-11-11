@@ -829,11 +829,13 @@ static buffers (the target's hidden rows with a zero tail, the gather rows,
 the frontier), and its outputs land in static buffers the decode steps read.
 The draft prologue writes K/V inside a captured segment, which holds no
 per-layer Host-load wait, so a step-0 replay first waits for the draft pool's
-whole Host load, as the target's replay does. These captures run each segment
-as soon as it is captured (`run_segments_while_capturing`): their breaks index
-with values a segment computes (the top-k rows the narrowing gathers, the
-decode steps' positions), which a capture alone leaves unwritten when the
-break runs.
+whole Host load, as the target's replay does on a pool that does not declare
+`layer_accesses_wait_for_load`, and skips the per-layer waits its capture
+noted; the decode-step replays, behind step 0, skip theirs too. These captures
+run each segment as soon as it is captured (`run_segments_while_capturing`):
+their breaks index with values a segment computes (the top-k rows the
+narrowing gathers, the decode steps' positions), which a capture alone leaves
+unwritten when the break runs.
 
 A round replays only what the graphs baked: a pure extend (MIXED rounds run
 eager), no attention DP or query shard, a fitting bucket at the exact request
@@ -1016,7 +1018,11 @@ cache contract, so the target allocates its write-location buffer
 unconditionally and drafts are gated structurally on `is_draft`.)
 
 K3 DSpark pipeline prefill distributes target-tap projection across stages,
-while the final stage owns the proposal network and draft cache. After
+while the final stage owns the proposal network and draft cache. Within a
+stage each attention-TP rank projects only its own `context_proj` output
+columns, so the partial sum crosses the stage boundary per rank at
+`hidden / attention TP` columns, and the final stage gathers the columns
+before the context norm. After
 target prefill sampling, that stage runs the ordinary drafter; its completed
 call publishes the final cache producer barrier. PD transfers the sampled
 anchor and real draft candidates with the target and draft caches. Decode
@@ -1068,8 +1074,9 @@ graph records. `SamplingBatchInfo.is_all_greedy` and the eager-only argmax
 branches were deleted. Equivalence (top_k=1 == argmax, ties excepted) is
 pinned by `test/runtime/sampling/test_greedy_route_equivalence.py` (for
 `sonic`, whose kernels rank candidates at bf16 resolution -- a penalized
-greedy pick lies within one bf16 ulp of the maximum -- and realize `top_k=-1`
-as bounded top-128 truncation, by `test_sonic_backend.py`).
+greedy pick lies within one bf16 ulp of the maximum -- and draw a request
+without top-k, top-p or min-p from its whole vocabulary, by
+`test_sonic_backend.py`).
 
 Admission uses the selected sampling backend's finite top-k bound. GPU
 backends retain the exclusive 128 bound. `ascend_full` accepts positive

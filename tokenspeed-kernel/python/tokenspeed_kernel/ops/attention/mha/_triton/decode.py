@@ -25,6 +25,23 @@ from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import current_platform
 
 _MIN_BLOCK_KV = 32
+# Split the keys until the stage-1 grid has about this many programs per
+# compute unit; a small batch otherwise leaves most of the GPU idle while each
+# program walks its whole cache.
+_PROGRAMS_PER_CU = 4
+
+
+def _num_kv_splits(q: torch.Tensor, num_kv_heads: int, max_kv_splits: int) -> int:
+    """Key splits per query: the batch shape alone decides, so one captured
+    graph keeps one split count. The splits are a runtime tensor, so a new
+    count reuses the compiled kernels."""
+    group = q.shape[1] // num_kv_heads
+    # Stage-1 programs per query: one per head, or per block of up to 16
+    # grouped heads.
+    heads = q.shape[1] if group == 1 else num_kv_heads * triton.cdiv(group, 16)
+    programs = q.shape[0] * heads
+    target = _PROGRAMS_PER_CU * current_platform().sm_count
+    return max(1, min(max_kv_splits, triton.cdiv(target, programs)))
 
 
 @triton.jit
@@ -608,9 +625,11 @@ def _fwd_kernel_stage2(
         cur_sink = tl.load(sink_ptr + cur_head)
         e_sum += tl.exp(cur_sink - e_max)
 
+    # A query with no keys in reach (an empty cache) has nothing to attend:
+    # a zero output rather than 0 / 0.
     tl.store(
         O + cur_q * stride_obs + cur_head * stride_oh + offs_d,
-        acc / e_sum,
+        tl.where(e_sum > 0.0, acc / e_sum, 0.0),
         mask=mask_d,
     )
 
@@ -1306,8 +1325,11 @@ def _triton_mha_decode_with_kvcache_impl(
         dtype=torch.float32,
         device=q.device,
     )
-    num_kv_splits = torch.ones(
-        (cache_seqlens.shape[0],), dtype=torch.int32, device=q.device
+    num_kv_splits = torch.full(
+        (cache_seqlens.shape[0],),
+        _num_kv_splits(q, k_cache.shape[2], max_kv_splits),
+        dtype=torch.int32,
+        device=q.device,
     )
     decode_attention_fwd(
         q,

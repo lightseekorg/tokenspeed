@@ -77,7 +77,11 @@ Lanes that carry per-row tables (`TreeCascadeRows.row_page_table`) let a
 sliding-window draft layer see in every lane row the window frozen at the
 round's prefix end: each row decodes the prefix alone (`q_len = 1` at the
 prefix's last key) and the window kernel attends the tree window only
-(`causal_prefix=False`).
+(`causal_prefix=False`). In the `mha` leaf every lane of a request decodes the
+same keys, so its prefix half folds the `K` lanes into the query heads (lane
+`r`'s head `h` is head `h * K + r`, a grouped query of KV head `h`) and runs
+the same folded Triton decode with `q_len = 1`: the keys are read once per
+request instead of `K` times.
 
 An FP8 KV cache (E4M3, unscaled like every FP8 KV cache here) changes no
 structure: trtllm-gen takes the query cast to FP8 as it does for any decode,
