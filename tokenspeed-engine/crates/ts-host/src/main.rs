@@ -305,13 +305,13 @@ fn reasoning_grammar(reasoning: &Bound<'_, PyAny>) -> PyResult<Option<ReasoningG
     if reasoning.is_none() {
         return Ok(None);
     }
-    Ok(Some(ReasoningGrammar {
-        continues: reasoning.getattr("continues")?.extract()?,
-        may_open: reasoning.getattr("may_open")?.extract()?,
-        schema_slot: reasoning.getattr("schema_slot")?.extract()?,
-        markers: reasoning.getattr("markers")?.extract()?,
-        implicit_closer: reasoning.getattr("implicit_closer")?.extract()?,
-    }))
+    Ok(Some(ReasoningGrammar::new(
+        reasoning.getattr("continues")?.extract()?,
+        reasoning.getattr("may_open")?.extract()?,
+        reasoning.getattr("schema_slot")?.extract()?,
+        reasoning.getattr("markers")?.extract()?,
+        reasoning.getattr("implicit_closer")?.extract()?,
+    )))
 }
 
 /// Which metrics this rank exports, and where (`rust_host.HostConfig`'s

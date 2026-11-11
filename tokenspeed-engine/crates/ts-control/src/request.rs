@@ -618,13 +618,13 @@ mod tests {
     }
 
     fn reasoning(markers: Option<(i32, i32)>, implicit_closer: Option<i32>) -> ReasoningGrammar {
-        ReasoningGrammar {
-            continues: String::new(),
-            may_open: String::new(),
-            schema_slot: String::new(),
+        ReasoningGrammar::new(
+            String::new(),
+            String::new(),
+            String::new(),
             markers,
             implicit_closer,
-        }
+        )
     }
 
     #[test]
