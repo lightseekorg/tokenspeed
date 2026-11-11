@@ -156,13 +156,9 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
         /*allow_state_checkpoint=*/coordinator_.CheckpointGranularity() == 1 ||
             (config_.role != Role::kD && num_computed_tokens <= request.PrefillSize()),
         /*preserve_source_blocks=*/false);
-    std::vector<std::string> store_hashes = progress.prefix_hashes;
     if (completed.completed_pages) {
         registerKvEventPublication(request, progress.prefix_hashes, *completed.completed_pages);
         coordinator_.CacheCompletedBlocks(request.BlockTablesRef(), completed, progress.access_epoch);
-        if (completed.completed_pages->tail) {
-            store_hashes.push_back(completed.completed_pages->tail->hash);
-        }
     }
     // The end state this finish publishes supersedes the checkpoint the turn
     // resumed from (MarkSupersededStateInput). A finish that publishes no end
@@ -193,6 +189,10 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
     // Every published entry of the request streams: its pages, its tail and
     // the state checkpoint published with the frontier; a demoted entry
     // under its pages is not stored.
+    std::vector<std::string> store_hashes = progress.prefix_hashes;
+    if (completed.completed_pages && completed.completed_pages->tail) {
+        store_hashes.push_back(completed.completed_pages->tail->hash);
+    }
     coordinator_.QueueCachedBlocksForStore(store_hashes);
     // The request's pages are released right after this (ReleaseEvent); the
     // pinned ticket keeps them cached and unevictable until the copy ACKs.
