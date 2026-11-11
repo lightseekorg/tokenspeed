@@ -544,6 +544,37 @@ public:
         return key;
     }
 
+    // Moves the entry at `from` onto `to`, a block of the same tier the caller
+    // acquired for a copy of the entry's block: a lone request's compaction
+    // (CacheCoordinator::CompactLoneRequest), which keeps the bucket. The
+    // entry keeps its key, epochs, logical block index, boundary kind,
+    // session, acquisition and demotion marks, pairing and its hold on the
+    // boundary-tree node -- nothing a hash, KV event or checkpoint depends on
+    // changes -- and only its block, location and place in the orders
+    // follow. It is pinned while the caller's reference to `to` lives; the
+    // old block is the caller's to release.
+    void Relocate(const BlockPool& pool, CacheBlockLocation from, const CacheBlockRef& to) {
+        _assert(to && to.IsOwnedBy(pool), "the destination block must belong to the entry's pool");
+        _assert(pool.BoundGroup(to->Location().lcm_block_id) == group_id_,
+                "the destination block must belong to the prefix index group");
+        CacheEntries* cache_index = findCacheEntries(pool);
+        _assert(cache_index != nullptr, "a moved block is indexed on its tier");
+        CacheEntryIterator entry_it = findEntry(*cache_index, from);
+        _assert(entry_it != cache_index->entries.end(), "a moved block is indexed at its location");
+        _assert(findEntry(*cache_index, to->Location()) == cache_index->entries.end(),
+                "an entry moves onto an unindexed location");
+        const EvictionOrder before = evictionOrder(*entry_it);
+        // The pin watch, if any, follows the block (restored below).
+        entry_it->unique_observer.Reset();
+        cache_index->by_location.erase(from);
+        entry_it->block_ref = to;
+        cache_index->by_location.emplace(to->Location(), entry_it);
+        reorderEntry(*cache_index, entry_it, before);
+        if (entry_it->pinned_order) {
+            entry_it->unique_observer.Observe(entry_it->block_ref, restoreAvailable, &*entry_it);
+        }
+    }
+
     // True when every occupied child of the LCM parent is an unpinned entry of
     // this index, i.e. evicting the parent loses only reusable cache.
     bool ParentIsFullyEvictable(const BlockPool& pool, std::int32_t lcm_block_id,
@@ -727,11 +758,12 @@ private:
             .slot_index = location.slot_index,
         };
     }
-    // The only writer of last_access_epoch: an entry's location never moves, so
-    // re-keying costs O(log N) per changed epoch, including on prefix hits, in
-    // exchange for admission's ordered traversal and early exit. Continued
-    // requests can republish under an older epoch, so moving entries to the
-    // back of an LRU list would not preserve this order.
+    // The only writer of last_access_epoch: an entry's location changes only
+    // in Relocate, re-keyed the same way, so re-keying costs O(log N) per
+    // changed epoch, including on prefix hits, in exchange for admission's
+    // ordered traversal and early exit. Continued requests can republish
+    // under an older epoch, so moving entries to the back of an LRU list
+    // would not preserve this order.
     void touchEntry(CacheEntries& cache_index, CacheEntryIterator entry_it, std::uint64_t access_epoch) {
         entry_it->max_access_epoch = std::max(entry_it->max_access_epoch, access_epoch);
         // A touch ends a demotion; markDemoted marks the entry after its own.
@@ -740,11 +772,18 @@ private:
         if (entry_it->last_access_epoch == access_epoch) {
             return;
         }
-        auto available_node = cache_index.available_order.extract(evictionOrder(*entry_it));
-        auto common_node = cache_index.common_source && entry_it->common_peer != nullptr
-                               ? cache_index.common_order.extract(evictionOrder(*entry_it))
-                               : EvictionOrderMap::node_type{};
+        const EvictionOrder before = evictionOrder(*entry_it);
         entry_it->last_access_epoch = access_epoch;
+        reorderEntry(cache_index, entry_it, before);
+    }
+    // Re-keys the entry's order nodes from `before`, its order key until
+    // now, to its current one: in available_order or, while pinned, in the
+    // node kept aside, and in common_order when this tier keeps it.
+    void reorderEntry(CacheEntries& cache_index, CacheEntryIterator entry_it, const EvictionOrder& before) {
+        auto available_node = cache_index.available_order.extract(before);
+        auto common_node = cache_index.common_source && entry_it->common_peer != nullptr
+                               ? cache_index.common_order.extract(before)
+                               : EvictionOrderMap::node_type{};
         if (common_node) {
             common_node.key() = evictionOrder(*entry_it);
             cache_index.common_order.insert(std::move(common_node));
