@@ -33,6 +33,7 @@ if TYPE_CHECKING:
 __all__ = [
     "quantize_fp8",
     "output_fp8_quant_pack",
+    "supports_output_fp8_quant_pack",
     "quantize_fp8_with_gate",
     "quantize_fp8_with_scale",
     "rmsnorm_quantize_fp8",
@@ -904,6 +905,51 @@ from tokenspeed_kernel.ops.quantization.triton import (  # noqa: E402
 )
 
 
+def _output_fp8_quant_pack_input_error(
+    x: torch.Tensor, z: torch.Tensor, weight: torch.Tensor | None, head_dim: int
+) -> str | None:
+    if (
+        x.ndim != 2
+        or x.dtype != torch.bfloat16
+        or not x.is_cuda
+        or x.stride(-1) != 1
+        or head_dim < 128
+        or head_dim & (head_dim - 1)
+        or x.shape[1] % head_dim
+        or x.shape[1] % 128
+    ):
+        return "requires BF16 [M,K], K%128=0, and aligned power-of-two heads"
+    expected = (
+        x.shape if z.ndim == 2 else (x.shape[0], x.shape[1] // head_dim, head_dim)
+    )
+    if (
+        z.shape != expected
+        or z.dtype != x.dtype
+        or z.device != x.device
+        or z.stride(-1) != 1
+    ):
+        return "gate must match the activation with unit inner stride"
+    if weight is not None and (
+        weight.shape != (head_dim,)
+        or weight.dtype != x.dtype
+        or weight.device != x.device
+        or not weight.is_contiguous()
+    ):
+        return "norm weight must be contiguous BF16 [head_dim] on the input device"
+    return None
+
+
+def supports_output_fp8_quant_pack(
+    x: torch.Tensor,
+    z: torch.Tensor,
+    weight: torch.Tensor | None,
+    *,
+    head_dim: int,
+) -> bool:
+    """Check the tensor requirements of output_fp8_quant_pack."""
+    return _output_fp8_quant_pack_input_error(x, z, weight, head_dim) is None
+
+
 def output_fp8_quant_pack(
     x: torch.Tensor,
     z: torch.Tensor,
@@ -930,36 +976,9 @@ def output_fp8_quant_pack(
         scales with strides [1,round_up(M,4)]. Padding is zero. The norm/gate
         result rounds to BF16 before quantization, matching separate launches.
     """
-    if (
-        x.ndim != 2
-        or x.dtype != torch.bfloat16
-        or not x.is_cuda
-        or x.stride(-1) != 1
-        or head_dim < 128
-        or head_dim & (head_dim - 1)
-        or x.shape[1] % head_dim
-        or x.shape[1] % 128
-    ):
-        raise ValueError("requires BF16 [M,K], K%128=0, and aligned power-of-two heads")
-    expected = (
-        x.shape if z.ndim == 2 else (x.shape[0], x.shape[1] // head_dim, head_dim)
-    )
-    if (
-        z.shape != expected
-        or z.dtype != x.dtype
-        or z.device != x.device
-        or z.stride(-1) != 1
-    ):
-        raise ValueError("gate must match the activation with unit inner stride")
-    if weight is not None and (
-        weight.shape != (head_dim,)
-        or weight.dtype != x.dtype
-        or weight.device != x.device
-        or not weight.is_contiguous()
-    ):
-        raise ValueError(
-            "norm weight must be contiguous BF16 [head_dim] on the input device"
-        )
+    error = _output_fp8_quant_pack_input_error(x, z, weight, head_dim)
+    if error is not None:
+        raise ValueError(error)
     if weight is None and not sigmoid_gate:
         raise ValueError("the unnormalized output gate must be sigmoid")
     kernel = select_kernel(

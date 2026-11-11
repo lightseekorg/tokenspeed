@@ -83,9 +83,8 @@ its request partition is invalidated before another PD owner uses it.
 
 ### Qwen FP8 attention projections
 
-Online conversion uses floating target projection weights from an unquantized
-checkpoint or an NVFP4 checkpoint that excludes those projections. Existing FP8
-configs are reused, including serialized FP8 configs. MTP draft
+Online conversion applies to floating target projection weights. It preserves
+existing FP8 configs and per-projection formats in mixed checkpoints. MTP draft
 projections follow the checkpoint.
 
 Group128 quantizes floating weights once after loading with 128×128 block
@@ -119,7 +118,9 @@ checkpoint config.
 With packed DeepGEMM scales, eligible BF16 output projections fuse activation
 quantization with the full-attention sigmoid gate or GDN per-head RMSNorm and
 SiLU/sigmoid gate. This path preserves the BF16 rounding boundary and supports
-group128, CUDA Graph and PDL.
+group128, CUDA Graph and PDL. Fusion requires a power-of-two head width of at
+least 128 and BF16 norm weights for GDN. Other supported projection layouts
+apply the gate or norm before a separate quantization launch.
 
 ## Numerics
 

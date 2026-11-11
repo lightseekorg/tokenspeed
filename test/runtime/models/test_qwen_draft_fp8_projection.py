@@ -52,7 +52,9 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("enabled", [False, True])
-@pytest.mark.parametrize("checkpoint", ["bf16", "nvfp4", "fp8", "mixed"])
+@pytest.mark.parametrize(
+    "checkpoint", ["bf16", "nvfp4", "fp8", "mixed", "mixed_qkv", "mixed_o"]
+)
 @pytest.mark.parametrize(
     "config_cls,layer_cls,draft",
     [
@@ -78,21 +80,30 @@ def test_draft_keeps_checkpoint_projections(
         num_experts=None,
     )
     config.dtype = torch.bfloat16
-    mixed = ModelOptMixedConfig(
-        quantized_layers={
-            f"{root}.mlp.{leaf}": "FP8"
-            for root in ("model.layers.0", "mtp.layers.0")
-            for leaf in ("gate_proj", "up_proj", "down_proj")
-        }
-    )
-    quant = {
-        "mixed": mixed,
-        "bf16": None,
-        "nvfp4": Nvfp4Config(exclude_modules=["*"]),
-        "fp8": Fp8Config(
-            is_checkpoint_fp8_serialized=True, weight_block_size=[128, 128]
-        ),
-    }[checkpoint]
+    root = "mtp.layers.0" if draft else "model.layers.0"
+    prefix = f"{root}.self_attn"
+    serialized = {
+        "mixed_qkv": ("q_proj", "k_proj", "v_proj"),
+        "mixed_o": ("o_proj",),
+    }.get(checkpoint, ())
+    if checkpoint.startswith("mixed"):
+        quant = ModelOptMixedConfig(
+            quantized_layers={
+                **{
+                    f"{root}.mlp.{leaf}": "FP8"
+                    for leaf in ("gate_proj", "up_proj", "down_proj")
+                },
+                **{f"{prefix}.{leaf}": "FP8" for leaf in serialized},
+            }
+        )
+    else:
+        quant = {
+            "bf16": None,
+            "nvfp4": Nvfp4Config(exclude_modules=["*"]),
+            "fp8": Fp8Config(
+                is_checkpoint_fp8_serialized=True, weight_block_size=[128, 128]
+            ),
+        }[checkpoint]
     old_dtype = torch.get_default_dtype()
     torch.set_default_dtype(torch.bfloat16)
     try:
@@ -103,22 +114,29 @@ def test_draft_keeps_checkpoint_projections(
                 0,
                 quant_config=quant,
                 enable_fp8_attn_proj=enabled and not draft,
-                prefix=(
-                    "mtp.layers.0.self_attn" if draft else "model.layers.0.self_attn"
-                ),
+                prefix=prefix,
             )
-        expected = (
-            Fp8LinearMethod
-            if checkpoint == "fp8" or (enabled and not draft)
-            else UnquantizedLinearMethod
-        )
-        assert isinstance(layer.qkv_proj.quant_method, expected)
-        assert isinstance(layer.o_proj.quant_method, expected)
-        if checkpoint == "mixed":
+        for projection, is_serialized in (
+            (layer.qkv_proj, checkpoint in ("fp8", "mixed_qkv")),
+            (layer.o_proj, checkpoint in ("fp8", "mixed_o")),
+        ):
+            if is_serialized:
+                assert projection.weight.dtype == torch.float8_e4m3fn
+                assert isinstance(projection.quant_method, Fp8LinearMethod)
+                if checkpoint.startswith("mixed"):
+                    assert projection.weight_scale.dtype == torch.float32
+                    assert projection.input_scale.dtype == torch.float32
+            elif enabled and not draft:
+                assert projection.weight.dtype == torch.bfloat16
+                assert isinstance(projection.quant_method, Fp8LinearMethod)
+                assert (
+                    not projection.quant_method.quant_config.is_checkpoint_fp8_serialized
+                )
+            else:
+                assert projection.weight.dtype == torch.bfloat16
+                assert isinstance(projection.quant_method, UnquantizedLinearMethod)
+        if checkpoint.startswith("mixed"):
             assert isinstance(layer.mlp.gate_up_proj.quant_method, Fp8LinearMethod)
-        if expected is UnquantizedLinearMethod:
-            assert layer.qkv_proj.weight.dtype == torch.bfloat16
-            assert layer.o_proj.weight.dtype == torch.bfloat16
     finally:
         torch.set_default_dtype(old_dtype)
 

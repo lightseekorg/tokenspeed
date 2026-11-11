@@ -406,7 +406,9 @@ class Qwen4ExpAttentionDecoderLayer(
             ctx,
             topk_indices=selected_slots,
         )
-        return self._project_output(attention_output, gate, fuse_output_quant)
+        return self._project_output(
+            attention_output, gate if fuse_output_quant else None
+        )
 
     def forward(
         self,
@@ -655,7 +657,7 @@ def load_qwen4_exp_weights(
         ("mix_inject_proj", "input_mix_weight_down", "mix"),
         ("mix_inject_proj", "block_inject_weight", "inject"),
     ]
-    stacked += _gdn_in_proj_stacked_mapping(params)
+    stacked += _gdn_in_proj_stacked_mapping()
     num_experts = getattr(config, "num_experts", None)
     moe_loader = None
     if num_experts is not None:
