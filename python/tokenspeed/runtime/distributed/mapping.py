@@ -711,6 +711,45 @@ class Mapping(MappingBase):
         self.vision.rank = rank
         self.linear_attn.rank = rank
 
+    def replicated_for_draft(self) -> "Mapping":
+        """This layout with a replicated dense group, every other axis unchanged.
+
+        A heterogeneous block draft (a DFlash stack, not an MTP depth) joins none
+        of the target's dense parallelism: its MLP holds whole weights and
+        reduces nothing. That matters beyond the duplicated bytes. Only the
+        attention-DP rank holding a request runs the draft; the other ranks'
+        idle forward skips it on purpose (``ModelExecutor.execute_idle_forward``),
+        so a collective inside the draft that one rank of a group enters and the
+        rest skip never completes.
+
+        The ATTENTION width is left alone: a block drafter writes K/V at the
+        target's cache locations and its cache cell is sized from the attention
+        TP width (``MhaSpec.cache_cell_size``), so its projections must keep
+        producing exactly the heads its cache rows hold.
+        """
+        stage_world_size = self.world_size // self.pp_size
+        return Mapping(
+            rank=self._rank,
+            world_size=self.world_size,
+            attn_tp_size=self.attn.tp_size,
+            attn_dp_size=self.attn.dp_size,
+            attn_kvp_size=self.attn.kvp_size,
+            attn_head_tp_size=self.attn.head_tp_size,
+            lm_head_tp_size=self.lm_head.tp_size,
+            attn_qcp_size=self.attn.qcp_size,
+            dense_tp_size=1,
+            dense_dp_size=stage_world_size,
+            moe_tp_size=self.moe.tp_size,
+            moe_ep_size=self.moe.ep_size,
+            moe_dp_size=self.moe.dp_size,
+            pp_size=self.pp_size,
+            pp_layer_partition=self.pp_layer_partition,
+            nprocs_per_node=self.nprocs_per_node,
+            nnodes=self.nnodes,
+            base_gpu_id=self.base_gpu_id,
+            gpu_id_step=self.gpu_id_step,
+        )
+
     @cached_property
     def has_pp(self) -> bool:
         return self.pp_size > 1

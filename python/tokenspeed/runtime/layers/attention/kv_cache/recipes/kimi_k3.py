@@ -326,21 +326,33 @@ class KimiK3Recipe(CacheRecipe):
 
     @override
     def check_layout(self, layout: CacheLayout) -> None:
-        """One plane per MLA layer, one per draft layer, and one index-K plane
+        """One plane per MLA layer, the draft's own, and one index-K plane
         per DSA layer -- no more.
 
         The KDA state groups pack to the MLA plane's byte width precisely so
         they ride inside those planes; a plane of their own means the packing
         did not divide and the parent grew.
+
+        A draft layer costs one plane when it plans the target's attention (an
+        MTP depth: one latent) and two when it plans its own family (a DFlash
+        GQA stack: K and V head rows), because the planes a layer occupies are
+        the fields its config declares.
         """
         num_mla_layers = sum(
             group_id == FULL_ATTENTION for group_id in self.target_group_ids
         )
-        expected = num_mla_layers + self.num_draft_layers + self.num_index_k_planes
+        planes_per_draft_layer = (
+            1
+            if self.draft_attn_config is None
+            or self.draft_attn_config.component(MLAConfig) is not None
+            else 2
+        )
+        num_draft_planes = planes_per_draft_layer * self.num_draft_layers
+        expected = num_mla_layers + num_draft_planes + self.num_index_k_planes
         if len(layout.plane_bytes) != expected:
             raise ValueError(
                 f"Kimi-K3 LCM requires {num_mla_layers} target planes (one per "
-                f"MLA layer) plus {self.num_draft_layers} draft planes and "
+                f"MLA layer) plus {num_draft_planes} draft planes and "
                 f"{self.num_index_k_planes} index-K planes, got "
                 f"{len(layout.plane_bytes)}"
             )
