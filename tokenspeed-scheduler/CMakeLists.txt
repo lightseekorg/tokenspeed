@@ -132,6 +132,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_prefill_gate.cpp
         tests/cpp/test_group_demands.cpp
         tests/cpp/test_forward_batch.cpp
+        tests/cpp/test_full_cache_benchmark.cpp
         tests/cpp/test_kv_cache_lifecycle.cpp
         tests/cpp/test_cache_scenarios.cpp
         tests/cpp/test_scheduler_plan.cpp
@@ -218,5 +219,15 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
     target_link_libraries(tokenspeed_scheduler_forward_batch_benchmark
         PRIVATE
             tokenspeed_scheduler_core
+    )
+
+    add_executable(tokenspeed_scheduler_full_cache_benchmark EXCLUDE_FROM_ALL
+        tests/cpp/benchmark_full_cache.cpp
+    )
+
+    target_link_libraries(tokenspeed_scheduler_full_cache_benchmark
+        PRIVATE
+            tokenspeed_scheduler_core
+            GTest::gtest
     )
 endif()
