@@ -169,9 +169,14 @@ def main():
 
     if not phases:
         if finished and args.pytest_status == 0:
-            # The kernel conftest passes a run that the changed-paths
-            # selection emptied; a run that collected nothing by itself exits 5.
-            print("  no test results: the changed-paths selection emptied the run")
+            # pytest passed without a test result: every collected module was
+            # skipped, or the changed-paths selection emptied the run (the
+            # kernel conftest passes it; a run that collected nothing by
+            # itself exits 5).
+            if collect_skips:
+                print("  no test results: every collected module was skipped")
+            else:
+                print("  no test results: the changed-paths selection emptied the run")
             return 0
         print("  the run recorded no test results at all")
         return 1
