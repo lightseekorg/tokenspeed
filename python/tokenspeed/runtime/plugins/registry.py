@@ -36,11 +36,13 @@ state behind.
 from __future__ import annotations
 
 import contextlib
+import inspect
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from tokenspeed.runtime.configs.model_profile import ModelProfile
+from tokenspeed.runtime.configs.numerics import register_numerics_envelope
 from tokenspeed.runtime.utils import get_colorful_logger
 
 if TYPE_CHECKING:
@@ -81,6 +83,9 @@ def register_drafter(
 
 
 __all__ = [
+    "register_trace_provider",
+    "get_trace_provider",
+    "TraceProvider",
     "register_drafter",
     "ModelProfile",
     "RegisteredModel",
@@ -90,6 +95,7 @@ __all__ = [
     "register_config",
     "register_linear_attention_backend",
     "register_model",
+    "register_numerics_envelope",
     "registered_architectures",
     "registered_model",
     "resolve_model_profile",
@@ -183,6 +189,55 @@ def record_external(kind: str, name: str, undo) -> None:
     if _active is not None:
         _active.names.setdefault(kind, []).append(str(name))
         _active.undo.append(undo)
+
+
+# The request ID is an input to the provider, not a prescribed encoding.
+TraceProvider = Callable[[str], tuple[str, str | None] | None]
+_TRACE_PROVIDERS: dict[str, TraceProvider] = {}
+
+
+def register_trace_provider(name: str, provider: TraceProvider) -> None:
+    """Register a named provider of custom context for native request spans.
+
+    The provider receives the request ID and returns (trace_id, optional
+    parent_span_id), or None to retain native generation. It may compute IDs,
+    recover propagated context, or use another application-specific policy.
+    It runs on the export thread and must be short, nonblocking and GPU-free.
+    Registration alone does not activate it; select its name with
+    --trace-provider. Duplicate names are rejected.
+    """
+    if not name or name != name.strip():
+        raise ValueError(
+            "Trace provider name must be nonempty without surrounding whitespace"
+        )
+    if not callable(provider):
+        raise TypeError("Trace provider must be callable")
+    for target in (provider, provider.__call__):
+        if (
+            inspect.iscoroutinefunction(target)
+            or inspect.isasyncgenfunction(target)
+            or inspect.isgeneratorfunction(target)
+        ):
+            raise TypeError(
+                "Trace provider must be synchronous and return context directly"
+            )
+    _put(
+        _TRACE_PROVIDERS,
+        name,
+        provider,
+        kind="trace provider",
+        override=False,
+    )
+
+
+def get_trace_provider(name: str) -> TraceProvider:
+    """Return a registered provider; an unknown selection fails startup."""
+    try:
+        return _TRACE_PROVIDERS[name]
+    except KeyError:
+        raise ValueError(
+            f"Unknown trace provider {name!r}; registered: {sorted(_TRACE_PROVIDERS)}"
+        ) from None
 
 
 def register_model(

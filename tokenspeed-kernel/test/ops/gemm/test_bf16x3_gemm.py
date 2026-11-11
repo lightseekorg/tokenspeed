@@ -303,22 +303,11 @@ def test_kernel_is_launched_with_the_drain_and_without_fp_fusion(monkeypatch, m)
 
 @pytest.fixture
 def select_on(monkeypatch):
-    # These tests read the split kernel's own registration. The FP32 CUDA-core
-    # kernel registered ahead of it for rows 17 to 96 of weights up to 256
-    # rows is set aside here; test_decode_gemv_fp32_simt.py checks the two
-    # together.
-    reg = KernelRegistry.get()
-    name = "gluon_simt_gemm_fp32"
-    spec, impl = reg.get_by_name(name), reg.get_impl(name)
-    assert spec is not None
-    reg._unregister(name)
-
     def use(platform):
         monkeypatch.setattr(gemm_api, "current_platform", lambda: platform)
         gemm_api._select_mv.cache_clear()
 
     yield use
-    reg.register(spec, impl)
     gemm_api._select_mv.cache_clear()
 
 
@@ -340,12 +329,14 @@ def test_registry_selects_the_split_kernel_from_17_rows(select_on, b200_platform
         assert _selected(64, n, k) is not triton_bf16x3_gemm_fp32
 
 
-def test_registry_keeps_the_split_kernel_to_sm100(
+def test_registry_keeps_the_split_kernel_to_nvidia_sm90_to_sm103(
     select_on, h100_platform, mi350_platform
 ):
-    for platform in (h100_platform, mi350_platform):
-        select_on(platform)
-        assert _selected(64, 256, 4096) is not triton_bf16x3_gemm_fp32
+    select_on(h100_platform)
+    for m in (17, 64, 1000, 8192):
+        assert _selected(m, 256, 4096) is triton_bf16x3_gemm_fp32
+    select_on(mi350_platform)
+    assert _selected(64, 256, 4096) is not triton_bf16x3_gemm_fp32
 
 
 def _cuda_weight(n, k, dtype=torch.float32):
@@ -369,10 +360,13 @@ def test_weight_split_follows_the_split_kernel_registration(
     for dtype in (torch.bfloat16, torch.float16):
         weight = _cuda_weight(256, 4096, dtype)
         assert gemm_api.mv_weight_split(weight) is None
-    for platform in (h100_platform, mi350_platform):
-        select_on(platform)
-        assert gemm_api.mv_weight_split(_cuda_weight(256, 4096)) is None
-    assert split.call_count == 1
+    select_on(h100_platform)
+    weight = _cuda_weight(256, 4096)
+    assert gemm_api.mv_weight_split(weight) is split.return_value
+    split.assert_called_with(weight)
+    select_on(mi350_platform)
+    assert gemm_api.mv_weight_split(_cuda_weight(256, 4096)) is None
+    assert split.call_count == 2
 
 
 def test_weights_of_128_rows_stay_off_the_split_kernel(
@@ -434,7 +428,7 @@ def test_weight_split_is_made_under_a_kernel_preferred_for_some_rows(
             solution="test",
             format_signatures=gemm_triton._BF16_FP32_SIG,
             traits={"m_min": frozenset({17}), "m_max": frozenset({96})},
-            priority=Priority.SPECIALIZED + 1,
+            priority=Priority.SPECIALIZED + 3,
         ),
         stand_in,
     )

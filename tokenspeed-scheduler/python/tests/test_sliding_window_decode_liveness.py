@@ -76,6 +76,7 @@ def _config(
             attn_kind=ts.AttnKind.Full,
         ),
     ]
+    cfg.host_group_packing = [1, 1]
     return cfg
 
 

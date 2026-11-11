@@ -22,39 +22,9 @@
 
 using tvm::ffi::TensorView;
 
-void fused_dsv4_qnorm_rope_kv_rope_quant_insert(
-    TensorView q,
-    TensorView kv,
-    TensorView k_cache,
-    TensorView slot_mapping,
-    TensorView positions,
-    TensorView cos_sin_cache,
-    double rms_norm_eps,
-    int64_t cache_block_size,
-    bool enable_pdl);
-
-void dsv4_indexer_topk_prefill(TensorView logits,
-                                      TensorView row_starts,
-                                      TensorView row_ends,
-                                      TensorView output,
-                                      int64_t k);
-
-void dsv4_gather_paged_indexer_mxfp4_cache(TensorView kv_cache,
-                                                  TensorView values_out,
-                                                  TensorView scales_out,
-                                                  TensorView block_table,
-                                                  TensorView cu_seq_lens,
-                                                  int64_t cache_block_size);
-
 void dsv4_persistent_topk(TensorView logits, TensorView lengths,
                           TensorView output, int64_t k, int64_t max_seq_len,
                           int64_t q_len_per_req, bool enable_pdl);
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(fused_dsv4_qnorm_rope_kv_rope_quant_insert,
-                              fused_dsv4_qnorm_rope_kv_rope_quant_insert);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(dsv4_indexer_topk_prefill,
-                              dsv4_indexer_topk_prefill);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(dsv4_gather_paged_indexer_mxfp4_cache,
-                              dsv4_gather_paged_indexer_mxfp4_cache);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(dsv4_persistent_topk,
                               dsv4_persistent_topk);

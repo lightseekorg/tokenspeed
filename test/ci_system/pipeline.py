@@ -36,6 +36,7 @@ SUPPORTED_TYPES = {"ut", "server_smoke", "eval", "perf"}
 # after startup (a per-batch constexpr) fails the run instead of stalling it.
 SERVING_TASK_TYPES = {"server_smoke", "eval", "perf"}
 JIT_COMPILE_CHECK_ENV = "TOKENSPEED_JIT_COMPILE_CHECK"
+DATA_PLANE_SYNC_DEBUG_ENV = "TOKENSPEED_DATA_PLANE_SYNC_DEBUG"
 SUPPORTED_TRIGGERS = {
     "per-commit",
     "post-submit",
@@ -54,6 +55,12 @@ WORKFLOW_STAGE_TYPES = {
     "model-test": {"eval", "perf"},
 }
 SUPPORTED_WORKFLOW_STAGES = tuple(WORKFLOW_STAGE_TYPES)
+# Model modules sit directly under this package; `model_sources` lists them.
+MODEL_DIRECTORY = "python/tokenspeed/runtime/models"
+# Speculative-decoding draft modules (NextN, EAGLE, DFlash, DSpark) are shared code.
+SPECULATIVE_MODULE = re.compile(r"(?:^|_)(?:nextn|eagle|dflash|dspark)\d*(?:_|$)")
+# Test sources cannot change what a served model computes.
+TEST_DIRECTORIES = ("test/runtime", "tokenspeed-kernel/test")
 # Kernel benchmark suite definitions are read only by `kernel-benchmark` tasks.
 KERNEL_BENCHMARK_SUITE_DIRECTORY = "tokenspeed-kernel/benchmarks/"
 SUPPORTED_SETUP_MODES = ("ci", "slurm")
@@ -250,6 +257,16 @@ def validate_task(data: Dict[str, Any], path: Path) -> None:
                 raise ValueError(
                     f"{path}: runner.env[{label!r}] must be a string mapping"
                 )
+    # CI serves with the data-plane sync check raising (execute_task), and no
+    # task may relax it.
+    for where, env in [("env", data.get("env") or {})] + [
+        (f"runner.env[{label!r}]", env) for label, env in (runner_env or {}).items()
+    ]:
+        if DATA_PLANE_SYNC_DEBUG_ENV in env:
+            raise ValueError(
+                f"{path}: {where} sets {DATA_PLANE_SYNC_DEBUG_ENV}; CI serves "
+                "with it set to error and a task cannot change it"
+            )
     if "priority" in data:
         priority = data["priority"]
         if isinstance(priority, str):
@@ -306,6 +323,43 @@ def validate_task(data: Dict[str, Any], path: Path) -> None:
                 f"{path}: optional must be a boolean or a per-label mapping; "
                 f"got {type(optional).__name__}"
             )
+    if "ignore_changes" in data:
+        prefixes = data["ignore_changes"]
+        if (
+            not isinstance(prefixes, list)
+            or not prefixes
+            or not all(
+                isinstance(prefix, str) and prefix and not prefix.endswith("/")
+                for prefix in prefixes
+            )
+        ):
+            raise ValueError(
+                f"{path}: ignore_changes must be a non-empty list of paths without "
+                "a trailing slash"
+            )
+    if "model_sources" in data:
+        sources = data["model_sources"]
+        if (
+            not isinstance(sources, list)
+            or not sources
+            or not all(
+                isinstance(source, str)
+                and re.fullmatch(rf"{MODEL_DIRECTORY}/[A-Za-z0-9_]+\.py", source)
+                for source in sources
+            )
+        ):
+            raise ValueError(
+                f"{path}: model_sources must be a non-empty list of modules "
+                f"directly under {MODEL_DIRECTORY}"
+            )
+        speculative = [source for source in sources if is_speculative_module(source)]
+        if speculative:
+            raise ValueError(
+                f"{path}: model_sources lists speculative-decoding modules "
+                f"{speculative}, which every model task shares"
+            )
+    if "changed_paths" in data and not isinstance(data["changed_paths"], bool):
+        raise ValueError(f"{path}: changed_paths must be a boolean")
     if "retries" in data:
         retries = data["retries"]
         if isinstance(retries, bool) or not isinstance(retries, int) or retries < 0:
@@ -361,6 +415,14 @@ def validate_task(data: Dict[str, Any], path: Path) -> None:
 def normalize_task(path: Path, repo_root: Path) -> Dict[str, Any]:
     data = load_yaml(path)
     validate_task(data, path)
+    # A renamed model module must not quietly stop selecting its tasks.
+    missing = [
+        source
+        for source in data.get("model_sources", [])
+        if not (repo_root / source).is_file()
+    ]
+    if missing:
+        raise ValueError(f"{path}: model_sources do not exist: {missing}")
     data["_source_path"] = path.relative_to(repo_root).as_posix()
     return data
 
@@ -1909,6 +1971,9 @@ def execute_task(
         env[JIT_COMPILE_CHECK_ENV] = str(
             task.get("env", {}).get(JIT_COMPILE_CHECK_ENV, "error")
         )
+        # Not even the task may relax this one (validate_task), and a value
+        # inherited from the runner's environment is overridden too.
+        env[DATA_PLANE_SYNC_DEBUG_ENV] = "error"
 
     jit_cache_env = get_jit_cache_env(env) if uses_isolated_jit_cache(runner) else {}
     env.update(jit_cache_env)
@@ -2193,7 +2258,12 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     scan_parser.add_argument(
         "--changed-files",
         type=Path,
-        help="Optional changed-path list; only task-YAML-only diffs narrow the matrix",
+        help="Optional changed-path list that narrows the matrix (see test/ci/README.md)",
+    )
+    scan_parser.add_argument(
+        "--full-tests",
+        action="store_true",
+        help="A reviewer asked for every test (pr_test_scope.py): ignore --changed-files.",
     )
     scan_parser.add_argument(
         "--trigger",
@@ -2289,11 +2359,178 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def path_is_ignored(path: str, prefixes: List[str]) -> bool:
+    """Return whether ``path`` is Markdown or lies under one of ``prefixes``."""
+    return path.endswith(".md") or any(
+        path == prefix or path.startswith(f"{prefix}/") for prefix in prefixes
+    )
+
+
+def is_speculative_module(path: str) -> bool:
+    """Return whether ``path`` is a speculative-decoding draft module."""
+    return bool(SPECULATIVE_MODULE.search(Path(path).stem))
+
+
+def model_specific_modules(root: Path, repo_root: Path) -> frozenset[str]:
+    """Return the modules directly under the models package that belong to one model.
+
+    They define ``EntryClass`` or a task lists them in ``model_sources``, and
+    are not speculative-decoding modules. Every other module there, such as
+    ``utils.py`` or a draft model, is shared by all models.
+    """
+    listed: set[str] = set()
+    for path in find_task_files(root):
+        listed.update(normalize_task(path, repo_root).get("model_sources", []))
+    defining = {
+        path.relative_to(repo_root).as_posix()
+        for path in (repo_root / MODEL_DIRECTORY).glob("*.py")
+        if re.search(r"^EntryClass\s*=", path.read_text(encoding="utf-8"), re.M)
+        and not is_speculative_module(path.name)
+    }
+    return frozenset(listed | defining)
+
+
+def imported_model_modules(path: Path) -> set[str]:
+    """Return the modules directly under the models package that ``path`` imports.
+
+    ``path`` is such a module too, so relative imports resolve against that
+    package. The result holds repository paths.
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    package = MODEL_DIRECTORY.removeprefix("python/").replace("/", ".")
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level == 0:
+                module = node.module or ""
+            else:
+                # A relative import resolves against the models package.
+                parts = package.split(".")[: len(package.split(".")) + 1 - node.level]
+                module = ".".join(parts + ([node.module] if node.module else []))
+            names.add(module)
+            names.update(f"{module}.{alias.name}" for alias in node.names)
+    return {
+        f"{MODEL_DIRECTORY}/{name[len(package) + 1 :].split('.')[0]}.py"
+        for name in names
+        if name.startswith(f"{package}.")
+    }
+
+
+def check_model_sources_closed(root: Path, repo_root: Path) -> None:
+    """Fail when a listed model module imports an unlisted model-specific module.
+
+    Such a list would let changes to the unlisted module skip the task.
+    """
+    model_specific = model_specific_modules(root, repo_root)
+    for path in find_task_files(root):
+        sources = normalize_task(path, repo_root).get("model_sources", [])
+        for source in sources:
+            missing = sorted(
+                (imported_model_modules(repo_root / source) & model_specific)
+                - set(sources)
+            )
+            if missing:
+                raise ValueError(
+                    f"{path}: model_sources lists {source}, which imports "
+                    f"{missing}; list them too"
+                )
+
+
+def task_test_paths(text: str) -> List[str]:
+    """Return the test files and directories that a task definition names."""
+    pattern = "|".join(re.escape(directory) for directory in TEST_DIRECTORIES)
+    return [
+        match.split("::")[0].rstrip("/")
+        for match in re.findall(rf"(?:{pattern})(?:/[^\s'\"]*)?", text)
+    ]
+
+
+def path_is_ignored_for_model(
+    path: str,
+    sources: List[str],
+    model_specific: frozenset[str],
+    run_tests: Optional[List[str]],
+) -> bool:
+    """Return whether a task serving ``sources`` can ignore ``path``.
+
+    It can ignore Markdown, another model's module, and tests. ``run_tests`` are
+    the test files and directories a unit-test task names; it cannot ignore their
+    tests, nor any test helper. ``run_tests`` is None for a model-test task.
+    """
+    if path.endswith(".md"):
+        return True
+    if any(path.startswith(f"{directory}/") for directory in TEST_DIRECTORIES):
+        return run_tests is None or (
+            Path(path).name.startswith("test_")
+            and not any(
+                path == test or path.startswith(f"{test}/") for test in run_tests
+            )
+        )
+    return path in model_specific and path not in sources
+
+
+def drop_unaffected_tasks(
+    include: List[Dict[str, Any]], changed: List[str], repo_root: Path, root: Path
+) -> List[Dict[str, Any]]:
+    """Drop the entries of tasks that can ignore every change.
+
+    ``ignore_changes`` and ``model_sources`` say which changes a task ignores.
+    """
+    tasks: Dict[str, Dict[str, Any]] = {}
+    model_specific: Optional[frozenset[str]] = None
+    kept: List[Dict[str, Any]] = []
+    for entry in include:
+        config = entry["config"]
+        if config not in tasks:
+            tasks[config] = normalize_task(repo_root / config, repo_root)
+        prefixes = tasks[config].get("ignore_changes")
+        sources = tasks[config].get("model_sources")
+        if prefixes is None and sources is None:
+            kept.append(entry)
+            continue
+        if sources is not None and model_specific is None:
+            model_specific = model_specific_modules(root, repo_root)
+        run_tests: Optional[List[str]] = None
+        if tasks[config].get("workflow_stage") != "model-test":
+            run_tests = task_test_paths(
+                (repo_root / config).read_text(encoding="utf-8")
+            )
+        if not all(
+            (prefixes is not None and path_is_ignored(path, prefixes))
+            or (
+                sources is not None
+                and path_is_ignored_for_model(path, sources, model_specific, run_tests)
+            )
+            for path in changed
+        ):
+            kept.append(entry)
+    return kept
+
+
+def attach_changed_paths(
+    include: List[Dict[str, Any]], changed: List[str], repo_root: Path
+) -> None:
+    """Give the entries of ``changed_paths`` tasks the pull request's changed
+    paths, which the workflow exports as ``TOKENSPEED_CI_CHANGED_PATHS``."""
+    paths = "\n".join(path.strip() for path in changed if path.strip())
+    opted_in: Dict[str, bool] = {}
+    for entry in include:
+        config = entry["config"]
+        if config not in opted_in:
+            task = normalize_task(repo_root / config, repo_root)
+            opted_in[config] = task.get("changed_paths", False)
+        if opted_in[config]:
+            entry["changed_paths"] = paths
+
+
 def main(argv: Iterable[str] | None = None) -> int:
     args = parse_args(argv)
     if args.command == "scan":
         repo_root = Path(args.repo_root).resolve()
         root = (repo_root / args.root).resolve()
+        check_model_sources_closed(root, repo_root)
         matrix = build_matrix(
             root,
             repo_root,
@@ -2302,7 +2539,8 @@ def main(argv: Iterable[str] | None = None) -> int:
             args.workflow_stage,
             args.multi_node,
         )
-        if args.changed_files is not None:
+        # A reviewer's full-test request (pr_test_scope.py) skips every narrowing.
+        if args.changed_files is not None and not args.full_tests:
             changed = args.changed_files.read_text(encoding="utf-8").splitlines()
             suite_changed = any(
                 path.startswith(KERNEL_BENCHMARK_SUITE_DIRECTORY) for path in changed
@@ -2324,6 +2562,12 @@ def main(argv: Iterable[str] | None = None) -> int:
                         and entry.get("workflow_stage") == "kernel-benchmark"
                     )
                 ]
+            # Pull requests only: pushes to main still run every task.
+            if args.trigger == "per-commit" and 0 < len(changed) < 300:
+                matrix["include"] = drop_unaffected_tasks(
+                    matrix["include"], changed, repo_root, root
+                )
+                attach_changed_paths(matrix["include"], changed, repo_root)
         print(json.dumps(matrix, separators=(",", ":")))
         return 0
 

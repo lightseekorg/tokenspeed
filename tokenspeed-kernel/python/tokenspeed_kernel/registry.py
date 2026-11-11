@@ -24,7 +24,7 @@ import logging
 from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import TYPE_CHECKING, Any, Callable, Iterable
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping
 
 if TYPE_CHECKING:
     import torch
@@ -40,9 +40,11 @@ __all__ = [
     "KernelSpec",
     "KernelRegistry",
     "Priority",
+    "RegistrySnapshot",
     "load_builtin_kernels",
     "register_kernel",
     "describe_kernel",
+    "priority_band_name",
 ]
 
 
@@ -140,6 +142,13 @@ class Priority(IntEnum):
 def _band_for(value: int) -> Priority:
     """Return the band that contains ``value`` (the largest band start ≤ value)."""
     return max((b for b in Priority if int(b) <= value), key=int)
+
+
+def priority_band_name(value: int) -> str:
+    """Spell a priority as its band plus offset: ``PORTABLE``, ``SPECIALIZED+1``."""
+    band = _band_for(value)
+    offset = int(value) - int(band)
+    return band.name if offset == 0 else f"{band.name}+{offset}"
 
 
 def _validate_priority(value: int | Priority) -> int:
@@ -255,6 +264,15 @@ class KernelSpec:
         )
 
 
+@dataclass(frozen=True)
+class RegistrySnapshot:
+    """The registrations of a :class:`KernelRegistry` at one moment."""
+
+    by_operator: dict[tuple[str, str], list[KernelSpec]]
+    by_name: dict[str, KernelSpec]
+    impls: dict[str, Callable]
+
+
 class KernelRegistry:
     """Central registry for all kernel implementations."""
 
@@ -292,6 +310,35 @@ class KernelRegistry:
         self._by_operator[key].append(spec)
         self._by_operator[key].sort(key=lambda s: s.priority, reverse=True)
         self._invalidate_cache(key)
+
+    def snapshot(self) -> RegistrySnapshot:
+        """Copy the registrations, so a failed module reload can put them back with :meth:`restore`."""
+        return RegistrySnapshot(
+            by_operator={key: list(specs) for key, specs in self._by_operator.items()},
+            by_name=dict(self._by_name),
+            impls=dict(self._impls),
+        )
+
+    def restore(self, snapshot: RegistrySnapshot) -> None:
+        """Return to the registrations ``snapshot`` copied, dropping every cached selection."""
+        self._by_operator = defaultdict(
+            list, {key: list(specs) for key, specs in snapshot.by_operator.items()}
+        )
+        self._by_name = dict(snapshot.by_name)
+        self._impls = dict(snapshot.impls)
+        self._selection_cache.clear()
+
+    def replace_impls(self, replacements: Mapping[int, Callable]) -> None:
+        """Swap each implementation whose ``id`` keys ``replacements`` for its value, dropping cached selections."""
+        for name, impl in list(self._impls.items()):
+            replacement = replacements.get(id(impl))
+            if replacement is not None:
+                self._impls[name] = replacement
+        self._selection_cache.clear()
+
+    def unregister(self, name: str) -> None:
+        """Remove the kernel registered as ``name``, if any, dropping its cached selections."""
+        self._unregister(name)
 
     def _unregister(self, name: str) -> None:
         if name not in self._by_name:
@@ -466,9 +513,7 @@ def describe_kernel(name: str) -> str:
     if not spec:
         return f"Kernel '{name}' not found"
 
-    band = _band_for(spec.priority)
-    offset = spec.priority - int(band)
-    band_str = band.name if offset == 0 else f"{band.name}+{offset}"
+    band_str = priority_band_name(spec.priority)
     lines = [
         f"Kernel: {spec.name}",
         f"  Operator: {spec.family}.{spec.mode}",

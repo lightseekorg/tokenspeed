@@ -36,7 +36,7 @@ jobs:
               "amd-mi350-tests.yml",
               "amd-mi450-tests.yml",
               "amd-kernel-benchmark.yml",
-              "pr-test-nvidia-arm.yml",
+              "nvidia-arm-tests.yml",
               "nvidia-gb200-tests.yml",
             ];
             const maxAttempts = 3;

@@ -40,19 +40,13 @@ logger = get_colorful_logger(__name__)
 @dataclass
 class _ModelRegistry:
     # Keyed by model_arch
-    models: dict[str, type[nn.Module] | str] = field(default_factory=dict)
+    models: dict[str, type[nn.Module]] = field(default_factory=dict)
 
     def get_supported_archs(self) -> Set[str]:
         return self.models.keys() | registered_architectures()
 
     def _raise_for_unsupported(self, architectures: list[str]):
         all_supported_archs = self.get_supported_archs()
-
-        if any(arch in all_supported_archs for arch in architectures):
-            raise ValueError(
-                f"Model architectures {architectures} failed "
-                "to be inspected. Please check the logs for more details."
-            )
 
         raise ValueError(
             f"Model architectures {architectures} are not supported for now. "

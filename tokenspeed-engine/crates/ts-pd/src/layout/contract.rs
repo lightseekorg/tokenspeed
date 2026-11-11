@@ -118,6 +118,8 @@ pub struct GroupSpec {
     pub transfer_policy: Option<String>,
     /// Cyclic owners of the group's virtual blocks; 1 is replicated.
     pub shard_count: i64,
+    /// Optional logical-token alignment of reusable State checkpoints.
+    pub checkpoint_granularity: Option<i64>,
 }
 
 impl GroupSpec {
@@ -143,6 +145,14 @@ impl GroupSpec {
         let id = &self.group_id;
         if self.shard_count <= 0 {
             return Err(LayoutError::new("shard_count must be a positive integer"));
+        }
+        if self
+            .checkpoint_granularity
+            .is_some_and(|grain| grain <= 0 || self.attn_kind != "state")
+        {
+            return Err(LayoutError::new(
+                "checkpoint_granularity requires a positive state-group grain",
+            ));
         }
         if !matches!(
             self.attn_kind.as_str(),
@@ -462,6 +472,7 @@ fn parse_spec(value: &Value) -> Result<GroupSpec, LayoutError> {
             "sliding_window_tokens",
             "transfer_policy",
             "shard_count",
+            "checkpoint_granularity",
         ],
     )?;
     let spec = GroupSpec {
@@ -481,6 +492,7 @@ fn parse_spec(value: &Value) -> Result<GroupSpec, LayoutError> {
             None => 1,
             Some(value) => int(value, "shard_count")?,
         },
+        checkpoint_granularity: opt_int(object, "checkpoint_granularity")?,
     };
     spec.validate()?;
     Ok(spec)
@@ -810,6 +822,7 @@ pub fn validate_peer(layout: &Contract, peer: &Contract) -> Result<(), LayoutErr
             || local.sliding_window_tokens != remote.sliding_window_tokens
             || local.replayable != remote.replayable
             || local.transfer_policy != remote.transfer_policy
+            || local.checkpoint_granularity != remote.checkpoint_granularity
         {
             return Err(LayoutError::new(format!(
                 "Cache P/D contract mismatch: group {:?} semantics",
@@ -913,8 +926,24 @@ pub(crate) mod tests {
         assert!(mutate(|v| v["plan"]["fields"][0]["dtype"] = "float7".into()).is_err());
         assert!(mutate(|v| v["plan"]["groups"][0]["extra"] = 1.into()).is_err());
         assert!(mutate(|v| v["group_specs"][1]["rows_per_page"] = 2.into()).is_err());
+        assert!(mutate(|v| v["group_specs"][1]["checkpoint_granularity"] = 0.into()).is_err());
+        assert!(mutate(|v| v["group_specs"][0]["checkpoint_granularity"] = 4096.into()).is_err());
         assert!(mutate(|v| v["field_addresses"] = serde_json::json!({"layer.0.kv": 1})).is_err());
         assert!(Contract::from_wire(b"").is_err());
         assert!(Contract::from_wire(b"[]").is_err());
+    }
+
+    #[test]
+    fn checkpoint_alignment_is_part_of_peer_semantics() {
+        let ordinary = Contract::from_wire(wire().as_bytes()).unwrap();
+        let mut value: Value = serde_json::from_str(&wire()).unwrap();
+        value["group_specs"][1]["checkpoint_granularity"] = 4096.into();
+        let aligned = Contract::from_wire(value.to_string().as_bytes()).unwrap();
+        assert_eq!(
+            aligned.group_spec("state").unwrap().checkpoint_granularity,
+            Some(4096)
+        );
+        assert!(validate_peer(&ordinary, &aligned).is_err());
+        assert!(validate_peer(&aligned, &aligned).is_ok());
     }
 }

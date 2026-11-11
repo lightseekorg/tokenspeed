@@ -26,7 +26,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import BFloat16, Float8E4M3FN, Float32, Int32, Int64, utils
+from cutlass import Float8E4M3FN, Float32, Int32, Int64, utils
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
@@ -94,14 +94,14 @@ class RoutePrepare:
     A warp quantizes each token once and copies its bytes to its local routes.
     """
 
-    def __init__(self, tokens, experts, topk, scale_rows, expert_offset, hidden):
-        self.t = tokens
+    def __init__(self, token_bucket, full_bucket, experts, topk, expert_offset, hidden):
+        self.token_bucket = token_bucket
+        self.full_bucket = full_bucket
+        self.tile_tokens = max(1, token_bucket // 128)
         self.e = experts
         self.padded_e = ((experts + 31) // 32) * 32
         self.k = topk
-        self.r = tokens * topk
         self.origin = expert_offset
-        self.ld = scale_rows
         self.hidden = hidden
         self.quant_blocks = hidden // 128
 
@@ -118,9 +118,42 @@ class RoutePrepare:
         inverse: cute.Tensor,
         packed: cute.Tensor,
         scales: cute.Tensor,
+        tokens: Int32,
+        scale_extent: Int32,
         stream: cuda.CUstream,
     ):
-        if cutlass.const_expr(self.t == 1):
+        # Flat one-element views carry pointers only. Rebuild layouts with fixed
+        # model strides; only N and the padded scale stride are runtime scalars.
+        n = tokens
+        if cutlass.const_expr(self.full_bucket):
+            n = self.token_bucket
+            scale_extent = ((n * self.k + self.e * 31 + 31) // 32) * 32
+        routes = n * self.k
+        inputs = cute.make_tensor(
+            inputs.iterator, cute.make_layout((n, self.hidden), stride=(self.hidden, 1))
+        )
+        ids = cute.make_tensor(
+            ids.iterator, cute.make_layout((n, self.k), stride=(self.k, 1))
+        )
+        counts = cute.make_tensor(counts.iterator, cute.make_layout((self.e,)))
+        cursors = cute.make_tensor(cursors.iterator, cute.make_layout((self.e,)))
+        offsets = cute.make_tensor(offsets.iterator, cute.make_layout((self.e + 1,)))
+        packed_ids = cute.make_tensor(packed_ids.iterator, cute.make_layout((routes,)))
+        scale_row = cute.make_tensor(scale_row.iterator, cute.make_layout((routes,)))
+        inverse = cute.make_tensor(
+            inverse.iterator, cute.make_layout((n, self.k), stride=(1, n))
+        )
+        packed = cute.make_tensor(
+            packed.iterator,
+            cute.make_layout((routes, self.hidden), stride=(self.hidden, 1)),
+        )
+        scales = cute.make_tensor(
+            scales.iterator,
+            cute.make_layout(
+                (self.quant_blocks, scale_extent), stride=(scale_extent, 1)
+            ),
+        )
+        if cutlass.const_expr(self.token_bucket == 1):
             self.decode(
                 inputs,
                 ids,
@@ -134,6 +167,7 @@ class RoutePrepare:
                 scales,
             ).launch(grid=(1, 1, 1), block=(128, 1, 1), stream=stream)
         else:
+            blocks = (tokens + self.tile_tokens - 1) // self.tile_tokens
             self.by_token_tile(
                 inputs,
                 ids,
@@ -145,7 +179,8 @@ class RoutePrepare:
                 inverse,
                 packed,
                 scales,
-            ).launch(grid=(min(self.t, 128), 1, 1), block=(256, 1, 1), stream=stream)
+                tokens,
+            ).launch(grid=(blocks, 1, 1), block=(256, 1, 1), stream=stream)
 
     @cute.jit
     def quantize_word(self, inputs: cute.Tensor, token: Int32, kb: Int32):
@@ -153,7 +188,7 @@ class RoutePrepare:
         # Four adjacent BF16 columns per lane permit aligned 8-byte loads and
         # packed 4-byte FP8 stores within each 128-column quantization group.
         values = load_bf16x4(
-            inputs.iterator + token * self.hidden + kb * 128 + lane * 4
+            inputs.iterator + Int64(token) * self.hidden + kb * 128 + lane * 4
         )
         amax = Float32(0)
         for i in cutlass.range_constexpr(4):
@@ -188,12 +223,24 @@ class RoutePrepare:
         inverse: cute.Tensor,
         packed: cute.Tensor,
         scales: cute.Tensor,
+        tokens: Int32,
     ):
         block, _, _ = cute.arch.block_idx()
         tid, _, _ = cute.arch.thread_idx()
         lane = cute.arch.lane_idx()
         warp = cute.arch.warp_idx()
-        tile = self.t // min(self.t, 128)
+        if cutlass.const_expr(self.full_bucket):
+            tokens = self.token_bucket
+        routes = tokens * self.k
+        # IDs are contiguous and inverse is slot-major. Express these layouts
+        # directly so only the actual N-dependent inverse stride stays dynamic.
+        route_ids = cute.make_tensor(
+            ids.iterator, cute.make_layout((routes,), stride=(1,))
+        )
+        inverse_rows = cute.make_tensor(
+            inverse.iterator, cute.make_layout((routes,), stride=(1,))
+        )
+        tile = self.tile_tokens
         first_token = block * tile
         allocator = utils.SmemAllocator()
         # Separate warp histograms bound contention when many routes select
@@ -216,10 +263,11 @@ class RoutePrepare:
         for base in cutlass.range_constexpr(0, 16 * self.padded_e, 256):
             histogram[base + tid] = Int32(0)
         cute.arch.sync_threads()
-        for base in cutlass.range(0, self.r, 256):
+        # The bucket bounds compilation; actual N masks the final scan segment.
+        for base in cutlass.range(0, self.token_bucket * self.k, 256):
             route = base + tid
-            if route < self.r:
-                expert = ids[route // self.k, route % self.k] - self.origin
+            if route < routes:
+                expert = route_ids[Int64(route)] - self.origin
                 if expert >= 0 and expert < self.e:
                     cute.arch.atomic_add(
                         histogram.iterator + warp * self.padded_e + expert,
@@ -278,41 +326,42 @@ class RoutePrepare:
         cute.arch.sync_threads()
         packed_words = cute.make_tensor(
             cute.recast_ptr(packed.iterator, dtype=Int32),
-            cute.make_layout((self.r, self.hidden // 4), stride=(self.hidden // 4, 1)),
+            cute.make_layout((routes, self.hidden // 4), stride=(self.hidden // 4, 1)),
         )
         for local_token in cutlass.range(warp, tile, 8):
             token = first_token + local_token
-            words = cute.make_rmem_tensor((self.quant_blocks,), Int32)
-            inverse_scales = cute.make_rmem_tensor((self.quant_blocks,), Float32)
-            for kb in cutlass.range_constexpr(self.quant_blocks):
-                word, inverse_scale = self.quantize_word(inputs, token, Int32(kb))
-                words[kb] = word
-                inverse_scales[kb] = inverse_scale
-            reserved = Int32(-1)
-            scale = Int32(0)
-            if lane < self.k:
-                expert = ids[token, lane] - self.origin
-                inverse[token, lane] = Int32(-1)
-                if expert >= 0 and expert < self.e:
-                    reserved = cute.arch.atomic_add(
-                        next_row.iterator + expert,
-                        Int32(1),
-                        sem="relaxed",
-                        scope="cta",
-                    )
-                    start = starts[expert]
-                    scale = ((start + expert * 31) // 32) * 32 + reserved - start
-                    packed_ids[reserved] = lane * self.t + token
-                    inverse[token, lane] = reserved
-                    scale_row[reserved] = scale
-            for slot in cutlass.range_constexpr(self.k):
-                row = cute.arch.shuffle_sync(reserved, offset=slot)
-                sr = cute.arch.shuffle_sync(scale, offset=slot)
-                if row >= 0:
-                    for kb in cutlass.range_constexpr(self.quant_blocks):
-                        packed_words[row, kb * 32 + lane] = words[kb]
-                        if lane == 0:
-                            scales[kb, sr] = inverse_scales[kb]
+            if cutlass.const_expr(self.full_bucket) or token < tokens:
+                words = cute.make_rmem_tensor((self.quant_blocks,), Int32)
+                inverse_scales = cute.make_rmem_tensor((self.quant_blocks,), Float32)
+                for kb in cutlass.range_constexpr(self.quant_blocks):
+                    word, inverse_scale = self.quantize_word(inputs, token, Int32(kb))
+                    words[kb] = word
+                    inverse_scales[kb] = inverse_scale
+                reserved = Int32(-1)
+                scale = Int32(0)
+                if lane < self.k:
+                    expert = route_ids[Int64(token) * self.k + lane] - self.origin
+                    inverse_rows[Int64(lane) * tokens + token] = Int32(-1)
+                    if expert >= 0 and expert < self.e:
+                        reserved = cute.arch.atomic_add(
+                            next_row.iterator + expert,
+                            Int32(1),
+                            sem="relaxed",
+                            scope="cta",
+                        )
+                        start = starts[expert]
+                        scale = ((start + expert * 31) // 32) * 32 + reserved - start
+                        packed_ids[reserved] = lane * tokens + token
+                        inverse_rows[Int64(lane) * tokens + token] = reserved
+                        scale_row[reserved] = scale
+                for slot in cutlass.range_constexpr(self.k):
+                    row = cute.arch.shuffle_sync(reserved, offset=slot)
+                    sr = cute.arch.shuffle_sync(scale, offset=slot)
+                    if row >= 0:
+                        for kb in cutlass.range_constexpr(self.quant_blocks):
+                            packed_words[Int64(row), kb * 32 + lane] = words[kb]
+                            if lane == 0:
+                                scales[Int64(kb), sr] = inverse_scales[kb]
 
     @cute.jit
     def quantize_block(self, inputs: cute.Tensor, token: Int32, kb: Int32):
@@ -322,7 +371,7 @@ class RoutePrepare:
         values = cute.make_rmem_tensor((4,), Float32)
         amax = Float32(0)
         for i in cutlass.range_constexpr(4):
-            value = inputs[token, kb * 128 + lane + i * 32].to(Float32)
+            value = inputs[Int64(token), kb * 128 + lane + i * 32].to(Float32)
             values[i] = value
             absolute = value
             if absolute < Float32(0):
@@ -384,7 +433,7 @@ class RoutePrepare:
             offsets[self.e] = valid
         if tid < self.k:
             selected = ids[0, tid] - self.origin
-            inverse[0, tid] = Int32(-1)
+            inverse[0, Int64(tid)] = Int32(-1)
             if selected >= 0 and selected < self.e:
                 start = Int32(0)
                 earlier = Int32(0)
@@ -397,7 +446,7 @@ class RoutePrepare:
                 row = start + earlier
                 packed_ids[row] = tid
                 scale_row[row] = ((start + selected * 31) // 32) * 32 + earlier
-                inverse[0, tid] = row
+                inverse[0, Int64(tid)] = row
         # Publish the valid-row count and scale-row map to all four warps.
         cute.arch.sync_threads()
         for base in cutlass.range_constexpr(0, self.quant_blocks, 4):
@@ -407,9 +456,9 @@ class RoutePrepare:
                 for row in cutlass.range_constexpr(self.k):
                     if row < offsets[self.e]:
                         if lane == 0:
-                            scales[kb, scale_row[row]] = inverse_scale
+                            scales[Int64(kb), scale_row[row]] = inverse_scale
                         for i in cutlass.range_constexpr(4):
-                            packed[row, kb * 128 + lane + i * 32] = quantized[i]
+                            packed[Int64(row), kb * 128 + lane + i * 32] = quantized[i]
 
 
 _compiled = {}
@@ -417,19 +466,19 @@ _compile_lock = threading.Lock()
 
 
 def run_route_quant(storage):
+    from tokenspeed_kernel.ops.moe.route_quant import _route_token_bucket
     from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail.primitives import to_cute
 
     tokens, topk = storage.ids.shape
-    bucket = 1 << (tokens - 1).bit_length()
-    if bucket != tokens:
-        raise ValueError("The selected route bucket requires a power-of-two row count")
+    bucket = _route_token_bucket(tokens)
+    hidden = storage.input.shape[1]
     key = (
         storage.input.device.index,
         bucket,
         storage.experts,
         topk,
         storage.expert_offset,
-        storage.input.shape[1],
+        hidden,
     )
     tensors = (
         storage.input,
@@ -446,6 +495,11 @@ def run_route_quant(storage):
     alignments = (16, 4, 4, 4, 8, 4, 4, 4, 16, 4)
     with torch.cuda.device(storage.input.device):
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        arguments = [
+            to_cute(tensor.as_strided((1,), (1,)), alignment)
+            for tensor, alignment in zip(tensors, alignments)
+        ]
+        scale_extent = Int32(storage.scales.shape[1])
         with _compile_lock:
             compiled = _compiled.get(key)
             if compiled is None:
@@ -453,35 +507,25 @@ def run_route_quant(storage):
                     raise RuntimeError(
                         "Warm the route token bucket before graph capture"
                     )
-                types = (
-                    BFloat16,
-                    Int32,
-                    Int32,
-                    Int32,
-                    Int64,
-                    Int32,
-                    Int32,
-                    Int32,
-                    Float8E4M3FN,
-                    Float32,
-                )
-                fake = cute.runtime.make_fake_tensor
-                arguments = [
-                    fake(dtype, tuple(t.shape), tuple(t.stride()), assumed_align=align)
-                    for t, dtype, align in zip(tensors, types, alignments)
-                ]
-                compiled = cute.compile(
-                    RoutePrepare(
-                        bucket,
-                        storage.experts,
-                        topk,
-                        storage.scales.shape[1],
-                        storage.expert_offset,
-                        storage.input.shape[1],
-                    ),
-                    *arguments,
-                    stream,
-                    options="--opt-level=2"
-                )
+                # Warm both finite variants: either full or partial N can be
+                # the first shape subsequently used during graph capture.
+                variants = {}
+                for full_bucket in ((True,) if bucket == 1 else (False, True)):
+                    variants[full_bucket] = cute.compile(
+                        RoutePrepare(
+                            bucket,
+                            full_bucket,
+                            storage.experts,
+                            topk,
+                            storage.expert_offset,
+                            hidden,
+                        ),
+                        *arguments,
+                        Int32(tokens),
+                        scale_extent,
+                        stream,
+                        options="--opt-level=2",
+                    )
+                compiled = variants
                 _compiled[key] = compiled
-        compiled(*(to_cute(t, align) for t, align in zip(tensors, alignments)), stream)
+        compiled[tokens == bucket](*arguments, Int32(tokens), scale_extent, stream)

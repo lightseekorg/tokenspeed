@@ -140,6 +140,7 @@ class CacheGroupRouter(AttentionBackend):
         spec_num_tokens: int,
         device,
         consumed_group_ids: tuple[str, ...] | None,
+        query_sharded: bool = False,
     ) -> None:
         """Args:
         leaf_factory: ``(group_id, block_granularity) -> leaf``; called once
@@ -153,6 +154,8 @@ class CacheGroupRouter(AttentionBackend):
         device: Buffer device.
         consumed_group_ids: Groups served by attention leaves, or None to
             serve every local paged group. Other groups go to peer consumers.
+        query_sharded: Whether this side's config carries a query-context
+            shard; False without ``--query-context-parallel-size``.
         """
         self._leaf_factory = leaf_factory
         self._consumed_group_ids = consumed_group_ids
@@ -162,6 +165,7 @@ class CacheGroupRouter(AttentionBackend):
         self.is_draft = bool(is_draft)
         self.spec_num_tokens = max(int(spec_num_tokens or 1), 1)
         self.device = device
+        self._query_sharded = bool(query_sharded)
         # Draft-tree verify: compaction's K/V address table, rebuilt on every pool bind.
         self._tree_verify_armed = False
         self._tree_window_rows: dict[str, tuple[torch.Tensor, int]] = {}
@@ -190,6 +194,16 @@ class CacheGroupRouter(AttentionBackend):
     @property
     def group_ids(self) -> tuple[str, ...]:
         return tuple(self.leaves)
+
+    @property
+    def query_sharded(self) -> bool:
+        """Whether this side computes a query-context shard of the extend span.
+
+        Taken from this side's attention config by :func:`create_paged_router`.
+        A draft planning its own attention family is configured ``qcp_size`` 1
+        even under a sharded target (``model_wide_kwargs``'s ``draft_unsharded``).
+        """
+        return self._query_sharded
 
     def child_backends(self) -> tuple[PagedAttentionBackend, ...]:
         return tuple(self.leaves.values())
@@ -448,9 +462,11 @@ class CacheGroupRouter(AttentionBackend):
     def decode_window_locations(self) -> torch.Tensor:
         """The full-history group's current decode write window view
         (``[decode_bs * tokens_per_req]``, address-stable; a MIXED round's
-        extend requests are skipped). DFLASH reads the TARGET router's verify
-        window through this to copy target-aligned KV into the draft cache
-        (the pools share one page-id space)."""
+        extend requests are skipped). A block drafter writes its KV through the
+        window of ITS OWN router: the target's full-history group when the
+        draft's fields are the target's shape (an MLA depth), a group of its own
+        when its family declares another (a DFlash GQA stack). The page-id
+        spaces differ, so the side asking must be the side writing."""
         return self._decode_window_of(self.group_ids[self._draft_history_index()])
 
     def _decode_window_of(self, gid: str) -> torch.Tensor:
@@ -696,8 +712,11 @@ class CacheGroupRouter(AttentionBackend):
         expands the device tables), so a leaf that gathers history by page
         owner can split the gather without a device sync. A page-sharded
         group's leaf gets the mirror for an extend with a prefix too, to split
-        its prefix-chunk gathers the same way; any other forward reads nothing
-        from the mirror.
+        its prefix-chunk gathers the same way, and for any pure extend, to
+        bound the pages each rank owns (the DSA leaf's owned-width index
+        tiles). Bounded native prefill also uses it for cold batches to keep
+        the receive pages within the scheduler's budget; other forwards read
+        nothing from the mirror.
         """
         del extend_prompt_lens_cpu
         reject_bounded_replay(extend_replay_lens_cpu, "CacheGroupRouter")
@@ -743,7 +762,11 @@ class CacheGroupRouter(AttentionBackend):
                 page_table_cpu=(
                     self.stacks.host_table(gid, block_tables_cpu[gid], num_extends)
                     if sharded
-                    or (extend_with_prefix and gid in self._page_sharded_groups)
+                    or (
+                        gid in self._page_sharded_groups
+                        and (extend_with_prefix or forward_mode.is_extend())
+                    )
+                    or (num_extends > 0 and leaf.prefill_needs_host_page_table)
                     else None
                 ),
             )
@@ -915,7 +938,7 @@ class CacheGroupRouter(AttentionBackend):
             return out
         # CPU reference (unit tests): same slot rule, overflow/holes -> 0.
         bs = cache_start.shape[0]
-        steps = torch.arange(num_tokens, dtype=torch.int64)
+        steps = torch.arange(num_tokens, dtype=torch.int64, device=view.table.device)
         pos = cache_start.to(torch.int64).unsqueeze(1) + steps
         max_num_pages = view.table.shape[1]
         page_idx = (pos // view.page_size).clamp_max(max_num_pages - 1)
@@ -991,6 +1014,12 @@ class CacheGroupRouter(AttentionBackend):
 
     def reads_fp8_kv_scales(self, layer):
         return self._leaf_for(layer).reads_fp8_kv_scales(layer)
+
+    def decode_kv_view(self, layer, token_to_kv_pool):
+        return self._leaf_for(layer).decode_kv_view(layer, token_to_kv_pool)
+
+    def query_dtype(self, layer, forward_mode, activation):
+        return self._leaf_for(layer).query_dtype(layer, forward_mode, activation)
 
     @break_point
     def forward(
@@ -1130,8 +1159,14 @@ class CacheGroupRouter(AttentionBackend):
     def supports_layer_sliding_window(self) -> bool:
         # A window dropped by any leaf is a window dropped, so this is all().
         return bool(self.leaves) and all(
-            getattr(leaf, "supports_layer_sliding_window", False)
-            for leaf in self.leaves.values()
+            leaf.supports_layer_sliding_window for leaf in self.leaves.values()
+        )
+
+    @property
+    def supports_layer_window_sink(self) -> bool:
+        # A sink dropped by any leaf is a sink dropped, as for the window.
+        return bool(self.leaves) and all(
+            leaf.supports_layer_window_sink for leaf in self.leaves.values()
         )
 
     @property
@@ -1174,6 +1209,11 @@ class CacheGroupRouter(AttentionBackend):
         return self._sole_leaf("gather_history_index_k").gather_history_index_k(
             layer_id, token_to_kv_pool, group
         )
+
+    # DSA KVP prefill: top-k over KVP pages tiles by the leaf's planned owned width.
+
+    def prefill_index_columns(self) -> int | None:
+        return self._sole_leaf("prefill_index_columns").prefill_index_columns()
 
     # ------------------------------------------------------------------
     # DSA KPool surface (GLM-5.3-Flash): the model drives the leaf's pooled

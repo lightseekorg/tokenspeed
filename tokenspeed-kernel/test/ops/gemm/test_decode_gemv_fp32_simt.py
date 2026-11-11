@@ -23,9 +23,9 @@
 On the CPU, an exact emulation of the kernel's summation order stays inside
 the forward error bound of that order, and the registry selects the kernel
 only inside its traits: BF16 activations with an FP32 weight and at most 256
-outputs; the launch tile follows the timed bands. Where the BF16x3 split
-kernel also takes the weight, this kernel keeps rows 17 to 96 and the split
-kernel the rows above. On NVIDIA GPUs the kernel equals the emulation bit for
+outputs; the launch tile follows the timed bands. A caller that passes the
+BF16x3 weight split gets the split kernel instead; without one, this kernel
+keeps rows 17 to 96. On NVIDIA GPUs the kernel equals the emulation bit for
 bit, for any row count and tile, and the inputs left to Torch take Torch.
 """
 
@@ -65,8 +65,8 @@ _requires_nvidia = pytest.mark.skipif(
 _requires_split_kernel = pytest.mark.skipif(
     not torch.cuda.is_available()
     or not current_platform().is_nvidia
-    or not (10, 0) <= torch.cuda.get_device_capability() <= (10, 3),
-    reason="the BF16x3 split kernel is registered for SM100 to SM103",
+    or not (9, 0) <= torch.cuda.get_device_capability() <= (10, 3),
+    reason="the BF16x3 split kernel is registered for SM90 to SM103",
 )
 
 
@@ -173,10 +173,14 @@ def nvidia_platform(monkeypatch, b200_platform):
 def test_selection_keeps_the_traits(
     nvidia_platform, dtypes, m, n, k, selected, weight_split
 ):
-    # FP32 activations are left to Torch at every shape. The kernel reads the
-    # FP32 weight, so a BF16 split of it does not change the selection.
+    # FP32 activations are left to Torch at every shape. A split the split
+    # kernel takes (here 256 outputs with K from 2048) goes to it; any other
+    # split leaves the selection unchanged, since this kernel reads the weight.
+    split_kernel = weight_split and dtypes == _MIXED and n == 256 and k >= 2048
     impl = _select(m, n, k, True, *dtypes, weight_split)
-    assert (impl is gluon_simt_gemm_fp32) is (selected and dtypes == _MIXED)
+    assert (impl is gluon_simt_gemm_fp32) is (
+        selected and dtypes == _MIXED and not split_kernel
+    )
     assert _select(m, n, k, False, *dtypes, weight_split) is not gluon_simt_gemm_fp32
 
 
@@ -237,11 +241,13 @@ def _cuda_weight(n: int, k: int) -> Mock:
     return weight
 
 
-def test_split_kernel_keeps_the_rows_above_96(nvidia_platform, monkeypatch):
+def test_a_split_weight_takes_the_split_kernel_from_17_rows(
+    nvidia_platform, monkeypatch
+):
     # Both FP32-weight kernels as registered. They share weights of 256 rows
-    # with K a multiple of 512 from 2048 to 8192: the split is still made for
-    # them, this kernel serves rows 17 to 96 from the FP32 weight whether or
-    # not the split is passed, and the split kernel serves rows from 97.
+    # with K a multiple of 512 from 2048 to 8192: the split kernel serves every
+    # row from 17 when the split is passed, and this kernel rows 17 to 96 from
+    # the FP32 weight when it is not.
     split = Mock(return_value=object())
     monkeypatch.setattr(gemm_api, "split_fp32_weight_bf16x3", split)
     both = (gluon_simt_gemm_fp32, triton_bf16x3_gemm_fp32)
@@ -250,9 +256,10 @@ def test_split_kernel_keeps_the_rows_above_96(nvidia_platform, monkeypatch):
         weight = _cuda_weight(256, k)
         assert mv_weight_split(weight) is split.return_value
         split.assert_called_with(weight)
+        for m in range(17, 97):
+            assert _select(m, 256, k, True, *_MIXED, True) is both[1]
+            assert _select(m, 256, k, True, *_MIXED, False) is both[0]
         for weight_split in (False, True):
-            for m in range(17, 97):
-                assert _select(m, 256, k, True, *_MIXED, weight_split) is both[0]
             # Rows up to 16 are left to other kernels.
             for m in (1, 16):
                 assert _select(m, 256, k, True, *_MIXED, weight_split) not in both
@@ -424,7 +431,7 @@ def test_decode_gemv_routes_rows_17_to_96(m):
 
 @_requires_split_kernel
 @pytest.mark.parametrize("m", [17, 96, 97, 128])
-def test_split_weight_takes_this_kernel_up_to_96_rows(m):
+def test_a_split_weight_runs_the_split_kernel(m):
     torch.manual_seed(m)
     x = torch.randn(m, 7168, device="cuda", dtype=torch.bfloat16)
     weight = torch.randn(256, 7168, device="cuda") * 0.02
@@ -433,11 +440,7 @@ def test_split_weight_takes_this_kernel_up_to_96_rows(m):
     out = torch.full((m, 256), float("nan"), device="cuda")
     _select.cache_clear()
     assert mv(x, weight, out, weight_split=pieces) is out
-    if m <= 96:
-        expected = gluon_simt_gemm_fp32(x, weight)
-    else:
-        expected = triton_bf16x3_gemm_fp32(x, pieces)
-    assert torch.equal(_bits(out), _bits(expected))
+    assert torch.equal(_bits(out), _bits(triton_bf16x3_gemm_fp32(x, pieces)))
 
 
 @_requires_nvidia

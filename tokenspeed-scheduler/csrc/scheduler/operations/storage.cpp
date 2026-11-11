@@ -24,6 +24,8 @@
 #include <limits>
 #include <stdexcept>
 
+#include <spdlog/spdlog.h>
+
 #include "cache/prefix/prefix_hasher.h"
 #include "fsm/storage_events.h"
 
@@ -56,9 +58,12 @@ StorageStats Scheduler::GetStorageStats() const {
 
 void Scheduler::expireStorage(Request& request) {
     if (request.Is<fsm::Prefetching>()) {
+        spdlog::debug("[L3] rid={} op_id={} prefetch timed out", request.Id(),
+                      request.GetIf<fsm::Prefetching>()->lease.OperationId());
         ++storage_wait_timeouts_;
     } else if (const auto* admission = request.AdmissionResourcesPtr();
                admission != nullptr && admission->storage_hold) {
+        spdlog::debug("[L3] rid={} ready hold expired before admission", request.Id());
         ++storage_ready_expirations_;
     }
     releaseStorage(request);
@@ -97,15 +102,13 @@ void Scheduler::handleEvent(const cache::StorageDetach& event) {
 
 void Scheduler::releaseStorage(Request& request) {
     if (!storage_transfers_) return;
-    if (const auto* prefetch = request.GetIf<fsm::Prefetching>()) {
-        storage_transfers_->Detach(prefetch->operation_id);
+    // The request gives L3 up and keeps its place: the lease on the operation
+    // it waits for, or on its Ready data, dies with the wait.
+    if (request.Is<fsm::Prefetching>()) {
         request.Apply(fsm::FinishPrefetchEvent{std::nullopt});
     }
     if (auto* admission = request.AdmissionResourcesPtr()) {
-        if (admission->storage_hold) {
-            storage_transfers_->Detach(admission->storage_hold->operation_id);
-            admission->storage_hold.reset();
-        }
+        admission->storage_hold.reset();
         admission->storage_prepared = true;
     }
 }
@@ -114,11 +117,13 @@ void Scheduler::prepareStorage(Request& request) {
     if (!storage_transfers_) return;
     const auto& limits = storage_transfers_->Config();
     if (auto* state = request.GetIf<fsm::Prefetching>()) {
-        if (storage_transfers_->Completed(state->operation_id) && !storage_transfers_->IsQuery(state->operation_id)) {
+        const std::uint64_t operation = state->lease.OperationId();
+        if (storage_transfers_->Completed(operation) && !storage_transfers_->IsQuery(operation)) {
             const auto deadline =
                 storage_now_us_ +
                 std::min(limits.ready_timeout_us, std::numeric_limits<std::int64_t>::max() - storage_now_us_);
-            request.Apply(fsm::FinishPrefetchEvent{fsm::StorageReadyHold{state->operation_id, deadline}});
+            spdlog::debug("[L3] rid={} op_id={} prefetch read completed", request.Id(), operation);
+            request.Apply(fsm::FinishPrefetchEvent{deadline});
             return;
         }
         if (storage_now_us_ >= state->deadline_us) {
@@ -133,21 +138,32 @@ void Scheduler::prepareStorage(Request& request) {
         // bounded local check does not rehash the prompt while it waits.
         const auto probe = coordinator_.ProbePromptPrefix(prompt);
         if (std::max(probe.device.num_common_tokens, probe.host.num_common_tokens) >= state->max_tokens) {
+            spdlog::debug("[L3] rid={} op_id={} prefetch released: prefix available locally", request.Id(), operation);
             releaseStorage(request);
             return;
         }
         // Congestion skips a new GET; an existing GET keeps its original
         // deadline and Host references until native retirement.
-        if (storage_transfers_->IsQuery(state->operation_id) && storage_transfers_->PressureGateClosed()) {
+        if (storage_transfers_->IsQuery(operation) && storage_transfers_->PressureGateClosed()) {
             ++storage_pressure_bypasses_;
+            spdlog::debug("[L3] rid={} op_id={} prefetch read skipped under storage pressure", request.Id(), operation);
             releaseStorage(request);
             return;
         }
-        if (!storage_transfers_->Completed(state->operation_id) || !storage_allowed_) return;
-        const auto hits = storage_transfers_->QueryHits(state->operation_id);
-        storage_transfers_->Detach(state->operation_id);
-        state->operation_id = storage_transfers_->StartRead(prompt, hits);
-        if (!state->operation_id) releaseStorage(request);
+        if (!storage_transfers_->Completed(operation) || !storage_allowed_) return;
+        const auto hits = storage_transfers_->QueryHits(operation);
+        // The finished query retires before the GET starts: CanStart counts
+        // its ticket.
+        state->lease.reset();
+        state->lease = storage_transfers_->StartRead(prompt, hits);
+        if (state->lease) {
+            spdlog::debug("[L3] rid={} op_id={} query_op_id={} hit_keys={} prefetch read enqueued", request.Id(),
+                          state->lease.OperationId(), operation, hits.size());
+        } else {
+            spdlog::debug("[L3] rid={} query_op_id={} hit_keys={} prefetch read skipped", request.Id(), operation,
+                          hits.size());
+            releaseStorage(request);
+        }
         return;
     }
 
@@ -158,6 +174,7 @@ void Scheduler::prepareStorage(Request& request) {
     if (config_.role == Role::kD || config_.disable_prefix_cache) return;
     if (!storage_transfers_->CanStart()) {
         if (storage_transfers_->PressureGateClosed()) ++storage_pressure_bypasses_;
+        spdlog::debug("[L3] rid={} prefetch query skipped: storage unavailable or out of credits", request.Id());
         return;
     }
     const auto grain = config_.prefix_granularity;
@@ -184,19 +201,38 @@ void Scheduler::prepareStorage(Request& request) {
     setBound(max_tokens);
     const auto probe = coordinator_.ProbePromptPrefix(prompt());
     const auto local = std::max(probe.device.num_common_tokens, probe.host.num_common_tokens);
-    if (max_tokens - local < limits.min_prefetch_tokens) return;
+    if (max_tokens - local < limits.min_prefetch_tokens) {
+        spdlog::debug("[L3] rid={} missing_tokens={} below prefetch minimum={}", request.Id(), max_tokens - local,
+                      limits.min_prefetch_tokens);
+        return;
+    }
     const auto end = std::min<std::int64_t>(max_tokens, static_cast<std::int64_t>(local) + limits.max_prefetch_tokens);
     setBound(static_cast<std::int32_t>(end));
     auto query = coordinator_.MissingStorageKeys(prompt(), limits.max_keys_per_operation);
     setBound(query.max_tokens);
     auto keys = std::move(query.keys);
+    auto key_tokens = std::move(query.key_tokens);
     if (bound - local < limits.min_prefetch_tokens || keys.empty()) return;
+    _assert(key_tokens.size() == keys.size(), "Each storage query key needs a token span");
     // A known failed immutable object remains unavailable for this attempt.
-    std::erase_if(keys, [this](const auto& key) { return storage_transfers_->IsNegative(key); });
-    const auto operation = storage_transfers_->StartQuery(std::move(keys));
-    if (!operation) return;
+    std::size_t kept = 0;
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        if (storage_transfers_->IsNegative(keys[i])) continue;
+        keys[kept] = keys[i];
+        key_tokens[kept] = key_tokens[i];
+        ++kept;
+    }
+    keys.resize(kept);
+    key_tokens.resize(kept);
+    StorageLease query_lease = storage_transfers_->StartQuery(std::move(keys), std::move(key_tokens));
+    if (!query_lease) {
+        spdlog::debug("[L3] rid={} prefetch query skipped: no ticket, eligible_keys={}", request.Id(), kept);
+        return;
+    }
+    spdlog::debug("[L3] rid={} op_id={} local_tokens={} bound_tokens={} keys={} prefetch query enqueued", request.Id(),
+                  query_lease.OperationId(), local, bound, kept);
     const auto deadline =
         storage_now_us_ + std::min(limits.wait_timeout_us, std::numeric_limits<std::int64_t>::max() - storage_now_us_);
-    request.Apply(fsm::StartPrefetchEvent{operation, deadline, std::move(hashes), bound, std::move(tail)});
+    request.Apply(fsm::StartPrefetchEvent{std::move(query_lease), deadline, std::move(hashes), bound, std::move(tail)});
 }
 }  // namespace tokenspeed

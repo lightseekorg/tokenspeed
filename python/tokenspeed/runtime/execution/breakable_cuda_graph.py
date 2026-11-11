@@ -37,8 +37,10 @@ full prefill graph, attention and request-shaped state updates stay eager, so
 live lengths and cache addresses never enter a captured segment. A KV-cache
 read or write in an eager break waits for its layer's Host load there; one a
 captured segment makes (an attention prologue's KV write, an inline KDA
-layer's state read) holds no such wait, so ``PrefillGraph.replay`` waits for
-the plan's whole Host load before the first segment.
+layer's state read) cannot hold that wait, so the capture notes the highest
+layer each segment's accesses ask that wait for
+(:meth:`BreakableCapture.wait_before_segment`) and
+:meth:`BreakableCapture.replay` waits for it before replaying the segment.
 
 Address-stability contract (the load-bearing invariant):
 
@@ -56,7 +58,6 @@ from __future__ import annotations
 import dataclasses
 import functools
 import gc
-from collections import deque
 from collections.abc import Callable, Generator
 from contextlib import AbstractContextManager, contextmanager
 from typing import Any
@@ -74,6 +75,7 @@ __all__ = [
     "current_forward_ctx",
     "current_valid_rows",
     "is_breakable_capture_active",
+    "run_eager",
     "scrub_padding_tail",
     "slice_to_real_tokens",
     "weak_ref_tensor",
@@ -205,6 +207,15 @@ class BreakableCapture:
             its documented "pass the same stream for effective memory sharing".
         handoff_storage: An optional handoff storage map shared with captures that
             never replay while this one's handoffs are live; see ``_handoff_view``.
+        run_segments_while_capturing: Whether each segment runs once as soon
+            as it is captured, before the break that follows it (default
+            False). A capture records a segment's kernels without running
+            them, so without this a break that runs during the capture reads
+            whatever the pool held for the tensors the segment computes, and
+            one that indexes with such a tensor can fault. Replays are
+            unaffected. The drafter's extend captures need it: their breaks
+            index with the top-k rows the narrowing gathers and with positions
+            a captured step advances.
     """
 
     _active: BreakableCapture | None = None
@@ -215,9 +226,18 @@ class BreakableCapture:
         pool: Any | None = None,
         stream: torch.cuda.Stream | None = None,
         handoff_storage: dict[HandoffSlot, torch.Tensor] | None = None,
+        *,
+        run_segments_while_capturing: bool = False,
     ) -> None:
         self.pool = pool
+        self._run_segments_while_capturing = run_segments_while_capturing
         self.segments: list[Callable[[], Any]] = []
+        # Per entry of ``segments``, the (wait, layer) calls a replay makes
+        # before it: a captured segment's cache accesses hold no layerwise
+        # Host-load wait, so the capture notes the highest layer each segment
+        # asks each wait for (see wait_before_segment); breaks wait themselves.
+        self.segment_waits: list[tuple[tuple[Callable[[int], None], int], ...]] = []
+        self._current_waits: dict[Callable[[int], None], int] = {}
         self._current_graph: torch.cuda.CUDAGraph | None = None
         self._capturing = False
         if stream is None:
@@ -291,6 +311,7 @@ class BreakableCapture:
         else:
             graph.capture_begin()
         self._current_graph = graph
+        self._current_waits = {}
         self._capturing = True
 
     def _end_segment(self) -> None:
@@ -299,6 +320,7 @@ class BreakableCapture:
         assert self._current_graph is not None
         self._current_graph.capture_end()
         self.segments.append(self._current_graph.replay)
+        self.segment_waits.append(tuple(self._current_waits.items()))
         # All segments share one pool so intermediate addresses stay stable.
         if self.pool is None:
             self.pool = self._current_graph.pool()
@@ -314,15 +336,30 @@ class BreakableCapture:
         """
         assert self._capturing, "add_eager called outside an active capture"
         self._end_segment()
+        if self._run_segments_while_capturing:
+            # The segment just captured recorded its kernels without running them.
+            self.segments[-1]()
         result = fn()
         self.segments.append(fn)
+        self.segment_waits.append(())
         self._begin_segment()
         return result
 
+    def wait_before_segment(self, wait: Callable[[int], None], layer: int) -> None:
+        """Make every replay call ``wait(layer)`` before the segment being captured.
+
+        ``wait``'s layers must complete in order (a layerwise Host-load
+        wait): the segment keeps only the highest layer noted per wait.
+        """
+        assert self._capturing, "wait_before_segment called outside a segment"
+        self._current_waits[wait] = max(layer, self._current_waits.get(wait, layer))
+
     # -- replay ------------------------------------------------------------
 
-    def replay(self, valid_rows: int | None = None) -> None:
-        """Replay all segments in order.
+    def replay(
+        self, valid_rows: int | None = None, *, noted_waits_done: bool = False
+    ) -> None:
+        """Replay all segments in order, each behind the waits its capture noted.
 
         Breaks read the live forward context from the ambient :func:`active_forward`
         scope (the runner wraps replay in it).
@@ -332,11 +369,18 @@ class BreakableCapture:
                 each eager break, handoff rows beyond this prefix are cleared
                 before the following graph segment consumes them. ``None``
                 leaves handoff buffers unchanged.
+            noted_waits_done: The current stream has already waited for
+                everything the noted waits wait for (a prefill graph's wait
+                for the whole Host load), so the replay skips them.
         """
         previous_valid_rows = _replay_valid_rows
         _set_replay_valid_rows(valid_rows)
         try:
-            deque((run() for run in self.segments), maxlen=0)
+            for waits, run in zip(self.segment_waits, self.segments, strict=True):
+                if not noted_waits_done:
+                    for wait, layer in waits:
+                        wait(layer)
+                run()
         finally:
             _set_replay_valid_rows(previous_valid_rows)
 
@@ -349,6 +393,29 @@ def is_breakable_capture_active() -> bool:
     """True while a :class:`BreakableCapture` is open AND currently capturing."""
     cap = BreakableCapture.current()
     return cap is not None and cap._capturing
+
+
+def run_eager(fn: Callable[[], Any]) -> Any:
+    """Call ``fn()``; under a breakable capture, also on every replay.
+
+    For a side-effecting step whose effect a captured segment cannot carry:
+    one that updates host-side state later breaks read (a backend's published
+    write window, a per-forward memo), or whose device writes land at
+    addresses that host state picks per forward. Under a capture the current
+    segment ends, ``fn`` runs and is recorded as a break, and the next segment
+    starts; :meth:`BreakableCapture.replay` re-invokes it in order. ``fn``
+    binds its arguments at capture time, so a tensor it reads must keep its
+    address across replays (a static buffer, or a graph tensor the closure
+    holds and an earlier segment rewrites). Outside a capture -- eager, or a
+    plain ``torch.cuda.graph`` capture -- it is a direct call.
+
+    Returns:
+        ``fn``'s result from this call.
+    """
+    cap = BreakableCapture.current()
+    if cap is None or not cap._capturing:
+        return fn()
+    return cap.add_eager(fn)
 
 
 def _record_break(

@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel._optional import has_optional_package
 from tokenspeed_kernel.ops.residual.triton import (
     _mhc_mixes_impl,
     _mhc_pre_impl,
@@ -128,7 +129,58 @@ def deep_gemm_mhc_shifted_post_pre_norm(
     )
 
 
-if platform.is_hopper_plus:
+@register_kernel(
+    "residual",
+    "mhc_shifted_post_pre_norm_quantize_fp8",
+    name="deep_gemm_mhc_shifted_post_pre_norm_quantize_fp8",
+    solution="deep_gemm",
+    capability=CapabilityRequirement(
+        min_arch_version=ArchVersion(10, 0),
+        max_arch_version=ArchVersion(10, 9),
+        vendors=frozenset({"nvidia"}),
+    ),
+    signatures=frozenset(
+        {format_signature(residual=dense_tensor_format(torch.bfloat16))}
+    ),
+    priority=Priority.PERFORMANT,
+)
+def deep_gemm_mhc_shifted_post_pre_norm_quantize_fp8(
+    x,
+    residual,
+    pre,
+    post,
+    comb,
+    weight,
+    scale,
+    base,
+    rms_eps,
+    hc_eps,
+    sinkhorn_iters,
+    norm_weight,
+    norm_eps,
+):
+    from tokenspeed_kernel.thirdparty.cuda.mega_mhc import (
+        shifted_post_pre_norm_quantize_fp8,
+    )
+
+    return shifted_post_pre_norm_quantize_fp8(
+        x,
+        residual,
+        pre,
+        post,
+        comb,
+        weight,
+        scale,
+        base,
+        rms_eps,
+        hc_eps,
+        sinkhorn_iters,
+        norm_weight,
+        norm_eps,
+    )
+
+
+if platform.is_hopper_plus and has_optional_package("deep_gemm"):
     prepare_cuda_toolkit_env()
     from deep_gemm import (
         get_pdl,

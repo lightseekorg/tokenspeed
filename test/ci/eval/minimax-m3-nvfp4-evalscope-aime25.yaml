@@ -5,6 +5,10 @@ workflow_stage: model-test
 triggers:
   - per-commit
   - manual
+# The model modules this task serves; pull requests changing only other models skip it.
+model_sources:
+  - python/tokenspeed/runtime/models/llama.py
+  - python/tokenspeed/runtime/models/minimax_m3.py
 runner:
   labels:
     - b200-4gpu
@@ -28,7 +32,6 @@ server:
     --speculative-eagle-topk 1
     --speculative-num-draft-tokens 4
     --disable-kvstore
-    --block-size 128
     --trust-remote-code
     --host 127.0.0.1
     --port 8000

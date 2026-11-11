@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 
 import pytest
 import torch
@@ -41,6 +42,14 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.fp16 import (  # noqa: E402
 pytestmark = pytest.mark.skipif(not is_cdna4(), reason="requires AMD gfx950 GPU")
 
 
+@dataclass
+class _SwigluArg:
+    """The SwiGLU parameters the MoE kernels read from ``module.swiglu_arg``."""
+
+    alpha: float
+    limit: float
+
+
 class _PackedModule(torch.nn.Module):
     def __init__(
         self,
@@ -52,8 +61,6 @@ class _PackedModule(torch.nn.Module):
         num_experts_total: int,
     ) -> None:
         super().__init__()
-        from tokenspeed.runtime.layers.activation import SwigluArg
-
         self.w13_weight = packed13
         self.w2_weight = packed2
         self.w13_weight_scale_inv = scales13
@@ -62,7 +69,7 @@ class _PackedModule(torch.nn.Module):
         self.num_experts = num_experts_total
         self.ep_rank = rank
         self.ep_size = num_experts_total // self.num_local_experts
-        self.swiglu_arg = SwigluArg(alpha=1.0, limit=7.0)
+        self.swiglu_arg = _SwigluArg(alpha=1.0, limit=7.0)
 
 
 def _run_packed(
@@ -117,10 +124,9 @@ def _whole_call_kernels() -> tuple[object, ...]:
         warp_decode._stage2_fp8_warp_gemv,
         moe_align_fused._fused_align_kernel,
         moe_align_device._prepare_small_kernel,
-        moe_align_device._init_kernel,
-        moe_align_device._count_kernel,
-        moe_align_device._offsets_kernel,
         moe_align_device._scatter_kernel,
+        moe_align_device._chunk_count_kernel,
+        moe_align_device._chunk_scatter_kernel,
         _fp8_token_group_quantize_kernel,
         packed_small.gluon_fp8_packed_small_stage1_gfx950,
         packed_small.gluon_fp8_packed_small_stage2_gfx950,

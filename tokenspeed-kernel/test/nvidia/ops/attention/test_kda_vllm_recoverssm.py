@@ -82,18 +82,26 @@ def _reference(
 
 
 @pytest.mark.parametrize(
-    "width,accepted",
+    "batch,width,accepted",
     [
-        (width, accepted)
+        (8 if width == 16 else 4, width, accepted)
         for width in (1, 2, 3, 4, 8, 16)
         for accepted in range(width + 1)
+    ]
+    # Above eight requests verify widens its value tile for windows below eight.
+    + [
+        (16, width, accepted)
+        for width in (4, 8, 16)
+        for accepted in (0, width // 2, width)
     ],
 )
 @pytest.mark.parametrize("dim", [64, 128])
-def test_vllm_recoverssm_verify_and_commit(width: int, accepted: int, dim: int) -> None:
+def test_vllm_recoverssm_verify_and_commit(
+    batch: int, width: int, accepted: int, dim: int
+) -> None:
     torch.manual_seed(7331)
     device = "cuda"
-    batch, heads = (8 if width == 16 else 4, 12)
+    heads = 12
     q = torch.randn(batch, width, heads, dim, device=device).bfloat16()
     k = torch.randn_like(q)
     v = torch.randn_like(q).mul_(0.2)
@@ -820,6 +828,7 @@ def test_verify_derived_records_with_serving_producers(
             ),
             g_raw=gate,
             conv_qkv=qkv,
+            output_norm=None,
         )
     else:
         kernel = select_kernel(

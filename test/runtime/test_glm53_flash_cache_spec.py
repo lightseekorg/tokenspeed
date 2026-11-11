@@ -15,7 +15,6 @@ from tokenspeed.runtime.layers.attention.configs.linear_attn import (
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import CacheRecipe
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.glm53_flash import (
-    GLM53_FLASH_LOGICAL_BLOCK_TOKENS,
     Glm53FlashPoolOptions,
     Glm53FlashRecipe,
 )
@@ -84,7 +83,6 @@ def _recipe(
         dtype=torch.bfloat16,
         kv_cache_dtype=mla_cache_dtype,
         kv_cache_quant_method="none",
-        prefix_granularity=GLM53_FLASH_LOGICAL_BLOCK_TOKENS,
         context_len=4096,
         max_bs=16,
         pd_disaggregation_enabled=pd_disaggregation_enabled,

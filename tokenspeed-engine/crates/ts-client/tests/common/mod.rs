@@ -224,6 +224,7 @@ async fn run(
                         finished.then_some("length"),
                         prompt,
                         &running,
+                        request.return_logprob,
                     );
                     output.send(single(batch)).await.unwrap();
                 }
@@ -231,7 +232,7 @@ async fn run(
             EngineRequest::Abort(rids) => {
                 for rid in rids {
                     if running.remove(&rid) {
-                        let batch = step(index, &rid, 2, Some("abort"), 0, &running);
+                        let batch = step(index, &rid, 2, Some("abort"), 0, &running, false);
                         output.send(single(batch)).await.unwrap();
                     }
                 }
@@ -273,6 +274,7 @@ fn step(
     finish: Option<&str>,
     prompt: i64,
     running: &HashSet<String>,
+    return_logprob: bool,
 ) -> Vec<Bytes> {
     let token = 1000 * i32::from(index) + k as i32;
     EngineOutput::Batch(Box::new(BatchTokenIDOutSlim {
@@ -286,8 +288,17 @@ fn step(
         prompt_tokens: vec![prompt],
         completion_tokens: vec![k],
         cached_tokens: vec![0],
-        output_token_logprobs_val: vec![vec![]],
-        output_token_logprobs_idx: vec![vec![]],
+        output_token_logprobs_val: vec![if return_logprob {
+            vec![-(k as f64) / 10.0]
+        } else {
+            vec![]
+        }],
+        output_token_logprobs_idx: vec![if return_logprob { vec![token] } else { vec![] }],
+        output_token_cumulative_probs_val: if return_logprob {
+            vec![vec![k as f64 / 10.0]]
+        } else {
+            vec![]
+        },
         engine_index: i64::from(index),
         num_running: running.len() as i64,
         num_waiting: 0,
@@ -303,6 +314,7 @@ fn step(
         input_top_logprobs_idx: vec![],
         output_top_logprobs_val: vec![],
         output_top_logprobs_idx: vec![],
+        reasoning_tokens: vec![k * 10],
     }))
     .to_frames()
 }

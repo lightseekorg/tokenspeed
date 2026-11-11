@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Token-local MLA preserves request boundaries and bounded page reads."""
+"""MLA head shards share full queries and compact KV page history."""
 
 from dataclasses import dataclass
 
@@ -29,7 +29,10 @@ from tokenspeed.runtime.layers.attention.backends.paged.ascend_mla import (
     AscendMLABackend,
     mla_prefill_spans,
 )
-from tokenspeed.runtime.layers.attention.dcp.ascend import AscendPrefillPlan
+from tokenspeed.runtime.layers.attention.dcp.ascend import (
+    AscendPrefillOptions,
+    AscendPrefillPlan,
+)
 from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
 from tokenspeed.runtime.layers.attention.mla.ascend import AscendMLAAttention
 
@@ -135,6 +138,7 @@ def test_head_shards_share_full_query_metadata_and_receive_page_addresses(
             topk=1,
             local_cache_pages=32,
             query_partition=(0, 146),
+            options=AscendPrefillOptions(146, 128),
         )
         for rank in range(degree)
     ]
@@ -154,7 +158,21 @@ class CPUOwnerCommit:
     current: torch.Tensor
     cache: torch.Tensor
 
-    def patch(self, layer_id, slots, direct, *, width, block_rows, virtual_blocks):
+    def patch(
+        self,
+        layer_id,
+        slots,
+        direct,
+        *,
+        slots_workspace,
+        mapped_slots,
+        width,
+        block_rows,
+        virtual_blocks,
+    ):
+        committed = slots_workspace[: slots.numel()]
+        committed.copy_(slots)
+        slots = committed
         live = (slots >= block_rows) & (slots < virtual_blocks * block_rows)
         self.cache.index_copy_(0, slots[live].long(), self.current[live])
 
@@ -184,6 +202,9 @@ def test_prefill_commits_router_slots_across_request_and_page_boundaries(
     cache = torch.full((7 * page, 576), -1, dtype=torch.int32)
     backend = object.__new__(AscendMLABackend)
     backend._prefill_runtime = CPUOwnerCommit(current, cache)
+    from tokenspeed.runtime.layers.attention.dcp.ascend import AscendPrefillOptions
+
+    backend._prefill_slots = torch.empty(total, dtype=torch.int64)
     backend._placement = CachePlacement(page, 7, (0,), 0)
     backend._prefill_plan = AscendPrefillPlan.build(
         RequestMetadata(torch.tensor(extends), torch.tensor(prefixes), table),
@@ -194,6 +215,7 @@ def test_prefill_commits_router_slots_across_request_and_page_boundaries(
         topk=1,
         local_cache_pages=7,
         query_partition=(0, total),
+        options=AscendPrefillOptions(total, 128),
     )
     backend.consume_prefill_kv(7, slots[0])
     expected = torch.full_like(cache, -1)
@@ -485,16 +507,16 @@ def _prefill_cache_and_backend(monkeypatch, *, options):
         max_padding_fraction=float("inf"),
     )
     arena = CacheArena(layout.bind(3), "npu", cache_group_specs=(group,))
-    kwargs = dict(
-        arena=arena,
-        dtype=torch.bfloat16,
-        model_dtype=torch.bfloat16,
-        quant_method="none",
-        kv_lora_rank=512,
-        qk_rope_head_dim=64,
-        layer_num=1,
-        rank=0,
-    )
+    kwargs = {
+        "arena": arena,
+        "dtype": torch.bfloat16,
+        "model_dtype": torch.bfloat16,
+        "quant_method": "none",
+        "kv_lora_rank": 512,
+        "qk_rope_head_dim": 64,
+        "layer_num": 1,
+        "rank": 0,
+    }
     if options is None:
         pool = MLATokenToKVPool(**kwargs)
     else:
@@ -521,7 +543,6 @@ def _prefill_cache_and_backend(monkeypatch, *, options):
         dtype=torch.bfloat16,
         kv_cache_dtype=torch.bfloat16,
         kv_cache_quant_method="none",
-        prefix_granularity=128,
         context_len=512,
         max_bs=4,
         components=(spec,),
@@ -530,7 +551,7 @@ def _prefill_cache_and_backend(monkeypatch, *, options):
 
 
 @pytest.mark.parametrize("engine", ["null", "prefill", "decode"])
-def test_ordinary_mla_cache_keeps_prefix_history_without_native_library(
+def test_unsupported_mla_cache_keeps_prefix_history_without_transport(
     monkeypatch, engine
 ):
     from tokenspeed.runtime.utils.env import global_server_args_dict
@@ -540,7 +561,8 @@ def test_ordinary_mla_cache_keeps_prefix_history_without_native_library(
     monkeypatch.delenv("TOKENSPEED_DSA_CP_LIBRARY", raising=False)
     pool, backend = _prefill_cache_and_backend(monkeypatch, options=None)
     backend.set_cache_pool(pool)
-    assert backend.prepare_prefill_workspace() == 0
+    assert backend.prepare_prefill() == 0
+    assert backend._prefill_slots is None
     rows = pool.get_key_buffer(0).view(-1, 576)
     rows[128:255].fill_(7)
     backend._init_prefill_metadata(
@@ -567,34 +589,202 @@ def test_ordinary_mla_cache_keeps_prefix_history_without_native_library(
         torch.testing.assert_close(rotary.cpu(), torch.full_like(rotary.cpu(), 7))
 
 
-def test_native_prefill_requires_its_reserved_budget_before_loading_library(
-    monkeypatch,
-):
+def test_prefill_cache_binding_needs_no_transport_library_or_buffers(monkeypatch):
     from tokenspeed.runtime.layers.attention.dcp.ascend import AscendPrefillOptions
 
     monkeypatch.delenv("TOKENSPEED_DSA_CP_LIBRARY", raising=False)
     pool, backend = _prefill_cache_and_backend(
-        monkeypatch, options=AscendPrefillOptions(129, 1)
+        monkeypatch, options=AscendPrefillOptions(129, 128)
     )
-    with pytest.raises(ValueError, match="cache recipe reserved"):
+    backend.set_cache_pool(pool)
+    assert backend.prefill_enabled
+    assert backend._prefill_runtime is None
+    assert backend._prefill_slots is None
+
+
+def test_mla_backend_releases_temporary_commit_slots_after_consumption(
+    monkeypatch, tmp_path
+):
+    import os
+
+    import torch.distributed as dist
+
+    import tokenspeed.runtime.distributed.process_group_manager as groups
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.layers.attention.dcp.ascend import AscendPrefillOptions
+
+    options = AscendPrefillOptions(129, 128)
+    pool, backend = _prefill_cache_and_backend(monkeypatch, options=options)
+    if not os.environ.get("TOKENSPEED_DSA_CP_LIBRARY"):
+        pytest.skip("requires the native Prefill transport library")
+    manager = groups.ProcessGroupManager()
+    monkeypatch.setattr(groups, "process_group_manager", manager)
+    manager.init_emulated_rank_zero(
+        f"file://{tmp_path}/bootstrap", "gloo", timeout=60, device_id=None
+    )
+    manager.init_process_group((0,), "gloo")
+    try:
         backend.set_cache_pool(pool)
+        assert backend._prefill_runtime is None
+        backend.configure_runtime(
+            block_granularity=128,
+            virtual_block_count=pool.arena.runtime_contract.virtual_block_counts[
+                "full_attention"
+            ],
+            shard_count=1,
+        )
+        backend.init_forward_metadata(
+            bs=1,
+            num_extends=1,
+            forward_mode=ForwardMode.EXTEND,
+            seq_lens=torch.tensor([1], device="npu", dtype=torch.int32),
+            extend_prefix_lens=torch.tensor([0], device="npu", dtype=torch.int32),
+            extend_prefix_lens_cpu=torch.tensor([0], dtype=torch.int32),
+            extend_seq_lens=torch.tensor([1], device="npu", dtype=torch.int32),
+            extend_seq_lens_cpu=torch.tensor([1], dtype=torch.int32),
+            page_table=torch.tensor([[1, 0, 0, 0]], device="npu", dtype=torch.int32),
+            page_table_cpu=torch.tensor([[1, 0, 0, 0]], dtype=torch.int32),
+            extend_with_prefix=False,
+            query_shard=None,
+        )
+        assert backend._prefill_runtime is None
+        backend.prefetch_prefill_layer(0)
+        assert backend._prefill_slots.numel() == 1
+        for value in (1, 2):
+            if value > 1:
+                backend.prefetch_prefill_layer(0)
+            current = torch.full((1, 576), value, dtype=torch.bfloat16, device="npu")
+            backend.start_prefill_kv(0, current)
+            backend.consume_prefill_kv(
+                0, torch.tensor([128], dtype=torch.int32, device="npu")
+            )
+            backend.finish_prefill_layer(0)
+            torch.testing.assert_close(
+                pool.get_key_buffer(0).view(-1, 576)[128].cpu(),
+                current[0].cpu(),
+                rtol=0,
+                atol=0,
+            )
+            assert backend._prefill_slots is None
+            assert backend._prefill_runtime.workspace_bytes == 0
+    finally:
+        backend.close_prefill()
+        dist.destroy_process_group()
+    assert backend._prefill_slots is None
 
 
-@pytest.mark.parametrize("degree", [1, 8, 16])
-@pytest.mark.parametrize("index_width", [0, 128])
-def test_native_workspace_reservation_includes_history_current_and_send(
-    degree, index_width
+@pytest.mark.parametrize("rows,page_size", [(0, 128), (1, 0), (-1, 128)])
+def test_prefill_requires_positive_physical_geometry(rows, page_size):
+    with pytest.raises(ValueError, match="positive"):
+        AscendPrefillOptions(rows, page_size)
+
+
+@pytest.mark.parametrize("degree", [1, 8])
+@pytest.mark.parametrize("page_size", [64, 128])
+def test_bounded_prefill_counts_all_requests_and_compacts_owner_pages(
+    degree, page_size
 ):
     from tokenspeed.runtime.layers.attention.dcp.ascend import AscendPrefillOptions
 
-    # One history page per owner, one current page per owner and one send page.
-    size = (degree * 128 * 2 + 128) * (576 + index_width) * 2
-    exact = AscendPrefillOptions(1, size)
-    assert (
-        exact.check_workspace(local_rows=128, degree=degree, index_width=index_width)
-        == size
-    )
-    with pytest.raises(ValueError, match="cache recipe reserved"):
-        AscendPrefillOptions(1, size - 1).check_workspace(
-            local_rows=128, degree=degree, index_width=index_width
+    table = torch.tensor([[2, 3, 4, 5], [2, 3, 6, 7]], dtype=torch.int32)
+    metadata = RequestMetadata(torch.tensor([3, 17]), torch.tensor([127, 63]), table)
+    # Each request rounds to a 128-token scheduler page separately: 2 + 1.
+    options = AscendPrefillOptions(20, kv_page_size=128)
+    placement = CachePlacement(128, 33, tuple(range(degree)), 0)
+    plans = [
+        AscendPrefillPlan.build(
+            metadata,
+            placement,
+            degree=degree,
+            rank=rank,
+            page_size=page_size,
+            topk=1,
+            local_cache_pages=64,
+            query_partition=(0, 20),
+            options=options,
         )
+        for rank in range(degree)
+    ]
+    for plan in plans:
+        assert plan.gather is not None
+        assert sum(plan.gather.row_counts) <= 3 * 128
+        assert plan.gather.table[0, 0] == plan.gather.table[1, 0]
+        expected = []
+        for req, (prefix, count) in enumerate([(127, 3), (63, 17)]):
+            expected.extend(
+                int(plan.gather.table[req, pos // page_size]) * page_size
+                + pos % page_size
+                for pos in range(prefix, prefix + count)
+            )
+        assert plan.patch_slots.tolist() == expected
+    # Runtime compaction depends on actual referenced pages, not admission.
+    requested = set(
+        table[0, : -(-130 // page_size)].tolist()
+        + table[1, : -(-80 // page_size)].tolist()
+    )
+    assert sum(plans[0].gather.row_counts) == len(requested) * page_size
+
+
+def test_mla_merge_packs_true_partials_and_uses_prepared_producer(monkeypatch):
+    from tokenspeed_kernel.ops.attention.mla.ascend import ascend_mla_merge
+    from tokenspeed_kernel_npu.ops import mla_dcp
+
+    class CpuPartialKernel:
+        # Supply the absent NPU kernel while retaining the real packer's checks.
+        def __getitem__(self, grid):
+            def run(partial, lse, visible, active, producer, maximum, rows, heads):
+                live = active & (visible > 0)
+                producer.copy_(partial.permute(1, 0, 2))
+                maximum.copy_(torch.where(live[:, None], lse, -2e38).unsqueeze(0))
+
+            return run
+
+    monkeypatch.setattr(mla_dcp, "_prepare_mla_partials", CpuPartialKernel())
+    library = torch.library.Library("custom", "FRAGMENT")
+    try:
+        try:
+            torch._C._dispatch_find_schema_or_throw(
+                "custom::npu_dsa_merge_lse_direct", ""
+            )
+        except RuntimeError:
+            library.define(
+                "npu_dsa_merge_lse_direct(Tensor attention_out, Tensor softmax_max, Tensor softmax_sum, str group, int rank_size) -> Tensor"
+            )
+
+        def cpu_merge(producer, maximum, total, group, rank_size):
+            # Model a prepared rank-0 producer with seven empty peer shards.
+            if group != "mla-merge-test" or rank_size != 8:
+                raise ValueError("Wrong prepared MLA communication group")
+            live = maximum[0, :, :8].T > -1e30
+            return torch.where(live[..., None], producer[:8], 0).bfloat16()
+
+        library.impl("npu_dsa_merge_lse_direct", cpu_merge, "CPU")
+        partial = (
+            torch.arange(64 * 64 * 512, dtype=torch.float32).reshape(64, 64, 512) / 1024
+        )
+        lse = torch.zeros(64, 64)
+        visible = torch.ones(64, dtype=torch.int32)
+        visible[::3] = 0
+        active = torch.ones(64, dtype=torch.bool)
+        active[::5] = False
+        producer = torch.empty(64, 64, 512)
+        maximum = torch.empty(1, 64, 64)
+        total = torch.ones_like(maximum)
+        for factor in (1.0, 0.5):
+            current = partial * factor
+            result = ascend_mla_merge(
+                current,
+                lse=lse,
+                visible=visible,
+                active=active,
+                producer=producer,
+                maximum=maximum,
+                total=total,
+                group="mla-merge-test",
+            )
+            expected = torch.where(
+                (active & (visible > 0))[None, :, None], current.permute(1, 0, 2)[:8], 0
+            )
+            assert torch.equal(result, expected.bfloat16())
+    finally:
+        library._destroy()

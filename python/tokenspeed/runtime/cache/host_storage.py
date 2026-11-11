@@ -22,7 +22,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
+from fractions import Fraction
 from typing import TYPE_CHECKING
 
 from tokenspeed.runtime.cache.transfer.layout import CacheTransferLayout
@@ -33,14 +35,81 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
         CacheMemoryPlan,
     )
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+        CacheGroupSpec,
+    )
+
+# The State density at which a Host parent rounded up to whole KV pages must
+# still pay: one State checkpoint (a payload of every State group) per this
+# many cached tokens. A request publishes only a few checkpoints (at its prompt
+# end, a junction cut, its finish), so a prefix cache of long prompts holds far
+# fewer; a denser guess only makes rounding up rarer.
+_TOKENS_PER_STATE_CHECKPOINT = 8192
+
+
+def _host_bytes_per_token(
+    parent_bytes: int, groups: Sequence[tuple[CacheGroupSpec, int]]
+) -> Fraction:
+    """Host L2 bytes per cached token when each parent is ``parent_bytes``.
+
+    A history group stores one block per ``page_size`` tokens and a State
+    group one per checkpoint, each dealt among its ``shard_count`` owners;
+    a replayable group never reaches Host L2.
+    """
+    parents_per_token = Fraction(0)
+    for spec, payload_bytes in groups:
+        if spec.replayable:
+            continue
+        tokens_per_block = (
+            _TOKENS_PER_STATE_CHECKPOINT
+            if spec.attn_kind == "state"
+            else spec.page_size
+        )
+        parents_per_token += Fraction(
+            1,
+            tokens_per_block * spec.shard_count * (parent_bytes // payload_bytes),
+        )
+    return parent_bytes * parents_per_token
+
+
+def _host_parent_bytes(groups: Sequence[tuple[CacheGroupSpec, int]]) -> int:
+    """Bytes of the shared Host parent for ``(spec, payload_bytes)`` groups."""
+    largest = max(payload_bytes for _, payload_bytes in groups)
+    if any(
+        spec.attn_kind != "state" and not spec.replayable and payload_bytes == largest
+        for spec, payload_bytes in groups
+    ):
+        # A KV page Host L2 caches is the largest payload and fills its parent
+        # exactly, as in every pure-attention model without a replayable window.
+        return largest
+    # Host bytes per token and page of each KV group Host L2 stores.
+    cached_kv = [
+        (Fraction(payload_bytes, spec.page_size * spec.shard_count), payload_bytes)
+        for spec, payload_bytes in groups
+        if spec.attn_kind != "state" and not spec.replayable
+    ]
+    if not cached_kv:
+        return largest
+    # The largest payload is a State checkpoint or a replayable window page,
+    # which Host L2 never stores and which only sizes the parent. It leaves a
+    # gap after the last whole KV page of every KV parent. Rounding the parent
+    # up to whole pages of the KV group with the most Host bytes per token
+    # closes that gap but adds the same growth to every parent of the largest
+    # payload as slack, so it is taken only when it lowers the Host bytes per
+    # cached token.
+    _, page = max(cached_kv)
+    rounded = -(-largest // page) * page
+    if _host_bytes_per_token(rounded, groups) < _host_bytes_per_token(largest, groups):
+        return rounded
+    return largest
 
 
 def _compute_host_layout(
-    layout: CacheTransferLayout,
-) -> tuple[tuple[int, ...], tuple[tuple[int, ...], ...], int]:
+    layout: CacheTransferLayout, *, group_specs: Sequence[CacheGroupSpec]
+) -> tuple[tuple[int, ...], tuple[tuple[int, ...], ...], int, tuple[int, ...]]:
+    specs = {spec.group_id: spec for spec in group_specs}
     host_cache_block_bytes = []
     host_field_offsets = []
-    host_lcm_block_bytes = 0
     for group in layout.groups:
         offsets = []
         cursor = 0
@@ -49,21 +118,79 @@ def _compute_host_layout(
             cursor += field.payload_bytes
         host_cache_block_bytes.append(cursor)
         host_field_offsets.append(tuple(offsets))
-        host_lcm_block_bytes = max(
-            host_lcm_block_bytes,
-            group.cache_blocks_per_lcm_block * cursor,
-        )
+    # Device packing satisfies model/kernel strides. Host bytes have no such
+    # stride constraint: one shared parent fits the largest compact payload,
+    # possibly rounded up to whole KV pages (``_host_parent_bytes``), and each
+    # group fills it with as many complete payloads as it can hold.
+    host_lcm_block_bytes = _host_parent_bytes(
+        [
+            (specs[group.group_id], size)
+            for group, size in zip(layout.groups, host_cache_block_bytes)
+        ]
+    )
+    host_group_packing = tuple(
+        host_lcm_block_bytes // size for size in host_cache_block_bytes
+    )
     return (
         tuple(host_cache_block_bytes),
         tuple(host_field_offsets),
         host_lcm_block_bytes,
+        host_group_packing,
     )
 
 
-def compute_host_lcm_block_bytes(layout: CacheTransferLayout) -> int:
-    """Return compact Host bytes required by one LCMBlock."""
+def compute_host_lcm_block_bytes(
+    layout: CacheTransferLayout, *, group_specs: Sequence[CacheGroupSpec]
+) -> int:
+    """Return compact Host bytes required by one LCMBlock.
 
-    return _compute_host_layout(layout)[2]
+    Args:
+        layout: The transfer layout whose payloads the Host packs.
+        group_specs: The scheduler's group specs. Their kinds, page sizes,
+            shard counts and replay flags decide whether the parent rounds
+            up from the largest payload to whole KV pages.
+    """
+
+    return _compute_host_layout(layout, group_specs=group_specs)[2]
+
+
+def compute_host_group_packing(
+    layout: CacheTransferLayout, *, group_specs: Sequence[CacheGroupSpec]
+) -> tuple[int, ...]:
+    """Return physical children per shared Host parent in layout group order.
+
+    Args:
+        layout: The transfer layout whose payloads the Host packs.
+        group_specs: The scheduler's group specs, as for
+            ``compute_host_lcm_block_bytes``.
+    """
+
+    return _compute_host_layout(layout, group_specs=group_specs)[3]
+
+
+def validate_host_group_packing(packing: tuple[int, ...], *, cpu_group) -> None:
+    """Require identical Host block IDs on every mirrored scheduler rank.
+
+    Args:
+        packing: Virtual Host children per parent in scheduler group order.
+        cpu_group: The ranks' Gloo group, or None for one rank.
+    """
+    if cpu_group is None:
+        return
+    import torch
+    import torch.distributed as dist
+
+    # Compare lengths first so every rank joins the same number of collectives.
+    for value in (len(packing), *packing):
+        minimum = torch.tensor(value, dtype=torch.int64)
+        negative_maximum = torch.tensor(-value, dtype=torch.int64)
+        dist.all_reduce(minimum, op=dist.ReduceOp.MIN, group=cpu_group)
+        dist.all_reduce(negative_maximum, op=dist.ReduceOp.MIN, group=cpu_group)
+        if minimum.item() != -negative_maximum.item():
+            raise ValueError(
+                "Host packing must match across scheduler ranks; their compact "
+                f"Host layouts differ (this rank's packing is {packing})"
+            )
 
 
 class HostCacheStorage:
@@ -77,19 +204,25 @@ class HostCacheStorage:
         self,
         layout: CacheTransferLayout,
         *,
+        group_specs: Sequence[CacheGroupSpec],
         num_host_lcm_blocks: int,
     ):
+        """
+        Args:
+            layout: The transfer layout whose payloads the Host packs.
+            group_specs: The scheduler's group specs, which size the shared
+                parent (``compute_host_lcm_block_bytes``).
+            num_host_lcm_blocks: Parents to allocate, the null block excluded.
+        """
         if num_host_lcm_blocks <= 0:
             raise ValueError("num_host_lcm_blocks must be > 0")
         self.group_ids = tuple(group.group_id for group in layout.groups)
-        self.group_packing = tuple(
-            group.cache_blocks_per_lcm_block for group in layout.groups
-        )
         (
             self.host_cache_block_bytes,
             self.host_field_offsets,
             self.host_lcm_block_bytes,
-        ) = _compute_host_layout(layout)
+            self.group_packing,
+        ) = _compute_host_layout(layout, group_specs=group_specs)
         self.num_host_lcm_blocks = int(num_host_lcm_blocks)
         self.host_buffer_bytes = self.num_host_lcm_blocks * self.host_lcm_block_bytes
         import torch
@@ -155,3 +288,4 @@ class HostCacheResources:
     memory_plan: CacheMemoryPlan
     attention_backend_name: str
     draft_attention_backend_name: str
+    checkpoint_granularities: tuple[tuple[str, int], ...] = ()

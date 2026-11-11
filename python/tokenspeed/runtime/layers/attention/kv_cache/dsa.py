@@ -20,10 +20,17 @@
 
 from __future__ import annotations
 
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
-from tokenspeed_kernel.ops.kvcache.triton import index_k_block_split_scatter
+from tokenspeed_kernel.ops.attention.dsa.triton import (
+    index_k_layernorm_fp8_scatter_and_quantize_query,
+)
+from tokenspeed_kernel.ops.kvcache.triton import (
+    index_k_block_split_scatter,
+    index_k_layernorm_fp8_scatter,
+    index_k_layernorm_scatter,
+)
 from tokenspeed_kernel.ops.quantization import quantize_fp8
 
 from tokenspeed.runtime.layers.attention.configs.dsa import (
@@ -34,6 +41,9 @@ from tokenspeed.runtime.layers.attention.kv_cache.mla import (
     MLATokenToKVPool,
     _get_tensor_size_bytes,
 )
+
+if TYPE_CHECKING:
+    from tokenspeed.runtime.layers.layernorm import LayerNorm
 
 _INDEX_K_FP8_GROUP_SIZE = 128
 
@@ -95,6 +105,18 @@ class DSATokenToKVPool(MLATokenToKVPool):
     def get_kv_size_bytes(self):
         return super().get_kv_size_bytes() + _get_tensor_size_bytes(self.index_k_buffer)
 
+    @property
+    def index_k_page_size(self) -> int:
+        """Tokens per page of the index-K plane's ``fp8_scaled`` layout.
+
+        The block-split write, the packed-row gather and the top-k scorers
+        all address the plane in pages of this many rows, and the scorers'
+        page tables count the same pages. The ordinary DSA family runs its
+        kernel page at the arena page; a pool whose arena page holds several
+        kernel pages (Kimi-K3.1) overrides this with the kernel page.
+        """
+        return int(self.arena.kv_page_size)
+
     def get_index_k_buffer(self, layer_id: int) -> torch.Tensor:
         if self.layerwise_load_tracker is not None:
             self.layerwise_load_tracker.wait_for_layer(layer_id)
@@ -136,7 +158,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         if index_k_format != "fp8_scaled":
             # A plain plane: the row is the key's bytes.
             return buf.reshape(-1, head_dim)[slots].view(torch.uint8)
-        page_size = int(self.arena.kv_page_size)
+        page_size = self.index_k_page_size
         row_bytes = index_k_row_bytes(head_dim, index_k_format)
         scale_bytes = row_bytes - head_dim
         page_bytes = page_size * row_bytes
@@ -155,17 +177,47 @@ class DSATokenToKVPool(MLATokenToKVPool):
         index_k: torch.Tensor,
         *,
         write_mask: torch.Tensor | None,
+        key_norm: LayerNorm | None = None,
     ) -> None:
         """Write one layer's index keys into its plane, in the plane's format.
 
         The plane's dtype is its format (``configs/dsa.py`` INDEX_K_FORMATS):
         a uint8 plane takes FP8 keys with per-128 fp32 scales, a bf16 plane
         takes the keys unquantized. Nothing is converted between formats.
+        ``key_norm`` is a LayerNorm the keys still need; both planes apply it
+        inside their write (a uint8 plane before quantizing).
         """
+        # Wait for the layer's Host load: a tail hit loads these rows' whole page.
+        buf = self.get_index_k_buffer(layer_id)
+        if key_norm is not None:
+            if buf.dtype == torch.bfloat16:
+                index_k_layernorm_scatter(
+                    buf,
+                    index_k.view(-1, self.index_head_dim),
+                    key_norm.weight,
+                    key_norm.bias,
+                    loc,
+                    eps=key_norm.variance_epsilon,
+                    write_mask=write_mask,
+                )
+                return
+            if buf.dtype == torch.uint8 and index_k.dtype == self.model_dtype:
+                index_k_layernorm_fp8_scatter(
+                    buf,
+                    index_k.view(-1, self.index_head_dim),
+                    key_norm.weight,
+                    key_norm.bias,
+                    loc,
+                    eps=key_norm.variance_epsilon,
+                    page_size=self.index_k_page_size,
+                    group_size=_INDEX_K_FP8_GROUP_SIZE,
+                    write_mask=write_mask,
+                )
+                return
+            index_k = key_norm(index_k)
         if index_k.dtype != self.model_dtype:
             index_k = index_k.to(self.model_dtype)
         index_k = index_k.view(-1, self.index_head_dim)
-        buf = self.index_k_buffer[layer_id]
         if buf.dtype == torch.bfloat16:
             rows = index_k.to(buf.dtype)
             slots = loc.to(torch.int64)
@@ -193,8 +245,64 @@ class DSATokenToKVPool(MLATokenToKVPool):
             index_k_fp8,
             index_k_scale,
             loc,
-            page_size=self.arena.kv_page_size,
+            page_size=self.index_k_page_size,
             head_dim=self.index_head_dim,
             group_size=_INDEX_K_FP8_GROUP_SIZE,
             write_mask=write_mask,
+        )
+
+    def set_index_k_buffer_and_quantize_query(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        index_k: torch.Tensor,
+        *,
+        write_mask: torch.Tensor | None,
+        key_norm: LayerNorm,
+        query: torch.Tensor,
+        query_weights: torch.Tensor,
+        softmax_scale: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Write pre-norm index keys and quantize the same rows' queries in one launch.
+
+        The write is :meth:`set_index_k_buffer` of pre-norm keys into a uint8
+        (``fp8_scaled``) plane, and the same rows' index queries are quantized in
+        the write's launch. The plane receives exactly the bytes
+        ``set_index_k_buffer(..., key_norm=key_norm)`` writes, and the query
+        comes back exactly as ``quantize_index_query_weights`` returns it.
+
+        Args:
+            layer_id: The indexer layer whose plane to write.
+            loc: ``[rows]`` cache slots of the keys.
+            index_k: ``[rows, index_head_dim]`` pre-norm keys in the model dtype.
+            write_mask: Optional bool ``[rows]`` ownership mask of the keys.
+            key_norm: The LayerNorm the keys still need.
+            query: ``[rows, heads, index_head_dim]`` BF16 index queries.
+            query_weights: ``[rows, heads]`` head weights.
+            softmax_scale: The score scale folded into the head weights.
+
+        Returns:
+            ``[rows, heads, index_head_dim]`` E4M3 queries and ``[rows,
+            heads]`` FP32 head weights carrying each query's scale and
+            ``softmax_scale``.
+        """
+        buf = self.get_index_k_buffer(layer_id)
+        if buf.dtype != torch.uint8 or index_k.dtype != self.model_dtype:
+            raise ValueError(
+                f"the fused index-K write takes {self.model_dtype} keys into a "
+                f"uint8 plane, got {index_k.dtype} keys and a {buf.dtype} plane"
+            )
+        return index_k_layernorm_fp8_scatter_and_quantize_query(
+            buf,
+            index_k.view(-1, self.index_head_dim),
+            key_norm.weight,
+            key_norm.bias,
+            loc,
+            query,
+            query_weights,
+            eps=key_norm.variance_epsilon,
+            page_size=self.index_k_page_size,
+            group_size=_INDEX_K_FP8_GROUP_SIZE,
+            write_mask=write_mask,
+            softmax_scale=softmax_scale,
         )

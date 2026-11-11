@@ -128,6 +128,7 @@ class Glm53FlashTextConfig(PretrainedConfig):
         head_dim: int = 0,
         layer_types: list[str] | None = None,
         indexer_types: list[str] | None = None,
+        index_share_for_mtp_iteration: bool = False,
         mlp_layer_types: list[str] | None = None,
         swiglu_limit: float = 10.0,
         linear_attn_config: dict | None = None,
@@ -242,6 +243,7 @@ class Glm53FlashTextConfig(PretrainedConfig):
                 for layer_id in range(num_hidden_layers)
             ]
         )
+        self.index_share_for_mtp_iteration = index_share_for_mtp_iteration
         dense_layers = min(first_k_dense_replace, num_hidden_layers)
         self.mlp_layer_types = (
             mlp_layer_types

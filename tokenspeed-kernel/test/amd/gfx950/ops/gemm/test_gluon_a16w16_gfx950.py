@@ -34,23 +34,29 @@ if not is_cdna4():
     )
 
 
-from tokenspeed_kernel.ops.gemm import kimi3_router_projection, mm  # noqa: E402
+from tokenspeed_kernel.ops.gemm import bmm, kimi3_router_projection, mm  # noqa: E402
 from tokenspeed_kernel.workspace import capture_session, zeroed_state  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (  # noqa: E402
     launch_gluon_mm_a16w16_prefill_gfx950,
+    launch_gluon_mm_a16w16_prefill_publish_rows_gfx950,
+    launch_gluon_mm_a16w16_prefill_skip_rows_gfx950,
     supports_gluon_mm_a16w16_prefill_gfx950,
 )
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (  # noqa: E402
     _choose_mfma_lds_mediumm_config,
     _get_partial_scratch,
     _supports_mfma_lds_smallm,
+    gluon_grouped_mm_a16w16_decode_num_counters_gfx950,
     gluon_mm_a16w16_decode_num_counters_gfx950,
     gluon_mm_a16w16_medium_gfx950,
     launch_gluon_bmm_a16w16_gfx950,
+    launch_gluon_grouped_mm_a16w16_decode_gfx950,
+    launch_gluon_mm_a16w16_column_shard_gfx950,
     launch_gluon_mm_a16w16_decode_add3_gfx950,
     launch_gluon_mm_a16w16_decode_gfx950,
     launch_gluon_mm_a16w16_medium_gfx950,
     launch_gluon_mm_a16w16_splitk_gfx950,
+    supports_gluon_mm_a16w16_column_shard_gfx950,
     supports_gluon_mm_a16w16_decode_add3_gfx950,
     supports_gluon_mm_a16w16_decode_gfx950,
 )
@@ -253,6 +259,80 @@ def test_choose_mfma_lds_mediumm_config_falls_back_for_slow_shapes() -> None:
     assert _choose_mfma_lds_mediumm_config(576, 7168, 3584) is None
 
 
+@pytest.mark.parametrize("m,k", [(8192, 1536), (4096, 1536), (2048, 768)])
+def test_largem_publish_rows_keeps_bits_and_counts_column_tiles(m, k) -> None:
+    torch.manual_seed(m + k)
+    a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((7168, k), device="cuda", dtype=torch.bfloat16) / 40
+    full = launch_gluon_mm_a16w16_prefill_gfx950(a, b, torch.bfloat16)
+    out = torch.full_like(full, 7.0)
+    counters = torch.full((5,), -3, device="cuda", dtype=torch.int32)
+    # Every owner's heap is this one, so each owned tile counts all 8 owners.
+    heaps = (counters.data_ptr(),) * 8
+    for call in (1, 2):
+        assert (
+            launch_gluon_mm_a16w16_prefill_publish_rows_gfx950(
+                a, b, out, counters, heaps, rank=3
+            )
+            is out
+        )
+        torch.testing.assert_close(out, full, atol=0, rtol=0)
+        tiles = m // 2048
+        expected = [-3 + call * 8 * 28] * tiles + [-3] * (5 - tiles)
+        assert counters.tolist() == expected
+    # Owner ranges of partial tiles, or too few counters, launch nothing.
+    for rows, width in ((m - 8, 7168), (m, 7168)):
+        operand = a[:rows]
+        short = counters[: m // 2048 - 1] if rows == m else counters
+        assert (
+            launch_gluon_mm_a16w16_prefill_publish_rows_gfx950(
+                operand, b, out[:rows, :width], short, heaps, rank=3
+            )
+            is None
+        )
+    assert counters.tolist() == expected
+
+
+@pytest.mark.parametrize(
+    "m,skip_start,skip_rows",
+    [
+        (8192, 0, 1024),
+        (8192, 3072, 1024),
+        (8192, 7168, 1024),
+        (2048, 256, 256),
+        (1800, 512, 768),
+    ],
+)
+def test_largem_skip_rows_keeps_the_full_gemm_bits(m, skip_start, skip_rows) -> None:
+    torch.manual_seed(m + skip_start)
+    a = torch.randn((m, 7168), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((6288, 7168), device="cuda", dtype=torch.bfloat16) / 84
+    full = launch_gluon_mm_a16w16_prefill_gfx950(a, b, torch.bfloat16)
+    out = torch.full_like(full, 7.0)
+    assert (
+        launch_gluon_mm_a16w16_prefill_skip_rows_gfx950(
+            a, b, out, skip_start=skip_start, skip_rows=skip_rows
+        )
+        is out
+    )
+    skipped = slice(skip_start, skip_start + skip_rows)
+    assert torch.all(out[skipped] == 7.0)
+    out[skipped] = full[skipped]
+    torch.testing.assert_close(out, full, atol=0, rtol=0)
+    # Row bounds off the 256-row tiles, or skipping every row, launch nothing.
+    for start, rows in (
+        (skip_start + 1, skip_rows),
+        (skip_start, skip_rows + 8),
+        (0, m),
+    ):
+        assert (
+            launch_gluon_mm_a16w16_prefill_skip_rows_gfx950(
+                a, b, out, skip_start=start, skip_rows=rows
+            )
+            is None
+        )
+
+
 @pytest.mark.parametrize(
     "shape",
     [
@@ -410,11 +490,17 @@ def test_decode_gemm_supports_only_measured_buckets() -> None:
     # the next bucket's config: dense gate/up is measured only for 9..32.
     assert not supports_gluon_mm_a16w16_decode_gfx950(8, 8448, 7168)
     assert supports_gluon_mm_a16w16_decode_gfx950(9, 8448, 7168)
+    # Only the Muse TP8 pre-expert projection is measured past 64 rows.
+    assert supports_gluon_mm_a16w16_decode_gfx950(256, 512, 8192)
+    assert not supports_gluon_mm_a16w16_decode_gfx950(65, 8192, 1024)
+    assert not supports_gluon_mm_a16w16_decode_gfx950(257, 512, 8192)
 
 
-def test_decode_gemm_row_count_does_not_recompile() -> None:
+# Kimi K3 shared gate/up, and the Muse TP8 pre-expert projection, whose
+# 64-row bucket splits K.
+@pytest.mark.parametrize("n,k", [(1536, 7168), (512, 8192)])
+def test_decode_gemm_row_count_does_not_recompile(n: int, k: int) -> None:
     torch.manual_seed(0)
-    n, k = 1536, 7168
     a = torch.randn((64, k), device="cuda", dtype=torch.bfloat16) * 0.25
     b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
 
@@ -503,6 +589,241 @@ def test_qwen38_decode_gemm_matches_reference(shape: tuple[int, int, int]) -> No
         torch.testing.assert_close(out, torch.mm(a, b.T), atol=1e-4, rtol=_RTOL)
 
 
+# K3.1 indexer verify row counts between buckets; wq_b up to 16 rows takes the GEMV.
+_K31_INDEXER_DECODE_CASES = [
+    pytest.param((27, 4096, 1536), id="wq-b-32-row-tile"),
+    pytest.param((61, 4096, 1536), id="wq-b-64-row-bucket"),
+    pytest.param((4, 160, 7168), id="key-weights-splitk-c1"),
+    pytest.param((13, 160, 7168), id="key-weights-splitk-ragged"),
+    pytest.param((64, 160, 7168), id="key-weights-splitk-c16"),
+]
+
+
+@pytest.mark.parametrize("shape", _K31_INDEXER_DECODE_CASES)
+def test_k31_indexer_decode_gemm_matches_reference(
+    shape: tuple[int, int, int],
+) -> None:
+    torch.manual_seed(0)
+    m, n, k = shape
+    assert supports_gluon_mm_a16w16_decode_gfx950(m, n, k)
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    for _ in range(2):
+        a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) * 0.25
+        out = _decode(a, b, torch.bfloat16)
+        torch.testing.assert_close(out, torch.mm(a, b.T), atol=1e-4, rtol=_RTOL)
+
+
+def test_k31_indexer_decode_row_count_does_not_recompile() -> None:
+    torch.manual_seed(0)
+    n, k = 160, 7168
+    a = torch.randn((64, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
+
+    def run(rows):
+        out = _decode(a[:rows], b, torch.bfloat16)
+        torch.testing.assert_close(out, torch.mm(a[:rows], b.T), atol=1e-4, rtol=_RTOL)
+
+    for rows in (3, 4, 5, 8, 9, 16, 17, 32, 33, 64):
+        run(rows)
+    with assert_no_triton_compile(gluon_mm_a16w16_medium_gfx950):
+        for rows in (2, 6, 7, 12, 14, 20, 27, 40, 48, 61):
+            run(rows)
+
+
+def _absorbed_query_operands(rows: int, heads: int = 12):
+    """q [rows, heads, 192] and the query buffer [rows, heads, 576] it absorbs into."""
+    nope, rope, latent = 128, 64, 512
+    q = torch.randn((rows, heads, nope + rope), device="cuda", dtype=torch.bfloat16)
+    query = torch.full(
+        (rows, heads, latent + rope), 7.0, device="cuda", dtype=torch.bfloat16
+    )
+    # K-major w_kc: the bmm operand w_kc.transpose(1, 2) is contiguous [H, N, K].
+    w_kc_t = torch.randn((heads, latent, nope), device="cuda", dtype=torch.bfloat16)
+    return q[..., :nope].transpose(0, 1), w_kc_t * 0.1, query
+
+
+@pytest.mark.parametrize("rows", [1, 4, 13, 37, 64, 100])
+def test_absorbed_query_bmm_fills_only_latent_channels(rows: int) -> None:
+    torch.manual_seed(0)
+    q_nope, w_kc_t, query = _absorbed_query_operands(rows)
+
+    bmm(q_nope, w_kc_t, out=query[..., :512].transpose(0, 1))
+
+    expected = torch.bmm(q_nope.float(), w_kc_t.float().transpose(1, 2))
+    torch.testing.assert_close(
+        query[..., :512].transpose(0, 1).float(), expected, atol=1e-3, rtol=_RTOL
+    )
+    assert torch.all(query[..., 512:] == 7.0)
+
+
+def test_absorbed_query_bmm_row_count_does_not_recompile() -> None:
+    torch.manual_seed(0)
+    q_nope, w_kc_t, query = _absorbed_query_operands(64)
+
+    def run(rows):
+        out = query[:rows, :, :512].transpose(0, 1)
+        bmm(q_nope[:, :rows], w_kc_t, out=out)
+        expected = torch.bmm(q_nope[:, :rows].float(), w_kc_t.float().transpose(1, 2))
+        torch.testing.assert_close(out.float(), expected, atol=1e-3, rtol=_RTOL)
+
+    for rows in (1, 2, 16, 17, 32):
+        run(rows)
+    with assert_no_triton_compile(gluon_mm_a16w16_medium_gfx950):
+        for rows in (3, 5, 8, 9, 15, 24, 33, 48, 61, 64):
+            run(rows)
+
+
+@pytest.mark.parametrize("rows", [1, 4, 29, 64, 100])
+def test_value_projection_bmm_matches_reference(rows: int) -> None:
+    torch.manual_seed(0)
+    heads, latent, value = 12, 512, 128
+    attn = torch.randn((rows, heads, latent), device="cuda", dtype=torch.bfloat16)
+    # K-major w_vc: the bmm operand w_vc.transpose(1, 2) is contiguous [H, N, K].
+    w_vc_t = (
+        torch.randn((heads, value, latent), device="cuda", dtype=torch.bfloat16) * 0.05
+    )
+    out = torch.empty((rows, heads * value), device="cuda", dtype=torch.bfloat16)
+
+    bmm(
+        attn.transpose(0, 1),
+        w_vc_t,
+        out=out.view(rows, heads, value).transpose(0, 1),
+    )
+
+    expected = torch.einsum("mhk,hnk->mhn", attn.float(), w_vc_t.float())
+    torch.testing.assert_close(
+        out.view(rows, heads, value).float(), expected, atol=1e-3, rtol=_RTOL
+    )
+
+
+def test_value_projection_bmm_row_count_does_not_recompile() -> None:
+    torch.manual_seed(0)
+    heads, latent, value = 12, 512, 128
+    attn = torch.randn((64, heads, latent), device="cuda", dtype=torch.bfloat16)
+    w_vc_t = (
+        torch.randn((heads, value, latent), device="cuda", dtype=torch.bfloat16) * 0.05
+    )
+    out = torch.empty((64, heads, value), device="cuda", dtype=torch.bfloat16)
+
+    def run(rows):
+        bmm(attn[:rows].transpose(0, 1), w_vc_t, out=out[:rows].transpose(0, 1))
+        expected = torch.einsum("mhk,hnk->mhn", attn[:rows].float(), w_vc_t.float())
+        torch.testing.assert_close(out[:rows].float(), expected, atol=1e-3, rtol=_RTOL)
+
+    for rows in (1, 2, 16, 17, 32, 33, 64):
+        run(rows)
+    with assert_no_triton_compile(gluon_mm_a16w16_medium_gfx950):
+        for rows in (3, 5, 8, 9, 15, 24, 31, 40, 48, 61):
+            run(rows)
+
+
+def test_grouped_bmm_without_a_config_matches_reference() -> None:
+    torch.manual_seed(0)
+    a = torch.randn((12, 4, 512), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((12, 512, 512), device="cuda", dtype=torch.bfloat16) * 0.05
+
+    actual = bmm(a, b)
+
+    expected = torch.bmm(a.float(), b.float().transpose(1, 2))
+    torch.testing.assert_close(actual.float(), expected, atol=1e-3, rtol=_RTOL)
+
+
+def _gated_value_operands(rows: int):
+    """Attended latent, K-major w_vc [H, latent, value], and a column-slice gate."""
+    heads, latent, value = 12, 512, 128
+    attn = torch.randn((rows, heads, latent), device="cuda", dtype=torch.bfloat16)
+    w_vc = (
+        torch.randn((heads, value, latent), device="cuda", dtype=torch.bfloat16) * 0.05
+    ).transpose(1, 2)
+    # The model's gate is a column slice of the fused a-projection output.
+    fused = torch.randn(
+        (rows, 704 + heads * value), device="cuda", dtype=torch.bfloat16
+    )
+    return attn, w_vc, fused[:, 704:]
+
+
+@pytest.mark.parametrize("rows", [1, 4, 37, 64])
+def test_grouped_decode_gemm_gate_matches_gemm_then_sigmoid_mul(rows: int) -> None:
+    from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
+
+    torch.manual_seed(0)
+    attn, w_vc, gate = _gated_value_operands(rows)
+    weight = w_vc.transpose(1, 2)
+    counters = torch.zeros(1, device="cuda", dtype=torch.int32)
+    expected = torch.empty((rows, 12 * 128), device="cuda", dtype=torch.bfloat16)
+    launch_gluon_grouped_mm_a16w16_decode_gfx950(
+        attn, weight, counters, False, out=expected.view(rows, 12, 128)
+    )
+    sigmoid_mul(expected, gate)
+
+    actual = torch.empty_like(expected)
+    launch_gluon_grouped_mm_a16w16_decode_gfx950(
+        attn,
+        weight,
+        counters,
+        False,
+        out=actual.view(rows, 12, 128),
+        gate=gate.view(rows, 12, 128),
+    )
+
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("gated", [False, True])
+@pytest.mark.parametrize("rows", [1, 4, 29, 64, 100])
+def test_k_major_value_projection_matches_reference(rows: int, gated: bool) -> None:
+    from tokenspeed_kernel.ops.attention.mla import mla_project_value
+
+    torch.manual_seed(0)
+    attn, w_vc, gate = _gated_value_operands(rows)
+    gate = gate if gated else None
+
+    out = mla_project_value(attn, w_vc, gate=gate)
+
+    expected = torch.einsum("mhk,hkn->mhn", attn.float(), w_vc.float()).flatten(1)
+    expected = expected.to(torch.bfloat16).float()
+    if gated:
+        expected = expected * torch.sigmoid(gate.float())
+    torch.testing.assert_close(out.float(), expected, atol=1e-3, rtol=2**-6)
+
+
+def test_k_major_value_projection_row_count_does_not_recompile() -> None:
+    from tokenspeed_kernel.ops.attention.mla import mla_project_value
+
+    torch.manual_seed(0)
+    attn, w_vc, gate = _gated_value_operands(64)
+    out = torch.empty((64, 12 * 128), device="cuda", dtype=torch.bfloat16)
+
+    def run(rows):
+        mla_project_value(attn[:rows], w_vc, gate=gate[:rows], out=out[:rows])
+
+    for rows in (1, 2, 16, 17, 32, 33, 64):
+        run(rows)
+    with assert_no_triton_compile(gluon_mm_a16w16_medium_gfx950):
+        for rows in (3, 5, 8, 9, 15, 24, 31, 40, 48, 61):
+            run(rows)
+
+
+def test_grouped_decode_gemm_splitk_writes_strided_out() -> None:
+    torch.manual_seed(0)
+    m, g, n, k = 8, 2, 1024, 4096
+    x = torch.randn((m, g, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    weight = torch.randn((g, n, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    backing = torch.full((m, g, n + 64), 7.0, device="cuda", dtype=torch.bfloat16)
+    out = backing[..., :n]
+    counters = zeroed_state(
+        gluon_grouped_mm_a16w16_decode_num_counters_gfx950(m, g, n, k),
+        dtype=torch.int32,
+        device=x.device,
+    )
+
+    launch_gluon_grouped_mm_a16w16_decode_gfx950(x, weight, counters, False, out=out)
+
+    expected = torch.einsum("mgk,gnk->mgn", x.float(), weight.float())
+    torch.testing.assert_close(out.float(), expected, atol=1e-2, rtol=_RTOL)
+    assert torch.all(backing[..., n:] == 7.0)
+
+
 def test_qwen38_decode_row_count_does_not_recompile() -> None:
     torch.manual_seed(0)
     n, k = 512, 2560
@@ -525,7 +846,8 @@ _DECODE_SHAPES = [(8192, 1024), (512, 8192)]
 
 
 @pytest.mark.parametrize("n,k", _DECODE_SHAPES)
-@pytest.mark.parametrize("m", [2, 3, 7, 16])
+# 24-64 rows are speculative verify batches of 3-8 requests.
+@pytest.mark.parametrize("m", [2, 3, 7, 16, 24, 33, 40, 64])
 def test_decode_gemm_is_selected_and_matches_reference(m: int, n: int, k: int) -> None:
     torch.manual_seed(0)
     assert supports_gluon_mm_a16w16_decode_gfx950(m, n, k)
@@ -536,6 +858,29 @@ def test_decode_gemm_is_selected_and_matches_reference(m: int, n: int, k: int) -
         torch.testing.assert_close(out, torch.mm(a, b.T), atol=1e-4, rtol=_RTOL)
         # gemm.mm hands the rows to the same kernel.
         assert torch.equal(mm(a, b), out)
+
+
+def test_decode_gemm_serves_muse_pre_expert_verify_rows() -> None:
+    # Speculative verify sends 65-172 rows (9-21 requests of eight) through the
+    # Muse TP8 pre-expert projection; the 128- and 256-row buckets take them,
+    # with rows a runtime argument inside each bucket.
+    torch.manual_seed(0)
+    n, k = 512, 8192
+    a = torch.randn((256, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
+
+    def run(rows):
+        assert supports_gluon_mm_a16w16_decode_gfx950(rows, n, k)
+        out = _decode(a[:rows], b, torch.bfloat16)
+        torch.testing.assert_close(out, torch.mm(a[:rows], b.T), atol=1e-4, rtol=_RTOL)
+        assert torch.equal(mm(a[:rows], b), out)
+
+    # Warm both integer classes (divisible by 16 or not) of each bucket.
+    for rows in (65, 128, 129, 256):
+        run(rows)
+    with assert_no_triton_compile(gluon_mm_a16w16_medium_gfx950):
+        for rows in (72, 100, 172, 200):
+            run(rows)
 
 
 def test_medium_coalesced_store_masks_strided_out() -> None:
@@ -553,3 +898,35 @@ def test_medium_coalesced_store_masks_strided_out() -> None:
     assert actual is out
     torch.testing.assert_close(out, torch.mm(a, b.T), atol=1e-2, rtol=_RTOL)
     assert torch.all(backing[:, n:] == 7.0)
+
+
+@pytest.mark.parametrize("m", [9, 13, 16])
+def test_column_shard_equals_the_replicated_decode_gemm_columns(m: int) -> None:
+    """Each 1024-column shard of the [8192, 4096] decode GEMM is bitwise its columns."""
+    torch.manual_seed(60 + m)
+    a = torch.randn((m, 4096), device="cuda", dtype=torch.bfloat16) * 0.25
+    b = torch.randn((8192, 4096), device="cuda", dtype=torch.bfloat16) * 0.25
+    assert supports_gluon_mm_a16w16_column_shard_gfx950(m, 8192, 1024, 4096)
+    full = launch_gluon_mm_a16w16_decode_gfx950(
+        a, b, torch.bfloat16, counters=torch.zeros(1, dtype=torch.int32, device="cuda")
+    )
+    for shard in (0, 5):
+        out = torch.empty(m, 1024, dtype=torch.bfloat16, device="cuda")
+        launch_gluon_mm_a16w16_column_shard_gfx950(
+            a, b[shard * 1024 : (shard + 1) * 1024], out
+        )
+        assert torch.equal(out, full[:, shard * 1024 : (shard + 1) * 1024]), shard
+
+
+def test_column_shard_row_count_does_not_recompile() -> None:
+    torch.manual_seed(77)
+    a = torch.randn((16, 4096), device="cuda", dtype=torch.bfloat16) * 0.25
+    b = torch.randn((1024, 4096), device="cuda", dtype=torch.bfloat16) * 0.25
+    out = torch.empty(16, 1024, dtype=torch.bfloat16, device="cuda")
+    # One warm-up per integer specialization class of the row count (16 is
+    # divisible by 16, 9 is not); every other row count reuses one of them.
+    for m in (9, 16):
+        launch_gluon_mm_a16w16_column_shard_gfx950(a[:m].contiguous(), b, out[:m])
+    with assert_no_triton_compile(gluon_mm_a16w16_medium_gfx950):
+        for m in range(9, 17):
+            launch_gluon_mm_a16w16_column_shard_gfx950(a[:m].contiguous(), b, out[:m])

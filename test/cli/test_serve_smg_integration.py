@@ -29,7 +29,9 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
@@ -48,15 +50,86 @@ def _wait_http_200(url: str, deadline: float) -> bool:
     import urllib.error
     import urllib.request
 
+    # These readiness endpoints are local, even when CI configures an HTTP proxy.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     while time.monotonic() < deadline:
         try:
-            with urllib.request.urlopen(url, timeout=2) as resp:
+            with opener.open(url, timeout=2) as resp:
                 if resp.status == 200:
                     return True
         except (urllib.error.URLError, ConnectionError, TimeoutError):
             pass
         time.sleep(0.5)
     return False
+
+
+def _stop_and_collect(proc, *, timeout: float) -> tuple[bytes, bytes]:
+    """Stop before reading captured pipes, which stay open while the process runs."""
+    if proc.poll() is None:
+        proc.terminate()
+    try:
+        return proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        return proc.communicate(timeout=5)
+
+
+def test_readiness_probe_ignores_environment_proxy(monkeypatch):
+    import urllib.request
+
+    class ReadyHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+
+    with (
+        ThreadingHTTPServer(("127.0.0.1", 0), ReadyHandler) as server,
+        socket.socket() as unavailable_proxy,
+    ):
+        unavailable_proxy.bind(("127.0.0.1", 0))
+        proxy = f"http://127.0.0.1:{unavailable_proxy.getsockname()[1]}"
+        for name in ("http_proxy", "HTTP_PROXY"):
+            monkeypatch.setenv(name, proxy)
+        for name in ("no_proxy", "NO_PROXY"):
+            monkeypatch.setenv(name, "")
+        # Use a real proxy-enabled opener even if an earlier test cached one.
+        monkeypatch.setattr(urllib.request, "_opener", urllib.request.build_opener())
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            url = f"http://127.0.0.1:{server.server_port}/readiness"
+            assert _wait_http_200(url, time.monotonic() + 2)
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+
+
+@pytest.mark.parametrize("ignore_sigterm", [False, True])
+def test_failed_startup_stops_the_process_and_preserves_logs(ignore_sigterm):
+    script = (
+        "import signal, sys, time\n"
+        f"signal.signal(signal.SIGTERM, signal.SIG_IGN if {ignore_sigterm} else signal.SIG_DFL)\n"
+        # The parent may terminate the child as soon as it reads the ready marker.
+        "print('startup details', file=sys.stderr, flush=True)\n"
+        "print('ready', flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-u", "-c", script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        assert proc.stdout.readline() == b"ready\n"
+        stdout, stderr = _stop_and_collect(proc, timeout=1)
+        assert stdout == b""
+        assert stderr == b"startup details\n"
+        expected_signal = signal.SIGKILL if ignore_sigterm else signal.SIGTERM
+        assert proc.returncode == -expected_signal
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate(timeout=5)
 
 
 # What ``ts serve`` reads before it starts the engine: the engine's parallel
@@ -79,6 +152,8 @@ _LLAMA_CONFIG = {
 def test_orchestrator_runs_against_fake_engine(tmp_path):
     user_port = _free_port()
     (tmp_path / "config.json").write_text(json.dumps(_LLAMA_CONFIG))
+    # Cold runtime imports are part of engine startup on shared CI filesystems.
+    startup_timeout = 120
 
     env = os.environ.copy()
     env["TS_SERVE_ENGINE_MODULE"] = "test.cli._fixtures.fake_engine"
@@ -98,9 +173,9 @@ def test_orchestrator_runs_against_fake_engine(tmp_path):
             "--port",
             str(user_port),
             "--engine-startup-timeout",
-            "30",
+            str(startup_timeout),
             "--gateway-startup-timeout",
-            "30",
+            str(startup_timeout),
             "--drain-timeout",
             "5",
             # The model has no tokenizer. Newer smg gates gateway readiness
@@ -115,10 +190,11 @@ def test_orchestrator_runs_against_fake_engine(tmp_path):
 
     try:
         ok = _wait_http_200(
-            f"http://127.0.0.1:{user_port}/readiness", time.monotonic() + 60
+            f"http://127.0.0.1:{user_port}/readiness",
+            time.monotonic() + 2 * startup_timeout + 30,
         )
         if not ok:
-            stdout, stderr = proc.communicate(timeout=5)
+            stdout, stderr = _stop_and_collect(proc, timeout=5)
             pytest.fail(
                 f"gateway never became healthy.\nstdout:\n{stdout.decode()}\n"
                 f"stderr:\n{stderr.decode()}"
@@ -128,7 +204,7 @@ def test_orchestrator_runs_against_fake_engine(tmp_path):
         try:
             rc = proc.wait(timeout=30)
         except subprocess.TimeoutExpired:
-            stdout, stderr = proc.communicate(timeout=5)
+            stdout, stderr = _stop_and_collect(proc, timeout=5)
             pytest.fail(
                 f"orchestrator did not exit 30s after SIGTERM.\n"
                 f"stdout:\n{stdout.decode()}\n"

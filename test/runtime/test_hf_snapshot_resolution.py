@@ -8,6 +8,7 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import huggingface_hub
 import pytest
 from transformers import PretrainedConfig
 
@@ -18,7 +19,6 @@ register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 from tokenspeed.runtime.utils.hf_transformers_utils import (
     _CONFIG_REGISTRY,
-    _find_deepseek_v4_encoding_file,
     _snapshot_commit_hash,
     get_config,
     get_generation_config,
@@ -100,6 +100,7 @@ class TestHFSnapshotResolutionTests:
             "org/model",
             revision="model-revision",
             ignore_patterns=["*.pt", "*.safetensors", "*.bin"],
+            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
         )
         from_pretrained.assert_called_once_with(snapshot)
         assert (config) is (loaded)
@@ -269,6 +270,7 @@ class TestHFSnapshotResolutionTests:
             "org/generation-model",
             revision="generation-revision",
             ignore_patterns=["*.pt", "*.safetensors", "*.bin"],
+            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
         )
         from_pretrained.assert_called_once_with(
             "/resolved/generation-snapshot",
@@ -333,6 +335,7 @@ class TestHFSnapshotResolutionTests:
             "org/tokenizer",
             revision="tokenizer-revision",
             ignore_patterns=["*.pt", "*.safetensors", "*.bin"],
+            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
         )
         from_pretrained.assert_called_once_with(
             "/resolved/tokenizer-snapshot",
@@ -465,18 +468,36 @@ class TestHFSnapshotResolutionTests:
                 revision="model-revision",
             )
 
-    def test_deepseek_encoding_missing_from_snapshot_fails_locally(self) -> None:
-        with (
-            tempfile.TemporaryDirectory() as snapshot,
-            patch(
-                "tokenspeed.runtime.utils.hf_transformers_utils.cached_file",
-                side_effect=AssertionError("must not re-resolve a local snapshot"),
-            ) as cached,
-            pytest.raises((RuntimeError), match=("encoding/encoding_dsv4.py")),
-        ):
-            _find_deepseek_v4_encoding_file(snapshot, None)
+    def test_metadata_resolves_from_offline_cache_at_commit_revision(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # This cache has no trees/<sha>.json, so huggingface_hub resolves the
+        # commit revision offline only when the caller passes local_files_only.
+        commit = "a" * 40
+        with tempfile.TemporaryDirectory() as cache:
+            snapshot = os.path.join(
+                cache, "models--org--offline-model", "snapshots", commit
+            )
+            os.makedirs(snapshot)
+            self._write_config(
+                snapshot, _SnapshotConfig.model_type, snapshot_value="cached"
+            )
+            with open(os.path.join(snapshot, "generation_config.json"), "w") as file:
+                json.dump({"max_new_tokens": 7}, file)
+            monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_OFFLINE", True)
+            monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_CACHE", cache)
+            with patch.dict(
+                _CONFIG_REGISTRY, {_SnapshotConfig.model_type: _SnapshotConfig}
+            ):
+                config = get_config(
+                    "org/offline-model", trust_remote_code=False, revision=commit
+                )
+            generation_config = get_generation_config(
+                "org/offline-model", trust_remote_code=False, revision=commit
+            )
 
-        cached.assert_not_called()
+        assert (config.snapshot_value) == ("cached")
+        assert (generation_config.max_new_tokens) == (7)
 
 
 if __name__ == "__main__":

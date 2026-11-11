@@ -38,6 +38,13 @@ enum class AbortReason : std::uint8_t {
     // by aborting it instead of imaging it (Scheduler::onImageDoesNotFit); or
     // the debug knob's retraction was refused after publishing its pages.
     kImageDoesNotFit = 0,
+    // On the fused role, alone (or beside requests holding no pages) and
+    // quiescent, it made no progress for Scheduler::kNoProgressAbortPlans
+    // consecutive plans while lone-request compaction had nothing left to
+    // move (a restore: while it did not fit even claiming no cached page):
+    // its admission (or restore) can never be funded, so it is aborted
+    // instead of waiting for good (docs/design/scheduler.md §1.4).
+    kNoProgress = 1,
 };
 
 // A request the scheduler finished this round: already Finished on every
@@ -62,20 +69,27 @@ public:
 
     const std::vector<Operation>& Operations() const { return operations_; }
 
-    // Cache child pages newly assigned in this plan. Group identity is
-    // required because one LCM parent can still contain live sibling children.
-    // The runtime clears these exact byte ranges before transfers/forward.
+    // Cache child pages newly assigned in this plan that nothing fills whole
+    // (a copy destination or a remote landing's block is left out). Group
+    // identity is required because one LCM parent can still contain live
+    // sibling children. The runtime clears these exact byte ranges before
+    // transfers/forward.
     std::map<std::string, std::vector<std::int32_t>> pages_to_zero;
     // Device -> Device whole-block copies, per cache group id, as (source,
     // destination) scheduler virtual block ids: a hitter's private copy of
-    // the shared block containing its boundary, or an owner's fresh block at
-    // a publication point it keeps writing past. Fire-and-forget like
+    // the shared block containing its boundary, an owner's copy-in block at
+    // a publication point it keeps writing past, or a block a lone request's
+    // compaction moves (docs/design/scheduler.md §1.4). Fire-and-forget like
     // pages_to_zero: no op id, no ACK. The runtime enqueues them on the
     // forward thread's default stream after the execution stream's in-flight
     // forwards and BEFORE this plan's zeroing, so a source re-granted in the
-    // same round is read before it is zeroed. Destinations are never listed
-    // in pages_to_zero. Both ends share a residue class under page-cyclic
-    // sharding, so the rank that owns one end owns the other.
+    // same round is read before it is zeroed, and the execution stream waits
+    // for them, so a later plan's stores read them. Destinations are never
+    // listed in pages_to_zero, and each is written once. Every source is read
+    // as the plan found it, so a copy from a block an earlier copy fills (a
+    // lone request's moved tail block) is listed from that copy's source
+    // instead. Both ends share a residue class under page-cyclic sharding, so
+    // the rank that owns one end owns the other.
     std::map<std::string, std::vector<std::pair<std::int32_t, std::int32_t>>> pages_to_copy;
 
     // The plan separates its streams by executor, and the two remote

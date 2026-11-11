@@ -387,19 +387,12 @@ class Qwen4ExpPLEBackend(AttentionBackend):
         ]
         conv_shape = tuple(conv_fields[0].shape[1:])
         conv_dtype = conv_fields[0].dtype
-        conv_dst_stride = row_stride_i32(conv_fields[0])
         for layer, field in zip(self._conv_field_ids, conv_fields, strict=True):
             if tuple(field.shape[1:]) != conv_shape or field.dtype != conv_dtype:
                 raise RuntimeError(
                     f"PLE layer {layer} convolution cache geometry "
                     f"{tuple(field.shape[1:])}/{field.dtype} differs from layer "
                     f"{self._conv_field_ids[0]} {conv_shape}/{conv_dtype}"
-                )
-            if row_stride_i32(field) != conv_dst_stride:
-                raise RuntimeError(
-                    f"PLE layer {layer} convolution page stride "
-                    f"{row_stride_i32(field)} must match layer "
-                    f"{self._conv_field_ids[0]} {conv_dst_stride}"
                 )
         device = context_field.device
         return {
@@ -416,7 +409,11 @@ class Qwen4ExpPLEBackend(AttentionBackend):
             "conv_src_stride": self._i64(
                 [row_stride_i32(scratch) for scratch in conv_scratches], device
             ),
-            "conv_dst_stride": self._i64([conv_dst_stride] * len(conv_fields), device),
+            # A plane spaces its pages by its widest tenant, so PLE layers on
+            # different planes can have different page strides.
+            "conv_dst_stride": self._i64(
+                [row_stride_i32(field) for field in conv_fields], device
+            ),
             "conv_row_bytes": conv_fields[0][0].numel() * conv_fields[0].element_size(),
         }
 

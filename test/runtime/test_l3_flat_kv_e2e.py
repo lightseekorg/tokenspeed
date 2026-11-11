@@ -83,10 +83,11 @@ class TestL3FlatKvRoundTripTest:
         self.CacheGroupLayout = CacheGroupLayout
         self.CacheTransferLayout = CacheTransferLayout
 
-    def test_d2h_backup_host_wipe_prefetch_h2d_restores_bytes(self):
+    @pytest.mark.parametrize("io_backend", ["direct", "kernel"])
+    def test_d2h_backup_host_wipe_prefetch_h2d_restores_bytes(self, io_backend):
         self._exercise(
             phase="roundtrip",
-            io_backend="direct",
+            io_backend=io_backend,
             namespace=f"e2e-{uuid.uuid4().hex}",
             mooncake=None,
         )
@@ -200,7 +201,11 @@ class TestL3FlatKvRoundTripTest:
                 )
                 stack.callback(executor.shutdown)
                 ownership = BlockOwnerTranslation.for_host_pool(
-                    layout, contract, num_host_lcm_blocks=8, rank=rank
+                    layout,
+                    contract,
+                    num_host_lcm_blocks=8,
+                    rank=rank,
+                    host_group_packing=executor.host_storage.group_packing,
                 )
                 # Both ranks' executors share the process's in-memory store.
                 l3 = host_storage_executor(
@@ -548,13 +553,16 @@ class TestL3FlatKvRoundTripTest:
             torch.cuda.synchronize()
             assert not bool(executor.host_storage.host_buffer.any().item())
 
-            get = StorageOp(3, StorageKind.Get, keys, [2, 5, 4])
+            # Host packing is (1, 2), independent of Device packing (2, 1).
+            # Keep Host payloads in distinct parents; Device targets stay 2, 5, 4.
+            restore_host_blocks = [2, 3, 7]
+            get = StorageOp(3, StorageKind.Get, keys, restore_host_blocks)
             self._complete(l3, get, expected=[True] * 3)
             assert bool(executor.host_storage.host_buffer.any().item())
 
             load_index = executor._start_loading(  # pylint: disable=protected-access
                 [9],
-                [(0, 2, 2), (0, 5, 5), (1, 4, 4)],
+                [(0, 2, 2), (0, 5, 3), (1, 4, 7)],
                 prerequisite_stream=torch.cuda.current_stream(),
             )
             assert load_index is not None
@@ -578,7 +586,7 @@ class TestL3FlatKvRoundTripTest:
 
             assert l3.delete_namespace()
             executor.host_storage.host_buffer.fill_(0)
-            miss = StorageOp(4, StorageKind.Get, keys, [2, 5, 4])
+            miss = StorageOp(4, StorageKind.Get, keys, restore_host_blocks)
             self._complete(l3, miss, expected=[False] * 3)
             assert not bool(executor.host_storage.host_buffer.any().item())
 

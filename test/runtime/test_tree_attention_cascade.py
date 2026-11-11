@@ -80,7 +80,6 @@ def _backend(
         device="cuda",
         dtype=torch.bfloat16,
         kv_cache_dtype=kv_dtype,
-        prefix_granularity=PAGE,
         kernel_page_size=PAGE,
         context_len=2048,
         max_bs=max_bs,
@@ -225,6 +224,21 @@ def test_tree_lanes_match_reference(topk, steps, poison, kv_dtype):
     )
 
 
+def test_lane_forward_ends_the_lane_step_when_the_forward_raises():
+    topk, steps = 2, 4
+    backend = _backend(
+        (steps - 1) * topk, max_bs=8, is_draft=True, kv_dtype=torch.bfloat16
+    )
+    lanes = TreeDraftInputs(topk, steps, 8, torch.device("cuda"))
+    backend.bind_tree_draft(lanes)
+    with pytest.raises(RuntimeError, match="draft step failed"):
+        with lanes.lane_forward():
+            assert backend.tree_lane_step_active
+            raise RuntimeError("draft step failed")
+    # The next draft forward (a reload's rollback capture) takes the plain decode layout.
+    assert not backend.tree_lane_step_active
+
+
 # MLA: Kimi K2.5 at TP4 (16 heads), one latent row of 512 + 64 rotary channels per token.
 MLA_HEADS, LATENT, ROPE = 16, 512, 64
 MLA_LEAVES = [TRTLLMMLABackend, CuteDSLMLABackend]
@@ -248,7 +262,6 @@ def _mla_backend(cls, num_draft_tokens, max_bs, is_draft, kv_dtype):
         device="cuda",
         dtype=torch.bfloat16,
         kv_cache_dtype=kv_dtype,
-        prefix_granularity=PAGE,
         kernel_page_size=PAGE,
         context_len=2048,
         max_bs=max_bs,

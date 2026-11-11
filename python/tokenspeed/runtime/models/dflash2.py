@@ -23,22 +23,30 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.ops.conv import dflash2_grouped_conv
 from torch import nn
 
+from tokenspeed.runtime.distributed.comm_backend.registry import get_global_backend
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.mapping import Mapping, MappingBase
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
+from tokenspeed.runtime.layers.dense.fp8_weight_only import quantize_fp8_weight_rows
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
+from tokenspeed.runtime.layers.logits_processor import (
+    should_apply_lm_head_quant_method,
+)
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.layers.quantization.fp8_weight_only import (
+    Fp8WeightOnlyConfig,
+)
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
-from tokenspeed.runtime.models.deepseek_v3 import _prepare_mla_kv_b_proj_weights
+from tokenspeed.runtime.models.deepseek_v3 import absorb_mla_kv_b_proj
 from tokenspeed.runtime.models.dflash import (
     DFlashDecoderLayer,
     DFlashDraftModel,
@@ -46,6 +54,16 @@ from tokenspeed.runtime.models.dflash import (
 )
 from tokenspeed.runtime.models.kimi_k3_dspark import K3DSparkAttention
 from tokenspeed.runtime.utils import add_prefix
+
+if TYPE_CHECKING:
+    from tokenspeed_kernel.ops.communication._iris.residual_rmsnorm import (
+        LamportResidualRMSNorm,
+    )
+
+# Most rows one fused reduce + norm serves (16 requests of 8 block rows), the
+# most the row-owned kernel keeps resident; larger draft forwards keep the
+# unfused reduction.
+_FUSED_REDUCE_NORM_MAX_ROWS = 128
 
 
 def _dflash2_config_value(config: Any, key: str, default: Any = None) -> Any:
@@ -270,17 +288,26 @@ def _reduce_norm(
     hidden_states: torch.Tensor,
     residual: torch.Tensor,
     tp: MappingBase,
+    fused: LamportResidualRMSNorm | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Reduce a shard-local partial, then norm.
+    """Reduce a shard-local partial, then add the residual and norm.
 
-    Deliberately the unfused path, matching
-    ``K3DSparkDecoderLayer._norm_with_allreduce``: the fused variant is sized
-    from the target's shapes and the draft's block forward is a different
-    width. This puts the reduction where that fusion can absorb it once it has
-    been verified at this width.
+    ``fused`` is the draft's prepared reduce + norm over ``tp``'s group, or
+    None; rows past its capacity take the reduction and the norm as two
+    launches. Each sums in FP32 rank order and rounds once to BF16, as the
+    group's Iris all-reduces do.
     """
     if tp.tp_size <= 1:
         return norm(hidden_states, residual)
+    rows = hidden_states.shape[0]
+    if fused is not None and 0 < rows <= fused.max_rows and norm.weight_offset == 0:
+        from tokenspeed_kernel.ops.communication.iris import (
+            iris_lamport_residual_rmsnorm,
+        )
+
+        return iris_lamport_residual_rmsnorm(
+            fused, hidden_states, residual, norm.weight, norm.variance_epsilon
+        )
     return norm(all_reduce(hidden_states, tp.tp_group), residual)
 
 
@@ -295,6 +322,8 @@ class DFlash2DecoderLayer(DFlashDecoderLayer):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
+        # Set before the base constructor, whose resolve_attn() reads it.
+        self._uses_mla = _dflash2_uses_mla(config)
         super().__init__(
             config=config,
             mapping=mapping,
@@ -302,38 +331,10 @@ class DFlash2DecoderLayer(DFlashDecoderLayer):
             quant_config=quant_config,
             prefix=prefix,
         )
-        self.layer_id = int(layer_id)
-        self._uses_mla = _dflash2_uses_mla(config)
         self.comm_manager = None
+        # The draft's prepared reduce + norm, bound by the draft model.
+        self.fused_reduce_norm: LamportResidualRMSNorm | None = None
         if self._uses_mla:
-            rope_theta, rope_scaling = _dflash2_mla_rope(config)
-            self.self_attn = K3DSparkAttention(
-                config=config,
-                mapping=mapping,
-                hidden_size=int(config.hidden_size),
-                num_heads=int(config.num_attention_heads),
-                qk_nope_head_dim=int(config.qk_nope_head_dim),
-                qk_rope_head_dim=int(config.qk_rope_head_dim),
-                v_head_dim=int(config.v_head_dim),
-                q_lora_rank=int(config.q_lora_rank),
-                kv_lora_rank=int(config.kv_lora_rank),
-                rope_theta=rope_theta,
-                rope_scaling=rope_scaling,
-                # Match training: grow the YaRN cache on demand instead of
-                # materializing K3's one-million-token limit in every layer.
-                max_position_embeddings=min(
-                    int(getattr(config, "max_position_embeddings", 32768)), 32768
-                ),
-                quant_config=quant_config,
-                layer_id=layer_id,
-                prefix=add_prefix("self_attn", prefix),
-                reduce_attn_results=False,
-            )
-            # The draft's window is its compute visibility; storage is the
-            # cache plan's (bound at startup, the target's full-history group).
-            sliding_window = _get_dflash_layer_sliding_window(config, layer_id)
-            for attention in (self.self_attn.attn_mqa, self.self_attn.attn_mha):
-                attention.sliding_window_size = sliding_window
             self.comm_manager = CommManager(
                 mapping=mapping,
                 layer_id=layer_id,
@@ -356,6 +357,40 @@ class DFlash2DecoderLayer(DFlashDecoderLayer):
         self.mlp_conv = DFlashGroupedConv(
             **conv_args, prefix=add_prefix("mlp_conv", prefix)
         )
+
+    def resolve_attn(self, prefix: str) -> nn.Module:
+        if not self._uses_mla:
+            return super().resolve_attn(prefix)
+        config = self.config
+        rope_theta, rope_scaling = _dflash2_mla_rope(config)
+        attention = K3DSparkAttention(
+            config=config,
+            mapping=self.mapping,
+            hidden_size=int(config.hidden_size),
+            num_heads=int(config.num_attention_heads),
+            qk_nope_head_dim=int(config.qk_nope_head_dim),
+            qk_rope_head_dim=int(config.qk_rope_head_dim),
+            v_head_dim=int(config.v_head_dim),
+            q_lora_rank=int(config.q_lora_rank),
+            kv_lora_rank=int(config.kv_lora_rank),
+            rope_theta=rope_theta,
+            rope_scaling=rope_scaling,
+            # Match training: grow the YaRN cache on demand instead of
+            # materializing K3's one-million-token limit in every layer.
+            max_position_embeddings=min(
+                int(getattr(config, "max_position_embeddings", 32768)), 32768
+            ),
+            quant_config=self.quant_config,
+            layer_id=self.layer_id,
+            prefix=prefix,
+            reduce_attn_results=False,
+        )
+        # The draft's window is its compute visibility; storage is the
+        # cache plan's (bound at startup, the target's full-history group).
+        sliding_window = _get_dflash_layer_sliding_window(config, self.layer_id)
+        for paged in (attention.attn_mqa, attention.attn_mha):
+            paged.sliding_window_size = sliding_window
+        return attention
 
     def forward(
         self,
@@ -381,6 +416,7 @@ class DFlash2DecoderLayer(DFlashDecoderLayer):
                 hidden_states,
                 residual,
                 self.mapping.dense,
+                self.fused_reduce_norm,
             )
 
         hidden_states, coefficients = self.attention_conv.prepare(hidden_states)
@@ -398,6 +434,7 @@ class DFlash2DecoderLayer(DFlashDecoderLayer):
             hidden_states,
             residual,
             self.mapping.attn,
+            self.fused_reduce_norm,
         )
 
         hidden_states, coefficients = self.mlp_conv.prepare(hidden_states)
@@ -425,10 +462,16 @@ class DFlash2DraftModel(DFlashDraftModel):
             prefix=prefix,
         )
         dtype = self.fc.weight.dtype
+        self.quant_config = quant_config
+        # The target head shard's weight-only FP8 copy (weight, scale) for the
+        # candidate GEMM, made in configure_target under fp8_weight_only.
+        self.fp8_head: tuple[torch.Tensor, torch.Tensor] | None = None
         self.input_embedding_scale = float(
             _dflash2_config_value(config, "input_embedding_scale", 1.0)
         )
         self.block_size = int(_dflash2_config_value(config, "block_size"))
+        # The draft's prepared reduce + norm (prepare_communication_runtime).
+        self.fused_reduce_norm: LamportResidualRMSNorm | None = None
         self.candidate_selector = CandidateSelector(
             hidden_size=int(config.hidden_size),
             vocab_size=int(config.vocab_size),
@@ -436,6 +479,30 @@ class DFlash2DraftModel(DFlashDraftModel):
             top_k=int(_dflash2_config_value(config, "selector_top_k")),
             params_dtype=dtype,
             prefix=add_prefix("candidate_selector", prefix),
+        )
+
+    def configure_target(self, target_model, target_config) -> None:
+        """Install the capture inputs, and the FP8 head copy if quantized.
+
+        Under ``fp8_weight_only`` the draft's candidate GEMM reads an FP8
+        copy of the target's (16-bit) head shard: the head is the largest
+        weight a draft step streams. It is made here, before the KV-cache
+        budget is profiled, so the copy's memory is counted.
+        """
+        super().configure_target(target_model, target_config)
+        if not isinstance(self.quant_config, Fp8WeightOnlyConfig):
+            return
+        head = target_model.lm_head
+        shard = head.shard_indices
+        if head.weight.dtype not in (torch.bfloat16, torch.float16) or (
+            should_apply_lm_head_quant_method(head, head.quant_method)
+        ):
+            raise ValueError(
+                "fp8_weight_only drafting needs the target's 16-bit LM head, "
+                f"got {head.weight.dtype} with {type(head.quant_method).__name__}"
+            )
+        self.fp8_head = quantize_fp8_weight_rows(
+            head.weight[: int(shard.num_org_elements)]
         )
 
     def final_norm(
@@ -449,8 +516,62 @@ class DFlash2DraftModel(DFlashDraftModel):
             hidden_states,
             residual,
             self.mapping.dense,
+            self.fused_reduce_norm,
         )
         return hidden_states
+
+    def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
+        """Prepare the fused reduce + norm of the draft's layer boundaries.
+
+        Collective: every rank prepares or declines alike, before cache
+        sizing and graph capture. Taken on gfx950 at TP4/TP8 for a BF16 draft
+        when the attention and dense groups are one group whose performance
+        route is Iris and whose all-reduce is already prepared (the
+        target's): the mailboxes come out of the headroom of the heap that
+        preparation sized, and an allocation past
+        it raises on every rank alike.
+
+        Args:
+            max_num_tokens: Most rows a forward carries; unused, the fused
+                path serves at most ``_FUSED_REDUCE_NORM_MAX_ROWS``.
+
+        Returns:
+            Whether the draft prepared anything.
+        """
+        del max_num_tokens
+        if self.fused_reduce_norm is not None:
+            return True
+        from tokenspeed_kernel.ops.communication.iris import (
+            iris_lamport_residual_rmsnorm_supported,
+            prepare_iris_lamport_residual_rmsnorm,
+        )
+
+        from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
+
+        mapping = self.mapping
+        group = mapping.attn.tp_group
+        backend = get_global_backend()
+        hidden_size = int(self.config.hidden_size)
+        # The kernel's predicate decides the device, group size and width.
+        if (
+            not iris_lamport_residual_rmsnorm_supported(
+                mapping.attn.tp_size, hidden_size, torch.bfloat16
+            )
+            or mapping.dense.tp_group != group
+            or self.fc.weight.dtype != torch.bfloat16
+            or not isinstance(backend, AutoBackend)
+            or not backend.can_prepare_all_reduce_buffers(group, torch.bfloat16)
+        ):
+            return False
+        all_reduce_state = backend.iris.state(group, torch.bfloat16)
+        if all_reduce_state is None:
+            return False
+        self.fused_reduce_norm = prepare_iris_lamport_residual_rmsnorm(
+            all_reduce_state, _FUSED_REDUCE_NORM_MAX_ROWS, hidden_size
+        )
+        for layer in self.layers:
+            layer.fused_reduce_norm = self.fused_reduce_norm
+        return True
 
     @property
     def _uses_mla(self) -> bool:
@@ -564,10 +685,7 @@ class DFlash2DraftModel(DFlashDraftModel):
                 f"DFlash2 MLA checkpoint is missing {len(missing)} weights: {missing[:8]}"
             )
         for layer in self.layers:
-            self_attn = layer.self_attn
-            self_attn.w_kc, self_attn.w_vc = _prepare_mla_kv_b_proj_weights(
-                self_attn.kv_b_proj.weight, self_attn
-            )
+            absorb_mla_kv_b_proj(layer.self_attn)
 
     @torch.no_grad()
     def forward(self, *args, input_embeds: torch.Tensor | None = None, **kwargs):

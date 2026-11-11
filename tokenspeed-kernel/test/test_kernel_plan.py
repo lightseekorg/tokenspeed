@@ -482,3 +482,74 @@ def test_mla_value_projection_plan_requires_declared_invariance():
     _register_project_value("ordinary", priority=19, invariant=False)
     with pytest.raises(NoKernelFoundError):
         _plan_project_value()
+
+
+@pytest.mark.parametrize("supports_mask", [False, True])
+def test_moe_mask_is_consumed_or_rejected(supports_mask):
+    from tokenspeed_kernel.ops.moe import moe_apply, moe_plan
+
+    def reference(
+        *,
+        plan,
+        x,
+        w,
+        router_logits,
+        topk_weights,
+        topk_ids,
+        num_tokens_global,
+        max_num_tokens_per_gpu,
+        do_finalize,
+        enable_pdl,
+        valid_token_mask=None
+    ):
+        return x if valid_token_mask is None else x * valid_token_mask[:, None]
+
+    features = frozenset({"valid_token_mask"}) if supports_mask else frozenset()
+    KernelRegistry.get().register(
+        KernelSpec(
+            name="reference_masked_moe",
+            family="moe",
+            mode="apply",
+            solution="reference",
+            format_signatures=format_signatures("x", "dense", {torch.float32}),
+            features=features,
+            traits={
+                "weight_dtype": frozenset({"unquant"}),
+                "routing_mode": frozenset({"precomputed_topk"}),
+                "combine_order": frozenset({"rank"}),
+            },
+        ),
+        reference,
+    )
+    plan = moe_plan(
+        "unquant",
+        input_dtype=torch.float32,
+        activation="swiglu",
+        routing_mode="precomputed_topk",
+        a2a_backend="none",
+        ep_size=1,
+        ispp=4,
+        hidden=4,
+        num_experts=2,
+        top_k=1,
+        swiglu_form="standard",
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=False,
+        combine_order="rank",
+        features=features,
+        solution="reference",
+    )
+    x = torch.arange(12).float().reshape(3, 4)
+    mask = torch.tensor([True, False, True])
+    w = torch.nn.Module()
+    if supports_mask:
+        torch.testing.assert_close(
+            moe_apply(plan, x, w, None, valid_token_mask=mask), x * mask[:, None]
+        )
+        with pytest.raises(ValueError, match="match its input rows"):
+            moe_apply(plan, x, w, None, valid_token_mask=mask[:1])
+    else:
+        with pytest.raises(ValueError, match="cannot consume a live-row mask"):
+            moe_apply(plan, x, w, None, valid_token_mask=mask)
+    torch.testing.assert_close(moe_apply(plan, x, w, None), x)

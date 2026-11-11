@@ -158,6 +158,19 @@ class Profiler:
         # All validation must precede any state mutation: the event loop runs
         # _profile_batch_predicate on every batch, so a rejected request that
         # left partial profiler state behind would crash the scheduler.
+        gpu_activities = sorted({"GPU", "PROTON"} & set(activities))
+        if (
+            gpu_activities
+            and torch.version.hip
+            and os.environ.get("HSA_TOOLS_DISABLE_REGISTER") == "1"
+        ):
+            # set_rocm_tool_registration_default turns registration off.
+            return ProfileReqOutput(
+                success=False,
+                message=f"{', '.join(gpu_activities)} profiling records no "
+                "kernels on ROCm without profiler-tool registration; launch "
+                "the server with HSA_TOOLS_DISABLE_REGISTER=0 to profile the GPU.",
+            )
         if "PROTON" in activities:
             conflicting = sorted({"GPU", "CUDA_PROFILER"} & set(activities))
             if conflicting:

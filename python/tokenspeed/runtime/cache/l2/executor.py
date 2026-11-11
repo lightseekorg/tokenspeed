@@ -64,7 +64,9 @@ from tokenspeed_scheduler import Cache
 
 from tokenspeed.runtime.cache.host_storage import (
     HostCacheStorage,
+    compute_host_group_packing,
     compute_host_lcm_block_bytes,
+    validate_host_group_packing,
 )
 from tokenspeed.runtime.cache.l2.layerwise_load import LayerwiseLoadTracker
 from tokenspeed.runtime.cache.l2.sizing import (
@@ -229,7 +231,22 @@ class HostCacheExecutor:
             draft_layout,
             group_ids=scheduler_group_ids or None,
         )
-        host_lcm_block_bytes = compute_host_lcm_block_bytes(self.layout)
+        host_lcm_block_bytes = compute_host_lcm_block_bytes(
+            self.layout, group_specs=contract.group_specs
+        )
+        shard_by_id = {
+            spec.group_id: int(spec.shard_count) for spec in contract.group_specs
+        }
+        self.host_group_packing = tuple(
+            packing * shard_by_id[group.group_id]
+            for group, packing in zip(
+                self.layout.groups,
+                compute_host_group_packing(
+                    self.layout, group_specs=contract.group_specs
+                ),
+                strict=True,
+            )
+        )
 
         # --- L2 prefix tier -------------------------------------------------
         host_lcm_blocks = 0
@@ -258,17 +275,20 @@ class HostCacheExecutor:
         self.max_retracted_requests = self.snapshot_sizing.max_retracted_requests
         snapshot_bytes = snapshot_lcm_blocks * host_lcm_block_bytes
         arena_bytes = (self.max_retracted_requests + 1) * self.blob_bytes
-        share_bytes = host_memory_share(
+        share_bytes, share_source = host_memory_share(
             nprocs_per_node=nprocs_per_node, headroom_bytes=_HOST_MEM_HEADROOM_BYTES
         )
-        # Each buffer takes the power of two its pinned allocation rounds to.
+        # Size each buffer using the effective pinned allocator configuration.
         pool_pinned_bytes = pinned_host_bytes(snapshot_bytes) + pinned_host_bytes(
             arena_bytes
         )
         # The L2 blocks every rank's share holds beside the pool. Agreeing on
         # it is also a barrier: no rank pins before every rank read its share.
         fitting_l2_blocks = _min_over_ranks(
-            largest_pinned_fit(share_bytes - pool_pinned_bytes) // host_lcm_block_bytes,
+            largest_pinned_fit(
+                share_bytes - pool_pinned_bytes, block_bytes=host_lcm_block_bytes
+            )
+            // host_lcm_block_bytes,
             world_cpu_group,
         )
         if l2_tier and host_size_gb <= 0 and 0 < fitting_l2_blocks < host_lcm_blocks:
@@ -282,9 +302,9 @@ class HostCacheExecutor:
                 "rank, the most every rank's share of its node holds: "
                 f"--kvstore-ratio {host_ratio} asks for more. The "
                 f"{nprocs_per_node} ranks of a node pin Host memory together, "
-                "and each pinned buffer takes a power of two; this rank's share "
+                "under the pinned allocator settings; this rank's share "
                 f"is {share_bytes / 1e9:.2f} GB (the node's available Host "
-                "memory over its ranks, less "
+                f"memory, from {share_source}, over its ranks, less "
                 f"{_HOST_MEM_HEADROOM_BYTES / 1e9:.2f} GB headroom each)"
             )
             host_lcm_blocks = fitting_l2_blocks
@@ -313,12 +333,24 @@ class HostCacheExecutor:
                     "--retraction-snapshot-ratio rather than "
                     "--retraction-snapshot-host-gb"
                 )
+        validate_host_group_packing(
+            self.host_group_packing,
+            cpu_group=world_cpu_group,
+        )
         l2_bytes = host_lcm_blocks * host_lcm_block_bytes
         # Both tiers count against the one check, at the sizes they pin.
+        l2_pinned_bytes = pinned_host_bytes(l2_bytes)
         check_host_memory(
-            pinned_host_bytes(l2_bytes) + pool_pinned_bytes,
+            l2_pinned_bytes + pool_pinned_bytes,
             share_bytes=share_bytes,
+            share_source=share_source,
             purpose="the compact Host cache",
+        )
+        logger.info(
+            f"Host pinned memory budget: L2 payload={l2_bytes / 1e9:.2f} GB, "
+            f"L2 reservation={l2_pinned_bytes / 1e9:.2f} GB, "
+            f"snapshot reservation={pool_pinned_bytes / 1e9:.2f} GB, "
+            f"rank share={share_bytes / 1e9:.2f} GB"
         )
 
         self.host_storage: HostCacheStorage | None = None
@@ -326,7 +358,9 @@ class HostCacheExecutor:
         self._transfer_geometry = None
         if l2_tier:
             self.host_storage = HostCacheStorage(
-                self.layout, num_host_lcm_blocks=host_lcm_blocks
+                self.layout,
+                group_specs=contract.group_specs,
+                num_host_lcm_blocks=host_lcm_blocks,
             )
             # Scheduler block ids on both ends of every L2 copy to this rank's
             # local ids.
@@ -334,6 +368,7 @@ class HostCacheExecutor:
                 self.layout,
                 contract,
                 num_host_lcm_blocks=host_lcm_blocks,
+                host_group_packing=self.host_storage.group_packing,
                 rank=kvp_rank,
             )
         # The scheduler wire includes logical null LCMBlock 0 in its counts;
@@ -347,12 +382,15 @@ class HostCacheExecutor:
         self.blob_arena: torch.Tensor | None = None
         if snapshot_lcm_blocks:
             self.snapshot_storage = HostCacheStorage(
-                self.layout, num_host_lcm_blocks=snapshot_lcm_blocks
+                self.layout,
+                group_specs=contract.group_specs,
+                num_host_lcm_blocks=snapshot_lcm_blocks,
             )
             self.snapshot_block_owners = BlockOwnerTranslation.for_host_pool(
                 self.layout,
                 contract,
                 num_host_lcm_blocks=snapshot_lcm_blocks,
+                host_group_packing=self.snapshot_storage.group_packing,
                 rank=kvp_rank,
             )
             # One row per retracted request, indexed by the op's snapshot_slot.
@@ -388,8 +426,9 @@ class HostCacheExecutor:
                 self._load_trackers.append((tracker, len(layout.consumers)))
         # Every copy runs on its own stream, ordered after the prerequisite
         # stream the caller names per submission: for a store the one the
-        # forwards wrote the source pages on, for a load the one that zeroed
-        # the destination pages. What differs per store is who waits on the
+        # forwards wrote the source pages on, for a load the one the plan's
+        # zeroing ran on, behind the forwards in flight (a load's destination
+        # pages are not zeroed). What differs per store is who waits on the
         # copy: a stream-ordered op (a retraction image's L2 leg, every
         # snapshot store, and under the Host write-back policy the store of
         # what the plan's admissions and restores evicted: sources this very
@@ -481,6 +520,38 @@ class HostCacheExecutor:
                         )
         self.write_stream.synchronize()
         self.load_stream.synchronize()
+
+        if snapshot_lcm_blocks and io_backend == "kernel":
+            self._warmup_restore_transfers()
+
+    def _warmup_restore_transfers(self) -> None:
+        """Warm each Host tier's unflagged H2D restore, preserving Device bytes."""
+        # Host blocks must still be unassigned for this scratch round trip.
+        # Use one group so compact Host-parent writes cannot overlap.
+        group_index = next(
+            i for i, group in enumerate(self.layout.groups) if group.fields
+        )
+        for storage, geometry, lane in (
+            (self.host_storage, self._transfer_geometry, self._restore_l2_lane),
+            (
+                self.snapshot_storage,
+                self._snapshot_geometry,
+                self._restore_pool_lane,
+            ),
+        ):
+            if storage is None:
+                continue
+            launch = dict(
+                device_buffers=self.layout.buffers,
+                host_buffer=storage.host_buffer,
+                geometry=geometry,
+                stream=self.load_stream,
+                prerequisite_stream=device_module.current_stream(),
+                backend=self.transfer_backend,
+            )
+            lane.start_d2h([(group_index, 1, 1)], **launch)
+            lane.start_h2d([(group_index, 1, 1)], **launch)
+            self.load_stream.synchronize()
 
     def submit_write_backs(
         self, cache_ops: Sequence, *, prerequisite_stream, fence_stream
@@ -574,7 +645,8 @@ class HostCacheExecutor:
 
         The device handle calls it on every plan, cache ops or none: it also
         points the layerwise load trackers at this plan's load, or at none,
-        which is what the forward's layers and a prefill graph replay wait on.
+        which is what the forward's layers and a prefill graph replay's
+        segments wait on.
 
         Every load-back row reads a Host L2 entry that is already there (an
         L3 prefetch, when one ran, filled and published it before the
@@ -591,9 +663,9 @@ class HostCacheExecutor:
                 batches and the per-request ``RestoreOp`` entries are read
                 here.
             prerequisite_stream: The stream whose completed work every copy
-                must observe -- the one the plan's page zeroing ran on (behind
-                the store fence), so the loads land on zeroed destination
-                pages and nothing reads a restored page before its image.
+                must observe -- the one the plan's page zeroing ran on, behind
+                the store fence and the forwards in flight, so no earlier
+                write to a destination lands after its copy.
         """
         op_ids: list[int] = []
         transfers: list[tuple[int, int, int]] = []
@@ -889,7 +961,8 @@ class HostCacheExecutor:
         tracker is not armed. A row overwrites its whole destination block,
         so the scheduler lists no restore destination for zeroing; the copies
         still order behind the stream the caller names, which carries the
-        plan's store fence and its zeroing of other pages. The ops were
+        plan's store fence, the forwards in flight and its zeroing of other
+        pages. The ops were
         validated at collection; an op with no rows restores its slot state
         alone.
         """
@@ -902,7 +975,8 @@ class HostCacheExecutor:
                 f"[snapshot] restore started: operations={len(ops):d} "
                 f"l2_blocks={len(l2_rows):d} pool_blocks={len(pool_rows):d}",
             )
-        # Behind the plan's zeroing and store fence on the stream the caller named.
+        # Behind the plan's zeroing, store fence and forwards in flight on the
+        # stream the caller named.
         self.load_stream.wait_stream(prerequisite_stream)
         if l2_rows:
             self._restore_l2_lane.start_h2d(
@@ -1009,10 +1083,10 @@ class HostCacheExecutor:
                 f"{len(transfers):d}",
             )
 
-        # The device handle zeroes the plan's freshly allocated Device blocks
-        # (``pages_to_zero``) on the prerequisite stream before submitting
-        # the load. Recording the start event there
-        # makes the H2D copy wait for that zeroing; per-layer ready flags
+        # The device handle orders the prerequisite stream behind the
+        # forwards in flight and the plan's zeroing before submitting the
+        # load. Recording the start event there makes the H2D copy wait for
+        # both; per-layer ready flags
         # (Triton) or events (DMA) then keep model consumers from reading
         # partially restored cache state.
         load_index = None

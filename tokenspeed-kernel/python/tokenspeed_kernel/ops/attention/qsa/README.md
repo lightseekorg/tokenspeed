@@ -1,5 +1,110 @@
 # QSA kernels
 
+QSA scores compressed index keys, selects logical blocks, expands them to
+full-cache slots, and attends to those slots. The block selector takes an
+explicit `auto`, `stream`, or `logits` path. Backend selection and overrides
+preserve the requested path.
+
+## Streaming block selection
+
+The Blackwell CuTe implementation lives under
+`thirdparty/cute_dsl/_qsa_stream_topk/`. It computes BF16 dot products with
+FP32 accumulation, clamps each head score at zero, and selects up to 512
+logical compressed-block IDs. Full candidate scores and logical IDs retain
+FP32 and 32-bit precision. `score.py` shares the positive clamps and paired
+head sums between warp-MMA decode and TMEM prefill; each independent score
+keeps its original left-to-right FP32 addition order.
+
+Long prefill shares K tiles across eight request-owned queries per CTA.
+TMA key copies, MMA accumulators, and compacted score queues each have two
+stages. Every row keeps two 1120-entry FP32 score buffers. Integer coarse
+and fine histograms can retain a bounded 528-candidate set, including the
+complete boundary bucket; exact FP32 refinement runs on overflow and final
+output. The retained minimum is a conservative producer cutoff. A stale
+cutoff may retain extra scores but cannot remove a required winner.
+
+Shared storage is allocated once outside request-group branches. Full
+single-owner groups bypass the ownership loop; mixed-owner groups and tails
+process consecutive phases with a reader barrier before storage reuse. The
+CTA allocates TMEM once before these phases and releases it after the final
+MMA tail. A request boundary never relinquishes the CTA's allocation permit.
+The score queue's acquire/release protocol protects each stage. Dead coarse
+histograms hold boundary candidates and carry overflow; exact histograms
+reuse a score stage only after its scores have been consumed. Running
+compaction scratch remains separate from live K and score storage.
+
+Small grids use the same warp-MMA score computation with optional bounded
+proposals. Every omitted score contributes to an exact upper bound. Merge
+accepts proposals only when that bound proves a complete top-k; otherwise it
+reads the original FP32 scores. Large ties and clipped histogram boundaries
+also retain exact refinement. Scratch is bounded by the caller's existing
+budget, with the grouped kernel handling zero-budget calls.
+
+Owners, frontiers, row counts, and tensor strides remain runtime inputs.
+Every CuTe streaming algorithm widens query-row and head indices before
+multiplying by runtime strides, including for strided query views. Key-page
+and partial-score row addressing retain 64-bit offsets for large cache pools
+and scratch buffers. Logical slots and TMA coordinates require fewer than
+`2**31` key slots.
+Only static geometry, explicit algorithm parameters, and bucketed capacity
+specialize compilation. Graph replay refreshes the same input buffers as
+eager execution; no backend-private request state is introduced.
+
+## FP8 direct-slot prefill
+
+`cute_dsl_fp8_qsa_sparse_prefill` handles SM107 BF16 queries with E4M3FN K/V,
+256-wide heads, twelve query heads per KV head, one or two KV heads, and
+512 four-token blocks plus three tail columns. Q/K/V must be dense and
+16-byte aligned. Int32 selected-slot rows may have padding; int64 query
+positions may be strided. Other inputs retain the existing registry candidates.
+Use the full registered name to force this prefill implementation. A normal
+`solution="cute_dsl"` filter respects prefill/decode traits; a forced
+`override="cute_dsl"` retains the established decode entry.
+
+The independent implementation lives in `ops/attention/qsa/_cute_dsl/`.
+It reuses the existing MIT-licensed TMA, MMA, and descriptor helpers under
+`thirdparty/cute_dsl/`, whose notices remain with those helpers. One CTA owns
+a query and KV head. TMA gathers existing physical slots into separate K/V
+stages, overlapping copies with native FP8 tensor-core operations. The existing
+`QSASparseMetadata.query_positions` bounds the complete-block prefix and fixed
+tail columns, including cached prefixes and ragged requests. Nonpositive slots
+contribute no probability mass; empty rows produce zero. Q and the cache remain
+unmodified. No packed KV copy, persistent request state, or global scratch is
+introduced; the prologue remains the sole cache writer.
+
+This solution introduces additional quantization. Each query head uses an
+E4M3FN temporary with scale `max(abs(Q)) / 448` (one for an all-zero head).
+Scale construction and Q division round to nearest-even FP32 before the FP8
+cast. Native FP8 QK accumulates in FP32; the attention scale, key descale, and
+Q scale apply afterward. Online softmax processes 128 selected tokens per
+tile. Its unnormalized probabilities multiply by 448 and round to E4M3FN for
+PV. The normalization sum and output accumulator stay FP32; the value descale
+and inverse probability scale apply before the final BF16 output. An empty
+tile keeps its running maximum at negative infinity, so later negative logits
+still normalize correctly. Scalar descales are supported; tensor descales are
+rejected when this implementation is forced.
+
+These Q/P roundings can change attention values and generated tokens relative
+to FA2 or BF16-operand attention. Tests compare the implementation tightly to
+an independent reference with the same quantization, while real-input studies
+report the additional approximation separately. Force the existing FA2 kernel
+when these extra roundings are undesirable.
+
+Only device, head geometry, and PDL specialize compilation. Query counts, pool
+rows, slot/position strides, and all scales remain runtime inputs. Metadata
+offsets widen to int64 before multiplication; TMA computes cache byte offsets.
+Query and pool row counts must remain below `2**31`, independent of pool byte
+size. Graph replay reads refreshed buffers through the same entry. PDL waits
+before producer-owned reads and signals after output stores.
+
+## PrimTS plan preparation
+
+FlashInfer PrimTS caches cluster occupancy by CUDA device and cluster size.
+New eager layouts retain their own workspace plans and route offsets while
+sharing the hardware capacity query. This keeps CuTe's
+occupancy-query kernel compilation in startup and preserves the serving JIT
+checks when batch geometry changes.
+
 ## TMA gather sparse attention
 
 `thirdparty/cute_dsl/qsa_tma_gather.py` provides `TmaGatherSparseAttention`, an explicit,
@@ -138,3 +243,129 @@ Provider agreement and model quality are separate checks: the BF16 probability
 rounding can change logits after later layers even when individual attention
 outputs meet their mathematical tolerance. Default selection does not imply
 bitwise equivalence with FA2 or a model-level quality acceptance result.
+
+## Metadata and recent writes
+
+Padded MTP rows with negative logical positions retain them for masking,
+but contribute zero complete blocks to scoring and top-k selection.
+
+Compressed-key RoPE is read only at compression write boundaries. Non-boundary
+draft rows may have valid raw-key tags before their group-start header is staged.
+
+Each recent-cache page owns a separate raw-key ring. A later token suppresses
+an earlier writer only when both address the same physical page and ring slot.
+Prefill must leave the last raw keys and group-start positions in every page
+it computes, including pages before the final window, so an interior state
+checkpoint has valid recent-cache data when the scheduler publishes it.
+
+Startup metadata preparation covers integer alignment classes for compressed
+page-table row strides. Recent-cache writes cover these classes for row count
+and the exclusive request-id bound. The ordinary unlimited prefill call also
+prepares request-limited variants: pure target verification skips the writer
+when there are no extends. Changed table widths and mixed-prefill request
+counts can then reuse startup binaries.
+
+## Materialized Triton scoring
+
+The `logits` path materializes FP32 block scores before top-k selection.
+Query-group count, table capacity, tensor strides, and per-row frontiers are
+runtime inputs. Request count is represented by page-table rows and the
+per-query request indices. The group count opts out of scalar specialization;
+other integer inputs retain Triton's finite alignment classes for optimization.
+
+`BLOCK_N`, `BLOCK_H`, and `BLOCK_D` set static tile dimensions. Query grouping
+also sets `arange` and `reshape` dimensions and remains compile-time; a
+bounded flag selects whether the query-group loop is needed. Model dimensions,
+tensor formats, PDL, and launch tuning stay fixed for a warmed configuration.
+
+During `kernel_warmup`, scoring compiles and loads every power-of-two group
+allowed by the model geometry and both loop variants, without launching the
+unused variants. Four index heads of width 128 on NVIDIA have six groups,
+1 through 32, and two loop variants. Warmup also covers row-stride and capacity
+classes: one, divisible by 16, and other integers. With 64-block pages, capacity
+and logits strides stay divisible by 16; the three page-table stride classes
+give at most 36 binaries for one fixed tensor-format/PDL configuration.
+Later query-count, request-count, and table-width changes reuse these binaries
+while refreshing the launch grid. Grouping and occupancy policies are the same
+during prefill, decode, and CUDA graphs.
+
+## FP8 decode head tile and grid
+
+The direct-slot CuTe path uses a 16-column tile for twelve query heads per KV
+head with FP8 caches: on SM100/SM103 for every grid, and on SM107 once
+`query_rows * kv_heads >= SM_count`. Each query retains its independent
+selected-slot list. Covering all twelve heads in one tile avoids the second
+gather/conversion stream of the eight-column tactic. Both tactics compute
+sixteen padded head columns in total; useful QK/PV work is unchanged.
+
+`_select_head_tile` owns the device/grid policy. Query packing and the grouped
+BF16 private-prefix fallback use a separate fixed-geometry helper, so launch
+policy cannot change their padding.
+
+On SM100/SM103, an FP8 grid of at least `3 * SM_count / 16` output tiles picks
+its query rows per CTA and KV splits from 1x1, 2x1, 1x2 and 1x4. With one
+resident CTA per SM, the choice minimizes the wave count times the per-CTA
+work: each of its query rows gathers the 2048-entry prefix slots within one KV
+split and adds a fixed per-row cost fitted on SM103. Smaller grids, and every
+FP8 grid on SM107, keep the split rule with one query per CTA.
+
+Within its KV split, each FP8 query row ends the prefix loop after the last
+128-entry tile holding a positive id, and runs at least one tile. The CTA
+finds that tile while it stages the row's slot ids in shared memory (a warp
+max-reduce, then a CTA-wide maximum after the staging barrier); the gather
+ring, both MMA warps and the softmax share it as their loop bound. Later tiles
+hold only masked entries, which leave the softmax maximum, sum and output
+unchanged, so outputs are bitwise identical to the full loop for any id order,
+and an all-padding prefix keeps the full loop's state for the tail and the
+split merge. The bound is runtime data, not a compile-time parameter. Grid
+sizing still assumes full prefixes: rows with fewer selected slots, such as
+short contexts and padded rows, finish sooner.
+
+The tile and grid choice selects static geometry inside the existing decode
+provider. Cache layout, writers, prefix/offload ownership and descales keep
+their contracts.
+Startup warmup enumerates every tile and launch configuration before graph
+capture, and rows remain dynamic within each configuration. Tests cover Hq/Hkv
+of 24/2 and 12/1, target and draft query widths, both sides of the SM107
+212-SM grid threshold, the SM100/SM103 wave-count choices, padding, prefixes
+ending inside or on the edge of a tile, refreshed cache values, PDL on/off,
+large KV offsets and execution without further compilation after warmup.
+
+## BF16 KV scratch for FP8 prefill
+
+`qsa_bf16_kv_scratch` copies the FP8 E4M3 KV pages one call can read into a
+caller-owned BF16 scratch and rewrites the call's selected slots to it, so a
+large prefill call over an FP8 cache can run the direct-slot CuTe kernel's
+BF16 path, one query row at a time (`max_seqlen_q=1`), instead of the FP8
+prefill kernel that selection picks: FlashInfer FA2 by default on NVIDIA,
+where the CuTe kernel is registered for decode only, or the CuTe kernel's FP8
+path under a kernel override. The runtime uses it behind
+`--enable-qsa-prefill-bf16-scratch`.
+
+Request `r` owns scratch pages `[first_r, first_r + n_r)`, with
+`n_r = ceil(seq_lens[r] / page_size)` and `first_r = 1 + sum(n_s for s < r)`.
+`qsa_bf16_scratch_pages` gives a call's page count from host lengths and the
+copy launches one program row per scratch page, so planning reads nothing
+from the device. Each request's page-table columns `[0, n_r)` are copied in
+order. E4M3 to BF16 is exact, so the BF16 kernel sees the values an FP8 kernel
+reading the cache at unit scale computes. Scratch page 0 is never written:
+padding keeps its ids, and the caller keeps page 0 finite for the reads that
+still address slot 1.
+
+The page map has one int32 entry per cache page. The copy writes every entry
+the remap then reads, so its prior contents are never read and it may alias
+memory that is free until the remap finishes; the runtime uses the attention
+output buffer, which the kernel writes after the remap. This holds when every
+positive slot lies in its request's pages and the device lengths match the
+host lengths the launch was sized from. A slot outside them reads a stale
+entry and becomes padding or another page of the call, never an address past
+the copied pages. Page, slot and row offsets are 64-bit. Request and slot
+counts and the table and slot-row strides opt out of scalar specialization;
+the page size, slot width and PDL are compile-time.
+
+The direct-slot CuTe kernel's BF16 gathers zero-fill padded entries, a
+`cp.async` with zero source bytes, instead of reading slot 1, a line every CTA
+would otherwise read. The softmax masks padded entries by their ids, so the
+output is unchanged; rows near request starts have many of them.
+`cute_dsl_blackwell_qsa_sparse_attention` also accepts a caller-owned `out`,
+so the runtime's scratch path allocates nothing while serving.

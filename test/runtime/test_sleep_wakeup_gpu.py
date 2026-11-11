@@ -81,6 +81,8 @@ class _Engine:
                 "--model",
                 model,
                 "--enable-memory-saver",
+                "--weight-memory-policy",
+                "cpu_backup",
                 (
                     "--enable-prefix-caching"
                     if enable_prefix_caching

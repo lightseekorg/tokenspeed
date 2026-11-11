@@ -61,7 +61,8 @@ fn post_init(params: &mut SamplingParams) {
         }
         _ => None,
     };
-    if params.temperature < SAMPLING_EPS {
+    // A near-zero temperature means greedy; `verify` rejects a negative one.
+    if (0.0..SAMPLING_EPS).contains(&params.temperature) {
         params.temperature = 1.0;
         params.top_k = 1;
     }
@@ -94,6 +95,16 @@ fn normalize(params: &mut SamplingParams) {
 
 /// `verify(vocab_size)`: the reason the parameters are invalid, if they are.
 pub fn verify(params: &SamplingParams, vocab_size: i64) -> Result<(), String> {
+    verify_with_top_k_limit(params, vocab_size, Some(TOP_K_FUSED_MAX))
+}
+
+/// Check the selected sampler's exclusive finite top-k admission bound.
+/// `None` delegates finite top-k normalization to that sampler.
+pub fn verify_with_top_k_limit(
+    params: &SamplingParams,
+    vocab_size: i64,
+    top_k_exclusive_max: Option<i64>,
+) -> Result<(), String> {
     let p = params;
     if p.temperature < 0.0 {
         return Err(format!(
@@ -113,9 +124,11 @@ pub fn verify(params: &SamplingParams, vocab_size: i64) -> Result<(), String> {
             p.top_k
         ));
     }
-    if p.top_k != TOP_K_DISABLED && p.top_k >= TOP_K_FUSED_MAX {
+    if let Some(max) =
+        top_k_exclusive_max.filter(|&max| p.top_k != TOP_K_DISABLED && p.top_k >= max)
+    {
         return Err(format!(
-            "top_k must be < {TOP_K_FUSED_MAX} (fused kernel limit) or -1 (disable), got {}.",
+            "top_k must be < {max} (fused kernel limit) or -1 (disable), got {}.",
             p.top_k
         ));
     }

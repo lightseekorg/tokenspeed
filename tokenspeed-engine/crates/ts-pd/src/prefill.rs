@@ -32,10 +32,11 @@
 //! transfer contract ([`crate::layout`]).
 
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
+    ops::Range,
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc, Condvar, Mutex, MutexGuard,
+        mpsc, Arc, Condvar, Mutex, MutexGuard, RwLock,
     },
     thread,
     time::{Duration, Instant},
@@ -46,7 +47,7 @@ use ts_collective::{Group, Mesh, Reduce};
 
 use crate::{
     batch::{BatchRows, Staged},
-    control::{BootstrapInfo, PdError, PdEvent, TransferPeer},
+    control::{stalled_drains, BootstrapInfo, Draining, PdError, PdEvent, TransferPeer},
     http,
     layout::{
         contract::Contract,
@@ -74,7 +75,9 @@ struct Registration {
     endpoint: String,
     /// Its port.
     port: u16,
-    /// Its transfer session.
+    /// The cache incarnation used by requests.
+    cache_id: String,
+    /// The Mooncake address used for writes, which can be reused.
     session_id: String,
     /// The Decode node's attention TP size.
     decode_tp_size: i64,
@@ -91,6 +94,27 @@ struct Registration {
 impl Registration {
     fn is_dummy(&self) -> bool {
         self.planned.is_dummy
+    }
+}
+
+/// A replacement waits only for writers to the identities it supersedes.
+/// Manifests stay queued until the registration can be applied.
+#[derive(Clone)]
+struct PendingRegistration {
+    frames: Vec<Bytes>,
+    cache_id: String,
+    registration: Option<Registration>,
+}
+
+impl PendingRegistration {
+    fn conflicts(&self, other: &Self) -> bool {
+        self.cache_id == other.cache_id
+            || match (&self.registration, &other.registration) {
+                (Some(a), Some(b)) => {
+                    (a.endpoint == b.endpoint && a.port == b.port) || a.session_id == b.session_id
+                }
+                _ => false,
+            }
     }
 }
 
@@ -147,7 +171,7 @@ pub struct PrefillConfig {
 /// One destination of a room.
 #[derive(Debug, Clone)]
 struct Destination {
-    session_id: String,
+    cache_id: String,
     /// Its manifest of the request's blocks; `None` from a rank this one
     /// only joins the status agreement with.
     manifest: Option<Arc<Manifest>>,
@@ -179,11 +203,39 @@ enum Chunk {
         selection: Arc<Selection>,
         /// The producer step each interval's KV is complete at.
         target_steps: Vec<u64>,
-        is_last: bool,
+        final_window: Option<Range<i64>>,
     },
 }
 
 impl Chunk {
+    /// The final queued token window and its block count across cache groups.
+    fn final_transfer(&self) -> Option<(Range<i64>, usize)> {
+        match self {
+            Self::Full { source, .. } => {
+                let source = source.as_ref()?;
+                let pages = source
+                    .groups
+                    .iter()
+                    .map(|group| group.block_ids.len())
+                    .sum();
+                Some((source.prefix_len..source.prompt_len, pages))
+            }
+            Self::Layerwise {
+                selection,
+                final_window,
+                ..
+            } => {
+                let window = final_window.clone()?;
+                let pages = selection
+                    .groups
+                    .iter()
+                    .map(|group| group.source_block_ids.len())
+                    .sum();
+                Some((window, pages))
+            }
+        }
+    }
+
     fn room(&self) -> u64 {
         match self {
             Chunk::Full { room, .. } | Chunk::Layerwise { room, .. } => *room,
@@ -215,6 +267,19 @@ struct State {
     /// The rooms of the requests the scheduling loop tracks: a sleep may
     /// not release the cache while one may still send.
     tracked: HashSet<u64>,
+    // Queued and executing jobs that can still read source pages.
+    pending_chunks: HashMap<u64, usize>,
+    /// A native write error does not establish a remote DMA fence. Such a
+    /// room must never acknowledge cancellation and release its destinations.
+    uncertain: HashSet<u64>,
+    /// Cancelled room ids, retained until their associated cache identities
+    /// retire. An empty set has not received a manifest yet: no TTL proves
+    /// that a delayed manifest can no longer arrive. Failures/timeouts also
+    /// add records: with a long-lived cache this metadata can grow without
+    /// bound. See the cancellation contract in docs/design/event-loop.md.
+    cancelled: HashMap<u64, HashSet<String>>,
+    /// Reply only after this room's queued and executing jobs have retired.
+    cancellation_replies: HashMap<(u64, String), (String, u16)>,
     /// The tracked requests' rooms, by request.
     rooms_by_rid: HashMap<String, u64>,
     /// Rooms no request here has claimed, since when: a Decode rank
@@ -223,7 +288,10 @@ struct State {
     /// still unclaimed after the bootstrap timeout is dropped.
     unclaimed: HashMap<u64, Instant>,
     registrations: HashMap<String, Registration>,
-    /// Sessions whose registration was rejected: their reply route.
+    registration_gates: HashMap<String, Arc<RwLock<()>>>,
+    pending_registrations: VecDeque<PendingRegistration>,
+    pending_manifests: HashMap<String, Vec<Vec<Bytes>>>,
+    /// Rejected or retired cache identities: their reply route. Never revive them.
     rejected: HashMap<String, (String, u16)>,
     destinations: HashMap<u64, Vec<Destination>>,
     failed_sessions: HashMap<String, Instant>,
@@ -236,15 +304,62 @@ struct State {
 }
 
 impl State {
-    fn route_of(&self, session_id: &str) -> Option<(String, u16)> {
+    /// Take cancellation replies only after all writers retired with no
+    /// uncertain native write. Failure notices alone never release D pages.
+    #[allow(clippy::type_complexity)]
+    fn take_cancellation_replies(&mut self) -> Vec<((u64, String), (String, u16))> {
+        let ready: Vec<_> = self
+            .cancellation_replies
+            .keys()
+            .filter(|(room, _)| {
+                !self.pending_chunks.contains_key(room) && !self.uncertain.contains(room)
+            })
+            .cloned()
+            .collect();
+        ready
+            .into_iter()
+            .map(|key| {
+                let route = self
+                    .cancellation_replies
+                    .remove(&key)
+                    .expect("pending reply");
+                (key, route)
+            })
+            .collect()
+    }
+
+    fn route_of(&self, cache_id: &str) -> Option<(String, u16)> {
         self.registrations
-            .get(session_id)
+            .get(cache_id)
             .map(|registration| (registration.endpoint.clone(), registration.port))
-            .or_else(|| self.rejected.get(session_id).cloned())
+            .or_else(|| {
+                self.pending_registrations
+                    .iter()
+                    .find(|pending| pending.cache_id == cache_id)
+                    .and_then(|pending| pending.registration.as_ref())
+                    .map(|registration| (registration.endpoint.clone(), registration.port))
+            })
+            .or_else(|| self.rejected.get(cache_id).cloned())
     }
 
     fn ended(&self, room: u64) -> bool {
-        matches!(self.rooms.get(room), None | Some(TransferPoll::Failed))
+        self.cancelled.contains_key(&room)
+            || matches!(self.rooms.get(room), None | Some(TransferPoll::Failed))
+    }
+
+    fn cancel_room(&mut self, room: u64, cache_id: Option<&str>) {
+        let identities: Vec<_> = self
+            .destinations
+            .get(&room)
+            .into_iter()
+            .flatten()
+            .map(|destination| destination.cache_id.clone())
+            .collect();
+        let cancelled = self.cancelled.entry(room).or_default();
+        cancelled.extend(identities);
+        if let Some(cache_id) = cache_id {
+            cancelled.insert(cache_id.to_owned());
+        }
     }
 
     /// `room` gained state: start its unclaimed clock unless a request here
@@ -275,10 +390,11 @@ impl State {
                     destinations
                         .iter()
                         .filter(|destination| !destination.is_dummy())
-                        .filter_map(|destination| self.route_of(&destination.session_id))
+                        .filter_map(|destination| self.route_of(&destination.cache_id))
                         .map(|route| (route, room)),
                 );
             }
+            self.cancel_room(room, None);
             self.clear(room);
         }
         (expired, notices)
@@ -302,7 +418,7 @@ impl State {
             .iter()
             .map(|destination| {
                 self.registrations
-                    .get(&destination.session_id)
+                    .get(&destination.cache_id)
                     .ok_or_else(|| {
                         "CachePD request references an unregistered Decode session".to_owned()
                     })
@@ -348,9 +464,10 @@ impl Shared {
     }
 
     fn notify(&self, (endpoint, port): (String, u16), message: &StatusMessage) {
-        self.transport
+        let _ = self
+            .transport
             .sockets
-            .send(&endpoint, port, message.to_frames());
+            .send_coalesced(&endpoint, port, message.to_frames());
     }
 
     fn notify_failed(&self, route: (String, u16), room: u64) {
@@ -371,6 +488,9 @@ impl Shared {
             if let (false, Some(metrics)) = (counted, &self.metrics) {
                 metrics.record_failure();
             }
+            // Timeout/failure must reject manifests arriving after this
+            // request is forgotten, just like an explicit cancellation.
+            state.cancel_room(room, None);
             state.rooms.record_failure(room, reason);
             state.rooms.update(room, TransferPoll::Failed);
             state.touch(room);
@@ -379,11 +499,11 @@ impl Shared {
                 .iter()
                 .filter(|destination| !destination.is_dummy())
                 .filter_map(|destination| {
-                    let route = state.route_of(&destination.session_id);
+                    let route = state.route_of(&destination.cache_id);
                     if route.is_none() {
                         tracing::error!(
                             room,
-                            session = destination.session_id,
+                            session = destination.cache_id,
                             "cannot notify Decode of a failed room: unregistered session"
                         );
                     }
@@ -399,8 +519,56 @@ impl Shared {
     fn handle(&self, frames: &[Bytes]) {
         if wire::is_registration(frames) {
             self.handle_registration(frames);
+        } else if wire::is_cancellation(frames) {
+            self.handle_cancellation(frames);
         } else {
             self.handle_preallocation(frames);
+        }
+    }
+
+    fn handle_cancellation(&self, frames: &[Bytes]) {
+        let (room, cache_id) = match wire::cancellation_route(frames) {
+            Ok(route) => route,
+            Err(error) => {
+                tracing::error!(%error, "rejecting a malformed CachePD cancellation");
+                return;
+            }
+        };
+        let active = {
+            let mut state = self.state();
+            let Some(route) = state.route_of(&cache_id) else {
+                tracing::error!(room, cache_id, "cancellation names an unregistered cache");
+                return;
+            };
+            let active = state.registrations.contains_key(&cache_id)
+                || state
+                    .pending_registrations
+                    .iter()
+                    .any(|pending| pending.cache_id == cache_id);
+            if active {
+                state.cancel_room(room, Some(&cache_id));
+            }
+            state.cancellation_replies.insert((room, cache_id), route);
+            active
+        };
+        // A superseded cache has already passed the registration write gate.
+        // Its delayed cancellation must not cancel a newer cache's request.
+        if active {
+            self.abort_room(room, "Decode cancelled the KV receive");
+        }
+        self.flush_cancellations();
+    }
+
+    /// This also runs without any registered Prefill request: an unclaimed
+    /// room's cancellation must not wait for the bootstrap TTL or a forward.
+    fn flush_cancellations(&self) {
+        let replies = self.state().take_cancellation_replies();
+        for ((room, cache_id), (endpoint, port)) in replies {
+            let _ = self.transport.sockets.send_coalesced(
+                &endpoint,
+                port,
+                wire::cancellation_ack_frames(room, &cache_id, self.status_rank),
+            );
         }
     }
 
@@ -411,6 +579,7 @@ impl Shared {
         Ok(Registration {
             endpoint: info.endpoint,
             port: info.port,
+            cache_id: info.cache_id,
             session_id: info.session_id,
             decode_tp_size: info.tp_size,
             decode_tp_rank: info.tp_rank,
@@ -421,34 +590,141 @@ impl Shared {
     }
 
     fn handle_registration(&self, frames: &[Bytes]) {
+        let Ok((_, _, cache_id)) = wire::registration_route(frames) else {
+            tracing::error!("rejecting a malformed CachePD registration");
+            return;
+        };
+        self.state()
+            .pending_registrations
+            .push_back(PendingRegistration {
+                frames: frames.to_vec(),
+                cache_id,
+                registration: self.plan_registration(frames).ok(),
+            });
+        self.flush_registrations();
+    }
+
+    fn flush_registrations(&self) {
+        // Keep deferred routes visible to cancellation and worker failures.
+        // Only the control receiver mutates the registration queue.
+        let pending = self.state().pending_registrations.clone();
+        let mut waiting: VecDeque<PendingRegistration> = VecDeque::new();
+        for registration in pending {
+            if waiting
+                .iter()
+                .any(|earlier| earlier.conflicts(&registration))
+                || !self.try_registration(&registration)
+            {
+                waiting.push_back(registration);
+                continue;
+            }
+            let manifests = {
+                let mut state = self.state();
+                let index = state
+                    .pending_registrations
+                    .iter()
+                    .position(|item| item.frames == registration.frames)
+                    .expect("registration is still pending");
+                state.pending_registrations.remove(index);
+                state
+                    .pending_manifests
+                    .remove(&registration.cache_id)
+                    .unwrap_or_default()
+            };
+            for frames in manifests {
+                self.handle_preallocation(&frames);
+            }
+        }
+    }
+
+    /// Never wait for a native write on the control receiver. The guards
+    /// fence replacement against the affected cache's writes, not other D ranks.
+    fn try_registration(&self, pending: &PendingRegistration) -> bool {
+        let gates: Vec<_> = {
+            let state = self.state();
+            state
+                .registrations
+                .values()
+                .filter(|previous| {
+                    previous.cache_id == pending.cache_id
+                        || pending.registration.as_ref().is_some_and(|next| {
+                            (previous.endpoint == next.endpoint && previous.port == next.port)
+                                || previous.session_id == next.session_id
+                        })
+                })
+                .map(|previous| state.registration_gates[&previous.cache_id].clone())
+                .collect()
+        };
+        let mut guards = Vec::with_capacity(gates.len());
+        for gate in &gates {
+            match gate.try_write() {
+                Ok(guard) => guards.push(guard),
+                Err(std::sync::TryLockError::WouldBlock) => return false,
+                Err(std::sync::TryLockError::Poisoned(error)) => guards.push(error.into_inner()),
+            }
+        }
+        let frames = &pending.frames;
         let registered = self.plan_registration(frames).and_then(|registration| {
-            let mut state = self.state();
-            let session_id = registration.session_id.clone();
+            let state = self.state();
+            let cache_id = registration.cache_id.clone();
+            // A delayed registration must not revive a superseded cache and
+            // retire the current one, even if its transport address is reused.
+            if state.rejected.contains_key(&cache_id) {
+                return Err("registration for a retired CachePD cache instance".to_owned());
+            }
             if state
                 .registrations
-                .get(&session_id)
+                .get(&cache_id)
                 .is_some_and(|previous| *previous != registration)
             {
                 return Err("conflicting registration for an active CachePD session".to_owned());
             }
-            state.rejected.remove(&session_id);
-            state.failed_sessions.remove(&session_id);
-            state.registrations.insert(session_id, registration);
+            let retired: Vec<_> = state
+                .registrations
+                .values()
+                .filter(|previous| {
+                    previous.cache_id != cache_id
+                        && ((previous.endpoint == registration.endpoint
+                            && previous.port == registration.port)
+                            || previous.session_id == registration.session_id)
+                })
+                .map(|previous| {
+                    (
+                        previous.endpoint.clone(),
+                        previous.port,
+                        previous.cache_id.clone(),
+                    )
+                })
+                .collect();
+            drop(state);
+            // Keep each old reply route available while its unfinished rooms
+            // fail. New requests may only refer to the new cache identity.
+            for (endpoint, port, old_id) in retired {
+                self.reject_session(endpoint, port, &old_id, "cache instance superseded");
+            }
+            let mut state = self.state();
+            state.failed_sessions.remove(&cache_id);
+            state
+                .registration_gates
+                .entry(cache_id.clone())
+                .or_insert_with(|| Arc::new(RwLock::new(())));
+            state.registrations.insert(cache_id, registration);
             Ok(())
         });
         match registered {
             Ok(()) => {}
             Err(reason) => {
                 tracing::error!(reason, "rejecting a CachePD Decode registration");
-                if let Ok((endpoint, port, session_id)) = wire::registration_route(frames) {
-                    self.reject_session(endpoint, port, &session_id, &reason);
+                if let Ok((endpoint, port, cache_id)) = wire::registration_route(frames) {
+                    self.reject_session(endpoint, port, &cache_id, &reason);
                 }
             }
         }
+        true
     }
 
     /// Invalidate a session and fail the rooms that reference it.
-    fn reject_session(&self, endpoint: String, port: u16, session_id: &str, reason: &str) {
+    fn reject_session(&self, endpoint: String, port: u16, cache_id: &str, reason: &str) {
         let affected: Vec<u64> = self
             .state()
             .destinations
@@ -456,35 +732,55 @@ impl Shared {
             .filter(|(_, destinations)| {
                 destinations
                     .iter()
-                    .any(|destination| destination.session_id == session_id)
+                    .any(|destination| destination.cache_id == cache_id)
             })
             .map(|(&room, _)| room)
             .collect();
         for room in affected {
             self.abort_room(
                 room,
-                &format!("Decode session {session_id} registration rejected: {reason}"),
+                &format!("Decode session {cache_id} registration rejected: {reason}"),
             );
         }
         let mut state = self.state();
-        state.registrations.remove(session_id);
-        state
-            .rejected
-            .insert(session_id.to_owned(), (endpoint, port));
+        state.registrations.remove(cache_id);
+        state.registration_gates.remove(cache_id);
+        state.rejected.insert(cache_id.to_owned(), (endpoint, port));
+        state.cancelled.retain(|_, identities| {
+            // Unbound cancellations have no cache lifetime to retire yet.
+            let bound = !identities.is_empty();
+            identities.remove(cache_id);
+            !bound || !identities.is_empty()
+        });
     }
 
     fn handle_preallocation(&self, frames: &[Bytes]) {
-        let (room, session_id) = match wire::preallocation_route(frames) {
+        let (room, cache_id) = match wire::preallocation_route(frames) {
             Ok(route) => route,
             Err(error) => {
                 tracing::error!(%error, "rejecting a malformed CachePD pre-allocation");
                 return;
             }
         };
-        if let Err(reason) = self.accept_preallocation(room, &session_id, frames) {
+        {
+            let mut state = self.state();
+            if state
+                .pending_registrations
+                .iter()
+                .any(|pending| pending.cache_id == cache_id)
+            {
+                state
+                    .pending_manifests
+                    .entry(cache_id)
+                    .or_default()
+                    .push(frames.to_vec());
+                return;
+            }
+        }
+        if let Err(reason) = self.accept_preallocation(room, &cache_id, frames) {
             tracing::error!(room, reason, "rejecting CachePD pre-allocation metadata");
             self.abort_room(room, &format!("invalid pre-allocation metadata: {reason}"));
-            match self.state().route_of(&session_id) {
+            match self.state().route_of(&cache_id) {
                 Some(route) => self.notify_failed(route, room),
                 None => tracing::error!(room, "cannot notify a malformed Decode peer"),
             }
@@ -494,17 +790,25 @@ impl Shared {
     fn accept_preallocation(
         &self,
         room: u64,
-        session_id: &str,
+        cache_id: &str,
         frames: &[Bytes],
     ) -> Result<(), String> {
         let registration = self
             .state()
             .registrations
-            .get(session_id)
+            .get(cache_id)
             .cloned()
             .ok_or("CachePD request references an unregistered Decode session")?;
         let route = (registration.endpoint.clone(), registration.port);
-        if self.state().rooms.get(room) == Some(TransferPoll::Failed) {
+        let cancelled = {
+            let mut state = self.state();
+            if state.cancelled.contains_key(&room) {
+                state.cancel_room(room, Some(cache_id));
+            }
+            state.cancelled.contains_key(&room)
+                || state.rooms.get(room) == Some(TransferPoll::Failed)
+        };
+        if cancelled {
             self.notify_failed(route, room);
             return Ok(());
         }
@@ -520,12 +824,12 @@ impl Shared {
         let mut destinations = state.destinations.get(&room).cloned().unwrap_or_default();
         if destinations
             .iter()
-            .any(|destination| destination.session_id == session_id)
+            .any(|destination| destination.cache_id == cache_id)
         {
             return Err("duplicate CachePD pre-allocation for Decode session".to_owned());
         }
         destinations.push(Destination {
-            session_id: session_id.to_owned(),
+            cache_id: cache_id.to_owned(),
             manifest: preallocation.manifest.map(Arc::new),
         });
         let expected = registration.planned.expected_decode_ranks.len();
@@ -537,7 +841,9 @@ impl Shared {
             state.validate_fanout(&destinations)?;
         }
         // A transfer worker may have failed the room since the check above.
-        if state.rooms.get(room) == Some(TransferPoll::Failed) {
+        if state.cancelled.contains_key(&room)
+            || state.rooms.get(room) == Some(TransferPoll::Failed)
+        {
             drop(state);
             self.notify_failed(route, room);
             return Ok(());
@@ -566,33 +872,33 @@ impl Shared {
         }
     }
 
-    fn session_failed(&self, session_id: &str) -> bool {
+    fn session_failed(&self, cache_id: &str) -> bool {
         if self.failed_session_ttl.is_zero() {
             return false;
         }
         let mut state = self.state();
-        match state.failed_sessions.get(session_id) {
+        match state.failed_sessions.get(cache_id) {
             None => false,
             Some(at) if at.elapsed() < self.failed_session_ttl => true,
             Some(_) => {
-                state.failed_sessions.remove(session_id);
+                state.failed_sessions.remove(cache_id);
                 false
             }
         }
     }
 
-    fn mark_session_failed(&self, session_id: &str) {
+    fn mark_session_failed(&self, cache_id: &str) {
         if self.failed_session_ttl.is_zero() {
             return;
         }
         tracing::warn!(
-            session = session_id,
+            session = cache_id,
             ttl = ?self.failed_session_ttl,
             "Decode session marked failed"
         );
         self.state()
             .failed_sessions
-            .insert(session_id.to_owned(), Instant::now());
+            .insert(cache_id.to_owned(), Instant::now());
     }
 
     /// Run one chunk of transfer work.
@@ -613,8 +919,8 @@ impl Shared {
                 room,
                 selection,
                 target_steps,
-                is_last,
-            } => self.transfer_layerwise(*room, selection, target_steps, *is_last),
+                final_window,
+            } => self.transfer_layerwise(*room, selection, target_steps, final_window.is_some()),
         }
     }
 
@@ -654,15 +960,15 @@ impl Shared {
         destinations
             .iter()
             .map(|destination| {
-                if self.session_failed(&destination.session_id) {
+                if self.session_failed(&destination.cache_id) {
                     return Err(format!(
                         "Decode session {} is not alive",
-                        destination.session_id
+                        destination.cache_id
                     ));
                 }
                 self.state()
                     .registrations
-                    .get(&destination.session_id)
+                    .get(&destination.cache_id)
                     .cloned()
                     .ok_or_else(|| {
                         "CachePD request references an unregistered Decode session".to_owned()
@@ -671,10 +977,39 @@ impl Shared {
             .collect()
     }
 
-    fn write_copies(&self, registration: &Registration, copies: &[Copy]) -> Result<(), String> {
+    fn write_copies(
+        &self,
+        room: u64,
+        registration: &Registration,
+        copies: &[Copy],
+    ) -> Result<(), String> {
+        let gate = self
+            .state()
+            .registration_gates
+            .get(&registration.cache_id)
+            .cloned()
+            .ok_or("CachePD transfer references a retired cache instance")?;
+        let _gate = gate.read().unwrap_or_else(|error| error.into_inner());
+        // A worker can hold a planned registration across a cache replacement.
+        // Checking under the gate prevents its stale copies from reaching the
+        // new memory at a reused transport address.
+        if !self
+            .state()
+            .registrations
+            .contains_key(&registration.cache_id)
+        {
+            return Err("CachePD transfer references a retired cache instance".to_owned());
+        }
+        if self.state().ended(room) {
+            return Err("CachePD transfer room was cancelled or ended".to_owned());
+        }
         let started = Instant::now();
-        if let Err(error) = self.transport.write(&registration.session_id, copies) {
-            self.mark_session_failed(&registration.session_id);
+        if let Err(error) =
+            self.transport
+                .write_cache(&registration.session_id, &registration.cache_id, copies)
+        {
+            self.state().uncertain.insert(room);
+            self.mark_session_failed(&registration.cache_id);
             return Err(format!(
                 "Mooncake transfer failed for {}:{}: {error}",
                 registration.endpoint, registration.port
@@ -682,6 +1017,7 @@ impl Shared {
         }
         if let Some(metrics) = &self.metrics {
             metrics.observe_latency(started.elapsed().as_secs_f64());
+            metrics.record_size(copies.iter().map(Copy::bytes).sum());
         }
         Ok(())
     }
@@ -781,7 +1117,7 @@ impl Shared {
             return Err("CachePD transfer room has no destinations".to_owned());
         }
         let registrations = self.live_registrations(&destinations)?;
-        let sessions: Vec<String> = destinations.iter().map(|d| d.session_id.clone()).collect();
+        let sessions: Vec<String> = destinations.iter().map(|d| d.cache_id.clone()).collect();
         // Every peer's copies of every interval, planned once, before any DMA.
         let plans = registrations
             .iter()
@@ -802,7 +1138,7 @@ impl Shared {
                     .get(interval)
                     .ok_or("a layerwise plan has fewer intervals than the chunk")?;
                 if !copies.is_empty() {
-                    self.write_copies(registration, copies)?;
+                    self.write_copies(room, registration, copies)?;
                 }
             }
         }
@@ -873,7 +1209,7 @@ impl Shared {
             prepared.push((registration, copies));
         }
         for (registration, copies) in &prepared {
-            self.write_copies(registration, copies)?;
+            self.write_copies(room, registration, copies)?;
         }
         let registrations: Vec<Registration> = prepared
             .into_iter()
@@ -883,21 +1219,49 @@ impl Shared {
         Ok(())
     }
 
-    fn run_worker(&self, queue: &mpsc::Receiver<Chunk>) {
-        while let Ok(chunk) = queue.recv() {
-            if let Err(reason) = self.transfer(&chunk) {
-                if self.state().ended(chunk.room()) {
-                    // Another thread failed or dropped the room after it was
-                    // queued: failing it again would replace its reason.
-                    tracing::debug!(
-                        room = chunk.room(),
-                        reason,
-                        "dropping an ended room's transfer"
-                    );
-                    continue;
+    fn run_worker(&self, queue: &mpsc::Receiver<QueuedChunk>) {
+        while let Ok(queued) = queue.recv() {
+            let chunk = &queued.chunk;
+            let room = chunk.room();
+            if !self.state().ended(room) {
+                tracing::debug!(room, "PD transfer worker received chunk");
+                if let Err(reason) = self.transfer(chunk) {
+                    if !self.state().ended(room) {
+                        tracing::error!(room, reason, "CachePD transfer failed");
+                        self.abort_room(room, &format!("CachePD transfer failed: {reason}"));
+                    }
+                } else {
+                    tracing::debug!(room, "PD transfer worker finished chunk");
                 }
-                tracing::error!(room = chunk.room(), reason, "CachePD transfer failed");
-                self.abort_room(chunk.room(), &format!("CachePD transfer failed: {reason}"));
+            }
+        }
+    }
+}
+
+/// A queued or executing transfer holds its room until the job is dropped.
+struct QueuedChunk {
+    chunk: Chunk,
+    _retirement: PendingChunk,
+}
+
+struct PendingChunk {
+    shared: Arc<Shared>,
+    room: u64,
+}
+
+impl Drop for PendingChunk {
+    fn drop(&mut self) {
+        // A failed worker may unwind while holding the state lock.
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(count) = state.pending_chunks.get_mut(&self.room) {
+            if *count > 1 {
+                *count -= 1;
+            } else {
+                state.pending_chunks.remove(&self.room);
             }
         }
     }
@@ -914,7 +1278,7 @@ impl Shared {
 #[derive(Clone)]
 pub struct PrefillOutbox {
     shared: Arc<Shared>,
-    queues: Arc<Vec<mpsc::Sender<Chunk>>>,
+    queues: Arc<Vec<mpsc::Sender<QueuedChunk>>>,
     staged: Staged,
     /// Layerwise: the producer steps armed so far, modulo `STEP_COUNT_MAX`
     /// (the host half of `StepCounter`).
@@ -1037,8 +1401,8 @@ impl PrefillOutbox {
             begin
         };
         let targets = interval_targets(begin, step_count, layerwise.interval.max(1) as u64);
-        for (rid, room, is_last, selection) in chunks {
-            self.send_layerwise(&rid, room, Arc::new(selection), targets.clone(), is_last);
+        for chunk in chunks {
+            self.send_layerwise(chunk, targets.clone());
         }
         Ok(())
     }
@@ -1063,10 +1427,23 @@ impl PrefillOutbox {
                         .prefill_metadata
                         .insert(room, (bootstrap_token, spec_candidate_ids));
                     self.shared.metadata_ready.notify_all();
+                    drop(state);
+                    tracing::debug!(
+                        rid,
+                        room,
+                        "bootstrap metadata ready for final layerwise chunk"
+                    );
                 }
                 return;
             }
         }
+        tracing::debug!(
+            rid,
+            room,
+            prefix_tokens = source.as_ref().map(|m| m.prefix_len),
+            prompt_tokens = source.as_ref().map(|m| m.prompt_len),
+            "submitting full KV transfer"
+        );
         self.enqueue(
             rid,
             Chunk::Full {
@@ -1080,28 +1457,27 @@ impl PrefillOutbox {
 
     /// Layerwise streaming: queue one armed chunk of `room`'s request; its
     /// intervals are complete at `target_steps`.
-    fn send_layerwise(
-        &self,
-        rid: &str,
-        room: u64,
-        selection: Arc<Selection>,
-        target_steps: Vec<u64>,
-        is_last: bool,
-    ) {
+    fn send_layerwise(&self, chunk: LayerwiseChunk, target_steps: Vec<u64>) {
         {
             let mut state = self.shared.state();
-            if state.ended(room) {
+            if state.ended(chunk.room) {
                 return;
             }
-            state.layerwise_rooms.insert(room);
+            state.layerwise_rooms.insert(chunk.room);
         }
+        tracing::debug!(
+            rid = chunk.rid,
+            room = chunk.room,
+            final_chunk = chunk.final_window.is_some(),
+            "submitting layerwise KV chunk"
+        );
         self.enqueue(
-            rid,
+            &chunk.rid,
             Chunk::Layerwise {
-                room,
-                selection,
+                room: chunk.room,
+                selection: Arc::new(chunk.selection),
                 target_steps,
-                is_last,
+                final_window: chunk.final_window,
             },
         );
     }
@@ -1110,8 +1486,8 @@ impl PrefillOutbox {
     /// chunks always reach the same worker, in order.
     fn enqueue(&self, rid: &str, chunk: Chunk) {
         let room = chunk.room();
-        let shard = {
-            let state = self.shared.state();
+        let (shard, queued) = {
+            let mut state = self.shared.state();
             if state.ended(room) {
                 tracing::debug!(rid, room, "the room already failed or ended");
                 return;
@@ -1122,12 +1498,33 @@ impl PrefillOutbox {
             };
             let ports: u64 = destinations
                 .iter()
-                .filter_map(|destination| wire::session_port(&destination.session_id))
+                .filter_map(|destination| state.registrations.get(&destination.cache_id))
+                .filter_map(|registration| wire::session_port(&registration.session_id))
                 .sum();
-            (ports % self.queues.len() as u64) as usize
+            *state.pending_chunks.entry(room).or_default() += 1;
+            let queued = QueuedChunk {
+                chunk,
+                _retirement: PendingChunk {
+                    shared: self.shared.clone(),
+                    room,
+                },
+            };
+            ((ports % self.queues.len() as u64) as usize, queued)
         };
-        if self.queues[shard].send(chunk).is_err() {
-            tracing::error!(rid, room, "the PD transfer workers stopped");
+        let final_transfer = queued.chunk.final_transfer();
+        if self.queues[shard].send(queued).is_err() {
+            self.shared
+                .abort_room(room, "the PD transfer workers stopped");
+        } else if let Some((window, pages)) = final_transfer {
+            tracing::info!(
+                rid,
+                bootstrap_room = room,
+                rank = self.shared.status_rank,
+                start_idx = window.start,
+                end_idx = window.end,
+                pages,
+                "event=ts_prefill_kv_transfer_queued"
+            );
         }
     }
 
@@ -1144,6 +1541,14 @@ impl PrefillOutbox {
     }
 }
 
+#[derive(Debug)]
+struct LayerwiseChunk {
+    rid: String,
+    room: u64,
+    selection: Selection,
+    final_window: Option<Range<i64>>,
+}
+
 /// One forward's layerwise chunks: for each extend row whose request has a
 /// destination, the blocks its chunk makes ready and whether it ends the
 /// prompt. A room's first chunk also carries the blocks this rank found in
@@ -1154,7 +1559,7 @@ fn layerwise_chunks(
     state: &State,
     layout: &Contract,
     forward: &BatchRows,
-) -> Result<Vec<(String, u64, bool, Selection)>, String> {
+) -> Result<Vec<LayerwiseChunk>, String> {
     let mut chunks = Vec::new();
     for index in 0..forward.num_extends {
         let rid = &forward.request_ids[index];
@@ -1204,7 +1609,13 @@ fn layerwise_chunks(
         {
             continue;
         }
-        chunks.push((rid.clone(), room, is_last, selection));
+        let final_window = is_last.then_some(selection_start.max(window.prefix_len)..chunk_end);
+        chunks.push(LayerwiseChunk {
+            rid: rid.clone(),
+            room,
+            selection,
+            final_window,
+        });
     }
     Ok(chunks)
 }
@@ -1239,6 +1650,7 @@ struct Sender {
     started: Instant,
     local: TransferPoll,
     concluded: Option<TransferPoll>,
+    draining: Option<Draining>,
 }
 
 /// A Prefill rank's PD transfer peer.
@@ -1251,6 +1663,7 @@ pub struct PrefillPeer {
     order: Vec<String>,
     senders: HashMap<String, Sender>,
     stall_logged_at: Option<Instant>,
+    drain_logged_at: Option<Instant>,
     timeout_logged: bool,
 }
 
@@ -1300,6 +1713,8 @@ impl PrefillPeer {
                             swept = Instant::now();
                             shared.drop_unclaimed(unclaimed_ttl);
                         }
+                        shared.flush_registrations();
+                        shared.flush_cancellations();
                     }
                 })?;
         }
@@ -1337,6 +1752,7 @@ impl PrefillPeer {
                 order: Vec::new(),
                 senders: HashMap::new(),
                 stall_logged_at: None,
+                drain_logged_at: None,
                 timeout_logged: false,
             },
             outbox,
@@ -1414,6 +1830,9 @@ impl TransferPeer for PrefillPeer {
             state.cached_tokens.remove(&room);
             state.bootstrap_logprobs.remove(&room);
             state.rooms.update(room, TransferPoll::Bootstrapping);
+            if state.cancelled.contains_key(&room) {
+                state.rooms.update(room, TransferPoll::Failed);
+            }
             // Claimed: its pre-allocations, or its failure, are this
             // request's now.
             state.unclaimed.remove(&room);
@@ -1429,6 +1848,7 @@ impl TransferPeer for PrefillPeer {
                     started: Instant::now(),
                     local: TransferPoll::Bootstrapping,
                     concluded: None,
+                    draining: None,
                 },
             )
             .is_none()
@@ -1495,25 +1915,74 @@ impl TransferPeer for PrefillPeer {
         };
         self.log_stalls(&agreed);
 
+        // A failure on any rank cancels work on every rank. The status alone
+        // is not a source-page fence: queued or executing writes must retire
+        // everywhere before the scheduler can release the request's pages.
+        for (rid, &poll) in self.order.iter().zip(&agreed) {
+            if TransferPoll::from_wire(poll) == Some(TransferPoll::Failed) {
+                let sender = self.senders.get_mut(rid).expect("tracked");
+                sender.concluded = Some(TransferPoll::Failed);
+                if self.shared.state().rooms.get(sender.room) != Some(TransferPoll::Failed) {
+                    self.shared
+                        .abort_room(sender.room, "replica transfer failed");
+                }
+            }
+        }
+        let retired: Vec<i64> = {
+            let state = self.shared.state();
+            self.order
+                .iter()
+                .map(|rid| {
+                    let room = self.senders[rid].room;
+                    i64::from(!state.pending_chunks.contains_key(&room))
+                })
+                .collect()
+        };
+        let has_terminal = agreed.iter().any(|&poll| {
+            matches!(
+                TransferPoll::from_wire(poll),
+                Some(TransferPoll::Success | TransferPoll::Failed)
+            )
+        });
+        let retired = if replica.size() > 1 && has_terminal {
+            mesh.all_reduce(replica, &retired, Reduce::Min)?
+        } else {
+            retired
+        };
+
         let mut events = Vec::new();
         let mut ended = Vec::new();
-        for (rid, &poll) in self.order.iter().zip(&agreed) {
+        for ((rid, &poll), &retired) in self.order.iter().zip(&agreed).zip(&retired) {
             let sender = self.senders.get_mut(rid).expect("tracked");
             let poll = TransferPoll::from_wire(poll).unwrap_or(TransferPoll::Failed);
             if sender.local == TransferPoll::Bootstrapping && poll == TransferPoll::Bootstrapped {
                 sender.local = TransferPoll::Bootstrapped;
                 events.push(PdEvent::Bootstrapped(rid.clone()));
             } else if poll == TransferPoll::Failed {
-                let reason = self
-                    .shared
-                    .state()
-                    .rooms
-                    .failure(sender.room)
-                    .map(str::to_owned);
-                tracing::warn!(rid, room = sender.room, reason, "KV transfer failed");
-                events.push(PdEvent::Failed(rid.clone()));
-                ended.push(rid.clone());
-            } else if sender.local == TransferPoll::Bootstrapped && poll == TransferPoll::Success {
+                if sender.local != TransferPoll::Failed {
+                    sender.local = TransferPoll::Failed;
+                    sender.draining = Some(Draining {
+                        rid: rid.clone(),
+                        room: sender.room,
+                        since: now,
+                    });
+                    let reason = self
+                        .shared
+                        .state()
+                        .rooms
+                        .failure(sender.room)
+                        .map(str::to_owned);
+                    tracing::warn!(rid, room = sender.room, reason, "KV transfer failed");
+                    events.push(PdEvent::Failed(rid.clone()));
+                }
+                if retired != 0 {
+                    events.push(PdEvent::Stopped(rid.clone()));
+                    ended.push(rid.clone());
+                }
+            } else if sender.local == TransferPoll::Bootstrapped
+                && poll == TransferPoll::Success
+                && retired != 0
+            {
                 sender.local = TransferPoll::Success;
                 events.push(PdEvent::Succeeded(rid.clone()));
                 ended.push(rid.clone());
@@ -1522,11 +1991,33 @@ impl TransferPeer for PrefillPeer {
         for rid in ended {
             self.forget(&rid);
         }
+        let stalled = stalled_drains(
+            self.order
+                .iter()
+                .filter_map(|rid| self.senders[rid].draining.as_ref()),
+            &mut self.drain_logged_at,
+            now,
+        );
+        if !stalled.is_empty() {
+            tracing::warn!(
+                ?stalled,
+                "PD source pages are waiting for transfers to stop"
+            );
+        }
         Ok(events)
     }
 
     fn has_in_flight(&self) -> bool {
         !self.order.is_empty()
+    }
+
+    fn cancel(&mut self, rid: &str) {
+        if let Some(sender) = self.senders.get_mut(rid) {
+            sender.concluded = Some(TransferPoll::Failed);
+            self.shared.state().cancel_room(sender.room, None);
+            self.shared
+                .abort_room(sender.room, "Prefill request cancelled");
+        }
     }
 
     fn abort_room(&mut self, rid: &str, room: u64) {
@@ -1573,7 +2064,8 @@ mod tests {
             Registration {
                 endpoint: "decode".to_owned(),
                 port: 7,
-                session_id: "s0".to_owned(),
+                cache_id: "s0".to_owned(),
+                session_id: "decode:7000".to_owned(),
                 decode_tp_size: 1,
                 decode_tp_rank: 0,
                 arena_base: 0x1000,
@@ -1588,7 +2080,7 @@ mod tests {
         );
         let destination = || {
             vec![Destination {
-                session_id: "s0".to_owned(),
+                cache_id: "s0".to_owned(),
                 manifest: Some(Arc::new(Manifest {
                     groups: Vec::new(),
                     prefix_len: 0,
@@ -1665,7 +2157,7 @@ mod tests {
         state.destinations.insert(
             room,
             vec![Destination {
-                session_id: "decode:7000".to_owned(),
+                cache_id: "decode:7000".to_owned(),
                 manifest: Some(Arc::new(Manifest {
                     groups: Vec::new(),
                     prefix_len: prefix,
@@ -1715,12 +2207,12 @@ mod tests {
         let chunks = layerwise_chunks(&state, &layout, &chunk_forward(&rows, &tables)).unwrap();
         let armed: Vec<(&str, u64, bool, Vec<i64>)> = chunks
             .iter()
-            .map(|(rid, room, is_last, selection)| {
+            .map(|chunk| {
                 (
-                    rid.as_str(),
-                    *room,
-                    *is_last,
-                    selection.groups[1].source_block_ids.clone(),
+                    chunk.rid.as_str(),
+                    chunk.room,
+                    chunk.final_window.is_some(),
+                    chunk.selection.groups[1].source_block_ids.clone(),
                 )
             })
             .collect();
@@ -1751,19 +2243,23 @@ mod tests {
         ];
         let history = |state: &State, begin, length| {
             let forward = chunk_forward(&[("request-0", begin, length)], &tables);
-            let (_, _, is_last, selection) = layerwise_chunks(state, &layout, &forward)
+            let chunk = layerwise_chunks(state, &layout, &forward)
                 .unwrap()
                 .pop()
                 .unwrap();
-            let group = selection.groups[0].clone();
-            (is_last, group.source_block_ids, group.destination_positions)
+            let group = chunk.selection.groups[0].clone();
+            (
+                chunk.final_window,
+                group.source_block_ids,
+                group.destination_positions,
+            )
         };
         // The first chunk, [4, 7), also sends the history blocks of [2, 4)
         // Decode lacks.
-        assert_eq!(history(&state, 4, 3), (false, vec![2, 3], vec![0, 1]));
+        assert_eq!(history(&state, 4, 3), (None, vec![2, 3], vec![0, 1]));
         state.layerwise_rooms.insert(9);
         // The last starts at its own boundary.
-        assert_eq!(history(&state, 7, 2), (true, vec![4, 5], vec![2, 3]));
+        assert_eq!(history(&state, 7, 2), (Some(7..9), vec![4, 5], vec![2, 3]));
     }
 
     #[test]
@@ -1777,4 +2273,44 @@ mod tests {
             [STEP_COUNT_MAX - 1, 0]
         );
     }
+
+    #[test]
+    fn cancellation_ack_waits_for_the_last_pending_chunk() {
+        let mut state = State::default();
+        let key = (4, "cache".to_owned());
+        let route = ("decode".to_owned(), 7000);
+        state.cancel_room(4, Some("cache"));
+        state
+            .cancellation_replies
+            .insert(key.clone(), route.clone());
+        state.pending_chunks.insert(4, 2);
+        assert!(state.take_cancellation_replies().is_empty());
+        *state.pending_chunks.get_mut(&4).unwrap() -= 1;
+        assert!(state.take_cancellation_replies().is_empty());
+        state.pending_chunks.remove(&4);
+        assert_eq!(state.take_cancellation_replies(), [(key, route)]);
+        assert!(state.take_cancellation_replies().is_empty());
+    }
+
+    #[test]
+    fn uncertain_writes_never_acknowledge_cancellation() {
+        let mut state = State::default();
+        let key = (5, "cache".to_owned());
+        state.cancel_room(5, Some("cache"));
+        state
+            .cancellation_replies
+            .insert(key.clone(), ("decode".to_owned(), 7000));
+        state.uncertain.insert(5);
+        state.pending_chunks.insert(5, 1);
+        assert!(state.take_cancellation_replies().is_empty());
+        state.pending_chunks.remove(&5);
+        assert!(state.take_cancellation_replies().is_empty());
+        state.clear(5);
+        assert!(state.take_cancellation_replies().is_empty());
+        assert!(state.cancellation_replies.contains_key(&key));
+    }
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/registration.rs"]
+mod registration_tests;

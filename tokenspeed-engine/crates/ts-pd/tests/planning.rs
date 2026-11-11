@@ -319,6 +319,7 @@ fn group_spec(value: &Value) -> GroupSpec {
         replayable: value["replayable"].as_bool().expect("a flag"),
         transfer_policy: value["transfer_policy"].as_str().map(str::to_owned),
         shard_count: int(&value["shard_count"]),
+        checkpoint_granularity: optional("checkpoint_granularity"),
     }
 }
 
@@ -453,6 +454,7 @@ fn replay(fixture: &Fixture, kind: &str, args: &Value) -> Result<Value, LayoutEr
                 endpoint: "decode".to_owned(),
                 port: 1,
                 session_id: "decode:1".to_owned(),
+                cache_id: "captured-cache".to_owned(),
                 arena_base: 1,
                 layout: fixture.contract(&registration["peer_layout"]).clone(),
                 tp_size: int(&registration["decode_tp_size"]),
@@ -505,7 +507,11 @@ fn replay(fixture: &Fixture, kind: &str, args: &Value) -> Result<Value, LayoutEr
             )
         }
         "registration_from_zmq" => {
-            let info = RegistrationInfo::from_frames(&frames(&args["frames"]))?;
+            // Captured Python peers predate cache identities; retain their
+            // layout/planning oracle while supplying the new protocol field.
+            let mut registration = frames(&args["frames"]);
+            registration.push(Bytes::from_static(b"captured-cache"));
+            let info = RegistrationInfo::from_frames(&registration)?;
             json!({
                 "endpoint": info.endpoint,
                 "dst_port": info.port,
@@ -520,7 +526,7 @@ fn replay(fixture: &Fixture, kind: &str, args: &Value) -> Result<Value, LayoutEr
             let info = Preallocation::from_frames(&frames(&args["frames"]))?;
             json!({
                 "room": info.room,
-                "session_id": info.session_id,
+                "session_id": info.cache_id,
                 "manifest": info.manifest.as_ref().map(manifest_json),
             })
         }
@@ -621,4 +627,85 @@ fn the_planning_gives_the_python_planners_answers() {
     );
     // Every ported entry point is exercised.
     assert_eq!(replayed.len(), 16, "{replayed:?}");
+}
+
+#[test]
+fn v41_pd_page_ownership_with_and_without_dspark() {
+    let fixtures: Value =
+        serde_json::from_str(include_str!("fixtures/planning/contracts.json")).unwrap();
+    // Existing V4.1 recipe fixtures, without and with DSpark window fields.
+    for key in ["446091a9025dc611", "b03d4ab8e942c299"] {
+        let make_contract = |kvp: i64| {
+            let mut wire: Value = serde_json::from_str(fixtures[key].as_str().unwrap()).unwrap();
+            for group in wire["group_specs"].as_array_mut().unwrap() {
+                if matches!(
+                    group["group_id"].as_str(),
+                    Some("v41.global_r1" | "v41.global_r2")
+                ) {
+                    group["shard_count"] = json!(kvp);
+                }
+            }
+            Contract::from_wire(&serde_json::to_vec(&wire).unwrap()).unwrap()
+        };
+        for prefill_kvp in [1_i64, 4] {
+            let source = make_contract(prefill_kvp);
+            let destination = make_contract(4);
+            let planner = Planner::new(4, 4, &source, &destination, None).unwrap();
+            let source_ids: Vec<i64> = (1..9).collect();
+            let destination_ids: Vec<i64> = (1..9).rev().collect();
+            for group in [
+                "v41.swa",
+                "v41.global_r1",
+                "v41.global_r2",
+                "v41.compressor_tail_r2",
+            ] {
+                let sharded = matches!(group, "v41.global_r1" | "v41.global_r2");
+                let source_count = if sharded { prefill_kvp } else { 1 };
+                let destination_count = if sharded { 4 } else { 1 };
+                let mut seen = Vec::new();
+                for rank in 0..4 {
+                    let route = planner.plan_for_decode_rank(rank).unwrap();
+                    assert_eq!(route.target_prefill_ranks().len(), prefill_kvp as usize);
+                    for source_rank in 0..source_count {
+                        let destination_rank = if sharded { rank } else { 0 };
+                        let (src, dst) = local_transfer_pages(
+                            &source_ids,
+                            &destination_ids,
+                            group,
+                            &source,
+                            &destination,
+                            source_rank,
+                            destination_rank,
+                        )
+                        .unwrap();
+                        let restored: Vec<_> = src
+                            .iter()
+                            .zip(&dst)
+                            .map(|(&s, &d)| {
+                                (
+                                    (s - 1) * source_count + source_rank + 1,
+                                    (d - 1) * destination_count + destination_rank + 1,
+                                )
+                            })
+                            .collect();
+                        let expected: Vec<_> = source_ids
+                            .iter()
+                            .zip(&destination_ids)
+                            .filter(|&(&s, &d)| {
+                                (s - 1) % source_count == source_rank
+                                    && (d - 1) % destination_count == destination_rank
+                            })
+                            .map(|(&s, &d)| (s, d))
+                            .collect();
+                        assert_eq!(restored, expected);
+                        seen.extend(restored.iter().map(|&(s, _)| s));
+                    }
+                }
+                seen.sort_unstable();
+                let mut expected = source_ids.repeat(if sharded { 1 } else { 4 });
+                expected.sort_unstable();
+                assert_eq!(seen, expected);
+            }
+        }
+    }
 }

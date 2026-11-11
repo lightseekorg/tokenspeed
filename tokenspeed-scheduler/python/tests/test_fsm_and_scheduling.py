@@ -30,6 +30,9 @@ Covers:
   - advance with output tokens appended to token container
 """
 
+import gc
+
+import numpy as np
 import pytest
 from tokenspeed_scheduler import (
     PD,
@@ -110,6 +113,69 @@ def first_group_page_count(op, request_id: str) -> int:
     row = op.request_ids.index(request_id)
     table = next(iter(dict(op.block_tables).values()))
     return len([page for page in table[row] if page >= 0])
+
+
+class TestPrefillKvPageBudget:
+    @pytest.mark.parametrize("limit,expected", [(0, 3), (2, 2), (3, 3)])
+    def test_rounds_each_request_before_summing(self, limit, expected):
+        cfg = make_config(prefix_granularity=16)
+        cfg.max_kv_page_num = limit
+        scheduler = Scheduler(cfg)
+        for index in range(3):
+            submit(scheduler, f"kv-{index}", list(range(index * 20, index * 20 + 9)))
+        batch = scheduler.next_execution_plan().forward[0]
+        assert batch.num_extends() == expected
+        assert batch.input_lengths == [9] * expected
+
+    def test_remaining_pages_can_shorten_the_next_request(self):
+        cfg = make_config(prefix_granularity=16)
+        cfg.max_kv_page_num = 3
+        scheduler = Scheduler(cfg)
+        submit(scheduler, "first", list(range(17)))
+        submit(scheduler, "second", list(range(100, 117)))
+        batch = scheduler.next_execution_plan().forward[0]
+        assert batch.request_ids == ["first", "second"]
+        assert batch.input_lengths == [17, 16]
+        assert (
+            sum(
+                (p + n + 15) // 16
+                for p, n in zip(batch.extend_prefix_lens, batch.input_lengths)
+            )
+            == 3
+        )
+
+    def test_continued_chunk_counts_its_history_again(self):
+        cfg = make_config(prefix_granularity=16, max_scheduled_tokens=16)
+        cfg.max_kv_page_num = 3
+        scheduler = Scheduler(cfg)
+        submit(scheduler, "long", list(range(40)))
+        for prefix, new in [(0, 16), (16, 16), (32, 8)]:
+            batch = scheduler.next_execution_plan().forward[0]
+            assert batch.extend_prefix_lens == [prefix]
+            assert batch.input_lengths == [new]
+            assert (prefix + new + 15) // 16 <= cfg.max_kv_page_num
+
+    def test_shared_cached_prefix_is_counted_for_each_request(self):
+        cfg = make_config(prefix_granularity=16)
+        cfg.max_kv_page_num = 3
+        scheduler = Scheduler(cfg)
+        prefix = list(range(16))
+        submit(scheduler, "seed", prefix + [80])
+        scheduler.next_execution_plan()
+        advance_forward(scheduler, "seed", [90], finish=True)
+        for index in range(2):
+            submit(scheduler, f"shared-{index}", prefix + [100 + index])
+        batch = scheduler.next_execution_plan().forward[0]
+        assert batch.num_extends() == 1
+        assert batch.extend_prefix_lens == [16]
+        assert batch.input_lengths == [1]
+
+    def test_prompt_over_the_entire_budget_is_rejected(self):
+        cfg = make_config(prefix_granularity=16)
+        cfg.max_kv_page_num = 3
+        scheduler = Scheduler(cfg)
+        with pytest.raises(ValueError, match="max_kv_page_num"):
+            submit(scheduler, "too-long", list(range(49)))
 
 
 # ---------------------------------------------------------------------------
@@ -512,8 +578,8 @@ class TestPrefillInputIds:
         op = plan.forward[0]
         assert op.num_extends() > 0
         assert op.input_lengths == [len(tokens)]
-        assert op.input_ids == tokens
-        assert op.shifted_input_ids == tokens[1:] + [-1]
+        assert op.input_ids.tolist() == tokens
+        assert op.shifted_input_ids.tolist() == tokens[1:] + [-1]
         assert op.extend_prefix_lens == [0]
 
     def test_chunked_prefill_input_ids_split_correctly(self):
@@ -525,22 +591,22 @@ class TestPrefillInputIds:
         # chunk 1: tokens[0:5], extend_prefix_len=0
         plan1 = s.next_execution_plan()
         assert plan1.forward[0].input_lengths == [5]
-        assert plan1.forward[0].input_ids == tokens[0:5]
-        assert plan1.forward[0].shifted_input_ids == tokens[1:6]
+        assert plan1.forward[0].input_ids.tolist() == tokens[0:5]
+        assert plan1.forward[0].shifted_input_ids.tolist() == tokens[1:6]
         assert plan1.forward[0].extend_prefix_lens == [0]
 
         # chunk 2: tokens[5:10], extend_prefix_len=5
         plan2 = s.next_execution_plan()
         assert plan2.forward[0].input_lengths == [5]
-        assert plan2.forward[0].input_ids == tokens[5:10]
-        assert plan2.forward[0].shifted_input_ids == tokens[6:11]
+        assert plan2.forward[0].input_ids.tolist() == tokens[5:10]
+        assert plan2.forward[0].shifted_input_ids.tolist() == tokens[6:11]
         assert plan2.forward[0].extend_prefix_lens == [5]
 
         # chunk 3: tokens[10:15], extend_prefix_len=10
         plan3 = s.next_execution_plan()
         assert plan3.forward[0].input_lengths == [5]
-        assert plan3.forward[0].input_ids == tokens[10:15]
-        assert plan3.forward[0].shifted_input_ids == tokens[11:15] + [-1]
+        assert plan3.forward[0].input_ids.tolist() == tokens[10:15]
+        assert plan3.forward[0].shifted_input_ids.tolist() == tokens[11:15] + [-1]
         assert plan3.forward[0].extend_prefix_lens == [10]
 
     def test_multi_request_prefill_input_ids_concatenated(self):
@@ -556,7 +622,7 @@ class TestPrefillInputIds:
         assert set(op.request_ids) == {"r0", "r1"}
         assert op.input_lengths == [len(tokens_by_id[rid]) for rid in op.request_ids]
         expected_ids = [t for rid in op.request_ids for t in tokens_by_id[rid]]
-        assert op.input_ids == expected_ids
+        assert op.input_ids.tolist() == expected_ids
         assert op.extend_prefix_lens == [0, 0]
 
     def test_extend_prefix_lens_nonzero_on_second_chunk(self):
@@ -568,17 +634,75 @@ class TestPrefillInputIds:
         plan1 = s.next_execution_plan()
         assert plan1.forward[0].input_lengths == [8]
         assert plan1.forward[0].extend_prefix_lens == [0]
-        assert plan1.forward[0].input_ids == tokens[0:8]
+        assert plan1.forward[0].input_ids.tolist() == tokens[0:8]
 
         plan2 = s.next_execution_plan()
         assert plan2.forward[0].input_lengths == [8]
         assert plan2.forward[0].extend_prefix_lens == [8]
-        assert plan2.forward[0].input_ids == tokens[8:16]
+        assert plan2.forward[0].input_ids.tolist() == tokens[8:16]
 
         plan3 = s.next_execution_plan()
         assert plan3.forward[0].input_lengths == [4]
         assert plan3.forward[0].extend_prefix_lens == [16]
-        assert plan3.forward[0].input_ids == tokens[16:20]
+        assert plan3.forward[0].input_ids.tolist() == tokens[16:20]
+
+    @pytest.mark.parametrize("shifted", [False, True])
+    def test_input_ids_are_zero_copy_readonly_views(self, shifted):
+        """Repeated reads share the batch's immutable token storage."""
+        tokens = list(range(300, 356))
+        s = Scheduler(make_config(max_scheduled_tokens=512))
+        submit(s, "r0", tokens)
+        op = s.next_execution_plan().forward[0]
+        view = op.shifted_input_ids if shifted else op.input_ids
+        second_view = op.shifted_input_ids if shifted else op.input_ids
+        expected = tokens[1:] + [-1] if shifted else tokens
+        assert isinstance(view, np.ndarray)
+        assert view.dtype == np.int32
+        assert view.shape == (len(tokens),)
+        assert not view.flags.writeable
+        assert np.shares_memory(view, second_view)
+        with pytest.raises(ValueError, match="read-only"):
+            view[0] = 0
+        assert view.tolist() == expected
+
+    @pytest.mark.parametrize("shifted", [False, True])
+    def test_views_keep_the_batch_alive_after_the_plan_is_dropped(self, shifted):
+        """Either view alone keeps its token storage alive."""
+        tokens = list(range(300, 356))
+        s = Scheduler(make_config(max_scheduled_tokens=512))
+        submit(s, "r0", tokens)
+        plan = s.next_execution_plan()
+        op = plan.forward[0]
+        view = op.shifted_input_ids if shifted else op.input_ids
+        expected = tokens[1:] + [-1] if shifted else tokens
+        del op, plan, s
+        gc.collect()
+        assert view.tolist() == expected
+
+    @pytest.mark.parametrize("shifted", [False, True])
+    def test_decode_only_batch_gives_empty_views(self, shifted):
+        """Decode-only rounds expose empty, read-only int32 token arrays."""
+        s = Scheduler(make_config(max_scheduled_tokens=512))
+        submit(s, "r0", list(range(4)))
+        s.next_execution_plan()  # -> Prefilling
+        plan = s.next_execution_plan()  # -> Decoding
+        op = plan.forward[0]
+        assert op.num_extends() == 0
+        view = op.shifted_input_ids if shifted else op.input_ids
+        assert isinstance(view, np.ndarray)
+        assert view.dtype == np.int32
+        assert view.shape == (0,)
+        assert not view.flags.writeable
+        assert view.tolist() == []
+        assert "input_ids=[], shifted_input_ids=[], " in repr(op)
+
+    def test_batch_repr_shows_plain_token_integers(self):
+        tokens = [300, 301, 302, 303]
+        s = Scheduler(make_config(max_scheduled_tokens=512))
+        submit(s, "r0", tokens)
+        op = s.next_execution_plan().forward[0]
+        assert f"input_ids={tokens}, " in repr(op)
+        assert f"shifted_input_ids={tokens[1:] + [-1]}, " in repr(op)
 
 
 # ---------------------------------------------------------------------------

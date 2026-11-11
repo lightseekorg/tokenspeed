@@ -22,14 +22,16 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.sampling import vocab_parallel_logprobs
+from tokenspeed_kernel.ops.sampling import blockwise_logprobs
 
 import tokenspeed.runtime.sampling.backends.flashinfer as flashinfer_module
-from tokenspeed.runtime.configs.numerics import MEGATRON_VOCAB_BLOCK
+from tokenspeed.runtime.configs.numerics import BLOCKWISE_VOCAB_BLOCK
 from tokenspeed.runtime.execution.context import InputLogprobRows
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.logits_processor import (
@@ -47,31 +49,68 @@ from tokenspeed.runtime.sampling.utils import (
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
-VOCAB = 2 * MEGATRON_VOCAB_BLOCK
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=10, suite="runtime-1gpu")
+
+VOCAB = 2 * BLOCKWISE_VOCAB_BLOCK
 POOL = 4
+ORDER_CASES = [
+    ("blockwise", 32768, "negative-cross-entropy"),
+    ("blockwise-direct", 32768, "direct"),
+    ("blockwise-16384", 16384, "negative-cross-entropy"),
+    ("blockwise-direct-16384", 16384, "direct"),
+]
 
 
 def _logits(rows: int) -> torch.Tensor:
     return torch.randn(rows, VOCAB, generator=torch.Generator().manual_seed(1)) * 3
 
 
-def test_gather_dispatches_on_the_order():
+@pytest.mark.parametrize("order", ["megatron", "blockwise-typo", ""])
+def test_gather_rejects_unknown_order(order):
+    logits = torch.tensor([[1.0, 2.0]])
+    tokens = torch.tensor([1], dtype=torch.int64)
+    with pytest.raises(ValueError, match="Unknown logprob order"):
+        gather_token_logprobs(logits, tokens, logprob_order=order)
+
+
+@pytest.mark.parametrize("order,block,form", ORDER_CASES)
+def test_gather_dispatches_on_the_order(order, block, form):
     logits = _logits(3)
     tokens = torch.tensor([5, 60000, 123], dtype=torch.int32)
     torch_order = gather_token_logprobs(logits, tokens, logprob_order="torch")
-    megatron = gather_token_logprobs(logits, tokens, logprob_order="megatron")
+    blockwise = gather_token_logprobs(logits, tokens, logprob_order=order)
     assert torch.equal(
         torch_order,
         torch.log_softmax(logits, -1).gather(1, tokens.long()[:, None]).squeeze(1),
     )
     assert torch.equal(
-        megatron,
-        vocab_parallel_logprobs(logits, tokens, vocab_block=MEGATRON_VOCAB_BLOCK),
+        blockwise,
+        blockwise_logprobs(
+            logits,
+            tokens,
+            vocab_block=block,
+            form=form,
+        ),
     )
-    torch.testing.assert_close(megatron, torch_order, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(blockwise, torch_order, rtol=1e-5, atol=1e-5)
 
 
-def test_flashinfer_backend_reports_megatron_logprobs(monkeypatch):
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("order,block,form", ORDER_CASES)
+def test_blockwise_order_logprob_form(dtype, order, block, form):
+    logits = torch.full((2, VOCAB), -float("inf"), dtype=dtype)
+    tokens = torch.tensor([3, BLOCKWISE_VOCAB_BLOCK + 3], dtype=torch.int32)
+    logits.scatter_(1, tokens.long()[:, None], 0)
+    got = gather_token_logprobs(logits, tokens, logprob_order=order)
+    expected = torch.full((2,), -0.0 if form == "negative-cross-entropy" else 0.0)
+    assert torch.equal(got.view(torch.int32), expected.view(torch.int32))
+
+
+@pytest.mark.parametrize("order,block,form", ORDER_CASES)
+def test_flashinfer_backend_reports_blockwise_logprobs(monkeypatch, order, block, form):
     def fake_gumbel(logits, req_pool_indices, *pools, min_p_pool=None, **_):
         out = pools[-1]
         out[: logits.shape[0]].copy_(torch.tensor([7, 60001], dtype=torch.int32))
@@ -93,7 +132,7 @@ def test_flashinfer_backend_reports_megatron_logprobs(monkeypatch):
             synthetic_acceptance_length=None,
             enable_speculative_sampling=False,
             sampling_stream="per-request",
-            logprob_order="megatron",
+            logprob_order=order,
             enable_output_logprobs=True,
             max_bs=2,
             max_draft_tokens_per_req=1,
@@ -123,7 +162,12 @@ def test_flashinfer_backend_reports_megatron_logprobs(monkeypatch):
     assert sampled.tolist() == [7, 60001]
     assert torch.equal(
         output.next_token_logprobs,
-        vocab_parallel_logprobs(logits, sampled, vocab_block=MEGATRON_VOCAB_BLOCK),
+        blockwise_logprobs(
+            logits,
+            sampled,
+            vocab_block=block,
+            form=form,
+        ),
     )
 
 
@@ -133,29 +177,40 @@ def _processor(order: str, monkeypatch, vocab_size: int = VOCAB) -> LogitsProces
         SimpleNamespace(
             model_type="test", vocab_size=vocab_size, final_logit_softcapping=None
         ),
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
 
 
-def _prompt_rows(rows: list[int], targets: list[int], *, num_input_rows: int):
+def _prompt_rows(
+    rows: list[int], targets: list[int], *, num_input_rows: int, chunk_tokens: int
+):
     return InputLogprobRows(
         rows=torch.tensor(rows, dtype=torch.int64),
         targets=torch.tensor(targets, dtype=torch.int64),
         slots=torch.zeros(len(rows), dtype=torch.int64),
         num_input_rows=num_input_rows,
-        chunk_tokens=2,
+        chunk_tokens=chunk_tokens,
         rows_per_rank=None,
+        gathered_to_rows=None,
     )
 
 
-def test_prompt_logprobs_follow_the_order(monkeypatch):
+@pytest.mark.parametrize("order,block,form", ORDER_CASES)
+@pytest.mark.parametrize("chunk_tokens", [1, 2, 3])
+def test_prompt_logprobs_follow_the_order(
+    monkeypatch, order, block, form, chunk_tokens
+):
     # Prompt rows take the sampler's gather in the launch's order, so a
     # token's prompt and output logprobs are the same number under either.
-    hidden = torch.randn(4, 8, generator=torch.Generator().manual_seed(2))
-    weight = torch.randn(VOCAB, 8, generator=torch.Generator().manual_seed(3))
+    # One-hot activations make the projection exact at every chunk size.
+    # Random CPU GEMMs can round differently for one row and several rows;
+    # that would test the BLAS implementation instead of logprob dispatch.
+    hidden = torch.eye(4, 8)
+    weight = torch.randn(VOCAB, 8, generator=torch.Generator().manual_seed(3)) * 3
     lm_head = SimpleNamespace(weight=weight)
-    rows, targets = [0, 1, 2], [3, 40000, 65535]
-    logits = (hidden @ weight.T)[rows]
+    rows, targets = [2, 0, 1], [3, 40000, 65535]
+    logits = weight[:, rows].T.contiguous()
     ids = torch.tensor(targets)
 
     def run(order: str) -> torch.Tensor:
@@ -163,7 +218,9 @@ def test_prompt_logprobs_follow_the_order(monkeypatch):
             forward_mode=ForwardMode.EXTEND,
             query_shard=None,
             gather_ids=torch.tensor([3]),
-            input_logprob_rows=_prompt_rows(rows, targets, num_input_rows=4),
+            input_logprob_rows=_prompt_rows(
+                rows, targets, num_input_rows=4, chunk_tokens=chunk_tokens
+            ),
         )
         return _processor(order, monkeypatch)(
             input_ids=None,
@@ -174,28 +231,38 @@ def test_prompt_logprobs_follow_the_order(monkeypatch):
 
     torch_order = run("torch")
     assert torch.equal(torch_order, gather_token_logprobs_torch(logits, ids))
-    megatron = run("megatron")
+    blockwise = run(order)
     assert torch.equal(
-        megatron, vocab_parallel_logprobs(logits, ids, vocab_block=MEGATRON_VOCAB_BLOCK)
+        blockwise,
+        blockwise_logprobs(
+            logits,
+            ids,
+            vocab_block=block,
+            form=form,
+        ),
     )
-    torch.testing.assert_close(megatron, torch_order, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(blockwise, torch_order, rtol=1e-5, atol=1e-5)
 
 
-def test_megatron_order_needs_a_block_multiple_vocabulary_at_construction(
+@pytest.mark.parametrize("order,block,form", ORDER_CASES)
+def test_blockwise_order_needs_a_block_multiple_vocabulary_at_construction(
     monkeypatch,
+    order,
+    block,
+    form,
 ):
     # The fold runs over fixed-width blocks of the sliced logits; a vocabulary
     # that does not tile is refused when the processor is built, not when
     # the first logprob request reaches the forward thread.
-    _processor("megatron", monkeypatch, vocab_size=3 * MEGATRON_VOCAB_BLOCK)
-    _processor("torch", monkeypatch, vocab_size=MEGATRON_VOCAB_BLOCK + 1)
+    _processor(order, monkeypatch, vocab_size=3 * block)
+    _processor("torch", monkeypatch, vocab_size=BLOCKWISE_VOCAB_BLOCK + 1)
     with pytest.raises(ValueError, match="multiple of it"):
-        _processor("megatron", monkeypatch, vocab_size=MEGATRON_VOCAB_BLOCK + 1)
+        _processor(order, monkeypatch, vocab_size=block + 1)
 
 
-def test_megatron_order_dispatches_to_a_registered_vendor_leaf():
+def test_blockwise_order_dispatches_to_a_registered_vendor_leaf():
     """A leaf registered under ("sampling", "block_sumexp") with the
-    batch_invariant feature above the portable one is what `megatron` runs.
+    batch_invariant feature above the portable one is what `blockwise` runs.
 
     The fake follows the leaf contract: ``leaf(shifted, *, block_size)`` ->
     fp32 ``[rows, vocab // block_size]`` block partials in vocabulary order.
@@ -228,18 +295,23 @@ def test_megatron_order_dispatches_to_a_registered_vendor_leaf():
     try:
         logits = _logits(2)
         tokens = torch.tensor([3, 40000], dtype=torch.int32)
-        got = gather_token_logprobs(logits, tokens, logprob_order="megatron")
+        got = gather_token_logprobs(
+            logits,
+            tokens,
+            logprob_order="blockwise",
+        )
     finally:
         registry._unregister(spec.name)
 
-    assert calls == [((2, VOCAB), MEGATRON_VOCAB_BLOCK)]
+    assert calls == [((2, VOCAB), BLOCKWISE_VOCAB_BLOCK)]
     shifted = logits - logits.max(-1, keepdim=True).values
-    partials = torch.exp(shifted).view(2, -1, MEGATRON_VOCAB_BLOCK).sum(-1) + marker
+    partials = torch.exp(shifted).view(2, -1, BLOCKWISE_VOCAB_BLOCK).sum(-1) + marker
     sum_exp = partials[:, 0]
     for block in range(1, partials.shape[1]):
         sum_exp = sum_exp + partials[:, block]
     target = shifted.gather(1, tokens.long()[:, None]).squeeze(1)
-    assert torch.equal(got, -(torch.log(sum_exp) - target))
+    expected = target - torch.log(sum_exp)
+    assert torch.equal(got.view(torch.int32), expected.view(torch.int32))
     # The torch order never consults the leaf.
     gather_token_logprobs(logits, tokens, logprob_order="torch")
     assert len(calls) == 1

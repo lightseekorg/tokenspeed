@@ -4,7 +4,7 @@ from typing import NamedTuple
 
 from lib.moe.rocm.memory_ops import MxFp4TileShape, MxFp4WeightLayout
 from lib.tal.device import DeviceTemplate, device_method
-from triton.experimental.gluon import language as l
+from tokenspeed_kernel._triton import gl as l
 
 
 class MxFp4ConfigWeightLayouts:

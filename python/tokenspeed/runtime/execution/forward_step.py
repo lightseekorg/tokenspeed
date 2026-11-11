@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import bisect
+import dataclasses
 import gc
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
@@ -108,25 +109,113 @@ def freeze_gc(enable_cudagraph_gc: bool):
             gc.collect()
 
 
-def get_batch_sizes_to_capture(config: ModelExecutorConfig):
+@dataclasses.dataclass(frozen=True)
+class DecodeLadderArgs:
+    """The executor config fields the decode graph ladder is built from
+    (``get_batch_sizes_to_capture``), as ``ModelExecutorConfig.from_server_args``
+    takes them."""
+
+    cudagraph_capture_sizes: list[int] | None
+    max_num_seqs: int
+    data_parallel_size: int
+    disable_cuda_graph_padding: bool
+    max_cudagraph_capture_size: int
+
+
+def get_batch_sizes_to_capture(config: ModelExecutorConfig | DecodeLadderArgs):
     capture_bs = config.cudagraph_capture_sizes
     max_bs = config.max_num_seqs // max(config.data_parallel_size, 1)
+    effective_max = min(config.max_cudagraph_capture_size, max_bs)
 
     if capture_bs is None:
         if config.disable_cuda_graph_padding:
             capture_bs = list(range(1, 33)) + [64, 96, 128, 160]
+            stride = 32
         else:
             capture_bs = [1, 2, 4] + [i * 8 for i in range(1, 21)]
+            stride = 16
+        # The default ladder ends at 160; carry it up to a larger capture cap.
+        if effective_max > capture_bs[-1]:
+            capture_bs += list(range(capture_bs[-1] + stride, effective_max, stride))
+            capture_bs.append(effective_max)
 
     if max(capture_bs) > max_bs:
         capture_bs = list(sorted(set(capture_bs + [max_bs - 1] + [max_bs])))
 
-    effective_max = min(config.max_cudagraph_capture_size, max_bs)
     # Ascending and unique: padding bisects the ladder for a batch's graph.
     return sorted({bs for bs in capture_bs if 0 < bs <= effective_max})
 
 
 global_graph_memory_pool = None
+
+
+def prepare_draft_extend_metadata(
+    draft_attn_backend: AttentionBackend,
+    drafter: BaseDrafter,
+    *,
+    padded_bs: int,
+    num_extends: int,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    forward_mode: ForwardMode,
+    **kwargs,
+) -> None:
+    """The draft backend's metadata for an extend or mixed forward.
+
+    One draft metadata contract for every backend family, the same two steps
+    as the pure-decode path: the prefill init reads the accepted-prefix
+    seq_lens view, then the unified refresh prepares the draft's step-1+
+    decode metadata. Drafters republish their in-loop seq_lens edits through
+    advance_draft_forward_metadata / update_draft_forward_metadata. Called by
+    the forward step for every extend and by the drafter prefill graph's
+    capture for its dummy extends, so both prepare the same state.
+
+    Args:
+        draft_attn_backend: The draft model's attention backend.
+        drafter: The drafter; its ``draft_seq_lens_buf`` is seeded for the
+            round (the DFLASH drafter reads it directly; Eagle advances it per
+            step), and it takes the round's ``block_tables``.
+        padded_bs: Requests in the forward.
+        num_extends: Leading extend requests.
+        req_pool_indices: ``[padded_bs]`` request-pool slots.
+        seq_lens: ``[>= padded_bs]`` cache lengths after this forward.
+        forward_mode: EXTEND or MIXED.
+        **kwargs: The target's extend metadata arguments, passed on unchanged
+            (the extend lengths, ``block_tables`` and the rest).
+    """
+    draft_seq_lens = drafter.draft_seq_lens_buf[:padded_bs]
+    draft_seq_lens.copy_(seq_lens[:padded_bs])
+    if not draft_attn_backend.query_sharded:
+        # A sharded target may have an unsharded draft (``draft_unsharded`` in
+        # ``model_wide_kwargs``): passing the target's plan on would claim a
+        # sharding the draft never sees, and a backend that cannot attend one
+        # refuses it (``reject_query_shard``).
+        kwargs = {**kwargs, "query_shard": None}
+    draft_attn_backend.init_forward_metadata(
+        bs=padded_bs,
+        num_extends=num_extends,
+        req_pool_indices=req_pool_indices,
+        seq_lens=seq_lens,
+        forward_mode=forward_mode,
+        **kwargs,
+    )
+    # Step two: the draft's step-1+ decode metadata for this round, via the
+    # same refresh the pure-decode path uses. Plain 1-token rows --
+    # deliberately NOT the packed verify width: V4's packed-decode arm would
+    # clobber forward_prefill_metadata with a DECODE-mode object and break the
+    # draft's first-step prefill. Refresh writes decode-slot metadata only, so
+    # rounds that run no decode steps (vanilla MTP extend depths, DFLASH block
+    # decode) simply leave it unread or overwrite it per step.
+    draft_attn_backend.refresh_decode_metadata(
+        padded_bs,
+        padded_bs,
+        req_pool_indices,
+        draft_seq_lens,
+        forward_mode=ForwardMode.DECODE,
+        num_extends=num_extends,
+        block_tables=kwargs.get("block_tables"),
+    )
+    drafter.round_block_tables = kwargs.get("block_tables")
 
 
 class DeepEPCudaGraphRunnerAdapter:
@@ -180,6 +269,29 @@ class DeepEPCudaGraphRunnerAdapter:
         if cls is None or cls._buffer is None:
             return
         cls.set_dispatch_mode_as_low_latency()
+
+
+def live_graph_outputs(outputs: tuple, bs: int, max_tokens_per_req: int) -> tuple:
+    """A captured decode graph's outputs, sliced to the live batch.
+
+    ``outputs`` is what the captured forward returned: ``(output_tokens,
+    output_lengths, output_logprobs, output_cumulative_probs,
+    forward_logprobs)`` for the padded batch. The sampled-token columns keep
+    ``bs * max_tokens_per_req`` rows and the lengths ``bs``; a decode graph
+    never gathers prompt logprobs or top-k alternatives, so its last output is
+    None.
+    """
+    tokens, lengths, logprobs, cumulative_probs, forward_logprobs = outputs
+    if forward_logprobs is not None:
+        raise RuntimeError("a captured decode graph returned prompt or top-k logprobs")
+    rows = bs * max_tokens_per_req
+    return (
+        tokens[:rows],
+        lengths[:bs],
+        None if logprobs is None else logprobs[:rows],
+        None if cumulative_probs is None else cumulative_probs[:rows],
+        None,
+    )
 
 
 class ForwardStepRunner:
@@ -587,6 +699,11 @@ class ForwardStepRunner:
                 if self.runtime_states is not None
                 else None
             ),
+            draft_q=(
+                self.runtime_states.future_draft_q
+                if self.runtime_states is not None
+                else None
+            ),
             vocab_size=self.vocab_size,
             device=self.device,
         )
@@ -767,6 +884,11 @@ class ForwardStepRunner:
                         if self.runtime_states is not None
                         else None
                     ),
+                    draft_q=(
+                        self.runtime_states.future_draft_q
+                        if self.runtime_states is not None
+                        else None
+                    ),
                     vocab_size=self.vocab_size,
                     device=self.device,
                 )
@@ -932,43 +1054,16 @@ class ForwardStepRunner:
             **kwargs,
         )
         if self.draft_attn_backend is not None:
-            # One draft metadata contract for every backend family, the same
-            # two steps as the pure-decode path: the prefill init reads the
-            # accepted-prefix seq_lens view, then the unified refresh prepares
-            # the draft's step-1+ decode metadata. Drafters republish their
-            # in-loop seq_lens edits through advance_draft_forward_metadata /
-            # update_draft_forward_metadata. The copy below seeds the
-            # drafter-owned buffer for the round (the DFLASH drafter reads it
-            # directly; Eagle advances it per step).
-            draft_seq_lens = self.drafter.draft_seq_lens_buf[:padded_bs]
-            draft_seq_lens.copy_(seq_lens[:padded_bs])
-            draft_extend_kwargs = dict(kwargs)
-            self.draft_attn_backend.init_forward_metadata(
-                bs=padded_bs,
+            prepare_draft_extend_metadata(
+                self.draft_attn_backend,
+                self.drafter,
+                padded_bs=padded_bs,
                 num_extends=num_extends,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 forward_mode=forward_mode,
-                **draft_extend_kwargs,
+                **kwargs,
             )
-            # Step two: the draft's step-1+ decode metadata for this round,
-            # via the same refresh the pure-decode path uses. Plain 1-token
-            # rows — deliberately NOT the packed verify width: V4's
-            # packed-decode arm would clobber forward_prefill_metadata with a
-            # DECODE-mode object and break the draft's first-step prefill.
-            # Refresh writes decode-slot metadata only, so rounds that run no
-            # decode steps (vanilla MTP extend depths, DFLASH block decode)
-            # simply leave it unread or overwrite it per step.
-            self.draft_attn_backend.refresh_decode_metadata(
-                padded_bs,
-                padded_bs,
-                req_pool_indices,
-                draft_seq_lens,
-                forward_mode=ForwardMode.DECODE,
-                num_extends=num_extends,
-                block_tables=kwargs.get("block_tables"),
-            )
-            self.drafter.round_block_tables = kwargs.get("block_tables")
 
     def _global_graph_bs(self, ctx: ForwardContext) -> int | None:
         if self.dp_size <= 1 or ctx.global_num_tokens is None:
@@ -1072,9 +1167,9 @@ class ForwardStepRunner:
         The ``extend_*`` lengths are the ``[:num_extends]`` slices of the
         input buffers on every call — empty for a pure decode or the idle
         replay, which never read them. ``block_tables_cpu`` mirrors
-        ``block_tables`` on the host (the same group keys; empty at bs 0) for
-        backends that plan an extend from the tables without waiting on the
-        device.
+        ``block_tables`` on the host (the same group keys) for backends that
+        plan an extend from the tables without waiting on the device; a pure
+        decode, which plans nothing from them, gets none.
 
         ``settle`` finishes what the inputs still wait on (a pending draft
         round): a decode calls it once the target's decode metadata, which
@@ -1082,10 +1177,12 @@ class ForwardStepRunner:
         first.
 
         Returns ``(output_tokens, output_lengths, output_logprobs,
-        forward_logprobs)``; the last is an extend/mixed forward's
-        ``ForwardLogprobs`` (the prompt-logprob gather of
-        ``ctx.input_logprob_rows`` and the top-k alternatives
-        ``ctx.sampled_top_k`` asks for) and None otherwise.
+        output_cumulative_probs, forward_logprobs)``; the last is an
+        extend/mixed forward's ``ForwardLogprobs`` (the prompt-logprob gather
+        of ``ctx.input_logprob_rows`` and the top-k alternatives
+        ``ctx.sampled_top_k`` asks for) and None otherwise. The sampled
+        tokens' logprobs and cumulative probabilities (None when not enabled)
+        share the tokens' rows on both paths.
         """
         use_graph = self._can_use_graph(bs, ctx)
         padded_bs = self._padded_bs(bs, ctx) if use_graph else bs
@@ -1215,24 +1312,8 @@ class ForwardStepRunner:
             if self._expert_load_rows is not None:
                 self._expert_load_rows.clear()
 
-            # A decode graph never gathers prompt logprobs or top-k
-            # alternatives (its captured fourth output is None).
-            (
-                output_tokens,
-                output_lengths,
-                output_logprobs,
-                _forward_logprobs,
-            ) = self.output_buffers[graph_key]
-
-            result = (
-                output_tokens[: bs * self.max_tokens_per_req],
-                output_lengths[:bs],
-                (
-                    output_logprobs[: bs * self.max_tokens_per_req]
-                    if output_logprobs is not None
-                    else None
-                ),
-                None,
+            result = live_graph_outputs(
+                self.output_buffers[graph_key], bs, self.max_tokens_per_req
             )
         else:
             result = self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)

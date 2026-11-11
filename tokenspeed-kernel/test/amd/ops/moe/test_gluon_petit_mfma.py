@@ -26,10 +26,10 @@ from tokenspeed_kernel.thirdparty.gluon_petit import load_petit_kernel
 
 load_petit_kernel()
 
-import triton.experimental.gluon as g
 from lib.gemm.rocm.cdna4_ops import scaled_mfma_tile
 from lib.gemm.rocm.intrinsics import _native_call
-from triton.experimental.gluon import language as l
+from tokenspeed_kernel._triton import gl as l
+from tokenspeed_kernel._triton import gluon as g
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()

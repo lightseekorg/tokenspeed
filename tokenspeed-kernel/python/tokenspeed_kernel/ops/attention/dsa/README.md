@@ -24,25 +24,110 @@ the online softmax; unused entries remain `-1`.
 Portable Triton implementations remain the fallback for trait combinations
 without a matching native registration.
 
+## FlashInfer Prims-TS FP8 D576
+
+The optional `flashinfer_prims` solution consumes native E4M3 queries and KV
+without a BF16 conversion. It supports SM100/SM103, 1–128 local query heads,
+latent dimension 512 with a 64-channel QK-only tail, page size 64, top-k
+512/1024/2048, and decode widths 1–8. Both prefill and decode return BF16;
+optional LSE is FP32 in natural-log units. Empty selections produce zero
+output and negative-infinite LSE. Negative slots inside a visible prefix are
+masked. Omitting lengths inspects the full selected-slot width.
+
+The pinned FlashInfer 0.7.3 provides the Prims-TS sparse MLA wrapper. Select
+`solution="flashinfer_prims"` in the kernel API, or set
+`TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_DSA_PREFILL=flashinfer_prims_dsa_prefill`
+and `TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_DSA_DECODE=flashinfer_prims_dsa_decode`
+for serving. TRTLLM keeps its higher default priority, and also returns the
+LSE that decode context parallelism merges. The indexer is unchanged.
+
+The upstream plan owns PDL scheduling. This adapter requires PDL enabled and
+rejects an explicit disable request. The caller prepares Q and the selected
+indices. `k_scale` multiplies the logit scale, as in the existing D576 facade;
+native MLA value storage stays at unit scale.
+
+Plans bucket request capacity to powers of two. Live rows and lengths remain
+runtime inputs. Scratch is separate per CUDA stream. Warm the geometry and
+row count on the capture stream before capture, inside the normal runtime
+warmup. Use `tokenspeed_kernel.workspace.capture_session(graph)` when capturing
+standalone calls. Captured plans live with their graph owner. Graphs sharing
+a plan must replay in order; concurrent streams need their own warmed plans.
+
+The adapter tests check both solutions against an FP32 reference. From the
+repo root:
+
+```bash
+python -m pytest tokenspeed-kernel/test/nvidia/ops/test_dsa_flashinfer_prims.py
+```
+
+## Speculative verify width
+
+On NVIDIA the FP8 index-K decode path supports one through eight query rows
+per request; the gfx950 Gluon scorers and sparse MLA decode stop at six.
+Eight rows cover DSpark's seven draft tokens plus the bonus token. DeepGEMM
+scores each row separately. The row at offset `j` can select only the first
+`seq_lens[request] - q_len_per_req + 1 + j` cache positions. The FlashInfer
+RoPE attention core and portable Triton core consume those selected rows.
+They do not attend to later draft positions.
+
+GPU tests compare seven- and eight-row verification with independent
+single-row calls. They cover short prefixes, page boundaries, sparse selection,
+and CUDA Graph replay.
+
 ## DCP local candidate selection
 
-`deep_gemm_dsa_index_candidates` scores compact owned Index-K pages. On
-Hopper, its local top-k uses the in-tree CuTe DSL DeepSelect selector with
-the original compact lengths, so selection excludes the unused logits
-tail. Empty shards keep length zero for selection even though DeepGEMM's
-scoring scheduler needs a nonzero dummy length.
+`deep_gemm_dsa_index_candidates` scores compact owned Index-K pages. Its
+local top-k uses a length-aware selector with the original compact lengths,
+so selection excludes the unused logits tail. Empty shards keep length zero
+for selection even though DeepGEMM's scoring scheduler needs a nonzero dummy
+length. Selectors are tried in this order:
 
-This selector serves `topk <= 2048` on CUDA FP32 matrices with unit column
-stride, a 16-byte aligned base, and rows padded to four elements. Aligned
-non-contiguous rows need no copy. Other architectures, unsupported layouts
-or top-k sizes, and installations without CuTe DSL retain the existing
-`torch.topk` selection. The first eager call compiles every cluster variant
-of its survivor capacity before CUDA-graph capture; later batch shapes use
-those compiled variants.
+- On Hopper, the in-tree CuTe DSL DeepSelect selector serves `topk <= 2048`
+  on CUDA FP32 matrices with unit column stride, a 16-byte aligned base, and
+  rows padded to four elements. The first eager call compiles every cluster
+  variant of its survivor capacity before CUDA-graph capture; later batch
+  shapes use those compiled variants.
+- Otherwise, including on Blackwell, the CUDA `persistent_topk` ragged
+  selector serves `topk` 512, 1024 or 2048 when the logits width is at
+  least `topk`. It needs the same aligned FP32 rows and reads them in place:
+  DeepGEMM's padded logits rows are widened rather than copied. The kernel
+  pads short rows with `-1`; gathering drops those and `-inf` candidates.
+- Unsupported layouts or top-k sizes, tables narrower than `topk`, and
+  installations without either selector retain the existing `torch.topk`
+  selection.
 
-Scoring and logits capacity are unchanged. Length-aware selection masks only
-the valid prefix and reuses DeepSelect's returned values; the full-width
-fallback still initializes the entire logits tail. The mask preserves mandatory
+Scoring and logits capacity follow the compact page table's width. Decode
+keeps the global column count on purpose: page ownership is balanced on a
+best-effort basis only, and decode graphs need a static width. That width
+still costs more than the DeepGEMM logits allocation. `compact_index_pages`
+runs one program per row over a `next_power_of_2(columns)`-lane block with a
+full-width cumsum (32768 lanes at the 16386-column 1M decode table), and it
+zero-fills `[rows, columns]` int32 pages and positions, which the scorer and
+the gather then read. DCP decode plans them once per forward.
+
+A prefill runs eagerly, so it can plan narrower pages instead:
+`plan_dsa_index_candidates(columns=)` compacts each row into its first
+`columns` owned pages with a bounded kernel that walks the table 1024 columns
+at a time (one binary for every table and output width). The DeepGEMM
+leaf's logits shrink to `columns * page_size` scores per row, so a logits
+budget fits proportionally more rows per tile. `columns` must bound every
+row's owned pages; the runtime derives it on the host from the page table
+(`max_owned_index_pages`), identically on every rank. A row past it still
+stays in bounds: it keeps its first `columns` pages, its length counts only
+their tokens, and the plan's `overflow` reports the pages it left out.
+`dsa_index_candidates_accepts_pages` tells whether the selected leaf scores
+planned pages at all; a leaf that does not compacts the whole table on every
+call, so its tiles must keep the table's width.
+
+Length-aware selection masks only the valid prefix with a device-sized grid
+(about eight programs per SM) whose programs stride over each row's length
+1024 scores at a time; DeepSelect's returned values are reused. The
+full-width fallback still initializes the entire logits tail, one 256-score
+block per program. Every row offset in these kernels is 64-bit: strides fit
+in int32, but past 2048 rows of a 1M-wide table their products do not. The
+runtime also keeps one tile below 2^31 logits elements, because the
+persistent top-k and the portable scorer offset rows in 32-bit arithmetic.
+The mask preserves mandatory
 global windows as `+inf`; do not apply the ordinary decode non-finite cleanup
 after those markings. Gathering bounds every selected offset before reading
 positions or logits, then emits interleaved int32 position/FP32-score-bit views
@@ -50,8 +135,14 @@ that runtime can exchange without repacking. Tie order remains unspecified,
 and gathering drops candidates scoring `-inf`. Attention-core selection and
 cache ownership are unchanged.
 
-Candidate exchange retains global `torch.topk`. Its gather kernel processes
-selected entries in bounded blocks; the block size does not restrict `topk`.
+Runtime DCP merges every rank's gathered candidates with
+`dsa_merge_candidates`, and every rank must select the same ones from the same
+records. `triton_dsa_merge_candidates` takes a global `torch.topk`; its gather
+kernel processes selected entries in bounded blocks, so the block size does not
+restrict `topk`. On NVIDIA, `cuda_dsa_merge_candidates` (topk 512, 1024 or 2048)
+finds the k-th largest score with the CUDA persistent-radix `persistent_topk`,
+whose atomics pick among tied scores in arrival order, and then keeps every
+candidate above that score and the first tied ones, in candidate order.
 
 ## Materialized Triton row top-k
 
@@ -109,11 +200,26 @@ never convert a plane:
 | `uint8` | `fp8_scaled` | `page_planar` | any other uint8 shape: per-page planes of keys and scales, the outer page stride possibly padded |
 | `bfloat16` | `bf16` | `packed` | `[slots, head_dim]`: the keys as the indexer produced them, no scale plane |
 
-The in-tree DeepGEMM, Triton, and Gluon leaves score `fp8_scaled` planes; a
-leaf scoring the checkpoint's bf16 keys (an indexer in the RL trainer's
-order) registers `index_k_format={"bf16"}`, `index_k_layout={"packed"}`, and
-the `batch_invariant` and `forced_initial_local` features, so a bf16 plane
-selects it and nothing else. A plane of any other dtype is a `TypeError`.
+An index-K plane can be a view into a shared cache arena. Both its key view
+and its scale view must preserve the plane's storage offset. The packed FP8
+row above is the plane's tensor shape; in memory each page stores the key
+bytes of all its slots first, then their FP32 scales.
+
+The in-tree DeepGEMM, Triton, and Gluon leaves score `fp8_scaled` planes. A
+leaf scoring the checkpoint's bf16 keys registers `index_k_format={"bf16"}`
+and `index_k_layout={"packed"}`, so a bf16 plane selects it and nothing else.
+A leaf that must reproduce an RL trainer's selection order also declares the
+`batch_invariant` and `forced_initial_local` features; the gfx950 ones below
+do not. A plane of any other dtype is a `TypeError`.
+
+On gfx950, `gluon_dsa_decode_topk_bf16_gfx950` and
+`gluon_dsa_prefill_topk_bf16_gfx950` score a bf16 plane with BF16 queries
+(32 or 64 heads, `head_dim` 128, page size 64, top-k 512/1024/2048). They
+declare only the `bf16`/`packed` traits: no `batch_invariant` (their radix
+selection does not promise lowest-index ties), no `forced_initial_local`, and
+no `index_k_workspace_rows`. They serve the plane path with
+`batch_invariant=False`; `plan_dsa_topk` and workspace-row prefill do not
+select them.
 
 `dsa_prefill_topk` also takes the index keys as rows already in
 workspace-row order instead of a plane (the query-context-parallel history
@@ -154,6 +260,23 @@ launches from it declares the feature alongside the keyword, and the facade
 reads the registration rather than probing call signatures, so a
 `*args, **kwargs` wrapper never receives a keyword its launcher cannot take.
 
+`row_starts_cpu` optionally supplies an int32 or int64 CPU mirror of each query's
+inclusive workspace-row start, shape `[tokens]`. A strided mirror is valid.
+Together with `candidate_lens_cpu`, it lets a leaf plan groups of queries
+sharing a history without reading metadata back from the device. The caller
+must provide the current invocation's values in the same workspace coordinates
+as `row_starts`, including any slice or group rebase. The facade checks shape,
+device, and dtype; it does not compare values against device metadata.
+A stale mirror violates the contract and can produce incorrect selection.
+
+`None` supplies no mirror and preserves existing selection. A supplied mirror
+requires `ROW_STARTS_CPU_FEATURE` (`"row_starts_cpu"`) and reaches the selected
+leaf unchanged. Ordinary selection, explicit overrides, and saved plans reject
+leaves without the feature instead of dropping the argument. A declaring leaf
+must accept the keyword and support its omission. No in-tree production leaf
+currently declares this feature; it is an extension contract for registered
+providers, not a standalone scoring optimization.
+
 ## Slot order of the sparse cores
 
 `dsa_decode` and `dsa_prefill` take a required `slot_order` in
@@ -165,6 +288,96 @@ so the reduction is batch-invariant whenever the selected set is, and is
 served only by cores declaring `slot_order={"sorted", ...}`, which receive
 the choice as the `slot_order` keyword. Asking a silent core for `sorted`
 is a `ValueError`, not a silent fallback.
+
+## Fused decode top-k (`cute_dsl_dsa_decode_topk`)
+
+On SM100-SM103 the `cute_dsl` leaf runs a decode step's indexer tail in two
+PDL-chained launches (`thirdparty/cute_dsl/k3_decode/dsa/indexer.py`) after the
+shared query quantization: a persistent tcgen05 scorer and a one-CTA-per-row
+select. It replaces the DeepGEMM leaf's block-table expansion, paged MQA logits,
+non-finite scrub, radix top-k and slot mapping, and ignores the `dsa_plan`.
+
+- Logits are bit-identical to `deep_gemm.fp8_paged_mqa_logits` on the same FP8
+  query and FP32 weights: the same FP8 MMA (K 128 in four K 32 steps, FP32
+  accumulator, keys as operand A) and DeepGEMM's FP32 head sum (`x + |x|`, two
+  FMA chains over the head pairs, their sum halved, times the key's scale), with
+  NaN and `+inf` stored as `-inf` as the scrub would. They live in a
+  request-compact FP32 scratch no larger than DeepGEMM's `[tokens, block-table
+  capacity]` output.
+- Selection is exact over FP32 order keys (`-0` ranks as `+0`): a row's top-k is
+  the head of the stable descending sort of its causal window, so ties at the
+  threshold go to the lowest positions (the `batch_invariant` contract), and the
+  slots come out in ascending position, which serves both `slot_order` values.
+  A row of at most `topk` keys takes all of them; a request whose rows all fit
+  is not scored. Rows whose request length leaves no keys come out empty.
+- Rows, requests, pages and the block-table width are runtime values: one
+  compile per `q_len_per_req`. At most 4096 requests per call.
+- The select never releases its dependents early: trtllm-gen sparse attention
+  reads the counts before its PDL wait.
+- It also takes queries quantized ahead: contiguous E4M3 queries with unit
+  scales (`q_scales=None`) and the FP32 weights that carry their scales and
+  the score scale (`softmax_scale=1`), which it scores without its own
+  quantization launch.
+
+The leaf registers below every other `dsa_decode_topk` leaf, so only
+`solution="cute_dsl"` selects it. Kimi-K3.1 pins it where it is registered;
+other models with the same indexer geometry keep their leaf.
+
+A Kimi-K3.1 decode round quantizes those queries in the launch that writes
+its index keys: `index_k_layernorm_fp8_scatter_and_quantize_query`
+(`_triton/topk.py`) runs, per row, the row functions of
+`index_k_layernorm_fp8_scatter` (one warp, so the key's LayerNorm sums in the
+same order) and of `quantize_index_query_weights`, so the plane's bytes and
+the query and weights are bit-identical to the two separate launches. Mixed
+rounds, prefill, and KV-parallel decode keep the separate write; decode rounds
+of the K3 decode chain run the fused decode front below instead.
+
+## Fused decode front (`cute_dsl_dsa_decode_front`)
+
+On SM100-SM103 a Kimi-K3.1 TP8 decode round of the K3 decode chain runs, after
+its packed input projection, one cluster launch
+(`thirdparty/cute_dsl/k3_decode/dsa/front.py`) in place of three:
+`rmsnorm_fused_parallel` (q_a into `q_norm`, kv_a in place), the stacked
+[q_b; wq_b] GEMM over `q_norm`, and
+`index_k_layernorm_fp8_scatter_and_quantize_query`. It is the
+`dsa_decode_front` operator (`solution="cute_dsl"`; traits q_lora_rank 1536,
+kv_lora_rank 512, 2304 q_b rows, 32 index heads of 128, 64-slot packed
+`fp8_scaled` planes) and serves 1-64 rows (`decode_front_rows_supported`).
+Kimi-K3.1 takes it up to 32 rows: on GB300 it saves about 2 us per DSA layer
+at 8-32 rows, while at 64 rows the stacked GEMM path is faster.
+
+- Grid (4, 32), clusters of 4, one CTA per SM. Cluster `h` owns index head `h`
+  (128 wq_b rows) and q_b rows `[72 h, 72 h + 72)`; CTA `p` holds K columns
+  `[384 p, 384 p + 384)` of those 200 rows. It issues its 150 KB of weights in
+  six 64-column blocks (cp.async, L2 evict_first) before the PDL wait, so the
+  weight stream starts under the input projection's tail, and the MMAs of a
+  block start as it lands.
+- After the wait, eight warps load the rows' q_a quarter. Each CTA sends its
+  peers (DSMEM bulk copies) one whole warp sum and 16 thread chains of the
+  RMSNorm per row, from which every CTA rebuilds `rmsnorm_fused_parallel`'s
+  exact reduction tree (an FMA chain per 8 columns, a butterfly per 256, the six
+  warp sums as `((w0 + w4) + w2) + ((w1 + w5) + w3)`, `-use_fast_math`
+  arithmetic), normalizes its quarter in place and runs BF16 `mma.sync` with FP32
+  accumulators. The FP32 partials overwrite the weight buffer; after a cluster
+  barrier the owner of a row adds the four K quarters in rank order, rounds to
+  BF16, writes the projection and quantizes the head as
+  `quantize_index_query_weights` does.
+- A ninth warp writes token `4 h + p`'s index key with the Triton write's
+  instruction sequence and normalizes its kv_a row in place.
+
+Numerics: `q_norm`, the normalized latent, the plane bytes and the quantized
+query (of the front's own BF16 projection) are bit-identical to the separate
+launches. Only the projection's K summation order differs from a GEMM
+library's, so a projected value may differ from the unfused GEMM's by one BF16
+step, and its FP8 query and scale follow it. Rows are a runtime value: one
+compile per 16-row tile and slot / LayerNorm dtype.
+
+Kimi-K3.1 selects the front at construction only with the fused decode top-k
+(`index_k_write_quantizes_query`) and takes it for decode rounds of the decode
+chain without KV placement or a breakable capture; the front runs inside the
+layer's eager break, and `forward_dsa_core` takes its outputs as
+`written_index_query`. Prefill, mixed and KV-parallel rounds, the non-chain
+forward and bitwise numerics keep the separate launches.
 
 ## Row top-k selection in CuTe DSL (`_cute_dsl/deep_select.py`)
 
@@ -218,6 +431,14 @@ DeepGEMM index scoring registers for 16, 32, or 64 index heads. The
 caller-provided scoring scales and forced initial/local candidate policies
 remain unchanged. Kernel traits exclude other head counts.
 
+DeepGEMM's FP8 logits kernels take no query scale, so
+`quantize_index_query_weights` quantizes each (token, head) query to E4M3
+with the 1x128 token-group quantizer's arithmetic and folds that scale and
+`softmax_scale` into the head weights in one launch, bit-exact with NVIDIA's
+`quantize_fp8` followed by `combine_topk_weights`. Before the decode top-k,
+`scrub_nonfinite_logits` reads the per-request lengths and derives each
+verify row's causal candidate count itself.
+
 FlashMLA sparse prefill (regular BF16 KV) and sparse decode (packed FP8 KV)
 also support `return_lse=True`. Both return natural-log LSE `[tokens, heads]`
 and normalize empty rows to zero output / negative-infinite LSE for the shared
@@ -252,7 +473,39 @@ DeepGEMM compacts owned, causally visible pages and maps results back to global
 offsets, masking padding and handling partial tails and empty shards. Query
 quantization and head padding match the unsharded path; portable Triton provides
 the same interface. Query tiling bounds scratch memory, and fixed-shape GPU
-metadata supports CUDA graph replay without host reads.
+metadata supports CUDA graph replay without host reads. Runtime
+(`select_dsa_topk`) bounds the candidate exchange by the same budget:
+consecutive tiles share one all-gather and merge while the gathered records
+and merge scores, `degree * topk * 12` bytes per row, fit it, so a long
+prefill chunk never exchanges every row at once. Without a budget (DCP
+decode by default) every row joins one exchange.
+
+A KVP prefill of at least 1024 rows
+merges each row on one rank instead of on every rank. An exchange's rows are
+padded with invalid candidates to equal slices, one per rank; an all-to-all
+sends each slice's candidates to its owner, which runs the same merge on
+them, and two all-gathers return every row's positions and counts. A row's
+merge input is unchanged, so its selection is too, up to the order of equal
+scores. This exchange holds `topk * 24` bytes per row whatever the degree.
+DCP decode keeps the all-gather. Owned-width tiles (see above) are held to
+the rows one exchange of the same kind fits, so with both the row-owner merge
+and owned-width tiles a 16K chunk
+after 200K cached tokens at KVP 8 and a 512 MiB budget scores 4 tiles in 2
+exchanges, against 27 tiles in 7 exchanges at the table's width.
+
+Rows that several calls score against the same table, such as every DCP
+decode indexer layer of one forward, can share one compaction.
+`plan_dsa_index_candidates` selects the leaf `dsa_index_candidates` would
+select and compacts the table once when that leaf declares
+`INDEX_CANDIDATE_PAGES_FEATURE` (`deep_gemm_dsa_index_candidates` does).
+For any other leaf, or for zero rows, it returns `None`. The query, weights
+and cache only supply the selection signature and traits. The result is a
+`DSAIndexCandidatePages`; `rows(start, end)` views a query tile's rows.
+`dsa_index_candidates(..., pages=...)` hands them only to declaring leaves.
+It refuses pages planned for another leaf or for a different row or column
+count. Planned pages are fixed-shape device tensors derived from the table
+and causal lengths, so a captured plan refreshes them on replay. The
+DeepGEMM scoring schedule is still built per call.
 
 The portable selected-slot kernel groups query heads into tensor-core tiles
 and gathers each latent KV tile for both scoring and value accumulation.
@@ -265,11 +518,56 @@ Packed FP8 keys retain a BF16 residual when scoring so dequantization rounding
 does not reduce LSE accuracy. FP16 and FP32 dense keys retain the same residual.
 Value tiles and probabilities use BF16 with FP32 accumulation.
 
+Under DCP, runtime compacts every selection row before the sparse core.
+`compact_owned_slots` (`ops/kvcache/triton_cache_placement.py`) moves the
+rank's owned live slots, translated to local slots, to the front of the row
+in selection order, fills the rest with `-1`, and returns the owned count,
+which runtime passes as `topk_lens`. The portable kernel splits only
+`[0, topk_lens)` across its programs, so each rank visits about
+`topk / kvp` entries rather than the whole width; masking non-owned slots in
+place saved KV reads but not this loop. FlashMLA sparse prefill (BF16 KV)
+masks columns at or past `topk_lens` and also passes them as FlashMLA's
+`topk_length`, whose kernels stop each row after
+`ceil(topk_length / B_TOPK)` blocks, so its work shrinks the same way. Each
+rank receives the same owned set in the same order as
+before, so `slot_order="sorted"` stays sorted, an empty rank still returns
+zero output with negative-infinity LSE, and the cross-rank LSE merge is
+unchanged. Only the in-rank split tiling of the portable kernel changes, so
+partials can differ from the masked layout at rounding level. A rank's work
+follows its owned count, so a row whose selection concentrates on one rank
+is bounded by that rank. Compaction is one program per row over the static
+width; its grid and output shapes are fixed, so CUDA graphs replay it.
+
 The Triton FP8 indexer skips Q/K scoring for tiles with no causally visible,
 owned entries. Empty tiles still write negative-infinite logits, including
 when lengths or ownership change during graph replay. Partially valid tiles
 keep the per-entry mask and global forced-window policy. This avoids redundant
 arithmetic without changing the launch grid, logits capacity, or Top-K scan.
+
+### Partial records written by the core
+
+The head-sharded KVP prefill gathers every rank's query heads, attends the
+rank's pages with all of them, and sends each head's output and LSE to the
+rank owning the head. Through `dsa_prefill` that takes a relayout of the
+gathered heads to `[tokens, ranks * heads]` and a repack of the partials by
+`dispatch_dcp_attention_partials` (`dsv4/_triton/dcp.py`).
+`dsa_prefill_dcp_records` skips both. It reads the query rank-major,
+`[ranks, tokens, heads, dim]`, as an all-gather lands it, and returns the
+int32 records `[ranks, tokens, heads, kv_lora_rank / 2 + 1]` that the
+all-to-all sends. Each record holds BF16 output pairs, low half first,
+followed by the natural-log FP32 LSE bits. The records are bit-identical to
+the repacked output of Triton `dsa_prefill(..., return_lse=True)`, including
+empty rows (zero output, `-inf`) and NaN.
+
+The op has its own name, `("attention", "dsa_prefill_dcp_records")`, and only
+the Triton leaf registers it. A `dsa_prefill` registration would make it a
+candidate for ordinary calls. The leaf runs `_dsa_dense_kv_kernel`'s
+single-split program over dense KV, with the same jitted body
+(`_dsa_dense_kv_attend`) and launch configuration. The token count is a
+runtime argument (`do_not_specialize`). `dsa_prefill_dcp_records_supported`
+accepts a size only when `dsa_prefill` would not split the keys either: the
+launch needs at least about one program per SM. Any other size raises.
+Callers check this from host sizes before they gather the query.
 
 ### Persistent CUDA top-k dependencies
 
@@ -293,3 +591,27 @@ or independent graphs can overwrite each other's queries. Cross-stream users
 must still follow PyTorch's normal tensor synchronization/lifetime rules.
 Padding remains an exact copy of the original heads plus zero-filled extra
 heads; this changes neither arithmetic nor the supported numerics envelopes.
+
+### FlashInfer sparse query head counts
+
+TRTLLM-GEN does not accept 65–127 query heads. The FlashInfer sparse adapter
+pads these queries to 128 heads and returns only the original heads. The
+selected KV slots, scales, and FP8/BF16 input values stay unchanged. Supplied
+output buffers retain their identity and shape. Padding tensors are call-local
+and follow the same stream and graph lifetime rules described above.
+An output buffer must use BF16 and reside on the query device, as required by
+the underlying FlashInfer operation.
+
+## Ascend fused decode resources
+
+The fused Prolog returns query, index-query and score, or writes them through
+an explicit caller-output form. KV and Index-K caches remain caller-owned
+persistent state. QA is private operator workspace; auxiliary debug copies are
+not part of the production interface. RoPE accepts real positions and cos/sin;
+NoPE takes neither input.
+
+`DSAResources` retains the communication window and producer/statistics views.
+LSE merge takes those real data tensors and the communication group. Peer
+window addresses and shape offsets are resolved inside the operator; the
+framework never receives a pointer table. Destroy referencing Graphs and drain
+forwards before releasing the resources or their dedicated process group.

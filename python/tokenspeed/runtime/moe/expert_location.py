@@ -67,6 +67,7 @@ from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.model_loader import get_model_architecture
 from tokenspeed.runtime.moe import eplb_algorithms
+from tokenspeed.runtime.moe.dispatch_algorithm import STATIC_EP_DISPATCH_ALGORITHMS
 from tokenspeed.runtime.moe.expert_load_rows import ExpertLoadRowMask
 from tokenspeed.runtime.moe.placement_maps import (
     compute_placement_maps,
@@ -396,7 +397,9 @@ class ExpertLocationMetadata:
         computed on first use (nearest replica: same GPU, then same node, else
         a seeded fair draw). Only all-to-all EP under a static dispatch
         algorithm consumes it; replicated-input EP routes through the replica
-        table instead and never pays for it.
+        table instead and never pays for it. ``build_expert_placement``
+        computes it with the placement when serving needs it, so the first
+        use is not inside a model build's weight allocation region.
         """
         if self._rank_dispatch_map is None:
             self._rank_dispatch_map = compute_logical_to_rank_dispatch_physical_map(
@@ -917,6 +920,15 @@ def build_expert_placement(
     placement = compute_initial_expert_location_metadata(server_args, model_config)
     if server_args.expert_distribution_recorder_mode is not None:
         placement.enable_load_recording(server_args.mapping)
+    if (
+        server_args.ep_dispatch_algorithm in STATIC_EP_DISPATCH_ALGORITHMS
+        and server_args.all2all_backend != "none"
+    ):
+        # All-to-all EP slices this rank's static map while the model is
+        # built, inside the weight region a memory-saver discard releases and
+        # no weight update rebuilds. Like the load counters, it is placement
+        # state: allocate it here, outside that region.
+        placement.rank_dispatch_map()
     logger.info(
         f"Expert placement: {placement.num_logical_experts} logical experts on "
         f"{placement.num_physical_experts} physical slots over "

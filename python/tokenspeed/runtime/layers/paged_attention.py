@@ -30,7 +30,7 @@ contracts must satisfy: a group must retain every token its layers can see.
 
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 import torch
 from tokenspeed_kernel.ops.attention.prologue import (
@@ -63,6 +63,9 @@ from tokenspeed.runtime.model_loader.weight_utils import (
     V_CACHE_SCALE_SUFFIXES,
 )
 
+if TYPE_CHECKING:
+    from tokenspeed.runtime.layers.attention.backends.base import DecodeKVView
+
 
 @dataclass(frozen=True)
 class QueryShardGather:
@@ -70,8 +73,9 @@ class QueryShardGather:
 
     Under query context parallelism every rank rotates its own rows and the
     prologue all-gathers the rotated latent over ``group`` (per-rank counts
-    ``plan.row_counts``) to the whole extend span before the owner-masked
-    store, so page ownership stays independent of the query shard.
+    ``plan.row_counts``) and puts it in span order (``plan.to_span_order``)
+    before the owner-masked store of the whole extend span, so page ownership
+    stays independent of the query shard.
 
     Attributes:
         plan: The forward's shard plan (``ctx.query_shard``).
@@ -137,6 +141,7 @@ class PagedAttention(nn.Module):
         logit_cap: float = 0.0,
         v_head_dim: int = -1,
         sliding_window_size: int = -1,
+        sliding_window_sink: int = 0,
         *,
         rotary_emb: HeadRotary | None,
         qk_norm: tuple[HeadRMSNorm, HeadRMSNorm] | None,
@@ -161,6 +166,19 @@ class PagedAttention(nn.Module):
                 f"{sliding_window_size!r}"
             )
         self.sliding_window_size = int(sliding_window_size)
+        # Leading tokens kept visible outside the window (attention sinks).
+        if sliding_window_sink is None or sliding_window_sink < 0:
+            raise ValueError(
+                f"PagedAttention layer_id={layer_id}: sliding_window_sink is a "
+                f"token count >= 0, got {sliding_window_sink!r}"
+            )
+        if sliding_window_sink and sliding_window_size < 0:
+            raise ValueError(
+                f"PagedAttention layer_id={layer_id}: sliding_window_sink="
+                f"{sliding_window_sink} needs a sliding window; full attention "
+                "already keeps those rows"
+            )
+        self.sliding_window_sink = int(sliding_window_sink)
         # The cache group this layer's KV rides, bound at startup by bind_cache_groups.
         self._group_id: str | None = None
         self.rotary_emb = rotary_emb
@@ -270,6 +288,15 @@ class PagedAttention(nn.Module):
             **kwargs,
         )
 
+    def decode_kv_view(self, ctx: ForwardContext) -> "DecodeKVView | None":
+        """This layer's paged cache and decode metadata, for a kernel that runs
+        its decode attention inside a larger launch, or None when the backend
+        does not expose them (:meth:`AttentionBackend.decode_kv_view`) or the
+        forward is not a decode."""
+        if not ctx.forward_mode.is_decode():
+            return None
+        return ctx.attn_backend.decode_kv_view(self, ctx.token_to_kv_pool)
+
     def prologue(
         self,
         q: torch.Tensor,
@@ -295,6 +322,7 @@ class PagedAttention(nn.Module):
             norm=norm,
             rotary=rotary,
             cache=self._write_target(q, ctx),
+            query_dtype=ctx.attn_backend.query_dtype(self, ctx.forward_mode, q.dtype),
             return_kv=not ctx.forward_mode.is_decode(),
             solution=None,
             override=None,
@@ -320,6 +348,7 @@ class PagedAttention(nn.Module):
             norm=None,
             rotary=None,
             cache=self._write_target(q, ctx),
+            query_dtype=ctx.attn_backend.query_dtype(self, ctx.forward_mode, q.dtype),
             return_kv=not ctx.forward_mode.is_decode(),
             solution=None,
             override=None,
@@ -468,8 +497,10 @@ class PagedAttention(nn.Module):
             out = MLAPrologueOutput(
                 query=query, key=None, value=None, latent=latent_cache
             )
-        gathered = token_all_gather(
-            out.latent.contiguous(), key_rows.group, list(plan.row_counts)
+        gathered = plan.to_span_order(
+            token_all_gather(
+                out.latent.contiguous(), key_rows.group, list(plan.row_counts)
+            )
         )
         latent_store(
             gathered,
@@ -549,7 +580,9 @@ class PagedAttention(nn.Module):
             )
         width = extra_rows.shape[1]
         payload = torch.cat((extra_rows, out.latent), dim=1).contiguous()
-        gathered = token_all_gather_rows(payload, key_rows.group, list(plan.row_counts))
+        gathered = plan.to_span_order(
+            token_all_gather_rows(payload, key_rows.group, list(plan.row_counts))
+        )
         latent_store(
             gathered[:, width:],
             kv_lora_rank=out.latent.shape[-1] - q_pe.shape[-1],
@@ -640,6 +673,10 @@ def check_block_drafter_storage(
     full-history group there is nothing to borrow: the draft's KV would sit
     in a group of its own while the target router hands it another group's
     slots.
+
+    A draft with its own group would read history through its own router while
+    its KV lands at the target's locations, so the two stop naming the same
+    rows. Nothing raises; the speculation is simply wasted.
     """
     target_groups = set(target_cache_pool.history_group_by_layer().values())
     specs = {

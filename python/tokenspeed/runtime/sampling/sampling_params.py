@@ -110,8 +110,8 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
         else:
             self.stop_token_ids = None
 
-        # Process some special cases
-        if self.temperature < _SAMPLING_EPS:
+        # A near-zero temperature means greedy; verify() rejects a negative one.
+        if 0.0 <= self.temperature < _SAMPLING_EPS:
             self.temperature = 1.0
             self.top_k = 1
         if self.top_k == 1:
@@ -196,6 +196,16 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
         ]  # since mutually exclusive, only one can be set
         if sum(x is not None for x in grammars) > 1:
             raise ValueError("Only one of regex, json_schema, or ebnf can be set.")
+
+    @property
+    def has_grammar(self) -> bool:
+        """Whether the request carries a structured-output constraint."""
+        return (
+            self.json_schema is not None
+            or self.regex is not None
+            or self.ebnf is not None
+            or self.structural_tag is not None
+        )
 
     def requested_features(self) -> "set[str]":
         """Return the set of backend-facing feature names this request needs.

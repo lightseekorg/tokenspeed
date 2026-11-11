@@ -28,6 +28,7 @@ from tokenspeed_kernel.ops.attention.gdn import (
     gdn_chunk_prefill_capturable,
     gdn_chunk_prefill_stores_state_checkpoints,
     gdn_decode_supports,
+    gdn_tree_verify_needs_node_states,
 )
 from tokenspeed_kernel.ops.attention.gdn.triton import pack_gdn_projection
 
@@ -52,71 +53,132 @@ class GdnAttnBackend(CapacityPrefillBackend):
     The shared base already runs GDN; this class only admits capacity-shaped
     prefills, which needs a chunk-prefill kernel that reads its sequence bounds
     on device (see ``gdn_chunk_prefill_capturable``).
+
+    Args:
+        config: The model's attention configuration.
+        spec: The softmax component of ``config``.
+        writes_state_checkpoints_in_forward: Whether the scheduler may give
+            extend rows in-forward State checkpoints
+            (``--enable-state-checkpoint-in-forward``). Captured scans then
+            store them through fixed checkpoint slots, so such forwards run
+            inline too.
     """
 
     # The scan reads its bounds on device, so packing would only add work to eager forwards.
     _capacity_layout_when_uncaptured = False
     _verify_scan_writes_replay = True
-    _verify_scan_runs_chain_form = True
 
-    def __init__(self, config: AttnConfig, spec: SoftmaxAttnConfig) -> None:
+    def __init__(
+        self,
+        config: AttnConfig,
+        spec: SoftmaxAttnConfig,
+        *,
+        writes_state_checkpoints_in_forward: bool,
+    ) -> None:
         super().__init__(config, spec)
         linear_attn = config.component(LinearAttnConfig)
-        scan_geometry = {
+        self._scan_geometry: dict[str, int | bool] = {
             "head_dim": linear_attn.head_k_dim,
             "value_head_dim": linear_attn.head_v_dim,
             "num_q_heads": linear_attn.num_k_heads // linear_attn.tp_size,
             "num_v_heads": linear_attn.num_v_heads // linear_attn.tp_size,
             "qk_l2norm": True,
         }
+        # A captured scan of a server writing in-forward checkpoints stores
+        # them, so the kernel that does must read its bounds on device too.
         self._prefill_capturable = gdn_chunk_prefill_capturable(
-            config.dtype, **scan_geometry
+            config.dtype,
+            **self._scan_geometry,
+            state_checkpoints=writes_state_checkpoints_in_forward,
         )
-        # In-forward checkpoints sit at prefix-page multiples of a chunk start,
-        # so the scan must store at that granularity.
-        self._stores_in_forward_state_checkpoints = (
-            gdn_chunk_prefill_stores_state_checkpoints(
-                config.dtype,
-                **scan_geometry,
-                interval_granularity=config.prefix_granularity,
-            )
-        )
+        self._writes_state_checkpoints_in_forward = writes_state_checkpoints_in_forward
 
         self._head_k_dim = linear_attn.head_k_dim
         self._head_v_dim = linear_attn.head_v_dim
-        # Resolved when a pool binds (its state dtype picks the verify kernel).
+        # Resolved when a pool binds: the pool's prefix granularity spaces the
+        # in-forward checkpoints (and so the interval a captured scan stores
+        # them at), and its state dtype picks the verify kernel.
+        self._stores_in_forward_state_checkpoints = False
+        self._state_checkpoint_interval: int | None = None
         self._verify_reads_committed_recurrent_state = False
         self._verify_packed_qkv_views = False
         self._decode_packed_qkv_views = False
 
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:
         super()._publish_cache_pool(cache_pool)
+        # In-forward checkpoints sit at prefix-page multiples of a chunk start,
+        # so the scan must store at that granularity.
+        contract = cache_pool.arena.runtime_contract
+        self._stores_in_forward_state_checkpoints = (
+            gdn_chunk_prefill_stores_state_checkpoints(
+                self.dtype,
+                **self._scan_geometry,
+                interval_granularity=contract.prefix_granularity,
+            )
+        )
+        # Every checkpoint offset is a multiple of that granularity, so a
+        # captured scan storing a state at each prefix page covers whichever
+        # checkpoints a forward carries.
+        self._state_checkpoint_interval = (
+            contract.prefix_granularity
+            if self._writes_state_checkpoints_in_forward
+            and self._stores_in_forward_state_checkpoints
+            else None
+        )
         # Where the verify kernel takes a separate destination pool, verify
         # reads the committed state in place instead of seeding the scratch
         # with a copy of it. Where a decode or verify kernel takes strided
         # q/k/v (and a/b), it reads the projection views as handed over
         # instead of a packed copy.
         ssm_dtype = self._state_components(self._state_layer_ids()[0])[1].dtype
+        decode_traits = {
+            "head_dim": self._head_k_dim,
+            "value_head_dim": self._head_v_dim,
+        }
+        verify_traits = {
+            **decode_traits,
+            "verify_tokens": self.speculative_num_draft_tokens,
+            "tree": self.draft_tree,
+            "output_only": self.replay_ssm
+            and not (
+                self.draft_tree
+                and gdn_tree_verify_needs_node_states(self.speculative_num_draft_tokens)
+            ),
+        }
 
-        def supports(op: str, trait: str) -> bool:
-            return gdn_decode_supports(
-                op,
+        self._verify_reads_committed_recurrent_state = (
+            not self.replay_ssm
+            and gdn_decode_supports(
+                "gdn_decode_mtp",
                 self.dtype,
-                head_dim=self._head_k_dim,
-                value_head_dim=self._head_v_dim,
                 state_dtype=ssm_dtype,
-                trait=trait,
+                trait="separate_output_state",
+                traits=verify_traits,
                 solution=None,
             )
-
-        self._verify_reads_committed_recurrent_state = not self.replay_ssm and supports(
-            "gdn_decode_mtp", "separate_output_state"
         )
-        self._verify_packed_qkv_views = supports("gdn_decode_mtp", "strided_qkv")
-        self._decode_packed_qkv_views = supports("gdn_decode_step", "strided_qkv")
+        self._verify_packed_qkv_views = gdn_decode_supports(
+            "gdn_decode_mtp",
+            self.dtype,
+            state_dtype=ssm_dtype,
+            trait="strided_qkv",
+            traits=verify_traits,
+            solution=None,
+        )
+        self._decode_packed_qkv_views = gdn_decode_supports(
+            "gdn_decode_step",
+            self.dtype,
+            state_dtype=ssm_dtype,
+            trait="strided_qkv",
+            traits=decode_traits,
+            solution=None,
+        )
 
     def _admits_capacity_prefill(self) -> bool:
         return self._prefill_capturable
+
+    def _capacity_checkpoint_interval(self) -> int | None:
+        return self._state_checkpoint_interval
 
     def _pack_projection(
         self,

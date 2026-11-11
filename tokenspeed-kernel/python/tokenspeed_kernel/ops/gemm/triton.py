@@ -144,80 +144,6 @@ register_kernel(
 )(triton_bmm_fp8_blockscale)
 
 
-_TRITON_GROUPED_OUTPUT_SIGNATURES = frozenset(
-    format_signature(
-        attention=dense_tensor_format(input_dtype),
-        weight=dense_tensor_format(_fp8_dtype),
-    )
-    for input_dtype in (torch.float16, torch.bfloat16)
-)
-
-
-@register_kernel(
-    "gemm",
-    "dsv4_grouped_output_projection",
-    name="triton_dsv4_grouped_output_projection",
-    solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
-    signatures=_TRITON_GROUPED_OUTPUT_SIGNATURES,
-    traits={},
-    priority=Priority.PERFORMANT + 3,
-)
-def triton_dsv4_grouped_output_projection(
-    *,
-    attention: torch.Tensor,
-    positions: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    num_groups: int,
-    heads_per_group: int,
-    output_dim: int,
-    nope_dim: int,
-    rope_dim: int,
-    block_size: tuple[int, int],
-) -> torch.Tensor:
-    """Run V4's grouped output projection with canonical scales and Triton BMM."""
-    from tokenspeed_kernel.ops.attention.dsv4.triton import (
-        dsv4_fused_inv_rope_fp8_quant,
-    )
-
-    values, scales = dsv4_fused_inv_rope_fp8_quant(
-        attention,
-        positions,
-        cos_sin_cache,
-        n_groups=num_groups,
-        heads_per_group=heads_per_group,
-        nope_dim=nope_dim,
-        rope_dim=rope_dim,
-        quant_group_size=block_size[1],
-        tma_aligned_scales=False,
-    )
-    input_dim = heads_per_group * attention.shape[-1]
-    grouped_weight = weight.view(num_groups, output_dim, input_dim)
-    block_n, block_k = block_size
-    grouped_scales = weight_scale.view(
-        num_groups,
-        output_dim // block_n,
-        input_dim // block_k,
-    )
-    output = torch.empty(
-        (attention.shape[0], num_groups, output_dim),
-        dtype=torch.bfloat16,
-        device=attention.device,
-    )
-    triton_bmm_fp8_blockscale(
-        values.transpose(0, 1),
-        grouped_weight,
-        scales.transpose(0, 1),
-        grouped_scales,
-        output.dtype,
-        block_size=list(block_size),
-        out=output.transpose(0, 1),
-    )
-    return output
-
-
 # ===-----------------------------------------------------------------------===#
 # MXFP4: Triton (AMD)
 # ===-----------------------------------------------------------------------===#
@@ -457,7 +383,7 @@ else:
 
 
 # ===-----------------------------------------------------------------------===#
-# FP32 decode GEMM: Triton BF16x3 (NVIDIA SM100)
+# FP32 decode GEMM: Triton BF16x3 (NVIDIA SM90 to SM103)
 # ===-----------------------------------------------------------------------===#
 
 
@@ -467,7 +393,7 @@ register_kernel(
     name="triton_bf16x3_gemm_fp32",
     solution="triton",
     capability=CapabilityRequirement(
-        min_arch_version=ArchVersion(10, 0),
+        min_arch_version=ArchVersion(9, 0),
         max_arch_version=ArchVersion(10, 3),
         vendors=frozenset({"nvidia"}),
     ),
@@ -486,7 +412,9 @@ register_kernel(
         # this kernel was up to 1.6x slower than the FP32 Torch product for
         # 128-row weights at most row counts up to 128, and at least 1.05x
         # faster at every point for weights of 256 rows and more. 128-row
-        # weights stay on Torch.
+        # weights stay on Torch. On H200, at Beam's 256 x 5120 router weight
+        # with a cold L2, it was 1.4x faster than the FP32 Torch product at 97
+        # rows and 2.9x to 4.0x from 256 to 16384 rows.
         "n_min": frozenset({256}),
         "n_max": frozenset({1024}),
         "k_align": frozenset({64}),
@@ -496,7 +424,13 @@ register_kernel(
         "k_max": frozenset({8192}),
         "weight_split": frozenset({True}),
     },
-    priority=Priority.SPECIALIZED,
+    # Above gluon_simt_gemm_fp32, which also takes split weights of up to 256
+    # rows from 17 to 96 rows. On GB200 (N 256, CUDA graphs of 49 calls over
+    # cold weights) this kernel was 1.3x to 3.2x faster at every row count for
+    # K from 5120 to 8192 and from 32 rows for K 3072 and 4096; the CUDA-core
+    # kernel was up to 1.5x faster below 32 rows there and below 48 rows at K
+    # 2048. Beam's router (K 5120) is the only caller that keeps a split.
+    priority=Priority.SPECIALIZED + 2,
     weight_preprocessor=split_fp32_weight_bf16x3,
 )(triton_bf16x3_gemm_fp32)
 
@@ -509,9 +443,9 @@ register_kernel(
 # Registry dispatch: rowcta owns BF16 M == 1 and the FP32 row-CTA kernel
 # owns narrow FP32-weight projections with M <= 16 (FP32 or BF16 activations).
 # From 17 rows, BF16 activations against an FP32 weight take
-# gluon_simt_gemm_fp32 up to 96 rows and, with a weight split,
-# triton_bf16x3_gemm_fp32, where their registrations match. Torch handles
-# the shapes that no registered kernel takes.
+# triton_bf16x3_gemm_fp32 with a weight split and gluon_simt_gemm_fp32 up to
+# 96 rows without one, where their registrations match. Torch handles the
+# shapes that no registered kernel takes.
 _BF16_SIG = frozenset(
     {
         format_signature(

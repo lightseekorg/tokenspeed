@@ -26,14 +26,20 @@ from tokenspeed_kernel.numerics.torch.conv import (
     torch_block_grouped_conv,
     torch_short_conv,
 )
+from tokenspeed_kernel.ops.attention.gdn._triton.causal_conv1d_metadata import (
+    CAUSAL_CONV1D_BLOCK_M,
+    build_causal_conv1d_prefill_metadata,
+)
 from tokenspeed_kernel.ops.conv import (
     PAD_SLOT_ID,
+    causal_conv1d_fn,
     dflash2_grouped_conv,
     inkling_commit_tables,
     inkling_ring_commit,
     inkling_ring_sconv,
     seq_idx_from_cu_seqlens,
 )
+from tokenspeed_kernel.selection import kernel_override
 from utils import assert_no_triton_compile
 
 pytestmark = pytest.mark.skipif(
@@ -125,6 +131,57 @@ def _make_cu_seqlens(lens: list[int], device: str) -> torch.Tensor:
         torch.tensor(lens, dtype=torch.int64, device=device), dim=0
     ).to(torch.int32)
     return cu
+
+
+@pytest.mark.parametrize("layout", ["token_major", "projection_slice", "channel_major"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_causal_conv_prefill_token_major_output(device, layout, dtype):
+    torch.manual_seed(42)
+    lengths, channels = [3, 17], 320
+    carrier = torch.randn(sum(lengths), channels + 32, device=device, dtype=dtype)
+    x = carrier[:, 16 : 16 + channels].T
+    if layout == "token_major":
+        x = x.T.contiguous().T
+    elif layout == "channel_major":
+        x = x.contiguous()
+    weight = torch.randn(channels, W, device=device, dtype=dtype) * 0.1
+    states = torch.randn(4, channels, W - 1, device=device, dtype=dtype)
+    expected_states = states.clone()
+    boundaries = _make_cu_seqlens(lengths, device)
+    metadata = build_causal_conv1d_prefill_metadata(
+        boundaries, torch.tensor(lengths), CAUSAL_CONV1D_BLOCK_M
+    )
+    references = []
+    start = 0
+    for row, (length, slot) in enumerate(zip(lengths, (1, 3), strict=True)):
+        tokens = x[:, start : start + length].T
+        prefix = expected_states[slot].T if row else torch.zeros_like(states[slot].T)
+        references.append(
+            torch_short_conv(tokens.float(), weight.float(), prefix.float(), False)
+        )
+        expected_states[slot].copy_(tokens[-(W - 1) :].T)
+        start += length
+
+    with kernel_override(
+        "conv", "causal_conv1d_prefill", "triton_causal_conv1d_prefill"
+    ):
+        out = causal_conv1d_fn(
+            x,
+            weight,
+            None,
+            states,
+            boundaries,
+            cache_indices=torch.tensor([1, 3], device=device, dtype=torch.int32),
+            has_initial_state=torch.tensor([False, True], device=device),
+            activation=None,
+            prefill_metadata=metadata,
+        )
+    tolerance = 1e-2 if dtype == torch.bfloat16 else 1e-5
+    torch.testing.assert_close(
+        out.T, torch.cat(references).to(dtype), atol=tolerance, rtol=tolerance
+    )
+    torch.testing.assert_close(states, expected_states, atol=0, rtol=0)
+    assert out.T.is_contiguous()
 
 
 def _make_prefill_inputs(
@@ -930,6 +987,49 @@ def test_ring_commit_publishes_every_streams_accepted_window(device: str) -> Non
                 torch.ones(bs, device=device, dtype=torch.int32),
                 verify_width=k,
             )
+
+
+def test_commit_tables_do_not_synchronize_with_the_device(device: str) -> None:
+    """The Inkling backend builds the tables on its first verify round, behind
+    the step in flight: uploading them must not wait for the stream."""
+    layers, pages = 2, 4
+    ring = torch.zeros(layers, 6, R, 24, device=device, dtype=DTYPE)
+    planes = torch.zeros(pages, layers, W - 1, 8, device=device, dtype=DTYPE)
+    hidden = torch.zeros(pages, layers, W - 1, 16, device=device).to(torch.float8_e5m2)
+    streams = [
+        entry
+        for layer in range(layers)
+        for entry in (
+            (layer, 0, 0, (planes[:, layer],)),
+            (layer, 8, 1, (hidden[:, layer],)),
+        )
+    ]
+    torch.cuda.synchronize()
+    # Hold the stream behind a long kernel: an upload that waits for it
+    # returns only after the kernel finished.
+    torch.cuda._sleep(1 << 30)
+    in_flight = torch.cuda.Event()
+    in_flight.record()
+    previous_mode = torch.cuda.get_sync_debug_mode()
+    try:
+        torch.cuda.set_sync_debug_mode("error")
+        tables = inkling_commit_tables(ring, streams)
+    finally:
+        torch.cuda.set_sync_debug_mode(previous_mode)
+    assert not in_flight.query()
+    torch.cuda.synchronize()
+
+    assert [table.dtype for table in tables] == [DTYPE, torch.float8_e5m2]
+    bf16, fp8 = tables
+    assert bf16.src_offsets.tolist() == [0, ring.stride(0)]
+    assert fp8.src_offsets.tolist() == [8, ring.stride(0) + 8]
+    assert bf16.widths.tolist() == [8, 8]
+    assert fp8.groups.tolist() == [1, 1]
+    assert bf16.addresses.cpu().tolist() == [
+        planes[:, layer].data_ptr() for layer in range(layers)
+    ]
+    assert bf16.page_strides.tolist() == [planes.stride(0)] * layers
+    assert bf16.row_strides.tolist() == [planes.stride(2)] * layers
 
 
 def test_prefill_matches_decode_on_short_warm_chunks(device: str) -> None:

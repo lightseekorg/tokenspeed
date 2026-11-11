@@ -162,6 +162,42 @@ def test_gluon_dsv4_prefill_registered_widths(width: int) -> None:
     torch.testing.assert_close(actual, expected, atol=4e-3, rtol=1e-2)
 
 
+@pytest.mark.skipif(not is_cdna5(), reason="gfx1250 dense dsv4_prefill gluon")
+@pytest.mark.parametrize("requests", [1, 16])
+def test_gluon_dsv4_prefill_dspark_window(requests: int) -> None:
+    """DSpark draft attention: 5 block rows select a 128-row window plus the block.
+
+    The 64 heads include 48 zero-padded ones.
+    """
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv4.prefill import (
+        launch_gluon_dsv4_prefill_gfx1250,
+    )
+
+    torch.manual_seed(9)
+    device = torch.device("cuda:0")
+    window, block, heads, real_heads = 128, 5, 64, 16
+    width = window + block
+    tokens = requests * block
+    kv = torch.randn((requests * width, 512), dtype=torch.bfloat16, device=device)
+    rows = torch.arange(requests * width, dtype=torch.int32, device=device)
+    indices = rows.view(requests, width).repeat_interleave(block, dim=0)
+    indices[0, :7] = -1
+    indices = indices.contiguous()
+    lens = torch.full((tokens,), width, dtype=torch.int32, device=device)
+    q = torch.zeros((tokens, heads, 512), dtype=torch.bfloat16, device=device)
+    q[:, :real_heads] = torch.randn(
+        (tokens, real_heads, 512), dtype=torch.bfloat16, device=device
+    )
+    sink = torch.full((heads,), -float("inf"), dtype=torch.float32, device=device)
+    sink[:real_heads] = torch.linspace(-3, 3, real_heads, device=device)
+    scale = 512**-0.5
+    actual = dsv4.dsv4_prefill(q, kv, indices, lens, sink, scale)
+    expected = _reference(q, kv, indices, lens, sink, scale)
+    torch.testing.assert_close(actual, expected, atol=4e-3, rtol=1e-2)
+    direct = launch_gluon_dsv4_prefill_gfx1250(q, kv, indices, lens, sink, scale)
+    assert torch.equal(actual, direct)
+
+
 @pytest.mark.skipif(
     not (is_cdna4() or is_cdna5()), reason="AMD dense dsv4_prefill gluon"
 )

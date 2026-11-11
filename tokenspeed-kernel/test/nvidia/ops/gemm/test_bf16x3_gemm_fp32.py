@@ -31,7 +31,6 @@ from tokenspeed_kernel.ops.gemm import _select_mv as _select
 from tokenspeed_kernel.ops.gemm import mv, mv_weight_split
 from tokenspeed_kernel.ops.gemm._triton import bf16x3 as triton_bf16x3
 from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.registry import KernelRegistry
 from utils import (
     assert_no_triton_compile,
     int_specialization_class,
@@ -41,29 +40,11 @@ from utils import (
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
     or current_platform().vendor != "nvidia"
-    or not (10, 0) <= torch.cuda.get_device_capability() <= (10, 3),
-    reason="the BF16x3 GEMM is registered for SM100 to SM103",
+    or not (9, 0) <= torch.cuda.get_device_capability() <= (10, 3),
+    reason="the BF16x3 GEMM is registered for SM90 to SM103",
 )
 
 U = 2.0**-24
-
-
-@pytest.fixture(autouse=True)
-def _split_kernel_alone():
-    """Set aside the FP32 CUDA-core kernel registered ahead of the split kernel
-    for rows 17 to 96 of weights up to 256 rows with K a multiple of 512 up to
-    8192, so that mv() runs the split kernel over its whole
-    registration here.
-    test_decode_gemv_fp32_simt.py checks the two together."""
-    reg = KernelRegistry.get()
-    name = "gluon_simt_gemm_fp32"
-    spec, impl = reg.get_by_name(name), reg.get_impl(name)
-    assert spec is not None
-    reg._unregister(name)
-    _select.cache_clear()
-    yield
-    reg.register(spec, impl)
-    _select.cache_clear()
 
 
 def _problem(m, n, k, seed):

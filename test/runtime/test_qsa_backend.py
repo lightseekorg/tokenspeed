@@ -108,7 +108,6 @@ def _qsa_config(*, max_bs: int, is_draft: bool, device: str) -> AttnConfig:
         kv_cache_dtype=torch.bfloat16,
         kv_cache_quant_method="none",
         kv_cache_mxfp8=False,
-        prefix_granularity=64,
         kernel_page_size=64,
         context_len=1024,
         max_bs=max_bs,

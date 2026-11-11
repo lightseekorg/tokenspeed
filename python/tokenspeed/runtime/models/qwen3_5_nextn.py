@@ -139,8 +139,7 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
     ) -> None:
         nn.Module.__init__(self)
 
-        self.is_multimodal = hasattr(config, "text_config")
-        if self.is_multimodal:
+        if hasattr(config, "text_config"):
             config = config.text_config
 
         quant_config = _resolve_mtp_quant_config(quant_config)
@@ -167,7 +166,7 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
         if config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
-            if self.mapping.attn.has_dp:
+            if self.mapping.attn.has_dp and not self.mapping.lm_head.has_tp:
                 self.lm_head = ReplicatedLinear(
                     config.hidden_size,
                     config.vocab_size,
@@ -180,20 +179,23 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
                     config.vocab_size,
                     config.hidden_size,
                     quant_config=quant_config,
-                    tp_rank=self.mapping.attn.tp_rank,
-                    tp_size=self.mapping.attn.tp_size,
-                    tp_group=self.mapping.attn.tp_group,
+                    tp_rank=self.mapping.lm_head.tp_rank,
+                    tp_size=self.mapping.lm_head.tp_size,
+                    tp_group=self.mapping.lm_head.tp_group,
                     prefix=add_prefix("lm_head", prefix),
                 )
 
+        # The shared target head follows mapping.lm_head. Under attention DP
+        # its replicated vocabulary can differ from the attention TP layout.
         self.logits_processor = LogitsProcessor(
             config,
             skip_all_gather=self.mapping.attn.has_dp,
-            tp_rank=self.mapping.attn.tp_rank,
-            tp_size=self.mapping.attn.tp_size,
-            tp_group=self.mapping.attn.tp_group,
+            tp_rank=self.mapping.lm_head.tp_rank,
+            tp_size=self.mapping.lm_head.tp_size,
+            tp_group=self.mapping.lm_head.tp_group,
             do_argmax=True,
-            dp_lm_head_tp=False,
+            attn_tp_size=self.mapping.attn.tp_size,
+            dp_lm_head_tp=self.mapping.attn.has_dp and self.mapping.lm_head.has_tp,
         )
 
     def get_hot_token_id(self):
@@ -262,10 +264,11 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
                 input_embeds=hidden_states,
             )
 
-        logits_metadata = LogitsMetadata.from_forward_context(ctx)
-        return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, logits_metadata
-        )
+            # Keep the narrowed draft row counts active through the head exchange.
+            logits_metadata = LogitsMetadata.from_forward_context(ctx)
+            return self.logits_processor(
+                input_ids, hidden_states, self.lm_head, logits_metadata
+            )
 
     def checkpoint_weight_name_filter(self, name: str) -> bool:
         """Shard preselection for ``load_weights`` (see DefaultModelLoader).
@@ -276,9 +279,7 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
         """
         return "mtp" in name
 
-    def load_weights(
-        self, weights: Iterable[tuple[str, torch.Tensor]], is_mtp: bool = False
-    ):
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -398,16 +399,7 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
 
 
 class Qwen3_5MoeForConditionalGenerationNextN(Qwen3_5ForConditionalGenerationNextN):
-    def __init__(
-        self,
-        config: PretrainedConfig,
-        mapping: Mapping,
-        quant_config=None,
-        prefix: str = "",
-    ) -> None:
-        super().__init__(
-            config=config, mapping=mapping, quant_config=quant_config, prefix=prefix
-        )
+    pass
 
 
 class Qwen3_5MoeForCausalLMNextN(Qwen3_5MoeForConditionalGenerationNextN):

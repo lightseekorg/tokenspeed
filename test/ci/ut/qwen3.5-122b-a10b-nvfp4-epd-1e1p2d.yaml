@@ -5,6 +5,11 @@ workflow_stage: unit-test
 triggers:
   - per-commit
   - manual
+# The model modules this task serves; pull requests changing only other models skip it.
+model_sources:
+  - python/tokenspeed/runtime/models/qwen3_5.py
+  - python/tokenspeed/runtime/models/qwen3_5_moe.py
+  - python/tokenspeed/runtime/models/qwen3_vision.py
 runner:
   labels:
     - slurm-gb200-4gpu

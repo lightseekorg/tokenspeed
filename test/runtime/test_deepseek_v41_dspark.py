@@ -99,7 +99,8 @@ def test_target_capture_is_mean_layer_input_after_engram(capture_mode):
             self.layer_id = layer_id
             self.layer_hash_index = layer_id - 37
 
-        def forward(self, hidden, hashes, mask):
+        def forward(self, hidden, hashes, mask, *, query_shard=None):
+            assert query_shard is None
             events.append(("engram", self.layer_id))
             assert hashes.tolist() == [[self.layer_hash_index] * 3] * 2
             assert mask.tolist() == [True, True]
@@ -423,6 +424,8 @@ def test_window_attention_matches_dense_reference():
         swa_rope_cache=None,
         swa_norm_weight=None,
         swa_norm_eps=0.0,
+        fused_decode_groups=None,
+        key_rows=None,
     )
     decoded = _quantized_kv(current).reshape(batch, block, dim)
     expected = torch.empty_like(q).reshape(batch, block, heads, dim)
@@ -500,6 +503,8 @@ def test_window_attention_kernel_matches_reference():
         swa_rope_cache=rotary.cos_sin_cache,
         swa_norm_weight=None,
         swa_norm_eps=config.rms_norm_eps,
+        fused_decode_groups=None,
+        key_rows=None,
     )
     actual = backend.forward_v41(q, swa, **kwargs)
     kv = backend._workspace(
@@ -940,9 +945,9 @@ def test_checkpoint_model_config_and_no_draft_paged_attention(
         _speculative_widths_explicit=False,
         attention_backend=None,
         drafter_attention_backend=None,
-        prefix_granularity=64,
         load_format="auto",
         disaggregation_mode="null",
+        decode_monokernel=False,
         validate_tp_batch_invariant_weights=Mock(),
     )
     configs = [
@@ -1081,6 +1086,45 @@ class TestDSparkBaseLogits:
         graph.replay()
         torch.cuda.synchronize()
         assert torch.equal(logits, hidden.float() @ head.float().T)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    @pytest.mark.parametrize("batch", [1, 16])
+    def test_dspark_base_logits_accumulate_fp32_on_the_tp4_vocab_shard(self, batch):
+        # V4.1 Flash: 5120 hidden, a 129280 / 4 vocabulary shard, block 5.
+        model = object.__new__(DeepseekV41DSparkModel)
+        generator = torch.Generator(device="cuda").manual_seed(batch)
+
+        def draw_hidden():
+            return torch.randn(
+                batch, 5, 5120, device="cuda", generator=generator
+            ).bfloat16()
+
+        hidden = draw_hidden()
+        head = (
+            torch.randn(32320, 5120, device="cuda", generator=generator) * 0.02
+        ).bfloat16()
+
+        def assert_fp32_head_math(logits):
+            assert logits.dtype == torch.float32
+            assert logits.shape == (batch, 5, 32320)
+            # Exact BF16 products summed in FP32 differ from FP64 only by
+            # summation order; one BF16 rounding of the logits (2**-9
+            # relative, logits near 1) would exceed this.
+            torch.testing.assert_close(
+                logits.double(),
+                hidden.double() @ head.double().T,
+                atol=1e-4,
+                rtol=1e-4,
+            )
+
+        assert_fp32_head_math(model.local_base_logits(hidden, head))
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            logits = model.local_base_logits(hidden, head)
+        hidden.copy_(draw_hidden())
+        graph.replay()
+        torch.cuda.synchronize()
+        assert_fp32_head_math(logits)
 
 
 @pytest.mark.parametrize("rank", [0, 1])

@@ -69,6 +69,7 @@ from tokenspeed.runtime.layers.ple_lookup import (
 )
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.utils import add_prefix, get_colorful_logger
+from tokenspeed.runtime.utils.host_sync import host_to_device
 
 logger = get_colorful_logger(__name__)
 
@@ -107,6 +108,29 @@ def _nth_prime_after(start: int, count: int) -> int:
     return candidate
 
 
+def _ngram_table_storage_dtype(
+    ple_embed_dtype: str | None,
+    quant_config: QuantizationConfig | None,
+    table_prefix: str,
+) -> torch.dtype | None:
+    """Storage dtype of the n-gram table; ``None`` stores the compute dtype.
+
+    Without an explicit ``ple_embed_dtype`` the table keeps the checkpoint's
+    format: an FP8 table is copied as stored and its per-tensor scale applied
+    at lookup, which reads the same values as dequantizing it at load.
+    """
+    if ple_embed_dtype is None:
+        if quant_config is not None and quant_config.stores_fp8_embedding(table_prefix):
+            return torch.float8_e4m3fn
+        return None
+    if ple_embed_dtype != "float8_e4m3fn":
+        raise ValueError(
+            "Qwen4-Exp ple_embed_dtype supports only 'float8_e4m3fn', "
+            f"got {ple_embed_dtype!r}"
+        )
+    return torch.float8_e4m3fn
+
+
 class Qwen4ExpNGramEmbedding(nn.Module):
     """Hashed, independently-sharded n-gram embedding used by PLE."""
 
@@ -122,6 +146,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         mapping: Mapping,
         embedding_dim: int,
         ple_layer_index: int,
+        quant_config: QuantizationConfig | None,
         prefix: str,
     ) -> None:
         super().__init__()
@@ -183,22 +208,19 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         )
         divisible_by = int(config.make_ngram_vocab_size_divisible_by)
         padded_vocab = (total + divisible_by - 1) // divisible_by * divisible_by
-        ple_embed_dtype = getattr(config, "ple_embed_dtype", None)
-        if ple_embed_dtype not in (None, "float8_e4m3fn"):
-            raise ValueError(
-                "Qwen4-Exp ple_embed_dtype supports only 'float8_e4m3fn', "
-                f"got {ple_embed_dtype!r}"
-            )
+        table_prefix = add_prefix("ngram_embedding", prefix)
         offload_embedding = config.ple_offload_embedding
         self.lookup = PLELookup(
             mapping,
             vocab_size=padded_vocab,
             ngram_heads=self.ngram_heads,
             head_dim=self.head_dim,
-            storage_dtype=torch.float8_e4m3fn if ple_embed_dtype else None,
+            storage_dtype=_ngram_table_storage_dtype(
+                config.ple_embed_dtype, quant_config, table_prefix
+            ),
             output_dtype=torch.get_default_dtype(),
             offload=offload_embedding,
-            prefix=add_prefix("ngram_embedding", prefix),
+            prefix=table_prefix,
         )
         if self.ple_layer_index == 0 and offload_embedding:
             weight = self.lookup.ngram_embedding.weight
@@ -385,6 +407,7 @@ class Qwen4ExpPLELayer(nn.Module):
             mapping,
             int(config.ple_embed_dim),
             ple_layer_index,
+            quant_config,
             add_prefix("ple_embedding", prefix),
         )
         # key_proj and value_proj consume the same embeddings; fuse them into
@@ -607,7 +630,7 @@ class Qwen4ExpPLELayer(nn.Module):
             req, col, lengths_t, starts = bundle
         else:
             positions = torch.arange(total, device=device, dtype=torch.long)
-            lengths_t = torch.tensor(lengths, device=device, dtype=torch.long)
+            lengths_t = host_to_device(lengths, dtype=torch.long, device=device)
             ends = torch.cumsum(lengths_t, dim=0)
             starts = ends - lengths_t
             req = torch.searchsorted(ends.contiguous(), positions, right=True)
@@ -1000,6 +1023,82 @@ class Qwen4ExpPLELayer(nn.Module):
         layout = embedding.lookup.make_layout(ctx.global_num_tokens, ids.shape[0])
         pending = embedding.lookup.start(ids, layout)
         self._prefetched = (plan, pending, final_context, context_tail)
+
+    def fused_operands(
+        self, ctx: ForwardContext, verify_out: torch.Tensor | None
+    ) -> dict[str, torch.Tensor]:
+        """What a fused kernel needs to run this block's step itself: its
+        state operands by name (the monokernel's ``PleStep`` fields but the
+        tokens).
+
+        ``context`` ``[pages, context_len]`` int64 and ``conv_state``
+        ``[pages, hc_count * hidden, conv_state_len]`` are the pools as
+        page-indexed views of the cache arena; ``page_in`` holds each
+        request's input page. The kernel does the lookup, the gate and the
+        conv, and writes the state after each row's token to row ``page_out`` of
+        ``context_out`` and ``conv_out``: in decode the pools and the output
+        pages (as a :meth:`start_prefetch` plus :meth:`forward` pair would);
+        in a target verify (``T`` tokens per request, request-major rows)
+        the verify scratch, row ``r * (T + 1) + 1 + t`` for token ``t`` of
+        request ``r``, as the regular verify does, and the post-verify
+        commit then copies the accepted row to the pages.
+
+        Args:
+            ctx: The forward's context.
+            verify_out: In a target verify, int32 ``[bs * T]`` holding
+                ``r * (T + 1) + 1 + t`` (the caller keeps it as a constant);
+                None in decode.
+        """
+        backend = self._ple_backend(ctx)
+        metadata = self._metadata(backend)
+        pool = ctx.token_to_kv_pool
+        load_tracker = getattr(pool, "layerwise_load_tracker", None)
+        if load_tracker is not None:
+            load_tracker.wait_for_layer(self.layer_id)
+        context_field = pool.arena.field(self.context_field_id)
+        conv_field = pool.arena.field(qwen4_exp_ple_conv_field(self.layer_id))
+        context = context_field.as_strided(
+            (context_field.shape[0], self.context_len),
+            (self._page_row_stride(context_field), 1),
+        )
+        conv = conv_field.as_strided(
+            (conv_field.shape[0], self.hc_hidden_size, self.conv_state_len),
+            (self._page_row_stride(conv_field), self.conv_state_len, 1),
+        )
+        bs = ctx.bs
+        chain = metadata.verify_width
+        if chain is None:
+            return {
+                "context": context,
+                "conv_state": conv,
+                "page_in": metadata.input_blocks[:bs],
+                "page_out": metadata.output_blocks[:bs],
+                "context_out": context,
+                "conv_out": conv,
+            }
+        context_scratch, conv_scratch = backend.ple_verify_scratch(
+            self.context_field_id, self.layer_id, bs
+        )
+        if verify_out is None or verify_out.numel() != bs * chain:
+            raise ValueError(
+                "a PLE verify needs its rows' scratch pages (verify_out) for "
+                f"{bs} requests of {chain} tokens"
+            )
+        return {
+            "context": context,
+            "conv_state": conv,
+            # The launch reads each request's input page for its rows.
+            "page_in": metadata.input_blocks[:bs],
+            "page_out": verify_out,
+            "context_out": context_scratch.as_strided(
+                (context_scratch.shape[0], self.context_len),
+                (context_scratch.stride(0), 1),
+            ),
+            "conv_out": conv_scratch.as_strided(
+                (conv_scratch.shape[0], self.hc_hidden_size, self.conv_state_len),
+                (conv_scratch.stride(0), self.conv_state_len, 1),
+            ),
+        }
 
     @break_point
     def forward(

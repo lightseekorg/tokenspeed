@@ -98,6 +98,8 @@ wire_struct! {
         pub validation_error: Option<String> = None,
         /// Pin to an attention-DP rank.
         pub data_parallel_rank: Option<i64> = None,
+        /// Router-only cache retention identity; does not enable continual prompting.
+        pub cache_session_id: Option<String> = None,
     }
 }
 
@@ -129,6 +131,7 @@ impl TokenizedGenerateReqInput {
             multimodal_inputs: None,
             validation_error: None,
             data_parallel_rank: None,
+            cache_session_id: None,
         }
     }
 }

@@ -36,7 +36,6 @@ from tokenspeed.runtime.layers.attention.backends.paged.ascend_mla import (
     AscendMLABackend,
     ascend_mla_prefill_backend,
 )
-from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm
 from tokenspeed.runtime.models.kimi_k3 import KimiLinearMLAAttention
 
@@ -58,7 +57,7 @@ class AscendMLAAttention(KimiLinearMLAAttention):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.fused_decode: FusedMLADecode | None = None
-        self.optimized_prefill = (
+        self.prefill_supported = (
             not self.use_output_gate
             and self.rotary_emb is None
             and self.q_lora_rank is not None
@@ -154,8 +153,9 @@ class AscendMLAAttention(KimiLinearMLAAttention):
         else:
             qnorm = hidden.new_empty((0, self.q_lora_rank))
             latent = hidden.new_empty((0, self.kv_lora_rank + self.qk_rope_head_dim))
-        # Only the normalized Q latent uses the ordinary TP gather. Current
-        # KV gathers directly into its final receive plane on the AICPU stream.
+        # Retain Q-latent gathering and local-head projections. KV uses the
+        # same execution stream with early history gathering when available.
+        backend.prefetch_prefill_layer(self.layer_id)
         backend.start_prefill_kv(self.layer_id, latent)
         qnorm = comm_manager.pre_attn_comm(qnorm, ctx)
         query = self.q_b_proj(qnorm)[0].view(-1, self.num_local_heads, self.qk_head_dim)
@@ -184,15 +184,13 @@ class AscendMLAAttention(KimiLinearMLAAttention):
                 )
             )
         backend.finish_prefill_layer(self.layer_id)
-        # This is the ordinary local-head partial. CommManager owns the same
-        # output ReduceScatter as before; no complete weight copies are needed.
         return self.o_proj(attended.flatten(1))[0]
 
     def forward(self, positions, hidden_states, ctx, comm_manager, *, projection_out):
         if (
             ctx.forward_mode.is_extend_or_mixed()
-            and self.optimized_prefill
-            and ascend_mla_prefill_backend(ctx.attn_backend).native_prefill_enabled
+            and self.prefill_supported
+            and ascend_mla_prefill_backend(ctx.attn_backend).prefill_enabled
         ):
             if projection_out is not None:
                 raise ValueError("MLA Prefill output reduction belongs to CommManager")
@@ -283,12 +281,7 @@ class FusedMLADecode:
         rows = hidden.shape[0]
         query, qnorm, latent, nope_positions = self.outputs[rows]
         locations = ctx.attn_backend.write_locations(layer.attn_mqa, ctx.forward_mode)
-        slots, owned = resolve_cache_slots(
-            locations, backend.cache_placement(layer.attn_mqa)
-        )
-        if owned is not None:
-            slots = torch.where(owned, slots, -1)
-        slots = slots.to(dtype=torch.int64).contiguous()
+        slots = backend.prepare_prolog_metadata(locations)
         cache = ctx.token_to_kv_pool.get_key_buffer(layer.layer_id).view(-1, 576)
         if self.weights["rotary_mode"]:
             positions = positions.to(dtype=torch.int64).contiguous()
@@ -323,21 +316,15 @@ class FusedMLADecode:
             out=self.attention_outputs[rows][0],
             lse=self.attention_outputs[rows][1],
         )
-        empty = visible.flatten()[:, None] == 0
-        partial = partial.masked_fill(empty[..., None], 0)
-        lse = lse.masked_fill(empty, -torch.inf)
-        metadata = backend.forward_decode_metadata
-        active = metadata.page_table[metadata.num_extends :].ne(0).any(-1)
-        active = active.repeat_interleave(metadata.q_len_per_req)
-        lse = torch.where(active[:, None], lse, 0)
         producer, maximum, total = self.owner.outputs[rows]
-        producer.copy_(partial.transpose(0, 1))
-        maximum.copy_(lse[None])
         result = self.merge(
-            producer,
+            partial,
+            lse=lse,
+            visible=visible,
+            active=backend._current_active,
+            producer=producer,
             maximum=maximum,
             total=total,
-            peers=self.owner.tables[rows],
             group=self.owner.group,
         )
         output = torch.empty(
@@ -345,9 +332,10 @@ class FusedMLADecode:
             dtype=hidden.dtype,
             device=hidden.device,
         )
-        layer.project_attended_heads(
-            result.transpose(0, 1).contiguous(), ctx, output, gate=None
-        )
+        attended = result.transpose(0, 1)
+        if layer.head_tp_exchanges(ctx):
+            attended = attended.contiguous()
+        layer.project_attended_heads(attended, ctx, output, gate=None)
         return layer.o_proj(output)[0]
 
 
@@ -381,7 +369,6 @@ class AscendMLARuntime:
         )
         self.window = self.resources.window
         self.outputs = self.resources.outputs
-        self.tables = self.resources.tables
         torch.npu.synchronize()
         dist.barrier(group=cpu_group)
         self.runtimes = []
@@ -410,6 +397,5 @@ class AscendMLARuntime:
         self.resources = None
         self.window = None
         self.outputs.clear()
-        self.tables.clear()
         self.runtimes.clear()
         self.closed = True

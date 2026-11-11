@@ -158,6 +158,7 @@ def test_snapshot_pool_is_stated_explicitly():
     cfg.num_snapshot_pages = 9
     cfg.max_retracted_requests = 2
     cfg.debug_force_retraction_interval = 0
+    cfg.host_group_packing = [1]
     scheduler = ts.Scheduler(cfg)
     assert scheduler.snapshot_pool_free_blocks() == 8
     assert scheduler.retracted_size() == 0
@@ -190,6 +191,7 @@ def test_host_write_policy_round_trips():
             transfer_policy=ts.CacheTransferPolicy.FullSuffix,
         )
     ]
+    cfg.host_group_packing = [1]
     # Unset: what feeds Host L2 is a behavioural choice, not a default.
     assert cfg.host_write_policy == policy.Unspecified
     with pytest.raises(ValueError, match="explicit host_write_policy"):
@@ -235,6 +237,7 @@ def test_an_eviction_store_is_stream_ordered_and_published_at_its_ack():
             transfer_policy=ts.CacheTransferPolicy.FullSuffix,
         )
     ]
+    cfg.host_group_packing = [1]
     scheduler = ts.Scheduler(cfg)
 
     def prefill_and_hand_off(rid, tokens):
@@ -283,10 +286,11 @@ def test_an_eviction_store_is_stream_ordered_and_published_at_its_ack():
 def test_device_evictions_count_a_requests_own_reclaim_apart():
     """K3 shape on twelve Device parents, a block each, a page per chunk. a
     publishes two pages and its checkpoint at 4 (five parents); b resumes
-    there, its first chunk takes four parents more. b's second chunk rotates
-    a's checkpoint out of slot 0 and needs four parents with three free: its
-    own released checkpoint funds the fourth, counted as the request's
-    reclaim, not as an admission's victim."""
+    there, its first chunk takes four parents more. b's second chunk, its
+    prompt's last token, rotates a's checkpoint out of slot 0 and needs five
+    parents -- its page, a State slot per group and the copy-in block of its
+    prompt end at 7 -- with three free: its own released checkpoint funds the
+    rest, counted as the request's reclaim, not as an admission's victim."""
     cfg = _make_k3_config()
     cfg.num_device_pages = 13  # page 0 = null sentinel, 12 usable parents
     cfg.max_scheduled_tokens = PAGE
@@ -294,7 +298,7 @@ def test_device_evictions_count_a_requests_own_reclaim_apart():
         group.total_pages = cfg.num_device_pages
     scheduler = ts.Scheduler(cfg)
     a = list(range(1, 2 * PAGE + 1))
-    for rid, tokens in (("a", a), ("b", a + list(range(50, 50 + 2 * PAGE)))):
+    for rid, tokens in (("a", a), ("b", a + list(range(50, 50 + 2 * PAGE - 1)))):
         spec = _spec(rid, tokens)
         spec.max_new_tokens = 1
         scheduler.submit_requests([spec])
@@ -311,6 +315,7 @@ def test_device_evictions_count_a_requests_own_reclaim_apart():
     evictions = stats.device_evictions
     # Each State group's released checkpoint at 4.
     assert evictions.request_reclaim.blocks == 3
+    assert evictions.request_reclaim_for_write_back == 0  # No Host write-back policy.
     assert evictions.admission.blocks == 0
     assert evictions.stranded_suffix.blocks == 0
 
@@ -325,6 +330,9 @@ def test_host_cache_stats_count_publication_and_finish_stores():
     history = cfg.cache_groups[0]
     history.cache_blocks_per_lcm_block = 2
     history.total_pages = 2 * 32 + 1
+    cfg.host_group_packing = [
+        group.cache_blocks_per_lcm_block for group in cfg.cache_groups
+    ]
     scheduler = ts.Scheduler(cfg)
     num_groups = len(K3_GROUP_IDS)
 
@@ -344,6 +352,7 @@ def test_host_cache_stats_count_publication_and_finish_stores():
         == fresh.eviction_stores.recopied
         == fresh.eviction_stores.cancelled
         == fresh.dead_entries_not_written_back
+        == fresh.demoted_entries_not_written_back
         == 0
     )
     assert (
@@ -451,6 +460,7 @@ def test_host_cache_stats_count_eviction_write_backs():
             transfer_policy=ts.CacheTransferPolicy.FullSuffix,
         )
     ]
+    cfg.host_group_packing = [1]
     scheduler = ts.Scheduler(cfg)
     stores = []
     for rid, tokens in (

@@ -30,6 +30,7 @@ namespace tokenspeed {
 
 struct RequestSpec {
     std::string request_id;
+    std::string session_id;
     std::vector<std::int32_t> tokens;
     std::int32_t max_new_tokens{0};
     // Upper bound on the prompt prefix the first admission's probe may claim

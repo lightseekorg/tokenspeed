@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 from tokenspeed.runtime.engine.scheduler_utils import scheduler_cache_geometry_from_pool
 
 
@@ -30,6 +32,37 @@ def test_lcm_scheduler_geometry_counts_parents_not_child_pages():
     assert geometry.token_capacity == 37 * 8 * 128
 
 
+@pytest.mark.parametrize("capacity", [37 * 8 * 128, 10_000])
+def test_packed_pool_reports_effective_capacity_in_token_gauges(capacity):
+    from prometheus_client import CollectorRegistry
+
+    from tokenspeed.runtime.metrics.collector import EngineMetrics
+
+    geometry = scheduler_cache_geometry_from_pool(
+        _pool(num_lcm_blocks=37, prefix_granularity=128, token_capacity=capacity)
+    )
+    registry = CollectorRegistry()
+    labels = {"model_name": "packed", "app_key": "", "dp_rank": "0"}
+    metrics = EngineMetrics(
+        labels, enabled=True, reporters=["prometheus"], registry=registry
+    )
+    for used, active in [(0, 0), (17, 11), (37, 37)]:
+        metrics.record_cache_occupancy(
+            used_pages=used,
+            active_pages=active,
+            total_pages=geometry.num_usable_pages,
+            token_capacity=geometry.token_capacity,
+        )
+        assert (
+            registry.get_sample_value("tokenspeed:num_used_tokens", labels)
+            == used * capacity // 37
+        )
+        assert (
+            registry.get_sample_value("tokenspeed:num_free_tokens", labels)
+            == (37 - active) * capacity // 37
+        )
+
+
 def test_lcm_scheduler_geometry_uses_contract_token_capacity():
     # Capacity comes from the contract, never re-derived from parents times a
     # packing guess.
@@ -39,3 +72,49 @@ def test_lcm_scheduler_geometry_uses_contract_token_capacity():
 
     assert geometry.num_usable_pages == 37
     assert geometry.token_capacity == 10_000
+
+
+@pytest.mark.parametrize("grain", [None, 4096])
+def test_state_checkpoint_granularity_survives_the_scheduler_bridge(grain):
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.scheduler_bridge import (
+        cache_group_config,
+    )
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import CacheGroupSpec
+
+    spec = CacheGroupSpec(
+        group_id="state",
+        attn_kind="state",
+        replayable=False,
+        checkpoint_granularity=grain,
+    )
+    config = cache_group_config(spec, total_pages=257, cache_blocks_per_lcm_block=1)
+    config.validate()
+    assert config.checkpoint_granularity == (grain or 1)
+    assert config.block_granularity == 0
+
+
+@pytest.mark.parametrize("grain", [0, -1, True, 1.5])
+def test_invalid_state_checkpoint_grain_is_rejected(grain):
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import CacheGroupSpec
+
+    with pytest.raises(ValueError, match="checkpoint_granularity"):
+        CacheGroupSpec(
+            group_id="state",
+            attn_kind="state",
+            replayable=False,
+            checkpoint_granularity=grain,
+        )
+
+
+def test_history_groups_do_not_accept_a_state_checkpoint_grain():
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import CacheGroupSpec
+
+    with pytest.raises(ValueError, match="checkpoint_granularity"):
+        CacheGroupSpec(
+            group_id="kv",
+            attn_kind="full_history",
+            replayable=False,
+            rows_per_page=128,
+            entry_stride_tokens=1,
+            checkpoint_granularity=4096,
+        )

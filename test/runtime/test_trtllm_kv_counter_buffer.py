@@ -51,7 +51,6 @@ def _backend(device: str = "cpu") -> trtllm.TRTLLMMHAAttnBackend:
         device=device,
         dtype=torch.bfloat16,
         kv_cache_dtype=torch.bfloat16,
-        prefix_granularity=PAGE,
         kernel_page_size=PAGE,
         context_len=4096,
         max_bs=MAX_BS,

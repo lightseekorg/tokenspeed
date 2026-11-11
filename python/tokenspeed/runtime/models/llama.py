@@ -27,9 +27,6 @@ variants have their own modules (``longcat_large.py``, ``llama_eagle3.py``).
 
 from __future__ import annotations
 
-from collections.abc import Iterable
-from typing import Any
-
 import torch
 from torch import nn
 from transformers import LlamaConfig
@@ -37,16 +34,11 @@ from transformers import LlamaConfig
 from tokenspeed.runtime.configs.utils import get_rope_theta
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
-from tokenspeed.runtime.layers.activation import SiluAndMul
-from tokenspeed.runtime.layers.linear import (
-    MergedColumnParallelLinear,
-    QKVParallelLinear,
-    RowParallelLinear,
-)
+from tokenspeed.runtime.layers.linear import QKVParallelLinear, RowParallelLinear
+from tokenspeed.runtime.layers.mlp import GatedMLP, gated_activation
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
-from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.base import (
     BaseCausalLM,
     BaseDecoderLayer,
@@ -56,58 +48,6 @@ from tokenspeed.runtime.models.utils import (
     validate_attention_partition,
 )
 from tokenspeed.runtime.utils import add_prefix
-
-
-class LlamaMLP(nn.Module):
-
-    def __init__(
-        self,
-        hidden_size: int,
-        intermediate_size: int,
-        hidden_act: str,
-        mapping: Mapping,
-        quant_config: QuantizationConfig | None = None,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        tp_rank = mapping.dense.tp_rank
-        tp_size = mapping.dense.tp_size
-        tp_group = mapping.dense.tp_group
-
-        self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size,
-            [intermediate_size] * 2,
-            bias=False,
-            quant_config=quant_config,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
-            tp_group=tp_group,
-            prefix=add_prefix("gate_up_proj", prefix),
-        )
-        self.down_proj = RowParallelLinear(
-            intermediate_size,
-            hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            reduce_results=False,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
-            tp_group=tp_group,
-            prefix=add_prefix("down_proj", prefix),
-        )
-        if hidden_act != "silu":
-            raise ValueError(
-                f"Unsupported activation: {hidden_act}. Only silu is supported."
-            )
-        self.act_fn = SiluAndMul()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.shape[0] == 0:
-            return x
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
-        return x
 
 
 class LlamaAttention(nn.Module):
@@ -206,7 +146,7 @@ class LlamaAttention(nn.Module):
     ) -> torch.Tensor:
         # Skip the QKV projection, RoPE, attention, and o_proj kernels when
         # the batch row is empty (e.g. idle ranks under DP attention). Matches
-        # the short-circuit ``LlamaMLP.forward`` already has.
+        # the short-circuit ``GatedMLP.forward`` already has.
         if hidden_states.shape[0] == 0:
             return hidden_states.new_zeros(
                 (0, self.hidden_size), dtype=hidden_states.dtype
@@ -245,11 +185,15 @@ class LlamaDecoderLayer(BaseDecoderLayer):
         )
 
     def resolve_mlp(self, prefix: str) -> nn.Module:
-        return LlamaMLP(
+        return GatedMLP.tensor_parallel(
             hidden_size=self.config.hidden_size,
             intermediate_size=self.config.intermediate_size,
-            hidden_act=self.config.hidden_act,
-            mapping=self.mapping,
+            activation=gated_activation(self.config.hidden_act, swiglu_limit=None),
+            tp_rank=self.mapping.dense.tp_rank,
+            tp_size=self.mapping.dense.tp_size,
+            tp_group=self.mapping.dense.tp_group,
+            reduce_results=False,
+            fusions=(),
             quant_config=self.quant_config,
             prefix=add_prefix("mlp", prefix),
         )
@@ -261,25 +205,7 @@ class LlamaModel(BaseTransformerModel):
 
 class LlamaForCausalLM(BaseCausalLM):
     model_cls = LlamaModel
-
-    # BitsAndBytes target/stacked modules — kept in sync with the Qwen3 / MoE
-    # variants so a single quantization config works across the Llama family.
-    default_bitsandbytes_target_modules = [
-        ".gate_proj.",
-        ".down_proj.",
-        ".up_proj.",
-        ".q_proj.",
-        ".k_proj.",
-        ".v_proj.",
-        ".o_proj.",
-    ]
-    bitsandbytes_stacked_params_mapping = {
-        "q_proj": ("qkv_proj", 0),
-        "k_proj": ("qkv_proj", 1),
-        "v_proj": ("qkv_proj", 2),
-        "gate_proj": ("gate_up_proj", 0),
-        "up_proj": ("gate_up_proj", 1),
-    }
+    supports_aux_capture = True
 
     def get_stacked_params_mapping(self) -> list[tuple[str, str, int | str]]:
         return [
@@ -289,50 +215,6 @@ class LlamaForCausalLM(BaseCausalLM):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
-
-    def load_weights(
-        self, weights: Iterable[tuple[str, torch.Tensor]], **kwargs: Any
-    ) -> None:
-        stacked_params_mapping = self.get_stacked_params_mapping()
-        params_dict = dict(self.named_parameters())
-        tie_word_embeddings = getattr(self.config, "tie_word_embeddings", False)
-
-        for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name:
-                continue
-            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
-                continue
-            # Llama-3.2-1B / 3B ship with tied input+output embeddings — some HF
-            # checkpoint variants still serialize lm_head.weight, skip it so we
-            # don't double-load into the shared embed_tokens parameter.
-            if tie_word_embeddings and "lm_head.weight" in name:
-                continue
-
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                if name not in params_dict:
-                    continue
-                param = params_dict[name]
-                # Fused q/k/v and gate/up parameters are built by distributed
-                # linear layers that install ``weight_loader`` during init; the
-                # ``getattr`` fallback just guards against stray non-fused
-                # parameters that happened to match the pattern (e.g. a user
-                # fork that registers a plain ``qkv_proj`` buffer).
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                if name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
 
 
 EntryClass = LlamaForCausalLM

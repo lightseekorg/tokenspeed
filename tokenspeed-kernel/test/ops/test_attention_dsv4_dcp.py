@@ -20,8 +20,8 @@
 
 """DeepSeek V4 decode context parallelism kernels.
 
-Virtual block translation, the LSE merge of per-shard attention partials, the
-sink applied once after merging, and the owner-only compressed cache stores.
+Virtual block translation, the LSE merge of per-shard attention partials, and
+the sink applied once after merging.
 """
 
 from __future__ import annotations
@@ -30,43 +30,28 @@ import pytest
 import torch
 from tokenspeed_kernel.numerics.torch.attention.dsv4 import (
     torch_dsv4_merge_partials,
-    torch_dsv4_selected_attention,
 )
 from tokenspeed_kernel.numerics.torch.kvcache import (
     torch_virtual_slots_to_local,
 )
 from tokenspeed_kernel.ops.attention.dsa._triton import candidate_exchange as exchange
 from tokenspeed_kernel.ops.attention.dsa._triton import index_candidates as candidates
-from tokenspeed_kernel.ops.attention.dsv4 import (
-    dsv4_decode,
-    dsv4_decode_supports_partials,
-)
 from tokenspeed_kernel.ops.attention.dsv4._triton import dcp
 from tokenspeed_kernel.ops.attention.dsv4._triton.dcp import (
     dcp_apply_sink,
     dcp_weight_for_reduce_scatter,
     normalize_dcp_partials,
 )
-from tokenspeed_kernel.ops.attention.dsv4.triton import (
-    dsv4_fused_sparse_compress_cache_insert,
+from tokenspeed_kernel.ops.kvcache import triton_cache_placement
+from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (
+    compact_owned_slots,
+    virtual_slots_to_local,
 )
-from tokenspeed_kernel.ops.kvcache.triton_cache_placement import virtual_slots_to_local
-from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.registry import KernelRegistry, KernelSpec
 from utils import assert_no_triton_compile
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires a CUDA device"
 )
-
-HEAD_DIM = 512
-PAGE_ROWS = 64
-SWA_TOKEN_STRIDE = 576  # 448 FP8 nope + 64 BF16 rope per row (fp8_swa_page_planar).
-SWA_ROW_BYTES = SWA_TOKEN_STRIDE + 8  # plus one FP8 scale per 64-wide nope block.
-# The arena aligns every page's stride to the token stride; SM100 FlashMLA
-# requires that alignment for its TMA loads.
-SWA_PAGE_BYTES = -(-PAGE_ROWS * SWA_ROW_BYTES // SWA_TOKEN_STRIDE) * SWA_TOKEN_STRIDE
-
 
 # ---------------------------------------------------------------------------
 # Virtual block translation
@@ -177,6 +162,214 @@ def test_virtual_slot_translation_rejects_invalid_geometry():
         virtual_slots_to_local(
             slots.float(), rows_per_page=1, virtual_block_count=9, degree=1, rank=0
         )
+
+
+def _owned_selection(rows, width, *, rows_per_page, virtual_count, seed):
+    # Virtual slots with -1 holes and null-block, negative and past-capacity entries.
+    generator = torch.Generator().manual_seed(seed)
+    slots = torch.randint(
+        -5,
+        virtual_count * rows_per_page + 3 * rows_per_page,
+        (rows, width),
+        generator=generator,
+        dtype=torch.int64,
+    )
+    holes = torch.rand((rows, width), generator=generator) < 0.1
+    return slots.masked_fill(holes, -1).to(torch.int32)
+
+
+def _compacted_reference(slots, lengths, **geometry):
+    local, owned = torch_virtual_slots_to_local(slots.long(), **geometry)
+    width = slots.shape[1]
+    if lengths is not None:
+        owned &= torch.arange(width) < lengths.long().clamp(0, width).unsqueeze(1)
+    expected = torch.full(slots.shape, -1, dtype=torch.int32)
+    for row in range(slots.shape[0]):
+        kept = local[row][owned[row]]
+        expected[row, : kept.numel()] = kept.to(torch.int32)
+    return expected, owned.sum(1).to(torch.int32)
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("degree", [1, 2, 4, 8])
+@pytest.mark.parametrize("rows_per_page", [64, 128])
+@pytest.mark.parametrize("lengths_kind", ["none", "partial", "zero"])
+@pytest.mark.parametrize("width", [1, 600, 2051])
+def test_compact_owned_slots_matches_reference(
+    device, degree, rows_per_page, lengths_kind, width
+):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires a CUDA device")
+    rows = 7
+    virtual_count = 1 + 5 * degree
+    slots = _owned_selection(
+        rows,
+        width,
+        rows_per_page=rows_per_page,
+        virtual_count=virtual_count,
+        seed=degree * 131 + width,
+    )
+    if lengths_kind == "none":
+        lengths = None
+    elif lengths_kind == "zero":
+        lengths = torch.zeros(rows, dtype=torch.int32)
+    else:
+        # Clamped below zero and past the width.
+        lengths = torch.tensor(
+            [0, 1, width // 2, width - 1, width, width + 9, -3], dtype=torch.int32
+        )
+    geometry = dict(
+        rows_per_page=rows_per_page, virtual_block_count=virtual_count, degree=degree
+    )
+    for rank in range(degree):
+        expected, expected_counts = _compacted_reference(
+            slots, lengths, rank=rank, **geometry
+        )
+        local, counts = compact_owned_slots(
+            slots.to(device),
+            None if lengths is None else lengths.to(device),
+            rank=rank,
+            **geometry,
+        )
+        assert local.dtype == torch.int32 and counts.dtype == torch.int32
+        assert local.shape == slots.shape and local.is_contiguous()
+        assert torch.equal(local.cpu(), expected)
+        assert torch.equal(counts.cpu(), expected_counts)
+    # int64 slots and lengths, and a column-strided view, compact alike.
+    view = torch.cat((slots, slots), dim=1).long().to(device)[:, ::2]
+    local, counts = compact_owned_slots(
+        view,
+        None if lengths is None else lengths.to(device).long(),
+        rank=degree - 1,
+        **geometry,
+    )
+    expected, expected_counts = _compacted_reference(
+        view.cpu(), lengths, rank=degree - 1, **geometry
+    )
+    assert torch.equal(local.cpu(), expected)
+    assert torch.equal(counts.cpu(), expected_counts)
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("degree", [1, 2, 4, 8])
+def test_compact_owned_slots_partitions_selection(device, degree):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires a CUDA device")
+    rows, width, rows_per_page = 9, 2048, 128
+    virtual_count = 1 + 24 * degree
+    generator = torch.Generator().manual_seed(degree)
+    # Distinct owned slots, as top-k selects them, with stale entries past each length.
+    capacity = (virtual_count - 1) * rows_per_page
+    slots = torch.stack(
+        [
+            torch.randperm(capacity, generator=generator)[:width] + rows_per_page
+            for _ in range(rows)
+        ]
+    ).to(torch.int32)
+    lengths = torch.randint(0, width + 1, (rows,), generator=generator)
+    lengths[:3] = torch.tensor([0, 1, width])
+    lengths = lengths.to(torch.int32)
+    # One row selects only rank 0's blocks: other ranks receive nothing.
+    rank0 = torch.arange(rows_per_page, virtual_count * rows_per_page)
+    rank0 = rank0[(rank0 // rows_per_page - 1) % degree == 0][: width // 2]
+    slots[3, : rank0.numel()] = rank0.to(torch.int32)
+    lengths[3] = rank0.numel()
+    total = torch.zeros(rows, dtype=torch.int32)
+    restored = [[] for _ in range(rows)]
+    for rank in range(degree):
+        local, counts = compact_owned_slots(
+            slots.to(device),
+            lengths.to(device),
+            rows_per_page=rows_per_page,
+            virtual_block_count=virtual_count,
+            degree=degree,
+            rank=rank,
+        )
+        local, counts = local.cpu().long(), counts.cpu()
+        total += counts
+        for row in range(rows):
+            count = int(counts[row])
+            assert (local[row, count:] == -1).all()
+            mine = local[row, :count]
+            # Back to virtual slots through the cyclic rule.
+            block = (mine // rows_per_page - 1) * degree + rank + 1
+            virtual = block * rows_per_page + mine % rows_per_page
+            live = slots[row, : int(lengths[row])].long()
+            # Selection order is kept within the rank.
+            assert torch.equal(
+                virtual, live[(live // rows_per_page - 1) % degree == rank]
+            )
+            restored[row].append(virtual)
+    assert torch.equal(total, lengths)
+    for row in range(rows):
+        union = torch.cat(restored[row]).sort().values
+        assert torch.equal(union, slots[row, : int(lengths[row])].long().sort().values)
+
+
+@requires_cuda
+def test_compact_owned_slots_graph_replay():
+    geometry = dict(rows_per_page=128, virtual_block_count=97, degree=8, rank=3)
+
+    def selection(rows, width, seed):
+        return _owned_selection(
+            rows, width, rows_per_page=128, virtual_count=97, seed=seed
+        )
+
+    rows, width = 64 * 8, 2048
+    slots = selection(rows, width, 0).cuda()
+    lengths = torch.randint(0, width + 1, (rows,), dtype=torch.int32).cuda()
+    compact_owned_slots(slots, lengths, **geometry)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        local, counts = compact_owned_slots(slots, lengths, **geometry)
+    for seed in range(1, 4):
+        slots.copy_(selection(rows, width, seed))
+        lengths.copy_(torch.randint(0, width + 1, (rows,), dtype=torch.int32))
+        graph.replay()
+        expected, expected_counts = _compacted_reference(
+            slots.cpu(), lengths.cpu(), **geometry
+        )
+        assert torch.equal(local.cpu(), expected)
+        assert torch.equal(counts.cpu(), expected_counts)
+
+    # Rows, widths and strides are runtime: one binary per placement and lengths form.
+    compact_owned_slots(selection(4, 512, 7).cuda(), None, **geometry)
+    with assert_no_triton_compile(triton_cache_placement._compact_owned_slots):
+        for rows, width in ((1, 2048), (3, 2051), (16, 512), (33, 2048)):
+            slots = selection(rows, width, rows).cuda()
+            lengths = torch.full((rows,), width // 2, dtype=torch.int32).cuda()
+            for row_lengths in (None, lengths):
+                local, counts = compact_owned_slots(slots, row_lengths, **geometry)
+                expected, expected_counts = _compacted_reference(
+                    slots.cpu(),
+                    None if row_lengths is None else row_lengths.cpu(),
+                    **geometry,
+                )
+                assert torch.equal(local.cpu(), expected)
+                assert torch.equal(counts.cpu(), expected_counts)
+
+
+def test_compact_owned_slots_rejects_invalid_inputs():
+    slots = torch.arange(8, dtype=torch.int64).view(2, 4)
+    geometry = dict(rows_per_page=1, virtual_block_count=9)
+    with pytest.raises(ValueError, match="owner rank"):
+        compact_owned_slots(slots, None, degree=2, rank=2, **geometry)
+    with pytest.raises(ValueError, match="usable pages"):
+        compact_owned_slots(
+            slots, None, rows_per_page=1, virtual_block_count=1, degree=1, rank=0
+        )
+    with pytest.raises(TypeError):
+        compact_owned_slots(slots.float(), None, degree=1, rank=0, **geometry)
+    with pytest.raises(ValueError, match="rows, width"):
+        compact_owned_slots(slots.flatten(), None, degree=1, rank=0, **geometry)
+    with pytest.raises(ValueError, match="lengths"):
+        compact_owned_slots(
+            slots, torch.ones(3, dtype=torch.int32), degree=1, rank=0, **geometry
+        )
+    local, counts = compact_owned_slots(
+        slots[:0], torch.ones(0, dtype=torch.int32), degree=1, rank=0, **geometry
+    )
+    assert local.shape == (0, 4) and counts.shape == (0,)
 
 
 # ---------------------------------------------------------------------------
@@ -305,264 +498,6 @@ def test_weight_and_sink_reject_inconsistent_shapes():
         )
 
 
-# ---------------------------------------------------------------------------
-# Kernel capability and the no-sink LSE contract
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "traits,expected",
-    [
-        pytest.param({}, False, id="undeclared"),
-        pytest.param({"sinks": frozenset({True})}, False, id="sink-only"),
-        pytest.param({"sinks": frozenset({False})}, False, id="missing-lse"),
-        pytest.param({"return_lse": frozenset({True})}, False, id="missing-sinks"),
-        pytest.param(
-            {"return_lse": frozenset({True}), "sinks": frozenset({True})},
-            False,
-            id="lse-includes-sink",
-        ),
-        pytest.param(
-            {"return_lse": frozenset({False}), "sinks": frozenset({False})},
-            False,
-            id="no-lse",
-        ),
-        pytest.param(
-            {"return_lse": frozenset({True}), "sinks": frozenset({False})},
-            True,
-            id="no-sink-lse",
-        ),
-        pytest.param(
-            {"return_lse": frozenset({False, True}), "sinks": frozenset({False, True})},
-            True,
-            id="optional-sink-and-lse",
-        ),
-    ],
-)
-def test_decode_partials_require_explicit_no_sink_lse_support(
-    fresh_registry, h100_platform, traits, expected
-):
-    KernelRegistry.get().register(
-        KernelSpec(
-            name="test_dsv4_decode",
-            family="attention",
-            mode="dsv4_decode",
-            traits=traits,
-        ),
-        lambda: None,
-    )
-
-    assert dsv4_decode_supports_partials(h100_platform) is expected
-
-
-def test_decode_partials_need_a_kernel_registered_for_the_platform(
-    a100_platform, mi350_platform, h100_platform
-):
-    # No portable kernel returns a no-sink LSE yet; only FlashMLA does, and
-    # it is registered for NVIDIA SM90+ hosts only.
-    assert not dsv4_decode_supports_partials(a100_platform)
-    assert not dsv4_decode_supports_partials(mi350_platform)
-    platform = current_platform()
-    assert dsv4_decode_supports_partials(h100_platform) == (
-        platform.is_nvidia and platform.is_hopper_plus
-    )
-
-
-def test_decode_refuses_a_sink_together_with_lse():
-    q = torch.empty(1, 64, HEAD_DIM, dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="no-sink LSE"):
-        dsv4_decode(
-            q=q,
-            swa_kv_cache=torch.empty(1, SWA_PAGE_BYTES, dtype=torch.uint8),
-            swa_slots=torch.zeros(1, 8, dtype=torch.int32),
-            swa_lens=torch.zeros(1, dtype=torch.int32),
-            swa_page_size=PAGE_ROWS,
-            attn_sink=torch.zeros(64),
-            softmax_scale=HEAD_DIM**-0.5,
-            return_lse=True,
-        )
-
-
-def _page_planar_cache(pages, page_size):
-    """A random FP8 SWA-layout cache plus its BF16 row reference [pages*page_size, 512]."""
-    assert page_size == PAGE_ROWS
-    nope = torch.randn(pages, page_size, 448, device="cuda").to(torch.float8_e4m3fn)
-    rope = torch.randn(pages, page_size, 64, device="cuda", dtype=torch.bfloat16)
-    # 127 is the UE8M0 scale for 1.0, so every quant block dequantizes as-is.
-    cache = torch.full((pages, SWA_PAGE_BYTES), 127, device="cuda", dtype=torch.uint8)
-    payload = torch.cat((nope.view(torch.uint8), rope.view(torch.uint8)), dim=-1)
-    cache[:, : page_size * SWA_TOKEN_STRIDE] = payload.reshape(pages, -1)
-    reference = torch.cat((nope.to(torch.bfloat16), rope), dim=-1).reshape(-1, HEAD_DIM)
-    return cache, reference
-
-
-def _selected_attention_reference(q, kv, slots, lens, sink):
-    """Softmax over each token's selected rows with the sink, plus the no-sink LSE."""
-    return torch_dsv4_selected_attention(q, kv, slots, lens, sink, HEAD_DIM**-0.5)
-
-
-@requires_cuda
-@pytest.mark.parametrize("heads,degree", [(64, 2), (64, 4), (128, 2), (128, 8)])
-def test_flashmla_partials_merge_to_the_full_softmax_with_empty_shards(
-    require, heads, degree
-):
-    require("attention", "dsv4_decode", "flashmla", torch.bfloat16, "q")
-    from tokenspeed_kernel.ops.attention.dsv4.cuda import reset_dsv4_tile_metadata
-
-    torch.manual_seed(74)
-    tokens = 5
-    swa_cache, swa_kv = _page_planar_cache(3, PAGE_ROWS)
-    extra_cache, extra_kv = _page_planar_cache(4, PAGE_ROWS)
-    q = torch.randn(tokens, heads, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
-    sink = torch.randn(heads, device="cuda", dtype=torch.float32)
-    swa_slots = torch.arange(128, device="cuda", dtype=torch.int32).repeat(tokens, 1)
-    swa_slots[0, 10] = -1
-    swa_lens = torch.tensor([91, 1, 40, 0, 0], device="cuda", dtype=torch.int32)
-    extra_width = 128
-    extra_slots = torch.arange(extra_width, device="cuda", dtype=torch.int32).repeat(
-        tokens, 1
-    )
-    extra_slots[1, 5] = -1
-    # Token 1 selects three compressed rows, so some shards own none of them;
-    # token 4 attends to nothing at all.
-    extra_lens = torch.tensor([120, 3, 0, 64, 0], device="cuda", dtype=torch.int32)
-
-    swa_selected = swa_slots.masked_fill(
-        torch.arange(128, device="cuda")[None] >= swa_lens[:, None], -1
-    )
-    extra_selected = (extra_slots + swa_kv.shape[0]).masked_fill(
-        torch.arange(extra_width, device="cuda")[None] >= extra_lens[:, None], -1
-    )
-    selected = torch.cat((swa_selected, extra_selected), dim=1)
-    expected, expected_lse = _selected_attention_reference(
-        q,
-        torch.cat((swa_kv, extra_kv), dim=0),
-        selected,
-        torch.full((tokens,), selected.shape[1], device="cuda", dtype=torch.int32),
-        sink,
-    )
-
-    # Shard compressed pages cyclically and keep the scan length, as the
-    # runtime does; only rank 0 counts the replicated SWA cache.
-    partials, lses = [], []
-    for rank in range(degree):
-        owned = ((extra_slots // PAGE_ROWS) % degree == rank) & (extra_slots >= 0)
-        shard_slots = torch.where(owned, extra_slots, torch.full_like(extra_slots, -1))
-        in_prefix = torch.arange(extra_width, device="cuda")[None] < extra_lens[:, None]
-        valid_lens = (owned & in_prefix).sum(dim=1, dtype=torch.int32)
-        rank_swa_lens = swa_lens if rank == 0 else torch.zeros_like(swa_lens)
-        reset_dsv4_tile_metadata()
-        out, lse = dsv4_decode(
-            q=q,
-            swa_kv_cache=swa_cache,
-            swa_slots=swa_slots,
-            swa_lens=rank_swa_lens,
-            swa_page_size=PAGE_ROWS,
-            attn_sink=None,
-            softmax_scale=HEAD_DIM**-0.5,
-            extra_kv_cache=extra_cache,
-            extra_slots=shard_slots,
-            extra_lens=extra_lens,
-            extra_page_size=PAGE_ROWS,
-            solution="flashmla",
-            return_lse=True,
-        )
-        out, lse = normalize_dcp_partials(
-            out, lse.squeeze(-1), rank_swa_lens, valid_lens
-        )
-        partials.append(out)
-        lses.append(lse)
-
-    all_lse = torch.stack(lses, dim=0)
-    local_heads = heads // degree
-    summed = None
-    global_lses = []
-    for rank in range(degree):
-        weighted, global_lse = dcp_weight_for_reduce_scatter(
-            partials[rank], all_lse, rank
-        )
-        summed = weighted if summed is None else summed + weighted
-        global_lses.append(global_lse)
-    actual = torch.cat(
-        [
-            dcp_apply_sink(
-                summed[rank * local_heads : (rank + 1) * local_heads].movedim(0, 1),
-                global_lses[rank],
-                sink[rank * local_heads : (rank + 1) * local_heads].contiguous(),
-                dtype=q.dtype,
-            )
-            for rank in range(degree)
-        ],
-        dim=1,
-    )
-    global_lse = torch.cat(global_lses, dim=1)
-
-    assert not actual.isnan().any() and not global_lse.isnan().any()
-    assert torch.equal(torch.isinf(global_lse), torch.isinf(expected_lse))
-    finite = torch.isfinite(expected_lse)
-    torch.testing.assert_close(
-        global_lse[finite], expected_lse[finite], atol=1e-5, rtol=1e-5
-    )
-    torch.testing.assert_close(actual, expected, atol=8e-3, rtol=8e-3)
-
-
-# ---------------------------------------------------------------------------
-# Owner-only compressed cache stores
-# ---------------------------------------------------------------------------
-
-
-@requires_cuda
-@pytest.mark.parametrize("compress_ratio", [4, 128])
-def test_masked_compress_stores_leave_every_other_byte_untouched(compress_ratio):
-    torch.manual_seed(compress_ratio)
-    tokens = 8
-    positions = torch.arange(
-        tokens, device="cuda", dtype=torch.int32
-    ) * compress_ratio + (compress_ratio - 1)
-    token_to_req = torch.zeros(tokens, device="cuda", dtype=torch.int32)
-    state_rows = compress_ratio
-    state_cache = torch.randn(
-        tokens * 2, state_rows, HEAD_DIM * 2, device="cuda", dtype=torch.float32
-    )
-    kv_cache = torch.randint(
-        0, 255, (tokens + 2, SWA_PAGE_BYTES), device="cuda", dtype=torch.uint8
-    )
-    before = kv_cache.clone()
-    kv_slots = (torch.arange(tokens, device="cuda", dtype=torch.int64) + 1) * PAGE_ROWS
-    mask = torch.tensor([True, False] * (tokens // 2), device="cuda")
-    dsv4_fused_sparse_compress_cache_insert(
-        state_cache=state_cache,
-        token_to_req_indices=token_to_req,
-        positions=positions,
-        compressor_slot_mapping=torch.arange(tokens, device="cuda", dtype=torch.int32),
-        block_table=torch.arange(tokens, device="cuda", dtype=torch.int32).view(
-            1, tokens
-        ),
-        compressor_block_size=1,
-        rms_norm_weight=torch.ones(HEAD_DIM, device="cuda", dtype=torch.float32),
-        rms_norm_eps=1e-6,
-        cos_sin_cache=torch.randn(
-            positions.max().item() + 1, 64, device="cuda", dtype=torch.float32
-        ),
-        kv_cache_2d=kv_cache,
-        kv_slot_mapping=kv_slots,
-        kv_cache_block_size=PAGE_ROWS,
-        compress_ratio=compress_ratio,
-        overlap=compress_ratio == 4,
-        block_table_base_offsets=None,
-        kv_write_mask=mask,
-    )
-    torch.cuda.synchronize()
-    changed_pages = (kv_cache != before).any(dim=1)
-    written_pages = (kv_slots // PAGE_ROWS)[mask]
-    unwritten_pages = (kv_slots // PAGE_ROWS)[~mask]
-    assert changed_pages[written_pages].all()
-    assert not changed_pages[unwritten_pages].any()
-    # Masked tokens park on slot 0; the null page must stay untouched too.
-    assert not changed_pages[0]
-    assert not changed_pages[tokens + 1]
-
-
 # Candidate transport and head-owner merging share the DCP graph contract.
 
 
@@ -591,6 +526,122 @@ def test_rank_major_merge_preserves_order_and_bits(rows, degree, width, topk):
     torch.testing.assert_close(
         counts, (values > -torch.inf).sum(1).int(), atol=0, rtol=0
     )
+
+
+@pytest.mark.parametrize("degree", [2, 3, 8])
+@pytest.mark.parametrize("rows_per_owner", [1, 5])
+@pytest.mark.parametrize("width,topk", [(16, 8), (2048, 2048)])
+@pytest.mark.parametrize("tied", [False, True])
+@requires_cuda
+def test_rank_major_merge_row_slices_match_full_merge(
+    degree, rows_per_owner, width, topk, tied
+):
+    """An owner merging its equal slice of the rows over every rank's
+    candidates selects what merging every row selects for that slice: the
+    merge is row-independent, which the KVP prefill's row-owner exchange
+    relies on to merge each row on one rank only."""
+    generator = torch.Generator(device="cuda").manual_seed(4117 + degree + width)
+    rows = degree * rows_per_owner
+    shape = (degree, rows, width)
+    base = 2**24 + 1
+    ids = torch.arange(degree * rows * width, device="cuda", dtype=torch.int32)
+    ids = ids.reshape(shape) + base
+    if tied:
+        # Four score values: selections cut through runs of equal scores.
+        scores = torch.randint(0, 4, shape, generator=generator, device="cuda").float()
+    else:
+        # Distinct scores order every candidate: the selection is unique.
+        scores = torch.randperm(
+            degree * rows * width, generator=generator, device="cuda"
+        )
+        scores = (scores + 1).float().reshape(shape)
+    # Row 0: an invalid candidate of each kind, and one mandatory candidate.
+    ids[:, 0, -1] = -1
+    scores[:, 0, 1] = -torch.inf
+    scores[:, 0, 2] = torch.nan
+    scores[0, 0, 0] = torch.inf
+    # The last row is cold: one valid candidate per rank.
+    scores[:, -1, 1:] = -torch.inf
+    if rows > 2:
+        # Row 1 has none, as an exchange's padding rows.
+        ids[:, 1] = -1
+    records = torch.stack((ids, scores.view(torch.int32)), dim=-1)
+    full_positions, full_counts = exchange.merge_packed_index_candidates(
+        records, topk=topk
+    )
+    valid = (ids >= 0) & ~torch.isnan(scores) & (scores > -torch.inf)
+    candidates = valid.sum(dim=(0, 2))
+    torch.testing.assert_close(
+        full_counts, candidates.clamp_max(topk).int(), atol=0, rtol=0
+    )
+    # Every candidate's score by position, -inf where invalid.
+    by_position = torch.where(valid, scores, -torch.inf).flatten()
+
+    def selected_scores(positions):
+        picked = by_position[(positions - base).clamp_min(0).long()]
+        picked = torch.where(positions >= 0, picked, -torch.inf)
+        return picked.sort(dim=-1, descending=True).values
+
+    owned = rows // degree
+    for owner in range(degree):
+        part = slice(owner * owned, (owner + 1) * owned)
+        positions, counts = exchange.merge_packed_index_candidates(
+            records[:, part].contiguous(), topk=topk
+        )
+        torch.testing.assert_close(counts, full_counts[part], atol=0, rtol=0)
+        if not tied:
+            torch.testing.assert_close(positions, full_positions[part], atol=0, rtol=0)
+            continue
+        # Ties may order or cut differently; scores and fully-selected rows still agree.
+        torch.testing.assert_close(
+            selected_scores(positions),
+            selected_scores(full_positions[part]),
+            atol=0,
+            rtol=0,
+        )
+        whole = candidates[part] <= topk
+        torch.testing.assert_close(
+            positions[whole].sort(dim=-1).values,
+            full_positions[part][whole].sort(dim=-1).values,
+            atol=0,
+            rtol=0,
+        )
+
+
+@requires_cuda
+def test_threshold_selection_ignores_which_tied_candidates_a_topk_chose():
+    # Three 2.0s tie at the top-4 cutoff; -inf, NaN and negative offsets never count.
+    ids = torch.tensor(
+        [[[10, 11, 12, 13]], [[20, 21, -1, 23]]], device="cuda", dtype=torch.int32
+    )
+    scores = torch.tensor(
+        [[[2.0, -torch.inf, 5.0, torch.nan]], [[2.0, 9.0, 7.0, 2.0]]],
+        device="cuda",
+    )
+    records = torch.stack((ids, scores.view(torch.int32)), dim=-1)
+    rank_major = exchange.rank_major_scores(records)
+    # Two exact top-4s keeping different tied candidates, in different orders.
+    orders = [
+        torch.tensor([[5, 2, 7, 4]], device="cuda", dtype=torch.int32),
+        torch.tensor([[0, 5, 2, 4]], device="cuda", dtype=torch.int64),
+    ]
+
+    results = [
+        exchange.select_through_threshold(records, rank_major, order, topk=4)
+        for order in orders
+    ]
+
+    for positions, counts in results:
+        # 9.0, 5.0 and the first two 2.0 ties (10, 20; not 23), in candidate order.
+        torch.testing.assert_close(
+            positions,
+            torch.tensor([[10, 12, 20, 21]], device="cuda", dtype=torch.int32),
+            atol=0,
+            rtol=0,
+        )
+        torch.testing.assert_close(
+            counts, torch.tensor([4], device="cuda", dtype=torch.int32), atol=0, rtol=0
+        )
 
 
 @requires_cuda

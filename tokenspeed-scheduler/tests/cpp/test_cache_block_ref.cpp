@@ -192,5 +192,73 @@ TEST(CacheBlockRefTest, LastOwnerDestroysDynamicBlockAndReleasesExactSlot) {
     EXPECT_EQ(pool.BoundGroup(location.lcm_block_id), std::nullopt);
 }
 
+TEST(CacheBlockRefTest, UniqueObserverFiresOnceAfterAllOtherOwnersRelease) {
+    BlockPool pool(1, {1});
+    CacheBlockRef owner = pool.AcquireBlock(0);
+    CacheBlockRef second = owner;
+    CacheBlockRef third = owner;
+    CacheBlockUniqueObserver observer;
+    int notifications = 0;
+    observer.Observe(owner, [](void* context) noexcept { ++*static_cast<int*>(context); }, &notifications);
+    second.reset();
+    EXPECT_EQ(notifications, 0);
+    third.reset();
+    EXPECT_TRUE(owner.unique());
+    EXPECT_EQ(notifications, 1);
+    second = owner;
+    second.reset();
+    EXPECT_EQ(notifications, 1);
+}
+
+TEST(CacheBlockRefTest, UniqueObserverCanCancelAnotherPendingObserverAndDestroyBlock) {
+    BlockPool pool(1, {1});
+    CacheBlockRef owner = pool.AcquireBlock(0);
+    CacheBlockRef second = owner;
+    CacheBlockUniqueObserver cancelled;
+    CacheBlockUniqueObserver active;
+    int cancelled_notifications = 0;
+    cancelled.Observe(owner, [](void* context) noexcept { ++*static_cast<int*>(context); }, &cancelled_notifications);
+    struct Context {
+        CacheBlockRef& owner;
+        CacheBlockUniqueObserver& cancelled;
+        int notifications{0};
+    } context{owner, cancelled};
+    active.Observe(
+        owner,
+        [](void* data) noexcept {
+            auto& context = *static_cast<Context*>(data);
+            context.cancelled.Reset();
+            context.owner.reset();
+            ++context.notifications;
+        },
+        &context);
+
+    second.reset();
+
+    EXPECT_EQ(context.notifications, 1);
+    EXPECT_EQ(cancelled_notifications, 0);
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 1);
+}
+
+TEST(CacheBlockRefTest, UniqueObserverCanBeCancelledOrRebound) {
+    BlockPool pool(2, {1});
+    CacheBlockRef first = pool.AcquireBlock(0);
+    CacheBlockRef second = pool.AcquireBlock(0);
+    CacheBlockRef first_pin = first;
+    CacheBlockRef second_pin = second;
+    CacheBlockUniqueObserver observer;
+    int notifications = 0;
+    const auto notify = [](void* context) noexcept { ++*static_cast<int*>(context); };
+    observer.Observe(first, notify, &notifications);
+    observer.Observe(second, notify, &notifications);
+    first_pin.reset();
+    EXPECT_EQ(notifications, 0);
+    observer.Reset();
+    second_pin.reset();
+    EXPECT_EQ(notifications, 0);
+    observer.Observe(first, notify, &notifications);
+    EXPECT_EQ(notifications, 1);
+}
+
 }  // namespace
 }  // namespace tokenspeed::test

@@ -14,9 +14,16 @@ from __future__ import annotations
 from collections.abc import Callable
 
 import torch
-from tokenspeed_kernel.ops.attention.kda import KdaPrefillResult, KdaReplayRecords
+from tokenspeed_kernel.ops.attention.kda import (
+    KdaOutputNorm,
+    KdaPrefillResult,
+    KdaReplayRecords,
+    _attention_format_signature,
+    apply_kda_output_norm,
+)
 from tokenspeed_kernel.platform import CapabilityRequirement, pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 _DENSE_HALF_SIGNATURES = format_signatures(
@@ -268,9 +275,10 @@ def triton_nvidia_kda_fused_paged_verify(
     head_dim: int,
     draft_token_num: int,
     lower_bound: float | None,
+    output_norm: KdaOutputNorm | None,
 ) -> torch.Tensor:
     """Run fused target verify, storing per-position rollback states."""
-    return _nvidia_fused_verify(
+    result = _nvidia_fused_verify(
         mixed_qkv,
         conv_weights,
         conv_states,
@@ -291,6 +299,7 @@ def triton_nvidia_kda_fused_paged_verify(
         store_states=True,
         split_producers=False,
     )
+    return apply_kda_output_norm(result, output_norm)
 
 
 @register_kernel(
@@ -327,9 +336,10 @@ def triton_nvidia_kda_fused_paged_verify_no_store(
     head_dim: int,
     draft_token_num: int,
     lower_bound: float | None,
+    output_norm: KdaOutputNorm | None,
 ) -> torch.Tensor:
     """Run fused target verify without materializing rollback states."""
-    return _nvidia_fused_verify(
+    result = _nvidia_fused_verify(
         mixed_qkv,
         conv_weights,
         conv_states,
@@ -350,6 +360,7 @@ def triton_nvidia_kda_fused_paged_verify_no_store(
         store_states=False,
         split_producers=False,
     )
+    return apply_kda_output_norm(result, output_norm)
 
 
 @register_kernel(
@@ -388,15 +399,12 @@ def triton_nvidia_kda_fused_paged_verify_split(
     draft_token_num: int,
     lower_bound: float | None,
     replay_records: KdaReplayRecords | None,
+    output_norm: KdaOutputNorm | None,
     g_raw: torch.Tensor | None = None,
     conv_qkv: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run target verify with split convolution and gate producers."""
     if replay_records is not None:
-        from tokenspeed_kernel.ops.attention.kda.vllm_recoverssm import (
-            vllm_triton_kda_recoverssm_verify,
-        )
-
         if conv_qkv is None or g_raw is None:
             raise ValueError("record verify requires precomputed conv and gates")
         if replay_records.original_qkv is not None:
@@ -424,7 +432,19 @@ def triton_nvidia_kda_fused_paged_verify_split(
         q, k, v = (
             part.view(1, -1, num_heads, head_dim) for part in conv_qkv.chunk(3, dim=-1)
         )
-        return vllm_triton_kda_recoverssm_verify(
+        verify = select_kernel(
+            "attention",
+            "kda_recoverssm_verify",
+            _attention_format_signature(q=q, k=k, v=v),
+            traits={
+                "head_dim": head_dim,
+                "spec_query_len": draft_token_num,
+                "paged_state": True,
+                "recurrent_layout": "v_major",
+                "state_dtype": state_pool.dtype,
+            },
+        )
+        result = verify(
             q,
             k,
             v,
@@ -443,7 +463,8 @@ def triton_nvidia_kda_fused_paged_verify_split(
             record_metadata=replay_records.metadata,
             record_stamps=replay_records.stamps,
         )
-    return _nvidia_fused_verify(
+        return apply_kda_output_norm(result, output_norm)
+    result = _nvidia_fused_verify(
         mixed_qkv,
         conv_weights,
         conv_states,
@@ -466,6 +487,7 @@ def triton_nvidia_kda_fused_paged_verify_split(
         g_raw=g_raw,
         conv_qkv=conv_qkv,
     )
+    return apply_kda_output_norm(result, output_norm)
 
 
 @register_kernel(

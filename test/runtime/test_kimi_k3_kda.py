@@ -158,7 +158,6 @@ def _backend_config(device: str, *, spec_tokens: int = 1):
         dtype=torch.bfloat16,
         kv_cache_dtype=torch.bfloat16,
         kv_cache_quant_method="none",
-        prefix_granularity=64,
         context_len=4096,
         max_bs=8,
         is_draft=False,
@@ -1138,7 +1137,7 @@ def test_prefill_state_inputs_zero_fresh_rows_without_reading_null_page() -> Non
     state_out = torch.tensor([1, 3, 4], dtype=torch.int64)
 
     recurrent_state, has_initial_state = _prepare_cache_prefill_state_inputs(
-        conv_states, ssm_states, state_in, state_out
+        conv_states, ssm_states, state_in, state_out, dtype=torch.float32
     )
 
     assert has_initial_state.tolist() == [False, True, False]
@@ -1153,7 +1152,11 @@ def test_prefill_state_inputs_zero_fresh_rows_without_reading_null_page() -> Non
 
 @requires_cuda
 @pytest.mark.parametrize("prefix", [0, 1024])
-def test_kda_prefill_fused_staging_matches_pytorch(prefix, monkeypatch):
+@pytest.mark.parametrize("backend_name", ["cutedsl_kda", "cudnn"])
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_kda_prefill_fused_staging_matches_pytorch(
+    prefix, backend_name, state_dtype, monkeypatch
+):
     """Native KDA outputs and persistent state match the old staging ops."""
     from tokenspeed_kernel.ops.attention.kda.cute_dsl import cutedsl_kda_supported
 
@@ -1168,6 +1171,10 @@ def test_kda_prefill_fused_staging_matches_pytorch(prefix, monkeypatch):
         for _ in range(2)
     ]
     for layer_id in range(3):
+        for pool in pools:
+            pool._components[layer_id]["recurrent_state"] = pool.get_component(
+                layer_id, "recurrent_state"
+            ).to(state_dtype)
         for component in ("conv_state", "recurrent_state"):
             before = pools[0].get_component(layer_id, component)
             before.normal_(0, 0.1)
@@ -1180,7 +1187,7 @@ def test_kda_prefill_fused_staging_matches_pytorch(prefix, monkeypatch):
         gid: [[2 * row + 1, 2 * row + 2]] for row, gid in enumerate(_STATE_GROUPS)
     }
     for harness in harnesses:
-        harness.backend.kda_backend = "cutedsl_kda"
+        harness.backend.kda_backend = backend_name
         harness.extend_metadata(
             tables,
             seq_lens=[prefix + 868],
@@ -1188,13 +1195,13 @@ def test_kda_prefill_fused_staging_matches_pytorch(prefix, monkeypatch):
             num_extends=1,
         )
 
-    def pytorch_staging(conv, state, sources, destinations):
+    def pytorch_staging(conv, state, sources, destinations, *, dtype):
         history = sources > 0
         safe = torch.where(history, sources, destinations).long()
         conv[destinations.long()] = conv[safe]
         recurrent = state[safe]
         recurrent.masked_fill_(~history[:, None, None, None], 0)
-        return recurrent, history
+        return recurrent.to(dtype), history
 
     before, after = harnesses
     for layer_id in range(3):

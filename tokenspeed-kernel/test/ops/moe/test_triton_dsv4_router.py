@@ -28,6 +28,18 @@ import torch.nn.functional as F
 from tokenspeed_kernel.numerics.torch.quantization import dequantize_mxfp4
 from tokenspeed_kernel.ops.moe import moe_apply, moe_plan, moe_process_weights, moe_topk
 from tokenspeed_kernel.selection import NoKernelFoundError
+from utils import kernel_supported
+
+_TOPK_KERNELS = [
+    "triton_sqrt_softplus_topk",
+    pytest.param(
+        "gluon_sqrt_softplus_topk_gfx1250",
+        marks=pytest.mark.skipif(
+            not kernel_supported("gluon_sqrt_softplus_topk_gfx1250"),
+            reason="requires AMD CDNA5",
+        ),
+    ),
+]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
@@ -77,7 +89,9 @@ def test_router_reuses_compilation_across_token_counts(
 @pytest.mark.parametrize("renormalize", [False, True])
 @pytest.mark.parametrize("scaling_factor", [1.0, 2.5])
 @pytest.mark.parametrize("weights_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("kernel", _TOPK_KERNELS)
 def test_router_matches_reference(
+    kernel: str,
     kind: str,
     dtype: torch.dtype,
     renormalize: bool,
@@ -121,7 +135,7 @@ def test_router_matches_reference(
         correction_bias=bias,
         hash_indices_table=table,
         input_ids=input_ids,
-        override="triton_sqrt_softplus_topk",
+        override=kernel,
     )
     expected_scores = F.softplus(logits.float()).sqrt()
     expected_ids = (
@@ -148,7 +162,7 @@ def test_router_matches_reference(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 @pytest.mark.parametrize("experts", [256, 384])
-@pytest.mark.parametrize("tokens", [1, 16, 17])
+@pytest.mark.parametrize("tokens", [1, 16, 17, 256])
 def test_fused_router_matches_logits_path(experts: int, tokens: int) -> None:
     torch.manual_seed(experts + tokens)
     x = torch.randn(tokens, 4096, device="cuda").bfloat16()
@@ -166,9 +180,46 @@ def test_fused_router_matches_logits_path(experts: int, tokens: int) -> None:
         weights, ids = moe_topk(None, hidden_states=x, gate_weight=gate, **args)
     except NoKernelFoundError:
         pytest.skip("no fused router kernel on this platform")
-    expected_weights, expected_ids = moe_topk(x.float() @ gate.float().T, **args)
+    expected_weights, expected_ids = moe_topk(
+        x.float() @ gate.float().T, override="triton_sqrt_softplus_topk", **args
+    )
     torch.testing.assert_close(ids, expected_ids, atol=0, rtol=0)
     torch.testing.assert_close(weights, expected_weights, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.skipif(
+    not kernel_supported("gluon_router_sqrt_softplus_topk_gfx1250"),
+    reason="requires AMD CDNA5",
+)
+def test_gfx1250_fused_router_reuses_compilation_across_token_counts() -> None:
+    from tokenspeed_kernel_amd.ops.gfx1250.moe import router_gemv, sqrt_softplus_topk
+    from utils import assert_no_triton_compile
+
+    torch.manual_seed(0)
+    gate = (torch.randn(384, 4096, device="cuda") * 0.05).bfloat16()
+    bias = torch.randn(384, device="cuda")
+
+    def run(tokens):
+        moe_topk(
+            None,
+            hidden_states=torch.randn(tokens, 4096, device="cuda").bfloat16(),
+            gate_weight=gate,
+            top_k=6,
+            score_function="sqrt_softplus",
+            selection_method="topk",
+            renormalize=True,
+            routed_scaling_factor=1.5,
+            correction_bias=bias,
+            override="gluon_router_sqrt_softplus_topk_gfx1250",
+        )
+
+    run(1)
+    with assert_no_triton_compile(
+        router_gemv.gluon_router_sqrt_softplus_topk_gemv_gfx1250,
+        sqrt_softplus_topk.gluon_sqrt_softplus_topk_gfx1250,
+    ):
+        for tokens in (2, 17, 96, 256):
+            run(tokens)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
@@ -208,7 +259,10 @@ def test_router_ties_and_graph_replay(weights_dtype: torch.dtype) -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 @pytest.mark.parametrize("with_bias", [False, True])
-def test_router_nan_logits_keep_expert_ids_in_range(with_bias: bool) -> None:
+@pytest.mark.parametrize("kernel", _TOPK_KERNELS)
+def test_router_nan_logits_keep_expert_ids_in_range(
+    kernel: str, with_bias: bool
+) -> None:
     logits = torch.full(
         (80, 256),
         float("nan"),
@@ -228,7 +282,7 @@ def test_router_nan_logits_keep_expert_ids_in_range(with_bias: bool) -> None:
             renormalize=True,
             routed_scaling_factor=1.0,
             correction_bias=bias,
-            override="triton_sqrt_softplus_topk",
+            override=kernel,
         )
         return ids
 

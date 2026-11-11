@@ -273,8 +273,11 @@ def gluon_dsv41_index_topk_select_gfx1250(
     descents = gl.sum(((i > 0) & (i < count) & (mine < previous)).to(gl.int32), 0)
     if descents > 0:
         rank = gl.zeros([TOPK], gl.int32, layout=LR)
-        for j0 in gl.static_range(0, TOPK, 64):
-            other = picked_smem.slice(j0, 64).load(LC)
+        # Slots past ``count`` hold the int64 max and rank no picked id, so
+        # skip them.
+        chunks = picked_smem.reinterpret(shape=[2 * TOPK // 64, 64], layout=SL)
+        for j in range(0, gl.cdiv(count, 64)):
+            other = chunks.index(j).load(LC)
             rank += gl.sum(
                 (gl.expand_dims(other, 0) < gl.expand_dims(mine, 1)).to(gl.int32),
                 axis=1,

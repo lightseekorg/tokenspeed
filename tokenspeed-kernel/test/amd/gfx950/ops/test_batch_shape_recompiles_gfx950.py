@@ -27,12 +27,7 @@ specialization class, then sweep the batch-dependent value inside
 
 import pytest
 import torch
-from utils import (
-    assert_no_triton_compile,
-    int_specialization_class,
-    is_cdna4,
-    warm_specialization_classes,
-)
+from utils import assert_no_triton_compile, is_cdna4
 
 if not is_cdna4():
     pytest.skip("AMD CDNA4 is required", allow_module_level=True)
@@ -106,6 +101,328 @@ def test_mha_extend_split_count():
             run(pages * page - 5)
 
 
+# Request lengths per batch: the batch size runs across the persistent
+# scheduler's slot split (512 workgroups / 32 heads = 16 batch slots), including
+# a partly filled last batch group (17 requests), and the longest query length
+# is 1, divisible by 16, or neither.
+_PREFILL_BATCHES = (
+    [1],
+    [64, 200],
+    [130, 1, 77],
+    [16] * 7,
+    [129, 64, 1, 300, 16, 5, 90, 33, 250, 48, 2, 7, 140, 64, 31, 99],
+    [40] * 17,
+    [96, 3] * 16,
+)
+
+
+def _prefill_inputs(heads, kv_heads, dim, lengths):
+    generator = torch.Generator(device=DEVICE).manual_seed(len(lengths))
+    tokens = sum(lengths)
+
+    def rand(*shape):
+        return torch.randn(
+            *shape, device=DEVICE, dtype=torch.bfloat16, generator=generator
+        )
+
+    q = rand(tokens, heads, dim)
+    k = rand(tokens, kv_heads, dim)
+    v = rand(tokens, kv_heads, dim)
+    cu = [0]
+    for length in lengths:
+        cu.append(cu[-1] + length)
+    cu_gpu = torch.tensor(cu, dtype=torch.int32, device=DEVICE)
+    return q, k, v, cu, cu_gpu
+
+
+def _check_batch_matches_single_requests(run, lengths, out, lse):
+    # Every (request, head, query block) tile is computed alone, so a request's
+    # result must not depend on the batch around it or the slot split.
+    cu = [0]
+    for length in lengths:
+        cu.append(cu[-1] + length)
+    for index, length in enumerate(lengths):
+        rows = slice(cu[index], cu[index + 1])
+        single_out, single_lse = run(lengths, single=index)
+        torch.testing.assert_close(out[rows], single_out, rtol=0, atol=0)
+        torch.testing.assert_close(lse[rows], single_lse, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "window_left,skip_softmax_threshold", [(-1, 0.0), (-1, 1e-3), (100, 0.0)]
+)
+def test_mha_prefill_batch_size(window_left, skip_softmax_threshold):
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mha import prefill
+
+    heads, kv_heads, dim = 32, 8, 128
+
+    def run(lengths, single=None):
+        q, k, v, cu, cu_gpu = _prefill_inputs(heads, kv_heads, dim, lengths)
+        if single is not None:
+            rows = slice(cu[single], cu[single + 1])
+            q, k, v = q[rows], k[rows], v[rows]
+            lengths = [lengths[single]]
+            cu = [0, lengths[0]]
+            cu_gpu = torch.tensor(cu, dtype=torch.int32, device=DEVICE)
+        return prefill.launch_gluon_mha_prefill_gfx950(
+            q,
+            k,
+            v,
+            cu_gpu,
+            cu,
+            max(lengths),
+            window_left=window_left,
+            return_lse=True,
+            skip_softmax_threshold=skip_softmax_threshold,
+        )
+
+    # The batch size and longest query length are unspecialized: one compile.
+    run([5])
+    with assert_no_triton_compile(
+        prefill.gluon_mha_prefill_gfx950, prefill.gluon_mha_prefill_sliding_gfx950
+    ):
+        for lengths in _PREFILL_BATCHES:
+            out, lse = run(lengths)
+            _check_batch_matches_single_requests(run, lengths, out, lse)
+
+
+@pytest.mark.parametrize("window", [-1, 127])
+def test_mha_prefill_token_stride_and_request_count(window):
+    from tokenspeed_kernel.numerics.torch.attention.mha import torch_dense_attention
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mha import prefill
+
+    heads, kv_heads, dim = 16, 2, 64
+    q_width, kv_width = heads * dim, kv_heads * dim
+    # One projection row holds Q, K, V and the output gate, so views into it
+    # step over the whole row while copies step over their own heads only.
+    packed = torch.randn(
+        1600, 2 * q_width + 2 * kv_width, device=DEVICE, dtype=torch.bfloat16
+    )
+    q_rows, k_rows, v_rows, _ = packed.split(
+        (q_width, kv_width, kv_width, q_width), dim=-1
+    )
+
+    def run(seqlens, views):
+        tokens = sum(seqlens)
+        q = q_rows[:tokens].view(tokens, heads, dim)
+        k = k_rows[:tokens].view(tokens, kv_heads, dim)
+        v = v_rows[:tokens].view(tokens, kv_heads, dim)
+        if not views:
+            q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+        cu = [0]
+        for length in seqlens:
+            cu.append(cu[-1] + length)
+        out = prefill.launch_gluon_mha_prefill_gfx950(
+            q,
+            k,
+            v,
+            torch.tensor(cu, dtype=torch.int32, device=DEVICE),
+            cu,
+            max(seqlens),
+            window_left=window,
+        )
+        for start, end in zip(cu, cu[1:]):
+            expected, _ = torch_dense_attention(
+                q[start:end],
+                k[start:end],
+                v[start:end],
+                scale=dim**-0.5,
+                causal_offset=0,
+                window_left=window if window >= 0 else None,
+                sinks=None,
+            )
+            torch.testing.assert_close(
+                out[start:end].float(), expected, rtol=2e-2, atol=2e-2
+            )
+
+    run([300], views=False)
+    with assert_no_triton_compile(
+        prefill.gluon_mha_prefill_gfx950, prefill.gluon_mha_prefill_sliding_gfx950
+    ):
+        # The packed views of a short prompt next to the copies of a long one
+        # are what a server sees from one model; then request counts of 6,
+        # 16 and 40 (past the 32 requests a full grid holds per round) and
+        # longest requests on and off multiples of 16.
+        run([300], views=True)
+        run([17, 250, 64, 5, 100, 33], views=True)
+        run([32] * 16, views=False)
+        run([40, 1] * 20, views=True)
+        run([1], views=False)
+
+
+# FP8 caches run the products on the F8F6F4 MFMA, a separate set of variants.
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("window", [-1, 127, 2047])
+def test_mha_extend_startup_warmup_covers_every_variant(window, dtype):
+    from tokenspeed_kernel.numerics.torch.attention.mha import (
+        gather_pages,
+        torch_dense_attention,
+    )
+    from tokenspeed_kernel.ops.attention.mha import mha_extend_with_kvcache
+    from tokenspeed_kernel.ops.tuning import kernel_warmup
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mha import extend
+
+    heads, kv_heads, dim, page, width, slots = 16, 2, 64, 64, 160, 80
+    generator = torch.Generator(device=DEVICE).manual_seed(3)
+    cache_shape = (1 + slots * width, page, kv_heads, dim)
+    k_cache = torch.randn(cache_shape, device=DEVICE, generator=generator).to(dtype)
+    v_cache = torch.randn(cache_shape, device=DEVICE, generator=generator).to(dtype)
+    tables = 1 + torch.arange(slots * width, dtype=torch.int32, device=DEVICE)
+    tables = tables.view(slots, width)
+    queries_pool = torch.randn(8192, heads, dim, device=DEVICE, generator=generator)
+    queries_pool = queries_pool.to(dtype)
+    # FP8 rounds the probabilities to 3 mantissa bits: on these inputs the
+    # worst output needs 0.02 where BF16 needs 0.002 (measured on MI350X).
+    # BF16 keeps the file's 2e-2; FP8 gets 3e-2 for headroom.
+    tol = 2e-2 if dtype == torch.bfloat16 else 3e-2
+
+    def run(queries, prefix):
+        lengths = [query + prefix for query in queries]
+        cu_q, cu_kv = [0], [0]
+        for query, length in zip(queries, lengths):
+            cu_q.append(cu_q[-1] + query)
+            cu_kv.append(cu_kv[-1] + length)
+        q = queries_pool[: cu_q[-1]]
+        out = mha_extend_with_kvcache(
+            q=q,
+            cu_seqlens_q=torch.tensor(cu_q, dtype=torch.int32, device=DEVICE),
+            cu_seqlens_kv=torch.tensor(cu_kv, dtype=torch.int32, device=DEVICE),
+            k_cache=k_cache,
+            v_cache=v_cache,
+            page_table=tables[: len(queries)],
+            cache_seqlens=torch.tensor(lengths, dtype=torch.int32, device=DEVICE),
+            max_seqlen_q=max(queries),
+            max_seqlen_k=max(lengths),
+            is_causal=True,
+            window_left=window,
+            solution="gluon",
+        )
+        for request, length in enumerate(lengths):
+            start, end = cu_q[request], cu_q[request + 1]
+            expected, _ = torch_dense_attention(
+                q[start:end],
+                gather_pages(k_cache, tables[request], length),
+                gather_pages(v_cache, tables[request], length),
+                scale=dim**-0.5,
+                causal_offset=prefix,
+                window_left=window if window >= 0 else None,
+                sinks=None,
+            )
+            torch.testing.assert_close(
+                out[start:end].float(), expected, rtol=tol, atol=tol
+            )
+
+    # Startup runs one extend shape; the launcher compiles the rest then.
+    with kernel_warmup(enabled=True):
+        run([100], 300)
+    with assert_no_triton_compile(
+        extend.gluon_mha_extend_gfx950,
+        extend.gluon_mha_extend_split_gfx950,
+        extend.gluon_mha_extend_reduce_gfx950,
+    ):
+        # Up to 64 queries take the 64-row tile (8 positions of the 8-head
+        # group), longer ones the 128-row tile (16 positions). Equal lengths
+        # take the per-request grid, mixed ones the ragged grid.
+        # Small grids split full attention 6 to 8 ways, or 16 ways over 2048
+        # cached tokens.
+        for queries in ([40], [100], [60, 30, 20], [100, 70, 200]):
+            run(queries, 300)
+        for queries in ([40], [100], [60, 30, 20], [100, 70]):
+            run(queries, 2048 - max(queries))
+        # From 512 work-groups (256 query blocks of 2 KV heads) nothing
+        # splits; 570 to 768 work-groups run single-buffered, 886 and 896
+        # pipeline.
+        for queries in (
+            [60] * 40,
+            [60] * 56,
+            [120] * 40,
+            [120] * 56,
+            [64] + [20] * 79,
+            [64] + [36] * 79,
+            [120] + [60] * 79,
+        ):
+            run(queries, 300)
+        # The 8-wave tile (32 positions): under full attention from 8192
+        # cached keys, split for small grids and unsplit from 256 query
+        # blocks; under a 2047-key window from a window of cached keys and a
+        # work-group for every CU.
+        if window < 0:
+            for queries in (
+                [100],
+                [1024],
+                [600, 70, 400],
+                [512] * 8,
+                [512] * 7 + [300],
+            ):
+                run(queries, 9000)
+        if window == 2047:
+            for queries in ([1024] * 4, [4096, 100]):
+                run(queries, 2100)
+
+
+# FP8 caches run their own variants.
+@pytest.mark.parametrize(
+    "dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16", "fp8"]
+)
+@pytest.mark.parametrize("width", [1, 8], ids=["decode", "verify"])
+def test_mha_decode_balanced_batch_size(dtype, width):
+    """The balanced decode's schedule, split and reduce kernels take the batch
+    as runtime values: no batch size compiles a new variant."""
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mha import decode
+
+    heads, kv_heads, dim, page = 16, 2, 64, 64
+    generator = torch.Generator(device=DEVICE).manual_seed(5)
+    k_cache = torch.randn(
+        200, page, kv_heads, dim, device=DEVICE, generator=generator
+    ).to(dtype)
+    v_cache = torch.randn(
+        200, page, kv_heads, dim, device=DEVICE, generator=generator
+    ).to(dtype)
+    # A fixed table width keeps the table stride out of the sweep.
+    table_width = 64
+
+    def run(batch):
+        q = torch.randn(batch * width, heads, dim, device=DEVICE).to(dtype)
+        cache_seqlens = torch.randint(
+            width,
+            table_width * page,
+            (batch,),
+            dtype=torch.int32,
+            device=DEVICE,
+            generator=generator,
+        )
+        schedule = decode.launch_gluon_mha_decode_schedule_gfx950(
+            q, k_cache, cache_seqlens, max_seqlen_q=width, window_left=-1, out=None
+        )
+        decode.launch_gluon_mha_decode_balanced_gfx950(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            page_table=torch.randint(
+                1,
+                200,
+                (batch, table_width),
+                dtype=torch.int32,
+                device=DEVICE,
+                generator=generator,
+            ),
+            cache_seqlens=cache_seqlens,
+            max_seqlen_k=1 << 20,
+            max_seqlen_q=width,
+            schedule=schedule,
+        )
+
+    run(1)
+    run(16)
+    with assert_no_triton_compile(
+        decode.gluon_mha_decode_schedule_gfx950,
+        decode.gluon_mha_decode_balanced_gfx950,
+        decode.gluon_mha_decode_balanced_reduce_gfx950,
+    ):
+        for batch in (3, 5, 7, 12, 24, 40, 70):
+            run(batch)
+
+
 def test_mxfp8_gemm_row_count():
     from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8 import mm
 
@@ -175,7 +492,7 @@ def test_mxfp4_moe_sorting_route_count():
     experts, topk, block = 64, 8, 32
     generator = torch.Generator(device=DEVICE).manual_seed(3)
 
-    def run(tokens):
+    def run(tokens, block=block):
         ids = torch.randint(
             0, experts, (tokens, topk), device=DEVICE, generator=generator
         ).int()
@@ -190,6 +507,7 @@ def test_mxfp4_moe_sorting_route_count():
                 block,
                 use_minimum_route_chunks=False,
                 runtime_rows=False,
+                deterministic_order=False,
             )
         )
         assert int(valid[1]) == tokens
@@ -204,24 +522,18 @@ def test_mxfp4_moe_sorting_route_count():
         torch.testing.assert_close(sorted_weights[position], weights.flatten()[flat])
         assert torch.equal(block_experts[position // block], ids.flatten()[flat])
 
-    def key(tokens):
-        routes = tokens * topk
-        programs = max(experts, -(-routes // 1024))
-        per_program = -(-routes // programs)
-        counts = (routes, programs, per_program)
-        return (
-            *map(int_specialization_class, counts),
-            1 << (per_program - 1).bit_length(),
-        )
-
-    # Route counts from 8K to 16K share one power-of-two route block.
-    sweep = (1033, 1100, 1500, 2000)
-    warm_specialization_classes(run, key, sweep, range(1030, 2049))
+    # Prefill sizes vary routes per program and the padding block; neither recompiles.
+    sweep = (100, 300, 1033, 1100, 3000, 8000)
+    run(1030)
     with assert_no_triton_compile(
-        moe_sorting._moe_sorting_stage1_kernel, moe_sorting._moe_sorting_stage4_kernel
+        moe_sorting._moe_sorting_stage1_kernel,
+        moe_sorting._moe_sorting_stage2_kernel,
+        moe_sorting._moe_sorting_stage3_kernel,
+        moe_sorting._moe_sorting_stage4_kernel,
     ):
         for tokens in sweep:
-            run(tokens)
+            for padding_block in (16, 32, 64, 128):
+                run(tokens, padding_block)
 
 
 def test_moe_topk_row_count():
@@ -252,7 +564,7 @@ def test_iris_allreduce_sizes():
     buf = torch.empty(1 << 22, device=DEVICE, dtype=torch.bfloat16)
     flags = torch.zeros(1024, device=DEVICE, dtype=torch.int32)
     heaps = [1 << 40] * 8
-    policy = comm.iris_cache_policy()
+    policy = comm.iris_arch_policy()
     common = dict(RANK=0, WORLD_SIZE=8)
     common.update(WORDS_PER_LANE=2, ELEMENT_DTYPE=gl.bfloat16, ELEMENTS_PER_WORD=4)
     common.update(
@@ -275,6 +587,7 @@ def test_iris_allreduce_sizes():
             NUM_TILES=tiles,
             NUM_WARPS=8,
             EXIT_BARRIER=True,
+            WAIT_STORES=policy.wait_stores,
             num_warps=8,
             grid=(1,),
             **common,

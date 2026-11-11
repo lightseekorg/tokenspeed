@@ -57,10 +57,10 @@ def _compile_allgather_columns(arch_name):
     from tokenspeed_kernel._triton import gluon, triton
     from tokenspeed_kernel.ops.communication._iris import all_gather as ag
     from tokenspeed_kernel.ops.communication._iris.all_reduce import (
-        iris_cache_policy,
+        iris_arch_policy,
     )
 
-    policy = iris_cache_policy(_ARCH_VERSIONS[arch_name])
+    policy = iris_arch_policy(_ARCH_VERSIONS[arch_name])
     subgroup_size = triton.backends.amd.compiler.HIPOptions(arch=arch_name).warp_size
     fn = ag.iris_pull_allgather_columns
     pointers = ("input_ptr", "input_sym_ptr", "output_ptr", "ready_flags")
@@ -151,8 +151,8 @@ _ISA = {
 
 
 @pytest.mark.parametrize("arch", _ARCHS)
-def test_iris_cache_policy_codegen(arch, tmp_path):
-    """Peer accesses carry their architecture's IrisCachePolicy.
+def test_iris_arch_policy_codegen(arch, tmp_path):
+    """Peer accesses carry their architecture's IrisArchPolicy.
 
     gfx950 reads peer data non-temporally and writes peer barrier epochs
     write-through. On gfx1250 both carry no cache policy. Flag polls and epoch
@@ -192,3 +192,129 @@ def test_iris_cache_policy_codegen(arch, tmp_path):
     assert all(re.search(isa["system"], line) for line in atomics), atomics
 
     assert re.search(r"\.amdhsa_private_segment_fixed_size\s+0\b", assembly)
+
+
+@pytest.mark.skipif(not current_platform().is_cdna4, reason="gfx950 codegen")
+@pytest.mark.parametrize("exit_barrier", [False, True])
+def test_iris_pull_twoshot_stores_reach_l2_before_release(exit_barrier):
+    """Every subgroup's partition stores reach L2 before the readiness release.
+
+    All eight subgroups store the reduced partition, and the release run by
+    one thread waits only for its own subgroup's stores. Compile without
+    launching and check that, on every path, each subgroup runs
+    s_waitcnt vmcnt(0) before the barrier preceding the entry and partition
+    releases.
+    """
+    from tokenspeed_kernel._triton import gl, gluon, triton
+    from tokenspeed_kernel.ops.communication._iris.all_reduce import (
+        iris_arch_policy,
+        iris_pull_twoshot,
+    )
+    from utils import vmcnt_zero_before_barrier
+
+    policy = iris_arch_policy(ArchVersion(9, 5))
+    fn = iris_pull_twoshot
+    pointers = ("input_sym_ptr", "scratch_sym_ptr", "output_ptr", "ready_flags")
+    signature = {name: "*bf16" for name in pointers[:3]}
+    signature["ready_flags"] = "*i32"
+    signature.update({f"heap_base_{peer}": "i64" for peer in range(8)})
+    signature.update({"PARTITION_WORDS": "i32", "NUM_PROGRAMS": "i32"})
+    signature["NUM_TILES"] = "i32"
+    constexprs = {
+        "RANK": 3,
+        "WORLD_SIZE": 8,
+        "BLOCK_WORDS": 128,
+        "NUM_WARPS": 8,
+        "WORDS_PER_LANE": 2,
+        "ELEMENT_DTYPE": gl.bfloat16,
+        "ELEMENTS_PER_WORD": 4,
+        "EXIT_BARRIER": exit_barrier,
+        "PEER_PAYLOAD_LOAD_CACHE": policy.peer_payload_load,
+        "PEER_SIGNAL_STORE_CACHE": policy.peer_signal_store,
+        "WAIT_STORES": policy.wait_stores,
+        "residual": None,
+        "post": None,
+        "comb": None,
+        "HIDDEN_WORDS": 0,
+        "HC_POST": False,
+    }
+    signature.update({name: "constexpr" for name in constexprs})
+    attrs = {
+        (index,): [["tt.divisibility", 16]]
+        for index, name in enumerate(fn.arg_names)
+        if name in pointers
+    }
+    source = gluon._runtime.GluonASTSource(
+        fn, signature, constexprs=constexprs, attrs=attrs
+    )
+    kernel = triton.compile(
+        source,
+        target=triton.backends.compiler.GPUTarget("hip", "gfx950", 64),
+        options={"num_warps": 8},
+    )
+    releases = vmcnt_zero_before_barrier(
+        kernel.asm["amdgcn"], "iris_pull_twoshot", r"\bglobal_atomic_add\b.*sc0 sc1"
+    )
+    # The exit release only reports returned peer reads, so it needs a barrier
+    # after them; its local output stores need not reach L2.
+    assert len(releases) == 2 + exit_barrier, releases
+    assert all(waited for _, waited, _ in releases[:2]), releases
+    assert all(barrier for _, _, barrier in releases), releases
+
+
+@pytest.mark.skipif(not current_platform().is_cdna4, reason="gfx950 codegen")
+def test_iris_allgather_rmsnorm_mxfp4_stores_reach_l2_before_release():
+    """Every subgroup's staged shard reaches L2 before the readiness release.
+
+    At TP4 the 1024-feature shard spans two of the eight subgroups, and the
+    release run by one thread waits only for its own subgroup's stores.
+    Compile without launching and check that, on every path, each subgroup
+    runs s_waitcnt vmcnt(0) before the barrier preceding the release. The
+    later completion release only reports returned peer reads, so it needs
+    just a barrier after them.
+    """
+    from tokenspeed_kernel._triton import gluon, triton
+    from tokenspeed_kernel.ops.communication._iris.all_gather import (
+        iris_fused_pull_allgather_rmsnorm_mxfp4 as fn,
+    )
+    from tokenspeed_kernel.ops.communication._iris.all_reduce import (
+        iris_arch_policy,
+    )
+    from utils import vmcnt_zero_before_barrier
+
+    pointers = ("local_input", "symmetric_input", "weight", "ready_flags")
+    signature = {name: "*bf16" for name in pointers[:3]}
+    signature.update(packed_output="*u8", scale_output="*u8", ready_flags="*i32")
+    signature.update(heaps=("i64",) * 4)
+    signature.update(scale_stride_linear="i32", scale_stride_mblock="i32")
+    constexprs = {
+        "rank": 1,
+        "local_width": 1024,
+        "total_width": 4096,
+        "eps": 1e-6,
+        "weight_offset": 1.0,
+        "block_k": 4096,
+        "input_published": False,
+        "num_warps": 8,
+        "WAIT_STORES": iris_arch_policy(ArchVersion(9, 5)).wait_stores,
+    }
+    signature.update({name: "constexpr" for name in constexprs})
+    signature = {name: signature[name] for name in fn.arg_names}
+    attrs = {
+        (index,): [["tt.divisibility", 16]]
+        for index, name in enumerate(fn.arg_names)
+        if name in pointers or name.endswith("output")
+    }
+    kernel = triton.compile(
+        gluon._runtime.GluonASTSource(
+            fn, signature, constexprs=constexprs, attrs=attrs
+        ),
+        target=triton.backends.compiler.GPUTarget("hip", "gfx950", 64),
+        options={"num_warps": 8},
+    )
+    releases = vmcnt_zero_before_barrier(
+        kernel.asm["amdgcn"], fn.fn.__name__, r"\bglobal_atomic_add\b.*sc0 sc1"
+    )
+    assert len(releases) == 2, releases
+    assert releases[0][1], releases
+    assert releases[1][2], releases

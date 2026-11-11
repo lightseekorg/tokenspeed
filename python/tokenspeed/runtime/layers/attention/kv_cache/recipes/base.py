@@ -47,6 +47,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.scheduler_bridge impor
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     CacheGroupDeclaration,
     CacheGroupSpec,
+    SlidingWindowTokens,
     group,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.storage import (
@@ -61,6 +62,9 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
         CacheModelFamily,
         CacheSetup,
+    )
+    from tokenspeed.runtime.layers.attention.qsa.bf16_scratch import (
+        QSABf16ScratchPlan,
     )
 
 
@@ -301,6 +305,16 @@ class CacheRecipe(ABC):
         )
 
     @property
+    def sliding_window_tokens(self) -> SlidingWindowTokens:
+        """Sliding-window sizes for :attr:`layer_types`: one value for every
+        sliding layer, or one entry per layer.
+
+        Returns the target config's windows, which the default per-layer
+        :meth:`groups` walk reads; recipes that append draft layers override it.
+        """
+        return self.attn_config.component(SoftmaxAttnConfig).sliding_window_tokens
+
+    @property
     def num_target_layers(self) -> int:
         """Leading layers that belong to the target model."""
         return self.model_config.num_attention_layers
@@ -327,9 +341,14 @@ class CacheRecipe(ABC):
     # ------------------------------------------------------------------
 
     @property
+    @abstractmethod
     def prefix_granularity(self) -> int:
-        """Scheduler-wide identity grain in tokens."""
-        return int(self.attn_config.prefix_granularity)
+        """Scheduler-wide identity grain in tokens.
+
+        Every recipe declares its own: a multiple of each history group's
+        ``block_granularity``, sized for the kernels that read those blocks.
+        No launch option overrides it; the memory plan carries it from here.
+        """
 
     @property
     def alignment(self) -> int:
@@ -375,9 +394,7 @@ class CacheRecipe(ABC):
         return group(
             layer_types=self.layer_types,
             group_ids=self.group_ids,
-            sliding_window_tokens=self.attn_config.component(
-                SoftmaxAttnConfig
-            ).sliding_window_tokens,
+            sliding_window_tokens=self.sliding_window_tokens,
             prefix_granularity=self.prefix_granularity,
             fields_for_layer=self.fields_for_layer,
             pd_disaggregation_enabled=self.pd_disaggregation_enabled,
@@ -568,6 +585,21 @@ class CacheRecipe(ABC):
     def workspace_bytes(self) -> int:
         """Cache-adjacent fixed allocation this family also needs."""
         return 0
+
+    @cached_property
+    def qsa_bf16_scratch_plan(self) -> QSABf16ScratchPlan | None:
+        """The QSA BF16 prefill scratch this engine reserves, or None.
+
+        ``--enable-qsa-prefill-bf16-scratch`` serves families with QSA
+        sparse-attention layers, which override this seam and count the plan
+        in ``workspace_bytes``; every other family refuses the flag.
+        """
+        if self.server_args.enable_qsa_prefill_bf16_scratch:
+            raise ValueError(
+                "--enable-qsa-prefill-bf16-scratch serves QSA sparse-attention "
+                f"models; this model's cache family is {self.family!r}"
+            )
+        return None
 
     def verify_scratch_in_pool(self) -> bool:
         """Whether speculative verify stages its scratch in the bound pool.

@@ -14,8 +14,14 @@ from tokenspeed.runtime.configs.glm53_flash_config import (
     Glm53FlashVisionConfig,
 )
 from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.drafter.eagle import Eagle
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.layers.attention import kpool as kpool_runtime
+from tokenspeed.runtime.layers.attention.backends.base import SparseTopKShare
 from tokenspeed.runtime.layers.attention.kpool import KPoolRuntime
+from tokenspeed.runtime.layers.dense import unquant
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
 from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
@@ -445,6 +451,108 @@ def test_text_and_nextn_model_hierarchies(monkeypatch) -> None:
         nextn.model.decoder.self_attn.kv_b_proj.prefix
         == "model.layers.4.self_attn.kv_b_proj"
     )
+
+
+@pytest.mark.parametrize(
+    "share_indices", [None, False, True], ids=["absent", "off", "on"]
+)
+def test_nextn_reuses_first_draft_selection_only_when_configured(
+    monkeypatch, share_indices: bool | None
+) -> None:
+    mapping = Mapping(rank=0, world_size=1)
+    monkeypatch.setitem(global_server_args_dict, "mapping", mapping)
+    monkeypatch.setitem(global_server_args_dict, "attention_backend", "dsa")
+    monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 0)
+    checkpoint_config = _tiny_config().to_dict()
+    if share_indices is None:
+        del checkpoint_config["text_config"]["index_share_for_mtp_iteration"]
+    else:
+        checkpoint_config["text_config"][
+            "index_share_for_mtp_iteration"
+        ] = share_indices
+    config = Glm53FlashConfig.from_dict(checkpoint_config)
+    assert config.text_config.index_share_for_mtp_iteration is bool(share_indices)
+    model = Glm53FlashForConditionalGenerationNextN(config, mapping)
+    target = Glm53FlashForCausalLM(config.text_config, mapping)
+    assert model.index_share_for_mtp_iteration is bool(share_indices)
+    assert not target.model.layers[3].self_attn.skip_indexer_topk
+
+    attention = model.model.decoder.self_attn
+    assert attention.skip_indexer_topk is bool(share_indices)
+    runtime = KPoolRuntime(pool_size=4, index_topk=8)
+    backend = SimpleNamespace(
+        sparse_topk=SparseTopKShare(),
+        require_kpool_runtime=lambda: runtime,
+        forward_decode_metadata=None,
+        write_locations=lambda *_args: torch.zeros(1, dtype=torch.int64),
+    )
+    drafter = Eagle.__new__(Eagle)
+    drafter.draft_model_runner = SimpleNamespace(model=model)
+    drafter.attn_backend = backend
+    ctx = ForwardContext(
+        attn_backend=backend,
+        token_to_kv_pool=None,
+        bs=1,
+        num_extends=0,
+        input_num_tokens=1,
+        forward_mode=ForwardMode.DECODE,
+        output_layout=ForwardOutputLayout(0, 0, 1, 1),
+    )
+
+    # Keep the real projection layers, using PyTorch for their GPU GEMM leaf.
+    monkeypatch.setattr(unquant, "kernel_mm", nn.functional.linear)
+    with torch.no_grad():
+        for parameter in attention.parameters():
+            parameter.fill_(0.25)
+        attention.o_proj.weight.copy_(torch.eye(16))
+
+    # The remaining substitutions are GPU-only normalization, indexer and cache
+    # kernels. Sparse attention exposes the selected slots in the output.
+    monkeypatch.setattr(
+        attention.fused_qk_layernorm,
+        "forward",
+        lambda **kwargs: kwargs["output_q_a"].zero_(),
+    )
+    monkeypatch.setattr(
+        attention.indexer,
+        "forward",
+        lambda *_args: Glm53FlashIndexerOutput(
+            query=torch.zeros((1, 2, 8)),
+            key=torch.zeros((1, 8)),
+            weights=torch.zeros((1, 2)),
+            gate=torch.zeros(1),
+        ),
+    )
+    monkeypatch.setattr(runtime, "write_decode", lambda **_kwargs: None)
+    selections = []
+
+    def select_topk(*_args, **_kwargs):
+        selections.append(step)
+        return GlmDsaDecodeTopK(
+            topk_indices=torch.tensor([[10 * (step + 1)]], dtype=torch.int32),
+            topk_lens=torch.ones(1, dtype=torch.int32),
+        )
+
+    def sparse_attention(_positions, _q, _latent, _ctx, _slots, out, **kwargs):
+        out.copy_(kwargs["topk_indices"].to(out.dtype).expand_as(out))
+
+    monkeypatch.setattr(attention, "_compute_decode_topk_indices", select_topk)
+    monkeypatch.setattr(attention, "forward_absorb", sparse_attention)
+    state = (None, None)
+    for step in range(5):
+        drafter._attach_dsa_topk(state)
+        output = attention(
+            torch.tensor([step]),
+            torch.zeros((1, 16)),
+            ctx,
+            model.model.decoder.comm_manager,
+        )
+        state = drafter._extract_dsa_topk(state)
+        expected_selection = 10 if share_indices else 10 * (step + 1)
+        torch.testing.assert_close(
+            output, torch.full((1, 16), expected_selection * 1.0)
+        )
+    assert selections == ([0] if share_indices else list(range(5)))
 
 
 def test_decode_topk_workspaces_reuse_storage_and_retain_grown_buffers() -> None:

@@ -73,7 +73,6 @@ def test_flashmla_prefill_plans_without_device_downloads(
         device="cuda",
         dtype=torch.bfloat16,
         kv_cache_dtype=torch.bfloat16,
-        prefix_granularity=128,
         kernel_page_size=64,
         context_len=512,
         max_bs=4,
@@ -83,11 +82,11 @@ def test_flashmla_prefill_plans_without_device_downloads(
     leaf = flashmla.FlashMLABackend(config, spec, kernel_page_size=64)
     leaf.set_cache_pool(make_kimi_pool("cuda", usable_pages=6))
     leaf.init_cuda_graph_state(max_bs=4)
-    table = torch.tensor(
+    table_cpu = torch.tensor(
         [[2, 5, 1, 0, 0, 0, 0, 0], [4, 3, 1, 0, 0, 0, 0, 0], [1] * 8],
         dtype=torch.int32,
-        device="cuda",
     )
+    table = table_cpu.to("cuda")
     prefix_cpu = torch.tensor([65, 17] if with_prefix else [0, 0], dtype=torch.int32)
     extends_cpu = torch.tensor([4, 3], dtype=torch.int32)
     prefix = prefix_cpu.to("cuda")
@@ -120,7 +119,8 @@ def test_flashmla_prefill_plans_without_device_downloads(
             extend_prefix_lens_cpu=prefix_cpu,
             extend_with_prefix=with_prefix,
             query_shard=None,
-            page_table_cpu=None,
+            # The router hands an extend the host rows of its kernel page table.
+            page_table_cpu=table_cpu[:2],
         )
         if with_prefix:
             output = leaf.prefill_wrapper_paged.run(

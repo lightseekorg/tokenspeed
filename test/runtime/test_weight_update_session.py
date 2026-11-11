@@ -134,7 +134,7 @@ def test_partial_streams_in_a_session_derive_once_at_the_end(model):
     first, second = stream[:2], stream[2:]
     pointers = [(a.w_kc.data_ptr(), a.w_vc.data_ptr()) for a in model.layers]
 
-    with weight_update_session([model]):
+    with weight_update_session([model], require_complete=False, cpu_group=None):
         model.load_weights(first)
         # Nothing derived mid-stream.
         assert model.post_load_calls == 1
@@ -155,7 +155,7 @@ def test_partial_streams_in_a_session_derive_once_at_the_end(model):
 def test_norm_scale_applies_only_to_reloaded_layers(model):
     stream = [entry for entry in _checkpoint(2) if entry[0].startswith("layers.0.")]
 
-    with weight_update_session([model]):
+    with weight_update_session([model], require_complete=False, cpu_group=None):
         model.load_weights(stream)
 
     assert torch.equal(
@@ -176,13 +176,13 @@ def test_outside_a_session_each_call_derives_as_before(model):
 
 def test_a_failed_update_leaves_no_session_behind_and_skips_derivation(model):
     with pytest.raises(RuntimeError, match="store"):
-        with weight_update_session([model]):
+        with weight_update_session([model], require_complete=False, cpu_group=None):
             model.load_weights(_checkpoint(4)[:1])
             raise RuntimeError("store unreachable")
     assert model.post_load_calls == 1
     assert not model._weight_update_active
     # The next session starts clean.
-    with weight_update_session([model]):
+    with weight_update_session([model], require_complete=False, cpu_group=None):
         model.load_weights(_checkpoint(4))
     assert model.post_load_calls == 2
 
@@ -199,7 +199,7 @@ def test_a_non_unit_kv_scale_is_loaded_derived_and_then_rejected(model):
     ]
 
     with pytest.raises(ValueError, match="layers.0.attn.k_scale") as info:
-        with weight_update_session([model]):
+        with weight_update_session([model], require_complete=False, cpu_group=None):
             model.load_weights(stream[:2] + scales)
             model.load_weights(stream[2:])
     assert "v_scale" not in str(info.value)
@@ -209,7 +209,7 @@ def test_a_non_unit_kv_scale_is_loaded_derived_and_then_rejected(model):
         w_kc, w_vc = _expected_pair(attn.kv_b_proj.weight.detach())
         assert torch.equal(attn.w_kc, w_kc)
     # The next session starts clean and a unit scale passes.
-    with weight_update_session([model]):
+    with weight_update_session([model], require_complete=False, cpu_group=None):
         model.load_weights(_checkpoint(6) + scales[1:])
     assert model.post_load_calls == 3
 
@@ -221,7 +221,7 @@ def test_kv_scales_are_not_screened_outside_a_session(model):
 
 
 def test_nested_sessions_are_rejected(model):
-    with weight_update_session([model]):
+    with weight_update_session([model], require_complete=False, cpu_group=None):
         with pytest.raises(RuntimeError, match="already active"):
             model.begin_weight_update()
     with pytest.raises(RuntimeError, match="no weight-update session"):
@@ -238,7 +238,7 @@ def test_models_outside_the_protocol_are_left_alone():
             self.calls += len(list(weights))
 
     plain = _Plain()
-    with weight_update_session([plain]):
+    with weight_update_session([plain], require_complete=False, cpu_group=None):
         plain.load_weights([("a", torch.ones(1))])
     assert plain.calls == 1
 
@@ -312,7 +312,7 @@ def test_naive_overrides_derive_once_per_session_and_record_names():
     assert lm.seen_at_derive == [None]
 
     stream = _naive_stream(1)
-    with weight_update_session([lm]):
+    with weight_update_session([lm], require_complete=False, cpu_group=None):
         lm.load_weights(stream[:1])
         lm.load_weights(stream[1:])
         assert lm.post_load_calls == 1
@@ -337,7 +337,7 @@ def test_a_delegating_override_reports_each_non_unit_scale_once():
     lm = _Delegating()
     lm.load_weights(_checkpoint(0))
     with pytest.raises(ValueError) as info:
-        with weight_update_session([lm]):
+        with weight_update_session([lm], require_complete=False, cpu_group=None):
             lm.load_weights(
                 _checkpoint(7) + [("layers.0.attn.k_scale", torch.tensor([0.5]))]
             )
@@ -348,7 +348,7 @@ def test_a_delegating_override_reports_each_non_unit_scale_once():
 def test_a_session_without_any_load_derives_nothing():
     lm = _NaiveLM()
     lm.load_weights(_naive_stream(0))
-    with weight_update_session([lm]):
+    with weight_update_session([lm], require_complete=False, cpu_group=None):
         pass
     assert lm.post_load_calls == 1
 
@@ -386,7 +386,9 @@ def test_end_of_one_model_raising_still_closes_the_others():
         raise RuntimeError("derive failed")
 
     with pytest.raises(RuntimeError, match="derive failed"):
-        with weight_update_session([first, second, third]):
+        with weight_update_session(
+            [first, second, third], require_complete=False, cpu_group=None
+        ):
             for lm in (first, second, third):
                 lm.load_weights(_naive_stream(2))
             # The deferred derivation of ``second`` fails at end_weight_update.
@@ -397,7 +399,9 @@ def test_end_of_one_model_raising_still_closes_the_others():
     for lm in (first, second, third):
         assert not lm._weight_update_active
         assert lm._weight_update_loaded_names is None
-    with weight_update_session([first, second, third]):
+    with weight_update_session(
+        [first, second, third], require_complete=False, cpu_group=None
+    ):
         pass
 
 
@@ -471,7 +475,7 @@ def test_nextn_pairs_q_a_and_kv_a_across_chunks(nextn):
     pointers = (attn.w_kc.data_ptr(), attn.w_vc.data_ptr())
 
     q_a, kv_a = _a_proj_pair(1)
-    with weight_update_session([nextn]):
+    with weight_update_session([nextn], require_complete=False, cpu_group=None):
         nextn.load_weights([q_a])
         # Half a pair: the fused projection keeps waiting.
         assert nextn._pending_a_proj
@@ -490,14 +494,14 @@ def test_nextn_rejects_an_update_whose_partner_never_arrived(nextn):
     before = attn.fused_qkv_a_proj_with_mqa.weight.clone()
 
     with pytest.raises(RuntimeError, match="q_a_proj"):
-        with weight_update_session([nextn]):
+        with weight_update_session([nextn], require_complete=False, cpu_group=None):
             nextn.load_weights([_a_proj_pair(1)[0]])
     assert torch.equal(attn.fused_qkv_a_proj_with_mqa.weight, before)
     assert not nextn._pending_a_proj
     assert not nextn._weight_update_active
     # The next session starts clean.
     q_a, kv_a = _a_proj_pair(2)
-    with weight_update_session([nextn]):
+    with weight_update_session([nextn], require_complete=False, cpu_group=None):
         nextn.load_weights([q_a, kv_a])
     assert torch.equal(
         attn.fused_qkv_a_proj_with_mqa.weight, torch.cat([q_a[1], kv_a[1]])
@@ -539,3 +543,180 @@ def test_fp8_qkv_a_pad_keeps_the_loader_attributes_for_live_updates():
     # Aligned now: a re-run (every load_weights ends in the pad) is a no-op.
     pad_fused_qkv_a_proj_weight_for_fp8_blockscale(attn)
     assert proj.weight is padded
+
+
+# ---------------------------------------------------------------------------
+# Complete updates: discarded storage has no old value to fill missing names.
+# ---------------------------------------------------------------------------
+
+
+class _CompleteLM(_TinyLM):
+    supports_weight_discard = True
+
+    def required_weight_update_names(self) -> set[str]:
+        return {name for name, _ in self.named_parameters()}
+
+    def weight_discard_preserved_tensors(self) -> tuple[torch.Tensor, ...]:
+        return ()
+
+
+def _complete_model() -> _CompleteLM:
+    model = _CompleteLM()
+    model.load_weights(_checkpoint(0))
+    return model
+
+
+def test_complete_update_accumulates_chunks_and_derives_after_the_last():
+    model = _complete_model()
+    before = [
+        pointer
+        for attn in model.layers
+        for pointer in (attn.w_kc.data_ptr(), attn.w_vc.data_ptr())
+    ]
+    stream = _checkpoint(8)
+    with weight_update_session([model], require_complete=True, cpu_group=None):
+        for entry in stream:
+            model.load_weights([entry])
+            assert model.post_load_calls == 1
+    assert model.post_load_calls == 2
+    assert before == [
+        pointer
+        for attn in model.layers
+        for pointer in (attn.w_kc.data_ptr(), attn.w_vc.data_ptr())
+    ]
+    for attn in model.layers:
+        key, value = _expected_pair(attn.kv_b_proj.weight.detach())
+        assert torch.equal(attn.w_kc, key)
+        assert torch.equal(attn.w_vc, value)
+
+
+@pytest.mark.parametrize("failure", ["missing", "duplicate", "unexpected"])
+def test_complete_update_rejects_bad_coverage_and_next_session_starts_clean(failure):
+    model = _complete_model()
+    stream = _checkpoint(9)
+    with pytest.raises(ValueError, match=failure):
+        with weight_update_session([model], require_complete=True, cpu_group=None):
+            model.load_weights(stream[:-1])
+            if failure == "duplicate":
+                model.load_weights(stream[:1])
+            elif failure == "unexpected":
+                model.load_weights([("unknown.weight", torch.ones(1))])
+    assert model.post_load_calls == 1
+    assert not model._weight_update_active
+    with weight_update_session([model], require_complete=True, cpu_group=None):
+        model.load_weights(stream)
+    assert model.post_load_calls == 2
+
+
+def test_complete_session_checks_every_model_before_any_derivation():
+    models = [_complete_model() for _ in range(3)]
+    stream = _checkpoint(10)
+    with pytest.raises(ValueError, match="missing checkpoint weights"):
+        with weight_update_session(models, require_complete=True, cpu_group=None):
+            models[0].load_weights(stream)
+            models[1].load_weights(stream[:-1])
+            models[2].load_weights(stream)
+    assert [model.post_load_calls for model in models] == [1, 1, 1]
+    assert not any(model._weight_update_active for model in models)
+    with weight_update_session(models, require_complete=True, cpu_group=None):
+        for model in models:
+            model.load_weights(stream)
+    assert [model.post_load_calls for model in models] == [2, 2, 2]
+
+
+def test_complete_update_tracks_source_names_once_through_delegating_loaders():
+    class _RenamingLM(_CompleteLM):
+        def required_weight_update_names(self):
+            return {
+                f"checkpoint.{name}" for name in super().required_weight_update_names()
+            }
+
+        def load_weights(self, weights):
+            return super().load_weights(
+                (name.removeprefix("checkpoint."), tensor) for name, tensor in weights
+            )
+
+    class _DelegatingLM(_RenamingLM):
+        def load_weights(self, weights):
+            return super().load_weights(weights=iter(weights))
+
+    model = _DelegatingLM()
+    stream = [(f"checkpoint.{name}", tensor) for name, tensor in _checkpoint(11)]
+    with weight_update_session([model], require_complete=True, cpu_group=None):
+        model.load_weights(weights=stream[:2])
+        model.load_weights(weights=stream[2:])
+    assert model.post_load_calls == 1
+    for attn in model.layers:
+        assert torch.equal(attn.q_a_layernorm.weight, torch.full((LATENT,), SCALE))
+
+
+def test_complete_update_does_not_accept_a_caught_load_failure():
+    model = _complete_model()
+    with pytest.raises(ValueError, match="failed while loading"):
+        with weight_update_session([model], require_complete=True, cpu_group=None):
+            model.load_weights(_checkpoint(12))
+            with pytest.raises(ValueError, match="duplicate"):
+                model.load_weights(_checkpoint(12)[:1])
+    assert model.post_load_calls == 1
+    with weight_update_session([model], require_complete=True, cpu_group=None):
+        model.load_weights(_checkpoint(13))
+    assert model.post_load_calls == 2
+
+
+def test_complete_update_rejects_a_loader_that_leaves_input_unconsumed():
+    class _ShortReader(_CompleteLM):
+        def load_weights(self, weights):
+            return super().load_weights([next(iter(weights))])
+
+    model = _ShortReader()
+    with pytest.raises(ValueError, match="did not consume"):
+        with weight_update_session([model], require_complete=True, cpu_group=None):
+            model.load_weights(_checkpoint(14))
+    assert model.post_load_calls == 0
+    assert not model._weight_update_active
+
+
+def test_complete_update_rejects_models_without_a_source_contract():
+    model = _TinyLM()
+    with pytest.raises(NotImplementedError, match="complete weight updates"):
+        with weight_update_session([model], require_complete=True, cpu_group=None):
+            pytest.fail("unsupported model entered a complete session")
+    assert not model._weight_update_active
+    with pytest.raises(TypeError, match="cannot validate"):
+        with weight_update_session(
+            [nn.Linear(2, 2)], require_complete=True, cpu_group=None
+        ):
+            pytest.fail("plain module entered a complete session")
+    with pytest.raises(ValueError, match="at least one model"):
+        with weight_update_session([], require_complete=True, cpu_group=None):
+            pytest.fail("empty model set entered a complete session")
+
+
+def test_failed_begin_override_does_not_leave_a_session_open():
+    class _BeginFailure(_CompleteLM):
+        def begin_weight_update(self):
+            super().begin_weight_update()
+            raise RuntimeError("setup failed")
+
+    model = _BeginFailure()
+    with pytest.raises(RuntimeError, match="setup failed"):
+        with weight_update_session([model], require_complete=True, cpu_group=None):
+            pytest.fail("begin failure entered session")
+    assert not model._weight_update_active
+
+
+def test_failed_end_override_closes_itself_and_remaining_models():
+    class _EndFailure(_CompleteLM):
+        def end_weight_update(self):
+            raise RuntimeError("finish failed")
+
+    first, second = _EndFailure(), _complete_model()
+    with pytest.raises(RuntimeError, match="finish failed"):
+        with weight_update_session(
+            [first, second], require_complete=True, cpu_group=None
+        ):
+            first.load_weights(_checkpoint(15))
+            second.load_weights(_checkpoint(15))
+    assert not first._weight_update_active
+    assert not second._weight_update_active
+    assert second.post_load_calls == 1

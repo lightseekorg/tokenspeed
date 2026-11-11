@@ -2,7 +2,7 @@
 
 ## Triggers and change selection
 
-The workflow is `.github/workflows/pr-test-ascendnpu-arm.yml`, displayed as `Ascend NPU Tests`.
+The workflow is `.github/workflows/ascend-npu-tests.yml`, displayed as `Ascend NPU Tests`.
 It runs in `lightseekorg/tokenspeed` or the repository identified by the full `owner/repository` value of the `TOKENSPEED_NPU_CI_REPOSITORY` repository variable. Forks must explicitly set that variable.
 Triggers include pushes to main, `pull_request` events targeting main, and `workflow_dispatch`.
 The `select` job can run in an allowed repository. The hardware job additionally requires `TOKENSPEED_NPU_ARM_CI_ENABLED` to be set to `true`.
@@ -11,7 +11,7 @@ The NPU allowlist uses its own `TOKENSPEED_NPU_CI_REPOSITORY` variable; it does 
 
 Supported PR events are `opened`, `synchronize`, `reopened`, and `ready_for_review`. Draft PRs do not start the NPU job.
 Accuracy always precedes performance.
-The independent `pr-test-npu-arm` concurrency group is keyed by PR or ref. Automatic events cancel older runs in the same group; manual events do not initiate cancellation.
+The independent `pr-test-npu-arm` concurrency group is keyed by PR or ref. Pull request events cancel older runs for the same PR; pushes and manual runs do not initiate cancellation.
 Test code never runs through `pull_request_target`.
 
 The GitHub-hosted `select` job checks out the event commit, runs the CPU-only API regression tests with `python3 -B -m unittest discover -s test/ci_system/npu -p test_changes.py`, then runs `test/ci_system/npu/changes.py`. Selection uses the same GitHub API change-list checks as the independent NPU workflow:

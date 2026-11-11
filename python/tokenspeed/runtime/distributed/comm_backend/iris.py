@@ -34,6 +34,9 @@ from tokenspeed.runtime.distributed.process_group_manager import (
 
 if TYPE_CHECKING:
     from tokenspeed_kernel.ops.communication._iris.all_gather import IrisAllGather
+    from tokenspeed_kernel.ops.communication._iris.all_reduce import (
+        ProducerAllReduce,
+    )
     from tokenspeed_kernel.ops.communication._iris.broadcast import IrisBroadcast
     from tokenspeed_kernel.ops.communication.iris import IrisAllReduce
 
@@ -53,6 +56,7 @@ class IrisBackend(CommBackend):
         self._instances: dict[tuple[Group, torch.dtype], IrisAllReduce] = {}
         self._gathers: dict[tuple[Group, torch.dtype], IrisAllGather] = {}
         self._broadcasts: dict[Group, IrisBroadcast] = {}
+        self._ordinary_all_reduces: dict[Group, ProducerAllReduce] = {}
         self._producer_direct_max_bytes = producer_direct_max_bytes
         self._max_numel = (
             min(producer_direct_max_bytes, _DEFAULT_ALL_REDUCE_MAX_BYTES)
@@ -88,6 +92,32 @@ class IrisBackend(CommBackend):
         if previous is not None and previous is not state:
             raise RuntimeError("cannot replace a prepared Iris broadcast")
         self._broadcasts[group] = state
+
+    def install_ordinary_all_reduce(
+        self, group: Group, reduction: "ProducerAllReduce"
+    ) -> None:
+        """Serve the group's ordinary BF16 all-reduces with a model's reduction.
+
+        The reduction then reduces every caller-owned tensor it admits, before
+        the generic staged path, sharing its mailboxes and producer buffer
+        with the model's own uses in stream order.
+        """
+        previous = self._ordinary_all_reduces.get(group)
+        if previous is not None and previous is not reduction:
+            raise RuntimeError("cannot replace a prepared Iris reduction")
+        self._ordinary_all_reduces[group] = reduction
+
+    def _prepared_reduction(
+        self, tensor: torch.Tensor, group: Group, op
+    ) -> "ProducerAllReduce | None":
+        reduction = self._ordinary_all_reduces.get(group)
+        if (
+            reduction is None
+            or op not in (None, torch.distributed.ReduceOp.SUM)
+            or not reduction.can_reduce_ordinary(tensor, rccl_fallback=True)
+        ):
+            return None
+        return reduction
 
     def get_prepared_all_gather(
         self, group: Group, dtype: torch.dtype
@@ -163,9 +193,11 @@ class IrisBackend(CommBackend):
         return True
 
     def can_run(self, tensor: torch.Tensor, group: Group, op=None) -> bool:
-        """Check ordinary staged eligibility without allocating collective state."""
+        """Check ordinary eligibility without allocating collective state."""
         if len(group) <= 1 or not current_platform().is_amd:
             return False
+        if self._prepared_reduction(tensor, group, op) is not None:
+            return True
         state = self.state(group, tensor.dtype)
         max_numel = self._max_numel
         if state is not None:
@@ -194,6 +226,9 @@ class IrisBackend(CommBackend):
                     self.state(group, tensor[0].dtype), tensor
                 )
             return super().all_reduce(tensor, group, op=op)
+        reduction = self._prepared_reduction(tensor, group, op)
+        if reduction is not None:
+            return reduction.reduce_ordinary(tensor)
         if self.can_run(tensor, group, op=op):
             from tokenspeed_kernel.ops.communication.iris import iris_all_reduce
 

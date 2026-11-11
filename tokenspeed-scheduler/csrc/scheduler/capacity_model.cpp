@@ -95,14 +95,11 @@ std::int64_t CapacityModel::DraftWindowTokens(const SchedulerConfig& config) {
 }
 
 std::int64_t CapacityModel::tailHandoverBlocks(std::size_t group_index) const {
-    // Blocks a request's table holds beyond its history while a published
-    // tail changes hands, one admission long: a hitter copies the tail's
-    // full blocks out of the shared entries, which stay pinned as sources
-    // until the copies land; an owner that keeps writing past its prompt end
-    // (the fused and P roles' local prefill) moves off every published tail
-    // block, the partial one included, into fresh copies. A tail holds at
-    // most P - 1 tokens; the D role lands the partial block as a fresh page
-    // instead and never continues past a publication. A sliding group
+    // Blocks a request holds beyond its history while a published tail
+    // changes hands, one admission long: a hitter copies the tail's blocks
+    // out of the shared entries, which stay pinned as sources until the
+    // copies land. A tail holds at most P - 1 tokens; the D role lands the
+    // partial block as a fresh page instead of a copy. A sliding group
     // publishes only its lookback behind the boundary.
     if (config_.disable_prefix_cache) {
         return 0;
@@ -112,6 +109,16 @@ std::int64_t CapacityModel::tailHandoverBlocks(std::size_t group_index) const {
     const std::int64_t blocks = config_.role == Role::kD ? tail_tokens / group.block_granularity
                                                          : ceilDiv(tail_tokens, group.block_granularity);
     return group.prefix_closed ? blocks : std::min(blocks, group.lookback_pages);
+}
+
+std::int64_t CapacityModel::copyInReserveBlocks(std::size_t group_index) const {
+    // Blocks a fused request holds beyond its history until its first decode
+    // publishes its prompt end and copies the published tail blocks into
+    // them -- one per published tail block, each reserved with the block it
+    // serves. The first admission can be a hitter's, whose pinned copy
+    // sources (tailHandoverBlocks) it holds beside these, so the two charges
+    // add up.
+    return config_.role == Role::kFused ? tailHandoverBlocks(group_index) : 0;
 }
 
 std::vector<std::int64_t> CapacityModel::SingleRequestGroupPages(std::int32_t token_limit) const {
@@ -148,7 +155,7 @@ std::vector<std::int64_t> CapacityModel::SingleRequestGroupPages(std::int32_t to
             }
             return pages;
         };
-        std::int64_t child_pages = token_limit == 0 ? 0 : tailHandoverBlocks(i);
+        std::int64_t child_pages = token_limit == 0 ? 0 : tailHandoverBlocks(i) + copyInReserveBlocks(i);
         if (groups_[i].prefix_closed) {
             child_pages += ceilDiv(static_cast<std::int64_t>(token_limit) + protected_tokens, block_granularity);
         } else if (config_.role == Role::kD) {
@@ -198,11 +205,11 @@ std::vector<std::int64_t> CapacityModel::ConcurrentGroupPages(std::int64_t max_t
         // past it: ceil((h + protected) / g) <= floor(h / g) + ceil((g - 1 +
         // protected) / g) for any history h, summed over the live requests;
         // plus per request the blocks a tail handover holds for one
-        // admission.
+        // admission and the copy-in blocks it may hold beside them.
         const std::int64_t dense_pages =
             ceilDiv(max_total_tokens, block_granularity) +
             live_requests * ceilDiv(block_granularity - 1 + protected_tokens, block_granularity);
-        const std::int64_t handover_pages = live_requests * tailHandoverBlocks(i);
+        const std::int64_t handover_pages = live_requests * (tailHandoverBlocks(i) + copyInReserveBlocks(i));
         if (groups_[i].prefix_closed) {
             group_pages[i] = dense_pages + handover_pages;
         } else {

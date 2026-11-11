@@ -55,10 +55,10 @@ from tokenspeed.runtime.utils import hf_transformers_utils
 def _profile(**overrides) -> ModelProfile:
     fields = dict(
         configure_attention=configure_mla_attention,
+        create_attention_config=None,
         cache_family="fixture_family",
         linear_attention="fixture_linear",
         default_attention_backend="mla",
-        default_prefix_granularity=64,
         request_token_history=True,
         is_multimodal=False,
         tokenizer_kwargs={"fix_mistral_regex": True},
@@ -531,7 +531,7 @@ def test_declared_draft_cache_family_must_match_a_custom_target() -> None:
         resolve("fixture_family", "fixture_family", draft_family_declared=True) is None
     )
     # An in-tree draft without a profile rides the target recipe's draft
-    # view (the deepseek_v4 NextN pattern).
+    # view (the in-tree NextN pattern).
     assert resolve("fixture_family", "mla", draft_family_declared=False) is None
     # A declared, different family is a layout contradiction.
     with pytest.raises(RuntimeError, match="declares cache family"):
@@ -547,7 +547,6 @@ def test_draft_profile_backend_default_lands_on_the_drafter_field() -> None:
         args,
         name="Fixture",
         default_backend="fixture_backend",
-        default_prefix_granularity=None,
         is_draft_worker=True,
     )
     assert args.drafter_attention_backend == "fixture_backend"
@@ -556,7 +555,6 @@ def test_draft_profile_backend_default_lands_on_the_drafter_field() -> None:
         args,
         name="Fixture",
         default_backend="target_backend",
-        default_prefix_granularity=None,
         is_draft_worker=False,
     )
     assert args.attention_backend == "target_backend"
@@ -651,10 +649,10 @@ def test_profiled_linear_attention_without_linear_layers_is_rejected() -> None:
 def test_attention_instances_per_layer_has_no_fallback() -> None:
     fields = dict(
         configure_attention=configure_mla_attention,
+        create_attention_config=None,
         cache_family="fixture_family",
         linear_attention=None,
         default_attention_backend=None,
-        default_prefix_granularity=None,
         request_token_history=False,
         is_multimodal=False,
         tokenizer_kwargs={},
@@ -702,7 +700,6 @@ def test_superseded_draft_profile_default_is_reported(caplog, monkeypatch) -> No
             args,
             name="Fixture",
             default_backend="draft_default",
-            default_prefix_granularity=None,
             is_draft_worker=True,
         )
     assert args.drafter_attention_backend == "target_choice"
@@ -834,3 +831,38 @@ def test_mla_dcp_checks_backend_capability(monkeypatch) -> None:
     )
     with pytest.raises(ValueError, match="supports_mla_dcp=False"):
         attention_registry._validate_mla_dcp_backend("flashmla", AttentionArch.MLA)
+
+
+def test_named_trace_context_provider_and_registration_rollback():
+    def generate_context(rid):
+        return ("a" * 32, None) if rid == "ordinary-request" else None
+
+    with pytest.raises(RuntimeError, match="rollback provider"):
+        with registry.recording():
+            registry.register_trace_provider("test-root-trace", generate_context)
+            provider = registry.get_trace_provider("test-root-trace")
+            assert provider("ordinary-request") == ("a" * 32, None)
+            assert provider("other") is None
+            with pytest.raises(ValueError, match="already registered"):
+                registry.register_trace_provider("test-root-trace", generate_context)
+            raise RuntimeError("rollback provider")
+    with pytest.raises(ValueError, match="Unknown trace provider"):
+        registry.get_trace_provider("test-root-trace")
+
+
+def test_trace_context_provider_rejects_async_and_generators():
+    async def async_provider(rid):
+        return ("a" * 32, None)
+
+    def generator_provider(rid):
+        yield ("a" * 32, None)
+
+    class AsyncProvider:
+        async def __call__(self, rid):
+            return ("a" * 32, None)
+
+    for provider in (async_provider, generator_provider, AsyncProvider()):
+        with pytest.raises(TypeError, match="synchronous"):
+            registry.register_trace_provider("test-async-trace", provider)
+    with pytest.raises(ValueError, match="Unknown trace provider"):
+        registry.get_trace_provider("test-async-trace")

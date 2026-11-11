@@ -29,7 +29,7 @@ use bytes::Bytes;
 use ts_wire::{
     control::{
         FlushCacheReqOutput, GetInternalStateReqOutput, PauseSchedulerReqInput, ProfileReq,
-        UpdateWeightsFromDistributedReqInput, PROFILE_START,
+        UpdateWeightsFromDistributedReqInput, UpdateWeightsFromMooncakeReqInput, PROFILE_START,
     },
     decode_frames, encode_frames,
     handshake::STATUS_HELLO,
@@ -193,6 +193,7 @@ fn generate_text() {
             multimodal_inputs: None,
             validation_error: Some(s("rejected")),
             data_parallel_rank: Some(1),
+            cache_session_id: Some(s("cache-session")),
         },
     );
 }
@@ -354,6 +355,24 @@ fn check_control_output(name: &str, expected: ControlOutput) {
 #[test]
 fn control_requests() {
     check_control(
+        "control_update_mooncake",
+        ControlRequest::UpdateWeightsFromMooncake(UpdateWeightsFromMooncakeReqInput {
+            rid: None,
+            http_worker_ipc: None,
+            version: 7,
+            flush_cache: true,
+            weight_version: Some(s("7")),
+            snapshot: Some(Value::Map(vec![
+                ("format_version".into(), int(1)),
+                ("version".into(), int(7)),
+                (
+                    "publishers".into(),
+                    Value::Array(vec![Value::Map(vec![("key".into(), "weights/7".into())])]),
+                ),
+            ])),
+        }),
+    );
+    check_control(
         "control_pause",
         ControlRequest::PauseScheduler(PauseSchedulerReqInput {
             rid: None,
@@ -457,6 +476,8 @@ fn output_slim() {
         ("a", &[1, 2][..], None)
     );
     assert_eq!(rows[0].output_token_logprobs, [-0.5, -1.25]);
+    assert!(rows[0].output_token_cumulative_probs.is_empty());
+    assert_eq!(rows[0].reasoning_tokens, 0);
     assert_eq!(
         (rows[1].finish_reason, rows[1].completion_tokens),
         (Some("stop"), 9)
@@ -502,6 +523,8 @@ fn no_tail() -> BatchTokenIDOutSlim {
         cached_tokens: vec![],
         output_token_logprobs_val: vec![],
         output_token_logprobs_idx: vec![],
+        output_token_cumulative_probs_val: vec![],
+        reasoning_tokens: vec![],
         engine_index: 0,
         num_running: 0,
         num_waiting: 0,
@@ -562,6 +585,8 @@ fn output_slim_tail() {
         input_top_logprobs_idx: vec![vec![None, Some(vec![9, 2]), Some(vec![4, 3])], vec![]],
         output_top_logprobs_val: vec![vec![vec![-0.25, -3.0]], vec![]],
         output_top_logprobs_idx: vec![vec![vec![7, 1]], vec![]],
+        output_token_cumulative_probs_val: vec![vec![0.75], vec![]],
+        reasoning_tokens: vec![1, 0],
         ..no_tail()
     };
     let frames = fixture("output_slim_tail");
@@ -576,6 +601,14 @@ fn output_slim_tail() {
     let rows: Vec<_> = expected.requests().unwrap().collect();
     assert_eq!(rows[0].spec_verify_ct, Some(2));
     assert_eq!(rows[0].accept_draft_tokens, Some(1.5));
+    assert_eq!(rows[0].output_token_cumulative_probs, [0.75]);
+    assert!(rows[1].output_token_cumulative_probs.is_empty());
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.reasoning_tokens)
+            .collect::<Vec<_>>(),
+        [1, 0]
+    );
     assert_eq!(
         rows[0].input_token_logprobs,
         Some((&[None, Some(-1.0), Some(-2.5)][..], &[1, 2, 3][..]))
@@ -593,6 +626,16 @@ fn ragged_output_columns_are_rejected() {
     batch.cached_tokens.pop();
     let error = batch.requests().err().unwrap();
     assert!(error.to_string().contains("cached_tokens"), "{error}");
+}
+
+#[test]
+fn cumulative_probabilities_reject_ragged_request_and_token_rows() {
+    let mut batch: BatchTokenIDOutSlim = decode_frames(&fixture("output_slim_tail")).unwrap();
+    batch.output_token_cumulative_probs_val.pop();
+    assert!(batch.requests().is_err());
+    batch.output_token_cumulative_probs_val.push(vec![]);
+    batch.output_token_cumulative_probs_val[0].push(1.0);
+    assert!(batch.requests().is_err());
 }
 
 #[test]

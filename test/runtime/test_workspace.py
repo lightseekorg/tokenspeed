@@ -89,10 +89,13 @@ def test_growth_moves_the_block():
 
 def test_block_grows_to_the_largest_request_and_never_shrinks():
     pool = _pool()
+    assert pool.capacity_bytes == 1024
     pool.allocate(((1024,), torch.float32))
+    assert pool.capacity_bytes == 4096
     grown = pool.allocate(((1,), torch.uint8))[0].data_ptr()
     pool.allocate(((256,), torch.float32))
     assert pool.allocate(((1,), torch.uint8))[0].data_ptr() == grown
+    assert pool.capacity_bytes == 4096
 
 
 def test_frozen_pool_keeps_addresses_stable():

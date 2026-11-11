@@ -23,7 +23,7 @@
 :func:`causal_conv1d_fn` (prefill) and :func:`causal_conv1d_update` (decode,
 chain verify and draft trees) select the depthwise causal conv in front of
 the Mamba / GDN recurrences, over a slot-indexed conv-window pool; the
-selected leaves are registered in ``conv/triton.py``.
+selected leaves are registered in ``conv/triton.py`` and ``conv/cute_dsl.py``.
 
 :func:`dflash2_grouped_conv` is independent of everything below it: a
 block-local grouped depthwise convolution for DFlash2's draft layers, with no
@@ -66,8 +66,10 @@ import torch
 from tokenspeed_kernel._triton import tl as _tl
 from tokenspeed_kernel._triton import triton as _triton_lang
 from tokenspeed_kernel.ops.attention.gdn.triton import CausalConv1dPrefillMetadata
+from tokenspeed_kernel.ops.conv import cute_dsl as _cute_dsl_solutions  # noqa: F401
 from tokenspeed_kernel.ops.conv.triton import (
     PAD_SLOT_ID,
+    PREFILL_QKV_CHANNEL_MULTIPLE,
     _inkling_ring_commit_kernel,
     _inkling_ring_sconv_decode_kernel,
     _inkling_ring_sconv_prefill_kernel,
@@ -80,8 +82,10 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = [
     "PAD_SLOT_ID",
+    "PREFILL_QKV_CHANNEL_MULTIPLE",
     "InklingCommitTable",
     "causal_conv1d_fn",
+    "causal_conv1d_qkv_fn",
     "causal_conv1d_update",
     "dflash2_grouped_conv",
     "inkling_commit_tables",
@@ -358,7 +362,11 @@ def inkling_commit_tables(
             raise ValueError(f"layer {layer}'s stream runs past the ring channels")
 
     def device(values: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
-        return torch.tensor(values, dtype=dtype, device=ring.device)
+        # The caller may build the tables on the first verify round, while
+        # serving: stage through pinned memory so the upload does not wait
+        # for the step in flight (a pageable copy would).
+        host = torch.tensor(values, dtype=dtype, pin_memory=True)
+        return host.to(ring.device, non_blocking=True)
 
     tables = []
     for dtype, rows in entries.items():
@@ -483,6 +491,16 @@ def causal_conv1d_fn(
         traits={
             "width": weight.shape[1],
             "state_layout": _state_layout(conv_states, weight),
+            "channels": x.shape[0],
+            "channel_contiguous": x.stride(0) == 1,
+            "token_stride": x.stride(1),
+            "weight_dtype": weight.dtype,
+            "bias_dtype": bias.dtype if bias is not None else None,
+            "state_dtype": conv_states.dtype,
+            "indexed_state": cache_indices is not None
+            and has_initial_state is not None,
+            "pad_slot_id": pad_slot_id,
+            "block_m": prefill_metadata.block_m,
         },
     )
     return kernel(
@@ -497,6 +515,49 @@ def causal_conv1d_fn(
         pad_slot_id=pad_slot_id,
         validate_data=validate_data,
         prefill_metadata=prefill_metadata,
+    )
+
+
+def causal_conv1d_qkv_fn(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    conv_states: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    cache_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
+    activation: str | None = "silu",
+    pad_slot_id: int = PAD_SLOT_ID,
+    *,
+    prefill_metadata: CausalConv1dPrefillMetadata,
+    key_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``causal_conv1d_fn`` whose packed ``[q | k | v]`` output leaves as
+    contiguous ``[tokens, width]`` q, k and v, with the same values."""
+    kernel = select_kernel(
+        "conv",
+        "causal_conv1d_prefill_qkv",
+        format_signature(x=dense_tensor_format(x.dtype)),
+        traits={
+            "width": weight.shape[1],
+            "state_layout": _state_layout(conv_states, weight),
+            "channels": x.shape[0],
+            "channel_contiguous": x.stride(0) == 1,
+            "block_m": prefill_metadata.block_m,
+        },
+    )
+    return kernel(
+        x=x,
+        weight=weight,
+        bias=bias,
+        conv_states=conv_states,
+        query_start_loc=query_start_loc,
+        cache_indices=cache_indices,
+        has_initial_state=has_initial_state,
+        activation=activation,
+        pad_slot_id=pad_slot_id,
+        prefill_metadata=prefill_metadata,
+        key_dim=key_dim,
     )
 
 

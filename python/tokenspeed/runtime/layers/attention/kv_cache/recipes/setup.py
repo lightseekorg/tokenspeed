@@ -137,7 +137,7 @@ class CacheSetup:
     """One big model, one spec: target and draft layers share everything.
 
     Draft layers are continuation layers of the one merged model (global
-    layer ids ``num_target_layers..``, the DeepSeek-V4 MTP convention
+    layer ids ``num_target_layers..``, the DeepSeek MTP convention
     generalized): one plan, one arena, one contract, one pool.
     ``num_draft_layers`` is the only draft-specific fact, consumed at
     model-runner wiring time (a draft model's local layer ``i`` maps to

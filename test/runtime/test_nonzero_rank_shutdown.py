@@ -99,6 +99,7 @@ if __name__ == "__main__":
         node_rank=1,
         model="",
         tokenizer="",
+        log_level="info",
         disaggregation_mode="null",
         kv_events_config=None,
         dist_init_addr="127.0.0.1:25000",
@@ -106,6 +107,7 @@ if __name__ == "__main__":
         zmq_handshake_endpoint=functools.partial(str, "tcp://127.0.0.1:25001"),
     )
     args.enable_memory_saver = args.enable_metrics = False
+    args.enable_async_logging = False
     args.emulate_rank_zero = False
     engine.launch_scheduler_headless(args)
 """

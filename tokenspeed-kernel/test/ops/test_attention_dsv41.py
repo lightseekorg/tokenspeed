@@ -195,6 +195,68 @@ def test_paged_field_strides_padding_and_invalid_slots(device, fmt):
     torch.testing.assert_close(direct.cpu(), decoded[:1].bfloat16(), rtol=0, atol=0)
 
 
+def test_cache_gather_output_rows_past_int32(device):
+    """Gather output rows whose offsets pass 2**31 elements land in place.
+
+    The prefill workspace gathers a batch's whole owner history, more than
+    2**31 / 512 rows near a 1M-token context.
+    """
+    fmt, dim, tail = "global", 512, 3
+    rows = 2**31 // dim + tail
+    guard = 2**31
+    required_bytes = (guard + rows * dim) * torch.bfloat16.itemsize
+    if torch.cuda.mem_get_info(device)[0] < required_bytes + (256 << 20):
+        pytest.skip("requires 9 GiB of free device memory")
+    torch.manual_seed(43)
+    values = torch.randn((tail, dim), dtype=torch.float32, device=device)
+    cache = _make_cache(values, fmt)
+    slots = torch.full((rows,), -1, dtype=torch.int64, device=device)
+    slots[-tail:] = torch.arange(tail, device=device)
+    # Row 2**31 / dim + k wrapped to 32 bits lands k * dim elements past the
+    # storage base, inside the guard, where it would overwrite the sentinel.
+    storage = torch.empty(guard + rows * dim, dtype=torch.bfloat16, device=device)
+    storage[: tail * dim].fill_(-7.0)
+    out = storage[guard:].view(rows, dim)
+    out[-tail:].fill_(float("nan"))
+
+    assert dsv41.cache_gather(cache, slots, fmt, out) is out
+    _, decoded = torch_dsv41_cache_quantize(values, fmt)
+    torch.testing.assert_close(
+        out[-tail:].cpu(), decoded.bfloat16().cpu(), rtol=0, atol=0
+    )
+    sentinel = storage[: tail * dim]
+    torch.testing.assert_close(sentinel, torch.full_like(sentinel, -7.0))
+
+
+def test_cache_scatter_input_rows_past_int32(device):
+    """Scatter reads input rows whose offsets pass 2**31 elements.
+
+    The codec's cache side addresses slots in 64 bits; the input rows follow a
+    caller-sized buffer, so their offsets do too. Three rows a 2**30 stride
+    apart put the last read at 2**31 elements, and a guard before the base
+    holds a sentinel a wrapped read would return instead.
+    """
+    fmt, dim = "global", 512
+    stride, guard = 2**30, 2**31
+    needed = guard + 2 * stride + dim
+    if torch.cuda.mem_get_info(device)[0] < needed * 2 + (256 << 20):
+        pytest.skip("requires 9 GiB of free device memory")
+    torch.manual_seed(44)
+    storage = torch.empty(needed, dtype=torch.bfloat16, device=device)
+    storage[:dim].fill_(3.0)
+    rows = storage[guard:].as_strided((3, dim), (stride, 1))
+    rows.copy_(torch.randn((3, dim), dtype=torch.bfloat16, device=device))
+    cache = torch.zeros((1, 64, _LAYOUTS[fmt][3]), dtype=torch.uint8, device=device)
+    slots = torch.arange(3, device=device)
+
+    dsv41.cache_scatter(rows, cache, slots, fmt)
+    _, decoded = torch_dsv41_cache_quantize(rows.float(), fmt)
+    got = dsv41.cache_gather(cache, slots, fmt, None)
+    torch.testing.assert_close(got.cpu(), decoded.bfloat16().cpu(), rtol=0, atol=0)
+    sentinel = storage[:dim]
+    torch.testing.assert_close(sentinel, torch.full_like(sentinel, 3.0))
+
+
 @pytest.mark.parametrize("heads", [1, 7, 16])
 @pytest.mark.parametrize("with_global", [False, True])
 def test_selected_attention_joint_sink_masking_and_chunking(device, heads, with_global):
@@ -993,24 +1055,25 @@ def test_compressor_fused_norm_preserves_pooled_bf16_boundary(device):
     assert not torch.any(actual[~active])
 
 
-def test_compressor_pool_token_count_does_not_recompile(device):
-    """Every prefill brings a new token count; the kernel must not key its
-    compile cache on the row count."""
-    tail = torch.randn(5, 2, 2, 512, device=device)
+def test_compressor_pool_token_count_and_capacity_do_not_recompile(device):
+    """Token counts and tail capacities must not key the compile cache."""
 
-    def run(count):
+    def run(count, pages):
+        tail = torch.empty(pages, 2, 2, 512, device=device)
+        tail[-1].normal_()
         projection = torch.randn(count, 1024, device=device)
         content, scores = projection[:, :512], projection[:, 512:]
         previous = torch.arange(count, device=device) - 1
-        slots = torch.full((count,), 2, device=device, dtype=torch.int32)
+        slots = torch.full((count,), pages * 2 - 1, device=device, dtype=torch.int32)
         active = torch.arange(count, device=device) % 2 == 1
+        active[0] = True
         pooled = dsv41.compressor_pool(
             content, scores, previous, tail, slots, active, None, None, 0.0
         )
         # Row 0 pairs with the tail slot; every later active row pairs with
         # its predecessor in this forward.
-        prior_content = torch.cat([tail[1, 0, 0][None], content[:-1]])
-        prior_scores = torch.cat([tail[1, 0, 1][None], scores[:-1]])
+        prior_content = torch.cat([tail[-1, 1, 0][None], content[:-1]])
+        prior_scores = torch.cat([tail[-1, 1, 1][None], scores[:-1]])
         maximum = torch.maximum(prior_scores, scores)
         old_exp = torch.exp(prior_scores - maximum)
         new_exp = torch.exp(scores - maximum)
@@ -1018,13 +1081,20 @@ def test_compressor_pool_token_count_does_not_recompile(device):
         expected[~active] = 0
         torch.testing.assert_close(pooled, expected, rtol=1e-6, atol=1e-6)
 
-    # Warm both integer-specialization classes (16-divisible and not); Triton
-    # still keys on those two properties for runtime scalars.
-    run(32)
-    run(33)
+    # Warm at a fixed capacity, then vary both token count and capacity.
+    run(32, 5)
+    run(33, 5)
     with assert_no_triton_compile(implementation._compressor_pool):
-        for count in (48, 97, 130, 1483, 4096):
-            run(count)
+        for count, pages in ((48, 3), (97, 16), (130, 17), (1483, 32), (4096, 33)):
+            run(count, pages)
+
+    # The last page starts at 2**31 FP32 elements, beyond int32 offsets.
+    pages = (1 << 20) + 1
+    required_bytes = pages * 2 * 2 * 512 * torch.float32.itemsize
+    if torch.cuda.mem_get_info(device)[0] < required_bytes + (256 << 20):
+        pytest.skip("requires 8 GiB of free device memory")
+    # AMD may compile a separate variant for buffers larger than 2 GiB.
+    run(32, pages)
 
 
 def _native_available():
@@ -1183,6 +1253,60 @@ def test_native_prefill_workspace_matches_joint_softmax(query_chunk_size):
     ]
     expected = torch.bmm(probs, selected).bfloat16()
     torch.testing.assert_close(out, expected, rtol=0.02, atol=0.004)
+
+
+@pytest.mark.skipif(
+    not _native_available(), reason="FlashMLA V4.1 on Hopper or newer required"
+)
+def test_native_prefill_output_rows_past_int32():
+    """Copy native prefill results into rows whose offsets pass 2**31 elements.
+
+    The destination is the caller's, so its row stride is too. Three rows a
+    2**30 stride apart put the last write at 2**31 elements, and a guard before
+    the base holds a sentinel a wrapped write would overwrite.
+    """
+    tokens, heads, dim = 3, 64, 512
+    stride, guard = 2**30, 2**31
+    needed = guard + 2 * stride + heads * dim
+    if torch.cuda.mem_get_info()[0] < needed * 2 + (512 << 20):
+        pytest.skip("requires 9 GiB of free device memory")
+    torch.manual_seed(743)
+    storage = torch.empty(needed, dtype=torch.bfloat16, device="cuda")
+    storage[: heads * dim].fill_(-7.0)
+    out = storage[guard:].as_strided((tokens, heads, dim), (stride, dim, 1))
+    out.fill_(float("nan"))
+    q = torch.randn(tokens, heads, dim, dtype=torch.bfloat16, device="cuda") * 0.3
+    kv = torch.randn(1024, 1, dim, dtype=torch.bfloat16, device="cuda")
+    indices = torch.randint(0, 1024, (tokens, 640), dtype=torch.int32, device="cuda")
+    sink = torch.linspace(-2, 2, heads, device="cuda")
+
+    got = dsv41.selected_attention(
+        q,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        sink,
+        dim**-0.5,
+        out,
+        tokens,
+        None,
+        kv,
+        indices,
+        lse=None,
+    )
+    assert got is out
+    selected = kv[indices.long(), 0].float()
+    logits = torch.bmm(q.float(), selected.transpose(1, 2)) * dim**-0.5
+    probs = torch.cat((logits, sink[None, :, None].expand(tokens, -1, 1)), -1).softmax(
+        -1
+    )[..., :-1]
+    expected = torch.bmm(probs, selected).bfloat16()
+    torch.testing.assert_close(out, expected, rtol=0.02, atol=0.004)
+    sentinel = storage[: heads * dim]
+    torch.testing.assert_close(sentinel, torch.full_like(sentinel, -7.0))
 
 
 @pytest.mark.parametrize("n", [0, 1, 16, 128, 129, 257, 8192, 32768])
@@ -1650,7 +1774,7 @@ def test_dspark_sparse_outputs_preserve_inactive_rows_without_recompile(device):
 @pytest.mark.parametrize(
     "heads,rows",
     [(32, rows) for rows in (0, 6, 12, 24, 48, 96, 128, 129, 192, 257)]
-    + [(heads, 257) for heads in (4, 8, 16)],
+    + [(heads, 257) for heads in (4, 8, 13, 16)],
 )
 @pytest.mark.parametrize("strided", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])

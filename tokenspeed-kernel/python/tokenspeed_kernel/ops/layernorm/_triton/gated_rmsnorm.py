@@ -29,6 +29,7 @@
 ``tokenspeed_kernel.ops.layernorm.triton.triton_gated_rmsnorm``."""
 
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.warmup import register_triton_warmup
 
 __all__ = ["gated_rmsnorm_kernel"]
 
@@ -97,3 +98,6 @@ def gated_rmsnorm_kernel(
     tl.store(
         Y + rows[:, None] * stride_y_row + offsets, y.to(Y.dtype.element_ty), mask=mask
     )
+
+
+register_triton_warmup(gated_rmsnorm_kernel.fn, variants=({"M": (1, 16, 17)},))

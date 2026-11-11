@@ -24,7 +24,16 @@ from dataclasses import dataclass
 
 import torch
 
-TOKEN_BUCKETS = (1, 8, 16, 32, 64, 128, 256, 1024, 4096)
+TOKEN_BUCKETS = (1, 8, 16, 32, 64, 128, 256)
+
+
+def _route_token_bucket(tokens: int) -> int:
+    """Select a compilation bound for any token count in 1..256."""
+    if tokens <= 0:
+        raise ValueError("Route token count must be positive")
+    if tokens > TOKEN_BUCKETS[-1]:
+        raise ValueError("Fused route token count must not exceed 256")
+    return next(bound for bound in TOKEN_BUCKETS if tokens <= bound)
 
 
 @dataclass(frozen=True)
@@ -77,16 +86,18 @@ def route_quant_fp8(
 
     Returns:
         Owned FP8 rows, padded FP32 scales, offsets and inverse/source maps.
-        Current token buckets are 1, 8, 16, 32, 64, 128, 256, 1024 and 4096;
-        top-k is a model-static value in 1..32. Warm each used bucket before
-        CUDA graph capture. Other shapes must retain their existing producer.
+        Any integer token count in 1..256 is accepted, subject to
+        tokens * topk * hidden <= 2**31 - 1. Top-k is model-static in 1..32.
+        Compilation rounds up to one of the finite TOKEN_BUCKETS. Actual N
+        remains a runtime value; inputs are not padded to a bucket. Warm each
+        used bucket before CUDA graph capture. The registered MoE path uses
+        native preprocessing for N > 256.
     """
     if input.ndim != 2 or input.shape[1] <= 0 or input.shape[1] % 128:
         raise ValueError("Route input width must be a positive multiple of 128")
     hidden = input.shape[1]
     tokens = input.shape[0]
-    if tokens not in TOKEN_BUCKETS:
-        raise ValueError("Unsupported route token bucket")
+    _route_token_bucket(tokens)
     if ids.ndim != 2 or ids.shape[0] != tokens or not 1 <= ids.shape[1] <= 32:
         raise ValueError("Route IDs must have shape [tokens, topk] with 1..32 slots")
     if (
@@ -101,6 +112,12 @@ def route_quant_fp8(
         raise ValueError("Expected BF16 inputs and int32 route IDs")
     if not input.is_contiguous() or not ids.is_contiguous():
         raise ValueError("Route inputs and IDs must be contiguous")
+    topk = ids.shape[1]
+    rows = tokens * topk
+    # Route counts, slot-major IDs and shared row reservations stay int32.
+    # Tensor address calculations use int64 before multiplying by a stride.
+    if rows * hidden > 2**31 - 1:
+        raise ValueError("Packed inputs exceed the int32 indexing range")
     if (
         not input.is_cuda
         or ids.device != input.device
@@ -108,10 +125,6 @@ def route_quant_fp8(
         or ids.data_ptr() % 4
     ):
         raise ValueError("Route inputs must be aligned tensors on one CUDA device")
-    topk = ids.shape[1]
-    rows = tokens * topk
-    if rows * hidden > 2**31 - 1:
-        raise ValueError("Packed inputs exceed the int32 indexing range")
     packed_rows = ((rows + 3) // 4) * 4
     extent = ((rows + experts * 31 + 31) // 32) * 32
     if out is None:

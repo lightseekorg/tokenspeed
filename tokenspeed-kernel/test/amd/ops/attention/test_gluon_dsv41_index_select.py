@@ -47,6 +47,8 @@ else:
     )
 
 DEVICE = "cuda"
+# Largest selection capacity each launcher accepts.
+MAX_TOPK = 2048 if is_cdna4() else 1024
 
 
 def _logits(queries, width, generator, levels=None):
@@ -88,6 +90,7 @@ def _select(fn, logits, candidates, topk, live_widths=None):
         (192, 2048, 512, None),
         (192, 4608, 512, "ordered"),
         (64, 16384, 512, "shuffled"),
+        (16, 32768, MAX_TOPK, "shuffled"),
         (8, 100, 512, None),
         (16, 3000, 300, "ordered"),
         (16, 777, 1, None),

@@ -24,6 +24,8 @@ def _make_model(num_layers: int = 8):
 class _CausalLM:
     """Minimal stand-in exposing set_dflash_layers_to_capture."""
 
+    supports_aux_capture = True
+    require_aux_capture = None  # replaced below
     set_dflash_layers_to_capture = None  # replaced below
 
     def __init__(self, model) -> None:
@@ -34,6 +36,7 @@ class _CausalLM:
 def _bind_setter():
     from tokenspeed.runtime.models.kimi_k3 import KimiLinearForCausalLM
 
+    _CausalLM.require_aux_capture = KimiLinearForCausalLM.require_aux_capture
     _CausalLM.set_dflash_layers_to_capture = (
         KimiLinearForCausalLM.set_dflash_layers_to_capture
     )
@@ -168,7 +171,7 @@ def test_attnres_capture_runs_at_owner_entry_across_pipeline_boundaries(
             is_first_pp_rank=stage == 0, is_last_pp_rank=stage == len(windows) - 1
         )
         projector = SimpleNamespace(
-            hidden_size=3,
+            projection_width=3,
             mapping=mapping,
             project_target_tap=lambda index, rows: rows,
             finalize_target_projection=lambda rows: rows,
@@ -190,14 +193,15 @@ def test_attnres_capture_runs_at_owner_entry_across_pipeline_boundaries(
             layers_to_capture=[1, 3],
             _dflash_capture_idx_map={1: 0, 3: 1},
             eagle3_layers_to_capture=(),
+            decode_chain=None,
             dflash_aux_stream="attn_res",
             output_attn_res_proj=None,
             output_attn_res_norm=None,
             norm=None,
+            decode_final=None,
         )
-        model._dspark_capture_stream = lambda index, prefix, residual: kimi_k3.KimiLinearModel._dspark_capture_stream(
-            model, index, prefix, residual
-        )
+        for name in ("_dspark_capture_stream", "_capture_tap", "_write_dspark_context"):
+            setattr(model, name, getattr(kimi_k3.KimiLinearModel, name).__get__(model))
         locations = torch.tensor([9, 10])
 
         def no_decode_window():

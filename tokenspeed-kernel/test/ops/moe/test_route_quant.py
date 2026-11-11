@@ -22,7 +22,11 @@ import dataclasses
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.moe.route_quant import PreparedMoEInput, route_quant_fp8
+from tokenspeed_kernel.ops.moe.route_quant import (
+    PreparedMoEInput,
+    _route_token_bucket,
+    route_quant_fp8,
+)
 
 
 @pytest.mark.parametrize("tokens", (1, 8))
@@ -36,6 +40,86 @@ def test_dimensions_reach_device_validation(tokens, experts, topk, hidden):
         route_quant_fp8(
             x, ids, experts=experts, expert_offset=experts * 3, solution=None
         )
+
+
+@pytest.mark.parametrize(
+    "tokens,bucket",
+    (
+        (1, 1),
+        (2, 8),
+        (3, 8),
+        (7, 8),
+        (8, 8),
+        (9, 16),
+        (16, 16),
+        (17, 32),
+        (32, 32),
+        (33, 64),
+        (64, 64),
+        (65, 128),
+        (127, 128),
+        (128, 128),
+        (129, 256),
+        (192, 256),
+        (256, 256),
+    ),
+)
+def test_runtime_token_count_and_compilation_bucket(tokens, bucket):
+    assert _route_token_bucket(tokens) == bucket
+    # Arbitrary N passes shape validation without padding or allocating GPU storage.
+    with pytest.raises(ValueError, match="one CUDA device"):
+        route_quant_fp8(
+            torch.empty((tokens, 128), dtype=torch.bfloat16),
+            torch.empty((tokens, 3), dtype=torch.int32),
+            experts=33,
+            expert_offset=66,
+            solution=None,
+        )
+
+
+@pytest.mark.parametrize("tokens", (0, -1))
+def test_compilation_bucket_rejects_nonpositive_tokens(tokens):
+    with pytest.raises(ValueError, match="token count must be positive"):
+        _route_token_bucket(tokens)
+
+
+@pytest.mark.parametrize("tokens", (257, 512, 1024, 4096, 8193))
+def test_fused_producer_rejects_tokens_above_256(tokens):
+    with pytest.raises(ValueError, match="must not exceed 256"):
+        _route_token_bucket(tokens)
+    with pytest.raises(ValueError, match="must not exceed 256"):
+        route_quant_fp8(
+            torch.empty((tokens, 128), dtype=torch.bfloat16, device="meta"),
+            torch.empty((tokens, 3), dtype=torch.int32, device="meta"),
+            experts=33,
+            expert_offset=66,
+            solution=None,
+        )
+
+
+@pytest.mark.parametrize("tokens", range(1, 257))
+def test_all_token_counts_reach_device_validation(tokens):
+    with pytest.raises(ValueError, match="one CUDA device"):
+        route_quant_fp8(
+            torch.empty((tokens, 128), dtype=torch.bfloat16),
+            torch.empty((tokens, 3), dtype=torch.int32),
+            experts=33,
+            expert_offset=66,
+            solution=None,
+        )
+
+
+@pytest.mark.parametrize("topk", (1, 5, 32))
+@pytest.mark.parametrize("overflow", (False, True))
+def test_runtime_token_indexing_bound(topk, overflow):
+    tokens = 256
+    hidden = ((2**31 - 1) // (tokens * topk * 128) + int(overflow)) * 128
+    # Meta tensors exercise the real admission check without multi-GB allocations.
+    x = torch.empty((tokens, hidden), dtype=torch.bfloat16, device="meta")
+    ids = torch.empty((tokens, topk), dtype=torch.int32, device="meta")
+    message = "int32 indexing range" if overflow else "one CUDA device"
+    with pytest.raises(ValueError, match=message):
+        route_quant_fp8(x, ids, experts=65, expert_offset=0, solution=None)
 
 
 @pytest.mark.parametrize(
@@ -56,9 +140,7 @@ def test_invalid_expert_interval(experts, offset):
 @pytest.mark.parametrize(
     "tokens,width,topk,message",
     (
-        (0, 512, 5, "token bucket"),
-        (2, 512, 5, "token bucket"),
-        (8192, 512, 5, "token bucket"),
+        (0, 512, 5, "token count must be positive"),
         (8, 257, 5, "multiple of 128"),
         (8, 512, 0, "slots"),
         (8, 512, 33, "slots"),
@@ -123,16 +205,18 @@ def test_storage_retains_original_input_and_native_map():
 @pytest.fixture(params=(128, 256, 768, 1024))
 def small_storage(request):
     # Device execution is separate; host layout validation uses real CPU storage.
-    tokens, topk, experts = 1, 2, 31
-    hidden = request.param
+    return make_storage(tokens=1, topk=2, experts=31, hidden=request.param)
+
+
+def make_storage(*, tokens, topk, experts, hidden):
     rows = tokens * topk
     extent = ((rows + experts * 31 + 31) // 32) * 32
     return PreparedMoEInput(
         torch.empty((tokens, hidden), dtype=torch.bfloat16),
         torch.empty((tokens, topk), dtype=torch.int32),
-        62,
+        experts * 2,
         experts,
-        torch.empty((4, hidden), dtype=torch.float8_e4m3fn),
+        torch.empty((((rows + 3) // 4) * 4, hidden), dtype=torch.float8_e4m3fn),
         torch.empty((hidden // 128, extent), dtype=torch.float32),
         torch.empty(experts + 1, dtype=torch.int64),
         torch.empty(rows, dtype=torch.int32),
@@ -163,6 +247,23 @@ def test_native_consumer_accepts_padded_capacity(small_storage):
         small_storage.inverse.T.reshape(-1).data_ptr()
         == small_storage.inverse.data_ptr()
     )
+
+
+@pytest.mark.parametrize("tokens", (2, 7, 9, 129, 192, 255, 256))
+def test_native_consumer_uses_actual_token_layout(tokens):
+    storage = make_storage(tokens=tokens, topk=5, experts=33, hidden=256)
+    validate_storage(storage)
+    assert storage.inverse.stride() == (1, tokens)
+    native_map = storage.inverse.T.reshape(-1)
+    native_map[4 * tokens + tokens - 1] = 123
+    assert storage.inverse[tokens - 1, 4].item() == 123
+    # Matching logical dimensions do not make a stale slot-major stride valid.
+    malformed = dataclasses.replace(
+        storage,
+        inverse=torch.empty_strided((tokens, 5), (1, tokens + 1), dtype=torch.int32),
+    )
+    with pytest.raises(ValueError, match="layout"):
+        validate_storage(malformed)
 
 
 @pytest.mark.parametrize("field", ("packed", "scales", "inverse", "offsets"))

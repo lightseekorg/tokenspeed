@@ -24,9 +24,10 @@ import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
 from tokenspeed_kernel.ops.attention.mla._triton.page_table import resolve_group_slot
 from tokenspeed_kernel.ops.layernorm.triton import reference_rmsnorm_row
-from tokenspeed_kernel.platform import CapabilityRequirement
+from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+from tokenspeed_kernel.warmup import kernel_launcher, register_triton_warmup
 
 # (decoded dimensions, quantization group, value bytes, total row bytes,
 #  quantized dimensions). QUANTIZED == D means the whole row is quantized. The
@@ -176,8 +177,10 @@ def _pack_kernel(
     FORMAT: tl.constexpr,
     SCATTER: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    slot = tl.load(Slots + row * SS).to(tl.int64) if SCATTER else row.to(tl.int64)
+    # The row reads a caller-sized input, so its offset is 64-bit like the
+    # gather's output offset; the cache side is already 64-bit through slot.
+    row = tl.program_id(0).to(tl.int64)
+    slot = tl.load(Slots + row * SS).to(tl.int64) if SCATTER else row
     if slot >= 0 and slot < CAPACITY:
         # V4 rows keep their trailing RoPE dims unquantized, so the scale groups
         # past QUANTIZED cover BF16 data. Their scale bytes are never read back;
@@ -288,8 +291,10 @@ def _gather_kernel(
     FORMAT: tl.constexpr,
     GATHER: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    slot = tl.load(Slots + row).to(tl.int64) if GATHER else row.to(tl.int64)
+    # A batch's gathered history can pass 2**31 / D output rows (the prefill
+    # workspace near a 1M-token context), so the row offset is 64-bit.
+    row = tl.program_id(0).to(tl.int64)
+    slot = tl.load(Slots + row).to(tl.int64) if GATHER else row
     valid = (slot >= 0) & (slot < CAPACITY)
     slot = tl.where(valid, slot, 0)
     d = tl.arange(0, D)
@@ -578,7 +583,7 @@ def _compressor_tail_scatter_kernel(
     # track the batch, so it stays a runtime bound.
     CAPACITY,
 ):
-    row = tl.program_id(0)
+    row = tl.program_id(0).to(tl.int64)
     slot = tl.load(Slots + row * LS).to(tl.int64)
     if slot >= 0 and slot < CAPACITY:
         d = tl.arange(0, 512)
@@ -1324,7 +1329,7 @@ def index_topk(
     return out
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["N", "PAGES"])
 def _compressor_pool(
     CONTENT,
     SCORES,
@@ -1352,15 +1357,18 @@ def _compressor_pool(
     T3: tl.constexpr,
     O0: tl.constexpr,
     O1: tl.constexpr,
-    PAGES: tl.constexpr,
+    PAGES,
 ):
-    row = tl.program_id(0)
+    row = tl.program_id(0).to(tl.int64)
     channels = tl.arange(0, 512)
     live = tl.load(ACTIVE + row * A0)
-    previous = tl.load(PREVIOUS + row * P0)
-    slot = tl.load(SLOTS + row * S0)
+    # Both rows index the caller's projections, so they are 64-bit as well.
+    previous = tl.load(PREVIOUS + row * P0).to(tl.int64)
+    slot = tl.load(SLOTS + row * S0).to(tl.int64)
     in_current = live & (previous >= 0) & (previous < N)
-    in_tail = live & (previous < 0) & (slot >= 2) & (slot < PAGES * 2)
+    # Pool capacity changes when startup replaces the probe arena. Widen
+    # before multiplying so a runtime int32 page count cannot wrap the bound.
+    in_tail = live & (previous < 0) & (slot >= 2) & (slot < PAGES.to(tl.int64) * 2)
     old_content = tl.load(CONTENT + previous * C0 + channels * C1, in_current, 0.0)
     old_scores = tl.load(SCORES + previous * G0 + channels * G1, in_current, 0.0)
     tail_offset = slot // 2 * T0 + slot % 2 * T1 + channels * T3
@@ -1477,7 +1485,7 @@ def _rotate_interleaved(value, partner, cosine, sine, odd):
     return tl.where(odd, first + second, first - second)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["NP"], do_not_specialize_on_alignment=["POS", "SLOTS"])
 def _swa_rope_insert(
     X,
     W,
@@ -1488,16 +1496,16 @@ def _swa_rope_insert(
     CACHE,
     SLOTS,
     OUT,
-    X0: tl.constexpr,
+    X0,
     X1: tl.constexpr,
     POS0: tl.constexpr,
     CS0: tl.constexpr,
     C0: tl.constexpr,
     S0: tl.constexpr,
-    O0: tl.constexpr,
+    O0,
     O1: tl.constexpr,
     P: tl.constexpr,
-    NP: tl.constexpr,
+    NP,
     MAX_POS: tl.constexpr,
     GROUP: tl.constexpr,
     VALUES: tl.constexpr,
@@ -1512,7 +1520,9 @@ def _swa_rope_insert(
         position_valid, "SWA RoPE position is outside the cosine/sine table"
     )
     slot = tl.load(SLOTS + token * S0).to(tl.int64)
-    live = (slot >= P) & (slot < NP * P)
+    # Capacity is a runtime bound, not kernel geometry. Promote before the
+    # product to retain the constexpr path's range for large pools.
+    live = (slot >= P) & (slot < NP.to(tl.int64) * P)
     x = tl.load(X + token * X0 + d * X1).to(tl.float32)
     normalized = x
     if HAS_NORM:
@@ -1681,9 +1691,11 @@ def _rope_inplace_kernel(
     X1,
     P0,
     CS0,
+    H,
     R: tl.constexpr,
     MAX_POS: tl.constexpr,
     B: tl.constexpr,
+    HB: tl.constexpr,
     WEIGHTS,
     W0,
     W1,
@@ -1691,27 +1703,29 @@ def _rope_inplace_kernel(
     SCALE_WEIGHTS: tl.constexpr,
 ):
     token = tl.program_id(0).to(tl.int64)
-    head = tl.program_id(1).to(tl.int64)
+    head = tl.program_id(1) * HB + tl.arange(0, HB)
+    live = head < H
     if SCALE_WEIGHTS:
         weight_ptr = WEIGHTS + token * W0 + head * W1
-        weight = tl.load(weight_ptr).to(tl.float32)
-        tl.store(weight_ptr, weight * WEIGHT_SCALE)
+        weight = tl.load(weight_ptr, live).to(tl.float32)
+        tl.store(weight_ptr, weight * WEIGHT_SCALE, live)
     # Keep padding/compressor sentinels in the caller's metadata. Only this
     # frequency-table lookup maps negative positions to the identity row.
     position = tl.maximum(tl.load(POS + token * P0).to(tl.int64), 0)
     valid = position < MAX_POS
     tl.device_assert(valid, "RoPE position is outside the cosine/sine table")
     pair = tl.arange(0, B)
-    mask = (pair < R // 2) & valid
-    base = X + token * X0 + head * X1
-    even = tl.load(base + 2 * pair, mask, 0.0)
-    odd = tl.load(base + 2 * pair + 1, mask, 0.0)
-    cosine = tl.load(CS + position * CS0 + pair, mask, 0.0)
-    sine = tl.load(CS + position * CS0 + R // 2 + pair, mask, 0.0)
+    pair_mask = (pair < R // 2) & valid
+    mask = live[:, None] & pair_mask[None, :]
+    base = X + token * X0 + head[:, None] * X1 + 2 * pair[None, :]
+    even = tl.load(base, mask, 0.0)
+    odd = tl.load(base + 1, mask, 0.0)
+    cosine = tl.load(CS + position * CS0 + pair, pair_mask, 0.0)[None, :]
+    sine = tl.load(CS + position * CS0 + R // 2 + pair, pair_mask, 0.0)[None, :]
     out_even = _rotate_interleaved(even, odd, cosine, sine, False)
     out_odd = _rotate_interleaved(odd, even, cosine, sine, True)
-    tl.store(base + 2 * pair, out_even.to(even.dtype), mask)
-    tl.store(base + 2 * pair + 1, out_odd.to(odd.dtype), mask)
+    tl.store(base, out_even.to(even.dtype), mask)
+    tl.store(base + 1, out_odd.to(odd.dtype), mask)
 
 
 @_register_rope("dsv41_rope_inplace")
@@ -1734,7 +1748,9 @@ def _launch_rope_inplace(values, positions, cache, weights, weight_scale):
     # launch there and scale the owned weights with the existing tensor op.
     scale_separately = weights is not None and values.shape[0] * heads > 4096
     fused_weights = None if scale_separately else weights
-    _rope_inplace_kernel[(values.shape[0], heads)](
+    # A program per token and 8 heads: one head's tail is too little work for a program.
+    heads_per_program = min(triton.next_power_of_2(heads), 8)
+    _rope_inplace_kernel[(values.shape[0], triton.cdiv(heads, heads_per_program))](
         values[..., -rotary_dim:],
         positions,
         cache,
@@ -1742,9 +1758,11 @@ def _launch_rope_inplace(values, positions, cache, weights, weight_scale):
         0 if values.ndim == 2 else values.stride(1),
         positions.stride(0),
         cache.stride(0),
+        heads,
         rotary_dim,
         cache.shape[0],
         max(triton.next_power_of_2(rotary_dim // 2), 16),
+        heads_per_program,
         fused_weights,
         0 if fused_weights is None else fused_weights.stride(0),
         0 if fused_weights is None else fused_weights.stride(1),
@@ -1825,6 +1843,197 @@ def _launch_query(values, positions, cache, output, heads_to_write):
             debug=True,
         )
     return output
+
+
+@triton.jit
+def _ue8m0_inverse(exponent):
+    # Scales are powers of two, so multiplying by the exact reciprocal rounds
+    # exactly like dividing.
+    return tl.div_rn(1.0, (exponent << 23).to(tl.float32, bitcast=True))
+
+
+# Adapted from vLLM's fused_inv_rope_fp8_quant (Apache-2.0), TMA-aligned path only.
+@triton.jit(do_not_specialize=["T", "OG", "SG", "SK"])
+def _rope_quantize_fp8_grouped(
+    X,
+    POS,
+    CS,
+    OUT,
+    S,
+    T,
+    X0,
+    X1,
+    P0,
+    CS0,
+    OG,
+    OT,
+    SG,
+    SK,
+    HPG: tl.constexpr,
+    HB: tl.constexpr,
+    R: tl.constexpr,
+    MAX_POS: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+    # One program quantizes one token's group of HPG heads, as [head, 32-channel
+    # block, channel] tiles: 512 - R NoPE channels, then R interleaved RoPE ones.
+    token = tl.program_id(0).to(tl.int64)
+    group = tl.program_id(1).to(tl.int64)
+    head = tl.arange(0, HB)[:, None, None]
+    live = head < HPG
+    block = tl.arange(0, 16)[None, :, None]
+    # S is the int32 scale storage as bytes: each int32 word packs the UE8M0
+    # exponents of four 32-channel blocks, byte j (little endian) for block
+    # 4w+j, so every block's exponent is stored as one byte.
+    scale_row = S + 4 * (group * SG + token)
+    head2 = tl.arange(0, HB)[:, None]
+    block2 = tl.arange(0, 16)[None, :]
+    scale_ptr = scale_row + 4 * (head2 * 4 + block2 // 4).to(tl.int64) * SK + block2 % 4
+    # Rows past T only pad the TMA-aligned scale storage; they must read as 0.
+    if token >= T:
+        tl.store(scale_ptr, tl.zeros((HB, 16), dtype=tl.uint8), head2 < HPG)
+        return
+    position = tl.maximum(tl.load(POS + token * P0).to(tl.int64), 0)
+    valid_position = position < MAX_POS
+    tl.device_assert(valid_position, "RoPE position is outside the cosine/sine table")
+    x_ptr = X + token * X0 + group * HPG * X1 + head * X1
+    out_ptr = OUT + group * OG + token * OT + head * 512
+
+    nope_blocks: tl.constexpr = (512 - R) // 32
+    nope = live & (block < nope_blocks)
+    offset = block * 32 + tl.arange(0, 32)[None, None, :]
+    values = tl.load(x_ptr + offset, nope, 0.0).to(tl.float32)
+    # As _fp8_group32_ue8m0_quantize_swizzled: amax floored at 1e-4, over 448.
+    amax = tl.maximum(tl.max(tl.abs(values), 2), 1.0e-4)
+    exponent = _ue8m0_exponent(amax * (1.0 / 448.0))
+    codes = values * _ue8m0_inverse(exponent)[:, :, None]
+    tl.store(out_ptr + offset, codes.to(tl.float8e4nv), nope)
+    tl.store(scale_ptr, exponent.to(tl.uint8), (head2 < HPG) & (block2 < nope_blocks))
+
+    # RoPE blocks, as (even, odd) channel pairs: pair = 16 * tail block + lane.
+    tail = tl.arange(0, R // 32)[None, :, None]
+    pair = tail * 16 + tl.arange(0, 16)[None, None, :]
+    offset = 512 - R + 2 * pair
+    even = tl.load(x_ptr + offset, live, 0.0)
+    odd = tl.load(x_ptr + offset + 1, live, 0.0)
+    cosine = tl.load(CS + position * CS0 + pair, valid_position, 1.0)
+    sine = tl.load(CS + position * CS0 + R // 2 + pair, valid_position, 0.0)
+    # Round to BF16 first, as the unfused path stores RoPE output before quantizing.
+    even_out = _rotate_interleaved(even, odd, cosine, sine, False).to(even.dtype)
+    odd_out = _rotate_interleaved(odd, even, cosine, sine, True).to(odd.dtype)
+    even_out = even_out.to(tl.float32)
+    odd_out = odd_out.to(tl.float32)
+    tail_amax = tl.maximum(tl.max(tl.abs(even_out), 2), tl.max(tl.abs(odd_out), 2))
+    tail_exponent = _ue8m0_exponent(tl.maximum(tail_amax, 1.0e-4) * (1.0 / 448.0))
+    inverse = _ue8m0_inverse(tail_exponent)[:, :, None]
+    tl.store(out_ptr + offset, (even_out * inverse).to(tl.float8e4nv), live)
+    tl.store(out_ptr + offset + 1, (odd_out * inverse).to(tl.float8e4nv), live)
+
+    block2 = nope_blocks + tl.arange(0, R // 32)[None, :]
+    tail_scale_ptr = (
+        scale_row + 4 * (head2 * 4 + block2 // 4).to(tl.int64) * SK + block2 % 4
+    )
+    tl.store(tail_scale_ptr, tail_exponent.to(tl.uint8), head2 < HPG)
+
+
+@register_kernel(
+    "attention",
+    "dsv41_rope_quantize_fp8_grouped",
+    name="triton_dsv41_rope_quantize_fp8_grouped",
+    solution="triton",
+    # The packed scales use DeepGEMM's SM100 MN-major UE8M0 layout.
+    capability=CapabilityRequirement(
+        min_arch_version=ArchVersion(10, 0), vendors=frozenset({"nvidia"})
+    ),
+    signatures=_QUERY_SIGNATURES,
+    traits={},
+    priority=Priority.PORTABLE,
+)
+def triton_dsv41_rope_quantize_fp8_grouped(values, positions, cos_sin_cache, groups):
+    """Rotate each head's interleaved RoPE tail, then quantize heads in groups.
+
+    Args:
+        values: BF16 [T,H,512] with unit channel stride; token and head strides
+            may be arbitrary. H must be divisible by groups.
+        positions: Int32/int64 [T]; negative positions use table row 0, and
+            positions past the table assert on device.
+        cos_sin_cache: FP32 [max_positions,64], cosine then sine halves. The
+            rotation formula is rope_inplace's; pass the inverse table to undo
+            RoPE.
+        groups: Number of output head groups; each holds D = H/groups*512.
+
+    Returns:
+        (codes, scales). codes is FP8 E4M3 [T,groups,D], a transposed view of
+        contiguous [groups,T,D] storage. scales is int32 [T,groups,D/128] with
+        strides (1, D/128*aligned_T, aligned_T), aligned_T = ceil(T/4)*4; each
+        element packs the UE8M0 exponents of four consecutive 32-channel groups,
+        byte j for group 4w+j. Storage rows [T, aligned_T) are zero.
+    """
+    if values.dtype != torch.bfloat16 or values.ndim != 3:
+        raise ValueError("values must be BF16 [tokens,heads,512]")
+    if values.shape[2] != 512 or values.stride(2) != 1:
+        raise ValueError("values must have 512 channels with unit channel stride")
+    tokens, heads, _ = values.shape
+    if groups <= 0 or heads % groups != 0:
+        raise ValueError(f"heads {heads} must be divisible by groups {groups}")
+    if positions.dtype not in (torch.int32, torch.int64) or positions.shape != (
+        tokens,
+    ):
+        raise ValueError(f"positions must be int32/int64 [{tokens}]")
+    if (
+        cos_sin_cache.dtype != torch.float32
+        or cos_sin_cache.ndim != 2
+        or cos_sin_cache.shape[1] != 64
+        or cos_sin_cache.stride(1) != 1
+    ):
+        raise ValueError("cos_sin_cache must be FP32 [max_positions,64], unit stride")
+    if positions.device != values.device or cos_sin_cache.device != values.device:
+        raise ValueError("values, positions and cos_sin_cache must share a device")
+    heads_per_group = heads // groups
+    dim = heads_per_group * 512
+    words = dim // 128
+    aligned_tokens = triton.cdiv(tokens, 4) * 4
+    codes = torch.empty(
+        (groups, tokens, dim), dtype=torch.float8_e4m3fn, device=values.device
+    )
+    storage = torch.empty(
+        groups * words * aligned_tokens, dtype=torch.int32, device=values.device
+    )
+    scales = storage.as_strided(
+        (tokens, groups, words), (1, words * aligned_tokens, aligned_tokens)
+    )
+    if tokens:
+        enable_pdl = pdl_enabled()
+        _rope_quantize_fp8_grouped[(aligned_tokens, groups)](
+            values,
+            positions,
+            cos_sin_cache,
+            codes,
+            storage.view(torch.uint8),
+            tokens,
+            values.stride(0),
+            values.stride(1),
+            positions.stride(0),
+            cos_sin_cache.stride(0),
+            codes.stride(0),
+            codes.stride(1),
+            words * aligned_tokens,
+            aligned_tokens,
+            heads_per_group,
+            triton.next_power_of_2(heads_per_group),
+            cos_sin_cache.shape[1],
+            cos_sin_cache.shape[0],
+            enable_pdl,
+            num_warps=4,
+            num_stages=1,
+            enable_fp_fusion=False,
+            debug=True,
+            **({"launch_pdl": True} if enable_pdl else {}),
+        )
+    return codes.transpose(0, 1), scales
 
 
 @triton.jit
@@ -2535,7 +2744,7 @@ def safe_metadata(table, lengths, pages, capacity, page_size):
 
 
 @triton.jit(
-    do_not_specialize=["X0", "L0", "T0", "T1", "TC", "NP", "CAP"],
+    do_not_specialize=["X0", "L0", "T0", "T1", "TC", "NP", "CAP", "O0"],
 )
 def _clean_logits(
     X,
@@ -2549,15 +2758,22 @@ def _clean_logits(
     TC,
     NP,
     CAP,
+    O0,
     P: tl.constexpr,
     PAGED: tl.constexpr,
     LIVE_TILES_ONLY: tl.constexpr,
     B: tl.constexpr,
 ):
-    row, tile = tl.program_id(0).to(tl.int64), tl.program_id(1)
-    end = tl.load(L + row * L0)
-    if not LIVE_TILES_ONLY or tile * B < end:
-        column = tile * B + tl.arange(0, B)
+    row = tl.program_id(0).to(tl.int64)
+    end = tl.minimum(tl.maximum(tl.load(L + row * L0), 0), CAP)
+    # A row's programs stride over its tiles. A live-only clean visits just the
+    # tiles before end, so a wide capacity launches no idle programs.
+    if LIVE_TILES_ONLY:
+        tiles = tl.cdiv(end, B).to(tl.int32)
+    else:
+        tiles = tl.cdiv(O0, B)
+    for tile in range(tl.program_id(1), tiles, tl.num_programs(1)):
+        column = tile.to(tl.int64) * B + tl.arange(0, B)
         valid = (column < CAP) & (column < end)
         if PAGED:
             page = tl.load(
@@ -2567,35 +2783,110 @@ def _clean_logits(
         value = tl.load(X + row * X0 + column, valid, other=-float("inf"))
         # Write the entire last live 1024-value tile, including its -inf tail.
         # DeepSelect can prefetch the last 512-value segment before masking it.
-        tl.store(O + row * CAP + column, value, column < CAP)
+        tl.store(O + row * O0 + column, value, column < O0)
 
 
 def clean_logits(values, lengths, table, pages, capacity, page_size):
     """Copy logits, masking every future row and invalid page to -inf."""
     return _clean_logits_output(
-        values, lengths, table, pages, capacity, page_size, False
+        values, lengths, table, pages, capacity, page_size, 1, False
     )
 
 
 @triton.jit(
-    do_not_specialize=["L0", "N", "CAP"],
+    do_not_specialize=["X0", "L0", "T0", "S0", "TC", "NP"],
 )
-def _dense_ranges(L, START, END, L0, N, CAP, B: tl.constexpr):
+def _mask_invalid_pages(
+    X, L, T, S, X0, L0, T0, S0, TC, NP, P: tl.constexpr, B: tl.constexpr
+):
+    # One program per query row, looping only over its live pages.
+    row = tl.program_id(0).to(tl.int64)
+    end = tl.minimum(tl.maximum(tl.load(L + row * L0), 0), TC * P)
+    # The row's history starts at packed key column S[row], i.e. page S[row] / P
+    # of the flattened history page list.
+    base = tl.load(S + row * S0).to(tl.int64) // P
+    for first in range(0, tl.cdiv(end, P), B):
+        page_index = first + tl.arange(0, B)
+        live = page_index * P < end
+        page = tl.load(T + (base + page_index) * T0, live, other=0).to(tl.int64)
+        invalid = live & ((page < 0) | (page >= NP))
+        # Normally every live page is valid and nothing is written.
+        if tl.max(invalid.to(tl.int32), axis=0) > 0:
+            column = page_index[:, None] * P + tl.arange(0, P)[None, :]
+            value = tl.full((B, P), float("-inf"), X.dtype.element_ty)
+            tl.store(X + row * X0 + column, value, invalid[:, None] & (column < end))
+
+
+def mask_invalid_pages(values, lengths, history_pages, starts, pages, page_size):
+    """Set logits of invalid pages in [0, length) to -inf in place.
+
+    values is [rows, >= width * page_size] with unit column stride, where
+    history_pages is the flattened [histories * width] page list of the packed
+    dense keys and starts holds each row's packed key start (history * width *
+    page_size). Rows of one history share its page row, so the table is read
+    per history, not per row. Columns at or beyond length are left untouched:
+    consumers read [0, length). Unlike clean_logits, nothing is copied.
+    Returns values.
+    """
+    if (
+        values.ndim != 2
+        or values.stride(1) != 1
+        or values.shape[0] != lengths.numel()
+        or starts.numel() != lengths.numel()
+        or history_pages.ndim != 1
+    ):
+        raise RuntimeError("DeepGEMM returned incompatible score geometry")
+    width = values.shape[1] // page_size
+    if values.shape[0] and width:
+        _mask_invalid_pages[(values.shape[0],)](
+            values,
+            lengths,
+            history_pages,
+            starts,
+            values.stride(0),
+            lengths.stride(0),
+            history_pages.stride(0),
+            starts.stride(0),
+            width,
+            pages,
+            page_size,
+            256,
+            num_warps=4,
+        )
+    return values
+
+
+@triton.jit(
+    do_not_specialize=["L0", "O0", "N", "CAP"],
+)
+def _dense_ranges(L, OFFSET, START, END, L0, O0, N, CAP, B: tl.constexpr):
     row = tl.program_id(0) * B + tl.arange(0, B)
     length = tl.load(L + row * L0, row < N, other=0)
-    tl.store(START + row, 0, row < N)
-    tl.store(END + row, tl.minimum(tl.maximum(length, 0), CAP).to(tl.int32), row < N)
+    origin = tl.load(OFFSET + row * O0, row < N, other=0)
+    begin = tl.maximum(origin, 0).to(tl.int32)
+    span = tl.minimum(tl.maximum(length, 0), CAP).to(tl.int32)
+    tl.store(START + row, begin, row < N)
+    tl.store(END + row, begin + span, row < N)
 
 
-def dense_ranges(lengths, capacity):
+def dense_ranges(lengths, capacity, offsets=None):
+    """Exclusive [start, end) into packed keys; offsets default to 0 (one history)."""
     starts = torch.empty(lengths.shape, dtype=torch.int32, device=lengths.device)
     ends = torch.empty_like(starts)
     if lengths.numel():
+        packed = offsets
+        packed_stride = 0
+        if packed is None:
+            packed = torch.zeros(1, dtype=torch.int32, device=lengths.device)
+        else:
+            packed_stride = packed.stride(0)
         _dense_ranges[(triton.cdiv(lengths.numel(), 256),)](
             lengths,
+            packed,
             starts,
             ends,
             lengths.stride(0),
+            packed_stride,
             lengths.numel(),
             capacity,
             256,
@@ -2702,28 +2993,41 @@ def _reduce_blocks(
     BLOCK_SIZE: tl.constexpr,
     GROUP: tl.constexpr,
     PIN_NEWEST: tl.constexpr,
+    FULL_WIDTH: tl.constexpr,
+    ALIGNMENT: tl.constexpr,
     B: tl.constexpr,
 ):
-    row, tile = tl.program_id(0).to(tl.int64), tl.program_id(1)
-    block = tile * B + tl.arange(0, B)
+    row, tile = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
     lane = tl.arange(0, GROUP)
     end = tl.minimum(tl.maximum(tl.load(L + row * L0), 0), W)
-    position = block[:, None] * BLOCK_SIZE + lane[None, :]
-    value = tl.load(
-        X + row * X0 + position * X1,
-        (position < end) & (lane[None, :] < BLOCK_SIZE),
-        other=-float("inf"),
-    )
-    scores = tl.max(value, axis=1)
-    if PIN_NEWEST:
-        scores = tl.where(
-            (end > 0) & (block == (end - 1) // BLOCK_SIZE) & (scores > -float("inf")),
-            float("inf"),
-            scores,
+    count = tl.cdiv(end, BLOCK_SIZE)
+    if FULL_WIDTH:
+        stop = SW
+    else:
+        # Native selection may prefetch the final aligned segment before masking.
+        stop = tl.cdiv(count, ALIGNMENT) * ALIGNMENT
+    for start in range(tile * B, stop, tl.num_programs(1) * B):
+        block = start + tl.arange(0, B)
+        position = block[:, None] * BLOCK_SIZE + lane[None, :]
+        value = tl.load(
+            X + row * X0 + position * X1,
+            (position < end) & (lane[None, :] < BLOCK_SIZE),
+            other=-float("inf"),
         )
-    tl.store(S + row * S0 + block, scores, block < SW)
+        # torch.amax propagates NaNs, including in the pinned newest block.
+        has_nan = tl.sum((value != value).to(tl.int32), axis=1) != 0
+        scores = tl.where(has_nan, float("nan"), tl.max(value, axis=1))
+        if PIN_NEWEST:
+            scores = tl.where(
+                (end > 0)
+                & (block == (end - 1) // BLOCK_SIZE)
+                & (scores > -float("inf")),
+                float("inf"),
+                scores,
+            )
+        tl.store(S + row * S0 + block, scores, block < stop)
     if tile == 0:
-        tl.store(E + row, (end + BLOCK_SIZE - 1) // BLOCK_SIZE)
+        tl.store(E + row, count)
 
 
 @triton.jit(
@@ -2874,14 +3178,48 @@ def prepare_native_dense_scores(logits, lengths, alignment):
     return prepare_scores(logits, lengths, 1, alignment, False)
 
 
-def prepare_scores(logits, lengths, block_size, alignment, pin_newest):
-    """Fuse causal masking/alignment, optionally block maxima and newest pin."""
+def prepare_native_block_scores(logits, lengths, block_size, alignment):
+    """Return FP32 block maxima/newest pin and clamped native exclusive ends.
+
+    Rows have ``alignment``-element padding. Only live blocks and their final
+    aligned segment are initialized; native consumers must honor the ends.
+    """
     width = logits.shape[1]
     logical_width = (width + block_size - 1) // block_size
     stride = (logical_width + alignment - 1) // alignment * alignment
     scores = torch.empty(
         (logits.shape[0], stride), dtype=torch.float32, device=logits.device
     )
+    ends = torch.empty(logits.shape[0], dtype=torch.int32, device=logits.device)
+    if logits.shape[0]:
+        _reduce_blocks[(logits.shape[0], 32)](
+            logits,
+            lengths,
+            scores,
+            ends,
+            logits.stride(0),
+            logits.stride(1),
+            lengths.stride(0),
+            stride,
+            width,
+            stride,
+            block_size,
+            triton.next_power_of_2(block_size),
+            True,
+            False,
+            alignment,
+            128,
+        )
+    return scores, ends
+
+
+def prepare_scores(logits, lengths, block_size, alignment, pin_newest):
+    """Fuse causal masking/alignment, optionally block maxima and newest pin."""
+    width = logits.shape[1]
+    logical_width = (width + block_size - 1) // block_size
+    stride = (logical_width + alignment - 1) // alignment * alignment
+    dtype = logits.dtype if block_size == 1 and not pin_newest else torch.float32
+    scores = torch.empty((logits.shape[0], stride), dtype=dtype, device=logits.device)
     end = torch.empty(logits.shape[0], dtype=torch.int32, device=logits.device)
     if block_size == 1 and not pin_newest:
         _prepare_dense[(logits.shape[0], triton.cdiv(stride, 1024))](
@@ -2912,6 +3250,8 @@ def prepare_scores(logits, lengths, block_size, alignment, pin_newest):
             block_size,
             triton.next_power_of_2(block_size),
             pin_newest,
+            True,
+            alignment,
             128,
         )
     return scores, end
@@ -2926,7 +3266,7 @@ def prepare_candidate_scores(logits, lengths, candidates, block_size, alignment)
     end = torch.empty(logits.shape[0], dtype=torch.int32, device=logits.device)
     stride = (count * block_size + alignment - 1) // alignment * alignment
     scores = torch.empty(
-        (logits.shape[0], stride), dtype=torch.float32, device=logits.device
+        (logits.shape[0], stride), dtype=logits.dtype, device=logits.device
     )
     # Small candidate sets fit their scores in the normalization CTA. Larger
     # sets need the separate tiled gather to retain memory-level parallelism.
@@ -2983,7 +3323,7 @@ def finish_selection(
     Selection width is runtime data; only its power-of-two tile specializes.
     """
     output = torch.empty(indices.shape, dtype=torch.int32, device=indices.device)
-    _finish_selection[(indices.shape[0],)](
+    kernel_launcher(_finish_selection, (indices.shape[0],))(
         indices,
         scores,
         lengths,
@@ -3005,6 +3345,7 @@ def finish_selection(
 
 @triton.jit(
     do_not_specialize=["selected_stride", "candidate_stride", "K", "C"],
+    do_not_specialize_on_alignment=["Lengths", "BlockLengths"],
 )
 def _write_selection(
     Selected,
@@ -3047,7 +3388,7 @@ def write_selection(selected, candidates, out):
     rows, lengths, blocks, block_lengths = out
     if selected.shape[0] == 0:
         return
-    _write_selection[(selected.shape[0],)](
+    kernel_launcher(_write_selection, (selected.shape[0],))(
         selected,
         candidates if candidates is not None else selected,
         rows,
@@ -3129,7 +3470,10 @@ def decode_rows(
         )
 
 
-@triton.jit(do_not_specialize=["SW", "SS", "SC", "TABLE_ROWS"])
+@triton.jit(
+    do_not_specialize=["SW", "SS", "SC", "TABLE_ROWS", "SWA_PAGES"],
+    do_not_specialize_on_alignment=["Positions", "Requests", "Write"],
+)
 def _decode_window_kernel(
     Positions,
     Requests,
@@ -3143,7 +3487,7 @@ def _decode_window_kernel(
     TABLE_ROWS,
     PS: tl.constexpr,
     RS: tl.constexpr,
-    SWA_PAGES: tl.constexpr,
+    SWA_PAGES,
 ):
     row = tl.program_id(0)
     pos = tl.load(Positions + row * PS).to(tl.int64)
@@ -3205,7 +3549,10 @@ def decode_window(
         )
 
 
-@triton.jit(do_not_specialize=["N", "TR", "TC", "TS0", "TS1"])
+@triton.jit(
+    do_not_specialize=["N", "TR", "TC", "TS0", "TS1", "PAGES"],
+    do_not_specialize_on_alignment=["Table", "P", "Req"],
+)
 def _global_slots_kernel(
     Rows,
     P,
@@ -3223,7 +3570,7 @@ def _global_slots_kernel(
     TS0,
     TS1,
     RATIO: tl.constexpr,
-    PAGES: tl.constexpr,
+    PAGES,
     BLOCK: tl.constexpr,
 ):
     i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -3273,7 +3620,100 @@ def global_slots(rows, positions, requests, table, ratio, pages):
     return out
 
 
-@triton.jit(do_not_specialize=["N", "TC", "TR", "TS0", "TS1"])
+@triton.jit(
+    do_not_specialize=["Q", "ROW0", "SS0", "LS0", "GS0"],
+    do_not_specialize_on_alignment=["Rows", "Logical", "Slots"],
+)
+def _prefill_indices_kernel(
+    Swa,
+    Logical,
+    Slots,
+    Rows,
+    Base,
+    Out,
+    Q,
+    ROW0,
+    SS0,
+    LS0,
+    GS0,
+    W: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    HAS_ROWS: tl.constexpr,
+):
+    q = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    live = q < Q
+    # Row and query offsets grow with the step's token count: compute in int64.
+    q64 = q.to(tl.int64)
+    if HAS_ROWS:
+        row = tl.load(Rows + q64, live, other=0).to(tl.int64)
+    else:
+        row = q64 + ROW0
+    out_row = Out + q64[:, None] * (W + K)
+
+    w = tl.arange(0, BLOCK_W)
+    w_mask = live[:, None] & (w[None, :] < W)
+    swa = tl.load(Swa + q64[:, None] * SS0 + w[None, :], w_mask, other=-1)
+    tl.store(out_row + w[None, :], swa.to(tl.int32), w_mask)
+
+    k = tl.arange(0, BLOCK_K)
+    k_mask = live[:, None] & (k[None, :] < K)
+    selected = tl.load(Logical + row[:, None] * LS0 + k[None, :], k_mask, other=-1)
+    slots = tl.load(Slots + row[:, None] * GS0 + k[None, :], k_mask, other=-1)
+    base = tl.load(Base + q64, live, other=0).to(tl.int64)
+    rows = tl.where(
+        (selected >= 0) & (slots >= 0), selected.to(tl.int64) + base[:, None], -1
+    )
+    tl.store(out_row + W + k[None, :], rows.to(tl.int32), k_mask)
+
+
+@register_kernel(
+    "attention",
+    "dsv41_prefill_indices",
+    name="triton_dsv41_prefill_indices",
+    solution="triton",
+    signatures=_INTEGER_SIGNATURES,
+    capability=_CAPABILITY,
+    priority=Priority.PORTABLE,
+)
+def prefill_indices(swa_indices, logical_rows, global_slots, rows, history_base):
+    """Join SWA and selected-history workspace rows into int32 attention indices."""
+    queries, window = swa_indices.shape
+    width = logical_rows.shape[1]
+    out = torch.empty(
+        (queries, window + width), dtype=torch.int32, device=swa_indices.device
+    )
+    if queries:
+        has_rows = not isinstance(rows, slice)
+        kernel_launcher(_prefill_indices_kernel, (triton.cdiv(queries, 8),))(
+            swa_indices,
+            logical_rows,
+            global_slots,
+            rows if has_rows else history_base,
+            history_base,
+            out,
+            queries,
+            0 if has_rows else rows.start,
+            swa_indices.stride(0),
+            logical_rows.stride(0),
+            global_slots.stride(0),
+            W=window,
+            K=width,
+            BLOCK_W=triton.next_power_of_2(window),
+            BLOCK_K=triton.next_power_of_2(width),
+            BLOCK_M=8,
+            HAS_ROWS=has_rows,
+            num_warps=4,
+        )
+    return out
+
+
+@triton.jit(
+    do_not_specialize=["N", "TC", "TR", "TS0", "TS1"],
+    do_not_specialize_on_alignment=["Table", "P", "Req"],
+)
 def _selection_table_kernel(
     P,
     Req,
@@ -3316,7 +3756,9 @@ def selection_table(positions, requests, table, ratio):
     out = torch.empty((n, table.shape[1]), dtype=torch.int32, device=table.device)
     lengths = torch.empty(n, dtype=torch.int32, device=table.device)
     if n:
-        _selection_table_kernel[(n, max(1, triton.cdiv(table.shape[1], 256)))](
+        kernel_launcher(
+            _selection_table_kernel, (n, max(1, triton.cdiv(table.shape[1], 256)))
+        )(
             positions,
             requests,
             table,
@@ -3334,7 +3776,10 @@ def selection_table(positions, requests, table, ratio):
     return out, lengths
 
 
-@triton.jit(do_not_specialize=["N", "TR", "TC", "TS0", "TS1"])
+@triton.jit(
+    do_not_specialize=["N", "TR", "TC", "TS0", "TS1", "PAGES"],
+    do_not_specialize_on_alignment=["Table"],
+)
 def _compressor_metadata(
     Positions,
     Requests,
@@ -3354,7 +3799,7 @@ def _compressor_metadata(
     TC,
     TS0,
     TS1,
-    PAGES: tl.constexpr,
+    PAGES,
     BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -3458,7 +3903,7 @@ def _block_maxima_kernel(
     blocks,
     TILE: tl.constexpr,
 ):
-    row = tl.program_id(0)
+    row = tl.program_id(0).to(tl.int64)
     block = tl.program_id(1) * TILE + tl.arange(0, TILE)
     col = block[:, None] * 8 + tl.arange(0, 8)[None, :]
     values = tl.load(
@@ -3551,7 +3996,7 @@ def _clean_block_maxima_kernel(
     workers,
     TILE: tl.constexpr,
 ):
-    row = tl.program_id(0)
+    row = tl.program_id(0).to(tl.int64)
     worker = tl.program_id(1)
     length = tl.minimum(tl.maximum(tl.load(Lengths + row * length_stride), 0), width)
     end = (length + 7) // 8
@@ -3585,7 +4030,7 @@ def _clean_block_maxima_kernel(
 def clean_block_maxima(
     scores: torch.Tensor, visible: torch.Tensor, table: torch.Tensor, num_pages: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Clean paged FP32 scores and reduce their visible eight-token blocks.
+    """Clean paged FP32/BF16 scores and return FP32 eight-token block maxima.
 
     ``table`` maps each row's logical 64-token pages to physical page IDs.
     Invalid pages inside the visible prefix are masked to -inf. Return fixed-
@@ -3597,7 +4042,7 @@ def clean_block_maxima(
         scores.ndim != 2
         or scores.shape[1] == 0
         or scores.stride(1) != 1
-        or scores.dtype != torch.float32
+        or scores.dtype not in (torch.float32, torch.bfloat16)
         or visible.ndim != 1
         or visible.numel() != scores.shape[0]
         or table.ndim != 2
@@ -3609,7 +4054,7 @@ def clean_block_maxima(
     # Enough independent tiles for long contexts; short rows exit on the GPU.
     workers = min(triton.cdiv(width, 1024), 256)
     cleaned = torch.empty((rows, width), device=scores.device, dtype=scores.dtype)
-    maxima = torch.empty((rows, blocks), device=scores.device, dtype=scores.dtype)
+    maxima = torch.empty((rows, blocks), device=scores.device, dtype=torch.float32)
     ends = torch.empty((rows,), device=scores.device, dtype=torch.int32)
     if rows:
         _clean_block_maxima_kernel[(rows, workers)](
@@ -3733,7 +4178,10 @@ def _copy_attention_heads_kernel(
     S0: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    # A flat index over the destination, which grows with the step's tokens, so
+    # it is 64-bit: a wrapped index would go negative and still pass the
+    # row < tokens mask.
+    i = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     row, head, col = i // (HY * 512), i // 512 % HY, i % 512
     x = tl.load(X + row * X0 + head * X1 + col * X2, (row < tokens) & (head < HX), 0)
     tl.store(Y + row * Y0 + head * Y1 + col * Y2, x, row < tokens)
@@ -3794,18 +4242,19 @@ def _index_select_all(
     ROW_BLOCK: tl.constexpr,
     CANDIDATE_BLOCK: tl.constexpr,
 ):
-    row = tl.program_id(0)
+    row = tl.program_id(0).to(tl.int64)
     visible = tl.load(Visible + row * LS)
     ids = tl.arange(0, ROW_BLOCK)
     page = tl.load(
         Table + row * TS0 + (ids // 64) * TS1, (ids < K) & (ids // 64 < TC), other=-1
     )
     valid = (ids < K) & (ids < visible) & (page > 0) & (page < PAGES)
-    selected = tl.sort(tl.where(valid, ids, 2147483647))
-    tl.store(
-        Rows + row * K + ids, tl.where(selected == 2147483647, -1, selected), ids < K
-    )
-    tl.store(Lengths + row, tl.sum(valid.to(tl.int32)))
+    # Logical IDs are already ordered; compact holes without sorting them.
+    prefix = tl.cumsum(valid.to(tl.int32))
+    length = tl.sum(valid.to(tl.int32))
+    tl.store(Rows + row * K + prefix - 1, ids, valid)
+    tl.store(Rows + row * K + ids, -1, (ids < K) & (ids >= length))
+    tl.store(Lengths + row, length)
     count = tl.full((), 0, tl.int32)
     if C:
         candidate_ids = tl.arange(0, CANDIDATE_BLOCK)
@@ -3829,6 +4278,10 @@ def _index_select_all(
             tl.where(candidate_selected == 2147483647, -1, candidate_selected),
             candidate_ids < C,
         )
+        # Visible rows fit K; the larger candidate destination only needs padding.
+        for start in range(CANDIDATE_BLOCK, C, 1024):
+            padding = start + tl.arange(0, 1024)
+            tl.store(Blocks + row * C + padding, -1, padding < C)
         count = tl.sum(candidate_valid.to(tl.int32))
     tl.store(BlockLengths + row, count)
 
@@ -3874,40 +4327,47 @@ def index_select_all(page_table, visible_lens, pages, candidate_block_size, out)
             out[2].shape[1],
             candidate_block_size,
             triton.next_power_of_2(out[0].shape[1]),
-            triton.next_power_of_2(max(1, out[2].shape[1])),
+            triton.next_power_of_2(triton.cdiv(out[0].shape[1], candidate_block_size)),
             num_warps=4,
         )
     return out
 
 
-def clean_logits_for_selection(values, lengths, table, pages, capacity, page_size):
-    """Copy valid logits for bounded DeepSelect consumers, preserving row layout.
+def clean_logits_for_selection(
+    values, lengths, table, pages, capacity, page_size, alignment
+):
+    """Copy valid logits to rows padded to ``alignment`` elements for DeepSelect.
 
     Every live 1024-value tile is fully initialized, including its -inf tail;
     wholly future tiles are unspecified. Consumers must pass exclusive ends.
     Ordinary clean_logits retains its full-width contract, including on Hopper.
     """
     return _clean_logits_output(
-        values, lengths, table, pages, capacity, page_size, True
+        values, lengths, table, pages, capacity, page_size, alignment, True
     )
 
 
 def _clean_logits_output(
-    values, lengths, table, pages, capacity, page_size, live_tiles_only
+    values, lengths, table, pages, capacity, page_size, alignment, live_tiles_only
 ):
     if (
         values.ndim != 2
         or values.shape[0] != lengths.numel()
         or values.shape[1] < capacity
         or values.stride(1) != 1
-        or values.dtype != torch.float32
+        or values.dtype not in (torch.float32, torch.bfloat16)
     ):
-        raise RuntimeError("DeepGEMM returned incompatible FP32 score geometry")
+        raise RuntimeError("DeepGEMM returned incompatible score geometry")
+    stride = (capacity + alignment - 1) // alignment * alignment
     output = torch.empty(
-        (values.shape[0], capacity), dtype=torch.float32, device=values.device
+        (values.shape[0], stride), dtype=values.dtype, device=values.device
     )
     if output.numel():
-        _clean_logits[(values.shape[0], triton.cdiv(capacity, 1024))](
+        # Enough programs per row to fill the GPU, and no more than a row has
+        # tiles: the live tiles of a wide capacity are a small prefix.
+        tiles = triton.cdiv(stride, 1024)
+        programs = min(tiles, max(16, triton.cdiv(2048, values.shape[0])))
+        _clean_logits[(values.shape[0], programs)](
             values,
             lengths,
             table if table is not None else lengths,
@@ -3919,6 +4379,7 @@ def _clean_logits_output(
             table.shape[1] if table is not None else 0,
             pages,
             capacity,
+            stride,
             page_size,
             table is not None,
             live_tiles_only,
@@ -4342,3 +4803,20 @@ def compact_slots(slots, lengths):
             BLOCK=triton.next_power_of_2(max(1, slots.shape[1])),
         )
     return out, counts
+
+
+# Candidate budgets vary with history and are bounded by 2048 in _index_topk_outputs.
+_SELECTION_BLOCKS = tuple(1 << bit for bit in range(12))
+register_triton_warmup(
+    _finish_selection,
+    variants=lambda args: () if args["POSITION_SORT"] else ({"B": _SELECTION_BLOCKS},),
+)
+register_triton_warmup(
+    _write_selection, variants=({"CANDIDATE_BLOCK": _SELECTION_BLOCKS},)
+)
+# Canonical windows pass a row slice, reordered subsets an index tensor.
+register_triton_warmup(_prefill_indices_kernel, variants=({"HAS_ROWS": (False, True)},))
+register_triton_warmup(
+    _selection_table_kernel,
+    variants=lambda args: ({"RATIO": tuple(sorted({1, args["RATIO"]}))},),
+)

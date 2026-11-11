@@ -45,6 +45,8 @@ mod ffi {
     struct RequestSpec {
         /// Request id.
         request_id: String,
+        /// Router-only cache retention identity, empty when untracked.
+        session_id: String,
         /// Prompt token ids.
         tokens: Vec<i32>,
         /// Generation limit the scheduler reserves for.
@@ -67,7 +69,8 @@ mod ffi {
         UpdateReserveNumTokens,
         /// PD: the request's peers are connected (`pd::BootstrappedEvent`).
         PdBootstrapped,
-        /// PD: the request's transfer failed (`pd::FailedEvent`).
+        /// PD: the request's transfer failed; it may still be stopping
+        /// (`pd::FailedEvent`).
         PdFailed,
         /// PD, P role: the request's KV reached the decode node
         /// (`pd::SucceededEvent`).
@@ -75,6 +78,9 @@ mod ffi {
         /// PD, D role: the request's KV landed, with the prefill node's
         /// first token (`pd::RemotePrefillDoneEvent`).
         PdRemotePrefillDone,
+        /// PD: a failed or cancelled transfer stopped on every rank; the
+        /// request's pages may return (`pd::TransferStoppedEvent`).
+        PdTransferStopped,
     }
 
     /// A forward event fed back to the scheduler. Fields other kinds do not
@@ -325,9 +331,53 @@ mod ffi {
         cleanup_dropped_backup_keys: u64,
     }
 
+    /// Prefix-cache hits by tier, cumulative since start (`HostCacheStats`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    struct PrefixHitView {
+        /// Prompt tokens of every admitted request.
+        prompt_tokens: u64,
+        /// Tokens served from the Device prefix cache (L1).
+        device_hit_tokens: u64,
+        /// Tokens the Host loads (L2 including anything L3 supplied).
+        host_hit_tokens: u64,
+        /// Token spans of successful storage keys (L3), counted per cache group.
+        l3_hit_tokens: u64,
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    /// Snapshot in physical allocator units. The curve is a conservative
+    /// fresh-request bound from the scheduler's own multi-group capacity model.
+    struct AdmissionSnapshot {
+        free_slots: i32,
+        total_slots: i32,
+        available_blocks: i32,
+        total_blocks: i32,
+        host_free_blocks: i32,
+        host_total_blocks: i32,
+        retracted: usize,
+        waiting: usize,
+        max_tokens: i32,
+        capacity_token_step: i32,
+        capacity_blocks: Vec<i64>,
+    }
+
+    /// What the prefill-delay vote reads from one rank
+    /// (`Scheduler::ProbePrefillGate`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct PrefillGateProbe {
+        /// A resident chunk, or new prefill work at or below the watermark.
+        wants_prefill: bool,
+        /// Decode work the round would otherwise run.
+        has_decode_work: bool,
+    }
+
     /// Request and page counts.
     #[derive(Debug, Clone, PartialEq)]
     struct SchedulerSizes {
+        /// Requests in the running batch: local prefill forwards, prompts
+        /// whose prefill is done, and decodes. Remote prefilling, waiting and
+        /// retracted requests are not running.
+        running: usize,
         /// Requests awaiting admission or restore.
         waiting: usize,
         /// Requests prefilling.
@@ -344,8 +394,6 @@ mod ffi {
         pd_transfer: usize,
         /// Cache blocks holding nothing.
         empty_lcm_blocks: i32,
-        /// Cache blocks held by running requests.
-        active_lcm_blocks: i32,
     }
 
     /// A prefix-cache mutation (`KvBlockStoredEvent` / `KvBlockRemovedEvent`).
@@ -382,8 +430,12 @@ mod ffi {
         #[namespace = "tokenspeed"]
         type ExecutionPlan;
 
-        fn submit_requests(scheduler: Pin<&mut Scheduler>, specs: &[RequestSpec]);
-        fn next_execution_plan(scheduler: Pin<&mut Scheduler>) -> UniquePtr<ExecutionPlan>;
+        fn submit_requests(scheduler: Pin<&mut Scheduler>, specs: &[RequestSpec]) -> Result<()>;
+        fn next_execution_plan(
+            scheduler: Pin<&mut Scheduler>,
+            allow_prefill: bool,
+            apply_prefill_watermark: bool,
+        ) -> UniquePtr<ExecutionPlan>;
         fn advance(scheduler: Pin<&mut Scheduler>, events: &[ForwardEvent]) -> Result<()>;
         fn advance_head(
             scheduler: Pin<&mut Scheduler>,
@@ -392,13 +444,23 @@ mod ffi {
             done: &[StorageDoneView],
             cache_events: &[CacheEvent],
         ) -> Result<()>;
+        fn demote_sessions(
+            scheduler: Pin<&mut Scheduler>,
+            session_ids: &[String],
+            ended: bool,
+        ) -> usize;
+        fn demote_session(scheduler: Pin<&mut Scheduler>, session_id: &str, ended: bool) -> usize;
+        fn admission_snapshot(scheduler: &Scheduler, token_step: i32) -> AdmissionSnapshot;
         fn sizes(scheduler: &Scheduler) -> SchedulerSizes;
+        fn active_lcm_blocks(scheduler: &Scheduler) -> i32;
+        fn probe_prefill_gate(scheduler: &Scheduler) -> PrefillGateProbe;
         fn cache_group_pages(scheduler: &Scheduler, group_id: &str) -> CacheGroupPages;
         fn drain_kv_events(scheduler: Pin<&mut Scheduler>) -> Vec<KvEventView>;
         fn request_token_size(scheduler: &Scheduler, request_id: &str) -> i32;
         fn can_abort_before_admission(scheduler: &Scheduler, request_id: &str) -> bool;
         fn storage_pending(scheduler: &Scheduler) -> bool;
         fn storage_stats(scheduler: &Scheduler) -> StorageStatsView;
+        fn prefix_hit_stats(scheduler: &Scheduler) -> PrefixHitView;
         fn clear_cache(scheduler: Pin<&mut Scheduler>) -> bool;
         fn clear_l1_cache(scheduler: Pin<&mut Scheduler>) -> bool;
         fn can_clear_cache(scheduler: &Scheduler) -> bool;
@@ -419,9 +481,10 @@ mod ffi {
 
 pub use ffi::{
     BlockTableView, CacheEvent, CacheEventKind, CacheGroupPages, CacheOpKind, CacheOpView,
-    ForwardBatchView, ForwardEvent, ForwardEventKind, KvEventView, RequestSpec, SchedulerAbortView,
-    SchedulerSizes, StorageCancellationView, StorageDoneView, StorageKeyView, StorageOpKind,
-    StorageOpView, StorageStatsView, StorageTickView, TransferBatchView,
+    ForwardBatchView, ForwardEvent, ForwardEventKind, KvEventView, PrefillGateProbe, PrefixHitView,
+    RequestSpec, SchedulerAbortView, SchedulerSizes, StorageCancellationView, StorageDoneView,
+    StorageKeyView, StorageOpKind, StorageOpView, StorageStatsView, StorageTickView,
+    TransferBatchView,
 };
 
 /// What advances the scheduler at the head of a round: with L3, the agreed
@@ -519,14 +582,26 @@ impl Scheduler {
         unsafe { self.raw.as_ref() }
     }
 
-    /// Queue requests for admission.
-    pub fn submit_requests(&mut self, specs: &[RequestSpec]) {
-        ffi::submit_requests(self.pinned(), specs);
+    /// Queue requests for admission. Validation errors reject the entire
+    /// batch without inserting any request.
+    pub fn submit_requests(&mut self, specs: &[RequestSpec]) -> Result<(), cxx::Exception> {
+        ffi::submit_requests(self.pinned(), specs)
     }
 
-    /// Plan the next round.
-    pub fn next_execution_plan(&mut self) -> ExecutionPlan {
-        ExecutionPlan(ffi::next_execution_plan(self.pinned()))
+    /// Plan the next round. `allow_prefill` gates the fused role's prefill
+    /// work; `apply_prefill_watermark` checks pressure before new admissions
+    /// when delay is enabled. Resident chunks ignore pressure, and PD roles
+    /// ignore both options (see `docs/design/prefill-delay.md`).
+    pub fn next_execution_plan(
+        &mut self,
+        allow_prefill: bool,
+        apply_prefill_watermark: bool,
+    ) -> ExecutionPlan {
+        ExecutionPlan(ffi::next_execution_plan(
+            self.pinned(),
+            allow_prefill,
+            apply_prefill_watermark,
+        ))
     }
 
     /// Feed forward results back. Fails, applying none of `events`' later
@@ -552,9 +627,37 @@ impl Scheduler {
         )
     }
 
-    /// Request and page counts.
+    /// Apply one batch with a single scan of each cache index.
+    pub fn demote_sessions(&mut self, session_ids: &[String], ended: bool) -> usize {
+        ffi::demote_sessions(self.pinned(), session_ids, ended)
+    }
+
+    /// Lower only this session's exclusive cache entries in the eviction order.
+    pub fn demote_session(&mut self, session_id: &str, ended: bool) -> usize {
+        ffi::demote_session(self.pinned(), session_id, ended)
+    }
+
+    /// Poll native capacity; token_step must be positive.
+    pub fn admission_snapshot(&self, token_step: i32) -> ffi::AdmissionSnapshot {
+        ffi::admission_snapshot(self.get(), token_step)
+    }
+
+    /// Request and physical block counts: a pass over the requests per
+    /// state, and the empty-block count, which the pool keeps.
     pub fn sizes(&self) -> SchedulerSizes {
         ffi::sizes(self.get())
+    }
+
+    /// Cache blocks held by running requests. Taking the count walks every
+    /// live request's block tables, so its cost grows with the batch's
+    /// context; a caller on the round's path reuses it.
+    pub fn active_lcm_blocks(&self) -> i32 {
+        ffi::active_lcm_blocks(self.get())
+    }
+
+    /// What the prefill-delay vote should publish for this rank.
+    pub fn probe_prefill_gate(&self) -> PrefillGateProbe {
+        ffi::probe_prefill_gate(self.get())
     }
 
     /// One cache group's page counts.
@@ -582,6 +685,11 @@ impl Scheduler {
     /// The scheduler's storage observations.
     pub fn storage_stats(&self) -> StorageStatsView {
         ffi::storage_stats(self.get())
+    }
+
+    /// Cumulative prefix-cache hits by tier.
+    pub fn prefix_hit_stats(&self) -> PrefixHitView {
+        ffi::prefix_hit_stats(self.get())
     }
 
     /// The prefix-cache mutations since the last drain, in order; empty

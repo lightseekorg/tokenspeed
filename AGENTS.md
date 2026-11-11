@@ -17,6 +17,9 @@ people and average people is more than tenfold.
 * Before any work, check for a local Python venv and, if one exists, activate
   it.
 * If a local Python venv exists, don't install pip packages outside it.
+* For kernel or forward-path iteration, serve with `--allow-reload-forward` and
+  run `ts reload-forward` after each edit instead of restarting; validate the
+  final change on a freshly started server before opening a PR.
 
 ## Code changes
 
@@ -94,16 +97,25 @@ change.
   between prefix matching, allocation, and page geometry.
 * `docs/design/scheduler.md` — the C++ scheduler's admission granularity,
   what triggers retraction in each engine role, and the recovery protocol.
+* `docs/design/prefill-delay.md` — the fused prefill gate: attention-DP
+  agreement, ALL/ANY windows, live admission watermarks, and resident progress.
 * `docs/design/unified_path.md` — the unified decode path: one
   refresh-in-place metadata contract for eager and CUDA-graph decode, the
   padding contract, buffer sizing, and what stays graph-only.
 * `docs/design/attention-prologue.md` — the one entry between projections
   and core attention: QK norm, RoPE, quantization, and the KV write, the
   numerics contract every solution meets, and who writes the cache.
+* `docs/design/tracing.md` — OTLP trace export: the retrospective span
+  built at a request's release, its GenAI attributes and session
+  grouping, the never-blocking export thread, and what stays out.
 * `docs/design/tree-speculation.md` — draft-tree speculation: the tree as a
   parameter of the chain path (compaction), position vs slot, one tree
   attention path (trtllm-gen prefix plus window cascade), and position-keyed
   sampled verify.
+* `docs/design/monokernel.md` — decode monokernels: one persistent launch
+  per decoder layer, stages handing off through tagged mailboxes, every
+  layer of a forward launching or none, the per-step state, shared cache
+  layouts, and the deadlock rule.
 
 ## Public pull requests
 
@@ -141,6 +153,19 @@ change.
 * NPU support targets only one or two specific models. There are currently no
   plans to expand NPU model coverage.
 
+## tokenspeed-scheduler
+
+Inside the root `tokenspeed-scheduler/` directory:
+
+* Prefer RAII to manual bookkeeping in the C++ scheduler. Tie each resource
+  or registration that a request or an in-flight operation holds (cache
+  blocks, pool slots, transfer or storage tickets, side-table entries keyed
+  by an id) to an owning handle whose destructor releases it, and keep that
+  handle in the object whose lifetime it shares, usually an FSM state or the
+  request itself. Avoid paired acquire/release calls, hand-kept counters and
+  erase-on-teardown code spread across call sites. `CacheBlockRef`,
+  `ReqPoolIndex` and `StorageLease` are the models to follow.
+
 ## tokenspeed-scheduler releases
 
 Prefer separate PRs for scheduler code changes and version bumps. A scheduler
@@ -158,6 +183,21 @@ Follow this sequence:
 4. Once the new version is available on PyPI, update the main TokenSpeed
    project's `tokenspeed-scheduler` dependency requirement in
    `python/pyproject.toml` through a follow-up PR targeting `main`.
+
+## tokenspeed-engine
+
+Inside the root `tokenspeed-engine/` directory:
+
+* Prefer RAII to manual bookkeeping in Rust code too. Tie each resource,
+  registration or in-flight count that a request, a queued job or a thread
+  holds to a guard whose `Drop` releases it, and move that guard with the
+  work it covers, such as inside the job a channel carries, so a panic, an
+  early return or a dropped channel releases it as well. Avoid paired
+  increment/decrement or insert/remove calls and cleanup code spread across
+  call sites. A `Drop` that may run while a thread unwinds must not panic,
+  since a second panic aborts the process: take the locks it needs even if
+  poisoned. `ExitNotice` (`ts-host`) and `RequestStream` (`ts-client`) are
+  the models to follow.
 
 ## tokenspeed-kernel
 
@@ -205,14 +245,19 @@ Inside the root `tokenspeed-kernel/` directory:
   widths, split counts computed from the batch size), must be runtime
   arguments, or be bucketed first (such as `next_power_of_2`) when the kernel
   needs a compile-time bound. The same holds for template arguments of other
-  JITs such as DeepGEMM. Reviews should check every new or changed kernel
-  signature and launch site for this. Kernels should have tests to guard
-  against excessive scalar parameter specialization with
-  `assert_no_triton_compile` from `test/utils.py`. Tensor parameters need no
-  such test. At runtime, `tokenspeed_kernel.compile_monitor` logs every
-  Triton compilation after startup and names a parameter that keeps taking
-  new values. CI serves with `TOKENSPEED_JIT_COMPILE_CHECK=error`, so such a
-  parameter fails the model tests.
+  JITs such as DeepGEMM, for static CuTe DSL tensor dimensions, and for the
+  key under which a caller caches a `cute.compile` result, which must hold
+  only what the kernel specializes on. Call CuTe DSL kernels through their
+  compiled functions; a direct `@cute.jit` call traces on every call. Reviews
+  should check every new or changed kernel signature and launch site for this.
+  Kernels should have tests to guard against excessive scalar parameter
+  specialization with `assert_no_triton_compile` or `assert_no_cute_compile`
+  from `test/utils.py`. Triton tensor parameters need no such test. At runtime,
+  `tokenspeed_kernel.compile_monitor` logs every Triton and CuTe DSL
+  compilation after startup and names a parameter that keeps taking new
+  values, a call site that keeps recompiling known specializations, and a
+  direct `@cute.jit` call. CI serves with
+  `TOKENSPEED_JIT_COMPILE_CHECK=error`, so any of these fails the model tests.
 * Integer offsets into global memory must not overflow int32. Compute in
   int64 every offset whose bound grows with a runtime count: a token,
   request, page, slot, or expert index times a stride, or a product of sizes

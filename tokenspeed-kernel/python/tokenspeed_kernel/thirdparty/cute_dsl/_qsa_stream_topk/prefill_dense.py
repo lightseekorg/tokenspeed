@@ -404,10 +404,11 @@ class DensePrefillTopK(PrefillTopK):
                     col = (vector - q_head * 16) * 8
                     q_row = q_head // _HEADS
                     head = q_head - q_row * _HEADS
+                    # Runtime strides scale in int64; the in-row column stays int32.
                     source = (
                         query.iterator
-                        + (row_base + q_row) * q_stride_row
-                        + head * q_stride_head
+                        + cutlass.Int64(row_base + q_row) * q_stride_row
+                        + cutlass.Int64(head) * q_stride_head
                         + col
                     )
                     logical_byte = (

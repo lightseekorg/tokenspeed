@@ -19,8 +19,38 @@ inverse exchange restores the TP head layout. SWA-only and global-attention
 layers have separate minimum query counts to amortize communication.
 
 These are operator-local partitions. Hidden states, Engram, MoE, compressor
-work, and DSpark auxiliary states retain their existing layouts. Generic
-`--query-context-parallel-size` remains the separate DSA model-wide layout.
+work, and DSpark auxiliary states retain their existing layouts. The
+model-wide `--query-context-parallel-size` layout below is separate; the two
+cannot be enabled together.
+
+## Model-wide QCP
+
+On the PD prefill role, `--query-context-parallel-size` shards each extend
+forward's rows in per-request zigzag order over attention TP (`QueryShardPlan`), from
+the embedding through the final norm. Attention heads stay replicated, so a
+rank attends its own rows with every head against the complete history and
+no partial attention is merged. Backend metadata, positions and cache
+coordinates always describe the complete span; only compute rows are local.
+
+- Cache production uses the complete span. Compressor projections and SWA
+  rows are gathered before pooling and cache writes, so every rank writes the
+  same rows (owner-masked under KVP). Gathered rows are restored to span
+  order before compressor pairing, SWA planning, or cache writes. A rank boundary is never a cache prefix
+  or a compressor pairing boundary.
+- CED narrowing keeps each retained row on the rank that owned it in the
+  encoder: the decoder plan retains the original row owners and gathers
+  selected rows back into canonical order, without redistribution. The backend plans these row maps once
+  per forward from host spans.
+- Ranks without local rows still join every collective: projection and SWA
+  gathers, KVP history gathers, Engram and MoE.
+- Engram gathers hash IDs and reduce-scatters the table contributions back to
+  local rows. The output gathers only the sampled rows. With DSpark it also
+  restores gathered CED taps to span order, so the drafter writes the
+  replicated SWA-window fields from complete rows.
+
+KVP is either 1 (replicated KV) or equal to QCP, in which case every rank
+gathers the same per-request history from the page owners. Model-wide QCP
+requires eager, text-only pure prefill without PP.
 
 ## Cache ownership
 
@@ -82,17 +112,34 @@ requires matching KVP/DCP sizes for aggregated and PD decode engines, and
 separate prefill/decode rounds for aggregated DCP. QCP can be enabled with
 either replicated or sharded KV. V4.1-specific restrictions are listed below.
 
+For model-wide QCP on PD prefill, with the global cache replicated
+(`--kv-parallel-size 1`) or sharded over the query group:
+
+```text
+--query-context-parallel-size 8
+--kv-parallel-size 8
+--disable-prefill-graph
+--disaggregation-mode prefill
+--disaggregation-layerwise-interval 0
+```
+
 PD prefill can use KVP with DCP size 1 and
-`--disaggregation-layerwise-interval 0`. V4.1 PD decode with KVP is not
-supported. KVP requires eager prefill, no mixed batches, and either no
-speculation or DSpark. CUDA Graph decode is supported.
+`--disaggregation-layerwise-interval 0`. PD decode with KVP takes an equal DCP
+size and runs the DCP decode path; prefill with KVP 1 or the same KVP feeds it
+through the page-owner transfer planning. KVP requires eager prefill, no
+mixed batches, and either no speculation or DSpark; with DSpark both roles
+enable it, so the transfer carries the context windows. CUDA Graph decode is
+supported.
 
 ## Validation and tradeoffs
 
 Runtime tests cover query ordering, head exchange, packed-page transport,
 cache ownership, metadata refresh and selection reuse. Kernel tests compare
 partial outputs/LSE against a reference, local Top-k against replicated
-scoring, and repeated graph replay with changing lengths.
+scoring, and repeated graph replay with changing lengths. A four-GPU
+reduced-model test (torchrun) checks model-wide QCP sampled outputs against
+the unsharded model, and QCP with KVP against QCP with replicated KV exactly,
+including empty query owners and CED narrowing.
 
 QCP targets long-prefill latency. KVP trades communication for persistent KV
 capacity; V4.1's small selected-attention workload does not imply a decode

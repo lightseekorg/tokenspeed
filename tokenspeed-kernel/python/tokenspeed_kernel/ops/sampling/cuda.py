@@ -19,8 +19,14 @@
 
 import os as _os
 
-from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.registry import error_fn
+import torch
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    current_platform,
+)
+from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 
 chain_speculative_sampling_target_only = error_fn
 # Prepare is a side-stream registration helper. On non-NVIDIA the fused
@@ -61,6 +67,62 @@ if current_platform().is_nvidia:
         )
     except ImportError:
         pass
+
+    # Its tvm-ffi library loads on the first launch, not on import.
+    from tokenspeed_kernel.thirdparty.cuda.eagle4_candidate import (
+        eagle4_candidate_tail as _eagle4_candidate_tail_impl,
+    )
+    from tokenspeed_kernel.thirdparty.cuda.eagle4_candidate import (
+        eagle4_shard_topk as _eagle4_shard_topk_impl,
+    )
+
+    # Thread-block clusters: SM90 onward.
+    _EAGLE4_CAPABILITY = CapabilityRequirement(
+        min_arch_version=ArchVersion(9, 0), vendors=frozenset({"nvidia"})
+    )
+
+    @register_kernel(
+        "sampling",
+        "eagle4_shard_topk",
+        name="cuda_eagle4_shard_topk",
+        solution="cuda",
+        capability=_EAGLE4_CAPABILITY,
+        signatures=format_signatures("scores", "dense", {torch.bfloat16}),
+        priority=Priority.SPECIALIZED,
+    )
+    def cuda_eagle4_shard_topk(
+        scores: torch.Tensor, k: int, vocab_start: int, global_ids: torch.Tensor
+    ) -> None:
+        _eagle4_shard_topk_impl(scores, k, vocab_start, global_ids)
+
+    @register_kernel(
+        "sampling",
+        "eagle4_candidate_tail",
+        name="cuda_eagle4_candidate_tail",
+        solution="cuda",
+        capability=_EAGLE4_CAPABILITY,
+        signatures=format_signatures("cand_logits", "dense", {torch.bfloat16}),
+        priority=Priority.SPECIALIZED,
+    )
+    def cuda_eagle4_candidate_tail(
+        cand_logits: torch.Tensor,
+        cand_tokens: torch.Tensor,
+        top_k: int,
+        logits_out: torch.Tensor,
+        tokens_out: torch.Tensor,
+        topk_probs: torch.Tensor | None,
+        topk_tokens: torch.Tensor | None,
+    ) -> None:
+        _eagle4_candidate_tail_impl(
+            cand_logits,
+            cand_tokens,
+            top_k,
+            logits_out,
+            tokens_out,
+            topk_probs,
+            topk_tokens,
+        )
+
 
 __all__ = [
     "chain_speculative_sampling_target_only",

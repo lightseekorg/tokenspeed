@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from test.runtime.conftest import whole_row_spans, whole_row_windows
 from types import SimpleNamespace
 
 import numpy as np
@@ -89,7 +90,6 @@ def test_glm53_flash_pool_binds_paged_cache_and_request_local_tail() -> None:
         dtype=torch.bfloat16,
         kv_cache_dtype=torch.float8_e4m3fn,
         kv_cache_quant_method="none",
-        prefix_granularity=GLM53_FLASH_LOGICAL_BLOCK_TOKENS,
         context_len=4096,
         max_bs=8,
         components=(dsa, linear),
@@ -190,12 +190,18 @@ def test_glm53_flash_pool_binds_paged_cache_and_request_local_tail() -> None:
         spec.group_id: np.zeros((1, 1), dtype=np.int32)
         for spec in pool.arena.runtime_contract.group_specs
     }
-    forward_op = SimpleNamespace(block_tables_arrays=lambda: arrays)
+    spans = whole_row_spans(arrays)
+    forward_op = SimpleNamespace(
+        block_table_windows=lambda: whole_row_windows(arrays),
+        block_table_spans=lambda: spans,
+    )
     metadata = CacheBatchMetadata.from_forward_op(
         forward_op,
         device="cuda",
         contract=pool.arena.runtime_contract,
         num_requests=1,
+        validate_page_ids=True,
+        host_tables=False,
     )
     tables = metadata.tables(active_forward_op=forward_op)
     assert tables[FULL_ATTENTION].shape == (1, 1)

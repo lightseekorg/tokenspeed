@@ -26,6 +26,7 @@ import asyncio
 import json
 import os
 import signal
+import socket
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -41,8 +42,6 @@ sys.path.insert(0, os.path.join(REPO_ROOT, "python"))
 from tokenspeed.cli._argsplit import OrchestratorOpts, split_argv
 from tokenspeed.cli.serve_smg import (
     _DEFAULT_SMG_DISABLE_FLAGS,
-    DEEPSEEK_V4_REASONING_PARSER,
-    DEEPSEEK_V4_TOOL_CALL_PARSER,
     INKLING_ATTENTION_BACKEND,
     INKLING_REASONING_PARSER,
     INKLING_TOOL_CALL_PARSER,
@@ -68,7 +67,6 @@ from tokenspeed.cli.serve_smg import (
     _gateway_args_with_engine_identity,
     _gateway_args_with_smg_disable_defaults,
     _get_from_args,
-    _is_deepseek_v4_model,
     _is_inkling_model,
     _is_kimi_k3_model,
     _is_muse_spark_model,
@@ -404,11 +402,6 @@ def _make_muse_spark_model_dir(tmp_path):
     return str(tmp_path)
 
 
-def _make_deepseek_v4_model_dir(tmp_path):
-    (tmp_path / "config.json").write_text(json.dumps({"model_type": "deepseek_v4"}))
-    return str(tmp_path)
-
-
 def _make_kimi_k3_model_dir(tmp_path):
     (tmp_path / "config.json").write_text(
         json.dumps(
@@ -447,14 +440,6 @@ _MODEL_FAMILIES = (
         MUSE_SPARK_TOOL_CALL_PARSER,
         extra_engine_args=("--grammar-backend", MUSE_SPARK_GRAMMAR_BACKEND),
         extra_gateway_args=("--parser", MUSE_SPARK_GATEWAY_PARSER),
-    ),
-    _ModelFamily(
-        "deepseek_v4",
-        "deepseek-ai/DeepSeek-V4-Flash",
-        _make_deepseek_v4_model_dir,
-        _is_deepseek_v4_model,
-        DEEPSEEK_V4_REASONING_PARSER,
-        DEEPSEEK_V4_TOOL_CALL_PARSER,
     ),
     _ModelFamily(
         "kimi_k3",
@@ -539,8 +524,8 @@ def test_model_parser_defaults_preserve_explicit_values(tmp_path, family):
     )
 
 
-def test_deepseek_v4_parser_defaults_fill_missing_parser_only():
-    model = "deepseek-ai/DeepSeek-V4-Flash"
+def test_kimi_k3_parser_defaults_fill_missing_parser_only():
+    model = "moonshotai/Kimi-K3"
 
     engine_args, gateway_args = _args_with_default_model_parsers(
         ["--model", model, "--reasoning-parser", "none"],
@@ -553,7 +538,7 @@ def test_deepseek_v4_parser_defaults_fill_missing_parser_only():
         "--reasoning-parser",
         "none",
         "--tool-call-parser",
-        DEEPSEEK_V4_TOOL_CALL_PARSER,
+        KIMI_K3_TOOL_CALL_PARSER,
     ]
 
     engine_args, gateway_args = _args_with_default_model_parsers(
@@ -564,7 +549,7 @@ def test_deepseek_v4_parser_defaults_fill_missing_parser_only():
         "--model",
         model,
         "--reasoning-parser",
-        DEEPSEEK_V4_REASONING_PARSER,
+        KIMI_K3_REASONING_PARSER,
     ]
     assert gateway_args == [
         "--model",
@@ -572,12 +557,12 @@ def test_deepseek_v4_parser_defaults_fill_missing_parser_only():
         "--tool-call-parser",
         "json",
         "--reasoning-parser",
-        DEEPSEEK_V4_REASONING_PARSER,
+        KIMI_K3_REASONING_PARSER,
     ]
 
 
-def test_deepseek_v4_default_reasoning_parser_survives_gateway_defaults():
-    model = "deepseek-ai/DeepSeek-V4-Flash"
+def test_kimi_k3_default_reasoning_parser_survives_gateway_defaults():
+    model = "moonshotai/Kimi-K3"
 
     _, gateway_args = _args_with_default_model_parsers(
         ["--model", model],
@@ -585,14 +570,14 @@ def test_deepseek_v4_default_reasoning_parser_survives_gateway_defaults():
     )
     gateway_args = _gateway_args_with_defaults(gateway_args)
 
-    # Exactly one reasoning parser, and it is the deepseek-v4 default — the
+    # Exactly one reasoning parser, and it is the Kimi K3 default — the
     # generic passthrough reasoning-parser default must not be layered on top.
     # Check the parser slot rather than bare membership: the value "passthrough"
     # (== DEFAULT_REASONING_PARSER) now also appears as the --policy value, which
     # is an unrelated flag.
     assert gateway_args.count("--reasoning-parser") == 1
     idx = gateway_args.index("--reasoning-parser")
-    assert gateway_args[idx + 1] == DEEPSEEK_V4_REASONING_PARSER
+    assert gateway_args[idx + 1] == KIMI_K3_REASONING_PARSER
 
 
 def test_muse_spark_explicit_gateway_parser_wins(tmp_path):
@@ -726,7 +711,7 @@ def _make_inkling_model_dir(tmp_path):
 
 def test_local_inkling_config_is_detected(tmp_path):
     assert _is_inkling_model(_make_inkling_model_dir(tmp_path))
-    assert not _is_inkling_model("deepseek-ai/DeepSeek-V4-Flash")
+    assert not _is_inkling_model("moonshotai/Kimi-K3")
     assert not _is_inkling_model(None)
 
 
@@ -1442,7 +1427,7 @@ def test_run_smg_from_args_sets_process_title(monkeypatch):
     assert captured.get("title") == "ts-serve"
 
 
-def test_run_smg_from_args_applies_deepseek_v4_parser_defaults(monkeypatch):
+def test_run_smg_from_args_applies_kimi_k3_parser_defaults(monkeypatch):
     captured = {}
 
     async def fake_run_smg(**kwargs):
@@ -1466,22 +1451,22 @@ def test_run_smg_from_args_applies_deepseek_v4_parser_defaults(monkeypatch):
     from tokenspeed.cli.serve_smg import run_smg_from_args
 
     with pytest.raises(SystemExit) as exc:
-        run_smg_from_args(Namespace(), ["deepseek-ai/DeepSeek-V4-Flash"])
+        run_smg_from_args(Namespace(), ["moonshotai/Kimi-K3"])
 
     assert exc.value.code == 0
     assert captured["engine_args"] == [
         "--model",
-        "deepseek-ai/DeepSeek-V4-Flash",
+        "moonshotai/Kimi-K3",
         "--reasoning-parser",
-        DEEPSEEK_V4_REASONING_PARSER,
+        KIMI_K3_REASONING_PARSER,
     ]
     assert captured["gateway_args"][:6] == [
         "--model",
-        "deepseek-ai/DeepSeek-V4-Flash",
+        "moonshotai/Kimi-K3",
         "--reasoning-parser",
-        DEEPSEEK_V4_REASONING_PARSER,
+        KIMI_K3_REASONING_PARSER,
         "--tool-call-parser",
-        DEEPSEEK_V4_TOOL_CALL_PARSER,
+        KIMI_K3_TOOL_CALL_PARSER,
     ]
 
 
@@ -1869,3 +1854,103 @@ def test_follower_node_does_not_read_the_template(tmp_path, monkeypatch, capsys)
     # A follower's ranks never register with the gateway.
     assert "--data-parallel-rpc-port" not in execs[0]
     assert "response_template" not in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("host", ["127.0.0.1", "::1"])
+async def test_run_smg_probes_real_http_server(host, monkeypatch, capsys):
+    """A listening gateway must pass both startup probes, including on IPv6."""
+    from aiohttp import ClientSession, web
+
+    family = socket.AF_INET6 if host == "::1" else socket.AF_INET
+    listener = socket.socket(family, socket.SOCK_STREAM)
+    try:
+        listener.bind((host, 0))
+    except OSError as exc:
+        listener.close()
+        if family == socket.AF_INET6:
+            pytest.skip(f"IPv6 loopback is unavailable: {exc}")
+        raise
+    listener.listen()
+    port = listener.getsockname()[1]
+    stop = asyncio.Event()
+    paths = []
+
+    async def health(request):
+        paths.append(request.path)
+        if request.path == "/readiness":
+            asyncio.get_running_loop().call_later(0.05, stop.set)
+        return web.Response(text="ready")
+
+    app = web.Application()
+    app.router.add_get("/liveness", health)
+    app.router.add_get("/readiness", health)
+    runner = web.AppRunner(app)
+    children = []
+
+    async def spawn_placeholder(*args, **kwargs):
+        # Replace unavailable SMG/model processes, not HTTP probing or teardown.
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            "import time; time.sleep(60)",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        children.append(proc)
+        return proc
+
+    monkeypatch.setattr("tokenspeed.cli.serve_smg.spawn_gateway", spawn_placeholder)
+    monkeypatch.setattr("tokenspeed.cli.serve_smg.spawn_engine", spawn_placeholder)
+    try:
+        await runner.setup()
+        await web.SockSite(runner, listener).start()
+        authority = (
+            f"[{host}]:{port}" if family == socket.AF_INET6 else f"{host}:{port}"
+        )
+        # Establish that the server is reachable before testing the launcher.
+        async with ClientSession() as session:
+            async with session.get(f"http://{authority}/liveness") as response:
+                assert response.status == 200
+        paths.clear()
+        rc = await asyncio.wait_for(
+            run_smg(
+                engine_args=[],
+                gateway_args=[],
+                opts=OrchestratorOpts(
+                    gateway_startup_timeout=1,
+                    engine_startup_timeout=1,
+                    drain_timeout=1,
+                ),
+                user_host=host,
+                user_port=port,
+                layout=EngineLayout(1, None),
+                _stop_event=stop,
+            ),
+            timeout=5,
+        )
+        assert rc == 0
+        assert paths == ["/liveness", "/readiness"]
+        assert f"ts serve ready on http://{authority}" in capsys.readouterr().out
+    finally:
+        await runner.cleanup()
+        listener.close()
+        for proc in children:
+            if proc.returncode is None:
+                proc.kill()
+            await proc.wait()
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "localhost", "::1", "[::1]"])
+@pytest.mark.parametrize("auto_port", [False, True])
+def test_metrics_url_preserves_host_and_port(host, auto_port):
+    from urllib.parse import urlsplit
+
+    args = ["--enable-metrics", "--metrics-host", host]
+    if not auto_port:
+        args += ["--metrics-port", "5006"]
+    forwarded, url = _add_metrics_port(args)
+    parsed = urlsplit(url)
+    assert parsed.hostname == host.strip("[]")
+    assert parsed.port == int(_get_from_args(forwarded, "--metrics-port"))
+    assert parsed.path == "/metrics"

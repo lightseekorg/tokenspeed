@@ -62,7 +62,7 @@ register_cuda_ci(
     est_time=5,
     suite="runtime-1gpu",
     disabled_on_runners=["amd-*"],
-    disabled_on_runners_reason="the EAGLE-4 candidate head kernels are NVIDIA-only",
+    disabled_on_runners_reason="no AMD MoE kernel for the latent MoE's relu2 experts",
 )
 
 _HIDDEN = 32
@@ -122,6 +122,7 @@ def _static_tree_drafter(model: LlamaForCausalLMEagle4, topk: int) -> Eagle4:
         ),
         runtime_states=RuntimeStates(
             req_pool_size=max_bs,
+            input_vocab_size=model.config.vocab_size,
             vocab_size=model.config.vocab_size,
             output_length=nodes,
             device="cuda",

@@ -86,8 +86,8 @@ public:
     QueryCache(std::int32_t grain, std::vector<CacheGroupSpec> specs, std::int32_t parents)
         : device{parents, Packing(specs)},
           host{parents, Packing(specs)},
-          coordinator{
-              MakeCoordinator(specs, grain, device, true, &host, nullptr, true, /*write_back_evictions=*/false)},
+          coordinator{MakeCoordinator(specs, grain, device, true, &host, nullptr, true, /*write_back_evictions=*/false,
+                                      /*checkpoint_retention_requests=*/0)},
           storage{coordinator,
                   StorageConfig{8, 256, parents, 256, 8192, 1, 1000, 1000, {8, 1048576, 1000}, {4, 524288, 500}}} {}
 
@@ -100,17 +100,16 @@ public:
     }
 
     std::vector<CacheKey> Restore(const CacheCoordinator::PromptPrefix& prefix, std::span<const CacheKey> hits) {
-        const auto id = storage.StartRead(prefix, hits);
-        EXPECT_NE(id, 0u);
-        if (!id) return {};
+        const StorageLease read = storage.StartRead(prefix, hits);
+        EXPECT_TRUE(read);
+        if (!read) return {};
         const auto commands = storage.TakeCommands();
         EXPECT_EQ(commands.size(), 1u);
         if (commands.size() != 1 || !std::holds_alternative<StorageGetOperation>(commands[0])) return {};
         const auto operation = std::get<StorageGetOperation>(commands[0]);
-        storage.Complete(cache::StorageDone{id, std::vector<std::uint8_t>(operation.keys.size(), 1), true,
-                                            std::vector<std::uint8_t>(operation.keys.size(), 0)});
-        storage.Detach(id);
-        return operation.keys;
+        storage.Complete(cache::StorageDone{read.OperationId(), std::vector<std::uint8_t>(operation.keys.size(), 1),
+                                            true, std::vector<std::uint8_t>(operation.keys.size(), 0)});
+        return operation.keys;  // dropping the lease retires the completed read
     }
 
     BlockPool device;
@@ -445,8 +444,9 @@ TEST_P(StorageWarmLifetimeTest, ExistingDependenciesRemainEvictableAcrossTheGetL
                                      {.group_id = 2, .content_hash = prompt.hashes[0], .page_offset = 1}};
     cache.Warm(warm);
     const auto query = cache.coordinator.MissingStorageKeys(prefix, 64);
-    const auto id = cache.storage.StartRead(prefix, query.keys);
-    ASSERT_NE(id, 0u);
+    StorageLease read = cache.storage.StartRead(prefix, query.keys);
+    ASSERT_TRUE(read);
+    const auto id = read.OperationId();
     const auto commands = cache.storage.TakeCommands();
     ASSERT_EQ(commands.size(), 1u);
     const auto op = std::get<StorageGetOperation>(commands[0]);
@@ -460,11 +460,11 @@ TEST_P(StorageWarmLifetimeTest, ExistingDependenciesRemainEvictableAcrossTheGetL
         complete(true);
         ASSERT_EQ(cache.coordinator.ProbePromptPrefix(prefix).host.num_common_tokens, 8);
     } else if (stage == WarmReadStage::kDetached || stage == WarmReadStage::kDetachBeforeQuarantine) {
-        cache.storage.Detach(id);
+        read.reset();
         if (stage == WarmReadStage::kDetachBeforeQuarantine) complete(false);
     } else if (stage == WarmReadStage::kQuarantined) {
         complete(false);
-        cache.storage.Detach(id);
+        read.reset();
     }
 
     // The old dependency is not an I/O destination, even when its group is

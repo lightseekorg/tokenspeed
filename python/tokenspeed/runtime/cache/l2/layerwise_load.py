@@ -22,6 +22,10 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
+from tokenspeed.runtime.execution.breakable_cuda_graph import (
+    BreakableCapture,
+    is_breakable_capture_active,
+)
 from tokenspeed.runtime.utils import get_device_module
 
 device_module = get_device_module()
@@ -88,7 +92,27 @@ class LayerwiseLoadTracker:
         self.consumer_indices = tuple(deduped)
 
     def wait_for_layer(self, layer_index: int) -> None:
+        if is_breakable_capture_active():
+            # A captured segment cannot hold this wait (every replay has its
+            # own load): the capture notes the layer, and every replay waits
+            # for it on this tracker before replaying the segment.
+            BreakableCapture.current().wait_before_segment(
+                self.wait_for_layer, layer_index
+            )
+            return
         if not self.consumer_indices:
             return
         for consumer_index in self.consumer_indices:
             self.event_sets[consumer_index].wait_for_layer(layer_index)
+
+    def wait_for_all_layers(self) -> None:
+        """Make the current stream wait for every consumed load as a whole.
+
+        Each load's last-layer event is recorded after every earlier layer's
+        copy. For work that holds no per-layer wait of its own: a CUDA-graph
+        replay, whose captured segments write and read loaded pages.
+        """
+        for consumer_index in self.consumer_indices:
+            device_module.current_stream().wait_event(
+                self.event_sets[consumer_index].last_layer_done_event
+            )

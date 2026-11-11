@@ -28,6 +28,13 @@ from typing import Any
 
 import torch
 from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
+from tokenspeed_kernel.ops.model.qwen4_exp.monokernel import (
+    qwen4_exp_mtp_fuse_inputs,
+    select_qwen4_exp_mtp_fuse_inputs_kernel,
+)
+from tokenspeed_kernel.ops.model.qwen4_exp.monokernel.triton import (
+    MTP_FUSE_INPUTS_MAX_ROWS,
+)
 from torch import nn
 
 from tokenspeed.runtime.distributed.mapping import Mapping
@@ -39,6 +46,7 @@ from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.layers.quantization.mxfp4 import Mxfp4Config
 from tokenspeed.runtime.layers.quantization.utils import (
     should_exclude_quant_module,
     should_ignore_quant_layer,
@@ -47,7 +55,12 @@ from tokenspeed.runtime.layers.vocab_parallel_embedding import ParallelLMHead
 from tokenspeed.runtime.models.qwen4_exp import (
     Qwen4ExpAttentionDecoderLayer,
     Qwen4ExpModel,
+    _warmup_qwen4_moe,
     load_qwen4_exp_weights,
+)
+from tokenspeed.runtime.models.qwen4_exp_monokernel import (
+    QSAMonokernelLayer,
+    enable_decode_monokernels,
 )
 from tokenspeed.runtime.utils import add_prefix
 
@@ -59,6 +72,11 @@ def _resolve_mtp_quant_config(
         return None
     if should_exclude_quant_module("mtp.layers.0", quant_config.exclude_modules):
         return None
+    if (
+        not isinstance(quant_config, Mxfp4Config)
+        or quant_config.quant_method != "quark"
+    ):
+        return quant_config
     # AMD Quark expands an ``mtp.*`` exclusion into the MTP layer's linear
     # module names only; its fused routed experts (and ``fc_embedding``) are
     # left out of the list but stay BF16 as well.
@@ -81,7 +99,7 @@ def _mtp_index_sharing_enabled(config) -> bool:
 
 
 def _build_mtp_lm_head(config, mapping: Mapping, quant_config, prefix: str):
-    if mapping.attn.has_dp:
+    if mapping.attn.has_dp and not mapping.lm_head.has_tp:
         return ReplicatedLinear(
             config.hidden_size,
             config.vocab_size,
@@ -94,9 +112,9 @@ def _build_mtp_lm_head(config, mapping: Mapping, quant_config, prefix: str):
         config.hidden_size,
         quant_config=quant_config,
         prefix=add_prefix("model.shared_head.head", prefix),
-        tp_rank=mapping.attn.tp_rank,
-        tp_size=mapping.attn.tp_size,
-        tp_group=mapping.attn.tp_group,
+        tp_rank=mapping.lm_head.tp_rank,
+        tp_size=mapping.lm_head.tp_size,
+        tp_group=mapping.lm_head.tp_group,
     )
 
 
@@ -157,8 +175,23 @@ class Qwen4ExpDraftAttentionDecoderLayer(Qwen4ExpAttentionDecoderLayer):
         return self._run_mlp(mixed, residuals, ctx)
 
 
+class Qwen4ExpMonokernelDraftAttentionDecoderLayer(
+    QSAMonokernelLayer, Qwen4ExpDraftAttentionDecoderLayer
+):
+    """The MTP draft's QSA layer whose decode steps run as one monokernel
+    launch."""
+
+
 class Qwen4ExpDraftModel(Qwen4ExpModel):
     ATTENTION_LAYER_CLS = Qwen4ExpDraftAttentionDecoderLayer
+    MONOKERNEL_ATTENTION_LAYER_CLS = Qwen4ExpMonokernelDraftAttentionDecoderLayer
+
+    def _decode_monokernel(self) -> bool:
+        # Draft steps that reuse the first step's top-k keep the regular
+        # layer: the monokernel selects its own top-k.
+        return super()._decode_monokernel() and not _mtp_index_sharing_enabled(
+            self.config
+        )
 
     def __init__(self, config, mapping, quant_config=None, prefix: str = ""):
         if config.num_hidden_layers != 1:
@@ -170,6 +203,13 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
     """One-layer Qwen4-Exp MTP head used by TokenSpeed's MTP drafter."""
 
     compute_dsa_topk_first_step = True
+    # Its narrowed extend step keeps the sequence mixers at breakable-graph
+    # break points (the QSA indexer, ``PagedAttention.attend``) and publishes
+    # the accepted prefix through the narrowing handle, and its draft backend
+    # (the cache-group router, no state groups) attends in the mode it is
+    # passed, so the drafter may record its extend round as breakable graphs
+    # (--enable-drafter-prefill-graph).
+    supports_breakable_draft_extend = True
 
     def __init__(
         self,
@@ -220,21 +260,61 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
         for indexer in self.model.qsa_indexers:
             indexer.share_topk_for_mtp_iteration = self.index_share_for_mtp_iteration
         self.lm_head = _build_mtp_lm_head(config, mapping, quant_config, prefix)
+        # Set by post_quant_warmup when the draft layer runs the decode
+        # monokernel: the kernel that runs _fuse_inputs in one launch for a
+        # decode step's rows.
+        self.fuse_inputs_kernel: Any | None = None
         self.logits_processor = LogitsProcessor(
             config,
             skip_all_gather=mapping.attn.has_dp,
-            tp_rank=mapping.attn.tp_rank,
-            tp_size=mapping.attn.tp_size,
-            tp_group=mapping.attn.tp_group,
+            tp_rank=mapping.lm_head.tp_rank,
+            tp_size=mapping.lm_head.tp_size,
+            tp_group=mapping.lm_head.tp_group,
             do_argmax=True,
-            dp_lm_head_tp=False,
+            attn_tp_size=mapping.attn.tp_size,
+            dp_lm_head_tp=mapping.attn.has_dp and mapping.lm_head.has_tp,
         )
 
     def get_hot_token_id(self):
         return None
 
+    def post_quant_warmup(self) -> None:
+        _warmup_qwen4_moe(self.model)
+        # The draft layer is a monokernel layer unless the draft steps reuse
+        # the first step's top-k (Qwen4ExpDraftModel._decode_monokernel).
+        enable_decode_monokernels(self.model)
+        if self.model.monokernel_state is not None and self._can_fuse_inputs():
+            self.fuse_inputs_kernel = select_qwen4_exp_mtp_fuse_inputs_kernel(
+                MTP_FUSE_INPUTS_MAX_ROWS
+            )
+
+    def _can_fuse_inputs(self) -> bool:
+        """Whether the fused input kernel reads this model's weights as they are:
+        4 streams, an unsharded embedding and BF16 linears without
+        quantization."""
+        linears = (self.fc_embedding, self.fc_hidden)
+        return (
+            self.hc_count == 4
+            and self.model.embed_tokens.tp_size == 1
+            and all(
+                linear.weight.dtype == torch.bfloat16
+                and linear.weight.shape == (self.hidden_size, self.hidden_size)
+                for linear in linears
+            )
+        )
+
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
+
+    def set_embed_and_head_module(
+        self, embed: torch.Tensor, lm_head: nn.Module
+    ) -> None:
+        """Share the target head's weights, quantization method and scales together."""
+        del self.model.embed_tokens.weight
+        self.model.embed_tokens.weight = embed
+        self.lm_head = lm_head
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
     def set_embed_and_head(self, embed, head):
         del self.model.embed_tokens.weight
@@ -290,9 +370,33 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
         else:
             if input_embeds is not None:
                 raise ValueError("Qwen4-Exp MTP does not accept input_embeds")
-            fused = self._fuse_inputs(
-                self.model.embed_tokens(input_ids), captured_hidden_states
-            )
+            rows = input_ids.shape[0]
+            if (
+                self.fuse_inputs_kernel is not None
+                and ctx.forward_mode.is_decode()
+                and rows <= MTP_FUSE_INPUTS_MAX_ROWS
+            ):
+                # A decode step's rows: the norms, linears and stream add in
+                # one launch (the same math as _fuse_inputs).
+                fused = captured_hidden_states.new_empty(
+                    rows, self.hc_count * self.hidden_size
+                )
+                qwen4_exp_mtp_fuse_inputs(
+                    self.fuse_inputs_kernel,
+                    input_ids,
+                    self.model.embed_tokens.weight,
+                    captured_hidden_states.contiguous(),
+                    self.pre_fc_norm_embedding.weight,
+                    self.pre_fc_norm_hidden.weight,
+                    self.fc_embedding.weight,
+                    self.fc_hidden.weight,
+                    self.pre_fc_norm_embedding.variance_epsilon,
+                    fused,
+                )
+            else:
+                fused = self._fuse_inputs(
+                    self.model.embed_tokens(input_ids), captured_hidden_states
+                )
         with report_collective_sizing(ctx, ctx.bs, ctx.global_bs):
             hidden_states, aux_hidden_states = self.model(
                 input_ids,
@@ -300,22 +404,20 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
                 ctx,
                 input_embeds=fused,
             )
-        return self.logits_processor(
-            input_ids,
-            hidden_states,
-            self.lm_head,
-            LogitsMetadata.from_forward_context(ctx),
-            aux_hidden_states,
-        )
+            # The first draft step narrows verify rows to one per request.
+            # Keep that row table active through the cross-DP head exchange.
+            return self.logits_processor(
+                input_ids,
+                hidden_states,
+                self.lm_head,
+                LogitsMetadata.from_forward_context(ctx),
+                aux_hidden_states,
+            )
 
     def checkpoint_weight_name_filter(self, name: str) -> bool:
         return "mtp" in name or "shared_head" in name
 
-    def load_weights(
-        self, weights: Iterable[tuple[str, torch.Tensor]], is_mtp: bool = False
-    ):
-        del is_mtp
-
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         def remap():
             for name, weight in weights:
                 if "mtp" not in name and "shared_head" not in name:

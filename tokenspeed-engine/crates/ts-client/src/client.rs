@@ -64,8 +64,13 @@ pub struct OutputChunk {
     pub completion_tokens: i64,
     /// Prompt tokens served from the prefix cache.
     pub cached_tokens: i64,
+    /// Reasoning tokens generated so far, excluding structural markers.
+    pub reasoning_tokens: i64,
     /// Logprobs of this step's tokens; empty when not requested.
     pub output_token_logprobs: Vec<f64>,
+    /// Selected tokens' cumulative probability diagnostics, parallel to
+    /// logprobs; empty when diagnostics or logprobs were not requested.
+    pub output_token_cumulative_probs: Vec<f64>,
     /// The finish reason in full on the last chunk (the matched token, an
     /// abort's message and codes), from an engine that sends it.
     pub finish_details: Option<FinishDetails>,
@@ -95,7 +100,9 @@ impl From<&RequestOutput<'_>> for OutputChunk {
             prompt_tokens: row.prompt_tokens,
             completion_tokens: row.completion_tokens,
             cached_tokens: row.cached_tokens,
+            reasoning_tokens: row.reasoning_tokens,
             output_token_logprobs: row.output_token_logprobs.to_vec(),
+            output_token_cumulative_probs: row.output_token_cumulative_probs.to_vec(),
             finish_details: row.finish_details.cloned(),
             spec_verify_ct: row.spec_verify_ct,
             accept_draft_tokens: row.accept_draft_tokens,
@@ -475,6 +482,7 @@ impl EngineClient {
         }
         self.shared.require(REQUEST_ADD)?;
         let engine = self.shared.route(&request)?;
+        debug!(rid, engine, routing = ?self.shared.routing, bootstrap_room = request.bootstrap_room, "generate request routed");
         let (tx, rx) = mpsc::unbounded_channel();
         {
             // Register before sending: outputs can arrive before `send`

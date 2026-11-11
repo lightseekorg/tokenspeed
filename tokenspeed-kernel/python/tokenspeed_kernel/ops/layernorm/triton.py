@@ -18,8 +18,7 @@ from tokenspeed_kernel.ops.quantization.triton import (
 from tokenspeed_kernel.platform import ArchVersion, current_platform, pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
-
-_FP32_MIN_NORMAL = tl.constexpr(1.1754943508222875e-38)
+from tokenspeed_kernel.warmup import kernel_launcher
 
 
 @triton.jit
@@ -57,6 +56,7 @@ def _rmsnorm_kernel(
     x_scale,
     residual_scale,
     x_row_stride,
+    out_row_stride,
     n_cols: tl.constexpr,
     eps: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -99,7 +99,9 @@ def _rmsnorm_kernel(
     variance = tl.sum(x * x, axis=0) / n_cols
     x *= tl.rsqrt(variance + eps)
     weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-    tl.store(out_ptr + row_offsets, x * weight, mask=mask)
+    tl.store(
+        out_ptr + row.to(tl.int64) * out_row_stride + offsets, x * weight, mask=mask
+    )
     if TOKEN_FP8_OUT:
         # The stored row quantized per token (as fp8_quantize_per_token
         # quantizes it): FP8 E4M3 codes and one FP32 dequant scale.
@@ -313,8 +315,9 @@ def rmsnorm(
             f"residual shape {tuple(residual.shape)} does not match input shape {tuple(x.shape)}"
         )
 
-    # Without a residual the kernel reads strided rows (e.g. a column slice of
-    # a fused projection) in place; other layouts are made contiguous.
+    # Without a residual the kernel reads and writes strided rows (e.g. a
+    # column slice of a fused projection) in place; other layouts are made
+    # contiguous.
     strided_rows = residual is None and x.ndim == 2 and x.stride(-1) == 1
     if not x.is_contiguous() and not strided_rows:
         x = x.contiguous()
@@ -326,9 +329,10 @@ def rmsnorm(
     hidden_size = x.shape[-1]
     x_2d = x if strided_rows else x.view(-1, hidden_size)
     out = torch.empty(x.shape, dtype=x.dtype, device=x.device) if out is None else out
-    if not out.is_contiguous():
-        raise ValueError("out must be contiguous")
-    out_2d = out.view(-1, hidden_size)
+    strided_out = residual is None and out.ndim == 2 and out.stride(-1) == 1
+    if not out.is_contiguous() and not strided_out:
+        raise ValueError("out must be contiguous or 2-D rows with unit column stride")
+    out_2d = out if strided_out else out.view(-1, hidden_size)
 
     residual_out = torch.empty_like(x) if residual is not None else None
     if token_fp8_out is not None:
@@ -363,6 +367,7 @@ def rmsnorm(
         x_scale,
         residual_scale,
         x_2d.stride(0),
+        out_2d.stride(0),
         hidden_size,
         eps,
         BLOCK=block,
@@ -1166,11 +1171,10 @@ def _store_nvfp4(
     # fp4_quantize's E4M3-scale recipe, bit for bit: block amax / 6 scaled into E4M3, values into E2M1.
     blocks = tl.reshape(normed, [BLOCK // 16, 16])
     vec_max = tl.max(tl.abs(blocks), axis=1).to(tl.float32)
-    # Its zero test flushes too: a subnormal block amax counts as zero.
-    vec_max = tl.where(vec_max < _FP32_MIN_NORMAL, 0.0, vec_max)
     sf = _mul_ftz(sf_scale, _mul_ftz(vec_max, rcp6)).to(tl.float8e4nv)
+    # A block whose E4M3 scale rounds to zero encodes zero values.
     out_scale = tl.where(
-        vec_max != 0,
+        sf.to(tl.float32) != 0,
         _rcp_approx_ftz(_mul_ftz(sf.to(tl.float32), rcp_sf_scale)),
         0.0,
     )
@@ -1435,6 +1439,51 @@ def add_rmsnorm(
     )
 
 
+@register_kernel(
+    "layernorm",
+    "gemma_rmsnorm",
+    name="triton_gemma_rmsnorm",
+    solution="triton",
+    signatures=format_signatures(
+        "x", "dense", {torch.bfloat16, torch.float16, torch.float32}
+    ),
+    priority=Priority.PORTABLE,
+)
+def triton_gemma_rmsnorm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    residual: torch.Tensor | None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Triton kernel of :func:`tokenspeed_kernel.ops.layernorm.gemma_rmsnorm`:
+    ``grouped_gemma_rmsnorm`` with one group per row, or ``add_rmsnorm(gemma=True)``
+    writing the norm into ``x`` and the sum into ``residual``."""
+    if residual is None:
+        return grouped_gemma_rmsnorm(x, weight, int(x.shape[-1]), eps, out=None)
+    # [M, N] rows with dense columns stay as they are (a column slice of a fused
+    # projection stays a view); other layouts become a [rows, N] view or copy.
+    x_rows = x if x.ndim == 2 and x.stride(-1) == 1 else x.reshape(-1, x.shape[-1])
+    residual_rows = (
+        residual
+        if residual.ndim == 2 and residual.stride(-1) == 1
+        else residual.reshape(-1, residual.shape[-1])
+    )
+    add_rmsnorm(
+        x_rows,
+        residual_rows,
+        weight,
+        eps,
+        x2=None,
+        out=x_rows,
+        out_fp8=None,
+        fp8_scale=None,
+        out_fp4=None,
+        fp4_scale=None,
+        gemma=True,
+    )
+    return x_rows.view(x.shape), residual_rows.view(residual.shape)
+
+
 # Rows each gated RMSNorm program normalizes when one warp covers a row.
 GATED_RMSNORM_ROWS_PER_PROGRAM = 4
 
@@ -1492,7 +1541,9 @@ def triton_gated_rmsnorm(
     block_m = GATED_RMSNORM_ROWS_PER_PROGRAM if num_warps == 1 else 1
     grid = (triton.cdiv(M, block_m), ngroups)
     with torch.cuda.device(x.device.index):
-        gated_rmsnorm_kernel[grid](
+        # Pass the heuristic explicitly so startup can retain and load each
+        # compiled binary; the heuristic wrapper discards that return value.
+        kernel_launcher(gated_rmsnorm_kernel.fn, grid)(
             x,
             out,
             weight,
@@ -1506,6 +1557,7 @@ def triton_gated_rmsnorm(
             eps,
             BLOCK_M=block_m,
             BLOCK_N=BLOCK_N,
+            HAS_Z=z is not None,
             NORM_BEFORE_GATE=norm_before_gate,
             SIGMOID_GATE=sigmoid_gate,
             num_warps=block_m * num_warps,

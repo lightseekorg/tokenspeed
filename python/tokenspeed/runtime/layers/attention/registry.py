@@ -93,6 +93,9 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
         CacheMemoryPlan,
     )
+    from tokenspeed.runtime.layers.attention.qsa.bf16_scratch import (
+        QSABf16ScratchPlan,
+    )
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
@@ -301,6 +304,10 @@ _HYBRID_MAMBA2_ARCHITECTURES = {
 _HYBRID_MLA_KDA_ARCHITECTURES = {
     "KimiK3ForConditionalGeneration",
 }
+# Kimi-K3.1: the K3 layout with DSA sparse MLA on its full-attention layers.
+_HYBRID_KIMI_DSA_KDA_ARCHITECTURES = {
+    "KimiK31ForConditionalGeneration",
+}
 _HYBRID_DSA_KDA_TARGET_ARCHITECTURES = {
     "Glm53FlashForConditionalGeneration",
 }
@@ -336,6 +343,8 @@ class _AttnSideProfile:
     # subset of ``is_kda`` that selects the DSA history consumer and the
     # glm53_flash cache family.
     is_dsa_kda: bool
+    # Kimi-K3.1: subset of is_kda that selects only the DSA history consumer.
+    is_kimi_dsa_kda: bool
     is_qwen4_exp: bool
     is_qsa: bool
     is_inkling: bool
@@ -379,6 +388,7 @@ def _resolve_attn_side(
             is_mamba2=False,
             is_kda=False,
             is_dsa_kda=False,
+            is_kimi_dsa_kda=False,
             is_qwen4_exp=False,
             is_qsa=False,
             is_inkling=False,
@@ -389,14 +399,19 @@ def _resolve_attn_side(
     qwen4_exp = is_qwen4_exp(hf_config)
     is_dspark = any(a in _DSPARK_DRAFT_ARCHITECTURES for a in architectures)
     is_dsa_kda = any(a in _HYBRID_DSA_KDA_ARCHITECTURES for a in architectures)
+    is_kimi_dsa_kda = any(
+        a in _HYBRID_KIMI_DSA_KDA_ARCHITECTURES for a in architectures
+    )
     return _AttnSideProfile(
         architectures=tuple(architectures),
         requested_backend=requested_backend,
         is_hybrid_gdn=any(a in _HYBRID_GDN_ARCHITECTURES for a in architectures),
         is_mamba2=any(a in _HYBRID_MAMBA2_ARCHITECTURES for a in architectures),
         is_kda=is_dsa_kda
+        or is_kimi_dsa_kda
         or any(a in _HYBRID_MLA_KDA_ARCHITECTURES for a in architectures),
         is_dsa_kda=is_dsa_kda,
+        is_kimi_dsa_kda=is_kimi_dsa_kda,
         is_qwen4_exp=qwen4_exp,
         is_qsa=qwen4_exp and getattr(text_config, "indexer_n_heads", None) is not None,
         is_inkling=any(a in _INKLING_ARCHITECTURES for a in architectures),
@@ -490,7 +505,7 @@ def _resolve_full_attn_backend_name(
         return _resolve_hybrid_full_backend_name(
             hybrid_request,
             is_kda=profile.is_kda,
-            is_dsa=profile.is_dsa_kda,
+            is_dsa=profile.is_dsa_kda or profile.is_kimi_dsa_kda,
             is_qsa=profile.is_qsa,
         )
     return softmax_attn.backend_name
@@ -528,7 +543,7 @@ def _resolve_cache_family(
     config: AttnConfig,
 ) -> CacheModelFamily:
     """The one dispatch from family facts (plus built config) to the recipe."""
-    if profile.model_profile is not None:
+    if profile.model_profile is not None and profile.model_profile.cache_family:
         return profile.model_profile.cache_family
     if config.component(Dots3NoteAttentionConfig) is not None:
         return "dots3_note"
@@ -640,6 +655,40 @@ def create_paged_router(
         spec_num_tokens=config.speculative_num_draft_tokens or 1,
         device=config.device,
         consumed_group_ids=(FULL_ATTENTION,) if name == "qsa" else None,
+        query_sharded=config.qcp_size > 1,
+    )
+
+
+def _pin_fixed_kernel_page(
+    config: AttnConfig,
+    model_config: ModelConfig,
+    backend_name: str | None,
+) -> AttnConfig:
+    """Pin a fixed-page leaf's kernel page on an ordinary side's config.
+
+    The ordinary recipe makes one block span its prefix granularity and sizes
+    that span to hold whole kernel pages (``OrdinaryRecipe.prefix_granularity``),
+    so the page a leaf fixes must be visible before the plan. The leaf then
+    resolves the same page from the pinned value. A flexible leaf runs at the
+    block span and pins nothing; MSA builds a dense and a sparse leaf, and its
+    recipe adds the sparse page itself.
+    """
+    from tokenspeed.runtime.layers.attention.backends.paged.base import (
+        PagedAttentionBackend,
+    )
+
+    if config.kernel_page_size is not None or isinstance(
+        config.component(SoftmaxAttnConfig), MSAConfig
+    ):
+        return config
+    leaf_cls = _get_backend_cls(backend_name, model_config.attention_arch)
+    if (
+        not issubclass(leaf_cls, PagedAttentionBackend)
+        or leaf_cls.default_kernel_page_size is None
+    ):
+        return config
+    return dataclasses.replace(
+        config, kernel_page_size=int(leaf_cls.default_kernel_page_size)
     )
 
 
@@ -684,6 +733,7 @@ _LINEAR_ATTN_CLS: dict[str, type[LinearAttnConfig]] = {
     for arch in (
         *_HYBRID_GDN_ARCHITECTURES,
         *_HYBRID_MLA_KDA_ARCHITECTURES,
+        *_HYBRID_KIMI_DSA_KDA_ARCHITECTURES,
         # GLM NextN is one DSA layer. It reuses the target's mixed-layer
         # metadata but must not acquire a linear-attention component.
         *_HYBRID_DSA_KDA_TARGET_ARCHITECTURES,
@@ -697,13 +747,31 @@ def _create_attn_config(
     arch = model_config.attention_arch
     if arch not in _CONFIG_CLS:
         raise NotImplementedError(f"Not supported Attention Arch: {arch!r}")
-    if isinstance(model_config.hf_config, Dots3NoteConfig):
-        config_cls = Dots3NoteAttentionConfig
-    elif is_deepseek_v41_config(model_config.hf_config):
-        config_cls = DeepseekV41Config
+    profile = model_config.model_profile
+    if profile is not None and profile.create_attention_config is not None:
+        config = profile.create_attention_config(server_args, model_config, is_draft)
+        if not isinstance(config, AttnConfig):
+            raise TypeError(
+                "ModelProfile.create_attention_config must return AttnConfig"
+            )
+        if config.is_draft != is_draft:
+            raise ValueError(
+                "ModelProfile.create_attention_config must build the config for "
+                f"is_draft={is_draft}, got is_draft={config.is_draft}"
+            )
+        if config.component(LinearAttnConfig) is not None:
+            raise ValueError(
+                "ModelProfile.create_attention_config must leave linear attention "
+                "composition to the runtime"
+            )
     else:
-        config_cls = _CONFIG_CLS[arch]
-    config = config_cls.generate(server_args, model_config, is_draft)
+        if isinstance(model_config.hf_config, Dots3NoteConfig):
+            config_cls = Dots3NoteAttentionConfig
+        elif is_deepseek_v41_config(model_config.hf_config):
+            config_cls = DeepseekV41Config
+        else:
+            config_cls = _CONFIG_CLS[arch]
+        config = config_cls.generate(server_args, model_config, is_draft)
     # Extra components are built through the same generate() protocol and
     # composed into config.components (consumers look them up by class via
     # ``component()``).
@@ -823,12 +891,17 @@ def _kda_linear_attn_backend(
 def _gdn_linear_attn_backend(
     server_args: ServerArgs, config: AttnConfig
 ) -> AttentionBackend:
-    del server_args
     from tokenspeed.runtime.layers.attention.backends.state.gdn import (
         GdnAttnBackend,
     )
 
-    return GdnAttnBackend(config, config.component(SoftmaxAttnConfig))
+    return GdnAttnBackend(
+        config,
+        config.component(SoftmaxAttnConfig),
+        writes_state_checkpoints_in_forward=(
+            server_args.writes_state_checkpoints_in_forward
+        ),
+    )
 
 
 def _mamba2_linear_attn_backend(
@@ -1088,12 +1161,14 @@ def _prepare_fixed_workspaces(
     draft_backend,
     uses_paged_state_verify: bool,
     is_inkling: bool,
+    qsa_bf16_scratch: QSABf16ScratchPlan | None,
     expected_bytes: int,
 ) -> None:
     """Allocate the fixed workspaces the recipe reserved from the cache budget
     (``CacheRecipe.workspace_bytes``) and check the bytes agree.
 
-    The verify workspaces of the paged-state families and the
+    The verify workspaces of the paged-state families, Qwen4-Exp's QSA BF16
+    prefill scratch (``qsa_bf16_scratch``, the target's) and the
     query-context-parallel history gather workspace of GPU DSA: the target
     tree allocates the latter once and the draft tree gathers into the same
     buffers (the draft's extend step follows the target's forward on the
@@ -1101,6 +1176,7 @@ def _prepare_fixed_workspaces(
     """
     from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
         Qwen4ExpBackend,
+        qwen4_exp_backend,
     )
 
     width = int(server_args.speculative_num_draft_tokens or 1)
@@ -1116,7 +1192,14 @@ def _prepare_fixed_workspaces(
         if draft_backend is not None:
             actual_bytes += draft_backend.fixed_workspace_bytes()
         allocated = True
-    if config.qcp_size > 1:
+    if qsa_bf16_scratch is not None:
+        actual_bytes += qwen4_exp_backend(backend).preallocate_qsa_bf16_scratch(
+            qsa_bf16_scratch
+        )
+        allocated = True
+    # V4.1 allocates its gathered projections and per-request packed history
+    # per forward; it has no DSA history gather workspace to reserve.
+    if config.qcp_size > 1 and config.component(DeepseekV41Config) is None:
         actual_bytes += backend.preallocate_history_gather_workspace(config.context_len)
         allocated = True
         if draft_backend is not None:
@@ -1281,19 +1364,24 @@ def create_attn_components(
         if draft_attn_config is not None
         else None
     )
-    # A draft model's own profile is authoritative for its cache layout;
-    # the attention-config class only approximates it for in-tree drafts.
+    # A draft model's own profile is authoritative for its cache layout. One that
+    # leaves cache_family None declares nothing: it binds like an undeclared
+    # draft, so the same draft serves an ordinary target (as an MHA view) and a
+    # custom family (through that family's own recipe).
     draft_profile = (
         draft_model_config.model_profile if draft_attn_config is not None else None
     )
-    if draft_profile is not None:
+    draft_family_declared = (
+        draft_profile is not None and draft_profile.cache_family is not None
+    )
+    if draft_family_declared:
         draft_cache_family = draft_profile.cache_family
     else:
         draft_cache_family = _ordinary_cache_family(draft_attn_config)
     heterogeneous_draft_family = _resolve_heterogeneous_draft_family(
         cache_family,
         draft_cache_family,
-        draft_family_declared=draft_profile is not None,
+        draft_family_declared=draft_family_declared,
     )
     # One profile per boot, where a boot without a reserve takes it; a rebuild reuses it.
     if profiled_cache_bytes is None:
@@ -1307,6 +1395,14 @@ def create_attn_components(
             world_group=server_args.mapping.world_group,
         )
     cache_memory = reserve_cache_budget(profiled_cache_bytes, graph_reserve_bytes)
+    if cache_family in _ORDINARY_CACHE_FAMILIES:
+        config = _pin_fixed_kernel_page(
+            config, model_config, target_full_attn_backend_name
+        )
+        if draft_attn_config is not None:
+            draft_attn_config = _pin_fixed_kernel_page(
+                draft_attn_config, draft_model_config, draft_full_attn_backend_name
+            )
     recipe = cache_recipe(
         cache_family,
         server_args=server_args,
@@ -1319,37 +1415,19 @@ def create_attn_components(
         overlap_schedule_depth=overlap_schedule_depth,
         probe_batch_rows=probe_batch_rows,
     )
+    # Reserved from the budget by the recipe, allocated below; a family
+    # without QSA layers refuses --enable-qsa-prefill-bf16-scratch here.
+    qsa_bf16_scratch = recipe.qsa_bf16_scratch_plan
     num_draft_cache_layers = recipe.num_draft_layers
     num_target_cache_layers = len(recipe.layer_types) - num_draft_cache_layers
-    if server_args.mapping.has_pp:
-        from tokenspeed.runtime.distributed.pp_stage import (
-            pp_stage_cache_windows,
-            pp_stage_windows,
-        )
+    from tokenspeed.runtime.distributed.pp_stage import pp_target_cache_windows
 
-        # Stage windows partition execution blocks; cache ownership speaks
-        # cache-layer IDs, one per attention instance. A model's profile says
-        # how many instances each block owns (LongCat's paired layout: two);
-        # the in-tree PP targets K3 and V4 declare no profile and own one.
-        # Cache ownership itself does not partition execution blocks.
-        profile = model_config.model_profile
-        target_cache_windows = pp_stage_cache_windows(
-            pp_stage_windows(
-                model_config.num_hidden_layers,
-                server_args.mapping.pp_size,
-                server_args.mapping.pp_layer_partition,
-            ),
-            cache_layers_per_execution_layer=(
-                profile.attention_instances_per_layer if profile is not None else 1
-            ),
-            num_target_cache_layers=num_target_cache_layers,
-        )
-    else:
-        target_cache_windows = [(0, num_target_cache_layers)]
     owners = pipeline_cache_ownership(
         num_target_cache_layers,
         num_draft_cache_layers,
-        target_cache_windows,
+        pp_target_cache_windows(
+            server_args.mapping, model_config, num_target_cache_layers
+        ),
     )
     layer_ownership = owners[server_args.mapping.pp_rank]
     from tokenspeed.runtime.distributed.process_group_manager import (
@@ -1491,6 +1569,7 @@ def create_attn_components(
         draft_backend=draft_attn_backend,
         uses_paged_state_verify=cache_setup.uses_paged_state_verify,
         is_inkling=cache_family == "inkling",
+        qsa_bf16_scratch=qsa_bf16_scratch,
         expected_bytes=fixed_workspace_bytes,
     )
 

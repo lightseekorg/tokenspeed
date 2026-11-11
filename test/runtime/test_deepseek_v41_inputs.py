@@ -32,6 +32,7 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 import torch
 from torch import nn
@@ -85,6 +86,10 @@ def _op(states, rids, slots, lengths, prefixes, replays, overrides):
         ids.extend(
             (state.prompt_input_ids + state.output_ids)[prefix : prefix + length]
         )
+    input_ids = np.array(ids, dtype=np.int32)
+    shifted_ids = np.array(ids[1:] + [-1] if ids else [], dtype=np.int32)
+    input_ids.flags.writeable = False
+    shifted_ids.flags.writeable = False
     return SimpleNamespace(
         request_ids=rids,
         request_pool_indices=slots,
@@ -92,8 +97,8 @@ def _op(states, rids, slots, lengths, prefixes, replays, overrides):
         prefill_lengths=[
             len(states[r].prompt_input_ids) + len(states[r].output_ids) for r in rids
         ],
-        input_ids=ids,
-        shifted_input_ids=ids[1:] + [-1] if ids else [],
+        input_ids=input_ids,
+        shifted_input_ids=shifted_ids,
         extend_prefix_lens=prefixes,
         extend_replay_lens=replays,
         decode_input_ids=overrides,
@@ -147,7 +152,11 @@ def buffers(request, monkeypatch):
     )
     ib.init_ngram_buffers(3, _hash_params(ib.device), VOCAB_SIZE)
     runtime = RuntimeStates(
-        req_pool_size=5, vocab_size=VOCAB_SIZE, output_length=1, device=device
+        req_pool_size=5,
+        input_vocab_size=VOCAB_SIZE,
+        vocab_size=VOCAB_SIZE,
+        output_length=1,
+        device=device,
     )
     runtime.init_ngram_state(3)
     return ib, runtime
@@ -508,7 +517,11 @@ def test_the_buffers_validate_the_windows_and_the_config_their_width(buffers):
 
 def _spec_runtime(ib, width):
     runtime = RuntimeStates(
-        req_pool_size=5, vocab_size=VOCAB_SIZE, output_length=width, device=ib.device
+        req_pool_size=5,
+        input_vocab_size=VOCAB_SIZE,
+        vocab_size=VOCAB_SIZE,
+        output_length=width,
+        device=ib.device,
     )
     runtime.init_ngram_state(3)
     return runtime
@@ -805,6 +818,7 @@ def test_executor_input_capacity_covers_decode_capture(
         max_req_pool_size=5,
         pp_size=pp_size,
         overlap_schedule_depth=depth,
+        input_vocab_size=VOCAB_SIZE,
         vocab_size=VOCAB_SIZE,
         output_length=width,
         enable_nan_detection=False,
@@ -973,6 +987,7 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
     executor.runtime_states = runtime
     executor.model_runner = runner
     executor.drafter = None
+    executor._samples_from_vocab_shard = False
     pg = PrefillGraph.__new__(PrefillGraph)
     pg.config = executor.config
     pg.input_buffers = ib
@@ -1003,7 +1018,7 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
         lambda path, group, rank: events.append(("save", path, group, rank)),
     )
 
-    executor.autotune()
+    executor.autotune(keep_loaded_tactics=False)
 
     assert (ib.ngram_previous_tokens_buf == -1).all()
     assert not ib.ngram_token_mask_buf.any()
@@ -1241,6 +1256,8 @@ def test_weight_loader_initializes_engram_once_in_weight_region(
         tokenizer_mode="auto",
         trust_remote_code=False,
         revision="revision",
+        weight_memory_policy=None,
+        model_update_draft_weights=None,
     )
     config = SimpleNamespace(
         dtype=torch.bfloat16,
@@ -1254,6 +1271,7 @@ def test_weight_loader_initializes_engram_once_in_weight_region(
         gpu_id=0,
         memory_saver_adapter=SimpleNamespace(region=region),
         checkpoint_load_group=None,
+        is_draft_worker=False,
     )
     assert result is model
     assert events == (
@@ -1360,3 +1378,61 @@ def test_engram_token_map_must_cover_the_vocabulary():
     )
     with pytest.raises(ValueError, match="fewer than the vocabulary"):
         ib.init_ngram_buffers(3, _hash_params("cpu"), VOCAB_SIZE + 1)
+
+
+def test_input_only_tokens_survive_prefill_decode_and_ngram_preparation(buffers):
+    ib, _ = buffers
+    runtime = RuntimeStates(
+        req_pool_size=5,
+        input_vocab_size=VOCAB_SIZE,
+        vocab_size=64,
+        output_length=1,
+        device=ib.device,
+    )
+    runtime.init_ngram_state(3)
+    states = {"a": _state([10, 100, 127, 20], [])}
+    op = _op(states, ["a"], [2], [4], [0], [0], [])
+    _fill(ib, runtime, op, _ngram_inputs(op, states, 3))
+    assert ib.input_ids_buf[:4].tolist() == [10, 100, 127, 20]
+    assert ib.ngram_previous_tokens_buf[3, :3].tolist() == [127, 100, 10]
+    runtime.valid_cache_lengths[2] = 4
+    runtime.future_input_map[2] = 100
+    op = _op(states, ["a"], [2], [1], [], [], [-1])
+    _fill(ib, runtime, op, _ngram_inputs(op, states, 3))
+    assert ib.input_ids_buf[0].item() == 100
+    runtime.init_draft_probs(spec_num_tokens=2, reject_threshold=2.0)
+    assert runtime.draft_probs.shape == (6, 2, 64)
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+@pytest.mark.parametrize("draft_ids", [[5, 63], [64, 127], [-1, 999]])
+def test_spec_candidates_use_output_bounds_without_narrowing_inputs(
+    buffers, mixed, draft_ids
+):
+    ib, _ = buffers
+    runtime = RuntimeStates(
+        req_pool_size=5,
+        input_vocab_size=VOCAB_SIZE,
+        vocab_size=64,
+        output_length=3,
+        device=ib.device,
+    )
+    runtime.init_ngram_state(3)
+    runtime.future_input_map[2] = torch.tensor([100, *draft_ids], device=ib.device)
+    runtime.valid_cache_lengths[2] = 4
+    states = {"p": _state([100, 127], []), "d": _state([1, 2, 3, 4], [])}
+    op = (
+        _op(states, ["p", "d"], [1, 2], [2, 3], [0], [0], [-1])
+        if mixed
+        else _op(states, ["d"], [2], [3], [], [], [-1])
+    )
+    _fill(ib, runtime, op, _ngram_inputs(op, states, 3))
+    start = 2 if mixed else 0
+    assert ib.input_ids_buf[start : start + 3].tolist() == [
+        100,
+        *[min(63, max(0, x)) for x in draft_ids],
+    ]
+    if mixed:
+        assert ib.input_ids_buf[:2].tolist() == [100, 127]
+    # The drafter-owned source is never rewritten by input preparation.
+    assert runtime.future_input_map[2].tolist() == [100, *draft_ids]

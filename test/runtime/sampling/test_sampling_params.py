@@ -60,3 +60,28 @@ def test_min_p_stays_inclusive_at_zero():
     # this file: min_p=0 is valid and must keep passing.
     SamplingParams(min_p=0.0).verify(vocab_size=32)
     SamplingParams(min_p=1.0).verify(vocab_size=32)
+
+
+def test_temperature_rejects_negative():
+    # Coercing it to greedy would also drop the caller's top_k.
+    params = SamplingParams(temperature=-0.5, top_k=40)
+    with pytest.raises(ValueError, match=r"temperature must be non-negative"):
+        params.verify(vocab_size=32)
+
+
+def test_temperature_zero_collapses_to_greedy():
+    # Greedy pins the seed and forces top_k=1.
+    params = SamplingParams(temperature=0.0, top_k=40, seed=7)
+    assert (params.temperature, params.top_k, params.seed) == (1.0, 1, 0)
+    params.verify(vocab_size=32)
+
+
+@pytest.mark.parametrize("top_k", [1, 127, -1])
+def test_default_top_k_validation_preserves_gpu_range(top_k):
+    SamplingParams(temperature=1.0, top_k=top_k).verify(vocab_size=163840)
+
+
+@pytest.mark.parametrize("top_k", [128, 4096, 4097, 1 << 40])
+def test_default_top_k_validation_keeps_rejecting_gpu_overflow(top_k):
+    with pytest.raises(ValueError, match="top_k must be < 128"):
+        SamplingParams(temperature=1.0, top_k=top_k).verify(vocab_size=163840)

@@ -23,7 +23,7 @@ model config, the process groups, the request length limits and the C++
 scheduler's config. ``rust_host.bootstrap`` runs them in this order."""
 
 import torch
-from tokenspeed_scheduler import StorageConfig
+from tokenspeed_scheduler import SchedulerConfig, StorageConfig
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.engine.scheduler_utils import make_config
@@ -37,6 +37,24 @@ from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
 from tokenspeed.runtime.utils.startup_timing import startup_phase
 
 logger = get_colorful_logger(__name__)
+
+
+def _implied_scheduler_policy(on: bool, field: str) -> bool:
+    """Whether to turn on a scheduler policy that ``--enable-state-checkpoint-in-forward``
+    implies, rather than an option of its own.
+
+    A tokenspeed-scheduler wheel released before the policy's
+    ``SchedulerConfig`` field (0.1.49 lacks the superseded-checkpoint demotion
+    and the short prompt-end drop) would raise AttributeError when it is set;
+    such a wheel serves the in-forward checkpoints without the policy instead.
+    """
+    if on and not hasattr(SchedulerConfig(), field):
+        logger.warning(
+            f"the installed tokenspeed-scheduler has no SchedulerConfig.{field}; "
+            "serving the in-forward State checkpoints without that policy"
+        )
+        return False
+    return on
 
 
 def rank_process_title(mapping) -> str:
@@ -103,8 +121,13 @@ def load_model_config(
     """
     quantization = server_args.quantization
     dtype = server_args.dtype
+    revision = server_args.revision
     if draft_of is not None:
         quantization = server_args.speculative_draft_model_quantization
+        # A revision is a branch, tag, or commit of one repository, so only a
+        # draft inside the target checkpoint can use the target's.
+        if not server_args.draft_model_path_use_base:
+            revision = server_args.speculative_draft_model_revision
         if dtype == "auto":
             # A draft is fed the target's hidden states and borrows its
             # embedding and LM head, so the two dtypes have to agree.
@@ -112,7 +135,7 @@ def load_model_config(
     return ModelConfig(
         model_path,
         trust_remote_code=server_args.trust_remote_code,
-        revision=server_args.revision,
+        revision=revision,
         context_length=server_args.max_model_len,
         model_override_args=server_args.hf_overrides,
         dtype=dtype,
@@ -155,7 +178,12 @@ def init_distributed(
 
 
 def request_length_limits(
-    *, context_len: int, max_single_request_tokens: int, decode_input_tokens: int
+    *,
+    context_len: int,
+    max_single_request_tokens: int,
+    decode_input_tokens: int,
+    max_kv_page_num: int,
+    prefix_granularity: int,
 ) -> tuple[int, int]:
     """The longest request and the longest prompt this rank admits.
 
@@ -164,6 +192,8 @@ def request_length_limits(
         max_single_request_tokens: The most tokens the cache holds for one
             request.
         decode_input_tokens: Verify width per decode step.
+        max_kv_page_num: Optional Prefill batch page budget; 0 is unbounded.
+        prefix_granularity: Tokens represented by one budgeted KV page.
 
     Returns:
         ``(max_model_len, max_req_input_len)``.
@@ -171,6 +201,8 @@ def request_length_limits(
     Raises:
         RuntimeError: The cache cannot hold one request with its first
             decode window.
+        ValueError: The configured Prefill KV capacity does not exceed the
+            maximum prompt length. The prompt limit is never reduced to fit it.
     """
     max_model_len = min(context_len, max_single_request_tokens)
     # Every role reserves the first decode/verify window behind the prompt:
@@ -183,6 +215,16 @@ def request_length_limits(
             f"decode reserve: max_single_request_tokens="
             f"{max_single_request_tokens}, reserve={input_reserve}"
         )
+    if max_kv_page_num > 0:
+        kv_capacity_tokens = max_kv_page_num * prefix_granularity
+        if kv_capacity_tokens <= max_req_input_len:
+            raise ValueError(
+                "--chunk-prefill-kv-size must provide a page-aligned capacity "
+                f"greater than max_req_input_len={max_req_input_len}; "
+                f"max_kv_page_num={max_kv_page_num} with "
+                f"prefix_granularity={prefix_granularity} provides "
+                f"{kv_capacity_tokens} tokens"
+            )
     logger.info(
         f"Single-request token limit: cache={max_single_request_tokens!s} "
         f"model={context_len!s} effective={max_model_len!s} "
@@ -223,6 +265,12 @@ def scheduler_config_from_args(
     return make_config(
         num_device_pages=geometry.num_device_pages,
         max_scheduled_tokens=max_scheduled_tokens,
+        max_kv_page_num=(
+            0
+            if server_args.chunk_prefill_kv_size is None
+            else (server_args.chunk_prefill_kv_size + geometry.prefix_granularity - 1)
+            // geometry.prefix_granularity
+        ),
         max_batch_size=max_batch_size,
         prefix_granularity=geometry.prefix_granularity,
         num_host_pages=specs.num_host_pages,
@@ -230,6 +278,7 @@ def scheduler_config_from_args(
         enable_l3_storage=has_l3,
         role=server_args.disaggregation_mode,
         num_snapshot_pages=specs.num_snapshot_pages,
+        host_group_packing=specs.host_group_packing,
         max_retracted_requests=specs.max_retracted_requests,
         storage_config=storage_config,
         host_write_policy=server_args.kvstore_write_policy,
@@ -241,5 +290,18 @@ def scheduler_config_from_args(
         prefix_replay_tokens=prefix_replay_tokens,
         cache_groups=specs.cache_groups,
         enable_mixed_prefill_decode=server_args.enable_mixed_batch,
+        prefill_decode_interval=server_args.prefill_decode_interval,
+        enable_short_prefill_first=server_args.enable_short_prefill_first,
         state_checkpoint_in_forward=server_args.writes_state_checkpoints_in_forward,
+        demote_superseded_state_checkpoints=_implied_scheduler_policy(
+            server_args.writes_state_checkpoints_in_forward,
+            "demote_superseded_state_checkpoints",
+        ),
+        drop_short_prompt_end_checkpoints=_implied_scheduler_policy(
+            server_args.drops_short_prompt_end_checkpoints,
+            "drop_short_prompt_end_checkpoints",
+        ),
+        checkpoint_retention_requests=server_args.checkpoint_retention_requests,
+        checkpoint_retention_leaf_distance=server_args.checkpoint_retention_leaf_distance,
+        prefill_chunk_yield_tokens=server_args.scheduler_prefill_chunk_yield_tokens,
     )

@@ -28,20 +28,73 @@ harness passes for its checkpoint and kernel selection.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.configs.model_profile import ModelProfile
+    from tokenspeed.runtime.utils.server_args import ServerArgs
 
 # Every envelope name, the default first. A model always serves ``auto``.
-# ``rl-bitwise`` is the one bitwise envelope: run and batch invariance plus
+# ``rl-bitwise`` is the built-in bitwise envelope: run and batch invariance plus
 # the trainer's operation order (``docs/design/numerics.md``).
-NUMERICS_ENVELOPES = ("auto", "rl-bitwise")
+NUMERICS_ENVELOPES = ["auto", "rl-bitwise"]
 
 # Envelopes that promise the bitwise contract. Selection points that pin
 # batch-invariant leaves test membership here rather than the one name, so an
 # envelope added above it inherits every pin.
-BITWISE_ENVELOPES = frozenset({"rl-bitwise"})
+# Mutate these shared containers at registration: modules importing them must
+# see plugin additions even when they imported before plugin discovery.
+BITWISE_ENVELOPES = {"rl-bitwise"}
+_PLUGIN_ENVELOPES: dict[
+    str, tuple[Callable[[ServerArgs], None], Callable[..., None]]
+] = {}
+
+
+def register_numerics_envelope(
+    name: str,
+    *,
+    bitwise: bool,
+    resolve: Callable[[ServerArgs], None],
+    validate: Callable[..., None],
+) -> None:
+    """Register a plugin's numerical policy during its ``register()`` call.
+
+    ``resolve(server_args)`` resolves launch settings. After the common model
+    profile gate, ``validate(quantization=..., vocab_size=...)`` checks storage
+    and vocabulary requirements. A bitwise policy opts into the existing
+    batch-invariant selection points; it does not inherit RL operation order.
+    Names cannot replace an existing policy. Failed plugin loading rolls back
+    its resolver, CLI choice and bitwise membership together.
+    """
+    if not isinstance(name, str) or not name or name.strip() != name:
+        raise ValueError("A numerics envelope requires a nonempty name")
+    if name in NUMERICS_ENVELOPES:
+        raise ValueError(f"Numerics envelope {name!r} is already registered")
+    if type(bitwise) is not bool or not callable(resolve) or not callable(validate):
+        raise TypeError("A numerics envelope requires bitwise, resolve and validate")
+    _PLUGIN_ENVELOPES[name] = (resolve, validate)
+    NUMERICS_ENVELOPES.append(name)
+    if bitwise:
+        BITWISE_ENVELOPES.add(name)
+
+    def undo() -> None:
+        del _PLUGIN_ENVELOPES[name]
+        NUMERICS_ENVELOPES.remove(name)
+        BITWISE_ENVELOPES.discard(name)
+
+    from tokenspeed.runtime.plugins.registry import record_external
+
+    record_external("numerics envelope", name, undo)
+
+
+def resolve_numerics_envelope(server_args: ServerArgs) -> None:
+    """Resolve the built-in or registered policy after plugin discovery."""
+    if server_args.numerics == "rl-bitwise":
+        server_args._resolve_rl_bitwise()
+    elif server_args.numerics != "auto":
+        _PLUGIN_ENVELOPES[server_args.numerics][0](server_args)
+
 
 # Sampling backends whose greedy rows break exact logit ties toward the lowest
 # token id in every batch shape: ``greedy`` is a canonical argmax, the
@@ -54,11 +107,12 @@ RL_BITWISE_SAMPLING_BACKENDS = frozenset({"flashinfer", "flashinfer_full", "gree
 # (request seed, position), which the bitwise envelope requires.
 SAMPLING_STREAMS = ("batch", "per-request")
 
-# ``--yarn-ramp-mask-device``: where the deepseek_yarn RoPE inverse frequencies
-# (position frequencies, both divisions and the YaRN linear ramp mask) are
-# computed before moving to the model device. The trainer builds them on the
-# host.
+# ``--yarn-ramp-mask-device`` selects the deepseek_yarn linear ramp device;
+# ``--yarn-frequency-device`` selects powers, divisions and interpolation.
+# Under auto, both devices default independently to CUDA.
+# rl-bitwise pins a CPU ramp and CUDA frequency construction.
 YARN_RAMP_MASK_DEVICES = ("cuda", "cpu")
+YARN_FREQUENCY_DEVICES = ("cuda", "cpu")
 
 # ``--mla-lora-scale``: where LongCat-style MLA applies its sqrt(hidden /
 # lora_rank) norm scales — folded into the q_a/kv_a layernorm weights at load,
@@ -76,10 +130,17 @@ LAYER_BOUNDARY_NORMS = ("fused", "unfused")
 ROUTER_TOPKS = ("fused", "torch")
 
 # ``--logprob-order``: the selected-token log-softmax behind every returned
-# logprob — ``torch.log_softmax``, or Megatron's vocab-parallel cross-entropy
-# order over fixed ``MEGATRON_VOCAB_BLOCK``-wide vocab blocks. Logprobs only.
-LOGPROB_ORDERS = ("torch", "megatron")
-MEGATRON_VOCAB_BLOCK = 32768
+# logprob — ``torch.log_softmax``, or fixed-width blockwise reduction
+# over ``BLOCKWISE_VOCAB_BLOCK``-wide vocab blocks. Logprobs only.
+BLOCKWISE_VOCAB_BLOCK = 32768
+# Block width describes the trainer's reduction, independently of serving TP.
+BLOCKWISE_LOGPROB_ORDERS = {
+    "blockwise": (BLOCKWISE_VOCAB_BLOCK, "negative-cross-entropy"),
+    "blockwise-direct": (BLOCKWISE_VOCAB_BLOCK, "direct"),
+    "blockwise-16384": (16384, "negative-cross-entropy"),
+    "blockwise-direct-16384": (16384, "direct"),
+}
+LOGPROB_ORDERS = ("torch", *BLOCKWISE_LOGPROB_ORDERS)
 
 # ``--moe-combine-order``: how a token's routed-expert contributions meet
 # across the MoE TP-EP group — ``rank``: per-rank partials summed by the
@@ -92,7 +153,7 @@ MOE_COMBINE_ORDERS = ("rank", "slot")
 
 # ``--dsa-slot-order``: the order the sparse attention cores reduce a token's
 # selected KV slots in — ``selection``: as the top-k leaf emitted them (what
-# every core does); ``sorted``: ascending slot order, so the reduction is
+# every core does); ``sorted``: ascending token position, so the reduction is
 # batch-invariant whenever the selected set is; served only by cores
 # declaring the ``slot_order`` trait (registered batch-invariant leaves). Mirrors
 # ``tokenspeed_kernel``'s ``attention.dsa.SLOT_ORDERS``.
@@ -115,14 +176,13 @@ def require_verified_numerics(
             model (none of which is verified under an envelope beyond auto).
         architecture: The model's architecture name, for the error.
         quantization: The checkpoint's resolved quantization method, or None.
-        vocab_size: The model's vocabulary size; the envelope's Megatron-order
-            logprobs fold fixed ``MEGATRON_VOCAB_BLOCK``-wide blocks of it.
+        vocab_size: The model's vocabulary size; the envelope's blockwise
+            logprobs fold fixed ``BLOCKWISE_VOCAB_BLOCK``-wide blocks of it.
 
     Raises:
-        ValueError: The envelope is not verified for this model, the
-            checkpoint is quantized (no batch-invariant quantized GEMM leaf
-            exists, so quantized linears would select shape-dependent ones),
-            or the vocabulary is not a whole number of Megatron blocks.
+        ValueError: The envelope is not verified for this model, or its
+            checkpoint validator rejects the storage or vocabulary. The RL
+            policy requires unquantized weights and whole blockwise vocab blocks.
     """
     if numerics == "auto":
         return
@@ -135,16 +195,19 @@ def require_verified_numerics(
             "logprob comparison against the trainer pass for it "
             "(docs/design/numerics.md, Acceptance)"
         )
+    if numerics != "rl-bitwise":
+        _PLUGIN_ENVELOPES[numerics][1](quantization=quantization, vocab_size=vocab_size)
+        return
     if quantization is not None:
         raise ValueError(
             f"--numerics {numerics} serves unquantized checkpoints only: "
             f"{architecture} is {quantization}-quantized, and no "
             "batch-invariant quantized GEMM leaf exists"
         )
-    if vocab_size % MEGATRON_VOCAB_BLOCK != 0:
+    if vocab_size % BLOCKWISE_VOCAB_BLOCK != 0:
         raise ValueError(
-            f"--numerics {numerics} folds --logprob-order megatron, whose "
-            f"sum(exp) runs over fixed {MEGATRON_VOCAB_BLOCK}-wide vocabulary "
+            f"--numerics {numerics} folds --logprob-order blockwise, whose "
+            f"sum(exp) runs over fixed {BLOCKWISE_VOCAB_BLOCK}-wide vocabulary "
             f"blocks; {architecture} has vocab_size {vocab_size}, not a "
             "multiple of it"
         )
@@ -155,7 +218,8 @@ __all__ = [
     "DSA_SLOT_ORDERS",
     "LAYER_BOUNDARY_NORMS",
     "LOGPROB_ORDERS",
-    "MEGATRON_VOCAB_BLOCK",
+    "BLOCKWISE_VOCAB_BLOCK",
+    "BLOCKWISE_LOGPROB_ORDERS",
     "MLA_LORA_SCALES",
     "MOE_COMBINE_ORDERS",
     "NUMERICS_ENVELOPES",
@@ -163,5 +227,8 @@ __all__ = [
     "ROUTER_TOPKS",
     "SAMPLING_STREAMS",
     "YARN_RAMP_MASK_DEVICES",
+    "YARN_FREQUENCY_DEVICES",
     "require_verified_numerics",
+    "register_numerics_envelope",
+    "resolve_numerics_envelope",
 ]

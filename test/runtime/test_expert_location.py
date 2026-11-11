@@ -394,6 +394,7 @@ def test_build_expert_placement_refuses_models_that_do_not_opt_in():
         init_expert_location="trivial",
         expert_distribution_recorder_mode="stat",
         ep_dispatch_algorithm="static",
+        all2all_backend="none",
         enable_eplb=False,
         mapping=_mapping(),
     )
@@ -421,6 +422,68 @@ def test_build_expert_placement_refuses_models_that_do_not_opt_in():
     args.ep_num_redundant_experts = 0
     args.expert_distribution_recorder_mode = None
     assert build_expert_placement(args, model_config) is None
+
+
+@pytest.mark.parametrize(
+    "algorithm,all2all_backend,built",
+    [
+        ("static", "deepep", True),
+        ("static_with_zero_expert", "deepep", True),
+        ("static", "none", False),
+        ("dynamic", "deepep", False),
+    ],
+)
+def test_build_expert_placement_owns_the_all_to_all_static_dispatch_map(
+    algorithm, all2all_backend, built
+):
+    # All-to-all EP slices this map while the model is built, inside the
+    # weight region a memory-saver discard releases; the placement must hold
+    # it before then. Replicated-input EP still never builds it.
+    from tokenspeed.runtime.layers.moe.topk import ExpertLocationDispatchInfo
+    from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
+
+    class Placed(BaseCausalLM):
+        supports_expert_placement = True
+
+        @classmethod
+        def get_model_config_for_expert_location(cls, config):
+            return expert_location.ModelConfigForExpertLocation(
+                num_layers=1, num_logical_experts=4
+            )
+
+    args = SimpleNamespace(
+        ep_num_redundant_experts=2,
+        init_expert_location="trivial",
+        expert_distribution_recorder_mode=None,
+        ep_dispatch_algorithm=algorithm,
+        all2all_backend=all2all_backend,
+        enable_eplb=False,
+        mapping=_mapping(),
+    )
+    with (
+        mock.patch.object(
+            expert_location, "get_model_architecture", return_value=(Placed, "Placed")
+        ),
+        mock.patch.object(
+            expert_location,
+            "compute_initial_expert_location_metadata",
+            return_value=_placement(0),
+        ),
+    ):
+        placement = build_expert_placement(args, SimpleNamespace(hf_config=None))
+    assert (placement._rank_dispatch_map is not None) == built
+    if built:
+        info = ExpertLocationDispatchInfo.init_new(
+            layer_id=0,
+            ep_dispatch_algorithm=algorithm,
+            expert_location_metadata=placement,
+            all_to_all_ep=True,
+        )
+        # The layer's view shares the storage the placement allocated.
+        assert (
+            info.partial_logical_to_rank_dispatch_physical_map.untyped_storage().data_ptr()
+            == placement._rank_dispatch_map.untyped_storage().data_ptr()
+        )
 
 
 # ----------------------------------------------------------------------

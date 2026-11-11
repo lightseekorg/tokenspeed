@@ -5,8 +5,12 @@ workflow_stage: unit-test
 triggers:
   - per-commit
   - manual
+changed_paths: true
 runner:
   labels:
+    - h100-1gpu
+    - b200-1gpu
+    - gb200-1gpu
     - amd-mi355-1gpu
 env:
   CI: "true"

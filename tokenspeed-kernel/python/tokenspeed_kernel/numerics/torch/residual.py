@@ -24,11 +24,16 @@ gated residual boundary."""
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.numerics.torch.layernorm import torch_rmsnorm
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+
+if TYPE_CHECKING:
+    from tokenspeed_kernel.ops.moe._cute_dsl.latent_down import MailboxPublish
 
 
 def mhc_mix_coefficients(
@@ -257,6 +262,7 @@ def torch_post_norm_residual_pre_norm(
     enable_pdl: bool,
     branch_sentinel: int | None,
     branch_ranks: int,
+    branch_publish: MailboxPublish | None,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """A decoder-layer boundary in FP64 from FP32 gate coefficients.
 
@@ -264,14 +270,15 @@ def torch_post_norm_residual_pre_norm(
     then ``pre = rmsnorm(new_stream) * pre_weight``; each checkpoint weight
     plus its offset rounds through BF16 as the kernels load it, and nothing
     else rounds. Only an ordinary branch is supported (``branch_sentinel``
-    None, ``branch_ranks`` 1). ``enable_pdl`` is a launch hint.
+    and ``branch_publish`` None, ``branch_ranks`` 1). ``enable_pdl`` is a
+    launch hint.
 
     Returns:
         ``(new_stream, pre, pre_bf16)`` with the first two in FP64, or
         ``None`` for the pre-norm outputs when ``pre_weight`` is None.
     """
     del enable_pdl
-    if branch_sentinel is not None or branch_ranks != 1:
+    if branch_sentinel is not None or branch_ranks != 1 or branch_publish is not None:
         raise ValueError("the reference reads an ordinary branch only")
 
     def centered(weight: torch.Tensor, offset: float) -> torch.Tensor:

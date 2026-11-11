@@ -21,6 +21,8 @@
 from __future__ import annotations
 
 import dataclasses
+import logging
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -28,10 +30,17 @@ from tokenspeed_kernel.ops.attention.dsa import (
     dsa_decode,
     dsa_plan,
     dsa_prefill,
+    dsa_prefill_dcp_records,
+    dsa_prefill_dcp_records_supported,
     select_dsa_prefill_topk_for_rows,
 )
+from tokenspeed_kernel.ops.attention.dsa.flashinfer import (
+    reserve_flashinfer_trtllm_dsa_buffers,
+    trtllm_sparse_mla_query_heads,
+)
 from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.selection import KernelPlan, NoKernelFoundError
+from tokenspeed_kernel.registry import KernelRegistry, priority_band_name
+from tokenspeed_kernel.selection import KernelPlan, NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
@@ -55,17 +64,22 @@ from tokenspeed.runtime.layers.attention.configs.dsa import (
 from tokenspeed.runtime.layers.attention.dcp.cache import (
     HistoryGatherPlan,
     HistoryGatherWorkspace,
+    all_gather_history_rows,
     gather_history_rows,
     plan_history_gather,
 )
 from tokenspeed.runtime.layers.attention.dcp.comm import (
     combine_attention_partials,
+    combine_attention_records,
     gather_query_heads,
+    gather_query_heads_padded,
+    gather_query_heads_rank_major,
 )
 from tokenspeed.runtime.layers.attention.dcp.placement import (
     CachePlacement,
+    compact_owned_cache_slots,
+    max_owned_index_pages,
     owned_history_rows,
-    resolve_cache_slots,
 )
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     DSA_SPARSE_PAGE_SIZE,
@@ -81,6 +95,24 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 
+logger = logging.getLogger(__name__)
+
+# Logged sparse-leaf configurations: one log line per distinct configuration.
+_LOGGED_SPARSE_LEAVES: set[tuple] = set()
+
+# Owned-width KVP index tiles span whole groups of this many pages, so tile widths take few values.
+_OWNED_INDEX_COLUMN_ALIGN = 16
+
+
+def _priority_band(name: str) -> str:
+    """The registered priority band of kernel ``name``, spelled as
+    ``describe_kernel`` does (``PORTABLE``, ``SPECIALIZED+1``), so a portable
+    fallback stands out in the startup log."""
+    spec = KernelRegistry.get().get_by_name(name)
+    if spec is None:
+        return "unregistered"
+    return priority_band_name(spec.priority)
+
 
 def _k_row_context_lengths(seq_lens: torch.Tensor, k: int) -> torch.Tensor:
     """``[bs]`` request lengths as the indexer's per-token rows: ``k`` query
@@ -92,6 +124,58 @@ def _k_row_context_lengths(seq_lens: torch.Tensor, k: int) -> torch.Tensor:
     (``_publish_k_row_indexer_rows``). Only ``k == 1`` aliases ``seq_lens``;
     callers that keep the rows call ``.contiguous()`` to cover that case."""
     return seq_lens.unsqueeze(1).expand(-1, k).reshape(-1, 1)
+
+
+def balanced_group_rows(lengths: list[int], cap: int) -> int:
+    """Minimize the largest contiguous group without increasing group count.
+
+    ``lengths`` are nonnegative request history row counts, each at most the
+    nonnegative workspace ``cap``. Requests stay whole and in input order.
+    Return the smallest row bound preserving greedy packing's group count
+    at ``cap``; return ``cap`` for an empty input.
+    """
+    if cap < 0:
+        raise ValueError(f"history workspace capacity must be nonnegative, got {cap}")
+    for length in lengths:
+        if length < 0:
+            raise ValueError(
+                f"request history length must be nonnegative, got {length}"
+            )
+        if length > cap:
+            raise RuntimeError(
+                f"request history of {length} rows exceeds the "
+                f"{cap}-row query-context-parallel gather workspace"
+            )
+    if not lengths:
+        return cap
+
+    def count(bound: int) -> int:
+        groups, rows = 1, 0
+        for length in lengths:
+            if rows + length > bound:
+                groups, rows = groups + 1, 0
+            rows += length
+        return groups
+
+    # For nonnegative lengths, greedy packing uses the fewest contiguous
+    # groups at a given bound. That count cannot rise as the bound grows.
+    target = count(cap)
+    lo, hi = max(lengths), cap
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if count(mid) <= target:
+            hi = mid
+        else:
+            lo = mid + 1
+    return lo
+
+
+def _k_row_causal_lengths(seq_lens: torch.Tensor, k: int) -> torch.Tensor:
+    """``[bs]`` request lengths as the sparse decode core's per-token KV
+    lengths (``[bs * k]`` int32): verify row ``t`` of a request sees
+    ``seq_len - (k - 1 - t)`` tokens, clamped at zero."""
+    offsets = torch.arange(k, device=seq_lens.device, dtype=torch.int32) - (k - 1)
+    return seq_lens.to(torch.int32).unsqueeze(1).add(offsets).clamp_min(0).reshape(-1)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -106,7 +190,8 @@ class QueryShardHistoryGroup:
             returns rows in that numbering.
         rows: History rows of the group.
         local_query: This rank's query rows that belong to the group, as a
-            slice of the rank's shard rows.
+            slice of the rank's shard rows (a rank's rows are in request
+            order, so a request range is one run of them).
         gather: How the group's rows split over the page owners.
     """
 
@@ -157,11 +242,10 @@ class DSABackend(PagedAttentionBackend):
     default_kernel_page_size = DSA_SPARSE_PAGE_SIZE
     _make_dense_leaf = staticmethod(_make_dense_leaf)
 
-    # DSA's sparse indexer reads this backend's chunked_prefill_metadata from
-    # inside the captured prefill segment, but the prefill graph rebinds only
-    # the live ForwardContext at replay — the backend metadata object stays
-    # frozen at capture-time (dummy) values. Keep prefills eager.
+    # Opt-in only: a padded replay needs all DSA ops in a break narrowing to live rows.
     cuda_graph_support = CudaGraphSupport(prefill_graph=False)
+    # Owner-masked writes and KVP-merged cores (dcp/) let hybrid DSA layers shard KV.
+    supports_mla_dcp = True
 
     def __init__(self, config: AttnConfig, spec: DSAConfig, *, kernel_page_size: int):
         if len(config.kvp_group) > 1 and (
@@ -188,6 +272,7 @@ class DSABackend(PagedAttentionBackend):
         if len(self.qcp_group) > 1 and spec.index_kpool is not None:
             raise ValueError("DSA query context parallelism does not support KPool")
         self.index_head_dim = spec.index_head_dim
+        self.index_n_heads = spec.index_n_heads
         # The index-K plane's format (configs/dsa.py INDEX_K_FORMATS): the
         # history gather packs rows in it and hands the indexer that form.
         self.index_k_format = spec.index_k_format
@@ -210,6 +295,27 @@ class DSABackend(PagedAttentionBackend):
         self.batch_invariant: bool = (
             global_server_args_dict["numerics"] in BITWISE_ENVELOPES
         )
+        # Development switch: plan the decode core without the batch_invariant
+        # feature. No batch-invariant dsa_decode leaf covers a width-8 verify
+        # (aok stops at q_len 4), so a DFlash block_size 8 deployment under a
+        # bitwise envelope cannot otherwise start. Such a run does NOT meet the
+        # envelope: never record a baseline from it.
+        #
+        # Deliberately an environment variable, not a server_args flag: a CLI
+        # parameter would make this a supported feature, and it is a temporary
+        # bypass. Remove it once a batch-invariant dsa_decode leaf covers a
+        # width-8 verify.
+        self._non_bitwise_decode_escape: bool = (
+            self.batch_invariant
+            and os.environ.get("TS_DSA_ALLOW_NON_BITWISE_DECODE") == "1"
+        )
+        if self._non_bitwise_decode_escape:
+            logger.warning(
+                "TS_DSA_ALLOW_NON_BITWISE_DECODE=1: DSA decode planned without "
+                "batch invariance under --numerics %s; this run does not meet "
+                "the envelope.",
+                global_server_args_dict["numerics"],
+            )
         # --dsa-slot-order: how the cores reduce the selected slots
         # (docs/design/numerics.md, invariance.batch).
         self.slot_order: str = global_server_args_dict["dsa_slot_order"]
@@ -246,16 +352,36 @@ class DSABackend(PagedAttentionBackend):
                 ),
                 ignore_layout=False,
             )
+            decode_traits = {
+                **traits,
+                "q_len": frozenset(range(1, self.spec_num_tokens + 1)),
+            }
+            decode_variable = variable
+            if self._non_bitwise_decode_escape:
+                # Only aok declares slot_order, and it stops at width 4; a leaf
+                # that does not declare it serves "selection" implicitly, so
+                # "sorted" would still be refused.
+                if self.slot_order != "selection":
+                    raise ValueError(
+                        "TS_DSA_ALLOW_NON_BITWISE_DECODE needs "
+                        f"--dsa-slot-order selection; got {self.slot_order!r}"
+                    )
+                decode_traits.pop("slot_order", None)
+                # aok declares no `topk`, so the plan leaves it unrestricted,
+                # which the portable leaves' finite sets cannot match: pin it.
+                decode_variable = decode_variable - {"topk"}
+                decode_traits["topk"] = self.index_topk
             self.decode_kernel_plan = KernelPlan.select(
                 "attention",
                 "dsa_decode",
                 signature,
-                features=frozenset({"batch_invariant"}),
-                static_traits={
-                    **traits,
-                    "q_len": frozenset(range(1, self.spec_num_tokens + 1)),
-                },
-                variable_traits=variable,
+                features=(
+                    frozenset()
+                    if self._non_bitwise_decode_escape
+                    else frozenset({"batch_invariant"})
+                ),
+                static_traits=decode_traits,
+                variable_traits=decode_variable,
                 solution=None,
                 declared_traits=(
                     frozenset({"slot_order"})
@@ -264,17 +390,41 @@ class DSABackend(PagedAttentionBackend):
                 ),
                 ignore_layout=False,
             )
+            # Which leaf serves a verify width is otherwise only derivable by
+            # replaying the registry's trait matching by hand.
+            logger.info(
+                "DSA kernel plan: prefill=%s decode=%s (q_len<=%d, topk=%d, "
+                "batch_invariant=%s)",
+                self.prefill_kernel_plan.spec.name,
+                self.decode_kernel_plan.spec.name,
+                self.spec_num_tokens,
+                self.index_topk,
+                self.batch_invariant and not self._non_bitwise_decode_escape,
+            )
+        # Rank-major query gather with partials in the exchange layout; a pinned prefill plan keeps its own core.
+        self.kvp_prefill_query_layout: bool = self.prefill_kernel_plan is None
+        # KVP prefill's Triton FP8 core, probed once a router's solution pin has landed.
+        self._dcp_records_core: bool = False
+        # Whether that selection runs the trtllm-gen core, which takes a padded query.
+        self._dcp_padded_query: bool = False
         self._prefill_page_table: torch.Tensor | None = None
+        # Owned KVP index-tile width in kernel pages; None means the page table's width.
+        self._prefill_index_columns: int | None = None
         self.kpool_runtime = (
             KPoolRuntime(spec.index_kpool, spec.index_topk)
             if spec.index_kpool is not None
             else None
         )
+        padded_replay_opt_in = False
         if self.kpool_runtime is not None:
             # GLM-5.3-Flash (the one KPool consumer) handles padded prefill
             # replay explicitly in its model code, so the class-level DSA
             # restriction does not apply to it.
             self.cuda_graph_support = CudaGraphSupport(prefill_graph=True)
+        elif spec.padded_prefill_replay and platform.is_nvidia:
+            # K3.1 narrows padded replays to live rows; validated on NVIDIA only.
+            self.cuda_graph_support = CudaGraphSupport(prefill_graph=True)
+            padded_replay_opt_in = True
         if len(self.qcp_group) > 1:
             # The sharded extend arm gathers each request's history in the
             # eager attention break; a captured prefill would replay the
@@ -285,6 +435,9 @@ class DSABackend(PagedAttentionBackend):
         self.cuda_graph_support = self.cuda_graph_support & CudaGraphSupport.from_plans(
             prefill=self.prefill_kernel_plan, decode=self.decode_kernel_plan
         )
+        if padded_replay_opt_in and self.cuda_graph_support.prefill_graph:
+            # Logged after the vetoes on every rank, so a dissenting rank shows.
+            logger.info("DSA prefill graph admitted (padded_prefill_replay)")
 
     def _probe_history_gather_topk_leaf(self, spec: DSAConfig) -> None:
         """Select, at construction, the indexer leaf the sharded extend arm
@@ -338,6 +491,289 @@ class DSABackend(PagedAttentionBackend):
             raise ValueError("DSA cache geometry does not match KVP topology")
         self.kvp_block_granularity = block_granularity
         self.kvp_virtual_block_count = virtual_block_count
+        # Probed here: a router's solution pin lands after construction.
+        self._dcp_records_core = self._probe_dcp_records_core()
+        self._dcp_padded_query = self._probe_dcp_padded_query()
+        self._log_sparse_leaves()
+        self._reserve_trtllm_sparse_buffers()
+
+    def _reserve_trtllm_sparse_buffers(self) -> None:
+        """Allocate the persistent buffers of every sparse call the forward
+        makes that selects a trtllm-gen core, now rather than in its first
+        forward (``reserve_flashinfer_trtllm_dsa_buffers``), whose first one
+        is the startup tuning forward: allocated between its activations, they
+        may keep the rest of a freed activation block's segment resident. A
+        call carries the KVP group's gathered heads, or every head where the
+        query holds them.
+        """
+        if torch.device(self.device).type != "cuda":
+            return
+        use_dcp = len(self.kvp_group) > 1
+        heads = (
+            {self.num_local_heads * len(self.kvp_group), self.num_attention_heads}
+            if use_dcp
+            else {self.num_local_heads}
+        )
+        for _, mode, signature, traits, solution, plan in self._sparse_leaf_probes():
+            if mode not in ("dsa_prefill", "dsa_decode"):
+                continue
+            try:
+                name, _ = self._resolve_sparse_leaf(
+                    mode, signature, traits, solution, plan
+                )
+            except (NoKernelFoundError, TypeError, ValueError):
+                # The forward's own selection raises it.
+                continue
+            if name.startswith("flashinfer_trtllm_"):
+                for num_heads in sorted(heads):
+                    reserve_flashinfer_trtllm_dsa_buffers(
+                        self.device,
+                        num_heads=num_heads,
+                        return_lse=traits["return_lse"],
+                    )
+
+    def _probe_dcp_records_core(self) -> bool:
+        """Whether the head-sharded KVP prefill may run the DCP records core.
+
+        ``dsa_prefill_dcp_records`` is the Triton ``dsa_prefill`` core reading
+        the rank-major gather and writing the partials exchange's records, so
+        it stands in only where the forward's own ``dsa_prefill`` selection
+        (the selection inputs ``_sparse_leaf_probes`` mirrors, solution pin
+        and kernel override included) picks ``triton_dsa_prefill`` without a
+        plan, and where the records op selects for the same inputs. Boot
+        configuration only, so every rank of the group agrees.
+
+        Only an FP8 cache's query qualifies: its bytes take the NCCL
+        inner-dimension gather (``gather_query_heads``), whose relayout copy
+        the rank-major gather skips. A BF16 query's inner-dimension gather
+        takes the multicast kernels where multicast reaches, which land it
+        token-major with no copy, while the rank-major gather is NCCL only;
+        that trade is unmeasured, so a BF16 query keeps its gather.
+        """
+        if (
+            len(self.kvp_group) <= 1
+            or self.prefill_kernel_plan is not None
+            or self.data_type != torch.float8_e4m3fn
+        ):
+            return False
+        if current_platform().is_npu:
+            # The Ascend leaf launches its own operators, not these facades.
+            return False
+        for _, mode, signature, traits, solution, _ in self._sparse_leaf_probes():
+            if mode != "dsa_prefill" or not traits["return_lse"]:
+                continue
+            try:
+                core = select_kernel(
+                    "attention", mode, signature, traits=traits, solution=solution
+                )
+                select_kernel(
+                    "attention",
+                    "dsa_prefill_dcp_records",
+                    signature,
+                    traits=traits,
+                    solution=solution,
+                )
+            except NoKernelFoundError:
+                return False
+            return core.name == "triton_dsa_prefill"
+        return False
+
+    def _probe_dcp_padded_query(self) -> bool:
+        """Whether the head-sharded KVP prefill may gather its query heads
+        straight into the trtllm-gen core's padded query.
+
+        That core runs 65..127 heads (K3.1's 96 gathered at KVP8) as 128 and
+        would pad the token-major gather with a second copy of every row;
+        ``gather_query_heads_padded`` lands the rank-major gather in the
+        padded query with one. Only where the forward's own LSE
+        ``dsa_prefill`` selection picks ``flashinfer_trtllm_dsa_prefill``
+        without a plan, on an FP8 cache, whose query takes the NCCL gather
+        either way (as :meth:`_probe_dcp_records_core`). Boot configuration
+        only, so every rank of the group agrees.
+        """
+        if (
+            len(self.kvp_group) <= 1
+            or self.prefill_kernel_plan is not None
+            or self.data_type != torch.float8_e4m3fn
+            or current_platform().is_npu
+        ):
+            return False
+        for _, mode, signature, traits, solution, _ in self._sparse_leaf_probes():
+            if mode != "dsa_prefill" or not traits["return_lse"]:
+                continue
+            try:
+                core = select_kernel(
+                    "attention", mode, signature, traits=traits, solution=solution
+                )
+            except NoKernelFoundError:
+                return False
+            return core.name == "flashinfer_trtllm_dsa_prefill"
+        return False
+
+    def _sparse_leaf_probes(self) -> list[tuple]:
+        """The sparse selections this leaf's forward makes, as ``(label, mode,
+        signature, traits, solution, plan)``.
+
+        Each mirrors its facade call: the core query is FP8 on an FP8 KV cache
+        (the cast in ``forward_sparse_prefill`` / ``forward_sparse_decode``),
+        else the model dtype; ``return_lse`` follows DCP, and a query-sharded
+        extend adds its LSE-free arm; decode runs one row per request and
+        ``spec_num_tokens`` verify rows; the cores' width is ``index_topk``
+        plus a KPool's ``pool_size - 1`` tail slots (GLM-5.3-Flash's 2051).
+        Under DCP the indexer scores the model-dtype index query and head
+        weights against packed index-K pages of this leaf's page size,
+        without a solution pin (``select_dsa_topk``).
+        """
+        use_dcp = len(self.kvp_group) > 1
+        q_dtype = (
+            torch.float8_e4m3fn
+            if self.data_type == torch.float8_e4m3fn
+            else self.q_data_type
+        )
+        signature = format_signature(q=dense_tensor_format(q_dtype))
+        kpool = self.kpool_runtime
+        traits = {
+            "qk_nope_head_dim": self.qk_nope_head_dim,
+            "kv_lora_rank": self.kv_lora_rank,
+            "qk_rope_head_dim": self.qk_rope_head_dim,
+            "page_size": self.kernel_page_size,
+            "topk": self.index_topk + (0 if kpool is None else kpool.pool_size - 1),
+            "has_kv_cache": True,
+            "has_sparse_kv_cache": False,
+            "logit_cap": False,
+            "topk_layout": "global_slots",
+            "slot_order": self.slot_order,
+        }
+        probes = []
+        prefill_lse = {use_dcp} | ({False} if len(self.qcp_group) > 1 else set())
+        for return_lse in sorted(prefill_lse):
+            probes.append(
+                (
+                    f"dsa_prefill(q_len=1, return_lse={return_lse})",
+                    "dsa_prefill",
+                    signature,
+                    {**traits, "q_len": 1, "return_lse": return_lse},
+                    self.kernel_solution,
+                    self.prefill_kernel_plan,
+                )
+            )
+        for q_len in sorted({1, self.spec_num_tokens}):
+            probes.append(
+                (
+                    f"dsa_decode(q_len={q_len}, return_lse={use_dcp})",
+                    "dsa_decode",
+                    signature,
+                    {**traits, "q_len": q_len, "return_lse": use_dcp},
+                    self.kernel_solution,
+                    self.decode_kernel_plan,
+                )
+            )
+        if use_dcp:
+            probes.append(
+                (
+                    "dsa_index_candidates",
+                    "dsa_index_candidates",
+                    format_signature(
+                        q=dense_tensor_format(self.q_data_type),
+                        weights=dense_tensor_format(self.q_data_type),
+                    ),
+                    {
+                        "index_heads": self.index_n_heads,
+                        "head_dim": self.index_head_dim,
+                        "page_size": self.kernel_page_size,
+                        "index_k_layout": "packed",
+                    },
+                    None,
+                    None,
+                )
+            )
+        return probes
+
+    def _resolve_sparse_leaf(
+        self, mode: str, signature, traits: dict, solution: str | None, plan
+    ) -> tuple[str, bool]:
+        """The kernel the forward's ``mode`` call runs, and whether a plan fixed it.
+
+        A batch-invariant plan names its kernel without reselection, after the
+        validation the facades run before every launch, so a plan the first
+        forward would reject (an FP8-cast query, another solution pin) raises
+        here; otherwise ``select_kernel`` makes the facade's selection
+        (``TOKENSPEED_KERNEL_OVERRIDE_*`` included) and caches it for the
+        forward.
+        """
+        if plan is not None:
+            plan.validate("attention", mode, signature, traits, None, solution, None)
+            return plan.kernel.name, True
+        if mode == "dsa_index_candidates" and self.index_k_format != "fp8_scaled":
+            # The facade refuses any other plane before it selects.
+            raise TypeError(
+                "DSA index candidates require packed FP8 Index-K storage, "
+                f"index_k_format is {self.index_k_format!r}"
+            )
+        kernel = select_kernel(
+            "attention", mode, signature, traits=traits, solution=solution
+        )
+        return kernel.name, False
+
+    def _log_sparse_leaves(self) -> None:
+        """Log the sparse leaves this leaf's forward will run, once per
+        distinct configuration in the process.
+
+        Every leaf is printed with its priority band, so a portable fallback
+        (the Triton core under DCP, say) shows at startup rather than in a
+        profile. A probe that raises reads ``none`` (no leaf matches) or
+        ``unresolved`` and is repeated at WARNING with its error; logging
+        never fails startup. Ranks of a KVP group share the configuration,
+        so only its first rank logs.
+        """
+        if current_platform().is_npu:
+            # The Ascend leaf launches its own operators, not these facades.
+            return
+        try:
+            if self.kvp_rank != 0:
+                return
+            probes = self._sparse_leaf_probes()
+            key = (
+                self.data_type,
+                len(self.kvp_group),
+                tuple(
+                    (
+                        label,
+                        mode,
+                        signature,
+                        tuple(sorted(traits.items())),
+                        solution,
+                        None if plan is None else plan.kernel.name,
+                    )
+                    for label, mode, signature, traits, solution, plan in probes
+                ),
+            )
+        except Exception as e:
+            logger.warning(f"DSA sparse leaves unresolved: {type(e).__name__}: {e!s}")
+            return
+        if key in _LOGGED_SPARSE_LEAVES:
+            return
+        _LOGGED_SPARSE_LEAVES.add(key)
+        entries = []
+        for label, mode, signature, traits, solution, plan in probes:
+            try:
+                name, planned = self._resolve_sparse_leaf(
+                    mode, signature, traits, solution, plan
+                )
+                band = _priority_band(name)
+            except Exception as e:
+                missing = isinstance(e, NoKernelFoundError)
+                entries.append(f"{label}={'none' if missing else 'unresolved'}")
+                logger.warning(
+                    f"DSA sparse leaf {label} unresolved: {type(e).__name__}: {e!s}"
+                )
+                continue
+            entries.append(f"{label}={name} [{band}{', planned' if planned else ''}]")
+        logger.info(
+            f"DSA sparse leaves (kv_cache={self.data_type!s}, "
+            f"kvp={len(self.kvp_group):d}, solution={self.kernel_solution!s}): "
+            + "; ".join(entries)
+        )
 
     def preallocate_history_gather_workspace(self, max_model_len: int) -> int:
         """Allocate the gathered-history workspace of the sharded extend arm.
@@ -555,8 +991,9 @@ class DSABackend(PagedAttentionBackend):
                 seq_lens_2d=metadata._dsa_seq_lens_2d,
                 page_size=self.kernel_page_size,
             )
-            return
-        self._publish_k_row_indexer_rows(metadata, seq_lens, bs)
+        else:
+            self._publish_k_row_indexer_rows(metadata, seq_lens, bs)
+        self._publish_kv_seq_lens(metadata, bs)
 
     def _publish_k_row_indexer_rows(
         self, metadata, seq_lens: torch.Tensor, bs: int
@@ -577,6 +1014,20 @@ class DSABackend(PagedAttentionBackend):
             page_size=self.kernel_page_size,
             out=metadata._dsa_plan,
         )
+
+    def _publish_kv_seq_lens(self, metadata, bs: int) -> None:
+        """Publish the sparse decode core's per-token causal KV lengths for a
+        target verify. They derive from the dense leaf's ``seq_lens_k`` (its
+        verify-clamped copy, padded graph rows included), so they equal what
+        ``forward_sparse_decode`` would derive; written in place once
+        allocated, so a captured graph replays the edit."""
+        if self.is_draft or self.spec_num_tokens <= 1:
+            return
+        causal = _k_row_causal_lengths(metadata.seq_lens_k[:bs], self.spec_num_tokens)
+        if metadata._dsa_kv_seq_lens is None:
+            metadata._dsa_kv_seq_lens = causal
+        else:
+            metadata._dsa_kv_seq_lens.copy_(causal)
 
     def advance_draft_forward_metadata(self, seq_lens: torch.Tensor) -> None:
         """Eagle chain step: one query row per request, so the plan is
@@ -685,6 +1136,7 @@ class DSABackend(PagedAttentionBackend):
             metadata._dsa_seq_lens_2d = _k_row_context_lengths(
                 seq_lens, self.spec_num_tokens
             ).contiguous()
+            self._publish_kv_seq_lens(metadata, bs)
             if num_extends < bs:
                 # Decode rows only: skip the extend requests' per-token block.
                 seq_lens_2d = metadata._dsa_seq_lens_2d[
@@ -707,6 +1159,55 @@ class DSABackend(PagedAttentionBackend):
                 # the leaf's kernel page size by construction).
                 self._prefill_page_table = page_table[:num_extends]
                 cmeta.page_table = self._prefill_page_table
+        self._prefill_index_columns = None
+        if (
+            len(self.kvp_group) > 1
+            and forward_mode.is_extend()
+            and num_extends > 0
+            and self.query_shard_metadata is None
+            and page_table_cpu is not None
+        ):
+            self._prefill_index_columns = self._plan_prefill_index_columns(
+                page_table_cpu[:num_extends],
+                extend_prefix_lens_cpu[:num_extends].to(torch.int64)
+                + extend_seq_lens_cpu[:num_extends].to(torch.int64),
+            )
+
+    # KVP prefill: owned-width index tiles
+
+    def _plan_prefill_index_columns(
+        self, page_table_cpu: torch.Tensor, seq_lens_cpu: torch.Tensor
+    ) -> int:
+        """The owned width of a pure extend's KVP index tiles, in kernel pages.
+
+        Host arithmetic over the host page table and lengths, identical on
+        every rank, so every rank tiles and exchanges the same rows: the most
+        pages any rank owns below any request's length bounds every query
+        row's owned pages. The width is at least ``ceil(index_topk /
+        page_size)`` pages, so the logits stay wide enough for the
+        length-aware top-k, in whole groups of ``_OWNED_INDEX_COLUMN_ALIGN``
+        pages; the indexer clamps it to the forward's page table.
+        """
+        bound = max_owned_index_pages(
+            page_table_cpu,
+            seq_lens_cpu,
+            page_size=self.kernel_page_size,
+            placement=self.cache_placement(None),
+        )
+        floor = -(-self.index_topk // self.kernel_page_size)
+        align = _OWNED_INDEX_COLUMN_ALIGN
+        return -(-max(bound, floor) // align) * align
+
+    def prefill_index_columns(self) -> int | None:
+        """The owned width, in kernel pages, of this forward's KVP index tiles.
+
+        Set by :meth:`init_forward_metadata` for a pure extend over KVP pages
+        (and not query-sharded): the
+        model's KVP top-k plans each query row's owned index pages that wide
+        instead of the page table's width, so a logits budget fits more rows
+        per tile. ``None`` keeps the page table's width.
+        """
+        return self._prefill_index_columns
 
     # ------------------------------------------------------------------
     # Query context parallelism: the gathered-history extend arm
@@ -727,8 +1228,9 @@ class DSABackend(PagedAttentionBackend):
 
         Host arithmetic over the pinned length mirrors and the host page table
         (owned-row counts per rank); the device work is one slot build per
-        group. Greedy grouping by summed history length against the gather
-        workspace, a request never splits.
+        group. Keep the minimum number of contiguous groups that fit the gather
+        workspace, then minimize their largest summed history length. A
+        request never splits.
         """
         if self._history_workspace is None:
             raise RuntimeError(
@@ -744,6 +1246,7 @@ class DSABackend(PagedAttentionBackend):
                 f"carry {sum(extend_lens)}"
             )
         history_lens = [p + e for p, e in zip(prefix_lens, extend_lens)]
+        bound = balanced_group_rows(history_lens, self._history_workspace.rows)
         placement = self.cache_placement(None)
         owned = owned_history_rows(
             page_table_cpu[:num_extends],
@@ -751,28 +1254,18 @@ class DSABackend(PagedAttentionBackend):
             page_size=self.kernel_page_size,
             placement=placement,
         )
-        cap = self._history_workspace.rows
         groups: list[QueryShardHistoryGroup] = []
-        query_start = 0
+        local_start = 0
         row_base = 0
         first = 0
         while first < num_extends:
-            if history_lens[first] > cap:
-                raise RuntimeError(
-                    f"request history of {history_lens[first]} rows exceeds the "
-                    f"{cap}-row query-context-parallel gather workspace"
-                )
             last = first
             rows = history_lens[first]
-            while last + 1 < num_extends and rows + history_lens[last + 1] <= cap:
+            while last + 1 < num_extends and rows + history_lens[last + 1] <= bound:
                 last += 1
                 rows += history_lens[last]
             requests = slice(first, last + 1)
-            query_rows = sum(extend_lens[requests])
-            local_lo = min(max(query_start, plan.local_start), plan.local_end)
-            local_hi = min(
-                max(query_start + query_rows, plan.local_start), plan.local_end
-            )
+            local_rows = sum(plan.local_rows_per_request[requests])
             virtual_slots = build_prefill_kv_workspace_slots(
                 page_table=page_table[requests],
                 seq_lens=seq_lens[requests],
@@ -791,13 +1284,11 @@ class DSABackend(PagedAttentionBackend):
                     requests=requests,
                     row_base=row_base,
                     rows=rows,
-                    local_query=slice(
-                        local_lo - plan.local_start, local_hi - plan.local_start
-                    ),
+                    local_query=slice(local_start, local_start + local_rows),
                     gather=gather,
                 )
             )
-            query_start += query_rows
+            local_start += local_rows
             row_base += rows
             first = last + 1
         return DSAQueryShardMetadata(plan=plan, groups=tuple(groups))
@@ -810,24 +1301,37 @@ class DSABackend(PagedAttentionBackend):
 
     def gather_history_kv(
         self, layer, token_to_kv_pool, group: QueryShardHistoryGroup
-    ) -> torch.Tensor:
-        """Assemble one group's latent rows in position order.
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gather one group's latent rows, rank-major, without reordering.
 
-        Returns a ``[pages * kernel_page_size, kv_cache_dim]`` view of the
-        gather workspace (valid until the next group's gather) whose leading
-        ``group.rows`` rows are the history: a whole number of kernel pages, so
-        every ``dsa_prefill`` solution's view of a flat ``[slots, dim]`` cache
-        holds, paged or not; the padding rows are never selected. A collective
-        over the page owners: every rank calls it for every group.
+        The sparse core reads rows by index, so the rows stay where the
+        all-gather put them and the caller maps the selected positions
+        instead, avoiding a full history copy. The tradeoff is mapping
+        ``[local_query_rows, topk]`` indices for the selected rows.
+
+        Returns ``(kv, rows)``: a ``[pages * kernel_page_size, kv_cache_dim]``
+        view of the gather workspace (valid until the next group's gather) --
+        a whole number of kernel pages, so every ``dsa_prefill`` solution's
+        view of a flat ``[slots, dim]`` cache holds, paged or not; the padding
+        rows are never selected -- and the ``[group.rows]`` int32 row of
+        ``kv`` holding each history position. A collective over the page
+        owners: every rank calls it for every group.
         """
         if self._history_workspace is None:
             raise RuntimeError("DSA history gather workspace is not allocated")
         kv_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
         kv_flat = kv_cache.reshape(-1, kv_cache.shape[-1])
-        local = kv_flat.index_select(0, group.gather.local_fetch_slots)
-        gather_history_rows(group.gather, local, out=self._history_workspace.kv)
+        local = kv_flat.index_select(0, group.gather.send_slots)
         page = self.kernel_page_size
-        return self._history_workspace.kv[: -(-group.rows // page) * page]
+        rows = len(group.gather.group) * group.gather.send_rows
+        paged_rows = -(-rows // page) * page
+        out = self._history_workspace.kv
+        if paged_rows > out.shape[0]:
+            # The owners' send padding pushed a full workspace's group past
+            # its capacity.
+            out = out.new_empty((paged_rows, out.shape[1]))
+        all_gather_history_rows(group.gather, local, out=out)
+        return out[:paged_rows], group.gather.gathered_index
 
     def gather_history_index_k(
         self, layer_id: int, token_to_kv_pool, group: QueryShardHistoryGroup
@@ -845,7 +1349,7 @@ class DSABackend(PagedAttentionBackend):
             raise RuntimeError("DSA history gather workspace is not allocated")
         packed = token_to_kv_pool.gather_index_k_rows(
             layer_id,
-            group.gather.local_fetch_slots,
+            group.gather.send_slots,
             index_k_format=self.index_k_format,
         )
         gathered = gather_history_rows(
@@ -1124,17 +1628,53 @@ class DSABackend(PagedAttentionBackend):
 
         use_dcp = len(self.kvp_group) > 1
         keep_all_heads = use_dcp and self._query_holds_every_head(heads)
+        topk_lens = topk_lens.to(device=q.device, dtype=torch.int32).contiguous()
+        # Gathered heads of a padded query; its partials end with the padding heads'.
+        live_heads = None
         if use_dcp:
-            slots, owned = resolve_cache_slots(topk_slots, self.cache_placement(layer))
-            topk_slots = torch.where(owned, slots, -1)
-            if not keep_all_heads:
+            # Owned slots first with their count as length: ~topk/kvp entries per row.
+            topk_slots, topk_lens = compact_owned_cache_slots(
+                topk_slots, topk_lens, self.cache_placement(layer)
+            )
+            # Decided before the query gather from inputs every rank shares.
+            if (
+                not keep_all_heads
+                and self.kvp_prefill_query_layout
+                and self._dcp_records_core
+                and dsa_prefill_dcp_records_supported(
+                    tokens=q_view.shape[0],
+                    heads=heads * len(self.kvp_group),
+                    topk=topk_slots.shape[1],
+                )
+            ):
+                out = self._forward_dcp_records_prefill(
+                    q_view=q_view,
+                    layer=layer,
+                    kv_cache=kv_cache,
+                    topk_slots=topk_slots,
+                    topk_lens=topk_lens,
+                )
+                if self.step_counter is not None:
+                    self.step_counter.record_cache()
+                return out.reshape(-1, heads * layer.v_head_dim)
+            gathered_heads = heads * len(self.kvp_group)
+            core_heads = trtllm_sparse_mla_query_heads(gathered_heads)
+            if (
+                not keep_all_heads
+                and self.kvp_prefill_query_layout
+                and self._dcp_padded_query
+                and core_heads != gathered_heads
+            ):
+                q_view = gather_query_heads_padded(q_view, self.kvp_group, core_heads)
+                live_heads = gathered_heads
+            elif not keep_all_heads:
                 q_view = gather_query_heads(q_view, self.kvp_group)
         out = dsa_prefill(
             q=q_view,
             kv_cache=kv_cache,
             sparse_kv_cache=None,
             topk_slots=topk_slots,
-            topk_lens=topk_lens.to(device=q.device, dtype=torch.int32).contiguous(),
+            topk_lens=topk_lens,
             kv_seq_lens=(
                 kv_seq_lens.to(device=q.device, dtype=torch.int32).contiguous()
                 if kv_seq_lens is not None
@@ -1155,6 +1695,9 @@ class DSABackend(PagedAttentionBackend):
         )
         if use_dcp:
             local_output, local_lse = out
+            if live_heads is not None:
+                local_output = local_output[:, :live_heads]
+                local_lse = local_lse[:, :live_heads]
             out = combine_attention_partials(
                 local_output,
                 local_lse,
@@ -1171,6 +1714,46 @@ class DSABackend(PagedAttentionBackend):
         if self.step_counter is not None:
             self.step_counter.record_cache()
         return out.reshape(-1, heads * layer.v_head_dim)
+
+    def _forward_dcp_records_prefill(
+        self,
+        *,
+        q_view: torch.Tensor,
+        layer,
+        kv_cache: torch.Tensor,
+        topk_slots: torch.Tensor,
+        topk_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        """The head-sharded KVP arm with the qlayout lever: the same core and
+        exchange as ``dsa_prefill`` plus ``combine_attention_partials``, bit
+        for bit, without the relayout of the gathered heads or the repack of
+        the partials. The query heads stay rank-major as the all-gather lands
+        them, the core writes each head's partial straight into the record its
+        owner receives, and one all-to-all sends them, as the other arm's."""
+        records = dsa_prefill_dcp_records(
+            q=gather_query_heads_rank_major(q_view, self.kvp_group),
+            kv_cache=kv_cache,
+            topk_slots=topk_slots,
+            topk_lens=topk_lens,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            softmax_scale=layer.scaling,
+            page_size=self.kernel_page_size,
+            logit_cap=layer.logit_cap,
+            k_scale=1.0,
+            solution=self.kernel_solution,
+            slot_order=self.slot_order,
+        )
+        # The Triton core emits BF16 partials, which the combine keeps.
+        return combine_attention_records(
+            records,
+            group=self.kvp_group,
+            head_dim=self.kv_lora_rank,
+            partial_dtype=torch.bfloat16,
+            output_dtype=torch.bfloat16,
+            sink=None,
+        )
 
     def _forward_sharded_sparse_prefill(
         self,
@@ -1205,12 +1788,19 @@ class DSABackend(PagedAttentionBackend):
         for group in meta.groups:
             # Every rank joins every group's gather; the collective does not
             # know which ranks have query rows in the group.
-            kv_group = self.gather_history_kv(layer, token_to_kv_pool, group)
+            kv_group, kv_rows = self.gather_history_kv(layer, token_to_kv_pool, group)
             rows = group.local_query
             if rows.stop <= rows.start:
                 continue
             slots = topk_slots[rows]
-            slots = torch.where(slots >= 0, slots - group.row_base, -1)
+            # The selected positions, mapped to the rows of the rank-major
+            # gather; the order (the reduction order) is unchanged.
+            # Workspace tails can contain stale slots outside this history.
+            # Mask them before indexing, not only inside the attention kernel.
+            columns = torch.arange(slots.shape[1], device=slots.device)
+            valid = (slots >= 0) & (columns < topk_lens[rows, None])
+            positions = torch.where(valid, slots - group.row_base, 0).to(torch.int64)
+            slots = torch.where(valid, kv_rows[positions], -1)
             # This call mirrors the unsharded arm's: every kernel facade
             # option the unsharded call passes (the slot-order selection
             # included) must be passed here too.
@@ -1235,6 +1825,25 @@ class DSABackend(PagedAttentionBackend):
                 slot_order=self.slot_order,
             )
         return out
+
+    def _published_kv_seq_lens(
+        self, metadata, num_extends: int, q_len_per_req: int, num_tokens: int
+    ) -> torch.Tensor | None:
+        """The round's per-token causal KV lengths for the decode rows, or
+        ``None`` when this forward did not publish rows of its width.
+
+        A target verify's refresh (or mixed init) publishes them once, so
+        every DSA layer of the forward reads one tensor instead of
+        re-deriving it; a draft chain step moves ``seq_lens_k`` without a
+        refresh, so drafts keep the local form.
+        """
+        rows = metadata._dsa_kv_seq_lens
+        if rows is None or self.is_draft or q_len_per_req != self.spec_num_tokens:
+            return None
+        start = num_extends * q_len_per_req
+        if rows.numel() < start + num_tokens:
+            return None
+        return rows[start : start + num_tokens]
 
     def forward_sparse_decode(
         self,
@@ -1326,12 +1935,11 @@ class DSABackend(PagedAttentionBackend):
         if q_len_per_req == 1:
             kv_seq_lens = seq_lens
         else:
-            offsets = torch.arange(
-                q_len_per_req, device=q.device, dtype=torch.int32
-            ) - (q_len_per_req - 1)
-            kv_seq_lens = (
-                seq_lens.unsqueeze(1).add(offsets).clamp_min(0).reshape(-1).contiguous()
+            kv_seq_lens = self._published_kv_seq_lens(
+                metadata, num_extends, q_len_per_req, num_tokens
             )
+            if kv_seq_lens is None:
+                kv_seq_lens = _k_row_causal_lengths(seq_lens, q_len_per_req)
 
         heads = self._query_heads(q, layer)
         q_view = q.view(num_tokens, heads, layer.head_dim)
@@ -1353,8 +1961,10 @@ class DSABackend(PagedAttentionBackend):
         keep_all_heads = use_dcp and self._query_holds_every_head(heads)
         topk_slots = topk_indices.view(num_tokens, -1)
         if use_dcp:
-            slots, owned = resolve_cache_slots(topk_slots, self.cache_placement(layer))
-            topk_slots = torch.where(owned, slots, -1)
+            # Owned slots first, counted as length (full width without topk_lens).
+            topk_slots, topk_lens = compact_owned_cache_slots(
+                topk_slots, topk_lens, self.cache_placement(layer)
+            )
             if not keep_all_heads:
                 q_view = gather_query_heads(q_view, self.kvp_group)
         out = dsa_decode(

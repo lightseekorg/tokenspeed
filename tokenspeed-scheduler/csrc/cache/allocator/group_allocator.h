@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <iterator>
 #include <limits>
 #include <optional>
 #include <span>
@@ -62,7 +63,9 @@ public:
     // Cyclic owners of this group's virtual blocks; 1 balances nothing.
     std::int32_t ShardCount() const noexcept { return shard_count_; }
 
-    std::int32_t ResolveCacheBlockId(CacheBlockLocation location) const {
+    // Bare locations occur in recorded Device eviction segments. A live
+    // reference carries its pool and must use the pool-aware overload below.
+    std::int32_t ResolveDeviceCacheBlockId(CacheBlockLocation location) const {
         _assert(location.lcm_block_id > 0, "LCM block id must be > 0");
         _assert(0 <= location.slot_index && location.slot_index < cache_blocks_per_lcm_block_,
                 "cache block slot is out of range");
@@ -72,30 +75,46 @@ public:
         _assert(page_id <= std::numeric_limits<std::int32_t>::max(), "kernel page id exceeds int32 range");
         return static_cast<std::int32_t>(page_id);
     }
+    std::int32_t ResolveCacheBlockId(const CacheBlock& block) const {
+        _assert(block.OwnerPool().BoundGroup(block.Location().lcm_block_id) == group_id_,
+                "block reference belongs to another cache group");
+        return block.OwnerPool().ResolveCacheBlockId(group_id_, block.Location());
+    }
     std::vector<std::int32_t> BlockTablePageIds(const BlockTable& table) const {
         std::vector<std::int32_t> ids;
         ids.reserve(static_cast<std::size_t>(table.NumBlocks()));
-        for (const CacheBlockRef& block_ref : table.Blocks()) {
-            ids.push_back(block_ref ? ResolveCacheBlockId(block_ref->Location()) : 0);
-        }
+        AppendBlockTablePageIds(table, ids, 0);
         return ids;
+    }
+
+    // Append the row from first_slot on, preserving null holes in that range.
+    void AppendBlockTablePageIds(const BlockTable& table, std::vector<std::int32_t>& ids,
+                                 std::size_t first_slot) const {
+        assertPageIdsCurrent(table);
+        const auto released = static_cast<std::size_t>(table.ReclaimedPrefixBlocks());
+        const std::span<const std::int32_t> page_ids = table.PageIds();
+        _assert(first_slot <= page_ids.size(), "block-table range starts beyond its row");
+        if (first_slot < released) ids.insert(ids.end(), released - first_slot, 0);
+        ids.insert(ids.end(), page_ids.begin() + static_cast<std::ptrdiff_t>(std::max(first_slot, released)),
+                   page_ids.end());
     }
 
     // The table window handed to PrefixCacheIndex::RegisterFullBlocks. The
     // index owns no table: publishing a completed block may dedupe it against
     // the key's existing canonical block, and the table must then hold that
     // canonical reference, so the mutable window is issued here, by the one
-    // component allowed to change a table.
-    std::span<CacheBlockRef> BlocksToPublish(BlockTable& table, std::int32_t first_slot, std::size_t count) const {
+    // component allowed to change a table. The window's page ids follow the
+    // references the index leaves when it closes.
+    BlockTable::PublishWindow BlocksToPublish(BlockTable& table, std::int32_t first_slot, std::size_t count) const {
         _assert(first_slot >= 0, "first_slot must be >= 0");
         _assert(static_cast<std::int64_t>(first_slot) + static_cast<std::int64_t>(count) <= table.NumBlocks(),
                 "publish window exceeds table size");
-        return std::span<CacheBlockRef>{table.blocks_}.subspan(static_cast<std::size_t>(first_slot), count);
+        return BlockTable::PublishWindow{group_id_, table, static_cast<std::size_t>(first_slot), count};
     }
 
     void ClaimHitBlocks(BlockTable& table, PrefixMatch&& hit) {
         _assert(table.blocks_.empty(), "ClaimHitBlocks requires a fresh (empty) table");
-        table.blocks_ = std::move(hit.blocks);
+        table.assignAll(group_id_, std::move(hit.blocks));
         while (table.reclaimed_prefix_blocks_ < table.NumBlocks() &&
                !table.blocks_[static_cast<std::size_t>(table.reclaimed_prefix_blocks_)]) {
             ++table.reclaimed_prefix_blocks_;
@@ -104,31 +123,54 @@ public:
 
     // Executes a GroupGeometry plan: acquires plan.num_blocks fresh blocks,
     // places them (dense append or sparse suffix), and stores the planned
-    // bookkeeping. Returns false without mutation when the pool is short.
-    bool Acquire(BlockPool& pool, BlockTable& table, const AcquirePlan& plan) {
+    // bookkeeping. A dense append may be handed `placed`: blocks the caller
+    // acquired in the buckets their slots must take, for table slots
+    // [first_placed_slot, first_placed_slot + placed.size()) of the appended
+    // run, so that every bucket-exact block is acquired before the plan's
+    // other blocks take any hole (the order the admission planner's fit
+    // assumes). Returns false when the pool is short of the other blocks,
+    // without mutating the table; the placed blocks go back then.
+    bool Acquire(BlockPool& pool, BlockTable& table, const AcquirePlan& plan, std::int32_t first_placed_slot,
+                 std::vector<CacheBlockRef> placed) {
         const std::int32_t old_num_blocks = table.NumBlocks();
+        _assert(placed.empty() || (plan.suffix_start < 0 && first_placed_slot >= old_num_blocks &&
+                                   first_placed_slot + static_cast<std::int64_t>(placed.size()) <=
+                                       static_cast<std::int64_t>(old_num_blocks) + plan.num_blocks),
+                "placed blocks fill slots of a dense append");
+        const std::int32_t num_others = plan.num_blocks - static_cast<std::int32_t>(placed.size());
         std::vector<CacheBlockRef> block_refs;
-        if (plan.num_blocks > 0) {
-            block_refs = pool.AcquireBlocks(group_id_, plan.num_blocks, BucketLoads(table));
-            if (static_cast<std::int32_t>(block_refs.size()) < plan.num_blocks) {
+        if (num_others > 0) {
+            // The placed blocks count toward the request's bucket loads too.
+            std::vector<std::int32_t> loads = BucketLoads(table);
+            for (const CacheBlockRef& block : placed) {
+                if (!loads.empty()) {
+                    ++loads[static_cast<std::size_t>(block->Location().slot_index % shard_count_)];
+                }
+            }
+            block_refs = pool.AcquireBlocks(group_id_, num_others, loads);
+            if (static_cast<std::int32_t>(block_refs.size()) < num_others) {
                 return false;
             }
         }
+        if (!placed.empty()) {
+            // Slot order: the placed run sits among the other appended slots.
+            const auto before = static_cast<std::ptrdiff_t>(first_placed_slot - old_num_blocks);
+            block_refs.insert(block_refs.begin() + before, std::make_move_iterator(placed.begin()),
+                              std::make_move_iterator(placed.end()));
+        }
         if (plan.suffix_start < 0) {
-            table.blocks_.reserve(table.blocks_.size() + block_refs.size());
-            for (CacheBlockRef& block_ref : block_refs) {
-                table.blocks_.push_back(std::move(block_ref));
-            }
+            // Insert the batch together so allocation failure cannot leave a partial append.
+            table.appendAll(group_id_, std::move(block_refs));
         } else {
             _assert(table.NumBlocks() <= plan.suffix_start, "sparse suffix overlaps the existing block table");
             _assert(plan.suffix_start + plan.num_blocks <= plan.table_blocks_after,
                     "sparse suffix exceeds the planned table size");
-            table.blocks_.resize(static_cast<std::size_t>(plan.table_blocks_after));
+            table.resize(static_cast<std::size_t>(plan.table_blocks_after));
             if (old_num_blocks == 0) {
                 table.reclaimed_prefix_blocks_ = plan.suffix_start;
             }
             for (std::size_t i = 0; i < block_refs.size(); ++i) {
-                table.blocks_[static_cast<std::size_t>(plan.suffix_start) + i] = std::move(block_refs[i]);
+                table.assign(group_id_, static_cast<std::size_t>(plan.suffix_start) + i, std::move(block_refs[i]));
             }
         }
         table.available_tokens_ = plan.available_tokens_after;
@@ -166,11 +208,11 @@ public:
         if (fresh.size() != buckets.size()) {
             return false;
         }
-        table.blocks_.resize(static_cast<std::size_t>(shape.num_blocks));
+        table.resize(static_cast<std::size_t>(shape.num_blocks));
         std::size_t next_fresh = 0;
         for (std::size_t i = 0; i < shape.slots.size(); ++i) {
-            CacheBlockRef& destination = table.blocks_[static_cast<std::size_t>(shape.slots[i].slot_index)];
-            destination = claimed[i] ? std::move(claimed[i]) : std::move(fresh[next_fresh++]);
+            table.assign(group_id_, static_cast<std::size_t>(shape.slots[i].slot_index),
+                         claimed[i] ? std::move(claimed[i]) : std::move(fresh[next_fresh++]));
         }
         table.available_tokens_ = shape.available_tokens;
         table.reclaimed_prefix_blocks_ = shape.reclaimed_prefix_blocks;
@@ -180,24 +222,44 @@ public:
     // Swaps a fresh block into `slot`, in the bucket of the block it replaces
     // (any bucket when the slot was a hole), and sets the table's unconsumed
     // tail capacity. Returns the replaced block: a hitter's shared partial
-    // block or an owner's just-published one, which the caller copies into
-    // the fresh block; empty for a hole, which the caller zeroes instead.
-    CacheBlockRef SwapInFreshBlock(BlockPool& pool, BlockTable& table, std::int32_t slot,
-                                   std::int32_t available_tokens) {
+    // block, which the caller copies into the fresh block; empty for a hole,
+    // which the caller zeroes instead. Installing into a hole ends the released
+    // prefix at this slot, so subsequent exports include the new writable block.
+    // With a destination the fresh block is that free slot of a parent bound to
+    // this group (a lone request's compaction moving its own block; the caller
+    // keeps a copied block's bucket, and may change an unwritten block's);
+    // without one the pool places it.
+    CacheBlockRef SwapInFreshBlock(BlockPool& pool, BlockTable& table, std::int32_t slot, std::int32_t available_tokens,
+                                   std::optional<CacheBlockLocation> destination) {
         _assert(0 <= slot && slot < table.NumBlocks(), "swapped slot lies inside the table");
         _assert(available_tokens >= 0, "tail capacity must be non-negative");
-        CacheBlockRef& current = table.blocks_[static_cast<std::size_t>(slot)];
+        const CacheBlockRef& current = table.blocks_[static_cast<std::size_t>(slot)];
         std::vector<CacheBlockRef> fresh;
-        if (current) {
+        if (destination) {
+            fresh.push_back(pool.AcquireBlockAt(group_id_, *destination));
+        } else if (current) {
             const std::array<std::int32_t, 1> bucket{BucketOf(current->Location())};
             fresh = pool.AcquireBlocksInBuckets(group_id_, bucket);
         } else {
             fresh = pool.AcquireBlocks(group_id_, 1, BucketLoads(table));
         }
         FatalCheck(fresh.size() == 1, "admission plan no longer fits the block pool");
-        CacheBlockRef replaced = std::exchange(current, std::move(fresh.front()));
+        CacheBlockRef replaced = table.exchange(group_id_, static_cast<std::size_t>(slot), std::move(fresh.front()));
         table.available_tokens_ = available_tokens;
+        table.reclaimed_prefix_blocks_ = std::min(table.reclaimed_prefix_blocks_, slot);
         return replaced;
+    }
+
+    // Swaps `block` -- an owner's copy-in block, held since the admission that
+    // reserved it in the bucket of the block in `slot` -- into `slot`. Returns
+    // the replaced block, the owner's just-published one, which the caller
+    // copies into `block`. The table's tail capacity is unchanged.
+    CacheBlockRef SwapInBlock(BlockTable& table, std::int32_t slot, CacheBlockRef block) {
+        _assert(0 <= slot && slot < table.NumBlocks(), "swapped slot lies inside the table");
+        const CacheBlockRef& current = table.blocks_[static_cast<std::size_t>(slot)];
+        _assert(current && block && BucketOf(current->Location()) == BucketOf(block->Location()),
+                "a copy-in block shares the bucket of the block it replaces");
+        return table.exchange(group_id_, static_cast<std::size_t>(slot), std::move(block));
     }
 
     // Appends one Device destination per Host hit, each in its Host block's
@@ -214,17 +276,17 @@ public:
                 buckets.push_back(BucketOf(block_ref->Location()));
             }
         }
-        table.blocks_.reserve(table.blocks_.size() + host_block_refs.size());
+        table.reserve(table.blocks_.size() + host_block_refs.size());
         std::vector<CacheBlockRef> destination_refs = pool.AcquireBlocksInBuckets(group_id_, buckets);
         FatalCheck(destination_refs.size() == buckets.size(), "admission plan no longer fits the block pool");
         auto destination_it = destination_refs.begin();
         for (CacheBlockRef& host_block_ref : host_block_refs) {
             if (!host_block_ref) {
-                table.blocks_.emplace_back();
+                table.append(group_id_, {});
                 continue;
             }
             _assert(destination_it != destination_refs.end(), "missing host extension destination");
-            table.blocks_.push_back(std::move(*destination_it));
+            table.append(group_id_, std::move(*destination_it));
             ++destination_it;
             load_pairs.push_back(BlockTransfer{
                 .group_id = group_id_,
@@ -245,8 +307,8 @@ public:
     // AcquireStateLive.
     void ShapeStateTable(BlockTable& table, CacheBlockRef input) {
         _assert(table.blocks_.empty(), "ShapeStateTable requires a fresh (empty) table");
-        table.blocks_.push_back(std::move(input));
-        table.blocks_.emplace_back();
+        table.append(group_id_, std::move(input));
+        table.append(group_id_, {});
         table.available_tokens_ = 0;
         table.reclaimed_prefix_blocks_ = 0;
     }
@@ -257,20 +319,20 @@ public:
     // it is published, otherwise it returns to the pool.
     void ReleaseStateInput(BlockTable& table) {
         assertStateTable(table);
-        table.blocks_[0].reset();
+        table.take(0).reset();
     }
     // Slot 0 receives a block the admission acquired: a Host checkpoint's
     // fresh destination, or the zeroed block a prompt starts from.
     void InstallStateInput(BlockTable& table, CacheBlockRef input) {
         assertStateTable(table);
         _assert(!table.blocks_[0], "the input slot is installed only when empty");
-        table.blocks_[0] = std::move(input);
+        table.assign(group_id_, 0, std::move(input));
     }
     // Slot 1 becomes slot 0 (the block the last forward wrote is the next
     // one's input); slot 1 is left empty for AcquireStateLive.
     void RotateState(BlockTable& table) {
         assertStateTable(table);
-        table.blocks_[0] = std::exchange(table.blocks_[1], CacheBlockRef{});
+        table.assign(group_id_, 0, table.take(1));
     }
     bool AcquireStateLive(BlockPool& pool, BlockTable& table) {
         assertStateTable(table);
@@ -317,13 +379,20 @@ public:
         table.reclaimed_prefix_blocks_ = std::max(table.reclaimed_prefix_blocks_, expired);
     }
 
+    // Unreclaimed slots below the retention frontier, including null holes
+    // and shared blocks. The size is an optimistic reclaim bound; the actual
+    // candidates must come from this same range and pass the ownership check.
+    std::span<const CacheBlockRef> ExpiredBlockSlotsAt(const BlockTable& table, std::int32_t num_expired_blocks) const {
+        const std::int32_t first = table.ReclaimedPrefixBlocks();
+        const std::int32_t count = std::max(std::min(num_expired_blocks, table.NumBlocks()) - first, 0);
+        return table.Blocks().subspan(first, count);
+    }
+
     // Only blocks uniquely owned by this table reach the free list, so shared ones don't count.
     std::int32_t BlocksReclaimableAt(const PrefixCacheIndex& index, const BlockTable& table,
                                      std::int32_t num_expired_blocks, bool count_uncached) const {
-        const std::int32_t expired = std::min(num_expired_blocks, table.NumBlocks());
         std::int32_t freed = 0;
-        for (std::int32_t i = table.ReclaimedPrefixBlocks(); i < expired; ++i) {
-            const CacheBlockRef& block = table.Blocks()[static_cast<std::size_t>(i)];
+        for (const CacheBlockRef& block : ExpiredBlockSlotsAt(table, num_expired_blocks)) {
             if (!block) {
                 continue;
             }
@@ -338,10 +407,8 @@ public:
 
     std::vector<CacheBlockLocation> ReclaimableBlockLocationsAt(const PrefixCacheIndex& index, const BlockTable& table,
                                                                 std::int32_t num_expired_blocks) const {
-        const std::int32_t expired = std::min(num_expired_blocks, table.NumBlocks());
         std::vector<CacheBlockLocation> locations;
-        for (std::int32_t i = table.ReclaimedPrefixBlocks(); i < expired; ++i) {
-            const CacheBlockRef& block = table.Blocks()[static_cast<std::size_t>(i)];
+        for (const CacheBlockRef& block : ExpiredBlockSlotsAt(table, num_expired_blocks)) {
             if (!block) {
                 continue;
             }
@@ -360,23 +427,32 @@ public:
     }
 
     void Free(BlockTable& table) {
-        // Release the logical suffix first so newly emptied LCM parents enter
-        // the FIFO free queue in deterministic table order.
-        for (auto it = table.blocks_.rbegin(); it != table.blocks_.rend(); ++it) {
-            it->reset();
-        }
-        table.blocks_.clear();
+        table.releaseAll();
         table.available_tokens_ = 0;
         table.reclaimed_prefix_blocks_ = 0;
     }
 
 private:
+    // Debug builds re-resolve every live slot the way the export did before
+    // tables kept their page ids, and fail on any slot a write left stale.
+    void assertPageIdsCurrent([[maybe_unused]] const BlockTable& table) const {
+#ifndef NDEBUG
+        const std::span<const CacheBlockRef> blocks = table.Blocks();
+        const std::span<const std::int32_t> page_ids = table.PageIds();
+        _assert(blocks.size() == page_ids.size(), "a table keeps one page id per slot");
+        for (std::size_t slot = static_cast<std::size_t>(table.ReclaimedPrefixBlocks()); slot < blocks.size(); ++slot) {
+            const std::int32_t expected = blocks[slot] ? ResolveCacheBlockId(*blocks[slot]) : 0;
+            _assert(page_ids[slot] == expected, "a table's page id went stale");
+        }
+#endif
+    }
+
     bool acquireStateSlot(BlockPool& pool, BlockTable& table, std::size_t slot) {
         std::vector<CacheBlockRef> fresh = pool.AcquireBlocks(group_id_, 1, BucketLoads(table));
         if (fresh.size() != 1) {
             return false;
         }
-        table.blocks_[slot] = std::move(fresh.front());
+        table.assign(group_id_, slot, std::move(fresh.front()));
         return true;
     }
     std::vector<std::int32_t> BucketLoads(const BlockTable& table) const {

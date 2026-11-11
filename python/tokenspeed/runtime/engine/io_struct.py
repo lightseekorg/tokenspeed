@@ -141,9 +141,11 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # the client receives a terminal abort instead of a silent drop.
     validation_error: str | None = None
 
-    # Hard-pin to an attention-DP rank. Keep last: array_like declaration
-    # order is the wire contract.
+    # Hard-pin to an attention-DP rank.
     data_parallel_rank: int | None = None
+    # Router-only cache retention identity; no prompt concatenation.
+    cache_session_id: str | None = None
+    # array_like declaration order is the wire contract; append new fields here.
 
 
 # Serialized form of BaseFinishReason.to_json() (or None while streaming) —
@@ -208,6 +210,12 @@ class BatchTokenIDOutSlim(BaseBatchReq, kw_only=True):
     output_top_logprobs_idx: list[list] = []
     # Resident LCM blocks, including reclaimable prefix-cache entries.
     kv_used_pages: int = 0
+    # Appended diagnostic tail: per-token cumulative probability mass, parallel
+    # to output_token_logprobs_val. Empty for frames without this diagnostic.
+    output_token_cumulative_probs_val: list[list[float]] = []
+    # Cumulative reasoning tokens per request, excluding structural markers.
+    # Appended wire tail: older producers omit it and decode as [].
+    reasoning_tokens: list[int] = []
 
 
 class FlushCacheReqInput(BaseReq, kw_only=True):
@@ -347,6 +355,8 @@ class UpdateWeightsFromMooncakeReqInput(BaseReq, kw_only=True):
     # Required. The L3 namespace to publish after a successful load, or
     # ``None`` for the default ``mooncake_load_weight_version`` resolves.
     weight_version: str | None
+    # Optional publication directory for SDKs that use explicit snapshots.
+    snapshot: dict | None = None
 
 
 class UpdateWeightsFromMooncakeReqOutput(BaseReq, kw_only=True):
@@ -436,6 +446,22 @@ class ProfileReq(BaseReq, kw_only=True):
 
 
 class ProfileReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+
+
+class ReloadForwardReqInput(BaseReq, kw_only=True):
+    # How a drain treats running requests: "wait" lets them finish, "abort" ends them.
+    mode: str = "wait"
+    # Modules to re-execute; None reloads every module whose source changed.
+    modules: list[str] | None = None
+    # The caller's id, the same on every engine; the gate runs the reload once all hold it.
+    id: str | None = None
+    # Seconds to wait for the drain and every attention-DP engine; None waits until cancelled.
+    timeout_s: float | None = None
+
+
+class ReloadForwardReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
 

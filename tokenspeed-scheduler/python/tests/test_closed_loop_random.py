@@ -62,6 +62,8 @@ import pytest
 
 ts = pytest.importorskip("tokenspeed_scheduler")
 
+from conftest import _event  # noqa: E402
+
 P = 8
 HISTORY = "full_attention"
 STATES = ("linear_attention_0", "linear_attention_1")
@@ -135,14 +137,6 @@ def _config(
     return cfg
 
 
-def _event(kind: str, request_id: str, **fields):
-    event = getattr(ts.ForwardEvent, kind)()
-    event.request_id = request_id
-    for name, value in fields.items():
-        setattr(event, name, value)
-    return event
-
-
 class _Loop:
     def __init__(
         self,
@@ -188,6 +182,11 @@ class _Loop:
             groups = list(cfg.cache_groups)
             random.Random(seed + 2).shuffle(groups)
             cfg.cache_groups = groups
+        if host_pages > 0 or num_snapshot_pages > 1:
+            # These scenarios use Device packing on Host, in declaration order.
+            cfg.host_group_packing = [
+                group.cache_blocks_per_lcm_block for group in cfg.cache_groups
+            ]
         self.history_group = [group.group_id for group in cfg.cache_groups].index(
             HISTORY
         )
@@ -201,6 +200,9 @@ class _Loop:
             for _ in range(3)
         ]
         self.live: dict[str, dict] = {}
+        # Ended (aborted or failed) while their transfer may still touch their
+        # pages: the peer reports each transfer stopped some rounds later.
+        self.stopping: set[str] = set()
         self.done: list[list[int]] = []
         self.pending: list = []
         self.next_id = 0
@@ -290,7 +292,7 @@ class _Loop:
     def peer(self, plan) -> None:
         """The transfer peer: bootstraps waiting prompts; on the D lands the
         plan's remote prefills, on the P acknowledges (or fails) the decodes
-        it was handed."""
+        it was handed; on both, reports the ended transfers stopped."""
         events = ts.ExecutionEvent()
         count = 0
         if plan is not None and plan.remote_decode is not None:
@@ -302,14 +304,19 @@ class _Loop:
                 state["bootstrapped"] = True
                 count += 1
             if state["transferring"] and self.rng.random() < 0.5:
-                kind = (
-                    ts.PD.FailedEvent
-                    if self.rng.random() < 0.1
-                    else ts.PD.SucceededEvent
-                )
-                events.add_event(kind(request_id))
+                if self.rng.random() < 0.1:
+                    events.add_event(ts.PD.FailedEvent(request_id))
+                    self.stopping.add(request_id)
+                else:
+                    events.add_event(ts.PD.SucceededEvent(request_id))
                 state["transferring"] = False
                 state["finished"] = True
+                count += 1
+        # Sorted: a set's order would vary from run to run.
+        for request_id in sorted(self.stopping):
+            if self.rng.random() < 0.5:
+                events.add_event(ts.PD.TransferStoppedEvent(request_id))
+                self.stopping.remove(request_id)
                 count += 1
         if plan is not None and plan.remote_prefill is not None:
             for request_id in plan.remote_prefill.request_ids:
@@ -398,6 +405,8 @@ class _Loop:
                     events.add_event(_event("Abort", request_id))
                     self.scheduler.advance(events)
                     del self.live[request_id]
+                    if self.role != ts.SchedulerConfig.Role.Fused:
+                        self.stopping.add(request_id)
                     self.aborts += 1
             if len(self.pending) > 1:
                 self.land(self.pending.pop(0))
@@ -517,6 +526,7 @@ def test_random_host_acks_leave_nothing_in_flight(
                 del loop.live[request_id]
             if (
                 not loop.live
+                and not loop.stopping
                 and not any(op.request_ids for op in plan.forward)
                 and not plan.cache
                 and plan.remote_decode is None

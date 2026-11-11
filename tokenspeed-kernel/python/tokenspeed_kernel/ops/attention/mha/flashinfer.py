@@ -260,6 +260,8 @@ if platform.is_nvidia and platform.is_hopper_plus:
             "return_lse": frozenset({False}),
             "sinks": frozenset({False, True}),
             "sliding_window": frozenset({False, True}),
+            # FA3/FA4/flashinfer take no token sink; the Triton leaf does.
+            "window_sink": frozenset({False}),
         },
     )
     def flashinfer_trtllm_mha_decode_with_kvcache(

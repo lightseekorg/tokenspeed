@@ -133,6 +133,23 @@ def test_forward_batch_uses_per_group_block_tables_as_the_only_page_table():
     assert not hasattr(op, "sizes")
 
 
+def test_block_table_arrays_keep_their_snapshot_alive():
+    import gc
+
+    scheduler = ts.Scheduler(_make_config())
+    scheduler.submit_requests([_make_spec("r1", num_pages=2)])
+    plan = scheduler.next_execution_plan()
+    op = _find_forward_op(plan)
+    arrays = op.block_tables_arrays()
+    expected = dict(op.block_tables)
+    assert all(not array.flags.writeable for array in arrays.values())
+
+    del op, plan, scheduler
+    gc.collect()
+    for group_id, array in arrays.items():
+        assert array.tolist() == expected[group_id]
+
+
 def test_pages_to_zero_arrays_view_the_plan_without_python_ints():
     import numpy as np
 
@@ -231,11 +248,11 @@ def _make_k3_128k_config(num_device_pages: int) -> ts.SchedulerConfig:
 def test_k3_reports_group_aware_single_request_capacity() -> None:
     # Each State group holds two slots (the input checkpoint and the live
     # state) whatever the prompt length. The three groups therefore leave 278
-    # of the 284 usable parents for Full KV: 278 * 12 child pages, one of
-    # which a tail handover holds, so P=128 exposes (278 * 12 - 1) * 128
-    # tokens.
+    # of the 284 usable parents for Full KV: 278 * 12 child pages, of which a
+    # tail handover holds one and the copy-in block of a prompt end another,
+    # so P=128 exposes (278 * 12 - 2) * 128 tokens.
     scheduler = ts.Scheduler(_make_k3_128k_config(285))
-    assert scheduler.max_single_request_tokens() == 426_880
+    assert scheduler.max_single_request_tokens() == 426_752
 
 
 def test_k3_128k_requires_group_aware_shared_pool_geometry() -> None:
@@ -327,11 +344,13 @@ def test_accepted_state_prompts_can_prefill_and_start_decode(
                 assert _find_forward_op(scheduler.next_execution_plan()) is not None
 
 
+@pytest.mark.parametrize("state_checkpoint_in_forward", [False, True])
 @pytest.mark.parametrize("finish_after_first_decode", [False, True])
 @pytest.mark.parametrize("decode_width", [1, 3])
 @pytest.mark.parametrize("prompt_tokens", [3, 7, 8])
 @pytest.mark.parametrize("truncate_output", [False, True])
 def test_state_checkpoints_are_published_at_prompt_end_and_finish(
+    state_checkpoint_in_forward: bool,
     finish_after_first_decode: bool,
     decode_width: int,
     prompt_tokens: int,
@@ -340,7 +359,10 @@ def test_state_checkpoints_are_published_at_prompt_end_and_finish(
     """A State group publishes its state where its owner stops writing it: the
     prompt end (whatever its alignment) and the finish frontier. Decode steps in
     between publish nothing, so a prompt sharing the decoded tokens resumes at
-    the finish frontier when it reaches it and at the prompt end otherwise."""
+    the finish frontier when it reaches it and at the prompt end otherwise.
+    With ``state_checkpoint_in_forward`` a finish past the prompt end publishes
+    no state, so such a prompt resumes at the prompt end, which no pre-tail
+    checkpoint covers in a prompt that fits one chunk."""
     cfg = ts.SchedulerConfig()
     cfg.prefix_granularity = 4
     cfg.num_device_pages = 33
@@ -352,6 +374,7 @@ def test_state_checkpoints_are_published_at_prompt_end_and_finish(
     cfg.disable_prefix_cache = False
     cfg.decode_input_tokens = decode_width
     cfg.overlap_schedule_depth = 0
+    cfg.state_checkpoint_in_forward = state_checkpoint_in_forward
     cfg.cache_groups = [
         ts.CacheGroupConfig(
             group_id="state",
@@ -394,7 +417,8 @@ def test_state_checkpoints_are_published_at_prompt_end_and_finish(
     scheduler.submit_requests([reuse])
     batch = _find_forward_op(scheduler.next_execution_plan())
     assert batch is not None
-    expected = finish_frontier if finish_frontier <= len(shared) else prompt_tokens
+    reaches_finish = finish_frontier <= len(shared) and not state_checkpoint_in_forward
+    expected = finish_frontier if reaches_finish else prompt_tokens
     assert list(batch.extend_prefix_lens) == [expected]
     [state_row] = dict(batch.block_tables)["state"]
     assert len(state_row) == 2
@@ -477,6 +501,31 @@ def _drive_k3_to_retract(scheduler) -> tuple[object, dict[str, list[int]]]:
     return snapshot, a_rows
 
 
+@pytest.mark.parametrize("host_pool", ["l2", "snapshot"])
+def test_host_pools_require_explicit_packing_for_every_group(host_pool: str) -> None:
+    cfg = _make_k3_config()
+    if host_pool == "l2":
+        cfg.num_host_pages = 33
+        cfg.disable_l2_cache = False
+        cfg.host_write_policy = ts.SchedulerConfig.HostWritePolicy.WriteThrough
+    else:
+        cfg.num_snapshot_pages = 33
+        cfg.max_retracted_requests = 4
+
+    with pytest.raises(ValueError, match="Host pools require explicit packing"):
+        ts.Scheduler(cfg)
+
+    cfg.host_group_packing = [
+        group.cache_blocks_per_lcm_block for group in cfg.cache_groups
+    ]
+    scheduler = ts.Scheduler(cfg)
+    scheduler.submit_requests([_spec("request", [1, 2, 3, 4])])
+    batch = _find_forward_op(scheduler.next_execution_plan())
+    assert batch is not None
+    assert tuple(batch.request_ids) == ("request",)
+    assert list(batch.input_lengths) == [4]
+
+
 def test_k3_retraction_images_every_group_and_restores_it_in_place() -> None:
     """Without L2 the whole image lives in the snapshot pool; the restore
     copies it back into fresh pages and decode resumes where it stopped."""
@@ -485,6 +534,9 @@ def test_k3_retraction_images_every_group_and_restores_it_in_place() -> None:
     assert cfg.disable_l2_cache
     cfg.num_snapshot_pages = 33
     cfg.max_retracted_requests = 4
+    cfg.host_group_packing = [
+        group.cache_blocks_per_lcm_block for group in cfg.cache_groups
+    ]
     scheduler = ts.Scheduler(cfg)
     before = scheduler.available_lcm_blocks()
     assert scheduler.snapshot_pool_free_blocks() == 32
@@ -603,6 +655,9 @@ def test_k3_finish_while_retracted_returns_the_image() -> None:
     cfg = _make_k3_config()
     cfg.num_snapshot_pages = 33
     cfg.max_retracted_requests = 4
+    cfg.host_group_packing = [
+        group.cache_blocks_per_lcm_block for group in cfg.cache_groups
+    ]
     scheduler = ts.Scheduler(cfg)
     snapshot, _ = _drive_k3_to_retract(scheduler)
     assert scheduler.snapshot_pool_free_blocks() == 32 - 8

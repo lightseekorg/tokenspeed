@@ -134,6 +134,7 @@ from tokenspeed_kernel.ops.sampling import argmax as kernel_argmax
 from tokenspeed_kernel.ops.transform import (
     hadamard_transform as kernel_hadamard_transform,
 )
+from tokenspeed_kernel.ops.tuning import kernel_warmup
 from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
 from tokenspeed_kernel.registry import KernelRegistry, Priority
 from tokenspeed_kernel.selection import NoKernelFoundError as kernel_NoKernelFoundError
@@ -317,6 +318,7 @@ def test_residual_family_exports_and_modes():
         "post_norm_residual_pre_norm_bf16",
         "residual_gate_coefficients",
         "try_mhc_shifted_post_pre_norm",
+        "try_mhc_shifted_post_pre_norm_quantize_fp8",
     }
     assert set(_residual_pkg.__all__) == expected_exports
     residual_modes = {
@@ -335,6 +337,7 @@ def test_residual_family_exports_and_modes():
         "mhc_post",
         "mhc_pre",
         "mhc_shifted_post_pre_norm",
+        "mhc_shifted_post_pre_norm_quantize_fp8",
         "normalized_dot_gate",
     }
 
@@ -367,6 +370,7 @@ def test_builtin_moe_specialized_offsets_are_intentional() -> None:
         "gluon_petit_mxfp4_megamoe_apply": Priority.SPECIALIZED + 3,
         "triton_decode_sigmoid_bias_topk": Priority.SPECIALIZED + 1,
         # Prefer packed routing while keeping overlapping Gluon selectable.
+        "triton_kimi3_packed_sigmoid_bias_topk_gfx950": Priority.SPECIALIZED + 1,
         "triton_kimi3_packed_sigmoid_bias_topk_gfx1250": Priority.SPECIALIZED + 1,
     }
     actual_offsets = {
@@ -444,20 +448,12 @@ def _is_hopper_plus(platform: PlatformInfo) -> bool:
     return platform.is_nvidia and platform.arch_version >= ArchVersion(9, 0)
 
 
-def _is_hopper_plus_with_flashmla(platform: PlatformInfo) -> bool:
-    return _is_hopper_plus(platform)
-
-
 def _is_hopper_plus_with_flashmla_prefill(platform: PlatformInfo) -> bool:
     return _is_hopper_plus(platform)
 
 
 def _is_nvidia(platform: PlatformInfo) -> bool:
     return platform.is_nvidia
-
-
-def _is_nvidia_with_dsv4_cuda(platform: PlatformInfo) -> bool:
-    return platform.is_nvidia and _attention_cuda_dsv4.has_fused_qnorm_rope_kv_insert()
 
 
 def _is_nvidia_with_cute_dsl(platform: PlatformInfo) -> bool:
@@ -1002,6 +998,9 @@ def test_gemm_mxfp8_online_activation_signature_uses_quantized_storage() -> None
         ("fp32", False, 1, "gluon_mm_fp8_blockscale_gfx1250"),
         ("fp32", True, 1, "gluon_mm_fp8_blockscale_gfx1250"),
         ("fp32", False, 64, "gluon_mm_fp8_blockscale_gfx1250"),
+        ("fp32", False, 65, "gluon_mm_fp8_blockscale_largem_gfx1250"),
+        ("fp32", True, 4096, "gluon_mm_fp8_blockscale_largem_gfx1250"),
+        ("fp32", False, 8192, "gluon_mm_fp8_blockscale_largem_gfx1250"),
     ],
 )
 def test_public_mm_selects_gfx1250_decode_kernel(
@@ -1021,7 +1020,7 @@ def test_public_mm_selects_gfx1250_decode_kernel(
         pytest.skip(f"{expected_name!r} is not registered (optional backend missing)")
     assert expected_spec.capability.satisfied_by(mi450_platform)
 
-    n, k = 128, 256
+    n, k = 128, 512
     a_dtype = torch.bfloat16 if online else _fp8_dtype()
     a = torch.empty((m, k), dtype=a_dtype)
     b = torch.empty((n, k), dtype=_fp8_dtype())
@@ -2059,150 +2058,6 @@ def _attention_dsv4_selected_i64() -> object:
     )
 
 
-def _attention_dsv4_paged_selected(with_extra: bool, heads: int) -> object:
-    q = torch.empty((2, heads, 512), dtype=torch.bfloat16)
-    swa_cache = torch.empty((2, 64 * 584), dtype=torch.uint8)
-    swa_slots = torch.empty((2, 256), dtype=torch.int32)
-    swa_lens = torch.empty((2,), dtype=torch.int32)
-    attn_sink = torch.empty((heads,), dtype=torch.float32)
-    kwargs = {}
-    if with_extra:
-        kwargs = {
-            "extra_kv_cache": torch.empty((2, 64 * 584), dtype=torch.uint8),
-            "extra_slots": torch.empty((2, 1, 128), dtype=torch.int32),
-            "extra_lens": torch.empty((2,), dtype=torch.int32),
-            "extra_page_size": 64,
-        }
-    return _attention_dsv4_pkg.dsv4_decode(
-        q=q,
-        swa_kv_cache=swa_cache,
-        swa_slots=swa_slots,
-        swa_lens=swa_lens,
-        swa_page_size=64,
-        attn_sink=attn_sink,
-        softmax_scale=512**-0.5,
-        **kwargs,
-    )
-
-
-def _attention_dsv4_paged_selected_swa_only() -> object:
-    return _attention_dsv4_paged_selected(with_extra=False, heads=16)
-
-
-def _attention_dsv4_paged_selected_pro_tp8() -> object:
-    tokens = 6
-    q = torch.empty((tokens, 16, 512), dtype=torch.bfloat16)
-    swa_cache = torch.empty((2, 64 * 584), dtype=torch.uint8)
-    swa_slots = torch.empty((tokens, 128), dtype=torch.int32)
-    swa_lens = torch.empty((tokens,), dtype=torch.int32)
-    extra_cache = torch.empty((16, 64 * 584), dtype=torch.uint8)
-    extra_slots = torch.empty((tokens, 1024), dtype=torch.int32)
-    extra_lens = torch.empty((tokens,), dtype=torch.int32)
-    attn_sink = torch.empty((16,), dtype=torch.float32)
-    return _attention_dsv4_pkg.dsv4_decode(
-        q=q,
-        swa_kv_cache=swa_cache,
-        swa_slots=swa_slots,
-        swa_lens=swa_lens,
-        swa_page_size=64,
-        attn_sink=attn_sink,
-        softmax_scale=512**-0.5,
-        extra_kv_cache=extra_cache,
-        extra_slots=extra_slots,
-        extra_lens=extra_lens,
-        extra_page_size=64,
-    )
-
-
-def _attention_dsv4_paged_selected_pro_tp8_i64() -> object:
-    tokens = 6
-    return _attention_dsv4_pkg.dsv4_decode(
-        q=torch.empty((tokens, 16, 512), dtype=torch.bfloat16),
-        swa_kv_cache=torch.empty((2, 64 * 584), dtype=torch.uint8),
-        swa_slots=torch.empty((tokens, 128), dtype=torch.int32),
-        swa_lens=torch.empty((tokens,), dtype=torch.int32),
-        swa_page_size=64,
-        attn_sink=torch.empty((16,), dtype=torch.float32),
-        softmax_scale=512**-0.5,
-        extra_kv_cache=torch.empty((16, 64 * 584), dtype=torch.uint8),
-        extra_slots=torch.empty((tokens, 1024), dtype=torch.int32),
-        extra_lens=torch.empty((tokens,), dtype=torch.int64),
-        extra_page_size=64,
-    )
-
-
-def _attention_dsv4_swa_cache_insert() -> object:
-    q = torch.empty((1, 2, 512), dtype=torch.bfloat16)
-    kv = torch.empty((1, 512), dtype=torch.bfloat16)
-    cache = torch.empty((1, 64 * 584), dtype=torch.uint8)
-    slot_mapping = torch.zeros((1,), dtype=torch.int64)
-    positions = torch.zeros((1,), dtype=torch.int64)
-    cos_sin_cache = torch.empty((1, 64), dtype=torch.float32)
-    q_out = torch.empty_like(q)
-    return _attention_dsv4_pkg.dsv4_swa_cache_insert(
-        q,
-        kv,
-        cache,
-        slot_mapping,
-        positions,
-        cos_sin_cache,
-        1e-6,
-        64,
-        q_out=q_out,
-        validate_positions=True,
-    )
-
-
-def test_dsv4_swa_cache_insert_can_reuse_prior_position_validation(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A runtime may skip only the redundant position check, not the insert."""
-    calls: list[dict[str, object]] = []
-
-    class _SelectedKernel:
-        name = "test_dsv4_swa_cache_insert"
-
-        def __call__(self, **kwargs):
-            calls.append(kwargs)
-
-    monkeypatch.setattr(
-        _attention_dsv4_pkg,
-        "select_kernel",
-        lambda *args, **kwargs: _SelectedKernel(),
-    )
-    q = torch.empty((1, 2, 512), dtype=torch.bfloat16)
-    kv = torch.empty((1, 512), dtype=torch.bfloat16)
-    cache = torch.empty((1, 584), dtype=torch.uint8)
-    slots = torch.zeros((1,), dtype=torch.int64)
-    positions = torch.ones((1,), dtype=torch.int64)
-    cos_sin_cache = torch.empty((1, 64), dtype=torch.float32)
-
-    with pytest.raises(ValueError, match="positions entries must index"):
-        _attention_dsv4_pkg.dsv4_swa_cache_insert(
-            q,
-            kv,
-            cache,
-            slots,
-            positions,
-            cos_sin_cache,
-            1e-6,
-            1,
-            validate_positions=True,
-        )
-    _attention_dsv4_pkg.dsv4_swa_cache_insert(
-        q,
-        kv,
-        cache,
-        slots,
-        positions,
-        cos_sin_cache,
-        1e-6,
-        1,
-        validate_positions=False,
-    )
-    assert len(calls) == 1
-
-
 def _attention_dsa_decode_fp8_dense_rank128_q4(
     dtype: torch.dtype = torch.float8_e4m3fn,
 ) -> object:
@@ -2704,6 +2559,41 @@ def _attention_dsa_prefill_topk_standard(
         index_k_cache=index_k_cache,
         page_size=64,
         q_scales=q_scales,
+        slot_order="selection",
+    )
+
+
+def _attention_dsa_decode_topk_bf16_plane(
+    index_heads: int, weights_dtype: torch.dtype
+) -> object:
+    return _attention_dsa_pkg.dsa_decode_topk(
+        torch.empty((2, index_heads, 128), dtype=torch.bfloat16),
+        torch.empty((2, index_heads), dtype=weights_dtype),
+        torch.tensor([64, 64], dtype=torch.int32),
+        torch.zeros((2, 1), dtype=torch.int32),
+        page_size=64,
+        topk=512,
+        softmax_scale=1.0,
+        batch_invariant=False,
+        index_k_cache=torch.zeros((128, 128), dtype=torch.bfloat16),
+        slot_order="selection",
+    )
+
+
+def _attention_dsa_prefill_topk_bf16_plane(
+    index_heads: int, weights_dtype: torch.dtype
+) -> object:
+    return _attention_dsa_pkg.dsa_prefill_topk(
+        torch.empty((2, index_heads, 128), dtype=torch.bfloat16),
+        torch.empty((2, index_heads), dtype=weights_dtype),
+        torch.arange(64, dtype=torch.int64),
+        torch.tensor([0, 8], dtype=torch.int32),
+        torch.tensor([8, 16], dtype=torch.int32),
+        topk=512,
+        softmax_scale=1.0,
+        batch_invariant=False,
+        index_k_cache=torch.zeros((128, 128), dtype=torch.bfloat16),
+        page_size=64,
         slot_order="selection",
     )
 
@@ -3668,6 +3558,48 @@ def test_triton_decode_sigmoid_topk_priority_beats_broad_gluon(
     assert triton_spec.priority == Priority.SPECIALIZED + 1
     assert gluon_spec.priority == Priority.SPECIALIZED
     assert selected.name == "triton_decode_sigmoid_bias_topk"
+
+
+def test_gfx950_sigmoid_topk_selects_by_token_count(
+    mi350_platform: PlatformInfo,
+) -> None:
+    registry = KernelRegistry.get()
+    packed_spec = registry.get_by_name("triton_kimi3_packed_sigmoid_bias_topk_gfx950")
+    gluon_spec = registry.get_by_name("gluon_sigmoid_bias_topk_gfx950")
+    if packed_spec is None or gluon_spec is None:
+        pytest.skip("gfx950 sigmoid top-k kernels are unavailable")
+
+    signature = format_signature(
+        router_logits=dense_tensor_format(torch.float32),
+    )
+
+    def select(tokens: int, **kwargs) -> str:
+        return select_kernel(
+            "moe",
+            "sigmoid_bias_topk",
+            signature,
+            traits={"tokens": tokens, "experts": 896, "topk": 16},
+            **kwargs,
+        ).name
+
+    real_platform = Platform.get()
+    try:
+        Platform.override(mi350_platform)
+        registry.clear_cache()
+        decode = select(1)
+        verify = select(4)
+        last_packed = select(512)
+        past_packed = select(513)
+        forced_gluon = select(4, solution="gluon")
+    finally:
+        Platform.override(real_platform)
+        registry.clear_cache()
+
+    assert decode == "triton_decode_sigmoid_bias_topk"
+    assert verify == "triton_kimi3_packed_sigmoid_bias_topk_gfx950"
+    assert last_packed == "triton_kimi3_packed_sigmoid_bias_topk_gfx950"
+    assert past_packed == "gluon_sigmoid_bias_topk_gfx950"
+    assert forced_gluon == "gluon_sigmoid_bias_topk_gfx950"
 
 
 def test_gfx1250_sigmoid_topk_selects_by_token_count(
@@ -5810,33 +5742,6 @@ _CASES = [
         "gluon_dsv41_index_topk_gfx1250",
         partial(_attention_dsv41_index_topk, 32, None, 68),
     ),
-    _case(
-        _is_cdna5,
-        "cdna5",
-        "attention",
-        "dsv4_decode",
-        "gluon_dsv4_decode_gfx1250",
-        _attention_dsv4_paged_selected_pro_tp8,
-        id_suffix="pro-tp8",
-    ),
-    _case(
-        _is_cdna5,
-        "cdna5",
-        "attention",
-        "dsv4_decode",
-        "triton_dsv4_decode",
-        _attention_dsv4_paged_selected_pro_tp8_i64,
-        id_suffix="pro-tp8-int64-metadata",
-    ),
-    _case(
-        _is_cdna5,
-        "cdna5",
-        "attention",
-        "dsv4_decode",
-        "gluon_dsv4_decode_gfx1250",
-        _attention_dsv4_paged_selected_swa_only,
-        id_suffix="swa-only",
-    ),
     *[
         _case(
             _is_hopper_plus_with_flashmla_prefill,
@@ -5846,23 +5751,6 @@ _CASES = [
             f"{solution}_dsv4_prefill",
             partial(_attention_dsv4_selected, width=640, heads=heads),
             id_suffix=f"heads{heads}",
-        )
-        for heads, solution in (
-            (16, "triton"),
-            (32, "triton"),
-            (64, "flashmla"),
-            (128, "flashmla"),
-        )
-    ],
-    *[
-        _case(
-            _is_hopper_plus_with_flashmla,
-            "hopper-plus",
-            "attention",
-            "dsv4_decode",
-            f"{solution}_dsv4_decode",
-            partial(_attention_dsv4_paged_selected, with_extra=True, heads=heads),
-            id_suffix=f"extra-segment-heads{heads}",
         )
         for heads, solution in (
             (16, "triton"),
@@ -5902,14 +5790,6 @@ _CASES = [
         "attn_merge_state",
         "cuda_attn_merge_state",
         _attention_merge_state,
-    ),
-    _case(
-        _is_nvidia_with_dsv4_cuda,
-        "hopper",
-        "attention",
-        "dsv4_swa_cache_insert",
-        "cuda_dsv4_swa_cache_insert",
-        _attention_dsv4_swa_cache_insert,
     ),
     _case(
         _is_blackwell_sm100,
@@ -6050,42 +5930,6 @@ _CASES = [
         _is_cdna4,
         "cdna4",
         "attention",
-        "dsv4_decode",
-        "gluon_dsv4_decode_split_gfx950",
-        _attention_dsv4_paged_selected_pro_tp8,
-        id_suffix="pro-tp8",
-    ),
-    _case(
-        _is_cdna4,
-        "cdna4",
-        "attention",
-        "dsv4_decode",
-        "triton_dsv4_decode",
-        _attention_dsv4_paged_selected_pro_tp8_i64,
-        id_suffix="pro-tp8-int64-metadata",
-    ),
-    _case(
-        _is_cdna4,
-        "cdna4",
-        "attention",
-        "dsv4_decode",
-        "triton_dsv4_decode",
-        partial(_attention_dsv4_paged_selected, with_extra=True, heads=16),
-        id_suffix="extra-segment",
-    ),
-    _case(
-        _is_cdna4,
-        "cdna4",
-        "attention",
-        "dsv4_decode",
-        "triton_dsv4_decode",
-        _attention_dsv4_paged_selected_swa_only,
-        id_suffix="swa-only",
-    ),
-    _case(
-        _is_cdna4,
-        "cdna4",
-        "attention",
         "dsv4_prefill",
         "gluon_dsv4_prefill_gfx950",
         partial(_attention_dsv4_selected, width=640, heads=16),
@@ -6135,14 +5979,6 @@ _CASES = [
         "gluon_dsv4_prefill_gfx1250",
         _attention_dsv4_selected_short,
         id_suffix="width128",
-    ),
-    _case(
-        _is_cdna4,
-        "cdna4",
-        "attention",
-        "dsv4_swa_cache_insert",
-        "triton_dsv4_swa_cache_insert",
-        _attention_dsv4_swa_cache_insert,
     ),
     _case(
         _is_cdna4,
@@ -6545,27 +6381,49 @@ _CASES = [
             "cdna4",
             "attention",
             operation,
-            expected,
+            # FP8 queries take the multi-row scorers; BF16 queries the standard ones.
+            f"gluon_{operation}_{'fp8_rows' if dtype == torch.float8_e4m3fn else 'standard'}"
+            "_gfx950",
             lambda heads=heads, dtype=dtype, layout=layout, invoke=invoke: invoke(
                 heads, dtype, layout
             ),
             id_suffix=(f"h{heads}-{str(dtype).removeprefix('torch.')}-{layout}"),
         )
-        for operation, expected, invoke in (
-            (
-                "dsa_decode_topk",
-                "gluon_dsa_decode_topk_standard_gfx950",
-                _attention_dsa_decode_topk_standard,
-            ),
-            (
-                "dsa_prefill_topk",
-                "gluon_dsa_prefill_topk_standard_gfx950",
-                _attention_dsa_prefill_topk_standard,
-            ),
+        for operation, invoke in (
+            ("dsa_decode_topk", _attention_dsa_decode_topk_standard),
+            ("dsa_prefill_topk", _attention_dsa_prefill_topk_standard),
         )
         for heads in (32, 64)
         for dtype in (torch.bfloat16, torch.float8_e4m3fn)
         for layout in ("packed", "page_planar")
+    ),
+    # A bf16 index-K plane selects only the bf16 scorers.
+    *(
+        _case(
+            _is_cdna4,
+            "cdna4",
+            "attention",
+            operation,
+            expected,
+            partial(invoke, heads, weights_dtype),
+            id_suffix=(
+                f"bf16-plane-h{heads}-w{str(weights_dtype).removeprefix('torch.')}"
+            ),
+        )
+        for operation, expected, invoke in (
+            (
+                "dsa_decode_topk",
+                "gluon_dsa_decode_topk_bf16_gfx950",
+                _attention_dsa_decode_topk_bf16_plane,
+            ),
+            (
+                "dsa_prefill_topk",
+                "gluon_dsa_prefill_topk_bf16_gfx950",
+                _attention_dsa_prefill_topk_bf16_plane,
+            ),
+        )
+        for heads in (32, 64)
+        for weights_dtype in (torch.bfloat16, torch.float32)
     ),
     _case(
         _is_cdna4,
@@ -7025,18 +6883,18 @@ _CASES = [
             "cdna5",
             "moe",
             "topk",
-            "triton_sqrt_softplus_topk",
+            "gluon_sqrt_softplus_topk_gfx1250",
             partial(_moe_topk_bias, tokens=tokens),
             id_suffix=f"bias-tokens{tokens}",
         )
-        for tokens in (1, 2, 17)
+        for tokens in (1, 2, 17, 8192)
     ],
     _case(
         _is_cdna5,
         "cdna5",
         "moe",
         "topk",
-        "triton_sqrt_softplus_topk",
+        "gluon_sqrt_softplus_topk_gfx1250",
         _moe_topk_hash,
         id_suffix="hash",
     ),
@@ -7839,17 +7697,18 @@ def test_attn_merge_state_routes_to_triton_on_cdna4(
 
 
 @pytest.mark.parametrize(
-    ("entrypoint_name", "implementation_name"),
+    ("entrypoint_name", "implementation_name", "forwards_warmup"),
     [
-        ("gluon_dsa_prefill_gfx950", "_dsa_prefill_impl"),
-        ("gluon_dsa_prefill_fp8_dense_gfx950", "_dsa_prefill_impl"),
-        ("gluon_dsa_prefill_gfx1250", "_dsa_prefill_gfx1250_impl"),
-        ("gluon_dsa_prefill_fp8_dense_gfx1250", "_dsa_prefill_gfx1250_impl"),
+        ("gluon_dsa_prefill_gfx950", "_dsa_prefill_impl", True),
+        ("gluon_dsa_prefill_fp8_dense_gfx950", "_dsa_prefill_impl", True),
+        ("gluon_dsa_prefill_gfx1250", "_dsa_prefill_gfx1250_impl", False),
+        ("gluon_dsa_prefill_fp8_dense_gfx1250", "_dsa_prefill_gfx1250_impl", False),
     ],
 )
 def test_gluon_dsa_prefill_adapters_drop_unused_kv_seq_lens(
     entrypoint_name: str,
     implementation_name: str,
+    forwards_warmup: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     entrypoint = getattr(_attention_gluon_dsa, entrypoint_name, None)
@@ -7867,10 +7726,15 @@ def test_gluon_dsa_prefill_adapters_drop_unused_kv_seq_lens(
     monkeypatch.setattr(_attention_gluon_dsa, implementation_name, fake_impl)
 
     marker = object()
-    result = entrypoint(marker=marker, kv_seq_lens=object())
+    for warming_up in (False, True):
+        forwarded.clear()
+        with kernel_warmup(enabled=warming_up):
+            result = entrypoint(marker=marker, kv_seq_lens=object())
 
-    assert result is expected
-    assert forwarded == {"marker": marker}
+        assert result is expected
+        # The gfx950 launcher prepares its split variants during warmup.
+        warmup = {"warm_split_variants": warming_up} if forwards_warmup else {}
+        assert forwarded == {"marker": marker, **warmup}
 
 
 @pytest.mark.parametrize(
@@ -8237,3 +8101,83 @@ def test_kernel_api_selection(
         registry.clear_cache()
 
     assert calls == [case.expected]
+
+
+def test_fa3_declares_sinks_from_the_installed_signature(
+    h100_platform: PlatformInfo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An FA3 build without ``sinks`` must not advertise sink support.
+
+    Attention sinks reached FA3 after these entry points stabilized. When the
+    installed build takes no ``sinks`` argument, the kernels have to declare
+    ``sinks=False`` so selection skips them for a sink-bearing graph; declaring
+    True would hand the leaf a graph it cannot serve and fail on an unexpected
+    keyword inside ``flash_attn_with_kvcache``. Reaching the leaf anyway (a
+    caller bypassing selection) must raise rather than silently compute
+    sink-free attention.
+    """
+    if (
+        not Platform.get().is_nvidia
+        or importlib.util.find_spec("flash_attn_interface") is None
+    ):
+        pytest.skip("FA3 registration simulation requires NVIDIA FA3")
+
+    # The has_sinks=True half substitutes nothing: it reads the installed
+    # signature, so it only means anything on a build that takes `sinks`. On an
+    # older build both halves probe False and the assertion below reports the
+    # environment rather than the declaration under test.
+    import inspect as _fa3_inspect
+
+    import flash_attn_interface as _installed_fa3
+
+    if (
+        "sinks"
+        not in _fa3_inspect.signature(_installed_fa3.flash_attn_with_kvcache).parameters
+    ):
+        pytest.skip("the installed FA3 build takes no `sinks` argument")
+
+    real_platform = Platform.get()
+    real_registry = KernelRegistry.get()
+    import flash_attn_interface
+
+    sink_modes = ("fa3_mha_prefill", "fa3_mha_extend_with_kvcache")
+    decode = "fa3_mha_decode_with_kvcache"
+
+    def sinkless_with_kvcache(**kwargs):
+        # The older build's signature: no `sinks` parameter at all.
+        raise AssertionError("the sinkless probe must not be launched")
+
+    try:
+        Platform.override(h100_platform)
+        for has_sinks in (True, False):
+            KernelRegistry.reset()
+            with monkeypatch.context() as patch:
+                if not has_sinks:
+                    patch.setattr(
+                        flash_attn_interface,
+                        "flash_attn_with_kvcache",
+                        sinkless_with_kvcache,
+                    )
+                importlib.reload(_attention_flash_attn)
+                assert _attention_flash_attn._FA3_HAS_SINKS is has_sinks
+                registry = KernelRegistry.get()
+                for name in (*sink_modes, decode):
+                    spec = registry.get_by_name(name)
+                    assert spec is not None, name
+                    assert spec.traits["sinks"] == (
+                        frozenset({False, True}) if has_sinks else frozenset({False})
+                    ), name
+                # A sink that reaches the leaf anyway is named, not dropped.
+                kwargs = _attention_flash_attn._fa3_sink_kwargs
+                assert kwargs(None) == ({"sinks": None} if has_sinks else {})
+                if has_sinks:
+                    sinks = torch.empty((4,), dtype=torch.float32, device="meta")
+                    assert kwargs(sinks) == {"sinks": sinks}
+                else:
+                    with pytest.raises(ValueError, match="takes no attention sinks"):
+                        kwargs(torch.empty((4,), dtype=torch.float32, device="meta"))
+    finally:
+        Platform.override(real_platform)
+        KernelRegistry._instance = real_registry
+        importlib.reload(_attention_flash_attn)

@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from test.ci_system.ci_register import register_cuda_ci
 from types import SimpleNamespace
 
 import pytest
+
+register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 pytest.importorskip("tokenspeed_scheduler")
 
@@ -29,8 +32,10 @@ def _make_config(*, prefix_replay_tokens: int | None = None):
         enable_l3_storage=False,
         role="fused",
         num_snapshot_pages=1,
+        host_group_packing=(),
         max_retracted_requests=0,
         host_write_policy="write_through",
+        prefill_decode_interval=0,
         storage_config=None,
         **kwargs,
     )
@@ -145,8 +150,10 @@ def test_make_config_preserves_explicit_l3_storage(enable_l3_storage: bool) -> N
         enable_l3_storage=enable_l3_storage,
         role="fused",
         num_snapshot_pages=1,
+        host_group_packing=(),
         max_retracted_requests=0,
         host_write_policy="write_through",
+        prefill_decode_interval=0,
         storage_config=(
             StorageRuntimeConfig.from_extra_config(
                 None, host_blocks=7, prefix_granularity=2

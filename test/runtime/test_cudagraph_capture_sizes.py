@@ -42,7 +42,13 @@ from tokenspeed.runtime.execution.model_executor import (  # noqa: E402
 )
 
 
-def _config(sizes: list[int], *, max_num_seqs: int, max_capture: int):
+def _config(
+    sizes: list[int] | None,
+    *,
+    max_num_seqs: int,
+    max_capture: int,
+    disable_padding: bool = False,
+):
     return ModelExecutorConfig(
         max_req_pool_size=max_num_seqs + 1,
         output_length=1,
@@ -50,6 +56,7 @@ def _config(sizes: list[int], *, max_num_seqs: int, max_capture: int):
         prefix_granularity=128,
         max_num_seqs=max_num_seqs,
         chunked_prefill_size=4096,
+        input_vocab_size=32,
         vocab_size=32,
         context_len=4096,
         physical_context_len=4096,
@@ -57,7 +64,7 @@ def _config(sizes: list[int], *, max_num_seqs: int, max_capture: int):
         gpu_id=0,
         global_rank=0,
         cudagraph_capture_sizes=sizes,
-        disable_cuda_graph_padding=False,
+        disable_cuda_graph_padding=disable_padding,
         spec_topk=1,
         max_cudagraph_capture_size=max_capture,
         model_is_mrope=False,
@@ -71,6 +78,7 @@ def _config(sizes: list[int], *, max_num_seqs: int, max_capture: int):
         query_shard_rank=0,
         prefill_graph_max_tokens=256,
         enable_memory_saver=False,
+        enable_drafter_prefill_graph=False,
     )
 
 
@@ -90,3 +98,27 @@ def test_the_ladder_ascends_whatever_order_the_sizes_come_in(
 ) -> None:
     config = _config(sizes, max_num_seqs=max_num_seqs, max_capture=max_capture)
     assert get_batch_sizes_to_capture(config) == ladder
+
+
+@pytest.mark.parametrize(
+    "disable_padding,max_capture,top",
+    [
+        # Padded: every 16 past the default's 160, ending on the cap.
+        (False, 200, [152, 160, 176, 192, 200]),
+        (False, 256, [160, 176, 192, 208, 224, 240, 256]),
+        # Unpadded: every 32, like the default's own top.
+        (True, 256, [128, 160, 192, 224, 256]),
+        # At the default cap the default ladder is unchanged.
+        (False, 160, [144, 152, 160]),
+    ],
+)
+def test_the_default_ladder_reaches_a_capture_cap_above_160(
+    disable_padding, max_capture, top
+) -> None:
+    config = _config(
+        None,
+        max_num_seqs=256,
+        max_capture=max_capture,
+        disable_padding=disable_padding,
+    )
+    assert get_batch_sizes_to_capture(config)[-len(top) :] == top

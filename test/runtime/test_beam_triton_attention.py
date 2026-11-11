@@ -189,7 +189,6 @@ class _RuntimeMixedAttention:
                 dtype=torch.bfloat16,
                 kv_cache_dtype=torch.bfloat16,
                 kv_cache_quant_method="none",
-                prefix_granularity=16,
                 context_len=1024,
                 max_bs=3,
                 speculative_num_draft_tokens=width,

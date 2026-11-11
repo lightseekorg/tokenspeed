@@ -67,6 +67,21 @@ def is_block_drafter(speculative_algorithm: str | None, is_draft: bool) -> bool:
     return bool(is_draft and speculative_algorithm in ("DFLASH", "DSPARK"))
 
 
+def block_draft_is_causal(hf_config) -> bool:
+    """Whether a block draft's queries attend causally within their block.
+
+    Only an explicit declaration makes a block causal: ``is_causal``, else
+    ``dflash_config.causal`` (Kimi-K3.1's DSpark draft). A draft declaring
+    neither (Kimi-K3 DSpark) attends the whole block; ``sliding_attention``
+    layers only bound how far back a query reads.
+    """
+    is_causal = getattr(hf_config, "is_causal", None)
+    if is_causal is not None:
+        return bool(is_causal)
+    dflash_config = getattr(hf_config, "dflash_config", None) or {}
+    return bool(dflash_config.get("causal", False))
+
+
 def resolve_cache_layer_types(
     hf_config,
     *,
@@ -127,6 +142,10 @@ class SoftmaxAttnConfig(AttnComponentSpec):
     """Base of the softmax-attention families (MHA / MLA / DSA / MSA)."""
 
     is_dsa: ClassVar[bool] = False
+    # Whether this family stores a latent KV page (MLA and its DSA variant) as
+    # opposed to K/V head rows (MHA, MSA). A draft of the latter kind plans an
+    # attention family of its own beside an MLA target.
+    is_latent_kv: ClassVar[bool] = False
 
     num_attention_heads: int
     num_kv_heads: int
@@ -173,11 +192,11 @@ class AttnConfig:
     kv_cache_quant_method: str
     # MXFP8 KV: UE8M0 vec-32 scale sidecar in pool buffers; kv_cache_dtype alone can't express it
     kv_cache_mxfp8: bool = False
-    # Scheduler prefix granularity (CLI --block-size): the identity axis.
-    prefix_granularity: int
     # Tokens covered by one attention-kernel page. None picks the backend's
-    # per-kernel default (flexible kernels use the prefix granularity;
-    # fixed-page kernels use their own constant).
+    # per-kernel default (flexible kernels use their group's block
+    # granularity; fixed-page kernels use their own constant). For the
+    # ordinary families the registry pins a fixed-page leaf's constant here
+    # before planning, so the recipe sizes its block span to hold whole pages.
     kernel_page_size: int | None = None
     # Physical per-request KV extent: the model's logical context_len plus
     # ServerArgs.spec_context_pad (spec verify overshoot for a finished request
@@ -195,6 +214,8 @@ class AttnConfig:
     # per request) instead of Eagle/MTP's per-step single-token decode. Backends
     # use this to expand decode metadata to spec_num_tokens rows per request.
     draft_block_decode: bool = False
+    # Causal within a block draft; otherwise every query sees the whole block.
+    draft_block_causal: bool = False
     # KV parallelism (page-cyclic KV page sharding over a consecutive subgroup
     # of attention TP): one topology for target and continuation/MTP views;
     # KVP does not add ranks. Decode attends the owned pages and merges the
@@ -202,8 +223,8 @@ class AttnConfig:
     kvp_size: int = 1
     kvp_rank: int = 0
     kvp_group: tuple[int, ...] = (0,)
-    # Query context parallelism: the extend rows this rank computes are a
-    # contiguous shard of the chunk; the group is the attention TP group.
+    # Query context parallelism: each rank computes early and late segments
+    # of every request; the group is the attention TP group.
     qcp_size: int = 1
     qcp_rank: int = 0
     qcp_group: tuple[int, ...] = (0,)
@@ -222,18 +243,25 @@ class AttnConfig:
             raise ValueError("INT8 KV cache is not supported by the runtime")
         if self.qcp_size > 1:
             softmax = softmax_components[0]
-            # The gathered-history extend arm exists on the GPU DSA leaf only;
-            # every other leaf rejects a query shard at its metadata build.
-            if not (softmax.is_dsa and softmax.backend_name in (None, "dsa")):
+            # DSA gathers paged history; V4.1 publishes its packed KV from
+            # gathered projections and keeps full logical metadata.
+            is_v41 = softmax.backend_name == "deepseek_v41"
+            if not (
+                is_v41 or (softmax.is_dsa and softmax.backend_name in (None, "dsa"))
+            ):
                 raise ValueError(
-                    "query context parallelism requires GPU DSA attention; "
+                    "query context parallelism requires GPU DSA or V4.1 attention; "
                     f"got {softmax.backend_name!r}"
                 )
+            if not is_v41 and self.qcp_size != self.kvp_size:
+                raise ValueError(
+                    "DSA query context parallelism requires KVP equal to QCP"
+                )
             if torch.device(self.device).type != "cuda":
-                raise ValueError("GPU DSA query context parallelism requires CUDA")
+                raise ValueError("GPU query context parallelism requires CUDA")
             # The sharded KV write gathers the rotated latent and stores it
             # with latent_store, which writes native (bf16) rows only.
-            if (
+            if not is_v41 and (
                 self.kv_cache_dtype is not torch.bfloat16
                 or self.kv_cache_mxfp8
                 or self.kv_cache_quant_method != "none"
@@ -245,6 +273,21 @@ class AttnConfig:
                 )
         if self.kvp_size > 1:
             softmax = softmax_components[0]
+            if self.is_draft and not softmax.is_latent_kv:
+                # A block drafter of its own attention family (DFlash: a GQA
+                # stack storing K/V head rows) shares the target's full-history
+                # group (check_block_drafter_storage), so page-sharding that
+                # group puts head-partitioned K/V inside a sharded group, which
+                # PD refuses to transfer (ts-pd layout/route.rs). Refused here,
+                # at startup, not per request once traffic arrives.
+                raise ValueError(
+                    "--kv-parallel-size > 1 page-shards the cache group a "
+                    "block drafter shares with the target, but this draft "
+                    "stores K/V head rows, which PD cannot transfer from a "
+                    "page-sharded group; launch with --kv-parallel-size 1 "
+                    "(and --query-context-parallel-size 1), or use a draft "
+                    "that plans the target's own attention"
+                )
             if softmax.backend_name == "flashmla":
                 if torch.device(self.device).type != "cuda":
                     raise ValueError("FlashMLA DCP decode requires CUDA")
@@ -296,13 +339,19 @@ def model_wide_kwargs(
     kv_cache_dtype: torch.dtype,
     kv_cache_mxfp8: bool = False,
     draft_block_decode: bool = False,
+    draft_block_causal: bool = False,
     speculative_num_draft_tokens: int | None = None,
+    shards_query_context: bool = False,
 ) -> dict:
     """The AttnConfig fields shared by every family's generate().
 
     The softmax family passes in the facts its policies decide (cache dtype,
     block-decode mode, and — for families that bypass the DSpark width
     convention — the raw speculative width).
+
+    ``shards_query_context`` says whether this family can compute a query
+    context parallel shard (GPU DSA through the MLA config, and V4.1). It only
+    affects a draft config; ``__post_init__`` refuses a target that cannot shard.
     """
     kwargs = dict(
         device=server_args.device,
@@ -310,22 +359,28 @@ def model_wide_kwargs(
         kv_cache_dtype=kv_cache_dtype,
         kv_cache_mxfp8=kv_cache_mxfp8,
         kv_cache_quant_method=server_args.kv_cache_quant_method,
-        prefix_granularity=server_args.prefix_granularity,
         context_len=model_config.context_len + server_args.spec_context_pad,
         max_bs=server_args.max_num_seqs
         // (server_args.data_parallel_size or server_args.mapping.attn.dp_size),
         pd_disaggregation_enabled=server_args.disaggregation_mode != "null",
         is_draft=is_draft,
         draft_block_decode=draft_block_decode,
+        draft_block_causal=draft_block_causal,
     )
     attn_mapping = server_args.mapping.attn
+    # QCP shards the target's extend rows. A draft takes that shard only when it
+    # plans the target's own sharded attention (an MTP depth). A draft with its
+    # own ordinary attention is handed the rows the target computed and runs
+    # over them whole (the DFlash drafter builds its logits metadata with
+    # ``query_shard=None``), so it is configured unsharded.
+    draft_unsharded = is_draft and not shards_query_context
     kwargs.update(
         kvp_size=attn_mapping.kvp_size,
         kvp_rank=attn_mapping.kvp_rank,
         kvp_group=attn_mapping.kvp_group,
-        qcp_size=attn_mapping.qcp_size,
-        qcp_rank=attn_mapping.qcp_rank,
-        qcp_group=attn_mapping.qcp_group,
+        qcp_size=1 if draft_unsharded else attn_mapping.qcp_size,
+        qcp_rank=0 if draft_unsharded else attn_mapping.qcp_rank,
+        qcp_group=(0,) if draft_unsharded else attn_mapping.qcp_group,
     )
     if server_args.speculative_algorithm is not None:
         kwargs.update(

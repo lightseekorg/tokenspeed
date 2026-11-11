@@ -28,6 +28,7 @@ from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.model_executor import ModelExecutor
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+from tokenspeed.runtime.layers.logits_processor_output import LogitsProcessorOutput
 
 
 class _RuntimeStates:
@@ -192,13 +193,8 @@ def test_draft_final_step_follows_the_complete_drafter_run():
         audit_logits=lambda *_args: None,
         merge_oov=lambda *_args: None,
     )
-    executor._run_target_forward = lambda *_args: SimpleNamespace(
-        next_token_logprobs=None,
-        input_token_logprobs=None,
-        input_top_logprobs_val=None,
-        input_top_logprobs_idx=None,
-        sampled_top_logprobs_val=None,
-        sampled_top_logprobs_idx=None,
+    executor._run_target_forward = lambda *_args: LogitsProcessorOutput(
+        next_token_logits=torch.zeros((1, 32)),
     )
     executor._run_sampling = lambda *_args: (
         torch.tensor([3], dtype=torch.int32),

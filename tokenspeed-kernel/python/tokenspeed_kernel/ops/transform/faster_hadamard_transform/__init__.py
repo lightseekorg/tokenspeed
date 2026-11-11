@@ -21,14 +21,16 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel._optional import has_optional_package
 from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
-from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 platform = current_platform()
+fast_hadamard_transform = error_fn
 
 
-if platform.is_nvidia:
+if platform.is_nvidia and has_optional_package("fast_hadamard_transform"):
     from fast_hadamard_transform import hadamard_transform
 
     @register_kernel(

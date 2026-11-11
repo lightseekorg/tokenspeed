@@ -31,6 +31,7 @@ from tokenspeed.runtime.configs.numerics import NUMERICS_ENVELOPES
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.configs.model_config import ModelConfig
+    from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
@@ -41,8 +42,9 @@ class ModelProfile:
     A registered model class exposes ``model_profile(hf_config)`` as a
     classmethod returning one of these. ``ModelConfig`` resolves it once, and
     every resolver that would otherwise match the architecture name against a
-    table reads the profile instead. Every field is explicit: a profile that
-    omits a fact is a construction error, never a silent fallback.
+    table reads the profile instead. Required facts are explicit. Optional
+    history lookback defaults to the complete history, preserving readers
+    that declare no bound.
 
     Attributes:
         configure_attention: Writes the attention geometry onto the
@@ -53,15 +55,23 @@ class ModelProfile:
             under ``server_args.numerics``, say); the in-tree hooks read none
             of it.
         cache_family: Registered cache recipe and pool family that owns this
-            model's per-request state.
+            model's per-request state, or None to derive it from the built
+            attention config. None is for a draft whose family must follow the
+            target's pool (an ordinary MHA view under an ordinary target, the
+            target's own recipe under a custom family); declaring one there
+            would contradict a custom target family and be refused. A target
+            model names its family.
         linear_attention: Registered linear-attention backend serving the
             model's linear layers, or None for a model without them.
         default_attention_backend: Attention backend used when the launch
             names none, or None to keep the architecture default.
-        default_prefix_granularity: Prefix granularity used when the launch
-            keeps the server default, or None to keep that default.
         request_token_history: Whether the model reads each request's
             committed token history (``ForwardContext.request_token_history``).
+        request_token_history_lookback: Committed tokens behind the write
+            frontier the model reads (an n-gram hash reads its order minus
+            one), so a resuming extend seeds only that tail of its prefix.
+            Omitting it (None) preserves the complete history. Zero means the
+            model reads no committed tokens behind the frontier.
         is_multimodal: Whether this checkpoint has an active-capable media encoder.
         tokenizer_kwargs: Extra keyword arguments for the model's tokenizer.
         attention_instances_per_layer: Attention modules per decoder layer:
@@ -74,22 +84,51 @@ class ModelProfile:
             only once the bitwise invariance harness and the teacher-forced
             logprob comparison against the trainer pass for it; launching an
             unlisted envelope is refused.
+        create_attention_config: Model-owned construction of the
+            softmax attention configuration from the resolved launch, model
+            config, and draft flag. Explicitly pass None to keep the
+            architecture's generator.
+            Returns an ``AttnConfig``; the runtime adds the profile's linear
+            component afterwards. The factory owns validation of its cache
+            format and execution constraints; its errors are not retried
+            through the architecture's generator.
     """
 
     configure_attention: Callable[[ModelConfig, ServerArgs], None]
-    cache_family: str
+    cache_family: str | None
     linear_attention: str | None
     default_attention_backend: str | None
-    default_prefix_granularity: int | None
     request_token_history: bool
     is_multimodal: bool
     tokenizer_kwargs: Mapping[str, object]
     attention_instances_per_layer: int
     numerics_envelopes: frozenset[str]
+    create_attention_config: (
+        Callable[[ServerArgs, ModelConfig, bool], AttnConfig] | None
+    )
+    request_token_history_lookback: int | None = None
 
     def __post_init__(self) -> None:
-        if not self.cache_family:
-            raise ValueError("ModelProfile.cache_family must name a cache family")
+        if self.create_attention_config is not None and not callable(
+            self.create_attention_config
+        ):
+            raise TypeError(
+                "ModelProfile.create_attention_config must be callable or None"
+            )
+        if self.request_token_history_lookback is not None and (
+            not self.request_token_history
+            or type(self.request_token_history_lookback) is not int
+            or self.request_token_history_lookback < 0
+        ):
+            raise ValueError(
+                "ModelProfile.request_token_history_lookback needs a model that "
+                "reads request token history and a non-negative integer count"
+            )
+        if self.cache_family is not None and not self.cache_family:
+            raise ValueError(
+                "ModelProfile.cache_family must name a cache family, or be None "
+                "to derive it from the attention config"
+            )
         if self.linear_attention == "":
             raise ValueError("ModelProfile.linear_attention must be None or a name")
         if self.attention_instances_per_layer < 1:
@@ -105,13 +144,6 @@ class ModelProfile:
                 f"only {list(NUMERICS_ENVELOPES)}, got {sorted(envelopes)}"
             )
         object.__setattr__(self, "numerics_envelopes", envelopes)
-        if self.default_prefix_granularity is not None and (
-            self.default_prefix_granularity <= 0
-        ):
-            raise ValueError(
-                "ModelProfile.default_prefix_granularity must be positive, got "
-                f"{self.default_prefix_granularity}"
-            )
         # Profiles are shared by every ModelConfig of the model; keep the one
         # mutable field read-only so no consumer can edit it for the others.
         object.__setattr__(
@@ -119,4 +151,22 @@ class ModelProfile:
         )
 
 
-__all__ = ["ModelProfile"]
+def resolve_history_seed_lookback(*profiles: ModelProfile | None) -> int | None:
+    """Bound seeds for all history readers, including the draft model.
+
+    Unprofiled models and profiles that read no history add no requirement.
+    Any reader without a declared bound requires the complete prefix;
+    otherwise the largest lookback covers every reader. No readers returns
+    None, with history allocation and seeding still disabled by the caller.
+    """
+    lookbacks = [
+        profile.request_token_history_lookback
+        for profile in profiles
+        if profile is not None and profile.request_token_history
+    ]
+    if not lookbacks or any(value is None for value in lookbacks):
+        return None
+    return max(value for value in lookbacks if value is not None)
+
+
+__all__ = ["ModelProfile", "resolve_history_seed_lookback"]

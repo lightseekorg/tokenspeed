@@ -16,7 +16,7 @@
 # SOFTWARE.
 from __future__ import annotations
 
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import torch
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
@@ -26,6 +26,9 @@ from tokenspeed_kernel.signature import (
     dense_tensor_format,
     format_signature,
 )
+
+if TYPE_CHECKING:
+    from tokenspeed_kernel.ops.moe._cute_dsl.latent_down import MailboxPublish
 
 __all__ = [
     "quantize_fp8",
@@ -76,24 +79,34 @@ def rmsnorm_quantize_fp8_group32(
     weight: torch.Tensor,
     eps: float,
     *,
+    scale_layout: Literal["canonical", "swizzled", "packed"],
     override: str | None,
     solution: str | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Normalize BF16 [M,K] rows and quantize them with exact group-32 scales.
 
     Quantization preserves the 1e-4 amax floor and the BF16 normalization
-    boundary. Multiple GEMMs can share the codes and scales.
+    boundary. Multiple GEMMs can share the codes and scales, so every consumer
+    must read the layout asked for here.
 
     Args:
         x: BF16 rows ``[M, K]`` with unit inner stride; K divisible by 32.
         weight: Contiguous BF16 RMSNorm weight ``[K]`` on x's device.
         eps: Positive epsilon added to the row mean square.
+        scale_layout: Layout the scales are written in. ``"canonical"`` is the
+            only one a caller can select rows of. ``"swizzled"`` is
+            FlashInfer's F8_128x4 layout, which ``mm(prepacked_scales=True)``
+            reads without repacking. ``"packed"`` is the MN-major int32 layout
+            ``fp8_projection`` reads, and needs K divisible by 128.
         override: Optional exact registered kernel name.
         solution: Optional registered solution name.
 
     Returns:
-        BF16 normalized rows ``[M, K]``, E4M3 codes ``[M, K]`` and canonical
-        uint8 UE8M0 scales ``[M, K/32]``.
+        BF16 normalized rows ``[M, K]``, E4M3 codes ``[M, K]`` and the scales:
+        canonical uint8 ``[M, K/32]``; swizzled 1-D uint8 F8_128x4 bytes for
+        ``M`` rows padded to 128 and ``K/32`` scale columns padded to 4, the
+        padding zero; or packed int32 ``[M, K/128]`` words, each four UE8M0
+        bytes little-endian, strided ``(1, M padded to 4)``.
     """
     kernel = select_kernel(
         "quantization",
@@ -103,7 +116,7 @@ def rmsnorm_quantize_fp8_group32(
         override=override,
         solution=solution,
     )
-    return kernel(x, weight, eps)
+    return kernel(x, weight, eps, scale_layout=scale_layout)
 
 
 def silu_and_mul_quantize_fp8_group32(
@@ -827,6 +840,7 @@ def rmsnorm_nvfp4_quant(
     global_scale: torch.Tensor,
     mailbox_sentinel: int | None,
     enable_pdl: bool,
+    mailbox_publish: MailboxPublish | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """RMSNorm a BF16 row and quantize it to NVFP4 in one launch.
 
@@ -851,6 +865,8 @@ def rmsnorm_nvfp4_quant(
         mailbox_sentinel: The 32-bit word ``x`` is armed with, whose 16-bit
             halves agree, or None for an ordinary tensor.
         enable_pdl: Enable NVIDIA programmatic dependent launch.
+        mailbox_publish: This rank's block for the kernel to store into the
+            mailbox before it polls, or None when the producer stored it.
 
     Returns:
         ``(packed, scales)``: E2M1 pairs as ``uint8 [rows, width // 2]`` and
@@ -869,6 +885,7 @@ def rmsnorm_nvfp4_quant(
         global_scale,
         mailbox_sentinel,
         enable_pdl,
+        mailbox_publish,
     )
 
 

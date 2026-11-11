@@ -82,7 +82,6 @@ def _backend():
         dtype=torch.bfloat16,
         kv_cache_dtype=torch.bfloat16,
         kv_cache_quant_method="none",
-        prefix_granularity=128,
         context_len=4096,
         max_bs=8,
         is_draft=False,
@@ -210,7 +209,7 @@ def test_outer_graph_replays_mamba2_lengths_pages_and_states(batch_size):
     initial_conv, initial_states = conv.clone(), states.clone()
     raw = torch.randn(bucket, channels, device="cuda", dtype=torch.bfloat16)
     backend = _backend()
-    backend._layer_state = lambda layer_id: (
+    backend.layer_state = lambda layer_id: (
         backend.forward_metadata.state_in_blocks_by_group["state"],
         backend.forward_metadata.state_out_blocks_by_group["state"],
         conv,
@@ -288,8 +287,7 @@ def test_outer_graph_replays_mamba2_lengths_pages_and_states(batch_size):
     owner._handoff_storage, owner._outputs = {}, None
     owner._captures = {}
     owner.input_buffers = SimpleNamespace(input_ids_buf=torch.ones(bucket))
-    owner._embed_tokens = lambda ids: ids
-    owner._land_input_embeds = lambda *args: None
+    owner._input_embeds_buf = torch.empty(bucket, 1)
     owner.attn_backend = backend
     owner._run_inner = lambda bucket: (forward(), None)
 

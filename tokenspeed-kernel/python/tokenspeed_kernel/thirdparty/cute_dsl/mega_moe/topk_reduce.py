@@ -94,15 +94,17 @@ class TopkReduce:
     ``__init__`` pins the static shape and format (and the derived launch
     geometry); ``__call__`` (a ``@cute.jit`` launcher) sizes a 1D grid from the
     runtime token count and dispatches the format's kernel. The caller owns the
-    torch->cute conversion and the ``cute.compile``.
+    torch->cute conversion and the ``cute.compile``. The required
+    ``bf16_hidden_per_thread`` selects 2, 4, or 8 BF16 elements per worker.
+    Quantized formats retain their fixed widths from the format table.
     """
 
     _threads: ClassVar[int] = 128
-    # combine_format.name -> hidden elements per worker (one LDG of data:
-    # bf16 8*2B=16B, e4m3 16*1B=16B, e2m1 16*0.5B=8B). For quantized formats this
-    # stays <= the scale block, so each worker reads exactly one scale entry.
-    _hidden_per_thread: ClassVar[Dict[str, int]] = {
-        "bf16": 8,
+    # Hidden elements per worker the BF16 reducer can be built with.
+    bf16_hidden_per_thread_options: ClassVar[tuple[int, ...]] = (2, 4, 8)
+    # Quantized payload widths stay within one scale block per worker.
+    # BF16 uses the explicit constructor argument instead.
+    _quantized_hidden_per_thread: ClassVar[Dict[str, int]] = {
         "32e4m3xe8m0": 16,
         "16e2m1xbf16": 16,
     }
@@ -111,12 +113,30 @@ class TopkReduce:
     _prefetch_limit: ClassVar[int] = 16
 
     def __init__(
-        self, hidden: int, num_topk: int, combine_format: CombineFormat
+        self,
+        hidden: int,
+        num_topk: int,
+        combine_format: CombineFormat,
+        *,
+        bf16_hidden_per_thread: int,
     ) -> None:
         self.hidden = int(hidden)
         self.num_topk = int(num_topk)
         self.combine_format = combine_format
-        self.hidden_per_thread = self._hidden_per_thread[combine_format.name]
+        self.bf16_hidden_per_thread = bf16_hidden_per_thread
+        if (
+            not isinstance(bf16_hidden_per_thread, int)
+            or bf16_hidden_per_thread not in self.bf16_hidden_per_thread_options
+        ):
+            raise ValueError(
+                "bf16_hidden_per_thread must be one of "
+                f"{self.bf16_hidden_per_thread_options}, got {bf16_hidden_per_thread}"
+            )
+        self.hidden_per_thread = (
+            self._quantized_hidden_per_thread[combine_format.name]
+            if combine_format.is_quantized
+            else bf16_hidden_per_thread
+        )
         # hidden must tile cleanly both into worker slices and into scale blocks.
         align = max(
             combine_format.scale_block or self.hidden_per_thread, self.hidden_per_thread
@@ -241,6 +261,55 @@ class TopkReduce:
         reduced_output: cute.Tensor,
     ):
         threads = self._threads
+        worker_idx = (
+            cute.arch.block_idx()[0] * Int32(threads) + cute.arch.thread_idx()[0]
+        )
+        self.reduce_bf16_worker(
+            combine_output,
+            topk_score,
+            reduced_output,
+            worker_idx,
+            normalize_layout=False,
+        )
+
+    @cute.jit
+    def reduce_bf16_worker(
+        self,
+        combine_output: cute.Tensor,
+        topk_score: Optional[cute.Tensor],
+        reduced_output: cute.Tensor,
+        worker_idx: Int32,
+        *,
+        normalize_layout: cutlass.Constexpr[bool],
+    ):
+        """Reduce one hidden slice with the standalone kernel's FP32 order.
+
+        The caller supplies a flat worker index. This helper has no barriers and
+        can run on an existing kernel's workers after all combine stores finish.
+        Inline callers normalize static model dimensions. Standalone inputs
+        already carry those layouts and keep them unchanged.
+        """
+        if cutlass.const_expr(normalize_layout):
+            combine_output = cute.make_tensor(
+                combine_output.iterator,
+                cute.make_layout(
+                    (combine_output.shape[0], self.num_topk, self.hidden),
+                    stride=combine_output.stride,
+                ),
+            )
+            reduced_output = cute.make_tensor(
+                reduced_output.iterator,
+                cute.make_layout(
+                    (reduced_output.shape[0], self.hidden), stride=reduced_output.stride
+                ),
+            )
+            if cutlass.const_expr(topk_score is not None):
+                topk_score = cute.make_tensor(
+                    topk_score.iterator,
+                    cute.make_layout(
+                        (topk_score.shape[0], self.num_topk), stride=topk_score.stride
+                    ),
+                )
         hidden_per_thread = self.hidden_per_thread
         hidden_tiles = self.hidden_tiles
         num_topk: cutlass.Constexpr[int] = self.num_topk
@@ -248,9 +317,6 @@ class TopkReduce:
         prefetch = self.prefetch
         out_dtype = reduced_output.element_type
 
-        worker_idx = (
-            cute.arch.block_idx()[0] * Int32(threads) + cute.arch.thread_idx()[0]
-        )
         token_idx = worker_idx // hidden_tiles
         hidden_tile_idx = worker_idx % hidden_tiles
 
@@ -283,7 +349,7 @@ class TopkReduce:
             load_atom = cute.make_copy_atom(
                 cute.nvgpu.CopyUniversalOp(),
                 cutlass.BFloat16,
-                num_bits_per_copy=128,
+                num_bits_per_copy=hidden_per_thread * 16,
             )
             acc = cute.make_rmem_tensor((hidden_per_thread,), cutlass.Float32)
 
@@ -313,7 +379,9 @@ class TopkReduce:
             out.store(acc.load().to(out_dtype))
             cute.copy(
                 cute.make_copy_atom(
-                    cute.nvgpu.CopyUniversalOp(), out_dtype, num_bits_per_copy=128
+                    cute.nvgpu.CopyUniversalOp(),
+                    out_dtype,
+                    num_bits_per_copy=hidden_per_thread * out_dtype.width,
                 ),
                 out,
                 self._mark_alignment(dst, hidden_per_thread * out_dtype.width // 8),
@@ -420,7 +488,9 @@ class TopkReduce:
             out.store(acc.load().to(out_dtype))
             cute.copy(
                 cute.make_copy_atom(
-                    cute.nvgpu.CopyUniversalOp(), out_dtype, num_bits_per_copy=256
+                    cute.nvgpu.CopyUniversalOp(),
+                    out_dtype,
+                    num_bits_per_copy=hidden_per_thread * out_dtype.width,
                 ),
                 out,
                 self._mark_alignment(dst, hidden_per_thread * out_dtype.width // 8),
@@ -525,7 +595,9 @@ class TopkReduce:
             out.store(acc.load().to(out_dtype))
             cute.copy(
                 cute.make_copy_atom(
-                    cute.nvgpu.CopyUniversalOp(), out_dtype, num_bits_per_copy=256
+                    cute.nvgpu.CopyUniversalOp(),
+                    out_dtype,
+                    num_bits_per_copy=hidden_per_thread * out_dtype.width,
                 ),
                 out,
                 self._mark_alignment(dst, hidden_per_thread * out_dtype.width // 8),

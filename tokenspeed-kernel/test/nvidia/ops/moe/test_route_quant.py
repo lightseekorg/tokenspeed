@@ -29,8 +29,9 @@ from tokenspeed_kernel.ops.moe import route_quant_fp8
 from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail.primitives import (
     to_cute_dynamic_m,
 )
+from utils import assert_no_cute_compile
 
-TOKENS = (1, 8, 16, 32, 64, 128, 256, 1024, 4096)
+TOKENS = (1, 8, 16, 32, 64, 128, 256)
 
 
 @dsl_user_op
@@ -221,8 +222,73 @@ def exercise_route_graph(tokens, experts, topk, hidden):
 
 
 @pytest.mark.parametrize("tokens", TOKENS)
-def test_nine_token_buckets(tokens):
+def test_token_buckets(tokens):
     exercise_route_graph(tokens, 65, 5, 256)
+
+
+@pytest.mark.parametrize("tokens", range(1, 257))
+def test_every_token_count_and_cta_tails(tokens):
+    exercise_route_graph(tokens, 65, 5, 256)
+
+
+@pytest.mark.parametrize(
+    "warm_tokens,reuse_tokens",
+    (
+        (8, (2, 3, 7)),
+        (16, (9, 15)),
+        (32, (17, 31)),
+        (64, (33, 63)),
+        (128, (65, 127)),
+        (256, (129, 192, 255)),
+        (3, (8, 2, 7)),
+        (129, (256, 192, 255)),
+    ),
+)
+@pytest.mark.parametrize("topk", (1, 3))
+def test_bucket_warmup_covers_new_shapes_during_capture(
+    warm_tokens, reuse_tokens, topk
+):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip("Requires Hopper")
+    experts, hidden, origin = 67, 256, 201
+
+    def inputs(tokens):
+        x = torch.randn((tokens, hidden), device="cuda", dtype=torch.bfloat16)
+        ids = (
+            torch.arange(tokens * topk, device="cuda", dtype=torch.int32)
+            .view(tokens, topk)
+            .remainder(experts)
+            + origin
+        )
+        return x, ids
+
+    x, ids = inputs(warm_tokens)
+    warm = route_quant_fp8(
+        x, ids, experts=experts, expert_offset=origin, solution="cute_dsl"
+    )
+    verify_routes(warm)
+    for tokens in reuse_tokens:
+        x, ids = inputs(tokens)
+        graph = torch.cuda.CUDAGraph()
+        try:
+            # First call at this N is captured, with no per-shape eager warmup.
+            # A missing cache entry raises: compiling during capture is forbidden.
+            with assert_no_cute_compile(), torch.cuda.graph(graph):
+                out = route_quant_fp8(
+                    x, ids, experts=experts, expert_offset=origin, solution="cute_dsl"
+                )
+            graph.replay()
+            verify_routes(out)
+            x.normal_()
+            ids.view(-1)[::3] = -1
+            out.inverse.fill_(-999)
+            out.packed.view(torch.uint8).fill_(255)
+            out.scales.fill_(float("nan"))
+            graph.replay()
+            verify_routes(out)
+        finally:
+            torch.cuda.synchronize()
+            graph.reset()
 
 
 @pytest.mark.parametrize("tokens", (1, 256))
@@ -243,8 +309,8 @@ def native_input_consumer():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
         pytest.skip("Requires Hopper")
     flashinfer = pytest.importorskip("flashinfer")
-    if flashinfer.__version__ != "0.7.2.post1":
-        pytest.skip("The SM90 source patch requires FlashInfer 0.7.2.post1")
+    if flashinfer.__version__ != "0.7.3":
+        pytest.skip("The SM90 source patch requires FlashInfer 0.7.3")
     from tokenspeed_kernel.ops.moe import prepare_sm90_fp8_moe
 
     return prepare_sm90_fp8_moe(
@@ -252,8 +318,9 @@ def native_input_consumer():
     )
 
 
-@pytest.fixture(scope="module", params=((256, 768), (768, 256)))
+@pytest.fixture(scope="module", params=((256, 768), (768, 256), (512, 1024)))
 def native_input_weights(request):
+    # 512x1024 also exercises the native FC1 + SwiGLU + FP8 epilogue.
     hidden, intermediate = request.param
     generator = torch.Generator(device="cuda").manual_seed(9243)
     weights, scales = [], []
@@ -281,6 +348,12 @@ def native_input_weights(request):
             )
         )
     return *weights, *scales
+
+
+def assert_native_output(actual, expected):
+    assert torch.isfinite(expected).all(), "Native reference contains NaN or Inf"
+    assert torch.isfinite(actual).all(), "Prepared-input output contains NaN or Inf"
+    assert_bytes(actual, expected)
 
 
 def exercise_native_consumer(
@@ -328,7 +401,7 @@ def exercise_native_consumer(
 
     for _ in range(3):
         reference = native(**arguments)[0]
-        assert_bytes(candidate(), reference)
+        assert_native_output(candidate(), reference)
     graph = torch.cuda.CUDAGraph()
     try:
         with torch.cuda.graph(graph):
@@ -366,8 +439,8 @@ def exercise_native_consumer(
             graph.replay()
             try:
                 verify_routes(prepared)
-                assert_bytes(output, reference)
-                assert_bytes(candidate(), reference)
+                assert_native_output(output, reference)
+                assert_native_output(candidate(), reference)
             except AssertionError as error:
                 raise AssertionError(
                     {
@@ -402,6 +475,22 @@ def test_prepared_input_matches_native_moe(
         5,
         ep_size,
         ep_rank,
+        use_fused_finalize=use_fused_finalize,
+    )
+
+
+@pytest.mark.parametrize("tokens", (2, 7, 9, 129, 192, 255))
+@pytest.mark.parametrize("use_fused_finalize", (False, True))
+def test_arbitrary_token_input_matches_native_moe(
+    native_input_consumer, native_input_weights, tokens, use_fused_finalize
+):
+    exercise_native_consumer(
+        native_input_consumer,
+        native_input_weights,
+        tokens,
+        5,
+        3,
+        2,
         use_fused_finalize=use_fused_finalize,
     )
 
@@ -467,6 +556,24 @@ def test_prepared_input_preserves_finalize_configuration(
     finally:
         torch.cuda.synchronize()
         runners.update(saved_runners)
+
+
+@pytest.mark.parametrize("tokens", (1, 3, 17))
+def test_prepared_input_after_native_workspace_growth(
+    native_input_consumer, native_input_weights, tokens
+):
+    # Grow native scratch first. Prepared input scales still use the small
+    # invocation's stride; fused FC1 output scales must retain FC2's native stride.
+    for n in (256, tokens):
+        exercise_native_consumer(
+            native_input_consumer,
+            native_input_weights,
+            n,
+            5,
+            1,
+            0,
+            use_fused_finalize=True,
+        )
 
 
 class PlannedRouteWeights(torch.nn.Module):
@@ -570,7 +677,7 @@ def exercise_planned_moe(
         assert candidate().shape == x.shape
         return
     for _ in range(3):
-        assert_bytes(candidate(), reference())
+        assert_native_output(candidate(), reference())
     graph = torch.cuda.CUDAGraph()
     try:
         with torch.cuda.graph(graph):
@@ -603,14 +710,16 @@ def exercise_planned_moe(
             weights.copy_(torch.softmax(torch.randn_like(weights), dim=-1))
             expected = reference().clone()
             graph.replay()
-            assert_bytes(output, expected)
-            assert_bytes(candidate(), expected)
+            assert_native_output(output, expected)
+            assert_native_output(candidate(), expected)
     finally:
         torch.cuda.synchronize()
         graph.reset()
 
 
-@pytest.mark.parametrize("tokens", (0, 2, 7, 9, 15, 17, *TOKENS))
+@pytest.mark.parametrize(
+    "tokens", (0, 2, 7, 9, 15, 17, 129, 192, 255, 257, 1024, 4097, *TOKENS)
+)
 @pytest.mark.parametrize("ep_size,ep_rank", ((1, 0), (3, 2)))
 def test_registered_moe_input_path(
     native_input_consumer, native_input_weights, tokens, ep_size, ep_rank
@@ -660,8 +769,8 @@ def test_registered_moe_preserves_finalize_configuration(
         runners.update(saved_runners)
 
 
-@pytest.mark.parametrize("hidden", (128, 256, 768, 1024, 2048))
-@pytest.mark.parametrize("tokens", (1, 8, 128))
+@pytest.mark.parametrize("hidden", (128, 256, 768, 1024, 2048, 4096))
+@pytest.mark.parametrize("tokens", (1, 3, 8, 129, 255, 256))
 def test_route_quantization_widths(hidden, tokens):
     exercise_route_graph(tokens, 33, 5, hidden)
 

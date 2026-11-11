@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Loader boundary for the unchanged vendored Gluon Petit source."""
+"""Loader boundary for the vendored Gluon Petit source."""
 
 from __future__ import annotations
 

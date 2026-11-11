@@ -48,7 +48,7 @@ use ts_control::{
     eplb::{Algorithm, Controller, EplbConfig, EplbSpecs, SlotMoves},
     event_loop::{
         DataPlane, DataPlaneError, Dispatch, DpRound, EventLoop, Frontend, Load, LoopConfig,
-        LoopError, Ranks, Subsystems,
+        LoopError, PrefillDelay, Ranks, Subsystems,
     },
     grammar::{GrammarConfig, GrammarKey, Grammars},
     ingress::{Admission, IngressLimits, LogprobServability},
@@ -70,8 +70,9 @@ use ts_wire::{
     codec::Dict,
     control::{
         FlushCacheReqInput, IsSchedulerPausedReqInput, IsSleepingReqInput, PauseSchedulerReqInput,
-        ProfileReq, ReleaseMemoryOccupationReqInput, ResumeMemoryOccupationReqInput,
-        ResumeSchedulerReqInput, UpdateWeightFromDiskReqInput, PROFILE_START,
+        ProfileReq, ReleaseMemoryOccupationReqInput, ReloadForwardReqInput,
+        ResumeMemoryOccupationReqInput, ResumeSchedulerReqInput, UpdateWeightFromDiskReqInput,
+        PROFILE_START,
     },
     multimodal::{Modality, MultimodalDataItem, MultimodalInputs},
     ControlOutput, ControlRequest, EngineCoreReadyResponse, EngineRequest, SamplingParams,
@@ -127,7 +128,12 @@ enum Tiers {
 /// shard, so the Device keeps 512 usable Full blocks (64 on
 /// `HostL2WriteBackForcedRetraction`) and a tier with Host pages 1024, the
 /// counts the tests' numbers rely on.
-fn new_scheduler(tiers: Tiers, role: Role, kv_shard_count: usize) -> Scheduler {
+fn new_scheduler(
+    tiers: Tiers,
+    role: Role,
+    kv_shard_count: usize,
+    device_pages: usize,
+) -> Scheduler {
     interpreter();
     let role = match role {
         Role::Plain => "Fused",
@@ -178,10 +184,10 @@ cfg = ts.SchedulerConfig()
 cfg.prefix_granularity = 16
 cfg.max_scheduled_tokens = {MAX_SCHEDULED_TOKENS}
 cfg.max_batch_size = 8
-cfg.num_device_pages = 512 // {kv_shard_count} + 1
+cfg.num_device_pages = ({device_pages} - 1) // {kv_shard_count} + 1
 cfg.num_snapshot_pages = 1
 cfg.cache_groups = [ts.CacheGroupConfig(group_id="full_attention", block_granularity=16,
-                                        total_pages=513, attn_kind=ts.AttnKind.Full,
+                                        total_pages={device_pages}, attn_kind=ts.AttnKind.Full,
                                         cache_blocks_per_lcm_block={kv_shard_count},
                                         shard_count={kv_shard_count})]
 cfg.role = ts.SchedulerConfig.Role.{role}
@@ -190,6 +196,8 @@ if cfg.role != ts.SchedulerConfig.Role.Fused:
 {tiers}
 if cfg.num_host_pages > 1:
     cfg.num_host_pages = 1024 // {kv_shard_count} + 1
+if cfg.num_host_pages > 1 or cfg.num_snapshot_pages > 1:
+    cfg.host_group_packing = [{kv_shard_count}]
 result = ts.Scheduler(cfg)
 "#
     );
@@ -309,6 +317,13 @@ struct FakeDevice {
     landed: Arc<Mutex<Vec<Landing>>>,
     /// Control operations the device ran, in order.
     device_ops: Arc<Mutex<Vec<String>>>,
+    /// Results published after the control plane's all-rank agreement.
+    weight_commits: Arc<Mutex<Vec<bool>>>,
+    /// Inject a local loading failure while other ranks succeed.
+    fail_weight_update: bool,
+    /// The rank's load prerequisites refuse (weights released, KV still
+    /// resident); a test clears it before retrying.
+    weight_load_refused: Arc<AtomicBool>,
     /// EPLB: this rank's EP rank, which skews the load it counts.
     ep_rank: usize,
     /// EPLB: the placement the experts sit in, as the routing tables say.
@@ -395,6 +410,10 @@ struct WireRoom {
     fails: bool,
     /// The transfer breaks on this prefill rank alone.
     fails_on_prefill_rank: Option<usize>,
+    /// Cancellation was requested; the peer must still acknowledge retirement.
+    cancel_pending: bool,
+    /// Keep the cancellation acknowledgment pending, as an in-flight write does.
+    hold_cancel: bool,
 }
 
 /// A stand-in transfer peer over a [`Wire`]: a transfer advances as soon as
@@ -404,8 +423,8 @@ struct FakePeer {
     role: Role,
     rank: usize,
     wire: Arc<Mutex<Wire>>,
-    /// Tracked requests: rid, room, bootstrapped.
-    tracked: Vec<(String, u64, bool)>,
+    /// Tracked requests: rid, room, bootstrapped, failure reported.
+    tracked: Vec<(String, u64, bool, bool)>,
 }
 
 impl TransferPeer for FakePeer {
@@ -419,7 +438,8 @@ impl TransferPeer for FakePeer {
                 .or_default()
                 .decode_registered = true;
         }
-        self.tracked.push((rid.to_owned(), bootstrap.room, false));
+        self.tracked
+            .push((rid.to_owned(), bootstrap.room, false, false));
         Ok(())
     }
 
@@ -437,9 +457,10 @@ impl TransferPeer for FakePeer {
             let prefill_ranks = wire.prefill_ranks;
             self.tracked
                 .iter()
-                .map(|(_, room, bootstrapped)| {
+                .flat_map(|(_, room, bootstrapped, _)| {
                     let room = wire.rooms.entry(*room).or_default();
                     let poll = if room.fails
+                        || room.cancel_pending
                         || (role == Role::Prefill && room.fails_on_prefill_rank == Some(rank))
                     {
                         TransferPoll::Failed
@@ -466,7 +487,9 @@ impl TransferPeer for FakePeer {
                             TransferPoll::Bootstrapped
                         }
                     };
-                    poll as i64
+                    // Retirement must agree too: hold_cancel can change
+                    // between ranks polling the shared wire.
+                    [poll as i64, i64::from(!room.hold_cancel)]
                 })
                 .collect()
         };
@@ -478,41 +501,51 @@ impl TransferPeer for FakePeer {
 
         let mut wire = self.wire.lock().unwrap();
         let mut events = Vec::new();
-        let mut agreed = agreed.into_iter();
-        self.tracked.retain_mut(|(rid, room, bootstrapped)| {
-            let poll = agreed.next().expect("one state per tracked request");
-            let room = wire.rooms.entry(*room).or_default();
-            match TransferPoll::from_wire(poll).unwrap_or(TransferPoll::Failed) {
-                TransferPoll::Failed => {
-                    // The peer engine sees the failure only on the wire.
-                    room.fails = true;
-                    events.push(PdEvent::Failed(rid.clone()));
-                    false
+        let mut agreed = agreed.chunks_exact(2);
+        self.tracked
+            .retain_mut(|(rid, room, bootstrapped, failed)| {
+                let state = agreed.next().expect("one state per tracked request");
+                let (poll, retired) = (state[0], state[1]);
+                let room = wire.rooms.entry(*room).or_default();
+                match TransferPoll::from_wire(poll).unwrap_or(TransferPoll::Failed) {
+                    TransferPoll::Failed => {
+                        // Failure ends the output before held writes retire.
+                        room.fails = true;
+                        if !*failed {
+                            events.push(PdEvent::Failed(rid.clone()));
+                            *failed = true;
+                        }
+                        if retired == 0 {
+                            true
+                        } else {
+                            events.push(PdEvent::Stopped(rid.clone()));
+                            false
+                        }
+                    }
+                    TransferPoll::Bootstrapped if !*bootstrapped => {
+                        *bootstrapped = true;
+                        events.push(PdEvent::Bootstrapped(rid.clone()));
+                        true
+                    }
+                    TransferPoll::Success => {
+                        events.push(match role {
+                            Role::Prefill => PdEvent::Succeeded(rid.clone()),
+                            _ => PdEvent::RemotePrefillDone(RemotePrefill {
+                                rid: rid.clone(),
+                                bootstrap_token: room.sent.expect("sent with the KV"),
+                                cached_tokens: 0,
+                                bootstrap_logprob: None,
+                                spec_candidate_ids: None,
+                                request_pool_index: room
+                                    .preallocated
+                                    .expect("admitted before the KV moved"),
+                            }),
+                        });
+                        false
+                    }
+                    _ => true,
                 }
-                TransferPoll::Bootstrapped if !*bootstrapped => {
-                    *bootstrapped = true;
-                    events.push(PdEvent::Bootstrapped(rid.clone()));
-                    true
-                }
-                TransferPoll::Success => {
-                    events.push(match role {
-                        Role::Prefill => PdEvent::Succeeded(rid.clone()),
-                        _ => PdEvent::RemotePrefillDone(RemotePrefill {
-                            rid: rid.clone(),
-                            bootstrap_token: room.sent.expect("sent with the KV"),
-                            cached_tokens: 0,
-                            bootstrap_logprob: None,
-                            spec_candidate_ids: None,
-                            request_pool_index: room
-                                .preallocated
-                                .expect("admitted before the KV moved"),
-                        }),
-                    });
-                    false
-                }
-                _ => true,
-            }
-        });
+            });
         Ok(events)
     }
 
@@ -523,6 +556,18 @@ impl TransferPeer for FakePeer {
     }
 
     fn abort_room(&mut self, _: &str, _: u64) {}
+
+    fn cancel(&mut self, rid: &str) {
+        if let Some((_, room, _, _)) = self.tracked.iter().find(|(id, _, _, _)| id == rid) {
+            self.wire
+                .lock()
+                .unwrap()
+                .rooms
+                .entry(*room)
+                .or_default()
+                .cancel_pending = true;
+        }
+    }
 }
 
 /// EPD: a `lost-*` request's receive fails at its second poll, a `slow-*`
@@ -782,9 +827,22 @@ impl DataPlane for FakeDevice {
         Ok(())
     }
 
+    fn check_weight_update(
+        &mut self,
+        _op: &ControlRequest,
+    ) -> Result<(bool, String), DataPlaneError> {
+        let refused = self.weight_load_refused.load(Ordering::SeqCst);
+        Ok((!refused, "local load prerequisite".to_owned()))
+    }
+
     fn update_weights(&mut self, op: &ControlRequest) -> Result<(bool, String), DataPlaneError> {
         self.device_ops.lock().unwrap().push(op.tag().to_owned());
-        Ok((true, "applied".to_owned()))
+        Ok((!self.fail_weight_update, "applied".to_owned()))
+    }
+
+    fn commit_weight_update(&mut self, success: bool) -> Result<(), DataPlaneError> {
+        self.weight_commits.lock().unwrap().push(success);
+        Ok(())
     }
 
     fn profile(&mut self, request: &ProfileReq) -> Result<(bool, String), DataPlaneError> {
@@ -801,6 +859,11 @@ impl DataPlane for FakeDevice {
             .unwrap()
             .push(format!("release {}", tags.join(",")));
         Ok(())
+    }
+
+    fn reload_forward(&mut self, op: &ControlRequest) -> Result<(bool, String), DataPlaneError> {
+        self.device_ops.lock().unwrap().push(op.tag().to_owned());
+        Ok((!self.fail_weight_update, "reloaded".to_owned()))
     }
 
     fn resume_memory(&mut self, tags: &[String]) -> Result<(), DataPlaneError> {
@@ -1039,6 +1102,8 @@ struct Rank {
     storage_gate: Arc<Gate>,
     landed: Arc<Mutex<Vec<Landing>>>,
     device_ops: Arc<Mutex<Vec<String>>>,
+    weight_commits: Arc<Mutex<Vec<bool>>>,
+    weight_load_refused: Arc<AtomicBool>,
     applied: Applied,
     epd_admitted: Arc<Mutex<Vec<String>>>,
     epd_released: Arc<Mutex<Vec<usize>>>,
@@ -1181,6 +1246,12 @@ struct Pd {
 /// What an engine runs with beyond its layout, depth and cache tiers.
 #[derive(Default, Clone)]
 struct Setup {
+    /// Override the ingress context limit to exercise native capacity errors.
+    context_limit: Option<i64>,
+    /// Override the Device pool size for capacity-pressure scenarios.
+    device_pages: Option<usize>,
+    /// Batch prefill in windows, with pressure checks for fresh admissions.
+    prefill_delay: Option<PrefillDelay>,
     /// Predecessors Engram reads per token.
     ngram_context_len: usize,
     /// PD: the engine's role and its peer's wire.
@@ -1198,6 +1269,7 @@ struct Setup {
     logprobs: bool,
     /// The model reads request token history.
     request_token_history: bool,
+    request_token_history_lookback: Option<usize>,
     /// L3 (`Tiers::L3`): the leading keys of a get that land on each rank;
     /// all of them when unset.
     l3_landed_keys: Option<fn(usize) -> usize>,
@@ -1208,6 +1280,10 @@ struct Setup {
     cache_ack_polls: Option<fn(usize) -> usize>,
     /// The devices acknowledge no cache op until the test opens their gates.
     held_cache_acks: bool,
+    /// A rank whose device refuses a weight load.
+    weight_update_failure_rank: Option<usize>,
+    /// The ranks whose load prerequisites refuse until the test clears them.
+    weight_load_refused: Option<fn(usize) -> bool>,
 }
 
 impl Layout {
@@ -1224,18 +1300,21 @@ impl Layout {
 /// The loop's settings for `setup`.
 fn loop_config(in_flight_depth: usize, pipeline: bool, setup: &Setup) -> LoopConfig {
     let pd = setup.pd.as_ref();
+    let kv_total_pages = setup.device_pages.map_or(512, |pages| pages as i64 - 1);
     LoopConfig {
         in_flight_depth,
         limits: IngressLimits {
             vocab_size: 100_000,
             eos_token_ids: Vec::new(),
-            max_model_len: 4096,
+            top_k_exclusive_max: Some(ts_control::sampling::TOP_K_FUSED_MAX),
+            max_model_len: setup.context_limit.unwrap_or(4096),
             max_req_input_len: 4000,
             enable_output_logprobs: setup.logprobs,
             requires_bootstrap: pd.is_some(),
             multimodal: setup.epd_receive_enabled,
             grammar: setup.grammar,
             reasoning: None,
+            reasoning_usage: None,
             logprobs: LogprobServability {
                 supports_prompt_logprobs: true,
                 logprob_order: "torch".to_owned(),
@@ -1245,18 +1324,21 @@ fn loop_config(in_flight_depth: usize, pipeline: bool, setup: &Setup) -> LoopCon
                 computes_prompt_logprobs: pd.is_none_or(|pd| pd.role != Role::Decode),
             },
         },
-        kv_total_pages: 512,
+        kv_total_pages,
+        kv_token_capacity: kv_total_pages * 16,
         ngram_context_len: setup.ngram_context_len,
         request_token_history: setup.request_token_history,
+        request_token_history_lookback: setup.request_token_history_lookback,
         controls: ControlConfig {
             memory_saver: true,
             memory_regions: vec!["kv_cache".to_owned(), "weights".to_owned()],
             l3_weight_version: None,
+            allow_reload_forward: true,
         },
         batch_log: BatchLogConfig {
             enabled: true,
             decode_log_interval: 40,
-            num_total_pages: 512,
+            num_total_pages: kv_total_pages,
             spec_num_steps: 0,
             dp_rank: 0,
             disaggregated: pd.is_some(),
@@ -1268,6 +1350,7 @@ fn loop_config(in_flight_depth: usize, pipeline: bool, setup: &Setup) -> LoopCon
         // The fake device fills bitmasks from the committed matcher state,
         // as the eager path does.
         eager_grammar: setup.grammar,
+        prefill_delay: setup.prefill_delay,
     }
 }
 
@@ -1309,6 +1392,7 @@ fn run_rank<F: Frontend>(
     let dp = (num_engines > 1).then(|| Group::new(0, (0..world).collect(), rank).unwrap());
     let frontend = frontend();
     let Setup {
+        device_pages,
         pd,
         eplb,
         grammar,
@@ -1325,7 +1409,10 @@ fn run_rank<F: Frontend>(
         FinishLog {
             enabled: true,
             request_stats: true,
+            ttft_percentage: 0,
         },
+        false,
+        None,
     );
     let transfer = pd.map(|pd| {
         Box::new(FakePeer {
@@ -1353,7 +1440,7 @@ fn run_rank<F: Frontend>(
         _ => 1,
     };
     let mut event_loop = EventLoop::new(
-        new_scheduler(tiers, role, kv_shard_count),
+        new_scheduler(tiers, role, kv_shard_count, device_pages.unwrap_or(513)),
         device,
         frontend,
         outputs,
@@ -1404,6 +1491,12 @@ fn fake_device(layout: Layout, rank: usize, setup: &Setup) -> FakeDevice {
         placeholder_stage: matches!(layout, Layout::Pp(_)) && rank + 1 < world,
         wire: setup.pd.as_ref().map(|pd| pd.wire.clone()),
         ep_rank: rank,
+        fail_weight_update: setup.weight_update_failure_rank == Some(rank),
+        weight_load_refused: Arc::new(AtomicBool::new(
+            setup
+                .weight_load_refused
+                .is_some_and(|refused| refused(rank)),
+        )),
         // The trivial initial placement: slot p holds expert p % 4.
         placement: Arc::new(Mutex::new(vec![vec![0, 1, 2, 3, 0, 1]; 2])),
         ..Default::default()
@@ -1480,6 +1573,8 @@ async fn start_ranks_with(
                 storage_gate,
                 landed: device.landed.clone(),
                 device_ops: device.device_ops.clone(),
+                weight_commits: device.weight_commits.clone(),
+                weight_load_refused: device.weight_load_refused.clone(),
                 applied: device.applied.clone(),
                 epd_admitted: device.epd_admitted.clone(),
                 epd_released: device.epd_released.clone(),
@@ -1547,6 +1642,7 @@ struct ScriptedFrontend {
     replies: Arc<Mutex<Vec<ControlOutput>>>,
     /// The requests that finished, with their reasons.
     finished: Arc<Mutex<Vec<(String, String)>>>,
+    outputs: Arc<Mutex<Vec<StreamedOutput>>>,
 }
 
 impl Frontend for ScriptedFrontend {
@@ -1562,6 +1658,7 @@ impl Frontend for ScriptedFrontend {
 
     fn send(&mut self, outputs: Vec<StreamedOutput>, _load: Load) {
         self.reacted.extend((self.react)(&outputs));
+        self.outputs.lock().unwrap().extend(outputs.iter().cloned());
         self.finished
             .lock()
             .unwrap()
@@ -1583,8 +1680,13 @@ struct ScriptedRank {
     /// Its engine's control replies, on the engine's first rank.
     replies: Vec<ControlOutput>,
     finished: Vec<(String, String)>,
+    outputs: Vec<StreamedOutput>,
+    released: Vec<(String, i32)>,
     cache_ops: Vec<CacheOpKind>,
     idle_forwards: usize,
+    forwards: usize,
+    /// The device operations the rank ran (weight updates, reloads, ...).
+    device_ops: Vec<String>,
 }
 
 /// Run `layout`'s ranks, one script per engine (its first rank's frontend
@@ -1592,6 +1694,7 @@ struct ScriptedRank {
 /// the ranks stop by themselves.
 fn run_scripted(
     layout: Layout,
+    in_flight_depth: usize,
     tiers: Tiers,
     setup: Setup,
     scripts: Vec<Script>,
@@ -1599,7 +1702,7 @@ fn run_scripted(
 ) -> Vec<ScriptedRank> {
     let (world, tp_size, num_engines) = layout.sizes();
     assert_eq!(scripts.len(), num_engines);
-    let config = loop_config(0, matches!(layout, Layout::Pp(_)), &setup);
+    let config = loop_config(in_flight_depth, matches!(layout, Layout::Pp(_)), &setup);
     let stop = Arc::new(AtomicBool::new(false));
     let (mesh_listeners, addresses) = mesh_listeners(world);
     let mut scripts = scripts.into_iter();
@@ -1610,14 +1713,18 @@ fn run_scripted(
         .map(|(rank, mesh_listener)| {
             let device = fake_device(layout, rank, &setup);
             let (plans, idle_forwards) = (device.plans.clone(), device.idle_forwards.clone());
+            let device_ops = device.device_ops.clone();
             let replies = Arc::new(Mutex::new(Vec::new()));
             let finished = Arc::new(Mutex::new(Vec::new()));
+            let outputs = Arc::new(Mutex::new(Vec::new()));
+            let released = device.released.clone();
             let frontend = (rank % tp_size == 0).then(|| ScriptedFrontend {
                 script: scripts.next().unwrap().into(),
                 react,
                 reacted: Vec::new(),
                 replies: replies.clone(),
                 finished: finished.clone(),
+                outputs: outputs.clone(),
             });
             let spec = RankSpec {
                 rank,
@@ -1635,7 +1742,16 @@ fn run_scripted(
                 done.send(rank).unwrap();
                 outcome
             });
-            (thread, replies, finished, plans, idle_forwards)
+            (
+                thread,
+                replies,
+                finished,
+                outputs,
+                released,
+                plans,
+                idle_forwards,
+                device_ops,
+            )
         })
         .collect();
     for _ in 0..world {
@@ -1647,17 +1763,23 @@ fn run_scripted(
     ranks
         .into_iter()
         .map(
-            |(thread, replies, finished, plans, idle_forwards)| ScriptedRank {
-                outcome: thread.join().unwrap(),
-                replies: replies.lock().unwrap().clone(),
-                finished: finished.lock().unwrap().clone(),
-                cache_ops: plans
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .flat_map(|(_, _, ops)| ops.iter().map(|op| op.kind))
-                    .collect(),
-                idle_forwards: *idle_forwards.lock().unwrap(),
+            |(thread, replies, finished, outputs, released, plans, idle_forwards, device_ops)| {
+                let outcome = thread.join().unwrap();
+                let plans = plans.lock().unwrap();
+                ScriptedRank {
+                    outcome,
+                    replies: replies.lock().unwrap().clone(),
+                    finished: finished.lock().unwrap().clone(),
+                    outputs: outputs.lock().unwrap().clone(),
+                    released: released.lock().unwrap().clone(),
+                    cache_ops: plans
+                        .iter()
+                        .flat_map(|(_, _, ops)| ops.iter().map(|op| op.kind))
+                        .collect(),
+                    idle_forwards: *idle_forwards.lock().unwrap(),
+                    forwards: plans.iter().filter(|(_, rids, _)| !rids.is_empty()).count(),
+                    device_ops: device_ops.lock().unwrap().clone(),
+                }
             },
         )
         .collect()
@@ -1680,6 +1802,302 @@ fn budget(max_new_tokens: i64) -> SamplingParams {
     SamplingParams {
         max_new_tokens: Some(max_new_tokens),
         ..Default::default()
+    }
+}
+
+fn assert_scripted_tokens(rank: &ScriptedRank, rid: &str, count: i32) {
+    assert_eq!(rank.outcome, Ok(()));
+    let outputs: Vec<_> = rank
+        .outputs
+        .iter()
+        .filter(|output| output.rid == rid)
+        .collect();
+    let tokens: Vec<_> = outputs
+        .iter()
+        .flat_map(|output| output.output_ids.iter().copied())
+        .collect();
+    assert_eq!(tokens, (1000..1000 + count).collect::<Vec<_>>());
+    assert_eq!(
+        outputs
+            .iter()
+            .filter(|output| output.finish_reason.is_some())
+            .count(),
+        1
+    );
+    assert_eq!(outputs.last().unwrap().finish_reason, Some("length"));
+    assert_eq!(outputs.last().unwrap().completion_tokens, i64::from(count));
+}
+
+#[test]
+fn duplicate_submissions_preserve_the_original_stream_on_every_rank() {
+    for layout in [Layout::Single, Layout::Tp(2)] {
+        for depth in 0..=2 {
+            let mut script: Script = vec![Vec::new(); 30];
+            script[0] = vec![
+                EngineRequest::Add(Box::new(request("original", 16, budget(8)))),
+                EngineRequest::Add(Box::new(request("original", 20, budget(2)))),
+                EngineRequest::Add(Box::new(request("healthy", 16, budget(3)))),
+            ];
+            // Ingress would normally send this malformed request a final error.
+            script[1].push(EngineRequest::Add(Box::new(request(
+                "original",
+                0,
+                budget(2),
+            ))));
+            script[2].push(EngineRequest::Add(Box::new(request(
+                "original",
+                20,
+                budget(2),
+            ))));
+            let ranks = run_scripted(
+                layout,
+                depth,
+                Tiers::DeviceOnly,
+                Setup::default(),
+                vec![script],
+                no_reaction,
+            );
+            assert_scripted_tokens(&ranks[0], "original", 8);
+            assert_scripted_tokens(&ranks[0], "healthy", 3);
+            assert!(ranks[0]
+                .outputs
+                .iter()
+                .filter(|output| output.rid == "original")
+                .all(|output| output.prompt_tokens == 16));
+            for rank in ranks {
+                assert_eq!(rank.outcome, Ok(()));
+                assert_eq!(
+                    rank.released
+                        .iter()
+                        .filter(|(rid, _)| rid == "original")
+                        .count(),
+                    1
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn duplicate_submissions_cannot_replace_a_request_being_aborted() {
+    for depth in 0..=2 {
+        let mut script: Script = vec![Vec::new(); 30];
+        script[0].push(EngineRequest::Add(Box::new(request(
+            "aborted",
+            16,
+            budget(20),
+        ))));
+        script[1] = vec![
+            EngineRequest::Abort(vec!["aborted".to_owned()]),
+            EngineRequest::Add(Box::new(request("aborted", 20, budget(2)))),
+            EngineRequest::Add(Box::new(request("healthy", 16, budget(3)))),
+        ];
+        let ranks = run_scripted(
+            Layout::Single,
+            depth,
+            Tiers::DeviceOnly,
+            Setup::default(),
+            vec![script],
+            no_reaction,
+        );
+        assert_scripted_tokens(&ranks[0], "healthy", 3);
+        assert_eq!(
+            ranks[0]
+                .released
+                .iter()
+                .filter(|(rid, _)| rid == "aborted")
+                .count(),
+            1
+        );
+        assert!(!ranks[0].finished.iter().any(|(rid, _)| rid == "aborted"));
+    }
+}
+
+#[test]
+fn duplicate_submissions_after_final_output_refuse_a_retiring_id() {
+    fn retry(outputs: &[StreamedOutput]) -> Vec<EngineRequest> {
+        if outputs
+            .iter()
+            .any(|output| output.rid == "retiring" && output.finish_reason == Some("length"))
+        {
+            vec![
+                EngineRequest::Add(Box::new(request("retiring", 20, budget(3)))),
+                EngineRequest::Add(Box::new(request("healthy", 16, budget(3)))),
+            ]
+        } else {
+            Vec::new()
+        }
+    }
+    for depth in 0..=2 {
+        let mut script: Script = vec![Vec::new(); 30];
+        script[0].push(EngineRequest::Add(Box::new(request(
+            "retiring",
+            16,
+            budget(2),
+        ))));
+        let ranks = run_scripted(
+            Layout::Single,
+            depth,
+            Tiers::DeviceOnly,
+            Setup::default(),
+            vec![script],
+            retry,
+        );
+        assert_scripted_tokens(&ranks[0], "healthy", 3);
+        let finals: Vec<_> = ranks[0]
+            .outputs
+            .iter()
+            .filter(|output| output.rid == "retiring" && output.finish_reason.is_some())
+            .collect();
+        assert_eq!(finals.len(), 2);
+        assert_eq!(finals[0].finish_reason, Some("length"));
+        assert_eq!(finals[1].finish_reason, Some("abort"));
+        assert_eq!(finals[1].completion_tokens, 0);
+        assert_eq!(
+            finals[1]
+                .finish_details
+                .as_ref()
+                .unwrap()
+                .get(&"status_code".to_owned()),
+            Some(&Value::from(409i64)),
+        );
+        // The refused request was never admitted or released on the data plane.
+        assert_eq!(
+            ranks[0]
+                .released
+                .iter()
+                .filter(|(rid, _)| rid == "retiring")
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn duplicate_submissions_while_paused_keep_the_first_admission() {
+    let mut script: Script = vec![Vec::new(); 30];
+    script[0] = vec![
+        EngineRequest::Control(Box::new(pause("freeze"))),
+        EngineRequest::Add(Box::new(request("withheld", 16, budget(5)))),
+        EngineRequest::Control(Box::new(pause("freeze"))),
+        EngineRequest::Add(Box::new(request("withheld", 20, budget(2)))),
+    ];
+    script[1].push(EngineRequest::Add(Box::new(request(
+        "withheld",
+        20,
+        budget(2),
+    ))));
+    script[3].push(EngineRequest::Control(Box::new(resume())));
+    let ranks = run_scripted(
+        Layout::Tp(2),
+        1,
+        Tiers::DeviceOnly,
+        Setup::default(),
+        vec![script],
+        no_reaction,
+    );
+    assert_scripted_tokens(&ranks[0], "withheld", 5);
+    for rank in ranks {
+        assert_eq!(rank.outcome, Ok(()));
+        assert_eq!(rank.released.len(), 1);
+    }
+}
+
+#[test]
+fn duplicate_submissions_can_reuse_an_id_after_scheduler_retirement() {
+    for depth in 0..=2 {
+        let mut script: Script = vec![Vec::new(); 40];
+        script[0].push(EngineRequest::Add(Box::new(request(
+            "reused",
+            16,
+            budget(2),
+        ))));
+        script[20].push(EngineRequest::Add(Box::new(request(
+            "reused",
+            20,
+            budget(3),
+        ))));
+        let ranks = run_scripted(
+            Layout::Single,
+            depth,
+            Tiers::DeviceOnly,
+            Setup::default(),
+            vec![script],
+            no_reaction,
+        );
+        assert_eq!(ranks[0].outcome, Ok(()));
+        let finals: Vec<_> = ranks[0]
+            .outputs
+            .iter()
+            .filter(|output| output.finish_reason.is_some())
+            .collect();
+        assert_eq!(finals.len(), 2);
+        assert_eq!(
+            (finals[0].prompt_tokens, finals[0].completion_tokens),
+            (16, 2)
+        );
+        assert_eq!(
+            (finals[1].prompt_tokens, finals[1].completion_tokens),
+            (20, 3)
+        );
+        assert!(finals
+            .iter()
+            .all(|output| output.finish_reason == Some("length")));
+    }
+}
+
+#[test]
+fn scheduler_submission_errors_release_the_rejected_batch_and_keep_serving() {
+    for depth in 0..=2 {
+        let mut script: Script = vec![Vec::new(); 30];
+        script[0] = vec![
+            EngineRequest::Add(Box::new(request("batch-peer", 16, budget(2)))),
+            EngineRequest::Add(Box::new(request("oversized", 16, budget(10000)))),
+        ];
+        script[1].push(EngineRequest::Add(Box::new(request(
+            "healthy",
+            16,
+            budget(3),
+        ))));
+        let ranks = run_scripted(
+            Layout::Tp(2),
+            depth,
+            Tiers::DeviceOnly,
+            Setup {
+                context_limit: Some(16384),
+                ..Setup::default()
+            },
+            vec![script],
+            no_reaction,
+        );
+        assert_scripted_tokens(&ranks[0], "healthy", 3);
+        for rid in ["batch-peer", "oversized"] {
+            let refused: Vec<_> = ranks[0]
+                .outputs
+                .iter()
+                .filter(|output| output.rid == rid)
+                .collect();
+            assert_eq!(refused.len(), 1);
+            assert_eq!(refused[0].finish_reason, Some("abort"));
+            assert!(refused[0].output_ids.is_empty());
+            let message = refused[0]
+                .finish_details
+                .as_ref()
+                .unwrap()
+                .get(&"message".to_owned());
+            assert!(
+                matches!(message, Some(Value::Str(message)) if message.contains("exceeds cache capacity"))
+            );
+        }
+        for rank in ranks {
+            assert_eq!(rank.outcome, Ok(()));
+            assert_eq!(rank.released.len(), 3);
+            assert!(rank
+                .released
+                .iter()
+                .filter(|(rid, _)| rid != "healthy")
+                .all(|(_, generated)| *generated == 0));
+        }
     }
 }
 
@@ -1779,6 +2197,37 @@ async fn a_long_prompt_is_prefilled_in_chunks() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn delayed_long_prefill_completes_above_the_watermark() {
+    for layout in [Layout::Single, Layout::Dp(2)] {
+        for depth in [0, 1] {
+            let engine = start_ranks_with(
+                layout,
+                depth,
+                Tiers::DeviceOnly,
+                Setup {
+                    device_pages: Some(49),
+                    prefill_delay: Some(PrefillDelay {
+                        attempt_interval: 2,
+                        any_interval: 4,
+                    }),
+                    ..Setup::default()
+                },
+            )
+            .await;
+            // 720 prompt tokens + four output slots reserve 46 of 48 usable
+            // pages on the first 256-token chunk. Later chunks must drain
+            // through the actual local vote and (for DP) group collectives.
+            let chunks = run(&engine.client, request("long", 720, budget(4))).await;
+            assert_eq!(tokens(&chunks), [1000, 1001, 1002, 1003], "{chunks:?}");
+            assert_eq!(
+                chunks.last().unwrap().finish_reason.as_deref(),
+                Some("length")
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn concurrent_requests_each_get_their_own_tokens() {
     let engine = start_engine(1).await;
     // Submit all before reading any, so they share forwards.
@@ -1830,11 +2279,20 @@ async fn dropping_a_stream_aborts_the_request() {
                 *generated < 100,
                 "generated {generated} tokens after the abort"
             );
-            return;
+            // Cancellation produces no final output for the dropped stream,
+            // but the frontend must still learn that the engine is idle.
+            if engine
+                .client
+                .loads()
+                .iter()
+                .all(|load| load.num_running == 0 && load.num_waiting == 0)
+            {
+                return;
+            }
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    panic!("the aborted request was never released");
+    panic!("the aborted request was not released and reported idle");
 }
 
 /// Submit every request, then read each stream to its end.
@@ -1989,28 +2447,32 @@ async fn prompt_logprobs_reach_the_frontend_from_the_last_stage() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn token_histories_are_seeded_where_the_row_lost_them() {
-    for depth in [0, 1] {
-        let engine = start_ranks_with(
-            Layout::Single,
-            depth,
-            Tiers::DeviceOnly,
-            Setup {
-                request_token_history: true,
-                ..Setup::default()
-            },
-        )
-        .await;
-        // A fresh request starts its row at position 0, and its decodes
-        // keep extending it: nothing to seed.
-        run(&engine.client, request("first", 40, budget(3))).await;
-        assert!(engine.ranks[0].history.lock().unwrap().is_empty());
-        // The same prompt again hits the prefix cache: its prefill starts
-        // past position 0, so it seeds the cached prefix.
-        run(&engine.client, request("second", 40, budget(3))).await;
-        let seeds = engine.ranks[0].history.lock().unwrap().clone();
-        assert_eq!(seeds.len(), 1, "depth {depth}: {seeds:?}");
-        assert_eq!(seeds[0].1, (1..=32).collect::<Vec<i32>>());
-        drop(engine);
+    for lookback in [None, Some(0), Some(3)] {
+        for depth in [0, 1] {
+            let engine = start_ranks_with(
+                Layout::Single,
+                depth,
+                Tiers::DeviceOnly,
+                Setup {
+                    request_token_history: true,
+                    request_token_history_lookback: lookback,
+                    ..Setup::default()
+                },
+            )
+            .await;
+            // A fresh request starts its row at position 0, and its decodes
+            // keep extending it: nothing to seed.
+            run(&engine.client, request("first", 40, budget(3))).await;
+            assert!(engine.ranks[0].history.lock().unwrap().is_empty());
+            // The same prompt again hits the prefix cache: its prefill starts
+            // past position 0, so it seeds the cached prefix.
+            run(&engine.client, request("second", 40, budget(3))).await;
+            let seeds = engine.ranks[0].history.lock().unwrap().clone();
+            assert_eq!(seeds.len(), 1, "depth {depth}: {seeds:?}");
+            let start = lookback.map_or(0, |n| 32_usize.saturating_sub(n));
+            assert_eq!(seeds[0].1, (start as i32 + 1..33).collect::<Vec<i32>>());
+            drop(engine);
+        }
     }
 }
 
@@ -3046,6 +3508,259 @@ fn disaggregated(
     }
 }
 
+#[test]
+fn a_pd_abort_in_the_submission_round_retires_the_transfer() {
+    for layout in [Layout::Single, Layout::Tp(2)] {
+        for abort_first in [false, true] {
+            let wire = Arc::new(Mutex::new(Wire {
+                prefill_ranks: 1,
+                ..Wire::default()
+            }));
+            let add = EngineRequest::Add(Box::new(disaggregated("cancelled", 70, 20, 4)));
+            let abort = EngineRequest::Abort(vec!["cancelled".to_owned()]);
+            let mut script = vec![Vec::new(); 10];
+            script[0] = if abort_first {
+                vec![abort, add]
+            } else {
+                vec![add, abort]
+            };
+            script[1].push(EngineRequest::Control(Box::new(pause("wait"))));
+            let ranks = run_scripted(
+                layout,
+                1,
+                Tiers::DeviceOnly,
+                Setup {
+                    pd: Some(Pd {
+                        role: Role::Decode,
+                        wire: wire.clone(),
+                    }),
+                    ..Setup::default()
+                },
+                vec![script],
+                no_reaction,
+            );
+            assert!(wire.lock().unwrap().rooms[&70].cancel_pending);
+            assert_eq!(
+                outcome(ranks[0].replies.clone()),
+                [("PauseSchedulerReqOutput", true)]
+            );
+            for rank in ranks {
+                assert_eq!(rank.outcome, Ok(()));
+                assert_eq!(rank.released, [("cancelled".to_owned(), 0)]);
+                assert_eq!(rank.forwards, 0);
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_abort_pause_waits_for_pd_retirement_before_releasing_memory() {
+    assert_pause_waits_for_pd_retirement("abort").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wait_pause_waits_for_failed_pd_retirement_before_releasing_memory() {
+    assert_pause_waits_for_pd_retirement("wait").await;
+}
+
+async fn assert_pause_waits_for_pd_retirement(mode: &str) {
+    let wire = Arc::new(Mutex::new(Wire {
+        prefill_ranks: 2,
+        ..Wire::default()
+    }));
+    wire.lock()
+        .unwrap()
+        .rooms
+        .entry(70)
+        .or_default()
+        .hold_cancel = true;
+    let decode = start_ranks_with(
+        Layout::Tp(2),
+        1,
+        Tiers::DeviceOnly,
+        Setup {
+            pd: Some(Pd {
+                role: Role::Decode,
+                wire: wire.clone(),
+            }),
+            ..Setup::default()
+        },
+    )
+    .await;
+    let stream = decode
+        .client
+        .generate(disaggregated("waiting-kv", 70, 20, 4))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if wire
+                .lock()
+                .unwrap()
+                .rooms
+                .get(&70)
+                .is_some_and(|room| room.preallocated.is_some())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("decode allocated its KV landing pages");
+
+    let paused = control(&decode, pause(mode));
+    tokio::pin!(paused);
+    if mode == "wait" {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut paused)
+                .await
+                .is_err()
+        );
+        wire.lock().unwrap().rooms.get_mut(&70).unwrap().fails = true;
+    }
+    let chunks = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            response = &mut paused => panic!("pause completed before PD retirement: {response:?}"),
+            chunks = collect(stream) => chunks,
+        }
+    })
+    .await
+    .expect("Failed ends the output while Stopped is withheld");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut paused)
+            .await
+            .is_err()
+    );
+    if mode == "abort" {
+        assert!(wire.lock().unwrap().rooms[&70].cancel_pending);
+    }
+    // Failed may already forget the request's output state; the scheduler's
+    // transfer pin must still prevent its pages from being flushed.
+    assert_eq!(
+        control(
+            &decode,
+            ControlRequest::FlushCache(FlushCacheReqInput {
+                rid: None,
+                http_worker_ipc: None,
+            })
+        )
+        .await,
+        [("FlushCacheReqOutput", false)]
+    );
+    wire.lock().unwrap().rooms.get_mut(&70).unwrap().hold_cancel = false;
+    assert_eq!(paused.await, [("PauseSchedulerReqOutput", true)]);
+    assert!(tokens(&chunks).is_empty());
+    assert_eq!(
+        chunks.last().unwrap().finish_reason.as_deref(),
+        Some("abort")
+    );
+    decode.settle().await;
+    for rank in 0..decode.ranks.len() {
+        // The fake device reserves the bootstrap token when it allocates
+        // landing pages; no decode forward may actually have run.
+        assert_eq!(decode.released_on(rank), [("waiting-kv".to_owned(), 1)]);
+        assert!(decode.ranks[rank]
+            .plans
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(_, rids, _)| rids.is_empty()));
+    }
+    assert_eq!(
+        control(
+            &decode,
+            ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
+                rid: None,
+                http_worker_ipc: None,
+                tags: Some(vec!["kv_cache".to_owned()]),
+            })
+        )
+        .await,
+        [("ReleaseMemoryOccupationReqOutput", true)]
+    );
+    assert_eq!(
+        control(
+            &decode,
+            ControlRequest::ResumeMemoryOccupation(ResumeMemoryOccupationReqInput {
+                rid: None,
+                http_worker_ipc: None,
+                tags: Some(vec!["kv_cache".to_owned()]),
+            })
+        )
+        .await,
+        [("ResumeMemoryOccupationReqOutput", true)]
+    );
+    assert_eq!(
+        control(&decode, resume()).await,
+        [("ResumeSchedulerReqOutput", true)]
+    );
+    // A fresh request can use the released pages after a new KV transfer.
+    {
+        let mut wire = wire.lock().unwrap();
+        let room = wire.rooms.entry(71).or_default();
+        room.sent = Some(1000);
+        room.sent_by = vec![0, 1];
+    }
+    assert_eq!(
+        tokens(&run(&decode.client, disaggregated("resumed", 71, 20, 3)).await),
+        [1000, 1001, 1002]
+    );
+}
+
+#[test]
+fn a_prefill_abort_waits_for_its_outstanding_forward_results() {
+    let wire = Arc::new(Mutex::new(Wire {
+        prefill_ranks: 2,
+        ..Wire::default()
+    }));
+    wire.lock().unwrap().rooms.insert(
+        70,
+        WireRoom {
+            decode_registered: true,
+            preallocated: Some(0),
+            ..WireRoom::default()
+        },
+    );
+    let mut script = vec![Vec::new(); 20];
+    script[0].push(EngineRequest::Add(Box::new(disaggregated(
+        "prefilling",
+        70,
+        3000,
+        4,
+    ))));
+    script[3].push(EngineRequest::Control(Box::new(pause("abort"))));
+    let ranks = run_scripted(
+        Layout::Tp(2),
+        2,
+        Tiers::DeviceOnly,
+        Setup {
+            pd: Some(Pd {
+                role: Role::Prefill,
+                wire: wire.clone(),
+            }),
+            ..Setup::default()
+        },
+        vec![script],
+        no_reaction,
+    );
+    assert!(wire.lock().unwrap().rooms[&70].cancel_pending);
+    assert_eq!(
+        outcome(ranks[0].replies.clone()),
+        [("PauseSchedulerReqOutput", true)]
+    );
+    assert_eq!(
+        ranks[0].finished,
+        [("prefilling".to_owned(), "abort".to_owned())]
+    );
+    for rank in ranks {
+        assert_eq!(rank.outcome, Ok(()));
+        assert!(rank.forwards > 0 && rank.forwards < 12);
+        assert_eq!(rank.released.len(), 1);
+        assert_eq!(rank.released[0].0, "prefilling");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_prompt_prefills_on_one_engine_and_decodes_on_the_other() {
     for (prefill_layout, depth) in [
@@ -3158,9 +3873,10 @@ async fn a_prefill_engine_writes_back_what_it_evicts_and_loads_it_back() {
 
     // The device acknowledges nothing until the test opens its gate. While
     // the third prompt's write-backs are unacknowledged, none of the pages
-    // they carry is reused from the Host: the first prompt sent again
-    // computes them anew, evicting the second prompt's last pages. Once the
-    // gate opens, the second prompt sent again loads those back.
+    // they carry is reused from the Host. The first prompt sent again waits
+    // for those copies instead of recomputing a shorter prefix. Opening the
+    // gate lets it load them back, evicting the second prompt's last pages;
+    // the second prompt sent again loads those back too.
     let (prefill, decode, _wire) = start_pd_pair(
         1,
         Layout::Single,
@@ -3180,38 +3896,25 @@ async fn a_prefill_engine_writes_back_what_it_evicts_and_loads_it_back() {
         ("b-again", 10_000),
     ];
     for (room, (rid, first)) in (70_u64..).zip(prompts) {
-        if rid == "b-again" {
-            assert_eq!(prefill.cache_ops(CacheOpKind::LoadBack), 0);
-            assert!(prefill.ranks[0].acknowledged.lock().unwrap().is_empty());
-            prefill.ranks[0].ack_gate.open();
-            let written_back = prefill.cache_ops(CacheOpKind::WriteBack);
-            for _ in 0..500 {
-                if prefill.ranks[0].acknowledged.lock().unwrap().len() == written_back {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            assert_eq!(
-                prefill.ranks[0].acknowledged.lock().unwrap().len(),
-                written_back
-            );
-        }
         let request = TokenizedGenerateReqInput {
             input_ids: Some((first + 1..=first + 3000).collect()),
             ..disaggregated(rid, room, 1, 2)
         };
-        let (prefilled, decoded) = tokio::join!(
-            run(&prefill.client, request.clone()),
-            run(&decode.client, request)
-        );
+        let prefilled = prefill.client.generate(request.clone()).await.unwrap();
+        let decoded = decode.client.generate(request).await.unwrap();
+        if rid == "a-again" {
+            assert_eq!(prefill.cache_ops(CacheOpKind::LoadBack), 0);
+            assert!(prefill.ranks[0].acknowledged.lock().unwrap().is_empty());
+            prefill.ranks[0].ack_gate.open();
+        }
+        let (prefilled, decoded) = tokio::join!(collect(prefilled), collect(decoded));
         assert_eq!(tokens(&prefilled), [1000], "{rid} held");
         assert_eq!(tokens(&decoded), [1000, 1001], "{rid} held");
         cached.push(prefilled.last().unwrap().cached_tokens);
     }
-    // The first prompt sent again hits only the full pages the Device kept;
-    // the second hits all of its own, loading the written-back ones.
-    assert_eq!(prefill.cache_ops(CacheOpKind::LoadBack), 1);
-    assert_eq!(cached, [0, 0, 0, 136 * 16, 187 * 16]);
+    // Both repeated prompts reuse all their full pages after the stores land.
+    assert_eq!(prefill.cache_ops(CacheOpKind::LoadBack), 2);
+    assert_eq!(cached, [0, 0, 0, 187 * 16, 187 * 16]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3543,6 +4246,7 @@ fn outcome(replies: Vec<ControlOutput>) -> Vec<(&'static str, bool)> {
                 ControlOutput::ResumeMemoryOccupation(r) => r.success,
                 ControlOutput::IsSleeping(r) => r.is_sleeping,
                 ControlOutput::Profile(r) => r.success,
+                ControlOutput::ReloadForward(r) => r.success,
                 other => panic!("unexpected {}", other.tag()),
             };
             (reply.tag(), flag)
@@ -3606,6 +4310,100 @@ async fn a_wait_pause_answers_once_drained_and_withholds_new_requests() {
         chunks.push(chunk.unwrap());
     }
     assert_eq!(tokens(&chunks), [1000, 1001, 1002]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forward_reload_drains_runs_once_on_every_rank_and_resumes() {
+    let engine = start_ranks(Layout::Tp(2), 1, Tiers::DeviceOnly).await;
+    let running = engine
+        .client
+        .generate(request("r1", 3, budget(40)))
+        .await
+        .unwrap();
+    let reload = ControlRequest::ReloadForward(ReloadForwardReqInput {
+        rid: None,
+        http_worker_ipc: None,
+        mode: "wait".to_owned(),
+        modules: None,
+        id: Some("tp".to_owned()),
+        timeout_s: None,
+    });
+    // The reload answers only after r1 finished, on the old code.
+    let (reloaded, chunks) = tokio::join!(control(&engine, reload), collect(running));
+    assert_eq!(reloaded, [("ReloadForwardReqOutput", true)]);
+    assert_eq!(tokens(&chunks).len(), 40);
+    for rank in &engine.ranks {
+        assert_eq!(*rank.device_ops.lock().unwrap(), ["ReloadForwardReqInput"]);
+    }
+    // It resumed on its own: a new request is served.
+    let served = collect(
+        engine
+            .client
+            .generate(request("r2", 3, budget(3)))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(tokens(&served), [1000, 1001, 1002]);
+}
+
+#[test]
+fn a_reload_runs_once_every_dp_engine_holds_the_same_one() {
+    let reload = |id: &str| {
+        EngineRequest::Control(Box::new(ControlRequest::ReloadForward(
+            ReloadForwardReqInput {
+                rid: None,
+                http_worker_ipc: None,
+                mode: "wait".to_owned(),
+                modules: None,
+                id: Some(id.to_owned()),
+                timeout_s: None,
+            },
+        )))
+    };
+    let mut first: Script = vec![Vec::new(); 14];
+    let mut second: Script = vec![Vec::new(); 14];
+    // Sent to one engine only, it waits there until a resume cancels it.
+    first[0].push(reload("lost"));
+    first[3].push(EngineRequest::Control(Box::new(resume())));
+    // Different reloads at the two heads wait, never fail the loop.
+    first[5].push(reload("a"));
+    second[5].push(reload("b"));
+    first[7].push(EngineRequest::Control(Box::new(resume())));
+    second[7].push(EngineRequest::Control(Box::new(resume())));
+    // The same one on both runs once on each, in the round both drained.
+    first[8].push(reload("both"));
+    second[9].push(reload("both"));
+    let ranks = run_scripted(
+        Layout::Dp(2),
+        1,
+        Tiers::DeviceOnly,
+        Setup::default(),
+        vec![first, second],
+        no_reaction,
+    );
+    for rank in &ranks {
+        assert_eq!(rank.outcome, Ok(()));
+        assert_eq!(rank.device_ops, ["ReloadForwardReqInput"]);
+    }
+    assert_eq!(
+        outcome(ranks[0].replies.clone()),
+        [
+            ("ReloadForwardReqOutput", false),
+            ("ResumeSchedulerReqOutput", true),
+            ("ReloadForwardReqOutput", false),
+            ("ResumeSchedulerReqOutput", true),
+            ("ReloadForwardReqOutput", true)
+        ]
+    );
+    assert_eq!(
+        outcome(ranks[1].replies.clone()),
+        [
+            ("ReloadForwardReqOutput", false),
+            ("ResumeSchedulerReqOutput", true),
+            ("ReloadForwardReqOutput", true)
+        ]
+    );
 }
 
 /// A JSON schema the toy vocabulary takes most of a second to compile.
@@ -3773,9 +4571,198 @@ async fn flushes_and_weight_updates_run_on_every_data_parallel_rank() {
             ["UpdateWeightFromDiskReqInput"]
         );
     }
+    assert_weight_commits(&engine, &[true]).await;
     // Serving goes on.
     let chunks = run(&engine.client, request("r", 3, budget(2))).await;
     assert_eq!(tokens(&chunks), [1000, 1001]);
+}
+
+/// Wait until every rank recorded `expected` weight commits. The reply
+/// comes from one rank once the replica agreed; its peers record their own
+/// commit right after the same agreement, on their own threads.
+async fn assert_weight_commits(engine: &Engine, expected: &[bool]) {
+    let settled = tokio::time::timeout(Duration::from_secs(10), async {
+        while !engine
+            .ranks
+            .iter()
+            .all(|rank| *rank.weight_commits.lock().unwrap() == expected)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    if settled.is_err() {
+        let commits: Vec<Vec<bool>> = engine
+            .ranks
+            .iter()
+            .map(|rank| rank.weight_commits.lock().unwrap().clone())
+            .collect();
+        panic!("weight commits {commits:?}, expected {expected:?} on every rank");
+    }
+}
+
+/// Flush until every engine accepts: a request that just finished (or a
+/// Host cache op still in flight) refuses a flush for a round or two.
+async fn flush_until_idle(engine: &Engine) {
+    let flush = ControlRequest::FlushCache(FlushCacheReqInput {
+        rid: None,
+        http_worker_ipc: None,
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while control(engine, flush.clone())
+            .await
+            .iter()
+            .any(|(_, ok)| !ok)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the engine did not go idle");
+}
+
+fn disk_load() -> ControlRequest {
+    ControlRequest::UpdateWeightFromDisk(UpdateWeightFromDiskReqInput {
+        rid: None,
+        http_worker_ipc: None,
+        model_path: "/checkpoint".to_owned(),
+        load_format: None,
+        weight_version: None,
+        flush_cache: true,
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_weight_flush_commits_nothing_and_can_be_retried() {
+    for layout in [Layout::Single, Layout::Tp(2), Layout::Dp(2), Layout::Pp(2)] {
+        let engine = start_ranks_with(
+            layout,
+            1,
+            Tiers::HostL2,
+            Setup {
+                held_cache_acks: true,
+                ..Setup::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            tokens(&run(&engine.client, request("warm", 65, budget(2))).await),
+            [1000, 1001]
+        );
+        for _ in 0..500 {
+            if engine.cache_ops(CacheOpKind::WriteBack) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(engine.cache_ops(CacheOpKind::WriteBack) > 0);
+        // A write-back in flight refuses the flush, so no rank loads.
+        let refused = control(&engine, disk_load()).await;
+        assert_eq!(refused.len(), layout.sizes().2);
+        assert!(refused.iter().all(|(_, success)| !success));
+        for rank in &engine.ranks {
+            assert!(rank.device_ops.lock().unwrap().is_empty());
+            assert!(rank.weight_commits.lock().unwrap().is_empty());
+        }
+        // The untouched weights keep serving.
+        assert_eq!(
+            tokens(&run(&engine.client, request("after-refusal", 3, budget(2))).await),
+            [1000, 1001]
+        );
+        for rank in &engine.ranks {
+            rank.ack_gate.open();
+        }
+        flush_until_idle(&engine).await;
+        assert!(control(&engine, disk_load())
+            .await
+            .iter()
+            .all(|(_, success)| *success));
+        assert_weight_commits(&engine, &[true]).await;
+        assert_eq!(
+            tokens(&run(&engine.client, request("after-retry", 3, budget(2))).await),
+            [1000, 1001]
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_load_refused_by_any_rank_runs_on_none_and_can_be_retried() {
+    for layout in [Layout::Single, Layout::Tp(2), Layout::Dp(2), Layout::Pp(2)] {
+        // Every rank refuses, or only rank zero while its peers are ready:
+        // a ready peer must not start loading without it.
+        let refusals: [fn(usize) -> bool; 2] = [|_| true, |rank| rank == 0];
+        for refused in refusals {
+            let engine = start_ranks_with(
+                layout,
+                1,
+                Tiers::DeviceOnly,
+                Setup {
+                    weight_load_refused: Some(refused),
+                    ..Setup::default()
+                },
+            )
+            .await;
+            run(&engine.client, request("warm", 65, budget(2))).await;
+            let replies = control(&engine, disk_load()).await;
+            assert_eq!(replies.len(), layout.sizes().2);
+            assert!(replies.iter().all(|(_, success)| !success));
+            for rank in &engine.ranks {
+                assert!(rank.device_ops.lock().unwrap().is_empty());
+                assert!(rank.weight_commits.lock().unwrap().is_empty());
+            }
+            // The refusal came before the load's flush: the prefix cache
+            // still serves the warm prompt (on the one engine that took it).
+            let one_engine = layout.sizes().2 == 1;
+            let chunks = run(&engine.client, request("after-refusal", 65, budget(2))).await;
+            assert_eq!(tokens(&chunks), [1000, 1001]);
+            if one_engine {
+                assert!(chunks.last().unwrap().cached_tokens > 0, "{layout:?}");
+            }
+            for rank in &engine.ranks {
+                rank.weight_load_refused.store(false, Ordering::SeqCst);
+            }
+            // The retry's flush can race the request that just finished; a
+            // refused flush loads and commits nothing, so send it again.
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while control(&engine, disk_load())
+                    .await
+                    .iter()
+                    .any(|(_, success)| !success)
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the retried load never succeeded");
+            assert_weight_commits(&engine, &[true]).await;
+            // An admitted load flushes as asked.
+            let chunks = run(&engine.client, request("after-retry", 65, budget(2))).await;
+            assert_eq!(tokens(&chunks), [1000, 1001]);
+            assert_eq!(chunks.last().unwrap().cached_tokens, 0, "{layout:?}");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_weight_load_is_committed_as_invalid_on_every_rank() {
+    for layout in [Layout::Dp(2), Layout::Tp(2), Layout::Pp(2)] {
+        let engine = start_ranks_with(
+            layout,
+            1,
+            Tiers::DeviceOnly,
+            Setup {
+                weight_update_failure_rank: Some(1),
+                ..Setup::default()
+            },
+        )
+        .await;
+        let replies = control(&engine, disk_load()).await;
+        assert_eq!(replies.len(), layout.sizes().2);
+        assert!(replies
+            .iter()
+            .all(|(tag, success)| { *tag == "UpdateWeightFromDiskReqOutput" && !success }));
+        assert_weight_commits(&engine, &[false]).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3890,6 +4877,166 @@ async fn memory_is_released_after_the_drain_and_resumed_in_reverse_order() {
     assert_eq!(tokens(&chunks), [1000, 1001]);
 }
 
+#[test]
+fn dp_memory_release_waits_for_every_rank_to_pause_and_drain() {
+    let release = ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
+        rid: None,
+        http_worker_ipc: None,
+        tags: None,
+    });
+    for peer_pause in [pause("wait"), release.clone()] {
+        let peer_releases = matches!(&peer_pause, ControlRequest::ReleaseMemoryOccupation(_));
+        let mut busy = vec![Vec::new(); 340];
+        busy[0].push(EngineRequest::Add(Box::new(request(
+            "busy",
+            3,
+            budget(300),
+        ))));
+        busy[10].push(EngineRequest::Control(Box::new(peer_pause)));
+        let mut idle = vec![Vec::new(); 340];
+        idle[2].push(EngineRequest::Control(Box::new(release.clone())));
+        let ranks = run_scripted(
+            Layout::Dp(2),
+            0,
+            Tiers::DeviceOnly,
+            Setup::default(),
+            vec![busy, idle],
+            no_reaction,
+        );
+        for rank in &ranks {
+            assert!(rank.outcome.is_ok(), "{:?}", rank.outcome);
+            assert!(outcome(rank.replies.clone()).iter().all(|(_, ok)| *ok));
+        }
+        assert_eq!(
+            ranks[0].finished,
+            [("busy".to_owned(), "length".to_owned())]
+        );
+        assert!(ranks[0].forwards >= 300);
+        // Every real forward still has its peer's device participation,
+        // including the rounds after the idle rank requested its release.
+        assert_eq!(ranks[1].idle_forwards, ranks[0].forwards);
+        assert_eq!(ranks[1].device_ops, ["release kv_cache,weights"]);
+        assert_eq!(
+            outcome(ranks[0].replies.clone()),
+            [(
+                if peer_releases {
+                    "ReleaseMemoryOccupationReqOutput"
+                } else {
+                    "PauseSchedulerReqOutput"
+                },
+                true
+            )]
+        );
+        assert_eq!(
+            outcome(ranks[1].replies.clone()),
+            [("ReleaseMemoryOccupationReqOutput", true)]
+        );
+    }
+}
+
+#[test]
+fn dp_memory_release_waits_for_an_idle_peer_to_pause() {
+    let mut peer = vec![Vec::new(); 60];
+    peer[12].push(EngineRequest::Add(Box::new(request(
+        "later",
+        3,
+        budget(20),
+    ))));
+    let mut releasing = vec![Vec::new(); 60];
+    releasing[2].push(EngineRequest::Control(Box::new(
+        ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
+            rid: None,
+            http_worker_ipc: None,
+            tags: None,
+        }),
+    )));
+    let ranks = run_scripted(
+        Layout::Dp(2),
+        0,
+        Tiers::DeviceOnly,
+        Setup::default(),
+        vec![peer, releasing],
+        no_reaction,
+    );
+    for rank in &ranks {
+        assert!(rank.outcome.is_ok(), "{:?}", rank.outcome);
+        assert!(
+            rank.device_ops.is_empty(),
+            "an unpaused peer prevents release"
+        );
+        assert!(rank.replies.is_empty());
+    }
+    assert_eq!(
+        ranks[0].finished,
+        [("later".to_owned(), "length".to_owned())]
+    );
+    assert_eq!(ranks[1].idle_forwards, ranks[0].forwards);
+}
+
+#[test]
+fn dp_memory_resume_waits_for_every_rank_and_region_before_forwarding() {
+    for wake_peer in [false, true] {
+        let mut scripts = vec![vec![Vec::new(); 90]; 2];
+        for (rank, script) in scripts.iter_mut().enumerate() {
+            script[0].push(EngineRequest::Control(Box::new(
+                ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
+                    rid: None,
+                    http_worker_ipc: None,
+                    tags: None,
+                }),
+            )));
+            for (round, tag) in [(4 + rank * 16, "weights"), (8 + rank * 22, "kv_cache")] {
+                if rank == 1 && tag == "kv_cache" && !wake_peer {
+                    continue;
+                }
+                script[round].push(EngineRequest::Control(Box::new(
+                    ControlRequest::ResumeMemoryOccupation(ResumeMemoryOccupationReqInput {
+                        rid: None,
+                        http_worker_ipc: None,
+                        tags: Some(vec![tag.to_owned()]),
+                    }),
+                )));
+            }
+        }
+        scripts[0][5].push(EngineRequest::Add(Box::new(request(
+            "awake",
+            3,
+            budget(40),
+        ))));
+        let ranks = run_scripted(
+            Layout::Dp(2),
+            0,
+            Tiers::DeviceOnly,
+            Setup::default(),
+            scripts,
+            no_reaction,
+        );
+        for rank in &ranks {
+            assert!(rank.outcome.is_ok(), "{:?}", rank.outcome);
+            assert!(outcome(rank.replies.clone()).iter().all(|(_, ok)| *ok));
+        }
+        assert_eq!(
+            ranks[0].device_ops,
+            [
+                "release kv_cache,weights",
+                "resume weights",
+                "resume kv_cache"
+            ]
+        );
+        assert_eq!(ranks[1].idle_forwards, ranks[0].forwards);
+        if wake_peer {
+            assert_eq!(
+                ranks[0].finished,
+                [("awake".to_owned(), "length".to_owned())]
+            );
+            assert!(ranks[0].forwards >= 40);
+        } else {
+            assert!(ranks[0].finished.is_empty());
+            assert_eq!(ranks[0].forwards, 0);
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn memory_release_waits_for_the_host_stores_in_flight() {
     // The devices hold every cache acknowledgment until the test opens their
@@ -3898,7 +5045,12 @@ async fn memory_release_waits_for_the_host_stores_in_flight() {
     // Host; under write-back, what the third of three 3000-token prompts
     // evicts of the first one. Either way the KV cache cannot be cleared, nor
     // released, until the stores land.
-    for layout in [Layout::Single, Layout::Tp(2), Layout::TpKvp(2, 2)] {
+    for layout in [
+        Layout::Single,
+        Layout::Tp(2),
+        Layout::TpKvp(2, 2),
+        Layout::Dp(2),
+    ] {
         for (tiers, prompts) in [
             (Tiers::HostL2, &[("r1", 0, 65)][..]),
             (
@@ -3908,6 +5060,7 @@ async fn memory_release_waits_for_the_host_stores_in_flight() {
         ] {
             let write_back = matches!(tiers, Tiers::HostL2WriteBack);
             let case = format!("{layout:?}, write-back {write_back}");
+            let num_engines = layout.sizes().2;
             let engine = start_ranks_with(
                 layout,
                 1,
@@ -3924,6 +5077,7 @@ async fn memory_release_waits_for_the_host_stores_in_flight() {
                     &engine.client,
                     TokenizedGenerateReqInput {
                         input_ids: Some((first + 1..=first + len).collect()),
+                        data_parallel_rank: Some(0),
                         ..request(rid, 1, budget(2))
                     },
                 )
@@ -3963,7 +5117,7 @@ async fn memory_release_waits_for_the_host_stores_in_flight() {
                 .unwrap();
             assert_eq!(
                 outcome(released),
-                [("ReleaseMemoryOccupationReqOutput", true)],
+                vec![("ReleaseMemoryOccupationReqOutput", true); num_engines],
                 "{case}"
             );
             let wake = ControlRequest::ResumeMemoryOccupation(ResumeMemoryOccupationReqInput {
@@ -3973,7 +5127,7 @@ async fn memory_release_waits_for_the_host_stores_in_flight() {
             });
             assert_eq!(
                 control(&engine, wake).await,
-                [("ResumeMemoryOccupationReqOutput", true)],
+                vec![("ResumeMemoryOccupationReqOutput", true); num_engines],
                 "{case}"
             );
             // The first prompt is served exactly after the wake. Under
@@ -3986,6 +5140,7 @@ async fn memory_release_waits_for_the_host_stores_in_flight() {
                 &engine.client,
                 TokenizedGenerateReqInput {
                     input_ids: Some((first + 1..=first + len).collect()),
+                    data_parallel_rank: Some(0),
                     ..request("again", 1, budget(2))
                 },
             )
@@ -4073,6 +5228,7 @@ fn an_engine_stops_once_its_frontend_is_gone() {
     )))]];
     for (rank, outcome) in run_scripted(
         Layout::Tp(2),
+        0,
         Tiers::DeviceOnly,
         Setup::default(),
         vec![script],
@@ -4107,6 +5263,7 @@ fn a_frozen_data_parallel_rank_keeps_its_rebalance_in_step() {
     second[60].push(EngineRequest::Control(Box::new(resume())));
     let ranks = run_scripted(
         Layout::Dp(2),
+        0,
         Tiers::DeviceOnly,
         Setup {
             eplb: Some(eplb_config),
@@ -4157,6 +5314,7 @@ fn a_flush_under_a_keep_pause_runs_once_the_cache_work_did() {
     )));
     let ranks = run_scripted(
         Layout::Single,
+        0,
         Tiers::HostL2,
         Setup::default(),
         vec![script],

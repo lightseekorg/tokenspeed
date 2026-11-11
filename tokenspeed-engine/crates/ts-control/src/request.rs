@@ -28,6 +28,8 @@ use ts_wire::{
     value::Value,
 };
 
+use crate::grammar::ReasoningGrammar;
+
 /// Why an abort happened, as the frontend sees it (`ABORT_CODE`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AbortCode {
@@ -159,8 +161,62 @@ pub struct StopCriteria {
     pub token_limit: i64,
 }
 
+/// Cache ownership IDs have the same UTF-8 byte limit at ingress and demotion.
+pub(crate) const MAX_CACHE_SESSION_ID_BYTES: usize = 4096;
+
 /// The device's per-request stop table width (`MAX_STOP_TOKEN_IDS`).
 pub const MAX_STOP_TOKEN_IDS: usize = 16;
+
+/// A request's cumulative reasoning-token usage, counted by token id before
+/// detokenization. Delimiters belong to neither the reasoning nor the answer.
+#[derive(Debug, Clone, Copy)]
+pub struct ReasoningTokens {
+    open_id: i32,
+    close_id: i32,
+    implicit_closer: i32,
+    in_reasoning: bool,
+    count: i64,
+}
+
+impl ReasoningTokens {
+    /// Start a counter from the request's rendered prompt.
+    pub fn new(grammar: &ReasoningGrammar, prompt_ids: &[i32]) -> Self {
+        let (open_id, close_id) = grammar.markers.unwrap_or((-1, -1));
+        let in_reasoning = open_id >= 0
+            && prompt_ids
+                .iter()
+                .rposition(|&id| id == open_id || id == close_id)
+                .is_some_and(|i| prompt_ids[i] == open_id);
+        // Templates without known single-token markers cannot account by
+        // token id; leave them at zero rather than counting the whole reply.
+        Self {
+            open_id,
+            close_id,
+            implicit_closer: grammar.implicit_closer.unwrap_or(-1),
+            in_reasoning,
+            count: 0,
+        }
+    }
+
+    /// Add committed output tokens. Retraction keeps these tokens and only
+    /// rebuilds their KV prefix, so each one is counted exactly once.
+    pub fn push(&mut self, token_ids: impl IntoIterator<Item = i32>) {
+        for id in token_ids {
+            if id == self.open_id {
+                self.in_reasoning = true;
+            } else if id == self.close_id || id == self.implicit_closer {
+                self.in_reasoning = false;
+            } else if self.in_reasoning {
+                self.count += 1;
+            }
+        }
+    }
+
+    /// Tokens inside the reasoning block so far.
+    pub fn count(&self) -> i64 {
+        self.count
+    }
+}
 
 /// One admitted request.
 #[derive(Debug, Clone)]
@@ -192,8 +248,13 @@ pub struct RequestState {
     pub computed_length: i64,
     /// Generated tokens.
     pub output_ids: Vec<i32>,
+    /// Cumulative reasoning usage; `None` without a reasoning parser.
+    pub reasoning_tokens: Option<ReasoningTokens>,
     /// Their logprobs, when requested.
     pub output_logprobs: Vec<f64>,
+    /// Selected tokens' cumulative probability mass, when diagnostics and
+    /// logprobs are enabled.
+    pub output_token_cumulative_probs: Vec<f64>,
     /// Their top-k alternatives' logprobs and ids, when requested.
     pub output_top_logprobs: Option<TopLogprobs>,
     /// The prompt positions' logprobs as the chunks deliver them, over
@@ -207,8 +268,14 @@ pub struct RequestState {
     pub input_logprobs_sent: bool,
     /// Prompt tokens served from the prefix cache.
     pub cached_tokens: i64,
+    /// The continual-prompting session the request belongs to, when it
+    /// names one; traces group a session's requests under it.
+    pub session_id: Option<String>,
     /// Speculative verify rounds this request took part in.
     pub spec_verify_ct: i64,
+    /// The decode reservation last sent to the scheduler
+    /// (`UpdateReserveNumTokens`), which keeps it until it is sent another.
+    pub decode_reserve: Option<i32>,
     /// Once it finished with speculative decoding, its accepted tokens per
     /// verify round.
     pub accept_draft_tokens: Option<f64>,
@@ -229,8 +296,14 @@ pub struct RequestState {
     /// When the frontend received it (wall-clock seconds), 0 if it did not
     /// say.
     pub created_time: f64,
+    /// When its first output token existed (wall-clock seconds), 0 until
+    /// then. Unlike `timings`, this is collected whenever the rank reports
+    /// engine metrics.
+    pub first_token_time: f64,
     /// Its lifecycle timestamps, with `--enable-log-request-stats`.
     pub timings: Option<crate::request_stats::RequestTimings>,
+    /// Sampled PD timings, consumed at the first output or terminal release.
+    pub(crate) ttft: Option<Box<crate::request_stats::TtftTrace>>,
     /// The matcher of its grammar, once compiled.
     pub grammar: Option<RequestGrammar>,
 
@@ -287,14 +360,18 @@ impl RequestState {
             returns_input_logprobs: false,
             computed_length: 0,
             output_ids: Vec::new(),
+            reasoning_tokens: None,
             output_logprobs: Vec::new(),
+            output_token_cumulative_probs: Vec::new(),
             output_top_logprobs: None,
             input_logprob_rows: None,
             input_top_logprob_rows: None,
             input_logprobs: None,
             input_logprobs_sent: false,
             cached_tokens: 0,
+            session_id: None,
             spec_verify_ct: 0,
+            decode_reserve: None,
             accept_draft_tokens: None,
             numerical_error_detected: false,
             finished_reason: None,
@@ -302,7 +379,9 @@ impl RequestState {
             abort_notify_client: false,
             submitted_at: None,
             created_time: 0.0,
+            first_token_time: 0.0,
             timings: None,
+            ttft: None,
             grammar: None,
             admission: 0,
             send_token_offset: 0,
@@ -536,6 +615,48 @@ mod tests {
             None,
             false,
         )
+    }
+
+    fn reasoning(markers: Option<(i32, i32)>, implicit_closer: Option<i32>) -> ReasoningGrammar {
+        ReasoningGrammar {
+            continues: String::new(),
+            may_open: String::new(),
+            schema_slot: String::new(),
+            markers,
+            implicit_closer,
+        }
+    }
+
+    #[test]
+    fn reasoning_usage_excludes_structural_markers() {
+        let grammar = reasoning(Some((1, 2)), Some(3));
+        let mut tokens = ReasoningTokens::new(&grammar, &[9, 1]);
+        tokens.push([10, 11, 2, 12]);
+        assert_eq!(tokens.count(), 2);
+
+        // DeepSeek V4.1 may enter a tool block directly, without </think>.
+        tokens.push([1, 13, 3, 14]);
+        assert_eq!(tokens.count(), 3);
+    }
+
+    #[test]
+    fn reasoning_usage_starts_from_the_prompt_state() {
+        let grammar = reasoning(Some((1, 2)), None);
+        for (prompt, output, expected) in [
+            (vec![1, 2], vec![10, 1, 11, 2, 12], 1),
+            (vec![], vec![10, 1, 11], 1),
+            (vec![1], vec![10, 11], 2),
+        ] {
+            let mut tokens = ReasoningTokens::new(&grammar, &prompt);
+            tokens.push(output);
+            assert_eq!(tokens.count(), expected, "prompt: {prompt:?}");
+        }
+
+        // A template without known single-token markers cannot account by
+        // token id; it must not count the whole reply as reasoning.
+        let mut unmarked = ReasoningTokens::new(&reasoning(None, None), &[]);
+        unmarked.push([10, 11]);
+        assert_eq!(unmarked.count(), 0);
     }
 
     #[test]

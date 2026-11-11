@@ -30,6 +30,10 @@ from tokenspeed.runtime.layers.attention.backends.paged.base import (
 from tokenspeed.runtime.layers.attention.backends.paged.cache_group_geometry import (
     CacheGroupGeometry,
 )
+from tokenspeed.runtime.layers.attention.backends.paged.group_tables import (
+    GroupTableSpec,
+    GroupTableStacks,
+)
 from tokenspeed.runtime.layers.attention.backends.paged.router import CacheGroupRouter
 from tokenspeed.runtime.layers.attention.backends.paged.write_locations import (
     decode_write_locations,
@@ -235,6 +239,40 @@ class TestBaseWriteLocationsDefaultTest:
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))
+
+
+class TestInt32WriteSlots:
+    def test_stacked_slots_refresh_and_pad_without_replacing_decode_storage(self):
+        stacks = GroupTableStacks(
+            [GroupTableSpec("history", 128, 128, 2)],
+            max_bs=1,
+            max_tokens_per_req=4,
+            max_extend_tokens=4,
+            device="cpu",
+        )
+        stacks.fill(1, 1, {"history": torch.tensor([[17, 18]], dtype=torch.int32)})
+        lengths = torch.tensor([2], dtype=torch.int32)
+        stacks.compute_decode_locations(1, lengths, 1)
+        view = stacks.decode_locations("history", 1, 1)
+        pointer = view.data_ptr()
+        assert view.dtype == torch.int32 and view.tolist() == [17 * 128 + 1]
+        one = torch.ones(1, dtype=torch.int32)
+        stacks.extend_locations(one, one, 1)
+        stacks.append_decode_rows(0, 1)
+        padded = stacks.padded_extend_span("history", 4)
+        assert padded.dtype == torch.int32
+        assert padded.tolist() == [17 * 128 + 1, 17 * 128 + 1, 0, 0]
+        fresh = stacks.extend_locations(one, torch.full_like(one, 5), 5)["history"]
+        assert fresh.dtype == torch.int32
+        assert fresh.tolist() == [17 * 128 + offset for offset in range(1, 6)]
+        assert stacks.padded_extend_span("history", 7).tolist() == fresh.tolist() + [
+            0,
+            0,
+        ]
+        stacks.tables[0, 0, 0].fill_(19)
+        lengths.fill_(3)
+        stacks.compute_decode_locations(1, lengths, 1)
+        assert view.data_ptr() == pointer and view.tolist() == [19 * 128 + 2]
 
 
 class TestHostPageSizeMirror:

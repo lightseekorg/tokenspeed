@@ -27,6 +27,7 @@ from unittest import mock
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.sampling.triton import dflash2_sample_path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
@@ -36,17 +37,14 @@ register_cuda_ci(est_time=30, suite="runtime-1gpu")
 from tokenspeed.runtime.configs.model_config import _is_dflash2_mla
 from tokenspeed.runtime.execution.drafter import get_drafter_impl
 from tokenspeed.runtime.execution.drafter.dflash import DFlash
-from tokenspeed.runtime.execution.drafter.dflash2 import (
-    DFlash2,
-    _greedy_path_torch,
-    _walk_greedy_path,
-)
+from tokenspeed.runtime.execution.drafter.dflash2 import DFlash2
 
 # Imported for its register_backend() side effects on _BACKEND_REGISTRY.
 from tokenspeed.runtime.layers.attention import backends  # noqa: F401
 from tokenspeed.runtime.layers.attention.registry import _BACKEND_REGISTRY
 from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
+from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.models import dflash as dflash_model
 from tokenspeed.runtime.models.dflash import DFlashDraftModel
 from tokenspeed.runtime.models.dflash2 import (
@@ -149,6 +147,49 @@ def test_dflash2_mla_model_mode_and_yarn_config() -> None:
     }
 
 
+@_CUDA_ONLY
+def test_mla_draft_layers_build_windowed_mla_attention() -> None:
+    from transformers import PretrainedConfig
+
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.models.kimi_k3_dspark import K3DSparkAttention
+
+    config = PretrainedConfig(
+        vocab_size=64,
+        hidden_size=256,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        q_lora_rank=64,
+        kv_lora_rank=64,
+        qk_nope_head_dim=32,
+        qk_rope_head_dim=16,
+        v_head_dim=32,
+        rms_norm_eps=1e-6,
+        max_position_embeddings=4096,
+        rope_theta=10000.0,
+        layer_types=["sliding_attention", "full_attention"],
+        sliding_window=1024,
+        dflash_config={
+            "attention_mode": "mla",
+            "block_size": 16,
+            "conv_group_size": 16,
+            "conv_kernel_size": 2,
+            "selector_rank": 8,
+            "selector_top_k": 4,
+            "target_layer_ids": [0],
+        },
+    )
+    with torch.device("cuda"):
+        model = DFlash2DraftModel(config, Mapping(rank=0, world_size=1))
+
+    for layer, window in zip(model.layers, (1023, -1), strict=True):
+        assert isinstance(layer.self_attn, K3DSparkAttention)
+        assert layer.self_attn.attn_mqa.sliding_window_size == window
+        assert layer.self_attn.attn_mha.sliding_window_size == window
+        assert layer.comm_manager is not None
+
+
 @pytest.mark.parametrize(
     ("attention_config", "expected_sliding_window"),
     (
@@ -202,7 +243,9 @@ def test_block_drafter_declares_only_its_sliding_mask(
 
 def test_candidate_logits_processor_is_created_after_target_wiring() -> None:
     drafter = DFlash2.__new__(DFlash2)
-    drafter.model = SimpleNamespace(config=SimpleNamespace(vocab_size=32))
+    drafter.model = SimpleNamespace(
+        config=SimpleNamespace(vocab_size=32), fp8_head=None
+    )
     drafter.output_multiplier = 1.25
     drafter.final_logit_softcapping = 8.0
     drafter.candidate_logits_processor = None
@@ -215,6 +258,7 @@ def test_candidate_logits_processor_is_created_after_target_wiring() -> None:
         tp_size=1,
         tp_group=None,
         skip_all_gather=False,
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
 
@@ -269,17 +313,52 @@ _WINDOW_AWARE_BACKENDS = frozenset(
 )
 
 
+def _draft_attention(
+    window: int, sink: int = 0, *, layer_id: int = 0
+) -> PagedAttention:
+    """A real draft attention layer carrying the given window and sink."""
+    return PagedAttention(
+        num_heads=1,
+        head_dim=8,
+        scaling=1.0,
+        num_kv_heads=1,
+        layer_id=layer_id,
+        sliding_window_size=window,
+        sliding_window_sink=sink,
+        rotary_emb=None,
+        qk_norm=None,
+    )
+
+
 def _window_validator(*windows: int, supported: bool, backend: str) -> DFlash:
     """A DFlash stub whose draft layers carry the given window_lefts."""
     model = torch.nn.Module()
-    model.layers = torch.nn.ModuleList()
-    for window in windows:
-        attention = torch.nn.Module()
-        attention.sliding_window_size = window
-        model.layers.append(attention)
+    model.layers = torch.nn.ModuleList(
+        _draft_attention(window, layer_id=layer_id)
+        for layer_id, window in enumerate(windows)
+    )
     drafter = DFlash.__new__(DFlash)
     drafter.model = model
     drafter.attn_backend = SimpleNamespace(supports_layer_sliding_window=supported)
+    drafter.draft_model_runner = SimpleNamespace(
+        server_args=SimpleNamespace(drafter_attention_backend=backend)
+    )
+    return drafter
+
+
+def _sink_validator(*sinks: int, supported: bool, backend: str) -> DFlash:
+    """A DFlash stub whose draft layers carry the given window sinks.
+
+    A sink needs a window, so every layer gets one.
+    """
+    model = torch.nn.Module()
+    model.layers = torch.nn.ModuleList(
+        _draft_attention(4095, sink, layer_id=layer_id)
+        for layer_id, sink in enumerate(sinks)
+    )
+    drafter = DFlash.__new__(DFlash)
+    drafter.model = model
+    drafter.attn_backend = SimpleNamespace(supports_layer_window_sink=supported)
     drafter.draft_model_runner = SimpleNamespace(
         server_args=SimpleNamespace(drafter_attention_backend=backend)
     )
@@ -309,6 +388,40 @@ def test_draft_attention_window_validation_accepts_the_served_combinations() -> 
 
     honoured._validate_draft_attention_window()
     unwindowed._validate_draft_attention_window()
+
+
+def test_a_window_sink_draft_rejects_a_backend_that_drops_the_sink() -> None:
+    drafter = _sink_validator(128, 0, supported=False, backend="fa3")
+
+    with pytest.raises(ValueError, match="fa3.*cannot keep those leading tokens"):
+        drafter._validate_draft_window_sink()
+
+
+def test_draft_window_sink_validation_accepts_the_served_combinations() -> None:
+    honoured = _sink_validator(128, 0, supported=True, backend="triton")
+    sinkless = _sink_validator(0, 0, supported=False, backend="fa3")
+
+    honoured._validate_draft_window_sink()
+    sinkless._validate_draft_window_sink()
+
+
+def test_draft_validation_ignores_a_non_attention_module_of_the_same_name() -> None:
+    """Only a PagedAttention declares the draft's visibility.
+
+    A sibling module carrying an attribute of the same name is not an
+    attention layer, so its value must not reach the backend check.
+    """
+    drafter = _window_validator(-1, supported=False, backend="trtllm_mla")
+    impostor = torch.nn.Module()
+    impostor.sliding_window_size = 4095
+    impostor.sliding_window_sink = 128
+    drafter.model.add_module("impostor", impostor)
+    drafter.attn_backend = SimpleNamespace(
+        supports_layer_sliding_window=False, supports_layer_window_sink=False
+    )
+
+    drafter._validate_draft_attention_window()
+    drafter._validate_draft_window_sink()
 
 
 @pytest.mark.parametrize("block_size", (6, 8))
@@ -368,31 +481,58 @@ def test_candidate_selector_edges_match_the_official_equation() -> None:
     torch.testing.assert_close(actual, expected)
 
 
-def test_greedy_path_follows_the_selected_predecessor() -> None:
-    candidate_ids = torch.tensor([[[10, 11], [20, 21], [30, 31]]])
-    scores = torch.zeros(1, 3, 2, 2)
-    scores[0, 0, 0, 1] = 3
-    scores[0, 1, 1, 0] = 4
-    scores[0, 2, 0, 1] = 5
-    out = torch.empty(1, 4, dtype=torch.int32)
-    _walk_greedy_path(candidate_ids, scores, torch.tensor([7]), out)
-    assert out.tolist() == [[7, 11, 20, 31]]
+class _GreedyWalk:
+    """The walk as DFlash2 runs it with --enable-speculative-sampling off:
+    every row reads row 0 of one greedy (top_k 1) pool and writes its chain
+    to a scratch row of its own."""
 
+    def __init__(self, batch_size: int, num_steps: int, top_k: int) -> None:
+        device = torch.device("cuda")
+        self.pool_indices = torch.zeros(batch_size, dtype=torch.int64, device=device)
+        self.temperature = torch.ones(1, dtype=torch.float32, device=device)
+        self.top_k = torch.ones(1, dtype=torch.int32, device=device)
+        self.top_p = torch.ones(1, dtype=torch.float32, device=device)
+        self.seed = torch.zeros(1, dtype=torch.int64, device=device)
+        self.valid_cache_lengths = torch.zeros(1, dtype=torch.int32, device=device)
+        self.table_rows = torch.arange(batch_size, dtype=torch.int64, device=device)
+        self.q = torch.empty(batch_size, num_steps, top_k, device=device)
+        self.q_ids = torch.empty(
+            batch_size, num_steps, top_k, dtype=torch.int32, device=device
+        )
+        self.pos = torch.empty(
+            batch_size, num_steps + 1, dtype=torch.int32, device=device
+        )
+        self.slot = torch.empty(
+            batch_size, num_steps + 1, dtype=torch.int32, device=device
+        )
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_the_path_kernel_reproduces_the_torch_walk() -> None:
-    torch.manual_seed(5)
-    candidate_ids = torch.rand(4, 7, 128).topk(16).indices.cuda()
-    scores = torch.randn(4, 7, 16, 16, device="cuda")
-    scores[:, 0] = scores[:, 0, :1].expand(-1, 16, -1)
-    anchors = torch.randint(128, (4,), device="cuda")
-    kernel_out = torch.empty(4, 8, dtype=torch.int32, device="cuda")
-    torch_out = torch.empty(4, 8, dtype=torch.int32, device="cuda")
-
-    _walk_greedy_path(candidate_ids, scores, anchors, kernel_out)
-    _greedy_path_torch(candidate_ids, scores, anchors, torch_out)
-
-    torch.testing.assert_close(kernel_out, torch_out)
+    def __call__(
+        self,
+        candidate_ids: torch.Tensor,
+        scores: torch.Tensor,
+        anchor_token_ids: torch.Tensor,
+        out: torch.Tensor,
+    ) -> torch.Tensor:
+        dflash2_sample_path(
+            candidate_ids,
+            scores,
+            anchor_token_ids,
+            self.pool_indices,
+            self.temperature,
+            self.top_k,
+            self.top_p,
+            self.seed,
+            self.valid_cache_lengths,
+            scores.shape[1] + 1,
+            1 << 20,
+            out,
+            self.table_rows,
+            self.q,
+            self.q_ids,
+            self.pos,
+            self.slot,
+        )
+        return out
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -409,6 +549,7 @@ def test_official_nodes_capture_and_replay_in_one_cuda_graph() -> None:
     static_unary = torch.randn(1, 7, 4, device=device)
     static_anchor = torch.tensor([3], device=device)
     static_out = torch.empty(1, 8, dtype=torch.int32, device=device)
+    walk = _GreedyWalk(1, 7, 4)
 
     for _ in range(3):
         prepared, coefficients = conv.prepare(static_hidden)
@@ -416,7 +557,7 @@ def test_official_nodes_capture_and_replay_in_one_cuda_graph() -> None:
         scores = selector(
             static_candidates, static_unary, finished[1:].unsqueeze(0), static_anchor
         )
-        _walk_greedy_path(static_candidates, scores, static_anchor, static_out)
+        walk(static_candidates, scores, static_anchor, static_out)
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
@@ -426,7 +567,7 @@ def test_official_nodes_capture_and_replay_in_one_cuda_graph() -> None:
         scores = selector(
             static_candidates, static_unary, finished[1:].unsqueeze(0), static_anchor
         )
-        _walk_greedy_path(static_candidates, scores, static_anchor, static_out)
+        walk(static_candidates, scores, static_anchor, static_out)
 
     new_hidden = torch.randn_like(static_hidden)
     static_hidden.copy_(new_hidden)
@@ -441,14 +582,17 @@ def test_official_nodes_capture_and_replay_in_one_cuda_graph() -> None:
     )
     assert torch.isfinite(eager_scores).all()
     expected = torch.empty_like(static_out)
-    _walk_greedy_path(static_candidates, eager_scores, static_anchor, expected)
+    walk(static_candidates, eager_scores, static_anchor, expected)
     torch.testing.assert_close(replayed, expected)
 
 
 @_CUDA_ONLY
 def test_the_fused_mla_context_write_reproduces_the_per_layer_chain() -> None:
     """One GEMM + one launch must land what norm -> RoPE -> scatter lands."""
-    from tokenspeed_kernel.ops.kvcache.triton import mla_latent_norm_rope_scatter
+    from tokenspeed_kernel.ops.kvcache.triton import (
+        LatentPlanes,
+        mla_latent_norm_rope_scatter,
+    )
 
     from tokenspeed.runtime.layers.layernorm import RMSNorm
     from tokenspeed.runtime.layers.rotary_embedding import get_rope
@@ -492,7 +636,7 @@ def test_the_fused_mla_context_write_reproduces_the_per_layer_chain() -> None:
         hidden_states,
         torch.cat([w[q_lora:] for w in weights], dim=0).t().contiguous(),
     ).view(tokens, layers, width)
-    actual = [torch.zeros_like(expected) for _ in range(layers)]
+    actual = [torch.zeros_like(expected).unsqueeze(1) for _ in range(layers)]
     mla_latent_norm_rope_scatter(
         stacked,
         torch.stack([norm.weight.data for norm in norms]),
@@ -500,16 +644,18 @@ def test_the_fused_mla_context_write_reproduces_the_per_layer_chain() -> None:
         rotary.cos_sin_cache,
         positions,
         loc,
-        torch.tensor([p.data_ptr() for p in actual], dtype=torch.int64, device=device),
-        actual[0].stride(0),
-        dtype,
+        LatentPlanes.from_buffers(actual),
+        write_mask=None,
         is_neox=rotary.is_neox_style,
         sanitize=False,
     )
 
     for index in range(layers):
         torch.testing.assert_close(
-            actual[index].float(), planes[index].float(), atol=2e-2, rtol=2e-2
+            actual[index].squeeze(1).float(),
+            planes[index].float(),
+            atol=2e-2,
+            rtol=2e-2,
         )
 
 
@@ -537,14 +683,17 @@ def test_a_mixed_batch_derives_draft_lengths_without_reading_the_device() -> Non
         bs=3,
         num_extends=1,
         input_num_tokens=positions.numel(),
-        # The round's write vector comes from the TARGET router: the prefill
-        # row's extend span first, then the decode rows' verify windows, in
-        # the token order the hidden states arrive in.
         attn_backend=SimpleNamespace(
+            group_ids=("full_attention",),
             extend_span_locations=lambda: torch.arange(5, dtype=torch.int32),
             decode_window_locations=lambda: torch.arange(5, 13, dtype=torch.int32),
         ),
     )
+    # A shared cache group: the taps are the TARGET's rows, so its router owns
+    # the write vector -- the prefill row's extend span first, then the decode
+    # rows' verify windows, in the token order the hidden states arrive in.
+    # (The draft's own router has republished a block window by now.)
+    drafter.attn_backend = SimpleNamespace(group_ids=("full_attention",))
     drafter._update_native_cache_from_target(
         ctx,
         SimpleNamespace(hidden_states=torch.zeros(positions.numel(), 8)),

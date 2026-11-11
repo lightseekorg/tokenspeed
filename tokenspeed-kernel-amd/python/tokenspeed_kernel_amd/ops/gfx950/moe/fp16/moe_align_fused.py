@@ -38,19 +38,28 @@ atomics). One kernel:
 Sync-free: outputs sized at the bound of bucketed routes * block_m;
 ``num_valid`` (real EM) is on-device and the GEMM stages early-out on the padded
 tail. Decode-only (EM_MAX + the O(G^2) rank tile grow with M*topk).
+
+An optional ``output_to_zero`` is cleared by extra workgroups of the same
+launch, so callers that accumulate expert outputs with atomics need no separate
+fill launch.
 """
 
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel_amd._triton import gl, gluon
+from tokenspeed_kernel_amd._triton import gl, gluon, triton
+from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.moe_align_device import (
+    _ZERO_BLOCK,
+    _zero_block,
+    _zero_target,
+)
 
 
 def _next_pow2(x: int) -> int:
     return 1 << max(0, (x - 1)).bit_length()
 
 
-@gluon.jit(do_not_specialize=("G", "sentinel"))
+@gluon.jit(do_not_specialize=("G", "sentinel", "zero_numel"))
 def _fused_align_kernel(
     ids_ptr,  # [G] int32  flat topk_ids
     wts_ptr,  # [G] fp32   flat topk_weights
@@ -58,22 +67,31 @@ def _fused_align_kernel(
     sw_ptr,  # [EM_MAX] fp32   out (routed weight)
     sei_ptr,  # [NB_MAX] int32  out (expert per block, -1 pad)
     nv_ptr,  # [1] int32       out (EM)
+    zero_ptr,  # buffer cleared for the caller (unused when zero_numel is 0)
     G,
     num_experts,
     block_m,
     sentinel,
     nb_max,
     em_max,
+    zero_numel,  # 16-byte vectors to clear
     TOPK: gl.constexpr,
     GP: gl.constexpr,  # next_pow2(G) == nb_max
     EP: gl.constexpr,  # next_pow2(num_experts)
     EXPERT_START: gl.constexpr,
     INIT_TILE: gl.constexpr,
+    ZERO_BLOCK: gl.constexpr,
 ):
     LG: gl.constexpr = gl.BlockedLayout([1], [64], [4], [0])  # [GP]
     LE: gl.constexpr = gl.BlockedLayout([1], [64], [4], [0])  # [EP]
     LR: gl.constexpr = gl.BlockedLayout([1], [64], [4], [0])  # init tile
     LT: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [4, 1], [1, 0])  # 2D rank
+
+    # Workgroups after the first only clear the caller's output.
+    pid = gl.program_id(0)
+    if pid > 0:
+        _zero_block(zero_ptr, zero_numel, pid - 1, ZERO_BLOCK, 4)
+        return
 
     # ---- in-kernel init of the full output (folds away a separate launch) ----
     for r0 in range(0, em_max, INIT_TILE):
@@ -149,6 +167,7 @@ def moe_align_block_size_fused(
     block_m: int,
     *,
     expert_start: int = 0,
+    output_to_zero: torch.Tensor | None = None,
 ):
     """Single-kernel sync-free decode block-align (pure Gluon). Same return
     contract as ``moe_align_block_size``.
@@ -156,6 +175,9 @@ def moe_align_block_size_fused(
     ``topk_ids`` may use global expert IDs. ``expert_start`` identifies the
     first expert owned by this rank; routes outside the contiguous local range
     are ignored without a separate localization kernel.
+
+    ``output_to_zero`` is an optional contiguous tensor that the same launch
+    clears, for callers that accumulate expert outputs into it with atomics.
     """
     assert topk_ids.shape == topk_weights.shape
     if expert_start < 0:
@@ -178,25 +200,29 @@ def moe_align_block_size_fused(
     sw = torch.empty(EM_MAX, dtype=torch.float32, device=device)
     sei = torch.empty(NB_MAX, dtype=torch.int32, device=device)
     nv = torch.empty(1, dtype=torch.int32, device=device)
+    zero_target, zero_numel = _zero_target(output_to_zero, sti)
 
-    _fused_align_kernel[(1,)](
+    _fused_align_kernel[(1 + triton.cdiv(zero_numel, _ZERO_BLOCK),)](
         ids,
         wts,
         sti,
         sw,
         sei,
         nv,
+        zero_target,
         G,
         num_experts,
         block_m,
         sentinel,
         NB_MAX,
         EM_MAX,
+        zero_numel,
         TOPK=topk,
         GP=GP,
         EP=EP,
         EXPERT_START=expert_start,
         INIT_TILE=1024,
+        ZERO_BLOCK=_ZERO_BLOCK,
         num_warps=4,
     )
     return sti, sei, sw, nv

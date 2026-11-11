@@ -974,6 +974,454 @@ def test_dsa_decode_topk_keeps_late_values_above_threshold() -> None:
     torch.testing.assert_close(lens_out.cpu(), torch.tensor([topk], dtype=torch.int32))
 
 
+@pytest.mark.parametrize("tied_keys", (10, 200), ids=("few_ties", "many_ties"))
+def test_dsa_decode_topk_orders_keys_sharing_the_threshold_prefix(
+    tied_keys: int,
+) -> None:
+    # The k-th value is among keys one ulp apart, tied on 24 bits, ordered by low bits.
+    page_size = 64
+    cols = 16384
+    topk = 2048
+    taken_from_ties = 3
+    gen = _generator("cuda", tied_keys)
+    tied_values = (
+        (torch.arange(tied_keys, dtype=torch.int32) + 0x3F800001)
+        .view(torch.float32)
+        .cuda()
+    )
+    values = torch.cat(
+        (
+            torch.full((topk - taken_from_ties,), 5.0, device="cuda"),
+            tied_values,
+            -10.0
+            - torch.rand(
+                (cols - topk + taken_from_ties - tied_keys,),
+                device="cuda",
+                generator=gen,
+            ),
+        )
+    )
+    logits = values[torch.randperm(cols, device="cuda", generator=gen)][None, :]
+    seq_lens = torch.full((1,), cols, device="cuda", dtype=torch.int32)
+    block_table = torch.arange(
+        cols // page_size, device="cuda", dtype=torch.int32
+    ).reshape(1, -1)
+    out = torch.empty((1, topk), device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((1,), device="cuda", dtype=torch.int32)
+
+    dsa_topk_backend._dsa_topk_indices(
+        logits,
+        seq_lens,
+        seq_lens,
+        block_table=block_table,
+        page_size=page_size,
+        topk=topk,
+        out=out,
+        lens_out=lens_out,
+    )
+
+    selected = out[0].long()
+    assert torch.unique(selected).numel() == topk
+    torch.testing.assert_close(
+        torch.sort(logits[0, selected], descending=True).values,
+        torch.topk(logits[0], topk).values,
+        rtol=0.0,
+        atol=0.0,
+    )
+    torch.testing.assert_close(lens_out.cpu(), torch.tensor([topk], dtype=torch.int32))
+
+
+# Indexer logits crowd few exponents, so the first radix pass fills one or two buckets.
+_DECODE_TOPK_DISTRIBUTIONS = {
+    "spread": (1.0, 0.0),
+    "crowded": (0.5, -30.0),
+    "one_prefix": (0.01, 1.5),
+}
+
+
+@pytest.mark.parametrize("distribution", tuple(_DECODE_TOPK_DISTRIBUTIONS))
+@pytest.mark.parametrize("row_pad", (0, 1), ids=("aligned_rows", "unaligned_rows"))
+@pytest.mark.parametrize("q_len_per_req", (1, 4))
+def test_dsa_decode_topk_selects_largest_values_on_ragged_rows(
+    q_len_per_req: int, row_pad: int, distribution: str
+) -> None:
+    page_size = 64
+    topk = 2048
+    max_pages = 512
+    cols = max_pages * page_size
+    # Exact tiles, tile plus tail, tails off a 4-element boundary, tail-only, <= topk.
+    length_sets = (
+        (32768, 24581, 16383, 8197, 4099, 2050),
+        (32765, 16384, 24579, 12290, 8191, 2049),
+    )
+    reqs = len(length_sets[0])
+    rows = reqs * q_len_per_req
+    gen = _generator("cuda", cols + q_len_per_req)
+    scale, shift = _DECODE_TOPK_DISTRIBUTIONS[distribution]
+    storage = (
+        torch.randn(
+            (rows, cols + row_pad), device="cuda", generator=gen, dtype=torch.float32
+        )
+        * scale
+        + shift
+    )
+    logits = storage[:, :cols]
+    block_table = torch.stack(
+        [torch.randperm(max_pages, device="cuda", generator=gen) for _ in range(reqs)]
+    ).to(torch.int32)
+    logical_page = torch.argsort(block_table.long(), dim=1)
+    out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
+
+    def check(lengths: Sequence[int]) -> None:
+        seq_lens = torch.tensor(lengths, device="cuda", dtype=torch.int32)
+        row_lens = [
+            seq_len - (q_len_per_req - 1) + offset
+            for seq_len in lengths
+            for offset in range(q_len_per_req)
+        ]
+        values = storage[:, :cols].clone()
+        for row, row_len in enumerate(row_lens):
+            # Padding that a selection must never reach.
+            logits[row, row_len:] = float("inf")
+        dsa_topk_backend._dsa_topk_indices(
+            logits,
+            seq_lens,
+            seq_lens,
+            block_table=block_table,
+            page_size=page_size,
+            topk=topk,
+            q_len_per_req=q_len_per_req,
+            out=out,
+            lens_out=lens_out,
+        )
+        torch.testing.assert_close(
+            lens_out.cpu(),
+            torch.tensor([min(n, topk) for n in row_lens], dtype=torch.int32),
+        )
+        for row, row_len in enumerate(row_lens):
+            req = row // q_len_per_req
+            slots = out[row, : min(row_len, topk)].long()
+            logical = (
+                logical_page[req, slots // page_size] * page_size + slots % page_size
+            )
+            assert torch.unique(logical).numel() == logical.numel()
+            assert (logical < row_len).all()
+            torch.testing.assert_close(
+                torch.sort(values[row, logical], descending=True).values,
+                torch.topk(values[row, :row_len], min(row_len, topk)).values,
+                rtol=0.0,
+                atol=0.0,
+            )
+        storage[:, :cols] = values
+
+    check(length_sets[0])
+    compile_kernels = (
+        (
+            dsa_topk_backend._dsa_oneblock_manual_radix_topk_kernel,
+            dsa_topk_backend._dsa_multi_cta_histogram_kernel,
+            dsa_topk_backend._dsa_multi_cta_select_kernel,
+        )
+        if is_cdna4()
+        else ()
+    )
+    with assert_no_triton_compile(*compile_kernels):
+        check(length_sets[1])
+
+
+def _multi_cta_topk_logits(
+    distribution: str, rows: int, cols: int, gen: torch.Generator
+) -> torch.Tensor:
+    if distribution == "integers":
+        # Exact ties everywhere, so many keys equal the k-th value.
+        return torch.randint(0, 64, (rows, cols), device="cuda", generator=gen).float()
+    if distribution == "ulp_ties":
+        # Keys one ulp apart: the k-th shares a 24-bit prefix; low bits order them.
+        logits = -3.0 - torch.rand((rows, cols), device="cuda", generator=gen)
+        tied = (
+            torch.randint(0, 200, (rows, 3000), device="cuda", generator=gen).int()
+            + 0x3F800001
+        ).view(torch.float32)
+        columns = torch.randint(0, cols, (rows, 3000), device="cuda", generator=gen)
+        return logits.scatter_(1, columns, tied)
+    scale, shift = _DECODE_TOPK_DISTRIBUTIONS[distribution]
+    return (
+        torch.randn((rows, cols), device="cuda", generator=gen, dtype=torch.float32)
+        * scale
+        + shift
+    )
+
+
+def _check_decode_topk_selection(
+    logits: torch.Tensor,
+    row_lens: Sequence[int],
+    out: torch.Tensor,
+    lens_out: torch.Tensor,
+    logical_page: torch.Tensor,
+    q_len_per_req: int,
+    page_size: int,
+    topk: int,
+) -> list[torch.Tensor]:
+    torch.testing.assert_close(
+        lens_out.cpu(),
+        torch.tensor([min(n, topk) for n in row_lens], dtype=torch.int32),
+    )
+    selections = []
+    for row, row_len in enumerate(row_lens):
+        req = row // q_len_per_req
+        slots = out[row, : min(row_len, topk)].long()
+        logical = logical_page[req, slots // page_size] * page_size + slots % page_size
+        assert torch.unique(logical).numel() == logical.numel()
+        assert (logical < row_len).all()
+        torch.testing.assert_close(
+            torch.sort(logits[row, logical], descending=True).values,
+            torch.topk(logits[row, :row_len], min(row_len, topk)).values,
+            rtol=0.0,
+            atol=0.0,
+        )
+        if row_len < topk:
+            assert (out[row, row_len:] == -1).all()
+        selections.append(torch.sort(logical).values)
+    return selections
+
+
+@pytest.mark.skipif(not is_cdna4(), reason="the multi-CTA decode top-k is gfx950's")
+@pytest.mark.parametrize(
+    "distribution", ("spread", "crowded", "one_prefix", "integers", "ulp_ties")
+)
+@pytest.mark.parametrize(
+    ("rows", "cols"),
+    (
+        (1, 65536),
+        (4, 65536),
+        (8, 65536),
+        (16, 65536),
+        (32, 65536),
+        (4, 131072),
+        # Logits as wide as a 256K or 1M max-model-len, mostly over short rows.
+        (32, 262144),
+        (8, 1048576),
+    ),
+)
+def test_dsa_decode_topk_multi_cta_selects_the_one_block_set(
+    rows: int, cols: int, distribution: str
+) -> None:
+    # Multi-CTA rows match the one-block kernel's columns unless the k-th value is tied.
+    page_size = 64
+    topk = 2048
+    q_len_per_req = 4 if rows % 4 == 0 else 1
+    reqs = rows // q_len_per_req
+    max_pages = cols // page_size
+    gen = _generator("cuda", rows * 7 + cols + len(distribution))
+    plan = dsa_topk_backend._dsa_topk_plan(
+        rows, cols, topk, torch.device("cuda"), is_decode=True
+    )
+    assert plan.kind == "multi-cta"
+    # Full rows, rows past 65536 columns, crowded tails, and rows at or under topk.
+    lengths = (cols, 50004, cols - 3, 32765, 8191, 4099, 2050, 2049)[:reqs]
+    if reqs > len(lengths):
+        lengths += tuple(
+            int(n)
+            for n in torch.randint(
+                topk // 2, cols, (reqs - len(lengths),), generator=torch.Generator()
+            )
+        )
+    row_lens = [
+        seq_len - (q_len_per_req - 1) + offset
+        for seq_len in lengths
+        for offset in range(q_len_per_req)
+    ]
+    logits = _multi_cta_topk_logits(distribution, rows, cols, gen)
+    for row, row_len in enumerate(row_lens):
+        # Padding that a selection must never reach.
+        logits[row, row_len:] = float("inf")
+    block_table = torch.stack(
+        [torch.randperm(max_pages, device="cuda", generator=gen) for _ in range(reqs)]
+    ).to(torch.int32)
+    logical_page = torch.argsort(block_table.long(), dim=1)
+    seq_lens = torch.tensor(lengths, device="cuda", dtype=torch.int32)
+    out = torch.full((rows, topk), -7, device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
+    dsa_topk_backend._dsa_topk_indices(
+        logits,
+        seq_lens,
+        seq_lens,
+        block_table=block_table,
+        page_size=page_size,
+        topk=topk,
+        q_len_per_req=q_len_per_req,
+        out=out,
+        lens_out=lens_out,
+    )
+    selections = _check_decode_topk_selection(
+        logits, row_lens, out, lens_out, logical_page, q_len_per_req, page_size, topk
+    )
+
+    oneblock_out = torch.full_like(out, -7)
+    oneblock_lens = torch.empty_like(lens_out)
+    dsa_topk_backend._dsa_oneblock_topk_indices(
+        logits,
+        block_table,
+        seq_lens,
+        seq_lens,
+        block_table_cols=max_pages,
+        page_size=page_size,
+        topk=topk,
+        q_len_per_req=q_len_per_req,
+        is_decode=True,
+        plan=dsa_topk_backend._oneblock_launch_plan(cols, is_decode=True),
+        out=oneblock_out,
+        lens_out=oneblock_lens,
+    )
+    oneblock_selections = _check_decode_topk_selection(
+        logits,
+        row_lens,
+        oneblock_out,
+        oneblock_lens,
+        logical_page,
+        q_len_per_req,
+        page_size,
+        topk,
+    )
+    for row, row_len in enumerate(row_lens):
+        if row_len <= topk:
+            continue
+        kth = torch.topk(logits[row, :row_len], topk).values[-1]
+        if int((logits[row, :row_len] == kth).sum()) == 1:
+            torch.testing.assert_close(selections[row], oneblock_selections[row])
+
+
+@pytest.mark.skipif(not is_cdna4(), reason="the multi-CTA decode top-k is gfx950's")
+def test_dsa_decode_topk_multi_cta_reuses_its_kernels_across_batches() -> None:
+    # Rows and lengths are runtime values; the workspace re-zeroes after every call.
+    page_size = 64
+    topk = 2048
+    cols = 65536
+    max_pages = cols // page_size
+    gen = _generator("cuda", 11)
+
+    def run(rows: int, seq_len: int) -> None:
+        reqs = rows // 4
+        lengths = [seq_len - 97 * req for req in range(reqs)]
+        row_lens = [n - 3 + offset for n in lengths for offset in range(4)]
+        logits = _multi_cta_topk_logits("crowded", rows, cols, gen)
+        block_table = torch.stack(
+            [
+                torch.randperm(max_pages, device="cuda", generator=gen)
+                for _ in range(reqs)
+            ]
+        ).to(torch.int32)
+        seq_lens = torch.tensor(lengths, device="cuda", dtype=torch.int32)
+        out = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
+        lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
+        for _ in range(3):
+            dsa_topk_backend._dsa_topk_indices(
+                logits,
+                seq_lens,
+                seq_lens,
+                block_table=block_table,
+                page_size=page_size,
+                topk=topk,
+                q_len_per_req=4,
+                out=out,
+                lens_out=lens_out,
+            )
+            _check_decode_topk_selection(
+                logits,
+                row_lens,
+                out,
+                lens_out,
+                torch.argsort(block_table.long(), dim=1),
+                4,
+                page_size,
+                topk,
+            )
+
+    run(4, 50004)
+    run(16, 50004)
+    with assert_no_triton_compile(
+        dsa_topk_backend._dsa_multi_cta_histogram_kernel,
+        dsa_topk_backend._dsa_multi_cta_select_kernel,
+    ):
+        run(8, 32771)
+        run(4, 9000)
+        run(32, 61234)
+        run(24, 4100)
+
+
+@pytest.mark.parametrize(("rows", "cols"), ((1, 8192), (4, 16384), (32, 16384)))
+def test_dsa_decode_topk_short_logits_select_largest_values(
+    rows: int, cols: int
+) -> None:
+    # Short logits keep the one-block kernel at small batches, rows <= topk included.
+    page_size = 64
+    topk = 2048
+    q_len_per_req = 4 if rows % 4 == 0 else 1
+    reqs = rows // q_len_per_req
+    max_pages = cols // page_size
+    gen = _generator("cuda", rows * 13 + cols)
+    lengths = [cols - 61 * req for req in range(reqs)]
+    lengths[-1] = min(lengths[-1], 1500 + q_len_per_req)
+    row_lens = [
+        seq_len - (q_len_per_req - 1) + offset
+        for seq_len in lengths
+        for offset in range(q_len_per_req)
+    ]
+    logits = _multi_cta_topk_logits("crowded", rows, cols, gen)
+    for row, row_len in enumerate(row_lens):
+        logits[row, row_len:] = float("inf")
+    block_table = torch.stack(
+        [torch.randperm(max_pages, device="cuda", generator=gen) for _ in range(reqs)]
+    ).to(torch.int32)
+    seq_lens = torch.tensor(lengths, device="cuda", dtype=torch.int32)
+    out = torch.full((rows, topk), -7, device="cuda", dtype=torch.int32)
+    lens_out = torch.empty((rows,), device="cuda", dtype=torch.int32)
+    dsa_topk_backend._dsa_topk_indices(
+        logits,
+        seq_lens,
+        seq_lens,
+        block_table=block_table,
+        page_size=page_size,
+        topk=topk,
+        q_len_per_req=q_len_per_req,
+        out=out,
+        lens_out=lens_out,
+    )
+    _check_decode_topk_selection(
+        logits,
+        row_lens,
+        out,
+        lens_out,
+        torch.argsort(block_table.long(), dim=1),
+        q_len_per_req,
+        page_size,
+        topk,
+    )
+
+
+@pytest.mark.skipif(not is_cdna4(), reason="the multi-CTA decode top-k is gfx950's")
+def test_dsa_topk_plan_spreads_only_small_decode_batches() -> None:
+    device = torch.device("cuda")
+    plan = dsa_topk_backend._dsa_topk_plan
+    assert plan(4, 65536, 2048, device, is_decode=True).kind == "multi-cta"
+    assert plan(32, 65536, 2048, device, is_decode=True).kind == "multi-cta"
+    assert (
+        plan(4, 65536, 2048, device, is_decode=True).block_n
+        < plan(16, 65536, 2048, device, is_decode=True).block_n
+    )
+    assert plan(64, 65536, 2048, device, is_decode=True).kind == "oneblock"
+    assert plan(4, 65536, 2048, device, is_decode=False).kind != "multi-cta"
+    assert plan(4, 2048, 2048, device, is_decode=True).kind == "trivial"
+    # Short decode logits: the one-block kernel is faster on every row length.
+    assert plan(4, 16384, 2048, device, is_decode=True).kind == "oneblock"
+    assert plan(32, 8192, 2048, device, is_decode=True).kind == "oneblock"
+    assert plan(4, 16384 + 64, 2048, device, is_decode=True).kind == "multi-cta"
+    # Larger decode batches keep the one-block kernel at any max-model-len.
+    for rows in (64, 128):
+        assert plan(rows, 1 << 20, 2048, device, is_decode=True).kind == "oneblock"
+    assert plan(4, 1 << 20, 2048, device, is_decode=True).kind == "multi-cta"
+
+
 @pytest.mark.skipif(
     not (is_cdna4() or is_cdna5()),
     reason="requires the AMD Gluon logical top-k",
@@ -1050,6 +1498,76 @@ def test_dsa_decode_topk_gluon_long_row_uses_radix_path() -> None:
     expected = torch.arange(topk, device=device, dtype=torch.int32)
     torch.testing.assert_close(topk_lens.cpu(), torch.tensor([topk], dtype=torch.int32))
     torch.testing.assert_close(torch.sort(topk_slots[0]).values.cpu(), expected.cpu())
+
+
+@pytest.mark.skipif(not is_cdna4(), reason="gfx950 codegen")
+@pytest.mark.parametrize("is_decode", [False, True])
+def test_dsa_persistent_topk_atomics_reach_l2_before_arrival(is_decode) -> None:
+    """Every wave's histogram atomics reach L2 before the program arrives.
+
+    All waves add to the row histogram, then one thread bumps the arrival
+    counter, and the last program releases pass_done to the others. Compile
+    without launching and check that, on every path, each wave runs
+    s_waitcnt vmcnt(0) before the barrier preceding each pass's arrival and
+    release.
+    """
+    from tokenspeed_kernel._triton import gluon, triton
+    from tokenspeed_kernel_amd._extern import extern_compile_options
+    from utils import vmcnt_zero_before_barrier
+
+    fn = dsa_topk_backend._dsa_persistent_radix_topk_kernel
+    pointers = (
+        "logits",
+        "histograms",
+        "pass_arrivals",
+        "pass_done",
+        "reset_arrivals",
+        "output_counters",
+        "block_table",
+        "row_starts",
+        "row_ends",
+        "out",
+        "lens_out",
+    )
+    signature = {name: "*i32" for name in pointers}
+    signature.update(logits="*fp32", logits_stride="i32", block_table_cols="i32")
+    constexprs = {
+        "out_stride": 2048,
+        "page_size": 64,
+        "q_len_per_req": 1,
+        "IS_DECODE": is_decode,
+        "GROUPS_PER_ROW": 4,
+        "TOPK": 2048,
+        "BLOCK_N": 8192,
+    }
+    signature.update({name: "constexpr" for name in constexprs})
+    signature = {name: signature[name] for name in fn.arg_names}
+    attrs = {
+        (index,): [["tt.divisibility", 16]]
+        for index, name in enumerate(fn.arg_names)
+        if name in pointers
+    }
+    kernel = triton.compile(
+        gluon._runtime.GluonASTSource(
+            fn, signature, constexprs=constexprs, attrs=attrs
+        ),
+        target=triton.backends.compiler.GPUTarget("hip", "gfx950", 64),
+        options={
+            "num_warps": dsa_topk_backend._PERSISTENT_NUM_WARPS,
+            **extern_compile_options(),
+        },
+    )
+    # Each pass has one arrival and one pass_done atomic on a scalar address,
+    # and the passes come first in program order; the later output-slot and
+    # reset atomics publish no histogram.
+    passes = int(dsa_topk_backend._PERSISTENT_NUM_PASSES)
+    atomics = vmcnt_zero_before_barrier(
+        kernel.asm["amdgcn"],
+        "_dsa_persistent_radix_topk_kernel",
+        r"\bglobal_atomic_add v\d+, v\d+, (?:v\d+, )?s\[",
+    )[: 2 * passes]
+    assert len(atomics) == 2 * passes, atomics
+    assert all(waited for _, waited, _ in atomics), atomics
 
 
 def test_dsa_prefill_topk_gluon_long_row_uses_radix_path() -> None:
@@ -1696,6 +2214,54 @@ def test_dsa_glm53_bf16_split_schedule(
     )
 
 
+@pytest.mark.skipif(not is_cdna5(), reason="gfx1250 dense decode head tiling")
+@pytest.mark.parametrize(
+    (
+        "tokens",
+        "num_heads",
+        "topk_width",
+        "max_seqlen_k",
+        "block_k",
+        "kv_lora_rank",
+        "expected_block_h",
+    ),
+    (
+        (64, 8, 2048, 50000, 32, 512, 8),
+        (8, 16, 2048, 50000, 32, 512, 8),
+        (16, 16, 2048, 50000, 32, 512, 16),
+        (64, 16, 2048, 50000, 32, 512, 16),
+        (16, 16, 2048, 50000, 64, 512, 16),
+        # Short contexts and the rank-128 BF16 cap leave 8 splits per tile.
+        (16, 16, 2048, 300, 32, 512, 8),
+        (16, 16, 1024, 50000, 32, 128, 8),
+    ),
+)
+def test_dsa_gfx1250_decode_block_h(
+    tokens: int,
+    num_heads: int,
+    topk_width: int,
+    max_seqlen_k: int,
+    block_k: int,
+    kv_lora_rank: int,
+    expected_block_h: int,
+) -> None:
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsa.attention import (
+        _select_decode_block_h,
+    )
+
+    assert (
+        _select_decode_block_h(
+            num_tokens=tokens,
+            num_heads=num_heads,
+            topk_width=topk_width,
+            max_seqlen_k=max_seqlen_k,
+            block_k=block_k,
+            kv_lora_rank=kv_lora_rank,
+        )
+        == expected_block_h
+    )
+
+
 @pytest.mark.skipif(
     not (is_cdna4() or is_cdna5()),
     reason="GLM-5.3-Flash BF16 decode requires AMD CDNA4 or CDNA5",
@@ -1863,6 +2429,111 @@ def test_dsa_decode_glm53_flash_graph_tracks_live_lengths(
             torch.testing.assert_close(
                 replayed.float(), ref.float(), rtol=8e-2, atol=8e-2
             )
+
+
+def _twelve_head_fp8_split_runs():
+    """Runs a 12-head native-FP8 decode, as Kimi-K3.1 at TP8 does, at any batch size."""
+    device = "cuda"
+    num_heads = 12
+    num_slots = 4096
+    topk = 2048
+    kv_lora_rank = 512
+    qk_rope_head_dim = 64
+    qk_nope_head_dim = 128
+    generator = _generator(device, 1300)
+    kv_cache = _randn_bf16(
+        (num_slots, kv_lora_rank + qk_rope_head_dim),
+        device=device,
+        generator=generator,
+    ).to(torch.float8_e4m3fn)
+    softmax_scale = 1.0 / math.sqrt(qk_nope_head_dim + qk_rope_head_dim)
+
+    def run(
+        tokens: int, *, warm_split_variants: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        q = _randn_bf16(
+            (tokens, num_heads, kv_lora_rank + qk_rope_head_dim),
+            device=device,
+            generator=generator,
+        ).to(torch.float8_e4m3fn)
+        topk_slots = torch.stack(
+            [
+                torch.randperm(num_slots, device=device, generator=generator)[:topk]
+                for _ in range(tokens)
+            ]
+        ).to(torch.int32)
+        topk_lens = torch.full((tokens,), topk, device=device, dtype=torch.int32)
+        out = gluon_dsa_decode(
+            q=q,
+            kv_cache=kv_cache,
+            sparse_kv_cache=None,
+            topk_slots=topk_slots,
+            topk_lens=topk_lens,
+            max_seqlen_k=num_slots,
+            qk_nope_head_dim=qk_nope_head_dim,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            softmax_scale=softmax_scale,
+            page_size=64,
+            warm_split_variants=warm_split_variants,
+        )
+        ref = torch_dsa_sparse_attention(
+            q,
+            kv_cache[:, :kv_lora_rank],
+            kv_cache[:, kv_lora_rank:],
+            topk_slots,
+            topk_lens,
+            softmax_scale,
+        )
+        return out, ref
+
+    # Off the tuned 16-head schedule, each batch size here gets a different split count.
+    split_counts = {
+        tokens: gfx950_dsa_backend._select_num_kv_splits(
+            num_tokens=tokens,
+            num_heads=num_heads,
+            topk_width=topk,
+            max_seqlen_k=topk,
+            is_fp8=True,
+            native_fp8=True,
+            qk_rope_head_dim=qk_rope_head_dim,
+        )
+        for tokens in (1, 20, 32, 64, 128)
+    }
+    assert len(set(split_counts.values())) == len(split_counts)
+    assert min(split_counts.values()) > 1
+
+    return run
+
+
+@pytest.mark.skipif(
+    not is_cdna4(),
+    reason="the split dense kernel is specific to gfx950",
+)
+def test_dsa_dense_split_count_changes_reuse_one_kv_binary() -> None:
+    run = _twelve_head_fp8_split_runs()
+    run(1)
+    # The reduce kernel compiles once per power-of-two split bucket instead.
+    with assert_no_triton_compile(gfx950_dsa_backend._dsa_dense_mfma_kv_kernel):
+        for tokens in (20, 32, 64, 128, 1):
+            out, ref = run(tokens)
+            torch.testing.assert_close(out.float(), ref.float(), rtol=8e-2, atol=8e-2)
+
+
+@pytest.mark.skipif(
+    not is_cdna4(),
+    reason="the split dense kernel is specific to gfx950",
+)
+def test_dsa_dense_split_variants_compile_during_warmup() -> None:
+    run = _twelve_head_fp8_split_runs()
+    run(128, warm_split_variants=True)
+    with assert_no_triton_compile(
+        gfx950_dsa_backend._dsa_dense_mfma_kv_kernel,
+        gfx950_dsa_backend._dsa_dense_mfma_reduce_kernel,
+    ):
+        for tokens in (20, 32, 64, 128, 1):
+            out, ref = run(tokens)
+            torch.testing.assert_close(out.float(), ref.float(), rtol=8e-2, atol=8e-2)
 
 
 @pytest.mark.skipif(

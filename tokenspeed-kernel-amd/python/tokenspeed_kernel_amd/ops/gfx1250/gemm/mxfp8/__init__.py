@@ -25,11 +25,13 @@ from tokenspeed_kernel_amd.ops.gfx1250.gemm.mxfp8.decode_mm import (
     launch_gluon_mm_mxfp8_ue8m0_gfx1250,
 )
 from tokenspeed_kernel_amd.ops.gfx1250.gemm.mxfp8.mm import (
+    launch_gluon_mm_fp8_blockscale_largem_gfx1250,
     launch_gluon_mm_mxfp8_ue8m0_largem_gfx1250,
 )
 
 __all__ = [
     "launch_gluon_mm_fp8_blockscale_gfx1250",
+    "launch_gluon_mm_fp8_blockscale_largem_gfx1250",
     "launch_gluon_mm_mxfp8_ue8m0_gfx1250",
     "launch_gluon_mm_mxfp8_ue8m0_largem_gfx1250",
 ]

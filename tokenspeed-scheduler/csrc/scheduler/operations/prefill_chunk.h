@@ -30,7 +30,9 @@ namespace tokenspeed {
 // shaped by what the cache groups need: a junction cut when a hit's KV
 // coverage reached further than its state checkpoint; for replayable groups
 // the re-fed window is debited from a hit chunk's budget and a prompt's final
-// chunk is never shorter than the window (ChunkKeepingFinalWindow). Every
+// chunk is never shorter than the window (ChunkKeepingFinalWindow). On the P
+// role a chunk that cannot finish may take a smaller budget so that whole
+// prompts waiting behind it join its forward (YieldingChunkBudget). Every
 // function here is pure token arithmetic on the coordinator's facts; the
 // forward planner calls PrefillChunkTokens and never branches on a group kind
 // itself.
@@ -43,6 +45,8 @@ namespace tokenspeed {
 // one chunk budget (a later prompt re-prefills it cheaply) and for a model
 // without State groups. The forward that spans the boundary writes the
 // state there (SchedulerConfig::state_checkpoint_in_forward); no chunk is cut.
+// Restricted State groups instead save the last aligned segment entrance,
+// including prompts that fit one chunk budget.
 std::int32_t PrefillStateCheckpointTokens(const CacheCoordinator& coordinator, std::int32_t prompt_tokens,
                                           std::int32_t chunk_budget, std::int32_t prefix_replay_tokens);
 
@@ -64,8 +68,24 @@ std::int32_t ChunkKeepingFinalWindow(std::int32_t prefill_tokens, std::int32_t u
 // token. A junction inside the prompt's final replay window yields to the
 // window rule: the chunk passes the junction rather than waiting for a chunk
 // end that satisfies both. Returns 0 when no chunk fits this round's budget.
+// For restricted State groups, nonterminal chunks contain whole checkpoint
+// segments; a terminal remainder is carried whole whenever it fits.
 std::int32_t PrefillChunkTokens(const CacheCoordinator& coordinator, std::int32_t first_pos, bool resumes_hit,
                                 std::int32_t unscheduled, std::int32_t token_budget, std::int32_t junction_tokens);
+
+// The round budget a local prefill chunk starting at first_pos takes when it
+// gives way to whole prompts (SchedulerConfig::prefill_chunk_yield_tokens):
+// `yield_tokens` is what those prompts take, replay included. A chunk that
+// cannot finish its prompt within token_budget (`resumes_hit`: a hit's first
+// chunk, whose replay window comes out of the budget) ends instead on the
+// last alignment boundary at least yield_tokens before the budget's end --
+// a page, or for restricted State groups a whole checkpoint segment -- so it
+// gives up fewer than yield_tokens plus one boundary. The budget is returned
+// unchanged when nothing is yielded, when the chunk finishes within it, and
+// when the cut would leave less than one boundary (or MinPrefillChunkTokens)
+// of new tokens.
+std::int32_t YieldingChunkBudget(const CacheCoordinator& coordinator, std::int32_t first_pos, bool resumes_hit,
+                                 std::int32_t unscheduled, std::int32_t token_budget, std::int32_t yield_tokens);
 
 // Budget a fused mixed-mode decode batch leaves untouched so a pending local
 // prefill can still advance: for replayable groups the replay window plus the
