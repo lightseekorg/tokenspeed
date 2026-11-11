@@ -21,14 +21,18 @@ from tokenspeed_kernel._triton import tl, triton  # noqa.
 cdiv, jit = triton.cdiv, triton.jit
 
 from tokenspeed_kernel.thirdparty.sonic_sampler.ops.base import (
+    exponential_log,
+    fast_expf,
     gdc_launch_dependents,
     gdc_wait,
     ones_like,
+    philox_gumbel,
+    philox_key,
 )
 from tokenspeed_kernel.thirdparty.sonic_sampler.ops.encoding import bitpack_scalar
 from tokenspeed_kernel.thirdparty.sonic_sampler.ops.topk.bitpack import top_k_reduction
 
-__all__ = ["bitpacked_reduction_kernel"]
+__all__ = ["bitpacked_reduction_kernel", "whole_reduction_kernel"]
 
 
 @jit
@@ -368,7 +372,7 @@ def exact_maximum(
 
 
 @jit
-def exact_greedy(
+def exact_first(
     s_ptr,
     row_id,
     vocab_blocks: tl.constexpr,
@@ -376,7 +380,7 @@ def exact_greedy(
     stride_s: tl.constexpr,
     block_v: tl.constexpr,
 ):
-    """The first column holding the row's exact fp32 maximum, from the blocks' ``exact_maximum`` slots."""
+    """The row's exact fp32 maximum and the first column holding it, from the blocks' ``exact_maximum`` slots."""
 
     span = tl.arange(0, block_v)
     span_mask = span < vocab_blocks
@@ -391,9 +395,287 @@ def exact_greedy(
 
     # Blocks run in vocabulary order, so the first maximal block holds the first maximal column.
 
-    _, block = tl.max(maxima.to(tl.float32, bitcast=True), axis=0, return_indices=True)
+    value, block = tl.max(
+        maxima.to(tl.float32, bitcast=True), axis=0, return_indices=True
+    )
 
-    return tl.sum(tl.where(span == block, columns, 0), axis=0).to(tl.int32)
+    return value, tl.sum(tl.where(span == block, columns, 0), axis=0).to(tl.int32)
+
+
+@jit
+def exact_greedy(
+    s_ptr,
+    row_id,
+    vocab_blocks: tl.constexpr,
+    enable_pdl: tl.constexpr,
+    stride_s: tl.constexpr,
+    block_v: tl.constexpr,
+):
+    """The first column holding the row's exact fp32 maximum, from the blocks' ``exact_maximum`` slots."""
+
+    _, column = exact_first(s_ptr, row_id, vocab_blocks, enable_pdl, stride_s, block_v)
+
+    return column
+
+
+@jit
+def whole_row(indicator, whole: tl.constexpr, singular: tl.constexpr):
+    """Whether a row draws from its whole vocabulary: no greedy, top-k, top-p or min-p bit and, in a verify, point-draw drafts (bit 0x800), whose residual drops only the draft."""
+
+    if whole:
+
+        plain = (indicator & 0x3C0) == 0
+
+        if not singular:
+
+            plain = plain & ((indicator & 0x800) != 0)
+
+    else:
+
+        # Never true (the bits are non-negative): no row takes the whole path.
+        plain = (indicator & 0x3C0) < 0
+
+    return plain
+
+
+@jit
+def block_gumbel(key, start, size: tl.constexpr):
+    """``philox_gumbel`` at the ``size`` token ids from ``start`` (a multiple of four), one Philox round per four of them."""
+
+    b0, b1, b2, b3 = tl.randint4x(key, start // 4 + tl.arange(0, size // 4))
+
+    lanes = tl.arange(0, 4)[None, :]
+    bits = tl.where(
+        lanes == 0,
+        b0[:, None],
+        tl.where(
+            lanes == 1, b1[:, None], tl.where(lanes == 2, b2[:, None], b3[:, None])
+        ),
+    )
+
+    return tl.reshape(exponential_log(bits), (size,))
+
+
+@jit
+def whole_block(
+    x_ptr,
+    y_ptr,
+    h_ptr,
+    l_ptr,
+    m_ptr,
+    g_ptr,
+    c_ptr,
+    d_ptr,
+    t_ptr,
+    r_ptr,
+    f_ptr,
+    p_ptr,
+    b_ptr,
+    e_ptr,
+    indicator,
+    row_id,
+    block_id,
+    blocks,
+    batch_id,
+    step_id,
+    margin,
+    timesteps,
+    vocab_size: tl.constexpr,
+    shard_offset: tl.constexpr,
+    lookahead: tl.constexpr,
+    indirection: tl.constexpr,
+    tokens: tl.constexpr,
+    singular: tl.constexpr,
+    stride_x: tl.constexpr,
+    stride_g: tl.constexpr,
+    stride_c: tl.constexpr,
+    stride_t: tl.constexpr,
+    stride_y: tl.constexpr,
+    block_n: tl.constexpr,
+    block_t: tl.constexpr,
+    value_dtype: tl.constexpr,
+    logit_scale,
+    softcap,
+):
+    """
+    Stores a whole-vocabulary row's block as ``exact_maximum`` stores a
+    maximum: its best value plus the Gumbel noise the candidates' draw adds
+    (``philox_gumbel`` keyed by the slot's seed, offset and the row's
+    position, at global token ids). The best over every block is then the
+    Gumbel-max over the whole vocabulary, the token the candidates' draw
+    takes whenever it lies among them.
+
+    Note(s):
+
+        • The block is read in tiles of at most 4096 columns, so its registers
+          stay those of one tile whatever ``block_n``.
+
+        • A verify row leaves its draft out of that best, which is then the
+          residual draw past a rejected draft, and from slot ``2 • blocks``
+          on stores the block's maximum value, its exp-sum below that
+          maximum, and the draft's value and perturbed value (-inf in the
+          blocks without it).
+
+    """
+    minima: tl.constexpr = -float("inf")
+    tile: tl.constexpr = 4096 if block_n > 4096 else block_n
+
+    key = philox_key(h_ptr, l_ptr, batch_id, step_id)
+
+    if singular:
+
+        draft = -1
+
+    else:
+
+        # The bonus row has no draft.
+        draft = tl.load(t_ptr + margin + tl.minimum(step_id, lookahead - 1))
+        draft = tl.where(step_id < lookahead, draft, -1)
+
+    best = tl.full((), minima, tl.float32)
+    column = tl.full((), 0, tl.int32)
+    maximum = tl.full((), minima, tl.float32)
+    total = tl.full((), 0.0, tl.float32)
+    draft_value = tl.full((), minima, tl.float32)
+    draft_score = tl.full((), minima, tl.float32)
+
+    for start in tl.range(0, block_n, tile):
+
+        cols = block_id * block_n + start + tl.arange(0, tile)
+        mask = cols < vocab_size
+
+        logits = tl.load(x_ptr + (row_id * stride_x) + cols, mask=mask, other=minima)
+        logits = head_logits(logits, mask, logit_scale, softcap)
+        logits = transform(
+            logits,
+            indicator,
+            cols,
+            mask,
+            m_ptr,
+            g_ptr,
+            c_ptr,
+            d_ptr,
+            t_ptr,
+            r_ptr,
+            f_ptr,
+            p_ptr,
+            b_ptr,
+            e_ptr,
+            batch_id,
+            step_id,
+            margin,
+            timesteps,
+            shard_offset,
+            lookahead,
+            indirection,
+            tokens,
+            singular,
+            stride_g,
+            stride_c,
+            stride_t,
+            block_t,
+            tile,
+            value_dtype,
+        )
+
+        ids = cols + shard_offset
+
+        if indirection:
+
+            ids = tl.load(m_ptr + ids, mask=mask, other=0)
+
+        if indirection or (shard_offset % 4 != 0):
+
+            noise = philox_gumbel(key, ids)
+
+        else:
+
+            noise = block_gumbel(key, block_id * block_n + start + shard_offset, tile)
+
+        values = logits.to(tl.float32)
+        scores = tl.where(mask, values - noise, minima)
+
+        if not singular:
+
+            drafting = ids == draft
+
+            # Online exp-sum below the running maximum.
+            peak = tl.maximum(maximum, tl.max(values, axis=0))
+            part = tl.sum(
+                tl.where(values > minima, fast_expf(values - peak), 0.0), axis=0
+            )
+            total = tl.where(
+                peak > minima, total * fast_expf(maximum - peak) + part, 0.0
+            )
+            maximum = peak
+
+            draft_value = tl.maximum(
+                draft_value, tl.max(tl.where(drafting, values, minima), axis=0)
+            )
+            draft_score = tl.maximum(
+                draft_score, tl.max(tl.where(drafting, scores, minima), axis=0)
+            )
+            scores = tl.where(drafting, minima, scores)
+
+        score, index = tl.max(scores, axis=0, return_indices=True)
+
+        # Strictly greater, so the first tile holding the best keeps it.
+        better = score > best
+        column = tl.where(better, start + index, column)
+        best = tl.where(better, score, best)
+
+    target = (row_id * stride_y) + block_id
+
+    tl.store(y_ptr + target, best.to(tl.uint32, bitcast=True))
+    tl.store(y_ptr + target + blocks, (block_id * block_n + column).to(tl.uint32))
+
+    if not singular:
+
+        tl.store(y_ptr + target + 2 * blocks, maximum.to(tl.uint32, bitcast=True))
+        tl.store(y_ptr + target + 3 * blocks, total.to(tl.uint32, bitcast=True))
+        tl.store(y_ptr + target + 4 * blocks, draft_value.to(tl.uint32, bitcast=True))
+        tl.store(y_ptr + target + 5 * blocks, draft_score.to(tl.uint32, bitcast=True))
+
+
+@jit
+def whole_normalizer(
+    s_ptr,
+    row_id,
+    vocab_blocks: tl.constexpr,
+    stride_s: tl.constexpr,
+    block_v: tl.constexpr,
+):
+    """A verify row's maximum value, its exp-sum below that maximum, and its draft's value and perturbed value, from the blocks' ``whole_block`` slots."""
+
+    minima: tl.constexpr = -float("inf")
+
+    span = tl.arange(0, block_v)
+    span_mask = span < vocab_blocks
+    offsets = (row_id * stride_s) + span + 2 * vocab_blocks
+
+    maxima = tl.load(s_ptr + offsets, mask=span_mask, other=0xFF800000)
+    totals = tl.load(s_ptr + offsets + vocab_blocks, mask=span_mask, other=0)
+    drafts = tl.load(
+        s_ptr + offsets + 2 * vocab_blocks, mask=span_mask, other=0xFF800000
+    )
+    scores = tl.load(
+        s_ptr + offsets + 3 * vocab_blocks, mask=span_mask, other=0xFF800000
+    )
+
+    maxima = maxima.to(tl.float32, bitcast=True)
+    totals = totals.to(tl.float32, bitcast=True)
+
+    maximum = tl.max(maxima, axis=0)
+    total = tl.sum(
+        tl.where(maxima > minima, fast_expf(maxima - maximum) * totals, 0.0), axis=0
+    )
+
+    return (
+        maximum,
+        total,
+        tl.max(drafts.to(tl.float32, bitcast=True), axis=0),
+        tl.max(scores.to(tl.float32, bitcast=True), axis=0),
+    )
 
 
 @jit
@@ -615,6 +897,7 @@ def bitpacked_reduction_kernel(
     value_dtype: tl.constexpr,  # Dtype the logit manipulators keep.
     logit_scale=None,  # Logit Scale of a Vocabulary Shard's Raw Head Logits.
     softcap=None,  # Final Logit Softcap of a Vocabulary Shard's Raw Head Logits.
+    whole: tl.constexpr = False,  # Leave Whole-Vocabulary Rows to ``whole_reduction_kernel``.
 ) -> None:
     """
     Note that the value of L and T in the above shapes differ as follows:
@@ -671,82 +954,215 @@ def bitpacked_reduction_kernel(
         block_q,
     )
 
-    # Load the logits and the bit-indicator(s).
+    # Load the bit-indicator(s), then the logits of the rows reduced here.
 
-    logits = tl.load(x_ptr + offsets, mask=mask, other=-float("inf"))
-    logits = head_logits(logits, mask, logit_scale, softcap)
     indicator = tl.load(z_ptr + batch_id)
 
-    logits = transform(
-        logits,
-        indicator,
-        cols,
-        mask,
-        m_ptr,
-        g_ptr,
-        c_ptr,
-        d_ptr,
-        t_ptr,
-        r_ptr,
-        f_ptr,
-        p_ptr,
-        b_ptr,
-        e_ptr,
-        batch_id,
-        step_id,
-        margin,
-        timesteps,
-        shard_offset,
-        lookahead,
-        indirection,
-        tokens,
-        singular,
-        stride_g,
-        stride_c,
-        stride_t,
-        block_t,
-        block_n,
-        value_dtype,
-    )
+    if whole_row(indicator, whole, singular):
 
-    if (indicator & 0x40) > 0:
+        # Reduced by ``whole_reduction_kernel``.
 
-        # Greedy (Top-1) selection.
-
-        if exact:
-
-            exact_maximum(
-                y_ptr,
-                row_id,
-                col_id,
-                tl.num_programs(axis=1),
-                shift,
-                logits,
-                enable_pdl,
-                stride_y,
-            )
-
-        else:
-
-            greedy_reduction(
-                y_ptr, row_id, col_id, logits, enable_pdl, stride_y, block_n
-            )
+        pass
 
     else:
 
-        # Top-K selection by bf16 keys; exact logits are re-read at the candidates.
+        logits = tl.load(x_ptr + offsets, mask=mask, other=-float("inf"))
+        logits = head_logits(logits, mask, logit_scale, softcap)
 
-        top_k_reduction(
-            y_ptr,
-            row_id,
-            col_id,
-            logits.to(tl.bfloat16),
-            steps,
-            max_k,
-            scale,
-            enable_adaptive,
-            enable_radix,
-            enable_pdl,
-            stride_y,
+        logits = transform(
+            logits,
+            indicator,
+            cols,
+            mask,
+            m_ptr,
+            g_ptr,
+            c_ptr,
+            d_ptr,
+            t_ptr,
+            r_ptr,
+            f_ptr,
+            p_ptr,
+            b_ptr,
+            e_ptr,
+            batch_id,
+            step_id,
+            margin,
+            timesteps,
+            shard_offset,
+            lookahead,
+            indirection,
+            tokens,
+            singular,
+            stride_g,
+            stride_c,
+            stride_t,
+            block_t,
             block_n,
+            value_dtype,
         )
+
+        if (indicator & 0x40) > 0:
+
+            # Greedy (Top-1) selection.
+
+            if exact:
+
+                exact_maximum(
+                    y_ptr,
+                    row_id,
+                    col_id,
+                    tl.num_programs(axis=1),
+                    shift,
+                    logits,
+                    enable_pdl,
+                    stride_y,
+                )
+
+            else:
+
+                greedy_reduction(
+                    y_ptr, row_id, col_id, logits, enable_pdl, stride_y, block_n
+                )
+
+        else:
+
+            # Top-K selection by bf16 keys; exact logits are re-read at the candidates.
+
+            top_k_reduction(
+                y_ptr,
+                row_id,
+                col_id,
+                logits.to(tl.bfloat16),
+                steps,
+                max_k,
+                scale,
+                enable_adaptive,
+                enable_radix,
+                enable_pdl,
+                stride_y,
+                block_n,
+            )
+
+
+@triton.jit(do_not_specialize=["batch_size", "group_blocks"])
+def whole_reduction_kernel(
+    # Input Data Pointer(s).
+    x_ptr,  # Logits -> [ L, V_d' / W ].
+    z_ptr,  # Indicators -> [ B ].
+    s_ptr,  # Slot Mapping -> [ B ].
+    m_ptr,  # D2T Mapping -> [ V_d ].
+    g_ptr,  # Grammar Bit-Mask -> [ B • (γ' + 1), V_t / 32 ].
+    c_ptr,  # Context Counts -> [ B, V_t ].
+    d_ptr,  # Decode Counts -> [ B, V_t ].
+    t_ptr,  # Tokens -> [ T ].
+    r_ptr,  # Repetition Penalties -> [ B ].
+    f_ptr,  # Frequency Penalties -> [ B ].
+    p_ptr,  # Presence Penalties -> [ B ].
+    b_ptr,  # Logit Bias -> [ B, V_t ].
+    e_ptr,  # Temperature -> [ B ].
+    h_ptr,  # Noise Seeds -> [ B ].
+    l_ptr,  # Noise Offsets -> [ B ].
+    # Output Data Pointer(s).
+    y_ptr,  # Scratch-Pad -> [ L, Z_v • M ].
+    # Model Specific(s).
+    vocab_size: tl.constexpr,  # Local Vocab Size.
+    shard_offset: tl.constexpr,  # Local Shard Offset.
+    lookahead: tl.constexpr,  # Maximum Lookahead -> γ.
+    batch_size: tl.int32,  # Total Sequences -> B.
+    vocab_blocks: tl.constexpr,  # Vocab Blocks -> Z_v.
+    group_blocks,  # Vocab Blocks per Program.
+    # Conditional Flag(s).
+    indirection: tl.constexpr,  # Vocab Indirection Flag.
+    tokens: tl.constexpr,  # Drafted / Decoded Tokens Flag.
+    slotted: tl.constexpr,  # Slot Indirection Flag.
+    singular: tl.constexpr,  # Singular Timestep Flag.
+    enable_pdl: tl.constexpr,  # PDL Enablement Flag.
+    # Stride(s).
+    stride_x: tl.constexpr,  # Batch Stride of Logits.
+    stride_g: tl.constexpr,  # Batch Stride of Grammar Bit-Mask.
+    stride_c: tl.constexpr,  # Batch Stride of Counts (Target Vocab Size) -> V_t.
+    stride_t: tl.constexpr,  # Batch Stride of Tokens.
+    stride_y: tl.constexpr,  # Batch Stride of Scratch-Pad.
+    # Kernel Specific(s).
+    block_n: tl.constexpr,  # Block Size of Vocab Block(s).
+    block_t: tl.constexpr,  # Block Size of Token(s).
+    value_dtype: tl.constexpr,  # Dtype the logit manipulators keep.
+    logit_scale=None,  # Logit Scale of a Vocabulary Shard's Raw Head Logits.
+    softcap=None,  # Final Logit Softcap of a Vocabulary Shard's Raw Head Logits.
+) -> None:
+    """
+    The first stage of the rows ``bitpacked_reduction_kernel`` leaves out under
+    its ``whole`` flag, which draw from their whole vocabulary: the
+    ``whole_block`` slots of ``group_blocks`` consecutive vocab blocks per
+    program, the same blocks the selection reads.
+
+    Note(s):
+
+        • A kernel of its own keeps the other rows' reduction compiled as it
+          is without these rows, and its few programs per row keep the grid
+          small for the batches that have none.
+
+    """
+    row_id = tl.program_id(axis=0)
+    group_id = tl.program_id(axis=1)
+
+    if enable_pdl:
+
+        gdc_wait()
+
+    batch_id, step_id, margin, timesteps = resolve_indices(
+        None, s_ptr, row_id, lookahead, batch_size, slotted, singular, False, None
+    )
+
+    indicator = tl.load(z_ptr + batch_id)
+
+    if whole_row(indicator, True, singular):
+
+        first = group_id * group_blocks
+
+        for block_id in tl.range(first, tl.minimum(first + group_blocks, vocab_blocks)):
+
+            whole_block(
+                x_ptr,
+                y_ptr,
+                h_ptr,
+                l_ptr,
+                m_ptr,
+                g_ptr,
+                c_ptr,
+                d_ptr,
+                t_ptr,
+                r_ptr,
+                f_ptr,
+                p_ptr,
+                b_ptr,
+                e_ptr,
+                indicator,
+                row_id,
+                block_id,
+                vocab_blocks,
+                batch_id,
+                step_id,
+                margin,
+                timesteps,
+                vocab_size,
+                shard_offset,
+                lookahead,
+                indirection,
+                tokens,
+                singular,
+                stride_x,
+                stride_g,
+                stride_c,
+                stride_t,
+                stride_y,
+                block_n,
+                block_t,
+                value_dtype,
+                logit_scale,
+                softcap,
+            )
+
+    if enable_pdl:
+
+        gdc_launch_dependents()

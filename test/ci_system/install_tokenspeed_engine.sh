@@ -18,8 +18,7 @@ if ! command -v cargo > /dev/null 2>&1; then
 fi
 cargo --version
 
-# Engine changes accumulate without a version bump, like the scheduler's:
-# reinstall the checkout instead of accepting an earlier build.
-"${PYTHON}" -m pip install --force-reinstall --no-deps \
-    "${WORKSPACE}/tokenspeed-engine"
-"${PYTHON}" -c 'import os, tokenspeed_engine; assert os.access(tokenspeed_engine.host_binary(), os.X_OK)'
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/package_cache.sh"
+configure_package_cache
+"${PYTHON}" "${SCRIPT_DIR}/engine_cache.py" --workspace "${WORKSPACE}"

@@ -38,6 +38,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
+from tokenspeed_kernel_amd._extern import extern_compile_options, wait_stores
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx1250.moe.fp16._common import (
     _is_packed_projection_view,
@@ -126,19 +127,6 @@ def _store_direct(
             (row[:, None] * LATENT_N + column[None, :] - ROUTER_N).to(gl.int32),
             mask=live,
         )
-
-
-@gluon.jit
-def _wait_stores():
-    """Wait until this wave's global stores are acknowledged."""
-    gl.inline_asm_elementwise(
-        asm="s_wait_storecnt 0x0",
-        constraints="=v,0",
-        args=[gl.arange(0, 32, gl.BlockedLayout([1], [32], [gl.num_warps()], [0]))],
-        dtype=gl.int32,
-        is_pure=False,
-        pack=1,
-    )
 
 
 @gluon.jit(launch_metadata=_decode_launch_metadata)
@@ -290,7 +278,7 @@ def gluon_latent_input_decode_gfx1250(
         )
         # Publish the partial before announcing it. One warp issues both, so
         # draining its stores orders them before the relaxed counter bump.
-        _wait_stores()
+        wait_stores()
         old = gl.atomic_add(counter_ptr + block, 1, sem="relaxed", scope="gpu")
         if old == 2 * SHARED_SPLIT - 1:
             # Every other arrival has incremented, so rearm the counter.
@@ -601,6 +589,7 @@ def _launch_small_batch(
         HAS_LINEAR_BETA=linear_beta is not None,
         K=_HIDDEN,
         num_warps=1,
+        **extern_compile_options(),
         num_stages=1,
         waves_per_eu=0,
     )

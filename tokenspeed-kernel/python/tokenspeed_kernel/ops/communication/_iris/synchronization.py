@@ -20,70 +20,54 @@
 
 """Vector-memory waits that Iris selects per architecture through its policy.
 
-``args`` and ``constraints`` specify each wait's compiler dependencies. Callers
-handle workgroup synchronization, cache writeback/invalidation, and
+Callers handle workgroup synchronization, cache writeback/invalidation, and
 system-scope ordering.
 """
 
 from tokenspeed_kernel._triton import gl, gluon
 
 
+# asm: the LLVM intrinsic form of these waits (tokenspeed_kernel_amd._extern)
+# makes the backend's wait insertion add a vector-memory wait after the peer
+# flag store or atomic that precedes a rendezvous poll or acquire, delaying the
+# first poll until that store completes. An inline asm wait is invisible to
+# that pass, so the publish and the first poll overlap as before. The memory
+# clobber keeps loads and stores on their side of the wait. Retire these once
+# the backend no longer adds that wait for a visible s_waitcnt.
 @gluon.jit
-def wait_vmem(args, constraints: gl.constexpr):
+def _wait(asm: gl.constexpr):
+    gl.inline_asm_elementwise(
+        asm=asm,
+        constraints="=r,~{memory}",
+        args=[],
+        dtype=gl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@gluon.jit
+def wait_vmem():
     """Wait for this subgroup's vector memory operations on one-counter targets.
 
     Targets such as gfx950 track vector loads and stores with one counter
     (VMcnt).
     """
-    gl.inline_asm_elementwise(
-        asm="s_waitcnt vmcnt(0)",
-        constraints=constraints,
-        args=args,
-        dtype=gl.int32,
-        is_pure=False,
-        pack=1,
-    )
+    _wait("s_waitcnt vmcnt(0)")
 
 
 # Targets such as gfx1250 track vector-memory loads and stores with separate
 # counters (LOADcnt and STOREcnt) and have no VMcnt.
 @gluon.jit
-def wait_loads(args, constraints: gl.constexpr):
-    """Wait for this subgroup's vector loads and returning atomics."""
-    gl.inline_asm_elementwise(
-        asm="s_wait_loadcnt 0x0",
-        constraints=constraints,
-        args=args,
-        dtype=gl.int32,
-        is_pure=False,
-        pack=1,
-    )
-
-
-@gluon.jit
-def wait_stores(args, constraints: gl.constexpr):
+def wait_stores():
     """Wait for this subgroup's vector stores and non-returning atomics."""
-    gl.inline_asm_elementwise(
-        asm="s_wait_storecnt 0x0",
-        constraints=constraints,
-        args=args,
-        dtype=gl.int32,
-        is_pure=False,
-        pack=1,
-    )
+    _wait("s_wait_storecnt 0x0")
 
 
 @gluon.jit
-def wait_loads_stores(args, constraints: gl.constexpr):
+def wait_loads_stores():
     """Wait for this subgroup's vector loads and stores.
 
     Async and tensor copies to LDS (ASYNCcnt and TENSORcnt) are not covered.
     """
-    gl.inline_asm_elementwise(
-        asm="s_wait_loadcnt 0x0\n\ts_wait_storecnt 0x0",
-        constraints=constraints,
-        args=args,
-        dtype=gl.int32,
-        is_pure=False,
-        pack=1,
-    )
+    _wait("s_wait_loadcnt 0x0\n\ts_wait_storecnt 0x0")
