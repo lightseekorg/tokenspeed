@@ -38,6 +38,8 @@ from test.runtime.models.conftest import model_config, server_args  # noqa: E402
 
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
+from tokenspeed.runtime.utils import server_args as server_args_module  # noqa: E402
+
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 
@@ -50,11 +52,24 @@ def test_without_the_switch_the_model_launches(checkpoints) -> None:
     assert not server_args(checkpoints["other"]).decode_monokernel
 
 
-def test_a_stuck_record_dir_without_the_switch_fails(checkpoints, tmp_path) -> None:
+def test_a_stuck_record_dir_without_the_switch_fails(checkpoints) -> None:
     """Only the monokernel launches write stuck-poll records: the directory
     without the switch is refused, not silently ignored."""
+    if server_args_module._filesystem_type("/dev/shm") != "tmpfs":
+        pytest.skip("no tmpfs at /dev/shm here")
     with pytest.raises(ValueError, match="needs --decode-monokernel"):
-        server_args(checkpoints["other"], monokernel_stuck_record_dir=str(tmp_path))
+        server_args(checkpoints["other"], monokernel_stuck_record_dir="/dev/shm/x")
+
+
+def test_a_stuck_record_dir_off_tmpfs_fails(checkpoints) -> None:
+    """The record file is GPU-registered host memory: on a disk filesystem
+    its dirty-page writeback stalls decode every few seconds, so only tmpfs
+    is accepted."""
+    disk_dir = os.path.dirname(os.path.abspath(__file__))
+    if server_args_module._filesystem_type(disk_dir) == "tmpfs":
+        pytest.skip("the test tree itself is on tmpfs here")
+    with pytest.raises(ValueError, match="must be on tmpfs"):
+        server_args(checkpoints["other"], monokernel_stuck_record_dir=disk_dir)
 
 
 @pytest.mark.parametrize("switch", [False, True])

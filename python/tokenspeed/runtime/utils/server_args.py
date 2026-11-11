@@ -401,6 +401,23 @@ def validate_qcp(
         )
 
 
+def _filesystem_type(path: str) -> str:
+    """The type of the filesystem whose mount point is ``path``'s longest
+    prefix in ``/proc/self/mounts``; ``path`` need not exist yet."""
+    path = os.path.realpath(path)
+    best, fs_type = "", "unknown"
+    with open("/proc/self/mounts") as mounts:
+        for line in mounts:
+            fields = line.split()
+            mount_point = fields[1].replace("\\040", " ")
+            inside = path == mount_point or path.startswith(
+                mount_point.rstrip("/") + "/"
+            )
+            if inside and len(mount_point) >= len(best):
+                best, fs_type = mount_point, fields[2]
+    return fs_type
+
+
 @dataclasses.dataclass
 class ServerArgs:
     # Model and tokenizer
@@ -2794,6 +2811,18 @@ class ServerArgs:
                 "prefill engine runs no decodes and a decode engine no local "
                 "prefill rounds"
             )
+        if self.monokernel_stuck_record_dir is not None:
+            fs_type = _filesystem_type(self.monokernel_stuck_record_dir)
+            if fs_type != "tmpfs":
+                # The record file is mapped and registered as GPU-visible host
+                # memory. On a disk filesystem the kernel's periodic dirty-page
+                # writeback of those pages stalls decode for 1-2 s every few
+                # seconds; tmpfs pages are never written back.
+                raise ValueError(
+                    "--monokernel-stuck-record-dir must be on tmpfs (for "
+                    f"example /dev/shm); {self.monokernel_stuck_record_dir} is "
+                    f"on {fs_type}"
+                )
         if self.monokernel_stuck_record_dir is not None and not self.decode_monokernel:
             raise ValueError(
                 "--monokernel-stuck-record-dir needs --decode-monokernel: only "
@@ -4036,7 +4065,8 @@ class ServerArgs:
             type=str,
             default=ServerArgs.monokernel_stuck_record_dir,
             help=(
-                "With --decode-monokernel: a directory where each rank keeps "
+                "With --decode-monokernel: a directory on tmpfs (for example "
+                "/dev/shm) where each rank keeps "
                 "its stuck-poll record file (stuck-rank<N>-pid<P>.bin and a "
                 ".json sidecar). A launch poll that gives up writes what it "
                 "waited for there before the launch traps, so the record "
