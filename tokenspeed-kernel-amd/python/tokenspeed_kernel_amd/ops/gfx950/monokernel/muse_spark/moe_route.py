@@ -337,6 +337,17 @@ def _top8_asm(outputs, inputs):
     return "\n".join(a)
 
 
+LOWEST_CHOICE = gl.constexpr(-3.4028234663852886e38)  # -FLT_MAX
+
+
+@gluon.jit
+def _finite_choice(choice):
+    """``choice`` with its non-finite low values (NaN, -inf) clamped to
+    -FLT_MAX, so the top-8 always picks 8 distinct experts: the top-8 asm
+    removes a pick by writing -inf, below every choice left."""
+    return gl.where(choice >= LOWEST_CHOICE, choice, LOWEST_CHOICE)
+
+
 @gluon.jit
 def topk_stage(mb, task, bias, STAGE: gl.constexpr):
     """The top-8 of row ``task``'s summed logits (``bias``: FP32 ``[256]``)."""
@@ -372,7 +383,7 @@ def topk_stage(mb, task, bias, STAGE: gl.constexpr):
     logit = gl.convert_layout(logit * s, wl)
     # An exact division: the scores decide which experts a near tie picks.
     score = 1.0 / (1.0 + gl.exp(-(logit * ROUTER_SCALE)))
-    choice = score + bias_w
+    choice = _finite_choice(score + bias_w)
     # The 8 passes (max, then the lowest expert at it) by hand: the wave
     # reductions Triton emits cost hundreds of cycles each, 3 a pass.
     one: gl.constexpr = gl.BlockedLayout([1], [64], [nw], [0])
