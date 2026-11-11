@@ -169,7 +169,8 @@ def test_backend_verification_and_nan_guard_keep_request_ownership(
     assert torch.isfinite(logits).all()
 
 
-def test_packed_synthetic_acceptance_respects_computed_rows_and_graph(device):
+@pytest.mark.parametrize("length", [2.5, 4.0])
+def test_packed_verification_rejects_synthetic_acceptance(device, length):
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
     from tokenspeed.runtime.sampling.backends.base import SamplingBackendConfig
     from tokenspeed.runtime.sampling.backends.greedy import GreedySamplingBackend
@@ -177,56 +178,21 @@ def test_packed_synthetic_acceptance_respects_computed_rows_and_graph(device):
 
     backend = GreedySamplingBackend(
         SamplingBackendConfig(
-            synthetic_acceptance_length=4.0,
+            synthetic_acceptance_length=length,
             enable_speculative_sampling=False,
             sampling_stream="batch",
             logprob_order="torch",
-            max_bs=3,
-            max_draft_tokens_per_req=6,
-            max_req_pool_size=4,
+            max_bs=1,
+            max_draft_tokens_per_req=4,
+            max_req_pool_size=2,
             vocab_size=128,
             device=device,
         )
     )
-    candidates = torch.tensor(
-        [[10, 11, 12, 13, 14, 15], [20, 21, 22, 23, 24, 25], [30, 31, 32, 33, 34, 35]],
-        dtype=torch.int32,
-        device=device,
-    )
-    target = torch.arange(50, 60, device=device)
-    logits = torch.full((10, 128), -1.0, device=device)
-    logits.scatter_(1, target[:, None], 1.0)
+    candidates = torch.tensor([[10, 11, 12, 13]], dtype=torch.int32, device=device)
+    logits = torch.zeros((4, 128), device=device)
     output = LogitsProcessorOutput(next_token_logits=logits)
     info = SamplingBatchInfo(vocab_size=128, device=device)
-    starts = torch.tensor([0, 4, 9, 10], device=device)
-
-    def run():
-        return backend.verify(
-            output, info, candidates, tree=None, query_start_loc=starts
-        )
-
-    tokens, lengths = run()
-    assert lengths.tolist() == [4, 4, 1]
-    assert tokens.view(3, 6)[0, :4].tolist() == [11, 12, 13, 53]
-    assert tokens.view(3, 6)[1, :4].tolist() == [21, 22, 23, 57]
-    assert tokens.view(3, 6)[2, 0].item() == 59
-    graph = None
-    if device == "cuda":
-        stream = torch.cuda.Stream()
-        stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(stream):
-            run()
-        torch.cuda.current_stream().wait_stream(stream)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            tokens, lengths = run()
-    starts.copy_(torch.tensor([0, 4, 4, 10], device=device))
-    if graph is None:
-        tokens, lengths = run()
-    else:
-        graph.replay()
-    assert lengths.tolist() == [4, 0, 4]
-    assert backend._accept_index_buf[:18].view(3, 6)[1].tolist() == [-1] * 6
-    assert tokens.view(3, 6)[2, :4].tolist() == [31, 32, 33, 57]
-    if graph is not None:
-        graph.reset()
+    starts = torch.tensor([0, 4], device=device)
+    with pytest.raises(ValueError, match="plain chain sampling"):
+        backend.verify(output, info, candidates, tree=None, query_start_loc=starts)

@@ -50,3 +50,33 @@ def test_removed_experimental_options_are_rejected(option, value):
     with pytest.raises(SystemExit) as result:
         prepare_server_args(["--model", "unused", option, value])
     assert result.value.code == 2
+
+
+@pytest.mark.parametrize("bs,width", [(1, 1), (2, 4), (32, 6)])
+def test_native_drafter_query_capacity(bs, width):
+    from tokenspeed.runtime.execution.context import ForwardContext
+    from tokenspeed.runtime.execution.drafter.base import BaseDrafter
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+
+    drafter = BaseDrafter.__new__(BaseDrafter)
+    drafter.spec_num_tokens = width
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=bs,
+        num_extends=0,
+        input_num_tokens=bs * width,
+        forward_mode=ForwardMode.DECODE,
+        output_layout=ForwardOutputLayout(0, 0, bs, width),
+    )
+    assert drafter.decode_graph_query_capacities(bs) == (bs * width,)
+    assert (
+        drafter.prepare_decode_graph_token_layout(ctx, actual_bs=bs, padded_bs=bs * 2)
+        == bs * 2 * width
+    )
+    drafter.prepare_decode_graph_token_capture_layout(bs=bs, query_tokens=bs * width)
+    with pytest.raises(ValueError, match="full query capacity"):
+        drafter.prepare_decode_graph_token_capture_layout(
+            bs=bs, query_tokens=bs * width + 1
+        )
