@@ -32,9 +32,11 @@ namespace tokenspeed {
 
 // Reusable allocation storage, never reusable occupancy state. Each planning
 // lease gets independent bytes; its containers must die before the lease.
-// Two lazily allocated banks retain at most 512 KiB per pool. Larger or more
-// deeply nested plans use the normal allocator and return that memory at the
-// end of the plan. Only the scheduler control thread uses this owner.
+// Three lazily allocated banks retain at most 768 KiB per pool: an admission
+// planner's lookup tables, its shadow and its pre-scan's shadow live at once.
+// Larger or more deeply nested plans use the normal allocator and return that
+// memory at the end of the plan. Only the scheduler control thread uses this
+// owner.
 class PlanningScratch {
     static constexpr std::size_t kBankBytes = 256 * 1024;
     struct Bank {
@@ -94,7 +96,7 @@ public:
     }
 
 private:
-    mutable std::array<Bank, 2> banks_;
+    mutable std::array<Bank, 3> banks_;
 };
 
 }  // namespace tokenspeed

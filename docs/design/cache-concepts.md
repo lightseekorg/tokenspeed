@@ -215,12 +215,19 @@ growing only with touched parents. Restoring a parent keeps its slot until the
 shadow dies, so repeated Remove/Restore does not allocate individual nodes.
 Dense parent ranges initially use nearby slots; clustered probes trigger one
 rehash with mixed integer hashes, so regular strides do not produce long scans.
-Each shadow owns an independent RAII scratch lease. The pool lazily retains at
-most two 256 KiB banks; larger allocations and further simultaneous leases use
-the ordinary allocator and free that overflow with their containers. Only
-storage is reused: every shadow starts with fresh occupancy state, and its
-containers die before the lease returns. No array proportional to a sparse
-Host pool's theoretical slot count is initialized for planning.
+The eviction planners' lookup tables (protected and reclaimed locations, the
+selected sets' members, segment tops, checkpoint counts) are open-addressed
+slot arrays as well, reserved from the probe's hit count and the demand's
+shortfall, with every key bit mixed so strided page IDs and pooled node
+addresses do not cluster. No plan iterates them, so none depends on slot
+order. Each shadow, and each planner for its tables, owns an independent RAII
+scratch lease. The pool lazily retains at most three 256 KiB banks, as many as
+an admission's planner, shadow and pre-scan shadow hold at once; larger
+allocations and further simultaneous leases use the ordinary allocator and
+free that overflow with their containers. Only storage is reused: every plan
+starts with fresh tables and occupancy state, and its containers die before
+the lease returns. No array proportional to a sparse Host pool's theoretical
+slot count is initialized for planning.
 
 Replicated groups have one ownership bucket: every Host hit needs a Device
 destination in that bucket, without looking up or temporarily owning the Host

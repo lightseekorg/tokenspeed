@@ -25,17 +25,16 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
-#include <memory_resource>
 #include <numeric>
 #include <optional>
 #include <span>
 #include <tuple>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include "cache/cache_group.h"
+#include "cache/coordinator/flat_hash_map.h"
 #include "cache/core/block_pool.h"
 #include "cache/prefix/checkpoint_tree.h"
 #include "cache/prefix/prefix_index.h"
@@ -45,7 +44,7 @@ namespace tokenspeed {
 // Non-owning candidate traversal. Finish it before changing the pool or indexes.
 class CacheEvictionCandidates {
 public:
-    using LocationSet = std::pmr::unordered_set<CacheBlockLocation, CacheBlockLocationHash>;
+    using LocationSet = FlatHashSet<CacheBlockLocation>;
     // Per checkpoint, the State entries the plan has taken from this tier.
     using RemovedCheckpoints = std::unordered_map<ContentHash, std::int32_t>;
 
@@ -305,12 +304,8 @@ private:
     }
 
     bool excluded(CacheBlockLocation location) const {
-        // Plans without hits or reclaims leave these sets empty; skip hashing
-        // into them.
-        return (protected_locations_ != nullptr && !protected_locations_->empty() &&
-                protected_locations_->contains(location)) ||
-               (request_reclaim_locations_ != nullptr && !request_reclaim_locations_->empty() &&
-                request_reclaim_locations_->contains(location));
+        return (protected_locations_ != nullptr && protected_locations_->contains(location)) ||
+               (request_reclaim_locations_ != nullptr && request_reclaim_locations_->contains(location));
     }
 
     // `closed`: the group is prefix-closed. `metadata` is an entry's
