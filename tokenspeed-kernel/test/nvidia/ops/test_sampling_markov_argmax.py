@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from utils import assert_no_cute_compile
 
 cute_dsl = pytest.importorskip("tokenspeed_kernel.ops.sampling.cute_dsl")
 
@@ -128,6 +129,15 @@ def test_matches_the_unfused_walk_bit_for_bit(workspace, rows):
     # Only the output column is written.
     keep = [c for c in range(TABLE_WIDTH) if c != 3]
     torch.testing.assert_close(table[:, keep], before[:, keep], rtol=0, atol=0)
+
+
+def test_row_counts_reuse_the_precompiled_kernels(workspace):
+    """The workspace compiles every row-tile kernel; launches never trace."""
+    steps = [_inputs(rows, seed=rows) for rows in (1, 9, 16, 65, 130)]
+    with assert_no_cute_compile():
+        for base, embedding, projection, table in steps:
+            _step(workspace, base, table, 2, 3, embedding, projection)
+    torch.cuda.synchronize()
 
 
 def test_random_weights_differ_only_at_near_ties(workspace):
