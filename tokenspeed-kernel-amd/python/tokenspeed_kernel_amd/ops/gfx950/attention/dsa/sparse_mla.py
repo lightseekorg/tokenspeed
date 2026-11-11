@@ -1126,6 +1126,79 @@ def _load_listed_group(
 
 
 @gluon.jit
+def _compact_listed_ends(row_counts, num_tiles, shared_ends, TILES_LOG2: gl.constexpr):
+    # Tile t's listed keys take compact slots [ends[t - 1], ends[t]); returns their total.
+    TILES: gl.constexpr = 1 << TILES_LOG2
+    W: gl.constexpr = gl.num_warps()
+    tiles = gl.arange(0, TILES, layout=_vector_layout(W, TILES // (64 * W)))
+    counts = gl.amd.cdna4.buffer_load(
+        ptr=row_counts, offsets=tiles, mask=tiles < num_tiles, other=0, cache=".cv"
+    )
+    starts, total = _block_exclusive_ranks(counts, TILES // (64 * W))
+    shared_ends.store(starts + counts)
+    gl.barrier()
+    return total
+
+
+@gluon.jit
+def _load_compact_listed(
+    tile_total,
+    overflow_count,
+    row_keys,
+    row_slots,
+    row_overflow_keys,
+    row_overflow_slots,
+    shared_ends,
+    gather_layout: gl.constexpr,
+    TILES_LOG2: gl.constexpr,
+    CHUNK: gl.constexpr,
+    SIZE: gl.constexpr,
+):
+    # Tile-listed keys in tile order, then the overflow, packed into SIZE register slots.
+    TILES: gl.constexpr = 1 << TILES_LOG2
+    flat = gl.arange(0, SIZE, layout=gather_layout)
+    # A slot's tile is the number of tiles ending at or before it.
+    tile = gl.zeros_like(flat)
+    for level in gl.static_range(TILES_LOG2):
+        probe = tile + (TILES >> (level + 1))
+        tile = gl.where(shared_ends.gather(probe - 1, axis=0) <= flat, probe, tile)
+    tile_start = gl.where(
+        tile > 0, shared_ends.gather(gl.maximum(tile - 1, 0), axis=0), 0
+    )
+    tile_offsets = tile * CHUNK + flat - tile_start
+    in_tiles = flat < tile_total
+    overflow_offsets = flat - tile_total
+    in_overflow = (flat >= tile_total) & (overflow_offsets < overflow_count)
+    keys = gl.where(
+        in_tiles,
+        gl.amd.cdna4.buffer_load(
+            ptr=row_keys, offsets=tile_offsets, mask=in_tiles, other=0, cache=".cv"
+        ),
+        gl.amd.cdna4.buffer_load(
+            ptr=row_overflow_keys,
+            offsets=overflow_offsets,
+            mask=in_overflow,
+            other=0,
+            cache=".cv",
+        ),
+    ).to(gl.uint32, bitcast=True)
+    slots = gl.where(
+        in_tiles,
+        gl.amd.cdna4.buffer_load(
+            ptr=row_slots, offsets=tile_offsets, mask=in_tiles, other=0, cache=".cv"
+        ),
+        gl.amd.cdna4.buffer_load(
+            ptr=row_overflow_slots,
+            offsets=overflow_offsets,
+            mask=in_overflow,
+            other=0,
+            cache=".cv",
+        ),
+    )
+    return keys, slots, in_tiles | in_overflow
+
+
+@gluon.jit
 def _load_listed_overflow(
     row_overflow_keys,
     row_overflow_slots,
@@ -1337,6 +1410,7 @@ def _dsa_multi_cta_select_kernel(
     TILE_GROUP: gl.constexpr,
     CHUNK: gl.constexpr,
     TIE_CAP: gl.constexpr,
+    TILES_LOG2: gl.constexpr,
 ):
     # Level 2: CTAs list bucket keys; the last to arrive resolves and re-zeroes the row.
     gl.static_assert(
@@ -1489,12 +1563,47 @@ def _dsa_multi_cta_select_kernel(
         gl.zeros([NUM_BUCKETS], gl.int32, layout=histogram_layout)
     )
     gather_layout: gl.constexpr = gl.BlockedLayout([4], [64], [W], [0])
+    SIZE: gl.constexpr = TILE_GROUP * CHUNK
     remaining = topk - greater
-    # The first tile group's keys stay in registers; the rest stream once per level.
-    gathered_keys, gathered_slots, gathered = _load_listed_group(
-        row_counts, row_keys, row_slots, 0, num_tiles, gather_layout, TILE_GROUP, CHUNK
+    shared_ends = gl.allocate_shared_memory(
+        gl.int32, [1 << TILES_LOG2], _flat_shared_layout(1 << TILES_LOG2)
     )
     spilled = (num_tiles > TILE_GROUP) | (overflow_count > 0)
+    tile_total = num_tiles * 0
+    if spilled:
+        tile_total = _compact_listed_ends(row_counts, num_tiles, shared_ends, TILES_LOG2)
+    visit_tiles = num_tiles
+    visit_overflow = overflow_count
+    if spilled & (tile_total + overflow_count <= SIZE):
+        # A long row's few listed keys pack into registers instead of streaming per level.
+        gathered_keys, gathered_slots, gathered = _load_compact_listed(
+            tile_total,
+            overflow_count,
+            row_keys,
+            row_slots,
+            row_overflow_keys,
+            row_overflow_slots,
+            shared_ends,
+            gather_layout,
+            TILES_LOG2,
+            CHUNK,
+            SIZE,
+        )
+        visit_tiles = gl.minimum(num_tiles, TILE_GROUP)
+        visit_overflow = overflow_count * 0
+    else:
+        # The first tile group's keys stay in registers; the rest stream once per level.
+        gathered_keys, gathered_slots, gathered = _load_listed_group(
+            row_counts,
+            row_keys,
+            row_slots,
+            0,
+            num_tiles,
+            gather_layout,
+            TILE_GROUP,
+            CHUNK,
+        )
+    spilled = (visit_tiles > TILE_GROUP) | (visit_overflow > 0)
     bucket_prefix = bucket.to(gl.uint32)
     _count_multi_cta_digits(
         shared_histogram,
@@ -1512,8 +1621,8 @@ def _dsa_multi_cta_select_kernel(
         row_slots,
         row_overflow_keys,
         row_overflow_slots,
-        num_tiles,
-        overflow_count,
+        visit_tiles,
+        visit_overflow,
         shared_histogram,
         shared_tie_keys,
         shared_tie_slots,
@@ -1556,8 +1665,8 @@ def _dsa_multi_cta_select_kernel(
                 row_slots,
                 row_overflow_keys,
                 row_overflow_slots,
-                num_tiles,
-                overflow_count,
+                visit_tiles,
+                visit_overflow,
                 shared_histogram,
                 shared_tie_keys,
                 shared_tie_slots,
@@ -1594,8 +1703,8 @@ def _dsa_multi_cta_select_kernel(
             row_slots,
             row_overflow_keys,
             row_overflow_slots,
-            num_tiles,
-            overflow_count,
+            visit_tiles,
+            visit_overflow,
             shared_histogram,
             shared_tie_keys,
             shared_tie_slots,
@@ -1637,8 +1746,8 @@ def _dsa_multi_cta_select_kernel(
                 row_slots,
                 row_overflow_keys,
                 row_overflow_slots,
-                num_tiles,
-                overflow_count,
+                visit_tiles,
+                visit_overflow,
                 shared_histogram,
                 shared_tie_keys,
                 shared_tie_slots,
@@ -3102,6 +3211,8 @@ def _dsa_multi_cta_topk(
         TILE_GROUP=tile_group,
         CHUNK=chunk,
         TIE_CAP=_MULTI_CTA_TIE_CAP,
+        # The tile-count scan gives every lane of the block at least one tile.
+        TILES_LOG2=max(tiles - 1, 64 * _MULTI_CTA_NUM_WARPS - 1).bit_length(),
         num_warps=_MULTI_CTA_NUM_WARPS,
         **extern_compile_options(),
     )
