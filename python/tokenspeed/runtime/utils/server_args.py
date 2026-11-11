@@ -212,27 +212,31 @@ DECODE_MONOKERNEL_ARCHITECTURES = (
     "Qwen4ExpForCausalLM",
     "Qwen4ExpForConditionalGeneration",
 )
-# Target architectures whose speculative draft has decode monokernels too,
-# and the draft architectures those monokernels serve. Under
-# --decode-monokernel such a target's draft of such an architecture must pack
-# them or startup fails; any other draft keeps its regular layers.
-DRAFT_MONOKERNEL_TARGET_ARCHITECTURES = ("MuseSparkForConditionalGeneration",)
-DRAFT_MONOKERNEL_ARCHITECTURES = ("DFlash2DraftModel",)
+# Draft architectures with decode monokernels, and the target architectures
+# whose drafts they serve. Under --decode-monokernel such a draft of such a
+# target takes the switch too; any other draft (a Qwen3.8 target's DFlash2
+# draft, a Muse Spark target's other drafts) keeps its regular layers.
+DRAFT_MONOKERNEL_TARGETS = {
+    "DFlash2DraftModel": ("MuseSparkForConditionalGeneration",),
+    # The MTP draft of a Qwen3.8 target (hf_transformers_utils renames the
+    # draft's architecture to it).
+    "Qwen4ExpForCausalLMNextN": (
+        "Qwen4ExpForCausalLM",
+        "Qwen4ExpForConditionalGeneration",
+    ),
+}
 
 
 def draft_takes_decode_monokernel(
     switch: bool, target_architectures: list[str], draft_architectures: list[str]
 ) -> bool:
     """Whether a draft under ``--decode-monokernel`` (``switch``) builds its
-    layers from its monokernel class: only a draft in
-    DRAFT_MONOKERNEL_ARCHITECTURES (DFlash2) of a target in
-    DRAFT_MONOKERNEL_TARGET_ARCHITECTURES."""
-    return (
-        switch
-        and any(
-            a in DRAFT_MONOKERNEL_TARGET_ARCHITECTURES for a in target_architectures
-        )
-        and any(a in DRAFT_MONOKERNEL_ARCHITECTURES for a in draft_architectures)
+    layers from its monokernel class: only a draft in DRAFT_MONOKERNEL_TARGETS
+    of one of the targets it lists."""
+    return switch and any(
+        target in DRAFT_MONOKERNEL_TARGETS.get(draft, ())
+        for draft in draft_architectures
+        for target in target_architectures
     )
 
 
@@ -4002,13 +4006,14 @@ class ServerArgs:
                 "layouts its kernels serve). Models: "
                 f"{', '.join(DECODE_MONOKERNEL_ARCHITECTURES)} on gfx950. "
                 "Startup fails when a layer cannot be packed for its "
-                "monokernel. A "
-                f"{', '.join(DRAFT_MONOKERNEL_ARCHITECTURES)} speculative "
-                "draft of a target in "
-                f"{', '.join(DRAFT_MONOKERNEL_TARGET_ARCHITECTURES)} takes the "
-                "switch too, and startup fails when its layers, context write "
-                "or head cannot be packed; every other draft keeps the "
-                "regular path. Other steps keep the regular path."
+                "monokernel. A speculative draft with monokernels of its "
+                "own takes the switch too when its target is one they serve ("
+                + "; ".join(
+                    f"{draft}: {', '.join(targets)}"
+                    for draft, targets in DRAFT_MONOKERNEL_TARGETS.items()
+                )
+                + "); every other draft keeps the regular path. Other steps "
+                "keep the regular path."
             ),
         )
         parser.add_argument(

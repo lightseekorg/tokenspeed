@@ -822,17 +822,21 @@ def test_the_drafts_config_switch_picks_the_monokernel_layer_class(
 
 
 @pytest.mark.parametrize("switch", [False, True])
-def test_only_a_muse_spark_targets_dflash2_draft_takes_the_decode_monokernels(
+def test_a_draft_takes_the_decode_monokernels_only_for_a_target_they_serve(
     switch: bool,
 ) -> None:
-    """Under --decode-monokernel only a DFlash2 draft of a target with draft
-    monokernels (Muse Spark) gets the switch; a Qwen3.8 target's DFlash2 draft
-    and a Muse Spark target's other drafts keep their regular layers."""
+    """Under --decode-monokernel a DFlash2 draft of a Muse Spark target and the
+    MTP draft of a Qwen3.8 target get the switch; a Qwen3.8 target's DFlash2
+    draft and a Muse Spark target's other drafts keep their regular layers."""
     from tokenspeed.runtime.utils.server_args import draft_takes_decode_monokernel
 
     muse, dflash2 = ["MuseSparkForConditionalGeneration"], ["DFlash2DraftModel"]
+    mtp = ["Qwen4ExpForCausalLMNextN"]
+    for qwen in (["Qwen4ExpForCausalLM"], ["Qwen4ExpForConditionalGeneration"]):
+        assert draft_takes_decode_monokernel(switch, qwen, mtp) is switch
+        assert not draft_takes_decode_monokernel(switch, qwen, dflash2)
     assert draft_takes_decode_monokernel(switch, muse, dflash2) is switch
-    assert not draft_takes_decode_monokernel(switch, ["Qwen4ExpForCausalLM"], dflash2)
+    assert not draft_takes_decode_monokernel(switch, muse, mtp)
     assert not draft_takes_decode_monokernel(switch, [], dflash2)
     assert not draft_takes_decode_monokernel(switch, muse, ["DFlashDraftModel"])
     assert not draft_takes_decode_monokernel(switch, muse, ["LlamaForCausalLMEagle3"])

@@ -149,9 +149,9 @@ def load_model_config(
     )
     if draft_of is not None:
         # Declared on every draft's config (a draft has no config class that
-        # declares it). Only a draft with decode monokernels (DFlash2) of a
-        # target with draft monokernels takes them, and packs every piece or
-        # startup fails (enable_draft_monokernels).
+        # declares it). Only a draft with decode monokernels of a target they
+        # serve takes them (DRAFT_MONOKERNEL_TARGETS), and packs every piece
+        # or startup fails.
         config.hf_text_config.decode_monokernel = draft_takes_decode_monokernel(
             bool(server_args.decode_monokernel),
             list(getattr(draft_of.hf_config, "architectures", None) or []),
