@@ -44,7 +44,7 @@ use std::{
     process::ExitCode,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
     thread,
     time::Duration,
@@ -135,6 +135,45 @@ struct Args {
     python: String,
     control_fd: i32,
     enable_async_logging: bool,
+}
+
+/// The control and forward threads report to the same launcher.
+static LAUNCHER_FAILURE: OnceLock<LauncherFailure> = OnceLock::new();
+
+struct LauncherFailure {
+    reported: AtomicBool,
+    parent: Option<libc::pid_t>,
+}
+
+impl LauncherFailure {
+    #[allow(unsafe_code)]
+    fn for_parent() -> Self {
+        // SAFETY: getppid has no preconditions.
+        let parent = unsafe { libc::getppid() };
+        Self {
+            reported: AtomicBool::new(false),
+            parent: (parent > 1).then_some(parent),
+        }
+    }
+
+    #[allow(unsafe_code)]
+    fn report(&self, error: impl std::fmt::Display) {
+        if self.reported.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let signal_error = self.parent.and_then(|parent| {
+            // SAFETY: parent is a positive PID. Check that the launcher still
+            // owns this rank before sending the existing child-failure signal.
+            let failed =
+                unsafe { libc::getppid() == parent && libc::kill(parent, libc::SIGUSR1) != 0 };
+            failed.then(std::io::Error::last_os_error)
+        });
+        // Synchronous logging can stall on a blocked output stream.
+        tracing::error!("{error}");
+        if let Some(error) = signal_error {
+            tracing::error!(%error, "could not notify the launcher");
+        }
+    }
 }
 
 fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, HostError> {
@@ -576,7 +615,7 @@ fn watch_signals(stop: Arc<AtomicBool>) -> std::io::Result<()> {
     Ok(())
 }
 
-fn serve(args: &Args) -> Result<(), HostError> {
+fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
     let stop = Arc::new(AtomicBool::new(false));
     watch_signals(stop.clone())?;
 
@@ -806,11 +845,25 @@ fn serve(args: &Args) -> Result<(), HostError> {
             l3,
         },
     );
-    let served = event_loop.run(&stop);
-    // Stops the forward thread and tells the frontend the engine is gone.
-    drop(event_loop);
-    call("close")?;
-    Ok(served?)
+    finish_serving(event_loop.run(&stop), launcher, || {
+        // Stops the forward thread and tells the frontend the engine is gone.
+        drop(event_loop);
+        call("close")
+    })
+}
+
+fn finish_serving(
+    served: Result<(), LoopError>,
+    launcher: &LauncherFailure,
+    close: impl FnOnce() -> Result<(), HostError>,
+) -> Result<(), HostError> {
+    let served = served.map_err(HostError::from);
+    if let Err(error) = &served {
+        // Joining the forward thread and closing Python can wait on device
+        // work. Let the launcher start failure handling before either.
+        launcher.report(error);
+    }
+    served.and(close())
 }
 
 fn main() -> ExitCode {
@@ -822,17 +875,18 @@ fn main() -> ExitCode {
         }
     };
     let _log_guard = logging::init(args.enable_async_logging);
+    let launcher = LAUNCHER_FAILURE.get_or_init(LauncherFailure::for_parent);
     let served = (|| {
         interpreter::start(&args.python).map_err(HostError::Interpreter)?;
         let served = {
             // The host does not finalize Python. Drain its logger on success,
-            // error and unwind, before failure notification can kill the rank.
+            // error and unwind if the launcher has not stopped the rank.
             let _python_logs = logging::PythonLogGuard;
-            serve(&args)
+            serve(&args, launcher)
         };
-        if served.is_err() {
-            // As `run_event_loop` does: the launcher then stops the other
-            // ranks.
+        if served.is_err() && !launcher.reported.load(Ordering::Relaxed) {
+            // Failures outside the serving loop still notify after Python
+            // log cleanup.
             let notified = Python::attach(|py| {
                 py.import("tokenspeed.runtime.engine.rust_host")?
                     .call_method0("notify_launcher_of_failure")
@@ -847,7 +901,9 @@ fn main() -> ExitCode {
     match served {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            tracing::error!("{error}");
+            if !launcher.reported.load(Ordering::Relaxed) {
+                tracing::error!("{error}");
+            }
             ExitCode::FAILURE
         }
     }

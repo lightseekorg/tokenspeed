@@ -33,9 +33,9 @@ With `--enable-async-logging`, the Rust tracing writer and Python root logger
 also run off the serving threads. Each has a bounded, lossy queue: a slow
 output stream must not introduce I/O backpressure into a round. The host
 owns Python log cleanup explicitly after serving returns, including errors
-and encode ranks, before notifying its launcher of a failure. Returning from
-Rust does not finalize Python, so an `atexit` hook alone cannot drain those
-records. Cleanup is bounded because an output stream can remain stalled.
+and encode ranks. Returning from Rust does not finalize Python, so an
+`atexit` hook alone cannot drain those records. Cleanup is bounded because
+an output stream can remain stalled.
 
 The ranks of a replica (an attention-TP group, across every pipeline stage)
 run the same scheduler. They talk over `ts-collective`'s TCP mesh, in fixed
@@ -1062,6 +1062,13 @@ status. Failure, termination and constructor-error cleanup share one
 process-local shutdown latch: once cleanup starts, later rank notifications
 cannot interrupt it. Signal callbacks do not log or enumerate processes;
 cleanup runs outside the callback.
+
+While serving generation, a fatal control-loop or forward-thread error
+signals the owning launcher once from the thread that detects it. The
+signal requires no Python call and precedes the Rust error log and any wait
+for the forward thread or device cleanup. The launcher can begin stopping
+the local ranks even while the failing rank is still alive. An orderly stop
+still drains the forward thread and closes the data plane.
 
 ## Checklist for extending the loop
 
