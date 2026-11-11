@@ -171,6 +171,55 @@ class TestBreakableCudaGraph:
         expected[:1] = ((new_x @ self.w1)[:1] * 2) @ self.w2
         torch.testing.assert_close(captured_out, expected, rtol=1e-4, atol=1e-4)
 
+    def test_tuple_break_outputs_replay_independently_and_clear_padding(self):
+        class PairOp:
+            @break_point
+            def forward(self, x):
+                rows = current_valid_rows()
+                if rows is not None:
+                    x = x[:rows]
+                # Equal signatures exercise distinct storage within one handoff.
+                return x * 2, x * 3
+
+        op = PairOp()
+
+        def forward():
+            left, right = op.forward(self.x_static @ self.w1)
+            return left @ self.w2 + right @ self.w2
+
+        for _ in range(3):
+            forward()
+        torch.cuda.synchronize()
+        cap = BreakableCapture()
+        with cap:
+            captured_out = forward()
+
+        for rows in (self.n, 3, self.n, 1):
+            new_x = torch.randn(self.n, self.d, device=self.dev, dtype=self.dtype)
+            self.x_static.copy_(new_x)
+            cap.replay(valid_rows=rows)
+            torch.cuda.synchronize()
+            expected = torch.zeros_like(captured_out)
+            expected[:rows] = ((new_x @ self.w1)[:rows] * 5) @ self.w2
+            torch.testing.assert_close(captured_out, expected, rtol=1e-4, atol=1e-4)
+
+    def test_expanded_break_output_can_be_copied_and_scrubbed(self):
+        class ExpandedOp:
+            @break_point
+            def forward(self, x):
+                return x[:, :1].expand_as(x)
+
+        op = ExpandedOp()
+        cap = BreakableCapture()
+        with cap:
+            output = op.forward(self.x_static) + 1
+        self.x_static.normal_()
+        cap.replay(valid_rows=3)
+        torch.cuda.synchronize()
+        expected = self.x_static[:, :1].expand_as(self.x_static).clone()
+        expected[3:].zero_()
+        torch.testing.assert_close(output, expected + 1)
+
     def test_multiple_breaks_chain(self):
         """Many breaks (like a deep transformer) must chain correctly."""
         depth = 6
@@ -420,6 +469,125 @@ class TestSharedHandoffStorage:
                     for n in (8, 4)
                 )
                 assert (wide) == (narrow)
+
+    @pytest.mark.parametrize("order", [(129, 65), (65, 129)])
+    def test_packed_scale_layout_survives_bucket_reuse(self, order):
+        """A packed scale consumer reads rows with stride one, including padding."""
+        groups, words = 2, 4
+        inputs = torch.zeros(max(order), groups, words, device=self.dev)
+
+        class ScaleOp:
+            @break_point
+            def forward(self, x):
+                rows = current_valid_rows()
+                x = x if rows is None else x[:rows]
+                padded = (x.shape[0] + 3) // 4 * 4
+                scales = torch.empty(
+                    groups, words, padded, device=x.device, dtype=x.dtype
+                ).permute(2, 0, 1)[: x.shape[0]]
+                scales.copy_(x * 3)
+                return x * 2, scales
+
+        op = ScaleOp()
+        captures, storage, pool = {}, {}, None
+        for n in order:
+
+            def forward():
+                codes, scales = op.forward(inputs[:n])
+                # This is the MN-major scale contract used by the FP8 GEMM.
+                assert scales.stride() == (
+                    1,
+                    words * ((n + 3) // 4 * 4),
+                    (n + 3) // 4 * 4,
+                )
+                return codes + scales
+
+            cap = BreakableCapture(pool=pool, handoff_storage=storage)
+            with cap:
+                output = forward()
+            pool = cap.pool
+            captures[n] = cap, output
+        assert len(storage) == 2
+        if order[0] > order[1]:
+            addresses = [
+                tuple(t.data_ptr() for t in next(iter(cap._handoff_tuples.values())))
+                for cap, _ in captures.values()
+            ]
+            assert addresses[0] == addresses[1]
+        for n in (*order, *reversed(order)):
+            cap, output = captures[n]
+            for rows in (n, 3, 0, n - 1):
+                inputs.normal_()
+                cap.replay(valid_rows=rows)
+                torch.cuda.synchronize()
+                expected = inputs[:n] * 5
+                expected[rows:].zero_()
+                torch.testing.assert_close(output, expected)
+
+    def test_packed_scale_handoff_feeds_grouped_fp8_projection(self):
+        from tokenspeed_kernel.ops.gemm import (
+            grouped_fp8_projection_quantize_fp8,
+            has_grouped_fp8_projection,
+            prepare_grouped_fp8_projection,
+        )
+
+        device = torch.device(self.dev)
+        groups, width, output_dim, bucket = 8, 4096, 128, 128
+        if not has_grouped_fp8_projection(device, output_dim, width):
+            pytest.skip("requires grouped FP8 projection")
+        inputs = torch.zeros(bucket, groups, width, device=device)
+        weight = torch.randn(groups * output_dim, width, device=device).to(
+            torch.float8_e4m3fn
+        )
+        weight_scales = prepare_grouped_fp8_projection(
+            weight,
+            torch.full(
+                (groups * output_dim, width // 32),
+                127,
+                dtype=torch.uint8,
+                device=device,
+            ),
+            groups,
+        )
+
+        class PackedAttention:
+            @break_point
+            def forward(self, x):
+                rows = current_valid_rows()
+                x = x if rows is None else x[:rows]
+                padded = (x.shape[0] + 3) // 4 * 4
+                scales = torch.full(
+                    (groups, width // 128, padded),
+                    0x7F7F7F7F,
+                    dtype=torch.int32,
+                    device=device,
+                ).permute(2, 0, 1)[: x.shape[0]]
+                return x.to(torch.float8_e4m3fn), scales
+
+        op = PackedAttention()
+
+        def forward():
+            codes, scales = op.forward(inputs)
+            return grouped_fp8_projection_quantize_fp8(
+                codes, scales, weight.view(groups, output_dim, width), weight_scales
+            )
+
+        for _ in range(3):
+            forward()
+        torch.cuda.synchronize()
+        cap = BreakableCapture()
+        with cap:
+            actual = forward()
+        for rows in (bucket, 3, 0, 65):
+            inputs.normal_()
+            cap.replay(valid_rows=rows)
+            torch.cuda.synchronize()
+            inputs[rows:].zero_()
+            expected = forward()
+            for found, reference in zip(actual, expected, strict=True):
+                torch.testing.assert_close(
+                    found.float(), reference.float(), rtol=0, atol=0
+                )
 
 
 @pytest.mark.skipif(not (torch.cuda.is_available()), reason=("requires CUDA"))

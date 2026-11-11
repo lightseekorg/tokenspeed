@@ -73,6 +73,7 @@ def _config(
         input_logprob_chunk_tokens=1024,
         decode_only_attention=False,
         prefill_graph_capture_batch_sizes=None,
+        prefill_graph_decoder_capture_sizes=None,
         enable_speculative_sampling=False,
         query_shard_size=1,
         query_shard_rank=0,

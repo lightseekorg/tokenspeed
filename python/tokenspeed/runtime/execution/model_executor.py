@@ -427,6 +427,8 @@ class ModelExecutorConfig:
     decode_only_attention: bool
     # Explicit None selects the minimum request count for each token bucket.
     prefill_graph_capture_batch_sizes: list[int] | None
+    # Explicit None inherits the token ladder for the narrowing decoder.
+    prefill_graph_decoder_capture_sizes: list[int] | None
     # The drafter's extend-round work replays from graphs beside the target's
     # prefill graph (--enable-drafter-prefill-graph): it selects whether that
     # work runs eager or from graphs, so it is explicit.
@@ -559,6 +561,7 @@ class ModelExecutorConfig:
             prefill_graph_max_tokens=_resolve_prefill_graph_max_tokens(server_args),
             prefill_graph_capture_sizes=server_args.prefill_graph_capture_sizes,
             prefill_graph_capture_batch_sizes=server_args.prefill_graph_capture_batch_sizes,
+            prefill_graph_decoder_capture_sizes=server_args.prefill_graph_decoder_capture_sizes,
             enable_drafter_prefill_graph=server_args.enable_drafter_prefill_graph,
             state_checkpoint_in_forward=server_args.writes_state_checkpoints_in_forward,
             model_is_mrope=model_is_mrope,
@@ -1580,6 +1583,8 @@ class ModelExecutor:
                 ctx,
                 input_ids,
                 self._active_multimodal_context,
+                positions=positions,
+                model_kwargs=model_kwargs,
             )
         if (
             mode is not None

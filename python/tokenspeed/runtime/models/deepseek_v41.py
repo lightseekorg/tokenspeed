@@ -1015,6 +1015,19 @@ def _row_plan(layer_id: int, ced_decoder_start: int, ctx: ForwardContext) -> V41
     return V41RowPlan(view.metadata, view.metadata, None, None, None)
 
 
+@dataclass(frozen=True)
+class V41AttentionInput:
+    """Token-local attention projections captured before the sequence-mixing break."""
+
+    qr: torch.Tensor
+    swa: torch.Tensor
+    q_input: torch.Tensor
+    q_scale: torch.Tensor | None
+    index_q_input: torch.Tensor
+    index_q_scale: torch.Tensor | None
+    q: torch.Tensor | None
+
+
 class DeepseekV41Attention(nn.Module):
     def __init__(
         self,
@@ -1354,43 +1367,21 @@ class DeepseekV41Attention(nn.Module):
             return "packed"
         return "swizzled" if "swizzled" in layouts else "canonical"
 
-    @break_point
-    def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        ctx: ForwardContext,
-        reduce_output: bool,
-        hidden_codes: torch.Tensor | None = None,
-        hidden_scales: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Return the attention output, reducing its TP partial when requested.
-
-        hidden_codes/hidden_scales optionally carry hidden_states already
-        quantized for wq_a_wkv (group-32 E4M3 codes and UE8M0 scales).
-        """
-        backend, mode = ctx.attn_backend, ctx.forward_mode
-        if mode is None:
-            raise ValueError("V4.1 attention requires an explicit forward mode")
-        rows = _row_plan(self.layer_id, self.ced_decoder_start, ctx)
-        meta = rows.source
-        source_gather = (
-            QueryShardGather(rows.source_shard, self.mapping.attn.qcp_group)
-            if rows.source_shard is not None
-            else None
-        )
-        query_gather = (
+    def _query_gather(self, rows: V41RowPlan) -> QueryShardGather | None:
+        return (
             QueryShardGather(rows.query_shard, self.mapping.attn.qcp_group)
             if rows.query_shard is not None
             else None
         )
-        # The prepared weights serve decode and pure prefill alike. A mixed
-        # batch keeps the step-by-step path, as its extend and decode halves
-        # must agree on the output format. So does a query shard: the fused
-        # kernel rotates Q from the positions the backend holds, and under
-        # model QCP those are the shard's query rows rather than the source
-        # rows this layer rotates itself.
-        fused_decode = (
+
+    def _use_fused_attention(
+        self, ctx: ForwardContext, query_gather: QueryShardGather | None
+    ) -> bool:
+        mode = ctx.forward_mode
+        if mode is None:
+            raise ValueError("V4.1 attention requires an explicit forward mode")
+        backend = ctx.attn_backend
+        return (
             self.fused_q_weight is not None
             and query_gather is None
             and (
@@ -1398,55 +1389,64 @@ class DeepseekV41Attention(nn.Module):
                 or (mode.is_extend() and backend.supports_fused_prefill)
             )
         )
-        if source_gather is not None and (
-            source_gather.plan.size != len(source_gather.group)
-            or self.mapping.attn.head_tp_size != 1
-        ):
-            raise ValueError(
-                "V4.1 model QCP requires matching query ranks and replicated heads"
-            )
-        source_positions, source_requests = meta.positions, meta.request_indices
-        source_count = (
-            rows.source_shard.local_rows
-            if rows.source_shard is not None
-            else source_positions.numel()
+
+    def _inverse_output_rope_cache(self, x: torch.Tensor) -> torch.Tensor | None:
+        return (
+            self.rotary_emb.inverse_cos_sin_cache
+            if x.is_cuda
+            and (current_platform().is_cdna4 or current_platform().is_cdna5)
+            else None
         )
-        # Prefill buckets pad token-local compute; cache writes and selection
-        # must use only the live rows, including the decode suffix of a mixed batch.
-        if current_forward_ctx() is not None:
-            positions, hidden_states, hidden_codes, hidden_scales = (
-                slice_to_real_tokens(
-                    source_count,
-                    positions,
-                    hidden_states,
-                    hidden_codes,
-                    hidden_scales,
+
+    def _project_query(
+        self,
+        q_input: torch.Tensor,
+        q_scale: torch.Tensor | None,
+        qr: torch.Tensor,
+        *,
+        fused_decode: bool,
+    ) -> torch.Tensor:
+        if q_input.shape[0]:
+            if fused_decode and q_scale is not None and q_scale.dtype == torch.int32:
+                q = fp8_projection(
+                    q_input,
+                    q_scale,
+                    self.fused_q_weight,
+                    self.fused_q_projection_scales,
+                    None,
                 )
-            )
-        if (
-            positions.shape != (source_count,)
-            or positions.numel() != hidden_states.shape[0]
-        ):
-            raise ValueError("V4.1 hidden rows and backend query metadata disagree")
-        # Backend positions carry -1 for padding; request indices are batch rows.
-        positions, requests = source_positions, source_requests
-        if rows.source_shard is not None:
-            positions = positions[rows.source_shard.local_row_ids]
-            requests = requests[rows.source_shard.local_row_ids]
-        if (
-            rows.keep_rows is not None
-            and rows.keep_rows.numel() == 0
-            and (rows.query_shard is None or rows.query_shard.total_rows == 0)
-        ):
-            self._write_global_kv(
-                hidden_states,
-                source_positions,
-                source_requests,
-                backend,
-                mode,
-                key_rows=source_gather,
-            )
-            return hidden_states[:0]
+            elif fused_decode:
+                q = mm(
+                    q_input,
+                    self.fused_q_weight,
+                    A_scales=q_scale,
+                    B_scales=self.fused_q_scales,
+                    out_dtype=qr.dtype,
+                    quant="mxfp8",
+                    block_size=[1, 32],
+                    prepacked_scales=True,
+                )
+            else:
+                q, _ = self.wq_b(
+                    q_input,
+                    block_scale=q_scale,
+                    output_dtype=qr.dtype if q_scale is not None else None,
+                )
+        else:
+            q = qr.new_empty((0, self.n_local_heads * self.head_dim))
+        return q.unflatten(-1, (self.n_local_heads, self.head_dim))
+
+    def _prepare_input(
+        self,
+        hidden_states: torch.Tensor,
+        hidden_codes: torch.Tensor | None,
+        hidden_scales: torch.Tensor | None,
+        rows: V41RowPlan,
+        *,
+        fused_decode: bool,
+        project_query: bool,
+    ) -> V41AttentionInput:
+        """Run the token-local QKV front before the eager sequence mixer."""
         if hidden_states.shape[0]:
             qkv, _ = self.wq_a_wkv(
                 hidden_states if hidden_codes is None else hidden_codes,
@@ -1491,6 +1491,183 @@ class DeepseekV41Attention(nn.Module):
             # Both reference methods read the layout _q_scale_layout agreed on
             # with this projection, so they share one quantization of Q.
             index_q_input, index_q_scale = q_input, q_scale
+        q = (
+            self._project_query(q_input, q_scale, qr, fused_decode=fused_decode)
+            if project_query
+            else None
+        )
+        return V41AttentionInput(
+            qr, swa, q_input, q_scale, index_q_input, index_q_scale, q
+        )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        ctx: ForwardContext,
+        reduce_output: bool,
+        hidden_codes: torch.Tensor | None = None,
+        hidden_scales: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Capture token-local projections around the eager sequence mixer.
+
+        hidden_codes/hidden_scales optionally carry hidden_states already
+        quantized for wq_a_wkv (group-32 E4M3 codes and UE8M0 scales).
+        """
+        rows = _row_plan(self.layer_id, self.ced_decoder_start, ctx)
+        query_gather = self._query_gather(rows)
+        fused_decode = self._use_fused_attention(ctx, query_gather)
+        cache_only = (
+            rows.keep_rows is not None
+            and rows.keep_rows.numel() == 0
+            and (rows.query_shard is None or rows.query_shard.total_rows == 0)
+        )
+        # The candidate source keeps QB after narrowing to preserve its original
+        # projection batch. Decode keeps QB beside the overlapped indexer branch.
+        project_query = (
+            not cache_only
+            and rows.keep_rows is None
+            and rows.query_shard is None
+            and ctx.forward_mode.is_extend()
+        )
+        prepared = (
+            None
+            if cache_only
+            else self._prepare_input(
+                hidden_states,
+                hidden_codes,
+                hidden_scales,
+                rows,
+                fused_decode=fused_decode,
+                project_query=project_query,
+            )
+        )
+        out, auxiliary = self._attn(
+            positions,
+            hidden_states,
+            ctx,
+            prepared,
+            fused_decode=fused_decode,
+        )
+        if cache_only:
+            return hidden_states[:0]
+        return self._project_output(
+            out,
+            auxiliary,
+            hidden_states=hidden_states,
+            query_gather=query_gather,
+            reduce_output=reduce_output,
+            fused_decode=fused_decode,
+        )
+
+    @break_point
+    def _attn(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        ctx: ForwardContext,
+        attention_input: V41AttentionInput | None,
+        *,
+        fused_decode: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return MegaAttn's codes/scales, or BF16 output and its positions."""
+        backend, mode = ctx.attn_backend, ctx.forward_mode
+        if mode is None:
+            raise ValueError("V4.1 attention requires an explicit forward mode")
+        rows = _row_plan(self.layer_id, self.ced_decoder_start, ctx)
+        meta = rows.source
+        source_gather = (
+            QueryShardGather(rows.source_shard, self.mapping.attn.qcp_group)
+            if rows.source_shard is not None
+            else None
+        )
+        query_gather = self._query_gather(rows)
+        # The caller fixes fused_decode for this capture. A mixed batch keeps
+        # the step-by-step path, as its extend and decode halves must agree on
+        # the output format. So does a query shard: the fused kernel rotates Q
+        # from backend positions rather than this layer's source rows.
+        if source_gather is not None and (
+            source_gather.plan.size != len(source_gather.group)
+            or self.mapping.attn.head_tp_size != 1
+        ):
+            raise ValueError(
+                "V4.1 model QCP requires matching query ranks and replicated heads"
+            )
+        source_positions, source_requests = meta.positions, meta.request_indices
+        source_count = (
+            rows.source_shard.local_rows
+            if rows.source_shard is not None
+            else source_positions.numel()
+        )
+        if attention_input is None:
+            qr = swa = q_input = q_scale = index_q_input = index_q_scale = q = None
+        else:
+            qr = attention_input.qr
+            swa = attention_input.swa
+            q_input = attention_input.q_input
+            q_scale = attention_input.q_scale
+            index_q_input = attention_input.index_q_input
+            index_q_scale = attention_input.index_q_scale
+            q = attention_input.q
+        # Prefill buckets run the projections over padded rows; cache writes and
+        # selection consume only the live prefix, including a mixed decode suffix.
+        padded_rows = positions.shape[0]
+        if current_forward_ctx() is not None:
+            (
+                positions,
+                hidden_states,
+                qr,
+                swa,
+                q_input,
+                q_scale,
+                index_q_input,
+                index_q_scale,
+                q,
+            ) = slice_to_real_tokens(
+                source_count,
+                positions,
+                hidden_states,
+                qr,
+                swa,
+                q_input,
+                q_scale,
+                index_q_input,
+                index_q_scale,
+                q,
+            )
+            if source_count < padded_rows and q_scale is not None:
+                # Packed/swizzled scales are not row-sliceable. When QB already
+                # ran in the graph only the indexer requantizes live BF16 rows.
+                q_input, q_scale = qr, None
+                index_q_input, index_q_scale = qr, None
+        if (
+            positions.shape != (source_count,)
+            or positions.numel() != hidden_states.shape[0]
+        ):
+            raise ValueError("V4.1 hidden rows and backend query metadata disagree")
+        # Backend positions carry -1 for padding; request indices are batch rows.
+        positions, requests = source_positions, source_requests
+        if rows.source_shard is not None:
+            positions = positions[rows.source_shard.local_row_ids]
+            requests = requests[rows.source_shard.local_row_ids]
+        if (
+            rows.keep_rows is not None
+            and rows.keep_rows.numel() == 0
+            and (rows.query_shard is None or rows.query_shard.total_rows == 0)
+        ):
+            self._write_global_kv(
+                hidden_states,
+                source_positions,
+                source_requests,
+                backend,
+                mode,
+                key_rows=source_gather,
+            )
+            return hidden_states[:0], positions[:0]
+        if attention_input is None:
+            raise RuntimeError(
+                "V4.1 attention input is required after cache-only narrowing"
+            )
         if hidden_states.is_cuda:
             # Lazy shared constants are produced before the fork event, so both
             # branches observe them even on the first eager decode after loading.
@@ -1626,39 +1803,8 @@ class DeepseekV41Attention(nn.Module):
                             projected_partition=partition,
                         )
                         index_q = index_weights = None
-            if q_input.shape[0]:
-                if (
-                    fused_decode
-                    and q_scale is not None
-                    and q_scale.dtype == torch.int32
-                ):
-                    q = fp8_projection(
-                        q_input,
-                        q_scale,
-                        self.fused_q_weight,
-                        self.fused_q_projection_scales,
-                        None,
-                    )
-                elif fused_decode:
-                    q = mm(
-                        q_input,
-                        self.fused_q_weight,
-                        A_scales=q_scale,
-                        B_scales=self.fused_q_scales,
-                        out_dtype=qr.dtype,
-                        quant="mxfp8",
-                        block_size=[1, 32],
-                        prepacked_scales=True,
-                    )
-                else:
-                    q, _ = self.wq_b(
-                        q_input,
-                        block_scale=q_scale,
-                        output_dtype=qr.dtype if q_scale is not None else None,
-                    )
-            else:
-                q = qr.new_empty((0, self.n_local_heads * self.head_dim))
-            q = q.unflatten(-1, (self.n_local_heads, self.head_dim))
+            if q is None:
+                q = self._project_query(q_input, q_scale, qr, fused_decode=fused_decode)
             if (
                 not fused_decode
                 and q.is_cuda
@@ -1698,12 +1844,7 @@ class DeepseekV41Attention(nn.Module):
                 for tensor in (record.candidates.block_ids, record.candidates.lengths):
                     tensor.record_stream(consumer)
         # CDNA4/5 rotate the attention output back inside the attention kernel.
-        out_rope_cache = (
-            self.rotary_emb.inverse_cos_sin_cache
-            if q.is_cuda
-            and (current_platform().is_cdna4 or current_platform().is_cdna5)
-            else None
-        )
+        out_rope_cache = self._inverse_output_rope_cache(q)
         out = backend.forward_v41(
             q,
             swa,
@@ -1727,8 +1868,26 @@ class DeepseekV41Attention(nn.Module):
         )
         if fused_decode:
             codes, scales = out
+            return codes, scales
+        return out, positions
+
+    def _project_output(
+        self,
+        out: torch.Tensor,
+        auxiliary: torch.Tensor,
+        *,
+        hidden_states: torch.Tensor,
+        query_gather: QueryShardGather | None,
+        reduce_output: bool,
+        fused_decode: bool,
+    ) -> torch.Tensor:
+        """Project MegaAttn's handoff in the following captured segment."""
+        if fused_decode:
+            codes, scales = out, auxiliary
+            positions = None
             weight, weight_scales = self.fused_wo_a_weight, self.fused_wo_a_scales
         else:
+            positions = auxiliary
             if out.shape[0] == 0 and query_gather is not None:
                 return hidden_states.new_empty((0, self.wo_b.output_size))
             out = out[:, : self.n_local_heads]
@@ -1742,10 +1901,10 @@ class DeepseekV41Attention(nn.Module):
                 self.mapping.attn.head_tp_group,
             )
         method = self.wo_b.quant_method
+        out_rope_cache = self._inverse_output_rope_cache(hidden_states)
         if self.wo_a_fp8:
-            # One kernel undoes RoPE and casts every 32 channels to FP8, as the
-            # reference rounds o before wo_a. Only CDNA attention rotates back
-            # itself, and no grouped FP8 kernel serves CDNA.
+            # Fused MegaAttn already undid RoPE and quantized its output. Only
+            # the non-fused path needs the separate inverse-RoPE quantizer.
             if not fused_decode:
                 codes, scales = self.rotary_emb.inverse_quantize_grouped(
                     out, positions, self.n_local_groups
@@ -1925,6 +2084,55 @@ class V41HCPost:
         return v41_hc_post(self.x, residual, self.post, self.comb)
 
 
+@break_point
+def _v41_try_hc_post_pre(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    pre_mix: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    base: torch.Tensor,
+    *,
+    hc_norm_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    quantize_fp8: bool,
+) -> tuple[torch.Tensor, ...]:
+    """Try MegaMHC eagerly between prefill graph segments.
+
+    A flat empty tuple represents a declined kernel so the consumer keeps its
+    ordinary fallback and coefficient overlap. Eligibility and output arity
+    depend on the fixed physical bucket shape and projection configuration;
+    preserve that shape, including padded rows, on every replay. Packed FP8
+    scales still have logical token-leading rows with their original strides.
+    """
+    join = (
+        try_mhc_shifted_post_pre_norm_quantize_fp8
+        if quantize_fp8
+        else try_mhc_shifted_post_pre_norm
+    )
+    shifted = join(
+        x,
+        residual,
+        pre_mix,
+        post,
+        comb,
+        weight,
+        scale,
+        base,
+        hc_norm_eps,
+        hc_eps,
+        sinkhorn_iters,
+        norm_weight,
+        norm_eps,
+    )
+    return () if shifted is None else shifted
+
+
 def _v41_hc_post_pre(
     residual,
     pre_mix,
@@ -1960,28 +2168,24 @@ def _v41_hc_post_pre(
             pending.reduce_group,
         )
         return residual, x, None, None
-    # DeepGEMM mega_mhc split barriers race under CUDA graph replay: a replay can
-    # read the previous replay's partials, so keep it out of captured segments.
-    if not prefer_overlap and not is_breakable_capture_active():
-        join = (
-            try_mhc_shifted_post_pre_norm_quantize_fp8
-            if quantize_fp8
-            else try_mhc_shifted_post_pre_norm
-        )
-        shifted = join(
+    # MegaMHC's split barriers stay outside breakable prefill segments. Plain
+    # decode capture and eager execution keep the same native/fallback choice.
+    if not prefer_overlap:
+        shifted = _v41_try_hc_post_pre(
             pending.x,
             residual,
             pre_mix,
             pending.post,
             pending.comb,
             *hc_weights,
-            hc_norm_eps,
-            hc_eps,
-            sinkhorn_iters,
-            norm.weight,
-            norm.variance_epsilon,
+            hc_norm_eps=hc_norm_eps,
+            hc_eps=hc_eps,
+            sinkhorn_iters=sinkhorn_iters,
+            norm_weight=norm.weight,
+            norm_eps=norm.variance_epsilon,
+            quantize_fp8=quantize_fp8,
         )
-        if shifted is not None:
+        if shifted:
             residual, x, pre, post, comb, *quantized = shifted
             return residual, x, (pre, post, comb), tuple(quantized) or None
     return pending.finish(residual), None, None, None

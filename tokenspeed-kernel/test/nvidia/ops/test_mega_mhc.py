@@ -149,9 +149,7 @@ def test_shifted_mhc_quantize_fp8_matches_group32_reference(tokens, hidden):
 @pytest.mark.parametrize("tokens", [33, 512, 8192])
 def test_shifted_mhc_refresh_on_two_streams(tokens):
     args = _inputs(tokens, 5120, 20)
-    # A fresh stream needs its own native barrier initialization. CUDA graph
-    # replay is unsupported: split barriers can read the previous replay's
-    # partials.
+    # A fresh stream needs its own native barrier initialization.
     streams = [torch.cuda.Stream(), torch.cuda.Stream()]
     for stream in streams:
         stream.wait_stream(torch.cuda.current_stream())
@@ -164,6 +162,49 @@ def test_shifted_mhc_refresh_on_two_streams(tokens):
                 for got, ref in zip(actual, _reference(args), strict=True):
                     torch.testing.assert_close(got, ref, atol=0.02, rtol=0.01)
         stream.synchronize()
+
+
+@pytest.mark.parametrize("tokens", [33, 512, 4096, 8192])
+@pytest.mark.parametrize("quantize_fp8", [False, True])
+def test_shifted_mhc_graph_replay_refreshes_split_partials(tokens, quantize_fp8):
+    """Repeated graph launches must read this invocation's split-K partials."""
+    args = _inputs(tokens, 5120, 20)
+    launch = (
+        try_mhc_shifted_post_pre_norm_quantize_fp8
+        if quantize_fp8
+        else try_mhc_shifted_post_pre_norm
+    )
+    captures = []
+    for _ in range(2):
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                assert launch(**args) is not None
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                actual = launch(**args)
+        torch.cuda.current_stream().wait_stream(stream)
+        captures.append((stream, graph, actual))
+    for _ in range(4):
+        for stream, graph, actual in captures:
+            args["x"].normal_()
+            args["residual"].normal_()
+            args["pre"].uniform_()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                graph.replay()
+            torch.cuda.current_stream().wait_stream(stream)
+            for got, ref in zip(actual[:5], _reference(args), strict=True):
+                torch.testing.assert_close(got, ref, atol=0.02, rtol=0.01)
+            if quantize_fp8:
+                exponent, codes = _group32_reference(actual[1])
+                shifts = torch.arange(4, dtype=torch.int32, device="cuda") * 8
+                packed = ((actual[6][..., None] >> shifts) & 255).flatten(-2)
+                torch.testing.assert_close(packed, exponent, atol=0, rtol=0)
+                torch.testing.assert_close(
+                    actual[5].view(torch.uint8), codes.view(torch.uint8), atol=0, rtol=0
+                )
 
 
 @pytest.mark.parametrize(
