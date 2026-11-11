@@ -521,9 +521,17 @@ def test_bf16_index_k_plane_keeps_the_keys_unquantized() -> None:
     assert not pool.get_index_k_buffer(7).any()
 
 
+# Row widths of the projection the index keys are columns of: the indexer's
+# own [wk; weights_proj] GEMM, and the K3 decode chain's packed DSA projection.
+_KEY_PROJECTION_WIDTHS = pytest.mark.parametrize(
+    "width", [160, 3808], ids=["indexer", "decode_chain"]
+)
+
+
 @requires_gpu
+@_KEY_PROJECTION_WIDTHS
 @pytest.mark.parametrize("index_k_format", ["bf16", "fp8_scaled"])
-def test_the_index_k_write_applies_the_deferred_key_norm(index_k_format) -> None:
+def test_the_index_k_write_applies_the_deferred_key_norm(index_k_format, width) -> None:
     """A pre-norm key handed over with its LayerNorm lands in the plane as the
     normalized key would; owned rows only."""
     from tokenspeed_kernel.ops.kvcache.triton import index_k_block_split_scatter
@@ -537,9 +545,9 @@ def test_the_index_k_write_applies_the_deferred_key_norm(index_k_format) -> None
         norm.weight.uniform_(0.5, 1.5)
         norm.bias.normal_(0.0, 0.1)
     slots = _slots([5, 2], 200, "cuda")
-    # A row-strided view, as the fused key and head-weight projection returns.
-    wide = torch.randn(200, 160, device="cuda") * 3 + 1
-    keys = wide.to(torch.bfloat16)[:, :128]
+    # A row-strided view, as the key and head-weight columns of a projection.
+    wide = torch.randn(200, width, device="cuda") * 3 + 1
+    keys = wide.to(torch.bfloat16)[:, width - 160 : width - 32]
     owned = torch.rand(200, device="cuda") < 0.75
     deferred, _ = _k31_pool("cuda", num_lcm_blocks=1, index_k_format=index_k_format)
     eager, _ = _k31_pool("cuda", num_lcm_blocks=1, index_k_format=index_k_format)
@@ -578,6 +586,58 @@ def test_the_index_k_write_applies_the_deferred_key_norm(index_k_format) -> None
         )
         assert not written[slots[~owned].long()].any()
     assert not deferred.get_index_k_buffer(7).any()
+
+
+@requires_gpu
+@_KEY_PROJECTION_WIDTHS
+def test_the_index_k_write_can_quantize_the_index_query_in_its_launch(width) -> None:
+    """The fused write matches the separate write and query quantization.
+
+    It leaves the plane as the separate deferred-norm write does, foreign slots
+    included, and returns the separate quantization of the same rows' index
+    queries.
+    """
+    from tokenspeed_kernel.ops.attention.dsa import triton as dsa_triton
+
+    from tokenspeed.runtime.layers import layernorm
+
+    torch.manual_seed(0)
+    norm = layernorm.LayerNorm(128, eps=1e-6).cuda()
+    with torch.no_grad():
+        norm.weight.uniform_(0.5, 1.5)
+        norm.bias.normal_(0.0, 0.1)
+    slots = _slots([5, 2], 200, "cuda")
+    # Row-strided views of the key and head-weight columns of one projection.
+    keys, weights = (
+        (torch.randn(200, width, device="cuda") * 3 + 1)
+        .to(torch.bfloat16)[:, width - 160 :]
+        .split((128, 32), dim=1)
+    )
+    magnitudes = torch.logspace(-3, 3, 32, device="cuda").unsqueeze(-1)
+    query = (torch.randn(200, 32, 128, device="cuda") * magnitudes).to(torch.bfloat16)
+    owned = torch.rand(200, device="cuda") < 0.75
+    fused, _ = _k31_pool("cuda", num_lcm_blocks=1)
+    separate, _ = _k31_pool("cuda", num_lcm_blocks=1)
+
+    q_fp8, folded = fused.set_index_k_buffer_and_quantize_query(
+        3,
+        slots,
+        keys,
+        write_mask=owned,
+        key_norm=norm,
+        query=query,
+        query_weights=weights,
+        softmax_scale=128**-0.5 * 32**-0.5,
+    )
+    separate.set_index_k_buffer(3, slots, keys, write_mask=owned, key_norm=norm)
+    expected_q, expected_w = dsa_triton.quantize_index_query_weights(
+        query, weights, 128**-0.5 * 32**-0.5
+    )
+
+    assert torch.equal(fused.get_index_k_buffer(3), separate.get_index_k_buffer(3))
+    assert torch.equal(q_fp8.view(torch.uint8), expected_q.view(torch.uint8))
+    assert torch.equal(folded, expected_w)
+    assert not fused.get_index_k_buffer(7).any()
 
 
 def _indexer_attention(*, index_topk: int):
@@ -812,12 +872,17 @@ def test_prefill_topk_rows_gather_through_the_k3_iris_state(
     assert len(calls) == 2 and len(gathers) == 4 and rows.dtype == torch.int32
 
 
-@pytest.mark.parametrize("fused", [True, False], ids=["fused", "separate"])
-def test_a_k31_decode_step_reads_its_query_and_index_projections(fused) -> None:
+@pytest.mark.parametrize(
+    "fused, packed",
+    [(True, False), (False, False), (True, True)],
+    ids=["fused", "separate", "decode-chain"],
+)
+def test_a_k31_decode_step_reads_its_query_and_index_projections(fused, packed) -> None:
     """The decode weights in reading order.
 
     They come from the stacked query and index-key weights when those were fused
-    after load, else from each projection.
+    after load, else from each projection; the decode chain's packed projection
+    holds the index-key rows.
     """
     from tokenspeed.runtime.models import kimi_k31
 
@@ -828,24 +893,20 @@ def test_a_k31_decode_step_reads_its_query_and_index_projections(fused) -> None:
     attention.o_proj = SimpleNamespace(weight="o_proj")
     attention.w_kc, attention.w_vc = "w_kc", "w_vc"
     attention.q_b_wq_b_weight = "q_b_wq_b" if fused else None
+    attention.decode_projection = "qkv_a_wk_weights_proj" if packed else None
     attention.indexer = SimpleNamespace(
         wq_b=SimpleNamespace(weight="wq_b"),
         wk=SimpleNamespace(weight="wk"),
         weights_proj=SimpleNamespace(weight="weights_proj"),
         wk_weights_proj_weight="wk_weights_proj" if fused else None,
     )
-    middle = (
-        ("q_b_wq_b", "wk_weights_proj")
-        if fused
-        else ("q_b", "wq_b", "wk", "weights_proj")
-    )
-    assert attention.decode_weights() == (
-        "qkv_a",
-        *middle,
-        "w_kc",
-        "w_vc",
-        "o_proj",
-    )
+    if packed:
+        head = ("qkv_a_wk_weights_proj", "q_b_wq_b")
+    elif fused:
+        head = ("qkv_a", "q_b_wq_b", "wk_weights_proj")
+    else:
+        head = ("qkv_a", "q_b", "wq_b", "wk", "weights_proj")
+    assert attention.decode_weights() == (*head, "w_kc", "w_vc", "o_proj")
 
 
 def test_k31_layers_take_the_attention_iris_state(
@@ -1075,10 +1136,89 @@ def test_the_fused_key_and_head_weight_projection_matches_the_two_gemms(
 
 
 @requires_gpu
+def test_the_decode_chain_projection_carries_the_index_keys_and_head_weights() -> None:
+    """The decode chain's projection carries the index keys and head weights.
+
+    ``pack_decode_projection`` stacks [q_a | kv_a | gate | wk | weights_proj]
+    once, changing no value and no GEMM of the other paths: the parameters and
+    the stacked [wk; weights_proj] become views of its rows, the indexer's own
+    projection stays bit-identical, and in-place loads (and a weight update's
+    repeated fusion) keep it current. The indexer takes the key and head-weight
+    columns of one GEMM over it, matching its two GEMMs within FP32
+    accumulation.
+    """
+    from tokenspeed_kernel.ops import gemm
+
+    torch.manual_seed(0)
+    attention = _indexer_attention(index_topk=2048)
+    indexer = attention.indexer
+    with torch.no_grad():
+        for linear in (
+            attention.fused_qkv_a_proj_with_mqa,
+            indexer.wq_b,
+            indexer.wk,
+            indexer.weights_proj,
+        ):
+            linear.weight.normal_(0.0, 0.05)
+    hidden = torch.randn(37, 256, device="cuda", dtype=torch.bfloat16)
+    q_lora = torch.randn(37, 128, device="cuda", dtype=torch.bfloat16)
+    positions = torch.arange(37, device="cuda")
+    two_gemms = indexer(hidden, q_lora, positions)
+    indexer.fuse_key_weight_projections()
+    stacked = indexer(hidden, q_lora, positions)
+    parts = [part.detach().clone() for part in attention.decode_projection_parts()]
+    rows = parts[0].shape[0]
+
+    packed = attention.pack_decode_projection()
+    assert attention.pack_decode_projection() is packed
+    assert attention.decode_projection is packed
+    assert packed.shape == (rows + 160, 256) and packed.is_contiguous()
+    assert torch.equal(packed, torch.cat(parts))
+    views = (
+        attention.fused_qkv_a_proj_with_mqa.weight,
+        indexer.wk.weight,
+        indexer.weights_proj.weight,
+        indexer.wk_weights_proj_weight,
+    )
+    for view, start in zip(views, (0, rows, rows + 128, rows)):
+        assert view.data_ptr() == packed[start].data_ptr()
+        assert view.stride() == packed.stride()
+    assert indexer.wk_weights_proj_weight.shape == (160, 256)
+    ordinary = indexer(hidden, q_lora, positions)
+    assert torch.equal(ordinary.key, stacked.key)
+    assert torch.equal(ordinary.weights, stacked.weights)
+
+    out = gemm.mm(hidden, packed)
+    chain = indexer.from_key_weights(q_lora, out[:, rows:])
+    assert chain.key.data_ptr() == out[:, rows].data_ptr()
+    assert chain.weights.data_ptr() == out[:, rows + 128].data_ptr()
+    assert chain.key.stride() == chain.weights.stride() == (rows + 160, 1)
+    assert chain.key_norm is indexer.k_norm
+    torch.testing.assert_close(
+        chain.query_rows(0, 37), two_gemms.query_rows(0, 37), rtol=0, atol=0
+    )
+    for got, want in ((chain.key, two_gemms.key), (chain.weights, two_gemms.weights)):
+        torch.testing.assert_close(got.float(), want.float(), rtol=2**-7, atol=1e-5)
+
+    with torch.no_grad():
+        attention.fused_qkv_a_proj_with_mqa.weight.normal_(0.0, 0.05)
+        indexer.wk.weight.normal_(0.0, 0.05)
+        indexer.weights_proj.weight.normal_(0.0, 0.05)
+    indexer.fuse_key_weight_projections()
+    assert indexer.wk_weights_proj_weight.data_ptr() == packed[rows].data_ptr()
+    reloaded = (
+        attention.fused_qkv_a_proj_with_mqa.weight,
+        indexer.wk.weight,
+        indexer.weights_proj.weight,
+    )
+    assert torch.equal(packed, torch.cat(reloaded))
+
+
+@requires_gpu
 def test_the_fused_query_projection_matches_the_two_gemms(monkeypatch) -> None:
     """One GEMM over ``q_norm`` for ``q_b_proj`` and the indexer's ``wq_b``
     gives the two projections, keeps tracking in-place loads into either
-    parameter, and is skipped under bitwise numerics."""
+    parameter across a repeated fusion, and is skipped under bitwise numerics."""
     from tokenspeed_kernel.ops.gemm import mm
 
     from tokenspeed.runtime.utils.env import global_server_args_dict
@@ -1118,6 +1258,9 @@ def test_the_fused_query_projection_matches_the_two_gemms(monkeypatch) -> None:
         atol=2e-3,
         rtol=1.6e-2,
     )
+    attention.fuse_query_projections()
+    assert attention.q_b_wq_b_weight is fused
+    assert attention.q_b_proj.weight.data_ptr() == fused.data_ptr()
 
     bitwise = _indexer_attention(index_topk=2048)
     monkeypatch.setitem(global_server_args_dict, "numerics", "rl-bitwise")
@@ -1415,6 +1558,98 @@ def test_decode_topk_keeps_the_best_topk_of_a_longer_history() -> None:
     good[bad] = False
     assert int(selected.topk_lens[0]) == 2048
     assert sorted(selected.topk_indices[0].tolist()) == sorted(slots[good].tolist())
+    if attention.decode_topk_solution is not None:
+        # The pinned fused top-k emits the selection in ascending position.
+        assert torch.equal(selected.topk_indices[0], slots[good].to(torch.int32))
+
+
+@requires_gpu
+def test_the_fused_decode_topk_is_pinned_only_where_every_round_fits(
+    monkeypatch,
+) -> None:
+    """More requests per round than the fused top-k takes keep normal selection."""
+    from tokenspeed_kernel.ops.attention.dsa import cute_dsl as dsa_cute_dsl
+
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    cap = dsa_cute_dsl.FUSED_DECODE_TOPK_MAX_REQUESTS
+    monkeypatch.setitem(global_server_args_dict, "max_num_seqs", cap)
+    if _indexer_attention(index_topk=2048).decode_topk_solution is None:
+        pytest.skip("needs the fused decode top-k (SM100-SM103)")
+    monkeypatch.setitem(global_server_args_dict, "max_num_seqs", cap + 1)
+    attention = _indexer_attention(index_topk=2048)
+    assert attention.decode_topk_solution is None
+    assert not attention.index_k_write_quantizes_query
+
+
+@requires_gpu
+@pytest.mark.parametrize("q_len_per_req", [1, 8])
+def test_decode_topk_scores_the_query_the_index_k_write_quantized(
+    q_len_per_req,
+) -> None:
+    """The index-K write's E4M3 query selects what the BF16 query selects.
+
+    Handed the E4M3 query and folded weights of the fused index-K write, the
+    decode top-k selects exactly what it selects from the BF16 query.
+    """
+    import dataclasses
+
+    from tokenspeed_kernel.ops.attention import dsa
+    from tokenspeed_kernel.ops.attention.dsa import triton as dsa_triton
+
+    from tokenspeed.runtime.models import glm5
+
+    torch.manual_seed(2)
+    attention = _indexer_attention(index_topk=2048)
+    if not attention.index_k_write_quantizes_query:
+        pytest.skip("needs the fused decode top-k (SM100-SM103)")
+    pool, _ = _k31_pool("cuda", num_lcm_blocks=2)
+    block_ids = list(range(23, 5, -1))
+    seq_len = 2200
+    keys = torch.randn(seq_len, 128, device="cuda", dtype=torch.bfloat16)
+    pool.set_index_k_buffer(
+        3, _slots(block_ids, seq_len, "cuda"), keys, write_mask=None
+    )
+    seq_lens = torch.tensor([seq_len], dtype=torch.int32, device="cuda")
+    seq_lens_2d = seq_lens.repeat_interleave(q_len_per_req).unsqueeze(1).contiguous()
+    metadata = SimpleNamespace(
+        _dsa_seq_lens_2d=seq_lens_2d,
+        _dsa_plan=dsa.dsa_plan(seq_lens_2d=seq_lens_2d, page_size=64),
+    )
+    ctx = SimpleNamespace(
+        attn_backend=SimpleNamespace(
+            forward_decode_metadata=metadata, cache_placement=lambda layer: None
+        ),
+        token_to_kv_pool=pool,
+        num_extends=0,
+    )
+    query = torch.randn(q_len_per_req, 32, 128, device="cuda").to(torch.bfloat16)
+    weights = torch.randn(q_len_per_req, 32, device="cuda").to(torch.bfloat16)
+    plain = glm5.GlmDsaIndexerOutput(query=query, key=torch.empty(0), weights=weights)
+    quantized = dataclasses.replace(
+        plain,
+        quantized_query=dsa_triton.quantize_index_query_weights(
+            query, weights, attention.indexer.weights_softmax_scale
+        ),
+    )
+
+    def select(indexer_output):
+        selected = attention._compute_decode_topk_indices_portable(
+            indexer_output=indexer_output,
+            ctx=ctx,
+            seq_lens=seq_lens,
+            page_table=_kernel_page_table(block_ids, "cuda"),
+            q_len_per_req=q_len_per_req,
+            decode_start=0,
+            num_tokens=q_len_per_req,
+            num_decode_tokens=q_len_per_req,
+            topk=2048,
+        )
+        return selected.topk_indices.clone(), selected.topk_lens.clone()
+
+    expected_slots, expected_lens = select(plain)
+    slots, lens = select(quantized)
+    assert torch.equal(lens, expected_lens) and torch.equal(slots, expected_slots)
 
 
 @requires_gpu
@@ -1843,9 +2078,11 @@ def _k31_attention_stack(
     kvp_rank: int,
     full_blocks: int = 0,
     context_len: int = 4096,
+    q_lora_rank: int = 128,
 ):
     """A real K3.1 sparse MLA layer (id 3) over the K3.1 pool and the DSA
-    router, at TP8's 12 local heads and K3's latent geometry.
+    router, at TP8's 12 local heads and K3's latent geometry (a narrow q
+    latent unless ``q_lora_rank`` asks for the checkpoint's 1536).
 
     With ``kvp_size > 1`` the layer is one rank of a KVP group that is also
     its attention-TP group: the pool holds the rank's share of the
@@ -1913,7 +2150,7 @@ def _k31_attention_stack(
         num_hidden_layers=4,
         num_attention_heads=heads,
         num_key_value_heads=heads,
-        q_lora_rank=128,
+        q_lora_rank=q_lora_rank,
         linear_attn_config={
             "kda_layers": [1, 2, 3],
             "full_attn_layers": [4],
@@ -1937,7 +2174,7 @@ def _k31_attention_stack(
                 qk_nope_head_dim=128,
                 qk_rope_head_dim=64,
                 v_head_dim=128,
-                q_lora_rank=128,
+                q_lora_rank=q_lora_rank,
                 kv_lora_rank=512,
                 max_position_embeddings=context_len,
                 quant_config=None,
@@ -2231,16 +2468,32 @@ def test_k31_attention_matches_dense_mla_and_replays_in_a_decode_graph(
 
 
 @requires_gpu
-@pytest.mark.parametrize("kv_cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("projection", ["forward_gemms", "packed_weight"])
+@pytest.mark.parametrize(
+    "kv_cache_dtype, fraction", [(torch.bfloat16, 1e-2), (torch.float8_e4m3fn, 8e-2)]
+)
 def test_the_decode_chain_entry_attends_like_forward(
-    monkeypatch, kv_cache_dtype
+    monkeypatch, kv_cache_dtype, fraction, projection
 ) -> None:
-    # The K3 TP8 chain enters via o_proj_input; a K3.1 layer still attends its top-k.
-    from tokenspeed_kernel.ops.gemm import kimi3_mla_qkv_gate_projection
+    """The K3 TP8 chain enters via ``o_proj_input`` and attends like ``forward``.
+
+    It enters with the packed [q_a | kv_a | gate | wk | weights_proj] projection;
+    a K3.1 layer still attends its top-k, its indexer taking the keys and head
+    weights from those columns.
+
+    Packed from the GEMMs ``forward`` runs, the output and the index-K plane
+    equal ``forward``'s bit for bit. From one GEMM over
+    ``pack_decode_projection``'s weight (which leaves ``forward`` bit for bit
+    as it was), the keys and head weights match ``forward``'s within FP32
+    accumulation, and the output and the written index-K row within their
+    rounding.
+    """
+    from tokenspeed_kernel.ops import gemm
 
     from tokenspeed.runtime.execution.context import ForwardContext
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
     from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+    from tokenspeed.runtime.layers.attention.kv_cache import dsa as kv_dsa
     from tokenspeed.runtime.utils.env import global_server_args_dict
 
     monkeypatch.setitem(global_server_args_dict, "chunked_prefill_size", 8192)
@@ -2253,6 +2506,7 @@ def test_the_decode_chain_entry_attends_like_forward(
         kvp_size=1,
         kvp_rank=0,
     )
+    indexer = attention.indexer
     prompt = 40
     hidden = torch.randn(prompt + 1, 256, device="cuda", dtype=torch.bfloat16)
     _extend_forward(
@@ -2277,23 +2531,446 @@ def test_the_decode_chain_entry_attends_like_forward(
     )
     positions = torch.tensor([prompt], device="cuda")
     step = hidden[prompt:]
+    plane = pool.get_index_k_buffer(3)
+    history = plane.clone()
+    # The keys and head weights the index-K write and the decode top-k read.
+    read = []
+    select = attention._compute_decode_topk_indices
 
-    def packed_projection(x):
-        # The a-projection ``forward`` takes, packed as the chain supplies it.
-        out = kimi3_mla_qkv_gate_projection(
-            x, attention.fused_qkv_a_proj_with_mqa.weight, attention._qkv_a_width
-        )
-        if out.packed is not None:
-            return out.packed
-        return torch.cat((out.qkv, out.gate), dim=-1)
+    def record(indexer_output, ctx, **kwargs):
+        read.append((indexer_output.key.clone(), indexer_output.weights.clone()))
+        return select(indexer_output, ctx, **kwargs)
 
+    monkeypatch.setattr(attention, "_compute_decode_topk_indices", record)
+
+    def forward_step():
+        plane.copy_(history)
+        with torch.no_grad():
+            return attention(positions, step, ctx, comm, projection_out=None).clone()
+
+    if projection == "forward_gemms":
+
+        def packed_projection(x):
+            # The GEMMs ``forward`` runs, packed as the chain supplies them.
+            out = gemm.kimi3_mla_qkv_gate_projection(
+                x, attention.fused_qkv_a_proj_with_mqa.weight, attention._qkv_a_width
+            )
+            qkv_gate = (
+                out.packed
+                if out.packed is not None
+                else torch.cat((out.qkv, out.gate), dim=-1)
+            )
+            keys = (indexer.wk(x)[0], indexer.weights_proj(x)[0])
+            return torch.cat((qkv_gate, *keys), dim=-1)
+
+    else:
+        unpacked = forward_step()
+        weight = attention.pack_decode_projection()
+
+        def packed_projection(x):
+            return gemm.mm(x, weight)
+
+    expected = forward_step()
+    written = plane.clone()
+    plane.copy_(history)
     with torch.no_grad():
-        expected = attention(positions, step, ctx, comm, projection_out=None).clone()
         local = attention.o_proj_input(
             positions, step, ctx, comm, projection=packed_projection
         )
         actual, _ = attention.o_proj(local, ctx=ctx)
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    (want_key, want_weights), (key, weights) = read[-2:]
+    if projection == "forward_gemms":
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert torch.equal(key, want_key) and torch.equal(weights, want_weights)
+        assert torch.equal(plane, written)
+        return
+
+    assert torch.equal(expected, unpacked)
+    for got, want in ((key, want_key), (weights, want_weights)):
+        torch.testing.assert_close(got.float(), want.float(), rtol=2**-7, atol=1e-5)
+    _assert_close_to_reference(actual, expected.float(), fraction)
+    # Only the step's index-K row differs, within FP8 rounding of nearby keys.
+    slot = torch.tensor([5 * 128 + prompt], device="cuda")
+    dequantized = []
+    for source in (written, plane.clone()):
+        plane.copy_(source)
+        codes, scale = kv_dsa.split_index_k_rows(
+            pool.gather_index_k_rows(3, slot, index_k_format="fp8_scaled"),
+            index_head_dim=128,
+            index_k_format="fp8_scaled",
+        )
+        dequantized.append(codes.view(torch.float8_e4m3fn).float() * scale)
+    want_row, row = dequantized
+    assert (plane != written).sum() <= 128 + 4
+    torch.testing.assert_close(
+        row, want_row, rtol=2**-2, atol=2**-5 * want_row.abs().max().item()
+    )
+
+
+@requires_gpu
+@pytest.mark.parametrize("spec_width", [1, 4])
+@pytest.mark.parametrize("prompt", [40, 2300], ids=["all_keys", "selected"])
+def test_a_decode_round_quantizes_its_query_in_the_index_k_write(
+    monkeypatch, prompt, spec_width
+) -> None:
+    """A decode round's fused index-K write matches the separate launches bit for bit.
+
+    The fused index-K write of a decode round leaves the plane, the selection
+    and the attention output bit-identical to the separate write and query
+    quantization.
+    """
+    from tokenspeed.runtime.execution import context, forward_batch_info, output_layout
+    from tokenspeed.runtime.utils import env
+
+    monkeypatch.setitem(env.global_server_args_dict, "chunked_prefill_size", 8192)
+    torch.manual_seed(5)
+    total = prompt + spec_width
+    num_blocks = -(-total // 128)
+    attention, comm, router, pool = _k31_attention_stack(
+        kv_cache_dtype=torch.float8_e4m3fn,
+        spec_width=spec_width,
+        heads=12,
+        index_topk=2048,
+        kvp_size=1,
+        kvp_rank=0,
+        full_blocks=num_blocks,
+        context_len=max(4096, 2 * total),
+    )
+    if not attention.index_k_write_quantizes_query:
+        pytest.skip("needs the fused decode top-k (SM100-SM103)")
+    hidden = torch.randn(total, 256, device="cuda", dtype=torch.bfloat16)
+    order = torch.randperm(num_blocks, generator=torch.Generator().manual_seed(3))
+    blocks = (order + 1).tolist()
+    _extend_forward(
+        attention, comm, router, pool, hidden, prefix=0, end=prompt, blocks=blocks
+    )
+    plane = pool.get_index_k_buffer(3)
+    history = plane.clone()
+    ctx = context.ForwardContext(
+        attn_backend=router,
+        token_to_kv_pool=pool,
+        bs=1,
+        num_extends=0,
+        input_num_tokens=spec_width,
+        forward_mode=forward_batch_info.ForwardMode.DECODE,
+        output_layout=output_layout.ForwardOutputLayout(0, 0, 1, spec_width),
+    )
+
+    def decode(fused: bool):
+        plane.copy_(history)
+        attention.index_k_write_quantizes_query = fused
+        router.refresh_decode_metadata(
+            1,
+            1,
+            torch.tensor([0], dtype=torch.int32, device="cuda"),
+            torch.tensor([total], dtype=torch.int32, device="cuda"),
+            forward_mode=forward_batch_info.ForwardMode.DECODE,
+            block_tables=_block_table(blocks),
+        )
+        with torch.no_grad():
+            out = attention(
+                torch.arange(prompt, total, device="cuda"),
+                hidden[prompt:],
+                ctx,
+                comm,
+                projection_out=None,
+            ).clone()
+        selection = router.sparse_topk.decode
+        return (
+            out,
+            selection.topk_indices.clone(),
+            selection.topk_lens.clone(),
+            plane.clone(),
+        )
+
+    separate = decode(False)
+    fused = decode(True)
+    assert not torch.equal(separate[3], history)
+    for name, expected, got in zip(
+        ("output", "slots", "lens", "plane"), separate, fused
+    ):
+        assert torch.equal(got, expected), name
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "takes",
+        "extend",
+        "shared_topk",
+        "no_front",
+        "unstacked_query",
+        "separate_write",
+        "indexer_projects_keys",
+        "breakable_capture",
+        "placed",
+        "unsupported_rows",
+        "most_rows",
+        "past_most_rows",
+    ],
+)
+def test_only_a_decode_chain_round_takes_the_decode_front(monkeypatch, case) -> None:
+    """Only decode-chain rounds take the front.
+
+    It serves decode rounds whose keys and head weights come from the
+    a-projection and whose index-K write quantizes the query, without KV
+    placement or a breakable capture, over at most 32 rows it addresses.
+    """
+    from tokenspeed.runtime.models import kimi_k31
+
+    attention = object.__new__(kimi_k31.KimiK31SparseMLAAttention)
+    torch.nn.Module.__init__(attention)
+    attention.skip_indexer_topk = case == "shared_topk"
+    attention.decode_front = None if case == "no_front" else object()
+    attention.q_b_wq_b_weight = None if case == "unstacked_query" else object()
+    attention.index_k_write_quantizes_query = case != "separate_write"
+    attention.indexer = SimpleNamespace(index_head_dim=128, index_n_heads=32)
+    attention.attn_mqa = SimpleNamespace(layer_id=3)
+    placement = object() if case == "placed" else None
+    backend = SimpleNamespace(cache_placement=lambda layer: placement)
+    ctx = SimpleNamespace(num_extends=int(case == "extend"), attn_backend=backend)
+    rows = {"most_rows": 32, "past_most_rows": 33}.get(case, 4)
+    q_a, kv_a = torch.zeros(rows, 1536), torch.zeros(rows, 512)
+    keys = None if case == "indexer_projects_keys" else torch.zeros(rows, 160)
+    supported = []
+
+    def rows_supported(*tensors):
+        supported.append(tuple(t.shape for t in tensors))
+        return case != "unsupported_rows"
+
+    monkeypatch.setattr(
+        kimi_k31.dsa_cute_dsl, "decode_front_rows_supported", rows_supported
+    )
+    monkeypatch.setattr(
+        kimi_k31, "is_breakable_capture_active", lambda: case == "breakable_capture"
+    )
+    takes = case in ("takes", "most_rows")
+    assert attention._takes_decode_front(ctx, q_a, kv_a, keys) == takes
+    if case in ("takes", "unsupported_rows", "most_rows"):
+        assert supported == [((rows, 1536), (rows, 512), (rows, 128), (rows, 32))]
+
+
+@pytest.mark.parametrize(
+    "num_extends, quantizes, caller_keys",
+    [(1, True, True), (0, False, True), (0, True, False)],
+    ids=["extend", "separate", "indexer_keys"],
+)
+def test_dsa_core_refuses_a_written_index_query_it_cannot_take(
+    num_extends, quantizes, caller_keys
+) -> None:
+    """A written index query is refused outside the rounds it serves.
+
+    It serves decode rounds of a layer whose index-K write quantizes the
+    query, over keys the caller projected (the writing launch scattered
+    them); anything else fails before touching the cache.
+    """
+    from tokenspeed.runtime.models.glm5 import GlmDsaSparseAttentionMixin
+
+    core = SimpleNamespace(index_k_write_quantizes_query=quantizes)
+    rows = torch.zeros(1, 4)
+    with pytest.raises(ValueError, match="written index query"):
+        GlmDsaSparseAttentionMixin.forward_dsa_core(
+            core,
+            torch.zeros(1, dtype=torch.long),
+            rows,
+            rows,
+            rows,
+            SimpleNamespace(num_extends=num_extends),
+            None,
+            index_key_weights=rows if caller_keys else None,
+            written_index_query=(rows, rows),
+        )
+
+
+def _bf16_step(x: torch.Tensor) -> torch.Tensor:
+    """The BF16 spacing at |x| (8 significant bits; the subnormal spacing below)."""
+    exponent = torch.floor(torch.log2(x.abs().double().clamp_min(2.0**-126)))
+    return torch.exp2(exponent - 7)
+
+
+@requires_gpu
+@pytest.mark.parametrize("spec_width", [1, 8])
+@pytest.mark.parametrize("prompt", [40, 2300], ids=["all_keys", "selected"])
+def test_a_decode_chain_round_runs_the_fused_front(
+    monkeypatch, prompt, spec_width
+) -> None:
+    """A decode chain round runs the fused front where it is registered.
+
+    Against the separate launches (``decode_front`` cleared), the front leaves
+    the index-K plane, the latent cache and ``q_norm`` bit-identical, hands
+    the core the E4M3 query ``quantize_index_query_weights`` gives for its own
+    projection, and its projection, selection and output agree within the one
+    BF16 step its K order may move a projected value. A CUDA graph of the
+    round replays the next step bit for bit.
+    """
+    from tokenspeed_kernel.ops import gemm
+    from tokenspeed_kernel.ops.attention.dsa._triton import topk as dsa_topk
+    from tokenspeed_kernel.workspace import capture_session
+
+    from tokenspeed.runtime.execution import context, forward_batch_info, output_layout
+    from tokenspeed.runtime.utils import env
+
+    monkeypatch.setitem(env.global_server_args_dict, "chunked_prefill_size", 8192)
+    torch.manual_seed(5)
+    total = prompt + 2 * spec_width
+    num_blocks = -(-total // 128)
+    attention, comm, router, pool = _k31_attention_stack(
+        kv_cache_dtype=torch.float8_e4m3fn,
+        spec_width=spec_width,
+        heads=12,
+        index_topk=2048,
+        kvp_size=1,
+        kvp_rank=0,
+        full_blocks=num_blocks,
+        context_len=max(4096, 2 * total),
+        q_lora_rank=1536,
+    )
+    front = attention.decode_front
+    if front is None:
+        pytest.skip("needs the fused decode front (SM100-SM103)")
+    attention.indexer.fuse_key_weight_projections()
+    attention.fuse_query_projections()
+    weight = attention.pack_decode_projection()
+    hidden = torch.randn(total, 256, device="cuda", dtype=torch.bfloat16)
+    order = torch.randperm(num_blocks, generator=torch.Generator().manual_seed(3))
+    blocks = (order + 1).tolist()
+    _extend_forward(
+        attention, comm, router, pool, hidden, prefix=0, end=prompt, blocks=blocks
+    )
+    plane, latent = pool.get_index_k_buffer(3), pool.get_key_buffer(3)
+    history = (plane.clone(), latent.clone())
+    core_inputs = []
+    recording = [True]
+    core = attention.forward_dsa_core
+
+    def record(positions, hidden_states, q_norm, latent_cache, ctx, comm, **kwargs):
+        if recording[0]:
+            written = kwargs["written_index_query"]
+            core_inputs.append(
+                (
+                    q_norm.clone(),
+                    kwargs["projected_q"].clone(),
+                    kwargs["index_query"].clone(),
+                    None if written is None else tuple(t.clone() for t in written),
+                )
+            )
+        return core(positions, hidden_states, q_norm, latent_cache, ctx, comm, **kwargs)
+
+    monkeypatch.setattr(attention, "forward_dsa_core", record)
+    decode_mode = forward_batch_info.ForwardMode.DECODE
+    ctx = context.ForwardContext(
+        attn_backend=router,
+        token_to_kv_pool=pool,
+        bs=1,
+        num_extends=0,
+        input_num_tokens=spec_width,
+        forward_mode=decode_mode,
+        output_layout=output_layout.ForwardOutputLayout(0, 0, 1, spec_width),
+    )
+    request = torch.tensor([0], dtype=torch.int32, device="cuda")
+
+    def refresh(length, **kwargs):
+        router.refresh_decode_metadata(
+            1,
+            1,
+            request,
+            torch.tensor([length], dtype=torch.int32, device="cuda"),
+            forward_mode=decode_mode,
+            block_tables=_block_table(blocks),
+            **kwargs,
+        )
+
+    def projection(x):
+        return gemm.mm(x, weight)
+
+    step_hidden = hidden[prompt : prompt + spec_width].clone()
+    step_positions = torch.arange(prompt, prompt + spec_width, device="cuda")
+
+    def decode(with_front: bool):
+        plane.copy_(history[0])
+        latent.copy_(history[1])
+        attention.decode_front = front if with_front else None
+        refresh(prompt + spec_width)
+        with torch.no_grad():
+            out = attention.o_proj_input(
+                step_positions, step_hidden, ctx, comm, projection=projection
+            ).clone()
+        selection = router.sparse_topk.decode
+        return (
+            out,
+            selection.topk_indices[:spec_width].clone(),
+            selection.topk_lens[:spec_width].clone(),
+            plane.clone(),
+            latent.clone(),
+        )
+
+    separate = decode(False)
+    fused = decode(True)
+    (q_norm, proj, index_query, written), (
+        front_q_norm,
+        front_proj,
+        front_index_query,
+        front_written,
+    ) = core_inputs
+    assert written is None and front_written is not None
+    assert torch.equal(front_q_norm.view(torch.int16), q_norm.view(torch.int16))
+    assert torch.equal(fused[3], separate[3]) and not torch.equal(fused[3], history[0])
+    assert torch.equal(fused[4].view(torch.uint8), separate[4].view(torch.uint8))
+    for got, want in ((front_proj, proj), (front_index_query, index_query)):
+        got, want = got.double(), want.double()
+        step = _bf16_step(torch.maximum(got.abs(), want.abs()))
+        assert ((got - want).abs() <= step + 1e-4 * want.abs().max()).all()
+    head_weights = projection(step_hidden)[:, -attention.indexer.index_n_heads :]
+    want_q, want_w = dsa_topk.quantize_index_query_weights(
+        front_index_query, head_weights, attention.indexer.weights_softmax_scale
+    )
+    assert torch.equal(front_written[0].view(torch.uint8), want_q.view(torch.uint8))
+    assert torch.equal(front_written[1].view(torch.int32), want_w.view(torch.int32))
+    assert torch.equal(fused[2], separate[2])
+    if prompt < 2048:
+        assert torch.equal(fused[1], separate[1])
+    for got, want, count in zip(fused[1], separate[1], separate[2].tolist()):
+        shared = set(got[:count].tolist()) & set(want[:count].tolist())
+        assert len(shared) >= 0.98 * count
+    _assert_close_to_reference(fused[0], separate[0].float(), 2e-2)
+
+    # A CUDA graph of the fused round replays the next step bit for bit.
+    recording[0] = False
+    attention.decode_front = front
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    plane.copy_(history[0])
+    latent.copy_(history[1])
+    refresh(prompt + spec_width)
+    with torch.no_grad(), torch.cuda.stream(stream):
+        attention.o_proj_input(
+            step_positions, step_hidden, ctx, comm, projection=projection
+        )
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.no_grad(), capture_session(graph), torch.cuda.graph(
+        graph, stream=stream
+    ):
+        captured = attention.o_proj_input(
+            step_positions, step_hidden, ctx, comm, projection=projection
+        )
+    before = (plane.clone(), latent.clone())
+    step_hidden.copy_(hidden[prompt + spec_width :])
+    step_positions.copy_(torch.arange(prompt + spec_width, total, device="cuda"))
+    refresh(total, for_graph_replay=True)
+    graph.replay()
+    torch.cuda.synchronize()
+    replayed = (captured.clone(), plane.clone(), latent.clone())
+    plane.copy_(before[0])
+    latent.copy_(before[1])
+    refresh(total)
+    with torch.no_grad():
+        eager = attention.o_proj_input(
+            step_positions, step_hidden, ctx, comm, projection=projection
+        )
+    assert torch.equal(replayed[0].view(torch.int16), eager.view(torch.int16))
+    assert torch.equal(replayed[1], plane)
+    assert torch.equal(replayed[2].view(torch.uint8), latent.view(torch.uint8))
 
 
 def _extend_over_a_cached_prefix(stack, twin, hidden, *, prefix, blocks):
@@ -2363,11 +3040,14 @@ _BUCKET_ROWS = 16
 
 
 def _recording_dsa_core(calls: list, *, write_rows: int, gather: bool):
-    """``GlmDsaSparseAttentionMixin.forward_dsa_core`` whose collaborators
-    record every call into ``calls``: the indexer, the index-K write, the
+    """``GlmDsaSparseAttentionMixin.forward_dsa_core`` with recording collaborators.
+
+    Its collaborators record every call into ``calls``: the indexer (projecting,
+    or over keys and head weights projected ahead), the index-K write, the
     prefill top-k, ``q_b_proj`` and the sparse prefill core. The router hands
     out ``write_rows`` live extend slots and no KVP placement; the
-    pre-attention comm is the identity unless ``gather``."""
+    pre-attention comm is the identity unless ``gather``.
+    """
     from tokenspeed.runtime.models.glm5 import (
         GlmDsaIndexerOutput,
         GlmDsaSparseAttentionMixin,
@@ -2384,13 +3064,20 @@ def _recording_dsa_core(calls: list, *, write_rows: int, gather: bool):
             )
         )
 
-    def indexer(hidden_states, q_norm, positions):
-        record("indexer", hidden_states, q_norm, positions)
-        return GlmDsaIndexerOutput(
-            query=q_norm * 2,
-            key=hidden_states[:, :8],
-            weights=positions[:, None].float(),
-        )
+    class Indexer:
+        def __call__(self, hidden_states, q_norm, positions):
+            record("indexer", hidden_states, q_norm, positions)
+            return GlmDsaIndexerOutput(
+                query=q_norm * 2,
+                key=hidden_states[:, :8],
+                weights=positions[:, None].float(),
+            )
+
+        def from_key_weights(self, q_norm, key_weights):
+            record("indexer_ahead", q_norm, key_weights)
+            return GlmDsaIndexerOutput(
+                query=q_norm * 2, key=key_weights[:, :8], weights=key_weights[:, 8:]
+            )
 
     selection = object()
 
@@ -2424,7 +3111,7 @@ def _recording_dsa_core(calls: list, *, write_rows: int, gather: bool):
     core.is_nextn = False
     core.num_local_heads = 2
     core.v_head_dim = 4
-    core.indexer = indexer
+    core.indexer = Indexer()
     core._compute_prefill_topk_indices = compute_prefill_topk
     core.q_b_proj = q_b_proj
     core.forward_dsa_sparse_prefill = sparse_prefill
@@ -2449,10 +3136,14 @@ def _run_dsa_core(
     write_rows: int,
     gather: bool,
     valid_rows: int | None,
+    ahead: bool,
 ) -> torch.Tensor:
-    """One pure-extend forward of ``_LIVE_ROWS`` live rows through the DSA
-    break, handed ``rows`` rows (filler past the live ones) with
-    ``valid_rows`` set as a padded replay sets it."""
+    """One pure-extend forward of ``_LIVE_ROWS`` live rows through the DSA break.
+
+    It is handed ``rows`` rows (filler past the live ones) with ``valid_rows``
+    set as a padded replay sets it, and, when ``ahead``, the index keys and head
+    weights projected ahead.
+    """
     from tokenspeed.runtime.execution.breakable_cuda_graph import (
         _set_replay_valid_rows,
     )
@@ -2471,6 +3162,7 @@ def _run_dsa_core(
         return torch.cat((live, torch.full((rows - _LIVE_ROWS, width), 1e4)))
 
     hidden_states, q_norm, latent_cache = padded(16), padded(6), padded(10)
+    index_key_weights = padded(9) if ahead else None
     ctx = ForwardContext(
         attn_backend=backend,
         token_to_kv_pool=pool,
@@ -2484,18 +3176,28 @@ def _run_dsa_core(
     _set_replay_valid_rows(valid_rows)
     try:
         return core.forward_dsa_core(
-            positions, hidden_states, q_norm, latent_cache, ctx, comm
+            positions,
+            hidden_states,
+            q_norm,
+            latent_cache,
+            ctx,
+            comm,
+            index_key_weights=index_key_weights,
         )
     finally:
         _set_replay_valid_rows(None)
 
 
-def test_dsa_core_narrows_a_padded_replay_to_the_eager_inputs() -> None:
-    """Under a padded prefill-graph replay the DSA break receives the bucket's
-    rows. It hands the indexer, the index-K write, the top-k, ``q_b_proj`` and
-    the sparse core exactly what the eager forward of the live rows hands
-    them, and returns the live rows only (the replay lands them in the
-    bucket-shaped handoff and zeroes its tail)."""
+@pytest.mark.parametrize("ahead", [False, True], ids=["indexer", "projected_ahead"])
+def test_dsa_core_narrows_a_padded_replay_to_the_eager_inputs(ahead) -> None:
+    """Under a padded prefill-graph replay the DSA break receives the bucket's rows.
+
+    It hands the indexer (or, with index keys and head weights projected ahead,
+    the indexer's ``from_key_weights``), the index-K write, the top-k,
+    ``q_b_proj`` and the sparse core exactly what the eager forward of the live
+    rows hands them, and returns the live rows only (the replay lands them in
+    the bucket-shaped handoff and zeroes its tail).
+    """
     positions = torch.arange(40, 40 + _LIVE_ROWS)
     # A replay resets the positions of the padded rows to 0.
     padded_positions = torch.cat(
@@ -2509,6 +3211,7 @@ def test_dsa_core_narrows_a_padded_replay_to_the_eager_inputs() -> None:
         write_rows=_LIVE_ROWS,
         gather=False,
         valid_rows=None,
+        ahead=ahead,
     )
     replay = _run_dsa_core(
         replay_calls,
@@ -2517,10 +3220,11 @@ def test_dsa_core_narrows_a_padded_replay_to_the_eager_inputs() -> None:
         write_rows=_LIVE_ROWS,
         gather=False,
         valid_rows=_LIVE_ROWS,
+        ahead=ahead,
     )
 
     assert [name for name, _ in eager_calls] == [
-        "indexer",
+        "indexer_ahead" if ahead else "indexer",
         "index_k_write",
         "prefill_topk",
         "q_b_proj",
@@ -2561,6 +3265,7 @@ def test_dsa_core_refuses_a_padded_replay_it_cannot_narrow(case, match) -> None:
             write_rows=_LIVE_ROWS - 1 if case == "write_span" else _LIVE_ROWS,
             gather=case == "gathered_rows",
             valid_rows=_LIVE_ROWS,
+            ahead=False,
         )
     assert calls == []
 

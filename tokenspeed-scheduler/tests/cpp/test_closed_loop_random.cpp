@@ -480,9 +480,11 @@ struct ClosedLoop {
     // Each rank builds the round's plan; the plan's cache ops are checked and
     // their ACKs scheduled.
     ExecutionPlan NextPlan() {
-        ExecutionPlan plan = schedulers[0]->NextExecutionPlan();
+        ExecutionPlan plan = schedulers[0]->NextExecutionPlan(
+            Scheduler::PlanOptions{.allow_prefill = true, .apply_prefill_watermark = false});
         for (std::size_t rank = 1; rank < schedulers.size(); ++rank) {
-            if (!(schedulers[rank]->NextExecutionPlan() == plan)) {
+            if (!(schedulers[rank]->NextExecutionPlan(
+                      Scheduler::PlanOptions{.allow_prefill = true, .apply_prefill_watermark = false}) == plan)) {
                 throw std::logic_error("the mirrored schedulers planned apart at round " + std::to_string(round));
             }
         }

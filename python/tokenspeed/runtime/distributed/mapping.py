@@ -570,9 +570,9 @@ def _resolve_lm_head_tp_size(
     """Resolve the LM-head TP width against the attention layout.
 
     The default is today's layout: the attention TP width without attention
-    DP, replicated (1) with it. An explicit width under attention DP needs
-    attention TP 1 (the logits path gathers whole rows from each rank) and
-    must tile the stage world; without DP it must equal the attention TP.
+    DP, replicated (1) with it. An explicit width under attention DP must
+    tile the stage world and align with attention TP groups; without DP it
+    must equal the attention TP.
     """
     if lm_head_tp_size is None:
         return 1 if attn.has_dp else attn.tp_size
@@ -590,16 +590,13 @@ def _resolve_lm_head_tp_size(
                 f"attn_tp_size={attn.tp_size}"
             )
         return lm_head_tp_size
-    if lm_head_tp_size > 1 and attn.tp_size != 1:
-        raise ValueError(
-            "LM head TP under attention DP needs attention TP 1, got "
-            f"attn_tp_size={attn.tp_size}"
-        )
     if attn.world_size % lm_head_tp_size:
         raise ValueError(
             f"LM head TP size {lm_head_tp_size} must divide the stage world "
             f"size {attn.world_size}"
         )
+    if max(lm_head_tp_size, attn.tp_size) % min(lm_head_tp_size, attn.tp_size):
+        raise ValueError("LM head and attention TP groups must tile each other")
     return lm_head_tp_size
 
 
@@ -750,6 +747,45 @@ class Mapping(MappingBase):
             or self.moe.tp_ep_size > 1
             or self.lm_head.tp_size > 1
             or self.linear_attn.tp_size > 1
+        )
+
+    def replicated_for_draft(self) -> "Mapping":
+        """This layout with a replicated dense group, every other axis unchanged.
+
+        A heterogeneous block draft (a DFlash stack, not an MTP depth) joins none
+        of the target's dense parallelism: its MLP holds whole weights and
+        reduces nothing. That matters beyond the duplicated bytes. Only the
+        attention-DP rank holding a request runs the draft; the other ranks'
+        idle forward skips it on purpose (``ModelExecutor.execute_idle_forward``),
+        so a collective inside the draft that one rank of a group enters and the
+        rest skip never completes.
+
+        The ATTENTION width is left alone: a block drafter writes K/V at the
+        target's cache locations and its cache cell is sized from the attention
+        TP width (``MhaSpec.cache_cell_size``), so its projections must keep
+        producing exactly the heads its cache rows hold.
+        """
+        stage_world_size = self.world_size // self.pp_size
+        return Mapping(
+            rank=self._rank,
+            world_size=self.world_size,
+            attn_tp_size=self.attn.tp_size,
+            attn_dp_size=self.attn.dp_size,
+            attn_kvp_size=self.attn.kvp_size,
+            attn_head_tp_size=self.attn.head_tp_size,
+            lm_head_tp_size=self.lm_head.tp_size,
+            attn_qcp_size=self.attn.qcp_size,
+            dense_tp_size=1,
+            dense_dp_size=stage_world_size,
+            moe_tp_size=self.moe.tp_size,
+            moe_ep_size=self.moe.ep_size,
+            moe_dp_size=self.moe.dp_size,
+            pp_size=self.pp_size,
+            pp_layer_partition=self.pp_layer_partition,
+            nprocs_per_node=self.nprocs_per_node,
+            nnodes=self.nnodes,
+            base_gpu_id=self.base_gpu_id,
+            gpu_id_step=self.gpu_id_step,
         )
 
     @cached_property

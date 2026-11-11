@@ -835,6 +835,91 @@ def test_an_unsupported_attention_keeps_only_the_moe_chain(monkeypatch, odd_laye
     assert all(layer.block_sparse_moe.decode_moe for layer in layers[1:])
 
 
+def _dsa_attention(layer):
+    """Give ``layer`` a Kimi-K3.1 DSA attention over real BF16 weights.
+
+    The weights have a narrow hidden width (the binding checks rows): K3's
+    [q_a | kv_a | gate] projection and the indexer's ``wk`` and ``weights_proj``,
+    stacked after load as the model stacks them.
+    """
+    from tokenspeed.runtime.models import kimi_k31
+
+    attn = object.__new__(kimi_k31.KimiK31SparseMLAAttention)
+    torch.nn.Module.__init__(attn)
+    attn.qkv_parallel = attn.output_parallel = None
+    attn.use_output_gate = True
+    tag = f"layer{layer.layer_id}"
+    attn.o_proj = SimpleNamespace(
+        supports_fp8_group128_input=False,
+        weight=_Stub(
+            f"{tag}.o_proj.weight", dtype=torch.bfloat16, shape=(HIDDEN_SIZE, 1536)
+        ),
+    )
+    generator = torch.Generator().manual_seed(layer.layer_id)
+
+    def weight(rows):
+        values = torch.randn(rows, HIDDEN, generator=generator).bfloat16()
+        return torch.nn.Parameter(values, requires_grad=False)
+
+    attn.fused_qkv_a_proj_with_mqa = SimpleNamespace(weight=weight(3648))
+    stacked = weight(160).data
+    attn.indexer = SimpleNamespace(
+        index_head_dim=128,
+        index_n_heads=32,
+        wk=SimpleNamespace(weight=torch.nn.Parameter(stacked[:128], False)),
+        weights_proj=SimpleNamespace(weight=torch.nn.Parameter(stacked[128:], False)),
+        wk_weights_proj_weight=stacked,
+    )
+    attn.q_b_wq_b_weight = f"{tag}.q_b_wq_b"
+    attn.w_kc, attn.w_vc = f"{tag}.w_kc", f"{tag}.w_vc"
+    attn.decode_projection = None
+    layer.self_attn = attn
+    return layer
+
+
+def test_a_dsa_layer_binds_its_projection_packed_with_the_index_keys(monkeypatch):
+    """A Kimi-K3.1 DSA layer binds its chain projection packed with the index keys.
+
+    The projection is [q_a | kv_a | gate | wk | weights_proj] (3808 rows per
+    rank), packed once before the MoE layers record the next attention's
+    weights: the attention binds the packed weight, the previous MoE layer
+    prefetches it in place of the separate projections, and the parameters and
+    the stacked [wk; weights_proj] become views of its rows. KDA layers bind
+    their projections as loaded.
+    """
+    layers = _attention_layers()
+    attn = _dsa_attention(layers[2]).self_attn
+    parts = [part.clone() for part in attn.decode_projection_parts()]
+    model = _bindable(monkeypatch, layers, attention=True)
+
+    assert KimiLinearForCausalLM._prepare_decode_chain(model) is True
+
+    packed = attn.decode_projection
+    assert packed.shape == (3808, HIDDEN) and torch.equal(packed, torch.cat(parts))
+    indexer = attn.indexer
+    views = (
+        attn.fused_qkv_a_proj_with_mqa.weight,
+        indexer.wk.weight,
+        indexer.weights_proj.weight,
+        indexer.wk_weights_proj_weight,
+    )
+    for view, start in zip(views, (0, 3648, 3776, 3648)):
+        assert view.data_ptr() == packed[start].data_ptr()
+    (attention,) = _Attention.built
+    bound = [kwargs["projection_weight"] for _, kwargs in attention.layers]
+    assert bound[0] is layers[0].self_attn.qkvgb_proj.weight
+    assert bound[1] is layers[1].self_attn.qkvgb_proj.weight
+    assert bound[2] is packed and attention.layers[2][1]["mla"] is True
+    following = layers[1].block_sparse_moe.decode_moe.bound["next_attention"]
+    assert following[0] is packed
+    assert following[1:] == (
+        "layer2.q_b_wq_b",
+        "layer2.w_kc",
+        "layer2.w_vc",
+        "layer2.o_proj.weight",
+    )
+
+
 class _Producer:
     """A DSpark context producer that keeps what the target hands it."""
 

@@ -460,14 +460,21 @@ class DeviceHandle:
         whose sources the scheduler holds until the ACK -- rides the write
         stream and fences nothing), then the Device-to-Device block copies
         (``pages_to_copy``: a prefix hit's private copy of the block holding
-        its boundary, an owner's move off the block it just published; the
-        source may be re-granted by this very plan, so the copy precedes the
-        zeroing), then page zeroing (the new owner's
-        sanitization), then the Device-bound copies (``LoadBackOp`` and
-        ``RestoreOp``, ordered behind the zeroing: a load-back lands on
-        zeroed pages, a restore overwrites its destinations whole), the
-        transfer peer's remote streams, and finally the ``ForwardBatch``. The
-        loop hands the round over and does not branch on it.
+        its boundary, an owner's move off the block it just published, a
+        block a lone request's compaction moves; the source may be re-granted
+        by this very plan, so the copy precedes the zeroing; the execution
+        stream waits for the copies, so a later plan's stores, which order
+        behind it, read what they wrote even when no forward ran between),
+        then page zeroing (the new owner's sanitization), then the
+        Device-bound copies (``LoadBackOp`` and ``RestoreOp``, ordered behind
+        the zeroing and the forwards in flight, which may still write a
+        block freed by an abort and granted here; both overwrite their
+        destinations whole), the transfer peer's remote streams (a
+        D-node remote prefill only prepares its slots here), the
+        ``ForwardBatch``, and last the D-node remote prefill's pull, whose
+        wait on the zeroing fence would otherwise hold the forward's launch
+        until the step in flight ends. The loop hands the round over and
+        does not branch on it.
 
         A store's ``request_pool_index`` names the victim's slot, which the
         scheduler frees in the same plan build: the slot's next owner first
@@ -554,9 +561,17 @@ class DeviceHandle:
             executor.copy_cache_pages(copies)
         zero_event = executor.zero_cache_pages(pages) if pages else None
         if l2 is not None:
-            # Behind the zeroing: the loads' destinations were zeroed on the
-            # default stream, so that is the prerequisite they order after.
-            # Every plan makes the call, with a load or not: it points the
+            if cache_ops:
+                # A load's or restore's destination may be a block that a
+                # forward still in flight writes: an abort frees its request's
+                # blocks at once, and this plan may grant one to a Host hit.
+                # The copies and the zeroing wait for those forwards, but a
+                # plan may have neither (a hit whose new tokens fit its tail
+                # block), so the loads wait for them here.
+                executor.default_stream.wait_stream(executor.execution_stream)
+            # Behind the store fence, the zeroing and the forwards in flight,
+            # all on the default stream, the prerequisite the loads order
+            # after. Every plan makes the call, with a load or not: it points the
             # layerwise load waits at this plan's load or at none, so neither
             # an eager layer nor a prefill graph replay of this plan waits on
             # an earlier plan's load. Without cache ops it enqueues nothing,
@@ -577,23 +592,27 @@ class DeviceHandle:
             peer.execute(remote_decode)
         if remote_prefill is not None:
             # D role: the prompt prefills on the peer; pull its KV into the
-            # pages this plan admitted (and may be zeroing).
-            self._receive_remote_prefill(remote_prefill, zero_event)
+            # pages this plan admitted (and may be zeroing). The slots are
+            # prepared here; the pull follows the round's forward below.
+            self._prepare_remote_prefill_slots(remote_prefill)
 
         if planned is None:
-            return None
-
-        if self._role is DeviceRole.PD_PREFILL:
+            result = None
+        elif self._role is DeviceRole.PD_PREFILL:
             # A prefill chunk; the host armed its layerwise KV streaming, if
             # on, when it handed this plan over.
-            return self._launch_forward(planned, capture_next_input_ids=True)
+            result = self._launch_forward(planned, capture_next_input_ids=True)
+        else:
+            # Plain engine, or a D-role decode (the D role runs no local
+            # prefill: a retracted request resumes by restore, not by
+            # recompute). A constrained request's matcher was advanced past
+            # the prefill node's token when its RemotePrefillDoneEvent
+            # landed, so masking continues from the right state.
+            result = self._launch_forward(planned)
 
-        # Plain engine, or a D-role decode (the D role runs no local prefill:
-        # a retracted request resumes by restore, not by recompute). A
-        # constrained request's matcher was advanced past the prefill node's
-        # token when its RemotePrefillDoneEvent landed, so masking continues
-        # from the right state.
-        return self._launch_forward(planned)
+        if remote_prefill is not None:
+            self._pull_remote_prefill(remote_prefill, zero_event)
+        return result
 
     @property
     def role(self) -> DeviceRole:
@@ -709,21 +728,42 @@ class DeviceHandle:
         self.settle()
         self._executor.execute_idle_forward(dp_metadata)
 
-    def _receive_remote_prefill(self, remote_prefill, zero_event) -> None:
-        """Pull a remote-prefill stream's rows' KV from the peer.
+    def _prepare_remote_prefill_slots(self, remote_prefill) -> None:
+        """Prepare a remote-prefill stream's slots, ahead of the round's
+        forward.
 
         Slot preparation and the cache-length reset touch the execution
         stream, each behind the default stream (the store fence: the slot
         may be a victim's this plan imaged, and its slot-state export reads
-        it on the write stream); the RDMA trigger is CPU-issued but writes
-        the same device pages, so it must follow them and the zeroing fence
+        it on the write stream). Stream-ordered, so it never blocks.
+
+        Args:
+            remote_prefill: The plan's remote-prefill stream; supplies the
+                admitted rows.
+        """
+        executor = self._executor
+        num_extends = remote_prefill.num_extends()
+        executor.prepare_remote_cache_slots(
+            list(remote_prefill.request_pool_indices[:num_extends])
+        )
+        executor.reset_remote_prefill_cache_lengths(remote_prefill)
+
+    def _pull_remote_prefill(self, remote_prefill, zero_event) -> None:
+        """Pull a remote-prefill stream's rows' KV from the peer, behind the
+        round's forward.
+
+        The RDMA trigger is CPU-issued but writes the device pages the slot
+        preparation touched, so it must follow them and the zeroing fence
         (Mooncake and GPUDirect writes are not ordered by the zeroing
         stream, so the destination pages must be published from sanitized
         memory). The same fence covers a retraction's stream-ordered
         write-back reading pages this admission was granted: the zero event
         is recorded on the forward thread's stream AFTER that stream waited
         on the write-back's completion, so waiting on it waits on the copy
-        too. Completion arrives through the transfer events.
+        too. The zeroing is ordered behind the step in flight, so this wait
+        holds the forward thread until that step ends; placed after the
+        round's forward is launched, it never delays that launch. Completion
+        arrives through the transfer events.
 
         Args:
             remote_prefill: The plan's remote-prefill stream; supplies the
@@ -732,12 +772,6 @@ class DeviceHandle:
                 plan zeroes nothing (an admission always zeroes its fresh
                 pages, so a granted request's receive never sees None).
         """
-        executor = self._executor
-        num_extends = remote_prefill.num_extends()
-        executor.prepare_remote_cache_slots(
-            list(remote_prefill.request_pool_indices[:num_extends])
-        )
-        executor.reset_remote_prefill_cache_lengths(remote_prefill)
         if zero_event is not None:
             zero_event.synchronize()
         self._kv_transfer.execute(remote_prefill)
@@ -1665,27 +1699,15 @@ def build_device_side(
             )
         _warm_rebound_draft(executor, server_args, has_draft=draft is not None)
 
-    with startup_phase("graph.capture"):
-        _capture_serving_graphs(executor, server_args, replays_prefill_graphs)
-
-    # Per-rank GPU memory breakdown (weights by group, KV/graph/non-torch).
-    if attn_tp_rank == 0:
-        log_gpu_memory_summary(
-            target.model,
-            gpu_id,
-            global_rank,
-            logger,
-            device=server_args.device,
-            draft_model=draft.model if draft is not None else None,
-            kv_pool=views.token_to_kv_pool,
-            draft_kv_pool=views.draft_token_to_kv_pool,
-        )
-
     # The compact Host cache: the L2 prefix tier (--enable-kvstore), the
     # retraction snapshot pool (on by default on the roles that retract), or
     # both in one executor over the same field geometry. The executor is the
     # model executor's peer: it lays out the slot-state exporters the model
-    # executor lists, so it is built after it.
+    # executor lists, so it is built after it. It is built before the graphs
+    # are captured, over the final pools: a prefill graph's capture notes,
+    # through the layerwise load trackers it registers on them, which layer
+    # each captured segment's cache accesses reach, for its replays to wait
+    # for (BreakableCapture.wait_before_segment).
     host_cache_executor = None
     host_cache = None
     host_tail_packing = {}
@@ -1752,6 +1774,23 @@ def build_device_side(
         logger.info(
             NO_POOL.describe(host_lcm_block_bytes=0, blob_bytes=0, l2_tier=False)
         )
+
+    with startup_phase("graph.capture"):
+        _capture_serving_graphs(executor, server_args, replays_prefill_graphs)
+
+    # Per-rank GPU memory breakdown (weights by group, KV/graph/non-torch).
+    if attn_tp_rank == 0:
+        log_gpu_memory_summary(
+            target.model,
+            gpu_id,
+            global_rank,
+            logger,
+            device=server_args.device,
+            draft_model=draft.model if draft is not None else None,
+            kv_pool=views.token_to_kv_pool,
+            draft_kv_pool=views.draft_token_to_kv_pool,
+        )
+
     if host_cache_executor is not None and host_cache_executor.host_storage is not None:
         from tokenspeed.runtime.cache.host_storage import HostCacheResources
 

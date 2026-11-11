@@ -1106,6 +1106,20 @@ TEST_F(PrefillChunkYieldSuite, APromptSharingTheChunksUnpublishedPagesIsNotCarri
         << "its first chunk ends at the junction";
 }
 
+// Without prefix caching no probe can hit what the long chunk's admission
+// publishes, so the same prompt is carried at once, its whole prompt computed.
+TEST_F(PrefillChunkYieldSuite, APromptSharingTheChunksPagesIsCarriedBesideStateGroupsWithoutPrefixCaching) {
+    hybrid_ = true;
+    Restart(16);
+    config_.disable_prefix_cache = true;
+    scheduler_ = std::make_unique<Scheduler>(config_);
+    const std::vector<std::int32_t> long_tokens = MakeTokens(100, 1000);
+    SubmitPrompt("long", long_tokens);
+    EXPECT_EQ(Round(), (PrefillRows{{"long", 0, 32, 100}}));
+    SubmitPrompt("sharing", Extending({long_tokens.begin(), long_tokens.begin() + 8}, {7001, 7002}));
+    EXPECT_EQ(Round(), (PrefillRows{{"sharing", 0, 10, 10}, {"long", 32, 52, 100}}));
+}
+
 // With only prompts too long to carry waiting, the plans are those without
 // the knob.
 TEST_F(PrefillChunkYieldSuite, WithOnlyLongPromptsWaitingThePlansAreThoseWithoutTheKnob) {
@@ -1297,8 +1311,9 @@ TEST_F(PrefillChunkYieldSuite, MirroredSchedulersPlanAlike) {
         for (int i = 0; i < 2; ++i, ++next) {
             submit("s" + std::to_string(next), MakeTokens(1 + next % 7, 10000 + 10 * next));
         }
-        const ExecutionPlan plan = ranks[0]->NextExecutionPlan();
-        ASSERT_TRUE(ranks[1]->NextExecutionPlan() == plan) << "round " << round;
+        const Scheduler::PlanOptions options{.allow_prefill = true, .apply_prefill_watermark = false};
+        const ExecutionPlan plan = ranks[0]->NextExecutionPlan(options);
+        ASSERT_TRUE(ranks[1]->NextExecutionPlan(options) == plan) << "round " << round;
         if (plan.remote_decode) {
             ExecutionEvent acks;
             for (const std::string& id : plan.remote_decode->request_ids) {
@@ -1453,6 +1468,24 @@ TEST_F(PrefillDecodeIntervalSuite, ANewPromptWaitsForTheIntervalsDecodeRounds) {
     EXPECT_EQ(Round(), "D:a");  // the second decode round owed since a's prefill
     EXPECT_EQ(Round(), "P:b");
     EXPECT_EQ(Round(), "D:ab");
+}
+
+TEST_F(PrefillDecodeIntervalSuite, ShortPrefillOrderingResumesAfterTheDecodeInterval) {
+    auto cfg = MakeConfig();
+    cfg.enable_short_prefill_first = true;
+    scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(cfg));
+    Submit(MakeRequestSpec("a", 2));
+    EXPECT_EQ(Round(), "P:a");
+    Submit(MakeRequestSpec("long", 6, /*start=*/100));
+    Submit(MakeRequestSpec("short", 1, /*start=*/200));
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round({"long"}), "P:shortlong");
+    // Both prompts used their interval allowance. The remaining long chunks
+    // run without another decode delay, even after short's first admission.
+    EXPECT_EQ(Round({"long"}), "P:long");
+    EXPECT_EQ(Round({"long"}), "P:long");
+    EXPECT_EQ(Round(), "P:long");
 }
 
 TEST_F(PrefillDecodeIntervalSuite, APromptIsHeldBackAtMostTheIntervalAcrossItsChunks) {
@@ -1637,6 +1670,61 @@ protected:
         return cfg;
     }
 };
+
+TEST_F(MixedPrefillDecodeIntervalCapacitySuite, AGrantedFirstAdmissionCountsTowardOldestProtection) {
+    for (const bool abort_victim : {false, true}) {
+        SCOPED_TRACE(abort_victim ? "abort grant" : "retraction grant");
+        auto cfg = MakeConfig();
+        cfg.prefill_decode_interval = 0;
+        cfg.enable_short_prefill_first = true;
+        if (abort_victim) {
+            cfg.snapshot_allocator.total_pages = 1;
+            cfg.max_retracted_requests = 0;
+        }
+        scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(cfg));
+        Submit(
+            {MakeRequestSpec("c", 1, /*start=*/300), MakeRequestSpec("e", 1, /*start=*/500), MakeRequestSpec("a", 2)});
+        EXPECT_EQ(Round(), "P:cea");
+        EXPECT_EQ(Round(), "D:cea");
+        EXPECT_EQ(Round(), "D:cea");
+
+        Submit(MakeRequestSpec("old", 6, /*start=*/100));
+        Submit(MakeRequestSpec("short", 4, /*start=*/200));
+        // Neither prompt fits until a gives up its pages. The shorter prompt receives
+        // the freed capacity after its ordinary admission failed this round.
+        const auto grant = PlanOnce();
+        const auto* batch = FindForwardBatch(grant);
+        ASSERT_NE(batch, nullptr);
+        EXPECT_EQ(batch->request_ids, (std::vector<std::string>{"short", "c", "e"}));
+        ASSERT_EQ(grant.aborts.size(), abort_victim ? 1u : 0u);
+        if (abort_victim) {
+            EXPECT_EQ(grant.aborts.front().request_id, "a");
+            EXPECT_EQ(grant.aborts.front().reason, AbortReason::kImageDoesNotFit);
+        }
+        ASSERT_EQ(scheduler_->RetractedSize(), abort_victim ? 0u : 1u);
+        AckImageStores(grant);
+        SendForwardDone("short");
+        SendForwardDone("c", {7});
+        SendForwardDone("e", {7});
+        SendFinish("c");
+        SendFinish("e");
+        if (!abort_victim) {
+            SendAbortEvent("a");
+        }
+        SendAbortEvent("short");
+
+        // The grant was the first bypass. Seven ordinary admissions fill the
+        // remaining allowance; each consumes the round's entire token budget.
+        for (int i = 0; i < 7; ++i) {
+            const std::string id = "s" + std::to_string(i);
+            Submit(MakeRequestSpec(id, 4, /*start=*/1000 + i * 100));
+            EXPECT_EQ(Round(), "P:" + id);
+            SendFinish(id);
+        }
+        Submit(MakeRequestSpec("later", 4, /*start=*/2000));
+        EXPECT_EQ(Round({"old"}), "P:old");
+    }
+}
 
 TEST_F(MixedPrefillDecodeIntervalCapacitySuite, AGrantAdmittedPromptIsNotHeldBackThatRound) {
     Submit({MakeRequestSpec("c", 1, /*start=*/300), MakeRequestSpec("e", 1, /*start=*/500), MakeRequestSpec("a", 2)});

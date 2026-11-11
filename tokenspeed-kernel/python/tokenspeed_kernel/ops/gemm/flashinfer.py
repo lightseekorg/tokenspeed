@@ -578,6 +578,9 @@ if mm_fp4 is not error_fn:
         if alpha is None or alpha.numel() != 1:
             raise ValueError("NVFP4 GEMM takes a one-element global alpha")
         m, n, k = A.shape[0], B.shape[1], A.shape[1] * 2
+        if m == 0:
+            # The kernel cannot launch an empty grid, as on an idle data-parallel rank.
+            return out if out is not None else A.new_empty((0, n), dtype=out_dtype)
         direct = out is not None and out.is_contiguous() and out.data_ptr() % 16 == 0
         result = (
             out if direct else torch.empty((m, n), dtype=out_dtype, device=A.device)
@@ -788,6 +791,25 @@ _fi_gemm = None
 # Automatic dispatch scope, not a TGV capability limit.
 BF16_GEMM_MAX_M = 4 if platform.arch_version == ArchVersion(10, 7) else 32
 
+# SM107 admits only the projection shapes with a measured CuTe DSL win over
+# cuBLAS nvjet on vr200 (fi 0.7.2/0.7.3 microbenchmarks; full-N >= 13312
+# projections and the LM head lose and stay on nvjet). (N, K) of the TP4
+# per-rank projections plus the existing TP1 o_proj admission.
+_SM107_BF16_GEMM_SHAPES = frozenset(
+    {
+        (2560, 6144),  # attention o_proj, TP1 (existing admission)
+        (3584, 2560),  # attention qkv gated proj, TP4
+        (4096, 2560),  # GDN in_proj, TP4
+        (4120, 2560),  # GDN in_proj (padded variant), TP4
+        (4160, 2560),  # GDN in_proj (padded variant), TP4
+        (2560, 1536),  # attention o_proj, TP4
+        (1280, 2560),  # MoE shared-expert gate_up, TP4
+        (2560, 640),  # MoE shared-expert down, TP4
+        (320, 2560),  # small-N router-class proj, TP4
+        (512, 2560),  # small-N gate-up proj, TP4
+    }
+)
+
 if platform.is_nvidia and platform.arch_version in (
     *_CUTE_DSL_SM100_ARCHS,
     ArchVersion(10, 7),
@@ -830,6 +852,13 @@ def _bf16_gemm_runner_names(k: int) -> list[str]:
     """Admit each backend by its own K contract, not their intersection."""
     if k <= 0:
         return []
+    if platform.arch_version == ArchVersion(10, 7):
+        # SM107: pin CuTe DSL, the measured winner on every admitted shape
+        # (microbenchmarks; the AutoTuner joint pick chose TGV for
+        # (2560, 1536) in production, so the joint ranking is not trusted
+        # here). Only consulted for shapes in _SM107_BF16_GEMM_SHAPES, so the
+        # pin's effective scope is exactly that set.
+        return ["cute-dsl"] if k % 128 == 0 else []
     # TGV handles partial K tiles; its TMA rows need 16-byte (8 BF16) strides.
     runners = ["tgv"] if k % 8 == 0 else []
     # Only cute-dsl requires whole 128-element K tiles. Its native runners
@@ -852,10 +881,11 @@ def flashinfer_joint_bf16_supported(
         and x.is_cuda
         and x.device == weight.device
         and x.ndim == weight.ndim == 2
-        # Limit SM107 dispatch to the measured attention output projection.
-        # Other dense projections keep their existing implementation.
+        # Limit SM107 dispatch to the measured projection set. Other dense
+        # projections keep their existing implementation.
         and (
-            platform.arch_version != ArchVersion(10, 7) or weight.shape == (2560, 6144)
+            platform.arch_version != ArchVersion(10, 7)
+            or tuple(weight.shape) in _SM107_BF16_GEMM_SHAPES
         )
         and x.dtype == weight.dtype == torch.bfloat16
         and x.shape[0] > 0

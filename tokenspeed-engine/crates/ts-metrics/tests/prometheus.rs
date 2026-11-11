@@ -68,8 +68,8 @@ fn run_scenario(directory: &Path) {
             dp_rank: 0,
         },
     );
-    engine.record_scheduler_iteration(3, 2, 10, 40, 17);
-    engine.record_scheduler_iteration(1, 0, 4, 40, 0);
+    engine.record_scheduler_iteration(3, 5, 2, 10, 40, 17);
+    engine.record_scheduler_iteration(1, 4, 0, 4, 40, 0);
     engine.record_spec_decode_step(4, 5, 3);
     engine.record_jit_compiles(2, 0.5);
     engine.record_nan_abort();
@@ -79,7 +79,7 @@ fn run_scenario(directory: &Path) {
     engine.observe_request_queue_time(9000.0);
     engine.record_cache_occupancy(12, 8, 40, 647);
     engine.record_prefill_queues(1, 2, 0);
-    engine.record_decode_queues(3, 4, 1);
+    engine.record_decode_queues(3, 2, 4, 1);
     engine.record_generation_tokens(25);
     engine.record_request_tokens(100, 40);
     engine.observe_time_to_first_token(0.25);

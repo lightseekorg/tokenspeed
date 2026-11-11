@@ -407,6 +407,7 @@ def test_mla_forward_takes_precomputed_qkv_a_and_projects_only_the_gate():
         absorbed_weights_k_major=True,
         o_proj=SimpleNamespace(supports_fp8_group128_input=False),
         q_b_wq_b_weight=None,
+        _takes_decode_front=mock.Mock(return_value=False),
         _sparse_attention=mock.Mock(return_value=attn_output),
         _gate_project_output=mock.Mock(return_value=output),
         _project_qkv_gate_a=mock.Mock(side_effect=AssertionError("projected twice")),

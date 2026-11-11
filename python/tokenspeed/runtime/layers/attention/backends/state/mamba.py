@@ -51,6 +51,10 @@ from tokenspeed_kernel.ops.attention.gdn.triton import (
     set_total_chunks_hint,
     set_total_chunks_hint_uniform,
 )
+from tokenspeed_kernel.ops.attention.kda import (
+    KdaOutputNorm,
+    apply_kda_output_norm,
+)
 from tokenspeed_kernel.ops.attention.kda.triton import (
     commit_state_pages,
     verify_state_blocks,
@@ -1662,6 +1666,7 @@ class MambaAttnBackend(AttentionBackend):
         dt_bias = kwargs["dt_bias"]
         D = kwargs.get("D")
         layer_id = kwargs["layer_id"]
+        output_norm = kwargs.get("output_norm")
 
         # Read the page holding position n-1 and write the page holding
         # position n. Padding rows use -1 and are skipped by both kernels.
@@ -1688,7 +1693,7 @@ class MambaAttnBackend(AttentionBackend):
             lower_bound=gate_lower_bound,
         )
         if fused_out is not None:
-            return fused_out
+            return apply_kda_output_norm(fused_out, output_norm)
 
         # Stride-aware decoders consume packed projection views directly.
         # Otherwise a family whose model hands over projection views makes them
@@ -1725,7 +1730,7 @@ class MambaAttnBackend(AttentionBackend):
         key = key.view(seq_len, 1, num_heads, head_k_dim)
         value = value.view(seq_len, 1, value.shape[1] // head_v_dim, head_v_dim)
 
-        return self._decode_scan(
+        core_attn_out = self._decode_scan(
             query,
             key,
             value,
@@ -1743,6 +1748,7 @@ class MambaAttnBackend(AttentionBackend):
             beta_raw=beta_raw,
             lower_bound=gate_lower_bound,
         )
+        return apply_kda_output_norm(core_attn_out, output_norm)
 
     def _decode(
         self,
@@ -1904,6 +1910,8 @@ class MambaAttnBackend(AttentionBackend):
                     value = inputs.get(name)
                     if value is not None:
                         inputs[name] = value[begin:end]
+                if inputs.get("output_norm") is not None:
+                    inputs["output_norm"] = inputs["output_norm"].rows(begin, end)
                 self.forward_metadata = part_metadata
                 output = self.forward_extend(
                     q,
@@ -1966,6 +1974,7 @@ class MambaAttnBackend(AttentionBackend):
         D = kwargs.get("D")
         layer_id = kwargs["layer_id"]
         seq_len = kwargs["seq_len"]
+        output_norm = kwargs.get("output_norm")
 
         is_target_verify = (
             forward_mode.is_decode_or_idle() and self.deferred_state_commit
@@ -2005,6 +2014,7 @@ class MambaAttnBackend(AttentionBackend):
                 attn_tp_size=attn_tp_size,
                 head_v_dim=head_v_dim,
                 lower_bound=gate_lower_bound,
+                output_norm=output_norm,
             )
             if fused_out is not None:
                 return fused_out
@@ -2267,7 +2277,7 @@ class MambaAttnBackend(AttentionBackend):
                     core_attn_out[0] if core_attn_out.ndim == 4 else core_attn_out
                 )
 
-        return core_attn_out
+        return apply_kda_output_norm(core_attn_out, output_norm)
 
     def _replay_inputs(
         self,
@@ -2319,6 +2329,7 @@ class MambaAttnBackend(AttentionBackend):
         attn_tp_size: int,
         head_v_dim: int,
         lower_bound: float | None,
+        output_norm: KdaOutputNorm | None,
     ) -> torch.Tensor | None:
         """Whole-round verify attempt; ``None`` falls through to the shared flow.
 
@@ -2353,6 +2364,8 @@ class MambaAttnBackend(AttentionBackend):
             attn_tp_size: Attention tensor-parallel size.
             head_v_dim: Value head dimension.
             lower_bound: KDA decay clamp.
+            output_norm: KDA's gated output norm, applied to the returned
+                output; None returns the attention output.
 
         Returns:
             The layer output when a fused kernel ran, else None.

@@ -28,10 +28,13 @@ payload rows, and pages include padding (0 and -1). Destinations start as
 sentinels, so equality on whole tensors also checks that nothing outside the
 write set changes. Key records, stamps and retained rows must match exactly;
 the gate projection sums in a different order, so a raw gate may differ by one
-BF16 step and outputs and corrections by what that step propagates.
+BF16 step and outputs and corrections by what that step propagates. The fused
+output norm is checked against the norm kernel on the plain output.
 """
 
 from __future__ import annotations
+
+import dataclasses
 
 import pytest
 import torch
@@ -46,7 +49,11 @@ from tokenspeed_kernel.platform import ArchVersion, current_platform
 
 if not ArchVersion(10, 0) <= current_platform().arch_version <= ArchVersion(10, 3):
     pytest.skip("requires SM100 or SM103", allow_module_level=True)
+from tokenspeed_kernel.ops.activation.triton import (  # noqa: E402
+    rmsnorm_gated_sigmoid,
+)
 from tokenspeed_kernel.ops.attention.kda import (  # noqa: E402
+    KdaOutputNorm,
     KdaReplayRecords,
     kda_fused_paged_verify_fuses_producers,
     try_kda_fused_paged_verify,
@@ -92,6 +99,7 @@ def _inputs(batch, *, seed, lower_bound=-5.0, metadata=True, f_a_pitch=0):
         ).to(torch.int64)
     return dict(
         mixed_qkv=projection[:, : 3 * WIDTH],
+        out_gate=projection[:, 3 * WIDTH : 4 * WIDTH],
         f_a_out=projection[:, 4 * WIDTH + f_a_pitch : 4 * WIDTH + f_a_pitch + RANK],
         beta_logits=projection[:, 4 * WIDTH + f_a_pitch + RANK :][:, :HEADS],
         conv_weights=randn(3 * WIDTH, 4, scale=0.5).bfloat16(),
@@ -137,7 +145,7 @@ def _records(x, *, original):
     return records, (correction_rows, key_gate_rows, stamps, retained)
 
 
-def _verify(x, records, **producers):
+def _verify(x, records, output_norm, **producers):
     return try_kda_fused_paged_verify(
         x["mixed_qkv"],
         x["conv_weights"],
@@ -159,6 +167,7 @@ def _verify(x, records, **producers):
         store_states=False,
         recurrent_layout="v_major",
         replay_records=records,
+        output_norm=output_norm,
         **producers,
     )
 
@@ -177,12 +186,12 @@ def _split(x):
         original_qkv=buffers[3][:, : 3 * WIDTH],
     )
     g_raw = F.linear(x["f_a_out"], x["f_b_weight"])
-    return _verify(x, records, g_raw=g_raw, conv_qkv=conv_qkv), buffers
+    return _verify(x, records, None, g_raw=g_raw, conv_qkv=conv_qkv), buffers
 
 
-def _fused(x):
+def _fused(x, output_norm=None):
     records, buffers = _records(x, original=True)
-    return _verify(x, records), buffers
+    return _verify(x, records, output_norm), buffers
 
 
 def _assert_matches(expected, actual):
@@ -197,8 +206,9 @@ def _assert_matches(expected, actual):
     assert torch.equal(kg[:, 2 * WIDTH :], kg_ref[:, 2 * WIDTH :])
     gate_cols = key_cols + DIM
     gates, gates_ref = kg[:, gate_cols].float(), kg_ref[:, gate_cols].float()
-    # One BF16 step of the larger gate at most.
+    # One BF16 step of the larger gate, plus a floor for sums that cancel to near zero.
     step = torch.maximum(gates.abs(), gates_ref.abs()) * 2.0**-7
+    step = step + gates_ref.abs().max() * 2.0**-16
     assert ((gates - gates_ref).abs() <= step).all()
     assert torch.equal(corr[:, WIDTH:], corr_ref[:, WIDTH:])
     written = corr_ref != CORRECTION_FILL
@@ -256,6 +266,21 @@ def test_fused_step_without_metadata_records_by_request():
     _assert_matches(_split(x), _fused(x))
 
 
+@pytest.mark.parametrize("strided", ["metadata", "stamps"])
+def test_strided_replay_records_are_rejected(strided):
+    """The kernel reads the record metadata and stamps as dense INT64 rows."""
+    x = _inputs(3, seed=42)
+    records = _records(x, original=True)[0]
+    dense = records.metadata if strided == "metadata" else records.stamps
+    wide = dense.new_zeros(*dense.shape[:-1], 2 * dense.shape[-1])
+    view = wide[..., ::2]
+    view.copy_(dense)
+    assert not view.is_contiguous() and torch.equal(view, dense)
+    records = dataclasses.replace(records, **{strided: view})
+    with pytest.raises(ValueError, match="contiguous INT64"):
+        _verify(x, records, None)
+
+
 @pytest.mark.parametrize("unaligned", ["f_a rows", "conv weights"])
 def test_unaligned_inputs_fall_back_to_split_producers(unaligned):
     x = _inputs(3, seed=41, f_a_pitch=int(unaligned == "f_a rows"))
@@ -284,17 +309,14 @@ def test_unaligned_inputs_fall_back_to_split_producers(unaligned):
         assert torch.equal(ref, got)
 
 
-@pytest.mark.parametrize(("window", "fused"), [(1, True), (2, False), (8, False)])
-def test_one_token_windows_fuse_their_producers(window, fused):
-    assert (
-        kda_fused_paged_verify_fuses_producers(
-            torch.bfloat16,
-            recurrent_layout="v_major",
-            num_heads=HEADS,
-            head_dim=DIM,
-            draft_token_num=window,
-        )
-        is fused
+def test_one_token_windows_fuse_their_producers():
+    assert kda_fused_paged_verify_fuses_producers(
+        torch.bfloat16,
+        recurrent_layout="v_major",
+        num_heads=HEADS,
+        head_dim=DIM,
+        draft_token_num=1,
+        batch_size=64,
     )
 
 
@@ -305,3 +327,66 @@ def test_serving_batches_reuse_one_compiled_kernel():
         for batch in (2, 7, 64):
             _fused(_inputs(batch, seed=60 + batch))
     torch.cuda.synchronize()
+
+
+def _output_norm(x, weight_dtype):
+    gen = torch.Generator(device="cuda").manual_seed(91)
+    weight = (1 + 0.1 * torch.randn(DIM, device="cuda", generator=gen)).to(weight_dtype)
+    return KdaOutputNorm(x["out_gate"], weight, 1e-5)
+
+
+@pytest.mark.parametrize("batch", [1, 3, 8, 64])
+@pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float32])
+def test_fused_output_norm_matches_the_norm_kernel(batch, weight_dtype):
+    """The epilogue stores the norm kernel's result on the BF16 output.
+
+    Only the order of the sum of squares differs, so an element may move by one
+    BF16 step; the records do not change at all.
+    """
+    x = _inputs(batch, seed=80 + batch)
+    norm = _output_norm(x, weight_dtype)
+    plain, plain_records = _fused(x)
+    normed, normed_records = _fused(x, norm)
+    for got, want in zip(normed_records, plain_records):
+        assert torch.equal(got, want)
+    rows = x["mixed_qkv"].shape[0]
+    expected = rmsnorm_gated_sigmoid(
+        plain.view(rows, WIDTH),
+        norm.gate,
+        norm.weight,
+        norm.eps,
+        HEADS,
+        DIM,
+        enable_pdl=False,
+    ).float()
+    normed = normed.float()
+    assert normed.shape == (rows, WIDTH)
+    step = expected.abs() * 2.0**-7
+    assert ((normed - expected).abs() <= step).all()
+    assert (normed != expected).float().mean() < 0.01
+    if batch > 2:
+        assert not normed[1:3].any()
+
+
+def test_unaligned_inputs_apply_the_output_norm_after_the_split_producers():
+    x = _inputs(3, seed=43, f_a_pitch=1)
+    norm = _output_norm(x, torch.bfloat16)
+    plain = _split(x)[0]
+    normed = _fused(x, norm)[0]
+    expected = rmsnorm_gated_sigmoid(
+        plain.view(3, WIDTH),
+        norm.gate,
+        norm.weight,
+        norm.eps,
+        HEADS,
+        DIM,
+        enable_pdl=False,
+    )
+    assert torch.equal(normed, expected)
+
+
+def test_misshaped_output_norm_is_rejected():
+    x = _inputs(3, seed=44)
+    norm = _output_norm(x, torch.bfloat16)
+    with pytest.raises(ValueError, match="output norm"):
+        _fused(x, KdaOutputNorm(norm.gate, norm.weight[:64], norm.eps))

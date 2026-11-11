@@ -289,6 +289,96 @@ served only by cores declaring `slot_order={"sorted", ...}`, which receive
 the choice as the `slot_order` keyword. Asking a silent core for `sorted`
 is a `ValueError`, not a silent fallback.
 
+## Fused decode top-k (`cute_dsl_dsa_decode_topk`)
+
+On SM100-SM103 the `cute_dsl` leaf runs a decode step's indexer tail in two
+PDL-chained launches (`thirdparty/cute_dsl/k3_decode/dsa/indexer.py`) after the
+shared query quantization: a persistent tcgen05 scorer and a one-CTA-per-row
+select. It replaces the DeepGEMM leaf's block-table expansion, paged MQA logits,
+non-finite scrub, radix top-k and slot mapping, and ignores the `dsa_plan`.
+
+- Logits are bit-identical to `deep_gemm.fp8_paged_mqa_logits` on the same FP8
+  query and FP32 weights: the same FP8 MMA (K 128 in four K 32 steps, FP32
+  accumulator, keys as operand A) and DeepGEMM's FP32 head sum (`x + |x|`, two
+  FMA chains over the head pairs, their sum halved, times the key's scale), with
+  NaN and `+inf` stored as `-inf` as the scrub would. They live in a
+  request-compact FP32 scratch no larger than DeepGEMM's `[tokens, block-table
+  capacity]` output.
+- Selection is exact over FP32 order keys (`-0` ranks as `+0`): a row's top-k is
+  the head of the stable descending sort of its causal window, so ties at the
+  threshold go to the lowest positions (the `batch_invariant` contract), and the
+  slots come out in ascending position, which serves both `slot_order` values.
+  A row of at most `topk` keys takes all of them; a request whose rows all fit
+  is not scored. Rows whose request length leaves no keys come out empty.
+- Rows, requests, pages and the block-table width are runtime values: one
+  compile per `q_len_per_req`. At most 4096 requests per call.
+- The select never releases its dependents early: trtllm-gen sparse attention
+  reads the counts before its PDL wait.
+- It also takes queries quantized ahead: contiguous E4M3 queries with unit
+  scales (`q_scales=None`) and the FP32 weights that carry their scales and
+  the score scale (`softmax_scale=1`), which it scores without its own
+  quantization launch.
+
+The leaf registers below every other `dsa_decode_topk` leaf, so only
+`solution="cute_dsl"` selects it. Kimi-K3.1 pins it where it is registered;
+other models with the same indexer geometry keep their leaf.
+
+A Kimi-K3.1 decode round quantizes those queries in the launch that writes
+its index keys: `index_k_layernorm_fp8_scatter_and_quantize_query`
+(`_triton/topk.py`) runs, per row, the row functions of
+`index_k_layernorm_fp8_scatter` (one warp, so the key's LayerNorm sums in the
+same order) and of `quantize_index_query_weights`, so the plane's bytes and
+the query and weights are bit-identical to the two separate launches. Mixed
+rounds, prefill, and KV-parallel decode keep the separate write; decode rounds
+of the K3 decode chain run the fused decode front below instead.
+
+## Fused decode front (`cute_dsl_dsa_decode_front`)
+
+On SM100-SM103 a Kimi-K3.1 TP8 decode round of the K3 decode chain runs, after
+its packed input projection, one cluster launch
+(`thirdparty/cute_dsl/k3_decode/dsa/front.py`) in place of three:
+`rmsnorm_fused_parallel` (q_a into `q_norm`, kv_a in place), the stacked
+[q_b; wq_b] GEMM over `q_norm`, and
+`index_k_layernorm_fp8_scatter_and_quantize_query`. It is the
+`dsa_decode_front` operator (`solution="cute_dsl"`; traits q_lora_rank 1536,
+kv_lora_rank 512, 2304 q_b rows, 32 index heads of 128, 64-slot packed
+`fp8_scaled` planes) and serves 1-64 rows (`decode_front_rows_supported`).
+Kimi-K3.1 takes it up to 32 rows: on GB300 it saves about 2 us per DSA layer
+at 8-32 rows, while at 64 rows the stacked GEMM path is faster.
+
+- Grid (4, 32), clusters of 4, one CTA per SM. Cluster `h` owns index head `h`
+  (128 wq_b rows) and q_b rows `[72 h, 72 h + 72)`; CTA `p` holds K columns
+  `[384 p, 384 p + 384)` of those 200 rows. It issues its 150 KB of weights in
+  six 64-column blocks (cp.async, L2 evict_first) before the PDL wait, so the
+  weight stream starts under the input projection's tail, and the MMAs of a
+  block start as it lands.
+- After the wait, eight warps load the rows' q_a quarter. Each CTA sends its
+  peers (DSMEM bulk copies) one whole warp sum and 16 thread chains of the
+  RMSNorm per row, from which every CTA rebuilds `rmsnorm_fused_parallel`'s
+  exact reduction tree (an FMA chain per 8 columns, a butterfly per 256, the six
+  warp sums as `((w0 + w4) + w2) + ((w1 + w5) + w3)`, `-use_fast_math`
+  arithmetic), normalizes its quarter in place and runs BF16 `mma.sync` with FP32
+  accumulators. The FP32 partials overwrite the weight buffer; after a cluster
+  barrier the owner of a row adds the four K quarters in rank order, rounds to
+  BF16, writes the projection and quantizes the head as
+  `quantize_index_query_weights` does.
+- A ninth warp writes token `4 h + p`'s index key with the Triton write's
+  instruction sequence and normalizes its kv_a row in place.
+
+Numerics: `q_norm`, the normalized latent, the plane bytes and the quantized
+query (of the front's own BF16 projection) are bit-identical to the separate
+launches. Only the projection's K summation order differs from a GEMM
+library's, so a projected value may differ from the unfused GEMM's by one BF16
+step, and its FP8 query and scale follow it. Rows are a runtime value: one
+compile per 16-row tile and slot / LayerNorm dtype.
+
+Kimi-K3.1 selects the front at construction only with the fused decode top-k
+(`index_k_write_quantizes_query`) and takes it for decode rounds of the decode
+chain without KV placement or a breakable capture; the front runs inside the
+layer's eager break, and `forward_dsa_core` takes its outputs as
+`written_index_query`. Prefill, mixed and KV-parallel rounds, the non-chain
+forward and bitwise numerics keep the separate launches.
+
 ## Row top-k selection in CuTe DSL (`_cute_dsl/deep_select.py`)
 
 `deepselect_topk(scores, ends, topk, capacity=..., cluster_size=...)` selects

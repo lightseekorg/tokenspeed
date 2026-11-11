@@ -5,6 +5,13 @@ workflow_stage: model-test
 triggers:
   - per-commit
   - manual
+# The model modules this task serves; pull requests changing only other models skip it.
+model_sources:
+  - python/tokenspeed/runtime/models/qwen3_5.py
+  - python/tokenspeed/runtime/models/qwen3_5_moe.py
+  - python/tokenspeed/runtime/models/qwen3_vision.py
+  - python/tokenspeed/runtime/models/qwen4_exp.py
+  - python/tokenspeed/runtime/models/qwen4_exp_monokernel.py
 runner:
   labels:
     - amd-mi35x-2gpu-test

@@ -289,6 +289,26 @@ def start_rust_host(
     preexec_fn = None
     if parent_death_signal:
         preexec_fn = functools.partial(set_parent_death_signal, os.getpid())
+    # Set each native writer's fallback before the host initializes logging.
+    level = server_args.log_level.lower()
+    host_env = os.environ.copy()
+    host_env.setdefault(
+        "TS_HOST_LOG",
+        {
+            "warning": "warn",
+            "critical": "error",
+            "fatal": "error",
+            "notset": "trace",
+        }.get(level, level),
+    )
+    host_env.setdefault(
+        "SPDLOG_LEVEL",
+        {
+            "warn": "warning",
+            "fatal": "critical",
+            "notset": "trace",
+        }.get(level, level),
+    )
     with start_context:
         popen = subprocess.Popen(
             [
@@ -305,6 +325,7 @@ def start_rust_host(
                 str(server_args.enable_async_logging).lower(),
             ],
             executable=binary,
+            env=host_env,
             pass_fds=[child.fileno(), held_until_exit],
             preexec_fn=preexec_fn,
         )
@@ -469,6 +490,7 @@ class HostConfig:
         log_spec_accept_lengths: ``TOKENSPEED_LOG_SPEC_ACCEPT_LENGTHS``.
         finish_log: This rank logs each request's finish line: the
             attention-TP group's first rank.
+        ttft_trace_sampling_percentage: Percentage of PD rooms to log at bootstrap and first output.
         log_request_stats: ``--enable-log-request-stats``: the finish line is
             the request's timing summary.
         kv_events: The scheduler records KV cache events
@@ -498,6 +520,9 @@ class HostConfig:
             ``--grammar-backend none``.
         eager_grammar: The forward fills grammar bitmasks from the
             matchers' committed state (``DeviceSpecs.uses_eager_grammar``).
+        prefill_delay: The fused engine's prefill-delay gate intervals,
+            (attempt, any) rounds; None plans prefill every round
+            (``ServerArgs.prefill_delay``).
     """
 
     handshake_address: str
@@ -542,6 +567,7 @@ class HostConfig:
     log_spec_accept_lengths: bool
     finish_log: bool
     log_request_stats: bool
+    ttft_trace_sampling_percentage: int
     kv_events: bool
     kv_events_publisher: KVEventsConfig | None
     otlp_traces_endpoint: str | None
@@ -556,6 +582,10 @@ class HostConfig:
     reasoning: ReasoningGrammar | None
     grammar: GrammarSettings | None
     eager_grammar: bool
+    # The fused engine's prefill-delay gate, (attempt, any) intervals in
+    # rounds; None plans prefill every round. See
+    # ``ServerArgs.prefill_delay``.
+    prefill_delay: tuple[int, int] | None
 
 
 def host_in_flight_depth(server_args: ServerArgs) -> int:
@@ -1456,6 +1486,7 @@ class HostBootstrap:
                 log_spec_accept_lengths=envs.TOKENSPEED_LOG_SPEC_ACCEPT_LENGTHS.get(),
                 finish_log=attn_tp_rank == 0,
                 log_request_stats=server_args.enable_log_request_stats,
+                ttft_trace_sampling_percentage=server_args.ttft_trace_sampling_percentage,
                 kv_events=kv_events,
                 kv_events_publisher=(
                     kv_events_config
@@ -1497,6 +1528,7 @@ class HostBootstrap:
                     else None
                 ),
                 eager_grammar=specs.uses_eager_grammar,
+                prefill_delay=server_args.prefill_delay,
                 eplb=(
                     EplbSettings(
                         specs=specs.expert_rebalance,

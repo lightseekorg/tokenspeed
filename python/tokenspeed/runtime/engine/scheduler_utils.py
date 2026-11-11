@@ -125,6 +125,7 @@ def make_config(
     disable_prefix_cache: bool = False,
     cache_groups: Sequence[CacheGroupConfig] | None = None,
     enable_mixed_prefill_decode: bool = False,
+    enable_short_prefill_first: bool = False,
     prefix_replay_tokens: int = 0,
     state_checkpoint_in_forward: bool = False,
     demote_superseded_state_checkpoints: bool = False,
@@ -139,6 +140,8 @@ def make_config(
     Args:
         num_device_pages: Device LCM blocks including the null page.
         max_scheduled_tokens: Per-step prefill token budget.
+        enable_short_prefill_first: Opt in to remaining-work ordering with
+            oldest-request protection; False preserves submission order.
         max_batch_size: Per-rank batch slots -- the most requests this rank
             runs at once (``--max-num-seqs`` over the attention-DP ranks).
         prefix_granularity: Prefix-hash page size in tokens.
@@ -179,7 +182,9 @@ def make_config(
         enable_kv_cache_events: Publish KV cache events.
         decode_input_tokens: Verify width per decode step.
         overlap_schedule_depth: Dispatched-but-uncommitted plans allowed.
-        disable_prefix_cache: No prefix matching at admission.
+        disable_prefix_cache: No prefix matching at admission. Computed
+            pages are then published only for a retraction's image, so a
+            finished request's pages return to the pool.
         cache_groups: The arena's scheduler group configs.
         enable_mixed_prefill_decode: Mixed prefill/decode batches.
         prefix_replay_tokens: Prompt tail recomputed after a prefix hit.
@@ -298,6 +303,9 @@ def make_config(
         # Set only when on, like state_checkpoint_in_forward: a scheduler
         # wheel without the field still runs the default.
         cfg.prefill_decode_interval = prefill_decode_interval
+    if enable_short_prefill_first:
+        # Older scheduler wheels retain FIFO and reject an explicit opt-in.
+        cfg.enable_short_prefill_first = True
     if cache_groups:
         cfg.cache_groups = list(cache_groups)
     return cfg

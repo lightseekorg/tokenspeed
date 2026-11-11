@@ -37,6 +37,7 @@
 
 #include "core/token_container.h"
 #include "cache/tier/transfer.h"
+#include "fsm/forward_events.h"
 #include "fsm/forward_states.h"
 #include "scheduler/capacity_model.h"
 #include "scheduler/operations/forward.h"
@@ -47,11 +48,6 @@
 namespace tokenspeed {
 
 namespace {
-
-// Stalled rounds (Scheduler::trackStalledRounds) before the first warning.
-// Later warnings come at every doubling of the streak, so a stall that never
-// ends still logs only a few dozen lines.
-constexpr std::int64_t kStalledRoundsBeforeWarning = 1024;
 
 std::int32_t hostPoolBlocks(const SchedulerConfig& config) {
     return config.HasHostCache() ? config.host_allocator.NumUsableBlocks() : 0;
@@ -462,6 +458,12 @@ std::size_t Scheduler::PrefillSize() const {
     }));
 }
 
+std::size_t Scheduler::RunningSize() const {
+    return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const std::unique_ptr<Request>& request) {
+        return request->IsAnyOf<fsm::Prefilling, fsm::PrefillAwaitingResult, fsm::PrefillDone, fsm::Decoding>();
+    }));
+}
+
 std::size_t Scheduler::RemotePrefillSize() const {
     return static_cast<std::size_t>(std::ranges::count_if(
         requests_, [](const std::unique_ptr<Request>& request) { return request->Is<fsm::RemotePrefilling>(); }));
@@ -499,6 +501,8 @@ HostCacheStats Scheduler::GetHostCacheStats() const {
         .dead_entries_not_written_back = coordinator_.DeadEntriesNotWrittenBack(),
         .demoted_entries_not_written_back = coordinator_.DemotedEntriesNotWrittenBack(),
         .device_evictions = coordinator_.DeviceEvictions(),
+        .lone_compactions = coordinator_.LoneCompactions(),
+        .lone_compaction_moves = coordinator_.LoneCompactionMoves(),
         .checkpoint_resume_gaps = coordinator_.CheckpointResumeGaps(),
     };
 }
@@ -546,7 +550,38 @@ std::vector<std::int64_t> Scheduler::AdmissionCapacityCurve(std::int32_t token_s
     return curve;
 }
 
-ExecutionPlan Scheduler::NextExecutionPlan() {
+Scheduler::PrefillGateProbe Scheduler::ProbePrefillGate() const {
+    PrefillGateProbe probe{.wants_prefill = false, .has_decode_work = false};
+    if (config_.role != Role::kFused) {
+        // Only the fused role has both kinds of work to choose between: a P
+        // node is all prefill and a D node's prompts are its peer's.
+        return probe;
+    }
+    bool pending_prefill = false;
+    bool resident_prefill = false;
+    for (const auto& request : requests_) {
+        // Storage preparation has not admitted Device pages yet. Resident
+        // chunks, however, must be able to consume their own reservations.
+        if (request->Is<fsm::Prefilling>()) {
+            resident_prefill = true;
+        } else if (request->IsAnyOf<fsm::Submitted, fsm::Prefetching>()) {
+            pending_prefill = true;
+        } else if (request->IsAnyOf<fsm::PrefillDone, fsm::Decoding>()) {
+            probe.has_decode_work = true;
+        }
+    }
+    probe.wants_prefill = resident_prefill || (pending_prefill && belowPrefillWatermark());
+    return probe;
+}
+
+bool Scheduler::belowPrefillWatermark() const {
+    const std::int32_t total_pages = coordinator_.TotalLcmBlocks();
+    const float used_ratio =
+        total_pages > 0 ? static_cast<float>(ActiveLcmBlocks()) / static_cast<float>(total_pages) : 0.0F;
+    return used_ratio <= kPrefillWatermark;
+}
+
+ExecutionPlan Scheduler::NextExecutionPlan(PlanOptions options) {
     std::vector<WriteBackOperation> write_back_operations = std::exchange(pending_write_back_operations_, {});
     // Dropping a finished request drops what it still holds elsewhere -- its
     // session's registration under its access epoch -- with it.
@@ -579,7 +614,7 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
     BuiltOperations built;
     bool builds_work = false;
     if (forward_allowed_) {
-        built = buildForwardOperations(plan, std::move(candidates), write_back_operations);
+        built = buildForwardOperations(plan, std::move(candidates), write_back_operations, options);
         builds_work = !built.forward.empty() || plan.remote_decode.has_value() || plan.remote_prefill.has_value();
         plan.With(ForwardBatch{std::move(built.forward)});
     }
@@ -637,6 +672,40 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
                        /*plan_is_empty=*/!builds_work && write_back_operations.empty() &&
                            built.snapshot_stores.empty() && !has_storage_work && built.load_backs.empty() &&
                            built.snapshot_restores.empty() && plan.aborts.empty());
+    // The no-progress abort (docs/design/scheduler.md §1.4, §2), decided on
+    // the diagnostic's own count: at the kNoProgressAbortPlans-th consecutive
+    // stalled plan, unless lone-request compaction moved or published
+    // something in it, the request the build left blocked for capacity with
+    // no other request holding pages is aborted with a reason -- neither
+    // eviction nor compaction can ever fund its admission, nor eviction a
+    // landed image's restore that claims no cached page, so waiting would
+    // last for good. Fused role only: on the P and D roles a Submitted
+    // request stuck so has its PD transfer registered, which a scheduler
+    // abort does not conclude, so a request stuck there waits behind the
+    // warning as before. The abort ends the streak, like any plan carrying
+    // an abort: the next request stuck alone is judged on a streak of its
+    // own.
+    if (config_.role == Role::kFused && stalled_rounds_ >= kNoProgressAbortPlans &&
+        last_lone_compaction_plan_ != plan_calls_ && built.blocked_alone != nullptr) {
+        Request& stuck = *built.blocked_alone;
+        const bool restore = stuck.Is<fsm::Retracted>();
+        const std::string detail = fmt::format(
+            "no progress for {} consecutive plans with no other request holding pages: its {} needs Device pages "
+            "that {} (device LCM blocks active={}, empty={}, total={})",
+            stalled_rounds_, restore ? "restore" : "admission",
+            restore ? "eviction cannot free even when it claims no cached page"
+                    : "neither eviction nor lone-request compaction can free",
+            ActiveLcmBlocks(), EmptyLcmBlocks(), coordinator_.TotalLcmBlocks());
+        spdlog::warn("[Scheduler] no-progress abort: request {} ({} tokens) -- {}; aborting it", stuck.Id(),
+                     stuck.TokenSize(), detail);
+        plan.aborts.push_back(SchedulerAbort{
+            .request_id = stuck.Id(),
+            .reason = AbortReason::kNoProgress,
+            .detail = detail,
+        });
+        stuck.Apply(fsm::AbortEvent{&coordinator_});
+        stalled_rounds_ = 0;
+    }
     return plan;
 }
 
@@ -661,9 +730,10 @@ void Scheduler::trackStalledRounds(std::size_t num_live_requests, bool plan_is_e
         spdlog::warn(
             "[Scheduler] no work scheduled for {} consecutive rounds with {} live requests and nothing in flight "
             "(waiting={}, prefilling={}, decoding={}; device LCM blocks active={}, empty={}, total={}); "
-            "they cannot progress until a request is aborted",
+            "they cannot progress until a request is aborted (on the fused role a lone request is aborted after {} "
+            "such plans)",
             stalled_rounds_, num_live_requests, WaitingSize(), PrefillSize(), DecodingSize(), ActiveLcmBlocks(),
-            EmptyLcmBlocks(), coordinator_.TotalLcmBlocks());
+            EmptyLcmBlocks(), coordinator_.TotalLcmBlocks(), kNoProgressAbortPlans);
     }
 }
 

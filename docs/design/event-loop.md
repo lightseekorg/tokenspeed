@@ -794,6 +794,13 @@ synchronous transport call before retiring. Client cancellation keeps the
 request's source ownership until that retirement event. The retirement agreement
 is needed only in rounds with a terminal status.
 
+**PD output completion.** A prefill's computed finish is not its client's
+final output: the output waits for the transfer's result. A transfer failure
+must publish an abort even after computation finished, unless the client
+already cancelled its stream or a final output was sent. A pause abort still
+notifies the client; repeated transfer events do not repeat the final output.
+This output fence does not retire source pages.
+
 **PD cancellation.** Client aborts and `pause(abort)` cancel the tracked
 transfer as well as marking the request's output. A decode receiver sends a
 cancellation to every prefill target that could write its landing pages.
@@ -821,6 +828,18 @@ identities. A prefill cancellation that never learns a destination identity
 must retain its room tombstone until that peer exits, since an arbitrarily
 late manifest must not revive the transfer.
 
+These records include every prefill failure and bootstrap timeout, not just
+explicit client cancellation. There is currently no count or age limit:
+unbound records last for the prefill peer's lifetime, and bound records can
+last just as long when a healthy decode cache is never superseded. Sustained
+timeouts therefore grow metadata with the number of failed rooms, even after
+all associated jobs and network workers retire. Request timeout bounds do not
+bound this memory. An age or size eviction would allow a delayed manifest to
+revive an ended room; the wire has no enforced message lifetime or retired
+attempt epoch to reject it. Bounded retention needs such a protocol guarantee
+(or a fail-closed admission policy), rather than assuming that a multiple of
+the bootstrap timeout rules out late messages.
+
 A native write error does not prove that its remote DMA stopped. The prefill
 peer marks that room uncertain and withholds cancellation acknowledgments even
 after its queued and executing calls return. Failure notices may still reach
@@ -835,9 +854,51 @@ pages are released. A timeout can trigger diagnostics or recovery but cannot
 authorize page reuse; the current protocol provides no forced retirement
 for an uncertain room.
 
-**PD** (`pd`, `ts-pd`). Requests register with the transfer peer at
-admission, and every round the replica agrees on which transfers changed
-state; their scheduler events join the round's tail feedback, and a failed
+**PD failure isolation.** Control messages use one bounded FIFO per destination
+endpoint. Connect and send each have a five-second deadline; a failed endpoint
+cannot hold another endpoint's registration, manifest or cancellation. An
+identical cancellation or status occupies at most one queued/in-flight entry.
+Queue refusal fails registration/manifest publication; partial publication
+still uses the cancellation fence. Cancellation polling retries refused or
+undelivered notifications. Network delivery itself remains best effort: a
+locally accepted message is not a remote acknowledgment. A connect or send
+failure discards that endpoint's queued backlog and retires its task; it does
+not spend another I/O timeout on every queued message. Requests still use
+their failure/timeout and cancellation paths. After 60 seconds with no queued
+or in-flight message, even a healthy endpoint retires its socket, task and
+registry entry. The next send recreates them. Idle retirement and enqueue
+share a lock so a new message cannot be stranded on a closing FIFO; an old
+task's teardown cannot erase its replacement. Socket retirement does not
+retire cache identities, room tombstones or possible remote writes.
+
+Decode bootstrap lookups are serialized per bootstrap address, with independent
+workers for other addresses. Polling (including idle polls) and registration
+release a lost address's sender once its route is gone and no live request is
+still looking it up. The worker finishes any bounded in-flight HTTP call,
+skips terminal queued requests and exits; a later request creates another
+worker. A first lookup with no route yet keeps its worker so concurrent
+requests for that address stay serialized. Heartbeat failure counters expire
+with the routes too. Cache registration on prefill fences only the
+cache identities being replaced. A replacement waits off the control receive
+path for those native writes, while unrelated registrations and cancellations
+continue. Manifests for the replacement wait until it is installed; queued
+old writes recheck their identity before reaching native I/O. Synchronous data
+writes still use the configured transfer worker pool, and heartbeat probes are
+still sequential; these bounds do not provide native write cancellation or
+writer incarnation discovery.
+
+Bootstrap timeout and other prefill failures retain the same terminal room
+record as explicit cancellation. A late manifest is rejected immediately,
+without another unclaimed timeout. Before manifest publication, decode bounds
+bootstrap and scheduler admission waiting by `waiting_timeout`. Publication
+starts a separate receive budget of the same duration. These phase budgets do
+not constitute an upstream end-to-end deadline. Before publication a failed
+receiver retires locally and notifies known targets; after publication it must
+obtain the normal retirement acknowledgments.
+
+**PD** (`pd`, `ts-pd`). Requests register with the transfer peer when submitted
+to the scheduler, before cache admission. Every round the replica agrees on
+which transfers changed state; their scheduler events join the round's tail feedback, and a failed
 transfer aborts its request on every rank together. A peer keeps state only
 for the rooms of requests the loop tracks (a sleep waits for those alone),
 with one exception on the prefill side: a room the decode node pre-allocated
@@ -951,20 +1012,28 @@ For orientation, one `EventLoop::round`:
    as another group's copy destination, which the arena writes only after
    every pair reading those byte ranges; a destination is never zeroed;
    no op id, no ACK), then
-   page zeroing (the new owner's sanitization), then the Device-bound copies
-   -- `LoadBackOp` and `RestoreOp`, ordered behind the zeroing: a load-back
-   lands on zeroed pages and the forward reads it layer by layer behind the
-   layerwise fences (a prefill graph replay waits for the whole load before
-   its first segment, which holds no fence), so the loads start first on the
-   load stream, and every plan, with cache ops or without, points the fences
-   at its own load or at none; a restore
+   page zeroing (the new owner's sanitization of the fresh pages nothing
+   fills whole: a copy destination and a block a remote landing fills are
+   left out), then the Device-bound copies
+   -- `LoadBackOp` and `RestoreOp`, ordered behind the zeroing and the
+   forwards in flight, which may still write a block an abort freed and this
+   plan granted (load-back destinations are never zeroed): the forward reads
+   a load-back layer by layer behind the
+   layerwise fences (a prefill graph replay waits on them before each
+   captured segment, which holds none, or, on a pool that does not declare
+   every access fenced, for the whole load instead), so the loads start first
+   on the load stream, and every plan, with cache ops or without, points
+   the fences at its own load or at none; a restore
    queues behind them, overwrites its destination blocks whole (the
    scheduler lists none of them for zeroing), reads both Host tiers under one
    event and arms no layerwise fence, its request being unschedulable until
    the ACK -- then the plan's remote streams to the transfer peer (a D-node
-   remote prefill waits on the zeroing fence inside its submission, which
-   the FIFO orders after the store fence), then the plan's batch to the
-   model. A store names the victim's request-pool slot, which the scheduler
+   remote prefill submits only its stream-ordered slot preparation here),
+   then the plan's batch to the model, then the D-node remote prefill's
+   pull, which waits on the zeroing fence before its CPU-issued RDMA
+   trigger. The zeroing orders behind the step in flight, so a pull queued
+   ahead of the batch would hold the batch's launch until that step ends. A
+   store names the victim's request-pool slot, which the scheduler
    freed in the same plan build: its next owner first writes it in a
    forward, and every forward is enqueued behind the store fence, so the
    slot-state export reads the victim's bytes; a restore names the resumed

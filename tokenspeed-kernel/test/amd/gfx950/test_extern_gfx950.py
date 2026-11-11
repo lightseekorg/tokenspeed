@@ -32,8 +32,8 @@ if not is_cdna4():
 from tokenspeed_kernel_amd._extern import (  # noqa: E402
     arithmetic_fence,
     extern_compile_options,
-    release_drain,
     sched_group,
+    wait_vmem,
     wave_all_equal,
     wave_uniform_i32,
 )
@@ -70,7 +70,7 @@ def _multi_library_probe(a, b, first_lane, all_equal, fenced):
     equal = wave_all_equal(x, gl.load(b + offset))
     gl.store(all_equal + offset, equal)
     gl.store(fenced + offset, arithmetic_fence(x) * 2.0)
-    release_drain()
+    wait_vmem()
 
 
 def test_one_kernel_links_several_libraries():

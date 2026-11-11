@@ -171,7 +171,7 @@ def test_attnres_capture_runs_at_owner_entry_across_pipeline_boundaries(
             is_first_pp_rank=stage == 0, is_last_pp_rank=stage == len(windows) - 1
         )
         projector = SimpleNamespace(
-            hidden_size=3,
+            projection_width=3,
             mapping=mapping,
             project_target_tap=lambda index, rows: rows,
             finalize_target_projection=lambda rows: rows,

@@ -52,6 +52,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 const NO_FINISH_LOG: FinishLog = FinishLog {
     enabled: false,
     request_stats: false,
+    ttft_percentage: 0,
 };
 
 /// (rid, input_length, extend_prefix_len, prefill_length)
@@ -401,6 +402,7 @@ fn bench_rounds(name: &str, shape: RoundShape) {
     });
     let config = LoopConfig {
         in_flight_depth: 1,
+        prefill_delay: None,
         limits: IngressLimits {
             vocab_size: 1 << 17,
             eos_token_ids: vec![2],
