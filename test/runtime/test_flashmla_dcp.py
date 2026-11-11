@@ -938,6 +938,31 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(
     assert (out == 7).all()
 
 
+@pytest.mark.parametrize(
+    ("kvp_group", "topk_lens"),
+    [((0,), torch.ones(1, dtype=torch.int32)), ((0, 1), None)],
+)
+def test_dsa_decode_refuses_an_owned_topk_off_a_sharded_cache_or_its_counts(
+    kvp_group, topk_lens
+):
+    from tokenspeed.runtime.layers.attention.backends.paged import dsa
+
+    # Owned slots are local cache slots; read as scheduler slots they would
+    # attend other pages.
+    backend = object.__new__(dsa.DSABackend)
+    backend.kvp_group = kvp_group
+    with pytest.raises(ValueError, match="owned decode top-k"):
+        backend.forward_sparse_decode(
+            q=torch.zeros(1, 2, 576, dtype=torch.bfloat16),
+            layer=None,
+            token_to_kv_pool=None,
+            bs=1,
+            topk_indices=torch.zeros(1, 2048, dtype=torch.int32),
+            topk_lens=topk_lens,
+            topk_owned=True,
+        )
+
+
 @pytest.mark.parametrize("rank", range(4))
 @pytest.mark.parametrize(
     "arm",
