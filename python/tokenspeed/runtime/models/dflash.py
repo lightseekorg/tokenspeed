@@ -329,8 +329,11 @@ class DFlashDraftModel(nn.Module, TargetCaptureConfigurator):
         The draft is listed under ``rl-bitwise``: it builds from the host's
         standard layers, owns no MoE, returns hidden states with
         ``next_token_logits=None`` (so the Megatron-order vocabulary fold is not
-        on its path), and reduces nothing of its own (``Mapping.replicated_for_draft``,
-        ``DFlash._replicate_head_over_attention_dp``). Three limits, none a
+        on its path), and under attention DP reduces nothing of its own
+        (``Mapping.for_block_draft``, ``DFlash._replicate_head_over_attention_dp``).
+        At attention DP 1 it keeps the target's dense layout, so its MLP
+        all-reduces each layer through the envelope's batch-invariant
+        collectives, as the target's ``down_proj`` does. Three limits, none a
         property of this class:
 
         * The teacher-forced trainer-dump comparison (``docs/design/numerics.md``,
