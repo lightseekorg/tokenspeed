@@ -168,6 +168,37 @@ def _bases(rows: int, next_qkvg: bool, *names: str) -> dict[str, int]:
     return {name: table[name] for name in names}
 
 
+@gluon.jit
+def _head(
+    mb,
+    task,
+    seq_len,
+    slot,
+    k_cache,
+    v_cache,
+    cos_sin,
+    proj_in,
+    ROPE: gl.constexpr,
+    OWN: gl.constexpr,
+):
+    """The head task ``task`` (:func:`attention.head_stage`)."""
+    attention.head_stage(
+        mb, task, seq_len, slot, k_cache, v_cache, cos_sin, proj_in, ROPE, OWN, "head"
+    )
+
+
+def _gate_halves(full: bool, rows: int, chain: int) -> int:
+    """Gate tasks a 16-row block (qkvg.stages). With one request a full
+    layer's attention has one task on every CTA (2 KV heads x FULL_SPLITS),
+    so gate's CTAs run their attention task only after their gate task:
+    two 8-row tasks a block on every CTA halve that wait. Otherwise gate
+    stays off the attention's CTAs, a task a block."""
+    one_task_a_cta = (
+        full and rows // chain * int(attention.KV_HEADS) * FULL_SPLITS == 256
+    )
+    return 2 if one_task_a_cta else 1
+
+
 def _exr_parts(rows: int, next_qkvg: bool) -> int:
     if rows == 1:
         return 1
@@ -254,7 +285,9 @@ def layer_plan(
     nq = next_qkvg
     stages = (
         (Stage("code", CODE_TASKS, 0),)
-        + qkvg.stages(_bases(rows, nq, "qkvg", "gate"), own_qkvg)
+        + qkvg.stages(
+            _bases(rows, nq, "qkvg", "gate"), own_qkvg, _gate_halves(full, rows, chain)
+        )
         + attention.stages(
             _bases(rows, nq, "head", "attn", "merge"), splits, rows, chain, own_qkvg
         )
@@ -460,24 +493,29 @@ def gluon_muse_spark_layer_gfx950(
         task, active = schedule.stage_task(PLAN, "qkvg")
         if active:
             qkvg.qkvg_stage(mb, task, w_qkvg, a_in, HIDDEN, "qkvg")
+    # With gate split over every CTA (_gate_halves) gate shares the head's
+    # CTAs. Without its own qkvg the head is ready at once and every
+    # attention task waits on it: it runs before gate. Otherwise (its own
+    # qkvg: the head waits on the projection, gate runs meanwhile; or gate
+    # off the head's CTAs) the head runs after gate.
+    HEAD_FIRST: gl.constexpr = (not OWN) and schedule.stage_tasks(PLAN, "gate") > int(
+        qkvg.KSPLIT * qkvg.GATE_BLOCKS
+    )
+    if HEAD_FIRST:
+        task, active = schedule.stage_task(PLAN, "head")
+        if active:
+            _head(
+                mb, task, seq_len, slot, k_cache, v_cache, cos_sin, proj_in, ROPE, OWN
+            )
     task, active = schedule.stage_task(PLAN, "gate")
     if active:
         qkvg.gate_stage(mb, task, w_qkvg, a_in, HIDDEN, "gate")
-    task, active = schedule.stage_task(PLAN, "head")
-    if active:
-        attention.head_stage(
-            mb,
-            task,
-            seq_len,
-            slot,
-            k_cache,
-            v_cache,
-            cos_sin,
-            proj_in,
-            ROPE,
-            OWN,
-            "head",
-        )
+    if not HEAD_FIRST:
+        task, active = schedule.stage_task(PLAN, "head")
+        if active:
+            _head(
+                mb, task, seq_len, slot, k_cache, v_cache, cos_sin, proj_in, ROPE, OWN
+            )
     # Several requests' attention tasks may outnumber the CTAs: rounds.
     G: gl.constexpr = schedule.grid(PLAN)
     attn_task, attn_rounds = schedule.stage_rounds(PLAN, "attn")
@@ -539,7 +577,7 @@ def gluon_muse_spark_layer_gfx950(
     union = moe_experts.union_of(ids)
     # Every CTA, outside the task branches: it ends in a barrier.
     slot_lds = moe_experts.cta_slots(PLAN, union)
-    pre1 = moe_experts.ex1_prefetch(PLAN, task1, active1, slot_lds, w13, s13_we)
+    pre1 = moe_experts.ex1_prefetch(PLAN, task1, active1, slot_lds, union, w13, s13_we)
     a1 = moe_experts.ex1_xq(mb, task1, active1, "ex1")
     if active1:
         moe_experts.ex1_finish(

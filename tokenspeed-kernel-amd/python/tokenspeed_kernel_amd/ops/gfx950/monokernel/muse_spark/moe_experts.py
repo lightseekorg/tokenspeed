@@ -887,22 +887,28 @@ B_TILE_BYTES = gl.constexpr(8192)  # 64 packed K x 128 columns
 
 
 @gluon.jit
-def ex1_prefetch(PLAN: gl.constexpr, task, active, table, w13, stride_we):
-    """Past 8 rows: copy the w13 B tiles (not the scales) of the lane's second
+def ex1_prefetch(PLAN: gl.constexpr, task, active, table, union, w13, stride_we):
+    """Past one row: copy the w13 B tiles (not the scales) of the lane's second
     slot for ex1 task ``task`` into LDS: 8 buffers, ``uint8 [8192]`` a K-tile,
     while the CTA waits on the routing chain for its A operand. Only the first
     slot's tiles are in flight then (in registers: a second there spills past 8
-    rows). ``table``: :func:`cta_slots`. Up to 8 rows nothing loads (a
-    placeholder).
+    rows). The slot's expert comes from ``table`` (:func:`cta_slots`) past 8
+    rows, else from ``union``. With one row a lane has one slot at most (8
+    picks over 8 lanes): nothing loads (a placeholder).
 
     The copies count in ``vmcnt`` in order, so :func:`ex1_xq`'s poll waits for
     them: by its return they have landed."""
-    if schedule.rows(PLAN) > 8:
+    R: gl.constexpr = schedule.rows(PLAN)
+    if R > 1:
         nw: gl.constexpr = gl.num_warps()
         KT: gl.constexpr = K_SLICE // 128
         blk = (task // KSPLIT) % NB1
         ks = task % KSPLIT
-        expert = lane_slot_expert(table[0], 1)
+        if R > 8:
+            expert = lane_slot_expert(table[0], 1)
+        else:
+            lane = task // (NB1 * KSPLIT)
+            expert = _slot_expert(union, lane + LANES)
         on = active & (expert >= 0)
         w_off = gl.maximum(expert, 0).to(gl.int64) * stride_we
         raw: gl.constexpr = gl.BlockedLayout([16], [64], [nw], [0])
@@ -1173,8 +1179,8 @@ def ex1_finish(
     (``tiles``, of the lane's first slot, ``expert``) and :func:`slots`
     (``union``): multiply and publish the FP32 partial sums, then the same
     for the lane's other slots. ``table``: past 8 rows, the CTA's
-    :func:`lane_slots`; ``pre``: past 8 rows, the second slot's B tiles in LDS
-    (:func:`ex1_prefetch`)."""
+    :func:`lane_slots`; ``pre``: past one row, the second slot's B tiles in
+    LDS (:func:`ex1_prefetch`)."""
     lane = task // (NB1 * KSPLIT)
     count = union[3]
     R: gl.constexpr = schedule.rows(mb.plan)
@@ -1230,6 +1236,62 @@ def ex1_finish(
                 stride_snb,
             )
             _ex1_slot_picked(mb, task, a, tiles, picks_smem.index(k))
+    elif R > 1:
+        # Slot 1's B tiles landed in LDS during the A poll (ex1_prefetch), so
+        # the wait is free; its scales load here, and slot 2's tiles go out
+        # into registers before slot 0's product. Every CTA's waves see the
+        # copies after the barrier.
+        cdna4_async_copy.wait_group(0)
+        gl.barrier()
+        blk = (task // KSPLIT) % NB1
+        ks = task % KSPLIT
+        following = _slot_expert(union, lane + 2 * LANES)
+        more = ex1_issue(
+            task,
+            True,
+            following,
+            w13,
+            w13s,
+            stride_we,
+            stride_se,
+            stride_slin,
+            stride_snb,
+        )
+        _ex1_slot(mb, task, a, tiles, union, expert)
+        if lane + LANES < count:
+            # Slot 1's scales load after slot 0's product: not live across it.
+            expert1 = _slot_expert(union, lane + LANES)
+            second = _load_scales(
+                w13s,
+                expert1,
+                stride_se,
+                stride_slin,
+                stride_snb,
+                blk * BLOCK_N,
+                ks * (K_SLICE // 128),
+                K_SLICE // 128,
+            )
+            _ex1_slot(mb, task, a, _lds_b_tiles(pre, second), union, expert1)
+        for i in range(lane + 2 * LANES, count, LANES):
+            expert = following
+            tiles = more
+            following = _slot_expert(union, i + LANES)
+            more = ex1_issue(
+                task,
+                True,
+                following,
+                w13,
+                w13s,
+                stride_we,
+                stride_se,
+                stride_slin,
+                stride_snb,
+            )
+            _ex1_slot(mb, task, a, tiles, union, expert)
+        # One row: one slot a lane (8 picks over 8 lanes). Each slot's loads
+        # go out before the previous slot's product; the loop never runs, yet
+        # this form schedules faster than one without it (a backend schedule
+        # effect).
     else:
         # Each slot's loads go out before the previous slot's product. With
         # one row the loop never runs; it stays there too, since the backend

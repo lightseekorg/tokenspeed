@@ -107,7 +107,7 @@ def experts_kernel(
     )
     union = moe_experts.union_of(ids)
     table = moe_experts.cta_slots(PLAN, union)
-    pre1 = moe_experts.ex1_prefetch(PLAN, task1, active1, table, w13, s13_we)
+    pre1 = moe_experts.ex1_prefetch(PLAN, task1, active1, table, union, w13, s13_we)
     a1 = moe_experts.ex1_xq(mb, task1, active1, "ex1")
     if active1:
         moe_experts.ex1_finish(

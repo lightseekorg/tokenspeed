@@ -151,6 +151,44 @@ def load_row_major_tiles(
 
 
 @gluon.jit
+def load_weight_half_tiles(
+    w, nb, K: gl.constexpr, kit0, KITS: gl.constexpr, SPLIT: gl.constexpr, half
+):
+    """:func:`load_weight_tiles` of one 16-row block ``nb`` (``NW`` 1,
+    ``GROUP`` 1) that loads only its rows ``8 half .. 8 half + 7``: half
+    the bytes. The other rows' lanes load nothing (their values are 0). A
+    row's values, and so its sum in :func:`gemv`, are exactly those of the
+    whole-block load.
+
+    Returns:
+        One ``[SPLIT, 32, 16]`` B tile per chain step.
+    """
+    gl.static_assert(K % 32 == 0 and KITS % SPLIT == 0 and KITS <= K // 32)
+    bl: gl.constexpr = b_layout(SPLIT, 1)
+    s = gl.arange(0, SPLIT, gl.SliceLayout(1, gl.SliceLayout(2, bl)))
+    k = gl.arange(0, 32, gl.SliceLayout(0, gl.SliceLayout(2, bl)))
+    n = gl.arange(0, 16, gl.SliceLayout(0, gl.SliceLayout(1, bl)))
+    # As load_weight_tiles: lane g * 16 + n reads values 128 g + 8 n .. of
+    # the block's 512 values a k-iteration; rows 8 half .. are 128 bytes of
+    # each 256-byte run.
+    lane = ((k // 8) * 128 + k % 8)[None, :, None] + (n * 8)[None, None, :]
+    offset = (nb * (K // 32) + (kit0 + s)[:, None, None]) * 512 + lane
+    mine = (
+        ((n // 8) == half)[None, None, :]
+        & (s >= 0)[:, None, None]
+        & (k >= 0)[None, :, None]
+    )
+    tiles = ()
+    for i in gl.static_range(KITS // SPLIT):
+        tiles += (
+            cdna4.buffer_load(
+                w, offset + i * SPLIT * 512, mask=mine, other=0.0, cache=".cg"
+            ),
+        )
+    return tiles
+
+
+@gluon.jit
 def gemv(x_smem, tiles, FIRST: gl.constexpr, ROWS: gl.constexpr):
     """Activation rows times the loaded weight tiles.
 
