@@ -4971,25 +4971,6 @@ def triton_dsv41_verify_layout(
 ):
     bs, draft = scores.shape
     block = triton.next_power_of_2(bs * (draft + 1))
-    if (
-        scores.stride(1) != 1
-        or (latest_scores is not None and latest_scores.stride(1) != 1)
-        or block > 4096
-    ):
-        from tokenspeed_kernel.ops.attention.dsv41.portable_torch import (
-            torch_dsv41_verify_layout,
-        )
-
-        return torch_dsv41_verify_layout(
-            scores,
-            query_capacity,
-            rows_out,
-            indptr_out,
-            counts_out,
-            valid_out,
-            latest_scores=latest_scores,
-            request_slots=request_slots,
-        )
     _verify_layout_kernel[(1,)](
         scores,
         latest_scores,

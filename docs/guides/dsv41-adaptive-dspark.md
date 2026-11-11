@@ -76,5 +76,8 @@ prefix. Under attention DP, the same kernel gathers the latest GPU confidence
 by request slot, using historical scores for non-finite rows.
 
 This does not change the host budget policy or token acceptance checks.
-The portable PyTorch implementation remains the CPU reference and the fallback
-for non-unit column strides or layouts exceeding the single-program size limit.
+Allocation requires GPU scores with unit column stride and
+`local_batch_size * (draft_width + 1) <= 4096`. Unsupported inputs raise an
+error instead of falling back to PyTorch. With five draft tokens this supports
+up to 682 requests per attention rank; serving and CUDA Graph limits still
+apply. The PyTorch reference is retained only in kernel tests.

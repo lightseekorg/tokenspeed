@@ -23,6 +23,48 @@ import torch
 from tokenspeed_kernel.ops.attention.dsv41 import verify_layout
 
 
+def reference_layout(
+    scores,
+    query_capacity,
+    rows_out,
+    indptr_out,
+    counts_out,
+    valid_out,
+    latest_scores=None,
+    request_slots=None,
+):
+    if latest_scores is not None:
+        latest = latest_scores.index_select(0, request_slots)
+        scores = torch.where(
+            torch.isfinite(latest).all(dim=1, keepdim=True), latest, scores
+        )
+    batch_size, draft_width = scores.shape
+    width = draft_width + 1
+    finite = torch.isfinite(scores).all(dim=1)
+    survival = torch.sigmoid(scores.clamp(-60, 60)).cumprod(dim=1)
+    gains = torch.where(
+        finite[:, None], survival, torch.full_like(survival, float("inf"))
+    ).flatten()
+    # Stable ties preserve a prefix within each request, including underflowed
+    # probabilities and unknown-score rows requiring their complete draft.
+    order = torch.argsort(gains, descending=True, stable=True)
+    extra = torch.zeros_like(gains, dtype=torch.int64)
+    extra.scatter_(0, order[: query_capacity - batch_size], 1)
+    counts = 1 + extra.reshape(batch_size, draft_width).sum(dim=1)
+    valid = (~finite).sum() * draft_width <= query_capacity - batch_size
+    counts = torch.where(valid, counts, torch.ones_like(counts))
+    indptr = torch.cat((counts.new_zeros(1), counts.cumsum(0)))
+    positions = torch.arange(query_capacity, device=scores.device, dtype=torch.int64)
+    owners = torch.searchsorted(indptr[1:], positions, right=True).clamp_max(
+        batch_size - 1
+    )
+    rows = owners * width + positions - indptr[owners]
+    rows_out.copy_(torch.where(positions < indptr[-1], rows, torch.zeros_like(rows)))
+    indptr_out.copy_(indptr)
+    counts_out.copy_(counts)
+    valid_out.copy_(valid)
+
+
 def outputs(scores, capacity):
     bs = scores.shape[0]
     return dict(
@@ -33,16 +75,14 @@ def outputs(scores, capacity):
     )
 
 
-@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 @pytest.mark.parametrize(
     "bs,draft_width,extra", [(1, 5, 0), (4, 3, 5), (32, 5, 120), (128, 5, 640)]
 )
-def test_layout_matches_stable_prefix_reference(device, bs, draft_width, extra):
-    if device == "cuda" and not torch.cuda.is_available():
-        pytest.skip("CUDA unavailable")
+def test_layout_matches_stable_prefix_reference(bs, draft_width, extra):
     scores = torch.randn(
         bs, draft_width, generator=torch.Generator().manual_seed(42)
-    ).to(device)
+    ).to("cuda")
     capacity = bs + extra
     out = outputs(scores, capacity)
     verify_layout(scores, query_capacity=capacity, **out)
@@ -65,8 +105,9 @@ def test_layout_matches_stable_prefix_reference(device, bs, draft_width, extra):
     assert out["indptr_out"][-1].item() == capacity
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 def test_unknown_scores_require_full_prefix_and_ties_are_stable():
-    scores = torch.tensor([[float("nan"), 0.0], [0.0, 0.0]])
+    scores = torch.tensor([[float("nan"), 0.0], [0.0, 0.0]], device="cuda")
     out = outputs(scores, 4)
     verify_layout(scores, query_capacity=4, **out)
     assert out["valid_out"].item()
@@ -107,15 +148,8 @@ def test_graph_replay_reads_changed_scores_and_keeps_output_storage():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
-@pytest.mark.parametrize("bs", [1, 2, 4, 8, 16, 32, 64, 128, 256])
-def test_triton_layout_exactly_matches_torch(bs):
-    from tokenspeed_kernel.ops.attention.dsv41.portable_torch import (
-        torch_dsv41_verify_layout,
-    )
-    from tokenspeed_kernel.ops.attention.dsv41.triton import (
-        triton_dsv41_verify_layout,
-    )
-
+@pytest.mark.parametrize("bs", [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 682])
+def test_layout_matches_torch_reference(bs):
     for seed in range(8):
         scores = torch.randn(
             bs, 5, generator=torch.Generator().manual_seed(seed)
@@ -135,8 +169,8 @@ def test_triton_layout_exactly_matches_torch(bs):
         for capacity in sorted({bs, bs + 1, bs * 3, bs * 6 - 1, bs * 6}):
             expected = outputs(scores, capacity)
             actual = outputs(scores, capacity)
-            torch_dsv41_verify_layout(scores, capacity, **expected)
-            triton_dsv41_verify_layout(scores, capacity, **actual)
+            reference_layout(scores, capacity, **expected)
+            verify_layout(scores, query_capacity=capacity, **actual)
             for name in expected:
                 torch.testing.assert_close(actual[name], expected[name], atol=0, rtol=0)
 
@@ -162,9 +196,6 @@ def test_triton_layout_runtime_capacities_do_not_compile():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 def test_fused_latest_scores_replay_and_history_fallback():
-    from tokenspeed_kernel.ops.attention.dsv41.portable_torch import (
-        torch_dsv41_verify_layout,
-    )
 
     history = torch.randn(8, 5, device="cuda")
     latest = torch.randn(32, 5, device="cuda")
@@ -192,7 +223,7 @@ def test_fused_latest_scores_replay_and_history_fallback():
         slots.copy_(torch.randperm(32, device="cuda")[:8])
         graph.replay()
         expected = outputs(history, 24)
-        torch_dsv41_verify_layout(
+        reference_layout(
             history, 24, **expected, latest_scores=latest, request_slots=slots
         )
         for name in expected:
@@ -227,18 +258,25 @@ def test_latest_layout_runtime_shapes_do_not_compile():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
-@pytest.mark.parametrize("bs,strided", [(4, True), (700, False)])
-def test_layout_fallback_matches_reference(bs, strided):
-    from tokenspeed_kernel.ops.attention.dsv41.portable_torch import (
-        torch_dsv41_verify_layout,
-    )
-
-    scores = torch.randn(bs, 10 if strided else 5, device="cuda")
-    if strided:
+@pytest.mark.parametrize("case", ["scores_stride", "latest_stride", "capacity"])
+def test_unsupported_layout_rejected(case):
+    bs = 683 if case == "capacity" else 4
+    scores = torch.randn(bs, 10 if case == "scores_stride" else 5, device="cuda")
+    if case == "scores_stride":
         scores = scores[:, ::2]
-    capacity = bs * 3
-    actual, expected = outputs(scores, capacity), outputs(scores, capacity)
-    verify_layout(scores, query_capacity=capacity, **actual)
-    torch_dsv41_verify_layout(scores, capacity, **expected)
-    for name in expected:
-        torch.testing.assert_close(actual[name], expected[name], atol=0, rtol=0)
+    kwargs = {}
+    if case == "latest_stride":
+        kwargs = dict(
+            latest_scores=torch.randn(bs, 10, device="cuda")[:, ::2],
+            request_slots=torch.arange(bs, device="cuda"),
+        )
+    with pytest.raises(ValueError, match="unit column stride|4096"):
+        verify_layout(
+            scores, query_capacity=bs * 3, **outputs(scores, bs * 3), **kwargs
+        )
+
+
+def test_cpu_layout_rejected():
+    scores = torch.zeros(4, 5)
+    with pytest.raises(ValueError, match="GPU"):
+        verify_layout(scores, query_capacity=12, **outputs(scores, 12))

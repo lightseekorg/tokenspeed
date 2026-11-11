@@ -1628,7 +1628,6 @@ def history_pack(cache, table, visible_rows, *, virtual_block_count, degree, ran
 
 # Backend registration (side-effect imports)
 # isort: off
-import tokenspeed_kernel.ops.attention.dsv41.portable_torch  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsv41.triton  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsv41._triton.rope  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsv41._triton.kvp  # noqa: E402,F401
@@ -1791,6 +1790,8 @@ def verify_layout(
     every request receives an anchor. query_capacity is in [B,B*(D+1)].
     Int64 outputs are packed source rows [query_capacity], CSR [B+1] and
     counts [B]; valid_out is a scalar bool. Inputs and outputs share a device.
+    Requires GPU scores with unit column stride and B*(D+1) <= 4096.
+    Unsupported layouts raise ValueError.
     All outputs have stable caller-owned storage and no host readback is used.
     Optional latest_scores [slots,D] and request_slots [B] select current GPU
     confidence by request. A non-finite latest row uses the entire history row
@@ -1804,6 +1805,18 @@ def verify_layout(
     if scores.ndim != 2 or scores.dtype != torch.float32:
         raise ValueError("verification scores must be FP32 [batch, draft width]")
     bs, draft_width = scores.shape
+    if not scores.is_cuda:
+        raise ValueError("verification layout requires a CUDA or ROCm GPU")
+    if scores.stride(1) != 1 or (
+        latest_scores is not None
+        and latest_scores.ndim == 2
+        and latest_scores.stride(1) != 1
+    ):
+        raise ValueError("verification scores require unit column stride")
+    if bs * (draft_width + 1) > 4096:
+        raise ValueError(
+            "verification layout requires batch * (draft width + 1) <= 4096"
+        )
     if (
         bs < 1
         or draft_width < 1
@@ -1839,14 +1852,7 @@ def verify_layout(
             or not output.is_contiguous()
         ):
             raise ValueError("verification output storage does not match the budget")
-    if scores.is_cuda:
-        implementation = _kernel("verify_layout", scores)
-    else:
-        from tokenspeed_kernel.ops.attention.dsv41.portable_torch import (
-            torch_dsv41_verify_layout,
-        )
-
-        implementation = torch_dsv41_verify_layout
+    implementation = _kernel("verify_layout", scores)
     implementation(
         scores,
         query_capacity,
