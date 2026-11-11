@@ -91,6 +91,122 @@ def test_a_draft_replicates_its_mlp_only_under_attention_dp() -> None:
     assert _draft(tp, 16).mapping is tp
 
 
+def _embedding(vocab: int, hidden: int, table: torch.Tensor, rank, size):
+    """The target's embedding on one rank: vocab-sharded over ``size`` ranks,
+    or the whole table when ``size`` is None."""
+    from tokenspeed.runtime.layers.vocab_parallel_embedding import (
+        VocabParallelEmbedding,
+    )
+
+    if size is None:
+        embed = VocabParallelEmbedding(vocab, hidden, params_dtype=torch.bfloat16)
+    else:
+        embed = VocabParallelEmbedding(
+            vocab,
+            hidden,
+            params_dtype=torch.bfloat16,
+            tp_rank=rank,
+            tp_size=size,
+            tp_group=tuple(range(size)),
+        )
+    embed.weight_loader(embed.weight, table)
+    return embed
+
+
+VOCAB = 256
+# Small integers keep every sum exact in BF16.
+TABLE = torch.randint(
+    -3, 4, (VOCAB, 16), generator=torch.Generator().manual_seed(0)
+).bfloat16()
+
+
+def _check_first_layer_embeds(rank, world_size, port, embed_shards):
+    from tokenspeed.runtime.distributed.comm_ops import all_reduce
+    from tokenspeed.runtime.distributed.process_group_manager import (
+        process_group_manager as pg_manager,
+    )
+    from tokenspeed.runtime.execution.drafter.dflash import DFlash
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    device = torch.device("cuda", rank)
+    torch.cuda.set_device(device)
+    # Attention DP 1: the draft's dense group is every rank.
+    mapping = Mapping(rank=rank, world_size=world_size, attn_tp_size=world_size)
+    pg_manager.init_distributed(
+        mapping=mapping,
+        distributed_init_method=f"tcp://localhost:{port}",
+        backend="nccl",
+    )
+    pg_manager.init_process_group(mapping.dense.tp_group)
+    global_server_args_dict["mapping"] = mapping
+
+    drafter = DFlash.__new__(DFlash)
+    drafter.model = _draft(mapping, 16)
+    drafter.embed_tokens = _embedding(
+        VOCAB, 16, TABLE, rank, world_size if embed_shards else None
+    ).to(device)
+    drafter._first_layer_input = drafter._first_layer_input_mode()
+    ids = torch.tensor([0, 5, 37, 100, 255, 128, 64, 1], device=device)
+
+    # The first layer sums its input over the dense group, as here.
+    first_layer = all_reduce(
+        drafter._first_layer_embeds(ids).clone(), mapping.dense.tp_group
+    )
+    want = TABLE.to(device)[ids]
+    assert torch.equal(first_layer, want), (first_layer / want).nan_to_num().max()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU collective")
+@pytest.mark.parametrize("world_size", [2, 4, 8])
+@pytest.mark.parametrize("embed_shards", [True, False], ids=["sharded", "whole"])
+def test_the_first_layer_sums_to_one_embedding(world_size, embed_shards) -> None:
+    """At attention DP 1 the draft's first layer reduces its input over the
+    dense group, so that reduce must yield the embedding exactly once (not
+    once per rank), whether the target's embedding is vocab-sharded or
+    whole."""
+    if world_size > torch.cuda.device_count():
+        pytest.skip(f"Need {world_size} GPUs, have {torch.cuda.device_count()}")
+    error_dict = mp.Manager().dict()
+    mp.spawn(
+        _worker,
+        args=(
+            world_size,
+            _open_port(),
+            error_dict,
+            functools.partial(_check_first_layer_embeds, embed_shards=embed_shards),
+        ),
+        nprocs=world_size,
+        join=True,
+    )
+    if error_dict:
+        raise RuntimeError("\n".join(f"Rank {r}: {e}" for r, e in error_dict.items()))
+
+
+def test_a_replicated_draft_takes_the_whole_embedding() -> None:
+    """Under attention DP the draft's dense group is one rank, which reduces
+    nothing, so the lookup alone must hand it the whole embedding."""
+    from tokenspeed.runtime.execution.drafter.dflash import DFlash
+
+    mapping = Mapping(rank=1, world_size=4, attn_tp_size=1, attn_dp_size=4)
+    drafter = DFlash.__new__(DFlash)
+    drafter.model = _draft(mapping, 16)
+    drafter.embed_tokens = _embedding(VOCAB, 16, TABLE, 0, None)
+    drafter._first_layer_input = drafter._first_layer_input_mode()
+    ids = torch.tensor([3, 200, 17])
+    assert torch.equal(drafter._first_layer_embeds(ids), TABLE[ids])
+
+
+def test_an_embedding_sharded_over_another_group_is_refused() -> None:
+    from tokenspeed.runtime.execution.drafter.dflash import DFlash
+
+    mapping = Mapping(rank=0, world_size=8, attn_tp_size=8)
+    drafter = DFlash.__new__(DFlash)
+    drafter.model = _draft(mapping, 16)
+    drafter.embed_tokens = _embedding(VOCAB, 16, TABLE, 0, 4)
+    with pytest.raises(ValueError, match="not the embedding's shard group"):
+        drafter._first_layer_input_mode()
+
+
 def _bf16_steps_apart(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """How many representable BF16 values lie between a and b, elementwise."""
 
