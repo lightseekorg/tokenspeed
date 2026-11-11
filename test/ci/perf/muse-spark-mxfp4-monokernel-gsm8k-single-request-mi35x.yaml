@@ -81,6 +81,7 @@ perf:
     --model muse-spark
     --config muse-spark-mxfp4-dflash2-monokernel
     --num-prompts 128
+    --concurrency 1
     --max-tokens 2048
     --chat-template-kwargs '{"reasoning_effort": "low"}'
     --min-accuracy 0.88

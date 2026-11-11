@@ -19,6 +19,8 @@
 # SOFTWARE.
 
 import importlib.util
+import threading
+import time
 from pathlib import Path
 
 from pipeline import check_perf_reference, extract_perf_summary_rows
@@ -61,7 +63,7 @@ def test_summary_csv_passes_the_pipeline_perf_gate():
         bench.RequestResult(101, 0.0, 0.5, ""),  # 200 tok/s
         bench.RequestResult(41, 0.0, 0.1, ""),  # 400 tok/s
     ]
-    csv = bench.summary_csv("cfg", results, wall_s=1.0, num_gpus=2)
+    csv = bench.summary_csv("cfg", results, wall_s=1.0, num_gpus=2, concurrency=1)
     rows = extract_perf_summary_rows(f"log line\n{csv}\nmore log")
     assert rows == [
         {
@@ -78,3 +80,49 @@ def test_summary_csv_passes_the_pipeline_perf_gate():
     assert check_perf_reference(task, results_by_stage, ["perf"])["passed"]
     task = {"perf_reference": {1: [400, 70]}, "perf_threshold": 0.9}
     assert not check_perf_reference(task, results_by_stage, ["perf"])["passed"]
+
+
+def _recording_send(gate_at: int):
+    """A send that records how many requests are in flight. Each request holds
+    until ``gate_at`` are in flight together (or a short timeout), so a run
+    that never reaches that many shows it."""
+    lock = threading.Lock()
+    reached = threading.Event()
+    state = {"now": 0, "peak": 0}
+
+    def send(prompt: str):
+        with lock:
+            state["now"] += 1
+            state["peak"] = max(state["peak"], state["now"])
+            if state["now"] >= gate_at:
+                reached.set()
+        reached.wait(timeout=0.5)
+        time.sleep(0.01)
+        with lock:
+            state["now"] -= 1
+        return bench.RequestResult(len(prompt), 0.0, 1.0, prompt)
+
+    return send, state
+
+
+def test_requests_run_concurrency_at_a_time_in_prompt_order():
+    prompts = [f"q{i}" * (i + 1) for i in range(7)]
+    send, state = _recording_send(gate_at=2)
+    results = bench.run_requests(prompts, 2, send)
+    assert [r.text for r in results] == prompts
+    assert state["peak"] == 2
+
+    send, state = _recording_send(gate_at=2)
+    results = bench.run_requests(prompts, 1, send)
+    assert [r.text for r in results] == prompts
+    assert state["peak"] == 1
+
+
+def test_summary_csv_reports_the_concurrency_the_gate_keys_on():
+    results = [bench.RequestResult(101, 0.0, 0.5, "")]
+    csv = bench.summary_csv("cfg", results, wall_s=1.0, num_gpus=1, concurrency=2)
+    rows = extract_perf_summary_rows(csv)
+    assert rows[0]["Conc."] == "2"
+    results_by_stage = [{"stage": "perf", "perf_summary_rows": rows}]
+    task = {"perf_reference": {2: [180, 90]}, "perf_threshold": 0.9}
+    assert check_perf_reference(task, results_by_stage, ["perf"])["passed"]
