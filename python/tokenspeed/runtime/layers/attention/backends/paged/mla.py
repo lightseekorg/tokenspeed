@@ -36,6 +36,7 @@ from tokenspeed_kernel.ops.attention.mla import (
 from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (
     kvp_decode_visible_lengths,
 )
+from tokenspeed_kernel.ops.metadata import broadcast_block_lengths
 from tokenspeed_kernel.selection import KernelPlan, NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
@@ -248,7 +249,6 @@ class MLAAttnBackend(PagedAttentionBackend):
         self._query_block_decode: dict[tuple[int, int, bool], bool] = {}
         self._block_page_table_buf: torch.Tensor | None = None
         self._block_seq_lens_buf: torch.Tensor | None = None
-        self._block_causal_backoff: torch.Tensor | None = None
 
         self.kvp_group = tuple(config.kvp_group)
         self.kvp_rank = config.kvp_rank
@@ -445,7 +445,6 @@ class MLAAttnBackend(PagedAttentionBackend):
         self.chunked_prefill_metadata = None
         self._block_page_table_buf = None
         self._block_seq_lens_buf = None
-        self._block_causal_backoff = None
         self.kvp_block_granularity = None
         self.kvp_virtual_block_count = None
         self.dcp_metadata = None
@@ -619,20 +618,13 @@ class MLAAttnBackend(PagedAttentionBackend):
         self._block_seq_lens_buf = torch.zeros(
             max_bs, dtype=self.seq_lens_buf.dtype, device=self.seq_lens_buf.device
         )
-        expansion = max(self.block_decode_expansion, 1)
-        self._block_causal_backoff = torch.arange(
-            expansion - 1,
-            -1,
-            -1,
-            dtype=self.seq_lens_buf.dtype,
-            device=self.seq_lens_buf.device,
-        )
 
     def fill_block_decode_seq_lens(self, bs: int, block_seq_lens: torch.Tensor) -> None:
         """Broadcast, keeping the per-request row the query-axis fold reads.
 
         The drafter calls this inside the captured graph, so the row has to be
-        written there too rather than derived from the expanded view per layer.
+        written there too rather than derived from the expanded view per layer;
+        one launch writes both.
         """
         if self._dcp_causal_block:
             torch.clamp(
@@ -643,17 +635,18 @@ class MLAAttnBackend(PagedAttentionBackend):
             )
             return
         self._ensure_block_row_buffers(bs)
-        rows = self._block_seq_lens_buf[:bs]
-        torch.clamp(
-            block_seq_lens[:bs], self.spec_num_tokens, self.max_context_len, out=rows
-        )
         expansion = self.block_decode_expansion
-        expanded = self.decode_seq_lens_buffer[: bs * expansion].view(bs, expansion)
-        if self.draft_block_causal:
-            # rows >= spec_num_tokens = expansion, so every entry keeps >= 1 token.
-            torch.sub(rows.unsqueeze(1), self._block_causal_backoff, out=expanded)
-        else:
-            expanded.copy_(rows.unsqueeze(1))
+        broadcast_block_lengths(
+            block_seq_lens[:bs],
+            self.spec_num_tokens,
+            self.max_context_len,
+            # rows >= spec_num_tokens = expansion: a causal entry keeps >= 1 token.
+            causal=self.draft_block_causal,
+            rows_out=self._block_seq_lens_buf[:bs],
+            entries_out=self.decode_seq_lens_buffer[: bs * expansion].view(
+                bs, expansion
+            ),
+        )
 
     def _decode_views(self, bs: int) -> MLADecodeMetadata:
         """Per-bs decode metadata views over the persistent buffers.
