@@ -104,3 +104,141 @@ def test_graph_replay_reads_changed_scores_and_keeps_output_storage():
         for name, value in out.items():
             torch.testing.assert_close(value, expected[name], atol=0, rtol=0)
     graph.reset()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+@pytest.mark.parametrize("bs", [1, 2, 4, 8, 16, 32, 64, 128, 256])
+def test_triton_layout_exactly_matches_torch(bs):
+    from tokenspeed_kernel.ops.attention.dsv41.portable_torch import (
+        torch_dsv41_verify_layout,
+    )
+    from tokenspeed_kernel.ops.attention.dsv41.triton import (
+        triton_dsv41_verify_layout,
+    )
+
+    for seed in range(8):
+        scores = torch.randn(
+            bs, 5, generator=torch.Generator().manual_seed(seed)
+        ).cuda()
+        if seed == 1:
+            scores.zero_()
+        elif seed == 2:
+            scores.fill_(-1000)
+        elif seed == 3:
+            scores[::2, 0] = float("nan")
+        elif seed == 4:
+            scores[::2, 1] = float("inf")
+        elif seed == 5:
+            scores.fill_(1000)
+        elif seed == 6:
+            scores[:, 1] = -60
+        for capacity in sorted({bs, bs + 1, bs * 3, bs * 6 - 1, bs * 6}):
+            expected = outputs(scores, capacity)
+            actual = outputs(scores, capacity)
+            torch_dsv41_verify_layout(scores, capacity, **expected)
+            triton_dsv41_verify_layout(scores, capacity, **actual)
+            for name in expected:
+                torch.testing.assert_close(actual[name], expected[name], atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+def test_triton_layout_runtime_capacities_do_not_compile():
+    from tokenspeed_kernel.ops.attention.dsv41.triton import (
+        _verify_layout_kernel,
+        triton_dsv41_verify_layout,
+    )
+    from utils import assert_no_triton_compile
+
+    scores = torch.randn(32, 5, device="cuda")
+    for capacity in [32, 128]:
+        triton_dsv41_verify_layout(scores, capacity, **outputs(scores, capacity))
+    with assert_no_triton_compile(_verify_layout_kernel):
+        for bs, capacity in [(32, 48), (32, 176), (24, 72), (25, 150)]:
+            current = scores[:bs]
+            out = outputs(current, capacity)
+            triton_dsv41_verify_layout(current, capacity, **out)
+            assert out["indptr_out"][-1].item() == capacity
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+def test_fused_latest_scores_replay_and_history_fallback():
+    from tokenspeed_kernel.ops.attention.dsv41.portable_torch import (
+        torch_dsv41_verify_layout,
+    )
+
+    history = torch.randn(8, 5, device="cuda")
+    latest = torch.randn(32, 5, device="cuda")
+    slots = torch.arange(8, dtype=torch.int64, device="cuda")
+    out = outputs(history, 24)
+
+    def run():
+        verify_layout(
+            history, query_capacity=24, latest_scores=latest, request_slots=slots, **out
+        )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            run()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        run()
+    for seed in range(8):
+        latest.normal_()
+        latest[::3, seed % 5] = float("nan")
+        history.normal_()
+        slots.copy_(torch.randperm(32, device="cuda")[:8])
+        graph.replay()
+        expected = outputs(history, 24)
+        torch_dsv41_verify_layout(
+            history, 24, **expected, latest_scores=latest, request_slots=slots
+        )
+        for name in expected:
+            torch.testing.assert_close(out[name], expected[name], atol=0, rtol=0)
+    graph.reset()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+def test_latest_layout_runtime_shapes_do_not_compile():
+    from tokenspeed_kernel.ops.attention.dsv41.triton import _verify_layout_kernel
+    from utils import assert_no_triton_compile
+
+    history = torch.randn(32, 5, device="cuda")
+    latest = torch.randn(128, 5, device="cuda")
+    slots = torch.arange(32, device="cuda")
+
+    def run(bs, capacity, table_rows):
+        out = outputs(history[:bs], capacity)
+        verify_layout(
+            history[:bs],
+            query_capacity=capacity,
+            latest_scores=latest[:table_rows],
+            request_slots=slots[:bs],
+            **out
+        )
+        assert out["indptr_out"][-1].item() == capacity
+
+    run(32, 128, 128)
+    with assert_no_triton_compile(_verify_layout_kernel):
+        run(24, 72, 64)
+        run(25, 100, 96)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+@pytest.mark.parametrize("bs,strided", [(4, True), (700, False)])
+def test_layout_fallback_matches_reference(bs, strided):
+    from tokenspeed_kernel.ops.attention.dsv41.portable_torch import (
+        torch_dsv41_verify_layout,
+    )
+
+    scores = torch.randn(bs, 10 if strided else 5, device="cuda")
+    if strided:
+        scores = scores[:, ::2]
+    capacity = bs * 3
+    actual, expected = outputs(scores, capacity), outputs(scores, capacity)
+    verify_layout(scores, query_capacity=capacity, **actual)
+    torch_dsv41_verify_layout(scores, capacity, **expected)
+    for name in expected:
+        torch.testing.assert_close(actual[name], expected[name], atol=0, rtol=0)

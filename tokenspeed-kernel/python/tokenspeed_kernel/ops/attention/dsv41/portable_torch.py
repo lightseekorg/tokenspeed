@@ -37,8 +37,20 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
     priority=Priority.PORTABLE,
 )
 def torch_dsv41_verify_layout(
-    scores, query_capacity, rows_out, indptr_out, counts_out, valid_out
+    scores,
+    query_capacity,
+    rows_out,
+    indptr_out,
+    counts_out,
+    valid_out,
+    latest_scores=None,
+    request_slots=None,
 ):
+    if latest_scores is not None:
+        latest = latest_scores.index_select(0, request_slots)
+        scores = torch.where(
+            torch.isfinite(latest).all(dim=1, keepdim=True), latest, scores
+        )
     batch_size, draft_width = scores.shape
     width = draft_width + 1
     finite = torch.isfinite(scores).all(dim=1)

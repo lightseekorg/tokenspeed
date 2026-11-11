@@ -538,25 +538,12 @@ class DeepseekV41DSpark(BaseDrafter):
             # Keep the pinned H2D source step-local; peers is CPU-only storage.
             buffers.packet.copy_(packet, non_blocking=True)
             history = buffers.packet[2:].view(batch_size, self.block_size)
-            # Capacity uses completed N-2 feedback. Allocation reads N-1
-            # predictions in current request order on the forward stream,
-            # before this round can overwrite them with its next draft.
-            slots = self.input_buffers.req_pool_indices_buf[:batch_size]
-            source = self._allocation_scores(slots, history)
+            # Capacity uses N-2 host feedback. The allocation graph reads
+            # N-1 GPU confidence in request order before the next draft writes.
             self.prepare_verify_budget_layout(
-                source, batch_size=batch_size, query_capacity=selected
+                history, batch_size=batch_size, query_capacity=selected
             )
         return selected
-
-    def _allocation_scores(
-        self, slots: torch.Tensor, history: torch.Tensor
-    ) -> torch.Tensor:
-        # Startup profiling and restored slots can lack a valid GPU prediction.
-        # Retain admitted history for those rows without a device readback.
-        latest = self.confidence_scores.index_select(0, slots)
-        return torch.where(
-            torch.isfinite(latest).all(dim=1, keepdim=True), latest, history
-        )
 
     def _prepare_calibrated_budget(self, *, actual_bs: int, padded_bs: int) -> int:
         full = padded_bs * self.spec_num_tokens
@@ -656,6 +643,16 @@ class DeepseekV41DSpark(BaseDrafter):
                     indptr_out=self._verify_indptr[: graph_bs + 1],
                     counts_out=buffers.counts,
                     valid_out=buffers.valid,
+                    latest_scores=(
+                        self.confidence_scores
+                        if self.draft_model.mapping.attn.dp_size > 1
+                        else None
+                    ),
+                    request_slots=(
+                        self.input_buffers.req_pool_indices_buf[:graph_bs]
+                        if self.draft_model.mapping.attn.dp_size > 1
+                        else None
+                    ),
                 )
 
             stream.wait_stream(torch.cuda.current_stream())

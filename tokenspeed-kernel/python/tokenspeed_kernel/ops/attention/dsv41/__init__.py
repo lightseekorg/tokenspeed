@@ -1782,6 +1782,8 @@ def verify_layout(
     indptr_out: torch.Tensor,
     counts_out: torch.Tensor,
     valid_out: torch.Tensor,
+    latest_scores: torch.Tensor | None = None,
+    request_slots: torch.Tensor | None = None,
 ) -> None:
     """Allocate a shared query budget to contiguous per-request prefixes.
 
@@ -1790,6 +1792,9 @@ def verify_layout(
     Int64 outputs are packed source rows [query_capacity], CSR [B+1] and
     counts [B]; valid_out is a scalar bool. Inputs and outputs share a device.
     All outputs have stable caller-owned storage and no host readback is used.
+    Optional latest_scores [slots,D] and request_slots [B] select current GPU
+    confidence by request. A non-finite latest row uses the entire history row
+    from scores. Supply both or neither; slot indices must address the table.
 
     Non-finite rows require full width. If the budget cannot cover them,
     valid_out is false and outputs describe anchor-only verification with
@@ -1806,6 +1811,21 @@ def verify_layout(
         or not bs <= query_capacity <= bs * (draft_width + 1)
     ):
         raise ValueError("invalid verification query capacity")
+    if (latest_scores is None) != (request_slots is None):
+        raise ValueError(
+            "latest confidence and request slots must be supplied together"
+        )
+    if latest_scores is not None and (
+        latest_scores.ndim != 2
+        or latest_scores.shape[1] != draft_width
+        or latest_scores.dtype != torch.float32
+        or latest_scores.device != scores.device
+        or request_slots.shape != (bs,)
+        or request_slots.dtype not in (torch.int32, torch.int64)
+        or request_slots.device != scores.device
+        or not request_slots.is_contiguous()
+    ):
+        raise ValueError("latest confidence must match the history and request slots")
     for output, shape, dtype in (
         (rows_out, (query_capacity,), torch.int64),
         (indptr_out, (bs + 1,), torch.int64),
@@ -1827,4 +1847,13 @@ def verify_layout(
         )
 
         implementation = torch_dsv41_verify_layout
-    implementation(scores, query_capacity, rows_out, indptr_out, counts_out, valid_out)
+    implementation(
+        scores,
+        query_capacity,
+        rows_out,
+        indptr_out,
+        counts_out,
+        valid_out,
+        latest_scores=latest_scores,
+        request_slots=request_slots,
+    )

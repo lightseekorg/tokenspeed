@@ -66,3 +66,15 @@ Cost profiling runs only at startup. Serving keeps asynchronous confidence
 feedback for budget selection, but does not collect or synchronize per-step
 timing samples. Weight reload invalidates costs and falls back to full
 verification until a new compatible startup profile is available.
+
+## Verification layout
+
+After the host selects a graph capacity, a captured Triton kernel converts
+confidence scores into per-request prefix lengths, packed row indices and CSR
+boundaries. Stable ties use request/token order so every selection remains a
+prefix. Under attention DP, the same kernel gathers the latest GPU confidence
+by request slot, using historical scores for non-finite rows.
+
+This does not change the host budget policy or token acceptance checks.
+The portable PyTorch implementation remains the CPU reference and the fallback
+for non-unit column strides or layouts exceeding the single-program size limit.
