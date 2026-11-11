@@ -1071,8 +1071,9 @@ impl TransferPeer for DecodePeer {
                         .rooms
                         .failure(receiver.room)
                         .map(str::to_owned);
-                    tracing::error!(
+                    tracing::warn!(
                         rid,
+                        room = receiver.room,
                         bootstrap_room = receiver.room,
                         rank = self.shared.engine_rank,
                         reason,

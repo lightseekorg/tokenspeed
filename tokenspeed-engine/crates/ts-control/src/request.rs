@@ -302,6 +302,7 @@ pub struct RequestState {
     pub first_token_time: f64,
     /// Its lifecycle timestamps, with `--enable-log-request-stats`.
     pub timings: Option<crate::request_stats::RequestTimings>,
+    /// Sampled PD timings, consumed at the first output or terminal release.
     pub(crate) ttft: Option<Box<crate::request_stats::TtftTrace>>,
     /// The matcher of its grammar, once compiled.
     pub grammar: Option<RequestGrammar>,

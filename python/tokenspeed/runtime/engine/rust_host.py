@@ -295,8 +295,8 @@ def start_rust_host(
         "TS_HOST_LOG",
         {
             "warning": "warn",
-            "critical": "off",
-            "fatal": "off",
+            "critical": "error",
+            "fatal": "error",
             "notset": "trace",
         }.get(level, level),
     )

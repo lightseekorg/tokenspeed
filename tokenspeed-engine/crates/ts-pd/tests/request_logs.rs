@@ -65,10 +65,34 @@ fn transfer_events_identify_the_request_and_room() {
         .filter(|line| line.contains("event=ts_"))
         .collect();
     assert_eq!(events.len(), 3, "{log}");
-    assert!(events[0].contains("event=ts_prefill_kv_transfer_queued rid=\"ok\" bootstrap_room=40"));
-    assert!(events[0].contains("start_idx=0 end_idx=48 pages=3"));
-    assert!(events[1].contains("event=ts_decode_kv_transfer_success rid=\"ok\" bootstrap_room=40"));
-    assert!(events[1].contains("cached_tokens=0 output_tokens=1"));
-    assert!(events[2]
-        .contains("event=ts_decode_kv_transfer_failed rid=\"failed\" bootstrap_room=41 rank=0"));
+    let expected: &[&[&str]] = &[
+        &[
+            "event=ts_prefill_kv_transfer_queued",
+            "rid=\"ok\"",
+            "bootstrap_room=40",
+            "start_idx=0",
+            "end_idx=48",
+            "pages=3",
+        ],
+        &[
+            "event=ts_decode_kv_transfer_success",
+            "rid=\"ok\"",
+            "bootstrap_room=40",
+            "cached_tokens=0",
+            "output_tokens=1",
+        ],
+        &[
+            "WARN",
+            "event=ts_decode_kv_transfer_failed",
+            "rid=\"failed\"",
+            " room=41",
+            "bootstrap_room=41",
+            "rank=0",
+        ],
+    ];
+    for (line, fields) in events.iter().zip(expected) {
+        for field in *fields {
+            assert!(line.contains(field), "missing {field}: {line}");
+        }
+    }
 }

@@ -205,6 +205,8 @@ def test_the_launcher_hands_a_host_its_rank_and_hears_it_ready(
     [
         ("DEBUG", {}, ("debug", "debug")),
         ("WARNING", {}, ("warn", "warning")),
+        ("CRITICAL", {}, ("error", "critical")),
+        ("FATAL", {}, ("error", "critical")),
         (
             "error",
             {"TS_HOST_LOG": "ts_pd=debug", "SPDLOG_LEVEL": "off"},

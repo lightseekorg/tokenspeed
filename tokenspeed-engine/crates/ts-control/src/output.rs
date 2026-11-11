@@ -618,28 +618,27 @@ impl OutputProcessor {
             self.completion_tokens += state.output_ids.len() as u64;
             self.collect_request_latencies(state);
         }
-        if !self.finish_log.enabled {
-            return;
-        }
-        if let Some(timings) = &state.timings {
-            tracing::info!(
-                "{}",
-                request_stats::stats_line(
-                    rid,
-                    state,
-                    timings,
-                    wall_seconds(),
-                    self.spec_num_tokens
-                )
-            );
-        }
     }
 
     fn log_finished(&self, rid: &str, state: &RequestState) {
         if let Some(trace) = &state.ttft {
             trace.finish(rid, state);
         }
-        if self.finish_log.enabled {
+        if self.finish_log.enabled && tracing::enabled!(tracing::Level::INFO) {
+            let finished_at = wall_seconds();
+            let stats = state
+                .timings
+                .as_ref()
+                .filter(|_| self.finish_log.request_stats)
+                .map(|timings| {
+                    request_stats::stats_line(
+                        rid,
+                        state,
+                        timings,
+                        finished_at,
+                        self.spec_num_tokens,
+                    )
+                });
             tracing::info!(
                 rid,
                 role = ?self.role,
@@ -649,7 +648,8 @@ impl OutputProcessor {
                 abort_reason = state.finished_reason.as_ref().and_then(FinishReason::abort_message),
                 cached_tokens = state.cached_tokens,
                 e2e_latency_s = (state.created_time > 0.0)
-                    .then(|| (wall_seconds() - state.created_time).max(0.0)),
+                    .then(|| (finished_at - state.created_time).max(0.0)),
+                request_stats = stats.as_deref(),
                 "event=ts_request_finished"
             );
         }
@@ -1931,9 +1931,14 @@ mod tests {
                     processor.bootstrapped(rid);
                     if role == Role::Prefill {
                         processor.mark_scheduled(&[rid.into()]);
-                        processor
+                        let committed = processor
                             .commit(&batch(&[(rid, 2, 0, 2)], 1), None, &result(&[10], &[1]))
                             .unwrap();
+                        assert!(committed.outputs.is_empty());
+                        if rid == "kept" {
+                            let trace = processor.state(rid).unwrap().ttft.as_ref().unwrap();
+                            assert!(trace.transfer_done_ms.is_none());
+                        }
                         processor.finish_prefill(rid);
                     } else {
                         processor.remote_prefill_done(rid, 10, 1, None);
@@ -1961,6 +1966,8 @@ mod tests {
         }
         assert_eq!(summaries[0]["prefill_chunks"], 1);
         assert!(summaries[0]["phases_ms"]["prefill"].is_number());
+        assert!(summaries[0]["phases_ms"]["transfer_observe"].is_number());
+        assert!(summaries[0]["phases_ms"]["output_pack"].is_number());
         assert!(summaries[1]["phases_ms"]["output_after_landing"].is_number());
     }
 
