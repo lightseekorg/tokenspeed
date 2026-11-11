@@ -866,7 +866,7 @@ class ModelExecutor:
         if not self.sampling_backend.supports_tree_verify:
             raise NotImplementedError(
                 f"{type(self.sampling_backend).__name__} cannot verify draft trees; "
-                "use --sampling-backend greedy, triton or flashinfer"
+                "use --sampling-backend greedy, triton, flashinfer or sonic"
             )
         if self.draft_attn_backend is self.attn_backend:
             raise NotImplementedError(

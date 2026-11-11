@@ -106,6 +106,8 @@ class SamplingBackendConfig:
     # rejection sampling). Required to keep RNG out of the CUDA graph.
     max_bs: int = 1
     max_draft_tokens_per_req: int = 1
+    # Drafts verify as trees (``ServerArgs.speculative_draft_tree``): backends size and warm their tree verify.
+    draft_tree: bool = False
 
     # Sizing for backend-owned per-request state (e.g. token-count buffers
     # for penalties in FlashInferFullSamplingBackend). Indexed by req_pool_idx, not
@@ -151,6 +153,7 @@ class SamplingBackendConfig:
             ),
             max_bs=max_bs,
             max_draft_tokens_per_req=max(max_draft_tokens_per_req, 1),
+            draft_tree=server_args.speculative_draft_tree,
             max_req_pool_size=max_req_pool_size,
             vocab_size=vocab_size,
             device=device,
