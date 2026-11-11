@@ -193,6 +193,70 @@ def test_mla_draft_layers_build_windowed_mla_attention() -> None:
         assert layer.comm_manager is not None
 
 
+@_CUDA_ONLY
+def test_an_mla_draft_load_returns_every_parameter_it_loaded() -> None:
+    """The MLA draft's load_weights returns the names it loaded, as the GQA
+    draft's does, so the base loader records them."""
+    from transformers import PretrainedConfig
+
+    from tokenspeed.runtime.distributed.mapping import Mapping
+
+    config = PretrainedConfig(
+        vocab_size=64,
+        hidden_size=256,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        q_lora_rank=64,
+        kv_lora_rank=64,
+        qk_nope_head_dim=32,
+        qk_rope_head_dim=16,
+        v_head_dim=32,
+        rms_norm_eps=1e-6,
+        max_position_embeddings=4096,
+        rope_theta=10000.0,
+        layer_types=["sliding_attention", "full_attention"],
+        sliding_window=1024,
+        decode_monokernel=False,
+        dflash_config={
+            "attention_mode": "mla",
+            "block_size": 16,
+            "conv_group_size": 16,
+            "conv_kernel_size": 2,
+            "selector_rank": 8,
+            "selector_top_k": 4,
+            "target_layer_ids": [0],
+        },
+    )
+    with torch.device("cuda"):
+        model = DFlash2DraftModel(config, Mapping(rank=0, world_size=1))
+    params = dict(model.named_parameters())
+    # The checkpoint's names: gate_up_proj and the fused q_a / kv_a
+    # projection come as their halves.
+    weights: list[tuple[str, torch.Tensor]] = []
+    for name, param in params.items():
+        value = torch.randn_like(param)
+        if ".gate_up_proj." in name:
+            gate, up = value.chunk(2)
+            weights.append((name.replace("gate_up_proj", "gate_proj"), gate))
+            weights.append((name.replace("gate_up_proj", "up_proj"), up))
+        elif ".fused_qkv_a_proj_with_mqa." in name:
+            q_rows = int(config.q_lora_rank)
+            weights.append(
+                (name.replace("fused_qkv_a_proj_with_mqa", "q_a_proj"), value[:q_rows])
+            )
+            weights.append(
+                (
+                    name.replace("fused_qkv_a_proj_with_mqa", "kv_a_proj_with_mqa"),
+                    value[q_rows:],
+                )
+            )
+        else:
+            weights.append((name, value))
+
+    assert model.load_weights(weights) == set(params)
+
+
 @pytest.mark.parametrize(
     ("attention_config", "expected_sliding_window"),
     (

@@ -722,7 +722,9 @@ class DFlash2DraftModel(DFlashDraftModel):
             enable_draft_monokernels(self)
         return loaded
 
-    def _load_mla_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
+    def _load_mla_weights(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> set[str]:
         params = dict(self.named_parameters())
         loaded: set[str] = set()
         unexpected: list[str] = []
@@ -790,6 +792,7 @@ class DFlash2DraftModel(DFlashDraftModel):
             )
         for layer in self.layers:
             absorb_mla_kv_b_proj(layer.self_attn)
+        return loaded
 
     @torch.no_grad()
     def forward(self, *args, input_embeds: torch.Tensor | None = None, **kwargs):
