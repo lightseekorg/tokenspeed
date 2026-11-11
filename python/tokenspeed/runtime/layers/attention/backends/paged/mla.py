@@ -27,11 +27,13 @@ from typing import TYPE_CHECKING
 import torch
 from tokenspeed_kernel.ops.attention.dsv4._triton.dcp import normalize_dcp_partials
 from tokenspeed_kernel.ops.attention.mla import (
+    mla_decode_query_rows,
     mla_decode_with_kvcache,
     mla_extend_with_kvcache,
     mla_prefill,
     mla_use_absorbed_extend,
     supports_mla_decode_query_blocks,
+    supports_mla_decode_query_rows,
 )
 from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (
     kvp_decode_visible_lengths,
@@ -246,6 +248,7 @@ class MLAAttnBackend(PagedAttentionBackend):
         self.forward_prefill_metadata: MLAPrefillMetadata | None = None
         self.chunked_prefill_metadata: MLAPrefillMetadata | None = None
         self._query_block_decode: dict[tuple[int, int, bool], bool] = {}
+        self._dcp_query_rows: dict[tuple[torch.dtype, int], bool] = {}
         self._block_page_table_buf: torch.Tensor | None = None
         self._block_seq_lens_buf: torch.Tensor | None = None
 
@@ -434,6 +437,30 @@ class MLAAttnBackend(PagedAttentionBackend):
                 f"(heads={num_q_heads:d}, block={q_len:d}, page="
                 f"{self.kernel_page_size:d}, dtype={self.data_type!s}, window="
                 f"{sliding_window!s}).",
+            )
+        return answer
+
+    def _takes_dcp_query_rows(self, q_dtype: torch.dtype, q_len: int) -> bool:
+        """Whether the DCP decode hands each request's gathered rows, with
+        their local lengths, to one query-row kernel instead of one folded
+        launch row per query and head group."""
+        key = (q_dtype, q_len)
+        answer = self._dcp_query_rows.get(key)
+        if answer is None:
+            answer = supports_mla_decode_query_rows(
+                q_dtype=q_dtype,
+                kv_dtype=self.data_type,
+                page_size=self.kernel_page_size,
+                q_len=q_len,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                return_lse=True,
+                solution=self.kernel_solution,
+            )
+            self._dcp_query_rows[key] = answer
+            logger.info(
+                f"MLA DCP decode uses {'query rows' if answer else 'folded rows'} "
+                f"(q_len={q_len:d}, q={q_dtype!s}, kv={self.data_type!s})."
             )
         return answer
 
@@ -941,27 +968,40 @@ class MLAAttnBackend(PagedAttentionBackend):
             q.view(-1, layer.tp_q_head_num, layer.head_dim), self.kvp_group
         )
         rows = query.shape[0]
-        query = query.reshape(rows * groups, 1, kernel_heads, layer.head_dim)
-        page_table = dcp.local_page_table.repeat_interleave(
-            q_len_per_req * groups, dim=0
-        )
         kv_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
         if self.data_type != kv_cache.dtype:
             kv_cache = kv_cache.to(self.data_type)
         kv_cache = kv_cache.view(-1, self.kernel_page_size, 1, self.kv_cache_dim)
-        output, lse = mla_decode_with_kvcache(
-            q=query,
-            kv_cache=kv_cache,
-            page_table=page_table,
-            cache_seqlens=cache_seqlens,
-            max_seqlen_k=self.max_context_len,
-            qk_nope_head_dim=self.qk_nope_head_dim,
-            kv_lora_rank=self.kv_lora_rank,
-            qk_rope_head_dim=self.qk_rope_head_dim,
-            softmax_scale=layer.scaling,
-            return_lse=True,
-            solution=self.kernel_solution,
-        )
+        if self._takes_dcp_query_rows(query.dtype, q_len_per_req):
+            # Every row of a request shares its KV reads, each row stopping at
+            # its own local length.
+            output, lse = mla_decode_query_rows(
+                query.reshape(bs, q_len_per_req, heads, layer.head_dim),
+                kv_cache,
+                dcp.local_page_table,
+                local_lengths.view(bs, q_len_per_req),
+                self.max_context_len,
+                layer.scaling,
+                kv_lora_rank=self.kv_lora_rank,
+                return_lse=True,
+                solution=self.kernel_solution,
+            )
+        else:
+            output, lse = mla_decode_with_kvcache(
+                q=query.reshape(rows * groups, 1, kernel_heads, layer.head_dim),
+                kv_cache=kv_cache,
+                page_table=dcp.local_page_table.repeat_interleave(
+                    q_len_per_req * groups, dim=0
+                ),
+                cache_seqlens=cache_seqlens,
+                max_seqlen_k=self.max_context_len,
+                qk_nope_head_dim=self.qk_nope_head_dim,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                softmax_scale=layer.scaling,
+                return_lse=True,
+                solution=self.kernel_solution,
+            )
         output, local_lse = normalize_dcp_partials(
             output.reshape(rows, heads, self.kv_lora_rank),
             lse.reshape(rows, heads),
