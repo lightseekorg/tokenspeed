@@ -2856,6 +2856,10 @@ candidate boundaries shorter than this request. The native matcher hashes each
 candidate from this request's actual input and considers it only within the
 ordinary replay/logprob cacheable bound. Hints are request-local, do not insert
 global tail metadata, do not limit an existing longer local hit, and confer no
-ownership or residency. Query/GET still requires all Full, State and window
+ownership or residency. Candidate enumeration skips boundaries that violate
+any State group's checkpoint granularity, including hinted tails and page
+boundaries inside a restricted segment. A hint cannot make an otherwise
+unusable State checkpoint eligible for an optimistic storage query.
+Query/GET still requires all Full, State and window
 objects; diverging prompts therefore cannot reuse a checkpoint solely because
 they share a group or boundary length.

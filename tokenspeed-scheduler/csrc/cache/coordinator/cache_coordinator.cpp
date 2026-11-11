@@ -842,8 +842,8 @@ void CacheCoordinator::forEachCandidateBoundary(const PromptPrefix& prompt, std:
             std::int32_t hashed_tail_tokens = 0;
             for (const TailTable::Tail& tail : candidates) {
                 const std::int32_t boundary = page_tokens + tail.tail_tokens;
-                if (boundary > from_tokens || boundary > prompt.max_tokens || boundary <= floor_tokens ||
-                    static_cast<std::size_t>(boundary) > prompt.tokens.size()) {
+                if (boundary % checkpoint_granularity_ != 0 || boundary > from_tokens || boundary > prompt.max_tokens ||
+                    boundary <= floor_tokens || static_cast<std::size_t>(boundary) > prompt.tokens.size()) {
                     continue;
                 }
                 if (tail.tail_tokens != hashed_tail_tokens) {
@@ -860,7 +860,7 @@ void CacheCoordinator::forEachCandidateBoundary(const PromptPrefix& prompt, std:
                 }
             }
         }
-        if (page_tokens > floor_tokens && page_tokens <= from_tokens) {
+        if (page_tokens > floor_tokens && page_tokens <= from_tokens && page_tokens % checkpoint_granularity_ == 0) {
             if (!visit(page_tokens, 0, ContentHash{})) {
                 return;
             }

@@ -200,6 +200,29 @@ TEST(SharedPrefixPublicationTest, RespectsRestrictedCheckpointGeometry) {
     EXPECT_EQ(cache.coordinator.SharedPrefixKeys(prompt.Prefix(8, false), 256).max_tokens, 8);
 }
 
+TEST(SharedPrefixPublicationTest, RestrictedStateHintsSkipUnalignedCandidates) {
+    for (const std::int32_t checkpoint_grain : {4, 8}) {
+        SCOPED_TRACE(checkpoint_grain);
+        auto specs = FullAndStates(4, 2, 2);
+        specs.back().checkpoint_granularity = checkpoint_grain;
+        QueryCache cache(4, specs, 64);
+        const QueryPrompt prompt(13, 4);
+        auto prefix = prompt.Prefix(12, false);
+        const auto without_hints = cache.coordinator.MissingStorageKeys(prefix, 256);
+        // Seven passes ingress validation but cannot name a restricted State.
+        // A larger State grain also rejects otherwise valid page boundaries.
+        const std::array<std::int32_t, 4> hints{3, 7, 8, 11};
+        prefix.shared_prefix_tokens = hints;
+        const auto query = cache.coordinator.MissingStorageKeys(prefix, 256);
+        EXPECT_EQ(query.max_tokens, 12 / checkpoint_grain * checkpoint_grain);
+        EXPECT_EQ(query.max_tokens, without_hints.max_tokens);
+        EXPECT_EQ(query.keys, without_hints.keys);
+        EXPECT_EQ(cache.coordinator.ProbePromptPrefix(prefix).host.num_common_tokens, 0);
+        cache.Restore(prefix, query.keys);
+        EXPECT_EQ(cache.coordinator.ProbePromptPrefix(prefix).host.num_common_tokens, query.max_tokens);
+    }
+}
+
 TEST(SharedPrefixPublicationTest, OnlySuccessfulRetiredPutsCreateReceiptsAndFlushClearsThem) {
     QueryCache cache(4, FullAndStates(4, 4, 0), 16);
     const QueryPrompt prompt(8, 4);
