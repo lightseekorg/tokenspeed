@@ -1459,6 +1459,29 @@ def test_gfx950_k3_decode_split_policy() -> None:
     )
 
 
+def test_gfx950_folded_drafter_decode_split_policy() -> None:
+    """Fill three waves when a long-context drafter folds rows onto the batch."""
+    if not current_platform().is_cdna4:
+        pytest.skip("BF16-Q FP8-KV MLA split policy targets CDNA4")
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mla.decode import (
+        _select_num_kv_splits_bh16bn128,
+    )
+
+    def select(batch: int, max_seqlen_k: int = 262_144) -> int:
+        return _select_num_kv_splits_bh16bn128(
+            batch=batch, max_seqlen_k=max_seqlen_k, block_n=128
+        )
+
+    # DSpark at KVP8: 4 block positions x 6 head groups per request.
+    assert [select(24 * bs) for bs in (1, 2, 4, 8, 16)] == [32, 16, 8, 4, 2]
+    # EAGLE3 at KVP8: 4 head groups per request.
+    assert [select(4 * bs) for bs in (2, 4, 8, 16)] == [32, 32, 16, 8]
+    assert select(4) == 32
+    assert select(1024) == 1
+    # A 16K-capacity server keeps the half-wave target.
+    assert select(64, 16_384) == 2
+
+
 # Real MLA widths: the fast windowed kernel is registered for these alone.
 _QUERY_BLOCK_DIMS = dict(kv_lora_rank=512, qk_rope_head_dim=64, qk_nope_head_dim=128)
 
