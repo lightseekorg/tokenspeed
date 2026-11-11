@@ -32,6 +32,18 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
 )
 
 
+def profile_decode_context(
+    context_length: int, *, max_positions: int, verify_width: int, draft_width: int
+) -> int:
+    """Leave room for the draft following a fully accepted target block."""
+    if min(context_length, max_positions, verify_width, draft_width) < 1:
+        raise ValueError("profiling dimensions must be positive")
+    context = min(context_length, max_positions - draft_width)
+    if context < verify_width:
+        raise ValueError("position capacity cannot fit target verification and draft")
+    return context
+
+
 @dataclass(frozen=True)
 class ProfileCacheGroup:
     group_id: str
@@ -238,12 +250,23 @@ def profile_dsv41_startup(executor) -> None:
                 ):
                     lower = context + 1
                     continue
+                # A full step drafts beyond the last accepted target position.
+                # At the model limit, measure just below the endpoint rather than
+                # indexing outside RoPE; the calibration interval stays unchanged.
+                measured_context = profile_decode_context(
+                    context,
+                    max_positions=min(
+                        maximum, int(drafter.model.config.max_position_embeddings)
+                    ),
+                    verify_width=width,
+                    draft_width=drafter.block_size,
+                )
                 plan = plan_profile_cache(
                     arena.cache_group_specs,
                     virtual_packing=arena.runtime_contract.virtual_packing,
                     page_counts=arena.cache_group_page_counts,
                     batch_size=bs,
-                    context_length=context,
+                    context_length=measured_context,
                     verify_width=width,
                     overlap_schedule_depth=runner.overlap_schedule_depth,
                 )
@@ -305,7 +328,8 @@ def profile_dsv41_startup(executor) -> None:
                             feedback.publish(
                                 feedback.snapshot(),
                                 [[0.0] * (width - 1)] * bs,
-                                context_lengths=[max(1, context - 2 * width)] * bs,
+                                context_lengths=[max(1, measured_context - 2 * width)]
+                                * bs,
                             )
                         drafter.verify_feedback = feedback
                         for q in reversed(capacities):
@@ -335,12 +359,16 @@ def profile_dsv41_startup(executor) -> None:
                                 )
                                 ib.positions_buf[: bs * width].copy_(
                                     torch.arange(
-                                        context - width, context, device=device
+                                        measured_context - width,
+                                        measured_context,
+                                        device=device,
                                     ).repeat(bs)
                                 )
-                                ib.seq_lens_buf[:bs].fill_(context)
+                                ib.seq_lens_buf[:bs].fill_(measured_context)
                                 states = executor.runtime_states
-                                states.valid_cache_lengths[:bs].fill_(context - width)
+                                states.valid_cache_lengths[:bs].fill_(
+                                    measured_context - width
+                                )
                                 states.spec_candidates_ready[:bs].fill_(True)
                                 states.stopped[:bs].zero_()
                                 states.stop_token_ids[:bs].fill_(-1)
@@ -420,7 +448,8 @@ def profile_dsv41_startup(executor) -> None:
                 if drafter._verification_rank == 0:
                     logger.info(
                         f"Adaptive DSpark startup profile complete: local_bs={bs}, "
-                        f"context=[{lower}, {context}], full_ms={profile.native_step_ms:.3f}, "
+                        f"context=[{lower}, {context}], measured_context={measured_context}, "
+                        f"full_ms={profile.native_step_ms:.3f}, "
                         f"adaptive_ms={dict(profile.adaptive_step_ms)}"
                     )
                 lower = context + 1

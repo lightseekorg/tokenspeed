@@ -1783,6 +1783,7 @@ def verify_layout(
     valid_out: torch.Tensor,
     latest_scores: torch.Tensor | None = None,
     request_slots: torch.Tensor | None = None,
+    active_count: torch.Tensor | None = None,
 ) -> None:
     """Allocate a shared query budget to contiguous per-request prefixes.
 
@@ -1796,6 +1797,10 @@ def verify_layout(
     Optional latest_scores [slots,D] and request_slots [B] select current GPU
     confidence by request. A non-finite latest row uses the entire history row
     from scores. Supply both or neither; slot indices must address the table.
+
+    active_count optionally holds the live prefix length in a device scalar.
+    Its value must be in [0,B]. Padding retains one anchor but receives no draft
+    allocation; the caller masks its state writes and discards its output.
 
     Non-finite rows require full width. If the budget cannot cover them,
     valid_out is false and outputs describe anchor-only verification with
@@ -1839,6 +1844,12 @@ def verify_layout(
         or not request_slots.is_contiguous()
     ):
         raise ValueError("latest confidence must match the history and request slots")
+    if active_count is not None and (
+        active_count.numel() != 1
+        or active_count.dtype not in (torch.float32, torch.int32, torch.int64)
+        or active_count.device != scores.device
+    ):
+        raise ValueError("active count must be a device scalar")
     for output, shape, dtype in (
         (rows_out, (query_capacity,), torch.int64),
         (indptr_out, (bs + 1,), torch.int64),
@@ -1862,4 +1873,5 @@ def verify_layout(
         valid_out,
         latest_scores=latest_scores,
         request_slots=request_slots,
+        active_count=active_count,
     )

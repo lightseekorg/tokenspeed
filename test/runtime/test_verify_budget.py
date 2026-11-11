@@ -20,6 +20,7 @@
 
 """Verification budget decisions use native cost and actual batch occupancy."""
 
+import itertools
 import math
 
 import pytest
@@ -88,3 +89,114 @@ def test_generic_width_and_stable_extreme_scores():
 def test_invalid_cost_measurements(costs):
     with pytest.raises(ValueError):
         choose(policy(), [[0.0] * 5] * 2, costs=costs)
+
+
+def test_distributed_budget_uses_all_rank_rewards():
+    policy = VerifyBudgetPolicy(
+        enabled=True, min_batch_size=1, verify_width=3, min_gain=0.0
+    )
+    costs = dict(
+        graph_batch_size=1,
+        native_step_ms=3.0,
+        adaptive_step_ms={1: 1.1, 2: 2.1},
+        policy_ms=0.0,
+    )
+    high = [[20.0, 20.0]]
+    low = [[-20.0, -20.0]]
+    assert policy.select_distributed((high, [[math.nan, 0.0]]), **costs) == 3
+    assert policy.select(high, **costs) == 3
+    assert policy.select(low, **costs) == 1
+    assert policy.select_distributed((high, low), **costs) == 1
+    assert policy.select_distributed((low, high), **costs) == 1
+
+
+def test_distributed_budget_preserves_single_rank_selection():
+    policy = VerifyBudgetPolicy(
+        enabled=True, min_batch_size=1, verify_width=3, min_gain=0.02
+    )
+    scores = [[1.0, -0.5], [2.0, 0.0]]
+    costs = dict(
+        graph_batch_size=2,
+        native_step_ms=5.0,
+        adaptive_step_ms={2: 2.0, 4: 3.0},
+        policy_ms=0.1,
+    )
+    expected = policy.select(scores, **costs)
+    assert policy.select_distributed((scores,), **costs) == expected
+    assert policy.select_distributed((scores, scores), **costs) == expected
+
+
+@pytest.mark.parametrize("sizes", [(8, 7), (7, 7), (8, 6, 4, 2, 0, 0, 0, 0)])
+def test_distributed_budget_accepts_padding_and_idle_ranks(sizes):
+    policy = VerifyBudgetPolicy(
+        enabled=True, min_batch_size=4, verify_width=6, min_gain=0.02
+    )
+    scores = [[[-20.0] * 5 for _ in range(size)] for size in sizes]
+    assert (
+        policy.select_distributed(
+            scores,
+            graph_batch_size=8,
+            native_step_ms=8.0,
+            adaptive_step_ms={8: 2.0, 16: 3.0},
+            policy_ms=0.0,
+        )
+        == 8
+    )
+
+
+def test_distributed_budget_rejects_undersized_graph():
+    with pytest.raises(ValueError, match="cover every rank"):
+        policy().select_distributed(
+            ([[0.0] * 5] * 3, []),
+            graph_batch_size=2,
+            native_step_ms=3.0,
+            adaptive_step_ms={},
+            policy_ms=0.0,
+        )
+
+
+@pytest.mark.parametrize("sizes", [(2, 1), (1, 0), (2, 2), (0, 0)])
+def test_distributed_budget_matches_exhaustive_prefix_rewards(sizes):
+    policy = VerifyBudgetPolicy(
+        enabled=True, min_batch_size=1, verify_width=3, min_gain=0.02
+    )
+    ranks = [
+        [[float(rank - row), float(row - rank - 1)] for row in range(size)]
+        for rank, size in enumerate(sizes)
+    ]
+    physical_bs, full = 2, 6
+    costs = {2: 0.8, 3: 1.0, 4: 1.4, 5: 2.0}
+    native_ms, overhead = 2.5, 0.1
+
+    def reward(capacity):
+        total = 0.0
+        for rows in ranks:
+            prefixes = []
+            for row in rows:
+                p0, p1 = (1 / (1 + math.exp(-score)) for score in row)
+                prefixes.append((0.0, p0, p0 + p0 * p1))
+            # Padding keeps an anchor; only real rows can earn draft rewards.
+            best = max(
+                sum(prefixes[i][n] for i, n in enumerate(counts))
+                for counts in itertools.product(range(3), repeat=len(rows))
+                if sum(counts) <= capacity - physical_bs
+            )
+            total += len(rows) + best
+        return total
+
+    expected = full
+    best_rate = reward(full) / native_ms * (1 + policy.min_gain)
+    for capacity, cost in sorted(costs.items(), reverse=True):
+        rate = reward(capacity) / (cost + overhead)
+        if rate > best_rate:
+            expected, best_rate = capacity, rate
+    assert (
+        policy.select_distributed(
+            ranks,
+            graph_batch_size=physical_bs,
+            native_step_ms=native_ms,
+            adaptive_step_ms=costs,
+            policy_ms=overhead,
+        )
+        == expected
+    )

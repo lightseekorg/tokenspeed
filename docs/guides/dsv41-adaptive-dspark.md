@@ -1,83 +1,81 @@
 # Adaptive DSpark verification
 
-Enable DeepSeek V4.1 adaptive verification with:
+Adaptive verification selects a query budget using draft confidence and
+measured graph costs. It keeps the normal token acceptance checks and can use
+full verification when shortening is not beneficial.
+
+## Enable
+
+Add these options to a supported DeepSeek V4.1 DSpark deployment:
 
 ```bash
 --enable-dsv41-adaptive-dspark --dsv41-dspark-min-batch-size 4
 ```
 
-The minimum batch size is local to each attention rank, not submitted request
-concurrency. For example, balanced attention DP8 with 32 decoding requests has
-four requests per rank. This threshold permits adaptation; it does not guarantee
-that shortening verification improves performance.
+The threshold is the largest actual local batch among attention ranks, not client
+concurrency. For balanced DP8, C32 gives local BS4. For TP8 with DP1, C32 gives
+local BS32. Reaching the threshold permits adaptation but does not guarantee
+that a shorter graph will be selected.
 
-The current execution contract requires greedy sampling, CUDA graphs, equal
-unpadded local decode batches, and the existing server-argument restrictions.
-Unsupported batches use full verification. Token acceptance checks are unchanged.
-Packed verification requires real acceptance; synthetic acceptance is rejected
-at both service validation and the packed sampler entry. Ordinary fixed-width
-verification retains its existing benchmark acceptance controls.
+## Runtime requirements
 
-## Startup measurement
+Adaptive verification requires greedy sampling, CUDA graphs and a globally
+decode-or-idle step. DP ranks share a physical graph capacity; their actual
+request counts may differ, including empty ranks. The service validates additional model and
+parallelism restrictions. Synthetic acceptance is unsupported.
 
-After final graph capture, startup profiles eligible verification capacities
-using synthetic contexts and disjoint cache blocks. The memory-planning graph
-probe does not run this profiling. No calibration dataset is required.
+Missing confidence feedback or unavailable cost coverage uses full
+verification. Mixed prefill/decode steps retain the existing full-width path. There is no online exploration or
+per-step timing calibration. Confidence feedback is updated asynchronously;
+weight reload invalidates the costs.
 
-The context endpoints are 8K, 32K, 128K, 512K and the configured context limit,
-clipped and deduplicated. An endpoint supplies a synthetic cost estimate for its
-interval; it is not a measurement of every intermediate length or workload.
-Each graph uses two warmup replays and eight measured replays. Rank timings are
-aligned and reduced by maximum. Native full verification is measured without
-adaptive budget selection; shortened verification includes its host budget
-path and layout submission before replay. CUDA events measure the GPU timeline,
-including exposed host scheduling gaps, rather than request wall time.
+## Startup costs and cache
 
-The recorded graph includes target verification, sampling and DSpark drafting.
-Metadata preparation, barriers, cache initialization and state restoration are
-outside that timing interval. Synthetic KV and token values cannot reproduce
-every real workload's expert routing, acceptance pattern or memory locality.
-Use paired application measurements before claiming a throughput improvement.
+After graph capture, each eligible batch size is measured with synthetic
+contexts and disjoint cache blocks. No calibration dataset is required.
+Context endpoints are 8K, 32K, 128K, 512K and the configured limit, clipped and
+deduplicated. Each endpoint estimates costs for an interval.
 
-All ranks must agree on the graph ladder and have enough cache capacity. An
-unavailable region is skipped on every rank. After startup, missing feedback,
-missing cost coverage, padding or unequal local batches fall back to full
-verification; they do not trigger online budget exploration.
+Each graph gets two warmup replays and eight measured replays. Timings use the
+slowest rank and include target verification, sampling and drafting. Shortened
+verification also includes the exposed budget-selection and layout-submission
+overhead. Metadata preparation, barriers and cache initialization are excluded.
+At the position limit, profiling reserves space for the following draft block.
 
-## Cache and logs
+Costs are cached in:
 
-Costs are stored under `$XDG_CACHE_HOME/tokenspeed/adaptive-dspark`, or
-`~/.cache/tokenspeed/adaptive-dspark` when XDG_CACHE_HOME is unset. Cache
-identity includes hardware, model, topology, graph configuration and software.
-Startup estimates have a separate identity from older online measurements.
-Malformed or incompatible caches are treated as misses.
+```text
+$XDG_CACHE_HOME/tokenspeed/adaptive-dspark
+```
 
-Look for `startup profile complete`, `startup profile unavailable` and
-`loaded ... calibration regions`. A completed profile is saved only after
-every required capacity has valid samples. Restarting with a compatible cache
-avoids profiling those regions.
+If unset, the root is `~/.cache`. This is a disk cost cache, not a prefix/KV
+cache or a setting for all compiler caches. Compatible entries are reused;
+hardware, model, topology, graph or software changes can invalidate them.
+Regions without enough cache capacity or valid samples are skipped.
 
-The implementation does not perform active recovery probes or online reward
-calibration. It does not yet passively correct startup curves from serving
-measurements. Keep this limitation separate from confidence-head prediction:
-a cost cache does not establish that predicted acceptance is well calibrated.
-
-Cost profiling runs only at startup. Serving keeps asynchronous confidence
-feedback for budget selection, but does not collect or synchronize per-step
-timing samples. Weight reload invalidates costs and falls back to full
-verification until a new compatible startup profile is available.
+Logs report `startup profile complete`, `startup profile unavailable` and
+loaded calibration regions. Synthetic timings do not reproduce every
+workload's routing, acceptance or memory locality; verify gains with paired
+application measurements.
 
 ## Verification layout
 
-After the host selects a graph capacity, a captured Triton kernel converts
-confidence scores into per-request prefix lengths, packed row indices and CSR
-boundaries. Stable ties use request/token order so every selection remains a
-prefix. Under attention DP, the same kernel gathers the latest GPU confidence
-by request slot, using historical scores for non-finite rows.
+A captured Triton kernel assigns per-request prefix lengths and builds packed
+row indices and CSR boundaries. Ties preserve request/token order. Under
+attention DP, it reads current GPU confidence by request slot and uses
+historical scores when a current row is non-finite. A device-resident live
+request count excludes padding from draft allocation. Padding keeps one
+physical anchor for existing CSR and sampling conventions; its state writes
+use the runtime's dummy slot and its outputs are discarded. Budget rewards
+count real requests only, while costs use the common physical graph capacity.
+All ranks, including idle ranks, participate in the same host budget agreement.
 
-This does not change the host budget policy or token acceptance checks.
-Allocation requires GPU scores with unit column stride and
-`local_batch_size * (draft_width + 1) <= 4096`. Unsupported inputs raise an
-error instead of falling back to PyTorch. With five draft tokens this supports
-up to 682 requests per attention rank; serving and CUDA Graph limits still
-apply. The PyTorch reference is retained only in kernel tests.
+The kernel requires:
+
+- GPU inputs with unit column stride for confidence scores.
+- `local_batch_size * (draft_width + 1) <= 4096`.
+
+With five draft tokens, the layout supports up to 682 requests per attention
+rank. Serving, memory and CUDA Graph limits still apply. Unsupported layouts
+raise an error; there is no production PyTorch fallback. A PyTorch reference
+is retained only in tests.
