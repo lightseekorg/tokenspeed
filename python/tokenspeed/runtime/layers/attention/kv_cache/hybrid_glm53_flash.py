@@ -102,6 +102,8 @@ class HybridGlm53FlashTokenToKVPool(HybridKDATokenToKVPool):
             raise ValueError(f"layer {layer_id} has no DSA index cache") from exc
         if buffer is None:
             raise ValueError(f"layer {layer_id} has no DSA index cache")
+        if self.layerwise_load_tracker is not None:
+            self.layerwise_load_tracker.wait_for_layer(layer_id)
         return buffer
 
     def get_kpool_buffers(
