@@ -185,21 +185,15 @@ streams. `record_stream` protects allocation lifetime, but does not order a
 producer on one stream before a consumer on another. `finish` releases
 references after queueing consumers; it does not synchronize the device.
 
-`_stream(warmup=...)` therefore enforces two lifetimes. `_layer_stream` records
-the existing caller stream from `prefetch` through `finish`, rejecting stream
-or phase changes during that active layer. It is cleared at `finish` and
-does not create a separate stream per model layer. `compute_stream` records
-the first serving stream and remains bound across layers and batches.
-
-The NPU backends pass the existing kernel-startup warmup flag to distinguish
-phases. Warmup uses `_layer_stream` but leaves `compute_stream` unbound.
-`ModelExecutor.autotune()` synchronizes the device before serving begins, so
-the first serving call can bind its own stream safely. Warmup and serving
-can also use the same stream; phase is explicit rather than inferred from
-stream identity. Later serving stream changes remain errors after `finish`.
-Binding during warmup would incorrectly reject a different serving stream
-when the same transport survives startup. Rebuilding the cache pool closes
-the old transport, so that startup path may avoid the failure.
+The caller owns this ordering. `ModelExecutor` runs serving forwards inside
+its persistent `execution_stream` context, and `ModelExecutor.autotune()`
+synchronizes the device before serving starts. Warmup may therefore use a
+different stream even when the same transport survives startup. The transport
+does not bind or compare stream identities and needs no warmup phase flag.
+It remembers only the last caller stream so `close()` can drain execution,
+including after `finish()`. A caller handing work to another stream must
+establish the required dependencies before reusing cache or temporary storage;
+concurrent use of one transport is unsupported.
 
 Run `test/test_mla_cp_transport.py` with `torchrun` and an explicit `TEST_OUTPUT`
 directory. It covers compact shared history pages, empty/uneven owners, both

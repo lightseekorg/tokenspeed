@@ -29,7 +29,6 @@ from tokenspeed_kernel.ops.attention.mla.ascend import (
     ascend_mla_dcp_kernels,
     prepare_ascend_mla_prefill,
 )
-from tokenspeed_kernel.ops.tuning import is_warming_up
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
@@ -255,7 +254,6 @@ class AscendMLABackend(MLAAttnBackend):
             layer_id,
             self.cache_pool.get_key_buffer(layer_id),
             None,
-            warmup=is_warming_up(),
             batch_key=plan,
             total_rows=sum(plan.row_counts),
             has_history=not plan.cold,

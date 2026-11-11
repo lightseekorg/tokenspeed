@@ -22,7 +22,6 @@
 
 import importlib
 import sys
-from contextlib import nullcontext
 from types import ModuleType
 
 import pytest
@@ -96,9 +95,8 @@ def exact(actual, expected):
 )
 @pytest.mark.parametrize("has_index", [False, True])
 @pytest.mark.parametrize("early", [False, True])
-@pytest.mark.parametrize("warmup", [False, True])
 def test_temporary_packed_history_and_current_keep_exact_bytes(
-    transport_class, monkeypatch, degree, rank, total, has_index, early, warmup
+    transport_class, monkeypatch, degree, rank, total, has_index, early
 ):
     cls, collectives = transport_class
     monkeypatch.setattr(dist, "get_rank", lambda: rank)
@@ -170,7 +168,6 @@ def test_temporary_packed_history_and_current_keep_exact_bytes(
             3,
             cache[rank].unsqueeze(1),
             index[rank].unsqueeze(1) if has_index else None,
-            warmup=warmup,
             batch_key=key,
             total_rows=total,
             has_history=True,
@@ -239,7 +236,6 @@ def test_patch_copies_router_slots_into_owned_native_buffer(
         1,
         cache,
         None,
-        warmup=False,
         batch_key=object(),
         total_rows=2,
         has_history=False,
@@ -266,9 +262,7 @@ def test_patch_copies_router_slots_into_owned_native_buffer(
     runtime.close()
 
 
-def test_history_ensure_rejects_stale_batch_and_different_stream(
-    transport_class, monkeypatch
-):
+def test_history_ensure_rejects_stale_batch(transport_class, monkeypatch):
     cls, _ = transport_class
     monkeypatch.setattr(dist, "get_rank", lambda: 0)
     monkeypatch.setattr(dist, "get_process_group_ranks", lambda group: [0])
@@ -283,7 +277,6 @@ def test_history_ensure_rejects_stale_batch_and_different_stream(
     )
     key = object()
     options = dict(
-        warmup=False,
         batch_key=key,
         total_rows=1,
         has_history=False,
@@ -295,20 +288,15 @@ def test_history_ensure_rejects_stale_batch_and_different_stream(
         runtime.prefetch(2, cache, None, **options)
     with pytest.raises(RuntimeError, match="different batch/layer"):
         runtime.prefetch(1, cache, None, **(options | {"batch_key": object()}))
-    torch.npu.stream = ExecutionStream()
-    with pytest.raises(RuntimeError, match="original execution stream"):
-        runtime.prefetch(1, cache, None, **options)
-    with pytest.raises(RuntimeError, match="original execution stream"):
-        runtime.gather_current(1, cache[:1], width=576, total_rows=1)
+    runtime.finish(1)
+    runtime.close()
 
 
 @pytest.mark.parametrize("has_index", [False, True])
 @pytest.mark.parametrize("same_stream", [False, True])
-def test_warmup_does_not_bind_the_serving_stream(
+def test_ordered_stream_handoffs_keep_exact_bytes(
     transport_class, monkeypatch, has_index, same_stream
 ):
-    from tokenspeed_kernel.ops.tuning import is_warming_up, kernel_warmup
-
     cls, _ = transport_class
     monkeypatch.setattr(dist, "get_rank", lambda: 0)
     cache = payload(256, 576, 9)
@@ -323,6 +311,7 @@ def test_warmup_does_not_bind_the_serving_stream(
     )
     warmup_stream = ExecutionStream()
     serving_stream = warmup_stream if same_stream else ExecutionStream()
+    next_stream = serving_stream if same_stream else ExecutionStream()
     key = object()
     options = dict(
         batch_key=key,
@@ -331,18 +320,15 @@ def test_warmup_does_not_bind_the_serving_stream(
         history_slots=torch.tensor([128, 129]),
         history_counts=(2,),
     )
-    for step, warmup in enumerate((True, True, False, False)):
-        stream = warmup_stream if warmup else serving_stream
+    previous = None
+    for step, stream in enumerate(
+        (warmup_stream, warmup_stream, serving_stream, serving_stream, next_stream)
+    ):
+        if previous is not None and stream is not previous:
+            # Startup completes warmup; other callers must also order a handoff.
+            previous.synchronize()
         torch.npu.stream = stream
-        with kernel_warmup(enabled=warmup):
-            runtime.prefetch(
-                3,
-                cache,
-                index,
-                warmup=is_warming_up(),
-                **options,
-            )
-        assert runtime.compute_stream is (None if warmup else serving_stream)
+        runtime.prefetch(3, cache, index, **options)
         exact(runtime.kv[128:130], cache[128:130])
         if has_index:
             exact(runtime.index[128:130], index[128:130])
@@ -354,62 +340,42 @@ def test_warmup_does_not_bind_the_serving_stream(
         if has_index:
             exact(runtime.index[130:132], current_index)
         runtime.finish(3)
-        assert runtime.compute_stream is (None if warmup else serving_stream)
-        assert runtime._layer_stream is None
+        assert runtime.workspace_bytes == 0
         assert stream.recorded > 0
-        if warmup:
-            # ModelExecutor completes startup before the serving phase.
-            stream.synchronize()
-    torch.npu.stream = ExecutionStream()
-    with pytest.raises(RuntimeError, match="original execution stream"):
-        runtime.prefetch(3, cache, index, warmup=False, **options)
-    assert runtime.compute_stream is serving_stream
+        previous = stream
+    assert not next_stream.synchronized
     runtime.close()
-    assert serving_stream.synchronized
+    assert next_stream.synchronized
 
 
-@pytest.mark.parametrize("warmup", [False, True])
-def test_active_prefill_keeps_its_stream_and_phase(
-    transport_class, monkeypatch, warmup
-):
+@pytest.mark.parametrize("has_index", [False, True])
+def test_close_drains_active_prefill(transport_class, monkeypatch, has_index):
     cls, _ = transport_class
     monkeypatch.setattr(dist, "get_rank", lambda: 0)
     cache = payload(256, 576, 7)
+    index = payload(256, 128, 17) if has_index else None
     runtime = cls(
         cache,
-        None,
+        index,
         ranks=(0,),
         history_group=None,
         max_current_rows=1,
         history_null_rows=128,
     )
     stream = torch.npu.stream
-    options = dict(
+    runtime.prefetch(
+        1,
+        cache,
+        index,
         batch_key=object(),
         total_rows=1,
         has_history=False,
         history_slots=torch.empty(0, dtype=torch.int64),
         history_counts=(0,),
     )
-    runtime.prefetch(1, cache, None, warmup=warmup, **options)
-    with pytest.raises(RuntimeError, match="warmup phase changed"):
-        runtime.prefetch(1, cache, None, warmup=not warmup, **options)
-    torch.npu.stream = ExecutionStream()
-    with pytest.raises(RuntimeError, match="original execution stream"):
-        runtime.prefetch(1, cache, None, warmup=warmup, **options)
-    with pytest.raises(RuntimeError, match="original execution stream"):
-        runtime.gather_current(1, cache[:1], width=576, total_rows=1)
-    with pytest.raises(RuntimeError, match="original execution stream"):
-        runtime.finish(1)
-    torch.npu.stream = stream
-    runtime.gather_current(1, cache[:1], width=576, total_rows=1)
-    runtime.finish(1)
-    torch.npu.stream = ExecutionStream()
-    with (
-        nullcontext()
-        if warmup
-        else pytest.raises(RuntimeError, match="original execution stream")
-    ):
-        runtime.prefetch(1, cache, None, warmup=warmup, **options)
+    assert runtime.workspace_bytes > 0
+    assert not stream.synchronized
     runtime.close()
-    assert (torch.npu.stream if warmup else stream).synchronized
+    assert stream.synchronized
+    assert runtime.workspace_bytes == 0
+    runtime.close()
