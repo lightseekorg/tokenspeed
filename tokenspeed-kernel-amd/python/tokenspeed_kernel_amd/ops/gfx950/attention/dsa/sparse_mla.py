@@ -2782,6 +2782,15 @@ def _oneblock_launch_plan(cols: int, *, is_decode: bool) -> _TopKLaunchPlan:
     )
 
 
+# Row-bounded selection plans for its rows' lengths, not the buffer's width:
+# over 8K-128K candidates per row (KVP owned rows of a 1M-wide buffer, 40-128
+# rows) the short-row tiles beat the wide ones with the compact final pass by
+# 10-13 us on MI355X.
+_ROW_BOUNDED_ONEBLOCK_PLAN = _oneblock_launch_plan(
+    _ONEBLOCK_RADIX_MAX_COLS, is_decode=False
+)
+
+
 def _residency_safe_homogeneous_groups(
     rows: int,
     cols: int,
@@ -3355,7 +3364,7 @@ def gluon_dsa_row_bounded_logical_topk_gfx950(
         topk=topk,
         q_len_per_req=1,
         is_decode=False,
-        plan=_oneblock_launch_plan(cols, is_decode=False),
+        plan=_ROW_BOUNDED_ONEBLOCK_PLAN,
         out=out,
         lens_out=lens_out,
     )
