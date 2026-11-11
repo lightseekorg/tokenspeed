@@ -24,6 +24,7 @@
 #include <array>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <memory>
 #include <random>
 #include <stdexcept>
@@ -344,6 +345,77 @@ TEST(FlatPointerIndex, CollidingKeysSurviveGrowthWrappedClustersAndChurn) {
     EXPECT_FALSE(index.Erase(0));
     EXPECT_TRUE(index.Insert(&entries[0]));
     EXPECT_EQ(index.Find(0), &entries[0]);
+}
+
+// At every capacity, half the keys are homed at the last slot, a quarter at the
+// one before it and a quarter at slot 3: clusters of equal and of mixed hashes
+// wrap around the end of the table into the keys homed in front of it while
+// the table grows.
+TEST(FlatPointerIndex, ExtractObjectRemovesOnlyThatObjectAmongCollidingKeys) {
+    struct Entry {
+        int key;
+    };
+    struct KeyOfEntry {
+        const int& operator()(const Entry* entry) const { return entry->key; }
+    };
+    struct WrappingHash {
+        std::size_t operator()(int key) const {
+            constexpr std::array<std::size_t, 4> homes{~std::size_t{0}, ~std::size_t{0} - 1, ~std::size_t{0}, 3};
+            return homes[static_cast<std::size_t>(key) % homes.size()];
+        }
+    };
+    using Index = FlatPointerIndex<const Entry*, int, KeyOfEntry, WrappingHash>;
+    std::array<Entry, 300> entries;
+    Index index;
+    const Entry absent{0};
+    EXPECT_EQ(index.ExtractObject(absent.key, absent), nullptr);
+    std::map<int, const Entry*> expected;
+    for (int i = 0; i < 300; ++i) {
+        entries[i].key = i;
+        ASSERT_TRUE(index.Insert(&entries[i]));
+        expected.emplace(i, &entries[i]);
+    }
+    const auto expect_contents = [&] {
+        ASSERT_EQ(index.size(), expected.size());
+        for (int i = 0; i < 300; ++i) {
+            const auto found = expected.find(i);
+            EXPECT_EQ(index.Find(i), found == expected.end() ? nullptr : found->second) << i;
+        }
+    };
+
+    // An equal key on another object names nothing; the indexed one stays.
+    const Entry impostor{entries[120].key};
+    EXPECT_EQ(index.ExtractObject(impostor.key, impostor), nullptr);
+    expect_contents();
+    // One object out of a cluster of equal hashes, taken from its middle.
+    EXPECT_EQ(index.ExtractObject(entries[120].key, entries[120]), &entries[120]);
+    expected.erase(120);
+    expect_contents();
+    EXPECT_EQ(index.ExtractObject(entries[120].key, entries[120]), nullptr);
+
+    std::mt19937 random(5309);
+    for (int step = 0; step < 6000; ++step) {
+        const int key = static_cast<int>(random() % entries.size());
+        const bool present = expected.contains(key);
+        switch (random() % 3) {
+            case 0:
+                EXPECT_EQ(index.Insert(&entries[key]), !present);
+                expected.emplace(key, &entries[key]);
+                break;
+            case 1:
+                EXPECT_EQ(index.ExtractObject(entries[key].key, entries[key]), present ? &entries[key] : nullptr);
+                expected.erase(key);
+                break;
+            default:
+                EXPECT_EQ(index.Extract(key), present ? &entries[key] : nullptr);
+                expected.erase(key);
+                break;
+        }
+        if (step % 97 == 0) expect_contents();
+    }
+    expect_contents();
+    for (const auto& [key, entry] : expected) EXPECT_EQ(index.ExtractObject(key, *entry), entry);
+    EXPECT_TRUE(index.empty());
 }
 
 TEST(PrefixCacheIndexInspectionTest, CompleteDigestIdentitySurvivesCommonLeadingBytes) {

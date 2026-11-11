@@ -1004,7 +1004,8 @@ private:
             peer->common_peer = nullptr;
         }
         entry_it->unique_observer.Reset();
-        FatalCheck(cache_index.by_key.Erase(entry_it->key), "an indexed cache entry keeps its key");
+        FatalCheck(cache_index.by_key.ExtractObject(entry_it->key, *entry_it) == entry_it,
+                   "an indexed cache entry keeps its key");
         cache_index.by_location.Erase(entry_it->block_ref->Location());
         cache_index.entries.erase(entry_it);
     }

@@ -20,10 +20,13 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <map>
+#include <numeric>
 #include <optional>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -173,6 +176,64 @@ TEST(BoundaryTreeTest, NodesAndKeysStayStableAcrossIndexGrowthDeletionAndSlotReu
     EXPECT_EQ(tree.Size(), 1);
     root_hold.reset();
     EXPECT_EQ(tree.Size(), 0);
+}
+
+// Every hash shares the eight leading bytes the node index hashes, all ones,
+// so every node probes one cluster that wraps around the end of the table at
+// each capacity. A leaving node takes out only its own slot: the rest keep
+// their nodes and keys, down a chain and in any release order.
+TEST(BoundaryTreeTest, NodesWithCollidingIndexHashesLeaveOneByOne) {
+    BoundaryTree tree{TreeConfig(1, false), nullptr};
+    const auto colliding = [](int i) {
+        std::string hex = std::string(16, 'f') + std::string(48, '0');
+        hex[62] = "0123456789abcdef"[i / 16];
+        hex[63] = "0123456789abcdef"[i % 16];
+        return hex;
+    };
+    std::vector<std::string> chain;
+    std::vector<BoundaryTree::Hold> chain_holds;
+    for (int i = 0; i < 40; ++i) chain.push_back(colliding(i));
+    {
+        BoundaryTree::Hold publication = Publish(tree, chain, 0, std::nullopt);
+        for (const auto& hash : chain) chain_holds.push_back(tree.HoldEntry(hash, kDeviceKv));
+    }
+    std::map<std::string, const Node*> roots;
+    std::vector<BoundaryTree::Hold> root_holds;
+    for (int i = 40; i < 120; ++i) {
+        const auto hash = colliding(i);
+        BoundaryTree::Hold publication = Publish(tree, {hash}, 0, std::nullopt);
+        root_holds.push_back(tree.HoldEntry(hash, kDeviceKv));
+        roots.emplace(hash, tree.Find(hash));
+    }
+    ASSERT_EQ(tree.Size(), 120u);
+    const auto expect_roots = [&] {
+        for (const auto& [hash, node] : roots) {
+            EXPECT_EQ(tree.Find(hash), node);
+            EXPECT_EQ(*node->hash, ContentHash(hash));
+        }
+    };
+
+    // Each page stays under its child until the leaf leaves and takes the
+    // whole chain with it.
+    for (std::size_t i = 0; i + 1 < chain.size(); ++i) {
+        chain_holds[i].reset();
+        EXPECT_EQ(tree.Size(), 120u);
+    }
+    chain_holds.back().reset();
+    EXPECT_EQ(tree.Size(), 80u);
+    for (const auto& hash : chain) EXPECT_EQ(tree.Find(hash), nullptr);
+    expect_roots();
+
+    std::vector<int> order(root_holds.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::shuffle(order.begin(), order.end(), std::mt19937(77));
+    for (const int k : order) {
+        root_holds[static_cast<std::size_t>(k)].reset();
+        roots.erase(colliding(40 + k));
+        EXPECT_EQ(tree.Find(colliding(40 + k)), nullptr);
+        expect_roots();
+    }
+    EXPECT_EQ(tree.Size(), 0u);
 }
 
 // A node started without a known parent (a Host entry no publication linked)

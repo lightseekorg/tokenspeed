@@ -22,6 +22,7 @@
 
 #include <cstddef>
 #include <functional>
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -55,22 +56,25 @@ public:
     // owns the object and can destroy it after its index entry has gone.
     T Extract(const Key& key) {
         if (slots_.empty()) return {};
-        std::size_t hole = find(key, Hash{}(key));
-        if (hole == slots_.size()) return {};
-        const T value = slots_[hole].value;
+        const std::size_t position = find(key, Hash{}(key));
+        return position == slots_.size() ? T{} : removeAt(position);
+    }
+
+    // Extract for a caller holding the indexed object itself: `key` is that
+    // object's own key. Slots match by cached hash and object identity, so no
+    // stored key is read or compared. Returns T{} when the object is not
+    // indexed under `key`.
+    template <typename Object>
+    T ExtractObject(const Key& key, const Object& object) {
+        if (slots_.empty()) return {};
+        const auto hash = Hash{}(key);
         const auto mask = slots_.size() - 1;
-        for (auto next = (hole + 1) & mask; slots_[next].value != T{}; next = (next + 1) & mask) {
-            const auto home = slots_[next].hash & mask;
-            // Move an entry only when the hole is on its probe path. This
-            // also handles clusters crossing the end of the table.
-            if (((next - home) & mask) >= ((next - hole) & mask)) {
-                slots_[hole] = slots_[next];
-                hole = next;
+        for (auto position = hash & mask; slots_[position].value != T{}; position = (position + 1) & mask) {
+            if (slots_[position].hash == hash && std::addressof(*slots_[position].value) == std::addressof(object)) {
+                return removeAt(position);
             }
         }
-        slots_[hole] = {};
-        --size_;
-        return value;
+        return {};
     }
 
     bool Erase(const Key& key) { return Extract(key) != T{}; }
@@ -91,6 +95,22 @@ private:
             if (slot.hash == hash && KeyOf{}(slot.value) == key) return position;
         }
         return slots_.size();
+    }
+    T removeAt(std::size_t hole) {
+        const T value = slots_[hole].value;
+        const auto mask = slots_.size() - 1;
+        for (auto next = (hole + 1) & mask; slots_[next].value != T{}; next = (next + 1) & mask) {
+            const auto home = slots_[next].hash & mask;
+            // Move an entry only when the hole is on its probe path. This
+            // also handles clusters crossing the end of the table.
+            if (((next - home) & mask) >= ((next - hole) & mask)) {
+                slots_[hole] = slots_[next];
+                hole = next;
+            }
+        }
+        slots_[hole] = {};
+        --size_;
+        return value;
     }
     static void put(std::vector<Slot>& slots, Slot value) {
         const auto mask = slots.size() - 1;

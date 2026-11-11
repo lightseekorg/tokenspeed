@@ -58,11 +58,13 @@ its old location or control address is reused.
 Key and boundary lookup use open-addressed tables containing cached hashes and
 stable handles. Per-tier entry lists and the boundary node list own their
 objects in pooled storage; each boundary node also owns its key. Rehash and
-backward-shift deletion move handles only. Root, child, sibling and Host order
-still come from the existing links, never from hash-slot iteration. Tables
-grow at 75% occupancy and retain their high-water capacity; at 16 bytes per
-slot, each lookup table costs between roughly 21 and 43 bytes per live key
-immediately before/after growth. Rehash temporarily holds both slot arrays.
+backward-shift deletion move handles only. An entry or node leaving its table
+is found by handle identity from its own key's hash, never by comparing stored
+keys. Root, child, sibling and Host order still come from the existing links,
+never from hash-slot iteration. Tables grow at 75% occupancy and retain their
+high-water capacity; at 16 bytes per slot, each lookup table costs between
+roughly 21 and 43 bytes per live key immediately before/after growth. Rehash
+temporarily holds both slot arrays.
 Each node shape has its own fixed-slot resource, allocating chunks of 256
 slots on demand. A freed slot stores the free-list link, so recycling needs no
 search through chunks. Retained slot bytes are

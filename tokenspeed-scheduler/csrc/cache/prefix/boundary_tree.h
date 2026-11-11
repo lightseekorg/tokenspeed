@@ -645,7 +645,7 @@ private:
         }
         // Erase by iterator: the node's own key must not be read after the
         // node is gone.
-        const auto entry = nodes_.Extract(*node.hash);
+        const auto entry = nodes_.ExtractObject(*node.hash, node);
         FatalCheck(entry != NodeIterator{}, "a removed boundary keeps its index entry");
         node_storage_.erase(entry);
     }
