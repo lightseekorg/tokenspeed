@@ -1587,7 +1587,8 @@ def launch_gluon_mm_a16w16_medium_gfx950(
 # K tile of a program. Only buckets that beat torch.mm by at least 4% at the
 # row counts their model sends are listed, except where an entry notes
 # otherwise; the rest keep the torch path. The 128 and 256 buckets were swept
-# inside capture_session, as serving captures.
+# inside capture_session, as serving captures, except the K3.1 TP8 ones, swept
+# in graph replays over rotating weight copies at 96/128 and 160/192 rows.
 DECODE_M_BUCKETS = (4, 8, 16, 32, 64, 128, 256)
 _DECODE_CONFIGS: dict[
     tuple[int, int], dict[int, tuple[int, int, int, int, int, int, int, int]]
@@ -1682,6 +1683,8 @@ _DECODE_CONFIGS: dict[
         4: (16, 32, 256, 2, 2, 3, 1, 1),
         8: (16, 32, 256, 2, 2, 3, 1, 1),
         32: (32, 32, 256, 2, 2, 3, 1, 1),
+        64: (64, 32, 256, 2, 2, 3, 1, 8),
+        128: (64, 64, 64, 2, 2, 3, 2, 8),
     },
     # shared_gu
     (1536, 7168): {
@@ -1690,6 +1693,7 @@ _DECODE_CONFIGS: dict[
         16: (16, 16, 256, 2, 2, 2, 7, 8),
         32: (32, 32, 256, 2, 2, 3, 4, 1),
         64: (32, 32, 128, 2, 2, 2, 8, 1),
+        128: (32, 32, 64, 2, 2, 3, 4, 8),
     },
     # shared_dn
     (7168, 768): {
@@ -1698,6 +1702,8 @@ _DECODE_CONFIGS: dict[
         16: (16, 32, 256, 1, 4, 3, 1, 1),
         32: (32, 32, 256, 2, 2, 3, 1, 8),
         64: (32, 32, 256, 2, 2, 2, 1, 8),
+        128: (64, 64, 256, 2, 2, 2, 1, 8),
+        256: (64, 64, 64, 2, 2, 3, 1, 1),
     },
     # router
     (896, 7168): {
@@ -1711,6 +1717,7 @@ _DECODE_CONFIGS: dict[
     (8448, 7168): {
         16: (16, 128, 64, 1, 4, 3, 7, 1),
         32: (32, 32, 64, 2, 2, 2, 4, 8),
+        64: (64, 128, 64, 2, 2, 3, 7, 1),
     },
     # dense_dn
     (7168, 4224): {
@@ -1718,6 +1725,7 @@ _DECODE_CONFIGS: dict[
         8: (16, 32, 64, 1, 4, 3, 2, 1),
         16: (16, 32, 64, 1, 4, 3, 2, 1),
         32: (32, 32, 64, 2, 2, 3, 2, 1),
+        64: (64, 32, 64, 2, 2, 3, 2, 1),
     },
     # K3.1 indexer wq_b (replicated); up to 16 rows the GEMV takes it.
     (4096, 1536): {
@@ -1731,6 +1739,8 @@ _DECODE_CONFIGS: dict[
         16: (16, 16, 256, 2, 2, 4, 7, 8),
         32: (32, 16, 256, 2, 2, 4, 7, 8),
         64: (32, 16, 256, 2, 2, 4, 7, 8),
+        128: (32, 32, 512, 2, 2, 2, 7, 8),
+        256: (32, 32, 512, 2, 2, 2, 7, 8),
     },
     # lm_head
     (20480, 7168): {
@@ -1750,6 +1760,27 @@ _DECODE_CONFIGS: dict[
         16: (16, 32, 256, 1, 4, 3, 2, 1),
         32: (32, 32, 256, 2, 2, 3, 2, 1),
         64: (32, 32, 256, 2, 2, 3, 1, 8),
+    },
+    # K3.1 TP8 speculative-verify projections. q_b with the indexer wq_b.
+    (6400, 1536): {
+        64: (64, 32, 256, 2, 2, 3, 1, 1),
+    },
+    # KDA decay-gate up projection (f_b).
+    (1536, 128): {
+        64: (64, 16, 64, 4, 1, 2, 1, 1),
+        128: (64, 16, 64, 4, 1, 2, 1, 8),
+        256: (32, 32, 64, 2, 2, 2, 1, 1),
+    },
+    # MLA q_a with kv_a.
+    (2112, 7168): {
+        64: (64, 32, 128, 2, 2, 3, 7, 1),
+        128: (64, 64, 128, 2, 2, 2, 7, 8),
+        256: (64, 64, 64, 2, 2, 3, 4, 8),
+    },
+    # EAGLE3 MLA drafter q_b (eight heads per rank).
+    (1536, 1536): {
+        64: (32, 16, 512, 4, 1, 3, 1, 8),
+        128: (32, 32, 256, 2, 2, 3, 1, 8),
     },
     # Qwen3.8-Flash-Next TP2 per-rank projections. Its hyper-connection mix
     # GEMMs run inside gluon_hyperconnection_mix_gfx950 at decode sizes.
