@@ -1324,7 +1324,7 @@ class DSABackend(PagedAttentionBackend):
         self._prefill_index_columns = None
         if (
             len(self.kvp_group) > 1
-            and forward_mode.is_extend()
+            and forward_mode.is_extend_or_mixed()
             and num_extends > 0
             and self.query_shard_metadata is None
             and self.history_prefill is None
@@ -1341,7 +1341,7 @@ class DSABackend(PagedAttentionBackend):
     def _plan_prefill_index_columns(
         self, page_table_cpu: torch.Tensor, seq_lens_cpu: torch.Tensor
     ) -> int:
-        """The owned width of a pure extend's KVP index tiles, in kernel pages.
+        """The owned width of the extend rows' KVP index tiles, in kernel pages.
 
         Host arithmetic over the host page table and lengths, identical on
         every rank, so every rank tiles and exchanges the same rows: the most
@@ -1364,8 +1364,8 @@ class DSABackend(PagedAttentionBackend):
     def prefill_index_columns(self) -> int | None:
         """The owned width, in kernel pages, of this forward's KVP index tiles.
 
-        Set by :meth:`init_forward_metadata` for a pure extend over KVP pages
-        (and not query-sharded): the
+        Set by :meth:`init_forward_metadata` for the extend rows of an extend
+        or mixed round over KVP pages (and not query-sharded): the
         model's KVP top-k plans each query row's owned index pages that wide
         instead of the page table's width, so a logits budget fits more rows
         per tile. ``None`` keeps the page table's width.

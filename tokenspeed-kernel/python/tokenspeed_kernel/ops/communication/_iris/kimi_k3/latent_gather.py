@@ -441,10 +441,10 @@ def iris_k3moe_latent_input_gather(
     MAX_ELEMENTS: gl.constexpr,
     PEER_SIGNAL_STORE_CACHE: gl.constexpr,
     NUM_WARPS: gl.constexpr,
+    MAX_ROWS: gl.constexpr,
     QUANTIZE: gl.constexpr = False,
     MIN_AMAX: gl.constexpr = 1.0e-12,
     FP8_MAX: gl.constexpr = 448.0,
-    MAX_ROWS: gl.constexpr = 64,
 ):
     """Sum the K splits of this rank's columns, publish and gather the rows.
 
