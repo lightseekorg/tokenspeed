@@ -2817,6 +2817,19 @@ as `GetAdmissionReqOutput.shared_prefix_publication_contract == 1` and
 `shared_prefix_storage_enabled == true`; absent fields on an older engine mean
 unsupported, not successful publication.
 
+Contract version 1 requires exact prompt-end publication. With State groups,
+`--enable-state-checkpoint-in-forward` can omit the prompt-end checkpoint in
+favor of an earlier checkpoint (for example, 20 instead of 22 with a page of
+4 and a prefill budget of 8). This combination advertises
+`shared_prefix_storage_enabled == false` and publication queries return
+`unsupported` immediately, even for aligned boundaries or under pressure.
+Routers must reject grouped publication waiting during their capability check;
+turn the flag off to use this contract with unrestricted State groups. Ordinary
+local caching and shared-store QUERY/GET/PUT remain available. A future protocol
+that waits for an earlier checkpoint must report the actual published boundary
+and verify every State and KV dependency there; it cannot relabel that receipt
+as publication of the full prompt. Models without State groups are unaffected.
+
 A `published` result requires successful **retired PUT or accepted GET** receipts, agreed across
 the producer's cache-owning replica ranks, for every immutable object needed at
 that exact prefix: full KV history, each non-replayable window, and every State

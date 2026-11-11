@@ -93,7 +93,8 @@ control_struct! {
         cache_group_contract: i64 = 0,
         /// Successful retired shared-store object confirmation protocol.
         shared_prefix_publication_contract: i64 = 0,
-        /// This rank can publish prefixes through Host memory to shared storage.
+        /// This rank supports exact-prefix receipts through Host/shared storage;
+        /// false when in-forward State checkpoints can omit prompt endpoints.
         shared_prefix_storage_enabled: bool = false,
     }
 

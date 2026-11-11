@@ -920,37 +920,56 @@ fn shared_prefix_publication_exposes_pressure_and_flush_epoch() {
 }
 
 #[test]
-fn shared_prefix_publication_rejects_unsupported_state_boundaries() {
+fn shared_prefix_publication_rejects_in_forward_state_before_waiting() {
     interpreter();
-    for checkpoint_granularity in [1, 4] {
-        let code = STORAGE_SCHEDULER.replace(
-            "result = ts.Scheduler(cfg)",
-            &format!(
-                "cfg.state_checkpoint_in_forward = True\ncfg.cache_groups = [*cfg.cache_groups, ts.CacheGroupConfig('state', 0, 32, ts.AttnKind.State, transfer_policy=ts.CacheTransferPolicy.LatestSnapshot, checkpoint_granularity={checkpoint_granularity})]\ncfg.host_group_packing = [1, 1]\nresult = ts.Scheduler(cfg)"
-            ),
-        );
-        let mut scheduler = Python::attach(|py| Scheduler::from_python(&run(py, &code)).unwrap());
-        assert!(scheduler.shared_prefix_storage_enabled());
-        for pressure in [false, true] {
-            let mut round = tick(if pressure { 2 } else { 1 });
-            round.tick.as_mut().unwrap().queued_operations = if pressure { 100 } else { 0 };
-            scheduler.advance_head(&round, &[]).unwrap();
-            for boundary in [4, 5] {
-                let result = scheduler
-                    .shared_prefix_publication(&[1, 2, 3, 4, 5, 6], boundary)
-                    .unwrap();
-                let expected = if boundary % checkpoint_granularity != 0 {
-                    "unsupported"
-                } else if pressure {
-                    "pressure"
-                } else {
-                    "pending"
-                };
-                assert_eq!(
-                    result.status, expected,
-                    "grain={checkpoint_granularity}, boundary={boundary}, pressure={pressure}"
-                );
-                assert_eq!(result.confirmed_prefix_tokens, 0);
+    for role in ["P", "Fused"] {
+        for (state_grain, in_forward) in [
+            (None, false),
+            (None, true),
+            (Some(1), false),
+            (Some(1), true),
+            (Some(4), true),
+        ] {
+            let state = state_grain.map_or_else(String::new, |grain| format!(
+                "cfg.cache_groups = [*cfg.cache_groups, ts.CacheGroupConfig('state', 0, 32, ts.AttnKind.State, transfer_policy=ts.CacheTransferPolicy.LatestSnapshot, checkpoint_granularity={grain})]\ncfg.host_group_packing = [1, 1]\n"
+            ));
+            let enabled = if in_forward { "True" } else { "False" };
+            let code = STORAGE_SCHEDULER.replace(
+                "result = ts.Scheduler(cfg)",
+                &format!(
+                    "cfg.role = ts.SchedulerConfig.Role.{role}\ncfg.prefix_granularity = 4\ncfg.num_host_pages = 32\ncfg.storage_config = ts.StorageConfig(8, 64, 16, 64, 32, 1, 1000, 1000, ts.StoragePressure(8, 65536, 1000), ts.StoragePressure(4, 32768, 500))\ncfg.cache_groups = [ts.CacheGroupConfig('full', 2, 32, ts.AttnKind.Full, transfer_policy=ts.CacheTransferPolicy.FullSuffix)]\ncfg.state_checkpoint_in_forward = {enabled}\n{state}result = ts.Scheduler(cfg)"
+                ),
+            );
+            let mut scheduler =
+                Python::attach(|py| Scheduler::from_python(&run(py, &code)).unwrap());
+            let supported = !(state_grain.is_some() && in_forward);
+            // A router must detect the incompatible mode before submitting a group.
+            assert_eq!(scheduler.shared_prefix_storage_enabled(), supported);
+            let tokens: Vec<i32> = (1..=22).collect();
+            for pressure in [false, true] {
+                let mut round = tick(if pressure { 2 } else { 1 });
+                round.tick.as_mut().unwrap().queued_operations = if pressure { 100 } else { 0 };
+                scheduler.advance_head(&round, &[]).unwrap();
+                // With page=4 and budget=8, in-forward State can save 20 and
+                // suppress 22. Neither query may start an impossible wait in
+                // that mode; callers need an actual-boundary receipt contract.
+                for boundary in [20, 22] {
+                    let result = scheduler
+                        .shared_prefix_publication(&tokens, boundary)
+                        .unwrap();
+                    let expected = if !supported {
+                        "unsupported"
+                    } else if pressure {
+                        "pressure"
+                    } else {
+                        "pending"
+                    };
+                    assert_eq!(
+                        result.status, expected,
+                        "role={role}, grain={state_grain:?}, in_forward={in_forward}, boundary={boundary}, pressure={pressure}"
+                    );
+                    assert_eq!(result.confirmed_prefix_tokens, 0);
+                }
             }
         }
     }

@@ -55,6 +55,11 @@ StorageStats Scheduler::GetStorageStats() const {
 }
 
 bool Scheduler::SharedPrefixStorageEnabled() const {
+    // In-forward State checkpoints can omit prompt endpoints required by exact-prefix receipts.
+    if (config_.state_checkpoint_in_forward && std::ranges::any_of(config_.cache_groups, [](const auto& group) {
+            return group.attn_kind == AttnKind::kState;
+        }))
+        return false;
     return storage_transfers_ && coordinator_.HasHostPool() && config_.role != Role::kD &&
            !config_.disable_prefix_cache && storage_transfers_->Config().max_operations >= 2 &&
            storage_transfers_->Config().max_host_blocks >= 2;
