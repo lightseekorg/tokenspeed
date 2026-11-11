@@ -856,7 +856,7 @@ def test_a_draft_block_takes_the_last_launchs_final_norm(launches: str) -> None:
             ),
         ]
     )
-    model.final_norm = lambda hidden_states, residual: -hidden_states
+    model.final_norm = lambda hidden_states, residual, ctx: -hidden_states
     hidden = torch.zeros(2, 3)
 
     out = model.run_decoder(torch.zeros(2), hidden, torch.zeros(2, 3), None)

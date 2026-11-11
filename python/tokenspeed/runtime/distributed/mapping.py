@@ -711,17 +711,6 @@ class Mapping(MappingBase):
         self.vision.rank = rank
         self.linear_attn.rank = rank
 
-    def for_block_draft(self) -> "Mapping":
-        """The layout of a block draft (a DFlash stack) of this target.
-
-        Under attention DP, a rank whose DP group holds no request skips the
-        draft, so the draft takes ``replicated_for_draft``: no dense
-        collective is left for that rank's peers to wait on. At attention DP
-        1 every rank runs the draft, so it keeps this layout, whose MLP shard
-        costs a TP-th of the replicated weights' memory and bandwidth.
-        """
-        return self.replicated_for_draft() if self.attn.dp_size > 1 else self
-
     def replicated_for_draft(self) -> "Mapping":
         """This layout with a replicated dense group, every other axis unchanged.
 

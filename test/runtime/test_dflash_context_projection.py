@@ -24,6 +24,7 @@ target's capture sink writes exactly what the projection of the
 concatenated taps gives. The draft's final norm reduces the last layer's
 dense-TP MLP partial."""
 
+import functools
 import importlib.util
 import os
 import socket
@@ -79,6 +80,15 @@ def test_each_rank_loads_and_projects_its_fc_output_columns(world_size):
         )
         columns.append(model.fc(taps)[0])
     assert torch.equal(torch.cat(columns, dim=-1), taps @ full_weight.T)
+
+
+def test_a_draft_replicates_its_mlp_only_under_attention_dp() -> None:
+    """Under attention DP a rank may skip the draft, so its MLP is replicated
+    (no dense collective); at attention DP 1 it keeps the target's TP shard."""
+    dp = Mapping(rank=3, world_size=8, attn_tp_size=1, attn_dp_size=8, dense_tp_size=8)
+    assert _draft(dp, 16).mapping.dense.tp_size == 1
+    tp = Mapping(rank=3, world_size=8, attn_tp_size=8, dense_tp_size=8)
+    assert _draft(tp, 16).mapping is tp
 
 
 def _bf16_steps_apart(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -313,19 +323,19 @@ def test_split_context_projection_matches_the_replicated_one(world_size):
         raise RuntimeError("\n".join(f"Rank {r}: {e}" for r, e in error_dict.items()))
 
 
-def _check_final_norm(rank, world_size, port):
+def _check_final_norm(rank, world_size, port, fusion_max_tokens):
     from tokenspeed.runtime.distributed.process_group_manager import (
         process_group_manager as pg_manager,
     )
+    from tokenspeed.runtime.execution.context import ForwardContext
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
     from tokenspeed.runtime.utils.env import global_server_args_dict
 
     device = torch.device("cuda", rank)
     torch.cuda.set_device(device)
-    # Attention DP 1: the draft keeps the target's dense TP width.
-    mapping = Mapping(
-        rank=rank, world_size=world_size, attn_tp_size=world_size
-    ).for_block_draft()
-    assert mapping.dense.tp_size == world_size
+    # Attention DP 1, so the draft keeps the target's dense TP width.
+    mapping = Mapping(rank=rank, world_size=world_size, attn_tp_size=world_size)
     pg_manager.init_distributed(
         mapping=mapping,
         distributed_init_method=f"tcp://localhost:{port}",
@@ -333,9 +343,11 @@ def _check_final_norm(rank, world_size, port):
     )
     pg_manager.init_process_group(mapping.dense.tp_group)
     global_server_args_dict["mapping"] = mapping
+    global_server_args_dict["comm_fusion_max_num_tokens"] = fusion_max_tokens
 
     hidden = 1024
     model = _draft(mapping, hidden).to(device=device, dtype=torch.bfloat16)
+    assert model.mapping.dense.tp_size == world_size
     torch.manual_seed(5)
     model.load_weights([("model.norm.weight", torch.rand(hidden).bfloat16() + 0.5)])
     # Small integers keep the cross-rank sum exact in BF16.
@@ -343,22 +355,38 @@ def _check_final_norm(rank, world_size, port):
     partials = partials.bfloat16()
     residual = torch.randint(-4, 5, (ROWS, hidden), device=device).bfloat16()
 
-    out = model.final_norm(partials[rank].clone(), residual.clone())
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=ROWS,
+        num_extends=0,
+        output_layout=ForwardOutputLayout(0, 0, ROWS, 1),
+        input_num_tokens=ROWS,
+        forward_mode=ForwardMode.DECODE,
+    )
+    out = model.final_norm(partials[rank].clone(), residual.clone(), ctx)
     reference = model.norm(partials.sum(dim=0), residual.clone())[0]
     assert torch.equal(out, reference), (out - reference).abs().max()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU collective")
 @pytest.mark.parametrize("world_size", [4, 8])
-def test_final_norm_reduces_the_last_mlp_partial(world_size):
+@pytest.mark.parametrize("fusion_max_tokens", [-1, 2048], ids=["unfused", "fused"])
+def test_final_norm_reduces_the_last_mlp_partial(world_size, fusion_max_tokens):
     """The layers' MLPs hand back shard-local partials; the last one reaches
-    ``final_norm``, which must sum it over the dense group before the norm."""
+    ``final_norm``, which must sum it over the dense group before the norm,
+    both as a separate all-reduce and fused with the norm."""
     if world_size > torch.cuda.device_count():
         pytest.skip(f"Need {world_size} GPUs, have {torch.cuda.device_count()}")
     error_dict = mp.Manager().dict()
     mp.spawn(
         _worker,
-        args=(world_size, _open_port(), error_dict, _check_final_norm),
+        args=(
+            world_size,
+            _open_port(),
+            error_dict,
+            functools.partial(_check_final_norm, fusion_max_tokens=fusion_max_tokens),
+        ),
         nprocs=world_size,
         join=True,
     )

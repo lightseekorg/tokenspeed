@@ -540,7 +540,7 @@ class DFlash2DraftModel(DFlashDraftModel):
         lm_head_input = state.finish_step()
         if lm_head_input is not None:
             return lm_head_input
-        return self.final_norm(hidden_states, residual)
+        return self.final_norm(hidden_states, residual, ctx)
 
     def configure_target(self, target_model, target_config) -> None:
         """Install the capture inputs, the packed head monokernel under
@@ -579,7 +579,10 @@ class DFlash2DraftModel(DFlashDraftModel):
         )
 
     def final_norm(
-        self, hidden_states: torch.Tensor, residual: torch.Tensor | None
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        ctx: ForwardContext,
     ) -> torch.Tensor:
         """The last layer hands back its MLP conv's partial; reduce it here."""
         if residual is None:
