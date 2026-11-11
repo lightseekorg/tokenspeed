@@ -26,10 +26,13 @@ from pathlib import Path
 
 import pytest
 import torch
+from transformers import PretrainedConfig
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
+from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.input_buffer import InputBuffers
 from tokenspeed.runtime.execution.memory_delta import NULL_MEMORY_DELTA_OBSERVER
 from tokenspeed.runtime.execution.model_executor import ModelExecutorConfig
@@ -43,6 +46,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     pack,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import CacheGroupSpec
+from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
 from tokenspeed.runtime.multimodal.inputs import MultimodalForwardContext
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
@@ -53,7 +57,9 @@ class _TokenModel(torch.nn.Module):
         super().__init__()
         self.embed_tokens = torch.nn.Embedding(32, 8, device="cuda")
 
-    def forward(self, input_ids, positions, ctx, *, input_embeds):
+    def forward(self, input_ids, positions, ctx, *, input_embeds=None):
+        if input_embeds is None:
+            input_embeds = self.embed_tokens(input_ids)
         return input_embeds.square() + positions[:, None], None
 
 
@@ -62,12 +68,18 @@ class _HiddenRows(torch.nn.Module):
         return hidden
 
 
-class _TextModel(torch.nn.Module):
+class _TextModel(BaseCausalLM):
     def __init__(self):
-        super().__init__()
-        self.model = _TokenModel()
-        self.lm_head = torch.nn.Identity()
-        self.logits_processor = _HiddenRows()
+        super().__init__(PretrainedConfig(), Mapping(rank=0, world_size=1))
+
+    def resolve_model(self, config, mapping, quant_config, prefix):
+        return _TokenModel()
+
+    def resolve_lm_head(self, config, quant_config, prefix):
+        return torch.nn.Identity()
+
+    def resolve_logits_processor(self, config):
+        return _HiddenRows()
 
     def multimodal_input_embeds(self, input_ids, ctx, multimodal_context):
         return self.model.embed_tokens(input_ids)
@@ -75,6 +87,8 @@ class _TextModel(torch.nn.Module):
 
 class _HistoryModel(_TextModel):
     def prefill_input_embeds(self, input_ids, ctx, *, request_token_history):
+        if request_token_history is None:
+            raise ValueError("history is required when computing embeddings")
         history = request_token_history
         # A small history-dependent embedding with the runtime's append contract.
         # This intentionally uses CPU lengths: the seam must stay outside capture.
@@ -203,13 +217,8 @@ def test_embeddings_refresh_with_live_history_and_padding(history_embedding):
                 ib.input_start_offsets_buf[: len(slots) + 1],
                 ib.active_request_mask_buf[: len(slots)],
             )
-            expected_embeds = (
-                model.prefill_input_embeds(ids, ctx, request_token_history=history)
-                if history_embedding
-                else model.model.embed_tokens(ids)
-            )
-            expected, _ = model.model(
-                ids, ib.positions_buf[:count], ctx, input_embeds=expected_embeds
+            expected = model(
+                ctx, ids, ib.positions_buf[:count], request_token_history=history
             )
             appended = history_ids.clone()
             history_ids.copy_(before)
@@ -225,6 +234,21 @@ def test_embeddings_refresh_with_live_history_and_padding(history_embedding):
         owner.release_graphs()
         owner.capture(entries=None, observer=NULL_MEMORY_DELTA_OBSERVER)
         torch.testing.assert_close(history_ids, before, rtol=0, atol=0)
+        ctx = owner.make_dummy_batch(16, 1)
+        ids = ib.input_ids_buf[:16]
+        history = RequestTokenHistoryView(
+            history_ids,
+            committed,
+            ib.req_pool_indices_buf[:1],
+            ib.input_start_offsets_buf[:2],
+            ib.active_request_mask_buf[:1],
+        )
+        expected = model(ctx, ids, ib.positions_buf[:16], request_token_history=history)
+        appended = history_ids.clone()
+        history_ids.copy_(before)
+        actual = owner.replay(ctx, ids, request_token_history=history)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.testing.assert_close(history_ids, appended, rtol=0, atol=0)
     finally:
         owner.release_graphs()
 
@@ -252,3 +276,42 @@ def test_dp_multimodal_restriction_follows_active_model(active):
         runner, _NoAttention(), _pool(), InputBuffers(2, 32, 4), config
     )
     assert bool(owner.capture_plan) is not active
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@torch.inference_mode()
+def test_supplied_embeddings_bypass_history_in_eager_forward():
+    model = _HistoryModel()
+    owner = PrefillGraph(
+        _Runner(model, _ModelConfig(True)),
+        _NoAttention(),
+        _pool(),
+        InputBuffers(2, 32, 4),
+        _config(),
+    )
+    ctx = owner.make_dummy_batch(16, 1)
+    ids = torch.arange(16, device="cuda")
+    positions = owner.input_buffers.positions_buf[:16]
+    embeds = torch.randn(16, 8, device="cuda")
+    actual = model(ctx, ids, positions, input_embeds=embeds)
+    torch.testing.assert_close(actual, embeds.square() + positions[:, None])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@torch.inference_mode()
+def test_prefill_embedding_hook_does_not_replace_decode_embedding():
+    model = _HistoryModel()
+    owner = PrefillGraph(
+        _Runner(model, _ModelConfig(True)),
+        _NoAttention(),
+        _pool(),
+        InputBuffers(2, 32, 4),
+        _config(),
+    )
+    ctx = owner.make_dummy_batch(1, 1)
+    ctx.forward_mode = ForwardMode.DECODE
+    ids = torch.ones(1, dtype=torch.int32, device="cuda")
+    positions = owner.input_buffers.positions_buf[:1]
+    actual = model(ctx, ids, positions)
+    expected = model.model.embed_tokens(ids).square() + positions[:, None]
+    torch.testing.assert_close(actual, expected)

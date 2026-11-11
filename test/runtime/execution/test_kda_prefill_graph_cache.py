@@ -551,7 +551,7 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name):
     owner._captures = {}
     owner.input_buffers = SimpleNamespace(input_ids_buf=torch.ones(bucket))
     owner._embed_tokens = lambda ids: ids
-    owner._prefill_input_embeds = None
+    owner._embedding_model = None
     owner._land_input_embeds = lambda *args: None
     owner.attn_backend = hybrid
     owner._run_inner = lambda bucket: (forward(compact=False), None)
@@ -704,7 +704,7 @@ def test_outer_owner_selects_matching_graph_and_refreshes_before_replay(
     owner._replay_bucket = lambda ctx: 8
     owner._log_engaged_once = lambda *args: None
     owner._embed_tokens = lambda ids: torch.zeros(8, 4)
-    owner._prefill_input_embeds = None
+    owner._embedding_model = None
     owner._land_input_embeds = lambda *args: None
     owner._padded_to = lambda *args: nullcontext()
     owner.config = SimpleNamespace(model_is_mrope=False, world_size=1)
@@ -790,7 +790,7 @@ def test_replay_waits_for_the_whole_host_load_before_the_first_segment(consumers
     owner._replay_bucket = lambda ctx: 8
     owner._log_engaged_once = lambda *args: None
     owner._embed_tokens = lambda ids: torch.zeros(8, 4)
-    owner._prefill_input_embeds = None
+    owner._embedding_model = None
     owner._land_input_embeds = lambda *args: None
     owner._padded_to = lambda *args: nullcontext()
     owner.config = SimpleNamespace(model_is_mrope=False, world_size=1)
@@ -918,7 +918,7 @@ def test_outer_capture_records_one_variant_per_configured_request_count():
     owner._captures = {}
     owner.input_buffers = SimpleNamespace(input_ids_buf=torch.ones(8))
     owner._embed_tokens = lambda ids: ids
-    owner._prefill_input_embeds = None
+    owner._embedding_model = None
     owner._land_input_embeds = lambda *args: None
     active_count = None
 
@@ -1109,7 +1109,7 @@ def kimi_host_cache():
     owner.config = SimpleNamespace(world_size=1, model_is_mrope=False)
     owner._replay_bucket = lambda ctx: _BUCKET
     owner._embed_tokens = lambda ids: ids
-    owner._prefill_input_embeds = None
+    owner._embedding_model = None
     owner._land_input_embeds = lambda *args: None
     owner.text_model = SimpleNamespace(
         lm_head=None, logits_processor=lambda ids, hidden, *args: hidden

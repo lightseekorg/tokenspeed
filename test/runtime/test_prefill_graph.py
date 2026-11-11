@@ -1095,7 +1095,7 @@ class TestCaptureFailureIsLoudTest:
             max_num_seqs=4,
             data_parallel_size=1,
         )
-        pg._prefill_input_embeds = None
+        pg._embedding_model = None
         pg._embed_tokens = SimpleNamespace(
             weight=self.torch.zeros(2, 8, dtype=self.torch.float32)
         )

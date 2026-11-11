@@ -288,7 +288,7 @@ def test_outer_graph_replays_mamba2_lengths_pages_and_states(batch_size):
     owner._captures = {}
     owner.input_buffers = SimpleNamespace(input_ids_buf=torch.ones(bucket))
     owner._embed_tokens = lambda ids: ids
-    owner._prefill_input_embeds = None
+    owner._embedding_model = None
     owner._land_input_embeds = lambda *args: None
     owner.attn_backend = backend
     owner._run_inner = lambda bucket: (forward(), None)

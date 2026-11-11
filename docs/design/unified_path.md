@@ -712,15 +712,20 @@ configuration, so every DP rank derives the same answer
 only. `decode_graph=False` still requires `refresh_decode_metadata` and
 `init_cuda_graph_state` — eager decode runs the same unified path.
 
-Models whose embedding reads request-token history may expose
-`prefill_input_embeds(input_ids, ctx, *, request_token_history)` on the text
-model. The executor supplies its live `RequestTokenHistoryView`; the graph
+Models whose embedding reads request-token history may implement
+`PrefillEmbeddingModel` on the text model. Its
+`prefill_input_embeds(input_ids, ctx, *, request_token_history)` method is
+shared by `BaseCausalLM.prepare_model_kwargs` for eager prefill and the graph
+owner for replay. Models overriding argument preparation must preserve supplied
+`input_embeds` and reuse the same embedding method when computing them eagerly.
+The executor supplies its live `RequestTokenHistoryView`; the graph
 owner calls this method eagerly, before padding, and copies its result into
 the same static embedding buffer used by ordinary text and multimodal
 prefills. The method must return all input rows, and every history-dependent
 operation must finish there. The captured inner stack consumes the supplied
-`input_embeds` without requiring history. Capture uses zero dummy embeddings
-and does not access live history. Models requiring history without this seam
+`input_embeds` without requiring or appending history, including during
+`prepare_model_kwargs`. Decode keeps its existing embedding path. Capture uses
+zero dummy embeddings and does not access live history. Models requiring history without this seam
 remain eager. Multimodal forwards of history-embedding models also remain
 eager because the multimodal embedding seam does not receive history.
 Request history retains its existing runtime owner and lifetime.

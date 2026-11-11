@@ -33,6 +33,7 @@ from transformers import PretrainedConfig
 
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.prefill_embedding import PrefillEmbeddingModel
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from tokenspeed.runtime.layers.quantization import QuantizationConfig
@@ -433,6 +434,18 @@ class BaseCausalLM(nn.Module):
         for key in ("input_embeds", "inputs_embeds", "pp_inbound"):
             if kwargs.get(key) is not None:
                 model_kwargs[key] = kwargs[key]
+        # Supplied embeddings or a pipeline handoff already provide the input.
+        if (
+            isinstance(self, PrefillEmbeddingModel)
+            and not model_kwargs
+            and ctx.forward_mode is not None
+            and ctx.forward_mode.is_extend_or_mixed()
+        ):
+            model_kwargs["input_embeds"] = self.prefill_input_embeds(
+                input_ids,
+                ctx,
+                request_token_history=kwargs.get("request_token_history"),
+            )
         return model_kwargs
 
     # Weight loading.

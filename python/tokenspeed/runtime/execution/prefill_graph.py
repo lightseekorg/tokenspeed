@@ -86,6 +86,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
 from tokenspeed.runtime.execution.forward_step import prepare_draft_extend_metadata
 from tokenspeed.runtime.execution.memory_delta import MemoryDeltaObserver
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+from tokenspeed.runtime.execution.prefill_embedding import PrefillEmbeddingModel
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
     CacheBatchMetadata,
@@ -430,8 +431,10 @@ class PrefillGraph:
         # multimodal_input_embeds; others (e.g. deepstack) replay text only.
         self._multimodal_input_embeds = getattr(model, "multimodal_input_embeds", None)
         self.text_model, self.inner_model = text_and_inner_model(model)
-        self._prefill_input_embeds = getattr(
-            self.text_model, "prefill_input_embeds", None
+        self._embedding_model: PrefillEmbeddingModel | None = (
+            self.text_model
+            if isinstance(self.text_model, PrefillEmbeddingModel)
+            else None
         )
         # Embedding runs eagerly OUTSIDE the graphs (see capture); the graphs
         # read a static input-embeds buffer instead of gathering from input_ids.
@@ -473,7 +476,7 @@ class PrefillGraph:
             # belong to the eager embedding, outside the captured inner stack.
             or (
                 model_runner.model_config.requires_request_token_history
-                and self._prefill_input_embeds is None
+                and self._embedding_model is None
             )
             # DP replay decisions must come from replicated state, and a
             # forward's multimodal-ness is rank-local: one rank running its mm
@@ -1035,7 +1038,7 @@ class PrefillGraph:
         )
 
     def _prepare_dummy_embeddings(self, num_tokens: int) -> None:
-        if self._prefill_input_embeds is not None:
+        if self._embedding_model is not None:
             # Capture starts after the embedding. It neither needs nor mutates
             # request history; replay supplies the live embeddings eagerly.
             self._input_embeds_buf[:num_tokens].zero_()
@@ -1345,8 +1348,7 @@ class PrefillGraph:
         extra per-layer inputs (deepstack) run eager.
         """
         if multimodal_context is not None and (
-            self._multimodal_input_embeds is None
-            or self._prefill_input_embeds is not None
+            self._multimodal_input_embeds is None or self._embedding_model is not None
         ):
             # The multimodal seam does not consume or append token history.
             return False
@@ -1383,10 +1385,10 @@ class PrefillGraph:
             )
         if input_embeds is None:
             input_embeds = (
-                self._prefill_input_embeds(
+                self._embedding_model.prefill_input_embeds(
                     input_ids, ctx, request_token_history=request_token_history
                 )
-                if self._prefill_input_embeds is not None
+                if self._embedding_model is not None
                 else self._embed_tokens(input_ids)
             )
         self._land_input_embeds(input_embeds, bucket)
