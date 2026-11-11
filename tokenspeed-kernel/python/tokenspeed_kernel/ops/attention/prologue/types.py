@@ -227,6 +227,29 @@ class MLAExpandedKV:
 
 
 @dataclass(frozen=True)
+class GatheredLatentStore:
+    """Prepared rows in padded producer order and their owner/compact targets.
+
+    Slots address virtual history; mapped_slots address the compact buffer.
+    The store writes owner-local history and repairs compact boundary pages
+    in one native operation, without repeating normalization or rotation.
+    """
+
+    current: torch.Tensor
+    slots: torch.Tensor
+    cache: torch.Tensor
+    compact: torch.Tensor
+    direct: torch.Tensor
+    mapped_slots: torch.Tensor
+    virtual_blocks: int
+    send_rows: int
+    block_rows: int
+    degree: int
+    rank: int
+    history_rows: int
+
+
+@dataclass(frozen=True)
 class GQAPrologueOutput:
     """Inputs for GQA core attention.
 

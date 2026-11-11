@@ -28,9 +28,11 @@ import torch
 import torch.distributed as dist
 from tokenspeed_kernel.ops.attention.mla import (
     mla_prefill,
-    prepare_mla_prolog,
+    prepare_mla_prologue_weights,
     prepare_mla_resources,
 )
+from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 from tokenspeed.runtime.layers.attention.backends.paged.ascend_mla import (
     AscendMLABackend,
@@ -127,10 +129,9 @@ class AscendMLAAttention(KimiLinearMLAAttention):
             del rows, expanded, key, partial, lse
         return output.to(query.dtype)
 
-    def _forward_prefill(self, positions, hidden, ctx, comm_manager):
-        backend = ascend_mla_prefill_backend(ctx.attn_backend)
-        plan = backend._prefill_plan
-        if plan is None or hidden.shape[0] != plan.row_counts[backend._dcp.rank]:
+    def _forward_prefill(self, positions, hidden, ctx, *, backend):
+        plan = backend.prefill_cache_metadata
+        if hidden.shape[0] != plan.projection_row_counts[backend._dcp.rank]:
             raise ValueError("MLA Prefill hidden rows must follow the TP partition")
         if (
             self.use_output_gate
@@ -156,19 +157,23 @@ class AscendMLAAttention(KimiLinearMLAAttention):
         # Retain Q-latent gathering and local-head projections. KV uses the
         # same execution stream with early history gathering when available.
         backend.prefetch_prefill_layer(self.layer_id)
-        backend.start_prefill_kv(self.layer_id, latent)
-        qnorm = comm_manager.pre_attn_comm(qnorm, ctx)
+        backend.prepare_prefill_current(
+            self.layer_id,
+            latent,
+            None,
+            ctx.attn_backend.padded_write_locations(
+                self.attn_mqa, ctx.forward_mode, sum(plan.projection_row_counts)
+            ),
+        )
+        qnorm = backend.gather_prefill_queries(qnorm)
         query = self.q_b_proj(qnorm)[0].view(-1, self.num_local_heads, self.qk_head_dim)
         if self.q_lora_scale is not None:
             query = query * self.q_lora_scale
-        if query.shape[0] != plan.row_end:
+        if query.shape[0] != plan.query_end:
             raise ValueError("MLA Prefill Q gather must cover the full token span")
-        backend.consume_prefill_kv(
-            self.layer_id,
-            ctx.attn_backend.padded_write_locations(
-                self.attn_mqa, ctx.forward_mode, query.shape[0]
-            ),
-        )
+        from tokenspeed_kernel.ops.attention.prologue import gathered_latent_store
+
+        gathered_latent_store(backend.prefill_store(self.attn_mqa))
         attended = query.new_empty(
             (query.shape[0], self.num_local_heads, self.v_head_dim)
         )
@@ -186,15 +191,27 @@ class AscendMLAAttention(KimiLinearMLAAttention):
         backend.finish_prefill_layer(self.layer_id)
         return self.o_proj(attended.flatten(1))[0]
 
-    def forward(self, positions, hidden_states, ctx, comm_manager, *, projection_out):
-        if (
-            ctx.forward_mode.is_extend_or_mixed()
-            and self.prefill_supported
-            and ascend_mla_prefill_backend(ctx.attn_backend).prefill_enabled
-        ):
-            if projection_out is not None:
-                raise ValueError("MLA Prefill output reduction belongs to CommManager")
-            return self._forward_prefill(positions, hidden_states, ctx, comm_manager)
+    def forward(
+        self,
+        positions,
+        hidden_states,
+        ctx,
+        comm_manager,
+        *,
+        projection_out,
+        prefill_backend=None,
+    ):
+        if ctx.forward_mode.is_extend_or_mixed() and self.prefill_supported:
+            if prefill_backend is None:
+                prefill_backend = ascend_mla_prefill_backend(ctx.attn_backend)
+            if prefill_backend.prefill_enabled:
+                if projection_out is not None:
+                    raise ValueError(
+                        "MLA Prefill output reduction belongs to CommManager"
+                    )
+                return self._forward_prefill(
+                    positions, hidden_states, ctx, backend=prefill_backend
+                )
         if (
             self.fused_decode is not None
             and ctx.forward_mode.is_decode()
@@ -228,8 +245,25 @@ class FusedMLADecode:
 
     def __init__(self, layer, *, owner, group, rank):
         self.layer, self.owner, self.rank = layer, owner, rank
-        self.prolog, self.weights, self.attention, self.merge = prepare_mla_prolog(
-            layer, group=group
+        self.prologue = select_kernel(
+            "attention",
+            "mla_fused_prolog",
+            format_signature(x=dense_tensor_format(layer.q_b_proj.weight.dtype)),
+        )
+        self.prologue_weights = prepare_mla_prologue_weights(
+            layer,
+            group=group,
+            prologue=self.prologue,
+        )
+        self.decode_partial = select_kernel(
+            "attention",
+            "mla_fused_attention",
+            format_signature(query=dense_tensor_format(torch.bfloat16)),
+        )
+        self.merge_partials = select_kernel(
+            "attention",
+            "mla_fused_merge",
+            format_signature(output=dense_tensor_format(torch.float32)),
         )
         device = layer.q_b_proj.weight.device
         self.outputs = {
@@ -283,7 +317,7 @@ class FusedMLADecode:
         locations = ctx.attn_backend.write_locations(layer.attn_mqa, ctx.forward_mode)
         slots = backend.prepare_prolog_metadata(locations)
         cache = ctx.token_to_kv_pool.get_key_buffer(layer.layer_id).view(-1, 576)
-        if self.weights["rotary_mode"]:
+        if self.prologue_weights["rotary_mode"]:
             positions = positions.to(dtype=torch.int64).contiguous()
         else:
             positions = nope_positions
@@ -291,9 +325,9 @@ class FusedMLADecode:
         hidden.record_stream(stream)
         slots.record_stream(stream)
         positions.record_stream(stream)
-        self.prolog(
+        self.prologue(
             hidden,
-            weights=self.weights,
+            weights=self.prologue_weights,
             rank=self.rank,
             window=self.owner.window,
             query=query,
@@ -307,7 +341,7 @@ class FusedMLADecode:
         if local is None:
             raise RuntimeError("MLA decode metadata was not refreshed")
         table, lengths, visible = local
-        partial, lse = self.attention(
+        partial, lse = self.decode_partial(
             query,
             cache=cache.view(-1, backend.kernel_page_size, 1, 576),
             table=table,
@@ -317,7 +351,7 @@ class FusedMLADecode:
             lse=self.attention_outputs[rows][1],
         )
         producer, maximum, total = self.owner.outputs[rows]
-        result = self.merge(
+        result = self.merge_partials(
             partial,
             lse=lse,
             visible=visible,

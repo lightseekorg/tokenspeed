@@ -51,6 +51,7 @@ from tokenspeed_kernel.ops.attention.prologue.checks import (
 )
 from tokenspeed_kernel.ops.attention.prologue.types import (
     FP8TensorScales,
+    GatheredLatentStore,
     GQAPrologueOutput,
     HeadKVCache,
     HeadNorm,
@@ -345,6 +346,57 @@ def mla_prologue(
         )
 
 
+def gathered_latent_store(store: GatheredLatentStore) -> None:
+    """Store already prepared, gathered latent rows and their compact view."""
+    if (
+        store.degree < 1
+        or not 0 <= store.rank < store.degree
+        or store.block_rows < 1
+        or store.virtual_blocks < 1
+        or store.send_rows < 0
+        or store.history_rows < 1
+    ):
+        raise ValueError("Invalid gathered latent store geometry")
+    width = store.cache.shape[-1]
+    for value in (store.current, store.cache, store.compact):
+        if (
+            value.ndim != 2
+            or value.shape[1] != width
+            or value.dtype != store.cache.dtype
+            or value.device != store.cache.device
+            or not value.is_contiguous()
+        ):
+            raise ValueError("Gathered latent store needs matching dense row planes")
+    rows = store.slots.numel()
+    for value, dtype in (
+        (store.slots, torch.int64),
+        (store.direct, torch.uint8),
+        (store.mapped_slots, torch.int64),
+    ):
+        if (
+            value.ndim != 1
+            or value.dtype != dtype
+            or value.device != store.cache.device
+            or not value.is_contiguous()
+            or value.numel() != rows
+        ):
+            raise ValueError("Gathered latent store needs one mapping per current row")
+    if (
+        store.cache.shape[0] % store.block_rows
+        or store.current.shape[0] != store.degree * store.send_rows
+        or rows > store.current.shape[0]
+        or store.compact.shape[0] != store.history_rows + store.current.shape[0]
+    ):
+        raise ValueError("Gathered latent store rows disagree with their layout")
+    kernel = select_kernel(
+        "attention",
+        "mla_gathered_store",
+        format_signature(latent=dense_tensor_format(store.cache.dtype)),
+        traits={"width": width},
+    )
+    kernel(store)
+
+
 def latent_store(
     latent: torch.Tensor,
     *,
@@ -384,6 +436,7 @@ def latent_store(
 __all__ = [
     "FP8TensorScales",
     "GQAPrologueOutput",
+    "GatheredLatentStore",
     "HeadKVCache",
     "HeadNorm",
     "KVCacheFormat",
@@ -396,11 +449,14 @@ __all__ = [
     "RopeStyle",
     "Rotary",
     "gqa_prologue",
+    "gathered_latent_store",
     "latent_store",
     "mla_prologue",
     "qk_norm_rope",
 ]
 
+
+import tokenspeed_kernel.ops.attention.prologue.ascend  # noqa: E402,F401
 
 # Backend registration (side-effect imports)
 import tokenspeed_kernel.ops.attention.prologue.composite  # noqa: E402,F401

@@ -319,6 +319,12 @@ class ModelRunner:
             return prepared
         return bool(prepare(max_num_tokens)) or prepared
 
+    def release_attention_runtime(self) -> None:
+        """Release model-owned native attention state after graphs and forwards end."""
+        release = getattr(self.model, "release_attention_runtime", None)
+        if release is not None:
+            release()
+
     def release_dp_linear_communication(self) -> None:
         """Collectively release this model's DP projection communication only.
 

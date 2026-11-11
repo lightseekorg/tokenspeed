@@ -604,6 +604,31 @@ the underlying FlashInfer operation.
 
 ## Ascend fused decode resources
 
+Ascend's native execution consumes request-local sparse offsets rather than
+the global KV slots of the portable sparse interface above. These operations
+have separate registered entry points, so an incompatible layout cannot win
+selection for the portable call:
+
+| Operation | Inputs and result |
+| --- | --- |
+| `store_index_keys` | BF16 Index-K rows and owner-local slots; writes the persistent index cache |
+| `dsa_local_topk` | Query/index cache, causal request ends and forced windows; returns local sparse offsets and chunk hints |
+| `dsa_local_topk_candidates` | Owner-local causal metadata; returns offsets and scores for distributed selection |
+| `dsa_gathered_prefill_topk` | Contiguous query spans and gathered Index-K pages; returns sparse offsets |
+| `dsa_gathered_prefill_attention` | Gathered latent pages and per-query causal metadata; returns head-major attention output |
+| `dsa_sparse_decode` | Selected local offsets and latent KV; returns token-major attention output |
+| `dsa_sparse_decode_partial` | Rank-major queries and owner KV; returns output, softmax maximum and sum |
+| `merge_dsa_topk`, `merge_dsa_lse` | Prepared native communication inputs; exchange and merge candidates or attention partials |
+
+Ordinary distributed attention uses the shared `merge_normalized_partials`
+operation over normalized outputs and natural-log LSE. Weight preparation and
+the fused prologue/output projection likewise select individual callables.
+The Runtime holds no adapter containing a collection of these operations.
+Common Prefill page layout lives at the `attention.ascend_prefill` boundary;
+DSA's query metadata is generated separately. Gathered Index-K stores write
+both persistent owner rows and non-aliasing compact pages through the named
+`store_gathered_index_keys` operation.
+
 The fused Prolog returns query, index-query and score, or writes them through
 an explicit caller-output form. KV and Index-K caches remain caller-owned
 persistent state. QA is private operator workspace; auxiliary debug copies are

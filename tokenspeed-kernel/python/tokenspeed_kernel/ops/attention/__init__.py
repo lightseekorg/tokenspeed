@@ -135,6 +135,22 @@ import tokenspeed_kernel.ops.attention.ascend  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.triton  # noqa: E402,F401
 
+
+def merge_normalized_partials(output: torch.Tensor, lse: torch.Tensor) -> torch.Tensor:
+    """Merge O[ranks,rows,dim] with natural-log LSE[ranks,rows].
+
+    Empty owners have zero output and -inf LSE; an all-empty row returns zero.
+    The selected implementation returns the normalized merged output.
+    """
+    kernel = select_kernel(
+        "attention",
+        "merge_normalized_partials",
+        format_signature(input=dense_tensor_format(output.dtype)),
+    )
+    return kernel(output, lse)
+
+
 __all__ = [
+    "merge_normalized_partials",
     "attn_merge_state",
 ]

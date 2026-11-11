@@ -36,7 +36,6 @@ from compressed_tensors.quantization import QuantizationStrategy
 from tokenspeed_kernel.ops.attention import attn_merge_state
 from tokenspeed_kernel.ops.attention.mla import (
     mla_project_value,
-    mla_project_value_prefers_contiguous_weight,
 )
 from tokenspeed_kernel.ops.attention.mla.tokenspeed_mla import mla_kv_pack_quantize_fp8
 from tokenspeed_kernel.ops.attention.prologue import MLAExpandedKV, MLAPrologueOutput
@@ -82,6 +81,9 @@ from tokenspeed.runtime.execution.context import (
     report_collective_sizing,
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.layers.attention.mla.weights import (
+    _prepare_mla_kv_b_proj_weights,
+)
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
 from tokenspeed.runtime.layers.linear import (
@@ -118,7 +120,6 @@ from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from tokenspeed.runtime.model_loader.weight_utils import (
-    bind_or_copy,
     default_weight_loader,
 )
 from tokenspeed.runtime.models.base import BaseCausalLM
@@ -142,40 +143,6 @@ _OPTIONAL_MISSING_WEIGHT_SUFFIXES = (
     ".k_scale",
     ".v_scale",
 )
-
-
-def _prepare_mla_kv_b_proj_weights(
-    w: torch.Tensor, self_attn
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Split ``kv_b_proj`` into the absorbed ``w_kc``/``w_vc`` pair.
-
-    When ``self_attn`` already holds a pair of the same geometry (a live
-    weight update re-running ``post_load_weights``), the new values are
-    copied into it so captured CUDA graphs keep valid addresses.
-
-    An attention with ``absorbed_weights_k_major`` set runs both absorbed
-    products as plain GEMMs and keeps their reduction dim contiguous
-    regardless of the fused value-projection kernel's preference.
-    """
-    w_kc, w_vc = w.unflatten(
-        0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
-    ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
-    if not getattr(
-        self_attn, "absorbed_weights_k_major", False
-    ) and mla_project_value_prefers_contiguous_weight(
-        dtype=w.dtype,
-        heads=w_vc.shape[0],
-        latent_dim=w_vc.shape[2],
-        value_dim=w_vc.shape[1],
-    ):
-        w_kc, w_vc = w_kc.contiguous(), w_vc.transpose(1, 2).contiguous()
-    else:
-        w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
-        w_vc = w_vc.contiguous().transpose(1, 2)
-    return (
-        bind_or_copy(self_attn.w_kc, w_kc),
-        bind_or_copy(self_attn.w_vc, w_vc),
-    )
 
 
 def absorb_mla_kv_b_proj(self_attn) -> None:

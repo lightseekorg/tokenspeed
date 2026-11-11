@@ -27,7 +27,8 @@ import torch
 
 from tokenspeed.runtime.layers.attention.dcp.ascend import (
     AscendPrefillOptions,
-    AscendPrefillPlan,
+    DSAPrefillQueryMetadata,
+    PrefillCacheMetadata,
 )
 from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
 
@@ -84,13 +85,12 @@ def test_request_pages_and_query_causal_spans(degree, granularity, extends, pref
     virtual_blocks = last_page // per_block + 1
     local_capacity = ((virtual_blocks - 2) // degree + 2) * per_block
     plans = [
-        AscendPrefillPlan.build(
+        PrefillCacheMetadata.build(
             metadata,
             CachePlacement(granularity, virtual_blocks, tuple(range(degree)), rank),
             degree=degree,
             rank=rank,
             page_size=page,
-            topk=2048,
             local_cache_pages=local_capacity,
             options=AscendPrefillOptions(max(sum(extends), 1), page),
         )
@@ -106,14 +106,14 @@ def test_request_pages_and_query_causal_spans(degree, granularity, extends, pref
         physical = ((block - 1) // degree + 1) * per_block + subpage if block else 0
         caches[owner][physical] = torch.arange(page, dtype=torch.int64) + virtual * page
     send_rows = -(-sum(extends) // (degree * page)) * page
-    gather_plan = plans[0].gather
+    gather_plan = plans[0].history_gather
     history_rows = page + sum(gather_plan.row_counts)
     gathered = torch.zeros(
         (history_rows // page + degree * send_rows // page, page), dtype=torch.int64
     )
     offset = page
     for rank, plan in enumerate(plans):
-        slots = plan.gather.send_slots.tolist()
+        slots = plan.history_gather.send_slots.tolist()
         for local in slots:
             physical, lane = divmod(local, page)
             gathered.view(-1)[offset] = caches[rank][physical][lane]
@@ -126,14 +126,16 @@ def test_request_pages_and_query_causal_spans(degree, granularity, extends, pref
                 table[request, positions // page].long() * page + positions % page
             ).tolist()
         )
-    for owner, count in enumerate(plans[0].row_counts):
-        start = sum(plans[0].row_counts[:owner])
+    for owner, count in enumerate(plans[0].projection_row_counts):
+        start = sum(plans[0].projection_row_counts[:owner])
         target = history_rows + owner * send_rows
         gathered.view(-1)[target : target + count] = torch.tensor(
             current_values[start : start + count]
         )
-    assert sum(plans[0].row_counts) == sum(extends)
-    assert max(plans[0].row_counts) - min(plans[0].row_counts) <= 1
+    assert sum(plans[0].projection_row_counts) == sum(extends)
+    assert (
+        max(plans[0].projection_row_counts) - min(plans[0].projection_row_counts) <= 1
+    )
     global_sequence = [
         request for request, count in enumerate(extends) for _ in range(count)
     ]
@@ -141,22 +143,23 @@ def test_request_pages_and_query_causal_spans(degree, granularity, extends, pref
         prefix + i + 1 for prefix, count in zip(prefixes, extends) for i in range(count)
     ]
     for plan in plans:
+        query_metadata = DSAPrefillQueryMetadata.build(metadata, plan, topk=2048)
         active_requests = [
             request
             for request, count in enumerate(extends)
-            if sum(extends[:request]) < plan.row_end
-            and sum(extends[: request + 1]) > plan.row_start
+            if sum(extends[:request]) < plan.query_end
+            and sum(extends[: request + 1]) > plan.query_start
             and count
         ]
         expected_sequence = [
             active_requests.index(request)
-            for request in global_sequence[plan.row_start : plan.row_end]
+            for request in global_sequence[plan.query_start : plan.query_end]
         ]
-        assert plan.query_seq.tolist() == expected_sequence
-        assert plan.scan_count.tolist() == [
-            min(end, 2048) for end in global_ends[plan.row_start : plan.row_end]
+        assert query_metadata.query_seq.tolist() == expected_sequence
+        assert query_metadata.scan_count.tolist() == [
+            min(end, 2048) for end in global_ends[plan.query_start : plan.query_end]
         ]
-        assert plan.query_cu[-1] == plan.row_end - plan.row_start
+        assert query_metadata.query_cu[-1] == plan.query_end - plan.query_start
         for compact, request in enumerate(active_requests):
             length = lengths[request]
             positions = torch.arange(length)
@@ -167,20 +170,19 @@ def test_request_pages_and_query_causal_spans(degree, granularity, extends, pref
                 table[request, positions // page].long() * page + positions % page
             )
             torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-        q_lens = torch.diff(plan.query_cu).tolist()
-        k_lens = torch.diff(plan.key_cu).tolist()
+        q_lens = torch.diff(query_metadata.query_cu).tolist()
+        k_lens = torch.diff(query_metadata.key_cu).tolist()
         active_requests = [
             request
             for request, count in enumerate(extends)
-            if sum(extends[:request]) < plan.row_end
-            and sum(extends[: request + 1]) > plan.row_start
+            if sum(extends[:request]) < plan.query_end
+            and sum(extends[: request + 1]) > plan.query_start
             and count
         ]
-        assert plan.index_table.data_ptr() == plan.page_table.data_ptr()
         for request, qlen, klen in zip(active_requests, q_lens, k_lens):
             offset = sum(extends[:request])
-            start = min(max(plan.row_start - offset, 0), extends[request])
-            end = min(max(plan.row_end - offset, 0), extends[request])
+            start = min(max(plan.query_start - offset, 0), extends[request])
+            end = min(max(plan.query_end - offset, 0), extends[request])
             assert qlen == end - start
             assert klen == prefixes[request] + end
 
@@ -190,13 +192,12 @@ def test_prefill_rejects_mismatched_request_lengths():
         torch.tensor([2, 3]), torch.tensor([0]), torch.ones(2, 1, dtype=torch.int32)
     )
     with pytest.raises(ValueError, match="request page-table"):
-        AscendPrefillPlan.build(
+        PrefillCacheMetadata.build(
             metadata,
             None,
             degree=1,
             rank=0,
             page_size=128,
-            topk=2048,
             local_cache_pages=8,
             options=AscendPrefillOptions(5, 128),
         )

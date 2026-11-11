@@ -37,3 +37,64 @@ if current_platform().is_npu:
         signatures=format_signatures(("out_a", "out_b"), "dense", {torch.bfloat16}),
         priority=Priority.PORTABLE,
     )(attn_merge_state)
+
+    @register_kernel(
+        "attention",
+        "merge_normalized_partials",
+        name="ascend_merge_normalized_partials",
+        solution="ascend",
+        capability=CapabilityRequirement(vendors=frozenset({"ascend"})),
+        signatures=format_signatures("input", "dense", {torch.bfloat16, torch.float32}),
+        priority=Priority.PERFORMANT,
+    )
+    def ascend_merge_normalized_partials(output, lse):
+        from tokenspeed_kernel_npu.ops.dcp_tensors import merge_normalized_partials
+
+        return merge_normalized_partials(output, lse)
+
+    @register_kernel(
+        "attention",
+        "prefill_cache_layout",
+        name="ascend_prefill_cache_layout",
+        solution="ascend",
+        capability=CapabilityRequirement(vendors=frozenset({"ascend"})),
+        signatures=format_signatures("input", "dense", {torch.int32}),
+        priority=Priority.PERFORMANT,
+    )
+    def ascend_prefill_cache_layout(
+        table,
+        cumulative,
+        prefixes,
+        *,
+        first,
+        rows,
+        total,
+        per_block,
+        degree,
+        local_pages,
+        send_rows,
+        page_size,
+        active_requests,
+        history_table=None,
+        patch_slots=None,
+        history_pages=None
+    ):
+        from tokenspeed_kernel_npu.ops.dsa import prefill_cache_layout
+
+        return prefill_cache_layout(
+            table,
+            cumulative,
+            prefixes,
+            first=first,
+            rows=rows,
+            total=total,
+            per_block=per_block,
+            degree=degree,
+            local_pages=local_pages,
+            send_rows=send_rows,
+            page_size=page_size,
+            active_requests=active_requests,
+            history_table=history_table,
+            patch_slots=patch_slots,
+            history_pages=history_pages,
+        )

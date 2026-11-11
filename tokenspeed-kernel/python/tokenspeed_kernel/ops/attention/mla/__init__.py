@@ -43,6 +43,23 @@ from tokenspeed_kernel.signature import (
 AttentionResult = torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]
 
 
+def create_mla_length_binding(lengths):
+    """Retain one graph bucket's host lengths, refreshed outside capture/update."""
+    from tokenspeed_kernel_npu.ops.mla_dcp import LocalLengths
+
+    return LocalLengths(lengths)
+
+
+def mla_decode_partial(query, cache, table, binding, scale):
+    """Attend owner-local latent KV; return token-major output and natural-log LSE."""
+    kernel = select_kernel(
+        "attention",
+        "mla_decode_partial",
+        format_signature(input=dense_tensor_format(query.dtype)),
+    )
+    return kernel(query, cache, table, binding, scale)
+
+
 def prepare_mla_resources(*, group, rank, heads, rank_size):
     """Prepare selected fused MLA communication storage before capture."""
     from tokenspeed_kernel.selection import select_kernel
@@ -52,48 +69,12 @@ def prepare_mla_resources(*, group, rank, heads, rank_size):
     )
 
 
-def prepare_mla_prolog(layer, *, group):
-    """Resolve MLA prolog and apply its registered weight preparation once."""
-    from tokenspeed_kernel.registry import KernelRegistry
-    from tokenspeed_kernel.selection import select_kernel
-
-    kernel = select_kernel(
-        "attention",
-        "mla_fused_prolog",
-        format_signature(x=dense_tensor_format(layer.q_b_proj.weight.dtype)),
-    )
-    spec = KernelRegistry.get().get_by_name(kernel.name)
+def prepare_mla_prologue_weights(layer, *, group, prologue):
+    """Prepare loaded weights for the explicitly selected fused MLA prologue."""
+    spec = KernelRegistry.get().get_by_name(prologue.name)
     if spec is None or spec.weight_preprocessor is None:
-        raise RuntimeError("MLA prolog has no registered weight preprocessor")
-    merge = select_kernel(
-        "attention",
-        "mla_fused_merge",
-        format_signature(output=dense_tensor_format(torch.float32)),
-    )
-    attention = select_kernel(
-        "attention",
-        "mla_fused_attention",
-        format_signature(query=dense_tensor_format(torch.bfloat16)),
-    )
-    return kernel, spec.weight_preprocessor(layer, group=group), attention, merge
-
-
-def mla_prolog_available() -> bool:
-    """Whether the optional Ascend Lite MLA prolog is available."""
-    if not current_platform().is_npu:
-        return False
-    from tokenspeed_kernel_npu.ops.mla_prolog import mla_prolog_available as available
-
-    return available()
-
-
-def mla_prolog(*args, **kwargs) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """Run the Ascend Lite MLA prolog when its input is eligible."""
-    if not current_platform().is_npu:
-        raise NotImplementedError("Lite MLA prolog is only available on Ascend")
-    from tokenspeed_kernel_npu.ops.mla_prolog import mla_prolog as npu_mla_prolog
-
-    return npu_mla_prolog(*args, **kwargs)
+        raise RuntimeError("MLA prologue has no registered weight preprocessor")
+    return spec.weight_preprocessor(layer, group=group)
 
 
 # One UE8M0 scale per 32 consecutive head_dim elements (MXFP8).
@@ -1456,7 +1437,9 @@ if current_platform().is_npu:
 
 
 __all__ = [
-    "prepare_mla_prolog",
+    "prepare_mla_prologue_weights",
+    "create_mla_length_binding",
+    "mla_decode_partial",
     "prepare_mla_resources",
     "mla_project_value_prefers_contiguous_weight",
     "mla_project_value",

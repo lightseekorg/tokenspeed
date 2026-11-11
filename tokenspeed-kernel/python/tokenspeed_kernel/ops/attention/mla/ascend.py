@@ -27,33 +27,35 @@ from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signature, format_signatures
 
 
-def ascend_mla_dcp_kernels():
-    """Return the Ascend packed MLA partial/merge and graph-length adapter."""
-    if not current_platform().is_npu:
-        raise RuntimeError("Ascend MLA DCP kernels require an NPU platform")
-    from tokenspeed_kernel_npu.ops import mla_dcp
-
-    return mla_dcp
-
-
-def prepare_ascend_mla_prefill(
-    cache,
-    *,
-    ranks,
-    history_group,
-    max_current_rows,
-    history_null_rows,
-):
-    """Reuse the DSA HCCL gather/owner-commit transport with no Index-K plane."""
-    from tokenspeed_kernel_npu.ops.prefill import AscendDSAPrefill
-
-    return AscendDSAPrefill(
-        cache,
-        None,
-        ranks=ranks,
-        history_group=history_group,
-        max_current_rows=max_current_rows,
-        history_null_rows=history_null_rows,
+def supports_fused_mla_decode(layer) -> bool:
+    """Whether loaded weights meet the prepared native MLA projection ABI."""
+    if (
+        (layer.num_heads, layer.num_local_heads, layer.q_lora_rank)
+        not in ((64, 8, 1536), (32, 4, 768))
+        or layer.use_output_gate
+        or layer.q_lora_scale is not None
+        or layer.kv_lora_scale is not None
+        or (
+            layer.kv_lora_rank,
+            layer.qk_nope_head_dim,
+            layer.qk_rope_head_dim,
+            layer.v_head_dim,
+        )
+        != (512, 128, 64, 128)
+    ):
+        return False
+    hidden = 4096 if layer.num_heads == 64 else 2048
+    down = layer.fused_qkv_a_proj_with_mqa.weight
+    qb = layer.q_b_proj.weight
+    if (
+        down.dtype != torch.bfloat16
+        or qb.dtype != torch.bfloat16
+        or down.shape != (layer.q_lora_rank + 576, hidden)
+        or qb.shape != (layer.num_local_heads * 192, layer.q_lora_rank)
+    ):
+        return False
+    return layer.rotary_emb is None or (
+        not layer.rotary_emb.is_neox_style and layer.rotary_emb.rotary_dim == 64
     )
 
 
@@ -84,26 +86,10 @@ def pack_mla_panels(weight: torch.Tensor, *, width: int) -> torch.Tensor:
 
 def _prepare_mla_prolog_weights(layer, *, group):
     """Pack fixed BF16 weights once, before any forward or graph capture."""
-    if (
-        (layer.num_heads, layer.num_local_heads, layer.q_lora_rank)
-        not in ((64, 8, 1536), (32, 4, 768))
-        or layer.use_output_gate
-        or layer.q_lora_scale is not None
-        or layer.kv_lora_scale is not None
-    ):
-        raise ValueError(
-            "Fused MLA requires H64/TP8 or H32/TP8 without output gate/runtime LoRA scaling"
-        )
+    if not supports_fused_mla_decode(layer):
+        raise ValueError("Loaded weights do not meet the native MLA projection ABI")
     down = layer.fused_qkv_a_proj_with_mqa.weight.detach()
     qb = layer.q_b_proj.weight.detach()
-    hidden = 4096 if layer.num_heads == 64 else 2048
-    if down.shape != (layer.q_lora_rank + 576, hidden) or qb.shape != (
-        layer.num_local_heads * 192,
-        layer.q_lora_rank,
-    ):
-        raise ValueError("Unsupported MLA projection geometry")
-    if down.dtype != torch.bfloat16 or qb.dtype != torch.bfloat16:
-        raise ValueError("Fused MLA requires unquantized BF16 projections")
 
     def nz(weight, width):
         import torch_npu
@@ -121,8 +107,6 @@ def _prepare_mla_prolog_weights(layer, *, group):
     pieces = [torch.empty_like(layer.w_kc) for _ in range(8)]
     dist.all_gather(pieces, layer.w_kc.contiguous(), group=group)
     if layer.rotary_emb is not None:
-        if layer.rotary_emb.is_neox_style or layer.rotary_emb.rotary_dim != 64:
-            raise ValueError("Fused MLA supports GPT-J rotary64 only")
         cos_sin = layer.rotary_emb.cos_sin_cache.float().contiguous()
     else:
         cos_sin = torch.zeros((1, 64), dtype=torch.float32, device=down.device)
@@ -193,10 +177,19 @@ def ascend_mla_merge(output, *, lse, visible, active, producer, maximum, total, 
 
 def ascend_prepare_mla_resources(*, group, rank, heads, rank_size):
     """Retain checked operator views of this MLA group's HCCL window."""
+    import flash_ops  # noqa: F401
     from tokenspeed_kernel.ops.attention.dsa import DSAResources
-    from tokenspeed_kernel.ops.attention.dsa.ascend import ascend_dsa_kernels
 
-    ascend_dsa_kernels()
+    required = (
+        "mla_prepare_prolog_window",
+        "mla_prepare_lse_buffers",
+        "dsa_release_prolog_window",
+        "npu_mla_prolog_fused",
+        "npu_dsa_merge_lse_direct",
+    )
+    missing = [name for name in required if not hasattr(torch.ops.custom, name)]
+    if missing:
+        raise RuntimeError(f"Missing native MLA operators: {', '.join(missing)}")
     window = torch.ops.custom.mla_prepare_prolog_window(group, rank, heads, rank_size)
     try:
         prepared = {
@@ -217,6 +210,13 @@ def ascend_prepare_mla_resources(*, group, rank, heads, rank_size):
     )
 
 
+def ascend_mla_decode_partial(query, cache, table, binding, scale):
+    """Run owner-local FIA and return token-major output plus natural-log LSE."""
+    from tokenspeed_kernel_npu.ops.mla_dcp import mla_partial
+
+    return mla_partial(query, cache, table, binding, scale)
+
+
 if current_platform().is_npu:
     register_kernel(
         "attention",
@@ -227,6 +227,16 @@ if current_platform().is_npu:
         signatures=[format_signature()],
         priority=Priority.PERFORMANT,
     )(ascend_prepare_mla_resources)
+
+    register_kernel(
+        "attention",
+        "mla_decode_partial",
+        name="ascend_mla_decode_partial",
+        solution="ascend",
+        capability=CapabilityRequirement(vendors=frozenset({"ascend"})),
+        signatures=format_signatures("input", "dense", {torch.bfloat16}),
+        priority=Priority.PERFORMANT,
+    )(ascend_mla_decode_partial)
 
     from tokenspeed_kernel_npu.ops.mla import (
         mla_decode_with_kvcache as _mla_decode_with_kvcache,

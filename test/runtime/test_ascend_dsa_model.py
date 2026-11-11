@@ -31,9 +31,7 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.dsa.ascend import AscendDSAAttention
 
 
-def make_attention(
-    *, nope, separate, independent, prefill_enabled=False, scale_q=False
-):
+def make_attention(*, nope, prefill_enabled=False, scale_q=False):
     config = PretrainedConfig(
         rms_norm_eps=1e-6,
         mla_use_nope=nope,
@@ -59,14 +57,12 @@ def make_attention(
         max_position_embeddings=16,
         layer_id=0,
         lora_norm_eps=1e-6,
-        separate_mla_projections=separate,
-        independent_selection=independent,
         prefill_enabled=prefill_enabled,
     )
 
 
 def test_rotary_model_preserves_requested_positions():
-    attention = make_attention(nope=False, separate=True, independent=True)
+    attention = make_attention(nope=False)
     rotary = attention.rotary_emb
     positions = torch.tensor([0, 7], dtype=torch.int64)
     # Exercise the actual rotary module's table construction with two positions.
@@ -80,13 +76,8 @@ def test_rotary_model_preserves_requested_positions():
     torch.testing.assert_close(coeff.double(), expected, atol=1e-6, rtol=1e-6)
 
 
-def test_rejects_old_projection_layout():
-    with pytest.raises(ValueError, match="separate checkpoint"):
-        make_attention(nope=True, separate=False, independent=True)
-
-
 def test_unprepared_weights_fail_before_device_execution():
-    attention = make_attention(nope=True, separate=True, independent=True)
+    attention = make_attention(nope=True)
 
     @dataclass
     class Context:
@@ -94,11 +85,6 @@ def test_unprepared_weights_fail_before_device_execution():
 
     with pytest.raises(RuntimeError, match="Prepare DSA weights"):
         attention(None, torch.zeros((64, 4096)), Context(), None)
-
-
-def test_rejects_shared_cross_layer_selection():
-    with pytest.raises(ValueError, match="independent per-layer selection"):
-        make_attention(nope=True, separate=True, independent=False)
 
 
 def test_failed_native_initialization_releases_its_window(monkeypatch):
@@ -136,26 +122,25 @@ def test_failed_native_initialization_releases_its_window(monkeypatch):
     monkeypatch.setattr(ascend.dist, "get_rank", lambda: 0)
     monkeypatch.setattr(ascend.dist, "all_reduce", lambda *args, **kwargs: None)
     monkeypatch.setattr(ascend.dist, "barrier", lambda *args, **kwargs: None)
-    monkeypatch.setattr(torch.npu, "synchronize", lambda: None)
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        torch, "npu", SimpleNamespace(synchronize=lambda: None), raising=False
+    )
+    monkeypatch.setattr(ascend, "supports_fused_dsa_decode", lambda layer: True)
     monkeypatch.setattr(ascend, "prepare_dsa_resources", lambda **kwargs: resources)
-    layer = make_attention(nope=True, separate=True, independent=True)
+    layer = make_attention(nope=True)
     with pytest.raises(ValueError, match="eight local and 64 global heads"):
         ascend.AscendDSARuntime([layer], Mapping(rank=0, world_size=8, attn_tp_size=8))
     assert window.storage is None
     assert layer._fused_decode_runtime is None
 
 
-@pytest.mark.parametrize("role", [None, "prefill", "decode"])
 @pytest.mark.parametrize("prefill_enabled", [False, True])
-def test_prefill_weight_preparation_follows_model_opt_in(
-    monkeypatch, role, prefill_enabled
-):
+def test_prefill_weight_preparation_follows_model_opt_in(prefill_enabled):
     from tokenspeed.runtime.utils.env import global_server_args_dict
 
-    monkeypatch.setitem(global_server_args_dict, "disaggregation_mode", role)
-    attention = make_attention(
-        nope=True, separate=True, independent=True, prefill_enabled=prefill_enabled
-    )
+    attention = make_attention(nope=True, prefill_enabled=prefill_enabled)
     with torch.no_grad():
         for index, parameter in enumerate(attention.parameters()):
             parameter.copy_(
@@ -183,13 +168,17 @@ def test_prefill_weight_preparation_follows_model_opt_in(
         assert attention._prefill_weights is weights
 
 
-@pytest.mark.parametrize("rows", [1, 1025, 2049])
-@pytest.mark.parametrize("scale_q", [False, True])
+@pytest.mark.parametrize(
+    "rows,scale_q,fail_index_store",
+    [(1, False, False), (17, True, False), (7, False, True)],
+)
 def test_model_router_leaves_cache_readiness_to_the_index_writer(
-    monkeypatch, rows, scale_q
+    monkeypatch, rows, scale_q, fail_index_store
 ):
     """The prologue's KV write alone cannot release a DSA producer step."""
+    from tokenspeed_kernel.ops.attention import prologue as kernel_prologue
     from tokenspeed_kernel.ops.attention.prologue.types import (
+        GatheredLatentStore,
         LatentKVCache,
         MLAPrologueOutput,
     )
@@ -217,16 +206,21 @@ def test_model_router_leaves_cache_readiness_to_the_index_writer(
 
     @dataclass
     class QuerySpan:
-        row_start: int = 0
-        row_end: int = rows
+        query_start: int = 0
+        query_end: int = rows
+        projection_row_counts: tuple[int, ...] = (rows,)
 
     class CpuIndexWriter(AscendDSABackend):
         # The device SFA/index kernels are unavailable. This leaf writes a real
         # index-cache tensor and publishes when its device work would finish.
-        def __init__(self):
+        def __init__(self, pool):
             self._prefill_options = None
-            self._prefill_plan = QuerySpan()
+            self._prefill_cache_metadata = QuerySpan()
             self.step_counter = None
+            self.pool = pool
+            self.latent = None
+            self.slots = None
+            self.index_key = None
             self.index_cache = torch.zeros(rows, 1, 4, dtype=torch.bfloat16)
             self.counter_before_index = None
             self.query = None
@@ -236,15 +230,42 @@ def test_model_router_leaves_cache_readiness_to_the_index_writer(
         def cache_placement(self, layer):
             return None
 
-        def forward_extend(self, q, k, v, layer, slots, pool, bs, **kwargs):
+        def prepare_prefill_current(self, layer_id, latent, index_key, slots):
+            self.latent = latent
+            self.slots = slots.long()
+            self.index_key = index_key
+
+        def select_prefill_indices(self, query, weights, layer, *, initial, window):
             self.counter_before_index = int(self.step_counter.h_ready_cache_step)
-            self.query = q.clone()
-            self.index_query = kwargs["index_query"].clone()
-            self.index_weights = kwargs["index_weights"].clone()
-            pool.latent.index_copy_(
-                0, slots.long(), kwargs["prefill_latent"].unsqueeze(1)
+            self.index_query = query.clone()
+            self.index_weights = weights.clone()
+            if fail_index_store:
+                raise RuntimeError("Index-K store failed")
+            self.index_cache.index_copy_(0, self.slots, self.index_key)
+            return torch.empty(rows, 0, dtype=torch.int32)
+
+        def prefill_store(self, layer):
+            compact = torch.cat((self.latent.new_zeros(128, 8), self.latent))
+            return GatheredLatentStore(
+                current=compact[128:],
+                slots=self.slots,
+                cache=self.pool.latent.view(-1, 8),
+                compact=compact,
+                direct=torch.zeros(rows, dtype=torch.uint8),
+                mapped_slots=torch.full((rows,), -1, dtype=torch.int64),
+                virtual_blocks=rows,
+                send_rows=rows,
+                block_rows=1,
+                degree=1,
+                rank=0,
+                history_rows=128,
             )
-            self.index_cache.index_copy_(0, slots.long(), kwargs["index_key"])
+
+        def forward_extend(self, q, k, v, layer, slots, pool, bs, **kwargs):
+            torch.testing.assert_close(
+                pool.latent.view(-1, 8), self.latent, rtol=0, atol=0
+            )
+            self.query = q.clone()
             self.step_counter.record_cache()
             return q[..., :4].transpose(0, 1).contiguous()
 
@@ -272,7 +293,16 @@ def test_model_router_leaves_cache_readiness_to_the_index_writer(
             x.float(), (x.shape[-1],), weight.float(), eps
         ).to(x.dtype)
 
+    def cpu_store(store):
+        assert int(leaf.step_counter.h_ready_cache_step) == 0
+        store.cache.index_copy_(0, store.slots, store.current)
+
     monkeypatch.setattr(ascend, "mla_prologue", cpu_prologue)
+    monkeypatch.setattr(
+        kernel_prologue,
+        "select_kernel",
+        lambda *args, **kwargs: cpu_store,
+    )
     monkeypatch.setattr(
         unquant,
         "kernel_mm",
@@ -282,8 +312,6 @@ def test_model_router_leaves_cache_readiness_to_the_index_writer(
     )
     attention = make_attention(
         nope=True,
-        separate=True,
-        independent=True,
         scale_q=scale_q,
         prefill_enabled=True,
     )
@@ -304,7 +332,8 @@ def test_model_router_leaves_cache_readiness_to_the_index_writer(
     attention.process_weights_after_loading()
     group = "full_history"
     attention.attn_mqa.bind_cache_group(group)
-    leaf = CpuIndexWriter()
+    pool = Pool(torch.zeros(rows, 1, 8, dtype=torch.bfloat16))
+    leaf = CpuIndexWriter(pool)
     router = CacheGroupRouter(
         lambda *args: leaf,
         is_draft=False,
@@ -325,8 +354,13 @@ def test_model_router_leaves_cache_readiness_to_the_index_writer(
     router._extend_write_locations = {group: torch.arange(rows)}
     counter = CpuStepCounter()
     router.register_step_counter(counter)
-    pool = Pool(torch.zeros(rows, 1, 8, dtype=torch.bfloat16))
     hidden = torch.sin(torch.arange(rows * 8).float()).reshape(rows, 8).bfloat16()
+    if fail_index_store:
+        with pytest.raises(RuntimeError, match="Index-K store failed"):
+            attention(torch.arange(rows), hidden, Context(router, pool), None)
+        assert int(counter.h_ready_cache_step) == 0
+        assert torch.count_nonzero(leaf.index_cache) == 0
+        return
     output = attention(torch.arange(rows), hidden, Context(router, pool), None)
 
     latent = torch.nn.functional.linear(hidden, attention.q_a_proj.weight)

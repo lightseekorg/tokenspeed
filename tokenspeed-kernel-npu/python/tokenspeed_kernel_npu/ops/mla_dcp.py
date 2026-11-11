@@ -191,13 +191,6 @@ def mla_partial(query, cache, table, binding, scale):
     return out.view(tokens, heads, 512), lse.view(tokens, heads)
 
 
-def merge_dcp_partials(output, lse):
-    """Merge framework-gathered partials with explicit empty-shard semantics."""
-    from tokenspeed_kernel_npu.ops.dcp_tensors import merge_normalized_partials
-
-    return merge_normalized_partials(output, lse)
-
-
 @triton.jit(do_not_specialize=["rows"])
 def _prepare_mla_partials(
     Partial,

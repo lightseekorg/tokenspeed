@@ -25,11 +25,16 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.attention.dsa import (
+    dsa_local_topk_candidates,
+    dsa_sparse_decode_partial,
+    store_index_keys,
+)
 
 from tokenspeed.runtime.layers.attention.backends.paged.ascend_dsa import (
     AscendDSABackend,
-    _AscendDSAContextParallel,
 )
+from tokenspeed.runtime.layers.attention.dcp.ascend import AscendDCPMetadata
 from tokenspeed.runtime.layers.attention.dcp.placement import (
     CachePlacement,
     resolve_cache_slots,
@@ -43,14 +48,6 @@ pytestmark = pytest.mark.skipif(
 @pytest.mark.parametrize("batch", [1, 2])
 @pytest.mark.parametrize("width", [1, 2, 4, 8])
 def test_single_rank_verify_has_per_candidate_causal_metadata(batch, width):
-    from tokenspeed_kernel_npu.ops.dsa import AscendDSAKernels
-
-    class CheckedKernels(AscendDSAKernels):
-        def index(self, query, key, weights, q_ends, lengths, table, *policy):
-            # Fail before a native launch if request rows reach per-query ops.
-            assert q_ends.numel() == lengths.numel() == table.shape[0] == query.shape[0]
-            return super().index(query, key, weights, q_ends, lengths, table, *policy)
-
     torch.npu.set_device(0)
     page, heads, prefix_rows = 128, 32, 1
     rows = batch * width
@@ -85,7 +82,6 @@ def test_single_rank_verify_has_per_candidate_causal_metadata(batch, width):
     backend.kernel_page_size = page
     backend.spec_num_tokens = width
     backend.step_counter = None
-    backend.kvp_group = (0,)
     backend._ascend_placement = None
     backend._fused_group = None
     backend._indexer_spec = SimpleNamespace(
@@ -95,8 +91,7 @@ def test_single_rank_verify_has_per_candidate_causal_metadata(batch, width):
         kv_lora_rank=512,
         qk_rope_head_dim=64,
     )
-    backend._indexer_kernels = CheckedKernels()
-    backend._dcp = _AscendDSAContextParallel(
+    backend._dcp = AscendDCPMetadata(
         degree=1, rank=0, ranks=(0,), virtual_block_count=None
     )
     backend._dcp.allocate_decode_buffers(rows, 3, "npu")
@@ -179,7 +174,6 @@ def test_single_rank_verify_has_per_candidate_causal_metadata(batch, width):
 @pytest.mark.parametrize("rank", [0, 1, 7])
 @pytest.mark.parametrize("block_size", [128, 256])
 def test_dcp_local_storage_replay(rank, block_size):
-    from tokenspeed_kernel_npu.ops.dsa import AscendDSAKernels
 
     torch.npu.set_device(0)
     degree, virtual_count, page = 8, 17, 128
@@ -200,7 +194,7 @@ def test_dcp_local_storage_replay(rank, block_size):
     placement = CachePlacement(block_size, virtual_count, tuple(range(degree)), rank)
     table = torch.zeros((8, 4 * subpages), dtype=torch.int32, device="npu")
     lengths = torch.zeros(8, dtype=torch.int32, device="npu")
-    dcp = _AscendDSAContextParallel(
+    dcp = AscendDCPMetadata(
         degree=degree,
         rank=rank,
         ranks=tuple(range(degree)),
@@ -208,13 +202,12 @@ def test_dcp_local_storage_replay(rank, block_size):
     )
     dcp.allocate_decode_buffers(8, table.shape[1], "npu")
     # Scatter itself has no dependency on the optional indexer extension.
-    kernels = object.__new__(AscendDSAKernels)
 
     def run():
         dcp.clear_forward_metadata()
         local, owned = resolve_cache_slots(slots, placement)
         local = torch.where(owned, local, -1)
-        kernels.scatter(keys, cache, local)
+        store_index_keys(keys, cache, local)
         for _ in range(6):
             dcp.prepare_metadata(
                 seq_lens=lengths[:],
@@ -293,11 +286,9 @@ def test_dcp_metadata_feeds_indexer_and_sparse_attention(endpoint):
     production path uses fused distributed TopK/LSE; no legacy CP kernels are
     required by this metadata regression.
     """
-    from tokenspeed_kernel_npu.ops.dsa import AscendDSAKernels
 
     torch.npu.set_device(0)
     torch.manual_seed(981016)
-    kernels = AscendDSAKernels()
     degree, block_size, page, width, topk = 8, 256, 128, 8, 2048
     blocks = list(range(24, 0, -1))
     pages = [b * 2 + s for b in blocks for s in range(2)]
@@ -336,9 +327,12 @@ def test_dcp_metadata_feeds_indexer_and_sparse_attention(endpoint):
         kv_cache = torch.full(
             (8, page, 1, 576), -99, dtype=torch.bfloat16, device="npu"
         )
-        kernels.scatter(keys, index_cache, local)
-        kernels.scatter(kv, kv_cache, local)
-        dcp = _AscendDSAContextParallel(
+        store_index_keys(keys, index_cache, local)
+        valid = local >= page
+        kv_cache.view(-1, 576).index_copy_(
+            0, local[valid].long(), kv.view(-1, 576)[valid]
+        )
+        dcp = AscendDCPMetadata(
             degree=degree,
             rank=rank,
             ranks=tuple(range(degree)),
@@ -356,7 +350,7 @@ def test_dcp_metadata_feeds_indexer_and_sparse_attention(endpoint):
             slots=None,
         )
         meta = dcp.metadata(start=0, end=width)
-        ix, score = kernels.index_partial(
+        ix, score = dsa_local_topk_candidates(
             index_query,
             index_cache,
             weights,
@@ -405,7 +399,7 @@ def test_dcp_metadata_feeds_indexer_and_sparse_attention(endpoint):
             selected_positions[row].extend(
                 torch.tensor(logical, dtype=torch.long)[chosen].tolist()
             )
-        out, maximum, total = kernels.attention_partial(
+        out, maximum, total = dsa_sparse_decode_partial(
             packed,
             caches[rank],
             selected,
