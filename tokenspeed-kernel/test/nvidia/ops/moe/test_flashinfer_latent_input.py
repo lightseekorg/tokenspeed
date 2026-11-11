@@ -42,7 +42,7 @@ def weights():
         or platform.sm_count != 152
         or not latent_front_available()
     ):
-        pytest.skip("requires the GB300 Kimi-K3 source bundle")
+        pytest.skip("requires GB300 and FlashInfer's JIT builder")
     torch.manual_seed(621)
     return tuple(
         (torch.randn(rows, 7168, device="cuda") / math.sqrt(7168)).bfloat16()
@@ -64,7 +64,7 @@ def reference(x, weights):
     )
 
 
-@pytest.mark.parametrize("rows", [2048, 2049, 4096, 8192])
+@pytest.mark.parametrize("rows", [2048, 2049, 4096, 8192, 16385, 24576, 32768, 49152])
 def test_front_matches_reference_and_replays_changed_inputs(weights, rows):
     torch.manual_seed(147 + rows)
     x = torch.randn(rows, 7168, device="cuda", dtype=torch.bfloat16)
@@ -75,7 +75,7 @@ def test_front_matches_reference_and_replays_changed_inputs(weights, rows):
             *weights,
             gate_clamp=4.0,
             up_clamp=25.0,
-            override="flashinfer_latent_input",
+            solution="flashinfer",
         )
 
     actual = run()
@@ -98,7 +98,7 @@ def test_front_matches_reference_and_replays_changed_inputs(weights, rows):
         torch.testing.assert_close(value, expected, atol=tolerance, rtol=tolerance)
 
 
-@pytest.mark.parametrize("rows", [1, 128, 1024, 2047, 16385])
+@pytest.mark.parametrize("rows", [1, 128, 1024, 2047])
 def test_front_declines_unvalidated_rows(weights, rows):
     x = torch.zeros(rows, 7168, device="cuda", dtype=torch.bfloat16)
     assert (

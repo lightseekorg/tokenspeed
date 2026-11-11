@@ -1108,6 +1108,12 @@ setup(
             "allgather_quant.cu",
             "sm90_moe.patch",
         ],
+        # Vendored FlashInfer Kimi-K3 latent MoE sources, compiled on first use.
+        "tokenspeed_kernel.thirdparty.flashinfer.kimi_k3_latent_moe": [
+            "LICENSE",
+            "csrc/**/*.cu",
+            "csrc/**/*.cuh",
+        ],
         # Vendored MiniMax MSA CuTe sources: cute/ has no __init__.py (it is
         # loaded via the upstream sys.path bootstrap), so ship it as data.
         "tokenspeed_kernel.thirdparty.msa": [

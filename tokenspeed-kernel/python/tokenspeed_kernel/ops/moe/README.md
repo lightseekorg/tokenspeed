@@ -396,16 +396,18 @@ separate projections and their stream scheduling for unsupported inputs.
 `latent_moe_input_projections` keeps its portable composition when no fused
 implementation is available.
 
-The FlashInfer front is enabled on SM103 with 152 SMs for 2048–16384 BF16
+The FlashInfer front is enabled on SM103 with 152 SMs for at least 2048 BF16
 rows, Kimi-K3's replicated router/latent weights, full shared-expert weights,
-and SiTU clamps 4 and 25. Attention-DP uses it only without shared-expert TP;
-EP routing/quantization and the shared down projection keep their existing
-owners. Smaller shapes and shared-expert TP retain their existing paths.
+and SiTU clamps 4 and 25, at any larger row count. Attention-DP uses it only
+without shared-expert TP; EP routing/quantization and the shared down
+projection keep their existing owners. Smaller shapes and shared-expert TP
+retain their existing paths.
 
-This optional backend requires the qualified 152-SM planner and the matching
-CUDA source payload in FlashInfer. The unpatched 0.7.2 wheel lacks these and
-does not enable the registration. Prepare/warm up before graph capture;
-no persistent activation tensors are cached per layer by this adapter.
+FlashInfer's PyPI wheels omit this experimental backend's sources, so they are
+vendored under `thirdparty/flashinfer/kimi_k3_latent_moe` (see its
+`VENDOR.md`) and compiled on first use by the installed FlashInfer's JIT
+builder. Prepare/warm up before graph capture; no persistent activation
+tensors are cached per layer by this adapter.
 
 ## MegaMoE producer buffers
 

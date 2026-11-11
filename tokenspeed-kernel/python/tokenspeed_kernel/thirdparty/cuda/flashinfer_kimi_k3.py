@@ -18,7 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Optional FlashInfer Kimi-K3 kernels with their source payloads."""
+"""Kimi-K3 kernels from FlashInfer: the vendored latent front and the
+installed wheel's fused router."""
 
 from __future__ import annotations
 
@@ -30,23 +31,14 @@ import torch
 
 @functools.cache
 def latent_front_available() -> bool:
+    """Whether FlashInfer's JIT builder for the vendored front sources is installed."""
     try:
-        from flashinfer.experimental.kimi_k3_latent_moe import cake_jit
-        from flashinfer.experimental.kimi_k3_latent_moe.cake_backend import (
-            QUALIFIED_SM_COUNTS,
+        from tokenspeed_kernel.thirdparty.flashinfer.kimi_k3_latent_moe import (  # noqa: F401
+            cake_backend,
         )
     except ImportError:
         return False
-    root = Path(cake_jit.__file__).parent / "csrc"
-    return (
-        152 in QUALIFIED_SM_COUNTS
-        and bool(cake_jit.MODULES)
-        and all(
-            (root / source).is_file()
-            for record in cake_jit.MODULES.values()
-            for source in record["sources"]
-        )
-    )
+    return True
 
 
 def latent_front(
@@ -55,7 +47,9 @@ def latent_front(
     routed_weight: torch.Tensor,
     shared_gate_up_weight: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    from flashinfer.kimi_k3_latent_moe import kimi_k3_latent_moe_front
+    from tokenspeed_kernel.thirdparty.flashinfer.kimi_k3_latent_moe.cake_backend import (
+        kimi_k3_latent_moe_front,
+    )
 
     rows = hidden_states.shape[0]
     logits = torch.empty(
@@ -71,7 +65,6 @@ def latent_front(
         logits,
         routed,
         shared,
-        backend="cake",
     )
 
 

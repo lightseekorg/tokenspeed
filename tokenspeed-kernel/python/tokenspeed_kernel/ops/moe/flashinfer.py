@@ -4329,7 +4329,6 @@ if (
             priority=Priority.SPECIALIZED,
             traits={
                 "tokens_min": frozenset({2048}),
-                "tokens_max": frozenset({16384}),
                 "gate_clamp": frozenset({4.0}),
                 "hidden_size": frozenset({7168}),
                 "inputs_contiguous": frozenset({True}),
