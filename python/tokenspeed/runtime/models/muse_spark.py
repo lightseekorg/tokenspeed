@@ -65,6 +65,7 @@ from tokenspeed_kernel.ops.moe import (
     warmup_moe_sorted_prefill,
 )
 from tokenspeed_kernel.ops.moe._cute_dsl.latent_down import (
+    AllReduceMailbox,
     KimiK3LatentDownOp,
     MailboxPublish,
 )
@@ -1514,17 +1515,17 @@ class MuseSparkMoE(nn.Module):
                     norm.eps,
                     norm.weight_offset,
                 )
-            ep_mailbox = (
-                self.ep_all_reduce.all_reduce_mailbox(num_tokens)
-                if self.ep_all_reduce is not None
+            ep_mailbox: AllReduceMailbox | None = None
+            if (
+                self.ep_all_reduce is not None
                 and not owned_rows
                 and output is None
                 and self.ep_all_reduce.handles(num_tokens)
                 and routed_sum_reduces_mailbox(
                     routes, route_map, num_tokens, self.topk, route_weights, norm.weight
                 )
-                else None
-            )
+            ):
+                ep_mailbox = self.ep_all_reduce.all_reduce_mailbox(num_tokens)
             combined = routed_input_scale_rmsnorm_sum_gathered(
                 routes,
                 route_map,
