@@ -417,6 +417,10 @@ MI450 simulator tasks share their ROCm and PyTorch pins through
 simulator and dependency installers in the same shell; standalone simulator
 setup loads it as well. Update that file to change the stack: its pins override
 inherited environment values. Changes to it select both MI450 tasks.
+The simulator tasks use `install_kernel_deps_rocm.sh` to install kernel
+dependencies without building the scheduler or Rust engine or installing the
+serving runtime. Full ROCm serving installs reuse that script through
+`install_deps_rocm.sh` before installing the runtime components.
 
 PR and push diffs containing only `test/ci/**/*.yaml` run only the changed tasks,
 with existing validation and runner/trigger rules. Diffs that also, or only,
