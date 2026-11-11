@@ -1350,7 +1350,7 @@ class PrefillGraph:
 
         A forward carrying multimodal inputs replays only when the model
         exposes the embeds-only ``multimodal_input_embeds`` seam; models with
-        extra per-layer inputs (deepstack) run eager.
+        extra per-layer inputs (deepstack) or request-token history run eager.
         """
         if multimodal_context is not None and self._multimodal_input_embeds is None:
             return False
@@ -1362,7 +1362,7 @@ class PrefillGraph:
         input_ids: torch.Tensor,
         multimodal_context=None,
         *,
-        request_token_history: RequestTokenHistoryView | None = None,
+        request_token_history: RequestTokenHistoryView | None,
     ):
         """Replay the captured graph for ``ctx`` (caller checked :meth:`can_run`).
 

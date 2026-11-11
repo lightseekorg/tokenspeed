@@ -728,7 +728,12 @@ def test_outer_owner_selects_matching_graph_and_refreshes_before_replay(
         ),
         patch("tokenspeed.runtime.execution.prefill_graph.logger") as log,
     ):
-        result = owner.replay(ctx, torch.zeros(num_tokens, dtype=torch.int64), None)
+        result = owner.replay(
+            ctx,
+            torch.zeros(num_tokens, dtype=torch.int64),
+            None,
+            request_token_history=None,
+        )
     torch.testing.assert_close(result, torch.full((num_tokens, 4), float(expected)))
     assert ctx.bs == batch_size
     assert events == ([] if transfer else ["refresh"]) + [
@@ -822,7 +827,9 @@ def test_replay_waits_for_the_whole_host_load_before_the_first_segment(consumers
             return_value=None,
         ),
     ):
-        owner.replay(ctx, torch.zeros(8, dtype=torch.int64), None)
+        owner.replay(
+            ctx, torch.zeros(8, dtype=torch.int64), None, request_token_history=None
+        )
     waits = [f"wait e{index}" for index in consumers or ()]
     assert events == waits + ["refresh", "inline"]
 
@@ -1222,7 +1229,12 @@ def test_a_replay_writes_a_loaded_tail_page_after_the_load(kimi_host_cache):
         None,
         cache_ops=[cache.LoadBackOp(3, [group], 1, page)],
     )
-    result = owner.replay(cache.ctx, torch.ones(_BUCKET, dtype=torch.int64), None)
+    result = owner.replay(
+        cache.ctx,
+        torch.ones(_BUCKET, dtype=torch.int64),
+        None,
+        request_token_history=None,
+    )
     assert not cache.executor.load_stream.query()
     torch.cuda.synchronize()
     assert [int(ack.op_id) for ack in cache.handle.poll_cache_results()] == [3]
@@ -1305,7 +1317,10 @@ def test_an_inline_kda_replay_reads_a_loaded_state_after_the_load(kimi_host_cach
             ],
         )
         results[inline_kda] = owner.replay(
-            cache.ctx, torch.ones(_BUCKET, dtype=torch.int64), None
+            cache.ctx,
+            torch.ones(_BUCKET, dtype=torch.int64),
+            None,
+            request_token_history=None,
         ).clone()
         assert not cache.executor.load_stream.query()
         torch.cuda.synchronize()
