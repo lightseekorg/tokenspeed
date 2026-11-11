@@ -52,6 +52,10 @@ struct SchedulerTestAccess {
         scheduler.recordAdmittedPages(plan, result);
     }
     static std::uint64_t DecodeAdmissions(const Scheduler& scheduler) { return scheduler.decode_admissions_; }
+    // Whether the request's prompt prefix hashes have been computed.
+    static bool PromptHashed(Scheduler& scheduler, const std::string& request_id) {
+        return scheduler.findRequest(request_id)->prompt_prefix_hashes_.has_value();
+    }
 };
 
 }  // namespace tokenspeed

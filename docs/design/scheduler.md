@@ -36,12 +36,13 @@ and builds it; see [cache-concepts](cache-concepts.md#the-coordinator-layer-csrc
 for why publication rides with admission).
 
 Pages are published only for later admissions to match
-(`SchedulerConfig::PublishesCompletedPages`). With prefix caching disabled no
+(`SchedulerConfig::PublishesCompletedPages`). With prefix caching disabled, no
 admission matches either tier or prefetches from L3, so chunk ends, decode
-steps and the finish hash and publish nothing, and a finished request's pages
+steps, and the finish hash and publish nothing, and a finished request's pages
 return straight to the pool. Published, they could only stay resident until
 an allocation evicted them, and on a D node, which allocates every request's
-whole prompt, every allocation would first walk the eviction order. A non-D
+whole prompt, every allocation would first walk the eviction order. Admission
+does not hash the prompt either, since there is nothing to probe. A non-D
 role with a Host cache is a conservative exception: it still publishes and
 streams to that tier, although nothing on the node reads it without prefix
 caching. A retraction publishes its victim either way; with a Host cache, the

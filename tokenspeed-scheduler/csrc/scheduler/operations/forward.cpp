@@ -362,6 +362,12 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
         }
         return coordinator_.ProbePromptPrefix(prompt);
     };
+    AdmissionMatch match;
+    // Without prefix caching nothing can match, so the prompt is not hashed.
+    if (config_.disable_prefix_cache) {
+        match.probe = probe(CacheCoordinator::PromptPrefix{});
+        return match;
+    }
     const std::int32_t prefix_granularity = coordinator_.PrefixGranularity();
     // The final prompt token is always recomputed to produce logits. Some
     // consumers additionally require a larger prompt tail (for example, to
@@ -381,13 +387,7 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
                                                     ? request->PrefillSize() / prefix_granularity
                                                     : std::max((request->PrefillSize() - 1) / prefix_granularity, 0);
     const auto hashes = request->PromptPrefixHashes().first(static_cast<std::size_t>(candidate_prefix_pages));
-
-    AdmissionMatch match;
     match.candidate_prefix_hashes = hashes;
-    if (config_.disable_prefix_cache) {
-        match.probe = probe(CacheCoordinator::PromptPrefix{});
-        return match;
-    }
     auto& prepared_keys = request->GetIf<fsm::Submitted>()->admission.prefix_keys;
     if (!prepared_keys) {
         prepared_keys = coordinator_.PreparePrefixKeys(hashes);

@@ -780,6 +780,20 @@ protected:
     }
 };
 
+// Admission hashes the prompt only to probe the prefix cache: without it,
+// nothing can match and the prompt stays unhashed.
+TEST_F(DecodeNoPrefixCacheNoHostCacheTestSuite, AdmissionHashesThePromptOnlyWithPrefixCaching) {
+    for (const bool prefix_cache : {false, true}) {
+        SCOPED_TRACE(prefix_cache ? "with prefix caching" : "without prefix caching");
+        config_.disable_prefix_cache = !prefix_cache;
+        scheduler_ = std::make_unique<Scheduler>(config_);
+        Submit({MakeRequestSpec("r0", /*num_pages=*/2, /*start=*/1)});
+        SendBootstrapped("r0");
+        ASSERT_NE(FindRemoteAdmission(PlanOnce()), nullptr);
+        EXPECT_EQ(SchedulerTestAccess::PromptHashed(*scheduler_, "r0"), prefix_cache);
+    }
+}
+
 TEST_F(DecodeNoPrefixCacheNoHostCacheTestSuite, FinishedRemotePrefillLeavesNoCacheOnlyParents) {
     const std::int32_t total = scheduler_->EmptyLcmBlocks();
     EXPECT_EQ(total, scheduler_->AvailableLcmBlocks());
