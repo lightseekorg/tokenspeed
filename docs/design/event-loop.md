@@ -1012,7 +1012,9 @@ For orientation, one `EventLoop::round`:
    as another group's copy destination, which the arena writes only after
    every pair reading those byte ranges; a destination is never zeroed;
    no op id, no ACK), then
-   page zeroing (the new owner's sanitization), then the Device-bound copies
+   page zeroing (the new owner's sanitization of the fresh pages nothing
+   fills whole: a copy destination and a block a remote landing fills are
+   left out), then the Device-bound copies
    -- `LoadBackOp` and `RestoreOp`, ordered behind the zeroing and the
    forwards in flight, which may still write a block an abort freed and this
    plan granted (load-back destinations are never zeroed): the forward reads
@@ -1026,9 +1028,12 @@ For orientation, one `EventLoop::round`:
    scheduler lists none of them for zeroing), reads both Host tiers under one
    event and arms no layerwise fence, its request being unschedulable until
    the ACK -- then the plan's remote streams to the transfer peer (a D-node
-   remote prefill waits on the zeroing fence inside its submission, which
-   the FIFO orders after the store fence), then the plan's batch to the
-   model. A store names the victim's request-pool slot, which the scheduler
+   remote prefill submits only its stream-ordered slot preparation here),
+   then the plan's batch to the model, then the D-node remote prefill's
+   pull, which waits on the zeroing fence before its CPU-issued RDMA
+   trigger. The zeroing orders behind the step in flight, so a pull queued
+   ahead of the batch would hold the batch's launch until that step ends. A
+   store names the victim's request-pool slot, which the scheduler
    freed in the same plan build: its next owner first writes it in a
    forward, and every forward is enqueued behind the store fence, so the
    slot-state export reads the victim's bytes; a restore names the resumed

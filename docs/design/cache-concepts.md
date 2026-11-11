@@ -1084,7 +1084,11 @@ Its responsibilities:
   phase leaves the partial block a hole: the peer's transfer starts at the
   block containing `hit_tokens` and fills a fresh page whole, so the D role
   never copies it; a tail's full blocks below that page are copied like on
-  every role ([Scheduler §3.2](scheduler.md#32-d--decode-worker)).
+  every role ([Scheduler §3.2](scheduler.md#32-d--decode-worker)). Like any
+  copy destination, a block the transfer fills whole is not zeroed
+  (`GroupDemand::landed_tokens`, `StateStep::kLand`): the landing zeroes
+  only the block holding an unaligned prompt end and the reserve pages
+  beyond it.
 
   `Admit` takes two inputs of different scope and tense. One `GroupDemand`
   per group says what that group needs for the round ahead: an extent and a

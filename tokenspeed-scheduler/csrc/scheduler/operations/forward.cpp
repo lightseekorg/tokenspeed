@@ -691,12 +691,16 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
                       .checkpoint = checkpoint});
         ReservePrefillDemands(demands, config_.cache_groups, reserve);
         if (source == fsm::PrefillSource::kRemote) {
-            // Cached windows already own the hit's blocks, including a
-            // fresh partial tail block. Replayable windows own no hit blocks:
-            // the peer must fill their whole retained suffix.
+            // A full-history group's blocks up to the prompt end land whole
+            // and are not zeroed (GroupDemand::landed_tokens). Cached windows
+            // already own the hit's blocks, including a fresh partial tail
+            // block. Replayable windows own no hit blocks: the peer must fill
+            // their whole retained suffix.
             for (std::size_t i = 0; i < demands.size(); ++i) {
                 const CacheGroupConfig& group = config_.cache_groups[i];
-                if (group.attn_kind == AttnKind::kSlidingWindow) {
+                if (group.attn_kind == AttnKind::kFull) {
+                    demands[i].landed_tokens = request->PrefillSize();
+                } else if (group.attn_kind == AttnKind::kSlidingWindow) {
                     const std::int32_t block_granularity =
                         coordinator_.GroupBlockGranularity(static_cast<std::int32_t>(i));
                     const std::int32_t hit_blocks =
