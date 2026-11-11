@@ -137,6 +137,44 @@ struct Args {
     enable_async_logging: bool,
 }
 
+/// A serving failure can be reported by either the control or forward thread.
+#[derive(Default)]
+struct LauncherFailure {
+    reported: AtomicBool,
+    parent: Option<libc::pid_t>,
+}
+
+impl LauncherFailure {
+    #[allow(unsafe_code)]
+    fn for_parent() -> Self {
+        // SAFETY: getppid has no preconditions.
+        let parent = unsafe { libc::getppid() };
+        Self {
+            reported: AtomicBool::new(false),
+            parent: (parent > 1).then_some(parent),
+        }
+    }
+
+    #[allow(unsafe_code)]
+    fn report(&self, error: impl std::fmt::Display) {
+        if self.reported.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let signal_error = self.parent.and_then(|parent| {
+            // SAFETY: parent is a positive PID. Check that the launcher still
+            // owns this rank before sending the existing child-failure signal.
+            let failed =
+                unsafe { libc::getppid() == parent && libc::kill(parent, libc::SIGUSR1) != 0 };
+            failed.then(std::io::Error::last_os_error)
+        });
+        // Synchronous logging can stall on a blocked output stream.
+        tracing::error!("{error}");
+        if let Some(error) = signal_error {
+            tracing::error!(%error, "could not notify the launcher");
+        }
+    }
+}
+
 fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, HostError> {
     let mut python = None;
     let mut control_fd = None;
@@ -576,7 +614,7 @@ fn watch_signals(stop: Arc<AtomicBool>) -> std::io::Result<()> {
     Ok(())
 }
 
-fn serve(args: &Args) -> Result<(), HostError> {
+fn serve(args: &Args, launcher: &Arc<LauncherFailure>) -> Result<(), HostError> {
     let stop = Arc::new(AtomicBool::new(false));
     watch_signals(stop.clone())?;
 
@@ -706,8 +744,8 @@ fn serve(args: &Args) -> Result<(), HostError> {
                 .map_err(|error| python_error(py, error))
         })?;
     }
-    let data_plane =
-        PythonDataPlane::start(data_plane, peers.streams).map_err(HostError::DataPlane)?;
+    let data_plane = PythonDataPlane::start(data_plane, peers.streams, launcher.clone())
+        .map_err(HostError::DataPlane)?;
     let metrics = exporter
         .as_ref()
         .filter(|_| config.metrics.engine)
@@ -806,11 +844,25 @@ fn serve(args: &Args) -> Result<(), HostError> {
             l3,
         },
     );
-    let served = event_loop.run(&stop);
-    // Stops the forward thread and tells the frontend the engine is gone.
-    drop(event_loop);
-    call("close")?;
-    Ok(served?)
+    finish_serving(event_loop.run(&stop), launcher, || {
+        // Stops the forward thread and tells the frontend the engine is gone.
+        drop(event_loop);
+        call("close")
+    })
+}
+
+fn finish_serving(
+    served: Result<(), LoopError>,
+    launcher: &LauncherFailure,
+    close: impl FnOnce() -> Result<(), HostError>,
+) -> Result<(), HostError> {
+    let served = served.map_err(HostError::from);
+    if let Err(error) = &served {
+        // Joining the forward thread and closing Python can wait on device
+        // work. Let the launcher start failure handling before either.
+        launcher.report(error);
+    }
+    served.and(close())
 }
 
 fn main() -> ExitCode {
@@ -822,17 +874,18 @@ fn main() -> ExitCode {
         }
     };
     let _log_guard = logging::init(args.enable_async_logging);
+    let launcher = Arc::new(LauncherFailure::for_parent());
     let served = (|| {
         interpreter::start(&args.python).map_err(HostError::Interpreter)?;
         let served = {
             // The host does not finalize Python. Drain its logger on success,
-            // error and unwind, before failure notification can kill the rank.
+            // error and unwind if the launcher has not stopped the rank.
             let _python_logs = logging::PythonLogGuard;
-            serve(&args)
+            serve(&args, &launcher)
         };
-        if served.is_err() {
-            // As `run_event_loop` does: the launcher then stops the other
-            // ranks.
+        if served.is_err() && !launcher.reported.load(Ordering::Relaxed) {
+            // Failures outside the serving loop still notify after Python
+            // log cleanup.
             let notified = Python::attach(|py| {
                 py.import("tokenspeed.runtime.engine.rust_host")?
                     .call_method0("notify_launcher_of_failure")
@@ -847,7 +900,9 @@ fn main() -> ExitCode {
     match served {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            tracing::error!("{error}");
+            if !launcher.reported.load(Ordering::Relaxed) {
+                tracing::error!("{error}");
+            }
             ExitCode::FAILURE
         }
     }
@@ -855,7 +910,75 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_args;
+    use super::{finish_serving, parse_args, HostError, LauncherFailure, LoopError};
+
+    #[test]
+    fn serving_error_notifies_launcher_before_teardown() {
+        use std::{
+            process::{Command, Stdio},
+            time::Duration,
+        };
+        use tokio::signal::unix::{signal, SignalKind};
+
+        const CHILD: &str = "TS_HOST_BLOCKED_TEARDOWN_TEST";
+        if std::env::var_os(CHILD).is_some() {
+            // The launcher holds this pipe open until it gets SIGUSR1.
+            let wait_for_launcher = || {
+                std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink()).unwrap();
+            };
+            tracing_subscriber::fmt()
+                .with_writer(move || {
+                    wait_for_launcher();
+                    std::io::sink()
+                })
+                .init();
+            let launcher = LauncherFailure::for_parent();
+            let result = finish_serving(
+                Err(LoopError::Scheduler("serving failed".to_owned())),
+                &launcher,
+                || {
+                    wait_for_launcher();
+                    Err(HostError::Python("close failed".to_owned()))
+                },
+            );
+            assert!(
+                matches!(result, Err(HostError::Loop(LoopError::Scheduler(message)))
+                if message == "serving failed")
+            );
+            return;
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut failure = {
+            let _entered = runtime.enter();
+            signal(SignalKind::user_defined1()).unwrap()
+        };
+        let mut rank = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::serving_error_notifies_launcher_before_teardown",
+            ])
+            .env(CHILD, "1")
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let notified = runtime.block_on(async {
+            matches!(
+                tokio::time::timeout(Duration::from_secs(5), failure.recv()).await,
+                Ok(Some(()))
+            )
+        });
+        let running = rank.try_wait().unwrap().is_none();
+        drop(rank.stdin.take());
+        assert!(rank.wait().unwrap().success());
+        assert!(
+            notified && running,
+            "no launcher signal before blocked logging and teardown"
+        );
+    }
 
     #[test]
     fn python_trace_provider_loads_and_falls_back_on_error() {

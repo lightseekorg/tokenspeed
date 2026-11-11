@@ -57,7 +57,7 @@ use ts_pd::LandedRequest;
 use ts_scheduler::{CacheEvent, CacheEventKind, ExecutionPlan};
 use ts_wire::{control::ProfileReq, ControlRequest, Wire};
 
-use crate::pd::Streams;
+use crate::{pd::Streams, LauncherFailure};
 
 /// A forward the forward thread launched, by launch order.
 pub type ForwardId = u64;
@@ -157,11 +157,11 @@ struct AdmitRow {
 
 /// What the two threads share. The lock is a leaf: nobody takes the GIL
 /// while holding it.
-#[derive(Default)]
 struct Shared {
     state: Mutex<State>,
     /// Signalled when a forward was launched or the data plane failed.
     changed: Condvar,
+    launcher: Arc<LauncherFailure>,
 }
 
 #[derive(Default)]
@@ -186,6 +186,9 @@ impl Shared {
     /// Record a failure, unless an earlier one is recorded, and wake the
     /// control thread if it waits for a launch.
     fn fail(&self, failure: String) {
+        // The control thread can still be waiting on a collective.
+        self.launcher
+            .report(format_args!("the data plane failed:\n{failure}"));
         self.state().failure.get_or_insert(failure);
         self.changed.notify_all();
     }
@@ -213,13 +216,15 @@ impl Shared {
     }
 }
 
-/// Fails the data plane when the forward thread ends, so the control thread
-/// never waits for a launch that cannot come (a panic included).
+/// Wake the control thread if a panic leaves it waiting for a launch.
+/// Closing the forward queue during teardown is an orderly exit.
 struct ExitNotice(Arc<Shared>);
 
 impl Drop for ExitNotice {
     fn drop(&mut self) {
-        self.0.fail("the forward thread exited".to_owned());
+        if thread::panicking() {
+            self.0.fail("the forward thread panicked".to_owned());
+        }
     }
 }
 
@@ -240,7 +245,11 @@ impl PythonDataPlane {
     /// dispatch guard on the calling thread, the control thread, which must
     /// also drop the data plane. With PD, the forward thread stages each
     /// plan's remote stream with the transfer peer (`streams`).
-    pub fn start(plane: Py<PyAny>, streams: Option<Streams>) -> Result<Self, String> {
+    pub(super) fn start(
+        plane: Py<PyAny>,
+        streams: Option<Streams>,
+        launcher: Arc<LauncherFailure>,
+    ) -> Result<Self, String> {
         let guard = Python::attach(|py| {
             plane
                 .call_method0(py, "control_thread_guard")
@@ -248,7 +257,11 @@ impl PythonDataPlane {
                 .map_err(|error| describe(py, &error))
         })?;
         let (ops, queue) = mpsc::channel();
-        let shared = Arc::new(Shared::default());
+        let shared = Arc::new(Shared {
+            state: Mutex::default(),
+            changed: Condvar::new(),
+            launcher,
+        });
         let mut data_plane = Self {
             plane: Python::attach(|py| plane.clone_ref(py)),
             guard: Some(guard),
@@ -264,9 +277,7 @@ impl PythonDataPlane {
                 Python::attach(|py| {
                     let plane = plane.bind(py);
                     if let Err(error) = plane.call_method0("enter_forward_thread") {
-                        let error = describe(py, &error);
-                        tracing::error!("the forward thread could not start:\n{error}");
-                        shared.fail(error);
+                        shared.fail(describe(py, &error));
                         return;
                     }
                     forward_loop(py, plane, queue, &shared, streams.as_ref());
@@ -591,7 +602,6 @@ fn forward_loop(
                 if let Err(error) = plane.call_method0("exit_forward_thread") {
                     let error = describe(py, &error);
                     tracing::error!("the forward thread could not finish:\n{error}");
-                    shared.fail(error);
                 }
             }
             return;
@@ -627,7 +637,6 @@ fn forward_loop(
             continue;
         }
         if let Err(error) = run(py, plane, op, shared, streams) {
-            tracing::error!("the data plane failed:\n{error}");
             shared.fail(error);
         }
     }
@@ -1062,7 +1071,12 @@ result = (Plane(), ts.Scheduler(cfg))
     }
 
     fn start(plane: &Py<PyAny>) -> PythonDataPlane {
-        PythonDataPlane::start(Python::attach(|py| plane.clone_ref(py)), None).unwrap()
+        PythonDataPlane::start(
+            Python::attach(|py| plane.clone_ref(py)),
+            None,
+            Arc::default(),
+        )
+        .unwrap()
     }
 
     /// A one-row batch: the stand-in launches whatever it is handed.
