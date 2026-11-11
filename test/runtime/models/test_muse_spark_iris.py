@@ -791,6 +791,7 @@ def _muse_owned_routed_wt_worker(rank, world_size, device):
                 norm.weight_offset,
                 pdl_enabled(),
                 output,
+                None,
             )
         return state.reduce_scatter_owned_rows(output).clone()
 
