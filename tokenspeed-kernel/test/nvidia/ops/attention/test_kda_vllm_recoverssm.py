@@ -828,6 +828,7 @@ def test_verify_derived_records_with_serving_producers(
             ),
             g_raw=gate,
             conv_qkv=qkv,
+            output_norm=None,
         )
     else:
         kernel = select_kernel(

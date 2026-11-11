@@ -381,6 +381,7 @@ def _boundary_reference(stream, reduced, post, alpha, beta, pre):
         False,
         None,
         1,
+        None,
     )
 
 
@@ -811,9 +812,11 @@ def _compile_gfx950(fn, types, constexprs, num_warps, unspecialized=(), options=
     Arguments named in unspecialized get no 16-byte divisibility, as when a
     caller passes them in do_not_specialize or compiles ahead of time.
     Pointers the kernel annotates ``tl.const`` compile as const pointers, as
-    at launch. ``options`` adds compile options (such as extern libraries).
+    at launch. ``options`` adds compile options. Every compile links the
+    extern intrinsic libraries.
     """
     from tokenspeed_kernel._triton import gluon, triton
+    from tokenspeed_kernel_amd._extern import extern_compile_options
 
     types = dict(types)
     for param in fn.params:
@@ -840,7 +843,11 @@ def _compile_gfx950(fn, types, constexprs, num_warps, unspecialized=(), options=
     return triton.compile(
         source,
         target=triton.backends.compiler.GPUTarget("hip", "gfx950", 64),
-        options={"num_warps": num_warps, **(options or {})},
+        options={
+            "num_warps": num_warps,
+            **extern_compile_options(),
+            **(options or {}),
+        },
     )
 
 
@@ -1990,6 +1997,7 @@ def _muse_moetail_reference(x, weight, stream, post, alpha, beta, pre):
         False,
         None,
         1,
+        None,
         return_pre_fp32=False,
     )
     return out_stream, pre_bf16

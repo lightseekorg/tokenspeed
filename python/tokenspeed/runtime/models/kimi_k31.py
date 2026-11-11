@@ -67,7 +67,11 @@ from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
 from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import DenseLayerMapping, Mapping
-from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
+from tokenspeed.runtime.execution.breakable_cuda_graph import (
+    break_point,
+    is_breakable_capture_active,
+)
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
     HybridLinearAttnBackend,
 )
@@ -95,6 +99,9 @@ _PRECOMPUTED_QKV_A_WIDTH = 2112
 
 # The checkpoint names no epsilon for the index-key LayerNorm; 1e-6 is DeepSeek-V3.2's.
 _INDEX_K_NORM_EPS = 1e-6
+
+# GB300 AL8: the front saves 2 us/DSA layer at 8-32 rows and costs 7 at 64.
+_DECODE_FRONT_MAX_ROWS = 32
 
 
 class KimiK31Indexer(nn.Module):
@@ -308,6 +315,42 @@ def _fused_decode_topk_solution(indexer: KimiK31Indexer) -> str | None:
     return "cute_dsl"
 
 
+def _decode_front_kernel(
+    indexer: KimiK31Indexer, q_lora_rank: int, kv_lora_rank: int, q_b_rows: int
+) -> Callable | None:
+    """The fused decode front (``dsa_decode_front``) serving this layer, or None.
+
+    One launch replaces a decode round's q_a / kv_a RMSNorm, its stacked
+    [q_b; wq_b] projection and its index-K write with query quantization. It
+    hands the fused decode top-k E4M3 queries, so a host selects it only with
+    ``index_k_write_quantizes_query``.
+    """
+    signature = format_signature(
+        q_a=dense_tensor_format(torch.bfloat16),
+        weight=dense_tensor_format(torch.bfloat16),
+    )
+    traits = {
+        "q_lora_rank": q_lora_rank,
+        "kv_lora_rank": kv_lora_rank,
+        "q_b_rows": q_b_rows,
+        "index_heads": indexer.index_n_heads,
+        "head_dim": indexer.index_head_dim,
+        "page_size": 64,
+        "index_k_format": "fp8_scaled",
+        "index_k_layout": "packed",
+    }
+    try:
+        return select_kernel(
+            "attention",
+            "dsa_decode_front",
+            signature,
+            traits=traits,
+            solution="cute_dsl",
+        )
+    except NoKernelFoundError:
+        return None
+
+
 class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttention):
     """K3's gated NoPE MLA attending its own indexer's top-k (DSA).
 
@@ -317,6 +360,11 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
     does not expose. The 64-wide unrotated slice stays in the latent row
     (576 values) and in the absorbed query, and the DSA cores take its dot
     product like any other key channel.
+
+    A decode round of the K3 decode chain runs its norms, the stacked
+    [q_b; wq_b] projection and the index-K write with query quantization in
+    one launch where the platform registers ``dsa_decode_front``
+    (``_takes_decode_front``).
     """
 
     def __init__(
@@ -394,6 +442,17 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
         )
         # A decode round quantizes its index query in the index-K write's launch.
         self.index_k_write_quantizes_query = self.decode_topk_solution is not None
+        # A decode chain round's norms, q_b / wq_b projection and index-K write in one launch.
+        self.decode_front = (
+            _decode_front_kernel(
+                self.indexer,
+                self.q_lora_rank,
+                self.kv_lora_rank,
+                self.q_b_proj.weight.shape[0],
+            )
+            if self.index_k_write_quantizes_query
+            else None
+        )
         self._decode_topk_indices_buffer: torch.Tensor | None = None
         self._decode_topk_lens_buffer: torch.Tensor | None = None
         self._retired_decode_workspaces: list[torch.Tensor] = []
@@ -539,7 +598,9 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
 
         It follows ``KimiLinearMLAAttention.o_proj_input``, attending the
         indexer's top-k like ``forward``. The indexer takes its keys and head
-        weights from the packed projection instead of projecting them itself.
+        weights from the packed projection instead of projecting them itself,
+        and a decode round runs the fused decode front where
+        ``_takes_decode_front`` admits it.
 
         Args:
             positions: The token positions.
@@ -659,9 +720,6 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
             when the value projection applied it).
         """
         kv_a = latent_cache[..., : self.kv_lora_rank]
-        # Normalizes the latent in place and the q latent into q_norm.
-        q_norm = torch.empty_like(q_a)
-        self.fused_qk_layernorm(input_q_a=q_a, input_kv_a=kv_a, output_q_a=q_norm)
         # Decode gates in the value projection; an FP8 o_proj gates in its input quant.
         fuse_value_gate = (
             gate is not None
@@ -669,6 +727,25 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
             and self.absorbed_weights_k_major
             and not self.o_proj.supports_fp8_group128_input
         )
+        if self._takes_decode_front(ctx, q_a, kv_a, index_key_weights):
+            # The decode front normalizes, projects and writes the index keys in the break.
+            attn_output = self._sparse_attention(
+                positions,
+                hidden_states,
+                q_a,
+                latent_cache,
+                ctx,
+                comm_manager,
+                gate if fuse_value_gate else None,
+                None,
+                None,
+                index_key_weights,
+                normalized=False,
+            )
+            return attn_output, None if fuse_value_gate else gate
+        # Normalizes the latent in place and the q latent into q_norm.
+        q_norm = torch.empty_like(q_a)
+        self.fused_qk_layernorm(input_q_a=q_a, input_kv_a=kv_a, output_q_a=q_norm)
         projected_q = index_query = None
         # Decode rounds only: a prefill projects wq_b for its rank's top-k share of rows.
         if self.q_b_wq_b_weight is not None and ctx.num_extends == 0:
@@ -691,8 +768,105 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
             projected_q,
             index_query,
             index_key_weights,
+            normalized=True,
         )
         return attn_output, None if fuse_value_gate else gate
+
+    def _takes_decode_front(
+        self,
+        ctx: ForwardContext,
+        q_a: torch.Tensor,
+        kv_a: torch.Tensor,
+        index_key_weights: torch.Tensor | None,
+    ) -> bool:
+        """Whether this round runs the fused decode front (``_decode_front``).
+
+        A decode round of the decode chain (keys and head weights projected
+        with the a-projection) qualifies where the front was selected, the
+        layer computes its own top-k, the stacked [q_b; wq_b] weight exists,
+        the round's index-K write quantizes its query, its KV is not placed
+        across ranks, the front addresses the rows, there are at most
+        ``_DECODE_FRONT_MAX_ROWS`` of them, and no breakable capture records
+        the round (its eager break would replay the capture-time choice over
+        padded rows).
+        """
+        if (
+            ctx.num_extends != 0
+            or q_a.shape[0] > _DECODE_FRONT_MAX_ROWS
+            or self.skip_indexer_topk
+            or self.decode_front is None
+            or self.q_b_wq_b_weight is None
+            or not self.index_k_write_quantizes_query
+            or index_key_weights is None
+            or is_breakable_capture_active()
+        ):
+            return False
+        backend = ctx.attn_backend
+        if isinstance(backend, HybridLinearAttnBackend):
+            backend = backend.full_attn_backend
+        if backend.cache_placement(self.attn_mqa) is not None:
+            return False
+        key, weights = index_key_weights.split(
+            (self.indexer.index_head_dim, self.indexer.index_n_heads), dim=-1
+        )
+        return dsa_cute_dsl.decode_front_rows_supported(q_a, kv_a, key, weights)
+
+    def _decode_front(
+        self,
+        q_a: torch.Tensor,
+        latent_cache: torch.Tensor,
+        index_key_weights: torch.Tensor,
+        ctx: ForwardContext,
+    ) -> tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor]
+    ]:
+        """A decode round's front in one launch, inside the eager break.
+
+        It normalizes ``q_a`` into ``q_norm`` and the latent in place exactly as
+        ``fused_qk_layernorm`` does, projects ``q_norm`` through the stacked
+        [q_b; wq_b] weight (FP32 accumulation in its own K order), writes the
+        round's index keys exactly as ``set_index_k_buffer_and_quantize_query``
+        does and quantizes the index query as it does.
+
+        Returns:
+            ``(q_norm, projected_q, index_query, written_index_query)``: the
+            BF16 ``q_norm``, ``q_b_proj`` rows and ``[T, index_heads,
+            index_head_dim]`` index query (views of one projection, as the
+            unfused GEMM's split gives them), and the E4M3 query with its FP32
+            head weights for ``forward_dsa_core``.
+        """
+        indexer = self.indexer
+        key, head_weights = index_key_weights.split(
+            (indexer.index_head_dim, indexer.index_n_heads), dim=-1
+        )
+        pool = ctx.token_to_kv_pool
+        norms = self.fused_qk_layernorm
+        q_b_rows = self.q_b_proj.weight.shape[0]
+        q_norm, projected, q_fp8, weights = self.decode_front(
+            q_a,
+            latent_cache[..., : self.kv_lora_rank],
+            key,
+            head_weights,
+            q_norm_weight=norms.weight_q_a,
+            kv_norm_weight=norms.weight_kv_a,
+            norm_eps=norms.q_a_norm.variance_epsilon,
+            query_weight=self.q_b_wq_b_weight,
+            q_b_rows=q_b_rows,
+            key_norm_weight=indexer.k_norm.weight,
+            key_norm_bias=indexer.k_norm.bias,
+            key_norm_eps=indexer.k_norm.variance_epsilon,
+            index_k_cache=pool.get_index_k_buffer(self.attn_mqa.layer_id),
+            slots=ctx.attn_backend.write_locations(self.attn_mqa, ForwardMode.DECODE),
+            page_size=pool.index_k_page_size,
+            softmax_scale=indexer.weights_softmax_scale,
+        )
+        projected_q, index_query = projected.split(
+            (q_b_rows, self.indexer.wq_b.weight.shape[0]), dim=-1
+        )
+        index_query = index_query.view(
+            -1, indexer.index_n_heads, indexer.index_head_dim
+        )
+        return q_norm, projected_q, index_query, (q_fp8, weights)
 
     def project_latent_values(
         self,
@@ -709,7 +883,7 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        q_norm: torch.Tensor,
+        q_latent: torch.Tensor,
         latent_cache: torch.Tensor,
         ctx: ForwardContext,
         comm_manager: CommManager,
@@ -717,6 +891,8 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
         projected_q: torch.Tensor | None,
         index_query: torch.Tensor | None,
         index_key_weights: torch.Tensor | None,
+        *,
+        normalized: bool,
     ) -> torch.Tensor:
         """The eager break: index-K write, top-k, and the sparse cores.
 
@@ -726,21 +902,33 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
         ``ModelConfig.dsa_padded_prefill_replay`` declares. Anything moved out
         of the break must be token-shaped and read no backend metadata. The
         DSA leaf is the hybrid wrapper's full-attention child.
+
+        ``q_latent`` is ``q_norm`` when ``normalized``; otherwise it is the raw
+        q_a rows of a round ``_takes_decode_front`` admitted, the latent is
+        still unnormalized, and ``_decode_front`` produces the normalized rows,
+        the projections and the index-K write here.
         """
         backend = ctx.attn_backend
         if isinstance(backend, HybridLinearAttnBackend):
             backend = backend.full_attn_backend
+        ctx = replace(ctx, attn_backend=backend)
+        written_index_query = None
+        if not normalized:
+            q_latent, projected_q, index_query, written_index_query = (
+                self._decode_front(q_latent, latent_cache, index_key_weights, ctx)
+            )
         return self.forward_dsa_core(
             positions,
             hidden_states,
-            q_norm,
+            q_latent,
             latent_cache,
-            replace(ctx, attn_backend=backend),
+            ctx,
             comm_manager,
             output_gate=output_gate,
             projected_q=projected_q,
             index_query=index_query,
             index_key_weights=index_key_weights,
+            written_index_query=written_index_query,
         )
 
 

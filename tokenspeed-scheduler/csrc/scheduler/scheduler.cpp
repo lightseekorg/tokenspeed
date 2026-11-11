@@ -37,6 +37,7 @@
 
 #include "core/token_container.h"
 #include "cache/tier/transfer.h"
+#include "fsm/forward_events.h"
 #include "fsm/forward_states.h"
 #include "scheduler/capacity_model.h"
 #include "scheduler/operations/forward.h"
@@ -47,11 +48,6 @@
 namespace tokenspeed {
 
 namespace {
-
-// Stalled rounds (Scheduler::trackStalledRounds) before the first warning.
-// Later warnings come at every doubling of the streak, so a stall that never
-// ends still logs only a few dozen lines.
-constexpr std::int64_t kStalledRoundsBeforeWarning = 1024;
 
 std::int32_t hostPoolBlocks(const SchedulerConfig& config) {
     return config.HasHostCache() ? config.host_allocator.NumUsableBlocks() : 0;
@@ -505,6 +501,8 @@ HostCacheStats Scheduler::GetHostCacheStats() const {
         .dead_entries_not_written_back = coordinator_.DeadEntriesNotWrittenBack(),
         .demoted_entries_not_written_back = coordinator_.DemotedEntriesNotWrittenBack(),
         .device_evictions = coordinator_.DeviceEvictions(),
+        .lone_compactions = coordinator_.LoneCompactions(),
+        .lone_compaction_moves = coordinator_.LoneCompactionMoves(),
         .checkpoint_resume_gaps = coordinator_.CheckpointResumeGaps(),
     };
 }
@@ -674,6 +672,40 @@ ExecutionPlan Scheduler::NextExecutionPlan(PlanOptions options) {
                        /*plan_is_empty=*/!builds_work && write_back_operations.empty() &&
                            built.snapshot_stores.empty() && !has_storage_work && built.load_backs.empty() &&
                            built.snapshot_restores.empty() && plan.aborts.empty());
+    // The no-progress abort (docs/design/scheduler.md §1.4, §2), decided on
+    // the diagnostic's own count: at the kNoProgressAbortPlans-th consecutive
+    // stalled plan, unless lone-request compaction moved or published
+    // something in it, the request the build left blocked for capacity with
+    // no other request holding pages is aborted with a reason -- neither
+    // eviction nor compaction can ever fund its admission, nor eviction a
+    // landed image's restore that claims no cached page, so waiting would
+    // last for good. Fused role only: on the P and D roles a Submitted
+    // request stuck so has its PD transfer registered, which a scheduler
+    // abort does not conclude, so a request stuck there waits behind the
+    // warning as before. The abort ends the streak, like any plan carrying
+    // an abort: the next request stuck alone is judged on a streak of its
+    // own.
+    if (config_.role == Role::kFused && stalled_rounds_ >= kNoProgressAbortPlans &&
+        last_lone_compaction_plan_ != plan_calls_ && built.blocked_alone != nullptr) {
+        Request& stuck = *built.blocked_alone;
+        const bool restore = stuck.Is<fsm::Retracted>();
+        const std::string detail = fmt::format(
+            "no progress for {} consecutive plans with no other request holding pages: its {} needs Device pages "
+            "that {} (device LCM blocks active={}, empty={}, total={})",
+            stalled_rounds_, restore ? "restore" : "admission",
+            restore ? "eviction cannot free even when it claims no cached page"
+                    : "neither eviction nor lone-request compaction can free",
+            ActiveLcmBlocks(), EmptyLcmBlocks(), coordinator_.TotalLcmBlocks());
+        spdlog::warn("[Scheduler] no-progress abort: request {} ({} tokens) -- {}; aborting it", stuck.Id(),
+                     stuck.TokenSize(), detail);
+        plan.aborts.push_back(SchedulerAbort{
+            .request_id = stuck.Id(),
+            .reason = AbortReason::kNoProgress,
+            .detail = detail,
+        });
+        stuck.Apply(fsm::AbortEvent{&coordinator_});
+        stalled_rounds_ = 0;
+    }
     return plan;
 }
 
@@ -698,9 +730,10 @@ void Scheduler::trackStalledRounds(std::size_t num_live_requests, bool plan_is_e
         spdlog::warn(
             "[Scheduler] no work scheduled for {} consecutive rounds with {} live requests and nothing in flight "
             "(waiting={}, prefilling={}, decoding={}; device LCM blocks active={}, empty={}, total={}); "
-            "they cannot progress until a request is aborted",
+            "they cannot progress until a request is aborted (on the fused role a lone request is aborted after {} "
+            "such plans)",
             stalled_rounds_, num_live_requests, WaitingSize(), PrefillSize(), DecodingSize(), ActiveLcmBlocks(),
-            EmptyLcmBlocks(), coordinator_.TotalLcmBlocks());
+            EmptyLcmBlocks(), coordinator_.TotalLcmBlocks(), kNoProgressAbortPlans);
     }
 }
 

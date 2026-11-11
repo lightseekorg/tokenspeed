@@ -1287,17 +1287,19 @@ class Eagle(HiddenStateDrafter):
             ib.positions_buf[num_tokens:bucket].zero_()
         # The draft prologue writes K/V inside a captured segment, which holds
         # no per-layer Host-load wait: wait for the draft pool's whole load
-        # first, as PrefillGraph.replay does for the target's.
+        # first, as PrefillGraph.replay does for an undeclared pool, which
+        # covers the per-layer waits the capture noted.
         tracker = self.token_to_kv_pool.layerwise_load_tracker
         if tracker is not None:
             tracker.wait_for_all_layers()
         self._attach_dsa_topk((None, None))
         with active_forward(graph.ctx):
-            graph.capture.replay(valid_rows=num_tokens)
+            graph.capture.replay(valid_rows=num_tokens, noted_waits_done=True)
         return (None, None)
 
     def _replay_decode_steps(self, bs: int) -> None:
         """Replay the decode steps over the staged step-0 outputs."""
         graph = self._decode_steps_graphs[bs]
         with active_forward(graph.ctx):
-            graph.capture.replay()
+            # Step 0 has waited for the draft layers' Host load.
+            graph.capture.replay(noted_waits_done=True)

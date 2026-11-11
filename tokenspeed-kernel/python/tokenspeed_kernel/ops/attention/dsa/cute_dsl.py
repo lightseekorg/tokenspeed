@@ -32,6 +32,11 @@ cluster capacity. NVIDIA Blackwell (sm_100+) only; gate on
 ``cute_dsl_dsa_decode_topk`` is the registered fused ``dsa_decode_topk`` leaf
 (README, "Fused decode top-k"): the paged FP32 logits and the exact top-k of a
 decode step in two launches, selected only by ``solution="cute_dsl"``.
+
+``cute_dsl_dsa_decode_front`` is the registered ``dsa_decode_front`` leaf
+(README, "Fused decode front"): a Kimi-K3.1 TP8 decode round's q_a / kv_a
+RMSNorm, stacked [q_b; wq_b] projection, index query quantization and index-K
+write in one cluster launch.
 """
 
 from __future__ import annotations
@@ -53,7 +58,9 @@ from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = [
+    "DECODE_FRONT_MAX_ROWS",
     "cute_dsl_decode_topk",
+    "decode_front_rows_supported",
     "has_cute_dsl_decode_topk",
 ]
 
@@ -498,3 +505,261 @@ if _fused_indexer is not None:
             lens_out=lens_out,
         )
         return out, lens_out
+
+
+# Fused decode front: a decode round's q_a / kv_a RMSNorm, the stacked [q_b; wq_b]
+# projection, the index query quantization and the index-K write in one launch.
+
+_decode_front = None
+if _ts_supported_arch():
+    try:
+        from tokenspeed_kernel.thirdparty.cute_dsl.k3_decode.dsa import (
+            front as _decode_front,
+        )
+    except ImportError:
+        _decode_front = None
+
+# Rows one fused decode front serves, 0 without it.
+DECODE_FRONT_MAX_ROWS = 0 if _decode_front is None else _decode_front.MAX_ROWS
+_FRONT_Q_LORA = 1536
+_FRONT_LATENT = 512
+_FRONT_WQ_B_ROWS = _FUSED_HEADS * 128
+# quantize_index_query_weights' amax floor: 1e-10 rounded to the BF16 query dtype.
+_FRONT_AMAX_FLOOR = float(torch.tensor(1e-10, dtype=torch.bfloat16))
+_FRONT_FP8_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
+
+
+def decode_front_rows_supported(
+    q_a: torch.Tensor,
+    kv_a: torch.Tensor,
+    index_key: torch.Tensor,
+    head_weights: torch.Tensor,
+) -> bool:
+    """Whether ``cute_dsl_dsa_decode_front`` addresses these rows.
+
+    Args:
+        q_a: ``[rows, 1536]`` q latent rows.
+        kv_a: ``[rows, 512]`` latent rows (normalized in place).
+        index_key: ``[rows, 128]`` pre-norm index keys.
+        head_weights: ``[rows, 32]`` index head weights.
+
+    Returns:
+        True for 1 to ``DECODE_FRONT_MAX_ROWS`` CUDA BF16 rows with unit inner
+        stride, 16-byte aligned q_a and kv_a rows and 8-byte aligned key rows
+        (columns of the K3 decode chain's packed projection qualify).
+    """
+    rows = q_a.shape[0]
+    widths = (_FRONT_Q_LORA, _FRONT_LATENT, 128, _FUSED_HEADS)
+    tensors = (q_a, kv_a, index_key, head_weights)
+    return (
+        1 <= rows <= DECODE_FRONT_MAX_ROWS
+        and all(
+            t.dim() == 2
+            and t.shape == (rows, width)
+            and t.dtype == torch.bfloat16
+            and t.is_cuda
+            and t.stride(1) == 1
+            for t, width in zip(tensors, widths)
+        )
+        and all(t.stride(0) % 8 == 0 and t.data_ptr() % 16 == 0 for t in tensors[:2])
+        and index_key.stride(0) % 4 == 0
+        and index_key.data_ptr() % 8 == 0
+    )
+
+
+if _decode_front is not None:
+
+    @register_kernel(
+        "attention",
+        "dsa_decode_front",
+        name="cute_dsl_dsa_decode_front",
+        solution="cute_dsl",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 3),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    q_a=dense_tensor_format(torch.bfloat16),
+                    weight=dense_tensor_format(torch.bfloat16),
+                )
+            }
+        ),
+        traits={
+            "q_lora_rank": frozenset({_FRONT_Q_LORA}),
+            "kv_lora_rank": frozenset({_FRONT_LATENT}),
+            "q_b_rows": frozenset({2304}),
+            "index_heads": frozenset({_FUSED_HEADS}),
+            "head_dim": frozenset({128}),
+            "page_size": frozenset({_FUSED_PAGE}),
+            "index_k_format": frozenset({"fp8_scaled"}),
+            "index_k_layout": frozenset({"packed"}),
+        },
+        priority=Priority.SPECIALIZED,
+    )
+    def cute_dsl_dsa_decode_front(
+        q_a: torch.Tensor,
+        kv_a: torch.Tensor,
+        index_key: torch.Tensor,
+        head_weights: torch.Tensor,
+        *,
+        q_norm_weight: torch.Tensor,
+        kv_norm_weight: torch.Tensor,
+        norm_eps: float,
+        query_weight: torch.Tensor,
+        q_b_rows: int,
+        key_norm_weight: torch.Tensor,
+        key_norm_bias: torch.Tensor,
+        key_norm_eps: float,
+        index_k_cache: torch.Tensor,
+        slots: torch.Tensor,
+        page_size: int,
+        softmax_scale: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """A decode round's attention front, one cluster launch.
+
+        It produces, bit for bit unless noted:
+
+        - ``q_norm``: ``rmsnorm_fused_parallel``'s normalized ``q_a``, and
+          ``kv_a`` normalized in place, both with ``norm_eps``;
+        - ``projected = q_norm @ query_weight.T`` in FP32, rounded to BF16
+          (the K accumulation order differs from a GEMM library's, so a
+          value may differ from it by one BF16 step);
+        - ``quantize_index_query_weights(projected[:, q_b_rows:], head_weights,
+          softmax_scale)`` of those projected rows;
+        - ``index_k_layernorm_fp8_scatter(index_k_cache, index_key,
+          key_norm_weight, key_norm_bias, slots, ...)``'s plane bytes.
+
+        Args:
+            q_a: ``[rows, 1536]`` BF16 q latent rows (``decode_front_rows_supported``).
+            kv_a: ``[rows, 512]`` BF16 latent rows, normalized in place.
+            index_key: ``[rows, 128]`` BF16 pre-norm index keys.
+            head_weights: ``[rows, 32]`` BF16 index head weights.
+            q_norm_weight: ``[1536]`` BF16 q_a RMSNorm weight.
+            kv_norm_weight: ``[512]`` BF16 kv_a RMSNorm weight.
+            norm_eps: The RMSNorm epsilon of both (``rmsnorm_fused_parallel``
+                takes one).
+            query_weight: Contiguous ``[q_b_rows + 4096, 1536]`` BF16 stacked
+                [q_b; wq_b] weight, 16-byte aligned.
+            q_b_rows: The q_b rows ahead of the index query rows (2304).
+            key_norm_weight: ``[128]`` FP32 or BF16 index-key LayerNorm weight.
+            key_norm_bias: ``[128]`` index-key LayerNorm bias, same dtype.
+            key_norm_eps: The index-key LayerNorm epsilon.
+            index_k_cache: Contiguous packed uint8 ``fp8_scaled`` plane
+                ``[slots, 132]`` of whole pages, 16-byte aligned.
+            slots: Contiguous int64 or int32 ``[rows]`` non-negative plane slots.
+            page_size: Slots per plane page (64).
+            softmax_scale: Score scale folded into the head weights.
+
+        Returns:
+            ``(q_norm, projected, q_fp8, weights)``: ``[rows, 1536]`` BF16,
+            ``[rows, q_b_rows + 4096]`` BF16 (the q_b rows, then the BF16
+            index query), ``[rows, 32, 128]`` E4M3 index queries and ``[rows,
+            32]`` FP32 head weights carrying each query's scale and
+            ``softmax_scale``, all contiguous.
+        """
+        if not decode_front_rows_supported(q_a, kv_a, index_key, head_weights):
+            raise ValueError(
+                "the fused decode front takes 1-"
+                f"{DECODE_FRONT_MAX_ROWS} BF16 rows q_a [rows, 1536], kv_a [rows, "
+                "512] (16-byte aligned rows), keys [rows, 128] (8-byte aligned) "
+                "and head weights [rows, 32] with unit inner stride, got "
+                f"{[(tuple(t.shape), t.stride(), t.dtype) for t in (q_a, kv_a, index_key, head_weights)]}"
+            )
+        rows, device = q_a.shape[0], q_a.device
+        width = q_b_rows + _FRONT_WQ_B_ROWS
+        norm_dtype = key_norm_weight.dtype
+        if (
+            query_weight.shape != (width, _FRONT_Q_LORA)
+            or query_weight.dtype != torch.bfloat16
+            or not query_weight.is_contiguous()
+            or query_weight.data_ptr() % 16
+        ):
+            raise ValueError(
+                f"query_weight must be a contiguous 16-byte aligned BF16 [{width}, "
+                f"{_FRONT_Q_LORA}] [q_b; wq_b], got {tuple(query_weight.shape)} "
+                f"{query_weight.dtype}"
+            )
+        for name, tensor, size in (
+            ("q_norm_weight", q_norm_weight, _FRONT_Q_LORA),
+            ("kv_norm_weight", kv_norm_weight, _FRONT_LATENT),
+        ):
+            if (
+                tensor.shape != (size,)
+                or tensor.dtype != torch.bfloat16
+                or not tensor.is_contiguous()
+                or tensor.data_ptr() % 16
+            ):
+                raise ValueError(f"{name} must be a contiguous BF16 [{size}]")
+        if (
+            norm_dtype not in (torch.float32, torch.bfloat16)
+            or key_norm_bias.dtype != norm_dtype
+            or key_norm_weight.shape != (128,)
+            or key_norm_bias.shape != (128,)
+            or not (key_norm_weight.is_contiguous() and key_norm_bias.is_contiguous())
+            or key_norm_weight.data_ptr() % 16
+            or key_norm_bias.data_ptr() % 16
+        ):
+            raise ValueError(
+                "the index-key LayerNorm weight and bias must be contiguous [128] "
+                "FP32 or BF16 of one dtype"
+            )
+        if (
+            int(page_size) != _FUSED_PAGE
+            or index_k_cache.dtype != torch.uint8
+            or index_k_cache.dim() != 2
+            or index_k_cache.shape[1] != _FUSED_ROW_BYTES
+            or index_k_cache.shape[0] % _FUSED_PAGE
+            or not index_k_cache.is_contiguous()
+            or index_k_cache.data_ptr() % 16
+        ):
+            raise ValueError(
+                "the fused decode front writes a contiguous, 16-byte aligned packed "
+                "uint8 index-K plane [slots, 132] of whole 64-slot pages"
+            )
+        if (
+            slots.shape != (rows,)
+            or slots.dtype not in (torch.int64, torch.int32)
+            or slots.stride(0) != 1
+        ):
+            raise ValueError(f"slots must be contiguous int64 or int32 [{rows}]")
+        q_norm = torch.empty((rows, _FRONT_Q_LORA), dtype=torch.bfloat16, device=device)
+        projected = torch.empty((rows, width), dtype=torch.bfloat16, device=device)
+        q_fp8 = torch.empty(
+            (rows, _FUSED_HEADS, 128), dtype=torch.float8_e4m3fn, device=device
+        )
+        weights = torch.empty((rows, _FUSED_HEADS), dtype=torch.float32, device=device)
+        front = _decode_front.compile_front(
+            -(-rows // 16),
+            int(q_b_rows),
+            slots.dtype == torch.int64,
+            norm_dtype == torch.float32,
+            pdl_enabled(),
+        )
+        front(
+            q_a,
+            kv_a,
+            index_key,
+            head_weights,
+            q_norm_weight,
+            kv_norm_weight,
+            query_weight,
+            key_norm_weight,
+            key_norm_bias,
+            index_k_cache,
+            slots,
+            q_norm,
+            projected,
+            q_fp8.view(torch.uint8).view(rows, _FRONT_WQ_B_ROWS),
+            weights,
+            _FRONT_Q_LORA,
+            _FRONT_LATENT,
+            float(norm_eps),
+            float(key_norm_eps),
+            _FRONT_FP8_MAX,
+            _FRONT_AMAX_FLOOR,
+            float(softmax_scale),
+        )
+        return q_norm, projected, q_fp8, weights

@@ -1480,7 +1480,7 @@ def test_mi450_installers_receive_shared_stack(tmp_path, task_name, case):
         f"{mi450_env_dump_command()} > setup-env.json\n"
         f"exit {73 if case == 'setup-failure' else 0}\n"
     )
-    (scripts / "install_deps_rocm.sh").write_text(
+    (scripts / "install_kernel_deps_rocm.sh").write_text(
         'test "$WORKSPACE" = "$PWD" || exit 1\n'
         'test "$GFX_ARCH" = gfx1250 || exit 1\n'
         f"{mi450_env_dump_command()} > deps-env.json\n"

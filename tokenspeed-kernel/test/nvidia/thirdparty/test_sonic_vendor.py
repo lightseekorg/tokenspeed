@@ -47,6 +47,7 @@ from tokenspeed_kernel.thirdparty.sonic_sampler.ops import (
 def test_kernels_are_tokenspeed_triton_jit_functions():
     kernels = (
         prologue.bitpacked_reduction_kernel,
+        prologue.whole_reduction_kernel,
         singular.cumulative_selection_kernel,
         multistep.cumulative_unpack_kernel,
         verify.chain_speculative_verification_kernel,

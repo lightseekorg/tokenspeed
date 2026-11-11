@@ -504,6 +504,7 @@ def test_kda_fused_verify_selects_all_layout_traits(
         recurrent_layout=recurrent_layout,
         store_states=store_states,
         replay_records=None,
+        output_norm=None,
     )
     assert result is tensor
     expected = {
@@ -514,6 +515,7 @@ def test_kda_fused_verify_selects_all_layout_traits(
         "num_heads": 1,
         "head_dim": 1,
         "spec_query_len": 1,
+        "batch_size": 1,
         "split_producers": False,
     }
     assert selected == expected
@@ -552,6 +554,7 @@ def test_kda_fused_verify_selects_split_producer_kernel_when_inputs_are_given(
         g_raw=tensor,
         conv_qkv=tensor,
         replay_records=None,
+        output_norm=None,
     )
     assert result is tensor
     assert selected["split_producers"] is True
@@ -1491,6 +1494,7 @@ def test_kda_fused_verify_and_replay_match_sequential_reference(
         "recurrent_layout": "v_major",
         "store_states": False,
         "replay_records": records,
+        "output_norm": None,
     }
     output = try_kda_fused_paged_verify(*verify_args, **verify_kwargs)
     assert output is not None

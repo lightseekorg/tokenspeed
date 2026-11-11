@@ -30,6 +30,7 @@ large-M dense16 projection shapes.
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel_amd._extern import extern_compile_options, wait_vmem
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 
 cdna4 = gl.amd.cdna4
@@ -712,9 +713,7 @@ def gluon_mm_a16w16_prefill_publish_rows_gfx950(
     )
     offset = counters.to(gl.uint64) - heaps[RANK]
     # Every subgroup's write-through stores land before the tile is published.
-    gl.inline_asm_elementwise(
-        "s_waitcnt vmcnt(0)", "=r,~{memory}", [], dtype=gl.int32, is_pure=False, pack=1
-    )
+    wait_vmem()
     gl.barrier()
     for peer in gl.static_range(8):
         if owner == peer:
@@ -1287,6 +1286,7 @@ def launch_gluon_mm_a16w16_prefill_publish_rows_gfx950(
         WARPS_M=LARGEM_WARPS_M,
         WARPS_N=LARGEM_WARPS_N,
         num_warps=LARGEM_NUM_WARPS,
+        **extern_compile_options(),
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
     )
     return C
