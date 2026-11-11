@@ -715,9 +715,10 @@ only. `decode_graph=False` still requires `refresh_decode_metadata` and
 Models whose embedding reads request-token history may implement
 `InputEmbeddingModel` on the inner model. Its
 `compute_input_embeddings(input_ids, ctx, *, request_token_history)` method is
-shared by ordinary forward and graph replay. The graph owner detects the protocol
-once at construction. Argument preparation must preserve supplied `input_embeds`
-so the inner model skips embedding computation when they are present.
+shared by ordinary forward and graph replay. At construction the graph owner
+resolves one embedding callable: this method, or a plain token lookup for models
+that do not require history. Argument preparation must preserve supplied
+`input_embeds` so the inner model skips embedding computation when they are present.
 The executor supplies its live `RequestTokenHistoryView`; the graph
 owner calls this method eagerly, before padding, and copies its result into
 the same static embedding buffer used by ordinary text and multimodal

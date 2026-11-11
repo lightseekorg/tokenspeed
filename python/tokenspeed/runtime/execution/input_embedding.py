@@ -35,10 +35,10 @@ if TYPE_CHECKING:
 
 @runtime_checkable
 class InputEmbeddingModel(Protocol):
-    """An inner model whose input embedding consumes all request-history inputs.
+    """An inner model with a shared input-embedding stage.
 
     Ordinary forward and graph replay share this method. It returns one
-    embedding row per input token and performs any history appends. Graph
+    embedding row per input token and handles all history reads and appends. Graph
     replay calls it eagerly, before padding. With ``input_embeds`` supplied,
     the inner stack and the outer model's ``prepare_model_kwargs`` must
     neither require nor append history.

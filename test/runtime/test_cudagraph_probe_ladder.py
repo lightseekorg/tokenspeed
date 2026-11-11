@@ -128,9 +128,7 @@ def _prefill_graph(buckets, *, decoder_buckets=None, context_len=4096, sizes=Non
     graph.input_buffers = SimpleNamespace(
         input_ids_buf=torch.zeros(max(buckets), dtype=torch.int32)
     )
-    graph._embed_tokens = lambda ids: ids
-    graph._embedding_model = None
-    graph._land_input_embeds = lambda _embeds, _bucket: None
+    graph._input_embeds_buf = torch.empty(max(buckets), 1)
     graph.make_dummy_batch = lambda rows, bs: graph.dummies.append((rows, bs)) or (
         SimpleNamespace(capture_hidden_mode=None, forward_mode=None, rows=rows)
     )

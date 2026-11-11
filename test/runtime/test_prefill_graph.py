@@ -1010,9 +1010,7 @@ class TestDummyGroupTablesTest:
         inner_model = SimpleNamespace(embed_tokens=object())
         model_runner = SimpleNamespace(
             model=SimpleNamespace(model=inner_model),
-            model_config=SimpleNamespace(
-                requires_request_token_history=False, is_multimodal_active=False
-            ),
+            model_config=SimpleNamespace(requires_request_token_history=False),
             is_generation=True,
             is_multimodal=False,
         )
@@ -1095,9 +1093,10 @@ class TestCaptureFailureIsLoudTest:
             max_num_seqs=4,
             data_parallel_size=1,
         )
-        pg._embedding_model = None
-        pg._embed_tokens = SimpleNamespace(
-            weight=self.torch.zeros(2, 8, dtype=self.torch.float32)
+        pg.inner_model = SimpleNamespace(
+            embed_tokens=SimpleNamespace(
+                weight=self.torch.zeros(2, 8, dtype=self.torch.float32)
+            )
         )
 
         def _capture_all_buckets(_decode_wrapper, _entries, _observer):
@@ -1199,9 +1198,7 @@ class TestNarrowingPrefillGraphTest:
             inner.embed_tokens = object()
             model_runner = SimpleNamespace(
                 model=SimpleNamespace(model=inner),
-                model_config=SimpleNamespace(
-                    requires_request_token_history=False, is_multimodal_active=False
-                ),
+                model_config=SimpleNamespace(requires_request_token_history=False),
                 is_generation=True,
                 is_multimodal=False,
             )
@@ -1466,9 +1463,7 @@ class TestPrefillRoleGraphsTest:
         inner = SimpleNamespace(embed_tokens=object())
         model_runner = SimpleNamespace(
             model=SimpleNamespace(model=inner),
-            model_config=SimpleNamespace(
-                requires_request_token_history=False, is_multimodal_active=False
-            ),
+            model_config=SimpleNamespace(requires_request_token_history=False),
             is_generation=True,
             is_multimodal=False,
         )
@@ -1539,9 +1534,7 @@ class TestPrefillRoleGraphsTest:
         inner = SimpleNamespace(embed_tokens=object())
         model_runner = SimpleNamespace(
             model=SimpleNamespace(model=inner),
-            model_config=SimpleNamespace(
-                requires_request_token_history=False, is_multimodal_active=False
-            ),
+            model_config=SimpleNamespace(requires_request_token_history=False),
             is_generation=True,
             is_multimodal=False,
         )

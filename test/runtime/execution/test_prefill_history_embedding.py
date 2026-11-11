@@ -63,22 +63,9 @@ class _TokenModel(torch.nn.Module):
         return input_embeds.square() + positions[:, None], None
 
 
-class _HistoryTokenModel(_TokenModel):
+class _SharedEmbeddingTokenModel(_TokenModel):
     def compute_input_embeddings(self, input_ids, ctx, *, request_token_history):
-        if request_token_history is None:
-            raise ValueError("history is required when computing embeddings")
-        history = request_token_history
-        # A small history-dependent embedding with the runtime's append contract.
-        # This intentionally uses CPU lengths: the seam must stay outside capture.
-        pieces = []
-        for row, slot in enumerate(history.req_pool_indices.tolist()):
-            start, end = history.input_start_offsets[row : row + 2].tolist()
-            committed = int(history.committed_lengths[slot])
-            prior = history.history_token_ids[slot, :committed].sum() % 32
-            ids = input_ids[start:end]
-            pieces.append(self.embed_tokens((ids + prior) % 32))
-            history.history_token_ids[slot, committed : committed + len(ids)].copy_(ids)
-        return torch.cat(pieces)
+        return self.embed_tokens(input_ids) * 2
 
     def forward(
         self,
@@ -94,6 +81,24 @@ class _HistoryTokenModel(_TokenModel):
                 input_ids, ctx, request_token_history=request_token_history
             )
         return super().forward(input_ids, positions, ctx, input_embeds=input_embeds)
+
+
+class _HistoryTokenModel(_SharedEmbeddingTokenModel):
+    def compute_input_embeddings(self, input_ids, ctx, *, request_token_history):
+        if request_token_history is None:
+            raise ValueError("history is required when computing embeddings")
+        history = request_token_history
+        # A small history-dependent embedding with the runtime's append contract.
+        # This intentionally uses CPU lengths: the seam must stay outside capture.
+        pieces = []
+        for row, slot in enumerate(history.req_pool_indices.tolist()):
+            start, end = history.input_start_offsets[row : row + 2].tolist()
+            committed = int(history.committed_lengths[slot])
+            prior = history.history_token_ids[slot, :committed].sum() % 32
+            ids = input_ids[start:end]
+            pieces.append(self.embed_tokens((ids + prior) % 32))
+            history.history_token_ids[slot, committed : committed + len(ids)].copy_(ids)
+        return torch.cat(pieces)
 
 
 class _HiddenRows(torch.nn.Module):
@@ -116,6 +121,11 @@ class _TextModel(BaseCausalLM):
 
     def multimodal_input_embeds(self, input_ids, ctx, multimodal_context):
         return self.model.embed_tokens(input_ids)
+
+
+class _SharedEmbeddingModel(_TextModel):
+    def resolve_model(self, config, mapping, quant_config, prefix):
+        return _SharedEmbeddingTokenModel()
 
 
 class _HistoryModel(_TextModel):
@@ -209,10 +219,13 @@ def _config():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("history_embedding", [False, True])
+@pytest.mark.parametrize(
+    "model_cls,history_embedding",
+    [(_TextModel, False), (_SharedEmbeddingModel, False), (_HistoryModel, True)],
+)
 @torch.inference_mode()
-def test_embeddings_refresh_with_live_history_and_padding(history_embedding):
-    model = _HistoryModel() if history_embedding else _TextModel()
+def test_embeddings_refresh_with_live_history_and_padding(model_cls, history_embedding):
+    model = model_cls()
     ib = InputBuffers(2, 32, 4)
     owner = PrefillGraph(
         _Runner(model, _ModelConfig(history_embedding)),

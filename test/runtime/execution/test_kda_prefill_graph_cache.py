@@ -550,9 +550,7 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name):
     owner._handoff_storage, owner._outputs = {}, None
     owner._captures = {}
     owner.input_buffers = SimpleNamespace(input_ids_buf=torch.ones(bucket))
-    owner._embed_tokens = lambda ids: ids
-    owner._embedding_model = None
-    owner._land_input_embeds = lambda *args: None
+    owner._input_embeds_buf = torch.empty(bucket, 1)
     owner.attn_backend = hybrid
     owner._run_inner = lambda bucket: (forward(compact=False), None)
 
@@ -703,8 +701,9 @@ def test_outer_owner_selects_matching_graph_and_refreshes_before_replay(
     owner._route_counts = {}
     owner._replay_bucket = lambda ctx: 8
     owner._log_engaged_once = lambda *args: None
-    owner._embed_tokens = lambda ids: torch.zeros(8, 4)
-    owner._embedding_model = None
+    owner._compute_input_embeddings = (
+        lambda ids, ctx, *, request_token_history: torch.zeros(8, 4)
+    )
     owner._land_input_embeds = lambda *args: None
     owner._padded_to = lambda *args: nullcontext()
     owner.config = SimpleNamespace(model_is_mrope=False, world_size=1)
@@ -789,8 +788,9 @@ def test_replay_waits_for_the_whole_host_load_before_the_first_segment(consumers
     owner._route_counts = {}
     owner._replay_bucket = lambda ctx: 8
     owner._log_engaged_once = lambda *args: None
-    owner._embed_tokens = lambda ids: torch.zeros(8, 4)
-    owner._embedding_model = None
+    owner._compute_input_embeddings = (
+        lambda ids, ctx, *, request_token_history: torch.zeros(8, 4)
+    )
     owner._land_input_embeds = lambda *args: None
     owner._padded_to = lambda *args: nullcontext()
     owner.config = SimpleNamespace(model_is_mrope=False, world_size=1)
@@ -917,9 +917,7 @@ def test_outer_capture_records_one_variant_per_configured_request_count():
     owner.capture_buckets = [8]
     owner._captures = {}
     owner.input_buffers = SimpleNamespace(input_ids_buf=torch.ones(8))
-    owner._embed_tokens = lambda ids: ids
-    owner._embedding_model = None
-    owner._land_input_embeds = lambda *args: None
+    owner._input_embeds_buf = torch.empty(8, 1)
     active_count = None
 
     def prepare(bucket, bs, mode, *, capture):
@@ -1108,8 +1106,7 @@ def kimi_host_cache():
     owner.token_to_kv_pool = pool
     owner.config = SimpleNamespace(world_size=1, model_is_mrope=False)
     owner._replay_bucket = lambda ctx: _BUCKET
-    owner._embed_tokens = lambda ids: ids
-    owner._embedding_model = None
+    owner._compute_input_embeddings = lambda ids, ctx, *, request_token_history: ids
     owner._land_input_embeds = lambda *args: None
     owner.text_model = SimpleNamespace(
         lm_head=None, logits_processor=lambda ids, hidden, *args: hidden
