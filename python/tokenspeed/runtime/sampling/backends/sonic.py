@@ -1077,6 +1077,13 @@ class SonicSamplingBackend(SamplingBackend):
         Synthetic lengths force chains only, as on the greedy backend.
         """
 
+        if not self.tree:
+
+            raise RuntimeError(
+                "SonicSamplingBackend verifies draft trees only when built with "
+                "SamplingBackendConfig.draft_tree, which allocates their buffers"
+            )
+
         bs, n = candidates.shape
 
         logits = logits_output.next_token_logits

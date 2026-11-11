@@ -35,7 +35,6 @@ import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.sampling import sonic
 from tokenspeed_kernel.ops.sampling.sonic import (
-    MAX_K,
     Indicator,
     SlotState,
     configs,
