@@ -89,7 +89,7 @@ jobs:
       - name: Check release orchestration
         run: |
           python -m pip install "pytest>=9" packaging cryptography pyyaml
-          python -m pytest -q test/ci_system/test_weekly_release.py test/ci_system/test_engine_release.py
+          python -m pytest -q test/ci_system/test_weekly_release.py test/ci_system/test_engine_release.py test/ci_system/test_nightly_release.py
 
       - name: Install scheduler C++ lint tools
         if: steps.scheduler_cpp_changes.outputs.changed == 'true'
