@@ -36,13 +36,14 @@ from ci_system.ci_register import register_cuda_ci
 register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
+from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.layers.moe.topk import StandardTopKOutput, TopKOutputFormat
 from tokenspeed.runtime.layers.moe.utils import All2AllBackend, MoeBackend
 from tokenspeed.runtime.models import kimi_k3
 from tokenspeed.runtime.models.kimi_k3 import KimiLinearMoE
 
 
-@pytest.mark.parametrize("dp,ep,world", [(2, 1, 2), (2, 4, 4), (4, 4, 8)])
+@pytest.mark.parametrize("dp,ep,world", [(4, 2, 4), (2, 4, 4), (4, 4, 8)])
 def test_attn_dp_rejects_partial_world_layout_before_backend_setup(
     monkeypatch, dp: int, ep: int, world: int
 ) -> None:
@@ -51,10 +52,8 @@ def test_attn_dp_rejects_partial_world_layout_before_backend_setup(
     with pytest.raises(ValueError, match="attention DP == MoE EP == world size"):
         KimiLinearMoE(
             config=SimpleNamespace(),
-            mapping=SimpleNamespace(
-                world_size=world,
-                attn=SimpleNamespace(dp_size=dp),
-                moe=SimpleNamespace(ep_size=ep),
+            mapping=Mapping(
+                rank=0, world_size=world, attn_dp_size=dp, moe_tp_size=1, moe_ep_size=ep
             ),
             layer_index=0,
             model_scope="test",
@@ -526,7 +525,9 @@ def test_attn_dp_forward_bypasses_tp_tail() -> None:
     ctx = SimpleNamespace()
     dp_forward = mock.Mock(return_value=hidden)
     layer = SimpleNamespace(
-        mapping=SimpleNamespace(attn=SimpleNamespace(dp_size=2)),
+        mapping=Mapping(
+            rank=0, world_size=2, attn_tp_size=1, moe_tp_size=1, moe_ep_size=2
+        ),
         _forward_attn_dp=dp_forward,
     )
     result = KimiLinearMoE.forward(
@@ -565,7 +566,11 @@ def test_attn_dp_rejects_invalid_token_metadata_before_collectives(
 
 
 def test_attn_dp_forward_requires_context() -> None:
-    layer = SimpleNamespace(mapping=SimpleNamespace(attn=SimpleNamespace(dp_size=2)))
+    layer = SimpleNamespace(
+        mapping=Mapping(
+            rank=0, world_size=2, attn_tp_size=1, moe_tp_size=1, moe_ep_size=2
+        )
+    )
     hidden = torch.ones(1, 4)
     with pytest.raises(ValueError, match="requires a ForwardContext"):
         KimiLinearMoE.forward(
