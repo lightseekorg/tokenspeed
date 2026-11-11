@@ -794,6 +794,13 @@ synchronous transport call before retiring. Client cancellation keeps the
 request's source ownership until that retirement event. The retirement agreement
 is needed only in rounds with a terminal status.
 
+**PD output completion.** A prefill's computed finish is not its client's
+final output: the output waits for the transfer's result. A transfer failure
+must publish an abort even after computation finished, unless the client
+already cancelled its stream or a final output was sent. A pause abort still
+notifies the client; repeated transfer events do not repeat the final output.
+This output fence does not retire source pages.
+
 **PD cancellation.** Client aborts and `pause(abort)` cancel the tracked
 transfer as well as marking the request's output. A decode receiver sends a
 cancellation to every prefill target that could write its landing pages.
