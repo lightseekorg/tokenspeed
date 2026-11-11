@@ -145,7 +145,7 @@ def test_query_quantizer_matches_dsv41_codec():
 
 
 @pytest.mark.parametrize("heads", [32, 64])
-@pytest.mark.parametrize("q_len", [1, 4])
+@pytest.mark.parametrize("q_len", [1, 4, 8])
 def test_decode_scores(captured_logits, heads, q_len):
     torch.manual_seed(0)
     pages = 96

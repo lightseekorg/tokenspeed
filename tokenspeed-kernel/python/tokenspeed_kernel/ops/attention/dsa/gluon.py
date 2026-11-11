@@ -118,7 +118,7 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED + 1,
         traits={
-            "q_len": frozenset({1, 2, 3, 4, 5, 6}),
+            "q_len": frozenset(range(1, 9)),
             "index_heads": frozenset({32, 64}),
             "head_dim": frozenset({128}),
             "page_size": frozenset({64}),
@@ -185,7 +185,7 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED + 2,
         traits={
-            "q_len": frozenset({1, 2, 3, 4, 5, 6}),
+            "q_len": frozenset(range(1, 9)),
             "index_heads": frozenset({32, 64}),
             "head_dim": frozenset({128}),
             "page_size": frozenset({64}),
@@ -221,7 +221,7 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED + 2,
         traits={
-            "q_len": frozenset({1, 2, 3, 4, 5, 6}),
+            "q_len": frozenset(range(1, 9)),
             "index_heads": frozenset({32, 64}),
             "head_dim": frozenset({128}),
             "page_size": frozenset({64}),
@@ -319,7 +319,7 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED + 1,
         traits={
-            "q_len": frozenset({1, 2, 3, 4, 5, 6}),
+            "q_len": frozenset(range(1, 9)),
             "index_heads": frozenset({32, 64}),
             "head_dim": frozenset({128}),
             "page_size": frozenset({64}),
@@ -387,7 +387,7 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            "q_len": frozenset({1, 2, 3, 4, 5, 6}),
+            "q_len": frozenset(range(1, 9)),
             "head_dim": frozenset({128}),
             "page_size": frozenset({64}),
             "topk": frozenset({512, 1024, 2048}),
@@ -451,7 +451,7 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            "q_len": frozenset({1, 2, 3, 4, 5, 6}),
+            "q_len": frozenset(range(1, 9)),
             "qk_nope_head_dim": frozenset({128, 192, 256}),
             "kv_lora_rank": frozenset({128, 512}),
             "qk_rope_head_dim": frozenset({0, 64}),
@@ -487,7 +487,7 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            "q_len": frozenset({1, 2, 3, 4, 5, 6}),
+            "q_len": frozenset(range(1, 9)),
             "qk_nope_head_dim": frozenset({128, 192, 256}),
             "kv_lora_rank": frozenset({512}),
             "qk_rope_head_dim": frozenset({0, 64}),
