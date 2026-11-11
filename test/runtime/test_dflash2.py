@@ -519,7 +519,10 @@ def test_official_nodes_capture_and_replay_in_one_cuda_graph() -> None:
 @_CUDA_ONLY
 def test_the_fused_mla_context_write_reproduces_the_per_layer_chain() -> None:
     """One GEMM + one launch must land what norm -> RoPE -> scatter lands."""
-    from tokenspeed_kernel.ops.kvcache.triton import mla_latent_norm_rope_scatter
+    from tokenspeed_kernel.ops.kvcache.triton import (
+        LatentPlanes,
+        mla_latent_norm_rope_scatter,
+    )
 
     from tokenspeed.runtime.layers.layernorm import RMSNorm
     from tokenspeed.runtime.layers.rotary_embedding import get_rope
@@ -563,7 +566,7 @@ def test_the_fused_mla_context_write_reproduces_the_per_layer_chain() -> None:
         hidden_states,
         torch.cat([w[q_lora:] for w in weights], dim=0).t().contiguous(),
     ).view(tokens, layers, width)
-    actual = [torch.zeros_like(expected) for _ in range(layers)]
+    actual = [torch.zeros_like(expected).unsqueeze(1) for _ in range(layers)]
     mla_latent_norm_rope_scatter(
         stacked,
         torch.stack([norm.weight.data for norm in norms]),
@@ -571,16 +574,18 @@ def test_the_fused_mla_context_write_reproduces_the_per_layer_chain() -> None:
         rotary.cos_sin_cache,
         positions,
         loc,
-        torch.tensor([p.data_ptr() for p in actual], dtype=torch.int64, device=device),
-        actual[0].stride(0),
-        dtype,
+        LatentPlanes.from_buffers(actual),
+        write_mask=None,
         is_neox=rotary.is_neox_style,
         sanitize=False,
     )
 
     for index in range(layers):
         torch.testing.assert_close(
-            actual[index].float(), planes[index].float(), atol=2e-2, rtol=2e-2
+            actual[index].squeeze(1).float(),
+            planes[index].float(),
+            atol=2e-2,
+            rtol=2e-2,
         )
 
 
