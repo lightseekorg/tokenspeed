@@ -156,7 +156,7 @@ def test_an_unaligned_weight_is_rejected():
 
 
 def test_rows_spanning_past_int32_offsets_are_rejected():
-    """The kernel's row offsets are int32; a meta view spans 2**31 elements unallocated."""
+    """Int32 row offsets reject a meta view spanning 2**31 elements."""
     attention, w_vc, gate = _inputs(4, 12, seed=7)
     out = torch.empty_strided(
         (4, 12 * VALUE), (2**29, 1), device="meta", dtype=torch.bfloat16

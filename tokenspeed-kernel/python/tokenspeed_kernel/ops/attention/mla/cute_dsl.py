@@ -95,7 +95,10 @@ def cute_dsl_mla_project_value(
     gate: torch.Tensor | None,
     out: torch.Tensor,
 ) -> torch.Tensor:
-    """``out = bf16(attention @ weight)`` per head, times ``sigmoid(gate)`` when given.
+    """Project each head's values and apply the optional sigmoid gate.
+
+    Computes ``out = bf16(attention @ weight)`` per head, times
+    ``sigmoid(gate)`` when a gate is given.
 
     Args:
         attention: ``[batch, heads, 512]`` BF16 absorbed values with unit inner
