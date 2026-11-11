@@ -125,11 +125,25 @@ checkout. The committed base version and Rust crate versions stay unchanged.
 
 Wheels are attached to
 [`lightseekorg/whl` releases](https://github.com/lightseekorg/whl/releases)
-under `tokenspeed-engine-v<VERSION>`. `post` and `rc` releases are marked
-as GitHub prereleases. Download the matching wheel and install it with
-`pip install ./<wheel>.whl`. An rc sorts below the same base version's final
-release under Python version ordering; use an exact wheel/version when
-testing it. Merge a base version bump before the next stable release.
+under `tokenspeed-engine-v<VERSION>`. Only `rc` is marked as a GitHub
+prerelease; `post` uses a normal GitHub release. The workflow also creates or
+updates the pip indexes
+in the wheel repository's `gh-pages` branch, retaining historical links and
+adding SHA256 hashes. No manual directory preparation is needed. GitHub
+Pages serves an index update after its deployment finishes.
+
+```bash
+# Stable wheels mirrored from a release.
+pip install --index-url https://lightseek.org/whl/ tokenspeed-engine
+# Post releases and explicitly selected release candidates.
+pip install --index-url https://lightseek.org/whl/nightly/ tokenspeed-engine
+pip install --pre --index-url https://lightseek.org/whl/nightly/ 'tokenspeed-engine==0.1.0rc20261112'
+```
+
+The existing `https://lightseek.org/whl/nightly/rocm7.2/` index receives the
+same engine post/rc wheels. An rc sorts below the same base version's final
+and post releases, so pin the exact version when testing it. Merge a base
+version bump before the next stable release.
 
 Use **Re-run failed jobs** to upload missing files from the same source
 commit. **Re-run all jobs** resolves the version again and may allocate a
@@ -153,7 +167,7 @@ Configure the `tokenspeed-engine` project's PyPI Trusted Publisher with
 owner `lightseekorg`, repository `tokenspeed`, workflow filename
 `release-tokenspeed-engine.yml`, and GitHub environment `pypi`. Publication
 uses GitHub OIDC and does not require a stored PyPI token.
-The workflow also needs `LIGHTSEEK_BOT_TOKEN` with release write access to
+The workflow also needs `LIGHTSEEK_BOT_TOKEN` with release and contents write access to
 `lightseekorg/whl`, authenticated as `lightseek-bot`.
 
 ## Releasing Rust crates

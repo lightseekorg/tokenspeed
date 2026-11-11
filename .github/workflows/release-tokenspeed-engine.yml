@@ -166,6 +166,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      - name: Checkout release scripts
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Download tested wheels
         uses: actions/download-artifact@v4
         with:
@@ -204,13 +214,71 @@ jobs:
             done
           else
             flags=()
-            if [ "$RELEASE_TYPE" != release ]; then
+            if [ "$RELEASE_TYPE" = rc ]; then
               flags+=(--prerelease --latest=false)
             fi
             gh release create "$TAG_NAME" dist/*.whl --repo lightseekorg/whl \
               --title "$title" --notes-file release-notes.txt "${flags[@]}"
           fi
           gh release view "$TAG_NAME" --repo lightseekorg/whl --json url,body,assets
+          gh api "repos/lightseekorg/whl/releases/tags/$TAG_NAME" > engine-release.json
+
+      - name: Checkout wheel index
+        uses: actions/checkout@v4
+        with:
+          repository: lightseekorg/whl
+          ref: gh-pages
+          path: wheelhouse
+          token: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+
+      - name: Publish pip indexes
+        env:
+          GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+          RELEASE_TYPE: ${{ inputs.release_type }}
+          VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          variant=engine-nightly
+          if [ "$RELEASE_TYPE" = release ]; then
+            variant=engine-release
+          fi
+          python .github/scripts/update-nightly-index.py \
+            --package tokenspeed-engine --variant "$variant" \
+            wheelhouse engine-release.json dist > engine-index-paths.txt
+          mapfile -t index_paths < engine-index-paths.txt
+          cd wheelhouse
+          gh auth status
+          test "$(gh api user --jq .login)" = lightseek-bot
+          case "$(git remote get-url --push origin)" in
+            https://github.com/lightseekorg/whl|https://github.com/lightseekorg/whl.git) ;;
+            *) echo "Unexpected wheel index push destination." >&2; exit 1 ;;
+          esac
+          for repo in lightseekorg/tokenspeed lightseekorg/whl; do
+            test "$(gh repo view "$repo" --json visibility --jq .visibility)" = PUBLIC
+          done
+          git config user.name lightseek-bot
+          git config user.email 243258330+lightseek-bot@users.noreply.github.com
+          git add -- "${index_paths[@]}"
+          git diff --cached --check
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git diff --cached
+          if [ -f .pre-commit-config.yaml ]; then
+            pre-commit run --all-files
+          fi
+          git commit -s -m "Publish tokenspeed-engine $VERSION wheel indexes"
+          for attempt in 1 2 3; do
+            if git push origin HEAD:gh-pages; then
+              for path in "${index_paths[@]}"; do
+                gh api "repos/lightseekorg/whl/contents/$path?ref=gh-pages" --jq .content | base64 --decode
+              done
+              exit 0
+            fi
+            git fetch origin gh-pages:refs/remotes/origin/gh-pages
+            git rebase origin/gh-pages
+          done
+          echo "Could not publish the engine pip indexes after three attempts." >&2
+          exit 1
 
   publish:
     needs: publish-whl
