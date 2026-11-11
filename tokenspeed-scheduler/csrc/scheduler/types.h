@@ -84,11 +84,13 @@ struct SchedulerConfig {
     }
 
     // Whether a request's completed pages are published into the Device index
-    // as it computes and when it finishes: for later admissions to match, or
-    // for a non-D role's Host tier, which both write policies feed from
-    // published Device entries. Without either nothing can reuse them, and a
-    // published page would only hold its block until an allocation evicted
-    // it. A retraction publishes its victim regardless; with a Host cache the
+    // as it computes and when it finishes, for later admissions to match.
+    // Without prefix caching no admission matches either tier or prefetches
+    // from L3, so a published page would only hold its block until an
+    // allocation evicted it. A non-D role with a Host cache still publishes,
+    // and streams to that tier, although nothing on the node reads it without
+    // prefix caching: a conservative exception that could be tightened. A
+    // retraction publishes its victim regardless; with a Host cache the
     // image's L2 leg is built from that publication.
     bool PublishesCompletedPages() const { return !disable_prefix_cache || (HasHostCache() && role != Role::kD); }
 

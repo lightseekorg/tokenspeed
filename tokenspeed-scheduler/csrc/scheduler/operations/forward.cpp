@@ -1047,7 +1047,6 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
         return fsm::ScheduleDecodeEvent{config_.decode_input_tokens};
     }
 
-    ++decode_admissions_;
     StagedCacheProgress staged{cache_progress};
     const RequestProgress progress =
         AdvanceRequestProgress(*request, cache_progress, num_computed_tokens, coordinator_.PrefixGranularity(),
@@ -1066,6 +1065,7 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
         return std::nullopt;
     }
     staged.Commit();
+    ++decode_admissions_;
     if (prompt_end) {
         cache_progress.prompt_end_rotated = true;
     }

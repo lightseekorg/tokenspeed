@@ -35,16 +35,17 @@ and reclaims inside the same `Admit` (`AdvanceRequestProgress` in
 and builds it; see [cache-concepts](cache-concepts.md#the-coordinator-layer-csrccachecoordinator)
 for why publication rides with admission).
 
-Pages are published only when something can reuse them
-(`SchedulerConfig::PublishesCompletedPages`): prefix caching, or a non-D
-role's Host tier, which both write policies feed from published Device
-entries. Otherwise — prefix caching disabled on a D node, or with no Host
-cache — chunk ends, decode steps and the finish hash and publish nothing, and
-a finished request's pages return straight to the pool. Published, they could
-only stay resident until an allocation evicted them, and on a D node, which
-allocates every request's whole prompt, every allocation would first walk
-the eviction order. A retraction publishes its victim either way; with a Host
-cache, the image's L2 leg is built from that publication.
+Pages are published only for later admissions to match
+(`SchedulerConfig::PublishesCompletedPages`). With prefix caching disabled no
+admission matches either tier or prefetches from L3, so chunk ends, decode
+steps and the finish hash and publish nothing, and a finished request's pages
+return straight to the pool. Published, they could only stay resident until
+an allocation evicted them, and on a D node, which allocates every request's
+whole prompt, every allocation would first walk the eviction order. A non-D
+role with a Host cache is a conservative exception: it still publishes and
+streams to that tier, although nothing on the node reads it without prefix
+caching. A retraction publishes its victim either way; with a Host cache, the
+image's L2 leg is built from that publication.
 
 Decode-role remote admission covers the complete unmatched prompt in one
 landing window. Local prefill chunk limits and junction cuts do not shorten
