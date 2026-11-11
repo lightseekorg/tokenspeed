@@ -1100,3 +1100,15 @@ count. An unchanged idle load is sent at most once per second as a heartbeat,
 so the frontend can distinguish an idle engine from a stale connection. The
 active page count in it is reused for up to 100 ms (see the page gauges),
 far inside the three seconds the frontend considers a report fresh.
+
+## Independent execution with shared weights
+
+The device build exports `requires_forward_coordination` as an immutable
+capability derived from execution groups. The host hands the control plane a
+DP coordination group only when forwards span workers, or when a shared L3
+namespace needs agreed flushes. Without one, fully local workers omit the
+per-round DP metadata exchange, peer-induced idle forwards and the DP
+rendezvous for cache flushes while retaining their DP routing identities.
+Sharing immutable expert weights alone does not require forward coordination.
+Weight-copy streams and readiness/release events remain behind the model on
+the data plane; see [distributed immutable weights](distributed-weights.md).

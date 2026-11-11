@@ -1029,3 +1029,42 @@ Before benchmarking:
 - confirm GPU visibility and process placement
 - compare output correctness before tuning throughput
 - keep the full launch command with benchmark results
+
+### Distributed expert-weight storage
+
+`--moe-weight-sharing-size N` enables DWDP: each prefill worker stores one of
+`N` immutable expert shards and fetches remote weights while executing its own
+batch. Execution remains TP1/EP1; attention DP still identifies the serving
+workers. Omitting the option keeps resident expert weights.
+
+The initial K3 NVFP4 configuration requires `--attn-tp-size 1 --moe-tp-size 1
+--ep-size 1 --all2all-backend none`, `--disaggregation-mode prefill`,
+`--enforce-eager --prefill-graph-max-tokens 0`, and a fixed prefill token budget.
+The weight-sharing size must divide the instance size. Shared-expert and
+attention-projection TP overrides must also remain local. The additional
+staging memory is allocated before KV cache sizing. Live checkpoint replacement
+requires restarting these workers.
+
+See [distributed immutable weights](../design/distributed-weights.md) for
+storage ownership and stream-ordering invariants.
+
+Every forward streams the expert shards the worker does not own, so a DWDP
+prefill forward takes seconds whether it carries one token or the whole
+budget; the per-forward cost is paid in full by forwards well below the
+budget. Choose the chunk size and admission so forwards stay near the budget.
+Every timeout between the frontend and the decode side must then cover at
+least one full forward plus queueing: the gateway's per-worker silence bound
+(SMG `--worker-wedge-secs`, 3 s by default, after which every request on the
+worker returns 504), and in prefill/decode disaggregation
+`TOKENSPEED_DISAGGREGATION_BOOTSTRAP_TIMEOUT` (120 s) and
+`TOKENSPEED_DISAGGREGATION_WAITING_TIMEOUT` (300 s), which otherwise drop
+requests queued behind a saturated decode instance as `KV transfer failed`;
+the client's stream then ends with no content and no error. A larger token
+budget also grows the MoE activation workspace, which must fit beside the
+staging pools; if startup runs out of memory there, lower
+`--gpu-memory-utilization` rather than the budget.
+
+DWDP supports local Device and Host L2 caches and auto/safetensors checkpoint
+loading. Memory-saver sleep/wake is unsupported. Shared L3 cache control and
+online expert rebalancing are currently unsupported: L3 flushes coordinate
+across DP ranks, and rebalancing changes immutable expert ownership.
