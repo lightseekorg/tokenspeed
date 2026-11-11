@@ -83,6 +83,15 @@ struct SchedulerConfig {
         return HasHostCache() && role != Role::kD && host_write_policy == HostWritePolicy::kWriteThrough;
     }
 
+    // Whether a request's completed pages are published into the Device index
+    // as it computes and when it finishes, for later admissions to match.
+    // Without prefix caching no admission matches either tier or prefetches
+    // from L3, so a published page would only hold its block until an
+    // allocation evicted it, and a Host copy of it would never be read. A
+    // retraction publishes its victim regardless; with a Host cache the
+    // image's L2 leg is built from that publication.
+    bool PublishesCompletedPages() const { return !disable_prefix_cache; }
+
     std::int32_t max_scheduled_tokens{};
     // Sum of ceil((cached prefix + this chunk) / prefix_granularity) across
     // all local prefill requests in one batch. Zero leaves this unbounded.
