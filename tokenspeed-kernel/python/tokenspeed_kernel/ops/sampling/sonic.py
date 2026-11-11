@@ -167,7 +167,18 @@ def scratchpad_columns(vocab_size: int) -> int:
 
 
 def pairs_width(draft_probs: bool) -> int:
-    """Columns of a row's shard candidate pairs: values, token ids, the draft probabilities with ``draft_probs``, then the shard's maximum and exp-sum."""
+    """The fp32 columns of one row's shard candidate pairs.
+
+    Args:
+        draft_probs: Whether the pairs also carry the draft probability the
+            row recorded at each candidate (``shard_candidates`` given
+            ``draft_probs``).
+
+    Returns:
+        ``MAX_K`` values, ``MAX_K`` token ids, with ``draft_probs`` ``MAX_K``
+        draft probabilities, then the shard's maximum and exp-sum:
+        ``3 * MAX_K + 2`` columns with ``draft_probs``, else ``2 * MAX_K + 2``.
+    """
     return (3 if draft_probs else 2) * MAX_K + 2
 
 

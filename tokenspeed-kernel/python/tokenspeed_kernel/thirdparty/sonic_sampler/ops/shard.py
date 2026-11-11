@@ -405,7 +405,7 @@ def merged_candidates(
 ):
     """
     A row's best ``max_k`` candidates over the whole vocabulary, merged from
-    every rank's gathered pairs (``[ranks, rows, 2 • max_k]`` at ``cand_ptr``):
+    every rank's gathered pairs (``[ranks, rows, >= 2 • max_k]`` at ``cand_ptr``):
     the values in descending order, the lowest rank-major slot (so the lowest
     token id) first among equal values (bf16 unless ``exact``, as the unpack
     keeps them), and their token ids.
