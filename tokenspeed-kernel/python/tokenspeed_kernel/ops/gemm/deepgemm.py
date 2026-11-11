@@ -20,8 +20,12 @@
 
 from __future__ import annotations
 
+from functools import cache
+
 import torch
 from tokenspeed_kernel._optional import has_optional_package
+from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.tuning import is_warming_up
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -43,6 +47,200 @@ from tokenspeed_kernel.thirdparty.deepgemm import (
     grouped_fp8_weight_scales,
     prepare_block_fp8_weight,
 )
+
+try:
+    from flashinfer import autotuner
+except ImportError:
+    autotuner = None
+
+
+_SPLIT_K_MAX_ROWS = 32
+_TUNING_OP = "tokenspeed_deepgemm_fp8_split_k"
+_ShapeKey = tuple[torch.device, int, int, bool, int, int]
+# Only dispatch tactics that were warmed in this process.
+_prepared_tactics: dict[_ShapeKey, tuple[int, ...]] = {}
+
+
+@cache
+def _valid_tactics(k: int) -> tuple[int, ...]:
+    return (1,) + tuple(splits for splits in (2, 3, 4, 6) if k % (splits * 512) == 0)
+
+
+@triton.jit(do_not_specialize=["elements"])
+def _reduce_split_k_kernel(
+    partial,
+    out,
+    elements,
+    N: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+    offset = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    row, col = offset // N, offset % N
+    first = partial + row * (NUM_SPLITS * N) + col
+    value = tl.load(first, offset < elements, other=0)
+    for split in tl.static_range(1, NUM_SPLITS):
+        value += tl.load(first + split * N, offset < elements, other=0)
+    tl.store(out + offset, value, offset < elements)
+
+
+def block_fp8_mm_split_k(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    num_splits: int,
+    enable_pdl: bool,
+) -> torch.Tensor:
+    """Use views of packed operands, then reduce FP32 partials to BF16 out."""
+    import deep_gemm
+
+    m, k = a.shape
+    n = b.shape[0]
+    split_k = k // num_splits
+    scale_words = split_k // 512
+    # Preserve the MN-major strides, including the singleton M=1 case.
+    sa = a_scale.as_strided(
+        (m, num_splits, scale_words),
+        (1, scale_words * a_scale.stride(1), a_scale.stride(1)),
+    )
+    sb = b_scale.as_strided(
+        (num_splits, n, scale_words),
+        (scale_words * b_scale.stride(1), 1, b_scale.stride(1)),
+    )
+    partial = torch.empty((m, num_splits, n), dtype=torch.float32, device=a.device)
+    deep_gemm.set_pdl(enable_pdl)
+    deep_gemm.fp8_einsum(
+        "bhr,hdr->bhd",
+        (a.view(m, num_splits, split_k), sa),
+        (b.view(n, num_splits, split_k).transpose(0, 1), sb),
+        partial,
+        recipe=(1, 1, 128),
+    )
+    _reduce_split_k_kernel[(triton.cdiv(m * n, 256),)](
+        partial,
+        out,
+        m * n,
+        N=n,
+        NUM_SPLITS=num_splits,
+        ENABLE_PDL=enable_pdl,
+        BLOCK=256,
+        num_warps=4,
+        **({"launch_pdl": True} if enable_pdl else {}),
+    )
+    return out
+
+
+if autotuner is not None:
+    # Tune exact input shapes so packed scale strides never have to be resized
+    # by a dynamic-M profile.
+    _TUNING = autotuner.TuningConfig(
+        use_cold_l2_cache=True, use_cuda_graph=True, cuda_graph_profile_replays=1
+    )
+
+    class _SplitKRunner(autotuner.TunableRunner):
+        def __init__(self, *, enable_pdl: bool, extras: tuple):
+            self.enable_pdl = enable_pdl
+            self.extras = extras
+
+        def get_valid_tactics(self, inputs, profile):
+            return list(_valid_tactics(inputs[0].shape[1]))
+
+        def get_cache_key_extras(self, inputs):
+            return self.extras
+
+        def forward(self, inputs, tactic=-1, do_preparation=False):
+            if tactic in (-1, 1):
+                return block_fp8_mm(*inputs, enable_pdl=self.enable_pdl)
+            return block_fp8_mm_split_k(
+                *inputs, num_splits=tactic, enable_pdl=self.enable_pdl
+            )
+
+
+def _warm_tactics(b: torch.Tensor, b_scale: torch.Tensor, key: _ShapeKey) -> None:
+    device, n, k, enable_pdl, num_sms, tc_util = key
+    runner = _SplitKRunner(
+        enable_pdl=enable_pdl,
+        extras=(
+            "packed_group128_fp32_reduce_v1",
+            torch.cuda.get_device_name(device),
+            torch.cuda.get_device_capability(device),
+            enable_pdl,
+            num_sms,
+            tc_util,
+        ),
+    )
+    tuner = autotuner.AutoTuner.get()
+    a = b.new_zeros((_SPLIT_K_MAX_ROWS, k))
+    out = torch.empty((_SPLIT_K_MAX_ROWS, n), dtype=torch.bfloat16, device=device)
+    words = k // 512
+    storage = b_scale.new_full((words * _SPLIT_K_MAX_ROWS,), 0x7F7F7F7F)
+    candidates = _valid_tactics(k)
+    tactics = []
+    for rows in range(1, _SPLIT_K_MAX_ROWS + 1):
+        padded = (rows + 3) // 4 * 4
+        scales = storage[: words * padded].view(words, padded).t()[:rows]
+        inputs = [a[:rows], b, scales, b_scale, out[:rows]]
+        _, tactic = tuner.choose_one(_TUNING_OP, [runner], _TUNING, inputs)
+        tactic = tactic if tactic in candidates else 1
+        runner(inputs, tactic=tactic)
+        tactics.append(tactic)
+    _prepared_tactics[key] = tuple(tactics)
+
+
+def block_fp8_mm_tuned(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    enable_pdl: bool,
+) -> torch.Tensor:
+    """Profile at startup and run the prepared tactic for the exact row count."""
+    m, k = a.shape
+    warming_up = is_warming_up()
+    if (
+        autotuner is not None
+        and (warming_up or m <= _SPLIT_K_MAX_ROWS)
+        and len(_valid_tactics(k)) > 1
+    ):
+        import deep_gemm
+
+        key = (
+            a.device,
+            b.shape[0],
+            k,
+            enable_pdl,
+            deep_gemm.get_num_sms(),
+            deep_gemm.get_tc_util(),
+        )
+        if (
+            warming_up
+            and key not in _prepared_tactics
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            _warm_tactics(b, b_scale, key)
+        tactics = _prepared_tactics.get(key)
+        if tactics is not None and m <= _SPLIT_K_MAX_ROWS:
+            num_splits = tactics[m - 1]
+            if num_splits > 1:
+                return block_fp8_mm_split_k(
+                    a,
+                    b,
+                    a_scale,
+                    b_scale,
+                    out,
+                    num_splits=num_splits,
+                    enable_pdl=enable_pdl,
+                )
+    return block_fp8_mm(a, b, a_scale, b_scale, out, enable_pdl=enable_pdl)
 
 
 def prepare_deepgemm_fp8_weight(
@@ -188,7 +386,10 @@ def deepgemm_mm_fp8_blockscale(
         )
     if not m:
         return out
-    return block_fp8_mm(A, B, A_scales, B_scales, out, enable_pdl=pdl_enabled())
+    enable_pdl = pdl_enabled()
+    if packed and n <= 4096 and k >= 4096:
+        return block_fp8_mm_tuned(A, B, A_scales, B_scales, out, enable_pdl=enable_pdl)
+    return block_fp8_mm(A, B, A_scales, B_scales, out, enable_pdl=enable_pdl)
 
 
 if has_optional_package("deep_gemm"):

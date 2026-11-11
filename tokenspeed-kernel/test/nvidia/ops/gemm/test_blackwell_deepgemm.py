@@ -60,6 +60,7 @@ def reference_quant(x):
         (1, 192, 640),
         (4, 256, 2560),
         (32, 256, 1536),
+        (1, 2560, 6144),
         (128, 256, 2560),
         (16384, 256, 1536),
     ],
@@ -115,3 +116,61 @@ def test_registered_deepgemm_values_out_graph(m, n, k, pdl):
     finally:
         pdl_enabled(previous)
         torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+
+
+@pytest.mark.parametrize("num_splits", [2, 3, 4, 6])
+@pytest.mark.parametrize("pdl", [False, True])
+def test_split_k_graph_and_variable_rows(num_splits, pdl):
+    pytest.importorskip("deep_gemm")
+    from tokenspeed_kernel.ops.gemm.deepgemm import (
+        _reduce_split_k_kernel,
+        block_fp8_mm_split_k,
+    )
+    from tokenspeed_kernel.thirdparty.deepgemm import block_fp8_mm
+    from utils import assert_no_triton_compile
+
+    torch.manual_seed(43)
+    k, n = 6144, 512
+    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * 0.03
+    b, b_scale = quantize_fp8(w, granularity="block", block_size=[128, 128])
+    b, b_scale = prepare_deepgemm_fp8_weight(b, b_scale)
+    x = torch.randn(32, k, device="cuda", dtype=torch.bfloat16) * 0.1
+
+    def operands(rows):
+        return quantize_fp8(
+            x[:rows],
+            granularity="token_group",
+            group_size=128,
+            scale_encoding="packed_ue8m0",
+            enable_pdl=pdl,
+        )
+
+    def run(rows):
+        a, a_scale = operands(rows)
+        out = x.new_empty((rows, n))
+        return block_fp8_mm_split_k(
+            a, b, a_scale, b_scale, out, num_splits=num_splits, enable_pdl=pdl
+        )
+
+    def check(rows, actual):
+        a, a_scale = operands(rows)
+        expected = block_fp8_mm(
+            a, b, a_scale, b_scale, x.new_empty((rows, n)), enable_pdl=pdl
+        )
+        torch.testing.assert_close(actual, expected, rtol=0.008, atol=0.002)
+
+    old_pdl = pdl_enabled()
+    pdl_enabled(pdl)
+    try:
+        run(4)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual = run(4)
+        x.normal_().mul_(0.2)
+        graph.replay()
+        check(4, actual)
+        with assert_no_triton_compile(_reduce_split_k_kernel):
+            for rows in (1, 7, 17, 32):
+                check(rows, run(rows))
+    finally:
+        pdl_enabled(old_pdl)
