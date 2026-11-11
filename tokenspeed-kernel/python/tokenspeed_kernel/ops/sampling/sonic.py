@@ -297,7 +297,7 @@ def _reduce(
     ancestors: Tensor | None = None,
     steps: Tensor | None = None,
 ) -> None:
-    """The first stage: each block's keys (greedy maximum, or best perturbed value of a whole-vocabulary row) in ``scratchpad``; ``drafted`` is None for one row per request, whose penalties then count its ``ancestors`` row and whose noise ``steps`` keys (``tree_targets``)."""
+    """The first stage: each block's keys (greedy maximum, or best perturbed value of a whole-vocabulary row) in ``scratchpad``; ``drafted`` is None for one row per request. ``tree_targets`` also passes ``ancestors``, the tokens each row's penalties count, and ``steps``, which key each row's noise."""
     exact = _exact(logits)
     rows, vocab_size = logits.shape
     blocks = triton.cdiv(vocab_size, config.block_n)
