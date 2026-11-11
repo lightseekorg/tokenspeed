@@ -714,10 +714,11 @@ only. `decode_graph=False` still requires `refresh_decode_metadata` and
 
 Models whose embedding reads request-token history may implement
 `PrefillEmbeddingModel` on the text model. Its
-`prefill_input_embeds(input_ids, ctx, *, request_token_history)` method is
-shared by `BaseCausalLM.prepare_model_kwargs` for eager prefill and the graph
-owner for replay. Models overriding argument preparation must preserve supplied
-`input_embeds` and reuse the same embedding method when computing them eagerly.
+`prefill_input_embeds(input_ids, ctx, *, request_token_history)` method delegates
+to the embedding implementation used by its ordinary forward. The model owns
+embedding computation; the graph owner only detects the protocol at construction
+and calls it for replay. Argument preparation must preserve supplied
+`input_embeds` so the inner model skips embedding computation when they are present.
 The executor supplies its live `RequestTokenHistoryView`; the graph
 owner calls this method eagerly, before padding, and copies its result into
 the same static embedding buffer used by ordinary text and multimodal
@@ -725,9 +726,10 @@ prefills. The method must return all input rows, and every history-dependent
 operation must finish there. The captured inner stack consumes the supplied
 `input_embeds` without requiring or appending history, including during
 `prepare_model_kwargs`. Decode keeps its existing embedding path. Capture uses
-zero dummy embeddings and does not access live history. Models requiring history without this seam
-remain eager. Multimodal forwards of history-embedding models also remain
-eager because the multimodal embedding seam does not receive history.
+zero dummy embeddings and does not access live history. Models requiring history
+without this protocol remain eager. Multimodal forwards of history-embedding
+models also remain eager because the multimodal embedding seam does not receive
+history.
 Request history retains its existing runtime owner and lifetime.
 
 Prefill graph warmup runs on the same side stream as capture. Some kernels

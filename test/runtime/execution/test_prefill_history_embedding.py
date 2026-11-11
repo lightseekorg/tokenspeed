@@ -57,10 +57,41 @@ class _TokenModel(torch.nn.Module):
         super().__init__()
         self.embed_tokens = torch.nn.Embedding(32, 8, device="cuda")
 
-    def forward(self, input_ids, positions, ctx, *, input_embeds=None):
+    def compute_input_embeddings(self, input_ids, ctx, request_token_history):
+        return self.embed_tokens(input_ids)
+
+    def forward(
+        self,
+        input_ids,
+        positions,
+        ctx,
+        *,
+        input_embeds=None,
+        request_token_history=None,
+    ):
         if input_embeds is None:
-            input_embeds = self.embed_tokens(input_ids)
+            input_embeds = self.compute_input_embeddings(
+                input_ids, ctx, request_token_history
+            )
         return input_embeds.square() + positions[:, None], None
+
+
+class _HistoryTokenModel(_TokenModel):
+    def compute_input_embeddings(self, input_ids, ctx, request_token_history):
+        if request_token_history is None:
+            raise ValueError("history is required when computing embeddings")
+        history = request_token_history
+        # A small history-dependent embedding with the runtime's append contract.
+        # This intentionally uses CPU lengths: the seam must stay outside capture.
+        pieces = []
+        for row, slot in enumerate(history.req_pool_indices.tolist()):
+            start, end = history.input_start_offsets[row : row + 2].tolist()
+            committed = int(history.committed_lengths[slot])
+            prior = history.history_token_ids[slot, :committed].sum() % 32
+            ids = input_ids[start:end]
+            pieces.append(self.embed_tokens((ids + prior) % 32))
+            history.history_token_ids[slot, committed : committed + len(ids)].copy_(ids)
+        return torch.cat(pieces)
 
 
 class _HiddenRows(torch.nn.Module):
@@ -86,21 +117,19 @@ class _TextModel(BaseCausalLM):
 
 
 class _HistoryModel(_TextModel):
+    def resolve_model(self, config, mapping, quant_config, prefix):
+        return _HistoryTokenModel()
+
+    def prepare_model_kwargs(self, ctx, input_ids, kwargs):
+        model_kwargs = super().prepare_model_kwargs(ctx, input_ids, kwargs)
+        model_kwargs["request_token_history"] = kwargs.get("request_token_history")
+        return model_kwargs
+
     def prefill_input_embeds(self, input_ids, ctx, *, request_token_history):
-        if request_token_history is None:
-            raise ValueError("history is required when computing embeddings")
-        history = request_token_history
-        # A small history-dependent embedding with the runtime's append contract.
-        # This intentionally uses CPU lengths: the seam must stay outside capture.
-        pieces = []
-        for row, slot in enumerate(history.req_pool_indices.tolist()):
-            start, end = history.input_start_offsets[row : row + 2].tolist()
-            committed = int(history.committed_lengths[slot])
-            prior = history.history_token_ids[slot, :committed].sum() % 32
-            ids = input_ids[start:end]
-            pieces.append(self.model.embed_tokens((ids + prior) % 32))
-            history.history_token_ids[slot, committed : committed + len(ids)].copy_(ids)
-        return torch.cat(pieces)
+        assert ctx.forward_mode.is_extend_or_mixed()
+        return self.model.compute_input_embeddings(
+            input_ids, ctx, request_token_history
+        )
 
 
 class _NoAttention(AttentionBackend):
@@ -299,7 +328,7 @@ def test_supplied_embeddings_bypass_history_in_eager_forward():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @torch.inference_mode()
-def test_prefill_embedding_hook_does_not_replace_decode_embedding():
+def test_decode_uses_model_owned_history_embedding():
     model = _HistoryModel()
     owner = PrefillGraph(
         _Runner(model, _ModelConfig(True)),
@@ -310,8 +339,23 @@ def test_prefill_embedding_hook_does_not_replace_decode_embedding():
     )
     ctx = owner.make_dummy_batch(1, 1)
     ctx.forward_mode = ForwardMode.DECODE
+    ctx.num_extends = 0
+    ib = owner.input_buffers
     ids = torch.ones(1, dtype=torch.int32, device="cuda")
-    positions = owner.input_buffers.positions_buf[:1]
-    actual = model(ctx, ids, positions)
-    expected = model.model.embed_tokens(ids).square() + positions[:, None]
-    torch.testing.assert_close(actual, expected)
+    positions = ib.positions_buf[:1]
+    history_ids = torch.full((4, 64), 7, dtype=torch.int32, device="cuda")
+    committed = torch.full((4,), 2, dtype=torch.int32, device="cuda")
+    history = RequestTokenHistoryView(
+        history_ids,
+        committed,
+        ib.req_pool_indices_buf[:1],
+        ib.input_start_offsets_buf[:2],
+        ib.active_request_mask_buf[:1],
+    )
+    expected_history = history_ids.clone()
+    expected_history[0, 2] = 1
+    actual = model(ctx, ids, positions, request_token_history=history)
+    # The two committed tokens each contribute 7 to the embedding index.
+    expected = model.model.embed_tokens(ids + 14).square() + positions[:, None]
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(history_ids, expected_history, rtol=0, atol=0)
