@@ -530,7 +530,12 @@ elif platform.is_nvidia and platform.is_hopper:
         profile=OpProfile(
             cost_rule="attention_varlen.v1",
             scalar_args=("causal", "window_size", "attention_chunk"),
-            integer_tensor_args=("cu_seqlens_q", "cu_seqlens_k"),
+            integer_tensor_args=(
+                "cu_seqlens_q",
+                "cu_seqlens_k",
+                "seqused_q",
+                "seqused_k",
+            ),
         ),
     )
 

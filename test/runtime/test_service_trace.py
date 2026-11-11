@@ -539,6 +539,32 @@ def test_metadata_gate_requires_every_forward_and_native_gate_requires_scope_evi
     verified = _baseline.verify_native_coverage(tmp_path, 1, metadata, metadata_path)
     assert verified["status"] == "verified"
     assert verified["verified_scope"] == "model_layer_op"
+    assert verified["native_evidence"]["whole_run_status"] == "not_verified"
+    assert verified["native_evidence"]["whole_run_critical_unknowns"] == []
+
+    native.update(
+        whole_run_status="partial",
+        whole_run_critical_unknowns=["eager_scope_native_activity_unavailable"],
+    )
+    native_path.write_text(json.dumps(native))
+    decode_only = _baseline.verify_native_coverage(tmp_path, 1, metadata, metadata_path)
+    assert decode_only["status"] == "verified"
+    assert decode_only["native_evidence"]["status"] == "verified"
+    assert decode_only["native_evidence"]["whole_run_status"] == "partial"
+    assert decode_only["native_evidence"]["whole_run_critical_unknowns"] == [
+        "eager_scope_native_activity_unavailable"
+    ]
+
+    native.update(
+        status="partial", critical_unknowns=["compute_normalization_unavailable"]
+    )
+    native_path.write_text(json.dumps(native))
+    partial = _baseline.verify_native_coverage(tmp_path, 1, metadata, metadata_path)
+    assert partial["native_graph_ownership"] == "partial"
+    assert partial["native_evidence"]["critical_unknowns"] == [
+        "compute_normalization_unavailable"
+    ]
+    assert partial["status"] == "incomplete"
 
 
 def test_model_depth_aliases_preserve_declared_depth_and_reject_conflicts():
@@ -643,8 +669,9 @@ def test_run_arm_observes_startup_before_unavailable_engine_import(
     assert "startup_observation" not in observation["body"]["timeline_config"]
 
 
+@pytest.mark.parametrize("legacy_config", [False, True])
 def test_sealed_manifest_rejects_epoch_later_self_consistent_config_change(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, legacy_config
 ):
     import hashlib
 
@@ -675,6 +702,8 @@ def test_sealed_manifest_rejects_epoch_later_self_consistent_config_change(
     monkeypatch.setenv("TOKENSPEED_PROFILE_RUN_ID", run_id)
     observation = _baseline.observe_before_engine(case, case_sha, repetition=1)
     config = _profile_config_for_observation(observation, run_id=run_id)
+    if legacy_config:
+        config["library"] = None
     config_path, window_path, capture_path, replay_path = [
         tmp_path / name
         for name in (
@@ -699,6 +728,17 @@ def test_sealed_manifest_rejects_epoch_later_self_consistent_config_change(
                 source_context=context, baseline=dict(source_context=context)
             )
         ),
+    )
+    communication = tmp_path / "rank-0.communication.json"
+    communication.write_text(
+        json.dumps(
+            dict(
+                schema="tokenspeed.communication_evidence/v1",
+                run_id=run_id,
+                rank=0,
+                config_sha256=context["profile_config_sha256"],
+            )
+        )
     )
     capture = dict(
         run_id=run_id,
@@ -777,6 +817,8 @@ def test_sealed_manifest_rejects_epoch_later_self_consistent_config_change(
             metadata_path,
             Path(observation["body"]["driver_source"]["path"]),
         ]
+        if not legacy_config:
+            paths.append(communication)
         sources = {
             _baseline.artifact_source(path)["path"]: _baseline.artifact_source(path)
             for path in paths
@@ -802,12 +844,22 @@ def test_sealed_manifest_rejects_epoch_later_self_consistent_config_change(
             ],
             artifacts=sources,
         )
+        if not legacy_config:
+            document["communication_evidence"] = [str(communication)]
         raw = json.dumps(document).encode()
         path = tmp_path / f"run-1.{hashlib.sha256(raw).hexdigest()}.json"
         path.write_bytes(raw)
         return path
 
-    assert read_run_manifest(seal(), rank=0)["graph_window"] == window_path
+    sealed = read_run_manifest(seal(), rank=0)
+    assert sealed["graph_window"] == window_path
+    if legacy_config:
+        assert "sealed_communication_artifacts" not in sealed
+    else:
+        assert sealed["sealed_communication_artifacts"] == {
+            str(item): _baseline.artifact_source(item)
+            for item in (communication, config_path)
+        }
     # Recompute every downstream hash after changing a real config field while
     # retaining the original pre-import observation. Integrity alone is not enough.
     config["hardware"] = "changed-after-epoch.json"

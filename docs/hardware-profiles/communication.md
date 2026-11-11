@@ -60,6 +60,7 @@ Each entry requires these fields:
 | --- | --- |
 | `id` | Unique identifier in this selected hardware profile |
 | `bytes_per_second` | Positive finite decimal byte/s, per rank, one direction |
+| `bidirectional_bytes_per_second` | Optional symmetric endpoint total equal to twice the directional reference |
 | `scope`, `direction`, `normalization` | `per_rank`, `one_direction`; normalization is `nccl_tests_bus_bytes` or `trtllm_mnnvl_oneshot_remote_payload` |
 | `world_size` | Exact participating group size, at least two |
 | `placement` | `single_node` or `multi_node` |
@@ -70,14 +71,13 @@ Each entry requires these fields:
 | `normalization_reason` | Explain why this directional bound matches the selected traffic model; equivalent BusBW reference efficiency is distinct from directional utilization |
 
 `bytes_per_second` must equal `published_value * unit_scale *
-conversion_factor`. A `per_link` source additionally requires `transport:
-nvlink`, `active_link_count` and `link_version` (raw NVML enum), both positive integers,
-`link_generation` (such as `"4.0"`), `link_version_source_id`, and
-`required_link_rate_bytes_per_second`, the raw driver full-rate predicate; multiply
-by `active_link_count` as well. All participating ranks must prove that exact
-active port count/version and minimum per-port raw rate. The raw rate is only
-a state-matching predicate and is never substituted for the published directional
-capacity. The hardware profile records the required count;
+conversion_factor`. For a `per_link` source, also multiply by the positive integer
+`active_link_count`. Each rank must prove that count and match the configured
+`required_link_rate_bytes_per_second` driver state. Such a source requires
+`transport: nvlink` and a sourced `link_generation` such as `"4.0"`. Profiles
+can select a documented raw `link_version` and `link_version_source_id`, or
+specify `nvlink_board` as described below. The published per-link bandwidth
+supplies the denominator. The hardware profile records the required count;
 the observation records the actual count. A theoretical reference is not an
 achievable payload benchmark; encoding, protocol overhead and remote reductions
 can change physical bytes. NVSwitch multicast/reduction paths require their own
@@ -100,7 +100,32 @@ accepted without changing ordered rank identity.
 | `comm_placement` | `single_node` or `multi_node`, checked against rank hosts |
 | `comm_topology`, `comm_transport`, `comm_backend`, `comm_algorithm`, `comm_protocol` | Actual route tokens, matching exactly one capacity entry |
 | `comm_transport_source`, `comm_topology_source`, `comm_placement_source`, `comm_route_source` | Nonempty references to immutable evidence from this run (content hash plus source/record locator recommended); a configured preference is not proof of selected transport |
-| `comm_rank_active_link_counts`, `comm_rank_link_versions`, `comm_rank_min_link_rate_bytes_per_second`, `comm_link_source` | Required for a `per_link` denominator: count, raw NVML version enum (6 means generation4.0) and minimum raw active-port rate (decimal byte/s) per ordered rank, plus immutable active-link evidence |
+| `comm_rank_active_link_counts`, `comm_rank_min_link_rate_bytes_per_second`, `comm_link_source` | Active count and minimum raw active-port rate (decimal byte/s) per ordered rank, with a hashed snapshot reference |
+| `comm_rank_link_versions` | Raw driver values retained for audit and required by profiles that select a raw `link_version` |
+
+## H200 SXM board evidence
+
+The H200 SXM profile uses `nvlink_board` for link generation. The mapping
+specifies the combined NVML `pci_device_id` and `pci_subsystem_id`, the
+`switch_count`, and `pci_source_id`, `generation_source_id`, and
+`switch_source_id` entries from `sources`. The documented H200 HGX board
+uses fourth-generation NVLink. Its startup snapshot binds CUDA and NVML
+UUIDs, the PCI IDs, and current MIG mode on every rank. All eight full GPUs
+must share the same four actual NVSwitch PCI endpoints. Each directed peer
+entry must show NV18 and every GPU must report 18 active links in the
+configured full-rate state. The board, route, and link evidence refer to the
+same captured snapshot and its SHA256. The allocation and selected route
+checks still apply to the MNNVL payload model. [NVIDIA HGX reference architecture](https://docs.nvidia.com/enterprise-reference-architectures/hgx-ai-factory-h100-h200-b200/latest/components.html) · [NVIDIA Fabric Manager topology](https://docs.nvidia.com/datacenter/tesla/fabric-manager-user-guide/#supported-virtual-machine-configurations)
+
+The startup snapshot retains raw `nvmlDeviceGetNvLinkVersion` values and
+the driver/NVML versions. The board proof uses the documented hardware
+topology to establish the generation. Missing PCI, link-state, or topology
+evidence leaves utilization N/A. At full rate the reference is
+`18 × 25e9 = 450e9` byte/s per rank per direction and `900e9` byte/s as
+the symmetric bidirectional sum. TX and RX payload estimates each use the
+450 GB/s reference and the whole Op GPU span.
+
+## Observation provenance
 
 The recorder/caller must establish run/rank provenance and that evidence covers
 this Op's group. The helper checks the group/size, distinct ordered devices,
@@ -204,7 +229,7 @@ is added on the Op/replay path. `comm_allocation_source` and
 `comm_payload_model_source` identify these facts and the reviewed source;
 `comm_addressing=nvls_multicast` and `comm_allocator_backend=CUDA` retain the
 actual route separately from `comm_workspace=mnnvl`/`comm_protocol=mnnvl`.
-Missing APIs, allocator/mapping failures, a changed workspace, two-shot, other
+Missing APIs, allocator/mapping failures, a changed workspace, other
 patterns, multi-node placement, or missing link evidence keep the model N/A.
 
 The source chain is the workspace creator's `symm_mem.empty/rendezvous` and
@@ -216,6 +241,39 @@ defines this mapped NVLS route. The reviewed kernel uses a vector store to the
 mapping; this documentation does not relabel it as a `multimem.red` instruction.
 Kernel/creator/source hashes and actual allocator facts are retained for audit;
 a function name alone is not transport evidence.
+
+## MNNVL two-shot directional payload model
+
+The reviewed kernel assigns token `t` to group-local rank `t % P`. Let `T`
+be the number of tokens, `L` the bytes per token and `n_r` the number of
+tokens owned by rank `r`. The kernel unicasts each input vector to its owner.
+The owner reduces the inputs locally and stores one reduced vector through the
+multicast mapping. Local owner stores and the owner's multicast replica do
+not count as useful remote receive payload.
+
+| Phase | TX payload at rank `r` | Remote RX payload at rank `r` |
+| --- | --- | --- |
+| Scatter | `(T-n_r)*L` | `(P-1)*n_r*L` |
+| Reduced multicast | `n_r*L` | `(T-n_r)*L` |
+| Total | `T*L` | `(T+(P-2)*n_r)*L` |
+
+With 59 tokens, BF16 width 4096 and eight ranks, group-local rank 0 owns
+eight tokens. Its modeled TX payload is 483,328 B and remote RX payload is
+876,544 B. Ranks that own seven tokens have a different RX payload.
+AllReduce AlgBW and NCCL-tests BusBW retain their own conventions.
+
+Both directions use the whole pure or fused Op GPU span. The estimate uses
+the larger directional rate divided by the matching per-rank, one-direction
+peak. The peak is the same physical endpoint reference as the compatible
+MNNVL one-shot entry in the captured hardware profile. The report preserves
+that entry's ID separately from the two-shot route and payload model. Neither
+polling/flags nor packet overhead or physical loopback traffic are modeled.
+
+Two-shot is bound offline from a sealed same-run snapshot, verified
+all-rank CUDA peer/multicast allocations and the exact owned eager kernel
+activity. The kernel's pattern, dtype, group size and launch geometry must
+agree with the recorded Op and input shape. An unmatched route, missing
+native evidence or missing endpoint capacity leaves utilization N/A.
 
 The `profiling` extra includes `PyYAML` and `nvidia-ml-py>=13.580.82` (`pynvml`).
 Optional driver/NVML capabilities are probed once at configured startup. An

@@ -41,7 +41,6 @@ from tokenspeed_kernel.profile_costs import (
     register_compute_costs,
 )
 from tokenspeed_kernel.profile_nsys import finalize_nsight
-from tokenspeed_kernel.profile_nvtx import build_nvtx_bridge
 from tokenspeed_kernel.registry import KernelRegistry, KernelSpec
 
 
@@ -236,16 +235,13 @@ def test_native_ranges_preserve_thread_nesting_and_gpu_projection(tmp_path):
     )
     output = tmp_path / "capture"
     output.mkdir()
-    build_nvtx_bridge(
-        include_dir=Path(nsys).resolve().parent / "nvtx/include",
-        output=output / "nvtx_profile.so",
-        compiler="cc",
-    )
     script = tmp_path / "workload.py"
     script.write_text(textwrap.dedent("""\
         import sys
+        from itertools import count
         from pathlib import Path
         import torch
+        from tokenspeed_kernel import profile_nvtx
         from tokenspeed_kernel.numerics.torch.gemm import torch_mm
         from tokenspeed_kernel.op_profile import CostRegistry, ProfileSession, profiled
         from tokenspeed_kernel.profile_costs import register_compute_costs
@@ -265,6 +261,7 @@ def test_native_ranges_preserve_thread_nesting_and_gpu_projection(tmp_path):
 
         root = Path(sys.argv[1])
         output = root / "capture"
+        profile_nvtx._scope_ids = count((1 << 53) + 1)
         layer = TwoMatmulLayer()
         x = torch.randn_like(layer.up)
         reference = torch.mm(torch.mm(x, layer.up.T), layer.down.T)
@@ -279,7 +276,7 @@ def test_native_ranges_preserve_thread_nesting_and_gpu_projection(tmp_path):
             session, costs=costs,
             hardware=HardwareProfile.from_json(root / "hardware.json"),
             stream=torch.cuda.current_stream(), max_scopes=6,
-            library=output / "nvtx_profile.so", output=output / "metrics.json",
+            output=output / "metrics.json",
         ):
             for iteration in range(2):
                 with session.iteration(iter_id=iteration):
@@ -311,7 +308,12 @@ def test_native_ranges_preserve_thread_nesting_and_gpu_projection(tmp_path):
     assert {op["cost_rule"] for op in report["ops"]} == {"torch_mm.v1"}
     rows = report["device_analysis"]["scopes"]
     assert len(rows) == 6
-    assert all(r["mfu"] > 0 and r["estimated_mbu"] > 0 for r in rows)
+    for row in rows:
+        assert row["useful_flops"] > 0
+        assert row["gpu_duration_ns"] > 0
+        assert row["estimated_mbu"] > 0
+        assert row["mfu"] is None
+        assert "positive FLOPs have no proven compute type" in row["mfu_missing_reason"]
     projection = output / "projection"
     subprocess.run(
         [
@@ -328,33 +330,46 @@ def test_native_ranges_preserve_thread_nesting_and_gpu_projection(tmp_path):
         timeout=120,
     )
     with (output / "projection_nvtx_gpu_proj_trace.csv").open() as source:
-        projected = defaultdict(list)
-        for r in csv.DictReader(source):
-            projected[(int(r["TID"]), r["Name"].split(":", 1)[-1])].append(r)
-    labels = {row["native_nvtx_label"] for row in rows}
+        projected = {int(row["RangeId"]): row for row in csv.DictReader(source)}
+    metadata = json.loads((output / "metrics.json").read_text())
+    assert metadata["device_analysis"]["nvtx_payload_type"] == "int64"
+    expected = metadata["device_analysis"]["scopes"]
+    assert [item["nvtx_id"] for item in expected] == list(
+        range((1 << 53) + 1, (1 << 53) + 7)
+    )
     with sqlite3.connect(f"file:{output / 'timeline.sqlite'}?mode=ro", uri=True) as db:
-        events = [
-            event
+        events = {
+            event[0]: event[1:]
             for event in db.execute(
-                "SELECT start,end,eventType,globalTid,text FROM NVTX_EVENTS"
+                """
+                SELECT n.rowid, n.eventType, n.globalTid, n.endGlobalTid,
+                       COALESCE(s.value, n.text), n.int64Value, n.uint64Value
+                FROM NVTX_EVENTS n LEFT JOIN StringIds s ON n.textId = s.id
+                WHERE n.int64Value BETWEEN ? AND ?
+                """,
+                (expected[0]["nvtx_id"], expected[-1]["nvtx_id"]),
             )
-            if event[4] in labels
-        ]
+        }
     assert len(events) == 6  # finish must not duplicate ranges.
-    assert {e[2] for e in events} == {59}  # Actual thread NVTX push/pop ranges.
-    assert len({e[3] for e in events}) == 1
-    assert events[0][3] % (1 << 24) == report["device_analysis"]["thread_id"]
+    expected = {item["trace_label"]: item for item in expected}
     for row in rows:
-        projection_row = projected[
-            (report["device_analysis"]["thread_id"], row["native_nvtx_label"])
-        ].pop(0)
+        range_id = row["nsight_range_id"]
+        event_type, tid, end_tid, label, payload, unsigned_payload = events[range_id]
+        assert event_type == 59  # Actual thread NVTX push/pop range.
+        assert tid % (1 << 24) == report["device_analysis"]["thread_id"]
+        assert end_tid in (None, tid)
+        assert (
+            label
+            == row["native_nvtx_label"]
+            == expected[row["trace_label"]]["nvtx_label"]
+        )
+        assert payload == expected[row["trace_label"]]["nvtx_id"]
+        assert unsigned_payload is None
+        projection_row = projected[range_id]
+        assert projection_row["Name"] == f"TokenSpeed:{label}"
         assert int(projection_row["NumGPUOps"]) == (1 if row["kind"] == "op" else 2)
         assert int(projection_row["Lvl"]) == (1 if row["kind"] == "op" else 0)
         assert int(projection_row["TID"]) == report["device_analysis"]["thread_id"]
-        cost = row["useful_flops"]
-        assert row["mfu"] == pytest.approx(
-            cost / (1e12 * row["gpu_duration_ns"] * 1e-9)
-        )
         if row["kind"] == "op":
             assert row["gpu_duration_ns"] == int(
                 projection_row["Projected Duration (ns)"]
@@ -367,11 +382,6 @@ def test_finalize_once_and_recover_after_workload_exception(tmp_path):
     nsys = os.environ.get("TOKENSPEED_TEST_NSYS")
     if not nsys or not torch.cuda.is_available():
         pytest.skip("Requires CUDA and TOKENSPEED_TEST_NSYS pointing to Nsight 2026.5+")
-    bridge = build_nvtx_bridge(
-        include_dir=Path(nsys).resolve().parent / "nvtx/include",
-        output=tmp_path / "bridge.so",
-        compiler="cc",
-    )
     script = tmp_path / "workload.py"
     script.write_text(textwrap.dedent("""\
         import json
@@ -380,7 +390,7 @@ def test_finalize_once_and_recover_after_workload_exception(tmp_path):
         from pathlib import Path
         import torch
         from tokenspeed_kernel.op_profile import (
-            ProfileSession, CostRegistry, OpProfile,
+            ProfileSession, CostRegistry, OpProfile, profiled,
         )
         from tokenspeed_kernel.profile_costs import DenseMatmulCost
         from tokenspeed_kernel.profile_nvtx import NvtxTimeline
@@ -399,6 +409,11 @@ def test_finalize_once_and_recover_after_workload_exception(tmp_path):
             profile=OpProfile(cost_rule="mm", integer_tensor_args=("lengths",)),
         )
         mm = registry.get_impl("test")
+        class FailingLayer:
+            @profiled(level="layer")
+            def forward(self, a, lengths):
+                return mm(a, None, lengths)
+        failing_layer = FailingLayer()
         dense = DenseMatmulCost(lhs="a", rhs="b", output="return")
         costs = CostRegistry()
         costs.register("mm", lambda op: replace(dense(op), compute_type="test",
@@ -410,14 +425,15 @@ def test_finalize_once_and_recover_after_workload_exception(tmp_path):
             lengths = torch.tensor([2, 4], dtype=torch.int64 if case == "valid" else torch.int32,
                 device="cpu" if case == "cpu" else "cuda")
             session = ProfileSession(run_id=case, model_id=case, rank=0, backend="nvtx")
+            session.bind_layer(failing_layer, layer_id=7)
             timeline = NvtxTimeline(session, costs=costs, hardware=hardware,
                 stream=torch.cuda.current_stream(), max_scopes=2, max_metadata_bytes=32,
-                library=root / "bridge.so", output=root / f"{case}.json")
+                output=root / f"{case}.json")
             try:
                 with timeline:
                     with session.iteration(iter_id=0):
                         if case == "failed":
-                            mm(a, None, lengths)
+                            failing_layer.forward(a, lengths)
                         elif case == "cpu":
                             mm(torch.ones(16, 16), torch.ones(16, 16), lengths)
                         else:
@@ -482,6 +498,7 @@ def test_finalize_once_and_recover_after_workload_exception(tmp_path):
         text=True,
         timeout=120,
     )
+    windows = {}
     for case in ("valid", "failed", "cpu"):
         report = finalize_nsight(
             nsys=nsys,
@@ -489,21 +506,25 @@ def test_finalize_once_and_recover_after_workload_exception(tmp_path):
             metadata=tmp_path / f"{case}.json",
             output=tmp_path / f"{case}.nsight.json",
         )
-        row = report["device_analysis"]["scopes"][0]
+        scopes = report["device_analysis"]["scopes"]
+        row = next(item for item in scopes if item["kind"] == "op")
+        if case == "failed":
+            layer = next(item for item in scopes if item["kind"] == "layer")
+            assert layer["cpu_start_ns"] <= row["cpu_start_ns"]
+            assert row["cpu_end_ns"] <= layer["cpu_end_ns"]
+            windows[case] = (layer["cpu_start_ns"], layer["cpu_end_ns"])
+        else:
+            windows[case] = (row["cpu_start_ns"], row["cpu_end_ns"])
         assert (row["mfu"] is not None) == (case == "valid")
         if case == "cpu":
             assert "no GPU activity" in row["mfu_missing_reason"]
+    assert windows["failed"][0] < windows["failed"][1] <= windows["valid"][0]
 
 
 def test_real_collective_busbw_in_native_timeline(tmp_path):
     nsys = os.environ.get("TOKENSPEED_TEST_NSYS")
     if not nsys or torch.cuda.device_count() < 2:
         pytest.skip("Requires two CUDA devices and TOKENSPEED_TEST_NSYS")
-    bridge = build_nvtx_bridge(
-        include_dir=Path(nsys).resolve().parent / "nvtx/include",
-        output=tmp_path / "bridge.so",
-        compiler="cc",
-    )
     script = tmp_path / "collectives.py"
     script.write_text(textwrap.dedent("""\
         import os
@@ -569,7 +590,7 @@ def test_real_collective_busbw_in_native_timeline(tmp_path):
         torch.cuda.synchronize()
         session = ProfileSession(run_id="collectives", model_id="collective-validation", rank=rank, backend="nvtx")
         session.bind_layer(layer, layer_id=0)
-        with NvtxTimeline(session, costs=costs, hardware=HardwareProfile("test", {}, 1e12, "synthetic HBM peak for metric validation"), stream=torch.cuda.current_stream(), max_scopes=4, library=root / "bridge.so", output=root / f"metrics.rank{rank}.json"):
+        with NvtxTimeline(session, costs=costs, hardware=HardwareProfile("test", {}, 1e12, "synthetic HBM peak for metric validation"), stream=torch.cuda.current_stream(), max_scopes=4, output=root / f"metrics.rank{rank}.json"):
             with session.iteration(iter_id=0):
                 reduced = layer.forward()
         torch.testing.assert_close(reduced, torch.full_like(full, 3.), rtol=0, atol=0)

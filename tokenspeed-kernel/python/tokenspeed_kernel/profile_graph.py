@@ -35,7 +35,7 @@ import threading
 from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from tokenspeed_kernel.op_profile import (
@@ -44,6 +44,9 @@ from tokenspeed_kernel.op_profile import (
     loaded_library_manifest,
 )
 from tokenspeed_kernel.profile_utilization import HardwareProfile
+
+if TYPE_CHECKING:
+    from tokenspeed_kernel.profile_nvtx import NvtxTimeline
 
 
 class ProfileWindow:
@@ -454,9 +457,11 @@ class ProfileStep:
         self.forward_id: int | None = None
         self.capture: GraphCapture | None = None
         self.lease: MetadataLease | None = None
+        self.eager_timeline: NvtxTimeline | None = None
         self.unavailable_reason: str | None = None
         self._event: Any = None
         self._ready = False
+        self.device_ready_sequence: int | None = None
         self.replay_thread_id: int | None = None
         self.replay_stream: int | None = None
         self.geometry: dict = {}
@@ -496,11 +501,18 @@ class ProfileStep:
     def unavailable(self, reason: str) -> None:
         self.unavailable_reason = reason
 
+    def bind_eager_timeline(self, timeline: NvtxTimeline) -> None:
+        if self.eager_timeline is not None or self.replay_thread_id is not None:
+            raise ValueError("A serving step must have one native execution path")
+        self.eager_timeline = timeline
+
     def bind_result_event(self, event: Any) -> None:
         if self._event is not None:
             raise ValueError("Bind the result-copy event exactly once")
         self._event = event
-        if self.capture is None and self.unavailable_reason is None:
+        if self.eager_timeline is not None:
+            self.eager_timeline.verify_result_stream()
+        elif self.capture is None and self.unavailable_reason is None:
             self.unavailable("no_graph_metadata_for_step")
         if self.lease is not None:
             self.owner.slots.queue(self.lease, event)
@@ -520,6 +532,7 @@ class ProfileStep:
         return {
             **self.identity(),
             "event": "device_results_ready",
+            "device_ready_sequence": self.device_ready_sequence,
             "process_id": os.getpid(),
             "replay_thread_id": self.replay_thread_id,
             "replay_stream": self.replay_stream,
@@ -538,8 +551,8 @@ class ProfileStep:
 class GraphReplayCollector:
     """One rank's bounded pinned slots, paired to exact async results.
 
-    Own one exclusive replay index stream; flush each row before releasing its
-    metadata slot, and close the stream only after the CPU writer drains.
+    Graph rows are flushed before reusing their slots. Eager sidecars retain
+    independently bounded reservations until the profiling window stops.
     """
 
     def __init__(
@@ -565,11 +578,15 @@ class GraphReplayCollector:
         self.selected_steps = 0
         self.device_ready_steps = 0
         self.persisted_payloads = 0
+        self.persisted_eager = 0
         self.dropped_metadata = 0
         if output.exists():
             raise ValueError("Profile replay output already exists; choose a new run")
         output.parent.mkdir(parents=True, exist_ok=True)
         self._ready_queue = queue.Queue(maxsize=metadata_slots)
+        self._eager_capacity = metadata_slots
+        self._eager_lock = threading.Lock()
+        self._eager_pending: dict[str, tuple[ProfileStep, dict] | None] = {}
         self._writer_error: str | None = None
         self._closed = False
         self._index_stream = output.open("x", encoding="utf-8")
@@ -578,8 +595,38 @@ class GraphReplayCollector:
         )
         self._writer.start()
 
+    @contextmanager
+    def reserve_eager_metadata(self, step: ProfileStep):
+        """Reserve a bounded serving eager capture before allocating its buffer."""
+        with self._eager_lock:
+            if self._closed or step.step_id in self._eager_pending:
+                raise ValueError("Eager metadata reservation is closed or duplicated")
+            reserved = len(self._eager_pending) < self._eager_capacity
+            if reserved:
+                self._eager_pending[step.step_id] = None
+        if not reserved:
+            step.unavailable("metadata_dropped:eager_postwindow_capacity")
+        try:
+            yield reserved
+        finally:
+            if reserved and step.eager_timeline is None:
+                with self._eager_lock:
+                    self._eager_pending.pop(step.step_id, None)
+
     def persist_ready(self, step: ProfileStep) -> None:
         self.device_ready_steps += 1
+        step.device_ready_sequence = self.device_ready_steps
+        if step.eager_timeline is not None:
+            with self._eager_lock:
+                if (
+                    step.step_id not in self._eager_pending
+                    or self._eager_pending[step.step_id] is not None
+                ):
+                    raise ValueError(
+                        "Ready eager metadata requires its one reservation"
+                    )
+                self._eager_pending[step.step_id] = (step, step.ready_record())
+            return
         if step.lease is None:
             try:
                 self.emit(step.ready_record())
@@ -595,7 +642,8 @@ class GraphReplayCollector:
                 self.emit(step.ready_record())
             except Exception as error:
                 self._writer_error = f"Dropped identity index unavailable: {error}"
-            self.slots.release(step.lease)
+            if step.lease is not None:
+                self.slots.release(step.lease)
 
     def _drain(self) -> None:
         while True:
@@ -624,7 +672,8 @@ class GraphReplayCollector:
                 self.emit(row)
                 if "binary_payload" in row:
                     self.persisted_payloads += 1
-                self.slots.release(step.lease)
+                if step.lease is not None:
+                    self.slots.release(step.lease)
             except BaseException as error:
                 # Keep its slot owned: failed persistence cannot expose old bytes
                 # to a new generation. Future captures explicitly drop on capacity.
@@ -643,9 +692,51 @@ class GraphReplayCollector:
             finally:
                 self._ready_queue.task_done()
 
+    def _flush_eager_ready(self) -> None:
+        with self._eager_lock:
+            pending = [
+                record for record in self._eager_pending.values() if record is not None
+            ]
+            for step, row in sorted(
+                pending, key=lambda record: record[1]["device_ready_sequence"]
+            ):
+                timeline = step.eager_timeline
+                try:
+                    timeline.finish_after_results()
+                    with timeline.output.open("rb") as stream:
+                        digest = hashlib.file_digest(stream, "sha256").hexdigest()
+                        size = os.fstat(stream.fileno()).st_size
+                    self.emit(
+                        {
+                            **row,
+                            "execution_mode": "eager",
+                            "eager_sidecar": dict(
+                                path=str(timeline.output.resolve()),
+                                bytes=size,
+                                sha256=digest,
+                            ),
+                        }
+                    )
+                    self.persisted_eager += 1
+                except Exception as error:
+                    self._writer_error = f"{type(error).__name__}: {error}"
+                    step.unavailable(
+                        f"metadata_persistence_failed:{self._writer_error}"
+                    )
+                    try:
+                        self.emit(
+                            {**row, "unavailable_reason": step.unavailable_reason}
+                        )
+                    except Exception as emit_error:
+                        self._writer_error += f"; failure index unavailable: {type(emit_error).__name__}: {emit_error}"
+                finally:
+                    step.eager_timeline = None
+                    del self._eager_pending[step.step_id]
+
     def flush_ready(self) -> dict:
         """Drain only CPU-ready work; never query or wait for a CUDA event."""
         self._ready_queue.join()
+        self._flush_eager_ready()
         library_manifest = loaded_library_manifest(source_context=self._source_context)
         if "semantic_provenance" in library_manifest:
             library_manifest["semantic_provenance"]["baseline"] = self._source_baseline
@@ -653,6 +744,10 @@ class GraphReplayCollector:
             selected_steps=self.selected_steps,
             device_results_ready=self.device_ready_steps,
             persisted_payloads=self.persisted_payloads,
+            persisted_eager=self.persisted_eager,
+            profile_config_sha256=(self._source_context or {}).get(
+                "profile_config_sha256"
+            ),
             dropped_metadata=self.dropped_metadata,
             unresolved_result_metadata=self.selected_steps - self.device_ready_steps,
             writer_flushed=True,
@@ -667,6 +762,7 @@ class GraphReplayCollector:
             self._ready_queue.join()
             self._ready_queue.put(None)
             self._writer.join()
+            self._flush_eager_ready()
             with self._write_lock:
                 self._index_stream.close()
 
@@ -684,6 +780,8 @@ class GraphReplayCollector:
     def replay(
         self, step: ProfileStep, capture: GraphCapture | None, *, geometry: dict
     ):
+        if step.eager_timeline is not None:
+            raise ValueError("A serving step must have one native execution path")
         if step.capture is not None or step.lease is not None:
             step.unavailable("multiple_graph_launches_for_step")
         else:

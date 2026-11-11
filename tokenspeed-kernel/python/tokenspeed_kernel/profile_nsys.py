@@ -60,31 +60,74 @@ def _read_nvtx_ranges(
     *,
     capture: dict[str, Any],
     scope_ids: set[int | str],
-    identity_field: str,
+    payload_type: str | None,
 ) -> dict[int | str, sqlite3.Row]:
     """Read this session's ranges, excluding other processes and threads."""
     ranges = {}
     labels = {scope["nvtx_label"] for scope in capture["scopes"]}
     process_id = capture.get("process_id")
+    payload_column = {"int64": "n.int64Value", "uint64": "n.uint64Value", None: "NULL"}[
+        payload_type
+    ]
     with sqlite3.connect(f"{database.resolve().as_uri()}?mode=ro", uri=True) as db:
         db.row_factory = sqlite3.Row
+        domain_join = signed_range = ""
+        if payload_type == "int64":
+            if type(process_id) is not int or not 0 < process_id < (1 << 24):
+                raise ValueError("Signed TokenSpeed NVTX capture requires an exact PID")
+            columns = {
+                column[1] for column in db.execute("PRAGMA table_info(NVTX_EVENTS)")
+            }
+            if not {"domainId", "eventType", "int64Value"} <= columns:
+                raise ValueError(
+                    "Signed NVTX export lacks TokenSpeed domain or push/pop evidence"
+                )
+            # Domain IDs are process-local. Use the full packed process key
+            # for the declaration, including any Nsight namespace bits.
+            domain_join = """
+            JOIN (
+                SELECT d.domainId, (d.globalTid >> 24) AS process_key
+                FROM NVTX_EVENTS d LEFT JOIN StringIds ds ON d.textId = ds.id
+                WHERE d.eventType = 75
+                GROUP BY d.domainId, process_key
+                HAVING COUNT(*) = 1 AND MAX(COALESCE(ds.value, d.text)) = 'TokenSpeed'
+            ) domains ON domains.domainId = n.domainId
+                      AND domains.process_key = (n.globalTid >> 24)
+            """
+            signed_range = """
+                AND n.eventType = 59
+                AND typeof(n.start) = 'integer' AND typeof(n.end) = 'integer'
+                AND n.end >= n.start
+                AND (n.endGlobalTid IS NULL OR n.endGlobalTid = n.globalTid)
+            """
         # Nsight packs PID/TID into 24-bit fields within globalTid.
         for row in db.execute(
-            """
+            f"""
             SELECT n.rowid AS range_id, n.start, n.end, n.globalTid, n.endGlobalTid,
                    ((n.globalTid >> 24) & 0xFFFFFF) AS pid,
                    COALESCE(s.value, n.text) AS nvtx_label,
-                   n.uint64Value AS nvtx_id
+                   {payload_column} AS nvtx_id
             FROM NVTX_EVENTS n LEFT JOIN StringIds s ON n.textId = s.id
+            {domain_join}
             WHERE (n.globalTid & 0xFFFFFF) = ?
               AND (? IS NULL OR ((n.globalTid >> 24) & 0xFFFFFF) = ?)
+            {signed_range}
             """,
             (capture["thread_id"], process_id, process_id),
         ):
-            scope_id = row[identity_field]
-            if scope_id not in scope_ids or row["nvtx_label"] not in labels:
-                continue
             label = row["nvtx_label"]
+            if label not in labels:
+                continue
+            scope_id = label
+            if payload_type is not None:
+                scope_id = row["nvtx_id"]
+                if type(scope_id) is not int:
+                    continue
+                # SQLite stores the unsigned payload's bits in a signed INTEGER.
+                if payload_type == "uint64" and scope_id < 0:
+                    scope_id += 1 << 64
+            if scope_id not in scope_ids:
+                continue
             if scope_id in ranges:
                 raise ValueError(f"Ambiguous NVTX range for {label}")
             if (
@@ -97,31 +140,37 @@ def _read_nvtx_ranges(
     return ranges
 
 
-def analyze_nsight(
+def _join_nsight_projection(
     report: dict[str, Any], *, database: Path, projection: Path
-) -> dict[str, Any]:
-    """Join cost metadata to the official Nsight NVTX GPU projection export.
-
-    The SQLite database and nvtx_gpu_proj_trace CSV must come from the same
-    capture. CPU range timestamps identify nesting only. The denominator is
-    Projected Duration: last associated GPU activity end minus first start,
-    including gaps between activities. Missing GPU work stays unavailable.
-    No Event, CPU duration or previously calculated metric is a fallback.
-    """
+) -> tuple[list[ScopeTiming], dict[str, dict[str, Any]]]:
+    """Join signed/legacy NVTX identities to original native scope boundaries."""
     capture = report["device_analysis"]
     recorded = capture["scopes"]
     if len({scope["trace_label"] for scope in recorded}) != len(recorded):
         raise ValueError("Duplicate metadata scope identity")
-    # New captures carry payload IDs; historical captures used unique labels.
-    identity_field = (
-        "nvtx_id" if all("nvtx_id" in scope for scope in recorded) else "nvtx_label"
-    )
+    # Python NVTX uses signed payloads. C sidecars have unsigned IDs and no type.
+    # The oldest captures identify ranges by unique labels.
+    payload_type = capture.get("nvtx_payload_type")
+    has_id = ["nvtx_id" in scope for scope in recorded]
+    if payload_type is None and any(has_id):
+        payload_type = "uint64"
+    if payload_type not in (None, "int64", "uint64"):
+        raise ValueError(f"Unsupported NVTX payload type: {payload_type!r}")
+    identity_field = "nvtx_label"
+    if payload_type is not None:
+        limit = 1 << (63 if payload_type == "int64" else 64)
+        if any(
+            type(scope.get("nvtx_id")) is not int or not 0 <= scope["nvtx_id"] < limit
+            for scope in recorded
+        ):
+            raise ValueError(f"Expected exact {payload_type} NVTX scope IDs")
+        identity_field = "nvtx_id"
     scopes = {scope[identity_field]: scope for scope in recorded}
     if len(scopes) != len(recorded):
         raise ValueError("NVTX identities must uniquely identify calls in this session")
     projected = _read_projection(projection)
     ranges = _read_nvtx_ranges(
-        database, capture=capture, scope_ids=set(scopes), identity_field=identity_field
+        database, capture=capture, scope_ids=set(scopes), payload_type=payload_type
     )
     timings = []
     evidence = {}
@@ -129,7 +178,12 @@ def analyze_nsight(
     for scope_id, scope in scopes.items():
         trace_label, label = scope["trace_label"], scope["nvtx_label"]
         if scope_id not in ranges:
-            raise ValueError(f"NVTX range missing from Nsight capture: {label}")
+            detail = (
+                " (expected a closed same-thread TokenSpeed push/pop range)"
+                if payload_type == "int64"
+                else ""
+            )
+            raise ValueError(f"NVTX range missing from Nsight capture: {label}{detail}")
         native = ranges[scope_id]
         if native["nvtx_label"] != label:
             raise ValueError("NVTX payload identity has an unexpected label")
@@ -140,12 +194,18 @@ def analyze_nsight(
         count = 0
         reason = "no GPU activity correlated by Nsight to this NVTX range"
         if gpu is not None:
+            projection_name = gpu["Name"]
+            name_matches = (
+                projection_name == f"TokenSpeed:{label}"
+                if payload_type == "int64"
+                else projection_name.split(":", 1)[-1] == label
+            )
             if (
                 int(gpu["Orig Start (ns)"]) != start
                 or int(gpu["Orig Duration (ns)"]) != end - start
                 or int(gpu["PID"]) != native["pid"]
                 or int(gpu["TID"]) != capture["thread_id"]
-                or gpu["Name"].split(":", 1)[-1] != label
+                or not name_matches
             ):
                 raise ValueError("Nsight projection and NVTX capture do not match")
             duration = int(gpu["Projected Duration (ns)"])
@@ -173,6 +233,24 @@ def analyze_nsight(
             "gpu_end_ns": None if gpu_start is None else gpu_start + duration,
             "gpu_activity_count": count,
         }
+    return timings, evidence
+
+
+def analyze_nsight(
+    report: dict[str, Any], *, database: Path, projection: Path
+) -> dict[str, Any]:
+    """Join cost metadata to the official Nsight NVTX GPU projection export.
+
+    The SQLite database and nvtx_gpu_proj_trace CSV must come from the same
+    capture. CPU range timestamps identify nesting only. The denominator is
+    Projected Duration: last associated GPU activity end minus first start,
+    including gaps between activities. Missing GPU work stays unavailable.
+    No Event, CPU duration or previously calculated metric is a fallback.
+    """
+    capture = report["device_analysis"]
+    timings, evidence = _join_nsight_projection(
+        report, database=database, projection=projection
+    )
     rows = analyze_utilization(
         report, timings, hardware_for_analysis(report["hardware"], None)
     )
@@ -314,6 +392,7 @@ def finalize_graph_nsight(
     scheduler_mode: str,
     registry: CostRegistry | None,
     cost_provider_source: dict | None = None,
+    sealed_communication_artifacts: dict[str, dict] | None = None,
 ) -> dict[str, Any]:
     """Export and analyze collector graph artifacts using public CPU cost rules.
 
@@ -329,6 +408,7 @@ def finalize_graph_nsight(
     from tokenspeed_kernel.profile_graph_analysis import (
         analyze_graph_replays,
         default_cost_registry,
+        file_source,
         native_coverage_receipt,
     )
 
@@ -362,7 +442,7 @@ def finalize_graph_nsight(
     selected_registry = (
         default_cost_registry(hbm_policy=hbm_policy) if registry is None else registry
     )
-    source_trace_hash = hashlib.sha256(trace.read_bytes()).hexdigest()
+    source_trace_hash = file_source(trace)["sha256"]
     with tempfile.TemporaryDirectory(prefix="tokenspeed-graph-nsight-") as directory:
         database = Path(directory) / "trace.sqlite"
         subprocess.run(
@@ -375,6 +455,27 @@ def finalize_graph_nsight(
             ],
             check=True,
         )
+        eager_projection = None
+        if any(
+            json.loads(line).get("eager_sidecar") is not None
+            for line in replays.read_text().splitlines()
+            if line.strip()
+        ):
+            projection = database.with_name("projection")
+            subprocess.run(
+                [
+                    nsys,
+                    "stats",
+                    "--report=nvtx_gpu_proj_trace",
+                    "--format=csv",
+                    f"--output={projection}",
+                    str(database),
+                ],
+                check=True,
+            )
+            eager_projection = projection.with_name(
+                "projection_nvtx_gpu_proj_trace.csv"
+            )
         result = analyze_graph_replays(
             database=database,
             report=trace,
@@ -383,6 +484,8 @@ def finalize_graph_nsight(
             registry=selected_registry,
             hardware=hardware,
             evidence_kind="nsight_capture",
+            eager_projection=eager_projection,
+            sealed_communication_artifacts=sealed_communication_artifacts,
         )
         result["provenance"]["cost_provider"] = cost_provider_source
         result["provenance"]["database"][
@@ -406,6 +509,11 @@ def finalize_graph_nsight(
                 report=trace,
                 expected_report_sha256=source_trace_hash,
                 registry=selected_registry,
+                eager_steps={
+                    step["step_id"]: step
+                    for step in result["steps"]
+                    if step.get("attribution_mode") == "eager_nvtx_gpu_projection"
+                },
             )
             for name, path in (("ready_index", replays), ("window", window)):
                 if (
@@ -450,7 +558,7 @@ def finalize_graph_nsight(
     return result
 
 
-def read_run_manifest(path: Path, *, rank: int | None) -> dict[str, Path | None]:
+def read_run_manifest(path: Path, *, rank: int | None) -> dict[str, Any]:
     """Validate a sealed pair-driver inventory and select one exact rank.
 
     Every consumed source must be present in the hash inventory, including
@@ -500,6 +608,27 @@ def read_run_manifest(path: Path, *, rank: int | None) -> dict[str, Path | None]
             raise ValueError(f"Run source absent from hash inventory: {name}")
         return Path(name)
 
+    sealed_communication = None
+    if "communication_evidence" in manifest:
+        from tokenspeed_kernel.profile_communication_inventory import (
+            communication_inventory,
+        )
+
+        directories = {source(item["config"]).parent for item in manifest["ranks"]}
+        names = manifest["communication_evidence"]
+        if not isinstance(names, list) or not names:
+            raise ValueError("Invalid sealed communication inventory")
+        paths = [source(name) for name in names]
+        if any(item.parent not in directories for item in paths):
+            raise ValueError("Communication receipt outside sealed rank directory")
+        observed = communication_inventory(paths, run_id=run_id)
+        if any(artifacts[name] != item for name, item in observed.items()):
+            raise ValueError("Sealed communication receipt fingerprint mismatch")
+        sealed_communication = {
+            **observed,
+            **{item["config"]: artifacts[item["config"]] for item in manifest["ranks"]},
+        }
+
     if manifest["report"] is None:
         raise ValueError("JSON-only run has no completed Nsight report")
     report = source(manifest["report"])
@@ -517,7 +646,7 @@ def read_run_manifest(path: Path, *, rank: int | None) -> dict[str, Path | None]
     observation = None
     if manifest.get("startup_observation_sha256") is not None:
         from tokenspeed_kernel.op_profile import (
-            _profile_config_for_observation,
+            _profile_observed_configs,
             _profile_validate_startup_observation,
         )
 
@@ -592,7 +721,7 @@ def read_run_manifest(path: Path, *, rank: int | None) -> dict[str, Path | None]
         )
         if observation is not None:
             config = json.loads(source(item["config"]).read_text())
-            if config["config"] != _profile_config_for_observation(
+            if config["config"] not in _profile_observed_configs(
                 observation, run_id=run_id
             ):
                 raise ValueError(
@@ -622,8 +751,28 @@ def read_run_manifest(path: Path, *, rank: int | None) -> dict[str, Path | None]
                     raise ValueError(
                         "Sealed startup observation/window identity mismatch"
                     )
-        for line in replays.read_text().splitlines():
-            row = json.loads(line)
+        replay_rows = [json.loads(line) for line in replays.read_text().splitlines()]
+        eager_rows = [
+            row for row in replay_rows if row.get("eager_sidecar") is not None
+        ]
+        if eager_rows:
+            config = json.loads(source(item["config"]).read_text())
+            config_sha = hashlib.sha256(
+                json.dumps(
+                    config["config"],
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode()
+            ).hexdigest()
+            if (
+                config.get("schema") != "tokenspeed.profile_config/v1"
+                or (config.get("run_id"), config.get("rank")) != identity
+                or config.get("sha256") != config_sha
+                or recorded.get("profile_config_sha256") != config_sha
+            ):
+                raise ValueError("Eager sidecar/window/rank config mismatch")
+        for row in replay_rows:
             if (
                 type(row.get("rank")) is not int
                 or (row.get("run_id"), row.get("rank")) != identity
@@ -646,6 +795,14 @@ def read_run_manifest(path: Path, *, rank: int | None) -> dict[str, Path | None]
                     raise ValueError(
                         "Sealed startup observation/capture config mismatch"
                     )
+            if row.get("eager_sidecar") is not None:
+                from tokenspeed_kernel.profile_eager import read_eager_sidecar
+
+                eager = row["eager_sidecar"]
+                eager_path = source(eager["path"])
+                if eager != artifacts[str(eager_path)]:
+                    raise ValueError("Manifest/replay eager fingerprint mismatch")
+                read_eager_sidecar(row, config_sha256=config_sha)
             if row.get("binary_payload"):
                 payload = row["binary_payload"]
                 payload_path = source(str(Path(payload["path"]).resolve()))
@@ -659,6 +816,11 @@ def read_run_manifest(path: Path, *, rank: int | None) -> dict[str, Path | None]
                 "report": report,
                 "graph_replays": replays,
                 "graph_window": window,
+                **(
+                    {"sealed_communication_artifacts": sealed_communication}
+                    if sealed_communication is not None
+                    else {}
+                ),
             }
     # The pair driver's fixed service proof is rank 0. Other ranks remain valid
     # graph analyses, but cannot borrow rank 0's scheduler/coverage evidence.
@@ -757,6 +919,7 @@ def main() -> None:
         "--target-id", help="Actual Hw:Vm ID from ImportNvtxt report info"
     )
     args = parser.parse_args()
+    sealed_communication = None
     if args.run_manifest is not None:
         if any(
             value is not None
@@ -780,6 +943,7 @@ def main() -> None:
         args.graph_window = sources["graph_window"]
         args.metadata = sources.get("metadata")
         args.model_config = sources.get("model_config")
+        sealed_communication = sources.get("sealed_communication_artifacts")
         if args.native_coverage is None:
             args.native_coverage = sources.get("native_coverage")
     elif args.rank is not None:
@@ -823,6 +987,7 @@ def main() -> None:
             scheduler_mode=args.scheduler_mode,
             registry=registry,
             cost_provider_source=provider_source,
+            sealed_communication_artifacts=sealed_communication,
         )
     else:
         if args.metadata is None:

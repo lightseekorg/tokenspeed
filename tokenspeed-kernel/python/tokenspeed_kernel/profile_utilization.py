@@ -377,40 +377,72 @@ class HardwareProfile:
                 "published_direction"
             )
             published_scope = capacity.get("published_scope")
+            board = capacity.get("nvlink_board")
+            if "nvlink_board" in capacity and (
+                not isinstance(board, dict)
+                or published_scope != "per_link"
+                or capacity["placement"] != "single_node"
+                or capacity["topology"] != "single_node_nvswitch"
+                or "link_version" in capacity
+                or "link_version_source_id" in capacity
+                or not _communication_text(capacity.get("link_generation"))
+                or any(
+                    type(board.get(key)) is not int or not 0 < board[key] <= 0xFFFFFFFF
+                    for key in ("pci_device_id", "pci_subsystem_id")
+                )
+                or type(board.get("switch_count")) is not int
+                or board["switch_count"] < 1
+                or any(
+                    not _communication_text(board.get(key))
+                    or board[key] not in source_ids
+                    for key in (
+                        "pci_source_id",
+                        "generation_source_id",
+                        "switch_source_id",
+                    )
+                )
+            ):
+                raise ValueError(
+                    "NVLink board evidence requires sourced PCI IDs, generation and switch count for a single-node per-link capacity"
+                )
             links = 1
             if published_scope == "per_link":
                 links = capacity.get("active_link_count")
                 if (
                     type(links) is not int
                     or links < 1
-                    or type(capacity.get("link_version")) is not int
-                    or capacity["link_version"] < 1
                     or capacity["transport"] != "nvlink"
                     or not _positive(
                         capacity.get("required_link_rate_bytes_per_second")
                     )
-                    or capacity.get("link_version_source_id") not in source_ids
                 ):
                     raise ValueError(
-                        "Per-link capacity requires an explicit NVLink version, active link count and observed full-rate predicate"
+                        "Per-link capacity requires an active NVLink count and observed full-rate predicate"
                     )
-                # NVML reports an enum, not the marketed generation number.
-                generations = {
-                    1: "1.0",
-                    2: "2.0",
-                    3: "2.2",
-                    4: "3.0",
-                    5: "3.1",
-                    6: "4.0",
-                    7: "5.0",
-                    8: "6.0",
-                }
-                if generations.get(capacity["link_version"]) != capacity.get(
-                    "link_generation"
-                ):
-                    raise ValueError(
-                        "NVML link_version enum does not match link_generation"
-                    )
+                if board is None:
+                    # This enum namespace only applies to profiles selecting it.
+                    generations = {
+                        1: "1.0",
+                        2: "2.0",
+                        3: "2.2",
+                        4: "3.0",
+                        5: "3.1",
+                        6: "4.0",
+                        7: "5.0",
+                        8: "6.0",
+                    }
+                    version = capacity.get("link_version")
+                    source_id = capacity.get("link_version_source_id")
+                    if (
+                        type(version) is not int
+                        or version not in generations
+                        or generations[version] != capacity.get("link_generation")
+                        or not _communication_text(source_id)
+                        or source_id not in source_ids
+                    ):
+                        raise ValueError(
+                            "NVML link_version enum does not match its sourced link_generation"
+                        )
             if (
                 not _positive(value)
                 or not _positive(factor)
@@ -427,6 +459,17 @@ class HardwareProfile:
             ):
                 raise ValueError(
                     "Communication capacity needs an explicit supported directional conversion"
+                )
+            if "bidirectional_bytes_per_second" in capacity and (
+                not _positive(capacity["bidirectional_bytes_per_second"])
+                or not math.isclose(
+                    capacity["bidirectional_bytes_per_second"],
+                    2 * capacity["bytes_per_second"],
+                    rel_tol=1e-12,
+                )
+            ):
+                raise ValueError(
+                    "Symmetric bidirectional capacity must equal twice the directional reference"
                 )
 
     @classmethod
@@ -812,6 +855,114 @@ def scope_metrics(
     return result
 
 
+def _nvlink_capacity_missing_reason(
+    capacity: dict[str, Any], observation: dict[str, Any], size: int
+) -> str | None:
+    link_source = observation.get("comm_link_source")
+    if not _communication_text(link_source):
+        return "active NVLink evidence source unavailable"
+
+    exact_rank_fields = [
+        (
+            "active link count",
+            "comm_rank_active_link_counts",
+            capacity["active_link_count"],
+        ),
+    ]
+    rate_fields = ["comm_rank_min_link_rate_bytes_per_second"]
+    board = capacity.get("nvlink_board")
+    if board is None:
+        exact_rank_fields.append(
+            ("link version", "comm_rank_link_versions", capacity["link_version"])
+        )
+    else:
+        board_source = observation.get("comm_nvlink_board_source")
+        if not _communication_text(board_source):
+            return "same-run NVLink board evidence unavailable"
+        snapshot = link_source.partition("#rank_evidence")[0]
+        if (
+            re.fullmatch(r".+#sha256=[0-9a-f]{64}", snapshot) is None
+            or any(
+                observation[field].partition("#rank_evidence")[0] != snapshot
+                for field in (
+                    "comm_nvlink_board_source",
+                    "comm_topology_source",
+                    "comm_placement_source",
+                )
+            )
+            or observation["comm_route_source"].partition("#route_sources")[0]
+            != snapshot
+        ):
+            return "NVLink board, link, topology and route snapshots differ"
+        exact_rank_fields.extend(
+            (
+                (
+                    "GPU PCI device ID",
+                    "comm_rank_pci_device_ids",
+                    board["pci_device_id"],
+                ),
+                (
+                    "GPU PCI subsystem ID",
+                    "comm_rank_pci_subsystem_ids",
+                    board["pci_subsystem_id"],
+                ),
+                ("full GPU device", "comm_rank_full_devices", True),
+            )
+        )
+        switches = observation.get("comm_switch_pci_addresses")
+        if (
+            not isinstance(switches, (list, tuple))
+            or len(switches) != board["switch_count"]
+            or any(
+                not isinstance(address, str)
+                or re.fullmatch(
+                    r"(?:[0-9a-f]{4}){1,2}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]",
+                    address.lower(),
+                )
+                is None
+                for address in switches
+            )
+            or len({address.lower() for address in switches}) != len(switches)
+        ):
+            return "observed NVLink switch endpoints do not match capacity"
+        peer_counts = observation.get("comm_peer_nvlink_counts")
+        if (
+            not isinstance(peer_counts, (list, tuple))
+            or len(peer_counts) != 1
+            or type(peer_counts[0]) is not int
+            or peer_counts[0] != capacity["active_link_count"]
+        ):
+            return "observed NVLink peer matrix does not match capacity"
+        rate_fields.append("comm_rank_max_link_rate_bytes_per_second")
+
+    for label, field, expected in exact_rank_fields:
+        values = observation.get(field)
+        if (
+            not isinstance(values, (tuple, list))
+            or len(values) != size
+            or any(
+                type(value) is not type(expected) or value != expected
+                for value in values
+            )
+        ):
+            return f"observed rank NVLink {label} does not match capacity"
+    for field in rate_fields:
+        rates = observation.get(field)
+        if (
+            not isinstance(rates, (tuple, list))
+            or len(rates) != size
+            or any(
+                not _positive(rate)
+                or not math.isclose(
+                    rate, capacity["required_link_rate_bytes_per_second"], rel_tol=1e-6
+                )
+                for rate in rates
+            )
+        ):
+            return "observed rank NVLink rates do not match required full-rate state"
+    return None
+
+
 def _communication_utilization(
     metrics: dict[str, Any],
     hardware: HardwareProfile,
@@ -879,6 +1030,10 @@ def _communication_utilization(
     ):
         value = observation.get(f"comm_{key}")
         if not _communication_text(value):
+            if observation.get("comm_algorithm") == "twoshot" and _communication_text(
+                observation.get("comm_offline_binding_missing_reason")
+            ):
+                return unavailable(observation["comm_offline_binding_missing_reason"])
             return unavailable(f"communication evidence unavailable: comm_{key}")
     size = metrics["communication_world_size"]
     ranks = observation.get("comm_ranks")
@@ -924,62 +1079,58 @@ def _communication_utilization(
     placement = "single_node" if len(set(hosts)) == 1 else "multi_node"
     if observation.get("comm_placement") != placement:
         return unavailable("communication placement disagrees with ordered rank hosts")
+    twoshot = (
+        observation.get("comm_normalization") == "trtllm_mnnvl_twoshot_remote_payload"
+    )
+    if twoshot:
+        if not (
+            observation.get("comm_algorithm") == "twoshot"
+            and observation.get("comm_offline_binding_verified") is True
+            and observation.get("comm_all_rank_mapping_verified") is True
+        ):
+            return unavailable("MNNVL two-shot route lacks sealed all-rank binding")
     match_fields = (
         "scope",
         "direction",
-        "normalization",
         "placement",
         "transport",
         "topology",
         "backend",
-        "algorithm",
         "protocol",
         "world_size",
+    )
+    # Use the compatible physical endpoint peak already in the capture.
+    # Two-shot normalization remains tied to the observed native route.
+    reference_contract = (
+        ("oneshot", "trtllm_mnnvl_oneshot_remote_payload")
+        if twoshot
+        else (observation.get("comm_algorithm"), observation.get("comm_normalization"))
     )
     matches = [
         capacity
         for capacity in hardware.communication_capacities
-        if all(observation.get(f"comm_{key}") == capacity[key] for key in match_fields)
+        if (capacity["algorithm"], capacity["normalization"]) == reference_contract
+        and all(observation.get(f"comm_{key}") == capacity[key] for key in match_fields)
     ]
     if len(matches) != 1:
         return unavailable(
             "selected route/scope/direction/topology does not uniquely match a sourced communication capacity"
         )
     capacity = matches[0]
+    if twoshot:
+        capacity = {
+            **capacity,
+            "id": f"{capacity['id']}/two-shot-endpoint-reference",
+            "algorithm": "twoshot",
+            "normalization": "trtllm_mnnvl_twoshot_remote_payload",
+            "endpoint_reference_profile_entry_id": capacity["id"],
+            "normalization_reason": "reviewed two-shot peer-unicast scatter and reduced multicast payloads divided by the whole Op GPU span",
+        }
     result["communication_capacity"] = capacity
     if capacity["published_scope"] == "per_link":
-        counts = observation.get("comm_rank_active_link_counts")
-        versions = observation.get("comm_rank_link_versions")
-        rates = observation.get("comm_rank_min_link_rate_bytes_per_second")
-        source = observation.get("comm_link_source")
-        if not _communication_text(source):
-            return unavailable("active NVLink evidence source unavailable")
-        for key, values, expected in (
-            ("active link count", counts, capacity["active_link_count"]),
-            ("link version", versions, capacity["link_version"]),
-        ):
-            if (
-                not isinstance(values, (tuple, list))
-                or len(values) != size
-                or any(type(value) is not int or value != expected for value in values)
-            ):
-                return unavailable(
-                    f"observed rank NVLink {key} does not match capacity"
-                )
-        if (
-            not isinstance(rates, (tuple, list))
-            or len(rates) != size
-            or any(
-                not _positive(rate)
-                or not math.isclose(
-                    rate, capacity["required_link_rate_bytes_per_second"], rel_tol=1e-6
-                )
-                for rate in rates
-            )
-        ):
-            return unavailable(
-                "observed rank NVLink rates do not match required full-rate state"
-            )
+        reason = _nvlink_capacity_missing_reason(capacity, observation, size)
+        if reason is not None:
+            return unavailable(reason)
     if capacity["normalization"] == "nccl_tests_bus_bytes":
         value = metrics["busbw_bytes_per_second"] / capacity["bytes_per_second"]
         if not math.isfinite(value) or value < 0:
@@ -994,15 +1145,17 @@ def _communication_utilization(
         return unavailable(
             "only NCCL-equivalent reference efficiency is available; selected route has no reviewed directional payload model"
         )
+    expected_oneshot = not twoshot
     if (
-        observation.get("comm_payload_model") != "trtllm_mnnvl_oneshot_remote_payload"
-        or observation.get("comm_addressing") != "nvls_multicast"
+        observation.get("comm_payload_model") != capacity["normalization"]
+        or observation.get("comm_addressing")
+        != ("nvlink_peer_unicast_then_nvls_multicast" if twoshot else "nvls_multicast")
         or observation.get("comm_allocator_backend") != "CUDA"
         or not _communication_text(observation.get("comm_allocation_source"))
         or not _communication_text(observation.get("comm_payload_model_source"))
         or type(observation.get("comm_pattern")) is not int
         or observation["comm_pattern"] not in (0, 1)
-        or observation.get("comm_use_oneshot") is not True
+        or observation.get("comm_use_oneshot") is not expected_oneshot
         or observation.get("comm_workspace") != "mnnvl"
         or type(observation.get("comm_payload_element_size")) is not int
         or observation["comm_payload_element_size"] != 2
@@ -1012,19 +1165,54 @@ def _communication_utilization(
         or observation["comm_payload_bytes"] % 16
         or metrics["communication_collectives"] != ["all_reduce_sum"]
     ):
+        algorithm = "two-shot" if twoshot else "one-shot"
         return unavailable(
-            "selected MNNVL one-shot directional payload contract is incomplete or differs from collective cost"
+            f"selected MNNVL {algorithm} directional payload contract is incomplete or differs from collective cost"
         )
     payload = metrics["collective_total_bytes"]
+    rx_payload = (size - 1) * payload
+    model_details = {
+        "tx_definition": "one complete S-byte input stored once to the NVLS multicast mapping",
+        "rx_definition": "(P-1)*S useful bytes from the other ranks delivered to this rank's local replica",
+    }
+    if twoshot:
+        tokens = observation.get("comm_payload_tokens")
+        row_bytes = observation.get("comm_payload_bytes_per_token")
+        if (
+            type(tokens) is not int
+            or tokens <= 0
+            or type(row_bytes) is not int
+            or row_bytes <= 0
+            or row_bytes % 16
+            or tokens * row_bytes != payload
+            or not _communication_text(observation.get("comm_native_kernel"))
+            or type(observation.get("comm_native_kernel_rowid")) is not int
+            or observation["comm_native_kernel_rowid"] <= 0
+        ):
+            return unavailable("MNNVL two-shot native payload geometry unavailable")
+        owned = (tokens + size - 1 - ranks.index(rank)) // size
+        scatter_tx = (tokens - owned) * row_bytes
+        scatter_rx = (size - 1) * owned * row_bytes
+        multicast_tx = owned * row_bytes
+        multicast_rx = scatter_tx
+        rx_payload = scatter_rx + multicast_rx
+        model_details = {
+            "tx_definition": "remote owner scatter plus one multicast injection per owned reduced token",
+            "rx_definition": "peer contributions to owned tokens plus multicast deliveries for nonowned tokens",
+            "owned_tokens": owned,
+            "scatter_tx_payload_bytes": scatter_tx,
+            "scatter_rx_payload_bytes": scatter_rx,
+            "multicast_tx_payload_bytes": multicast_tx,
+            "multicast_rx_payload_bytes": multicast_rx,
+        }
     tx_rate = metrics["algbw_bytes_per_second"]
-    rx_rate = tx_rate * (size - 1)
+    rx_rate = tx_rate * (rx_payload / payload)
     tx_util = tx_rate / capacity["bytes_per_second"]
     rx_util = rx_rate / capacity["bytes_per_second"]
     result.update(
         communication_payload_model={
-            "id": "trtllm_mnnvl_oneshot_remote_payload",
-            "tx_definition": "one complete S-byte input stored once to the NVLS multicast mapping",
-            "rx_definition": "(P-1)*S useful bytes from the other ranks delivered to this rank's local replica",
+            "id": capacity["normalization"],
+            **model_details,
             "unmodeled": [
                 "self-replica physical switch loopback",
                 "packet/encoding overhead",
@@ -1038,14 +1226,16 @@ def _communication_utilization(
             "source": observation["comm_payload_model_source"],
         },
         estimated_comm_tx_payload_bytes=payload,
-        estimated_comm_rx_payload_bytes=(size - 1) * payload,
+        estimated_comm_rx_payload_bytes=rx_payload,
         estimated_comm_tx_payload_bytes_per_second=tx_rate,
         estimated_comm_rx_payload_bytes_per_second=rx_rate,
         estimated_comm_tx_utilization=tx_util,
         estimated_comm_rx_utilization=rx_util,
         estimated_comm_tx_capacity_bytes_per_second=capacity["bytes_per_second"],
         estimated_comm_rx_capacity_bytes_per_second=capacity["bytes_per_second"],
-        communication_bottleneck_direction="rx" if size > 2 else "tx_and_rx",
+        communication_bottleneck_direction=(
+            "rx" if rx_payload > payload else "tx_and_rx"
+        ),
     )
     value = max(tx_util, rx_util)
     if not math.isfinite(value) or value < 0:

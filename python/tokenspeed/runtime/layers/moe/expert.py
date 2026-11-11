@@ -701,6 +701,7 @@ class MoELayer(torch.nn.Module):
                 "topk_output.topk_weights",
             ),
             integer_tensor_args=("topk_output.topk_ids",),
+            integer_tensor_max_elements=8192,
         ),
     )
     def forward(

@@ -634,6 +634,16 @@ def write_run_manifest(output_dir: Path, index: int, run_id: str) -> Path:
                 retain(Path(row["capture_file"]))
             if row.get("binary_payload"):
                 retain(Path(row["binary_payload"]["path"]))
+            if row.get("eager_sidecar") is not None:
+                from tokenspeed_kernel.profile_eager import read_eager_sidecar
+
+                read_eager_sidecar(
+                    row, config_sha256=window.get("profile_config_sha256")
+                )
+                eager = row["eager_sidecar"]
+                name = retain(Path(eager["path"]))
+                if artifacts[name] != eager:
+                    raise ValueError("Run manifest eager sidecar fingerprint mismatch")
         ranks.append(
             {
                 "rank": rank,
@@ -664,6 +674,20 @@ def write_run_manifest(output_dir: Path, index: int, run_id: str) -> Path:
         "ranks": ranks,
         "artifacts": artifacts,
     }
+    communication = sorted(
+        set(graph_dir.glob("rank-*.communication.json"))
+        | set(graph_dir.glob("rank-*.mnnvl-allocation-*.json"))
+    )
+    if communication:
+        from tokenspeed_kernel.profile_communication_inventory import (
+            communication_inventory,
+        )
+
+        sealed = communication_inventory(
+            [path.absolute() for path in communication], run_id=run_id
+        )
+        artifacts.update(sealed)
+        manifest["communication_evidence"] = sorted(sealed)
     for path in sorted(output_dir.glob(f"{index}-service-*.jsonl")):
         retain(path)
     for path in (
@@ -886,14 +910,26 @@ def verify_instrumentation(
         and manifest.get("writer_error") is None
         and manifest.get("unresolved_result_metadata") == 0
     )
-    ready = [json.loads(line) for line in replay_path.read_text().splitlines()]
+    replay_rows = [json.loads(line) for line in replay_path.read_text().splitlines()]
     ready = [
         row
-        for row in ready
+        for row in replay_rows
         if row.get("event") == "device_results_ready"
         and row.get("run_id") == run_id
         and row.get("rank") == 0
     ]
+    bindings = [
+        row for row in replay_rows if row.get("event") == "forward_identity_bound"
+    ]
+    if bindings:
+        from tokenspeed_kernel.profile_eager import merge_forward_binding
+
+        by_step = {row["step_id"]: row for row in ready}
+        for binding in bindings:
+            row = by_step.get(binding["step_id"])
+            if row is None:
+                raise ValueError("Late ForwardId binding lacks a device-ready step")
+            merge_forward_binding(row, binding)
     commits = [
         row
         for row in same_run
@@ -1002,6 +1038,31 @@ def verify_instrumentation(
                     "capture_id": row.get("capture_id"),
                 }
             )
+            if row.get("eager_sidecar") is not None:
+                from tokenspeed_kernel.profile_eager import read_eager_sidecar
+
+                capture = read_eager_sidecar(
+                    row, config_sha256=manifest.get("profile_config_sha256")
+                )
+                expected_scopes = sorted(
+                    item["nvtx_id"] for item in capture["device_analysis"]["scopes"]
+                )
+                expected_layers = sorted(
+                    {
+                        item["layer_id"]
+                        for item in capture["layers"]
+                        if type(item.get("layer_id")) is int
+                    }
+                )
+                if not capture["ops"] or expected_layers != expected_model_layers:
+                    problems.append("eager_scope_metadata_incomplete")
+                report["forward_evidence"][-1].update(
+                    eager_sidecar=row["eager_sidecar"],
+                    attribution_mode="eager_nvtx_gpu_projection",
+                    expected_scope_ids=expected_scopes,
+                    expected_layer_ids=expected_layers,
+                )
+                continue
             payload = row.get("binary_payload")
             capture_file = row.get("capture_file")
             if (
@@ -1095,23 +1156,40 @@ def verify_native_coverage(
         "rank": 0,
         "scope": "model_layer_op",
         "coverage_mode": metadata["requested_coverage_mode"],
-        "attribution": "same_run_cuda_graph_node_ids",
-        "status": "verified",
         "source_metadata_sha256": hashlib.sha256(
             metadata_path.read_bytes()
         ).hexdigest(),
     }
-    if any(native.get(key) != value for key, value in expected.items()):
+    attribution = native.get("attribution")
+    mixed = attribution == "same_run_graph_and_eager_native_activities"
+    if (
+        any(native.get(key) != value for key, value in expected.items())
+        or attribution
+        not in {
+            "same_run_cuda_graph_node_ids",
+            "same_run_graph_and_eager_native_activities",
+        }
+        or native.get("status") not in {"partial", "verified"}
+        or (mixed and not native.get("source_provenance", {}).get("eager_projection"))
+    ):
         result["native_graph_ownership"] = (
             "invalid_native_receipt_identity_or_metadata_hash"
         )
         return result
     source = native.get("source_nsight_report", {})
     report_path = Path(source.get("path", ""))
-    if not report_path.is_file() or hashlib.sha256(
-        report_path.read_bytes()
-    ).hexdigest() != source.get("sha256"):
+    if not report_path.is_file() or artifact_source(report_path)[
+        "sha256"
+    ] != source.get("sha256"):
         result["native_graph_ownership"] = "native_report_hash_unverified"
+        return result
+    selected = {
+        item["forward_id"]
+        for request in metadata["requests"].values()
+        for item in request["forward_evidence"]
+    }
+    if mixed and native.get("selected_forward_ids") != sorted(selected):
+        result["native_graph_ownership"] = "native_forward_identity_mismatch"
         return result
     for key, request in metadata["requests"].items():
         evidence = native.get("requests", {}).get(key, {})
@@ -1141,11 +1219,31 @@ def verify_native_coverage(
                 )
                 return result
             row = matches[0]
+            eager = expected_forward.get("eager_sidecar")
+            if (
+                eager is not None
+                and (
+                    not mixed
+                    or row.get("attribution_mode") != "eager_nvtx_gpu_projection"
+                    or row.get("eager_sidecar") != eager
+                )
+                or eager is None
+                and mixed
+                and row.get("attribution_mode") != "cuda_graph_node_ids"
+            ):
+                result["native_graph_ownership"] = "native_attribution_source_mismatch"
+                return result
+            if native["status"] == "partial":
+                continue
             layers, scopes = row.get("layer_coverage", {}), row.get(
                 "scope_coverage", {}
             )
             if (
-                not row.get("graph_node_ids")
+                (
+                    not row.get("graph_node_ids")
+                    if eager is None
+                    else not row.get("eager_native_timing", {}).get("activities")
+                )
                 or set(row.get("scope_kinds", [])) != {"model", "layer", "op"}
                 or row.get("critical_unknowns") != []
                 or layers.get("expected_ids") != expected_forward["expected_layer_ids"]
@@ -1162,16 +1260,22 @@ def verify_native_coverage(
                     "native_scope_or_node_attribution_incomplete"
                 )
                 return result
-    result.update(
-        status="verified",
-        verified_scope="model_layer_op",
-        native_graph_ownership="verified",
-        model_layer_op_overhead="eligible_with_matching_token_and_cache_windows",
-        native_evidence={
-            "path": str(path),
-            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-        },
-    )
+    result["native_evidence"] = {
+        "path": str(path),
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "status": native["status"],
+        "attribution": attribution,
+        "critical_unknowns": native.get("critical_unknowns", []),
+        "whole_run_status": native.get("whole_run_status", "not_verified"),
+        "whole_run_critical_unknowns": native.get("whole_run_critical_unknowns", []),
+    }
+    result["native_graph_ownership"] = native["status"]
+    if native["status"] == "verified":
+        result.update(
+            status="verified",
+            verified_scope="model_layer_op",
+            model_layer_op_overhead="eligible_with_matching_token_and_cache_windows",
+        )
     return result
 
 

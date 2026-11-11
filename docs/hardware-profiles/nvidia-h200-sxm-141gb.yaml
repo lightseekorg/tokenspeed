@@ -4,6 +4,8 @@ name: "NVIDIA H200 SXM 141GB (up to 700W, one full GPU)"
 device:
   vendor: "NVIDIA"
   sku: "H200"
+  # Official H200 compute capability: nvidia-cuda-gpus source below.
+  compute_capability: "9.0"
   form_factor: "SXM"
   memory_gb: 141
   power_watts: 700
@@ -19,7 +21,31 @@ compute_flops_per_second:
   fp16_tensor: 989500000000000
   fp8_e4m3_tensor: 1979000000000000
   fp32_simt: 67000000000000
+  bf16_simt: 134000000000000
+  tf32_tensor: 494500000000000
 compute_metadata:
+  bf16_simt:
+    kind: "derived"
+    precision: "bf16"
+    engine: "simt"
+    sparsity: "dense"
+    source_id: "nvidia-cuda-throughput"
+    derivation:
+      base_compute_type: "fp32_simt"
+      throughput_ratio: 2
+      compute_capability: "9.0"
+      source_id: "nvidia-cuda-throughput"
+      reference: "cc9_scalar_fma_throughput_ratio"
+      explanation: "CC9.0 native16-bit scalar throughput256 / FP32 throughput128; FMA reference ratio at the same product theoretical clock. Packed BF16x2 consists of two scalar results, not matrix MMA. Derived from FP32 product peak67TFLOP/s, not a published BF16 SIMT product peak."
+  tf32_tensor:
+    precision: "tf32"
+    engine: "tensor"
+    sparsity: "dense"
+    source_id: "nvidia-spec"
+    published_value: 989
+    published_unit: "TFLOP/s"
+    published_sparsity: "sparse"
+    dense_conversion_factor: 0.5
   bf16_tensor:
     precision: "bf16"
     engine: "tensor"
@@ -58,11 +84,108 @@ compute_metadata:
     dense_conversion_factor: 1.0
 hbm_bytes_per_second: 4800000000000
 bandwidth_source_id: "nvidia-spec"
+# Conditional endpoint reference for the documented eight-GPU H200 SXM board.
+# Eighteen full-rate links × 25 GB/s per direction. The raw 26.562 GB/s
+# driver observation checks the active-link state.
+communication_capacities:
+  - &trtllm_ipc_oneshot
+    id: "nvlink4-eighteen-link-trtllm-ipc-oneshot"
+    bytes_per_second: 450000000000
+    bidirectional_bytes_per_second: 900000000000
+    scope: "per_rank"
+    direction: "one_direction"
+    normalization: "nccl_tests_bus_bytes"
+    placement: "single_node"
+    topology: "single_node_nvswitch"
+    transport: "nvlink"
+    backend: "trtllm"
+    algorithm: "oneshot"
+    protocol: "lamport"
+    world_size: 8
+    source_id: "nvidia-hopper-nvlink4"
+    conversion_source_id: "nvidia-hopper-nvlink4"
+    normalization_source_id: "nvidia-nccl-tests"
+    published_value: 25
+    published_unit: "GB/s"
+    published_direction: "one_direction"
+    published_scope: "per_link"
+    conversion_factor: 1
+    active_link_count: 18
+    link_generation: "4.0"
+    nvlink_board:
+      pci_device_id: 0x233510de
+      pci_subsystem_id: 0x18be10de
+      switch_count: 4
+      pci_source_id: "nvidia-supported-gpus"
+      generation_source_id: "nvidia-hgx-h200-topology"
+      switch_source_id: "nvidia-hgx-h200-fabric-manager"
+    required_link_rate_bytes_per_second: 26562000000
+    conversion_reason: "NVIDIA specifies NVLink 4 at 25 GB/s per link per direction. The observed H200 PCI identities, full GPUs, common four NVSwitch endpoints, NV18 peer matrix and 18 full-rate links per rank establish the documented board configuration. The reference is 450 GB/s per direction per rank and 900 GB/s for the symmetric bidirectional sum."
+    normalization_reason: "NCCL-tests equivalent AllReduce bytes divided by the whole fused or pure Op GPU span, referenced to one endpoint's one-direction theoretical NVLink capacity. Lamport one/two-shot remote loads do not transfer exactly these equivalent bytes; this ratio is an estimated normalized reference efficiency, not physical link saturation or protocol payload utilization. Actual selected NVLink transport and the exact IPC route must be evidenced."
+  - <<: *trtllm_ipc_oneshot
+    id: "nvlink4-eighteen-link-trtllm-ipc-twoshot"
+    algorithm: "twoshot"
+  - <<: *trtllm_ipc_oneshot
+    id: "nvlink4-eighteen-link-trtllm-mnnvl-oneshot"
+    algorithm: "oneshot"
+    protocol: "mnnvl"
+    normalization: "trtllm_mnnvl_oneshot_remote_payload"
+    normalization_source_id: "nvidia-cuda-multicast"
+    addressing_source_id: "nvidia-cuda-multicast"
+    normalization_reason: "Custom MNNVL one-shot useful remote-payload model: for full input S bytes and P ranks, each rank injects S bytes once to the CUDA NVLS multicast mapping and receives (P-1)*S useful payload bytes from other ranks at its local replica. Divide each directional payload by the whole pure/fused Op GPU span and its450GB/s directional reference; report the larger modeled ratio, not the sum of TX and RX. NCCL-tests AlgBW/BusBW remain independent. Self-replica physical loopback, packet/encoding/retry/control overhead are unmodeled; local Lamport polling, dirty-clear, register reduction and epilogue are not remote payload. This is estimated directional useful-payload utilization, not physical TX/RX occupancy, switch bisection or measured saturation. Require actual CUDA allocator/mapping evidence, selected one-shot pattern0/1, exact single-node NVSwitch rank placement and full active-link predicates. Multi-node and unverified mappings remain unavailable."
 sources:
+  -
+    id: "nvidia-cuda-throughput"
+    title: "CUDA C++ Programming Guide12.8.2 arithmetic throughput Table4"
+    url: "https://docs.nvidia.com/cuda/archive/12.8.2/cuda-c-programming-guide/index.html#arithmetic-instructions"
+    accessed: "2026-11-09"
+    document_version: "CC9.0 scalar native16-bit256 and FP32128 results/SM/cycle; BF16 packed intrinsic guidance5.4.1.1"
+  -
+    id: "nvidia-cuda-gpus"
+    title: "NVIDIA CUDA GPU Compute Capability"
+    url: "https://developer.nvidia.com/cuda/gpus"
+    accessed: "2026-11-09"
+    document_version: "H200 listed under compute capability9.0"
   -
     id: "nvidia-spec"
     title: "NVIDIA H200 GPU official product specifications"
     url: "https://www.nvidia.com/en-us/data-center/h200/"
-    accessed: "2026-11-04"
-    document_version: "live product page, H200 SXM column; preliminary specifications; accessed 2026-11-04"
-source: "NVIDIA H200 GPU official product specifications; live product page, H200 SXM column; preliminary specifications; accessed 2026-11-04. SXM 141GB, one full GPU, not a multi-GPU NVLink pair or MIG slice. Dense Tensor Core peak is half the sparse published rate; FP32 SIMT and HBM bandwidth are unchanged. Decimal units. power_watts is the nominal maximum configurable TDP, not an observed power limit. Selection is explicit; device names alone do not prove form factor or TDP."
+    accessed: "2026-11-09"
+    document_version: "live product page, H200 SXM column; preliminary specifications; accessed 2026-11-09"
+  -
+    id: "nvidia-hopper-nvlink4"
+    title: "NVIDIA Hopper Architecture In-Depth, fourth-generation NVLink"
+    url: "https://developer.nvidia.com/blog/nvidia-hopper-architecture-in-depth/"
+    accessed: "2026-11-09"
+    document_version: "NVLink4 per-link directional definition; H100 aggregate link count is not used"
+  -
+    id: "nvidia-supported-gpus"
+    title: "NVIDIA R550 supported GPU products"
+    url: "https://download.nvidia.com/XFree86/Linux-x86_64/550.120/README/supportedchips.html"
+    accessed: "2026-11-11"
+    document_version: "550.120; H200 PCI device 2335 and subsystem 10DE:18BE"
+  -
+    id: "nvidia-hgx-h200-topology"
+    title: "NVIDIA HGX AI Factory reference architecture"
+    url: "https://docs.nvidia.com/enterprise-reference-architectures/hgx-ai-factory-h100-h200-b200/latest/components.html"
+    accessed: "2026-11-11"
+    document_version: "Table 2; eight H200 SXM GPUs, third-generation NVSwitch and fourth-generation NVLink"
+  -
+    id: "nvidia-hgx-h200-fabric-manager"
+    title: "NVIDIA Fabric Manager user guide"
+    url: "https://docs.nvidia.com/datacenter/tesla/fabric-manager-user-guide/#supported-virtual-machine-configurations"
+    accessed: "2026-11-11"
+    document_version: "Table 6 and H200 topology note; four NVSwitches and 18 active NVLinks per GPU in the eight-GPU configuration"
+  -
+    id: "nvidia-nccl-tests"
+    title: "NVIDIA NCCL-tests performance and bus bandwidth convention"
+    url: "https://github.com/NVIDIA/nccl-tests/blob/master/doc/PERFORMANCE.md"
+    accessed: "2026-11-05"
+    document_version: "AllReduce/AllGather/ReduceScatter equivalent per-rank traffic convention"
+  -
+    id: "nvidia-cuda-multicast"
+    title: "NVIDIA CUDA C++ Programming Guide12.6, multicast support"
+    url: "https://docs.nvidia.com/cuda/archive/12.6.3/cuda-c-programming-guide/index.html#multicast-support"
+    accessed: "2026-11-05"
+    document_version: "CUDA12.6.3; cuMulticastCreate/AddDevice/BindMem mappings use NVLink SHARP with NVSwitch"
+source: "NVIDIA H200 GPU official product specifications; live product page, H200 SXM column; preliminary specifications; accessed 2026-11-09. SXM 141GB, one full GPU, not a multi-GPU NVLink pair or MIG slice. Dense Tensor Core peak is half the sparse published rate; FP32 SIMT and HBM bandwidth are unchanged. Decimal units. power_watts is the nominal maximum configurable TDP, not an observed power limit. Selection is explicit; device names alone do not prove form factor or TDP. H200 compute capability9.0 is listed by NVIDIA CUDA GPU Compute Capability. BF16 SIMT134TFLOP/s is derived from the reviewed CC9.0 scalar FMA-reference throughput ratio2 and the FP32 product peak, not a published BF16 SIMT product specification. Conditional450GB/s communication references require every participating rank to prove eighteen full-rate NVLink4 links, exact single-node NVSwitch placement and the selected reviewed route; missing evidence remains unavailable."

@@ -36,10 +36,39 @@ from tokenspeed_kernel.op_profile import (
     OpCost,
     OpRecord,
     TensorDescription,
-    _profile_config_for_observation,
     _profile_include_search_roots,
+    _profile_observed_configs,
     _profile_validate_startup_observation,
 )
+
+
+def _eager_host_control_input(
+    op_name,
+    implementation,
+    source_sha256,
+    name,
+    *,
+    device,
+    dtype,
+    shape,
+    stride,
+    storage_offset,
+    logical_bytes,
+) -> bool:
+    """Identify the reviewed prefill descriptor that never reaches CUDA."""
+    return (
+        op_name == "conv.causal_conv1d_prefill"
+        and implementation == "triton_causal_conv1d_prefill"
+        and source_sha256
+        == "c42179c6e4c51d784ad9dc259094d9b5177b2ac121eae67874dd7cf966b22d5e"
+        and name == "prefill_metadata.cu_seqlens_cpu"
+        and device == "cpu"
+        and dtype == "torch.int64"
+        and tuple(shape) == (2,)
+        and tuple(stride) == (1,)
+        and storage_offset == 0
+        and logical_bytes == 16
+    )
 
 
 def _include_search_error(observed: dict, baseline: dict, reviewed: list) -> str | None:
@@ -124,7 +153,7 @@ def register_selected_engine_resolver(
     supplementary: bytes | None = None,
     supplementary_sha256: str | None = None,
 ) -> None:
-    """Use caller-reviewed immutable guards after the native exact-node join.
+    """Use caller-reviewed immutable guards after an exact native scope join.
 
     This is an offline cost provider, never a trace-selected import or runtime
     execution selector. The explicit caller owns semantic review of the guard
@@ -136,6 +165,8 @@ def register_selected_engine_resolver(
     capture. Its exact run/rank/process/capture binding is mandatory; it never
     mutates that capture or claims historical module-byte identity. Without it,
     source contracts consume the collector's automatic final-flush provenance.
+    Reviewed bindings default to Graph. An explicit attribution_modes entry
+    can enable the same guard checks over eager runtime/activity rows.
     """
     digest = hashlib.sha256(definitions).hexdigest()
     if digest != expected_sha256:
@@ -168,6 +199,19 @@ def register_selected_engine_resolver(
                 )
     rules = document["bindings"]
     for rule in rules:
+        modes = rule.get("attribution_modes", ["cuda_graph_node_ids"])
+        if (
+            not isinstance(modes, list)
+            or not modes
+            or any(
+                mode not in ("cuda_graph_node_ids", "eager_nvtx_gpu_projection")
+                for mode in modes
+            )
+            or len(set(modes)) != len(modes)
+        ):
+            raise ValueError(
+                "Unsupported or duplicate reviewed native attribution mode"
+            )
         divisor = rule.get("tensor_alignment_divisor", 1)
         if type(divisor) is not int or divisor < 1 or divisor > 256 or 256 % divisor:
             raise ValueError("Alignment guard must be provable from modulo256")
@@ -284,7 +328,7 @@ def register_selected_engine_resolver(
             json.dumps(item, sort_keys=True) for item in case["native_launches"]
         )
 
-    def source_provenance(rule, context, libraries):
+    def source_provenance(rule, context, libraries, worker):
         guards = rule.get("source_provenance")
         if guards is None:
             return None, None
@@ -299,8 +343,7 @@ def register_selected_engine_resolver(
         if (
             not isinstance(observed, dict)
             or observed.get("schema") != "tokenspeed.fp8_source_provenance/v1"
-            or observed.get("process_id")
-            != context["replay_identity"].get("process_id")
+            or observed.get("process_id") != worker.get("process_id")
         ):
             return None, "same-process semantic source/cache provenance unavailable"
         sources = {}
@@ -406,18 +449,23 @@ def register_selected_engine_resolver(
                 body = _profile_validate_startup_observation(
                     observation, run_id=context["run_id"]
                 )
-                expected_config = _profile_config_for_observation(
-                    observation, run_id=context["run_id"]
-                )
-                expected_config_sha = hashlib.sha256(
-                    json.dumps(
-                        expected_config,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                        allow_nan=False,
-                    ).encode()
-                ).hexdigest()
-                if source_context["profile_config_sha256"] != expected_config_sha:
+                expected_config_hashes = {
+                    hashlib.sha256(
+                        json.dumps(
+                            config,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            allow_nan=False,
+                        ).encode()
+                    ).hexdigest()
+                    for config in _profile_observed_configs(
+                        observation, run_id=context["run_id"]
+                    )
+                }
+                if (
+                    source_context["profile_config_sha256"]
+                    not in expected_config_hashes
+                ):
                     return (
                         None,
                         "expanded config differs from before-Engine observation",
@@ -531,7 +579,7 @@ def register_selected_engine_resolver(
                     "source/API/compiler/include lifetime does not predate before-Engine observation",
                 )
         if (
-            context["replay_identity"]["process_id"] not in worker_pids
+            worker["process_id"] not in worker_pids
             or type(lower) is not int
             or type(upper) is not int
             or lower >= upper
@@ -743,6 +791,28 @@ def register_selected_engine_resolver(
         ]
         if not candidates or not cost.useful_flops:
             return None
+        mode = context.get("attribution_mode", "cuda_graph_node_ids")
+        eager = mode == "eager_nvtx_gpu_projection"
+        device_tensors = [
+            value
+            for name, value in op.inputs.items()
+            if not (
+                eager
+                and _eager_host_control_input(
+                    op.op_name,
+                    op.implementation,
+                    op.scalar_args.get("profile_source_sha256"),
+                    name,
+                    device=value.device,
+                    dtype=value.dtype,
+                    shape=value.shape,
+                    stride=value.stride,
+                    storage_offset=value.storage_offset,
+                    logical_bytes=value.logical_bytes,
+                )
+            )
+        ] + list(op.outputs.values())
+        worker = context.get("eager_step_identity" if eager else "replay_identity", {})
         base = {
             key: context.get(key)
             for key in (
@@ -755,6 +825,15 @@ def register_selected_engine_resolver(
                 "native_device_uuids",
             )
         }
+        if eager:
+            for key in ("capture_sha256", "replay_identity", "source_node_ids"):
+                del base[key]
+            base.update(
+                attribution_mode=mode,
+                eager_step_identity=worker,
+                eager_sidecar=context["eager_sidecar"],
+                source_report_sha256=context["source_report_sha256"],
+            )
         base["definitions_sha256"] = digest
         failures = []
         accepted = []
@@ -764,23 +843,40 @@ def register_selected_engine_resolver(
             libraries = context.get("loaded_library_manifest")
             native = context.get("activity_bindings", [])
             signature = tensor_signature(op)
-            if not context.get("complete_join"):
-                failure = "incomplete exact native scope/source-node join"
-            elif any(
-                type(item.get("source_rowid")) is not int
-                or item["source_rowid"] < 1
-                or type(item.get("node")) is not int
-                or item.get("source") not in context["source_node_ids"]
-                for item in native
-            ) or len({(item["table"], item["source_rowid"]) for item in native}) != len(
-                native
+            identities = {(item["table"], item.get("source_rowid")) for item in native}
+            if mode not in rule.get("attribution_modes", ["cuda_graph_node_ids"]):
+                failure = "execution path has no reviewed native engine contract"
+            elif not context.get("complete_join"):
+                failure = (
+                    context.get("incomplete_join_reason")
+                    or "incomplete exact native scope/source-node join"
+                )
+            elif (
+                not native
+                or any(
+                    type(item.get("source_rowid")) is not int
+                    or item["source_rowid"] < 1
+                    for item in native
+                )
+                or len(identities) != len(native)
             ):
                 failure = "missing or duplicate native activity identity"
-            elif len(
-                {value.device for value in (*op.inputs.values(), *op.outputs.values())}
-            ) != 1 or any(
-                not value.device.startswith("cuda:")
-                for value in (*op.inputs.values(), *op.outputs.values())
+            elif eager and any(
+                type(item.get("runtime_rowid")) is not int
+                or item["runtime_rowid"] < 1
+                or item.get("process_id") != worker.get("process_id")
+                or item.get("thread_id") != worker.get("thread_id")
+                for item in native
+            ):
+                failure = "missing exact eager runtime activity identity"
+            elif not eager and any(
+                type(item.get("node")) is not int
+                or item.get("source") not in context["source_node_ids"]
+                for item in native
+            ):
+                failure = "missing or duplicate native activity identity"
+            elif len({value.device for value in device_tensors}) != 1 or any(
+                not value.device.startswith("cuda:") for value in device_tensors
             ):
                 failure = "boundary tensors do not share one CUDA device"
             elif (
@@ -791,7 +887,7 @@ def register_selected_engine_resolver(
             elif rule.get("tensor_alignment_divisor") is not None and any(
                 value.pointer_mod256 is None
                 or value.pointer_mod256 % rule["tensor_alignment_divisor"]
-                for value in (*op.inputs.values(), *op.outputs.values())
+                for value in device_tensors
             ):
                 failure = "required actual tensor alignment unavailable or unmatched"
             elif not matches(op.scalar_args, rule.get("scalar_args", {})):
@@ -830,8 +926,7 @@ def register_selected_engine_resolver(
             elif (
                 not isinstance(libraries, dict)
                 or libraries.get("schema") != "tokenspeed.loaded_libraries/v1"
-                or libraries.get("process_id")
-                != context["replay_identity"].get("process_id")
+                or libraries.get("process_id") != worker.get("process_id")
                 or libraries.get("unavailable_reason")
             ):
                 failure = "same-process run-owned loaded-library manifest unavailable"
@@ -904,7 +999,9 @@ def register_selected_engine_resolver(
                 if not set(rule.get("source_file_sha256s", [])) <= actual_sources:
                     failure = "reviewed installed source-file proof unavailable"
                 if failure is None:
-                    source_proof, failure = source_provenance(rule, context, libraries)
+                    source_proof, failure = source_provenance(
+                        rule, context, libraries, worker
+                    )
             if failure:
                 failures.append(f"{rule['contract_id']}: {failure}")
                 continue
@@ -1516,8 +1613,6 @@ class _VarlenAttentionCost:
             or any(
                 name in op.inputs
                 for name in (
-                    "seqused_q",
-                    "seqused_k",
                     "qv",
                     "q_descale",
                     "k_descale",
@@ -1555,9 +1650,10 @@ class _VarlenAttentionCost:
             raise ValueError(
                 "Variable-length attention requires matching native packed Q/K/V and output"
             )
-        offsets = []
+        lengths = []
         metadata_bytes = 0
-        for name, total in (("cu_seqlens_q", q.shape[0]), ("cu_seqlens_k", k.shape[0])):
+        for axis, total in (("q", q.shape[0]), ("k", k.shape[0])):
+            name = f"cu_seqlens_{axis}"
             values = op.tensor_values.get(name)
             if values is None:
                 raise ValueError(
@@ -1577,24 +1673,44 @@ class _VarlenAttentionCost:
                 raise ValueError(
                     "Cumulative attention lengths do not partition the packed tensors"
                 )
-            offsets.append(values)
             metadata_bytes += description.logical_bytes
-        if len(offsets[0]) != len(offsets[1]):
+            capacities = tuple(right - left for left, right in zip(values, values[1:]))
+            name = f"seqused_{axis}"
+            used = op.inputs.get(name)
+            if used is not None:
+                values = op.tensor_values.get(name)
+                if (
+                    values is None
+                    or used.shape != (len(capacities),)
+                    or used.dtype != "torch.int32"
+                    or used.device != q.device
+                    or len(values) != len(capacities)
+                    or any(
+                        type(length) is not int or not 0 <= length <= capacity
+                        for length, capacity in zip(values, capacities, strict=True)
+                    )
+                ):
+                    raise ValueError(
+                        f"{name} live lengths unavailable or out of bounds"
+                    )
+                metadata_bytes += used.logical_bytes
+                lengths.append(values)
+            else:
+                lengths.append(capacities)
+        if len(lengths[0]) != len(lengths[1]):
             raise ValueError(
                 "Query and KV cumulative lengths have different request counts"
             )
         flops = sum(
             AttentionMatmulCost._matmul_flops(
                 query_heads=q.shape[1],
-                query_length=qe - qs,
-                kv_length=ke - ks,
+                query_length=query_length,
+                kv_length=kv_length,
                 qk_head_dim=q.shape[2],
                 value_head_dim=v.shape[2],
                 mask="causal_lower_right" if causal else "full",
             )
-            for qs, qe, ks, ke in zip(
-                offsets[0], offsets[0][1:], offsets[1], offsets[1][1:]
-            )
+            for query_length, kv_length in zip(*lengths, strict=True)
         )
         reads = q.logical_bytes + k.logical_bytes + v.logical_bytes + metadata_bytes
         writes = sum(t.logical_bytes for t in op.outputs.values())
@@ -1610,7 +1726,7 @@ class _VarlenAttentionCost:
             assumptions=(
                 "packed native Q/K/V with exact per-request lengths and lower-right causal alignment",
                 "useful QK/PV work only; softmax, scaling, softcap and padding excluded",
-                "logical boundary IO counted once, including cumulative-length arguments and returned LSE",
+                "logical boundary IO counted once, including offsets, optional live lengths and returned LSE",
                 "HBM estimate excludes tiling reloads, intermediate workspace and cache effects",
             ),
             compute_type=_matmul_compute_type(op, q, k, v),

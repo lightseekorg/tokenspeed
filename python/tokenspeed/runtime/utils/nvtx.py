@@ -41,27 +41,29 @@ from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.utils.env import envs
 
-if current_platform().is_nvidia:
-    import nvtx
-    from nvtx.colors import _NVTX_COLORS
-else:
-    nvtx = None
-    _NVTX_COLORS = ()
-
 NVTX_DOMAIN: str = "tokenspeed"
+_enabled: bool = envs.TOKENSPEED_NVTX.get()
 
-# Built-in colors — keeping tokenspeed self-contained (no matplotlib
-# dependency for color resolution). Anything else falls back to "blue"
-# rather than crashing the server.
-_VALID_COLORS = frozenset(c for c in _NVTX_COLORS if c is not None)
 
-_nvtx_available = nvtx is not None
-_enabled: bool = _nvtx_available and envs.TOKENSPEED_NVTX.get()
+@functools.cache
+def _nvtx_backend():
+    if not current_platform().is_nvidia:
+        return None, frozenset()
+    try:
+        import nvtx
+        from nvtx.colors import _NVTX_COLORS
+    except ModuleNotFoundError as error:
+        if error.name != "nvtx":
+            raise
+        raise RuntimeError(
+            "NVTX ranges require the tokenspeed-kernel[nvtx] extra"
+        ) from error
+    return nvtx, frozenset(color for color in _NVTX_COLORS if color is not None)
 
 
 def set_nvtx_enabled(enabled: bool) -> None:
     global _enabled
-    _enabled = _nvtx_available and enabled
+    _enabled = enabled
 
 
 class _Range:
@@ -79,17 +81,21 @@ class _Range:
 
     def __enter__(self):
         if _enabled:
-            nvtx.push_range(
-                message=self.name,
-                color=self.color,
-                domain=NVTX_DOMAIN,
-                category=self.category,
-            )
+            nvtx, valid_colors = _nvtx_backend()
+            if nvtx is not None:
+                nvtx.push_range(
+                    message=self.name,
+                    color=self.color if self.color in valid_colors else "blue",
+                    domain=NVTX_DOMAIN,
+                    category=self.category,
+                )
         return self
 
     def __exit__(self, *exc):
         if _enabled:
-            nvtx.pop_range(domain=NVTX_DOMAIN)
+            nvtx, _ = _nvtx_backend()
+            if nvtx is not None:
+                nvtx.pop_range(domain=NVTX_DOMAIN)
         return False
 
     def __call__(self, func):
@@ -99,8 +105,14 @@ class _Range:
         def wrapper(*args, **kwargs):
             if not _enabled:
                 return func(*args, **kwargs)
+            nvtx, valid_colors = _nvtx_backend()
+            if nvtx is None:
+                return func(*args, **kwargs)
             nvtx.push_range(
-                message=name, color=color, domain=NVTX_DOMAIN, category=category
+                message=name,
+                color=color if color in valid_colors else "blue",
+                domain=NVTX_DOMAIN,
+                category=category,
             )
             try:
                 return func(*args, **kwargs)
@@ -116,6 +128,4 @@ def nvtx_range(
     color: str = "blue",
     category: str | None = None,
 ) -> _Range:
-    if color not in _VALID_COLORS:
-        color = "blue"
     return _Range(name, color, category)

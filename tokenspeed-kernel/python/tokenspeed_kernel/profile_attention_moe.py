@@ -503,8 +503,7 @@ def grouped_expert_cost(op, *, hbm_policy):
     }
     _require_contract(
         op,
-        metadata=tuple(names.values())
-        + ("logical_batch", "query_width", "dcp_size", "do_finalize"),
+        metadata=tuple(names.values()) + ("logical_batch", "dcp_size", "do_finalize"),
         inputs=(
             "self.w13_weight",
             "self.w2_weight",
@@ -517,6 +516,14 @@ def grouped_expert_cost(op, *, hbm_policy):
         **op.scalar_args,
         **{name: op.scalar_args[source] for name, source in names.items()},
     }
+    batch, width = a["logical_batch"], a.get("query_width")
+    logical_tokens = a.get("logical_tokens")
+    if logical_tokens is None or width is not None:
+        if type(batch) is not int or type(width) is not int or batch < 1 or width < 1:
+            raise ValueError("Actual logical batch/query width unavailable")
+        if logical_tokens is not None and logical_tokens != batch * width:
+            raise ValueError("Live token count differs from logical batch/query width")
+        logical_tokens = batch * width
     aliases = {
         "w13": "self.w13_weight",
         "w2": "self.w2_weight",
@@ -538,7 +545,6 @@ def grouped_expert_cost(op, *, hbm_policy):
             type(a[name]) is not int or a[name] < 1
             for name in (
                 "logical_batch",
-                "query_width",
                 "hidden_dim",
                 "num_experts",
                 "local_experts",
@@ -548,6 +554,8 @@ def grouped_expert_cost(op, *, hbm_policy):
             )
         )
         or type(a["ep_rank"]) is not int
+        or type(logical_tokens) is not int
+        or logical_tokens < 1
     ):
         raise ValueError("Actual logical/expert parallel geometry unavailable")
     if len(inputs["w2"].shape) != 3:
@@ -558,7 +566,7 @@ def grouped_expert_cost(op, *, hbm_policy):
     inputs["routes"] = replace(ids, shape=(prod(ids.shape),), stride=(1,))
     a.update(
         allocated_intermediate=inputs["w2"].shape[-1],
-        logical_tokens=a["logical_batch"] * a["query_width"],
+        logical_tokens=logical_tokens,
         shared_projection="shared_input" in op.inputs,
     )
     values = {"routes": op.tensor_values.get("topk_output.topk_ids")}

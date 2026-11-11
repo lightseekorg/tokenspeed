@@ -292,6 +292,49 @@ def test_ready_result_writer_persists_binary_before_slot_reuse(
     collector.close()
 
 
+def test_eager_reservation_is_bounded_and_independent_of_graph_slots(
+    tmp_path, cpu_gpu_allocations
+):
+    collector = GraphReplayCollector(
+        output=tmp_path / "replays.jsonl",
+        metadata_slots=1,
+        max_metadata_bytes=64,
+        max_steps=3,
+    )
+
+    def step(number):
+        return ProfileStep(
+            owner=collector,
+            run_id="test",
+            rank=0,
+            serving_step=number,
+            request_ids=("request",),
+            pool_indices=(7,),
+        )
+
+    try:
+        first, second, third = (step(number) for number in (1, 2, 3))
+        with pytest.raises(RuntimeError, match="forward failed"):
+            with collector.reserve_eager_metadata(first) as reserved:
+                assert reserved
+                assert collector.slots.reserve("graph")[0] is not None
+                with collector.reserve_eager_metadata(second) as overflow:
+                    assert not overflow
+                event = object()
+                second.bind_result_event(event)
+                second.device_results_ready(event)
+                raise RuntimeError("forward failed")
+        with collector.reserve_eager_metadata(third) as reserved:
+            assert reserved
+        state = collector.flush_ready()
+        row = json.loads(collector.output.read_text())
+        assert row["step_id"] == second.step_id and row["device_ready_sequence"] == 1
+        assert row["unavailable_reason"] == "metadata_dropped:eager_postwindow_capacity"
+        assert state["dropped_metadata"] == 1 and state["persisted_eager"] == 0
+    finally:
+        collector.close()
+
+
 def test_failed_persistence_retains_lease_and_reports_missing(
     tmp_path, cpu_gpu_allocations
 ):

@@ -49,7 +49,7 @@ from tokenspeed_kernel.profile_graph import (
     ProfileStep,
     ProfileWindow,
 )
-from tokenspeed_kernel.profile_nvtx import NvtxTimeline
+from tokenspeed_kernel.profile_nvtx import NvtxTimeline, NvtxUnavailableError
 from tokenspeed_kernel.profile_utilization import HardwareProfile
 
 from tokenspeed.runtime.utils.host_sync import allow_host_sync
@@ -72,7 +72,6 @@ class UtilizationProfileConfig:
     num_steps: int
     max_scopes: int
     hbm_policy: str
-    library: str | None = _PROFILE_CONFIG_DEFAULTS["library"]
     cuda_runtime_library: str | None = _PROFILE_CONFIG_DEFAULTS["cuda_runtime_library"]
     cupti_library: str | None = _PROFILE_CONFIG_DEFAULTS["cupti_library"]
     max_metadata_bytes: int = _PROFILE_CONFIG_DEFAULTS["max_metadata_bytes"]
@@ -126,9 +125,6 @@ class RuntimeUtilizationProfile:
         )
         self.graph_enabled = graph_enabled
         self.hardware = HardwareProfile.from_file(config.hardware)
-        self.library = (
-            Path(config.library).resolve(strict=True) if config.library else None
-        )
         self.output = Path(config.output_dir) / f"rank-{rank}.metrics.json"
         self.costs = CostRegistry()
         register_compute_costs(self.costs, hbm_policy=config.hbm_policy)
@@ -440,38 +436,59 @@ class RuntimeUtilizationProfile:
         self._captures.clear()
 
     @contextmanager
-    def eager(self):
+    def eager(self, *, batch_size, input_tokens, decode_query_width, query_sharded):
         if not self.graph_enabled or self.current_step is None:
             yield
             return
         step = self.current_step
-        if self.library is None:
-            step.unavailable("eager_profile_bridge_unconfigured")
-            yield
-            return
         session = self._session(f"eager:{step.serving_step}")
         session.backend = "nvtx"
-        with ExitStack() as stack:
-            for module, layer_id, name in self.modules:
-                stack.enter_context(
-                    session.watch_module(module, layer_id=layer_id, name=name)
-                )
-            timeline = NvtxTimeline(
-                session,
-                costs=self.costs,
-                hardware=self.hardware,
-                stream=torch.cuda.current_stream(),
-                max_scopes=self.config.max_scopes,
-                library=self.library,
-                output=Path(self.config.output_dir)
-                / f"rank-{self.rank}.step-{step.serving_step}.eager.json",
-                max_metadata_bytes=self.config.max_metadata_bytes,
-            )
-            with timeline, session.iteration(
-                iter_id=step.serving_step, metadata=self.static_metadata
+        # Packed prefill rows can have unequal per-request widths. Preserve the
+        # actual live token count without inventing a rectangular batch.
+        metadata = {**self.static_metadata, "logical_batch": batch_size}
+        if not query_sharded:
+            metadata["logical_tokens"] = input_tokens
+            if batch_size == 1:
+                metadata["query_width"] = input_tokens
+            elif (
+                decode_query_width is not None
+                and input_tokens == batch_size * decode_query_width
             ):
+                metadata["query_width"] = decode_query_width
+        with step.owner.reserve_eager_metadata(step) as reserved:
+            if not reserved:
                 yield
-        step.unavailable("eager_metadata_requires_separate_nsight_projection")
+                return
+            with ExitStack() as stack:
+                timeline = NvtxTimeline(
+                    session,
+                    costs=self.costs,
+                    hardware=self.hardware,
+                    stream=torch.cuda.current_stream(),
+                    max_scopes=self.config.max_scopes,
+                    output=Path(self.config.output_dir)
+                    / f"rank-{self.rank}.step-{step.serving_step}.eager.json",
+                    max_metadata_bytes=self.config.max_metadata_bytes,
+                    eager_step={
+                        **step.identity(),
+                        "profile_config_sha256": self.source_context[
+                            "profile_config_sha256"
+                        ],
+                    },
+                )
+                try:
+                    stack.enter_context(timeline)
+                except NvtxUnavailableError as error:
+                    step.unavailable(f"eager_native_nvtx_unavailable: {error}")
+                    yield
+                    return
+                for module, layer_id, name in self.modules:
+                    stack.enter_context(
+                        session.watch_module(module, layer_id=layer_id, name=name)
+                    )
+                with session.iteration(iter_id=step.serving_step, metadata=metadata):
+                    yield
+            step.bind_eager_timeline(timeline)
 
     @contextmanager
     def iteration(self, *, step: int, identity: ProfileStep | None = None):
@@ -496,24 +513,28 @@ class RuntimeUtilizationProfile:
             self.current_step = previous
             return
         if self._timeline is None:
-            if self.library is None:
-                raise ValueError("Eager profiles require the NVTX bridge library")
-            self._eager_hooks = ExitStack()
-            for module, layer_id, name in self.modules:
-                self._eager_hooks.enter_context(
-                    self.session.watch_module(module, layer_id=layer_id, name=name)
+            hooks = ExitStack()
+            try:
+                for module, layer_id, name in self.modules:
+                    hooks.enter_context(
+                        self.session.watch_module(module, layer_id=layer_id, name=name)
+                    )
+                timeline = NvtxTimeline(
+                    self.session,
+                    costs=self.costs,
+                    hardware=self.hardware,
+                    stream=torch.cuda.current_stream(),
+                    max_scopes=self.config.max_scopes,
+                    output=self.output,
+                    max_metadata_bytes=self.config.max_metadata_bytes,
                 )
-            self._timeline = NvtxTimeline(
-                self.session,
-                costs=self.costs,
-                hardware=self.hardware,
-                stream=torch.cuda.current_stream(),
-                max_scopes=self.config.max_scopes,
-                library=self.library,
-                output=self.output,
-                max_metadata_bytes=self.config.max_metadata_bytes,
-            )
-            self._timeline.__enter__()
+                timeline.__enter__()
+            except BaseException:
+                hooks.close()
+                self.current_step = previous
+                raise
+            self._eager_hooks = hooks
+            self._timeline = timeline
         error = None
         try:
             with self.session.iteration(iter_id=step, metadata=self.static_metadata):

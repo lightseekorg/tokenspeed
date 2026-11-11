@@ -106,6 +106,30 @@ def costs():
     return registry
 
 
+def test_declared_integer_metadata_capacity_preserves_eager_route_values():
+    def op(routes):
+        return routes
+
+    registry = KernelRegistry()
+    for name, limit in (("default", 4096), ("grouped", 8192)):
+        registry.register(
+            KernelSpec(name=name, family="test", mode="routes"),
+            op,
+            profile=OpProfile(
+                cost_rule=None,
+                integer_tensor_args=("routes",),
+                integer_tensor_max_elements=limit,
+            ),
+        )
+    routes = torch.arange(472 * 12, dtype=torch.int32).reshape(472, 12)
+    session = session_for()
+    with session.iteration(iter_id=0):
+        assert registry.get_impl("default")(routes) is routes
+        assert registry.get_impl("grouped")(routes) is routes
+    assert session.ops[0].tensor_values["routes"] is None
+    assert session.ops[1].tensor_values["routes"] == tuple(range(routes.numel()))
+
+
 def test_repeated_layers_iterations_and_selected_call(mm, tmp_path):
     layer = Layer(SelectedKernel("profile_test_mm", mm))
     session = session_for(layer)

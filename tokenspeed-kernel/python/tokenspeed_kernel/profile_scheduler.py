@@ -230,6 +230,8 @@ def _verified_source(source):
 
 def _collector_metadata(path):
     """Resolve existing service provenance, including late ForwardId bindings."""
+    from tokenspeed_kernel.profile_eager import merge_forward_binding
+
     metadata = json.loads(path.read_text())
     if metadata.get("schema") != "tokenspeed.metadata_coverage/v1":
         raise ValueError("Unsupported service metadata schema")
@@ -250,9 +252,9 @@ def _collector_metadata(path):
             continue
         step = row["step_id"]
         if row["event"] == "forward_identity_bound":
-            if step in bindings and bindings[step] != row["forward_id"]:
+            if step in bindings and bindings[step] != row:
                 raise ValueError("Conflicting late ForwardId binding")
-            bindings[step] = row["forward_id"]
+            bindings[step] = row
         elif row["event"] == "device_results_ready":
             if step in ready:
                 raise ValueError("Duplicate device-ready step identity")
@@ -262,9 +264,7 @@ def _collector_metadata(path):
     forwards = set()
     for step, row in ready.items():
         if step in bindings:
-            if row.get("forward_id") not in (None, bindings[step]):
-                raise ValueError("Late ForwardId binding mismatch")
-            row["forward_id"] = bindings[step]
+            merge_forward_binding(row, bindings[step])
         if row.get("forward_id") is not None:
             if row["forward_id"] in forwards:
                 raise ValueError("One ForwardId maps to multiple ready steps")
@@ -427,7 +427,7 @@ def _collector_requests(metadata, steps, gaps):
                 raise ValueError(
                     "Measured forward lies outside committed request window"
                 )
-            for field in ("capture_file", "binary_payload"):
+            for field in ("capture_file", "binary_payload", "eager_sidecar"):
                 actual = step["collector_sources"].get(field)
                 if field in identity and actual is None:
                     unknowns.append(f"measured_{field}_unavailable")
@@ -454,6 +454,7 @@ def _collector_requests(metadata, steps, gaps):
             not in (
                 "measured_capture_file_unavailable",
                 "measured_binary_payload_unavailable",
+                "measured_eager_sidecar_unavailable",
             )
         ]
         for previous, following in zip(endpoints, endpoints[1:]):
@@ -552,6 +553,7 @@ def analyze_scheduler(
     report: Path | None = None,
     expected_database_sha256: str | None = None,
     expected_report_sha256: str | None = None,
+    eager_steps: dict[str, dict] | None = None,
 ) -> dict[str, Any]:
     """Analyze scheduled launches with legacy NVTX or collector selection.
 
@@ -597,6 +599,9 @@ def analyze_scheduler(
     if selection_mode not in ("legacy", "collector"):
         raise ValueError("Select legacy or collector mode explicitly")
     collector = selection_mode == "collector"
+    eager_steps = {} if eager_steps is None else eager_steps
+    if eager_steps and not collector:
+        raise ValueError("Eager projection requires collector scheduling")
     registry_selection = "builtin" if registry is None else "trusted_python_registry"
     if collector:
         from tokenspeed_kernel.op_profile import CostRegistry
@@ -627,6 +632,10 @@ def analyze_scheduler(
                 "Collector selection requires service metadata and no legacy selectors"
             )
         metadata, manifest, ready, commits = _collector_metadata(service_metadata)
+        if eager_steps and set(eager_steps) != {
+            key for key, row in ready.items() if row.get("eager_sidecar") is not None
+        }:
+            raise ValueError("Scheduler eager projection and ready step sets differ")
         pids = {row["process_id"] for row in ready.values()}
         if len(pids) != 1 or (process_id is not None and process_id not in pids):
             raise ValueError("Collector selection requires one unambiguous worker PID")
@@ -710,6 +719,48 @@ def analyze_scheduler(
             native_index = _read_native_index(db, candidates)
             for row in ready.values():
                 step = row["step_id"]
+                if row.get("eager_sidecar") is not None:
+                    native_step = eager_steps.get(step)
+                    if native_step is None:
+                        collector_unknowns[step] = [
+                            "eager_native_projection_requires_mixed_analysis"
+                        ]
+                        continue
+                    if any(
+                        native_step.get(key) != row.get(key)
+                        for key in (
+                            "run_id",
+                            "rank",
+                            "process_id",
+                            "forward_id",
+                            "request_ids",
+                            "eager_sidecar",
+                        )
+                    ):
+                        raise ValueError(
+                            "Scheduler eager projection/ready identity mismatch"
+                        )
+                    timing = native_step["eager_native_timing"]
+                    models = timing["models"]
+                    if not models:
+                        collector_unknowns[step] = [
+                            "eager_model_native_range_unavailable"
+                        ]
+                        continue
+                    first = min(models, key=lambda item: item["cpu_start_ns"])
+                    replay = {
+                        "range_id": first["nsight_range_id"],
+                        "globalTid": timing["global_tid"],
+                        "start": first["cpu_start_ns"],
+                        "end": max(item["cpu_end_ns"] for item in models),
+                        "eager_step_id": step,
+                    }
+                    if replay["range_id"] in collector_rows:
+                        raise ValueError("Duplicate native scheduler range")
+                    collector_rows[replay["range_id"]] = row
+                    collector_sources[step] = {"eager_sidecar": row["eager_sidecar"]}
+                    replays.append(replay)
+                    continue
                 activities, evidence, unknowns = (
                     [],
                     {},
@@ -764,6 +815,8 @@ def analyze_scheduler(
                         )
                     # An unavailable device-ready record is still preserved below.
                     continue
+                if replay["range_id"] in collector_rows:
+                    raise ValueError("Duplicate native scheduler range")
                 collector_rows[replay["range_id"]] = row
                 replays.append(replay)
                 if row.get("capture_file") and row.get("binary_payload"):
@@ -813,6 +866,9 @@ def analyze_scheduler(
         _require(schema, "StringIds", ("id", "value"))
         launches = []
         for replay in replays:
+            if "eager_step_id" in replay:
+                launches.append(None)
+                continue
             matches = [
                 row
                 for row in db.execute(
@@ -833,7 +889,9 @@ def analyze_scheduler(
             raise ValueError("Reused or missing graph launch correlation identity")
 
         clones = {}
-        if prepared or collector:
+        if prepared or (
+            collector and any("eager_step_id" not in replay for replay in replays)
+        ):
             _require(
                 schema,
                 "CUDA_GRAPH_NODE_EVENTS",
@@ -858,7 +916,12 @@ def analyze_scheduler(
                 node = clones[node]
             return node
 
-        present = [table for table in _GPU_TABLES if table in schema]
+        gpu_tables = _GPU_TABLES
+        if eager_steps:
+            from tokenspeed_kernel.profile_eager import GPU_TABLES
+
+            gpu_tables = GPU_TABLES
+        present = [table for table in gpu_tables if table in schema]
         if not present:
             raise ValueError("No captured CUDA kernel/memcpy/memset tables")
         by_correlation = defaultdict(list)
@@ -898,7 +961,7 @@ def analyze_scheduler(
                     row["deviceId"],
                     row["contextId"],
                     row["streamId"],
-                    _GPU_TABLES[table],
+                    gpu_tables[table],
                 )
 
         for table in present:
@@ -911,6 +974,87 @@ def analyze_scheduler(
         steps = []
         semantic_groups = defaultdict(list)
         for index, (replay, launch) in enumerate(zip(replays, launches, strict=True)):
+            if "eager_step_id" in replay:
+                step_id = replay["eager_step_id"]
+                row = collector_rows[replay["range_id"]]
+                timing = eager_steps[step_id]["eager_native_timing"]
+                selected = [
+                    _Activity(
+                        item["start"],
+                        item["end"],
+                        item["process_key"],
+                        item["correlationId"],
+                        None,
+                        item["deviceId"],
+                        item["contextId"],
+                        item["streamId"],
+                        item["kind"],
+                    )
+                    for item in timing["activities"]
+                ]
+                groups = timing["semantic_groups"]
+                for name, intervals in groups.items():
+                    semantic_groups[name].extend(intervals)
+                token_commits = _token_commits(commits[step_id])
+                steps.append(
+                    {
+                        "attribution_mode": "eager_nvtx_gpu_projection",
+                        "scheduled_index": index,
+                        "replay_marker_index": None,
+                        "nvtx_range_id": replay["range_id"],
+                        "eager_model_range_ids": [
+                            item["nsight_range_id"] for item in timing["models"]
+                        ],
+                        "launch_identity_status": "identified_eager_model_ranges",
+                        "global_tid": replay["globalTid"],
+                        "process_key": process_key,
+                        "process_id": process_id,
+                        "rank": row["rank"],
+                        "cpu_start_ns": replay["start"],
+                        "cpu_end_ns": replay["end"],
+                        "runtime_row_id": None,
+                        "runtime_start_ns": None,
+                        "runtime_end_ns": None,
+                        "launch_correlation_id": None,
+                        "capture_path": None,
+                        "associated_model_source_node_count": None,
+                        "graph_source_nodes_outside_model_count": None,
+                        "whole_graph_launch": None,
+                        "timing_scope": "projected_eager_model_ranges",
+                        "step_id": step_id,
+                        "forward_id": row.get("forward_id"),
+                        "capture_id": None,
+                        "serving_step": row["serving_step"],
+                        "request_ids": row["request_ids"],
+                        "scheduled": True,
+                        "gpu_observed": bool(selected),
+                        "device_ready": True,
+                        "authoritative_commit": bool(token_commits),
+                        "token_commits": token_commits,
+                        "completion_status": (
+                            "token_committed"
+                            if token_commits
+                            else (
+                                "executed_without_observed_token_commit"
+                                if selected
+                                else "device_ready_without_observed_gpu_activity"
+                            )
+                        ),
+                        "critical_unknowns": (
+                            []
+                            if selected
+                            else ["eager_model_native_activity_unavailable"]
+                        ),
+                        "collector_sources": collector_sources[step_id],
+                        "gpu_activity_intervals_ns": _merged(
+                            (a.start, a.end) for a in selected
+                        ),
+                        "semantic_activity": _semantic_summary(groups),
+                        "semantic_activity_intervals_ns": groups,
+                        **_timing(selected),
+                    }
+                )
+                continue
             activities = (
                 by_correlation[launch["correlationId"]] if launch is not None else []
             )
@@ -1017,6 +1161,8 @@ def analyze_scheduler(
                         "unclassified": [(a.start, a.end) for a in activities]
                     }
                     semantic_groups["unclassified"].extend(classified["unclassified"])
+                if eager_steps:
+                    steps[-1]["attribution_mode"] = "cuda_graph_node_ids"
                 steps[-1].update(
                     step_id=step_id,
                     forward_id=collector_row.get("forward_id"),
@@ -1240,6 +1386,8 @@ def analyze_scheduler(
             ),
             "per_replay_completion_identity": "unavailable; aggregate counts do not identify a replay",
         }
+    graph_marker_count = sum("eager_step_id" not in row for row in replays)
+    eager_marker_count = len(replays) - graph_marker_count
     gpu_candidates = sorted(
         name
         for name, columns in schema.items()
@@ -1250,11 +1398,19 @@ def analyze_scheduler(
         "schema_version": 2,
         "selection_mode": selection_mode,
         "timing_scope": (
-            "captured_model_nodes"
-            if prepared or collector
-            else "whole_graph_launch; model boundary unavailable"
+            "captured_model_nodes_and_projected_eager_model_ranges"
+            if eager_steps
+            else (
+                "captured_model_nodes"
+                if prepared or collector
+                else "whole_graph_launch; model boundary unavailable"
+            )
         ),
-        "identity_method": "NVTX same globalTid -> enclosed cudaGraphLaunch -> correlationId + full process key; model uses explicit graph clone ancestry",
+        "identity_method": (
+            "exact Graph launch/clone identities and eager NVTX scopes with same-thread CUDA correlations"
+            if eager_steps
+            else "NVTX same globalTid -> enclosed cudaGraphLaunch -> correlationId + full process key; model uses explicit graph clone ancestry"
+        ),
         "request": {
             "selection": (
                 "collector_per_step_identity"
@@ -1276,7 +1432,15 @@ def analyze_scheduler(
                 default=None,
             ),
         },
-        "replay_marker_count": len(replays),
+        "replay_marker_count": graph_marker_count,
+        **(
+            {
+                "eager_marker_count": eager_marker_count,
+                "gpu_timed_step_count": len(timed),
+            }
+            if eager_steps
+            else {}
+        ),
         "device_ready_step_count": (
             sum(row["event"] == "device_results_ready" for row in ready.values())
             if collector
@@ -1284,15 +1448,18 @@ def analyze_scheduler(
         ),
         "identified_graph_launch_count": len(correlations),
         "scheduled_replay_count": (
-            len(replays) if len(correlations) == len(replays) else None
+            graph_marker_count if len(correlations) == graph_marker_count else None
         ),
-        "missing_launch_identity_count": len(replays) - len(correlations),
+        "missing_launch_identity_count": graph_marker_count - len(correlations),
         "statistics_coverage": (
             "complete_for_selected_markers"
             if len(timed) == len(steps)
             else "partial; unidentified or GPU-untimed markers excluded without bridging pairs"
         ),
-        "gpu_timed_replay_count": len(timed),
+        "gpu_timed_replay_count": sum(
+            step.get("attribution_mode") != "eager_nvtx_gpu_projection"
+            for step in timed
+        ),
         "completion": completion_evidence,
         "steps": steps,
         "consecutive_pairs": gaps,
@@ -1315,7 +1482,7 @@ def analyze_scheduler(
         },
         "coverage": {
             "activity_tables": present,
-            "missing_activity_tables": sorted(set(_GPU_TABLES) - set(present)),
+            "missing_activity_tables": sorted(set(gpu_tables) - set(present)),
             "unhandled_gpu_activity_tables": sorted(set(gpu_candidates) - set(present)),
             "captured_devices": sorted(
                 (device for device in device_coverage if device is not None)
@@ -1358,9 +1525,11 @@ def analyze_scheduler(
         result["provenance"]["cost_provider"] = {"selection": registry_selection}
         result["requests"] = _collector_requests(metadata, steps, gaps)
         result["semantic_activity"] = _semantic_summary(semantic_groups)
-        result["coverage"][
-            "semantic_activity_classification"
-        ] = "unique captured Op node ownership and trusted costs; unknown ownership/cost remains unclassified"
+        result["coverage"]["semantic_activity_classification"] = (
+            "unique Graph Op node ownership and exact eager Op activity ownership; unknown ownership/cost remains unclassified"
+            if eager_steps
+            else "unique captured Op node ownership and trusted costs; unknown ownership/cost remains unclassified"
+        )
         result["provenance"]["service_metadata"] = _digest(service_metadata)
         result["provenance"]["service_sources"] = metadata["service_sources"]
         result["provenance"]["ready_index"] = metadata["ready_index_source"]

@@ -19,6 +19,7 @@
 # SOFTWARE.
 
 import json
+from contextlib import nullcontext
 from dataclasses import asdict, replace
 
 import pytest
@@ -605,6 +606,27 @@ def test_varlen_attention_cost_uses_actual_causal_pairs(causal):
         == cost["logical_read_bytes"] + cost["logical_write_bytes"]
     )
     record = session.ops[0]
+    used = torch.tensor([1, 3], dtype=torch.int32)
+    used_desc = replace(record.inputs["cu_seqlens_k"], shape=(2,), logical_bytes=8)
+    session.ops[0] = replace(
+        record,
+        inputs={**record.inputs, "seqused_k": used_desc},
+        tensor_values={**record.tensor_values, "seqused_k": tuple(used.tolist())},
+    )
+    used_cost = session.report(costs=costs)["analysis"]["ops"][0]["cost"]
+    assert used_cost["useful_flops"] == 2 * 4 * (4 if causal else 6) * (4 + 3)
+    assert used_cost["logical_read_bytes"] == cost["logical_read_bytes"] + 8
+    with_lengths = session.ops[0]
+    for values in (None, (3, 3)):
+        session.ops[0] = replace(
+            with_lengths,
+            tensor_values={**record.tensor_values, "seqused_k": values},
+        )
+        invalid = session.report(costs=costs)["analysis"]["ops"][0]
+        assert (
+            invalid["cost"] is None
+            and "seqused_k live lengths" in invalid["missing_reason"]
+        )
     for lengths, reason in ((None, "snapshot unavailable"), ((0, 5, 4), "partition")):
         session.ops[0] = replace(
             record, tensor_values={**record.tensor_values, "cu_seqlens_q": lengths}
@@ -1224,10 +1246,22 @@ def test_attention_cost_uses_query_heads_and_causal_pairs():
 
 
 @pytest.mark.parametrize(
-    "missing_gpu,wrong_capture", [(False, False), (True, False), (False, True)]
+    "missing_gpu,wrong_capture,python_payload,signed_failure",
+    [
+        (False, False, False, None),
+        (False, False, True, None),
+        (True, False, True, None),
+        (False, True, True, None),
+        (False, False, True, "foreign_only"),
+        (False, False, True, "wrong_event"),
+        (False, False, True, "wrong_prefix"),
+        (False, False, True, "cross_thread"),
+        (False, False, True, "open_range"),
+        (False, False, True, "no_domain_schema"),
+    ],
 )
 def test_nsight_timestamps_are_the_only_gpu_denominator(
-    fixture, tmp_path, missing_gpu, wrong_capture
+    fixture, tmp_path, missing_gpu, wrong_capture, python_payload, signed_failure
 ):
     import csv
     import sqlite3
@@ -1238,31 +1272,41 @@ def test_nsight_timestamps_are_the_only_gpu_denominator(
     report = session.report(costs=costs)
     report["hardware"] = asdict(hardware)
     report["device_analysis"] = {"process_id": 17, "thread_id": 23, "scopes": []}
+    payload_column = "int64Value" if python_payload else "uint64Value"
+    id_base = 1 << (53 if python_payload else 63)
+    if python_payload:
+        report["device_analysis"]["nvtx_payload_type"] = "int64"
     database, projection = tmp_path / "trace.sqlite", tmp_path / "projection.csv"
     rows = []
     with sqlite3.connect(database) as db:
         db.execute("CREATE TABLE StringIds(id INTEGER,value TEXT)")
         db.execute(
-            "CREATE TABLE NVTX_EVENTS(start INTEGER,end INTEGER,globalTid INTEGER,endGlobalTid INTEGER,text TEXT,textId INTEGER,uint64Value INTEGER)"
+            "CREATE TABLE NVTX_EVENTS(start INTEGER,end INTEGER,globalTid INTEGER,"
+            f"endGlobalTid INTEGER,text TEXT,textId INTEGER,{payload_column} INTEGER)"
         )
         for index, timing in enumerate(timings, 1):
             label = "gemm.mm" if index <= 2 else "L7"
+            identity = id_base + index
+            stored = identity if python_payload else identity - (1 << 64)
+            if python_payload:
+                db.execute("INSERT INTO StringIds VALUES(?,?)", (index, label))
             report["device_analysis"]["scopes"].append(
                 {
                     "trace_label": timing.trace_label,
                     "nvtx_label": label,
-                    "nvtx_id": index,
+                    "nvtx_id": identity,
                     "gpu_duration_ns": 1,
                 }
             )
             db.execute(
-                "INSERT INTO NVTX_EVENTS VALUES(?,?,?,NULL,?,NULL,?)",
+                "INSERT INTO NVTX_EVENTS VALUES(?,?,?,NULL,?,?,?)",
                 (
                     timing.start_timestamp,
                     timing.end_timestamp,
                     (17 << 24) | 23,
-                    label,
-                    index,
+                    None if python_payload else label,
+                    index if python_payload else None,
+                    stored,
                 ),
             )
             if index != 1 or not missing_gpu:
@@ -1280,20 +1324,69 @@ def test_nsight_timestamps_are_the_only_gpu_denominator(
                         "NumGPUOps": 2,
                     }
                 )
+        stored_first = id_base + 1 if python_payload else id_base + 1 - (1 << 64)
         # Same TID, payload and label in a different process must not match.
         db.execute(
-            "INSERT INTO NVTX_EVENTS VALUES(1,2,?,NULL,'gemm.mm',NULL,1)",
-            ((18 << 24) | 23,),
+            "INSERT INTO NVTX_EVENTS VALUES(1,2,?,NULL,'gemm.mm',NULL,?)",
+            ((18 << 24) | 23, stored_first),
         )
         # Other annotations may reuse the numeric payload on our own thread.
         db.execute(
-            "INSERT INTO NVTX_EVENTS VALUES(1,2,?,NULL,'unrelated',NULL,1)",
-            ((17 << 24) | 23,),
+            "INSERT INTO NVTX_EVENTS VALUES(1,2,?,NULL,'unrelated',NULL,?)",
+            ((17 << 24) | 23, stored_first),
         )
+        if python_payload and signed_failure != "no_domain_schema":
+            db.executescript("""
+                ALTER TABLE NVTX_EVENTS ADD COLUMN domainId INTEGER;
+                ALTER TABLE NVTX_EVENTS ADD COLUMN eventType INTEGER;
+                UPDATE NVTX_EVENTS SET domainId=7, eventType=59;
+            """)
+            db.execute("INSERT INTO StringIds VALUES(99,'TokenSpeed')")
+            db.executemany(
+                "INSERT INTO NVTX_EVENTS(start,globalTid,text,textId,domainId,eventType) VALUES(0,?,?,?,?,75)",
+                [((17 << 24) | 9, None, 99, 7), ((17 << 24) | 9, "Foreign", None, 8)],
+            )
+            # Deliberately reuse the exact signed ID, registered label, and
+            # thread. Only the owning TokenSpeed range may take GPU timing.
+            foreign = db.execute("""
+                INSERT INTO NVTX_EVENTS(start,end,globalTid,endGlobalTid,text,textId,int64Value,domainId,eventType)
+                SELECT start,end,globalTid,endGlobalTid,text,textId,int64Value,8,59
+                FROM NVTX_EVENTS WHERE rowid=1
+                """).lastrowid
+            if not missing_gpu:
+                rows.append(
+                    {
+                        **rows[0],
+                        "RangeId": foreign,
+                        "Name": "Foreign:gemm.mm",
+                        "Projected Duration (ns)": 17,
+                    }
+                )
+            if signed_failure == "foreign_only":
+                db.execute("UPDATE NVTX_EVENTS SET domainId=8 WHERE rowid=1")
+            elif signed_failure == "wrong_event":
+                db.execute("UPDATE NVTX_EVENTS SET eventType=60 WHERE rowid=1")
+            elif signed_failure == "cross_thread":
+                db.execute(
+                    "UPDATE NVTX_EVENTS SET endGlobalTid=? WHERE rowid=1",
+                    ((17 << 24) | 31,),
+                )
+            elif signed_failure == "open_range":
+                db.execute("UPDATE NVTX_EVENTS SET end=NULL WHERE rowid=1")
+            elif signed_failure == "wrong_prefix":
+                rows[0]["Name"] = "Foreign:gemm.mm"
     with projection.open("w", newline="") as target:
         writer = csv.DictWriter(target, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
+    if signed_failure:
+        reason = {
+            "no_domain_schema": "lacks TokenSpeed domain or push/pop evidence",
+            "wrong_prefix": "projection and NVTX capture do not match",
+        }.get(signed_failure, "closed same-thread TokenSpeed push/pop range")
+        with pytest.raises(ValueError, match=reason):
+            analyze_nsight(report, database=database, projection=projection)
+        return
     if wrong_capture:
         with pytest.raises(ValueError, match="do not match"):
             analyze_nsight(report, database=database, projection=projection)
@@ -1302,6 +1395,7 @@ def test_nsight_timestamps_are_the_only_gpu_denominator(
     assert result["device_analysis"]["timing_kind"] == "nsight_gpu_projection"
     analyzed = result["device_analysis"]["scopes"]
     for index, row in enumerate(analyzed):
+        assert row["nsight_range_id"] == index + 1
         if missing_gpu and index in (0, 2):
             assert row["mfu"] is None and row["estimated_mbu"] is None
             assert "no GPU activity" in row["mfu_missing_reason"]
@@ -1310,12 +1404,60 @@ def test_nsight_timestamps_are_the_only_gpu_denominator(
             assert row["mfu"] == pytest.approx(0.96 if index < 2 else 0.48)
             assert row["op_count"] == 1
     assert report["device_analysis"]["scopes"][0]["gpu_duration_ns"] == 1
+    if python_payload and not missing_gpu:
+        report["device_analysis"]["scopes"][0]["nvtx_id"] = float(id_base + 1)
+        with pytest.raises(ValueError, match="exact int64 NVTX scope IDs"):
+            analyze_nsight(report, database=database, projection=projection)
 
 
+def test_nsight_legacy_label_projection_without_payload_or_domain_columns(tmp_path):
+    import sqlite3
+
+    from tokenspeed_kernel.profile_nsys import _join_nsight_projection
+
+    database = tmp_path / "old.sqlite"
+    projection = tmp_path / "old.csv"
+    with sqlite3.connect(database) as db:
+        db.executescript("""
+            CREATE TABLE StringIds(id INTEGER,value TEXT);
+            CREATE TABLE NVTX_EVENTS(start INTEGER,end INTEGER,globalTid INTEGER,
+                                     endGlobalTid INTEGER,text TEXT,textId INTEGER);
+        """)
+        db.execute(
+            "INSERT INTO NVTX_EVENTS VALUES(10,20,?,NULL,'legacy scope',NULL)",
+            ((17 << 24) | 23,),
+        )
+    projection.write_text(
+        "RangeId,Name,Orig Start (ns),Orig Duration (ns),PID,TID,"
+        "Projected Start (ns),Projected Duration (ns),NumGPUOps\n"
+        "1,Legacy:legacy scope,10,10,17,23,100,20,1\n"
+    )
+    report = {
+        "ops": [],
+        "device_analysis": {
+            "thread_id": 23,
+            "scopes": [{"trace_label": "original", "nvtx_label": "legacy scope"}],
+        },
+    }
+    timings, evidence = _join_nsight_projection(
+        report, database=database, projection=projection
+    )
+    assert timings[0].gpu_duration_ns == 20
+    assert evidence["original"]["nsight_range_id"] == 1
+
+
+@pytest.mark.parametrize("serving", [False, True])
 def test_native_collection_records_identity_without_events_or_timing_sync(
-    fixture, monkeypatch, tmp_path
+    fixture, monkeypatch, tmp_path, serving
 ):
+    from itertools import count
+
     import tokenspeed_kernel.profile_nvtx as native
+    from tokenspeed_kernel.profile_eager import (
+        merge_forward_binding,
+        read_eager_sidecar,
+    )
+    from tokenspeed_kernel.profile_graph import GraphReplayCollector, ProfileStep
 
     _, costs, _, hardware, layer = fixture
     emitted = []
@@ -1327,23 +1469,22 @@ def test_native_collection_records_identity_without_events_or_timing_sync(
         def synchronize(self):
             pytest.fail("Collection without metadata snapshots must not synchronize")
 
-    class Nvtx:
-        def __init__(self, library):
+    class Domain:
+        def __init__(self):
             self.stack = []
 
-        def push(self, label, scope_id):
-            self.stack.append(scope_id)
-            emitted.append((label, scope_id))
+        def push_range(self, *, message, payload):
+            self.stack.append(payload)
+            emitted.append((message, payload))
 
-        def pop(self):
+        def pop_range(self):
             self.stack.pop()
 
-        def close(self):
-            assert not self.stack
-
     stream = Stream()
+    domain = Domain()
     empty = torch.empty
-    monkeypatch.setattr(native, "_Nvtx", Nvtx)
+    monkeypatch.setattr(native, "_nvtx_domain", lambda: domain)
+    monkeypatch.setattr(native, "_scope_ids", count((1 << 63) - 4))
     monkeypatch.setattr(
         torch,
         "empty",
@@ -1359,29 +1500,92 @@ def test_native_collection_records_identity_without_events_or_timing_sync(
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda device: "CPU fixture")
-    session = ProfileSession(run_id="native", model_id="test", rank=0, backend="nvtx")
+    session = ProfileSession(
+        run_id="native:eager:0" if serving else "native",
+        model_id="test",
+        rank=0,
+        backend="nvtx",
+    )
+    collector = step = eager_step = None
+    index = tmp_path / "replays.jsonl"
+    if serving:
+        collector = GraphReplayCollector(
+            output=index,
+            metadata_slots=1,
+            max_metadata_bytes=64,
+            max_steps=1,
+            source_context={"profile_config_sha256": "a" * 64},
+        )
+        step = ProfileStep(
+            owner=collector,
+            run_id="native",
+            rank=0,
+            serving_step=0,
+            request_ids=("test",),
+            pool_indices=(0,),
+        )
+        eager_step = {**step.identity(), "profile_config_sha256": "a" * 64}
     session.bind_layer(layer, layer_id=7)
     output = tmp_path / "metadata.json"
-    with native.NvtxTimeline(
-        session,
-        costs=costs,
-        hardware=hardware,
-        stream=stream,
-        max_scopes=4,
-        library=tmp_path / "unused.so",
-        output=output,
-    ) as timeline:
-        with session.iteration(iter_id=0):
-            layer.forward()
-            layer.forward()
-        timeline.finish()
-        before = output.read_bytes()
-        timeline.finish()
-        assert output.read_bytes() == before
-    report = json.loads(output.read_text())
+    reservation = (
+        collector.reserve_eager_metadata(step) if serving else nullcontext(True)
+    )
+    with reservation as reserved:
+        assert reserved
+        with native.NvtxTimeline(
+            session,
+            costs=costs,
+            hardware=hardware,
+            stream=stream,
+            max_scopes=5,
+            output=output,
+            eager_step=eager_step,
+        ) as timeline:
+            with session.iteration(iter_id=0):
+                layer.forward()
+                layer.forward()
+                with pytest.raises(OverflowError, match="scope_id"):
+                    with timeline.record_func("overflow", display_name="overflow"):
+                        pytest.fail("Overflowing scope was entered")
+            if not serving:
+                timeline.finish()
+                before = output.read_bytes()
+                timeline.finish()
+                assert output.read_bytes() == before
+        if serving:
+            step.bind_eager_timeline(timeline)
+    if serving:
+        assert not output.exists()
+        event = object()  # Already synchronized by the existing serving result owner.
+        step.bind_result_event(event)
+        assert not output.exists()
+        step.device_results_ready(event)
+        step.bind_forward_id(9)
+        assert not output.exists()
+        assert [
+            json.loads(line)["event"] for line in index.read_text().splitlines()
+        ] == ["forward_identity_bound"]
+        window = collector.flush_ready()
+        collector.close()
+        assert window["persisted_eager"] == 1 and window["dropped_metadata"] == 0
+        rows = [json.loads(line) for line in index.read_text().splitlines()]
+        ready = next(row for row in rows if row["event"] == "device_results_ready")
+        binding = next(row for row in rows if row["event"] == "forward_identity_bound")
+        assert ready["device_ready_sequence"] == 1 and ready["forward_id"] is None
+        merge_forward_binding(ready, binding)
+        assert ready["forward_id"] == 9
+        report = read_eager_sidecar(
+            ready, config_sha256=window["profile_config_sha256"]
+        )
+    else:
+        report = json.loads(output.read_text())
     assert report["device_analysis"]["timing_kind"] == "pending_nsight"
     assert [label for label, _ in emitted] == ["L7", "gemm.mm", "L7", "gemm.mm"]
-    assert len({identity for _, identity in emitted}) == 4
+    assert not domain.stack
+    assert report["device_analysis"]["nvtx_payload_type"] == "int64"
+    assert [scope["nvtx_id"] for scope in report["device_analysis"]["scopes"]] == [
+        (1 << 63) - offset for offset in (4, 3, 2, 1)
+    ]
     assert all(
         "gpu_duration_ns" not in row for row in report["device_analysis"]["scopes"]
     )

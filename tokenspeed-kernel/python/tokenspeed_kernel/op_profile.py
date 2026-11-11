@@ -335,7 +335,6 @@ _PROFILE_CONFIG_REQUIRED = frozenset(
     }
 )
 _PROFILE_CONFIG_DEFAULTS = dict(
-    library=None,
     cuda_runtime_library=None,
     cupti_library=None,
     max_metadata_bytes=1 << 20,
@@ -346,6 +345,11 @@ _PROFILE_CONFIG_DEFAULTS = dict(
 
 
 def _profile_expand_timeline_config(config: dict) -> dict:
+    if isinstance(config, dict) and {"library", "nvtx_library"} & config.keys():
+        raise ValueError(
+            "Remove the legacy library or nvtx_library field; "
+            "eager native profiling uses NVIDIA nvtx==0.2.17"
+        )
     if (
         not isinstance(config, dict)
         or _PROFILE_CONFIG_REQUIRED - config.keys()
@@ -360,6 +364,19 @@ def _profile_config_for_observation(observation: dict, *, run_id: str) -> dict:
     expected = _profile_expand_timeline_config(body["timeline_config"])
     expected["startup_observation"] = observation
     return expected
+
+
+def _profile_observed_configs(observation: dict, *, run_id: str) -> tuple[dict, ...]:
+    """Reconstruct configs for verification of sealed current and old reports."""
+    body = _profile_validate_startup_observation(observation, run_id=run_id)
+    config = dict(body["timeline_config"])
+    # The former live config always expanded the library key, even if unset.
+    bridge_specified = "library" in config
+    bridge = config.pop("library", None)
+    current = _profile_expand_timeline_config(config)
+    current["startup_observation"] = observation
+    legacy = {**current, "library": bridge}
+    return (legacy,) if bridge_specified else (current, legacy)
 
 
 def _profile_validate_startup_observation(
@@ -834,8 +851,9 @@ class OpProfile:
     Multi-valued traits automatically capture same-named host arguments.
     Explicit scalar/tensor/integer paths may traverse declared object storage,
     dictionaries and NamedTuple fields; properties are never evaluated.
-    integer_tensor_args snapshots contiguous 1-D/2-D int32/int64 metadata with
-    at most 4096 elements. Matrices use a flat alias view without copying.
+    integer_tensor_args snapshots contiguous 1-D/2-D int32/int64 metadata up to
+    integer_tensor_max_elements per argument. Matrices use a flat alias view
+    without copying. The active observer also enforces its total byte budget.
     The active observer owns snapshot ordering: CUDA graphs retain D2D copies
     per replay, never capture-time CPU values. Without an observer only CPU
     integers are read. tensor_args records descriptions of explicit paths.
@@ -851,6 +869,14 @@ class OpProfile:
     integer_tensor_args: tuple[str, ...] = ()
     tensor_args: tuple[str, ...] = ()
     metadata_preparer: Callable[[dict[str, Any]], None] | None = None
+    integer_tensor_max_elements: int = 4096
+
+    def __post_init__(self):
+        if (
+            type(self.integer_tensor_max_elements) is not int
+            or self.integer_tensor_max_elements < 1
+        ):
+            raise ValueError("integer_tensor_max_elements must be a positive integer")
 
 
 @dataclass(frozen=True)
@@ -1420,7 +1446,7 @@ def wrap_op_for_profiling(
                     and 1 <= value.ndim <= 2
                     and value.dtype in (torch.int32, torch.int64)
                     and value.is_contiguous()
-                    and value.numel() <= 4096
+                    and value.numel() <= profile.integer_tensor_max_elements
                 ):
                     session.snapshot_integer_values(value.view(-1), tensor_values, name)
 
@@ -1661,6 +1687,40 @@ class CostRegistry:
             raise ValueError("Selected-engine resolver already registered")
         self._engine_resolver = resolver
 
+    def analyze_recorded(
+        self, report: dict, *, engine_context: dict[str, dict] | None = None
+    ) -> dict:
+        """Apply offline rules to serialized OpRecords with their actual metadata."""
+        session = ProfileSession(
+            run_id=report["run_id"],
+            model_id=report["model_id"],
+            rank=report["rank"],
+            backend="none",
+        )
+        for item in report["ops"]:
+            op = dict(item)
+            for key in ("inputs", "outputs"):
+                op[key] = {
+                    name: TensorDescription(
+                        **{
+                            **value,
+                            "shape": tuple(value["shape"]),
+                            "stride": tuple(value["stride"]),
+                        }
+                    )
+                    for name, value in op[key].items()
+                }
+            # ranks is a declared collective tuple, serialized as a JSON array.
+            # Do not recursively reinterpret arbitrary host metadata.
+            if isinstance(op.get("scalar_args", {}).get("ranks"), list):
+                op["scalar_args"] = {
+                    **op["scalar_args"],
+                    "ranks": tuple(op["scalar_args"]["ranks"]),
+                }
+            session.ops.append(OpRecord(**op))
+        session.layers = [LayerRecord(**item) for item in report["layers"]]
+        return self.analyze(session, engine_context=engine_context)
+
     def analyze(
         self, session: ProfileSession, *, engine_context: dict[str, dict] | None = None
     ) -> dict[str, Any]:
@@ -1684,57 +1744,87 @@ class CostRegistry:
                 try:
                     cost = rule(op)
                     context = (engine_context or {}).get(op.trace_label)
+                    eager = (
+                        context is not None
+                        and context.get("attribution_mode")
+                        == "eager_nvtx_gpu_projection"
+                    )
+                    proof = None
                     if self._engine_resolver is not None and context is not None:
                         proof = self._engine_resolver(op, cost, context)
-                        if proof is not None:
-                            engine_proof = proof
-                        if proof is not None and "unavailable_reason" in proof:
-                            cost = replace(
-                                cost,
-                                compute_type=None,
-                                compute_components=(
-                                    ComputeComponent(
-                                        cost.useful_flops,
-                                        None,
-                                        missing_reason=proof["unavailable_reason"],
-                                    ),
+                    if (
+                        eager
+                        and cost.useful_flops
+                        and (
+                            proof is None
+                            or "unavailable_reason" not in proof
+                            and (
+                                not context.get("complete_join")
+                                or proof.get("status") != "bound"
+                            )
+                        )
+                    ):
+                        proof = {
+                            "status": "unavailable",
+                            "attribution_mode": context["attribution_mode"],
+                            "scope_identity": context["scope_identity"],
+                            "unavailable_reason": context.get("incomplete_join_reason")
+                            or "eager native compute engine proof unavailable",
+                        }
+                    engine_proof = proof
+                    if proof is not None and "unavailable_reason" in proof:
+                        cost = replace(
+                            cost,
+                            compute_type=None,
+                            compute_components=(
+                                ComputeComponent(
+                                    cost.useful_flops,
+                                    None,
+                                    missing_reason=proof["unavailable_reason"],
                                 ),
+                            ),
+                        )
+                    elif proof is not None:
+                        components = tuple(
+                            ComputeComponent(**item) for item in proof["components"]
+                        )
+                        if eager and any(
+                            item.useful_flops
+                            and item.compute_type is not None
+                            and not item.contract_id
+                            for item in components
+                        ):
+                            raise ValueError(
+                                "Eager engine proof needs a reviewed component contract ID"
                             )
-                        if proof is not None and "unavailable_reason" not in proof:
-                            components = tuple(
-                                ComputeComponent(**item) for item in proof["components"]
+                        known = {}
+                        for item in cost.compute_components or ():
+                            if item.compute_type is not None:
+                                known[item.compute_type] = (
+                                    known.get(item.compute_type, 0) + item.useful_flops
+                                )
+                        if (
+                            cost.compute_components is None
+                            and cost.compute_type is not None
+                        ):
+                            known[cost.compute_type] = (
+                                known.get(cost.compute_type, 0) + cost.useful_flops
                             )
-                            known = {}
-                            for item in cost.compute_components or ():
-                                if item.compute_type is not None:
-                                    known[item.compute_type] = (
-                                        known.get(item.compute_type, 0)
-                                        + item.useful_flops
-                                    )
-                            if (
-                                cost.compute_components is None
-                                and cost.compute_type is not None
-                            ):
-                                known[cost.compute_type] = (
-                                    known.get(cost.compute_type, 0) + cost.useful_flops
-                                )
-                            proposed = {}
-                            for item in components:
-                                proposed[item.compute_type] = (
-                                    proposed.get(item.compute_type, 0)
-                                    + item.useful_flops
-                                )
-                            if any(
-                                proposed.get(key, 0) < amount
-                                for key, amount in known.items()
-                            ):
-                                raise ValueError(
-                                    "Selected-engine evidence conflicts with the existing source contract"
-                                )
-                            cost = replace(
-                                cost, compute_type=None, compute_components=components
+                        proposed = {}
+                        for item in components:
+                            proposed[item.compute_type] = (
+                                proposed.get(item.compute_type, 0) + item.useful_flops
                             )
-                            engine_proof = proof
+                        if any(
+                            proposed.get(key, 0) < amount
+                            for key, amount in known.items()
+                        ):
+                            raise ValueError(
+                                "Selected-engine evidence conflicts with the existing source contract"
+                            )
+                        cost = replace(
+                            cost, compute_type=None, compute_components=components
+                        )
                 except ValueError as exc:
                     reason = str(exc)
                     if engine_proof is not None:

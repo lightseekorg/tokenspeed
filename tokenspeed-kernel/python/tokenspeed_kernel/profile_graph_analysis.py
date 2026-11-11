@@ -35,17 +35,16 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from tokenspeed_kernel.op_profile import (
-    CostRegistry,
-    LayerRecord,
-    OpRecord,
-    ProfileSession,
-    TensorDescription,
-)
+from tokenspeed_kernel.op_profile import CostRegistry
 from tokenspeed_kernel.profile_communication import bind_capture_communication
 from tokenspeed_kernel.profile_costs import (
     register_collective_costs,
     register_compute_costs,
+)
+from tokenspeed_kernel.profile_eager import analyze_eager_step, merge_forward_binding
+from tokenspeed_kernel.profile_native_activity import (
+    activity_resource_columns,
+    decode_activity_resources,
 )
 from tokenspeed_kernel.profile_utilization import hardware_for_analysis, scope_metrics
 
@@ -158,35 +157,7 @@ def _reevaluate(
     *,
     engine_context: dict[str, dict] | None = None,
 ) -> dict:
-    session = ProfileSession(
-        run_id=report["run_id"],
-        model_id=report["model_id"],
-        rank=report["rank"],
-        backend="none",
-    )
-    for item in report["ops"]:
-        op = dict(item)
-        for key in ("inputs", "outputs"):
-            op[key] = {
-                name: TensorDescription(
-                    **{
-                        **value,
-                        "shape": tuple(value["shape"]),
-                        "stride": tuple(value["stride"]),
-                    }
-                )
-                for name, value in op[key].items()
-            }
-        # ranks is a declared collective tuple, serialized as a JSON array.
-        # Do not recursively reinterpret arbitrary host metadata.
-        if isinstance(op.get("scalar_args", {}).get("ranks"), list):
-            op["scalar_args"] = {
-                **op["scalar_args"],
-                "ranks": tuple(op["scalar_args"]["ranks"]),
-            }
-        session.ops.append(OpRecord(**op))
-    session.layers = [LayerRecord(**item) for item in report["layers"]]
-    return registry.analyze(session, engine_context=engine_context)
+    return registry.analyze_recorded(report, engine_context=engine_context)
 
 
 def _union(intervals: list[tuple[int, int]]) -> int:
@@ -477,46 +448,11 @@ def _read_native_index(db: sqlite3.Connection, replays: list[dict]) -> _NativeIn
         if table not in tables:
             continue
         columns = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
-        resource_columns = (
-            (
-                "mangledName",
-                "demangledName",
-                "shortName",
-                "deviceId",
-                "contextId",
-                "streamId",
-                "registersPerThread",
-                "gridX",
-                "gridY",
-                "gridZ",
-                "blockX",
-                "blockY",
-                "blockZ",
-                "staticSharedMemory",
-                "dynamicSharedMemory",
-                "clusterX",
-                "clusterY",
-                "clusterZ",
-                "graphId",
-                "launchType",
-            )
-            if table == "CUPTI_ACTIVITY_KIND_KERNEL"
-            else (
-                "bytes",
-                "deviceId",
-                "contextId",
-                "streamId",
-                "copyKind",
-                "srcKind",
-                "dstKind",
-                "srcDeviceId",
-                "dstDeviceId",
-            )
-        )
+        resource_columns = activity_resource_columns(table)
         selected = [
             name if name in columns else f"NULL AS {name}" for name in resource_columns
         ]
-        extra = "," + ",".join(selected) if selected else ""
+        extra = "," + ",".join(selected)
         strings = (
             dict(db.execute("SELECT id,value FROM StringIds"))
             if table == "CUPTI_ACTIVITY_KIND_KERNEL"
@@ -529,42 +465,9 @@ def _read_native_index(db: sqlite3.Connection, replays: list[dict]) -> _NativeIn
             values,
         ):
             source_rowid, start, end, node, correlation, global_pid = raw[:6]
-            kernel = None
-            memory = None
-            if table == "CUPTI_ACTIVITY_KIND_KERNEL":
-                data = dict(zip(resource_columns, raw[6:], strict=True))
-                for name in ("mangledName", "demangledName", "shortName"):
-                    value = data[name]
-                    data[name] = value if isinstance(value, str) else strings.get(value)
-                kernel = dict(
-                    name=data["mangledName"],
-                    demangled_name=data["demangledName"],
-                    short_name=data["shortName"],
-                    grid=[data[f"grid{axis}"] for axis in "XYZ"],
-                    block=[data[f"block{axis}"] for axis in "XYZ"],
-                    cluster=[data[f"cluster{axis}"] for axis in "XYZ"],
-                    registers_per_thread=data["registersPerThread"],
-                    static_shared_memory=data["staticSharedMemory"],
-                    dynamic_shared_memory=data["dynamicSharedMemory"],
-                    device_id=data["deviceId"],
-                    context_id=data["contextId"],
-                    stream_id=data["streamId"],
-                    graph_id=data["graphId"],
-                    launch_type=data["launchType"],
-                )
-            else:
-                data = dict(zip(resource_columns, raw[6:], strict=True))
-                memory = dict(
-                    bytes=data["bytes"],
-                    device_id=data["deviceId"],
-                    context_id=data["contextId"],
-                    stream_id=data["streamId"],
-                    copy_kind=data["copyKind"],
-                    source_kind=data["srcKind"],
-                    destination_kind=data["dstKind"],
-                    source_device_id=data["srcDeviceId"],
-                    destination_device_id=data["dstDeviceId"],
-                )
+            kernel, memory = decode_activity_resources(
+                table, resource_columns, raw[6:], strings
+            )
             key = ((global_pid >> 24) & 16777215, correlation)
             index.activities.setdefault(key, []).append(
                 _NativeActivity(start, end, node, table, source_rowid, kernel, memory)
@@ -707,6 +610,8 @@ def analyze_graph_replays(
     registry: CostRegistry,
     hardware: Path | None,
     evidence_kind: str,
+    eager_projection: Path | None = None,
+    sealed_communication_artifacts: dict[str, dict] | None = None,
 ) -> dict:
     """Analyze actual ready collector records against a same-run SQLite export.
 
@@ -759,9 +664,9 @@ def analyze_graph_replays(
         if not isinstance(step, str) or not step:
             raise ValueError("Invalid replay step identity")
         if event == "forward_identity_bound":
-            if step in bindings and bindings[step] != row["forward_id"]:
+            if step in bindings and bindings[step] != row:
                 raise ValueError("Ambiguous late ForwardId binding")
-            bindings[step] = row["forward_id"]
+            bindings[step] = row
         elif event == "device_results_ready":
             if step in ready:
                 raise ValueError("Duplicate device-ready step identity")
@@ -778,6 +683,16 @@ def analyze_graph_replays(
         and row.get("binary_payload")
         and row.get("capture_file")
     ]
+    eager = [row for row in ready.values() if row.get("eager_sidecar") is not None]
+    mixed = bool(eager)
+    if mixed and eager_projection is None:
+        raise ValueError(
+            "Mixed native analysis requires the same-report eager projection"
+        )
+    if mixed and set(bindings) - set(ready):
+        raise ValueError("Late ForwardId binding lacks a device-ready step")
+    claimed_activities = {}
+    source_report = file_source(report)
     # Account for explicit dropped rows separately. A flushed, fingerprinted
     # payload remains valid when a different step could not be persisted.
     if (
@@ -788,7 +703,8 @@ def analyze_graph_replays(
         or manifest.get("device_results_ready") != len(ready)
         or manifest.get("persisted_payloads") != len(persisted)
         or manifest.get("dropped_metadata") != len(unavailable)
-        or len(persisted) + len(unavailable) != len(ready)
+        or manifest.get("persisted_eager", 0) != len(eager)
+        or len(persisted) + len(unavailable) + len(eager) != len(ready)
         or any(row.get("binary_payload") for row in unavailable)
     ):
         lifecycle_unknowns.append("collector_window_incomplete")
@@ -812,9 +728,7 @@ def analyze_graph_replays(
         for step_id, original in ready.items():
             row = dict(original)
             if step_id in bindings:
-                if row.get("forward_id") not in (None, bindings[step_id]):
-                    raise ValueError("Late ForwardId binding mismatch")
-                row["forward_id"] = bindings[step_id]
+                merge_forward_binding(row, bindings[step_id])
             unknowns = list(lifecycle_unknowns)
             if not _integer(row.get("forward_id")):
                 unknowns.append("forward_identity_unavailable")
@@ -822,6 +736,35 @@ def analyze_graph_replays(
                 raise ValueError("One ForwardId maps to multiple replay steps")
             else:
                 forward_steps[row["forward_id"]] = step_id
+            if row.get("eager_sidecar") is not None:
+                eager_step, scopes, timing = analyze_eager_step(
+                    row,
+                    config_sha256=manifest.get("profile_config_sha256"),
+                    database=database,
+                    projection=eager_projection,
+                    hardware=hardware,
+                    device_uuids=native_index.device_uuids,
+                    registry=registry,
+                    loaded_library_manifest=manifest.get("loaded_library_manifest"),
+                    source_report_sha256=source_report["sha256"],
+                    sealed_communication_artifacts=sealed_communication_artifacts,
+                )
+                for scope in scopes:
+                    for item in scope["native_activity_rows"]:
+                        identity = item["table"], item["rowid"]
+                        if claimed_activities.setdefault(identity, step_id) != step_id:
+                            raise ValueError(
+                                "Native GPU activity belongs to multiple serving steps"
+                            )
+                eager_step["critical_unknowns"] = sorted(
+                    set(unknowns) | set(eager_step["critical_unknowns"])
+                )
+                eager_step["eager_native_timing"] = timing
+                steps.append(eager_step)
+                all_rows.extend(scopes)
+                artifact = row["eager_sidecar"]
+                sources[artifact["path"]] = artifact
+                continue
             if (
                 row.get("unavailable_reason") is not None
                 or not row.get("binary_payload")
@@ -851,7 +794,9 @@ def analyze_graph_replays(
             capture_key = str(capture_path.resolve())
             if capture_key not in communication_bindings:
                 communication_bindings[capture_key] = bind_capture_communication(
-                    current, capture_path.parent
+                    current,
+                    capture_path.parent,
+                    sealed_artifacts=sealed_communication_artifacts,
                 )
             for op in current["ops"]:
                 if op["trace_label"] in communication_bindings[capture_key]:
@@ -871,6 +816,14 @@ def analyze_graph_replays(
             leases[slot] = generation
             scopes, records, ancestry = _scopes(current)
             activities, evidence, join_unknowns = _join(native_index, current, row)
+            if mixed:
+                for activity in activities:
+                    identity = activity["table"], activity["source_rowid"]
+                    if claimed_activities.setdefault(identity, step_id) != step_id:
+                        raise ValueError(
+                            "Native GPU activity belongs to multiple serving steps"
+                        )
+                evidence["attribution_mode"] = "cuda_graph_node_ids"
             evidence.update(
                 {
                     name: row.get(name)
@@ -1081,6 +1034,9 @@ def analyze_graph_replays(
                         "critical_unknowns": scope_unknowns,
                         "quantity_scope": "per_rank",
                         "coverage_scope": "opted_in_registered_calls",
+                        **(
+                            {"attribution_mode": "cuda_graph_node_ids"} if mixed else {}
+                        ),
                     }
                 )
             capture_source, binary_source = file_source(capture_path), file_source(
@@ -1123,7 +1079,9 @@ def analyze_graph_replays(
         "schema_version": 1,
         "run_id": manifest["run_id"],
         "rank": manifest["rank"],
-        "execution_mode": "cuda_graph_replay",
+        "execution_mode": (
+            "cuda_graph_replay_and_eager" if mixed else "cuda_graph_replay"
+        ),
         "evidence_kind": evidence_kind,
         "quantity_scope": "per_rank",
         "steps": steps,
@@ -1151,17 +1109,33 @@ def analyze_graph_replays(
             ],
         },
         "provenance": {
-            "report": file_source(report),
+            "report": source_report,
             "database": file_source(database),
             "replays": file_source(replays),
             "window": file_source(window),
             "artifacts": list(sources.values()),
+            **(
+                {
+                    "sealed_communication_sources": list(
+                        sealed_communication_artifacts.values()
+                    )
+                }
+                if sealed_communication_artifacts is not None
+                else {}
+            ),
+            **({"eager_projection": file_source(eager_projection)} if mixed else {}),
         },
         "device_analysis": {
-            "timing_kind": "nsight_graph_node_ids",
+            "timing_kind": (
+                "nsight_mixed_graph_eager" if mixed else "nsight_graph_node_ids"
+            ),
             "source_report": str(report.resolve()),
-            "source_report_sha256": file_source(report)["sha256"],
-            "timing_definition": "last associated graph-node activity end minus first start",
+            "source_report_sha256": source_report["sha256"],
+            "timing_definition": (
+                "last exactly attributed GPU activity end minus first start"
+                if mixed
+                else "last associated graph-node activity end minus first start"
+            ),
             "timestamp_unit": "ns",
             "scopes": all_rows,
         },
@@ -1292,30 +1266,51 @@ def native_coverage_receipt(
             else:
                 item = copy.deepcopy(matches[0])
                 unknowns.extend(item["critical_unknowns"])
-            expected_scopes = expected["expected_scope_ids"]
+            expected_scopes = expected.get("expected_scope_ids")
             actual_scopes = item.get("attributed_scope_ids", [])
             actual_layers = item.get("attributed_layer_ids", [])
             if (
-                expected["expected_layer_ids"] != expected_layers
+                expected.get("expected_layer_ids") != expected_layers
                 or actual_layers != expected_layers
             ):
                 unknowns.append("frozen_model_layer_coverage_incomplete")
-            if (
+            if not isinstance(expected_scopes, list) or not expected_scopes:
+                # A dropped forward still has an exact serving identity. Its
+                # per-forward scope expectations were never established.
+                expected_scopes = None
+                unknowns.append("measured_scope_expectations_unavailable")
+            elif (
                 item.get("expected_scope_ids") != expected_scopes
                 or actual_scopes != expected_scopes
             ):
                 unknowns.append("measured_scope_coverage_incomplete")
-            for name in ("capture_file", "binary_payload"):
-                if name not in expected or any(
-                    item.get(name, {}).get(field) != expected[name].get(field)
-                    for field in ("path", "sha256")
+            eager = expected.get("eager_sidecar")
+            for name in (
+                ("eager_sidecar",)
+                if eager is not None
+                else ("capture_file", "binary_payload")
+            ):
+                recorded, required = item.get(name), expected.get(name)
+                if (
+                    not isinstance(recorded, dict)
+                    or not isinstance(required, dict)
+                    or any(
+                        not required.get(field)
+                        or recorded.get(field) != required[field]
+                        for field in ("path", "sha256")
+                    )
                 ):
                     unknowns.append(f"measured_{name}_hash_mismatch")
             if set(item.get("scope_kinds", [])) != {
                 "model",
                 "layer",
                 "op",
-            } or not item.get("graph_node_ids"):
+            } or (
+                not item.get("graph_node_ids")
+                if eager is None
+                else item.get("attribution_mode") != "eager_nvtx_gpu_projection"
+                or not item.get("eager_native_timing", {}).get("activities")
+            ):
                 unknowns.append("missing_model_layer_op_native_coverage")
             item.update(
                 layer_coverage={
@@ -1326,8 +1321,10 @@ def native_coverage_receipt(
                 scope_coverage={
                     "expected_scope_ids": expected_scopes,
                     "attributed_scope_ids": actual_scopes,
-                    "missing_scope_ids": sorted(
-                        set(expected_scopes) - set(actual_scopes)
+                    "missing_scope_ids": (
+                        sorted(set(expected_scopes) - set(actual_scopes))
+                        if expected_scopes is not None
+                        else None
                     ),
                 },
                 critical_unknowns=sorted(set(unknowns)),
@@ -1349,7 +1346,11 @@ def native_coverage_receipt(
         "rank": result["rank"],
         "scope": "model_layer_op",
         "coverage_mode": source["requested_coverage_mode"],
-        "attribution": "same_run_cuda_graph_node_ids",
+        "attribution": (
+            "same_run_graph_and_eager_native_activities"
+            if result["device_analysis"]["timing_kind"] == "nsight_mixed_graph_eager"
+            else "same_run_cuda_graph_node_ids"
+        ),
         "status": "partial" if problems else "verified",
         "whole_run_status": result.get("whole_run_status", "not_verified"),
         "whole_run_critical_unknowns": sorted(

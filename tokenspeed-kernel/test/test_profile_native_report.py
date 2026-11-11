@@ -27,10 +27,14 @@ from tokenspeed_kernel.profile_native_report import _scope_message
 
 
 @pytest.mark.parametrize("flops", [0, 48])
-def test_native_communication_label_prioritizes_directional_utilization(flops):
+def test_native_communication_label_prioritizes_bandwidth(flops):
     row = dict(
         kind="op",
-        native_nvtx_label="communication.all_reduce",
+        native_nvtx_label=(
+            "communication.all_reduce_residual_rmsnorm"
+            if flops
+            else "communication.all_reduce"
+        ),
         iter_id=100,
         layer_id=2,
         step_id="fixture:r0:s100",
@@ -47,32 +51,58 @@ def test_native_communication_label_prioritizes_directional_utilization(flops):
         estimated_comm_utilization=0.08220183486238532,
         algbw_bytes_per_second=2348623853.211009,
         busbw_bytes_per_second=4110091743.1192656,
+        estimated_comm_tx_payload_bytes_per_second=2348623853.211009,
+        estimated_comm_rx_payload_bytes_per_second=16440366972.477064,
+        estimated_comm_reference_efficiency=0.011,
+        scheduler_status=dict(
+            completion_status="token_committed",
+            scheduled=True,
+            gpu_observed=True,
+            device_ready=True,
+            authoritative_commit=True,
+            token_commits=[],
+        ),
         communication_bottleneck_direction="rx",
         communication_payload_model={"id": "fixture_directional_payload"},
     )
     original = copy.deepcopy(row)
     message = _scope_message(row)
     assert message.startswith(
-        "communication.all_reduce | Est.CommBWUtil=8.22% | GPU=3.488us | "
+        f"{row['native_nvtx_label']} | Est.CommBWUtil=8.22% | "
+        "commAlgBW=2.35GB/s | commBusBW=4.11GB/s | "
+        "Est.TXPayloadBW=2.35GB/s | Est.RemoteRXPayloadBW=16.4GB/s | GPU=3.488us | "
     )
-    assert "Est.MBU(HBM)=0.14%" in message
-    assert (
-        message.index("Est.CommBWUtil=8.22%")
-        < message.index("Est.MBU(HBM)=0.14%")
-        < message.index("commAlgBW=")
-    )
-    assert "commBusBW=" in message and "bottleneck=rx" in message
+    assert message.index("GPU=3.488us") < message.index("Est.MBU(HBM)=0.14%")
+    assert message.index("Est.MBU(HBM)=0.14%") < message.index("status=token_committed")
+    assert message.count(" | commAlgBW=") == message.count(" | commBusBW=") == 1
+    assert "CommRefEff=1.1%" in message and "bottleneck=rx" in message
     assert "whole Op GPU span" in message
-    assert ("MFU_total=" in message) is bool(flops)
+    assert "commAlgBW/commBusBW=NCCL-tests reference" in message
+    if flops:
+        assert message.index("GPU=3.488us") < message.index("MFU_total=")
+    else:
+        assert "MFU_total=" not in message
     assert row == original
     row["estimated_comm_utilization"] = None
+    row["busbw_bytes_per_second"] = None
+    row["estimated_comm_rx_payload_bytes_per_second"] = None
     row["estimated_comm_utilization_missing_reason"] = "fixture missing mapping"
     unavailable = _scope_message(row)
     assert unavailable.startswith(
-        "communication.all_reduce | Est.CommBWUtil=N/A | GPU=3.488us | "
+        f"{row['native_nvtx_label']} | Est.CommBWUtil=N/A | "
+        "commAlgBW=2.35GB/s | commBusBW=N/A | "
+        "Est.TXPayloadBW=2.35GB/s | Est.RemoteRXPayloadBW=N/A | GPU=3.488us | "
     )
     assert "fixture missing mapping" in unavailable
     assert "Est.MBU(HBM)=0.14%" in unavailable
+
+    row.pop("communication_payload_model")
+    row.pop("estimated_comm_tx_payload_bytes_per_second")
+    row.pop("estimated_comm_rx_payload_bytes_per_second")
+    historical = _scope_message(row)
+    assert "Est.TXPayloadBW=" not in historical
+    assert "Est.RemoteRXPayloadBW=" not in historical
+    assert historical.index("commAlgBW=") < historical.index("GPU=")
 
 
 def test_native_label_reader_remains_independent_of_torch():

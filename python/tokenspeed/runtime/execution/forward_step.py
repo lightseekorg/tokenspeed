@@ -1257,7 +1257,16 @@ class ForwardStepRunner:
             )
         else:
             profile_eager = (
-                self.utilization_profile.eager()
+                self.utilization_profile.eager(
+                    batch_size=bs,
+                    input_tokens=ctx.input_num_tokens,
+                    decode_query_width=(
+                        self.max_tokens_per_req
+                        if ctx.forward_mode.is_decode()
+                        else None
+                    ),
+                    query_sharded=ctx.query_shard is not None,
+                )
                 if self.utilization_profile is not None
                 else nullcontext()
             )

@@ -1093,7 +1093,6 @@ setup(
     install_requires=_selected_install_requires(),
     packages=find_packages(),
     package_data={
-        "tokenspeed_kernel": ["_nvtx_profile.c"],
         "tokenspeed_kernel.ops.communication": [
             "_cuda/*.cu",
             "_cuda/*.cuh",

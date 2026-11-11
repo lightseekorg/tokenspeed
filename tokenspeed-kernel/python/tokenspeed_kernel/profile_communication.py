@@ -87,6 +87,19 @@ def _probe(device, *, include_topology: bool) -> dict:
         )
         if result["nvml_uuid"].lower() != result["uuid"].lower():
             raise ValueError("CUDA and NVML UUID differ")
+        try:
+            pci = pynvml.nvmlDeviceGetPciInfo(handle)
+            current_mig_mode, pending_mig_mode = pynvml.nvmlDeviceGetMigMode(handle)
+            result.update(
+                pci_device_id=int(pci.pciDeviceId),
+                pci_subsystem_id=int(pci.pciSubSystemId),
+                mig_mode=int(current_mig_mode),
+                pending_mig_mode=int(pending_mig_mode),
+                full_device=result["nvml_uuid"].startswith("GPU-")
+                and current_mig_mode == pynvml.NVML_DEVICE_MIG_DISABLE,
+            )
+        except (AttributeError, pynvml.NVMLError) as error:
+            result["board_identity_unavailable"] = f"{type(error).__name__}: {error}"
         for link in range(pynvml.NVML_NVLINK_MAX_LINKS):
             try:
                 active = bool(pynvml.nvmlDeviceGetNvLinkState(handle, link))
@@ -96,8 +109,13 @@ def _probe(device, *, include_topology: bool) -> dict:
             row = {"link": link, "active": active}
             result["links"].append(row)
             if active:
+                try:
+                    row["version"] = int(
+                        pynvml.nvmlDeviceGetNvLinkVersion(handle, link)
+                    )
+                except pynvml.NVMLError as error:
+                    row["version_unavailable"] = str(error)
                 row.update(
-                    version=int(pynvml.nvmlDeviceGetNvLinkVersion(handle, link)),
                     remote_device_type=int(
                         pynvml.nvmlDeviceGetNvLinkRemoteDeviceType(handle, link)
                     ),
@@ -191,9 +209,8 @@ def bind_communication_profile(
     }
     snapshot = dict(
         link_version_definition={
-            "raw_enum": 6,
-            "generation": "4.0",
-            "source": "https://nvidia.github.io/cuda-python/cuda-bindings/13.4.4/module/generated/cuda.bindings.nvml.NvlinkVersion.html",
+            "api": "nvmlDeviceGetNvLinkVersion",
+            "value_kind": "driver_api_raw",
         },
         schema="tokenspeed.communication_evidence/v1",
         run_id=run_id,
@@ -309,56 +326,69 @@ def _freeze_workspace_allocation(allocation: dict) -> None:
     allocation["communication_snapshot_sha256"] = _binding["sha256"]
 
 
-def _nvlink_group(rows: list[dict], topology_evidence: dict) -> bool:
-    """Prove a single-node switched NVLink peer route for these endpoints."""
-    if len({row.get("host") for row in rows}) != 1 or any(
-        row.get("unavailable") for row in rows
+def _nvlink_group(
+    rows: list[dict], topology_evidence: dict
+) -> tuple[tuple[str, ...], tuple[int, ...]] | None:
+    """Prove a switched peer route and retain switch addresses and link counts."""
+    host = topology_evidence.get("host")
+    topology = topology_evidence.get("topology", {})
+    if (
+        not host
+        or topology.get("returncode") != 0
+        or any(row.get("host") != host or row.get("unavailable") for row in rows)
     ):
-        return False
-    switches = []
+        return None
     indices = [row.get("physical_index") for row in rows]
-    if any(type(index) is not int for index in indices):
-        return False
+    if any(type(index) is not int or index < 0 for index in indices) or len(
+        set(indices)
+    ) != len(indices):
+        return None
+    # nvidia-smi can underline its header with ANSI SGR formatting even when
+    # captured to a pipe. Keep raw evidence and parse plain tokens.
+    text = re.sub(r"\x1b\[[0-9;]*m", "", topology["stdout"])
+    lines = [line.split() for line in text.splitlines()]
+    header = next((line for line in lines if line and line[0] == "GPU0"), None)
+    if header is None:
+        return None
+    table = {
+        line[0]: line[1:]
+        for line in lines
+        if line and re.fullmatch(r"GPU\d+", line[0]) and line is not header
+    }
+    switches = []
+    peer_link_counts = set()
     for row in rows:
         active = [link for link in row.get("links", ()) if link.get("active")]
-        if not active or any(
-            link.get("remote_device_type") != row.get("switch_device_type")
-            or not link.get("remote_pci")
-            for link in active
+        switch_type = row.get("switch_device_type")
+        if (
+            not active
+            or type(switch_type) is not int
+            or any(
+                link.get("remote_device_type") != switch_type
+                or not isinstance(link.get("remote_pci"), str)
+                or not link["remote_pci"]
+                for link in active
+            )
         ):
-            return False
+            return None
         switches.append({link["remote_pci"] for link in active})
-        if topology_evidence.get("host") != row.get("host"):
-            return False
-        topology = topology_evidence.get("topology", {})
-        if topology.get("returncode") != 0:
-            return False
-        # nvidia-smi can underline its header with ANSI SGR formatting even
-        # when captured to a pipe. Preserve raw evidence; parse plain tokens.
-        text = re.sub(r"\x1b\[[0-9;]*m", "", topology["stdout"])
-        lines = [line.split() for line in text.splitlines()]
-        header = next((line for line in lines if line and line[0] == "GPU0"), None)
-        if header is None:
-            return False
-        table = {
-            line[0]: line[1:]
-            for line in lines
-            if line and re.fullmatch(r"GPU\d+", line[0]) and line is not header
-        }
         own = table.get(f"GPU{row['physical_index']}")
         if own is None:
-            return False
+            return None
         for index in indices:
             if index == row["physical_index"]:
                 continue
             label = f"GPU{index}"
             if (
-                label not in header
+                header.count(label) != 1
                 or header.index(label) >= len(own)
                 or not re.fullmatch(r"NV[1-9]\d*", own[header.index(label)])
             ):
-                return False
-    return all(ports == switches[0] for ports in switches)
+                return None
+            peer_link_counts.add(int(own[header.index(label)][2:]))
+    if not switches or any(ports != switches[0] for ports in switches):
+        return None
+    return tuple(sorted(switches[0])), tuple(sorted(peer_link_counts))
 
 
 def _group_observation(ranks: tuple[int, ...], group_name) -> dict:
@@ -408,27 +438,61 @@ def _group_observation_from_snapshot(
     if all(
         links
         and all(
-            type(link.get("version")) is int
-            and isinstance(link.get("raw_status_bytes_per_second"), (int, float))
+            type(link.get("raw_status_bytes_per_second")) in (int, float)
             for link in links
         )
-        and len({link["version"] for link in links}) == 1
         for links in active
     ):
         result.update(
             comm_rank_active_link_counts=tuple(len(links) for links in active),
-            comm_rank_link_versions=tuple(links[0]["version"] for links in active),
             comm_rank_min_link_rate_bytes_per_second=tuple(
                 min(link["raw_status_bytes_per_second"] for link in links)
                 for links in active
             ),
             comm_link_source=source + "#rank_evidence.links+link_status",
         )
-    if _nvlink_group(rows, binding["rank_evidence"][0]):
+        if all(
+            all(type(link.get("version")) is int for link in links)
+            and len({link["version"] for link in links}) == 1
+            for links in active
+        ):
+            result["comm_rank_link_versions"] = tuple(
+                links[0]["version"] for links in active
+            )
+    topology = _nvlink_group(rows, binding["rank_evidence"][0])
+    if topology is not None:
         result.update(
             comm_topology="single_node_nvswitch",
             comm_topology_source=source + "#rank_evidence.links+topology",
         )
+        if "comm_link_source" in result and all(
+            type(row.get("pci_device_id")) is int
+            and type(row.get("pci_subsystem_id")) is int
+            and type(row.get("full_device")) is bool
+            and isinstance(row.get("nvml_uuid"), str)
+            and row["nvml_uuid"].lower() == row.get("uuid", "").lower()
+            and all(
+                type(link.get("link")) is int and link["link"] >= 0 for link in links
+            )
+            and len({link["link"] for link in links}) == len(links)
+            for row, links in zip(rows, active, strict=True)
+        ):
+            switch_pci, peer_link_counts = topology
+            result.update(
+                comm_rank_pci_device_ids=tuple(row["pci_device_id"] for row in rows),
+                comm_rank_pci_subsystem_ids=tuple(
+                    row["pci_subsystem_id"] for row in rows
+                ),
+                comm_rank_full_devices=tuple(row["full_device"] for row in rows),
+                comm_switch_pci_addresses=switch_pci,
+                comm_peer_nvlink_counts=peer_link_counts,
+                comm_rank_max_link_rate_bytes_per_second=tuple(
+                    max(link["raw_status_bytes_per_second"] for link in links)
+                    for links in active
+                ),
+                comm_nvlink_board_source=source
+                + "#rank_evidence.pci+mig+links+topology",
+            )
     return result
 
 
@@ -438,12 +502,15 @@ def _mnnvl_route_observation(
     allocation: dict | None,
     ranks: tuple[int, ...],
     group_name,
+    *,
+    twoshot_geometry: dict | None = None,
 ) -> dict:
+    algorithm = metadata.get("comm_algorithm")
     if not (
         metadata.get("comm_backend") == "trtllm"
         and metadata.get("comm_workspace") == "mnnvl"
         and metadata.get("comm_protocol") == "mnnvl"
-        and metadata.get("comm_algorithm") == "oneshot"
+        and (algorithm == "oneshot" or (algorithm == "twoshot" and twoshot_geometry))
         and metadata.get("comm_pattern") in (0, 1)
         and metadata.get("comm_topology") == "single_node_nvswitch"
         and metadata.get("comm_placement") == "single_node"
@@ -458,31 +525,130 @@ def _mnnvl_route_observation(
         and all(binding["route_sources"].get(path) for path in _MNNVL_ROUTE_SOURCES)
     ):
         return {}
-    # The verified CUDA allocator/multicast mapping plus the actually selected
-    # one-shot branch establishes NVLS. This is not inferred from a GPU name.
+    if twoshot_geometry is None:
+        model = "trtllm_mnnvl_oneshot_remote_payload"
+        addressing = "nvls_multicast"
+        model_source = "one complete input MC store; other-rank replica payload delivery; local poll/reduce"
+    else:
+        model = "trtllm_mnnvl_twoshot_remote_payload"
+        addressing = "nvlink_peer_unicast_then_nvls_multicast"
+        model_source = "native two-shot kernel; unicast scatter to token owner; owner multicasts reduced vector"
     return dict(
         comm_transport="nvlink",
-        comm_addressing="nvls_multicast",
+        comm_addressing=addressing,
         comm_allocator_backend="CUDA",
         comm_allocation_source=allocation["source"],
-        comm_normalization="trtllm_mnnvl_oneshot_remote_payload",
-        comm_payload_model="trtllm_mnnvl_oneshot_remote_payload",
+        comm_normalization=model,
+        comm_payload_model=model,
         comm_payload_model_source=metadata["comm_route_source"]
-        + "#trtllm_mnnvl_allreduce_fusion.cuh: one complete input MC store; other-rank replica payload delivery; local poll/reduce",
+        + "#trtllm_mnnvl_allreduce_fusion.cuh: "
+        + model_source,
         comm_transport_source=allocation["source"]
         + "; "
         + metadata["comm_route_source"]
         + "; "
         + metadata["comm_topology_source"],
+        **(twoshot_geometry or {}),
     )
 
 
+_MNNVL_FUSION_HEADER = (
+    "thirdparty/cuda/csrc/include/flashinfer/comm/trtllm_mnnvl_allreduce_fusion.cuh"
+)
+_MNNVL_TWOSHOT_SOURCE_SHA256 = (
+    "e18ef6e6482ddc4d9660e4ee05bd0d1fc5b5162593b1191442783aa5695388bf"
+)
 _MNNVL_ROUTE_SOURCES = (
     "thirdparty/cuda/trtllm.py",
     "thirdparty/cuda/csrc/trtllm_mnnvl_allreduce_fusion.cu",
-    "thirdparty/cuda/csrc/include/flashinfer/comm/trtllm_mnnvl_allreduce_fusion.cuh",
+    _MNNVL_FUSION_HEADER,
     "thirdparty/cuda/csrc/include/flashinfer/vec_dtypes.cuh",
 )
+
+
+def _mnnvl_twoshot_geometry(op, activities, binding, ranks) -> dict:
+    """Prove the reviewed scatter/multicast launch and recover its token geometry."""
+    observation = op["scalar_args"]
+    pattern = observation.get("comm_pattern")
+    spec = {
+        0: ("communication.all_reduce", "trtllm_all_reduce", "tensor"),
+        1: (
+            "communication.all_reduce_residual_rmsnorm",
+            "trtllm_allreduce_residual_rmsnorm",
+            "input_tensor",
+        ),
+    }
+    if (
+        type(pattern) is not int
+        or pattern not in spec
+        or observation.get("comm_use_oneshot") is not False
+        or len(ranks) not in (2, 4, 8, 16)
+        or binding["route_sources"].get(_MNNVL_FUSION_HEADER)
+        != _MNNVL_TWOSHOT_SOURCE_SHA256
+        or type(observation.get("comm_payload_element_size")) is not int
+        or observation["comm_payload_element_size"] != 2
+        or len(activities) != 1
+    ):
+        raise ValueError(
+            "reviewed MNNVL two-shot source/selection/activity unavailable"
+        )
+    op_name, implementation, input_name = spec[pattern]
+    tensor = op["inputs"][input_name]
+    shape = tensor["shape"]
+    native_type = {"torch.bfloat16": "__nv_bfloat16", "torch.float16": "__half"}.get(
+        tensor["dtype"]
+    )
+    if (
+        (op.get("op_name"), op.get("implementation")) != (op_name, implementation)
+        or native_type is None
+        or not isinstance(shape, (list, tuple))
+        or len(shape) != 2
+        or any(type(dim) is not int or dim <= 0 for dim in shape)
+        or shape[0] > 2048
+        or shape[1] % 8
+        or tuple(tensor["stride"]) != (shape[1], 1)
+        or tensor["logical_bytes"] != shape[0] * shape[1] * 2
+        or tensor["logical_bytes"] != observation.get("comm_payload_bytes")
+    ):
+        raise ValueError("MNNVL two-shot payload geometry differs from the Op input")
+    activity = activities[0]
+    kernel = activity.get("kernel") or {}
+    name = kernel.get("demangled_name") or ""
+    kernel_name = "mnnvl_allreduce_fusion_kernel_twoshot"
+    prefix = (
+        "void flashinfer::trtllm_mnnvl_allreduce_fusion::"
+        + kernel_name
+        + "<(flashinfer::trtllm_allreduce_fusion::AllReduceFusionPattern)"
+        + f"{pattern}, {native_type}, (int){len(ranks)}, "
+    )
+    grid, block, cluster = (kernel.get(key) for key in ("grid", "block", "cluster"))
+    if (
+        activity.get("kind") != "kernel"
+        or activity.get("table") != "CUPTI_ACTIVITY_KIND_KERNEL"
+        or type(activity.get("source_rowid")) is not int
+        or activity["source_rowid"] <= 0
+        or kernel.get("short_name") != kernel_name
+        or not isinstance(kernel.get("name"), str)
+        or not kernel["name"]
+        or not name.startswith(prefix)
+        or not all(
+            isinstance(dims, (list, tuple))
+            and len(dims) == 3
+            and all(type(dim) is int and dim > 0 for dim in dims)
+            for dims in (grid, block, cluster)
+        )
+        or tuple(grid) != (shape[0], cluster[1], 1)
+        or tuple(cluster) != (1, cluster[1], 1)
+        or tuple(block[1:]) != (1, 1)
+        or block[0] * cluster[1] * 8 != shape[1]
+    ):
+        raise ValueError("MNNVL two-shot native kernel/launch geometry differs")
+    return {
+        "comm_payload_tokens": shape[0],
+        "comm_payload_bytes_per_token": shape[1] * 2,
+        "comm_native_kernel": kernel["name"],
+        "comm_native_kernel_rowid": activity["source_rowid"],
+    }
 
 
 def record_communication_route(
@@ -542,8 +708,14 @@ def record_communication_route(
             metadata.pop("comm_transport_source", None)
 
 
-def bind_capture_communication(capture: dict, directory: Path) -> dict[str, dict]:
-    """Rebind missing static graph route evidence from same-run hashed receipts.
+def bind_capture_communication(
+    capture: dict,
+    directory: Path,
+    *,
+    sealed_artifacts: dict[str, dict] | None = None,
+    native_op_activities: dict[str, list[dict]] | None = None,
+) -> dict[str, dict]:
+    """Rebind missing static route evidence from same-run hashed receipts.
 
     No raw artifact is changed, no transport is inferred from names, and no
     machine/device query runs offline. Unknown or ambiguous mappings stay absent.
@@ -555,17 +727,43 @@ def bind_capture_communication(capture: dict, directory: Path) -> dict[str, dict
         and op["scalar_args"].get("comm_workspace") == "mnnvl"
         and not op["scalar_args"].get("comm_transport")
     ]
-    if not pending:
-        return {}
 
     def read(path, expected=None):
         if path.stat().st_size > 16 * 1024 * 1024:
             raise ValueError("communication receipt byte budget exceeded")
         contents = path.read_bytes()
         digest = _sha(contents)
+        if sealed_artifacts is not None:
+            source = sealed_artifacts.get(str(path.resolve()))
+            if (
+                source is None
+                or source["bytes"] != len(contents)
+                or source["sha256"] != digest
+            ):
+                raise ValueError(
+                    "Communication source differs from sealed run inventory"
+                )
         if expected is not None and digest != expected:
             raise ValueError("communication receipt SHA256 mismatch")
         return json.loads(contents), digest
+
+    if sealed_artifacts is not None:
+        verified_references = set()
+        for op in capture["ops"]:
+            observation = op["scalar_args"]
+            if observation.get("comm_addressing") != "nvls_multicast":
+                continue
+            for field in ("comm_placement_source", "comm_allocation_source"):
+                original, separator, suffix = observation[field].partition("#sha256=")
+                digest = suffix[:64]
+                if not separator or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+                    raise ValueError(
+                        "Recorded multicast route lacks sealed receipt identity"
+                    )
+                path = directory / Path(original).name
+                if (path, digest) not in verified_references:
+                    read(path, digest)
+                    verified_references.add((path, digest))
 
     result = {}
     cache = {}
@@ -624,6 +822,11 @@ def bind_capture_communication(capture: dict, directory: Path) -> dict[str, dict
                         raise ValueError("communication peer/source contract differs")
                     matches = []
                     for path in directory.glob(f"rank-{rank}.mnnvl-allocation-*.json"):
+                        if (
+                            sealed_artifacts is not None
+                            and str(path.resolve()) not in sealed_artifacts
+                        ):
+                            continue
                         item, item_sha = read(path)
                         allocation = item.get("allocation", {})
                         if (
@@ -693,8 +896,22 @@ def bind_capture_communication(capture: dict, directory: Path) -> dict[str, dict
                     "recorded communication placement differs from receipt"
                 )
             observation.update(base)
+            twoshot_geometry = None
+            if observation.get("comm_algorithm") == "twoshot":
+                if sealed_artifacts is None or native_op_activities is None:
+                    raise ValueError(
+                        "MNNVL two-shot requires sealed routes and native Op activities"
+                    )
+                twoshot_geometry = _mnnvl_twoshot_geometry(
+                    op, native_op_activities.get(op["trace_label"], ()), binding, ranks
+                )
             route = _mnnvl_route_observation(
-                observation, binding, allocation, ranks, group
+                observation,
+                binding,
+                allocation,
+                ranks,
+                group,
+                twoshot_geometry=twoshot_geometry,
             )
             if not route:
                 raise ValueError(

@@ -14,4 +14,3 @@ flashinfer-python==0.7.2
 # FlashInfer tactic-cache metadata includes the frontend version; keep it stable.
 nvidia-cudnn-frontend==1.31.0
 nvidia-ml-py==13.580.82
-nvtx

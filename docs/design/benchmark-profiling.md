@@ -37,18 +37,18 @@ Tensor fields inside dataclass argument/return holders are described using dotte
 paths, such as `cache.kv_cache` and `return.query`; no tensor values are copied.
 
 Dynamic geometry can explicitly opt into `integer_tensor_args=("cache_seqlens",)`.
-These snapshots accept contiguous 1-D/2-D int32/int64 tensors of at most 4096
-values; matrices use a flat alias view. Explicit dotted argument paths traverse
+These snapshots accept contiguous 1-D/2-D int32/int64 tensors. The per-argument
+default is 4096 values. Grouped experts opt into 8192 route IDs. Matrices use a
+flat alias view. Explicit dotted argument paths traverse
 stored fields, dictionaries and NamedTuple fields, without evaluating properties.
 Without a collector, CPU values become immutable tuples immediately. CUDA values
 require an observer. The eager `NvtxTimeline`
 queues same-stream D2H copies before the op's NVTX range into a preallocated
-pinned buffer (`max_metadata_bytes`, default 1 MiB). Values are resolved after the
-window's final synchronization for metadata copies only. Reusing a device buffer preserves each
-call's original lengths. Ordinary metadata collection never reads CUDA values;
-unavailable snapshots remain `null` with a missing-cost reason. Snapshot overhead
-affects enclosing layer timing but is outside the op NVTX range. Capacity
-exhaustion raises explicitly.
+pinned buffer (`max_metadata_bytes`, default 1 MiB). Standalone values are
+resolved after the window's final metadata synchronization. Serving uses the
+existing result-copy event. Reusing a device buffer preserves each call's
+original lengths. Unavailable snapshots remain `null` with a missing-cost
+reason. Standalone capacity exhaustion raises. Serving reports it per argument.
 
 Existing direct entry points can use `wrap_op_for_profiling` with a `KernelSpec`
 for identity only; this does not register another kernel or alter dispatch.
@@ -293,16 +293,18 @@ excluded. Both native kernels belong to one attention op window. Sparse, FP8
 cache and sink variants retain an explicit missing-cost reason.
 
 FA3's packed variable-length entry uses the same QK/PV formula, with explicit
-snapshots of both cumulative-length vectors. Each request is counted separately,
-including lower-right causal alignment when query and key lengths differ.
+snapshots of both cumulative-length vectors and any supplied `seqused_q` or
+`seqused_k`. Each used length must fit its packed sequence capacity. Each request
+is counted separately, including lower-right causal alignment when query and key
+lengths differ.
 This covers normal MLA prefill's causal current-chunk pass and noncausal prefix
 passes without charging the full history on every pass. Q/K/V IO uses their
 expanded per-head tensors; returned LSE and the length arguments are included.
 Prefix KV projections, cache gathers, output copies and attention-state merges
-remain separate work. Native BF16/FP16 full or causal attention is supported;
-sliding windows, chunk masks, sinks, used-length overrides and FP8 variants retain
-a missing-cost reason. This metadata adapter does not add a second attention
-formula or change the vendor call's arguments/return values.
+remain separate work. The rule supports native BF16/FP16 full or causal
+attention. Sliding windows, chunk masks, sinks, missing used lengths and FP8
+variants retain a missing-cost reason. The adapter uses the existing attention
+formula and forwards the vendor arguments unchanged.
 
 The existing CUDA and Triton attention-state merge registrations share
 `attention_merge_state.v1`. It counts `3*N` useful FLOPs for combining two
@@ -379,12 +381,23 @@ metadata and are never GPU-time fallbacks.
 
 Visible labels are short (`gemm.mm`, `L7`). A process-local monotonic numeric
 NVTX payload joins each range to its full metadata identity, including repeated
-calls and iterations. Process and thread IDs prevent cross-rank joins. The C
-bridge records ordinary NVTX ranges; it does not submit invented timestamps.
-Wrappers supply the display name separately from the serialized identity; the
-collector does not parse identity strings to decide what to show. Offline analysis
-reads the projection CSV and this process/thread's native ranges separately,
-then joins payload IDs to Nsight range IDs before calculating metrics.
+calls and iterations. Process and thread IDs prevent cross-rank joins. The
+NVIDIA Python NVTX package emits same-thread push/pop ranges in the
+`TokenSpeed` domain. Its `get_domain(...).push_range(message=..., payload=...)`
+API stores Python integer payloads as signed 64-bit integers. The collector
+accepts scope IDs from `0` to `2**63 - 1` and rejects overflow before emitting
+a range. Wrappers supply the display name separately from the serialized
+identity. Offline analysis joins the projection CSV to this process/thread's
+native ranges by payload and Nsight range ID. It reads `int64Value` for Python
+sidecars and `uint64Value` for older C sidecars, preserving integer precision
+through the join. [NVIDIA Python NVTX payload types](https://nvidia.github.io/NVTX/python/annotation_attributes.html#payload).
+
+Install the optional `tokenspeed-kernel[nvtx]` extra, which pins
+`nvtx==0.2.17`, or install that NVIDIA package into an existing environment.
+Run eager collection under Nsight Systems 2026.5 or newer with
+`--trace=cuda,nvtx`. Remove `library` or `nvtx_library` from existing timeline
+configs. The Python NVTX package is loaded when eager native ranges are
+requested. [NVIDIA nvtx 0.2.17](https://pypi.org/project/nvtx/0.2.17/).
 
 At context exit, the collector evaluates costs and writes the sidecar with
 `device_analysis.timing_kind="pending_nsight"`. It synchronizes only when explicit
@@ -395,7 +408,7 @@ op timing. `finish()` is idempotent and runs outside iteration scopes.
 with NvtxTimeline(
     session, costs=costs, hardware=hardware,
     stream=torch.cuda.current_stream(), max_scopes=128,
-    library=bridge_path, output=metadata_path,
+    output=metadata_path,
 ):
     with session.iteration(iter_id=0):
         result = layer(inputs)
@@ -538,7 +551,44 @@ eager execution or change backend selection. `TOKENSPEED_TIMELINE_CONFIG` names 
 JSON file with the existing run/output/hardware/layers/window/HBM policy fields.
 Graph collection additionally requires explicit `cuda_runtime_library` and
 `cupti_library` paths. CUPTI must be the same already-loaded instance used by the
-external profiler. `max_metadata_bytes` bounds each capture slab and pinned slot;
+external profiler. A selected eager step emits a separate
+`rank-N.step-M.eager.json` through Python NVTX. Its integer snapshots become
+CPU-readable at the existing result-copy event. Eager capture reserves one of
+`metadata_slots` independently bounded sidecars. Exhaustion records an explicit
+metadata drop before allocating the eager buffer. The ready identity is saved
+at the event gate. The existing profile stop materializes the sidecar and
+publishes its SHA256 and size after the measured window. Graph payloads still
+drain through the live writer. Use `device_ready_sequence` for result readiness
+order because eager rows can be written after later Graph rows. The same replay
+index records any later ForwardId binding. The paired run manifest seals those sidecars with the
+rank config and Graph artifacts. If Python NVTX is unavailable or the domain is
+inactive, the step records an explicit drop reason and executes eagerly.
+
+Eager grouped expert accounting uses the live unsharded token count and this
+step's own route IDs. A packed multi-request forward can supply the total live
+rows without a uniform per-request width. With 48 layers and a `472×12` int32
+route matrix per layer, the route snapshots require 1,087,488 bytes before other
+metadata. Set `max_metadata_bytes` to cover the requested observer data.
+
+Mixed analysis projects the eager ranges with Nsight against the same SQLite
+export used for Graph joins. Each eager range is matched by domain, signed
+payload, process, thread and boundaries. The correlated CUDA activity row IDs,
+span and correlation count must agree with Nsight's projection. A signed
+`Profiler integer metadata D2H` range identifies each serving observer transfer.
+The analyzer verifies the original copy row and byte count and excludes these
+rows from Model, Layer, Op and scheduler model-work activity. Work spans can
+still contain elapsed gaps. Post-Model sampling support is attributed to the
+serving step separately. Graph steps retain node and clone attribution.
+Scheduler overlap uses the captured activity union for either path. The explicitly selected offline cost provider
+uses the eager sidecar's live tensors and branches with the uniquely owned
+CUPTI runtime and GPU activity rows. Reviewed engine guards default to Graph.
+A guard that independently qualifies eager may declare
+`attribution_modes: ["eager_nvtx_gpu_projection"]`. The eager proof retains
+the signed scope payload, launch resources, worker, CUDA device and context,
+source-report and sidecar fingerprints. Eager compute without matching
+reviewed evidence retains its useful FLOPs and N/A MFU. Sidecars from earlier runs are required
+for eager attribution in those runs.
+`max_metadata_bytes` bounds each capture slab and pinned slot;
 `metadata_slots` bounds retained asynchronous results. `ranks` optionally selects
 ranks. Each rank saves its normalized config contents/SHA256 and selected hardware
 input snapshot before capture. `TOKENSPEED_PROFILE_RUN_ID`, when set, must agree.

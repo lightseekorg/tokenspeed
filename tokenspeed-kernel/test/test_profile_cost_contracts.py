@@ -684,7 +684,7 @@ def test_closed_include_search_keeps_negative_results_and_rejects_unknown_inputs
     assert item["presence"] == "unavailable"
 
 
-def epoch_resolver_fixture(tmp_path):
+def epoch_resolver_fixture(tmp_path, *, legacy_config):
     """Synthetic CPU proof inputs exercise the real resolver, never GPU truth."""
     import copy
     import shlex
@@ -734,7 +734,10 @@ def epoch_resolver_fixture(tmp_path):
     observation = dict(body=body, sha256=digest(body))
     from tokenspeed_kernel.op_profile import _profile_config_for_observation
 
-    config_sha = digest(_profile_config_for_observation(observation, run_id=run_id))
+    expanded = _profile_config_for_observation(observation, run_id=run_id)
+    if legacy_config:
+        expanded["library"] = None
+    config_sha = digest(expanded)
     compiler = dict(
         path="/compiler",
         requested="/compiler",
@@ -925,10 +928,15 @@ def epoch_resolver_fixture(tmp_path):
     return registry, session, context
 
 
-def test_before_engine_epoch_binds_real_resolver_and_rejects_bad_lineage(tmp_path):
+@pytest.mark.parametrize("legacy_config", [False, True])
+def test_before_engine_epoch_binds_real_resolver_and_rejects_bad_lineage(
+    tmp_path, legacy_config
+):
     import copy
 
-    registry, session, context = epoch_resolver_fixture(tmp_path)
+    registry, session, context = epoch_resolver_fixture(
+        tmp_path, legacy_config=legacy_config
+    )
 
     def evaluate(value):
         return registry.analyze(

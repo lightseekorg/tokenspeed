@@ -151,6 +151,19 @@ def test_native_expert_adapter_keeps_route_instances_unique_weights_and_prepaddi
         16,
     )
     assert cost.compute_type is None and cost.estimated_hbm_bytes is not None
+    packed = {**op.scalar_args, "logical_batch": 2, "logical_tokens": 2}
+    del packed["query_width"]
+    assert (
+        grouped_expert_cost(
+            replace(op, scalar_args=packed), hbm_policy="logical_io_once"
+        )
+        == cost
+    )
+    with pytest.raises(ValueError, match="differs from logical batch/query width"):
+        grouped_expert_cost(
+            replace(op, scalar_args={**op.scalar_args, "logical_tokens": 3}),
+            hbm_policy="logical_io_once",
+        )
     with pytest.raises(ValueError, match="Actual per-call"):
         grouped_expert_cost(replace(op, tensor_values={}), hbm_policy="logical_io_once")
     with pytest.raises(ValueError, match="pre-padding"):

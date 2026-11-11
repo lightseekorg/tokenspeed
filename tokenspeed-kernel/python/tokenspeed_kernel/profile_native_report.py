@@ -57,9 +57,24 @@ def _scope_message(row: dict) -> str:
     if communication:
         utilization = row.get("estimated_comm_utilization")
         display = "N/A" if utilization is None else f"{100 * utilization:.3g}%"
-        message += (
-            f"Est.CommBWUtil={display} | GPU={row['gpu_duration_ns'] / 1000:.5g}us | "
+        message += f"Est.CommBWUtil={display}"
+        rates = (
+            ("algbw_bytes_per_second", "commAlgBW"),
+            ("busbw_bytes_per_second", "commBusBW"),
         )
+        directional_rates = (
+            ("estimated_comm_tx_payload_bytes_per_second", "Est.TXPayloadBW"),
+            ("estimated_comm_rx_payload_bytes_per_second", "Est.RemoteRXPayloadBW"),
+        )
+        if row.get("communication_payload_model") or any(
+            row.get(field) is not None for field, _ in directional_rates
+        ):
+            rates += directional_rates
+        for field, title in rates:
+            value = row.get(field)
+            rate = "N/A" if value is None else f"{value / 1e9:.3g}GB/s"
+            message += f" | {title}={rate}"
+        message += f" | GPU={row['gpu_duration_ns'] / 1000:.5g}us | "
     if not (row.get("kind") == "op" and collective_only):
         message += f"MFU_total={mfu} "
     message += f"Est.MBU(HBM)={mbu}"
@@ -74,14 +89,9 @@ def _scope_message(row: dict) -> str:
             first, last = commit["accepted_token_interval"]
             message += f" | rid={commit['rid']} generation={commit['generation']} accepted_tokens=({first},{last}]"
     if row.get("kind") == "op" and row.get("collective_count"):
-        for field, title, scale, unit in (
-            ("algbw_bytes_per_second", "commAlgBW", 1e9, "GB/s"),
-            ("busbw_bytes_per_second", "commBusBW", 1e9, "GB/s"),
-            ("estimated_comm_reference_efficiency", "CommRefEff", 0.01, "%"),
-        ):
-            value = row.get(field)
-            display = "N/A" if value is None else f"{value / scale:.3g}{unit}"
-            message += f" {title}={display}"
+        efficiency = row.get("estimated_comm_reference_efficiency")
+        display = "N/A" if efficiency is None else f"{efficiency / 0.01:.3g}%"
+        message += f" CommRefEff={display}"
         model = row.get("communication_payload_model")
         model_name = model.get("id") if isinstance(model, dict) else model
         direction = row.get("communication_bottleneck_direction")
@@ -335,6 +345,7 @@ def annotate_report(
     if analysis["timing_kind"] not in {
         "nsight_gpu_projection",
         "nsight_graph_node_ids",
+        "nsight_mixed_graph_eager",
     }:
         raise ValueError("Native annotation requires completed Nsight GPU timing")
     rows = [

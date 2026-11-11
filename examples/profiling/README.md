@@ -56,7 +56,9 @@ python -m tokenspeed_kernel.profile_nsys \
 The example sequence places the profiled arm at index 1. Each completed profiled
 arm prints one `run-INDEX.SHA256.json` manifest. It records the exact source report,
 client, case, frozen model config, service metadata, all collector ranks, capture
-JSONs and binary payloads with file sizes and SHA256s. Keep those source locations
+JSONs, binary payloads and eager sidecars with file sizes and SHA256s. When
+the runtime emits communication and MNNVL allocation receipts, the manifest
+also seals their exact bytes and binds each allocation to its rank's receipt. Keep those source locations
 and bytes unchanged. The analyzer checks the manifest content hash, source hashes
 and run/rank identities before loading any explicitly selected cost provider or
 exporting the report. Select `--rank` when the manifest contains multiple ranks.
@@ -86,7 +88,10 @@ Torch version and Python source fingerprints in `N-service-nvtx.json`.
 The removed `TOKENSPEED_SERVICE_NVTX_LIBRARY` setting now raises a migration
 error; no C compiler, NVTX headers or custom library are needed. A JSON-only
 service case without a profiler command keeps JSON-only observation without
-importing Torch/NVTX for markers.
+importing Torch/NVTX for markers. The optional
+`tokenspeed-kernel[nvtx]` extra enables `--enable-nvtx` ranges and the separate
+eager Model/Layer/Op timeline. Remove `library` and `nvtx_library` from older
+timeline configs.
 
 Run the pair driver outside an existing profiler session. Each arm starts a
 fresh engine in a separate process with the same warmup, then shuts it down.
