@@ -33,10 +33,10 @@ rows and only reduce-scatters the shared ones.
 from tokenspeed_kernel._triton import gl, gluon
 from tokenspeed_kernel.ops.communication._iris.all_reduce import (
     _iris_lamport_exchange_tile,
-    _iris_lamport_push,
     _iris_lamport_twoshot_tile,
     _iris_sanitize_lamport_bf16,
-    _iris_wait_lamport_slots,
+    iris_lamport_twoshot_rs_push,
+    iris_lamport_twoshot_rs_wait_reduce,
 )
 
 
@@ -282,22 +282,23 @@ def _k3moe_shared_rs_program(
                 gl.amd.cdna4.buffer_load(shared_ptr + first + owner * BLOCK, lane)
             ),
         )
-    PHASE: gl.constexpr = WORLD_SIZE * MAX_SHARD_ELEMENTS
-    slots = stage * (2 * PHASE)
-    _iris_lamport_push(
+    iris_lamport_twoshot_rs_push(
         chunks[1:],
         regions,
-        slots + RANK * MAX_SHARD_ELEMENTS,
+        stage,
         offsets,
         None,
         gl.program_id(0),
         RANK,
         WORLD_SIZE,
+        MAX_SHARD_ELEMENTS,
         PEER_SIGNAL_STORE_CACHE,
     )
     valid = gl.full([offsets.shape[0]], True, gl.int1, gl.SliceLayout(1, layout))
-    scattered = _iris_wait_lamport_slots(
-        region_sym_ptr + slots,
+    reduced = iris_lamport_twoshot_rs_wait_reduce(
+        region_sym_ptr,
+        stage,
+        chunks[0],
         offsets,
         valid,
         RANK,
@@ -305,21 +306,10 @@ def _k3moe_shared_rs_program(
         MAX_SHARD_ELEMENTS,
         layout,
     )
-    # The two-shot's per-element arithmetic: FP32 rank order, one BF16 rounding.
-    for source in gl.static_range(0, WORLD_SIZE):
-        if source == RANK:
-            term = chunks[0]
-        else:
-            term = scattered[(source - RANK + WORLD_SIZE) % WORLD_SIZE - 1]
-        if source == 0:
-            accumulator = term.to(gl.float32)
-        else:
-            accumulator += term.to(gl.float32)
-    gl.amd.cdna4.buffer_store(
-        _iris_sanitize_lamport_bf16(accumulator.to(gl.bfloat16)),
-        output_ptr + first + RANK * BLOCK,
-        lane,
-    )
+    gl.amd.cdna4.buffer_store(reduced, output_ptr + first + RANK * BLOCK, lane)
+
+    PHASE: gl.constexpr = WORLD_SIZE * MAX_SHARD_ELEMENTS
+    slots = stage * (2 * PHASE)
 
     sentinel = (
         gl.where(offsets % 2 == 0, 0, 0x8000)
