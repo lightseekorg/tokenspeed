@@ -157,7 +157,11 @@ BASES = {
     "oproj": 64,
     "afin": 0,
     "sum": 128,
-    "coef": 0,
+    # One CTA past acoef, so no CTA runs the same proj_task task in both
+    # stages: the compiler would otherwise keep acoef's weight-tile offsets
+    # and poll indices live across the attention half for coef, which
+    # spills registers.
+    "coef": 1,
     "conv0": 128,
     "gu": 0,
     "act": 144,
