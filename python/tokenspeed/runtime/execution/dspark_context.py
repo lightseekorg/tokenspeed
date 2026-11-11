@@ -47,16 +47,17 @@ class _DSparkContextStage(Protocol):
 class DSparkContextModel(Protocol):
     """DSpark projection and cache writes for pipeline execution."""
 
-    hidden_size: int
+    # Projection columns this rank sums; the output norm gathers the rest.
+    projection_width: int
     mapping: _DSparkContextStage
 
     def project_target_tap(
         self, capture_idx: int, hidden: torch.Tensor
     ) -> torch.Tensor:
-        """Return one positional tap's contribution before output normalization."""
+        """Return one positional tap's ``projection_width`` columns, unnormalized."""
 
     def finalize_target_projection(self, projected: torch.Tensor) -> torch.Tensor:
-        """Normalize the complete sum in the draft's activation dtype."""
+        """Gather the summed columns and normalize them in the activation dtype."""
 
     def write_context_kv(
         self,
@@ -104,7 +105,7 @@ class DSparkContextProducer:
         self, hidden: torch.Tensor, inbound: torch.Tensor | None
     ) -> torch.Tensor:
         """Return this chunk's accumulator, continuing its upstream partial sum."""
-        expected = (hidden.shape[0], self.model.hidden_size)
+        expected = (hidden.shape[0], self.model.projection_width)
         if inbound is None:
             if not self.model.mapping.is_first_pp_rank:
                 raise ValueError(

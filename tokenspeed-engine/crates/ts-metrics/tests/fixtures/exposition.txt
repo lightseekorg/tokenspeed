@@ -12,7 +12,7 @@
 # HELP tokenspeed:kv_transfer_latency_seconds Wall time of one KV cache transfer send to a peer.
 # HELP tokenspeed:kv_transfer_size_bytes_total Bytes one KV cache transfer send moved to a peer.
 # HELP tokenspeed:kv_transfer_timeouts_total KV transfers that timed out, by transfer stage.
-# HELP tokenspeed:num_capacity_aborted_requests_total Requests the scheduler aborted because a capacity retraction could not image its victim (retraction snapshot pool, image rows or Host L2 exhausted); clients may resubmit them. Forced retractions from --debug-force-retraction-interval aborted the same way count too.
+# HELP tokenspeed:num_capacity_aborted_requests_total Requests the scheduler aborted because a capacity retraction could not image its victim (retraction snapshot pool, image rows or Host L2 exhausted), or because a lone request made no progress for 4096 consecutive scheduler plans; clients may resubmit them. Forced retractions from --debug-force-retraction-interval aborted the same way count too.
 # HELP tokenspeed:num_decode_kv_wait_reqs Decode requests waiting for the prefill peer's KV: admitted with destination pages held, with no schedulable work.
 # HELP tokenspeed:num_decode_prealloc_queue_reqs Decode requests waiting for their prefill peer to connect.
 # HELP tokenspeed:num_decode_transfer_queue_reqs Decode requests whose KV a transfer still pins.

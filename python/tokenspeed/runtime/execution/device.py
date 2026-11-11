@@ -459,14 +459,17 @@ class DeviceHandle:
         whose sources the scheduler holds until the ACK -- rides the write
         stream and fences nothing), then the Device-to-Device block copies
         (``pages_to_copy``: a prefix hit's private copy of the block holding
-        its boundary, an owner's move off the block it just published; the
-        source may be re-granted by this very plan, so the copy precedes the
-        zeroing), then page zeroing (the new owner's
-        sanitization), then the Device-bound copies (``LoadBackOp`` and
-        ``RestoreOp``, ordered behind the zeroing: a load-back lands on
-        zeroed pages, a restore overwrites its destinations whole), the
-        transfer peer's remote streams, and finally the ``ForwardBatch``. The
-        loop hands the round over and does not branch on it.
+        its boundary, an owner's move off the block it just published, a
+        block a lone request's compaction moves; the source may be re-granted
+        by this very plan, so the copy precedes the zeroing; the execution
+        stream waits for the copies, so a later plan's stores, which order
+        behind it, read what they wrote even when no forward ran between),
+        then page zeroing (the new owner's sanitization), then the
+        Device-bound copies (``LoadBackOp`` and ``RestoreOp``, ordered behind
+        the zeroing: a load-back lands on zeroed pages, a restore overwrites
+        its destinations whole), the transfer peer's remote streams, and
+        finally the ``ForwardBatch``. The loop hands the round over and does
+        not branch on it.
 
         A store's ``request_pool_index`` names the victim's slot, which the
         scheduler frees in the same plan build: the slot's next owner first
