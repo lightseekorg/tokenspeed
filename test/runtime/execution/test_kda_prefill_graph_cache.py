@@ -1361,7 +1361,7 @@ def test_an_inline_kda_replay_reads_a_loaded_state_after_the_load(kimi_host_cach
     forward()
     torch.cuda.synchronize()
     inline = BreakableCapture()
-    with inline:
+    with maybe_inference_mode(), inline:
         inline_output = forward()
     assert inline.num_segments == 1
     owner._captures[_BUCKET, 1] = (inline, CapturedForward(inline_output, None))
