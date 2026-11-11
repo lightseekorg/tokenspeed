@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.ops.sampling import write_synthetic_verify_outputs
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.comm_backend import get_global_backend
@@ -657,29 +658,20 @@ class SamplingBackend(ABC):
     def write_synthetic_outputs(
         self,
         candidates: torch.Tensor,
-        target_tokens: torch.Tensor,
+        targets: torch.Tensor,
         lengths: torch.Tensor,
         predict: torch.Tensor,
         accept_index: torch.Tensor,
         accept_length: torch.Tensor,
     ) -> None:
-        """Commit a draft prefix followed by its target correction/bonus token."""
-        bs, n = candidates.shape
-        positions = torch.arange(n, device=candidates.device).expand(bs, n)
-        output = predict.view(bs, n)
-        output[:, : n - 1].copy_(candidates[:, 1:])
-        output.masked_fill_(positions >= lengths[:, None] - 1, 0)
-        output.scatter_(
-            1, (lengths - 1).long()[:, None], target_tokens.to(predict.dtype)[:, None]
+        """Commit a draft prefix followed by its target correction/bonus token.
+
+        ``targets`` is each row's token, or its ``[bs, n]`` target row whose
+        token at the cutoff is taken; ``lengths`` past ``n`` count as ``n``.
+        """
+        write_synthetic_verify_outputs(
+            candidates, targets, lengths, predict, accept_index, accept_length
         )
-        accept_index.copy_(
-            torch.where(
-                positions < lengths[:, None],
-                positions + torch.arange(bs, device=candidates.device)[:, None] * n,
-                -1,
-            )
-        )
-        accept_length.copy_(lengths - 1)
 
     def cuda_graph_capture_variants(self, num_tokens_per_req: int) -> tuple[str, ...]:
         """Return sampler-specific CUDA graph variants to capture."""
