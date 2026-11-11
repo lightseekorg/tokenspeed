@@ -87,6 +87,9 @@ from tokenspeed.runtime.layers.logits_processor import (
     should_apply_lm_head_quant_method,
 )
 from tokenspeed.runtime.models.monokernel import MonokernelLayer, MonokernelState
+
+# The draft serves exactly the target's steps, so it takes the target's
+# request count.
 from tokenspeed.runtime.models.muse_spark_monokernel import MAX_REQUESTS
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
@@ -133,8 +136,8 @@ SELECTOR_RANK = 256
 TOPK = 16
 STEPS = BLOCK_ROWS - 1  # the block's rows 1 .. 7 draft a token each
 CONTEXT_ROWS = 8  # one request's verify rows
-# MAX_REQUESTS (the target's): the requests a launch serves, their rows one
-# request after another.
+# MAX_REQUESTS (imported from the target): the requests a launch serves,
+# their rows one request after another.
 # The rows each launch is packed for, which also size its Iris scratch (and
 # so the draft's heap reservation): up to MAX_REQUESTS requests' blocks,
 # draft steps and verify rows.

@@ -319,7 +319,13 @@ def takes_monokernels(rows: int, ctx: ForwardContext) -> bool:
     decode step of 1 to ``MAX_REQUESTS`` requests of equal rows (one token
     each, or a speculative verify), at most ``CHAIN_ROWS`` rows a request and
     ``MAX_ROWS`` rows in all. Prefill, more requests and longer chains keep
-    the regular path: the kernels compile per chain up to ``CHAIN_ROWS``."""
+    the regular path: the kernels compile per chain up to ``CHAIN_ROWS``.
+
+    A decode step gives every request the same rows: one token, or the
+    verify of the server's fixed draft width
+    (``--speculative-num-draft-tokens``). So ``rows / ctx.bs`` is each
+    request's chain, which ``row_lengths`` uses; a step with ragged
+    per-request rows would need their counts here instead."""
     return (
         ctx.forward_mode.is_decode()
         and 1 <= ctx.bs <= MAX_REQUESTS
