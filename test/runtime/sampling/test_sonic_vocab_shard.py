@@ -211,6 +211,7 @@ class _Group:
                 peer_shard.logits[:rows].contiguous(),
                 state,
                 self.slots,
+                backend._sampling_offsets_pool,
                 self.drafted,
                 torch.empty_like(backend.scratchpad[:rows]),
                 sonic.VocabShard(
@@ -326,6 +327,7 @@ def test_sharded_launches_compile_nothing_after_warm_up(monkeypatch, dtype) -> N
         torch.zeros((1, N), dtype=torch.int32, device="cuda"),
         draft_q=None,
         with_vocab_mask=False,
+        draft_probs=None,
     )
     slots = _prepare(backend, N)
     # The same slots 8 bytes past 16-byte alignment, as a mixed round passes its decode rows.
@@ -334,6 +336,7 @@ def test_sharded_launches_compile_nothing_after_warm_up(monkeypatch, dtype) -> N
     drafts = torch.zeros((BS, N), dtype=torch.int32, device="cuda")
     kernels = (
         prologue.bitpacked_reduction_kernel,
+        prologue.whole_reduction_kernel,
         shard_ops.shard_candidates_kernel,
         singular.cumulative_selection_kernel,
         multistep.cumulative_unpack_kernel,

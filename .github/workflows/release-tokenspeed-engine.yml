@@ -1,0 +1,93 @@
+name: Release TokenSpeed Engine
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Build and test wheels, or also publish them to PyPI
+        required: true
+        type: choice
+        options:
+          - dry-run
+          - publish
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-tokenspeed-engine
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: inputs.mode == 'dry-run' || (inputs.mode == 'publish' && github.repository == 'lightseekorg/tokenspeed' && github.ref == 'refs/heads/main')
+    name: Wheel (${{ matrix.arch }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13"]
+        arch: [x86_64, aarch64]
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout release commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Build and repair wheel
+        env:
+          ARCH: ${{ matrix.arch }}
+          PYTHON_VERSION: ${{ matrix.python }}
+        run: |
+          docker run --rm \
+            -v "$PWD:/io" -w /io \
+            -e PYTHON_VERSION -e ARCH \
+            -e CARGO_BUILD_JOBS=4 -e CMAKE_BUILD_PARALLEL_LEVEL=4 \
+            "quay.io/pypa/manylinux_2_28_${ARCH}:latest" \
+            bash test/ci_system/build_engine_wheel.sh
+
+      - name: Test installed wheel outside the build environment
+        env:
+          PYTHON_VERSION: ${{ matrix.python }}
+        run: |
+          docker run --rm \
+            -v "$PWD/dist:/wheels:ro" \
+            -v "$PWD/test/ci_system/check_engine_wheel.py:/check_engine_wheel.py:ro" \
+            "python:${PYTHON_VERSION}-slim" \
+            sh -ec 'python -m venv /tmp/runtime; /tmp/runtime/bin/pip install --no-index /wheels/*.whl; /tmp/runtime/bin/python /check_engine_wheel.py'
+
+      - name: Upload tested wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: tokenspeed-engine-${{ matrix.arch }}-${{ matrix.python }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: inputs.mode == 'publish' && github.repository == 'lightseekorg/tokenspeed' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - name: Download tested wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: tokenspeed-engine-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          skip-existing: true

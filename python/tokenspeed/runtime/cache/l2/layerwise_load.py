@@ -22,6 +22,10 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
+from tokenspeed.runtime.execution.breakable_cuda_graph import (
+    BreakableCapture,
+    is_breakable_capture_active,
+)
 from tokenspeed.runtime.utils import get_device_module
 
 device_module = get_device_module()
@@ -88,6 +92,14 @@ class LayerwiseLoadTracker:
         self.consumer_indices = tuple(deduped)
 
     def wait_for_layer(self, layer_index: int) -> None:
+        if is_breakable_capture_active():
+            # A captured segment cannot hold this wait (every replay has its
+            # own load): the capture notes the layer, and every replay waits
+            # for it on this tracker before replaying the segment.
+            BreakableCapture.current().wait_before_segment(
+                self.wait_for_layer, layer_index
+            )
+            return
         if not self.consumer_indices:
             return
         for consumer_index in self.consumer_indices:

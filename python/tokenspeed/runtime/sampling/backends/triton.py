@@ -181,6 +181,7 @@ class TritonSamplingBackend(SamplingBackend):
         *,
         draft_q: DraftTreeQ | None,
         with_vocab_mask: bool,
+        draft_probs: torch.Tensor | None,
     ) -> None:
         """Compile ``sample`` and ``verify`` from vocabulary shards before serving.
 
@@ -191,6 +192,8 @@ class TritonSamplingBackend(SamplingBackend):
         The warmup samples and verifies the padding slot at each count, with
         and without a vocabulary mask when the server applies one.
         """
+        # Draft-prob sampling serves on flashinfer and sonic only.
+        del draft_probs
         device = shard.logits.device
         num_tokens_per_req = candidates.shape[1]
         masks: list[torch.Tensor | None] = [None]

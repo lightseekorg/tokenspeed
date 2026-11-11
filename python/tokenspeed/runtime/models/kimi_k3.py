@@ -67,9 +67,9 @@ from tokenspeed_kernel.ops.activation.triton import (
     attnres_combine,
     attnres_partial,
     attnres_partial_dual,
-    rmsnorm_gated_sigmoid,
     sigmoid_mul,
 )
+from tokenspeed_kernel.ops.attention.kda import KdaOutputNorm
 from tokenspeed_kernel.ops.attention.mla import (
     mla_normalize_project_query,
     validate_mla_query_projection,
@@ -1826,8 +1826,8 @@ class KimiLinearKDA(nn.Module):
                     scales = None
                 return self.o_proj(empty, scale=scales, ctx=ctx, out=projection_out)[0]
             return h
-        core_out = self._recurrent_core(mixed_qkv, f_a_out, beta, ctx)
         if self.o_proj.supports_fp8_group128_input:
+            core_out = self._recurrent_core(mixed_qkv, f_a_out, beta, ctx, None)
             values, scales = quantize_fp8_with_gate(
                 core_out,
                 out_gate,
@@ -1836,7 +1836,9 @@ class KimiLinearKDA(nn.Module):
                 enable_pdl=pdl_enabled(),
             )
             return self.o_proj(values, scale=scales, ctx=ctx, out=projection_out)[0]
-        core_out = self._gated_norm(core_out, out_gate)
+        core_out = self._recurrent_core(
+            mixed_qkv, f_a_out, beta, ctx, self._output_norm(out_gate)
+        )
         if projection_out is not None:
             return project_attention_partial(
                 core_out, self.o_proj.weight, projection_out
@@ -1866,8 +1868,9 @@ class KimiLinearKDA(nn.Module):
         mixed_qkv, out_gate, f_a_out, beta = self._split_qkvfab(
             projection(hidden_states)
         )
-        core_out = self._recurrent_core(mixed_qkv, f_a_out, beta, ctx)
-        return self._gated_norm(core_out, out_gate)
+        return self._recurrent_core(
+            mixed_qkv, f_a_out, beta, ctx, self._output_norm(out_gate)
+        )
 
     def decode_weights(self) -> tuple[torch.Tensor, ...]:
         """The weights one decode step reads, in reading order.
@@ -1897,8 +1900,13 @@ class KimiLinearKDA(nn.Module):
         f_a_out: torch.Tensor,
         beta: torch.Tensor,
         ctx: "ForwardContext",
+        output_norm: KdaOutputNorm | None,
     ) -> torch.Tensor:
-        """Short conv, gates and the delta-rule recurrence: [T, heads * head_dim]."""
+        """Short conv, gates and the delta-rule recurrence: [T, heads * head_dim].
+
+        With ``output_norm`` the result is the gated-RMSNormed o-projection
+        input, which the backend's kernels apply where they can.
+        """
         num_tokens = mixed_qkv.shape[0]
         hn, hd = self.local_num_heads, self.head_dim
         # The hybrid backend re-splits key_dim/value_dim by attn_tp_size to
@@ -1939,23 +1947,14 @@ class KimiLinearKDA(nn.Module):
             lower_bound=self.gate_lower_bound,
             layer_id=self.layer_id,
             seq_len=num_tokens,
+            output_norm=output_norm,
         )
 
         return core_out.reshape(num_tokens, hn * hd)
 
-    def _gated_norm(
-        self, core_out: torch.Tensor, out_gate: torch.Tensor
-    ) -> torch.Tensor:
-        """Gated RMSNorm of the core output, the BF16 o-projection input."""
-        return rmsnorm_gated_sigmoid(
-            core_out.contiguous(),
-            out_gate,
-            self.o_norm.weight,
-            self.o_norm.variance_epsilon,
-            self.local_num_heads,
-            self.head_dim,
-            enable_pdl=pdl_enabled(),
-        )
+    def _output_norm(self, out_gate: torch.Tensor) -> KdaOutputNorm:
+        """The gated RMSNorm that makes the core output the BF16 o-projection input."""
+        return KdaOutputNorm(out_gate, self.o_norm.weight, self.o_norm.variance_epsilon)
 
 
 class KimiLinearMoEGate(nn.Module):
