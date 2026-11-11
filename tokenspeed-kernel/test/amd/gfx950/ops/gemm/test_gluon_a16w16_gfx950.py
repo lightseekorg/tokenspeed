@@ -490,10 +490,50 @@ def test_decode_gemm_supports_only_measured_buckets() -> None:
     # the next bucket's config: dense gate/up is measured only for 9..32.
     assert not supports_gluon_mm_a16w16_decode_gfx950(8, 8448, 7168)
     assert supports_gluon_mm_a16w16_decode_gfx950(9, 8448, 7168)
-    # Only the Muse TP8 pre-expert projection is measured past 64 rows.
+    # Past 64 rows only the measured buckets serve: the Muse TP8 pre-expert
+    # projection and the K3.1 TP8 verify shapes that beat torch there.
     assert supports_gluon_mm_a16w16_decode_gfx950(256, 512, 8192)
     assert not supports_gluon_mm_a16w16_decode_gfx950(65, 8192, 1024)
     assert not supports_gluon_mm_a16w16_decode_gfx950(257, 512, 8192)
+    assert supports_gluon_mm_a16w16_decode_gfx950(128, 1536, 7168)
+    assert not supports_gluon_mm_a16w16_decode_gfx950(129, 1536, 7168)
+    assert supports_gluon_mm_a16w16_decode_gfx950(192, 2112, 7168)
+    assert not supports_gluon_mm_a16w16_decode_gfx950(65, 20480, 7168)
+
+
+# The K3.1 TP8 speculative-verify buckets at ragged and full row counts, twice
+# each so split-K counters reset between calls.
+_K31_VERIFY_BUCKETS = [
+    ((6288, 7168), (36, 100)),
+    ((1536, 7168), (68, 128)),
+    ((7168, 768), (100, 132, 192)),
+    ((8448, 7168), (36, 64)),
+    ((7168, 4224), (44, 64)),
+    ((160, 7168), (100, 132, 192)),
+    ((6400, 1536), (36, 60)),
+    ((1536, 128), (36, 100, 192)),
+    ((2112, 7168), (60, 100, 188)),
+    ((1536, 1536), (44, 100)),
+]
+
+
+@pytest.mark.parametrize(
+    "n,k,rows",
+    [pytest.param(n, k, rows, id=f"{n}x{k}") for (n, k), rows in _K31_VERIFY_BUCKETS],
+)
+def test_decode_gemm_k31_verify_buckets(n: int, k: int, rows: tuple[int, ...]) -> None:
+    torch.manual_seed(0)
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    for m in rows:
+        assert supports_gluon_mm_a16w16_decode_gfx950(m, n, k)
+        for _ in range(2):
+            a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) * 0.25
+            torch.testing.assert_close(
+                _decode(a, b, torch.bfloat16),
+                _decode_reference(a, b, torch.bfloat16),
+                atol=1e-4,
+                rtol=_RTOL,
+            )
 
 
 # Kimi K3 shared gate/up, the Muse TP8 pre-expert projection, whose 64-row
