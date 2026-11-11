@@ -248,6 +248,7 @@ def _check_all_reduce_routed_rmsnorm_sum(state, rank, world_size, device):
                 1.0,
                 False,
                 None,
+                None,
             )
             for peer in range(world_size)
         ]

@@ -546,7 +546,7 @@ def _resolve_cache_family(
     config: AttnConfig,
 ) -> CacheModelFamily:
     """The one dispatch from family facts (plus built config) to the recipe."""
-    if profile.model_profile is not None:
+    if profile.model_profile is not None and profile.model_profile.cache_family:
         return profile.model_profile.cache_family
     if config.component(Dots3NoteAttentionConfig) is not None:
         return "dots3_note"
@@ -658,6 +658,7 @@ def create_paged_router(
         spec_num_tokens=config.speculative_num_draft_tokens or 1,
         device=config.device,
         consumed_group_ids=(FULL_ATTENTION,) if name == "qsa" else None,
+        query_sharded=config.qcp_size > 1,
     )
 
 
@@ -1370,19 +1371,24 @@ def create_attn_components(
         if draft_attn_config is not None
         else None
     )
-    # A draft model's own profile is authoritative for its cache layout;
-    # the attention-config class only approximates it for in-tree drafts.
+    # A draft model's own profile is authoritative for its cache layout. One that
+    # leaves cache_family None declares nothing: it binds like an undeclared
+    # draft, so the same draft serves an ordinary target (as an MHA view) and a
+    # custom family (through that family's own recipe).
     draft_profile = (
         draft_model_config.model_profile if draft_attn_config is not None else None
     )
-    if draft_profile is not None:
+    draft_family_declared = (
+        draft_profile is not None and draft_profile.cache_family is not None
+    )
+    if draft_family_declared:
         draft_cache_family = draft_profile.cache_family
     else:
         draft_cache_family = _ordinary_cache_family(draft_attn_config)
     heterogeneous_draft_family = _resolve_heterogeneous_draft_family(
         cache_family,
         draft_cache_family,
-        draft_family_declared=draft_profile is not None,
+        draft_family_declared=draft_family_declared,
     )
     # One profile per boot, where a boot without a reserve takes it; a rebuild reuses it.
     if profiled_cache_bytes is None:

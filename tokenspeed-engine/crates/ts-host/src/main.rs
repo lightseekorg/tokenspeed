@@ -534,6 +534,9 @@ impl HostConfig {
             finish_log: FinishLog {
                 enabled: config.getattr("finish_log")?.extract()?,
                 request_stats: config.getattr("log_request_stats")?.extract()?,
+                ttft_percentage: config
+                    .getattr("ttft_trace_sampling_percentage")?
+                    .extract()?,
             },
             trace: match config
                 .getattr("otlp_traces_endpoint")?

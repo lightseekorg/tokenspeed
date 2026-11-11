@@ -208,7 +208,11 @@ class KernelPlan:
         ):
             raise ValueError("A kernel plan cannot change override during execution")
         if features and not features <= self.spec.features:
-            raise ValueError("Planned kernel does not provide the requested features")
+            raise ValueError(
+                f"Planned kernel {self.kernel.name!r} does not provide the "
+                f"requested features: missing {sorted(features - self.spec.features)}, "
+                f"it declares {sorted(self.spec.features)}"
+            )
         actual = traits or {}
         for name, value in self.static_traits:
             if not (

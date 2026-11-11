@@ -160,12 +160,14 @@ class OrdinaryRecipe(CacheRecipe):
         one whole history of latent rows plus index-K rows packed in the
         plane's format, reserved before the arena is sized
         (``AttnConfig.__post_init__`` has already pinned the family to GPU DSA
-        for ``qcp_size > 1``). One workspace serves the target and the draft
-        (the draft gathers into the target's buffers), so the two must pack
-        index-K rows in the same format; a draft naming another is refused
-        here, where both configs are visible. A KVP prefill over gathered
-        histories (``dsa_kvp_history_prefill``) reserves the same workspace
-        for the target alone."""
+        for ``qcp_size > 1``). One workspace serves the target and a draft that
+        gathers into the target's buffers, so those two must pack index-K rows
+        in the same format; a draft naming another is refused here, where both
+        configs are visible. A draft that takes no query-context shard
+        (``qcp_size == 1``: its own ordinary attention, as under DFlash) runs
+        no gather and shares no workspace, so its format is not constrained.
+        A KVP prefill over gathered histories (``dsa_kvp_history_prefill``)
+        reserves the same workspace for the target alone."""
         if dsa_kvp_history_prefill(self.attn_config):
             return dsa_history_gather_workspace_bytes(
                 self.attn_config, max_model_len=self.attn_config.context_len
@@ -173,7 +175,11 @@ class OrdinaryRecipe(CacheRecipe):
         if self.attn_config.qcp_size == 1:
             return 0
         target = self.attn_config.component(DSAConfig)
-        if self.draft_attn_config is not None and target is not None:
+        if (
+            self.draft_attn_config is not None
+            and self.draft_attn_config.qcp_size > 1
+            and target is not None
+        ):
             draft = self.draft_attn_config.component(DSAConfig)
             draft_format = None if draft is None else draft.index_k_format
             if draft_format != target.index_k_format:

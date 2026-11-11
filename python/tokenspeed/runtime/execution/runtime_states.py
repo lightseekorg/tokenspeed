@@ -141,7 +141,9 @@ class RuntimeStates:
             dtype=torch.int32,
             device=device,
         )
-        self._stop_criteria_owners: list[str | None] = [None] * (req_pool_size + 1)
+        self._stop_criteria_bindings: list[tuple[str, StopCriteria] | None] = [None] * (
+            req_pool_size + 1
+        )
         # True once a slot's request ended on the device. A forward dispatched
         # behind the one that ended it (the overlap schedule) runs the slot as
         # a padding row: its state rows read nothing and write nothing
@@ -478,10 +480,11 @@ class RuntimeStates:
         request_pool_indices: Sequence[int],
         stop_criteria: Sequence[StopCriteria],
     ) -> None:
-        """Write the stop criteria of every slot whose request changed.
+        """Write each slot whose request or stop criteria changed.
 
         Runs on the stream the forward runs on, ahead of it; a slot keeps its
-        rows while the same request holds it (a restore images them).
+        rows while the same request holds it (a restore images them). A later
+        request can reuse its RID and slot with different stop criteria.
         """
         if len(stop_criteria) != len(request_ids):
             raise ValueError(
@@ -489,10 +492,10 @@ class RuntimeStates:
             )
         changed = [
             i
-            for i, (request_id, slot) in enumerate(
-                zip(request_ids, request_pool_indices, strict=True)
+            for i, (request_id, slot, criteria) in enumerate(
+                zip(request_ids, request_pool_indices, stop_criteria, strict=True)
             )
-            if self._stop_criteria_owners[slot] != request_id
+            if self._stop_criteria_bindings[slot] != (request_id, criteria)
         ]
         if not changed:
             return
@@ -511,7 +514,10 @@ class RuntimeStates:
             ids = criteria.stop_token_ids
             token_ids[row, : len(ids)] = torch.tensor(ids, dtype=torch.int32)
             limits[row] = criteria.token_limit
-            self._stop_criteria_owners[request_pool_indices[i]] = request_ids[i]
+            self._stop_criteria_bindings[request_pool_indices[i]] = (
+                request_ids[i],
+                criteria,
+            )
         slots = slots.to(self.device, non_blocking=True)
         self.stop_token_ids.index_copy_(
             0, slots, token_ids.to(self.device, non_blocking=True)

@@ -123,6 +123,7 @@ def mha_plan(
     dtype: torch.dtype,
     head_dim: int,
     window_left: int = -1,
+    window_sink: int = 0,
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
     return_lse: bool = False,
@@ -155,6 +156,13 @@ def mha_plan(
         "return_lse": return_lse,
         "sinks": sinks is not None,
         "sliding_window": window_left >= 0,
+        # Distinct from "sinks" above: that one is the attention-sink tensor
+        # FA3/FA4 take, this one is a count of leading TOKENS kept visible
+        # outside the sliding window. Like its neighbours this is a capability
+        # predicate, not the length -- a leaf declares only whether it serves a
+        # sink at all. FA3's window_size cannot express one, so a leaf declares
+        # support or the plan refuses rather than serving plain SWA.
+        "window_sink": window_sink > 0,
     }
     signature = format_signature(
         q=dense_tensor_format(dtype),
@@ -208,6 +216,9 @@ def mha_prefill(
             list[int]. Used for host-side launch metadata; must match cu_seqlens.
         max_seqlen: Maximum sequence length.
         window_left: Exclusive left sliding-window size. -1 means full attention.
+        window_sink: Number of leading tokens that stay visible outside the
+            sliding window (attention sinks, StreamingLLM). 0 disables it.
+            Distinct from ``sinks``, which is a learned per-head logit bias.
         logit_cap: Optional soft cap applied to attention logits.
         sinks: Optional attention sink tensor.
         return_lse: Whether to also return natural-log log-sum-exp values with
@@ -461,6 +472,7 @@ def _decode_selection(
     v_cache: torch.Tensor,
     max_seqlen_q: int,
     window_left: int,
+    window_sink: int,
     logit_cap: float,
     sinks: torch.Tensor | None,
     return_lse: bool,
@@ -483,6 +495,11 @@ def _decode_selection(
         "return_lse": return_lse,
         "sinks": sinks is not None,
         "sliding_window": window_left >= 0,
+        # FA3's window_size=(window_left, 0) is a plain sliding mask and cannot
+        # express a token sink, so this trait has to drive the selection.
+        # Declaring it only on mha_plan leaves this shared path picking FA3 and
+        # then handing it a window_sink it does not take.
+        "window_sink": window_sink > 0,
     }
     return signature, scale_kwargs, traits
 
@@ -498,6 +515,7 @@ def mha_decode_with_kvcache(
     max_seqlen_q: int,
     # attention options
     window_left: int = -1,
+    window_sink: int = 0,
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
     return_lse: bool = False,
@@ -552,6 +570,7 @@ def mha_decode_with_kvcache(
         v_cache,
         max_seqlen_q,
         window_left,
+        window_sink,
         logit_cap,
         sinks,
         return_lse,
@@ -572,6 +591,8 @@ def mha_decode_with_kvcache(
         solution=solution,
         override=override,
     )
+    # Only the leaf the trait selected takes this argument.
+    sink_kwargs = {"window_sink": window_sink} if window_sink > 0 else {}
 
     # Record shapes
     shape_params = {
@@ -616,6 +637,7 @@ def mha_decode_with_kvcache(
             max_seqlen_k=max_seqlen_k,
             max_seqlen_q=max_seqlen_q,
             enable_pdl=pdl_enabled(),
+            **sink_kwargs,
             **scale_kwargs,
             **schedule_kwargs,
         )
@@ -847,6 +869,9 @@ def _select_schedule_kernel(
         v_cache,
         max_seqlen_q,
         window_left,
+        # The split schedule carries no sink: mha_decode_schedule takes no
+        # window_sink, so a sink-bearing layer reaches the unscheduled entry.
+        0,
         logit_cap,
         sinks,
         return_lse,

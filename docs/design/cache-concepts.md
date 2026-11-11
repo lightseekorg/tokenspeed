@@ -1084,7 +1084,11 @@ Its responsibilities:
   phase leaves the partial block a hole: the peer's transfer starts at the
   block containing `hit_tokens` and fills a fresh page whole, so the D role
   never copies it; a tail's full blocks below that page are copied like on
-  every role ([Scheduler §3.2](scheduler.md#32-d--decode-worker)).
+  every role ([Scheduler §3.2](scheduler.md#32-d--decode-worker)). Like any
+  copy destination, a block the transfer fills whole is not zeroed
+  (`GroupDemand::landed_tokens`, `StateStep::kLand`): the landing zeroes
+  only the block holding an unaligned prompt end and the reserve pages
+  beyond it.
 
   `Admit` takes two inputs of different scope and tense. One `GroupDemand`
   per group says what that group needs for the round ahead: an extent and a
@@ -1117,7 +1121,9 @@ Its responsibilities:
   `RequestProgress` for finish, retraction, and remote completion, which
   publish without admitting.
 * **Prefix publication.** `CacheFullBlocks` / `CacheCompletedBlocks` register
-  computed blocks into the prefix indexes for later requests. Prefix-closed
+  computed blocks into the prefix indexes for later requests — only when
+  something can reuse them (`SchedulerConfig::PublishesCompletedPages`,
+  [scheduler §1](scheduler.md#1-admission-is-per-chunk)). Prefix-closed
   groups match first; non-closed groups (SWA, State) match only within the
   boundary the closed groups settled (`match_order_` enforces this).
   A publication point is the request's computed frontier `T`
