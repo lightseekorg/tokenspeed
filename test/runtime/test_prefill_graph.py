@@ -878,6 +878,7 @@ class TestDummyGroupTablesTest:
 
         calls = []
         draft_backend = _backend(
+            query_sharded=False,
             init_forward_metadata=lambda **kwargs: calls.append(("init", kwargs)),
             refresh_decode_metadata=lambda *args, **kwargs: calls.append(
                 ("refresh", args, kwargs)
