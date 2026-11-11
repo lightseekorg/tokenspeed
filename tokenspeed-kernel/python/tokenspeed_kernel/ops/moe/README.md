@@ -589,33 +589,21 @@ normalized FP32 weights (scale 1) and INT32 IDs into caller-owned buffers.
 The routing-only kernel has no expert-plan workspace or 8,192-token limit.
 Other contracts retain their existing routers.
 
-## Kimi-K3 front projections
-
-`try_latent_moe_input_projections` runs a registered fused implementation or
-returns `None` before any projection. This lets the runtime retain the
-separate projections and their stream scheduling for unsupported inputs.
-`latent_moe_input_projections` keeps its portable composition when no fused
-implementation is available. The generic packed Triton kernel
-(`triton_latent_input_packed`) is registered on AMD only: on NVIDIA the
-separate vendor GEMM projections are faster, so below the fused front's row
-bound no fused kernel matches and the runtime keeps the separate path.
-
-`cuda_latent_input` is the vendored FlashInfer/Cake fused front
-(`thirdparty/cuda/kimi3_latent_front.py` and `csrc/kimi3_latent_front/`): one
-persistent launch produces the FP32 router logits, the BF16 latent input and
-the BF16 SiTU-activated shared-expert input. It is registered on SM100 and
-SM103 parts with 148 or 152 SMs (the counts the plan rules are validated for)
-for 2048 BF16 rows or more (no upper bound: the plan scales with the row
-count), Kimi-K3's replicated router/latent weights, full shared-expert weights,
-and SiTU clamps 4 and 25. Attention-DP uses it only
-without shared-expert TP; EP routing/quantization and the shared down projection
-keep their existing owners. Smaller shapes and shared-expert TP retain their
-existing paths.
-
-The programs are JIT-built through FlashInfer's toolchain like the Kimi-K3
-router and do not depend on the FlashInfer package shipping its experimental
-kernel sources (release wheels omit them). Prepare/warm up before graph capture;
-no persistent activation tensors are cached per layer by this adapter.
+On gfx950, `kimi3_sigmoid_bias_topk_sorted` (`_triton/kimi3_sigmoid_topk.py`)
+also sorts the routes by expert for the A8W4 SiTU decode, in one launch for
+up to 256 rows. Each row program routes one row with the packed top-k's own
+code, so ids and FP32 weights match `kimi3_sigmoid_bias_topk` bit for bit,
+writes them through to memory, sets its row's bit in each selected expert's
+arrival mask, and increments an arrival counter. One sorting program per 512
+routes follows the row programs in the grid (so every row program has
+dispatched before they wait) and polls the counter. Each sorting program
+derives the expert offsets from the masks and places its share of the routes
+at their expert's first slot plus the number of earlier rows in that expert's
+mask, in `gluon_moe_sorting`'s block-16 format. Routes within an expert
+therefore follow the flat top-k order, as `deterministic_order=True` does. The
+last sorting program leaves the caller-owned scratch zeroed, so sequential and
+graph-replayed launches can share it. The Kimi-K3 TP decode on gfx950 uses it,
+and the MoE then skips its own sort.
 
 ## NVFP4 MegaMoE for Qwen3.5
 
