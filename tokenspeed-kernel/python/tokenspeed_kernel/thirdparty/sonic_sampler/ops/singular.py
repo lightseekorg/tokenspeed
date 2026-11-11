@@ -240,7 +240,7 @@ def cumulative_selection_kernel(
     block_t: tl.constexpr,  # Block Size of Drafted Tokens.
     exact: tl.constexpr,  # Exact fp32 Logits Flag.
     # Every Rank's Candidates of Vocabulary-Sharded Logits (in place of the scratch-pad).
-    cand_ptr=None,  # Gathered Candidate Pairs -> [ W, L, 2 • M ] fp32: values, then token ids.
+    cand_ptr=None,  # Gathered Candidate Pairs -> [ W, L, 2 • M + 2 ] fp32: values, token ids, then the shard's maximum and exp-sum.
     ranks: tl.constexpr = None,  # Ranks -> W.
     stride_mr=None,  # Rank Stride of Gathered Candidate Pairs.
     stride_mb: tl.constexpr = None,  # Batch Stride of Gathered Candidate Pairs.

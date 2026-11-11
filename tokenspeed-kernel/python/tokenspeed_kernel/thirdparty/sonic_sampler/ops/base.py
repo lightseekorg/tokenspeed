@@ -180,7 +180,7 @@ def cumulative_masking(
     maximum,
     offsets,
     max_k: tl.constexpr,
-    total=0.0,
+    total,
 ):
     """Mask a row's candidates to its top-k, then its top-p nucleus and its min-p floor; ``total`` is the row's exp-sum below ``maximum`` over its whole vocabulary for a nucleus over the whole softmax, else zero."""
 
