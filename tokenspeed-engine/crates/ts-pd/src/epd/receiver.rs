@@ -223,17 +223,19 @@ impl Shared {
             .ok_or_else(missing)?;
         // The encode rank pushes this rank's statuses to the registered
         // socket; the pointers are informational.
-        self.sockets.send(
-            &host,
-            port,
-            registration_frames(
-                &self.transport.local_ip,
-                self.sockets.port(),
-                &self.transport.session_id(),
-                0,
-                0,
-            ),
-        );
+        self.sockets
+            .send(
+                &host,
+                port,
+                registration_frames(
+                    &self.transport.local_ip,
+                    self.sockets.port(),
+                    &self.transport.session_id(),
+                    0,
+                    0,
+                ),
+            )
+            .map_err(|error| error.to_string())?;
         self.state().connections.insert(key, (host.clone(), port));
         Ok(((host, port), fanout))
     }
@@ -476,7 +478,12 @@ impl Receiver {
                 };
                 // An empty shard still asks: the encode rank counts its
                 // block's requests, not their bytes.
-                self.shared.sockets.send(host, *port, info.to_frames());
+                if let Err(error) = self.shared.sockets.send(host, *port, info.to_frames()) {
+                    tracing::warn!(%error, "could not publish an EPD destination");
+                    item.failure = Some(error.to_string());
+                    self.shared.state().fail(item.item.room, error.to_string());
+                    return TransferPoll::Failed;
+                }
                 item.preallocated = true;
             }
         }

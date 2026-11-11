@@ -987,6 +987,7 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
     executor.runtime_states = runtime
     executor.model_runner = runner
     executor.drafter = None
+    executor._samples_from_vocab_shard = False
     pg = PrefillGraph.__new__(PrefillGraph)
     pg.config = executor.config
     pg.input_buffers = ib
@@ -1017,7 +1018,7 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
         lambda path, group, rank: events.append(("save", path, group, rank)),
     )
 
-    executor.autotune()
+    executor.autotune(keep_loaded_tactics=False)
 
     assert (ib.ngram_previous_tokens_buf == -1).all()
     assert not ib.ngram_token_mask_buf.any()

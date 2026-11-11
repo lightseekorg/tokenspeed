@@ -140,6 +140,7 @@ class DFlash2(DFlash):
             tp_rank=self.logits_processor.tp_rank,
             tp_size=self.logits_processor.tp_size,
             tp_group=self.logits_processor.tp_group,
+            attn_tp_size=self.logits_processor.attn_tp_size,
             dp_lm_head_tp=self.logits_processor.dp_lm_head_tp,
         )
         self.candidate_logits_processor.final_logit_softcapping = (
@@ -158,6 +159,7 @@ class DFlash2(DFlash):
             softcapping=processor.final_logit_softcapping,
             skip_all_gather=processor.skip_all_gather,
             dp_sampling_enabled=processor.dp_sampling_enabled,
+            fp8_weight=self.model.fp8_head,
         )
 
     def _compute_candidates(

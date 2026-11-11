@@ -6,6 +6,11 @@ triggers:
   - per-commit
   - manual
   - debug
+# Kernel tests never import the runtime (a pre-commit hook checks it).
+ignore_changes:
+  - python/tokenspeed
+  - test/runtime
+changed_paths: true
 runner:
   labels:
     - amd-mi45x-cpu-test
@@ -326,7 +331,7 @@ install:
     set -eu
     . test/ci_system/mi450_sim_env.sh
     bash test/ci_system/setup_mi450_sim.sh
-    WORKSPACE="$(pwd)" bash test/ci_system/install_deps_rocm.sh
+    WORKSPACE="$(pwd)" bash test/ci_system/install_kernel_deps_rocm.sh
 ut:
   commands:
     - >-

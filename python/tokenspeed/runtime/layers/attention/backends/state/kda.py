@@ -30,8 +30,10 @@ from typing import TYPE_CHECKING
 import torch
 from tokenspeed_kernel.ops.attention.gdn import GdnStateCheckpoints
 from tokenspeed_kernel.ops.attention.kda import (
+    KdaOutputNorm,
     KdaPrefillCapacity,
     KdaReplayRecords,
+    kda_fused_paged_verify_fuses_producers,
     kda_fused_paged_verify_uses_split_producers,
     kda_paged_decode,
     kda_paged_prefill,
@@ -848,14 +850,28 @@ class KdaAttnBackend(CapacityPrefillBackend):
         attn_tp_size: int,
         head_v_dim: int,
         lower_bound: float | None,
+        output_norm: KdaOutputNorm | None,
     ) -> torch.Tensor | None:
         """Keep live state read-only; acceptance commits the selected prefix."""
         if self._replay_active:
             qkv, f_a, beta, gate = self._replay_payload(layer_id)
             rows = batch_size * draft_token_num
             heads = value_dim // attn_tp_size // head_v_dim
+            # Small batches project the gate and convolve inside verify.
+            split = self._verify_split_producers and not (
+                g_raw is None
+                and bias is None
+                and kda_fused_paged_verify_fuses_producers(
+                    self.dtype,
+                    recurrent_layout=self.kda_recurrent_layout,
+                    num_heads=heads,
+                    head_dim=head_v_dim,
+                    draft_token_num=draft_token_num,
+                    batch_size=batch_size,
+                )
+            )
             split_producers = {}
-            if self._verify_split_producers:
+            if split:
                 fork = self._verify_producer_forks[layer_id]
                 with fork.scope(enable=True) as producer_fork:
                     with producer_fork.branch():
@@ -888,11 +904,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
             assert self._replay_record_metadata is not None
             assert self._replay_record_stamps is not None
             replay_records = KdaReplayRecords(
-                original_qkv=(
-                    None
-                    if self._verify_split_producers
-                    else qkv[:rows, : mixed_qkv.shape[-1]]
-                ),
+                original_qkv=None if split else qkv[:rows, : mixed_qkv.shape[-1]],
                 metadata=self._replay_record_metadata[:batch_size],
                 stamps=self._replay_record_stamps[
                     self._descriptor_row_by_layer[layer_id], :batch_size
@@ -939,6 +951,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
                 store_states=False,
                 recurrent_layout=self.kda_recurrent_layout,
                 replay_records=replay_records,
+                output_norm=output_norm,
                 **split_producers,
             )
             if fused_out is None:
@@ -971,6 +984,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
                 lower_bound=lower_bound,
                 recurrent_layout=self.kda_recurrent_layout,
                 replay_records=None,
+                output_norm=output_norm,
             )
 
     @override

@@ -15,7 +15,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 import math
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
@@ -29,6 +29,9 @@ from tokenspeed_kernel.platform import (
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 from tokenspeed_kernel.warmup import kernel_launcher, register_triton_warmup
+
+if TYPE_CHECKING:
+    from tokenspeed_kernel.ops.moe._cute_dsl.latent_down import MailboxPublish
 
 
 @triton.jit
@@ -1255,7 +1258,11 @@ def _rmsnorm_nvfp4_quant_kernel(
     weight_offset: tl.constexpr,
     sentinel_word: tl.constexpr,
     sentinel_half: tl.constexpr,
+    publish_block_ptr,
+    publish_destination_ptr,
     MAILBOX: tl.constexpr,
+    PUBLISH_WORDS: tl.constexpr,
+    PUBLISH_BLOCK: tl.constexpr,
     BLOCK: tl.constexpr,
     SF_BLOCK: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
@@ -1268,6 +1275,18 @@ def _rmsnorm_nvfp4_quant_kernel(
         tl.extra.cuda.gdc_wait()
         # Dependents may launch now; their own wait still covers this grid's completion.
         tl.extra.cuda.gdc_launch_dependents()
+    if PUBLISH_WORDS > 0:
+        # Store this rank's block into every peer's mailbox row before polling it.
+        words = tl.arange(0, PUBLISH_BLOCK)
+        in_block = words < PUBLISH_WORDS
+        block_words = tl.load(
+            publish_block_ptr + row * PUBLISH_WORDS + words, mask=in_block, other=0
+        )
+        tl.store(
+            publish_destination_ptr + row * (width // 2) + words,
+            block_words,
+            mask=in_block,
+        )
     if MAILBOX:
         # One row-wide poll load keeps the plain path's variance sum order bitwise.
         half_ptr = x_ptr.to(tl.pointer_type(tl.int16)) + row * width + offsets
@@ -1323,6 +1342,24 @@ def _rmsnorm_nvfp4_quant_kernel(
     )
 
 
+def _publish_words(
+    publish: "MailboxPublish", rows: int, width: int, sentinel: int | None
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """The block and its mailbox destination as 32-bit words, and the words per row."""
+    if sentinel is None:
+        raise ValueError("only a mailbox takes a block to publish")
+    block, destination = publish.block, publish.destination
+    if block.dtype != torch.bfloat16 or block.ndim != 2 or block.shape[0] != rows:
+        raise ValueError("the block must be BF16 [rows, block_width]")
+    if not block.is_contiguous() or block.shape[1] % 2 or publish.column % 2:
+        raise ValueError("the block must be contiguous whole 32-bit words")
+    if destination.shape != block.shape or destination.stride() != (width, 1):
+        raise ValueError("the destination must be the block's rows in the mailbox")
+    if not 0 <= publish.column <= width - block.shape[1]:
+        raise ValueError("the block must lie within a mailbox row")
+    return block.view(torch.int32), destination.view(torch.int32), block.shape[1] // 2
+
+
 @register_kernel(
     "quantization",
     "rmsnorm_nvfp4",
@@ -1339,6 +1376,7 @@ def triton_rmsnorm_nvfp4_quant(
     global_scale: torch.Tensor,
     mailbox_sentinel: int | None,
     enable_pdl: bool,
+    mailbox_publish: "MailboxPublish | None",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Triton kernel of :func:`tokenspeed_kernel.ops.quantization.rmsnorm_nvfp4_quant`."""
     if x.ndim != 2 or x.dtype != torch.bfloat16 or not x.is_cuda:
@@ -1372,6 +1410,14 @@ def triton_rmsnorm_nvfp4_quant(
     use_pdl = enable_pdl and current_platform().is_hopper_plus
     launch = {"launch_pdl": True} if use_pdl else {}
     sentinel = 0 if mailbox_sentinel is None else mailbox_sentinel
+    if mailbox_publish is None:
+        # An existing row of words stands in for the block, never read.
+        publish_block = publish_destination = values.view(torch.int32)
+        publish_words = 0
+    else:
+        publish_block, publish_destination, publish_words = _publish_words(
+            mailbox_publish, rows, width, mailbox_sentinel
+        )
     _rmsnorm_nvfp4_quant_kernel[(rows,)](
         values,
         weight,
@@ -1384,7 +1430,11 @@ def triton_rmsnorm_nvfp4_quant(
         # The kernel compares int16 halves and stores int32 words: signed images.
         sentinel_word=sentinel - (1 << 32) if sentinel >= 1 << 31 else sentinel,
         sentinel_half=(sentinel & 0xFFFF) - (1 << 16 if sentinel & 0x8000 else 0),
+        publish_block_ptr=publish_block,
+        publish_destination_ptr=publish_destination,
         MAILBOX=mailbox_sentinel is not None,
+        PUBLISH_WORDS=publish_words,
+        PUBLISH_BLOCK=triton.next_power_of_2(max(publish_words, 1)),
         BLOCK=block,
         SF_BLOCK=NVFP4_BLOCK,
         ENABLE_PDL=use_pdl,
@@ -1540,7 +1590,7 @@ def _gated_fp8_quantize_kernel(
     tl.store(scale_ptr + row * groups + group, scale, valid_group)
 
 
-@triton.jit(do_not_specialize=["M", "X0"])
+@triton.jit(do_not_specialize=["M", "X0", "SA"])
 def _rmsnorm_fp8_group32_ue8m0(
     X,
     W,
@@ -1549,10 +1599,11 @@ def _rmsnorm_fp8_group32_ue8m0(
     S,
     M,
     X0,
+    SA,
     K: tl.constexpr,
     EPS: tl.constexpr,
     BLOCK: tl.constexpr,
-    SWIZZLED: tl.constexpr,
+    LAYOUT: tl.constexpr,
     PADDED_GROUPS: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
@@ -1580,12 +1631,26 @@ def _rmsnorm_fp8_group32_ue8m0(
             (BLOCK,),
         ).to(tl.float8e4nv)
         tl.store(Q + row * K + col, quantized, col < K)
-        if SWIZZLED:
-            offsets = _fp8_swizzled_scale_offset(row, groups, k_tiles)
+        if LAYOUT == "packed":
+            # Four group bytes form one little-endian int32 word, and the words
+            # are MN-major: word w of this row sits at w * SA + row. Groups past
+            # K/32 contribute zero so a trailing word carries no stale byte.
+            words: tl.constexpr = BLOCK // 128
+            packed = tl.sum(
+                tl.reshape(tl.where(groups < K // 32, exponent, 0), (words, 4))
+                << (tl.arange(0, 4) * 8)[None, :],
+                1,
+            )
+            # SA grows with the token count; widen before multiplying it.
+            word = tl.arange(0, words).to(tl.int64)
+            tl.store(S + word * SA + row, packed, word < K // 128)
         else:
-            offsets = row * (K // 32) + groups
-        tl.store(S + offsets, exponent.to(tl.uint8), groups < K // 32)
-    if SWIZZLED:
+            if LAYOUT == "swizzled":
+                offsets = _fp8_swizzled_scale_offset(row, groups, k_tiles)
+            else:
+                offsets = row * (K // 32) + groups
+            tl.store(S + offsets, exponent.to(tl.uint8), groups < K // 32)
+    if LAYOUT == "swizzled":
         # The grid covers every row of the last 128-row tile. Padding rows and
         # the scale columns past K/32 read as zero; each program owns its row.
         padded = tl.arange(0, PADDED_GROUPS)
@@ -1682,13 +1747,16 @@ def triton_rmsnorm_fp8_group32_ue8m0(
     weight: torch.Tensor,
     eps: float,
     *,
-    swizzled_scales: bool,
+    scale_layout: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return BF16 normalized rows, E4M3 codes and group-32 UE8M0 scales.
 
-    The scales are canonical ``[M, K/32]``, or with ``swizzled_scales`` the
-    1-D F8_128x4 layout ``mm(prepacked_scales=True)`` reads directly.
+    The scales follow ``scale_layout``: ``"canonical"`` uint8 ``[M, K/32]``,
+    ``"swizzled"`` the 1-D F8_128x4 bytes ``mm(prepacked_scales=True)`` reads,
+    or ``"packed"`` int32 ``[M, K/128]`` words that ``fp8_projection`` reads.
     """
+    if scale_layout not in ("canonical", "swizzled", "packed"):
+        raise ValueError(f"unsupported group-32 scale layout: {scale_layout!r}")
     if (
         x.ndim != 2
         or not x.is_cuda
@@ -1703,16 +1771,27 @@ def triton_rmsnorm_fp8_group32_ue8m0(
         or eps <= 0
     ):
         raise ValueError("Expected BF16 [M,K] input and [K] weight, K divisible by 32")
+    if scale_layout == "packed" and x.shape[1] % 128:
+        raise ValueError("Packed group-32 scales need K divisible by 128")
     m, k = x.shape
     normalized = torch.empty_like(x, memory_format=torch.contiguous_format)
     quantized = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=x.device)
-    if swizzled_scales:
-        rows = triton.cdiv(m, 128) * 128
+    # Only the swizzled layout pads its row count; the kernel's padding-only
+    # programs zero the bytes the GEMM reads past M and past K/32.
+    rows = triton.cdiv(m, 128) * 128 if scale_layout == "swizzled" else m
+    scale_stride = 0
+    if scale_layout == "swizzled":
         scales = torch.empty(
             (rows * triton.cdiv(k, 128) * 4,), dtype=torch.uint8, device=x.device
         )
+    elif scale_layout == "packed":
+        # MN-major words with the token count padded to four, so each column
+        # starts 16-byte aligned for TMA; the row stride stays one.
+        scale_stride = (m + 3) // 4 * 4
+        scales = torch.empty(
+            k // 128 * scale_stride, dtype=torch.int32, device=x.device
+        ).as_strided((m, k // 128), (1, scale_stride))
     else:
-        rows = m
         scales = torch.empty((m, k // 32), dtype=torch.uint8, device=x.device)
     if m:
         enable_pdl = pdl_enabled()
@@ -1724,10 +1803,11 @@ def triton_rmsnorm_fp8_group32_ue8m0(
             scales,
             m,
             x.stride(0),
+            scale_stride,
             k,
             eps,
             triton.next_power_of_2(k),
-            swizzled_scales,
+            scale_layout,
             triton.next_power_of_2(triton.cdiv(k, 128) * 4),
             enable_pdl,
             num_warps=4,

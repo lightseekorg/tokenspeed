@@ -124,6 +124,24 @@ if platform.is_nvidia and platform.is_blackwell:
             raise RuntimeError("Initialize FP4 output buffers before graph capture")
         return generators[major, minor]().build_and_load()
 
+    def _empty_fp4_quantize(
+        input: torch.Tensor, *args, **kwargs
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """FlashInfer's outputs for zero rows, without its kernel launch.
+
+        FlashInfer launches an empty grid on zero rows, which fails and leaves
+        the launch error for the next kernel to report.
+        """
+        options = signature(_fp4_quantize).bind(input, *args, **kwargs)
+        options.apply_defaults()
+        cols = input.shape[-1] // options.arguments["sf_vec_size"]
+        if options.arguments["is_sf_swizzled_layout"]:
+            cols = (cols + 3) // 4 * 4
+        values = input.new_empty(
+            (*input.shape[:-1], input.shape[-1] // 2), dtype=torch.uint8
+        )
+        return values, input.new_empty((0, cols), dtype=torch.uint8)
+
     def fp4_quantize(
         input: torch.Tensor,
         global_scale: torch.Tensor | None = None,
@@ -140,6 +158,8 @@ if platform.is_nvidia and platform.is_blackwell:
         Return the packed values and the first M scale rows.
         """
         if out is None:
+            if input.numel() == 0:
+                return _empty_fp4_quantize(input, global_scale, *args, **kwargs)
             return _fp4_quantize(input, global_scale, *args, **kwargs)
         if args or kwargs.keys() - {"is_sf_swizzled_layout", "enable_pdl"}:
             raise ValueError(

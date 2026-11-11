@@ -55,6 +55,12 @@ stage without RMSNorm. Prequantized values and scales feed the output
 projection directly. The same Triton implementation serves NVIDIA and AMD;
 PDL is enabled only where supported.
 
+`rmsnorm_quantize_fp8_group32` preserves the BF16 normalization boundary and
+writes group-32 UE8M0 scales in the explicitly selected canonical, swizzled,
+or packed layout. Packed scales use MN-major int32 words with the row count
+padded to four; their column offsets use 64-bit arithmetic as that stride
+grows with the batch. Only canonical scales support arbitrary row selection.
+
 ## Native FP32 token-group scales
 
 Explicitly selecting `override="trtllm_quantize_fp8_mn_major"` with

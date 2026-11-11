@@ -183,6 +183,73 @@ optional:
   amd-mi355-1gpu: true
 ```
 
+`ignore_changes` lists directories whose changes cannot affect a task. On
+pull requests the scan drops the task when every changed file is Markdown or
+lies under one of them. Pushes to `main` and manual runs keep every task. The
+per-commit kernel unit-test tasks list the runtime sources and runtime tests,
+so a pull request that changes only the runtime skips them. That holds because
+the kernel tests never import the runtime: the `kernel-tests-without-runtime`
+pre-commit hook rejects such an import under `tokenspeed-kernel/test`.
+
+```yaml
+ignore_changes:
+  - python/tokenspeed
+  - test/runtime
+```
+
+`model_sources` lists the model modules (directly under
+`python/tokenspeed/runtime/models/`) that a model-test task serves, including
+those its model and draft model import. On pull requests the scan drops the
+task when every changed file is Markdown, another model's module, or a test
+under `test/runtime/` or `tokenspeed-kernel/test/`; a unit-test task keeps the
+tests its definition names, as files or directories, and every test helper. A
+module there belongs to one model when it defines `EntryClass` or a task lists
+it; any other module, such as `utils.py`, is shared, and a change to it runs
+every task. Speculative-decoding draft modules (file names with `nextn`,
+`eagle`, `dflash` or `dspark`) are shared too, and `model_sources` may not list
+them. The scan fails when a listed module does not exist, or imports a
+module that belongs to one model without the task listing it too.
+
+```yaml
+model_sources:
+  - python/tokenspeed/runtime/models/llama.py
+  - python/tokenspeed/runtime/models/minimax_m3.py
+```
+
+`changed_paths: true` hands a pull request's changed paths to the task's
+commands as `TOKENSPEED_CI_CHANGED_PATHS`, one path per line, so the suite can
+pick its own tests. The scan sets it only where it narrows tasks: pull
+requests with fewer than 300 changed files. The kernel unit-test tasks use it:
+`tokenspeed-kernel/test/kernel_test_selection.py` runs the test files whose
+op families a change names (`ops/<family>/`, an attention variant such as
+`ops/attention/mla/`, `thirdparty/<package>/`, and the AMD
+`ops/<arch>/<family>/`), the changed test files, and the tests that load every
+kernel. A change to a core module, `conftest.py`, packaging, or anything else
+that names no family runs every test. Dependencies between families are not
+followed; pushes to `main` run every test.
+
+The runtime unit-test tasks use it too: `test/runtime/run_ci_suite.py` keeps
+only the test files the changes reach before it partitions the suite
+(`test/ci_system/runtime_test_selection.py`). The suite narrows only when every
+change is Markdown, a test file, or a model module: a module directly under
+`python/tokenspeed/runtime/models/` that defines `EntryClass`. It then runs these
+test files:
+
+- The changed runtime test files.
+- The tests that import a changed model module or a module built on it, or that
+  name one of them, so `gpt_oss` matches a test serving `openai/gpt-oss-20b`.
+- The tests that import any of these, directly or through other test files.
+
+Any other change runs every test.
+
+A reviewer can widen a pull request's tests. The `ci-full-tests` label turns
+off every changed-path narrowing (vendor path filtering, `ignore_changes`,
+and `changed_paths`), and each `CI-Extra-Changes: <path>` line in the description
+counts as a changed path, such as a kernel family directory whose tests should
+also run. The scan job reads both from the pull request
+(`test/ci_system/pr_test_scope.py`), so re-run the workflows after adding the
+label or editing the description.
+
 The NVIDIA PR workflow routes `b200-<Ngpu>` task labels to
 `b200v2-<Ngpu>` by default. Set the `TOKENSPEED_B200_RUNNER_LABEL` repository
 variable in GitHub Actions (`Settings` -> `Secrets and variables` -> `Actions`
@@ -196,6 +263,22 @@ the jobs create the two directories beside that cache instead. This survives
 runner pod recreation and avoids downloading the same large wheels again on
 that node. Other runner families keep their existing cache behavior because
 their cluster storage layouts may differ.
+
+The engine installer reuses `tokenspeed-engine` wheels under
+`CI_WHEEL_CACHE_DIR/tokenspeed-engine` on these runners and on Slurm's mounted
+package cache. The key covers the engine and scheduler sources, Python ABI and
+configuration, resolved Python build dependencies, Rust/C++ toolchains, native
+system packages, and compiler settings. A source change invalidates the wheel
+even without a version bump. Concurrent jobs build a missing wheel once under
+a lock, then publish it atomically after an import check. Fork PRs and local
+xgrammar source overrides bypass this cache. The installer logs cache hits and
+build/install elapsed time. Each run prunes wheel directories, orphaned build
+directories, and stale lock files untouched for 14 days; a hit refreshes the
+wheel's timestamp.
+
+The dedicated Rust workflow caches Cargo dependencies and workspace build
+artifacts, with Python/native build inputs included in the key. GPU jobs share
+only the final wheel: CMake build trees contain checkout-specific paths.
 
 B200v2 CI stores FlashInfer tactics under `tokenspeed/flashinfer-autotune`
 in the same persistent root as the package cache: an explicit `CI_CACHE_ROOT`,
@@ -225,20 +308,6 @@ the task's server restarts, and the same job cleanup removes it. Compiler
 options and test workloads are unchanged. Performance jobs retain the runner's
 Triton cache policy so cold compilation is not newly introduced into measured
 requests.
-
-The AMD Kimi-K3 EAGLE3 performance task publishes its EvalScope outputs and
-tokenizer under
-`.ci-artifacts/published/kimi-k3-eagle3-tp8ep1-50k-500-perf`, including the
-request/response database. These artifacts support investigating input,
-output, and speculative acceptance differences alongside timing changes. The
-task measures 16 concurrent 50K-input/500-output requests with TP8/EP1 and
-zero benchmark warmup requests.
-
-The corresponding AMD Kimi-K3 EAGLE3 AIME26 gate publishes its per-question
-predictions and scoring records under
-`.ci-artifacts/published/kimi-k3-eagle3-aime26`. This retains evidence for accuracy
-misses without changing the full 30-question workload, generation settings, or
-score threshold.
 
 Model jobs load weights from the runner's shared Hugging Face cache
 (`HF_HOME`) and must not pass `--download-dir` into the job's work directory.
@@ -348,6 +417,10 @@ MI450 simulator tasks share their ROCm and PyTorch pins through
 simulator and dependency installers in the same shell; standalone simulator
 setup loads it as well. Update that file to change the stack: its pins override
 inherited environment values. Changes to it select both MI450 tasks.
+The simulator tasks use `install_kernel_deps_rocm.sh` to install kernel
+dependencies without building the scheduler or Rust engine or installing the
+serving runtime. Full ROCm serving installs reuse that script through
+`install_deps_rocm.sh` before installing the runtime components.
 
 PR and push diffs containing only `test/ci/**/*.yaml` run only the changed tasks,
 with existing validation and runner/trigger rules. Diffs that also, or only,

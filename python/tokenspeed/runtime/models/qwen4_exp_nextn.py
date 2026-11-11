@@ -46,6 +46,7 @@ from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.layers.quantization.mxfp4 import Mxfp4Config
 from tokenspeed.runtime.layers.quantization.utils import (
     should_exclude_quant_module,
     should_ignore_quant_layer,
@@ -54,6 +55,7 @@ from tokenspeed.runtime.layers.vocab_parallel_embedding import ParallelLMHead
 from tokenspeed.runtime.models.qwen4_exp import (
     Qwen4ExpAttentionDecoderLayer,
     Qwen4ExpModel,
+    _warmup_qwen4_moe,
     load_qwen4_exp_weights,
 )
 from tokenspeed.runtime.models.qwen4_exp_monokernel import (
@@ -70,6 +72,11 @@ def _resolve_mtp_quant_config(
         return None
     if should_exclude_quant_module("mtp.layers.0", quant_config.exclude_modules):
         return None
+    if (
+        not isinstance(quant_config, Mxfp4Config)
+        or quant_config.quant_method != "quark"
+    ):
+        return quant_config
     # AMD Quark expands an ``mtp.*`` exclusion into the MTP layer's linear
     # module names only; its fused routed experts (and ``fc_embedding``) are
     # left out of the list but stay BF16 as well.
@@ -266,6 +273,7 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
             tp_size=mapping.lm_head.tp_size,
             tp_group=mapping.lm_head.tp_group,
             do_argmax=True,
+            attn_tp_size=mapping.attn.tp_size,
             dp_lm_head_tp=mapping.attn.has_dp and mapping.lm_head.has_tp,
         )
 
@@ -273,6 +281,7 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
         return None
 
     def post_quant_warmup(self) -> None:
+        _warmup_qwen4_moe(self.model)
         # The draft layer is a monokernel layer unless the draft steps reuse
         # the first step's top-k (Qwen4ExpDraftModel._decode_monokernel).
         enable_decode_monokernels(self.model)
@@ -397,13 +406,15 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
                 ctx,
                 input_embeds=fused,
             )
-        return self.logits_processor(
-            input_ids,
-            hidden_states,
-            self.lm_head,
-            LogitsMetadata.from_forward_context(ctx),
-            aux_hidden_states,
-        )
+            # The first draft step narrows verify rows to one per request.
+            # Keep that row table active through the cross-DP head exchange.
+            return self.logits_processor(
+                input_ids,
+                hidden_states,
+                self.lm_head,
+                LogitsMetadata.from_forward_context(ctx),
+                aux_hidden_states,
+            )
 
     def checkpoint_weight_name_filter(self, name: str) -> bool:
         return "mtp" in name or "shared_head" in name

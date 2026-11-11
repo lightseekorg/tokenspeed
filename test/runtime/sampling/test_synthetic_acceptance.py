@@ -89,7 +89,9 @@ def test_unsupported_backend_rejects_synthetic_acceptance():
         _SUPPORTS_SYNTHETIC_ACCEPTANCE = False
 
     UnsupportedBackend(_config(None, 4, 4, "cpu"))
-    with pytest.raises(ValueError, match="requires the greedy sampling backend"):
+    with pytest.raises(
+        ValueError, match="requires the greedy or sonic sampling backend"
+    ):
         UnsupportedBackend(_config(2.6, 4, 4, "cpu"))
 
 

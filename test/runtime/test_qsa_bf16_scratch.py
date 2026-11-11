@@ -322,6 +322,9 @@ def test_families_without_qsa_layers_refuse_the_scratch():
 # The attention leaf, through the real router and composite backend
 # ---------------------------------------------------------------------------
 
+# The attention stand-in computes on a GPU if present; the rest stays on CPU.
+_STAND_IN_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
 
 def _reference_attention(
     q,
@@ -346,19 +349,25 @@ def _reference_attention(
     v_scale = 1.0 if v_scale is None else v_scale
     rows, heads, dim = q.shape
     kv_heads = k_cache.shape[1]
-    result = torch.empty_like(q)
+    # Dequantize the whole cache once, not every gathered chunk: converting the
+    # gathered FP8 rows took over half of this helper's CPU time.
+    k_cache = (k_cache.float() * k_scale).to(_STAND_IN_DEVICE)
+    v_cache = (v_cache.float() * v_scale).to(_STAND_IN_DEVICE)
+    selected_slots = selected_slots.to(_STAND_IN_DEVICE)
+    result = torch.empty_like(q, device=_STAND_IN_DEVICE)
     for start in range(0, rows, 32):
         slots = selected_slots[start : start + 32].long()
-        keys = k_cache[slots.clamp_min(0)].float() * k_scale
-        values = v_cache[slots.clamp_min(0)].float() * v_scale
-        query = q[start : start + 32].float().view(-1, kv_heads, heads // kv_heads, dim)
+        keys = k_cache[slots.clamp_min(0)]
+        values = v_cache[slots.clamp_min(0)]
+        query = q[start : start + 32].to(_STAND_IN_DEVICE).float()
+        query = query.view(-1, kv_heads, heads // kv_heads, dim)
         scores = torch.einsum("ckgd,cnkd->ckgn", query, keys) * scale
         scores = scores.masked_fill(~(slots > 0)[:, None, None, :], float("-inf"))
         weights = torch.softmax(scores, dim=-1).nan_to_num(0.0)
         chunk = torch.einsum("ckgn,cnkd->ckgd", weights, values)
         result[start : start + 32] = chunk.reshape(-1, heads, dim).to(q.dtype)
     if out is None:
-        return result
+        return result.to(q.device)
     out.copy_(result)
     return out
 

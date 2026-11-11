@@ -54,7 +54,9 @@
 //! * `release_memory_occupation([{tags}])`,
 //!   `resume_memory_occupation([{tags}])`;
 //! * `rebalance_experts()`;
-//! * `demote_sessions([{session_ids, ended}])`: explicit cache eviction hints.
+//! * `demote_sessions([{session_ids, ended}])`: explicit cache eviction hints;
+//! * `reload_forward([{mode = "wait", modules, id, timeout_s}])`: development only
+//!   (`--allow-reload-forward`); `id` is required and the same on every engine.
 
 use std::time::{Duration, Instant};
 
@@ -62,8 +64,8 @@ use ts_wire::{
     control::{
         ControlCall, DestroyWeightsUpdateGroupReqInput, FlushCacheReqInput,
         InitWeightsUpdateGroupReqInput, PauseSchedulerReqInput, ProfileReq,
-        RebalanceExpertsReqInput, ReleaseMemoryOccupationReqInput, ResumeMemoryOccupationReqInput,
-        ResumeSchedulerReqInput, UpdateWeightFromDiskReqInput,
+        RebalanceExpertsReqInput, ReleaseMemoryOccupationReqInput, ReloadForwardReqInput,
+        ResumeMemoryOccupationReqInput, ResumeSchedulerReqInput, UpdateWeightFromDiskReqInput,
         UpdateWeightsFromDistributedReqInput, UpdateWeightsFromMooncakeReqInput, PROFILE_START,
         PROFILE_STOP,
     },
@@ -277,6 +279,19 @@ fn rl_operation(method: &str, args: &[Value]) -> Result<ControlRequest, String> 
                 http_worker_ipc: None,
             })
         }
+        "reload_forward" => ControlRequest::ReloadForward(ReloadForwardReqInput {
+            rid: None,
+            http_worker_ipc: None,
+            mode: body.str_or("mode", "wait")?,
+            modules: body.strs_opt("modules")?,
+            id: Some(body.str("id")?),
+            timeout_s: body
+                .get("timeout_s")
+                .map(|value| {
+                    number(value).ok_or_else(|| body.wrong("timeout_s", "a number", value))
+                })
+                .transpose()?,
+        }),
         other => unreachable!("Body::of admitted {other}"),
     })
 }
@@ -294,6 +309,7 @@ const RL_METHODS: &[&str] = &[
     "release_memory_occupation",
     "resume_memory_occupation",
     "rebalance_experts",
+    "reload_forward",
 ];
 
 /// An RL call's body: the route's JSON body as a map, read by field name. A

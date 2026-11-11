@@ -1430,6 +1430,7 @@ dependencies = [
  "tokenspeed-wire",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "ureq",
  "zeromq",
 ]
@@ -1511,6 +1512,7 @@ dependencies = [
  "tokenspeed-mooncake",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "ureq",
  "zeromq",
 ]

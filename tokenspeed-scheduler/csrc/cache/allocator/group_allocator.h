@@ -83,18 +83,20 @@ public:
     std::vector<std::int32_t> BlockTablePageIds(const BlockTable& table) const {
         std::vector<std::int32_t> ids;
         ids.reserve(static_cast<std::size_t>(table.NumBlocks()));
-        AppendBlockTablePageIds(table, ids);
+        AppendBlockTablePageIds(table, ids, 0);
         return ids;
     }
 
-    // Append one absolute row directly to its C++-owned batch buffer: the
-    // page ids the table keeps, the released prefix as null holes.
-    void AppendBlockTablePageIds(const BlockTable& table, std::vector<std::int32_t>& ids) const {
+    // Append the row from first_slot on, preserving null holes in that range.
+    void AppendBlockTablePageIds(const BlockTable& table, std::vector<std::int32_t>& ids,
+                                 std::size_t first_slot) const {
         assertPageIdsCurrent(table);
         const auto released = static_cast<std::size_t>(table.ReclaimedPrefixBlocks());
         const std::span<const std::int32_t> page_ids = table.PageIds();
-        ids.insert(ids.end(), released, 0);
-        ids.insert(ids.end(), page_ids.begin() + static_cast<std::ptrdiff_t>(released), page_ids.end());
+        _assert(first_slot <= page_ids.size(), "block-table range starts beyond its row");
+        if (first_slot < released) ids.insert(ids.end(), released - first_slot, 0);
+        ids.insert(ids.end(), page_ids.begin() + static_cast<std::ptrdiff_t>(std::max(first_slot, released)),
+                   page_ids.end());
     }
 
     // The table window handed to PrefixCacheIndex::RegisterFullBlocks. The
@@ -223,13 +225,19 @@ public:
     // block, which the caller copies into the fresh block; empty for a hole,
     // which the caller zeroes instead. Installing into a hole ends the released
     // prefix at this slot, so subsequent exports include the new writable block.
-    CacheBlockRef SwapInFreshBlock(BlockPool& pool, BlockTable& table, std::int32_t slot,
-                                   std::int32_t available_tokens) {
+    // With a destination the fresh block is that free slot of a parent bound to
+    // this group (a lone request's compaction moving its own block; the caller
+    // keeps a copied block's bucket, and may change an unwritten block's);
+    // without one the pool places it.
+    CacheBlockRef SwapInFreshBlock(BlockPool& pool, BlockTable& table, std::int32_t slot, std::int32_t available_tokens,
+                                   std::optional<CacheBlockLocation> destination) {
         _assert(0 <= slot && slot < table.NumBlocks(), "swapped slot lies inside the table");
         _assert(available_tokens >= 0, "tail capacity must be non-negative");
         const CacheBlockRef& current = table.blocks_[static_cast<std::size_t>(slot)];
         std::vector<CacheBlockRef> fresh;
-        if (current) {
+        if (destination) {
+            fresh.push_back(pool.AcquireBlockAt(group_id_, *destination));
+        } else if (current) {
             const std::array<std::int32_t, 1> bucket{BucketOf(current->Location())};
             fresh = pool.AcquireBlocksInBuckets(group_id_, bucket);
         } else {

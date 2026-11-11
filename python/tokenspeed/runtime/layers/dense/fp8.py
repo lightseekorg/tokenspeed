@@ -54,6 +54,10 @@ class Fp8LinearMethod(LinearMethodBase):
         # 1x32 weight scales in the native GEMM's layout, or None for the
         # original path. see prepare_weight_scales.
         self.prepared_weight_scales: torch.Tensor | None = None
+        # DeepGEMM's E4M3 projection scales, when it serves this layer. They
+        # and the prepacked scales above are exclusive: a subclass that prepares
+        # both lets the activation's scale layout pick the GEMM.
+        self.projection_weight_scales: torch.Tensor | None = None
 
     def _get_block_solution(self) -> str | None:
         if self.block_solution is not None:
