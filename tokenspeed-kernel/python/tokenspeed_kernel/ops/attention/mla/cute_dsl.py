@@ -46,12 +46,15 @@ def _addressable(
     """Whether the kernel's vector loads and stores can address these tensors."""
     heads = weight.shape[0]
     rows = [(attention, 8, 16)] + [(t, 2, 4) for t in (gate, out) if t is not None]
+    # Row offsets stay int32: decode batches span far fewer than 2**31 elements.
     return (
         weight.stride() == (_LATENT * _VALUE, 1, _LATENT)
+        and weight.data_ptr() % 16 == 0
         and all(
             t.stride(-1) == 1
             and all(s % elements == 0 for s in t.stride()[:-1])
             and t.data_ptr() % align == 0
+            and t.shape[0] * t.stride(0) < 2**31
             for t, elements, align in rows
         )
         and attention.shape[1] == heads
@@ -107,7 +110,8 @@ def cute_dsl_mla_project_value(
         ``out``.
 
     Raises:
-        ValueError: If a stride or alignment is one the kernel cannot address.
+        ValueError: If a stride, an alignment or a row span past int32
+            offsets is one the kernel cannot address.
     """
     from tokenspeed_kernel.thirdparty.cute_dsl.k3_decode.common.host import stream
     from tokenspeed_kernel.thirdparty.cute_dsl.k3_decode.mla.value import mla_value

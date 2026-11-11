@@ -137,3 +137,23 @@ def test_unaligned_rows_are_rejected():
     out = torch.empty(4, 12 * VALUE, device="cuda", dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="cannot address"):
         cute_dsl_mla_project_value(unaligned, w_vc, gate, out)
+
+
+def test_an_unaligned_weight_is_rejected():
+    attention, w_vc, gate = _inputs(4, 12, seed=6)
+    stored = w_vc.transpose(1, 2)
+    shifted = torch.empty(stored.numel() + 1, device="cuda", dtype=torch.bfloat16)
+    unaligned = shifted[1:].view_as(stored).copy_(stored).transpose(1, 2)
+    out = torch.empty(4, 12 * VALUE, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="cannot address"):
+        cute_dsl_mla_project_value(attention, unaligned, gate, out)
+
+
+def test_rows_spanning_past_int32_offsets_are_rejected():
+    """The kernel's row offsets are int32; a meta view spans 2**31 elements unallocated."""
+    attention, w_vc, gate = _inputs(4, 12, seed=7)
+    out = torch.empty_strided(
+        (4, 12 * VALUE), (2**29, 1), device="meta", dtype=torch.bfloat16
+    )
+    with pytest.raises(ValueError, match="cannot address"):
+        cute_dsl_mla_project_value(attention, w_vc, gate, out)
