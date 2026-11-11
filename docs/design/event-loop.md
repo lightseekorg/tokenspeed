@@ -1065,10 +1065,10 @@ cleanup runs outside the callback.
 
 While serving generation, a fatal control-loop or forward-thread error
 signals the owning launcher once from the thread that detects it. The
-signal requires no Python call and precedes any wait for the forward thread
-or device cleanup. The launcher can begin stopping the local ranks even
-while the failing rank is still alive. An orderly stop still drains the
-forward thread and closes the data plane.
+signal requires no Python call and precedes the Rust error log and any wait
+for the forward thread or device cleanup. The launcher can begin stopping
+the local ranks even while the failing rank is still alive. An orderly stop
+still drains the forward thread and closes the data plane.
 
 ## Checklist for extending the loop
 

@@ -333,7 +333,6 @@ impl PythonDataPlane {
     }
 
     fn fail(&self, failure: String) -> DataPlaneError {
-        tracing::error!("the data plane failed:\n{failure}");
         self.shared.fail(failure.clone());
         DataPlaneError(failure)
     }
