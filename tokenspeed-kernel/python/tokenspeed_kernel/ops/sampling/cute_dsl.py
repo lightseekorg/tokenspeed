@@ -1594,7 +1594,7 @@ if _CUTE_AVAILABLE:
         ):
             """The distributed argmax's handshake for every row, in one CTA.
 
-            Same slots, band ping-pong and payload as ``DistArgmaxKernel``:
+            Same slots, band ping-pong, and payload as ``DistArgmaxKernel``:
             each row's candidate is multicast to slot ``(row, band, rank)``
             on every rank, each rank reads all ``world_size`` slots of the row
             and clears their flags, and ``round_id`` advances once per launch
@@ -1998,7 +1998,7 @@ def supports_markov_argmax_shape(
     Args:
         vocab_per_rank: Shard columns of the base logits (projection rows).
         rank_dim: Markov rank: width of the embedding and projection rows.
-        dtype: Dtype of the base logits, embedding and projection.
+        dtype: Dtype of the base logits, embedding, and projection.
 
     Returns:
         True when the kernel covers the geometry. The verdict follows from
@@ -2070,14 +2070,14 @@ def create_markov_argmax_workspace(
         max_rows: Most rows any step will pass.
         vocab_per_rank: Columns of this rank's shard.
         rank_dim: Markov rank.
-        dtype: Dtype of the base logits, embedding and projection.
+        dtype: Dtype of the base logits, embedding, and projection.
 
     Returns:
         The workspace to pass to :func:`markov_argmax_step`.
 
     Raises:
         RuntimeError: CuTe DSL is unavailable here, or a capture is running.
-        ValueError: The geometry, group or row bound is unsupported.
+        ValueError: The geometry, group, or row bound is unsupported.
     """
     if not _CUTE_AVAILABLE:
         raise RuntimeError("markov_argmax_step requires CuTe DSL on NVIDIA sm_90+")
@@ -2162,7 +2162,7 @@ def markov_argmax_step(
         None. ``out`` is written in place.
 
     Raises:
-        ValueError: A tensor's shape, dtype, layout or device does not match
+        ValueError: A tensor's shape, dtype, layout, or device does not match
             the workspace, or ``rows`` exceeds ``workspace.max_rows``.
     """
     if base_logits.dim() != 2 or not base_logits.is_contiguous():

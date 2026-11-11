@@ -7,7 +7,7 @@ vocabulary of a tensor-parallel group. Each rank reduces its shard to one
 `(value, global id)` candidate per row, multicasts it as one 64-bit word
 (`[ready flag | id | FP32 value]`) to slot `(row, band, rank)` of a
 symmetric-memory buffer on every rank, waits for the group's slots of the
-row, clears their flags and keeps the largest value, lowest id on ties.
+row, clears their flags, and keeps the largest value, lowest id on ties.
 Values that never beat -inf (-inf, NaN) do not compete; a row with no
 candidate yields 0.
 
@@ -33,7 +33,7 @@ Inside the launch:
 
 * Grid `(shard_rows / 64, ceil(rows / rows_per_cta))`, 256 threads. A CTA
   gathers its rows' latent vectors (one 1 KB row each at rank 512) into
-  shared memory with `cp.async`; the row-tile count (8, 16, 32 or 64 rows per
+  shared memory with `cp.async`; the row-tile count (8, 16, 32, or 64 rows per
   CTA) is a compile-time specialization.
 * Each warp pair owns 16 projection rows and splits the rank dimension in
   two. Lanes load their projection words straight from global memory and
@@ -41,7 +41,7 @@ Inside the launch:
   M, the requests as N). Both operands read the same permutation of rank
   columns, so each lane's loads are two contiguous 16-byte words per row.
 * The pair adds its halves in FP32, rounds to the dtype, adds the base logit,
-  rounds again and keeps the best `(value, lowest id)` per request as one
+  rounds again, and keeps the best `(value, lowest id)` per request as one
   ordered int64 key; the CTA folds its keys into a per-row global key with
   `red.max`.
 * The last CTA to finish (a global counter) reads the keys and runs the

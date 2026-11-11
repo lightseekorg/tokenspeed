@@ -86,7 +86,7 @@ class DSpark(DFlash):
         )
         for k in range(1, self.spec_num_tokens):
             if workspace is not None:
-                # One launch: bias, add and cross-rank argmax after token k - 1.
+                # One launch: bias, add, and cross-rank argmax after token k - 1.
                 start = int(self.lm_head.shard_indices.org_vocab_start_index)
                 markov_argmax_step(
                     workspace,

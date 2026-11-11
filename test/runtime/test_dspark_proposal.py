@@ -422,7 +422,7 @@ def test_the_fused_walk_proposes_what_the_unfused_walk_does(monkeypatch) -> None
     """The fused walk proposes exactly what the unfused walk does.
 
     Each fused position must read its own base logits, the token just written
-    for the previous position (clamped), this rank's projection rows and its
+    for the previous position (clamped), this rank's projection rows, and its
     vocabulary offset.
     """
     unfused = _shard_walk(False, monkeypatch)

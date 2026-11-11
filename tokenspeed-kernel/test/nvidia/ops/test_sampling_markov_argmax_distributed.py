@@ -26,7 +26,7 @@ rank, the argmax over the concatenated vocabulary of ``round(base +
 round(bias))``, exchanging candidates through the distributed argmax's
 slots. Integer-valued weights make the reference exact (see the one-GPU
 test); random weights are compared with the unfused path the drafter runs
-otherwise -- the BF16 bias GEMM, the BF16 add and ``distributed_argmax`` --
+otherwise -- the BF16 bias GEMM, the BF16 add, and ``distributed_argmax`` --
 and may only differ at near-ties.
 
 Normal one-GPU pytest runs skip this file. Exercise it with:

@@ -21,7 +21,7 @@
 """The fused greedy DSpark Markov step on one rank.
 
 ``markov_argmax_step`` folds one proposal position of the DSpark walk -- the
-Markov bias GEMM, the add to the base logits and the argmax -- into one
+Markov bias GEMM, the add to the base logits, and the argmax -- into one
 launch. The reference is the unfused walk: ``bias = embedding[clamp(prev)] @
 projection.T`` rounded to the logits dtype, ``logits = base + bias`` rounded
 again, ``torch.argmax`` over the vocabulary. Integer-valued Markov weights
@@ -197,7 +197,7 @@ def test_out_of_range_previous_tokens_clamp_to_the_table_edges(workspace):
 def test_ties_go_to_the_lowest_token(workspace):
     """Equal maxima resolve to the lowest column, like torch.argmax.
 
-    The maxima sit in different CTAs, warps and lanes; -0.0 ties with +0.0.
+    The maxima sit in different CTAs, warps, and lanes; -0.0 ties with +0.0.
     """
     rows = 4
     embedding = torch.zeros(VOCAB, RANK, dtype=torch.bfloat16, device="cuda")

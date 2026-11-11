@@ -152,9 +152,9 @@ fused distributed argmax with alternating slot bands when supported, and
 otherwise the packed-key argmax collective, instead of gathering full logits.
 The alternating bands allow consecutive target/draft calls without an extra
 group barrier; calls sharing a state must still be ordered across streams. The
-greedy DSpark draft walk runs each Markov position (bias, add and argmax) as one
-launch that exchanges candidates through the same slots and band order. Returned
-logits remain vocabulary-sharded and are not a full distribution. Sampled
+greedy DSpark draft walk runs each Markov position (bias, add, and argmax) as
+one launch that exchanges candidates through the same slots and band order.
+Returned logits remain vocabulary-sharded and are not a full distribution. Sampled
 draft distributions and consumers requiring full logits keep the vocabulary
 exchange; padded vocabularies, softcapping, and other argmax eligibility
 limits also retain the full-logit fallback.
