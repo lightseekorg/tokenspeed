@@ -164,6 +164,7 @@ def triton_mha_extend_with_kvcache(
         "return_lse": frozenset({False, True}),
         "sinks": frozenset({False, True}),
         "sliding_window": frozenset({False, True}),
+        "window_sink": frozenset({False, True}),
     },
 )
 def triton_mha_decode_with_kvcache(
@@ -175,6 +176,7 @@ def triton_mha_decode_with_kvcache(
     max_seqlen_k: int,
     max_seqlen_q: int = 1,
     window_left: int = -1,
+    window_sink: int = 0,
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
     return_lse: bool = False,
@@ -193,6 +195,7 @@ def triton_mha_decode_with_kvcache(
         max_seqlen_k=max_seqlen_k,
         max_seqlen_q=max_seqlen_q,
         window_left=window_left,
+        window_sink=window_sink,
         logit_cap=logit_cap,
         sinks=sinks,
         return_lse=return_lse,

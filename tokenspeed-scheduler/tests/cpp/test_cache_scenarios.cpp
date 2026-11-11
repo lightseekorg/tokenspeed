@@ -924,16 +924,36 @@ TEST_F(PrefillSlideAdmissionSuite, LongPromptAdmittedOnlyBecausePrefillSlides) {
 }
 
 TEST_F(PrefillSlideAdmissionSuite, InFlightStorePinsItsSourcesUntilAck) {
-    // Sink ON over the LongPromptAdmittedOnlyBecausePrefillSlides math: device
-    // 13 -> 12 usable, c1+c2 charge 8, c3 needs 6 = free 4 + slide credit 2.
-    // An ordinary store ticket pins its device sources until the ACK, so the
+    // Sink ON over the LongPromptAdmittedOnlyBecausePrefillSlides math: 12
+    // usable pages for r1, c1+c2 charge 8, c3 needs 6 = free 4 + slide credit
+    // 2. An ordinary store ticket pins its device sources until the ACK, so the
     // slid SWA pages op1 is copying are not evictable yet: c3 waits one round
     // for the ACK -- and waits, rather than retracting anyone (least of all
     // itself) for capacity that the ACK is about to return.
+    //
+    // Pages are published, and so streamed, only with prefix caching, whose
+    // per-request tail handover and copy-in reserve make r1 need a 17-page
+    // device pool. A one-page bystander's stores, never acknowledged, keep the
+    // 4 pages beyond r1's 12 pinned throughout.
+    config_.disable_prefix_cache = false;
     config_.disable_l2_cache = false;
-    config_.host_allocator.total_pages = 15;  // 12 streamed pages plus the finish-time tail in both groups
+    config_.device_allocator.total_pages = 17;
+    for (CacheGroupConfig& group : config_.cache_groups) {
+        group.total_pages = config_.device_allocator.total_pages;
+    }
+    SetTestSnapshotPool(config_);
+    // r1's 12 streamed pages and its finish-time tail in both groups, beside
+    // the bystander's 4 pages in flight.
+    config_.host_allocator.total_pages = 19;
     config_.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
     scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
+    Submit(MakeRequestSpec("bystander", /*num_pages=*/1, /*start=*/501));
+    PlanOnce();
+    SendForwardDone("bystander", {7});
+    PlanOnce();  // its first decode streams its prompt page
+    SendForwardDone("bystander", {8});
+    SendFinish("bystander");
+    PlanOnce();  // its finish streams its tail
     const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
     ASSERT_EQ(free_at_start, 12);
 
@@ -3147,6 +3167,9 @@ protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = ImageDoesNotFitSuite::MakeConfig();
         cfg.disable_l2_cache = false;
+        // The prompts' pages are published, and so written through, only with
+        // prefix caching.
+        cfg.disable_prefix_cache = false;
         return cfg;
     }
 };
@@ -6554,7 +6577,8 @@ protected:
         cfg.max_batch_size = 8;
         cfg.enable_l3_storage = false;
         cfg.disable_l2_cache = false;
-        cfg.disable_prefix_cache = true;
+        // Pages are published, and so streamed to Host, only with prefix caching.
+        cfg.disable_prefix_cache = false;
 
         cfg.cache_groups = {
             MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kFull),
@@ -6627,7 +6651,11 @@ TEST_F(StreamingSinkSuite, DuplicateRegistrationsAreDroppedAtDrain) {
     ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
     ASSERT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
 
-    ExecutionPlan finalize2 = RunToFinalize(MakeRequestSpec("r2", /*num_pages=*/4));  // identical tokens
+    // Identical tokens, recomputed in full: capped at 0 tokens, r2's probe
+    // hits nothing, so it registers r1's keys again.
+    RequestSpec r2 = MakeRequestSpec("r2", /*num_pages=*/4);
+    r2.max_cached_prefix_tokens = 0;
+    ExecutionPlan finalize2 = RunToFinalize(r2);
     EXPECT_FALSE(FindWriteBack(finalize2).has_value()) << "already-indexed keys must not re-emit a write-back";
     // r1's finish found the Host pool fully in flight, so its tail never
     // reached Host; r2's identical tail is the first store of that key and
