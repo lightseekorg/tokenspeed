@@ -61,9 +61,10 @@ from __future__ import annotations
 import bisect
 import os
 import zlib
+from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Callable, NamedTuple, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, NamedTuple, Protocol, runtime_checkable
 
 import numpy as np
 import torch
