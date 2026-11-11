@@ -22,11 +22,16 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
+
+if TYPE_CHECKING:
+    from tokenspeed_kernel.ops.moe._cute_dsl.latent_down import AllReduceMailbox
 
 _FLOAT_DTYPES = {torch.float16, torch.bfloat16, torch.float32}
 
@@ -465,8 +470,11 @@ def triton_routed_input_scale_rmsnorm_sum_gathered(
     weight_offset: float,
     enable_pdl: bool,
     output: torch.Tensor | None,
+    all_reduce: AllReduceMailbox | None,
 ) -> torch.Tensor:
     """Triton kernel of the routed normalized reduction dispatcher."""
+    if all_reduce is not None:
+        raise ValueError("an all-reduce mailbox needs the cluster routed sum")
     width = norm_weight.shape[0]
     if gemm2_out.ndim != 2 or gemm2_out.stride(1) != 1 or gemm2_out.shape[1] < width:
         raise ValueError("gemm2_out must be row-major [rows, >= width]")
