@@ -42,11 +42,10 @@ steps, and the finish hash and publish nothing, and a finished request's pages
 return straight to the pool. Published, they could only stay resident until
 an allocation evicted them, and on a D node, which allocates every request's
 whole prompt, every allocation would first walk the eviction order. Admission
-does not hash the prompt either, since there is nothing to probe. A non-D
-role with a Host cache is a conservative exception: it still publishes and
-streams to that tier, although nothing on the node reads it without prefix
-caching. A retraction publishes its victim either way; with a Host cache, the
-image's L2 leg is built from that publication.
+does not hash the prompt either, since there is nothing to probe, and nothing
+is written to a Host cache, which no probe could read. A retraction publishes
+its victim either way; with a Host cache, the image's L2 leg is built from that
+publication.
 
 Decode-role remote admission covers the complete unmatched prompt in one
 landing window. Local prefill chunk limits and junction cuts do not shorten

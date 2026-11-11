@@ -183,9 +183,8 @@ def make_config(
         decode_input_tokens: Verify width per decode step.
         overlap_schedule_depth: Dispatched-but-uncommitted plans allowed.
         disable_prefix_cache: No prefix matching at admission. Computed
-            pages are then published only for a retraction's image and, on a
-            non-D role, a Host cache; otherwise a finished request's pages
-            return to the pool.
+            pages are then published only for a retraction's image, so a
+            finished request's pages return to the pool.
         cache_groups: The arena's scheduler group configs.
         enable_mixed_prefill_decode: Mixed prefill/decode batches.
         prefix_replay_tokens: Prompt tail recomputed after a prefix hit.

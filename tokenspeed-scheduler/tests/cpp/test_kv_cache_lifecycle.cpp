@@ -163,37 +163,42 @@ TEST_F(KvCacheLifecycleTestSuite, EmptyAndActiveLcmBlocksPartitionThePool) {
     EXPECT_LT(scheduler_->EmptyLcmBlocks(), total) << "but they stay resident as cache-only parents";
 }
 
-// With prefix caching disabled and no Host cache, no admission can hit a
-// published page: a running request's completed pages and its finish publish
+// With prefix caching disabled no admission can hit a published page, in
+// either tier: a running request's completed pages and its finish publish
 // nothing, so its pages return straight to the free pool instead of staying
 // resident as cache-only parents (SchedulerConfig::PublishesCompletedPages).
 TEST_F(KvCacheLifecycleTestSuite, FinishedPagesReturnToThePoolWithoutPrefixCaching) {
-    const std::int32_t total = scheduler_->EmptyLcmBlocks();
-    EXPECT_EQ(total, scheduler_->AvailableLcmBlocks());
-    EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0);
+    for (const bool host_cache : {false, true}) {
+        SCOPED_TRACE(host_cache ? "with a Host cache" : "without a Host cache");
+        config_.disable_l2_cache = !host_cache;
+        scheduler_ = std::make_unique<Scheduler>(config_);
+        const std::int32_t total = scheduler_->EmptyLcmBlocks();
+        EXPECT_EQ(total, scheduler_->AvailableLcmBlocks());
+        EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0);
 
-    // More than one page so a page actually completes mid-request.
-    Submit(MakeRequestSpec("r1", /*num_pages=*/2));
-    PlanOnce();
-    SendForwardDone("r1", {42});
-    EXPECT_GT(scheduler_->ActiveLcmBlocks(), 0);
-    EXPECT_EQ(scheduler_->EmptyLcmBlocks() + scheduler_->ActiveLcmBlocks(), total)
-        << "a live request's pages are active; none are cache-only";
-
-    int tok = 43;
-    for (int step = 0; step < 4; ++step) {
+        // More than one page so a page actually completes mid-request.
+        Submit(MakeRequestSpec("r1", /*num_pages=*/2));
         PlanOnce();
+        SendForwardDone("r1", {42});
+        EXPECT_GT(scheduler_->ActiveLcmBlocks(), 0);
         EXPECT_EQ(scheduler_->EmptyLcmBlocks() + scheduler_->ActiveLcmBlocks(), total)
-            << "still no cache-only parents mid-decode";
-        SendForwardDone("r1", {tok++});
-    }
+            << "a live request's pages are active; none are cache-only";
 
-    SendFinish("r1");
-    PlanOnce();
-    EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0);
-    EXPECT_EQ(scheduler_->EmptyLcmBlocks(), total)
-        << "with prefix caching disabled the finished request leaves no cache-only parents";
-    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), total);
+        int tok = 43;
+        for (int step = 0; step < 4; ++step) {
+            PlanOnce();
+            EXPECT_EQ(scheduler_->EmptyLcmBlocks() + scheduler_->ActiveLcmBlocks(), total)
+                << "still no cache-only parents mid-decode";
+            SendForwardDone("r1", {tok++});
+        }
+
+        SendFinish("r1");
+        PlanOnce();
+        EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0);
+        EXPECT_EQ(scheduler_->EmptyLcmBlocks(), total)
+            << "with prefix caching disabled the finished request leaves no cache-only parents";
+        EXPECT_EQ(scheduler_->AvailableLcmBlocks(), total);
+    }
 }
 
 // One full-attention group with 8-token pages and no Host cache: a decode
