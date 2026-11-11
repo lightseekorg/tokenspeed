@@ -905,6 +905,49 @@ TEST(PrefixCacheIndexEvictionOrderTest, AcquiringAMatchMovesTheEntryToTheRequest
     EXPECT_EQ(DrainEvictionOrder(index, pool), (std::vector<CacheBlockLocation>{untouched, matched}));
 }
 
+// Hits re-keyed to a new epoch, and entries published under it, append at
+// the end of the order. The order stays exact when the last entry leaves it
+// (eviction, or a traversal setting it aside while pinned) right after an
+// insertion just before it, and when appends and restores follow.
+TEST(PrefixCacheIndexEvictionOrderTest, AppendsAtTheNewestEpochAndRemovesTheLastEntry) {
+    BlockPool pool(10, {1});
+    PrefixCacheIndex index(kGroupId);
+    std::vector<CacheBlockLocation> cached;
+    std::vector<CacheKey> keys;
+    for (int i = 0; i < 6; ++i) {
+        cached.push_back(Cache(index, pool, std::to_string(i), /*access_epoch=*/1));
+        keys.push_back(KeyOf(std::to_string(i)));
+    }
+    index.AcquireMatched(pool, std::vector<CacheKey>(keys.begin(), keys.begin() + 4), /*begin_blocks=*/0,
+                         GroupPrefixProbe{.hits = {1, 1, 1, 1}}, /*access_epoch=*/5, /*session=*/nullptr);
+    EXPECT_EQ(DrainEvictionOrder(index, pool),
+              (std::vector<CacheBlockLocation>{cached[4], cached[5], cached[0], cached[1], cached[2], cached[3]}));
+
+    index.AcquireMatched(pool, std::vector<CacheKey>{keys[3]}, 0, GroupPrefixProbe{.hits = {1}}, 6, nullptr);
+    const CacheBlockLocation mid = Cache(index, pool, "mid", 5);
+    ASSERT_TRUE(index.Evict(pool, cached[3]));
+    const CacheBlockLocation newest = Cache(index, pool, "newest", 7);
+    EXPECT_EQ(DrainEvictionOrder(index, pool),
+              (std::vector<CacheBlockLocation>{cached[4], cached[5], cached[0], cached[1], cached[2], mid, newest}));
+
+    CacheBlockRef pin = index.Find(pool, KeyOf("newest"));
+    const CacheBlockLocation before_newest = Cache(index, pool, "before-newest", 6);
+    EXPECT_EQ(DrainEvictionOrder(index, pool), (std::vector<CacheBlockLocation>{cached[4], cached[5], cached[0],
+                                                                                cached[1], cached[2], mid,
+                                                                                before_newest}));
+    const CacheBlockLocation appended = Cache(index, pool, "appended", 8);
+    pin.reset();
+    const std::vector<CacheBlockLocation> order = DrainEvictionOrder(index, pool);
+    EXPECT_EQ(order, (std::vector<CacheBlockLocation>{cached[4], cached[5], cached[0], cached[1], cached[2], mid,
+                                                      before_newest, newest, appended}));
+
+    for (const CacheBlockLocation location : order) {
+        ASSERT_TRUE(index.Evict(pool, location));
+    }
+    EXPECT_EQ(index.NumEntries(pool), 0);
+    EXPECT_EQ(index.PotentiallyEvictableEntries(pool), 0u);
+}
+
 TEST(PrefixCacheIndexEvictionOrderTest, AcquiredOwnersRestoreOrderOnLastReleaseAndUnwind) {
     BlockPool pool(3, {1});
     PrefixCacheIndex index(kGroupId);

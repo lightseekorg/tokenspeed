@@ -85,25 +85,32 @@ private:
         EvictionOrderMap::iterator Insert(EvictionOrder key, CacheEntryIterator entry) {
             const auto position = entries_.emplace_hint(hint_, key, entry);
             FatalCheck(position->second == entry, "an ordered entry has a unique epoch and location");
-            hint_ = std::next(position);
+            hint_ = successor(position);
             return position;
         }
         EvictionOrderMap::iterator Insert(EvictionOrderMap::node_type& node) noexcept {
             const auto position = entries_.insert(hint_, std::move(node));
             FatalCheck(node.empty(), "an extracted node restores its unique order key");
-            hint_ = std::next(position);
+            hint_ = successor(position);
             return position;
         }
         EvictionOrderMap::node_type Extract(EvictionOrderMap::iterator position) noexcept {
-            if (hint_ == position) ++hint_;
+            if (hint_ == position) hint_ = successor(position);
             return entries_.extract(position);
         }
         void Erase(EvictionOrderMap::iterator position) noexcept {
-            if (hint_ == position) ++hint_;
+            if (hint_ == position) hint_ = successor(position);
             entries_.erase(position);
         }
 
     private:
+        // Re-keying to a new epoch inserts the last node, whose std::next
+        // climbs the tree's whole right edge; the map reaches that node in
+        // O(1) as end()'s predecessor.
+        EvictionOrderMap::const_iterator successor(EvictionOrderMap::const_iterator position) const noexcept {
+            return position == std::prev(entries_.end()) ? entries_.end() : std::next(position);
+        }
+
         EvictionOrderMap entries_;
         EvictionOrderMap::const_iterator hint_{entries_.end()};
     };
