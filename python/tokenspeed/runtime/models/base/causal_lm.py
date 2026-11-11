@@ -484,13 +484,17 @@ class BaseCausalLM(nn.Module):
                 if weight_name not in name:
                     continue
 
-                mapped = name.replace(weight_name, param_name)
-                if mapped not in params_dict:
+                name = name.replace(weight_name, param_name)
+
+                if name.endswith(".bias") and name not in params_dict:
                     continue
 
-                param = params_dict[mapped]
+                if name not in params_dict:
+                    continue
+
+                param = params_dict[name]
                 param.weight_loader(param, loaded_weight, shard_id)
-                loaded.add(mapped)
+                loaded.add(name)
 
                 break
 

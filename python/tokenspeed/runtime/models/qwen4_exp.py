@@ -657,7 +657,7 @@ def load_qwen4_exp_weights(
         ("mix_inject_proj", "input_mix_weight_down", "mix"),
         ("mix_inject_proj", "block_inject_weight", "inject"),
     ]
-    stacked += _gdn_in_proj_stacked_mapping()
+    stacked += _gdn_in_proj_stacked_mapping(params)
     num_experts = getattr(config, "num_experts", None)
     moe_loader = None
     if num_experts is not None:

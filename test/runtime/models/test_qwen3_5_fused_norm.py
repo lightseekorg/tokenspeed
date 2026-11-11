@@ -233,7 +233,6 @@ def bf16_default_dtype():
         ("serialized_fp8", True, True, False),
         ("mixed_qkvz", True, True, True),
         ("mixed_out", True, True, True),
-        ("mixed_merged", True, True, False),
     ],
 )
 def test_gdn_projection_fp8_requires_opt_in(
@@ -255,9 +254,6 @@ def test_gdn_projection_fp8_requires_opt_in(
         "nvfp4": Nvfp4Config(exclude_modules=["*.linear_attn.*"]),
         "mixed_out": ModelOptMixedConfig(
             quantized_layers={"model.layers.0.linear_attn.out_proj": "FP8"}
-        ),
-        "mixed_merged": ModelOptMixedConfig(
-            quantized_layers={"model.layers.0.linear_attn.in_proj_qkvzba": "FP8"}
         ),
         "mixed_qkvz": ModelOptMixedConfig(
             quantized_layers={
@@ -285,7 +281,7 @@ def test_gdn_projection_fp8_requires_opt_in(
     if checkpoint.startswith("mixed"):
         serialized, online = (
             (input_proj, gdn.out_proj)
-            if checkpoint in ("mixed_qkvz", "mixed_merged")
+            if checkpoint == "mixed_qkvz"
             else (gdn.out_proj, input_proj)
         )
         assert serialized.weight.dtype == torch.float8_e4m3fn

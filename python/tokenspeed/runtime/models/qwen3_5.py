@@ -162,15 +162,10 @@ def _uses_packed_fp8_output(projection: RowParallelLinear) -> bool:
     )
 
 
-def _gdn_group_unquantized(prefix, group_name, shard_names, quant_config) -> bool:
-    if isinstance(quant_config, ModelOptMixedConfig):
-        group_prefix = add_prefix(group_name, prefix)
-        if group_prefix in quant_config.quantized_layers:
-            return not quant_config.is_quantized_layer(group_prefix)
-        quantized = {
-            quant_config.is_quantized_layer(add_prefix(shard, prefix))
-            for shard in shard_names
-        }
+def _gdn_group_unquantized(prefix, shard_names, quant_config) -> bool:
+    is_quantized_layer = getattr(quant_config, "is_quantized_layer", None)
+    if is_quantized_layer is not None:
+        quantized = {is_quantized_layer(f"{prefix}.{shard}") for shard in shard_names}
         if len(quantized) > 1:
             raise ValueError(
                 f"Partially quantized Gated DeltaNet projection group at {prefix}"
@@ -193,13 +188,15 @@ def _gdn_group_unquantized(prefix, group_name, shard_names, quant_config) -> boo
     return True
 
 
-def _gdn_in_proj_stacked_mapping() -> list[tuple[str, str, int | tuple[int, ...]]]:
-    # Resolve the destination for each layer, since a mixed checkpoint can use both.
+def _gdn_in_proj_stacked_mapping(param_names) -> list:
+    if any(name.endswith(".in_proj_qkvz.weight") for name in param_names):
+        return [
+            ("in_proj_qkvz.", "in_proj_qkv.", (0, 1, 2)),
+            ("in_proj_qkvz.", "in_proj_z.", 3),
+            ("in_proj_ba.", "in_proj_b.", 0),
+            ("in_proj_ba.", "in_proj_a.", 1),
+        ]
     return [
-        ("in_proj_qkvz.", "in_proj_qkv.", (0, 1, 2)),
-        ("in_proj_qkvz.", "in_proj_z.", 3),
-        ("in_proj_ba.", "in_proj_b.", 0),
-        ("in_proj_ba.", "in_proj_a.", 1),
         ("in_proj_qkvzba.", "in_proj_qkv.", (0, 1, 2)),
         ("in_proj_qkvzba.", "in_proj_z.", 3),
         ("in_proj_qkvzba.", "in_proj_b.", 4),
@@ -310,35 +307,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             # unless attention projection quantization is explicitly enabled.
             quant_config = None
         qkvz_prefix = add_prefix("in_proj_qkvz", prefix)
-        ba_prefix = add_prefix("in_proj_ba", prefix)
-        merged_prefix = add_prefix("in_proj_qkvzba", prefix)
-        ba_config = quant_config
-        if (
-            isinstance(quant_config, ModelOptMixedConfig)
-            and merged_prefix in quant_config.quantized_layers
-            and quant_config.is_quantized_layer(merged_prefix)
-        ):
-            qkvz_config = quant_config
-        else:
-            qkvz_config = _get_attn_proj_quant_config(
-                quant_config, qkvz_prefix, enabled=enable_fp8_attn_proj
-            )
-            if _gdn_group_unquantized(
-                prefix, "in_proj_qkvz", ("in_proj_qkv", "in_proj_z"), qkvz_config
-            ):
-                qkvz_config = None
-            if _gdn_group_unquantized(
-                prefix, "in_proj_ba", ("in_proj_b", "in_proj_a"), ba_config
-            ):
-                ba_config = None
-        self._split_in_proj = qkvz_config is not ba_config or (
-            isinstance(qkvz_config, ModelOptMixedConfig)
-            and merged_prefix not in qkvz_config.quantized_layers
-            and (
-                qkvz_prefix in qkvz_config.quantized_layers
-                or ba_prefix in qkvz_config.quantized_layers
-            )
+        qkvz_config = _get_attn_proj_quant_config(
+            quant_config, qkvz_prefix, enabled=enable_fp8_attn_proj
         )
+        if _gdn_group_unquantized(prefix, ("in_proj_qkv", "in_proj_z"), qkvz_config):
+            qkvz_config = None
+        ba_config = quant_config
+        if _gdn_group_unquantized(prefix, ("in_proj_b", "in_proj_a"), ba_config):
+            ba_config = None
+        self._split_in_proj = qkvz_config is not ba_config
         if self._split_in_proj:
             self.in_proj_qkvz = MergedColumnParallelLinear(
                 input_size=self.hidden_size,
@@ -366,7 +343,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 tp_rank=self.attn_tp_rank,
                 tp_size=self.attn_tp_size,
                 tp_group=self.attn_tp_group,
-                prefix=ba_prefix,
+                prefix=add_prefix("in_proj_ba", prefix),
             )
             self._bind_packed_weight_loaders(self.in_proj_qkvz)
             self._bind_packed_weight_loaders(self.in_proj_ba)
@@ -387,7 +364,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 tp_rank=self.attn_tp_rank,
                 tp_size=self.attn_tp_size,
                 tp_group=self.attn_tp_group,
-                prefix=merged_prefix,
+                prefix=add_prefix("in_proj_qkvzba", prefix),
             )
             self._qkvz_dim = (
                 self.key_dim * 2 + self.value_dim * 2
@@ -1611,7 +1588,9 @@ class Qwen3_5ForConditionalGeneration(BaseCausalLM):
             (".qkv_proj.", ".v_proj.", "v"),
             (".gate_up_proj.", ".gate_proj.", 0),
             (".gate_up_proj.", ".up_proj.", 1),
-        ] + _gdn_in_proj_stacked_mapping()
+        ] + _gdn_in_proj_stacked_mapping(
+            name for name, _ in self.named_parameters(remove_duplicate=False)
+        )
 
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]], **kwargs: Any
