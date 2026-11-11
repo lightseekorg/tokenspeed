@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""The shared model embedding boundary for eager and graphed prefill."""
+"""The shared embedding boundary for models that consume request history."""
 
 from __future__ import annotations
 
@@ -34,12 +34,12 @@ if TYPE_CHECKING:
 
 
 @runtime_checkable
-class InputEmbeddingModel(Protocol):
-    """An inner model with a shared input-embedding stage.
+class HistoryEmbeddingModel(Protocol):
+    """An inner model whose request-history work is confined to input embedding.
 
     Ordinary forward and graph replay share this method. It returns one
-    embedding row per input token and handles all history reads and appends. Graph
-    replay calls it eagerly, before padding. With ``input_embeds`` supplied,
+    embedding row per input token and handles all history reads and appends.
+    Graph replay calls it eagerly, before padding. With ``input_embeds`` supplied,
     the inner stack and the outer model's ``prepare_model_kwargs`` must
     neither require nor append history.
     """

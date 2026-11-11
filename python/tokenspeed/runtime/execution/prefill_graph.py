@@ -84,7 +84,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     ForwardMode,
 )
 from tokenspeed.runtime.execution.forward_step import prepare_draft_extend_metadata
-from tokenspeed.runtime.execution.input_embedding import InputEmbeddingModel
+from tokenspeed.runtime.execution.history_embedding import HistoryEmbeddingModel
 from tokenspeed.runtime.execution.memory_delta import MemoryDeltaObserver
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan
@@ -313,7 +313,7 @@ def input_embedding(
     embed_tokens = getattr(inner, "embed_tokens", None)
     if embed_tokens is None:
         return None
-    if isinstance(inner, InputEmbeddingModel):
+    if isinstance(inner, HistoryEmbeddingModel):
         return inner.compute_input_embeddings
     if requires_request_token_history:
         return None

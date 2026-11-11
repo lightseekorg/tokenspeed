@@ -713,7 +713,7 @@ only. `decode_graph=False` still requires `refresh_decode_metadata` and
 `init_cuda_graph_state` — eager decode runs the same unified path.
 
 Models whose embedding reads request-token history may implement
-`InputEmbeddingModel` on the inner model. Its
+`HistoryEmbeddingModel` on the inner model. Its
 `compute_input_embeddings(input_ids, ctx, *, request_token_history)` method is
 shared by ordinary forward and graph replay. At construction the graph owner
 resolves one embedding callable: this method, or a plain token lookup for models
