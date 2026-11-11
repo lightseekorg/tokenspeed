@@ -376,7 +376,7 @@ def iris_pull_allgather_rows(
         + 1
     )
     if PRODUCER_WRITES_THROUGH:
-        WAIT_VMEM(args=[], constraints="=r,~{memory}")
+        WAIT_VMEM()
         gl.barrier()
         _iris_rendezvous(ready_flags, heaps, program, epoch, RANK, NUM_WARPS, False)
     else:
@@ -395,7 +395,7 @@ def iris_pull_allgather_rows(
             )
             gl.amd.cdna4.buffer_store(values, output, destination, mask)
     # The next producer may reuse the owner scratch.
-    WAIT_VMEM(args=[], constraints="=r,~{memory}")
+    WAIT_VMEM()
     gl.barrier()
     _iris_rendezvous(
         ready_flags + FLAG_ROWS * WORLD_SIZE,
@@ -460,7 +460,7 @@ def iris_fused_pull_allgather_rmsnorm_mxfp4(
         # s_waitcnt vmcnt(0) cover only its own subgroup's stores. So each
         # subgroup first waits until its stores reach L2 (s_waitcnt vmcnt(0)
         # on gfx950).
-        WAIT_STORES(args=[], constraints="=r,~{memory}")
+        WAIT_STORES()
 
     epoch_ptr = ready_flags + row * WORLD_SIZE + rank
     ready_epoch = gl.atomic_add(epoch_ptr, 1, sem="release", scope="sys") + 1
@@ -705,7 +705,7 @@ def iris_fused_lamport_allgather_rmsnorm_mxfp4(
         )
 
     # Finish clearing the consumed packs before advancing the row's stages.
-    WAIT_STORES(args=[], constraints="=r,~{memory}")
+    WAIT_STORES()
     for tile in gl.static_range(TILES):
         gl.store(epochs + row * TILES + tile, ((stages[tile] + 1) % 3).to(gl.int32))
 
@@ -833,7 +833,7 @@ def iris_fused_lamport_allgather_rmsnorm(
     gl.store(output + row * total_width + columns, values.to(gl.bfloat16))
 
     # Finish every wave's clears before advancing the row's stages.
-    WAIT_STORES(args=[], constraints="=r,~{memory}")
+    WAIT_STORES()
     gl.barrier()
     for tile in gl.static_range(TILES):
         gl.store(epochs + row * TILES + tile, ((stages[tile] + 1) % 3).to(gl.int32))

@@ -27,6 +27,7 @@ floating-point inputs; ``tokenspeed-kernel`` selects among them by shape.
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel_amd._extern import extern_compile_options, wait_vmem
 from tokenspeed_kernel_amd._triton import compile_ahead, gl, gluon, tl, triton
 from tokenspeed_kernel_amd.ops.gfx950._xcd import _remap_xcd
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (
@@ -1042,14 +1043,7 @@ def gluon_mm_a16w16_medium_gfx950(
         # invalidate cost more than the GEMM: ".wt" writes through to memory,
         # every wave waits for its stores to complete (vmcnt), and the barrier
         # orders all waves' stores before the counter bump.
-        gl.inline_asm_elementwise(
-            asm="s_waitcnt vmcnt(0)",
-            constraints="=v,0",
-            args=[offs_cm],
-            dtype=gl.int32,
-            is_pure=False,
-            pack=1,
-        )
+        wait_vmem()
         gl.barrier()
         old = gl.atomic_add(counter_ptr + tile, 1, sem="relaxed", scope="gpu")
         if old != SPLIT_K - 1:
@@ -1571,6 +1565,7 @@ def launch_gluon_mm_a16w16_medium_gfx950(
         SPLIT_K=1,
         NUM_XCDS=1,
         num_warps=warps_m * warps_n,
+        **extern_compile_options(),
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
     )
 
@@ -1954,6 +1949,7 @@ def launch_gluon_mm_a16w16_decode_gfx950(
             SPLIT_K=split_k,
             NUM_XCDS=num_xcds,
             num_warps=warps_m * warps_n,
+            **extern_compile_options(),
             llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
         )
         if warm:
@@ -2055,6 +2051,7 @@ def launch_gluon_mm_a16w16_column_shard_gfx950(
         SPLIT_K=1,
         NUM_XCDS=1,
         num_warps=4,
+        **extern_compile_options(),
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
     )
     return out
@@ -2253,6 +2250,7 @@ def launch_gluon_grouped_mm_a16w16_decode_gfx950(
         STRIDE_GATE_G=0 if gate is None else gate.stride(1),
         GATE=gate is not None,
         num_warps=warps_m * warps_n,
+        **extern_compile_options(),
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
     )
     return (out.view(M, G * N), scales) if quantize else out
@@ -2361,6 +2359,7 @@ def launch_gluon_mm_a16w16_decode_add3_gfx950(
         SPLIT_K=1,
         NUM_XCDS=num_xcds,
         num_warps=warps_m * warps_n,
+        **extern_compile_options(),
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
     )
     return C
