@@ -691,12 +691,16 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
                       .checkpoint = checkpoint});
         ReservePrefillDemands(demands, config_.cache_groups, reserve);
         if (source == fsm::PrefillSource::kRemote) {
-            // Cached windows already own the hit's blocks, including a
-            // fresh partial tail block. Replayable windows own no hit blocks:
-            // the peer must fill their whole retained suffix.
+            // A full-history group's blocks up to the prompt end land whole
+            // and are not zeroed (GroupDemand::landed_tokens). Cached windows
+            // already own the hit's blocks, including a fresh partial tail
+            // block. Replayable windows own no hit blocks: the peer must fill
+            // their whole retained suffix.
             for (std::size_t i = 0; i < demands.size(); ++i) {
                 const CacheGroupConfig& group = config_.cache_groups[i];
-                if (group.attn_kind == AttnKind::kSlidingWindow) {
+                if (group.attn_kind == AttnKind::kFull) {
+                    demands[i].landed_tokens = request->PrefillSize();
+                } else if (group.attn_kind == AttnKind::kSlidingWindow) {
                     const std::int32_t block_granularity =
                         coordinator_.GroupBlockGranularity(static_cast<std::int32_t>(i));
                     const std::int32_t hit_blocks =
@@ -795,14 +799,15 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     _assert(std::max(admission->device_prefix_tokens, admission->host_prefix_tokens) == hit_tokens,
             "an admission claims exactly the prefix it probed");
     _assert(admission->junction_tokens == junction_tokens, "the junction changed between probe and admission");
-    if (!match.prefix_diagnostic.empty()) {
-        spdlog::info("[PrefixCacheDiagnostic] {}", match.prefix_diagnostic);
-    }
     recordAdmittedPages(plan, *admission);
     // host_prefix_tokens is a boundary: the Host loads the KV that lies beyond
     // the Device's prefix (0 when only checkpoints come from Host), and
     // nothing when the Device won.
     const std::int32_t host_hit_tokens = std::max(admission->host_prefix_tokens - admission->device_prefix_tokens, 0);
+    if (!match.prefix_diagnostic.empty()) {
+        spdlog::info("[PrefixCacheDiagnostic] {} device_hit_tokens={} host_hit_tokens={} host_gain_tokens={}",
+                     match.prefix_diagnostic, hit_tokens - host_hit_tokens, host_hit_tokens, host_gain_tokens);
+    }
     prefix_hit_stats_.prompt_tokens += request->PrefillSize();
     prefix_hit_stats_.device_hit_tokens += hit_tokens - host_hit_tokens;
     prefix_hit_stats_.host_hit_tokens += host_hit_tokens;
@@ -1789,6 +1794,7 @@ bool Scheduler::scheduleRestore(AdmissionFeedback& feedback, PlanBuild& build, R
     _assert(retracted != nullptr && retracted->ImageLanded(),
             "a restore resumes a Retracted request whose image landed");
     if (req_pool_allocator_.AvailableSlots() == 0) {
+        spdlog::debug("[Scheduler] restore blocked: rid={} no free request slot", request->Id());
         return false;
     }
     const auto* resumes_prefilling = std::get_if<fsm::ResumePrefilling>(&retracted->shape);
@@ -1830,6 +1836,8 @@ bool Scheduler::scheduleRestore(AdmissionFeedback& feedback, PlanBuild& build, R
         coordinator_.Restore(retracted->image, demands, copy_in_point, retracted->cache_progress.access_epoch,
                              /*drop_claims_if_unfit=*/!others_hold_pages);
     if (!result) {
+        spdlog::debug("[Scheduler] restore blocked: rid={} reserve_tokens={} headroom_tokens={}", request->Id(),
+                      reserve.decode_input_tokens, reserve.prompt_headroom_tokens);
         feedback.admission_failed = true;
         return false;
     }
@@ -2261,6 +2269,8 @@ void Scheduler::buildDecodeWorkerPlan(AdmissionFeedback& feedback, PlanBuild& bu
                 break;
             }
             if (feedback.admission_failed) {
+                spdlog::debug("[Scheduler] decode preallocation blocked: rid={} prompt_tokens={}", request->Id(),
+                              request->PrefillSize());
                 feedback.NoteCapacityBlocked(request);
             }
         }
