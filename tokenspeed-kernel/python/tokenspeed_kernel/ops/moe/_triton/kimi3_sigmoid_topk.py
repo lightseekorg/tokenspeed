@@ -520,6 +520,7 @@ def kimi3_sigmoid_bias_topk_sorted(
         scratch.shape != (_sorted_scratch_words(),)
         or scratch.dtype != torch.int32
         or scratch.device != router_logits.device
+        or not scratch.is_contiguous()
     ):
         raise ValueError("scratch must come from kimi3_sorted_routing_scratch")
     rows = router_logits.shape[0]
