@@ -368,3 +368,16 @@ def test_sorted_routing_rejects_unsupported_rows():
     logits, bias = _logits("random", 257, 3)
     with pytest.raises(ValueError):
         _fused(logits, bias, 1.0, True, scratch)
+
+
+def test_sorted_routing_rejects_strided_scratch():
+    """The arrival masks are addressed as a dense word array."""
+    from tokenspeed_kernel.ops.moe._triton.kimi3_sigmoid_topk import (
+        kimi3_sorted_routing_scratch,
+    )
+
+    words = kimi3_sorted_routing_scratch(torch.device("cuda")).numel()
+    scratch = torch.zeros(2 * words, dtype=torch.int32, device="cuda")[::2]
+    logits, bias = _logits("random", 16, 5)
+    with pytest.raises(ValueError, match="kimi3_sorted_routing_scratch"):
+        _fused(logits, bias, 1.0, True, scratch)
