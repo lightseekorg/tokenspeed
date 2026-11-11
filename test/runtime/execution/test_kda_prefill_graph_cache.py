@@ -644,6 +644,110 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name):
         assert torch.count_nonzero(output[sum(lengths) :]) == 0
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_plain_metadata_norms_only_the_scanned_rows():
+    """An ordinary capture's eager break gets the bucket's rows on the plain
+    metadata, which scans only the live ones; the output norm's gate spans the
+    bucket and must follow the scan."""
+    from tokenspeed_kernel.ops.attention.gdn.triton import (
+        CAUSAL_CONV1D_BLOCK_M,
+        build_causal_conv1d_prefill_metadata,
+    )
+    from tokenspeed_kernel.ops.attention.kda import (
+        KdaOutputNorm,
+        apply_kda_output_norm,
+        kda_recurrent_layout,
+    )
+
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.layers.attention.backends.state.kda import KdaAttnBackend
+
+    torch.manual_seed(0)
+    bucket, heads, dim = 256, 8, 128
+    channels = heads * dim
+    lengths = torch.tensor([60, 31])
+    live = int(lengths.sum())
+    conv = torch.zeros(4, 3 * channels, 3, device="cuda", dtype=torch.bfloat16)
+    states = torch.zeros(4, heads, dim, dim, device="cuda", dtype=torch.float32)
+    rows = torch.randn(
+        bucket, 4 * channels + 2 * dim, device="cuda", dtype=torch.bfloat16
+    )
+    backend = object.__new__(KdaAttnBackend)
+    configure_prefill(backend)
+    backend.__dict__.update(
+        is_draft=False,
+        cache_pool=object(),
+        kda_backend="auto",
+        kda_recurrent_layout=kda_recurrent_layout(),
+    )
+    host = torch.cat((torch.zeros(1, dtype=torch.int64), lengths.cumsum(0)))
+    bounds = host.to(device="cuda", dtype=torch.int32)
+    pages = torch.tensor([1, 2], device="cuda", dtype=torch.int32)
+    backend.forward_metadata = MambaForwardMetadata(
+        query_start_loc=bounds,
+        scan_query_start_loc=bounds.long(),
+        query_start_loc_int64=bounds.long(),
+        extend_seq_lens_cpu=lengths,
+        cu_extend_seq_lens_cpu=host,
+        state_in_blocks_by_group={"state": torch.zeros_like(pages)},
+        state_out_blocks_by_group={"state": pages},
+        conv_prefill_metadata=build_causal_conv1d_prefill_metadata(
+            bounds, lengths, CAUSAL_CONV1D_BLOCK_M
+        ),
+    )
+    backend.layer_state = lambda layer_id: (
+        backend.forward_metadata.state_in_blocks_by_group["state"],
+        backend.forward_metadata.state_out_blocks_by_group["state"],
+        conv,
+        states,
+    )
+    norm = KdaOutputNorm(
+        rows[:, 3 * channels : 4 * channels],
+        torch.randn(dim, device="cuda", dtype=torch.bfloat16),
+        1e-5,
+    )
+
+    def forward(output_norm):
+        conv.zero_()
+        states.zero_()
+        return backend.forward_extend(
+            None,
+            None,
+            None,
+            None,
+            None,
+            lengths.numel(),
+            forward_mode=ForwardMode.EXTEND,
+            mixed_qkv=rows[:, : 3 * channels],
+            conv_weights=torch.ones(
+                3 * channels, 4, device="cuda", dtype=torch.bfloat16
+            )
+            * 0.1,
+            bias=None,
+            activation="silu",
+            key_dim=channels,
+            value_dim=channels,
+            attention_tp_size=1,
+            head_k_dim=dim,
+            head_v_dim=dim,
+            f_a_out=rows[:, 4 * channels : 4 * channels + dim],
+            f_b_weight=torch.ones(channels, dim, device="cuda", dtype=torch.bfloat16)
+            * 0.01,
+            beta_raw=rows[:, 4 * channels + dim : 4 * channels + dim + heads],
+            A_log=torch.zeros(heads, device="cuda"),
+            dt_bias=torch.zeros(channels, device="cuda"),
+            lower_bound=-5.0,
+            layer_id=0,
+            seq_len=bucket,
+            output_norm=output_norm,
+        )
+
+    core = forward(None).reshape(-1, channels)
+    assert core.shape[0] == live
+    expected = apply_kda_output_norm(core, norm.rows(0, live))
+    assert torch.equal(forward(norm).reshape(-1, channels), expected)
+
+
 @pytest.mark.parametrize(
     "captured,compatible,transfer,expected",
     [
