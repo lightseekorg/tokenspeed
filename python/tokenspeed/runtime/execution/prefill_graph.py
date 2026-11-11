@@ -84,9 +84,9 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     ForwardMode,
 )
 from tokenspeed.runtime.execution.forward_step import prepare_draft_extend_metadata
+from tokenspeed.runtime.execution.input_embedding import InputEmbeddingModel
 from tokenspeed.runtime.execution.memory_delta import MemoryDeltaObserver
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
-from tokenspeed.runtime.execution.prefill_embedding import PrefillEmbeddingModel
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
     CacheBatchMetadata,
@@ -431,9 +431,9 @@ class PrefillGraph:
         # multimodal_input_embeds; others (e.g. deepstack) replay text only.
         self._multimodal_input_embeds = getattr(model, "multimodal_input_embeds", None)
         self.text_model, self.inner_model = text_and_inner_model(model)
-        self._embedding_model: PrefillEmbeddingModel | None = (
-            self.text_model
-            if isinstance(self.text_model, PrefillEmbeddingModel)
+        self._embedding_model: InputEmbeddingModel | None = (
+            self.inner_model
+            if isinstance(self.inner_model, InputEmbeddingModel)
             else None
         )
         # Embedding runs eagerly OUTSIDE the graphs (see capture); the graphs
@@ -1368,7 +1368,7 @@ class PrefillGraph:
         prefill gathers ``embed_tokens(input_ids)`` into the static buffer; a
         multimodal prefill builds the merged text+vision embeddings via the
         model's ``multimodal_input_embeds`` seam (vision encoder included)
-        instead. A text model with ``prefill_input_embeds`` computes its
+        instead. An inner model with ``compute_input_embeddings`` computes its
         embeddings from the live context and request-token history here too.
         All three consume the same static buffer. Then the inner stack replays
         over the padded bucket and the model's eager logits tail finishes on
@@ -1385,7 +1385,7 @@ class PrefillGraph:
             )
         if input_embeds is None:
             input_embeds = (
-                self._embedding_model.prefill_input_embeds(
+                self._embedding_model.compute_input_embeddings(
                     input_ids, ctx, request_token_history=request_token_history
                 )
                 if self._embedding_model is not None

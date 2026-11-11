@@ -57,27 +57,14 @@ class _TokenModel(torch.nn.Module):
         super().__init__()
         self.embed_tokens = torch.nn.Embedding(32, 8, device="cuda")
 
-    def compute_input_embeddings(self, input_ids, ctx, request_token_history):
-        return self.embed_tokens(input_ids)
-
-    def forward(
-        self,
-        input_ids,
-        positions,
-        ctx,
-        *,
-        input_embeds=None,
-        request_token_history=None,
-    ):
+    def forward(self, input_ids, positions, ctx, *, input_embeds=None):
         if input_embeds is None:
-            input_embeds = self.compute_input_embeddings(
-                input_ids, ctx, request_token_history
-            )
+            input_embeds = self.embed_tokens(input_ids)
         return input_embeds.square() + positions[:, None], None
 
 
 class _HistoryTokenModel(_TokenModel):
-    def compute_input_embeddings(self, input_ids, ctx, request_token_history):
+    def compute_input_embeddings(self, input_ids, ctx, *, request_token_history):
         if request_token_history is None:
             raise ValueError("history is required when computing embeddings")
         history = request_token_history
@@ -92,6 +79,21 @@ class _HistoryTokenModel(_TokenModel):
             pieces.append(self.embed_tokens((ids + prior) % 32))
             history.history_token_ids[slot, committed : committed + len(ids)].copy_(ids)
         return torch.cat(pieces)
+
+    def forward(
+        self,
+        input_ids,
+        positions,
+        ctx,
+        *,
+        input_embeds=None,
+        request_token_history=None,
+    ):
+        if input_embeds is None:
+            input_embeds = self.compute_input_embeddings(
+                input_ids, ctx, request_token_history=request_token_history
+            )
+        return super().forward(input_ids, positions, ctx, input_embeds=input_embeds)
 
 
 class _HiddenRows(torch.nn.Module):
@@ -124,12 +126,6 @@ class _HistoryModel(_TextModel):
         model_kwargs = super().prepare_model_kwargs(ctx, input_ids, kwargs)
         model_kwargs["request_token_history"] = kwargs.get("request_token_history")
         return model_kwargs
-
-    def prefill_input_embeds(self, input_ids, ctx, *, request_token_history):
-        assert ctx.forward_mode.is_extend_or_mixed()
-        return self.model.compute_input_embeddings(
-            input_ids, ctx, request_token_history
-        )
 
 
 class _NoAttention(AttentionBackend):

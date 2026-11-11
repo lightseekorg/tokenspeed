@@ -713,12 +713,11 @@ only. `decode_graph=False` still requires `refresh_decode_metadata` and
 `init_cuda_graph_state` — eager decode runs the same unified path.
 
 Models whose embedding reads request-token history may implement
-`PrefillEmbeddingModel` on the text model. Its
-`prefill_input_embeds(input_ids, ctx, *, request_token_history)` method delegates
-to the embedding implementation used by its ordinary forward. The model owns
-embedding computation; the graph owner only detects the protocol at construction
-and calls it for replay. Argument preparation must preserve supplied
-`input_embeds` so the inner model skips embedding computation when they are present.
+`InputEmbeddingModel` on the inner model. Its
+`compute_input_embeddings(input_ids, ctx, *, request_token_history)` method is
+shared by ordinary forward and graph replay. The graph owner detects the protocol
+once at construction. Argument preparation must preserve supplied `input_embeds`
+so the inner model skips embedding computation when they are present.
 The executor supplies its live `RequestTokenHistoryView`; the graph
 owner calls this method eagerly, before padding, and copies its result into
 the same static embedding buffer used by ordinary text and multimodal

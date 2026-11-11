@@ -34,17 +34,17 @@ if TYPE_CHECKING:
 
 
 @runtime_checkable
-class PrefillEmbeddingModel(Protocol):
-    """A text model whose prefill embedding consumes all request-history inputs.
+class InputEmbeddingModel(Protocol):
+    """An inner model whose input embedding consumes all request-history inputs.
 
-    This method delegates to the embedding implementation used by the model's
-    ordinary forward. Graph replay calls it before padding; it returns one
-    embedding row per input token and performs any history appends.
-    With ``input_embeds`` supplied, the inner stack and
-    ``prepare_model_kwargs`` must neither require nor append history.
+    Ordinary forward and graph replay share this method. It returns one
+    embedding row per input token and performs any history appends. Graph
+    replay calls it eagerly, before padding. With ``input_embeds`` supplied,
+    the inner stack and the outer model's ``prepare_model_kwargs`` must
+    neither require nor append history.
     """
 
-    def prefill_input_embeds(
+    def compute_input_embeddings(
         self,
         input_ids: torch.Tensor,
         ctx: ForwardContext,
