@@ -223,6 +223,14 @@ class PooledSamplingBackend(SamplingBackend):
 
         cpu_coins = torch.empty((bs, n), dtype=torch.float32, pin_memory=True)
         cpu_final = torch.empty((bs,), dtype=torch.float32, pin_memory=True)
+        # One draw per request instead of two: each row's coins and its
+        # final coin come from the same generator, so a single uniform_ over
+        # the row's n+1 values consumes the generator in the same order as
+        # the two-call form (bit-identical, pinned by
+        # test/runtime/sampling/test_coin_refill_draw_order.py). The loop's
+        # ATen call count was the per-round cost -- 2 calls per request,
+        # B requests per round.
+        row_draw = torch.empty((bs, n + 1), dtype=torch.float32)
         for i, pool_idx in enumerate(request_pool_indices):
             gen = self._cpu_generator_per_slot[pool_idx]
             if gen is None:
@@ -230,9 +238,10 @@ class PooledSamplingBackend(SamplingBackend):
                     f"sampling slot {pool_idx} was not initialized before "
                     "coin-buffer refill"
                 )
-            cpu_coins[i, :n].uniform_(lo, 1.0, generator=gen)
-            cpu_final[i].uniform_(lo, 1.0, generator=gen)
+            row_draw[i].uniform_(lo, 1.0, generator=gen)
 
+        cpu_coins.copy_(row_draw[:, :n])
+        cpu_final.copy_(row_draw[:, n])
         self._coins_buf[:bs, :n].copy_(cpu_coins, non_blocking=True)
         self._final_coins_buf[:bs].copy_(cpu_final, non_blocking=True)
 
