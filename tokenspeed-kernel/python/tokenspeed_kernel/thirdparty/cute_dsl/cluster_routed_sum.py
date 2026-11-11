@@ -239,45 +239,47 @@ class ClusterRoutedSumKernel:
                     inv_rms,
                 ).to(cutlass.BFloat16)
         else:
-            # Two columns per thread: the mailbox moves whole 32-bit words.
+            # Two columns per thread and pass: the mailbox moves whole 32-bit words.
             ranks: cutlass.Constexpr = self.mailbox_ranks
-            if tidx * 2 < self.slice:
-                col = rank * self.slice + tidx * 2
-                pair = cute.make_rmem_tensor((2,), BFloat16)
-                for i in cutlass.range_constexpr(2):
-                    pair[i] = self._route_sum(
-                        col + i,
-                        routes,
-                        norm_weight,
-                        row_stride,
-                        peer_rows,
-                        peer_weights,
-                        inv_rms,
-                    ).to(BFloat16)
-                # The all-reduce sends -0.0 as +0.0.
-                word = sanitize_negative_zero_u32(bf16x2_to_u32(pair.load()))
-                row_words = Int64(token) * Int64(width * ranks)
-                store_global_u32(
-                    mailbox_destination + (row_words + Int64(col)) * Int64(2), word
-                )
-                acc = Uint32(0)
-                for r in cutlass.range_constexpr(ranks):
-                    word_at = (
-                        mailbox.iterator + token * (width * ranks) + r * width + col
-                    )
-                    peer = load_volatile_u32(word_at)
-                    while word_is_dirty(peer, self.mailbox_sentinel):
-                        peer = load_volatile_u32(word_at)
+            pairs: cutlass.Constexpr = self.slice // 2
+            row_words = Int64(token) * Int64(width * ranks)
+            for p in cutlass.range_constexpr(
+                (pairs + ROUTED_CTA_THREADS - 1) // ROUTED_CTA_THREADS
+            ):
+                if p * ROUTED_CTA_THREADS + tidx < pairs:
+                    col = rank * self.slice + (p * ROUTED_CTA_THREADS + tidx) * 2
+                    pair = cute.make_rmem_tensor((2,), BFloat16)
+                    for i in cutlass.range_constexpr(2):
+                        pair[i] = self._route_sum(
+                            col + i,
+                            routes,
+                            norm_weight,
+                            row_stride,
+                            peer_rows,
+                            peer_weights,
+                            inv_rms,
+                        ).to(BFloat16)
+                    # The all-reduce sends -0.0 as +0.0.
+                    word = sanitize_negative_zero_u32(bf16x2_to_u32(pair.load()))
                     store_global_u32(
-                        Int64(word_at.toint()), Uint32(self.mailbox_sentinel)
+                        mailbox_destination + (row_words + Int64(col)) * Int64(2), word
                     )
-                    # BF16 in rank order, as the one-shot all-reduce kernel adds.
-                    if const_expr(r == 0):
-                        acc = without_negative_zero(peer)
-                    else:
-                        acc = bf16x2_add_rn(acc, without_negative_zero(peer))
-                out_row[col] = bf16_half_to_f32(acc, False).to(BFloat16)
-                out_row[col + 1] = bf16_half_to_f32(acc, True).to(BFloat16)
+                    acc = Uint32(0)
+                    for r in cutlass.range_constexpr(ranks):
+                        word_at = mailbox.iterator + row_words + r * width + col
+                        peer = load_volatile_u32(word_at)
+                        while word_is_dirty(peer, self.mailbox_sentinel):
+                            peer = load_volatile_u32(word_at)
+                        store_global_u32(
+                            Int64(word_at.toint()), Uint32(self.mailbox_sentinel)
+                        )
+                        # BF16 in rank order, as the one-shot all-reduce kernel adds.
+                        if const_expr(r == 0):
+                            acc = without_negative_zero(peer)
+                        else:
+                            acc = bf16x2_add_rn(acc, without_negative_zero(peer))
+                    out_row[col] = bf16_half_to_f32(acc, False).to(BFloat16)
+                    out_row[col + 1] = bf16_half_to_f32(acc, True).to(BFloat16)
 
         # Redundant with the mbarrier wait, but keeps the cluster exit ordered.
         cute.arch.cluster_arrive_relaxed()

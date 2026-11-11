@@ -240,11 +240,13 @@ def test_cluster_kernels_decline_what_they_cannot_serve(device: str) -> None:
 
 @pytest.mark.parametrize("device", ["cuda"])
 @pytest.mark.parametrize("tokens", [1, 6, 64])
+# Two routes give 2048-column slices, two word pairs per thread.
+@pytest.mark.parametrize("topk", [8, 2])
 def test_cluster_routed_sum_all_reduces_through_a_mailbox_like_the_oneshot_allreduce(
-    device: str, tokens: int
+    device: str, tokens: int, topk: int
 ) -> None:
     """The sum over ranks sends -0.0 as +0.0 and adds in BF16 in rank order."""
-    ranks, rank, topk = 4, 1, 8
+    ranks, rank = 4, 1
     args = _routed_case(tokens, topk, device, 4096 + 128)
     width = args[5].shape[0]
     local = routed_input_scale_rmsnorm_sum_gathered(*args, True, None, None)
