@@ -92,9 +92,10 @@ class _ToyLayout(NamedTuple):
 
 
 class ToyBackend:
-    """The draft attention backend surface the drafter and the toy model use."""
+    """An unsharded draft attention backend for the drafter and toy model."""
 
     def __init__(self, device: str) -> None:
+        self.query_sharded = False
         self.sparse_topk = SparseTopKShare()
         # Token-indexed cache: slot 0 is the dummy slot, request r's position
         # p lives at slot 1 + r * MAX_LEN + p.
