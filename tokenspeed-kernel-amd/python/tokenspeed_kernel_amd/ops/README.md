@@ -2322,6 +2322,18 @@ Both GEMMs overlap loads with matrix computation using double-buffered shared
 memory. Phased operand loading and scheduling barriers limit live registers;
 compiler-inserted shared-memory barriers provide inter-wave synchronization.
 
+### Precomputed expert sort for the A8W4 SiTU decode
+
+The expert-sorted A8W4 decode in `gluon_mxfp4_fp8_precomputed_situ` sorts
+its routes with `gluon_moe_sorting` (16-row blocks) before the stage GEMMs.
+A caller that already holds that metadata for the same routes passes
+`sorted_routes=(sorted_ids, sorted_weights, sorted_expert_ids,
+num_valid_ids)`, and the wrapper checks the buffers' shapes and dtypes against
+`gluon_moe_sorting`'s and skips the sort. The Kimi K3 router
+`kimi3_sigmoid_bias_topk_sorted` (tokenspeed-kernel) writes it while routing.
+The stage GEMMs do not depend on the order of routes inside an expert's
+blocks, so either sort gives the same output bit for bit.
+
 ### gfx950 dynamic-MXFP4 (A4W4) SiLU experts
 
 `gluon_mxfp4_a4w4_moe_apply_gfx950` serves MXFP4 checkpoints whose experts

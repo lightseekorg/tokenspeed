@@ -58,6 +58,8 @@ __all__ = [
     "torch_softmax_bias_topk",
     "packed_projection_weight_view",
     "moe_sigmoid_bias_topk_routing",
+    "kimi3_sigmoid_bias_topk_sorted",
+    "kimi3_sorted_routing_scratch",
     "FUSED_ROUTING_MAX_TOKENS",
     "PreparedNvfp4Routing",
     "prepare_nvfp4_routing",
@@ -1005,6 +1007,10 @@ def _moe_sigmoid_bias_topk(
 
 from tokenspeed_kernel.ops.moe._triton.bf16 import (  # noqa: E402
     _check_route_tensors as _check_bf16_route_tensors,
+)
+from tokenspeed_kernel.ops.moe._triton.kimi3_sigmoid_topk import (  # noqa: E402
+    kimi3_sigmoid_bias_topk_sorted,
+    kimi3_sorted_routing_scratch,
 )
 from tokenspeed_kernel.ops.moe._triton.sigmoid_topk_routing import (  # noqa: E402
     MAX_TOKENS as FUSED_ROUTING_MAX_TOKENS,

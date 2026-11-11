@@ -1971,6 +1971,9 @@ if platform.is_amd:
         # A producer that already quantized ``x`` leaves it for this call only.
         x_quantized = getattr(w, "_situ_input_fp8", None)
         w._situ_input_fp8 = None
+        # A router that also sorted these routes by expert leaves the sort too.
+        sorted_routes = getattr(w, "_situ_sorted_routes", None)
+        w._situ_sorted_routes = None
         rows = int(x[0].shape[0] if isinstance(x, tuple) else x.shape[0])
         if (
             situ_linear_beta is not None
@@ -2006,6 +2009,7 @@ if platform.is_amd:
                 # The caller reduces [M * top_k, N] slot rows itself.
                 defer_topk_reduce=getattr(w, "_situ_defer_topk_reduce", False),
                 x_quantized=x_quantized,
+                sorted_routes=sorted_routes,
             )
             if out is not None:
                 return out

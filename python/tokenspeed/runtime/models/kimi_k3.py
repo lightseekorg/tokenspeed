@@ -86,6 +86,8 @@ from tokenspeed_kernel.ops.gemm import (
     linear_attnres_partials_available,
 )
 from tokenspeed_kernel.ops.moe import (
+    kimi3_sigmoid_bias_topk_sorted,
+    kimi3_sorted_routing_scratch,
     latent_moe_decode_pipeline_available,
     latent_moe_input_projections,
 )
@@ -2038,6 +2040,11 @@ _IRIS_MOE_ROW_SHARD_MIN_TOKENS = 40
 # Through this many rows a replicated residual takes the Lamport reduce and gather
 # tail; the Iris K3 fused decode row limit.
 _IRIS_MOE_GATHER_TAIL_MAX_TOKENS = 192
+# The A8W4 decode sorts routes from 8 rows through its warp-decode bound, which
+# follows the fused decode bound; the one-launch sort keeps 256 rows in its
+# arrival masks.
+_FUSED_ROUTING_MIN_ROWS = 8
+_FUSED_ROUTING_MAX_ROWS = min(_IRIS_MOE_GATHER_TAIL_MAX_TOKENS, 256)
 # Below this, row-sharded router/latent projection idles CUs and loses (8x MI350X).
 _IRIS_MOE_ROW_INPUT_MIN_TOKENS = 4096
 
@@ -2486,6 +2493,24 @@ class KimiLinearMoE(nn.Module):
             if mapping.attn.dp_size == 1
             and alt_stream is not None
             and self.experts.supports_precomputed_topk
+            else None
+        )
+        # Route and expert-sort decode rows in one launch for the gfx950 A8W4
+        # MoE, which then skips its own sort.
+        self._fused_routing_scratch: torch.Tensor | None = (
+            kimi3_sorted_routing_scratch(
+                torch.device("cuda", torch.cuda.current_device())
+            )
+            if current_platform().is_cdna4
+            and mapping.attn.dp_size == 1
+            and self.experts.plan.get("apply_kernel_name")
+            == "gluon_mxfp4_a8w4_situ_precomputed_moe_apply"
+            and self.num_experts == 896
+            and self.top_k == 16
+            and config.use_grouped_topk
+            and config.num_expert_group == 1
+            and config.topk_group == 1
+            and self.routed_scaling_factor is not None
             else None
         )
 
@@ -3095,15 +3120,48 @@ class KimiLinearMoE(nn.Module):
             router_logits = self.gate(hidden_states)
             routed_in = shared_partial = None
 
+        self.experts._situ_sorted_routes = None
+        rows = router_logits.shape[0]
+        fused_routing = (
+            self._fused_routing_scratch is not None
+            and precompute_topk
+            and not self.topk.simulate_routing
+            and _FUSED_ROUTING_MIN_ROWS <= rows <= _FUSED_ROUTING_MAX_ROWS
+            and router_logits.shape == (rows, 896)
+            and router_logits.dtype == torch.float32
+            and router_logits.is_contiguous()
+        )
         # Warm the auxiliary stream serially before capture enables overlap.
         with self.stream_fork.scope(
             enable=get_is_cuda_graph_phase(),
             overlap=get_is_capture_mode(),
         ) as fork:
             with fork.branch():
-                topk_output = self.topk(
-                    hidden_states, router_logits, output_format=routing_output_format
-                )
+                if fused_routing:
+                    # The same routes as self.topk's packed gfx950 kernel, bit
+                    # for bit, plus the A8W4 MoE's expert sort of them. Called
+                    # directly, not through the registry: the sort is that
+                    # MoE's own format, so no other solution can stand in.
+                    topk_weights, topk_ids, *sorted_routes = (
+                        kimi3_sigmoid_bias_topk_sorted(
+                            router_logits,
+                            self.gate.e_score_correction_bias.float(),
+                            routed_scaling_factor=float(self.routed_scaling_factor),
+                            normalize_topk_weights=self.config.moe_renormalize,
+                            block_size=16,
+                            scratch=self._fused_routing_scratch,
+                        )
+                    )
+                    topk_output = StandardTopKOutput(
+                        topk_weights, topk_ids, router_logits
+                    )
+                    self.experts._situ_sorted_routes = tuple(sorted_routes)
+                else:
+                    topk_output = self.topk(
+                        hidden_states,
+                        router_logits,
+                        output_format=routing_output_format,
+                    )
                 if self._topk_ready is not None and precompute_topk and fork._active:
                     self._topk_ready.record(torch.cuda.current_stream())
                 if shared_partial is None:
