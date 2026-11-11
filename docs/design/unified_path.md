@@ -205,6 +205,15 @@ collective path and return the original in-place output buffer.
 Ranks choose the collective from the shared dtype, operation and element
 count; local layout differences only require packing and copying back.
 
+### PyNCCL stream ordering
+
+When PyNCCL is enabled, an operation without an explicit stream runs on the
+calling thread's current CUDA stream. A stream supplied to the operation or
+its communicator context takes precedence. This contract is identical during
+eager execution and graph capture, so a separate communicator stream cannot
+race input production or output consumption. Exiting the context, including
+through an exception, restores the prior communicator state.
+
 ### Rebinding a cache pool
 
 Prefill autotune and graph capture use distinct writable pages per fabricated
