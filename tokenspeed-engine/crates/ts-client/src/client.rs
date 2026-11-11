@@ -864,10 +864,8 @@ mod tests {
     /// the request alone.
     #[tokio::test]
     async fn an_unsent_request_is_forgotten_and_aborted() {
-        let path = std::env::temp_dir().join(format!(
-            "ts-client-unsent-{}.sock",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("ts-client-unsent-{}.sock", std::process::id()));
         let address = format!("ipc://{}", path.display());
         let mut socket = RouterSocket::new();
         socket.bind(&address).await.unwrap();
@@ -879,7 +877,10 @@ mod tests {
         engine.connect(&address).await.unwrap();
         // Announce the engine, so the router learns its identity before the
         // abort must route to it.
-        engine.send(ZmqMessage::from(Bytes::from_static(b"ready"))).await.unwrap();
+        engine
+            .send(ZmqMessage::from(Bytes::from_static(b"ready")))
+            .await
+            .unwrap();
         timeout(Duration::from_secs(5), input_recv.recv())
             .await
             .expect("the engine announces itself in time")
