@@ -542,7 +542,7 @@ for the online variant.
 | `--draft-moe-backend` | MoE backend for the speculative decoding draft model. |
 | `--all2all-backend` | MoE all-to-all backend. |
 | `--deepep-mode` | DeepEP mode: `auto`, `normal`, or `low_latency`. `auto` uses `low_latency` for decode batches and `normal` for prefill batches. `normal` reads its per-expert receive counts on the host, so it forces eager execution and disables CUDA graphs. |
-| `--sampling-backend` | Sampling backend: `greedy`, `flashinfer`, `flashinfer_full`, `triton`, `triton_full`, or `sonic` (vendored [sonic-sampler](https://github.com/tachyontrails/sonic-sampler) kernels: one fused Triton pipeline per step; `top_k=-1` is realized as bounded top-128 truncation; bf16 logits ranked at bf16 resolution, fp32 logits sampled exactly among the top-128 candidates; under TP with a vocab-parallel LM head each rank selects its vocabulary shard's top-128 and only those are gathered, instead of whole logit rows; kernel configs from a table measured on Blackwell, no startup tuning; see the `--sampling-backend` help for its memory cost). |
+| `--sampling-backend` | Sampling backend: `greedy`, `flashinfer`, `flashinfer_full`, `triton`, `triton_full`, or `sonic` (vendored [sonic-sampler](https://github.com/tachyontrails/sonic-sampler) kernels: one fused Triton pipeline per step; a request with no `top_k`, `top_p` or `min_p` samples its whole vocabulary (each vocabulary block keeps its best logit plus the request's Gumbel noise), the others select among the top-128 candidates; bf16 logits ranked at bf16 resolution, fp32 logits sampled exactly; under TP with a vocab-parallel LM head each rank selects its vocabulary shard's top-128 and only those are gathered, instead of whole logit rows; kernel configs from a table measured on Blackwell, no startup tuning; see the `--sampling-backend` help for its memory cost). |
 | `--disable-deepseek-v41-token-blacklist` | Allow DeepSeek V4.1 to generate BOS, PAD, and image control/placeholder token IDs `0, 2, 129262..129264`; these are masked by default. |
 
 Set backend choices explicitly in production. `auto` is useful for bring-up, but
@@ -1272,6 +1272,22 @@ is refused while a request is suspended with an image, so an image of
 old-weight KV is never restored under new weights.
 `--debug-force-retraction-interval` exercises the path without pressure in
 tests (see the flag above).
+
+**When a lone request cannot progress.** On the fused role the scheduler's
+no-progress abort fails a request like the image-fit abort above (524), with
+the detail "no progress for 4096 consecutive plans ...", counted in
+`tokenspeed:num_capacity_aborted_requests` too: a request no
+other request holds KV pages beside, whose admission needs Device pages that
+neither eviction nor lone-request compaction can free, or whose restore does
+not fit even when it claims no cached page
+([scheduler §1.4](../design/scheduler.md#14-what-bounds-a-single-request)),
+is aborted after 4096 consecutive scheduler plans without progress (the
+scheduler warns about such a stall from its 1024th plan on) instead of
+waiting for good. On the prefill and decode roles of a disaggregated
+deployment such a request waits behind the warning instead: a scheduler
+abort would not conclude the PD transfer it has registered. A prefill
+request past its first admission is not counted as stalled at all, as its
+pages stay pinned for the transfer.
 
 ### Host L2 and Mooncake Store L3
 
