@@ -381,6 +381,7 @@ def _boundary_reference(stream, reduced, post, alpha, beta, pre):
         False,
         None,
         1,
+        None,
     )
 
 
@@ -1996,6 +1997,7 @@ def _muse_moetail_reference(x, weight, stream, post, alpha, beta, pre):
         False,
         None,
         1,
+        None,
         return_pre_fp32=False,
     )
     return out_stream, pre_bf16
