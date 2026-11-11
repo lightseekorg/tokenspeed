@@ -60,7 +60,11 @@ jobs:
 
       - name: Identify native build environment
         id: engine-environment
-        run: echo "key=$(python ../test/ci_system/engine_cache.py --environment-key)" >> "$GITHUB_OUTPUT"
+        # Assign first so bash -e propagates a key-computation failure instead
+        # of writing an empty key that silently stops invalidating the cache.
+        run: |
+          key=$(python ../test/ci_system/engine_cache.py --environment-key)
+          echo "key=${key}" >> "$GITHUB_OUTPUT"
 
       - name: Cache Rust builds
         uses: Swatinem/rust-cache@v2

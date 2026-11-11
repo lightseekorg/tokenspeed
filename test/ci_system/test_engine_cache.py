@@ -18,12 +18,18 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import os
 import shutil
+import time
 from pathlib import Path
 
+import pytest
 from engine_cache import (
+    WHEEL_CACHE_RETENTION_SECONDS,
     build_requirements,
     environment_digest,
+    prune_wheel_cache,
+    publish_wheel,
     source_digest,
     wheel_cache_root,
 )
@@ -72,3 +78,55 @@ def test_native_include_path_invalidates_environment_key(monkeypatch, tmp_path):
     original = environment_digest(requirements)
     monkeypatch.setenv("CPLUS_INCLUDE_PATH", str(tmp_path))
     assert environment_digest(requirements) != original
+
+
+def test_publish_wheel_tolerates_concurrent_publish(tmp_path: Path):
+    built = tmp_path / "build-new"
+    built.mkdir()
+    (built / "tokenspeed_engine-1.0.0-cp312.whl").write_text("new wheel")
+    destination = tmp_path / "key"
+    publish_wheel(built, destination)
+    assert (
+        destination / "tokenspeed_engine-1.0.0-cp312.whl"
+    ).read_text() == "new wheel"
+
+    raced = tmp_path / "build-raced"
+    raced.mkdir()
+    (raced / "tokenspeed_engine-1.0.0-cp312.whl").write_text("duplicate wheel")
+    publish_wheel(raced, destination)
+    assert (
+        destination / "tokenspeed_engine-1.0.0-cp312.whl"
+    ).read_text() == "new wheel"
+
+    with pytest.raises(OSError):
+        publish_wheel(tmp_path / "missing", tmp_path / "other")
+
+
+def test_prune_wheel_cache_removes_only_stale_entries(tmp_path: Path):
+    stale_wheel = tmp_path / "stale-wheel"
+    stale_wheel.mkdir()
+    (stale_wheel / "engine.whl").write_text("stale wheel")
+    fresh_wheel = tmp_path / "fresh-wheel"
+    fresh_wheel.mkdir()
+    (fresh_wheel / "engine.whl").write_text("fresh wheel")
+    stale_build = tmp_path / "build-stale"
+    stale_build.mkdir()
+    fresh_build = tmp_path / "build-fresh"
+    fresh_build.mkdir()
+    orphan_lock = tmp_path / "orphan.lock"
+    orphan_lock.touch()
+    kept_lock = tmp_path / "fresh-wheel.lock"
+    kept_lock.touch()
+
+    stale = time.time() - WHEEL_CACHE_RETENTION_SECONDS - 1
+    for entry in (stale_wheel, stale_build, orphan_lock, kept_lock):
+        os.utime(entry, (stale, stale))
+
+    prune_wheel_cache(tmp_path)
+
+    assert not stale_wheel.exists()
+    assert not stale_build.exists()
+    assert not orphan_lock.exists()
+    assert (fresh_wheel / "engine.whl").read_text() == "fresh wheel"
+    assert fresh_build.exists()
+    assert kept_lock.exists()

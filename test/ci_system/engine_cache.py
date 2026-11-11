@@ -29,6 +29,7 @@ import os
 import platform
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import sysconfig
@@ -80,6 +81,13 @@ def source_digest(workspace: Path) -> str:
 
 
 def environment_digest(requirements: list[str]) -> str:
+    """Compute the build-environment portion of the engine wheel cache key.
+
+    The digest covers platform, Python, resolved build-requirement versions,
+    toolchain, and build-variable state, so a CI image or toolchain update
+    invalidates published wheels.
+    """
+
     def output(command: list[str]) -> str:
         return subprocess.check_output(command, text=True).strip()
 
@@ -155,7 +163,54 @@ def install(source: Path) -> None:
     )
 
 
+def publish_wheel(directory: Path, destination: Path) -> None:
+    """Publish a wheel directory that passed the import check."""
+    try:
+        directory.rename(destination)
+    except OSError:
+        if not destination.is_dir():
+            raise  # A concurrent publish of the same key is a hit, not an error.
+
+
+# The cache has no external cleanup owner, so each run bounds its growth.
+WHEEL_CACHE_RETENTION_SECONDS = 14 * 24 * 60 * 60
+
+
+def prune_wheel_cache(root: Path) -> None:
+    """Remove wheel cache entries unused for longer than the retention window.
+
+    Orphaned ``build-*`` directories from killed jobs and lock files whose
+    wheel is gone are removed directly. A wheel directory is removed only
+    under its key's lock, so a concurrent publisher or installer of the same
+    key is undisturbed.
+    """
+    cutoff = time.time() - WHEEL_CACHE_RETENTION_SECONDS
+    for entry in root.iterdir():
+        try:
+            if entry.is_dir() and entry.name.startswith("build-"):
+                if entry.stat().st_mtime < cutoff:
+                    shutil.rmtree(entry)
+            elif entry.suffix == ".lock":
+                stale = entry.stat().st_mtime < cutoff
+                if stale and not (root / entry.stem).exists():
+                    entry.unlink()
+            elif entry.is_dir() and entry.stat().st_mtime < cutoff:
+                with (root / f"{entry.name}.lock").open("a") as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+                    # Re-check under the lock: a hit or republish refreshes it.
+                    if entry.stat().st_mtime < cutoff:
+                        shutil.rmtree(entry)
+        except OSError:
+            continue  # Cleanup is best-effort and must never fail an install.
+
+
 def install_engine(workspace: Path, requirements: list[str]) -> None:
+    """Install the checkout's engine, reusing a cached wheel for identical inputs.
+
+    ``workspace`` is the repository checkout and ``requirements`` its declared
+    build-system requires. A cache miss builds under an exclusive per-key lock
+    and publishes atomically after an import check.
+    """
     # Resolve the declared build dependencies first, then key their actual
     # versions. PEP 517 isolation would hide a different set from this key.
     pip("install", *requirements)
@@ -174,6 +229,11 @@ def install_engine(workspace: Path, requirements: list[str]) -> None:
                 print(f"Engine wheel cache hit: {key}", flush=True)
                 (wheel,) = destination.glob("*.whl")
                 install(wheel)
+                # Mark use so the retention window keeps actively hit wheels.
+                try:
+                    os.utime(destination, None)
+                except OSError:
+                    pass
             else:
                 print(f"Engine wheel cache miss: {key}", flush=True)
                 with tempfile.TemporaryDirectory(
@@ -191,8 +251,13 @@ def install_engine(workspace: Path, requirements: list[str]) -> None:
                     (wheel,) = directory.glob("*.whl")
                     install(wheel)
                     # Publish only a complete wheel that passed the import check.
-                    directory.rename(destination)
+                    publish_wheel(directory, destination)
     print(f"Engine build/install elapsed: {time.monotonic() - start:.1f}s", flush=True)
+    if root is not None:
+        try:
+            prune_wheel_cache(root)
+        except OSError:
+            pass  # Cleanup is best-effort and must never fail an install.
 
 
 def main() -> None:

@@ -268,11 +268,13 @@ The engine installer reuses `tokenspeed-engine` wheels under
 `CI_WHEEL_CACHE_DIR/tokenspeed-engine` on these runners and on Slurm's mounted
 package cache. The key covers the engine and scheduler sources, Python ABI and
 configuration, resolved Python build dependencies, Rust/C++ toolchains, native
-system packages and compiler settings. A source change invalidates the wheel
+system packages, and compiler settings. A source change invalidates the wheel
 even without a version bump. Concurrent jobs build a missing wheel once under
 a lock, then publish it atomically after an import check. Fork PRs and local
 xgrammar source overrides bypass this cache. The installer logs cache hits and
-build/install elapsed time.
+build/install elapsed time. Each run prunes wheel directories, orphaned build
+directories, and stale lock files untouched for 14 days; a hit refreshes the
+wheel's timestamp.
 
 The dedicated Rust workflow caches Cargo dependencies and workspace build
 artifacts, with Python/native build inputs included in the key. GPU jobs share
