@@ -31,6 +31,7 @@ pytest.importorskip(
 )
 
 from tokenspeed_kernel.ops.moe import latent_moe_input_projections  # noqa: E402
+from tokenspeed_kernel_amd._extern import extern_compile_options  # noqa: E402
 from tokenspeed_kernel_amd._triton import triton  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx1250.moe.fp16.latent_input_decode import (  # noqa: E402
     gluon_latent_input_decode_gfx1250,
@@ -250,6 +251,7 @@ def test_decode_small_batch_pipeline(
         num_warps=1,
         num_stages=1,
         waves_per_eu=0,
+        **extern_compile_options(),
     )
 
     expected = _expected(

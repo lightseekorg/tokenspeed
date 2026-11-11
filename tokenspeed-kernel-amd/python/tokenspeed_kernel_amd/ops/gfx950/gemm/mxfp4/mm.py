@@ -48,6 +48,7 @@ sums the FP32 partials in split order and runs the epilogue.
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel_amd._extern import extern_compile_options, wait_vmem
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.decode import _remap_xcd
 from tokenspeed_kernel_amd.ops.gfx950.gemm.splitk import check_splitk_counters
@@ -394,14 +395,7 @@ def _mxfp4_linear_body(
         # and invalidate cost more than this GEMM: ".wt" writes through, every
         # wave waits for its stores (vmcnt), and the barrier orders all waves'
         # stores before the counter bump.
-        gl.inline_asm_elementwise(
-            asm="s_waitcnt vmcnt(0)",
-            constraints="=v,0",
-            args=[offs_cm],
-            dtype=gl.int32,
-            is_pure=False,
-            pack=1,
-        )
+        wait_vmem()
         gl.barrier()
         old = gl.atomic_add(counter_ptr + tile, 1, sem="relaxed", scope="gpu")
         is_last = old == SPLIT_K - 1
@@ -756,6 +750,7 @@ def _launch(
         SPLIT_K=split_k,
         NUM_XCDS=_NUM_XCDS,
         num_warps=warps_m * warps_n,
+        **extern_compile_options(),
     )
     return out
 

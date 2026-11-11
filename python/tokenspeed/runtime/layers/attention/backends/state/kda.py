@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING
 import torch
 from tokenspeed_kernel.ops.attention.gdn import GdnStateCheckpoints
 from tokenspeed_kernel.ops.attention.kda import (
+    KdaOutputNorm,
     KdaPrefillCapacity,
     KdaReplayRecords,
     kda_fused_paged_verify_fuses_producers,
@@ -849,13 +850,14 @@ class KdaAttnBackend(CapacityPrefillBackend):
         attn_tp_size: int,
         head_v_dim: int,
         lower_bound: float | None,
+        output_norm: KdaOutputNorm | None,
     ) -> torch.Tensor | None:
         """Keep live state read-only; acceptance commits the selected prefix."""
         if self._replay_active:
             qkv, f_a, beta, gate = self._replay_payload(layer_id)
             rows = batch_size * draft_token_num
             heads = value_dim // attn_tp_size // head_v_dim
-            # One-token windows project the gate and convolve inside verify.
+            # Small batches project the gate and convolve inside verify.
             split = self._verify_split_producers and not (
                 g_raw is None
                 and bias is None
@@ -865,6 +867,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
                     num_heads=heads,
                     head_dim=head_v_dim,
                     draft_token_num=draft_token_num,
+                    batch_size=batch_size,
                 )
             )
             split_producers = {}
@@ -948,6 +951,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
                 store_states=False,
                 recurrent_layout=self.kda_recurrent_layout,
                 replay_records=replay_records,
+                output_norm=output_norm,
                 **split_producers,
             )
             if fused_out is None:
@@ -980,6 +984,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
                 lower_bound=lower_bound,
                 recurrent_layout=self.kda_recurrent_layout,
                 replay_records=None,
+                output_norm=output_norm,
             )
 
     @override

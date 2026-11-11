@@ -23,18 +23,24 @@
 ; Memory synchronization. Every function is named __tokenspeed_sync_* so that
 ; Triton links this file only into kernels calling one (_extern.py).
 
-; Release drain: wait until this wave's vector memory operations completed
-; (s_waitcnt vmcnt(0); 3952 = 0x0F70 leaves expcnt and lgkmcnt untouched), so
-; its stores reached the L2 before a later arrival or flag store. The
-; workgroup-scope release fence keeps earlier stores above the wait in the IR
-; (llvm.amdgcn.s.waitcnt is declared not to touch memory, so on its own a
-; store could move across it) and adds no cache maintenance on gfx950. An
-; agent-scope release would also write back the whole L2 (buffer_wbl2).
+; Each wait is one hardware wait on this wave's vector memory counters. The
+; backend sees it, so it merges the wait with the ones it inserts itself (for
+; example the LDS wait before a barrier) and inserts no redundant ones after
+; it. LLVM treats these intrinsics as reading and writing all memory, so
+; loads and stores stay on their side of the wait.
 declare void @llvm.amdgcn.s.waitcnt(i32 immarg)
+declare void @llvm.amdgcn.s.wait.storecnt(i16 immarg)
 
-define i32 @__tokenspeed_sync_release_drain() alwaysinline {
+; gfx9: s_waitcnt vmcnt(0). 3952 = 0x0F70 leaves expcnt and lgkmcnt untouched.
+define i32 @__tokenspeed_sync_wait_vmem() alwaysinline {
 entry:
-  fence syncscope("workgroup") release
   call void @llvm.amdgcn.s.waitcnt(i32 3952)
+  ret i32 0
+}
+
+; gfx12 and gfx1250: s_wait_storecnt 0x0.
+define i32 @__tokenspeed_sync_wait_stores() alwaysinline {
+entry:
+  call void @llvm.amdgcn.s.wait.storecnt(i16 0)
   ret i32 0
 }

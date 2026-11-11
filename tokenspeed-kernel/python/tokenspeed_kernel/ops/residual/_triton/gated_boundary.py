@@ -22,6 +22,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import current_platform
@@ -31,6 +33,9 @@ from tokenspeed_kernel.signature import (
     format_signature,
     format_signatures,
 )
+
+if TYPE_CHECKING:
+    from tokenspeed_kernel.ops.moe._cute_dsl.latent_down import MailboxPublish
 
 _FLOAT_DTYPES = {torch.float16, torch.bfloat16, torch.float32}
 
@@ -184,6 +189,7 @@ def triton_post_norm_residual_pre_norm(
     enable_pdl: bool,
     branch_sentinel: int | None,
     branch_ranks: int,
+    branch_publish: MailboxPublish | None,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Return the residual stream and both normalized input dtypes."""
     return _launch_post_norm_residual_pre_norm(
@@ -200,6 +206,7 @@ def triton_post_norm_residual_pre_norm(
         enable_pdl,
         branch_sentinel,
         branch_ranks,
+        branch_publish,
         return_pre_fp32=True,
     )
 
@@ -218,6 +225,7 @@ def _launch_post_norm_residual_pre_norm(
     enable_pdl: bool,
     branch_sentinel: int | None,
     branch_ranks: int,
+    branch_publish: MailboxPublish | None,
     *,
     return_pre_fp32: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
@@ -226,7 +234,7 @@ def _launch_post_norm_residual_pre_norm(
     Same contract as the dispatcher ``post_norm_residual_pre_norm`` without a
     mailbox branch; every step stays FP32 and only the BF16 pre-norm rounds.
     """
-    if branch_sentinel is not None or branch_ranks != 1:
+    if branch_sentinel is not None or branch_ranks != 1 or branch_publish is not None:
         raise ValueError("a mailbox branch needs the cluster boundary kernel")
     if stream.shape != branch.shape or stream.ndim != 2:
         raise ValueError("stream and branch must share a [rows, width] shape")

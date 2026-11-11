@@ -190,6 +190,17 @@ def test_greedy_synthetic_acceptance_is_unchanged():
     assert not args.enable_speculative_sampling
 
 
+@pytest.mark.parametrize("sampled_drafts", [False, True])
+def test_sonic_synthetic_acceptance_over_either_draft_kind(sampled_drafts):
+    args = _args(
+        speculative_algorithm="DSPARK",
+        sampling_backend="sonic",
+        enable_speculative_sampling=sampled_drafts,
+        synthetic_acceptance_length=3.0,
+    )
+    assert args.speculative_rejection_sample_method == "synthetic"
+
+
 def test_synthetic_rejection_over_sampled_drafts_keeps_its_refusals():
     with pytest.raises(ValueError, match="enable-output-logprobs"):
         _args(
