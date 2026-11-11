@@ -106,8 +106,9 @@ def test_few_row_gemv_rows_match_the_single_row_gemv(n: int, k: int) -> None:
 
 
 # Qwen3.8-27B TP1 decode projections and its EAGLE-4 draft layer: gate-up,
-# down, GDN in/out, attention QKV/o_proj, draft fc. Each mixes the single-row
-# GEMV, the few-row GEMV and the multi-row GEMV across these row counts.
+# down, GDN in/out, attention QKV/o_proj, draft fc and down. Each mixes the
+# single-row GEMV, the few-row GEMV and the multi-row GEMV across these row
+# counts.
 @pytest.mark.parametrize(
     ("n", "k"),
     [
@@ -118,6 +119,7 @@ def test_few_row_gemv_rows_match_the_single_row_gemv(n: int, k: int) -> None:
         (14336, 5120),
         (15360, 10240),
         (5120, 15360),
+        (5120, 16384),
     ],
 )
 def test_qwen38_decode_projections_match_reference(n: int, k: int) -> None:

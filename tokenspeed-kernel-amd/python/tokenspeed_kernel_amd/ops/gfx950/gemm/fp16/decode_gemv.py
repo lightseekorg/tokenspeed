@@ -84,8 +84,7 @@ _ROWS_CONFIGS: dict[tuple[int, int], dict[int, tuple[int, int]]] = {
     (34816, 5120): {2: (4, 4), 4: (4, 4)},  # MLP gate-up
     # EAGLE-4 draft layer for Qwen3.8-27B.
     (5120, 5120): {2: (4, 4), 4: (4, 4)},  # attention o_proj
-    (5120, 16384): {2: (4, 4), 4: (4, 4)},  # MLP down
-    (15360, 10240): {2: (4, 4)},  # attention QKV
+    (15360, 10240): {2: (2, 4)},  # attention QKV
     (32768, 5120): {2: (4, 4)},  # MLP gate-up
 }
 
