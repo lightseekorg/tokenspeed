@@ -140,3 +140,15 @@ def test_a_layout_without_dense_parallelism_is_already_a_draft_layout() -> None:
     assert draft.attn.tp_size == target.attn.tp_size
     assert draft.world_size == 1
     assert draft.rank == 0
+
+
+def test_a_block_draft_replicates_its_mlp_only_under_attention_dp() -> None:
+    """Under attention DP the draft takes the replicated layout; at attention
+    DP 1, where every rank runs the draft, it keeps the target's layout."""
+    decode = _decode_layout()
+    draft = decode.for_block_draft()
+    assert draft.dense.tp_size == 1
+    assert draft.attn.tp_size == decode.attn.tp_size
+    tp8 = Mapping(rank=3, world_size=8, attn_tp_size=8, dense_tp_size=8)
+    assert tp8.for_block_draft() is tp8
+    assert tp8.for_block_draft().dense.tp_size == 8

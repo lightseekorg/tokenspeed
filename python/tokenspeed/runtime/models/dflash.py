@@ -416,10 +416,8 @@ class DFlashDraftModel(nn.Module, TargetCaptureConfigurator):
     ) -> None:
         super().__init__()
         self.config = config
-        # Replicated MLP: whole weights per rank, no dense collective, so an idle
-        # attention-DP rank skipping the draft cannot strand its peers. Attention
-        # width is unchanged (see Mapping.replicated_for_draft).
-        self.mapping = mapping.replicated_for_draft()
+        # See Mapping.for_block_draft: replicated MLP only under attention DP.
+        self.mapping = mapping.for_block_draft()
         eps = float(getattr(config, "rms_norm_eps", 1e-6))
         self.layers = nn.ModuleList(
             [
