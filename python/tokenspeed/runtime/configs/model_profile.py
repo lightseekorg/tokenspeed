@@ -55,7 +55,12 @@ class ModelProfile:
             under ``server_args.numerics``, say); the in-tree hooks read none
             of it.
         cache_family: Registered cache recipe and pool family that owns this
-            model's per-request state.
+            model's per-request state, or None to derive it from the built
+            attention config. None is for a draft whose family must follow the
+            target's pool (an ordinary MHA view under an ordinary target, the
+            target's own recipe under a custom family); declaring one there
+            would contradict a custom target family and be refused. A target
+            model names its family.
         linear_attention: Registered linear-attention backend serving the
             model's linear layers, or None for a model without them.
         default_attention_backend: Attention backend used when the launch
@@ -90,7 +95,7 @@ class ModelProfile:
     """
 
     configure_attention: Callable[[ModelConfig, ServerArgs], None]
-    cache_family: str
+    cache_family: str | None
     linear_attention: str | None
     default_attention_backend: str | None
     request_token_history: bool
@@ -119,8 +124,11 @@ class ModelProfile:
                 "ModelProfile.request_token_history_lookback needs a model that "
                 "reads request token history and a non-negative integer count"
             )
-        if not self.cache_family:
-            raise ValueError("ModelProfile.cache_family must name a cache family")
+        if self.cache_family is not None and not self.cache_family:
+            raise ValueError(
+                "ModelProfile.cache_family must name a cache family, or be None "
+                "to derive it from the attention config"
+            )
         if self.linear_attention == "":
             raise ValueError("ModelProfile.linear_attention must be None or a name")
         if self.attention_instances_per_layer < 1:

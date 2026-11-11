@@ -141,6 +141,7 @@ class PagedAttention(nn.Module):
         logit_cap: float = 0.0,
         v_head_dim: int = -1,
         sliding_window_size: int = -1,
+        sliding_window_sink: int = 0,
         *,
         rotary_emb: HeadRotary | None,
         qk_norm: tuple[HeadRMSNorm, HeadRMSNorm] | None,
@@ -165,6 +166,19 @@ class PagedAttention(nn.Module):
                 f"{sliding_window_size!r}"
             )
         self.sliding_window_size = int(sliding_window_size)
+        # Leading tokens kept visible outside the window (attention sinks).
+        if sliding_window_sink is None or sliding_window_sink < 0:
+            raise ValueError(
+                f"PagedAttention layer_id={layer_id}: sliding_window_sink is a "
+                f"token count >= 0, got {sliding_window_sink!r}"
+            )
+        if sliding_window_sink and sliding_window_size < 0:
+            raise ValueError(
+                f"PagedAttention layer_id={layer_id}: sliding_window_sink="
+                f"{sliding_window_sink} needs a sliding window; full attention "
+                "already keeps those rows"
+            )
+        self.sliding_window_sink = int(sliding_window_sink)
         # The cache group this layer's KV rides, bound at startup by bind_cache_groups.
         self._group_id: str | None = None
         self.rotary_emb = rotary_emb
@@ -659,6 +673,10 @@ def check_block_drafter_storage(
     full-history group there is nothing to borrow: the draft's KV would sit
     in a group of its own while the target router hands it another group's
     slots.
+
+    A draft with its own group would read history through its own router while
+    its KV lands at the target's locations, so the two stop naming the same
+    rows. Nothing raises; the speculation is simply wasted.
     """
     target_groups = set(target_cache_pool.history_group_by_layer().values())
     specs = {
