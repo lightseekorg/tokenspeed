@@ -68,7 +68,8 @@ def _plan(rows: int) -> Plan:
     )
 
 
-@pytest.mark.parametrize("rows", [1, 2, 4])
+# 3 rows: the GEMV pads to 4 rows (the padding row repeats the last one).
+@pytest.mark.parametrize("rows", [1, 2, 3, 4, 8, 16])
 def test_qkvg_halves_sum_to_the_bf16_rounded_fp32_projection(rows):
     g = torch.Generator().manual_seed(rows)
     w = (torch.randn(QKVG, HIDDEN, generator=g) / HIDDEN**0.5).to(torch.bfloat16)
@@ -90,6 +91,14 @@ def test_qkvg_halves_sum_to_the_bf16_rounded_fp32_projection(rows):
     torch.cuda.synchronize()
     want, bound = ref.bf16_gemm(a, w)
     tag = launch_tag(step, 0)
+    # Every pair the tasks put, in each row's copy of both regions; payloads
+    # checks the values' tags. No other pair may be written.
+    written = torch.zeros(plan.scratch_pairs, dtype=torch.bool)
+    for r in range(rows):
+        for region, n in (("qkvg", GATE_ROW), ("gate", QKVG - GATE_ROW)):
+            start = plan.offset(region) + r * plan.row_pairs
+            written[start : start + 2 * n] = True
+    assert not torch.any(scratch.cpu()[~written])
     for r in range(rows):
         halves = []
         for region, n in (("qkvg", GATE_ROW), ("gate", QKVG - GATE_ROW)):

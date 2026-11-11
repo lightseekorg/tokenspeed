@@ -114,12 +114,27 @@ def _block_stage(mb, task, w, a, a_stride, FIRST: gl.constexpr, N: gl.constexpr)
 
 @gluon.jit
 def _put_rows(mb, region: gl.constexpr, out, at):
+    """Put the 16 partial sums of every row of ``out`` (FP32 ``[RP, 16]``)
+    at ``at`` of each row's copy of ``region``, in one put. The put goes out
+    from a blocked layout that holds each value in few lanes: the GEMV
+    result layout repeats each value across many lanes, and every copy
+    would be a store."""
     R: gl.constexpr = schedule.rows(mb.plan)
-    rows = gl.arange(0, out.shape[0], gl.SliceLayout(1, out.type.layout))[:, None]
-    for r in gl.static_range(R):
-        v = gl.sum(gl.where(rows == r, out, 0.0), axis=0)
-        i = at + gl.arange(0, 16, v.type.layout)
-        mb.row(r).put(region, i, v.to(gl.int32, bitcast=True))
+    RP: gl.constexpr = out.shape[0]
+    nw: gl.constexpr = gl.num_warps()
+    cl: gl.constexpr = gl.BlockedLayout([1, 1], [4, 16], [nw, 1], [1, 0])
+    # + 0.0 maps -0.0 to +0.0, as summing a row out of zeros did.
+    v = gl.convert_layout(out + 0.0, cl)
+    r = gl.arange(0, RP, gl.SliceLayout(1, cl))[:, None]
+    i = gl.arange(0, 16, gl.SliceLayout(0, cl))[None, :]
+    # The padding rows repeat the last row; the mask skips their stores.
+    # (i >= 0) is always true: it broadcasts the row mask to the tile's shape.
+    mb.put(
+        region,
+        mb.row_offset(r) + at + i,
+        v.to(gl.int32, bitcast=True),
+        mask=(r < R) & (i >= 0),
+    )
 
 
 @gluon.jit
