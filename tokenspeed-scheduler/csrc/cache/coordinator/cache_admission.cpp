@@ -972,7 +972,7 @@ private:
     // bucket placement. If releasing every available block still cannot fit,
     // no victim ordering can help. Request releases often fund a State rotation
     // by themselves, so test those before visiting the cache's available index.
-    bool couldFitAfterReleasingCandidates() const {
+    bool couldFitAfterReleasingCandidates() {
         ShadowOccupancy maximum{pool_, groups_};
         for (const VictimCandidate& candidate : request_reclaim_candidates_) {
             maximum.Remove(candidate.group_id, candidate.location);
@@ -980,25 +980,16 @@ private:
         if (maximum.Fits(shape_need_, blocks_needed_, pair_need_)) {
             return true;
         }
-        std::vector<PrefixCacheIndex::EvictionCandidate> entries;
-        for (std::size_t i = 0; i < groups_.size(); ++i) {
-            PrefixCacheIndex::EvictionCursor cursor;
-            const auto& index = groups_[i].Index();
-            while (const auto epoch = index.PeekEvictionEpoch(pool_, cursor)) {
-                entries.clear();
-                index.NextEvictionEpoch(pool_, cursor, *epoch, entries);
+        return eviction_plan_.Candidates().PreScanUntil(
+            [&](std::uint32_t group_id, std::span<const PrefixCacheIndex::EvictionCandidate> entries) {
                 for (const auto& entry : entries) {
                     if (!protected_locations_.contains(entry.location) &&
                         !request_reclaim_locations_.contains(entry.location)) {
-                        maximum.Remove(static_cast<std::uint32_t>(i), entry.location);
+                        maximum.Remove(group_id, entry.location);
                     }
                 }
-                if (maximum.Fits(shape_need_, blocks_needed_, pair_need_)) {
-                    return true;
-                }
-            }
-        }
-        return false;
+                return maximum.Fits(shape_need_, blocks_needed_, pair_need_);
+            });
     }
 
     // The request's own slots that its retention has expired at this

@@ -22,7 +22,14 @@ planner and commit. This changes storage, not policy: feasibility still uses
 the common occupancy formula, and Minimize still restores victims in reverse
 order, checks fit and removes required victims again. Survivors are compacted
 in original order. The pre-scan and ordered epoch index remain part of that
-same planning path.
+same planning path. The planner may reuse a bounded prefix of the pre-scan's
+raw epoch snapshots; selection still applies the same exclusion, checkpoint
+aging and policy sort. Snapshot vectors retain at most 8,192 entry slots
+across groups, so a failed admission never copies an entire large cache into
+retained snapshots. Each snapshot owns its metadata and no blocks, and dies
+with the planner. After replay, the live cursor seeks past the last saved
+epoch by key: a saved next iterator could point at a pinned node extracted
+by the pre-scan.
 
 ## 1. Admission is per chunk
 

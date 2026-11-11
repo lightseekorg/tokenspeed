@@ -22,17 +22,90 @@
 #include <memory>
 #include <memory_resource>
 #include <list>
+#include <limits>
 #include <span>
+#include <string>
+#include <tuple>
 #include <vector>
 
 #include <gtest/gtest.h>
 
 #include "cache/cache_group.h"
 #include "cache/coordinator/cache_coordinator.h"
+#include "cache/coordinator/eviction_candidates.h"
+#include "cache/coordinator/parent_occupancy.h"
 #include "cache/coordinator/shadow_occupancy.h"
 
 namespace tokenspeed::test {
 namespace {
+
+TEST(ParentOccupancy, SparseParentsKeepZeroAndRestoredCountsAcrossGrowthAndUnwind) {
+    PlanningScratch storage;
+    for (int round = 0; round < 3; ++round) {
+        try {
+            auto lease = storage.Acquire();
+            ParentOccupancy counts{&lease};
+            EXPECT_EQ(counts.Find(1), nullptr);
+            for (int i = 1; i <= 16384; ++i) {
+                const auto parent = static_cast<std::int32_t>(static_cast<std::int64_t>(i) * 104729);
+                counts.GetOrInsert(parent, i % 4 + 1) -= 1;
+                EXPECT_EQ(counts.GetOrInsert(parent, 99), i % 4);
+            }
+            EXPECT_EQ(counts.size(), 16384u);
+            for (int i = 16384; i > 0; --i) {
+                const auto parent = static_cast<std::int32_t>(static_cast<std::int64_t>(i) * 104729);
+                auto* occupied = counts.Find(parent);
+                ASSERT_NE(occupied, nullptr);
+                EXPECT_EQ(*occupied, i % 4);
+                ++*occupied;
+                EXPECT_EQ(counts.GetOrInsert(parent, 99), i % 4 + 1);
+            }
+            EXPECT_EQ(counts.Find(1), nullptr);
+            throw 1;
+        } catch (int) {
+        }
+    }
+}
+
+TEST(CacheEvictionCandidates, PrescanReplaysPolicyOrderAcrossPinnedEpochsAndSnapshotLimit) {
+    for (const std::size_t threshold : {16u, 9000u, 12000u}) {
+        BlockPool pool(10032, {1, 1});
+        std::vector<CacheGroup> groups;
+        std::vector<CacheBlockRef> pinned;
+        for (std::uint32_t group = 0; group < 2; ++group) {
+            const CacheGroupSpec spec{.cache_blocks_per_lcm_block = 1, .block_granularity = 4};
+            groups.emplace_back(spec, std::make_unique<GroupAllocator>(1, group, 1), MakePrefixMatcher(spec));
+            for (int i = 0; i < (group == 0 ? 10000 : 32); ++i) {
+                auto block = pool.AcquireBlock(group);
+                const CacheKey key{.group_id = group, .content_hash = std::to_string(i)};
+                groups.back().Index().Register(pool, block, key, static_cast<std::uint64_t>(i / 16 + 1), i,
+                                               CacheBoundaryKind::kChunk, nullptr, nullptr);
+                if (i >= 16 && i < 32) pinned.push_back(block);
+            }
+        }
+        CacheEvictionCandidates replay{groups, pool, nullptr, nullptr, CheckpointAging{}, nullptr};
+        std::size_t seen = 0;
+        const bool fits = replay.PreScanUntil([&](std::uint32_t, auto entries) {
+            seen += entries.size();
+            return seen >= threshold;
+        });
+        EXPECT_EQ(fits, threshold <= 10000);
+        CacheEvictionCandidates direct{groups, pool, nullptr, nullptr, CheckpointAging{}, nullptr};
+        using Key = std::tuple<std::uint32_t, std::int32_t, std::int32_t, std::uint64_t, std::int64_t>;
+        const auto drain = [](CacheEvictionCandidates& candidates) {
+            std::vector<Key> result;
+            while (const auto candidate = candidates.Next(std::numeric_limits<std::uint64_t>::max())) {
+                result.emplace_back(candidate->group_id, candidate->location.lcm_block_id,
+                                    candidate->location.slot_index, candidate->rank_epoch, candidate->position_rank);
+            }
+            return result;
+        };
+        const auto expected = drain(direct);
+        EXPECT_EQ(expected.size(), 10000u);
+        EXPECT_EQ(drain(replay), expected);
+        EXPECT_EQ(pool.NumEmptyLcmBlocks(), 0);
+    }
+}
 
 TEST(FixedSlotResource, AlignedNodesKeepTheirAddressAcrossGrowthAndReuse) {
     struct alignas(256) Value {

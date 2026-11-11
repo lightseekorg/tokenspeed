@@ -105,6 +105,40 @@ public:
         std::ranges::sort(candidates, {}, [](const Candidate& candidate) { return evictionKey(candidate); });
     }
 
+    // Run the feasibility walk without policy reordering. Retain a bounded
+    // prefix of raw epochs for the later policy walk, which still filters,
+    // ranks and sorts them normally. Snapshots own metadata, never blocks,
+    // and die with this planner. Impossible admissions cannot retain the
+    // entire cache: the cap counts vector capacity, not just live entries.
+    template <typename EnoughCapacity>
+    bool PreScanUntil(EnoughCapacity&& enough_capacity) {
+        constexpr std::size_t max_retained_entries = 8192;
+        std::size_t retained_entries = 0;
+        std::vector<PrefixCacheIndex::EvictionCandidate> entries;
+        for (GroupCursor& group : cursors_) {
+            _assert(!group.started && group.snapshots.empty(), "pre-scan precedes candidate selection");
+            const auto& index = groups_[group.group_id].Index();
+            PrefixCacheIndex::EvictionCursor cursor;
+            bool retaining = true;
+            while (const auto epoch = index.PeekEvictionEpoch(pool_, cursor)) {
+                entries.clear();
+                index.NextEvictionEpoch(pool_, cursor, *epoch, entries);
+                const bool fits =
+                    enough_capacity(group.group_id, std::span<const PrefixCacheIndex::EvictionCandidate>{entries});
+                if (retaining && !entries.empty()) {
+                    if (entries.capacity() <= max_retained_entries - retained_entries) {
+                        retained_entries += entries.capacity();
+                        group.snapshots.push_back(EpochSnapshot{*epoch, std::move(entries)});
+                    } else {
+                        retaining = false;
+                    }
+                }
+                if (fits) return true;
+            }
+        }
+        return false;
+    }
+
     // A request release can precede the cache; never inspect a newer epoch.
     std::optional<Candidate> Next(std::uint64_t max_rank_epoch) {
         while (true) {
@@ -124,7 +158,7 @@ public:
                 if (group.next_candidate < group.candidates.size()) {
                     consider(group.Current(), Source::kGroup, &group);
                 } else if (!group.index_exhausted) {
-                    const auto epoch = groups_[group.group_id].Index().PeekEvictionEpoch(pool_, group.index_cursor);
+                    const auto epoch = peekEpoch(group);
                     if (!epoch) {
                         group.index_exhausted = true;
                     } else if (*epoch <= max_rank_epoch && (!next_epoch || *epoch < *next_epoch)) {
@@ -217,6 +251,11 @@ private:
         return key && aging_.tree->AgedDistance(key->content_hash, aging_.tier) != 0;
     }
 
+    struct EpochSnapshot {
+        std::uint64_t epoch;
+        std::vector<PrefixCacheIndex::EvictionCandidate> entries;
+    };
+
     struct GroupCursor {
         explicit GroupCursor(std::uint32_t id) : group_id{id} {}
         const Candidate& Current() const { return candidates[next_candidate]; }
@@ -227,7 +266,14 @@ private:
         PrefixCacheIndex::EvictionCursor index_cursor;
         std::vector<Candidate> candidates;
         std::size_t next_candidate{0};
+        std::vector<EpochSnapshot> snapshots;
+        std::size_t next_snapshot{0};
     };
+
+    std::optional<std::uint64_t> peekEpoch(GroupCursor& group) const {
+        if (group.next_snapshot < group.snapshots.size()) return group.snapshots[group.next_snapshot].epoch;
+        return groups_[group.group_id].Index().PeekEvictionEpoch(pool_, group.index_cursor);
+    }
 
     void loadEpoch(GroupCursor& group, std::uint64_t epoch) {
         if (!group.started) {
@@ -237,7 +283,17 @@ private:
         group.candidates.clear();
         group.next_candidate = 0;
         epoch_scratch_.clear();
-        groups_[group.group_id].Index().NextEvictionEpoch(pool_, group.index_cursor, epoch, epoch_scratch_);
+        const auto& index = groups_[group.group_id].Index();
+        if (group.next_snapshot < group.snapshots.size()) {
+            auto& snapshot = group.snapshots[group.next_snapshot++];
+            _assert(snapshot.epoch == epoch, "the replay preserves complete epoch order");
+            epoch_scratch_ = std::move(snapshot.entries);
+            if (group.next_snapshot == group.snapshots.size()) {
+                index.SeekAfterEvictionEpoch(pool_, group.index_cursor, epoch);
+            }
+        } else {
+            index.NextEvictionEpoch(pool_, group.index_cursor, epoch, epoch_scratch_);
+        }
         scanned_candidates_ += epoch_scratch_.size();
         for (const auto& entry : epoch_scratch_) {
             if (excluded(entry.location) || aged(group.group_id, entry)) {

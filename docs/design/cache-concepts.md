@@ -34,8 +34,24 @@ segment is released. For N dense slots, values cost approximately 8N bytes on
 Sparse tiers allocate no value array for untouched segments. Entries are found
 once for eviction: metadata is read before removal and the returned key owns
 its bytes through notifications and dependent-boundary cleanup. The ordered
-(epoch, location) index and its allocation-free pinned-node restoration remain
-unchanged.
+(epoch, location) policy remains unchanged. Entry-owned RAII registrations
+remove their order nodes at destruction. Acquiring a matched block returns
+an owning reference. Traversal suspends an available-order registration when
+it encounters a pinned entry, including pins obtained through other paths.
+The last external owner's notification restores the same node, without
+allocation; its key follows epoch changes and relocation while pinned. The
+order containers outlive their registrations, and observers are cancelled
+before either the registration or block owner is destroyed.
+All ordered-index mutations maintain an insertion hint, advancing it before
+removing its node. Restoring consecutive locations within one epoch can use
+that hint; arbitrary release order and older epochs retain the same map order.
+
+Page-walk probes can retain physical location hints, not entry pointers or
+block owners. Protection and acquisition check the pool and complete cache
+key at the live location before using a hint; relocation or reuse falls back
+to key lookup. Shapes with no hint use the same lookup. A probe therefore
+does not pin cache, and cannot accidentally acquire a different identity when
+its old location or control address is reused.
 
 Key and boundary lookup use open-addressed tables containing cached hashes and
 stable handles. Per-tier entry lists and the boundary node list own their
@@ -190,6 +206,9 @@ request fits, it does not enumerate eviction candidates. Under memory pressure,
 it enumerates candidates and keeps shadow occupancy only for the parents whose
 children it tentatively evicts. This makes the common zero-eviction path scale
 with cache groups and request demand rather than total cache capacity.
+Each shadow's occupancy table stores parent/count pairs in contiguous slots,
+growing only with touched parents. Restoring a parent keeps its slot until the
+shadow dies, so repeated Remove/Restore does not allocate individual nodes.
 Each shadow owns an independent RAII scratch lease. The pool lazily retains at
 most two 256 KiB banks; larger allocations and further simultaneous leases use
 the ordinary allocator and free that overflow with their containers. Only
@@ -202,7 +221,7 @@ destination in that bucket, without looking up or temporarily owning the Host
 block to count it. Sharded groups count destinations by their Host sources'
 ownership buckets.
 
-The prefix index remembers which entries an eviction traversal found pinned.
+The prefix index remembers acquired hits and entries an eviction traversal found pinned.
 Later admission attempts skip those entries until the last external block owner
 releases them. A one-shot ownership notification restores each entry to its
 original access epoch, including an epoch changed while it was pinned. This

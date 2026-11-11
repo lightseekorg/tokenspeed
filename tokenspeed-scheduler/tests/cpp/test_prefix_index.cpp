@@ -32,6 +32,7 @@
 
 #include "cache/core/block_pool.h"
 #include "cache/prefix/prefix_index.h"
+#include "cache/prefix/prefix_matcher.h"
 #include "cache/prefix/flat_pointer_index.h"
 
 namespace tokenspeed::test {
@@ -233,7 +234,10 @@ TEST(FlatPointerIndex, CollidingKeysSurviveGrowthWrappedClustersAndChurn) {
         if (random() % 2) {
             EXPECT_EQ(index.Insert(&entries[key]), expected.emplace(key, &entries[key]).second);
         } else {
-            EXPECT_EQ(index.Erase(key), expected.erase(key) != 0);
+            const auto found = expected.find(key);
+            const Entry* removed = found == expected.end() ? nullptr : found->second;
+            EXPECT_EQ(index.Extract(key), removed);
+            expected.erase(key);
         }
         EXPECT_EQ(index.size(), expected.size());
         if (step % 31 == 0) {
@@ -455,6 +459,10 @@ TEST(PrefixCacheIndexEvictionOrderTest, RepeatedOwnershipAndEpochChangesMatchFul
         const auto key = KeyOf(std::to_string(slot));
         if (pins[slot]) {
             pins[slot].reset();
+        } else if (iteration % 2 == 0) {
+            auto match = index.AcquireMatched(pool, std::vector<CacheKey>{key}, 0, GroupPrefixProbe{.hits = {1}},
+                                              random() % 13, nullptr);
+            pins[slot] = std::move(match.blocks.front());
         } else {
             pins[slot] = index.Find(pool, key);
         }
@@ -807,6 +815,92 @@ TEST(PrefixCacheIndexEvictionOrderTest, AcquiringAMatchMovesTheEntryToTheRequest
     match.blocks.clear();
 
     EXPECT_EQ(DrainEvictionOrder(index, pool), (std::vector<CacheBlockLocation>{untouched, matched}));
+}
+
+TEST(PrefixCacheIndexEvictionOrderTest, AcquiredOwnersRestoreOrderOnLastReleaseAndUnwind) {
+    BlockPool pool(3, {1});
+    PrefixCacheIndex index(kGroupId);
+    const auto hit = Cache(index, pool, "hit", 10);
+    const auto other = Cache(index, pool, "other", 20);
+    const std::vector<CacheKey> keys{KeyOf("hit")};
+    const GroupPrefixProbe probe{.hits = {1}};
+    CacheBlockRef retained;
+    try {
+        auto match = index.AcquireMatched(pool, keys, 0, probe, 40, nullptr);
+        retained = match.blocks.front();
+        EXPECT_FALSE(index.Evict(pool, hit));
+        auto older = index.AcquireMatched(pool, keys, 0, probe, 5, nullptr);
+        throw 7;
+    } catch (int) {
+    }
+    EXPECT_EQ(DrainEvictionOrder(index, pool), (std::vector<CacheBlockLocation>{other}));
+    retained.reset();
+    EXPECT_EQ(DrainEvictionOrder(index, pool), (std::vector<CacheBlockLocation>{hit, other}));
+    EXPECT_EQ(index.Evict(pool, hit), KeyOf("hit"));
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 2);
+}
+
+TEST(PrefixCacheIndexEvictionOrderTest, DestroyingIndexCancelsAnAcquiredOwnersNotification) {
+    BlockPool pool(1, {1});
+    PrefixMatch match;
+    {
+        PrefixCacheIndex index(kGroupId);
+        Cache(index, pool, "hit", 10);
+        match = index.AcquireMatched(pool, std::vector<CacheKey>{KeyOf("hit")}, 0, GroupPrefixProbe{.hits = {1}}, 20,
+                                     nullptr);
+        EXPECT_EQ(match.blocks.front().use_count(), 2);
+        EXPECT_TRUE(DrainEvictionOrder(index, pool).empty());
+    }
+    EXPECT_EQ(match.blocks.front().use_count(), 1);
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 0);
+    match.blocks.clear();
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 1);
+}
+
+TEST(PrefixCacheIndexInspectionTest, ProbeLocationsRecheckIdentityAfterSlotReuse) {
+    BlockPool pool(2, {1});
+    PrefixCacheIndex index(kGroupId);
+    const auto original = Cache(index, pool, "hit", 10);
+    const auto other = Cache(index, pool, "other", 20);
+    const std::vector<CacheKey> keys{KeyOf("unused"), KeyOf("hit")};
+    FullAttnMatcher matcher;
+    const auto probe = matcher.Probe(index, pool, keys, 1, 2, nullptr);
+    ASSERT_EQ(probe.hits, (std::vector<std::uint8_t>{1}));
+    // A probe is non-owning: it neither prevents eviction nor keeps the old
+    // control object alive when the location is reused for another identity.
+    ASSERT_TRUE(index.Evict(pool, original));
+    EXPECT_EQ(Cache(index, pool, "replacement", 30), original);
+    ASSERT_TRUE(index.Evict(pool, other));
+    EXPECT_EQ(Cache(index, pool, "hit", 40), other);
+    EXPECT_EQ(index.MatchedLocations(pool, keys, 1, probe), (std::vector<CacheBlockLocation>{other}));
+    auto match = index.AcquireMatched(pool, keys, 1, probe, 50, nullptr);
+    ASSERT_EQ(match.blocks.size(), 1u);
+    EXPECT_EQ(match.blocks.front()->Location(), other);
+    EXPECT_FALSE(index.Evict(pool, other));
+    match.blocks.clear();
+    EXPECT_EQ(index.Evict(pool, other), KeyOf("hit"));
+}
+
+TEST(PrefixCacheIndexInspectionTest, ProbeLocationsDoNotConfusePoolsOrRelocatedEntries) {
+    BlockPool device(3, {1});
+    BlockPool host(3, {1});
+    PrefixCacheIndex index(kGroupId);
+    const auto from = Cache(index, device, "hit", 10);
+    Cache(index, host, "other", 10);
+    const auto host_hit = Cache(index, host, "hit", 20);
+    const std::vector<CacheKey> keys{KeyOf("hit")};
+    FullAttnMatcher matcher;
+    const auto probe = matcher.Probe(index, device, keys, 0, 1, nullptr);
+    auto copy = device.AcquireBlock(kGroupId);
+    const auto to = copy->Location();
+    index.Relocate(device, from, copy);
+    copy.reset();
+    EXPECT_EQ(index.MatchedLocations(device, keys, 0, probe), (std::vector<CacheBlockLocation>{to}));
+    EXPECT_EQ(index.MatchedLocations(host, keys, 0, probe), (std::vector<CacheBlockLocation>{host_hit}));
+    auto match = index.AcquireMatched(host, keys, 0, probe, 30, nullptr);
+    ASSERT_EQ(match.blocks.size(), 1u);
+    EXPECT_TRUE(match.blocks.front().IsOwnedBy(host));
+    EXPECT_EQ(match.blocks.front()->Location(), host_hit);
 }
 
 TEST(PrefixCacheIndexEvictionOrderTest, EvictedEntriesLeaveTheOrder) {

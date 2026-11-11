@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "cache/cache_group.h"
+#include "cache/coordinator/parent_occupancy.h"
 #include "cache/core/block_pool.h"
 #include "cache/core/cache_block_ref.h"
 #include "utils.h"
@@ -64,9 +65,8 @@ public:
     // bucket owned packing / shard_count of them.
     void Remove(std::uint32_t group_id, CacheBlockLocation location) {
         _assert(pool_.BoundGroup(location.lcm_block_id) == group_id, "a released location belongs to another group");
-        auto it =
-            remaining_occupied_.try_emplace(location.lcm_block_id, pool_.OccupiedCount(location.lcm_block_id)).first;
-        std::int32_t& occupied = it->second;
+        std::int32_t& occupied =
+            remaining_occupied_.GetOrInsert(location.lcm_block_id, pool_.OccupiedCount(location.lcm_block_id));
         _assert(occupied > 0, "the shadow released the same location twice");
         const GroupAllocator& allocator = groups_[group_id].Allocator();
         std::vector<std::int64_t>& holes = holes_by_bucket_[group_id];
@@ -86,9 +86,9 @@ public:
     }
 
     void Restore(std::uint32_t group_id, CacheBlockLocation location) {
-        auto it = remaining_occupied_.find(location.lcm_block_id);
-        _assert(it != remaining_occupied_.end(), "a restored location has no shadow occupancy");
-        std::int32_t& occupied = it->second;
+        auto* count = remaining_occupied_.Find(location.lcm_block_id);
+        _assert(count != nullptr, "a restored location has no shadow occupancy");
+        std::int32_t& occupied = *count;
         const GroupAllocator& allocator = groups_[group_id].Allocator();
         const std::int32_t slots = pool_.Packing(group_id);
         std::vector<std::int64_t>& holes = holes_by_bucket_[group_id];
@@ -143,7 +143,7 @@ private:
     // Occupants left per parent a Remove touched; untouched parents keep the
     // pool's own count.
     PlanningScratch::Lease scratch_;
-    std::pmr::unordered_map<std::int32_t, std::int32_t> remaining_occupied_{&scratch_};
+    ParentOccupancy remaining_occupied_{&scratch_};
     std::vector<std::vector<std::int64_t>> holes_by_bucket_;
     std::int64_t empty_parent_count_{0};
     // The demand with a fit's pairs in place, as wide as the widest group's

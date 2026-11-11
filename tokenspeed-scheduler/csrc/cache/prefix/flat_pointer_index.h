@@ -51,10 +51,13 @@ public:
         return true;
     }
 
-    bool Erase(const Key& key) {
-        if (slots_.empty()) return false;
+    // Removes and returns the borrowed handle in one lookup. The caller still
+    // owns the object and can destroy it after its index entry has gone.
+    T Extract(const Key& key) {
+        if (slots_.empty()) return {};
         std::size_t hole = find(key, Hash{}(key));
-        if (hole == slots_.size()) return false;
+        if (hole == slots_.size()) return {};
+        const T value = slots_[hole].value;
         const auto mask = slots_.size() - 1;
         for (auto next = (hole + 1) & mask; slots_[next].value != T{}; next = (next + 1) & mask) {
             const auto home = slots_[next].hash & mask;
@@ -67,8 +70,10 @@ public:
         }
         slots_[hole] = {};
         --size_;
-        return true;
+        return value;
     }
+
+    bool Erase(const Key& key) { return Extract(key) != T{}; }
 
     std::size_t size() const noexcept { return size_; }
     bool empty() const noexcept { return size_ == 0; }
