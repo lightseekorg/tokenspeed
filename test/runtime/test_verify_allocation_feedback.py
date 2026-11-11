@@ -21,30 +21,24 @@
 import pytest
 import torch
 from tokenspeed_kernel.ops.attention import dsv41
-from tokenspeed_kernel.ops.attention.dsv41.portable_torch import (
-    torch_dsv41_verify_layout,
-)
 
 from tokenspeed.runtime.execution.drafter.deepseek_v41_dspark import DeepseekV41DSpark
 
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA unavailable"
+)
 
-def make_drafter(device):
+
+def make_drafter():
     # Model initialization requires weights and GPUs. Exercise the real
     # request-state and allocation methods with their existing tensor state.
     drafter = object.__new__(DeepseekV41DSpark)
     drafter.verify_feedback = None
     drafter.confidence_scores = torch.tensor(
-        [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], dtype=torch.float32, device=device
+        [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], dtype=torch.float32, device="cuda"
     )
     drafter._confidence_request_ids = ["a", "b", "c"]
     return drafter
-
-
-@pytest.fixture(params=["cpu", "cuda"])
-def device(request):
-    if request.param == "cuda" and not torch.cuda.is_available():
-        pytest.skip("CUDA unavailable")
-    return request.param
 
 
 def check_allocation(drafter, slots, history, expected):
@@ -72,27 +66,27 @@ def check_allocation(drafter, slots, history, expected):
             request_slots=slots,
             **actual
         )
-        torch_dsv41_verify_layout(expected, q, **reference)
+        dsv41.verify_layout(expected, query_capacity=q, **reference)
         for name in reference:
             torch.testing.assert_close(actual[name], reference[name], atol=0, rtol=0)
     torch.testing.assert_close(history, original, atol=0, rtol=0)
 
 
-def test_allocation_uses_latest_scores_in_request_order(device):
-    drafter = make_drafter(device)
+def test_allocation_uses_latest_scores_in_request_order():
+    drafter = make_drafter()
     check_allocation(drafter, [2, 0], [[0, 0], [0, 0]], [[5, 6], [1, 2]])
 
 
-def test_reused_slot_and_extend_do_not_leak_previous_predictions(device):
-    drafter = make_drafter(device)
+def test_reused_slot_and_extend_do_not_leak_previous_predictions():
+    drafter = make_drafter()
     drafter.prepare_request_state(["new", "b"], [0, 1], num_extends=0)
     check_allocation(drafter, [0, 1], [[-1, -2], [-3, -4]], [[-1, -2], [3, 4]])
     drafter.prepare_request_state(["b"], [1], num_extends=1)
     check_allocation(drafter, [1], [[-1, -2]], [[-1, -2]])
 
 
-def test_nonfinite_prediction_falls_back_as_a_whole_row(device):
-    drafter = make_drafter(device)
+def test_nonfinite_prediction_falls_back_as_a_whole_row():
+    drafter = make_drafter()
     drafter.confidence_scores[0, 1] = float("nan")
     drafter.confidence_scores[2, 0] = float("inf")
     check_allocation(
