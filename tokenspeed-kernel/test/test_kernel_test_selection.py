@@ -20,6 +20,9 @@
 
 """Kernel test files run when a pull request's changes name their families."""
 
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -147,3 +150,28 @@ def test_selection_comes_from_the_changed_paths_variable(repo, monkeypatch):
 
     assert selection.selects(repo / TESTS / "ops/test_gemm.py")
     assert not selection.selects(repo / TESTS / "ops/test_mla.py")
+
+
+def test_a_parallel_run_the_selection_empties_passes():
+    """Under pytest-xdist the workers collect and select, so the controller
+    learns from them that the selection emptied the run: like a
+    single-process run, it passes (exit 0) instead of failing with "no tests
+    collected" (exit 5). This file names no op family, so a change to the
+    gemm sources deselects all of it."""
+    pytest.importorskip("xdist")
+    repo_root = Path(__file__).resolve().parents[2]
+    env = dict(os.environ)
+    env[CHANGED_PATHS_ENV] = (
+        "tokenspeed-kernel/python/tokenspeed_kernel/ops/gemm/__init__.py"
+    )
+    run = subprocess.run(
+        [sys.executable, "-m", "pytest", "-n", "2", "-p", "no:cacheprovider", __file__],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert run.returncode == 0, run.stdout + run.stderr
+    # The controller doesn't see the workers' deselections, only that nothing ran.
+    assert "no tests ran" in run.stdout
