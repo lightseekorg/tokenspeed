@@ -987,6 +987,20 @@ def test_inline_asm_checks_catch_their_cases():
     ]
     # s_getpc_b64 leaves SCC alone; s_add_u32 writes it.
     assert undeclared_asm_writes("s_getpc_b64 $0", "=s") == []
+    # EXEC narrowed and restored before every way out needs no clobber; left
+    # narrowed at a branch, or narrowed without a saved copy, it does.
+    restored = "s_mov_b64 $0, exec\ns_and_b64 exec, $0, vcc\nglobal_load_dwordx2 $1, $2, off\ns_mov_b64 exec, $0\ns_branch 1b"
+    assert undeclared_asm_writes(restored, "=&s,=&v,v,~{vcc},~{scc}") == []
+    leaked = (
+        "s_mov_b64 $0, exec\ns_and_b64 exec, $0, vcc\ns_branch 1b\ns_mov_b64 exec, $0"
+    )
+    assert undeclared_asm_writes(leaked, "=&s,~{vcc},~{scc}") == [
+        "s_and_b64 writes undeclared exec",
+        "s_mov_b64 writes undeclared exec",
+    ]
+    assert undeclared_asm_writes("s_mov_b64 exec, vcc", "~{vcc}") == [
+        "s_mov_b64 writes undeclared exec"
+    ]
     assert undeclared_asm_writes("s_add_u32 $1, $1, 1", "=s,s") == [
         "s_add_u32 writes input $1",
         "s_add_u32 writes undeclared scc",

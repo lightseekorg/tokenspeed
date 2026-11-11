@@ -133,14 +133,16 @@ def _poll_constraints(groups):
     the first check (one SGPR pair). Inputs: every group's pointers, the tag,
     the poll check interval and timeout shift (immediates), then the wave's
     "spin" flag. The spin flag is one value per thread, so its entry also
-    names the clobbers. A retry reloads only the late pairs' lanes
-    (EXEC narrowed, then restored), so EXEC is among them.
+    names the clobbers. A retry reloads only the late pairs' lanes with EXEC
+    narrowed, and restores it before every way out, so EXEC is not a
+    clobber: one would make the compiler keep the enclosing branches' masks
+    in SGPRs around every poll.
     """
     return (
         ("=&v",) * groups
         + ("=&v", "=&s", "=&s", "=&s", "=&s")
         + ("v",) * groups
-        + ("s", "n", "n", "v,~{vcc},~{scc},~{exec}")
+        + ("s", "n", "n", "v,~{vcc},~{scc}")
     )
 
 
