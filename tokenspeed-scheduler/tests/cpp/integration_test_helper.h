@@ -51,6 +51,7 @@ struct SchedulerTestAccess {
                                     const CacheCoordinator::AdmissionResult& result) {
         scheduler.recordAdmittedPages(plan, result);
     }
+    static std::uint64_t DecodeAdmissions(const Scheduler& scheduler) { return scheduler.decode_admissions_; }
 };
 
 }  // namespace tokenspeed

@@ -234,7 +234,15 @@ std::optional<CacheCoordinator::CopyInPoint> Scheduler::promptEndCopyInPoint(con
 RequestProgress AdvanceRequestProgress(const Request& request, fsm::CacheProgress& cache_progress,
                                        std::int32_t num_computed_tokens, std::int32_t prefix_granularity,
                                        bool stream_completed_to_host, PublicationPoint point,
-                                       bool allow_state_checkpoint, bool preserve_source_blocks) {
+                                       bool allow_state_checkpoint, bool preserve_source_blocks,
+                                       bool publish_to_cache) {
+    if (!publish_to_cache) {
+        // Without prefix caching no forward writes an in-forward checkpoint
+        // (inForwardStateCheckpoint), so nothing is waiting to be published.
+        _assert(cache_progress.state_checkpoint_tokens == 0 && cache_progress.state_checkpoint_blocks.empty(),
+                "no in-forward State checkpoint is pending without prefix caching");
+        return RequestProgress{.num_computed_tokens = num_computed_tokens};
+    }
     const std::int32_t first_new_prefix_page = static_cast<std::int32_t>(cache_progress.prefix_hashes.size());
     const std::int32_t filled_prefix_pages = num_computed_tokens / prefix_granularity;
     if (filled_prefix_pages > first_new_prefix_page) {
@@ -908,7 +916,8 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
         *request, cache_progress, request->NumComputedTokens(), coordinator_.PrefixGranularity(),
         config_.StreamsDeviceCacheToHost(),
         ends_at_junction || ends_at_state_checkpoint ? PublicationPoint::kStateCheckpoint : PublicationPoint::kChunk,
-        /*allow_state_checkpoint=*/true, /*preserve_source_blocks=*/config_.role == Role::kP);
+        /*allow_state_checkpoint=*/true, /*preserve_source_blocks=*/config_.role == Role::kP,
+        /*publish_to_cache=*/config_.PublishesCompletedPages());
 
     std::vector<BlockTable>& tables = request->BlockTablesRef();
     // A chunk reads the state its predecessor wrote (slot 1 -> slot 0) and
@@ -1019,8 +1028,11 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
     const StateStep state_step{prompt_end                                 ? StateStep::Kind::kRotate
                                : first_decode && config_.role == Role::kD ? StateStep::Kind::kKeep
                                                                           : StateStep::Kind::kRelease};
-    const bool completed_page = num_computed_tokens / coordinator_.PrefixGranularity() >
-                                static_cast<std::int32_t>(cache_progress.prefix_hashes.size());
+    // Without publication the chain never grows, so no page completes a
+    // publication point.
+    const bool completed_page =
+        config_.PublishesCompletedPages() && num_computed_tokens / coordinator_.PrefixGranularity() >
+                                                 static_cast<std::int32_t>(cache_progress.prefix_hashes.size());
     const bool completed_checkpoint =
         cache_progress.state_checkpoint_tokens > 0 && num_computed_tokens >= cache_progress.state_checkpoint_tokens;
     // Between publication points, consuming an existing reserve cannot fail
@@ -1035,13 +1047,15 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
         return fsm::ScheduleDecodeEvent{config_.decode_input_tokens};
     }
 
+    ++decode_admissions_;
     StagedCacheProgress staged{cache_progress};
     const RequestProgress progress =
         AdvanceRequestProgress(*request, cache_progress, num_computed_tokens, coordinator_.PrefixGranularity(),
                                config_.StreamsDeviceCacheToHost() && first_decode,
                                prompt_end ? PublicationPoint::kOwnerContinues : PublicationPoint::kChunk,
                                /*allow_state_checkpoint=*/coordinator_.CheckpointGranularity() == 1 || prompt_end,
-                               /*preserve_source_blocks=*/config_.role == Role::kP);
+                               /*preserve_source_blocks=*/config_.role == Role::kP,
+                               /*publish_to_cache=*/config_.PublishesCompletedPages());
 
     std::vector<GroupDemand> demands =
         MakeGroupDemands(tables, config_.cache_groups, GroupDemand{.extent = DenseGrowth{reserve_tokens}}, state_step);
@@ -1227,12 +1241,15 @@ Scheduler::VictimChoice Scheduler::chooseVictim(std::span<Request* const> candid
 void Scheduler::publishCompletedPrefix(Request& victim) {
     fsm::CacheProgress cache_progress = victim.CacheProgress();
     const std::int32_t num_computed_tokens = victim.NumComputedTokens();
+    // Even without SchedulerConfig::PublishesCompletedPages: with a Host cache
+    // the image's L2 leg is built from this publication. A request that
+    // published nothing so far is hashed here in full.
     RequestProgress progress =
         AdvanceRequestProgress(victim, cache_progress, num_computed_tokens, coordinator_.PrefixGranularity(),
                                /*stream_completed_to_host=*/false, PublicationPoint::kFinal,
                                /*allow_state_checkpoint=*/coordinator_.CheckpointGranularity() == 1 ||
                                    (config_.role != Role::kD && num_computed_tokens <= victim.PrefillSize()),
-                               /*preserve_source_blocks=*/false);
+                               /*preserve_source_blocks=*/false, /*publish_to_cache=*/true);
     if (progress.completed_pages) {
         // A publication is a KV-event mutation: its pages from
         // CacheCoordinator::FirstPublishedPage (the newly hashed decode pages
@@ -1314,7 +1331,8 @@ std::optional<ImageShortfall> Scheduler::imageShortfall(const Request& request) 
                                /*stream_completed_to_host=*/false, PublicationPoint::kFinal,
                                /*allow_state_checkpoint=*/coordinator_.CheckpointGranularity() == 1 ||
                                    (config_.role != Role::kD && num_computed_tokens <= request.PrefillSize()),
-                               /*preserve_source_blocks=*/false);
+                               /*preserve_source_blocks=*/false,
+                               /*publish_to_cache=*/true);  // as publishCompletedPrefix does
     return tier_transfers_
         .SplitRetractionImage(
             request.BlockTablesRef(), num_computed_tokens,

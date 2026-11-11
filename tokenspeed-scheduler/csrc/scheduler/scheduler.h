@@ -792,6 +792,9 @@ private:
     std::optional<CheckpointLineage> checkpoint_lineage_;
     // DemotedCheckpointEntries.
     std::uint64_t demoted_checkpoint_entries_{0};
+    // Decode steps that ran a coordinator admission instead of consuming
+    // their reserve in place (scheduleDecode). Read by tests only.
+    std::uint64_t decode_admissions_{0};
 };
 
 }  // namespace tokenspeed
