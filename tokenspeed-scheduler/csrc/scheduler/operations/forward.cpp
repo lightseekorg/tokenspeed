@@ -614,6 +614,7 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
                                                                   std::int32_t decode_input_tokens,
                                                                   std::int64_t kv_token_limit,
                                                                   std::int32_t yield_tokens, bool must_complete) {
+    ProfileSpan profile_span{"Scheduler::schedulePrefillFirstChunk"};
     // No admission is possible while slots are full. L3 preparation runs
     // independently before forward scheduling and needs no request slot.
     if (req_pool_allocator_.AvailableSlots() == 0) {
@@ -880,6 +881,7 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
 std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     ExecutionPlan& plan, AdmissionFeedback& feedback, Request* request, std::int32_t remaining,
     std::int32_t reserve_num_tokens_in_next_schedule_event, std::int64_t kv_token_limit, std::int32_t yield_tokens) {
+    ProfileSpan profile_span{"Scheduler::schedulePrefill"};
     const std::int32_t unscheduled = request->UnscheduledPrefillSize();
     const std::int32_t first_pos = request->PrefillSize() - unscheduled;
     // As for a first chunk: a chunk that cannot finish gives way to the
@@ -1183,6 +1185,7 @@ std::optional<PrefillOperation> Scheduler::schedulePrefillCandidate(ExecutionPla
 // caller decides which residents to offer (maybeRetractForCapacity offers
 // none its own round has dispatched work for).
 Scheduler::VictimChoice Scheduler::chooseVictim(std::span<Request* const> candidates, bool ignore_exemption) const {
+    ProfileSpan profile_span{"Scheduler::chooseVictim"};
     const auto retractable = [ignore_exemption](const Request& request) {
         return request.IsAnyOf<fsm::Prefilling, fsm::PrefillDone, fsm::Decoding>() &&
                (ignore_exemption || !request.ReserveCoversGeneration(kRetractionSafeSteps));
@@ -1361,6 +1364,7 @@ std::optional<ImageShortfall> Scheduler::imageShortfall(const Request& request) 
 // writes in place).
 std::optional<ImageShortfall> Scheduler::retractVictim(Request& victim, PlanBuild& build,
                                                        std::vector<WriteBackOperation>& write_back_operations) {
+    ProfileSpan profile_span{"Scheduler::retractVictim"};
     if (snapshot_slots_.AvailableSlots() == 0) {
         return ImageShortfall::kBlobSlot;
     }
@@ -2002,6 +2006,7 @@ std::vector<Scheduler::WholePrompt> Scheduler::carriedPrompts(std::span<const Wh
 
 void Scheduler::carryWholePrompts(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                                   std::span<const WholePrompt> carried, std::int32_t decode_reserve) {
+    ProfileSpan profile_span{"Scheduler::carryWholePrompts"};
     _assert(!build.operations.empty(), "the holder's row is pushed before the prompts it carries");
     const auto holder_row = static_cast<std::ptrdiff_t>(build.operations.size()) - 1;
     for (const WholePrompt& prompt : carried) {
@@ -2225,6 +2230,7 @@ void Scheduler::scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& buil
 // restored.
 void Scheduler::buildPrefillWorkerPlan(AdmissionFeedback& feedback, PlanBuild& build,
                                        std::span<Request* const> candidates) {
+    ProfileSpan profile_span{"Scheduler::buildPrefillWorkerPlan"};
     // The prompt decodes on the peer node: its KV goes out on the plan's own
     // stream, occupying no token budget and no batch slot. A prompt still
     // waiting for its final chunk's result is in PrefillAwaitingResult, not
@@ -2253,6 +2259,7 @@ void Scheduler::buildPrefillWorkerPlan(AdmissionFeedback& feedback, PlanBuild& b
 void Scheduler::buildDecodeWorkerPlan(AdmissionFeedback& feedback, PlanBuild& build,
                                       std::span<Request* const> candidates,
                                       std::vector<WriteBackOperation>& write_back_operations) {
+    ProfileSpan profile_span{"Scheduler::buildDecodeWorkerPlan"};
     maybeForceRetraction(build, candidates, write_back_operations);
 
     // Phase 1: the one readmission this round may restore. It resumes a
@@ -2323,6 +2330,7 @@ void Scheduler::buildDecodeWorkerPlan(AdmissionFeedback& feedback, PlanBuild& bu
 // none were owed.
 void Scheduler::buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                                std::vector<WriteBackOperation>& write_back_operations) {
+    ProfileSpan profile_span{"Scheduler::buildFusedPlan"};
     maybeForceRetraction(build, candidates, write_back_operations);
 
     const bool new_prompts_sealed = scheduleReadmission(feedback, build, candidates);

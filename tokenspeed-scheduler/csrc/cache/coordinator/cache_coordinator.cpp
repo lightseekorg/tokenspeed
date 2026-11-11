@@ -1176,10 +1176,12 @@ CacheCoordinator::PrefixProbe CacheCoordinator::probePrefixWithOrder(const Promp
 }
 
 PreparedPrefixKeys CacheCoordinator::PreparePrefixKeys(std::span<const std::string> content_hashes) const {
+    ProfileSpan profile_span{"CacheCoordinator::PreparePrefixKeys"};
     return std::make_shared<const std::vector<std::vector<CacheKey>>>(buildGroupKeys(content_hashes));
 }
 
 CacheCoordinator::PrefixProbe CacheCoordinator::ProbePromptPrefix(const PromptPrefix& prompt) const {
+    ProfileSpan profile_span{"CacheCoordinator::ProbePromptPrefix"};
     return probePrefixWithOrder(prompt, match_order_, /*claim_partial=*/true);
 }
 
@@ -1281,6 +1283,7 @@ CacheCoordinator::PrefixProbe CacheCoordinator::ProbePrefix(std::span<const std:
 
 CacheCoordinator::PrefixProbe CacheCoordinator::ProbeDecodeDevicePrefix(const PromptPrefix& prompt,
                                                                         std::int32_t prompt_end_tokens) const {
+    ProfileSpan profile_span{"CacheCoordinator::ProbeDecodeDevicePrefix"};
     _assert(prompt.tokens.empty() || prompt_end_tokens <= static_cast<std::int32_t>(prompt.tokens.size()),
             "the prompt end lies inside the supplied tokens");
     std::vector<std::size_t> history_match_order;
@@ -1337,6 +1340,7 @@ CacheCoordinator::PrefixProbe CacheCoordinator::ProbeDecodeDevicePrefix(const Pr
 }
 
 CacheCoordinator::AcquiredPrefix CacheCoordinator::acquirePrefix(PrefixProbe&& probe, std::uint64_t access_epoch) {
+    ProfileSpan profile_span{"CacheCoordinator::acquirePrefix"};
     AcquiredPrefix out;
     // The Host floor is the Device's full-page coverage: the Host's KV pages
     // start there (a Device KV tail means the Host holds none, only State

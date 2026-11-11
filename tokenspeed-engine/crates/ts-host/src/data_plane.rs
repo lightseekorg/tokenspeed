@@ -623,6 +623,7 @@ fn forward_loop(
             // The wait for the GIL, which the control thread's completion
             // queries hold.
             profile::record(
+                profile::HOST,
                 "forward_loop::acquire_gil".into(),
                 received_ns,
                 profile::now_ns(),
@@ -1018,11 +1019,12 @@ mod tests {
                 host_spans.call_method0("stop").unwrap().extract().unwrap();
             drop(profile::span("after_stop"));
             // Other tests share the process: find this test's spans by name.
-            let (_, tid, begin_ns, end_ns) = spans
+            let (_, category, tid, begin_ns, end_ns) = spans
                 .iter()
                 .find(|(name, ..)| name == "recorded")
                 .expect("the span recorded between start and stop")
                 .clone();
+            assert_eq!(category, profile::HOST);
             assert!(0 < begin_ns && begin_ns <= end_ns);
             assert!(threads.iter().any(|(thread, _)| *thread == tid));
             assert!(!profile::recording());

@@ -35,7 +35,9 @@ profile.
 A torch profile also records the host's spans (``ts_scheduler::profile``):
 the event loop's phases and the C++ scheduler's on the control thread, and
 the forward thread's operations, which run no torch op the profiler could
-see. They are merged into the exported trace, on their threads' lanes.
+see. They are merged into the exported trace, on their threads' lanes, the
+C++ scheduler's under the ``scheduler`` category and the rest under
+``host``.
 """
 
 from __future__ import annotations
@@ -104,8 +106,8 @@ def _export_with_host_spans(
     Args:
         torch_profiler: A stopped ``torch.profiler.profile``.
         path: The trace file to write.
-        spans: ``(name, tid, begin_ns, end_ns)`` per span, in nanoseconds of
-            Unix time.
+        spans: ``(name, category, tid, begin_ns, end_ns)`` per span, with
+            times in nanoseconds of Unix time.
         threads: ``(tid, name)`` per thread that recorded spans.
         pid: This process's id, the pid of the trace's CPU events.
     """
@@ -124,19 +126,19 @@ def _export_with_host_spans(
             events = [
                 {
                     "ph": "X",
-                    "cat": "host",
+                    "cat": category,
                     "name": name,
                     "pid": pid,
                     "tid": tid,
                     "ts": (begin_ns - base_ns) / 1000,
                     "dur": (end_ns - begin_ns) / 1000,
                 }
-                for name, tid, begin_ns, end_ns in spans
+                for name, category, tid, begin_ns, end_ns in spans
             ]
             # Named as torch names the threads it saw (by the kernel's thread
             # name); the control thread runs no torch op, so only this names
             # its lane.
-            recorded = {tid for _, tid, _, _ in spans}
+            recorded = {tid for _, _, tid, _, _ in spans}
             events += [
                 {
                     "ph": "M",

@@ -25,8 +25,8 @@
 use pyo3::prelude::*;
 use ts_scheduler::profile;
 
-/// A span as Python receives it: `(name, tid, begin_ns, end_ns)`.
-pub(crate) type PySpan = (String, u64, i64, i64);
+/// A span as Python receives it: `(name, category, tid, begin_ns, end_ns)`.
+pub(crate) type PySpan = (String, String, u64, i64, i64);
 
 /// Starts and stops the host's span recording.
 #[pyclass(frozen, name = "HostSpans")]
@@ -39,15 +39,23 @@ impl HostSpans {
         profile::start();
     }
 
-    /// Stop the recording. Returns its spans, as `(name, tid, begin_ns,
-    /// end_ns)` in nanoseconds of Unix time, and the threads that recorded,
-    /// as `(tid, name)`.
+    /// Stop the recording. Returns its spans, as `(name, category, tid,
+    /// begin_ns, end_ns)` with times in nanoseconds of Unix time, and the
+    /// threads that recorded, as `(tid, name)`.
     fn stop(&self) -> (Vec<PySpan>, Vec<(u64, String)>) {
         let recording = profile::stop();
         let spans = recording
             .spans
             .into_iter()
-            .map(|span| (span.name.into_owned(), span.tid, span.begin_ns, span.end_ns))
+            .map(|span| {
+                (
+                    span.name.into_owned(),
+                    span.category.to_owned(),
+                    span.tid,
+                    span.begin_ns,
+                    span.end_ns,
+                )
+            })
             .collect();
         (spans, recording.threads)
     }

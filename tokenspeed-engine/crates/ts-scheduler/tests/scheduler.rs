@@ -341,22 +341,39 @@ fn a_recording_sees_the_schedulers_phases_inside_its_calls() {
             .find(|span| span.name == name)
             .unwrap_or_else(|| panic!("no {name} span in {spans:#?}"))
     };
+    let within = |inner: &profile::Span, outer: &profile::Span| {
+        outer.begin_ns <= inner.begin_ns && inner.end_ns <= outer.end_ns
+    };
+    // The control thread's call, and inside it the C++ scheduler's own spans
+    // under their category.
     let plan = named("Scheduler::next_execution_plan");
+    assert_eq!(plan.category, profile::HOST);
+    let planned = named("Scheduler::NextExecutionPlan");
+    assert!(within(planned, plan), "{planned:?} outside {plan:?}");
     for phase in [
+        "Scheduler::NextExecutionPlan",
         "Scheduler::buildForwardOperations",
+        "Scheduler::buildFusedPlan",
+        "Scheduler::scheduleLocalPrefillWork",
+        "Scheduler::schedulePrefillFirstChunk",
         "Scheduler::matchPrefixAtAdmission",
+        "ComputePrefixHashes",
+        "CacheCoordinator::ProbePromptPrefix",
         "CacheCoordinator::Admit",
+        "planAdmission",
+        "AdmissionPlanner::fitWithEviction",
+        "CacheCoordinator::acquirePrefix",
         "CacheCoordinator::CollectDeadEntries",
     ] {
         let phase = named(phase);
-        assert!(
-            plan.begin_ns <= phase.begin_ns && phase.end_ns <= plan.end_ns,
-            "{phase:?} outside {plan:?}"
-        );
+        assert_eq!(phase.category, profile::SCHEDULER, "{phase:?}");
+        assert!(within(phase, planned), "{phase:?} outside {planned:?}");
     }
     let advance = named("Scheduler::advance");
+    assert_eq!(advance.category, profile::HOST);
+    let advanced = named("Scheduler::Advance");
     let settle = named("Scheduler::settleFinishedRequests");
-    assert!(advance.begin_ns <= settle.begin_ns && settle.end_ns <= advance.end_ns);
+    assert!(within(advanced, advance) && within(settle, advanced));
     assert!(recording.threads.iter().any(|(thread, _)| *thread == tid));
 }
 

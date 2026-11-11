@@ -239,6 +239,7 @@ private:
     using VictimCandidate = CacheEvictionCandidates::Candidate;
 
     bool fitWithEviction() {
+        ProfileSpan profile_span{"AdmissionPlanner::fitWithEviction"};
         // Existing local holes plus empty parents are the zero-eviction
         // capacity. Do not discard cache merely to make placement denser: a
         // request's own scattered blocks are gathered by its compaction
@@ -1119,6 +1120,7 @@ std::optional<AdmissionPlan> planAdmission(
     std::optional<std::int32_t> num_computed_tokens, std::optional<std::int32_t> copy_in_point,
     std::span<const PlannedShape> shapes, std::span<const std::pair<std::uint32_t, CacheBlockLocation>> claimed,
     const BoundaryTree& boundary_tree, bool evicts_segments, bool evicts_blocks_past_segments) {
+    ProfileSpan profile_span{"planAdmission"};
     _assert(demands.size() == groups.size(), "demands/groups size mismatch");
 
     std::vector<VictimSet> victims;
@@ -1391,15 +1393,18 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
     // A reclaimable table block may still be pinned by both the request and
     // cache here. Evict what is already free, then slide the request tables and
     // retry the blocks whose request reference has just been released.
-    for (const VictimSet& set : plan.victims) {
-        EvictedSegment* segment = write_back_evictions_ ? &evicted_segments_.emplace_back() : nullptr;
-        for (const auto& [group_id, location, in_stranded_suffix, is_request_reclaim] : set.members) {
-            DeviceEvictionCounts DeviceEvictionStats::*reason =
-                is_request_reclaim   ? &DeviceEvictionStats::request_reclaim
-                : in_stranded_suffix ? &DeviceEvictionStats::stranded_suffix
-                                     : &DeviceEvictionStats::admission;
-            if (!evictCachedBlock(group_id, location, reason, segment)) {
-                prospective_victims.emplace_back(group_id, location, reason, segment);
+    {
+        ProfileSpan evicting{"CacheCoordinator::Admit (evict)"};
+        for (const VictimSet& set : plan.victims) {
+            EvictedSegment* segment = write_back_evictions_ ? &evicted_segments_.emplace_back() : nullptr;
+            for (const auto& [group_id, location, in_stranded_suffix, is_request_reclaim] : set.members) {
+                DeviceEvictionCounts DeviceEvictionStats::*reason =
+                    is_request_reclaim   ? &DeviceEvictionStats::request_reclaim
+                    : in_stranded_suffix ? &DeviceEvictionStats::stranded_suffix
+                                         : &DeviceEvictionStats::admission;
+                if (!evictCachedBlock(group_id, location, reason, segment)) {
+                    prospective_victims.emplace_back(group_id, location, reason, segment);
+                }
             }
         }
     }

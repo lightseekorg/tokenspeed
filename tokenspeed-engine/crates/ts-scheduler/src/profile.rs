@@ -31,6 +31,9 @@
 //! scheduler's spans (`csrc/core/profile_span.h`) enter through its bridge;
 //! `ts-control` and `ts-host` record theirs here too.
 //!
+//! Each span carries the trace category it is filed under: [`SCHEDULER`] for
+//! the C++ scheduler's own, [`HOST`] for the rest.
+//!
 //! Without a recording a span costs one atomic load. A [`hold`] keeps its
 //! thread's spans back until it closes, so a caller can drop them: the event
 //! loop keeps a round's spans only if the round did something, as a loop
@@ -51,6 +54,12 @@ use std::{
 
 use crate::ffi;
 
+/// The category of the C++ scheduler's spans.
+pub const SCHEDULER: &str = "scheduler";
+/// The category of every other span: the event loop, the scheduler calls
+/// as the control thread makes them, the data plane's operations.
+pub const HOST: &str = "host";
+
 static RECORDING: AtomicBool = AtomicBool::new(false);
 static SPANS: Mutex<Vec<Span>> = Mutex::new(Vec::new());
 /// Every thread that recorded a span, with its name, in first-span order.
@@ -67,6 +76,8 @@ thread_local! {
 pub struct Span {
     /// What ran.
     pub name: Cow<'static, str>,
+    /// Its trace category: [`SCHEDULER`] or [`HOST`].
+    pub category: &'static str,
     /// The thread it ran on: the kernel's thread id on Linux, as the torch
     /// trace's `tid`.
     pub tid: u64,
@@ -114,7 +125,7 @@ pub fn now_ns() -> i64 {
         .map_or(0, |since| since.as_nanos() as i64)
 }
 
-/// Record the span `name` from now until the guard drops.
+/// Record the [`HOST`] span `name` from now until the guard drops.
 #[must_use = "the span ends when the guard drops"]
 pub fn span(name: &'static str) -> SpanGuard {
     SpanGuard {
@@ -133,13 +144,13 @@ pub struct SpanGuard {
 impl Drop for SpanGuard {
     fn drop(&mut self) {
         if let Some(begin_ns) = self.begin_ns {
-            record(Cow::Borrowed(self.name), begin_ns, now_ns());
+            record(HOST, Cow::Borrowed(self.name), begin_ns, now_ns());
         }
     }
 }
 
 /// Record a finished span on this thread, if a recording runs.
-pub fn record(name: Cow<'static, str>, begin_ns: i64, end_ns: i64) {
+pub fn record(category: &'static str, name: Cow<'static, str>, begin_ns: i64, end_ns: i64) {
     if !recording() {
         return;
     }
@@ -149,6 +160,7 @@ pub fn record(name: Cow<'static, str>, begin_ns: i64, end_ns: i64) {
     };
     let span = Span {
         name,
+        category,
         tid,
         begin_ns,
         end_ns,
@@ -205,7 +217,10 @@ impl Hold {
         if !std::mem::take(&mut self.open) {
             return Vec::new();
         }
-        HELD.with(|held| held.borrow_mut().take())
+        // A thread past its thread-locals' destruction holds nothing.
+        HELD.try_with(|held| held.borrow_mut().take())
+            .ok()
+            .flatten()
             .unwrap_or_default()
     }
 }
@@ -219,7 +234,7 @@ impl Drop for Hold {
 /// The C++ scheduler's sink (`profile_span.h`), which the bridge installs
 /// while a recording runs.
 pub(crate) fn record_scheduler_span(name: &str, begin_ns: i64, end_ns: i64) {
-    record(Cow::Owned(name.to_owned()), begin_ns, end_ns);
+    record(SCHEDULER, Cow::Owned(name.to_owned()), begin_ns, end_ns);
 }
 
 /// Spans may be recorded while a thread unwinds: take a lock even if
@@ -270,6 +285,7 @@ mod tests {
         assert_eq!(names(&recorded), ["inner", "outer"]);
         let (inner, outer) = (&recorded.spans[0], &recorded.spans[1]);
         assert!(outer.begin_ns <= inner.begin_ns && inner.end_ns <= outer.end_ns);
+        assert!(recorded.spans.iter().all(|span| span.category == HOST));
         assert!(recorded.threads.iter().any(|(tid, _)| *tid == outer.tid));
 
         start();

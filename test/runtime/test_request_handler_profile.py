@@ -140,7 +140,7 @@ class _HostSpans:
 
     def __init__(self) -> None:
         self.recording = False
-        self.spans: list[tuple[str, int, int, int]] = []
+        self.spans: list[tuple[str, str, int, int, int]] = []
         self.threads: list[tuple[int, str]] = []
 
     def start(self) -> None:
@@ -172,7 +172,9 @@ class TestHostSpans:
             begin_ns = time.time_ns()
             with torch.profiler.record_function("forward_canary"):
                 torch.ones(4, device="cpu").add_(2)
-            host_spans.spans.append(("Op::Execute", forward, begin_ns, time.time_ns()))
+            host_spans.spans.append(
+                ("Op::Execute", "host", forward, begin_ns, time.time_ns())
+            )
 
             # One on a thread no torch op runs on, as the control thread.
             def control_round() -> int:
@@ -180,7 +182,18 @@ class TestHostSpans:
                 time.sleep(0.002)
                 tid = threading.get_native_id()
                 host_spans.spans.append(
-                    ("EventLoop::round", tid, begin_ns, time.time_ns())
+                    ("EventLoop::round", "host", tid, begin_ns, time.time_ns())
+                )
+                # A C++ scheduler phase inside the round, under its own
+                # category.
+                host_spans.spans.append(
+                    (
+                        "Scheduler::NextExecutionPlan",
+                        "scheduler",
+                        tid,
+                        begin_ns,
+                        begin_ns,
+                    )
                 )
                 return tid
 
@@ -205,6 +218,8 @@ class TestHostSpans:
         assert canary["ts"] + canary["dur"] <= execute["ts"] + execute["dur"]
         round_ = only("EventLoop::round")
         assert (round_["pid"], round_["tid"]) == (canary["pid"], control)
+        assert (execute["cat"], round_["cat"]) == ("host", "host")
+        assert only("Scheduler::NextExecutionPlan")["cat"] == "scheduler"
         assert round_["dur"] >= 2000
         thread_names = [
             (event["tid"], event["args"]["name"])

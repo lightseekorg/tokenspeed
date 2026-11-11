@@ -18,10 +18,12 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-// Profile spans: the scheduler's phases on a profile's timeline. While a
-// profile runs, the host installs a sink that receives every finished span
-// (ts-host's `/start_profile`, `ts_scheduler::profile`); without one a span
-// costs one atomic load.
+// Profile spans: the scheduler's phases on a profile's timeline, under the
+// trace category `scheduler`. While a profile runs, the host installs a sink
+// that receives every finished span (ts-host's `/start_profile`,
+// `ts_scheduler::profile`); without one a span costs one atomic load. Spans
+// go where the scheduler does work: a phase of planning or of an admission,
+// not every request it passes over.
 
 #pragma once
 

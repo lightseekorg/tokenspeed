@@ -438,7 +438,8 @@ the scheduler calls and their C++ phases (`csrc/core/profile_span.h`), the
 data-plane calls and their waits for the GIL on the control thread, and each
 operation on the forward thread. The profiler merges them into the trace it
 exports, on their threads' lanes, so a forward thread's operation encloses
-the Python it ran. The recording follows the torch profiler's window and
+the Python it ran; the C++ scheduler's spans are under the `scheduler`
+category, the rest under `host`. The recording follows the torch profiler's window and
 costs one atomic load per span outside it. A round that receives nothing,
 hands the data plane nothing, and commits, acknowledges or answers nothing
 leaves no spans: a loop waiting on a transfer spins through such rounds.
