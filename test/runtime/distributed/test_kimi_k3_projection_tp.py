@@ -202,6 +202,8 @@ def test_checkpoint_shards():
 @torch.no_grad()
 def _model_worker(rank, size, rendezvous, fp8_output):
 
+    from tokenspeed_kernel.ops.attention.kda import apply_kda_output_norm
+
     from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
     from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
     from tokenspeed.runtime.distributed.mapping import Mapping
@@ -270,9 +272,11 @@ def _model_worker(rank, size, rendezvous, fp8_output):
     def local_kda(**kwargs):
         # A real attention kernel finishes QKV before the gated consumer's PDL
         # launch. Even one row needs that boundary; contiguous() can be a no-op.
-        return kwargs["mixed_qkv"][:, 2 * proj : 3 * proj].clone(
+        # Like the backend, it applies the layer's output norm when given one.
+        core = kwargs["mixed_qkv"][:, 2 * proj : 3 * proj].clone(
             memory_format=torch.contiguous_format
         )
+        return apply_kda_output_norm(core, kwargs["output_norm"])
 
     comm = SimpleNamespace(pre_attn_comm=lambda value, ctx: value)
     for kind, gated in (("kda", True), ("mla", True), ("mla", False)):

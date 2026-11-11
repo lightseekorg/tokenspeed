@@ -674,10 +674,12 @@ def _muse_tp_owned_forward_worker(
             full = torch.randn(rows, 8192, device=device)
             local = torch.zeros(local_rows, 8192, device=device)
             local[:valid].copy_(full[first : first + valid])
-            expected_rows, _ = moe(full, full.float(), rows, rows, None, project=True)
+            expected_rows, _, _ = moe(
+                full, full.float(), rows, rows, None, project=True
+            )
             expected_rows = expected_rows.clone()
             expected = expected_rows[first : first + valid]
-            actual, _ = moe(local, local.float(), rows, rows, rows, project=True)
+            actual, _, _ = moe(local, local.float(), rows, rows, rows, project=True)
             actual = actual.clone()
             # Post projection borrows the generic producer; retain it before reuse.
             state.all_reduce.producer.data.fill_(torch.nan)
@@ -694,7 +696,7 @@ def _muse_tp_owned_forward_worker(
                     assert (
                         moe._route_and_quantize_inputs(rows_in, router_in) is not None
                     )
-                    decode, _ = moe(rows_in, router_in, small, small, None, True)
+                    decode, _, _ = moe(rows_in, router_in, small, small, None, True)
                     torch.testing.assert_close(
                         decode, expected_rows[:small], atol=2**-7, rtol=2**-7
                     )
