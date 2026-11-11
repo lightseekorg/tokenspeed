@@ -64,7 +64,7 @@ def reference(x, weights):
     )
 
 
-@pytest.mark.parametrize("rows", [2048, 2049, 4096, 8192])
+@pytest.mark.parametrize("rows", [2048, 2049, 4096, 8192, 16385, 32768])
 def test_front_matches_reference_and_replays_changed_inputs(weights, rows):
     torch.manual_seed(147 + rows)
     x = torch.randn(rows, 7168, device="cuda", dtype=torch.bfloat16)
@@ -98,8 +98,8 @@ def test_front_matches_reference_and_replays_changed_inputs(weights, rows):
         torch.testing.assert_close(value, expected, atol=tolerance, rtol=tolerance)
 
 
-@pytest.mark.parametrize("rows", [1, 128, 1024, 2047, 16385])
-def test_front_declines_unvalidated_rows(weights, rows):
+@pytest.mark.parametrize("rows", [1, 128, 1024, 2047])
+def test_front_declines_small_rows(weights, rows):
     x = torch.zeros(rows, 7168, device="cuda", dtype=torch.bfloat16)
     assert (
         try_latent_moe_input_projections(x, *weights, gate_clamp=4.0, up_clamp=25.0)

@@ -190,10 +190,10 @@ if (
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            # The validated rows of the fused front; smaller batches keep the separate
-            # projections (see ops/moe/README.md, "Kimi-K3 front projections").
+            # The fused front pays off from 2048 rows; smaller batches keep the separate
+            # projections (see ops/moe/README.md, "Kimi-K3 front projections"). There is
+            # no upper bound: the plan scales with the row count.
             "tokens_min": frozenset({2048}),
-            "tokens_max": frozenset({kimi3_latent_front.MAX_TOKENS}),
             "gate_clamp": frozenset({4.0}),
             "hidden_size": frozenset({kimi3_latent_front.HIDDEN}),
             "inputs_contiguous": frozenset({True}),

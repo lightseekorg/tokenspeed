@@ -50,6 +50,9 @@ from tokenspeed.runtime.layers.moe.topk import TopKOutputFormat
 from tokenspeed.runtime.layers.moe.utils import All2AllBackend, MoeBackend
 from tokenspeed.runtime.models import kimi_k3
 
+#: Largest row count the test drives through the block.
+MAX_ROWS = 32768
+
 
 class UnloadedExperts(nn.Module):
     """Replace missing expert weights/EP ranks while exercising real dense layers."""
@@ -59,10 +62,10 @@ class UnloadedExperts(nn.Module):
         self.plan = {"weight_dtype": "bf16", "a2a_backend": "none"}
         self.supports_precomputed_topk = True
         self.num_experts = num_experts
-        self.activation = torch.empty(8192, hidden_size, dtype=torch.bfloat16)
-        self.scales = torch.empty(8192, hidden_size // 16, dtype=torch.uint8)
-        self.ids = torch.empty(8192, top_k, dtype=torch.int64)
-        self.weights = torch.empty(8192, top_k, dtype=torch.float32)
+        self.activation = torch.empty(MAX_ROWS, hidden_size, dtype=torch.bfloat16)
+        self.scales = torch.empty(MAX_ROWS, hidden_size // 16, dtype=torch.uint8)
+        self.ids = torch.empty(MAX_ROWS, top_k, dtype=torch.int64)
+        self.weights = torch.empty(MAX_ROWS, top_k, dtype=torch.float32)
 
     def input_buffers(self, tokens, capacity):
         return (
@@ -88,7 +91,7 @@ class UnloadedExperts(nn.Module):
         return (hidden_states.float() * factor).to(hidden_states.dtype)
 
 
-@pytest.mark.parametrize("rows", [64, 2048, 8192])
+@pytest.mark.parametrize("rows", [64, 2048, 8192, 32768])
 def test_attention_dp_front_preserves_routing_and_output(monkeypatch, rows):
     platform = current_platform()
     if not (
@@ -102,7 +105,7 @@ def test_attention_dp_front_preserves_routing_and_output(monkeypatch, rows):
     from tokenspeed_kernel.thirdparty.cute_dsl.mega_moe import runner
 
     monkeypatch.setattr(kimi_k3, "MoELayer", UnloadedExperts)
-    monkeypatch.setattr(runner, "get_runner", lambda plan, experts: experts)
+    monkeypatch.setattr(runner, "get_runner", lambda plan, experts, **kwargs: experts)
     monkeypatch.setattr(kimi_k3, "get_moe_backend", lambda: MoeBackend.MEGA_MOE)
     monkeypatch.setattr(kimi_k3, "get_all2all_backend", lambda: All2AllBackend.NONE)
     monkeypatch.setenv("TOKENSPEED_KIMI_K3_SHARED_EXPERT_TP_SIZE", "1")

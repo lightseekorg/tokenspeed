@@ -31,10 +31,12 @@ sources, so they live here and are compiled through FlashInfer's JIT toolchain
 like ``kimi3_router``.
 
 Scope: the prefill front route of one rank holding the full shared experts
-(``shared_gate_up_weight`` of ``2 * 6144`` rows) for 513 to 16384 rows on
+(``shared_gate_up_weight`` of ``2 * 6144`` rows) for 513 rows or more on
 148- and 152-SM SM100/SM103 parts. Rows of at most 512 would take programs
 that are not vendored (the decode front and the 224-wide tile); the
-sharded-shared-expert (TP8) programs are not vendored either.
+sharded-shared-expert (TP8) programs are not vendored either. There is no
+upper row bound: the row count is a runtime argument, the plan rules scale
+with the tile count, and the programs index rows in 64-bit.
 """
 
 from __future__ import annotations
@@ -55,9 +57,8 @@ SHARED_INTERMEDIATE = 6144
 SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
 #: Physical SM counts the plan rules were validated on: 148 (B200, B300) and 152 (GB200, GB300).
 QUALIFIED_SM_COUNTS = (148, 152)
-#: Row range the vendored programs serve (both bounds inclusive); see the module docstring.
+#: Smallest row count the vendored programs serve; see the module docstring.
 MIN_TOKENS = 513
-MAX_TOKENS = 16384
 
 # Tile geometry of the front GEMM programs.
 BLOCK_M = 128
@@ -194,7 +195,7 @@ def front_plan(M: int, sm_count: int) -> dict[str, Any]:
     """Host plan of the front launch for ``M`` rows on a device of ``sm_count`` SMs.
 
     Args:
-        M: Row count, ``MIN_TOKENS`` to ``MAX_TOKENS``.
+        M: Row count, at least ``MIN_TOKENS``.
         sm_count: SM count of the device, one of ``QUALIFIED_SM_COUNTS``.
 
     Returns:
@@ -202,9 +203,9 @@ def front_plan(M: int, sm_count: int) -> dict[str, Any]:
         ``sk_ipc``, ``sk_max_seg``, ``sk_total``, ``grid``), the split-tile count ``sk_tiles``
         and the weight policy ``evict_first``.
     """
-    if not MIN_TOKENS <= int(M) <= MAX_TOKENS:
+    if int(M) < MIN_TOKENS:
         raise ValueError(
-            f"the vendored Kimi-K3 front programs serve {MIN_TOKENS} to {MAX_TOKENS} rows, got {M}"
+            f"the vendored Kimi-K3 front programs serve at least {MIN_TOKENS} rows, got {M}"
         )
     if int(sm_count) not in QUALIFIED_SM_COUNTS:
         raise ValueError(
@@ -567,7 +568,7 @@ def prepare_front(
     """Validate the operands, plan the launch and bind it into a reusable runner.
 
     Args:
-        x: Contiguous BF16 input ``[rows, 7168]``, 513 to 16384 rows.
+        x: Contiguous BF16 input ``[rows, 7168]``, at least 513 rows.
         router_weight: Contiguous BF16 router weight ``[896, 7168]``.
         routed_weight: Contiguous BF16 latent projection ``[3584, 7168]``.
         shared_gate_up_weight: Contiguous BF16 shared gate rows followed by up rows

@@ -101,6 +101,38 @@ from tokenspeed_kernel.thirdparty.cuda import kimi3_latent_front as front
                 grid=4224,
             ),
         ),
+        # Above 16384 rows the same rules apply: 16385 rows round up to 130 tiles (65 pair
+        # rows), and 32768 rows are 256 tiles; both are whole plans without evict_first.
+        (
+            16385,
+            152,
+            dict(
+                m_tiles=130,
+                num_items=4290,
+                full_items=4290,
+                sk_ipc=112,
+                sk_max_seg=1,
+                sk_total=0,
+                sk_tiles=0,
+                evict_first=False,
+                grid=8580,
+            ),
+        ),
+        (
+            32768,
+            152,
+            dict(
+                m_tiles=256,
+                num_items=8448,
+                full_items=8448,
+                sk_ipc=112,
+                sk_max_seg=1,
+                sk_total=0,
+                sk_tiles=0,
+                evict_first=False,
+                grid=16896,
+            ),
+        ),
     ],
 )
 def test_front_plan_matches_flashinfer_rules(rows, sm_count, expected):
@@ -121,9 +153,9 @@ def test_front_plan_is_a_private_copy():
     assert front.front_plan(4096, 152)["grid"] == 32 * 66
 
 
-@pytest.mark.parametrize("rows", [0, 1, 128, 512, 16385])
-def test_front_plan_refuses_rows_outside_the_vendored_programs(rows):
-    with pytest.raises(ValueError, match="513 to 16384 rows"):
+@pytest.mark.parametrize("rows", [0, 1, 128, 512])
+def test_front_plan_refuses_rows_below_the_vendored_programs(rows):
+    with pytest.raises(ValueError, match="at least 513 rows"):
         front.front_plan(rows, 152)
 
 

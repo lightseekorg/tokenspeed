@@ -474,8 +474,9 @@ implementation is available.
 (`thirdparty/cuda/kimi3_latent_front.py` and `csrc/kimi3_latent_front/`): one
 persistent launch produces the FP32 router logits, the BF16 latent input and
 the BF16 SiTU-activated shared-expert input. It is registered on SM103 with 152
-SMs for 2048-16384 BF16 rows, Kimi-K3's replicated router/latent weights, full
-shared-expert weights, and SiTU clamps 4 and 25. Attention-DP uses it only
+SMs for 2048 BF16 rows or more (no upper bound: the plan scales with the row
+count), Kimi-K3's replicated router/latent weights, full shared-expert weights,
+and SiTU clamps 4 and 25. Attention-DP uses it only
 without shared-expert TP; EP routing/quantization and the shared down projection
 keep their existing owners. Smaller shapes and shared-expert TP retain their
 existing paths.
