@@ -397,6 +397,8 @@ def _block_runtime():
     drafter.token_to_kv_pool = None  # No model/cache-storage operation is reached.
     drafter.round_block_tables = None
     drafter.embed_tokens = _stop_before_weights
+    # wire_target's choice for a one-rank layout: the lookup is the input.
+    drafter._first_layer_input = "full"
     runner = ForwardStepRunner.__new__(ForwardStepRunner)
     runner.attn_backend, runner.draft_attn_backend = routers
     runner.drafter = drafter

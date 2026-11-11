@@ -805,7 +805,9 @@ def test_eagle_tree_drafting_ranks_full_vocab_logits():
 @pytest.mark.parametrize("drafter_class", [DFlash, DSpark])
 def test_block_drafter_wire_target_only_binds_resources(drafter_class):
     drafter = drafter_class.__new__(drafter_class)
-    drafter.model = SimpleNamespace()
+    # A one-rank layout: the draft's first layer reduces nothing, so the
+    # drafter's embedding lookup is left as bound.
+    drafter.model = SimpleNamespace(mapping=_mapping())
     embedding, head = object(), object()
     # wire_target asks the processor whether the target's head is vocab-sharded
     # over attention-DP ranks (DFlash replicates it for drafting only then);
@@ -833,7 +835,7 @@ def test_block_drafter_wire_target_only_binds_resources(drafter_class):
 def test_block_drafter_binds_local_embedding_on_last_pipeline_stage():
     drafter = DSpark.__new__(DSpark)
     embedding = object()
-    drafter.model = SimpleNamespace(embed_tokens=embedding)
+    drafter.model = SimpleNamespace(embed_tokens=embedding, mapping=_mapping())
     target = SimpleNamespace(
         get_input_embeddings=lambda: None,
         lm_head=object(),
@@ -1150,7 +1152,7 @@ def test_k3_setup_capture_survives_resource_binding(monkeypatch, has_pp):
     draft.projection_width = 8
     # Only a pipeline splits the taps across stages; off the pipeline the
     # drafter keeps projecting and writing the context itself.
-    draft.mapping = SimpleNamespace(has_pp=has_pp)
+    draft.mapping = _mapping(has_pp=has_pp)
     validation = mock.Mock()
     monkeypatch.setattr(kimi_k3_dspark, "validate_k3_dspark_config", validation)
     target = SimpleNamespace(
