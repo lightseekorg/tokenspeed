@@ -107,8 +107,8 @@ and retain their checkpoint quantization policy.
 GDN splits its input into an FP8 QKVZ GEMM and a floating BA GEMM. Any split
 QKVZ/BA projection uses BA overlap when an auxiliary stream is available,
 regardless of quantization format. The streams join before the attention boundary.
-The standard FP8 exclusions cover BA, convolution, Mamba mixer projections,
-grouped `wo_a` and explicit checkpoint exclusions.
+The standard FP8 exclusions cover BA, convolution, and Mamba mixer
+projections. Explicit checkpoint exclusions also apply.
 With the switch off, floating GDN checkpoint projections stay floating even
 with a global online FP8 config. Serialized GDN projections use the
 checkpoint config.

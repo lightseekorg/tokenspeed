@@ -340,9 +340,9 @@ def deepgemm_mm_fp8_blockscale(
         raise ValueError("DeepGEMM requires contiguous 2D A[M,K] and B[N,K]")
     m, k = A.shape
     n, kb = B.shape
-    if m < 0 or n < 1 or k < 1 or k != kb or n % 64 or k % 128:
+    if n < 1 or k < 1 or k != kb or n % 64 or k % 128:
         raise ValueError(
-            "DeepGEMM requires positive dimensions, matching K, N%64=0 and K%128=0"
+            "DeepGEMM requires positive N and K, matching K, N%64=0 and K%128=0"
         )
     if not A.is_cuda or B.device != A.device:
         raise ValueError("DeepGEMM operands must share a CUDA device")
