@@ -248,6 +248,7 @@ class MLAAttnBackend(PagedAttentionBackend):
         self._query_block_decode: dict[tuple[int, int, bool], bool] = {}
         self._block_page_table_buf: torch.Tensor | None = None
         self._block_seq_lens_buf: torch.Tensor | None = None
+        self._block_causal_backoff: torch.Tensor | None = None
 
         self.kvp_group = tuple(config.kvp_group)
         self.kvp_rank = config.kvp_rank
@@ -444,6 +445,7 @@ class MLAAttnBackend(PagedAttentionBackend):
         self.chunked_prefill_metadata = None
         self._block_page_table_buf = None
         self._block_seq_lens_buf = None
+        self._block_causal_backoff = None
         self.kvp_block_granularity = None
         self.kvp_virtual_block_count = None
         self.dcp_metadata = None
@@ -788,10 +790,11 @@ class MLAAttnBackend(PagedAttentionBackend):
                 page_table = metadata.block_page_table
                 cache_seqlens = metadata.block_seq_lens
             else:
-                # One metadata row per block position already, each at the
-                # block-end length, so the causal offsets below would re-impose
-                # the ordering the draft must not have. No extend offset
-                # either: refresh_decode_metadata expanded rows [0, bs), which
+                # One metadata row per block position already: each at the
+                # block-end length for a non-causal draft, or backed off to its
+                # own position for a causal one. Either way the ordering is
+                # baked in, so the causal offsets below would apply it twice.
+                # No extend offset either: refresh_decode_metadata expanded rows [0, bs), which
                 # is exactly what this query covers.
                 query = q.view(-1, layer.tp_q_head_num, layer.head_dim).unsqueeze(1)
                 page_table = metadata.page_table
