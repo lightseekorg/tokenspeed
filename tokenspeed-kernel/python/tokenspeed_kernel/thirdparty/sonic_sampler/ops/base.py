@@ -150,14 +150,14 @@ def log_softmax(logits, maximum):
 
 
 @jit
-def nucleus_masking(p_ptr, batch_id, logits, maximum, max_k: tl.constexpr):
+def nucleus_masking(p_ptr, batch_id, logits, maximum, total, max_k: tl.constexpr):
 
     scores = fast_expf(logits.to(tl.float32) - maximum)
     ladder = tl.cumsum(scores, axis=0)
 
-    scale = tl.gather(
-        ladder, tl.full((1,), max_k - 1, dtype=tl.int32), axis=0
-    ) * tl.load(p_ptr + batch_id).to(tl.float32)
+    # The whole softmax's mass where the row passes it (it holds the candidates'), else the candidates'.
+    mass = tl.gather(ladder, tl.full((1,), max_k - 1, dtype=tl.int32), axis=0)
+    scale = tl.maximum(mass, total) * tl.load(p_ptr + batch_id).to(tl.float32)
 
     # Keep each token the mass ranked above it leaves short of p, so the one crossing p too.
     return ladder - scores < scale
@@ -180,7 +180,9 @@ def cumulative_masking(
     maximum,
     offsets,
     max_k: tl.constexpr,
+    total=0.0,
 ):
+    """Mask a row's candidates to its top-k, then its top-p nucleus and its min-p floor; ``total`` is the row's exp-sum below ``maximum`` over its whole vocabulary for a nucleus over the whole softmax, else zero."""
 
     minima: tl.constexpr = -float("inf")
 
@@ -191,9 +193,9 @@ def cumulative_masking(
 
     if (indicator & 0x100) > 0:
 
-        nucleus_mask = nucleus_masking(p_ptr, batch_id, values, maximum, max_k) | (
-            offsets == 0
-        )
+        nucleus_mask = nucleus_masking(
+            p_ptr, batch_id, values, maximum, total, max_k
+        ) | (offsets == 0)
 
         values = tl.where(nucleus_mask, values, minima)
 

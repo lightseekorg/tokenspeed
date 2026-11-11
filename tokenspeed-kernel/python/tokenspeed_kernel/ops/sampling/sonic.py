@@ -160,8 +160,15 @@ def configs(vocab_size: int) -> tuple[SonicConfig, ...]:
 
 
 def scratchpad_columns(vocab_size: int) -> int:
-    """Scratchpad columns one logits row needs: the narrowest picked tile's blocks, ``MAX_K`` keys each."""
-    return triton.cdiv(vocab_size, min(c.block_n for c in configs(vocab_size))) * MAX_K
+    """Scratchpad columns one logits row needs: the narrowest picked tile's blocks, ``MAX_K`` keys and a maximum and exp-sum each."""
+    return triton.cdiv(vocab_size, min(c.block_n for c in configs(vocab_size))) * (
+        MAX_K + 2
+    )
+
+
+def pairs_width(draft_probs: bool) -> int:
+    """Columns of a row's shard candidate pairs: values, token ids, the draft probabilities with ``draft_probs``, then the shard's maximum and exp-sum."""
+    return (3 if draft_probs else 2) * MAX_K + 2
 
 
 @dataclass(frozen=True)
@@ -272,7 +279,7 @@ class VocabShard:
     softcap: float | None  # The processor's final logit softcap, or None.
     # This rank's contiguous [rows, w] pairs to every rank's [W, rows, w], W a power of two.
     gather: Callable[[Tensor], Tensor]
-    # Contiguous fp32 scratch of >= rows * 3 * MAX_K: this rank's candidates, w = 2 * MAX_K wide (3 * MAX_K with shard-local draft probabilities).
+    # Contiguous fp32 scratch of >= rows * pairs_width(True): this rank's candidates, w = pairs_width(shard-local draft probabilities) wide.
     pairs: Tensor
 
 
@@ -294,7 +301,7 @@ def _reduce(
     enable_pdl: bool,
     shard: VocabShard | None,
 ) -> None:
-    """The first stage: each block's keys (greedy maximum, or best perturbed value of a whole-vocabulary row) in ``scratchpad``; ``drafted`` is None for one row per request."""
+    """The first stage: each block's keys (greedy maximum, or best perturbed value of a whole-vocabulary row) in ``scratchpad``, and past them a top-p row's block maximum and exp-sum; ``drafted`` is None for one row per request."""
     exact = _exact(logits)
     rows, vocab_size = logits.shape
     blocks = triton.cdiv(vocab_size, config.block_n)
@@ -351,7 +358,7 @@ def _reduce(
         whole=True,
         num_warps=config.first_warps,
     )
-    # The whole-vocabulary rows, a few programs per row walking consecutive blocks.
+    # The whole-vocabulary rows and the top-p rows' normalizers, a few programs per row walking consecutive blocks.
     group_blocks = triton.cdiv(
         blocks, min(blocks, triton.cdiv(_whole_programs(logits.device), rows))
     )
@@ -378,6 +385,7 @@ def _reduce(
         batch_size,
         blocks,
         group_blocks,
+        MAX_K,
         False,
         not singular,
         True,
@@ -431,15 +439,17 @@ def shard_candidates(
             recorded over its shard's columns, for a verify launch, or None.
 
     Returns:
-        Contiguous ``[rows, 2 * MAX_K]`` fp32 view of ``shard.pairs``: each
-        row's candidate values in descending order (bf16 values for bf16
-        logits, fp32 for fp32), the lower token id first among equal values,
-        then their global token ids as exact fp32 integers; a greedy row keeps
-        only its first maximum, the rest -inf, and a row drawing from its
-        whole vocabulary its best perturbed value (``merged_whole`` reads
-        it). With ``draft_probs``,
-        ``[rows, 3 * MAX_K]``: then the probability the row's draft recorded
-        at each candidate (zero on greedy rows and on each request's last row).
+        Contiguous ``[rows, pairs_width(draft_probs is not None)]`` fp32 view
+        of ``shard.pairs``: each row's candidate values in descending order
+        (bf16 values for bf16 logits, fp32 for fp32), the lower token id first
+        among equal values, then their global token ids as exact fp32
+        integers; a greedy row keeps only its first maximum, the rest -inf,
+        and a row drawing from its whole vocabulary its best perturbed value
+        (``merged_whole`` reads it). With ``draft_probs``, then the
+        probability the row's draft recorded at each candidate (zero on greedy
+        rows and on each request's last row). Then a row with top-p and no
+        top-k carries the shard's maximum value and its exp-sum below it, for
+        a nucleus over the whole softmax.
 
     Raises:
         ValueError: The logits are neither bf16 nor fp32, or a row offset
@@ -453,7 +463,7 @@ def shard_candidates(
     rows, vocab_size = logits.shape
     blocks = triton.cdiv(vocab_size, config.block_n)
     block_v = next_power_of_2(blocks)
-    width = (2 if draft_probs is None else 3) * MAX_K
+    width = pairs_width(draft_probs is not None)
     pairs = shard.pairs.view(-1)[: rows * width].view(rows, width)
     if drafted is None:
         gamma, block_g, stride_g = 0, None, state.grammar.stride(0)
@@ -884,6 +894,7 @@ __all__ = [
     "SonicConfig",
     "VocabShard",
     "configs",
+    "pairs_width",
     "pick",
     "sample",
     "scratchpad_columns",

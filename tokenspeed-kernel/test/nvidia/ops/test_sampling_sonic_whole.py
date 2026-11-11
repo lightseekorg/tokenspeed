@@ -41,6 +41,7 @@ from tokenspeed_kernel.ops.sampling.sonic import (
     SlotState,
     VocabShard,
     configs,
+    pairs_width,
     pick,
     scratchpad_columns,
 )
@@ -192,7 +193,7 @@ def test_a_shard_starting_off_a_multiple_of_four_draws_the_whole_rows_token(dtyp
     state = _state(1, dtype)
     expected = _sample(logits, state, slots, offsets, pick(VOCAB, ROWS))
     shards = [logits[:, :split].contiguous(), logits[:, split:].contiguous()]
-    landing = torch.empty((2, ROWS, 2 * MAX_K), device="cuda")
+    landing = torch.empty((2, ROWS, pairs_width(False)), device="cuda")
 
     def gather(pairs: torch.Tensor) -> torch.Tensor:
         """The second rank's candidates beside the first's, as the ranks' all-gather leaves them."""

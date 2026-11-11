@@ -679,6 +679,161 @@ def whole_normalizer(
 
 
 @jit
+def nucleus_row(indicator):
+    """Whether a row's top-p nucleus is taken over its whole softmax: a top-p bit without a top-k bit (a top-k row's nucleus is over its top-k)."""
+
+    return (indicator & 0x180) == 0x100
+
+
+@jit
+def nucleus_blocks(
+    x_ptr,
+    y_ptr,
+    m_ptr,
+    g_ptr,
+    c_ptr,
+    d_ptr,
+    t_ptr,
+    r_ptr,
+    f_ptr,
+    p_ptr,
+    b_ptr,
+    e_ptr,
+    indicator,
+    row_id,
+    first,
+    last,
+    blocks,
+    batch_id,
+    step_id,
+    margin,
+    timesteps,
+    vocab_size: tl.constexpr,
+    shard_offset: tl.constexpr,
+    lookahead: tl.constexpr,
+    indirection: tl.constexpr,
+    tokens: tl.constexpr,
+    singular: tl.constexpr,
+    stride_x: tl.constexpr,
+    stride_g: tl.constexpr,
+    stride_c: tl.constexpr,
+    stride_t: tl.constexpr,
+    stride_y: tl.constexpr,
+    max_k: tl.constexpr,
+    block_n: tl.constexpr,
+    block_t: tl.constexpr,
+    value_dtype: tl.constexpr,
+    logit_scale,
+    softcap,
+):
+    """Store each of blocks ``[first, last)``'s maximum value and its exp-sum below that maximum past the row's ``blocks`` keys, for a top-p nucleus over the whole softmax; one pipelined walk over their tiles of at most 4096 columns."""
+
+    minima: tl.constexpr = -float("inf")
+    tile: tl.constexpr = 4096 if block_n > 4096 else block_n
+    tiles: tl.constexpr = block_n // tile
+
+    target = (row_id * stride_y) + (blocks * max_k)
+
+    maximum = tl.full((), minima, tl.float32)
+    total = tl.full((), 0.0, tl.float32)
+
+    for tile_id in tl.range(first * tiles, last * tiles, num_stages=3):
+
+        cols = tile_id * tile + tl.arange(0, tile)
+        mask = cols < vocab_size
+
+        logits = tl.load(x_ptr + (row_id * stride_x) + cols, mask=mask, other=minima)
+        logits = head_logits(logits, mask, logit_scale, softcap)
+        logits = transform(
+            logits,
+            indicator,
+            cols,
+            mask,
+            m_ptr,
+            g_ptr,
+            c_ptr,
+            d_ptr,
+            t_ptr,
+            r_ptr,
+            f_ptr,
+            p_ptr,
+            b_ptr,
+            e_ptr,
+            batch_id,
+            step_id,
+            margin,
+            timesteps,
+            shard_offset,
+            lookahead,
+            indirection,
+            tokens,
+            singular,
+            stride_g,
+            stride_c,
+            stride_t,
+            block_t,
+            tile,
+            value_dtype,
+        )
+
+        # Online exp-sum below the running maximum.
+        values = logits.to(tl.float32)
+        peak = tl.maximum(maximum, tl.max(values, axis=0))
+        part = tl.sum(tl.where(values > minima, fast_expf(values - peak), 0.0), axis=0)
+        total = tl.where(peak > minima, total * fast_expf(maximum - peak) + part, 0.0)
+        maximum = peak
+
+        # A block's last tile stores its pair and restarts the sums.
+        ending = (tile_id % tiles) == tiles - 1
+        block_id = tile_id // tiles
+
+        tl.store(
+            y_ptr + target + block_id,
+            maximum.to(tl.uint32, bitcast=True),
+            mask=ending,
+        )
+        tl.store(
+            y_ptr + target + blocks + block_id,
+            total.to(tl.uint32, bitcast=True),
+            mask=ending,
+        )
+
+        maximum = tl.where(ending, minima, maximum)
+        total = tl.where(ending, 0.0, total)
+
+
+@jit
+def nucleus_normalizer(
+    s_ptr,
+    row_id,
+    vocab_blocks: tl.constexpr,
+    max_k: tl.constexpr,
+    stride_s: tl.constexpr,
+    block_v: tl.constexpr,
+):
+    """A row's maximum value and its exp-sum below that maximum, from the blocks' ``nucleus_blocks`` slots."""
+
+    minima: tl.constexpr = -float("inf")
+
+    span = tl.arange(0, block_v)
+    span_mask = span < vocab_blocks
+    offsets = (row_id * stride_s) + (vocab_blocks * max_k) + span
+
+    maxima = tl.load(s_ptr + offsets, mask=span_mask, other=0xFF800000)
+    totals = tl.load(s_ptr + offsets + vocab_blocks, mask=span_mask, other=0)
+
+    maxima = maxima.to(tl.float32, bitcast=True)
+    totals = totals.to(tl.float32, bitcast=True)
+
+    maximum = tl.max(maxima, axis=0)
+    total = tl.sum(
+        tl.where(maxima > minima, fast_expf(maxima - maximum) * totals, 0.0), axis=0
+    )
+
+    return maximum, total
+
+
+@jit
 def exact_candidates(
     x_ptr,
     row_id,
@@ -1071,6 +1226,7 @@ def whole_reduction_kernel(
     batch_size: tl.int32,  # Total Sequences -> B.
     vocab_blocks: tl.constexpr,  # Vocab Blocks -> Z_v.
     group_blocks,  # Vocab Blocks per Program.
+    max_k: tl.constexpr,  # Maximum Top-K Value -> M (each block's keys before a nucleus row's normalizer).
     # Conditional Flag(s).
     indirection: tl.constexpr,  # Vocab Indirection Flag.
     tokens: tl.constexpr,  # Drafted / Decoded Tokens Flag.
@@ -1094,13 +1250,19 @@ def whole_reduction_kernel(
     The first stage of the rows ``bitpacked_reduction_kernel`` leaves out under
     its ``whole`` flag, which draw from their whole vocabulary: the
     ``whole_block`` slots of ``group_blocks`` consecutive vocab blocks per
-    program, the same blocks the selection reads.
+    program, the same blocks the selection reads. A row whose top-p nucleus
+    is over its whole softmax (``nucleus_row``) adds each block's maximum
+    value and exp-sum past its keys (``nucleus_blocks``).
 
     Note(s):
 
         • A kernel of its own keeps the other rows' reduction compiled as it
           is without these rows, and its few programs per row keep the grid
           small for the batches that have none.
+
+        • A nucleus row reads its logits again here: the exp-sum in
+          ``bitpacked_reduction_kernel`` raised its registers from 64 to 91
+          and slowed its top-p rows by up to 42%.
 
     """
     row_id = tl.program_id(axis=0)
@@ -1162,6 +1324,51 @@ def whole_reduction_kernel(
                 logit_scale,
                 softcap,
             )
+
+    elif nucleus_row(indicator):
+
+        first = group_id * group_blocks
+
+        nucleus_blocks(
+            x_ptr,
+            y_ptr,
+            m_ptr,
+            g_ptr,
+            c_ptr,
+            d_ptr,
+            t_ptr,
+            r_ptr,
+            f_ptr,
+            p_ptr,
+            b_ptr,
+            e_ptr,
+            indicator,
+            row_id,
+            first,
+            tl.minimum(first + group_blocks, vocab_blocks),
+            vocab_blocks,
+            batch_id,
+            step_id,
+            margin,
+            timesteps,
+            vocab_size,
+            shard_offset,
+            lookahead,
+            indirection,
+            tokens,
+            singular,
+            stride_x,
+            stride_g,
+            stride_c,
+            stride_t,
+            stride_y,
+            max_k,
+            block_n,
+            block_t,
+            value_dtype,
+            logit_scale,
+            softcap,
+        )
 
     if enable_pdl:
 

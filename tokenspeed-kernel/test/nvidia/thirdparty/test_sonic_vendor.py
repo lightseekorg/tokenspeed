@@ -84,7 +84,8 @@ def test_the_table_closes_every_class_and_row_range():
 
 def test_the_scratchpad_holds_the_narrowest_picked_tiles_blocks():
     narrowest = min(c.block_n for c in configs(151936))
-    assert scratchpad_columns(151936) == -(-151936 // narrowest) * 128
+    # Each block's 128 keys, and its maximum and exp-sum for a nucleus over the whole softmax.
+    assert scratchpad_columns(151936) == -(-151936 // narrowest) * (128 + 2)
 
 
 def test_launches_past_the_int32_row_offsets_are_refused():

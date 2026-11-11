@@ -79,6 +79,7 @@ from tokenspeed_kernel.ops.sampling.sonic import (
     Indicator,
     SlotState,
     SonicConfig,
+    pairs_width,
     pick,
     scratchpad_columns,
 )
@@ -162,9 +163,10 @@ class SonicSamplingBackend(SamplingBackend):
     the whole softmax, past the top 128 too; a verify accepts a point-draw
     draft at its probability over the whole vocabulary and draws a rejected
     position from the rest of it. Rows with top-k, top-p or min-p select among
-    the top-128 candidates their reduction keeps (top-p's nucleus over the
-    candidates' mass), as do verify rows under
-    ``--enable-speculative-sampling``. Inherited from sonic's 16-bit packed
+    the top-128 candidates their reduction keeps, as do verify rows under
+    ``--enable-speculative-sampling``; without top-k, top-p's nucleus is
+    measured over the whole softmax (each block's maximum and exp-sum) and
+    keeps all 128 candidates when it runs past them. Inherited from sonic's 16-bit packed
     ranking: bf16 logits'
     candidates are compared at bf16 resolution (temperature, penalties and
     logit bias are applied in bf16, and the scaled logits are re-rounded), so
@@ -255,9 +257,9 @@ class SonicSamplingBackend(SamplingBackend):
             # Candidates carry draft probabilities recorded over each rank's shard: a third block, and their merged copy.
             self._candidate_drafts: torch.Tensor | None = None
             if self._shard_ranks is not None:
-                width = 2 * MAX_K
+                width = pairs_width(False)
                 if self.spec and config.enable_speculative_sampling:
-                    width = 3 * MAX_K
+                    width = pairs_width(True)
                     self._candidate_drafts = torch.empty(
                         (rows, MAX_K), dtype=torch.float32
                     )

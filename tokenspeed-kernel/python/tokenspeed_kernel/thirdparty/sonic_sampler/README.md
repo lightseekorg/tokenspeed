@@ -82,6 +82,14 @@ The vendored sources differ from `src/sonic_sampler` at that commit only by:
   and `cumulative_unpack_kernel` writes a draft row as the draft at its
   probability over the whole vocabulary and the draw without it at
   probability one (`whole_targets`), all under a new trailing `whole`;
+- a top-p nucleus over the whole softmax for rows with top-p and no top-k
+  (not upstream): `whole_reduction_kernel` stores each vocab block's maximum
+  value and exp-sum past the row's keys (`nucleus_blocks`, under a new
+  `max_k`), `shard_candidates_kernel` writes each rank's after its pairs
+  (`merged_normalizer` merges them), and `cumulative_selection_kernel` and
+  `cumulative_unpack_kernel` pass the row's exp-sum to `cumulative_masking`
+  (a new trailing `total`), whose `nucleus_masking` measures `top_p` over the
+  larger of it and the candidates' mass;
 - the Gumbel noise: `ops/base.py`'s `philox_gumbel` computes `log(-log u)`
   from the Philox draw's raw bits (`exponential_log`, on the same counters):
   `u` and `1 - u` come exactly from the bits and `-log u` from a short series below

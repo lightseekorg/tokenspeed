@@ -758,34 +758,28 @@ def test_stochastic_sample_matches_softmax(scale):
 
 
 def _nucleus_law(row: torch.Tensor, top_k: int, top_p: float) -> torch.Tensor:
-    """A logit row's law after top-k, then top-p: the nucleus keeps a token while the mass ranked above it is below top_p."""
-    values, columns = row.float().sort(descending=True)
+    """A logit row's law after top-k, then top-p over the whole softmax (the nucleus keeps a token while the mass ranked above it is below top_p), within the top MAX_K candidates."""
+    values, columns = row.float().sort(descending=True, stable=True)
     if top_k > 0:
         values, columns = values[:top_k], columns[:top_k]
     probs = torch.softmax(values, -1)
-    keep = probs.cumsum(-1) - probs < top_p
+    keep = (probs.cumsum(-1) - probs < top_p) & (torch.arange(probs.numel()) < 128)
     law = torch.zeros(row.numel())
     law[columns[keep]] = probs[keep] / probs[keep].sum()
     return law
 
 
-@pytest.mark.parametrize("verify", [False, True], ids=["sample", "verify"])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("top_k, top_p", [(-1, 0.75), (-1, 0.85), (2, 0.7)])
-def test_top_p_keeps_the_token_crossing_it(top_k, top_p, dtype, verify):
-    """Draws, and the first token a verify emits, follow the nucleus that keeps the token crossing top_p, whose point draft is accepted at its nucleus probability."""
-    torch.manual_seed(5)
+def _check_nucleus(probs, top_k, top_p, dtype, verify, draft_rank):
+    """Draws, and the first token a verify emits, of a row with ``probs`` at random columns follow ``_nucleus_law``, and a point draft at ``draft_rank`` is accepted at its nucleus probability."""
     iters = 4000
     n = 2 if verify else 1
     backend = _make_backend(max_n=n)
-    # Probabilities 0.5, 0.3, 0.1 and 60 tokens sharing 0.1, so the nucleus ends at the 0.3 or the 0.1 token.
-    probs = torch.tensor([0.5, 0.3, 0.1] + [0.1 / 60] * 60)
     row = torch.full((VOCAB,), -40.0)
     columns = torch.randperm(VOCAB)[: probs.numel()]
     row[columns] = probs.log()
     row = row.to(dtype)
     law = _nucleus_law(row, top_k, top_p)
-    draft = int(columns[1])
+    draft = int(columns[draft_rank])
     req = _prepare(
         backend,
         [_sp(f"np{i}", top_k=top_k, top_p=top_p) for i in range(MAX_BS)],
@@ -825,6 +819,28 @@ def test_top_p_keeps_the_token_crossing_it(top_k, top_p, dtype, verify):
             abs(accepted / total - p_draft)
             < 4 * math.sqrt(p_draft * (1 - p_draft) / total) + 0.01
         )
+
+
+@pytest.mark.parametrize("verify", [False, True], ids=["sample", "verify"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("top_k, top_p", [(-1, 0.75), (-1, 0.85), (2, 0.7)])
+def test_top_p_keeps_the_token_crossing_it(top_k, top_p, dtype, verify):
+    """Draws, and the first token a verify emits, follow the nucleus that keeps the token crossing top_p, whose point draft is accepted at its nucleus probability."""
+    torch.manual_seed(5)
+    # Probabilities 0.5, 0.3, 0.1 and 60 tokens sharing 0.1, so the nucleus ends at the 0.3 or the 0.1 token.
+    probs = torch.tensor([0.5, 0.3, 0.1] + [0.1 / 60] * 60)
+    _check_nucleus(probs, top_k, top_p, dtype, verify, 1)
+
+
+@pytest.mark.parametrize("verify", [False, True], ids=["sample", "verify"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("top_p", [0.8, 0.95])
+def test_top_p_nucleus_spans_the_whole_softmax(top_p, dtype, verify):
+    """Without top-k the nucleus is measured over the whole softmax, not the 128 candidates' mass (at 0.8 it keeps the 0.1 token, which 0.8 of the candidates' 0.9 drops); one running past the candidates keeps all 128."""
+    torch.manual_seed(6)
+    # Probabilities 0.5, 0.25, 0.1, 125 tokens sharing 0.05 (the rest of the 128 candidates) and 400 sharing 0.1 past them.
+    probs = torch.tensor([0.5, 0.25, 0.1] + [0.05 / 125] * 125 + [0.1 / 400] * 400)
+    _check_nucleus(probs, -1, top_p, dtype, verify, 2)
 
 
 def test_rejects_logits_other_than_bf16_or_fp32():

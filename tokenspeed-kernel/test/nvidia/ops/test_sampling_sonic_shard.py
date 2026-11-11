@@ -38,6 +38,7 @@ from tokenspeed_kernel.ops.sampling.sonic import (
     Indicator,
     SlotState,
     VocabShard,
+    pairs_width,
     pick,
     scratchpad_columns,
 )
@@ -145,7 +146,7 @@ class _Ranks:
                 for r in range(RANKS)
             ]
         self.config = pick(self.width, rows)
-        pairs = (2 if draft_probs is None else 3) * MAX_K
+        pairs = pairs_width(draft_probs is not None)
         self.landing = torch.empty((RANKS, rows, pairs), device="cuda")
         self.scale, self.softcap = logit_scale, softcap
         self.state, self.slots, self.drafted = state, slots, drafted

@@ -35,11 +35,14 @@ from tokenspeed_kernel.thirdparty.sonic_sampler.ops.base import (
 from tokenspeed_kernel.thirdparty.sonic_sampler.ops.prologue import (
     exact_candidates,
     exact_greedy,
+    nucleus_normalizer,
+    nucleus_row,
     whole_row,
 )
 from tokenspeed_kernel.thirdparty.sonic_sampler.ops.shard import (
     merged_candidates,
     merged_first,
+    merged_normalizer,
     merged_whole,
 )
 from tokenspeed_kernel.thirdparty.sonic_sampler.ops.topk.unpack import unpack_top_k
@@ -418,6 +421,24 @@ def cumulative_selection_kernel(
             maximum = tl.gather(values, tl.full((1,), 0, dtype=tl.int32), axis=0)
             offsets = tl.arange(0, max_k)
 
+            # A nucleus over the whole softmax takes the row's exp-sum; zero keeps it over the candidates.
+            total = tl.zeros((1,), dtype=tl.float32)
+
+            if nucleus_row(indicator):
+
+                if cand_ptr is not None:
+
+                    total += merged_normalizer(
+                        cand_ptr, row_id, ranks, stride_mr, stride_mb, 2, max_k, maximum
+                    )
+
+                else:
+
+                    peak, mass = nucleus_normalizer(
+                        s_ptr, row_id, vocab_blocks, max_k, stride_s, block_v
+                    )
+                    total += mass * fast_expf(peak - maximum)
+
             values = cumulative_masking(
                 k_ptr,
                 p_ptr,
@@ -428,6 +449,7 @@ def cumulative_selection_kernel(
                 maximum,
                 offsets,
                 max_k,
+                total,
             )
 
         if indirection:

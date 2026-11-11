@@ -33,6 +33,8 @@ from tokenspeed_kernel.thirdparty.sonic_sampler.ops.prologue import (
     exact_candidates,
     exact_first,
     exact_greedy,
+    nucleus_normalizer,
+    nucleus_row,
     whole_normalizer,
     whole_row,
 )
@@ -40,6 +42,7 @@ from tokenspeed_kernel.thirdparty.sonic_sampler.ops.shard import (
     merged_candidates,
     merged_candidates_with_drafts,
     merged_first,
+    merged_normalizer,
     merged_whole,
 )
 from tokenspeed_kernel.thirdparty.sonic_sampler.ops.singular import greedy_maximum
@@ -399,6 +402,30 @@ def cumulative_unpack_kernel(
 
         if (indicator & 0x380) > 0:
 
+            # A nucleus over the whole softmax takes the row's exp-sum; zero keeps it over the candidates.
+            total = tl.zeros((1,), dtype=tl.float32)
+
+            if nucleus_row(indicator):
+
+                if m_ptr is not None:
+
+                    total += merged_normalizer(
+                        cand_ptr, row_id, ranks, stride_mr, stride_mb, 3, max_k, maximum
+                    )
+
+                elif cand_ptr is not None:
+
+                    total += merged_normalizer(
+                        cand_ptr, row_id, ranks, stride_mr, stride_mb, 2, max_k, maximum
+                    )
+
+                else:
+
+                    peak, mass = nucleus_normalizer(
+                        s_ptr, row_id, vocab_blocks, max_k, stride_s, block_v
+                    )
+                    total += mass * fast_expf(peak - maximum)
+
             # Apply top-k, top-p, and / or min-p subset masking.
 
             values = cumulative_masking(
@@ -411,6 +438,7 @@ def cumulative_unpack_kernel(
                 maximum,
                 offsets,
                 max_k,
+                total,
             )
 
         # Compute softmax from values with potentially masked subset.

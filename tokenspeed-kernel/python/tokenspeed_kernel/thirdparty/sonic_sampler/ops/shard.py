@@ -31,7 +31,9 @@ verify whose draft probabilities each rank records over its own shard has
 the pairs carry them as a third block (``merged_candidates_with_drafts``).
 A row drawing from its whole vocabulary (``whole_block``) gathers its rank's
 best perturbed value instead, with a verify's normalizer and draft
-(``merged_whole``).
+(``merged_whole``). A row whose top-p nucleus is over its whole softmax
+(``nucleus_blocks``) adds its rank's maximum value and exp-sum after the
+blocks (``merged_normalizer``).
 """
 
 from __future__ import annotations
@@ -43,6 +45,8 @@ jit = triton.jit
 from tokenspeed_kernel.thirdparty.sonic_sampler.ops.base import fast_expf, gdc_wait
 from tokenspeed_kernel.thirdparty.sonic_sampler.ops.prologue import (
     exact_candidates,
+    nucleus_normalizer,
+    nucleus_row,
     whole_normalizer,
     whole_row,
 )
@@ -52,6 +56,7 @@ __all__ = [
     "merged_candidates",
     "merged_candidates_with_drafts",
     "merged_first",
+    "merged_normalizer",
     "merged_whole",
     "shard_candidates_kernel",
 ]
@@ -115,7 +120,7 @@ def shard_candidates_kernel(
     z_ptr,  # Indicators -> [ B ].
     f_ptr,  # Slot Mapping -> [ B ].
     # Output Data Pointer(s).
-    o_ptr,  # Candidate Pairs -> [ L, 2 • M ] fp32: values, then global token ids.
+    o_ptr,  # Candidate Pairs -> [ L, 2 • M + 2 ] fp32: values, then global token ids, then the normalizer.
     # Model Specific(s).
     vocab_blocks: tl.constexpr,  # This Rank's Vocab Blocks -> Z_v.
     lookahead: tl.constexpr,  # Drafted Tokens per Request -> γ (0 for one row per request).
@@ -161,7 +166,9 @@ def shard_candidates_kernel(
     ``vocab_topk_merge`` reads them: the values in descending order (the lower
     column first among equal values), then their global token ids as exact fp32
     integers; with ``d_ptr``, then the draft probability the slot recorded at
-    each candidate for the row's draft (zero for greedy and bonus rows).
+    each candidate for the row's draft (zero for greedy and bonus rows); then,
+    for a row whose nucleus is over its whole softmax (``nucleus_row``), this
+    rank's maximum value and its exp-sum below it.
 
     Note(s):
 
@@ -307,6 +314,22 @@ def shard_candidates_kernel(
 
         tl.store(o_ptr + pairs + 2 * max_k, drafts)
 
+    if nucleus_row(indicator):
+
+        maximum, total = nucleus_normalizer(
+            s_ptr, row_id, vocab_blocks, max_k, stride_s, block_v
+        )
+
+        # After the values and ids, and the draft probabilities when the pairs carry them.
+        normalizer = (row_id * stride_o) + (2 * max_k)
+
+        if d_ptr is not None:
+
+            normalizer += max_k
+
+        tl.store(o_ptr + normalizer, maximum)
+        tl.store(o_ptr + normalizer + 1, total)
+
 
 @jit
 def merged_keys(
@@ -450,6 +473,32 @@ def merged_first(
     _, slot = unpack_key(tl.max(keys, axis=0))
 
     return tl.sum(tl.where(tl.arange(0, ranks * max_k) == slot, ids, 0), axis=0)
+
+
+@jit
+def merged_normalizer(
+    cand_ptr,
+    row_id,
+    ranks: tl.constexpr,
+    stride_mr,
+    stride_mb: tl.constexpr,
+    blocks: tl.constexpr,
+    max_k: tl.constexpr,
+    maximum,
+):
+    """A row's exp-sum below ``maximum`` over the whole vocabulary, from every rank's maximum value and exp-sum after its ``blocks`` blocks of pairs."""
+
+    minima: tl.constexpr = -float("inf")
+
+    span = tl.arange(0, ranks)
+    pairs = cand_ptr + span * stride_mr + row_id * stride_mb + blocks * max_k
+
+    maxima = tl.load(pairs)
+    totals = tl.load(pairs + 1)
+
+    return tl.sum(
+        tl.where(maxima > minima, fast_expf(maxima - maximum) * totals, 0.0), axis=0
+    )
 
 
 @jit
