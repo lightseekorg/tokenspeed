@@ -1031,9 +1031,11 @@ def _put_p1(mb, acc, k, blk, ks):
 
     In the MFMA layout a lane holds 4 adjacent columns of a row, so each
     8-byte store writes 4 lanes 32 bytes apart and fills a quarter of every
-    segment it touches. :func:`_p1_layout` keeps each warp's columns (the
-    conversion stays within the warp) and puts a row's 16 of them in 16
-    lanes: one store writes 128 contiguous bytes a row."""
+    segment it touches. :func:`_p1_layout` puts a row's 16 columns of a
+    warp in 16 lanes: one store writes 128 contiguous bytes a row. Each
+    warp keeps its own columns, but the conversion moves both of a lane's
+    column bits from registers to lanes, which Triton lowers through LDS
+    with a workgroup barrier rather than lane shuffles."""
     cl: gl.constexpr = _p1_layout(gl.num_warps())
     v = gl.convert_layout(acc, cl)
     m = gl.arange(0, M_DUP, gl.SliceLayout(1, cl))[:, None]
