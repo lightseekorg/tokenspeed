@@ -880,7 +880,7 @@ private:
         // AdmissionPlanner owns the policy that ranks one access epoch.
         FixedSlotResource entry_memory{256};
         // Registration destructors erase their nodes, so maps outlive entries.
-        mutable OrderIndex available_order;
+        OrderIndex available_order;
         OrderIndex common_order;
         CacheEntryList entries{&entry_memory};
         // Both lookups answer entries.end() for an absent entry.
