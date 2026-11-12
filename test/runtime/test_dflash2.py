@@ -878,6 +878,8 @@ def _dspark_context_drafter(
     drafter.context_starts_buf = torch.zeros(2, dtype=torch.int64)
     drafter.context_locs_buf = torch.zeros(8, dtype=torch.int32)
     drafter._tap_rows = torch.empty(positions.numel(), 1)
+    # A target whose decode kernels leave the taps to the drafter's sink.
+    drafter.target_model = SimpleNamespace(stores_capture_taps=lambda ctx: False)
     written = []
     drafter._write_native_cache = lambda hidden, rows, slots, **kwargs: written.append(
         slots.tolist()
