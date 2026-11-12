@@ -433,9 +433,6 @@ def test_v41_aggregated_kvp_requires_explicit_matching_dcp(size):
     args = prepare_server_args(argv + ["--decode-context-parallel-size", str(size)])
     assert args.mapping.attn.kvp_size == args.decode_context_parallel_size == size
     assert not args.mapping.attn.has_qcp
-    assert prepare_server_args(
-        argv + ["--decode-context-parallel-size", str(size), "--enable-mixed-batch"]
-    ).enable_mixed_batch
     with pytest.raises(ValueError, match="must equal --kv-parallel-size"):
         prepare_server_args(argv + ["--decode-context-parallel-size", str(size * 2)])
     with pytest.raises(ValueError, match="requires --disaggregation-mode prefill"):

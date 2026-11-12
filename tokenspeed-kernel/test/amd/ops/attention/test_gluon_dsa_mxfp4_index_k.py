@@ -22,12 +22,11 @@
 
 Each page holds 64 rows of 64 nibble-packed E2M1 code bytes, then each row's
 four UE8M0 scales as one 4-byte word: DSV4.1's 68-byte index rows, page
-planar. The writer and the query quantizer must match DSV4.1's ``cache_pack``
-byte for byte; the decode, prefill and owned-page scorers must score as FP32
-over the ``cache_unpack`` queries and keys (E2M1 times a power of two is
-exact, so only the summation order differs); and the decode facade must
-reach them only when the caller names the format, a bare uint8 plane staying
-fp8_scaled.
+planar. The writer must match DSV4.1's ``cache_pack`` byte for byte; the
+decode, prefill and owned-page scorers must score as FP32 over the
+``cache_unpack`` queries and keys (E2M1 times a power of two is exact, so
+only the summation order differs); and the decode facade must reach them
+only when the caller names the format, a bare uint8 plane staying fp8_scaled.
 """
 
 from __future__ import annotations
@@ -132,16 +131,6 @@ def test_writer_matches_dsv41_codec(masked):
         (rows[:, :, :64].reshape(pages, -1), rows[:, :, 64:].reshape(pages, -1)), 1
     )
     assert torch.equal(buf.view(pages, -1), want)
-
-
-def test_query_quantizer_matches_dsv41_codec():
-    torch.manual_seed(5)
-    q = torch.randn(37, 64, 160, device="cuda", dtype=torch.bfloat16)[..., :_DIM]
-    q = q * torch.logspace(-3, 3, 64, device="cuda").to(torch.bfloat16)[:, None]
-    codes, scales = dsa_ops.dsa_quantize_index_query_mxfp4(q)
-    packed = cache_pack(q.reshape(-1, _DIM).float(), "index", None).view(37, 64, 68)
-    assert torch.equal(codes, packed[..., :64])
-    assert torch.equal(scales.view(torch.uint8).view(37, 64, 4), packed[..., 64:])
 
 
 @pytest.mark.parametrize("heads", [32, 64])

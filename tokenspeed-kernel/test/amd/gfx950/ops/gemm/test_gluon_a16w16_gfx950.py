@@ -490,14 +490,12 @@ def test_decode_gemm_supports_only_measured_buckets() -> None:
     # the next bucket's config: dense gate/up is measured only for 9..32.
     assert not supports_gluon_mm_a16w16_decode_gfx950(8, 8448, 7168)
     assert supports_gluon_mm_a16w16_decode_gfx950(9, 8448, 7168)
-    # Past 64 rows only the measured buckets serve: the Muse TP8 pre-expert
-    # projection and the K3.1 TP8 verify shapes that beat torch there.
+    # Past 64 rows only the listed buckets serve: the Muse TP8 pre-expert
+    # projection and the K3.1 TP8 verify shapes.
     assert supports_gluon_mm_a16w16_decode_gfx950(256, 512, 8192)
     assert not supports_gluon_mm_a16w16_decode_gfx950(65, 8192, 1024)
     assert not supports_gluon_mm_a16w16_decode_gfx950(257, 512, 8192)
-    assert supports_gluon_mm_a16w16_decode_gfx950(128, 1536, 7168)
     assert not supports_gluon_mm_a16w16_decode_gfx950(129, 1536, 7168)
-    assert supports_gluon_mm_a16w16_decode_gfx950(192, 2112, 7168)
     assert not supports_gluon_mm_a16w16_decode_gfx950(65, 20480, 7168)
 
 

@@ -1990,11 +1990,8 @@ class KimiLinearMoEGate(nn.Module):
 # this is a prefill chunk and takes the unsplit path; the scratch buffers are
 # allocated to exactly this many rows. Raise together with --max-num-seqs.
 ATTNRES_FAST_PATH_MAX_TOKENS = 32
-# On AMD, stream scheduling costs more than the available attention/AttnRes
-# overlap at every size (paired MI350 measurements through M=16; MI355X TP8
-# decode graphs from 17 to 32 rows, where the cross-stream waits leave one
-# rank behind at the next collective), so AMD never forks. Preserve NVIDIA's
-# policy.
+# On AMD, the cross-stream waits cost more than the attention/AttnRes overlap
+# they buy at every decode size, so AMD never forks. Preserve NVIDIA's policy.
 ATTNRES_STREAM_FORK_THRESHOLD = float("inf") if current_platform().is_amd else 0
 # On AMD the MoE routing branch also costs more in cross-stream waits than it
 # hides, so it stays on the main stream. Preserve NVIDIA's policy.

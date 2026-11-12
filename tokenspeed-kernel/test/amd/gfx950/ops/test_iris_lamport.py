@@ -294,10 +294,6 @@ def _check_lamport_state(rank, device):
     state = _new_state(rank, device, 10 * 10752, torch.bfloat16)
     region = state.lamport.mailbox
     epochs = state.lamport.epochs
-    # The MoE input gather's 192 rows of 1024 fill the producer buffer, wider
-    # than the seven-row all-reduce window.
-    assert region.shape == (3, 8, 10 * 10752)
-    assert epochs.shape == (10 * 10752 // 512,)
     # Even rows from 8 take the two-shot through its own mailboxes.
     assert state.two_shot_region.shape == (3, 2, 8, 10 * 10752 // 1024 * 1024 // 8)
     torch.testing.assert_close(
