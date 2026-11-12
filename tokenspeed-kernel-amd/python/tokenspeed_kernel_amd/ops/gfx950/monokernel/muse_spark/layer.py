@@ -416,7 +416,8 @@ def gluon_muse_spark_layer_gfx950(
     ``alpha``, ``beta`` (all 8192 columns), next input gain (all 8192
     columns), residual output, next attention input).
     ``tap``, ``tap_col``, ``tap_row``: with ``TAP``, where the residual
-    after the layer also goes, BF16 on every rank (``moe_tail.out_stage``).
+    after the layer also goes, BF16 whole rows on each rank
+    (``moe_tail.out_stage``).
     ``WHOLE_ROWS``: the residual output holds whole FP32 rows, not the owned
     columns. ``CHECK_PARITY``: fail-stop when this
     launch's parity repeats the last one's (``Mailbox.check_parity``).
@@ -760,10 +761,10 @@ def _launch_layer(
     """Launch one layer step of ``rows`` token rows, requests of ``chain``
     tokens (``full``: a
     full-attention, NoPE layer), or with ``compile_only`` only compile the
-    launch. ``tap`` (None, or a BF16 ``[rows+, slots, 8192]`` buffer on the
-    Iris heap) gets the residual after the layer in slot ``tap_slot`` on
-    every rank. ``warm_next`` (None, or the next launch's packed QKVG
-    weights) is warmed into the memory-side cache after the experts. With
+    launch. ``tap`` (None, or a BF16 ``[rows+, slots, 8192]`` buffer) gets
+    the residual after the layer in slot ``tap_slot`` on every rank.
+    ``warm_next`` (None, or the next launch's packed QKVG weights) is
+    warmed into the memory-side cache after the experts. With
     ``whole_rows`` the residual output (in ``moe_ops``) is whole FP32
     ``[rows, 8192]`` rows, else the rank's owned ``[rows, 1024]`` columns.
     With ``check_parity`` the launch traps when its peer-region parity
@@ -901,10 +902,10 @@ def launch_gluon_muse_spark_layer_gfx950(
         chain: Tokens a request: 1 for decode, ``k + 1`` for a verify.
         whole_rows: Every rank stores whole residual rows into ``h_out``
             (for a next layer on the regular path), not its owned columns.
-        tap: None, or a BF16 ``[rows+, slots, 8192]`` buffer on the Iris
-            symmetric heap (the same on every rank): the launch also stores
-            the residual after the layer, rounded to BF16, into slot
-            ``tap_slot`` of every rank's copy (a draft's tap).
+        tap: None, or a BF16 ``[rows+, slots, 8192]`` buffer on each rank:
+            the launch also stores the residual after the layer, rounded to
+            BF16, into slot ``tap_slot`` of this rank's buffer (a draft's
+            tap); every rank's launch stores the same values.
         tap_slot: The tap's slot, or None without ``tap``.
         warm_next: None, or the next launch's ``weights.LayerWeights``. Without
             ``proj_out`` this launch reads its QKVG weights into the

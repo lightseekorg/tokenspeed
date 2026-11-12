@@ -255,8 +255,8 @@ def _worker(rank: int, port: int, length: int, full: bool, rows: int) -> None:
             check_parity=False,
         )
         scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
-        # A draft's taps: the launch stores its residual into slot 3 of
-        # every rank's copy.
+        # A draft's taps: each rank's launch stores the whole residual rows
+        # into slot 3 of its own copy.
         tap = ctx.zeros((rows, 5, HIDDEN), dtype=torch.bfloat16)
         end = length + rows - 1
         sh = inputs.layer_shared(42, length, rows)
@@ -361,8 +361,8 @@ def _worker(rank: int, port: int, length: int, full: bool, rows: int) -> None:
             torch.testing.assert_close(
                 kernel_pooled[t].float(), pooled[t].float(), rtol=2**-6, atol=atol
             )
-        # The tap: every rank's h'' in its columns, rounded once to BF16, the
-        # other slots untouched.
+        # The tap on every rank: each rank's owned h'' in its columns, rounded
+        # once to BF16, the other slots untouched.
         parts = [torch.empty_like(h_next.cpu()) for _ in range(WORLD)]
         dist.all_gather(parts, h_next.cpu())
         torch.cuda.synchronize()

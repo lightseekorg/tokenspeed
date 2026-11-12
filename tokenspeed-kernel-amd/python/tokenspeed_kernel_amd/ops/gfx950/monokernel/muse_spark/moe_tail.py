@@ -55,9 +55,12 @@ columns ``1024 r ..`` of the residual.
   slice of the result to the other ranks instead would add a second
   exchange to the end of the layer. The tasks of a row that cover the
   rank's owned columns (``PER_ROW / 8``) also store ``h''`` (FP32, the
-  launch's residual output) and the draft's tap, not unpool's CTAs: a poll
-  waits for every earlier store of its wave, so after their ``ffn`` puts
-  unpool's wait for the scales would also wait for those 8 remote stores.
+  launch's residual output), not unpool's CTAs: a poll waits for every
+  earlier store of its wave, so after their ``ffn`` puts unpool's wait for
+  the scales would also wait for those stores. With a draft's tap, every
+  task also stores its columns of ``bf16(h'')`` to its own rank's tap: each
+  rank computes the whole row the same way, so no rank sends its owned
+  columns to the others.
 """
 
 from __future__ import annotations
@@ -495,11 +498,11 @@ def out_stage(
             8192 columns.
         h_next: Where the FP32 residual ``h''`` goes: ``[rows, 8192]`` with
             ``WHOLE_ROWS``, else the owned columns, ``[rows, 1024]``.
-        tap, tap_col, tap_row: With ``TAP``, a BF16 buffer on the Iris
-            symmetric heap where every rank's copy gets ``bf16(h'')`` of the
-            owned columns: row ``r``, column ``c`` (of 8192) at ``tap + r
-            tap_row + tap_col + c``. A draft reads this residual (the one
-            entering the next layer) as a tap. Unused without ``TAP``.
+        tap, tap_col, tap_row: With ``TAP``, this rank's BF16 buffer that
+            gets ``bf16(h'')`` of the task's columns: row ``r``, column ``c``
+            (of 8192) at ``tap + r tap_row + tap_col + c``. A draft reads
+            this residual (the one entering the next layer) as a tap. Unused
+            without ``TAP``.
     """
     mb.stamp(STAGE, trace.START)
     row, task, _ = schedule.row_task(mb.plan, task, PER_ROW)
@@ -550,20 +553,18 @@ def out_stage(
         at = h_next + row * HIDDEN + c
         gl.store(at, h_lo)
         gl.store(at + 1, h_hi)
-    if task // (PER_ROW // WORLD) == RANK:
-        # The owned columns: the residual output and the draft's tap.
-        if not WHOLE_ROWS:
-            at = h_next + row * OWNED + c - RANK * OWNED
-            gl.store(at, h_lo)
-            gl.store(at + 1, h_hi)
-        if TAP:
-            # Rounded once to BF16 as the regular capture rounds the FP32
-            # stream, into every rank's buffer: the stores to other GPUs write
-            # through, and the reader runs after later collectives of the
-            # forward.
-            t_at = tap + row.to(gl.int64) * tap_row + tap_col + c
-            for p in gl.static_range(WORLD):
-                peer_at = mb.peers.translate(t_at, p)
-                gl.store(peer_at, h_lo.to(gl.bfloat16), cache_modifier=".wt")
-                gl.store(peer_at + 1, h_hi.to(gl.bfloat16), cache_modifier=".wt")
+    if not WHOLE_ROWS and task // (PER_ROW // WORLD) == RANK:
+        # The owned columns of the residual output.
+        at = h_next + row * OWNED + c - RANK * OWNED
+        gl.store(at, h_lo)
+        gl.store(at + 1, h_hi)
+    if TAP:
+        # Rounded once to BF16 as the regular capture rounds the FP32 stream.
+        # Written through: the draft reads the tap past the caches.
+        t_at = tap + row.to(gl.int64) * tap_row + tap_col
+        gl.store(
+            t_at.to(gl.pointer_type(gl.int32), bitcast=True) + i,
+            _bf16_word(h_lo, h_hi),
+            cache_modifier=".wt",
+        )
     mb.stamp(STAGE, trace.END)
