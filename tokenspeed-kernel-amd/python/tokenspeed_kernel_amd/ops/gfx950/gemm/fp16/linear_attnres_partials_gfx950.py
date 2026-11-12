@@ -41,7 +41,8 @@ _LANES = gl.constexpr(64)
 _PARTIAL_BLOCK = gl.constexpr(8192)
 # Tokens the GEMV-projection launch takes: the decode GEMV's MFMA tile.
 _GEMV_TOKENS = range(5, gemv.MAX_M + 1)
-_GEMV_OUTPUT_SIZES = frozenset({6288})
+# The K3 MLA q_a/kv_a/gate and KDA qkvfab projections.
+_GEMV_OUTPUT_SIZES = frozenset({3648, 6288})
 # Half the hidden size, padded to a power of two: 8 waves x 64 lanes x 8 elements.
 _HALF = gl.constexpr(4096)
 _HALF_WAVES = gl.constexpr(8)

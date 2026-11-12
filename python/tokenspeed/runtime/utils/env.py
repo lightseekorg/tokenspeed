@@ -313,6 +313,8 @@ class Envs:
     TOKENSPEED_K31_DSA_HISTORY_PREFETCH = EnvBool(False)
     # Experiment: gather half of the split prefill top-k while the other half selects.
     TOKENSPEED_K31_DSA_TOPK_GATHER_OVERLAP = EnvBool(False)
+    # Kill switch: DSpark's greedy walk as one launch and one all-gather per round.
+    TOKENSPEED_DSPARK_FUSED_WALK = EnvBool(True)
     # Experiment TOKENSPEED_K31_GATHER_ROWS_GEMM (gather the KDA input
     # projection's rows inside the GEMM) is read by the kernel package's
     # ops/communication/_iris/kimi_k3/allreduce_sharded.py.
