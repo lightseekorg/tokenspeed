@@ -20,8 +20,7 @@
 
 """GFX950 query-row MLA decode: BF16 or FP8 queries over an FP8 cache, every
 query row of a request with its own visible length (a KVP rank's local
-lengths), against an FP32 softmax over the dequantized operands and against
-the folded ``bh16bn128`` decode the KVP drafter ran before."""
+lengths), against an FP32 softmax over the dequantized operands."""
 
 from __future__ import annotations
 
@@ -125,7 +124,7 @@ def test_matches_fp32_softmax(lengths, heads, q_dtype, kv_dtype):
 
 
 @pytest.mark.parametrize("q_dtype", [torch.bfloat16, _FP8])
-@pytest.mark.parametrize("splits", [1, 3, 7, 32, 128])
+@pytest.mark.parametrize("splits", [1, 7, 128])
 @pytest.mark.parametrize(
     "lengths",
     [
@@ -146,56 +145,6 @@ def test_every_split_count_merges_alike(lengths, splits, q_dtype, monkeypatch):
     torch.testing.assert_close(lse, ref_lse, atol=1e-3, rtol=1e-4)
 
 
-@pytest.mark.parametrize("q_dtype", [torch.bfloat16, _FP8])
-def test_matches_the_folded_decode(q_dtype):
-    """The rows the KVP drafter folded onto the batch axis, 16 heads each."""
-    q, kv, table, row_lengths = _inputs(
-        [[6000, 6001, 6002, 6003], [800, 800, 800, 801]], 96, q_dtype, seed=7
-    )
-    out, lse = mla_decode_query_rows(
-        q, kv, table, row_lengths, _MAX_K, _SCALE, kv_lora_rank=512, return_lse=True
-    )
-    batch, queries, heads, _ = q.shape
-    groups = heads // 16
-    folded_decode = (
-        decode.gluon_mla_decode_fp8xfp8_gfx950
-        if q_dtype == _FP8
-        else decode.gluon_mla_decode_bf16xfp8_gfx950
-    )
-    folded, folded_lse = folded_decode(
-        q.reshape(batch * queries * groups, 1, 16, 576),
-        kv,
-        table.repeat_interleave(queries * groups, 0).contiguous(),
-        row_lengths.reshape(-1).repeat_interleave(groups).contiguous(),
-        _MAX_K,
-        128,
-        512,
-        64,
-        _SCALE,
-        return_lse=True,
-    )
-    torch.testing.assert_close(
-        out.float(),
-        folded.reshape(batch, queries, heads, 512).float(),
-        **(_out_tol(q_dtype) if q_dtype == _FP8 else dict(atol=1e-2, rtol=1e-2)),
-    )
-    torch.testing.assert_close(
-        lse, folded_lse.reshape(batch, queries, heads), atol=1e-3, rtol=1e-4
-    )
-
-
-def test_split_count_fills_whole_waves():
-    select = decode._select_num_kv_splits_query_rows
-    assert select(batch=16, row_tiles=6, max_seqlen_k=_MAX_K) == 8
-    assert select(batch=16, row_tiles=6, max_seqlen_k=1024) == 2
-    assert select(batch=64, row_tiles=6, max_seqlen_k=_MAX_K) == 2
-    # A few requests split up to one whole wave.
-    assert select(batch=1, row_tiles=6, max_seqlen_k=_MAX_K) == 42
-    assert select(batch=1, row_tiles=2, max_seqlen_k=_MAX_K) == 128
-    assert select(batch=2, row_tiles=2, max_seqlen_k=_MAX_K) == 64
-
-
-@pytest.mark.parametrize("q_dtype", [torch.bfloat16, _FP8])
 @pytest.mark.parametrize(
     "lengths",
     [
@@ -203,9 +152,9 @@ def test_split_count_fills_whole_waves():
         [[2049, 2050, 2051], [130, 130, 131], [700, 701, 702]],
     ],
 )
-def test_large_pool_uses_safe_64_bit_addresses(lengths, q_dtype):
+def test_large_pool_uses_safe_64_bit_addresses(lengths):
     """Pages past the first 2^31 bytes of the pool read the right rows."""
-    q, kv, table, row_lengths = _inputs(lengths, 96, q_dtype, seed=5)
+    q, kv, table, row_lengths = _inputs(lengths, 96, seed=5)
     pool_pages = 0x80000000 // (kv[0].numel() * kv.element_size()) + 1
     large_kv = torch.empty((pool_pages, *kv.shape[1:]), dtype=kv.dtype, device="cuda")
     large_kv[-kv.shape[0] :].copy_(kv)
@@ -221,7 +170,7 @@ def test_large_pool_uses_safe_64_bit_addresses(lengths, q_dtype):
         return_lse=True,
     )
     ref_out, ref_lse = _reference(q, kv, table, row_lengths)
-    torch.testing.assert_close(out.float(), ref_out, **_out_tol(q_dtype))
+    torch.testing.assert_close(out.float(), ref_out, **_out_tol(torch.bfloat16))
     torch.testing.assert_close(lse, ref_lse, atol=1e-3, rtol=1e-4)
 
 

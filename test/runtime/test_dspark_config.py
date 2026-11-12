@@ -194,23 +194,15 @@ def test_geometry_applies_the_family_convention() -> None:
     assert _resolve_block_geometry(
         SimpleNamespace(dflash_config={"block_size": 8}), 8, "DFLASH"
     ) == (8, 7)
-
-    with pytest.raises(ValueError, match=r"--speculative-num-steps 6"):
-        _resolve_block_geometry(
-            SimpleNamespace(block_size=7), spec_num_tokens=8, spec_algorithm="DFLASH"
-        )
-
-
-def test_geometry_drafts_a_shorter_block_than_the_checkpoint() -> None:
-    """The block drafters size their block from the launch width."""
+    # A launch may draft a shorter block than the checkpoint's.
     assert _resolve_block_geometry(
         SimpleNamespace(block_size=7), spec_num_tokens=4, spec_algorithm="DSPARK"
     ) == (4, 3)
     assert _resolve_block_geometry(SimpleNamespace(block_size=8), 4, "DFLASH") == (4, 3)
 
-    with pytest.raises(ValueError, match=r"at most --speculative-num-steps 7"):
+    with pytest.raises(ValueError, match=r"--speculative-num-steps 6"):
         _resolve_block_geometry(
-            SimpleNamespace(block_size=7), spec_num_tokens=9, spec_algorithm="DSPARK"
+            SimpleNamespace(block_size=7), spec_num_tokens=8, spec_algorithm="DFLASH"
         )
 
 

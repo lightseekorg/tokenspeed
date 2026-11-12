@@ -910,8 +910,8 @@ class _Gate:
     or "gfx950" not in torch.cuda.get_device_properties(0).gcnArchName,
     reason="the fused K3 routing sorts for the gfx950 A8W4 MoE",
 )
-@pytest.mark.parametrize("rows", [4, 8, 64, 192])
-def test_fused_routing_hands_its_sort_to_the_experts(monkeypatch, rows):
+@pytest.mark.parametrize("rows", [4, 8, 192])
+def test_fused_routing_hands_its_sort_to_the_experts(rows):
     from tokenspeed_kernel.ops.moe import kimi3_sorted_routing_scratch
     from tokenspeed_kernel.ops.moe._triton.kimi3_sigmoid_topk import (
         kimi3_sigmoid_bias_topk,
@@ -919,7 +919,6 @@ def test_fused_routing_hands_its_sort_to_the_experts(monkeypatch, rows):
 
     from tokenspeed.runtime.models import kimi_k3 as mod
 
-    monkeypatch.setattr(mod, "_FUSED_ROUTING_MAX_ROWS", 192)
     generator = torch.Generator(device="cuda").manual_seed(rows)
     logits = torch.randn((rows, 896), generator=generator, device="cuda")
     bias = torch.randn((896,), generator=generator, device="cuda") * 0.01

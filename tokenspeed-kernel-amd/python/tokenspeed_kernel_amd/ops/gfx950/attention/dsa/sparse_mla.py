@@ -1571,7 +1571,9 @@ def _dsa_multi_cta_select_kernel(
     spilled = (num_tiles > TILE_GROUP) | (overflow_count > 0)
     tile_total = num_tiles * 0
     if spilled:
-        tile_total = _compact_listed_ends(row_counts, num_tiles, shared_ends, TILES_LOG2)
+        tile_total = _compact_listed_ends(
+            row_counts, num_tiles, shared_ends, TILES_LOG2
+        )
     visit_tiles = num_tiles
     visit_overflow = overflow_count
     if spilled & (tile_total + overflow_count <= SIZE):
@@ -2892,9 +2894,8 @@ def _oneblock_launch_plan(cols: int, *, is_decode: bool) -> _TopKLaunchPlan:
 
 
 # Row-bounded selection plans for its rows' lengths, not the buffer's width:
-# over 8K-128K candidates per row (KVP owned rows of a 1M-wide buffer, 40-128
-# rows) the short-row tiles beat the wide ones with the compact final pass by
-# 10-13 us on MI355X.
+# a KVP owned row holds a small fraction of a wide buffer's columns, so it
+# takes the short-row tiles rather than the wide ones with the compact final pass.
 _ROW_BOUNDED_ONEBLOCK_PLAN = _oneblock_launch_plan(
     _ONEBLOCK_RADIX_MAX_COLS, is_decode=False
 )

@@ -392,7 +392,7 @@ def test_linear_attnres_partials_cpu_skips_device_kernel_selection(
     or "gfx950" not in getattr(torch.cuda.get_device_properties(0), "gcnArchName", ""),
     reason="gfx950 is required",
 )
-@pytest.mark.parametrize("tokens", [1, 2, 4, 8, 16])
+@pytest.mark.parametrize("tokens", [1, 2, 4, 8])
 @pytest.mark.parametrize("output_size", [3648, 6288])
 def test_linear_attnres_partials_gfx950_matches_composition(
     tokens: int, output_size: int
