@@ -342,7 +342,15 @@ fn healthy_restarted_prefill_serves_a_surviving_decode() {
     drop(old.prefill);
     drop(old.prefill_outbox);
     drop(old._server);
-    let mut new = pair_on_port(library.clone(), &source, &fresh_dest, ttl, None, bootstrap);
+    let mut new = pair_on_port(
+        library.clone(),
+        &source,
+        &fresh_dest,
+        ttl,
+        None,
+        bootstrap,
+        "early",
+    );
     let new_port = new.prefill.port();
     assert_ne!(old_port, new_port);
     let url = format!("http://127.0.0.1:{bootstrap}");

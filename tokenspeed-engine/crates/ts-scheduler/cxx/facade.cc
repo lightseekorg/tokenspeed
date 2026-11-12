@@ -426,6 +426,22 @@ rust::Vec<ForwardBatchView> plan_forward_batches(const tokenspeed::ExecutionPlan
     return out;
 }
 
+rust::Vec<rust::String> plan_completed_prompts(const tokenspeed::ExecutionPlan& plan) {
+    rust::Vec<rust::String> out;
+    for (const tokenspeed::Operation& operation : plan.Operations()) {
+        const auto* batch = std::get_if<tokenspeed::ForwardBatch>(&operation);
+        if (batch == nullptr) {
+            continue;
+        }
+        for (std::size_t row = 0; row < batch->NumExtends(); ++row) {
+            if (batch->CompletesPrompt(row)) {
+                out.push_back(rust::String(batch->request_ids[row]));
+            }
+        }
+    }
+    return out;
+}
+
 bool plan_needs_device(const tokenspeed::ExecutionPlan& plan) {
     if (plan.remote_decode.has_value() || plan.remote_prefill.has_value()) {
         return true;

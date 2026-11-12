@@ -83,6 +83,7 @@ bool can_clear_cache(const tokenspeed::Scheduler& scheduler);
 std::int32_t max_single_request_tokens(const tokenspeed::Scheduler& scheduler);
 
 rust::Vec<ForwardBatchView> plan_forward_batches(const tokenspeed::ExecutionPlan& plan);
+rust::Vec<rust::String> plan_completed_prompts(const tokenspeed::ExecutionPlan& plan);
 bool plan_needs_device(const tokenspeed::ExecutionPlan& plan);
 rust::Vec<ForwardBatchView> plan_remote_decode(const tokenspeed::ExecutionPlan& plan);
 rust::Vec<ForwardBatchView> plan_remote_prefill(const tokenspeed::ExecutionPlan& plan);

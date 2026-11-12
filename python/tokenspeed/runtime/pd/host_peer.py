@@ -374,6 +374,9 @@ def _prefill_settings(
         "rank_ip": local_ip,
         "engine_rank": topology.global_rank,
         "cache_layout": wire_layout.decode("ascii"),
+        # What a Decode rank must do before it allocates a request's
+        # destination, and how this rank's peer admits requests.
+        "decode_allocation_policy": server_args.disaggregation_decode_allocation_policy,
     }
     # Stage-major, so Decode counts pp*tp distinct completions with PP.
     status_rank = topology.pp_rank * topology.tp_size + topology.tp_rank

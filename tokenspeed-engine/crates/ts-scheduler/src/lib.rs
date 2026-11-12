@@ -503,6 +503,7 @@ mod ffi {
         fn max_single_request_tokens(scheduler: &Scheduler) -> i32;
 
         fn plan_forward_batches(plan: &ExecutionPlan) -> Vec<ForwardBatchView>;
+        fn plan_completed_prompts(plan: &ExecutionPlan) -> Vec<String>;
         fn plan_needs_device(plan: &ExecutionPlan) -> bool;
         fn plan_remote_decode(plan: &ExecutionPlan) -> Vec<ForwardBatchView>;
         fn plan_remote_prefill(plan: &ExecutionPlan) -> Vec<ForwardBatchView>;
@@ -812,6 +813,12 @@ impl ExecutionPlan {
     pub fn forward_batches(&self) -> Vec<ForwardBatchView> {
         let _span = profile::span("ExecutionPlan::forward_batches");
         ffi::plan_forward_batches(&self.0)
+    }
+
+    /// The requests whose prompt's last chunk the plan's batches carry
+    /// (`ForwardBatch::CompletesPrompt`).
+    pub fn completed_prompts(&self) -> Vec<String> {
+        ffi::plan_completed_prompts(&self.0)
     }
 
     /// Whether the data plane has anything to do for this plan: a batch,

@@ -133,8 +133,10 @@ fn new_scheduler(
     role: Role,
     kv_shard_count: usize,
     device_pages: usize,
+    independent: bool,
 ) -> Scheduler {
     interpreter();
+    let policy = if independent { "Independent" } else { "Early" };
     let role = match role {
         Role::Plain => "Fused",
         Role::Prefill => "P",
@@ -192,7 +194,7 @@ cfg.cache_groups = [ts.CacheGroupConfig(group_id="full_attention", block_granula
                                         shard_count={kv_shard_count})]
 cfg.role = ts.SchedulerConfig.Role.{role}
 if cfg.role == ts.SchedulerConfig.Role.P:
-    cfg.decode_allocation_policy = ts.SchedulerConfig.DecodeAllocationPolicy.Early
+    cfg.decode_allocation_policy = ts.SchedulerConfig.DecodeAllocationPolicy.{policy}
 if cfg.role != ts.SchedulerConfig.Role.Fused:
     cfg.cache_groups[0].transfer_policy = ts.CacheTransferPolicy.FullSuffix
 {tiers}
@@ -417,6 +419,9 @@ struct WireRoom {
     cancel_pending: bool,
     /// Keep the cancellation acknowledgment pending, as an in-flight write does.
     hold_cancel: bool,
+    /// The decode engine admits the pages once the prefill engine dispatched
+    /// a forward of this room's prompt.
+    preallocated_once_dispatched: bool,
 }
 
 /// A stand-in transfer peer over a [`Wire`]: a transfer advances as soon as
@@ -426,8 +431,12 @@ struct FakePeer {
     role: Role,
     rank: usize,
     wire: Arc<Mutex<Wire>>,
-    /// Tracked requests: rid, room, bootstrapped, failure reported.
-    tracked: Vec<(String, u64, bool, bool)>,
+    /// Prefill: decode allocation is independent, so a request is admitted
+    /// at once and its destination's allocation has its own event.
+    independent: bool,
+    /// Tracked requests: rid, room, bootstrapped, failure reported, and
+    /// (independent) admitted.
+    tracked: Vec<(String, u64, bool, bool, bool)>,
 }
 
 impl TransferPeer for FakePeer {
@@ -442,8 +451,19 @@ impl TransferPeer for FakePeer {
                 .decode_registered = true;
         }
         self.tracked
-            .push((rid.to_owned(), bootstrap.room, false, false));
+            .push((rid.to_owned(), bootstrap.room, false, false, false));
         Ok(())
+    }
+
+    fn allocates_independently(&self) -> bool {
+        self.independent
+    }
+
+    fn occupy(&mut self, _: &str, _: i64, _: i64) {
+        assert!(
+            self.independent,
+            "only an independent prefill rank is told what its prompts take"
+        );
     }
 
     /// As `ts-pd`'s peers poll: each rank reads its view of every tracked
@@ -460,7 +480,7 @@ impl TransferPeer for FakePeer {
             let prefill_ranks = wire.prefill_ranks;
             self.tracked
                 .iter()
-                .flat_map(|(_, room, bootstrapped, _)| {
+                .flat_map(|(_, room, bootstrapped, _, _)| {
                     let room = wire.rooms.entry(*room).or_default();
                     let poll = if room.fails
                         || room.cancel_pending
@@ -505,11 +525,16 @@ impl TransferPeer for FakePeer {
         let mut wire = self.wire.lock().unwrap();
         let mut events = Vec::new();
         let mut agreed = agreed.chunks_exact(2);
+        let independent = self.independent && role == Role::Prefill;
         self.tracked
-            .retain_mut(|(rid, room, bootstrapped, failed)| {
+            .retain_mut(|(rid, room, bootstrapped, failed, admitted)| {
                 let state = agreed.next().expect("one state per tracked request");
                 let (poll, retired) = (state[0], state[1]);
                 let room = wire.rooms.entry(*room).or_default();
+                if independent && !*admitted {
+                    *admitted = true;
+                    events.push(PdEvent::Bootstrapped(rid.clone()));
+                }
                 match TransferPoll::from_wire(poll).unwrap_or(TransferPoll::Failed) {
                     TransferPoll::Failed => {
                         // Failure ends the output before held writes retire.
@@ -527,7 +552,11 @@ impl TransferPeer for FakePeer {
                     }
                     TransferPoll::Bootstrapped if !*bootstrapped => {
                         *bootstrapped = true;
-                        events.push(PdEvent::Bootstrapped(rid.clone()));
+                        events.push(if independent {
+                            PdEvent::DestinationReady(rid.clone())
+                        } else {
+                            PdEvent::Bootstrapped(rid.clone())
+                        });
                         true
                     }
                     TransferPoll::Success => {
@@ -561,7 +590,7 @@ impl TransferPeer for FakePeer {
     fn abort_room(&mut self, _: &str, _: u64) {}
 
     fn cancel(&mut self, rid: &str) {
-        if let Some((_, room, _, _)) = self.tracked.iter().find(|(id, _, _, _)| id == rid) {
+        if let Some((_, room, ..)) = self.tracked.iter().find(|(id, ..)| id == rid) {
             self.wire
                 .lock()
                 .unwrap()
@@ -707,6 +736,14 @@ impl DataPlane for FakeDevice {
             .extend(ops.into_iter().map(|op| (self.ack_polls, op)));
         if let Some(wire) = &self.wire {
             let mut wire = wire.lock().unwrap();
+            for rid in forward.iter().flat_map(|batch| &batch.request_ids) {
+                if let Some(room) = self.rooms.get(rid) {
+                    let room = wire.rooms.entry(*room).or_default();
+                    if room.preallocated_once_dispatched {
+                        room.preallocated.get_or_insert(1);
+                    }
+                }
+            }
             if let Some(admitted) = plan.remote_prefill() {
                 for (rid, &slot) in admitted
                     .request_ids
@@ -1259,6 +1296,8 @@ struct Setup {
     device_pages: Option<usize>,
     /// Batch prefill in windows, with pressure checks for fresh admissions.
     prefill_delay: Option<PrefillDelay>,
+    /// PD, prefill: admit without waiting for the decode allocation.
+    independent_admission: bool,
     /// Predecessors Engram reads per token.
     ngram_context_len: usize,
     /// PD: the engine's role and its peer's wire.
@@ -1405,6 +1444,7 @@ fn run_rank<F: Frontend>(
         grammar,
         grammar_timeouts,
         epd_receive_enabled,
+        independent_admission,
         ..
     } = setup;
     let role = pd.as_ref().map_or(Role::Plain, |pd| pd.role);
@@ -1426,6 +1466,7 @@ fn run_rank<F: Frontend>(
             role: pd.role,
             rank,
             wire: pd.wire,
+            independent: independent_admission,
             tracked: Vec::new(),
         }) as Box<dyn TransferPeer + Send>
     });
@@ -1447,7 +1488,13 @@ fn run_rank<F: Frontend>(
         _ => 1,
     };
     let mut event_loop = EventLoop::new(
-        new_scheduler(tiers, role, kv_shard_count, device_pages.unwrap_or(513)),
+        new_scheduler(
+            tiers,
+            role,
+            kv_shard_count,
+            device_pages.unwrap_or(513),
+            independent_admission,
+        ),
         device,
         frontend,
         outputs,
@@ -3515,6 +3562,423 @@ fn disaggregated(
     }
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn an_independent_prefill_computes_before_its_destination_and_sends_once_granted() {
+    for depth in [0, 1] {
+        let (prefill, decode, _wire) = start_pd_pair(
+            depth,
+            Layout::Single,
+            Tiers::DeviceOnly,
+            Setup {
+                independent_admission: true,
+                ..Setup::default()
+            },
+        )
+        .await;
+        let request = disaggregated("r", 9, 40, 4);
+        let (prefilled, decoded) = tokio::join!(run(&prefill.client, request.clone()), async {
+            // The prefill engine computes the prompt before the decode
+            // engine even knows the request.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !prefill.ranks[0]
+                    .plans
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(_, rids, _)| rids.iter().any(|rid| rid == "r"))
+                {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("depth {depth}: the prompt was not computed"));
+            run(&decode.client, request).await
+        });
+        assert_eq!(tokens(&prefilled), [1000], "depth {depth}");
+        assert_eq!(
+            prefilled.last().unwrap().finish_reason.as_deref(),
+            Some("length")
+        );
+        assert_eq!(tokens(&decoded), [1000, 1001, 1002, 1003], "depth {depth}");
+        assert_eq!(prefill.released().len(), 1, "depth {depth}");
+    }
+}
+
+/// An independent prefill engine alone, one script batch per round; no decode
+/// engine allocates any destination. Returns its rank and the wire.
+fn run_independent_prefill(depth: usize, script: Script) -> (ScriptedRank, Arc<Mutex<Wire>>) {
+    let wire = Arc::new(Mutex::new(Wire {
+        prefill_ranks: 1,
+        ..Wire::default()
+    }));
+    let mut ranks = run_scripted(
+        Layout::Single,
+        depth,
+        Tiers::DeviceOnly,
+        Setup {
+            pd: Some(Pd {
+                role: Role::Prefill,
+                wire: wire.clone(),
+            }),
+            independent_admission: true,
+            ..Setup::default()
+        },
+        vec![script],
+        no_reaction,
+    );
+    (ranks.remove(0), wire)
+}
+
+#[test]
+fn an_independent_prefill_keeps_its_kv_until_the_destination_is_allocated() {
+    for depth in [0, 1] {
+        let mut script = vec![Vec::new(); 20];
+        script[0].push(EngineRequest::Add(Box::new(disaggregated("r", 9, 40, 4))));
+        let (rank, wire) = run_independent_prefill(depth, script);
+        // One forward computed the prompt; for the rounds after it landed
+        // the prompt kept its pages and sent nothing.
+        assert_eq!(rank.outcome, Ok(()));
+        assert_eq!(rank.forwards, 1, "depth {depth}");
+        assert!(rank.released.is_empty(), "depth {depth}");
+        let wire = wire.lock().unwrap();
+        assert!(
+            wire.rooms[&9].preallocated.is_none() && wire.rooms[&9].sent.is_none(),
+            "depth {depth}"
+        );
+    }
+}
+
+#[test]
+fn a_cancelled_independent_prefill_is_released_without_its_destination() {
+    // The abort comes with the submission, so the transfer fails while the
+    // prompt's forward is still out at depth 1, or four rounds later, once
+    // the computed prompt waits for its destination. Either way the retired
+    // transfer's failure releases the request, and nothing is sent, to the
+    // decode engine or to the client, which tore down its stream.
+    for depth in [0, 1] {
+        for abort_round in [0, 4] {
+            let mut script = vec![Vec::new(); 12];
+            script[0].push(EngineRequest::Add(Box::new(disaggregated(
+                "doomed", 11, 40, 4,
+            ))));
+            script[abort_round].push(EngineRequest::Abort(vec!["doomed".to_owned()]));
+            let (rank, wire) = run_independent_prefill(depth, script);
+            assert_eq!(rank.outcome, Ok(()));
+            assert_eq!(
+                rank.released
+                    .iter()
+                    .map(|(rid, _)| rid.as_str())
+                    .collect::<Vec<_>>(),
+                ["doomed"],
+                "depth {depth}, abort round {abort_round}"
+            );
+            assert!(
+                rank.outputs.iter().all(|output| output.rid != "doomed"),
+                "depth {depth}, abort round {abort_round}"
+            );
+            let wire = wire.lock().unwrap();
+            assert!(
+                wire.rooms[&11].fails && wire.rooms[&11].sent.is_none(),
+                "depth {depth}, abort round {abort_round}"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_waiting_independent_prefill_whose_transfer_fails_ends_with_an_abort() {
+    // The prompt is computed and waits for its destination, then its
+    // transfer fails: a bootstrap timeout, a decode node gone. Its output
+    // waited for the transfer, even when its one token ended it, and its
+    // client gets the abort a prompt failing before it is computed gets.
+    for depth in [0, 1] {
+        for max_new_tokens in [1, 4] {
+            let wire = Arc::new(Mutex::new(Wire {
+                prefill_ranks: 1,
+                ..Wire::default()
+            }));
+            let prefill = start_ranks_with(
+                Layout::Single,
+                depth,
+                Tiers::DeviceOnly,
+                Setup {
+                    pd: Some(Pd {
+                        role: Role::Prefill,
+                        wire: wire.clone(),
+                    }),
+                    independent_admission: true,
+                    ..Setup::default()
+                },
+            )
+            .await;
+            let mut stream = prefill
+                .client
+                .generate(disaggregated("r", 9, 40, max_new_tokens))
+                .await
+                .unwrap();
+            let case = format!("depth {depth}, max_new_tokens {max_new_tokens}");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), stream.next())
+                    .await
+                    .is_err(),
+                "{case}"
+            );
+            assert!(
+                prefill.ranks[0]
+                    .plans
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(_, rids, _)| rids.iter().any(|rid| rid == "r")),
+                "{case}"
+            );
+            wire.lock().unwrap().rooms.entry(9).or_default().fails = true;
+            let chunks = collect(stream).await;
+            let last = chunks.last().unwrap();
+            assert_eq!(last.finish_reason.as_deref(), Some("abort"), "{case}");
+            let details = &last.finish_details.as_ref().unwrap().0;
+            assert!(
+                details.iter().any(|(k, v)| k == "message"
+                    && *v == Value::from("PD/EPD remote transfer failed or timed out")),
+                "{case}: {details:?}"
+            );
+            prefill.settle().await;
+            assert_eq!(prefill.released().len(), 1, "{case}");
+        }
+    }
+}
+
+#[test]
+fn a_grant_during_the_final_forward_sends_once_its_result_lands() {
+    // The decode engine allocates the destination once the prompt's only
+    // forward is dispatched. At depth 1 the round polls the grant while that
+    // forward is out, so the prompt never waits for it; at depth 0 the result
+    // lands first. Either way the KV goes out once its result landed.
+    for depth in [0, 1] {
+        let wire = Arc::new(Mutex::new(Wire {
+            prefill_ranks: 1,
+            ..Wire::default()
+        }));
+        wire.lock()
+            .unwrap()
+            .rooms
+            .entry(9)
+            .or_default()
+            .preallocated_once_dispatched = true;
+        let mut script = vec![Vec::new(); 20];
+        script[0].push(EngineRequest::Add(Box::new(disaggregated("r", 9, 40, 4))));
+        let rank = run_scripted(
+            Layout::Single,
+            depth,
+            Tiers::DeviceOnly,
+            Setup {
+                pd: Some(Pd {
+                    role: Role::Prefill,
+                    wire: wire.clone(),
+                }),
+                independent_admission: true,
+                ..Setup::default()
+            },
+            vec![script],
+            no_reaction,
+        )
+        .remove(0);
+        assert_eq!(rank.outcome, Ok(()), "depth {depth}");
+        assert_eq!(rank.forwards, 1, "depth {depth}");
+        assert_eq!(
+            wire.lock().unwrap().rooms[&9].sent,
+            Some(1000),
+            "depth {depth}"
+        );
+        let outputs: Vec<_> = rank
+            .outputs
+            .iter()
+            .filter(|output| output.rid == "r")
+            .collect();
+        assert_eq!(
+            outputs
+                .iter()
+                .flat_map(|output| output.output_ids.clone())
+                .collect::<Vec<_>>(),
+            [1000],
+            "depth {depth}"
+        );
+        assert_eq!(outputs.last().unwrap().finish_reason, Some("length"));
+        assert_eq!(rank.released.len(), 1, "depth {depth}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_keep_pause_freezes_an_independent_prefill_on_either_side_of_its_grant() {
+    // Frozen, the engine computes nothing and polls no transfer. A prompt
+    // whose destination is allocated before it arrives is not computed until
+    // the resume; a computed prompt whose destination is allocated during
+    // the freeze sends nothing until then. Both complete afterwards.
+    for depth in [0, 1] {
+        for granted_first in [true, false] {
+            let case = format!("depth {depth}, granted first {granted_first}");
+            let wire = Arc::new(Mutex::new(Wire {
+                prefill_ranks: 1,
+                ..Wire::default()
+            }));
+            let prefill = start_ranks_with(
+                Layout::Single,
+                depth,
+                Tiers::DeviceOnly,
+                Setup {
+                    pd: Some(Pd {
+                        role: Role::Prefill,
+                        wire: wire.clone(),
+                    }),
+                    independent_admission: true,
+                    ..Setup::default()
+                },
+            )
+            .await;
+            let forwards = || {
+                prefill.ranks[0]
+                    .plans
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(_, rids, _)| rids.iter().any(|rid| rid == "r"))
+                    .count()
+            };
+            let request = disaggregated("r", 9, 40, 4);
+            let mut stream = if granted_first {
+                wire.lock()
+                    .unwrap()
+                    .rooms
+                    .entry(9)
+                    .or_default()
+                    .preallocated = Some(1);
+                assert_eq!(
+                    control(&prefill, pause("keep")).await,
+                    [("PauseSchedulerReqOutput", true)],
+                    "{case}"
+                );
+                prefill.client.generate(request).await.unwrap()
+            } else {
+                let mut stream = prefill.client.generate(request).await.unwrap();
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(200), stream.next())
+                        .await
+                        .is_err(),
+                    "{case}"
+                );
+                assert_eq!(forwards(), 1, "{case}");
+                assert_eq!(
+                    control(&prefill, pause("keep")).await,
+                    [("PauseSchedulerReqOutput", true)],
+                    "{case}"
+                );
+                wire.lock()
+                    .unwrap()
+                    .rooms
+                    .entry(9)
+                    .or_default()
+                    .preallocated = Some(1);
+                stream
+            };
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), stream.next())
+                    .await
+                    .is_err(),
+                "{case}"
+            );
+            assert_eq!(forwards(), usize::from(!granted_first), "{case}");
+            assert_eq!(wire.lock().unwrap().rooms[&9].sent, None, "{case}");
+            assert_eq!(
+                control(&prefill, resume()).await,
+                [("ResumeSchedulerReqOutput", true)],
+                "{case}"
+            );
+            let chunks = collect(stream).await;
+            assert_eq!(tokens(&chunks), [1000], "{case}");
+            assert_eq!(
+                chunks.last().unwrap().finish_reason.as_deref(),
+                Some("length"),
+                "{case}"
+            );
+            assert_eq!(forwards(), 1, "{case}");
+            assert_eq!(wire.lock().unwrap().rooms[&9].sent, Some(1000), "{case}");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wait_pause_drains_a_computed_independent_prefill_once_its_destination_comes() {
+    // The scheduler holds a computed prompt until its transfer starts, so a
+    // wait pause answers only after the decode engine allocated its
+    // destination and its KV went out.
+    for depth in [0, 1] {
+        let wire = Arc::new(Mutex::new(Wire {
+            prefill_ranks: 1,
+            ..Wire::default()
+        }));
+        let prefill = start_ranks_with(
+            Layout::Single,
+            depth,
+            Tiers::DeviceOnly,
+            Setup {
+                pd: Some(Pd {
+                    role: Role::Prefill,
+                    wire: wire.clone(),
+                }),
+                independent_admission: true,
+                ..Setup::default()
+            },
+        )
+        .await;
+        let mut stream = prefill
+            .client
+            .generate(disaggregated("r", 9, 40, 4))
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), stream.next())
+                .await
+                .is_err(),
+            "depth {depth}"
+        );
+        let mut pausing = std::pin::pin!(prefill.client.control(pause("wait")));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut pausing)
+                .await
+                .is_err(),
+            "depth {depth}: the pause answered with the prompt waiting"
+        );
+        assert_eq!(wire.lock().unwrap().rooms[&9].sent, None, "depth {depth}");
+        wire.lock()
+            .unwrap()
+            .rooms
+            .entry(9)
+            .or_default()
+            .preallocated = Some(1);
+        let replies = tokio::time::timeout(Duration::from_secs(10), pausing)
+            .await
+            .unwrap_or_else(|_| panic!("depth {depth}: the pause never answered"))
+            .unwrap();
+        assert_eq!(
+            outcome(replies),
+            [("PauseSchedulerReqOutput", true)],
+            "depth {depth}"
+        );
+        assert_eq!(
+            wire.lock().unwrap().rooms[&9].sent,
+            Some(1000),
+            "depth {depth}"
+        );
+        let chunks = collect(stream).await;
+        assert_eq!(tokens(&chunks), [1000], "depth {depth}");
+        assert_eq!(
+            control(&prefill, resume()).await,
+            [("ResumeSchedulerReqOutput", true)],
+            "depth {depth}"
+        );
+    }
+}
+
 #[test]
 fn a_pd_abort_in_the_submission_round_retires_the_transfer() {
     for layout in [Layout::Single, Layout::Tp(2)] {
@@ -4073,14 +4537,21 @@ async fn a_prefill_nan_ends_both_clients_once_the_transfer_failed() {
     // releases the request once, and once the transfer stopped neither its
     // pages nor its transfer hold the engine: the cache flushes, memory is
     // released, and serving goes on.
-    for layout in [Layout::Single, Layout::Tp(2)] {
+    for (layout, independent_admission) in [
+        (Layout::Single, false),
+        (Layout::Single, true),
+        (Layout::Tp(2), false),
+    ] {
         for depth in [0, 1] {
-            let case = format!("{layout:?}, depth {depth}");
+            let case = format!("{layout:?}, independent {independent_admission}, depth {depth}");
             let (prefill, decode, wire) = start_pd_pair(
                 depth,
                 layout,
                 Tiers::DeviceOnly,
-                Setup::default(),
+                Setup {
+                    independent_admission,
+                    ..Setup::default()
+                },
             )
             .await;
             let request = disaggregated("nan-r", 9, 40, 4);
@@ -4172,12 +4643,17 @@ fn a_client_abort_racing_a_prefill_nan_stays_silent() {
     // that failure leaves the client, which tore down its stream, without
     // output; one after it finds the NaN abort already sent. Either way every
     // rank releases the request once and nothing is sent.
-    for layout in [Layout::Single, Layout::Tp(2)] {
+    for (layout, independent_admission) in [
+        (Layout::Single, false),
+        (Layout::Single, true),
+        (Layout::Tp(2), false),
+    ] {
         for depth in [0, 1] {
             let mut silent = Vec::new();
             for abort_round in 0..6 {
                 let case = format!(
-                    "{layout:?}, depth {depth}, abort round {abort_round}"
+                    "{layout:?}, independent {independent_admission}, depth {depth}, \
+                     abort round {abort_round}"
                 );
                 let wire = Arc::new(Mutex::new(Wire {
                     prefill_ranks: layout.sizes().1,
@@ -4203,6 +4679,7 @@ fn a_client_abort_racing_a_prefill_nan_stays_silent() {
                             role: Role::Prefill,
                             wire: wire.clone(),
                         }),
+                        independent_admission,
                         ..Setup::default()
                     },
                     vec![script],
@@ -4237,7 +4714,7 @@ fn a_client_abort_racing_a_prefill_nan_stays_silent() {
                 assert_eq!(wire.lock().unwrap().rooms[&9].sent, None, "{case}");
             }
             // The aborts before the failure, then those after it.
-            let case = format!("{layout:?}, depth {depth}");
+            let case = format!("{layout:?}, independent {independent_admission}, depth {depth}");
             assert!(silent.len() > 1 && silent.len() < 6, "{case}: {silent:?}");
             assert_eq!(silent, (0..silent.len()).collect::<Vec<_>>(), "{case}");
         }
