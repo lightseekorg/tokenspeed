@@ -1005,7 +1005,11 @@ impl Executor {
         if self.closed {
             return Ok(());
         }
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or(ExecutorError::Invalid(
+                "close timeout exceeds the clock range",
+            ))?;
         let mut state = self.shared.lock_even_poisoned();
         state.stopping = true;
         for work in &self.shared.work {
@@ -1964,6 +1968,21 @@ mod tests {
         // The worker still writes the pool after the close.
         std::mem::forget(std::mem::take(&mut harness.pool));
         release.set();
+    }
+
+    #[test]
+    fn an_unrepresentable_close_deadline_keeps_the_executor_usable() {
+        let mut harness = Harness::new(TestStore::new(), CONFIG);
+        assert!(matches!(
+            harness.close(Duration::MAX),
+            Err(ExecutorError::Invalid(_))
+        ));
+        harness
+            .executor()
+            .submit(&[query(1, &["still-open"])])
+            .unwrap();
+        assert!(harness.wait(1)[0].retired);
+        harness.close(Duration::from_secs(2)).unwrap();
     }
 
     #[test]

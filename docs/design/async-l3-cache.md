@@ -416,7 +416,8 @@ on a dead worker. An unwinding worker or poisoned state lock permanently marks
 retirement as unproven: a worker's exit alone never permits deregistration.
 The shutdown path takes its locks even when poisoned rather than risk a second
 panic inside a `Drop` during unwind. Python closes are serialized with the GIL
-released; invalid timeout values are rejected before changing the handle.
+released; nonfinite, negative or unrepresentable timeout values are rejected
+before changing the handle.
 
 ## Initial scope and validation
 

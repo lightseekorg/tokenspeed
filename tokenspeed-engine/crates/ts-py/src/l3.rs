@@ -22,7 +22,10 @@
 //! tests and tools that drive the storage tier against a data plane's Host
 //! pool. An engine rank's host runs its own.
 
-use std::{sync::Mutex, time::Duration};
+use std::{
+    sync::Mutex,
+    time::{Duration, Instant},
+};
 
 use pyo3::{
     exceptions::{PyRuntimeError, PyValueError},
@@ -202,7 +205,7 @@ mod tests {
                 },
             )
             .unwrap();
-            for timeout in [-1.0, f64::NAN, f64::INFINITY] {
+            for timeout in [-1.0, f64::NAN, f64::INFINITY, 1e19] {
                 let error = binding
                     .bind(py)
                     .call_method1("close", (timeout,))
@@ -394,6 +397,9 @@ impl L3Executor {
     fn close(&self, py: Python<'_>, timeout_s: f64) -> PyResult<()> {
         let timeout = Duration::try_from_secs_f64(timeout_s)
             .map_err(|_| PyValueError::new_err("timeout_s must be finite and nonnegative"))?;
+        Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| PyValueError::new_err("timeout_s exceeds the clock range"))?;
         py.detach(|| {
             // Serialize closes without holding the GIL. A pending close
             // must not look like a successful close to another caller.
