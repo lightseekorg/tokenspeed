@@ -31,7 +31,7 @@ jobs:
           set -euo pipefail
           changed_files="$RUNNER_TEMP/tokenspeed-lint-changed-files.txt"
           scheduler_cpp_files='^tokenspeed-scheduler/.*\.(c|cc|cpp|cxx|h|hh|hpp|hxx)$'
-          scheduler_cpp_config='^(tokenspeed-scheduler/(\.clang-(format|tidy)|(.*/)?CMakeLists\.txt|.*\.cmake)|\.github/workflows/lint\.yml)$'
+          scheduler_cpp_config='^(tokenspeed-scheduler/(\.clang-format|(.*/)?CMakeLists\.txt|.*\.cmake)|\.github/workflows/lint\.yml)$'
 
           list_changed_files() {
             if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
@@ -155,6 +155,7 @@ jobs:
     if: needs.changes.outputs.scheduler_cpp == 'true'
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         shard: [0, 1, 2]
     steps:
@@ -183,8 +184,8 @@ jobs:
       # warnings never failed the job.
       - name: Check scheduler C++ translation units
         env:
-          SHARD: ${{ matrix.shard }}
-          SHARDS: 3
+          SHARD: ${{ strategy.job-index }}
+          SHARDS: ${{ strategy.job-total }}
         run: |
           git ls-files tokenspeed-scheduler | grep -E '\.(c|cc|cpp|cxx)$' |
             awk -v shard="$SHARD" -v shards="$SHARDS" 'NR % shards == shard' |
