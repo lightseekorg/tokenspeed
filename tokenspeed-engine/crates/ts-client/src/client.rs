@@ -99,6 +99,8 @@ impl OutputChunk {
         // Keep the borrowed view's validation and compatibility rules as
         // the single definition of a well-formed output batch.
         drop(batch.requests()?);
+        // New columns must also update From<&RequestOutput> and extend
+        // consuming_output_rows_preserves_columns_and_transfers_prompt_buffers.
         let rids = batch.rids.take().expect("validated request ids");
         fn take<T: Default>(column: &mut [T], i: usize) -> T {
             column.get_mut(i).map(std::mem::take).unwrap_or_default()

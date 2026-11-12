@@ -85,8 +85,19 @@ impl Config {
             );
         }
         match self.suite.as_str() {
-            "stages" if self.transport == "none" && self.period_us == 0 && self.consumer_delay_us == 0 && self.client_threads == 0 => Ok(()),
-            "pipeline" if matches!(self.transport.as_str(), "ipc" | "tcp") && self.client_threads > 0 => Ok(()),
+            "stages"
+                if self.transport == "none"
+                    && self.period_us == 0
+                    && self.consumer_delay_us == 0
+                    && self.client_threads == 0 =>
+            {
+                Ok(())
+            }
+            "pipeline"
+                if matches!(self.transport.as_str(), "ipc" | "tcp") && self.client_threads > 0 =>
+            {
+                Ok(())
+            }
             _ => Err("stages requires transport=none and timing/thread knobs=0; pipeline requires ipc/tcp and client_threads>0".into()),
         }
     }

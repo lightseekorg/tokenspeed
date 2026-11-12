@@ -456,7 +456,7 @@ Python object), from which the forward thread builds what a forward reads.
 What a launched forward reads freezes: no attribute rebinding, no in-place
 edit, no releasing a resource it holds while it may still run. Results cross
 back **only** as the launched forward's result, which the commit reads once
-its copy event landed, as plain lists built from the landed host copies.
+its copy event landed, as metadata lists and CPU logprob buffer views.
 
 The plan's cache ops follow the same capture rule: the data plane adapts
 them once into immutable Device and storage tuples, and
@@ -498,13 +498,6 @@ single call:
 
 The round should read, top to bottom, as the schedule of one scheduling
 round, with no feature's internals inlined into it.
-
-Completed prompt logprobs move from request state into the first output that
-ships them. The state retains the fact that they are final after transferring
-the buffers, so a retraction's replay neither gathers nor sends them again.
-The frontend likewise consumes a decoded batch into independently owned
-per-request chunks. A queued chunk owns its arrays until consumption or
-cancellation; one slow request need not retain another request's payload.
 
 Consequences:
 

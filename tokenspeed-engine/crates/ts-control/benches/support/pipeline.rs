@@ -284,69 +284,106 @@ pub fn run(config: &Config) -> Value {
     let model = result(config, 0);
     let requests: Vec<_> = (0..config.batch).map(|row| request(config, row)).collect();
     rt.block_on(async {
-        let listener=ClientListener::bind(ClientConfig {
-            handshake_address:endpoints.addresses[0].clone(),input_address:endpoints.addresses[1].clone(),
-            output_address:endpoints.addresses[2].clone(),first_engine_index:0,num_engines:1,
-            routing:Routing::Aggregated(LoadBalance::RoundRobin),handshake_timeout:Duration::from_secs(30),
-            send_timeout:Duration::from_secs(180),
-        }).await.unwrap();
-        let handshake=listener.handshake_address().to_owned();
-        let shared=Arc::new(Shared::new(config.steps));
-        let engine_config=config.clone();let engine_shared=shared.clone();
-        let guard=RunningEngine {shared:shared.clone(),thread:Some(thread::Builder::new().name("bench-control".into()).spawn(move ||engine(handshake,engine_config,engine_shared,model)).unwrap())};
-        let client:Arc<EngineClient>=Arc::new(listener.accept().await.unwrap());
-        let barrier=Arc::new(tokio::sync::Barrier::new(config.batch+1));
-        let mut consumers=tokio::task::JoinSet::new();
-        for (row,request) in requests.into_iter().enumerate() {
-            let config=config.clone();let shared=shared.clone();let client=client.clone();let barrier=barrier.clone();
-            let mut observation=ClientObservation::new(config.steps);
+        let listener = ClientListener::bind(ClientConfig {
+            handshake_address: endpoints.addresses[0].clone(),
+            input_address: endpoints.addresses[1].clone(),
+            output_address: endpoints.addresses[2].clone(),
+            first_engine_index: 0,
+            num_engines: 1,
+            routing: Routing::Aggregated(LoadBalance::RoundRobin),
+            handshake_timeout: Duration::from_secs(30),
+            send_timeout: Duration::from_secs(180),
+        })
+        .await
+        .unwrap();
+        let handshake = listener.handshake_address().to_owned();
+        let shared = Arc::new(Shared::new(config.steps));
+        let engine_config = config.clone();
+        let engine_shared = shared.clone();
+        let guard = RunningEngine {
+            shared: shared.clone(),
+            thread: Some(
+                thread::Builder::new()
+                    .name("bench-control".into())
+                    .spawn(move || engine(handshake, engine_config, engine_shared, model))
+                    .unwrap(),
+            ),
+        };
+        let client: Arc<EngineClient> = Arc::new(listener.accept().await.unwrap());
+        let barrier = Arc::new(tokio::sync::Barrier::new(config.batch + 1));
+        let mut consumers = tokio::task::JoinSet::new();
+        for (row, request) in requests.into_iter().enumerate() {
+            let config = config.clone();
+            let shared = shared.clone();
+            let client = client.clone();
+            let barrier = barrier.clone();
+            let mut observation = ClientObservation::new(config.steps);
             consumers.spawn(async move {
                 barrier.wait().await;
-                let start=shared.ns();
-                let mut stream=client.generate(request).await.unwrap();
-                let submitted=shared.ns();
-                observation.started_ms=start as f64/1e6;
-                observation.submitted_ms=submitted as f64/1e6;
+                let start = shared.ns();
+                let mut stream = client.generate(request).await.unwrap();
+                let submitted = shared.ns();
+                observation.started_ms = start as f64 / 1e6;
+                observation.submitted_ms = submitted as f64 / 1e6;
                 for step in 0..config.steps {
-                    let chunk=tokio::time::timeout(Duration::from_secs(180),stream.next()).await.expect("stream makes progress").expect("one chunk each step").expect("valid output");
-                    let now=shared.ns();
-                    observation.ready_latency.push(now.saturating_sub(shared.ready_ns[step].load(Ordering::Acquire)) as f64/1e6);
-                    observation.intended_latency.push(now.saturating_sub(shared.intended_ns[step].load(Ordering::Acquire)) as f64/1e6);
-                    observation.arrival.push(now as f64/1e6);
-                    shared.last_received_ns.fetch_max(now,Ordering::Relaxed);
-                    shared.received.fetch_add(1,Ordering::AcqRel);
+                    let chunk = tokio::time::timeout(Duration::from_secs(180), stream.next())
+                        .await
+                        .expect("stream makes progress")
+                        .expect("one chunk each step")
+                        .expect("valid output");
+                    let now = shared.ns();
+                    observation.ready_latency.push(
+                        now.saturating_sub(shared.ready_ns[step].load(Ordering::Acquire)) as f64
+                            / 1e6,
+                    );
+                    observation.intended_latency.push(
+                        now.saturating_sub(shared.intended_ns[step].load(Ordering::Acquire)) as f64
+                            / 1e6,
+                    );
+                    observation.arrival.push(now as f64 / 1e6);
+                    shared.last_received_ns.fetch_max(now, Ordering::Relaxed);
+                    shared.received.fetch_add(1, Ordering::AcqRel);
                     // Constant-sized checks in the timing run. Behavioral tests
                     // exercise full values and protocol structure on small data.
-                    check_chunk(&chunk,&config,row,step);
-                    assert_eq!(chunk.output_ids,[output_token(step)]);
+                    check_chunk(&chunk, &config, row, step);
+                    assert_eq!(chunk.output_ids, [output_token(step)]);
                     drop(chunk);
-                    if config.consumer_delay_us>0 && step+1<config.steps {
+                    if config.consumer_delay_us > 0 && step + 1 < config.steps {
                         tokio::time::sleep(Duration::from_micros(config.consumer_delay_us)).await;
                     }
                 }
                 assert!(stream.next().await.is_none());
-                (row,observation)
+                (row, observation)
             });
         }
-        let mut rows:Vec<Option<ClientObservation>>=(0..config.batch).map(|_|None).collect();
-        let cpu_start=cpu_ms(ClockId::ProcessCPUTime);
+        let mut rows: Vec<Option<ClientObservation>> = (0..config.batch).map(|_| None).collect();
+        let cpu_start = cpu_ms(ClockId::ProcessCPUTime);
         shared.epoch.set(Instant::now()).unwrap();
         barrier.wait().await;
-        while let Some(result)=consumers.join_next().await {
-            let (row,data)=result.expect("consumer succeeds");rows[row]=Some(data);
+        while let Some(result) = consumers.join_next().await {
+            let (row, data) = result.expect("consumer succeeds");
+            rows[row] = Some(data);
         }
-        let drained_ns=shared.ns();
-        let process_cpu=cpu_ms(ClockId::ProcessCPUTime)-cpu_start;
-        assert_eq!(shared.received.load(Ordering::Acquire),config.batch*config.steps);
-        assert_eq!(client.in_flight(),[0]);
-        let pending=shared.max_pending.load(Ordering::Relaxed);
-        let engine=guard.finish();
+        let drained_ns = shared.ns();
+        let process_cpu = cpu_ms(ClockId::ProcessCPUTime) - cpu_start;
+        assert_eq!(
+            shared.received.load(Ordering::Acquire),
+            config.batch * config.steps,
+        );
+        assert_eq!(client.in_flight(), [0]);
+        let pending = shared.max_pending.load(Ordering::Relaxed);
+        let engine = guard.finish();
         // Report construction and histogram serialization do not run in the
         // measured client tasks or block receipt of another request's chunk.
-        let rows:Vec<_>=rows.into_iter().map(|r|r.unwrap().into_json()).collect();
-        json!({"engine":engine,"rows":rows,"all_received_ms":shared.last_received_ns.load(Ordering::Relaxed) as f64/1e6,
-            "consumer_completed_ms":drained_ns as f64/1e6,
-            "process_cpu_ms":process_cpu,"max_pending_output_rows":pending,
-            "checked_chunks":config.batch*config.steps})
+        let rows: Vec<_> = rows.into_iter().map(|r| r.unwrap().into_json()).collect();
+        json!({
+            "engine": engine,
+            "rows": rows,
+            "all_received_ms": shared.last_received_ns.load(Ordering::Relaxed) as f64 / 1e6,
+            "consumer_completed_ms": drained_ns as f64 / 1e6,
+            "process_cpu_ms": process_cpu,
+            "max_pending_output_rows": pending,
+            "checked_chunks": config.batch * config.steps,
+        })
     })
 }

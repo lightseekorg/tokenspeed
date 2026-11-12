@@ -67,6 +67,13 @@ rows report zero; older readers skip the appended column. `ts-client` output
 chunks, the Python chunk dictionaries, and `WireDriver.Completion` expose the
 same cumulative count.
 
+Completed prompt logprobs move from request state into the first output that
+ships them. The state retains the fact that they are final after transferring
+the buffers, so a retraction's replay neither gathers nor sends them again.
+The frontend likewise consumes a decoded batch into independently owned
+per-request chunks. A queued chunk owns its arrays until consumption or
+cancellation; one slow request need not retain another request's payload.
+
 ## Building
 
 Snapshot SDK updates carry a complete publication directory in the optional
