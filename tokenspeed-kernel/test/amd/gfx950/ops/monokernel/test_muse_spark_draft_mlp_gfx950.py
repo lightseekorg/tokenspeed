@@ -36,6 +36,7 @@ from utils import is_cdna4
 if not is_cdna4():
     pytest.skip("AMD CDNA4 is required", allow_module_level=True)
 
+import muse_spark_standins as standins  # noqa: E402
 from monokernel_testing import payloads  # noqa: E402
 from tokenspeed_kernel.ops.communication._iris import (  # noqa: E402
     IrisGroup,
@@ -60,6 +61,21 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.weights import (  # noqa: E402
 
 WORLD, HIDDEN, OWNED = 8, ref.HIDDEN, 1024
 LAUNCHES = 2
+ALL = tuple(range(WORLD))
+
+
+def _shared_inputs(launch: int, rows: int, present):
+    """The half's replicated inputs (``inputs.draft_mlp_shared``) of a
+    zero-shard model for ``present``: the partials of the ranks outside it
+    are zero, and so are every partial's and the residual's columns those
+    ranks own, so they put exactly zero (red, ss and hin)."""
+    parts, residual, gain, coef_w, base = inputs.draft_mlp_shared(launch, rows)
+    absent = standins.absent_columns(HIDDEN, OWNED, present)
+    parts = [p if r in present else torch.zeros_like(p) for r, p in enumerate(parts)]
+    for p in parts:
+        p[:, absent] = 0
+    residual[:, absent] = 0
+    return parts, residual, gain, coef_w, base
 
 
 @gluon.jit
@@ -231,29 +247,50 @@ def _plan(rows: int) -> Plan:
     )
 
 
-def _worker(rank: int, port: int, rows: int) -> None:
-    torch.cuda.set_device(rank)
+def _worker(me: int, port: int, rows: int, present) -> None:
+    """``present``: None for the whole TP8 group, one process a rank; or the
+    two rank programs that run (process ``me`` runs ``present[me]``) in a
+    zero-shard model (:func:`_shared_inputs`) whose other ranks' puts
+    (exactly zero) the host writes before each launch."""
+    torch.cuda.set_device(me)
     dist.init_process_group(
         "gloo",
         init_method=f"tcp://localhost:{port}",
-        rank=rank,
-        world_size=WORLD,
+        rank=me,
+        world_size=WORLD if present is None else len(present),
         timeout=timedelta(seconds=300),
     )
     try:
-        device = torch.device(f"cuda:{rank}")
+        device = torch.device(f"cuda:{me}")
         ctx = get_or_create_context(heap_size=256 << 20)
-        group = IrisGroup(ctx, dist.group.WORLD, rank, device)
+        group = IrisGroup(ctx, dist.group.WORLD, me, device)
         plan = _plan(rows)
         scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
+        if present is None:
+            rank, model, bases = me, ALL, group.bases
+        else:
+            rank, model = present[me], present
+            ghost = torch.zeros_like(scratch)
+            bases = standins.peer_bases(group.bases, present, me, scratch, ghost)
         own = slice(rank * OWNED, (rank + 1) * OWNED)
         group.finish_prepare()
         # Each launch has new inputs and a new step (the peer regions'
         # copies alternate).
         for k in range(LAUNCHES):
             step = 11 + k
-            parts, residual, gain, coef_w, base = inputs.draft_mlp_shared(k, rows)
+            parts, residual, gain, coef_w, base = _shared_inputs(k, rows, model)
             gu_w, down_w = inputs.draft_mlp_rank(k, rank)
+            if present is not None:
+                standins.standin_fill(
+                    scratch,
+                    plan,
+                    present,
+                    [(0, t) for t in range(rows)],
+                    step,
+                    0,
+                    step & 1,
+                    True,
+                )
             residual_out = torch.zeros(
                 rows, HIDDEN, dtype=torch.bfloat16, device=device
             )
@@ -261,7 +298,7 @@ def _worker(rank: int, port: int, rows: int) -> None:
             draft_mlp_kernel[(plan.grid,)](
                 scratch,
                 torch.full((1,), step, dtype=torch.int32, device=device),
-                group.bases,
+                bases,
                 parts[rank].to(device),
                 residual.to(device),
                 residual_out,
@@ -300,6 +337,12 @@ def _worker(rank: int, port: int, rows: int) -> None:
             # order; the projections sum their K parts in another order.
             h = region("hin", HIDDEN // 2, copy=step & 1)
             ref.assert_bf16_close(h, want_h)
+            if present is not None:
+                # The model is what the stand-ins claim: the absent ranks'
+                # columns of the normed input are zero, in both.
+                absent = standins.absent_columns(HIDDEN, OWNED, present)
+                assert not want_h[:, absent].float().any()
+                assert not h[:, absent].float().any()
             # The convolutions read a coefficient as its two K parts' sum,
             # rounded to BF16.
             cpart = words("cpart", 2 * ref.COEFFICIENTS).view(torch.float32)
@@ -336,4 +379,24 @@ def test_draft_mlp_half_matches_the_reference_stage_by_stage(rows: int):
     with socket.socket() as sock:
         sock.bind(("", 0))
         port = sock.getsockname()[1]
-    mp.spawn(_worker, args=(port, rows), nprocs=WORLD, join=True)
+    mp.spawn(_worker, args=(port, rows, None), nprocs=WORLD, join=True)
+
+
+@pytest.mark.parametrize("present", standins.PAIRS, ids=standins.PAIR_IDS)
+@pytest.mark.parametrize("rows", [8, 16])
+def test_draft_mlp_half_matches_the_reference_stage_by_stage_on_two_gpus(
+    rows: int, present
+):
+    """As :func:`test_draft_mlp_half_matches_the_reference_stage_by_stage`
+    with the production rank programs ``present`` on two GPUs, in a
+    zero-shard model (:func:`_shared_inputs`) whose six other ranks put
+    exactly zero (the host writes it): every stage against the reference on
+    the kernel's own input, and the absent ranks' columns of the normed
+    input stay zero. Two non-zero terms per sum cannot check the rank order
+    of the eight-rank all-reduce (see muse_spark_standins)."""
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires 2 GPUs")
+    with socket.socket() as sock:
+        sock.bind(("", 0))
+        port = sock.getsockname()[1]
+    mp.spawn(_worker, args=(port, rows, present), nprocs=2, join=True)
