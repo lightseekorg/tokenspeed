@@ -196,12 +196,8 @@ It stores no caller stream. `close()` only clears transport references;
 the owners of the cache arena and process groups manage completion before
 replacing or destroying those resources. The production close calls come
 from cache-pool publication: the first bind has no old transport, and a
-startup rebind follows warmup synchronization. A caller handing work to
-another stream must establish the required dependencies before reusing cache
-or temporary storage. Transient inputs allocated on another stream must also
-remain alive until their device consumers complete; waiting for their
-producers alone does not protect their storage. Concurrent use of one
-transport is unsupported.
+startup rebind follows warmup synchronization. Concurrent use of one transport
+is unsupported.
 
 Run `test/test_mla_cp_transport.py` with `torchrun` and an explicit `TEST_OUTPUT`
 directory. It covers compact shared history pages, empty/uneven owners, both

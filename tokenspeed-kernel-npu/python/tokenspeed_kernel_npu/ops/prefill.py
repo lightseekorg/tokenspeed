@@ -34,8 +34,7 @@ class AscendDSAPrefill:
     Gather, patch and attention rely on that execution stream's queue order;
     the transport does not insert dependencies between caller streams.
     Temporary buffers and TS forward inputs use that same allocation stream;
-    cache and router owners retain persistent inputs. Callers supplying inputs
-    allocated on another stream must keep them alive through device completion.
+    cache and router owners retain persistent inputs.
     No transport workspace is kept between layers.
     """
 
