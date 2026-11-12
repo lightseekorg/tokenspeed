@@ -158,6 +158,12 @@ def cuda_kimi3_sigmoid_bias_topk(
     return sigmoid_bias_topk(router_logits, correction_bias, out=out)
 
 
+__all__ = [
+    "cuda_sqrt_softplus_topk",
+    "cuda_kimi3_sigmoid_bias_topk",
+    "moe_finalize_fuse_shared",
+]
+
 # The fused front is validated on 152-SM GB300 parts only; the vendored programs also
 # compile for SM100, which stays on the separate projections until measured.
 _FRONT_PLATFORM = current_platform()
@@ -235,10 +241,4 @@ if (
             shared_act,
         )
 
-
-__all__ = [
-    "cuda_sqrt_softplus_topk",
-    "cuda_kimi3_sigmoid_bias_topk",
-    "cuda_latent_input",
-    "moe_finalize_fuse_shared",
-]
+    __all__.append("cuda_latent_input")

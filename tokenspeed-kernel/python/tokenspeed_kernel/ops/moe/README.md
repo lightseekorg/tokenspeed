@@ -467,8 +467,11 @@ Other contracts retain their existing routers.
 `try_latent_moe_input_projections` runs a registered fused implementation or
 returns `None` before any projection. This lets the runtime retain the
 separate projections and their stream scheduling for unsupported inputs.
-`latent_moe_input_projections` keeps its portable composition when no fused
-implementation is available.
+Automatic selection takes only kernels of the `SPECIALIZED` band or above: the
+separate projections already run on vendor GEMMs, so the generic packed Triton
+kernel would replace them with something slower. Explicit `override` or
+`solution` requests are preserved. `latent_moe_input_projections` keeps its
+portable composition when no fused implementation is available.
 
 `cuda_latent_input` is the vendored FlashInfer/Cake fused front
 (`thirdparty/cuda/kimi3_latent_front.py` and `csrc/kimi3_latent_front/`): one

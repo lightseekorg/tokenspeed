@@ -98,14 +98,40 @@ def test_front_matches_reference_and_replays_changed_inputs(weights, rows):
         torch.testing.assert_close(value, expected, atol=tolerance, rtol=tolerance)
 
 
+@pytest.fixture(scope="module")
+def packed_weights(weights):
+    """The same weights as consecutive rows of one tensor, as the model stores them."""
+    packed = torch.cat(weights, dim=0)
+    offset = 0
+    views = []
+    for weight in weights:
+        views.append(packed.narrow(0, offset, weight.shape[0]))
+        offset += weight.shape[0]
+    return tuple(views)
+
+
 @pytest.mark.parametrize("rows", [1, 128, 1024, 2047])
-def test_front_declines_small_rows(weights, rows):
+def test_front_declines_small_rows(weights, packed_weights, rows):
     x = torch.zeros(rows, 7168, device="cuda", dtype=torch.bfloat16)
     assert (
         try_latent_moe_input_projections(x, *weights, gate_clamp=4.0, up_clamp=25.0)
         is None
     )
+    # Packed weights match the generic packed Triton kernel, which is slower than
+    # the caller's separate projections, so automatic selection still declines;
+    # an explicit request for it is preserved.
+    assert (
+        try_latent_moe_input_projections(
+            x, *packed_weights, gate_clamp=4.0, up_clamp=25.0
+        )
+        is None
+    )
     assert torch.count_nonzero(x).item() == 0
+    explicit = try_latent_moe_input_projections(
+        x, *packed_weights, gate_clamp=4.0, up_clamp=25.0, solution="triton"
+    )
+    for value, expected in zip(explicit, reference(x, weights), strict=True):
+        torch.testing.assert_close(value, expected, atol=1e-2, rtol=1e-2)
     with pytest.raises(NoKernelFoundError):
         try_latent_moe_input_projections(
             x,

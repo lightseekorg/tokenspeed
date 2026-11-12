@@ -3115,6 +3115,26 @@ class KimiLinearMoE(nn.Module):
                     "Shared-expert communication must be prepared before forward"
                 )
 
+        # The fused front runs before the fork scope: the scope's fork event is
+        # recorded at entry, so an auxiliary branch is only ordered after work
+        # enqueued on main before this point, and the shared down projection on
+        # the branch below reads the front's shared_activated.
+        fused_inputs = None
+        if (
+            num_tokens > 0
+            and shared_communication is None
+            and hidden_states.is_cuda
+            and self.shared_experts.gate_up_proj.weight.dtype == hidden_states.dtype
+        ):
+            fused_inputs = try_latent_moe_input_projections(
+                hidden_states,
+                self.gate.weight,
+                self.routed_expert_down_proj.weight,
+                self.shared_experts.gate_up_proj.weight,
+                gate_clamp=self.shared_experts.act_fn.beta,
+                up_clamp=self.shared_experts.act_fn.linear_beta,
+            )
+
         with self.stream_fork.scope(
             enable=get_is_cuda_graph_phase(), overlap=get_is_capture_mode()
         ) as fork:
@@ -3131,21 +3151,6 @@ class KimiLinearMoE(nn.Module):
 
             shared_activated = None
             if num_tokens > 0:
-                fused_inputs = None
-                if (
-                    shared_communication is None
-                    and hidden_states.is_cuda
-                    and self.shared_experts.gate_up_proj.weight.dtype
-                    == hidden_states.dtype
-                ):
-                    fused_inputs = try_latent_moe_input_projections(
-                        hidden_states,
-                        self.gate.weight,
-                        self.routed_expert_down_proj.weight,
-                        self.shared_experts.gate_up_proj.weight,
-                        gate_clamp=self.shared_experts.act_fn.beta,
-                        up_clamp=self.shared_experts.act_fn.linear_beta,
-                    )
                 if fused_inputs is None:
                     router_logits = self.gate(hidden_states)
                 else:

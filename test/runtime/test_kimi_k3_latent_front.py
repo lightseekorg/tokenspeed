@@ -43,6 +43,7 @@ register_cuda_ci(
 
 from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
 from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.execution import forward_step
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
@@ -82,7 +83,7 @@ class UnloadedExperts(nn.Module):
         topk_output,
         num_global_tokens,
         max_num_tokens_per_gpu,
-        do_finalize
+        do_finalize,
     ):
         factor = (
             topk_output.topk_weights.float()
@@ -91,8 +92,8 @@ class UnloadedExperts(nn.Module):
         return (hidden_states.float() * factor).to(hidden_states.dtype)
 
 
-@pytest.mark.parametrize("rows", [64, 2048, 8192, 32768])
-def test_attention_dp_front_preserves_routing_and_output(monkeypatch, rows):
+def build_layer(monkeypatch, *, alt_stream):
+    """An attention-DP Kimi-K3 MoE block with packed projection weights."""
     platform = current_platform()
     if not (
         platform.is_nvidia
@@ -132,11 +133,18 @@ def test_attention_dp_front_preserves_routing_and_output(monkeypatch, rows):
                 moe_block_count=1,
                 quant_config=None,
                 prefix="moe",
-                alt_stream=None,
+                alt_stream=alt_stream,
             )
     finally:
         torch.set_default_dtype(dtype)
-    ctx = ForwardContext(
+    # Weight loading packs the three projections into one tensor, which is
+    # what lets the generic packed kernels match the inputs.
+    layer.pack_input_projection_weights()
+    return layer
+
+
+def forward_context(rows):
+    return ForwardContext(
         attn_backend=None,
         token_to_kv_pool=None,
         bs=1,
@@ -146,16 +154,27 @@ def test_attention_dp_front_preserves_routing_and_output(monkeypatch, rows):
         output_layout=ForwardOutputLayout(1, 1, 0, 1),
         global_num_tokens=[rows, rows],
     )
+
+
+def init_parameters(layer, rows):
     torch.manual_seed(271 + rows)
+    for parameter in layer.parameters():
+        if parameter.ndim == 1:
+            parameter.fill_(1.0)
+        else:
+            parameter.normal_(std=1.0 / math.sqrt(parameter.shape[-1]))
+    layer.gate.e_score_correction_bias.zero_()
+    hidden = torch.randn(rows, 7168, device="cuda", dtype=torch.bfloat16) * 0.25
+    prefix = torch.randn_like(hidden)
+    return hidden, prefix
+
+
+@pytest.mark.parametrize("rows", [64, 2048, 8192, 32768])
+def test_attention_dp_front_preserves_routing_and_output(monkeypatch, rows):
+    layer = build_layer(monkeypatch, alt_stream=None)
+    ctx = forward_context(rows)
     with torch.no_grad():
-        for parameter in layer.parameters():
-            if parameter.ndim == 1:
-                parameter.fill_(1.0)
-            else:
-                parameter.normal_(std=1.0 / math.sqrt(parameter.shape[-1]))
-        layer.gate.e_score_correction_bias.zero_()
-        hidden = torch.randn(rows, 7168, device="cuda", dtype=torch.bfloat16) * 0.25
-        prefix = torch.randn_like(hidden)
+        hidden, prefix = init_parameters(layer, rows)
 
         def reference():
             logits = layer.gate(hidden)
@@ -194,6 +213,9 @@ def test_attention_dp_front_preserves_routing_and_output(monkeypatch, rows):
             gate_clamp=4.0,
             up_clamp=25.0,
         )
+        # Below the fused front's row bound the packed Triton kernel matches
+        # the packed weights, but it is slower than the separate projections,
+        # so the block keeps them.
         assert (fused is not None) == (rows >= 2048)
         expected = reference()
         actual = layer(hidden, prefix, 2 * rows, rows, ctx, prefix_is_sharded=False)
@@ -206,3 +228,58 @@ def test_attention_dp_front_preserves_routing_and_output(monkeypatch, rows):
         hidden.normal_(std=0.125)
         graph.replay()
         torch.testing.assert_close(captured, reference(), atol=1e-2, rtol=1e-2)
+
+
+def test_attention_dp_shared_down_projection_waits_for_the_front(monkeypatch):
+    """The auxiliary stream consumes the front's shared activation after it exists.
+
+    During the CUDA graph phase the shared down projection runs on the
+    auxiliary stream. Delaying the main stream right before the front makes a
+    missing dependency deterministic: the branch would then read the
+    activation buffer before the front wrote it.
+    """
+    rows = 2048
+    layer = build_layer(monkeypatch, alt_stream=torch.cuda.Stream())
+    ctx = forward_context(rows)
+    monkeypatch.setattr(forward_step, "_is_cuda_graph_phase", True)
+    front = kimi_k3.try_latent_moe_input_projections
+
+    def delayed_front(*args, **kwargs):
+        torch.cuda._sleep(2_000_000_000)
+        return front(*args, **kwargs)
+
+    monkeypatch.setattr(kimi_k3, "try_latent_moe_input_projections", delayed_front)
+    with torch.no_grad():
+        hidden, prefix = init_parameters(layer, rows)
+        shared = layer.shared_experts(hidden, down_out=None)
+        logits, latent, activated = front(
+            hidden,
+            layer.gate.weight,
+            layer.routed_expert_down_proj.weight,
+            layer.shared_experts.gate_up_proj.weight,
+            gate_clamp=4.0,
+            up_clamp=25.0,
+        )
+        routing = layer.topk(
+            hidden,
+            logits,
+            output_format=TopKOutputFormat.STANDARD,
+            num_token_non_padded=None,
+            expert_location_dispatch_info=None,
+            out=(layer.experts.weights[:rows], layer.experts.ids[:rows]),
+        )
+        routed = layer.experts(
+            hidden_states=latent,
+            topk_output=routing,
+            num_global_tokens=2 * rows,
+            max_num_tokens_per_gpu=rows,
+            do_finalize=True,
+        )
+        if layer.routed_expert_norm is not None:
+            routed = layer.routed_expert_norm(routed)
+        expected = layer.routed_expert_up_proj.forward_add3(
+            routed, prefix, shared, norm_weight=None, eps=None
+        )
+        actual = layer(hidden, prefix, 2 * rows, rows, ctx, prefix_is_sharded=False)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
