@@ -21,6 +21,48 @@
 
 import cutlass
 import cutlass.cute as cute
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import dsl_user_op
+
+
+@dsl_user_op
+def _exit_thread(*, loc=None, ip=None):
+    llvm.inline_asm(
+        None, [], "exit;", "~{memory}", has_side_effects=True, loc=loc, ip=ip
+    )
+
+
+@cute.jit
+def compact_split_grid(o, split_kv, acc_o, cluster_m):
+    # A sliced plan can use more splits than a fresh plan for its smaller batch.
+    chunks = cutlass.Int64(o.shape[3]) * split_kv
+    if cutlass.const_expr(acc_o is not None):
+        chunks = cutlass.min(chunks, acc_o.shape[1])
+    return (chunks * cluster_m, o.shape[2], 1)
+
+
+@cute.jit
+def split_block_coord(offsets, params):
+    block = cute.arch.block_idx()
+    chunk = block[0] // params.cluster_shape_mnk[0]
+    base = offsets[0]
+    if chunk >= offsets[params.problem_shape_b] - base:
+        # The whole cluster exits before initializing its pipelines.
+        _exit_thread()
+    target = chunk + base
+    lo = cutlass.Int32(0)
+    hi = params.problem_shape_b
+    while lo + 1 < hi:
+        mid = lo + (hi - lo) // 2
+        if offsets[mid] <= target:
+            lo = mid
+        else:
+            hi = mid
+    return (
+        block[0] % params.cluster_shape_mnk[0],
+        block[1] * params.problem_shape_b + lo,
+        target - offsets[lo],
+    )
 
 
 @cute.jit
@@ -46,7 +88,7 @@ def make_compact_split_workspace(H, D, S, B, workspace, partial_dtype, acc_dtype
 
 @cute.jit
 def offset_split_workspace(tensor, offsets, request):
-    if cutlass.const_expr(tensor is not None and offsets is not None):
+    if cutlass.const_expr(tensor is not None):
         # A sliced batch may begin after split zero in its original plan.
         offset = cutlass.Int64(offsets[request]) - cutlass.Int64(offsets[0])
         tensor = cute.make_tensor(

@@ -1401,17 +1401,16 @@ def _check_per_request_split_gpu(heads, q_len, dtype_name, causal, large_workspa
 
     _check_output(out, reference(), dtype_name)
 
-    sliced = tokenspeed_mla_decode(
-        **{
-            **kwargs,
-            "query": q[1:],
-            "block_tables": tables[1:],
-            "seq_lens": seq_lens[1:],
-            "block_split_kvs": splits[1:],
-            "block_split_offsets": offsets[1:],
-            "out": None,
-        }
-    )
+    sliced_kwargs = {
+        **kwargs,
+        "query": q[1:],
+        "block_tables": tables[1:],
+        "seq_lens": seq_lens[1:],
+        "block_split_kvs": splits[1:],
+        "block_split_offsets": offsets[1:],
+        "out": None,
+    }
+    sliced = tokenspeed_mla_decode(**sliced_kwargs)
     torch.cuda.synchronize()
     torch.testing.assert_close(sliced, out[1:], rtol=0, atol=0)
 
@@ -1438,6 +1437,7 @@ def _check_per_request_split_gpu(heads, q_len, dtype_name, causal, large_workspa
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
         tokenspeed_mla_decode(**kwargs)
+        captured_sliced = tokenspeed_mla_decode(**sliced_kwargs)
     seq_lens.copy_(seq_lens.flip(0))
     tokenspeed_mla_decode_split_kvs(seq_lens, splits, offsets, **split_args)
     out.fill_(float("nan"))
@@ -1445,6 +1445,7 @@ def _check_per_request_split_gpu(heads, q_len, dtype_name, causal, large_workspa
     torch.cuda.synchronize()
     _check_output(out, reference(), dtype_name)
     assert decode._get_compiled_mla_kernel.cache_info().misses == misses
+    torch.testing.assert_close(captured_sliced, out[1:], rtol=0, atol=0)
 
 
 def _check_local_visible_gpu(
@@ -1604,6 +1605,7 @@ class TestGPU:
             (1, 96, 4, False, 65537, False),
             (3, 96, 4, False, 16384, True),
             (2, 16, 4, False, 385, True),
+            (1, 128, 1, False, 385, True),
             (256, 128, 1, False, 4096, True),
             (64, 128, 4, False, 4096, True),
         ],
