@@ -398,10 +398,12 @@ data plane keeps the Host allocation.
 ### Observability
 
 With Prometheus metrics enabled, L3 exports rank-local query/GET/PUT counters,
-queue/backend cumulative durations, queued/running/completed job counts and
-their payload-byte totals. Completed jobs remain charged until their facts
-are polled. Separate scheduler gauges retain visibility of Ready holds and
-quarantined references after runtime completion. Waiting soft timeouts and
+queue/backend cumulative durations, queued/running/completed job counts,
+their payload-byte totals and each state's oldest job age. Completed jobs
+remain charged until their facts are polled. Ages count from submission on
+the executor's monotonic clock, as the pressure age does, so a detached
+running job keeps aging until it retires. Separate scheduler gauges retain
+visibility of Ready holds and quarantined references after runtime completion. Waiting soft timeouts and
 Ready expiration are different counters; client detachment increments neither.
 Pressure bypasses and dropped backup candidate keys have separate counters;
 the admission gate is a mirrored scheduler gauge. These do not count unique
@@ -416,6 +418,9 @@ and detached GET results; they measure neither network traffic nor published
 cache hits. Metrics do not participate in scheduler decisions or agreement.
 The `backend_calls` event counts adapter invocations; a create-only PUT can
 finish after its existence check without calling the native PUT API.
+[Observing the L3 cache tier](../operations/l3-observability.md) covers
+aggregation, alerts and the difference between degraded and quarantined
+storage.
 
 ### Supported scope
 

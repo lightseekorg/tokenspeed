@@ -1056,6 +1056,9 @@ pub struct L3OperationSnapshot {
     pub operations: Vec<(String, f64)>,
     /// Job bytes now, by state.
     pub bytes: Vec<(String, f64)>,
+    /// Per state, seconds since the oldest job now in it was submitted on
+    /// the executor's monotonic clock; 0 when the state is empty.
+    pub oldest_age_seconds: Vec<(String, f64)>,
 }
 
 /// An L3 executor snapshot (`ExecutorSnapshot`).
@@ -1121,6 +1124,7 @@ pub struct L3Metrics {
     seconds: Metric,
     operations: Metric,
     held_bytes: Metric,
+    oldest_age: Metric,
     health: Metric,
     epoch: Metric,
     unsafe_io: Metric,
@@ -1182,6 +1186,13 @@ impl L3Metrics {
                 exporter,
                 "tokenspeed:l3_io_buffer_bytes",
                 "Job byte ranges; excludes C++ Ready and quarantined ownership after poll.",
+                &with(&["kind", "state"]),
+            ),
+            oldest_age: Metric::gauge(
+                exporter,
+                "tokenspeed:l3_io_oldest_operation_age_seconds",
+                "Seconds since the oldest local job in this state was submitted; 0 when none. \
+                 Cancelled running jobs stay until native I/O ends; completed until polled.",
                 &with(&["kind", "state"]),
             ),
             health: Metric::gauge(
@@ -1293,6 +1304,10 @@ impl L3Metrics {
             }
             for (state, value) in &row.bytes {
                 self.held_bytes
+                    .set(&self.label_values(&[kind, state.as_str()]), *value);
+            }
+            for (state, value) in &row.oldest_age_seconds {
+                self.oldest_age
                     .set(&self.label_values(&[kind, state.as_str()]), *value);
             }
         }

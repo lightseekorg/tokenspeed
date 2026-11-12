@@ -832,14 +832,18 @@ impl Executor {
     }
 
     /// The counters, without backend or GPU work. Completed jobs count until
-    /// a poll delivers them.
+    /// a poll delivers them. Each state's oldest age is measured from the
+    /// job's submission, as the poll's pressure age is: a cancelled running
+    /// job stays running until its native I/O ends.
     pub fn snapshot(&self) -> L3ExecutorSnapshot {
         let state = self.shared.lock();
+        let now = (self.shared.clock)();
         let operations = KINDS
             .iter()
             .map(|&kind| {
                 let counters = state.counters[kind.index()];
-                let mut phases = [(0.0, 0.0); 3];
+                // Per phase: jobs, bytes, and the oldest job's age.
+                let mut phases = [(0.0, 0.0, 0.0); 3];
                 for job_state in state.jobs.values().filter(|job| job.job.kind == kind) {
                     let phase = if job_state.completed {
                         2
@@ -850,8 +854,9 @@ impl Executor {
                     };
                     phases[phase].0 += 1.0;
                     phases[phase].1 += job_state.num_bytes as f64;
+                    phases[phase].2 = f64::max(phases[phase].2, now - job_state.submitted_at);
                 }
-                let by_phase = |pick: fn(&(f64, f64)) -> f64| -> Vec<(String, f64)> {
+                let by_phase = |pick: fn(&(f64, f64, f64)) -> f64| -> Vec<(String, f64)> {
                     ["queued", "running", "completed"]
                         .iter()
                         .zip(&phases)
@@ -879,6 +884,7 @@ impl Executor {
                     backend_seconds: counters.backend_seconds,
                     operations: by_phase(|phase| phase.0),
                     bytes: by_phase(|phase| phase.1),
+                    oldest_age_seconds: by_phase(|phase| phase.2),
                 }
             })
             .collect();
@@ -1674,6 +1680,140 @@ mod tests {
         release.set();
         assert!(harness.wait(2).iter().all(|c| c.retired));
         assert_eq!(executor.poll().pressure.oldest_operation_us, 0);
+    }
+
+    /// `kind`'s oldest ages: queued, running, completed.
+    fn ages(executor: &Executor, kind: &str) -> Vec<f64> {
+        let ages = row(&executor.snapshot(), kind).oldest_age_seconds;
+        let states: Vec<&str> = ages.iter().map(|(state, _)| state.as_str()).collect();
+        assert_eq!(states, ["queued", "running", "completed"]);
+        ages.into_iter().map(|(_, age)| age).collect()
+    }
+
+    #[test]
+    fn snapshot_ages_follow_a_job_from_submission_until_its_fact_is_polled() {
+        let now = Arc::new(Mutex::new(10.0));
+        // Per job, its I/O started and its release: `first`, then `second`.
+        let gates: Arc<[(Event, Event); 2]> = Arc::default();
+        let store_gates = Arc::clone(&gates);
+        let store = TestStore {
+            get: Some(Box::new(move |keys, _, _| {
+                let (started, release) = &store_gates[usize::from(!keys[0].contains("_first"))];
+                started.set();
+                assert!(release.wait(Duration::from_secs(5)));
+                Ok(IoResult {
+                    success: vec![true; keys.len()],
+                    retired: true,
+                    object_failures: vec![false; keys.len()],
+                })
+            })),
+            ..TestStore::new()
+        };
+        let harness = Harness::start(
+            store,
+            ExecutorConfig {
+                read_workers: 1,
+                ..CONFIG
+            },
+            layout(1, 0, 0),
+            fake_clock(&now),
+        );
+        let executor = harness.executor();
+        for kind in ["query", "get", "put"] {
+            assert_eq!(ages(executor, kind), [0.0, 0.0, 0.0]);
+        }
+        executor.submit(&[get(1, "first", 1)]).unwrap();
+        assert!(gates[0].0.wait(Duration::from_secs(1)));
+        *now.lock().unwrap() = 10.5;
+        executor
+            .submit(&[get(2, "second", 2), get(3, "cancelled", 3)])
+            .unwrap();
+        *now.lock().unwrap() = 12.0;
+        assert_eq!(ages(executor, "get"), [1.5, 2.0, 0.0]);
+        assert_eq!(ages(executor, "put"), [0.0, 0.0, 0.0]);
+        // Both ages count from submission, as the poll's pressure age does.
+        assert_eq!(executor.poll().pressure.oldest_operation_us, 2_000_000);
+
+        executor
+            .submit(&[
+                Operation::Cancel { op_id: 3 },
+                Operation::Cancel { op_id: 1 },
+            ])
+            .unwrap();
+        *now.lock().unwrap() = 13.0;
+        // The cancelled queued job is an undelivered fact; cancelling the
+        // running one does not end its native I/O.
+        assert_eq!(ages(executor, "get"), [2.5, 3.0, 2.5]);
+        let delivered: Vec<u64> = executor
+            .poll()
+            .completions
+            .iter()
+            .map(|c| c.op_id)
+            .collect();
+        assert_eq!(delivered, [3]);
+        assert_eq!(ages(executor, "get"), [2.5, 3.0, 0.0]);
+
+        // The worker finishes `first`, then starts `second` at 14.
+        *now.lock().unwrap() = 14.0;
+        gates[0].1.set();
+        assert!(gates[1].0.wait(Duration::from_secs(1)));
+        assert_eq!(ages(executor, "get"), [0.0, 3.5, 4.0]);
+        let delivered: Vec<u64> = executor
+            .poll()
+            .completions
+            .iter()
+            .map(|c| c.op_id)
+            .collect();
+        assert_eq!(delivered, [1]);
+        assert_eq!(ages(executor, "get"), [0.0, 3.5, 0.0]);
+
+        gates[1].1.set();
+        assert_eq!(harness.wait(1)[0].op_id, 2);
+        assert_eq!(ages(executor, "get"), [0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn reading_snapshots_calls_no_backend_and_leaves_the_recovery_probe() {
+        let now = Arc::new(Mutex::new(0.0));
+        let memory = Arc::new(MemoryStore::new());
+        let writer = Arc::clone(&memory);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempted = Arc::clone(&attempts);
+        let store = TestStore {
+            memory: Arc::clone(&memory),
+            // The first PUT opens the backend; later ones succeed.
+            put: Some(Box::new(move |keys, host, ranges| {
+                if attempted.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(StoreError("unavailable".to_owned()))
+                } else {
+                    writer.batch_put_from(keys, host, ranges)
+                }
+            })),
+            ..TestStore::new()
+        };
+        let calls = Arc::clone(&store.calls);
+        let harness = Harness::start(store, CONFIG, layout(1, 0, 0), fake_clock(&now));
+        let executor = harness.executor();
+        executor.submit(&[put(1, "a", 1)]).unwrap();
+        assert_eq!(harness.wait(1)[0].success, [false]);
+        // Past the recovery interval: the next backend call is the probe.
+        *now.lock().unwrap() = CONFIG.recovery_interval.as_secs_f64() + 1.0;
+        let before = executor.snapshot();
+        assert_eq!(before.health_state, "open");
+        for _ in 0..3 {
+            assert!(executor.poll().completions.is_empty());
+            // Cumulative counters do not grow by being read.
+            assert_eq!(executor.snapshot(), before);
+        }
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert_eq!(value(&row(&before, "put").events, "backend_calls"), 1.0);
+
+        executor.submit(&[put(2, "b", 2)]).unwrap();
+        assert_eq!(harness.wait(1)[0].success, [true]);
+        let after = executor.snapshot();
+        assert_eq!(after.health_state, "healthy");
+        assert_eq!(value(&row(&after, "put").events, "backend_calls"), 2.0);
+        assert_eq!(calls.lock().unwrap().len(), 2);
     }
 
     #[test]
