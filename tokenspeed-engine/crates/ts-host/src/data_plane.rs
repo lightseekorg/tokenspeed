@@ -935,6 +935,8 @@ mod tests {
 
     use super::*;
 
+    mod cpu_benchmark;
+
     /// Start the interpreter once per test process, with the scheduler
     /// module built in and the repository's `tokenspeed_scheduler` package
     /// importable.
