@@ -399,11 +399,8 @@ def try_latent_moe_input_projections(
 
     Arguments and outputs match :func:`latent_moe_input_projections`. A caller
     that schedules separate projections can retain that scheduling when no
-    fused implementation supports the inputs. Automatic selection takes only
-    kernels of the ``SPECIALIZED`` band or above: the caller's separate
-    projections already run on vendor GEMMs, so a generic fused kernel of the
-    portable or performant band would only replace them with something slower.
-    Explicit backend requests (``override`` or ``solution``) are preserved.
+    fused implementation supports the inputs. Automatic selection declines
+    correctness references; explicit backend requests are preserved.
     """
     if hidden_states.ndim != 2 or hidden_states.shape[0] < 1:
         raise ValueError("hidden_states must have shape [tokens, hidden_size]")
@@ -462,7 +459,7 @@ def try_latent_moe_input_projections(
     if kernel is not None and override is None and solution is None:
         spec = KernelRegistry.get().get_by_name(kernel.name)
         assert spec is not None
-        if spec.priority < Priority.SPECIALIZED:
+        if spec.priority == Priority.REFERENCE:
             return None
 
     if kernel is not None:

@@ -213,9 +213,9 @@ def test_attention_dp_front_preserves_routing_and_output(monkeypatch, rows):
             gate_clamp=4.0,
             up_clamp=25.0,
         )
-        # Below the fused front's row bound the packed Triton kernel matches
-        # the packed weights, but it is slower than the separate projections,
-        # so the block keeps them.
+        # Below the fused front's row bound no fused kernel matches on NVIDIA
+        # (the generic packed Triton kernel is AMD-only), so the block keeps
+        # the separate projections.
         assert (fused is not None) == (rows >= 2048)
         expected = reference()
         actual = layer(hidden, prefix, 2 * rows, rows, ctx, prefix_is_sharded=False)

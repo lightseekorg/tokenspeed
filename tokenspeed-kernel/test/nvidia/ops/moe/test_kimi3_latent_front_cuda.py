@@ -117,9 +117,8 @@ def test_front_declines_small_rows(weights, packed_weights, rows):
         try_latent_moe_input_projections(x, *weights, gate_clamp=4.0, up_clamp=25.0)
         is None
     )
-    # Packed weights match the generic packed Triton kernel, which is slower than
-    # the caller's separate projections, so automatic selection still declines;
-    # an explicit request for it is preserved.
+    # The model stores the weights packed; the generic packed Triton kernel is
+    # AMD-only, so on NVIDIA nothing matches below the front's row bound.
     assert (
         try_latent_moe_input_projections(
             x, *packed_weights, gate_clamp=4.0, up_clamp=25.0
@@ -127,11 +126,6 @@ def test_front_declines_small_rows(weights, packed_weights, rows):
         is None
     )
     assert torch.count_nonzero(x).item() == 0
-    explicit = try_latent_moe_input_projections(
-        x, *packed_weights, gate_clamp=4.0, up_clamp=25.0, solution="triton"
-    )
-    for value, expected in zip(explicit, reference(x, weights), strict=True):
-        torch.testing.assert_close(value, expected, atol=1e-2, rtol=1e-2)
     with pytest.raises(NoKernelFoundError):
         try_latent_moe_input_projections(
             x,
