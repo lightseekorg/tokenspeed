@@ -155,6 +155,14 @@ class PyNcclCommunicator:
                 f"but the input tensor is on {tensor.device}"
             )
 
+    def _resolve_stream(self, stream: torch.cuda.Stream | None) -> torch.cuda.Stream:
+        """Prefer the explicit stream, then the context stream, then the current stream."""
+        if stream is None:
+            stream = self.stream
+        if stream is None:
+            stream = torch.cuda.current_stream(self.device)
+        return stream
+
     def all_reduce(
         self, tensor: torch.Tensor, op: ReduceOp = ReduceOp.SUM, stream=None
     ):
@@ -164,10 +172,7 @@ class PyNcclCommunicator:
         # will only work on tensors on the same device
         # otherwise it will cause "illegal memory access"
         self._check_device(tensor)
-        if stream is None:
-            stream = self.stream
-        if stream is None:
-            stream = torch.cuda.current_stream(self.device)
+        stream = self._resolve_stream(stream)
         self.nccl.ncclAllReduce(
             buffer_type(tensor.data_ptr()),
             buffer_type(tensor.data_ptr()),
@@ -187,10 +192,7 @@ class PyNcclCommunicator:
         # will only work on tensors on the same device
         # otherwise it will cause "illegal memory access"
         self._check_device(input_tensor)
-        if stream is None:
-            stream = self.stream
-        if stream is None:
-            stream = torch.cuda.current_stream(self.device)
+        stream = self._resolve_stream(stream)
         self.nccl.ncclAllGather(
             buffer_type(input_tensor.data_ptr()),
             buffer_type(output_tensor.data_ptr()),
@@ -213,10 +215,7 @@ class PyNcclCommunicator:
         # will only work on tensors on the same device
         # otherwise it will cause "illegal memory access"
         self._check_device(input_tensor)
-        if stream is None:
-            stream = self.stream
-        if stream is None:
-            stream = torch.cuda.current_stream(self.device)
+        stream = self._resolve_stream(stream)
         self.nccl.ncclReduceScatter(
             buffer_type(input_tensor.data_ptr()),
             buffer_type(output_tensor.data_ptr()),
@@ -231,10 +230,7 @@ class PyNcclCommunicator:
         if self.disabled:
             return
         self._check_device(tensor)
-        if stream is None:
-            stream = self.stream
-        if stream is None:
-            stream = torch.cuda.current_stream(self.device)
+        stream = self._resolve_stream(stream)
         self.nccl.ncclSend(
             buffer_type(tensor.data_ptr()),
             tensor.numel(),
@@ -248,10 +244,7 @@ class PyNcclCommunicator:
         if self.disabled:
             return
         self._check_device(tensor)
-        if stream is None:
-            stream = self.stream
-        if stream is None:
-            stream = torch.cuda.current_stream(self.device)
+        stream = self._resolve_stream(stream)
         self.nccl.ncclRecv(
             buffer_type(tensor.data_ptr()),
             tensor.numel(),
@@ -265,10 +258,7 @@ class PyNcclCommunicator:
         if self.disabled:
             return
         self._check_device(tensor)
-        if stream is None:
-            stream = self.stream
-        if stream is None:
-            stream = torch.cuda.current_stream(self.device)
+        stream = self._resolve_stream(stream)
         if src == self.rank:
             sendbuff = buffer_type(tensor.data_ptr())
             # NCCL requires the sender also to have a receive buffer

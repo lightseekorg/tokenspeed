@@ -207,12 +207,13 @@ count; local layout differences only require packing and copying back.
 
 ### PyNCCL stream ordering
 
-When PyNCCL is enabled, an operation without an explicit stream runs on the
-calling thread's current CUDA stream. A stream supplied to the operation or
-its communicator context takes precedence. This contract is identical during
-eager execution and graph capture, so a separate communicator stream cannot
-race input production or output consumption. Exiting the context, including
-through an exception, restores the prior communicator state.
+When PyNCCL is enabled, every operation uses the same stream precedence:
+its explicit stream argument, then its communicator context's stream, then
+the calling thread's current CUDA stream on the communicator's device.
+This contract is identical during eager execution and graph capture, so a
+separate communicator stream cannot race input production or output
+consumption. Exiting the context, including through an exception, restores
+the prior communicator state.
 
 ### Rebinding a cache pool
 

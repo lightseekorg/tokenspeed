@@ -60,22 +60,26 @@ def _worker(rank, rendezvous):
     comm = backend._get_or_create_resources(group)["pynccl_comm"]
     assert comm is not None and comm.available
     producer = torch.cuda.Stream()
+    other = torch.cuda.Stream()
     results = []
-    for stream in (producer, None):
+    # Keep the lower-priority streams distinct to check all three precedence levels.
+    for current, context, explicit in (
+        (producer, None, None),
+        (other, producer, None),
+        (other, other, producer),
+    ):
         tensor = torch.zeros(1, dtype=torch.int32, device="cuda")
         torch.cuda.synchronize()
         dist.barrier()
-        with torch.cuda.stream(producer), comm.change_state(enable=True, stream=stream):
+        with torch.cuda.stream(producer):
             # Widen the overlap: the input value is ready only on the producer stream.
             torch.cuda._sleep(200_000_000)
             tensor.fill_(rank + 1)
-            backend.all_reduce(tensor, group)
+        with torch.cuda.stream(current), comm.change_state(enable=True, stream=context):
+            comm.all_reduce(tensor, stream=explicit)
         torch.cuda.synchronize()
         results.append(tensor.item())
-    print(
-        f"rank={rank}, explicit producer stream / default PyNCCL stream: {results}",
-        flush=True,
-    )
+    print(f"rank={rank}, current / context / explicit stream: {results}", flush=True)
     # Exercise each operation on the current side stream, including capture.
     inputs = torch.empty(2, dtype=torch.int32, device="cuda")
     reduced = torch.empty(1, dtype=torch.int32, device="cuda")
@@ -124,10 +128,7 @@ def _worker(rank, rendezvous):
         pass
     assert comm.disabled and comm.stream is None
     dist.destroy_process_group()
-    assert results == [
-        3,
-        3,
-    ], "collective missed the writes queued on the calling CUDA stream"
+    assert results == [3, 3, 3], "collective did not honor stream precedence"
 
 
 def test_pynccl_current_stream(tmp_path):
