@@ -115,8 +115,26 @@ def test_real_gdn_runtime_shapes_share_a_variant(analysis_module, tmp_path):
             }
         )
     )
-    config = json.loads((saved / "task.json").read_text())
-    base = config["clusters"][0]["workloads"][0]["params"]
+    parameter_contract = {
+        "parameters": {
+            "batch": {"source": "workload"},
+            "layers": {"source": "workload"},
+            "tokens": {"source": "workload"},
+            "accepted_lengths": {"source": "workload"},
+            "geometry": {"source": "model"},
+            "seed": {"source": "harness"},
+            "correctness_contract": {"source": "harness"},
+        }
+    }
+    base = {
+        "seed": 731,
+        "batch": 8,
+        "layers": 2,
+        "tokens": 4,
+        "geometry": [4, 12, 128, 128],
+        "accepted_lengths": [1, 2, 3, 4],
+        "correctness_contract": "repository",
+    }
     workloads = [
         {
             "params": {
@@ -131,7 +149,7 @@ def test_real_gdn_runtime_shapes_share_a_variant(analysis_module, tmp_path):
     result = analysis_module.analyze(
         {
             "candidate": {"path": str(tmp_path)},
-            "parameter_contract": config["parameter_contract"],
+            "parameter_contract": parameter_contract,
             "workloads": workloads,
         }
     )

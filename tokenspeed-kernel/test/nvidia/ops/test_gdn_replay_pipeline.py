@@ -69,6 +69,7 @@ def test_replay_pipeline_registry_dispatch(batch):
         draft_token_num=case.tokens,
         geometry=(2, 6, 128, 128),
         state_dtype=case.pool.dtype,
+        rows_aligned=False,
         override="gluon_nvidia_gdn_replay_commit",
     )
     _check_result(case, initial)

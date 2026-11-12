@@ -203,7 +203,9 @@ def _check(module, settings, params):
         if b > 2:
             kwargs["write_indices"][:, -1] = -1
         pool.copy_(initial)
-        gdn_replay_commit(payload, parameters, solution="triton", **kwargs)
+        gdn_replay_commit(
+            payload, parameters, solution="triton", rows_aligned=True, **kwargs
+        )
         expected = pool.clone()
         pool.copy_(initial)
         _launch(module, settings, payload, parameters, **kwargs)

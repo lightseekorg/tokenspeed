@@ -136,7 +136,12 @@ def _run_batch(args: argparse.Namespace, batch: int) -> list[dict[str, Any]]:
         state_dtype=state_dtype,
     )
     original = partial(
-        gdn_replay_commit, payload, parameters, solution="triton", **kwargs
+        gdn_replay_commit,
+        payload,
+        parameters,
+        solution="triton",
+        rows_aligned=True,
+        **kwargs,
     )
     original()
     expected = pool[:, batch + 1 :].clone()

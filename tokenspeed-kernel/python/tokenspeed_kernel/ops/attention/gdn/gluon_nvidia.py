@@ -903,13 +903,16 @@ def gluon_nvidia_gdn_replay_commit(
     head_k_dim: int,
     head_v_dim: int,
     state_dtype: torch.dtype,
+    rows_aligned: bool,
 ) -> None:
     """Commit accepted GDN states with the saved 24-CTA experiment settings.
 
     Arguments and in-place outputs follow ``gdn_replay_commit``. Key and value
     dimensions must both be 128, and the verify window must be at most 16.
     This opt-in solution uses two producer warps, eight compute warps, two
-    shared-memory slots, and a 168-register compilation limit.
+    shared-memory slots, and a 168-register compilation limit. The persistent
+    kernel detects row alignment from the pool metadata at runtime, so both
+    ``rows_aligned`` values are handled and the hint selects no separate path.
     """
     launch_gdn_replay_commit_persistent(
         payload,
