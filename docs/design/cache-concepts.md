@@ -96,7 +96,14 @@ fixes a single bucket on first use. Registration cannot change the geometry
 after it is fixed, including after all blocks are freed. The pool updates its
 per-bucket free-slot counts and bucket indexes together on every occupancy
 transition. A parent with zero occupants is unbound, so its capacity belongs
-to the global empty-parent FIFO rather than any group.
+to the global empty-parent FIFO rather than any group. An allocated block
+never moves, with one exception: a lone request's compaction
+(`CacheCoordinator::CompactLoneRequest`, `scheduler.md` §1.4) gathers the
+request's own blocks of a packed group into fewer of its parents, naming
+the free slot each one takes (`AcquireBlockAt`, the one placement that
+names its slot), so that the parents they leave empty return to the FIFO.
+A parent it keeps never empties between one block leaving it and another
+arriving: it would be unbound at once.
 
 Packing is a property of each pool. Device packing satisfies attention-kernel
 strides; compact Host storage uses a parent large enough for the largest single
@@ -183,9 +190,14 @@ The hash tables retain computed key hashes where the standard library supports
 it: walking a bucket or erasing an entry must not repeatedly hash its full
 content digest. Key equality and eviction order remain unchanged.
 
-The per-step page gauge composes two O(1)-or-cheaper quantities the same way:
-empty parents come from the pool, active parents from the live requests' block
+The per-step page gauge composes two O(1) quantities the same way: empty
+parents come from the pool, active parents from the live requests' block
 tables, and cache-only residency is the remainder `total - empty - active`.
+The tables keep the active count themselves: each slot holding a block owns a
+`ParentRef` (`cache/core/active_parents.h`) that counts the block's parent in
+the coordinator's `ActiveParents` for as long as the slot holds it, so reading
+the gauge walks nothing. The count is a holder fact kept by the holders; the
+pool never sees it. Debug builds check it against a walk of the tables.
 
 ## Who is allowed to see what
 
@@ -266,7 +278,8 @@ entry *values*, however, are **`CacheBlock` ids** — handles to the physical
 storage the cache layer allocated. The scheduler owns allocation, so its output names that storage directly.
 Consumers outside the cache layer treat the ids as opaque.
 Export preserves every logical slot, including holes in a released prefix.
-Export and active-parent accounting skip reading those released references.
+Every slot below the released prefix is null, so export skips reading those
+slots and they hold no active parent.
 On PD decode admission, a partial leading history block is a landing slot
 for the prefill peer. Installing its private writable block also rewinds
 the released-prefix frontier to include that slot: the outgoing destination
@@ -294,8 +307,10 @@ column count preserve logical indexing without writing long zero prefixes.
 No borrowed table escapes into an execution plan. The runtime uploads these
 windows and reconstructs absolute rows, including zero holes and `-1`
 padding, with the existing row-expansion kernel; a host mirror is built only
-when requested. The legacy absolute-table accessors materialize a stable,
-thread-safe cached buffer on demand. Copies share the immutable snapshot,
+when requested. CUDA and NPU use the same Triton row-expansion kernel through
+their respective vendor backends; other devices use the tensor fallback.
+The legacy absolute-table accessors materialize a stable, thread-safe cached
+buffer on demand. Copies share the immutable snapshot,
 and NumPy views keep their owning batch alive. Pinned staging remains
 runtime-owned; the scheduler neither allocates nor borrows a Torch buffer.
 
@@ -521,12 +536,7 @@ the pool's layerwise load tracker before their first read or write. A wait in a
 later attention-buffer accessor is too late: the side-cache kernels would
 already be racing the asynchronous H2D restore. Place the fence immediately
 before the first cache-field access so independent projections can still
-overlap the load. The fences are eager calls, so a captured prefill graph
-segment holds none: the latent rows an attention prologue writes there (into a
-page a tail hit loads) and the State checkpoint an inline KDA layer reads there
-would race the load. `PrefillGraph.replay` therefore waits for the plan's whole
-Host load before the first segment; a replayed forward overlaps only its
-embedding with that load.
+overlap the load.
 
 A write needs the fence as much as a read: a Host tail hit
 loads its partially filled last block whole, and the forward appends its new
@@ -535,6 +545,27 @@ overwritten by it. A pool's setters must therefore wait as its getters do. A
 draft view has its own tracker, and its layers land after all of the target's
 on either copy path, so no per-layer wait of the target forward covers a draft
 layer: the context rows a draft writes before its forward must wait themselves.
+
+A captured prefill graph segment cannot hold a fence: the latent rows an
+attention prologue writes there (into a page a tail hit loads) and the State
+checkpoint an inline KDA layer reads there would race the load. The fence call
+made during the capture instead notes its layer on the capture, and every
+replay waits, before each segment, for the highest layer that segment noted
+(the layers of a load land in order). The Host cache executor, which registers
+the load trackers the fences call, is therefore built before the graphs are
+captured. An access that no fence covers notes nothing: in a segment it would
+race the load, and in an eager break it would no longer run after the whole
+load. So a replay relies on the noted waits only on a pool whose class declares
+`layer_accesses_wait_for_load` (a subclass does not inherit it), set after
+auditing its accessors and the code that reaches them in a replay (the Kimi-K3
+pool). A replay on any other pool, or of a graph captured against another
+tracker than the pool's current one, or none, waits for the pool's whole Host
+load (its tracker's last layer) before the first segment instead, and skips the
+noted waits. A replay that relies on the noted waits has, like an eager forward,
+waited only for the layers it touched, not for a draft view's, which the
+whole-load wait covers on the Triton copy path (one kernel copies both): what
+touches a draft layer after the forward waits on the draft's tracker, as the
+context writes do.
 
 A batched post-verification commit is the one side-cache writer that issues no
 fence of its own. It moves every bound layer's fields in a single launch, so it
@@ -587,8 +618,12 @@ forwards and RDMA triggers behind it inherit the fence (the forward by
 waiting on the default stream in its prologue; that wait is one-way, the
 zeroing's and the writeback's own waits are what order the default and write
 streams behind the forwards). A load-back's prerequisite stream is the
-default stream that zeroed its destinations; its start event is recorded
-there rather than on whatever stream is current. Every stream the Host
+default stream, where its start event is recorded rather than on whatever
+stream is current. Load-back destinations are never zeroed, and an abort
+frees its request's blocks while that request's forward may still be in
+flight, so the device handle orders the default stream behind the
+execution stream before every plan's loads and restores: the zeroing and
+the block copies, which wait there too, are absent from many plans. Every stream the Host
 cache executor orders against is an argument, never ambient thread state.
 Each submission kind uses its own staging lane (`cache/transfer/lanes.py`:
 the stream-ordered and pinned write-backs, the snapshot store, and the
@@ -810,7 +845,9 @@ Perception rules per directory:
   pool-scoped: one index serves both the Device and Host tiers of its group. A
   cache entry is metadata plus an owning `CacheBlockRef` that publishes an
   existing block for reuse; registration neither allocates nor copies physical
-  storage.
+  storage. An entry moves only in lone-request compaction (`Relocate`,
+  `scheduler.md` §1.4): onto the copy of its block, keeping everything else
+  -- its key, epochs, session, pairing and boundary-tree hold included.
 * **`PrefixMatcher`** (`prefix_matcher.h`) — the per-attention-kind match
   policy. `FullAttnMatcher` walks left-to-right until the first miss
   (prefix-closed); `SwaMatcher` scans right-to-left for a run backing a
@@ -982,9 +1019,12 @@ Its responsibilities:
   So every tail block a hit claims becomes the hitter's own -- a
   Device→Device copy of the shared block (`AdmissionResult::pages_to_copy`,
   `(source, destination)` virtual ids in one bucket, the destination in the
-  hitter's table and never zeroed) or a fresh block where the probe left a
-  hole -- and a Host tail is loaded into fresh private pages like any Host
-  hit and never republished on the Device. The owner's side of the same
+  hitter's table and never zeroed; the source is where the block was
+  before a lone-request compaction of the same plan moved it, as
+  `Scheduler::recordAdmittedPages` composes the two copies) or a
+  fresh block where the probe left a hole -- and a Host tail is
+  loaded into fresh private pages like any Host hit and never
+  republished on the Device. The owner's side of the same
   rule is **copy-in**: the fused role's first decode, which publishes the
   prompt end and keeps writing past it (`OwnerTail::kCopiedIn`), registers
   the owner's tail blocks under `hash@T` and swaps into the table, for each
@@ -1050,7 +1090,11 @@ Its responsibilities:
   phase leaves the partial block a hole: the peer's transfer starts at the
   block containing `hit_tokens` and fills a fresh page whole, so the D role
   never copies it; a tail's full blocks below that page are copied like on
-  every role ([Scheduler §3.2](scheduler.md#32-d--decode-worker)).
+  every role ([Scheduler §3.2](scheduler.md#32-d--decode-worker)). Like any
+  copy destination, a block the transfer fills whole is not zeroed
+  (`GroupDemand::landed_tokens`, `StateStep::kLand`): the landing zeroes
+  only the block holding an unaligned prompt end and the reserve pages
+  beyond it.
 
   `Admit` takes two inputs of different scope and tense. One `GroupDemand`
   per group says what that group needs for the round ahead: an extent and a
@@ -1083,7 +1127,9 @@ Its responsibilities:
   `RequestProgress` for finish, retraction, and remote completion, which
   publish without admitting.
 * **Prefix publication.** `CacheFullBlocks` / `CacheCompletedBlocks` register
-  computed blocks into the prefix indexes for later requests. Prefix-closed
+  computed blocks into the prefix indexes for later requests — only when
+  something can reuse them (`SchedulerConfig::PublishesCompletedPages`,
+  [scheduler §1](scheduler.md#1-admission-is-per-chunk)). Prefix-closed
   groups match first; non-closed groups (SWA, State) match only within the
   boundary the closed groups settled (`match_order_` enforces this).
   A publication point is the request's computed frontier `T`
@@ -1639,20 +1685,56 @@ State checkpoint's block (`scheduler.md` §1.2) — is dropped first and never
 pays for such an eviction. Waiting would never
 fund such an admission: the blocks in use are its own, as when it resumed
 from a checkpoint whose segment holds the pages under it (`scheduler.md`
-§1.4). The pass does not always fund it either: a prefix hit the admission
-keeps never leaves, so on a KV-sharded pool of a few pages a request alone
-can still wait for good (`scheduler.md` §1.4). Beside another page holder it
+§1.4). Beside another page holder it
 waits for that holder's release instead, even where write-through, which
 evicts block by block, could fund it at once; and a restore, which falls back
 to claiming nothing (below), never takes blocks this way.
+
+Nor does the pass always fund it: eviction frees a parent only when the
+request holds nothing in it, and hole-first placement ("Virtual block
+placement" below) can have put the request's blocks of a packed group one
+per parent beside cached pages, or spread the prefix hit its first
+admission takes so. The coordinator's last means is then to move the
+request's own blocks into fewer parents,
+`CacheCoordinator::CompactLoneRequest`, and the caller retries the
+admission once in the plan build; which blocks move, how (a re-placement,
+a same-bucket copy, an index entry following its copy by
+`PrefixCacheIndex::Relocate`) and which stay are `scheduler.md` §1.4's
+rules. The planner lends the compaction two views: `DenseLayoutParents`,
+the parents a dense layout of the request's blocks plus the demand (its
+copy-in pairs counted) needs,
+counted on the planner's own capacity view, which gates the whole step (a
+dense layout that does not fit is the bound's own shortfall, not
+fragmentation), and `PlanBlockAlone`, the block-by-block expansion of the
+one cache entry at a slot a block moves into, evicted as this pass would
+evict it (`DeviceEvictionStats::compaction`; recorded as a segment under
+write-back) -- never an entry the admission keeps, which the pass's
+candidate filter excludes too: a page, tail block or State checkpoint the
+probe hit (in a packed group a page or tail block nothing else pins
+may be relocated instead, with its entry), a restore's claim, or a
+slot the retry reclaims as the request's own. An entry evicted so takes
+along what it always does (a tail's companions in the other groups, a
+page's State checkpoints), and that cascade does not consult the
+planner, so the compaction holds every Device block the probe hit -- in
+every group, and on the D role each State group's checkpoint at the
+prompt end -- until it returns: a slot the probe leaves a hole (the D
+role's partial tail block, the prompt's last page past its bound) may be
+cleared, and the held hits stay for the retry. The same expansion
+judges a parent before its blocks leave: each occupant beside them
+must be one it takes or a slot the retry reclaims, else the parent
+stays bound whatever leaves it and is not vacated. Nothing else is
+evicted by the compaction: the cache left in the vacated parents is the
+retry's to take, now by whole parents.
 
 A restore of a retracted request (`scheduler.md` §4) protects the blocks it
 claims like prefix hits. Under segment eviction a set holding one never
 leaves, so the claims can pin the only cache there is to evict: the
 request's own pages above a page it claims, or its own checkpoint beside
-one. When they leave no plan, the restore plans again claiming nothing;
-every imaged slot is a fresh copy, and the request's own cache leaves by
-segments like any other.
+one. Alone, the claims can also bind more parents than a dense layout of
+the image -- claimed pages one per parent beside cached ones -- with no
+release to wait for. When they leave no plan in either case, the restore
+plans again claiming nothing; every imaged slot is a fresh copy, and the
+request's own cache leaves like any other.
 
 Each cache group uses a non-owning cursor over its tier's eviction index.
 It advances continuously, skips fully pinned epochs, and returns complete
@@ -2077,10 +2159,14 @@ intersection still requires the actual owner's success before publication.
 L3 reservations distribute successive logical pages across cyclic owners;
 Device admission later preserves each restored Host block's residue.
 A residue-constrained acquisition can fail while
-other buckets have room; a restore then waits like any readmission, and the
-balanced allocator keeps ordinary admissions within one block per bucket, so
-the imbalance a restore sees is bounded by what its own victim table
-contributed.
+other buckets have room; a restore then waits like any readmission. The
+balanced allocator spreads an admission's blocks over the buckets only
+among the holes it finds and the parents it opens, so when every hole sits
+in one bucket an admission lands that many blocks there (bucket balance
+reserves no parent, below); a lone request's compaction re-places its
+unwritten blocks across buckets, a written block keeps its bucket
+(`scheduler.md` §1.4). The imbalance a restore sees is therefore its own
+victim table's, plus whatever such a skew left in it.
 
 **No rank reads or writes another rank's Device KV.** A page an eviction
 write-back copies may be granted again in the same plan -- zeroed, loaded
@@ -2222,6 +2308,9 @@ occupancies before selecting the next child. Only when all bound-parent holes
 are exhausted may it open the next FIFO empty parent. Bucket balance cannot
 reserve an extra parent or cause admission failure while another bucket is
 available. A failed acquire leaves both placement and request tables unchanged.
+Filling holes first can leave a request admitted alone with one block per
+parent beside cached pages in a packed group; the request's own compaction,
+never the allocator, gathers them again (`scheduler.md` §1.4).
 
 Beside that balanced path, `BlockPool::AcquireBlocksInBuckets(group, buckets)`
 acquires blocks in **given** buckets — one per requested block — for the
@@ -2229,7 +2318,9 @@ transfers above, for tail copies (a hitter's copy of a claimed tail block in
 its source's bucket; an owner's copy-in block, in its slot's bucket) and for
 `GroupAllocator::AcquireShape`, which rebuilds a retracted request's table
 from its recorded shape (claimed blocks in place, fresh ones in the imaged
-buckets). Its exact check is per bucket with one shared empty-parent budget:
+buckets); `AcquireBlockAt(group, location)` takes one named free slot of a
+parent bound to the group, for that compaction alone. The exact check of a
+bucket acquisition is per bucket with one shared empty-parent budget:
 an opened parent gives every bucket `packing / shard_count` slots at once, so
 the parents needed are
 `max_b ceil((need_b - holes_b)+ / (packing / shard_count))`
@@ -2382,7 +2473,7 @@ events (wire-format constrained; unify deliberately if ever).
 ### Principle 2 — scheduler perceives only logical quantities: fixed, now with hard vocabulary rules
 
 Scheduling and FSM code do no geometry arithmetic. The coordinator exposes
-capacity views — `NumActiveLcmBlocks(request_tables)`,
+capacity views — `NumActiveLcmBlocks()`,
 `NumAvailableLcmBlocks`, `TotalLcmBlocks`, `GroupAvailablePages(group)` — and
 the config-only `CapacityModel` (`csrc/scheduler/capacity_model.h`) folds
 page demand into LCM blocks (`LcmBlocksNeededFor(group_pages)`); the
@@ -2768,6 +2859,9 @@ session IDs are separate namespaces, so ending a cut or a session whose ID
 happens to equal the group ID cannot age that group's cache. Prefix matching
 continues to use token content and the normal model/cache namespace: the group
 ID never proves a hit, changes request tokens, or enables implicit appends.
+Every first-admission attempt, including the retry after lone-request
+compaction, carries the same session and group IDs so relocating hit blocks
+cannot change the cache owner selected by the request.
 
 `demote_cache_groups([{cache_group_ids, ended}])` applies the same bounded LRU
 hint to explicit group owners. Callers must not translate each member's

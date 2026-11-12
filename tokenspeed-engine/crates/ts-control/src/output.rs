@@ -468,6 +468,8 @@ pub struct FinishLog {
     /// `--enable-log-request-stats`: the timing summary replaces the
     /// accept-length line.
     pub request_stats: bool,
+    /// Percentage of PD rooms to trace through their first output.
+    pub ttft_percentage: u8,
 }
 
 /// Per-request latency samples and token totals since the last drain.
@@ -587,19 +589,28 @@ impl OutputProcessor {
 
     /// Stamp the first dispatch of `rids`, for the request stats.
     pub fn mark_scheduled(&mut self, rids: &[String]) {
-        if !(self.finish_log.request_stats || self.trace.is_some()) {
+        let stats = self.finish_log.request_stats || self.trace.is_some();
+        if !stats && self.finish_log.ttft_percentage == 0 {
             return;
         }
-        let now = wall_seconds();
+        let now = stats.then(wall_seconds);
         for rid in rids {
-            if let Some(timings) = self.states.get_mut(rid).and_then(|s| s.timings.as_mut()) {
-                timings.mark_scheduled(now);
+            if let Some(state) = self.states.get_mut(rid) {
+                if let (Some(timings), Some(now)) = (state.timings.as_mut(), now) {
+                    timings.mark_scheduled(now);
+                }
+                if let Some(trace) = state.ttft.as_mut() {
+                    if trace.scheduled_ms.is_none() {
+                        trace.scheduled_ms = Some(trace.ms());
+                    }
+                }
             }
         }
     }
 
     /// Log a request's stats line as it leaves the processor.
     fn log_end(&mut self, rid: &str, state: &RequestState) {
+        self.log_finished(rid, state);
         if self.metrics_enabled {
             // Cache and prompt totals feed the derived cache metrics.
             self.prompt_tokens += state.prompt_len.max(0) as u64;
@@ -607,19 +618,39 @@ impl OutputProcessor {
             self.completion_tokens += state.output_ids.len() as u64;
             self.collect_request_latencies(state);
         }
-        if !self.finish_log.enabled {
-            return;
+    }
+
+    fn log_finished(&self, rid: &str, state: &RequestState) {
+        if let Some(trace) = &state.ttft {
+            trace.finish(rid, state);
         }
-        if let Some(timings) = &state.timings {
+        if self.finish_log.enabled && tracing::enabled!(tracing::Level::INFO) {
+            let finished_at = wall_seconds();
+            let stats = state
+                .timings
+                .as_ref()
+                .filter(|_| self.finish_log.request_stats)
+                .map(|timings| {
+                    request_stats::stats_line(
+                        rid,
+                        state,
+                        timings,
+                        finished_at,
+                        self.spec_num_tokens,
+                    )
+                });
             tracing::info!(
-                "{}",
-                request_stats::stats_line(
-                    rid,
-                    state,
-                    timings,
-                    wall_seconds(),
-                    self.spec_num_tokens
-                )
+                rid,
+                role = ?self.role,
+                prompt_tokens = state.prompt_len,
+                completion_tokens = state.output_ids.len(),
+                finish_reason = state.finished_reason.as_ref().map(FinishReason::wire_type),
+                abort_reason = state.finished_reason.as_ref().and_then(FinishReason::abort_message),
+                cached_tokens = state.cached_tokens,
+                e2e_latency_s = (state.created_time > 0.0)
+                    .then(|| (finished_at - state.created_time).max(0.0)),
+                request_stats = stats.as_deref(),
+                "event=ts_request_finished"
             );
         }
     }
@@ -721,6 +752,29 @@ impl OutputProcessor {
         self.states.get(rid)
     }
 
+    pub(crate) fn sample_ttft(
+        &self,
+        state: &mut RequestState,
+        bootstrap: Option<&ts_pd::BootstrapInfo>,
+    ) {
+        if self.finish_log.enabled
+            && self.finish_log.ttft_percentage > 0
+            && tracing::enabled!(target: "ts_control::request_stats", tracing::Level::INFO)
+        {
+            state.ttft = bootstrap.and_then(|b| {
+                request_stats::TtftTrace::sample(self.finish_log.ttft_percentage, self.role, b)
+            });
+        }
+    }
+
+    pub(crate) fn bootstrapped(&mut self, rid: &str) {
+        if self.finish_log.ttft_percentage > 0 {
+            if let Some(trace) = self.states.get_mut(rid).and_then(|s| s.ttft.as_mut()) {
+                trace.bootstrapped(rid);
+            }
+        }
+    }
+
     /// Admit a request. An abort that arrived before it applies now.
     pub fn register(&mut self, rid: String, mut state: RequestState) {
         self.admissions += 1;
@@ -736,6 +790,16 @@ impl OutputProcessor {
         if self.finish_log.request_stats || self.trace.is_some() {
             state.timings = Some(RequestTimings::default());
         }
+        if self.finish_log.enabled {
+            tracing::info!(
+                rid,
+                role = ?self.role,
+                session_id = state.session_id.as_deref(),
+                input_tokens = state.prompt_len,
+                max_new_tokens = state.max_new_tokens,
+                "event=ts_request_accepted"
+            );
+        }
         self.states.insert(rid, state);
     }
 
@@ -747,6 +811,9 @@ impl OutputProcessor {
         let Some(mut state) = self.states.remove(rid) else {
             return committed;
         };
+        if let Some(trace) = &mut state.ttft {
+            trace.transfer_done_ms = Some(trace.ms());
+        }
         if !state.finished() {
             state.finished_reason = Some(FinishReason::Length(state.output_ids.len() as i64));
         }
@@ -775,6 +842,9 @@ impl OutputProcessor {
         let Some(state) = self.states.get_mut(rid) else {
             return;
         };
+        if let Some(trace) = &mut state.ttft {
+            trace.transfer_done_ms = Some(trace.ms());
+        }
         state.cached_tokens = cached_tokens;
         state.output_ids.push(bootstrap_token);
         if let Some(tokens) = &mut state.reasoning_tokens {
@@ -802,11 +872,18 @@ impl OutputProcessor {
         // its own matcher, or every decode step would mask from a state one
         // token behind.
         if let Some(grammar) = &state.grammar {
-            grammar
+            if !grammar
                 .matcher
                 .lock()
                 .expect("matcher lock")
-                .accept_token(bootstrap_token);
+                .accept_token(bootstrap_token)
+            {
+                tracing::warn!(
+                    rid,
+                    token = bootstrap_token,
+                    "grammar rejected the remote bootstrap token"
+                );
+            }
         }
         state.check_finished(false);
     }
@@ -841,28 +918,24 @@ impl OutputProcessor {
         committed
     }
 
-    /// A request's PD transfer failed. The client gets an abort unless it
-    /// already ended and tore down its stream. The scheduler keeps the
-    /// request's pages until the transfer and local forwards retire.
+    /// A request's PD transfer failed. A computed prefill still needs its
+    /// final output; only a client abort or an already-sent final stays silent.
+    /// The scheduler keeps its pages until the transfer and local forwards retire.
     pub fn fail_transfer(&mut self, rid: &str) -> Committed {
         let mut committed = Committed::default();
         let Some(mut state) = self.states.remove(rid) else {
             return committed;
         };
-        if !state.finished() {
-            state.abort("PD/EPD remote transfer failed or timed out", false, None);
-            state.finished_output = false;
-            committed.outputs =
-                Self::stream_state(rid, &mut state, self.stream_interval, self.spec_num_tokens)
-                    .into_iter()
-                    .collect();
-        } else if state.abort_notify_client {
-            state.finished_output = false;
+        if !state.to_abort && !state.finished_output {
+            state.abort("PD/EPD remote transfer failed or timed out", true, None);
+        }
+        if state.abort_notify_client {
             committed.outputs =
                 Self::stream_state(rid, &mut state, self.stream_interval, self.spec_num_tokens)
                     .into_iter()
                     .collect();
         }
+        self.log_finished(rid, &state);
         self.trace_end(rid, &state);
         committed.released.push(rid.to_owned());
         committed
@@ -870,6 +943,12 @@ impl OutputProcessor {
 
     /// Abort a request now, or when it registers if it has not yet.
     pub fn mark_abort(&mut self, rid: &str, notify_client: bool) {
+        tracing::debug!(
+            rid,
+            notify_client,
+            registered = self.states.contains_key(rid),
+            "abort requested"
+        );
         if let Some(state) = self.states.get_mut(rid) {
             let message = if notify_client {
                 "Aborted by pause"
@@ -905,6 +984,7 @@ impl OutputProcessor {
             self.pending_aborts.remove(index);
         }
         state.finished_output = false;
+        self.log_finished(rid, &state);
         Self::stream_state(rid, &mut state, self.stream_interval, self.spec_num_tokens)
             .into_iter()
             .collect()
@@ -930,6 +1010,7 @@ impl OutputProcessor {
                     .into_iter()
                     .collect();
         }
+        self.log_finished(rid, &state);
         committed.released.push(rid.to_owned());
         committed
     }
@@ -947,6 +1028,7 @@ impl OutputProcessor {
             return committed;
         };
         if !state.finished() {
+            tracing::warn!(rid, reason, status_code, "request failed before scheduling");
             state.abort(reason, true, status_code);
         }
         if !state.to_abort || state.abort_notify_client {
@@ -1255,6 +1337,18 @@ impl OutputProcessor {
                 continue;
             };
             if i < batch.num_extends {
+                if let Some(trace) = &mut state.ttft {
+                    trace.prefill_chunks += 1;
+                }
+                tracing::debug!(
+                    rid,
+                    prefix_tokens = batch.extend_prefix_lens[i],
+                    cached_tokens = state.cached_tokens,
+                    chunk_tokens = batch.input_lengths[i],
+                    prompt_tokens = batch.prefill_lengths[i],
+                    last_chunk = !mid_chunk,
+                    "prefill chunk committed"
+                );
                 state.computed_length =
                     i64::from(batch.input_lengths[i] + batch.extend_prefix_lens[i]);
             } else {
@@ -1282,6 +1376,13 @@ impl OutputProcessor {
                         rid: rid.clone(),
                         detail,
                     })?;
+            }
+            if !is_decode {
+                if let Some(trace) = &mut state.ttft {
+                    if trace.prompt_done_ms.is_none() {
+                        trace.prompt_done_ms = Some(trace.ms());
+                    }
+                }
             }
             if let Some(timings) = state.timings.as_mut() {
                 timings.mark_prefill_done(stats_now);
@@ -1516,6 +1617,17 @@ impl OutputProcessor {
         if state.finished() {
             state.finished_output = true;
         }
+        if let Some(trace) = state.ttft.take() {
+            trace.finish(rid, state);
+        }
+        tracing::debug!(
+            rid,
+            prompt_tokens = state.prompt_len,
+            cached_tokens = state.cached_tokens,
+            output_tokens = state.output_ids.len(),
+            finished = state.finished(),
+            "stream output"
+        );
         let sent = state.send_token_offset;
         let output_ids = state.output_ids[sent..].to_vec();
         state.send_token_offset = state.output_ids.len();
@@ -1635,6 +1747,7 @@ mod tests {
     const NO_FINISH_LOG: FinishLog = FinishLog {
         enabled: false,
         request_stats: false,
+        ttft_percentage: 0,
     };
 
     fn processor(spec_num_tokens: Option<usize>) -> OutputProcessor {
@@ -1775,6 +1888,85 @@ mod tests {
     }
 
     #[test]
+    fn sampled_rooms_emit_bootstrap_and_first_output_once() {
+        use std::{io::Read, os::unix::net::UnixStream};
+        let (writer, mut reader) = UnixStream::pair().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.try_clone().unwrap())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            for role in [Role::Prefill, Role::Decode] {
+                let mut processor = OutputProcessor::new(
+                    None,
+                    1,
+                    None,
+                    role,
+                    FinishLog {
+                        enabled: true,
+                        request_stats: false,
+                        ttft_percentage: 1,
+                    },
+                    false,
+                    None,
+                );
+                // Python zlib.crc32 of the decimal room, modulo 1000:
+                // room 4 lands in bucket 8, room 5 is outside the sample.
+                for (room, rid) in [(4, "kept"), (5, "skipped")] {
+                    let mut state =
+                        RequestState::new(vec![8, 9], 1, BTreeSet::new(), true, None, false);
+                    let bootstrap = ts_pd::BootstrapInfo {
+                        room,
+                        host: "p".into(),
+                        port: 8080,
+                    };
+                    processor.sample_ttft(&mut state, Some(&bootstrap));
+                    processor.register(rid.into(), state);
+                    processor.bootstrapped(rid);
+                    if role == Role::Prefill {
+                        processor.mark_scheduled(&[rid.into()]);
+                        let committed = processor
+                            .commit(&batch(&[(rid, 2, 0, 2)], 1), None, &result(&[10], &[1]))
+                            .unwrap();
+                        assert!(committed.outputs.is_empty());
+                        if rid == "kept" {
+                            let trace = processor.state(rid).unwrap().ttft.as_ref().unwrap();
+                            assert!(trace.transfer_done_ms.is_none());
+                        }
+                        processor.finish_prefill(rid);
+                    } else {
+                        processor.remote_prefill_done(rid, 10, 1, None);
+                        processor.finish_remote_prefill_only(rid);
+                    }
+                }
+            }
+        });
+        let mut log = String::new();
+        reader.read_to_string(&mut log).unwrap();
+        let records = |marker| {
+            log.lines()
+                .filter_map(|line| line.split_once(marker))
+                .map(|(_, data)| serde_json::from_str::<serde_json::Value>(data).unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(records("TTFTBootstrap ").len(), 1, "{log}");
+        let summaries = records("TTFTBreakdown ");
+        assert_eq!(summaries.len(), 2, "{log}");
+        for summary in &summaries {
+            assert_eq!(summary["rid"], "kept");
+            assert_eq!(summary["room"], 4);
+            assert_eq!(summary["status"], "first_output");
+            assert!(summary["phases_ms"]["bootstrap"].is_number());
+        }
+        assert_eq!(summaries[0]["prefill_chunks"], 1);
+        assert!(summaries[0]["phases_ms"]["prefill"].is_number());
+        assert!(summaries[0]["phases_ms"]["transfer_observe"].is_number());
+        assert!(summaries[0]["phases_ms"]["output_pack"].is_number());
+        assert!(summaries[1]["phases_ms"]["output_after_landing"].is_number());
+    }
+
+    #[test]
     fn request_latency_samples_use_the_prefill_boundaries() {
         let mut p = OutputProcessor::new(
             None,
@@ -1835,6 +2027,7 @@ mod tests {
             FinishLog {
                 enabled: true,
                 request_stats: true,
+                ttft_percentage: 0,
             },
             false,
             None,
@@ -1854,6 +2047,7 @@ mod tests {
             None,
         );
         assert!(line.contains("ttft_ms=1000.0,"), "{line}");
+        assert!(line.contains("prefill_ms=0.0,"), "{line}");
         assert!(line.contains("decode_tps=0.5,"), "{line}");
     }
 
@@ -2222,6 +2416,62 @@ mod tests {
             c.outputs[0].input_logprobs.as_ref().unwrap().values,
             [None, Some(0.0), Some(-1.0)]
         );
+    }
+
+    #[test]
+    fn a_failed_transfer_ends_a_prefill_that_finished_computing() {
+        let mut p = OutputProcessor::new(None, 1, None, Role::Prefill, NO_FINISH_LOG, true, None);
+        register(&mut p, "r", 3, 1, &[]);
+        let committed = p
+            .commit(&batch(&[("r", 3, 0, 3)], 1), None, &result(&[9], &[1]))
+            .unwrap();
+        assert!(committed.outputs.is_empty());
+        let state = p.state("r").unwrap();
+        assert!(state.finished());
+        assert!(!state.finished_output);
+        assert!(!state.to_abort);
+
+        // The transfer can fail before the next round applies pause(abort).
+        let failed = p.fail_transfer("r");
+        assert_eq!(failed.outputs.len(), 1);
+        assert_eq!(failed.outputs[0].finish_reason, Some("abort"));
+        assert_eq!(failed.outputs[0].output_ids, [9]);
+        assert_eq!(failed.released, ["r"]);
+        assert!(p.state("r").is_none());
+        assert!(p.fail_transfer("r").outputs.is_empty());
+        assert!(p.finish_prefill("r").outputs.is_empty());
+    }
+
+    #[test]
+    fn a_failed_transfer_aborts_an_unfinished_request() {
+        let mut p = processor(None);
+        register(&mut p, "r", 3, 4, &[]);
+        let failed = p.fail_transfer("r");
+        assert_eq!(failed.outputs.len(), 1);
+        assert_eq!(failed.outputs[0].finish_reason, Some("abort"));
+        assert_eq!(failed.released, ["r"]);
+    }
+
+    #[test]
+    fn a_failed_transfer_preserves_client_and_pause_abort_notifications() {
+        for max_new in [1, 4] {
+            for notify in [false, true] {
+                let mut p =
+                    OutputProcessor::new(None, 1, None, Role::Prefill, NO_FINISH_LOG, true, None);
+                register(&mut p, "r", 3, max_new, &[]);
+                p.commit(&batch(&[("r", 3, 0, 3)], 1), None, &result(&[9], &[1]))
+                    .unwrap();
+                p.mark_abort("r", notify);
+
+                let failed = p.fail_transfer("r");
+                assert_eq!(failed.outputs.len(), usize::from(notify));
+                if notify {
+                    assert_eq!(failed.outputs[0].finish_reason, Some("abort"));
+                }
+                assert_eq!(failed.released, ["r"]);
+                assert!(p.state("r").is_none());
+            }
+        }
     }
 
     #[test]

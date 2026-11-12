@@ -106,6 +106,8 @@ class SamplingBackendConfig:
     # rejection sampling). Required to keep RNG out of the CUDA graph.
     max_bs: int = 1
     max_draft_tokens_per_req: int = 1
+    # Sizing like max_bs: with draft trees (``ServerArgs.speculative_draft_tree``) a backend allocates and warms its tree verify; the ``tree`` argument of ``verify`` picks the rule.
+    draft_tree: bool = False
 
     # Sizing for backend-owned per-request state (e.g. token-count buffers
     # for penalties in FlashInferFullSamplingBackend). Indexed by req_pool_idx, not
@@ -151,6 +153,7 @@ class SamplingBackendConfig:
             ),
             max_bs=max_bs,
             max_draft_tokens_per_req=max(max_draft_tokens_per_req, 1),
+            draft_tree=server_args.speculative_draft_tree,
             max_req_pool_size=max_req_pool_size,
             vocab_size=vocab_size,
             device=device,
@@ -222,8 +225,8 @@ class SamplingBackend(ABC):
         if config.synthetic_acceptance_length is not None:
             if not self._SUPPORTS_SYNTHETIC_ACCEPTANCE:
                 raise ValueError(
-                    "synthetic acceptance requires the greedy sampling backend, "
-                    "or the flashinfer backend with block rejection"
+                    "synthetic acceptance requires the greedy or sonic sampling "
+                    "backend, or the flashinfer backend over sampled drafts"
                 )
             al = config.synthetic_acceptance_length
             if not math.isfinite(al) or not 1 <= al <= config.max_draft_tokens_per_req:
@@ -430,6 +433,16 @@ class SamplingBackend(ABC):
             and vocab_topk_merge_supports(tp_size, top_k)
         )
 
+    def verifies_vocab_shard_draft_probs(self) -> bool:
+        """Whether ``verify`` takes ``draft_probs`` over each rank's vocabulary shard.
+
+        Under ``enable_speculative_sampling`` with sharded target logits, a
+        drafter whose head is sharded alike can then record each rank's
+        columns of ``q`` only (``[P, N, V / tp]``), and never gather its
+        logits. The default reads whole-vocabulary rows.
+        """
+        return False
+
     def warmup_vocab_shard_sampling(
         self,
         shard: SampledVocabShard,
@@ -437,6 +450,7 @@ class SamplingBackend(ABC):
         *,
         draft_q: DraftTreeQ | None,
         with_vocab_mask: bool,
+        draft_probs: torch.Tensor | None,
     ) -> None:
         """Compile what ``sample`` and ``verify`` run on vocabulary shards.
 
@@ -451,6 +465,8 @@ class SamplingBackend(ABC):
             draft_q: The draft q every verify reads, or None when the server
                 verifies without one.
             with_vocab_mask: Whether the server applies grammar masks.
+            draft_probs: The runtime's dense draft distributions every verify
+                reads (whole rows, or this rank's columns), or None.
 
         Raises:
             NotImplementedError: This backend reads whole rows only.

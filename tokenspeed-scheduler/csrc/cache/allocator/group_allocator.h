@@ -225,13 +225,19 @@ public:
     // block, which the caller copies into the fresh block; empty for a hole,
     // which the caller zeroes instead. Installing into a hole ends the released
     // prefix at this slot, so subsequent exports include the new writable block.
-    CacheBlockRef SwapInFreshBlock(BlockPool& pool, BlockTable& table, std::int32_t slot,
-                                   std::int32_t available_tokens) {
+    // With a destination the fresh block is that free slot of a parent bound to
+    // this group (a lone request's compaction moving its own block; the caller
+    // keeps a copied block's bucket, and may change an unwritten block's);
+    // without one the pool places it.
+    CacheBlockRef SwapInFreshBlock(BlockPool& pool, BlockTable& table, std::int32_t slot, std::int32_t available_tokens,
+                                   std::optional<CacheBlockLocation> destination) {
         _assert(0 <= slot && slot < table.NumBlocks(), "swapped slot lies inside the table");
         _assert(available_tokens >= 0, "tail capacity must be non-negative");
         const CacheBlockRef& current = table.blocks_[static_cast<std::size_t>(slot)];
         std::vector<CacheBlockRef> fresh;
-        if (current) {
+        if (destination) {
+            fresh.push_back(pool.AcquireBlockAt(group_id_, *destination));
+        } else if (current) {
             const std::array<std::int32_t, 1> bucket{BucketOf(current->Location())};
             fresh = pool.AcquireBlocksInBuckets(group_id_, bucket);
         } else {
@@ -429,11 +435,17 @@ public:
 private:
     // Debug builds re-resolve every live slot the way the export did before
     // tables kept their page ids, and fail on any slot a write left stale.
+    // They also check that the released prefix holds no block: the export
+    // skips it, and the slots' ParentRefs count every non-null slot.
     void assertPageIdsCurrent([[maybe_unused]] const BlockTable& table) const {
 #ifndef NDEBUG
         const std::span<const CacheBlockRef> blocks = table.Blocks();
         const std::span<const std::int32_t> page_ids = table.PageIds();
         _assert(blocks.size() == page_ids.size(), "a table keeps one page id per slot");
+        const auto released = std::min(static_cast<std::size_t>(table.ReclaimedPrefixBlocks()), blocks.size());
+        for (std::size_t slot = 0; slot < released; ++slot) {
+            _assert(!blocks[slot], "a released-prefix slot still holds a block");
+        }
         for (std::size_t slot = static_cast<std::size_t>(table.ReclaimedPrefixBlocks()); slot < blocks.size(); ++slot) {
             const std::int32_t expected = blocks[slot] ? ResolveCacheBlockId(*blocks[slot]) : 0;
             _assert(page_ids[slot] == expected, "a table's page id went stale");

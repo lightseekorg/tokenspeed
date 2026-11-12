@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 import torch
 from tokenspeed_kernel.platform import (
@@ -39,6 +39,9 @@ from tokenspeed_kernel.signature import (
 )
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from tokenspeed_kernel.ops.moe._cute_dsl.latent_down import MailboxPublish
 
 # Past these batch sizes the per-row cluster overhead loses to the Triton kernels.
 CLUSTER_BOUNDARY_MAX_ROWS = 64
@@ -186,6 +189,7 @@ def _compiled(
     enable_pdl: bool,
     mailbox_sentinel: int | None,
     mailbox_ranks: int,
+    publish: bool,
 ) -> Callable[..., None]:
     key = (
         device.index,
@@ -199,6 +203,7 @@ def _compiled(
         enable_pdl,
         mailbox_sentinel,
         mailbox_ranks,
+        publish,
     )
 
     def build() -> Callable[..., None]:
@@ -213,6 +218,7 @@ def _compiled(
             enable_pdl,
             mailbox_sentinel,
             mailbox_ranks,
+            publish,
         )
         rows = cute.sym_int()
         f32_rows = _fake(cutlass.Float32, (rows, width))
@@ -237,6 +243,10 @@ def _compiled(
             f32_rows,
             f32_rows,
             bf16_rows,
+            _fake(cutlass.BFloat16, (cute.sym_int(), cute.sym_int())),
+            cutlass.Int64(0),
+            cutlass.Int32(0),
+            cutlass.Int32(0),
             1,
             _stream(device),
         )
@@ -279,6 +289,31 @@ def _stream(device: torch.device) -> cuda.CUstream:
     return cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
 
 
+def _check_publish(
+    publish: MailboxPublish,
+    rows: int,
+    width: int,
+    ranks: int,
+    sentinel: int | None,
+) -> None:
+    """Reject a block the kernel's threads would not store whole and in bounds."""
+    if sentinel is None:
+        raise ValueError("only a mailbox branch takes a block to publish")
+    block, destination = publish.block, publish.destination
+    per_thread = width // (CLUSTER_CTAS * CTA_THREADS)
+    if block.dtype != torch.bfloat16 or block.ndim != 2 or block.shape[0] != rows:
+        raise ValueError("the block must be BF16 [rows, block_width]")
+    if not block.is_contiguous() or block.data_ptr() % _PTR_ALIGN:
+        raise ValueError("the block must be contiguous and 16-byte aligned")
+    if destination.shape != block.shape or destination.stride() != (width * ranks, 1):
+        raise ValueError("the destination must be the block's rows in the mailbox")
+    # Each thread stores the whole words of its own columns.
+    if publish.column % per_thread or block.shape[1] % per_thread:
+        raise ValueError("the block must cover whole thread column slices")
+    if not 0 <= publish.column <= width * ranks - block.shape[1]:
+        raise ValueError("the block must lie within a mailbox row")
+
+
 @register_kernel(
     "residual",
     "post_norm_residual_pre_norm",
@@ -310,6 +345,7 @@ def cute_dsl_post_norm_residual_pre_norm(
     enable_pdl: bool,
     branch_sentinel: int | None,
     branch_ranks: int,
+    branch_publish: MailboxPublish | None,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """The fused layer boundary on one thread-block cluster per row.
 
@@ -328,6 +364,8 @@ def cute_dsl_post_norm_residual_pre_norm(
     ):
         raise ValueError("the cluster boundary does not support these operands")
     rows, width = stream.shape
+    if branch_publish is not None:
+        _check_publish(branch_publish, rows, width, branch_ranks, branch_sentinel)
     has_pre = pre_weight is not None
     out_stream = torch.empty_like(stream)
     pre_fp32 = torch.empty_like(stream) if has_pre else None
@@ -354,6 +392,17 @@ def cute_dsl_post_norm_residual_pre_norm(
         enable_pdl,
         branch_sentinel,
         branch_ranks,
+        branch_publish is not None,
+    )
+    # Without a block to publish, an existing BF16 row stands in, never read.
+    publish_block = (
+        branch[:1, :width] if branch_publish is None else branch_publish.block
+    )
+    publish_args = (
+        to_cute(publish_block, _PTR_ALIGN),
+        0 if branch_publish is None else branch_publish.destination.data_ptr(),
+        0 if branch_publish is None else branch_publish.column,
+        0 if branch_publish is None else publish_block.shape[1],
     )
     # The launch goes to the current context, so bind the operands' device.
     with torch.cuda.device(stream.device):
@@ -367,6 +416,7 @@ def cute_dsl_post_norm_residual_pre_norm(
             to_cute(out_stream, _PTR_ALIGN),
             to_cute(pre_fp32 if has_pre else out_stream, _PTR_ALIGN),
             to_cute(pre_bf16 if has_pre else branch[:, :width], _PTR_ALIGN),
+            *publish_args,
             rows,
             _stream(stream.device),
         )

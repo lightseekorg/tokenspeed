@@ -357,27 +357,18 @@ trainer-side contract below) when that matters.
 
 ### Mooncake weight updates
 
-The runtime includes the independent WeightStore receiver at
-`tokenspeed.runtime.execution.weight_store`. Select it with
-`--model-update-sdk-module tokenspeed.runtime.execution.weight_store` and
-`--model-update-engine-type TOKENSPEED`, supply the standalone SDK's flat
-`backend=weight_store` configuration and use `--model-update-draft-weights retain`.
-This optional path requires the independent `weight_store` and `data_dist_hub`
-packages in the scheduler environment. It does not import a rollout framework or
-the previous weight-update SDK.
-
-The update request carries a complete publication directory in `snapshot`,
-encoded as `{version, zlib_base64}`. Tensor contents remain in the Store.
-The receiver validates the publication version, declares the target's logical HF
-regions and calls the standalone SDK on the Store device's current CUDA stream.
-The SDK reads and assembles the tensors; the native loader owns physical TP/EP
-layout and the surrounding weight-update session owns finalization. This path
-supports one unquantized target and retains draft checkpoint weights.
+Install a Model Updater SDK provider in every scheduler environment and select
+its import path with `--model-update-sdk-module`. TokenSpeed supplies the update
+session and control-plane coordination; the provider owns store access, model
+support and publication metadata. The standalone WeightStore receiver is supplied
+by an external plugin rather than bundled with the runtime. Follow that
+provider's documentation for its module path, dependencies and configuration.
 
 `UpdateWeightsFromMooncakeReqInput` loads one committed checkpoint version
 that the RL trainer published to a Mooncake weight store through the Model
 Updater SDK. Fields: `version` (an integer), `flush_cache` (default true),
-and `weight_version` (optional). Every scheduler process reads its own shard
+`weight_version` (optional), and `snapshot` (optional SDK publication metadata
+passed unchanged to the provider). Every scheduler process reads its own shard
 with its global rank as the SDK reader rank, on the forward thread, ordered
 against forwards like the distributed update. The reply arrives only after
 every worker finished its read.
@@ -549,7 +540,7 @@ for the online variant.
 | `--draft-moe-backend` | MoE backend for the speculative decoding draft model. |
 | `--all2all-backend` | MoE all-to-all backend. |
 | `--deepep-mode` | DeepEP mode: `auto`, `normal`, or `low_latency`. `auto` uses `low_latency` for decode batches and `normal` for prefill batches. `normal` reads its per-expert receive counts on the host, so it forces eager execution and disables CUDA graphs. |
-| `--sampling-backend` | Sampling backend: `greedy`, `flashinfer`, `flashinfer_full`, `triton`, `triton_full`, or `sonic` (vendored [sonic-sampler](https://github.com/tachyontrails/sonic-sampler) kernels: one fused Triton pipeline per step; `top_k=-1` is realized as bounded top-128 truncation; bf16 logits ranked at bf16 resolution, fp32 logits sampled exactly among the top-128 candidates; under TP with a vocab-parallel LM head each rank selects its vocabulary shard's top-128 and only those are gathered, instead of whole logit rows; kernel configs from a table measured on Blackwell, no startup tuning; see the `--sampling-backend` help for its memory cost). |
+| `--sampling-backend` | Sampling backend: `greedy`, `flashinfer`, `flashinfer_full`, `triton`, `triton_full`, or `sonic` (vendored [sonic-sampler](https://github.com/tachyontrails/sonic-sampler) kernels: one fused Triton pipeline per step; a request with no `top_k`, `top_p` or `min_p` samples its whole vocabulary (each vocabulary block keeps its best logit plus the request's Gumbel noise), the others select among the top-128 candidates; bf16 logits ranked at bf16 resolution, fp32 logits sampled exactly; under TP with a vocab-parallel LM head each rank selects its vocabulary shard's top-128 and only those are gathered, instead of whole logit rows; kernel configs from a table measured on Blackwell, no startup tuning; see the `--sampling-backend` help for its memory cost). |
 | `--disable-deepseek-v41-token-blacklist` | Allow DeepSeek V4.1 to generate BOS, PAD, and image control/placeholder token IDs `0, 2, 129262..129264`; these are masked by default. |
 
 Set backend choices explicitly in production. `auto` is useful for bring-up, but
@@ -622,13 +613,13 @@ draft model, and token count together.
 
 ### Synthetic acceptance length
 
-The supported benchmark configuration is `--sampling-backend greedy`, with
-speculative decoding enabled and `--dp-sampling` and `--enable-output-logprobs`
-disabled. Draft trees are unsupported. Other sampling backends and these options
-are rejected at startup.
-As with ordinary greedy sampling, token selection is always argmax; stochastic
-sampling and penalties are not supported. Use unconstrained greedy requests
-(`temperature: 0`) for this benchmark.
+The greedy and sonic sampling backends accept it, and the flashinfer backend
+only over sampled drafts (`--enable-speculative-sampling`). Speculative
+decoding must be enabled, and `--dp-sampling`, `--enable-output-logprobs`,
+and draft trees are rejected at startup, as are the other sampling backends.
+On the greedy backend, token selection is always argmax, so stochastic sampling
+and penalties do not apply there; use unconstrained greedy requests
+(`temperature: 0`) with it.
 
 Use `--synthetic-acceptance-length L` to benchmark speculative execution at a
 fixed mean acceptance length (AL). AL includes the guaranteed target token,
@@ -656,9 +647,13 @@ AL `2.6`:
 
 Conflicting values between the flag and JSON configuration are rejected.
 The value must be finite and speculative decoding must be enabled.
-It selects the `synthetic` rejection method. The flashinfer backend accepts it
-only over sampled drafts (`--enable-speculative-sampling`); see
-[Block verification](#block-verification-experimental).
+It selects the `synthetic` rejection method. The greedy and sonic backends
+accept it; the flashinfer backend only over sampled drafts
+(`--enable-speculative-sampling`); see
+[Block verification](#block-verification-experimental). On sonic the token at
+the cutoff is the target's draw there, taken from the candidates the verify
+kernel already selected: a greedy request's argmax, otherwise the draw sonic
+makes past a fully accepted window, with the same per-request noise.
 For block drafters with implicit widths, the upper bound is checked against
 the checkpoint's resolved verify width when the sampler is initialized.
 
@@ -667,7 +662,7 @@ must equal `--speculative-num-steps + 1`. With `--speculative-eagle-topk` above 
 they draft a tree instead, and `--speculative-num-draft-tokens` is its node
 budget (root included). Set it explicitly: topk 1..16, steps 1..10,
 `(steps - 1) * topk` lane slots within the node budget, and at most 64 nodes. Trees need the `trtllm`
-attention backends (`trtllm_mla` or `tokenspeed_mla` for MLA models) and the `greedy`, `triton` or `flashinfer` sampling backend; see
+attention backends (`trtllm_mla` or `tokenspeed_mla` for MLA models) and the `greedy`, `triton`, `flashinfer` or `sonic` sampling backend; see
 [draft-tree speculation](../design/tree-speculation.md) for the full scope.
 
 `MTP` serves two head shapes under one flag. An Eagle-like head (one MTP
@@ -776,7 +771,13 @@ reads `q` at its top-128 target candidates; `greedy` verifies by exact match,
 the Triton backends by target-sampled exact match; neither reads the dense
 `q`). The drafter switches its draft model's fused TP-sharded argmax off so
 the full-vocab logits reach it, which adds the logits all-gather to every
-draft step under tensor parallelism.
+draft step under tensor parallelism. With `sonic` sampling vocabulary shards
+(the server logs `Sampled rows stay vocab-sharded`) and an MTP or EAGLE3 draft
+head spanning the target vocabulary, the draft steps stay sharded too (`Draft
+steps stay vocab-sharded`): each rank samples its shard of the draft logits,
+the ranks exchange a few values per request instead of the logits, every rank
+draws the same token, and each records `q` over its own vocabulary columns;
+its verify candidates carry that `q` through their gather.
 
 Known limits, kept as in the reference engine for now: a landed PD request's
 first verify always rejects its shipped candidates (sentinel rows) rather than
@@ -917,9 +918,10 @@ public address used by EPD.
 
 | Parameter | Purpose |
 | --- | --- |
-| `--log-level` | Runtime log level. |
+| `--log-level` | Engine logging threshold for Python, the Rust host and the C++ scheduler. Python `critical`/`fatal` maps to Rust `error`, its highest severity. Explicit `TS_HOST_LOG` and `SPDLOG_LEVEL` settings override their native writers. |
 | `--enable-async-logging` | Write Rust host and default Python root logs on background threads. Defaults to off; `--no-enable-async-logging` explicitly selects synchronous output. |
-| `--enable-log-request-stats` | Log a one-line per-request performance summary on finish/abort (see below). |
+| `--ttft-trace-sampling-percentage` | Percentage of PD rooms to trace through their first engine output (0–100, default 0). |
+| `--enable-log-request-stats`, `--enable-request-time-stats-logging` | Log a one-line per-request performance summary on finish/abort (see below). |
 | `--enable-metrics` | Enable the selected metrics reporters. |
 | `--metrics-reporters` | Select `prometheus` or an installed metric output; repeat for multiple. Defaults to `prometheus`. |
 | `--metrics-reporter-config` | JSON file mapping external reporter names to their settings. See [metric output plugins](../metrics-plugins.md). |
@@ -1084,17 +1086,80 @@ finish reason) plus the cached prompt tokens and preemption counts, with the
 lifecycle points as time-stamped events. See
 [the tracing design](../design/tracing.md).
 
+### Request lifecycle logs
+
+Search the engine logs for a request ID to follow it across roles. For example,
+`rg -F 'chatcmpl-019ef6b7' prefill.log decode.log` finds both sides of a
+disaggregated request when the frontend uses the same ID. The PD events also
+carry `bootstrap_room` to correlate peers that use different request IDs.
+
+| Event | When it appears | Fields besides `rid` |
+| --- | --- | --- |
+| `ts_request_accepted` | The engine registers the request. | Role, session ID when present, input tokens and effective maximum new tokens |
+| `ts_prefill_kv_transfer_queued` | A prefill rank queues the final KV chunk for a data transfer. | Bootstrap room, rank, token range `[start_idx, end_idx)` and block count across cache groups |
+| `ts_decode_kv_transfer_success` | The decode replica confirms receipt of KV and the bootstrap token. | Bootstrap room, rank, cached tokens and output token count |
+| `ts_decode_kv_transfer_failed` | The decode replica confirms transfer failure. | Bootstrap room (also retained as `room` for compatibility), rank and failure reason when available |
+| `ts_request_finished` | The engine releases the request or refuses it at admission. | Role, prompt, cached and completion token counts, finish and abort reasons, `e2e_latency_s` when the frontend supplied a creation time, and optional `request_stats` |
+
+These events are enabled for every request at the default INFO log level, with
+WARN for a failed transfer. They are independent of the request-stats flag and
+TTFT sampling percentage.
+Request admission and completion use the same logging ranks as the per-request
+stats. Each PD role records its own completion time. Ingress refusals have a
+finish event only. A duplicate-ID refusal logs a finish event for the rejected
+submission with an abort reason; the original request with that ID remains live
+and emits its own finish event later.
+
+Logging uses synchronous writers by default. `--enable-async-logging` moves
+Rust and Python root logger writes to bounded background queues; C++ scheduler
+logs still write synchronously. Formatting and queueing cost CPU time, and full
+asynchronous queues can drop records.
+
+For a first successful prefill admission, set `TOKENSPEED_PREFIX_CACHE_DIAGNOSTICS=1`
+to include the Device and Host contributions to the prefix hit in
+`[PrefixCacheDiagnostic]`. Their sum is the resumed token count.
+`host_gain_tokens` measures the extra reusable prefix beyond a device-only match.
+At DEBUG, the native client logs the chosen engine and routing policy by request
+ID. Scheduler diagnostics (`SPDLOG_LEVEL=debug`) report restore and decode
+preallocation waits, and link L3 prefetch queries, reads and timeouts to the request ID.
+
+### Sampled PD first-output logs
+
+Set `--ttft-trace-sampling-percentage 1` on both roles to select approximately
+1% of rooms. The selection uses the CRC32 of the decimal bootstrap room,
+modulo 1000, with a threshold of ten times the percentage. A frontend owner
+records a selected request once, even when several token batches stream out.
+Pair the JSON records using `endpoint` and `room` within the same time window.
+
+| INFO record | Boundary | Measurements |
+| --- | --- | --- |
+| `TTFTBootstrap` | The prefill replica agrees the room is bootstrapped | Engine registration to bootstrap agreement |
+| `TTFTBreakdown` on Prefill | First engine output or terminal release | Bootstrap, admission to first dispatch after bootstrap, prompt execution, transfer observation and output preparation |
+| `TTFTBreakdown` on Decode | First engine output or terminal release | Bootstrap, KV landing after bootstrap, and landing to output |
+
+Prefill holds its first output until the KV transfer completes. Its normal
+breakdown therefore includes `transfer_observe` and `output_pack`; producing
+the bootstrap token alone does not emit the breakdown.
+
+Schema `ts-engine-v1` measures local `phases_ms` and `engine_elapsed_ms` on a
+monotonic clock. `first_dispatch_ms` is relative to engine registration.
+`total_ms` starts at the frontend creation timestamp when supplied and ends
+when the engine prepares the output. Unreached phases and an unavailable
+creation time are JSON null. Tokenization, detokenization and delivery to the
+HTTP client belong to the gateway and fall outside this measurement.
+
 ### Per-request stats
 
-`--enable-log-request-stats` enriches the scheduler's per-request finish line for
-latency/throughput debugging. When set, the `Req: <rid> Finish! ...` line carries
-a Python-object repr (`RequestStats(...)`) instead of the default
-`Accept_num_tokens_avg` value (which it subsumes as `acc_len`). The scheduler
-derives every field from host-side timestamps and counters it already has —
-the line adds **no GPU sync** and so no engine slowdown. Example:
+`--enable-log-request-stats` adds a `request_stats` field to the existing
+`ts_request_finished` event for registered requests. There is one finish log
+record per completion. The field retains the `Req: <rid> Finish! RequestStats(...)`
+text, including the speculative acceptance average as `acc_len`. With the flag
+off, the finish event still appears without detailed stats. The scheduler derives
+the stats from host-side timestamps and counters, adding no GPU synchronization;
+formatting and writing the log still have a CPU cost. Example `request_stats` value:
 
 ```
-Req: chatcmpl-019ef6b7 Finish! RequestStats(status='finished', reason='stop', prompt_tokens=28684, cache_tokens=832, output_tokens=33, cache_hit_rate=0.029, queue_ms=13.8, prefill_ms=15.8, ttft_ms=42.1, total_ms=58.0, preempt_ms=0.0, preempt_count=0, decode_tps=210.4, acc_len=None, acc_rate=None, recv_ts=1782255696.726, commit_ts=1782255696.74, finish_ts=1782255696.784)
+Req: chatcmpl-019ef6b7 Finish! RequestStats(status='finished', reason='stop', prompt_tokens=28684, cache_tokens=832, output_tokens=33, cache_hit_rate=0.029, queue_ms=13.8, prefill_ms=15.8, decode_wait_ms=0.0, ttft_ms=42.1, total_ms=58.0, preempt_ms=0.0, preempt_count=0, decode_tps=210.4, acc_len=None, acc_rate=None, recv_ts=1782255696.726, commit_ts=1782255696.74, finish_ts=1782255696.784)
 ```
 
 | Field | Meaning |
@@ -1103,8 +1168,9 @@ Req: chatcmpl-019ef6b7 Finish! RequestStats(status='finished', reason='stop', pr
 | `prompt_tokens` / `cache_tokens` / `output_tokens` | Prompt tokens, prefix-cache-hit tokens, generated tokens. |
 | `cache_hit_rate` | `cache_tokens / prompt_tokens` (0–1). |
 | `queue_ms` | Received → first scheduled into a forward batch. |
-| `prefill_ms` | Scheduled → prefill complete. |
-| `ttft_ms` | Received → first output token (always ≥ `prefill_ms`; it also spans the queue). |
+| `prefill_ms` | Scheduled → prefill complete. Always `0` on a decode node, whose prompt is prefilled on the prefill node. |
+| `decode_wait_ms` | Decode nodes only: KV (with the bootstrap token) landed → first decode batch dispatch. `0` elsewhere. |
+| `ttft_ms` | Received → first output token. On a decode node the first token is the prefill node's bootstrap token, so `ttft_ms` spans received → KV landed. |
 | `total_ms` | Received → finished/aborted. |
 | `preempt_ms` / `preempt_count` | Wall-clock this request's decode was delayed by prefilling other requests, and the number of such interruptions. Host-side best-effort. |
 | `decode_tps` | Decode throughput (generated tokens / decode window). |
@@ -1268,6 +1334,22 @@ is refused while a request is suspended with an image, so an image of
 old-weight KV is never restored under new weights.
 `--debug-force-retraction-interval` exercises the path without pressure in
 tests (see the flag above).
+
+**When a lone request cannot progress.** On the fused role the scheduler's
+no-progress abort fails a request like the image-fit abort above (524), with
+the detail "no progress for 4096 consecutive plans ...", counted in
+`tokenspeed:num_capacity_aborted_requests` too: a request no
+other request holds KV pages beside, whose admission needs Device pages that
+neither eviction nor lone-request compaction can free, or whose restore does
+not fit even when it claims no cached page
+([scheduler §1.4](../design/scheduler.md#14-what-bounds-a-single-request)),
+is aborted after 4096 consecutive scheduler plans without progress (the
+scheduler warns about such a stall from its 1024th plan on) instead of
+waiting for good. On the prefill and decode roles of a disaggregated
+deployment such a request waits behind the warning instead: a scheduler
+abort would not conclude the PD transfer it has registered. A prefill
+request past its first admission is not counted as stalled at all, as its
+pages stay pinned for the transfer.
 
 ### Host L2 and Mooncake Store L3
 

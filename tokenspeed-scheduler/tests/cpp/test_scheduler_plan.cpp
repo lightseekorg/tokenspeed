@@ -1106,6 +1106,20 @@ TEST_F(PrefillChunkYieldSuite, APromptSharingTheChunksUnpublishedPagesIsNotCarri
         << "its first chunk ends at the junction";
 }
 
+// Without prefix caching no probe can hit what the long chunk's admission
+// publishes, so the same prompt is carried at once, its whole prompt computed.
+TEST_F(PrefillChunkYieldSuite, APromptSharingTheChunksPagesIsCarriedBesideStateGroupsWithoutPrefixCaching) {
+    hybrid_ = true;
+    Restart(16);
+    config_.disable_prefix_cache = true;
+    scheduler_ = std::make_unique<Scheduler>(config_);
+    const std::vector<std::int32_t> long_tokens = MakeTokens(100, 1000);
+    SubmitPrompt("long", long_tokens);
+    EXPECT_EQ(Round(), (PrefillRows{{"long", 0, 32, 100}}));
+    SubmitPrompt("sharing", Extending({long_tokens.begin(), long_tokens.begin() + 8}, {7001, 7002}));
+    EXPECT_EQ(Round(), (PrefillRows{{"sharing", 0, 10, 10}, {"long", 32, 52, 100}}));
+}
+
 // With only prompts too long to carry waiting, the plans are those without
 // the knob.
 TEST_F(PrefillChunkYieldSuite, WithOnlyLongPromptsWaitingThePlansAreThoseWithoutTheKnob) {

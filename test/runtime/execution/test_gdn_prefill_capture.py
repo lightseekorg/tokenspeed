@@ -167,8 +167,7 @@ def _capture(backend, bucket, batch_size, forward, dummy):
     owner._handoff_storage, owner._outputs = {}, None
     owner._captures = {}
     owner.input_buffers = SimpleNamespace(input_ids_buf=torch.ones(bucket))
-    owner._embed_tokens = lambda ids: ids
-    owner._land_input_embeds = lambda *args: None
+    owner._input_embeds_buf = torch.empty(bucket, 1)
     owner.attn_backend = backend
     owner._run_inner = lambda bucket: (forward(), None)
 

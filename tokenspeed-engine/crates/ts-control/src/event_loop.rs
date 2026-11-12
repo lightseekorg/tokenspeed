@@ -147,12 +147,11 @@ const IDLE_WAIT: Duration = Duration::from_millis(10);
 const ACTIVE_PAGES_REFRESH: Duration = Duration::from_millis(100);
 
 /// The scheduler's active page count, as the load report, the metrics and
-/// the batch line read it. Taking it walks every live request's block
-/// tables, which at long contexts costs a round more than the rest of its
-/// work, so it is taken at most once per [`ACTIVE_PAGES_REFRESH`] -- the
-/// frontend considers a load report fresh for seconds -- and whenever the
-/// loop runs no request, when the walk costs nothing and an engine that went
-/// idle reports none active at once. A count taken while idle is not kept:
+/// the batch line read it. Reading it is O(1) (the scheduler's block tables
+/// keep the count), and it is taken at most once per
+/// [`ACTIVE_PAGES_REFRESH`] -- the frontend considers a load report fresh
+/// for seconds -- and whenever the loop runs no request, so an engine that
+/// went idle reports none active at once. A count taken while idle is not kept:
 /// the first round after requests arrive takes a new one, so an engine that
 /// just took a burst does not report none active for the next 100 ms.
 #[derive(Debug, Default)]
@@ -2410,6 +2409,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             tracing::debug!(?event, "transfer event");
             match event {
                 PdEvent::Bootstrapped(rid) => {
+                    self.outputs.bootstrapped(&rid);
                     events.push(pd_event(ForwardEventKind::PdBootstrapped, &rid, -1));
                 }
                 PdEvent::Succeeded(rid) => {
@@ -2638,6 +2638,12 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                                     admission.state,
                                 ));
                             } else {
+                                if self.owns_frontend() {
+                                    self.outputs.sample_ttft(
+                                        &mut admission.state,
+                                        admission.bootstrap.as_ref(),
+                                    );
+                                }
                                 admissions.push(*admission);
                             }
                         }

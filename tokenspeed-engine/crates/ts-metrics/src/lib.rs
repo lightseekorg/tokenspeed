@@ -527,7 +527,8 @@ impl EngineMetrics {
                 exporter,
                 "tokenspeed:num_capacity_aborted_requests",
                 "Requests the scheduler aborted because a capacity retraction could not image its \
-                 victim (retraction snapshot pool, image rows or Host L2 exhausted); clients may \
+                 victim (retraction snapshot pool, image rows or Host L2 exhausted), or because a \
+                 lone request made no progress for 4096 consecutive scheduler plans; clients may \
                  resubmit them. Forced retractions from --debug-force-retraction-interval aborted \
                  the same way count too.",
                 names,

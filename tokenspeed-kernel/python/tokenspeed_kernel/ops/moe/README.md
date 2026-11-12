@@ -253,6 +253,24 @@ selected tile 8, leaving an idle interval before routing. This policy keeps
 tile 32 available for that shape while retaining upstream routing and GEMM
 implementations.
 
+### Kimi-K3 decode tactic
+
+The MXFP4 precomputed top-k path launches through the same private entry
+point, so its tuning gets the private runner's policies. For Kimi-K3's TP8
+experts (896 experts of 3,584 hidden and 384 intermediate, top-k 16), the
+runner restricts the 256- and 512-token buckets (129 to 512 decode rows) to
+tile 32. FlashInfer tunes on balanced routes, about 9 tokens per expert at
+512 rows, where tiles 8 and 16 win. In decode a few experts take 40% to 50% of
+the rows, and tiles of 8 or 16 tokens re-read their weights for every tile. Over
+16 serving routings per size on GB300, tile 32 takes 171.5 us at 256 rows
+(tile 8: 218.5 us) and 222.9 us at 512 rows (tile 16: 249.8 us); outputs are
+bitwise identical across tiles. Prefill chunks in these buckets see the same
+skew: rows drawn independently from serving routings put up to 120 of 256 rows
+on a single expert, and tile 32 takes 157.4 us at 256 rows (tile 16: 164.7 us, tile
+8: 205.0 us) and 209.0 us at 512 rows (tile 16: 235.9 us). The 128-token bucket
+measured no faster with tile 32 in serving, and tile 64 leads from 768 rows, so
+other buckets keep the full tuner.
+
 ### NVFP4 squared ReLU
 
 Nemotron-H experts use a non-gated `relu(x)**2` activation. GEMM1 holds only

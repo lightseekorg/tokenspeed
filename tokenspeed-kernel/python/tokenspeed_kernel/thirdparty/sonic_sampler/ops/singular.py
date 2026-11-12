@@ -35,10 +35,12 @@ from tokenspeed_kernel.thirdparty.sonic_sampler.ops.base import (
 from tokenspeed_kernel.thirdparty.sonic_sampler.ops.prologue import (
     exact_candidates,
     exact_greedy,
+    whole_row,
 )
 from tokenspeed_kernel.thirdparty.sonic_sampler.ops.shard import (
     merged_candidates,
     merged_first,
+    merged_whole,
 )
 from tokenspeed_kernel.thirdparty.sonic_sampler.ops.topk.unpack import unpack_top_k
 
@@ -239,6 +241,8 @@ def cumulative_selection_kernel(
     ranks: tl.constexpr = None,  # Ranks -> W.
     stride_mr=None,  # Rank Stride of Gathered Candidate Pairs.
     stride_mb: tl.constexpr = None,  # Batch Stride of Gathered Candidate Pairs.
+    whole: tl.constexpr = False,  # Whole-Vocabulary Rows Flag (``whole_block``).
+    u_ptr=None,  # Draw Steps -> [ B ] int32, each row's noise step (else 0).
 ) -> None:
 
     # Extract the batch id from program id and load the indicator.
@@ -252,7 +256,37 @@ def cumulative_selection_kernel(
 
     indicator = tl.load(z_ptr + batch_id)
 
-    if (indicator & 0x40) > 0:
+    if whole_row(indicator, whole, True):
+
+        # Whole-vocabulary Gumbel-max: the best of the blocks' perturbed values.
+
+        if cand_ptr is not None:
+
+            _, token_id, _, _, _, _ = merged_whole(
+                cand_ptr, row_id, ranks, stride_mr, stride_mb, enable_pdl, max_k
+            )
+
+        else:
+
+            token_id = exact_greedy(
+                s_ptr, row_id, vocab_blocks, enable_pdl, stride_s, block_v
+            )
+
+        if indirection:
+
+            token_id = tl.load(m_ptr + token_id)
+
+        if update_counts:
+
+            decode_update(d_ptr, batch_id, token_id, prefill, stride_d)
+
+        if enable_pdl:
+
+            gdc_launch_dependents()
+
+        tl.store(t_ptr + (row_id * stride_t), token_id)
+
+    elif (indicator & 0x40) > 0:
 
         # Load, reduce, and select greedy i.e. top-1 maximum.
 
@@ -411,7 +445,13 @@ def cumulative_selection_kernel(
 
             # Draw the gumbel noise in-kernel at the unpacked subset.
 
-            key = philox_key(h_ptr, l_ptr, batch_id, 0)
+            draw_step = 0
+
+            if u_ptr is not None:
+
+                draw_step = tl.load(u_ptr + row_id)
+
+            key = philox_key(h_ptr, l_ptr, batch_id, draw_step)
             noise = philox_gumbel(key, indices)
 
         selected = tl.argmax(values - noise, axis=0, keep_dims=True)

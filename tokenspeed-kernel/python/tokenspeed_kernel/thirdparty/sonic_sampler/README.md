@@ -30,6 +30,11 @@ The vendored sources differ from `src/sonic_sampler` at that commit only by:
 - Triton imports: `from triton import ...`, `triton.language.extra.libdevice`
   and `triton.language.core.builtin` go through `tokenspeed_kernel._triton`,
   so the kernels compile with `tokenspeed-triton`;
+- the top-p nucleus: `ops/base.py`'s `nucleus_masking` keeps a candidate
+  while the mass of the candidates ranked above it is below `top_p` of their
+  total, so the one crossing `top_p` too; upstream kept one only if the mass
+  up to and including it was at most `top_p` (and always the first), which
+  drops the crossing one;
 - exact fp32 logits (soft-capped heads): `ops/prologue.py` gathers the logit
   manipulators into `transform`, which keeps the logits' dtype
   (`value_dtype`; bf16 logits compile as before), and adds `exact_maximum`,
@@ -56,6 +61,40 @@ The vendored sources differ from `src/sonic_sampler` at that commit only by:
   draft is rejected and the rejected position is drawn from the target, as
   the q of that row counts as zero. A draft the target gives no mass is never
   accepted;
+- draft probabilities recorded over each rank's vocabulary shard:
+  `shard_candidates_kernel` takes trailing `d_ptr`, `stride_d` and `stride_dg`
+  and writes each candidate's recorded probability as a third block of its
+  pairs; `merged_candidates_with_drafts` (beside `merged_candidates`, both on
+  the new `merged_selection`) merges them, `cumulative_unpack_kernel` writes
+  them for its candidates (new trailing `m_ptr`), and
+  `chain_speculative_verification_kernel` reads them there (new trailing
+  `m_ptr`, in place of `d_ptr`) for the accept test and the residual;
+- whole-vocabulary draws for rows without top-k, top-p or min-p (not
+  upstream): `ops/prologue.py` adds `whole_reduction_kernel`, which stores
+  each block's best logit plus the slot's Gumbel noise at each token
+  (`whole_block`, reading the block in tiles of at most 4096 columns, in
+  `exact_maximum`'s slots), and in a verify with point-draw drafts leaves the
+  draft out and stores the block's maximum, exp-sum and the draft's value.
+  `bitpacked_reduction_kernel` leaves those rows to it under a new trailing
+  `whole`, so the other rows' reduction compiles as before;
+  `cumulative_selection_kernel` takes the best over the blocks,
+  `shard_candidates_kernel` writes each rank's (`merged_whole` merges them)
+  and `cumulative_unpack_kernel` writes a draft row as the draft at its
+  probability over the whole vocabulary and the draw without it at
+  probability one (`whole_targets`), all under a new trailing `whole`;
+- draft-tree draws (not upstream): one draw per tree node in the singular
+  setting. `whole_reduction_kernel` and `cumulative_selection_kernel` take a
+  new trailing `u_ptr`, each row's noise step (its depth in its tree) in
+  place of its step in the window (`whole_block` keys its noise by a new
+  `draw_step`), and `decode_counts` reads a singular row's drafted tokens at
+  its row (`margin`) instead of its slot, so rows sharing a slot count their
+  own paths;
+- the Gumbel noise: `ops/base.py`'s `philox_gumbel` computes `log(-log u)`
+  from the Philox draw's raw bits (`exponential_log`, on the same counters):
+  `u` and `1 - u` come exactly from the bits and `-log u` from a short series below
+  `2^-8` and fast logs above, accurate to about `1e-5` where Gumbel-max
+  winners draw (`u` near 1), where upstream's fp32 uniform spaces `1 - u` in
+  steps of `2^-24`;
 - the msgspec host layer is not vendored: `base/`, `core/buffer.py`,
   `interface/` (the `fused_singular`/`fused_multistep` wrappers, the tiling
   and warp-config structs, the class-based interfaces), the packaged dispatch

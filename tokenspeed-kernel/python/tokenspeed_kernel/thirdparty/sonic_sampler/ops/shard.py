@@ -26,7 +26,12 @@ its ``shard_offset``) and ``shard_candidates_kernel`` writes its best
 ``max_k`` (value, global token id) pairs; the ranks gather the pairs, and
 ``cumulative_selection_kernel`` and ``cumulative_unpack_kernel`` merge them
 into each row's sorted best ``max_k`` over the whole vocabulary
-(``merged_candidates``, ``merged_first``) in place of their own unpack.
+(``merged_candidates``, ``merged_first``) in place of their own unpack. A
+verify whose draft probabilities each rank records over its own shard has
+the pairs carry them as a third block (``merged_candidates_with_drafts``).
+A row drawing from its whole vocabulary (``whole_block``) gathers its rank's
+best perturbed value instead, with a verify's normalizer and draft
+(``merged_whole``).
 """
 
 from __future__ import annotations
@@ -35,11 +40,21 @@ from tokenspeed_kernel._triton import tl, triton  # noqa.
 
 jit = triton.jit
 
-from tokenspeed_kernel.thirdparty.sonic_sampler.ops.base import gdc_wait
-from tokenspeed_kernel.thirdparty.sonic_sampler.ops.prologue import exact_candidates
+from tokenspeed_kernel.thirdparty.sonic_sampler.ops.base import fast_expf, gdc_wait
+from tokenspeed_kernel.thirdparty.sonic_sampler.ops.prologue import (
+    exact_candidates,
+    whole_normalizer,
+    whole_row,
+)
 from tokenspeed_kernel.thirdparty.sonic_sampler.ops.topk.unpack import unpack_top_k
 
-__all__ = ["merged_candidates", "merged_first", "shard_candidates_kernel"]
+__all__ = [
+    "merged_candidates",
+    "merged_candidates_with_drafts",
+    "merged_first",
+    "merged_whole",
+    "shard_candidates_kernel",
+]
 
 
 @jit
@@ -135,12 +150,18 @@ def shard_candidates_kernel(
     exact: tl.constexpr,  # Exact fp32 Logits Flag.
     logit_scale,  # Logit Scale of the Raw Head Logits, or None.
     softcap,  # Final Logit Softcap of the Raw Head Logits, or None.
+    # This Rank's Recorded Draft Probabilities (a verify's third pairs block).
+    d_ptr=None,  # Draft Probabilities -> [ P, γ, V_s ] over this rank's columns.
+    stride_d=None,  # Slot Stride of Draft Probabilities.
+    stride_dg: tl.constexpr = None,  # Step Stride of Draft Probabilities.
+    whole: tl.constexpr = False,  # Whole-Vocabulary Rows Flag (``whole_block``).
 ) -> None:
     """
     Writes each row's best ``max_k`` candidates over this rank's vocab shard, as
     ``vocab_topk_merge`` reads them: the values in descending order (the lower
     column first among equal values), then their global token ids as exact fp32
-    integers.
+    integers; with ``d_ptr``, then the draft probability the slot recorded at
+    each candidate for the row's draft (zero for greedy and bonus rows).
 
     Note(s):
 
@@ -149,6 +170,11 @@ def shard_candidates_kernel(
           (``exact_candidates``), so the merge selects the fp32 top-k.
 
         • Greedy rows keep only their first maximum; the other slots are -inf.
+
+        • Whole-vocabulary rows keep their best perturbed value and its global
+          token id in slot 0; a verify's draft rows add their maximum value
+          and exp-sum in slot 1 and their draft's value and perturbed value
+          in slot 2, as raw fp32 in both blocks (``merged_whole``).
 
         • Rows are request-major, ``lookahead + 1`` per request.
 
@@ -166,7 +192,28 @@ def shard_candidates_kernel(
     span = tl.arange(0, max_k)
     pairs = (row_id * stride_o) + span
 
-    if (indicator & 0x40) > 0:
+    if whole_row(indicator, whole, lookahead == 0):
+
+        value, column = first_maximum(
+            s_ptr, row_id, vocab_blocks, True, enable_pdl, stride_s, block_n, block_v
+        )
+
+        values = tl.where(span == 0, value, -float("inf"))
+        indices = tl.where(span == 0, column, 0)
+        ids = (indices + shard_offset).to(tl.float32)
+
+        if lookahead > 0:
+
+            maximum, total, draft_value, draft_score = whole_normalizer(
+                s_ptr, row_id, vocab_blocks, stride_s, block_v
+            )
+
+            values = tl.where(span == 1, maximum, values)
+            values = tl.where(span == 2, draft_value, values)
+            ids = tl.where(span == 1, total, ids)
+            ids = tl.where(span == 2, draft_score, ids)
+
+    elif (indicator & 0x40) > 0:
 
         value, column = first_maximum(
             s_ptr, row_id, vocab_blocks, exact, enable_pdl, stride_s, block_n, block_v
@@ -174,6 +221,7 @@ def shard_candidates_kernel(
 
         values = tl.where(span == 0, value, -float("inf"))
         indices = tl.where(span == 0, column, 0)
+        ids = (indices + shard_offset).to(tl.float32)
 
     else:
 
@@ -240,9 +288,24 @@ def shard_candidates_kernel(
         # The greedy branch's types: fp32 values, int32 columns.
         values = values.to(tl.float32)
         indices = indices.to(tl.int32)
+        ids = (indices + shard_offset).to(tl.float32)
 
     tl.store(o_ptr + pairs, values)
-    tl.store(o_ptr + pairs + max_k, (indices + shard_offset).to(tl.float32))
+    tl.store(o_ptr + pairs + max_k, ids)
+
+    if d_ptr is not None:
+
+        # Only this rank holds q over its columns, so its candidates carry q to the merge.
+        drafts = tl.zeros((max_k,), dtype=tl.float32)
+
+        if ((indicator & 0x40) == 0) & (step_id < lookahead):
+
+            positions = (batch_id * stride_d) + (step_id * stride_dg) + indices
+            drafts = tl.load(
+                d_ptr + positions, mask=(indices >= 0) & (indices < vocab_size), other=0
+            )
+
+        tl.store(o_ptr + pairs + 2 * max_k, drafts)
 
 
 @jit
@@ -285,6 +348,28 @@ def unpack_key(keys):
 
 
 @jit
+def merged_selection(
+    cand_ptr,
+    row_id,
+    ranks: tl.constexpr,
+    stride_mr,
+    stride_mb: tl.constexpr,
+    enable_pdl: tl.constexpr,
+    max_k: tl.constexpr,
+):
+    """A row's best ``max_k`` gathered values in descending order (fp32), their rank-major slots, and every gathered token id."""
+
+    keys, ids = merged_keys(
+        cand_ptr, row_id, ranks, stride_mr, stride_mb, enable_pdl, max_k
+    )
+
+    best = tl.gather(tl.sort(keys, descending=True), tl.arange(0, max_k), axis=0)
+    values, slots = unpack_key(best)
+
+    return values, slots, ids
+
+
+@jit
 def merged_candidates(
     cand_ptr,
     row_id,
@@ -303,12 +388,9 @@ def merged_candidates(
     keeps them), and their token ids.
     """
 
-    keys, ids = merged_keys(
+    values, slots, ids = merged_selection(
         cand_ptr, row_id, ranks, stride_mr, stride_mb, enable_pdl, max_k
     )
-
-    best = tl.gather(tl.sort(keys, descending=True), tl.arange(0, max_k), axis=0)
-    values, slots = unpack_key(best)
     indices = tl.gather(ids, slots, axis=0)
 
     if not exact:
@@ -316,6 +398,37 @@ def merged_candidates(
         values = values.to(tl.bfloat16)
 
     return values, indices
+
+
+@jit
+def merged_candidates_with_drafts(
+    cand_ptr,
+    row_id,
+    ranks: tl.constexpr,
+    stride_mr,
+    stride_mb: tl.constexpr,
+    exact: tl.constexpr,
+    enable_pdl: tl.constexpr,
+    max_k: tl.constexpr,
+):
+    """``merged_candidates`` from pairs with a third block (``[ranks, rows, 3 • max_k]``), and the draft probabilities it holds for the merged candidates."""
+
+    values, slots, ids = merged_selection(
+        cand_ptr, row_id, ranks, stride_mr, stride_mb, enable_pdl, max_k
+    )
+
+    span = tl.arange(0, ranks * max_k)
+    pairs = cand_ptr + (span // max_k) * stride_mr + row_id * stride_mb + span % max_k
+    drafts = tl.load(pairs + 2 * max_k)
+
+    indices = tl.gather(ids, slots, axis=0)
+    proposals = tl.gather(drafts, slots, axis=0)
+
+    if not exact:
+
+        values = values.to(tl.bfloat16)
+
+    return values, indices, proposals
 
 
 @jit
@@ -337,3 +450,51 @@ def merged_first(
     _, slot = unpack_key(tl.max(keys, axis=0))
 
     return tl.sum(tl.where(tl.arange(0, ranks * max_k) == slot, ids, 0), axis=0)
+
+
+@jit
+def merged_whole(
+    cand_ptr,
+    row_id,
+    ranks: tl.constexpr,
+    stride_mr,
+    stride_mb: tl.constexpr,
+    enable_pdl: tl.constexpr,
+    max_k: tl.constexpr,
+):
+    """
+    A whole-vocabulary row over every rank's gathered pairs: the best
+    perturbed value and its token id (the lowest rank's among equal values),
+    then for a verify's draft row its maximum value, its exp-sum below that
+    maximum, and its draft's value and perturbed value.
+    """
+    minima: tl.constexpr = -float("inf")
+
+    span = tl.arange(0, ranks)
+    pairs = cand_ptr + span * stride_mr + row_id * stride_mb
+
+    if enable_pdl:
+
+        gdc_wait()
+
+    scores = tl.load(pairs)
+    ids = tl.load(pairs + max_k)
+    maxima = tl.load(pairs + 1)
+    totals = tl.load(pairs + max_k + 1)
+
+    score, rank = tl.max(scores, axis=0, return_indices=True)
+    token = tl.sum(tl.where(span == rank, ids, 0.0), axis=0).to(tl.int32)
+
+    maximum = tl.max(maxima, axis=0)
+    total = tl.sum(
+        tl.where(maxima > minima, fast_expf(maxima - maximum) * totals, 0.0), axis=0
+    )
+
+    return (
+        score,
+        token,
+        maximum,
+        total,
+        tl.max(tl.load(pairs + 2), axis=0),
+        tl.max(tl.load(pairs + max_k + 2), axis=0),
+    )

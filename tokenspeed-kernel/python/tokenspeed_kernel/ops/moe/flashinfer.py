@@ -1979,7 +1979,6 @@ if platform.is_nvidia:
         trtllm_fp4_block_scale_moe,
     )
     from flashinfer.cute_dsl import is_cute_dsl_available
-    from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe
     from flashinfer.fused_moe.core import (
         _maybe_get_cached_w3_w1_permute_indices as maybe_get_cached_w3_w1_permute_indices,
     )
@@ -1987,6 +1986,9 @@ if platform.is_nvidia:
         get_w2_permute_indices_with_cache,
     )
     from flashinfer.tllm_enums import ActivationType
+    from tokenspeed_kernel.thirdparty.flashinfer.trtllm_moe import (
+        trtllm_fp4_block_scale_routed_moe as tokenspeed_trtllm_fp4_block_scale_routed_moe,
+    )
 
     def _get_device_permute_indices(
         x: torch.Tensor,
@@ -2313,7 +2315,7 @@ if platform.is_nvidia:
             topk_ids.to(torch.int32).contiguous(),
             topk_weights.to(torch.bfloat16).contiguous(),
         )
-        result = trtllm_fp4_block_scale_routed_moe(
+        result = tokenspeed_trtllm_fp4_block_scale_routed_moe(
             topk_ids=topk,
             routing_bias=None,
             hidden_states=x,
@@ -3264,9 +3266,6 @@ if platform.is_nvidia:
     from tokenspeed_kernel.thirdparty.flashinfer.trtllm_moe import (
         trtllm_fp4_block_scale_moe as tokenspeed_trtllm_fp4_block_scale_moe,
     )
-    from tokenspeed_kernel.thirdparty.flashinfer.trtllm_moe import (
-        trtllm_fp4_block_scale_routed_moe as tokenspeed_trtllm_fp4_block_scale_routed_moe,
-    )
 
     def _flashinfer_trtllm_nvfp4_moe_weights(
         plan: dict, w: torch.nn.Module, *, activation: str
@@ -3522,6 +3521,35 @@ if platform.is_nvidia:
         # bias reflects the loaded values, not the empty Parameter.
         if _correction_bias is not None:
             _correction_bias = _correction_bias.to(_routing_logits_dtype)
+
+        from tokenspeed_kernel.ops.communication.peer_weights import (
+            ExpertWeightShard,
+            PreparedExpertWeights,
+        )
+
+        streamed = (
+            "gemm1_weights_fp4_shuffled",
+            "gemm1_scales_fp4_shuffled",
+            "gemm2_weights_fp4_shuffled",
+            "gemm2_scales_fp4_shuffled",
+        )
+        replicated = (
+            "g1_alphas",
+            "g2_alphas",
+            "g1_scale_c",
+            "gemm1_alpha",
+            "gemm1_beta",
+            "gemm1_clamp_limit",
+        )
+        parameters = dict(w.named_parameters(recurse=False))
+        return PreparedExpertWeights(
+            layout=f"flashinfer-trtllm-nvfp4-{activation}-v1",
+            shards=tuple(
+                ExpertWeightShard(name, parameters[name], name in replicated)
+                for name in (*streamed, *replicated)
+                if name in parameters
+            ),
+        )
 
     _FP4_TILES = (8, 16, 32, 64, 128)
 

@@ -84,10 +84,13 @@ through the `("gemm", "mv_weightless_rmsnorm_gated_sigmoid")` operation. A
 registered kernel serves it only where the separate gated norm and `mv` select
 the kernels it reproduces bit for bit; otherwise callers keep the two calls.
 
-On SM107, FlashInfer's TGV/CuTe DSL search supports BF16 output projections
-with weight shape `[2560, 6144]` and M <= 4. Startup tuning covers M=1/2/4.
-The kernels accumulate in FP32 and return BF16; reduction order can change
-rounding relative to the original GEMM.
+On SM107, BF16 output projections whose weight shape is in the measured
+`_SM107_BF16_GEMM_SHAPES` set (the TP4 per-rank projections plus the TP1
+`[2560, 6144]` o_proj) run FlashInfer's CuTe DSL low-latency GEMM at M <= 4,
+pinned as the measured winner on every admitted shape; other shapes keep
+their existing path. Startup tuning covers M=1/2/4. The kernels accumulate
+in FP32 and return BF16; reduction order can change rounding relative to
+the original GEMM.
 
 ## Decode GEMMs on small weights
 

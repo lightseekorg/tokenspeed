@@ -264,6 +264,22 @@ runner pod recreation and avoids downloading the same large wheels again on
 that node. Other runner families keep their existing cache behavior because
 their cluster storage layouts may differ.
 
+The engine installer reuses `tokenspeed-engine` wheels under
+`CI_WHEEL_CACHE_DIR/tokenspeed-engine` on these runners and on Slurm's mounted
+package cache. The key covers the engine and scheduler sources, Python ABI and
+configuration, resolved Python build dependencies, Rust/C++ toolchains, native
+system packages, and compiler settings. A source change invalidates the wheel
+even without a version bump. Concurrent jobs build a missing wheel once under
+a lock, then publish it atomically after an import check. Fork PRs and local
+xgrammar source overrides bypass this cache. The installer logs cache hits and
+build/install elapsed time. Each run prunes wheel directories, orphaned build
+directories, and stale lock files untouched for 14 days; a hit refreshes the
+wheel's timestamp.
+
+The dedicated Rust workflow caches Cargo dependencies and workspace build
+artifacts, with Python/native build inputs included in the key. GPU jobs share
+only the final wheel: CMake build trees contain checkout-specific paths.
+
 B200v2 CI stores FlashInfer tactics under `tokenspeed/flashinfer-autotune`
 in the same persistent root as the package cache: an explicit `CI_CACHE_ROOT`,
 the parent of `FLASHINFER_CACHE_DIR`, or `/raid/cache`. An explicit
@@ -401,6 +417,10 @@ MI450 simulator tasks share their ROCm and PyTorch pins through
 simulator and dependency installers in the same shell; standalone simulator
 setup loads it as well. Update that file to change the stack: its pins override
 inherited environment values. Changes to it select both MI450 tasks.
+The simulator tasks use `install_kernel_deps_rocm.sh` to install kernel
+dependencies without building the scheduler or Rust engine or installing the
+serving runtime. Full ROCm serving installs reuse that script through
+`install_deps_rocm.sh` before installing the runtime components.
 
 PR and push diffs containing only `test/ci/**/*.yaml` run only the changed tasks,
 with existing validation and runner/trigger rules. Diffs that also, or only,

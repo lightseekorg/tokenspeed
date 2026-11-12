@@ -104,6 +104,8 @@ def _small_layer() -> torch.nn.Module:
     layer._weights_processed = False
     layer._quant_kind = "fp8"
     layer._moe_backend_state = None
+    # Resident expert weights: nothing to publish or read through peers.
+    layer.peer_weights = None
     layer.plan = _plan()
     return layer
 

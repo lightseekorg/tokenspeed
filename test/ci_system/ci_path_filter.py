@@ -60,6 +60,7 @@ VENDOR_PATHS = {
     "amd": (
         "test/ci_system/cleanup_amd_gpu_state.sh",
         "test/ci_system/install_deps_rocm.sh",
+        "test/ci_system/install_kernel_deps_rocm.sh",
         "test/ci_system/install_kernel_benchmark_rocm.sh",
         "test/ci_system/kernel_benchmark_ci.py",
         "test/ci_system/verify_rocm_stack.py",

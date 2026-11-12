@@ -30,6 +30,7 @@ zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime
 ureq = { version = "2", default-features = false, features = ["tls"] }
 
 [dev-dependencies]
+tracing-subscriber = "0.3"
 mimalloc = { version = "0.1", default-features = false }
 pyo3 = "0.30"
 serde_json = "1"

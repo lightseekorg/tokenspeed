@@ -25,6 +25,23 @@ from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import current_platform
 
 _MIN_BLOCK_KV = 32
+# Split the keys until the stage-1 grid has about this many programs per
+# compute unit; a small batch otherwise leaves most of the GPU idle while each
+# program walks its whole cache.
+_PROGRAMS_PER_CU = 4
+
+
+def _num_kv_splits(q: torch.Tensor, num_kv_heads: int, max_kv_splits: int) -> int:
+    """Key splits per query: the batch shape alone decides, so one captured
+    graph keeps one split count. The splits are a runtime tensor, so a new
+    count reuses the compiled kernels."""
+    group = q.shape[1] // num_kv_heads
+    # Stage-1 programs per query: one per head, or per block of up to 16
+    # grouped heads.
+    heads = q.shape[1] if group == 1 else num_kv_heads * triton.cdiv(group, 16)
+    programs = q.shape[0] * heads
+    target = _PROGRAMS_PER_CU * current_platform().sm_count
+    return max(1, min(max_kv_splits, triton.cdiv(target, programs)))
 
 
 @triton.jit
@@ -59,6 +76,7 @@ def _fwd_kernel_stage1(
     PAGE_SIZE: tl.constexpr,
     MAX_SEQLEN_Q: tl.constexpr,
     WINDOW_LEFT: tl.constexpr,
+    WINDOW_SINK: tl.constexpr,
     kv_group_num: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_DV: tl.constexpr,
@@ -90,6 +108,10 @@ def _fwd_kernel_stage1(
         tl.minimum(cache_len, WINDOW_LEFT + 1) if WINDOW_LEFT >= 0 else cache_len
     )
     kv_start_offset = cache_len - cur_batch_seq_len
+    # Sink rows the window does not already cover, walked before it as extra
+    # iterations at absolute token indices.
+    sink_len = tl.minimum(WINDOW_SINK, kv_start_offset)
+    cur_batch_seq_len = cur_batch_seq_len + sink_len
     kv_splits = tl.load(num_kv_splits + cur_batch)
 
     off_q = cur_q * stride_qbs + cur_head * stride_qh + offs_d
@@ -108,7 +130,12 @@ def _fwd_kernel_stage1(
         q = tl.load(Q + off_q, mask=mask_d, other=0.0)
         for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
             offs_n = start_n + tl.arange(0, BLOCK_N)
-            token_indices = kv_start_offset + offs_n
+            # First sink_len entries are tokens 0..sink_len-1, then the window.
+            token_indices = tl.where(
+                offs_n < sink_len,
+                offs_n,
+                kv_start_offset + offs_n - sink_len,
+            )
             page_indices = token_indices // PAGE_SIZE
             page_offsets = token_indices - page_indices * PAGE_SIZE
             physical_pages = tl.load(
@@ -195,6 +222,7 @@ def _decode_att_m_fwd(
     page_size,
     max_seqlen_q,
     window_left,
+    window_sink,
     sm_scale,
     logit_cap,
 ):
@@ -246,6 +274,7 @@ def _decode_att_m_fwd(
         page_size,
         MAX_SEQLEN_Q=max_seqlen_q,
         WINDOW_LEFT=window_left,
+        WINDOW_SINK=window_sink,
         kv_group_num=kv_group_num,
         BLOCK_DMODEL=BLOCK_DMODEL,
         BLOCK_DV=BLOCK_DV,
@@ -285,6 +314,7 @@ def _fwd_grouped_kernel_stage1(
     PAGE_SIZE: tl.constexpr,
     MAX_SEQLEN_Q: tl.constexpr,
     WINDOW_LEFT: tl.constexpr,
+    WINDOW_SINK: tl.constexpr,
     kv_group_num: tl.constexpr,
     q_head_num: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
@@ -326,6 +356,9 @@ def _fwd_grouped_kernel_stage1(
         tl.minimum(cache_len, WINDOW_LEFT + 1) if WINDOW_LEFT >= 0 else cache_len
     )
     kv_start_offset = cache_len - cur_batch_seq_len
+    # Sinks: see _fwd_kernel_stage1.
+    sink_len = tl.minimum(WINDOW_SINK, kv_start_offset)
+    cur_batch_seq_len = cur_batch_seq_len + sink_len
     kv_splits = tl.load(num_kv_splits + cur_batch)
 
     offs_q = cur_q * stride_qbs + cur_head[:, None] * stride_qh + offs_d[None, :]
@@ -353,7 +386,12 @@ def _fwd_grouped_kernel_stage1(
             )
         for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
             offs_n = start_n + tl.arange(0, BLOCK_N)
-            token_indices = kv_start_offset + offs_n
+            # First sink_len entries are tokens 0..sink_len-1, then the window.
+            token_indices = tl.where(
+                offs_n < sink_len,
+                offs_n,
+                kv_start_offset + offs_n - sink_len,
+            )
             page_indices = token_indices // PAGE_SIZE
             page_offsets = token_indices - page_indices * PAGE_SIZE
             physical_pages = tl.load(
@@ -455,6 +493,7 @@ def _decode_grouped_att_m_fwd(
     page_size,
     max_seqlen_q,
     window_left,
+    window_sink,
     sm_scale,
     logit_cap,
 ):
@@ -519,6 +558,7 @@ def _decode_grouped_att_m_fwd(
         page_size,
         MAX_SEQLEN_Q=max_seqlen_q,
         WINDOW_LEFT=window_left,
+        WINDOW_SINK=window_sink,
         kv_group_num=kv_group_num,
         q_head_num=head_num,
         BLOCK_DMODEL=BLOCK_DMODEL,
@@ -555,6 +595,7 @@ def _fwd_kernel_stage2(
     BLOCK_DV: tl.constexpr,
     Lv: tl.constexpr,
     WINDOW_LEFT: tl.constexpr,
+    WINDOW_SINK: tl.constexpr,
     HAS_SINK: tl.constexpr,
 ):
     cur_q = tl.program_id(0)
@@ -570,6 +611,12 @@ def _fwd_kernel_stage2(
     cur_batch_seq_len = (
         tl.minimum(cache_len, WINDOW_LEFT + 1) if WINDOW_LEFT >= 0 else cache_len
     )
+    # Must match stage 1's row count, sinks included, or the reduction reads a
+    # different number of splits than stage 1 wrote. Both branches above keep
+    # cur_batch_seq_len <= cache_len, so the offset is non-negative.
+    kv_start_offset = cache_len - cur_batch_seq_len
+    sink_len = tl.minimum(WINDOW_SINK, kv_start_offset)
+    cur_batch_seq_len = cur_batch_seq_len + sink_len
     kv_splits = tl.load(num_kv_splits + cur_batch)
 
     offs_d = tl.arange(0, BLOCK_DV)
@@ -608,9 +655,11 @@ def _fwd_kernel_stage2(
         cur_sink = tl.load(sink_ptr + cur_head)
         e_sum += tl.exp(cur_sink - e_max)
 
+    # A query with no keys in reach (an empty cache) has nothing to attend:
+    # a zero output rather than 0 / 0.
     tl.store(
         O + cur_q * stride_obs + cur_head * stride_oh + offs_d,
-        acc / e_sum,
+        tl.where(e_sum > 0.0, acc / e_sum, 0.0),
         mask=mask_d,
     )
 
@@ -626,6 +675,7 @@ def _decode_softmax_reducev_fwd(
     max_kv_splits,
     max_seqlen_q,
     window_left,
+    window_sink,
     sinks=None,
 ):
     platform = current_platform()
@@ -659,6 +709,7 @@ def _decode_softmax_reducev_fwd(
         BLOCK_DV=BLOCK_DV,
         Lv=Lv,
         WINDOW_LEFT=window_left,
+        WINDOW_SINK=window_sink,
         HAS_SINK=HAS_SINK,
         num_warps=4,
         num_stages=2,
@@ -681,6 +732,7 @@ def decode_attention_fwd_normal(
     page_table_stride_b,
     page_size,
     window_left,
+    window_sink,
     sm_scale,
     logit_cap=0.0,
     sinks=None,
@@ -699,6 +751,7 @@ def decode_attention_fwd_normal(
         page_size,
         max_seqlen_q,
         window_left,
+        window_sink,
         sm_scale,
         logit_cap,
     )
@@ -713,6 +766,7 @@ def decode_attention_fwd_normal(
         max_kv_splits,
         max_seqlen_q,
         window_left,
+        window_sink,
         sinks,
     )
 
@@ -732,6 +786,7 @@ def decode_attention_fwd_grouped(
     page_table_stride_b,
     page_size,
     window_left,
+    window_sink,
     sm_scale,
     logit_cap=0.0,
     sinks=None,
@@ -750,6 +805,7 @@ def decode_attention_fwd_grouped(
         page_size,
         max_seqlen_q,
         window_left,
+        window_sink,
         sm_scale,
         logit_cap,
     )
@@ -764,6 +820,7 @@ def decode_attention_fwd_grouped(
         max_kv_splits,
         max_seqlen_q,
         window_left,
+        window_sink,
         sinks,
     )
 
@@ -783,6 +840,7 @@ def decode_attention_fwd(
     page_table_stride_b,
     page_size,
     window_left,
+    window_sink,
     sm_scale,
     logit_cap=0.0,
     sinks=None,
@@ -810,6 +868,7 @@ def decode_attention_fwd(
             page_table_stride_b,
             page_size,
             window_left,
+            window_sink,
             sm_scale,
             logit_cap=logit_cap,
             sinks=sinks,
@@ -831,6 +890,7 @@ def decode_attention_fwd(
             page_table_stride_b,
             page_size,
             window_left,
+            window_sink,
             sm_scale,
             logit_cap=logit_cap,
             sinks=sinks,
@@ -1252,6 +1312,7 @@ def _triton_mha_decode_with_kvcache_impl(
     max_seqlen_k: int,
     max_seqlen_q: int = 1,
     window_left: int = -1,
+    window_sink: int = 0,
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
     return_lse: bool = False,
@@ -1306,8 +1367,11 @@ def _triton_mha_decode_with_kvcache_impl(
         dtype=torch.float32,
         device=q.device,
     )
-    num_kv_splits = torch.ones(
-        (cache_seqlens.shape[0],), dtype=torch.int32, device=q.device
+    num_kv_splits = torch.full(
+        (cache_seqlens.shape[0],),
+        _num_kv_splits(q, k_cache.shape[2], max_kv_splits),
+        dtype=torch.int32,
+        device=q.device,
     )
     decode_attention_fwd(
         q,
@@ -1324,6 +1388,7 @@ def _triton_mha_decode_with_kvcache_impl(
         page_table.stride(0),
         k_cache.shape[1],
         window_left,
+        window_sink,
         sm_scale=softmax_scale,
         logit_cap=logit_cap,
         sinks=sinks,

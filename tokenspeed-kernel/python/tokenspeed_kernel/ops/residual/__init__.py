@@ -386,9 +386,14 @@ def select_gated_residual_mix_kernel(
     Returns:
         The selected kernel and the selection traits.
     """
-    from tokenspeed_kernel.ops.residual.cute_fused import supports_fused_hc
+    from tokenspeed_kernel.ops.residual.cute_fused import (
+        prefers_fused_hc,
+        supports_fused_hc,
+        supports_fused_hc_shape,
+    )
 
     rows = int(flat.shape[0])
+    grid_supported = supports_fused_hc(flat.device)
 
     traits = {
         "prefill_up_mix": (
@@ -397,7 +402,12 @@ def select_gated_residual_mix_kernel(
             and packed_up_weight.data_ptr() % 16 == 0
         ),
         "weights_independent": weights_independent,
-        "fused_grid_supported": supports_fused_hc(flat.device),
+        "fused_grid_supported": grid_supported,
+        "fused_shape_supported": supports_fused_hc_shape(
+            hc_count, hidden_size, lowrank
+        ),
+        "fused_workload_supported": grid_supported
+        and prefers_fused_hc(rows, hc_count, hidden_size, lowrank),
         "fused_tma_aligned": all(
             tensor.data_ptr() % 16 == 0
             for tensor in (flat, projection_weight, up_weight)

@@ -155,7 +155,7 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
         finishCheckpointIsDead(request, progress) ? PublicationPoint::kChunk : PublicationPoint::kFinal,
         /*allow_state_checkpoint=*/coordinator_.CheckpointGranularity() == 1 ||
             (config_.role != Role::kD && num_computed_tokens <= request.PrefillSize()),
-        /*preserve_source_blocks=*/false);
+        /*preserve_source_blocks=*/false, /*publish_to_cache=*/config_.PublishesCompletedPages());
     std::vector<std::string> store_hashes = progress.prefix_hashes;
     if (completed.completed_pages) {
         registerKvEventPublication(request, progress.prefix_hashes, *completed.completed_pages);

@@ -77,7 +77,11 @@ Lanes that carry per-row tables (`TreeCascadeRows.row_page_table`) let a
 sliding-window draft layer see in every lane row the window frozen at the
 round's prefix end: each row decodes the prefix alone (`q_len = 1` at the
 prefix's last key) and the window kernel attends the tree window only
-(`causal_prefix=False`).
+(`causal_prefix=False`). In the `mha` leaf every lane of a request decodes the
+same keys, so its prefix half folds the `K` lanes into the query heads (lane
+`r`'s head `h` is head `h * K + r`, a grouped query of KV head `h`) and runs
+the same folded Triton decode with `q_len = 1`: the keys are read once per
+request instead of `K` times.
 
 An FP8 KV cache (E4M3, unscaled like every FP8 KV cache here) changes no
 structure: trtllm-gen takes the query cast to FP8 as it does for any decode,
@@ -240,13 +244,20 @@ stream's position keys, while the walk's draft noise and the accept coins
 use their own salted offsets. Greedy rows, rows without a q (slot `-1`) and
 routes without an exact filtered distribution (top-p only, mixed batches)
 keep the plain-decoding draw.
-Backends that can do neither keep `supports_tree_verify = False` and the
+The `sonic` backend draws every node row the way its `sample` draws
+(`sonic.tree_targets`): Philox noise keyed by the request's offset and the
+node's depth, and penalties counting the tokens of the node's path on top of
+the request's decode counts. The same walk accepts the child holding its
+parent's draw, and the emitted tokens then join the decode counts. Like
+`triton` it reads no draft q, so the tokens it emits are exact samples of the
+target for any tree, and a sampled node is accepted at its target probability.
+Backends that can do none of these keep `supports_tree_verify = False` and the
 executor refuses tree drafting with them at startup.
 
 ## Scope
 
 EAGLE3 and EAGLE-style MTP drafters (the `Eagle` drafter; the multi-depth `Mtp`
-drafter refuses trees at startup) and EAGLE4; `greedy`, `triton` and `flashinfer` sampling backends; the `trtllm`
+drafter refuses trees at startup) and EAGLE4; `greedy`, `triton`, `flashinfer` and `sonic` sampling backends; the `trtllm`
 attention backend, the `mha` backend with bf16 KV, or `trtllm_mla` / `tokenspeed_mla` for MLA targets and drafts (no
 KV parallelism), with bf16 or FP8 E4M3 KV in full-history KV cache groups, alone or inside the
 hybrid linear-attention backend (GDN or Mamba2, ReplaySSM or staged); no structured output,
