@@ -1990,9 +1990,12 @@ class KimiLinearMoEGate(nn.Module):
 # this is a prefill chunk and takes the unsplit path; the scratch buffers are
 # allocated to exactly this many rows. Raise together with --max-num-seqs.
 ATTNRES_FAST_PATH_MAX_TOKENS = 32
-# Paired MI350 measurements show that stream scheduling costs more than the
-# available attention/AttnRes overlap through M=16. Preserve NVIDIA's policy.
-ATTNRES_STREAM_FORK_THRESHOLD = 16 if current_platform().is_amd else 0
+# On AMD, stream scheduling costs more than the available attention/AttnRes
+# overlap at every size (paired MI350 measurements through M=16; MI355X TP8
+# decode graphs from 17 to 32 rows, where the cross-stream waits leave one
+# rank behind at the next collective), so AMD never forks. Preserve NVIDIA's
+# policy.
+ATTNRES_STREAM_FORK_THRESHOLD = float("inf") if current_platform().is_amd else 0
 
 
 def _attnres_mlp_slot(layer_id: int) -> int:
@@ -3131,8 +3134,9 @@ class KimiLinearMoE(nn.Module):
             and router_logits.is_contiguous()
         )
         # Warm the auxiliary stream serially before capture enables overlap.
+        # On AMD the routing branch costs more in stream waits than it hides.
         with self.stream_fork.scope(
-            enable=get_is_cuda_graph_phase(),
+            enable=get_is_cuda_graph_phase() and not current_platform().is_amd,
             overlap=get_is_capture_mode(),
         ) as fork:
             with fork.branch():
