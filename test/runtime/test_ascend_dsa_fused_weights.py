@@ -27,6 +27,7 @@ from transformers import PretrainedConfig
 from tokenspeed.runtime.layers.attention.dsa.ascend import (
     AscendDSAIndexer,
     pack_down_qa_panels,
+    pack_dsa_qb,
     pack_qb_panels,
     pack_score_fp32,
 )
@@ -53,53 +54,78 @@ def test_compact_qb_rejects_missing_heads():
 
 
 @pytest.mark.parametrize("dtype", [torch.int32, torch.bfloat16])
-def test_down_pack_preserves_qa_kv_and_indexer_coefficients(dtype):
+@pytest.mark.parametrize("hidden,query_rank", [(4096, 1536), (2048, 768)])
+def test_down_pack_preserves_qa_kv_and_indexer_coefficients(dtype, hidden, query_rank):
     # Unique int32 coefficients detect misplaced rows. Reinterpreted BF16
     # coefficients also cover signed zeros and NaN payloads without rounding.
-    source = torch.arange(2240 * 4096, dtype=torch.int32).reshape(2240, 4096)
+    source = torch.arange((query_rank + 704) * hidden, dtype=torch.int32).reshape(
+        query_rank + 704, hidden
+    )
     if dtype == torch.bfloat16:
         source = source.to(torch.int16).view(torch.bfloat16)
     packed = pack_down_qa_panels(source)
     original_bits = source.view(torch.int16) if dtype == torch.bfloat16 else source
     packed_bits = packed.view(torch.int16) if dtype == torch.bfloat16 else packed
     rows = sorted(
-        {0, 7, 8, 15, 16, 1535, 1536, 1537, 1551, 1552, 2111, 2112, 2239}
-        | {r for panel in range(1, 16) for r in (panel * 96 - 1, panel * 96)}
+        {
+            0,
+            7,
+            8,
+            15,
+            16,
+            query_rank - 1,
+            query_rank,
+            query_rank + 1,
+            query_rank + 15,
+            query_rank + 16,
+            query_rank + 575,
+            query_rank + 576,
+            query_rank + 703,
+        }
+        | {
+            r
+            for panel in range(1, query_rank // 96)
+            for r in (panel * 96 - 1, panel * 96)
+        }
     )
-    channels = (0, 15, 16, 511, 512, 513, 1023, 1024, 2047, 2048, 4032, 4095)
+    channels = sorted({0, 15, 16, 511, 512, 513, 1023, 1024, hidden - 64, hidden - 1})
     for row in rows:
         for k in channels:
-            if row < 1536:
+            if row < query_rank:
                 # QA N96/K512 panels, with [K16, N16, n, k] inner tiles.
-                raw = row // 96 * (96 * 4096) + k // 512 * (96 * 512)
+                raw = row // 96 * (96 * hidden) + k // 512 * (96 * 512)
                 raw += (k % 512 // 16 * 6 + row % 96 // 16) * 256
                 raw += row % 16 * 16 + k % 16
             else:
                 # KV and indexer rows retain their genuine NZ suffix.
-                auxiliary_row = row - 1536
+                auxiliary_row = row - query_rank
                 raw = (
-                    1536 * 4096
-                    + ((auxiliary_row // 16 * 256 + k // 16) * 16 + k % 16) * 16
+                    query_rank * hidden
+                    + ((auxiliary_row // 16 * (hidden // 16) + k // 16) * 16 + k % 16)
+                    * 16
                     + auxiliary_row % 16
                 )
-            carrier_row = raw // 16 % 4096
-            carrier_column = raw // 65536 * 16 + raw % 16
+            carrier_row = raw // 16 % hidden
+            carrier_column = raw // (hidden * 16) * 16 + raw % 16
             assert packed_bits[carrier_row, carrier_column] == original_bits[row, k]
 
 
-def test_score_pack_preserves_fp32_coefficient_bits():
-    bits = torch.arange(64 * 4096, dtype=torch.int32) + 0x3F000000
-    weights = bits.view(torch.float32).reshape(64, 4096)
+@pytest.mark.parametrize("heads,hidden", [(16, 2048), (32, 4096), (64, 4096)])
+def test_score_pack_preserves_fp32_coefficient_bits(heads, hidden):
+    bits = torch.arange(heads * hidden, dtype=torch.int32) + 0x3F000000
+    weights = bits.view(torch.float32).reshape(heads, hidden)
     packed = pack_score_fp32(weights)
     assert packed.dtype == torch.float32
     actual = packed.view(torch.int32).flatten()
-    for head in (0, 7, 8, 31, 63):
-        for channel in (0, 15, 16, 511, 512, 4095):
+    for head in (0, 7, 8, heads - 1):
+        for channel in (0, 15, 16, 511, 512, hidden - 1):
             # Native NZ_KN: head blocks of 8, channel blocks of 16,
             # with the head lane contiguous inside each channel lane.
-            offset = ((head // 8 * 256 + channel // 16) * 16 + channel % 16) * 8
+            offset = (
+                (head // 8 * (hidden // 16) + channel // 16) * 16 + channel % 16
+            ) * 8
             offset += head % 8
-            assert actual[offset] == bits[head * 4096 + channel]
+            assert actual[offset] == bits[head * hidden + channel]
 
 
 def test_indexer_keeps_fp32_score_weights():
@@ -113,3 +139,36 @@ def test_indexer_keeps_fp32_score_weights():
     )
     assert indexer.weights_proj.weight.dtype == torch.float32
     assert not indexer.use_rotary
+
+
+@pytest.mark.parametrize("heads", [32, 64])
+def test_indexer_qb_padding_preserves_real_heads_and_zeros_unused_lanes(heads):
+    mla = torch.arange(64 * 192 * 1536, dtype=torch.int32).reshape(64, 192, 1536)
+    index = (
+        torch.arange(heads * 128 * 1536, dtype=torch.int32).reshape(heads, 128, 1536)
+        + 1
+    )
+    packed = pack_dsa_qb(mla, index)
+    # Independently invert carrier NZ and NK panels back to semantic heads.
+    # The carrier's logical first axis is the NZ N0 axis.
+    stream = packed.reshape(16, -1, 16).permute(1, 0, 2).contiguous().reshape(-1)
+    unpacked = stream.reshape(160, 3, 32, 8, 16, 16).permute(0, 3, 4, 1, 2, 5)
+    unpacked = unpacked.reshape(64, 320, 1536)
+    assert torch.equal(unpacked[:, :192], mla)
+    assert torch.equal(unpacked[:heads, 192:], index)
+    assert torch.count_nonzero(unpacked[heads:, 192:]) == 0
+
+
+def test_small_geometry_qb_preserves_all_attention_and_indexer_channels():
+    mla = torch.arange(32 * 192 * 768, dtype=torch.int32).reshape(32, 192, 768)
+    index = torch.arange(16 * 128 * 768, dtype=torch.int32).reshape(16, 128, 768) + 1
+    packed = pack_dsa_qb(mla, index)
+    stream = packed.reshape(16, -1, 16).permute(1, 0, 2).contiguous().reshape(-1)
+    unpacked = (
+        stream.reshape(64, 3, 16, 8, 16, 16)
+        .permute(0, 3, 4, 1, 2, 5)
+        .reshape(32, 256, 768)
+    )
+    assert torch.equal(unpacked[:, :192], mla)
+    assert torch.equal(unpacked[:, 192:].reshape(16, 128, 768), index)
+    assert unpacked.numel() == mla.numel() + index.numel()
