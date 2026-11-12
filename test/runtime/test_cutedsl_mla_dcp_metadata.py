@@ -372,9 +372,11 @@ def test_split_counts_use_local_lengths_and_gathered_heads(
     def check(local_lengths):
         local = torch.tensor(local_lengths, dtype=torch.int32, device="cuda")
         expected = torch.empty_like(local)
+        expected_offsets = torch.empty(3, dtype=torch.int32, device="cuda")
         tokenspeed_mla_decode_split_kvs(
             local,
             expected,
+            expected_offsets,
             num_heads=64,
             q_len=1 if mode == "chain" else 4,
             max_seq_len=16384,
@@ -382,6 +384,9 @@ def test_split_counts_use_local_lengths_and_gathered_heads(
             dtype=dtype,
         )
         torch.testing.assert_close(counts, expected, atol=0, rtol=0)
+        torch.testing.assert_close(
+            leaf._decode_split_offsets_buf[:3], expected_offsets, atol=0, rtol=0
+        )
 
     advance()
     check({0: [512, 8192], 1: [3584, 0], 3: [0, 0]}[rank])

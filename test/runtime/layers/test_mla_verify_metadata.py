@@ -345,6 +345,11 @@ def _run_cutedsl_decode(
     backend.tree_verify = None
     backend.tree_draft = None
     backend._decode_split_kvs_buf = split_kvs
+    backend._decode_split_offsets_buf = (
+        torch.cat((torch.zeros(1, dtype=torch.int32), split_kvs.cumsum(0).int()))
+        if split_kvs is not None
+        else None
+    )
 
     layer = SimpleNamespace(
         tp_q_head_num=1,

@@ -64,6 +64,8 @@ try:
         create_mla_static_tile_scheduler_params,
         get_mla_decode_arch,
         get_mla_decode_fold_sq_factor,
+        make_compact_split_workspace,
+        offset_split_workspace,
     )
 except ImportError:
     from mla_helpers import (
@@ -77,6 +79,8 @@ except ImportError:
         create_mla_static_tile_scheduler_params,
         get_mla_decode_arch,
         get_mla_decode_fold_sq_factor,
+        make_compact_split_workspace,
+        offset_split_workspace,
     )
 
 # Please refer to https://github.com/NVIDIA/cutlass/blob/main/include/cute/arch/mma_sm100_desc.hpp#L412
@@ -467,6 +471,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         stream: cuda.CUstream,
         use_pdl: cutlass.Constexpr = True,
         local_visible_lens: Optional[cute.Tensor] = None,
+        block_split_offsets: Optional[cute.Tensor] = None,
     ):
         """Execute the Multi-Head Latent Attention operation on the provided tensors.
 
@@ -676,6 +681,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             split_kv,
             self.acc_dtype,
             workspace,
+            block_split_offsets is not None,
         )
 
         c_latent_tranpose_layout = cute.select(c_latent.layout, mode=[1, 0, 2])
@@ -1058,6 +1064,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             causal_seqs,
             local_visible_lens,
             block_split_kvs,
+            block_split_offsets,
             softmax_scale_log2,
             output_scale,
             q_latent_smem_layout_staged,
@@ -1090,6 +1097,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 split_kv,
                 cache_seqs,
                 block_split_kvs,
+                block_split_offsets,
                 local_visible_lens is not None,
                 output_scale,
             ).launch(
@@ -1176,6 +1184,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         causal_seqs: cute.Tensor,  # per-request global causal bound (DCP)
         local_visible_lens: Optional[cute.Tensor],
         block_split_kvs: cute.Tensor,
+        block_split_offsets: Optional[cute.Tensor],
         softmax_scale_log2: cutlass.Float32,
         output_scale: cutlass.Float32,
         q_latent_smem_layout_staged: cute.ComposedLayout,
@@ -1674,7 +1683,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         split_kv=split_kv,
                         local_split_kv=local_split_kv,
                         smem_exchange=softmax_smem_exchange,
-                        mAccO=mAccO,
+                        mAccO=offset_split_workspace(
+                            mAccO, block_split_offsets, blk_coord[2]
+                        ),
                         mO=mO,
                         K=cache_seqs[blk_coord[2]],
                         K_causal=causal_seqs[blk_coord[2]],
@@ -1744,7 +1755,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         split_kv=split_kv,
                         local_split_kv=local_split_kv,
                         smem_exchange=epilogue_smem_exchange,
-                        mAccO=mAccO,
+                        mAccO=offset_split_workspace(
+                            mAccO, block_split_offsets, blk_coord[2]
+                        ),
                         mO=mO,
                         K=cache_seqs[blk_coord[2]],
                         K_causal=causal_seqs[blk_coord[2]],
@@ -1769,7 +1782,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     compute_epilogue_params = SimpleNamespace(
                         output_scale=output_scale,
                         softmax_scale_log2=softmax_scale_log2,
-                        mAccLSE=mAccLSE,
+                        mAccLSE=offset_split_workspace(
+                            mAccLSE, block_split_offsets, blk_coord[2]
+                        ),
                         mLSE=mLSE,
                     )
                     p_cor_consumer_state, mma_o_consumer_state = self.correction(
@@ -1821,6 +1836,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         split_kv: cutlass.Int32,
         cache_seqs: cute.Tensor,
         block_split_kvs: cute.Tensor,
+        block_split_offsets: Optional[cute.Tensor],
         has_local_visible_lens: cutlass.Constexpr,
         output_scale: cutlass.Float32,
     ):
@@ -1859,6 +1875,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         local_split_kv = (
             block_split_kvs[blk_coord[2]] if self.is_var_split_kv else split_kv
         )
+        mAccO = offset_split_workspace(mAccO, block_split_offsets, blk_coord[2])
+        mAccLSE = offset_split_workspace(mAccLSE, block_split_offsets, blk_coord[2])
         k_tile_total = cute.ceil_div(cache_seqs[blk_coord[2]], self.mma_qk_tiler[1])
         # Mirror get_k_tile_count's window-aware split, or this reduction reads
         # partials from CTAs that were given no tiles to write them.
@@ -4659,6 +4677,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         split_kv: cutlass.Int32,
         acc_dtype: Type[cutlass.Numeric],
         workspace: cute.Tensor,
+        compact_splits: cutlass.Constexpr,
     ) -> tuple[cute.Tensor, cute.Tensor]:
         """Initialize the workspace for the MLA kernel. Construct the intermediate tensors
         acc_o and acc_lse.
@@ -4683,6 +4702,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         """
         acc_o, acc_lse = None, None
         if cutlass.const_expr(workspace is not None):
+            if cutlass.const_expr(compact_splits):
+                return make_compact_split_workspace(
+                    H, D, S, B, workspace, self.partial_dtype, acc_dtype
+                )
             align = 256 // self.q_dtype.width
             acc_o_layout = cute.make_layout(
                 (H, split_kv, D, S, B),

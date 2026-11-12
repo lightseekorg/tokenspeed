@@ -36,10 +36,10 @@ from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel.ops.attention.mla.tokenspeed_mla import (
-    PER_REQUEST_SPLIT_KV_CAPACITY,
     get_num_sm,
     tokenspeed_mla_decode,
     tokenspeed_mla_decode_split_kvs,
+    tokenspeed_mla_decode_workspace_size,
     tokenspeed_mla_prefill,
     warmup_compile_prefill,
 )
@@ -88,11 +88,6 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
 
 logger = logging.getLogger(__name__)
-
-# Fallback q_len capacity for warming the decode workspace when the backend
-# runs without speculative decoding (q_len is then 1, but keep the historical
-# floor so draft experiments do not immediately hit the frozen-pool error).
-_CUTEDSL_WARMUP_Q_LEN_FLOOR = 8
 
 
 @dataclass
@@ -247,10 +242,8 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         if not 1 <= self.min_kv_split <= 256:
             raise ValueError("min_kv_split must be in [1, 256]")
         self._decode_row_capacity = config.max_bs * self.block_decode_expansion
-        self._decode_split_capacity = max(
-            PER_REQUEST_SPLIT_KV_CAPACITY, self.min_kv_split
-        )
         self._decode_split_kvs_buf: torch.Tensor | None = None
+        self._decode_split_offsets_buf: torch.Tensor | None = None
 
         # Layers reuse the partial-accumulator workspace. Reserve its peak
         # capacity before capture freezes the pool.
@@ -258,9 +251,7 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         self.kvp_rank = config.kvp_rank
         self._num_heads_per_tp = spec.num_attention_heads // spec.attn_tp_size
         self._workspace_pool = workspace_pool(config.device)
-        self.cutedsl_workspace = self._cutedsl_workspace(
-            max(_CUTEDSL_WARMUP_Q_LEN_FLOOR, self.spec_num_tokens or 1)
-        )
+        self.cutedsl_workspace = self._cutedsl_workspace(self.spec_num_tokens or 1)
 
         # Pre-compile prefill kernel variants so JIT doesn't run during serving.
         # The backend may be constructed once per attention layer (60x for
@@ -295,6 +286,7 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         self._block_page_table_buf = None
         self._block_seq_lens_buf = None
         self._decode_split_kvs_buf = None
+        self._decode_split_offsets_buf = None
         self._dcp = None
 
     def configure_runtime(
@@ -331,17 +323,23 @@ class CuteDSLMLABackend(PagedAttentionBackend):
             * (self.kv_lora_rank + 1)
             * 4
         )
-        if self._decode_split_capacity > 1:
+        required = max(
+            required,
+            tokenspeed_mla_decode_workspace_size(
+                self._decode_row_capacity // self.block_decode_expansion,
+                self._num_heads_per_tp * len(self.kvp_group),
+                q_len_capacity,
+                self.kv_lora_rank,
+                self.min_kv_split,
+                get_num_sm(self.device),
+            ),
+        )
+        if self.min_kv_split > 1:
             head_rows = self._num_heads_per_tp * len(self.kvp_group) * q_len_capacity
             # Packed queries pad the combined query/head axis to 128 rows.
             head_rows = ((head_rows + 127) // 128) * 128
             required = max(
                 required,
-                (self._decode_row_capacity // self.block_decode_expansion)
-                * head_rows
-                * self._decode_split_capacity
-                * (self.kv_lora_rank + 1)
-                * 4,
                 # The uniform fallback can flatten a block into separate rows.
                 self._decode_row_capacity
                 * head_rows
@@ -497,6 +495,9 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         self._decode_split_kvs_buf = torch.ones(
             max_bs, dtype=torch.int32, device=self.device
         )
+        self._decode_split_offsets_buf = torch.arange(
+            max_bs + 1, dtype=torch.int32, device=self.device
+        )
         if self._dcp is None:
             return
         if self.block_decode_active:
@@ -580,6 +581,7 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         tokenspeed_mla_decode_split_kvs(
             seq_lens,
             self._decode_split_kvs_buf[: seq_lens.shape[0]],
+            self._decode_split_offsets_buf[: seq_lens.shape[0] + 1],
             num_heads=self._num_heads_per_tp * len(self.kvp_group),
             q_len=q_len,
             max_seq_len=self.max_context_len,
@@ -829,6 +831,11 @@ class CuteDSLMLABackend(PagedAttentionBackend):
             return_lse=metadata.dcp is not None,
             min_split_kv=self.min_kv_split,
             block_split_kvs=block_split_kvs,
+            block_split_offsets=(
+                self._decode_split_offsets_buf[request_start : request_start + bs + 1]
+                if block_split_kvs is not None
+                else None
+            ),
         )
         if metadata.dcp is not None:
             partial, lse_log2 = raw_out
