@@ -1072,8 +1072,9 @@ still drains the forward thread and closes the data plane.
 
 Concurrent reporters wait only for the native signal attempt, never for
 another thread's log output. The data plane publishes its first failure
-and wakes waiters before logging; later distinct failures and cleanup
-errors remain visible without replacing the original serving error.
+and wakes waiters before logging either the rank failure or a failed signal.
+Later distinct failures and cleanup errors remain visible without replacing
+the original serving error.
 Failures outside generation serving use the same native notifier when
 they reach the host's final error handler; their cleanup timing is unchanged.
 

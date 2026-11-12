@@ -142,7 +142,7 @@ struct Args {
 static LAUNCHER_FAILURE: OnceLock<LauncherFailure> = OnceLock::new();
 
 struct LauncherFailure {
-    notification: OnceLock<Option<std::io::Error>>,
+    notification: OnceLock<()>,
     logged: Mutex<HashSet<String>>,
     parent: Option<libc::pid_t>,
 }
@@ -159,33 +159,37 @@ impl LauncherFailure {
         }
     }
 
-    /// Finish the signal attempt before any caller logs; return true once.
+    /// Wait for the first signal attempt. Only its caller receives the error,
+    /// so it can report it after publishing any failure state.
     #[allow(unsafe_code)]
-    fn notify(&self) -> bool {
-        let mut first = false;
-        let signal_error = self.notification.get_or_init(|| {
-            first = true;
+    fn notify(&self) -> std::io::Result<bool> {
+        let mut result = Ok(false);
+        self.notification.get_or_init(|| {
             // Keep logging and Python outside this initialization: concurrent
             // reporters wait here until the signal attempt has completed.
-            self.parent.and_then(|parent| {
+            let failed = self.parent.is_some_and(|parent| {
                 // SAFETY: parent is positive. A parent in an outer PID
                 // namespace is 0 and must not become a process-group signal.
                 // Only notify the launcher that originally owned this rank.
-                let failed =
-                    unsafe { libc::getppid() == parent && libc::kill(parent, libc::SIGUSR1) != 0 };
-                failed.then(std::io::Error::last_os_error)
-            })
+                unsafe { libc::getppid() == parent && libc::kill(parent, libc::SIGUSR1) != 0 }
+            });
+            result = if failed {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(true)
+            };
         });
-        if first {
-            if let Some(error) = signal_error {
-                tracing::error!(%error, "could not notify the launcher");
-            }
-        }
-        first
+        result
+    }
+
+    fn log_signal_error(error: std::io::Error) {
+        tracing::error!(%error, "could not notify the launcher");
     }
 
     fn report(&self, error: impl std::fmt::Display) {
-        self.notify();
+        if let Err(error) = self.notify() {
+            Self::log_signal_error(error);
+        }
         let error = error.to_string();
         let distinct = self
             .logged

@@ -188,9 +188,7 @@ impl Shared {
     fn fail(&self, failure: String) {
         // The control thread can still be waiting on a collective.
         let launcher = LAUNCHER_FAILURE.get();
-        if let Some(launcher) = launcher {
-            launcher.notify();
-        }
+        let signal_error = launcher.and_then(|launcher| launcher.notify().err());
         let distinct = {
             let mut state = self.state();
             match &state.failure {
@@ -202,6 +200,9 @@ impl Shared {
             }
         };
         self.changed.notify_all();
+        if let Some(error) = signal_error {
+            crate::LauncherFailure::log_signal_error(error);
+        }
         // Preserve the first failure for callers, but retain other diagnostics.
         // Log outside the state lock and only after notifying the launcher.
         if distinct {

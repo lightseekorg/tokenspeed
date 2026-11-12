@@ -280,7 +280,7 @@ fn notification_is_sent_once_across_concurrent_and_later_reports() {
                     let launcher = &launcher;
                     scope.spawn(move || {
                         ready.wait();
-                        launcher.notify()
+                        launcher.notify().unwrap()
                     })
                 })
                 .collect();
