@@ -28,6 +28,7 @@
 #include <cstring>
 #include <span>
 #include <string_view>
+#include <vector>
 
 namespace tokenspeed {
 
@@ -138,6 +139,28 @@ inline bool ReadLowercaseHex(std::string_view text, std::span<std::uint8_t> out)
         std::copy_n(bytes.begin(), out.size() - i, out.begin() + static_cast<std::ptrdiff_t>(i));
     }
     return invalid == 0;
+}
+
+// Decodes any text two characters per byte, the way a prefix-hash prior has
+// always been read: canonical lowercase text through ReadLowercaseHex, other
+// text (an opaque public key used as a prior) character by character with
+// uppercase digits accepted and other characters taken by their offset from
+// '0'. An odd last character is ignored. Chained hashes depend on these exact
+// bytes.
+inline std::vector<std::uint8_t> HexToBytes(std::string_view hex) {
+    std::vector<std::uint8_t> bytes(hex.size() / 2);
+    if (ReadLowercaseHex(hex.substr(0, 2 * bytes.size()), bytes)) {
+        return bytes;
+    }
+    const auto nibble = [](char c) {
+        return (c >= 'a')   ? static_cast<std::uint8_t>(c - 'a' + 10)
+               : (c >= 'A') ? static_cast<std::uint8_t>(c - 'A' + 10)
+                            : static_cast<std::uint8_t>(c - '0');
+    };
+    for (std::size_t i = 0; i < bytes.size(); ++i) {
+        bytes[i] = static_cast<std::uint8_t>((nibble(hex[2 * i]) << 4) | nibble(hex[2 * i + 1]));
+    }
+    return bytes;
 }
 
 }  // namespace tokenspeed

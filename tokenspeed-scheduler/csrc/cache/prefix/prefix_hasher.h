@@ -74,27 +74,14 @@ inline void Sha256UpdateTokensExplicitLE(SHA256_CTX& ctx, std::span<const std::i
     }
 }
 
-// Encode a 32-byte SHA-256 digest as a 64-char lowercase hex string.
-inline std::string DigestToHex(const unsigned char* digest) {
-    std::string out(SHA256_DIGEST_LENGTH * 2, '0');
-    WriteLowercaseHex({digest, SHA256_DIGEST_LENGTH}, out.data());
-    return out;
-}
+static_assert(std::tuple_size_v<ContentHash::Digest> == SHA256_DIGEST_LENGTH,
+              "a prefix page's identity is its SHA-256 digest");
 
-// Decode a hex string back into its raw bytes (inverse of DigestToHex).
-inline std::vector<uint8_t> HexToBytes(const std::string& hex) {
-    std::vector<uint8_t> bytes;
-    bytes.reserve(hex.size() / 2);
-    for (std::size_t i = 0; i + 1 < hex.size(); i += 2) {
-        uint8_t hi = (hex[i] >= 'a')   ? static_cast<uint8_t>(hex[i] - 'a' + 10)
-                     : (hex[i] >= 'A') ? static_cast<uint8_t>(hex[i] - 'A' + 10)
-                                       : static_cast<uint8_t>(hex[i] - '0');
-        uint8_t lo = (hex[i + 1] >= 'a')   ? static_cast<uint8_t>(hex[i + 1] - 'a' + 10)
-                     : (hex[i + 1] >= 'A') ? static_cast<uint8_t>(hex[i + 1] - 'A' + 10)
-                                           : static_cast<uint8_t>(hex[i + 1] - '0');
-        bytes.push_back(static_cast<uint8_t>((hi << 4) | lo));
-    }
-    return bytes;
+// Encode a SHA-256 digest as a 64-char lowercase hex string.
+inline std::string DigestToHex(const ContentHash::Digest& digest) {
+    std::string out(2 * digest.size(), '0');
+    WriteLowercaseHex(digest, out.data());
+    return out;
 }
 
 // extra_keys: per-page list of distinguishing keys (e.g. LoRA name, cache salt);
@@ -109,10 +96,9 @@ inline std::vector<uint8_t> HexToBytes(const std::string& hex) {
 // little-endian 32-bit bytes: a little-endian host submits a page's tokens in
 // one SHA update, any other host encodes them in bounded chunks, and both
 // produce the same stream.
-using PrefixDigest = std::array<unsigned char, SHA256_DIGEST_LENGTH>;
-
-inline PrefixDigest HashPrefixPageDigest(std::span<const std::int32_t> tokens, std::span<const uint8_t> prior_bytes,
-                                         std::span<const std::string> extra_keys) {
+inline ContentHash::Digest HashPrefixPageDigest(std::span<const std::int32_t> tokens,
+                                                std::span<const uint8_t> prior_bytes,
+                                                std::span<const std::string> extra_keys) {
     SHA256_CTX ctx;
     SHA256_Init(&ctx);
 
@@ -140,7 +126,7 @@ inline PrefixDigest HashPrefixPageDigest(std::span<const std::int32_t> tokens, s
         }
     }
 
-    PrefixDigest digest;
+    ContentHash::Digest digest;
     SHA256_Final(digest.data(), &ctx);
     return digest;
 }
@@ -148,7 +134,7 @@ inline PrefixDigest HashPrefixPageDigest(std::span<const std::int32_t> tokens, s
 inline std::string HashPrefixPage(std::span<const std::int32_t> tokens, const std::string& prior_hash,
                                   std::span<const std::string> extra_keys = {}) {
     const auto prior_bytes = HexToBytes(prior_hash);
-    return DigestToHex(HashPrefixPageDigest(tokens, prior_bytes, extra_keys).data());
+    return DigestToHex(HashPrefixPageDigest(tokens, prior_bytes, extra_keys));
 }
 
 // The same page hash under a prior held as an identity, returned as one: it
@@ -173,12 +159,12 @@ inline void AppendPrefixHashChain(std::vector<std::string>& hashes,
     const std::size_t size = hashes.size() + prefix_pages.size();
     if (size > hashes.capacity()) hashes.reserve(std::max(size, 2 * hashes.size()));
     std::span<const uint8_t> current_prior = seed;
-    PrefixDigest digest;
+    ContentHash::Digest digest;
     for (std::size_t i = 0; i < prefix_pages.size(); ++i) {
         std::span<const std::string> extra =
             (i < extra_keys_per_page.size()) ? extra_keys_per_page[i] : std::span<const std::string>{};
         digest = HashPrefixPageDigest(prefix_pages[i], current_prior, extra);
-        hashes.push_back(DigestToHex(digest.data()));
+        hashes.push_back(DigestToHex(digest));
         current_prior = digest;
     }
 }

@@ -157,6 +157,40 @@ TEST(PageHasherHexTest, HexToBytesAcceptsUppercase) {
     EXPECT_EQ(HexToBytes("ABCDEF"), HexToBytes("abcdef"));
 }
 
+// The per-character reading HexToBytes has always given every text; chained
+// hashes under an opaque prior depend on it.
+std::vector<std::uint8_t> ReferenceHexToBytes(const std::string& hex) {
+    const auto nibble = [](char c) {
+        return (c >= 'a')   ? static_cast<std::uint8_t>(c - 'a' + 10)
+               : (c >= 'A') ? static_cast<std::uint8_t>(c - 'A' + 10)
+                            : static_cast<std::uint8_t>(c - '0');
+    };
+    std::vector<std::uint8_t> bytes;
+    for (std::size_t i = 0; i + 1 < hex.size(); i += 2) {
+        bytes.push_back(static_cast<std::uint8_t>((nibble(hex[i]) << 4) | nibble(hex[i + 1])));
+    }
+    return bytes;
+}
+
+TEST(PageHasherHexTest, HexToBytesReadsCanonicalAndOpaqueTextLikeTheReference) {
+    // Every character pair, alone and inside canonical text of each word
+    // position, with and without an odd last character.
+    const std::string canonical = "0123456789abcdef0123456789abcdef";
+    for (unsigned high = 0; high < 256; ++high) {
+        for (unsigned low = 0; low < 256; ++low) {
+            const std::string pair{static_cast<char>(high), static_cast<char>(low)};
+            ASSERT_EQ(HexToBytes(pair), ReferenceHexToBytes(pair)) << high << " " << low;
+            std::string text = canonical;
+            text.replace(2 * ((high ^ low) % 16), 2, pair);
+            ASSERT_EQ(HexToBytes(text), ReferenceHexToBytes(text)) << high << " " << low;
+            ASSERT_EQ(HexToBytes(text + "g"), ReferenceHexToBytes(text + "g")) << high << " " << low;
+        }
+    }
+    for (std::size_t length = 0; length <= 9; ++length) {
+        EXPECT_EQ(HexToBytes(canonical.substr(0, length)), ReferenceHexToBytes(canonical.substr(0, length)));
+    }
+}
+
 // Per-character spelling the word-at-a-time codec must reproduce.
 std::string ReferenceLowercaseHex(std::span<const std::uint8_t> bytes) {
     std::string text;
@@ -216,11 +250,11 @@ TEST(PageHasherHexTest, DecodingAcceptsExactlyLowercaseDigitsOfTheExpectedLength
 TEST(PageHasherHexTest, DigestTextRoundTripsThroughBothDirections) {
     std::mt19937 random(5);
     for (int trial = 0; trial < 64; ++trial) {
-        PrefixDigest digest;
-        for (auto& byte : digest) byte = static_cast<unsigned char>(random());
-        const std::string text = DigestToHex(digest.data());
+        ContentHash::Digest digest;
+        for (auto& byte : digest) byte = static_cast<std::uint8_t>(random());
+        const std::string text = DigestToHex(digest);
         EXPECT_EQ(text, ReferenceLowercaseHex(digest));
-        PrefixDigest decoded;
+        ContentHash::Digest decoded;
         ASSERT_TRUE(ReadLowercaseHex(text, decoded));
         EXPECT_EQ(decoded, digest);
         EXPECT_EQ(HexToBytes(text), std::vector<std::uint8_t>(digest.begin(), digest.end()));
@@ -402,8 +436,8 @@ TEST(HashPrefixPageTest, PreservesFramedBytesAndChainingAcrossTokenBatchBoundari
                     bytes.insert(bytes.end(), key.begin(), key.end());
                 }
             }
-            unsigned char digest[SHA256_DIGEST_LENGTH];
-            SHA256(bytes.data(), bytes.size(), digest);
+            ContentHash::Digest digest;
+            SHA256(bytes.data(), bytes.size(), digest.data());
             const auto expected = DigestToHex(digest);
             EXPECT_EQ(HashPrefixPage(tokens, prior, keys), expected) << "token count " << length;
             SHA256_CTX explicit_ctx;
@@ -411,7 +445,7 @@ TEST(HashPrefixPageTest, PreservesFramedBytesAndChainingAcrossTokenBatchBoundari
             SHA256_Update(&explicit_ctx, bytes.data(), token_begin);
             Sha256UpdateTokensExplicitLE(explicit_ctx, tokens);
             SHA256_Update(&explicit_ctx, bytes.data() + token_end, bytes.size() - token_end);
-            SHA256_Final(digest, &explicit_ctx);
+            SHA256_Final(digest.data(), &explicit_ctx);
             EXPECT_EQ(DigestToHex(digest), expected) << "explicit encoding, token count " << length;
             prior = expected;
         }
