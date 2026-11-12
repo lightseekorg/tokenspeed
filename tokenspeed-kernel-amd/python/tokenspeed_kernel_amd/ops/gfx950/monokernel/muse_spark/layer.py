@@ -149,8 +149,9 @@ NEXT_BASES = {**CHAINED_BASES, "qnext": 192, "out": 96, "exr": 128}
 # a row), and the router's 128 tasks from CTA 160 would wait behind tail
 # tasks there or wrap to CTAs behind oproj. The router and topk
 # take CTAs 192 .. 255 and 0 .. 63, whose last earlier task is oproj or an
-# attention task.
-WIDE = {"router": 192, "topk": 192}
+# attention task. The pool's two row groups (64 tasks) take CTAs 192 .. 255,
+# after their router task.
+WIDE = {"router": 192, "topk": 192, "pool": 192}
 # exr's base and parts in a launch of more than 8 rows that ends with qnext:
 # spread over every CTA. From CTA 128 in 2 parts (the 8-row qnext placement),
 # exr would share CTAs 128 .. 255 with ex2's lanes 4 .. 7, whose ex2 then
@@ -294,7 +295,7 @@ def layer_plan(
         )
         + attn_tail.stages(_bases(rows, nq, "oproj", "tail"), rows)
         + moe_route.stages(_bases(rows, nq, "router", "topk"), rows)
-        + moe_pool.stages(_bases(rows, nq, "pool"))
+        + moe_pool.stages(_bases(rows, nq, "pool"), rows)
         + moe_experts.stages(
             _bases(rows, nq, "slt", "xq", "ex1", "exr", "ex2"),
             rows,
