@@ -331,6 +331,12 @@ class BaseCausalLM(nn.Module):
                 "EAGLE3 and DFLASH drafts cannot attach to it"
             )
 
+    def stores_capture_taps(self, ctx: ForwardContext) -> bool:
+        """Whether this forward stores the draft's taps itself (for example in
+        its decode monokernels), so that a draft's capture sink must not read
+        them as the forward produces them."""
+        return False
+
     def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None) -> None:
 
         self.require_aux_capture()
