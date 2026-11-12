@@ -39,6 +39,7 @@ sys.path.insert(0, os.path.dirname(_TEST_DIR))
 from test.runtime.conftest import kimi_layout, kimi_recipe, kimi_tp8_layout
 
 from ci_system.ci_register import register_cuda_ci
+from tokenspeed_kernel.platform import current_platform
 
 register_cuda_ci(est_time=60, suite="runtime-1gpu")
 
@@ -2079,6 +2080,7 @@ def _k31_attention_stack(
     full_blocks: int = 0,
     context_len: int = 4096,
     q_lora_rank: int = 128,
+    alt_stream: torch.cuda.Stream | None = None,
 ):
     """A real K3.1 sparse MLA layer (id 3) over the K3.1 pool and the DSA
     router, at TP8's 12 local heads and K3's latent geometry (a narrow q
@@ -2181,7 +2183,7 @@ def _k31_attention_stack(
                 layer_id=3,
                 prefix="model.layers.3.self_attn",
                 reduce_attn_results=False,
-                alt_stream=None,
+                alt_stream=alt_stream,
                 qkv_parallel=None,
                 output_parallel=None,
             )
@@ -2974,6 +2976,32 @@ def test_a_decode_chain_round_runs_the_fused_front(
 
 
 @requires_gpu
+@pytest.mark.parametrize("nvidia", [True, False], ids=["nvidia", "other"])
+def test_decode_rounds_fork_the_top_k_only_on_nvidia(monkeypatch, nvidia) -> None:
+    """Only NVIDIA decode rounds take the alternate stream for the top-k."""
+    from tokenspeed.runtime.models import kimi_k31
+
+    monkeypatch.setattr(
+        kimi_k31, "current_platform", lambda: SimpleNamespace(is_nvidia=nvidia)
+    )
+    aux = torch.cuda.Stream()
+    attention, *_ = _k31_attention_stack(
+        kv_cache_dtype=torch.bfloat16,
+        spec_width=1,
+        heads=12,
+        index_topk=64,
+        kvp_size=1,
+        kvp_rank=0,
+        alt_stream=aux,
+    )
+    assert attention.decode_topk_fork.aux_stream is (aux if nvidia else None)
+
+
+@requires_gpu
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not current_platform().is_nvidia,
+    reason="only NVIDIA decode rounds fork the top-k",
+)
 @pytest.mark.parametrize("spec_width", [1, 8])
 def test_a_decode_round_selects_top_k_beside_the_query_absorption(
     monkeypatch, spec_width

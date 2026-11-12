@@ -52,6 +52,7 @@ from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
 from tokenspeed_kernel.ops.attention.dsa import cute_dsl as dsa_cute_dsl
 from tokenspeed_kernel.ops.attention.mla import mla_project_value
 from tokenspeed_kernel.ops.gemm import kimi3_mla_gate_projection, mm
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 from torch import nn
@@ -434,8 +435,10 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
         self._decode_topk_indices_buffer: torch.Tensor | None = None
         self._decode_topk_lens_buffer: torch.Tensor | None = None
         self._retired_decode_workspaces: list[torch.Tensor] = []
-        # Decode rounds select top-k on the alternate stream while the query absorbs.
-        self.decode_topk_fork = StreamFork(alt_stream)
+        # NVIDIA decode rounds select top-k on the alternate stream beside the absorb.
+        self.decode_topk_fork = StreamFork(
+            alt_stream if current_platform().is_nvidia else None
+        )
         # The attention group's K3 Iris state, once communication is prepared.
         self.topk_iris_state: K3IrisState | None = None
         # [q_b_proj; indexer wq_b] stacked after load: one GEMM over q_norm.
