@@ -195,6 +195,36 @@ pub(super) fn assert_launcher_notified_before_blocking(test: &str, child: impl F
     );
 }
 
+pub(super) fn assert_no_launcher_notification(test: &str, child: impl FnOnce()) {
+    if std::env::var(CHILD).as_deref() == Ok(test) {
+        child();
+        return;
+    }
+
+    let _signal_test = SIGNAL_TEST
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut failure = {
+        let _entered = runtime.enter();
+        signal(SignalKind::user_defined1()).unwrap()
+    };
+    assert!(test_child(test).wait().success());
+    // Check the listener after the child exits so a notification sent during
+    // teardown is observed even if the child finishes before we poll it.
+    assert!(
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_millis(200), failure.recv())
+                .await
+                .is_err()
+        }),
+        "healthy lifecycle unexpectedly notified its launcher"
+    );
+}
+
 #[test]
 fn cleanup_failure_is_logged_without_replacing_the_serving_error() {
     // No owning launcher in this in-process diagnostic test.

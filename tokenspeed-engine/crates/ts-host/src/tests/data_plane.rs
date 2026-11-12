@@ -270,6 +270,52 @@ fn the_forward_thread_runs_the_queue_and_the_control_thread_its_queries() {
 }
 
 #[test]
+fn a_healthy_lifecycle_exits_without_notifying_the_launcher() {
+    crate::tests::assert_no_launcher_notification(
+        "data_plane::tests::a_healthy_lifecycle_exits_without_notifying_the_launcher",
+        || {
+            let launcher = LAUNCHER_FAILURE.get_or_init(crate::LauncherFailure::for_parent);
+            let (plane, mut scheduler) = plane();
+            let mut data_plane = start(&plane);
+            let batch = batch();
+            let dispatch = Dispatch {
+                forward: Some(&batch),
+                ..Dispatch::default()
+            };
+            let forward = data_plane
+                .execute(scheduler.next_execution_plan(true, false), &dispatch)
+                .unwrap()
+                .unwrap();
+            assert_eq!(data_plane.complete(forward).unwrap().output_tokens, [100]);
+            data_plane.ask(|reply| Op::Barrier { reply }).unwrap();
+            let mut closed = 0;
+            let result = crate::finish_serving(Ok(()), launcher, || {
+                drop(data_plane);
+                let recorded = calls(&plane);
+                assert_eq!(
+                    recorded
+                        .iter()
+                        .filter(|(name, _)| name == "exit_forward_thread")
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    recorded
+                        .iter()
+                        .filter(|(name, _)| name == "guard exit")
+                        .count(),
+                    1
+                );
+                closed += 1;
+                Ok(())
+            });
+            assert!(result.is_ok());
+            assert_eq!(closed, 1);
+        },
+    );
+}
+
+#[test]
 fn a_commit_does_not_wait_behind_a_later_launch() {
     let (plane, mut scheduler) = plane();
     let batch = batch();
