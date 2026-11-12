@@ -31,12 +31,19 @@ def make_compact_split_workspace(H, D, S, B, workspace, partial_dtype, acc_dtype
         cute.recast_ptr(workspace.iterator, dtype=partial_dtype),
         cute.make_layout(
             (H, slots, D, S, B),
-            stride=(slots * D, D, 1, slots * H * D, 0),
+            stride=(
+                cute.assume(slots * D, 32),
+                D,
+                1,
+                cute.assume(slots * H * D, 32),
+                0,
+            ),
         ),
     )
     lse = cute.make_tensor(
         cute.recast_ptr(
-            workspace.iterator + slots * H * S * D * (partial_dtype.width // 8),
+            workspace.iterator
+            + cute.assume(slots * H * S * D * (partial_dtype.width // 8), 32),
             dtype=acc_dtype,
         ),
         cute.make_layout((H, slots, S, B), stride=(slots, 1, slots * H, 0)),
@@ -49,9 +56,16 @@ def offset_split_workspace(tensor, offsets, request):
     if cutlass.const_expr(tensor is not None):
         # A sliced batch may begin after split zero in its original plan.
         offset = cutlass.Int64(offsets[request]) - cutlass.Int64(offsets[0])
-        tensor = cute.make_tensor(
-            tensor.iterator + offset * tensor.stride[1], tensor.layout
-        )
+        ptr = tensor.iterator + offset * tensor.stride[1]
+        if cutlass.const_expr(len(tensor.shape) == 5):
+            # Partials start on whole slots; without the base alignment the epilogue stores narrow vectors.
+            ptr = cute.make_ptr(
+                tensor.element_type,
+                ptr.toint(),
+                cute.AddressSpace.gmem,
+                assumed_align=32,
+            )
+        tensor = cute.make_tensor(ptr, tensor.layout)
     return tensor
 
 
