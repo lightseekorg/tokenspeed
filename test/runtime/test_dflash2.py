@@ -38,9 +38,22 @@ from tokenspeed.runtime.configs.model_config import _is_dflash2_mla
 from tokenspeed.runtime.execution.drafter import get_drafter_impl
 from tokenspeed.runtime.execution.drafter.dflash import DFlash
 from tokenspeed.runtime.execution.drafter.dflash2 import DFlash2
+from tokenspeed.runtime.execution.drafter.dspark import DSpark
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.forward_step import prepare_draft_extend_metadata
 
 # Imported for its register_backend() side effects on _BACKEND_REGISTRY.
 from tokenspeed.runtime.layers.attention import backends  # noqa: F401
+from tokenspeed.runtime.layers.attention.backends.paged.base import (
+    PagedAttentionBackend,
+)
+from tokenspeed.runtime.layers.attention.backends.paged.cache_group_geometry import (
+    CacheGroupGeometry,
+)
+from tokenspeed.runtime.layers.attention.backends.paged.router import CacheGroupRouter
+from tokenspeed.runtime.layers.attention.configs.base import (
+    resolve_speculative_num_tokens,
+)
 from tokenspeed.runtime.layers.attention.registry import _BACKEND_REGISTRY
 from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
@@ -743,10 +756,18 @@ def test_a_mixed_batch_derives_draft_lengths_without_reading_the_device() -> Non
         valid_cache_lengths=torch.tensor([100, 200, 300], dtype=torch.int32)
     )
     drafter.draft_seq_lens_buf = torch.zeros(3, dtype=torch.int32)
+    drafter.context_starts_buf = torch.zeros(3, dtype=torch.int64)
+    drafter.context_locs_buf = torch.zeros(12, dtype=torch.int32)
     written = []
     drafter._write_native_cache = lambda *args, **kwargs: written.append(
         (args[2].tolist(), kwargs)
     )
+
+    def resolve(out, starts, width):
+        # Pages offset by 1000: each slot names its position.
+        rows = 1000 + starts[:, None] + torch.arange(width)
+        out[: rows.numel()] = rows.reshape(-1)
+        return out
 
     ctx = SimpleNamespace(
         dspark_context_producer=None,
@@ -762,7 +783,7 @@ def test_a_mixed_batch_derives_draft_lengths_without_reading_the_device() -> Non
     drafter.attn_backend = SimpleNamespace(
         group_ids=("draft_swa",),
         extend_span_locations=lambda: torch.arange(105, 110, dtype=torch.int32),
-        decode_window_locations=lambda: torch.arange(210, 218, dtype=torch.int32),
+        draft_write_locations_uniform=resolve,
     )
     drafter._update_native_cache_from_target(
         ctx,
@@ -773,8 +794,177 @@ def test_a_mixed_batch_derives_draft_lengths_without_reading_the_device() -> Non
 
     assert drafter.draft_seq_lens_buf.tolist() == [15, 22, 300]
     assert written == [
-        (list(range(105, 110)) + list(range(210, 218)), {"decode_only": False})
+        (
+            list(range(105, 110)) + list(range(1020, 1024)) + list(range(1030, 1034)),
+            {"decode_only": False},
+        )
     ]
+
+
+class _DraftLeaf(PagedAttentionBackend):
+    """A paged leaf without kernels; the router resolves every slot."""
+
+    def __init__(self, query_width: int) -> None:
+        config = SimpleNamespace(
+            device="cpu",
+            dtype=torch.bfloat16,
+            is_draft=True,
+            speculative_num_draft_tokens=query_width,
+            context_len=64,
+        )
+        component = SimpleNamespace(
+            num_attention_heads=1, num_kv_heads=1, attn_tp_size=1, head_dim=8
+        )
+        super().__init__(config, component, kernel_page_size=4)
+
+    def init_forward_metadata(self, *args, **kwargs) -> None:
+        del args, kwargs
+
+    def refresh_decode_metadata(self, *args, **kwargs) -> None:
+        del args, kwargs
+
+    def forward_decode(self, *args, **kwargs):
+        raise AssertionError("a context write runs no attention")
+
+    def forward_extend(self, *args, **kwargs):
+        raise AssertionError("a context write runs no attention")
+
+
+# Raw blocks of 4 tokens per request, one kernel page each.
+_CONTEXT_TABLES = {
+    "full_attention": torch.tensor([[3, 5, 7], [9, 2, 6]], dtype=torch.int32)
+}
+
+
+def _dspark_context_drafter(
+    positions: torch.Tensor, input_lengths: list[int]
+) -> tuple[DSpark, list[list[int]]]:
+    """A DSpark drafter verifying 4 rows over the router a DSpark draft gets."""
+    server_args = SimpleNamespace(
+        speculative_num_draft_tokens=4, speculative_algorithm="DSPARK"
+    )
+    query_width = resolve_speculative_num_tokens(server_args, is_draft=True)
+    router = CacheGroupRouter(
+        None,
+        is_draft=True,
+        spec_num_tokens=query_width,
+        device="cpu",
+        consumed_group_ids=None,
+    )
+    router.bind(
+        CacheGroupGeometry(
+            granularities={"full_attention": 4},
+            attn_kinds={"full_attention": "full_history"},
+            full_history_group_id="full_attention",
+            row_geometry={"full_attention": (4, 1)},
+            windows={"full_attention": None},
+        ),
+        {"full_attention": _DraftLeaf(query_width)},
+    )
+    router.init_cuda_graph_state(2)
+
+    drafter = DSpark.__new__(DSpark)
+    drafter.spec_num_tokens = 4
+    drafter.attn_backend = router
+    drafter.input_buffers = SimpleNamespace(
+        positions_buf=positions,
+        input_lengths_buf=torch.tensor(input_lengths, dtype=torch.int32),
+        req_pool_indices_buf=torch.arange(2),
+    )
+    drafter.runtime_states = SimpleNamespace(
+        valid_cache_lengths=torch.zeros(2, dtype=torch.int32)
+    )
+    drafter.draft_seq_lens_buf = torch.zeros(2, dtype=torch.int32)
+    drafter.context_starts_buf = torch.zeros(2, dtype=torch.int64)
+    drafter.context_locs_buf = torch.zeros(8, dtype=torch.int32)
+    drafter._tap_rows = torch.empty(positions.numel(), 1)
+    written = []
+    drafter._write_native_cache = lambda hidden, rows, slots, **kwargs: written.append(
+        slots.tolist()
+    )
+    return drafter, written
+
+
+def test_dspark_context_writes_cover_every_target_verify_row() -> None:
+    """The target verifies one row more than a DSpark draft attends.
+
+    The draft router's decode window has the draft's query width, so a context
+    write naming its slots through that window would come one row short per
+    request and shifted by one position.
+    """
+    positions = torch.tensor([6, 7, 8, 9, 3, 4, 5, 6, 0, 0])
+    drafter, written = _dspark_context_drafter(positions, [1, 1])
+    # The runner's refresh of the draft router before the target forward.
+    drafter.attn_backend.refresh_decode_metadata(
+        2,
+        2,
+        torch.arange(2, dtype=torch.int32),
+        torch.tensor([10, 7], dtype=torch.int32),
+        forward_mode=ForwardMode.DECODE,
+        block_tables=_CONTEXT_TABLES,
+    )
+    ctx = SimpleNamespace(
+        dspark_context_producer=None,
+        target_capture_sink=None,
+        bs=2,
+        num_extends=0,
+        input_num_tokens=8,
+        forward_mode=ForwardMode.DECODE,
+    )
+    # Request 0 verifies positions 6..9, request 1 positions 3..6.
+    expected = [22, 23, 28, 29, 39, 8, 9, 10]
+
+    drafter.prepare_target_forward(ctx)
+    assert ctx.target_capture_sink is drafter
+    assert drafter._sink_cache_locs.tolist() == expected
+    assert drafter._sink_cache_locs.numel() == drafter._sink_positions.numel()
+
+    # A draft without the capture sink writes the same rows after verify.
+    drafter._update_native_cache_from_target(
+        ctx,
+        SimpleNamespace(hidden_states=torch.zeros(8, 1)),
+        accept_lengths=torch.tensor([2, 4], dtype=torch.int32),
+    )
+    assert written == [expected]
+
+
+def test_a_mixed_dspark_round_writes_the_extend_span_then_whole_verify_rows() -> None:
+    positions = torch.tensor([4, 5, 6, 3, 4, 5, 6, 0])
+    drafter, written = _dspark_context_drafter(positions, [3, 1])
+    extend, prefix = (torch.tensor([n], dtype=torch.int32) for n in (3, 4))
+    prepare_draft_extend_metadata(
+        drafter.attn_backend,
+        drafter,
+        padded_bs=2,
+        num_extends=1,
+        req_pool_indices=torch.arange(2, dtype=torch.int32),
+        seq_lens=torch.tensor([7, 7], dtype=torch.int32),
+        forward_mode=ForwardMode.MIXED,
+        block_tables=_CONTEXT_TABLES,
+        extend_seq_lens=extend,
+        extend_seq_lens_cpu=extend.clone(),
+        extend_prefix_lens=prefix,
+        extend_prefix_lens_cpu=prefix.clone(),
+        extend_replay_lens_cpu=torch.zeros_like(prefix),
+        extend_prompt_lens_cpu=prefix + extend,
+        extend_with_prefix=True,
+        block_tables_cpu={},
+    )
+    ctx = SimpleNamespace(
+        dspark_context_producer=None,
+        bs=2,
+        num_extends=1,
+        input_num_tokens=7,
+        forward_mode=ForwardMode.MIXED,
+    )
+
+    drafter._update_native_cache_from_target(
+        ctx,
+        SimpleNamespace(hidden_states=torch.zeros(7, 1)),
+        accept_lengths=torch.tensor([0, 2], dtype=torch.int32),
+    )
+    # Request 0 extends positions 4..6; request 1 verifies positions 3..6.
+    assert written == [[20, 21, 22, 39, 8, 9, 10]]
 
 
 def test_the_draft_residual_buffer_is_reused_and_recleared() -> None:

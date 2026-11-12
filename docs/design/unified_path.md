@@ -1674,9 +1674,13 @@ history destinations through `write_locations`.
   `extend_span_locations()` expose the writing router's history windows.
   DFLASH reads its own router before publishing a proposal window, so context
   KV follows the draft group's pages even when its retention differs from
-  the target's. The runner refreshes both routers before the target forward;
-  capture-tap writes and the fallback context write consume that same round's
-  draft locations.
+  the target's. Extend rows take the draft's extend span. Verify rows take
+  the target's verify width from each request's first verify position,
+  resolved through `draft_write_locations_uniform`: the draft's own decode
+  window has the draft's query width, which DSpark narrows by the anchor
+  row. The runner refreshes both routers before the target forward;
+  capture-tap writes and the fallback context write resolve over that same
+  round's draft table.
 * **Writes outside the backend** (the attention prologue) fetch their slots
   immediately before the write. An offloaded latent
   projection uses the compute slots returned by its sparse prepare. When a draft step-0

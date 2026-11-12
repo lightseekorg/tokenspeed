@@ -368,6 +368,13 @@ class DFlash(BaseDrafter):
         self.gather_indices_buf = torch.empty(
             (max_bs,), dtype=torch.int64, device=self.device
         )
+        # Context writes: per-request verify starts and the verify rows' slots.
+        self.context_starts_buf = torch.zeros(
+            (max_bs,), dtype=torch.int64, device=self.device
+        )
+        self.context_locs_buf = torch.zeros(
+            (max_bs * self.spec_num_tokens,), dtype=torch.int32, device=self.device
+        )
 
     def wire_target(self, target_model) -> None:
         """Bind execution resources without changing model capture configuration."""
@@ -777,27 +784,46 @@ class DFlash(BaseDrafter):
             return
 
         positions = self.input_buffers.positions_buf[: base_ctx.input_num_tokens]
-        # Context rows belong to the draft group's page-id space. This runs
-        # before the draft publishes its next proposal window.
-        backend = self.attn_backend
-        if base_ctx.num_extends == base_ctx.bs:
-            # A PD prefill worker may never publish a decode window.
-            cache_locs = backend.extend_span_locations()
-        elif base_ctx.num_extends == 0:
-            cache_locs = backend.decode_window_locations()
-        else:
-            cache_locs = torch.cat(
-                (
-                    backend.extend_span_locations(),
-                    backend.decode_window_locations(),
-                )
-            )
+        cache_locs = self._context_cache_locations(base_ctx)
         self._write_native_cache(
             hidden,
             positions,
             cache_locs[: base_ctx.input_num_tokens],
             decode_only=base_ctx.num_extends == 0,
         )
+
+    def _context_cache_locations(self, ctx: ForwardContext) -> torch.Tensor:
+        """Return the slots of the round's target rows in the draft's own pages.
+
+        Rows keep the target's packed order: extend rows, then verify rows.
+        Each decode request writes the target's verify width from its first
+        verify position. The draft's decode window has the draft's query
+        width instead, which DSpark narrows by the anchor row. This runs
+        before the draft publishes its next proposal window, over the table
+        the runner refreshed for this round.
+
+        Args:
+            ctx: The target forward's context.
+
+        Returns:
+            ``[ctx.input_num_tokens]`` int32 cache slots.
+        """
+        backend = self.attn_backend
+        if ctx.num_extends == ctx.bs:
+            # A PD prefill worker may never publish a decode window.
+            return backend.extend_span_locations()
+        width = self.spec_num_tokens
+        first = ctx.input_num_tokens - (ctx.bs - ctx.num_extends) * width
+        # Extend requests resolve stale non-negative starts; their slots are dropped.
+        starts = self.context_starts_buf[: ctx.bs]
+        starts[ctx.num_extends :].copy_(
+            self.input_buffers.positions_buf[first : ctx.input_num_tokens : width]
+        )
+        backend.draft_write_locations_uniform(self.context_locs_buf, starts, width)
+        verify = self.context_locs_buf[ctx.num_extends * width : ctx.bs * width]
+        if ctx.num_extends == 0:
+            return verify
+        return torch.cat((backend.extend_span_locations(), verify))
 
     def _update_draft_prefix_lengths(
         self, base_ctx: ForwardContext, accept_lengths: torch.Tensor
@@ -1223,7 +1249,7 @@ class DFlash(BaseDrafter):
         num_tokens = ctx.input_num_tokens
         self._sink_tokens = num_tokens
         self._sink_positions = self.input_buffers.positions_buf[:num_tokens]
-        self._sink_cache_locs = self.attn_backend.decode_window_locations()[:num_tokens]
+        self._sink_cache_locs = self._context_cache_locations(ctx)
         ctx.target_capture_sink = self
 
     def on_target_capture(self, capture_idx: int, hidden: torch.Tensor) -> None:

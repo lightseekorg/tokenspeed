@@ -911,12 +911,17 @@ def test_device_weight_update_notifies_drafter_before_returning():
 # --------------------------------------------------------------------------
 
 
-def _draft_locations(num_tokens: int) -> SimpleNamespace:
-    """The draft router's decode window: the draft writes its KV through its
-    OWN router, because the pages belong to its cache group."""
+def _draft_locations() -> SimpleNamespace:
+    """Return the draft router; the context KV lands in its own pages."""
+
+    def resolve(out, starts, width):
+        # Pages offset by 100: each slot names its position.
+        rows = 100 + starts[:, None] + torch.arange(width)
+        out[: rows.numel()] = rows.reshape(-1)
+        return out
+
     return SimpleNamespace(
-        group_ids=("full_attention",),
-        decode_window_locations=lambda: torch.arange(100, 100 + 2 * num_tokens),
+        group_ids=("full_attention",), draft_write_locations_uniform=resolve
     )
 
 
@@ -957,7 +962,10 @@ def _sink_dflash(
     drafter._context_written = True  # stale from a previous round
     drafter._sink_tokens = 0
     drafter.input_buffers = SimpleNamespace(positions_buf=torch.arange(16))
-    drafter.attn_backend = _draft_locations(4)
+    drafter.attn_backend = _draft_locations()
+    drafter.spec_num_tokens = 2
+    drafter.context_starts_buf = torch.zeros(2, dtype=torch.int64)
+    drafter.context_locs_buf = torch.zeros(4, dtype=torch.int32)
     return drafter
 
 
@@ -1081,12 +1089,12 @@ def test_context_cache_ownership_preserves_prefix_lengths(
     )
     drafter.runtime_states = SimpleNamespace(valid_cache_lengths=torch.tensor([10]))
     drafter.draft_seq_lens_buf = torch.zeros(1, dtype=torch.int32)
+    drafter.context_starts_buf = torch.zeros(1, dtype=torch.int64)
+    drafter.context_locs_buf = torch.zeros(4, dtype=torch.int32)
     drafter._write_native_cache = mock.Mock()
-    locations = torch.arange(4)
+    locations = torch.arange(4, dtype=torch.int32)
     backend = SimpleNamespace(
-        decode_window_locations=lambda: (
-            locations if not num_extends else torch.empty(0, dtype=torch.int64)
-        ),
+        draft_write_locations_uniform=lambda out, starts, width: out.copy_(locations),
         extend_span_locations=lambda: locations,
     )
     # The write locations come from the DRAFT's own router: the pages belong
