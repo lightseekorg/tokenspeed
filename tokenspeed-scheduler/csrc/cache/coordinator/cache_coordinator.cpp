@@ -292,7 +292,7 @@ bool CacheCoordinator::ClearDeviceCache() {
     // Every plan drains what its admissions and restores recorded; a clear
     // runs between plans and drops what it evicts.
     _assert(evicted_segments_.empty(), "a cache clear runs with no eviction left undrained");
-    std::vector<std::pair<std::uint32_t, CacheBlockLocation>> cached_locations;
+    VictimSet cached{std::pmr::get_default_resource()};
     for (const CacheGroup& group : groups_) {
         const PrefixCacheIndex& index = group.Index();
         const std::vector<PrefixCacheIndex::EvictionCandidate> group_entries = index.EvictableCandidates(pool_);
@@ -300,16 +300,22 @@ bool CacheCoordinator::ClearDeviceCache() {
             return false;
         }
         for (const PrefixCacheIndex::EvictionCandidate& entry : group_entries) {
-            cached_locations.emplace_back(group.Id(), entry.location);
+            cached.members.push_back(VictimSet::Member{.group_id = group.Id(),
+                                                       .location = entry.location,
+                                                       .in_stranded_suffix = false,
+                                                       .is_request_reclaim = false});
         }
     }
 
     store_candidates_dropped_by_flush_ += pending_stores_.size();
     pending_stores_.clear();
-    for (const auto& [group_id, location] : cached_locations) {
-        // The cascade of an earlier eviction may already have taken this one.
-        evictCachedBlock(group_id, location, &DeviceEvictionStats::flush, /*write_back_segment=*/nullptr);
-        FatalCheck(!pool_.IsOccupied(location), "clearable Device cache entry disappeared");
+    // The cascade of an earlier eviction may already have taken one.
+    for (const UnevictedVictim& victim :
+         evictPlannedVictims(std::span{&cached, 1}, /*write_back=*/false,
+                             VictimReasons{.victim = &DeviceEvictionStats::flush,
+                                           .stranded_suffix = &DeviceEvictionStats::flush,
+                                           .request_reclaim = &DeviceEvictionStats::flush})) {
+        FatalCheck(!pool_.IsOccupied(victim.location), "clearable Device cache entry disappeared");
     }
     // A Device-only clear leaves Host L2 untouched: the Host pages under a
     // Device prefix it emptied are not collected for it.
@@ -2041,6 +2047,25 @@ bool CacheCoordinator::evictCachedBlock(std::uint32_t group_id, CacheBlockLocati
         });
     }
     return true;
+}
+
+std::vector<CacheCoordinator::UnevictedVictim> CacheCoordinator::evictPlannedVictims(std::span<const VictimSet> victims,
+                                                                                     bool write_back,
+                                                                                     const VictimReasons& reasons) {
+    std::vector<UnevictedVictim> unevicted;
+    for (const VictimSet& set : victims) {
+        EvictedSegment* segment = write_back ? &evicted_segments_.emplace_back() : nullptr;
+        for (const auto& [group_id, location, in_stranded_suffix, is_request_reclaim] : set.members) {
+            DeviceEvictionCounts DeviceEvictionStats::*reason = is_request_reclaim   ? reasons.request_reclaim
+                                                                : in_stranded_suffix ? reasons.stranded_suffix
+                                                                                     : reasons.victim;
+            if (!evictCachedBlock(group_id, location, reason, segment)) {
+                unevicted.push_back(UnevictedVictim{
+                    .group_id = group_id, .location = location, .reason = reason, .write_back_segment = segment});
+            }
+        }
+    }
+    return unevicted;
 }
 
 bool CacheCoordinator::evictHostCachedBlock(std::uint32_t group_id, CacheBlockLocation location,

@@ -24,6 +24,7 @@
 #include "cache/coordinator/flat_hash_map.h"
 #include "cache/coordinator/group_geometry.h"
 #include "cache/coordinator/shadow_occupancy.h"
+#include "cache/coordinator/victim_set.h"
 
 #include <algorithm>
 #include <array>
@@ -41,24 +42,6 @@
 
 namespace tokenspeed {
 namespace {
-
-// Blocks a plan evicts together, in the order they leave: one block, or,
-// when the coordinator evicts by segments, a whole segment -- deepest node
-// first, a node's State checkpoints before its other blocks.
-struct VictimSet {
-    struct Member {
-        std::uint32_t group_id;
-        CacheBlockLocation location;
-        // Whether it lies strictly under the boundary of the candidate the
-        // set was chosen for, taken along so no Device page outlives its
-        // parent (counted as a stranded suffix).
-        bool in_stranded_suffix;
-        // Kept per block when a segment absorbs the request's released slots.
-        bool is_request_reclaim;
-    };
-    explicit VictimSet(std::pmr::memory_resource* resource) : members{resource} {}
-    std::pmr::vector<Member> members;
-};
 
 // A copy-in block an admission reserves: the table slot it serves and the
 // bucket it takes, the bucket of that slot's block -- for a slot the
@@ -1428,27 +1411,17 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
             result.new_page_ids[i].push_back(destination);
         }
     };
-    std::vector<
-        std::tuple<std::uint32_t, CacheBlockLocation, DeviceEvictionCounts DeviceEvictionStats::*, EvictedSegment*>>
-        prospective_victims;
     // Record cached victims for write-back even when this request releases
     // them: a published input can still resume another request. Uncached
     // slots and explicitly superseded inputs contribute no store records.
     // A reclaimable table block may still be pinned by both the request and
     // cache here. Evict what is already free, then slide the request tables and
     // retry the blocks whose request reference has just been released.
-    for (const VictimSet& set : plan.victims) {
-        EvictedSegment* segment = write_back_evictions_ ? &evicted_segments_.emplace_back() : nullptr;
-        for (const auto& [group_id, location, in_stranded_suffix, is_request_reclaim] : set.members) {
-            DeviceEvictionCounts DeviceEvictionStats::*reason =
-                is_request_reclaim   ? &DeviceEvictionStats::request_reclaim
-                : in_stranded_suffix ? &DeviceEvictionStats::stranded_suffix
-                                     : &DeviceEvictionStats::admission;
-            if (!evictCachedBlock(group_id, location, reason, segment)) {
-                prospective_victims.emplace_back(group_id, location, reason, segment);
-            }
-        }
-    }
+    const std::vector<UnevictedVictim> prospective_victims =
+        evictPlannedVictims(plan.victims, write_back_evictions_,
+                            VictimReasons{.victim = &DeviceEvictionStats::admission,
+                                          .stranded_suffix = &DeviceEvictionStats::stranded_suffix,
+                                          .request_reclaim = &DeviceEvictionStats::request_reclaim});
     // Held while the groups register under the publication's nodes.
     BoundaryTree::Hold publication;
     if (progress.completed_pages) {
@@ -1755,13 +1728,15 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Restore(const
     // write-back policy each set is recorded whole as one segment for this
     // plan's drain, as Admit does.
     for (const VictimSet& set : candidate->victims) {
-        EvictedSegment* segment = write_back_evictions_ ? &evicted_segments_.emplace_back() : nullptr;
-        for (const VictimSet::Member& member : set.members) {
-            _assert(!member.is_request_reclaim, "a restore rebuilds empty tables and reclaims nothing of its own");
-            if (!evictCachedBlock(member.group_id, member.location, &DeviceEvictionStats::restore, segment)) {
-                FatalCheck(!pool_.IsOccupied(member.location), "restore victim changed before acquisition");
-            }
-        }
+        _assert(std::ranges::none_of(set.members, &VictimSet::Member::is_request_reclaim),
+                "a restore rebuilds empty tables and reclaims nothing of its own");
+    }
+    const VictimReasons restore_reasons{.victim = &DeviceEvictionStats::restore,
+                                        .stranded_suffix = &DeviceEvictionStats::restore,
+                                        .request_reclaim = &DeviceEvictionStats::restore};
+    for (const UnevictedVictim& victim :
+         evictPlannedVictims(candidate->victims, write_back_evictions_, restore_reasons)) {
+        FatalCheck(!pool_.IsOccupied(victim.location), "restore victim changed before acquisition");
     }
     // A set whose every block was dropped records nothing: this restore's
     // empty records go, and an earlier call left none.
@@ -2227,10 +2202,10 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::CompactLoneRe
             for (Move& move : moves) {
                 Member& member = members[i][move.member];
                 if (move.clearing && pool_.IsOccupied(move.destination)) {
-                    EvictedSegment* segment = write_back_evictions_ ? &evicted_segments_.emplace_back() : nullptr;
-                    for (const VictimSet::Member& victim : move.clearing->members) {
-                        evictCachedBlock(victim.group_id, victim.location, &DeviceEvictionStats::compaction, segment);
-                    }
+                    evictPlannedVictims(std::span{&*move.clearing, 1}, write_back_evictions_,
+                                        VictimReasons{.victim = &DeviceEvictionStats::compaction,
+                                                      .stranded_suffix = &DeviceEvictionStats::compaction,
+                                                      .request_reclaim = &DeviceEvictionStats::compaction});
                 }
                 FatalCheck(!pool_.IsOccupied(move.destination), "compaction destination changed before placement");
                 // A kept parent never empties before the moves into it

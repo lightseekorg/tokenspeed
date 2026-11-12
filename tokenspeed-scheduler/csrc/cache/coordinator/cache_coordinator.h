@@ -37,6 +37,7 @@
 #include "cache/core/block_pool.h"
 #include "cache/core/cache_block_ref.h"
 #include "cache/coordinator/group_geometry.h"
+#include "cache/coordinator/victim_set.h"
 #include "cache/cache_group.h"
 #include "cache/core/cache_types.h"
 #include "cache/prefix/boundary_tree.h"
@@ -1298,6 +1299,29 @@ private:
     // pinned elsewhere stays.
     bool evictCachedBlock(std::uint32_t group_id, CacheBlockLocation location,
                           DeviceEvictionCounts DeviceEvictionStats::*reason, EvictedSegment* write_back_segment);
+    // The counter a planned victim's eviction counts under, by what its plan
+    // marked it as (VictimSet::Member).
+    struct VictimReasons {
+        DeviceEvictionCounts DeviceEvictionStats::*victim;
+        DeviceEvictionCounts DeviceEvictionStats::*stranded_suffix;
+        DeviceEvictionCounts DeviceEvictionStats::*request_reclaim;
+    };
+    // A planned victim evictPlannedVictims found no unpinned entry at: an
+    // earlier victim's cascade took it, or something still holds its block
+    // (an admission's own released slot until its table lets go).
+    struct UnevictedVictim {
+        std::uint32_t group_id;
+        CacheBlockLocation location;
+        DeviceEvictionCounts DeviceEvictionStats::*reason;
+        EvictedSegment* write_back_segment;
+    };
+    // Evicts planned victims in plan order, each with its cascade
+    // (evictCachedBlock), counted under `reasons`. With write_back each set is
+    // recorded as one segment of evicted_segments_; one whose every block was
+    // dropped stays empty for the caller to erase. The one loop that commits
+    // an admission's, a restore's, a compaction's or a cache clear's victims.
+    std::vector<UnevictedVictim> evictPlannedVictims(std::span<const VictimSet> victims, bool write_back,
+                                                     const VictimReasons& reasons);
     // What evictCachedBlockAlone took out of the index.
     struct EvictedEntry {
         CacheKey key;
