@@ -751,6 +751,9 @@ private:
     // prefill_decode_interval: reset by a prefill round, counted down by a
     // decode round. Derived from the plans alone, so mirrored ranks agree.
     std::int32_t prefill_deferral_rounds_left_{0};
+    // prefill_decode_min_interval: the same clock, but no overdue prompt
+    // suspends it.
+    std::int32_t prefill_min_rounds_left_{0};
 
     // Consecutive stalled rounds (trackStalledRounds); 0 after any round
     // that schedules work, leaves work in flight or aborts a request (the
