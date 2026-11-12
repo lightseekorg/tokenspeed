@@ -37,6 +37,7 @@ from typing import Protocol
 import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.ops.activation.triton import rmsnorm_gated_sigmoid
+from tokenspeed_kernel.ops.gemm import _try_gluon_largem_gfx1250
 from tokenspeed_kernel.ops.residual import mhc_post, mhc_pre
 from tokenspeed_kernel.ops.transform import hadamard_transform
 from tokenspeed_kernel.platform import pdl_enabled
@@ -669,8 +670,6 @@ class Glm53FlashKDA(nn.Module):
             dim=-1,
         )
         output_gate = self.g_b_proj(g_a)[0]
-        if not ctx.forward_mode.is_decode():
-            mixed_qkv = mixed_qkv.contiguous()
         conv_versions = (
             self.q_conv1d_weight._version,
             self.k_conv1d_weight._version,
@@ -834,7 +833,9 @@ class Glm53FlashIndexer(GlmDsaIndexer):
             query.contiguous(),
             scale=self.index_head_dim**-0.5,
         )
-        gate = F.linear(hidden_states, self.index_kpool_compress_gate)
+        gate = _try_gluon_largem_gfx1250(hidden_states, self.index_kpool_compress_gate)
+        if gate is None:
+            gate = F.linear(hidden_states, self.index_kpool_compress_gate)
         return Glm53FlashIndexerOutput(
             query=query,
             key=key,

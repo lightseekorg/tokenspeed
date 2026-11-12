@@ -204,7 +204,8 @@ def test_conv_compiles_once_across_prefill_shapes(channels, width):
 
 def test_conv_reads_a_wide_view_past_int32_offsets():
     """Token offsets times a projection-wide row stride pass int32 within one
-    long sequence; the view convolves like its dense copy."""
+    long sequence; the view convolves like its dense copy, into packed token
+    rows."""
     torch.manual_seed(5)
     channels, row_stride = 16, 1 << 16
     length = (1 << 31) // row_stride + 4 * CAUSAL_CONV1D_BLOCK_M
@@ -222,7 +223,8 @@ def test_conv_reads_a_wide_view_past_int32_offsets():
         out = _conv(x, weight, state, bounds, indices, history, metadata)
         results.append((out, state))
     (out, state), (expected, expected_state) = results
-    assert out.stride() == expected.stride() and out.dtype == expected.dtype
+    assert out.T.is_contiguous() and out.stride() == expected.stride()
+    assert out.dtype == expected.dtype
     assert torch.equal(out.T.view(torch.uint8), expected.T.view(torch.uint8))
     assert torch.equal(state.view(torch.uint8), expected_state.view(torch.uint8))
 

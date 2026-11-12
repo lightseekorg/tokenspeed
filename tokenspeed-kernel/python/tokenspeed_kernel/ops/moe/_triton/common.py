@@ -52,16 +52,26 @@ def _routing_kernel(
 
 
 def _routing(
-    topk_ids: torch.Tensor, num_experts: int, expert_start: int
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    expert_start: int,
+    *,
+    block_routes: int | None = None,
+    num_warps: int = 4,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Group route ids by the local experts ``expert_start + [0, num_experts)``."""
+    """Group route ids by the local experts ``expert_start + [0, num_experts)``.
+
+    Each expert's program scans the routes ``block_routes`` at a time, by
+    default 128 for at most 128 routes and 1024 otherwise.
+    """
     topk_ids = topk_ids.to(torch.int32).contiguous()
     num_routes = topk_ids.numel()
     expert_route_ids = torch.empty(
         (num_experts, num_routes), device=topk_ids.device, dtype=torch.int32
     )
     expert_counts = torch.empty(num_experts, device=topk_ids.device, dtype=torch.int32)
-    block_routes = 128 if num_routes <= 128 else 1024
+    if block_routes is None:
+        block_routes = 128 if num_routes <= 128 else 1024
     _routing_kernel[(num_experts,)](
         topk_ids,
         expert_route_ids,
@@ -69,7 +79,7 @@ def _routing(
         num_routes,
         expert_start,
         BLOCK_ROUTES=block_routes,
-        num_warps=4,
+        num_warps=num_warps,
     )
     return expert_route_ids, expert_counts
 
@@ -79,12 +89,14 @@ def _combine_kernel(
     route_output_ptr,
     topk_weights_ptr,
     topk_ids_ptr,
+    route_rows_ptr,
     output_ptr,
     num_tokens,
     hidden_size,
     num_experts,
     top_k: tl.constexpr,
     SKIP_INVALID_IDS: tl.constexpr,
+    HAS_ROUTE_ROWS: tl.constexpr,
     ROUND_WEIGHTED_ROUTES: tl.constexpr,
     OUTPUT_SCALE: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -101,10 +113,12 @@ def _combine_kernel(
         if SKIP_INVALID_IDS:
             ids = tl.load(topk_ids_ptr + route_offsets, mask=token_mask, other=-1)
             route_mask &= (ids >= 0) & (ids < num_experts)
+        if HAS_ROUTE_ROWS:
+            rows = tl.load(route_rows_ptr + route_offsets, mask=route_mask, other=0)
+        else:
+            rows = route_offsets
         values = tl.load(
-            route_output_ptr
-            + route_offsets[:, None] * hidden_size
-            + hidden_offsets[None, :],
+            route_output_ptr + rows[:, None] * hidden_size + hidden_offsets[None, :],
             mask=route_mask[:, None] & hidden_mask[None, :],
             other=0.0,
         )
@@ -130,11 +144,13 @@ def _combine(
     num_experts: int,
     round_weighted_routes: bool = False,
     output_scale: float = 1.0,
+    route_rows: torch.Tensor | None = None,
 ) -> None:
     """Sum weighted route rows into ``output``.
 
     With ``topk_ids``, routes whose id is outside ``[0, num_experts)`` are not
-    read, so their ``route_output`` rows may hold anything.
+    read, so their ``route_output`` rows may hold anything. With
+    ``route_rows``, route ``r`` reads row ``route_rows[r]`` instead of row ``r``.
     """
     num_tokens, top_k = topk_weights.shape
     hidden_size = output.shape[1]
@@ -142,12 +158,14 @@ def _combine(
         route_output,
         topk_weights.contiguous(),
         None if topk_ids is None else topk_ids.contiguous(),
+        route_rows,
         output,
         num_tokens,
         hidden_size,
         num_experts,
         top_k=top_k,
         SKIP_INVALID_IDS=topk_ids is not None,
+        HAS_ROUTE_ROWS=route_rows is not None,
         ROUND_WEIGHTED_ROUTES=round_weighted_routes,
         OUTPUT_SCALE=output_scale,
         BLOCK_M=4,

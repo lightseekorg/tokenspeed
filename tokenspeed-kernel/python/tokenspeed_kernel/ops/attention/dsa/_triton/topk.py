@@ -451,7 +451,7 @@ def workspace_topk_to_global_slots(
     workspace_indices = workspace_indices.contiguous()
     kv_workspace_slots = kv_workspace_slots.to(
         device=workspace_indices.device,
-        dtype=torch.int64,
+        dtype=(torch.int32 if kv_workspace_slots.dtype == torch.int32 else torch.int64),
     ).contiguous()
     out_view = out.contiguous() if not out.is_contiguous() else out
     total = int(workspace_indices.numel())

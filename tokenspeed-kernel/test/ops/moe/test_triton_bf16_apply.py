@@ -88,6 +88,54 @@ def test_bf16_route_combine_rounds_before_accumulate_and_scale(graph_replay):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+@pytest.mark.parametrize("round_weighted_routes", [False, True])
+def test_route_combine_through_route_rows_matches_canonical_rows(
+    round_weighted_routes,
+):
+    from tokenspeed_kernel.ops.moe._triton.bf16 import _combine
+
+    num_tokens, top_k, hidden, num_experts = 7, 3, 300, 4
+    generator = torch.Generator(device="cuda").manual_seed(2857)
+    topk_ids = torch.randint(
+        0, num_experts, (num_tokens, top_k), device="cuda", generator=generator
+    )
+    topk_ids[1, 2] = -1
+    topk_ids[4, 0] = num_experts
+    invalid = ((topk_ids < 0) | (topk_ids >= num_experts)).flatten()
+    topk_weights = torch.rand(num_tokens, top_k, device="cuda", generator=generator)
+    canonical = torch.randn(
+        num_tokens * top_k, hidden, device="cuda", generator=generator
+    ).bfloat16()
+    canonical[invalid] = float("nan")
+
+    num_routes = num_tokens * top_k
+    route_rows = torch.randperm(num_routes, device="cuda", generator=generator).int()
+    permuted = torch.full_like(canonical, float("nan"))
+    permuted[route_rows.long()] = canonical
+    route_rows[invalid] = 2**30
+
+    expected = torch.empty(num_tokens, hidden, device="cuda", dtype=torch.bfloat16)
+    actual = torch.empty_like(expected)
+    for route_output, rows, output in (
+        (canonical, None, expected),
+        (permuted, route_rows, actual),
+    ):
+        _combine(
+            route_output,
+            topk_weights,
+            output,
+            topk_ids,
+            num_experts,
+            round_weighted_routes=round_weighted_routes,
+            output_scale=1.0,
+            route_rows=rows,
+        )
+
+    assert not expected.isnan().any()
+    assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 @pytest.mark.parametrize("activation", ["silu", "situ"])
 @pytest.mark.parametrize("num_tokens", [4, 48, 80])
 @pytest.mark.parametrize("intermediate", [32, 128])

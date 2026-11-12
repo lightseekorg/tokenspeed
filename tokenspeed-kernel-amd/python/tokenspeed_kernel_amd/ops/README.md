@@ -668,10 +668,15 @@ projections with many rows.
 
 #### Contract
 
-- The operation computes `A @ B.T` from contiguous BF16 `[M, K]` and `[N, K]`
-  with `M >= 512` and K a multiple of 128, producing a contiguous BF16
-  `[M, N]`. The registered op accepts the weight shapes listed in
-  `use_gluon_largem_gfx1250`.
+- The operation computes `A @ B.T` from BF16 `[M, K]` with a unit column
+  stride and rows starting on 16-byte boundaries, and contiguous BF16
+  `[N, K]`, with K a multiple of 128, producing a contiguous BF16 `[M, N]`.
+- `use_gluon_largem_gfx1250` selects a BF16 serving weight when
+  `_LARGEM_ROWS` lists its `(K, N)` with a row range holding M, where these
+  kernels beat hipBLASLt. The Kimi K3 projections run from 512 rows.
+- Outputs of at most 512 columns run on one wave of dense tiles when one
+  fits (a `64`- or `128`-row tile of `32` or `64` columns dividing N, at most
+  one CTA per CU), and on the large-M kernels otherwise.
 - Ragged M and N are handled in-kernel. The row count is a runtime argument,
   so any number of rows reuses one compiled kernel.
 
@@ -694,9 +699,18 @@ Wide problems (at least 4096 rows and 1536 columns) run
   path and every cluster barrier completes.
 - Clusters are assigned contiguous runs per XCD so clusters sharing operands
   share an L2.
+- When the columns past the last whole 512-wide cluster column would add a CU
+  round to a grid that keeps less than 90% of its rounds busy, the warp
+  pipeline covers only the leading columns and a second launch of
+  `_wmma_tdm_dense_largem_kernel` with `128 x 64` tiles covers the tail. This
+  measured 2-25% faster (for example GLM-5.3-Flash's 6416-column and K3's
+  6288-column projections at 8192 rows), and the selection above counts the
+  peeled grid.
 
 Narrower or shorter problems keep `_wmma_tdm_dense_largem_kernel` and its
-own tile choice. The general BF16 GEMM's large-M route
+own tile choice, except that narrow outputs with a dividing dense tile run
+`_wmma_tdm_dense_kernel` over one wave of the tile with the most CTAs (the
+smaller on a tie) without splitting K. The general BF16 GEMM's large-M route
 (`_launch_largem`) uses the same selection for FP32 or BF16 output; a
 row-strided output also takes the older kernel, whose masked stores accept
 it.

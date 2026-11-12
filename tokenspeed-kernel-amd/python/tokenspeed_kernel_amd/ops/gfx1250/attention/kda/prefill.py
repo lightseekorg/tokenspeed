@@ -134,7 +134,7 @@ def _shift_bands(
 
 @gluon.jit
 def _column_beta(
-    beta_base, band, rows_left, H: gl.constexpr, BC: gl.constexpr, layout: gl.constexpr
+    beta_base, band, rows_left, beta_stride, BC: gl.constexpr, layout: gl.constexpr
 ):
     """sigmoid(beta) of column band ``band``, along the last axis of ``layout``; 0 past the sequence."""
     column = band * BC + gl.arange(
@@ -142,7 +142,10 @@ def _column_beta(
     )
     inside = column < rows_left
     beta = cdna5.buffer_load(
-        beta_base, gl.minimum(column, rows_left - 1) * H, mask=inside, other=0.0
+        beta_base,
+        gl.minimum(column, rows_left - 1) * beta_stride,
+        mask=inside,
+        other=0.0,
     ).to(gl.float32)
     return gl.where(inside, gl.fdiv(1.0, 1.0 + gl.exp(-beta)), 0.0)[None, None, :]
 
@@ -164,6 +167,7 @@ def gluon_kda_paged_prefill_prepare_gfx1250(
     decay,
     cu_seqlens,
     chunk_indices,
+    beta_stride,
     SCALE: gl.constexpr,
     H: gl.constexpr,
     D: gl.constexpr,
@@ -263,19 +267,19 @@ def gluon_kda_paged_prefill_prepare_gfx1250(
         + gl.arange(0, BC, layout=gl.SliceLayout(0, gl.SliceLayout(2, mf)))[None, :]
     )
     beta_mask = beta_row < rows_left
+    # The same betas along block columns, which scale the inverse's columns.
+    beta_base = raw_beta + (begin + token0).to(gl.int64) * beta_stride + head
     beta = cdna5.buffer_load(
-        raw_beta + (begin + token0) * H + head,
-        gl.minimum(beta_row, rows_left - 1) * H,
+        beta_base,
+        gl.minimum(beta_row, rows_left - 1) * beta_stride,
         mask=beta_mask,
         other=0.0,
     ).to(gl.float32)
     beta = gl.where(beta_mask, gl.fdiv(1.0, 1.0 + gl.exp(-beta)), 0.0)
-    # The same betas along block columns, which scale the inverse's columns.
-    beta_base = raw_beta + (begin + token0) * H + head
-    beta0 = _column_beta(beta_base, 0, rows_left, H, BC, mf)
-    beta1 = _column_beta(beta_base, 1, rows_left, H, BC, mf)
-    beta2 = _column_beta(beta_base, 2, rows_left, H, BC, mf)
-    beta3 = _column_beta(beta_base, 3, rows_left, H, BC, mf)
+    beta0 = _column_beta(beta_base, 0, rows_left, beta_stride, BC, mf)
+    beta1 = _column_beta(beta_base, 1, rows_left, beta_stride, BC, mf)
+    beta2 = _column_beta(beta_base, 2, rows_left, beta_stride, BC, mf)
+    beta3 = _column_beta(beta_base, 3, rows_left, beta_stride, BC, mf)
 
     cdna5.tdm.async_wait(1)
     g_mask = _band_index(NB, 0, bf) * BC + _band_index(BC, 1, bf) < rows_left
@@ -955,7 +959,8 @@ def launch_gluon_kda_paged_prefill_gfx1250(
         k: Packed keys with shape ``[1,T,H,K]``.
         v: Packed values with shape ``[1,T,H,V]``.
         g_raw: Raw per-key-channel gates with shape ``[1,T,H,K]``.
-        beta_logits: Raw delta coefficients with shape ``[1,T,H]``.
+        beta_logits: Raw delta coefficients with shape ``[1,T,H]``; the token
+            rows may be strided (a column slice of a fused projection).
         A_log: Per-head log decay with shape ``[H]``.
         dt_bias: Per-head, per-key-channel gate bias with shape ``[H,K]``.
         initial_state: Initial V-major state ``[N,H,V,K]`` (value-major,
@@ -987,7 +992,9 @@ def launch_gluon_kda_paged_prefill_gfx1250(
     k = k[0].contiguous()
     v = v[0].contiguous()
     g_raw = g_raw[0].contiguous()
-    beta_logits = beta_logits[0].contiguous()
+    beta_logits = beta_logits[0]
+    if beta_logits.stride(-1) != 1:
+        beta_logits = beta_logits.contiguous()
     heads, key_dim = q.shape[1:]
     value_dim = v.shape[-1]
     if initial_state.shape[1:] != (heads, value_dim, key_dim):
@@ -1039,6 +1046,7 @@ def launch_gluon_kda_paged_prefill_gfx1250(
         decay,
         cu_seqlens,
         chunk_indices,
+        beta_logits.stride(0),
         key_dim**-0.5,
         H=heads,
         D=key_dim,
