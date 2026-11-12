@@ -145,9 +145,10 @@ def _worker(rank: int, degree: int, rendezvous: str) -> None:
             _same_bits(captured, all_to_all_transpose(shard, group, even, backend=nccl))
         del warm
         dist.barrier()
-        # Drain graph work and release the prepared exchange while its group
-        # is still live. Replacing the global backend drops its shared owner.
+        # All ranks have finished replaying. Drop the graph before releasing
+        # its workspace, with the process group still live.
         graph.reset()
+        # Drop the registry's reference so the AutoBackend can be collected.
         set_global_backend(nccl)
         del backend
         gc.collect()
