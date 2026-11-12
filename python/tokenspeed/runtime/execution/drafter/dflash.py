@@ -368,10 +368,11 @@ class DFlash(BaseDrafter):
         self.gather_indices_buf = torch.empty(
             (max_bs,), dtype=torch.int64, device=self.device
         )
-        # Context writes: per-request verify starts and the verify rows' slots.
+        # Context writes' verify starts; zeros keep stale extend rows non-negative.
         self.context_starts_buf = torch.zeros(
             (max_bs,), dtype=torch.int64, device=self.device
         )
+        # Context writes' verify-row slots.
         self.context_locs_buf = torch.zeros(
             (max_bs * self.spec_num_tokens,), dtype=torch.int32, device=self.device
         )
