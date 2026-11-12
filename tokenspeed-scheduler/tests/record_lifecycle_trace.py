@@ -39,7 +39,7 @@ parser.add_argument("--module-dir", required=True)
 parser.add_argument("--output", required=True)
 args = parser.parse_args()
 sys.path.insert(0, args.module_dir)
-import tokenspeed_scheduler_ext as ts
+import tokenspeed_scheduler_ext as ts  # noqa: E402
 
 
 def canonical(value):
