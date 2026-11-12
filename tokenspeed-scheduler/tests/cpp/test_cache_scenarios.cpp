@@ -3524,6 +3524,11 @@ TEST_F(ReadmissionScanSuite, TheNoProgressAbortTakesTheImageTheRestorePhaseTries
     // block refs, the way a store ticket pins them: an admitted table would
     // bind to the active-parent gauge the scheduler's debug build checks
     // against a walk of the requests' tables, and this holder is no request.
+    // Raw refs take only free parents, so the evictable cache entries the
+    // frees published go first (the prefix cache is disabled, the restores
+    // claim nothing either way).
+    CacheCoordinator& coordinator = SchedulerTestAccess::Coordinator(*scheduler_);
+    ASSERT_TRUE(coordinator.ClearDeviceCache());
     BlockPool& pool = SchedulerTestAccess::Pool(*scheduler_);
     const std::int32_t available = scheduler_->AvailableLcmBlocks();
     const std::vector<CacheBlockRef> held = pool.AcquireBlocks(/*group_id=*/0, available);
