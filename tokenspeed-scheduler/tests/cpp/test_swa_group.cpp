@@ -334,33 +334,33 @@ TEST(BlockTableTest, EvictToNullIsIdempotentOnNullSlot) {
 TEST(GroupAllocatorTest, BucketBalanceKeepsLiveSlotsAfterReclaimedPrefixAndInteriorHole) {
     BlockPool pool(8, {4});
     pool.RegisterGroup(0, 4, 4);
-    GroupAllocator allocator(4, 0, 4);
+    GroupAllocator allocator(4, 0, 4, /*kept_head_blocks=*/0);
     BlockTable table;
-    ASSERT_TRUE(
-        allocator.Acquire(pool, table, AcquirePlan{.num_blocks = 3, .suffix_start = 64, .table_blocks_after = 67}));
+    ASSERT_TRUE(allocator.Acquire(
+        pool, table, AcquirePlan{.num_blocks = 3, .suffix_start = 64, .table_blocks_after = 67}, 0, {}));
     ASSERT_EQ(table.ReclaimedPrefixBlocks(), 64);
     table.EvictToNull(65).reset();
-    ASSERT_TRUE(allocator.Acquire(pool, table, AcquirePlan{.num_blocks = 4}));
+    ASSERT_TRUE(allocator.Acquire(pool, table, AcquirePlan{.num_blocks = 4}, 0, {}));
     std::vector<std::int32_t> buckets;
     for (const auto& ref : table.Blocks().subspan(67)) buckets.push_back(allocator.BucketOf(ref->Location()));
     EXPECT_EQ(buckets, (std::vector<std::int32_t>{1, 3, 0, 1}));
     const auto before = allocator.BlockTablePageIds(table);
     const auto occupied = pool.NumOccupiedSlots();
-    EXPECT_FALSE(allocator.Acquire(pool, table, AcquirePlan{.num_blocks = 100}));
+    EXPECT_FALSE(allocator.Acquire(pool, table, AcquirePlan{.num_blocks = 100}, 0, {}));
     EXPECT_EQ(allocator.BlockTablePageIds(table), before);
     EXPECT_EQ(pool.NumOccupiedSlots(), occupied);
     allocator.Free(table);
     EXPECT_EQ(table.ReclaimedPrefixBlocks(), 0);
-    ASSERT_TRUE(allocator.Acquire(pool, table, AcquirePlan{.num_blocks = 1}));
+    ASSERT_TRUE(allocator.Acquire(pool, table, AcquirePlan{.num_blocks = 1}, 0, {}));
     EXPECT_EQ(allocator.BucketOf(table.Blocks()[0]->Location()), 0);
 }
 
 TEST(GroupAllocatorTest, ReclaimedSharedPrefixDoesNotCountTowardNewPlacement) {
     BlockPool pool(8, {4});
     pool.RegisterGroup(0, 4, 4);
-    GroupAllocator allocator(4, 0, 4);
+    GroupAllocator allocator(4, 0, 4, /*kept_head_blocks=*/0);
     BlockTable owner;
-    ASSERT_TRUE(allocator.Acquire(pool, owner, AcquirePlan{.num_blocks = 8}));
+    ASSERT_TRUE(allocator.Acquire(pool, owner, AcquirePlan{.num_blocks = 8}, 0, {}));
     const auto owner_ids = allocator.BlockTablePageIds(owner);
     PrefixMatch prefix;
     prefix.blocks.assign(owner.Blocks().begin(), owner.Blocks().end());
@@ -368,10 +368,10 @@ TEST(GroupAllocatorTest, ReclaimedSharedPrefixDoesNotCountTowardNewPlacement) {
     allocator.ClaimHitBlocks(shared, std::move(prefix));
     allocator.ReclaimExpired(pool, shared, 6);
     ASSERT_EQ(shared.ReclaimedPrefixBlocks(), 6);
-    auto replaced = allocator.SwapInFreshBlock(pool, shared, 7, 0);
+    auto replaced = allocator.SwapInFreshBlock(pool, shared, 7, 0, std::nullopt);
     ASSERT_TRUE(replaced);
     EXPECT_EQ(allocator.BucketOf(shared.Blocks()[7]->Location()), 3);
-    ASSERT_TRUE(allocator.Acquire(pool, shared, AcquirePlan{.num_blocks = 1}));
+    ASSERT_TRUE(allocator.Acquire(pool, shared, AcquirePlan{.num_blocks = 1}, 0, {}));
     EXPECT_EQ(allocator.BucketOf(shared.Blocks()[8]->Location()), 0);
     EXPECT_EQ(allocator.BlockTablePageIds(owner), owner_ids);
     allocator.Free(shared);
