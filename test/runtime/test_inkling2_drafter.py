@@ -413,19 +413,22 @@ def test_shared_target_update_selects_features_and_publishes_only_accepted_prefi
     _cpu_context_kernels(monkeypatch)
     drafter, _, _, _, target_backend = build_native_drafter(tmp_path, 3, "cpu", {}, 40)
     router = target_backend.inner
-    groups = router.group_ids
-    tables = {name: torch.tensor([[1], [2]], dtype=torch.int32) for name in groups}
     slots = torch.tensor([1, 2], dtype=torch.int64)
     lengths = torch.tensor([9, 15], dtype=torch.int32)
-    router.refresh_decode_metadata(
-        2,
-        2,
-        slots,
-        lengths,
-        forward_mode=ForwardMode.DECODE,
-        block_tables=tables,
-        num_extends=0,
-    )
+    # The runner refreshes both routers before the target forward.
+    for backend in (router, drafter.attn_backend):
+        backend.refresh_decode_metadata(
+            2,
+            2,
+            slots,
+            lengths,
+            forward_mode=ForwardMode.DECODE,
+            block_tables={
+                name: torch.tensor([[1], [2]], dtype=torch.int32)
+                for name in backend.group_ids
+            },
+            num_extends=0,
+        )
     positions = torch.tensor([5, 6, 7, 8, 11, 12, 13, 14])
     drafter.input_buffers.positions_buf[:8].copy_(positions)
     drafter.input_buffers.req_pool_indices_buf[:2].copy_(slots)
@@ -445,6 +448,12 @@ def test_shared_target_update_selects_features_and_publishes_only_accepted_prefi
         drafter._proposal_features_buf[:2], drafter.model.compute_f_rnn(hidden[[1, 7]])
     )
     assert router.decode_window_locations().numel() == 8
+    # The side-stream write names rows through the target's window and the
+    # fallback write through the draft's: both must be the same rows.
+    assert torch.equal(
+        drafter.attn_backend.decode_window_locations(),
+        router.decode_window_locations(),
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires an admitted GPU")

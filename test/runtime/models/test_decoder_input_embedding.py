@@ -203,13 +203,16 @@ class _CPUInputGraph(PrefillGraph):
             num_warmup=0,
             graph_supported=True,
         )
-        weight = self._embed_tokens.weight
+        weight = self.inner_model.embed_tokens.weight
         self._input_embeds_buf = torch.full(
             (4, weight.shape[1]), -99, dtype=weight.dtype
         )
 
     def stage(self, input_ids: torch.Tensor) -> torch.Tensor:
-        self._land_input_embeds(self._embed_tokens(input_ids), bucket=4)
+        embeds = self._compute_input_embeddings(
+            input_ids, None, request_token_history=None
+        )
+        self._land_input_embeds(embeds, bucket=4)
         return self._input_embeds_buf
 
 

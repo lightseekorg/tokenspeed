@@ -528,8 +528,11 @@ def _draft_dtype(server_dtype: str, target_dtype: torch.dtype) -> object:
         speculative_draft_model_revision=None,
         max_model_len=262144,
         hf_overrides="{}",
+        decode_monokernel=False,
     )
-    target = SimpleNamespace(dtype=target_dtype)
+    target = SimpleNamespace(
+        dtype=target_dtype, hf_config=SimpleNamespace(architectures=[])
+    )
 
     with mock.patch.object(rank_setup, "ModelConfig") as model_config:
         rank_setup.load_model_config(server_args, "draft", draft_of=target)
