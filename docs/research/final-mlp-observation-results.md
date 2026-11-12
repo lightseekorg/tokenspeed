@@ -109,8 +109,12 @@ strict threshold `score > 3.25` before 3,600 held-out requests from two lineages
   damaged 14 and 53 currently correct edited cases, respectively. First-token
   correctness does not establish complete-answer correctness.
 - All 43,200 replay identity checks and 120 full-model ablation checks passed.
-  Reciprocal power-of-two up/down rescaling preserved all 3,600 tested logit
-  arrays and write-score arrays despite changing parameter norms.
+  All 3,600 matched controls preserved logit and write-score arrays. For 1,800
+  velvet requests, the nontrivial control multiplied down weights by 0.25 and
+  up weights by 4. The 1,800 marble controls used factor 1, an identity control
+  that supplies no evidence about rescaling sensitivity. A separate earlier
+  nonce-development control used down factor 64 and up factor 1/64 on 720
+  requests, also preserving every tested logit and write-score array exactly.
 
 The useful primitive is faithful observation and local causal replay. A deployment
 would still need model provenance, independent action authorization, and its own

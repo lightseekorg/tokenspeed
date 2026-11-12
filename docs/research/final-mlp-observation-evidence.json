@@ -210,6 +210,31 @@
       "exact_finite_full_model_ablation_checks": 120,
       "exact_rescale_control_logit_arrays": 3600,
       "exact_rescale_control_write_score_arrays": 3600,
+      "matched_control_factors": [
+        {
+          "lineage": "velvet",
+          "requests": 1800,
+          "down_multiplier": 0.25,
+          "up_multiplier": 4.0,
+          "kind": "nontrivial_reciprocal_rescaling"
+        },
+        {
+          "lineage": "marble",
+          "requests": 1800,
+          "down_multiplier": 1.0,
+          "up_multiplier": 1.0,
+          "kind": "identity_no_rescaling_sensitivity_evidence"
+        }
+      ],
+      "earlier_nonce_development_control": {
+        "requests": 720,
+        "down_multiplier": 64.0,
+        "up_multiplier": 0.015625,
+        "exact_logit_arrays": 720,
+        "exact_write_score_arrays": 720,
+        "split": "development",
+        "fixture_preparation_status": "fixture_failed_criteria"
+      },
       "limits": [
         "Constructed single-channel harmless-marker fixtures",
         "First-token outcomes only",
