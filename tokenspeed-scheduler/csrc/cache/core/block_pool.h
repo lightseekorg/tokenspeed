@@ -26,7 +26,6 @@
 #include <deque>
 #include <limits>
 #include <memory>
-#include <memory_resource>
 #include <new>
 #include <optional>
 #include <set>
@@ -36,8 +35,8 @@
 #include <vector>
 
 #include "cache/core/cache_block_ref.h"
-#include "cache/core/planning_scratch.h"
 #include "cache/core/fixed_slot_resource.h"
+#include "cache/core/planning_scratch.h"
 #include "utils.h"
 
 namespace tokenspeed {

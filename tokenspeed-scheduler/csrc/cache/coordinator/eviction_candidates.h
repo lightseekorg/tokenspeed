@@ -116,7 +116,7 @@ public:
     // just live entries.
     template <typename EnoughCapacity>
     bool PreScanUntil(EnoughCapacity&& enough_capacity) {
-        constexpr std::size_t max_retained_entries = 8192;
+        constexpr std::size_t kMaxRetainedEntries = 8192;
         std::size_t retained_entries = 0;
         std::vector<PrefixCacheIndex::EvictionCandidate> entries;
         for (GroupCursor& group : cursors_) {
@@ -130,7 +130,7 @@ public:
                 const bool fits =
                     enough_capacity(group.group_id, std::span<const PrefixCacheIndex::EvictionCandidate>{entries});
                 if (retaining && !entries.empty()) {
-                    if (entries.capacity() <= max_retained_entries - retained_entries) {
+                    if (entries.capacity() <= kMaxRetainedEntries - retained_entries) {
                         retained_entries += entries.capacity();
                         group.snapshots.push_back(EpochSnapshot{*epoch, std::move(entries)});
                     } else {
@@ -252,9 +252,9 @@ private:
     // without comparing it. False, leaving the candidates untouched, otherwise.
     static bool radixSortLoadedEpoch(std::vector<Candidate>& candidates, std::vector<Candidate>& scratch) {
         // Smaller sets sort faster by comparison than by clearing the digit counts.
-        constexpr std::size_t min_size = 256;
-        constexpr int digit_bits = 11;
-        if (candidates.size() < min_size) {
+        constexpr std::size_t kMinRadixSortSize = 256;
+        constexpr int kDigitBits = 11;
+        if (candidates.size() < kMinRadixSortSize) {
             return false;
         }
         // The tier, then the rank with its sign bit flipped: order-preserving
@@ -284,9 +284,9 @@ private:
         }
         scratch.resize(candidates.size());
         const int width = std::bit_width(highest - lowest);
-        std::array<std::size_t, (1U << digit_bits) + 1> starts;
-        for (int shift = 0; shift < width; shift += digit_bits) {
-            const std::uint64_t mask = (std::uint64_t{1} << std::min(digit_bits, width - shift)) - 1;
+        std::array<std::size_t, (1U << kDigitBits) + 1> starts;
+        for (int shift = 0; shift < width; shift += kDigitBits) {
+            const std::uint64_t mask = (std::uint64_t{1} << std::min(kDigitBits, width - shift)) - 1;
             const auto digit = [&](const Candidate& candidate) {
                 return static_cast<std::size_t>((rank_key(candidate) - lowest) >> shift & mask);
             };

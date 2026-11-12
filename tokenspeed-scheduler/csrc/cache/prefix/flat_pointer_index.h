@@ -21,9 +21,7 @@
 #pragma once
 
 #include <cstddef>
-#include <functional>
 #include <memory>
-#include <utility>
 #include <vector>
 
 namespace tokenspeed {

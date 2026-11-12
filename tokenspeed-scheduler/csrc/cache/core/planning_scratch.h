@@ -38,65 +38,73 @@ namespace tokenspeed {
 // memory at the end of the plan. Only the scheduler control thread uses this
 // owner.
 class PlanningScratch {
+public:
+    class Lease;
+
+    // A memory resource of independent bytes: a free bank, or the ordinary
+    // allocator once every bank is leased.
+    Lease Acquire() const;
+    ~PlanningScratch() {
+        for (const auto& bank : banks_) FatalCheck(!bank.leased, "planning scratch outlives all its leases");
+    }
+
+private:
     static constexpr std::size_t kBankBytes = 256 * 1024;
     struct Bank {
         std::unique_ptr<std::byte[]> bytes;
         bool leased{false};
     };
 
+    mutable std::array<Bank, 3> banks_;
+};
+
+class PlanningScratch::Lease final : public std::pmr::memory_resource {
 public:
-    class Lease final : public std::pmr::memory_resource {
-    public:
-        Lease(const Lease&) = delete;
-        Lease& operator=(const Lease&) = delete;
-        ~Lease() override {
-            if (bank_) bank_->leased = false;
-        }
-
-    private:
-        friend class PlanningScratch;
-        explicit Lease(const PlanningScratch& owner) {
-            for (auto& bank : owner.banks_) {
-                if (!bank.leased) {
-                    bank.leased = true;
-                    bank_ = &bank;
-                    break;
-                }
-            }
-        }
-        void* do_allocate(std::size_t bytes, std::size_t alignment) override {
-            if (bank_ && bytes <= kBankBytes) {
-                if (!bank_->bytes) bank_->bytes.reset(new std::byte[kBankBytes]);
-                void* next = bank_->bytes.get() + used_;
-                std::size_t remaining = kBankBytes - used_;
-                if (std::align(alignment, bytes, next, remaining)) {
-                    used_ = static_cast<std::byte*>(next) - bank_->bytes.get() + bytes;
-                    return next;
-                }
-            }
-            return std::pmr::new_delete_resource()->allocate(bytes, alignment);
-        }
-        void do_deallocate(void* pointer, std::size_t bytes, std::size_t alignment) override {
-            if (bank_ && bank_->bytes) {
-                const auto base = reinterpret_cast<std::uintptr_t>(bank_->bytes.get());
-                const auto address = reinterpret_cast<std::uintptr_t>(pointer);
-                if (address >= base && address - base < kBankBytes) return;
-            }
-            std::pmr::new_delete_resource()->deallocate(pointer, bytes, alignment);
-        }
-        bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override { return this == &other; }
-
-        Bank* bank_{nullptr};
-        std::size_t used_{0};
-    };
-
-    Lease Acquire() const { return Lease{*this}; }
-    ~PlanningScratch() {
-        for (const auto& bank : banks_) FatalCheck(!bank.leased, "planning scratch outlives all its leases");
+    Lease(const Lease&) = delete;
+    Lease& operator=(const Lease&) = delete;
+    ~Lease() override {
+        if (bank_) bank_->leased = false;
     }
 
 private:
-    mutable std::array<Bank, 3> banks_;
+    friend class PlanningScratch;
+    explicit Lease(const PlanningScratch& owner) {
+        for (auto& bank : owner.banks_) {
+            if (!bank.leased) {
+                bank.leased = true;
+                bank_ = &bank;
+                break;
+            }
+        }
+    }
+    void* do_allocate(std::size_t bytes, std::size_t alignment) override {
+        if (bank_ && bytes <= kBankBytes) {
+            if (!bank_->bytes) bank_->bytes.reset(new std::byte[kBankBytes]);
+            void* next = bank_->bytes.get() + used_;
+            std::size_t remaining = kBankBytes - used_;
+            if (std::align(alignment, bytes, next, remaining)) {
+                used_ = static_cast<std::byte*>(next) - bank_->bytes.get() + bytes;
+                return next;
+            }
+        }
+        return std::pmr::new_delete_resource()->allocate(bytes, alignment);
+    }
+    void do_deallocate(void* pointer, std::size_t bytes, std::size_t alignment) override {
+        if (bank_ && bank_->bytes) {
+            const auto base = reinterpret_cast<std::uintptr_t>(bank_->bytes.get());
+            const auto address = reinterpret_cast<std::uintptr_t>(pointer);
+            if (address >= base && address - base < kBankBytes) return;
+        }
+        std::pmr::new_delete_resource()->deallocate(pointer, bytes, alignment);
+    }
+    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override { return this == &other; }
+
+    Bank* bank_{nullptr};
+    std::size_t used_{0};
 };
+
+inline PlanningScratch::Lease PlanningScratch::Acquire() const {
+    return Lease{*this};
+}
 
 }  // namespace tokenspeed

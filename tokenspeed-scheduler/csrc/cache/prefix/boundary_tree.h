@@ -24,12 +24,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <list>
+#include <memory_resource>
 #include <optional>
 #include <span>
 #include <string>
-#include <unordered_map>
-#include <list>
-#include <memory_resource>
 #include <utility>
 
 #include "cache/core/cache_types.h"

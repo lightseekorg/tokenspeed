@@ -20,7 +20,6 @@
 
 #pragma once
 
-#include <algorithm>
 #include <limits>
 #include <optional>
 #include <span>

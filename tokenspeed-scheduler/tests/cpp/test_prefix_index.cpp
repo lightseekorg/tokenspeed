@@ -35,9 +35,9 @@
 #include <vector>
 
 #include "cache/core/block_pool.h"
+#include "cache/prefix/flat_pointer_index.h"
 #include "cache/prefix/prefix_index.h"
 #include "cache/prefix/prefix_matcher.h"
-#include "cache/prefix/flat_pointer_index.h"
 
 namespace tokenspeed::test {
 namespace {
@@ -412,8 +412,8 @@ TEST(FlatPointerIndex, ExtractObjectRemovesOnlyThatObjectAmongCollidingKeys) {
     };
     struct WrappingHash {
         std::size_t operator()(int key) const {
-            constexpr std::array<std::size_t, 4> homes{~std::size_t{0}, ~std::size_t{0} - 1, ~std::size_t{0}, 3};
-            return homes[static_cast<std::size_t>(key) % homes.size()];
+            constexpr std::array<std::size_t, 4> kHomes{~std::size_t{0}, ~std::size_t{0} - 1, ~std::size_t{0}, 3};
+            return kHomes[static_cast<std::size_t>(key) % kHomes.size()];
         }
     };
     using Index = FlatPointerIndex<const Entry*, int, KeyOfEntry, WrappingHash>;

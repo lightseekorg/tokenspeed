@@ -23,9 +23,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <memory_resource>
 #include <span>
-#include <unordered_map>
 #include <vector>
 
 #include "cache/cache_group.h"

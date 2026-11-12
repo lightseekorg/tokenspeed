@@ -21,10 +21,10 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
+#include <list>
 #include <memory>
 #include <memory_resource>
-#include <list>
-#include <limits>
 #include <numeric>
 #include <optional>
 #include <random>
@@ -121,9 +121,9 @@ TEST(CacheEvictionCandidates, PrescanReplaysPolicyOrderAcrossPinnedEpochsAndSnap
 // order: equal-age prefix pages from the suffix, unproven chunk boundaries
 // before established ones, then by group and physical location.
 TEST(CacheEvictionCandidates, EpochsLeaveInPolicyOrderOnAnyPhysicalLayout) {
-    constexpr int shuffled_pages = 1100;
-    constexpr int ascending_pages = 600;
-    BlockPool pool(shuffled_pages + ascending_pages, {1, 1});
+    constexpr int kShuffledPages = 1100;
+    constexpr int kAscendingPages = 600;
+    BlockPool pool(kShuffledPages + kAscendingPages, {1, 1});
     std::vector<CacheGroup> groups;
     const CacheGroupSpec full{.cache_blocks_per_lcm_block = 1, .block_granularity = 4};
     const CacheGroupSpec window{.attn_kind = AttnKind::kSlidingWindow,
@@ -134,7 +134,7 @@ TEST(CacheEvictionCandidates, EpochsLeaveInPolicyOrderOnAnyPhysicalLayout) {
     groups.emplace_back(window, std::make_unique<GroupAllocator>(1, 1, 1), MakePrefixMatcher(window));
     {
         // The ascending parents are handed out first, then these in a random order.
-        auto blocks = pool.AcquireBlocks(0, shuffled_pages);
+        auto blocks = pool.AcquireBlocks(0, kShuffledPages);
         std::mt19937 random(8731);
         std::shuffle(blocks.begin(), blocks.end(), random);
         for (CacheBlockRef& block : blocks) block.reset();
@@ -188,7 +188,7 @@ TEST(CacheEvictionCandidates, EpochsLeaveInPolicyOrderOnAnyPhysicalLayout) {
         });
         for (const Entry& entry : epoch) expected.push_back(entry.parent);
     }
-    EXPECT_EQ(expected.size(), static_cast<std::size_t>(shuffled_pages + ascending_pages - 80));
+    EXPECT_EQ(expected.size(), static_cast<std::size_t>(kShuffledPages + kAscendingPages - 80));
 
     // Read from the index directly, and replayed from a pre-scan's snapshots.
     for (const bool prescan : {false, true}) {

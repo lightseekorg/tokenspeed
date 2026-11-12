@@ -19,20 +19,19 @@
 // SOFTWARE.
 
 #pragma once
-#include <unordered_set>
-#include "cache/core/session_cache_tag.h"
 
 #include <algorithm>
 #include <cstdint>
 #include <iterator>
-#include <list>
 #include <limits>
+#include <list>
 #include <map>
 #include <memory>
 #include <memory_resource>
 #include <optional>
 #include <span>
 #include <type_traits>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -40,6 +39,7 @@
 #include "cache/core/cache_block_ref.h"
 #include "cache/core/cache_types.h"
 #include "cache/core/fixed_slot_resource.h"
+#include "cache/core/session_cache_tag.h"
 #include "cache/prefix/boundary_tree.h"
 #include "cache/prefix/flat_pointer_index.h"
 #include "cache/prefix/segmented_location_index.h"
