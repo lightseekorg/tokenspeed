@@ -30,6 +30,7 @@ from tokenspeed.runtime.utils.server_args import ServerArgs
 global_server_args_dict: dict = {
     "model": None,
     "revision": None,
+    "simulate": ServerArgs.simulate,
     "disaggregation_mode": ServerArgs.disaggregation_mode,
     "attention_backend": ServerArgs.attention_backend,
     "sampling_backend": ServerArgs.sampling_backend,
@@ -101,6 +102,7 @@ def global_server_args_dict_update(server_args: ServerArgs):
         {
             "model": server_args.model,
             "revision": server_args.revision,
+            "simulate": server_args.simulate,
             "disaggregation_mode": server_args.disaggregation_mode,
             "attention_backend": server_args.attention_backend,
             "sampling_backend": server_args.sampling_backend,

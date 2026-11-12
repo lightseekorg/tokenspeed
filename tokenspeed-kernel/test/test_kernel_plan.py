@@ -373,6 +373,7 @@ def _decode_topk(plan, rows, *, topk=3):
         index_k_cache=index_k_cache,
         slot_order="sorted",
         kernel_plan=plan,
+        simulation_seed=None,
     )
 
 

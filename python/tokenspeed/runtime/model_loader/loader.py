@@ -71,6 +71,7 @@ from tokenspeed.runtime.model_loader.weight_utils import (
 )
 from tokenspeed.runtime.models.extensible import ExtensibleLM
 from tokenspeed.runtime.utils import get_colorful_logger, is_pin_memory_available
+from tokenspeed.runtime.utils.startup_timing import startup_phase
 
 
 @contextmanager
@@ -116,8 +117,6 @@ def device_loading_context(
                     p.data = p.data.to(original_device)
         # New parameters or parameters already on target device are untouched
 
-
-from tokenspeed.runtime.utils.startup_timing import startup_phase
 
 logger = get_colorful_logger(__name__)
 
@@ -681,7 +680,7 @@ class DummyModelLoader(BaseModelLoader):
         device_config: DeviceConfig,
     ) -> nn.Module:
         with set_default_torch_dtype(model_config.dtype):
-            with torch.device(device_config.device):
+            with startup_phase("weights.allocate"), torch.device(device_config.device):
                 model = _initialize_model(
                     model_config,
                     self.load_config,
@@ -689,30 +688,35 @@ class DummyModelLoader(BaseModelLoader):
             # Post-processing can read integer weights, such as index tables,
             # and check scales that start as NaN, so they need valid values
             # before it runs.
-            initialize_dummy_integer_weights(model)
+            with startup_phase("weights.dummy_init"):
+                initialize_dummy_integer_weights(model)
+                # Absorbed projections, fused convolutions and packed scale layouts
+                # must derive from the values that forwards will actually read.
+                initialize_dummy_weights(model)
             # An EAGLE3 draft cannot share a vocab-sharded target embedding,
             # and its own dummy embedding is as valid as a loaded one.
             mark_initialized = getattr(model, "mark_embedding_initialized", None)
             if callable(mark_initialized):
                 mark_initialized()
-            if getattr(model, "post_load_weights", None):
-                model.post_load_weights()
+            with startup_phase("weights.postprocess"):
+                if getattr(model, "post_load_weights", None):
+                    model.post_load_weights()
 
-            for _, module in model.named_modules():
-                quant_method = getattr(module, "quant_method", None)
-                if quant_method is not None:
-                    quant_method.process_weights_after_loading(module)
-                process_method = getattr(module, "process_weights_after_loading", None)
-                if process_method is not None:
-                    module.process_weights_after_loading(module)
+                for _, module in model.named_modules():
+                    quant_method = getattr(module, "quant_method", None)
+                    if quant_method is not None:
+                        quant_method.process_weights_after_loading(module)
+                    process_method = getattr(
+                        module, "process_weights_after_loading", None
+                    )
+                    if process_method is not None:
+                        module.process_weights_after_loading(module)
 
             post_quant_warmup = getattr(model, "post_quant_warmup", None)
             if callable(post_quant_warmup):
-                post_quant_warmup()
+                with startup_phase("weights.post_quant_warmup"):
+                    post_quant_warmup()
 
-            #  For accurate performance evaluation, we assign
-            # random values to the weights.
-            initialize_dummy_weights(model)
         return model.eval()
 
 

@@ -197,7 +197,7 @@ def iris_pull_allgather_moe_inputs(
     )
 
 
-@gluon.jit(do_not_specialize=["rows"])
+@gluon.jit(do_not_specialize=["rows", "simulation_seed"])
 def iris_fused_lamport_allgather_rmsnorm_mxfp4_topk(
     local_input,
     weight,
@@ -213,6 +213,7 @@ def iris_fused_lamport_allgather_rmsnorm_mxfp4_topk(
     topk_ids,
     topk_weights,
     rows,
+    simulation_seed,
     rank: gl.constexpr,
     local_width: gl.constexpr,
     total_width: gl.constexpr,
@@ -224,6 +225,7 @@ def iris_fused_lamport_allgather_rmsnorm_mxfp4_topk(
     EXPERTS: gl.constexpr,
     TOPK: gl.constexpr,
     ROUTED_SCALING_FACTOR: gl.constexpr,
+    SIMULATE: gl.constexpr,
 ):
     """Gather, normalize and quantize the expert inputs, and route the same rows.
 
@@ -246,5 +248,5 @@ def iris_fused_lamport_allgather_rmsnorm_mxfp4_topk(
         sigmoid_bias_topk_row_gfx950(
             program - rows, logits, bias, topk_ids, topk_weights, EXPERTS, 1, 1,
             TOPK, 1, TOPK, 1, EXPERTS, TOPK, EXPERTS, TOPK, True,
-            ROUTED_SCALING_FACTOR, gl.float32, 1
+            ROUTED_SCALING_FACTOR, gl.float32, 1, simulation_seed, SIMULATE
         )  # fmt: skip

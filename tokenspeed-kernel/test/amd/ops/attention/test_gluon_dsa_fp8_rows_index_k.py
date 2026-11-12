@@ -191,6 +191,7 @@ def _decode(
         index_k_cache=plane,
         q_scales=q_scales,
         slot_order="selection",
+        simulation_seed=None,
     )
 
 
@@ -567,6 +568,7 @@ def test_fp8_pages_decode_cuda_graph_replays_changed_inputs() -> None:
             out=out,
             lens_out=lens_out,
             slot_order="selection",
+            simulation_seed=None,
         )
 
     invoke()

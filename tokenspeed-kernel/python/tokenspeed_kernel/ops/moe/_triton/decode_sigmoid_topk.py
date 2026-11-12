@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.moe._triton.simulation import permute_experts
 
 
 @triton.jit
@@ -34,7 +35,7 @@ def _float32_to_ordered_key(value):
     return bits ^ tl.where((bits & sign) != 0, full, sign)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["simulation_seed"])
 def _decode_sigmoid_bias_topk_kernel(
     logits,
     correction_bias,
@@ -47,6 +48,8 @@ def _decode_sigmoid_bias_topk_kernel(
     ROUTED_SCALING_FACTOR: tl.constexpr,
     NORMALIZE_TOPK_WEIGHTS: tl.constexpr,
     HAS_EXPERT_MAP: tl.constexpr,
+    simulation_seed,
+    SIMULATE: tl.constexpr,
 ):
     expert = tl.arange(0, PADDED_EXPERTS)
     valid = expert < NUM_EXPERTS
@@ -82,6 +85,11 @@ def _decode_sigmoid_bias_topk_kernel(
         selected_weights /= denominator
     selected_weights *= ROUTED_SCALING_FACTOR
 
+    if SIMULATE:
+        selected_ids = permute_experts(
+            selected_ids, tl.program_id(0), simulation_seed, NUM_EXPERTS
+        )
+
     offset = tl.arange(0, TOPK)
     output_ids = selected_ids
     if HAS_EXPERT_MAP:
@@ -99,6 +107,7 @@ def decode_sigmoid_bias_topk(
     normalize_topk_weights: bool,
     logical_to_physical_map: torch.Tensor | None = None,
     weights_dtype: torch.dtype = torch.float32,
+    simulation_seed: int | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Route one decode token using biased sigmoid scores.
 
@@ -170,6 +179,8 @@ def decode_sigmoid_bias_topk(
         ROUTED_SCALING_FACTOR=float(routed_scaling_factor),
         NORMALIZE_TOPK_WEIGHTS=normalize_topk_weights,
         HAS_EXPERT_MAP=logical_to_physical_map is not None,
+        simulation_seed=0 if simulation_seed is None else simulation_seed,
+        SIMULATE=simulation_seed is not None,
         num_warps=8,
         num_stages=1,
         waves_per_eu=1,

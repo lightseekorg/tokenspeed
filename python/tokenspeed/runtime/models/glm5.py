@@ -668,6 +668,10 @@ class GlmDsaSparseAttentionMixin:
         placement = ctx.attn_backend.cache_placement(self.attn_mqa)
         dcp_index = None
         capturing = False
+        if global_server_args_dict["simulate"] and placement is not None:
+            raise NotImplementedError(
+                "DSA simulation requires replicated index history"
+            )
         if placement is not None:
             if quantized is not None:
                 raise RuntimeError("the KV-parallel decode top-k scores BF16 queries")
@@ -744,6 +748,11 @@ class GlmDsaSparseAttentionMixin:
                 topk=topk,
                 softmax_scale=softmax_scale,
                 batch_invariant=False,
+                simulation_seed=(
+                    self.attn_mqa.layer_id
+                    if global_server_args_dict["simulate"]
+                    else None
+                ),
                 q_len_per_req=q_len_per_req,
                 index_k_cache=index_k_cache,
                 q_scales=q_scales,

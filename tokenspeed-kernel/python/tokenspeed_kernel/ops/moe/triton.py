@@ -212,6 +212,7 @@ def _invoke_packed(
     weights_dtype: torch.dtype,
     logical_to_physical_map: torch.Tensor | None = None,
     out: tuple[torch.Tensor, torch.Tensor] | None = None,
+    simulation_seed: int | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Launch the packed K3 specialist after layout/dtype adapters.
 
@@ -235,6 +236,7 @@ def _invoke_packed(
         weights_dtype=weights_dtype,
         enable_pdl=pdl_enabled(),
         out=out,
+        simulation_seed=simulation_seed,
     )
 
 
@@ -280,6 +282,7 @@ def triton_kimi3_packed_sigmoid_bias_topk_nvidia(
         normalize_topk_weights=normalize_topk_weights,
         weights_dtype=weights_dtype,
         out=out,
+        simulation_seed=None,
     )
 
 
@@ -324,6 +327,7 @@ def triton_kimi3_packed_sigmoid_bias_topk_nvidia_mapped(
         logical_to_physical_map=logical_to_physical_map,
         weights_dtype=weights_dtype,
         out=out,
+        simulation_seed=None,
     )
 
 
@@ -349,6 +353,7 @@ def triton_kimi3_packed_sigmoid_bias_topk_gfx950(
     routed_scaling_factor: float,
     normalize_topk_weights: bool,
     weights_dtype: torch.dtype,
+    simulation_seed: int | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return packed top-16 weights and ids for FP32 ``[tokens, 896]`` logits.
 
@@ -363,6 +368,7 @@ def triton_kimi3_packed_sigmoid_bias_topk_gfx950(
         routed_scaling_factor=routed_scaling_factor,
         normalize_topk_weights=normalize_topk_weights,
         weights_dtype=weights_dtype,
+        simulation_seed=simulation_seed,
     )
 
 
@@ -403,6 +409,7 @@ def triton_kimi3_packed_sigmoid_bias_topk_gfx1250(
         routed_scaling_factor=routed_scaling_factor,
         normalize_topk_weights=normalize_topk_weights,
         weights_dtype=weights_dtype,
+        simulation_seed=None,
     )
 
 
@@ -445,6 +452,7 @@ def triton_kimi3_packed_sigmoid_bias_topk_gfx1250_mapped(
         normalize_topk_weights=normalize_topk_weights,
         logical_to_physical_map=logical_to_physical_map,
         weights_dtype=weights_dtype,
+        simulation_seed=None,
     )
 
 
@@ -477,6 +485,7 @@ def triton_decode_sigmoid_bias_topk(
     routed_scaling_factor: float,
     normalize_topk_weights: bool,
     weights_dtype: torch.dtype = torch.float32,
+    simulation_seed: int | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return decode_sigmoid_bias_topk(
         router_logits,
@@ -485,6 +494,7 @@ def triton_decode_sigmoid_bias_topk(
         routed_scaling_factor=routed_scaling_factor,
         normalize_topk_weights=normalize_topk_weights,
         weights_dtype=weights_dtype,
+        simulation_seed=simulation_seed,
     )
 
 
@@ -511,6 +521,7 @@ def triton_decode_sigmoid_bias_topk_mapped(
     normalize_topk_weights: bool,
     logical_to_physical_map: torch.Tensor,
     weights_dtype: torch.dtype = torch.float32,
+    simulation_seed: int | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return decode_sigmoid_bias_topk(
         router_logits,
@@ -520,6 +531,7 @@ def triton_decode_sigmoid_bias_topk_mapped(
         normalize_topk_weights=normalize_topk_weights,
         logical_to_physical_map=logical_to_physical_map,
         weights_dtype=weights_dtype,
+        simulation_seed=simulation_seed,
     )
 
 

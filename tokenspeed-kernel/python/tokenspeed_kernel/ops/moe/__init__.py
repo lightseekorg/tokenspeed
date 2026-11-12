@@ -819,6 +819,25 @@ def _gluon_eligible(
     )
 
 
+def _simulation_kwargs(kernel_name: str, seed: int | None) -> dict:
+    supported = {
+        "gluon_sigmoid_bias_topk_gfx950",
+        "triton_kimi3_packed_sigmoid_bias_topk_gfx950",
+        "triton_decode_sigmoid_bias_topk",
+        "triton_decode_sigmoid_bias_topk_mapped",
+        "gluon_sqrt_softplus_topk_gfx950",
+        "gluon_router_sqrt_softplus_topk_gfx950",
+        "triton_sqrt_softplus_topk",
+    }
+    if kernel_name in supported:
+        return {"simulation_seed": seed}
+    if seed is not None:
+        raise NotImplementedError(
+            f"Final-writeback simulation is not implemented for {kernel_name}"
+        )
+    return {}
+
+
 def _moe_sigmoid_bias_topk(
     router_logits: torch.Tensor,
     correction_bias: torch.Tensor,
@@ -831,6 +850,7 @@ def _moe_sigmoid_bias_topk(
     override: str | None = None,
     solution: str | None = None,
     out: tuple[torch.Tensor, torch.Tensor] | None = None,
+    simulation_seed: int | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Select experts using ``sigmoid(logits) + correction_bias``.
 
@@ -871,8 +891,7 @@ def _moe_sigmoid_bias_topk(
         or not logical_to_physical_map.is_contiguous()
     ):
         raise ValueError(
-            "logical_to_physical_map must be contiguous colocated INT32/INT64 "
-            "[experts]"
+            "logical_to_physical_map must be contiguous colocated INT32/INT64 [experts]"
         )
     if not 0 < topk <= experts:
         raise ValueError(f"topk must be in [1, {experts}], got {topk}")
@@ -960,6 +979,7 @@ def _moe_sigmoid_bias_topk(
                 logical_to_physical_map=logical_to_physical_map,
                 weights_dtype=weights_dtype,
             )
+            kwargs.update(_simulation_kwargs(mapped_kernel.name, simulation_seed))
             if supports_output_buffers:
                 topk_weights, topk_ids = mapped_kernel(**kwargs, out=out)
             else:
@@ -988,6 +1008,7 @@ def _moe_sigmoid_bias_topk(
         normalize_topk_weights=normalize_topk_weights,
         weights_dtype=weights_dtype,
     )
+    kwargs.update(_simulation_kwargs(kernel.name, simulation_seed))
     if supports_output_buffers:
         topk_weights, topk_ids = kernel(**kwargs, out=out)
     else:
@@ -1112,6 +1133,8 @@ def moe_topk(
     hidden_states: torch.Tensor | None = None,
     gate_weight: torch.Tensor | None = None,
     out: tuple[torch.Tensor, torch.Tensor] | None = None,
+    *,
+    simulation_seed: int | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Produce expert weights and ids using a registered MoE TopK kernel.
 
@@ -1123,6 +1146,8 @@ def moe_topk(
     the unbiased scores. Hash routing uses the checkpoint table for expert ids.
 
     Args:
+        simulation_seed: Seed for a final expert-ID permutation, or None to keep
+            the calculated IDs. Scoring and top-k selection still run unchanged.
         router_logits: Router logits shaped [tokens, experts], or None when
             `hidden_states` and `gate_weight` are given.
         top_k: Number of experts selected for each token.
@@ -1183,6 +1208,8 @@ def moe_topk(
         )
     scaling_factor = 1.0 if routed_scaling_factor is None else routed_scaling_factor
     if score_function == "softmax":
+        if simulation_seed is not None:
+            raise NotImplementedError("Softmax routing simulation is not implemented")
         if selection_method != "topk":
             raise ValueError("softmax routing only supports topk selection")
         if correction_bias is not None:
@@ -1216,6 +1243,7 @@ def moe_topk(
             override=override,
             solution=solution,
             out=out,
+            simulation_seed=simulation_seed,
         )
         return topk_weights, topk_ids.to(topk_indices_dtype)
 
@@ -1296,6 +1324,7 @@ def moe_topk(
                 hash_indices_table,
                 input_ids,
                 scaling_factor,
+                **_simulation_kwargs(kernel.name, simulation_seed),
             )
             return topk_weights.to(topk_weights_dtype), topk_ids.to(topk_indices_dtype)
     traits = {
@@ -1373,6 +1402,7 @@ def moe_topk(
                 if topk_weights_dtype in (torch.float32, torch.bfloat16)
                 else torch.float32
             ),
+            **_simulation_kwargs(kernel.name, simulation_seed),
         )
         return topk_weights.to(topk_weights_dtype), topk_ids.to(topk_indices_dtype)
 

@@ -249,6 +249,8 @@ if platform.is_amd:
         need_scores: bool,
         routed_scaling_factor: float,
         weights_dtype: torch.dtype,
+        *,
+        simulation_seed: int | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         weights, ids, scores = _topk_impl(
             router_logits,
@@ -259,6 +261,7 @@ if platform.is_amd:
             input_ids,
             need_scores,
             routed_scaling_factor,
+            simulation_seed=simulation_seed,
         )
         return weights.to(weights_dtype), ids, scores
 
@@ -299,6 +302,8 @@ if platform.is_amd:
         hash_indices_table: torch.Tensor | None,
         input_ids: torch.Tensor | None,
         routed_scaling_factor: float,
+        *,
+        simulation_seed: int | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Split-K GEMV partials; the top-k kernel sums them in order.
         partials = launch_gluon_router_sqrt_softplus_topk_gemv_gfx950(
@@ -313,6 +318,7 @@ if platform.is_amd:
             input_ids,
             False,
             routed_scaling_factor,
+            simulation_seed=simulation_seed,
         )
         return weights, ids
 
@@ -474,6 +480,7 @@ if platform.is_amd:
         routed_scaling_factor: float,
         normalize_topk_weights: bool,
         weights_dtype: torch.dtype = torch.float32,
+        simulation_seed: int | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         decode_supported = router_logits.shape[0] * topk <= 128
         route = (
@@ -492,6 +499,7 @@ if platform.is_amd:
             topk,
             routed_scaling_factor=routed_scaling_factor,
             normalize_topk_weights=normalize_topk_weights,
+            simulation_seed=simulation_seed,
         )
         # The gluon route has no output-dtype argument to store through.
         return topk_weights.to(weights_dtype), topk_ids

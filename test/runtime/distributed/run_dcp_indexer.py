@@ -199,6 +199,7 @@ def main() -> None:
         plan=dsa_plan(page_size=64, seq_lens_2d=seq2d),
         solution="deep_gemm",
         slot_order="selection",
+        simulation_seed=None,
     )
     # Main's native indexer has no forced-window arguments. Compare its
     # unforced policy separately; the checks above exercise mandatory windows.
@@ -526,6 +527,7 @@ def main() -> None:
         plan=dsa_plan(page_size=64, seq_lens_2d=seq2d),
         solution="deep_gemm",
         slot_order="selection",
+        simulation_seed=None,
     )
     expected_slots = torch.where(
         single >= 0,

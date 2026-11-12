@@ -150,6 +150,7 @@ def _decode(
         q_len_per_req=q_len,
         index_k_cache=index_k,
         slot_order="selection",
+        simulation_seed=None,
     )
 
 
@@ -398,6 +399,7 @@ def test_bf16_plane_decode_cuda_graph_replays_changed_inputs() -> None:
             out=out,
             lens_out=lens_out,
             slot_order="selection",
+            simulation_seed=None,
         )
 
     invoke()
@@ -487,3 +489,43 @@ def test_bf16_plane_scorers_do_not_recompile_across_batches() -> None:
         ):
             prefill(prefix_lens, extend_lens)
     torch.cuda.synchronize()
+
+
+@pytest.mark.skipif(not is_cdna4(), reason="Simulation currently targets gfx950")
+def test_bf16_decode_simulation_reaches_selected_kernel():
+    generator = _generator(97)
+    q_len, heads = 4, 32
+    seq_lens, table = _paged_requests([73, 7003], num_pages=256, generator=generator)
+    index_k = _bf16((256 * _PAGE_SIZE, _HEAD_DIM), generator)
+    q = _bf16((2 * q_len, heads, _HEAD_DIM), generator)
+    weights = _weights(2 * q_len, heads, torch.float32, generator)
+    original, original_lengths = _decode(q, weights, seq_lens, table, index_k, q_len)
+    actual, lengths = dsa_ops.dsa_decode_topk(
+        q,
+        weights,
+        seq_lens,
+        table,
+        page_size=_PAGE_SIZE,
+        topk=_TOPK,
+        softmax_scale=_SOFTMAX_SCALE,
+        batch_invariant=False,
+        q_len_per_req=q_len,
+        index_k_cache=index_k,
+        slot_order="selection",
+        simulation_seed=17,
+    )
+    assert torch.equal(lengths, original_lengths)
+    assert not torch.equal(actual[-1].sort().values, original[-1].sort().values)
+    for row in range(2 * q_len):
+        req, offset = divmod(row, q_len)
+        visible = int(seq_lens[req]) - q_len + 1 + offset
+        positions = torch.arange(visible, device=_DEVICE)
+        valid_slots = (
+            table[req, positions // _PAGE_SIZE].long() * _PAGE_SIZE
+            + positions % _PAGE_SIZE
+        )
+        count = int(lengths[row])
+        selected = actual[row, :count].long()
+        assert selected.unique().numel() == count
+        assert torch.isin(selected, valid_slots).all()
+        assert actual[row, count:].eq(-1).all()

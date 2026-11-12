@@ -391,6 +391,7 @@ class Dots3NoteAttention(nn.Module):
             seq_lens_2d=meta._dsa_seq_lens_2d[num_extends * q_len :],
             plan=meta._dsa_plan,
             slot_order=global_server_args_dict["dsa_slot_order"],
+            simulation_seed=None,
         )
 
     @break_point

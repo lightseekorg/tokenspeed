@@ -2391,6 +2391,7 @@ class KimiLinearMoE(nn.Module):
         # backend family alone is too coarse (TRT-LLM has both kernel-routing
         # MXFP4 SiTU and precomputed-TopK NVFP4 SiTU implementations).
         self.topk = TopK(
+            layer_id=layer_index,
             top_k=self.top_k,
             renormalize=config.moe_renormalize,
             use_grouped_topk=config.use_grouped_topk,
@@ -4912,6 +4913,12 @@ class KimiLinearForCausalLM(BaseCausalLM):
         group = pg_manager.get_device_process_group(self.mapping.moe.tp_ep_group)
         if not multicast_backend_available(group):
             return False
+        if args["simulate"]:
+            # This chain selects experts internally, without the seeded
+            # final-writeback contract. Do not silently select another path.
+            raise NotImplementedError(
+                "CuTe decode-chain routing does not implement final-writeback simulation"
+            )
         from tokenspeed_kernel.ops.moe._cute_dsl.k3_decode import KimiK3DecodeMoE
 
         decoders = [

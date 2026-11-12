@@ -76,6 +76,7 @@ def test_deep_gemm_block_verify_matches_expanded_queries(width):
             ),
             solution="deep_gemm",
             slot_order="selection",
+            simulation_seed=None,
         )
 
     def check(actual, expected):

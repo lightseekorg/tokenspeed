@@ -23,6 +23,7 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
+from functools import partial
 
 import pytest
 import torch
@@ -62,6 +63,8 @@ if is_cdna4():
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (  # noqa: E402
         launch_gluon_dsa_decode_topk_fp8_gfx950 as gluon_dsa_decode_topk_fp8,
     )
+
+    gluon_dsa_decode_topk_fp8 = partial(gluon_dsa_decode_topk_fp8, simulation_seed=None)
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (
         launch_gluon_dsa_prefill_topk_fp8_gfx950 as gluon_dsa_prefill_topk_fp8,
     )
@@ -873,6 +876,7 @@ def test_dsa_prefill_topk_keeps_late_values_above_threshold() -> None:
         topk=topk,
         out=out,
         lens_out=lens_out,
+        **({"simulation_seed": None} if is_cdna4() else {}),
     )
 
     selected_set = set(out[0].cpu().tolist())
@@ -910,6 +914,7 @@ def test_dsa_prefill_topk_selects_largest_values_on_ragged_rows(cols: int) -> No
         topk=topk,
         out=out,
         lens_out=lens_out,
+        **({"simulation_seed": None} if is_cdna4() else {}),
     )
 
     torch.testing.assert_close(
@@ -966,6 +971,7 @@ def test_dsa_decode_topk_keeps_late_values_above_threshold() -> None:
         topk=topk,
         out=out,
         lens_out=lens_out,
+        **({"simulation_seed": None} if is_cdna4() else {}),
     )
 
     selected_set = set(out[0].cpu().tolist())
@@ -1018,6 +1024,7 @@ def test_dsa_decode_topk_orders_keys_sharing_the_threshold_prefix(
         topk=topk,
         out=out,
         lens_out=lens_out,
+        **({"simulation_seed": None} if is_cdna4() else {}),
     )
 
     selected = out[0].long()
@@ -1094,6 +1101,7 @@ def test_dsa_decode_topk_selects_largest_values_on_ragged_rows(
             q_len_per_req=q_len_per_req,
             out=out,
             lens_out=lens_out,
+            **({"simulation_seed": None} if is_cdna4() else {}),
         )
         torch.testing.assert_close(
             lens_out.cpu(),
@@ -1252,6 +1260,7 @@ def test_dsa_decode_topk_multi_cta_selects_the_one_block_set(
         q_len_per_req=q_len_per_req,
         out=out,
         lens_out=lens_out,
+        **({"simulation_seed": None} if is_cdna4() else {}),
     )
     selections = _check_decode_topk_selection(
         logits, row_lens, out, lens_out, logical_page, q_len_per_req, page_size, topk
@@ -1272,6 +1281,7 @@ def test_dsa_decode_topk_multi_cta_selects_the_one_block_set(
         plan=dsa_topk_backend._oneblock_launch_plan(cols, is_decode=True),
         out=oneblock_out,
         lens_out=oneblock_lens,
+        **({"simulation_seed": None} if is_cdna4() else {}),
     )
     oneblock_selections = _check_decode_topk_selection(
         logits,
@@ -1325,6 +1335,7 @@ def test_dsa_decode_topk_multi_cta_reuses_its_kernels_across_batches() -> None:
                 q_len_per_req=4,
                 out=out,
                 lens_out=lens_out,
+                **({"simulation_seed": None} if is_cdna4() else {}),
             )
             _check_decode_topk_selection(
                 logits,
@@ -1386,6 +1397,7 @@ def test_dsa_decode_topk_short_logits_select_largest_values(
         q_len_per_req=q_len_per_req,
         out=out,
         lens_out=lens_out,
+        **({"simulation_seed": None} if is_cdna4() else {}),
     )
     _check_decode_topk_selection(
         logits,
@@ -2795,3 +2807,128 @@ def test_dsa_glm52_selected_attention_cases(case: _DSACase) -> None:
     assert out.shape == (tokens, case.num_heads, case.kv_lora_rank)
     assert out.dtype == torch.bfloat16
     torch.testing.assert_close(out.float(), ref.float(), rtol=8e-2, atol=8e-2)
+
+
+@pytest.mark.skipif(not is_cdna4(), reason="Simulation currently targets gfx950")
+@pytest.mark.parametrize(
+    "batch,width,capacity,persistent",
+    [
+        (2, 1, 2048, False),
+        (4, 6, 8192, False),
+        (4, 6, 65536, False),
+        (1, 1, 250048, False),
+        (32, 6, 131072, False),
+        (4, 1, 131072, True),
+    ],
+)
+@pytest.mark.parametrize("tied", [False, True])
+def test_simulated_sparse_selection_preserves_causal_unique_physical_slots(
+    batch,
+    width,
+    capacity,
+    persistent,
+    tied,
+):
+    page_size, topk = 64, 2048
+    pages = capacity // page_size
+    generator = torch.Generator(device="cuda").manual_seed(13)
+    table = (
+        (torch.randperm(batch * pages, device="cuda", generator=generator) + 1)
+        .to(torch.int32)
+        .view(batch, pages)
+    )
+    inverse = torch.empty(batch * pages + 1, device="cuda", dtype=torch.int64)
+    inverse[table.flatten().long()] = torch.arange(batch * pages, device="cuda")
+    lengths = torch.full((batch,), capacity - 13, dtype=torch.int32, device="cuda")
+    if batch > 1:
+        lengths[0] = 0
+        lengths[1] = min(capacity, topk + 3)
+    rows = batch * width
+    row_start = torch.zeros(rows, device="cuda", dtype=torch.int32)
+    logits = torch.randn(rows, capacity, device="cuda", generator=generator)
+    if tied:
+        logits.zero_()
+    out = torch.empty(rows, topk, device="cuda", dtype=torch.int32)
+    selected_lengths = torch.empty(rows, device="cuda", dtype=torch.int32)
+    workspace = (
+        dsa_topk_backend._persistent_topk_workspace(rows, logits.device)
+        if persistent
+        else None
+    )
+
+    def run(seed):
+        if persistent:
+            dsa_topk_backend._dsa_persistent_radix_topk(
+                logits,
+                row_start,
+                lengths,
+                topk=topk,
+                groups=4,
+                block_n=8192,
+                workspace=workspace,
+                out=out,
+                lens_out=selected_lengths,
+                block_table=table,
+                page_size=page_size,
+                q_len_per_req=width,
+                is_decode=True,
+                simulation_seed=seed,
+            )
+        else:
+            dsa_topk_backend._dsa_topk_indices(
+                logits,
+                row_start,
+                lengths,
+                topk=topk,
+                out=out,
+                lens_out=selected_lengths,
+                block_table=table,
+                page_size=page_size,
+                q_len_per_req=width,
+                simulation_seed=seed,
+            )
+
+    def check():
+        for row in range(rows):
+            req, offset = divmod(row, width)
+            visible = max(0, int(lengths[req]) - width + 1 + offset)
+            count = min(visible, topk)
+            assert int(selected_lengths[row]) == count
+            picked = out[row, :count].long()
+            assert torch.all(picked >= page_size)
+            assert torch.all(picked < (batch * pages + 1) * page_size)
+            logical_page = inverse[picked // page_size]
+            assert torch.all(logical_page // pages == req)
+            logical = (logical_page % pages) * page_size + picked % page_size
+            assert logical.unique().numel() == count
+            assert torch.all((logical >= 0) & (logical < visible))
+            assert out[row, count:].eq(-1).all()
+            # Every nontrivial selection covers the full causal prefix, one
+            # point per stratum, regardless of the original scores or ties.
+            if visible > topk:
+                rank = torch.arange(count, device="cuda")
+                assert torch.all(logical >= rank * visible // count)
+                assert torch.all(logical < (rank + 1) * visible // count)
+
+    run(17)
+    check()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run(17)
+    out.fill_(-99)
+    graph.replay()
+    check()
+    # Multi-CTA completion order can permute the original selected IDs, so
+    # fixed seeds promise geometry, not byte-identical replay across schedules.
+    from contextlib import ExitStack
+
+    with ExitStack() as stack:
+        for kernel in (
+            dsa_topk_backend._dsa_trivial_topk_kernel,
+            dsa_topk_backend._dsa_oneblock_manual_radix_topk_kernel,
+            dsa_topk_backend._dsa_multi_cta_select_kernel,
+            dsa_topk_backend._dsa_persistent_radix_topk_kernel,
+        ):
+            stack.enter_context(assert_no_triton_compile(kernel))
+        run(19)
+    check()

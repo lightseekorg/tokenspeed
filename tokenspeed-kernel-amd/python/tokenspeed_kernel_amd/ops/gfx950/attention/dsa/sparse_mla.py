@@ -34,6 +34,7 @@ from tokenspeed_kernel_amd._extern import (
     wave_inclusive_sum_i32,
 )
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
+from tokenspeed_kernel_amd.ops.gfx950.attention._simulation import stratified_index
 from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.indexing import (
     _check_packed_fp8_inputs,
     gluon_dsa_decode_topk_fp8_gfx950,
@@ -280,6 +281,7 @@ def _persistent_row_metadata(
 @gluon.jit(
     do_not_specialize=(
         "logits_stride",
+        "simulation_seed",
         "block_table_cols",
     ),
 )
@@ -298,6 +300,8 @@ def _dsa_persistent_radix_topk_kernel(
     logits_stride,
     out_stride: gl.constexpr,
     block_table_cols,
+    simulation_seed,
+    SIMULATE: gl.constexpr,
     page_size: gl.constexpr,
     q_len_per_req: gl.constexpr,
     IS_DECODE: gl.constexpr,
@@ -323,6 +327,18 @@ def _dsa_persistent_radix_topk_kernel(
         IS_DECODE,
     )
     row_len = row_end - row_start
+    gl.static_assert(not SIMULATE or IS_DECODE)
+    simulation = (
+        SIMULATE,
+        simulation_seed,
+        req,
+        row,
+        row_len,
+        TOPK,
+        block_table,
+        block_table_cols,
+        page_size,
+    )
     selected_count = gl.minimum(row_len, TOPK)
     if group == 0:
         gl.store(lens_out + row, selected_count)
@@ -655,6 +671,12 @@ def _dsa_persistent_radix_topk_kernel(
             other=0,
         )
         equal_values = equal_page * page_size + equal_values % page_size
+    greater_values = _simulated_slots(
+        greater_values, greater_positions, greater_write, simulation
+    )
+    equal_values = _simulated_slots(
+        equal_values, TOPK - 1 - equal_positions, equal_write, simulation
+    )
     gl.store(
         out + row * out_stride + greater_positions,
         greater_values,
@@ -810,6 +832,22 @@ def _physical_slots(block_table, req, block_table_cols, logical, mask, page_size
         other=0,
     ).to(gl.int32)
     return page * page_size + (logical - block_idx * page_size)
+
+
+@gluon.jit
+def _simulated_slots(original, output_rank, live, simulation):
+    if simulation[0]:
+        _, seed, req, row, extent, count, table, table_cols, page_size = simulation
+        logical = stratified_index(original, output_rank, count, extent, row, seed)
+        # Widen the request-table offset before multiplication at long contexts.
+        page_index = logical // page_size
+        page = gl.load(
+            table + req.to(gl.int64) * table_cols + page_index,
+            mask=live & (page_index >= 0) & (page_index < table_cols),
+            other=0,
+        ).to(gl.int32)
+        return page * page_size + logical % page_size
+    return original
 
 
 @gluon.constexpr_function
@@ -1022,6 +1060,7 @@ def _emit_multi_cta_listed(
     shared_tie_keys,
     shared_tie_slots,
     row_out,
+    simulation,
     SHIFT: gl.constexpr,
     TIES: gl.constexpr,
 ):
@@ -1035,12 +1074,22 @@ def _emit_multi_cta_listed(
     below_ranks = ranks & 0xFFFF
     equal_ranks = equal_start + (ranks >> 16)
     if TIES:
-        gl.amd.cdna4.buffer_store(slots, row_out, below_start + below_ranks, mask=below)
+        gl.amd.cdna4.buffer_store(
+            _simulated_slots(slots, below_start + below_ranks, below, simulation),
+            row_out,
+            below_start + below_ranks,
+            mask=below,
+        )
         shared_tie_keys.atomic_scatter_xchg(keys, equal_ranks, axis=0, mask=equal)
         shared_tie_slots.atomic_scatter_xchg(slots, equal_ranks, axis=0, mask=equal)
     else:
         gl.amd.cdna4.buffer_store(
-            slots,
+            _simulated_slots(
+                slots,
+                gl.where(below, below_start + below_ranks, equal_ranks),
+                below | (equal & (equal_ranks < equal_needed)),
+                simulation,
+            ),
             row_out,
             gl.where(below, below_start + below_ranks, equal_ranks),
             mask=below | (equal & (equal_ranks < equal_needed)),
@@ -1061,6 +1110,7 @@ def _visit_multi_cta_listed(
     equal_start,
     equal_needed,
     row_out,
+    simulation,
     PHASE: gl.constexpr,
     NUM_BUCKETS: gl.constexpr,
 ):
@@ -1089,6 +1139,7 @@ def _visit_multi_cta_listed(
             shared_tie_keys,
             shared_tie_slots,
             row_out,
+            simulation,
             8 if PHASE == 3 else 0,
             PHASE == 3,
         )
@@ -1202,6 +1253,7 @@ def _visit_spilled_listed(
     equal_start,
     equal_needed,
     row_out,
+    simulation,
     gather_layout: gl.constexpr,
     PHASE: gl.constexpr,
     TILE_GROUP: gl.constexpr,
@@ -1255,6 +1307,7 @@ def _visit_spilled_listed(
                 equal_start,
                 equal_needed,
                 row_out,
+                simulation,
                 PHASE,
                 NUM_BUCKETS,
             )
@@ -1273,6 +1326,7 @@ def _rank_multi_cta_ties(
     out_start,
     needed,
     row_out,
+    simulation,
     TIE_CAP: gl.constexpr,
 ):
     # Rank tied keys by key, then buffer position, and emit the `needed` lowest.
@@ -1291,7 +1345,12 @@ def _rank_multi_cta_ties(
     )
     rank = gl.sum(ranked_before.to(gl.int32), axis=1)
     gl.amd.cdna4.buffer_store(
-        shared_tie_slots.load(gl.SliceLayout(1, tie_layout)),
+        _simulated_slots(
+            shared_tie_slots.load(gl.SliceLayout(1, tie_layout)),
+            out_start + rank,
+            (own < tie_count) & (rank < needed),
+            simulation,
+        ),
         row_out,
         out_start + rank,
         mask=(own < tie_count) & (rank < needed),
@@ -1301,6 +1360,7 @@ def _rank_multi_cta_ties(
 @gluon.jit(
     do_not_specialize=(
         "logits_stride",
+        "simulation_seed",
         "candidate_stride",
         "overflow_stride",
         "counts_stride",
@@ -1326,6 +1386,8 @@ def _dsa_multi_cta_select_kernel(
     counts_stride,
     out_stride: gl.constexpr,
     block_table_cols,
+    simulation_seed,
+    SIMULATE: gl.constexpr,
     page_size: gl.constexpr,
     topk: gl.constexpr,
     q_len_per_req: gl.constexpr,
@@ -1346,6 +1408,17 @@ def _dsa_multi_cta_select_kernel(
     row = gl.program_id(0)
     tile = gl.program_id(1)
     req, candidate_len = _multi_cta_decode_row(row, row_ends, q_len_per_req)
+    simulation = (
+        SIMULATE,
+        simulation_seed,
+        req,
+        row,
+        candidate_len,
+        topk,
+        block_table,
+        block_table_cols,
+        page_size,
+    )
     if tile == 0:
         gl.store(lens_out + row, gl.minimum(candidate_len, topk))
     output_layout: gl.constexpr = _vector_layout(
@@ -1464,7 +1537,10 @@ def _dsa_multi_cta_select_kernel(
         row_arrival, 1 + ((totals & 0xFFFF) << 12), sem="relaxed", scope="gpu"
     )
     gl.amd.cdna4.buffer_store(
-        slots, row_out, (arrived >> 12) + (ranks & 0xFFFF), mask=winner
+        _simulated_slots(slots, (arrived >> 12) + (ranks & 0xFFFF), winner, simulation),
+        row_out,
+        (arrived >> 12) + (ranks & 0xFFFF),
+        mask=winner,
     )
     if (arrived & 0xFFF) != num_tiles - 1:
         return
@@ -1521,6 +1597,7 @@ def _dsa_multi_cta_select_kernel(
         0,
         0,
         row_out,
+        simulation,
         gather_layout,
         0,
         TILE_GROUP,
@@ -1545,6 +1622,7 @@ def _dsa_multi_cta_select_kernel(
             shared_tie_keys,
             shared_tie_slots,
             row_out,
+            simulation,
             8,
             True,
         )
@@ -1565,6 +1643,7 @@ def _dsa_multi_cta_select_kernel(
                 equal_count,
                 0,
                 row_out,
+                simulation,
                 gather_layout,
                 3,
                 TILE_GROUP,
@@ -1578,6 +1657,7 @@ def _dsa_multi_cta_select_kernel(
             topk - remaining,
             remaining,
             row_out,
+            simulation,
             TIE_CAP,
         )
     else:
@@ -1603,6 +1683,7 @@ def _dsa_multi_cta_select_kernel(
             0,
             0,
             row_out,
+            simulation,
             gather_layout,
             1,
             TILE_GROUP,
@@ -1626,6 +1707,7 @@ def _dsa_multi_cta_select_kernel(
             shared_tie_keys,
             shared_tie_slots,
             row_out,
+            simulation,
             0,
             False,
         )
@@ -1646,6 +1728,7 @@ def _dsa_multi_cta_select_kernel(
                 topk - remaining + equal_count,
                 topk,
                 row_out,
+                simulation,
                 gather_layout,
                 2,
                 TILE_GROUP,
@@ -2078,6 +2161,7 @@ def _emit_compact_final_topk(
 @gluon.jit(
     do_not_specialize=(
         "logits_stride",
+        "simulation_seed",
         "block_table_cols",
     ),
 )
@@ -2091,6 +2175,8 @@ def _dsa_oneblock_manual_radix_topk_kernel(
     logits_stride,
     out_stride: gl.constexpr,
     block_table_cols,
+    simulation_seed,
+    SIMULATE: gl.constexpr,
     page_size: gl.constexpr,
     topk: gl.constexpr,
     q_len_per_req: gl.constexpr,
@@ -2214,6 +2300,18 @@ def _dsa_oneblock_manual_radix_topk_kernel(
         candidate_end = gl.load(row_ends + row).to(gl.int32)
 
     candidate_len = gl.maximum(candidate_end - candidate_start, 0)
+    gl.static_assert(not SIMULATE or IS_DECODE)
+    simulation = (
+        SIMULATE,
+        simulation_seed,
+        req,
+        row,
+        candidate_len,
+        topk,
+        block_table,
+        block_table_cols,
+        page_size,
+    )
     selected_count = gl.minimum(candidate_len, topk).to(gl.int32)
     output_offsets = gl.arange(0, topk, layout=output_layout)
     gl.store(lens_out + row, selected_count)
@@ -2534,7 +2632,12 @@ def _dsa_oneblock_manual_radix_topk_kernel(
                     ).to(gl.int32)
                     gl.store(
                         out + row * out_stride + output_offsets,
-                        page * page_size + block_offset,
+                        _simulated_slots(
+                            page * page_size + block_offset,
+                            output_offsets,
+                            output_offsets < selected_count,
+                            simulation,
+                        ),
                     )
                     return
             if pass1_complete:
@@ -2595,7 +2698,12 @@ def _dsa_oneblock_manual_radix_topk_kernel(
                     ).to(gl.int32)
                     gl.store(
                         out + row * out_stride + output_offsets,
-                        page * page_size + block_offset,
+                        _simulated_slots(
+                            page * page_size + block_offset,
+                            output_offsets,
+                            output_offsets < selected_count,
+                            simulation,
+                        ),
                     )
                 return
         if USE_COMPACT_FINAL and pass_index == 1:
@@ -2676,7 +2784,12 @@ def _dsa_oneblock_manual_radix_topk_kernel(
         ).to(gl.int32)
         gl.store(
             out + row * out_stride + output_offsets,
-            page * page_size + block_offset,
+            _simulated_slots(
+                page * page_size + block_offset,
+                output_offsets,
+                output_offsets < selected_count,
+                simulation,
+            ),
         )
 
 
@@ -2973,6 +3086,7 @@ def _dsa_persistent_radix_topk(
     row_starts: torch.Tensor,
     row_ends: torch.Tensor,
     *,
+    simulation_seed: int | None,
     topk: int,
     groups: int,
     block_n: int,
@@ -3006,6 +3120,8 @@ def _dsa_persistent_radix_topk(
         logits.stride(0),
         out.stride(0),
         block_table_cols=block_table_cols,
+        simulation_seed=0 if simulation_seed is None else simulation_seed,
+        SIMULATE=simulation_seed is not None,
         page_size=page_size,
         q_len_per_req=q_len_per_req,
         IS_DECODE=is_decode,
@@ -3023,6 +3139,7 @@ def _dsa_multi_cta_topk(
     block_table: torch.Tensor,
     row_ends: torch.Tensor,
     *,
+    simulation_seed: int | None,
     page_size: int,
     topk: int,
     q_len_per_req: int,
@@ -3079,6 +3196,8 @@ def _dsa_multi_cta_topk(
         tile_counts.stride(0),
         out.stride(0),
         block_table.shape[1],
+        simulation_seed=0 if simulation_seed is None else simulation_seed,
+        SIMULATE=simulation_seed is not None,
         page_size=int(page_size),
         topk=topk,
         q_len_per_req=q_len_per_req,
@@ -3101,6 +3220,7 @@ def _dsa_oneblock_topk_indices(
     row_starts: torch.Tensor,
     row_ends: torch.Tensor,
     *,
+    simulation_seed: int | None,
     block_table_cols: int,
     page_size: int,
     topk: int,
@@ -3131,6 +3251,8 @@ def _dsa_oneblock_topk_indices(
         logits.stride(0),
         out.stride(0),
         block_table_cols,
+        simulation_seed=0 if simulation_seed is None else simulation_seed,
+        SIMULATE=simulation_seed is not None,
         page_size=int(page_size),
         topk=topk,
         q_len_per_req=q_len_per_req,
@@ -3164,6 +3286,7 @@ def _dsa_topk_indices(
     row_starts: torch.Tensor,
     row_ends: torch.Tensor,
     *,
+    simulation_seed: int | None,
     topk: int,
     out: torch.Tensor,
     lens_out: torch.Tensor,
@@ -3171,6 +3294,8 @@ def _dsa_topk_indices(
     page_size: int = 1,
     q_len_per_req: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if simulation_seed is not None and block_table is None:
+        raise ValueError("DSA selection simulation requires a paged decode history")
     if block_table is None:
         is_decode = False
         block_table = row_starts
@@ -3218,6 +3343,7 @@ def _dsa_topk_indices(
             block_n=plan.block_n,
             out=out,
             lens_out=lens_out,
+            simulation_seed=simulation_seed,
         )
 
     if plan.kind == "persistent-homogeneous":
@@ -3236,6 +3362,7 @@ def _dsa_topk_indices(
             page_size=page_size,
             q_len_per_req=q_len_per_req,
             is_decode=is_decode,
+            simulation_seed=simulation_seed,
         )
 
     return _dsa_oneblock_topk_indices(
@@ -3251,6 +3378,7 @@ def _dsa_topk_indices(
         plan=plan,
         out=out,
         lens_out=lens_out,
+        simulation_seed=simulation_seed,
     )
 
 
@@ -3347,6 +3475,7 @@ def gluon_dsa_logical_topk_gfx950(
         topk=topk,
         out=out,
         lens_out=lens_out,
+        simulation_seed=None,
     )
 
 
@@ -3764,6 +3893,7 @@ def launch_gluon_dsa_decode_topk_fp8_gfx950(
     seq_lens: torch.Tensor,
     block_table: torch.Tensor,
     *,
+    simulation_seed: int | None,
     page_size: int,
     topk: int,
     softmax_scale: float,
@@ -3866,6 +3996,7 @@ def launch_gluon_dsa_decode_topk_fp8_gfx950(
         q_len_per_req=q_len_per_req,
         out=out,
         lens_out=lens_out,
+        simulation_seed=simulation_seed,
     )
 
 
@@ -3981,6 +4112,7 @@ def launch_gluon_dsa_prefill_topk_fp8_gfx950(
             topk=topk,
             out=out[start:end],
             lens_out=lens_out[start:end],
+            simulation_seed=None,
         )
     return out, lens_out
 
@@ -4158,6 +4290,7 @@ def launch_gluon_dsa_decode_topk_standard_gfx950(
     seq_lens: torch.Tensor,
     block_table: torch.Tensor,
     *,
+    simulation_seed: int | None,
     page_size: int,
     topk: int,
     softmax_scale: float,
@@ -4255,6 +4388,7 @@ def launch_gluon_dsa_decode_topk_standard_gfx950(
         q_len_per_req=q_len_per_req,
         out=out,
         lens_out=lens_out,
+        simulation_seed=simulation_seed,
     )
 
 
@@ -4355,6 +4489,7 @@ def launch_gluon_dsa_prefill_topk_standard_gfx950(
             topk=topk,
             out=out[start:end],
             lens_out=lens_out[start:end],
+            simulation_seed=None,
         )
     return out, lens_out
 
@@ -4365,6 +4500,7 @@ def launch_gluon_dsa_decode_topk_bf16_gfx950(
     seq_lens: torch.Tensor,
     block_table: torch.Tensor,
     *,
+    simulation_seed: int | None,
     page_size: int,
     topk: int,
     softmax_scale: float,
@@ -4479,6 +4615,7 @@ def launch_gluon_dsa_decode_topk_bf16_gfx950(
         q_len_per_req=q_len_per_req,
         out=out,
         lens_out=lens_out,
+        simulation_seed=simulation_seed,
     )
 
 
@@ -4591,6 +4728,7 @@ def launch_gluon_dsa_prefill_topk_bf16_gfx950(
             topk=topk,
             out=out[start:end],
             lens_out=lens_out[start:end],
+            simulation_seed=None,
         )
     return out, lens_out
 
@@ -4636,6 +4774,7 @@ def launch_gluon_dsa_decode_topk_fp8_rows_gfx950(
     seq_lens: torch.Tensor,
     block_table: torch.Tensor,
     *,
+    simulation_seed: int | None,
     page_size: int,
     topk: int,
     softmax_scale: float,
@@ -4748,6 +4887,7 @@ def launch_gluon_dsa_decode_topk_fp8_rows_gfx950(
         q_len_per_req=q_len_per_req,
         out=out,
         lens_out=lens_out,
+        simulation_seed=simulation_seed,
     )
 
 
@@ -4860,5 +5000,6 @@ def launch_gluon_dsa_prefill_topk_fp8_rows_gfx950(
             topk=topk,
             out=out[start:end],
             lens_out=lens_out[start:end],
+            simulation_seed=None,
         )
     return out, lens_out

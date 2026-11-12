@@ -2370,6 +2370,7 @@ def _attention_dsv41_index_topk(
         process_group,
         None,
         None,
+        simulation_seed=None,
     )
 
 
@@ -2390,6 +2391,7 @@ def _attention_dsa_decode_topk(*, weights_dtype: torch.dtype = torch.float32) ->
         batch_invariant=False,
         index_k_cache=index_k,
         slot_order="selection",
+        simulation_seed=None,
     )
 
 
@@ -2412,6 +2414,7 @@ def _attention_dsa_decode_topk_logical() -> object:
         topk_layout="logical_offsets",
         block_table_base_offsets=torch.tensor([3, 5], dtype=torch.int32),
         slot_order="selection",
+        simulation_seed=None,
     )
 
 
@@ -2528,6 +2531,7 @@ def _attention_dsa_decode_topk_standard(
         index_k_cache=index_k_cache,
         q_scales=q_scales,
         slot_order="selection",
+        simulation_seed=None,
     )
 
 
@@ -2577,6 +2581,7 @@ def _attention_dsa_decode_topk_bf16_plane(
         batch_invariant=False,
         index_k_cache=torch.zeros((128, 128), dtype=torch.bfloat16),
         slot_order="selection",
+        simulation_seed=None,
     )
 
 
@@ -2640,6 +2645,7 @@ def test_dsa_topk_selection_receives_index_heads(
             batch_invariant=False,
             index_k_cache=index_k_cache,
             slot_order="selection",
+            simulation_seed=None,
         )
     else:
         _attention_dsa_pkg.dsa_prefill_topk(
@@ -2912,6 +2918,7 @@ def test_dsa_topk_selection_receives_cache_layout(
             batch_invariant=False,
             index_k_cache=cache,
             slot_order="selection",
+            simulation_seed=None,
         )
     else:
         _attention_dsa_pkg.dsa_prefill_topk(
@@ -4847,6 +4854,7 @@ def _moe_topk_bias(tokens: int) -> object:
         renormalize=True,
         routed_scaling_factor=1.0,
         correction_bias=correction_bias,
+        simulation_seed=None,
     )
 
 
@@ -4863,6 +4871,7 @@ def _moe_topk_hash() -> object:
         routed_scaling_factor=1.0,
         hash_indices_table=hash_indices_table,
         input_ids=input_ids,
+        simulation_seed=None,
     )
 
 

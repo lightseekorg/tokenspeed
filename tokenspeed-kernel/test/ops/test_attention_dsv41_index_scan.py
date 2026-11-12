@@ -153,6 +153,7 @@ def test_index_scan_capacity_launches_and_scratch(device):
                 None,
                 None,
                 solution="triton",
+                simulation_seed=None,
             )
             return full + dsv41.index_topk(
                 q,
@@ -169,6 +170,7 @@ def test_index_scan_capacity_launches_and_scratch(device):
                 None,
                 None,
                 solution="triton",
+                simulation_seed=None,
             )
 
         run()
@@ -272,6 +274,7 @@ def run_index_scan_graph_oracle(
                 group,
                 None,
                 solution=solution,
+                simulation_seed=None,
             )
             return full + dsv41.index_topk(
                 local_q,
@@ -288,6 +291,7 @@ def run_index_scan_graph_oracle(
                 group,
                 None,
                 solution=solution,
+                simulation_seed=None,
             )
 
         stream = torch.cuda.Stream()
@@ -400,7 +404,7 @@ def run_index_topk_full_and_reindex(
         out=None,
         solution=solution,
     )
-    got = dsv41.index_topk(**kwargs)
+    got = dsv41.index_topk(**kwargs, simulation_seed=None)
     if match_triton:
         want = implementation.index_topk(
             q,
@@ -439,7 +443,7 @@ def run_index_topk_full_and_reindex(
     if candidate_topk:
         kwargs["candidate_blocks"] = got[2]
         kwargs["candidate_topk"] = 0
-        reindex = dsv41.index_topk(**kwargs)
+        reindex = dsv41.index_topk(**kwargs, simulation_seed=None)
         if match_triton:
             want_reindex = implementation.index_topk(
                 q,
@@ -509,7 +513,21 @@ def test_native_indexer_page_contract_and_graph_lengths(device):
 
     def run():
         return dsv41.index_topk(
-            q, weights, cache, table, visible, None, 16, 32, 8, 1, 64, None, None, None
+            q,
+            weights,
+            cache,
+            table,
+            visible,
+            None,
+            16,
+            32,
+            8,
+            1,
+            64,
+            None,
+            None,
+            None,
+            simulation_seed=None,
         )
 
     output = run()
@@ -529,7 +547,21 @@ def test_native_indexer_page_contract_and_graph_lengths(device):
     strided = torch.zeros((3, 64, 136), device=device, dtype=torch.uint8)[..., ::2]
     dsv41.cache_scatter(keys, strided, torch.arange(192, device=device), "index")
     result = dsv41.index_topk(
-        q, weights, strided, table, visible, None, 16, 0, 8, 1, 64, None, None, None
+        q,
+        weights,
+        strided,
+        table,
+        visible,
+        None,
+        16,
+        0,
+        8,
+        1,
+        64,
+        None,
+        None,
+        None,
+        simulation_seed=None,
     )
     assert result[1].item() == 16
     assert not ((result[0] >= 64) & (result[0] < 128)).any()
@@ -578,6 +610,7 @@ def test_native_broadcast_history_matches_paged_and_refreshes_graph(device):
             None,
             None,
             None,
+            simulation_seed=None,
         )
 
     dense, paged = run(table), run(table.clone())

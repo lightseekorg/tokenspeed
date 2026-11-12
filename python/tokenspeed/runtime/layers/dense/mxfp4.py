@@ -19,6 +19,8 @@
 
 from __future__ import annotations
 
+from functools import partial
+
 import torch
 from tokenspeed_kernel.ops.gemm import (
     mxfp4_linear,
@@ -28,6 +30,11 @@ from tokenspeed_kernel.ops.gemm import (
 from torch.nn.parameter import Parameter
 
 from tokenspeed.runtime.layers.quantization.base_config import QuantizeMethodBase
+from tokenspeed.runtime.layers.quantization.utils import (
+    dummy_mxfp4_scales,
+    dummy_mxfp4_weights,
+)
+from tokenspeed.runtime.utils import set_weight_attrs
 
 MXFP4_BLOCK = 32
 
@@ -57,7 +64,7 @@ class Mxfp4LinearMethod(QuantizeMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        del input_size, output_size
+        del output_size
         _validate_mxfp4_partition(input_size_per_partition)
         output_size_per_partition = sum(output_partition_sizes)
         weight_loader = extra_weight_attrs.get("weight_loader")
@@ -86,6 +93,7 @@ class Mxfp4LinearMethod(QuantizeMethodBase):
         weight.input_dim = 1
         if weight_loader is not None:
             weight.weight_loader = weight_loader
+        set_weight_attrs(weight, {"dummy_initializer": dummy_mxfp4_weights})
         layer.register_parameter("weight", weight)
 
         weight_scale = Parameter(
@@ -100,6 +108,12 @@ class Mxfp4LinearMethod(QuantizeMethodBase):
         weight_scale.input_dim = 1
         if scale_loader is not None:
             weight_scale.weight_loader = scale_loader
+        set_weight_attrs(
+            weight_scale,
+            {
+                "dummy_initializer": partial(dummy_mxfp4_scales, fan_in=input_size),
+            },
+        )
         layer.register_parameter("weight_scale", weight_scale)
 
     def enable_swiglu(self, layer: torch.nn.Module) -> None:

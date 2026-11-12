@@ -20,6 +20,8 @@
 
 from __future__ import annotations
 
+from functools import partial
+
 import torch
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
@@ -29,6 +31,10 @@ from tokenspeed.runtime.layers.moe.weights.loaders import (
     load_per_tensor_input_scale,
     make_weight_loader,
     round_up,
+)
+from tokenspeed.runtime.layers.quantization.utils import (
+    dummy_mxfp4_scales,
+    dummy_mxfp4_weights,
 )
 from tokenspeed.runtime.utils import set_weight_attrs
 
@@ -96,10 +102,25 @@ def create_mxfp4_weight_pair(
     layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
     weight_loader = make_weight_loader(spec)
-    set_weight_attrs(w13_weight, {"weight_loader": weight_loader})
-    set_weight_attrs(w13_weight_scale, {"weight_loader": weight_loader})
-    set_weight_attrs(w2_weight, {"weight_loader": weight_loader})
-    set_weight_attrs(w2_weight_scale, {"weight_loader": weight_loader})
+    for weight in (w13_weight, w2_weight):
+        set_weight_attrs(
+            weight,
+            {
+                "weight_loader": weight_loader,
+                "dummy_initializer": dummy_mxfp4_weights,
+            },
+        )
+    for scale, fan_in in (
+        (w13_weight_scale, spec.hidden_size),
+        (w2_weight_scale, spec.intermediate_size),
+    ):
+        set_weight_attrs(
+            scale,
+            {
+                "weight_loader": weight_loader,
+                "dummy_initializer": partial(dummy_mxfp4_scales, fan_in=fan_in),
+            },
+        )
 
     if with_bias:
         w13_weight_bias = torch.nn.Parameter(

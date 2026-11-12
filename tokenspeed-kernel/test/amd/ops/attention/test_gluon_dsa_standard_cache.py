@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 
 import pytest
 import torch
@@ -48,6 +49,8 @@ if is_cdna4():
         launch_gluon_dsa_decode_topk_standard_gfx950 as _decode_topk,
         launch_gluon_dsa_prefill_topk_standard_gfx950 as _prefill_topk,
     )
+
+    _decode_topk = partial(_decode_topk, simulation_seed=None)
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.standard_cache_logits import (  # isort: skip
         gluon_dsa_decode_topk_standard_gfx950 as _decode_logits_kernel,
     )

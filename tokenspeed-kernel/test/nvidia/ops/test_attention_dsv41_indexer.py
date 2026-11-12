@@ -145,6 +145,7 @@ def test_deferred_query_preprocessing_matches_explicit_rope(broadcast, candidate
             None,
             None,
             solution,
+            simulation_seed=None,
         )
 
     for solution in ("deep_gemm", "triton"):
@@ -323,6 +324,7 @@ def test_reindex_chunked_graph_matches_sparse_reference(
             None,
             None,
             solution="deep_gemm",
+            simulation_seed=None,
         )
 
     stream = torch.cuda.Stream()
@@ -387,6 +389,7 @@ def test_reindex_unaligned_pages_keep_candidate_filtering(monkeypatch):
         None,
         None,
         solution="deep_gemm",
+        simulation_seed=None,
     )
     selected = ids[0, : counts[0]].long()
     assert selected.numel() > 0
@@ -623,6 +626,7 @@ def test_packed_dense_histories_match_paged_scoring(history_rows):
             index_metadata=dsv41.new_index_metadata(
                 table, lengths, None, history_rows=rows
             ),
+            simulation_seed=None,
         )[:2]
 
     paged_ids, paged_counts = run(None)
@@ -661,6 +665,7 @@ def test_dense_scoring_rejects_windows_over_the_logits_budget(monkeypatch):
             index_metadata=dsv41.new_index_metadata(
                 table, lengths, None, history_rows=(4,)
             ),
+            simulation_seed=None,
         )
 
 
@@ -710,6 +715,7 @@ def test_packed_dense_batch_beyond_int32_logit_offsets(candidate_topk):
             index_metadata=dsv41.new_index_metadata(
                 table, lengths, None, history_rows=rows
             ),
+            simulation_seed=None,
         )
 
     paged = run(None)
@@ -757,6 +763,7 @@ def test_full_paged_query_tiles_match_with_large_capacity_in_graph(tokens):
             None,
             None,
             solution="deep_gemm",
+            simulation_seed=None,
         )
 
     stream = torch.cuda.Stream()

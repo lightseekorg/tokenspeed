@@ -16,6 +16,7 @@ For a compact compatibility table, see
 | `--tokenizer` | Tokenizer path when it differs from the model path. |
 | `--tokenizer-mode` | Select tokenizer behavior. `auto` uses fast tokenizers and model-specific hooks when available. |
 | `--load-format` | Weight loading format: `auto`, `pt`, `safetensors`, `instanttensor`, `npcache`, `dummy`, or `extensible`. See [InstantTensor](/guides/instanttensor) for the accelerated NVIDIA loader. |
+| `--simulate-tokens` | Use synthetic weights and final routing/selection decisions for benchmarks, retaining real collectives. The [direct-forward guide](/guides/simulated-forward-benchmarks) explains how to skip GPU prefill. |
 | `--trust-remote-code` | Allow custom model code from the model repository. |
 | `--revision` | Model branch, tag, or commit. |
 | `--download-dir` | Hugging Face download/cache directory. |

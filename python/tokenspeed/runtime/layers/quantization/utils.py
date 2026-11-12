@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Iterable, Mapping
 from types import MappingProxyType
@@ -31,6 +32,30 @@ from torch.nn import Module
 from tokenspeed.runtime.layers.quantization.compressed_tensors.scalar_type import (
     ScalarType as ScalarType,
 )
+
+
+def dummy_unit_scales(param: torch.Tensor, generator: torch.Generator) -> None:
+    """Store one in a floating scale tensor or its byte-encoded E8M0 form."""
+    param.data.fill_(127 if param.dtype == torch.uint8 else 1.0)
+
+
+def dummy_mxfp4_weights(param: torch.Tensor, generator: torch.Generator) -> None:
+    """Fill packed E2M1 nibbles, all of whose encodings are finite."""
+    param.data.random_(0, 256, generator=generator)
+
+
+def dummy_mxfp4_scales(
+    param: torch.Tensor, generator: torch.Generator, *, fan_in: int
+) -> None:
+    """Bound synthetic projection variance without decoding a weight tensor.
+
+    Uniform E2M1 nibbles have RMS about 3. Choosing a power-of-two scale
+    at most 1 / (3 * sqrt(fan_in)) keeps projection variance bounded.
+    E8M0 byte 255 is NaN; the selected finite exponent is stored directly.
+    """
+    exponent = math.floor(math.log2(1.0 / (3.0 * math.sqrt(fan_in))))
+    param.data.fill_(max(0, min(254, exponent + 127)))
+
 
 # Fused projections are absent from ModelOpt ignore lists, which name the
 # constituent shards instead (e.g. ``...ple.key_proj``/``...ple.value_proj``).
