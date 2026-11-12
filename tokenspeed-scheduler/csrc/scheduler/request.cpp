@@ -115,7 +115,7 @@ std::optional<TailPublication> Request::TailPublicationAt(std::int32_t num_compu
     }
     return TailPublication{
         .tail_tokens = tail_tokens,
-        .hash = HashPrefixPage(TokenSlice(num_computed_tokens - tail_tokens, tail_tokens), prior),
+        .hash = HashPrefixPage(TokenSlice(num_computed_tokens - tail_tokens, tail_tokens), ContentHash{prior}),
     };
 }
 

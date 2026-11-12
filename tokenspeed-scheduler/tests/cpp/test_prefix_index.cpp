@@ -45,7 +45,7 @@ namespace {
 constexpr std::uint32_t kGroupId = 0;
 
 CacheKey KeyOf(const std::string& content_hash) {
-    return CacheKey{.group_id = kGroupId, .content_hash = content_hash, .page_offset = 0};
+    return CacheKey{.group_id = kGroupId, .content_hash = ContentHash{content_hash}, .page_offset = 0};
 }
 
 // Registers one freshly acquired block and drops the local reference, leaving
@@ -129,7 +129,7 @@ TEST(PrefixCacheIndexInspectionTest, EvictionKeepsItsKeyAndMetadataAfterTheEntry
     BlockPool pool(1, {1});
     PrefixCacheIndex index(0);
     const auto key = KeyOf(std::string(64, 'a'));
-    const auto location = Cache(index, pool, key.content_hash, 17);
+    const auto location = Cache(index, pool, key.content_hash.ToString(), 17);
     EXPECT_THROW(
         index.EvictWithMetadata(
             pool, location, [](const auto&, const auto&, auto*) { throw std::runtime_error("publication refused"); }),
@@ -170,12 +170,13 @@ TEST(PrefixCacheIndexInspectionTest, EvictionShowsTheTreeNodeStillCountingTheEnt
         index.TrackBoundaries(tree, pool, /*host_pool=*/nullptr, /*state=*/false, /*closed=*/true);
         CacheBlockRef block = pool.AcquireBlock(group);
         locations.push_back(block->Location());
-        index.Register(pool, block, CacheKey{.group_id = group, .content_hash = "page"}, /*access_epoch=*/1,
+        index.Register(pool, block, CacheKey{.group_id = group, .content_hash = ContentHash{"page"}},
+                       /*access_epoch=*/1,
                        /*logical_block_index=*/0, CacheBoundaryKind::kChunk, /*newly_cached=*/nullptr,
                        /*session=*/nullptr);
     }
-    ASSERT_NE(tree.Find("page"), nullptr);
-    ASSERT_EQ(tree.Find("page")->Entries(BoundaryTree::kDevice), 2);
+    ASSERT_NE(tree.Find(ContentHash{"page"}), nullptr);
+    ASSERT_EQ(tree.Find(ContentHash{"page"})->Entries(BoundaryTree::kDevice), 2);
 
     for (std::uint32_t group = 0; group < 2; ++group) {
         bool saw_the_hashs_node = false;
@@ -189,7 +190,7 @@ TEST(PrefixCacheIndexInspectionTest, EvictionShowsTheTreeNodeStillCountingTheEnt
         EXPECT_TRUE(saw_the_hashs_node) << "group " << group;
         EXPECT_EQ(device_entries, 2 - static_cast<std::int32_t>(group)) << "group " << group;
     }
-    EXPECT_EQ(tree.Find("page"), nullptr);
+    EXPECT_EQ(tree.Find(ContentHash{"page"}), nullptr);
 
     BlockPool unbound_pool(1, {1});
     PrefixCacheIndex unbound(kGroupId);
@@ -235,7 +236,7 @@ TEST(SegmentedLocationIndex, SparseLargeLocationsAndEmptySegmentsCanBeReused) {
     EXPECT_EQ(index.Find(high), &first);
 }
 
-TEST(ContentHash, PreservesOpaqueBytesEmptyIdentityAndLexicalOrder) {
+TEST(ContentHash, PreservesOpaqueBytesAndEmptyIdentity) {
     const std::vector<std::string> text{"",      std::string(64, '0'),   std::string(64, 'a'), std::string(64, 'A'),
                                         "entry", std::string("a\0b", 3), std::string(63, 'f'), std::string(64, 'x')};
     std::vector<ContentHash> hashes;
@@ -247,10 +248,9 @@ TEST(ContentHash, PreservesOpaqueBytesEmptyIdentityAndLexicalOrder) {
     }
     EXPECT_NE(hashes[0], hashes[1]);
     EXPECT_NE(hashes[2], hashes[3]);
-    auto ordered_text = text;
-    std::ranges::sort(ordered_text);
-    std::ranges::sort(hashes);
-    for (std::size_t i = 0; i < hashes.size(); ++i) EXPECT_EQ(hashes[i].ToString(), ordered_text[i]);
+    for (std::size_t i = 0; i < hashes.size(); ++i) {
+        for (std::size_t j = i + 1; j < hashes.size(); ++j) EXPECT_NE(hashes[i], hashes[j]) << i << " " << j;
+    }
     EXPECT_EQ(ContentHash(ContentHash::Digest{}), ContentHash(std::string(64, '0')));
 }
 
@@ -537,7 +537,7 @@ TEST(PrefixCacheIndexInspectionTest, LongDigestsKeepNamespacesAndOffsetsDistinct
         digest.back() = "0123456789abcdef"[i / 8];
         keys.push_back(CacheKey{.namespace_id = static_cast<CacheNamespaceId>(i % 2),
                                 .group_id = kGroupId,
-                                .content_hash = std::move(digest),
+                                .content_hash = ContentHash{std::move(digest)},
                                 .page_offset = (i / 2) % 4});
         CacheBlockRef block = pool.AcquireBlock(kGroupId);
         ASSERT_TRUE(block);
@@ -561,7 +561,7 @@ TEST(PrefixCacheIndexInspectionTest, LongDigestsKeepNamespacesAndOffsetsDistinct
         missing = keys[i];
         auto missing_hash = missing.content_hash.ToString();
         missing_hash.front() = 'b';
-        missing.content_hash = std::move(missing_hash);
+        missing.content_hash = ContentHash{std::move(missing_hash)};
         EXPECT_FALSE(index.Contains(pool, missing));
     }
 
@@ -866,7 +866,7 @@ TEST(PrefixCacheIndexCommonOrderTest, TracksBothTiersAndUsesOnlySourceRecency) {
         std::vector<std::string> keys;
         PrefixCacheIndex::CommonCursor cursor;
         while (const auto entry = index.NextCommonRecentEntry(source, cursor)) {
-            keys.push_back(entry->key->content_hash);
+            keys.push_back(entry->key->content_hash.ToString());
         }
         return keys;
     };
@@ -997,7 +997,7 @@ TEST(PrefixCacheIndexSnapshotTest, VisitsBothOwnershipKindsWithoutTouchingOrPinn
     CacheBlockRef pin = index.Find(pool, KeyOf("held"));
     std::vector<std::string> seen;
     index.ForEachEntry(pool, [&](const CacheKey& key, const PrefixCacheIndex::CachedBlockSnapshot& entry) {
-        seen.push_back(key.content_hash);
+        seen.push_back(key.content_hash.ToString());
         EXPECT_EQ(entry.pinned, key == KeyOf("held"));
         EXPECT_FALSE(entry.metadata.was_acquired);
         if (key == KeyOf("old")) {
@@ -1305,7 +1305,7 @@ TEST(PrefixCacheIndexEvictionOrderTest, RelocatesAnEntryOntoItsCopyWithItsAgePin
     const CacheBlockLocation from = Cache(index, pool, "moved", /*access_epoch=*/10);
     const CacheBlockLocation other = Cache(index, pool, "other", /*access_epoch=*/20);
     publication.reset();
-    const BoundaryTree::Node* node = tree.Find("moved");
+    const BoundaryTree::Node* node = tree.Find(ContentHash{"moved"});
     ASSERT_NE(node, nullptr);
     ASSERT_EQ(node->boundary_tokens, 8);
 
@@ -1329,7 +1329,7 @@ TEST(PrefixCacheIndexEvictionOrderTest, RelocatesAnEntryOntoItsCopyWithItsAgePin
     EXPECT_EQ(moved->metadata.last_access_epoch, 10u);
     EXPECT_TRUE(moved->metadata.was_acquired);
     EXPECT_TRUE(moved->pinned);
-    EXPECT_EQ(tree.Find("moved"), node);
+    EXPECT_EQ(tree.Find(ContentHash{"moved"}), node);
     EXPECT_EQ(node->Entries(BoundaryTree::kDevice), 1);
     EXPECT_EQ(node->boundary_tokens, 8);
     // Set aside while pinned; back in age order, at the new location, once
@@ -1338,7 +1338,7 @@ TEST(PrefixCacheIndexEvictionOrderTest, RelocatesAnEntryOntoItsCopyWithItsAgePin
     pin.reset();
     EXPECT_EQ(DrainEvictionOrder(index, pool), (std::vector<CacheBlockLocation>{to, other}));
     EXPECT_EQ(index.Evict(pool, to), KeyOf("moved"));
-    EXPECT_EQ(tree.Find("moved"), nullptr);
+    EXPECT_EQ(tree.Find(ContentHash{"moved"}), nullptr);
 }
 
 TEST(PrefixCacheIndexEvictionOrderTest, MatchesTheEvictableSetSeenByAFullScan) {

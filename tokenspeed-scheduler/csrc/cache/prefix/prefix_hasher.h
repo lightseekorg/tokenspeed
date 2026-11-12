@@ -31,6 +31,7 @@
 
 #include <openssl/sha.h>
 
+#include "cache/core/content_hash.h"
 #include "cache/core/hex_codec.h"
 #include "utils.h"
 
@@ -145,6 +146,16 @@ inline std::string HashPrefixPage(std::span<const std::int32_t> tokens, const st
                                   std::span<const std::string> extra_keys = {}) {
     const auto prior_bytes = HexToBytes(prior_hash);
     return DigestToHex(HashPrefixPageDigest(tokens, prior_bytes, extra_keys).data());
+}
+
+// The same page hash under a prior held as an identity, returned as one: it
+// chains exactly the bytes HashPrefixPage(tokens, prior.ToString()) decodes,
+// taking a canonical prior's 32 bytes directly instead of through its text.
+inline ContentHash HashPrefixPage(std::span<const std::int32_t> tokens, const ContentHash& prior) {
+    if (const ContentHash::Digest* digest = prior.digest()) {
+        return ContentHash{HashPrefixPageDigest(tokens, *digest, {})};
+    }
+    return ContentHash{HashPrefixPageDigest(tokens, HexToBytes(prior.ToString()), {})};
 }
 
 // Appends the hashes of prefix_pages to hashes, chained on the raw seed

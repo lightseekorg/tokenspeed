@@ -1662,7 +1662,8 @@ TEST(LoneRequestCopyInCompactionTest, RePlacesAHeldCopyInBlockWithoutZeroingIt) 
     const CacheBlockRef held_state_input = r[1].Blocks()[0];
 
     const TailPublication tail{
-        .tail_tokens = 6, .hash = HashPrefixPage(std::span<const std::int32_t>(prompt.data() + 120, 6), hashes.back())};
+        .tail_tokens = 6,
+        .hash = ContentHash{HashPrefixPage(std::span<const std::int32_t>(prompt.data() + 120, 6), hashes.back())}};
     const RequestProgress progress{
         .completed_pages = CompletedPages{.tokens = std::span<const std::int32_t>(prompt.data(), 126),
                                           .prefix_hashes = hashes,

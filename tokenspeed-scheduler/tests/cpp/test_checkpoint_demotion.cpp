@@ -50,7 +50,7 @@ namespace tokenspeed::test {
 namespace {
 
 CacheKey Key(const std::string& hash, std::uint32_t group = 0) {
-    return CacheKey{.group_id = group, .content_hash = hash, .page_offset = 0};
+    return CacheKey{.group_id = group, .content_hash = ContentHash{hash}, .page_offset = 0};
 }
 
 // The names of `names`' entries in `pool`'s eviction order.
@@ -163,42 +163,43 @@ TEST(CheckpointDemotionIndexTest, DemoteDiscountsOnlyTheWriteBackHolds) {
 
 TEST(CheckpointLineageTest, RecordsPublicationsAndCountsResumesUpToTwo) {
     CheckpointLineage lineage;
-    EXPECT_EQ(lineage.FindPublication("c"), nullptr);
-    lineage.RecordPublication("c", {.resumed_tokens = 20, .access_epoch = 7});
-    ASSERT_NE(lineage.FindPublication("c"), nullptr);
-    EXPECT_EQ(lineage.FindPublication("c")->resumed_tokens, 20);
-    lineage.RecordPublication("c", {.resumed_tokens = 0, .access_epoch = 9});
-    EXPECT_EQ(lineage.FindPublication("c")->resumed_tokens, 0) << "a later publication replaces the earlier";
-    EXPECT_EQ(lineage.FindPublication("c")->access_epoch, 9u);
+    EXPECT_EQ(lineage.FindPublication(ContentHash{"c"}), nullptr);
+    lineage.RecordPublication(ContentHash{"c"}, {.resumed_tokens = 20, .access_epoch = 7});
+    ASSERT_NE(lineage.FindPublication(ContentHash{"c"}), nullptr);
+    EXPECT_EQ(lineage.FindPublication(ContentHash{"c"})->resumed_tokens, 20);
+    lineage.RecordPublication(ContentHash{"c"}, {.resumed_tokens = 0, .access_epoch = 9});
+    EXPECT_EQ(lineage.FindPublication(ContentHash{"c"})->resumed_tokens, 0)
+        << "a later publication replaces the earlier";
+    EXPECT_EQ(lineage.FindPublication(ContentHash{"c"})->access_epoch, 9u);
 
-    EXPECT_EQ(lineage.Resumes("b"), 0);
-    lineage.NoteResume("b");
-    EXPECT_EQ(lineage.Resumes("b"), 1);
-    lineage.NoteResume("b");
-    lineage.NoteResume("b");
-    EXPECT_EQ(lineage.Resumes("b"), 2) << "more than one";
+    EXPECT_EQ(lineage.Resumes(ContentHash{"b"}), 0);
+    lineage.NoteResume(ContentHash{"b"});
+    EXPECT_EQ(lineage.Resumes(ContentHash{"b"}), 1);
+    lineage.NoteResume(ContentHash{"b"});
+    lineage.NoteResume(ContentHash{"b"});
+    EXPECT_EQ(lineage.Resumes(ContentHash{"b"}), 2) << "more than one";
 }
 
 // Both maps forget their oldest key past kMaxEntries; a key recorded again
 // keeps its place.
 TEST(CheckpointLineageTest, ForgetsTheOldestKeysPastItsBound) {
     CheckpointLineage lineage;
-    lineage.RecordPublication("first", {.resumed_tokens = 4, .access_epoch = 1});
-    lineage.RecordPublication("second", {.resumed_tokens = 8, .access_epoch = 2});
-    lineage.NoteResume("first");
+    lineage.RecordPublication(ContentHash{"first"}, {.resumed_tokens = 4, .access_epoch = 1});
+    lineage.RecordPublication(ContentHash{"second"}, {.resumed_tokens = 8, .access_epoch = 2});
+    lineage.NoteResume(ContentHash{"first"});
     for (std::size_t i = 0; i + 2 < CheckpointLineage::kMaxEntries; ++i) {
-        lineage.RecordPublication("p" + std::to_string(i), {});
-        lineage.NoteResume("p" + std::to_string(i));
+        lineage.RecordPublication(ContentHash{"p" + std::to_string(i)}, {});
+        lineage.NoteResume(ContentHash{"p" + std::to_string(i)});
     }
-    lineage.RecordPublication("first", {.resumed_tokens = 12, .access_epoch = 3});
-    ASSERT_NE(lineage.FindPublication("first"), nullptr) << "kMaxEntries keys fit";
-    lineage.RecordPublication("newest", {});
-    EXPECT_EQ(lineage.FindPublication("first"), nullptr) << "re-recording kept the oldest place";
-    EXPECT_NE(lineage.FindPublication("second"), nullptr);
-    EXPECT_EQ(lineage.Resumes("first"), 1);
-    lineage.NoteResume("p-last");
-    lineage.NoteResume("p-newest");
-    EXPECT_EQ(lineage.Resumes("first"), 0) << "forgotten";
+    lineage.RecordPublication(ContentHash{"first"}, {.resumed_tokens = 12, .access_epoch = 3});
+    ASSERT_NE(lineage.FindPublication(ContentHash{"first"}), nullptr) << "kMaxEntries keys fit";
+    lineage.RecordPublication(ContentHash{"newest"}, {});
+    EXPECT_EQ(lineage.FindPublication(ContentHash{"first"}), nullptr) << "re-recording kept the oldest place";
+    EXPECT_NE(lineage.FindPublication(ContentHash{"second"}), nullptr);
+    EXPECT_EQ(lineage.Resumes(ContentHash{"first"}), 1);
+    lineage.NoteResume(ContentHash{"p-last"});
+    lineage.NoteResume(ContentHash{"p-newest"});
+    EXPECT_EQ(lineage.Resumes(ContentHash{"first"}), 0) << "forgotten";
 }
 
 // One KV group and one State group, P = 2, on Device and Host.

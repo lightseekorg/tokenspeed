@@ -819,7 +819,9 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
         .prefix_hashes = std::vector<std::string>(match.prefix_hashes.begin(), match.prefix_hashes.end()),
         .access_epoch = admission->access_epoch,
         .junction_tokens = admission->junction_tokens,
-        .resumed_tail_hash = std::move(admission->resumed_tail_hash),
+        .resumed_tail_hash = admission->resumed_tail_hash
+                                 ? std::optional<std::string>{admission->resumed_tail_hash->ToString()}
+                                 : std::nullopt,
         .resume_tokens = hit_tokens,
     };
     // Checkpoint demotion counts the first admissions that resume at each
@@ -828,7 +830,8 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     const std::int32_t resumed_pages = cache_progress.resume_tokens / prefix_granularity;
     if (checkpoint_lineage_ && resumed_pages > 0 && cache_progress.resume_tokens % prefix_granularity == 0 &&
         resumed_pages <= static_cast<std::int32_t>(cache_progress.prefix_hashes.size())) {
-        checkpoint_lineage_->NoteResume(cache_progress.prefix_hashes[static_cast<std::size_t>(resumed_pages) - 1]);
+        checkpoint_lineage_->NoteResume(
+            ContentHash{cache_progress.prefix_hashes[static_cast<std::size_t>(resumed_pages) - 1]});
     }
     if (writes_checkpoint) {
         cache_progress.state_checkpoint_tokens = state_checkpoint;

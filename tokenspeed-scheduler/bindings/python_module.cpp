@@ -768,7 +768,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                 page_offsets.reserve(keys.size());
                 for (const tokenspeed::CacheKey& key : keys) {
                     group_ids.push_back(key.group_id);
-                    hashes.push_back(key.content_hash);
+                    hashes.push_back(key.content_hash.ToString());
                     page_offsets.push_back(key.page_offset);
                 }
                 return std::tuple{std::move(group_ids), std::move(hashes), std::move(page_offsets)};

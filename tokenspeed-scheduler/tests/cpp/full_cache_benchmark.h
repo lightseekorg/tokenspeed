@@ -388,8 +388,8 @@ private:
         for (const auto& hashes : histories_) {
             // Equal-epoch full-history eviction takes the suffix first. The
             // endpoint lookup avoids scanning millions of untouched entries.
-            if (!Coordinator().GroupPrefixIndex(0).Contains(Pool(),
-                                                            CacheKey{.group_id = 0, .content_hash = hashes.back()})) {
+            if (!Coordinator().GroupPrefixIndex(0).Contains(
+                    Pool(), CacheKey{.group_id = 0, .content_hash = ContentHash{hashes.back()}})) {
                 RestoreHistory(hashes);
             }
         }

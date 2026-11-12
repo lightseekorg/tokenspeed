@@ -165,7 +165,7 @@ void MeasureEvictableCandidates(std::int32_t pool_size, std::int32_t iterations)
     }
     for (std::int32_t i = 0; i < pool_size; ++i) {
         index.Register(pool, blocks[static_cast<std::size_t>(i)],
-                       CacheKey{.group_id = 0, .content_hash = std::to_string(i), .page_offset = 0},
+                       CacheKey{.group_id = 0, .content_hash = ContentHash{std::to_string(i)}, .page_offset = 0},
                        /*access_epoch=*/static_cast<std::uint64_t>(i), /*logical_block_index=*/-1,
                        CacheBoundaryKind::kChunk, /*newly_cached=*/nullptr, /*session=*/nullptr);
     }
@@ -193,7 +193,8 @@ void FillAdmissionCache(CacheCoordinator& coordinator, BlockPool& pool, std::int
         }
         coordinator.GroupPrefixIndex(0).Register(
             pool, block,
-            CacheKey{.group_id = 0, .content_hash = "admission-cache-" + std::to_string(i), .page_offset = 0},
+            CacheKey{
+                .group_id = 0, .content_hash = ContentHash{"admission-cache-" + std::to_string(i)}, .page_offset = 0},
             /*access_epoch=*/static_cast<std::uint64_t>(i + 1), /*logical_block_index=*/-1, CacheBoundaryKind::kChunk,
             /*newly_cached=*/nullptr, /*session=*/nullptr);
     }
@@ -240,7 +241,9 @@ void MeasureAdmission(std::int32_t pool_size, std::int32_t iterations) {
         ++next_key;
         coordinator.GroupPrefixIndex(0).Register(
             pool, block,
-            CacheKey{.group_id = 0, .content_hash = "admission-cache-" + std::to_string(next_key), .page_offset = 0},
+            CacheKey{.group_id = 0,
+                     .content_hash = ContentHash{"admission-cache-" + std::to_string(next_key)},
+                     .page_offset = 0},
             /*access_epoch=*/next_key, /*logical_block_index=*/-1, CacheBoundaryKind::kChunk,
             /*newly_cached=*/nullptr, /*session=*/nullptr);
         return checksum;
@@ -256,7 +259,7 @@ void MeasurePinnedAdmission(std::int32_t pool_size, std::int32_t iterations) {
     for (std::int32_t i = 0; i < pool_size; ++i) {
         coordinator.GroupPrefixIndex(0).Register(
             pool, pins[static_cast<std::size_t>(i)],
-            CacheKey{.group_id = 0, .content_hash = "pinned-" + std::to_string(i), .page_offset = 0},
+            CacheKey{.group_id = 0, .content_hash = ContentHash{"pinned-" + std::to_string(i)}, .page_offset = 0},
             /*access_epoch=*/static_cast<std::uint64_t>(i + 1), /*logical_block_index=*/-1, CacheBoundaryKind::kChunk,
             /*newly_cached=*/nullptr, /*session=*/nullptr);
     }
@@ -301,7 +304,7 @@ void MeasureHostBlockAcquisition(std::int32_t pool_size, std::int32_t iterations
         }
         coordinator.GroupPrefixIndex(0).Register(
             host_pool, block,
-            CacheKey{.group_id = 0, .content_hash = "host-cache-" + std::to_string(i), .page_offset = 0},
+            CacheKey{.group_id = 0, .content_hash = ContentHash{"host-cache-" + std::to_string(i)}, .page_offset = 0},
             /*access_epoch=*/static_cast<std::uint64_t>(i + 1), /*logical_block_index=*/-1, CacheBoundaryKind::kChunk,
             /*newly_cached=*/nullptr, /*session=*/nullptr);
     }
@@ -317,7 +320,8 @@ void MeasureHostBlockAcquisition(std::int32_t pool_size, std::int32_t iterations
         ++next_key;
         coordinator.CacheHostBlock(
             batch.blocks.front(),
-            CacheKey{.group_id = 0, .content_hash = "host-cache-" + std::to_string(next_key), .page_offset = 0},
+            CacheKey{
+                .group_id = 0, .content_hash = ContentHash{"host-cache-" + std::to_string(next_key)}, .page_offset = 0},
             std::nullopt);
         return static_cast<std::uint64_t>(batch.stats.allocated);
     });
@@ -337,8 +341,8 @@ void MeasureSparseHostBlockAcquisition(std::int32_t pool_size, std::int32_t iter
                                                    /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     std::vector<CacheBlockRef> pins = host_pool.AcquireBlocks(0, pool_size - 1);
     CacheBlockRef cached = host_pool.AcquireBlock(1);
-    coordinator.CacheHostBlock(cached, CacheKey{.group_id = 1, .content_hash = "initial", .page_offset = 0},
-                               std::nullopt);
+    coordinator.CacheHostBlock(
+        cached, CacheKey{.group_id = 1, .content_hash = ContentHash{"initial"}, .page_offset = 0}, std::nullopt);
     cached.reset();
     std::uint64_t next_key = 0;
     Measure("acquire_host_blocks_sparse_evictable", pool_size, 1, iterations, [&] {
@@ -347,7 +351,8 @@ void MeasureSparseHostBlockAcquisition(std::int32_t pool_size, std::int32_t iter
             std::abort();
         }
         coordinator.CacheHostBlock(
-            replacement, CacheKey{.group_id = 1, .content_hash = std::to_string(++next_key), .page_offset = 0},
+            replacement,
+            CacheKey{.group_id = 1, .content_hash = ContentHash{std::to_string(++next_key)}, .page_offset = 0},
             std::nullopt);
         return static_cast<std::uint64_t>(replacement->Location().lcm_block_id);
     });
@@ -369,7 +374,8 @@ void MeasureMultiGroupHostBlockAcquisition(std::int32_t pool_size, std::int32_t 
         const auto group_id = static_cast<std::uint32_t>(i % 2);
         CacheBlockRef block = host_pool.AcquireBlock(group_id);
         coordinator.CacheHostBlock(
-            block, CacheKey{.group_id = group_id, .content_hash = std::to_string(i), .page_offset = 0}, std::nullopt);
+            block, CacheKey{.group_id = group_id, .content_hash = ContentHash{std::to_string(i)}, .page_offset = 0},
+            std::nullopt);
     }
     const std::array<std::uint32_t, 2> group_ids{0, 1};
     const std::array<std::int32_t, 2> buckets{0, 0};
@@ -380,10 +386,11 @@ void MeasureMultiGroupHostBlockAcquisition(std::int32_t pool_size, std::int32_t 
             std::abort();
         }
         for (std::size_t i = 0; i < group_ids.size(); ++i) {
-            coordinator.CacheHostBlock(
-                batch.blocks[i],
-                CacheKey{.group_id = group_ids[i], .content_hash = std::to_string(++next_key), .page_offset = 0},
-                std::nullopt);
+            coordinator.CacheHostBlock(batch.blocks[i],
+                                       CacheKey{.group_id = group_ids[i],
+                                                .content_hash = ContentHash{std::to_string(++next_key)},
+                                                .page_offset = 0},
+                                       std::nullopt);
         }
         return static_cast<std::uint64_t>(batch.stats.allocated);
     });
@@ -433,17 +440,17 @@ void MeasureSessionWithoutDeviceCheckpointAdmission(std::int32_t pages, std::int
     // leaves, taking the other State groups' along.
     std::vector<CacheKey> host_keys;
     for (const std::string& hash : hashes) {
-        host_keys.push_back(CacheKey{.group_id = 0, .content_hash = hash});
+        host_keys.push_back(CacheKey{.group_id = 0, .content_hash = ContentHash{hash}});
     }
     for (std::uint32_t group = 1; group < specs.size(); ++group) {
-        host_keys.push_back(CacheKey{.group_id = group, .content_hash = hashes.back()});
+        host_keys.push_back(CacheKey{.group_id = group, .content_hash = ContentHash{hashes.back()}});
     }
     for (const CacheKey& key : host_keys) {
         CacheBlockRef block = host_pool.AcquireBlock(key.group_id);
         coordinator.CacheHostBlock(block, key, std::nullopt);
     }
     const std::optional<CacheBlockLocation> checkpoint = CacheCoordinatorTestAccess::DeviceLocationOf(
-        coordinator, 1, CacheKey{.group_id = 1, .content_hash = hashes.back()});
+        coordinator, 1, CacheKey{.group_id = 1, .content_hash = ContentHash{hashes.back()}});
     if (!checkpoint || !CacheCoordinatorTestAccess::EvictCachedBlock(coordinator, 1, *checkpoint)) {
         std::abort();
     }
@@ -470,7 +477,8 @@ void MeasureSessionWithoutDeviceCheckpointAdmission(std::int32_t pages, std::int
         for (CacheCoordinator::EvictedSegment& segment : coordinator.TakeEvictedSegments()) {
             coordinator.SettleEvictedSegment(std::move(segment), /*placed_on_host=*/true);
         }
-        if (coordinator.GroupPrefixIndex(0).Contains(pool, CacheKey{.group_id = 0, .content_hash = hashes.front()})) {
+        if (coordinator.GroupPrefixIndex(0).Contains(
+                pool, CacheKey{.group_id = 0, .content_hash = ContentHash{hashes.front()}})) {
             std::abort();
         }
         publish(/*publish_state=*/false);
@@ -532,9 +540,10 @@ void MeasureSegmentAdmission(bool write_back_evictions, std::int32_t segments, s
         sessions.push_back(std::move(hashes));
     }
     const auto evicted = [&](const std::vector<std::string>& hashes) {
-        return !coordinator.GroupPrefixIndex(0).Contains(pool,
-                                                         CacheKey{.group_id = 0, .content_hash = hashes.back()}) ||
-               !coordinator.GroupPrefixIndex(1).Contains(pool, CacheKey{.group_id = 1, .content_hash = hashes.back()});
+        return !coordinator.GroupPrefixIndex(0).Contains(
+                   pool, CacheKey{.group_id = 0, .content_hash = ContentHash{hashes.back()}}) ||
+               !coordinator.GroupPrefixIndex(1).Contains(
+                   pool, CacheKey{.group_id = 1, .content_hash = ContentHash{hashes.back()}});
     };
     // A segment frees its 150 Full blocks and three State parents.
     const std::int32_t demand_blocks = kSpareParents * kFullPacking + (segments - 1) * (kPages + 3 * kFullPacking) + 1;
@@ -673,8 +682,8 @@ void MeasureWriteBackPlan(std::int32_t admissions, std::int32_t iterations) {
         held.clear();
         const std::size_t before = sessions.size();
         std::erase_if(sessions, [&](const std::vector<std::string>& hashes) {
-            return !coordinator.GroupPrefixIndex(1).Contains(pool,
-                                                             CacheKey{.group_id = 1, .content_hash = hashes.back()});
+            return !coordinator.GroupPrefixIndex(1).Contains(
+                pool, CacheKey{.group_id = 1, .content_hash = ContentHash{hashes.back()}});
         });
         if (sessions.size() == before) {
             std::abort();

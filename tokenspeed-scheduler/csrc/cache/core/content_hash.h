@@ -21,7 +21,6 @@
 #pragma once
 
 #include <array>
-#include <compare>
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -36,45 +35,36 @@ namespace tokenspeed {
 
 // Complete internal identity. Canonical SHA-256 text has an allocation-free
 // representation; opaque public keys retain their exact bytes, including
-// uppercase hex, embedded nulls and the empty prior.
+// uppercase hex, embedded nulls and the empty prior. Conversions from and to
+// text are explicit: text is the external format (storage, transfer, binding
+// and KV-event hashes), and an implicit round trip would hide a parse or a
+// 64-byte encode.
 class ContentHash {
 public:
     using Digest = std::array<std::uint8_t, 32>;
 
     ContentHash() : value_{std::string{}} {}
-    ContentHash(const char* text) : ContentHash(std::string_view{text}) {}
-    ContentHash(const std::string& text) : ContentHash(std::string_view{text}) {}
-    ContentHash(std::string_view text) : value_{parse(text)} {}
-    ContentHash(std::string&& text) : value_{parse(std::move(text))} {}
+    explicit ContentHash(const char* text) : ContentHash(std::string_view{text}) {}
+    explicit ContentHash(const std::string& text) : ContentHash(std::string_view{text}) {}
+    explicit ContentHash(std::string_view text) : value_{parse(text)} {}
+    explicit ContentHash(std::string&& text) : value_{parse(std::move(text))} {}
     explicit ContentHash(Digest digest) : value_{digest} {}
 
     bool empty() const noexcept {
         const auto* text = std::get_if<std::string>(&value_);
         return text && text->empty();
     }
+    // The 32 bytes of a canonical identity; null for opaque text.
+    const Digest* digest() const noexcept { return std::get_if<Digest>(&value_); }
     std::string ToString() const {
         if (const auto* text = std::get_if<std::string>(&value_)) return *text;
         std::string text(64, '0');
         WriteLowercaseHex(std::get<Digest>(value_), text.data());
         return text;
     }
-    operator std::string() const { return ToString(); }
+    explicit operator std::string() const { return ToString(); }
 
     bool operator==(const ContentHash&) const noexcept = default;
-    std::strong_ordering operator<=>(const ContentHash& other) const {
-        if (const auto* digest = std::get_if<Digest>(&value_)) {
-            if (const auto* rhs = std::get_if<Digest>(&other.value_)) {
-                const int order = std::memcmp(digest->data(), rhs->data(), digest->size());
-                return order < 0   ? std::strong_ordering::less
-                       : order > 0 ? std::strong_ordering::greater
-                                   : std::strong_ordering::equal;
-            }
-        }
-        const int order = ToString().compare(other.ToString());
-        return order < 0   ? std::strong_ordering::less
-               : order > 0 ? std::strong_ordering::greater
-                           : std::strong_ordering::equal;
-    }
     std::size_t Hash() const {
         if (const auto* digest = std::get_if<Digest>(&value_)) {
             // SHA's bits are already distributed. This is a table hash only:

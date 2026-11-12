@@ -175,8 +175,8 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
     // at, and it ages like any cache entry.
     if (progress.resumed_tail_hash && !shortPromptEndIsDropped(request) &&
         !(completed.completed_pages && completed.completed_pages->tail &&
-          completed.completed_pages->tail->hash == *progress.resumed_tail_hash)) {
-        coordinator_.MarkSupersededStateInput(*progress.resumed_tail_hash, progress.access_epoch);
+          completed.completed_pages->tail->hash == ContentHash{*progress.resumed_tail_hash})) {
+        coordinator_.MarkSupersededStateInput(ContentHash{*progress.resumed_tail_hash}, progress.access_epoch);
     }
     if (checkpoint_lineage_) {
         demoteSupersededCheckpoint(progress);
@@ -191,7 +191,7 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
     // under its pages is not stored.
     std::vector<std::string> store_hashes = progress.prefix_hashes;
     if (completed.completed_pages && completed.completed_pages->tail) {
-        store_hashes.push_back(completed.completed_pages->tail->hash);
+        store_hashes.push_back(completed.completed_pages->tail->hash.ToString());
     }
     coordinator_.QueueCachedBlocksForStore(store_hashes);
     // The request's pages are released right after this (ReleaseEvent); the
@@ -249,7 +249,7 @@ bool Scheduler::promptEndIsCoveredByCheckpoint(const Request& request, const fsm
     }
     const auto checkpoint_pages = static_cast<std::size_t>(checkpoint / coordinator_.PrefixGranularity());
     return checkpoint_pages <= progress.prefix_hashes.size() &&
-           coordinator_.HoldsStateCheckpoint(progress.prefix_hashes[checkpoint_pages - 1]);
+           coordinator_.HoldsStateCheckpoint(ContentHash{progress.prefix_hashes[checkpoint_pages - 1]});
 }
 
 // With drop_short_prompt_end_checkpoints (P role, in-forward checkpoint): a
@@ -331,7 +331,7 @@ void Scheduler::demoteSupersededCheckpoint(const fsm::CacheProgress& progress) {
     // where R's request resumed. The chain hash at R fixes every page before
     // it, so that boundary lies on this request's chain too.
     const CheckpointLineage::Publication* resumed_publication =
-        checkpoint_lineage_->FindPublication(chain[static_cast<std::size_t>(resumed / page) - 1]);
+        checkpoint_lineage_->FindPublication(ContentHash{chain[static_cast<std::size_t>(resumed / page) - 1]});
     if (resumed_publication == nullptr) {
         return;
     }
@@ -339,7 +339,7 @@ void Scheduler::demoteSupersededCheckpoint(const fsm::CacheProgress& progress) {
     if (superseded <= 0 || superseded >= resumed || superseded % page != 0) {
         return;
     }
-    const std::string& superseded_hash = chain[static_cast<std::size_t>(superseded / page) - 1];
+    const ContentHash superseded_hash{chain[static_cast<std::size_t>(superseded / page) - 1]};
     if (checkpoint_lineage_->FindPublication(superseded_hash) == nullptr) {
         return;  // two turns back is no recorded in-forward checkpoint
     }
@@ -371,7 +371,7 @@ void Scheduler::recordCheckpointPublication(const fsm::CacheProgress& progress) 
         return;  // no in-forward checkpoint past the point it resumed from
     }
     checkpoint_lineage_->RecordPublication(
-        progress.prefix_hashes[static_cast<std::size_t>(checkpoint / page) - 1],
+        ContentHash{progress.prefix_hashes[static_cast<std::size_t>(checkpoint / page) - 1]},
         CheckpointLineage::Publication{.resumed_tokens = resumed % page == 0 ? resumed : 0,
                                        .access_epoch = progress.access_epoch});
 }

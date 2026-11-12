@@ -267,13 +267,13 @@ public:
         Node* parent = nullptr;
         auto first_page_to_link = static_cast<std::size_t>(completed.first_new_prefix_page);
         for (; first_page_to_link > 0; --first_page_to_link) {
-            parent = Find(page_hashes[first_page_to_link - 1]);
+            parent = Find(ContentHash{page_hashes[first_page_to_link - 1]});
             if (parent != nullptr && (parent->parent != nullptr || first_page_to_link == 1)) {
                 break;
             }
         }
         for (std::size_t page = first_page_to_link; page < page_hashes.size(); ++page) {
-            parent = &findOrAdd(page_hashes[page], parent,
+            parent = &findOrAdd(ContentHash{page_hashes[page]}, parent,
                                 static_cast<std::int32_t>(page + 1) * config_.prefix_granularity, /*tail_tokens=*/0);
         }
         Node* deepest = parent;

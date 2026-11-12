@@ -149,7 +149,7 @@ TEST(StorageQueryTest, MissingHighestStateFallsBackToTheNextCompleteCheckpoint) 
     const auto query = cache.coordinator.MissingStorageKeys(prefix, 5);
     ASSERT_EQ(query.max_tokens, 11);
     ASSERT_TRUE(Has(query.keys, {.group_id = 1, .content_hash = prefix.tail->hash}));
-    ASSERT_TRUE(Has(query.keys, {.group_id = 1, .content_hash = prompt.hashes[1]}));
+    ASSERT_TRUE(Has(query.keys, {.group_id = 1, .content_hash = ContentHash{prompt.hashes[1]}}));
     std::vector<CacheKey> hits;
     for (const auto& key : query.keys) {
         if (key.group_id != 1 || key.content_hash != prefix.tail->hash) hits.push_back(key);
@@ -167,8 +167,8 @@ TEST(StorageQueryTest, OversizedHighestCandidateStillAllowsACompleteLowerBoundar
     // T=11 needs four objects; T=8 fits exactly, without the T=4 state.
     EXPECT_EQ(query.max_tokens, 8);
     EXPECT_EQ(query.keys.size(), 3u);
-    EXPECT_TRUE(Has(query.keys, {.group_id = 1, .content_hash = prompt.hashes[1]}));
-    EXPECT_FALSE(Has(query.keys, {.group_id = 1, .content_hash = prompt.hashes[0]}));
+    EXPECT_TRUE(Has(query.keys, {.group_id = 1, .content_hash = ContentHash{prompt.hashes[1]}}));
+    EXPECT_FALSE(Has(query.keys, {.group_id = 1, .content_hash = ContentHash{prompt.hashes[0]}}));
     EXPECT_FALSE(Has(query.keys, {.group_id = 1, .content_hash = prefix.tail->hash}));
     cache.Restore(prefix, query.keys);
     EXPECT_EQ(cache.coordinator.ProbePromptPrefix(prefix).host.num_common_tokens, 8);
@@ -184,16 +184,16 @@ TEST(StorageQueryTest, ADeviceKvPrefixQueriesOnlyTheMissingCheckpoint) {
     QueryPrompt prompt(14, 4);
     for (std::size_t page = 0; page < 3; ++page) {
         CacheBlockRef block = cache.device.AcquireBlock(0);
-        cache.coordinator.CacheDeviceBlock(block, {.group_id = 0, .content_hash = prompt.hashes[page]},
+        cache.coordinator.CacheDeviceBlock(block, {.group_id = 0, .content_hash = ContentHash{prompt.hashes[page]}},
                                            static_cast<std::int32_t>(page), CacheBoundaryKind::kChunk,
                                            /*access_epoch=*/1);
     }
     const auto prefix = prompt.Prefix(13, false);
     const auto query = cache.coordinator.MissingStorageKeys(prefix, 3);
     EXPECT_EQ(query.max_tokens, 12);
-    const std::vector<CacheKey> checkpoints{{.group_id = 1, .content_hash = prompt.hashes[2]},
-                                            {.group_id = 2, .content_hash = prompt.hashes[2]},
-                                            {.group_id = 3, .content_hash = prompt.hashes[2]}};
+    const std::vector<CacheKey> checkpoints{{.group_id = 1, .content_hash = ContentHash{prompt.hashes[2]}},
+                                            {.group_id = 2, .content_hash = ContentHash{prompt.hashes[2]}},
+                                            {.group_id = 3, .content_hash = ContentHash{prompt.hashes[2]}}};
     EXPECT_EQ(query.keys, checkpoints);
     EXPECT_EQ(cache.Restore(prefix, query.keys), checkpoints);
     const auto probe = cache.coordinator.ProbePromptPrefix(prefix);
@@ -209,16 +209,16 @@ TEST(StorageQueryTest, ADeviceKvPrefixReservesOnlyItsHostSuffix) {
     QueryPrompt prompt(22, 4);
     for (std::size_t page = 0; page < 3; ++page) {
         CacheBlockRef block = cache.device.AcquireBlock(0);
-        cache.coordinator.CacheDeviceBlock(block, {.group_id = 0, .content_hash = prompt.hashes[page]},
+        cache.coordinator.CacheDeviceBlock(block, {.group_id = 0, .content_hash = ContentHash{prompt.hashes[page]}},
                                            static_cast<std::int32_t>(page), CacheBoundaryKind::kChunk,
                                            /*access_epoch=*/1);
     }
     const auto prefix = prompt.Prefix(21, false);
-    const std::vector<CacheKey> hits{{.group_id = 0, .content_hash = prompt.hashes[3]},
-                                     {.group_id = 0, .content_hash = prompt.hashes[4]},
-                                     {.group_id = 1, .content_hash = prompt.hashes[4]},
-                                     {.group_id = 2, .content_hash = prompt.hashes[4]},
-                                     {.group_id = 3, .content_hash = prompt.hashes[4]}};
+    const std::vector<CacheKey> hits{{.group_id = 0, .content_hash = ContentHash{prompt.hashes[3]}},
+                                     {.group_id = 0, .content_hash = ContentHash{prompt.hashes[4]}},
+                                     {.group_id = 1, .content_hash = ContentHash{prompt.hashes[4]}},
+                                     {.group_id = 2, .content_hash = ContentHash{prompt.hashes[4]}},
+                                     {.group_id = 3, .content_hash = ContentHash{prompt.hashes[4]}}};
     const auto reservation = cache.coordinator.ReserveStoragePrefix(prefix, hits, 64);
     EXPECT_EQ(reservation.keys, hits);
     EXPECT_EQ(reservation.blocks.size(), 5u);
@@ -233,14 +233,14 @@ TEST(StorageQueryTest, AReservationResumesBelowTheDeviceKvCoverage) {
     QueryPrompt prompt(18, 4);
     for (std::size_t page = 0; page < 4; ++page) {
         CacheBlockRef block = cache.device.AcquireBlock(0);
-        cache.coordinator.CacheDeviceBlock(block, {.group_id = 0, .content_hash = prompt.hashes[page]},
+        cache.coordinator.CacheDeviceBlock(block, {.group_id = 0, .content_hash = ContentHash{prompt.hashes[page]}},
                                            static_cast<std::int32_t>(page), CacheBoundaryKind::kChunk,
                                            /*access_epoch=*/1);
     }
     const auto prefix = prompt.Prefix(17, false);
-    const std::vector<CacheKey> hits{{.group_id = 1, .content_hash = prompt.hashes[1]},
-                                     {.group_id = 2, .content_hash = prompt.hashes[1]},
-                                     {.group_id = 3, .content_hash = prompt.hashes[1]}};
+    const std::vector<CacheKey> hits{{.group_id = 1, .content_hash = ContentHash{prompt.hashes[1]}},
+                                     {.group_id = 2, .content_hash = ContentHash{prompt.hashes[1]}},
+                                     {.group_id = 3, .content_hash = ContentHash{prompt.hashes[1]}}};
     EXPECT_EQ(cache.Restore(prefix, hits), hits);
     const auto probe = cache.coordinator.ProbePromptPrefix(prefix);
     EXPECT_EQ(probe.device.kv_tokens, 16);
@@ -263,8 +263,8 @@ TEST_P(StorageQueryWindowTest, AShorterCheckpointQueriesItsOwnSlidingWindow) {
     const auto query = cache.coordinator.MissingStorageKeys(prefix, 8);
     ASSERT_EQ(query.max_tokens, 11);
     ASSERT_TRUE(Has(query.keys, {.group_id = 1, .content_hash = prefix.tail->hash}));
-    ASSERT_TRUE(Has(query.keys, {.group_id = 1, .content_hash = prompt.hashes[1]}));
-    ASSERT_TRUE(Has(query.keys, {.group_id = 0, .content_hash = prompt.hashes[1], .page_offset = 0}));
+    ASSERT_TRUE(Has(query.keys, {.group_id = 1, .content_hash = ContentHash{prompt.hashes[1]}}));
+    ASSERT_TRUE(Has(query.keys, {.group_id = 0, .content_hash = ContentHash{prompt.hashes[1]}, .page_offset = 0}));
     std::vector<CacheKey> hits;
     for (const auto& key : query.keys) {
         if (key.group_id != 1 || key.content_hash != prefix.tail->hash) hits.push_back(key);
@@ -283,17 +283,17 @@ TEST(StorageQueryTest, AnOversizedMiddleFallbackDoesNotHideASmallerCompleteOne) 
                                             {.attn_kind = AttnKind::kState, .block_granularity = 0}};
     QueryCache cache(4, specs, 64);
     QueryPrompt prompt(11, 4);
-    const std::vector<CacheKey> warm{{.group_id = 0, .content_hash = prompt.hashes[0], .page_offset = 0}};
+    const std::vector<CacheKey> warm{{.group_id = 0, .content_hash = ContentHash{prompt.hashes[0]}, .page_offset = 0}};
     cache.Warm(warm);
     const auto prefix = prompt.Prefix(11, true);
     const auto query = cache.coordinator.MissingStorageKeys(prefix, 5);
     // T=11 costs three. T=8 needs three more, but warm T=4 needs only two.
     ASSERT_EQ(query.max_tokens, 11);
     ASSERT_EQ(query.keys.size(), 5u);
-    EXPECT_FALSE(Has(query.keys, {.group_id = 1, .content_hash = prompt.hashes[1]}));
-    EXPECT_FALSE(Has(query.keys, {.group_id = 0, .content_hash = prompt.hashes[1], .page_offset = 0}));
-    EXPECT_FALSE(Has(query.keys, {.group_id = 0, .content_hash = prompt.hashes[1], .page_offset = 1}));
-    EXPECT_TRUE(Has(query.keys, {.group_id = 1, .content_hash = prompt.hashes[0]}));
+    EXPECT_FALSE(Has(query.keys, {.group_id = 1, .content_hash = ContentHash{prompt.hashes[1]}}));
+    EXPECT_FALSE(Has(query.keys, {.group_id = 0, .content_hash = ContentHash{prompt.hashes[1]}, .page_offset = 0}));
+    EXPECT_FALSE(Has(query.keys, {.group_id = 0, .content_hash = ContentHash{prompt.hashes[1]}, .page_offset = 1}));
+    EXPECT_TRUE(Has(query.keys, {.group_id = 1, .content_hash = ContentHash{prompt.hashes[0]}}));
     std::vector<CacheKey> hits;
     for (const auto& key : query.keys) {
         if (key.group_id != 1 || key.content_hash != prefix.tail->hash) hits.push_back(key);
@@ -306,8 +306,8 @@ TEST(StorageQueryTest, AnOversizedMiddleFallbackDoesNotHideASmallerCompleteOne) 
 TEST(StorageQueryTest, EvictedWarmObjectsCannotBeAssumedPresentByTheReadReservation) {
     QueryCache cache(4, FullAndStates(4, 2, 0), 64);
     QueryPrompt prompt(8, 4);
-    const std::vector<CacheKey> warm{{.group_id = 0, .content_hash = prompt.hashes[0], .page_offset = 0},
-                                     {.group_id = 0, .content_hash = prompt.hashes[0], .page_offset = 1}};
+    const std::vector<CacheKey> warm{{.group_id = 0, .content_hash = ContentHash{prompt.hashes[0]}, .page_offset = 0},
+                                     {.group_id = 0, .content_hash = ContentHash{prompt.hashes[0]}, .page_offset = 1}};
     cache.Warm(warm);
     const auto prefix = prompt.Prefix(8, false);
     const auto query = cache.coordinator.MissingStorageKeys(prefix, 2);
@@ -331,13 +331,13 @@ TEST(StorageQueryTest, APartialHostBoundaryUsesAlignedQueryFloorAndDeviceReserva
     QueryCache cache(4, FullAndStates(4, 2, 1), 64);
     QueryPrompt prompt(11, 4);
     const auto warm_prefix = prompt.Prefix(7, true);
-    const std::vector<CacheKey> warm{{.group_id = 0, .content_hash = prompt.hashes[0], .page_offset = 0},
-                                     {.group_id = 0, .content_hash = prompt.hashes[0], .page_offset = 1},
+    const std::vector<CacheKey> warm{{.group_id = 0, .content_hash = ContentHash{prompt.hashes[0]}, .page_offset = 0},
+                                     {.group_id = 0, .content_hash = ContentHash{prompt.hashes[0]}, .page_offset = 1},
                                      {.group_id = 0, .content_hash = warm_prefix.tail->hash, .page_offset = 0},
                                      {.group_id = 0, .content_hash = warm_prefix.tail->hash, .page_offset = 1},
                                      {.group_id = 1, .content_hash = warm_prefix.tail->hash}};
     cache.Warm(warm);
-    cache.coordinator.CacheHostTail(prompt.hashes[0], *warm_prefix.tail);
+    cache.coordinator.CacheHostTail(ContentHash{prompt.hashes[0]}, *warm_prefix.tail);
     const auto prefix = prompt.Prefix(11, true);
     const auto local = cache.coordinator.ProbePromptPrefix(prefix);
     ASSERT_EQ(local.host.num_common_tokens, 7);
@@ -346,8 +346,8 @@ TEST(StorageQueryTest, APartialHostBoundaryUsesAlignedQueryFloorAndDeviceReserva
     const auto query = cache.coordinator.MissingStorageKeys(prefix, 5);
     ASSERT_EQ(query.max_tokens, 11);
     ASSERT_EQ(query.keys.size(), 5u);
-    EXPECT_TRUE(Has(query.keys, {.group_id = 0, .content_hash = prompt.hashes[1], .page_offset = 0}));
-    EXPECT_TRUE(Has(query.keys, {.group_id = 0, .content_hash = prompt.hashes[1], .page_offset = 1}));
+    EXPECT_TRUE(Has(query.keys, {.group_id = 0, .content_hash = ContentHash{prompt.hashes[1]}, .page_offset = 0}));
+    EXPECT_TRUE(Has(query.keys, {.group_id = 0, .content_hash = ContentHash{prompt.hashes[1]}, .page_offset = 1}));
     const auto reservation = cache.coordinator.ReserveStoragePrefix(prefix, query.keys, 64);
     EXPECT_EQ(reservation.keys.size(), 5u);
     EXPECT_EQ(cache.coordinator.NumPinnedHostCachedBlocks(), 0);
@@ -365,17 +365,17 @@ TEST(StorageQuerySwaFloorTest, QuerySkipsBelowHostFloorAndWarmPinsEndWithReserva
     QueryCache cache(4, specs, 64);
     QueryPrompt prompt(9, 4);
     const auto warm_prefix = prompt.Prefix(7, true);
-    const std::vector<CacheKey> warm{{.group_id = 0, .content_hash = prompt.hashes[0], .page_offset = 0},
-                                     {.group_id = 0, .content_hash = prompt.hashes[0], .page_offset = 1},
+    const std::vector<CacheKey> warm{{.group_id = 0, .content_hash = ContentHash{prompt.hashes[0]}, .page_offset = 0},
+                                     {.group_id = 0, .content_hash = ContentHash{prompt.hashes[0]}, .page_offset = 1},
                                      {.group_id = 0, .content_hash = warm_prefix.tail->hash, .page_offset = 0},
                                      {.group_id = 0, .content_hash = warm_prefix.tail->hash, .page_offset = 1},
                                      {.group_id = 1, .content_hash = warm_prefix.tail->hash},
-                                     {.group_id = 2, .content_hash = prompt.hashes[0], .page_offset = 0},
-                                     {.group_id = 2, .content_hash = prompt.hashes[0], .page_offset = 1},
+                                     {.group_id = 2, .content_hash = ContentHash{prompt.hashes[0]}, .page_offset = 0},
+                                     {.group_id = 2, .content_hash = ContentHash{prompt.hashes[0]}, .page_offset = 1},
                                      {.group_id = 2, .content_hash = warm_prefix.tail->hash, .page_offset = 0},
                                      {.group_id = 2, .content_hash = warm_prefix.tail->hash, .page_offset = 1}};
     cache.Warm(warm);
-    cache.coordinator.CacheHostTail(prompt.hashes[0], *warm_prefix.tail);
+    cache.coordinator.CacheHostTail(ContentHash{prompt.hashes[0]}, *warm_prefix.tail);
     const auto prefix = prompt.Prefix(9, true);
     const auto local = cache.coordinator.ProbePromptPrefix(prefix);
     ASSERT_EQ(local.host.num_common_tokens, 7);
@@ -396,26 +396,28 @@ TEST(StorageQuerySwaFloorTest, QuerySkipsBelowHostFloorAndWarmPinsEndWithReserva
     EXPECT_EQ(cache.coordinator.NumPinnedHostCachedBlocks(), pinned_before);
     ASSERT_EQ(query.max_tokens, 9);
     ASSERT_EQ(query.keys.size(), 7u);
-    const std::vector<CacheKey> expected_query{{.group_id = 0, .content_hash = prompt.hashes[1], .page_offset = 0},
-                                               {.group_id = 0, .content_hash = prompt.hashes[1], .page_offset = 1},
-                                               {.group_id = 0, .content_hash = prefix.tail->hash, .page_offset = 0},
-                                               {.group_id = 1, .content_hash = prefix.tail->hash},
-                                               {.group_id = 2, .content_hash = prompt.hashes[1], .page_offset = 0},
-                                               {.group_id = 2, .content_hash = prompt.hashes[1], .page_offset = 1},
-                                               {.group_id = 2, .content_hash = prefix.tail->hash, .page_offset = 0}};
+    const std::vector<CacheKey> expected_query{
+        {.group_id = 0, .content_hash = ContentHash{prompt.hashes[1]}, .page_offset = 0},
+        {.group_id = 0, .content_hash = ContentHash{prompt.hashes[1]}, .page_offset = 1},
+        {.group_id = 0, .content_hash = prefix.tail->hash, .page_offset = 0},
+        {.group_id = 1, .content_hash = prefix.tail->hash},
+        {.group_id = 2, .content_hash = ContentHash{prompt.hashes[1]}, .page_offset = 0},
+        {.group_id = 2, .content_hash = ContentHash{prompt.hashes[1]}, .page_offset = 1},
+        {.group_id = 2, .content_hash = prefix.tail->hash, .page_offset = 0}};
     for (const auto& key : expected_query) EXPECT_TRUE(Has(query.keys, key));
-    EXPECT_FALSE(Has(query.keys, {.group_id = 2, .content_hash = prompt.hashes[0], .page_offset = 0}));
-    EXPECT_FALSE(Has(query.keys, {.group_id = 2, .content_hash = prompt.hashes[0], .page_offset = 1}));
+    EXPECT_FALSE(Has(query.keys, {.group_id = 2, .content_hash = ContentHash{prompt.hashes[0]}, .page_offset = 0}));
+    EXPECT_FALSE(Has(query.keys, {.group_id = 2, .content_hash = ContentHash{prompt.hashes[0]}, .page_offset = 1}));
 
     const auto reservation = cache.coordinator.ReserveStoragePrefix(prefix, query.keys, 64);
     EXPECT_EQ(pool_facts(cache.device), device_before);
     ASSERT_EQ(reservation.keys.size(), 7u);
     ASSERT_EQ(reservation.blocks.size(), 7u);
     EXPECT_EQ(cache.coordinator.NumPinnedHostCachedBlocks(), pinned_before);
-    const std::vector<CacheKey> expected_warm{{.group_id = 0, .content_hash = prompt.hashes[0], .page_offset = 0},
-                                              {.group_id = 0, .content_hash = prompt.hashes[0], .page_offset = 1},
-                                              // T=9, W=8 needs [2, 9): this block is below Query's F=4.
-                                              {.group_id = 2, .content_hash = prompt.hashes[0], .page_offset = 1}};
+    const std::vector<CacheKey> expected_warm{
+        {.group_id = 0, .content_hash = ContentHash{prompt.hashes[0]}, .page_offset = 0},
+        {.group_id = 0, .content_hash = ContentHash{prompt.hashes[0]}, .page_offset = 1},
+        // T=9, W=8 needs [2, 9): this block is below Query's F=4.
+        {.group_id = 2, .content_hash = ContentHash{prompt.hashes[0]}, .page_offset = 1}};
     for (const auto& key : expected_warm) {
         EXPECT_TRUE(cache.coordinator.ContainsHostCachedBlock(key));
     }
@@ -439,9 +441,9 @@ TEST_P(StorageWarmLifetimeTest, ExistingDependenciesRemainEvictableAcrossTheGetL
     QueryCache cache(4, specs, 32);
     QueryPrompt prompt(8, 4);
     const auto prefix = prompt.Prefix(8, false);
-    const std::vector<CacheKey> warm{{.group_id = 0, .content_hash = prompt.hashes[0]},
-                                     {.group_id = 1, .content_hash = prompt.hashes[1]},
-                                     {.group_id = 2, .content_hash = prompt.hashes[0], .page_offset = 1}};
+    const std::vector<CacheKey> warm{{.group_id = 0, .content_hash = ContentHash{prompt.hashes[0]}},
+                                     {.group_id = 1, .content_hash = ContentHash{prompt.hashes[1]}},
+                                     {.group_id = 2, .content_hash = ContentHash{prompt.hashes[0]}, .page_offset = 1}};
     cache.Warm(warm);
     const auto query = cache.coordinator.MissingStorageKeys(prefix, 64);
     StorageLease read = cache.storage.StartRead(prefix, query.keys);

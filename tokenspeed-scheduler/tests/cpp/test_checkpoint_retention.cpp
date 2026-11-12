@@ -49,7 +49,7 @@ struct Checkpoint {
         ContentHash prior;
         for (std::size_t i = 0; i + kPage <= tokens.size(); i += kPage) {
             prior = HashPrefixPage(std::span{tokens}.subspan(i, kPage), prior);
-            hashes.push_back(prior);
+            hashes.push_back(prior.ToString());
         }
         if (tokens.size() % kPage != 0) {
             tail = TailPublication{.tail_tokens = static_cast<std::int32_t>(tokens.size() % kPage),

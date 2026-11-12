@@ -480,7 +480,7 @@ std::vector<CacheKey> CacheCoordinator::keysForGroup(std::span<const std::string
         for (std::int32_t offset = 0; offset < pages_per_prefix_hash; ++offset) {
             keys.push_back(CacheKey{
                 .group_id = group_id,
-                .content_hash = content_hash,
+                .content_hash = ContentHash{content_hash},
                 .page_offset = offset,
             });
         }
@@ -704,7 +704,7 @@ bool CacheCoordinator::groupAcceptsBoundary(std::size_t i, std::span<const std::
         // An aligned boundary is keyed by the chain hash of its last page.
         _assert(full_tokens > 0 && full_tokens % prefix_granularity_ == 0, "a page boundary past page 0");
         const auto page = static_cast<std::size_t>(full_tokens / prefix_granularity_) - 1;
-        const CacheKey key{.group_id = group.Id(), .content_hash = prefix_hashes[page], .page_offset = 0};
+        const CacheKey key{.group_id = group.Id(), .content_hash = ContentHash{prefix_hashes[page]}, .page_offset = 0};
         if (!contains(key)) {
             return false;
         }
@@ -747,9 +747,10 @@ bool CacheCoordinator::groupAcceptsBoundary(std::size_t i, std::span<const std::
         if (block < floor_blocks) {
             continue;
         }
-        const CacheKey page_key{.group_id = group.Id(),
-                                .content_hash = prefix_hashes[static_cast<std::size_t>(block / blocks_per_page)],
-                                .page_offset = block % blocks_per_page};
+        const CacheKey page_key{
+            .group_id = group.Id(),
+            .content_hash = ContentHash{prefix_hashes[static_cast<std::size_t>(block / blocks_per_page)]},
+            .page_offset = block % blocks_per_page};
         if (!contains(page_key)) {
             return false;
         }
@@ -1232,11 +1233,12 @@ std::vector<CacheCoordinator::PrefixBoundaryAvailability> CacheCoordinator::Insp
                     bool available = true;
                     if (GroupIsState(i)) {
                         const CacheKey key =
-                            tail_tokens > 0 ? tail_keys[0]
-                                            : CacheKey{.group_id = groups_[i].Id(),
-                                                       .content_hash = prompt.prefix_hashes[static_cast<std::size_t>(
-                                                           page_tokens / prefix_granularity_ - 1)],
-                                                       .page_offset = 0};
+                            tail_tokens > 0
+                                ? tail_keys[0]
+                                : CacheKey{.group_id = groups_[i].Id(),
+                                           .content_hash = ContentHash{prompt.prefix_hashes[static_cast<std::size_t>(
+                                               page_tokens / prefix_granularity_ - 1)]},
+                                           .page_offset = 0};
                         available = contains(i, key, tier);
                     } else {
                         const std::int32_t granularity = geometry_[i].BlockGranularity();
@@ -2410,7 +2412,7 @@ void CacheCoordinator::recordCheckpoints(const CompletedPages& completed, std::u
         const auto pages = static_cast<std::size_t>(completed.state_checkpoint_pages);
         if (checkpoints_.Observe(completed.tokens.first(pages * static_cast<std::size_t>(prefix_granularity_)),
                                  completed.prefix_hashes.first(pages), std::nullopt, access_epoch)) {
-            syncCheckpoint(completed.prefix_hashes[pages - 1]);
+            syncCheckpoint(ContentHash{completed.prefix_hashes[pages - 1]});
         }
     }
     if (completed.publish_state &&
@@ -2509,7 +2511,8 @@ CacheKey CacheCoordinator::historyBlockKey(std::size_t group_index, const Comple
     if (block < full_blocks) {
         return CacheKey{
             .group_id = groups_[group_index].Id(),
-            .content_hash = completed.prefix_hashes[static_cast<std::size_t>(block / pages_per_prefix_hash)],
+            .content_hash =
+                ContentHash{completed.prefix_hashes[static_cast<std::size_t>(block / pages_per_prefix_hash)]},
             .page_offset = block % pages_per_prefix_hash};
     }
     _assert(completed.tail.has_value() && block - full_blocks < TailBlocksFor(static_cast<std::int32_t>(group_index),
@@ -2645,7 +2648,9 @@ void CacheCoordinator::cacheCompletedBlocksForGroup(std::size_t group_index, Blo
                     "an in-forward State checkpoint lies inside the hashed prefix");
             const CacheKey key{
                 .group_id = groups_[group_index].Id(),
-                .content_hash = completed.prefix_hashes[static_cast<std::size_t>(completed.state_checkpoint_pages - 1)],
+                .content_hash =
+                    ContentHash{
+                        completed.prefix_hashes[static_cast<std::size_t>(completed.state_checkpoint_pages - 1)]},
                 .page_offset = 0};
             cacheBlocksForGroup<Tier>(group_index, completed.state_checkpoint_blocks.subspan(group_index, 1),
                                       std::span<const CacheKey>(&key, 1), /*first_logical_block=*/1, access_epoch,
@@ -2725,8 +2730,9 @@ std::vector<CacheBlockRef> CacheCoordinator::RetainInputCheckpoint(std::span<con
             continue;
         }
         if (GroupIsState(i)) {
-            if (!retain(CacheKey{.group_id = groups_[i].Id(),
-                                 .content_hash = prefix_hashes[static_cast<std::size_t>(boundary_pages - 1)]})) {
+            if (!retain(CacheKey{
+                    .group_id = groups_[i].Id(),
+                    .content_hash = ContentHash{prefix_hashes[static_cast<std::size_t>(boundary_pages - 1)]}})) {
                 return {};
             }
             continue;
@@ -2734,9 +2740,10 @@ std::vector<CacheBlockRef> CacheCoordinator::RetainInputCheckpoint(std::span<con
         const BlockRange window = SlidingWindowBlocks(static_cast<std::int32_t>(i), boundary_tokens);
         const std::int32_t blocks_per_boundary = BlocksPerBoundary(static_cast<std::int32_t>(i));
         for (std::int32_t slot = window.first; slot < window.past_end; ++slot) {
-            if (!retain(CacheKey{.group_id = groups_[i].Id(),
-                                 .content_hash = prefix_hashes[static_cast<std::size_t>(slot / blocks_per_boundary)],
-                                 .page_offset = slot % blocks_per_boundary})) {
+            if (!retain(CacheKey{
+                    .group_id = groups_[i].Id(),
+                    .content_hash = ContentHash{prefix_hashes[static_cast<std::size_t>(slot / blocks_per_boundary)]},
+                    .page_offset = slot % blocks_per_boundary})) {
                 return {};
             }
         }

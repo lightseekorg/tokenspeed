@@ -87,7 +87,7 @@ TEST(CacheEvictionCandidates, PrescanReplaysPolicyOrderAcrossPinnedEpochsAndSnap
             groups.emplace_back(spec, std::make_unique<GroupAllocator>(1, group, 1), MakePrefixMatcher(spec));
             for (int i = 0; i < (group == 0 ? 10000 : 32); ++i) {
                 auto block = pool.AcquireBlock(group);
-                const CacheKey key{.group_id = group, .content_hash = std::to_string(i)};
+                const CacheKey key{.group_id = group, .content_hash = ContentHash{std::to_string(i)}};
                 groups.back().Index().Register(pool, block, key, static_cast<std::uint64_t>(i / 16 + 1), i,
                                                CacheBoundaryKind::kChunk, nullptr, nullptr);
                 if (i >= 16 && i < 32) pinned.push_back(block);
@@ -150,9 +150,9 @@ TEST(CacheEvictionCandidates, EpochsLeaveInPolicyOrderOnAnyPhysicalLayout) {
     int next_key = 0;
     const auto add = [&](std::uint32_t group, std::int32_t position, CacheBoundaryKind kind) {
         CacheBlockRef block = pool.AcquireBlock(group);
-        groups[group].Index().Register(pool, block,
-                                       CacheKey{.group_id = group, .content_hash = std::to_string(next_key++)},
-                                       epochs.size(), position, kind, nullptr, nullptr);
+        groups[group].Index().Register(
+            pool, block, CacheKey{.group_id = group, .content_hash = ContentHash{std::to_string(next_key++)}},
+            epochs.size(), position, kind, nullptr, nullptr);
         epochs.back().push_back(Entry{group, block->Location().lcm_block_id, position, kind});
     };
     const auto start_epoch = [&] { epochs.emplace_back(); };

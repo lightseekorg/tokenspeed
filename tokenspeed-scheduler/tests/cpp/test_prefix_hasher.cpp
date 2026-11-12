@@ -20,6 +20,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cctype>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -29,6 +30,7 @@
 #include <string>
 #include <vector>
 
+#include "cache/core/content_hash.h"
 #include "cache/core/hex_codec.h"
 #include "cache/prefix/prefix_hasher.h"
 #include "core/token_container.h"
@@ -281,6 +283,26 @@ TEST(HashPrefixPageTest, TailHashesAreDistinctFromThePageAndFromEachOther) {
     // The page's own chain hash is what a tail's prior names, so a tail of
     // the next page never collides with a tail of this one.
     EXPECT_NE(HashPrefixPage(token_span(page.data(), 1), full), tails[0]);
+}
+
+// The identity overload chains the bytes the text overload decodes from the
+// prior's text: an empty prior, a canonical digest (decoded from its text by
+// one, read directly by the other) and opaque text, including uppercase hex,
+// odd lengths and embedded nulls.
+TEST(HashPrefixPageTest, AnIdentityPriorHashesLikeItsText) {
+    const std::vector<std::int32_t> tokens = {7, -1, 0, 2147483647, 42};
+    const std::string canonical = HashPrefixPage(Tokens({1, 2, 3}), "");
+    std::string uppercase = canonical;
+    for (char& c : uppercase) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    const std::vector<std::string> priors{
+        "", canonical, std::string(64, '0'), uppercase, "opaque-key", std::string("a\0b", 3), std::string(63, 'f')};
+    for (const std::string& prior : priors) {
+        for (const token_span page : {Tokens(tokens), token_span{}}) {
+            const ContentHash hash = HashPrefixPage(page, ContentHash{prior});
+            EXPECT_EQ(hash.ToString(), HashPrefixPage(page, prior)) << prior;
+            ASSERT_NE(hash.digest(), nullptr) << "a page hash is a canonical identity";
+        }
+    }
 }
 
 TEST(HashPrefixPageTest, EmptyExtraKeysEqualsTwoArgForm) {

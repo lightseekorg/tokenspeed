@@ -275,7 +275,7 @@ void Scheduler::registerKvEventPrefixPages(Request& request, std::span<const std
 
     for (std::size_t i = static_cast<std::size_t>(first_page); i < prefix_hashes.size(); ++i) {
         const std::span<const std::int32_t> tokens = token_pages[i - static_cast<std::size_t>(first_page)];
-        CacheKey key{.content_hash = prefix_hashes[i]};
+        CacheKey key{.content_hash = ContentHash{prefix_hashes[i]}};
         const std::optional<std::uint64_t> parent_hash =
             i == 0 ? std::nullopt : std::optional<std::uint64_t>{block_hashes[i - 1]};
         KvBlockStoredEvent event{

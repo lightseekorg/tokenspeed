@@ -63,7 +63,8 @@ std::vector<std::string> MakeHashes(std::int32_t count) {
 }
 
 CacheKey KeyFor(const std::string& content_hash, std::uint32_t group_id) {
-    return CacheKey{.namespace_id = kDefaultCacheNamespaceId, .group_id = group_id, .content_hash = content_hash};
+    return CacheKey{
+        .namespace_id = kDefaultCacheNamespaceId, .group_id = group_id, .content_hash = ContentHash{content_hash}};
 }
 
 std::uint64_t g_epoch = 0;
@@ -342,7 +343,9 @@ TEST_P(HostSuffixHitInvariantsTest, HitsAreRestorableMaximalAndNeverReloadDevice
                         if (present[tier][row][group]) {
                             CacheBlockFor(
                                 coordinator, pool,
-                                row < kFirstTailRow ? ContentHash{hashes[row]} : tail_hash[row - kFirstTailRow], group);
+                                (row < kFirstTailRow ? ContentHash{hashes[row]} : tail_hash[row - kFirstTailRow])
+                                    .ToString(),
+                                group);
                         }
                     }
                 }
@@ -523,11 +526,11 @@ TEST_P(SegmentEvictionInvariantsTest, DeviceCoverageStaysClosedFromTheRootUnderS
             }
             session.hashes = ComputePrefixHashes(pages, "");
             if (num_tokens % kP != 0) {
-                session.tail =
-                    TailPublication{.tail_tokens = num_tokens % kP,
-                                    .hash = HashPrefixPage(std::span<const std::int32_t>(session.tokens)
-                                                               .subspan(static_cast<std::size_t>(full_pages * kP)),
-                                                           session.hashes.back())};
+                session.tail = TailPublication{
+                    .tail_tokens = num_tokens % kP,
+                    .hash = ContentHash{HashPrefixPage(std::span<const std::int32_t>(session.tokens)
+                                                           .subspan(static_cast<std::size_t>(full_pages * kP)),
+                                                       session.hashes.back())}};
             }
 
             // Resume on what the Device holds, below the last token.
@@ -629,11 +632,12 @@ TEST_P(SegmentEvictionInvariantsTest, DeviceCoverageStaysClosedFromTheRootUnderS
                             << "round " << round << ": page " << page << " outlives its parent";
                     }
                     if (collect) {
-                        EXPECT_GT(tree.Find(published.hashes[page])->checkpoint_boundaries_in_subtree[0], 0)
+                        EXPECT_GT(tree.Find(ContentHash{published.hashes[page]})->checkpoint_boundaries_in_subtree[0],
+                                  0)
                             << "round " << round << ": page " << page << " is dead";
                     }
                 }
-                if (published.tail && on_device(published.tail->hash)) {
+                if (published.tail && on_device(published.tail->hash.ToString())) {
                     EXPECT_TRUE(on_device(published.hashes.back()))
                         << "round " << round << ": a tail outlives its prior";
                 }
@@ -815,10 +819,11 @@ TEST(JointMatchInvariantsTest, AvailabilityIncludesUnalignedTailAndStateOnAnothe
     CacheBlockFor(coordinator, device, hashes[0], 0);
     CacheBlockFor(coordinator, device, hashes[0], 1);
     CacheBlockFor(coordinator, host, tail_hash, 0);
-    const CacheCoordinator::PromptPrefix prompt{.prefix_hashes = hashes,
-                                                .tokens = tokens,
-                                                .max_tokens = 6,
-                                                .tail = TailPublication{.tail_tokens = 2, .hash = tail_hash}};
+    const CacheCoordinator::PromptPrefix prompt{
+        .prefix_hashes = hashes,
+        .tokens = tokens,
+        .max_tokens = 6,
+        .tail = TailPublication{.tail_tokens = 2, .hash = ContentHash{tail_hash}}};
     auto rows = coordinator.InspectPrefixAvailability(prompt);
     ASSERT_EQ(rows.size(), 2u);
     EXPECT_EQ(rows[0].tokens, 6);
@@ -844,7 +849,7 @@ TEST(JointMatchInvariantsTest, NodeEntriesTrackPartialCheckpointsOnEachTier) {
                                        /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
                                        /*write_back_evictions=*/true, /*checkpoint_retention_requests=*/0);
     const auto entries = [&](const BlockPool& pool) {
-        return CacheCoordinatorTestAccess::NodeEntries(coordinator, pool, "page");
+        return CacheCoordinatorTestAccess::NodeEntries(coordinator, pool, ContentHash{"page"});
     };
     const auto groups = [&](const BlockPool& pool) {
         std::vector<std::uint32_t> result;

@@ -403,7 +403,7 @@ private:
         std::size_t first = prefix_hashes.size();
         PrefixSegment* parent = nullptr;
         while (first > 0) {
-            if (const auto it = prefixes_.find(prefix_hashes[first - 1]); it != prefixes_.end()) {
+            if (const auto it = prefixes_.find(ContentHash{prefix_hashes[first - 1]}); it != prefixes_.end()) {
                 parent = it->second.get();
                 break;
             }
@@ -414,7 +414,7 @@ private:
         for (std::size_t i = first; i < prefix_hashes.size(); ++i) {
             const auto page_tokens = tokens.subspan(i * page, page);
             auto segment = std::make_unique<PrefixSegment>(PrefixSegment{
-                .hash = prefix_hashes[i],
+                .hash = ContentHash{prefix_hashes[i]},
                 .tokens = {page_tokens.begin(), page_tokens.end()},
                 .parent = parent,
                 .depth = static_cast<std::int32_t>(i + 1),

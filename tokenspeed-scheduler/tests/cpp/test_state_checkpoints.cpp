@@ -5691,11 +5691,11 @@ TEST(InputCheckpointRetention, HoldsCompleteDependenciesAcrossTiersAndReleasesIn
             MakeCoordinator(specs, 4, device, false, &host, nullptr, false, true, /*checkpoint_retention_requests=*/0);
         const std::vector<std::string> hashes{"first", "second"};
         const std::vector<CacheKey> keys{
-            {.group_id = 1, .content_hash = hashes[1]},
-            {.group_id = 2, .content_hash = hashes[1]},
-            {.group_id = 3, .content_hash = hashes[0], .page_offset = 1},
-            {.group_id = 3, .content_hash = hashes[1], .page_offset = 0},
-            {.group_id = 3, .content_hash = hashes[1], .page_offset = 1},
+            {.group_id = 1, .content_hash = ContentHash{hashes[1]}},
+            {.group_id = 2, .content_hash = ContentHash{hashes[1]}},
+            {.group_id = 3, .content_hash = ContentHash{hashes[0]}, .page_offset = 1},
+            {.group_id = 3, .content_hash = ContentHash{hashes[1]}, .page_offset = 0},
+            {.group_id = 3, .content_hash = ContentHash{hashes[1]}, .page_offset = 1},
         };
         std::vector<std::uint64_t> epochs;
         for (std::size_t i = 0; i < keys.size(); ++i) {
@@ -5761,8 +5761,8 @@ TEST(InputCheckpointRetention, RefreshPreservesSessionOwnershipAcrossTiers) {
                           /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, std::nullopt, false, "session");
     ASSERT_TRUE(admitted);
     const std::vector<std::string> hashes{"checkpoint"};
-    const CacheKey device_key{.group_id = 0, .content_hash = hashes[0]};
-    const CacheKey host_key{.group_id = 1, .content_hash = hashes[0]};
+    const CacheKey device_key{.group_id = 0, .content_hash = ContentHash{hashes[0]}};
+    const CacheKey host_key{.group_id = 1, .content_hash = ContentHash{hashes[0]}};
     {
         auto block = device.AcquireBlock(0);
         coordinator.CacheDeviceBlock(block, device_key, 0, CacheBoundaryKind::kEndpoint, admitted->access_epoch);

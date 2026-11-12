@@ -226,10 +226,14 @@ TEST(ForwardCacheOpsPrefill, ChunkSlidesSwaWindowAndKeepsPunchedPageHashes) {
     // free before four fresh pages are acquired, for a net cost of two.
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), free_before_chunk - 2);
 
-    EXPECT_FALSE(coordinator.GroupPrefixIndex(1).Contains(pool, CacheKey{.group_id = 1, .content_hash = hashes[0]}));
-    EXPECT_FALSE(coordinator.GroupPrefixIndex(1).Contains(pool, CacheKey{.group_id = 1, .content_hash = hashes[1]}));
-    EXPECT_TRUE(coordinator.GroupPrefixIndex(1).Contains(pool, CacheKey{.group_id = 1, .content_hash = hashes[2]}));
-    EXPECT_TRUE(coordinator.GroupPrefixIndex(1).Contains(pool, CacheKey{.group_id = 1, .content_hash = hashes[3]}));
+    EXPECT_FALSE(coordinator.GroupPrefixIndex(1).Contains(
+        pool, CacheKey{.group_id = 1, .content_hash = ContentHash{hashes[0]}}));
+    EXPECT_FALSE(coordinator.GroupPrefixIndex(1).Contains(
+        pool, CacheKey{.group_id = 1, .content_hash = ContentHash{hashes[1]}}));
+    EXPECT_TRUE(coordinator.GroupPrefixIndex(1).Contains(
+        pool, CacheKey{.group_id = 1, .content_hash = ContentHash{hashes[2]}}));
+    EXPECT_TRUE(coordinator.GroupPrefixIndex(1).Contains(
+        pool, CacheKey{.group_id = 1, .content_hash = ContentHash{hashes[3]}}));
 }
 
 // The first decode step (query at position P) only reads keys back to P - W + 1.
