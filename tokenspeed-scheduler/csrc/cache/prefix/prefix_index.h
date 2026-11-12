@@ -80,6 +80,14 @@ private:
     // std::map's ordering.
     class OrderIndex {
     public:
+        OrderIndex() = default;
+        // The hint points into this very map: a copy or a move would leave it
+        // pointing at the original.
+        OrderIndex(const OrderIndex&) = delete;
+        OrderIndex& operator=(const OrderIndex&) = delete;
+        OrderIndex(OrderIndex&&) = delete;
+        OrderIndex& operator=(OrderIndex&&) = delete;
+
         auto begin() const { return entries_.begin(); }
         auto end() const { return entries_.end(); }
         auto rbegin() const { return entries_.rbegin(); }
@@ -858,6 +866,13 @@ private:
 
     struct CacheEntries {
         CacheEntries(std::int32_t packing, std::int32_t parents) : by_location{packing, parents} {}
+        // The entry list allocates from entry_memory, the order indices and
+        // lookup tables point into the list, and cursors and common peers
+        // point at this object: it never copies or moves.
+        CacheEntries(const CacheEntries&) = delete;
+        CacheEntries& operator=(const CacheEntries&) = delete;
+        CacheEntries(CacheEntries&&) = delete;
+        CacheEntries& operator=(CacheEntries&&) = delete;
         // Owns each CacheEntry once. The maps are non-owning secondary indices
         // into stable list nodes. available_order keeps eviction candidates
         // sorted by age; common_order keeps shared keys in source age order.

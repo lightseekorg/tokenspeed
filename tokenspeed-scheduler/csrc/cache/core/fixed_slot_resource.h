@@ -41,6 +41,12 @@ public:
     explicit FixedSlotResource(std::size_t slots_per_chunk) : slots_per_chunk_{slots_per_chunk} {
         FatalCheck(slots_per_chunk > 0, "a slot chunk must hold at least one object");
     }
+    // Containers keep a pointer to their resource, and their nodes live in
+    // its chunks: a copy or a move would strand them.
+    FixedSlotResource(const FixedSlotResource&) = delete;
+    FixedSlotResource& operator=(const FixedSlotResource&) = delete;
+    FixedSlotResource(FixedSlotResource&&) = delete;
+    FixedSlotResource& operator=(FixedSlotResource&&) = delete;
 
 private:
     struct FreeSlot {
