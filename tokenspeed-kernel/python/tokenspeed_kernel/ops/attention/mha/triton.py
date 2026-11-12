@@ -267,10 +267,14 @@ if current_platform().is_npu:
             ("q", "k_cache", "v_cache"), "dense", _PORTABLE_DTYPES
         ),
         priority=Priority.PERFORMANT,
+        # No q_len bound: one query is plain decode and a wider call is a
+        # speculative verify window, which FIA serves causally right-aligned.
         traits={
             **_NPU_OPTIONS,
-            "q_len": frozenset({1}),
             "page_size": frozenset({64, 128}),
+            # A token sink has no Ascend mask, so a sink-bearing layer stays on
+            # the portable solution.
+            "window_sink": frozenset({False}),
         },
     )
     def torch_npu_mha_decode_with_kvcache(**kwargs):

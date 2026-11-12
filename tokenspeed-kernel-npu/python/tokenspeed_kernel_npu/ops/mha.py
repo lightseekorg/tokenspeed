@@ -159,6 +159,7 @@ def mha_decode_with_kvcache(
     max_seqlen_k: int,
     max_seqlen_q: int = 1,
     window_left: int = -1,
+    window_sink: int = 0,
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
     return_lse: bool = False,
@@ -168,27 +169,44 @@ def mha_decode_with_kvcache(
     v_scale: torch.Tensor | None = None,
     enable_pdl: bool = False,
 ) -> torch.Tensor:
-    """Run fixed-shape, graph-capturable decode over a paged K/V cache."""
+    """Run fixed-shape, graph-capturable decode over a paged K/V cache.
+
+    ``max_seqlen_q == 1`` is plain decode. A larger value is a speculative
+    verify window: request ``b``'s ``t``-th query attends the cache prefix
+    through its own position, i.e. causal right-aligned so the window's last
+    row sees every cached key and the first row sees ``seq_len - q_len + 1``.
+    FIA expresses that with ``sparse_mode=3`` plus a triangular mask; its
+    default (no mask) aligns the window at the start instead, which is the
+    wrong span for verify.
+    """
     _check_options(
         window_left=window_left,
         logit_cap=logit_cap,
         sinks=sinks,
         return_lse=return_lse,
     )
-    if max_seqlen_q != 1:
-        raise NotImplementedError("Ascend MHA decode supports one query per request")
+    if window_sink:
+        raise NotImplementedError("Ascend MHA does not support attention sinks")
     if q_scale is not None or k_scale is not None or v_scale is not None:
         raise NotImplementedError("Ascend MHA does not support scaled FP8 cache")
 
     del max_seqlen_k, enable_pdl
     batch_size = cache_seqlens.shape[0]
+    q_len = max_seqlen_q
+    # Every query row needs a non-empty causal span, so the capture stub must
+    # reach the window width; a stale length of 1 overflows the earlier rows.
+    placeholder = max(1, q_len)
     actual_seq_lengths_kv = (
-        [1] * batch_size if torch.npu.is_current_stream_capturing() else cache_seqlens
+        [placeholder] * batch_size
+        if torch.npu.is_current_stream_capturing()
+        else cache_seqlens
     )
+    verify_window = q_len > 1
     output, _ = torch_npu.npu_fused_infer_attention_score(
-        q.reshape(batch_size, 1, -1),
+        q.reshape(batch_size, q_len, -1),
         k_cache.flatten(2),
         v_cache.flatten(2),
+        atten_mask=_causal_mask(q.device) if verify_window else None,
         actual_seq_lengths_kv=actual_seq_lengths_kv,
         block_table=page_table,
         num_heads=q.shape[1],
@@ -196,6 +214,7 @@ def mha_decode_with_kvcache(
         scale=_scale(q, softmax_scale),
         input_layout="BSH",
         block_size=k_cache.shape[1],
+        sparse_mode=3 if verify_window else 0,
     )
     return output.reshape_as(q)
 
