@@ -40,27 +40,21 @@ namespace hex_codec_detail {
 
 inline constexpr std::uint64_t kEachByte = 0x0101010101010101ULL;
 
-// Words hold their bytes in little-endian order on every host.
+// The lane arithmetic below takes a word's first byte as its lowest. Words
+// are loaded and stored in host byte order, which is little-endian on every
+// supported platform.
+static_assert(std::endian::native == std::endian::little, "the hex codec assumes a little-endian host");
+
 template <typename Word>
 inline Word LoadWord(const void* source) noexcept {
-    Word word{};
-    if constexpr (std::endian::native == std::endian::little) {
-        std::memcpy(&word, source, sizeof(word));
-    } else {
-        const auto* bytes = static_cast<const unsigned char*>(source);
-        for (std::size_t i = 0; i < sizeof(word); ++i) word |= static_cast<Word>(bytes[i]) << (8 * i);
-    }
+    Word word;
+    std::memcpy(&word, source, sizeof(word));
     return word;
 }
 
 template <typename Word>
 inline void StoreWord(void* target, Word word) noexcept {
-    if constexpr (std::endian::native == std::endian::little) {
-        std::memcpy(target, &word, sizeof(word));
-    } else {
-        auto* bytes = static_cast<unsigned char*>(target);
-        for (std::size_t i = 0; i < sizeof(word); ++i) bytes[i] = static_cast<unsigned char>(word >> (8 * i));
-    }
+    std::memcpy(target, &word, sizeof(word));
 }
 
 // Four bytes to their eight characters.

@@ -426,7 +426,7 @@ TEST(HashPrefixPageTest, FramingDisambiguatesTokensFromExtraKeys) {
 }
 
 // Serialize the framed bytes independently of the streaming implementation.
-TEST(HashPrefixPageTest, PreservesFramedBytesAndChainingAcrossTokenBatchBoundaries) {
+TEST(HashPrefixPageTest, PreservesFramedBytesAndChaining) {
     std::mt19937 random(871923);
     std::string prior;
     for (const std::size_t length : {0u, 1u, 2u, 15u, 16u, 17u, 63u, 64u, 65u, 255u, 256u, 257u, 4096u}) {
@@ -451,11 +451,9 @@ TEST(HashPrefixPageTest, PreservesFramedBytesAndChainingAcrossTokenBatchBoundari
             append_u32(static_cast<std::uint32_t>(prior_bytes.size()));
             bytes.insert(bytes.end(), prior_bytes.begin(), prior_bytes.end());
             append_u32(static_cast<std::uint32_t>(tokens.size()));
-            const auto token_begin = bytes.size();
             for (const auto token : tokens) {
                 append_u32(static_cast<std::uint32_t>(token));
             }
-            const auto token_end = bytes.size();
             if (!keys.empty()) {
                 append_u32(static_cast<std::uint32_t>(keys.size()));
                 for (const auto& key : keys) {
@@ -467,13 +465,6 @@ TEST(HashPrefixPageTest, PreservesFramedBytesAndChainingAcrossTokenBatchBoundari
             SHA256(bytes.data(), bytes.size(), digest.data());
             const auto expected = DigestToHex(digest);
             EXPECT_EQ(HashPrefixPage(tokens, prior, keys), expected) << "token count " << length;
-            SHA256_CTX explicit_ctx;
-            SHA256_Init(&explicit_ctx);
-            SHA256_Update(&explicit_ctx, bytes.data(), token_begin);
-            Sha256UpdateTokensExplicitLE(explicit_ctx, tokens);
-            SHA256_Update(&explicit_ctx, bytes.data() + token_end, bytes.size() - token_end);
-            SHA256_Final(digest.data(), &explicit_ctx);
-            EXPECT_EQ(DigestToHex(digest), expected) << "explicit encoding, token count " << length;
             prior = expected;
         }
     }

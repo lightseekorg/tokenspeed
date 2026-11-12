@@ -44,8 +44,8 @@ inline void AppendHexBytes(std::string& out, const uint8_t* bytes, std::size_t n
     WriteLowercaseHex({bytes, n}, out.data() + size);
 }
 
-// Absorb a uint32_t into the hash as 4 little-endian bytes. Encodes each token id
-// and the count/length prefixes that frame extra_keys.
+// Absorb a uint32_t into the hash as 4 little-endian bytes. Encodes the
+// length and count prefixes that frame the stream.
 inline void Sha256UpdateU32LE(SHA256_CTX& ctx, uint32_t v) {
     uint8_t buf[4] = {
         static_cast<uint8_t>(v),
@@ -56,26 +56,11 @@ inline void Sha256UpdateU32LE(SHA256_CTX& ctx, uint32_t v) {
     SHA256_Update(&ctx, buf, 4);
 }
 
-// Feed token IDs as little-endian bytes using bounded stack storage.
-inline void Sha256UpdateTokensExplicitLE(SHA256_CTX& ctx, std::span<const std::int32_t> tokens) {
-    constexpr std::size_t kChunkTokens = 64;
-    uint8_t buffer[kChunkTokens * sizeof(std::uint32_t)];
-    for (std::size_t start = 0; start < tokens.size();) {
-        const std::size_t count = std::min<std::size_t>(kChunkTokens, tokens.size() - start);
-        for (std::size_t i = 0; i < count; ++i) {
-            const auto token = static_cast<std::uint32_t>(tokens[start + i]);
-            buffer[4 * i] = static_cast<uint8_t>(token);
-            buffer[4 * i + 1] = static_cast<uint8_t>(token >> 8);
-            buffer[4 * i + 2] = static_cast<uint8_t>(token >> 16);
-            buffer[4 * i + 3] = static_cast<uint8_t>(token >> 24);
-        }
-        SHA256_Update(&ctx, buffer, count * sizeof(std::uint32_t));
-        start += count;
-    }
-}
-
 static_assert(std::tuple_size_v<ContentHash::Digest> == SHA256_DIGEST_LENGTH,
               "a prefix page's identity is its SHA-256 digest");
+// Every supported platform is little-endian, so the token IDs' in-memory
+// bytes are the stream's (HashPrefixPageDigest).
+static_assert(std::endian::native == std::endian::little, "prefix hashing assumes a little-endian host");
 
 // Encode a SHA-256 digest as a 64-char lowercase hex string.
 inline std::string DigestToHex(const ContentHash::Digest& digest) {
@@ -93,9 +78,8 @@ inline std::string DigestToHex(const ContentHash::Digest& digest) {
 // prior_len separates page 0 from a chained page, token_count keeps tokens from
 // bleeding into extra_keys, and per-key length prefixes prevent re-splitting.
 // Feed order is prior_hash -> tokens -> extra_keys. Token IDs are their
-// little-endian 32-bit bytes: a little-endian host submits a page's tokens in
-// one SHA update, any other host encodes them in bounded chunks, and both
-// produce the same stream.
+// little-endian 32-bit bytes, which on a little-endian host are the token
+// array itself: a page's tokens go in as one SHA update.
 inline ContentHash::Digest HashPrefixPageDigest(std::span<const std::int32_t> tokens,
                                                 std::span<const uint8_t> prior_bytes,
                                                 std::span<const std::string> extra_keys) {
@@ -109,11 +93,7 @@ inline ContentHash::Digest HashPrefixPageDigest(std::span<const std::int32_t> to
 
     Sha256UpdateU32LE(ctx, static_cast<uint32_t>(tokens.size()));
     if (!tokens.empty()) {
-        if constexpr (std::endian::native == std::endian::little) {
-            SHA256_Update(&ctx, tokens.data(), tokens.size_bytes());
-        } else {
-            Sha256UpdateTokensExplicitLE(ctx, tokens);
-        }
+        SHA256_Update(&ctx, tokens.data(), tokens.size_bytes());
     }
 
     // extra_keys is the terminal block, so an empty list can be skipped without
