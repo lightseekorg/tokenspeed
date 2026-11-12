@@ -1643,13 +1643,12 @@ def _ex2_compute_picked(mb, task, loads, a, picks_smem, RANK: gl.constexpr):
     rl: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [gl.num_warps(), 1], [1, 0])
     col = (blk * BLOCK_N) % OWNED_OUT
     R: gl.constexpr = schedule.rows(mb.plan)
-    if R > 8:
-        # Past 8 rows (two requests) the put streams twice the rows. In the
-        # accumulator's layout adjacent lanes hold pairs 16 bytes apart, so
-        # each 8-byte remote store fills half of every segment it touches.
-        # Here lane i holds pair i of a row: one store writes a row's 64
-        # pairs as 512 contiguous bytes. The same values go to the same
-        # addresses.
+    if R >= 8:
+        # In the accumulator's layout adjacent lanes hold pairs 16 bytes
+        # apart, so each 8-byte remote store fills half of every segment it
+        # touches. Here lane i holds pair i of a row: one store writes a
+        # row's 64 pairs as 512 contiguous bytes. The same values go to the
+        # same addresses. Below 8 rows the put keeps the accumulator's layout.
         cl: gl.constexpr = gl.BlockedLayout(
             [1, 1], [1, 64], [gl.num_warps(), 1], [1, 0]
         )
