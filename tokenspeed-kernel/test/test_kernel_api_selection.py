@@ -2409,6 +2409,7 @@ def _attention_dsa_decode_topk(*, weights_dtype: torch.dtype = torch.float32) ->
         batch_invariant=False,
         index_k_cache=index_k,
         slot_order="selection",
+        release_dependents_early=False,
     )
 
 
@@ -2431,6 +2432,7 @@ def _attention_dsa_decode_topk_logical() -> object:
         topk_layout="logical_offsets",
         block_table_base_offsets=torch.tensor([3, 5], dtype=torch.int32),
         slot_order="selection",
+        release_dependents_early=False,
     )
 
 
@@ -2547,6 +2549,7 @@ def _attention_dsa_decode_topk_standard(
         index_k_cache=index_k_cache,
         q_scales=q_scales,
         slot_order="selection",
+        release_dependents_early=False,
     )
 
 
@@ -2596,6 +2599,7 @@ def _attention_dsa_decode_topk_bf16_plane(
         batch_invariant=False,
         index_k_cache=torch.zeros((128, 128), dtype=torch.bfloat16),
         slot_order="selection",
+        release_dependents_early=False,
     )
 
 
@@ -2659,6 +2663,7 @@ def test_dsa_topk_selection_receives_index_heads(
             batch_invariant=False,
             index_k_cache=index_k_cache,
             slot_order="selection",
+            release_dependents_early=False,
         )
     else:
         _attention_dsa_pkg.dsa_prefill_topk(
@@ -2931,6 +2936,7 @@ def test_dsa_topk_selection_receives_cache_layout(
             batch_invariant=False,
             index_k_cache=cache,
             slot_order="selection",
+            release_dependents_early=False,
         )
     else:
         _attention_dsa_pkg.dsa_prefill_topk(

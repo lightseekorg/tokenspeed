@@ -842,6 +842,11 @@ class GlmDsaSparseAttentionMixin:
                 lens_out=topk_lens_slice,
                 slot_order=global_server_args_dict["dsa_slot_order"],
                 index_k_format=ctx.token_to_kv_pool.index_k_format,
+                # The fused CuTe DSL top-k releases early to a core that waits first.
+                release_dependents_early=self.decode_topk_solution == "cute_dsl"
+                and ctx.attn_backend.sparse_decode_waits_first(
+                    self.attn_mqa, q.shape[0], q_len_per_req
+                ),
                 solution=self.decode_topk_solution,
             )
         return GlmDsaDecodeTopK(

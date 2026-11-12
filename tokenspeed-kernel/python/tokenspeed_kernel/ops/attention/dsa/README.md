@@ -88,8 +88,9 @@ another leaf, never this one.
   partials can differ from trtllm-gen.
 - Negative slots inside the live length are masked, omitted lengths take the
   full width, and rows without live slots come out zero.
-- The kernel reads nothing before its PDL wait, so the kernel before it may
-  release it early.
+- The kernel reads nothing before its PDL wait, so the leaf declares
+  `reads_after_pdl_wait` and the fused decode top-k that feeds it releases
+  its dependents early.
 
 The tests check it against an FP64 reference within the FP8 roundoff bound
 and against the trtllm-gen core. From the repo root:
@@ -369,8 +370,15 @@ non-finite scrub, radix top-k and slot mapping, and ignores the `dsa_plan`.
   is not scored. Rows whose request length leaves no keys come out empty.
 - Rows, requests, pages and the block-table width are runtime values: one
   compile per `q_len_per_req`. At most 4096 requests per call.
-- The select never releases its dependents early: trtllm-gen sparse attention
-  reads the counts before its PDL wait.
+- The select releases its dependents early only on request
+  (`release_dependents_early`, the `early_release` feature): once its own PDL
+  wait returns, so the next kernel launches while it selects. A PDL-launched
+  grid does not complete before the grid it depends on, so a consumer that
+  reads nothing before its own PDL wait sees the selection whatever kernels
+  run in between; trtllm-gen sparse attention reads the counts before its
+  wait. The DSA backend asks for it where the decode core it selects declares
+  `reads_after_pdl_wait`, which only the CuTe DSL sparse core does. In the
+  Kimi-K3.1 decode the kernel launched early is the query absorb GEMM.
 - It also takes queries quantized ahead: contiguous E4M3 queries with unit
   scales (`q_scales=None`) and the FP32 weights that carry their scales and
   the score scale (`softmax_scale=1`), which it scores without its own

@@ -276,6 +276,7 @@ def fused_decode_topk_scores(
     topk: int,
     out: torch.Tensor,
     lens_out: torch.Tensor,
+    release: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Score and select a decode step with the fused CuTe DSL kernels.
 
@@ -291,6 +292,8 @@ def fused_decode_topk_scores(
         topk: Keys selected per row.
         out: int32 ``[tokens, topk]`` slot rows, unit column stride; written.
         lens_out: int32 ``[tokens]`` counts; written.
+        release: Let the next kernel launch once the select's PDL wait returns;
+            only for a consumer that reads nothing before its own PDL wait.
 
     Returns:
         ``(logits, tops)``: the request-compact FP32 logits scratch and its
@@ -311,8 +314,11 @@ def fused_decode_topk_scores(
         )
     logits = torch.empty(elements, dtype=torch.float32, device=device)
     tops = torch.empty(elements // 8, dtype=torch.int32, device=device)
+    pdl = pdl_enabled()
+    if release and not pdl:
+        raise ValueError("an early release needs programmatic dependent launch")
     score, select = _fused_indexer.compile_indexer(
-        int(q_len_per_req), int(topk), current_platform().sm_count, pdl_enabled()
+        int(q_len_per_req), int(topk), current_platform().sm_count, pdl, release
     )
     score(
         q_fp8.view(torch.uint8).view(tokens * _FUSED_HEADS, 128),
@@ -334,8 +340,8 @@ if _fused_indexer is not None:
         "dsa_decode_topk",
         name="cute_dsl_dsa_decode_topk",
         solution="cute_dsl",
-        # Row-local and deterministic: ties go to the lowest key.
-        features=frozenset({"batch_invariant"}),
+        # Row-local and deterministic (ties to the lowest key); may release early.
+        features=frozenset({"batch_invariant", "early_release"}),
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(10, 0),
             max_arch_version=ArchVersion(10, 3),
@@ -387,6 +393,7 @@ if _fused_indexer is not None:
         out: torch.Tensor | None = None,
         lens_out: torch.Tensor | None = None,
         batch_invariant: bool = False,
+        release_dependents_early: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Fused DSA decode top-k: the paged logits and each row's exact top-k.
 
@@ -421,6 +428,8 @@ if _fused_indexer is not None:
             lens_out: Optional contiguous int32 ``[tokens]`` counts.
             batch_invariant: Accepted for the facade; every selection is
                 already a function of its own row.
+            release_dependents_early: Let the next kernel launch once the
+                select's PDL wait returns (the facade passes it only when set).
 
         Returns:
             ``(slots, lens)``: ``[tokens, topk]`` global slots, ``-1`` past
@@ -512,6 +521,7 @@ if _fused_indexer is not None:
             topk=int(topk),
             out=out,
             lens_out=lens_out,
+            release=release_dependents_early,
         )
         return out, lens_out
 
@@ -799,6 +809,8 @@ if _sparse_core is not None:
         "dsa_decode",
         name="cute_dsl_dsa_decode",
         solution="cute_dsl",
+        # Reads nothing before its PDL wait: the top-k before it may release it early.
+        features=frozenset({"reads_after_pdl_wait"}),
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(10, 0),
             max_arch_version=ArchVersion(10, 3),

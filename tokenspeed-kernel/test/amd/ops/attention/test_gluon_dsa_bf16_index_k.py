@@ -150,6 +150,7 @@ def _decode(
         q_len_per_req=q_len,
         index_k_cache=index_k,
         slot_order="selection",
+        release_dependents_early=False,
     )
 
 
@@ -398,6 +399,7 @@ def test_bf16_plane_decode_cuda_graph_replays_changed_inputs() -> None:
             out=out,
             lens_out=lens_out,
             slot_order="selection",
+            release_dependents_early=False,
         )
 
     invoke()

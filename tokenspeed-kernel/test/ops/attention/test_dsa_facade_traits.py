@@ -139,6 +139,7 @@ def _decode_topk(index_k_cache: torch.Tensor, slot_order: str = "selection", **e
         batch_invariant=True,
         index_k_cache=index_k_cache,
         slot_order=slot_order,
+        release_dependents_early=False,
         **extra,
     )
 

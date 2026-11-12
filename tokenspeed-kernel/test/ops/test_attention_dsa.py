@@ -127,6 +127,7 @@ def test_dsa_decode_topk_fp8(device: str, require) -> None:
         index_k_cache=packed_index_k,
         solution="triton",
         slot_order="selection",
+        release_dependents_early=False,
     )
 
     expected = torch.full_like(topk_slots, -1)
@@ -187,6 +188,7 @@ def test_dsa_decode_topk_fp8_mtp(device: str, q_len_per_req: int, require) -> No
         index_k_cache=packed_index_k,
         solution="triton",
         slot_order="selection",
+        release_dependents_early=False,
     )
 
     for r in range(num_reqs):

@@ -152,6 +152,7 @@ def _fused(case, cache=None, table=None):
         topk=TOPK,
         out=out,
         lens_out=lens,
+        release=False,
     )
     return out, lens, logits, q_fp8, folded
 
@@ -272,6 +273,7 @@ def test_the_facade_pin_runs_the_fused_leaf(q_len) -> None:
         lens_out=lens,
         slot_order="sorted",
         solution="cute_dsl",
+        release_dependents_early=False,
     )
     q_fp8, folded = dsa_triton_topk.quantize_index_query_weights(
         case["q"], case["weights"], SOFTMAX_SCALE
@@ -282,7 +284,7 @@ def test_the_facade_pin_runs_the_fused_leaf(q_len) -> None:
     _check_selection(case, out, lens, reference)
 
 
-def _facade(case, q, weights, softmax_scale, **kwargs):
+def _facade(case, q, weights, softmax_scale, release=False, **kwargs):
     """The pinned facade's slots and counts over sentinel-filled outputs."""
     tokens = q.shape[0]
     out = torch.full((tokens, TOPK), SENTINEL, dtype=torch.int32, device="cuda")
@@ -303,6 +305,7 @@ def _facade(case, q, weights, softmax_scale, **kwargs):
         out=out,
         lens_out=lens,
         slot_order="sorted",
+        release_dependents_early=release,
         solution="cute_dsl",
         **kwargs,
     )
@@ -369,6 +372,7 @@ def test_selection_agrees_with_the_deep_gemm_batch_invariant_leaf() -> None:
         plan=dsa.dsa_plan(page_size=PAGE, seq_lens_2d=lens_2d, solution="deep_gemm"),
         slot_order="selection",
         solution="deep_gemm",
+        release_dependents_early=False,
     )
     assert torch.equal(lens, counts)
     assert torch.equal(out.sort(dim=1).values, slots.sort(dim=1).values)
@@ -533,6 +537,7 @@ def test_graph_replay_follows_new_lengths_and_queries(q_len) -> None:
             lens_out=lens,
             slot_order="selection",
             solution="cute_dsl",
+            release_dependents_early=False,
         )
 
     run()
@@ -585,3 +590,126 @@ def test_only_the_cute_dsl_pin_selects_the_fused_leaf() -> None:
         solution="cute_dsl",
     )
     assert pinned.name == LEAF
+
+
+@pytest.mark.parametrize("q_len", [1, 8])
+def test_an_early_release_selects_what_the_waiting_select_does(q_len) -> None:
+    """Releasing the next kernel early moves its launch, not the selection."""
+    case = _case([600, 3000, 70], q_len, seed=41 + q_len)
+    out, lens = _facade(case, case["q"], case["weights"], SOFTMAX_SCALE)
+    early_out, early_lens = _facade(
+        case, case["q"], case["weights"], SOFTMAX_SCALE, release=True
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(early_out, out) and torch.equal(early_lens, lens)
+
+
+@pytest.mark.parametrize("absorb", [False, True])
+def test_an_early_release_feeds_the_sparse_core_in_a_graph(absorb) -> None:
+    """The sparse core reads the selection after its PDL wait.
+
+    ``absorb`` runs the query absorb GEMM in between, as the K3.1 decode does.
+    """
+    if dsa_cute_dsl._sparse_core is None:
+        pytest.skip("the CuTe DSL sparse core is not built")
+    case = _case([3000], 8, seed=59)
+    rows = 8
+    gen = torch.Generator(device="cuda").manual_seed(60)
+    slots = case["cache"].shape[0]
+    kv = torch.randn(slots, 1, 576, device="cuda", generator=gen).to(
+        torch.float8_e4m3fn
+    )
+    query = torch.randn(rows, 12, 576, device="cuda", generator=gen) * 2
+    query = query.to(torch.float8_e4m3fn)
+    out = torch.empty(rows, TOPK, dtype=torch.int32, device="cuda")
+    lens = torch.empty(rows, dtype=torch.int32, device="cuda")
+    latent = torch.empty(rows, 12, 512, dtype=torch.bfloat16, device="cuda")
+    nope = torch.randn(12, rows, 128, device="cuda", generator=gen).bfloat16()
+    w_kc = torch.randn(12, 128, 512, device="cuda", generator=gen).bfloat16()
+    absorbed = torch.empty(12, rows, 512, dtype=torch.bfloat16, device="cuda")
+
+    def step(release):
+        dsa.dsa_decode_topk(
+            case["q"],
+            case["weights"],
+            case["seq_lens"],
+            case["table"],
+            page_size=PAGE,
+            topk=TOPK,
+            softmax_scale=SOFTMAX_SCALE,
+            batch_invariant=False,
+            q_len_per_req=8,
+            index_k_cache=case["cache"],
+            seq_lens_2d=None,
+            plan=None,
+            out=out,
+            lens_out=lens,
+            slot_order="selection",
+            release_dependents_early=release,
+            solution="cute_dsl",
+        )
+        if absorb:
+            torch.bmm(nope, w_kc, out=absorbed)
+        dsa.dsa_decode(
+            q=query,
+            kv_cache=kv,
+            sparse_kv_cache=None,
+            topk_slots=out,
+            topk_lens=lens,
+            max_seqlen_k=3000,
+            qk_nope_head_dim=128,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            softmax_scale=192**-0.5,
+            page_size=PAGE,
+            q_len_per_req=8,
+            logit_cap=0.0,
+            k_scale=1.0,
+            return_lse=False,
+            out=latent,
+            slot_order="selection",
+        )
+
+    step(False)
+    torch.cuda.synchronize()
+    expected, expected_absorbed = latent.clone(), absorbed.clone()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        step(True)
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        step(True)
+    for _ in range(3):
+        out.fill_(-1)
+        lens.zero_()
+        latent.zero_()
+        absorbed.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(latent, expected)
+        assert not absorb or torch.equal(absorbed, expected_absorbed)
+
+
+def test_only_a_leaf_declaring_it_releases_early() -> None:
+    """The DeepGEMM leaf never releases its dependents early: none is selected."""
+    case = _case([600], 1, seed=71)
+    with pytest.raises(selection.NoKernelFoundError):
+        dsa.dsa_decode_topk(
+            case["q"],
+            case["weights"],
+            case["seq_lens"],
+            case["table"],
+            page_size=PAGE,
+            topk=TOPK,
+            softmax_scale=SOFTMAX_SCALE,
+            batch_invariant=False,
+            q_len_per_req=1,
+            index_k_cache=case["cache"],
+            seq_lens_2d=None,
+            plan=None,
+            slot_order="selection",
+            release_dependents_early=True,
+            solution="deep_gemm",
+        )

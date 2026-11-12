@@ -1390,6 +1390,7 @@ def test_configured_index_k_quantization_and_topk(tmp_path, phase) -> None:
             block_table=_kernel_page_table(block_ids, "cuda"),
             seq_lens_2d=seq_lens_2d,
             plan=dsa_plan(seq_lens_2d=seq_lens_2d, page_size=pool.index_k_page_size),
+            release_dependents_early=False,
         )
     good = torch.ones(seq_len, device="cuda", dtype=torch.bool)
     good[bad] = False
@@ -1477,7 +1478,9 @@ def test_decode_topk_selects_every_visible_key_below_topk(
     # Only the leaf surface the selection reads; a real leaf needs the serving stack.
     ctx = SimpleNamespace(
         attn_backend=SimpleNamespace(
-            forward_decode_metadata=metadata, cache_placement=lambda layer: None
+            forward_decode_metadata=metadata,
+            cache_placement=lambda layer: None,
+            sparse_decode_waits_first=lambda layer, rows, q_len_per_req: False,
         ),
         token_to_kv_pool=pool,
         num_extends=0,
@@ -1533,7 +1536,9 @@ def test_decode_topk_keeps_the_best_topk_of_a_longer_history() -> None:
     )
     ctx = SimpleNamespace(
         attn_backend=SimpleNamespace(
-            forward_decode_metadata=metadata, cache_placement=lambda layer: None
+            forward_decode_metadata=metadata,
+            cache_placement=lambda layer: None,
+            sparse_decode_waits_first=lambda layer, rows, q_len_per_req: False,
         ),
         token_to_kv_pool=pool,
         num_extends=0,
@@ -1558,6 +1563,72 @@ def test_decode_topk_keeps_the_best_topk_of_a_longer_history() -> None:
     if attention.decode_topk_solution is not None:
         # The pinned fused top-k emits the selection in ascending position.
         assert torch.equal(selected.topk_indices[0], slots[good].to(torch.int32))
+
+
+@requires_gpu
+@pytest.mark.parametrize("pinned", [True, False])
+@pytest.mark.parametrize("waits_first", [True, False])
+def test_decode_topk_releases_early_only_to_a_core_that_waits_first(
+    monkeypatch, pinned, waits_first
+) -> None:
+    """Only the pinned fused top-k releases early, to a core that waits first."""
+    from tokenspeed_kernel.ops.attention.dsa import cute_dsl as dsa_cute_dsl
+    from tokenspeed_kernel.ops.attention.dsa import dsa_plan
+
+    from tokenspeed.runtime.models import glm5
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    if _indexer_attention(index_topk=2048).decode_topk_solution is None:
+        pytest.skip("needs the fused decode top-k (SM100-SM103)")
+    if not pinned:
+        cap = dsa_cute_dsl.FUSED_DECODE_TOPK_MAX_REQUESTS
+        monkeypatch.setitem(global_server_args_dict, "max_num_seqs", cap + 1)
+    attention = _indexer_attention(index_topk=2048)
+    assert (attention.decode_topk_solution == "cute_dsl") is pinned
+    pool, _ = _k31_pool("cuda", num_lcm_blocks=2)
+    # A table as wide as topk: the unpinned DeepGEMM top-k needs one.
+    block_ids = list(range(20, 4, -1))
+    seq_len = 600
+    slots = _slots(block_ids, seq_len, "cuda")
+    u, keys = _separable_keys(seq_len, torch.arange(0, device="cuda"), "cuda")
+    pool.set_index_k_buffer(3, slots, keys, write_mask=None)
+    seq_lens = torch.tensor([seq_len], dtype=torch.int32, device="cuda")
+    metadata = SimpleNamespace(
+        _dsa_seq_lens_2d=seq_lens.unsqueeze(1),
+        _dsa_plan=dsa_plan(seq_lens_2d=seq_lens.unsqueeze(1), page_size=64),
+    )
+    ctx = SimpleNamespace(
+        attn_backend=SimpleNamespace(
+            forward_decode_metadata=metadata,
+            cache_placement=lambda layer: None,
+            sparse_decode_waits_first=lambda layer, rows, q_len_per_req: waits_first,
+        ),
+        token_to_kv_pool=pool,
+        num_extends=0,
+    )
+    scorer, released = glm5.dsa_decode_topk, []
+
+    def record(*args, release_dependents_early, **kwargs):
+        released.append(release_dependents_early)
+        return scorer(
+            *args, release_dependents_early=release_dependents_early, **kwargs
+        )
+
+    monkeypatch.setattr(glm5, "dsa_decode_topk", record)
+    selected = attention._compute_decode_topk_indices_portable(
+        indexer_output=_indexer_output(u, 1),
+        ctx=ctx,
+        seq_lens=seq_lens,
+        page_table=_kernel_page_table(block_ids, "cuda"),
+        q_len_per_req=1,
+        decode_start=0,
+        num_tokens=1,
+        num_decode_tokens=1,
+        topk=2048,
+    )
+
+    assert released == [pinned and waits_first]
+    assert int(selected.topk_lens[0]) == seq_len
 
 
 @requires_gpu
@@ -1615,7 +1686,9 @@ def test_decode_topk_scores_the_query_the_index_k_write_quantized(
     )
     ctx = SimpleNamespace(
         attn_backend=SimpleNamespace(
-            forward_decode_metadata=metadata, cache_placement=lambda layer: None
+            forward_decode_metadata=metadata,
+            cache_placement=lambda layer: None,
+            sparse_decode_waits_first=lambda layer, rows, q_len_per_req: False,
         ),
         token_to_kv_pool=pool,
         num_extends=0,

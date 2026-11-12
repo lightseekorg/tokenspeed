@@ -503,6 +503,8 @@ class DSABackend(PagedAttentionBackend):
         self._prefill_page_table: torch.Tensor | None = None
         # Owned KVP index-tile width in kernel pages; None means the page table's width.
         self._prefill_index_columns: int | None = None
+        # sparse_decode_waits_first per (rows, q_len_per_req); selections are fixed.
+        self._decode_waits_first: dict[tuple[int, int], bool] = {}
         self.kpool_runtime = (
             KPoolRuntime(spec.index_kpool, spec.index_topk)
             if spec.index_kpool is not None
@@ -835,6 +837,31 @@ class DSABackend(PagedAttentionBackend):
                 )
             )
         return probes
+
+    def sparse_decode_waits_first(self, layer, rows: int, q_len_per_req: int) -> bool:
+        """Return whether this decode core declares ``reads_after_pdl_wait``.
+
+        The core is the forward's own ``dsa_decode`` selection for ``rows``
+        query rows: this width's decode probe at ``rows / q_len_per_req``
+        requests.
+        """
+        key = (rows, q_len_per_req)
+        cached = self._decode_waits_first.get(key)
+        if cached is not None:
+            return cached
+        waits_first = False
+        for _, mode, signature, traits, solution, plan in self._sparse_leaf_probes():
+            if mode != "dsa_decode" or traits["q_len"] != q_len_per_req:
+                continue
+            traits = {**traits, "batch": rows // q_len_per_req}
+            name, _ = self._resolve_sparse_leaf(mode, signature, traits, solution, plan)
+            waits_first = (
+                "reads_after_pdl_wait"
+                in KernelRegistry.get().get_by_name(name).features
+            )
+            break
+        self._decode_waits_first[key] = waits_first
+        return waits_first
 
     def _resolve_sparse_leaf(
         self, mode: str, signature, traits: dict, solution: str | None, plan

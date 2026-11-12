@@ -2057,6 +2057,7 @@ def dsa_decode_topk(
     out: torch.Tensor | None = None,
     lens_out: torch.Tensor | None = None,
     slot_order: str,
+    release_dependents_early: bool,
     override: str | None = None,
     solution: str | None = None,
     kernel_plan: KernelPlan | None = None,
@@ -2121,6 +2122,10 @@ def dsa_decode_topk(
             shape [tokens].
         slot_order: The order the leaf emits each row's selection in, as for
             :func:`dsa_prefill_topk`. Required keyword.
+        release_dependents_early: Let the next kernel launch once the top-k's
+            PDL wait returns, before it writes the selection; only for a consumer
+            that reads nothing before its own PDL wait. Only leaves declaring the
+            ``early_release`` feature are eligible. Required keyword.
         override: Optional exact kernel override name.
         kernel_plan: Optional initialization-time provider, validated without reselection.
         solution: Optional kernel solution to force through normal selection.
@@ -2202,6 +2207,8 @@ def dsa_decode_topk(
         required_features.add("forced_initial_local")
     if batch_invariant:
         required_features.add("batch_invariant")
+    if release_dependents_early:
+        required_features.add("early_release")
     signature = _index_query_signature(q, weights)
     if kernel_plan is None:
         kernel = select_kernel(
@@ -2274,6 +2281,8 @@ def dsa_decode_topk(
             kernel_kwargs["local_tokens"] = local_tokens
         if batch_invariant:
             kernel_kwargs["batch_invariant"] = True
+        if release_dependents_early:
+            kernel_kwargs["release_dependents_early"] = True
         return kernel(**kernel_kwargs)
 
 

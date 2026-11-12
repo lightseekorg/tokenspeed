@@ -875,3 +875,38 @@ def test_dcp_decode_records_core_on_the_real_k31_selection(monkeypatch, solution
         block_granularity=128, virtual_block_count=17, shard_count=8
     )
     assert backend._dcp_decode_records_core is (solution != "triton")
+
+
+@pytest.mark.parametrize(
+    ("kvp", "rows", "q_len", "waits_first"),
+    [
+        # One or four requests of eight verify rows run the CuTe DSL core.
+        (1, 8, 8, True),
+        (1, 32, 8, True),
+        (1, 16, 8, False),
+        (1, 64, 8, False),
+        (1, 8, 1, False),
+        # Under DCP the LSE core is trtllm-gen's, which reads before its wait.
+        (4, 8, 8, False),
+    ],
+)
+def test_sparse_decode_waits_first_follows_the_real_core(kvp, rows, q_len, waits_first):
+    from tokenspeed_kernel.ops.attention.dsa import cute_dsl
+
+    if cute_dsl._sparse_core is None:
+        pytest.skip("the CuTe DSL sparse core is not available on this platform")
+    backend = object.__new__(backends.dsa.DSABackend)
+    values = dict(
+        _K31_SPARSE_LEAF,
+        data_type=torch.float8_e4m3fn,
+        kvp_group=tuple(range(kvp)),
+        num_local_heads=12 // kvp if kvp > 1 else 12,
+        _decode_waits_first={},
+    )
+    for name, value in values.items():
+        setattr(backend, name, value)
+    assert backend.sparse_decode_waits_first(None, rows, q_len) is waits_first
+    # The answer is kept per width, and the kept one is returned.
+    assert backend._decode_waits_first == {(rows, q_len): waits_first}
+    backend._decode_waits_first[(rows, q_len)] = not waits_first
+    assert backend.sparse_decode_waits_first(None, rows, q_len) is not waits_first

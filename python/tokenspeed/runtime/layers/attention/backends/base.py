@@ -212,6 +212,16 @@ class CachePoolBinding:
         which the GQA prologue returns it in so no separate cast runs."""
         return activation
 
+    def sparse_decode_waits_first(
+        self, layer: PagedAttention, rows: int, q_len_per_req: int
+    ) -> bool:
+        """Return whether the sparse decode core reads nothing before its PDL wait.
+
+        It is ``layer``'s core for ``rows`` query rows; when it does, the top-k
+        that feeds it may release its dependents early.
+        """
+        return False
+
     # ------------------------------------------------------------------
     # Slot-state image (SlotStateExporter)
     # ------------------------------------------------------------------

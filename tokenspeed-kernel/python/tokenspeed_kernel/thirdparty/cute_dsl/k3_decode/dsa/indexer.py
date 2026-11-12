@@ -18,8 +18,8 @@
 # - Row ends come from per-request lengths (row j of q sees length - q + 1 + j
 #   keys), clamped to the block table; row, request, page and table sizes are
 #   runtime values, and the block table and the slot rows are runtime-strided.
-# - The select never releases its dependents early: the sparse core reads the
-#   counts before its PDL wait.
+# - The select releases its dependents early only when asked to: the trtllm-gen
+#   sparse core reads the counts before its PDL wait.
 
 """Fused decode indexer of a DSA layer: FP32 logits and an exact top-k.
 
@@ -816,9 +816,10 @@ class IndexerSelect:
     candidates finds the threshold; rows whose candidates overflow the shared
     lists take the same select over every key."""
 
-    def __init__(self, q: int, topk: int, pdl: bool):
+    def __init__(self, q: int, topk: int, pdl: bool, release: bool):
         assert 1 <= q <= 8 and topk % SELECT_THREADS == 0 and 0 < topk <= 4096
-        self.q, self.topk, self.pdl = q, topk, pdl
+        assert pdl or not release
+        self.q, self.topk, self.pdl, self.release = q, topk, pdl, release
 
     @cute.jit
     def __call__(
@@ -1234,9 +1235,11 @@ class IndexerSelect:
         tops_s = smem.allocate_tensor(Uint32, cute.make_layout(TOPS), 16)
         sm = hist, scan, counts, info, cand_index, cand_key, hot_list, tops_s
 
-        # No early release: the sparse core reads the counts before its PDL wait.
         if cutlass.const_expr(self.pdl):
             cute.arch.griddepcontrol_wait()
+        # A consumer that reads nothing before its PDL wait may launch now.
+        if cutlass.const_expr(self.release):
+            cute.arch.griddepcontrol_launch_dependents()
         cap = table.shape[1] * Int32(PAGE)
         length = clamp_end(seq_lens[request] - (Q - 1) + j, cap)
         emit_args = out, table, request, row
@@ -1262,9 +1265,10 @@ def _fake(dtype, shape, stride, align):
 
 
 @functools.cache
-def compile_indexer(q: int, topk: int, ctas: int, pdl: bool):
+def compile_indexer(q: int, topk: int, ctas: int, pdl: bool, release: bool):
     """The (score, select) kernels for ``q`` rows per request, ``topk`` selected
-    keys and a ``ctas``-CTA persistent scorer. Rows, requests, slots, block-table
+    keys and a ``ctas``-CTA persistent scorer; ``release``: the select releases
+    its dependents once its own PDL wait returns. Rows, requests, slots, block-table
     width and strides, and the scratch sizes are runtime values: one compile
     serves every batch."""
     sym = cute.sym_int
@@ -1292,7 +1296,7 @@ def compile_indexer(q: int, topk: int, ctas: int, pdl: bool):
         options=options,
     )
     select = cute.compile(
-        IndexerSelect(q, topk, pdl),
+        IndexerSelect(q, topk, pdl, release),
         logits,
         tops,
         seq_lens,

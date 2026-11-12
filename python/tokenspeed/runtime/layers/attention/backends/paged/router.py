@@ -1034,6 +1034,11 @@ class CacheGroupRouter(AttentionBackend):
     def query_dtype(self, layer, forward_mode, activation):
         return self._leaf_for(layer).query_dtype(layer, forward_mode, activation)
 
+    def sparse_decode_waits_first(self, layer, rows, q_len_per_req):
+        return self._leaf_for(layer).sparse_decode_waits_first(
+            layer, rows, q_len_per_req
+        )
+
     @break_point
     def forward(
         self,
