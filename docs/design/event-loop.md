@@ -440,7 +440,10 @@ operation on the forward thread. The profiler merges them into the trace it
 exports, on their threads' lanes, so a forward thread's operation encloses
 the Python it ran; the C++ scheduler's spans are under the `scheduler`
 category, the rest under `host`. The recording follows the torch profiler's window and
-costs one atomic load per span outside it. A round that receives nothing,
+costs one atomic load per span outside it; it keeps only the spans that began
+inside the window, so an operation open as a by-stage profile switches stages
+stays out of the next stage's trace. A trace the merge fails on is written
+without the host spans rather than failing the forward thread. A round that receives nothing,
 hands the data plane and the L3 executor nothing, and commits, acknowledges,
 or answers nothing leaves no spans: a loop waiting on a transfer spins through
 such rounds. A storage operation's outcome counts as an acknowledgment.

@@ -38,6 +38,10 @@
 //! thread's spans back until it closes, so a caller can drop them: the event
 //! loop keeps a round's spans only if the round did something, as a loop
 //! waiting on a transfer spins through empty rounds.
+//!
+//! A recording keeps only the spans that began after it started: a span or
+//! a hold open across a stop and the next start, as the forward thread's
+//! operation is when a by-stage profile switches stages, stays out of it.
 
 use std::{
     borrow::Cow,
@@ -61,7 +65,10 @@ pub const SCHEDULER: &str = "scheduler";
 pub const HOST: &str = "host";
 
 static RECORDING: AtomicBool = AtomicBool::new(false);
-static SPANS: Mutex<Vec<Span>> = Mutex::new(Vec::new());
+static SPANS: Mutex<Spans> = Mutex::new(Spans {
+    since_ns: 0,
+    spans: Vec::new(),
+});
 /// Every thread that recorded a span, with its name, in first-span order.
 static THREADS: Mutex<Vec<(u64, String)>> = Mutex::new(Vec::new());
 
@@ -87,6 +94,21 @@ pub struct Span {
     pub end_ns: i64,
 }
 
+/// The spans the recording collected, and when it started.
+struct Spans {
+    since_ns: i64,
+    spans: Vec<Span>,
+}
+
+impl Spans {
+    /// Collect `spans`, but those an earlier recording saw begin.
+    fn extend(&mut self, spans: impl IntoIterator<Item = Span>) {
+        let since_ns = self.since_ns;
+        self.spans
+            .extend(spans.into_iter().filter(|span| span.begin_ns >= since_ns));
+    }
+}
+
 /// What a recording collected.
 #[derive(Debug, Default)]
 pub struct Recording {
@@ -103,7 +125,11 @@ pub fn recording() -> bool {
 
 /// Start a recording, dropping what an earlier one left.
 pub fn start() {
-    lock(&SPANS).clear();
+    {
+        let mut spans = lock(&SPANS);
+        spans.spans.clear();
+        spans.since_ns = now_ns();
+    }
     RECORDING.store(true, Ordering::Relaxed);
     ffi::set_profile_span_sink(true);
 }
@@ -113,7 +139,7 @@ pub fn stop() -> Recording {
     ffi::set_profile_span_sink(false);
     RECORDING.store(false, Ordering::Relaxed);
     Recording {
-        spans: std::mem::take(&mut *lock(&SPANS)),
+        spans: std::mem::take(&mut lock(&SPANS).spans),
         threads: lock(&THREADS).clone(),
     }
 }
@@ -176,7 +202,7 @@ pub fn record(category: &'static str, name: Cow<'static, str>, begin_ns: i64, en
         .ok()
         .flatten();
     if let Some(span) = unheld {
-        lock(&SPANS).push(span);
+        lock(&SPANS).extend([span]);
     }
 }
 
@@ -302,6 +328,36 @@ mod tests {
         assert!(recorded.spans.is_empty());
         start();
         assert!(stop().spans.is_empty());
+    }
+
+    // A by-stage profile stops one stage and starts the next while the
+    // forward thread's operation is open.
+    #[test]
+    fn a_span_open_across_a_restart_stays_out_of_the_new_recording() {
+        let _serial = lock(&SERIAL);
+        start();
+        let open = span("previous_recording");
+        let begun_ns = now_ns();
+        drop(stop());
+        start();
+        drop(open);
+        // As the C++ scheduler's sink reports a span begun before the start.
+        record(SCHEDULER, "previous_scheduler".into(), begun_ns, now_ns());
+        drop(span("this_recording"));
+        assert_eq!(names(&stop()), ["this_recording"]);
+    }
+
+    #[test]
+    fn a_hold_open_across_a_restart_keeps_only_the_new_recordings_spans() {
+        let _serial = lock(&SERIAL);
+        start();
+        let held = hold();
+        drop(span("previous_recording"));
+        drop(stop());
+        start();
+        drop(span("this_recording"));
+        held.keep();
+        assert_eq!(names(&stop()), ["this_recording"]);
     }
 
     #[test]

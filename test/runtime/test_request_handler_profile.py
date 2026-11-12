@@ -232,6 +232,43 @@ class TestHostSpans:
         # named after the host's thread.
         assert (control, f"thread {control} (ts-host)") in thread_names
 
+    def test_a_trace_the_merge_fails_on_is_written_without_the_host_spans(
+        self, tmp_path
+    ):
+        host_spans = _HostSpans()
+        handler = Profiler(
+            server_args=SimpleNamespace(enable_eplb=False),
+            device=None,
+            attn_mapping=_attn_mapping(),
+            sync_size=1,
+            sync_group=None,
+            host_spans=host_spans,
+        )
+        req = _start_req(str(tmp_path), record_shapes=False, with_stack=False)
+        req.activities = ["CPU"]
+        with mock.patch.object(torch.cuda, "is_available", return_value=False):
+            assert handler.profile(req).success
+            # Metadata past the bytes the merge searches for the trace's
+            # base time, so the merge fails after torch exported the trace.
+            handler.torch_profiler.add_metadata(
+                "padding", "x" * profiler_mod._TRACE_HEAD_BYTES
+            )
+            with torch.profiler.record_function("forward_canary"):
+                torch.ones(4, device="cpu").add_(2)
+            now_ns = time.time_ns()
+            host_spans.spans.append(
+                ("Op::Execute", "host", threading.get_native_id(), now_ns, now_ns)
+            )
+            # Torch exports a trace once: the merge's failure must not reach
+            # the forward thread.
+            assert handler.stop_profile().success
+
+        trace = tmp_path / "test-profile-TP0.trace.json.gz"
+        with gzip.open(trace, "rt") as source:
+            names = {event.get("name") for event in json.load(source)["traceEvents"]}
+        assert "forward_canary" in names
+        assert "Op::Execute" not in names
+
 
 class TestRequestHandlerProtonProfile:
     @pytest.fixture(autouse=True)

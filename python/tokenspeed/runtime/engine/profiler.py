@@ -105,7 +105,9 @@ def _export_with_host_spans(
     writes each ``ts`` in microseconds after the trace's
     ``baseTimeNanoseconds``. The host's events go at the head of the event
     array while the trace streams into its gzip file, so a large trace is
-    never held in memory.
+    never held in memory. Torch exports a trace only once, so a trace the
+    merge fails on is written as torch exported it, without the host spans:
+    the failure must not fail the forward thread, which would end serving.
 
     Args:
         torch_profiler: A stopped ``torch.profiler.profile``.
@@ -118,51 +120,71 @@ def _export_with_host_spans(
     with tempfile.TemporaryDirectory(dir=os.path.dirname(path)) as scratch:
         raw = os.path.join(scratch, "trace.json")
         torch_profiler.export_chrome_trace(raw)
-        with open(raw, "rb") as source:
-            head = source.read(_TRACE_HEAD_BYTES)
-            match = _TRACE_HEAD.search(head)
-            if match is None:
-                raise ValueError(
-                    "the torch trace has no baseTimeNanoseconds right before "
-                    "its traceEvents"
-                )
-            base_ns = int(match.group(1))
-            events = [
-                {
-                    "ph": "X",
-                    "cat": category,
-                    "name": name,
-                    "pid": pid,
-                    "tid": tid,
-                    "ts": (begin_ns - base_ns) / 1000,
-                    "dur": (end_ns - begin_ns) / 1000,
-                }
-                for name, category, tid, begin_ns, end_ns in spans
-            ]
-            # Named as torch names the threads it saw (by the kernel's thread
-            # name); the control thread runs no torch op, so only this names
-            # its lane.
-            recorded = {tid for _, _, tid, _, _ in spans}
-            events += [
-                {
-                    "ph": "M",
-                    "name": "thread_name",
-                    "pid": pid,
-                    "tid": tid,
-                    "args": {"name": f"thread {tid} ({thread})"},
-                }
-                for tid, thread in threads
-                if tid in recorded
-            ]
-            # What follows the array's opening: an event, or its end.
-            rest = (head[match.end() :] + source.read(64)).lstrip()
-            with gzip.open(path, "wb") as sink:
-                sink.write(head[: match.end()])
-                sink.write(b",".join(json.dumps(event).encode() for event in events))
-                if events and not rest.startswith(b"]"):
-                    sink.write(b",")
-                sink.write(rest)
+        try:
+            _merge_host_spans(raw, path, spans, threads, pid)
+        except Exception:
+            logger.exception(
+                "Could not merge the host spans; writing the torch trace "
+                "without them"
+            )
+            with open(raw, "rb") as source, gzip.open(path, "wb") as sink:
                 shutil.copyfileobj(source, sink)
+
+
+def _merge_host_spans(
+    raw: str,
+    path: str,
+    spans: list[tuple[str, str, int, int, int]],
+    threads: list[tuple[int, str]],
+    pid: int,
+) -> None:
+    """Write the torch trace ``raw`` (JSON) to ``path`` (gzipped JSON) with
+    the host's spans; see ``_export_with_host_spans``."""
+    with open(raw, "rb") as source:
+        head = source.read(_TRACE_HEAD_BYTES)
+        match = _TRACE_HEAD.search(head)
+        if match is None:
+            raise ValueError(
+                "the torch trace has no baseTimeNanoseconds right before "
+                "its traceEvents"
+            )
+        base_ns = int(match.group(1))
+        events = [
+            {
+                "ph": "X",
+                "cat": category,
+                "name": name,
+                "pid": pid,
+                "tid": tid,
+                "ts": (begin_ns - base_ns) / 1000,
+                "dur": (end_ns - begin_ns) / 1000,
+            }
+            for name, category, tid, begin_ns, end_ns in spans
+        ]
+        # Named as torch names the threads it saw (by the kernel's thread
+        # name); the control thread runs no torch op, so only this names
+        # its lane.
+        recorded = {tid for _, _, tid, _, _ in spans}
+        events += [
+            {
+                "ph": "M",
+                "name": "thread_name",
+                "pid": pid,
+                "tid": tid,
+                "args": {"name": f"thread {tid} ({thread})"},
+            }
+            for tid, thread in threads
+            if tid in recorded
+        ]
+        # What follows the array's opening: an event, or its end.
+        rest = (head[match.end() :] + source.read(64)).lstrip()
+        with gzip.open(path, "wb") as sink:
+            sink.write(head[: match.end()])
+            sink.write(b",".join(json.dumps(event).encode() for event in events))
+            if events and not rest.startswith(b"]"):
+                sink.write(b",")
+            sink.write(rest)
+            shutil.copyfileobj(source, sink)
 
 
 def _all_thread_profile_config():
@@ -493,18 +515,9 @@ class Profiler:
                 self.torch_profiler.export_chrome_trace(trace_path)
             else:
                 spans, threads = self._host_spans.stop()
-                try:
-                    _export_with_host_spans(
-                        self.torch_profiler, trace_path, spans, threads, os.getpid()
-                    )
-                except Exception:
-                    # A failed merge must not fail the forward thread, which
-                    # would end serving: keep the torch trace.
-                    logger.exception(
-                        "Could not merge the host spans; exporting the torch "
-                        "trace without them"
-                    )
-                    self.torch_profiler.export_chrome_trace(trace_path)
+                _export_with_host_spans(
+                    self.torch_profiler, trace_path, spans, threads, os.getpid()
+                )
             self._profile_sync()
 
         if self.profiler_activities is not None and "MEM" in self.profiler_activities:
