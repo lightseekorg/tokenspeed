@@ -75,10 +75,29 @@ jobs:
           python -m pip install pre-commit ruff "nanobind>=2.13.0" tokenspeed-spdlog==1.15.1
           pre-commit install
 
+      # Hook environments and black's per-file cache; main refreshes them for PRs.
+      - name: Restore pre-commit cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cache/pre-commit
+            ~/.cache/black
+          key: pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}-${{ github.run_id }}
+          restore-keys: pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}-
+
       - name: Linting
         env:
           SKIP: ${{ steps.scheduler_cpp_changes.outputs.pre_commit_skip }}
         run: pre-commit run --all-files
+
+      - name: Save pre-commit cache
+        if: github.event_name == 'push'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cache/pre-commit
+            ~/.cache/black
+          key: pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}-${{ github.run_id }}
 
       - name: Lint runtime Python with ruff
         run: |
@@ -95,7 +114,7 @@ jobs:
         if: steps.scheduler_cpp_changes.outputs.changed == 'true'
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang-format clang-tidy cmake ninja-build
+          sudo apt-get install -y clang-format clang-tools cmake ninja-build
 
       - name: Configure scheduler compile database
         if: steps.scheduler_cpp_changes.outputs.changed == 'true'
@@ -140,9 +159,9 @@ jobs:
         run: |
           cpp_files="$(git ls-files tokenspeed-scheduler | grep -E '\.(c|cc|cpp|cxx|h|hh|hpp|hxx)$')"
           jobs="$(nproc)"
-          tidy_files="$(printf '%s\n' "$cpp_files" | grep -E '\.(c|cc|cpp|cxx)$' || true)"
+          tu_files="$(printf '%s\n' "$cpp_files" | grep -E '\.(c|cc|cpp|cxx)$' || true)"
           format_count="$(printf '%s\n' "$cpp_files" | sed '/^$/d' | wc -l)"
-          tidy_count="$(printf '%s\n' "$tidy_files" | sed '/^$/d' | wc -l)"
+          tu_count="$(printf '%s\n' "$tu_files" | sed '/^$/d' | wc -l)"
 
           echo "Running clang-format on ${format_count} files with ${jobs} workers"
           printf '%s\n' "$cpp_files" | xargs -r -n 16 -P "$jobs" sh -c '
@@ -150,8 +169,10 @@ jobs:
             clang-format --dry-run --Werror "$@"
           ' sh
 
-          echo "Running clang-tidy on ${tidy_count} translation units with ${jobs} workers"
-          printf '%s\n' "$tidy_files" | xargs -r -n 1 -P "$jobs" sh -c '
-            echo "clang-tidy: $1"
-            clang-tidy -p tokenspeed-scheduler/build "$1"
+          # Syntax-only: clang-tidy's default static analyzer took ~1h and its
+          # warnings never failed the job.
+          echo "Running clang-check on ${tu_count} translation units with ${jobs} workers"
+          printf '%s\n' "$tu_files" | xargs -r -n 1 -P "$jobs" sh -c '
+            echo "clang-check: $1"
+            clang-check -p tokenspeed-scheduler/build "$1"
           ' sh
