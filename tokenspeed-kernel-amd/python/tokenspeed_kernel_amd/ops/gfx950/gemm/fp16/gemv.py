@@ -106,7 +106,7 @@ _MFMA_LONG_K_WARPS = 8
 # (N, K) -> largest M where two 16-row programs per CU beat one 28-row program.
 _HALF_TILE_MAX_M = {(7168, 768): 16, (7168, 1536): 4, (7168, 3584): 8}
 # Gated GEMV: every K iteration's weights are in registers at once, and past 8
-# rows the repeated norm outlasts the weight stream (K = 1536 on MI350X).
+# rows the norm each program repeats outlasts the weight stream.
 _GATED_MAX_ITERS = 3
 _GATED_MAX_M = 8
 # FP8-weight tile: rows up to 128 in one MFMA tile (BLOCK_M 16 to 128), and
