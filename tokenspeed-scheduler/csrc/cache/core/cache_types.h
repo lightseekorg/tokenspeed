@@ -304,10 +304,12 @@ struct PrefixMatch {
 // converges every group to the final common boundary.
 struct GroupPrefixProbe {
     std::vector<std::uint8_t> hits{};
-    // Optional physical lookup hints, aligned with hits. These own no block
-    // or entry pointer. Consumers recheck the pool and complete key against
-    // the live location index, falling back to key lookup after relocation
-    // or slot reuse. Tail/State/L3-only shapes may have no location hints.
+    // Optional physical lookup hints: where the probe found each hit. Hints
+    // only, owning no block or entry pointer: nothing keeps them in step with
+    // hits once the coordinator rewrites hits, and consumers recheck the pool
+    // and complete key against the live location index, falling back to key
+    // lookup on a mismatch (after relocation, slot reuse or such a rewrite).
+    // Tail/State/L3-only shapes may have no location hints.
     const BlockPool* location_pool{nullptr};
     std::vector<CacheBlockLocation> locations{};
 };

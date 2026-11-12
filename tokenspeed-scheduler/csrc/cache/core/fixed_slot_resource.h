@@ -36,9 +36,12 @@ namespace tokenspeed {
 // general pool resource, freeing a node never searches the allocated chunks:
 // the freed slot itself links the free list. The first request fixes the slot
 // size and alignment; requests of any other shape, which a container may make
-// besides its nodes, go to the upstream new/delete resource. The owning
-// container destroys its objects before this resource, which retains chunks
-// until owner destruction.
+// besides its nodes, go to the upstream new/delete resource. Chunks of
+// slots_per_chunk slots are allocated on demand and, with every freed slot,
+// retained until this resource is destroyed: about
+// ceil(high_water_slots / slots_per_chunk) * slots_per_chunk * aligned slot
+// size bytes, plus one handle per chunk. The owning container destroys its
+// objects before this resource.
 class FixedSlotResource final : public std::pmr::memory_resource {
 public:
     explicit FixedSlotResource(std::size_t slots_per_chunk) : slots_per_chunk_{slots_per_chunk} {

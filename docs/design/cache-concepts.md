@@ -6,77 +6,6 @@ concepts are *logical* (token-based, storage-agnostic) and which are *physical*
 reference for naming, code placement, and layering decisions in both the C++
 scheduler (`tokenspeed-scheduler`) and the Python runtime.
 
-## Prefix hash bytes
-
-Prefix page identities use SHA-256 over the existing little-endian framed
-prior digest, token IDs and extra keys. On little-endian hosts a page's token
-payload is submitted to SHA in one update; other hosts encode bounded chunks
-explicitly. Batching must preserve the exact byte stream, including signed
-token IDs, empty priors and partial pages. It changes neither cache identity
-nor storage and KV-event formats.
-
-The synchronous chain carries raw prior digests between pages. Request-owned
-prompt hashes grow only as far as admission or a bounded storage query needs;
-publication reuses those already computed and hashes only its remaining complete
-pages. Tail hashing still uses the actual publication frontier and its prior.
-
-Cache keys and boundary indices store canonical lowercase SHA-256 identities as
-32 bytes. Opaque keys retain their exact string bytes; an empty prior and a
-zero digest remain distinct, as do uppercase and lowercase keys. Equality uses
-the complete identity and every namespace/group/page-offset field. Hash-table
-hashes may use a digest prefix, but never use it as identity. External storage,
-transfer and binding hash strings keep their existing format.
-
-Locations are indexed separately in each pool/group using its fixed packing.
-Two directory levels allocate only touched 1,024-entry segments; an empty
-segment is released. For N dense slots, values cost approximately 8N bytes on
-64-bit hosts, plus one directory pointer per segment and small size counters.
-Sparse tiers allocate no value array for untouched segments. Entries are found
-once for eviction: metadata is read before removal and the returned key owns
-its bytes through notifications and dependent-boundary cleanup. The ordered
-(epoch, location) policy remains unchanged. Entry-owned RAII registrations
-remove their order nodes at destruction. Acquiring a matched block returns
-an owning reference. Traversal suspends an available-order registration when
-it encounters a pinned entry, including pins obtained through other paths.
-The last external owner's notification restores the same node, without
-allocation; its key follows epoch changes and relocation while pinned. The
-order containers outlive their registrations, and observers are cancelled
-before either the registration or block owner is destroyed.
-All ordered-index mutations keep the last insertion as an insertion hint,
-advancing it before removing its node. Appends at the newest epoch, and
-restoring, publishing or re-keying consecutive locations within one epoch, in
-ascending or descending order, can use that hint; arbitrary release order and
-older epochs retain the same map order.
-
-Page-walk probes can retain physical location hints, not entry pointers or
-block owners. Protection and acquisition check the pool and complete cache
-key at the live location before using a hint; relocation or reuse falls back
-to key lookup. Shapes with no hint use the same lookup. A probe therefore
-does not pin cache, and cannot accidentally acquire a different identity when
-its old location or control address is reused.
-
-Key and boundary lookup use open-addressed tables containing cached hashes and
-stable handles. Per-tier entry lists and the boundary node list own their
-objects in pooled storage; each boundary node also owns its key. Rehash and
-backward-shift deletion move handles only. An entry or node leaving its table
-is found by handle identity from its own key's hash, never by comparing stored
-keys. Root, child, sibling and Host order still come from the existing links,
-never from hash-slot iteration. Tables grow at 75% occupancy and retain their
-high-water capacity; at 16 bytes per slot, each lookup table costs between
-roughly 21 and 43 bytes per live key immediately before/after growth. Rehash
-temporarily holds both slot arrays.
-Each node shape has its own fixed-slot resource, allocating chunks of 256
-slots on demand. A freed slot stores the free-list link, so recycling needs no
-search through chunks. Retained slot bytes are
-`ceil(high_water_nodes / 256) * 256 * aligned_node_size`, plus chunk handles;
-resources retain freed slots until their owner is destroyed.
-
-Block control objects similarly occupy stable, on-demand pooled slots owned by
-their BlockPool. Last-owner destruction cancels observers, releases the physical
-child exactly once, then recycles control storage. Physical placement and the
-free-parent FIFO are unchanged; reusing a control address conveys no ownership
-of its previous block.
-
 ## Two worlds: logical tokens vs. physical storage
 
 ### Logical world (token units, storage-agnostic)
@@ -210,38 +139,38 @@ request fits, it does not enumerate eviction candidates. Under memory pressure,
 it enumerates candidates and keeps shadow occupancy only for the parents whose
 children it tentatively evicts. This makes the common zero-eviction path scale
 with cache groups and request demand rather than total cache capacity.
-Each shadow's occupancy table stores parent/count pairs in contiguous slots,
-growing only with touched parents. Restoring a parent keeps its slot until the
-shadow dies, so repeated Remove/Restore does not allocate individual nodes.
-Dense parent ranges initially use nearby slots; clustered probes trigger one
-rehash with mixed integer hashes, so regular strides do not produce long scans.
-The eviction planners' lookup tables (protected and reclaimed locations, the
-selected sets' members, segment tops, checkpoint counts) are open-addressed
-slot arrays as well, reserved from the probe's hit count and the demand's
-shortfall, with every key bit mixed so strided page IDs and pooled node
-addresses do not cluster. No plan iterates them, so none depends on slot
-order. Each shadow, and each planner for its tables, owns an independent RAII
-scratch lease. The pool lazily retains at most three 256 KiB banks, as many as
-an admission's planner, shadow and pre-scan shadow hold at once; larger
-allocations and further simultaneous leases use the ordinary allocator and
-free that overflow with their containers. Only storage is reused: every plan
-starts with fresh tables and occupancy state, and its containers die before
-the lease returns. No array proportional to a sparse Host pool's theoretical
-slot count is initialized for planning.
+A shadow's occupancy state grows only with the parents it touches
+(`ParentOccupancy`), never with pool capacity. A planner's lookup tables live
+for its plan alone, and no plan iterates them, so no decision depends on their
+slot or bucket order, whether a table is open-addressed (`FlatHashMap`) or
+node-based. Each shadow and each planner allocates from its own RAII lease on
+the pool's planning scratch (`PlanningScratch`), which retains a small, fixed
+amount of memory. Only storage is reused: every plan starts with fresh tables
+and occupancy state, and its containers die before the lease returns. No
+array proportional to a sparse Host pool's theoretical slot count is
+initialized for planning.
 
 Replicated groups have one ownership bucket: every Host hit needs a Device
 destination in that bucket, without looking up or temporarily owning the Host
 block to count it. Sharded groups count destinations by their Host sources'
 ownership buckets.
 
-The prefix index remembers acquired hits and entries an eviction traversal found pinned.
-Later admission attempts skip those entries until the last external block owner
-releases them. A one-shot ownership notification restores each entry to its
-original access epoch, including an epoch changed while it was pinned. This
-keeps the same LRU victim order without repeatedly scanning active requests'
-blocks. Admission cursors read this available-entry index directly, so a later
-plan also skips epochs whose entries are all known to be pinned. Temporary
-lookups do not update this secondary index. The notification
+The prefix index orders the entries eviction may take by access epoch, then
+location (the available-entry order). Each entry owns its registration there,
+and in the common order below, and removes it when destroyed; the orders
+outlive their registrations, and an entry cancels its ownership notification
+before its registrations or its block go. The index remembers which entries
+an eviction traversal found pinned, by whatever owner -- an admission's
+acquired hit, a `Find()` reference, a transfer: the traversal sets such an
+entry's order node aside, and later admission attempts skip it until the last
+external block owner releases it. Acquiring a hit does not itself set
+anything aside. A one-shot ownership notification then restores the same
+node, without allocating, under the entry's current access epoch and
+location, either of which may have changed while it was pinned. This keeps
+the same LRU victim order without repeatedly scanning active requests'
+blocks. Admission cursors read this available-entry index directly, so a
+later plan also skips epochs whose entries are all known to be pinned.
+Temporary lookups do not update this secondary index. The notification
 belongs to block-reference ownership; the pool still tracks placement alone.
 
 Host duplicate reclamation needs a complete Device prefix with no pending
@@ -272,9 +201,10 @@ it consumes those snapshots in the same order without traversing the index
 again. Both ownership classes are observed within the same unchanged plan.
 Admission and Host placement keep temporary lookup nodes in a memory
 resource scoped to the plan; Host placement also uses it for snapshots.
-The returned victim list owns its storage;
-no snapshot or allocator survives the call. Every later plan observes fresh
-ownership, access epochs, and tree links.
+The returned plan owns its victim list and the arena holding the victims'
+members until the admission commits; no snapshot, lookup table or planner
+arena survives the call. Every later plan observes fresh ownership, access
+epochs, and tree links.
 The lookup tables retain computed key hashes: walking a cluster or erasing an
 entry does not repeatedly hash its full content digest. Key equality and
 eviction order remain unchanged.
@@ -977,6 +907,47 @@ Perception rules per directory:
 * **`prefix_hasher.h`** — SHA-256 prefix-page hashing (moved from
   `scheduler/`).
 
+#### Prefix identities and index storage
+
+* **Hash bytes.** A page identity is SHA-256 over one self-delimiting byte
+  stream: the prior's bytes, the page's token IDs as little-endian 32-bit
+  values, then any extra keys. However hashing is implemented, it feeds
+  exactly that stream: cache identity, storage and KV-event formats never
+  depend on it. Each page chains the previous page's raw digest. A request
+  hashes its prompt pages once and keeps the chain
+  (`Request::PromptPrefixHashes`): admission retries reuse it, a bounded
+  storage query hashes no further than it asks, and publication hashes only
+  the pages the chain does not cover yet. A tail is hashed at the actual
+  publication frontier, under the chain hash of the page before it.
+* **Identity.** `ContentHash` holds a canonical lowercase SHA-256 identity as
+  its 32 bytes and any other key as its exact text, so an empty prior and a
+  zero digest stay distinct, as do uppercase and lowercase text. Equality
+  compares the complete identity, and a `CacheKey` every other field too; a
+  table may hash a digest prefix but never takes it for identity. Converting
+  between identity and text is always explicit, and external storage,
+  transfer and binding interfaces keep text.
+* **Ownership.** Each tier's entry list owns its entries, and the boundary
+  tree's node list owns its nodes and their keys, in stable pooled storage.
+  The key and location lookups are non-owning indices of handles into those
+  lists: rehashing or erasing moves handles, never entries; an entry or node
+  leaves its lookup, by identity, before it is destroyed; and no walk follows
+  slot order -- roots, children, siblings, Host leaves and eviction order come
+  from explicit links and ordered indices, so mirrored ranks agree. Pooled
+  storage and lookup tables keep their high-water capacity until their owner
+  is destroyed; the location index releases each segment once its last entry
+  leaves.
+  The retained-memory bounds are in the class comments (`FixedSlotResource`,
+  `FlatPointerIndex`, `SegmentedLocationIndex`). Block control objects live
+  in their `BlockPool`'s pooled storage: the last owner's release cancels
+  observers, frees the physical child exactly once, then recycles the control
+  slot, and a reused control address carries no ownership of its previous
+  block.
+* **Probe hints.** A probe may record where it found each hit, never an entry
+  pointer or a block owner. Acquisition and protection use such a location
+  only after checking its pool and the complete key at the live location, and
+  otherwise look the key up, so a probe pins nothing and a relocated or reused
+  location can never make it acquire another identity.
+
 ### `cache/allocator/` — where things live (token-free)
 
 `GroupAllocator` is **physical placement only**, and there is exactly one of
@@ -1658,8 +1629,17 @@ until the plan fits. Before inspecting segment trees, a second relaxed check
 releases the actual request-reclaimable slots and available cache entries into
 temporary occupancy, preserving parent and bucket placement while ignoring
 segment restrictions. It stops as soon as placement fits; when even all such
-releases fail, no victim order can make space. It uses the available-entry
-index, not the live cache, and never commits these tentative releases.
+releases fail, no victim order can make space. It reads the same ordered
+available-entry index as selection, not the live cache, and never commits
+these tentative releases. Selection may replay a bounded prefix of the epochs
+this pre-scan read instead of reading them again. A replayed epoch owns only
+the policy metadata selection ranks by, never blocks or session owners, dies
+with the planner, and is filtered, aged and sorted like an epoch read live.
+After a replay, selection resumes the index by key past the last replayed
+epoch. A demand short by n parents cannot fit before n more blocks leave, as
+one release closes at most one parent of the shortfall
+(`ShadowOccupancy::ParentShortfall`), so the pre-scan and selection ask the
+fit again only after that many releases.
 The bounds read current ownership on every attempt, so a
 released pin can fund the next retry. Request-reclaimable candidates are collected and sorted
 once; each cache group loads and sorts one epoch of eligible candidates at a
@@ -2429,9 +2409,7 @@ release. Shared request/prefix references therefore keep both the parent
 binding and its index state alive until the last reference releases the block.
 These indices describe physical availability, not request-local owner loads.
 A parent's occupied-slot bits are clear whenever it is empty, so binding sets
-no initial state. Packings up to 64 keep them in the parent record itself; a
-parent of a wider group gets a word array sized for the pool's widest packing
-at its first such binding and retains it until the pool is destroyed.
+no initial state (`BlockPool::LcmBlock` says where they live).
 
 An exact acquire first checks `group holes + empty parents * group packing`.
 Capacity-first selection can consume all of these slots, so it then allocates

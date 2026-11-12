@@ -33,7 +33,11 @@ namespace tokenspeed {
 
 // A pool/group-scoped, sparse direct index. Packing is fixed for this group
 // in this pool; parent rebinding cannot alias another group's child slots.
-// Only touched segments allocate values. `empty`, given at construction,
+// Two directory levels lead to segments of kSegmentSize values, allocated when
+// first touched and released when their last entry leaves: N dense slots cost
+// about N values (8N bytes for a list iterator on a 64-bit host) plus one
+// directory pointer per segment and small counters, and a sparse tier
+// allocates nothing for an untouched segment. `empty`, given at construction,
 // denotes an absent entry; for list iterators, the owning list's end() (see
 // FlatPointerIndex).
 template <typename T>

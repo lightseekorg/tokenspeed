@@ -9,36 +9,6 @@ Companion documents: `event-loop.md` (the control/data plane split that
 consumes these plans), `cache-concepts.md` (the vocabulary below —
 prefix granularity, cache groups, LCM blocks).
 
-During one plan build, prefill operations borrow token windows from their
-requests, just as they borrow block-table windows. No Advance or token mutation
-can interleave that build. ForwardBatch reserves space and copies each input
-and shifted window once before the plan is returned; the returned batch owns
-its arrays independently of request lifetime. The shifted window stops at
-PrefillSize, with missing positions padded by -1, including replay and prompt
-boundaries followed by generated tokens.
-
-Eviction victim members use a plan-owned allocation arena that outlives the
-planner and commit. This changes storage, not policy: feasibility still uses
-the common occupancy formula, and Minimize still restores victims in reverse
-order, checks fit and removes required victims again. Survivors are compacted
-in original order. The pre-scan and ordered epoch index remain part of that
-same planning path. The planner may reuse a bounded prefix of the pre-scan's
-raw epoch snapshots; selection still applies the same exclusion, checkpoint
-aging and policy sort. Snapshot vectors retain at most 8,192 entry slots
-across groups, so a failed admission never copies an entire large cache into
-retained snapshots. Each snapshot owns the policy metadata selection ranks by
--- no blocks and no session owners -- and dies with the planner. After
-replay, the live cursor seeks past the last saved epoch by key: a saved next
-iterator could point at a pinned node extracted by the pre-scan.
-
-A demand short by n parents cannot fit before n more blocks are released:
-one release closes at most one parent of the shortfall
-(`ShadowOccupancy::ParentShortfall`). The pre-scan and selection therefore ask
-the fit again only then. Selection stops exactly where asking after every
-selection would. The pre-scan ends at the same epoch with the same answer and
-still reads that epoch whole: it finds the same pinned entries and saves the
-same snapshots.
-
 ## 1. Admission is per chunk
 
 An optional `--chunk-prefill-kv-size` also bounds the KV read by a local

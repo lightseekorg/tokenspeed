@@ -34,7 +34,11 @@ namespace tokenspeed {
 // defined against its other iterators (a value-initialized iterator does
 // not). Growing or backward-shifting slots never moves an object or its key.
 // Callers erase its handle before destroying or changing its key. Slot order
-// is deliberately not exposed as a traversal order.
+// is deliberately not exposed as a traversal order. A slot caches its handle's
+// hash: probing and erasing never hash a stored key again. The table doubles
+// at 75% occupancy and never shrinks; with 16-byte slots (an 8-byte handle) it
+// holds roughly 21 to 43 bytes per live key just before and after growing,
+// and a rehash briefly holds both slot arrays.
 template <typename T, typename Key, typename KeyOf, typename Hash>
 class FlatPointerIndex {
 public:

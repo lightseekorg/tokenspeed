@@ -117,8 +117,7 @@ public:
                 it->members.clear();
             }
         }
-        // Compact in original order after the reverse restore/fit pass.
-        // The capacity formula and checkpoint updates above are unchanged.
+        // The sets kept stay in selection order.
         std::erase_if(victims, [](const auto& set) { return set.members.empty(); });
     }
 

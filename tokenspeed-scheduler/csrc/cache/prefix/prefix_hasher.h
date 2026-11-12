@@ -105,7 +105,10 @@ inline std::vector<uint8_t> HexToBytes(const std::string& hex) {
 // distinct (prior, tokens, extra_keys) triples can hash the same byte stream:
 // prior_len separates page 0 from a chained page, token_count keeps tokens from
 // bleeding into extra_keys, and per-key length prefixes prevent re-splitting.
-// Feed order is prior_hash -> tokens -> extra_keys.
+// Feed order is prior_hash -> tokens -> extra_keys. Token IDs are their
+// little-endian 32-bit bytes: a little-endian host submits a page's tokens in
+// one SHA update, any other host encodes them in bounded chunks, and both
+// produce the same stream.
 using PrefixDigest = std::array<unsigned char, SHA256_DIGEST_LENGTH>;
 
 inline PrefixDigest HashPrefixPageDigest(std::span<const std::int32_t> tokens, std::span<const uint8_t> prior_bytes,
