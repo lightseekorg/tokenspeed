@@ -30,7 +30,7 @@ from tokenspeed_kernel.thirdparty.flashinfer.trtllm_moe import (
     _clone,
     _cluster_persistent_configs,
     _entrypoints,
-    _prefer_qwen38_decode_tile_32,
+    _prefer_tile_32,
     _register_private,
     _require_runner_rebinding,
     _require_tactic_hooks,
@@ -65,7 +65,7 @@ def test_operator_names_are_private():
         _register_private(register, "another::moe", mutates_args=())
 
 
-def test_qwen38_decode_tactic_filter_accepts_ffi_arrays():
+def test_tile_32_filter_accepts_ffi_arrays():
     tvm_ffi = pytest.importorskip("tvm_ffi")
     tactics = [
         tvm_ffi.Array([8, 1]),
@@ -73,12 +73,16 @@ def test_qwen38_decode_tactic_filter_accepts_ffi_arrays():
         tvm_ffi.Array([16, 3]),
         tvm_ffi.Array([32, 4]),
     ]
-    assert _prefer_qwen38_decode_tile_32(tactics) == [tactics[1], tactics[3]]
+    assert _prefer_tile_32(tactics) == [tactics[1], tactics[3]]
     without_tile_32 = [tactics[0], tactics[2]]
-    assert _prefer_qwen38_decode_tile_32(without_tile_32) is without_tile_32
+    assert _prefer_tile_32(without_tile_32) is without_tile_32
 
 
-def _moe_runner_and_inputs(num_tokens, hidden_size, weight_dtype):
+_QWEN38 = dict(top_k=10, num_local_experts=128, intermediate_size=640, num_experts=512)
+_KIMI_K3 = dict(top_k=16, num_local_experts=896, intermediate_size=384, num_experts=896)
+
+
+def _moe_runner_and_inputs(num_tokens, hidden_size, weight_dtype, geometry=_QWEN38):
     core = pytest.importorskip("flashinfer.fused_moe.core")
     inputs_module = pytest.importorskip("flashinfer.fused_moe.shared.inputs")
     enums = pytest.importorskip("flashinfer.tllm_enums")
@@ -95,14 +99,14 @@ def _moe_runner_and_inputs(num_tokens, hidden_size, weight_dtype):
 
     runner = _entrypoints()["TrtllmMoERunner"](
         MoeOp(),
-        top_k=10,
-        num_local_experts=128,
+        top_k=geometry["top_k"],
+        num_local_experts=geometry["num_local_experts"],
         dtype_act=enums.DtypeTrtllmGen.Bfloat16,
         dtype_weights=enums.DtypeTrtllmGen[weight_dtype],
         fp8_quantization_type=enums.Fp8QuantizationType.NoneFp8,
         hidden_size=hidden_size,
-        intermediate_size=640,
-        num_experts=512,
+        intermediate_size=geometry["intermediate_size"],
+        num_experts=geometry["num_experts"],
     )
     inputs = [None] * len(inputs_module.MoeRunnerInputs._FIELDS)
     hidden_index = inputs_module.MoeRunnerInputs._FIELDS.index("hidden_states")
@@ -148,6 +152,35 @@ def test_tactic_cache_key_changes_only_for_target_shape(
         assert key.extras == policy
 
 
+@pytest.mark.parametrize(
+    ("num_tokens", "weight_dtype", "geometry", "targeted"),
+    [
+        (256, "MxE2m1", _KIMI_K3, True),
+        (512, "MxE2m1", _KIMI_K3, True),
+        (128, "MxE2m1", _KIMI_K3, False),
+        (768, "MxE2m1", _KIMI_K3, False),
+        (256, "E2m1", _KIMI_K3, False),
+        (256, "MxE2m1", {**_KIMI_K3, "num_local_experts": 112}, False),
+    ],
+)
+def test_kimi_k3_decode_policy_tags_only_its_buckets(
+    num_tokens, weight_dtype, geometry, targeted
+):
+    core, runner, inputs, _, _ = _moe_runner_and_inputs(
+        num_tokens, 3584, weight_dtype, geometry
+    )
+    autotuner = pytest.importorskip("flashinfer.autotuner")
+    extras = runner.get_cache_key_extras(inputs)
+    key = core.AutoTuner._get_cache_key(
+        "test_moe", runner, _input_shapes(inputs), autotuner.TuningConfig(), extras
+    )
+    policy = (*extras, _CLUSTER_POLICY_TAG)
+    if targeted:
+        assert key.extras == (*policy, "tokenspeed-kimi-k3-tile32-v1")
+    else:
+        assert key.extras == policy
+
+
 def _is_blackwell():
     from tokenspeed_kernel.platform import current_platform
 
@@ -166,6 +199,19 @@ def _is_blackwell():
 def test_valid_tactics_apply_the_target_policy(num_tokens, hidden_size, targeted):
     _, runner, inputs, tactics, _ = _moe_runner_and_inputs(
         num_tokens, hidden_size, "E2m1"
+    )
+    expected = [tactics[1]] if targeted else tactics
+    assert runner.get_valid_tactics(inputs, None) == expected
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not _is_blackwell(),
+    reason="the cluster filter reads the Blackwell TRT-LLM MoE module's kernel list",
+)
+@pytest.mark.parametrize(("num_tokens", "targeted"), [(256, True), (128, False)])
+def test_kimi_k3_decode_valid_tactics_keep_tile_32(num_tokens, targeted):
+    _, runner, inputs, tactics, _ = _moe_runner_and_inputs(
+        num_tokens, 3584, "MxE2m1", _KIMI_K3
     )
     expected = [tactics[1]] if targeted else tactics
     assert runner.get_valid_tactics(inputs, None) == expected

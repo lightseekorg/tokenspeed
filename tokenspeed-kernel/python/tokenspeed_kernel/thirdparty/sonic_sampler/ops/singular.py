@@ -242,6 +242,7 @@ def cumulative_selection_kernel(
     stride_mr=None,  # Rank Stride of Gathered Candidate Pairs.
     stride_mb: tl.constexpr = None,  # Batch Stride of Gathered Candidate Pairs.
     whole: tl.constexpr = False,  # Whole-Vocabulary Rows Flag (``whole_block``).
+    u_ptr=None,  # Draw Steps -> [ B ] int32, each row's noise step (else 0).
 ) -> None:
 
     # Extract the batch id from program id and load the indicator.
@@ -444,7 +445,13 @@ def cumulative_selection_kernel(
 
             # Draw the gumbel noise in-kernel at the unpacked subset.
 
-            key = philox_key(h_ptr, l_ptr, batch_id, 0)
+            draw_step = 0
+
+            if u_ptr is not None:
+
+                draw_step = tl.load(u_ptr + row_id)
+
+            key = philox_key(h_ptr, l_ptr, batch_id, draw_step)
             noise = philox_gumbel(key, indices)
 
         selected = tl.argmax(values - noise, axis=0, keep_dims=True)
