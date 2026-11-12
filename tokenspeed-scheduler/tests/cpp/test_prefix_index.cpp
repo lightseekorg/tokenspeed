@@ -352,6 +352,13 @@ TEST(ContentHash, EveryNoncanonicalByteRemainsOpaqueAtEveryPosition) {
     }
 }
 
+// Indexes the handle of an object that already exists under the object's
+// key; false, leaving the index unchanged, when the key is indexed already.
+template <typename Index, typename Key, typename Handle>
+bool IndexHandle(Index& index, const Key& key, Handle handle) {
+    return index.FindOrInsert(key, [handle] { return handle; }).second;
+}
+
 TEST(FlatPointerIndex, CollidingKeysSurviveGrowthWrappedClustersAndChurn) {
     struct Entry {
         int key;
@@ -367,14 +374,14 @@ TEST(FlatPointerIndex, CollidingKeysSurviveGrowthWrappedClustersAndChurn) {
     std::map<int, const Entry*> expected;
     for (int i = 0; i < 256; ++i) {
         entries[i].key = i;
-        ASSERT_TRUE(index.Insert(&entries[i]));
+        ASSERT_TRUE(IndexHandle(index, entries[i].key, &entries[i]));
         expected.emplace(i, &entries[i]);
     }
     std::mt19937 random(8731);
     for (int step = 0; step < 4096; ++step) {
         const int key = random() % entries.size();
         if (random() % 2) {
-            EXPECT_EQ(index.Insert(&entries[key]), expected.emplace(key, &entries[key]).second);
+            EXPECT_EQ(IndexHandle(index, key, &entries[key]), expected.emplace(key, &entries[key]).second);
         } else {
             const auto found = expected.find(key);
             const Entry* removed = found == expected.end() ? nullptr : found->second;
@@ -395,7 +402,7 @@ TEST(FlatPointerIndex, CollidingKeysSurviveGrowthWrappedClustersAndChurn) {
     }
     EXPECT_TRUE(index.empty());
     EXPECT_FALSE(index.Erase(0));
-    EXPECT_TRUE(index.Insert(&entries[0]));
+    EXPECT_TRUE(IndexHandle(index, 0, &entries[0]));
     EXPECT_EQ(index.Find(0), &entries[0]);
 }
 
@@ -424,7 +431,7 @@ TEST(FlatPointerIndex, ExtractObjectRemovesOnlyThatObjectAmongCollidingKeys) {
     std::map<int, const Entry*> expected;
     for (int i = 0; i < 300; ++i) {
         entries[i].key = i;
-        ASSERT_TRUE(index.Insert(&entries[i]));
+        ASSERT_TRUE(IndexHandle(index, entries[i].key, &entries[i]));
         expected.emplace(i, &entries[i]);
     }
     const auto expect_contents = [&] {
@@ -451,7 +458,7 @@ TEST(FlatPointerIndex, ExtractObjectRemovesOnlyThatObjectAmongCollidingKeys) {
         const bool present = expected.contains(key);
         switch (random() % 3) {
             case 0:
-                EXPECT_EQ(index.Insert(&entries[key]), !present);
+                EXPECT_EQ(IndexHandle(index, key, &entries[key]), !present);
                 expected.emplace(key, &entries[key]);
                 break;
             case 1:
@@ -485,7 +492,7 @@ TEST(FlatPointerIndex, ListIteratorsUseTheListEndForAbsentKeys) {
     EXPECT_EQ(index.Find(3), nodes.end());
     for (int key = 0; key < 40; ++key) {
         nodes.push_back(key);
-        ASSERT_TRUE(index.Insert(std::prev(nodes.end())));
+        ASSERT_TRUE(IndexHandle(index, key, std::prev(nodes.end())));
     }
     EXPECT_EQ(index.Find(40), nodes.end());
     for (auto node = nodes.begin(); node != nodes.end();) {
@@ -504,6 +511,44 @@ TEST(FlatPointerIndex, ListIteratorsUseTheListEndForAbsentKeys) {
             ASSERT_NE(node, nodes.end()) << key;
             EXPECT_EQ(*node, key);
         }
+    }
+}
+
+// FindOrInsert creates an object only for an absent key. A creation that
+// throws, also right after the table grew for it, leaves every handle as it
+// was.
+TEST(FlatPointerIndex, FindOrInsertCreatesOnlyAbsentKeysAndSurvivesAThrowingCreation) {
+    using List = std::list<int>;
+    struct KeyOfNode {
+        const int& operator()(List::iterator node) const { return *node; }
+    };
+    struct ShortHash {
+        std::size_t operator()(int key) const { return static_cast<std::size_t>(key % 7); }
+    };
+    List nodes;
+    FlatPointerIndex<List::iterator, int, KeyOfNode, ShortHash> index{nodes.end()};
+    int created = 0;
+    const auto create = [&](int key) {
+        return [&nodes, &created, key] {
+            ++created;
+            return nodes.insert(nodes.end(), key);
+        };
+    };
+    for (int key = 0; key < 100; ++key) {
+        const auto [node, inserted] = index.FindOrInsert(key, create(key));
+        EXPECT_TRUE(inserted);
+        EXPECT_EQ(*node, key);
+        const auto [again, inserted_again] = index.FindOrInsert(key, create(key));
+        EXPECT_FALSE(inserted_again);
+        EXPECT_EQ(again, node);
+        EXPECT_THROW(index.FindOrInsert(-1 - key, []() -> List::iterator { throw std::runtime_error("no node"); }),
+                     std::runtime_error);
+        EXPECT_EQ(index.size(), static_cast<std::size_t>(key + 1));
+        EXPECT_EQ(index.Find(-1 - key), nodes.end());
+    }
+    EXPECT_EQ(created, 100);
+    for (auto node = nodes.begin(); node != nodes.end(); ++node) {
+        EXPECT_EQ(index.Find(*node), node) << *node;
     }
 }
 

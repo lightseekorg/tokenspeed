@@ -326,27 +326,27 @@ public:
             touchEntry(existing_it, access_epoch);
             return;
         }
-        CacheEntryIterator canonical_it = findEntry(cache_index, key);
-        if (canonical_it != cache_index.entries.end()) {
-            if (canonical_it->boundary_kind < boundary_kind) {
-                canonical_it->boundary_kind = boundary_kind;
+        // One key lookup finds the canonical entry or indexes a new one,
+        // created with its key; a throw on the way leaves neither.
+        const auto [entry_it, inserted] = cache_index.by_key.FindOrInsert(
+            key, [&] { return cache_index.entries.emplace(cache_index.entries.end(), key); });
+        if (!inserted) {
+            if (entry_it->boundary_kind < boundary_kind) {
+                entry_it->boundary_kind = boundary_kind;
             }
-            mergeSession(*canonical_it, session);
-            touchEntry(canonical_it, access_epoch);
-            block_ref = canonical_it->block_ref;
+            mergeSession(*entry_it, session);
+            touchEntry(entry_it, access_epoch);
+            block_ref = entry_it->block_ref;
             return;
         }
 
-        CacheEntry& entry = cache_index.entries.emplace_back();
-        entry.key = key;
+        CacheEntry& entry = *entry_it;
         entry.block_ref = block_ref;
         entry.last_access_epoch = session && session->demoted ? 0 : access_epoch;
         entry.logical_block_index = logical_block_index;
         entry.boundary_kind = boundary_kind;
         entry.max_access_epoch = access_epoch;
         entry.session = std::move(session);
-        CacheEntryIterator entry_it = std::prev(cache_index.entries.end());
-        FatalCheck(cache_index.by_key.Insert(entry_it), "a new cache entry has a unique key");
         cache_index.by_location.Set(entry_it->block_ref->Location(), entry_it);
         entry.available_order.Insert(cache_index.available_order, evictionOrder(entry), entry_it);
         if (cache_index.boundary_tree != nullptr) {
@@ -833,7 +833,10 @@ public:
 
 private:
     struct CacheEntry {
-        CacheKey key;
+        explicit CacheEntry(const CacheKey& key) : key{key} {}
+
+        // The entry's key in by_key, fixed for its lifetime.
+        const CacheKey key;
         CacheBlockRef block_ref;
         std::uint64_t last_access_epoch{0};
         // Position in the request's logical prefix. Host-only entries may not

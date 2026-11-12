@@ -78,7 +78,7 @@ const Node& NodeOf(const BoundaryTree& tree, const std::string& hash) {
 std::vector<std::string> Children(const Node& node) {
     std::vector<std::string> hashes;
     for (const Node* child = node.first_child; child != nullptr; child = child->next_sibling) {
-        hashes.push_back(child->hash->ToString());
+        hashes.push_back(child->hash.ToString());
     }
     return hashes;
 }
@@ -86,7 +86,7 @@ std::vector<std::string> Children(const Node& node) {
 std::vector<std::string> HostLeaves(const BoundaryTree& tree) {
     std::vector<std::string> hashes;
     for (const Node* leaf = tree.FirstHostLeaf(); leaf != nullptr; leaf = leaf->next_host_leaf) {
-        hashes.push_back(leaf->hash->ToString());
+        hashes.push_back(leaf->hash.ToString());
     }
     return hashes;
 }
@@ -144,7 +144,7 @@ TEST(BoundaryTreeTest, NodesAndKeysStayStableAcrossIndexGrowthDeletionAndSlotReu
     auto root_hold = tree.HoldEntry(ContentHash{"root"}, kDeviceKv);
     root_publication.reset();
     const Node* root = tree.Find(ContentHash{"root"});
-    const ContentHash* root_key = root->hash;
+    const ContentHash* root_key = &root->hash;
     std::vector<BoundaryTree::Hold> holds;
     for (int i = 0; i < 2048; ++i) {
         const auto hash = "child-" + std::to_string(i);
@@ -153,7 +153,7 @@ TEST(BoundaryTreeTest, NodesAndKeysStayStableAcrossIndexGrowthDeletionAndSlotReu
     }
     const Node* survivor = tree.Find(ContentHash{"child-1"});
     EXPECT_EQ(tree.Find(ContentHash{"root"}), root);
-    EXPECT_EQ(root->hash, root_key);
+    EXPECT_EQ(&root->hash, root_key);
     EXPECT_EQ(*root_key, ContentHash("root"));
     std::vector<std::string> expected;
     for (int i = 0; i < 2048; ++i) {
@@ -210,7 +210,7 @@ TEST(BoundaryTreeTest, NodesWithCollidingIndexHashesLeaveOneByOne) {
     const auto expect_roots = [&] {
         for (const auto& [hash, node] : roots) {
             EXPECT_EQ(tree.Find(ContentHash{hash}), node);
-            EXPECT_EQ(*node->hash, ContentHash(hash));
+            EXPECT_EQ(node->hash, ContentHash(hash));
         }
     };
 

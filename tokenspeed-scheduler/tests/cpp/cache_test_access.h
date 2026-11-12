@@ -164,24 +164,24 @@ struct CacheCoordinatorTestAccess {
             const BoundaryTree::Node* node = pending.back();
             pending.pop_back();
             ++reached;
-            if (!expected.contains(*node->hash) && node->first_child == nullptr && node->PendingHostStores() == 0) {
-                mismatches.push_back("nothing holds the node " + node->hash->ToString());
+            if (!expected.contains(node->hash) && node->first_child == nullptr && node->PendingHostStores() == 0) {
+                mismatches.push_back("nothing holds the node " + node->hash.ToString());
             }
-            if (checkpoints.Contains(*node->hash)) {
+            if (checkpoints.Contains(node->hash)) {
                 ++tracked_checkpoints;
                 const CheckpointTree::Residency residency = tree.CheckpointResidency(*node);
                 if (!residency.held) {
-                    mismatches.push_back("the checkpoint tree tracks the unheld checkpoint " + node->hash->ToString());
+                    mismatches.push_back("the checkpoint tree tracks the unheld checkpoint " + node->hash.ToString());
                 }
                 // Distance is reported for a checkpoint present on either tier.
                 const bool present = residency.complete[0] || residency.complete[1] || residency.pending_host_store;
-                if (checkpoints.Distance(*node->hash).has_value() != present) {
-                    mismatches.push_back("checkpoint presence of " + node->hash->ToString());
+                if (checkpoints.Distance(node->hash).has_value() != present) {
+                    mismatches.push_back("checkpoint presence of " + node->hash.ToString());
                 }
                 for (const CacheTier tier : {CacheTier::kDevice, CacheTier::kHost}) {
-                    if (checkpoints.AgedDistance(*node->hash, tier) != 0 &&
+                    if (checkpoints.AgedDistance(node->hash, tier) != 0 &&
                         !residency.complete[static_cast<std::size_t>(tier)]) {
-                        mismatches.push_back("aged checkpoint " + node->hash->ToString() + " incomplete on tier " +
+                        mismatches.push_back("aged checkpoint " + node->hash.ToString() + " incomplete on tier " +
                                              std::to_string(static_cast<int>(tier)));
                     }
                 }

@@ -16686,7 +16686,7 @@ TEST_P(WriteBackRandomTest, TreeNodesLiveExactlyAsLongAsAnEntryOrAStore) {
             }
             if (node != nullptr && node->parent != nullptr &&
                 coordinator.GroupPrefixIndex(0).Contains(pool, Key(hash, 0))) {
-                EXPECT_TRUE(coordinator.GroupPrefixIndex(0).Contains(pool, Key(node->parent->hash->ToString(), 0)))
+                EXPECT_TRUE(coordinator.GroupPrefixIndex(0).Contains(pool, Key(node->parent->hash.ToString(), 0)))
                     << "round " << round << ": a Device page or tail outlives the page it follows";
             }
         }

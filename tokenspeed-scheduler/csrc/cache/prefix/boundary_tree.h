@@ -97,6 +97,8 @@ public:
     class Hold;
 
     struct Node {
+        Node(const ContentHash& hash, BoundaryTree& tree) : hash{hash}, tree_{&tree} {}
+
         // Some group indexes this hash on the Device tier.
         bool OnDevice() const noexcept { return entries_[kDevice] > 0; }
         // Some group indexes this hash on the Host tier, or a store is
@@ -125,7 +127,8 @@ public:
         // settled yet.
         std::int32_t PendingHostStores() const noexcept { return pending_stores_; }
 
-        const ContentHash* hash{nullptr};  // this node's owned key
+        // The node's key in the tree's index, fixed for its lifetime.
+        const ContentHash hash;
         // Null for page 0, and for a node started without a known parent until
         // a publication through its hash links it (LinkPublication).
         Node* parent{nullptr};
@@ -175,8 +178,7 @@ public:
         std::int32_t pending_stores_{0};
         std::int32_t pending_checkpoint_stores_{0};
         std::int32_t publications_{0};
-        ContentHash owned_hash_;
-        BoundaryTree* tree_{nullptr};
+        BoundaryTree* tree_;
     };
 
     // One holder's claim on one node: while it lives the node stays, and what
@@ -224,8 +226,9 @@ public:
     // `checkpoints` (null: none) receives every change of a State
     // checkpoint's residency; it must outlive every hold.
     BoundaryTree(Config config, CheckpointTree* checkpoints) : config_{config}, checkpoints_{checkpoints} {}
-    // Nodes and holds point at the tree, and nodes at each other and at their
-    // map keys: a copy or a move would leave them pointing at the original.
+    // Nodes and holds point at the tree, and nodes and the index at each
+    // other's storage: a copy or a move would leave them pointing at the
+    // original.
     BoundaryTree(const BoundaryTree&) = delete;
     BoundaryTree& operator=(const BoundaryTree&) = delete;
     BoundaryTree(BoundaryTree&&) = delete;
@@ -473,7 +476,7 @@ private:
         // on this path are fatal checks, like the ones above.
         if (moves_checkpoint) {
             if (const CheckpointTree::Residency residency = CheckpointResidency(node); residency != had_residency) {
-                checkpoints_->Update(*node.hash, residency);
+                checkpoints_->Update(node.hash, residency);
             }
         }
         return checkpoint_flipped;
@@ -505,7 +508,7 @@ private:
         if (config_.queue_dead_candidates && ((checkpoint_flipped_or_node_removed && config_.num_state_groups > 0 &&
                                                !current->HasCheckpointBoundaryInSubtree()) ||
                                               is_gap)) {
-            queue(*current->hash);
+            queue(current->hash);
         }
     }
 
@@ -524,20 +527,10 @@ private:
     // it its boundary and, past page 0, a parent, whose last child it becomes,
     // its subtree's checkpoint boundaries counted in every new ancestor.
     Node& findOrAdd(const ContentHash& hash, Node* parent, std::int32_t boundary_tokens, std::int32_t tail_tokens) {
-        auto it = nodes_.Find(hash);
-        const bool inserted = it == node_storage_.end();
-        if (inserted) {
-            node_storage_.emplace_back();
-            it = std::prev(node_storage_.end());
-            try {
-                it->owned_hash_ = hash;
-                it->hash = &it->owned_hash_;
-                FatalCheck(nodes_.Insert(it), "a new boundary has a unique hash");
-            } catch (...) {
-                node_storage_.erase(it);
-                throw;
-            }
-        }
+        // A node is created with its hash before the index stores it; a
+        // throw on the way leaves neither.
+        const auto [it, inserted] =
+            nodes_.FindOrInsert(hash, [&] { return node_storage_.emplace(node_storage_.end(), hash, *this); });
         Node& node = *it;
         if (!inserted && (node.parent != nullptr || parent == nullptr)) {
             // Every real boundary is at least 1: only a node started without
@@ -548,9 +541,7 @@ private:
             }
             return node;
         }
-        if (inserted) {
-            node.tree_ = this;
-        } else {
+        if (!inserted) {
             // An existing root is about to acquire its known parent.
             (node.prev_sibling != nullptr ? node.prev_sibling->next_sibling : first_root_) = node.next_sibling;
             (node.next_sibling != nullptr ? node.next_sibling->prev_sibling : last_root_) = node.prev_sibling;
@@ -637,11 +628,11 @@ private:
                    "only a childless node nothing holds leaves the tree");
         // Nothing hangs under a tail, so a tail hash leaves the tail table
         // exactly when nothing holds its node.
-        tails_.Remove(*node.hash);
+        tails_.Remove(node.hash);
         // A candidate the last release queued for this node leaves with it
         // (the walk queues what is left above), so taking a chain from below
         // queues one node, not one per page.
-        if (!dead_candidates_.empty() && dead_candidates_.back() == *node.hash) {
+        if (!dead_candidates_.empty() && dead_candidates_.back() == node.hash) {
             dead_candidates_.pop_back();
         }
         if (node.parent != nullptr) {
@@ -654,7 +645,7 @@ private:
         }
         // Erase by iterator: the node's own key must not be read after the
         // node is gone.
-        const auto entry = nodes_.ExtractObject(*node.hash, node);
+        const auto entry = nodes_.ExtractObject(node.hash, node);
         FatalCheck(entry != node_storage_.end(), "a removed boundary keeps its index entry");
         node_storage_.erase(entry);
     }
@@ -667,13 +658,14 @@ private:
 
     Config config_;
     CheckpointTree* checkpoints_;
-    // Node-based, so nodes and keys keep their addresses across rehashes.
+    // Node-based, so nodes, with the keys they own, keep their addresses
+    // across rehashes.
     using NodeList = std::pmr::list<Node>;
     using NodeIterator = NodeList::iterator;
     struct NodeKey {
-        const ContentHash& operator()(NodeIterator node) const noexcept { return *node->hash; }
+        const ContentHash& operator()(NodeIterator node) const noexcept { return node->hash; }
     };
-    // Both node and key live in stable pooled list storage. Index rehash and
+    // Each node and its key live in stable pooled list storage. Index rehash and
     // backward-shift erase move handles only; Holds and traversal links stay
     // valid until their own node's ordinary last-holder removal.
     FixedSlotResource node_memory_{256};

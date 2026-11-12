@@ -22,6 +22,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <utility>
 #include <vector>
 
 namespace tokenspeed {
@@ -45,19 +46,30 @@ public:
     // The object's handle, or the empty handle.
     T Find(const Key& key) const {
         if (slots_.empty()) return empty_;
-        const auto hash = Hash{}(key);
-        const auto position = find(key, hash);
-        return position == slots_.size() ? empty_ : slots_[position].value;
+        return slots_[probe(key, Hash{}(key))].value;
     }
 
-    bool Insert(T value) {
-        const Key& key = KeyOf{}(value);
+    // The handle of key's object and false, or, when none is indexed, the
+    // handle make() returns, now indexed, and true. make creates the object,
+    // whose key equals `key`, and must not use this index. Either way the key
+    // is hashed and probed once. The table grows before make runs, so a make
+    // that throws leaves every handle as it was.
+    template <typename Make>
+    std::pair<T, bool> FindOrInsert(const Key& key, Make&& make) {
         const auto hash = Hash{}(key);
-        if (!slots_.empty() && find(key, hash) != slots_.size()) return false;
-        if ((size_ + 1) * 4 > slots_.size() * 3) grow();
-        put(slots_, Slot{hash, value});
+        std::size_t position = 0;
+        if (!slots_.empty()) {
+            position = probe(key, hash);
+            if (slots_[position].value != empty_) return {slots_[position].value, false};
+        }
+        if ((size_ + 1) * 4 > slots_.size() * 3) {
+            grow();
+            position = emptySlot(slots_, hash);
+        }
+        const T value = std::forward<Make>(make)();
+        slots_[position] = Slot{hash, value};
         ++size_;
-        return true;
+        return {value, true};
     }
 
     // Removes and returns the borrowed handle in one lookup, or returns the
@@ -65,8 +77,8 @@ public:
     // its index entry has gone.
     T Extract(const Key& key) {
         if (slots_.empty()) return empty_;
-        const std::size_t position = find(key, Hash{}(key));
-        return position == slots_.size() ? empty_ : removeAt(position);
+        const std::size_t position = probe(key, Hash{}(key));
+        return slots_[position].value == empty_ ? empty_ : removeAt(position);
     }
 
     // Extract for a caller holding the indexed object itself: `key` is that
@@ -98,14 +110,17 @@ private:
         std::size_t hash;
         T value;
     };
-    std::size_t find(const Key& key, std::size_t hash) const {
+    // The slot holding key's handle, or else the empty slot key's probe ends
+    // at. The table must not be empty; it always keeps an empty slot.
+    std::size_t probe(const Key& key, std::size_t hash) const {
         const T empty = empty_;
         const auto mask = slots_.size() - 1;
-        for (auto position = hash & mask; slots_[position].value != empty; position = (position + 1) & mask) {
+        auto position = hash & mask;
+        for (; slots_[position].value != empty; position = (position + 1) & mask) {
             const auto& slot = slots_[position];
-            if (slot.hash == hash && KeyOf{}(slot.value) == key) return position;
+            if (slot.hash == hash && KeyOf{}(slot.value) == key) break;
         }
-        return slots_.size();
+        return position;
     }
     T removeAt(std::size_t hole) {
         // A local copy: stores into the slots may alias the member.
@@ -125,18 +140,19 @@ private:
         --size_;
         return value;
     }
-    void put(std::vector<Slot>& slots, Slot value) const {
+    // The first empty slot from hash's home: where an absent key goes.
+    std::size_t emptySlot(const std::vector<Slot>& slots, std::size_t hash) const {
         const T empty = empty_;
         const auto mask = slots.size() - 1;
-        auto position = value.hash & mask;
+        auto position = hash & mask;
         while (slots[position].value != empty) position = (position + 1) & mask;
-        slots[position] = value;
+        return position;
     }
     void grow() {
         const T empty = empty_;
         std::vector<Slot> next(slots_.empty() ? 16 : 2 * slots_.size(), Slot{0, empty});
         for (const auto& slot : slots_)
-            if (slot.value != empty) put(next, slot);
+            if (slot.value != empty) next[emptySlot(next, slot.hash)] = slot;
         slots_.swap(next);
     }
 

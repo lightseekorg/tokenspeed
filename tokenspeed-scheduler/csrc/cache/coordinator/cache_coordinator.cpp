@@ -442,7 +442,7 @@ std::vector<CacheCoordinator::NodeEntry> CacheCoordinator::NodeEntries(const Blo
                                                                        const BoundaryTree::Node& node) const {
     std::vector<NodeEntry> entries;
     entries.reserve(groups_.size());
-    CacheKey boundary{.content_hash = *node.hash};
+    CacheKey boundary{.content_hash = node.hash};
     const auto append = [&](std::size_t i, const CacheKey& key) {
         if (const auto entry = groups_[i].Index().Inspect(pool, key)) {
             entries.push_back(NodeEntry{
@@ -2115,7 +2115,7 @@ void CacheCoordinator::CollectDeadEntries() {
     const auto dead = [&](const BoundaryTree::Node& node) {
         return node.PendingHostStores() == 0 &&
                ((num_state_groups_ > 0 && !node.HasCheckpointBoundaryInSubtree()) ||
-                (node.tail_tokens > 0 && !boundary_tree_.Tails().Contains(*node.hash)) ||
+                (node.tail_tokens > 0 && !boundary_tree_.Tails().Contains(node.hash)) ||
                 (has_prefix_closed_groups_ && std::ranges::none_of(entries_of(node), [&](const NodeEntry& entry) {
                      return groups_[entry.group_id].Matcher().IsPrefixClosed();
                  })));
@@ -2141,7 +2141,7 @@ void CacheCoordinator::CollectDeadEntries() {
             top = top->parent;
             climbed.emplace_back(top, std::move(parent_entries));
         }
-        if (waiting_roots.contains(*top->hash)) {
+        if (waiting_roots.contains(top->hash)) {
             continue;
         }
         // Post-order over the subtree, a node after the nodes under it, so
@@ -2179,7 +2179,7 @@ void CacheCoordinator::CollectDeadEntries() {
             stack.pop_back();
         }
         // The evictions below may take the node away.
-        ContentHash root = *top->hash;
+        ContentHash root = top->hash;
         for (const NodeEntry& entry : entries_to_evict) {
             if (entry.pool == &pool_) {
                 FatalCheck(
