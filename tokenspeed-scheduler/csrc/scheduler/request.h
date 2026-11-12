@@ -239,6 +239,8 @@ public:
     }
     // Immutable input-page identities, owned by this request. Admission may
     // retry against changing cache contents without hashing the input again.
+    // Every returned span stays valid, with unchanged contents, for the
+    // request's lifetime: later calls only append to the same storage.
     std::span<const std::string> PromptPrefixHashes();
     // Compute only the requested prompt prefix; storage can be bounded below
     // the admission frontier. Later calls extend the same immutable chain.

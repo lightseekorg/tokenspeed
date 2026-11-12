@@ -101,6 +101,24 @@ TEST(RequestPromptHashesTest, BoundedStorageThenAdmissionAndPublicationShareTheS
     EXPECT_EQ(request.PromptPrefixHashes().size(), 4);
 }
 
+TEST(RequestPromptHashesTest, ABoundedSpanStaysValidAfterLaterCallsExtendTheChain) {
+    std::vector<std::int32_t> tokens(33);
+    for (std::size_t i = 0; i < tokens.size(); ++i) tokens[i] = static_cast<std::int32_t>(i);
+    Request request(RequestSpec{.request_id = "stable", .tokens = tokens}, /*prefix_granularity=*/2, Role::kFused);
+    const auto expected = ComputePrefixHashes(request.FullPrefixPages(false), "");
+    ASSERT_EQ(expected.size(), 16);
+    const auto bounded = request.PromptPrefixHashes(1);
+    const auto middle = request.PromptPrefixHashes(5);
+    const auto full = request.PromptPrefixHashes();
+    // Each earlier span is a prefix of the same storage, still readable.
+    EXPECT_EQ(bounded.data(), full.data());
+    EXPECT_EQ(middle.data(), full.data());
+    EXPECT_EQ(std::vector<std::string>(bounded.begin(), bounded.end()), (std::vector<std::string>{expected[0]}));
+    EXPECT_EQ(std::vector<std::string>(middle.begin(), middle.end()),
+              (std::vector<std::string>(expected.begin(), expected.begin() + 5)));
+    EXPECT_EQ(std::vector<std::string>(full.begin(), full.end()), expected);
+}
+
 TEST(RequestPromptHashesTest, PublicationWithoutAdmissionHashesOnlyCompletedPages) {
     Request request(RequestSpec{.request_id = "uncached", .tokens = {1, 2, 3, 4, 5}},
                     /*prefix_granularity=*/2, Role::kFused);

@@ -44,9 +44,13 @@ std::span<const std::string> Request::PromptPrefixHashes() {
 }
 
 std::span<const std::string> Request::PromptPrefixHashes(std::int32_t num_pages) {
-    _assert(num_pages >= 0 && num_pages <= submitted_prompt_size_ / prefix_granularity_,
-            "prompt hashes stay within complete submitted pages");
-    if (!prompt_prefix_hashes_) prompt_prefix_hashes_.emplace();
+    const std::int32_t prompt_pages = submitted_prompt_size_ / prefix_granularity_;
+    _assert(num_pages >= 0 && num_pages <= prompt_pages, "prompt hashes stay within complete submitted pages");
+    if (!prompt_prefix_hashes_) {
+        // Room for every complete prompt page up front: the chain never grows
+        // past that, so it never reallocates and earlier spans stay valid.
+        prompt_prefix_hashes_.emplace().reserve(static_cast<std::size_t>(prompt_pages));
+    }
     auto& hashes = *prompt_prefix_hashes_;
     const auto first = static_cast<std::int32_t>(hashes.size());
     if (num_pages > first) {
