@@ -435,7 +435,7 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
         self._decode_topk_indices_buffer: torch.Tensor | None = None
         self._decode_topk_lens_buffer: torch.Tensor | None = None
         self._retired_decode_workspaces: list[torch.Tensor] = []
-        # NVIDIA decode rounds select top-k on the alternate stream beside the absorb.
+        # NVIDIA only: on AMD the forked round was not bit-identical to one stream.
         self.decode_topk_fork = StreamFork(
             alt_stream if current_platform().is_nvidia else None
         )
