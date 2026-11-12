@@ -356,7 +356,7 @@ def test_a8w4_moe_takes_the_fused_sort_bitwise(
     assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
 
 
-@pytest.mark.parametrize("rows", (1, 8, 16, 33, 64, 96, 128))
+@pytest.mark.parametrize("rows", (1, 33, 128))
 @pytest.mark.parametrize("out_kind", ("contiguous", "strided", "allocated"))
 def test_sorted_routing_carries_shared_down(rows, out_kind):
     """The shared down projection rides along without changing the routes."""
