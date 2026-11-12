@@ -238,7 +238,7 @@ def test_replica_failure_invalidates_a_locally_successful_update():
         state.before_kv_resume()
 
 
-@pytest.mark.parametrize("policy", ["cpu_backup", "discard"])
+@pytest.mark.parametrize("policy", [None, "cpu_backup", "discard"])
 def test_prerequisite_check_refuses_without_starting_a_transition(policy):
     model = TinyModel()
     state = WeightMemoryState(policy=policy, models=[model])
@@ -257,10 +257,11 @@ def test_prerequisite_check_refuses_without_starting_a_transition(policy):
     state.require_usable()
 
 
-def test_replica_failure_poisons_a_rank_without_a_local_session():
+@pytest.mark.parametrize("policy", [None, "cpu_backup", "discard"])
+def test_replica_failure_poisons_a_rank_without_a_local_session(policy):
     # The control plane commits only a load every rank started, so a failed
     # result reaching a rank without a session still means a mixed replica.
-    state = WeightMemoryState(policy="discard", models=[TinyModel()])
+    state = WeightMemoryState(policy=policy, models=[TinyModel()])
     state.commit_update(False)
     with pytest.raises(RuntimeError, match="restart"):
         state.require_usable()

@@ -670,8 +670,7 @@ class ModelRunner:
             return False, (
                 f"{e} (after {consumed} checkpoint tensors had reached the "
                 "model, so its weights may now mix the old and new "
-                "checkpoints: reload a complete checkpoint or restart the "
-                "engine)"
+                "checkpoints: restart the engine)"
             )
 
         self.model_config.model_path = model_path

@@ -399,7 +399,11 @@ class DeviceHandle:
     ) -> None:
         # Private by convention AND by absence: nothing below returns it.
         self._executor = executor
-        self._weight_memory = weight_memory
+        self._weight_memory = (
+            weight_memory
+            if weight_memory is not None
+            else WeightMemoryState(policy=None, models=())
+        )
         # Development only (--allow-reload-forward); None refuses reload_forward.
         self._forward_reloader = forward_reloader
         # Resolved here, on the building thread, whose current device the
@@ -1086,7 +1090,7 @@ class DeviceHandle:
             return result
         except Exception as exc:
             # The reply carries only the message; keep the traceback that
-            # explains a failed (and, under the memory saver, poisoning) load.
+            # explains a failed load that may have partially changed weights.
             logger.exception(f"weight operation {type(req).__name__} failed")
             if loads_weights and state is not None and state.updating:
                 state.finish_update(success=False)
