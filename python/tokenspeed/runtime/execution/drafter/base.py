@@ -58,6 +58,13 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
 
+# CUDA-graph memory projection series of a drafter's extend-round graphs: step 0 (--enable-drafter-prefill-graph) and the decode steps.
+EXTEND_STEP0_SERIES = "prefill:drafter-step0"
+EXTEND_DECODE_SERIES = "prefill:drafter-decode"
+# Most request counts an extend round's decode steps are recorded at: rounds admit a few requests each, and a larger one runs them eager.
+EXTEND_DECODE_MAX_REQUESTS = 16
+
+
 @dataclass(frozen=True)
 class DrafterExtendCapture:
     """What a drafter's extend-graph capture borrows from the executor."""
@@ -358,8 +365,9 @@ class BaseDrafter:
         token_buckets: Sequence[int],
         request_counts: Callable[[int], Sequence[int]],
     ) -> dict[str, list[tuple[int, int]]]:
-        """Every entry ``capture_extend_graphs`` measures, per memory-projection
-        series (``--enable-drafter-prefill-graph``).
+        """Every entry ``capture_extend_graphs`` can measure, per memory-projection
+        series (the executor keeps ``EXTEND_STEP0_SERIES`` only under
+        ``--enable-drafter-prefill-graph``).
 
         The one channel between that capture and the CUDA-graph memory
         projection, which prices exactly these entries: a series lists its
