@@ -772,7 +772,8 @@ private:
     // DrainKvEvents reconciles each marked boundary against its residency, so
     // the order of evictions and publications inside one admission does not
     // matter. After a drain, a descriptor exists exactly for the boundaries
-    // with a cached child.
+    // with any Device cached child, including State entries excluded from
+    // routing residency: their later mutations still need the descriptor.
     struct KvEventBoundary {
         KvBlockStoredEvent stored;
         // Position in the prefix chain (page index). Consumers resolve a
@@ -787,6 +788,7 @@ private:
     // order the coordinator touches pages (evictions run suffix-first), so
     // this order carries no meaning; DrainKvEvents sorts the batch.
     std::vector<CacheKey> kv_event_boundaries_to_reconcile_;
+    KvEventPrefixView kv_event_prefix_view_;
 
     // SchedulerConfig::demote_superseded_state_checkpoints where it takes
     // effect (a model with State groups, outside the D role): what finishes

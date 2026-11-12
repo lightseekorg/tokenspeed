@@ -40,6 +40,8 @@ from tokenspeed.runtime.execution.slot_state import (
 )
 
 if TYPE_CHECKING:
+    from transformers import PretrainedConfig
+
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
     from tokenspeed.runtime.layers.sampled_vocab_shard import SampledVocabShard
     from tokenspeed.runtime.sampling.dp_sampling_config import DpSamplingRuntimeConfig
@@ -87,6 +89,9 @@ class SamplingBackendConfig:
     # ServerArgs.logprob_order). Behaviour-selecting, so no default either.
     logprob_order: str
 
+    # Only ascend_full applies the optional top-p candidate truncation.
+    npu_sampling_top_p_top_k_cap: bool = False
+
     enable_nan_detection: bool = False
 
     # Optional logprob features — OFF by default. These are checked at server
@@ -127,6 +132,7 @@ class SamplingBackendConfig:
         cls,
         server_args: ServerArgs,
         *,
+        hf_config: PretrainedConfig,
         max_bs: int,
         max_draft_tokens_per_req: int,
         device: str,
@@ -135,11 +141,17 @@ class SamplingBackendConfig:
         vocab_size: int = 0,
         tp_group: tuple[int, ...] | None = None,
     ) -> SamplingBackendConfig:
+        npu_sampling_top_p_top_k_cap = getattr(
+            hf_config, "npu_sampling_top_p_top_k_cap", False
+        )
+        if not isinstance(npu_sampling_top_p_top_k_cap, bool):
+            raise ValueError("HF config npu_sampling_top_p_top_k_cap must be a boolean")
 
         return cls(
             synthetic_acceptance_length=server_args.synthetic_acceptance_length,
             sampling_stream=server_args.sampling_stream,
             logprob_order=server_args.logprob_order,
+            npu_sampling_top_p_top_k_cap=npu_sampling_top_p_top_k_cap,
             enable_nan_detection=server_args.enable_nan_detection,
             enable_output_logprobs=server_args.enable_output_logprobs,
             enable_output_cumulative_probs=server_args.enable_output_cumulative_probs,

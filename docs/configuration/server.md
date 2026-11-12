@@ -171,6 +171,28 @@ checkpoints cannot share a namespace. Intermediate loads pass `None` to keep
 the current one until the last load flushes. Without L3 storage the engine
 keeps no version.
 
+### NPU top-p sampling
+
+The HF model config boolean `npu_sampling_top_p_top_k_cap` is **false by
+default**. Enable NPU sampling candidate truncation at startup with:
+
+```bash
+--hf-overrides '{"npu_sampling_top_p_top_k_cap": true}'
+```
+
+On `ascend_full`, a request with `top_p < 1` and omitted `top_k` (or
+`top_k=-1`) then uses an effective `top_k=4096`: select the top 4096
+candidates, normalize their probabilities, then apply top-p filtering.
+This limits the candidate set and can change the distribution compared
+with whole-vocabulary top-p sampling. Set the field to `false` for
+whole-vocabulary top-p; the override affects the loaded configuration,
+without editing the checkpoint's `config.json`.
+
+The option does not affect GPU sampling backends, `top_p=1`, greedy
+requests, or explicit finite top-k values. Existing `ascend_full` behavior
+still caps explicit finite top-k above 4096 at 4096. The same per-request
+policy applies in eager execution, graph replay and chain verification.
+
 ### Logprobs
 
 | Parameter | Purpose |

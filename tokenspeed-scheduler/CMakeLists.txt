@@ -111,6 +111,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
     FetchContent_MakeAvailable(googletest)
 
     add_executable(tokenspeed_scheduler_tests
+        tests/cpp/test_kv_event_prefix_view.cpp
         tests/cpp/test_prefix_hasher.cpp
         tests/cpp/test_profile_span.cpp
         tests/cpp/test_prefix_index.cpp
