@@ -262,7 +262,7 @@ pub struct RequestState {
     pub input_logprob_rows: Option<Vec<Option<f64>>>,
     /// Their top-k alternatives, when requested.
     pub input_top_logprob_rows: Option<Vec<Option<Alternatives>>>,
-    /// The prompt logprobs once the prompt completed.
+    /// The completed prompt logprobs, until the first output takes them.
     pub input_logprobs: Option<InputLogprobs>,
     /// They were sent.
     pub input_logprobs_sent: bool,
@@ -403,7 +403,11 @@ impl RequestState {
         self.returns_input_logprobs = self.return_logprob && request.computes_prompt_logprobs;
         let scored = (last_position - self.logprob_start_len) as usize;
         if self.wants_input_logprobs() {
-            self.input_logprob_rows = Some(vec![None; scored]);
+            // Finalization prepends the unscored first position. Reserve its
+            // slot now so the completed output can reuse this allocation.
+            let mut rows = Vec::with_capacity(scored + 1);
+            rows.resize(scored, None);
+            self.input_logprob_rows = Some(rows);
             if self.top_logprobs_num > 0 {
                 self.input_top_logprob_rows = Some(vec![None; scored]);
             }
@@ -417,6 +421,12 @@ impl RequestState {
     /// default start, the last prompt position, needs none.
     pub fn wants_input_logprobs(&self) -> bool {
         self.returns_input_logprobs && self.logprob_start_len < self.prompt_len - 1
+    }
+
+    /// Finalization remains complete after the output takes ownership of
+    /// the buffers, including when a retraction replays the prompt.
+    pub fn input_logprobs_finalized(&self) -> bool {
+        self.input_logprobs.is_some() || self.input_logprobs_sent
     }
 
     /// Store one chunk's prompt logprobs for positions `[start, start + n)`
@@ -465,10 +475,10 @@ impl RequestState {
     /// Assemble the prompt logprobs once the prompt's final chunk
     /// committed; a second call keeps them.
     pub fn finalize_input_logprobs(&mut self) -> Result<(), String> {
-        if !self.returns_input_logprobs || self.input_logprobs.is_some() {
+        if !self.returns_input_logprobs || self.input_logprobs_finalized() {
             return Ok(());
         }
-        let rows = self.input_logprob_rows.take().unwrap_or_default();
+        let mut rows = self.input_logprob_rows.take().unwrap_or_default();
         let missing = rows.iter().filter(|row| row.is_none()).count();
         if missing > 0 {
             // Every scored position is recomputed by a chunk that commits
@@ -479,9 +489,8 @@ impl RequestState {
             ));
         }
         let start = self.logprob_start_len as usize;
-        let mut values = Vec::with_capacity(rows.len() + 1);
-        values.push(None);
-        values.extend(rows);
+        rows.insert(0, None);
+        let values = rows;
         let ids = self.prompt_ids[start..].to_vec();
         if values.len() != ids.len() {
             return Err(format!(

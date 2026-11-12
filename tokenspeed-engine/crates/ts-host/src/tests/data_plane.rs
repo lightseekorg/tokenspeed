@@ -28,6 +28,11 @@ use ts_scheduler::{ForwardBatchView, Scheduler};
 
 use super::*;
 
+#[path = "data_plane/cpu_benchmark.rs"]
+mod cpu_benchmark;
+#[path = "data_plane/result_buffers.rs"]
+mod result_buffers;
+
 /// Start the interpreter once per test process, with the scheduler
 /// module built in and the repository's `tokenspeed_scheduler` package
 /// importable.
@@ -134,7 +139,9 @@ class Plane:
         self.note("complete")
         if self.completion_failing:
             raise RuntimeError("the completion failed")
-        return ([launched], [1], None, None, None, None, None, None, self.cumulative_probs)
+        from array import array
+        cumulative = None if self.cumulative_probs is None else array('d', self.cumulative_probs)
+        return ([launched], [1], None, None, None, None, None, None, cumulative)
 
     def note_committed(self, launched):
         self.note("note_committed")

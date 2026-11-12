@@ -34,8 +34,8 @@ interpreter runs, plus the launcher's side:
   forward thread runs each operation the control thread queued (a plan
   becomes the ``PlannedForward`` that ``DeviceHandle`` launches); its control
   thread runs the completion queries itself (a launched forward's landed
-  results as plain lists, the cache ops' acknowledgments). The L3 tier runs
-  in the host (``ts-l3``), from the ``L3Settings`` bootstrap resolves.
+  results as metadata and CPU logprob buffers, the cache ops' acknowledgments).
+  The L3 tier runs in the host (``ts-l3``), from the ``L3Settings`` bootstrap resolves.
 
 The host covers TP, attention-DP and pipeline ranks and both PD roles (its
 own Rust transfer peer, started from ``pd/host_peer.py``'s settings);
@@ -90,6 +90,7 @@ from tokenspeed.runtime.engine.rank_setup import (
     request_length_limits,
     scheduler_config_from_args,
 )
+from tokenspeed.runtime.engine.result_buffers import completed_result
 from tokenspeed.runtime.engine.scheduler_utils import (
     cache_event_to_payload,
     cache_ops_from_plan,
@@ -624,30 +625,6 @@ class _Dispatched:
     forward_mode: ForwardMode
 
 
-def _logprob_lists(results) -> tuple | None:
-    """A forward's prompt-row logprobs and top-k alternatives as lists, None
-    when it computed none."""
-
-    def top(values, ids):
-        return (values.tolist(), ids.tolist()) if values is not None else None
-
-    if (
-        results.input_token_logprobs is None
-        and results.input_top_logprobs_val is None
-        and results.output_top_logprobs_val is None
-    ):
-        return None
-    return (
-        (
-            results.input_token_logprobs.tolist()
-            if results.input_token_logprobs is not None
-            else None
-        ),
-        top(results.input_top_logprobs_val, results.input_top_logprobs_idx),
-        top(results.output_top_logprobs_val, results.output_top_logprobs_idx),
-    )
-
-
 class HostDataPlane:
     """The data plane as the host drives it.
 
@@ -867,17 +844,7 @@ class HostDataPlane:
             ),
         )
 
-    def complete(self, dispatched: _Dispatched) -> tuple[
-        list[int],
-        list[int],
-        list[float] | None,
-        list[int] | None,
-        list[list[int]] | None,
-        tuple[int, float] | None,
-        list[int] | None,
-        tuple | None,
-        list[float] | None,
-    ]:
+    def complete(self, dispatched: _Dispatched) -> tuple:
         """Wait for a forward's host copies to land (the control thread: the
         event wait releases the interpreter lock), and return its sampled
         tokens, kept lengths, logprobs, NaN flags and, on the P role, each
@@ -888,40 +855,19 @@ class HostDataPlane:
         grammar; and, when the forward computed any, its planned prompt
         rows' logprobs, their top-k alternatives and the prefill rows'
         sampled-token alternatives (values and ids each), None for those it
-        did not."""
+        did not. Numeric logprob buffers retain CPU storage while Rust copies
+        them into owned vectors; no per-element Python list is built."""
         results = dispatched.results
         results.sync()
         compiles = compile_stats() if self._report_compiles else None
-        return (
-            results.output_tokens.tolist(),
-            results.output_lengths.tolist(),
-            (
-                results.output_logprobs.tolist()
-                if results.output_logprobs is not None
-                else None
-            ),
-            (
-                results.output_nan_flags.tolist()
-                if results.output_nan_flags is not None
-                else None
-            ),
-            (
-                [list(row) for row in results.next_input_ids.tolist()]
-                if results.next_input_ids is not None
-                else None
-            ),
-            (
+        return completed_result(
+            results,
+            serving_compiles=(
                 (compiles.serving_compiles, compiles.serving_seconds)
                 if compiles is not None
                 else None
             ),
-            resolve_grammar_completion(results),
-            _logprob_lists(results),
-            (
-                results.output_token_cumulative_probs.tolist()
-                if results.output_token_cumulative_probs is not None
-                else None
-            ),
+            grammar_terminated_at=resolve_grammar_completion(results),
         )
 
     def note_committed(self, dispatched: _Dispatched) -> None:

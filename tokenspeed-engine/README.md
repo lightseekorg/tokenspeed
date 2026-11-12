@@ -32,6 +32,10 @@ ts-client = { package = "tokenspeed-client", version = "0.1.0" }
 
 ## Wire conformance
 
+The [Rust engine CPU benchmark](crates/ts-control/benches/README.md) measures
+long-request ingress, prompt logprobs and high-frequency output streaming with
+the real wire, control and client classes, without a GPU or model weights.
+
 `crates/ts-wire/tests/fixtures/` holds messages written by the Python encoder.
 `cargo test` decodes each one, compares it field by field with the values the
 generator used, and re-encodes it byte for byte;
@@ -62,6 +66,13 @@ bootstrap token. An older producer defaults the column to empty and its output
 rows report zero; older readers skip the appended column. `ts-client` output
 chunks, the Python chunk dictionaries, and `WireDriver.Completion` expose the
 same cumulative count.
+
+Completed prompt logprobs move from request state into the first output that
+ships them. The state retains the fact that they are final after transferring
+the buffers, so a retraction's replay neither gathers nor sends them again.
+The frontend likewise consumes a decoded batch into independently owned
+per-request chunks. A queued chunk owns its arrays until consumption or
+cancellation; one slow request need not retain another request's payload.
 
 ## Building
 
