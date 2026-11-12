@@ -284,7 +284,8 @@ def _check_gqa_request(
     num_tokens = q.shape[0]
     if cache.k_cache.dim() not in (3, 4):
         raise ValueError(
-            f"key cache {tuple(cache.k_cache.shape)} is not [slots, heads, head_dim] rows"
+            f"key cache {tuple(cache.k_cache.shape)} is not [slots, heads, head_dim] "
+            "rows or [pages, rows, heads, head_dim] pages"
         )
     num_kv_heads, head_dim = cache.k_cache.shape[-2:]
     if (

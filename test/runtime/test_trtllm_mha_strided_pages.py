@@ -55,17 +55,15 @@ from tokenspeed.runtime.utils.server_args import ServerArgs
 @pytest.mark.parametrize(
     ("algorithm", "is_draft", "backend", "expected"),
     [
-        ("DFLASH", True, "trtllm", 128),
-        ("DSPARK", True, "trtllm", 128),
+        ("DFLASH", True, "trtllm", 64),
+        ("DSPARK", True, "trtllm", 64),
         ("DFLASH", False, "trtllm", 64),
         ("MTP", True, "trtllm", 64),
         (None, False, "trtllm", 64),
         ("DFLASH", True, "triton", None),
     ],
 )
-def test_generated_block_draft_page_default(
-    tmp_path, algorithm, is_draft, backend, expected
-):
+def test_general_mha_page_defaults(tmp_path, algorithm, is_draft, backend, expected):
     (tmp_path / "config.json").write_text(
         json.dumps(
             {
@@ -107,8 +105,12 @@ def test_generated_block_draft_page_default(
     if backend == "trtllm":
         assert TRTLLMMHAAttnBackend.resolve_kernel_page_size(config, 128) == expected
         # A supplied config override always wins over both generated and backend defaults.
-        explicit = dataclasses.replace(config, kernel_page_size=64)
-        assert TRTLLMMHAAttnBackend.resolve_kernel_page_size(explicit, 128) == 64
+        for page_size in (64, 128):
+            explicit = dataclasses.replace(config, kernel_page_size=page_size)
+            assert (
+                TRTLLMMHAAttnBackend.resolve_kernel_page_size(explicit, 128)
+                == page_size
+            )
     else:
         assert config.kernel_page_size is None
 
