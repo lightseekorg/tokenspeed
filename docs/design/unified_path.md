@@ -132,21 +132,7 @@ fail before a context-parallel kernel is launched. The backend takes its CP
 degree and ranks from the host topology and passes that degree to every fused
 collective. The installed operators' Meta implementations validate topology
 and head layout before execution or graph capture; the framework carries no
-CP degree whitelist. DSA native fusion remains specialized for DCP8 with16/32/64 Indexer heads,
-query width1/8 and power-of-two rows1..512. Sub64 Prolog pads compute rows
-with zero hidden states and skipped (-1) cache writes, returning only real
-rows; local index selection still sees the real request/causal metadata.
-Indexer32 preserves FP32 score weights and scales Q after the original QB
-BF16 boundary; Indexer64 retains its historical packed-weight boundary. The
-forward uses the declared output layout query width and the padded request
-count together, rather than inferring verify grouping from a row count.
-TopK transport pads sub8 rows with invalid candidates and LSE repacks sub64
-producer rows inside its native boundary. Output projection handles actual
-tail rows. The hidden2048/Q-LoRA768 geometry uses32 attention heads and16
-Indexer heads directly: adjacent64-channel carrier lanes reconstruct each
-128-channel Indexer head. Its score normalization runs after the FP32
-projection. H32 LSE pads small rows to32, and the localH4 output projection
-writes2048 channels. These pads do not change the logical batch or query grouping; prepared Ascend MLA also
+CP degree whitelist. DSA native fusion remains specialized for DCP8; prepared Ascend MLA also
 admits the H32 geometry on TP8/DCP8. Its head count, Q latent
 width and borrowed producer views follow the model, with the same projection,
 owner-store and FP32 LSE merge path.
