@@ -75,6 +75,13 @@ void SchedulerConfig::Validate() const {
                 "Scheduler: a State group with checkpoint_granularity > 1 requires state_checkpoint_in_forward");
         }
     }
+    if (enable_kv_cache_events && std::none_of(cache_groups.begin(), cache_groups.end(),
+                                               [](const auto& group) { return group.attn_kind == AttnKind::kFull; })) {
+        throw std::invalid_argument(
+            "Scheduler: KV cache events require a continuous Full/history cache group; "
+            "State-only, SWA-only, and State + SWA layouts are unsupported. "
+            "Disable enable_kv_cache_events to use these layouts without KV event routing.");
+    }
     if (prefix_replay_tokens < 0) {
         throw std::invalid_argument("Scheduler: prefix_replay_tokens must be >= 0");
     }
