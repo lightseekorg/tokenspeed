@@ -1016,6 +1016,37 @@ def ex1_issue(
     )
 
 
+@gluon.constexpr_function
+def _p1_layout(num_warps):
+    """``[M_DUP, BLOCK_N]`` with a warp's 16 columns of the MFMA tile, a
+    row's 16 columns in 16 lanes (4 rows a store)."""
+    return gl.BlockedLayout([1, 1], [4, 16], [1, num_warps], [1, 0])
+
+
+@gluon.jit
+def _put_p1(mb, acc, k, blk, ks):
+    """Put an ex1 slot's FP32 partials ``acc [M_DUP, BLOCK_N]`` (MFMA layout)
+    into ``p1``: MFMA row ``m`` goes to row ``m``'s copy under pick ``k[m]``
+    (``k`` in ``SliceLayout(1, _p1_layout)``; -1 skips the row).
+
+    In the MFMA layout a lane holds 4 adjacent columns of a row, so each
+    8-byte store writes 4 lanes 32 bytes apart and fills a quarter of every
+    segment it touches. :func:`_p1_layout` keeps each warp's columns (the
+    conversion stays within the warp) and puts a row's 16 of them in 16
+    lanes: one store writes 128 contiguous bytes a row."""
+    cl: gl.constexpr = _p1_layout(gl.num_warps())
+    v = gl.convert_layout(acc, cl)
+    m = gl.arange(0, M_DUP, gl.SliceLayout(1, cl))[:, None]
+    n = gl.arange(0, BLOCK_N, gl.SliceLayout(0, cl))[None, :]
+    at = ((k[:, None] * NB1 + blk) * KSPLIT + ks) * BLOCK_N + n
+    mb.put(
+        "p1",
+        mb.row_offset(m) + at,
+        v.to(gl.int32, bitcast=True),
+        mask=(k[:, None] >= 0) & (n >= 0),
+    )
+
+
 @gluon.jit
 def _ex1_slot(mb, task, a, tiles, union, expert):
     """Multiply the A rows by one slot's w13 ``tiles`` and publish the FP32
@@ -1026,18 +1057,11 @@ def _ex1_slot(mb, task, a, tiles, union, expert):
     p_smem, s_smem = a
     acc = _mma_rows(p_smem, s_smem, tiles)
     picks = _row_picks(union, expert, R)
-    m = gl.arange(0, M_DUP, gl.SliceLayout(1, acc.type.layout))
+    m = gl.arange(0, M_DUP, gl.SliceLayout(1, _p1_layout(gl.num_warps())))
     k = gl.full([M_DUP], -1, gl.int32, m.type.layout)
     for r in gl.static_range(R):
         k = gl.where(m == r, picks[r], k)
-    n = gl.arange(0, BLOCK_N, gl.SliceLayout(0, acc.type.layout))[None, :]
-    at = ((k[:, None] * NB1 + blk) * KSPLIT + ks) * BLOCK_N + n
-    mb.put(
-        "p1",
-        mb.row_offset(m[:, None]) + at,
-        acc.to(gl.int32, bitcast=True),
-        mask=(k[:, None] >= 0) & (n >= 0),
-    )
+    _put_p1(mb, acc, k, blk, ks)
 
 
 @gluon.jit
@@ -1145,16 +1169,8 @@ def _ex1_slot_picked(mb, task, a, tiles, picks_row):
     ks = task % KSPLIT
     p_smem, s_smem = a
     acc = _mma_rows(p_smem, s_smem, tiles)
-    m = gl.arange(0, M_DUP, gl.SliceLayout(1, acc.type.layout))
-    k = picks_row.load(gl.SliceLayout(1, acc.type.layout))
-    n = gl.arange(0, BLOCK_N, gl.SliceLayout(0, acc.type.layout))[None, :]
-    at = ((k[:, None] * NB1 + blk) * KSPLIT + ks) * BLOCK_N + n
-    mb.put(
-        "p1",
-        mb.row_offset(m[:, None]) + at,
-        acc.to(gl.int32, bitcast=True),
-        mask=(k[:, None] >= 0) & (n >= 0),
-    )
+    k = picks_row.load(gl.SliceLayout(1, _p1_layout(gl.num_warps())))
+    _put_p1(mb, acc, k, blk, ks)
 
 
 @gluon.jit
