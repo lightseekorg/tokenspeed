@@ -62,38 +62,26 @@ capture. Choose `default` for upstream FlashInfer, `expected_m` for the per-call
 hint backport, or `optimized` to also enable expert-tile prefix sums and direct
 tile-to-expert lookup. Both private modes accept independent pipeline stage
 caps for FC1 and FC2.
-The `cute_dsl` MoE solution connects prepared routes to this native consumer
-through `moe_plan`, `moe_process_weights`, and `moe_apply`. Select it explicitly
-for BF16 inputs with a positive width divisible by 128, block-FP8 weights,
-standard SwiGLU, and top-k in
-1..32 with distinct expert IDs per token. This constraint also covers calls
-that use native input preparation, whose permutation requires distinct IDs.
-The standalone route quantizer accepts repeated IDs, but that broader contract
-does not extend to the complete MoE solution.
-It prepares two cached native modules before processing weights. Batches of at
-most 16 tokens use FC1 stage cap 4 and expert lookup; larger batches use the
-original stage and lookup policies. Both retain native FC2 and expected-M
-selection. Module compilation happens during initialization, before warmup and
-graph capture; weight preprocessing runs once and both modules share the same
-processed tensors. Existing higher-priority MoE solutions retain their
-automatic selection preference.
+The `cute_dsl` MoE solution connects the native runner through `moe_plan`,
+`moe_process_weights`, and `moe_apply`. Select it explicitly for BF16 inputs,
+a positive width divisible by 128, block-FP8 weights, standard SwiGLU, and
+top-k in 1..32 with distinct expert IDs per token. Native input preparation
+performs routing, permutation, and input quantization before the expert GEMMs.
 
-At TP=1, any positive token count within the fused indexing bound and supported
-local expert counts use the registered route quantizer. Unsupported layouts,
-extents, TP configurations, and larger local expert counts use the selected
-native callable's input preparation. Every call owns its
-route buffers; graph capture keeps the allocator's captured storage alive.
-Both paths preserve native GEMM and finalized-output semantics. Deferred output,
-all-to-all, clamped activation, and the batch-invariant numerical envelope are
-not advertised by this solution.
+The solution prepares two cached native modules before processing weights.
+Batches of at most 16 tokens use FC1 stage cap 4 and expert lookup; larger
+batches use the original stage and lookup policies. Both retain native FC2
+and expected-M selection. Compilation happens during initialization, before
+warmup and graph capture. Weight preprocessing runs once, and both modules
+share the same processed tensors. Higher-priority MoE solutions retain their
+automatic-selection preference.
 
-Hidden width and local expert count come from the prepared weight tensors;
-the input quantizer does not assume a particular expert intermediate size.
-Width and top-k are model-static compilation parameters. Tests vary routing,
-expert-count boundaries, widths and intermediate sizes independently using
-synthetic tensors. The E4M3 weights, FP32 scales and 128x128 scale blocks follow
-the native block-FP8 contract. Other quantization formats remain separate
-registry choices; tensors are never reinterpreted to fit this solution.
+The finalized `moe_apply` output remains unchanged. `moe_apply_routes` exposes
+the separate deferred-output contract described below. All-to-all, clamped
+activation, and the batch-invariant numerical envelope are not advertised
+by this solution. Hidden width and local expert count come from the weight
+tensors; neither the runner nor output quantization assumes a particular
+expert intermediate size.
 
 ```python
 from tokenspeed_kernel.ops.moe import prepare_sm90_fp8_moe
@@ -119,6 +107,17 @@ The installed FlashInfer package is unchanged. To switch settings, prepare a
 new callable, warm it up, and recapture graphs.
 
 ### Deferred block-FP8 finalization
+
+The SM90 leaf advertises `supports_deferred_routes`. `moe_apply_routes` uses
+the same prepared weights and native schedule as `moe_apply`, with
+`cutlass_fused_finalize=False` explicitly selected before warmup. It returns
+`DeferredMoERoutes` instead of the legacy three-tensor finalize tuple.
+
+When combined with input fusion, prepared input and deferred output share
+the producer's read-only inverse map and offsets; the native binding rejects
+different metadata destinations. With this output change alone, native input
+preparation writes fresh caller-owned metadata. Consumers retain these
+allocations through graph replay in both cases.
 
 `prepare_sm90_fp8_moe_routes` retains both expert GEMMs in the native runner
 and defers only the weighted route reduction. It returns BF16 expert rows,
@@ -147,8 +146,8 @@ runtime parameters, not new compilation variants. Warm both map layouts that
 will be used before graph capture.
 
 The CuTe implementation explicitly selects round-to-nearest-even division for
-output quantization with `cute.math.div`. This differs from the native
-approximate arithmetic retained by input route quantization below.
+output quantization with `cute.math.div`. Input quantization retains its native
+approximate arithmetic contract.
 
 This operation leaves output projection and communication to their existing
 callers. It does not select a new model execution path automatically, and
@@ -540,7 +539,6 @@ returns the precomputed route weights it passed in. FP16 inputs, ROCm builds
 without the fused finalizer, and kernels without deferred finalize keep the
 kernel's own finalized output.
 
-
 ## Kimi-K3 router
 
 On SM100/SM103, batches from 2,560 tokens use a vendored CUDA top-16 router
@@ -791,14 +789,3 @@ also exercise uneven/empty owners over multiple GPUs:
 python -m torch.distributed.run --standalone --nproc-per-node=2 -m pytest -q \
   tokenspeed-kernel/test/nvidia/ops/moe/test_deep_gemm_mxfp4_mega_moe.py
 ```
-
-
-The SM90 route-input leaf also advertises `supports_deferred_routes`.
-`moe_apply_routes` uses the same prepared weights and native schedule as
-`moe_apply`, with `cutlass_fused_finalize=False` explicitly selected before
-warmup. It returns `DeferredMoERoutes` rather than the legacy three-tensor
-finalize tuple; the existing `moe_apply` finalized output is unchanged.
-Prepared input and deferred output share the producer's read-only inverse
-map and offsets. The native binding rejects different metadata destinations.
-Without prepared input, native routing writes fresh caller-owned metadata.
-Combine/quant consumers must retain these allocations through graph replay.
