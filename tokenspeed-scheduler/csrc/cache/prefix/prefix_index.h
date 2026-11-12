@@ -38,6 +38,7 @@
 #include "cache/core/cache_block_ref.h"
 #include "cache/core/cache_types.h"
 #include "cache/core/fixed_slot_resource.h"
+#include "cache/core/prefetch.h"
 #include "cache/core/session_cache_tag.h"
 #include "cache/prefix/boundary_tree.h"
 #include "cache/prefix/flat_pointer_index.h"
@@ -153,6 +154,10 @@ private:
             order_->Erase(position_);
             order_ = nullptr;
         }
+        // A hint for Reset or Rekey: prefetches the registered node's value.
+        void Prefetch() const noexcept {
+            if (order_ != nullptr) PrefetchObject(*position_);
+        }
 
     protected:
         OrderIndex* order_{nullptr};
@@ -186,6 +191,10 @@ private:
                 return;
             }
             OrderRegistration::Rekey(key);
+        }
+        // A suspended node is not in the order: nothing to prefetch.
+        void Prefetch() const noexcept {
+            if (!Suspended()) OrderRegistration::Prefetch();
         }
 
     private:
@@ -767,6 +776,37 @@ public:
         eraseEntry(*evictable.cache_index_, evictable.entry_);
         evictable.cache_index_ = nullptr;
         return key;
+    }
+
+    // A hint for evicting entries of `pool`'s tier later, in three stages,
+    // one victim each, issued furthest ahead first so that each stage reads
+    // only lines an earlier call prefetched: for `slot`, its slot in the
+    // location index; for `entry`, the entry found there; for `removal`, what
+    // removing the entry found there touches beyond it -- its key's slot, its
+    // block's control, its order nodes, and its boundary-tree node with that
+    // node's slot. A null location skips its stage. Changes nothing. Each
+    // stage finds its entry afresh and reads only that live entry and what it
+    // holds, so an entry evicted in between, or never indexed, is skipped;
+    // nothing is kept across calls.
+    void PrefetchEvictions(const BlockPool& pool, const CacheBlockLocation* slot, const CacheBlockLocation* entry,
+                           const CacheBlockLocation* removal) const noexcept {
+        const CacheEntries* cache_index = findCacheEntries(pool);
+        if (cache_index == nullptr) return;
+        if (slot != nullptr) cache_index->by_location.Prefetch(*slot);
+        if (entry != nullptr) {
+            const ConstCacheEntryIterator entry_it = findEntry(*cache_index, *entry);
+            if (entry_it != cache_index->entries.end()) PrefetchObject(*entry_it);
+        }
+        if (removal == nullptr) return;
+        const ConstCacheEntryIterator entry_it = findEntry(*cache_index, *removal);
+        if (entry_it == cache_index->entries.end()) return;
+        cache_index->by_key.Prefetch(entry_it->key);
+        entry_it->block_ref.Prefetch();
+        entry_it->available_order.Prefetch();
+        entry_it->common_order.Prefetch();
+        if (cache_index->boundary_tree != nullptr) {
+            cache_index->boundary_tree->PrefetchRelease(entry_it->boundary, entry_it->key.content_hash);
+        }
     }
 
     // Moves the entry at `from` onto `to`, a block of the same tier the caller

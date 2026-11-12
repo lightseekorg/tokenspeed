@@ -2049,13 +2049,100 @@ bool CacheCoordinator::evictCachedBlock(std::uint32_t group_id, CacheBlockLocati
     return true;
 }
 
+namespace {
+
+// Software prefetch for evicting a plan's victims in plan order
+// (CacheCoordinator::evictPlannedVictims). Before each victim leaves,
+// Advance() issues each stage of PrefixCacheIndex::PrefetchEvictions for the
+// victim that many places ahead: the location index slot, with the LCM
+// parent record, 2 * kDistance ahead; the entry kDistance ahead; and what
+// removing the entry touches beyond it kDistance / 2 ahead, so each stage
+// finds the lines it reads already on their way. It keeps positions in the
+// plan, never an entry: a victim a cascade took first is skipped by the
+// index. A cascade's own victims are not prefetched.
+class VictimPrefetch {
+public:
+    VictimPrefetch(std::span<const VictimSet> victims, const std::vector<CacheGroup>& groups, const BlockPool& pool)
+        : groups_{groups},
+          pool_{pool},
+          slot_{victims, 2 * kDistance},
+          entry_{victims, kDistance},
+          removal_{victims, kDistance / 2} {}
+
+    // Once before each victim leaves, in plan order. The stages' victims of
+    // one group share one call, which finds the group's Device entries once.
+    void Advance() noexcept {
+        const VictimSet::Member* slot = slot_.Next();
+        const VictimSet::Member* entry = entry_.Next();
+        const VictimSet::Member* removal = removal_.Next();
+        if (slot != nullptr) pool_.PrefetchRelease(slot->location);
+        while (const VictimSet::Member* first = slot != nullptr ? slot : entry != nullptr ? entry : removal) {
+            const std::uint32_t group_id = first->group_id;
+            // A stage's victim when it is of this group, which then leaves the
+            // stage.
+            const auto take = [group_id](const VictimSet::Member*& member) -> const CacheBlockLocation* {
+                if (member == nullptr || member->group_id != group_id) return nullptr;
+                return &std::exchange(member, nullptr)->location;
+            };
+            groups_[group_id].Index().PrefetchEvictions(pool_, take(slot), take(entry), take(removal));
+        }
+    }
+
+private:
+    // In victims. A full-cache benchmark ran equally fast from 2 to 16: a
+    // victim or two ahead already covers a memory miss.
+    static constexpr std::size_t kDistance = 4;
+
+    // A position in the victims of all sets, in plan order.
+    class Cursor {
+    public:
+        Cursor(std::span<const VictimSet> victims, std::size_t ahead) : victims_{victims} {
+            settle();
+            for (std::size_t i = 0; i < ahead && set_ < victims_.size(); ++i) step();
+        }
+        // The victim here, then moves past it; null past the last.
+        const VictimSet::Member* Next() noexcept {
+            if (set_ >= victims_.size()) return nullptr;
+            const VictimSet::Member* member = &victims_[set_].members[member_];
+            step();
+            return member;
+        }
+
+    private:
+        void step() noexcept {
+            ++member_;
+            settle();
+        }
+        void settle() noexcept {
+            while (set_ < victims_.size() && member_ >= victims_[set_].members.size()) {
+                ++set_;
+                member_ = 0;
+            }
+        }
+
+        std::span<const VictimSet> victims_;
+        std::size_t set_{0};
+        std::size_t member_{0};
+    };
+
+    const std::vector<CacheGroup>& groups_;
+    const BlockPool& pool_;
+    Cursor slot_;
+    Cursor entry_;
+    Cursor removal_;
+};
+
+}  // namespace
+
 std::vector<CacheCoordinator::UnevictedVictim> CacheCoordinator::evictPlannedVictims(std::span<const VictimSet> victims,
                                                                                      bool write_back,
                                                                                      const VictimReasons& reasons) {
     std::vector<UnevictedVictim> unevicted;
+    VictimPrefetch prefetch{victims, groups_, pool_};
     for (const VictimSet& set : victims) {
         EvictedSegment* segment = write_back ? &evicted_segments_.emplace_back() : nullptr;
         for (const auto& [group_id, location, in_stranded_suffix, is_request_reclaim] : set.members) {
+            prefetch.Advance();
             DeviceEvictionCounts DeviceEvictionStats::*reason = is_request_reclaim   ? reasons.request_reclaim
                                                                 : in_stranded_suffix ? reasons.stranded_suffix
                                                                                      : reasons.victim;

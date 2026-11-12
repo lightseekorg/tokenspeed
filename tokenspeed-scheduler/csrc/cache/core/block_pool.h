@@ -36,6 +36,7 @@
 
 #include "cache/core/cache_block_ref.h"
 #include "cache/core/fixed_slot_resource.h"
+#include "cache/core/prefetch.h"
 #include "utils.h"
 
 namespace tokenspeed {
@@ -336,6 +337,13 @@ public:
             }
         }
         return locations;
+    }
+
+    // A hint for a later Release(location): prefetches its LCM parent's
+    // record, found by its ID alone. Parent records live as long as the pool.
+    void PrefetchRelease(CacheBlockLocation location) const noexcept {
+        if (location.lcm_block_id <= 0 || static_cast<std::size_t>(location.lcm_block_id) > lcm_blocks_.size()) return;
+        PrefetchObject(lcm_blocks_[static_cast<std::size_t>(location.lcm_block_id - 1)]);
     }
 
     void Release(CacheBlockLocation location) noexcept {

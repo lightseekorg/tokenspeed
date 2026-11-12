@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "cache/core/cache_block_ref.h"
+#include "cache/core/prefetch.h"
 #include "utils.h"
 
 namespace tokenspeed {
@@ -54,6 +55,18 @@ public:
         if (outer >= directories_.size() || !directories_[outer]) return empty_;
         const auto& segment = directories_[outer]->segments[id / kSegmentSize % kDirectorySize];
         return segment ? segment->values[id % kSegmentSize] : empty_;
+    }
+
+    // A hint for a later Find or Erase of `location`: prefetches its value,
+    // when its segment exists.
+    void Prefetch(CacheBlockLocation location) const noexcept {
+        if (!valid(location)) return;
+        const auto id = offset(location);
+        const auto outer = id / (kSegmentSize * kDirectorySize);
+        if (outer >= directories_.size() || !directories_[outer]) return;
+        const auto& segment = directories_[outer]->segments[id / kSegmentSize % kDirectorySize];
+        if (!segment) return;
+        PrefetchObject(segment->values[id % kSegmentSize]);
     }
 
     void Set(CacheBlockLocation location, T value) {

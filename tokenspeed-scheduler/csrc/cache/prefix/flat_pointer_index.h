@@ -25,6 +25,8 @@
 #include <utility>
 #include <vector>
 
+#include "cache/core/prefetch.h"
+
 namespace tokenspeed {
 
 // An open-addressed index over stable, externally owned objects. `empty`, given
@@ -90,6 +92,17 @@ public:
         return empty;
     }
 
+    // A hint for a later Find or ExtractObject of `key`: prefetches the slot
+    // its probe starts at and the next cache line, which a backward-shift
+    // erase usually reads too. Reads no slot.
+    void Prefetch(const Key& key) const noexcept {
+        if (slots_.empty()) return;
+        const auto hash = Hash{}(key);
+        const auto mask = slots_.size() - 1;
+        PrefetchObject(slots_[hash & mask]);
+        PrefetchObject(slots_[(hash + kSlotsPerCacheLine) & mask]);
+    }
+
     std::size_t size() const noexcept { return size_; }
     bool empty() const noexcept { return size_ == 0; }
     bool contains(const Key& key) const { return Find(key) != empty_; }
@@ -99,6 +112,7 @@ private:
         std::size_t hash;
         T value;
     };
+    static constexpr std::size_t kSlotsPerCacheLine = sizeof(Slot) < 64 ? 64 / sizeof(Slot) : 1;
     // The slot holding key's handle, or else the empty slot key's probe ends
     // at. The table must not be empty; it always keeps an empty slot.
     std::size_t probe(const Key& key, std::size_t hash) const {

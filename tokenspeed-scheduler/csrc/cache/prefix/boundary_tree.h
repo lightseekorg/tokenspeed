@@ -33,6 +33,7 @@
 
 #include "cache/core/cache_types.h"
 #include "cache/core/fixed_slot_resource.h"
+#include "cache/core/prefetch.h"
 #include "cache/prefix/checkpoint_tree.h"
 #include "cache/prefix/flat_pointer_index.h"
 #include "cache/prefix/tail_table.h"
@@ -287,6 +288,16 @@ public:
         }
         _assert(deepest != nullptr, "a publication links at least one boundary");
         return acquire(*deepest, Hold::Kind::kPublication, kDevice, /*state=*/false, /*closed=*/false);
+    }
+
+    // A hint for dropping `hold`, a hold on this tree's node of `hash`: the
+    // holder passes the hash, so neither the node nor an index slot is read
+    // here. Prefetches the node and the index slot of its hash, which taking
+    // the node out of the tree reads.
+    void PrefetchRelease(const Hold& hold, const ContentHash& hash) const noexcept {
+        if (hold.node_ == nullptr) return;
+        PrefetchObject(*hold.node_);
+        nodes_.Prefetch(hash);
     }
 
     Node* Find(const ContentHash& hash) {

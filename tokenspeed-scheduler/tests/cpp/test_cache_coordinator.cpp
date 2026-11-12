@@ -8511,6 +8511,122 @@ TEST_F(StateCheckpointCascadeTest, RequestReclaimCountsApartFromAdmission) {
 }
 
 // ---------------------------------------------------------------------------
+// An admission evicts its planned victims in plan order, prefetching for the
+// victims a few places ahead (CacheCoordinator::evictPlannedVictims). Here
+// earlier victims' cascades take later ones first: a tail's block takes its
+// companions in the other Full group and every State group's checkpoint at
+// the tail, and a checkpoint takes the tail's KV blocks along. Each block
+// counts once, and under AddressSanitizer, which poisons freed pooled
+// entries, no eviction or prefetch reads a victim a cascade already took.
+// P = 4: Full group 0 with 2-token blocks, Full group 1 with 4-token blocks,
+// two State groups; one block per parent.
+// ---------------------------------------------------------------------------
+class PlannedVictimCascadeFixture : public ::testing::Test {
+protected:
+    static constexpr std::int32_t kP = 4;
+    // Each session: two full pages and a tail of three tokens, cached as six
+    // blocks of group 0, three of group 1 and one checkpoint per State group.
+    static constexpr std::int32_t kSessionTokens = 2 * kP + 3;
+    static constexpr std::int32_t kBlocksPerSession = 11;
+    static constexpr std::int32_t kSessions = 6;
+    static constexpr std::int32_t kParents = 96;
+
+    // write_back evicts by segments, as under the write-back policy.
+    explicit PlannedVictimCascadeFixture(bool write_back)
+        : pool_(kParents, {1, 1, 1, 1}),
+          host_pool_(kParents, {1, 1, 1, 1}),
+          coordinator_{MakeCoordinator(
+              std::vector<CacheGroupSpec>{
+                  {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+                  {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = kP},
+                  {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
+                  {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0}},
+              kP, pool_, /*enable_l3_storage=*/false, write_back ? &host_pool_ : nullptr, /*snapshot_pool=*/nullptr,
+              /*stream_device_cache_to_host=*/false, write_back, /*checkpoint_retention_requests=*/0)} {}
+
+    void TearDown() override {
+        const std::vector<std::string> mismatches = CacheCoordinatorTestAccess::BoundaryTreeMismatches(coordinator_);
+        EXPECT_TRUE(mismatches.empty()) << mismatches.size() << " mismatches, first: " << mismatches.front();
+    }
+
+    // A finished session over kSessionTokens tokens from `first_token`: its
+    // full pages, its tail and each State group's checkpoint at its end are
+    // published, and its tables freed.
+    void PublishSession(std::int32_t first_token) {
+        const std::vector<std::int32_t> tokens = MakeTokens(kSessionTokens, first_token);
+        std::vector<BlockTable> tables(4);
+        ASSERT_TRUE(AdmitForTest(coordinator_, tables, kSessionTokens));
+        const std::vector<std::string> hashes =
+            ContentHashes({std::vector<std::int32_t>(tokens.begin(), tokens.begin() + kP),
+                           std::vector<std::int32_t>(tokens.begin() + kP, tokens.begin() + 2 * kP)});
+        const RequestProgress progress{
+            .completed_pages =
+                CompletedPages{.tokens = tokens,
+                               .prefix_hashes = hashes,
+                               .first_new_prefix_page = 0,
+                               .tail = TailPublication{.tail_tokens = kSessionTokens - 2 * kP,
+                                                       .hash = HashPrefixPage(token_span(tokens).subspan(2 * kP),
+                                                                              ContentHash{hashes.back()})},
+                               .publish_state = true,
+                               .boundary_kind = CacheBoundaryKind::kEndpoint},
+            .num_computed_tokens = kSessionTokens,
+        };
+        coordinator_.CacheCompletedBlocks(tables, progress, CacheCoordinatorTestAccess::NextAccessEpoch(coordinator_));
+        coordinator_.Free(tables);
+    }
+
+    std::int32_t CachedBlocks() const {
+        std::int32_t blocks = 0;
+        for (std::int32_t group = 0; group < 4; ++group) {
+            blocks += coordinator_.GroupPrefixIndex(group).NumEntries(pool_);
+        }
+        return blocks;
+    }
+
+    // A new request whose blocks need every cached block: the other free
+    // parents are held.
+    void AdmitOverEveryCachedBlock() {
+        for (std::int32_t session = 0; session < kSessions; ++session) {
+            PublishSession(1000 * (session + 1));
+        }
+        ASSERT_EQ(CachedBlocks(), kSessions * kBlocksPerSession);
+        const std::vector<CacheBlockRef> held = pool_.AcquireBlocks(0, pool_.NumEmptyLcmBlocks());
+        // 41 + 21 Full blocks and two per State group: all 66 cached blocks.
+        constexpr std::int32_t kRequestTokens = 82;
+        std::vector<BlockTable> tables(4);
+        ASSERT_TRUE(AdmitForTest(coordinator_, tables, kRequestTokens));
+        EXPECT_EQ(CachedBlocks(), 0);
+        const CacheCoordinator::DeviceEvictionStats& evicted = coordinator_.DeviceEvictions();
+        EXPECT_EQ(evicted.admission.blocks + evicted.stranded_suffix.blocks,
+                  static_cast<std::uint64_t>(kSessions * kBlocksPerSession))
+            << "a victim a cascade took first counts once";
+        coordinator_.Free(tables);
+    }
+
+    BlockPool pool_;
+    BlockPool host_pool_;
+    CacheCoordinator coordinator_;
+};
+
+class PlannedVictimCascadeTest : public PlannedVictimCascadeFixture {
+protected:
+    PlannedVictimCascadeTest() : PlannedVictimCascadeFixture(/*write_back=*/false) {}
+};
+
+class PlannedSegmentCascadeTest : public PlannedVictimCascadeFixture {
+protected:
+    PlannedSegmentCascadeTest() : PlannedVictimCascadeFixture(/*write_back=*/true) {}
+};
+
+TEST_F(PlannedVictimCascadeTest, VictimsACascadeTookFirstLeaveOnce) {
+    AdmitOverEveryCachedBlock();
+}
+
+TEST_F(PlannedSegmentCascadeTest, VictimsACascadeTookFirstLeaveOnce) {
+    AdmitOverEveryCachedBlock();
+}
+
+// ---------------------------------------------------------------------------
 // The boundary tree through the coordinator: a publication links its nodes
 // before any group registers under them, and a node lives exactly while some
 // tier holds its hash or a child hangs under it. K3 shape: P = 4, one Full

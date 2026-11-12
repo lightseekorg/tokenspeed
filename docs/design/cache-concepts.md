@@ -947,6 +947,10 @@ Perception rules per directory:
   only after checking its pool and the complete key at the live location, and
   otherwise look the key up, so a probe pins nothing and a relocated or reused
   location can never make it acquire another identity.
+* **Eviction prefetch.** Evicting a plan's victims may prefetch for the
+  victims a few places ahead through the live location index; it is only a
+  hint: it takes no ownership, keeps no entry between steps, and reads only
+  entries indexed at that moment and what they hold.
 
 ### `cache/allocator/` — where things live (token-free)
 

@@ -1319,7 +1319,8 @@ private:
     // (evictCachedBlock), counted under `reasons`. With write_back each set is
     // recorded as one segment of evicted_segments_; one whose every block was
     // dropped stays empty for the caller to erase. The one loop that commits
-    // an admission's, a restore's, a compaction's or a cache clear's victims.
+    // an admission's, a restore's, a compaction's or a cache clear's victims;
+    // it prefetches for the victims a few places ahead (hints only).
     std::vector<UnevictedVictim> evictPlannedVictims(std::span<const VictimSet> victims, bool write_back,
                                                      const VictimReasons& reasons);
     // What evictCachedBlockAlone took out of the index.

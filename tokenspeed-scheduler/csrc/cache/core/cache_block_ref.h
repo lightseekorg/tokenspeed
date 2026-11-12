@@ -24,6 +24,8 @@
 #include <cstdint>
 #include <functional>
 
+#include "cache/core/prefetch.h"
+
 namespace tokenspeed {
 
 class BlockPool;
@@ -112,6 +114,11 @@ public:
 
     std::uint32_t use_count() const noexcept;
     bool unique() const noexcept { return use_count() == 1; }
+    // A hint for reading or releasing the block: prefetches its shared
+    // control (owner count, location, pool) without reading it.
+    void Prefetch() const noexcept {
+        if (control_ != nullptr) PrefetchObject(*control_);
+    }
     bool IsOwnedBy(const BlockPool& pool) const noexcept;
     void reset() noexcept;
     void swap(CacheBlockRef& other) noexcept;
