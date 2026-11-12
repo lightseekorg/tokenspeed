@@ -841,7 +841,11 @@ head spanning the target vocabulary, the draft steps stay sharded too (`Draft
 steps stay vocab-sharded`): each rank samples its shard of the draft logits,
 the ranks exchange a few values per request instead of the logits, every rank
 draws the same token, and each records `q` over its own vocabulary columns;
-its verify candidates carry that `q` through their gather.
+its verify candidates carry that `q` through their gather. An EAGLE3 head with
+a smaller hot-token vocabulary (`d2t`) still gathers its draft logits, because
+its columns do not line up with the target's shards, but each rank records
+`q` over its own vocabulary columns only (`Draft steps gather the hot-token
+head's logits and each rank records q over its own columns`).
 
 Known limits, kept as in the reference engine for now: a landed PD request's
 first verify always rejects its shipped candidates (sentinel rows) rather than
