@@ -42,7 +42,8 @@ from utils import assert_no_triton_compile, is_cdna4
 if not is_cdna4():
     pytest.skip("AMD CDNA4 is required", allow_module_level=True)
 
-from monokernel_testing import payloads  # noqa: E402
+import muse_spark_standins as standins  # noqa: E402
+from monokernel_testing import payloads, words  # noqa: E402
 from tokenspeed_kernel.ops.communication._iris import (  # noqa: E402
     IrisGroup,
     get_or_create_context,
@@ -81,7 +82,55 @@ def _all_experts(t: torch.Tensor) -> torch.Tensor:
     return full
 
 
-def _reference(sh, length, full, kernel_pooled, kernel_hp, dev):
+@dataclasses.dataclass(frozen=True)
+class _Shards:
+    """The test model's shards for the ranks in ``present``.
+
+    With every rank present it is the test model as is. With two present,
+    it is a zero-shard model: every weight shard of the other ranks is
+    zero, and so is every column those ranks own (the residual's, and the
+    present ranks' o-projection rows and expert w2 rows that would write
+    them). Each absent rank then puts exactly zero (plus the launch's tag)
+    in every peer region, which the host writes for it before a launch
+    (``muse_spark_standins.standin_fill(..., zero=True)``)."""
+
+    present: tuple[int, ...]
+
+    def absent_columns(self, n: int, owner_width: int) -> torch.Tensor:
+        """Which of ``n`` columns an absent rank owns (``owner_width`` a
+        rank)."""
+        return standins.absent_columns(n, owner_width, self.present)
+
+    def shared(self, seed: int, length: int, rows: int) -> dict:
+        sh = inputs.layer_shared(seed, length, rows)
+        sh["h"][:, self.absent_columns(HIDDEN, OWNED)] = 0
+        return sh
+
+    def rank_weights(self, rank: int, length: int) -> dict:
+        w = dict(inputs.layer_rank_weights(rank, length))
+        if rank not in self.present:
+            for k in ("w_qkvg", "w_o", "w_pool", "w_post"):
+                w[k] = torch.zeros_like(w[k])
+        else:
+            w["w_o"] = w["w_o"].clone()
+            w["w_o"][self.absent_columns(HIDDEN, OWNED)] = 0
+        return w
+
+    def raw_experts(self, rank: int) -> tuple:
+        w13, s13, w2, s2 = inputs.raw_experts(rank, EXPERTS)
+        if rank not in self.present:
+            # E2M1 code 0 is +0 whatever the scale.
+            w13, w2 = torch.zeros_like(w13), torch.zeros_like(w2)
+        else:
+            w2 = w2.clone()
+            w2[:, self.absent_columns(POOLED, POOLED // WORLD)] = 0
+        return w13, s13, w2, s2
+
+
+FULL_MODEL = _Shards(tuple(range(WORLD)))
+
+
+def _reference(sh, length, full, kernel_pooled, kernel_hp, dev, shards):
     """Each row's pooled row, FP32 residual ``h''`` and next BF16 attention
     input (``[rows, ...]``).
 
@@ -98,7 +147,7 @@ def _reference(sh, length, full, kernel_pooled, kernel_hp, dev):
     cs = ref.rope_table(end + 1)
     b = torch.zeros(rows, HIDDEN)
     for r in range(WORLD):
-        w = inputs.layer_rank_weights(r, end)
+        w = shards.rank_weights(r, end)
         qkvg = (sh["a_in"].float() @ w["w_qkvg"].float().T).to(torch.bfloat16)
         z, _, _, _, _, _ = ref.attention_z(
             qkvg,
@@ -115,13 +164,9 @@ def _reference(sh, length, full, kernel_pooled, kernel_hp, dev):
     hp, u, _ = _boundary(sh, "1", sh["h"], b.to(torch.bfloat16), None, sh["pre_gain"])
     gated1 = (hp - sh["alpha1"].double() * sh["h"].double()).abs().float()
     hp, u = hp.float(), u.float()
-    w_pool = torch.cat(
-        [inputs.layer_rank_weights(r, end)["w_pool"] for r in range(WORLD)]
-    )
+    w_pool = torch.cat([shards.rank_weights(r, end)["w_pool"] for r in range(WORLD)])
     pooled = (u.to(torch.bfloat16).float() @ w_pool.float().T).to(torch.bfloat16)
-    w_post = torch.cat(
-        [inputs.layer_rank_weights(r, end)["w_post"] for r in range(WORLD)]
-    )
+    w_post = torch.cat([shards.rank_weights(r, end)["w_post"] for r in range(WORLD)])
     h2 = torch.empty(rows, HIDDEN)
     a = torch.empty(rows, HIDDEN, dtype=torch.bfloat16)
     gated = torch.empty(rows, HIDDEN)
@@ -132,8 +177,11 @@ def _reference(sh, length, full, kernel_pooled, kernel_hp, dev):
     routes = torch.zeros(rows, 8, POOLED)
     for r in range(WORLD):
         routes += (
-            ref.expert_partials(
-                r, EXPERTS, kernel_pooled.to(dev), sh["pre_exp_gain"], ids.to(dev)
+            ref.expert_partials_of(
+                shards.raw_experts(r),
+                kernel_pooled.to(dev),
+                sh["pre_exp_gain"],
+                ids.to(dev),
             )
             .float()
             .cpu()
@@ -185,10 +233,11 @@ def _pack(
     sh: dict,
     length: int,
     full: bool,
+    shards: _Shards,
 ):
     """Pack ``rank``'s layer from the regular path's tensors (``length``: the
     last row's length)."""
-    return pack_layer(**_layer_tensors(rank, dev, sh, length, full))
+    return pack_layer(**_layer_tensors(rank, dev, sh, length, full, shards))
 
 
 def _layer_tensors(
@@ -197,11 +246,14 @@ def _layer_tensors(
     sh: dict,
     length: int,
     full: bool,
+    shards: _Shards,
 ) -> dict:
     """The packer's tensors by role (:func:`pack_layer`'s arguments, which the
     kernel boundary's ``prepare_muse_spark_layer`` takes as ``tensors``)."""
-    w = inputs.layer_rank_weights(rank, length)
-    w13, w13s, w2, w2s = ref.preprocessed_experts(rank, EXPERTS, dev)
+    w = shards.rank_weights(rank, length)
+    w13, w13s, w2, w2s = gluon_inputs.preprocess_experts(
+        tuple(t.to(dev) for t in shards.raw_experts(rank))
+    )
     experts = tuple(_all_experts(t) for t in (w13, w13s, w2, w2s))
     # The packer takes the regular path's tensors: the replicated pooler
     # and post-expert weights, and the router as the regular path stores
@@ -217,13 +269,13 @@ def _layer_tensors(
         router=sh["router"].t().to(dev),
         router_bias=sh["bias"].to(dev),
         pool=torch.cat(
-            [inputs.layer_rank_weights(r, length)["w_pool"] for r in range(WORLD)]
+            [shards.rank_weights(r, length)["w_pool"] for r in range(WORLD)]
         ).to(dev),
         experts=experts,
         pre_exp_gain=sh["pre_exp_gain"].to(dev),
         pen_gain=sh["pen_gain"].to(dev),
         post=torch.cat(
-            [inputs.layer_rank_weights(r, length)["w_post"] for r in range(WORLD)]
+            [shards.rank_weights(r, length)["w_post"] for r in range(WORLD)]
         ).to(dev),
         post_gain=sh["post_gain"].to(dev),
         alpha2=sh["alpha2"].to(dev),
@@ -261,7 +313,7 @@ def _worker(rank: int, port: int, length: int, full: bool, rows: int) -> None:
         end = length + rows - 1
         sh = inputs.layer_shared(42, length, rows)
         w = inputs.layer_rank_weights(rank, end)
-        weights = _pack(rank, dev, sh, end, full)
+        weights = _pack(rank, dev, sh, end, full, FULL_MODEL)
         own = slice(rank * OWNED, (rank + 1) * OWNED)
         k_cache, v_cache = w["k_cache"].to(dev), w["v_cache"].to(dev)
         h_in = sh["h"][:, own].contiguous().to(dev)
@@ -345,7 +397,7 @@ def _worker(rank: int, port: int, length: int, full: bool, rows: int) -> None:
         dist.all_gather(slices, hp_own)
         kernel_hp = torch.cat(slices, dim=1)
         pooled, hp, gated1, h2, a, gated = _reference(
-            sh, length, full, kernel_pooled, kernel_hp, dev
+            sh, length, full, kernel_pooled, kernel_hp, dev, FULL_MODEL
         )
         # h' sums 8 ranks' BF16 partials: where they cancel, a step of one
         # partial is an absolute error at the row's scale, which the norm
@@ -417,7 +469,9 @@ def test_the_kernel_boundary_refuses_experts_of_another_layout():
     )
 
     dev = torch.device("cuda:0")
-    tensors = _layer_tensors(0, dev, inputs.layer_shared(42, 3000, 1), 3000, False)
+    tensors = _layer_tensors(
+        0, dev, inputs.layer_shared(42, 3000, 1), 3000, False, FULL_MODEL
+    )
     tensors["experts_kernel"] = "triton_mxfp4_precomputed_moe_apply"
     with pytest.raises(ValueError, match="triton_mxfp4_precomputed_moe_apply"):
         prepare_muse_spark_layer(tensors=tensors, max_rows=layer.MAX_ROWS)
@@ -436,7 +490,9 @@ def test_the_kernel_boundary_packs_a_layer_for_its_launches(full, solution):
     )
 
     dev = torch.device("cuda:0")
-    tensors = _layer_tensors(0, dev, inputs.layer_shared(42, 3000, 1), 3000, full)
+    tensors = _layer_tensors(
+        0, dev, inputs.layer_shared(42, 3000, 1), 3000, full, FULL_MODEL
+    )
     tensors["experts_kernel"] = "gluon_mxfp4_precomputed_moe_apply"
     fused = prepare_muse_spark_layer(
         tensors=tensors, max_rows=layer.MAX_ROWS, solution=solution
@@ -457,7 +513,9 @@ def test_the_kernel_boundary_refuses_a_kernel_name_as_its_solution():
     from tokenspeed_kernel.selection import NoKernelFoundError
 
     dev = torch.device("cuda:0")
-    tensors = _layer_tensors(0, dev, inputs.layer_shared(42, 3000, 1), 3000, False)
+    tensors = _layer_tensors(
+        0, dev, inputs.layer_shared(42, 3000, 1), 3000, False, FULL_MODEL
+    )
     tensors["experts_kernel"] = "gluon_mxfp4_precomputed_moe_apply"
     with pytest.raises(NoKernelFoundError):
         prepare_muse_spark_layer(
@@ -479,7 +537,7 @@ def test_one_binary_serves_every_layer_step_and_length(full):
     dev = torch.device("cuda:0")
     sh = inputs.layer_shared(42, length, rows)
     w = inputs.layer_rank_weights(0, end)
-    weights = _pack(0, dev, sh, end, full)
+    weights = _pack(0, dev, sh, end, full, FULL_MODEL)
     k_cache, v_cache = w["k_cache"].to(dev), w["v_cache"].to(dev)
     # Compiling alone reads none of these: plain device memory stands in for
     # the symmetric heap and the peers.
@@ -562,19 +620,223 @@ def test_layer_matches_the_regular_path_math(full, rows):
     mp.spawn(_worker, args=(port, 3000, full, rows), nprocs=WORLD, join=True)
 
 
-def _two_requests_worker(rank: int, port: int, full: bool) -> None:
+def _zero_shard_worker(
+    me: int, port: int, length: int, full: bool, rows: int, present
+) -> None:
+    """Process ``me`` runs rank program ``present[me]`` of the zero-shard
+    model (:class:`_Shards`) with the other process; the host writes the
+    absent ranks' exact puts (zeros) before the launch. Checks the present
+    ranks' outputs against the reference as :func:`_worker` does, and that
+    the columns the absent ranks own stay zero."""
+    torch.cuda.set_device(me)
+    dist.init_process_group(
+        "gloo",
+        init_method=f"tcp://localhost:{port}",
+        rank=me,
+        world_size=len(present),
+        timeout=timedelta(seconds=900),
+    )
+    try:
+        dev = torch.device(f"cuda:{me}")
+        ctx = get_or_create_context(heap_size=256 << 20)
+        group = IrisGroup(ctx, dist.group.WORLD, me, dev)
+        rank = present[me]
+        shards = _Shards(present)
+        plan = layer.layer_plan(
+            full=full,
+            rows=rows,
+            chain=rows,
+            warm_next=False,
+            own_qkvg=True,
+            next_qkvg=False,
+            check_parity=False,
+        )
+        scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
+        ghost = torch.zeros_like(scratch)
+        bases = standins.peer_bases(group.bases, present, me, scratch, ghost)
+        end = length + rows - 1
+        sh = shards.shared(42, length, rows)
+        w = shards.rank_weights(rank, end)
+        weights = _pack(rank, dev, sh, end, full, shards)
+        own = slice(rank * OWNED, (rank + 1) * OWNED)
+        h_next = torch.empty(rows, OWNED, device=dev)
+        a_out = torch.empty(rows, HIDDEN, dtype=torch.bfloat16, device=dev)
+        pos = torch.arange(length - 1, length - 1 + rows)
+        slots = sh["table"][pos // 64].long() * 64 + pos % 64
+        lay, step = (1 if full else 2), 3
+        group.finish_prepare()
+        standins.standin_fill(
+            scratch,
+            plan,
+            present,
+            [(0, t) for t in range(rows)],
+            step,
+            lay,
+            lay & 1,
+            True,
+        )
+        layer.launch_gluon_muse_spark_layer_gfx950(
+            weights,
+            h=sh["h"][:, own].contiguous().to(dev),
+            a=sh["a_in"].to(dev),
+            h_out=h_next,
+            a_out=a_out,
+            seq_len=(pos + 1).to(torch.int32).to(dev),
+            slot=slots.to(torch.int32).to(dev),
+            page_table=sh["table"].to(dev),
+            k_cache=w["k_cache"].to(dev),
+            v_cache=w["v_cache"].to(dev),
+            cos_sin=ref.rope_table(end + 1).to(dev),
+            scratch=scratch,
+            step=torch.full((1,), step, dtype=torch.int32, device=dev),
+            peer_bases=bases,
+            layer=lay,
+            chain=rows,
+            whole_rows=False,
+            tap=None,
+            tap_slot=None,
+            warm_next=None,
+            proj_in=None,
+            proj_out=None,
+            trace_buf=None,
+            stuck_rec=None,
+            check_parity=False,
+            compile_only=False,
+        )
+        torch.cuda.synchronize()
+        dist.barrier()
+        tag = launch_tag(step, lay)
+        kernel_pooled = torch.stack(
+            [
+                payloads(scratch, plan, "cg", POOLED // 2, tag, row=t, copy=lay & 1)
+                .view(torch.bfloat16)
+                .cpu()
+                for t in range(rows)
+            ]
+        )
+        hp_own = torch.stack(
+            [
+                payloads(scratch, plan, "hp", OWNED, tag, row=t)
+                .view(torch.float32)
+                .cpu()
+                for t in range(rows)
+            ]
+        )
+        # The absent ranks' h' columns are zero in this model.
+        slices = [torch.empty_like(hp_own) for _ in present]
+        dist.all_gather(slices, hp_own)
+        kernel_hp = torch.zeros(rows, HIDDEN)
+        for r, part in zip(present, slices):
+            kernel_hp[:, r * OWNED : (r + 1) * OWNED] = part
+        pooled, hp, gated1, h2, a, gated = _reference(
+            sh, length, full, kernel_pooled, kernel_hp, dev, shards
+        )
+        # The model is what the stand-ins claim: the absent ranks' columns of
+        # the reference's results are zero, and so are the kernel's.
+        absent_cols = shards.absent_columns(HIDDEN, OWNED)
+        absent_pooled = shards.absent_columns(POOLED, POOLED // WORLD)
+        assert not hp[:, absent_cols].any() and not h2[:, absent_cols].any()
+        assert not pooled[:, absent_pooled].float().any()
+        assert not kernel_pooled[:, absent_pooled].float().any()
+        assert not a_out.cpu()[:, absent_cols].float().any()
+        # The routes reach the present ranks' expert shards.
+        assert pooled[:, ~absent_pooled].float().abs().amax() > 0
+        # As _worker: h', the pooled row, h'' and the next input, bounded.
+        err1 = (hp_own - hp[:, own]).abs()
+        bound1 = 2**-7 * hp[:, own].abs() + 2**-6 * gated1.amax(-1, keepdim=True)
+        assert torch.all(err1 <= bound1), float(err1.max())
+        # The pooled row follows from the kernel's own MoE input (as the MoE
+        # tail's test checks h'' from the kernel's combined row), link by
+        # link, each with a derived bound. The eight-GPU check's tolerance,
+        # rtol 2^-6 plus 2^-9 of the row's largest value, assumes a row of
+        # 4096 non-zero values: here 1024 are, so its largest value sits
+        # ~11 % lower against the same per-value error (measured on 8 and 2
+        # GPUs) and the check fails on that alone.
+        # u, the MoE input every rank published (xin), from the kernel's h':
+        # one BF16 rounding of the FP32 norm (whose FP32 slack is far below
+        # 2^-10 of it).
+        u_k = torch.stack(
+            [
+                words(scratch, plan, "xin", HIDDEN // 2, row=t, copy=lay & 1)
+                .view(torch.bfloat16)
+                .cpu()
+                for t in range(rows)
+            ]
+        )
+        hp64 = kernel_hp.double()
+        u64 = (
+            hp64
+            * torch.rsqrt(hp64.pow(2).mean(-1, keepdim=True) + 1e-5)
+            * sh["pre_gain"].double()
+        )
+        err = (u_k.double() - u64).abs()
+        assert torch.all(err <= 2**-8 * u64.abs() * (1 + 2**-10)), float(err.max())
+        # The pooled row: the BF16 GEMM of that u by the pooler's rows.
+        w_pool = torch.cat(
+            [shards.rank_weights(r, end)["w_pool"] for r in range(WORLD)]
+        )
+        want, bound = ref.bf16_gemm(u_k, w_pool)
+        err = (kernel_pooled.double() - want).abs()
+        assert torch.all(err <= bound), float((err / bound.clamp_min(1e-30)).max())
+        err = (h_next.cpu() - h2[:, own]).abs()
+        bound = 2**-7 * h2[:, own].abs() + 2**-6 * gated.amax(-1, keepdim=True)
+        assert torch.all(err <= bound), float(err.max())
+        for t in range(rows):
+            atol = 2**-8 * float(a[t].float().abs().max())
+            torch.testing.assert_close(
+                a_out[t].float().cpu(), a[t].float(), rtol=2**-6, atol=atol
+            )
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("present", standins.PAIRS, ids=standins.PAIR_IDS)
+@pytest.mark.parametrize("rows", [1, 8])
+@pytest.mark.parametrize("full", [False, True])
+def test_zero_shard_layer_matches_the_regular_path_math_on_two_gpus(
+    full, rows, present
+):
+    """The production TP8 rank programs ``present`` on two GPUs, in a
+    zero-shard model (:class:`_Shards`) whose six other ranks put exactly
+    zero, which the host writes for them: the present ranks' h', pooled
+    row, h'' and next input match the reference within the bounds of
+    :func:`test_layer_matches_the_regular_path_math`, and the absent
+    ranks' columns stay zero. With two non-zero terms per sum it cannot
+    check the rank order of a sum over eight ranks (see
+    :mod:`muse_spark_standins`)."""
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires 2 GPUs")
+    with socket.socket() as sock:
+        sock.bind(("", 0))
+        port = sock.getsockname()[1]
+    mp.spawn(
+        _zero_shard_worker,
+        args=(port, 3000, full, rows, present),
+        nprocs=2,
+        join=True,
+    )
+
+
+def _two_requests_worker(rank: int, port: int, full: bool, present) -> None:
+    """``present``: None for the whole TP8 group, one process a rank; or the
+    two rank programs that run (process ``i`` runs ``present[i]``) while
+    the host writes the other ranks' puts as keyed stand-ins
+    (:func:`muse_spark_standins.standin_fill`)."""
     torch.cuda.set_device(rank)
     dist.init_process_group(
         "gloo",
         init_method=f"tcp://localhost:{port}",
         rank=rank,
-        world_size=WORLD,
+        world_size=WORLD if present is None else len(present),
         timeout=timedelta(seconds=900),
     )
     try:
         dev = torch.device(f"cuda:{rank}")
         ctx = get_or_create_context(heap_size=256 << 20)
         group = IrisGroup(ctx, dist.group.WORLD, rank, dev)
+        me = rank
+        if present is not None:
+            rank = present[me]  # the rank program this process runs
         rows = 8  # a verify of 7 draft tokens a request
         plan = layer.layer_plan(
             full=full,
@@ -586,6 +848,11 @@ def _two_requests_worker(rank: int, port: int, full: bool) -> None:
             check_parity=False,
         )
         scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
+        if present is None:
+            bases = group.bases
+        else:
+            ghost = torch.zeros_like(scratch)
+            bases = standins.peer_bases(group.bases, present, me, scratch, ghost)
         own = slice(rank * OWNED, (rank + 1) * OWNED)
         lengths = (3000, 3100)
         ends = [n + rows - 1 for n in lengths]
@@ -605,7 +872,7 @@ def _two_requests_worker(rank: int, port: int, full: bool) -> None:
             ),
         ]
         w = inputs.layer_rank_weights(rank, 3 * max(ends))
-        weights = _pack(rank, dev, sh, ends[1], full)
+        weights = _pack(rank, dev, sh, ends[1], full, FULL_MODEL)
         cos_sin = ref.rope_table(max(ends) + 1).to(dev)
         for b, r in enumerate(reqs):
             pos = torch.arange(lengths[b] - 1, lengths[b] - 1 + rows)
@@ -614,8 +881,25 @@ def _two_requests_worker(rank: int, port: int, full: bool) -> None:
 
         def launch(rs, step, k_cache, v_cache):
             n = len(rs) * rows
+            if present is not None:
+                # The same stand-ins for a request's rows wherever they sit.
+                keys = [(b, i) for b, _ in rs for i in range(rows)]
+                launch_plan = layer.layer_plan(
+                    full=full,
+                    rows=n,
+                    chain=rows,
+                    warm_next=False,
+                    own_qkvg=True,
+                    next_qkvg=False,
+                    check_parity=False,
+                )
+                lay = 1 if full else 2
+                standins.standin_fill(
+                    scratch, launch_plan, present, keys, step, lay, lay & 1, False
+                )
             h_out = torch.empty(n, OWNED, device=dev)
             a_out = torch.empty(n, HIDDEN, dtype=torch.bfloat16, device=dev)
+            rs = [r for _, r in rs]
             width = max(len(r["table"]) for r in rs)
             table = torch.zeros(len(rs), width, dtype=torch.int32)
             for b, r in enumerate(rs):
@@ -634,7 +918,7 @@ def _two_requests_worker(rank: int, port: int, full: bool) -> None:
                 cos_sin=cos_sin,
                 scratch=scratch,
                 step=torch.full((1,), step, dtype=torch.int32, device=dev),
-                peer_bases=group.bases,
+                peer_bases=bases,
                 layer=1 if full else 2,
                 chain=rows,
                 whole_rows=False,
@@ -656,9 +940,9 @@ def _two_requests_worker(rank: int, port: int, full: bool) -> None:
         group.finish_prepare()
         caches = [w["k_cache"].to(dev), w["v_cache"].to(dev)]
         apart = [c.clone() for c in caches]
-        one = [launch([r], 3 + b, *apart) for b, r in enumerate(reqs)]
+        one = [launch([(b, r)], 3 + b, *apart) for b, r in enumerate(reqs)]
         together = [c.clone() for c in caches]
-        h2, a2 = launch(reqs, 5, *together)
+        h2, a2 = launch(list(enumerate(reqs)), 5, *together)
         # Every row's arithmetic is its own: the same values as each
         # request in a launch of its own. A row's FP32 sums reduce across
         # lanes in a tree that the launch's row count shapes, so the FP32
@@ -686,7 +970,25 @@ def test_two_requests_in_one_launch_match_their_own_launches(full):
     with socket.socket() as sock:
         sock.bind(("", 0))
         port = sock.getsockname()[1]
-    mp.spawn(_two_requests_worker, args=(port, full), nprocs=WORLD, join=True)
+    mp.spawn(_two_requests_worker, args=(port, full, None), nprocs=WORLD, join=True)
+
+
+@pytest.mark.parametrize("present", standins.PAIRS, ids=standins.PAIR_IDS)
+@pytest.mark.parametrize("full", [False, True])
+def test_two_requests_in_one_launch_match_their_own_launches_on_two_gpus(full, present):
+    """As :func:`test_two_requests_in_one_launch_match_their_own_launches`,
+    with two rank programs (the production TP8 binaries) on two GPUs and
+    the host writing the other six ranks' puts as stand-ins keyed by
+    request and row, so the launch of both requests and each request's own
+    launch read the same values. Checks the present ranks' arithmetic and
+    their exchange over the GPU links, not the absent ranks' (see
+    :mod:`muse_spark_standins` for what two GPUs cannot check)."""
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires 2 GPUs")
+    with socket.socket() as sock:
+        sock.bind(("", 0))
+        port = sock.getsockname()[1]
+    mp.spawn(_two_requests_worker, args=(port, full, present), nprocs=2, join=True)
 
 
 def _shift_worker(rank: int, port: int, kinds: tuple[bool, ...]) -> None:
@@ -716,7 +1018,7 @@ def _shift_worker(rank: int, port: int, kinds: tuple[bool, ...]) -> None:
         scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
         sh = inputs.layer_shared(42, length, rows)
         w = inputs.layer_rank_weights(rank, end)
-        packed = _pack(rank, dev, sh, end, kinds[0])
+        packed = _pack(rank, dev, sh, end, kinds[0], FULL_MODEL)
         # Each layer its own kind and q | k | v | gate weights: a launch
         # must project with the next layer's weights, not its own.
         layers = []
@@ -845,7 +1147,7 @@ def _serving_order_worker(rank: int, port: int) -> None:
         scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
         sh = inputs.layer_shared(42, length, rows)
         w = inputs.layer_rank_weights(rank, end)
-        packed = _pack(rank, dev, sh, end, False)
+        packed = _pack(rank, dev, sh, end, False, FULL_MODEL)
         # A step's last two launching layers, then the next step's first two:
         # (layer index, step offset, full). Serving launches layers 1-60
         # every step, so the parity (layer & 1) alternates across the step
@@ -979,7 +1281,7 @@ def _graph_worker(rank: int, port: int, length: int) -> None:
         )
         scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
         sh = inputs.layer_shared(42, length, 1)
-        weights = _pack(rank, dev, sh, length, False)
+        weights = _pack(rank, dev, sh, length, False, FULL_MODEL)
         w = inputs.layer_rank_weights(rank, length)
         own = slice(rank * OWNED, (rank + 1) * OWNED)
         k_cache, v_cache = w["k_cache"].to(dev), w["v_cache"].to(dev)
@@ -1210,19 +1512,26 @@ def _absent_ranks_plan(full: bool, rows: int, requests: int):
 
 
 def _absent_ranks_worker(
-    rank: int, port: int, full: bool, rows: int, requests: int, record: str
+    rank: int,
+    port: int,
+    gpus: int,
+    full: bool,
+    rows: int,
+    requests: int,
+    records: str,
 ) -> None:
-    """One process (rank 0) launches the TP8 layer through the public
-    launcher while the host stands in for ranks 1 to 7: their heap bases
-    point at a local ghost buffer, and before each launch their segment of
-    every peer region holds the launch's tag (flags raised), as
-    ``muse_spark_monokernel_gluon`` writes it for the layer bench."""
+    """Ranks 0 to ``gpus - 1`` (one process each) launch the TP8 layer
+    through the public launcher while the host stands in for the other
+    ranks: their heap bases point at a local ghost buffer, and before each
+    launch their segment of every peer region holds the launch's tag (flags
+    raised), as ``muse_spark_monokernel_gluon`` writes it for the layer
+    bench. The present ranks' puts to each other cross the GPU links."""
     torch.cuda.set_device(rank)
     dist.init_process_group(
         "gloo",
         init_method=f"tcp://localhost:{port}",
         rank=rank,
-        world_size=1,
+        world_size=gpus,
         timeout=timedelta(seconds=900),
     )
     try:
@@ -1234,10 +1543,11 @@ def _absent_ranks_worker(
         scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
         ghost = torch.zeros_like(scratch)
         bases = torch.empty(WORLD, dtype=torch.int64, device=dev)
-        bases[:1] = group.bases.to(dev)
-        bases[1:] = int(group.bases[rank]) + (ghost.data_ptr() - scratch.data_ptr())
-        index = [gluon_inputs.absent_index(plan, p, 1).to(dev) for p in (0, 1)]
-        bits = [gluon_inputs.ghost_payloads(plan, p, 1).to(dev) for p in (0, 1)]
+        bases[:gpus] = group.bases.to(dev)
+        bases[gpus:] = int(group.bases[rank]) + (ghost.data_ptr() - scratch.data_ptr())
+        index = [gluon_inputs.absent_index(plan, p, gpus).to(dev) for p in (0, 1)]
+        bits = [gluon_inputs.ghost_payloads(plan, p, gpus).to(dev) for p in (0, 1)]
+        record = os.path.join(records, f"rank{rank}.rec")
         buf = stuck.stuck_buffer(256, 8, record, scratch.data_ptr(), rank)
         own = slice(rank * OWNED, (rank + 1) * OWNED)
         # Request b at length 3000 + 100 b, each with pages of its own.
@@ -1260,7 +1570,7 @@ def _absent_ranks_worker(
             ]
         )
         w = inputs.layer_rank_weights(rank, 64 * first)
-        weights = _pack(rank, dev, sh, max(ends), full)
+        weights = _pack(rank, dev, sh, max(ends), full, FULL_MODEL)
         step = torch.full((1,), 5, dtype=torch.int32, device=dev)
         group.finish_prepare()
         # Two launches, so both copies of the peer regions are read.
@@ -1303,34 +1613,43 @@ def _absent_ranks_worker(
         dist.destroy_process_group()
 
 
+# ut-tokenspeed-kernel-amd-2gpu selects the gpus2 cases by this id.
+@pytest.mark.parametrize("gpus", [1, 2], ids=["gpus1", "gpus2"])
 @pytest.mark.parametrize("full", [False, True])
 @pytest.mark.parametrize("rows, requests", [(1, 1), (8, 1), (8, 2)])
-def test_one_gpu_launches_find_every_absent_rank_segment(
-    tmp_path, full: bool, rows: int, requests: int
+def test_launches_with_absent_ranks_reach_every_peer_segment(
+    tmp_path, gpus: int, full: bool, rows: int, requests: int
 ):
-    """With one GPU standing in for the TP8 group, a launch must find every
-    pair the absent ranks would have written (each peer region's
-    rank-ordered blocks, the flags past 8 rows, every row), or a poll gives
-    up, records what it waited for and stops the kernel."""
+    """With ``gpus`` GPUs present and the host standing in for the other
+    ranks of the TP8 group, every launch must find every pair it polls:
+    those the present ranks put to each other (across the GPU links when
+    ``gpus`` is 2) and those the absent ranks would have written (each peer
+    region's rank-ordered blocks, the flags past 8 rows, every row).
+    Otherwise a poll gives up, records what it waited for and stops the
+    kernel. This checks that the launches complete, not their values: the
+    absent ranks' payloads are placeholders."""
+    if torch.cuda.device_count() < gpus:
+        pytest.skip(f"requires {gpus} GPUs")
     with socket.socket() as sock:
         sock.bind(("", 0))
         port = sock.getsockname()[1]
-    record = str(tmp_path / "rank0.rec")
-    # A poll that gives up stops the worker; its record outlives it.
+    # A poll that gives up stops its worker; its record outlives it.
     try:
         mp.spawn(
             _absent_ranks_worker,
-            args=(port, full, rows, requests, record),
-            nprocs=1,
+            args=(port, gpus, full, rows, requests, str(tmp_path)),
+            nprocs=gpus,
             join=True,
         )
     finally:
-        if os.path.exists(record):
-            t = stuck.read_file(record)
-            plan = _absent_ranks_plan(full, rows, requests)
-            assert not stuck.records(t), "\n".join(
-                stuck.summarize(t, lambda index: [plan])
-            )
+        plan = _absent_ranks_plan(full, rows, requests)
+        for rank in range(gpus):
+            record = str(tmp_path / f"rank{rank}.rec")
+            if os.path.exists(record):
+                t = stuck.read_file(record)
+                assert not stuck.records(t), "\n".join(
+                    stuck.summarize(t, lambda index: [plan])
+                )
 
 
 def test_the_packer_names_every_tensor_of_another_layout():

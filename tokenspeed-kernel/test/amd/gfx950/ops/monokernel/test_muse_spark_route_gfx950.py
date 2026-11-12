@@ -34,6 +34,7 @@ from utils import is_cdna4
 if not is_cdna4():
     pytest.skip("AMD CDNA4 is required", allow_module_level=True)
 
+import muse_spark_standins as standins  # noqa: E402
 from monokernel_testing import fill, payloads  # noqa: E402
 from tokenspeed_kernel.ops.communication._iris import (  # noqa: E402
     IrisGroup,
@@ -51,6 +52,7 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import (  # noqa: E402
 
 WORLD, HIDDEN, OWNED, EXPERTS, TOP_K, TAIL_TASKS = 8, 8192, 1024, 256, 8, 8
 SUMS = 4
+ALL = tuple(range(WORLD))
 
 
 def _tail_sums(b, h, alpha, beta) -> torch.Tensor:
@@ -85,10 +87,12 @@ def route_kernel(
         moe_route.topk_stage(mb, task, bias, "topk")
 
 
-def _inputs(seed: int, rows: int):
+def _inputs(seed: int, rows: int, present):
     """The attention tail's ``b`` (BF16 values) and ``h`` of each row
     (``[rows, 8192]``), ``alpha``, ``beta``, the residual ``h' = beta b inv +
-    alpha h`` they give, and the router's weights."""
+    alpha h`` they give, and the router's weights. Outside ``present`` the
+    router is zero-shard: the columns those ranks own are zero, so their
+    partial logits (``lg`` / ``lg2``) are exactly zero."""
     g = torch.Generator().manual_seed(seed)
     b = torch.randn(rows, HIDDEN, generator=g).to(torch.bfloat16).float()
     h = torch.randn(rows, HIDDEN, generator=g) * 3.0
@@ -104,22 +108,28 @@ def _inputs(seed: int, rows: int):
         # bias, so the same score + bias. The lower id must come first.
         w[9] = w[5]
         bias[5] = bias[9] = 2.0
+    w[:, standins.absent_columns(HIDDEN, OWNED, present)] = 0
     return (b, h, alpha, beta), hp, pre_gain, w, bias
 
 
-def _worker(rank: int, port: int, rows: int) -> None:
-    torch.cuda.set_device(rank)
+def _worker(me: int, port: int, rows: int, present) -> None:
+    """Three routing launches against the reference. ``present``: None for
+    the whole TP8 group; or the two rank programs that run (process ``me``
+    runs ``present[me]``) with the zero-shard router of :func:`_inputs`,
+    whose other ranks' partial logits (exactly zero) the host writes before
+    each launch."""
+    torch.cuda.set_device(me)
     dist.init_process_group(
         "gloo",
         init_method=f"tcp://localhost:{port}",
-        rank=rank,
-        world_size=WORLD,
+        rank=me,
+        world_size=WORLD if present is None else len(present),
         timeout=timedelta(seconds=300),
     )
     try:
-        device = torch.device(f"cuda:{rank}")
+        device = torch.device(f"cuda:{me}")
         ctx = get_or_create_context(heap_size=256 << 20)
-        group = IrisGroup(ctx, dist.group.WORLD, rank, device)
+        group = IrisGroup(ctx, dist.group.WORLD, me, device)
         plan = Plan(
             grid=256,
             stages=moe_route.stages({"router": 0, "topk": 16}, rows),
@@ -132,11 +142,17 @@ def _worker(rank: int, port: int, rows: int) -> None:
             peers=moe_route.PEERS,
         )
         scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
+        if present is None:
+            rank, model, bases = me, ALL, group.bases
+        else:
+            rank, model = present[me], present
+            ghost = torch.zeros_like(scratch)
+            bases = standins.peer_bases(group.bases, present, me, scratch, ghost)
         group.finish_prepare()
         own = slice(rank * OWNED, (rank + 1) * OWNED)
         for k, seed in enumerate((1, 2, 3)):
             step = 4 + k
-            (b, h, alpha, beta), hp, pre_gain, w, bias = _inputs(seed, rows)
+            (b, h, alpha, beta), hp, pre_gain, w, bias = _inputs(seed, rows, model)
             tag = launch_tag(step, 0)
             for row in range(rows):
                 # The ranks' o_proj partials that sum to b: rank 1's holds
@@ -165,10 +181,21 @@ def _worker(rank: int, port: int, rows: int) -> None:
                     tag,
                     row=row,
                 )
+            if present is not None:
+                standins.standin_fill(
+                    scratch,
+                    plan,
+                    present,
+                    [(0, t) for t in range(rows)],
+                    step,
+                    0,
+                    step & 1,
+                    True,
+                )
             route_kernel[(plan.grid,)](
                 scratch,
                 torch.full((1,), step, dtype=torch.int32, device=device),
-                group.bases,
+                bases,
                 w[:, own].contiguous().to(device),
                 pre_gain[own].to(device),
                 h[:, own].contiguous().to(device),
@@ -184,6 +211,8 @@ def _worker(rank: int, port: int, rows: int) -> None:
                 got = payloads(scratch, plan, "route", 2 * TOP_K, tag, row=row).cpu()
                 u = hp[row] * torch.rsqrt(hp[row].pow(2).mean() + 1e-5) * pre_gain
                 logit = (w.double() @ u) * 0.17677669529663687
+                # The present ranks' columns carry the logits (absent: zero).
+                assert logit.abs().max() > 0
                 score = torch.sigmoid(logit)
                 # Largest first, a tie to the lowest id.
                 ids = torch.sort(
@@ -204,11 +233,36 @@ def _worker(rank: int, port: int, rows: int) -> None:
         dist.destroy_process_group()
 
 
+def _spawn(rows: int, present) -> None:
+    with socket.socket() as sock:
+        sock.bind(("", 0))
+        port = sock.getsockname()[1]
+    mp.spawn(
+        _worker,
+        args=(port, rows, present),
+        nprocs=WORLD if present is None else len(present),
+        join=True,
+    )
+
+
 @pytest.mark.parametrize("rows", [1, 8])
 def test_routing_sums_the_ranks_partial_logits_and_picks_the_top_8(rows: int):
     if torch.cuda.device_count() < WORLD:
         pytest.skip(f"requires {WORLD} GPUs")
-    with socket.socket() as sock:
-        sock.bind(("", 0))
-        port = sock.getsockname()[1]
-    mp.spawn(_worker, args=(port, rows), nprocs=WORLD, join=True)
+    _spawn(rows, None)
+
+
+@pytest.mark.parametrize("present", standins.PAIRS, ids=standins.PAIR_IDS)
+@pytest.mark.parametrize("rows", [1, 8])
+def test_routing_sums_the_ranks_partial_logits_and_picks_the_top_8_on_two_gpus(
+    rows: int, present
+):
+    """As :func:`test_routing_sums_the_ranks_partial_logits_and_picks_the_top_8`
+    with the production rank programs ``present`` on two GPUs, the router
+    zero-shard outside them: the top-8 ids (the seed-3 tie included) and
+    their weights against the reference. Two GPUs cannot check the rank order
+    of the eight-rank logit sum, or the partial logits the present ranks put
+    into the absent ranks' segments (see muse_spark_standins)."""
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires 2 GPUs")
+    _spawn(rows, present)
