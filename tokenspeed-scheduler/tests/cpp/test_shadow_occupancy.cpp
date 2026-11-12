@@ -43,6 +43,7 @@
 #include "cache/coordinator/eviction_plan.h"
 #include "cache/coordinator/parent_occupancy.h"
 #include "cache/coordinator/shadow_occupancy.h"
+#include "cache/core/fixed_slot_resource.h"
 
 namespace tokenspeed::test {
 namespace {
@@ -327,6 +328,35 @@ TEST(FixedSlotResource, RequestsOfAnotherShapeUseTheUpstreamResource) {
     EXPECT_EQ(&nodes.back(), freed);
     EXPECT_EQ(nodes.back(), 99);
     EXPECT_EQ(values.back(), 64);
+}
+
+// A free slot is poisoned until it is handed out again, so AddressSanitizer
+// reports a read through a stale pointer to a pooled node.
+TEST(FixedSlotResource, FreeSlotsArePoisonedUntilHandedOut) {
+#if !defined(TOKENSPEED_SCHEDULER_ADDRESS_SANITIZER)
+    GTEST_SKIP() << "needs AddressSanitizer";
+#else
+    FixedSlotResource storage{4};
+    std::pmr::list<std::int64_t> nodes{&storage};
+    nodes.push_back(1);
+    nodes.push_back(2);
+    const std::int64_t* kept = &nodes.front();
+    const std::int64_t* freed = &nodes.back();
+    nodes.pop_back();
+    EXPECT_TRUE(__asan_address_is_poisoned(freed));
+    EXPECT_FALSE(__asan_address_is_poisoned(kept));
+    nodes.push_back(3);
+    ASSERT_EQ(&nodes.back(), freed) << "the freed slot is the next one handed out";
+    EXPECT_FALSE(__asan_address_is_poisoned(freed));
+    EXPECT_EQ(nodes.back(), 3);
+    // A slot of the chunk not handed out before is unpoisoned when it is.
+    nodes.push_back(4);
+    const std::int64_t* fresh = &nodes.back();
+    EXPECT_FALSE(__asan_address_is_poisoned(fresh));
+    nodes.clear();
+    EXPECT_TRUE(__asan_address_is_poisoned(kept));
+    EXPECT_TRUE(__asan_address_is_poisoned(fresh));
+#endif
 }
 
 TEST(ShadowOccupancy, ConcurrentPlansHaveIndependentCapacity) {

@@ -30,6 +30,17 @@
 
 #include "utils.h"
 
+#if defined(__SANITIZE_ADDRESS__)
+#define TOKENSPEED_SCHEDULER_ADDRESS_SANITIZER 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define TOKENSPEED_SCHEDULER_ADDRESS_SANITIZER 1
+#endif
+#endif
+#if defined(TOKENSPEED_SCHEDULER_ADDRESS_SANITIZER)
+#include <sanitizer/asan_interface.h>
+#endif
+
 namespace tokenspeed {
 
 // Storage for one fixed node type on the scheduler control thread. Unlike a
@@ -41,7 +52,9 @@ namespace tokenspeed {
 // retained until this resource is destroyed: about
 // ceil(high_water_slots / slots_per_chunk) * slots_per_chunk * aligned slot
 // size bytes, plus one handle per chunk. The owning container destroys its
-// objects before this resource.
+// objects before this resource. Under AddressSanitizer every free slot is
+// poisoned, its free-list link included, so reading a freed node through a
+// stale pointer is reported even though the memory stays allocated.
 class FixedSlotResource final : public std::pmr::memory_resource {
 public:
     explicit FixedSlotResource(std::size_t slots_per_chunk) : slots_per_chunk_{slots_per_chunk} {
@@ -62,9 +75,20 @@ private:
         std::size_t bytes;
         std::size_t alignment;
         void operator()(std::byte* pointer) const noexcept {
+            unpoison(pointer, bytes);
             std::pmr::new_delete_resource()->deallocate(pointer, bytes, alignment);
         }
     };
+    static void poison([[maybe_unused]] void* memory, [[maybe_unused]] std::size_t bytes) noexcept {
+#if defined(TOKENSPEED_SCHEDULER_ADDRESS_SANITIZER)
+        __asan_poison_memory_region(memory, bytes);
+#endif
+    }
+    static void unpoison([[maybe_unused]] void* memory, [[maybe_unused]] std::size_t bytes) noexcept {
+#if defined(TOKENSPEED_SCHEDULER_ADDRESS_SANITIZER)
+        __asan_unpoison_memory_region(memory, bytes);
+#endif
+    }
     void* do_allocate(std::size_t bytes, std::size_t alignment) override {
         if (stride_ == 0) {
             bytes_ = bytes;
@@ -87,9 +111,11 @@ private:
             chunks_.push_back(std::move(chunk));
             for (std::size_t i = 0; i < slots_per_chunk_; ++i) {
                 free_ = new (memory + i * stride_) FreeSlot{free_};
+                poison(free_, stride_);
             }
         }
         auto* slot = free_;
+        unpoison(slot, stride_);
         free_ = slot->next;
         return slot;
     }
@@ -100,6 +126,7 @@ private:
             return;
         }
         free_ = new (pointer) FreeSlot{free_};
+        poison(pointer, stride_);
     }
     bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override { return this == &other; }
 
