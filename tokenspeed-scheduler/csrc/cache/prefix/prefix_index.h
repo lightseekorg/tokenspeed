@@ -70,9 +70,11 @@ private:
 
     using EvictionOrderMap = std::map<EvictionOrder, CacheEntryIterator>;
 
-    // All mutations maintain the insertion hint, including erasing its node.
-    // Sequential releases within an epoch can then restore in amortized
-    // constant time; arbitrary epochs/locations still use std::map's ordering.
+    // All mutations maintain the insertion hint, the last insertion, including
+    // erasing its node. std::map checks both neighbours of the hint, so
+    // appends and consecutive locations within an epoch, in either direction,
+    // insert in amortized constant time; arbitrary epochs/locations still use
+    // std::map's ordering.
     class OrderIndex {
     public:
         auto begin() const { return entries_.begin(); }
@@ -85,13 +87,13 @@ private:
         EvictionOrderMap::iterator Insert(EvictionOrder key, CacheEntryIterator entry) {
             const auto position = entries_.emplace_hint(hint_, key, entry);
             FatalCheck(position->second == entry, "an ordered entry has a unique epoch and location");
-            hint_ = successor(position);
+            hint_ = position;
             return position;
         }
         EvictionOrderMap::iterator Insert(EvictionOrderMap::node_type& node) noexcept {
             const auto position = entries_.insert(hint_, std::move(node));
             FatalCheck(node.empty(), "an extracted node restores its unique order key");
-            hint_ = successor(position);
+            hint_ = position;
             return position;
         }
         EvictionOrderMap::node_type Extract(EvictionOrderMap::iterator position) noexcept {
@@ -104,9 +106,9 @@ private:
         }
 
     private:
-        // Re-keying to a new epoch inserts the last node, whose std::next
-        // climbs the tree's whole right edge; the map reaches that node in
-        // O(1) as end()'s predecessor.
+        // Re-keying to a new epoch leaves the hint on the last node, whose
+        // std::next climbs the tree's whole right edge; the map reaches that
+        // node in O(1) as end()'s predecessor.
         EvictionOrderMap::const_iterator successor(EvictionOrderMap::const_iterator position) const noexcept {
             return position == std::prev(entries_.end()) ? entries_.end() : std::next(position);
         }

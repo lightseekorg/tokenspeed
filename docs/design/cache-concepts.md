@@ -42,9 +42,11 @@ The last external owner's notification restores the same node, without
 allocation; its key follows epoch changes and relocation while pinned. The
 order containers outlive their registrations, and observers are cancelled
 before either the registration or block owner is destroyed.
-All ordered-index mutations maintain an insertion hint, advancing it before
-removing its node. Restoring consecutive locations within one epoch can use
-that hint; arbitrary release order and older epochs retain the same map order.
+All ordered-index mutations keep the last insertion as an insertion hint,
+advancing it before removing its node. Appends at the newest epoch, and
+restoring, publishing or re-keying consecutive locations within one epoch, in
+ascending or descending order, can use that hint; arbitrary release order and
+older epochs retain the same map order.
 
 Page-walk probes can retain physical location hints, not entry pointers or
 block owners. Protection and acquisition check the pool and complete cache

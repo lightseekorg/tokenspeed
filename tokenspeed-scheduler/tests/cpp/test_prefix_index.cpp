@@ -29,6 +29,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "cache/core/block_pool.h"
@@ -906,46 +907,80 @@ TEST(PrefixCacheIndexEvictionOrderTest, AcquiringAMatchMovesTheEntryToTheRequest
 }
 
 // Hits re-keyed to a new epoch, and entries published under it, append at
-// the end of the order. The order stays exact when the last entry leaves it
-// (eviction, or a traversal setting it aside while pinned) right after an
-// insertion just before it, and when appends and restores follow.
+// the end of the order and become its insertion hint. The order stays exact
+// when that last entry leaves it right away (re-keyed again, evicted, or set
+// aside by a traversal while pinned), and when appends and restores follow.
 TEST(PrefixCacheIndexEvictionOrderTest, AppendsAtTheNewestEpochAndRemovesTheLastEntry) {
     BlockPool pool(10, {1});
     PrefixCacheIndex index(kGroupId);
     std::vector<CacheBlockLocation> cached;
     std::vector<CacheKey> keys;
     for (int i = 0; i < 6; ++i) {
-        cached.push_back(Cache(index, pool, std::to_string(i), /*access_epoch=*/1));
+        cached.push_back(Cache(index, pool, std::to_string(i), /*access_epoch=*/1 + i));
         keys.push_back(KeyOf(std::to_string(i)));
     }
-    index.AcquireMatched(pool, std::vector<CacheKey>(keys.begin(), keys.begin() + 4), /*begin_blocks=*/0,
-                         GroupPrefixProbe{.hits = {1, 1, 1, 1}}, /*access_epoch=*/5, /*session=*/nullptr);
+    for (int i = 0; i < 4; ++i) {
+        index.AcquireMatched(pool, std::vector<CacheKey>{keys[i]}, /*begin_blocks=*/0, GroupPrefixProbe{.hits = {1}},
+                             /*access_epoch=*/10 + i, /*session=*/nullptr);
+    }
     EXPECT_EQ(DrainEvictionOrder(index, pool),
               (std::vector<CacheBlockLocation>{cached[4], cached[5], cached[0], cached[1], cached[2], cached[3]}));
 
-    index.AcquireMatched(pool, std::vector<CacheKey>{keys[3]}, 0, GroupPrefixProbe{.hits = {1}}, 6, nullptr);
-    const CacheBlockLocation mid = Cache(index, pool, "mid", 5);
-    ASSERT_TRUE(index.Evict(pool, cached[3]));
-    const CacheBlockLocation newest = Cache(index, pool, "newest", 7);
+    index.AcquireMatched(pool, std::vector<CacheKey>{keys[3]}, 0, GroupPrefixProbe{.hits = {1}}, 20, nullptr);
+    const CacheBlockLocation evicted = Cache(index, pool, "evicted", 30);
+    ASSERT_TRUE(index.Evict(pool, evicted));
+    const CacheBlockLocation mid = Cache(index, pool, "mid", 15);
     EXPECT_EQ(DrainEvictionOrder(index, pool),
-              (std::vector<CacheBlockLocation>{cached[4], cached[5], cached[0], cached[1], cached[2], mid, newest}));
+              (std::vector<CacheBlockLocation>{cached[4], cached[5], cached[0], cached[1], cached[2], mid, cached[3]}));
 
-    CacheBlockRef pin = index.Find(pool, KeyOf("newest"));
-    const CacheBlockLocation before_newest = Cache(index, pool, "before-newest", 6);
-    EXPECT_EQ(DrainEvictionOrder(index, pool), (std::vector<CacheBlockLocation>{cached[4], cached[5], cached[0],
-                                                                                cached[1], cached[2], mid,
-                                                                                before_newest}));
-    const CacheBlockLocation appended = Cache(index, pool, "appended", 8);
+    const CacheBlockLocation pinned = Cache(index, pool, "pinned", 40);
+    CacheBlockRef pin = index.Find(pool, KeyOf("pinned"));
+    EXPECT_EQ(DrainEvictionOrder(index, pool),
+              (std::vector<CacheBlockLocation>{cached[4], cached[5], cached[0], cached[1], cached[2], mid, cached[3]}));
+    const CacheBlockLocation before_pinned = Cache(index, pool, "before-pinned", 35);
+    const CacheBlockLocation appended = Cache(index, pool, "appended", 50);
     pin.reset();
     const std::vector<CacheBlockLocation> order = DrainEvictionOrder(index, pool);
     EXPECT_EQ(order, (std::vector<CacheBlockLocation>{cached[4], cached[5], cached[0], cached[1], cached[2], mid,
-                                                      before_newest, newest, appended}));
+                                                      cached[3], before_pinned, pinned, appended}));
 
     for (const CacheBlockLocation location : order) {
         ASSERT_TRUE(index.Evict(pool, location));
     }
     EXPECT_EQ(index.NumEntries(pool), 0);
     EXPECT_EQ(index.PotentiallyEvictableEntries(pool), 0u);
+}
+
+// Pages freed suffix first are reused, and published, in descending location
+// order: each lands just before the previous one, inside the order or at its
+// end.
+TEST(PrefixCacheIndexEvictionOrderTest, PublishingInDescendingLocationOrderKeepsTheOrder) {
+    BlockPool pool(10, {1});
+    PrefixCacheIndex index(kGroupId);
+    const CacheBlockLocation oldest = Cache(index, pool, "oldest", /*access_epoch=*/1);
+    const CacheBlockLocation newest = Cache(index, pool, "newest", /*access_epoch=*/9);
+    std::vector<CacheBlockRef> blocks;
+    for (int i = 0; i < 8; ++i) {
+        blocks.push_back(pool.AcquireBlock(kGroupId));
+    }
+    std::ranges::sort(blocks, {}, [](const CacheBlockRef& block) {
+        const CacheBlockLocation location = block->Location();
+        return std::pair{location.lcm_block_id, location.slot_index};
+    });
+    std::vector<CacheBlockLocation> locations;
+    for (const CacheBlockRef& block : blocks) {
+        locations.push_back(block->Location());
+    }
+    for (int i = 7; i >= 0; --i) {
+        index.Register(pool, blocks[i], KeyOf(std::to_string(i)), /*access_epoch=*/i < 4 ? 5 : 10,
+                       /*logical_block_index=*/i, CacheBoundaryKind::kChunk, /*newly_cached=*/nullptr,
+                       /*session=*/nullptr);
+    }
+    blocks.clear();
+
+    EXPECT_EQ(DrainEvictionOrder(index, pool),
+              (std::vector<CacheBlockLocation>{oldest, locations[0], locations[1], locations[2], locations[3], newest,
+                                               locations[4], locations[5], locations[6], locations[7]}));
 }
 
 TEST(PrefixCacheIndexEvictionOrderTest, AcquiredOwnersRestoreOrderOnLastReleaseAndUnwind) {
