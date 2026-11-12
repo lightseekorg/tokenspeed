@@ -150,8 +150,8 @@ class DSpark(DFlash):
     def _fused_walk_fits(self, block_logits: torch.Tensor) -> bool:
         """Whether the greedy walk can take one launch and one gather per round.
 
-        Without a distributed argmax state the generic walk spends about a
-        dozen launches and two all-gathers per round. A state, where the
+        Without a distributed argmax state the generic walk takes several
+        launches and two all-gathers per round. A state, where the
         platform has one, keeps the walk it already fuses.
 
         Every test must come out the same on every rank: ranks taking
