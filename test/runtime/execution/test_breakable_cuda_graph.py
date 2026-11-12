@@ -995,7 +995,7 @@ class TestPoolReuseAcrossCaptures:
             if bundle == "tensors":
                 return MLAPrologueOutput(query=q, key=q * 2.0, value=None)
             # The scalar is frozen at capture, like a loose scalar arg.
-            return ScaledKey(query=q, key=q, scale=2.0)
+            return ScaledKey(query=q, key=q * 2.0, scale=1.0)
 
         probe = torch.empty(1, device="cuda")
         if weak_ref_tensor(probe) is probe:
