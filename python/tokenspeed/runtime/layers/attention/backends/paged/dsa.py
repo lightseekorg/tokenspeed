@@ -755,7 +755,9 @@ class DSABackend(PagedAttentionBackend):
         (the cast in ``forward_sparse_prefill`` / ``forward_sparse_decode``),
         else the model dtype; ``return_lse`` follows DCP, and a query-sharded
         extend adds its LSE-free arm; decode runs one row per request and
-        ``spec_num_tokens`` verify rows; the cores' width is ``index_topk``
+        ``spec_num_tokens`` verify rows, probed at one request of the local
+        heads (the KVP group's gathered heads under DCP), as a decode core may
+        serve only some batches; the cores' width is ``index_topk``
         plus a KPool's ``pool_size - 1`` tail slots (GLM-5.3-Flash's 2051).
         Under DCP the indexer scores the model-dtype index query and head
         weights against packed index-K pages of this leaf's page size,
@@ -795,13 +797,15 @@ class DSABackend(PagedAttentionBackend):
                     self.prefill_kernel_plan,
                 )
             )
+        decode_heads = self.num_local_heads * len(self.kvp_group)
         for q_len in sorted({1, self.spec_num_tokens}):
+            decode_traits = {"batch": 1, "q_len": q_len, "num_heads": decode_heads}
             probes.append(
                 (
                     f"dsa_decode(q_len={q_len}, return_lse={use_dcp})",
                     "dsa_decode",
                     signature,
-                    {**traits, "q_len": q_len, "return_lse": use_dcp},
+                    {**traits, **decode_traits, "return_lse": use_dcp},
                     self.kernel_solution,
                     self.decode_kernel_plan,
                 )

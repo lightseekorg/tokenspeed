@@ -37,6 +37,10 @@ decode step in two launches, selected only by ``solution="cute_dsl"``.
 (README, "Fused decode front"): a Kimi-K3.1 TP8 decode round's q_a / kv_a
 RMSNorm, stacked [q_b; wq_b] projection, index query quantization and index-K
 write in one cluster launch.
+
+``cute_dsl_dsa_decode`` is the registered ``dsa_decode`` leaf (README, "CuTe
+DSL sparse MLA decode"): it takes the E4M3 verify rows of one or four
+eight-row requests from trtllm-gen, the row counts where it is faster.
 """
 
 from __future__ import annotations
@@ -55,10 +59,15 @@ from tokenspeed_kernel.platform import (
     pdl_enabled,
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+from tokenspeed_kernel.signature import (
+    dense_tensor_format,
+    format_signature,
+    format_signatures,
+)
 
 __all__ = [
     "DECODE_FRONT_MAX_ROWS",
+    "SPARSE_CORE_SPLIT_BY_ROWS",
     "cute_dsl_decode_topk",
     "decode_front_rows_supported",
     "has_cute_dsl_decode_topk",
@@ -763,3 +772,158 @@ if _decode_front is not None:
             float(softmax_scale),
         )
         return q_norm, projected, q_fp8, weights
+
+
+# Sparse MLA core: E4M3 queries over the selected E4M3 latent rows.
+
+_sparse_core = None
+if _ts_supported_arch():
+    try:
+        from tokenspeed_kernel.thirdparty.cute_dsl.k3_decode.dsa import (
+            sparse as _sparse_core,
+        )
+    except ImportError:
+        _sparse_core = None
+
+# Query rows of a call the sparse core takes from trtllm-gen, and its CTAs per row.
+SPARSE_CORE_SPLIT_BY_ROWS = {8: 8, 32: 4}
+_SPARSE_CORE_Q_LEN = 8
+_SPARSE_CORE_HEADS = 16
+_SPARSE_CORE_ROW = 576
+_SPARSE_CORE_LATENT = 512
+
+if _sparse_core is not None:
+
+    @register_kernel(
+        "attention",
+        "dsa_decode",
+        name="cute_dsl_dsa_decode",
+        solution="cute_dsl",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 3),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=format_signatures("q", "dense", {torch.float8_e4m3fn}),
+        traits={
+            # Requests of eight verify rows: 8 and 32 rows, where it beats trtllm-gen.
+            "batch": frozenset(
+                rows // _SPARSE_CORE_Q_LEN for rows in SPARSE_CORE_SPLIT_BY_ROWS
+            ),
+            "q_len": frozenset({_SPARSE_CORE_Q_LEN}),
+            # The measured Kimi-K3.1 TP8 geometry: 12 local heads, 128 NoPE channels.
+            "num_heads": frozenset({12}),
+            "qk_nope_head_dim": frozenset({128}),
+            "kv_lora_rank": frozenset({_SPARSE_CORE_LATENT}),
+            "qk_rope_head_dim": frozenset({_SPARSE_CORE_ROW - _SPARSE_CORE_LATENT}),
+            "page_size": frozenset({64}),
+            "topk": frozenset({512, 1024, 2048}),
+            "has_kv_cache": frozenset({True}),
+            "has_sparse_kv_cache": frozenset({False}),
+            "logit_cap": frozenset({False}),
+            "return_lse": frozenset({False}),
+            "topk_layout": frozenset({"global_slots"}),
+        },
+        # Above trtllm-gen, whose decode core keeps every other row count.
+        priority=Priority.SPECIALIZED + 1,
+    )
+    def cute_dsl_dsa_decode(
+        *,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor | None,
+        sparse_kv_cache: torch.Tensor | None,
+        topk_slots: torch.Tensor,
+        topk_lens: torch.Tensor | None,
+        max_seqlen_k: int,
+        qk_nope_head_dim: int,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        softmax_scale: float,
+        page_size: int,
+        q_len_per_req: int,
+        kv_seq_lens: torch.Tensor | None,
+        logit_cap: float,
+        k_scale: float,
+        return_lse: bool,
+        out: torch.Tensor | None,
+        enable_pdl: bool,
+    ) -> torch.Tensor:
+        """Sparse decode of 8 or 32 query rows over their selected cache rows.
+
+        The selected slots alone define the reads (the indexer enforces
+        causality), so ``max_seqlen_k`` and ``kv_seq_lens`` do not enter.
+
+        Args:
+            q: E4M3 ``[rows, heads, 576]`` or ``[batch, 8, heads, 576]``.
+            kv_cache: Contiguous E4M3 latent cache rows (576 per slot).
+            sparse_kv_cache: Must be None.
+            topk_slots: INT32 ``[rows, topk]`` global slots; -1 entries are masked.
+            topk_lens: INT32 ``[rows]`` live prefix of each row, or None.
+            max_seqlen_k: Unused.
+            qk_nope_head_dim: 128 or 192 (the absorbed query is 576 wide).
+            kv_lora_rank: 512.
+            qk_rope_head_dim: 64.
+            softmax_scale: Logit scale.
+            page_size: 64.
+            q_len_per_req: 8.
+            kv_seq_lens: Unused.
+            logit_cap: Must be 0.
+            k_scale: Key scale, folded into the logit scale.
+            return_lse: Must be False.
+            out: Optional contiguous BF16 output of ``rows * heads * 512`` elements.
+            enable_pdl: Launch with programmatic dependent launch.
+
+        Returns:
+            BF16 ``[rows, heads, 512]``, or ``out`` when given.
+        """
+        del max_seqlen_k, kv_seq_lens
+        heads = q.shape[-2]
+        rows = q.numel() // (heads * _SPARSE_CORE_ROW)
+        if rows not in SPARSE_CORE_SPLIT_BY_ROWS:
+            raise ValueError(f"the CuTe DSL sparse core does not take {rows} rows")
+        if (
+            kv_cache is None
+            or sparse_kv_cache is not None
+            or logit_cap != 0.0
+            or return_lse
+            or q_len_per_req != _SPARSE_CORE_Q_LEN
+            or (kv_lora_rank, qk_rope_head_dim, page_size) != (512, 64, 64)
+            or qk_nope_head_dim not in (128, 192)
+        ):
+            raise ValueError("unsupported CuTe DSL sparse core call")
+        if q.shape[-1] != _SPARSE_CORE_ROW or not 1 <= heads <= _SPARSE_CORE_HEADS:
+            raise ValueError(f"unsupported query shape {tuple(q.shape)}")
+        if kv_cache.dtype != torch.float8_e4m3fn or not kv_cache.is_contiguous():
+            raise ValueError("the KV cache must be contiguous E4M3 rows")
+        if topk_slots.shape != (rows, topk_slots.shape[-1]) or not (
+            topk_slots.dtype == torch.int32 and topk_slots.is_contiguous()
+        ):
+            raise ValueError("topk_slots must be contiguous INT32 [rows, topk]")
+        if topk_lens is not None and (
+            topk_lens.shape != (rows,) or topk_lens.dtype != torch.int32
+        ):
+            raise ValueError("topk_lens must be INT32 [rows]")
+        query = q.reshape(rows, heads, _SPARSE_CORE_ROW)
+        if out is None:
+            output = q.new_empty(
+                (rows, heads, _SPARSE_CORE_LATENT), dtype=torch.bfloat16
+            )
+        elif (
+            out.dtype != torch.bfloat16
+            or out.numel() != rows * heads * _SPARSE_CORE_LATENT
+            or not out.is_contiguous()
+        ):
+            raise ValueError("out must be contiguous BF16 with rows * heads * 512")
+        else:
+            output = out.view(rows, heads, _SPARSE_CORE_LATENT)
+        _sparse_core.sparse_mla_decode(
+            query.contiguous(),
+            kv_cache,
+            topk_slots,
+            None if topk_lens is None else topk_lens.contiguous(),
+            output,
+            float(softmax_scale) * float(k_scale),
+            split=SPARSE_CORE_SPLIT_BY_ROWS[rows],
+            pdl=enable_pdl,
+        )
+        return output if out is None else out

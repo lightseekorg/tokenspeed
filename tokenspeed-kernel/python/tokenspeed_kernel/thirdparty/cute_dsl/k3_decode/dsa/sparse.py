@@ -193,9 +193,9 @@ class SparseMlaDecode:
     columns s / ``split``.
     """
 
-    def __init__(self, heads, split, has_lens):
+    def __init__(self, heads, split, has_lens, pdl):
         assert 1 <= heads <= HEADS and split in (1, 2, 4, 8)
-        self.heads, self.split, self.has_lens = heads, split, has_lens
+        self.heads, self.split, self.has_lens, self.pdl = heads, split, has_lens, pdl
         self.cols = LATENT // split
 
     @cute.jit
@@ -219,6 +219,7 @@ class SparseMlaDecode:
             (self.split, rows, 1),
             THREADS,
             cluster=(self.split, 1, 1),
+            pdl=self.pdl,
         )
 
     @cute.kernel
@@ -543,7 +544,7 @@ class SparseMlaDecode:
 
 
 @cache
-def compile_sparse_mla(heads, split, has_lens, device_index):
+def compile_sparse_mla(heads, split, has_lens, pdl, device_index):
     """Compile SparseMlaDecode for runtime row, slot-width and cache-row counts."""
     rows = cute.sym_int()
     query = fake((rows, heads, ROW), None, torch.uint8)
@@ -551,7 +552,7 @@ def compile_sparse_mla(heads, split, has_lens, device_index):
     slots = fake((cute.sym_int(),), (1,), torch.int32, 4)
     lens = fake((cute.sym_int(),), (1,), torch.int32, 4)
     out = fake((rows, heads, LATENT))
-    kernel = SparseMlaDecode(heads, split, has_lens)
+    kernel = SparseMlaDecode(heads, split, has_lens, pdl)
     arch = architecture(torch.device("cuda", device_index))
     with torch.accelerator.device_index(device_index):
         return cute.compile(
@@ -570,7 +571,7 @@ def compile_sparse_mla(heads, split, has_lens, device_index):
         )
 
 
-def sparse_mla_decode(query, kv, slots, lens, out, softmax_scale, *, split):
+def sparse_mla_decode(query, kv, slots, lens, out, softmax_scale, *, split, pdl):
     """Attend each query row over its live selected cache rows.
 
     ``out[r, h] = softmax(query[r, h] . K[s]) V[s]`` over the live slots s of row r.
@@ -583,12 +584,13 @@ def sparse_mla_decode(query, kv, slots, lens, out, softmax_scale, *, split):
         out: BF16 [rows, heads, 512], contiguous.
         softmax_scale: Logit scale, including any key scale.
         split: CTAs per row (a cluster).
+        pdl: Launch with programmatic dependent launch.
 
     Returns:
         ``out``. Rows without live slots come out zero.
     """
     rows, heads, _ = query.shape
-    code = compile_sparse_mla(heads, split, lens is not None, query.device.index)
+    code = compile_sparse_mla(heads, split, lens is not None, pdl, query.device.index)
     code(
         to_cute(query.view(torch.uint8)),
         to_cute(kv.view(-1, ROW).view(torch.uint8)),

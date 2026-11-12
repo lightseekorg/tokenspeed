@@ -60,12 +60,20 @@ repo root:
 python -m pytest tokenspeed-kernel/test/nvidia/ops/test_dsa_flashinfer_prims.py
 ```
 
-## CuTe DSL sparse MLA decode (prototype)
+## CuTe DSL sparse MLA decode
 
 `thirdparty/cute_dsl/k3_decode/dsa/sparse.py` attends E4M3 queries of 1 to 16
 local heads over selected native E4M3 D576 cache rows on SM100/SM103. It
 targets the Kimi-K3.1 TP8 verify shape: 12 heads and eight rows per request.
-It is not registered as a `dsa_decode` solution yet.
+
+`cute_dsl_dsa_decode` registers it for `dsa_decode` above trtllm-gen, but only
+for one or four requests of eight verify rows (8 and 32 rows), the row counts
+where it is faster at every measured context; `SPARSE_CORE_SPLIT_BY_ROWS`
+names them with the CTAs per row each runs. The leaf declares the facade's
+`batch` trait, a shape trait that a request must state, and the measured
+geometry (12 local heads, 128 NoPE channels), so every other row count, LSE
+call, head count, BF16 query, or batch-invariant plan selects trtllm-gen or
+another leaf, never this one.
 
 - A cluster of `split` CTAs serves one query row. CTA `s` takes the live slots
   `s`, `s + split`, and so on, in passes of up to 128 keys. Two warpgroups

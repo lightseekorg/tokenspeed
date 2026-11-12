@@ -596,7 +596,10 @@ def dsa_decode(
         batch_size = tokens // q_len
 
     traits = {
+        # Requests per call: a core declaring it serves only those row counts.
+        "batch": int(batch_size),
         "q_len": int(q_len_per_req),
+        "num_heads": int(num_heads),
         "qk_nope_head_dim": int(qk_nope_head_dim),
         "kv_lora_rank": int(kv_lora_rank),
         "qk_rope_head_dim": int(qk_rope_head_dim),
