@@ -548,6 +548,8 @@ class ServerArgs:
 
     # Dense GEMM selection is independent of routed-expert kernels.
     dense_gemm_backend: str = "auto"
+    # Online W8A8 for Qwen3.5/Qwen4-Exp attention projections only.
+    enable_fp8_attn_proj: bool = False
 
     # MoE backend
     moe_backend: str = "auto"
@@ -806,6 +808,7 @@ class ServerArgs:
     tp_batch_invariant: Literal["none", "attn", "attn+dense"] = "none"
     dense_tp_size: int | None = None
     moe_tp_size: int | None = None
+    moe_weight_sharing_size: int | None = None
     mapping: Mapping | None = None
     emulate_rank_zero: bool = False
 
@@ -1315,6 +1318,7 @@ class ServerArgs:
             moe_tp_size=moe_tp_size,
             moe_ep_size=moe_ep_size,
             moe_dp_size=moe_dp_size,
+            moe_weight_sharing_size=self.moe_weight_sharing_size,
             vision_tp_size=vision_tp_size,
             vision_dp_size=vision_dp_size,
             pp_size=pp_size,
@@ -1324,6 +1328,34 @@ class ServerArgs:
             base_gpu_id=self.base_gpu_id,
             gpu_id_step=self.gpu_id_step,
         )
+
+        if self.moe_weight_sharing_size is not None:
+            if self.load_format not in ("auto", "safetensors"):
+                raise ValueError(
+                    "Peer expert weights require auto or safetensors checkpoint loading"
+                )
+            if self.enable_memory_saver:
+                raise ValueError("Peer expert weights do not support memory saver")
+            if self.disaggregation_mode != "prefill":
+                raise ValueError(
+                    "Peer expert weights currently require a prefill instance"
+                )
+            if self.prefill_graph_max_tokens != 0 or not self.enforce_eager:
+                raise ValueError(
+                    "Peer expert weights require --prefill-graph-max-tokens 0 and --enforce-eager"
+                )
+            if self.mapping.requires_forward_coordination:
+                raise ValueError(
+                    "Peer expert weights require fully local execution groups"
+                )
+            if self.kvstore_storage_backend is not None:
+                raise ValueError(
+                    "Peer expert weights do not support shared L3 cache control"
+                )
+            if self.enable_eplb:
+                raise ValueError(
+                    "Peer expert weights are immutable and do not support expert rebalancing"
+                )
 
         # Impl constraints:
         if self.deepseek_v41_attention_query_swa_min_tokens < 1:
@@ -2881,8 +2913,7 @@ class ServerArgs:
             nargs="?",
             metavar="model",
             default=None,
-            help="The model name or path (positional argument). "
-            "Equivalent to --model.",
+            help="The model name or path (positional argument). Equivalent to --model.",
         )
         parser.add_argument(
             "--model",
@@ -3648,6 +3679,14 @@ class ServerArgs:
             "Fewer layers per chunk bound the per-round stall.",
         )
         parser.add_argument(
+            "--enable-fp8-attn-proj",
+            action="store_true",
+            default=ServerArgs.enable_fp8_attn_proj,
+            help="Use online block-FP8 QKV/O and GDN QKVZ/output projections "
+            "in the Qwen3.5/Qwen4-Exp target model. GDN BA uses floating precision "
+            "and MTP draft projections follow the checkpoint.",
+        )
+        parser.add_argument(
             "--dense-gemm-backend",
             type=str,
             default=ServerArgs.dense_gemm_backend,
@@ -3656,7 +3695,8 @@ class ServerArgs:
             "auto prefers compatible CuTe-DSL on Blackwell at M > 16 GEMM rows. "
             "trtllm_cutedsl requires Blackwell and preserves checkpoint FP8 "
             "weights and FP32 scales without requantization. "
-            "deepgemm requires Hopper and preserves FP32 scales. "
+            "deepgemm preserves FP32 scales on Hopper; SM100/SM103 use "
+            "UE8M0 weight requantization and packed activation scales. "
             "Other quantization formats and routed experts are unchanged.",
         )
         parser.add_argument(
@@ -4627,6 +4667,14 @@ class ServerArgs:
             help="Specify tp size for dense part. Defaults to the attention "
             "TP width: the full world without DP attention, one replica with "
             "it.",
+        )
+        parser.add_argument(
+            "--moe-weight-sharing-size",
+            type=int,
+            default=ServerArgs.moe_weight_sharing_size,
+            help="Share immutable expert weights across this many workers while executing "
+            "each batch locally (DWDP). Omission keeps resident weights. Requires "
+            "prefill, TP1/EP1 compute, and disabled model CUDA graphs.",
         )
         parser.add_argument(
             "--moe-tp-size",

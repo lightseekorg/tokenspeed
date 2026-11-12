@@ -68,6 +68,7 @@ from tokenspeed_scheduler import Scheduler
 from tokenspeed.runtime.cache.l3.config import L3Settings
 from tokenspeed.runtime.cache.l3.factory import l3_settings
 from tokenspeed.runtime.configs.model_profile import resolve_history_seed_lookback
+from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.distributed.nccl_suspend import nccl_suspend_supported
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -403,6 +404,24 @@ class EplbSettings:
     ep_ranks: tuple[int, ...]
 
 
+def dp_coordination_ranks(
+    mapping: Mapping, *, requires_forward_coordination: bool, shared_l3: bool
+) -> tuple[int, ...] | None:
+    """The ranks the control plane keeps in step each round, or None.
+
+    Attention-DP workers whose forwards span workers gather per-round DP
+    metadata and run idle forwards for peers with work; workers that share a
+    Mooncake namespace agree their flushes. Workers that only share immutable
+    expert weights do neither: they keep their DP rank for routing and advance
+    independently.
+    """
+    if not mapping.has_attn_dp:
+        return None
+    if not (requires_forward_coordination or shared_l3):
+        return None
+    return tuple(mapping.world_group)
+
+
 @dataclass(frozen=True)
 class HostConfig:
     """What the host's control plane is configured from.
@@ -440,7 +459,9 @@ class HostConfig:
             the frontend.
         pp_ranks: With pipeline parallelism, this rank's pipeline, in stage
             order; the last stage samples. None without.
-        dp_ranks: With attention DP, every rank: their forwards run in step.
+        dp_ranks: The ranks whose rounds the control plane keeps in step:
+            with attention DP, every rank, when forwards span workers or a
+            shared L3 namespace needs agreed flushes (``dp_coordination_ranks``).
             None without.
         collective_bind_host: Where the rank listens for the other ranks'
             collective connections.
@@ -664,8 +685,12 @@ class HostDataPlane:
 
     def exit_forward_thread(self) -> None:
         """The forward thread's last call, once nothing more is queued:
-        finish a drafter's pending round before the caches close."""
-        self._device.settle()
+        finish a drafter's pending round, then release the expert weights
+        this rank shares with other ranks, before the caches close."""
+        try:
+            self._device.settle()
+        finally:
+            self._device.shutdown_model()
 
     def admit(
         self,
@@ -1117,6 +1142,7 @@ class HostBootstrap:
         port_args: PortArgs,
         connection: Connection,
         pd_outbox,
+        host_spans,
         metrics_relay_endpoint: str | None,
     ) -> None:
         self._server_args = server_args
@@ -1377,7 +1403,11 @@ class HostBootstrap:
                     )
                 ),
                 pp_ranks=tuple(mapping.pp_group) if mapping.has_pp else None,
-                dp_ranks=tuple(mapping.world_group) if mapping.has_attn_dp else None,
+                dp_ranks=dp_coordination_ranks(
+                    mapping,
+                    requires_forward_coordination=specs.requires_forward_coordination,
+                    shared_l3=l3 is not None,
+                ),
                 # One node's ranks reach each other on loopback.
                 collective_bind_host="127.0.0.1" if mapping.nnodes == 1 else "0.0.0.0",
                 multimodal=model_config.is_multimodal_active,
@@ -1490,6 +1520,7 @@ class HostBootstrap:
                             else mapping.attn.tp_group
                         ),
                     ),
+                    host_spans=host_spans,
                 ),
                 regions,
                 report_compiles=self.config.engine_metrics,
@@ -1589,12 +1620,17 @@ class HostBootstrap:
 
 
 def bootstrap(
-    control_fd: int, pd_outbox, weight_update_commit_protocol: int = 0
+    control_fd: int,
+    pd_outbox,
+    weight_update_commit_protocol: int = 0,
+    host_spans=None,
 ) -> HostBootstrap | EncodeBootstrap:
     """Build this host's rank from the arguments the launcher sends on
     ``control_fd``; with PD, its transfer peer reaches the host through
     ``pd_outbox`` (see ``pd/host_peer.py``). An EPD encode rank runs the
-    host's encode mode instead (``epd/encode_host.py``)."""
+    host's encode mode instead (``epd/encode_host.py``). ``host_spans`` is
+    the host's span recording, which a profile merges into its trace
+    (``engine/profiler.py``); an older host binary passes none."""
     connection = Connection(control_fd)
     server_args, port_args, metrics_relay_endpoint = connection.recv()
     # Reject an older host binary before constructing a model or process
@@ -1610,7 +1646,12 @@ def bootstrap(
     if server_args.disaggregation_mode == "encode":
         return EncodeBootstrap(server_args, port_args, connection)
     return HostBootstrap(
-        server_args, port_args, connection, pd_outbox, metrics_relay_endpoint
+        server_args,
+        port_args,
+        connection,
+        pd_outbox,
+        host_spans,
+        metrics_relay_endpoint,
     )
 
 

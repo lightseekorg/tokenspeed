@@ -26,6 +26,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.models import kimi_k3_comm as mod
 
 
@@ -228,7 +229,9 @@ def test_routed_implementations_use_same_second_stage(monkeypatch, enabled, defe
 def test_up_proj_inject_ar_selects_collective(monkeypatch, m, use_multimem):
     comm = _comm(enabled=False, capacity=16384, deferred=False)
     comm.hidden_size = 16
-    comm.mapping = SimpleNamespace(moe=SimpleNamespace(tp_ep_group=tuple(range(8))))
+    comm.mapping = Mapping(
+        rank=0, world_size=8, attn_tp_size=8, moe_tp_size=8, moe_ep_size=1
+    )
     comm.up_proj = SimpleNamespace(
         shard_slice=(4, 2), weight=torch.full((2, 3), 2, dtype=torch.bfloat16)
     )

@@ -27,7 +27,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ts_scheduler::{ForwardBatchView, ForwardEvent, ForwardEventKind, SchedulerAbortView};
+use ts_scheduler::{profile, ForwardBatchView, ForwardEvent, ForwardEventKind, SchedulerAbortView};
 
 use ts_wire::output::FinishDetails;
 
@@ -1230,6 +1230,7 @@ impl OutputProcessor {
         input_logprobs: Option<&InputLogprobPlan>,
         result: &ForwardResult,
     ) -> Result<Committed, CommitError> {
+        let _span = profile::span("OutputProcessor::commit");
         let rows = batch.request_ids.len();
         let check = |column, found| {
             if found == rows {

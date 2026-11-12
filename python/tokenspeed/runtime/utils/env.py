@@ -28,6 +28,8 @@ from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 global_server_args_dict: dict = {
+    "model": None,
+    "revision": None,
     "disaggregation_mode": ServerArgs.disaggregation_mode,
     "attention_backend": ServerArgs.attention_backend,
     "sampling_backend": ServerArgs.sampling_backend,
@@ -81,6 +83,7 @@ global_server_args_dict: dict = {
     "moe_cutlass_fused_finalize": ServerArgs.moe_cutlass_fused_finalize,
     "moe_mxfp4_fp8_activation": ServerArgs.moe_mxfp4_fp8_activation,
     "dense_gemm_backend": ServerArgs.dense_gemm_backend,
+    "enable_fp8_attn_proj": ServerArgs.enable_fp8_attn_proj,
     "enforce_eager": ServerArgs.enforce_eager,
     "max_cudagraph_capture_size": ServerArgs.max_cudagraph_capture_size,
     "cudagraph_capture_sizes": ServerArgs.cudagraph_capture_sizes,
@@ -96,6 +99,8 @@ def global_server_args_dict_update(server_args: ServerArgs):
     pdl_enabled(not server_args.disable_pdl)
     global_server_args_dict.update(
         {
+            "model": server_args.model,
+            "revision": server_args.revision,
             "disaggregation_mode": server_args.disaggregation_mode,
             "attention_backend": server_args.attention_backend,
             "sampling_backend": server_args.sampling_backend,
@@ -151,6 +156,7 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "moe_cutlass_fused_finalize": server_args.moe_cutlass_fused_finalize,
             "moe_mxfp4_fp8_activation": server_args.moe_mxfp4_fp8_activation,
             "dense_gemm_backend": server_args.dense_gemm_backend,
+            "enable_fp8_attn_proj": server_args.enable_fp8_attn_proj,
             "enforce_eager": server_args.enforce_eager,
             "max_cudagraph_capture_size": server_args.max_cudagraph_capture_size,
             "cudagraph_capture_sizes": server_args.cudagraph_capture_sizes,

@@ -866,7 +866,7 @@ class ModelExecutor:
         if not self.sampling_backend.supports_tree_verify:
             raise NotImplementedError(
                 f"{type(self.sampling_backend).__name__} cannot verify draft trees; "
-                "use --sampling-backend greedy, triton or flashinfer"
+                "use --sampling-backend greedy, triton, flashinfer or sonic"
             )
         if self.draft_attn_backend is self.attn_backend:
             raise NotImplementedError(
@@ -1584,6 +1584,7 @@ class ModelExecutor:
                 ctx,
                 input_ids,
                 self._active_multimodal_context,
+                request_token_history=model_kwargs.get("request_token_history"),
             )
         if (
             mode is not None
@@ -2789,17 +2790,10 @@ class ModelExecutor:
                     output_layout=output_layout,
                     query_shard=query_shard,
                 )
-                if self.config.data_parallel_size > 1:
-                    if dp_metadata is None:
-                        raise RuntimeError(
-                            "DP forward metadata must be gathered on CPU by "
-                            "the event loop before model execution."
-                        )
-                    ctx.global_num_tokens = dp_metadata.global_num_tokens
-                    ctx.global_bs = dp_metadata.global_batch_size
-                    ctx.global_num_decodes = dp_metadata.global_num_decodes
-                    ctx.all_decode_or_idle = dp_metadata.all_decode_or_idle
-                    ctx.all_extend = dp_metadata.all_extend
+                ctx.apply_dp_metadata(
+                    dp_metadata,
+                    required=self.model_runner.mapping.requires_forward_coordination,
+                )
                 with nvtx_range("sampling_prep", color="yellow"):
                     sampling_start = time.perf_counter() if timing_enabled else 0.0
                     sampling_info = self._build_sampling_info(bs, num_extends)

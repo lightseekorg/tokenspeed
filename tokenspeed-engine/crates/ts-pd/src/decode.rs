@@ -31,8 +31,6 @@
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
-    fs::File,
-    io::Read,
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc, Arc, Mutex, MutexGuard,
@@ -65,13 +63,6 @@ const SOCKET_POLL: Duration = Duration::from_millis(100);
 
 /// How long a bootstrap-server lookup may take.
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// A fresh cache must never inherit the identity of a reused transport address.
-fn new_cache_id() -> std::io::Result<String> {
-    let mut random = [0u8; 16];
-    File::open("/dev/urandom")?.read_exact(&mut random)?;
-    Ok(format!("{:032x}", u128::from_be_bytes(random)))
-}
 
 /// A Decode rank's settings.
 #[derive(Debug, Clone)]
@@ -147,7 +138,7 @@ struct State {
     /// Bootstrap address -> the rooms reading from it.
     addr_rooms: HashMap<String, HashSet<u64>>,
     /// Bootstrap address -> its route; the addresses the heartbeat watches.
-    routes: HashMap<String, Arc<PrefillRoute>>,
+    routes: HashMap<String, (Option<String>, Arc<PrefillRoute>)>,
     connections: HashMap<ConnectionKey, Arc<Vec<Target>>>,
 }
 
@@ -415,11 +406,8 @@ impl Shared {
         }
     }
 
-    /// The route for `addr`, fetched and planned once.
+    /// Revalidate before attaching a new room: a healthy address may be a new P.
     fn route(&self, addr: &str) -> Result<Arc<PrefillRoute>, String> {
-        if let Some(route) = self.state().routes.get(addr).cloned() {
-            return Ok(route);
-        }
         let info = http::get_text(
             &format!("http://{addr}/route?engine_rank=-1&target_dp_group=-1"),
             LOOKUP_TIMEOUT,
@@ -428,10 +416,29 @@ impl Shared {
             tracing::error!(addr, error, "cannot fetch the prefill parallel info");
             format!("Could not fetch prefill parallel info from bootstrap_addr: {addr}")
         })?;
+        let description: serde_json::Value = serde_json::from_str(&info)
+            .map_err(|error| format!("invalid prefill route: {error}"))?;
+        let version = description["route_version"].as_str().map(str::to_owned);
+        {
+            let state = self.state();
+            if let Some((known_version, route)) = state.routes.get(addr) {
+                if version.is_some() && *known_version == version {
+                    return Ok(route.clone());
+                }
+            }
+        }
         let route = Arc::new(
             plan_route(&info, &self.layout, self.tp_size, self.tp_rank).map_err(|error| error.0)?,
         );
-        self.state().routes.insert(addr.to_owned(), route.clone());
+        let mut state = self.state();
+        // Existing rooms retain their targets and retirement fences. Only new
+        // rooms resolve the replacement ranks and register with them again.
+        state
+            .connections
+            .retain(|(connected, _, _), _| connected != addr);
+        state
+            .routes
+            .insert(addr.to_owned(), (version, route.clone()));
         Ok(route)
     }
 
@@ -615,7 +622,7 @@ impl DecodeOutbox {
     /// identity. The next request registers this incarnation even when the
     /// engine reuses an earlier transport address.
     pub fn restore_registration(&self) -> Result<(), String> {
-        let cache_id = new_cache_id()
+        let cache_id = crate::new_instance_id()
             .map_err(StartError::CacheIdentity)
             .map_err(|error| error.to_string())?;
         let mut state = self.shared.state();
@@ -759,7 +766,7 @@ impl DecodePeer {
     /// socket and start the threads.
     pub fn start(config: DecodeConfig) -> Result<(Self, DecodeOutbox), StartError> {
         let layout = Contract::from_wire(&config.layout)?;
-        let cache_id = new_cache_id().map_err(StartError::CacheIdentity)?;
+        let cache_id = crate::new_instance_id().map_err(StartError::CacheIdentity)?;
         let (incoming, messages) = mpsc::channel::<Vec<bytes::Bytes>>();
         let transport = Transport::start(&config.peer, incoming)?;
         let shared = Arc::new(Shared {

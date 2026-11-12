@@ -1450,6 +1450,7 @@ name = "tokenspeed-host"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "libc",
  "mimalloc",
  "pyo3",
  "rustix",

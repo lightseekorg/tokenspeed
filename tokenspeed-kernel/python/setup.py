@@ -76,7 +76,7 @@ from setuptools.command.editable_wheel import editable_wheel
 ROOT = Path(__file__).resolve().parent
 REQUIREMENTS_DIR = ROOT / "requirements"
 THIRDPARTY_DIR = ROOT / "tokenspeed_kernel" / "thirdparty"
-BASE_VERSION = "0.1.4"
+BASE_VERSION = "0.1.5"
 BACKEND_ENV = "TOKENSPEED_KERNEL_BACKEND"
 VALID_BACKENDS = {"cuda", "rocm", "npu"}
 DEFAULT_CUDA_ARCHS = ("100a", "103a")
@@ -155,11 +155,10 @@ def _git_branch() -> str:
 def _nightly_release_candidate() -> str:
     """Return the release-candidate part of a manual nightly's version, or "".
 
-    TOKENSPEED_KERNEL_RELEASE_CANDIDATE=N (or rcN) builds 0.1.4rcN.post20261108
-    instead of that date's nightly 0.1.4.post20261108. A release candidate sorts
-    below every 0.1.4 nightly, so it neither collides with the scheduled nightly
-    of its date nor shadows a nightly of its release: an install that such a
-    nightly satisfies still gets the nightly.
+    TOKENSPEED_KERNEL_RELEASE_CANDIDATE=N (or rcN) adds rcN before the nightly's
+    date suffix. A release candidate sorts below every nightly with the same
+    base version, so it neither collides with the scheduled nightly of its date
+    nor shadows a nightly that satisfies the install.
 
     Raises:
         ValueError: If the value is set but is not a release-candidate number.
