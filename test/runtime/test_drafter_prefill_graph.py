@@ -435,6 +435,16 @@ def test_a_pure_extend_replays_the_smallest_fitting_bucket(monkeypatch) -> None:
     assert single._extend_graph_route(3, extend_input(single, [1, 1, 1])) is None
 
 
+def test_a_step_0_count_past_the_decode_steps_runs_them_eager(monkeypatch) -> None:
+    # With the decode steps recorded up to 2 requests, a step-0 graph at 3 replays step 0 alone.
+    monkeypatch.setattr(eagle_module, "EXTEND_DECODE_MAX_REQUESTS", 2)
+    drafter = _captured(monkeypatch, [16], lambda _bucket: [1, 2, 3])
+
+    assert sorted(drafter._decode_steps_graphs) == [1, 2]
+    route = drafter._extend_graph_route(3, extend_input(drafter, [2, 2, 2]))
+    assert route == eagle_module._ExtendRoute((16, 3), False)
+
+
 def test_rounds_a_graph_did_not_bake_run_eager(monkeypatch) -> None:
     drafter = _captured(monkeypatch, [16, 32], lambda _bucket: [1, 2])
 

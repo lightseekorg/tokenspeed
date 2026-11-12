@@ -248,6 +248,38 @@ def test_the_decode_steps_replay_without_a_step_0_graph() -> None:
             assert torch.equal(graphed_backend.cache[1:], eager_backend.cache[1:])
 
 
+def test_a_replayed_step_0_feeds_eager_decode_steps_past_their_ladder(
+    monkeypatch,
+) -> None:
+    """A step-0 graph at a request count past the decode steps' ladder hands
+    its proposals and hidden rows to eager decode steps through the static
+    buffers, and the round leaves the verify window and draft cache the eager
+    round does."""
+    monkeypatch.setattr(eagle_module, "EXTEND_DECODE_MAX_REQUESTS", 2)
+    generator = torch.Generator().manual_seed(3)
+    graphed, graphed_backend = make_eagle(device="cuda")
+    eager, eager_backend = make_eagle(device="cuda")
+    _capture(graphed, graphed_backend, [16], lambda _bucket: [1, 2, 3])
+    lengths, prefixes = [5, 2, 6], [0, 40, 9]
+    inputs = _inputs(lengths, generator)
+    with torch.inference_mode():
+        prepare_extend(
+            graphed, graphed_backend, lengths, prefixes, final=True, ids=inputs[0]
+        )
+        route = graphed._extend_graph_route(
+            len(lengths), extend_input(graphed, lengths, hidden=inputs[2])
+        )
+        assert route == eagle_module._ExtendRoute((16, 3), False)
+        window, forwards = _round(
+            graphed, graphed_backend, lengths, prefixes, True, inputs
+        )
+        want, _ = _round(eager, eager_backend, lengths, prefixes, True, inputs)
+    # The decode steps alone run eager.
+    assert forwards == STEPS - 1
+    assert torch.equal(window, want)
+    assert torch.equal(graphed_backend.cache[1:], eager_backend.cache[1:])
+
+
 def test_a_publication_recorded_into_the_graph_diverges_from_eager(
     monkeypatch,
 ) -> None:

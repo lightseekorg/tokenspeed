@@ -61,7 +61,7 @@ if TYPE_CHECKING:
 # CUDA-graph memory projection series of a drafter's extend-round graphs: step 0 (--enable-drafter-prefill-graph) and the decode steps.
 EXTEND_STEP0_SERIES = "prefill:drafter-step0"
 EXTEND_DECODE_SERIES = "prefill:drafter-decode"
-# Most request counts an extend round's decode steps are recorded at: rounds admit a few requests each, and a larger one runs them eager.
+# The largest request count an extend round's decode steps are recorded at: rounds admit a few requests each, and a round with more runs them eager.
 EXTEND_DECODE_MAX_REQUESTS = 16
 
 

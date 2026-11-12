@@ -192,7 +192,6 @@ class Eagle(HiddenStateDrafter):
         # For constructing fallback global_num_tokens during CUDA graph capture.
         self.dp_size = draft_model_runner.mapping.attn.dp_size
         self.world_size = draft_model_runner.mapping.world_size
-        self.pp_size = draft_model_runner.mapping.pp_size
 
         # Draft-side request-token history (e.g. a draft with its own n-gram
         # over-embedding). The drafter owns the per-slot write frontier: it
@@ -891,7 +890,7 @@ class Eagle(HiddenStateDrafter):
             and not self.draft_reads_token_history
             and not self._model_shares_mtp_topk()
             and self.dp_size == 1
-            and self.pp_size == 1
+            and self.draft_model_runner.mapping.pp_size == 1
         )
 
     def _extend_graphs_supported(self) -> bool:

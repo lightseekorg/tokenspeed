@@ -64,7 +64,7 @@ def probe_arena_parent_blocks(
     context_len: int,
     capture_batch_sizes: Sequence[int] | None,
     decoder_requests: int,
-    drafter_requests: int = 0,
+    drafter_requests: int,
 ) -> int:
     """The parent-block floor a probe arena has to clear.
 

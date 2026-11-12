@@ -294,6 +294,7 @@ def test_the_floor_is_the_widest_row_count_the_probe_fabricates(
         context_len=context,
         capture_batch_sizes=capture_batch_sizes,
         decoder_requests=0,
+        drafter_requests=0,
     )
     assert floor == expected
     widest = max(

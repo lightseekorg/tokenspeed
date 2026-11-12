@@ -1131,9 +1131,9 @@ class ModelExecutor:
         Only with the target's prefill graph on and a drafter that can capture
         them in this configuration. The decode steps' graphs are recorded at
         each request count from 1 to ``EXTEND_DECODE_MAX_REQUESTS`` (at most
-        the batch); step 0's
-        (``--enable-drafter-prefill-graph``) share the target's token buckets
-        and capture each at the bucket's exact request counts
+        the batch); the step-0 graphs (``--enable-drafter-prefill-graph``)
+        share the target's token buckets and are captured at the bucket's
+        exact request counts
         (``--prefill-graph-capture-batch-sizes``, unset: the fewest requests
         that fit the bucket in the context length). The capture and the
         projection read this one plan, so they reach the same verdict.
