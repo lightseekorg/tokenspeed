@@ -211,8 +211,11 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
 
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        # The freed tensors belong to the active device, which is not CUDA on
+        # an NPU; `torch.cuda` raises there.
+        device_module = torch.get_device_module()
+        device_module.empty_cache()
+        device_module.synchronize()
 
     def set_embed_and_head_module(
         self, embed: torch.Tensor, lm_head: nn.Module
@@ -220,8 +223,9 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
         del self.model.embed_tokens.weight
         self.model.embed_tokens.weight = embed
         self.lm_head = lm_head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        device_module = torch.get_device_module()
+        device_module.empty_cache()
+        device_module.synchronize()
 
     @torch.no_grad()
     def forward(

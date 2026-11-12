@@ -38,6 +38,9 @@ def apply_rope(
     k_rope_out: torch.Tensor | None = None,
 ) -> None:
     """Apply RoPE to Q and K, writing into outputs or the inputs in place."""
+    # ``npu_mrope`` indexes its cache with int64 positions only; the runtime
+    # hands over int32 on some paths (the MTP draft's decode step does).
+    positions = positions.to(torch.int64)
     q_out, k_out = torch_npu.npu_mrope(
         positions,
         q,

@@ -329,7 +329,9 @@ class GemmaRMSNorm(torch.nn.Module):
         tuple[torch.Tensor, torch.Tensor] | None,
         torch.Tensor,
     ]:
-        if _is_amd:
+        if _is_amd or _platform.is_npu:
+            # Neither platform has the fused FP8/FP4 add-norm kernel; the plain
+            # norm keeps the same values.
             x, residual = self(x, residual)
             return x, None, None, residual
         # The NVFP4 linear's prequantized path returns BF16 whatever the model dtype.

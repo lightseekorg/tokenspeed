@@ -63,7 +63,6 @@ def _paged_rows(
 
 
 def test_mha_prefill() -> None:
-    lengths = [3, 5]
     cumulative = torch.tensor([0, 3, 8], dtype=torch.int32, device="npu")
     q = torch.randn(8, 4, 64, dtype=torch.bfloat16, device="npu")
     k = torch.randn(8, 2, 64, dtype=torch.bfloat16, device="npu")
@@ -176,6 +175,103 @@ def test_mha_decode_with_paged_cache() -> None:
     )
 
     torch.testing.assert_close(output, expected, atol=2e-2, rtol=2e-2)
+
+
+def test_mha_decode_verify_window() -> None:
+    """A multi-query decode call is a verify window, not plain decode.
+
+    Each request packs ``q_len`` rows that continue the cached prefix, so row
+    ``t`` attends causally through its own position: the last row sees the
+    whole cache and the first sees ``seq_len - q_len + 1`` keys. FIA aligns a
+    window at the start unless given a mask, so this pins the right-aligned
+    span a speculative verify needs.
+    """
+    page_size = 128
+    q_len = 4
+    q = torch.randn(2 * q_len, 4, 64, dtype=torch.bfloat16, device="npu")
+    k_cache = torch.randn(4, page_size, 2, 64, dtype=torch.bfloat16, device="npu")
+    v_cache = torch.randn_like(k_cache)
+    page_table = torch.tensor([[0, 0], [1, 2]], dtype=torch.int32, device="npu")
+    cache_lengths = torch.tensor([6, 70], dtype=torch.int32, device="npu")
+
+    output = mha_decode_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        cache_lengths,
+        max_seqlen_k=128,
+        max_seqlen_q=q_len,
+    )
+    assert output.shape == q.shape
+
+    expected = torch.cat(
+        [
+            _attention(
+                q[batch * q_len : (batch + 1) * q_len],
+                _paged_rows(k_cache, page_table, batch, int(length)),
+                _paged_rows(v_cache, page_table, batch, int(length)),
+                causal=True,
+            )
+            for batch, length in enumerate(cache_lengths)
+        ]
+    )
+
+    torch.testing.assert_close(output, expected, atol=2e-2, rtol=2e-2)
+
+
+def test_mha_decode_verify_window_npugraph_updates_sequence_lengths() -> None:
+    """A captured verify window replays with refreshed cache lengths."""
+    page_size = 128
+    q_len = 4
+    q = torch.randn(2 * q_len, 4, 64, dtype=torch.bfloat16, device="npu")
+    k_cache = torch.randn(4, page_size, 2, 64, dtype=torch.bfloat16, device="npu")
+    v_cache = torch.randn_like(k_cache)
+    page_table = torch.tensor([[0, 0], [1, 2]], dtype=torch.int32, device="npu")
+    capture_lengths = torch.full((2,), q_len, dtype=torch.int32, device="npu")
+
+    for _ in range(3):
+        mha_decode_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            page_table,
+            capture_lengths,
+            max_seqlen_k=128,
+            max_seqlen_q=q_len,
+        )
+    torch.npu.synchronize()
+
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph, stream=torch.npu.Stream(), auto_dispatch_capture=True):
+        output = mha_decode_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            page_table,
+            capture_lengths,
+            max_seqlen_k=128,
+            max_seqlen_q=q_len,
+        )
+    torch.npu.synchronize()
+
+    for lengths in ([6, 70], [12, 80]):
+        graph.update(cpu_update_input=[{"actual_seq_lengths_kv": lengths}])
+        graph.replay()
+        torch.npu.synchronize()
+
+        expected = torch.cat(
+            [
+                _attention(
+                    q[batch * q_len : (batch + 1) * q_len],
+                    _paged_rows(k_cache, page_table, batch, length),
+                    _paged_rows(v_cache, page_table, batch, length),
+                    causal=True,
+                )
+                for batch, length in enumerate(lengths)
+            ]
+        )
+        torch.testing.assert_close(output, expected, atol=2e-2, rtol=2e-2)
 
 
 def test_mha_decode_npugraph_updates_sequence_lengths() -> None:

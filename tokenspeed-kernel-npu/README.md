@@ -105,6 +105,60 @@ CPU scheduler lengths are passed directly, without a device length readback.
 MLA decode partial packing reuses its compiled kernel across changing batch
 sizes and preserves empty-shard masks during Graph replay.
 
+Paged MHA decode takes more than one query per request: a call with
+`max_seqlen_q = N` is a speculative verify window, where row `t` of a request
+attends causally through its own position, so the last row sees the whole
+cache and the first sees `seq_len - N + 1` keys. FIA needs a triangular mask
+and `sparse_mode=3` for that right-aligned span; without them it aligns the
+window at the start of the cache instead. The capture stub sets each length
+to at least `N`, since every window row must keep a non-empty causal span.
+MLA reaches the same window through the runtime's one-row-per-query path,
+which hands each row its own cache length.
+
+Linear-attention (GDN) prefill, decode and verify use CANN's native Gated
+Delta Rule operators, so Qwen3.5/3.6 hybrid layers run without a portable
+kernel. Four native properties shape the adaptation: `beta` is the activated
+coefficient (the sigmoid is applied here, as the Triton leaf does), the
+recurrence reads the state from `ssm_state_indices[0]` and writes token `t`'s
+resulting state to `ssm_state_indices[t]`, a negative `ssm_state_indices` entry
+faults the device instead of acting as padding, and the tiling rejects a state
+pool with fewer rows than the call has tokens. A verify therefore stages each
+verified position in its own row of the caller's `output_state` pool, and a
+padding row (`-1`) is redirected to the reserved null page, which is restored
+after the launch so it stays the zero state.
+
+The causal conv1d in front of each GDN layer uses `npu_fused_causal_conv1d`.
+Its window is fixed at three taps while Qwen3.5/3.6 use four, so the leaf keeps
+the native three and adds the oldest tap as a delayed read of the pool slot the
+op leaves untouched. Two further native limits are handled in the leaf rather
+than at the call sites: `activation` is accepted but never applied and `bias`
+is unsupported, both applied afterwards; `num_accepted_tokens` changes neither
+the output nor the state on Ascend 950PR, so a verify that must stop at a
+shorter accepted prefix has to run that prefix instead.
+
+Both decode and verify call the native ops from inside a captured ACL Graph,
+so the leaves keep every branch on the device. The conv leaf copies the
+committed window onto the write row unconditionally instead of comparing the
+two index vectors on the host, and the GDN leaf snapshots the null page before
+every launch instead of only when a padded row is present; a host `item()` or
+`torch.equal` would sync, which capture rejects.
+
+Chain MTP speculation is covered: `gdn_decode_mtp` writes each verified
+position's state into a row of the caller's verify scratch, and the runtime
+commits the accepted prefix by copying rows back, so no replay kernel is
+needed. Draft-tree verify is not: a tree names parents per node, which the
+native recurrent op cannot follow, so `tree=True` has no Ascend kernel and
+selection fails rather than running a wrong window. The same applies to
+ReplaySSM, whose `gdn_replay_commit` reads per-layer address tables no Ascend
+kernel consumes; `enable_replay_ssm` is a no-op here because its recipe gate
+also requires a CUDA device.
+
+Gemma RMSNorm folds `1 + weight` into the scale and runs the native RMSNorm
+op, which also covers `grouped_gemma_rmsnorm`'s one-group case. Grouped gated
+RMSNorm is composed from the native norm and elementwise math on a
+`[..., groups, group_size]` view: it serves any group size, but not the FP8
+output, so a static-FP8 consumer keeps selecting the portable solution.
+
 Run the operator correctness suite on a visible NPU with:
 
 ```bash

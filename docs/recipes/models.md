@@ -859,6 +859,82 @@ Qwen2, dense Qwen3, and Qwen3 MoE checkpoints use different architecture names.
 For Qwen3 30B-A3B, the Hugging Face config advertises `qwen3_moe` and
 `Qwen3MoeForCausalLM`, so launch it as a MoE model.
 
+### Qwen3.6-35B-A3B on Ascend NPU
+
+Qwen3.6-35B-A3B is a hybrid checkpoint: 30 Gated Delta Net (linear-attention)
+layers and 10 full-attention layers, plus a 256-expert MoE block. It runs on one
+Ascend 950PR with the same flags as the dense Qwen3 path, adding the SSM state
+dtype and a multimodal attention backend because the checkpoint ships a vision
+tower:
+
+```bash
+source /home/dlb/Ascend/install/cann/set_env.sh
+export ASCEND_RT_VISIBLE_DEVICES=0
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export PYTHONPATH="${PWD}/python:${PWD}/tokenspeed-kernel/python:${PWD}/tokenspeed-kernel-npu/python:${PYTHONPATH:-}"
+
+python -m tokenspeed.cli serve /home/models/Qwen3.6-35B-A3B \
+  --served-model-name qwen36 \
+  --device npu \
+  --dtype bfloat16 \
+  --kv-cache-dtype auto \
+  --attention-backend mha \
+  --sampling-backend greedy \
+  --disable-prefill-graph \
+  --disable-pdl \
+  --disable-autotune \
+  --max-model-len 4096 \
+  --max-num-seqs 4 \
+  --max-total-tokens 16384 \
+  --chunked-prefill-size 4096 \
+  --max-cudagraph-capture-size 4 \
+  --cudagraph-capture-sizes 1 2 4 \
+  --mamba-ssm-dtype float32 \
+  --mm-attention-backend triton_attn \
+  --speculative-algorithm MTP \
+  --speculative-draft-model-path /home/models/Qwen3.6-35B-A3B \
+  --speculative-num-steps 3 \
+  --host 127.0.0.1 \
+  --port 51135
+```
+
+`--speculative-algorithm MTP` with the draft path pointing at the same
+checkpoint drafts from the checkpoint's own `mtp.*` head, so it costs 1.6 GB of
+extra weights and no second model.
+
+`--mm-attention-backend triton_attn` is required: the checkpoint's vision tower
+has no Ascend encoder backend of its own, and `triton_attn` is the one
+cross-vendor choice. The MoE weights stay unquantized BF16 because the Ascend
+leaf covers only the unquantized and W8A8 expert paths, and `--all2all-backend`
+must remain `none`.
+
+Validated on one 950PR (123 GB usable HBM, 67.5 GB device-resident after
+loading): startup takes about 30 s including the 4096-token warmup and the
+ACL Graph captures for batches 1, 2 and 4; prompts up to the 4095-token input
+cap run, 4 concurrent requests decode together, multi-turn context re-prefill
+keeps the prior turns, and a 1.3K-token prompt answers correctly.
+
+The KV pool is small at these settings: `--max-total-tokens 16384` yields about
+7.9K cache tokens, so a single request is still bounded by `--max-model-len`
+(4096, of which 4095 is input). Raise `--max-total-tokens` together with
+`--max-model-len` and the capture sizes to scale the deployment.
+
+ReplaySSM and draft-tree speculation are unavailable here: `gdn_replay_commit`
+has no Ascend path, and the native recurrent op cannot walk a draft tree or
+stop a window at an accepted prefix. Requirement-level detail for each kernel is
+in `tokenspeed-kernel-npu/README.md`.
+
+Chain MTP speculation does work: `gdn_decode_mtp` stages each verified
+position in its own row of the verify scratch and the runtime commits the
+accepted prefix by copying rows back, which needs no replay kernel. Measured on
+the checkpoint's own MTP head (`--speculative-algorithm MTP
+--speculative-draft-model-path` pointing at the same directory,
+`--speculative-num-steps 3`) the accept rate settles around 78-86% with an
+average accepted length near 3.4 of 4 drafted tokens. Add those flags to the
+command above; do not raise `--speculative-eagle-topk` above 1, since tree
+drafting selects a `tree=True` verify kernel that has no Ascend
+implementation.
+
 ### Qwen3-0.6B on Ascend NPU
 
 The Ascend path supports unquantized Qwen3-0.6B on one or more NPUs. It uses
@@ -961,6 +1037,35 @@ tokenspeed serve Qwen/Qwen3-30B-A3B \
 
 Qwen3.8 shares the hybrid linear-attention (GDN) / full-attention layer
 pattern with Qwen3.5.
+
+### Ascend NPU
+
+Qwen3.8 reuses the Qwen3.5 model classes: the checkpoint's architecture is
+`Qwen3_5ForConditionalGeneration` (dense) or
+`Qwen3_5MoeForConditionalGeneration` (MoE), so it loads through the same
+registered entry points with no Qwen3.8-specific code. The GDN layers run on
+the native Ascend kernels described in the Qwen3.6 section above.
+
+Two constraints apply on an NPU:
+
+- Only unquantized BF16 weights run. Every registered `gemm` FP8 kernel
+  (blockscale, scaled, and the FP8 MoE path) declares `nvidia`/`amd` only, so
+  an FP8 checkpoint has no kernel to select; `--kv-cache-dtype fp8_e4m3` is
+  likewise CUDA-only. The unquantized `Qwen3.8-27B` checkpoint loads as is;
+  `Qwen3.8-27B-FP8` does not.
+- `--language-model-only` skips the vision tower, which otherwise loads
+  because these checkpoints are multimodal. Pass `--mm-attention-backend
+  triton_attn` when the tower is kept.
+
+The launch command is the Qwen3.6 one above with the checkpoint path and any
+`--max-model-len` / `--max-total-tokens` scaled to the model's own geometry.
+
+Validated on one 950PR with the unquantized `Qwen3.8-27B` checkpoint: dense
+64-layer geometry (48 linear-attention, 16 full-attention, 5120 hidden), 52 GB
+of weights, 56.6 GB device-resident after loading, readiness in about 35 s.
+Short answers, four concurrent requests, a 3.2K-token prompt, and multi-turn
+context all return correct output, and chain MTP speculation runs off the
+checkpoint's own `mtp.*` head at an accept rate of 0.68-0.70.
 
 ### Qwen3.8-2.4T-A95B
 
@@ -1082,8 +1187,10 @@ Notes:
 
 ### Qwen3.8-27B
 
-A dense 27B-class Qwen3.8 FP8 checkpoint on a single GPU, with self-speculative
-MTP (the draft model path points at the same checkpoint):
+A dense 27B-class Qwen3.8 checkpoint on a single GPU, with self-speculative
+MTP (the draft model path points at the same checkpoint). On an Ascend NPU use
+the unquantized `Qwen/Qwen3.8-27B` checkpoint rather than the FP8 one, because
+no FP8 GEMM is registered for `ascend`; see the Ascend subsection above.
 
 ```bash
 tokenspeed serve Qwen/Qwen3.8-27B-FP8 \

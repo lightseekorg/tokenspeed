@@ -60,13 +60,17 @@ def _reference(
 @pytest.mark.parametrize("rotary_dim", [64, 128])
 @pytest.mark.parametrize("is_neox", [True, False])
 @pytest.mark.parametrize("use_output_buffers", [True, False])
+@pytest.mark.parametrize("positions_dtype", [torch.int64, torch.int32])
 def test_apply_rope(
     dtype: torch.dtype,
     rotary_dim: int,
     is_neox: bool,
     use_output_buffers: bool,
+    positions_dtype: torch.dtype,
 ) -> None:
-    positions = torch.tensor([0, 7, 3, 15, 2, 9, 1], device="npu")
+    # int32 positions reach this op from the MTP draft's decode step; the
+    # native RoPE op only takes int64, so the leaf must widen them.
+    positions = torch.tensor([0, 7, 3, 15, 2, 9, 1], device="npu").to(positions_dtype)
     frequencies = torch.randn(32, rotary_dim // 2, device="npu", dtype=dtype)
     cos_sin_cache = torch.cat((frequencies.cos(), frequencies.sin()), dim=-1)
     packed = torch.randn(7, (16 + 8) * 128, device="npu", dtype=dtype)

@@ -66,6 +66,7 @@ import torch
 from tokenspeed_kernel._triton import tl as _tl
 from tokenspeed_kernel._triton import triton as _triton_lang
 from tokenspeed_kernel.ops.attention.gdn.triton import CausalConv1dPrefillMetadata
+from tokenspeed_kernel.ops.conv import ascend as _ascend_solutions  # noqa: F401
 from tokenspeed_kernel.ops.conv import cute_dsl as _cute_dsl_solutions  # noqa: F401
 from tokenspeed_kernel.ops.conv.triton import (
     PAD_SLOT_ID,

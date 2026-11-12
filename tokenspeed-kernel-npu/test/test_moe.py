@@ -84,6 +84,7 @@ def _plan(weights: _Weights, *, num_zero_experts: int = 0) -> dict:
         expert_id_repeats=num_zero_experts > 0,
         fast_math=False,
         combine_order="rank",
+        features=frozenset(),
         solution="torch_npu",
     )
     plan["num_zero_experts"] = num_zero_experts

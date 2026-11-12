@@ -190,12 +190,9 @@ def _ascend_bf16_expert_gmm(
         group_type=0,
         group_list_type=1,
     )[0]
-    hidden = torch_npu.mlp_split_swiglu(
-        hidden,
-        expert_counts.to(torch.int32),
-        local_exp_start=0,
-        local_exp_end=int(w.num_local_experts),
-    )
+    # ``npu_swiglu`` halves every row down the last axis; a dispatch row never
+    # spans experts, so this is the per-expert split.
+    hidden = torch_npu.npu_swiglu(hidden, dim=-1)
     return torch_npu.npu_grouped_matmul(
         [hidden],
         [w.w2_weight],

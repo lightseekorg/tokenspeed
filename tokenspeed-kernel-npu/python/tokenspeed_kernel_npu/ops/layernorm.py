@@ -76,4 +76,101 @@ def qk_rmsnorm(
     return q_out, k_out
 
 
-__all__ = ["qk_rmsnorm", "rmsnorm"]
+def gemma_rmsnorm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    residual: torch.Tensor | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Gemma RMSNorm (multiplier ``1 + weight``) through the native RMSNorm ops.
+
+    Args:
+        x: ``[..., hidden]`` input; rows may be strided, columns dense.
+        weight: Gemma checkpoint weight offset, ``[hidden]``.
+        eps: Epsilon added to the mean square.
+        residual: Optional ``x``-shaped residual stream; when given the FP32 sum
+            ``x + residual`` is normalized and its rounded copy becomes the new
+            residual.
+
+    Returns:
+        The normalized tensor, or ``(normalized, new_residual)``.
+    """
+    scale = (weight.float() + 1.0).to(weight.dtype)
+    return rmsnorm(x, scale, eps, residual)
+
+
+def gated_rmsnorm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    z: torch.Tensor | None,
+    *,
+    eps: float,
+    group_size: int | None,
+    norm_before_gate: bool,
+    sigmoid_gate: bool,
+    fp8_scale: torch.Tensor | None,
+    weights_independent: bool,
+) -> torch.Tensor:
+    """Grouped gated RMSNorm composed from the native RMSNorm op and elementwise math.
+
+    The native op normalizes the whole last dimension, so grouped statistics
+    are formed by viewing the row as ``[groups, group_size]``.
+
+    Args:
+        x: ``[..., width]`` input.
+        weight: ``[width]`` norm weight, or ``[group_size]`` shared per group.
+        z: Gate input shaped like ``x``, or ``None`` for a plain grouped norm.
+        eps: Epsilon added to each group's mean square.
+        group_size: Features sharing one RMS statistic; ``None`` means the whole
+            last dimension.
+        norm_before_gate: ``norm(x) * gate(z)``; otherwise
+            ``norm(x * gate(z))``.
+        sigmoid_gate: Gate with ``sigmoid(z)``; otherwise ``silu(z)``.
+        fp8_scale: Rejected; the native path returns ``x``'s dtype.
+        weights_independent: Unused; the native op has no PDL producer.
+
+    Returns:
+        The normalized tensor, shaped like ``x``.
+    """
+    del weights_independent
+    if fp8_scale is not None:
+        raise NotImplementedError("Ascend gated RMSNorm does not emit FP8")
+    width = x.shape[-1]
+    group = width if group_size is None else int(group_size)
+    if width % group:
+        raise ValueError(
+            f"gated RMSNorm width {width} is not a multiple of group {group}"
+        )
+    if weight.numel() not in (width, group):
+        raise ValueError(
+            f"gated RMSNorm weight must hold {width} or {group} values, "
+            f"got {weight.numel()}"
+        )
+    groups = width // group
+    # A weight of ``group`` values is shared by every group.
+    per_group_weight = weight.float().reshape(
+        1 if weight.numel() == group else groups, group
+    )
+
+    # ``[..., groups, group]``: one RMS statistic per group.
+    shaped = x.reshape(*x.shape[:-1], groups, group).float()
+    gate = None
+    if z is not None:
+        gate_input = z.reshape(*x.shape[:-1], groups, group).float()
+        gate = (
+            torch.sigmoid(gate_input)
+            if sigmoid_gate
+            else gate_input * torch.sigmoid(gate_input)
+        )
+        if not norm_before_gate:
+            shaped = shaped * gate
+
+    rstd = torch.rsqrt(shaped.square().mean(-1, keepdim=True) + eps)
+    normalized = (shaped * rstd) * per_group_weight
+    if gate is not None and norm_before_gate:
+        normalized = normalized * gate
+    # The portable leaf emits the activation dtype whatever the weight dtype.
+    return normalized.reshape(*x.shape).to(x.dtype)
+
+
+__all__ = ["gated_rmsnorm", "gemma_rmsnorm", "qk_rmsnorm", "rmsnorm"]

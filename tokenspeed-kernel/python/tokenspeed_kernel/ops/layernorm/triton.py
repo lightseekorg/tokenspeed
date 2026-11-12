@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 import torch
@@ -1540,7 +1541,12 @@ def triton_gated_rmsnorm(
     num_warps = min(max(BLOCK_N // 256, 1), 8)
     block_m = GATED_RMSNORM_ROWS_PER_PROGRAM if num_warps == 1 else 1
     grid = (triton.cdiv(M, block_m), ngroups)
-    with torch.cuda.device(x.device.index):
+    # An NPU has no CUDA device context; its Triton launcher binds the active
+    # device itself, so the switch only applies on CUDA.
+    device_scope = (
+        torch.cuda.device(x.device.index) if x.device.type == "cuda" else nullcontext()
+    )
+    with device_scope:
         # Pass the heuristic explicitly so startup can retain and load each
         # compiled binary; the heuristic wrapper discards that return value.
         kernel_launcher(gated_rmsnorm_kernel.fn, grid)(
