@@ -366,16 +366,12 @@ def _group_layouts(nw):
 
 @gluon.jit
 def _group_softmax_step(
-    q, keys, values, valid, m, l, acc, p_layout: gl.constexpr, MASK: gl.constexpr
+    scores, values, valid, m, l, acc, p_layout: gl.constexpr, MASK: gl.constexpr
 ):
-    """:func:`softmax_step` of every key group's own keys: ``q [G, QM, 64]``,
-    ``keys [G, 64, KW]``, ``values [G, KW, 64]``, ``valid [G, QM, KW]`` (used
-    only when ``MASK``)."""
+    """:func:`softmax_step` of every key group's own keys, from their QK
+    products ``scores [G, QM, KW]``: ``values [G, KW, 64]``, ``valid [G, QM,
+    KW]`` (used only when ``MASK``)."""
     pv3: gl.constexpr = acc.type.layout
-    scores = gl.zeros(
-        [q.shape[0], q.shape[1], keys.shape[2]], gl.float32, valid.type.layout
-    )
-    scores = gl.amd.cdna4.mfma(q, keys, scores)
     if MASK:
         scores = gl.where(valid, scores * QK_SCALE, float("-inf"))
     else:
@@ -548,18 +544,25 @@ def _group_keys(
         cdna4_async_copy.wait_group(2)
         gl.barrier()
         keys = k_ring.index(i % NBUF).reshape([G, KW, HEAD]).permute([0, 2, 1]).load(k3)
-        values = v_ring.index(i % NBUF).reshape([G, KW, HEAD]).load(v3)
         if not FP8QK:
             keys = keys.to(gl.bfloat16)  # a BF16 cache's keys as they are
+        # The QK products go out before the values load: the values' LDS
+        # reads and conversion fill the MFMA's latency. This order keeps the
+        # scores live across the values' load, which raises the full-layer
+        # binaries' VGPR count: check their headroom before keeping more
+        # state live across this loop.
+        scores = gl.zeros([G, QM, KW], gl.float32, qk3)
+        scores = gl.amd.cdna4.mfma(q_w, keys, scores)
+        values = v_ring.index(i % NBUF).reshape([G, KW, HEAD]).load(v3)
         values = values.to(gl.bfloat16)
         # Only the split's last chunk has keys past its end.
         if c0 + BN > hi:
             m_w, l_w, acc_w = _group_softmax_step(
-                q_w, keys, values, valid, m_w, l_w, acc_w, p3, True
+                scores, values, valid, m_w, l_w, acc_w, p3, True
             )
         else:
             m_w, l_w, acc_w = _group_softmax_step(
-                q_w, keys, values, valid, m_w, l_w, acc_w, p3, False
+                scores, values, valid, m_w, l_w, acc_w, p3, False
             )
         i += 1
     cdna4_async_copy.wait_group(0)
