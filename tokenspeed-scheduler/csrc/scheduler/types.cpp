@@ -181,11 +181,20 @@ void SchedulerConfig::Validate() const {
     if (prefill_decode_interval < 0) {
         throw std::invalid_argument("Scheduler: prefill_decode_interval (--prefill-decode-interval) must be >= 0");
     }
+    if (prefill_decode_min_interval < 0) {
+        throw std::invalid_argument(
+            "Scheduler: prefill_decode_min_interval (--prefill-decode-min-interval) must be >= 0");
+    }
     // Only the fused role runs local prefill rounds and decodes on one engine.
     if (prefill_decode_interval != 0 && role != Role::kFused) {
         throw std::invalid_argument(
             "Scheduler: prefill_decode_interval (--prefill-decode-interval) applies to the fused role only: a P "
             "node runs no decodes and a D node no local prefill");
+    }
+    if (prefill_decode_min_interval != 0 && role != Role::kFused) {
+        throw std::invalid_argument(
+            "Scheduler: prefill_decode_min_interval (--prefill-decode-min-interval) applies to the fused role only: "
+            "a P node runs no decodes and a D node no local prefill");
     }
     if (HasHostCache() || HasSnapshotPool()) {
         if (host_group_packing.size() != cache_groups.size()) {
