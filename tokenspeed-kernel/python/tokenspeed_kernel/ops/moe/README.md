@@ -510,6 +510,11 @@ sizes: inputs and route maps use actual N, without padding to a bucket.
 These are API bounds; validation and performance coverage must be established
 for a model before selecting this producer in its execution plan.
 
+Quantization uses `cute.math.div(approx=True, ftz=True)` and
+`cute.arch.rcp_approx` to retain the native approximate division and
+flush-to-zero reciprocal. Ordinary division or a differently rounded
+reciprocal is not an interchangeable numerical contract.
+
 A `PreparedMoEInput` retains the original inputs, the packed data, and the
 same invocation's maps. Its logical inverse map is `[tokens, topk]` with
 native slot-major storage. Only rows below `offsets[-1]` and their referenced

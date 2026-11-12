@@ -155,6 +155,24 @@ def verify_routes(out):
     assert_bytes(out.scales[:, scale_rows].T, scales[token])
 
 
+@pytest.mark.parametrize("tokens", (1, 3, 129))
+@pytest.mark.parametrize("exponent", (-30, 0, 30))
+def test_route_quantization_rounding_boundaries(tokens, exponent):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip("Requires Hopper")
+    # Include signed zero and E4M3 midpoints in each four-value load. Amax=448
+    # makes the unscaled multiplier exactly one, exposing tie-to-even rounding.
+    pattern = torch.tensor(
+        [0.0, -0.0, 1.0625, -1.0625, 1.1875, -1.1875, 448.0, -448.0],
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    x = (pattern.repeat(tokens * 64).view(tokens, 512) * 2.0**exponent).contiguous()
+    ids = torch.tensor([0, 1, 2], device="cuda", dtype=torch.int32).repeat(tokens, 1)
+    out = route_quant_fp8(x, ids, experts=3, expert_offset=0, solution="cute_dsl")
+    verify_routes(out)
+
+
 def exercise_route_graph(tokens, experts, topk, hidden):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
         pytest.skip("Requires Hopper")

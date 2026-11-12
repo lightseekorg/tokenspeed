@@ -32,38 +32,6 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 
 
 @dsl_user_op
-def divide_approx_ftz(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
-    """Divide with PTX div.approx.ftz.f32, preserving flush-to-zero behavior."""
-    return Float32(
-        llvm.inline_asm(
-            T.f32(),
-            [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
-            "div.approx.ftz.f32 $0, $1, $2;",
-            "=f,f,f",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@dsl_user_op
-def reciprocal_approx_ftz(a: Float32, *, loc=None, ip=None) -> Float32:
-    """Compute the approximate FTZ reciprocal stored as the FP32 inverse scale."""
-    return Float32(
-        llvm.inline_asm(
-            T.f32(),
-            [Float32(a).ir_value(loc=loc, ip=ip)],
-            "rcp.approx.ftz.f32 $0, $1;",
-            "=f,f",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@dsl_user_op
 def load_bf16x4(ptr: cute.Pointer, *, loc=None, ip=None):
     """Load four BF16 values as FP32 from a valid eight-byte-aligned address."""
     result = llvm.inline_asm(
@@ -203,12 +171,12 @@ class RoutePrepare:
                 amax = other
         multiplier = Float32(1)
         if amax != Float32(0):
-            multiplier = divide_approx_ftz(Float32(448), amax)
+            multiplier = cute.math.div(Float32(448), amax, approx=True, ftz=True)
         quantized = cute.make_rmem_tensor((4,), Float8E4M3FN)
         for i in cutlass.range_constexpr(4):
             quantized[i] = Float8E4M3FN(values[i] * multiplier)
         bits = cute.recast_tensor(quantized, Int32)
-        return bits[0], reciprocal_approx_ftz(multiplier)
+        return bits[0], cute.arch.rcp_approx(multiplier)
 
     @cute.kernel
     def by_token_tile(
@@ -384,8 +352,8 @@ class RoutePrepare:
                 amax = other
         multiplier = Float32(1)
         if amax != Float32(0):
-            multiplier = divide_approx_ftz(Float32(448), amax)
-        inverse_scale = reciprocal_approx_ftz(multiplier)
+            multiplier = cute.math.div(Float32(448), amax, approx=True, ftz=True)
+        inverse_scale = cute.arch.rcp_approx(multiplier)
         quantized = cute.make_rmem_tensor((4,), Float8E4M3FN)
         for i in cutlass.range_constexpr(4):
             quantized[i] = Float8E4M3FN(values[i] * multiplier)
