@@ -30,7 +30,6 @@
 #include <memory_resource>
 #include <optional>
 #include <span>
-#include <type_traits>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -128,10 +127,8 @@ private:
         EvictionOrderMap::const_iterator hint_{entries_.end()};
     };
 
-    // Owns one ordered-index registration. A pinned entry keeps the extracted
-    // node, so restoring its order never allocates during a block destructor.
+    // Owns one ordered-index registration: its node leaves the order with it.
     // The map outlives all registrations; stable entries never move this handle.
-    template <bool CanSuspend>
     class OrderRegistration {
     public:
         OrderRegistration() = default;
@@ -145,54 +142,54 @@ private:
             order_ = &order;
         }
         bool Registered() const noexcept { return order_ != nullptr; }
-        bool Suspended() const noexcept {
-            if constexpr (CanSuspend) return !suspended_.empty();
-            return false;
-        }
-        void Suspend() noexcept
-            requires(CanSuspend)
-        {
-            FatalCheck(Registered(), "only a registered entry can be suspended");
-            if (!Suspended()) suspended_ = order_->Extract(position_);
-        }
-        void Resume() noexcept
-            requires(CanSuspend)
-        {
-            FatalCheck(Suspended(), "only a suspended order node can be restored");
-            position_ = order_->Insert(suspended_);
-        }
         void Rekey(EvictionOrder key) noexcept {
             FatalCheck(Registered(), "only a registered entry can change age or location");
-            if constexpr (CanSuspend) {
-                if (Suspended()) {
-                    suspended_.key() = key;
-                    return;
-                }
-            }
             auto node = order_->Extract(position_);
             node.key() = key;
             position_ = order_->Insert(node);
         }
         void Reset() noexcept {
             if (order_ == nullptr) return;
-            if constexpr (CanSuspend) {
-                if (Suspended()) {
-                    suspended_ = {};
-                    order_ = nullptr;
-                    return;
-                }
-            }
             order_->Erase(position_);
             order_ = nullptr;
         }
 
-    private:
-        struct NoSuspension {};
+    protected:
         OrderIndex* order_{nullptr};
         EvictionOrderMap::iterator position_{};
-        // Common-order registrations never suspend; pay for a node handle
-        // only in the available-order registration that can be pinned.
-        [[no_unique_address]] std::conditional_t<CanSuspend, EvictionOrderMap::node_type, NoSuspension> suspended_{};
+    };
+
+    // The available-order registration, which a pinned entry suspends: it
+    // keeps the extracted node, so restoring the order never allocates during
+    // a block destructor. Only this one pays for a node handle.
+    class SuspendableOrderRegistration : private OrderRegistration {
+    public:
+        SuspendableOrderRegistration() = default;
+        // A suspended node is not in the order: it leaves with the handle.
+        ~SuspendableOrderRegistration() {
+            if (Suspended()) order_ = nullptr;
+        }
+
+        using OrderRegistration::Insert;
+        bool Suspended() const noexcept { return !suspended_.empty(); }
+        void Suspend() noexcept {
+            FatalCheck(Registered(), "only a registered entry can be suspended");
+            if (!Suspended()) suspended_ = order_->Extract(position_);
+        }
+        void Resume() noexcept {
+            FatalCheck(Suspended(), "only a suspended order node can be restored");
+            position_ = order_->Insert(suspended_);
+        }
+        void Rekey(EvictionOrder key) noexcept {
+            if (Suspended()) {
+                suspended_.key() = key;
+                return;
+            }
+            OrderRegistration::Rekey(key);
+        }
+
+    private:
+        EvictionOrderMap::node_type suspended_{};
     };
 
 public:
@@ -849,8 +846,8 @@ private:
         bool demoted{false};
         // See CachedBlockMetadata::max_access_epoch.
         std::uint64_t max_access_epoch{0};
-        OrderRegistration<true> available_order;
-        OrderRegistration<false> common_order;
+        SuspendableOrderRegistration available_order;
+        OrderRegistration common_order;
         // Cancel callbacks before either registration or the block is destroyed.
         CacheBlockUniqueObserver unique_observer;
         CacheEntry* common_peer{nullptr};
