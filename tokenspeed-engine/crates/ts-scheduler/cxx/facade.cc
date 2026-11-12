@@ -58,15 +58,19 @@ void record_profile_span(const char* name, std::int64_t begin_ns, std::int64_t e
 
 void submit_requests(tokenspeed::Scheduler& scheduler, rust::Slice<const RequestSpec> specs) {
     std::vector<tokenspeed::RequestSpec> converted;
-    converted.reserve(specs.size());
-    for (const RequestSpec& spec : specs) {
-        converted.push_back(tokenspeed::RequestSpec{
-            .request_id = std::string(spec.request_id),
-            .session_id = std::string(spec.session_id),
-            .tokens = to_std({spec.tokens.data(), spec.tokens.size()}),
-            .max_new_tokens = spec.max_new_tokens,
-            .max_cached_prefix_tokens = spec.max_cached_prefix_tokens,
-        });
+    {
+        // Each prompt is copied across the bridge.
+        tokenspeed::ProfileSpan profile_span{"copyRequestSpecs"};
+        converted.reserve(specs.size());
+        for (const RequestSpec& spec : specs) {
+            converted.push_back(tokenspeed::RequestSpec{
+                .request_id = std::string(spec.request_id),
+                .session_id = std::string(spec.session_id),
+                .tokens = to_std({spec.tokens.data(), spec.tokens.size()}),
+                .max_new_tokens = spec.max_new_tokens,
+                .max_cached_prefix_tokens = spec.max_cached_prefix_tokens,
+            });
+        }
     }
     scheduler.SubmitRequests(converted);
 }

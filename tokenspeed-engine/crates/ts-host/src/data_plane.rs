@@ -375,6 +375,7 @@ impl DataPlane for PythonDataPlane {
     type Pending = ForwardId;
 
     fn admit(&mut self, requests: &[Admission]) -> Result<(), DataPlaneError> {
+        let _span = profile::span("DataPlane::admit");
         let mut rows = Vec::with_capacity(requests.len());
         for request in requests {
             let frames = ts_wire::encode_frames(&request.sampling_params);

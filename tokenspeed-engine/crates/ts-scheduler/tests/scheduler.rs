@@ -311,16 +311,21 @@ fn a_recording_sees_the_schedulers_phases_inside_its_calls() {
     interpreter();
     let mut scheduler =
         Python::attach(|py| Scheduler::from_python(&run(py, NEW_SCHEDULER)).unwrap());
-    scheduler
-        .submit_requests(&[spec("r1", (1..=10).collect())])
-        .unwrap();
 
     profile::start();
     // Other tests share the process: this thread's spans are the marker's.
     drop(profile::span("marker"));
+    scheduler
+        .submit_requests(&[spec("r1", (1..=10).collect())])
+        .unwrap();
     scheduler.next_execution_plan(true, false);
     scheduler
         .advance(&[event(ForwardEventKind::ExtendResult, "r1", vec![42])])
+        .unwrap();
+    // A decode step: its result is no prefill result.
+    scheduler.next_execution_plan(true, false);
+    scheduler
+        .advance(&[event(ForwardEventKind::ExtendResult, "r1", vec![43])])
         .unwrap();
     let recording = profile::stop();
 
@@ -344,6 +349,13 @@ fn a_recording_sees_the_schedulers_phases_inside_its_calls() {
     let within = |inner: &profile::Span, outer: &profile::Span| {
         outer.begin_ns <= inner.begin_ns && inner.end_ns <= outer.end_ns
     };
+    let submit = named("Scheduler::submit_requests");
+    assert_eq!(submit.category, profile::HOST);
+    for phase in ["copyRequestSpecs", "Scheduler::SubmitRequests"] {
+        let phase = named(phase);
+        assert_eq!(phase.category, profile::SCHEDULER, "{phase:?}");
+        assert!(within(phase, submit), "{phase:?} outside {submit:?}");
+    }
     // The control thread's call, and inside it the C++ scheduler's own spans
     // under their category.
     let plan = named("Scheduler::next_execution_plan");
@@ -364,6 +376,7 @@ fn a_recording_sees_the_schedulers_phases_inside_its_calls() {
         "AdmissionPlanner::fitWithEviction",
         "CacheCoordinator::acquirePrefix",
         "CacheCoordinator::CollectDeadEntries",
+        "ForwardBatch::ForwardBatch",
     ] {
         let phase = named(phase);
         assert_eq!(phase.category, profile::SCHEDULER, "{phase:?}");
@@ -374,6 +387,12 @@ fn a_recording_sees_the_schedulers_phases_inside_its_calls() {
     let advanced = named("Scheduler::Advance");
     let settle = named("Scheduler::settleFinishedRequests");
     assert!(within(advanced, advance) && within(settle, advanced));
+    let prefill_results: Vec<_> = spans
+        .iter()
+        .filter(|span| span.name == "Scheduler::handlePrefillResult")
+        .collect();
+    assert_eq!(prefill_results.len(), 1, "{spans:#?}");
+    assert!(within(prefill_results[0], advanced));
     assert!(recording.threads.iter().any(|(thread, _)| *thread == tid));
 }
 

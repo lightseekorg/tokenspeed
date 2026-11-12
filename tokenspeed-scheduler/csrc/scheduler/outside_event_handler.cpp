@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <array>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -387,6 +388,12 @@ void Scheduler::handleEvent(const forward::UpdateReserveNumTokens& event) {
 
 void Scheduler::handleEvent(const forward::ExtendResult& event) {
     if (Request* request = findRequest(event.request_id)) {
+        // Only a prefill chunk's result is a span: a decode batch would add
+        // one per row.
+        std::optional<ProfileSpan> profile_span;
+        if (!request->Is<fsm::Decoding>()) {
+            profile_span.emplace("Scheduler::handlePrefillResult");
+        }
         request->NoteResultLanded();
         request->Apply(fsm::ExtendResultEvent{event.tokens});
         if (!event.spec_candidate_ids.empty()) {

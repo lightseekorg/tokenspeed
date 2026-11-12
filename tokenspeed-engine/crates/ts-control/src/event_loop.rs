@@ -2665,6 +2665,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         if admissions.is_empty() {
             return Ok(());
         }
+        let _span = profile::span("EventLoop::register");
         tracing::debug!(admitted = admissions.len(), "requests admitted");
         // The data plane learns a request before the scheduler can plan it.
         self.data_plane.admit(&admissions)?;

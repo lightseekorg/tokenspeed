@@ -5406,6 +5406,9 @@ fn a_profile_keeps_the_spans_of_rounds_that_did_something() {
     );
     assert_eq!(count("Scheduler::next_execution_plan"), rounds);
     assert!(count("EventLoop::commit") >= forwards);
+    // The request's admission, once.
+    assert_eq!(count("ingress::admit"), 1);
+    assert_eq!(count("EventLoop::register"), 1);
 }
 
 /// What [`HeldQueryFrontend`] noted of a run.
