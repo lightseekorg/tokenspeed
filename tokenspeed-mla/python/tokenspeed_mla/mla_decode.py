@@ -86,7 +86,7 @@ def _get_reducer_max_splits(split_kv: int) -> int:
     return max(4, 1 << (split_kv - 1).bit_length())
 
 
-# Per-request split limit: the most splits the automatic
+# Grid width for per-request split counts: the most splits the automatic
 # heuristic of the 2-CTA kernels ever picks.
 PER_REQUEST_SPLIT_KV_CAPACITY = 32
 
@@ -94,7 +94,7 @@ PER_REQUEST_SPLIT_KV_CAPACITY = 32
 def _per_request_split_kv_width(
     max_seq_len: int, mma_qk_tiler_mn: tuple[int, int], min_split_kv: int
 ) -> int:
-    """Per-request split capacity, capped by the configured KV tile count."""
+    """Grid width when each request carries its own split count, without empty partitions."""
     k_tiles = ceil_div(max_seq_len, mma_qk_tiler_mn[1])
     width = max(PER_REQUEST_SPLIT_KV_CAPACITY, min_split_kv)
     return ceil_div(k_tiles, ceil_div(k_tiles, width))
@@ -1089,10 +1089,9 @@ def tokenspeed_mla_decode(
     block_split_kvs : torch.Tensor, optional
         Contiguous int32 [B] per-request split counts on the query device,
         each in ``[1, grid width]``; ``tokenspeed_mla_decode_split_kvs`` writes
-        them for the same arguments. Each request may use up to
-        ``max(32, min_split_kv)`` splits (fewer when ``max_seq_len`` has fewer
-        K tiles). The compact launch grid shares the workspace's aggregate
-        split capacity and maps work through ``block_split_offsets``. Values are not
+        them for the same arguments. The launch grid is then
+        ``max(32, min_split_kv)`` splits wide (fewer when ``max_seq_len`` has
+        fewer K tiles) and each request uses its own count. Values are not
         copied to the CPU for validation and may be updated in place between
         CUDA graph replays. FP8 E4M3, BF16 or FP16 Q/KV with ``is_var_seq``;
         FP8 output is unsupported. Supports ``local_visible_lens`` for
