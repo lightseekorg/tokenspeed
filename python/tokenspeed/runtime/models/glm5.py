@@ -101,8 +101,7 @@ _INDEXER_PREFILL_MAX_LOGITS_MB_ARG = "deepseek_v4_indexer_prefill_max_logits_mb"
 # Fewer rows: the all-gather costs more than split scoring saves (TP8 50K, MI350X).
 _PREFILL_TOPK_TP_SPLIT_MIN_ROWS = 384
 _PREFILL_TOPK_ROW_ALIGN = 16
-# Fewer rows: two half-size top-k passes cost more than the hidden gather saves
-# (TP8 KVP8, MI350X).
+# Fewer rows: two half-size top-k passes cost more than the hidden gather saves.
 _PREFILL_TOPK_OVERLAP_MIN_ROWS = 8192
 # Below this many rows every rank merges every KVP prefill row: the row-owner merge's two extra collectives cost more.
 _KVP_PREFILL_ROW_OWNER_MIN_ROWS = 1024

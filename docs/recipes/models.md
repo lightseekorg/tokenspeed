@@ -763,9 +763,7 @@ GPU_MAX_HW_QUEUES=2 tokenspeed serve moonshotai/Kimi-K3.1-Pro \
   selected keys. See
   [KV parallelism](../serving/parallelism.md#kv-parallelism).
   With KV parallelism, also add `--enable-mixed-batch`: decode rows then ride
-  in a prefill chunk's forward instead of waiting for it. On 8x MI355X with
-  AgentX traces this gives about 4% more throughput and 7-10% more
-  interactivity at 32-48 concurrent requests.
+  in a prefill chunk's forward instead of waiting for it.
 - The Kimi-K3 AMD note on greedy sampling applies.
 
 ## GLM5 / GLM5.2
