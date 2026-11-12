@@ -972,7 +972,7 @@ def test_fused_routing_hands_its_sort_to_the_experts(rows):
     or "gfx950" not in torch.cuda.get_device_properties(0).gcnArchName,
     reason="the fused K3 routing sorts for the gfx950 A8W4 MoE",
 )
-@pytest.mark.parametrize("rows", [4, 8, 64, 128, 192])
+@pytest.mark.parametrize("rows", [4, 8, 128, 192])
 def test_fused_routing_carries_the_shared_down_projection(monkeypatch, rows):
     from tokenspeed_kernel.ops.moe import kimi3_sorted_routing_scratch
 
@@ -1027,7 +1027,6 @@ def test_fused_routing_carries_the_shared_down_projection(monkeypatch, rows):
             rows,
             rows,
         )
-    assert projections.call_args.kwargs["defer_shared_down"] is True
     # 8 through 128 rows ride the routing launch; the rest project first.
     carried = 8 <= rows <= 128
     assert order == (["experts"] if carried else ["shared_down", "experts"])

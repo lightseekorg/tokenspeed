@@ -239,8 +239,7 @@ _SORTED_HELPER_ROUTES = 512
 # The shared-expert down projection a sorted launch can carry. Each program
 # writes a block of output columns of every row, reducing K in 256-wide steps:
 # 32 columns spread the weight over more CUs through 32 rows, and 64 halve the
-# activation reads above that (gfx950: 64-column programs lose at 32 rows,
-# 32-column programs at 96).
+# activation reads above that.
 _SHARED_DOWN_BLOCK_K = 256
 _SHARED_DOWN_NARROW_ROWS = 32
 _SHARED_DOWN_MAX_ROWS = 128
