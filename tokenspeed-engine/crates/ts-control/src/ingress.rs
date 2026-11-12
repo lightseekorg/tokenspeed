@@ -858,13 +858,13 @@ mod tests {
 
     #[test]
     fn a_json_schema_waits_for_the_reasoning_block() {
-        let reasoning = ReasoningGrammar {
-            continues: r#"{"continues":SLOT}"#.to_owned(),
-            may_open: r#"{"may_open":SLOT}"#.to_owned(),
-            schema_slot: "SLOT".to_owned(),
-            markers: Some((7, 8)),
-            implicit_closer: None,
-        };
+        let reasoning = ReasoningGrammar::new(
+            r#"{"continues":SLOT}"#.to_owned(),
+            r#"{"may_open":SLOT}"#.to_owned(),
+            "SLOT".to_owned(),
+            Some((7, 8)),
+            None,
+        );
         let admitted = |limits: &IngressLimits, prompt: Vec<i32>, schema: &str| {
             let params = SamplingParams {
                 json_schema: Some(schema.to_owned()),

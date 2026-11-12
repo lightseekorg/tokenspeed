@@ -67,7 +67,10 @@ pub struct GrammarConfig {
 /// `schema_slot`, which the request's schema replaces. A bare schema would
 /// lock the grammar onto `{` at the first token, so the model could not
 /// reason first.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// The schema cache is behind a lock, so equality is on the tags alone --
+/// two reasoning grammars are the same when they constrain the same way.
+#[derive(Debug, Clone)]
 pub struct ReasoningGrammar {
     /// The tag for a reply that continues a reasoning block the prompt
     /// opened.
@@ -83,6 +86,71 @@ pub struct ReasoningGrammar {
     /// A tool-block opener that ends reasoning without the closing marker;
     /// excluded from reasoning usage like the explicit markers.
     pub implicit_closer: Option<i32>,
+    /// The schemas already found to be JSON, so a repeated schema is not
+    /// parsed again.
+    pub valid_schemas: Arc<Mutex<HashSet<String>>>,
+}
+
+/// Two reasoning grammars are the same when they constrain the same way; the
+/// schema cache is not part of that.
+impl PartialEq for ReasoningGrammar {
+    fn eq(&self, other: &Self) -> bool {
+        self.continues == other.continues
+            && self.may_open == other.may_open
+            && self.schema_slot == other.schema_slot
+            && self.markers == other.markers
+            && self.implicit_closer == other.implicit_closer
+    }
+}
+
+impl ReasoningGrammar {
+    /// A reasoning grammar with no schema seen yet.
+    pub fn new(
+        continues: String,
+        may_open: String,
+        schema_slot: String,
+        markers: Option<(i32, i32)>,
+        implicit_closer: Option<i32>,
+    ) -> Self {
+        Self {
+            continues,
+            may_open,
+            schema_slot,
+            markers,
+            implicit_closer,
+            valid_schemas: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+
+    /// Whether `schema` is JSON.
+    ///
+    /// A schema is parsed to find out, and the parse builds the whole
+    /// document to throw it away. The schemas repeat across requests (a
+    /// deployment's schemas are a small fixed set), so the ones already
+    /// found to be JSON are remembered and skipped. A schema that is not
+    /// JSON is not remembered: it stays the compiler's to refuse, and it
+    /// costs a parse either way.
+    ///
+    /// The parse is the same one the schema would take, so a schema this
+    /// accepts is exactly a schema the compiler can read.
+    fn schema_is_json(&self, schema: &str) -> bool {
+        if self
+            .valid_schemas
+            .lock()
+            .expect("schema cache lock")
+            .contains(schema)
+        {
+            return true;
+        }
+        if serde_json::from_str::<serde_json::Value>(schema).is_err() {
+            return false;
+        }
+        self.valid_schemas
+            .lock()
+            .expect("schema cache lock")
+            .insert(schema.to_owned());
+        true
+    }
 }
 
 impl ReasoningGrammar {
@@ -93,7 +161,7 @@ impl ReasoningGrammar {
         let Some(schema) = params.json_schema.take() else {
             return;
         };
-        if serde_json::from_str::<serde_json::Value>(&schema).is_err() {
+        if !self.schema_is_json(&schema) {
             params.json_schema = Some(schema);
             return;
         }
@@ -567,6 +635,92 @@ impl Grammars {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reasoning grammar over the toy tags.
+    fn reasoning() -> ReasoningGrammar {
+        ReasoningGrammar::new(
+            r#"{"continues":SLOT}"#.to_owned(),
+            r#"{"may_open":SLOT}"#.to_owned(),
+            "SLOT".to_owned(),
+            Some((7, 8)),
+            None,
+        )
+    }
+
+    /// The structural tag a schema gets, or the schema staying put when it
+    /// is not JSON.
+    fn deferred(grammar: &ReasoningGrammar, schema: &str) -> (Option<String>, Option<String>) {
+        let mut params = SamplingParams {
+            json_schema: Some(schema.to_owned()),
+            ..Default::default()
+        };
+        grammar.defer_schema(&mut params, &[1, 7]);
+        (params.structural_tag, params.json_schema)
+    }
+
+    #[test]
+    fn a_json_schema_replaces_the_tag() {
+        let grammar = reasoning();
+        let (tag, schema) = deferred(&grammar, r#"{"type":"object"}"#);
+        assert_eq!(tag.as_deref(), Some(r#"{"continues":{"type":"object"}}"#));
+        assert_eq!(schema, None);
+    }
+
+    #[test]
+    fn a_schema_that_is_not_json_stays_for_the_compiler_to_refuse() {
+        let grammar = reasoning();
+        let (tag, schema) = deferred(&grammar, "$$ANY$$");
+        assert_eq!(tag, None);
+        assert_eq!(schema.as_deref(), Some("$$ANY$$"));
+    }
+
+    #[test]
+    fn a_cached_schema_defers_the_same_way() {
+        let grammar = reasoning();
+        let first = deferred(&grammar, r#"{"type":"object"}"#);
+        // The second request with the same schema comes from the cache.
+        let second = deferred(&grammar, r#"{"type":"object"}"#);
+        assert_eq!(first, second);
+        assert!(grammar
+            .valid_schemas
+            .lock()
+            .expect("schema cache lock")
+            .contains(r#"{"type":"object"}"#));
+    }
+
+    #[test]
+    fn a_schema_that_is_not_json_is_not_cached() {
+        let grammar = reasoning();
+        deferred(&grammar, "$$ANY$$");
+        assert!(!grammar
+            .valid_schemas
+            .lock()
+            .expect("schema cache lock")
+            .contains("$$ANY$$"));
+    }
+
+    #[test]
+    fn a_clone_shares_the_schema_cache() {
+        let grammar = reasoning();
+        let clone = grammar.clone();
+        deferred(&grammar, r#"{"type":"object"}"#);
+        assert!(clone
+            .valid_schemas
+            .lock()
+            .expect("schema cache lock")
+            .contains(r#"{"type":"object"}"#));
+    }
+
+    #[test]
+    fn two_reasoning_grammars_are_equal_when_they_constrain_the_same_way() {
+        assert_eq!(reasoning(), reasoning());
+        let mut other = reasoning();
+        other.markers = None;
+        assert_ne!(reasoning(), other);
+        let mut other = reasoning();
+        other.implicit_closer = Some(9);
+        assert_ne!(reasoning(), other);
+    }
 
     /// The cache over the nine-token vocabulary of `ts-grammar`'s tests.
     fn grammars(compile_timeout: Duration, max_retries: u32) -> Grammars {

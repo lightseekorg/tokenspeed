@@ -1860,13 +1860,13 @@ mod tests {
 
     #[test]
     fn commits_accumulate_reasoning_usage() {
-        let grammar = crate::grammar::ReasoningGrammar {
-            continues: String::new(),
-            may_open: String::new(),
-            schema_slot: String::new(),
-            markers: Some((1, 2)),
-            implicit_closer: None,
-        };
+        let grammar = crate::grammar::ReasoningGrammar::new(
+            String::new(),
+            String::new(),
+            String::new(),
+            Some((1, 2)),
+            None,
+        );
         let mut state = RequestState::new(vec![1], 10, BTreeSet::new(), true, None, false);
         state.reasoning_tokens = Some(crate::request::ReasoningTokens::new(
             &grammar,
@@ -1999,13 +1999,13 @@ mod tests {
         let mut p =
             OutputProcessor::new(None, 1, Some(4096), Role::Decode, NO_FINISH_LOG, true, None);
         register(&mut p, "a", 4, 8, &[]);
-        let grammar = crate::grammar::ReasoningGrammar {
-            continues: String::new(),
-            may_open: String::new(),
-            schema_slot: String::new(),
-            markers: Some((0, 2)),
-            implicit_closer: None,
-        };
+        let grammar = crate::grammar::ReasoningGrammar::new(
+            String::new(),
+            String::new(),
+            String::new(),
+            Some((0, 2)),
+            None,
+        );
         let state = p.states.get_mut("a").unwrap();
         state.reasoning_tokens = Some(crate::request::ReasoningTokens::new(
             &grammar,
