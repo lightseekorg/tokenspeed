@@ -1206,11 +1206,6 @@ class CacheGroupRouter(AttentionBackend):
             "gather_history_index_k_pages"
         ).gather_history_index_k_pages(layer_id, token_to_kv_pool, group)
 
-    def prefetch_history_kv_pages(self, layer, token_to_kv_pool) -> bool:
-        return self._sole_leaf("prefetch_history_kv_pages").prefetch_history_kv_pages(
-            layer, token_to_kv_pool
-        )
-
     def history_prefill_plan(self):
         return self._sole_leaf("history_prefill_plan").history_prefill_plan()
 
