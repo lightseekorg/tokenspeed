@@ -33,23 +33,27 @@ namespace tokenspeed {
 
 // A pool/group-scoped, sparse direct index. Packing is fixed for this group
 // in this pool; parent rebinding cannot alias another group's child slots.
-// Only touched segments allocate values. T{} denotes an absent entry.
+// Only touched segments allocate values. `empty`, given at construction,
+// denotes an absent entry; for list iterators, the owning list's end() (see
+// FlatPointerIndex).
 template <typename T>
 class SegmentedLocationIndex {
 public:
-    SegmentedLocationIndex(std::int32_t packing, std::int32_t parents) : packing_{packing}, parents_{parents} {}
+    SegmentedLocationIndex(std::int32_t packing, std::int32_t parents, T empty)
+        : packing_{packing}, parents_{parents}, empty_{empty} {}
 
+    // The entry at `location`, or the empty value.
     T Find(CacheBlockLocation location) const noexcept {
-        if (!valid(location)) return {};
+        if (!valid(location)) return empty_;
         const auto id = offset(location);
         const auto outer = id / (kSegmentSize * kDirectorySize);
-        if (outer >= directories_.size() || !directories_[outer]) return {};
+        if (outer >= directories_.size() || !directories_[outer]) return empty_;
         const auto& segment = directories_[outer]->segments[id / kSegmentSize % kDirectorySize];
-        return segment ? segment->values[id % kSegmentSize] : T{};
+        return segment ? segment->values[id % kSegmentSize] : empty_;
     }
 
     void Set(CacheBlockLocation location, T value) {
-        _assert(valid(location) && value != T{}, "a location index stores a live entry at a valid slot");
+        _assert(valid(location) && value != empty_, "a location index stores a live entry at a valid slot");
         const auto id = offset(location);
         const auto outer = id / (kSegmentSize * kDirectorySize);
         if (outer >= directories_.size()) directories_.resize(outer + 1);
@@ -57,11 +61,11 @@ public:
         if (!directory) directory = std::make_unique<Directory>();
         auto& segment = directory->segments[id / kSegmentSize % kDirectorySize];
         if (!segment) {
-            segment = std::make_unique<Segment>();
+            segment = std::make_unique<Segment>(empty_);
             ++directory->size;
         }
         auto& entry = segment->values[id % kSegmentSize];
-        if (entry == T{}) ++segment->size;
+        if (entry == empty_) ++segment->size;
         entry = value;
     }
 
@@ -73,8 +77,8 @@ public:
         auto& directory = directories_[outer];
         if (!directory) return;
         auto& segment = directory->segments[id / kSegmentSize % kDirectorySize];
-        if (!segment || segment->values[id % kSegmentSize] == T{}) return;
-        segment->values[id % kSegmentSize] = T{};
+        if (!segment || segment->values[id % kSegmentSize] == empty_) return;
+        segment->values[id % kSegmentSize] = empty_;
         if (--segment->size == 0) {
             segment.reset();
             if (--directory->size == 0) directory.reset();
@@ -85,7 +89,8 @@ private:
     static constexpr std::size_t kSegmentSize = 1024;
     static constexpr std::size_t kDirectorySize = 256;
     struct Segment {
-        std::array<T, kSegmentSize> values{};
+        explicit Segment(T empty) { values.fill(empty); }
+        std::array<T, kSegmentSize> values;
         std::size_t size{0};
     };
     struct Directory {
@@ -103,6 +108,7 @@ private:
 
     std::int32_t packing_;
     std::int32_t parents_;
+    T empty_;
     std::vector<std::unique_ptr<Directory>> directories_;
 };
 

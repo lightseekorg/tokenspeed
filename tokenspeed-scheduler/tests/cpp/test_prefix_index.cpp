@@ -24,6 +24,7 @@
 #include <array>
 #include <cstdint>
 #include <limits>
+#include <list>
 #include <map>
 #include <memory>
 #include <random>
@@ -217,7 +218,7 @@ TEST(PrefixCacheIndexInspectionTest, PackedLocationsAcrossSegmentsSurviveEvictio
 }
 
 TEST(SegmentedLocationIndex, SparseLargeLocationsAndEmptySegmentsCanBeReused) {
-    SegmentedLocationIndex<int*> index(/*packing=*/64, /*parents=*/10000000);
+    SegmentedLocationIndex<int*> index(/*packing=*/64, /*parents=*/10000000, /*empty=*/nullptr);
     int first = 1, last = 2;
     const CacheBlockLocation low{1, 0}, high{9000000, 63};
     index.Set(low, &first);
@@ -362,7 +363,7 @@ TEST(FlatPointerIndex, CollidingKeysSurviveGrowthWrappedClustersAndChurn) {
         std::size_t operator()(int) const { return 15; }
     };
     std::array<Entry, 256> entries;
-    FlatPointerIndex<const Entry*, int, KeyOfEntry, CollisionHash> index;
+    FlatPointerIndex<const Entry*, int, KeyOfEntry, CollisionHash> index{/*empty=*/nullptr};
     std::map<int, const Entry*> expected;
     for (int i = 0; i < 256; ++i) {
         entries[i].key = i;
@@ -417,7 +418,7 @@ TEST(FlatPointerIndex, ExtractObjectRemovesOnlyThatObjectAmongCollidingKeys) {
     };
     using Index = FlatPointerIndex<const Entry*, int, KeyOfEntry, WrappingHash>;
     std::array<Entry, 300> entries;
-    Index index;
+    Index index{/*empty=*/nullptr};
     const Entry absent{0};
     EXPECT_EQ(index.ExtractObject(absent.key, absent), nullptr);
     std::map<int, const Entry*> expected;
@@ -467,6 +468,43 @@ TEST(FlatPointerIndex, ExtractObjectRemovesOnlyThatObjectAmongCollidingKeys) {
     expect_contents();
     for (const auto& [key, entry] : expected) EXPECT_EQ(index.ExtractObject(key, *entry), entry);
     EXPECT_TRUE(index.empty());
+}
+
+// The owning list's end() is the empty handle: every handle the index stores,
+// returns or skips over compares against it as an iterator of the same list.
+TEST(FlatPointerIndex, ListIteratorsUseTheListEndForAbsentKeys) {
+    using List = std::list<int>;
+    struct KeyOfNode {
+        const int& operator()(List::iterator node) const { return *node; }
+    };
+    struct ShortHash {
+        std::size_t operator()(int key) const { return static_cast<std::size_t>(key % 5); }
+    };
+    List nodes;
+    FlatPointerIndex<List::iterator, int, KeyOfNode, ShortHash> index{nodes.end()};
+    EXPECT_EQ(index.Find(3), nodes.end());
+    for (int key = 0; key < 40; ++key) {
+        nodes.push_back(key);
+        ASSERT_TRUE(index.Insert(std::prev(nodes.end())));
+    }
+    EXPECT_EQ(index.Find(40), nodes.end());
+    for (auto node = nodes.begin(); node != nodes.end();) {
+        if (*node % 3 == 0) {
+            EXPECT_EQ(index.ExtractObject(*node, *node), node);
+            node = nodes.erase(node);
+        } else {
+            ++node;
+        }
+    }
+    for (int key = 0; key < 40; ++key) {
+        const auto node = index.Find(key);
+        if (key % 3 == 0) {
+            EXPECT_EQ(node, nodes.end()) << key;
+        } else {
+            ASSERT_NE(node, nodes.end()) << key;
+            EXPECT_EQ(*node, key);
+        }
+    }
 }
 
 TEST(PrefixCacheIndexInspectionTest, CompleteDigestIdentitySurvivesCommonLeadingBytes) {

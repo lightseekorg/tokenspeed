@@ -34,8 +34,11 @@ namespace tokenspeed {
 
 // Storage for one fixed node type on the scheduler control thread. Unlike a
 // general pool resource, freeing a node never searches the allocated chunks:
-// the freed slot itself links the free list. The owning container destroys its
-// objects before this resource, which retains chunks until owner destruction.
+// the freed slot itself links the free list. The first request fixes the slot
+// size and alignment; requests of any other shape, which a container may make
+// besides its nodes, go to the upstream new/delete resource. The owning
+// container destroys its objects before this resource, which retains chunks
+// until owner destruction.
 class FixedSlotResource final : public std::pmr::memory_resource {
 public:
     explicit FixedSlotResource(std::size_t slots_per_chunk) : slots_per_chunk_{slots_per_chunk} {
@@ -68,7 +71,9 @@ private:
             if (size > std::numeric_limits<std::size_t>::max() - (storage_alignment_ - 1)) throw std::bad_alloc{};
             stride_ = (size + storage_alignment_ - 1) / storage_alignment_ * storage_alignment_;
         }
-        FatalCheck(bytes == bytes_ && alignment == alignment_, "one fixed slot resource serves one node type");
+        if (bytes != bytes_ || alignment != alignment_) {
+            return std::pmr::new_delete_resource()->allocate(bytes, alignment);
+        }
         if (free_ == nullptr) {
             if (stride_ > std::numeric_limits<std::size_t>::max() / slots_per_chunk_) throw std::bad_alloc{};
             const auto chunk_bytes = stride_ * slots_per_chunk_;
@@ -86,7 +91,11 @@ private:
         return slot;
     }
     void do_deallocate(void* pointer, std::size_t bytes, std::size_t alignment) noexcept override {
-        FatalCheck(bytes == bytes_ && alignment == alignment_, "a slot returns to its original resource");
+        // A deallocation names the shape it was allocated with.
+        if (bytes != bytes_ || alignment != alignment_) {
+            std::pmr::new_delete_resource()->deallocate(pointer, bytes, alignment);
+            return;
+        }
         free_ = new (pointer) FreeSlot{free_};
     }
     bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override { return this == &other; }

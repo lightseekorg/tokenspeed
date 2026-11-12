@@ -289,11 +289,11 @@ public:
 
     Node* Find(const ContentHash& hash) {
         const auto it = nodes_.Find(hash);
-        return it == NodeIterator{} ? nullptr : &*it;
+        return it == node_storage_.end() ? nullptr : &*it;
     }
     const Node* Find(const ContentHash& hash) const {
         const auto it = nodes_.Find(hash);
-        return it == NodeIterator{} ? nullptr : &*it;
+        return it == node_storage_.end() ? nullptr : &*it;
     }
 
     // The oldest root; next_sibling walks the rest.
@@ -526,7 +526,7 @@ private:
     // its subtree's checkpoint boundaries counted in every new ancestor.
     Node& findOrAdd(const ContentHash& hash, Node* parent, std::int32_t boundary_tokens, std::int32_t tail_tokens) {
         auto it = nodes_.Find(hash);
-        const bool inserted = it == NodeIterator{};
+        const bool inserted = it == node_storage_.end();
         if (inserted) {
             node_storage_.emplace_back();
             it = std::prev(node_storage_.end());
@@ -656,7 +656,7 @@ private:
         // Erase by iterator: the node's own key must not be read after the
         // node is gone.
         const auto entry = nodes_.ExtractObject(*node.hash, node);
-        FatalCheck(entry != NodeIterator{}, "a removed boundary keeps its index entry");
+        FatalCheck(entry != node_storage_.end(), "a removed boundary keeps its index entry");
         node_storage_.erase(entry);
     }
 
@@ -679,7 +679,8 @@ private:
     // valid until their own node's ordinary last-holder removal.
     FixedSlotResource node_memory_{256};
     NodeList node_storage_{&node_memory_};
-    FlatPointerIndex<NodeIterator, ContentHash, NodeKey, std::hash<ContentHash>> nodes_;
+    // Answers node_storage_.end() for an absent hash.
+    FlatPointerIndex<NodeIterator, ContentHash, NodeKey, std::hash<ContentHash>> nodes_{node_storage_.end()};
     Node* first_root_{nullptr};
     Node* last_root_{nullptr};
     Node* first_host_leaf_{nullptr};

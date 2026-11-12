@@ -307,6 +307,31 @@ TEST(FixedSlotResource, AlignedNodesKeepTheirAddressAcrossGrowthAndReuse) {
     }
 }
 
+TEST(FixedSlotResource, RequestsOfAnotherShapeUseTheUpstreamResource) {
+    FixedSlotResource storage{4};
+    // The list's first node fixes the slot shape; the vector's growing
+    // buffers never match it.
+    std::pmr::list<std::int64_t> nodes{&storage};
+    std::pmr::vector<std::int64_t> values{&storage};
+    for (std::int64_t i = 0; i < 64; ++i) {
+        nodes.push_back(i);
+        values.push_back(-i);
+    }
+    std::int64_t expected = 0;
+    for (const std::int64_t node : nodes) EXPECT_EQ(node, expected++);
+    for (std::int64_t i = 0; i < 64; ++i) EXPECT_EQ(values[static_cast<std::size_t>(i)], -i);
+    // Another shape never took a slot: a freed node's slot is the next one
+    // handed out, across a vector reallocation.
+    const std::int64_t* freed = &nodes.back();
+    nodes.pop_back();
+    ASSERT_EQ(values.size(), values.capacity());
+    values.push_back(64);
+    nodes.push_back(99);
+    EXPECT_EQ(&nodes.back(), freed);
+    EXPECT_EQ(nodes.back(), 99);
+    EXPECT_EQ(values.back(), 64);
+}
+
 TEST(ShadowOccupancy, ConcurrentPlansAndReusedScratchHaveIndependentCapacity) {
     const CacheGroupSpec history{.cache_blocks_per_lcm_block = 2, .block_granularity = 4};
     std::vector<CacheGroup> groups;

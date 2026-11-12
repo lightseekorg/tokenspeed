@@ -402,7 +402,7 @@ public:
         }
         return std::ranges::any_of(cache_entries_by_pool_, [&](const auto& item) {
             const auto entry = item.second->by_location.Find(block_ref->Location());
-            return entry != CacheEntryIterator{} && entry->block_ref == block_ref;
+            return entry != item.second->entries.end() && entry->block_ref == block_ref;
         });
     }
 
@@ -778,7 +778,8 @@ public:
             _assert(cache_index != nullptr, "cached pool disappeared between match probe and acquisition");
             CacheEntryIterator entry_it =
                 findMatchedEntry(*cache_index, pool, keys[static_cast<std::size_t>(begin_blocks) + i], probe, i);
-            _assert(entry_it != CacheEntryIterator{}, "cached block disappeared between match probe and acquisition");
+            _assert(entry_it != cache_index->entries.end(),
+                    "cached block disappeared between match probe and acquisition");
             // The returned RAII owner pins the block. As for Find(), traversal
             // suspends its order node only if it actually reaches this entry.
             match.blocks[i] = entry_it->block_ref;
@@ -824,7 +825,7 @@ public:
             _assert(cache_index != nullptr, "cached pool disappeared between match probes");
             const auto entry_it =
                 findMatchedEntry(*cache_index, pool, keys[static_cast<std::size_t>(begin_blocks) + i], probe, i);
-            _assert(entry_it != CacheEntryIterator{}, "cached block disappeared between match probes");
+            _assert(entry_it != cache_index->entries.end(), "cached block disappeared between match probes");
             locations.push_back(entry_it->block_ref->Location());
         }
         return locations;
@@ -865,7 +866,7 @@ private:
     };
 
     struct CacheEntries {
-        CacheEntries(std::int32_t packing, std::int32_t parents) : by_location{packing, parents} {}
+        CacheEntries(std::int32_t packing, std::int32_t parents) : by_location{packing, parents, entries.end()} {}
         // The entry list allocates from entry_memory, the order indices and
         // lookup tables point into the list, and cursors and common peers
         // point at this object: it never copies or moves.
@@ -882,7 +883,8 @@ private:
         mutable OrderIndex available_order;
         OrderIndex common_order;
         CacheEntryList entries{&entry_memory};
-        FlatPointerIndex<CacheEntryIterator, CacheKey, EntryKey, CacheKeyHash> by_key;
+        // Both lookups answer entries.end() for an absent entry.
+        FlatPointerIndex<CacheEntryIterator, CacheKey, EntryKey, CacheKeyHash> by_key{entries.end()};
         SegmentedLocationIndex<CacheEntryIterator> by_location;
         // Traversal suspends entries it finds pinned by matched acquisition,
         // Find(), or any other owner.
@@ -1007,27 +1009,24 @@ private:
         if (probe.location_pool == &pool && offset < probe.locations.size() &&
             probe.locations[offset].lcm_block_id > 0) {
             const auto entry = entries.by_location.Find(probe.locations[offset]);
-            if (entry != CacheEntryIterator{} && entry->key == key) return entry;
+            if (entry != entries.entries.end() && entry->key == key) return entry;
         }
         return entries.by_key.Find(key);
     }
+    // An absent entry is entries.end().
     CacheEntryIterator findEntry(CacheEntries& cache_index, const CacheKey& key) {
         validateKey(key);
-        const auto entry = cache_index.by_key.Find(key);
-        return entry == CacheEntryIterator{} ? cache_index.entries.end() : entry;
+        return cache_index.by_key.Find(key);
     }
     CacheEntryIterator findEntry(CacheEntries& cache_index, CacheBlockLocation location) {
-        const auto entry = cache_index.by_location.Find(location);
-        return entry == CacheEntryIterator{} ? cache_index.entries.end() : entry;
+        return cache_index.by_location.Find(location);
     }
     ConstCacheEntryIterator findEntry(const CacheEntries& cache_index, const CacheKey& key) const {
         validateKey(key);
-        const auto entry = cache_index.by_key.Find(key);
-        return entry == CacheEntryIterator{} ? cache_index.entries.end() : entry;
+        return cache_index.by_key.Find(key);
     }
     ConstCacheEntryIterator findEntry(const CacheEntries& cache_index, CacheBlockLocation location) const {
-        const auto entry = cache_index.by_location.Find(location);
-        return entry == CacheEntryIterator{} ? cache_index.entries.end() : entry;
+        return cache_index.by_location.Find(location);
     }
     template <typename BeforeErase>
     std::optional<CacheKey> evictWith(const BlockPool& pool, CacheBlockLocation location, BeforeErase&& before_erase) {

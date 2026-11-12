@@ -28,18 +28,24 @@
 
 namespace tokenspeed {
 
-// An open-addressed index over stable, externally owned objects. T{} is the
-// empty handle. Growing or backward-shifting slots never moves an object or
-// its key. Callers erase its handle before destroying or changing its key.
-// Slot order is deliberately not exposed as a traversal order.
+// An open-addressed index over stable, externally owned objects. `empty`, given
+// at construction, is the handle of no object: for list iterators, the owning
+// list's end(), which stays valid for the list's lifetime and compares
+// defined against its other iterators (a value-initialized iterator does
+// not). Growing or backward-shifting slots never moves an object or its key.
+// Callers erase its handle before destroying or changing its key. Slot order
+// is deliberately not exposed as a traversal order.
 template <typename T, typename Key, typename KeyOf, typename Hash>
 class FlatPointerIndex {
 public:
+    explicit FlatPointerIndex(T empty) : empty_{empty} {}
+
+    // The object's handle, or the empty handle.
     T Find(const Key& key) const {
-        if (slots_.empty()) return {};
+        if (slots_.empty()) return empty_;
         const auto hash = Hash{}(key);
         const auto position = find(key, hash);
-        return position == slots_.size() ? T{} : slots_[position].value;
+        return position == slots_.size() ? empty_ : slots_[position].value;
     }
 
     bool Insert(T value) {
@@ -52,54 +58,59 @@ public:
         return true;
     }
 
-    // Removes and returns the borrowed handle in one lookup. The caller still
-    // owns the object and can destroy it after its index entry has gone.
+    // Removes and returns the borrowed handle in one lookup, or returns the
+    // empty handle. The caller still owns the object and can destroy it after
+    // its index entry has gone.
     T Extract(const Key& key) {
-        if (slots_.empty()) return {};
+        if (slots_.empty()) return empty_;
         const std::size_t position = find(key, Hash{}(key));
-        return position == slots_.size() ? T{} : removeAt(position);
+        return position == slots_.size() ? empty_ : removeAt(position);
     }
 
     // Extract for a caller holding the indexed object itself: `key` is that
     // object's own key. Slots match by cached hash and object identity, so no
-    // stored key is read or compared. Returns T{} when the object is not
-    // indexed under `key`.
+    // stored key is read or compared. Returns the empty handle when the
+    // object is not indexed under `key`.
     template <typename Object>
     T ExtractObject(const Key& key, const Object& object) {
-        if (slots_.empty()) return {};
+        if (slots_.empty()) return empty_;
+        const T empty = empty_;
         const auto hash = Hash{}(key);
         const auto mask = slots_.size() - 1;
-        for (auto position = hash & mask; slots_[position].value != T{}; position = (position + 1) & mask) {
+        for (auto position = hash & mask; slots_[position].value != empty; position = (position + 1) & mask) {
             if (slots_[position].hash == hash && std::addressof(*slots_[position].value) == std::addressof(object)) {
                 return removeAt(position);
             }
         }
-        return {};
+        return empty;
     }
 
-    bool Erase(const Key& key) { return Extract(key) != T{}; }
+    bool Erase(const Key& key) { return Extract(key) != empty_; }
 
     std::size_t size() const noexcept { return size_; }
     bool empty() const noexcept { return size_ == 0; }
-    bool contains(const Key& key) const { return Find(key) != T{}; }
+    bool contains(const Key& key) const { return Find(key) != empty_; }
 
 private:
     struct Slot {
-        std::size_t hash{0};
-        T value{};
+        std::size_t hash;
+        T value;
     };
     std::size_t find(const Key& key, std::size_t hash) const {
+        const T empty = empty_;
         const auto mask = slots_.size() - 1;
-        for (auto position = hash & mask; slots_[position].value != T{}; position = (position + 1) & mask) {
+        for (auto position = hash & mask; slots_[position].value != empty; position = (position + 1) & mask) {
             const auto& slot = slots_[position];
             if (slot.hash == hash && KeyOf{}(slot.value) == key) return position;
         }
         return slots_.size();
     }
     T removeAt(std::size_t hole) {
+        // A local copy: stores into the slots may alias the member.
+        const T empty = empty_;
         const T value = slots_[hole].value;
         const auto mask = slots_.size() - 1;
-        for (auto next = (hole + 1) & mask; slots_[next].value != T{}; next = (next + 1) & mask) {
+        for (auto next = (hole + 1) & mask; slots_[next].value != empty; next = (next + 1) & mask) {
             const auto home = slots_[next].hash & mask;
             // Move an entry only when the hole is on its probe path. This
             // also handles clusters crossing the end of the table.
@@ -108,23 +119,26 @@ private:
                 hole = next;
             }
         }
-        slots_[hole] = {};
+        slots_[hole] = Slot{0, empty};
         --size_;
         return value;
     }
-    static void put(std::vector<Slot>& slots, Slot value) {
+    void put(std::vector<Slot>& slots, Slot value) const {
+        const T empty = empty_;
         const auto mask = slots.size() - 1;
         auto position = value.hash & mask;
-        while (slots[position].value != T{}) position = (position + 1) & mask;
+        while (slots[position].value != empty) position = (position + 1) & mask;
         slots[position] = value;
     }
     void grow() {
-        std::vector<Slot> next(slots_.empty() ? 16 : 2 * slots_.size());
+        const T empty = empty_;
+        std::vector<Slot> next(slots_.empty() ? 16 : 2 * slots_.size(), Slot{0, empty});
         for (const auto& slot : slots_)
-            if (slot.value != T{}) put(next, slot);
+            if (slot.value != empty) put(next, slot);
         slots_.swap(next);
     }
 
+    T empty_;
     std::vector<Slot> slots_;
     std::size_t size_{0};
 };
