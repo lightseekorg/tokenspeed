@@ -54,8 +54,8 @@ TEST(ShadowOccupancy, AReleasedHostParentCannotAlsoLeaveHistorySlotsBehind) {
     const CacheGroupSpec history{.cache_blocks_per_lcm_block = 6, .block_granularity = 4};
     const CacheGroupSpec state{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0};
     std::vector<CacheGroup> groups;
-    groups.emplace_back(history, std::make_unique<GroupAllocator>(6, 0, 1), MakePrefixMatcher(history));
-    groups.emplace_back(state, std::make_unique<GroupAllocator>(1, 1, 1), MakePrefixMatcher(state));
+    groups.emplace_back(history, std::make_unique<GroupAllocator>(6, 0, 1, 0), MakePrefixMatcher(history));
+    groups.emplace_back(state, std::make_unique<GroupAllocator>(1, 1, 1, 0), MakePrefixMatcher(state));
     BlockPool host{1, {8, 1}};
     host.RegisterGroup(0, 8, 1);
     host.RegisterGroup(1, 1, 1);
@@ -76,7 +76,7 @@ TEST(ShadowOccupancy, AReleasedHostParentCannotAlsoLeaveHistorySlotsBehind) {
 }
 
 TEST(HostPacking, ABlockIdUsesTheOwningPoolsPacking) {
-    GroupAllocator allocator{4, 0, 2};
+    GroupAllocator allocator{4, 0, 2, 0};
     BlockPool device{2, {4}};
     BlockPool host{2, {6}};
     device.RegisterGroup(0, 4, 2);

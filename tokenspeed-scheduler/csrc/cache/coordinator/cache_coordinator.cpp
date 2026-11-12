@@ -376,6 +376,11 @@ CacheCoordinator::BlockRange CacheCoordinator::SlidingWindowBlocks(std::int32_t 
     return BlockRange{.first = first_row / block_granularity, .past_end = past_end};
 }
 
+CacheCoordinator::BlockRange CacheCoordinator::SinkBlocksBelow(std::int32_t i, const BlockRange& window) const {
+    const std::int32_t sink_blocks = groups_[static_cast<std::size_t>(i)].Allocator().KeptHeadBlocks();
+    return BlockRange{.first = 0, .past_end = std::min(sink_blocks, window.first)};
+}
+
 CacheCoordinator::BlockRange CacheCoordinator::CopyInSlots(std::size_t i, std::int32_t tokens) const {
     _assert(i < groups_.size() && tokens >= 0, "copy-in slots of a group at a non-negative frontier");
     const auto group = static_cast<std::int32_t>(i);
@@ -755,7 +760,7 @@ bool CacheCoordinator::groupAcceptsBoundary(std::size_t i, std::span<const std::
         return true;
     }
     // A sliding window resumes at T when the blocks holding rows
-    // [T - W + 1, T) are cached.
+    // [T - W + 1, T) are cached, and with a sink the blocks holding it.
     const std::int32_t block_granularity = geometry_[i].BlockGranularity();
     const std::int32_t blocks_per_page = prefix_granularity_ / block_granularity;
     const std::int32_t floor_blocks = floor_tokens / block_granularity;
@@ -766,17 +771,17 @@ bool CacheCoordinator::groupAcceptsBoundary(std::size_t i, std::span<const std::
     if (page_hits != nullptr) {
         page_hits->hits.assign(static_cast<std::size_t>(std::max(full_blocks - floor_blocks, 0)), 0);
     }
-    for (std::int32_t block = window.first; block < window.past_end; ++block) {
+    const auto holds = [&](std::int32_t block) {
         if (block >= full_blocks) {
             const auto j = static_cast<std::size_t>(block - full_blocks);
             if (!contains(tail_keys[j])) {
                 return false;
             }
             tail_hits.hits[j] = 1;
-            continue;
+            return true;
         }
         if (block < floor_blocks) {
-            continue;
+            return true;
         }
         const CacheKey page_key{.group_id = group.Id(),
                                 .content_hash = prefix_hashes[static_cast<std::size_t>(block / blocks_per_page)],
@@ -786,6 +791,14 @@ bool CacheCoordinator::groupAcceptsBoundary(std::size_t i, std::span<const std::
         }
         if (page_hits != nullptr) {
             page_hits->hits[static_cast<std::size_t>(block - floor_blocks)] = 1;
+        }
+        return true;
+    };
+    for (const BlockRange& needed : {SinkBlocksBelow(static_cast<std::int32_t>(i), window), window}) {
+        for (std::int32_t block = needed.first; block < needed.past_end; ++block) {
+            if (!holds(block)) {
+                return false;
+            }
         }
     }
     return true;
@@ -1048,11 +1061,14 @@ void CacheCoordinator::probeHostSuffix(const PromptPrefix& prompt, std::span<con
             }
             const std::int32_t block_granularity = geometry_[i].BlockGranularity();
             const BlockRange window = SlidingWindowBlocks(static_cast<std::int32_t>(i), boundary);
-            for (std::int32_t block = window.first; block < std::min(window.past_end, split_tokens / block_granularity);
-                 ++block) {
-                if (!groups_[i].Index().Contains(pool_, group_keys[i][static_cast<std::size_t>(block)])) {
-                    split_tokens = block * block_granularity - block * block_granularity % prefix_granularity_;
-                    break;
+            // Lowest first: a missing sink block lowers the split under the window.
+            for (const BlockRange& needed : {SinkBlocksBelow(static_cast<std::int32_t>(i), window), window}) {
+                for (std::int32_t block = needed.first;
+                     block < std::min(needed.past_end, split_tokens / block_granularity); ++block) {
+                    if (!groups_[i].Index().Contains(pool_, group_keys[i][static_cast<std::size_t>(block)])) {
+                        split_tokens = block * block_granularity - block * block_granularity % prefix_granularity_;
+                        break;
+                    }
                 }
             }
         }
@@ -1115,11 +1131,14 @@ void CacheCoordinator::probeHostSuffix(const PromptPrefix& prompt, std::span<con
                 host_hits[i].hits.assign(static_cast<std::size_t>((page_tokens - split_tokens) / block_granularity), 1);
                 continue;
             }
-            // The window blocks below the split, all on the Device by the split.
+            // The sink and window blocks below the split, all on the Device by the split.
             const BlockRange window = SlidingWindowBlocks(static_cast<std::int32_t>(i), boundary);
             device_hits[i].hits.assign(static_cast<std::size_t>(split_tokens / block_granularity), 0);
-            for (std::int32_t block = window.first; block < split_tokens / block_granularity; ++block) {
-                device_hits[i].hits[static_cast<std::size_t>(block)] = 1;
+            for (const BlockRange& needed : {SinkBlocksBelow(static_cast<std::int32_t>(i), window), window}) {
+                for (std::int32_t block = needed.first;
+                     block < std::min(needed.past_end, split_tokens / block_granularity); ++block) {
+                    device_hits[i].hits[static_cast<std::size_t>(block)] = 1;
+                }
             }
         }
         // The longest boundary whose KV the two tiers hold: the Host's KV
@@ -1281,11 +1300,14 @@ std::vector<CacheCoordinator::PrefixBoundaryAvailability> CacheCoordinator::Insp
                             }
                         } else {
                             const BlockRange window = SlidingWindowBlocks(static_cast<std::int32_t>(i), boundary);
-                            for (std::int32_t block = window.first; available && block < window.past_end; ++block) {
-                                const CacheKey& key = block < full_blocks
-                                                          ? keys[i][static_cast<std::size_t>(block)]
-                                                          : tail_keys[static_cast<std::size_t>(block - full_blocks)];
-                                available = contains(i, key, tier);
+                            for (const BlockRange& needed :
+                                 {SinkBlocksBelow(static_cast<std::int32_t>(i), window), window}) {
+                                for (std::int32_t block = needed.first; available && block < needed.past_end; ++block) {
+                                    const CacheKey& key =
+                                        block < full_blocks ? keys[i][static_cast<std::size_t>(block)]
+                                                            : tail_keys[static_cast<std::size_t>(block - full_blocks)];
+                                    available = contains(i, key, tier);
+                                }
                             }
                         }
                     }
@@ -1442,8 +1464,11 @@ std::int32_t CacheCoordinator::CountActiveLcmBlocks(std::span<const std::span<co
     std::vector<std::uint8_t> seen(static_cast<std::size_t>(pool_.NumLcmBlocks()) + 1, 0);
     std::int32_t active = 0;
     for (std::span<const BlockTable> tables : request_tables) {
-        for (const BlockTable& table : tables) {
-            for (const CacheBlockRef& block_ref : table.Blocks().subspan(table.ReclaimedPrefixBlocks())) {
+        _assert(tables.empty() || tables.size() == groups_.size(), "tables/groups size mismatch");
+        for (std::size_t i = 0; i < tables.size(); ++i) {
+            const BlockTable& table = tables[i];
+            const std::int32_t released = groups_[i].Allocator().LeadingReleasedBlocks(table);
+            for (const CacheBlockRef& block_ref : table.Blocks().subspan(static_cast<std::size_t>(released))) {
                 if (!block_ref) {
                     continue;
                 }
@@ -2393,7 +2418,8 @@ std::vector<CacheKey> CacheCoordinator::BoundaryCheckpointKeys(std::span<const s
                 const std::int32_t block = range.first_cache_block + static_cast<std::int32_t>(j);
                 const auto behind = [&](std::int32_t kept_tokens) {
                     const BlockRange window = SlidingWindowBlocks(static_cast<std::int32_t>(i), kept_tokens);
-                    return block >= window.first && block < window.past_end;
+                    return (block >= window.first && block < window.past_end) ||
+                           block < SinkBlocksBelow(static_cast<std::int32_t>(i), window).past_end;
                 };
                 if (sliding && std::ranges::any_of(kept_boundaries, behind)) {
                     continue;
@@ -2615,14 +2641,23 @@ std::vector<CacheCoordinator::PublishedRange> CacheCoordinator::completedBlockRa
     const std::int32_t state_checkpoint_tokens = completed.state_checkpoint_pages * prefix_granularity_;
     for (const std::int32_t boundary_tokens : boundaries) {
         const BlockRange window = SlidingWindowBlocks(static_cast<std::int32_t>(group_index), boundary_tokens);
-        if (window.first >= window.past_end) {
+        const BlockRange sink_blocks = SinkBlocksBelow(static_cast<std::int32_t>(group_index), window);
+        if (window.first >= window.past_end && sink_blocks.first >= sink_blocks.past_end) {
             continue;
         }
         PublishedRange range = history_range(window.first, window.past_end);
         if (state_checkpoint_tokens > 0 && boundary_tokens == state_checkpoint_tokens) {
             range.boundary_kind = CacheBoundaryKind::kEndpoint;
         }
-        ranges.push_back(std::move(range));
+        if (sink_blocks.first < sink_blocks.past_end) {
+            PublishedRange sink = history_range(sink_blocks.first, sink_blocks.past_end);
+            sink.boundary_kind = range.boundary_kind;
+            sink.sink = true;
+            ranges.push_back(std::move(sink));
+        }
+        if (!range.keys.empty()) {
+            ranges.push_back(std::move(range));
+        }
     }
     return ranges;
 }
@@ -2700,6 +2735,9 @@ std::int32_t CacheCoordinator::FirstPublishedPage(const CompletedPages& complete
     std::int32_t first_page = completed.first_new_prefix_page;
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         for (const PublishedRange& range : completedBlockRanges(i, completed)) {
+            if (range.sink) {
+                continue;  // PublishedSinkPages names these pages
+            }
             // A State group's one key is the point itself: the deepest page
             // unless a tail is published. A history group's run starts at
             // slot first_cache_block.
@@ -2715,6 +2753,23 @@ std::int32_t CacheCoordinator::FirstPublishedPage(const CompletedPages& complete
     // below the first new one. A sliding window behind it is one of the
     // ranges read above.
     return first_page;
+}
+
+std::int32_t CacheCoordinator::PublishedSinkPages(const CompletedPages& completed) const {
+    std::int32_t pages = 0;
+    for (std::size_t i = 0; i < groups_.size(); ++i) {
+        if (groups_[i].Allocator().KeptHeadBlocks() == 0) {
+            continue;
+        }
+        const std::int32_t blocks_per_page = BlocksPerBoundary(static_cast<std::int32_t>(i));
+        for (const PublishedRange& range : completedBlockRanges(i, completed)) {
+            if (range.sink) {
+                const std::int32_t past_end = range.first_cache_block + static_cast<std::int32_t>(range.keys.size());
+                pages = std::max(pages, (past_end + blocks_per_page - 1) / blocks_per_page);
+            }
+        }
+    }
+    return pages;
 }
 
 void CacheCoordinator::ReclaimExpired(std::span<BlockTable> tables, std::int32_t num_computed_tokens) {
@@ -2758,11 +2813,14 @@ std::vector<CacheBlockRef> CacheCoordinator::RetainInputCheckpoint(std::span<con
         }
         const BlockRange window = SlidingWindowBlocks(static_cast<std::int32_t>(i), boundary_tokens);
         const std::int32_t blocks_per_boundary = BlocksPerBoundary(static_cast<std::int32_t>(i));
-        for (std::int32_t slot = window.first; slot < window.past_end; ++slot) {
-            if (!retain(CacheKey{.group_id = groups_[i].Id(),
+        for (const BlockRange& needed : {SinkBlocksBelow(static_cast<std::int32_t>(i), window), window}) {
+            for (std::int32_t slot = needed.first; slot < needed.past_end; ++slot) {
+                if (!retain(
+                        CacheKey{.group_id = groups_[i].Id(),
                                  .content_hash = prefix_hashes[static_cast<std::size_t>(slot / blocks_per_boundary)],
                                  .page_offset = slot % blocks_per_boundary})) {
-                return {};
+                    return {};
+                }
             }
         }
     }
@@ -3132,7 +3190,7 @@ std::unique_ptr<PrefixMatcher> MakePrefixMatcher(const CacheGroupSpec& spec) {
         case AttnKind::kSlidingWindow:
             _assert(spec.block_granularity > 0, "group block_granularity must be > 0");
             _assert(spec.sliding_window > 0, "sliding window group requires a positive window");
-            return std::make_unique<SwaMatcher>(spec.block_granularity, spec.sliding_window);
+            return std::make_unique<SwaMatcher>(spec.block_granularity, spec.sliding_window, spec.sink_tokens);
         default:
             FatalCheck(false, "unknown AttnKind in coordinator group spec");
             return nullptr;
@@ -3160,7 +3218,17 @@ CacheCoordinator MakeCoordinator(std::span<const CacheGroupSpec> specs, std::int
             _assert(spec.block_granularity > 0 && prefix_granularity % spec.block_granularity == 0,
                     "group block_granularity must be a positive divisor of the prefix granularity");
         }
-        auto allocator = std::make_unique<GroupAllocator>(spec.cache_blocks_per_lcm_block, group_id, spec.shard_count);
+        std::int32_t sink_blocks = 0;
+        if (spec.sink_tokens > 0) {
+            _assert(spec.attn_kind == AttnKind::kSlidingWindow && !spec.replayable,
+                    "only a cached sliding-window group keeps a sink");
+            // A window of at least a prefix page needs every block of a tail,
+            // so a tail in the sink's page holds the sink blocks as well.
+            _assert(spec.sliding_window >= prefix_granularity, "a sink group's window must cover a prefix page");
+            sink_blocks = spec.sink_tokens / spec.block_granularity + (spec.sink_tokens % spec.block_granularity != 0);
+        }
+        auto allocator =
+            std::make_unique<GroupAllocator>(spec.cache_blocks_per_lcm_block, group_id, spec.shard_count, sink_blocks);
         groups.emplace_back(spec, std::move(allocator), MakePrefixMatcher(spec));
     }
     return CacheCoordinator{std::move(groups),

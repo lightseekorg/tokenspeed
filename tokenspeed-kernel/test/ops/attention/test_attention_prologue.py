@@ -1885,8 +1885,12 @@ def _mrope(rotary: Rotary, section: tuple[int, ...]) -> Rotary:
         (dict(q=lambda r: r["q"].view(4, 4, 1, 64)), "is not \\[tokens"),
         (dict(q=lambda r: r["q"][0, 0]), "is not \\[tokens"),
         # Caches: dense rows of packed heads, one geometry and dtype.
-        (dict(cache__k_cache=lambda c: c.k_cache.unsqueeze(1)), "slots, heads"),
+        (
+            dict(cache__k_cache=lambda c: c.k_cache.unsqueeze(1).unsqueeze(1)),
+            "slots, heads",
+        ),
         (dict(cache__k_cache=lambda c: c.k_cache.flatten(1)), "slots, heads"),
+        (dict(cache__k_cache=lambda c: c.k_cache.unsqueeze(1)), "one geometry"),
         (dict(cache__v_cache=lambda c: c.v_cache[..., :32]), "one geometry"),
         (dict(cache__v_cache=lambda c: c.v_cache[:, :1].contiguous()), "one geometry"),
         (dict(cache__v_cache=lambda c: c.v_cache[:2]), "one geometry"),

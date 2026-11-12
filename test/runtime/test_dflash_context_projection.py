@@ -118,6 +118,11 @@ def _sink_drafter(model, device, max_bs: int, spec_num_tokens: int):
         max_bs=max_bs,
         positions_buf=torch.arange(max_bs * spec_num_tokens, device=device),
     )
+    drafter.attn_backend = SimpleNamespace(
+        decode_window_locations=lambda: (
+            torch.arange(max_bs * spec_num_tokens, device=device) + 100
+        )
+    )
     drafter._fused_kv_enabled = True
     drafter._init_context_taps()
     assert drafter._tap_rows is not None

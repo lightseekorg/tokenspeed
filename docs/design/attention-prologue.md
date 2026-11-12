@@ -408,3 +408,9 @@ Attention-front FP8 projection warmup visits every layer and deduplicates by
 device and weight shape. The initial window-only layers have no indexer, and
 canonical Q weights remain active when fused attention is unavailable, so
 neither the first layer nor the fused Q copy alone covers every projection.
+
+A head cache may retain explicit ``[pages, rows, heads, dim]`` axes when its
+K and V fields share a plane. Prologue and context scatters resolve a token
+slot as ``page * page_stride + row * row_stride``; flattening these pages
+would discard the gap occupied by the other field. Dense row caches keep
+their existing three-dimensional views.
