@@ -28,6 +28,8 @@ from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 global_server_args_dict: dict = {
+    "model": None,
+    "revision": None,
     "disaggregation_mode": ServerArgs.disaggregation_mode,
     "attention_backend": ServerArgs.attention_backend,
     "sampling_backend": ServerArgs.sampling_backend,
@@ -97,6 +99,8 @@ def global_server_args_dict_update(server_args: ServerArgs):
     pdl_enabled(not server_args.disable_pdl)
     global_server_args_dict.update(
         {
+            "model": server_args.model,
+            "revision": server_args.revision,
             "disaggregation_mode": server_args.disaggregation_mode,
             "attention_backend": server_args.attention_backend,
             "sampling_backend": server_args.sampling_backend,

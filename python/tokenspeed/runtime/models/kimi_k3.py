@@ -76,6 +76,10 @@ from tokenspeed_kernel.ops.attention.mla import (
 )
 from tokenspeed_kernel.ops.communication import allreduce_fusion_lane
 from tokenspeed_kernel.ops.communication.flashinfer import get_flashinfer_moe_alltoall
+from tokenspeed_kernel.ops.communication.peer_weights import (
+    ExpertPartition,
+    create_peer_weight_store,
+)
 from tokenspeed_kernel.ops.gemm import (
     kimi3_mla_qkv_gate_projection,
     kimi3_qkvfab_projection,
@@ -138,6 +142,7 @@ from tokenspeed.runtime.layers.moe.latent import (
     latent_moe_expert_shared_all_reduce,
 )
 from tokenspeed.runtime.layers.moe.loader import build_moe_checkpoint_loader
+from tokenspeed.runtime.layers.moe.peer_weights import MoEPeerWeights
 from tokenspeed.runtime.layers.moe.schema import ExpertCheckpointSchema
 from tokenspeed.runtime.layers.moe.topk import (
     StandardTopKOutput,
@@ -2243,6 +2248,7 @@ class KimiLinearMoE(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         alt_stream: torch.cuda.Stream | None = None,
+        peer_weights: MoEPeerWeights | None = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -2251,7 +2257,7 @@ class KimiLinearMoE(nn.Module):
         self.iris_state: K3IrisState | None = None
         # Decoder layers inspect this even when attention DP skips native setup.
         self.native_latent_moe: LatentMoELayer | None = None
-        if mapping.attn.dp_size > 1:
+        if mapping.attn.dp_size > 1 and mapping.moe.tp_ep_size > 1:
             if not (mapping.attn.dp_size == mapping.moe.ep_size == mapping.world_size):
                 raise ValueError(
                     "Kimi-K3 attention DP requires attention DP == MoE EP == world size."
@@ -2333,6 +2339,7 @@ class KimiLinearMoE(nn.Module):
             tp_size=mapping.moe.tp_size,
             ep_rank=mapping.moe.ep_rank,
             ep_size=mapping.moe.ep_size,
+            peer_weights=peer_weights,
             activation="situ",
             activation_situ_beta=situ_beta,
             activation_situ_linear_beta=situ_linear_beta,
@@ -2465,7 +2472,7 @@ class KimiLinearMoE(nn.Module):
         )
         self._topk_ready = (
             torch.cuda.Event()
-            if mapping.attn.dp_size == 1
+            if (mapping.attn.dp_size == 1 or mapping.moe.tp_ep_size == 1)
             and alt_stream is not None
             and self.experts.supports_precomputed_topk
             else None
@@ -2506,7 +2513,7 @@ class KimiLinearMoE(nn.Module):
         # TP8 decode chain over Lamport mailboxes; bound by prepare_communication_runtime.
         self.decode_moe: KimiK3DecodeMoELayer | None = None
 
-        if mapping.attn.dp_size > 1:
+        if mapping.attn.dp_size > 1 and mapping.moe.tp_ep_size > 1:
             self.moe_alltoall = None
             if self.execution_plan.owns_ep_communication:
                 if layer_index == config.first_k_dense_replace:
@@ -3345,7 +3352,7 @@ class KimiLinearMoE(nn.Module):
             raise ValueError(
                 "A residual with only this rank's rows requires matching TP8 groups and one eighth of the token rows"
             )
-        if self.mapping.attn.dp_size > 1:
+        if self.mapping.attn.dp_size > 1 and self.mapping.moe.tp_ep_size > 1:
             if ctx is None:
                 raise ValueError("Kimi-K3 attention DP requires a ForwardContext.")
             return self._forward_attn_dp(hidden_states, prefix_sum, ctx)
@@ -3452,6 +3459,7 @@ def create_kimi_linear_moe(
     quant_config: QuantizationConfig | None,
     prefix: str,
     alt_stream: torch.cuda.Stream | None,
+    peer_weights: MoEPeerWeights | None = None,
 ) -> nn.Module:
     """Construct K3 MoE with the token ownership required by its transport.
 
@@ -3463,7 +3471,11 @@ def create_kimi_linear_moe(
         from tokenspeed.runtime.models.kimi_k3_deepep import KimiLinearMoEDeepEP
 
         implementation = KimiLinearMoEDeepEP
+    if peer_weights is not None and implementation is not KimiLinearMoE:
+        raise ValueError("Peer expert weights require the local MoE implementation")
+    peer_kwargs = {"peer_weights": peer_weights} if peer_weights is not None else {}
     return implementation(
+        **peer_kwargs,
         config=config,
         mapping=mapping,
         layer_index=layer_index,
@@ -3499,6 +3511,7 @@ class KimiLinearDecoderLayer(nn.Module):
         *,
         qkv_parallel: DenseLayerMapping | None,
         output_parallel: DenseLayerMapping | None,
+        peer_weights: MoEPeerWeights | None = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -3563,6 +3576,7 @@ class KimiLinearDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("block_sparse_moe", prefix),
                 alt_stream=alt_stream,
+                peer_weights=peer_weights,
             )
         else:
             self.mlp = KimiLinearMLP(
@@ -4190,6 +4204,32 @@ class KimiLinearModel(nn.Module):
         self.mapping = mapping
         self.quant_config = quant_config
         self.iris_states = K3AttnComm.iris_states
+        self.peer_weights: MoEPeerWeights | None = None
+        if mapping.moe_weight_sharing_size is not None:
+            from tokenspeed.runtime.distributed.process_group_manager import (
+                process_group_manager,
+            )
+
+            if get_all2all_backend() is not All2AllBackend.NONE:
+                raise ValueError("Peer expert weights require --all2all-backend none")
+            group_ranks = mapping.moe_weight_group
+            process_group_manager.init_process_group(
+                group_ranks, backend="gloo", name="moe_weights"
+            )
+            group = process_group_manager.get_process_group(
+                "gloo", group_ranks, name="moe_weights"
+            )
+            partition = ExpertPartition(config.num_experts, group.rank(), group.size())
+            store = create_peer_weight_store(
+                partition=partition,
+                group=group,
+                device=torch.device("cuda", torch.cuda.current_device()),
+                model_identity=f"{global_server_args_dict['model']}@{global_server_args_dict['revision']}",
+                pool_page_bytes=16 * 1024**2,
+                copy_implementation="simple",
+                solution="cuda",
+            )
+            self.peer_weights = MoEPeerWeights(partition=partition, store=store)
 
         # Agree on parsed sizes before any shared-expert subgroup is created.
         shared_size = envs.TOKENSPEED_KIMI_K3_SHARED_EXPERT_TP_SIZE.get()
@@ -4205,6 +4245,14 @@ class KimiLinearModel(nn.Module):
             envs.TOKENSPEED_KIMI_K3_QKV_PROJ_TP_SIZE.get(),
             envs.TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE.get(),
         )
+
+        if self.peer_weights is not None and any(
+            layout is not None and layout.tp_size > 1
+            for layout in (shared_parallel, qkv_parallel, output_parallel)
+        ):
+            raise ValueError(
+                "Peer expert weights require local shared-expert and attention projections"
+            )
 
         alt_stream = (
             torch.cuda.Stream(priority=-1) if torch.cuda.is_available() else None
@@ -4240,6 +4288,7 @@ class KimiLinearModel(nn.Module):
                 alt_stream=alt_stream,
                 qkv_parallel=qkv_parallel,
                 output_parallel=output_parallel,
+                peer_weights=self.peer_weights,
             )
 
         self.layers = make_layers(
@@ -4486,6 +4535,8 @@ class KimiLinearModel(nn.Module):
             )
 
         prefix_sum = hidden_states
+        if self.peer_weights is not None and hidden_states.shape[0] > 0:
+            self.peer_weights.prefetch_first()
 
         def capture_tap(layer_idx: int) -> None:
             self._capture_tap(
@@ -4733,6 +4784,14 @@ class KimiLinearForCausalLM(BaseCausalLM):
 
     model_cls = KimiLinearModel
     supports_aux_capture = True
+
+    def post_quant_warmup(self) -> None:
+        if self.model.peer_weights is not None:
+            self.model.peer_weights.finalize()
+
+    def close_peer_weights(self) -> None:
+        if self.model.peer_weights is not None:
+            self.model.peer_weights.close()
 
     def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
         shared_mlps = [
@@ -5171,8 +5230,16 @@ class KimiLinearForCausalLM(BaseCausalLM):
                 gate_proj_name="w1", up_proj_name="w3", down_proj_name="w2"
             ),
             num_experts=config.num_experts,
-            ep_rank=self.mapping.moe.ep_rank,
-            ep_size=self.mapping.moe.ep_size,
+            ep_rank=(
+                self.mapping.moe_weight_group.index(self.mapping.rank)
+                if self.model.peer_weights is not None
+                else self.mapping.moe.ep_rank
+            ),
+            ep_size=(
+                len(self.mapping.moe_weight_group)
+                if self.model.peer_weights is not None
+                else self.mapping.moe.ep_size
+            ),
         )
 
         pp_start = self.model.pp_start_layer
@@ -5424,6 +5491,14 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 "Kimi-K3 encoder-only mode does not expose text embeddings."
             )
         return self.language_model.model.get_input_embeddings()
+
+    def post_quant_warmup(self) -> None:
+        if self.language_model is not None:
+            self.language_model.post_quant_warmup()
+
+    def close_peer_weights(self) -> None:
+        if self.language_model is not None:
+            self.language_model.close_peer_weights()
 
     def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
         if self.language_model is None:

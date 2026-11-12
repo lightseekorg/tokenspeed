@@ -801,6 +801,15 @@ already cancelled its stream or a final output was sent. A pause abort still
 notifies the client; repeated transfer events do not repeat the final output.
 This output fence does not retire source pages.
 
+**PD route refresh.** Before attaching a new room, the decode connection worker
+fetches the bootstrap route version. The version changes on bootstrap restart
+and source-rank registration, even when the address stays healthy. A changed
+version invalidates the cached route and target registrations for future rooms;
+existing rooms keep their targets and cancellation retirement fences. Bootstrap
+servers without a version are resolved afresh on each connection. This adds
+one bootstrap lookup per room, off the scheduler and forward threads. It does
+not transparently migrate an in-flight transfer to a replacement prefill peer.
+
 **PD cancellation.** Client aborts and `pause(abort)` cancel the tracked
 transfer as well as marking the request's output. A decode receiver sends a
 cancellation to every prefill target that could write its landing pages.
@@ -1100,3 +1109,15 @@ count. An unchanged idle load is sent at most once per second as a heartbeat,
 so the frontend can distinguish an idle engine from a stale connection. The
 active page count in it is reused for up to 100 ms (see the page gauges),
 far inside the three seconds the frontend considers a report fresh.
+
+## Independent execution with shared weights
+
+The device build exports `requires_forward_coordination` as an immutable
+capability derived from execution groups. The host hands the control plane a
+DP coordination group only when forwards span workers, or when a shared L3
+namespace needs agreed flushes. Without one, fully local workers omit the
+per-round DP metadata exchange, peer-induced idle forwards and the DP
+rendezvous for cache flushes while retaining their DP routing identities.
+Sharing immutable expert weights alone does not require forward coordination.
+Weight-copy streams and readiness/release events remain behind the model on
+the data plane; see [distributed immutable weights](distributed-weights.md).
