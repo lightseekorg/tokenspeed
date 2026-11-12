@@ -459,6 +459,11 @@ class ModelRunner:
         """Receive trainer-broadcast weights over the NCCL group and load them."""
         import torch.distributed as dist
 
+        if self.mapping.moe_weight_sharing_size is not None:
+            return (
+                False,
+                "Peer expert weights are immutable; restart to change the checkpoint",
+            )
         pg = self._weight_update_pg
         if pg is None:
             return False, "weight update group not initialized"
@@ -528,6 +533,11 @@ class ModelRunner:
         Returns:
             ``(ok, message)`` for the control plane.
         """
+        if self.mapping.moe_weight_sharing_size is not None:
+            return (
+                False,
+                "Peer expert weights are immutable; restart to change the checkpoint",
+            )
         if self.model_update is None:
             return False, (
                 "update_weights_from_mooncake requires the server to start with "
@@ -575,6 +585,11 @@ class ModelRunner:
             post_load_transformed_modules,
         )
 
+        if self.mapping.moe_weight_sharing_size is not None:
+            return (
+                False,
+                "Peer expert weights are immutable; restart to change the checkpoint",
+            )
         model_path = str(obj.model_path)
         transformed = post_load_transformed_modules(self.model)
         if transformed:

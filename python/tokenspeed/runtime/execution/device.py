@@ -296,6 +296,7 @@ class DeviceSpecs:
     spec_num_tokens: int
     uses_eager_grammar: bool
     supports_disaggregation: bool
+    requires_forward_coordination: bool
     supports_pd_layerwise_finalization: bool
     supports_prompt_logprobs: bool
     cache_state_group_ids: tuple[str, ...]
@@ -697,6 +698,17 @@ class DeviceHandle:
                 "snapshot pool"
             )
         return l2.poll_results()
+
+    def shutdown_model(self) -> None:
+        """Drain local readers, then release shared model weights
+        collectively. Called by the forward thread as its last task, after
+        the last forward's readers: the release joins the other weight
+        owners, who must all reach it."""
+        from tokenspeed.runtime.layers.moe.peer_weights import PeerWeightOwner
+
+        model = self._executor.model_runner.model
+        if isinstance(model, PeerWeightOwner):
+            model.close_peer_weights()
 
     def shutdown_cache(self) -> None:
         """Close the Host cache (the L2 tier and the snapshot pool), once the
@@ -1825,6 +1837,7 @@ def build_device_side(
         spec_num_tokens=spec_num_tokens,
         uses_eager_grammar=executor.eager_grammar_buffers is not None,
         supports_disaggregation=views.token_to_kv_pool.arena.supports_disaggregation,
+        requires_forward_coordination=server_args.mapping.requires_forward_coordination,
         supports_pd_layerwise_finalization=_supports_pd_layerwise_finalization(
             executor, server_args.mapping
         ),

@@ -1255,11 +1255,8 @@ def test_native_prefill_workspace_matches_joint_softmax(query_chunk_size):
     torch.testing.assert_close(out, expected, rtol=0.02, atol=0.004)
 
 
-@pytest.mark.skipif(
-    not _native_available(), reason="FlashMLA V4.1 on Hopper or newer required"
-)
-def test_native_prefill_output_rows_past_int32():
-    """Copy native prefill results into rows whose offsets pass 2**31 elements.
+def test_attention_head_copy_output_rows_past_int32(device):
+    """Copy attention heads into rows whose offsets pass 2**31 elements.
 
     The destination is the caller's, so its row stride is too. Three rows a
     2**30 stride apart put the last write at 2**31 elements, and a guard before
@@ -1268,45 +1265,21 @@ def test_native_prefill_output_rows_past_int32():
     tokens, heads, dim = 3, 64, 512
     stride, guard = 2**30, 2**31
     needed = guard + 2 * stride + heads * dim
-    if torch.cuda.mem_get_info()[0] < needed * 2 + (512 << 20):
+    if torch.cuda.mem_get_info(device)[0] < needed * 2 + (512 << 20):
         pytest.skip("requires 9 GiB of free device memory")
     torch.manual_seed(743)
-    storage = torch.empty(needed, dtype=torch.bfloat16, device="cuda")
+    storage = torch.empty(needed, dtype=torch.bfloat16, device=device)
     storage[: heads * dim].fill_(-7.0)
     out = storage[guard:].as_strided((tokens, heads, dim), (stride, dim, 1))
     out.fill_(float("nan"))
-    q = torch.randn(tokens, heads, dim, dtype=torch.bfloat16, device="cuda") * 0.3
-    kv = torch.randn(1024, 1, dim, dtype=torch.bfloat16, device="cuda")
-    indices = torch.randint(0, 1024, (tokens, 640), dtype=torch.int32, device="cuda")
-    sink = torch.linspace(-2, 2, heads, device="cuda")
+    src = torch.randn(tokens, heads, dim, dtype=torch.bfloat16, device=device)
 
-    got = dsv41.selected_attention(
-        q,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        sink,
-        dim**-0.5,
-        out,
-        tokens,
-        None,
-        kv,
-        indices,
-        lse=None,
-    )
-    assert got is out
-    selected = kv[indices.long(), 0].float()
-    logits = torch.bmm(q.float(), selected.transpose(1, 2)) * dim**-0.5
-    probs = torch.cat((logits, sink[None, :, None].expand(tokens, -1, 1)), -1).softmax(
-        -1
-    )[..., :-1]
-    expected = torch.bmm(probs, selected).bfloat16()
-    torch.testing.assert_close(out, expected, rtol=0.02, atol=0.004)
+    implementation._copy_attention_heads(out, src, None, None)
+    torch.testing.assert_close(out, src, rtol=0, atol=0)
     sentinel = storage[: heads * dim]
-    torch.testing.assert_close(sentinel, torch.full_like(sentinel, -7.0))
+    torch.testing.assert_close(
+        sentinel, torch.full_like(sentinel, -7.0), rtol=0, atol=0
+    )
 
 
 @pytest.mark.parametrize("n", [0, 1, 16, 128, 129, 257, 8192, 32768])

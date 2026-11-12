@@ -1301,7 +1301,9 @@ def test_situ_shared_launcher_preserves_ep_routing_and_return_contract(
     )
     fi = _FiMoeDouble(output if finalize else deferred)
     monkeypatch.setattr(mxfp4_module, "trtllm_fp4_block_scale_moe", fi)
-    monkeypatch.setattr(mxfp4_module, "trtllm_fp4_block_scale_routed_moe", fi)
+    monkeypatch.setattr(
+        mxfp4_module, "tokenspeed_trtllm_fp4_block_scale_routed_moe", fi
+    )
     monkeypatch.setattr(tuning_module, "_autotune_max_num_tokens", 9216)
     w = _RoutedWeightsDouble()
     logits = torch.randn(3, 8, dtype=torch.bfloat16)

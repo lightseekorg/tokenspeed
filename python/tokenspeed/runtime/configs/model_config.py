@@ -701,6 +701,7 @@ class ModelConfig:
             validate_drafter_algorithm(server_args.speculative_algorithm)
             require_plugin_draft_checkpoint(server_args)
         self.model_path = model_path
+        self.is_draft_worker = bool(is_draft_worker)
         self.revision = revision
         self.quantization = quantization
         self.mapping = server_args.mapping

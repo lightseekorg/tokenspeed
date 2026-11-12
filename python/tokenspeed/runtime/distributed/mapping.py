@@ -618,6 +618,7 @@ class Mapping(MappingBase):
         moe_tp_size: int | None = None,
         moe_ep_size: int | None = None,
         moe_dp_size: int | None = None,
+        moe_weight_sharing_size: int | None = None,
         vision_tp_size: int | None = None,
         vision_dp_size: int | None = None,
         linear_attn_tp_size: int | None = None,
@@ -675,6 +676,25 @@ class Mapping(MappingBase):
             ep_size=moe_ep_size,
             dp_size=moe_dp_size,
         )
+        self.moe_weight_sharing_size = moe_weight_sharing_size
+        if moe_weight_sharing_size is not None:
+            if (
+                moe_weight_sharing_size < 2
+                or stage_world_size % moe_weight_sharing_size
+            ):
+                raise ValueError(
+                    "Expert weight-sharing size must divide the stage world and exceed one"
+                )
+            if (
+                pp_size != 1
+                or self.attn.tp_size != 1
+                or self.dense.tp_size != 1
+                or self.moe.tp_ep_size != 1
+            ):
+                raise ValueError(
+                    "Peer expert weights currently require local TP1/EP1 execution and PP1"
+                )
+
         # The vision mapping is local to each attention TP group. With both
         # sizes omitted it resolves to weight TP, preserving the legacy mode.
         self.vision = VisionTowerMapping(
@@ -710,6 +730,24 @@ class Mapping(MappingBase):
         self.moe.rank = rank
         self.vision.rank = rank
         self.linear_attn.rank = rank
+
+    @property
+    def moe_weight_group(self) -> Group:
+        size = self.moe_weight_sharing_size or 1
+        first = self.rank // size * size
+        return tuple(range(first, first + size))
+
+    @property
+    def requires_forward_coordination(self) -> bool:
+        return self.has_attn_dp and (
+            self.pp_size > 1
+            or self.attn.tp_size > 1
+            or self.attn.qcp_size > 1
+            or self.dense.tp_size > 1
+            or self.moe.tp_ep_size > 1
+            or self.lm_head.tp_size > 1
+            or self.linear_attn.tp_size > 1
+        )
 
     def replicated_for_draft(self) -> "Mapping":
         """This layout with a replicated dense group, every other axis unchanged.
