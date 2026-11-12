@@ -49,6 +49,7 @@ from tokenspeed_kernel.ops.kvcache.host_transfer import (
     transfer_cache_blocks,
 )
 
+from tokenspeed.runtime.cache.host_budget import pinned_reservation_bytes
 from tokenspeed.runtime.utils import get_device_module
 
 device_module = get_device_module()
@@ -251,10 +252,9 @@ def pinned_host_bytes(nbytes: int) -> int:
     """Conservatively estimate the configured pinned-buffer reservation."""
     if nbytes <= 0:
         return 0
-    limit = _pinned_rounding_limit_bytes()
-    if limit is not None and nbytes > limit:
-        return nbytes
-    return 1 << (nbytes - 1).bit_length()
+    return pinned_reservation_bytes(
+        nbytes, round_limit_bytes=_pinned_rounding_limit_bytes()
+    )
 
 
 def largest_pinned_fit(room_bytes: int, *, block_bytes: int) -> int:

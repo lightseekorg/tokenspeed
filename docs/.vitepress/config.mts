@@ -49,6 +49,10 @@ export default defineConfig({
           {
             text: "Compatible Parameters",
             link: "/configuration/compatible-parameters"
+          },
+          {
+            text: "Deployment Host Memory Budget",
+            link: "/configuration/host-memory-budget"
           }
         ]
       },

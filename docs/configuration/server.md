@@ -1489,6 +1489,12 @@ they usually do on pipeline stages, which store different layers, so with
 `--pipeline-parallel-size > 1` size Host L2 with `--kvstore-ratio` rather
 than `--kvstore-size`.
 
+This check covers one rank's buffers at startup. To check a whole
+deployment offline, use `tokenspeed cache-budget`
+([deployment Host memory budget](./host-memory-budget.md)). It covers
+independent jobs, replicas and P/D worlds on one node, container limits,
+Mooncake client and provider segments, and staging buffers.
+
 **Requirements and deployment.** L3 requires Host L2 (omit
 `--disable-kvstore`) and currently supports PP=1. Cyclic KV-page sharding
 (`--kv-parallel-size`) is supported when the payload is replicated within
@@ -1502,7 +1508,8 @@ by CPU DRAM need no GPU memory. Set `global_segment_size` to `0` in inference
 workers to use those providers without mounting storage in the workers.
 Reuse after inference restarts requires the master and providers to retain
 the objects. `--kvstore-size` sizes each rank's Host L2, not the shared L3
-capacity. Account separately for provider segments and client staging memory.
+capacity. Account separately for provider segments and client staging memory
+([deployment Host memory budget](./host-memory-budget.md)).
 A positive `global_segment_size` mounts storage in the inference workers;
 TokenSpeed divides it across attention-TP × PP ranks, using the resolved
 `mapping.attn.tp_size`, so their total matches the configured size.
