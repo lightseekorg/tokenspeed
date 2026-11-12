@@ -750,6 +750,14 @@ TEST(BlockPoolBucketAcquireTest, ParentsNeededSharesOpenedParentsAcrossBuckets) 
     EXPECT_EQ(ParentsNeededForBuckets(std::array<std::int64_t, 2>{1, 1}, no_holes, /*dense_need=*/3, 4), 2);
     // One bucket is ordinary placement: holes plus parents times packing.
     EXPECT_EQ(ParentsNeededForBuckets(std::array<std::int64_t, 1>{0}, std::array<std::int64_t, 1>{1}, 5, 2), 2);
+    // One slot per parent: every block the holes miss opens a parent.
+    EXPECT_EQ(ParentsNeededForBuckets(std::array<std::int64_t, 1>{5}, std::array<std::int64_t, 1>{2}, 0, 1), 3);
+    EXPECT_EQ(ParentsNeededForBuckets(std::array<std::int64_t, 1>{5}, std::array<std::int64_t, 1>{2}, 4, 1), 7);
+    EXPECT_EQ(ParentsNeededForBuckets(std::array<std::int64_t, 1>{1}, std::array<std::int64_t, 1>{3}, 2, 1), 0);
+    // One slot per bucket (packing 2, two buckets): the shortest bucket opens
+    // a parent per block, while the total still counts two slots a parent.
+    EXPECT_EQ(ParentsNeededForBuckets(std::array<std::int64_t, 2>{3, 1}, std::array<std::int64_t, 2>{0, 1}, 0, 2), 3);
+    EXPECT_EQ(ParentsNeededForBuckets(std::array<std::int64_t, 2>{1, 1}, std::array<std::int64_t, 2>{0, 1}, 5, 2), 3);
 }
 
 // A pair of blocks that must share a bucket, either bucket: each pair takes

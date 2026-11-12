@@ -18,14 +18,19 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <memory_resource>
 #include <list>
 #include <limits>
+#include <numeric>
+#include <random>
 #include <span>
 #include <string>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -106,6 +111,175 @@ TEST(CacheEvictionCandidates, PrescanReplaysPolicyOrderAcrossPinnedEpochsAndSnap
         EXPECT_EQ(expected.size(), 10000u);
         EXPECT_EQ(drain(replay), expected);
         EXPECT_EQ(pool.NumEmptyLcmBlocks(), 0);
+    }
+}
+
+// Whatever physical pages an epoch's entries sit on, they leave in the policy
+// order: equal-age prefix pages from the suffix, unproven chunk boundaries
+// before established ones, then by group and physical location.
+TEST(CacheEvictionCandidates, EpochsLeaveInPolicyOrderOnAnyPhysicalLayout) {
+    constexpr int shuffled_pages = 1100;
+    constexpr int ascending_pages = 600;
+    BlockPool pool(shuffled_pages + ascending_pages, {1, 1});
+    std::vector<CacheGroup> groups;
+    const CacheGroupSpec full{.cache_blocks_per_lcm_block = 1, .block_granularity = 4};
+    const CacheGroupSpec window{.attn_kind = AttnKind::kSlidingWindow,
+                                .sliding_window = 8,
+                                .cache_blocks_per_lcm_block = 1,
+                                .block_granularity = 4};
+    groups.emplace_back(full, std::make_unique<GroupAllocator>(1, 0, 1), MakePrefixMatcher(full));
+    groups.emplace_back(window, std::make_unique<GroupAllocator>(1, 1, 1), MakePrefixMatcher(window));
+    {
+        // The ascending parents are handed out first, then these in a random order.
+        auto blocks = pool.AcquireBlocks(0, shuffled_pages);
+        std::mt19937 random(8731);
+        std::shuffle(blocks.begin(), blocks.end(), random);
+        for (CacheBlockRef& block : blocks) block.reset();
+    }
+
+    struct Entry {
+        std::uint32_t group;
+        std::int32_t parent;
+        std::int32_t position;
+        CacheBoundaryKind kind;
+    };
+    std::vector<std::vector<Entry>> epochs;
+    int next_key = 0;
+    const auto add = [&](std::uint32_t group, std::int32_t position, CacheBoundaryKind kind) {
+        CacheBlockRef block = pool.AcquireBlock(group);
+        groups[group].Index().Register(pool, block,
+                                       CacheKey{.group_id = group, .content_hash = std::to_string(next_key++)},
+                                       epochs.size(), position, kind, nullptr, nullptr);
+        epochs.back().push_back(Entry{group, block->Location().lcm_block_id, position, kind});
+    };
+    const auto start_epoch = [&] { epochs.emplace_back(); };
+    // Ascending pages, the prefix written forward and then backward.
+    start_epoch();
+    for (int i = 0; i < 300; ++i) add(0, i, CacheBoundaryKind::kChunk);
+    start_epoch();
+    for (int i = 299; i >= 0; --i) add(0, i, CacheBoundaryKind::kChunk);
+    // Shuffled pages: one prefix, two prefixes sharing positions, a short one.
+    start_epoch();
+    for (int i = 0; i < 300; ++i) add(0, i, CacheBoundaryKind::kChunk);
+    start_epoch();
+    for (int i = 0; i < 300; ++i) add(0, i % 150, CacheBoundaryKind::kChunk);
+    start_epoch();
+    for (int i = 0; i < 20; ++i) add(0, i, CacheBoundaryKind::kChunk);
+    // Both groups in one epoch, the window group with both boundary tiers.
+    start_epoch();
+    for (int i = 0; i < 300; ++i) {
+        add(1, i, i % 2 == 0 ? CacheBoundaryKind::kChunk : CacheBoundaryKind::kEndpoint);
+        if (i < 100) add(0, i, CacheBoundaryKind::kChunk);
+    }
+
+    std::vector<std::int32_t> expected;
+    for (std::vector<Entry>& epoch : epochs) {
+        // Probationary window chunks by position, established window
+        // boundaries by page, then full-history pages from the suffix.
+        const auto rank = [](const Entry& entry) {
+            if (entry.group == 0) return std::tuple{2, -entry.position};
+            return entry.kind == CacheBoundaryKind::kChunk ? std::tuple{0, entry.position} : std::tuple{1, 0};
+        };
+        std::ranges::sort(epoch, [&](const Entry& lhs, const Entry& rhs) {
+            return std::tuple{rank(lhs), lhs.parent} < std::tuple{rank(rhs), rhs.parent};
+        });
+        for (const Entry& entry : epoch) expected.push_back(entry.parent);
+    }
+    EXPECT_EQ(expected.size(), static_cast<std::size_t>(shuffled_pages + ascending_pages - 80));
+
+    // Read from the index directly, and replayed from a pre-scan's snapshots.
+    for (const bool prescan : {false, true}) {
+        CacheEvictionCandidates candidates{groups, pool, nullptr, nullptr, CheckpointAging{}, nullptr};
+        if (prescan) {
+            EXPECT_FALSE(candidates.PreScanUntil([](std::uint32_t, auto) { return false; }));
+        }
+        std::vector<std::int32_t> order;
+        while (const auto candidate = candidates.Next(std::numeric_limits<std::uint64_t>::max())) {
+            order.push_back(candidate->location.lcm_block_id);
+        }
+        EXPECT_EQ(order, expected);
+    }
+}
+
+// Sort reaches the evictionKey order from any input: an epoch already in that
+// order or reversed, one in page order with scattered ranks, and inputs one
+// loaded epoch never forms (mixed epochs, groups, aged ranks, repeated pages).
+TEST(CacheEvictionCandidates, SortReachesTheKeyOrderFromAnyInput) {
+    using Candidate = CacheEvictionCandidates::Candidate;
+    using Tier = CacheEvictionCandidates::BoundaryTier;
+    std::mt19937 random(97);
+    const auto epoch = [](std::size_t size, auto&& tier_and_rank) {
+        std::vector<Candidate> candidates;
+        for (std::size_t i = 0; i < size; ++i) {
+            const auto [tier, rank] = tier_and_rank(i);
+            candidates.push_back(Candidate{.last_access_epoch = 9,
+                                           .position_rank = rank,
+                                           .location = {.lcm_block_id = static_cast<std::int32_t>(i / 2 + 1),
+                                                        .slot_index = static_cast<std::int32_t>(i % 2)},
+                                           .group_id = 1,
+                                           .boundary_tier = tier,
+                                           .rank_epoch = 9});
+        }
+        return candidates;
+    };
+    std::vector<std::vector<Candidate>> inputs;
+    for (const std::size_t size : {std::size_t{2}, std::size_t{40}, std::size_t{300}, std::size_t{5000}}) {
+        const auto n = static_cast<std::int64_t>(size);
+        std::vector<std::int64_t> shuffled(size);
+        std::iota(shuffled.begin(), shuffled.end(), 0);
+        std::shuffle(shuffled.begin(), shuffled.end(), random);
+        std::uniform_int_distribution<std::int32_t> any_rank(-std::numeric_limits<std::int32_t>::max(),
+                                                             std::numeric_limits<std::int32_t>::max());
+        std::uniform_int_distribution<int> any_tier(0, 3);
+        std::vector<std::pair<Tier, std::int64_t>> wide(size);
+        for (auto& [tier, rank] : wide) {
+            tier = static_cast<Tier>(any_tier(random));
+            rank = any_rank(random);
+        }
+        const auto closed = [](std::int64_t rank) { return std::pair{Tier::kClosedPrefix, rank}; };
+        inputs.push_back(epoch(size, [&](std::size_t i) { return closed(static_cast<std::int64_t>(i) - n); }));
+        inputs.push_back(epoch(size, [&](std::size_t i) { return closed(-static_cast<std::int64_t>(i)); }));
+        inputs.push_back(epoch(size, [&](std::size_t i) { return closed(-shuffled[i]); }));
+        inputs.push_back(epoch(size, [&](std::size_t i) { return closed(-(shuffled[i] % 7)); }));
+        inputs.push_back(epoch(size, [&](std::size_t i) { return wide[i]; }));
+        inputs.push_back(epoch(size, [&](std::size_t i) {
+            return std::pair{shuffled[i] % 3 == 0 ? Tier::kEstablished : Tier::kProbationary, shuffled[i] % 50};
+        }));
+        // Not one loaded epoch: each breaks a different shared field or the page order.
+        const std::vector<Candidate> base = inputs.back();
+        inputs.push_back(base);
+        inputs.back()[size / 2].last_access_epoch = inputs.back()[size / 2].rank_epoch = 8;
+        inputs.push_back(base);
+        inputs.back().back().group_id = 0;
+        inputs.push_back(base);
+        inputs.back().front().aged_distance = 2;
+        inputs.back().front().rank_epoch = 10;
+        inputs.push_back(base);
+        inputs.back().back().position_rank = std::int64_t{1} << 40;
+        inputs.push_back(base);
+        inputs.back().insert(inputs.back().end(), base.begin(), base.begin() + static_cast<std::ptrdiff_t>(size / 2));
+    }
+
+    const auto same = [](const Candidate& lhs, const Candidate& rhs) {
+        const auto fields = [](const Candidate& c) {
+            return std::tuple{c.last_access_epoch,   c.position_rank, c.location.lcm_block_id,
+                              c.location.slot_index, c.group_id,      c.boundary_tier,
+                              c.rank_epoch,          c.aged_distance};
+        };
+        return fields(lhs) == fields(rhs);
+    };
+    std::vector<Candidate> scratch(3, Candidate{.last_access_epoch = 1, .group_id = 7});
+    for (std::size_t i = 0; i < inputs.size(); ++i) {
+        const std::vector<Candidate>& input = inputs[i];
+        SCOPED_TRACE(testing::Message() << "input " << i << ", size " << input.size());
+        std::vector<Candidate> expected = input;
+        std::stable_sort(expected.begin(), expected.end(), CacheEvictionCandidates::Before);
+        std::vector<Candidate> sorted = input;
+        CacheEvictionCandidates::Sort(sorted);
+        EXPECT_TRUE(std::ranges::equal(sorted, expected, same));
+        sorted = input;
+        CacheEvictionCandidates::Sort(sorted, scratch);
+        EXPECT_TRUE(std::ranges::equal(sorted, expected, same));
     }
 }
 

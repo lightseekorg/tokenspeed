@@ -55,21 +55,26 @@ inline std::int64_t ParentsNeededForBuckets(std::span<const std::int64_t> need_b
     _assert(!need_by_bucket.empty() && need_by_bucket.size() == holes_by_bucket.size(),
             "bucket demand and holes must cover the same shard count");
     const auto buckets = static_cast<std::int64_t>(need_by_bucket.size());
-    _assert(packing > 0 && packing % buckets == 0 && dense_need >= 0,
+    _assert(packing > 0 && (buckets == 1 || packing % buckets == 0) && dense_need >= 0,
             "bucket count must divide the parent packing and dense demand must be non-negative");
-    const std::int64_t per_parent = packing / buckets;
+    // Every eviction candidate asks again; one slot per parent or bucket, the
+    // common geometry, skips the integer divisions.
+    const auto parents_for = [](std::int64_t blocks, std::int64_t slots_per_parent) {
+        return slots_per_parent == 1 ? blocks : (blocks + slots_per_parent - 1) / slots_per_parent;
+    };
+    const std::int64_t per_parent = buckets == 1 ? packing : packing / buckets;
     std::int64_t parents = 0;
     std::int64_t total_need = dense_need;
     std::int64_t total_holes = 0;
     for (std::size_t b = 0; b < need_by_bucket.size(); ++b) {
         _assert(need_by_bucket[b] >= 0 && holes_by_bucket[b] >= 0, "bucket demand and holes must be non-negative");
         const std::int64_t short_by = std::max<std::int64_t>(need_by_bucket[b] - holes_by_bucket[b], 0);
-        parents = std::max(parents, (short_by + per_parent - 1) / per_parent);
+        parents = std::max(parents, parents_for(short_by, per_parent));
         total_need += need_by_bucket[b];
         total_holes += holes_by_bucket[b];
     }
     const std::int64_t total_short = std::max<std::int64_t>(total_need - total_holes, 0);
-    return std::max(parents, (total_short + packing - 1) / packing);
+    return std::max(parents, parents_for(total_short, packing));
 }
 
 // Where pairs of blocks go when a pair's two blocks must share a bucket but
