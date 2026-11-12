@@ -317,6 +317,18 @@ class _AutotuneExecutor:
         self._events.append(("draft_experts", num_tokens))
 
 
+class _DrafterDouble:
+    """Records the startup's extend warmup (``BaseDrafter.warmup_extend``); a
+    real drafter needs a draft model and its runner."""
+
+    def __init__(self, events):
+        self._events = events
+
+    def warmup_extend(self, num_tokens):
+        assert tuning_module.is_warming_up()
+        self._events.append(("draft_extend", num_tokens))
+
+
 class _ProcessGroupManagerDouble:
     """Hands out a stand-in CPU group; a real gloo group needs torch.distributed."""
 
@@ -410,7 +422,7 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
         forward_step=_ForwardStepDouble(
             warmup_decode_path=draft, max_decode_bs=max_decode_bs
         ),
-        drafter=object() if speculative else None,
+        drafter=_DrafterDouble(events) if speculative else None,
         model_input_kwargs=lambda n, bs, rows: {
             "engram_hash_ids": ngram_history[rows],
             "engram_token_mask": ngram_mask[rows],
@@ -458,7 +470,10 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
             "scrub",
             ("target", (32 if chunk_size < 0 else chunk_size)),
             *(
-                [("draft_experts", (32 if chunk_size < 0 else chunk_size))]
+                [
+                    ("draft_extend", (32 if chunk_size < 0 else chunk_size)),
+                    ("draft_experts", (32 if chunk_size < 0 else chunk_size)),
+                ]
                 if speculative
                 else []
             ),
@@ -607,7 +622,7 @@ def test_decode_only_attention_tunes_on_a_decode_step(
         forward_step=_ForwardStepDouble(
             warmup_decode_path=warmup, max_decode_bs=8, max_tokens_per_req=3
         ),
-        drafter=object() if speculative else None,
+        drafter=_DrafterDouble(events) if speculative else None,
         model_input_kwargs=no_extend_inputs,
         events=events,
     )
