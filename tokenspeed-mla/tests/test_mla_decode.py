@@ -1420,10 +1420,10 @@ def _check_per_request_split_gpu(heads, q_len, dtype_name, causal):
 
 
 def _check_local_visible_gpu(
-    batch, heads, q_len, persistent, kv_len, dtype, partial_fp16
+    batch, heads, q_len, persistent, kv_len, dtype, partial_fp16, per_request
 ):
     import tokenspeed_mla.mla_decode as decode
-    from tokenspeed_mla import tokenspeed_mla_decode
+    from tokenspeed_mla import tokenspeed_mla_decode, tokenspeed_mla_decode_split_kvs
 
     decode._FP16_PARTIALS = partial_fp16
 
@@ -1440,8 +1440,27 @@ def _check_local_visible_gpu(
     case = _Case(batch, kv_len, heads, q_len)
     q, kv, tables, lengths = _make_inputs(case, dtype, False, "cuda")
     visible = torch.empty((batch, q_len), dtype=torch.int32, device="cuda")
-    workspace = torch.empty(64 * 1024**2, dtype=torch.int8, device="cuda")
+    workspace_bytes = 64 * 1024**2
+    if per_request:
+        workspace_bytes = max(
+            workspace_bytes, batch * math.ceil(heads * q_len / 128) * 128 * 32 * 513 * 4
+        )
+    workspace = torch.empty(workspace_bytes, dtype=torch.int8, device="cuda")
     out = torch.empty((batch, q_len, heads, 512), dtype=torch.bfloat16, device="cuda")
+    splits = torch.empty_like(lengths) if per_request else None
+
+    def refresh_splits():
+        if splits is not None:
+            tokenspeed_mla_decode_split_kvs(
+                lengths,
+                splits,
+                num_heads=heads,
+                q_len=q_len,
+                max_seq_len=kv_len,
+                min_split_kv=1,
+                dtype=q.dtype,
+            )
+
     kwargs = dict(
         query=q,
         kv_cache=kv,
@@ -1457,6 +1476,7 @@ def _check_local_visible_gpu(
         causal_mask=True,
         return_lse=True,
         local_visible_lens=visible,
+        block_split_kvs=splits,
     )
     boundaries = [0, 1, 63, 64, 65, 127, 128, 129, 257, kv_len]
     initial = torch.tensor(
@@ -1475,11 +1495,15 @@ def _check_local_visible_gpu(
             device="cuda",
         )
     visible.copy_(initial)
+    refresh_splits()
     tokenspeed_mla_decode(**kwargs)
-    assert selections[-1] == (batch == 128), "Expected direct/split-KV coverage changed"
+    assert selections[-1] == (
+        batch == 128 and not per_request
+    ), "Expected direct/split-KV coverage changed"
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
+        refresh_splits()
         captured_out, captured_lse = tokenspeed_mla_decode(**kwargs)
 
     for state in ("mixed", "zero_k", "empty_rows", "restored"):
@@ -1512,6 +1536,7 @@ def _check_local_visible_gpu(
         # Explicit local bounds also override the noncausal path. The captured
         # causal variant must produce the same result for these same bounds.
         kwargs["causal_mask"] = state != "restored"
+        refresh_splits()
         eager_out, eager_lse = tokenspeed_mla_decode(**kwargs)
         torch.cuda.synchronize()
         _check_output(eager_out, expected, dtype)
@@ -1533,23 +1558,25 @@ class TestGPU:
         "dtype,partial_fp16", [("bf16", False), ("fp8", False), ("fp8", True)]
     )
     @pytest.mark.parametrize(
-        "batch,heads,q_len,persistent,kv_len",
+        "batch,heads,q_len,persistent,kv_len,per_request",
         [
-            (1, 96, 1, False, 385),
-            (1, 16, 4, False, 385),
-            (1, 96, 5, True, 385),
-            (128, 16, 4, False, 385),
-            (128, 96, 5, True, 385),
-            (1, 16, 4, False, 65537),
-            (1, 96, 4, False, 65537),
+            (1, 96, 1, False, 385, False),
+            (1, 16, 4, False, 385, False),
+            (1, 96, 5, True, 385, False),
+            (128, 16, 4, False, 385, False),
+            (128, 96, 5, True, 385, False),
+            (1, 16, 4, False, 65537, False),
+            (1, 96, 4, False, 65537, False),
+            (3, 96, 4, False, 16384, True),
+            (2, 16, 4, False, 385, True),
         ],
     )
     def test_local_visible_lengths(
-        self, batch, heads, q_len, persistent, kv_len, dtype, partial_fp16
+        self, batch, heads, q_len, persistent, kv_len, per_request, dtype, partial_fp16
     ):
         _run_gpu_check(
             _check_local_visible_gpu,
-            (batch, heads, q_len, persistent, kv_len, dtype, partial_fp16),
+            (batch, heads, q_len, persistent, kv_len, dtype, partial_fp16, per_request),
             600,
         )
 

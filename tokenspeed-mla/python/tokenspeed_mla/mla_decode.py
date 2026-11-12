@@ -1039,8 +1039,10 @@ def tokenspeed_mla_decode(
         fewer K tiles) and each request uses its own count. Values are not
         copied to the CPU for validation and may be updated in place between
         CUDA graph replays. FP8 E4M3, BF16 or FP16 Q/KV with ``is_var_seq``;
-        FP8 output is unsupported. Cannot be
-        combined with sliding windows, DCP or ``local_visible_lens``. None
+        FP8 output is unsupported. Supports ``local_visible_lens`` for
+        compacted KVP/DCP pages; plan from local KV lengths and the gathered
+        query-head count. Cannot be combined with sliding windows or
+        interleaved context-parallel metadata. None
         splits every request ``split_kv`` ways.
 
     local_visible_lens : torch.Tensor, optional
@@ -1099,15 +1101,10 @@ def tokenspeed_mla_decode(
             raise ValueError("block_split_kvs requires BF16 or FP16 output")
         if not is_var_seq:
             raise ValueError("block_split_kvs requires is_var_seq=True")
-        if (
-            window_left != -1
-            or cp_world != 1
-            or causal_seqs is not None
-            or local_visible_lens is not None
-        ):
+        if window_left != -1 or cp_world != 1 or causal_seqs is not None:
             raise ValueError(
-                "block_split_kvs cannot be combined with a sliding window, DCP "
-                "or local_visible_lens"
+                "block_split_kvs cannot be combined with a sliding window "
+                "or interleaved context-parallel metadata"
             )
         if (
             block_split_kvs.shape != (B,)

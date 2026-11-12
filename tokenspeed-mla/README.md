@@ -121,8 +121,10 @@ The grid reserves up to `max(32, min_split_kv)` splits per request
 workspace is sized for the resulting width. Counts live in a device tensor, so
 a CUDA graph replays with counts refreshed in place and no recompilation.
 Target verification, chain drafting, multi-depth MTP and block drafting
-refresh the same metadata when their cache lengths change. Sliding-window
-and DCP calls keep uniform splits.
+refresh the same metadata when their cache lengths change. With compacted
+KVP/DCP pages, planning follows the local-length refresh and uses the gathered
+query-head count. Ranks choose their counts independently; the output/LSE
+merge is unchanged. Sliding-window and interleaved-CP calls keep uniform splits.
 
 Sliding-window and DCP masking remain supported; window boundaries use the
 packed row's original query-token position.
