@@ -68,7 +68,7 @@ on:
           - test/ci/ut/ut-runtime-prefix-cache-e2e.yaml
           - test/ci/ut/import-tokenspeed-kernel-mi350.yaml
           - test/ci/ut/import-tokenspeed-kernel-mi450-sim.yaml
-          - test/ci/ut/ut-tokenspeed-kernel-amd-8gpu.yaml
+          - test/ci/ut/ut-tokenspeed-kernel-amd-2gpu.yaml
           - test/ci/ut/ut-tokenspeed-kernel-mi450-sim.yaml
           - test/ci/ut/ut-tokenspeed-kernel-part-i.yaml
           - test/ci/ut/ut-tokenspeed-kernel-part-ii.yaml

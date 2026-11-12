@@ -36,6 +36,7 @@ from utils import is_cdna4
 if not is_cdna4():
     pytest.skip("AMD CDNA4 is required", allow_module_level=True)
 
+import muse_spark_standins as standins  # noqa: E402
 from monokernel_testing import fill, payloads  # noqa: E402
 from tokenspeed_kernel.ops.communication._iris import (  # noqa: E402
     IrisGroup,
@@ -126,6 +127,18 @@ def reference_head(parts, w, cos, sin, rotated: bool) -> torch.Tensor:
     n = x * torch.rsqrt(x.pow(2).mean() + EPS) * w.float()
     n1, n2 = n[:HALF], n[HALF:]
     return torch.cat([n1 * cos - n2 * sin, n2 * cos + n1 * sin]).to(torch.bfloat16)
+
+
+def rope_terms(parts, w, cos, sin) -> torch.Tensor:
+    """The sizes of the two RoPE terms of each output element of a rotated
+    head (as :func:`reference_head`): ``|n1 cos| + |n2 sin|`` for the first
+    half, ``|n2 cos| + |n1 sin|`` for the second, in FP32."""
+    x = parts.sum(0).to(torch.bfloat16).float()
+    n = x * torch.rsqrt(x.pow(2).mean() + EPS) * w.float()
+    n1, n2 = n[:HALF], n[HALF:]
+    return torch.cat(
+        [(n1 * cos).abs() + (n2 * sin).abs(), (n2 * cos).abs() + (n1 * sin).abs()]
+    )
 
 
 def _close_bf16(got: torch.Tensor, want: torch.Tensor) -> None:
@@ -312,6 +325,21 @@ def _far(cache: torch.Tensor, first: int, device) -> torch.Tensor:
 
 
 WORLD, HIDDEN, OWNED = 8, ref.HIDDEN, 1024
+ALL = tuple(range(WORLD))
+
+
+def _shared_inputs(prefix: int, rows: int, present):
+    """The half's replicated inputs (``inputs.draft_attn_shared``) of a
+    zero-shard model for ``present``: the partials of the ranks outside it
+    are zero, and so are every partial's and the residual's columns those
+    ranks own, so they put exactly zero (ared, ass and ahin)."""
+    parts, residual, *rest = inputs.draft_attn_shared(prefix, rows)
+    absent = standins.absent_columns(HIDDEN, OWNED, present)
+    parts = [p if r in present else torch.zeros_like(p) for r, p in enumerate(parts)]
+    for p in parts:
+        p[:, absent] = 0
+    residual[:, absent] = 0
+    return (parts, residual, *rest)
 
 
 @gluon.jit
@@ -426,33 +454,56 @@ def attn_half_kernel(
         )
 
 
-def _close_chained(got: torch.Tensor, want: torch.Tensor) -> None:
+def _close_chained(
+    got: torch.Tensor, want: torch.Tensor, terms: torch.Tensor | None = None
+) -> None:
     """Within two BF16 steps: the reference projects with one FP32 product,
     the kernel sums 16 K parts, so the projection can round one step apart
-    before the norm and RoPE carry it on."""
-    torch.testing.assert_close(got.float(), want.float(), rtol=2**-6, atol=1e-6)
+    before the norm and RoPE carry it on.
+
+    For a rotated head, ``terms`` (:func:`rope_terms`) adds what that step
+    does to an output element whose two RoPE terms cancel: each term carries
+    its input's step, so the error scales with the terms' size, not with the
+    small result. One BF16 step is 2^-8 to 2^-7 of a value (8 significand
+    bits), hence 2^-7 of what the terms cancel (``terms - |want|``, about 0
+    where they do not), which keeps the other elements' bound as it was."""
+    err = (got.float() - want.float()).abs()
+    bound = 2**-6 * want.float().abs() + 1e-6
+    if terms is not None:
+        bound = bound + 2**-7 * (terms - want.float().abs()).clamp(min=0)
+    assert torch.all(err <= bound), float((err / bound).max())
 
 
-def _half_worker(rank: int, port: int, prefix: int) -> None:
+def _half_worker(me: int, port: int, prefix: int, present) -> None:
+    """``present``: None for the whole TP8 group, one process a rank; or the
+    two rank programs that run (process ``me`` runs ``present[me]``) in a
+    zero-shard model (:func:`_shared_inputs`) whose other ranks' puts
+    (exactly zero) the host writes before the launch."""
     rows = 8
-    torch.cuda.set_device(rank)
+    torch.cuda.set_device(me)
     dist.init_process_group(
         "gloo",
         init_method=f"tcp://localhost:{port}",
-        rank=rank,
-        world_size=WORLD,
+        rank=me,
+        world_size=WORLD if present is None else len(present),
         timeout=timedelta(seconds=300),
     )
     try:
-        device = torch.device(f"cuda:{rank}")
+        device = torch.device(f"cuda:{me}")
         ctx = get_or_create_context(heap_size=256 << 20)
-        group = IrisGroup(ctx, dist.group.WORLD, rank, device)
+        group = IrisGroup(ctx, dist.group.WORLD, me, device)
         plan = _plan(rows, WORLD)
         scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
+        if present is None:
+            rank, model, bases = me, ALL, group.bases
+        else:
+            rank, model = present[me], present
+            ghost = torch.zeros_like(scratch)
+            bases = standins.peer_bases(group.bases, present, me, scratch, ghost)
         own = slice(rank * OWNED, (rank + 1) * OWNED)
         group.finish_prepare()
-        parts, residual, gain, coef_w, base, q_norm, k_norm = inputs.draft_attn_shared(
-            prefix, rows
+        parts, residual, gain, coef_w, base, q_norm, k_norm = _shared_inputs(
+            prefix, rows, model
         )
         qkv_w, o_w, ctx_k, ctx_v = inputs.draft_attn_rank(prefix, rank, rows)
         end = prefix + rows
@@ -473,10 +524,21 @@ def _half_worker(rank: int, port: int, prefix: int) -> None:
         residual_out = torch.zeros(rows, HIDDEN, dtype=torch.bfloat16, device=device)
         out = torch.zeros(rows, HIDDEN, dtype=torch.bfloat16, device=device)
         step = 21
+        if present is not None:
+            standins.standin_fill(
+                scratch,
+                plan,
+                present,
+                [(0, t) for t in range(rows)],
+                step,
+                0,
+                step & 1,
+                True,
+            )
         attn_half_kernel[(plan.grid,)](
             scratch,
             torch.full((1,), step, dtype=torch.int32, device=device),
-            group.bases,
+            bases,
             parts[rank].to(device),
             residual.to(device),
             residual_out,
@@ -520,6 +582,12 @@ def _half_worker(rank: int, port: int, prefix: int) -> None:
         assert torch.equal(residual_out[:, own].cpu(), want_res[:, own])
         h = bf("ahin", HIDDEN // 2, copy=step & 1)
         ref.assert_bf16_close(h, want_h)
+        if present is not None:
+            # The model is what the stand-ins claim: the absent ranks'
+            # columns of the normed input are zero, in both.
+            absent = standins.absent_columns(HIDDEN, OWNED, present)
+            assert not want_h[:, absent].float().any()
+            assert not h[:, absent].float().any()
         cpart = words("acpart", 2 * ref.COEFFICIENTS).view(torch.float32)
         dl = (cpart[:, : ref.COEFFICIENTS] + cpart[:, ref.COEFFICIENTS :]).to(
             torch.bfloat16
@@ -535,18 +603,17 @@ def _half_worker(rank: int, port: int, prefix: int) -> None:
         for r in range(rows):
             cos, sin = cos_sin[positions[r], :HALF], cos_sin[positions[r], HALF:]
             for hh in range(Q_HEADS):
+                head = proj[r, None, hh * HEAD : (hh + 1) * HEAD]
                 _close_chained(
                     q[r, hh],
-                    reference_head(
-                        proj[r, None, hh * HEAD : (hh + 1) * HEAD],
-                        q_norm,
-                        cos,
-                        sin,
-                        True,
-                    ),
+                    reference_head(head, q_norm, cos, sin, True),
+                    rope_terms(head, q_norm, cos, sin),
                 )
+            k_head = proj[r, None, 1024:1152]
             _close_chained(
-                kb[r], reference_head(proj[r, None, 1024:1152], k_norm, cos, sin, True)
+                kb[r],
+                reference_head(k_head, k_norm, cos, sin, True),
+                rope_terms(k_head, k_norm, cos, sin),
             )
             _close_chained(
                 vb[r], reference_head(proj[r, None, 1152:], k_norm, cos, sin, False)
@@ -577,4 +644,24 @@ def test_draft_attention_half_matches_the_reference_stage_by_stage(prefix: int):
     with socket.socket() as sock:
         sock.bind(("", 0))
         port = sock.getsockname()[1]
-    mp.spawn(_half_worker, args=(port, prefix), nprocs=WORLD, join=True)
+    mp.spawn(_half_worker, args=(port, prefix, None), nprocs=WORLD, join=True)
+
+
+@pytest.mark.parametrize("present", standins.PAIRS, ids=standins.PAIR_IDS)
+@pytest.mark.parametrize("prefix", [3000])
+def test_draft_attention_half_matches_the_reference_stage_by_stage_on_two_gpus(
+    prefix: int, present
+):
+    """As :func:`test_draft_attention_half_matches_the_reference_stage_by_stage`
+    with the production rank programs ``present`` on two GPUs, in a
+    zero-shard model (:func:`_shared_inputs`) whose six other ranks put
+    exactly zero (the host writes it): every stage against the reference on
+    the kernel's own input, and the absent ranks' columns of the normed
+    input stay zero. Two non-zero terms per sum cannot check the rank order
+    of the eight-rank all-reduce (see muse_spark_standins)."""
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires 2 GPUs")
+    with socket.socket() as sock:
+        sock.bind(("", 0))
+        port = sock.getsockname()[1]
+    mp.spawn(_half_worker, args=(port, prefix, present), nprocs=2, join=True)
