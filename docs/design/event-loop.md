@@ -441,8 +441,9 @@ exports, on their threads' lanes, so a forward thread's operation encloses
 the Python it ran; the C++ scheduler's spans are under the `scheduler`
 category, the rest under `host`. The recording follows the torch profiler's window and
 costs one atomic load per span outside it. A round that receives nothing,
-hands the data plane nothing, and commits, acknowledges or answers nothing
-leaves no spans: a loop waiting on a transfer spins through such rounds.
+hands the data plane and the L3 executor nothing, and commits, acknowledges,
+or answers nothing leaves no spans: a loop waiting on a transfer spins through
+such rounds. A storage operation's outcome counts as an acknowledgment.
 
 ### The capture contract
 

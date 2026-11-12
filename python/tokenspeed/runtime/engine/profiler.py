@@ -92,7 +92,11 @@ _TRACE_HEAD_BYTES = 1 << 20
 
 
 def _export_with_host_spans(
-    torch_profiler, path: str, spans: list, threads: list, pid: int
+    torch_profiler,
+    path: str,
+    spans: list[tuple[str, str, int, int, int]],
+    threads: list[tuple[int, str]],
+    pid: int,
 ) -> None:
     """Export ``torch_profiler``'s trace to ``path`` (gzipped JSON) with the
     host's ``spans`` on it.

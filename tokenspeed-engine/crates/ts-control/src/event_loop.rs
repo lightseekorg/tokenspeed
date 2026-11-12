@@ -761,7 +761,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 .scheduler
                 .next_execution_plan(false, self.config.prefill_delay.is_some());
             if let Some(l3) = &self.l3 {
-                l3.submit(&plan)?;
+                busy |= l3.submit(&plan)?;
             }
             self.cache_ops.dispatched(&plan.cache_ops());
             busy |= plan.needs_device();
@@ -812,8 +812,12 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 publisher.publish(&drained);
             }
         }
-        busy |=
-            !ready.is_empty() || !events.is_empty() || !outputs.is_empty() || !released.is_empty();
+        // A storage operation's outcome is an acknowledgment too.
+        busy |= !ready.is_empty()
+            || !storage.done.is_empty()
+            || !events.is_empty()
+            || !outputs.is_empty()
+            || !released.is_empty();
         if !released.is_empty() {
             self.data_plane.release(&released)?;
         }
@@ -855,7 +859,8 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
     }
 
     /// The round's plan, dispatched, and the forwards older than the
-    /// in-flight depth committed. Returns whether the data plane got work.
+    /// in-flight depth committed. Returns whether the data plane or the L3
+    /// executor got work.
     fn plan_and_dispatch(
         &mut self,
         stop: &mut bool,
@@ -878,9 +883,10 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         }
         // The storage operations start on the L3 executor at once, apart
         // from the device work.
-        if let Some(l3) = &self.l3 {
-            l3.submit(&plan)?;
-        }
+        let storage_work = match &self.l3 {
+            Some(l3) => l3.submit(&plan)?,
+            None => false,
+        };
         // Counted here because `execute` below always runs this plan.
         let cache_ops = plan.cache_ops();
         self.cache_ops.dispatched(&cache_ops);
@@ -1052,7 +1058,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             0
         };
         self.commit_down_to(depth, events, outputs, released)?;
-        Ok(device_work)
+        Ok(device_work || storage_work)
     }
 
     /// Count this round's forward, real or idle, for the expert rebalance;
