@@ -609,7 +609,9 @@ def test_one_binary_serves_every_layer_step_and_length(full):
             compile_launch(lay, 8, length, rows - 1, 16)
 
 
-@pytest.mark.parametrize("rows", [1, 8])
+# Serving admits a request's verify of 1 to 8 rows (any draft width): 2 to 4
+# rows pad the 16 MFMA rows in several blocks, 5 to 7 in one.
+@pytest.mark.parametrize("rows", [1, 2, 3, 4, 6, 8])
 @pytest.mark.parametrize("full", [False, True])
 def test_layer_matches_the_regular_path_math(full, rows):
     if torch.cuda.device_count() < WORLD:
@@ -817,11 +819,12 @@ def test_zero_shard_layer_matches_the_regular_path_math_on_two_gpus(
     )
 
 
-def _two_requests_worker(rank: int, port: int, full: bool, present) -> None:
-    """``present``: None for the whole TP8 group, one process a rank; or the
-    two rank programs that run (process ``i`` runs ``present[i]``) while
-    the host writes the other ranks' puts as keyed stand-ins
-    (:func:`muse_spark_standins.standin_fill`)."""
+def _two_requests_worker(rank: int, port: int, full: bool, rows: int, present) -> None:
+    """``rows``: each request's rows (1: a decode token, 8: a verify of 7
+    draft tokens). ``present``: None for the whole TP8 group, one process a
+    rank; or the two rank programs that run (process ``i`` runs
+    ``present[i]``) while the host writes the other ranks' puts as keyed
+    stand-ins (:func:`muse_spark_standins.standin_fill`)."""
     torch.cuda.set_device(rank)
     dist.init_process_group(
         "gloo",
@@ -837,7 +840,6 @@ def _two_requests_worker(rank: int, port: int, full: bool, present) -> None:
         me = rank
         if present is not None:
             rank = present[me]  # the rank program this process runs
-        rows = 8  # a verify of 7 draft tokens a request
         plan = layer.layer_plan(
             full=full,
             rows=2 * rows,
@@ -961,8 +963,9 @@ def _two_requests_worker(rank: int, port: int, full: bool, present) -> None:
         dist.destroy_process_group()
 
 
+@pytest.mark.parametrize("rows", [1, 8])
 @pytest.mark.parametrize("full", [False, True])
-def test_two_requests_in_one_launch_match_their_own_launches(full):
+def test_two_requests_in_one_launch_match_their_own_launches(full, rows):
     """The verify rows of two requests (their own lengths and page tables)
     in one launch give what each request's own launch gives."""
     if torch.cuda.device_count() < WORLD:
@@ -970,12 +973,17 @@ def test_two_requests_in_one_launch_match_their_own_launches(full):
     with socket.socket() as sock:
         sock.bind(("", 0))
         port = sock.getsockname()[1]
-    mp.spawn(_two_requests_worker, args=(port, full, None), nprocs=WORLD, join=True)
+    mp.spawn(
+        _two_requests_worker, args=(port, full, rows, None), nprocs=WORLD, join=True
+    )
 
 
 @pytest.mark.parametrize("present", standins.PAIRS, ids=standins.PAIR_IDS)
+@pytest.mark.parametrize("rows", [1, 8])
 @pytest.mark.parametrize("full", [False, True])
-def test_two_requests_in_one_launch_match_their_own_launches_on_two_gpus(full, present):
+def test_two_requests_in_one_launch_match_their_own_launches_on_two_gpus(
+    full, rows, present
+):
     """As :func:`test_two_requests_in_one_launch_match_their_own_launches`,
     with two rank programs (the production TP8 binaries) on two GPUs and
     the host writing the other six ranks' puts as stand-ins keyed by
@@ -988,7 +996,9 @@ def test_two_requests_in_one_launch_match_their_own_launches_on_two_gpus(full, p
     with socket.socket() as sock:
         sock.bind(("", 0))
         port = sock.getsockname()[1]
-    mp.spawn(_two_requests_worker, args=(port, full, present), nprocs=2, join=True)
+    mp.spawn(
+        _two_requests_worker, args=(port, full, rows, present), nprocs=2, join=True
+    )
 
 
 def _shift_worker(rank: int, port: int, kinds: tuple[bool, ...]) -> None:
