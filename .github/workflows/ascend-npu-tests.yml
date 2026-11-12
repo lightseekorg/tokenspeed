@@ -57,6 +57,9 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 1
           persist-credentials: false
+      - name: Simulate a failed diagnostic rerun
+        if: ${{ github.run_attempt != '1' }}
+        run: exit 1
       - name: Select operator tests
         id: changes
         shell: bash
