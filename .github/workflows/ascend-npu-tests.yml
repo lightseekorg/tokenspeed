@@ -33,7 +33,8 @@ permissions:
   pull-requests: read
 
 concurrency:
-  group: pr-test-npu-arm-${{ github.event.pull_request.number || github.ref }}
+  # A rerun keeps its original event and must not supersede fresh PR runs.
+  group: pr-test-npu-arm-${{ github.event.pull_request.number || github.ref }}${{ github.run_attempt != '1' && format('-rerun-{0}', github.run_id) || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
