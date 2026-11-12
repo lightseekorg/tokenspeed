@@ -20,8 +20,8 @@
 
 //! CPU-array diagnostic for the actual Rust result extraction boundary.
 //!
-//! Only the GPU-dependent plane/event is a stand-in. Its `.tolist()` operations
-//! match HostDataPlane.complete and _logprob_lists in rust_host.py. This does
+//! Only the GPU-dependent plane/event is a stand-in. It uses the production
+//! completed_result exporter called by HostDataPlane.complete. This does
 //! not invoke a model, synchronize a GPU event, or replace the Rust extractor.
 
 use super::{complete, interpreter};
@@ -33,37 +33,30 @@ use std::{ffi::CString, path::PathBuf, time::Instant};
 const PLANE: &str = r#"
 import time
 import torch
+from tokenspeed.runtime.engine.result_buffers import completed_result
+from tokenspeed.runtime.execution.types import ModelExecutionResult
 torch.set_num_threads(1)
 
 class CpuResultPlane:
     def __init__(self, batch, prompt, mode, top_k):
-        self.tokens = torch.full((batch,), 120000, dtype=torch.int32, device="cpu")
-        self.lengths = torch.ones(batch, dtype=torch.int32, device="cpu")
-        self.output_lp = None if mode == 'none' else torch.full((batch,), -0.5, dtype=torch.float32, device="cpu")
         rows = batch * (prompt - 1) if mode == 'prompt' else 0
-        self.input_lp = torch.full((rows,), -1.25, dtype=torch.float32, device="cpu") if rows else None
-        self.input_top_values = torch.full((rows, top_k), -3.0, dtype=torch.float32, device="cpu") if rows and top_k else None
-        self.input_top_ids = torch.full((rows, top_k), 110000, dtype=torch.int64, device="cpu") if rows and top_k else None
-        self.output_top_values = torch.full((batch, top_k), -3.0, dtype=torch.float32, device="cpu") if top_k else None
-        self.output_top_ids = torch.full((batch, top_k), 110000, dtype=torch.int64, device="cpu") if top_k else None
+        self.results = ModelExecutionResult(
+            output_tokens=torch.full((batch,), 120000, dtype=torch.int32, device="cpu"),
+            output_lengths=torch.ones(batch, dtype=torch.int32, device="cpu"),
+            output_logprobs=None if mode == 'none' else torch.full((batch,), -0.5, dtype=torch.float32, device="cpu"),
+            input_token_logprobs=torch.full((rows,), -1.25, dtype=torch.float32, device="cpu") if rows else None,
+            input_top_logprobs_val=torch.full((rows, top_k), -3.0, dtype=torch.float32, device="cpu") if rows and top_k else None,
+            input_top_logprobs_idx=torch.full((rows, top_k), 110000, dtype=torch.int64, device="cpu") if rows and top_k else None,
+            output_top_logprobs_val=torch.full((batch, top_k), -3.0, dtype=torch.float32, device="cpu") if top_k else None,
+            output_top_logprobs_idx=torch.full((batch, top_k), 110000, dtype=torch.int64, device="cpu") if top_k else None,
+        )
         self.last_cpu_ns = 0
         self.last_wall_ns = 0
-
-    def logprob_lists(self):
-        def top(values, ids):
-            return (values.tolist(), ids.tolist()) if values is not None else None
-        if self.input_lp is None and self.input_top_values is None and self.output_top_values is None:
-            return None
-        return (self.input_lp.tolist() if self.input_lp is not None else None,
-                top(self.input_top_values, self.input_top_ids),
-                top(self.output_top_values, self.output_top_ids))
 
     def complete(self, launched):
         cpu = time.thread_time_ns()
         wall = time.perf_counter_ns()
-        result = (self.tokens.tolist(), self.lengths.tolist(),
-                  self.output_lp.tolist() if self.output_lp is not None else None,
-                  None, None, None, None, self.logprob_lists(), None)
+        result = completed_result(self.results, serving_compiles=None, grammar_terminated_at=None)
         self.last_wall_ns = time.perf_counter_ns() - wall
         self.last_cpu_ns = time.thread_time_ns() - cpu
         return result
@@ -81,6 +74,15 @@ fn plane<'py>(
     mode: &str,
     top_k: usize,
 ) -> Bound<'py, PyAny> {
+    py.import("sys")
+        .unwrap()
+        .getattr("path")
+        .unwrap()
+        .call_method1(
+            "insert",
+            (0, concat!(env!("CARGO_MANIFEST_DIR"), "/../../../python")),
+        )
+        .unwrap();
     let globals = PyDict::new(py);
     py.run(&CString::new(PLANE).unwrap(), Some(&globals), None)
         .unwrap();
@@ -177,7 +179,7 @@ fn measured(
             let rust_result_drop_ms = drop_start.elapsed().as_secs_f64() * 1000.0;
             if i >= warmups {
                 samples.push(json!({"wall_ms":wall_ms,"thread_cpu_ms":cpu_ms,
-                "python_tolist_wall_ms":python_wall_ms,"python_tolist_cpu_ms":python_cpu_ms,
+                "python_export_wall_ms":python_wall_ms,"python_export_cpu_ms":python_cpu_ms,
                 "extract_and_python_cleanup_cpu_ms":cpu_ms-python_cpu_ms,"rust_result_drop_wall_ms":rust_result_drop_ms}));
             }
         }
@@ -195,6 +197,47 @@ fn cpu_results_cross_the_real_extractor_with_optional_logprob_columns() {
     }
     measured(3, 17, "prompt", 5, 0, 1, false);
     measured(3, 17, "output", 5, 0, 1, false);
+}
+
+#[test]
+#[ignore = "optional CPU PyTorch diagnostic; validates the older host's sequence contract"]
+fn exported_buffers_remain_readable_by_the_legacy_sequence_extractor() {
+    use ts_control::output::TopLogprobs;
+    type Legacy = (
+        Vec<i32>,
+        Vec<i32>,
+        Option<Vec<f64>>,
+        Option<Vec<i32>>,
+        Option<Vec<Vec<i32>>>,
+        Option<(u64, f64)>,
+        Option<Vec<i32>>,
+        Option<(Option<Vec<f64>>, Option<TopLogprobs>, Option<TopLogprobs>)>,
+        Option<Vec<f64>>,
+    );
+    interpreter();
+    Python::attach(|py| {
+        let plane = plane(py, 3, 17, "prompt", 5);
+        // This is the complete pre-buffer result type. The production
+        // exporter must remain consumable during a mixed-version upgrade.
+        let legacy: Legacy = plane
+            .call_method1("complete", (py.None(),))
+            .unwrap()
+            .extract()
+            .unwrap();
+        assert_eq!(legacy.0, [120000; 3]);
+        assert_eq!(legacy.1, [1; 3]);
+        assert_eq!(legacy.2.unwrap(), [-0.5; 3]);
+        let (input, input_top, output_top) = legacy.7.unwrap();
+        assert_eq!(input.unwrap(), vec![-1.25; 48]);
+        assert_eq!(
+            input_top.unwrap(),
+            (vec![vec![-3.0; 5]; 48], vec![vec![110000; 5]; 48])
+        );
+        assert_eq!(
+            output_top.unwrap(),
+            (vec![vec![-3.0; 5]; 3], vec![vec![110000; 5]; 3])
+        );
+    });
 }
 
 #[test]

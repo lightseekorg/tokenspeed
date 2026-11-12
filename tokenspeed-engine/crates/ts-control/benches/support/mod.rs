@@ -408,9 +408,9 @@ pub fn run_stages(config: &Config) -> Value {
             panic!("output batch")
         };
         let chunks = timed(&mut phases, &format!("{phase}_client_materialize"), || {
-            wire.requests()
+            OutputChunk::from_batch(*wire)
                 .unwrap()
-                .map(|r| OutputChunk::from(&r))
+                .map(|(_, chunk)| chunk)
                 .collect::<Vec<_>>()
         });
         for (row, chunk) in chunks.iter().enumerate() {

@@ -453,6 +453,13 @@ the executor's completion poll.
 exceptions — grammar matchers, whose ownership splits by path and whose
 overlap the drain rules in Principle 4 break instead, and multimodal items.
 
+Completion queries export large logprob columns as CPU buffer views, after
+the result's copy event has landed. The host validates dtype, rank, shape
+and token-ID narrowing, then copies into Rust-owned vectors while Python
+buffer guards retain the storage. No borrowed array escapes the query or
+outlives the result's reuse lease. Buffer guards release on errors and
+unwinding too; no manual export/release pair belongs in the event loop.
+
 ## Principle 2: the event loop is a coordinator, nothing more
 
 `EventLoop::round` sequences components. It does not implement them. Domain
@@ -475,6 +482,13 @@ single call:
 
 The round should read, top to bottom, as the schedule of one scheduling
 round, with no feature's internals inlined into it.
+
+Completed prompt logprobs move from request state into the first output that
+ships them. The state retains the fact that they are final after transferring
+the buffers, so a retraction's replay neither gathers nor sends them again.
+The frontend likewise consumes a decoded batch into independently owned
+per-request chunks. A queued chunk owns its arrays until consumption or
+cancellation; one slow request need not retain another request's payload.
 
 Consequences:
 

@@ -128,9 +128,9 @@ KV-cache capacity.
 ## Python result conversion diagnostic
 
 The host's optional `data_plane::tests::cpu_benchmark` tests measure the result
-boundary that the core benchmark excludes. A CPU PyTorch plane reproduces the
-`.tolist()` calls and tuple layout of `HostDataPlane.complete`, then invokes the
-real Rust `complete` extractor. It replaces only the GPU-dependent producer;
+boundary that the core benchmark excludes. A CPU PyTorch plane constructs the
+real `ModelExecutionResult`, calls the production `completed_result` exporter,
+then invokes the real Rust `complete` extractor. It replaces only the GPU-dependent producer;
 it does not call the full Python host or wait on a device event. PyTorch must be
 importable by the embedded interpreter. These tests are ignored by default so
 normal Rust tests do not acquire a PyTorch dependency.
@@ -140,6 +140,8 @@ cargo test --release -p tokenspeed-host --no-run
 # Run the ts-host test executable printed by Cargo:
 ./ts-host-tests --ignored --exact \
   data_plane::tests::cpu_benchmark::cpu_results_cross_the_real_extractor_with_optional_logprob_columns
+./ts-host-tests --ignored --exact \
+  data_plane::tests::cpu_benchmark::exported_buffers_remain_readable_by_the_legacy_sequence_extractor
 TS_BRIDGE_BATCH=128 TS_BRIDGE_PROMPT=131072 TS_BRIDGE_MODE=prompt \
 TS_BRIDGE_TOP_K=0 TS_BRIDGE_WARMUPS=1 TS_BRIDGE_REPEATS=3 \
 TS_BRIDGE_OUTPUT=bridge.json taskset -c 20 ./ts-host-tests --ignored --exact \
@@ -149,9 +151,11 @@ TS_BRIDGE_OUTPUT=bridge.json taskset -c 20 ./ts-host-tests --ignored --exact \
 All `TS_BRIDGE_*` arguments are required. Modes are `none`, `output` and `prompt`;
 positive top-k measures a single prefill result, as in the core workload.
 Array allocation and validation are outside timers. Output includes Python
-`.tolist()` CPU/wall time, the entire extractor call, and Rust result destruction.
-The difference between outer CPU and Python CPU includes both PyO3 extraction
-and Python list destruction; it is not a pure copy timer. IDs are outside
+export CPU/wall time (`python_export_*`), the entire extractor call, and Rust result destruction.
+The exported NumPy arrays also support older hosts' sequence extraction; the
+second optional test checks that contract through the production exporter.
+The difference between outer CPU and Python CPU includes buffer copying,
+numeric conversion, and Python buffer cleanup; it is not a pure copy timer. IDs are outside
 Python's small-integer cache and tensors use float32 values, int32 sampled tokens/lengths and int64 top-k IDs, matching host results. Tensor operations use one CPU thread.
 The standalone measurement mirrors serving GC startup (`collect`, `freeze`,
 generation-2 threshold 10,000); run it alone in its process. No competing Python

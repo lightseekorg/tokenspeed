@@ -103,6 +103,74 @@ fn complete_prompt_values_and_ids_cross_the_wire_once() {
 }
 
 #[test]
+fn consuming_output_rows_preserves_columns_and_transfers_prompt_buffers() {
+    let c = config("stages", "none", 1, Logprobs::Prompt, 5);
+    let mut p = processor(&c);
+    let rids: Vec<_> = (0..c.batch)
+        .map(|row| admit_one(request(&c, row), &c, &mut p).request_id)
+        .collect();
+    let view = batch(&c, &rids, true);
+    let plan = p.logprob_plan(&view);
+    let output = p
+        .commit(&view, plan.input.as_ref(), &result(&c, 0))
+        .unwrap();
+    let mut wire = output_batch(output.outputs, 0, Load::default());
+    wire.spec_verify_ct = vec![3, 4, 5];
+    wire.accept_draft_tokens = vec![Some(1.5), None, Some(2.0)];
+    wire.reasoning_tokens = vec![1, 2, 3];
+    wire.output_token_cumulative_probs_val = vec![vec![0.25]; c.batch];
+    // A mixed frame need not carry prompt data for every row.
+    wire.input_token_logprobs_val[1].clear();
+    wire.input_token_logprobs_idx[1].clear();
+    wire.input_top_logprobs_val[1].clear();
+    wire.input_top_logprobs_idx[1].clear();
+    let expected: Vec<_> = wire
+        .requests()
+        .unwrap()
+        .map(|row| (row.rid.to_owned(), OutputChunk::from(&row)))
+        .collect();
+    let values = wire.input_token_logprobs_val[0].as_ptr();
+    let alternatives = wire.input_top_logprobs_idx[0][1].as_ref().unwrap().as_ptr();
+    let actual: Vec<_> = OutputChunk::from_batch(wire).unwrap().collect();
+    assert_eq!(actual, expected);
+    // Buffer ownership, rather than another deep copy, crosses this API.
+    assert_eq!(
+        actual[0]
+            .1
+            .input_token_logprobs
+            .as_ref()
+            .unwrap()
+            .0
+            .as_ptr(),
+        values
+    );
+    assert_eq!(
+        actual[0].1.input_top_logprobs.as_ref().unwrap().1[1]
+            .as_ref()
+            .unwrap()
+            .as_ptr(),
+        alternatives
+    );
+}
+
+#[test]
+fn consuming_output_rows_rejects_ragged_columns_before_yielding() {
+    let c = config("stages", "none", 1, Logprobs::Output, 0);
+    let mut p = processor(&c);
+    let rids: Vec<_> = (0..c.batch)
+        .map(|row| admit_one(request(&c, row), &c, &mut p).request_id)
+        .collect();
+    let view = batch(&c, &rids, true);
+    let plan = p.logprob_plan(&view);
+    let output = p
+        .commit(&view, plan.input.as_ref(), &result(&c, 0))
+        .unwrap();
+    let mut wire = output_batch(output.outputs, 0, Load::default());
+    wire.cached_tokens.pop();
+    assert!(OutputChunk::from_batch(wire).is_err());
+}
+
+#[test]
 fn top_alternatives_have_every_prompt_position_and_the_sampled_token() {
     let c = config("stages", "none", 1, Logprobs::Prompt, 5);
     let mut p = processor(&c);
