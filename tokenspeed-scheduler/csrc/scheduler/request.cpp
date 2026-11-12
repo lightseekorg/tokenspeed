@@ -20,6 +20,8 @@
 
 #include "scheduler/request.h"
 
+#include <algorithm>
+#include <cstddef>
 #include <stdexcept>
 
 #include "cache/prefix/prefix_hasher.h"
@@ -62,7 +64,10 @@ std::span<const std::string> Request::PromptPrefixHashes(std::int32_t num_pages)
 void Request::AppendPrefixHashes(std::vector<std::string>& hashes, std::int32_t num_pages) const {
     _assert(num_pages >= static_cast<std::int32_t>(hashes.size()) && num_pages <= TokenSize() / prefix_granularity_,
             "completed hashes append only full token pages");
-    hashes.reserve(num_pages);
+    // Grow geometrically: decode appends one completed page at a time.
+    if (static_cast<std::size_t>(num_pages) > hashes.capacity()) {
+        hashes.reserve(std::max<std::size_t>(num_pages, 2 * hashes.size()));
+    }
     if (prompt_prefix_hashes_) {
         const auto& cached = *prompt_prefix_hashes_;
         const auto end = std::min<std::size_t>(num_pages, cached.size());

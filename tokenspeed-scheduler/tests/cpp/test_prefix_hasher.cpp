@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <numeric>
 #include <random>
 #include <span>
 #include <stdexcept>
@@ -131,6 +132,32 @@ TEST(RequestPromptHashesTest, PublicationWithoutAdmissionHashesOnlyCompletedPage
     EXPECT_EQ(completed, (std::vector<std::string>{HashPrefixPage(Tokens({1, 2}), "")}));
     request.AppendPrefixHashes(completed, 2);
     EXPECT_EQ(completed, ComputePrefixHashes(request.FullPrefixPages(false), ""));
+}
+
+// Decode publishes one completed page at a time: the completed chain grows
+// geometrically, whether it copies prompt hashes or hashes pages itself.
+TEST(RequestPromptHashesTest, PageByPageAppendsGrowTheCompletedChainGeometrically) {
+    constexpr std::int32_t kPages = 256;
+    std::vector<std::int32_t> tokens(2 * kPages);
+    std::iota(tokens.begin(), tokens.end(), 0);
+    for (const bool prompt_hashed : {false, true}) {
+        Request request(RequestSpec{.request_id = "grow", .tokens = tokens}, /*prefix_granularity=*/2, Role::kFused);
+        if (prompt_hashed) {
+            ASSERT_EQ(request.PromptPrefixHashes().size(), kPages);
+        }
+        std::vector<std::string> completed;
+        int reallocations = 0;
+        for (std::int32_t pages = 1; pages <= kPages; ++pages) {
+            // The storage moves exactly when it reallocates; capacity() may
+            // report less than was allocated (_GLIBCXX_DEBUG_PEDANTIC).
+            const std::string* storage = completed.data();
+            request.AppendPrefixHashes(completed, pages);
+            reallocations += completed.data() != storage ? 1 : 0;
+        }
+        EXPECT_EQ(completed, ComputePrefixHashes(request.FullPrefixPages(false), ""));
+        // Doubling from one page reallocates log2(256) + 1 times.
+        EXPECT_LE(reallocations, 9) << "prompt hashed: " << prompt_hashed;
+    }
 }
 
 // ---- hex helpers --------------------------------------------------------
