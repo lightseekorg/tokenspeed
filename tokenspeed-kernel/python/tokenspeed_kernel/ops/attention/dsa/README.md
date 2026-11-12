@@ -60,6 +60,36 @@ repo root:
 python -m pytest tokenspeed-kernel/test/nvidia/ops/test_dsa_flashinfer_prims.py
 ```
 
+## CuTe DSL sparse MLA decode (prototype)
+
+`thirdparty/cute_dsl/k3_decode/dsa/sparse.py` attends E4M3 queries of 1 to 16
+local heads over selected native E4M3 D576 cache rows on SM100/SM103. It
+targets the Kimi-K3.1 TP8 verify shape: 12 heads and eight rows per request.
+It is not registered as a `dsa_decode` solution yet.
+
+- A cluster of `split` CTAs serves one query row. CTA `s` takes the live slots
+  `s`, `s + split`, and so on, in passes of up to 128 keys. Two warpgroups
+  take alternate passes, so one pass's gather, softmax, and epilogue overlap
+  the other's.
+- Rows land through 16-byte `cp.async` copies in the 128B-swizzled operand
+  layout. tcgen05 FP8 MMAs compute S^T = K Q^T (128 keys by 16 heads) and
+  O^T = V^T P^T, reading V MN-major from the same tile, into TMEM.
+- P is E4M3 at 448 of the running row max, as in the FP8 trtllm-gen core.
+  Partials merge in FP32 over DSMEM, and CTA `s` owns latent columns
+  `s / split`. Only the summation order and the rounding of the split
+  partials can differ from trtllm-gen.
+- Negative slots inside the live length are masked, omitted lengths take the
+  full width, and rows without live slots come out zero.
+- The kernel reads nothing before its PDL wait, so the kernel before it may
+  release it early.
+
+The tests check it against an FP64 reference within the FP8 roundoff bound
+and against the trtllm-gen core. From the repo root:
+
+```bash
+python -m pytest tokenspeed-kernel/test/nvidia/ops/attention/test_dsa_sparse_mla_cute_dsl.py
+```
+
 ## Speculative verify width
 
 On NVIDIA the FP8 index-K decode path supports one through eight query rows
