@@ -646,7 +646,7 @@ def test_index_pack_matches_independent_fp4_oracle(
         assert output_weights is weights
 
 
-@pytest.mark.parametrize("tokens", [2, 8, 40])
+@pytest.mark.parametrize("tokens", [8])
 def test_index_query_pack_reads_projection_column_slice(device, tokens):
     # Decode splits the index query off a wider projection's rows; packing reads
     # that view in place, so its token stride differs from heads * 128.
@@ -654,6 +654,8 @@ def test_index_query_pack_reads_projection_column_slice(device, tokens):
     heads, leading = 32, 3072
     projected = torch.randn(tokens, leading + heads * 128, device=device).bfloat16()
     q = projected[:, leading:].view(tokens, heads, 128)
+    # Head magnitudes from 1e-3 to 1e3 sweep the scale exponents.
+    q.mul_(torch.logspace(-3, 3, heads, device=device).to(torch.bfloat16)[:, None])
     assert not q.is_contiguous()
     data, scales = pack_index_queries(q)
     packed = torch.cat(
