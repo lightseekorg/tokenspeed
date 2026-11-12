@@ -49,13 +49,10 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
-from tokenspeed.runtime.distributed.comm_backend import CommWork, get_global_backend
 from tokenspeed.runtime.distributed.comm_ops import (
     acquire_exchange_input,
     all_gather_single,
-    all_gather_single_async,
 )
-from tokenspeed.runtime.distributed.mapping import KVP_HISTORY_GROUP_NAME
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.layers.attention.backends.paged.base import (
@@ -342,12 +339,6 @@ class DSABackend(PagedAttentionBackend):
         # Allocated by the target leaf (preallocate_history_gather_workspace),
         # shared with the draft leaf (adopt_history_gather_workspace).
         self._history_workspace: HistoryGatherWorkspace | None = None
-        # The named KVP history communicator a prefetched latent gather runs
-        # on, and that gather: (layer id, group, gathered pages, work).
-        self._history_comm = None
-        self._history_kv_prefetch: (
-            tuple[int, HistoryPrefillGroup, torch.Tensor, CommWork] | None
-        ) = None
         self.index_topk = spec.index_topk
         self.kv_lora_rank = spec.kv_lora_rank
         self.qk_nope_head_dim = spec.qk_nope_head_dim
@@ -866,16 +857,13 @@ class DSABackend(PagedAttentionBackend):
         row_bytes = index_k_row_bytes(self.index_head_dim, self.index_k_format)
         if self._history_prefill:
             # A layer's top-k consumes its gathered index-K rows before the
-            # layer gathers its latent rows, on the same stream. The index-K
-            # rows sit at the tail, so a prefetched latent gather that stays
-            # clear of them can land during the top-k.
+            # layer gathers its latent rows, on the same stream.
             kv_bytes = rows * self.kv_cache_dim * self.data_type.itemsize
-            index_k_bytes = rows * row_bytes
             buffer = torch.empty(
-                max(kv_bytes, index_k_bytes), dtype=torch.uint8, device=self.device
+                max(kv_bytes, rows * row_bytes), dtype=torch.uint8, device=self.device
             )
             kv = buffer[:kv_bytes].view(self.data_type).view(rows, self.kv_cache_dim)
-            index_k = buffer[buffer.numel() - index_k_bytes :].view(rows, row_bytes)
+            index_k = buffer[: rows * row_bytes].view(rows, row_bytes)
         else:
             kv = torch.empty(
                 (rows, self.kv_cache_dim), dtype=self.data_type, device=self.device
@@ -1486,8 +1474,7 @@ class DSABackend(PagedAttentionBackend):
         row_bytes: int,
         group: HistoryPrefillGroup,
         workspace: torch.Tensor,
-        comm=None,
-    ) -> torch.Tensor | tuple[torch.Tensor, CommWork]:
+    ) -> torch.Tensor:
         """All-gather ``group``'s pages of one cache plane into the leading
         bytes of ``workspace`` (a transient buffer when they exceed it).
 
@@ -1495,8 +1482,7 @@ class DSABackend(PagedAttentionBackend):
         ``row_bytes``-byte slots in slot order; the result has its dtype and
         trailing shape, its slots being the gathered slots the plan's
         ``slots`` name. A collective over the page owners: every rank calls
-        it for every group. On ``comm`` the gather is asynchronous and the
-        result comes with its work.
+        it for every group.
         """
         if not cache.is_contiguous():
             raise RuntimeError("the history gather reads a contiguous cache plane")
@@ -1511,14 +1497,8 @@ class DSABackend(PagedAttentionBackend):
             if size <= landing.numel()
             else torch.empty(size, dtype=torch.uint8, device=send.device)
         )
-        gathered = out.view(cache.dtype).view(-1, *cache.shape[1:])
-        if comm is not None:
-            work = all_gather_single_async(
-                out, send.reshape(-1), self.kvp_group, backend=comm
-            )
-            return gathered, work
         all_gather_single(out, send.reshape(-1), self.kvp_group)
-        return gathered
+        return out.view(cache.dtype).view(-1, *cache.shape[1:])
 
     def gather_history_index_k_pages(
         self, layer_id: int, token_to_kv_pool, group: HistoryPrefillGroup
@@ -1554,71 +1534,6 @@ class DSABackend(PagedAttentionBackend):
             group,
             self._history_workspace.kv,
         )
-
-    def prefetch_history_kv_pages(self, layer, token_to_kv_pool) -> bool:
-        """Start the layer's latent history gather of a one-group plan on the
-        named KVP history communicator, so it overlaps the prefill top-k;
-        the layer's sparse prefill takes it. Called after the extend rows'
-        latent is written, at the same point on every rank. False when there
-        is nothing to start: no plan, or several groups, which share the
-        workspace and gather in turn."""
-        plan = self.history_prefill
-        if (
-            plan is None
-            or len(plan.groups) != 1
-            or self.query_shard_metadata is not None
-        ):
-            return False
-        if self._history_workspace is None:
-            raise RuntimeError("DSA history gather workspace is not allocated")
-        if self._history_comm is None:
-            self._history_comm = get_global_backend().for_named_groups(
-                KVP_HISTORY_GROUP_NAME
-            )
-        group = plan.groups[0]
-        kv_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
-        workspace = self._history_workspace
-        kv_landing = (
-            len(self.kvp_group)
-            * group.send_pages
-            * self.kernel_page_size
-            * kv_cache[0].numel()
-            * kv_cache.element_size()
-        )
-        if (
-            workspace.kv.untyped_storage().data_ptr()
-            == workspace.index_k.untyped_storage().data_ptr()
-            and workspace.kv.data_ptr() + kv_landing > workspace.index_k.data_ptr()
-        ):
-            # The latent rows would land on the index-K rows the top-k reads.
-            return False
-        kv, work = self._gather_history_pages(
-            kv_cache,
-            kv_cache[0].numel() * kv_cache.element_size(),
-            group,
-            self._history_workspace.kv,
-            comm=self._history_comm,
-        )
-        self._history_kv_prefetch = (layer.layer_id, group, kv, work)
-        return True
-
-    def _take_history_kv_pages(
-        self, layer, token_to_kv_pool, group: HistoryPrefillGroup
-    ) -> torch.Tensor:
-        """``group``'s gathered latent history pages for the current stream:
-        the layer's prefetched gather when there is one, else gathered now."""
-        prefetch = self._history_kv_prefetch
-        self._history_kv_prefetch = None
-        if prefetch is None:
-            return self.gather_history_kv_pages(layer, token_to_kv_pool, group)
-        layer_id, prefetched_group, kv, work = prefetch
-        if layer_id != layer.layer_id or prefetched_group is not group:
-            raise RuntimeError(
-                f"DSA layer {layer.layer_id} found layer {layer_id}'s prefetched "
-                "history gather; every rank must take a prefetch in its layer"
-            )
-        work.wait()
-        return kv
 
     # ------------------------------------------------------------------
     # Query context parallelism: the gathered-history extend arm
@@ -2167,14 +2082,14 @@ class DSABackend(PagedAttentionBackend):
         group's rows against them with the query's heads."""
         kv_seq_lens = self._int32_lens(kv_seq_lens, q_view.device)
         if len(groups) == 1 and groups[0].query == slice(0, q_view.shape[0]):
-            kv = self._take_history_kv_pages(layer, token_to_kv_pool, groups[0])
+            kv = self.gather_history_kv_pages(layer, token_to_kv_pool, groups[0])
             return self._prefill_rows(
                 layer, q_view, kv, topk_slots, topk_lens, kv_seq_lens, max_seq_len
             )
         out = self._prefill_output(q_view, layer)
         for group in groups:
             rows = group.query
-            kv = self._take_history_kv_pages(layer, token_to_kv_pool, group)
+            kv = self.gather_history_kv_pages(layer, token_to_kv_pool, group)
             out[rows] = self._prefill_rows(
                 layer,
                 q_view[rows],
