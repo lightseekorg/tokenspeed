@@ -113,7 +113,11 @@ def github_json(endpoint, *, paginate):
 
 
 def changed_paths(repository, event_name, event, api=github_json, *, run_attempt=1):
-    """Return paths, or None if a rerun targets a superseded PR head."""
+    """Return paths, or None if a rerun targets a superseded PR head.
+
+    Reject partial API responses rather than treating missing paths as
+    unrelated.
+    """
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
         raise ValueError("Invalid repository")
     if event_name == "workflow_dispatch":
