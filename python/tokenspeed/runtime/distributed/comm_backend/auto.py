@@ -457,6 +457,48 @@ class AutoBackend(CommBackend):
             return self._iris.all_reduce(tensor, group, op=op)
         return self._nccl.all_reduce(tensor, group, op=op)
 
+    def supports_all_reduce_sconv(
+        self, x: torch.Tensor, weight: torch.Tensor, group: Group
+    ) -> bool:
+        # The fusion sums as the tiered dispatch's trtllm all-reduce does;
+        # the batch-invariant and deterministic routes keep fusions off.
+        return (
+            self.route(Collective.ALL_REDUCE, x, group) is Route.TIERED
+            and self._trtllm_ar.has_trtllm_ar(group)
+            and self._trtllm_ar.supports_all_reduce_sconv(x, weight, group)
+        )
+
+    def all_reduce_sconv(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        ring: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        seq_idx: torch.Tensor,
+        cache_indices: torch.Tensor,
+        has_initial_state: torch.Tensor,
+        seq_lens: torch.Tensor,
+        block_table: torch.Tensor,
+        checkpoint: torch.Tensor,
+        output_scale: float,
+        group: Group,
+    ) -> torch.Tensor:
+        return self._trtllm_ar.all_reduce_sconv(
+            x,
+            weight,
+            ring,
+            cu_seqlens,
+            seq_idx,
+            cache_indices,
+            has_initial_state,
+            seq_lens,
+            block_table,
+            checkpoint,
+            output_scale,
+            group,
+            fp32_acc=False,
+        )
+
     def supports_all_reduce_mhc_norm(
         self, x: torch.Tensor, norm_weight: torch.Tensor, group: Group
     ) -> bool:

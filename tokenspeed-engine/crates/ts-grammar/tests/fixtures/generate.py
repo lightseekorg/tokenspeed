@@ -18,9 +18,10 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""The serialized tokenizer info the ts-grammar tests compile against.
+"""The serialized tokenizer infos the ts-grammar tests compile against.
 
 A nine-token raw vocabulary (`TOY_VOCAB`), its last token the stop token,
+and one with message protocol tokens (`FRAMED_VOCAB`), ending the same way,
 serialized by the xgrammar the Python package pins. Rewrite the fixture after
 an xgrammar upgrade:
 
@@ -33,14 +34,27 @@ import xgrammar
 
 TOY_VOCAB = ["a", "b", "{", "}", '"', "x", ":", ",", "</s>"]
 
+# Protocol tokens are ordinary here: their spellings are valid JSON string text.
+FRAMED_VOCAB = [
+    *TOY_VOCAB[:-1],
+    "\\",
+    "<|message_model|>",
+    "<|content_text|>",
+    "<|content_thinking|>",
+    "<|end_message|>",
+    "<|message_tool|>",
+    "</s>",
+]
+
 
 def main() -> None:
-    info = xgrammar.TokenizerInfo(
-        TOY_VOCAB, vocab_type=xgrammar.VocabType.RAW, stop_token_ids=[8]
-    )
-    path = Path(__file__).resolve().parent / "toy_tokenizer_info.json"
-    path.write_text(info.serialize_json())
-    print(f"wrote {path}")
+    for name, vocab in (("toy", TOY_VOCAB), ("framed", FRAMED_VOCAB)):
+        info = xgrammar.TokenizerInfo(
+            vocab, vocab_type=xgrammar.VocabType.RAW, stop_token_ids=[len(vocab) - 1]
+        )
+        path = Path(__file__).resolve().parent / f"{name}_tokenizer_info.json"
+        path.write_text(info.serialize_json())
+        print(f"wrote {path}")
 
 
 if __name__ == "__main__":

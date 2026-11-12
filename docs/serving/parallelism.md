@@ -487,7 +487,9 @@ recorded load with DeepSeek's EPLB algorithm — once at startup from a
 profile record, or online from the live counters ([dynamic
 rebalancing](#dynamic-expert-rebalancing) below). Models opt in explicitly
 (`supports_expert_placement` on the model class) by building their MoE layers
-from the placement and loading every placed slot — LongCat-Flash does.
+from the placement and loading every placed slot — LongCat-Flash does, and
+Inkling2 does for static placements (it does not expose its expert weights to
+`--enable-eplb`).
 TokenSpeed refuses the placement flags for any other model, so it
 never installs a placement only to ignore it.
 `--ep-num-redundant-experts` also needs expert parallelism (`ep_size > 1`):
@@ -1004,6 +1006,23 @@ all-gather/reduce-scatter runs on the Triton RSAG backend and uses NCCL
 across nodes. Logits all-gather and distributed argmax use the same
 cross-node fallback. Layouts such as attention DP with dense TP or MoE EP
 spanning nodes need this fallback.
+
+On the tiered route, Inkling 2's output convolutions sum their producer's
+partial themselves (`all_reduce_sconv`) for target-verify decode batches the
+one-shot mnnvl lane serves: the all-reduce releases the convolution once it
+has waited for its input rather than at its end, so the convolution's cold
+reads of its taps, ring and routing run under the reduction. Other batches
+reduce in the producer with the release at the end.
+
+When the attention TP group is also the MoE EP group and the node has
+multicast memory, decode batches of up to 8 rows skip both all-reduces:
+the attention's output projection (`publish_projection`) and the MoE route
+fold store each rank's partial straight into slot `rank` of every rank's
+Lamport mailbox (`ops.communication.mailbox`), and the output convolutions
+read the sum from there (`inkling_ring_sconv_mailbox`, FP32 in rank order,
+rounded once). The model builds the mailbox in `prepare_communication_runtime`;
+each layer uses both chains or neither, so the two uses alternate the
+mailbox's parities.
 
 Under `--numerics rl-bitwise` (`--batch-invariant-collectives`) every
 reduction takes NCCL data movement plus a rank-ordered fp32 fold, and the

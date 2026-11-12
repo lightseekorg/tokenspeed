@@ -2,6 +2,90 @@
 
 Per-op notes for `ops/moe/`.
 
+## Original block-scaled expert rows
+
+`block_scaled_moe_routes` consumes original NVFP4 or MXFP8 weights and returns
+BF16 `[tokens, top_k, hidden]` rows, gamma already applied inside each expert.
+`block_scaled_moe_routes_plan` fixes the implementation for a layer's formats
+and widths, and loaders pass every expert weight and scale tensor they load
+through `block_scaled_moe_routes_process_tensor`, which rewrites it in place
+into the layout that implementation reads (a no-op for the Triton solutions).
+With `zero_remote_routes`, remote expert rows contain zero; without it they are
+left unwritten. With `fold_slots` the op returns BF16 `[tokens, 1, hidden]`
+instead: each token's local route rows summed in FP32 slot order from +0.0 and
+rounded once, remote routes adding nothing. Inkling2 folds this way and the EP
+all-reduce then adds the ranks' BF16 sums, an all-reduce of `[tokens, hidden]`
+rather than of every route row.
+
+NVFP4 quantizes each input row with outer denominator 1536. Each 16-value
+group chooses between FP8 E4M3 scales targeting E2M1 maxima of six and four,
+using a fixed FP32 pairwise MAE sum; ties retain six. FP4 ties round to even.
+Decoded BF16 tiles make NVFP4 products exact; they accumulate in FP32, then
+`(input_amax * weight_amax) * reciprocal_rn(1536 * stored_denominator)`
+applies before the BF16 output store. The loader owns the stored denominator;
+it is not an activation calibration scale or a hardcoded kernel constant. On
+Blackwell (`triton_scaled_dot_block_scaled_moe_routes`, SM100–SM103)
+`tl.dot_scaled` consumes the payloads and scales directly, so only the
+accumulation order inside a tile differs. Every tile shape sums an element's
+K blocks alike, so a token's rows do not depend on the batch.
+
+`flashinfer_trtllm_block_scaled_moe_routes` (SM100–SM103, widths in whole
+256-column K tiles) runs both projections on TRT-LLM-gen batched GEMMs, the
+MMA kind and K order of the scaled dot, and matches its rows bit for bit. The
+routing quantizer's rows are laid out per expert in GEMM token tiles
+(`_tile_routes`, which also writes the GEMM's dynamic-batch metadata and each
+row's FP32 output scale), the SwiGLU quantizer reads and writes those rows
+through a route-to-row map, and `_gather_route_rows` restores route rows, or
+with `fold_slots` the fold reads the tiled rows through the same map. The
+token tile is the mean routes per expert rounded up to a power of two, so the
+global expert count is an argument; configs that split K are never chosen.
+Tile and scale layout are runtime kernel arguments: a new batch size compiles
+nothing. The TRT-LLM-gen GEMMs read their tile metadata and stream their
+weights before their PDL wait; they wait before reading the activation rows.
+So under PDL the decode-sized routing quantizer quantizes its token's chunk
+before it waits, stores the tile metadata first and then releases the first
+GEMM, which streams weights while the rows are stored; the SwiGLU quantizer
+releases the second GEMM right after its wait, the metadata being older. The
+early quantization reads `x` before the top-k finishes, which holds for the
+router's input: the router waits before it releases its successors.
+
+MXFP8 quantizes input groups of 32 with UE8M0 ceiling scales. Code zero means
+`2^-127`, and 255 denotes NaN. Checkpoint scales are already rowwise and must
+not be expanded again from a conceptual block descriptor. Normal-range
+FP8 times power-of-two values decode exactly into BF16 tiles; extreme
+subnormal/overflow cases require separate native scaled-dot validation.
+
+The first projection stores interleaved BF16 gate/up rows. Capped SwiGLU
+loads them in FP32, computes sigmoid on the original gate, applies separate
+tanh caps, multiplies gamma last and rounds to BF16. On NVIDIA the sigmoid
+and tanh are the checkpoint reference kernels' PTX approximations,
+`rcp.approx.ftz(1 + ex2.approx.ftz(-log2(e) * gate))` and `tanh.approx.f32`;
+the torch oracle evaluates them exactly. The second projection's
+quantizer reads that BF16 value, for local routes only. Neither
+dropping these BF16 roundings nor moving gamma to the epilogue preserves this
+contract. Prefill- and decode-sized launches split this quantizer differently;
+NVFP4 row maxima do not depend on grouping, so both give the same bits.
+
+Under PDL, `block_scaled_topk` and the routing quantizer trigger their
+dependents before their own wait: their successors read only constant
+operands before waiting. The second expert projection maps its routes and
+prefetches its weight rows before its wait, and the SwiGLU quantizer before
+it loads its routes' expert ids before its own; both are older than the
+first expert projection, which waits first. The one-launch quantizer waits
+first too; the two launches of the decode-sized NVFP4 quantizer trigger
+first, so the second projection prefetches across both.
+
+The explicit `torch` solution supplies a CPU numerical oracle. The portable
+`triton` solution reuses the common route grouping; it does not assert
+cross-vendor bitwise GEMM equivalence. Different FP32 reduction
+associations remain observable near cancellation and must be checked against
+native operator and model references before qualification.
+
+Expert selection scores `sigmoid(logit) + bias` with `torch.sigmoid`'s
+`expf` and correctly rounded divide, so near-tied experts rank as in the
+reference. The router projection keeps the FP32 accumulator: `skinny_mm` for
+decode-size rows on NVIDIA, the GEMM facade's FP32 output otherwise.
+
 ## Deferred route outputs
 
 `bf16_moe_routes` returns individual, unweighted expert outputs. Deferred MXFP4
@@ -38,8 +122,14 @@ tensor ops, graph-capturable. Every id must be a real expert in
 `[0, num_logical)`; the runtime masks zero experts and padded slots around
 the call and counts the mapped ids into its load counters afterwards.
 
-Follow-up: a fused Triton kernel for the same contract (one launch instead of
-four tensor ops per MoE layer per forward). Its arguments must follow the
+`block_scaled_topk` takes the layer's `ExpertDispatch` and makes the same
+choice inside its own launch: the tables are constant within a forward, so it
+reads each expert's first replica and replica count before its PDL wait and
+loads only a later replica after selection. The table width stays a runtime
+argument.
+
+Follow-up: the same fusion for the other routers (one launch instead of four
+tensor ops per MoE layer per forward). Their arguments must follow the
 compile-time parameter rule: token count, top-k, and table width are runtime
 arguments or bucketed, never `constexpr`.
 

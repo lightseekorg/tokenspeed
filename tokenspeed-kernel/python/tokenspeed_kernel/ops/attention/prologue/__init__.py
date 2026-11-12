@@ -50,17 +50,21 @@ from tokenspeed_kernel.ops.attention.prologue.checks import (
     check_mla_request,
 )
 from tokenspeed_kernel.ops.attention.prologue.types import (
+    ConvBatch,
+    ConvStream,
     FP8TensorScales,
     GQAPrologueOutput,
     HeadKVCache,
     HeadNorm,
     KVCacheFormat,
+    KVShortConv,
     LatentKVCache,
     MLAExpandedKV,
     MLAPrologueOutput,
     MRope,
     MXFP8Scales,
     PerTokenHeadPlanes,
+    RelativeHeadNorm,
     RopeStyle,
     Rotary,
 )
@@ -81,6 +85,7 @@ def _select(
     mode: str,
     dtype: torch.dtype,
     traits: tuple[tuple[str, object], ...],
+    features: frozenset[str],
     solution: str | None,
     override: str | None,
 ) -> SelectedKernel:
@@ -92,6 +97,7 @@ def _select(
         "attention",
         mode,
         format_signature(**{role: dense_tensor_format(dtype)}),
+        features=features,
         traits=dict(traits),
         solution=solution,
         override=override,
@@ -109,12 +115,20 @@ def _select(
     return kernel
 
 
+def _kv_conv_trait(norm: HeadNorm | RelativeHeadNorm | None) -> str:
+    """Whether the K/V rows take a short convolution, over decode or extend
+    batches (whose pre-chunk taps read the ring or the checkpoint)."""
+    if not isinstance(norm, RelativeHeadNorm) or norm.kv_conv is None:
+        return "none"
+    return "extend" if norm.kv_conv.batch.num_extends else "decode"
+
+
 def gqa_prologue(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     *,
-    norm: HeadNorm | None,
+    norm: HeadNorm | RelativeHeadNorm | None,
     rotary: Rotary | None,
     cache: HeadKVCache,
     query_dtype: torch.dtype,
@@ -132,7 +146,9 @@ def gqa_prologue(
             the packed QKV projection) but each head is contiguous.
         k: Key ``[num_tokens, num_kv_heads * head_dim]``.
         v: Value ``[num_tokens, num_kv_heads * head_dim]``.
-        norm: Per-head RMSNorm, or ``None``.
+        norm: Per-head RMSNorm, relative attention's head steps (which also
+            return the relative logits, and with a K/V convolution take its
+            inputs as ``k`` and ``v``), or ``None``.
         rotary: Rotary embedding, or ``None`` for NoPE.
         cache: KV cache destination.
         query_dtype: Dtype of the returned query: ``q``'s dtype, or an FP8
@@ -161,7 +177,9 @@ def gqa_prologue(
     traits = {
         "head_dim": head_dim,
         "token_heads": num_tokens * num_q_heads,
-        "has_norm": norm is not None,
+        "has_norm": isinstance(norm, HeadNorm),
+        "relative_norm": isinstance(norm, RelativeHeadNorm),
+        "kv_conv": _kv_conv_trait(norm),
         "kv_format": cache.format.value,
         "kv_convert": cache.format is KVCacheFormat.NATIVE
         and cache.k_cache.dtype is not q.dtype,
@@ -170,7 +188,14 @@ def gqa_prologue(
         "return_kv": return_kv,
         "rope_style": "none" if rotary is None else rotary.style.value,
     }
-    kernel = _select("gqa_prologue", q.dtype, tuple(traits.items()), solution, override)
+    features = (
+        frozenset({"materialized_qk_norm"})
+        if isinstance(norm, HeadNorm) and norm.round_before_rope
+        else frozenset()
+    )
+    kernel = _select(
+        "gqa_prologue", q.dtype, tuple(traits.items()), features, solution, override
+    )
     shape_params = {
         "num_tokens": num_tokens,
         "num_q_heads": num_q_heads,
@@ -315,7 +340,12 @@ def mla_prologue(
             "store": True,
         }
     kernel = _select(
-        "mla_prologue", query.dtype, tuple(traits.items()), solution, override
+        "mla_prologue",
+        query.dtype,
+        tuple(traits.items()),
+        frozenset(),
+        solution,
+        override,
     )
     shape_params = {
         "num_tokens": num_tokens,
@@ -382,17 +412,21 @@ def latent_store(
 
 
 __all__ = [
+    "ConvBatch",
+    "ConvStream",
     "FP8TensorScales",
     "GQAPrologueOutput",
     "HeadKVCache",
     "HeadNorm",
     "KVCacheFormat",
+    "KVShortConv",
     "LatentKVCache",
     "MLAExpandedKV",
     "MLAPrologueOutput",
     "MRope",
     "MXFP8Scales",
     "PerTokenHeadPlanes",
+    "RelativeHeadNorm",
     "RopeStyle",
     "Rotary",
     "gqa_prologue",

@@ -633,6 +633,7 @@ mod tests {
             schema_slot: String::new(),
             markers,
             implicit_closer,
+            boundary: None,
         }
     }
 

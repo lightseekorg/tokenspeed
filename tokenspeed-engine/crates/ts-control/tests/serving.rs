@@ -355,6 +355,7 @@ fn toy_grammars() -> Grammars {
         any_whitespace: true,
         compile_timeout: Duration::from_secs(30),
         max_retries: 2,
+        json_framing: None,
     })
     .unwrap()
 }

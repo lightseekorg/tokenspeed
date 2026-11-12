@@ -22,6 +22,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.attention.prologue.types import (
@@ -33,12 +35,17 @@ from tokenspeed_kernel.ops.attention.prologue.types import (
     KVCacheFormat,
     LatentKVCache,
     MLAPrologueOutput,
+    RelativeHeadNorm,
     RopeStyle,
     Rotary,
 )
 from tokenspeed_kernel.ops.embedding import FusedMLASetKVBufferArg
 from tokenspeed_kernel.ops.embedding.triton import apply_rope_mla_set_kv_buffer_triton
-from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
+from tokenspeed_kernel.platform import (
+    CapabilityRequirement,
+    current_platform,
+    pdl_enabled,
+)
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 from tokenspeed_kernel.warmup import kernel_launcher, register_triton_warmup
@@ -89,23 +96,55 @@ def _rope_tables(
 
 
 @triton.jit
+def _row_inv_rms(
+    head_ptr,
+    first_token,
+    num_tokens,
+    token_stride,
+    head_dim: tl.constexpr,
+    eps: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Each token's ``rsqrt(mean(x^2) + eps)`` over one head, summed from a 1D
+    row as ``qk_rmsnorm``'s kernel sums it (the same reduction order), so a
+    head normalized and rounded here has its bytes."""
+    offs = tl.arange(0, BLOCK)
+    slot = tl.arange(0, BLOCK_T)
+    inv_rms = tl.zeros([BLOCK_T], tl.float32)
+    for t in tl.static_range(BLOCK_T):
+        token = first_token + t
+        x = tl.load(
+            head_ptr + token * token_stride + offs,
+            mask=(offs < head_dim) & (token < num_tokens),
+            other=0.0,
+        ).to(tl.float32)
+        var = tl.sum(x * x, axis=0) / head_dim
+        inv_rms = tl.where(slot == t, tl.rsqrt(var + eps), inv_rms)
+    return inv_rms
+
+
+@triton.jit
 def _gqa_prologue_tile(
     src,
     weight_ptr,
     cos,
     sin,
     row_mask,
+    row_inv_rms,
     head_dim: tl.constexpr,
     half_rotary: tl.constexpr,
     weight_offset: tl.constexpr,
     eps: tl.constexpr,
     HAS_NORM: tl.constexpr,
+    ROUND_BEFORE_ROPE: tl.constexpr,
     IS_NEOX: tl.constexpr,
     BLOCK: tl.constexpr,
     HALF_BLOCK: tl.constexpr,
 ):
     """A block of one head's fp32 rows and their rotated pairs: (rows, first
-    half, second half)."""
+    half, second half). With ROUND_BEFORE_ROPE the rows normalize by
+    ``row_inv_rms`` and round to the input dtype before rotation."""
     offs = tl.arange(0, BLOCK)
     mask = row_mask[:, None] & (offs < head_dim)[None, :]
     rows = tl.load(src[:, None] + offs[None, :], mask=mask, other=0.0).to(tl.float32)
@@ -121,7 +160,10 @@ def _gqa_prologue_tile(
     x1 = tl.load(src[:, None] + i1[None, :], mask=pair_mask, other=0.0).to(tl.float32)
     x2 = tl.load(src[:, None] + i2[None, :], mask=pair_mask, other=0.0).to(tl.float32)
     if HAS_NORM:
-        inv_rms = tl.rsqrt(tl.sum(rows * rows, axis=1) / head_dim + eps)
+        if ROUND_BEFORE_ROPE:
+            inv_rms = row_inv_rms
+        else:
+            inv_rms = tl.rsqrt(tl.sum(rows * rows, axis=1) / head_dim + eps)
         w = tl.load(weight_ptr + offs, mask=offs < head_dim, other=0.0).to(tl.float32)
         w1 = tl.load(weight_ptr + i1, mask=half_mask, other=0.0).to(tl.float32)
         w2 = tl.load(weight_ptr + i2, mask=half_mask, other=0.0).to(tl.float32)
@@ -131,6 +173,11 @@ def _gqa_prologue_tile(
         rows = rows * inv_rms[:, None] * w[None, :]
         x1 = x1 * inv_rms[:, None] * w1[None, :]
         x2 = x2 * inv_rms[:, None] * w2[None, :]
+        if ROUND_BEFORE_ROPE:
+            dtype = src.dtype.element_ty
+            rows = rows.to(dtype).to(tl.float32)
+            x1 = x1.to(dtype).to(tl.float32)
+            x2 = x2.to(dtype).to(tl.float32)
     # The association the CUDA embedding.rope kernel compiles to.
     o1 = tl.fma(x1, cos, -x2 * sin)
     o2 = tl.fma(x2, cos, x1 * sin)
@@ -212,6 +259,7 @@ def _gqa_prologue_kernel(
     weight_offset: tl.constexpr,
     eps: tl.constexpr,
     HAS_NORM: tl.constexpr,
+    ROUND_BEFORE_ROPE: tl.constexpr,
     IS_NEOX: tl.constexpr,
     MROPE_ROWS: tl.constexpr,
     INTERLEAVED: tl.constexpr,
@@ -254,18 +302,33 @@ def _gqa_prologue_kernel(
             S2,
         )
     # A pointer tensor yielded from a runtime branch fails to lower on AMD; each head kind builds its own.
+    first_token = tl.program_id(0).to(tl.int64) * BLOCK_T
     if head < num_q_heads:
+        row_inv_rms = 0.0
+        if HAS_NORM and ROUND_BEFORE_ROPE:
+            row_inv_rms = _row_inv_rms(
+                q_ptr + head * q_stride_h,
+                first_token,
+                num_tokens,
+                q_stride_t,
+                head_dim,
+                eps,
+                BLOCK_T,
+                BLOCK,
+            )
         rows, o1, o2, i1, i2, half_mask = _gqa_prologue_tile(
             q_ptr + tokens * q_stride_t + head * q_stride_h,
             q_weight_ptr,
             cos,
             sin,
             row_mask,
+            row_inv_rms,
             head_dim,
             half_rotary,
             weight_offset,
             eps,
             HAS_NORM,
+            ROUND_BEFORE_ROPE,
             IS_NEOX,
             BLOCK,
             HALF_BLOCK,
@@ -287,17 +350,31 @@ def _gqa_prologue_kernel(
         )
     else:
         kv_head = head - num_q_heads
+        row_inv_rms = 0.0
+        if HAS_NORM and ROUND_BEFORE_ROPE:
+            row_inv_rms = _row_inv_rms(
+                k_ptr + kv_head * head_dim,
+                first_token,
+                num_tokens,
+                k_stride_t,
+                head_dim,
+                eps,
+                BLOCK_T,
+                BLOCK,
+            )
         rows, o1, o2, i1, i2, half_mask = _gqa_prologue_tile(
             k_ptr + tokens * k_stride_t + kv_head * head_dim,
             k_weight_ptr,
             cos,
             sin,
             row_mask,
+            row_inv_rms,
             head_dim,
             half_rotary,
             weight_offset,
             eps,
             HAS_NORM,
+            ROUND_BEFORE_ROPE,
             IS_NEOX,
             BLOCK,
             HALF_BLOCK,
@@ -369,11 +446,14 @@ def _block_tokens(num_tokens: int, block: int) -> int:
     "gqa_prologue",
     name="triton_gqa_prologue",
     solution="triton",
+    features=frozenset({"materialized_qk_norm"}),
     capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
     signatures=format_signatures(("q",), "dense", {torch.float16, torch.bfloat16}),
     priority=Priority.PERFORMANT,
     traits={
         "has_norm": BOOLS,
+        "relative_norm": frozenset({False}),
+        "kv_conv": frozenset({"none"}),
         "kv_format": frozenset({"native", "fp8", "fp8_per_tensor"}),
         "kv_convert": BOOLS,
         "mrope": BOOLS,
@@ -476,6 +556,7 @@ def triton_gqa_prologue(
             0.0 if norm is None else norm.weight_offset,
             0.0 if norm is None else norm.eps,
             HAS_NORM=norm is not None,
+            ROUND_BEFORE_ROPE=norm is not None and norm.round_before_rope,
             IS_NEOX=rotary is not None and rotary.style is RopeStyle.NEOX,
             MROPE_ROWS=mrope_rows,
             INTERLEAVED=mrope_rows and mrope.interleaved,
@@ -557,6 +638,54 @@ def triton_mla_prologue(
         enable_pdl=enable_pdl,
     )
     return MLAPrologueOutput(query=out, key=None, value=None)
+
+
+@register_kernel(
+    "attention",
+    "gqa_prologue",
+    name="triton_relative_gqa_prologue",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
+    signatures=format_signatures(("q",), "dense", {torch.float16, torch.bfloat16}),
+    priority=Priority.PERFORMANT,
+    traits={
+        "has_norm": frozenset({False}),
+        "relative_norm": frozenset({True}),
+        "kv_conv": frozenset({"none", "decode"}),
+        "kv_format": frozenset({"native", "mxfp8"}),
+        "kv_convert": frozenset({False}),
+        "mrope": frozenset({False}),
+        "partial_rotary": frozenset({False}),
+        "return_kv": BOOLS,
+        "rope_style": frozenset({"none"}),
+    },
+)
+def triton_relative_gqa_prologue(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    norm: RelativeHeadNorm,
+    rotary: Rotary | None,
+    cache: HeadKVCache,
+    query_dtype: torch.dtype,
+    return_kv: bool,
+    enable_pdl: bool,
+) -> GQAPrologueOutput:
+    """Relative attention's head steps and the K/V store in one launch
+    (``rel_mha_head_norms``'s kernel): the bits of the composite's head
+    steps followed by its cache store. The query is stored in ``q``'s dtype;
+    another ``query_dtype`` is converted after the launch."""
+    # The relative-attention kernels import the prologue's types.
+    from tokenspeed_kernel.ops.attention.rmha._triton.head_norms import (
+        relative_head_prologue,
+    )
+
+    assert rotary is None and enable_pdl == pdl_enabled()
+    out = relative_head_prologue(q, k, v, norm, cache, return_kv)
+    if query_dtype != out.q.dtype:
+        out = replace(out, q=out.q.to(query_dtype))
+    return out
 
 
 def _gqa_warmup_variants(args):
