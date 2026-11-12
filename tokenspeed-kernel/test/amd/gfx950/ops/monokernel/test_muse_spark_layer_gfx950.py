@@ -1132,7 +1132,9 @@ def _two_requests_worker(rank: int, port: int, full: bool, rows: int, present) -
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("rows", [1, 8])
+# Rows a request: serving admits two requests of 1 to 8 rows each; the odd
+# counts make launches that pad to a power of two.
+@pytest.mark.parametrize("rows", [1, 2, 3, 4, 5, 6, 7, 8])
 @pytest.mark.parametrize("full", [False, True])
 def test_two_requests_in_one_launch_match_their_own_launches(full, rows):
     """The verify rows of two requests (their own lengths and page tables)
