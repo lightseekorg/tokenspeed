@@ -1069,7 +1069,7 @@ def _ex1_slot(mb, task, a, tiles, union, expert):
 @gluon.jit
 def lane_slots(union, lane):
     """Past 8 rows: the expert and the row picks of each of lane ``lane``'s
-    slots, from the slot table (``union``) in one reduction, in LDS: ``(experts,
+    slots, from the slot table (``union``), in LDS: ``(experts,
     picks)``, ``int32 [16, 16]`` each, row ``k`` for slot ``lane + 8 k`` (at
     most 8 picks a row make at most 16 slots a lane). A picks row holds each
     row's pick of the slot's expert, or -1 (as :func:`_ex2_gather_lane`); an
@@ -1083,21 +1083,46 @@ def lane_slots(union, lane):
     :func:`_row_picks`) are reductions over the 128-pick table a slot."""
     nw: gl.constexpr = gl.num_warps()
     ids, owner, slot, count, table = union
+    NP: gl.constexpr = table.shape[0]
     RP: gl.constexpr = table.shape[1]
     gl.static_assert(RP == M_DUP, "past 8 rows the table has 16 row columns")
-    # [slot, pick, row]: a slot a wave, a pick a lane, the rows in registers.
-    l3: gl.constexpr = gl.BlockedLayout([1, 1, RP], [1, 64, 1], [nw, 1, 1], [2, 1, 0])
-    pl: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(2, l3))
-    j = gl.arange(0, M_DUP, gl.SliceLayout(1, gl.SliceLayout(2, l3)))[:, None, None]
-    want = lane + j * LANES
-    hit = (gl.convert_layout(owner, pl)[None, :, None] > 0) & (
-        gl.convert_layout(slot, pl)[None, :, None] == want
+    # The [slot, pick] layout below: two slots a wave, the picks over the 64
+    # lanes.
+    gl.static_assert(M_DUP == 2 * nw, "two slots a wave")
+    gl.static_assert(NP % 64 == 0, "the picks fill whole lanes")
+    # Each slot has exactly one owner pick, however many rows share its
+    # expert: a row picks an expert at most once, and the owner is its pick
+    # in the first row that chose it (later rows' picks of it are "seen",
+    # see _slots_asm); slots number the owners. So find the owner with one
+    # reduction over the picks a slot ([slot, pick]: a slot a wave, two
+    # picks a lane) and gather its table row (every row's pick of the
+    # expert) from LDS: the same values as a max over the slot's owner
+    # picks. Reducing the whole [slot, pick, row] table instead took a DPP
+    # max step per row column on every CTA.
+    l2: gl.constexpr = gl.BlockedLayout([2, NP // 64], [1, 64], [nw, 1], [1, 0])
+    j = gl.arange(0, M_DUP, gl.SliceLayout(1, l2))[:, None]
+    p = gl.arange(0, NP, gl.SliceLayout(0, l2))[None, :]
+    pl: gl.constexpr = gl.SliceLayout(0, l2)
+    hit = (gl.convert_layout(owner, pl)[None, :] > 0) & (
+        gl.convert_layout(slot, pl)[None, :] == lane + j * LANES
     )
-    t3 = gl.convert_layout(table, gl.SliceLayout(0, l3))[None, :, :]
-    picks = gl.max(gl.where(hit, t3, -1), axis=1)  # [16, RP]
-    i3 = gl.convert_layout(ids, pl)[None, :, None]
-    experts, _ = gl.broadcast(gl.max(gl.where(hit, i3, -1), axis=1), picks)
+    owner_pick = gl.max(gl.where(hit, p, -1), axis=1)  # [16]
+    expert = gl.max(gl.where(hit, gl.convert_layout(ids, pl)[None, :], -1), axis=1)
     plain: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
+    table_smem = gl.allocate_shared_memory(gl.int32, [NP, RP], plain)
+    table_smem.store(table)
+    gl.barrier()
+    rl: gl.constexpr = gl.BlockedLayout([1, 1], [4, 16], [nw, 1], [1, 0])
+    # A slot without an owner (past the lane's last slot) gathers pick 0's
+    # row; `has` masks it to -1 below.
+    at = gl.convert_layout(gl.maximum(owner_pick, 0), gl.SliceLayout(1, rl))[:, None]
+    at = at + gl.zeros([M_DUP, RP], gl.int32, rl)
+    got = table_smem.gather(at, 0)  # [16, RP]: row k is slot lane + 8 k's
+    has = gl.convert_layout(owner_pick, gl.SliceLayout(1, rl))[:, None] >= 0
+    picks = gl.where(has, got, -1)
+    experts = gl.convert_layout(expert, gl.SliceLayout(1, rl))[:, None] + gl.zeros(
+        [M_DUP, RP], gl.int32, rl
+    )
     picks_smem = gl.allocate_shared_memory(gl.int32, [M_DUP, M_DUP], plain)
     experts_smem = gl.allocate_shared_memory(gl.int32, [M_DUP, M_DUP], plain)
     picks_smem.store(picks)
