@@ -281,6 +281,7 @@ TEST(CacheOperationTest, DecodeCanStartWithoutHostL2) {
         config.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         config.max_scheduled_tokens = 2;
         config.max_batch_size = 1;
+        config.max_resident_requests = config.max_batch_size;
         config.role = Role::kD;
         config.cache_groups.push_back(CacheGroupConfig{
             .group_id = "full",
@@ -313,6 +314,7 @@ TEST(CacheOperationTest, DeviceRequestLimitDoesNotDependOnHostCapacity) {
         config.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         config.max_scheduled_tokens = 8;
         config.max_batch_size = 2;
+        config.max_resident_requests = config.max_batch_size;
         config.role = Role::kD;
         config.cache_groups.push_back(CacheGroupConfig{
             .group_id = "full",
@@ -679,6 +681,7 @@ TEST(CacheOperationTest, DecodeRejectsRequestWhoseMaximumExtentCannotFitDevice) 
     config.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
     config.max_scheduled_tokens = 8;
     config.max_batch_size = 2;
+    config.max_resident_requests = config.max_batch_size;
     config.role = Role::kD;
     config.cache_groups.push_back(CacheGroupConfig{
         .group_id = "full",
@@ -707,6 +710,7 @@ TEST(CacheOperationTest, PrefillAcceptsPromptThatFitsWithoutReservingDecodeToken
     config.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
     config.max_scheduled_tokens = 8;
     config.max_batch_size = 2;
+    config.max_resident_requests = config.max_batch_size;
     config.role = Role::kP;
     config.cache_groups.push_back(CacheGroupConfig{
         .group_id = "full",
@@ -812,6 +816,7 @@ TEST(CacheOperationTest, L3StorageRequiresHostCache) {
     config.host_allocator.total_pages = 1;
     config.max_scheduled_tokens = 2;
     config.max_batch_size = 1;
+    config.max_resident_requests = config.max_batch_size;
     config.enable_l3_storage = true;
     config.cache_groups.push_back(CacheGroupConfig{
         .group_id = "full",
@@ -831,6 +836,7 @@ TEST(CacheOperationTest, L3StorageAcceptsHostCache) {
     config.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
     config.max_scheduled_tokens = 2;
     config.max_batch_size = 1;
+    config.max_resident_requests = config.max_batch_size;
     config.enable_l3_storage = true;
     config.cache_groups.push_back(CacheGroupConfig{
         .group_id = "full",

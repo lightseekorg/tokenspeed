@@ -31,6 +31,7 @@ def _sizing_config(
     cfg.prefix_granularity = prefix_granularity
     cfg.max_scheduled_tokens = max_scheduled_tokens
     cfg.max_batch_size = max_batch_size
+    cfg.max_resident_requests = cfg.max_batch_size
     cfg.decode_input_tokens = decode_input_tokens
     cfg.overlap_schedule_depth = overlap_schedule_depth
     cfg.disable_l2_cache = True

@@ -99,6 +99,7 @@ class _Step:
             kv_cache_quant_method="none",
             context_len=CONTEXT,
             max_bs=MAX_BS,
+            max_resident_requests=MAX_BS,
             speculative_num_draft_tokens=width,
             is_draft=is_draft,
             draft_block_decode=False,

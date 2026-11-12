@@ -976,6 +976,13 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
 
 std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                                   Request* request) {
+    DecodeSlotIndex decode_slot;
+    if (config_.role != Role::kP && !request->HasDecodeSlot()) {
+        if (decode_slots_.AvailableSlots() == 0) {
+            return std::nullopt;  // Execution admission, not a KV capacity failure.
+        }
+        decode_slot = decode_slots_.Allocate();
+    }
     std::vector<BlockTable>& tables = request->BlockTablesRef();
     const std::int32_t num_computed_tokens = request->NumComputedTokens();
     std::int32_t reserve_tokens = request->ReserveNumTokensInNextScheduleEvent();
@@ -1044,7 +1051,7 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
             coordinator_.ReleaseStateInputs(tables);
         }
         cache_progress.published_state_checkpoint_blocks.clear();
-        return fsm::ScheduleDecodeEvent{config_.decode_input_tokens};
+        return fsm::ScheduleDecodeEvent{config_.decode_input_tokens, std::move(decode_slot)};
     }
 
     StagedCacheProgress staged{cache_progress};
@@ -1077,7 +1084,7 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
                 coordinator_.RetainInputCheckpoint(cache_progress.prefix_hashes, checkpoint);
         }
     }
-    return fsm::ScheduleDecodeEvent{config_.decode_input_tokens};
+    return fsm::ScheduleDecodeEvent{config_.decode_input_tokens, std::move(decode_slot)};
 }
 
 PrefillOperation Scheduler::applyEventAndBuildOperation(Request* request, fsm::SchedulePrefillFirstChunkEvent event,
@@ -1815,6 +1822,13 @@ bool Scheduler::scheduleRestore(AdmissionFeedback& feedback, PlanBuild& build, R
         spdlog::debug("[Scheduler] restore blocked: rid={} no free request slot", request->Id());
         return false;
     }
+    DecodeSlotIndex decode_slot;
+    if (std::holds_alternative<fsm::ResumeDecoding>(retracted->shape)) {
+        if (decode_slots_.AvailableSlots() == 0) {
+            return false;  // Waiting for execution must not seal KV admission.
+        }
+        decode_slot = decode_slots_.Allocate();
+    }
     const auto* resumes_prefilling = std::get_if<fsm::ResumePrefilling>(&retracted->shape);
     const std::int32_t resume_reserve =
         std::visit([](const auto& shape) { return shape.reserve_num_tokens_in_next_schedule_event; }, retracted->shape);
@@ -1864,8 +1878,8 @@ bool Scheduler::scheduleRestore(AdmissionFeedback& feedback, PlanBuild& build, R
     // its ACK hands it to the resumed state (an abort meanwhile must not
     // re-grant a row still being written), and shares the blob slot.
     SnapshotRestoreOperation op = tier_transfers_.StartSnapshotRestore(
-        request->Id(), req_pool_allocator_.Allocate(), retracted->blob_slot, std::move(result->load_pairs),
-        std::move(result->snapshot_pairs), retracted->cache_progress.access_epoch);
+        request->Id(), req_pool_allocator_.Allocate(), std::move(decode_slot), retracted->blob_slot,
+        std::move(result->load_pairs), std::move(result->snapshot_pairs), retracted->cache_progress.access_epoch);
     const std::uint32_t restore_op = op.op_id;
     build.snapshot_restores.push_back(std::move(op));
     request->Apply(
@@ -2257,8 +2271,8 @@ void Scheduler::buildDecodeWorkerPlan(AdmissionFeedback& feedback, PlanBuild& bu
     // it waits for would starve it.
     const bool new_prompts_sealed = scheduleReadmission(feedback, build, candidates);
 
-    // Phase 2: the decode batch. Completed prefills' first decodes go ahead
-    // of the running ones; neither consumes token budget on this role.
+    // Phase 2: the decode batch. Running requests keep their permits; ready
+    // prefills use only the remaining execution capacity.
     scheduleDecodeBatch(feedback, build, candidates);
 
     // Phase 3: at most one remote admission -- the whole prompt reserves at

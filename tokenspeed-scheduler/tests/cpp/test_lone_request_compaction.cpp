@@ -76,6 +76,7 @@ protected:
         cfg.max_retracted_requests = 0;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 64;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.decode_input_tokens = 1;
         cfg.overlap_schedule_depth = 0;
         cfg.disable_prefix_cache = false;
@@ -1555,6 +1556,7 @@ TEST_F(LoneRequestCompactionSuite, ALoneRestoreDropsClaimsThatLeaveNoPlan) {
     config_.host_allocator.total_pages = 28;
     config_.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
     config_.max_batch_size = 8;
+    config_.max_resident_requests = config_.max_batch_size;
     config_.debug_force_retraction_interval = 4;
     SetTestSnapshotPool(config_);
     config_ = WithHostPackingFromDevice(config_);

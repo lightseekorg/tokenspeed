@@ -252,6 +252,7 @@ def _scheduler(pool, *, width: int, overlap_schedule_depth: int):
     config.max_retracted_requests = 0
     config.max_scheduled_tokens = 8
     config.max_batch_size = 1
+    config.max_resident_requests = 1
     config.decode_input_tokens = width
     config.overlap_schedule_depth = overlap_schedule_depth
     config.enable_mixed_prefill_decode = False

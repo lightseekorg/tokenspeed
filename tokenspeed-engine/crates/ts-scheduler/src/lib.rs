@@ -378,6 +378,12 @@ mod ffi {
         /// whose prefill is done, and decodes. Remote prefilling, waiting and
         /// retracted requests are not running.
         running: usize,
+        /// Resident requests holding a request-pool slot.
+        allocated_request_slots: usize,
+        /// Decode permits held by requests or their in-flight operations.
+        active_decode_slots: usize,
+        /// Resident requests whose KV is ready but that have no decode permit.
+        ready_waiting: usize,
         /// Requests awaiting admission or restore.
         waiting: usize,
         /// Requests prefilling.

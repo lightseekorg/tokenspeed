@@ -54,6 +54,7 @@ def _backend(device: str = "cpu") -> trtllm.TRTLLMMHAAttnBackend:
         kernel_page_size=PAGE,
         context_len=4096,
         max_bs=MAX_BS,
+        max_resident_requests=MAX_BS,
         kv_cache_quant_method="none",
         components=(spec,),
     )

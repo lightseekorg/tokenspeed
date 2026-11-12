@@ -100,6 +100,7 @@ def _mamba_config_pair(
         kv_cache_quant_method="none",
         context_len=4096,
         max_bs=max_bs,
+        max_resident_requests=max_bs,
         speculative_num_draft_tokens=spec_tokens,
         components=(spec, linear),
     )

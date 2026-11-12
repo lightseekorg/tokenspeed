@@ -44,6 +44,7 @@ def _base_config(num_device_pages: int = 64) -> SchedulerConfig:
     cfg.prefix_granularity = 64
     cfg.max_scheduled_tokens = 4096
     cfg.max_batch_size = 8
+    cfg.max_resident_requests = cfg.max_batch_size
     cfg.num_device_pages = num_device_pages
     cfg.num_snapshot_pages = 1  # never retracts
     cfg.disable_l2_cache = True
@@ -299,6 +300,7 @@ def test_batch_admission_debits_simulated_free_pages():
     cfg = _base_config(num_device_pages=15)
     cfg.prefix_granularity = 2
     cfg.max_batch_size = 4
+    cfg.max_resident_requests = cfg.max_batch_size
     cfg.max_scheduled_tokens = 512
     cfg.cache_groups = [
         CacheGroupConfig(

@@ -296,7 +296,8 @@ def _model(specs, packing):
         virtual_packing=packing,
         limits=SchedulerLimits(
             role=ts.SchedulerConfig.Role.Fused,
-            max_live_requests=4,
+            max_batch_size=4,
+            max_resident_requests=4,
             max_scheduled_tokens=2048,
             max_context_len=4096,
             decode_input_tokens=1,
@@ -388,6 +389,7 @@ def _device_request(**overrides):
         contract,
         host_group_packing=contract.virtual_packing,
         max_batch_size=4,
+        max_resident_requests=4,
         max_context_len=4096,
         decode_input_tokens=1,
         overlap_schedule_depth=0,

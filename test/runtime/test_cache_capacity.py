@@ -72,6 +72,7 @@ def mha_recipe(
         kernel_page_size=64,
         context_len=1024,
         max_bs=1,
+        max_resident_requests=1,
         components=(
             MHAConfig(
                 backend_name="fa2",
@@ -184,6 +185,7 @@ def test_qcp_reserves_one_shared_workspace_before_sizing(qcp, draft):
         kernel_page_size=64,
         context_len=65536,
         max_bs=1,
+        max_resident_requests=1,
         kvp_size=8,
         qcp_size=qcp,
         components=(

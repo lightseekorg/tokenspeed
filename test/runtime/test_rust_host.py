@@ -457,6 +457,7 @@ def _scheduler() -> Scheduler:
     config.prefix_granularity = 16
     config.max_scheduled_tokens = 64
     config.max_batch_size = 4
+    config.max_resident_requests = 4
     config.num_device_pages = 64
     config.num_snapshot_pages = 1
     config.cache_groups = [

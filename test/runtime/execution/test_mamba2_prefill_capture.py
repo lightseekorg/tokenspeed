@@ -84,6 +84,7 @@ def _backend():
         kv_cache_quant_method="none",
         context_len=4096,
         max_bs=8,
+        max_resident_requests=8,
         is_draft=False,
         speculative_num_draft_tokens=1,
         components=(spec, mamba2),

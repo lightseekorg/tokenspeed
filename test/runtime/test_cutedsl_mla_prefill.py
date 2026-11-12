@@ -60,6 +60,7 @@ def _leaf(dtype, cache_dtype, device):
         kv_cache_quant_method="",
         context_len=1024,
         max_bs=4,
+        max_resident_requests=4,
         components=(spec,),
     )
     return CuteDSLMLABackend(config, spec, kernel_page_size=64)

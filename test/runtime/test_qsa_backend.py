@@ -111,6 +111,7 @@ def _qsa_config(*, max_bs: int, is_draft: bool, device: str) -> AttnConfig:
         kernel_page_size=64,
         context_len=1024,
         max_bs=max_bs,
+        max_resident_requests=max_bs,
         pd_disaggregation_enabled=False,
         speculative_num_steps=0,
         speculative_num_draft_tokens=4,

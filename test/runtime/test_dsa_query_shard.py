@@ -851,6 +851,7 @@ def test_the_registry_allocates_the_workspace_once_and_the_draft_shares_it():
         kvp_group=tuple(range(WORLD)),
         context_len=max_model_len,
         max_bs=4,
+        max_resident_requests=4,
         kv_cache_dtype=torch.bfloat16,
         kv_cache_quant_method="none",
         kernel_page_size=PAGE,

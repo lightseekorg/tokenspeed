@@ -92,6 +92,7 @@ def _config(
     cfg.debug_force_retraction_interval = force_retraction_interval
     cfg.max_scheduled_tokens = 48
     cfg.max_batch_size = 6
+    cfg.max_resident_requests = cfg.max_batch_size
     cfg.enable_l3_storage = False
     # A Host tier states what feeds it; Validate refuses what it cannot run.
     cfg.disable_l2_cache = host_pages == 0

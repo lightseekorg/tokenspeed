@@ -9,6 +9,29 @@ Companion documents: `event-loop.md` (the control/data plane split that
 consumes these plans), `cache-concepts.md` (the vocabulary below —
 prefix granularity, cache groups, LCM blocks).
 
+## Request slots and active decode capacity
+
+The rank-local max_batch_size bounds model forwards and active decode
+permits. The separate max_resident_requests bounds the shared request pool.
+On a D role, disaggregation-decode-extra-slots adds resident rows without
+enlarging model batches. RemotePrefilling and a PrefillDone waiting for its
+first decode hold a request row and KV pages but no execution permit. All
+these requests share one pool; extra rows are not a dedicated transfer pool.
+
+A first local decode acquires a move-only permit and keeps it across rounds.
+Newly completed prefills cannot displace an already streaming request.
+Restoring a Decoding request reserves a permit before issuing the restore;
+the transfer owns it until acknowledgement, including after cancellation.
+Finishing requests keep their resources until outstanding results land.
+An abort drains those results without publishing its completed pages.
+Retraction relinquishes the permit once the existing in-flight guards allow
+the request to leave; readmission obtains a new one ahead of fresh work.
+
+A missing request row or decode permit is a scheduling wait, not a cache
+capacity failure. Only a failed KV admission enters the existing capacity
+recovery policy. The P role hands execution to its peer and does not consume
+a local decode permit.
+
 ## 1. Admission is per chunk
 
 An optional `--chunk-prefill-kv-size` also bounds the KV read by a local

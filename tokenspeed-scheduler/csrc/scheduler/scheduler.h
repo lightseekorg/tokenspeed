@@ -183,6 +183,12 @@ public:
     // RemotePrefilling (waiting for the peer's KV), waiting and retracted
     // requests are not running.
     std::size_t RunningSize() const;
+    // Physical resources include in-flight cleanup, even after its request
+    // leaves the runnable FSM states. Decode permits include restore tickets.
+    std::int32_t AllocatedRequestSlots() const { return TotalRequestSlots() - FreeRequestSlots(); }
+    std::int32_t ActiveDecodeSlots() const { return decode_slots_.Size() - decode_slots_.AvailableSlots(); }
+    // Prefill is complete but the first local decode has not acquired a permit.
+    std::size_t ReadyWaitingSize() const;
     // Device pool parents that are empty or hold only unpinned cache entries.
     // Scans the pool and every prefix index: a leak check for tests and
     // diagnostics, not a per-step gauge.
@@ -710,6 +716,7 @@ private:
 
     SchedulerConfig config_;
     ReqPoolAllocator req_pool_allocator_;
+    DecodeSlotAllocator decode_slots_;
     // One slot per retracted request: the index of its slot-state blob in
     // the runtime's arena, released by the FSM transition that drops the image.
     SnapshotSlotAllocator snapshot_slots_;

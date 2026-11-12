@@ -49,6 +49,7 @@ def _make_config() -> ts.SchedulerConfig:
     cfg.max_retracted_requests = 2
     cfg.max_scheduled_tokens = 64
     cfg.max_batch_size = 8
+    cfg.max_resident_requests = cfg.max_batch_size
     cfg.disable_l2_cache = False
     cfg.disable_prefix_cache = False
     cfg.cache_groups = [

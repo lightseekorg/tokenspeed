@@ -52,6 +52,7 @@ def _config(
     cfg.enable_l3_storage = False
     cfg.max_scheduled_tokens = max_scheduled_tokens
     cfg.max_batch_size = 8
+    cfg.max_resident_requests = cfg.max_batch_size
     # A snapshot pool as large as the Device pool and a blob slot per batch
     # row: any resident request can be imaged, so a retraction never aborts.
     cfg.num_snapshot_pages = cfg.num_device_pages

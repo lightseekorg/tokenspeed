@@ -238,6 +238,7 @@ protected:
         // Force the candidates loop to break after exactly one push so the
         // tiebreaker decides which request wins.
         cfg.max_batch_size = 1;
+        cfg.max_resident_requests = cfg.max_batch_size;
         return cfg;
     }
 };
@@ -890,6 +891,7 @@ protected:
         cfg.disable_l2_cache = true;
         cfg.max_scheduled_tokens = kBudget;
         cfg.max_batch_size = batch_;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.prefill_chunk_yield_tokens = yield_;
         cfg.cache_groups.push_back(CacheGroupConfig{
             .group_id = "full_attention",
@@ -1524,6 +1526,7 @@ protected:
     SchedulerConfig MakeConfig() override {
         auto cfg = PrefillDecodeIntervalSuite::MakeConfig();
         cfg.max_batch_size = 2;
+        cfg.max_resident_requests = cfg.max_batch_size;
         return cfg;
     }
 };
@@ -1752,6 +1755,7 @@ TEST(SchedulerConstructionTest, RefusesAPrefillDecodeIntervalOutsideTheFusedRole
         cfg.prefix_granularity = 2;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.device_allocator.total_pages = 32;
         cfg.disable_l2_cache = true;
         cfg.cache_groups.push_back(CacheGroupConfig{
@@ -1827,6 +1831,7 @@ TEST(SchedulerConstructionTest, ValidatesConfigBeforeBuildingPools) {
     cfg.prefix_granularity = 2;
     cfg.max_scheduled_tokens = 64;
     cfg.max_batch_size = 8;
+    cfg.max_resident_requests = cfg.max_batch_size;
     cfg.cache_groups.push_back(CacheGroupConfig{
         .group_id = "full_attention",
         .block_granularity = cfg.prefix_granularity,
@@ -1854,6 +1859,7 @@ TEST(SchedulerConstructionTest, PrefillChunkYieldIsAPrefillRoleOptionOfAtMostHal
         cfg.disable_l2_cache = true;
         cfg.max_scheduled_tokens = budget;
         cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.cache_groups.push_back(CacheGroupConfig{
             .group_id = "full_attention",
             .block_granularity = cfg.prefix_granularity,

@@ -105,7 +105,8 @@ private:
 struct ScheduleDecodeEvent : InvalidTransitionHandler<ScheduleDecodeEvent> {
     using InvalidTransitionHandler<ScheduleDecodeEvent>::operator();
 
-    explicit ScheduleDecodeEvent(std::int32_t decode_input_tokens) : decode_input_tokens_{decode_input_tokens} {}
+    ScheduleDecodeEvent(std::int32_t decode_input_tokens, DecodeSlotIndex decode_slot)
+        : decode_input_tokens_{decode_input_tokens}, decode_slot_{std::move(decode_slot)} {}
 
     Decoding operator()(PrefillDone&& state);
     Decoding operator()(PrefillAwaitingResult&& state);
@@ -116,6 +117,7 @@ private:
     Decoding decode(State&& state);
 
     std::int32_t decode_input_tokens_{};
+    DecodeSlotIndex decode_slot_;
 };
 
 // The request is done. A page-holding request parks in Finishing with its
@@ -154,6 +156,19 @@ struct ReleaseEvent : InvalidTransitionHandler<ReleaseEvent> {
 
 private:
     CacheCoordinator* coordinator_{};
+};
+
+// Cancellation cannot recycle a row or execution permit while a queued
+// forward can still write it. Finishing carries the resources until results
+// land, with publication disabled for the cancelled request.
+struct AbortInFlightEvent : InvalidTransitionHandler<AbortInFlightEvent> {
+    using InvalidTransitionHandler<AbortInFlightEvent>::operator();
+
+    template <typename State>
+        requires HoldsForwardResources<std::remove_cvref_t<State>>
+    Finishing operator()(State&& state) {
+        return Finishing{std::move(state.resources), /*publish_completed_pages=*/false};
+    }
 };
 
 struct AbortEvent : InvalidTransitionHandler<AbortEvent> {
@@ -267,12 +282,14 @@ private:
 struct RestoreDoneEvent : InvalidTransitionHandler<RestoreDoneEvent> {
     using InvalidTransitionHandler<RestoreDoneEvent>::operator();
 
-    explicit RestoreDoneEvent(ReqPoolIndex req_pool_index) : req_pool_index_{std::move(req_pool_index)} {}
+    RestoreDoneEvent(ReqPoolIndex req_pool_index, DecodeSlotIndex decode_slot)
+        : req_pool_index_{std::move(req_pool_index)}, decode_slot_{std::move(decode_slot)} {}
 
     std::variant<Prefilling, PrefillDone, Decoding> operator()(Restoring&& state);
 
 private:
     ReqPoolIndex req_pool_index_;
+    DecodeSlotIndex decode_slot_;
 };
 
 struct UpdateReserveNumTokensEvent : InvalidTransitionHandler<UpdateReserveNumTokensEvent> {

@@ -187,6 +187,7 @@ def _attn_config(layer_types, window) -> AttnConfig:
         kernel_page_size=64,
         context_len=262144,
         max_bs=64,
+        max_resident_requests=64,
     )
 
 

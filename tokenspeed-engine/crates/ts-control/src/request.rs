@@ -293,6 +293,8 @@ pub struct RequestState {
     /// When it reached the scheduler's waiting queue, until its first
     /// forward observes the wait.
     pub submitted_at: Option<std::time::Instant>,
+    /// Decode KV landing, until its first decode dispatch observes the wait.
+    pub decode_ready_at: Option<std::time::Instant>,
     /// When the frontend received it (wall-clock seconds), 0 if it did not
     /// say.
     pub created_time: f64,
@@ -378,6 +380,7 @@ impl RequestState {
             to_abort: false,
             abort_notify_client: false,
             submitted_at: None,
+            decode_ready_at: None,
             created_time: 0.0,
             first_token_time: 0.0,
             timings: None,

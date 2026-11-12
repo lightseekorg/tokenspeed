@@ -462,6 +462,7 @@ def _decode_batch(bs: int, width: int):
             num_device_pages=65,
             max_scheduled_tokens=bs * width,
             max_batch_size=bs,
+            max_resident_requests=bs,
             prefix_granularity=4,
             num_host_pages=0,
             disable_l2_cache=True,

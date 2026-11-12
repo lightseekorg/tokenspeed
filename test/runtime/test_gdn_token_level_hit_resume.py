@@ -75,6 +75,7 @@ def _scheduler(ts, make_config):
             num_device_pages=65,
             max_scheduled_tokens=256,
             max_batch_size=4,
+            max_resident_requests=4,
             prefix_granularity=PAGE,
             num_host_pages=0,
             disable_l2_cache=True,

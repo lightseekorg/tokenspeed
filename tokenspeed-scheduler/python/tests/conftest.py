@@ -27,6 +27,7 @@ def _make_k3_config() -> "ts.SchedulerConfig":
     cfg.num_snapshot_pages = 1  # never retracts
     cfg.max_scheduled_tokens = 64
     cfg.max_batch_size = 8
+    cfg.max_resident_requests = cfg.max_batch_size
     cfg.enable_l3_storage = False
     cfg.disable_l2_cache = True
     cfg.disable_prefix_cache = False

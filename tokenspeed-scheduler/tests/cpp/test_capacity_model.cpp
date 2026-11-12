@@ -75,6 +75,7 @@ SchedulerConfig SizingConfig(Role role, std::int32_t prefix_granularity, std::in
     cfg.prefix_granularity = prefix_granularity;
     cfg.max_scheduled_tokens = chunk_tokens;
     cfg.max_batch_size = 1;
+    cfg.max_resident_requests = cfg.max_batch_size;
     cfg.decode_input_tokens = decode_width;
     cfg.overlap_schedule_depth = overlap_depth;
     cfg.disable_prefix_cache = disable_prefix_cache;
@@ -177,6 +178,7 @@ TEST(CapacityModelTest, ConcurrentDemandByKind) {
     SchedulerConfig cfg = SizingConfig(Role::kFused, 64, 8192, /*decode_width=*/4, /*overlap_depth=*/1, false,
                                        {Full("full", 64, 12), State("state", 1), Sliding("swa", 64, 128, 3)});
     cfg.max_batch_size = 16;
+    cfg.max_resident_requests = cfg.max_batch_size;
     const CapacityModel model{cfg};
     const std::vector<std::int64_t> pages =
         model.ConcurrentGroupPages(/*max_total_tokens=*/65536, /*max_context_len=*/4096);

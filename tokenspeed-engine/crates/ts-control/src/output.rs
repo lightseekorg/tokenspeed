@@ -735,6 +735,16 @@ impl OutputProcessor {
         self.states.get_mut(rid)?.submitted_at.take()
     }
 
+    /// Observe KV-ready waiting once, only for a request that starts decode.
+    pub fn take_decode_ready_at(&mut self, rid: &str) -> Option<Instant> {
+        let state = self.states.get_mut(rid)?;
+        let at = state.decode_ready_at.take();
+        if state.to_abort || state.finished() {
+            return None;
+        }
+        at
+    }
+
     /// Stamp `rid`'s arrival in the scheduler's waiting queue.
     pub fn mark_submitted(&mut self, rid: &str, at: Instant) {
         if let Some(state) = self.states.get_mut(rid) {
@@ -842,6 +852,9 @@ impl OutputProcessor {
         let Some(state) = self.states.get_mut(rid) else {
             return;
         };
+        if self.metrics_enabled {
+            state.decode_ready_at.get_or_insert_with(Instant::now);
+        }
         if let Some(trace) = &mut state.ttft {
             trace.transfer_done_ms = Some(trace.ms());
         }
@@ -1991,6 +2004,37 @@ mod tests {
         assert!(metrics.tpot_seconds.is_empty());
         assert_eq!(metrics.completion_tokens, 1);
         assert_eq!(p.take_request_metrics().completion_tokens, 0);
+    }
+
+    #[test]
+    fn decode_ready_wait_starts_at_kv_landing_and_is_observed_once() {
+        let mut p = OutputProcessor::new(None, 1, None, Role::Decode, NO_FINISH_LOG, true, None);
+        register(&mut p, "a", 4, 8, &[]);
+        assert!(p.take_decode_ready_at("a").is_none());
+        let before = Instant::now();
+        p.remote_prefill_done("a", 7, 0, None);
+        let after = Instant::now();
+        let ready = p.take_decode_ready_at("a").unwrap();
+        assert!(before <= ready && ready <= after);
+        assert!(p.take_decode_ready_at("a").is_none());
+
+        register(&mut p, "cancelled", 4, 8, &[]);
+        p.remote_prefill_done("cancelled", 7, 0, None);
+        p.states.get_mut("cancelled").unwrap().to_abort = true;
+        assert!(p.take_decode_ready_at("cancelled").is_none());
+
+        register(&mut p, "finished", 4, 1, &[]);
+        p.remote_prefill_done("finished", 7, 0, None);
+        p.finish_remote_prefill_only("finished");
+        assert!(p.take_decode_ready_at("finished").is_none());
+    }
+
+    #[test]
+    fn decode_ready_wait_does_not_stamp_without_metrics() {
+        let mut p = OutputProcessor::new(None, 1, None, Role::Decode, NO_FINISH_LOG, false, None);
+        register(&mut p, "a", 4, 8, &[]);
+        p.remote_prefill_done("a", 7, 0, None);
+        assert!(p.take_decode_ready_at("a").is_none());
     }
 
     #[test]

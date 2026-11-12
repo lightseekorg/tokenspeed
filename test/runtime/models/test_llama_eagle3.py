@@ -164,6 +164,7 @@ def test_sliding_window_draft_layer_rides_a_sliding_cache_group(
         kernel_page_size=64,
         context_len=1024,
         max_bs=2,
+        max_resident_requests=2,
     )
     draft_attn_config = AttnConfig(
         components=(replace(target, cache_layer_types=("sliding_attention",)),),

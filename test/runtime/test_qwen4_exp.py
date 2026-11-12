@@ -552,6 +552,7 @@ def _qsa_config(*, kernel_page_size: int | None, max_bs: int, spec: int) -> Attn
         kernel_page_size=kernel_page_size,
         context_len=1024,
         max_bs=max_bs,
+        max_resident_requests=max_bs,
         pd_disaggregation_enabled=False,
         speculative_num_steps=0,
         speculative_num_draft_tokens=spec,
@@ -2320,6 +2321,7 @@ def test_qwen4_exp_cache_recipe_adds_ple_and_qsa_groups() -> None:
         kv_cache_mxfp8=False,
         context_len=1024,
         max_bs=2,
+        max_resident_requests=2,
         kernel_page_size=64,
         kv_cache_quant_method="none",
         components=(softmax, linear),
@@ -2410,7 +2412,8 @@ def test_qwen4_exp_cache_recipe_adds_ple_and_qsa_groups() -> None:
             },
             limits=SchedulerLimits(
                 role=SchedulerConfig.Role.Fused,
-                max_live_requests=2,
+                max_batch_size=2,
+                max_resident_requests=2,
                 # A chunk must cover one PLE state checkpoint (256 tokens).
                 max_scheduled_tokens=256,
                 max_context_len=max_tokens,
@@ -2486,6 +2489,7 @@ def _fp8_kv_qwen4_exp_cache_setup(*, with_ple: bool):
         kv_cache_mxfp8=False,
         context_len=1024,
         max_bs=2,
+        max_resident_requests=2,
         kernel_page_size=64,
         kv_cache_quant_method="none",
         components=(softmax, linear),

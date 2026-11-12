@@ -59,6 +59,7 @@ def scheduler_forward_op():
     cfg.num_snapshot_pages = 1
     cfg.max_scheduled_tokens = 64
     cfg.max_batch_size = 8
+    cfg.max_resident_requests = 8
     cfg.enable_l3_storage = False
     cfg.disable_l2_cache = True
     cfg.disable_prefix_cache = True
@@ -632,6 +633,7 @@ def _scheduler_bridge_config(ts, *, max_scheduled_tokens: int, num_usable_pages:
     cfg.enable_l3_storage = False
     cfg.max_scheduled_tokens = max_scheduled_tokens
     cfg.max_batch_size = 8
+    cfg.max_resident_requests = 8
     cfg.num_snapshot_pages = cfg.num_device_pages
     cfg.max_retracted_requests = cfg.max_batch_size
     cfg.prefix_granularity = PAGE

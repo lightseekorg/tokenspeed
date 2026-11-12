@@ -315,6 +315,7 @@ def _make_config(kernel_page_size: int | None):
         kernel_page_size=kernel_page_size,
         context_len=4096,
         max_bs=8,
+        max_resident_requests=8,
         kv_cache_quant_method="none",
         components=(spec,),
     )

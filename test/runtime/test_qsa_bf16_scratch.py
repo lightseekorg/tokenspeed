@@ -193,6 +193,7 @@ def _recipe(
         kernel_page_size=None,
         context_len=CONTEXT_LEN,
         max_bs=2,
+        max_resident_requests=2,
         pd_disaggregation_enabled=role != "null",
         speculative_num_steps=2 if speculative else 0,
         speculative_num_draft_tokens=width,
@@ -428,6 +429,7 @@ def _config(*, is_draft=False, kv_cache_dtype=FP8):
         kernel_page_size=None,
         context_len=CONTEXT_LEN,
         max_bs=MAX_BS,
+        max_resident_requests=MAX_BS,
         pd_disaggregation_enabled=False,
         speculative_num_steps=0,
         speculative_num_draft_tokens=1,
@@ -532,7 +534,7 @@ def test_startup_checks_the_planned_bytes_against_the_allocation(kernels):
     plan = _plan()
     kwargs = dict(
         server_args=SimpleNamespace(speculative_num_draft_tokens=1),
-        config=SimpleNamespace(max_bs=4, qcp_size=1),
+        config=SimpleNamespace(max_bs=4, max_resident_requests=4, qcp_size=1),
         backend=root,
         draft_backend=None,
         uses_paged_state_verify=False,

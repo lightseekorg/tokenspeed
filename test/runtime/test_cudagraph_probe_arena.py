@@ -480,6 +480,7 @@ def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager, is_nv
             overlap_schedule_depth=0,
             decode_input_tokens=1,
             max_batch_size=8,
+            max_resident_requests=8,
             kv_transfer_builder=functools.partial(build_host_peer, outbox=None),
         )
     return charged, set(reads), stack[0]

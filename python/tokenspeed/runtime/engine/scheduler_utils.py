@@ -112,6 +112,7 @@ def make_config(
     enable_l3_storage: bool,
     role: str,
     *,
+    max_resident_requests: int,
     num_snapshot_pages: int,
     host_group_packing: Sequence[int],
     max_retracted_requests: int,
@@ -144,6 +145,8 @@ def make_config(
             oldest-request protection; False preserves submission order.
         max_batch_size: Per-rank batch slots -- the most requests this rank
             runs at once (``--max-num-seqs`` over the attention-DP ranks).
+        max_resident_requests: Per-rank requests that may own a request slot,
+            including requests waiting for remote KV or their first decode.
         prefix_granularity: Prefix-hash page size in tokens.
         num_host_pages: Host L2 LCM blocks including the null page; 0 without
             the L2 tier.
@@ -258,6 +261,7 @@ def make_config(
     if max_kv_page_num:
         cfg.max_kv_page_num = max_kv_page_num
     cfg.max_batch_size = max_batch_size
+    cfg.max_resident_requests = max_resident_requests
     cfg.prefix_granularity = prefix_granularity
 
     cfg.num_host_pages = num_host_pages

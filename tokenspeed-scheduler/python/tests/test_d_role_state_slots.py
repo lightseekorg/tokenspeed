@@ -52,6 +52,7 @@ def _d_role_config(decode_input_tokens: int) -> "ts.SchedulerConfig":
     cfg.role = ts.SchedulerConfig.Role.D
     cfg.decode_input_tokens = decode_input_tokens
     cfg.max_batch_size = 8
+    cfg.max_resident_requests = cfg.max_batch_size
     for group in cfg.cache_groups:
         group.transfer_policy = (
             ts.CacheTransferPolicy.LatestSnapshot
@@ -280,6 +281,7 @@ class TestFullRemoteAdmissionQueue:
         """A full slot pool must retain queued remote work until release."""
         config = _d_role_config(decode_input_tokens=1)
         config.max_batch_size = 1
+        config.max_resident_requests = config.max_batch_size
         scheduler = ts.Scheduler(config)
         _submit_and_bootstrap(scheduler, ["resident", "queued"])
         first = scheduler.next_execution_plan().remote_prefill

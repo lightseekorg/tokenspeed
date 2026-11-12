@@ -49,7 +49,8 @@ def compute_cache_group_pages(
         virtual_packing={spec.group_id: 1 for spec in specs},
         limits=SchedulerLimits(
             role=SchedulerConfig.Role.Fused,
-            max_live_requests=max_live_requests,
+            max_batch_size=max_live_requests,
+            max_resident_requests=max_live_requests,
             max_scheduled_tokens=max_scheduled_tokens,
             max_context_len=max_context_len,
             decode_input_tokens=decode_input_tokens,

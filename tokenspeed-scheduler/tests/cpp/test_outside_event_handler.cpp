@@ -292,6 +292,7 @@ protected:
         cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 2;
         cfg.max_batch_size = 1;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.decode_input_tokens = 1;
         cfg.role = Role::kD;
         cfg.enable_l3_storage = false;
@@ -352,6 +353,7 @@ protected:
         SchedulerConfig cfg = DisaggDecodeAdmissionTestSuite::MakeConfig();
         cfg.device_allocator.total_pages = 5;
         cfg.max_batch_size = 2;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.cache_groups.front().total_pages = cfg.device_allocator.total_pages;
         SetTestSnapshotPool(cfg);
         return cfg;
@@ -398,6 +400,7 @@ protected:
         cfg.host_allocator.total_pages = 7;
         cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_batch_size = 2;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.cache_groups.front().total_pages = cfg.device_allocator.total_pages;
         SetTestSnapshotPool(cfg);
         return cfg;
@@ -458,6 +461,7 @@ protected:
         cfg.host_allocator.total_pages = 6;  // null parent + five retraction parents
         cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_batch_size = 3;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.cache_groups.front().total_pages = cfg.device_allocator.total_pages;
         SetTestSnapshotPool(cfg);
         return cfg;
@@ -474,6 +478,7 @@ protected:
         cfg.device_allocator.total_pages = 9;
         cfg.cache_groups.front().total_pages = cfg.device_allocator.total_pages;
         cfg.max_batch_size = 3;
+        cfg.max_resident_requests = cfg.max_batch_size;
         SetTestSnapshotPool(cfg);
         return cfg;
     }
@@ -1027,6 +1032,7 @@ protected:
         cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 4;
         cfg.max_batch_size = 4;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.disable_prefix_cache = false;
 
         CacheGroupConfig full = cfg.cache_groups.front();
@@ -1628,6 +1634,7 @@ protected:
         cfg.role = Role::kP;
         cfg.max_scheduled_tokens = 16;
         cfg.max_batch_size = 4;
+        cfg.max_resident_requests = cfg.max_batch_size;
         // Null parent plus four usable: exactly "a"'s two pages and "b"'s
         // two pages, none spare for "c".
         cfg.device_allocator.total_pages = 5;
@@ -2088,9 +2095,9 @@ TEST_F(PdTransferParkingDecodeTestSuite, FailedEventWhileRemotePrefillingParksUn
     EXPECT_FALSE(PlanSchedulesD0());
 }
 
-// Fused role: forward::Abort frees pages immediately. pdTransferInFlight is
-// always false there, so no request ever parks.
-TEST_F(SchedulerTestSuite, FusedRoleAbortFreesPagesImmediately) {
+// A fused cancellation has no PD transfer to retire, but its queued forward
+// still owns the request's pages until its result lands.
+TEST_F(SchedulerTestSuite, FusedRoleAbortWaitsForForwardCompletion) {
     const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
     Submit({MakeRequestSpec("f1", /*num_pages=*/2)});
     PlanOnce();
@@ -2098,7 +2105,9 @@ TEST_F(SchedulerTestSuite, FusedRoleAbortFreesPagesImmediately) {
     SendAbortEvent("f1");
     EXPECT_FALSE(scheduler_->PdTransferPinned("f1"));
     EXPECT_EQ(scheduler_->PdTransferSize(), 0u);
-    EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0) << "the fused role never parks: its pages free immediately";
+    EXPECT_GT(scheduler_->ActiveLcmBlocks(), 0);
+    SendForwardDone("f1");
+    EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0);
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
 }
 

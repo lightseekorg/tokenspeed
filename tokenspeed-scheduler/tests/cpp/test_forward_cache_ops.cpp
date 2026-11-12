@@ -473,6 +473,7 @@ SchedulerConfig MakeValidConfig() {
     config.device_allocator.total_pages = 32;
     config.max_scheduled_tokens = 1024;
     config.max_batch_size = 8;
+    config.max_resident_requests = config.max_batch_size;
     CacheGroupConfig group;
     group.group_id = "full";
     group.block_granularity = 128;
