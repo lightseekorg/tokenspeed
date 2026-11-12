@@ -191,8 +191,9 @@ public:
     std::int32_t TotalRequestSlots() const { return req_pool_allocator_.Size(); }
     std::int32_t TotalLcmBlocks() const { return block_pool_.NumLcmBlocks(); }
     std::vector<std::int64_t> AdmissionCapacityCurve(std::int32_t token_step) const;
-    // Per-step gauges: empty parents are O(1), active parents walk the live
-    // requests' block tables. Parents resident only as cache are
+    // Per-step gauges, both O(1): the pool keeps its empty parents, the
+    // requests' block tables count the parents they hold as they change.
+    // Parents resident only as cache are
     // TotalLcmBlocks - EmptyLcmBlocks - ActiveLcmBlocks.
     std::int32_t EmptyLcmBlocks() const { return coordinator_.NumEmptyLcmBlocks(); }
     std::int32_t ActiveLcmBlocks() const;
@@ -713,7 +714,8 @@ private:
     // the runtime's arena, released by the FSM transition that drops the image.
     SnapshotSlotAllocator snapshot_slots_;
 
-    // Pools outlive every CacheBlockRef stored below.
+    // Pools outlive every CacheBlockRef stored below, and the coordinator
+    // every BlockTable it binds (the requests' tables, in requests_ below).
     BlockPool block_pool_;
     BlockPool host_pool_;
     BlockPool snapshot_pool_;
