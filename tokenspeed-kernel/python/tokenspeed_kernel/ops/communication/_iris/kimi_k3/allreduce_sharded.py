@@ -21,7 +21,6 @@
 """Iris all-reduce with sharded K3 attn/MoE compute and shared result storage."""
 
 import math
-import os
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -60,22 +59,7 @@ PREFILL_TOPK_GATHER_PROGRAMS = 64
 _LARGEM_ROW_TILE = 256
 # A published projection's scatter overlaps the GEMM from the second owned row tile.
 PUBLISHED_MIN_ROWS = 2 * 8 * _LARGEM_ROW_TILE
-# Owned row tiles of an 8192-row chunk (LARGEM_GATHER_MAX_TILES).
-_GATHER_ROW_TILES = 4
-
 _attn_res_mix_gfx950 = None
-
-
-def _gather_rows_gemm_enabled() -> bool:
-    """Whether the KDA input projection gathers its rows inside the GEMM
-    (experiment, default off; listed with the K3.1 switches in the runtime's
-    ``utils/env.py``)."""
-    return os.environ.get("TOKENSPEED_K31_GATHER_ROWS_GEMM", "").lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
 
 
 @gluon.jit
@@ -1315,7 +1299,6 @@ class IrisAllReduceShardedState:
             + allocation_bytes((2, max_rows // world_size, PREFILL_TOPK), torch.int16)
             + allocation_bytes((2, max_rows // world_size), torch.int32)
             + allocation_bytes((PREFILL_TOPK_GATHER_PROGRAMS, world_size), torch.int32)
-            + allocation_bytes((world_size * _GATHER_ROW_TILES,), torch.int32)
         )
 
     def __init__(self, pull: ProducerPull, *, max_rows: int) -> None:
@@ -1364,17 +1347,6 @@ class IrisAllReduceShardedState:
         self._published_counts = [0] * 4
         self._published: _PublishedProjection | None = None
         self.scatter_stream: torch.cuda.Stream | None = None
-        # Peers add their pushed workgroups of each of their row tiles here.
-        self.gather_row_counters = peers.ctx.zeros(
-            (8 * _GATHER_ROW_TILES,), dtype=torch.int32
-        )
-        # Pushed workgroups of every peer's row tile so far, as int32s.
-        self._gather_row_counts = [0] * _GATHER_ROW_TILES
-        # Output tiles handed out so far, as an int32.
-        self.gather_row_tickets = torch.zeros(
-            (1,), dtype=torch.int32, device=peers.device
-        )
-        self._gather_ticket_base = 0
 
     def project_attention(
         self, activation: torch.Tensor, weight: torch.Tensor, out: torch.Tensor
@@ -1971,10 +1943,6 @@ class IrisAllReduceShardedState:
             NUM_WARPS=4,
             num_warps=4,
         )
-        if not gather_next_projection:
-            out = self._gather_rows_project(mixed, output, next_weight)
-            if out is not None:
-                return out
         main = torch.cuda.current_stream(mixed.device)
         side = self._gather_side_stream(mixed.device)
         side.wait_stream(main)
@@ -2039,61 +2007,6 @@ class IrisAllReduceShardedState:
             WAIT_STORES=self._arch.wait_stores,
         )
         return qkv
-
-    def _gather_rows_project(
-        self, mixed: torch.Tensor, output: torch.Tensor, next_weight: torch.Tensor
-    ) -> torch.Tensor | None:
-        """Gather ``mixed`` into ``output`` inside the projection GEMM, or nothing.
-
-        Each row tile of a peer is projected as soon as it lands, so the
-        gather hides behind the GEMM instead of preceding seven eighths of it.
-        """
-        local_rows = mixed.shape[0]
-        tiles = local_rows // _LARGEM_ROW_TILE
-        if (
-            not _gather_rows_gemm_enabled()
-            or torch.cuda.is_current_stream_capturing()
-            or local_rows % _LARGEM_ROW_TILE
-            or not 0 < tiles <= len(self._gather_row_counts)
-        ):
-            return None
-        from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (
-            LARGEM_GATHER_PUSH_PROGRAMS,
-            gather_rows_mm_tickets,
-            launch_gluon_mm_a16w16_prefill_gather_rows_gfx950,
-        )
-
-        counts = list(self._gather_row_counts)
-        for tile in range(tiles):
-            count = counts[tile] + LARGEM_GATHER_PUSH_PROGRAMS
-            counts[tile] = (count + (1 << 31)) % (1 << 32) - (1 << 31)
-        out = torch.empty(
-            (output.shape[0], next_weight.shape[0]),
-            device=mixed.device,
-            dtype=mixed.dtype,
-        )
-        if (
-            launch_gluon_mm_a16w16_prefill_gather_rows_gfx950(
-                mixed,
-                output,
-                next_weight,
-                out,
-                self.gather_row_counters,
-                self.gather_row_tickets,
-                self.heap_bases,
-                rank=self.rank,
-                targets=tuple(counts),
-                ticket_base=self._gather_ticket_base,
-            )
-            is None
-        ):
-            return None
-        self._gather_row_counts = counts
-        base = self._gather_ticket_base + gather_rows_mm_tickets(
-            local_rows, next_weight.shape[0]
-        )
-        self._gather_ticket_base = (base + (1 << 31)) % (1 << 32) - (1 << 31)
-        return out
 
     def _mix_side_gather(
         self,
