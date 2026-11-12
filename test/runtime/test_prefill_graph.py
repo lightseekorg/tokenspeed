@@ -863,8 +863,8 @@ class TestDummyGroupTablesTest:
         assert (unsharded["query_shard"]) is None
 
     def test_the_drafter_dummy_batch_prepares_the_draft_from_the_same_tables(self):
-        """The drafter's prefill-graph capture runs over a dummy extend whose
-        draft metadata comes from the same tables and lengths as the target's,
+        """The unsharded drafter's capture runs over a dummy extend whose draft
+        metadata comes from the same tables and lengths as the target's,
         through the live extend's two-step prep."""
         import torch
 

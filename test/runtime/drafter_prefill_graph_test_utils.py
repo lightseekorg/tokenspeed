@@ -92,9 +92,10 @@ class _ToyLayout(NamedTuple):
 
 
 class ToyBackend:
-    """The draft attention backend surface the drafter and the toy model use."""
+    """Unsharded draft attention for the single-rank graph tests."""
 
     def __init__(self, device: str) -> None:
+        self.query_sharded = False
         self.sparse_topk = SparseTopKShare()
         # The toy draft attends whole extend spans; it takes no query shard.
         self.query_sharded = False

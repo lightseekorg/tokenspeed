@@ -801,6 +801,15 @@ already cancelled its stream or a final output was sent. A pause abort still
 notifies the client; repeated transfer events do not repeat the final output.
 This output fence does not retire source pages.
 
+**PD route refresh.** Before attaching a new room, the decode connection worker
+fetches the bootstrap route version. The version changes on bootstrap restart
+and source-rank registration, even when the address stays healthy. A changed
+version invalidates the cached route and target registrations for future rooms;
+existing rooms keep their targets and cancellation retirement fences. Bootstrap
+servers without a version are resolved afresh on each connection. This adds
+one bootstrap lookup per room, off the scheduler and forward threads. It does
+not transparently migrate an in-flight transfer to a replacement prefill peer.
+
 **PD cancellation.** Client aborts and `pause(abort)` cancel the tracked
 transfer as well as marking the request's output. A decode receiver sends a
 cancellation to every prefill target that could write its landing pages.

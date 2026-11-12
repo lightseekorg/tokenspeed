@@ -30,6 +30,7 @@ SCRIPT = Path(__file__).parents[2] / ".github/scripts/update-nightly-index.py"
 def test_nightly_index_preserves_history_and_uses_published_digest(
     tmp_path, variant
 ) -> None:
+    """Preserve published history, including when release assets are missing."""
     update_index = runpy.run_path(str(SCRIPT))["update_index"]
     wheelhouse = tmp_path / "wheelhouse"
     nightly = wheelhouse / "nightly"
