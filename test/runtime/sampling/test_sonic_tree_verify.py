@@ -82,7 +82,9 @@ DEPTHS = [0, 1, 1, 2, 2]
 N = len(PARENTS)
 
 
-def _backend(vocab: int = VOCAB, logprobs: bool = False) -> SonicSamplingBackend:
+def _backend(
+    vocab: int = VOCAB, logprobs: bool = False, tree: bool = True
+) -> SonicSamplingBackend:
     return SonicSamplingBackend(
         SamplingBackendConfig(
             synthetic_acceptance_length=None,
@@ -92,7 +94,7 @@ def _backend(vocab: int = VOCAB, logprobs: bool = False) -> SonicSamplingBackend
             enable_output_logprobs=logprobs,
             max_bs=BS,
             max_draft_tokens_per_req=N,
-            draft_tree=True,
+            draft_tree=tree,
             max_req_pool_size=POOL,
             vocab_size=vocab,
             device="cuda",
@@ -207,6 +209,20 @@ def test_a_padded_verify_reads_back_at_the_live_batch_size():
     assert path[:, 1].tolist() == [1] * BS
     for live in range(1, BS):
         assert torch.equal(backend.accepted_path(live, N), path[:live])
+
+
+def test_a_backend_built_without_draft_trees_refuses_one():
+    backend = _backend(tree=False)
+    req = _prepare(backend, [_sp(f"r{i}", temperature=0.0) for i in range(BS)])
+    logits, _ = _peaks(BS * N)
+    candidates = torch.zeros(BS, N, dtype=torch.int32, device="cuda")
+    with pytest.raises(RuntimeError, match="draft_tree"):
+        backend.verify(
+            LogitsProcessorOutput(next_token_logits=logits),
+            _info(req),
+            candidates,
+            tree=_tree(),
+        )
 
 
 def test_penalized_greedy_trees_count_each_node_path():

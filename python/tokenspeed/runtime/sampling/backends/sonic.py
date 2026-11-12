@@ -1078,7 +1078,6 @@ class SonicSamplingBackend(SamplingBackend):
         """
 
         if not self.tree:
-
             raise RuntimeError(
                 "SonicSamplingBackend verifies draft trees only when built with "
                 "SamplingBackendConfig.draft_tree, which allocates their buffers"
