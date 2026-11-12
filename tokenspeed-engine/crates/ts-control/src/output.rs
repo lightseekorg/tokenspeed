@@ -27,7 +27,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ts_scheduler::{ForwardBatchView, ForwardEvent, ForwardEventKind, SchedulerAbortView};
+use ts_scheduler::{profile, ForwardBatchView, ForwardEvent, ForwardEventKind, SchedulerAbortView};
 
 use ts_wire::output::FinishDetails;
 
@@ -1107,7 +1107,7 @@ impl OutputProcessor {
                 }
                 let lo = chunk_start.max(state.logprob_start_len);
                 let hi = (chunk_start + chunk_len).min(state.prompt_len - 1);
-                if state.wants_input_logprobs() && state.input_logprobs.is_none() && lo < hi {
+                if state.wants_input_logprobs() && !state.input_logprobs_finalized() && lo < hi {
                     row = (row_offset + lo - chunk_start, hi - lo, lo);
                     input.top_k = input.top_k.max(state.top_logprobs_num);
                 }
@@ -1230,6 +1230,7 @@ impl OutputProcessor {
         input_logprobs: Option<&InputLogprobPlan>,
         result: &ForwardResult,
     ) -> Result<Committed, CommitError> {
+        let _span = profile::span("OutputProcessor::commit");
         let rows = batch.request_ids.len();
         let check = |column, found| {
             if found == rows {
@@ -1658,7 +1659,7 @@ impl OutputProcessor {
         let input_logprobs = if state.input_logprobs_sent {
             None
         } else {
-            state.input_logprobs.clone()
+            state.input_logprobs.take()
         };
         state.input_logprobs_sent |= input_logprobs.is_some();
         let output_top_logprobs = state.output_top_logprobs.as_ref().map(|(values, ids)| {
@@ -2292,6 +2293,35 @@ mod tests {
         let c = p.commit(&last, Some(&plan), &scored(&plan, &[9])).unwrap();
         assert_eq!(
             c.outputs[0].input_logprobs.as_ref().unwrap().values,
+            [None, Some(0.0), Some(-1.0), Some(-2.0)]
+        );
+    }
+
+    #[test]
+    fn replay_after_sending_prompt_logprobs_does_not_regather_or_resend_them() {
+        let mut p = processor(None);
+        register_scored(&mut p, "r", vec![5, 6, 7, 8], 0, 0, true);
+        let prompt = batch(&[("r", 4, 0, 4)], 1);
+        let plan = p.logprob_plan(&prompt).input.unwrap();
+        let first = p
+            .commit(&prompt, Some(&plan), &scored(&plan, &[9]))
+            .unwrap();
+        assert_eq!(
+            first.outputs[0].input_logprobs.as_ref().unwrap().ids,
+            [5, 6, 7, 8]
+        );
+        assert!(p.state("r").unwrap().input_logprobs.is_none());
+        assert!(p.state("r").unwrap().input_logprobs_finalized());
+        // The request remains live, but a later retraction can replay its
+        // prefill. The sent marker outlives the buffers transferred above.
+        assert!(p.logprob_plan(&prompt).input.is_none());
+        let replay = p.commit(&prompt, None, &result(&[10], &[1])).unwrap();
+        assert!(replay.outputs[0].input_logprobs.is_none());
+        assert!(p.logprob_plan(&prompt).input.is_none());
+        // The first output owns its data independently of the live state.
+        drop(p);
+        assert_eq!(
+            first.outputs[0].input_logprobs.as_ref().unwrap().values,
             [None, Some(0.0), Some(-1.0), Some(-2.0)]
         );
     }

@@ -2075,6 +2075,9 @@ def _store_kv_cache_kernel(
     v_src_token_stride,
     k_dst_row_stride,
     v_dst_row_stride,
+    dst_page_size,
+    k_dst_page_stride,
+    v_dst_page_stride,
     n_kv_per_token: tl.constexpr,
     BLOCK: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
@@ -2101,12 +2104,26 @@ def _store_kv_cache_kernel(
         src = tl.load(
             v_src_ptr + row * v_src_token_stride + offsets, mask=mask, other=0
         )
-        tl.store(v_dst_ptr + dst_row * v_dst_row_stride + offsets, src, mask=mask)
+        tl.store(
+            v_dst_ptr
+            + (dst_row // dst_page_size) * v_dst_page_stride
+            + (dst_row % dst_page_size) * v_dst_row_stride
+            + offsets,
+            src,
+            mask=mask,
+        )
     else:
         src = tl.load(
             k_src_ptr + row * k_src_token_stride + offsets, mask=mask, other=0
         )
-        tl.store(k_dst_ptr + dst_row * k_dst_row_stride + offsets, src, mask=mask)
+        tl.store(
+            k_dst_ptr
+            + (dst_row // dst_page_size) * k_dst_page_stride
+            + (dst_row % dst_page_size) * k_dst_row_stride
+            + offsets,
+            src,
+            mask=mask,
+        )
 
 
 def store_kv_cache(
@@ -2123,7 +2140,8 @@ def store_kv_cache(
     launch handling both k and v rows. The last dim of all four tensors must
     be contiguous (stride == 1); the leading axis may have any stride — this
     lets src tensors come from a qkv-split view directly (no contiguous copy
-    required).
+    required). Destinations may also be ``[pages, rows, heads, dim]`` fields
+    with an explicit page stride; ``loc`` still indexes token slots.
 
     ``enable_pdl`` defaults to the platform policy; pass ``False`` to disable
     Programmatic Dependent Launch explicitly. When enabled, the kernel waits
@@ -2143,8 +2161,16 @@ def store_kv_cache(
 
     k_src_stride = k_src.stride(0) if k_src.dim() > 1 else k_src.shape[-1]
     v_src_stride = v_src.stride(0) if v_src.dim() > 1 else v_src.shape[-1]
-    k_dst_stride = k_dst.stride(0) if k_dst.dim() > 1 else k_dst.shape[-1]
-    v_dst_stride = v_dst.stride(0) if v_dst.dim() > 1 else v_dst.shape[-1]
+    k_dst_stride = (
+        k_dst.stride(-3)
+        if k_dst.dim() >= 3
+        else (k_dst.stride(0) if k_dst.dim() > 1 else k_dst.shape[-1])
+    )
+    v_dst_stride = (
+        v_dst.stride(-3)
+        if v_dst.dim() >= 3
+        else (v_dst.stride(0) if v_dst.dim() > 1 else v_dst.shape[-1])
+    )
 
     block = triton.next_power_of_2(n_kv_k)
     use_pdl = _use_pdl(enable_pdl)
@@ -2161,6 +2187,9 @@ def store_kv_cache(
         v_src_stride,
         k_dst_stride,
         v_dst_stride,
+        k_dst.shape[1] if k_dst.ndim == 4 else 1,
+        k_dst.stride(0) if k_dst.ndim == 4 else k_dst_stride,
+        v_dst.stride(0) if v_dst.ndim == 4 else v_dst_stride,
         n_kv_k,
         BLOCK=block,
         ENABLE_PDL=use_pdl,

@@ -282,16 +282,17 @@ def _check_gqa_request(
             f"q {tuple(q.shape)} is not [tokens, heads * head_dim] or [tokens, heads, head_dim]"
         )
     num_tokens = q.shape[0]
-    if cache.k_cache.dim() != 3:
+    if cache.k_cache.dim() not in (3, 4):
         raise ValueError(
-            f"key cache {tuple(cache.k_cache.shape)} is not [slots, heads, head_dim] rows"
+            f"key cache {tuple(cache.k_cache.shape)} is not [slots, heads, head_dim] "
+            "rows or [pages, rows, heads, head_dim] pages"
         )
-    num_kv_heads, head_dim = cache.k_cache.shape[1:]
+    num_kv_heads, head_dim = cache.k_cache.shape[-2:]
     if (
         cache.v_cache.shape != cache.k_cache.shape
         or cache.v_cache.dtype != cache.k_cache.dtype
         or any(
-            x.stride(-1) != 1 or (num_kv_heads > 1 and x.stride(1) != head_dim)
+            x.stride(-1) != 1 or (num_kv_heads > 1 and x.stride(-2) != head_dim)
             for x in (cache.k_cache, cache.v_cache)
         )
     ):

@@ -27,6 +27,7 @@
 #include <utility>
 #include <vector>
 
+#include "cache/core/active_parents.h"
 #include "cache/core/block_pool.h"
 #include "cache/core/cache_block_ref.h"
 #include "utils.h"
@@ -52,7 +53,9 @@ inline std::int32_t ResolvedPageId(std::uint32_t group_id, const CacheBlockRef& 
 // the table keeps the block's kernel page id, resolved when the block enters
 // the slot: a forward batch exports every scheduled row each round, and
 // resolving every block of a long context again each round was most of the
-// round's work.
+// round's work. A table bound to its coordinator's ActiveParents also keeps
+// each slot's ParentRef, which counts the block's LCM parent as active for as
+// long as the slot holds it, so the active-page gauge needs no walk.
 class BlockTable {
 public:
     static BlockTable FromBlocks(std::uint32_t group_id, std::vector<CacheBlockRef> blocks,
@@ -70,6 +73,18 @@ public:
     std::int32_t NumBlocks() const { return static_cast<std::int32_t>(blocks_.size()); }
     std::int32_t AvailableTokens() const { return available_tokens_; }
     std::int32_t ReclaimedPrefixBlocks() const { return reclaimed_prefix_blocks_; }
+
+    // From now on this table's slots count their parents in `active_parents`.
+    // The coordinator binds every table it admits or restores into before
+    // the table holds a block, so no slot is ever counted late.
+    void CountActiveParentsIn(ActiveParents* active_parents) {
+        if (active_parents_ == active_parents) {
+            return;
+        }
+        _assert(active_parents_ == nullptr, "a table counts its parents in one gauge for life");
+        _assert(blocks_.empty(), "a table is bound before it holds a block");
+        active_parents_ = active_parents;
+    }
 
     CacheBlockRef EvictToNull(std::int32_t index) {
         _assert(0 <= index && index < static_cast<std::int32_t>(blocks_.size()), "EvictToNull index out of range");
@@ -108,30 +123,36 @@ private:
     // The allocator is the only component that changes a table; anything
     // else that needs to write blocks (publishing them to a prefix index)
     // receives a window from it. Every write goes through the members below,
-    // which keep page_ids_ in step with blocks_.
+    // which keep page_ids_ and parents_ in step with blocks_.
     friend class GroupAllocator;
 
     void assign(std::uint32_t group_id, std::size_t slot, CacheBlockRef block) {
         page_ids_[slot] = ResolvedPageId(group_id, block);
+        parents_[slot] = ParentRef{active_parents_, block};
         blocks_[slot] = std::move(block);
     }
     CacheBlockRef exchange(std::uint32_t group_id, std::size_t slot, CacheBlockRef block) {
         page_ids_[slot] = ResolvedPageId(group_id, block);
+        parents_[slot] = ParentRef{active_parents_, block};
         return std::exchange(blocks_[slot], std::move(block));
     }
     // Empties the slot, returning its block.
     CacheBlockRef take(std::size_t slot) noexcept {
         page_ids_[slot] = 0;
+        parents_[slot] = ParentRef{};
         return std::exchange(blocks_[slot], {});
     }
     void append(std::uint32_t group_id, CacheBlockRef block) {
         page_ids_.push_back(ResolvedPageId(group_id, block));
+        parents_.emplace_back(active_parents_, block);
         blocks_.push_back(std::move(block));
     }
     void appendAll(std::uint32_t group_id, std::vector<CacheBlockRef>&& blocks) {
         page_ids_.reserve(page_ids_.size() + blocks.size());
+        parents_.reserve(parents_.size() + blocks.size());
         for (const CacheBlockRef& block : blocks) {
             page_ids_.push_back(ResolvedPageId(group_id, block));
+            parents_.emplace_back(active_parents_, block);
         }
         blocks_.insert(blocks_.end(), std::make_move_iterator(blocks.begin()), std::make_move_iterator(blocks.end()));
     }
@@ -139,18 +160,23 @@ private:
         blocks_ = std::move(blocks);
         page_ids_.clear();
         page_ids_.reserve(blocks_.size());
+        parents_.clear();
+        parents_.reserve(blocks_.size());
         for (const CacheBlockRef& block : blocks_) {
             page_ids_.push_back(ResolvedPageId(group_id, block));
+            parents_.emplace_back(active_parents_, block);
         }
     }
     // New slots are null.
     void resize(std::size_t slots) {
         blocks_.resize(slots);
         page_ids_.resize(slots, 0);
+        parents_.resize(slots);
     }
     void reserve(std::size_t slots) {
         blocks_.reserve(slots);
         page_ids_.reserve(slots);
+        parents_.reserve(slots);
     }
     // Releases the logical suffix first, so newly emptied LCM parents enter
     // the FIFO free queue in deterministic table order.
@@ -160,25 +186,33 @@ private:
         }
         blocks_.clear();
         page_ids_.clear();
+        parents_.clear();
     }
     void refresh(std::uint32_t group_id, std::size_t first, std::size_t count) {
         for (std::size_t slot = first; slot < first + count; ++slot) {
             page_ids_[slot] = ResolvedPageId(group_id, blocks_[slot]);
+            parents_[slot] = ParentRef{active_parents_, blocks_[slot]};
         }
     }
 
     std::vector<CacheBlockRef> blocks_{};
     // page_ids_[i] is blocks_[i]'s kernel page id, 0 for a null slot.
     std::vector<std::int32_t> page_ids_{};
+    // parents_[i] counts blocks_[i]'s LCM parent active; empty for a null
+    // slot or an unbound table. Released slots exclude the allocator's kept head.
+    std::vector<ParentRef> parents_{};
     // Unconsumed capacity at the logical tail. This may span multiple blocks
     // when admission preallocates a later decode/MTP step.
     std::int32_t available_tokens_{0};
-    // Slots below this frontier have released their request ownership.
+    // Slots below this frontier, except the allocator's kept head, have
+    // released their request ownership.
     // Installing a private block into a hole below the frontier rewinds it
     // to that slot (see SwapInFreshBlock). A sliding group's table keeps a
     // null hole at every slid-out slot, so reclaim cannot infer this frontier
     // from the first null slot.
     std::int32_t reclaimed_prefix_blocks_{0};
+    // Where the slots count their parents; null until a coordinator binds it.
+    ActiveParents* active_parents_{nullptr};
 };
 
 // LCM ownership ids for scheduler accounting/debugging. Kernel-facing page

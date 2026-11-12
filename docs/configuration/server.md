@@ -79,6 +79,48 @@ its request partition is invalidated before another PD owner uses it.
 | `--mamba-ssm-dtype` | Stored linear-attention recurrent state dtype (GDN and KDA): `float32` (default) or `bfloat16`. Scans still accumulate in FP32; `bfloat16` halves state memory. |
 | `--quantization` | Weight quantization mode such as `fp8`, `nvfp4`, `w8a8_fp8`, or `compressed-tensors`. |
 | `--quantization-param-path` | JSON file of FP8 KV cache scaling factors, read only under an FP8 KV cache. KV caches run unscaled, so every factor must be 1.0, as must any KV-cache scale the checkpoint carries. |
+| `--enable-fp8-attn-proj` | Enable online FP8 QKV/O and GDN QKVZ/output projections in the Qwen3.5 or Qwen4-Exp target model. Off by default. |
+
+### Qwen FP8 attention projections
+
+Online conversion applies to floating target projection weights. It preserves
+existing FP8 configs and per-projection formats in mixed checkpoints. MTP draft
+projections follow the checkpoint.
+
+Group128 quantizes floating weights once after loading with 128×128 block
+scales and dynamically quantizes activation rows in groups of 128 channels.
+The GEMM returns the model's floating activation dtype. On SM100/SM103,
+`--dense-gemm-backend deepgemm` prepares UE8M0 weight scales and writes
+activation scales directly into the packed layout. The `auto` backend uses
+FP32 scales for this online block FP8 path.
+
+For an NVFP4 checkpoint with floating attention projections, use
+
+```bash
+--quantization nvfp4 --enable-fp8-attn-proj
+```
+
+Target models resolve the projection switch once and pass it to their layers.
+MTP backbones explicitly disable additional online FP8 projection quantization
+and retain their checkpoint quantization policy.
+
+GDN splits its input into an FP8 QKVZ GEMM and a floating BA GEMM. Any split
+QKVZ/BA projection uses BA overlap when an auxiliary stream is available,
+regardless of quantization format. The streams join before the attention boundary.
+The standard FP8 exclusions cover BA, convolution, and Mamba mixer
+projections. Explicit checkpoint exclusions also apply.
+With the switch off, floating GDN checkpoint projections stay floating even
+with a global online FP8 config. Serialized GDN projections use the
+checkpoint config.
+
+#### Projection fusion
+
+With packed DeepGEMM scales, eligible BF16 output projections fuse activation
+quantization with the full-attention sigmoid gate or GDN per-head RMSNorm and
+SiLU/sigmoid gate. This path preserves the BF16 rounding boundary and supports
+group128, CUDA Graph and PDL. Fusion requires a power-of-two head width of at
+least 128 and BF16 norm weights for GDN. Other supported projection layouts
+apply the gate or norm before a separate quantization launch.
 
 ## Numerics
 
@@ -128,6 +170,28 @@ only after the load succeeds on every rank. A new `weight_version` requires
 checkpoints cannot share a namespace. Intermediate loads pass `None` to keep
 the current one until the last load flushes. Without L3 storage the engine
 keeps no version.
+
+### NPU top-p sampling
+
+The HF model config boolean `npu_sampling_top_p_top_k_cap` is **false by
+default**. Enable NPU sampling candidate truncation at startup with:
+
+```bash
+--hf-overrides '{"npu_sampling_top_p_top_k_cap": true}'
+```
+
+On `ascend_full`, a request with `top_p < 1` and omitted `top_k` (or
+`top_k=-1`) then uses an effective `top_k=4096`: select the top 4096
+candidates, normalize their probabilities, then apply top-p filtering.
+This limits the candidate set and can change the distribution compared
+with whole-vocabulary top-p sampling. Set the field to `false` for
+whole-vocabulary top-p; the override affects the loaded configuration,
+without editing the checkpoint's `config.json`.
+
+The option does not affect GPU sampling backends, `top_p=1`, greedy
+requests, or explicit finite top-k values. Existing `ascend_full` behavior
+still caps explicit finite top-k above 4096 at 4096. The same per-request
+policy applies in eager execution, graph replay and chain verification.
 
 ### Logprobs
 
@@ -777,7 +841,11 @@ head spanning the target vocabulary, the draft steps stay sharded too (`Draft
 steps stay vocab-sharded`): each rank samples its shard of the draft logits,
 the ranks exchange a few values per request instead of the logits, every rank
 draws the same token, and each records `q` over its own vocabulary columns;
-its verify candidates carry that `q` through their gather.
+its verify candidates carry that `q` through their gather. An EAGLE3 head with
+a smaller hot-token vocabulary (`d2t`) still gathers its draft logits, because
+its columns do not line up with the target's shards, but each rank records
+`q` over its own vocabulary columns only (`Draft steps gather the hot-token
+head's logits and each rank records q over its own columns`).
 
 Known limits, kept as in the reference engine for now: a landed PD request's
 first verify always rejects its shipped candidates (sentinel rows) rather than

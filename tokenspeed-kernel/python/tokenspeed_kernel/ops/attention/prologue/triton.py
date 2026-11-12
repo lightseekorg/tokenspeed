@@ -203,6 +203,9 @@ def _gqa_prologue_kernel(
     k_cache_stride_h,
     v_cache_stride_s,
     v_cache_stride_h,
+    cache_page_size,
+    k_cache_stride_p,
+    v_cache_stride_p,
     num_q_heads: tl.constexpr,
     head_dim: tl.constexpr,
     half_rotary: tl.constexpr,
@@ -318,7 +321,10 @@ def _gqa_prologue_kernel(
         write_mask = tokens < num_rows
         slot = tl.load(slots_ptr + tokens, mask=write_mask, other=0).to(tl.int64)
         _gqa_store_tile(
-            k_cache_ptr + slot * k_cache_stride_s + kv_head * k_cache_stride_h,
+            k_cache_ptr
+            + (slot // cache_page_size) * k_cache_stride_p
+            + (slot % cache_page_size) * k_cache_stride_s
+            + kv_head * k_cache_stride_h,
             rows,
             o1,
             o2,
@@ -340,7 +346,11 @@ def _gqa_prologue_kernel(
         )
         dst = (
             v_cache_ptr
-            + (slot * v_cache_stride_s + kv_head * v_cache_stride_h)[:, None]
+            + (
+                (slot // cache_page_size) * v_cache_stride_p
+                + (slot % cache_page_size) * v_cache_stride_s
+                + kv_head * v_cache_stride_h
+            )[:, None]
             + offs[None, :]
         )
         if KV_SCALED:
@@ -392,7 +402,7 @@ def triton_gqa_prologue(
         and query_dtype == q.dtype
     )
     num_tokens = q.shape[0]
-    num_kv_heads, head_dim = cache.k_cache.shape[1:]
+    num_kv_heads, head_dim = cache.k_cache.shape[-2:]
     num_q_heads = q.shape[1:].numel() // head_dim
     q_out = (
         q.flatten(1)
@@ -453,10 +463,13 @@ def triton_gqa_prologue(
             positions.stride(0) if mrope_rows else 0,
             1.0 if scales is None else 1.0 / scales.k,
             1.0 if scales is None else 1.0 / scales.v,
+            cache.k_cache.stride(-3),
+            cache.k_cache.stride(-2),
+            cache.v_cache.stride(-3),
+            cache.v_cache.stride(-2),
+            cache.k_cache.shape[1] if cache.k_cache.ndim == 4 else 1,
             cache.k_cache.stride(0),
-            cache.k_cache.stride(1),
             cache.v_cache.stride(0),
-            cache.v_cache.stride(1),
             num_q_heads,
             head_dim,
             half_rotary,

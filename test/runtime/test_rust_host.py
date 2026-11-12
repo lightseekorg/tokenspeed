@@ -490,6 +490,7 @@ def _data_plane(handle: DeviceHandle) -> HostDataPlane:
             attn_mapping=server_args.mapping.attn,
             sync_size=1,
             sync_group=None,
+            host_spans=None,
         ),
         {},
         report_compiles=False,
@@ -530,10 +531,11 @@ def test_the_data_plane_runs_a_plan_with_the_admitted_requests(
     )
 
     assert pending is not None
-    assert plane.complete(pending) == (
+    completed = plane.complete(pending)
+    assert completed[2].tolist() == [-0.5]
+    assert completed[:2] + completed[3:] == (
         [100],
         [1],
-        [-0.5],
         None,
         None,
         None,
@@ -572,16 +574,16 @@ def test_the_data_plane_hands_the_logprob_plan_to_the_forward(cumulative_probs):
     if cumulative_probs is None:
         assert returned_cumulative_probs is None
     else:
-        assert returned_cumulative_probs == pytest.approx(cumulative_probs)
+        assert returned_cumulative_probs.tolist() == pytest.approx(cumulative_probs)
     ((plan, sampled_top_k),) = executor.logprob_plans
     assert plan == InputLogprobPlan(
         row_starts=(0,), counts=(2,), position_starts=(0,), top_k=2
     )
     assert sampled_top_k == 1
     input_logprobs, input_top, output_top = logprobs
-    assert input_logprobs == pytest.approx([0.0, -0.1])
-    assert input_top[1] == [[0, 1], [1, 2]]
-    assert output_top == ([[-10.0]], [[100]])
+    assert input_logprobs.tolist() == pytest.approx([0.0, -0.1])
+    assert input_top[1].tolist() == [[0, 1], [1, 2]]
+    assert tuple(column.tolist() for column in output_top) == ([[-10.0]], [[100]])
 
 
 def _plan_with_one_request(rid: str):

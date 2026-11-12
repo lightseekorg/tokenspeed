@@ -676,7 +676,9 @@ def test_a_mixed_batch_derives_draft_lengths_without_reading_the_device() -> Non
     )
     drafter.draft_seq_lens_buf = torch.zeros(3, dtype=torch.int32)
     written = []
-    drafter._write_native_cache = lambda *args, **kwargs: written.append(kwargs)
+    drafter._write_native_cache = lambda *args, **kwargs: written.append(
+        (args[2].tolist(), kwargs)
+    )
 
     ctx = SimpleNamespace(
         dspark_context_producer=None,
@@ -689,11 +691,11 @@ def test_a_mixed_batch_derives_draft_lengths_without_reading_the_device() -> Non
             decode_window_locations=lambda: torch.arange(5, 13, dtype=torch.int32),
         ),
     )
-    # A shared cache group: the taps are the TARGET's rows, so its router owns
-    # the write vector -- the prefill row's extend span first, then the decode
-    # rows' verify windows, in the token order the hidden states arrive in.
-    # (The draft's own router has republished a block window by now.)
-    drafter.attn_backend = SimpleNamespace(group_ids=("full_attention",))
+    drafter.attn_backend = SimpleNamespace(
+        group_ids=("draft_swa",),
+        extend_span_locations=lambda: torch.arange(105, 110, dtype=torch.int32),
+        decode_window_locations=lambda: torch.arange(210, 218, dtype=torch.int32),
+    )
     drafter._update_native_cache_from_target(
         ctx,
         SimpleNamespace(hidden_states=torch.zeros(positions.numel(), 8)),
@@ -702,7 +704,9 @@ def test_a_mixed_batch_derives_draft_lengths_without_reading_the_device() -> Non
     )
 
     assert drafter.draft_seq_lens_buf.tolist() == [15, 22, 300]
-    assert written == [{"decode_only": False}]
+    assert written == [
+        (list(range(105, 110)) + list(range(210, 218)), {"decode_only": False})
+    ]
 
 
 def test_the_draft_residual_buffer_is_reused_and_recleared() -> None:

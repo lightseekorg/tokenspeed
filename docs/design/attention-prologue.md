@@ -345,13 +345,13 @@ belong to the `attention` family in `tokenspeed-kernel`. Weight preparation
 preserves coefficients and dtype.
 
 DSA's indexer uses the normalized Q latent before the main attention's Q-LoRA
-scale. Prefill applies that scale after the main Q projection;
-the fused Decode packs it into only the main Q projection panels. The shared
-Q norm and indexer projection remain unscaled. Indexer head weights retain FP32
-and include `index_head_dim**-0.5 * index_n_heads**-0.5` in every execution path.
-Moving the main scale into the shared norm changes the indexer scores. Packed
-BF16 weight scaling can round differently from activation scaling; this does
-not establish cross-provider bitwise equality.
+scale. Prefill and fused Decode with 16/32 Indexer heads scale the BF16 main
+Q projection result; the 64-head fused path retains scaled weight panels.
+The shared Q norm and indexer query projection remain unscaled. Indexer score
+projections retain FP32 and include `index_head_dim**-0.5 * index_n_heads**-0.5`;
+the 16-head fused path applies this factor after projection, while 32/64-head
+paths fold it into FP32 weights. These rounding boundaries do not establish
+cross-provider bitwise equality.
 
 Native prologues follow the normalization, rotation and cache-write contracts
 above. Owner-sharded transport may commit prepared KV rows on the prologue's
@@ -408,3 +408,9 @@ Attention-front FP8 projection warmup visits every layer and deduplicates by
 device and weight shape. The initial window-only layers have no indexer, and
 canonical Q weights remain active when fused attention is unavailable, so
 neither the first layer nor the fused Q copy alone covers every projection.
+
+A head cache may retain explicit ``[pages, rows, heads, dim]`` axes when its
+K and V fields share a plane. Prologue and context scatters resolve a token
+slot as ``page * page_stride + row * row_stride``; flattening these pages
+would discard the gap occupied by the other field. Dense row caches keep
+their existing three-dimensional views.

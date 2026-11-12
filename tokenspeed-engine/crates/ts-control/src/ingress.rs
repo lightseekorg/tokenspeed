@@ -28,7 +28,7 @@
 use std::collections::BTreeSet;
 
 use ts_pd::{BootstrapInfo, EmbeddingItem};
-use ts_scheduler::RequestSpec;
+use ts_scheduler::{profile, RequestSpec};
 use ts_wire::{SamplingParams, StrOrList, TokenizedGenerateReqInput};
 
 use crate::{
@@ -214,6 +214,7 @@ pub enum Admitted {
 
 /// Admit `request`, or `None` if it carries no single request id to answer.
 pub fn admit(mut request: TokenizedGenerateReqInput, limits: &IngressLimits) -> Option<Admitted> {
+    let _span = profile::span("ingress::admit");
     let rid = match request.rid.take() {
         Some(StrOrList::One(rid)) => rid,
         _ => {

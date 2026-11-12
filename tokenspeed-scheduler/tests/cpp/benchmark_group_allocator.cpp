@@ -132,7 +132,7 @@ Result Measure(int batch, int initial_slots, int append, int shards) {
     const int parents = batch * 4 + 16;
     BlockPool pool(parents, {kPacking});
     pool.RegisterGroup(0, kPacking, shards);
-    GroupAllocator allocator(kPacking, 0, shards);
+    GroupAllocator allocator(kPacking, 0, shards, 0);
     std::vector<BlockTable> tables(batch);
     for (auto& table : tables) {
         Require(allocator.Acquire(pool, table,
