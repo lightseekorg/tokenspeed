@@ -37,6 +37,7 @@ from utils import is_cdna4
 if not is_cdna4():
     pytest.skip("AMD CDNA4 is required", allow_module_level=True)
 
+import muse_spark_standins as standins  # noqa: E402
 from monokernel_testing import fill, payloads  # noqa: E402
 from tokenspeed_kernel.ops.communication._iris import (  # noqa: E402
     IrisGroup,
@@ -61,6 +62,7 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import (  # noqa: E402
 # with 9), and up to 128 (16).
 WORLD, POOLED, INTER, EXPERTS, TOP_K, OWNED = 8, 4096, 512, 128, 8, 512
 RANDOM_EXPERTS = 48
+ALL = tuple(range(WORLD))
 
 
 @gluon.jit
@@ -149,21 +151,24 @@ def experts_kernel(
         )
 
 
-def _raw_experts(rank: int, device: torch.device):
+def _raw_experts(rank: int, device: torch.device, present):
     """Random MXFP4 expert shards of ``rank``, made on ``device`` (the same on
     every GPU; on the host they would take seconds a rank): w13 rows
-    interleave gate / up."""
+    interleave gate / up. A rank outside ``present`` has zero shards (E2M1
+    code 0 is +0 whatever the scale), so it puts exactly zero partials."""
     g = torch.Generator(device).manual_seed(500 + rank)
     kw = dict(dtype=torch.uint8, generator=g, device=device)
     w13 = torch.randint(0, 256, (EXPERTS, 2 * INTER, POOLED // 2), **kw)
     s13 = torch.randint(122, 127, (EXPERTS, 2 * INTER, POOLED // 32), **kw)
     w2 = torch.randint(0, 256, (EXPERTS, POOLED, INTER // 2), **kw)
     s2 = torch.randint(118, 123, (EXPERTS, POOLED, INTER // 32), **kw)
+    if rank not in present:
+        w13, w2 = torch.zeros_like(w13), torch.zeros_like(w2)
     return w13, s13, w2, s2
 
 
-def _preprocessed(rank: int, device: torch.device):
-    return gluon_inputs.preprocess_experts(_raw_experts(rank, device))
+def _preprocessed(rank: int, device: torch.device, present):
+    return gluon_inputs.preprocess_experts(_raw_experts(rank, device, present))
 
 
 def _inputs(launch: int, rows: int, distinct: int | None):
@@ -193,20 +198,30 @@ def _picks(g: torch.Generator, rows: int, distinct: int | None) -> torch.Tensor:
 
 
 def _worker(
-    rank: int, port: int, rows: int, exr: int, exr_parts: int, distinct: int | None
+    me: int,
+    port: int,
+    rows: int,
+    exr: int,
+    exr_parts: int,
+    distinct: int | None,
+    present,
 ) -> None:
-    torch.cuda.set_device(rank)
+    """``present``: None for the whole TP8 group, one process a rank; or the
+    two rank programs that run (process ``me`` runs ``present[me]``) with
+    the other ranks' expert shards zero, whose partials (exactly zero) the
+    host writes before each launch."""
+    torch.cuda.set_device(me)
     dist.init_process_group(
         "gloo",
         init_method=f"tcp://localhost:{port}",
-        rank=rank,
-        world_size=WORLD,
+        rank=me,
+        world_size=WORLD if present is None else len(present),
         timeout=timedelta(seconds=600),
     )
     try:
-        device = torch.device(f"cuda:{rank}")
+        device = torch.device(f"cuda:{me}")
         ctx = get_or_create_context(heap_size=256 << 20)
-        group = IrisGroup(ctx, dist.group.WORLD, rank, device)
+        group = IrisGroup(ctx, dist.group.WORLD, me, device)
         plan = Plan(
             grid=256,
             # The layer's placements of exr (layer.BASES, CHAINED_BASES and
@@ -224,7 +239,13 @@ def _worker(
             peers=("cg",) + moe_experts.PEERS,
         )
         scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
-        w13, s13, w2, s2 = _preprocessed(rank, device)
+        if present is None:
+            rank, model, bases = me, ALL, group.bases
+        else:
+            rank, model = present[me], present
+            ghost = torch.zeros_like(scratch)
+            bases = standins.peer_bases(group.bases, present, me, scratch, ghost)
+        w13, s13, w2, s2 = _preprocessed(rank, device, model)
         group.finish_prepare()
         own = slice(rank * OWNED, (rank + 1) * OWNED)
         for launch in range(2):
@@ -247,10 +268,21 @@ def _worker(
                     copy=step & 1,
                     row=row,
                 )
+            if present is not None:
+                standins.standin_fill(
+                    scratch,
+                    plan,
+                    present,
+                    [(0, t) for t in range(rows)],
+                    step,
+                    0,
+                    step & 1,
+                    True,
+                )
             experts_kernel[(plan.grid,)](
                 scratch,
                 torch.full((1,), step, dtype=torch.int32, device=device),
-                group.bases,
+                bases,
                 w13,
                 s13,
                 w2,
@@ -278,7 +310,7 @@ def _worker(
                 tuple(
                     t.cpu()
                     for t in ref.expert_partials_bounded(
-                        _raw_experts(src, device),
+                        _raw_experts(src, device, model),
                         pooled.to(device),
                         gain.to(device),
                         ids.long().to(device),
@@ -311,6 +343,13 @@ def _worker(
     "rows, exr, exr_parts, distinct",
     [
         (1, 192, 1, None),
+        # 2 to 7 rows (2 to 4 pad the 16 MFMA rows in several blocks): 8
+        # distinct experts leave every lane without a second slot (its
+        # prefetch masked off), 12 mix lanes with and without one.
+        (2, 0, 4, 8),
+        (2, 0, 4, 12),
+        (3, 0, 4, None),
+        (6, 0, 4, None),
         (8, 0, 4, None),
         (8, 128, 2, None),
         (8, 0, 4, 64),
@@ -338,5 +377,36 @@ def test_experts_match_the_regular_path_math_on_its_weight_layout(
         sock.bind(("", 0))
         port = sock.getsockname()[1]
     mp.spawn(
-        _worker, args=(port, rows, exr, exr_parts, distinct), nprocs=WORLD, join=True
+        _worker,
+        args=(port, rows, exr, exr_parts, distinct, None),
+        nprocs=WORLD,
+        join=True,
+    )
+
+
+@pytest.mark.parametrize("present", standins.PAIRS, ids=standins.PAIR_IDS)
+@pytest.mark.parametrize(
+    "rows, exr, exr_parts, distinct",
+    [(1, 192, 1, None), (8, 0, 4, None), (16, 0, 4, None), (16, 128, 2, 128)],
+)
+def test_experts_match_the_regular_path_math_on_two_gpus(
+    rows: int, exr: int, exr_parts: int, distinct: int | None, present
+):
+    """As :func:`test_experts_match_the_regular_path_math_on_its_weight_layout`
+    with the production rank programs ``present`` on two GPUs and the other
+    six ranks' expert shards zero (the host writes their zero partials): the
+    present ranks' partials, as received from both, within the reference's
+    bound, and the absent ranks' exactly zero. It cannot check the values
+    the present ranks put into the absent ranks' segments (see
+    muse_spark_standins)."""
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires 2 GPUs")
+    with socket.socket() as sock:
+        sock.bind(("", 0))
+        port = sock.getsockname()[1]
+    mp.spawn(
+        _worker,
+        args=(port, rows, exr, exr_parts, distinct, present),
+        nprocs=2,
+        join=True,
     )

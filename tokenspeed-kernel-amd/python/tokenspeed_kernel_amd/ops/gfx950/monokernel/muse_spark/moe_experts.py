@@ -1331,15 +1331,10 @@ def ex1_finish(
                 stride_snb,
             )
             _ex1_slot(mb, task, a, tiles, union, expert)
-        # One row: one slot a lane (8 picks over 8 lanes). Each slot's loads
-        # go out before the previous slot's product; the loop never runs, yet
-        # this form schedules faster than one without it (a backend schedule
-        # effect).
     else:
         # Each slot's loads go out before the previous slot's product. With
         # one row the loop never runs; it stays there too, since the backend
-        # schedules the slot's code around it better than without it. Past
-        # one row it fits the registers since the slots' ids sit a lane each.
+        # schedules the slot's code around it better than without it.
         following = _slot_expert(union, lane + LANES)
         more = ex1_issue(
             task,
@@ -1614,12 +1609,16 @@ def _ex2_gather_lane(
         else:
             valid = lane + ks * LANES < count
         picks_smem.slice(0, RP, dim=1).store(gl.where(valid, picks, -1))
-        if RP < M_DUP:
-            # MFMA rows past the launch's rows: no pick.
-            fill: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [nw, 1], [1, 0])
-            picks_smem.slice(RP, M_DUP - RP, dim=1).store(
-                gl.full([S, M_DUP - RP], -1, gl.int32, fill)
-            )
+        # MFMA rows past the launch's rows: no pick. A block's width must be a
+        # power of two, so the columns go in blocks [RP, 2 RP), [2 RP, 4 RP),
+        # ... up to M_DUP (one block at 8 rows, none at 16).
+        fill: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [nw, 1], [1, 0])
+        for k in gl.static_range(4):  # at most log2(M_DUP) blocks
+            # RP << k inline: a constexpr name cannot be reassigned per pass.
+            if (RP << k) < M_DUP:
+                picks_smem.slice(RP << k, RP << k, dim=1).store(
+                    gl.full([S, RP << k], -1, gl.int32, fill)
+                )
     r = gl.arange(0, RP, gl.SliceLayout(0, tl))[None, :]
     routed = picks >= 0
     first = gl.min(gl.where(routed, r, RP), axis=1)[:, None]

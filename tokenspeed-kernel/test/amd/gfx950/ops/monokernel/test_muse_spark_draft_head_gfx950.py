@@ -37,6 +37,7 @@ from utils import assert_no_triton_compile, is_cdna4
 if not is_cdna4():
     pytest.skip("AMD CDNA4 is required", allow_module_level=True)
 
+import muse_spark_standins as standins  # noqa: E402
 from tokenspeed_kernel.ops.communication._iris import (  # noqa: E402
     IrisGroup,
     get_or_create_context,
@@ -57,21 +58,27 @@ SHARD, VOCAB, RANK_DIM, TOPK = (
 )
 STEPS = draft_head.STEPS
 SCALE, SOFTCAP = inputs.HEAD_SCALE, inputs.HEAD_SOFTCAP
+ALL = tuple(range(WORLD))
 
 
 def _reference_candidates(x, shard, rank):
     """The regular path (``VocabParallelTopK``): this rank's BF16 logits
-    times the scale, its top 16, the 8 ranks' 16s gathered, the best 16
-    sorted, softcapped."""
+    times the scale, its top 16, the running ranks' 16s gathered, the best
+    16 sorted, softcapped. On two GPUs the other ranks' shards are zero:
+    their logits are 0, below the running ranks' best 16 (asserted), so
+    the gathered 16s give the eight-rank result."""
     logits = torch.matmul(x, shard.T)
     logits.mul_(SCALE)
     values, ids = torch.topk(logits, TOPK, dim=-1, sorted=False)
     staged = torch.cat([values.float(), (ids + rank * SHARD).float()], dim=-1).cpu()
-    gathered = [torch.empty_like(staged) for _ in range(WORLD)]
+    world = dist.get_world_size()
+    gathered = [torch.empty_like(staged) for _ in range(world)]
     dist.all_gather(gathered, staged)
-    planes = torch.stack(gathered).view(WORLD, STEPS, 2, TOPK)
-    planes = planes.permute(1, 2, 0, 3).reshape(STEPS, 2, WORLD * TOPK)
+    planes = torch.stack(gathered).view(world, STEPS, 2, TOPK)
+    planes = planes.permute(1, 2, 0, 3).reshape(STEPS, 2, world * TOPK)
     values, lanes = torch.topk(planes[:, 0], TOPK, dim=-1, sorted=True)
+    if world < WORLD:
+        assert (values[:, -1] > 0).all(), "a zero logit could enter the top 16"
     ids = torch.gather(planes[:, 1], 1, lanes).long()
     return ids, values
 
@@ -89,22 +96,46 @@ def _reference_scores(x, hidden_proj, pred, succ, anchor, ids, unary):
     return unary[:, None, :] + edge.float()
 
 
-def _worker(rank: int, port: int, seed: int) -> None:
-    torch.cuda.set_device(rank)
+def _worker(me: int, port: int, seed: int, present) -> None:
+    """``present``: None for the whole TP8 group, one process a rank; or the
+    two rank programs that run (process ``me`` runs ``present[me]``) in a
+    zero-shard model: the other ranks' vocabulary shards are zero, so their
+    logits are 0 and lose to the running ranks' positive best 16 (the
+    reference asserts it). The host writes zero words for their candidates
+    before each launch (:func:`muse_spark_standins.standin_fill`): the
+    lowest keys, which lose likewise. Keyed stand-in words would not do
+    here: a candidate word packs a shard row index, which must be a real
+    one if it wins."""
+    torch.cuda.set_device(me)
     dist.init_process_group(
         "gloo",
         init_method=f"tcp://localhost:{port}",
-        rank=rank,
-        world_size=WORLD,
+        rank=me,
+        world_size=WORLD if present is None else len(present),
         timeout=timedelta(seconds=300),
     )
     try:
-        device = torch.device(f"cuda:{rank}")
+        device = torch.device(f"cuda:{me}")
         ctx = get_or_create_context(heap_size=256 << 20)
-        group = IrisGroup(ctx, dist.group.WORLD, rank, device)
+        group = IrisGroup(ctx, dist.group.WORLD, me, device)
         # Two requests' plan is the larger: one scratch serves both.
         plan = draft_head.head_plan(2 * STEPS)
         scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
+        if present is None:
+            rank, bases = me, group.bases
+        else:
+            rank = present[me]
+            ghost = torch.zeros_like(scratch)
+            bases = standins.peer_bases(group.bases, present, me, scratch, ghost)
+
+        def stand_ins(step: int, requests: int) -> None:
+            if present is not None:
+                rows = [(q, t) for q in range(requests) for t in range(STEPS)]
+                launch_plan = draft_head.head_plan(len(rows))
+                standins.standin_fill(
+                    scratch, launch_plan, present, rows, step, 0, step & 1, True
+                )
+
         group.finish_prepare()
         x, hidden_proj, pred, succ, anchor = inputs.draft_head_shared(
             seed, STEPS, device
@@ -128,6 +159,7 @@ def _worker(rank: int, port: int, seed: int) -> None:
             scores=torch.empty(STEPS, TOPK, TOPK, dtype=torch.float32, device=device),
         )
         for step in (5, 6):
+            stand_ins(step, 1)
             # The second launch, at another step, runs the first one's binary.
             with (
                 assert_no_triton_compile(draft_head.gluon_muse_spark_draft_head_gfx950)
@@ -141,7 +173,7 @@ def _worker(rank: int, port: int, seed: int) -> None:
                     **outs,
                     scratch=scratch,
                     step=torch.full((1,), step, dtype=torch.int32, device=device),
-                    peer_bases=group.bases,
+                    peer_bases=bases,
                     trace_buf=None,
                     compile_only=False,
                 )
@@ -155,6 +187,7 @@ def _worker(rank: int, port: int, seed: int) -> None:
         one = {}
         for name, xs, first, step in (("a", x, anchor, 7), ("b", xb, anchor_b, 8)):
             one[name] = {k: torch.empty_like(v) for k, v in outs.items()}
+            stand_ins(step, 1)
             draft_head.launch_gluon_muse_spark_draft_head_gfx950(
                 weights,
                 x=xs,
@@ -162,7 +195,7 @@ def _worker(rank: int, port: int, seed: int) -> None:
                 **one[name],
                 scratch=scratch,
                 step=torch.full((1,), step, dtype=torch.int32, device=device),
-                peer_bases=group.bases,
+                peer_bases=bases,
                 trace_buf=None,
                 compile_only=False,
             )
@@ -174,6 +207,7 @@ def _worker(rank: int, port: int, seed: int) -> None:
                 2 * STEPS, TOPK, TOPK, dtype=torch.float32, device=device
             ),
         )
+        stand_ins(9, 2)
         draft_head.launch_gluon_muse_spark_draft_head_gfx950(
             weights,
             x=torch.cat([x, xb]),
@@ -181,7 +215,7 @@ def _worker(rank: int, port: int, seed: int) -> None:
             **both,
             scratch=scratch,
             step=torch.full((1,), 9, dtype=torch.int32, device=device),
-            peer_bases=group.bases,
+            peer_bases=bases,
             trace_buf=None,
             compile_only=False,
         )
@@ -197,7 +231,8 @@ def _worker(rank: int, port: int, seed: int) -> None:
 
 
 def _exact(x, shard, rank, ids):
-    """Each candidate's scaled logit in FP64 (the ranks' shards summed)."""
+    """Each candidate's scaled logit in FP64 (the running ranks' shards
+    summed; the others' are zero on two GPUs)."""
     local = ids.to(shard.device) - rank * SHARD
     mine = (local >= 0) & (local < SHARD)
     rows = shard[local.clamp(0, SHARD - 1)].double()  # [steps, 16, hidden]
@@ -212,7 +247,7 @@ def _check(x, shard, rank, hidden_proj, pred, succ, anchor, outs) -> None:
     want_ids, want_values = _reference_candidates(x, shard, rank)
     got_ids, got_unary = outs["cand_ids"].cpu(), outs["unary"].cpu()
     # Every rank holds the same candidates, 16 distinct tokens a step.
-    gathered = [torch.empty_like(got_ids) for _ in range(WORLD)]
+    gathered = [torch.empty_like(got_ids) for _ in range(dist.get_world_size())]
     dist.all_gather(gathered, got_ids)
     assert all(torch.equal(g, got_ids) for g in gathered)
     assert all(len(set(r.tolist())) == TOPK for r in got_ids)
@@ -263,7 +298,26 @@ def test_draft_head_in_one_launch_matches_the_vocab_parallel_top16_and_selector(
     with socket.socket() as sock:
         sock.bind(("", 0))
         port = sock.getsockname()[1]
-    mp.spawn(_worker, args=(port, seed), nprocs=WORLD, join=True)
+    mp.spawn(_worker, args=(port, seed, None), nprocs=WORLD, join=True)
+
+
+@pytest.mark.parametrize("present", standins.PAIRS, ids=standins.PAIR_IDS)
+@pytest.mark.parametrize("seed", [0])
+def test_draft_head_in_one_launch_matches_the_vocab_parallel_top16_and_selector_on_two_gpus(
+    seed: int, present
+):
+    """As :func:`test_draft_head_in_one_launch_matches_the_vocab_parallel_top16_and_selector`
+    with the production rank programs ``present`` on two GPUs, in a
+    zero-shard model (see :func:`_worker`): the top 16, its order and the
+    selector's scores against the reference, and two requests in one launch
+    against a launch each. It cannot check the merge of candidates from
+    more than two ranks."""
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires 2 GPUs")
+    with socket.socket() as sock:
+        sock.bind(("", 0))
+        port = sock.getsockname()[1]
+    mp.spawn(_worker, args=(port, seed, present), nprocs=2, join=True)
 
 
 def test_one_binary_serves_every_step_and_block():
