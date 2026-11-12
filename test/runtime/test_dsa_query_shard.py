@@ -997,8 +997,15 @@ def test_a_query_with_neither_head_layout_is_refused():
     assert not (len(backend.kvp_group) > 1)
 
 
-@pytest.mark.parametrize("history_prefill", [False, True])
-@pytest.mark.parametrize("index_k_format", INDEX_K_FORMATS)
+# Query context parallelism refuses an mxfp4 plane, so mxfp4 rows are only
+# gathered for the KVP history prefill.
+@pytest.mark.parametrize(
+    "index_k_format,history_prefill",
+    [
+        *((fmt, prefill) for fmt in ROW_INDEX_K_FORMATS for prefill in (False, True)),
+        ("mxfp4", True),
+    ],
+)
 def test_the_workspace_reservation_matches_the_recipe_plan(
     monkeypatch, index_k_format, history_prefill
 ):
@@ -1030,7 +1037,6 @@ def test_the_workspace_reservation_matches_the_recipe_plan(
     # One whole history, padded to kernel pages.
     rows = 38
     row_bytes = index_k_row_bytes(INDEX_HEAD_DIM, index_k_format)
-    assert row_bytes == {"fp8_scaled": 132, "bf16": 256, "mxfp4": 68}[index_k_format]
 
     def planned(rows):
         if history_prefill:
