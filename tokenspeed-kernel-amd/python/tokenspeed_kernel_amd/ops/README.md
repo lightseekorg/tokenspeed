@@ -136,33 +136,6 @@ eight outputs per lane store C through a row-contiguous layout, 16 bytes per
 lane. An optional XCD remap keeps the M tiles that share a weight tile on one
 XCD's L2.
 
-#### Row-gathering prefill GEMM
-
-`launch_gluon_mm_a16w16_prefill_gather_rows_gfx950` fuses an eight-rank
-all-gather of row-sharded `A` with the prefill GEMM over the gathered rows,
-for the Kimi K3 KDA input projection under the Iris row-sharded path
-(`TOKENSPEED_K31_GATHER_ROWS_GEMM=1`).
-
-- Each rank holds `L` rows of `A`, whole 256-row tiles and at most four
-  (`LARGEM_GATHER_MAX_TILES`). `gathered` is the `[8 * L, K]` symmetric buffer
-  that every rank's rows fill in rank order, and `M * K` stays under `2^30`
-  so int32 element offsets suffice. Each output equals the prefill kernel's
-  over the gathered rows, bit for bit.
-- Every rank calls it in the same order, so the counter targets and ticket
-  base agree; `IrisAllReduceShardedState` carries them across calls.
-
-The first `LARGEM_GATHER_PUSH_PROGRAMS` (32) workgroups push this rank's row
-tiles into every peer's `gathered`. After its stores of tile `c` complete, a
-pusher adds 1 to the peers' int32 counter for `(rank, c)`, so tile `c` of rank
-`q` has landed once that counter reaches the call's target. Counters only
-grow and may wrap, so each call targets 32 past the last. Every workgroup,
-pushers included once their rows are out, then takes output tiles in order
-from a ticket counter: this rank's own tiles first, then tile `c` of every
-peer before tile `c + 1`, each waiting only for its rows' counter. A tile thus
-starts as soon as its rows arrive instead of after the whole gather. The grid
-is at most one workgroup per CU, so every pusher is resident and the waits
-cannot deadlock.
-
 ### gfx950 single- and few-row BF16 GEMV
 
 `gluon_rowcta_bf16_gemv_gfx950` (`gemm/fp16/decode_gemv.py`) computes

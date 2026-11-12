@@ -43,16 +43,8 @@ from transformers import PretrainedConfig
 
 from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.distributed import Mapping
-from tokenspeed.runtime.distributed.comm_backend import get_global_backend
 from tokenspeed.runtime.distributed.comm_manager import CommManager
-from tokenspeed.runtime.distributed.comm_ops import (
-    all_gather_single,
-    all_gather_single_async,
-)
-from tokenspeed.runtime.distributed.mapping import KVP_HISTORY_GROUP_NAME
-from tokenspeed.runtime.distributed.process_group_manager import (
-    process_group_manager,
-)
+from tokenspeed.runtime.distributed.comm_ops import all_gather_single
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     break_point,
     current_valid_rows,
@@ -95,37 +87,14 @@ from tokenspeed.runtime.models.deepseek_v3 import (
 )
 from tokenspeed.runtime.utils import add_prefix, set_weight_attrs
 from tokenspeed.runtime.utils.device_stream import is_current_stream_capturing
-from tokenspeed.runtime.utils.env import envs, global_server_args_dict
+from tokenspeed.runtime.utils.env import global_server_args_dict
 
 _INDEXER_PREFILL_MAX_LOGITS_MB_ARG = "deepseek_v4_indexer_prefill_max_logits_mb"
 # Fewer rows: the all-gather costs more than split scoring saves (TP8 50K, MI350X).
 _PREFILL_TOPK_TP_SPLIT_MIN_ROWS = 384
 _PREFILL_TOPK_ROW_ALIGN = 16
-# Fewer rows: two half-size top-k passes cost more than the hidden gather saves.
-_PREFILL_TOPK_OVERLAP_MIN_ROWS = 8192
 # Below this many rows every rank merges every KVP prefill row: the row-owner merge's two extra collectives cost more.
 _KVP_PREFILL_ROW_OWNER_MIN_ROWS = 1024
-_topk_gather_comm = None
-
-
-def _topk_gather_overlap_comm(group):
-    """The named KVP history communicator a split prefill top-k overlaps its
-    gather on, or None: the experiment is off, a graph is capturing, or the
-    TP ranks carry no such group."""
-    global _topk_gather_comm
-    if (
-        not envs.TOKENSPEED_K31_DSA_TOPK_GATHER_OVERLAP.get()
-        or torch.cuda.is_current_stream_capturing()
-        or not process_group_manager.has_process_group(
-            "nccl", group, name=KVP_HISTORY_GROUP_NAME
-        )
-    ):
-        return None
-    if _topk_gather_comm is None:
-        _topk_gather_comm = get_global_backend().for_named_groups(
-            KVP_HISTORY_GROUP_NAME
-        )
-    return _topk_gather_comm
 
 
 def _int32_to_device(
@@ -1103,15 +1072,6 @@ class GlmDsaSparseAttentionMixin:
         gather_dtype = (
             torch.int16 if kv_workspace_slots.numel() < 0xFFFF else torch.int32
         )
-        comm = _topk_gather_overlap_comm(self.mapping.attn.tp_group)
-        if (
-            comm is not None
-            and num_rows >= _PREFILL_TOPK_OVERLAP_MIN_ROWS
-            and per_rank % (2 * _PREFILL_TOPK_ROW_ALIGN) == 0
-        ):
-            return self._select_prefill_topk_rows_overlapped(
-                select, num_rows, per_rank, topk, gather_dtype, q.device, comm
-            )
         local = torch.empty((per_rank, topk), dtype=torch.int32, device=q.device)
         local_lens = torch.zeros((per_rank,), dtype=torch.int32, device=q.device)
         if end > begin:
@@ -1151,69 +1111,6 @@ class GlmDsaSparseAttentionMixin:
             all_gather_single(gathered, local, group)
         all_gather_single(gathered_lens, local_lens, group)
         return gathered, gathered_lens
-
-    def _select_prefill_topk_rows_overlapped(
-        self,
-        select: Callable,
-        num_rows: int,
-        per_rank: int,
-        topk: int,
-        gather_dtype: torch.dtype,
-        device: torch.device,
-        comm,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """The split prefill top-k in two passes, each pass's selection
-        gathered on ``comm`` while the next selects.
-
-        Pass ``s`` of rank ``r`` selects rows ``s * tp * half + r * half +
-        [0, half)``, so the ranks' rows of a pass are contiguous and its
-        gather lands in place.
-        """
-        tp_size = self.mapping.attn.tp_size
-        tp_rank = self.mapping.attn.tp_rank
-        group = self.mapping.attn.tp_group
-        half = per_rank // 2
-        gathered = torch.empty(
-            (tp_size * per_rank, topk), dtype=gather_dtype, device=device
-        )
-        gathered_lens = torch.empty(
-            (tp_size * per_rank,), dtype=torch.int32, device=device
-        )
-        works = []
-        for p in range(2):
-            begin = min(num_rows, (p * tp_size + tp_rank) * half)
-            end = min(num_rows, begin + half)
-            local = torch.empty((half, topk), dtype=torch.int32, device=device)
-            local_lens = torch.zeros((half,), dtype=torch.int32, device=device)
-            if end > begin:
-                select(
-                    slice(begin, end),
-                    out=local[: end - begin],
-                    lens_out=local_lens[: end - begin],
-                )
-            rows = slice(p * tp_size * half, (p + 1) * tp_size * half)
-            local = local.to(gather_dtype)
-            if gather_dtype == torch.int16:
-                works.append(
-                    all_gather_single_async(
-                        gathered[rows].view(torch.bfloat16),
-                        local.view(torch.bfloat16),
-                        group,
-                        backend=comm,
-                    )
-                )
-            else:
-                works.append(
-                    all_gather_single_async(gathered[rows], local, group, backend=comm)
-                )
-            works.append(
-                all_gather_single_async(
-                    gathered_lens[rows], local_lens, group, backend=comm
-                )
-            )
-        for work in works:
-            work.wait()
-        return gathered[:num_rows], gathered_lens[:num_rows]
 
     def _compute_prefill_topk_indices_portable(
         self,
@@ -1614,35 +1511,6 @@ class GlmDsaSparseAttentionMixin:
                 decode_locs,
             )
             query_rider = backend.dcp_decode_query_rider(self.attn_mqa, decode_query)
-        prefill_ctx = None
-        if ctx.num_extends > 0:
-            prefill_ctx = replace(
-                ctx,
-                bs=ctx.num_extends,
-                input_num_tokens=num_prefill_tokens,
-                forward_mode=ForwardMode.EXTEND,
-            )
-        # A KVP extend over gathered histories can write its rows' latent
-        # before the indexer and gather the latent history behind the top-k.
-        # Decided from host values every rank shares, so the ranks issue the
-        # same gathers.
-        prefill_query = None
-        if (
-            prefill_ctx is not None
-            and should_compute_indexer
-            and envs.TOKENSPEED_K31_DSA_HISTORY_PREFETCH.get()
-            and not torch.cuda.is_current_stream_capturing()
-            and backend.history_prefill_plan() is not None
-        ):
-            q = self.q_b_proj(q_norm)[0] if projected_q is None else projected_q
-            prefill_query = self.forward_absorb_qkv_proj(
-                q[:num_prefill_tokens],
-                latent_cache[:num_prefill_tokens],
-                positions[:num_prefill_tokens],
-                prefill_ctx,
-                prefill_locs,
-            )
-            backend.prefetch_history_kv_pages(self.attn_mqa, ctx.token_to_kv_pool)
         if should_compute_indexer:
             if index_key_weights is None:
                 hidden_states = comm_manager.pre_attn_comm(hidden_states, ctx)
@@ -1724,7 +1592,13 @@ class GlmDsaSparseAttentionMixin:
             device=q.device,
         )
 
-        if prefill_ctx is not None:
+        if ctx.num_extends > 0:
+            prefill_ctx = replace(
+                ctx,
+                bs=ctx.num_extends,
+                input_num_tokens=num_prefill_tokens,
+                forward_mode=ForwardMode.EXTEND,
+            )
             if shared_topk.prefill is None:
                 raise RuntimeError(
                     "GLM DSA sparse prefill requires computed top-k indices."
@@ -1737,7 +1611,6 @@ class GlmDsaSparseAttentionMixin:
                 prefill_locs,
                 attn_output[:num_prefill_tokens],
                 prefill_topk=shared_topk.prefill,
-                query=prefill_query,
             )
 
         if num_decode_tokens > 0:
@@ -1792,20 +1665,15 @@ class GlmDsaSparseAttentionMixin:
         *,
         prefill_topk: GlmDsaPrefillTopK,
         cache_num_tokens: int | None = None,
-        query: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """``query``: the rows' absorbed query when their latent is already
-        written (:meth:`forward_absorb_qkv_proj` ran before the indexer)."""
-        Q = query
-        if Q is None:
-            Q = self.forward_absorb_qkv_proj(
-                q,
-                latent_cache,
-                positions,
-                ctx,
-                out_cache_loc,
-                cache_num_tokens=cache_num_tokens,
-            )
+        Q = self.forward_absorb_qkv_proj(
+            q,
+            latent_cache,
+            positions,
+            ctx,
+            out_cache_loc,
+            cache_num_tokens=cache_num_tokens,
+        )
         # The host's sparse core + value projection (``mla_project_value``
         # is this bmm on NVIDIA; the gluon kernel elsewhere).
         return self.sparse_prefill_attn_v_proj(

@@ -520,7 +520,6 @@ def _history_backend(
         0, workspace_rows=workspace_rows, qcp=False, index_k_format=index_k_format
     )
     backend._history_prefill = True
-    backend._history_kv_prefetch = None
     return backend
 
 
@@ -652,77 +651,6 @@ def test_the_history_arm_attends_gathered_groups_with_the_querys_heads(monkeypat
         )
         assert torch.equal(call["topk_slots"], topk[local])
         assert torch.all(out[local] == index)
-
-
-def _prefetch_backend(index_k_offset: int) -> dsa.DSABackend:
-    """A one-group history plan over a shared workspace whose index-K rows
-    start ``index_k_offset`` bytes in."""
-    backend = _history_backend(32)
-    _init_history(backend)
-    rows = backend._history_workspace.rows
-    row_bytes = index_k_row_bytes(INDEX_HEAD_DIM, "fp8_scaled")
-    buffer = torch.zeros(index_k_offset + rows * row_bytes, dtype=torch.uint8)
-    backend._history_workspace = history_cache.HistoryGatherWorkspace(
-        rows=rows,
-        kv=buffer[: rows * KV_DIM * 2].view(torch.bfloat16).view(rows, KV_DIM),
-        index_k=buffer[index_k_offset:].view(rows, row_bytes),
-        index_k_format="fp8_scaled",
-    )
-    backend._history_comm = "history-comm"
-    return backend
-
-
-def test_the_latent_prefetch_lands_clear_of_the_index_k_rows(monkeypatch):
-    """``prefetch_history_kv_pages`` starts a one-group plan's latent gather
-    early only when it lands before the index-K rows the top-k is reading;
-    the layer's sparse prefill then takes that gather, another layer's take
-    is refused, and without a prefetch the take gathers in place."""
-    works = []
-
-    def gather_async(out, send, group, *, backend):
-        assert group == (0,) and backend == "history-comm"
-        out.copy_(send)
-        work = SimpleNamespace(waited=False)
-        work.wait = lambda: setattr(work, "waited", True)
-        works.append(work)
-        return work
-
-    monkeypatch.setattr(dsa, "all_gather_single_async", gather_async)
-    _gather_one_owner(monkeypatch)
-    plane = torch.arange(40, dtype=torch.float32).unsqueeze(1).expand(40, KV_DIM)
-    plane = plane.to(torch.bfloat16).unsqueeze(1).contiguous()
-    pool = SimpleNamespace(get_key_buffer=lambda layer_id: plane)
-    layer = SimpleNamespace(layer_id=3)
-
-    # Two groups share the workspace and gather in turn: nothing starts.
-    two_groups = _history_backend(11)
-    _init_history(two_groups)
-    assert not two_groups.prefetch_history_kv_pages(layer, pool)
-
-    group = _prefetch_backend(0).history_prefill.groups[0]
-    landing = group.send_pages * PAGE * KV_DIM * 2
-    expected = plane.view(-1, PAGE, 1, KV_DIM)[group.fetch_pages].view(-1, 1, KV_DIM)
-    # A byte short, the latent rows would overwrite the index-K rows.
-    refused = _prefetch_backend(landing - 1)
-    assert not refused.prefetch_history_kv_pages(layer, pool)
-    assert refused._history_kv_prefetch is None and not works
-
-    backend = _prefetch_backend(landing)
-    group = backend.history_prefill.groups[0]
-    assert backend.prefetch_history_kv_pages(layer, pool)
-    kv = backend._take_history_kv_pages(layer, pool, group)
-    assert len(works) == 1 and works[0].waited
-    assert torch.equal(kv, expected)
-    end = kv.data_ptr() + kv.numel() * kv.element_size()
-    assert end == backend._history_workspace.index_k.data_ptr()
-
-    # Without a prefetch the take gathers now, synchronously.
-    assert torch.equal(backend._take_history_kv_pages(layer, pool, group), expected)
-    assert len(works) == 1
-
-    assert backend.prefetch_history_kv_pages(layer, pool)
-    with pytest.raises(RuntimeError, match="prefetched history gather"):
-        backend._take_history_kv_pages(SimpleNamespace(layer_id=4), pool, group)
 
 
 def test_the_dense_delegate_is_refused_under_a_shard():
