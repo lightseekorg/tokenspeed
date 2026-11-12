@@ -1586,7 +1586,7 @@ class MuseSparkMoE(nn.Module):
             self._prepare_routing(compressed_quantized, topk_ids, topk_weights)
         # Map-less routes are in token order with every row defined.
         if expanded_idx is None:
-            gemm2_out = gemm2_out.view(*topk_ids.shape, gemm2_out.shape[-1])
+            gemm2_out = gemm2_out.view(*topk_ids.shape, norm_weight.shape[0])
         elif (
             self.tp_size > 1
             and self.ep_size == 1

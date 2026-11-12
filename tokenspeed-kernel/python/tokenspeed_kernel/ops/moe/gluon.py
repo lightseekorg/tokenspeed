@@ -782,9 +782,9 @@ if platform.is_amd:
         and Triton otherwise. Selected only by layers that defer the finalize;
         see ``_bf16_routes_moe_apply`` for the arguments and the routes.
         """
-        del router_logits, topk_weights, num_tokens_global, max_num_tokens_per_gpu
-        del enable_pdl
-        return _bf16_routes_moe_apply(plan, x, w, topk_ids, do_finalize, deferred_out)
+        del plan, router_logits, topk_weights, num_tokens_global
+        del max_num_tokens_per_gpu, enable_pdl
+        return _bf16_routes_moe_apply(x, w, topk_ids, do_finalize, deferred_out)
 
     gluon_bf16_routes_moe_apply._tokenspeed_warmup = _bf16_routes_moe_warmup  # type: ignore[attr-defined]
 

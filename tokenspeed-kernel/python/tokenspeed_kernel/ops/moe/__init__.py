@@ -1826,7 +1826,6 @@ def bf16_moe_routes_warmup(
 
 
 def _bf16_routes_moe_apply(
-    plan: dict,
     x: torch.Tensor,
     w: torch.nn.Module,
     topk_ids: torch.Tensor | None,
@@ -1839,7 +1838,6 @@ def _bf16_routes_moe_apply(
     ``supports_finalize={False}``: they only return unfinalized routes.
 
     Args:
-        plan: The layer's MoE plan; its features select batch invariance.
         x: Contiguous BF16 hidden states ``[tokens, hidden]``.
         w: The layer, holding local ``w13_weight`` ``[experts, 2I, hidden]``
             and ``w2_weight`` ``[experts, hidden, I]`` and its ``ep_rank`` and
@@ -1865,7 +1863,7 @@ def _bf16_routes_moe_apply(
         topk_ids.contiguous(),
         w.ep_rank * w.num_local_experts,
         output=deferred_out,
-        batch_invariant="batch_invariant" in plan["features"],
+        batch_invariant=False,
     )
     return routes.view(-1, x.shape[1]), None, None
 
@@ -1878,7 +1876,7 @@ def _bf16_routes_moe_warmup(plan: dict, w: torch.nn.Module) -> None:
         w.top_k,
         w.ep_rank * w.num_local_experts,
         max_num_tokens=plan["warmup_max_num_tokens"],
-        batch_invariant="batch_invariant" in plan["features"],
+        batch_invariant=False,
     )
 
 
