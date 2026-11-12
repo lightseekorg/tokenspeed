@@ -129,14 +129,15 @@ TEST(PrefixCacheIndexInspectionTest, EvictionKeepsItsKeyAndMetadataAfterTheEntry
     PrefixCacheIndex index(0);
     const auto key = KeyOf(std::string(64, 'a'));
     const auto location = Cache(index, pool, key.content_hash, 17);
-    EXPECT_THROW(index.EvictWithMetadata(
-                     pool, location, [](const auto&, const auto&) { throw std::runtime_error("publication refused"); }),
-                 std::runtime_error);
+    EXPECT_THROW(
+        index.EvictWithMetadata(
+            pool, location, [](const auto&, const auto&, auto*) { throw std::runtime_error("publication refused"); }),
+        std::runtime_error);
     EXPECT_TRUE(index.Contains(pool, key));
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), 0);
     PrefixCacheIndex::CachedBlockMetadata recorded;
     auto removed =
-        index.EvictWithMetadata(pool, location, [&](const auto&, const auto& metadata) { recorded = metadata; });
+        index.EvictWithMetadata(pool, location, [&](const auto&, const auto& metadata, auto*) { recorded = metadata; });
     ASSERT_TRUE(removed);
     EXPECT_EQ(*removed, key);
     EXPECT_EQ(recorded.last_access_epoch, 17);
@@ -146,6 +147,56 @@ TEST(PrefixCacheIndexInspectionTest, EvictionKeepsItsKeyAndMetadataAfterTheEntry
     EXPECT_EQ(replacement, location);
     EXPECT_EQ(*removed, key);
     EXPECT_EQ(index.KeyOf(pool, replacement), KeyOf("replacement"));
+}
+
+// The callback sees the boundary-tree node the entry holds, still counting
+// the entry: here two groups' entries under one hash, then the last of them,
+// which takes the node along. An index never bound to a tree shows none.
+TEST(PrefixCacheIndexInspectionTest, EvictionShowsTheTreeNodeStillCountingTheEntry) {
+    BlockPool pool(2, {1, 1});
+    BoundaryTree tree(BoundaryTree::Config{.prefix_granularity = 8,
+                                           .closed_blocks_per_page = 2,
+                                           .num_state_groups = 0,
+                                           .has_prefix_closed_groups = true,
+                                           .has_host_tier = false,
+                                           .queue_dead_candidates = false},
+                      /*checkpoints=*/nullptr);
+    std::vector<PrefixCacheIndex> indexes;
+    indexes.reserve(2);
+    std::vector<CacheBlockLocation> locations;
+    for (std::uint32_t group = 0; group < 2; ++group) {
+        PrefixCacheIndex& index = indexes.emplace_back(group);
+        index.TrackBoundaries(tree, pool, /*host_pool=*/nullptr, /*state=*/false, /*closed=*/true);
+        CacheBlockRef block = pool.AcquireBlock(group);
+        locations.push_back(block->Location());
+        index.Register(pool, block, CacheKey{.group_id = group, .content_hash = "page"}, /*access_epoch=*/1,
+                       /*logical_block_index=*/0, CacheBoundaryKind::kChunk, /*newly_cached=*/nullptr,
+                       /*session=*/nullptr);
+    }
+    ASSERT_NE(tree.Find("page"), nullptr);
+    ASSERT_EQ(tree.Find("page")->Entries(BoundaryTree::kDevice), 2);
+
+    for (std::uint32_t group = 0; group < 2; ++group) {
+        bool saw_the_hashs_node = false;
+        std::int32_t device_entries = 0;
+        const auto removed = indexes[group].EvictWithMetadata(
+            pool, locations[group], [&](const CacheKey& key, const auto&, BoundaryTree::Node* node) {
+                saw_the_hashs_node = node != nullptr && node == tree.Find(key.content_hash);
+                device_entries = node == nullptr ? 0 : node->Entries(BoundaryTree::kDevice);
+            });
+        ASSERT_TRUE(removed) << "group " << group;
+        EXPECT_TRUE(saw_the_hashs_node) << "group " << group;
+        EXPECT_EQ(device_entries, 2 - static_cast<std::int32_t>(group)) << "group " << group;
+    }
+    EXPECT_EQ(tree.Find("page"), nullptr);
+
+    BlockPool unbound_pool(1, {1});
+    PrefixCacheIndex unbound(kGroupId);
+    const CacheBlockLocation location = Cache(unbound, unbound_pool, "page", /*access_epoch=*/1);
+    bool saw_a_node = true;
+    ASSERT_TRUE(unbound.EvictWithMetadata(unbound_pool, location,
+                                          [&](const auto&, const auto&, auto* node) { saw_a_node = node != nullptr; }));
+    EXPECT_FALSE(saw_a_node);
 }
 
 TEST(PrefixCacheIndexInspectionTest, PackedLocationsAcrossSegmentsSurviveEvictionAndReuse) {

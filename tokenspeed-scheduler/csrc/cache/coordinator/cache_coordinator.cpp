@@ -1878,12 +1878,19 @@ CacheBlockRef CacheCoordinator::FindHostCachedBlock(const CacheKey& key) const {
     return groups_[key.group_id].Index().Find(*host_pool_, key);
 }
 
-std::optional<CacheKey> CacheCoordinator::evictCachedBlockAlone(std::uint32_t group_id, CacheBlockLocation location,
-                                                                DeviceEvictionCounts DeviceEvictionStats::*reason,
-                                                                EvictedSegment* write_back_segment) {
+std::optional<CacheCoordinator::EvictedEntry> CacheCoordinator::evictCachedBlockAlone(
+    std::uint32_t group_id, CacheBlockLocation location, DeviceEvictionCounts DeviceEvictionStats::*reason,
+    EvictedSegment* write_back_segment) {
     PrefixCacheIndex& index = groups_[group_id].Index();
-    const auto key = index.EvictWithMetadata(
-        pool_, location, [&](const CacheKey& key, const PrefixCacheIndex::CachedBlockMetadata& metadata) {
+    // Every path returns this one object: the key moves in once.
+    std::optional<EvictedEntry> removed;
+    bool device_companions_left = false;
+    std::optional<CacheKey> key = index.EvictWithMetadata(
+        pool_, location,
+        [&](const CacheKey& key, const PrefixCacheIndex::CachedBlockMetadata& metadata, BoundaryTree::Node* node) {
+            _assert(node != nullptr, "an indexed entry has a tree node");
+            // The node still counts this entry among its Device entries.
+            device_companions_left = node->Entries(BoundaryTree::kDevice) > 1;
             // A demoted entry never rides an eviction write-back, whatever evicts it
             // -- an admission's or a restore's victim, a request's own released slot
             // or a stranded suffix: it is dropped, counted under what evicted it. A
@@ -1917,8 +1924,6 @@ std::optional<CacheKey> CacheCoordinator::evictCachedBlockAlone(std::uint32_t gr
                 if (reason == &DeviceEvictionStats::request_reclaim) {
                     ++device_evictions_.request_reclaim_for_write_back;
                 }
-                BoundaryTree::Node* node = boundary_tree_.Find(key.content_hash);
-                _assert(node != nullptr, "an indexed entry has a tree node");
                 // Judged and recorded while the entry still holds the node, so the
                 // checkpoints of a checkpoint boundary are recorded and hold it on the
                 // Host before the pages above it are judged: no probe could resume
@@ -1943,7 +1948,7 @@ std::optional<CacheKey> CacheCoordinator::evictCachedBlockAlone(std::uint32_t gr
                 }
             }
         });
-    if (!key) return key;
+    if (!key) return removed;
     if (cache_mutation_sink_) {
         cache_mutation_sink_(*key, CacheMutation::kRemoved);
     }
@@ -1953,7 +1958,8 @@ std::optional<CacheKey> CacheCoordinator::evictCachedBlockAlone(std::uint32_t gr
     if (host_pool_ != nullptr && index.Contains(*host_pool_, *key)) {
         ++evicted.host_resident;
     }
-    return key;
+    removed.emplace(std::move(*key), device_companions_left);
+    return removed;
 }
 
 CacheCoordinator::PendingHostStore CacheCoordinator::holdPendingStore(BoundaryTree::Node& node, const CacheKey& key,
@@ -2003,20 +2009,25 @@ bool CacheCoordinator::evictCachedBlock(std::uint32_t group_id, CacheBlockLocati
                                         DeviceEvictionCounts DeviceEvictionStats::*reason,
                                         EvictedSegment* write_back_segment) {
     // Its own entry first: when that was the last holder of the hash's node,
-    // the node leaves with its tail hint, and the cascade finds nothing.
-    const std::optional<CacheKey> removed = evictCachedBlockAlone(group_id, location, reason, write_back_segment);
-    if (!removed) {
+    // the node leaves with its tail hint. Either cascade evicts only Device
+    // entries under the hash: with none left, it would find nothing.
+    const std::optional<EvictedEntry> evicted = evictCachedBlockAlone(group_id, location, reason, write_back_segment);
+    if (!evicted) {
         return false;
     }
-    if (const std::optional<std::int32_t> tail_tokens = boundary_tree_.Tails().TailTokensOf(removed->content_hash)) {
-        evictTailEntries(removed->content_hash, *tail_tokens, reason, write_back_segment);
+    if (!evicted->device_companions_left) {
+        return true;
+    }
+    const CacheKey& removed = evicted->key;
+    if (const std::optional<std::int32_t> tail_tokens = boundary_tree_.Tails().TailTokensOf(removed.content_hash)) {
+        evictTailEntries(removed.content_hash, *tail_tokens, reason, write_back_segment);
     } else {
         // A state checkpoint is matched only with the KV below it and with
         // the checkpoints every other State group holds at its hash: a KV
         // block of its page gone, or one of those checkpoints, it is dead
         // weight and leaves too. A checkpoint takes no KV along: the page
         // still serves the boundaries past it.
-        ForEachBoundaryKey(*removed, /*tail_tokens=*/0, [&](std::size_t i, const CacheKey& key) {
+        ForEachBoundaryKey(removed, /*tail_tokens=*/0, [&](std::size_t i, const CacheKey& key) {
             if (!GroupIsState(i)) {
                 return;
             }

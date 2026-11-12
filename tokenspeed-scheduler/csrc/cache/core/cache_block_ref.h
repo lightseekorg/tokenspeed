@@ -127,6 +127,19 @@ private:
     internal_cache_block_ref::CacheBlockControl* control_{nullptr};
 };
 
+// Inline: index scans and evictions read these once per cache entry.
+inline const CacheBlock* CacheBlockRef::operator->() const noexcept {
+    return control_ == nullptr ? nullptr : &control_->object();
+}
+
+inline const CacheBlock& CacheBlockRef::operator*() const noexcept {
+    return control_->object();
+}
+
+inline std::uint32_t CacheBlockRef::use_count() const noexcept {
+    return control_ == nullptr ? 0 : control_->useCount();
+}
+
 inline void swap(CacheBlockRef& lhs, CacheBlockRef& rhs) noexcept {
     lhs.swap(rhs);
 }
@@ -145,10 +158,17 @@ public:
     // A unique block invokes callback immediately; an empty reference cancels
     // any previous observation. The observer does not keep the block alive.
     void Observe(const CacheBlockRef& block, Callback callback, void* context) noexcept;
-    void Reset() noexcept;
+    void Reset() noexcept {
+        // An observer Observe has not linked has every field null already.
+        if (head_ != nullptr) {
+            unlink();
+        }
+    }
 
 private:
     friend class internal_cache_block_ref::CacheBlockControl;
+
+    void unlink() noexcept;
 
     CacheBlockUniqueObserver** head_{nullptr};
     CacheBlockUniqueObserver* previous_{nullptr};

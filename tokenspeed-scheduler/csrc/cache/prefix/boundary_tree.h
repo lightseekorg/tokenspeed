@@ -419,6 +419,16 @@ private:
     // checkpoint mark flipped.
     bool apply(const Hold& hold, std::int32_t delta) noexcept {
         Node& node = *hold.node_;
+        if (hold.kind_ == Hold::Kind::kEntry && hold.tier_ == kDevice && !hold.state_ && !hold.paired_) {
+            // A Device entry that is no State checkpoint and pairs with no
+            // Host copy counts in no checkpoint, Host or duplicate mark: none
+            // flips, and only its own counts change.
+            node.entries_[kDevice] += delta;
+            node.closed_entries_[kDevice] += hold.closed_ ? delta : 0;
+            FatalCheck(node.entries_[kDevice] >= 0 && node.closed_entries_[kDevice] >= 0,
+                       "a boundary node lost a holder it did not have");
+            return false;
+        }
         // Only a State group's entry or a checkpoint's store changes a
         // checkpoint's residency.
         const bool moves_checkpoint = hold.state_ && checkpoints_ != nullptr;

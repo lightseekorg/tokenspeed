@@ -28,11 +28,11 @@
 #include <list>
 #include <limits>
 #include <map>
+#include <memory>
 #include <memory_resource>
 #include <optional>
 #include <span>
 #include <type_traits>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -379,7 +379,7 @@ public:
             return false;
         }
         return std::ranges::any_of(cache_entries_by_pool_, [&](const auto& item) {
-            const auto entry = item.second.by_location.Find(block_ref->Location());
+            const auto entry = item.second->by_location.Find(block_ref->Location());
             return entry != CacheEntryIterator{} && entry->block_ref == block_ref;
         });
     }
@@ -672,12 +672,15 @@ public:
 
     // Locate and check ownership once. The callback records tree/Host state
     // while the Device entry lives; it must not mutate this tier's index or
-    // pin the source block. The returned key owns its bytes after deletion.
+    // pin the source block. It also gets the boundary-tree node the entry
+    // holds (TrackBoundaries; null in an index never bound), which counts the
+    // entry until it leaves. The returned key owns its bytes after deletion.
     template <typename BeforeErase>
     std::optional<CacheKey> EvictWithMetadata(const BlockPool& pool, CacheBlockLocation location,
                                               BeforeErase&& before_erase) {
-        return evictWith(pool, location,
-                         [&](const CacheKey& key, const CacheEntry& entry) { before_erase(key, metadataOf(entry)); });
+        return evictWith(pool, location, [&](const CacheKey& key, const CacheEntry& entry) {
+            before_erase(key, metadataOf(entry), entry.boundary ? &entry.boundary.node() : nullptr);
+        });
     }
 
     // Moves the entry at `from` onto `to`, a block of the same tier the caller
@@ -936,15 +939,23 @@ private:
     }
 
     CacheEntries& cacheEntries(const BlockPool& pool) {
-        return cache_entries_by_pool_.try_emplace(&pool, pool.Packing(group_id_), pool.NumLcmBlocks()).first->second;
+        if (CacheEntries* cache_index = findCacheEntries(pool)) {
+            return *cache_index;
+        }
+        return *cache_entries_by_pool_
+                    .emplace_back(&pool, std::make_unique<CacheEntries>(pool.Packing(group_id_), pool.NumLcmBlocks()))
+                    .second;
     }
     CacheEntries* findCacheEntries(const BlockPool& pool) {
-        auto it = cache_entries_by_pool_.find(&pool);
-        return it == cache_entries_by_pool_.end() ? nullptr : &it->second;
+        return const_cast<CacheEntries*>(std::as_const(*this).findCacheEntries(pool));
     }
     const CacheEntries* findCacheEntries(const BlockPool& pool) const {
-        auto it = cache_entries_by_pool_.find(&pool);
-        return it == cache_entries_by_pool_.end() ? nullptr : &it->second;
+        for (const auto& [owner, cache_index] : cache_entries_by_pool_) {
+            if (owner == &pool) {
+                return cache_index.get();
+            }
+        }
+        return nullptr;
     }
     void validateKey(const CacheKey& key) const {
         _assert(key.group_id == group_id_, "cache key group does not match index");
@@ -980,16 +991,19 @@ private:
     }
     template <typename BeforeErase>
     std::optional<CacheKey> evictWith(const BlockPool& pool, CacheBlockLocation location, BeforeErase&& before_erase) {
+        // Every path returns this one object, so the key is copied once,
+        // straight into the caller's result.
+        std::optional<CacheKey> key;
         CacheEntries* cache_index = findCacheEntries(pool);
         if (cache_index == nullptr) {
-            return std::nullopt;
+            return key;
         }
         CacheEntryIterator entry_it = findEntry(*cache_index, location);
         if (entry_it == cache_index->entries.end() || !entry_it->block_ref.unique()) {
-            return std::nullopt;
+            return key;
         }
-        CacheKey key = entry_it->key;
-        before_erase(key, *entry_it);
+        key.emplace(entry_it->key);
+        before_erase(*key, *entry_it);
         FatalCheck(entry_it->block_ref.unique(), "an unpinned cache entry stays evictable");
         eraseEntry(*cache_index, entry_it);
         return key;
@@ -1011,7 +1025,11 @@ private:
     }
 
     std::uint32_t group_id_;
-    std::unordered_map<const BlockPool*, CacheEntries> cache_entries_by_pool_;
+    // One per pool this index serves (the coordinator's Device and Host
+    // tiers): scanning these few addresses costs less than hashing one on
+    // every lookup. Each CacheEntries keeps its address: cursors and peers
+    // point at it.
+    std::vector<std::pair<const BlockPool*, std::unique_ptr<CacheEntries>>> cache_entries_by_pool_;
 };
 
 }  // namespace tokenspeed

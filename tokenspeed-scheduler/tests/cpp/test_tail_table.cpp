@@ -94,6 +94,24 @@ TEST(TailTableTest, RemoveForgetsTheHashAndEmptiesThePrior) {
     table.Remove("never-recorded");
 }
 
+TEST(TailTableTest, AnEmptyTableAnswersEveryLookupAndFillsAgain) {
+    TailTable table;
+    table.Remove("never-recorded");
+    EXPECT_FALSE(table.Contains("never-recorded"));
+    EXPECT_FALSE(table.TailTokensOf("never-recorded").has_value());
+    table.Add("p", 3, "a");
+    table.Remove("a");
+    EXPECT_EQ(table.Size(), 0u);
+    EXPECT_FALSE(table.Contains("a")) << "emptied again";
+    EXPECT_FALSE(table.TailTokensOf("a").has_value());
+    table.Add("q", 2, "b");
+    EXPECT_TRUE(table.Contains("b"));
+    EXPECT_EQ(table.TailTokensOf("b"), 2);
+    EXPECT_FALSE(table.TailTokensOf("a").has_value());
+    table.Remove("a");
+    EXPECT_EQ(table.Size(), 1u) << "removing an absent hash keeps the others";
+}
+
 TEST(TailTableTest, CapKeepsTheNewestEightPerPriorAndReportsTheDropped) {
     TailTable table;
     for (std::int32_t t = 1; t <= TailTable::kMaxTailsPerPrior; ++t) {

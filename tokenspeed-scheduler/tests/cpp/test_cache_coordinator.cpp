@@ -7799,6 +7799,38 @@ TEST_F(TailPublicationTest, EvictingOneTailBlockTakesItsCompanionsAndPrunesTheTa
               CacheCoordinator::BoundaryResidency::kNone);
 }
 
+// A companion pinned through a tail's cascade stays; once released it is the
+// tail's last Device entry, and evicting it takes nothing else but the hint.
+TEST_F(TailPublicationTest, ACompanionPinnedThroughTheCascadeLaterLeavesAloneWithTheHint) {
+    std::vector<BlockTable> tables(3);
+    const TailPublication tail = PublishFinal(tables, MakeTokens(12), /*num_computed_tokens=*/11);
+    coordinator_.Free(tables);
+    CacheBlockRef pinned = coordinator_.GroupPrefixIndex(0).Find(pool_, Key(tail.hash, 0, 0));
+    ASSERT_TRUE(static_cast<bool>(pinned));
+    CacheBlockLocation victim{};
+    {
+        const CacheBlockRef block = coordinator_.GroupPrefixIndex(1).Find(pool_, Key(tail.hash, 1, 0));
+        ASSERT_TRUE(static_cast<bool>(block));
+        victim = block->Location();
+    }
+    ASSERT_TRUE(CacheCoordinatorTestAccess::EvictCachedBlock(coordinator_, 1, victim));
+    EXPECT_TRUE(Cached(0, tail.hash, 0)) << "pinned";
+    EXPECT_FALSE(Cached(0, tail.hash, 1));
+    EXPECT_FALSE(Cached(2, tail.hash, 0));
+    EXPECT_FALSE(Cached(2, tail.hash, 1));
+    EXPECT_EQ(coordinator_.DeviceEvictions().admission.blocks, 4u);
+    EXPECT_EQ(coordinator_.NumTailEntries(), 1u) << "the pinned entry keeps the hint";
+
+    const CacheBlockLocation last = pinned->Location();
+    pinned.reset();
+    ASSERT_TRUE(CacheCoordinatorTestAccess::EvictCachedBlock(coordinator_, 0, last));
+    EXPECT_FALSE(Cached(0, tail.hash, 0));
+    EXPECT_EQ(coordinator_.DeviceEvictions().admission.blocks, 5u);
+    EXPECT_EQ(coordinator_.NumTailEntries(), 0u);
+    EXPECT_TRUE(Cached(0, hashes_[1], 0)) << "the full pages stay";
+    EXPECT_TRUE(Cached(1, hashes_[1], 0));
+}
+
 // A sliding group's acceptance is not monotone in T: it can hold the lookback
 // behind a tail while the lookback behind the page boundary below it is gone.
 // The probe judges it per candidate, so the tail stays resumable.
@@ -8295,6 +8327,32 @@ TEST_F(StateCheckpointCascadeTest, EvictingOneStateCheckpointEvictsTheOtherState
     EXPECT_EQ(coordinator_.NumEmptyLcmBlocks(), 6) << "three State parents freed";
     // The checkpoint and the two it takes along count under the same reason.
     EXPECT_EQ(coordinator_.DeviceEvictions().admission.blocks, 3u);
+}
+
+// The KV block of a page without checkpoints leaves alone; the KV block of
+// the checkpoint's page takes every State group's checkpoint along.
+TEST_F(StateCheckpointCascadeTest, EvictingAPagesKvBlockTakesOnlyTheCheckpointsAtItsHash) {
+    PublishCheckpointAndFinish();
+    const auto kv_location = [&](std::size_t page) {
+        const std::optional<CacheBlockLocation> location =
+            CacheCoordinatorTestAccess::DeviceLocationOf(coordinator_, 0, Key(hashes_[page], 0));
+        _assert(location.has_value(), "the page is published");
+        return *location;
+    };
+    ASSERT_TRUE(CacheCoordinatorTestAccess::EvictCachedBlock(coordinator_, 0, kv_location(1)));
+    EXPECT_FALSE(Cached(0, 1));
+    for (std::uint32_t group = 1; group <= 3; ++group) {
+        EXPECT_TRUE(Cached(group, 2)) << "group " << group;
+    }
+    EXPECT_EQ(coordinator_.DeviceEvictions().admission.blocks, 1u);
+
+    ASSERT_TRUE(CacheCoordinatorTestAccess::EvictCachedBlock(coordinator_, 0, kv_location(2)));
+    for (std::uint32_t group = 0; group <= 3; ++group) {
+        EXPECT_FALSE(Cached(group, 2)) << "group " << group;
+    }
+    EXPECT_TRUE(Cached(0, 0));
+    EXPECT_EQ(coordinator_.DeviceEvictions().admission.blocks, 5u);
+    EXPECT_EQ(coordinator_.NumEmptyLcmBlocks(), 6) << "three State parents freed";
 }
 
 TEST_F(StateCheckpointCascadeTest, APinnedStateSiblingStaysWhenItsCheckpointIsEvicted) {
