@@ -305,9 +305,10 @@ public:
         // Restore only: snapshot pool -> Device copies of the private slots.
         std::vector<BlockTransfer> snapshot_pairs;
         // Fresh device child pages appended by ordinary Acquire, aligned by
-        // group_id, for the plan to zero. Cache hits and copy destinations
-        // (Host hits, a restore's rebuilt slots, the pairs below) are
-        // excluded: the copy fills them whole.
+        // group_id, for the plan to zero. Cache hits, copy destinations
+        // (Host hits, a restore's rebuilt slots, the pairs below) and the
+        // blocks a remote landing fills whole (GroupDemand::landed_tokens,
+        // StateStep::kLand's slot 1) are excluded: the copy fills them whole.
         std::vector<std::vector<std::int32_t>> new_page_ids;
         // Device -> Device whole-block copies, aligned by group_id, as
         // (source, destination) virtual block ids: a hitter's private copy of
@@ -342,11 +343,16 @@ public:
     };
 
     // ProbePrefix is read-only. Cache state must not change before its
-    // result is passed to Admit. Admit leaves the probe intact when capacity is
-    // unavailable so the caller may perform a hypothetical-release check.
-    // A missing epoch starts a new request; a supplied epoch continues that
-    // request. Once commit starts, an internal plan/pool mismatch is fatal
-    // because partial commit is not rolled back.
+    // result is passed to Admit, except by a lone-request compaction
+    // (CompactLoneRequest), whose caller retries with its copy of the probe
+    // taken before it: every hit stays under its key, held and relocated with
+    // its entry, but the coverage the probe counts past its hit (kv_tokens,
+    // closed_kv_tokens, so the junction) may then be gone from the Device.
+    // Admit consumes the probe whether or not it admits; a caller that
+    // retries after a failure keeps a copy. A missing
+    // epoch starts a new request; a supplied epoch continues that request.
+    // Once commit starts, an internal plan/pool mismatch is fatal because
+    // partial commit is not rolled back.
     PreparedPrefixKeys PreparePrefixKeys(std::span<const std::string> content_hashes) const;
     PrefixProbe ProbePromptPrefix(const PromptPrefix& prompt) const;
     // Whether recorded or in-flight eviction stores would extend the visible
@@ -403,6 +409,58 @@ public:
                                          std::optional<CopyInPoint> copy_in_point,
                                          std::optional<std::uint64_t> request_access_epoch,
                                          bool evict_blocks_past_segments, const std::string& session_id);
+
+    // Lone-request compaction, the last means for a request no other one
+    // holds pages beside, whose Admit with evict_blocks_past_segments just
+    // failed although the bound admits it (docs/design/scheduler.md §1.4):
+    // its blocks of every packed, token-spanned group -- and, at a first
+    // admission, the Device pages and tail blocks the probe hits, at most one
+    // tail block per call -- are gathered into fewer parents, so the parents
+    // they leave return to the empty FIFO for the caller's retry in the same
+    // plan build (whose copy of a moved tail block reads where it was:
+    // Scheduler::recordAdmittedPages). Nothing runs unless a dense
+    // layout of those blocks plus the demand (its copy-in pairs counted)
+    // fits the pool. Per group the target is ParentsNeededForBuckets over
+    // the blocks alone; every parent holding a block that cannot move (a page
+    // this admission publishes, one another holder pins; an expired slot the
+    // retry reclaims is not counted) is kept first and counts toward it, then
+    // the densest (of equally dense ones, the one with more bucket-bound
+    // blocks), and the rest are vacated in the reverse order, a parent whole
+    // or not at all, and only when the retry can take
+    // its other occupants (a slot it reclaims, cache its block-by-block
+    // pass may evict). Every Device block the probe hits, in every group
+    // (on the D role each State group's prompt-end checkpoint too), is held
+    // through the call, so no eviction the clearing takes along reaches one
+    // before the retry acquires it. An unwritten reserve block
+    // re-places anywhere in a kept parent and is zeroed (new_page_ids); a
+    // written one moves by a Device copy into a slot of its own bucket
+    // (pages_to_copy, the contract of the owner's copy-in) -- with none left
+    // in the kept parents, one a free block of the request gives up, that
+    // block re-placing in its own parent first; the keep order leaves
+    // another of the request's blocks in that parent, so it never empties
+    // (and unbinds) between the two moves -- and a published
+    // one's entry, like a probe block's, moves onto the copy
+    // (PrefixCacheIndex::Relocate), its boundary-tree hold with it.
+    // copy_in_blocks are the copy-in
+    // blocks the request holds (Request::CopyInBlocksRef, every admission's,
+    // empty when it holds none), aligned to the slots of its copy-in point:
+    // copy_in_point, the one this step's Admit reserves for, else the
+    // computed frontier the step publishes. Each is held in its slot's
+    // bucket, so the two re-place within that bucket (the copy-in block
+    // swapped in copy_in_blocks, not zeroed: the copy-in fills it whole, in
+    // this plan when the retry spends it). A kept parent's slot held by a
+    // cache entry not in use is cleared first, block by block as the
+    // planner's last pass would take it (under write-back recorded as a
+    // segment for this plan's drain; DeviceEvictionStats::compaction);
+    // other cache occupants stay for the retry's own eviction. Vacating
+    // stops once the admission plans. Returns what moved for the plan, or
+    // nullopt when nothing could (the dense layout does not fit, or no
+    // parent can be vacated). A retracted request holds no block to move:
+    // alone, its Restore drops the claims that leave no plan instead.
+    std::optional<AdmissionResult> CompactLoneRequest(PrefixProbe&& prefix, std::span<const GroupDemand> demands,
+                                                      const RequestProgress& progress,
+                                                      std::span<std::vector<CacheBlockRef>> copy_in_blocks,
+                                                      std::optional<CopyInPoint> copy_in_point);
 
     // The data slots of a retracted request are the non-null slots covering
     // [0, num_tokens) in every group -- the unaligned tail block included;
@@ -474,10 +532,14 @@ public:
     // request_access_epoch is the request's first-admission epoch, carried
     // on. Under write_back_evictions each set of cache victims is recorded for
     // the plan's drain as an admission's is; each call erases the records it
-    // added that ended up empty.
+    // added that ended up empty. An L2 slot whose key the Device index still
+    // holds is claimed instead of copied; when the claims leave no plan, the
+    // restore plans once more claiming nothing under write_back_evictions,
+    // or when drop_claims_if_unfit, which the caller sets when no other
+    // request holds pages (docs/design/scheduler.md §1.4, §4).
     std::optional<AdmissionResult> Restore(const RetractionImage& snapshot, std::span<const GroupDemand> demands,
-                                           std::optional<CopyInPoint> copy_in_point,
-                                           std::uint64_t request_access_epoch);
+                                           std::optional<CopyInPoint> copy_in_point, std::uint64_t request_access_epoch,
+                                           bool drop_claims_if_unfit);
     bool HasHostPool() const { return host_pool_ != nullptr; }
     bool HasSnapshotPool() const { return snapshot_pool_ != nullptr; }
     std::int32_t NumFreeSnapshotLcmBlocks() const {
@@ -912,6 +974,9 @@ public:
         // The collection of dead prefix entries, which like the tail cap evicts
         // every block it drops itself; only when evicting by segments.
         DeviceEvictionCounts dead_entry_collection;
+        // A lone request's compaction clearing a slot it moves a block into
+        // (CompactLoneRequest), with what the entry takes along.
+        DeviceEvictionCounts compaction;
         // Subset of request_reclaim considered for write-back, including
         // entries later dropped as dead or demoted. Superseded inputs are
         // excluded.
@@ -919,6 +984,11 @@ public:
     };
     // Cumulative, never reset (accounting only).
     const DeviceEvictionStats& DeviceEvictions() const { return device_evictions_; }
+    // Lone-request compactions that moved a block (CompactLoneRequest) and
+    // the blocks they moved, copied or re-placed. Cumulative, never reset
+    // (accounting only).
+    std::uint64_t LoneCompactions() const { return lone_compactions_; }
+    std::uint64_t LoneCompactionMoves() const { return lone_compaction_moves_; }
 
     // Publishes a Device block a restore filled from Host L2
     // (CompleteSnapshotRestore): the entry comes back with the logical block
@@ -1111,6 +1181,10 @@ private:
     HostPlacementPlan planHostBoundaries(std::span<const std::uint32_t> group_ids,
                                          std::span<const std::int32_t> buckets,
                                          std::span<const HostSegmentRows> boundaries, bool place_by_segments) const;
+    // The demands an admission with `prefix` plans: each replayable group's
+    // dense growth made the sparse suffix it regenerates from the replay
+    // window; empty when the probe hit nothing or no group replays.
+    std::vector<GroupDemand> replayedDemands(const PrefixProbe& prefix, std::span<const GroupDemand> demands) const;
     std::vector<CacheKey> keysForGroup(std::span<const std::string> content_hashes, std::uint32_t group_id) const;
     std::vector<std::vector<CacheKey>> buildGroupKeys(std::span<const std::string> content_hashes) const;
     template <CacheTier Tier>
@@ -1369,6 +1443,8 @@ private:
     std::uint64_t demoted_entries_not_written_back_{0};
     std::uint64_t store_candidates_dropped_by_flush_{0};
     DeviceEvictionStats device_evictions_;
+    std::uint64_t lone_compactions_{0};
+    std::uint64_t lone_compaction_moves_{0};
 };
 
 // The prefix-match policy of one spec: full attention is prefix-closed with

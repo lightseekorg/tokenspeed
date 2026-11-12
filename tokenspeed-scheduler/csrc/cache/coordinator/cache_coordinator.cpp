@@ -1899,7 +1899,7 @@ std::optional<CacheKey> CacheCoordinator::evictCachedBlockAlone(std::uint32_t gr
         write_back_segment = nullptr;
     } else if (metadata && metadata->last_access_epoch == kSupersededAccessEpoch &&
                (reason == &DeviceEvictionStats::admission || reason == &DeviceEvictionStats::restore ||
-                reason == &DeviceEvictionStats::request_reclaim)) {
+                reason == &DeviceEvictionStats::compaction || reason == &DeviceEvictionStats::request_reclaim)) {
         reason = &DeviceEvictionStats::request_reclaim;
         write_back_segment = nullptr;
     }
@@ -2540,8 +2540,9 @@ std::vector<CacheCoordinator::PublishedRange> CacheCoordinator::completedBlockRa
         return ranges;
     }
     if (GroupIsState(group_index)) {
-        // A natural checkpoint: slot 1 holds the state the forward that ended
-        // at this point wrote, keyed like the point itself.
+        // A natural checkpoint: the state the forward that ended at this
+        // point wrote (slot 1, or slot 0 behind a padded first decode), keyed
+        // like the point itself.
         if (!completed.publish_state || completed.prefix_hashes.empty() && !completed.tail) {
             return ranges;
         }
@@ -2552,7 +2553,7 @@ std::vector<CacheCoordinator::PublishedRange> CacheCoordinator::completedBlockRa
         }
         const ContentHash hash = completed.tail ? completed.tail->hash : completed.prefix_hashes.back();
         ranges.push_back(PublishedRange{
-            .first_cache_block = 1,
+            .first_cache_block = completed.state_slot,
             .keys = {CacheKey{.group_id = groups_[group_index].Id(), .content_hash = hash, .page_offset = 0}},
             .boundary_kind = completed.boundary_kind,
         });

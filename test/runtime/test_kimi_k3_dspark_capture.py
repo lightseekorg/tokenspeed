@@ -171,7 +171,7 @@ def test_attnres_capture_runs_at_owner_entry_across_pipeline_boundaries(
             is_first_pp_rank=stage == 0, is_last_pp_rank=stage == len(windows) - 1
         )
         projector = SimpleNamespace(
-            hidden_size=3,
+            projection_width=3,
             mapping=mapping,
             project_target_tap=lambda index, rows: rows,
             finalize_target_projection=lambda rows: rows,
@@ -193,11 +193,13 @@ def test_attnres_capture_runs_at_owner_entry_across_pipeline_boundaries(
             layers_to_capture=[1, 3],
             _dflash_capture_idx_map={1: 0, 3: 1},
             eagle3_layers_to_capture=(),
+            decode_chain=None,
             dflash_aux_stream="attn_res",
             output_attn_res_proj=None,
             output_attn_res_norm=None,
             norm=None,
             decode_final=None,
+            peer_weights=None,
         )
         for name in ("_dspark_capture_stream", "_capture_tap", "_write_dspark_context"):
             setattr(model, name, getattr(kimi_k3.KimiLinearModel, name).__get__(model))

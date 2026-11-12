@@ -105,8 +105,10 @@ def _runner(model: torch.nn.Module, booted_from: Path) -> ModelRunner:
     runner.gpu_id = 0
     runner.checkpoint_load_group = None
     runner._disk_reload_shapes = None
+    # Resident weights (no peer sharing), so disk reloads are allowed.
+    runner.mapping = Mapping(rank=0)
     runner.model_config = SimpleNamespace(
-        model_path=str(booted_from), mapping=Mapping(rank=0)
+        model_path=str(booted_from), mapping=runner.mapping
     )
     runner.server_args = SimpleNamespace(
         load_format="auto",

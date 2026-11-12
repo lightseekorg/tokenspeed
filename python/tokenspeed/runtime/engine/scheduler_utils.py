@@ -117,6 +117,7 @@ def make_config(
     max_retracted_requests: int,
     storage_config: StorageConfig | None,
     host_write_policy: str,
+    prefill_decode_interval: int,
     debug_force_retraction_interval: int = 0,
     enable_kv_cache_events: bool = False,
     decode_input_tokens: int = 1,
@@ -124,6 +125,7 @@ def make_config(
     disable_prefix_cache: bool = False,
     cache_groups: Sequence[CacheGroupConfig] | None = None,
     enable_mixed_prefill_decode: bool = False,
+    enable_short_prefill_first: bool = False,
     prefix_replay_tokens: int = 0,
     state_checkpoint_in_forward: bool = False,
     demote_superseded_state_checkpoints: bool = False,
@@ -138,6 +140,8 @@ def make_config(
     Args:
         num_device_pages: Device LCM blocks including the null page.
         max_scheduled_tokens: Per-step prefill token budget.
+        enable_short_prefill_first: Opt in to remaining-work ordering with
+            oldest-request protection; False preserves submission order.
         max_batch_size: Per-rank batch slots -- the most requests this rank
             runs at once (``--max-num-seqs`` over the attention-DP ranks).
         prefix_granularity: Prefix-hash page size in tokens.
@@ -167,6 +171,10 @@ def make_config(
             refuses it where it cannot run). Required on every role; without a
             Host tier write_through has no effect, and the decode role's Host
             tier holds retraction images only.
+        prefill_decode_interval: ``--prefill-decode-interval``: decode rounds
+            owed to the running decodes after each round that schedules a
+            prefill chunk, unless no decode can run, and the most rounds it
+            holds any one prompt back in total; 0 is off. Fused role only.
         debug_force_retraction_interval: ``--debug-force-retraction-interval``:
             0 is off; every ``|N|`` plans the scheduler retracts the oldest
             quiescent Decoding (``N > 0``) or Prefilling (``N < 0``) request
@@ -174,7 +182,9 @@ def make_config(
         enable_kv_cache_events: Publish KV cache events.
         decode_input_tokens: Verify width per decode step.
         overlap_schedule_depth: Dispatched-but-uncommitted plans allowed.
-        disable_prefix_cache: No prefix matching at admission.
+        disable_prefix_cache: No prefix matching at admission. Computed
+            pages are then published only for a retraction's image, so a
+            finished request's pages return to the pool.
         cache_groups: The arena's scheduler group configs.
         enable_mixed_prefill_decode: Mixed prefill/decode batches.
         prefix_replay_tokens: Prompt tail recomputed after a prefix hit.
@@ -289,6 +299,13 @@ def make_config(
     cfg.host_write_policy = _HOST_WRITE_POLICIES[host_write_policy]
 
     cfg.enable_mixed_prefill_decode = enable_mixed_prefill_decode
+    if prefill_decode_interval:
+        # Set only when on, like state_checkpoint_in_forward: a scheduler
+        # wheel without the field still runs the default.
+        cfg.prefill_decode_interval = prefill_decode_interval
+    if enable_short_prefill_first:
+        # Older scheduler wheels retain FIFO and reject an explicit opt-in.
+        cfg.enable_short_prefill_first = True
     if cache_groups:
         cfg.cache_groups = list(cache_groups)
     return cfg
@@ -656,10 +673,10 @@ def packed_block_tables_from_forward_op(
     precondition of the routers' one-launch fill of every group
     (``GroupTableStacks.fill``). Per-group uploads would fail its
     same-storage check and fall back to one launch per group. The copy
-    carries each row's span from the scheduler (``block_table_spans``):
-    before it the row holds its released prefix's null holes and after it
-    padding, so a sliding-window row at a long context moves a few entries.
-    With ``host_tables`` the tables are also copied into pinned host memory,
+    carries the scheduler's compact row windows (``block_table_windows``)
+    and their absolute spans (``block_table_spans``). The expansion fills
+    omitted columns with null holes before the window and padding after it.
+    With ``host_tables`` the tables are also rebuilt in pinned host memory,
     so a backend planning an extend from them reads them without a D2H sync.
 
     Structural contract checks run whenever bounds or expected groups are
@@ -669,8 +686,8 @@ def packed_block_tables_from_forward_op(
     to scan (``CacheBatchMetadata.from_forward_op``'s ``validate_page_ids``).
 
     Args:
-        forward_op: Scheduler forward operation exporting CPU NumPy tables
-            and their row spans.
+        forward_op: Scheduler forward operation exporting CPU NumPy row windows,
+            absolute column counts, and row spans.
         device: Destination device for the packed tensor.
         host_tables: Also return the tables in host memory (``tables_cpu``).
         num_reqs: Optional expected row count for every group.
@@ -708,8 +725,9 @@ def packed_block_tables_from_forward_op(
             raise ValueError(
                 f"expected_group_ids contains duplicates: {sorted(duplicate_group_ids)}"
             )
-    array_items = [
-        (str(key), arr) for key, arr in forward_op.block_tables_arrays().items()
+    window_items = [
+        (str(key), array, columns)
+        for key, (array, columns) in forward_op.block_table_windows().items()
     ]
     spans_by_id = {
         str(key): spans for key, spans in forward_op.block_table_spans().items()
@@ -717,7 +735,7 @@ def packed_block_tables_from_forward_op(
     if strict_validation:
         normalized_group_ids: set[str] = set()
         collided_ids: set[str] = set()
-        for group_id, _ in array_items:
+        for group_id, _, _ in window_items:
             if group_id in normalized_group_ids:
                 collided_ids.add(group_id)
             normalized_group_ids.add(group_id)
@@ -726,22 +744,20 @@ def packed_block_tables_from_forward_op(
                 "cache group keys collide after string normalization: "
                 f"{sorted(collided_ids)}"
             )
-    arrays_by_id = dict(array_items)
     if expected_group_ids is not None:
-        actual = set(arrays_by_id)
+        windows_by_id = {item[0]: item for item in window_items}
+        actual = set(windows_by_id)
         expected = set(expected_group_ids)
         if actual != expected:
             raise ValueError(
                 f"cache group keys disagree: missing={sorted(expected - actual)} "
                 f"extra={sorted(actual - expected)}"
             )
-        ordered_items = [
-            (group_id, arrays_by_id[group_id]) for group_id in expected_group_ids
-        ]
+        ordered_items = [windows_by_id[group_id] for group_id in expected_group_ids]
     else:
-        ordered_items = array_items
+        ordered_items = window_items
     if strict_validation:
-        for group_id, arr in ordered_items:
+        for group_id, arr, _ in ordered_items:
             if not isinstance(arr, np.ndarray):
                 raise ValueError(f"cache group {group_id!r} must be a NumPy array")
             if arr.dtype != np.int32:
@@ -751,14 +767,16 @@ def packed_block_tables_from_forward_op(
             if arr.shape[0] == 0:
                 raise ValueError(f"cache group {group_id!r} has zero rows")
             # rows-vs-num_reqs is checked once in the packing loop below.
-            if arr.shape[1] == 0:
-                raise ValueError(f"cache group {group_id!r} has zero width")
             group_max_page_id = (
                 max_page_ids.get(group_id) if max_page_ids is not None else max_page_id
             )
             if max_page_ids is not None and group_max_page_id is None:
                 raise ValueError(f"max_page_ids is missing cache group {group_id!r}")
             if group_max_page_id is not None:
+                if group_max_page_id < -1:
+                    raise ValueError(
+                        f"cache group {group_id!r} has an invalid page ID bound"
+                    )
                 invalid = (arr < -1) | (arr > group_max_page_id)
                 if bool(invalid.any()):
                     raise ValueError(
@@ -768,17 +786,24 @@ def packed_block_tables_from_forward_op(
     device = torch.device(device) if isinstance(device, str) else device
     out: dict[str, torch.Tensor] = {}
     out_cpu: dict[str, torch.Tensor] = {}
-    # (key, table, offset in the packed storage, window start per row, width)
-    packable: list[tuple[str, Any, int, np.ndarray, int]] = []
+    # (key, window, absolute columns, offset in packed storage, row starts)
+    packable: list[tuple[str, np.ndarray, int, int, np.ndarray]] = []
+    empty_groups: list[tuple[str, int]] = []
     total = 0
-    for key, arr in ordered_items:
+    for key, arr, columns in ordered_items:
         if num_reqs is not None and arr.shape[0] != num_reqs:
             raise ValueError(
-                f"block_tables_arrays[{key}] has {arr.shape[0]} rows "
+                f"block_table_windows[{key}] has {arr.shape[0]} rows "
                 f"but forward op reported num_reqs={num_reqs}"
             )
         if arr.shape[0] == 0:
             continue
+        if type(columns) is not int or columns < 0 or arr.shape[1] > columns:
+            raise ValueError(f"cache group {key!r} has invalid absolute columns")
+        if strict_validation and columns == 0:
+            raise ValueError(f"cache group {key!r} has zero width")
+        if total + arr.shape[0] * columns >= 1 << 31:
+            raise ValueError("block tables beyond 2**31 entries need int64 row fields")
         spans = spans_by_id.get(key)
         if (
             not isinstance(spans, np.ndarray)
@@ -787,10 +812,19 @@ def packed_block_tables_from_forward_op(
         ):
             raise ValueError(f"block_table_spans[{key}] must be int32 [rows, 2]")
         released, pages = spans[:, 0], spans[:, 1]
-        if bool(((released < 0) | (released > pages) | (pages > arr.shape[1])).any()):
+        if bool(((released < 0) | (released > pages) | (pages > columns)).any()):
             raise ValueError(f"block_table_spans[{key}] exceeds its table")
+        width = arr.shape[1]
+        if bool(((pages - released) > width).any()):
+            raise ValueError(f"block_table_windows[{key}] omits live entries")
+        first = np.maximum(pages.astype(np.int64) - width, 0)
         if max_page_id is not None or max_page_ids is not None:
-            column = np.arange(arr.shape[1])
+            maximum = max_page_ids[key] if max_page_ids is not None else max_page_id
+            if maximum < 0 and bool((released > 0).any()):
+                raise ValueError(
+                    f"cache group {key!r} contains a page ID outside -1..{maximum}"
+                )
+            column = first[:, None] + np.arange(width)[None, :]
             if bool(
                 (arr[column < released[:, None]] != 0).any()
                 or (arr[column >= pages[:, None]] != -1).any()
@@ -798,18 +832,16 @@ def packed_block_tables_from_forward_op(
                 raise ValueError(
                     f"cache group {key!r} holds entries outside its row spans"
                 )
-        if arr.shape[1] == 0:
+        if columns == 0:
             # Kept out of the pack: CacheBatchMetadata rejects a zero-width table.
-            out[key] = torch.empty((arr.shape[0], 0), dtype=torch.int32, device=device)
-            if host_tables:
-                out_cpu[key] = torch.empty((arr.shape[0], 0), dtype=torch.int32)
+            empty_groups.append((key, arr.shape[0]))
             continue
-        # One window width per group: the windows of a group form one block,
-        # and a window ending at a span's end starts at or before it.
-        width = int((pages - released).max())
-        first = np.maximum(pages.astype(np.int64) - width, 0)
-        packable.append((key, arr, total, first, width))
-        total += arr.shape[0] * arr.shape[1]
+        packable.append((key, arr, columns, total, first))
+        total += arr.shape[0] * columns
+    for key, rows in empty_groups:
+        out[key] = torch.empty((rows, 0), dtype=torch.int32, device=device)
+        if host_tables:
+            out_cpu[key] = torch.empty((rows, 0), dtype=torch.int32)
     if not packable:
         return PackedBlockTables(out, out_cpu)
     from tokenspeed_kernel.ops.metadata import (
@@ -819,7 +851,7 @@ def packed_block_tables_from_forward_op(
 
     num_rows = sum(arr.shape[0] for _, arr, _, _, _ in packable)
     fields = num_rows * BLOCK_TABLE_ROW_FIELDS
-    num_values = sum(arr.shape[0] * width for _, arr, _, _, width in packable)
+    num_values = sum(arr.size for _, arr, _, _, _ in packable)
     # Fresh pinned stages per step (event-fenced; reuse races overlap).
     # arr is a read-only zero-copy view over the C++ buffer; np.copyto
     # reads it into our own writable pinned tensors (never writes back).
@@ -829,8 +861,8 @@ def packed_block_tables_from_forward_op(
     row_fields = upload_np[:fields].reshape(num_rows, BLOCK_TABLE_ROW_FIELDS)
     values = upload_np[fields:]
     row_at = value_at = 0
-    for key, arr, offset, first, width in packable:
-        rows, columns = arr.shape
+    for _, arr, columns, offset, first in packable:
+        rows, width = arr.shape
         # (offset, width, start, end, source): expand_block_table_rows' fields.
         group_fields = row_fields[row_at : row_at + rows]
         group_fields[:, 0] = offset + np.arange(rows) * columns
@@ -839,15 +871,7 @@ def packed_block_tables_from_forward_op(
         group_fields[:, 3] = first + width
         group_fields[:, 4] = value_at + np.arange(rows) * width
         windows = values[value_at : value_at + rows * width].reshape(rows, width)
-        if not first.any():
-            np.copyto(windows, arr[:, :width])
-        elif width:
-            np.copyto(
-                windows,
-                np.lib.stride_tricks.sliding_window_view(arr, width, axis=1)[
-                    np.arange(rows), first
-                ],
-            )
+        np.copyto(windows, arr)
         row_at += rows
         value_at += rows * width
     upload = upload.to(device, non_blocking=True)
@@ -855,14 +879,26 @@ def packed_block_tables_from_forward_op(
     expand_block_table_rows(
         upload[:fields].view(num_rows, BLOCK_TABLE_ROW_FIELDS), upload[fields:], packed
     )
-    for key, arr, offset, _, _ in packable:
-        out[key] = packed[offset : offset + arr.size].view(arr.shape)
+    for key, arr, columns, offset, _ in packable:
+        shape = (arr.shape[0], columns)
+        size = shape[0] * shape[1]
+        out[key] = packed[offset : offset + size].view(shape)
     if host_tables:
         staged = torch.empty(total, dtype=torch.int32, pin_memory=pin_memory)
         staged_np = staged.numpy()
-        for key, arr, offset, _, _ in packable:
-            np.copyto(staged_np[offset : offset + arr.size].reshape(arr.shape), arr)
-            out_cpu[key] = staged[offset : offset + arr.size].view(arr.shape)
+        for key, arr, columns, offset, first in packable:
+            rows, width = arr.shape
+            shape = (rows, columns)
+            size = shape[0] * shape[1]
+            host = staged_np[offset : offset + size].reshape(shape)
+            if width == shape[1]:
+                np.copyto(host, arr)
+            else:
+                for row, start in enumerate(first):
+                    host[row, :start] = 0
+                    host[row, start : start + width] = arr[row]
+                    host[row, start + width :] = -1
+            out_cpu[key] = staged[offset : offset + size].view(shape)
     return PackedBlockTables(out, out_cpu)
 
 

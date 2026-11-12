@@ -185,6 +185,12 @@ def prepare_draft_extend_metadata(
     """
     draft_seq_lens = drafter.draft_seq_lens_buf[:padded_bs]
     draft_seq_lens.copy_(seq_lens[:padded_bs])
+    if not draft_attn_backend.query_sharded:
+        # A sharded target may have an unsharded draft (``draft_unsharded`` in
+        # ``model_wide_kwargs``): passing the target's plan on would claim a
+        # sharding the draft never sees, and a backend that cannot attend one
+        # refuses it (``reject_query_shard``).
+        kwargs = {**kwargs, "query_shard": None}
     draft_attn_backend.init_forward_metadata(
         bs=padded_bs,
         num_extends=num_extends,

@@ -67,7 +67,7 @@ def test_pipeline_projection_matches_concatenated_reference(stage_taps, with_tap
             writes.append((rows, pos, loc))
 
         model = SimpleNamespace(
-            hidden_size=4,
+            projection_width=4,
             mapping=SimpleNamespace(
                 is_first_pp_rank=stage == 0,
                 is_last_pp_rank=stage == len(stage_taps) - 1,
@@ -106,7 +106,7 @@ def test_pipeline_projection_matches_concatenated_reference(stage_taps, with_tap
 
 def test_context_accumulators_do_not_alias_between_inflight_chunks():
     model = SimpleNamespace(
-        hidden_size=4,
+        projection_width=4,
         mapping=SimpleNamespace(is_first_pp_rank=True, is_last_pp_rank=True),
     )
     producer = DSparkContextProducer(model, object(), attn_backend=object())
@@ -128,13 +128,23 @@ def test_prefill_context_write_does_not_require_decode_window():
         input_buffers=SimpleNamespace(positions_buf=positions),
         _write_native_cache=lambda h, p, loc, **kw: writes.append((h, p, loc, kw)),
     )
+    # The real router choice, not a stand-in: it is what decides whose write
+    # vector addresses these rows.
+    drafter._target_row_write_backend = lambda ctx: DFlash._target_row_write_backend(
+        drafter, ctx
+    )
     # No decode accessor: pure prefill must not query a stale/unpublished view.
+    # A shared cache group, so the TARGET's router owns the span.
+    drafter.attn_backend = SimpleNamespace(group_ids=("full_attention",))
     ctx = SimpleNamespace(
         bs=1,
         num_extends=1,
         input_num_tokens=5,
         dspark_context_producer=None,
-        attn_backend=SimpleNamespace(extend_span_locations=lambda: slots),
+        attn_backend=SimpleNamespace(
+            group_ids=("full_attention",),
+            extend_span_locations=lambda: slots,
+        ),
     )
     DFlash._update_native_cache_from_target(
         drafter,

@@ -25,8 +25,9 @@ from dataclasses import dataclass
 
 import torch
 from tokenspeed_kernel._optional import has_optional_package
+from tokenspeed_kernel.ops.activation.triton import rmsnorm_gated_sigmoid
 from tokenspeed_kernel.ops.attention.kda._prefill_capacity import KdaPrefillCapacity
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import (
     NoKernelFoundError,
@@ -106,6 +107,58 @@ class KdaPrefillResult:
 
     out: torch.Tensor
     final_state: torch.Tensor
+
+
+@dataclass(frozen=True)
+class KdaOutputNorm:
+    """The gated RMSNorm a KDA layer applies to its attention output.
+
+    ``out = rmsnorm(core) * weight * sigmoid(gate)`` per head over ``head_dim``,
+    in FP32 on the BF16 core output, rounded once to the output dtype.
+
+    Attributes:
+        gate: ``[tokens, heads * head_dim]`` raw output-gate logits with unit
+            inner stride; a column view of the input projection is fine.
+        weight: ``[head_dim]`` RMSNorm weight.
+        eps: RMSNorm epsilon.
+    """
+
+    gate: torch.Tensor
+    weight: torch.Tensor
+    eps: float
+
+    def rows(self, begin: int, end: int) -> KdaOutputNorm:
+        """The norm of token rows ``[begin, end)``."""
+        return KdaOutputNorm(self.gate[begin:end], self.weight, self.eps)
+
+
+def apply_kda_output_norm(
+    out: torch.Tensor, output_norm: KdaOutputNorm | None
+) -> torch.Tensor:
+    """``out`` gated-RMSNormed as a ``[tokens, heads * head_dim]`` tensor, or as is.
+
+    Args:
+        out: KDA attention output whose leading dimensions flatten to the
+            gate's token rows and whose last dimension is ``head_dim`` or
+            ``heads * head_dim``.
+        output_norm: The layer's output norm, or None to return ``out``.
+
+    Returns:
+        ``out`` when ``output_norm`` is None, else the normed output.
+    """
+    if output_norm is None:
+        return out
+    tokens, width = output_norm.gate.shape
+    head_dim = output_norm.weight.shape[0]
+    return rmsnorm_gated_sigmoid(
+        out.reshape(tokens, width).contiguous(),
+        output_norm.gate,
+        output_norm.weight,
+        output_norm.eps,
+        width // head_dim,
+        head_dim,
+        enable_pdl=pdl_enabled(),
+    )
 
 
 @dataclass(frozen=True)
@@ -464,6 +517,7 @@ def try_kda_fused_paged_verify(
     solution: str | None = None,
     store_states: bool = True,
     replay_records: KdaReplayRecords | None,
+    output_norm: KdaOutputNorm | None,
     g_raw: torch.Tensor | None = None,
     conv_qkv: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
@@ -478,7 +532,9 @@ def try_kda_fused_paged_verify(
     activation-dtype unnormalized keys and raw gates, and query boundaries
     for same-round recovery. Commit recomputes key normalization and gate decay.
     A raw gate may be supplied to fused-convolution verification; supplying
-    ``conv_qkv`` additionally selects split producers.
+    ``conv_qkv`` additionally selects split producers. With ``output_norm``
+    the result is the layer's gated-RMSNormed ``[tokens, heads * head_dim]``
+    output; kernels apply it in their epilogue where they can.
     Returns ``None`` only when no implementation
     supports the current platform.
     """
@@ -501,6 +557,9 @@ def try_kda_fused_paged_verify(
                 "head_dim": head_dim,
                 "paged_state": True,
                 "recurrent_layout": recurrent_layout,
+                "replay_records": replay_records is not None,
+                "spec_query_len": draft_token_num,
+                "batch_size": read_indices.shape[0],
                 "split_producers": split_producers,
                 "store_states": store_states,
             },
@@ -534,6 +593,7 @@ def try_kda_fused_paged_verify(
         head_dim=head_dim,
         draft_token_num=draft_token_num,
         lower_bound=lower_bound,
+        output_norm=output_norm,
         **kwargs,
     )
 
@@ -565,6 +625,7 @@ def kda_fused_paged_verify_uses_split_producers(
     traits = {
         "paged_state": True,
         "recurrent_layout": recurrent_layout,
+        "split_producers": True,
         "store_states": store_states,
         "num_heads": num_heads,
         "head_dim": head_dim,
@@ -585,6 +646,56 @@ def kda_fused_paged_verify_uses_split_producers(
     return (
         resolve_kda_batched_replay_commit(dtype, num_heads=num_heads, head_dim=head_dim)
         is not None
+    )
+
+
+def kda_fused_paged_verify_fuses_producers(
+    dtype: torch.dtype,
+    *,
+    recurrent_layout: str,
+    num_heads: int,
+    head_dim: int,
+    draft_token_num: int,
+    batch_size: int,
+) -> bool:
+    """Whether record verify runs its gate and convolution producers inline.
+
+    Args:
+        dtype: Activation dtype used to resolve the registered kernel.
+        recurrent_layout: Committed recurrent-state layout.
+        num_heads: Per-rank KDA head count.
+        head_dim: KDA head width.
+        draft_token_num: Tokens per request window.
+        batch_size: Requests in the batch (padding included).
+
+    Returns:
+        True when the selected record verify for these windows computes the gate
+        projection and convolution itself, so the caller passes neither
+        ``g_raw`` nor ``conv_qkv``. Records and commit are the same either way.
+    """
+    probe = torch.empty(0, dtype=dtype, device="meta")
+    signature = _attention_format_signature(q=probe, k=probe, v=probe)
+    traits = {
+        "num_heads": num_heads,
+        "head_dim": head_dim,
+        "paged_state": True,
+        "recurrent_layout": recurrent_layout,
+        "replay_records": True,
+        "spec_query_len": draft_token_num,
+        "batch_size": batch_size,
+        "store_states": False,
+    }
+    try:
+        kernel = select_kernel(
+            "attention", "kda_fused_paged_verify", signature, traits=traits
+        )
+    except NoKernelFoundError:
+        return False
+    registered = KernelRegistry.get().get_by_name(kernel.name)
+    return (
+        registered is not None
+        and registered.traits.get("split_producers") == frozenset({False})
+        and registered.traits.get("replay_records") == frozenset({True})
     )
 
 
@@ -768,13 +879,16 @@ import tokenspeed_kernel.ops.attention.kda.gluon  # noqa: E402,F401
 # isort: on
 
 __all__ = [
+    "KdaOutputNorm",
     "KdaPrefillResult",
+    "apply_kda_output_norm",
     "kda_replay_payload_specs",
     "kda_recurrent_layout",
     "kda_paged_prefill",
     "kda_paged_decode",
     "try_kda_fused_paged_decode",
     "try_kda_fused_paged_verify",
+    "kda_fused_paged_verify_fuses_producers",
     "kda_fused_paged_verify_uses_split_producers",
     "kda_verify_conv_update",
     "resolve_kda_batched_replay_commit",

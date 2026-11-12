@@ -376,6 +376,7 @@ def _output_slim_tail() -> list[bytes]:
         output_top_logprobs_val=[[[-0.25, -3.0]], []],
         output_top_logprobs_idx=[[[7, 1]], []],
         output_token_cumulative_probs_val=[[0.75], []],
+        reasoning_tokens=[1, 0],
     )
     return [bytes(f) for f in _ENCODER.encode(batch)]
 

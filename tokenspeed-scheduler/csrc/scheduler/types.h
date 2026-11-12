@@ -83,6 +83,15 @@ struct SchedulerConfig {
         return HasHostCache() && role != Role::kD && host_write_policy == HostWritePolicy::kWriteThrough;
     }
 
+    // Whether a request's completed pages are published into the Device index
+    // as it computes and when it finishes, for later admissions to match.
+    // Without prefix caching no admission matches either tier or prefetches
+    // from L3, so a published page would only hold its block until an
+    // allocation evicted it, and a Host copy of it would never be read. A
+    // retraction publishes its victim regardless; with a Host cache the
+    // image's L2 leg is built from that publication.
+    bool PublishesCompletedPages() const { return !disable_prefix_cache; }
+
     std::int32_t max_scheduled_tokens{};
     // Sum of ceil((cached prefix + this chunk) / prefix_granularity) across
     // all local prefill requests in one batch. Zero leaves this unbounded.
@@ -98,6 +107,15 @@ struct SchedulerConfig {
     std::optional<StorageConfig> storage_config;
     bool enable_kv_cache_events{false};
     bool enable_mixed_prefill_decode{false};
+    // Fused role only: decode rounds owed after a local prefill round
+    // (docs/design/scheduler.md §3.3). 0 is off.
+    std::int32_t prefill_decode_interval{0};
+    // P and fused roles: rank new local prefills by work after Device/Host
+    // prefix reuse, keeping stable ties and resident chunks first. Only the
+    // oldest waiting prompt counts successful later first admissions; after
+    // eight, it gains selection priority. Off preserves submission order.
+    // See docs/design/scheduler.md section 1.1.
+    bool enable_short_prefill_first{false};
 
     // The P and D roles ARE the cache-transfer PD protocol: there is no
     // disaggregated deployment without it, so everything PD-specific

@@ -1201,6 +1201,8 @@ def _rmsnorm_gated_kernel(
     gate_idx = token * gate_stride + offs_h[:, None] * head_dim + offs_d[None, :]
     g = tl.load(gate_ptr + gate_idx, mask=mask_h[:, None], other=0.0).to(tl.float32)
     if ENABLE_PDL:
+        # Release the next kernel at once; its own wait orders it after this one.
+        tl.extra.cuda.gdc_launch_dependents()
         # Gate and norm weight are independent of the KDA primary. Delay only
         # the attention-output read until every primary CTA has completed.
         tl.extra.cuda.gdc_wait()
@@ -1208,8 +1210,6 @@ def _rmsnorm_gated_kernel(
     var = tl.sum(x * x, axis=1) / head_dim
     rsig = tl.math.rsqrt(var + eps)
     y = x * rsig[:, None] * w[None, :] * tl.sigmoid(g)
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
     tl.store(out_ptr + idx, y.to(out_ptr.dtype.element_ty), mask=mask_h[:, None])
 
 
@@ -1231,8 +1231,9 @@ def rmsnorm_gated_sigmoid(
         weight: ``[head_dim]`` RMSNorm weight.
         eps: RMSNorm epsilon.
         num_heads / head_dim: per-head norm geometry.
-        enable_pdl: Whether to prefetch gate/weight before waiting for the
-            immediately preceding programmatic-launch primary.
+        enable_pdl: Whether to release the next kernel at entry and prefetch
+            gate/weight before waiting for the immediately preceding
+            programmatic-launch primary.
 
     Returns:
         ``[num_tokens, num_heads*head_dim]`` tensor of ``x``'s dtype.

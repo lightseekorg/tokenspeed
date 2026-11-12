@@ -61,6 +61,7 @@ from __future__ import annotations
 import bisect
 import os
 import zlib
+from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, NamedTuple, Protocol, runtime_checkable
@@ -84,6 +85,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     ForwardMode,
 )
 from tokenspeed.runtime.execution.forward_step import prepare_draft_extend_metadata
+from tokenspeed.runtime.execution.history_embedding import HistoryEmbeddingModel
 from tokenspeed.runtime.execution.memory_delta import MemoryDeltaObserver
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan
@@ -108,9 +110,13 @@ from tokenspeed.runtime.utils.common import (
 logger = get_colorful_logger(__name__)
 
 if TYPE_CHECKING:
+    from tokenspeed.runtime.cache.l2.layerwise_load import LayerwiseLoadTracker
     from tokenspeed.runtime.execution.forward_step import ForwardStepRunner
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
     from tokenspeed.runtime.execution.model_executor import ModelExecutorConfig
+    from tokenspeed.runtime.execution.request_token_history import (
+        RequestTokenHistoryView,
+    )
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
@@ -301,6 +307,25 @@ def text_and_inner_model(
     return text_model, getattr(text_model, "model", None)
 
 
+def input_embedding(
+    model, *, requires_request_token_history: bool
+) -> Callable[..., torch.Tensor] | None:
+    """Resolve the inner model's eager embedding, or None when unsupported."""
+    _, inner = text_and_inner_model(model)
+    embed_tokens = getattr(inner, "embed_tokens", None)
+    if embed_tokens is None:
+        return None
+    if isinstance(inner, HistoryEmbeddingModel):
+        return inner.compute_input_embeddings
+    if requires_request_token_history:
+        return None
+
+    def compute_input_embeddings(input_ids, ctx, *, request_token_history):
+        return embed_tokens(input_ids)
+
+    return compute_input_embeddings
+
+
 def narrowing_prefill_model(model) -> NarrowingPrefillModel | None:
     """The narrowing model a prefill capture would drive, or ``None``.
 
@@ -423,13 +448,21 @@ class PrefillGraph:
         graph_supported: bool = True,
     ) -> None:
         model = model_runner.model if model_runner is not None else None
-        # Multimodal seam: models whose multimodal path is embeds-only expose
-        # multimodal_input_embeds; others (e.g. deepstack) replay text only.
-        self._multimodal_input_embeds = getattr(model, "multimodal_input_embeds", None)
+        requires_history = (
+            model_runner is not None
+            and model_runner.model_config.requires_request_token_history
+        )
+        # The multimodal seam does not consume or append token history.
+        self._multimodal_input_embeds = (
+            None
+            if requires_history
+            else getattr(model, "multimodal_input_embeds", None)
+        )
         self.text_model, self.inner_model = text_and_inner_model(model)
-        # Embedding runs eagerly OUTSIDE the graphs (see capture); the graphs
-        # read a static input-embeds buffer instead of gathering from input_ids.
-        self._embed_tokens = getattr(self.inner_model, "embed_tokens", None)
+        # Both embeddings run eagerly before graph padding, through one callable.
+        self._compute_input_embeddings = input_embedding(
+            model, requires_request_token_history=requires_history
+        )
         self._input_embeds_buf: torch.Tensor | None = None
         self.attn_backend = attn_backend
         self.token_to_kv_pool = token_to_kv_pool
@@ -460,18 +493,18 @@ class PrefillGraph:
             or not graph_supported
             or not self.capture_buckets
             or self.inner_model is None
-            or self._embed_tokens is None
+            or self._compute_input_embeddings is None
             or model_runner is None
             or not model_runner.is_generation
-            # The graph's embedding seam takes input_ids alone; an embedding
-            # that reads request-token history stays eager.
-            or model_runner.model_config.requires_request_token_history
             # DP replay decisions must come from replicated state, and a
             # forward's multimodal-ness is rank-local: one rank running its mm
             # prefill eager while text-only peers replay desyncs the EP
             # collectives. Until the DP metadata gather carries a multimodal
             # flag, keep the graph off for multimodal models under DP.
-            or (config.data_parallel_size > 1 and model_runner.is_multimodal)
+            or (
+                config.data_parallel_size > 1
+                and model_runner.model_config.is_multimodal_active
+            )
             # The narrowed row count is rank-local (which prompts complete on
             # this rank), so the decoder bucket -- and the collective shapes
             # its graph bakes -- would differ across ranks; the stages also
@@ -512,6 +545,9 @@ class PrefillGraph:
         self._route_counts: dict[str, int] = {}
         # Aux-capture mode baked into the graphs; mismatched live forwards run eager.
         self._captured_hidden_mode = None
+        # The pool's layerwise load tracker when the graphs were captured, on
+        # which their segments wait for the Host loads (see replay).
+        self._captured_load_tracker: LayerwiseLoadTracker | None = None
         # One owner for ordinary and attention-containing captures. None is the
         # batch-independent attention-break variant; integers require exact BS.
         self._captures: dict[
@@ -561,7 +597,7 @@ class PrefillGraph:
         """
         if self.disable:
             return
-        weight = self._embed_tokens.weight
+        weight = self.inner_model.embed_tokens.weight
         self._input_embeds_buf = torch.zeros(
             max(self.capture_buckets),
             weight.shape[1],
@@ -573,6 +609,7 @@ class PrefillGraph:
         self._captures.clear()
         self._encoders.clear()
         self._decoders.clear()
+        self._captured_load_tracker = self.token_to_kv_pool.layerwise_load_tracker
         self.attn_backend.init_prefill_graph_state(
             max_num_tokens=max(self.capture_buckets),
             max_bs=int(self.config.max_num_seqs)
@@ -614,9 +651,7 @@ class PrefillGraph:
                 )
             minimum_bs = dummy_batch_size(bucket, self.config.context_len)
             self._ctx = self.make_dummy_batch(bucket, minimum_bs)
-            self._land_input_embeds(
-                self._embed_tokens(self.input_buffers.input_ids_buf[:bucket]), bucket
-            )
+            self._input_embeds_buf[:bucket].zero_()
             self._captured_hidden_mode = self._ctx.capture_hidden_mode
             # Breaks record the ambient dummy ctx; it is rebound live at replay.
             try:
@@ -664,9 +699,21 @@ class PrefillGraph:
                 if bs is None
             }
             sample = next(iter(ordinary.values()), None)
+            # Segments a replay runs behind the waits for their own layers'
+            # Host loads: none without a Host L2 tier (no load trackers when
+            # capturing), and none on a pool that does not declare
+            # layer_accesses_wait_for_load, whose replays wait for the whole
+            # load instead and skip the noted waits (see replay).
+            waiting = (
+                sum(1 for waits in sample[0].segment_waits if waits)
+                if sample is not None
+                and self.token_to_kv_pool.layer_accesses_wait_for_load
+                else 0
+            )
             logger.info(
                 f"prefill breakable graph: captured buckets {sorted(ordinary)!s} "
                 f"(segments={(sample[0].num_segments if sample is not None else 0):d}, "
+                f"{waiting:d} behind per-layer Host-load waits, "
                 "eager attention breaks)",
             )
             variants = {
@@ -717,9 +764,7 @@ class PrefillGraph:
                 )
             bs = -(-rows // per_request)
             self._ctx = self.make_dummy_batch(rows, bs)
-            self._land_input_embeds(
-                self._embed_tokens(self.input_buffers.input_ids_buf[:rows]), rows
-            )
+            self._input_embeds_buf[:rows].zero_()
             statics = self._narrowing.allocate_decoder_state(rows)
             try:
                 with active_forward(self._ctx):
@@ -1262,7 +1307,10 @@ class PrefillGraph:
                 for group_id, array in arrays.items()
             }
             dummy_forward_op = SimpleNamespace(
-                block_tables_arrays=lambda: arrays, block_table_spans=lambda: spans
+                block_table_windows=lambda: {
+                    key: (array, array.shape[1]) for key, array in arrays.items()
+                },
+                block_table_spans=lambda: spans,
             )
             cache_metadata = CacheBatchMetadata.from_forward_op(
                 dummy_forward_op,
@@ -1320,7 +1368,7 @@ class PrefillGraph:
 
         A forward carrying multimodal inputs replays only when the model
         exposes the embeds-only ``multimodal_input_embeds`` seam; models with
-        extra per-layer inputs (deepstack) run eager.
+        extra per-layer inputs (deepstack) or request-token history run eager.
         """
         if multimodal_context is not None and self._multimodal_input_embeds is None:
             return False
@@ -1331,6 +1379,8 @@ class PrefillGraph:
         ctx: ForwardContext,
         input_ids: torch.Tensor,
         multimodal_context=None,
+        *,
+        request_token_history: RequestTokenHistoryView | None,
     ):
         """Replay the captured graph for ``ctx`` (caller checked :meth:`can_run`).
 
@@ -1338,7 +1388,9 @@ class PrefillGraph:
         prefill gathers ``embed_tokens(input_ids)`` into the static buffer; a
         multimodal prefill builds the merged text+vision embeddings via the
         model's ``multimodal_input_embeds`` seam (vision encoder included)
-        instead -- both replay the same graphs. Then the inner stack replays
+        instead. An inner model with ``compute_input_embeddings`` computes its
+        embeddings from the live context and request-token history here too.
+        All three consume the same static buffer. Then the inner stack replays
         over the padded bucket and the model's eager logits tail finishes on
         the real-token rows.
         """
@@ -1351,10 +1403,11 @@ class PrefillGraph:
             input_embeds = self._multimodal_input_embeds(
                 input_ids, ctx, multimodal_context
             )
-        self._land_input_embeds(
-            input_embeds if input_embeds is not None else self._embed_tokens(input_ids),
-            bucket,
-        )
+        if input_embeds is None:
+            input_embeds = self._compute_input_embeddings(
+                input_ids, ctx, request_token_history=request_token_history
+            )
+        self._land_input_embeds(input_embeds, bucket)
         # Re-pad tail rows: they hold the previous forward's residue, which captured kernels consume.
         if num_tokens < bucket:
             ib = self.input_buffers
@@ -1370,19 +1423,30 @@ class PrefillGraph:
             if ctx.global_num_tokens is not None
             else [num_tokens] * self.config.world_size
         )
-        # The layerwise Host-load waits are made eagerly, and a captured
-        # segment holds none: a prologue writes latent rows into a page a
-        # tail hit loads, and an inline KDA layer reads the State checkpoint
-        # a hit loads, both inside segments. So a replay waits for the
-        # plan's whole Host load (its last layer's event, which the load
-        # stream records after every earlier layer's copy) before its first
-        # segment.
+        # A captured segment waits for the Host loads of the layers it
+        # touches on the tracker the capture noted them on
+        # (BreakableCapture.wait_before_segment). The capture notes only the
+        # accesses made through an accessor that waits, so these waits stand
+        # in for the whole load only on a pool that declares that every access
+        # a replay makes waits (layer_accesses_wait_for_load), and only for
+        # graphs captured against its current tracker: graphs captured
+        # against another tracker, or none, noted no wait on this one. Every
+        # other replay waits for this pool's whole Host load (its tracker's
+        # last layer event, which the load stream records after every earlier
+        # layer's copy for this pool) before its first segment and skips the
+        # segment waits its capture noted, which that wait covers: they are
+        # on this pool's tracker, as a target forward's captured segments
+        # touch no other view's cache.
         tracker = self.token_to_kv_pool.layerwise_load_tracker
-        if tracker is not None:
+        whole_load_waited = tracker is not None and not (
+            self.token_to_kv_pool.layer_accesses_wait_for_load
+            and tracker is self._captured_load_tracker
+        )
+        if whole_load_waited:
             tracker.wait_for_all_layers()
         if self._narrowing is not None:
             hidden_states, aux_hidden_states = self._replay_narrowed(
-                bucket, ctx, num_tokens
+                bucket, ctx, num_tokens, noted_waits_done=whole_load_waited
             )
         else:
             cap, output = self._captures[bucket, None]
@@ -1405,7 +1469,7 @@ class PrefillGraph:
                         padded_global_num_tokens=[bucket] * self.config.world_size,
                         live_global_num_tokens=live_global_num_tokens,
                     )
-                cap.replay(valid_rows=num_tokens)
+                cap.replay(valid_rows=num_tokens, noted_waits_done=whole_load_waited)
                 if self._expert_load_rows is not None:
                     self._expert_load_rows.clear()
             hidden_states, aux_hidden_states = output.sliced(num_tokens)
@@ -1439,7 +1503,12 @@ class PrefillGraph:
             logger.info(f"prefill graph routes: {dict(sorted(counts.items()))!s}")
 
     def _replay_narrowed(
-        self, bucket: int, ctx: ForwardContext, num_tokens: int
+        self,
+        bucket: int,
+        ctx: ForwardContext,
+        num_tokens: int,
+        *,
+        noted_waits_done: bool,
     ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
         """Encoder replay, eager narrowing, decoder replay (or eager decoder).
 
@@ -1470,7 +1539,9 @@ class PrefillGraph:
                 f"rows={rows:d} decoder_bucket={decoder_bucket!s}"
             )
         with self._padded_to(ctx, bucket):
-            encoder.capture.replay(valid_rows=num_tokens)
+            encoder.capture.replay(
+                valid_rows=num_tokens, noted_waits_done=noted_waits_done
+            )
             narrowed = model.narrowing_forward(encoder.state, ctx)
             if narrowed.rows != rows:
                 raise RuntimeError(
@@ -1482,7 +1553,9 @@ class PrefillGraph:
             else:
                 decoder = self._decoders[decoder_bucket]
                 narrowed.land_into(decoder.statics)
-                decoder.capture.replay(valid_rows=rows)
+                decoder.capture.replay(
+                    valid_rows=rows, noted_waits_done=noted_waits_done
+                )
                 hidden, captured = decoder.output.sliced(rows)
         return model.finish_forward(hidden, list(captured), ctx)
 

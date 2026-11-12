@@ -443,4 +443,71 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn a_cancellation_round_trips_and_is_never_a_preallocation() {
+        let frames = cancellation_frames(42, "10.0.0.1:5000");
+        assert!(is_cancellation(&frames));
+        assert!(!is_registration(&frames));
+        assert_eq!(
+            cancellation_route(&frames),
+            Ok((42, "10.0.0.1:5000".to_owned()))
+        );
+        // A pre-allocation starts with its room, a registration with "None":
+        // neither is taken for a cancellation.
+        let preallocation = preallocation_frames(42, "10.0.0.1:5000", None);
+        assert!(!is_cancellation(&preallocation));
+        assert!(cancellation_route(&preallocation).is_err());
+        let registration = registration_frames(
+            "10.0.0.1",
+            4000,
+            "10.0.0.1:5000",
+            "cache",
+            0x1000,
+            b"L",
+            4,
+            2,
+        );
+        assert!(!is_cancellation(&registration));
+        assert!(cancellation_route(&registration).is_err());
+        assert!(!is_cancellation(&[]));
+        assert!(cancellation_route(&[]).is_err());
+    }
+
+    #[test]
+    fn a_malformed_cancellation_is_rejected() {
+        let short = cancellation_frames(1, "s");
+        assert!(cancellation_route(&short[..2]).is_err());
+        let mut long = cancellation_frames(1, "s");
+        long.push(Bytes::new());
+        assert!(cancellation_route(&long).is_err());
+        // The room is a canonical unsigned integer at most `MAX_ROOM`.
+        let room = |frame: &[u8]| {
+            cancellation_route(&[
+                Bytes::from_static(b"Cancel"),
+                Bytes::copy_from_slice(frame),
+                ascii("s"),
+            ])
+        };
+        assert!(room(b"01").is_err());
+        assert!(room(b"-1").is_err());
+        assert!(room(b"").is_err());
+        assert!(room(b"9223372036854775808").is_err());
+        assert_eq!(room(b"9223372036854775807"), Ok((MAX_ROOM, "s".to_owned())));
+        // The Decode session must be a non-empty ASCII text frame.
+        let session = |frame: &[u8]| {
+            cancellation_route(&[
+                Bytes::from_static(b"Cancel"),
+                ascii(3),
+                Bytes::copy_from_slice(frame),
+            ])
+        };
+        assert!(session(b"").is_err());
+        assert!(session(&[0xff]).is_err());
+        assert!(session(&[b's'; 513]).is_err());
+        assert_eq!(session(b"s"), Ok((3, "s".to_owned())));
+        // Another header is a pre-allocation, not a cancellation.
+        assert!(
+            cancellation_route(&[Bytes::from_static(b"Cancel "), ascii(1), ascii("s")]).is_err()
+        );
+    }
 }

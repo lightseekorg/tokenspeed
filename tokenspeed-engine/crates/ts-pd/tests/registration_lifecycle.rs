@@ -102,10 +102,7 @@ fn repeated_wakes_transfer_with_reused_addresses_and_reject_old_cache_messages()
             Bytes::from_static(manifest),
         ],
     );
-    assert_eq!(
-        next_event(&mut pair.prefill, &mut mesh, &group),
-        PdEvent::Failed("stale".to_owned())
-    );
+    expect_cancelled(&mut pair.prefill, "stale", &mut mesh, &group);
     assert!(destination.iter().all(|&byte| byte == 0));
 
     transfer_one(&mut pair, "current", 5001, &mut mesh, &group);
@@ -164,10 +161,7 @@ fn replacing_a_cache_retires_queued_layerwise_reads_before_releasing_the_room() 
             Bytes::from("replacement-cache"),
         ],
     );
-    assert_eq!(
-        next_event(&mut pair.prefill, &mut mesh, &group),
-        PdEvent::Failed(rid.to_owned())
-    );
+    expect_cancelled(&mut pair.prefill, rid, &mut mesh, &group);
     assert!(!pair.prefill.has_in_flight());
     steps.store(1000, Ordering::Release);
     thread::sleep(Duration::from_millis(100));

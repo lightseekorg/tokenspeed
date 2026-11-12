@@ -46,6 +46,25 @@ they publish a generation and all consumer subgroups before they read the
 peer inbox. Removing either rendezvous can increase cross-rank
 skew and regress performance even when the generated kernel remains correct.
 
+### Inline asm
+
+Prefer Gluon ops, then LLVM intrinsics through an extern `.ll` library
+(see `_extern.py`), over inline asm. The compiler inserts the wait states
+between dependent instructions and protects live registers only for
+instructions it can see. It doesn't look inside an asm block. Use inline asm
+only where neither exists, and follow these rules:
+
+- Say why at the site with an `# asm:` comment.
+- Declare every register the template writes: outputs and `~{...}` clobbers,
+  including SCC and VCC.
+- Don't read a value inside its producer's hazard window (an MFMA or
+  transcendental result, or an SGPR that a VALU instruction just wrote). Pass
+  it through a compiler-visible op first.
+- Don't pad with `s_nop`.
+
+`tokenspeed-kernel/test/amd/gfx950/ops/test_inline_asm_gfx950.py` lists the
+allowed helpers and checks these rules on the compiled kernels.
+
 ## GEMM
 
 ### Offline-tuned BLAS solutions with TunableOp (ROCm)
@@ -115,6 +134,13 @@ Qwen3.8-Flash-Next decode batches.
   single rounding. It reuses the decode tile for `M` and accepts only buckets
   without split-K (Kimi K3 latent up-projection, `2 <= M <= 32`), replacing a
   separate add kernel.
+- `launch_gluon_mm_a16w16_column_shard_gfx950` runs the decode kernel over a
+  column shard `[shard_n, K]` of a replicated weight with full-K 16x16 tiles
+  (512-deep K, three buffers). Every output issues its 16x16x32 MFMAs over K
+  in order on one FP32 accumulator, whatever the tile shape. When the full
+  GEMM's measured config has no split-K
+  (`supports_gluon_mm_a16w16_column_shard_gfx950`), each column therefore
+  equals the replicated GEMM's bitwise.
 - Other shapes retain the default PyTorch path. The small- and medium-M
   kernels remain available for direct use, but the package does not register
   them for automatic selection.
@@ -178,7 +204,9 @@ except for the measured `(N, K)` entries in `_CONFIGS`.
 
 A few-row program streams a tile of weight rows, reusing each load across
 its input rows. Each (input row, output) keeps the single-row reduction;
-FMA throughput limits this path to a few rows. The gated projection
+FMA throughput limits this path to a few rows. All of a lane's weight chunks
+are issued up front and the input rows one chunk ahead, so a wave waits for
+one memory round trip instead of one per chunk. The gated projection
 recomputes its normalized, gated input in every program.
 
 ### gfx950 FP32 router GEMV
@@ -221,6 +249,30 @@ tile's programs can run on different XCDs, so partials are stored and loaded
 at system scope, which bypasses the per-XCD L2. Weight loads are
 non-temporal.
 
+### gfx950 FP32 router with a decode GEMM
+
+`gluon_fp32_router_gemv_mm_a16w16_gfx950` (`gemm/fp32/router_gemv.py`) runs
+the router's split-K GEMM and an independent BF16 decode GEMM
+(`gluon_mm_a16w16_medium_gfx950`) in one launch.
+`gemm.fp32_router_gemv_execute_with_mm` selects it.
+
+#### Contract
+
+- Router operands as for the router GEMV; `mm_a` `[M, K']` and `mm_b`
+  `[N', K']` contiguous BF16, `mm_out` an `[M, N']` BF16 destination.
+- `1 <= M <= 16`, `N` a multiple of 16, `K` a multiple of 512, and a measured
+  four-wave decode GEMM config for `(M, N', K')`.
+- `mm_out` is bitwise `gemm.mm(mm_a, mm_b)`. The router always runs the
+  16 x 16 split-K-by-8 tile, so its logits equal the split-K GEMM's at 9-16
+  rows and differ from the GEMV's in the last bits at 1-8 rows.
+
+#### Algorithm
+
+Programs `[0, P)` are the router's split-K programs and the rest the decode
+GEMM's, with its program ids offset by `P`. Neither half waits on the other.
+The split-K router reads 32 KB of activations per program, where a GEMV
+program reads all of them, so both weight streams finish together.
+
 ### gfx950 dense BF16 decode GEMV
 
 `gluon_gemv_a16w16_gfx950` (`gemm/fp16/gemv.py`) computes `x @ w.T` for
@@ -262,6 +314,34 @@ constexprs alone.
   uses eight waves instead of four.
 - Weight loads are streaming (`.cg`). K loops are unrolled: a loop-carried
   register copy of a pending load waits for the load and serializes the chunks.
+
+### gfx950 weight-only FP8 decode GEMV
+
+`gluon_gemv_a16w8_gfx950` (`gemm/fp16/gemv.py`) computes
+`(x @ w.T) * s` with E4M3 weights and one FP32 scale per weight row.
+
+#### Contract
+
+- `x` is `[M, K]` BF16 or FP16 with unit inner stride and `1 <= M <= 128`;
+  `w` a contiguous `[N, K]` `float8_e4m3fn` matrix with `K` a multiple of 16
+  and at least 64; `s` a contiguous FP32 `[N]`; `out` `[M, N]` in `x`'s dtype
+  with unit inner stride.
+- Each E4M3 value upcasts exactly to `x`'s dtype, products sum in FP32, the
+  row scale multiplies the sum once, and the output rounds once.
+- `gemm.mv_fp8_weight` selects it up to 32 rows, where it measured faster
+  than the BF16 GEMVs on 8192-hidden MLP, output-projection and LM-head
+  shards (MI355X, cold weights); larger calls run as 32-row chunks.
+- One binary per (shape, row bucket 16 / 32 / 64 / 128); `M` is a runtime
+  argument, and a row's bits do not depend on the other rows of its bucket.
+
+#### Algorithm
+
+The dense GEMV's MFMA tile with 16-byte weight loads of 16 E4M3 values. The
+tile's `BLOCK_M` covers every row, so each weight byte is read once; the K
+step shrinks with `BLOCK_M` to keep the activation tile within 32 VGPRs a
+buffer. At most 32 outputs per program, so wide outputs (a vocabulary shard)
+launch several programs per CU. Weights pass through LDS in E4M3 and upcast
+(`v_cvt_scalef32_pk_bf16_fp8`) in the MFMA operand layout.
 
 ### gfx950 MXFP8 projection
 
@@ -588,7 +668,9 @@ quantize the result for `wo_b` (`gluon_grouped_bf16_projection_fp8_gfx1250`).
   contiguous `B` `[G, N, K]`, and returns contiguous BF16 `[M, G, N]`. With
   quantization (`N` divisible by 32) it returns E4M3 codes `[M, G * N]` and
   uint8 UE8M0 scales `[M, G * N / 32]`, bit-identical to quantizing the BF16
-  result with `gluon_quantize_fp8_group32_ue8m0_gfx1250`.
+  result of the same K split with `gluon_quantize_fp8_group32_ue8m0_gfx1250`.
+  Up to 32 rows that split differs from the unquantized form's, so a sum can
+  round to an adjacent BF16 value before it is quantized.
 
 #### Algorithm
 
@@ -1451,6 +1533,11 @@ descriptor based at that page. Prefetches past the split repeat its last page,
 since a masked copy becomes a branch followed by `s_waitcnt vmcnt(0)`; only
 pages crossing the split's end or a row's causal end are masked. The loop waits
 for the prefetches before the epilogue reuses their LDS.
+
+A long sliding window in four-wave blocks (more than 16 pages) streams each
+split through the same pipeline two deep: one page is in flight while another
+is consumed, and every page is masked to the rows' windows. Its rows equal the
+single-buffered loop's bit for bit.
 
 Every split stores its partial and LSE (-inf for rows without keys in it), so
 the reduce does not read cache lengths.

@@ -386,9 +386,14 @@ def select_gated_residual_mix_kernel(
     Returns:
         The selected kernel and the selection traits.
     """
-    from tokenspeed_kernel.ops.residual.cute_fused import supports_fused_hc
+    from tokenspeed_kernel.ops.residual.cute_fused import (
+        prefers_fused_hc,
+        supports_fused_hc,
+        supports_fused_hc_shape,
+    )
 
     rows = int(flat.shape[0])
+    grid_supported = supports_fused_hc(flat.device)
 
     traits = {
         "prefill_up_mix": (
@@ -397,7 +402,12 @@ def select_gated_residual_mix_kernel(
             and packed_up_weight.data_ptr() % 16 == 0
         ),
         "weights_independent": weights_independent,
-        "fused_grid_supported": supports_fused_hc(flat.device),
+        "fused_grid_supported": grid_supported,
+        "fused_shape_supported": supports_fused_hc_shape(
+            hc_count, hidden_size, lowrank
+        ),
+        "fused_workload_supported": grid_supported
+        and prefers_fused_hc(rows, hc_count, hidden_size, lowrank),
         "fused_tma_aligned": all(
             tensor.data_ptr() % 16 == 0
             for tensor in (flat, projection_weight, up_weight)
@@ -841,6 +851,75 @@ def try_mhc_shifted_post_pre_norm(
     )
 
 
+def try_mhc_shifted_post_pre_norm_quantize_fp8(
+    x: _torch.Tensor,
+    residual: _torch.Tensor,
+    pre: _torch.Tensor,
+    post: _torch.Tensor,
+    comb: _torch.Tensor,
+    weight: _torch.Tensor,
+    scale: _torch.Tensor,
+    base: _torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+    norm_weight: _torch.Tensor,
+    norm_eps: float,
+) -> (
+    tuple[
+        _torch.Tensor,
+        _torch.Tensor,
+        _torch.Tensor,
+        _torch.Tensor,
+        _torch.Tensor,
+        _torch.Tensor,
+        _torch.Tensor,
+    ]
+    | None
+):
+    """``try_mhc_shifted_post_pre_norm`` that also quantizes the normalized input.
+
+    Takes the same arguments and has the same contract. Returns the five
+    outputs of ``try_mhc_shifted_post_pre_norm`` followed by the input's E4M3
+    codes ``[T,H]`` and int32 packed group-32 UE8M0 scales ``[T,H/128]``,
+    strided ``(1, T padded to 4)`` as ``fp8_projection`` reads them; or None
+    for unsupported inputs. H must also be a multiple of 128 (always true
+    given the multiple of 1024).
+    """
+    from tokenspeed_kernel.ops.residual.deep_gemm import mega_mhc_eligible
+
+    if not mega_mhc_eligible(
+        x, residual, pre, post, comb, weight, scale, base, sinkhorn_iters, norm_weight
+    ):
+        return None
+    try:
+        kernel = select_kernel(
+            "residual",
+            "mhc_shifted_post_pre_norm_quantize_fp8",
+            format_signature(residual=dense_tensor_format(residual.dtype)),
+            traits=None,
+            override=None,
+            solution=None,
+        )
+    except NoKernelFoundError:
+        return None
+    return kernel(
+        x,
+        residual,
+        pre,
+        post,
+        comb,
+        weight,
+        scale,
+        base,
+        rms_eps,
+        hc_eps,
+        sinkhorn_iters,
+        norm_weight,
+        norm_eps,
+    )
+
+
 def mhc_apply_pre(
     residual: _torch.Tensor,
     pre: _torch.Tensor,
@@ -1174,6 +1253,7 @@ __all__ = [
     "post_norm_residual_pre_norm_bf16",
     "residual_gate_coefficients",
     "try_mhc_shifted_post_pre_norm",
+    "try_mhc_shifted_post_pre_norm_quantize_fp8",
 ]
 
 

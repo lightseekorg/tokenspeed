@@ -27,7 +27,7 @@ attention kernels in ROCm/gfx950-gluon-tutorials.
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel_amd._scheduling import sched_compile_options
+from tokenspeed_kernel_amd._extern import extern_compile_options
 from tokenspeed_kernel_amd._triton import gl, gluon
 from tokenspeed_kernel_amd.ops.gfx950.attention._common import (
     _INV_LN2,
@@ -876,7 +876,7 @@ def launch_gluon_mla_prefill_8wave_gfx950(
         num_stages=1,
         # Keep the overlapping matrix and softmax state in one register class.
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
-        **sched_compile_options(),
+        **extern_compile_options(),
     )
 
     if return_lse:

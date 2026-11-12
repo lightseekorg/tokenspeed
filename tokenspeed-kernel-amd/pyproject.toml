@@ -25,4 +25,4 @@ license-files = ["LICENSE", "THIRDPARTYNOTICES"]
 where = ["python"]
 
 [tool.setuptools.package-data]
-"tokenspeed_kernel_amd" = ["sched_barrier.ll", "ops/gemm/configs/*.csv"]
+"tokenspeed_kernel_amd" = ["_intrinsics/*.ll", "ops/gemm/configs/*.csv"]

@@ -176,6 +176,7 @@ def _build_processor(
         tp_rank=tp_rank,
         tp_size=tp_size,
         tp_group=tp_group,
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
 

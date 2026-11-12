@@ -184,7 +184,7 @@ pub(crate) struct Pair {
     pub(crate) decode: DecodePeer,
     pub(crate) decode_outbox: ts_pd::DecodeOutbox,
     pub(crate) bootstrap: BootstrapInfo,
-    _server: BootstrapServer,
+    pub(crate) _server: BootstrapServer,
 }
 
 pub(crate) fn pair(
@@ -203,7 +203,25 @@ pub(crate) fn pair_with(
     bootstrap_timeout: Duration,
     step_address: Option<usize>,
 ) -> Pair {
-    let server = BootstrapServer::start(0, Registry::CacheLayouts).unwrap();
+    pair_on_port(
+        library,
+        source,
+        destination,
+        bootstrap_timeout,
+        step_address,
+        0,
+    )
+}
+
+pub(crate) fn pair_on_port(
+    library: PathBuf,
+    source: &[u8],
+    destination: &[u8],
+    bootstrap_timeout: Duration,
+    step_address: Option<usize>,
+    port: u16,
+) -> Pair {
+    let server = BootstrapServer::start(port, Registry::CacheLayouts).unwrap();
     let port = server.port();
     let source_base = source.as_ptr() as u64;
     let parse = |wire: String| Contract::from_wire(wire.as_bytes()).unwrap();
@@ -307,6 +325,38 @@ pub(crate) fn next_event(peer: &mut dyn TransferPeer, mesh: &mut Mesh, group: &G
         assert!(Instant::now() < deadline, "no transfer event");
         thread::sleep(Duration::from_millis(5));
     }
+}
+
+/// Wait for failure and retirement, whether they arrive in one poll or separately.
+pub(crate) fn expect_cancelled(
+    peer: &mut dyn TransferPeer,
+    rid: &str,
+    mesh: &mut Mesh,
+    group: &Group,
+) {
+    let expected = [
+        PdEvent::Failed(rid.to_owned()),
+        PdEvent::Stopped(rid.to_owned()),
+    ];
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut seen = Vec::new();
+    while seen.len() < expected.len() {
+        seen.extend(peer.poll(mesh, group).unwrap());
+        assert!(
+            expected.starts_with(&seen),
+            "unexpected cancellation events: {seen:?}"
+        );
+        if seen == expected {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "cancellation did not retire: {seen:?}"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(seen, expected);
+    assert!(!peer.has_in_flight());
 }
 
 /// An arena's bytes: a pattern, page by page.

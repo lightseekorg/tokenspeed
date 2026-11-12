@@ -139,8 +139,12 @@ TEST_F(KvCacheLifecycleTestSuite, AvailableLcmBlocksReportsSharedPool) {
 }
 
 // The per-step gauge splits the pool into empty, active and cache-only
-// parents without asking who holds each child.
+// parents without asking who holds each child. Only prefix caching keeps a
+// finished request's pages as cache-only parents, and the suite disables it.
 TEST_F(KvCacheLifecycleTestSuite, EmptyAndActiveLcmBlocksPartitionThePool) {
+    config_.disable_prefix_cache = false;
+    scheduler_ = std::make_unique<Scheduler>(config_);
+
     const std::int32_t total = scheduler_->EmptyLcmBlocks();
     EXPECT_EQ(total, scheduler_->AvailableLcmBlocks());
     EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0);
@@ -157,6 +161,101 @@ TEST_F(KvCacheLifecycleTestSuite, EmptyAndActiveLcmBlocksPartitionThePool) {
     EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0);
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), total) << "the finished request's pages are evictable";
     EXPECT_LT(scheduler_->EmptyLcmBlocks(), total) << "but they stay resident as cache-only parents";
+}
+
+// With prefix caching disabled no admission can hit a published page, in
+// either tier: a running request's completed pages and its finish publish
+// nothing, so its pages return straight to the free pool instead of staying
+// resident as cache-only parents (SchedulerConfig::PublishesCompletedPages).
+TEST_F(KvCacheLifecycleTestSuite, FinishedPagesReturnToThePoolWithoutPrefixCaching) {
+    for (const bool host_cache : {false, true}) {
+        SCOPED_TRACE(host_cache ? "with a Host cache" : "without a Host cache");
+        config_.disable_l2_cache = !host_cache;
+        scheduler_ = std::make_unique<Scheduler>(config_);
+        const std::int32_t total = scheduler_->EmptyLcmBlocks();
+        EXPECT_EQ(total, scheduler_->AvailableLcmBlocks());
+        EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0);
+
+        // More than one page so a page actually completes mid-request.
+        Submit(MakeRequestSpec("r1", /*num_pages=*/2));
+        PlanOnce();
+        SendForwardDone("r1", {42});
+        EXPECT_GT(scheduler_->ActiveLcmBlocks(), 0);
+        EXPECT_EQ(scheduler_->EmptyLcmBlocks() + scheduler_->ActiveLcmBlocks(), total)
+            << "a live request's pages are active; none are cache-only";
+
+        int tok = 43;
+        for (int step = 0; step < 4; ++step) {
+            PlanOnce();
+            EXPECT_EQ(scheduler_->EmptyLcmBlocks() + scheduler_->ActiveLcmBlocks(), total)
+                << "still no cache-only parents mid-decode";
+            SendForwardDone("r1", {tok++});
+        }
+
+        SendFinish("r1");
+        PlanOnce();
+        EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0);
+        EXPECT_EQ(scheduler_->EmptyLcmBlocks(), total)
+            << "with prefix caching disabled the finished request leaves no cache-only parents";
+        EXPECT_EQ(scheduler_->AvailableLcmBlocks(), total);
+    }
+}
+
+// One full-attention group with 8-token pages and no Host cache: a decode
+// step needs a new block once every 8 tokens.
+class DecodeInPlaceReserveTestSuite : public SchedulerTestSuite {
+protected:
+    static constexpr std::int32_t kPageTokens = 8;
+
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg{};
+        cfg.prefix_granularity = kPageTokens;
+        cfg.device_allocator.total_pages = 32;
+        cfg.max_scheduled_tokens = 64;
+        cfg.max_batch_size = 8;
+        cfg.disable_l2_cache = true;
+        cfg.disable_prefix_cache = true;
+        cfg.cache_groups.push_back(CacheGroupConfig{
+            .group_id = "full_attention",
+            .block_granularity = cfg.prefix_granularity,
+            .total_pages = cfg.device_allocator.total_pages,
+            .attn_kind = AttnKind::kFull,
+        });
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+};
+
+// Without prefix caching a decode step publishes nothing, so one that needs no
+// new block consumes its reserve in place: only a step whose block row grows
+// runs an admission (SchedulerConfig::PublishesCompletedPages).
+TEST_F(DecodeInPlaceReserveTestSuite, DecodeAdmitsOnlyWhenItOpensABlock) {
+    Submit(MakeRequestSpec("r1", /*num_pages=*/2));
+    ExecutionPlan prefill_plan = PlanOnce();
+    const ForwardBatch* prefill = FindForwardBatch(prefill_plan);
+    ASSERT_NE(prefill, nullptr);
+    std::size_t row_blocks = prefill->BlockTables().at("full_attention").at(0).size();
+    SendForwardDone("r1", {42});
+
+    const std::uint64_t admissions_before = SchedulerTestAccess::DecodeAdmissions(*scheduler_);
+    constexpr std::int32_t kSteps = 2 * kPageTokens;
+    std::uint64_t steps_opening_a_block = 0;
+    int tok = 43;
+    for (std::int32_t step = 0; step < kSteps; ++step) {
+        ExecutionPlan plan = PlanOnce();
+        const ForwardBatch* decode = FindForwardBatch(plan);
+        ASSERT_NE(decode, nullptr);
+        const std::size_t blocks = decode->BlockTables().at("full_attention").at(0).size();
+        if (blocks > row_blocks) {
+            ++steps_opening_a_block;
+        }
+        row_blocks = blocks;
+        SendForwardDone("r1", {tok++});
+    }
+    ASSERT_GT(steps_opening_a_block, 0u);
+    ASSERT_LT(steps_opening_a_block, static_cast<std::uint64_t>(kSteps));
+    EXPECT_EQ(SchedulerTestAccess::DecodeAdmissions(*scheduler_) - admissions_before, steps_opening_a_block)
+        << "a decode step that opens no block consumes its reserve in place";
 }
 
 TEST_F(KvCacheLifecycleTestSuite, TwoRequestsBatchBlockTables) {

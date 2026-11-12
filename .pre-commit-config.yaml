@@ -51,3 +51,11 @@ repos:
         args:
           - --config
           - tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/.markdownlint.yaml
+  - repo: local
+    hooks:
+      # Runtime-only changes skip the kernel unit tests, so those never import it.
+      - id: kernel-tests-without-runtime
+        name: kernel tests do not import the runtime
+        language: pygrep
+        entry: '^\s*(from|import)\s+tokenspeed(\.|\s|$)'
+        files: ^tokenspeed-kernel/test/.*\.py$

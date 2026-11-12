@@ -28,12 +28,15 @@ from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 global_server_args_dict: dict = {
+    "model": None,
+    "revision": None,
     "disaggregation_mode": ServerArgs.disaggregation_mode,
     "attention_backend": ServerArgs.attention_backend,
     "sampling_backend": ServerArgs.sampling_backend,
     "attention_use_fp4_indexer_cache": ServerArgs.attention_use_fp4_indexer_cache,
     "deepseek_v4_mega_moe_max_num_tokens": ServerArgs.deepseek_v4_mega_moe_max_num_tokens,
     "deepseek_v4_indexer_prefill_max_logits_mb": ServerArgs.deepseek_v4_indexer_prefill_max_logits_mb,
+    "disable_deepseek_v41_token_blacklist": ServerArgs.disable_deepseek_v41_token_blacklist,
     "engram_host_table": ServerArgs.engram_host_table,
     "engram_host_table_dir": ServerArgs.engram_host_table_dir,
     "engram_host_table_layout": ServerArgs.engram_host_table_layout,
@@ -95,12 +98,15 @@ def global_server_args_dict_update(server_args: ServerArgs):
     pdl_enabled(not server_args.disable_pdl)
     global_server_args_dict.update(
         {
+            "model": server_args.model,
+            "revision": server_args.revision,
             "disaggregation_mode": server_args.disaggregation_mode,
             "attention_backend": server_args.attention_backend,
             "sampling_backend": server_args.sampling_backend,
             "attention_use_fp4_indexer_cache": server_args.attention_use_fp4_indexer_cache,
             "deepseek_v4_mega_moe_max_num_tokens": server_args.deepseek_v4_mega_moe_max_num_tokens,
             "deepseek_v4_indexer_prefill_max_logits_mb": server_args.deepseek_v4_indexer_prefill_max_logits_mb,
+            "disable_deepseek_v41_token_blacklist": server_args.disable_deepseek_v41_token_blacklist,
             "engram_host_table": server_args.engram_host_table,
             "engram_host_table_dir": server_args.engram_host_table_dir,
             "engram_host_table_layout": server_args.engram_host_table_layout,

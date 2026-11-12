@@ -108,6 +108,7 @@ from tokenspeed.runtime.layers.hyperconnection import (
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.layers.ple_lookup import PLELookup
+from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
 from tokenspeed.runtime.layers.quantization.modelopt_mixed import ModelOptMixedConfig
 from tokenspeed.runtime.layers.quantization.mxfp4 import Mxfp4Config
 from tokenspeed.runtime.layers.quantization.utils import should_exclude_quant_module
@@ -178,7 +179,7 @@ def test_qwen4_exp_nextn_preserves_quantized_mtp_config() -> None:
     assert qwen4_exp_nextn._resolve_mtp_quant_config(excluded) is None
 
 
-def test_qwen4_exp_nextn_drops_quark_quantization_for_excluded_mtp() -> None:
+def test_qwen4_exp_nextn_resolves_mtp_linear_exclusions() -> None:
     mtp_linear_modules = [
         f"mtp.layers.0.{module}"
         for module in (
@@ -192,10 +193,15 @@ def test_qwen4_exp_nextn_drops_quark_quantization_for_excluded_mtp() -> None:
         )
     ]
     # Quark lists linear modules only; the fused MTP experts are never named.
-    excluded = Mxfp4Config(ignored_layers=["lm_head", *mtp_linear_modules])
+    excluded = Mxfp4Config(
+        quant_method="quark", ignored_layers=["lm_head", *mtp_linear_modules]
+    )
     assert qwen4_exp_nextn._resolve_mtp_quant_config(excluded) is None
 
-    quantized = Mxfp4Config(ignored_layers=["lm_head"])
+    # An MXFP4 export can keep the linears BF16 and pack only routed experts.
+    quantized = Mxfp4Config.from_config(
+        {"quant_method": "mxfp4", "ignored_layers": ["lm_head", *mtp_linear_modules]}
+    )
     assert qwen4_exp_nextn._resolve_mtp_quant_config(quantized) is quantized
 
 
@@ -271,6 +277,32 @@ def test_qwen4_exp_decoder_policies_are_model_local() -> None:
     assert Qwen4ExpAttentionDecoderLayer._uses_sparse_moe(moe_qwen38)
     assert Qwen4ExpAttentionDecoderLayer._uses_attention_output_gate(moe_qwen38)
     assert moe_qwen38.model_type == "qwen4_exp_text"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_qwen4_exp_attention_layer_gates_its_output_whatever_the_config_says() -> None:
+    config = Qwen4ExpTextConfig(
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=32,
+        layer_types=["linear_attention", "full_attention"],
+        hc_count=2,
+        hc_lowrank=8,
+        num_experts=None,
+        attn_output_gate=False,
+    )
+    with torch.device("cuda"):
+        layer = Qwen4ExpAttentionDecoderLayer(
+            config, Mapping(rank=0, world_size=1), 1, prefix="model.layers.1.self_attn"
+        )
+
+    # The query projection carries a gate per head on top of q, k and v.
+    assert layer.attn_output_gate
+    assert layer.qkv_proj.weight.shape[0] == (2 * 2 + 1 + 1) * 32
 
 
 def test_qwen4_exp_config_normalizes_layer_and_ple_geometry() -> None:
@@ -1601,9 +1633,16 @@ def test_attention_dp_mtp_shares_target_head_layout(monkeypatch, rank, attn_tp):
 
 
 @pytest.mark.parametrize("rank", range(8))
-def test_attention_dp_mtp_shares_vocab_sharded_head(monkeypatch, rank):
+@pytest.mark.parametrize("attn_tp,head_tp", [(1, 2), (2, 8)])
+def test_attention_dp_mtp_shares_vocab_sharded_head(
+    monkeypatch, rank, attn_tp, head_tp
+):
     mapping = Mapping(
-        rank=rank, world_size=8, attn_tp_size=1, attn_dp_size=8, lm_head_tp_size=2
+        rank=rank,
+        world_size=8,
+        attn_tp_size=attn_tp,
+        attn_dp_size=8 // attn_tp,
+        lm_head_tp_size=head_tp,
     )
     config = PretrainedConfig(
         hc_count=4,
@@ -1624,10 +1663,11 @@ def test_attention_dp_mtp_shares_vocab_sharded_head(monkeypatch, rank):
     start = mapping.lm_head.tp_rank * width
     with torch.no_grad():
         target.lm_head.weight.copy_(full_weight[start : start + width])
-    draft.set_embed_and_head(target.model.embed_tokens.weight, target.lm_head.weight)
-    rows = [1 + r % 3 for r in range(8)]
+    draft.set_embed_and_head_module(target.model.embed_tokens.weight, target.lm_head)
+    assert draft.lm_head is target.lm_head
+    rows = [1 + (r // attn_tp) % 3 for r in range(8)]
     hidden = [
-        torch.arange(n * 4, dtype=torch.float32).reshape(n, 4) / 7 + r
+        torch.arange(n * 4, dtype=torch.float32).reshape(n, 4) / 7 + r // attn_tp
         for r, n in enumerate(rows)
     ]
 
@@ -1658,6 +1698,34 @@ def test_attention_dp_mtp_shares_vocab_sharded_head(monkeypatch, rank):
             dim=1,
         )
 
+    def reduce_hidden(local, group):
+        assert group == mapping.lm_head.tp_group
+        distinct = torch.cat(hidden[::attn_tp])
+        expected = torch.zeros_like(distinct)
+        if rank % attn_tp == 0:
+            start = sum(rows[:rank:attn_tp])
+            expected[start : start + rows[rank]] = hidden[rank]
+        torch.testing.assert_close(local, expected)
+        return distinct
+
+    def gather_vocab(output, local, group):
+        assert group == mapping.lm_head.tp_group
+        all_hidden = torch.cat(hidden[::attn_tp])
+        torch.testing.assert_close(
+            local, torch.nn.functional.linear(all_hidden, draft.lm_head.weight)
+        )
+        output.copy_(
+            torch.cat(
+                [
+                    torch.nn.functional.linear(all_hidden, shard)
+                    for shard in full_weight.split(width, dim=0)
+                ],
+                dim=0,
+            )
+        )
+
+    monkeypatch.setattr(logits_module, "all_reduce", reduce_hidden)
+    monkeypatch.setattr(logits_module, "all_gather_single", gather_vocab)
     monkeypatch.setattr(logits_module, "token_all_gather", gather)
     monkeypatch.setattr(logits_module, "all_to_all_transpose", transpose)
     metadata = LogitsMetadata(
@@ -1672,6 +1740,35 @@ def test_attention_dp_mtp_shares_vocab_sharded_head(monkeypatch, rank):
     torch.testing.assert_close(
         actual, torch.nn.functional.linear(hidden[rank], full_weight)
     )
+
+    # Exercise the model wrapper too: MTP step zero receives four verify rows
+    # per request but the transformer narrows them before the LM head. Only
+    # transformer weights/GPU input fusion and collective transport are mocked.
+    def transformer_forward(input_ids, positions, ctx, *, input_embeds):
+        return input_embeds[::4], None
+
+    monkeypatch.setattr(draft.model, "forward", transformer_forward)
+    expanded = hidden[rank].repeat_interleave(4, dim=0)
+    monkeypatch.setattr(draft, "_fuse_inputs", lambda embedding, captured: expanded)
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=rows[rank],
+        num_extends=0,
+        input_num_tokens=4 * rows[rank],
+        output_layout=None,
+        forward_mode=ForwardMode.DECODE,
+        all_decode_or_idle=True,
+        global_num_tokens=[4 * n for n in rows],
+        global_bs=rows,
+        gather_ids=4 * torch.arange(rows[rank]) + 3,
+    )
+    ids = torch.zeros(4 * rows[rank], dtype=torch.int64)
+    result = draft(ctx, ids, torch.arange(ids.numel()), captured_hidden_states=expanded)
+    torch.testing.assert_close(
+        result.next_token_logits, torch.nn.functional.linear(hidden[rank], full_weight)
+    )
+    assert ctx.collective_global_num_tokens is None
 
 
 def test_qwen4_exp_nextn_reads_nested_mtp_index_sharing_config() -> None:
@@ -3598,6 +3695,182 @@ def test_ple_prequantized_checkpoint_scale_is_applied(
     assert loaded == {"ple.lookup.ngram_embedding.weight"}
 
 
+_PLE_LAYER_PREFIX = "model.language_model.layers.1.ple"
+_PLE_TABLE_PREFIX = f"{_PLE_LAYER_PREFIX}.ple_embedding.ngram_embedding"
+
+
+def _checkpoint_quant_config(kind: str):
+    """The quantization config each checkpoint format declares, if any."""
+
+    if kind == "none":
+        return None
+    if kind.startswith("modelopt"):
+        layers = {"model.language_model.layers.0.mlp.experts": {"quant_algo": "NVFP4"}}
+        if kind == "modelopt_fp8_table":
+            layers[_PLE_TABLE_PREFIX] = {"quant_algo": "FP8"}
+        return ModelOptMixedConfig.from_config(
+            {"quant_algo": "MIXED_PRECISION", "quantized_layers": layers}
+        )
+    fp8 = {
+        "quant_method": "fp8",
+        "activation_scheme": "dynamic",
+        "weight_block_size": [128, 128],
+        # As in Qwen/Qwen3.8-Flash-Next-FP8, the PLE projections stay BF16.
+        "modules_to_not_convert": [
+            f"{_PLE_LAYER_PREFIX}.key_proj",
+            f"{_PLE_LAYER_PREFIX}.value_proj",
+        ],
+    }
+    if kind == "hf_fp8_table":
+        fp8["modules_to_convert"] = ["ple.ple_embedding.ngram_embedding"]
+    return Fp8Config.from_config(fp8)
+
+
+def _tiny_ple_config(**overrides) -> Qwen4ExpTextConfig:
+    """A two-layer Qwen4-Exp text config whose second layer has PLE.
+
+    ``ngram_vocab_size_base`` is tiny so the n-gram table is small; the hash
+    geometry that decides which rows are read is unaffected by it.
+    """
+
+    kwargs = dict(
+        vocab_size=128,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=16,
+        layer_types=["linear_attention", "full_attention"],
+        ple_layer_ids=[2],
+        ngram_size=3,
+        heads_per_ngram=4,
+        ngram_vocab_size_base=257,
+        make_ngram_vocab_size_divisible_by=8,
+        hc_count=2,
+        num_experts=None,
+        eos_token_id=7,
+    )
+    kwargs.update(overrides)
+    return Qwen4ExpTextConfig(**kwargs)
+
+
+@pytest.mark.parametrize(
+    ("checkpoint", "ple_embed_dtype", "expect_fp8"),
+    [
+        ("none", None, False),
+        ("none", "float8_e4m3fn", True),
+        ("modelopt", None, False),
+        ("modelopt_fp8_table", None, True),
+        ("hf_fp8", None, False),
+        ("hf_fp8_table", None, True),
+    ],
+)
+def test_ple_table_storage_follows_checkpoint(
+    checkpoint: str, ple_embed_dtype: str | None, expect_fp8: bool
+) -> None:
+    """Without ``ple_embed_dtype`` the n-gram table keeps the checkpoint's format.
+
+    ModelOpt mixed-precision exports list an FP8 table in ``quantized_layers``
+    and Hugging Face fp8 exports in ``modules_to_convert``; either keeps the
+    table in FP8, and a checkpoint that declares neither stores the compute
+    dtype. An explicit ``float8_e4m3fn`` stores FP8 regardless.
+    """
+
+    layer = Qwen4ExpPLELayer(
+        _tiny_ple_config(ple_embed_dtype=ple_embed_dtype, ple_offload_embedding=False),
+        Mapping(rank=0, world_size=1),
+        layer_id=1,
+        ple_layer_index=0,
+        quant_config=_checkpoint_quant_config(checkpoint),
+        prefix=_PLE_LAYER_PREFIX,
+    )
+
+    expected = torch.float8_e4m3fn if expect_fp8 else torch.get_default_dtype()
+    assert layer.ple_embedding.lookup.ngram_embedding.weight.dtype == expected
+
+
+def test_ple_table_rejects_unsupported_storage_dtype() -> None:
+    config = _tiny_ple_config(ple_embed_dtype="bfloat16", ple_offload_embedding=False)
+
+    with pytest.raises(ValueError, match="ple_embed_dtype"):
+        Qwen4ExpNGramEmbedding(
+            config, Mapping(rank=0, world_size=1), 64, 0, None, "ple_embedding"
+        )
+
+
+def test_fp8_config_matches_modules_to_convert_on_module_boundaries() -> None:
+    quant_config = _checkpoint_quant_config("hf_fp8_table")
+
+    assert quant_config.stores_fp8_embedding(_PLE_TABLE_PREFIX)
+    assert quant_config.stores_fp8_embedding("ple.ple_embedding.ngram_embedding")
+    assert not quant_config.stores_fp8_embedding(
+        "model.language_model.layers.1.xple.ple_embedding.ngram_embedding"
+    )
+
+
+@_requires_cuda
+@pytest.mark.parametrize("scale_first", [False, True])
+@pytest.mark.parametrize("offload", [False, True])
+def test_ple_fp8_checkpoint_table_reads_like_dequantized_table(
+    offload: bool, scale_first: bool
+) -> None:
+    """Keeping an FP8 checkpoint table in FP8 returns the dequantized rows.
+
+    The kept table holds the checkpoint payload verbatim and applies the
+    per-tensor scale at lookup; a table stored in the compute dtype applies the
+    same scale at load. Lookups through both must match exactly.
+    """
+
+    config = _tiny_ple_config(ple_offload_embedding=offload, split_ngram_parts=1)
+    mapping = Mapping(rank=0, world_size=1)
+    previous_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        with torch.device("cuda"):
+            kept, dequantized = [
+                Qwen4ExpNGramEmbedding(
+                    config,
+                    mapping,
+                    64,
+                    0,
+                    _checkpoint_quant_config(checkpoint),
+                    f"{_PLE_LAYER_PREFIX}.ple_embedding",
+                )
+                for checkpoint in ("modelopt_fp8_table", "modelopt")
+            ]
+    finally:
+        torch.set_default_dtype(previous_dtype)
+    assert kept.lookup.embed_store_dtype == torch.float8_e4m3fn
+    assert dequantized.lookup.embed_store_dtype is None
+
+    torch.manual_seed(6)
+    rows = kept.lookup.ngram_embedding.org_vocab_size
+    payload = (
+        (torch.randn(rows, kept.head_dim) * 64).clamp(-448, 448).to(torch.float8_e4m3fn)
+    )
+    shard = ("ple.ngram_embedding.shard_0.weight", payload)
+    # The scale of the released checkpoints' table.
+    scale = (
+        "ple.ngram_embedding.weight_scale",
+        torch.tensor([1.9931793212890625e-4], dtype=torch.bfloat16),
+    )
+    for embedding in (kept, dequantized):
+        root = torch.nn.Module()
+        root.ple = embedding
+        load_qwen4_exp_weights(
+            root,
+            config,
+            mapping,
+            [scale, shard] if scale_first else [shard, scale],
+            include_visual=False,
+        )
+
+    assert torch.equal(kept.lookup.ngram_embedding.weight[:rows].cpu(), payload)
+    contexts = torch.randint(0, 128, (96, 3), device="cuda")
+    torch.testing.assert_close(kept(contexts), dequantized(contexts), rtol=0, atol=0)
+
+
 def test_should_exclude_quant_module_expands_fused_members() -> None:
     from tokenspeed.runtime.layers.quantization.utils import (
         should_exclude_quant_module,
@@ -3726,38 +3999,18 @@ def _lookup_flat(embedding, input_ids, initial, req, col, starts):
 def _ngram_embedding_pair(
     store_fp8: bool,
 ) -> tuple[Qwen4ExpNGramEmbedding, Qwen4ExpNGramEmbedding]:
-    """A device-resident and a host-offloaded n-gram table holding equal rows.
+    """A device-resident and a host-offloaded n-gram table holding equal rows."""
 
-    ``ngram_vocab_size_base`` is tiny here so the two tables fit side by side;
-    the hash geometry that decides which rows are read is unaffected by it.
-    """
-
-    kwargs = dict(
-        vocab_size=128,
-        hidden_size=32,
-        intermediate_size=64,
-        num_hidden_layers=2,
-        num_attention_heads=2,
-        num_key_value_heads=1,
-        head_dim=16,
-        layer_types=["linear_attention", "full_attention"],
-        ple_layer_ids=[2],
-        ngram_size=3,
-        heads_per_ngram=4,
-        ngram_vocab_size_base=257,
-        make_ngram_vocab_size_divisible_by=8,
-        ple_embed_dtype="float8_e4m3fn" if store_fp8 else None,
-        hc_count=2,
-        num_experts=None,
-        eos_token_id=7,
-    )
     mapping = Mapping(rank=0, world_size=1)
     built = []
     for offload in (False, True):
-        config = Qwen4ExpTextConfig(**kwargs, ple_offload_embedding=offload)
+        config = _tiny_ple_config(
+            ple_embed_dtype="float8_e4m3fn" if store_fp8 else None,
+            ple_offload_embedding=offload,
+        )
         with torch.device("cuda"):
             built.append(
-                Qwen4ExpNGramEmbedding(config, mapping, 64, 0, "ple_embedding")
+                Qwen4ExpNGramEmbedding(config, mapping, 64, 0, None, "ple_embedding")
             )
     device, host = built
 
@@ -3860,30 +4113,13 @@ def test_ple_host_table_skips_device_allocation(
     """
 
     caplog.set_level(logging.INFO, logger="tokenspeed.runtime.layers.qwen4_exp_ple")
-    config = Qwen4ExpTextConfig(
-        vocab_size=128,
-        hidden_size=32,
-        intermediate_size=64,
-        num_hidden_layers=2,
-        num_attention_heads=2,
-        num_key_value_heads=1,
-        head_dim=16,
-        layer_types=["linear_attention", "full_attention"],
-        ple_layer_ids=[2],
-        ngram_size=3,
-        heads_per_ngram=4,
-        ngram_vocab_size_base=1_000_003,
-        make_ngram_vocab_size_divisible_by=8,
-        hc_count=2,
-        num_experts=None,
-        eos_token_id=7,
-    )
+    config = _tiny_ple_config(ngram_vocab_size_base=1_000_003)
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
     before = torch.cuda.max_memory_allocated()
     with torch.device("cuda"):
         embedding = Qwen4ExpNGramEmbedding(
-            config, Mapping(rank=0, world_size=1), 64, 0, "ple_embedding"
+            config, Mapping(rank=0, world_size=1), 64, 0, None, "ple_embedding"
         )
     growth = torch.cuda.max_memory_allocated() - before
 

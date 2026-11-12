@@ -30,6 +30,7 @@ from ci_system.ci_register import register_cuda_ci
 
 from tokenspeed.runtime.engine.scheduler_utils import make_config
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates
+from tokenspeed.runtime.execution.types import StopCriteria
 from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
     CacheBatchMetadata,
 )
@@ -223,6 +224,7 @@ def _scheduled_batch():
         host_group_packing=(),
         max_retracted_requests=0,
         host_write_policy="write_through",
+        prefill_decode_interval=0,
         storage_config=None,
         enable_kv_cache_events=False,
         decode_input_tokens=1,
@@ -318,3 +320,60 @@ def test_masked_state_tables_pads_only_the_stopped_rows_of_state_groups(device, 
         assert torch.equal(masked[group_id][0].cpu(), expected[group_id][0])
         assert (masked[group_id][1] == -1).all()
     assert torch.equal(masked["history"].cpu(), expected["history"])
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize(
+    "old_criteria,new_criteria,valid_length,token,expected_length,expected_stopped",
+    [
+        (StopCriteria((), 9), StopCriteria((), 53), 21, 5, 1, False),
+        (StopCriteria((), 53), StopCriteria((), 9), 8, 5, 0, True),
+        (StopCriteria((5,), 53), StopCriteria((6,), 53), 21, 5, 1, False),
+        (StopCriteria((6,), 53), StopCriteria((5,), 53), 21, 5, 1, True),
+    ],
+    ids=["longer-budget", "shorter-budget", "removed-stop-token", "added-stop-token"],
+)
+def test_reused_rid_updates_stop_criteria(
+    device,
+    old_criteria,
+    new_criteria,
+    valid_length,
+    token,
+    expected_length,
+    expected_stopped,
+):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    states = RuntimeStates(2, 32, 32, 1, device)
+    states.bind_stop_criteria(["reused", "other"], [0, 1], [old_criteria, old_criteria])
+    slots = torch.tensor([0], dtype=torch.int64, device=device)
+    lengths = torch.tensor([valid_length], dtype=torch.int32, device=device)
+    # A later request may reuse both the public RID and its retired slot.
+    states.stopped[0] = True
+    states.reset_states(slots, lengths)
+    states.bind_stop_criteria(["reused"], [0], [new_criteria])
+    accepted = torch.ones(1, dtype=torch.int32, device=device)
+    states.apply_stop_conditions(
+        slots,
+        torch.tensor([token], dtype=torch.int32, device=device),
+        accepted,
+        torch.ones(1, dtype=torch.int32, device=device),
+        torch.empty(0, dtype=torch.int32, device=device),
+        num_extends=0,
+        num_prefill_outputs=0,
+        decode_width=1,
+        padding_index=2,
+    )
+    assert accepted.tolist() == [expected_length]
+    assert states.stopped[0].item() == expected_stopped
+    assert states.token_limits[:2].tolist() == [
+        new_criteria.token_limit,
+        old_criteria.token_limit,
+    ]
+    assert states.stop_token_ids[
+        1, : len(old_criteria.stop_token_ids)
+    ].tolist() == list(old_criteria.stop_token_ids)
+    # Binding an unchanged criterion must not clear the device's stop decision
+    # while a later overlapped forward is still draining.
+    states.bind_stop_criteria(["reused"], [0], [new_criteria])
+    assert states.stopped[0].item() == expected_stopped

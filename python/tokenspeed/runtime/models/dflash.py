@@ -28,14 +28,19 @@ import torch.nn.functional as F
 from tokenspeed_kernel.ops.embedding import apply_k_rope as _apply_k_rope
 from torch import nn
 
-from tokenspeed.runtime.distributed.comm_ops import all_reduce
+from tokenspeed.runtime.configs.model_config import (
+    configure_mha_attention,
+    configure_mla_attention,
+)
+from tokenspeed.runtime.configs.model_profile import ModelProfile
+from tokenspeed.runtime.distributed.comm_ops import all_gather, all_reduce
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.linear import (
+    ColumnParallelLinear,
     QKVParallelLinear,
-    ReplicatedLinear,
     RowParallelLinear,
 )
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
@@ -128,6 +133,7 @@ class DFlashAttention(nn.Module):
         )
 
         sliding_window_size = _get_dflash_layer_sliding_window(config, layer_id)
+        sliding_window_sink = _get_dflash_layer_window_sink(config, layer_id)
         self.attn = PagedAttention(
             self.num_heads,
             self.head_dim,
@@ -135,6 +141,7 @@ class DFlashAttention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
             sliding_window_size=sliding_window_size,
+            sliding_window_sink=sliding_window_sink,
             rotary_emb=self.rotary_emb,
             qk_norm=(self.q_norm, self.k_norm),
         )
@@ -185,6 +192,12 @@ class DFlashAttention(nn.Module):
 
 
 class DFlashDecoderLayer(nn.Module):
+    """A block-draft layer.
+
+    Subclasses swap its norms, attention or MLP through ``resolve_norm``,
+    ``resolve_attn`` and ``resolve_mlp``.
+    """
+
     def __init__(
         self,
         config,
@@ -194,31 +207,43 @@ class DFlashDecoderLayer(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        hidden_size = int(config.hidden_size)
-        eps = float(getattr(config, "rms_norm_eps", 1e-6))
+        self.config = config
         self.mapping = mapping
-        self.input_layernorm = RMSNorm(hidden_size, eps=eps)
-        self.self_attn = DFlashAttention(
-            config=config,
-            mapping=mapping,
-            layer_id=layer_id,
-            quant_config=quant_config,
-            prefix=add_prefix("self_attn", prefix),
+        self.layer_id = layer_id
+        self.quant_config = quant_config
+        self.input_layernorm = self.resolve_norm()
+        self.self_attn = self.resolve_attn(add_prefix("self_attn", prefix))
+        self.post_attention_layernorm = self.resolve_norm()
+        self.mlp = self.resolve_mlp(add_prefix("mlp", prefix))
+
+    def resolve_norm(self) -> nn.Module:
+        eps = float(getattr(self.config, "rms_norm_eps", 1e-6))
+        return RMSNorm(int(self.config.hidden_size), eps=eps)
+
+    def resolve_attn(self, prefix: str) -> nn.Module:
+        return DFlashAttention(
+            config=self.config,
+            mapping=self.mapping,
+            layer_id=self.layer_id,
+            quant_config=self.quant_config,
+            prefix=prefix,
         )
-        self.post_attention_layernorm = RMSNorm(hidden_size, eps=eps)
-        self.mlp = GatedMLP.tensor_parallel(
-            hidden_size=hidden_size,
-            intermediate_size=int(config.intermediate_size),
+
+    def resolve_mlp(self, prefix: str) -> nn.Module:
+        mapping = self.mapping
+        return GatedMLP.tensor_parallel(
+            hidden_size=int(self.config.hidden_size),
+            intermediate_size=int(self.config.intermediate_size),
             activation=gated_activation(
-                getattr(config, "hidden_act", "silu"), swiglu_limit=None
+                getattr(self.config, "hidden_act", "silu"), swiglu_limit=None
             ),
             tp_rank=mapping.dense.tp_rank,
             tp_size=mapping.dense.tp_size,
             tp_group=mapping.dense.tp_group,
             reduce_results=False,
             fusions=(),
-            quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
+            quant_config=self.quant_config,
+            prefix=prefix,
         )
 
     def forward(
@@ -274,8 +299,71 @@ class DFlashDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+def _is_dflash_mla_config(hf_config) -> bool:
+    """Whether the checkpoint asks for the MLA parameterization.
+
+    Reads both ``dflash_config.attention_mode`` (DFlash2's spelling) and
+    ``attention_method``, so a profiled draft configures the attention it would
+    have been given without a profile.
+    """
+    dflash_config = getattr(hf_config, "dflash_config", None)
+    if isinstance(dflash_config, dict) and dflash_config.get("attention_mode"):
+        return str(dflash_config["attention_mode"]).lower() == "mla"
+    method = str(getattr(hf_config, "attention_method", "") or "").lower()
+    return method.replace("-", "_").endswith("mla")
+
+
 class DFlashDraftModel(nn.Module, TargetCaptureConfigurator):
     decoder_layer_cls = DFlashDecoderLayer
+
+    @classmethod
+    def model_profile(cls, hf_config) -> ModelProfile:
+        """The draft's family facts, including its verified numerics.
+
+        ``cache_family`` stays None: a DFlash draft's layout is its attention
+        config's, and the same draft serves targets of different families -- an
+        ordinary MHA view under an ordinary target, the target's own recipe
+        under a custom family. Naming a family here would contradict a custom
+        target family and be refused.
+
+        The draft is listed under ``rl-bitwise``: it builds from the host's
+        standard layers, owns no MoE, returns hidden states with
+        ``next_token_logits=None`` (so the Megatron-order vocabulary fold is not
+        on its path), and reduces nothing of its own (``Mapping.replicated_for_draft``,
+        ``DFlash._replicate_head_over_attention_dp``). Three limits, none a
+        property of this class:
+
+        * The teacher-forced trainer-dump comparison (``docs/design/numerics.md``,
+          Acceptance) has not been run for a DFlash deployment: this is
+          development acceptance, not a trainer-alignment certification.
+        * Under ``--speculative-num-steps`` above 1 the verify is multi-token,
+          whose cache/scheduling invariance the envelope does not establish.
+        * A verify width the batch-invariant attention leaves do not cover cannot
+          meet the envelope whatever this listing says; a decode core planned
+          without ``batch_invariant`` is outside it.
+        """
+        return ModelProfile(
+            # Mirrors what ModelConfig derives for an unprofiled DFlash draft:
+            # MLA when the checkpoint asks for it, else the MHA default.
+            configure_attention=(
+                configure_mla_attention
+                if _is_dflash_mla_config(hf_config)
+                else configure_mha_attention
+            ),
+            cache_family=None,
+            linear_attention=None,
+            default_attention_backend=None,
+            request_token_history=False,
+            is_multimodal=False,
+            tokenizer_kwargs={},
+            attention_instances_per_layer=1,
+            numerics_envelopes=frozenset({"auto", "rl-bitwise"}),
+            # None: the draft takes the ordinary construction path, which
+            # ``configure_attention`` above has already shaped. A factory here
+            # would have to rebuild the whole AttnConfig, and registry.py only
+            # calls one when it is not None.
+            create_attention_config=None,
+        )
 
     def _checkpoint_capture_field(self, name: str):
         """A capture field from ``dflash_config``, else the top-level config."""
@@ -328,13 +416,16 @@ class DFlashDraftModel(nn.Module, TargetCaptureConfigurator):
     ) -> None:
         super().__init__()
         self.config = config
-        self.mapping = mapping
+        # Replicated MLP: whole weights per rank, no dense collective, so an idle
+        # attention-DP rank skipping the draft cannot strand its peers. Attention
+        # width is unchanged (see Mapping.replicated_for_draft).
+        self.mapping = mapping.replicated_for_draft()
         eps = float(getattr(config, "rms_norm_eps", 1e-6))
         self.layers = nn.ModuleList(
             [
                 self.decoder_layer_cls(
                     config=config,
-                    mapping=mapping,
+                    mapping=self.mapping,
                     layer_id=i,
                     quant_config=quant_config,
                     prefix=add_prefix(f"layers.{i}", prefix),
@@ -347,11 +438,18 @@ class DFlashDraftModel(nn.Module, TargetCaptureConfigurator):
             "target_layer_ids"
         ) or (getattr(config, "target_layer_ids", None) or [])
         self.num_context_features = len(target_layer_ids)
-        self.fc = ReplicatedLinear(
+        # Each attention-TP rank holds the fc rows of its own output columns,
+        # so a projection reads 1/TP of the weight; gathering the columns
+        # completes the rows the draft's attention reads.
+        self.fc = ColumnParallelLinear(
             self.num_context_features * int(config.hidden_size),
             int(config.hidden_size),
             bias=False,
+            gather_output=False,
             prefix=add_prefix("fc", prefix),
+            tp_rank=mapping.attn.tp_rank,
+            tp_size=mapping.attn.tp_size,
+            tp_group=mapping.attn.tp_group,
         )
         self.hidden_norm = RMSNorm(int(config.hidden_size), eps=eps)
         # Name the DFlash drafter reads off the draft model.
@@ -359,7 +457,24 @@ class DFlashDraftModel(nn.Module, TargetCaptureConfigurator):
         self._residual_buffer: torch.Tensor | None = None
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
-        return self.hidden_norm(self.fc(target_hidden)[0])
+        """Project the concatenated target taps to normalized context rows.
+
+        Gathers ``fc``'s output columns over the attention TP group, so call
+        it in stream order with the group's other collectives.
+
+        Args:
+            target_hidden: ``[num_tokens, context_in_features]`` taps,
+                identical on every rank of the group.
+
+        Returns:
+            The ``[num_tokens, hidden]`` context rows.
+        """
+        columns = self.fc(target_hidden)[0]
+        # Every rank holds the same rows, so skipping an empty gather is
+        # uniform across the group.
+        if self.fc.tp_size > 1 and columns.shape[0] > 0:
+            columns = all_gather(columns, self.fc.tp_group, dim=-1)
+        return self.hidden_norm(columns)
 
     # ------------------------------------------------------------------
     # Context-injection contract
@@ -429,7 +544,6 @@ class DFlashDraftModel(nn.Module, TargetCaptureConfigurator):
         positions: torch.Tensor,
         input_lengths: torch.Tensor | None = None,
         input_embeds: torch.Tensor | None = None,
-        kv_sync_event=None,
         **kwargs,
     ) -> LogitsProcessorOutput:
         if input_embeds is None:
@@ -440,9 +554,6 @@ class DFlashDraftModel(nn.Module, TargetCaptureConfigurator):
         else:
             hidden_states = input_embeds
             residual = self._zeroed_residual(input_embeds)
-
-        if kv_sync_event is not None:
-            torch.cuda.current_stream().wait_event(kv_sync_event)
 
         for layer in self.layers:
             hidden_states, residual = layer(
@@ -546,6 +657,14 @@ def get_dflash_layer_types(config: Any) -> Sequence[str] | None:
 
 
 def get_dflash_attention_sliding_window_size(config: Any) -> int | None:
+    """The window a ``sliding_attention`` draft layer attends over, or None.
+
+    The window is the mask's extent; a checkpoint's ``sliding_window_sink``
+    (retain the first N tokens outside the window) is applied separately, see
+    :func:`get_dflash_attention_window_sink`. The MHA backend's ``sinks`` is a
+    different thing (gpt-oss's learnable per-head logit bias, a weight a
+    DFlash checkpoint does not carry).
+    """
     layer_types = get_dflash_layer_types(config)
     if layer_types is None or "sliding_attention" not in layer_types:
         return None
@@ -560,6 +679,33 @@ def get_dflash_attention_sliding_window_size(config: Any) -> int | None:
         )
 
     return hf_sliding_window_to_window_left(sliding_window)
+
+
+def get_dflash_attention_window_sink(config: Any) -> int:
+    """Leading tokens a ``sliding_attention`` draft layer keeps outside its
+    window (``sliding_window_sink``), or 0.
+
+    The trainer's own implementation ships this as ``context_sink_size`` inside
+    ``dflash_config`` and the exports repeat it at the top level; read both.
+    Returns 0 when the draft has no windowed layer, where a sink would name
+    rows the mask already keeps.
+    """
+    layer_types = get_dflash_layer_types(config)
+    if layer_types is None or "sliding_attention" not in layer_types:
+        return 0
+
+    text_config = _get_text_config(config)
+    dflash_config = getattr(config, "dflash_config", None) or {}
+    sink = _cfg_get(
+        text_config,
+        "sliding_window_sink",
+        _cfg_get(config, "sliding_window_sink"),
+    )
+    if sink is None and isinstance(dflash_config, dict):
+        sink = dflash_config.get("context_sink_size")
+    if sink is None:
+        return 0
+    return int(sink)
 
 
 def _get_dflash_layer_sliding_window(config, layer_id: int) -> int:
@@ -583,6 +729,21 @@ def _get_dflash_layer_sliding_window(config, layer_id: int) -> int:
         "Unsupported DFLASH draft layer type. "
         f"layer_types[{layer_id}]={layer_type!r}."
     )
+
+
+def _get_dflash_layer_window_sink(config, layer_id: int) -> int:
+    """This layer's window sink: 0 unless the layer is windowed."""
+    layer_types = get_dflash_layer_types(config)
+    if layer_types is None:
+        return 0
+    if layer_id >= len(layer_types):
+        raise ValueError(
+            "DFLASH config.layer_types must contain one entry per draft layer. "
+            f"Got {len(layer_types)} entries, layer_id={layer_id}."
+        )
+    if layer_types[layer_id] != "sliding_attention":
+        return 0
+    return get_dflash_attention_window_sink(config)
 
 
 EntryClass = [DFlashDraftModel]

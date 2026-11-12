@@ -38,6 +38,13 @@ captured decode graph records one path for every request mix.
 The proposal is drawn with the in-tree Triton Gumbel-max kernel keyed per
 request by the verifier's seed pool and a salted position, so the draft
 stream is run- and batch-invariant like the per-slot verify coins.
+
+When ``draft_probs`` holds each rank's vocabulary columns only (the target's
+rows stay sharded and the verifier reads q per shard), the draft head hands
+over its shard instead of gathered logits (``propose_vocab_shard``): each
+rank reduces its shard to a few partials, the ranks gather those, and every
+rank draws the token the whole row would draw (the Gumbel noise is keyed by
+global token id) and records q over its own columns.
 """
 
 from __future__ import annotations
@@ -46,6 +53,11 @@ from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
+from tokenspeed_kernel.ops.sampling import (
+    vocab_shard_draft_record,
+    vocab_shard_draft_stats,
+    vocab_shard_draft_stats_width,
+)
 from tokenspeed_kernel.ops.sampling.flashinfer import softmax
 from tokenspeed_kernel.ops.sampling.triton import (
     DRAFT_SAMPLE_OFFSET_SALT,
@@ -53,9 +65,12 @@ from tokenspeed_kernel.ops.sampling.triton import (
     gumbel_scratch_shape,
 )
 
+from tokenspeed.runtime.layers.sampled_vocab_shard import gather_topk_pairs
+
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
+    from tokenspeed.runtime.layers.sampled_vocab_shard import SampledVocabShard
     from tokenspeed.runtime.sampling.backends.base import SpeculativeSamplingPools
 
 
@@ -75,7 +90,8 @@ class DraftProposalSampler:
         """
         Args:
             pools: The verifier's pool-indexed temperature / top-k / seed.
-            runtime_states: Owner of ``draft_probs`` (must be allocated) and
+            runtime_states: Owner of ``draft_probs`` (must be allocated; over
+                whole-vocabulary rows or this rank's vocabulary columns) and
                 ``valid_cache_lengths``.
             input_buffers: The executor's batch-ordered pool index buffers.
             spec_num_tokens: Verify chain width N; steps ``0..N-2`` record.
@@ -107,31 +123,71 @@ class DraftProposalSampler:
             (max_bs,), dtype=torch.int32, device=device
         )
         self._gumbel_out = torch.empty((max_bs,), dtype=torch.int32, device=device)
-        # Sized by the draft head's width: the Gumbel draw runs over the draft
-        # logits, which a hot-token head keeps narrower than the full vocab.
-        draft_vocab_size = vocab_size if vocab_map is None else vocab_map.shape[0]
-        scratch_shape = gumbel_scratch_shape(max_bs, draft_vocab_size)
-        self._gumbel_local_ids = torch.empty(
-            scratch_shape, dtype=torch.int32, device=device
-        )
-        self._gumbel_local_scores = torch.empty(
-            scratch_shape, dtype=torch.float32, device=device
-        )
+        # Shard scratch when the table holds this rank's columns of q, else the whole-row scratch; the other stays None.
+        self._shard_ranks: int | None = None
+        self._shard_stats: torch.Tensor | None = None
+        self._shard_landing: torch.Tensor | None = None
+        self._gumbel_local_ids: torch.Tensor | None = None
+        self._gumbel_local_scores: torch.Tensor | None = None
         # Hot-token heads: q over the draft vocab is scattered into a
         # full-vocab row before it is recorded. The scatter only ever writes
         # the mapped columns, so the others stay zero from allocation.
         self._vocab_map: torch.Tensor | None = None
         self._full_q: torch.Tensor | None = None
-        if vocab_map is not None:
-            if vocab_map.ndim != 1 or vocab_map.shape[0] > vocab_size:
+        if vocab_size != runtime_states.vocab_size:
+            if vocab_map is not None or runtime_states.vocab_size % vocab_size:
                 raise ValueError(
-                    f"vocab_map must be a [V_draft <= {vocab_size}] vector, got "
-                    f"{tuple(vocab_map.shape)}"
+                    f"draft_probs over {vocab_size} of {runtime_states.vocab_size} "
+                    "columns must be one of equal vocabulary shards of a draft head "
+                    "spanning the target vocabulary"
                 )
-            self._vocab_map = vocab_map.to(device=device, dtype=torch.int64)
-            self._full_q = torch.zeros(
-                (max_bs, vocab_size), dtype=torch.float32, device=device
+            self._shard_ranks = runtime_states.vocab_size // vocab_size
+            width = vocab_shard_draft_stats_width(vocab_size)
+            self._shard_stats = torch.empty(
+                (max_bs, width), dtype=torch.float32, device=device
             )
+            self._shard_landing = torch.empty(
+                (self._shard_ranks * max_bs * width,),
+                dtype=torch.float32,
+                device=device,
+            )
+        else:
+            # Sized by the draft head's width: the Gumbel draw runs over the draft
+            # logits, which a hot-token head keeps narrower than the full vocab.
+            draft_vocab_size = vocab_size if vocab_map is None else vocab_map.shape[0]
+            scratch_shape = gumbel_scratch_shape(max_bs, draft_vocab_size)
+            self._gumbel_local_ids = torch.empty(
+                scratch_shape, dtype=torch.int32, device=device
+            )
+            self._gumbel_local_scores = torch.empty(
+                scratch_shape, dtype=torch.float32, device=device
+            )
+            if vocab_map is not None:
+                if vocab_map.ndim != 1 or vocab_map.shape[0] > vocab_size:
+                    raise ValueError(
+                        f"vocab_map must be a [V_draft <= {vocab_size}] vector, got "
+                        f"{tuple(vocab_map.shape)}"
+                    )
+                self._vocab_map = vocab_map.to(device=device, dtype=torch.int64)
+                self._full_q = torch.zeros(
+                    (max_bs, vocab_size), dtype=torch.float32, device=device
+                )
+
+    def _check_step(self, step: int) -> None:
+        """Refuse a draft step without a verify column."""
+        if step < 0 or step >= self._spec_num_tokens - 1:
+            raise ValueError(
+                f"draft step {step} has no verify column in a chain of "
+                f"{self._spec_num_tokens} tokens"
+            )
+
+    def _refresh_offsets(self, step: int) -> None:
+        """This step's Philox offset per slot: its round's position and the salted step."""
+        torch.add(
+            self._valid_cache_lengths.to(torch.int64) * self._spec_num_tokens,
+            DRAFT_SAMPLE_OFFSET_SALT + step,
+            out=self._offsets_pool,
+        )
 
     def propose(self, logits: torch.Tensor, *, step: int) -> torch.Tensor:
         """Sample this step's draft tokens and record their distribution.
@@ -146,12 +202,16 @@ class DraftProposalSampler:
         Returns:
             ``[bs]`` int32 draft-vocab token ids.
         """
-        if step < 0 or step >= self._spec_num_tokens - 1:
-            raise ValueError(
-                f"draft step {step} has no verify column in a chain of "
-                f"{self._spec_num_tokens} tokens"
-            )
+        self._check_step(step)
         bs = logits.shape[0]
+        if self._shard_ranks is not None:
+            # A forward without logits rows (a cache-only chunk) hands over no shard and proposes nothing.
+            if bs == 0:
+                return self._gumbel_out[:0]
+            raise RuntimeError(
+                "draft_probs hold this rank's vocabulary columns: propose from "
+                "the draft head's shard (propose_vocab_shard)"
+            )
         pool_indices = self._req_pool_indices_buf[:bs]
         pool_indices_i32 = self._pool_indices_i32[:bs]
         pool_indices_i32.copy_(pool_indices)
@@ -178,11 +238,7 @@ class DraftProposalSampler:
 
         # Gumbel-max over logits / T draws exactly Categorical(q); the noise is
         # keyed by the request's seed and this (round, step) offset.
-        torch.add(
-            self._valid_cache_lengths.to(torch.int64) * self._spec_num_tokens,
-            DRAFT_SAMPLE_OFFSET_SALT + step,
-            out=self._offsets_pool,
-        )
+        self._refresh_offsets(step)
         sampled = gumbel_sample_from_pools(
             logits,
             pool_indices_i32,
@@ -210,5 +266,71 @@ class DraftProposalSampler:
         # gathers.
         self._draft_probs[:, step, :].index_copy_(
             0, self._state_write_req_pool_indices_buf[:bs], q
+        )
+        return tokens
+
+    def propose_vocab_shard(
+        self, shard: SampledVocabShard, *, step: int
+    ) -> torch.Tensor:
+        """``propose`` from this rank's shard of the draft head's logits.
+
+        Every rank draws the token ``propose`` would draw from the gathered
+        rows (the same Gumbel noise, keyed by global token id) and records q
+        over its own vocabulary columns: ``softmax(logits / T)``, one-hot for
+        greedy rows, the sentinel for rows without a finite softmax. Only a
+        few partials per row cross the ranks.
+
+        Args:
+            shard: The step's draft head shard, one row per request in batch
+                order (padding rows included).
+            step: Draft step index; the token lands in verify candidate
+                column ``step + 1`` and ``q`` in ``draft_probs[:, step]``.
+
+        Returns:
+            ``[bs]`` int32 token ids.
+        """
+        self._check_step(step)
+        if self._shard_ranks is None or shard.tp_size != self._shard_ranks:
+            raise RuntimeError(
+                f"draft_probs hold whole rows or another shard count than the "
+                f"head's {shard.tp_size}: propose from gathered logits instead"
+            )
+        logits = shard.logits
+        bs = logits.shape[0]
+        slots = self._req_pool_indices_buf[:bs]
+        stats = self._shard_stats[:bs]
+        self._refresh_offsets(step)
+        vocab_shard_draft_stats(
+            logits,
+            shard.vocab_start,
+            slots,
+            self._pools.temperature,
+            self._pools.seed,
+            self._offsets_pool,
+            stats,
+            logit_scale=shard.logit_scale,
+            softcap=shard.softcap,
+        )
+        landing = self._shard_landing[: shard.tp_size * stats.numel()]
+        gathered = gather_topk_pairs(
+            stats,
+            landing.view(shard.tp_size * bs, stats.shape[1]),
+            shard.tp_size,
+            shard.tp_group,
+        )
+        tokens = self._gumbel_out[:bs]
+        vocab_shard_draft_record(
+            logits,
+            gathered,
+            shard.vocab_start,
+            slots,
+            self._state_write_req_pool_indices_buf[:bs],
+            self._pools.temperature,
+            self._pools.top_k,
+            self._draft_probs[:, step],
+            tokens,
+            logit_scale=shard.logit_scale,
+            softcap=shard.softcap,
+            sentinel=self._sentinel,
         )
         return tokens

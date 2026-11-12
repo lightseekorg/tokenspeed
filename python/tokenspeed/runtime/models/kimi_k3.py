@@ -67,15 +67,19 @@ from tokenspeed_kernel.ops.activation.triton import (
     attnres_combine,
     attnres_partial,
     attnres_partial_dual,
-    rmsnorm_gated_sigmoid,
     sigmoid_mul,
 )
+from tokenspeed_kernel.ops.attention.kda import KdaOutputNorm
 from tokenspeed_kernel.ops.attention.mla import (
     mla_normalize_project_query,
     validate_mla_query_projection,
 )
 from tokenspeed_kernel.ops.communication import allreduce_fusion_lane
 from tokenspeed_kernel.ops.communication.flashinfer import get_flashinfer_moe_alltoall
+from tokenspeed_kernel.ops.communication.peer_weights import (
+    ExpertPartition,
+    create_peer_weight_store,
+)
 from tokenspeed_kernel.ops.gemm import (
     kimi3_mla_qkv_gate_projection,
     kimi3_qkvfab_projection,
@@ -138,6 +142,7 @@ from tokenspeed.runtime.layers.moe.latent import (
     latent_moe_expert_shared_all_reduce,
 )
 from tokenspeed.runtime.layers.moe.loader import build_moe_checkpoint_loader
+from tokenspeed.runtime.layers.moe.peer_weights import MoEPeerWeights
 from tokenspeed.runtime.layers.moe.schema import ExpertCheckpointSchema
 from tokenspeed.runtime.layers.moe.topk import (
     StandardTopKOutput,
@@ -206,6 +211,7 @@ if TYPE_CHECKING:
     from tokenspeed_kernel.ops.communication._iris.kimi_k3 import K3IrisState
     from tokenspeed_kernel.ops.moe._cute_dsl.k3_decode import (
         KimiK3DecodeAttentionLayer,
+        KimiK3DecodeMoE,
         KimiK3DecodeMoELayer,
     )
     from tokenspeed_kernel.thirdparty.cute_dsl.k3_decode.attn_res.prepared import (
@@ -892,6 +898,30 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
             absorbed_query=absorbed_query,
         )
         return attn_output if fused else sigmoid_mul(attn_output, gate)
+
+    def decode_weights(self) -> tuple[torch.Tensor, ...]:
+        """The weights one decode step reads, in reading order.
+
+        The packed [q_a | kv_a | gate] projection, q_b, the absorbed key and
+        value projections (once derived) and the o-projection.
+        """
+        absorbed = tuple(w for w in (self.w_kc, self.w_vc) if w is not None)
+        projection = self.fused_qkv_a_proj_with_mqa.weight
+        return (projection, self.q_b_proj.weight, *absorbed, self.o_proj.weight)
+
+    def decode_projection_parts(self) -> tuple[torch.Tensor, ...]:
+        """The weights stacked row-wise into the decode chain's input projection.
+
+        In output order: the packed [q_a | kv_a | gate] projection alone.
+        """
+        return (self.fused_qkv_a_proj_with_mqa.weight,)
+
+    def pack_decode_projection(self) -> torch.Tensor:
+        """The decode chain's input projection weight.
+
+        It is the [q_a | kv_a | gate] projection as loaded.
+        """
+        return self.fused_qkv_a_proj_with_mqa.weight
 
 
 def _sliced_scratch(like: torch.Tensor, slot: int, n_tokens: int):
@@ -1801,8 +1831,8 @@ class KimiLinearKDA(nn.Module):
                     scales = None
                 return self.o_proj(empty, scale=scales, ctx=ctx, out=projection_out)[0]
             return h
-        core_out = self._recurrent_core(mixed_qkv, f_a_out, beta, ctx)
         if self.o_proj.supports_fp8_group128_input:
+            core_out = self._recurrent_core(mixed_qkv, f_a_out, beta, ctx, None)
             values, scales = quantize_fp8_with_gate(
                 core_out,
                 out_gate,
@@ -1811,7 +1841,9 @@ class KimiLinearKDA(nn.Module):
                 enable_pdl=pdl_enabled(),
             )
             return self.o_proj(values, scale=scales, ctx=ctx, out=projection_out)[0]
-        core_out = self._gated_norm(core_out, out_gate)
+        core_out = self._recurrent_core(
+            mixed_qkv, f_a_out, beta, ctx, self._output_norm(out_gate)
+        )
         if projection_out is not None:
             return project_attention_partial(
                 core_out, self.o_proj.weight, projection_out
@@ -1841,8 +1873,31 @@ class KimiLinearKDA(nn.Module):
         mixed_qkv, out_gate, f_a_out, beta = self._split_qkvfab(
             projection(hidden_states)
         )
-        core_out = self._recurrent_core(mixed_qkv, f_a_out, beta, ctx)
-        return self._gated_norm(core_out, out_gate)
+        return self._recurrent_core(
+            mixed_qkv, f_a_out, beta, ctx, self._output_norm(out_gate)
+        )
+
+    def decode_weights(self) -> tuple[torch.Tensor, ...]:
+        """The weights one decode step reads, in reading order.
+
+        The merged input projection, the decay gate's up projection and the
+        o-projection.
+        """
+        return (self.qkvgb_proj.weight, self.f_b_proj.weight, self.o_proj.weight)
+
+    def decode_projection_parts(self) -> tuple[torch.Tensor, ...]:
+        """The weights stacked row-wise into the decode chain's input projection.
+
+        In output order: the merged input projection alone.
+        """
+        return (self.qkvgb_proj.weight,)
+
+    def pack_decode_projection(self) -> torch.Tensor:
+        """The decode chain's input projection weight.
+
+        It is the merged input projection as loaded.
+        """
+        return self.qkvgb_proj.weight
 
     def _recurrent_core(
         self,
@@ -1850,8 +1905,13 @@ class KimiLinearKDA(nn.Module):
         f_a_out: torch.Tensor,
         beta: torch.Tensor,
         ctx: "ForwardContext",
+        output_norm: KdaOutputNorm | None,
     ) -> torch.Tensor:
-        """Short conv, gates and the delta-rule recurrence: [T, heads * head_dim]."""
+        """Short conv, gates and the delta-rule recurrence: [T, heads * head_dim].
+
+        With ``output_norm`` the result is the gated-RMSNormed o-projection
+        input, which the backend's kernels apply where they can.
+        """
         num_tokens = mixed_qkv.shape[0]
         hn, hd = self.local_num_heads, self.head_dim
         # The hybrid backend re-splits key_dim/value_dim by attn_tp_size to
@@ -1892,23 +1952,14 @@ class KimiLinearKDA(nn.Module):
             lower_bound=self.gate_lower_bound,
             layer_id=self.layer_id,
             seq_len=num_tokens,
+            output_norm=output_norm,
         )
 
         return core_out.reshape(num_tokens, hn * hd)
 
-    def _gated_norm(
-        self, core_out: torch.Tensor, out_gate: torch.Tensor
-    ) -> torch.Tensor:
-        """Gated RMSNorm of the core output, the BF16 o-projection input."""
-        return rmsnorm_gated_sigmoid(
-            core_out.contiguous(),
-            out_gate,
-            self.o_norm.weight,
-            self.o_norm.variance_epsilon,
-            self.local_num_heads,
-            self.head_dim,
-            enable_pdl=pdl_enabled(),
-        )
+    def _output_norm(self, out_gate: torch.Tensor) -> KdaOutputNorm:
+        """The gated RMSNorm that makes the core output the BF16 o-projection input."""
+        return KdaOutputNorm(out_gate, self.o_norm.weight, self.o_norm.variance_epsilon)
 
 
 class KimiLinearMoEGate(nn.Module):
@@ -2197,6 +2248,7 @@ class KimiLinearMoE(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         alt_stream: torch.cuda.Stream | None = None,
+        peer_weights: MoEPeerWeights | None = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -2205,7 +2257,7 @@ class KimiLinearMoE(nn.Module):
         self.iris_state: K3IrisState | None = None
         # Decoder layers inspect this even when attention DP skips native setup.
         self.native_latent_moe: LatentMoELayer | None = None
-        if mapping.attn.dp_size > 1:
+        if mapping.attn.dp_size > 1 and mapping.moe.tp_ep_size > 1:
             if not (mapping.attn.dp_size == mapping.moe.ep_size == mapping.world_size):
                 raise ValueError(
                     "Kimi-K3 attention DP requires attention DP == MoE EP == world size."
@@ -2287,6 +2339,7 @@ class KimiLinearMoE(nn.Module):
             tp_size=mapping.moe.tp_size,
             ep_rank=mapping.moe.ep_rank,
             ep_size=mapping.moe.ep_size,
+            peer_weights=peer_weights,
             activation="situ",
             activation_situ_beta=situ_beta,
             activation_situ_linear_beta=situ_linear_beta,
@@ -2419,7 +2472,7 @@ class KimiLinearMoE(nn.Module):
         )
         self._topk_ready = (
             torch.cuda.Event()
-            if mapping.attn.dp_size == 1
+            if (mapping.attn.dp_size == 1 or mapping.moe.tp_ep_size == 1)
             and alt_stream is not None
             and self.experts.supports_precomputed_topk
             else None
@@ -2460,7 +2513,7 @@ class KimiLinearMoE(nn.Module):
         # TP8 decode chain over Lamport mailboxes; bound by prepare_communication_runtime.
         self.decode_moe: KimiK3DecodeMoELayer | None = None
 
-        if mapping.attn.dp_size > 1:
+        if mapping.attn.dp_size > 1 and mapping.moe.tp_ep_size > 1:
             self.moe_alltoall = None
             if self.execution_plan.owns_ep_communication:
                 if layer_index == config.first_k_dense_replace:
@@ -3299,7 +3352,7 @@ class KimiLinearMoE(nn.Module):
             raise ValueError(
                 "A residual with only this rank's rows requires matching TP8 groups and one eighth of the token rows"
             )
-        if self.mapping.attn.dp_size > 1:
+        if self.mapping.attn.dp_size > 1 and self.mapping.moe.tp_ep_size > 1:
             if ctx is None:
                 raise ValueError("Kimi-K3 attention DP requires a ForwardContext.")
             return self._forward_attn_dp(hidden_states, prefix_sum, ctx)
@@ -3406,6 +3459,7 @@ def create_kimi_linear_moe(
     quant_config: QuantizationConfig | None,
     prefix: str,
     alt_stream: torch.cuda.Stream | None,
+    peer_weights: MoEPeerWeights | None = None,
 ) -> nn.Module:
     """Construct K3 MoE with the token ownership required by its transport.
 
@@ -3417,7 +3471,11 @@ def create_kimi_linear_moe(
         from tokenspeed.runtime.models.kimi_k3_deepep import KimiLinearMoEDeepEP
 
         implementation = KimiLinearMoEDeepEP
+    if peer_weights is not None and implementation is not KimiLinearMoE:
+        raise ValueError("Peer expert weights require the local MoE implementation")
+    peer_kwargs = {"peer_weights": peer_weights} if peer_weights is not None else {}
     return implementation(
+        **peer_kwargs,
         config=config,
         mapping=mapping,
         layer_index=layer_index,
@@ -3453,6 +3511,7 @@ class KimiLinearDecoderLayer(nn.Module):
         *,
         qkv_parallel: DenseLayerMapping | None,
         output_parallel: DenseLayerMapping | None,
+        peer_weights: MoEPeerWeights | None = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -3517,6 +3576,7 @@ class KimiLinearDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("block_sparse_moe", prefix),
                 alt_stream=alt_stream,
+                peer_weights=peer_weights,
             )
         else:
             self.mlp = KimiLinearMLP(
@@ -4144,6 +4204,32 @@ class KimiLinearModel(nn.Module):
         self.mapping = mapping
         self.quant_config = quant_config
         self.iris_states = K3AttnComm.iris_states
+        self.peer_weights: MoEPeerWeights | None = None
+        if mapping.moe_weight_sharing_size is not None:
+            from tokenspeed.runtime.distributed.process_group_manager import (
+                process_group_manager,
+            )
+
+            if get_all2all_backend() is not All2AllBackend.NONE:
+                raise ValueError("Peer expert weights require --all2all-backend none")
+            group_ranks = mapping.moe_weight_group
+            process_group_manager.init_process_group(
+                group_ranks, backend="gloo", name="moe_weights"
+            )
+            group = process_group_manager.get_process_group(
+                "gloo", group_ranks, name="moe_weights"
+            )
+            partition = ExpertPartition(config.num_experts, group.rank(), group.size())
+            store = create_peer_weight_store(
+                partition=partition,
+                group=group,
+                device=torch.device("cuda", torch.cuda.current_device()),
+                model_identity=f"{global_server_args_dict['model']}@{global_server_args_dict['revision']}",
+                pool_page_bytes=16 * 1024**2,
+                copy_implementation="simple",
+                solution="cuda",
+            )
+            self.peer_weights = MoEPeerWeights(partition=partition, store=store)
 
         # Agree on parsed sizes before any shared-expert subgroup is created.
         shared_size = envs.TOKENSPEED_KIMI_K3_SHARED_EXPERT_TP_SIZE.get()
@@ -4159,6 +4245,14 @@ class KimiLinearModel(nn.Module):
             envs.TOKENSPEED_KIMI_K3_QKV_PROJ_TP_SIZE.get(),
             envs.TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE.get(),
         )
+
+        if self.peer_weights is not None and any(
+            layout is not None and layout.tp_size > 1
+            for layout in (shared_parallel, qkv_parallel, output_parallel)
+        ):
+            raise ValueError(
+                "Peer expert weights require local shared-expert and attention projections"
+            )
 
         alt_stream = (
             torch.cuda.Stream(priority=-1) if torch.cuda.is_available() else None
@@ -4194,6 +4288,7 @@ class KimiLinearModel(nn.Module):
                 alt_stream=alt_stream,
                 qkv_parallel=qkv_parallel,
                 output_parallel=output_parallel,
+                peer_weights=self.peer_weights,
             )
 
         self.layers = make_layers(
@@ -4245,6 +4340,9 @@ class KimiLinearModel(nn.Module):
         # by prepare_communication_runtime.
         self.decode_final: PreparedAttnRes | None = None
         self.decode_batches: tuple[int, ...] = ()
+        # The decode MoE chain's owner, whose side streams rejoin at the end of
+        # every forward; bound by prepare_communication_runtime.
+        self.decode_chain: KimiK3DecodeMoE | None = None
 
         # DFLASH/DSpark speculative decoding: layer indices whose *output*
         # stream is captured for the draft. Populated by
@@ -4437,6 +4535,8 @@ class KimiLinearModel(nn.Module):
             )
 
         prefix_sum = hidden_states
+        if self.peer_weights is not None and hidden_states.shape[0] > 0:
+            self.peer_weights.prefetch_first()
 
         def capture_tap(layer_idx: int) -> None:
             self._capture_tap(
@@ -4482,6 +4582,8 @@ class KimiLinearModel(nn.Module):
                     if stream is not None and stream.sharded
                     else prefix_sum.clone()
                 )
+        if self.decode_chain is not None:
+            self.decode_chain.join()
         if stream is not None and stream.activation is not None:
             # Mix and norm already applied; the activation borrows collective storage.
             return stream.activation.clone(), aux_hidden_states
@@ -4645,6 +4747,7 @@ class KimiLinearModel(nn.Module):
             self.decode_final.run_ring(prefix, blocks, out)
         else:
             self.decode_final.run(delta, prefix, blocks, out)
+        self.decode_chain.join()
         capture(self.pp_end_layer - 1)
         if dspark_context is not None:
             self._write_dspark_context(ctx, positions, projected_context)
@@ -4681,6 +4784,14 @@ class KimiLinearForCausalLM(BaseCausalLM):
 
     model_cls = KimiLinearModel
     supports_aux_capture = True
+
+    def post_quant_warmup(self) -> None:
+        if self.model.peer_weights is not None:
+            self.model.peer_weights.finalize()
+
+    def close_peer_weights(self) -> None:
+        if self.model.peer_weights is not None:
+            self.model.peer_weights.close()
 
     def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
         shared_mlps = [
@@ -4803,6 +4914,40 @@ class KimiLinearForCausalLM(BaseCausalLM):
             return False
         from tokenspeed_kernel.ops.moe._cute_dsl.k3_decode import KimiK3DecodeMoE
 
+        decoders = [
+            layer
+            for layer in self.model.layers
+            if isinstance(layer, KimiLinearDecoderLayer)
+        ]
+
+        def attention_served(layer) -> bool:
+            # The chain owns the o-projection's reduction and gates MLA outputs.
+            attn = layer.self_attn
+            kda = isinstance(attn, KimiLinearKDA)
+            parts = attn.decode_projection_parts()
+            return (
+                attn.qkv_parallel is None
+                and attn.output_parallel is None
+                and not attn.o_proj.supports_fp8_group128_input
+                and (kda or attn.use_output_gate)
+                and len({part.dtype for part in parts}) == 1
+                and attention_supports(
+                    projection_rows=sum(part.shape[0] for part in parts),
+                    o_proj_width=attn.o_proj.weight.shape[1],
+                    projection_dtype=parts[0].dtype,
+                    o_proj_dtype=attn.o_proj.weight.dtype,
+                )
+            )
+
+        serve_attention = len(decoders) == self.config.num_hidden_layers and all(
+            attention_served(layer) for layer in decoders
+        )
+        # Packed before the MoE layers record the next attention's weights.
+        projections = (
+            [layer.self_attn.pack_decode_projection() for layer in decoders]
+            if serve_attention
+            else []
+        )
         beta, linear_beta = _situ_betas(self.config)
         owner = KimiK3DecodeMoE(
             group=group,
@@ -4815,6 +4960,8 @@ class KimiLinearForCausalLM(BaseCausalLM):
         for ordinal, layer in enumerate(layers):
             moe = layer.block_sparse_moe
             norm = moe.routed_expert_norm
+            # The chain prefetches the next attention's weights while the experts run.
+            following = decoders[decoders.index(layer) + 1 :]
             moe.decode_moe = owner.layer(
                 ordinal=ordinal,
                 layer_idx=layer.layer_id,
@@ -4832,38 +4979,15 @@ class KimiLinearForCausalLM(BaseCausalLM):
                 norm_weight=norm.weight,
                 norm_eps=norm.variance_epsilon,
                 up_shard=moe.routed_expert_up_proj.weight,
+                next_attention=(
+                    following[0].self_attn.decode_weights() if following else ()
+                ),
             )
+        self.model.decode_chain = owner
         logger.info(
             f"K3 decode MoE chain bound to {len(layers)} layers for batches {batches}"
         )
-
-        decoders = [
-            layer
-            for layer in self.model.layers
-            if isinstance(layer, KimiLinearDecoderLayer)
-        ]
-
-        def attention_served(layer) -> bool:
-            # The chain owns the o-projection's reduction and gates MLA outputs.
-            attn = layer.self_attn
-            kda = isinstance(attn, KimiLinearKDA)
-            projection = attn.qkvgb_proj if kda else attn.fused_qkv_a_proj_with_mqa
-            return (
-                attn.qkv_parallel is None
-                and attn.output_parallel is None
-                and not attn.o_proj.supports_fp8_group128_input
-                and (kda or attn.use_output_gate)
-                and attention_supports(
-                    projection_rows=projection.weight.shape[0],
-                    o_proj_width=attn.o_proj.weight.shape[1],
-                    projection_dtype=projection.weight.dtype,
-                    o_proj_dtype=attn.o_proj.weight.dtype,
-                )
-            )
-
-        if len(decoders) != self.config.num_hidden_layers or not all(
-            attention_served(layer) for layer in decoders
-        ):
+        if not serve_attention:
             return True
         from tokenspeed_kernel.ops.moe._cute_dsl.k3_decode import (
             KimiK3DecodeAttention,
@@ -4874,19 +4998,14 @@ class KimiLinearForCausalLM(BaseCausalLM):
             batches=batches,
             moe=owner,
         )
-        for layer in decoders:
-            mla = isinstance(layer.self_attn, KimiLinearMLAAttention)
-            projection = (
-                layer.self_attn.fused_qkv_a_proj_with_mqa
-                if mla
-                else layer.self_attn.qkvgb_proj
-            )
+        for layer, projection in zip(decoders, projections, strict=True):
             layer.decode_attention = attention.layer(
                 layer,
                 layer_idx=layer.layer_id,
-                mla=mla,
+                mla=isinstance(layer.self_attn, KimiLinearMLAAttention),
                 first=layer is decoders[0],
-                projection_weight=projection.weight,
+                projection_weight=projection,
+                moe=layer.block_sparse_moe.decode_moe if layer.is_moe_layer else None,
             )
         self.model.decode_final = attention.final(
             res_norm=self.model.output_attn_res_norm,
@@ -5111,8 +5230,16 @@ class KimiLinearForCausalLM(BaseCausalLM):
                 gate_proj_name="w1", up_proj_name="w3", down_proj_name="w2"
             ),
             num_experts=config.num_experts,
-            ep_rank=self.mapping.moe.ep_rank,
-            ep_size=self.mapping.moe.ep_size,
+            ep_rank=(
+                self.mapping.moe_weight_group.index(self.mapping.rank)
+                if self.model.peer_weights is not None
+                else self.mapping.moe.ep_rank
+            ),
+            ep_size=(
+                len(self.mapping.moe_weight_group)
+                if self.model.peer_weights is not None
+                else self.mapping.moe.ep_size
+            ),
         )
 
         pp_start = self.model.pp_start_layer
@@ -5364,6 +5491,14 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 "Kimi-K3 encoder-only mode does not expose text embeddings."
             )
         return self.language_model.model.get_input_embeddings()
+
+    def post_quant_warmup(self) -> None:
+        if self.language_model is not None:
+            self.language_model.post_quant_warmup()
+
+    def close_peer_weights(self) -> None:
+        if self.language_model is not None:
+            self.language_model.close_peer_weights()
 
     def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
         if self.language_model is None:

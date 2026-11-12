@@ -25,20 +25,21 @@ CDNA4 scales into route order instead of quantizing the BF16 input again.
 Route-tiled GEMMs group each expert's routes into small tiles and preserve
 token/slot order for intermediates and outputs, so each expert's weights are
 read once however many tokens route to it. Matrix dimensions, top-k and expert
-counts are explicit kernel parameters. Up to 16 rows each GEMM program groups
-the routes itself from the top-k IDs (an expert then has at most 16 routes, one
-tile) and stage 1 writes the route map, so no separate launch builds
-descriptors. Above that each expert packs its routes into a fixed-length list
-whose length is a power-of-two capacity no smaller than the row count (a
-token's top-k expert IDs are distinct, so an expert gets at most one route per
-row), and a second kernel splits the lists into `(start, count, expert)`
-descriptors; all row counts sharing a capacity reuse one compilation. The GEMMs
-run a fixed persistent grid over the device-side group count and have no
-row-dependent compile-time parameters.
+counts are explicit kernel parameters. Up to 16 rows, each stage 1 program
+groups the routes itself from the top-k IDs (an expert then has at most 16
+routes, one tile); stage 1 writes the route map and the grouping as descriptors,
+which stage 2 reads, so no separate launch builds them. Above that, each expert
+packs its routes into a fixed-length list whose length is a power-of-two
+capacity no smaller than the row count (a token's top-k expert IDs are distinct,
+so an expert gets at most one route per row), and a second kernel splits the
+lists into `(start, count, expert)` descriptors; all row counts sharing a
+capacity reuse one compilation. The GEMMs run a fixed persistent grid over the
+device-side group count and have no row-dependent compile-time parameters.
 `fused/tuning.py:_ROUTE_TILE_CONFIGS` sets which shapes and rows take this path
 and each GEMM's tile widths, waves, and how many K tiles' loads it keeps in
-flight ahead of the MFMA (`PREFETCH_TILES`). Neither changes the K
-accumulation order, so every schedule, and the direct decode and staged
+flight ahead of the MFMA (`PREFETCH_TILES`); the direct decode stage 1 takes
+its depth per shape from `_DIRECT_STAGE1_PREFETCH_TILES`. Neither changes the
+K accumulation order, so every schedule, and the direct decode and staged
 package paths that serve the other rows, produce bitwise-identical results.
 
 The package prefill also runs as two calls split at the intermediate:

@@ -50,13 +50,16 @@ jobs:
       matrix: ${{ fromJson(inputs.matrix) }}
     name: ${{ matrix.name }} (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: ${{ matrix.runner == 'amd-mi45x-cpu-test' && 30 || inputs.timeout_minutes }}
+    # The AMD kernel suite needs more than an hour with a cold Triton cache.
+    timeout-minutes: ${{ matrix.runner == 'amd-mi45x-cpu-test' && 30 || (matrix.name == 'ut-tokenspeed-kernel' && inputs.timeout_minutes < 90 && 90 || inputs.timeout_minutes) }}
     continue-on-error: ${{ matrix.optional }}
     env:
       INSTALL_TOKENSPEED_MLA_FROM_SOURCE: ${{ inputs.install_tokenspeed_mla_from_source }}
       BASE_REF: ${{ inputs.comparison_base_ref }}
       CANDIDATE_REF: ${{ inputs.comparison_candidate_ref }}
       PR_NUMBER: ${{ github.event_name == 'pull_request' && github.event.pull_request.number || '' }}
+      # Set only for tasks that select their tests from a pull request's changes.
+      TOKENSPEED_CI_CHANGED_PATHS: ${{ matrix.changed_paths || '' }}
       MERGE_SHA: ${{ github.event_name == 'pull_request' && github.sha || '' }}
       # Authenticate model downloads so cold runners do not hit anonymous
       # Hugging Face rate limits while starting `ts serve`.
@@ -102,6 +105,11 @@ jobs:
             work_dir="$NPU_CI_WORK/checkout"
           fi
           echo "WORK_DIR=$work_dir" >> "$GITHUB_ENV"
+          # Correctness jobs must be able to compile on full shared volumes.
+          # Performance jobs retain their established warm kernel cache.
+          if [ "${{ matrix.type }}" = "ut" ] || [ "${{ matrix.type }}" = "eval" ]; then
+            echo "TRITON_CACHE_DIR=$work_dir/.triton-cache" >> "$GITHUB_ENV"
+          fi
           # Keep project dependencies job-local, but reuse EvalScope downloads
           # from the model cache when the runner provides one.
           if [ "${{ matrix.workflow_stage }}" = "model-test" ]; then
@@ -113,11 +121,6 @@ jobs:
               echo "EVALSCOPE_UV_CACHE_DIR=$evalscope_uv_cache_dir" >> "$GITHUB_ENV"
             fi
             echo "UV_CACHE_DIR=$work_dir/.uv-cache" >> "$GITHUB_ENV"
-            # Accuracy jobs must be able to compile on full shared volumes.
-            # Performance jobs retain their established warm kernel cache.
-            if [ "${{ matrix.type }}" = "eval" ]; then
-              echo "TRITON_CACHE_DIR=$work_dir/.triton-cache" >> "$GITHUB_ENV"
-            fi
             # MIOpen's writable SQLite databases also need job-local storage.
             mkdir -p "$work_dir/.miopen-db" "$work_dir/.miopen-kernels"
             echo "MIOPEN_USER_DB_PATH=$work_dir/.miopen-db" >> "$GITHUB_ENV"

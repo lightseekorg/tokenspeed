@@ -25,7 +25,6 @@ import re
 import socket
 import traceback
 from functools import partial
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -168,6 +167,22 @@ def _column_all_gather_worker(rank, world_size, device):
             torch.testing.assert_close(
                 state.gather.run(local), expected, atol=0, rtol=0
             )
+
+    # Packed fp32 words ride the BF16 gather as raw 16-bit halves: negative
+    # zero, NaN payloads and halves equal to the mailbox's empty value (0x8000)
+    # arrive bit for bit.
+    def words(peer):
+        pattern = torch.tensor(
+            # 0x80000000, 0x7FC00001, 0x00008000, 0x80008000, 0x3F800000, ~0.
+            [-(1 << 31), 0x7FC00001, 0x8000, 0x8000 - (1 << 31), 0x3F800000, -1],
+            dtype=torch.int32,
+            device=device,
+        )
+        return (pattern.repeat(7, 6)[:, :32] ^ (peer << 20)).contiguous()
+
+    gathered = state.gather.run(words(rank).view(torch.bfloat16))
+    expected = torch.cat([words(peer) for peer in range(world_size)], dim=-1)
+    assert torch.equal(gathered.view(torch.int32), expected)
     if current_platform().is_cdna4:
         _check_all_reduce_routed_rmsnorm_sum(state, rank, world_size, device)
 
@@ -233,6 +248,7 @@ def _check_all_reduce_routed_rmsnorm_sum(state, rank, world_size, device):
                 1.0,
                 False,
                 None,
+                None,
             )
             for peer in range(world_size)
         ]
@@ -277,6 +293,58 @@ def test_iris_column_all_gather(world_size):
     )
 
 
+def _lamport_gather_rmsnorm_worker(rank, world_size, device):
+    from tokenspeed_kernel.ops.layernorm import affine_rmsnorm
+
+    state = _muse_state(rank, device, 64, True)
+    width = 4096
+    local_width = width // world_size
+    weight = torch.linspace(-0.5, 0.5, width, device=device).to(torch.bfloat16)
+    for rows in (1, 8, 16, 64):
+        gen = torch.Generator(device=device).manual_seed(rows)
+        full = torch.randn(rows, width, generator=gen, device=device).to(torch.bfloat16)
+        local = torch.empty(rows, local_width, dtype=torch.bfloat16, device=device)
+
+        def run():
+            # The MXFP4 sibling shares the mailboxes and stage counters.
+            state.all_gather_rmsnorm_mxfp4_quant(local, weight, 1e-5, 1.0)
+            return state.all_gather_rmsnorm(local, weight, 1e-5, 1.0)
+
+        assert state.can_all_gather_rmsnorm(local, weight)
+        local.copy_(full[:, rank * local_width : (rank + 1) * local_width])
+        run()
+        torch.cuda.synchronize()
+        dist.barrier()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = run()
+        # Four replays cycle every mailbox stage with changed inputs.
+        for scale in (2.0, -1.0, 0.5, 3.0):
+            scaled = (full.float() * scale).to(torch.bfloat16)
+            local.copy_(scaled[:, rank * local_width : (rank + 1) * local_width])
+            graph.replay()
+            reference = affine_rmsnorm(scaled, weight, 1e-5, 1.0, torch.bfloat16)
+            # Another in-thread addition order: a rare element rounds the
+            # other way, at most one BF16 ulp (adjacent bit patterns).
+            # Adding zero turns a negative zero into zero on both sides.
+            got, want = output + 0.0, reference + 0.0
+            assert torch.equal(got.sign(), want.sign())
+            ulps = got.view(torch.int16).int() - want.view(torch.int16).int()
+            assert ulps.abs().max().item() <= 1
+
+
+@pytest.mark.parametrize("world_size", [4, 8])
+def test_iris_lamport_gather_rmsnorm_matches_affine_rmsnorm(world_size):
+    """The fused gather + RMSNorm is affine_rmsnorm of the gathered rows."""
+    _skip_if_unsupported(world_size, "Iris gather + RMSNorm tests")
+    port = _get_open_port()
+    _spawn_and_collect(
+        _communication_worker,
+        (world_size, port, _lamport_gather_rmsnorm_worker, "gloo"),
+        world_size,
+    )
+
+
 def _muse_state(rank, device, max_rows, enable_lamport):
     from tokenspeed_kernel.ops.communication._iris.muse_spark import (
         prepare_muse_communication,
@@ -314,6 +382,7 @@ def _boundary_reference(stream, reduced, post, alpha, beta, pre):
         False,
         None,
         1,
+        None,
     )
 
 
@@ -578,6 +647,29 @@ def _muse_collective_policy_worker(rank, world_size, device):
         )
 
 
+def _muse_pull_warmup_worker(rank, world_size, device):
+    from tokenspeed_kernel.ops.communication._iris.all_reduce import (
+        iris_pull_twoshot_allreduce,
+    )
+    from utils import assert_no_triton_compile
+
+    # Past the push and Lamport two-shot windows, below the owned-row path:
+    # the producer pull reduces these rows.
+    rows = 179
+    state = _muse_state(rank, device, 192, True)
+    state.warmup_reduce_outputs()
+    with assert_no_triton_compile(iris_pull_twoshot_allreduce):
+        branch = state.all_reduce.acquire_outputs(((rows, 8192),))[0]
+        branch.fill_(rank + 1)
+        output = state.reduce_outputs((branch,))[0]
+    torch.testing.assert_close(
+        output,
+        torch.full_like(output, world_size * (world_size + 1) // 2),
+        rtol=0,
+        atol=0,
+    )
+
+
 def _muse_owned_packet_worker(rank, world_size, device):
     from tokenspeed_kernel.ops.communication._iris.muse_spark.all_gather import (
         iris_pack_moe_inputs,
@@ -715,276 +807,23 @@ def _muse_owned_packet_worker(rank, world_size, device):
     torch.cuda.synchronize()
 
 
-def _prepare_muse_backend(world_size, projection, moe, *, expert_tp_size):
-    from tokenspeed.runtime.distributed import process_group_manager as pgm
-    from tokenspeed.runtime.distributed.comm_backend.registry import (
-        initialize_comm_backend,
-    )
-    from tokenspeed.runtime.models.muse_spark import MuseSparkForConditionalGeneration
-
-    group = tuple(range(world_size))
-    pgm.process_group_manager.register_process_group("nccl", group, dist.group.WORLD)
-    backend = initialize_comm_backend()
-    if projection is None:
-        projection = SimpleNamespace(iris_state=None)
-    if moe is None:
-        moe = SimpleNamespace(
-            iris_state=None,
-            pre_expert_proj=None,
-            post_expert_proj=None,
-            down_columns=None,
-        )
-    layer = SimpleNamespace(
-        iris_state=None,
-        self_attn=SimpleNamespace(iris_state=None, qkv_proj=projection),
-        mlp=moe,
-    )
-    owner = SimpleNamespace(
-        mapping=SimpleNamespace(
-            attn=SimpleNamespace(tp_size=world_size, tp_group=group),
-            moe=SimpleNamespace(
-                tp_ep_group=group,
-                tp_size=expert_tp_size,
-                ep_size=world_size // expert_tp_size,
-            ),
-        ),
-        config=SimpleNamespace(
-            hidden_size=8192, moe_hidden_size=4096, num_experts_per_tok=8
-        ),
-        model=SimpleNamespace(iris_state=None, layers=[layer]),
-    )
-    assert MuseSparkForConditionalGeneration.prepare_communication_runtime(owner, 8192)
-    state = owner.model.iris_state
-    assert MuseSparkForConditionalGeneration.prepare_communication_runtime(owner, 8192)
-    assert owner.model.iris_state is state
-    assert projection.iris_state is state and moe.iris_state is state
-    assert backend.get_prepared_all_gather(group, torch.bfloat16) is state.gather
-    return group, state
-
-
-def _muse_owned_qkvg_worker(rank, world_size, device):
-    torch.set_grad_enabled(False)
-    torch.set_default_dtype(torch.bfloat16)
-    from tokenspeed_kernel.ops.attention.prologue import (
-        HeadKVCache,
-        HeadNorm,
-        RopeStyle,
-        Rotary,
-        gqa_prologue,
-    )
-    from tokenspeed_kernel.ops.communication._iris.muse_spark.all_to_all import (
-        iris_a2a_transpose_qkvg,
-        iris_fused_a2a_transpose_qkvg_norm_rope,
-    )
-    from utils import assert_no_triton_compile
-
-    from tokenspeed.runtime.models.muse_spark import (
-        MUSE_OWNED_QKVG_MIN_TOKENS,
-        QKVOGateParallelLinear,
-    )
-
-    group = tuple(range(world_size))
-    with torch.device(device):
-        projection = QKVOGateParallelLinear(
-            hidden_size=8192,
-            head_size=64,
-            total_num_heads=128,
-            total_num_kv_heads=16,
-            quant_config=None,
-            prefix="model.layers.1.self_attn.qkv_proj",
-            tp_rank=rank,
-            tp_size=world_size,
-            tp_group=group,
-            replicate_for_owned_rows=True,
-        )
-    group, state = _prepare_muse_backend(world_size, projection, None, expert_tp_size=1)
-    full_weights = {}
-    expected_columns = []
-    for index, (name, width) in enumerate(
-        (("q", 8192), ("k", 1024), ("v", 1024), ("g", 8192))
-    ):
-        weight = torch.zeros(width, 8192, device=device)
-        columns = (torch.arange(width, device=device) * 13 + index * 17) % 8192
-        weight[torch.arange(width, device=device), columns] = 1
-        full_weights[name] = weight
-        projection.weight_loader(projection.weight, weight, name)
-        expected_columns.append(
-            columns[rank * (width // world_size) : (rank + 1) * (width // world_size)]
-        )
-    expected_columns = torch.cat(expected_columns)
-    parameter_pointer = projection.weight.data_ptr()
-    local_pointer = projection._local_weight().data_ptr()
-
-    angles = torch.arange(16384, device=device, dtype=torch.float32)[:, None] / (
-        torch.arange(32, device=device, dtype=torch.float32)[None, :] + 1
-    )
-    rope = torch.cat((angles.cos(), angles.sin()), dim=1)
-    nope = torch.empty((1, 0), device=device, dtype=torch.float32)
-    eps, q_scale = 1e-5, 5.4730064863875
-    norm = HeadNorm(
-        torch.full((64,), q_scale, device=device, dtype=torch.float32),
-        torch.ones((64,), device=device, dtype=torch.float32),
-        0.0,
-        eps,
-    )
-
-    def make_inputs(rows):
-        local_rows = (rows + world_size - 1) // world_size
-        first = rank * local_rows
-        valid = min(local_rows, rows - first)
-        full = (
-            (
-                torch.arange(rows, device=device)[:, None] % 13
-                + torch.arange(8192, device=device)[None, :] % 7
-            )
-            / 16
-        ).bfloat16()
-        local = torch.full((local_rows, 8192), float("nan"), device=device)
-        local[:valid].copy_(full[first : first + valid])
-        poison = torch.full((rows, 8192), rank + 1, dtype=torch.bfloat16, device=device)
-        positions = (
-            torch.arange(rows, device=device, dtype=torch.int64) * 17 + 31
-        ) % 16384
-        k_cache = torch.empty(
-            (rows, 16 // world_size, 64), dtype=torch.bfloat16, device=device
-        )
-        cache = HeadKVCache(
-            k_cache,
-            torch.empty_like(k_cache),
-            None,
-            torch.arange(rows, device=device, dtype=torch.int64),
-        )
-        return full, local, poison, positions, cache
-
-    inputs = [make_inputs(rows) for rows in (2047, 2048, 8191)]
-
-    def run(item):
-        full, local, poison, positions, cache = item
-        generic = state.all_reduce.acquire_outputs(
-            ((state.reduction.push_max_numel + 8192,),)
-        )[0]
-        generic.fill_(rank + 1)
-        previous = state.reduce_outputs((generic,))[0]
-        fused = reference = None
-        if full.shape[0] >= MUSE_OWNED_QKVG_MIN_TOKENS:
-            projected = projection.project_owned_rows(local, full.shape[0])
-            output = state.all_to_all_transpose_qkvg(projected, full.shape[0])
-            table = rope if full.shape[0] < 4096 else nope
-            q, k, v, gate = output.split(
-                tuple(width // world_size for width in (8192, 1024, 1024, 8192)), dim=-1
-            )
-            prepared = gqa_prologue(
-                q,
-                k,
-                v,
-                norm=norm,
-                rotary=(
-                    Rotary(table, positions, RopeStyle.GPTJ, None)
-                    if table.shape[1]
-                    else None
-                ),
-                cache=cache,
-                query_dtype=q.dtype,
-                return_kv=True,
-                solution="triton",
-                override=None,
-            )
-            reference = (prepared.q, prepared.k, prepared.v, gate)
-            projected = projection.project_owned_rows(local, full.shape[0])
-            if rank == full.shape[0] % world_size:
-                torch.cuda._sleep(20000)
-            fused = state.all_to_all_transpose_qkvg_norm_rope(
-                projected, full.shape[0], positions, table, eps, q_scale
-            )
-        else:
-            normalized = state.all_gather_owned_rows(local, full.shape[0], True)
-            output, _ = projection(normalized)
-        # O's next producer can overwrite every old QKVG source address.
-        reduced = state.reduce_scatter_owned_rows(poison)
-        gathered = state.all_gather_owned_rows(reduced, full.shape[0], True)
-        return output, gathered, previous, fused, reference
-
-    def sequence():
-        return [run(item) for item in inputs]
-
-    sequence()
-    state.row_gather_flags.fill_(2**32 - 2)
-    torch.cuda.synchronize()
-    dist.barrier()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        outputs = sequence()
-    for replay in range(4):
-        gain = 2 ** (replay + 1)
-        for name, weight in full_weights.items():
-            weight.mul_(2)
-            projection.weight_loader(projection.weight, weight, name)
-        assert projection.weight.data_ptr() == parameter_pointer
-        assert projection._local_weight().data_ptr() == local_pointer
-        for full, local, _, positions, _ in inputs:
-            positions.add_(97).remainder_(16384)
-            full.add_(1 / 16)
-            first = rank * local.shape[0]
-            valid = min(local.shape[0], full.shape[0] - first)
-            local[:valid].copy_(full[first : first + valid])
-        if rank == replay:
-            torch.cuda._sleep(10000)
-        graph.replay()
-        for (full, *_), (output, gathered, previous, fused, reference) in zip(
-            inputs, outputs
-        ):
-            if fused is not None:
-                for actual, expected in zip(fused, reference):
-                    assert actual.is_contiguous() and bool(torch.isfinite(actual).all())
-                    torch.testing.assert_close(
-                        actual.view(torch.int16),
-                        expected.view(torch.int16),
-                        rtol=0,
-                        atol=0,
-                    )
-            expected = full.index_select(1, expected_columns) * gain
-            torch.testing.assert_close(output, expected, rtol=0, atol=0)
-            torch.testing.assert_close(
-                gathered,
-                torch.full_like(gathered, world_size * (world_size + 1) // 2),
-                rtol=0,
-                atol=0,
-            )
-            torch.testing.assert_close(
-                previous,
-                torch.full_like(previous, world_size * (world_size + 1) // 2),
-                rtol=0,
-                atol=0,
-            )
-        small = inputs[0][0][:4].contiguous()
-        small_output, _ = projection(small)
-        torch.testing.assert_close(
-            small_output,
-            small.index_select(1, expected_columns) * gain,
-            rtol=0,
-            atol=0,
-        )
-    with assert_no_triton_compile(
-        iris_a2a_transpose_qkvg, iris_fused_a2a_transpose_qkvg_norm_rope
-    ):
-        for rows in (2051, 8190):
-            output, _, _, fused, reference = run(make_inputs(rows))
-            for actual, expected in zip(fused, reference):
-                torch.testing.assert_close(
-                    actual.view(torch.int16), expected.view(torch.int16), rtol=0, atol=0
-                )
-    torch.cuda.synchronize()
-    dist.barrier()
-
-
-def _compile_gfx950(fn, types, constexprs, num_warps, unspecialized=()):
+def _compile_gfx950(fn, types, constexprs, num_warps, unspecialized=(), options=None):
     """Compile a Gluon kernel for gfx950 without launching it.
 
     Arguments named in unspecialized get no 16-byte divisibility, as when a
     caller passes them in do_not_specialize or compiles ahead of time.
+    Pointers the kernel annotates ``tl.const`` compile as const pointers, as
+    at launch. ``options`` adds compile options. Every compile links the
+    extern intrinsic libraries.
     """
     from tokenspeed_kernel._triton import gluon, triton
+    from tokenspeed_kernel_amd._extern import extern_compile_options
 
+    types = dict(types)
+    for param in fn.params:
+        kind = types.get(param.name)
+        if param.is_const and isinstance(kind, str) and kind.startswith("*"):
+            types[param.name] = "*k" + kind[1:]
     attrs = {}
     for index, name in enumerate(fn.arg_names):
         if isinstance(types.get(name), tuple):
@@ -1005,7 +844,11 @@ def _compile_gfx950(fn, types, constexprs, num_warps, unspecialized=()):
     return triton.compile(
         source,
         target=triton.backends.compiler.GPUTarget("hip", "gfx950", 64),
-        options={"num_warps": num_warps},
+        options={
+            "num_warps": num_warps,
+            **extern_compile_options(),
+            **(options or {}),
+        },
     )
 
 
@@ -1184,12 +1027,8 @@ def test_route_sum_gather_lamport_polling_codegen():
     assert re.search(r"\.amdhsa_private_segment_fixed_size\s+0\b", assembly)
 
 
-def test_attntail_lamport_polling_codegen():
-    """Each subgroup of the 16-subgroup poller retries on its own.
-
-    A workgroup-wide readiness reduction would put shared-memory traffic and
-    barriers into every retry; the subgroup ballot keeps them out.
-    """
+def _attntail_lamport_assembly() -> str:
+    """gfx950 assembly of the 16-subgroup Lamport attention tail at TP8."""
     rank = 5
     from tokenspeed_kernel.ops.communication._iris.all_reduce import iris_arch_policy
     from tokenspeed_kernel.ops.communication._iris.muse_spark.attntail import (
@@ -1233,7 +1072,16 @@ def test_attntail_lamport_polling_codegen():
         },
         num_warps=16,
     )
-    assembly = kernel.asm["amdgcn"]
+    return kernel.asm["amdgcn"]
+
+
+def test_attntail_lamport_polling_codegen():
+    """Each subgroup of the 16-subgroup poller retries on its own.
+
+    A workgroup-wide readiness reduction would put shared-memory traffic and
+    barriers into every retry; the subgroup ballot keeps them out.
+    """
+    assembly = _attntail_lamport_assembly()
     polls = [
         cycle for cycle in polling_cycles(assembly) if _batched_peer_reads(cycle, 7)
     ]
@@ -1242,6 +1090,274 @@ def test_attntail_lamport_polling_codegen():
         votes_with_subgroup_mask(cycle) for cycle in polls
     ), "a retry must branch on one subgroup lane mask"
     assert re.search(r"\.amdhsa_private_segment_fixed_size\s+0\b", assembly)
+
+
+def test_attntail_stage_store_follows_a_barrier():
+    """Every wave loads its workgroup's stage; one lane stores the next.
+
+    A wave that loaded after that store would use the next stage's mailbox
+    slot, so a workgroup barrier must precede the store on every path: it
+    sits in the block that ends in the store.
+    """
+    lines = _attntail_lamport_assembly().splitlines()
+    stores = [i for i, line in enumerate(lines) if "global_store_dword " in line]
+    assert len(stores) == 1, "expected one global store (the stage)"
+    index = stores[0]
+    # Walk back through fall-through-only blocks ("; %bb.N:") to a block
+    # that branches may enter (".LBB").
+    while index > 0 and not lines[index].startswith(".LBB"):
+        if "s_barrier" in lines[index]:
+            break
+        index -= 1
+    assert "s_barrier" in lines[index], "the stage store does not follow a barrier"
+
+
+def _sliding_tail_assembly() -> str:
+    """gfx950 assembly of the fused sliding tail at 8 rows, TP8."""
+    from tokenspeed_kernel.ops.communication._iris.muse_spark.attntail import (
+        iris_fused_sliding_attention_twoshot_muse_attntail as fn,
+    )
+    from tokenspeed_kernel_amd._extern import extern_compile_options
+
+    pointers = {
+        name: kind
+        for name, kind in {
+            "q_ptr": "*fp8e4nv",
+            "k_cache_ptr": "*fp8e4nv",
+            "v_cache_ptr": "*fp8e4nv",
+            "page_table_ptr": "*i32",
+            "cache_seqlens_ptr": "*i32",
+            "mid_o_ptr": "*fp32",
+            "mid_lse_ptr": "*fp32",
+            "counters_ptr": "*i32",
+            "gate_ptr": "*bf16",
+            "weight_ptr": "*bf16",
+            "att_buffer": "*i32",
+            "epochs": "*i32",
+            "region": "*bf16",
+            "rs_peers": ("i64",) * 8,
+            "sums": "*i64",
+            "sums_peers": ("i64",) * 8,
+            "stream_ptr": "*fp32",
+            "post_weight_ptr": "*bf16",
+            "alpha_ptr": "*fp32",
+            "beta_ptr": "*fp32",
+            "pre_weight_ptr": "*bf16",
+            "out_stream_ptr": "*fp32",
+            "pre_fp32_ptr": "*fp32",
+            "pre_bf16_ptr": "*bf16",
+        }.items()
+    }
+    pointers.update({"gate_stride": "i32", "rows": "i32"})
+    kernel = _compile_gfx950(
+        fn,
+        pointers,
+        dict(
+            Q_STRIDE_B=1024,
+            Q_STRIDE_H=64,
+            Q_STRIDE_D=1,
+            SM_SCALE=0.125 * 1.4426950408889634,
+            PAGE_TABLE_STRIDE=4096,
+            PAGE_SIZE=64,
+            NUM_KV_SPLITS=8,
+            MAX_SEQLEN_Q=8,
+            NUM_Q_HEADS=16,
+            NUM_KV_HEADS=2,
+            HEAD_DIM=64,
+            BLOCK_M=64,
+            BLOCK_N=64,
+            WINDOW_LEFT=2047,
+            IS_FP8=True,
+            NUM_REQUESTS=1,
+            WIDTH=8192,
+            RANK=3,
+            WORLD_SIZE=8,
+            MAX_SHARD_ELEMENTS=16 * 1024,
+            MAX_ROWS=16,
+            PARTS=8,
+            GATE_EPS=1e-6,
+            POST_EPS=1e-6,
+            POST_WEIGHT_OFFSET=1.0,
+            PRE_EPS=1e-6,
+            PRE_WEIGHT_OFFSET=1.0,
+            POST_HAS_WEIGHT=True,
+            RESERVED_LDS=128 * 1024,
+            NUM_STAGES=2,
+            PEER_SIGNAL_STORE_CACHE=".wt",
+        ),
+        num_warps=4,
+        options=extern_compile_options(),
+    )
+    return kernel.asm["amdgcn"]
+
+
+def test_sliding_attention_tail_epoch_store_follows_a_barrier():
+    """Every subgroup of a fused sliding-tail workgroup loads its epoch; one
+    lane stores the next. A subgroup that loaded after that store would push
+    with the next stage and tag (or clear the current stage's all-gather
+    slots), so a workgroup barrier must precede the store on every path: it
+    sits in the block that ends in the store."""
+    lines = _sliding_tail_assembly().splitlines()
+    stores = [i for i, line in enumerate(lines) if "global_store_dword " in line]
+    assert stores, "expected the epoch's global store"
+    index = stores[-1]
+    # Walk back through fall-through-only blocks to a block that branches may
+    # enter (".LBB").
+    while index > 0 and not lines[index].startswith(".LBB"):
+        if "s_barrier" in lines[index]:
+            break
+        index -= 1
+    assert "s_barrier" in lines[index], "the epoch store does not follow a barrier"
+
+
+def test_sliding_attention_tail_hand_offs_bypass_every_l2():
+    """No load or store of the fused sliding tail uses agent scope alone.
+
+    Its hand-offs cross XCDs (and GPUs), and each XCD has its own L2 that
+    does not snoop the others: a hand-off word read or written with SC1 but
+    not SC0 may hit a stale line in the reader's L2. Hand-offs use SC0 SC1,
+    which bypasses every L2 coherently (CDNA4 ISA 9.1.10.2); everything else
+    uses neither bit.
+    """
+    agent_only = [
+        line.strip()
+        for line in _sliding_tail_assembly().splitlines()
+        if re.match(r"\s*(global|buffer)_(load|store)", line)
+        and re.search(r"\bsc1\b", line)
+        and not re.search(r"\bsc0\b", line)
+    ]
+    assert not agent_only, agent_only
+
+
+def test_sliding_attention_tail_stage_is_unsigned():
+    """The fused sliding tail takes its stage (epoch % 3) as unsigned.
+
+    A signed remainder of an epoch word past 2**31 - 1 is negative, which
+    moves the two-shot slots below the region. LLVM divides by three with a
+    multiply-high by a magic constant: 0x55555556 (s/v_mul_hi_i32) for a
+    signed remainder, 0xaaaaaaab (s/v_mul_hi_u32) for an unsigned one.
+    """
+    assembly = _sliding_tail_assembly()
+    signed = re.findall(r"_mul_hi_i32\b.*0x55555556", assembly)
+    assert not signed, signed
+    assert re.search(r"_mul_hi_u32\b.*0xaaaaaaab", assembly), "no unsigned % 3"
+
+
+@pytest.mark.parametrize("rows", [8, 16])
+def test_sliding_attntail_page_loads_keep_copies_in_flight(rows):
+    """The fused sliding tail's page-index loads do not drain the KV copies.
+
+    The split loads each page index two pages ahead with a volatile load, so
+    the next pages' K/V copies stay in flight. LLVM follows a volatile load
+    from global memory with `s_waitcnt vmcnt(0)`, which would wait for every
+    copy issued before it; from a const page table it does not.
+    """
+    from tokenspeed_kernel.ops.communication._iris.all_reduce import iris_arch_policy
+    from tokenspeed_kernel.ops.communication._iris.muse_spark.attntail import (
+        iris_fused_sliding_attention_twoshot_muse_attntail as fn,
+    )
+    from tokenspeed_kernel_amd._extern import extern_compile_options
+
+    types = {
+        "q_ptr": "*fp8e4nv",
+        "k_cache_ptr": "*fp8e4nv",
+        "v_cache_ptr": "*fp8e4nv",
+        "page_table_ptr": "*i32",
+        "cache_seqlens_ptr": "*i32",
+        "mid_o_ptr": "*fp32",
+        "mid_lse_ptr": "*fp32",
+        "counters_ptr": "*i32",
+        "gate_ptr": "*bf16",
+        "gate_stride": "i32",
+        "weight_ptr": "*bf16",
+        "att_buffer": "*bf16",
+        "epochs": "*i32",
+        "region": "*bf16",
+        "rs_peers": ("i64",) * 8,
+        "sums": "*i64",
+        "sums_peers": ("i64",) * 8,
+        "stream_ptr": "*fp32",
+        "post_weight_ptr": "*bf16",
+        "alpha_ptr": "*fp32",
+        "beta_ptr": "*fp32",
+        "pre_weight_ptr": "*bf16",
+        "out_stream_ptr": "*fp32",
+        "pre_fp32_ptr": "*fp32",
+        "pre_bf16_ptr": "*bf16",
+        "rows": "i32",
+    }
+    # The 4-wave sliding split of 8 or 16 verify rows over a 2048-token
+    # window of 64-token FP8 pages, as sliding_attention_boundary selects it.
+    kernel = _compile_gfx950(
+        fn,
+        types,
+        {
+            "Q_STRIDE_B": 1024,
+            "Q_STRIDE_H": 64,
+            "Q_STRIDE_D": 1,
+            "SM_SCALE": 0.125,
+            "PAGE_TABLE_STRIDE": 4096,
+            "PAGE_SIZE": 64,
+            "NUM_KV_SPLITS": 8,
+            "MAX_SEQLEN_Q": 8,
+            "NUM_Q_HEADS": 16,
+            "NUM_KV_HEADS": 2,
+            "HEAD_DIM": 64,
+            "BLOCK_M": 64,
+            "BLOCK_N": 64,
+            "WINDOW_LEFT": 2047,
+            "IS_FP8": True,
+            "NUM_REQUESTS": rows // 8,
+            "WIDTH": 8192,
+            "RANK": 5,
+            "WORLD_SIZE": 8,
+            "MAX_SHARD_ELEMENTS": 16 * 1024,
+            "MAX_ROWS": 16,
+            "PARTS": 8 if rows <= 8 else 4,
+            "GATE_EPS": 1e-6,
+            "POST_EPS": 1e-6,
+            "POST_WEIGHT_OFFSET": 1.0,
+            "PRE_EPS": 1e-6,
+            "PRE_WEIGHT_OFFSET": 1.0,
+            "POST_HAS_WEIGHT": True,
+            "RESERVED_LDS": 128 * 1024,
+            "NUM_STAGES": 2,
+            "PEER_SIGNAL_STORE_CACHE": iris_arch_policy(
+                ArchVersion(9, 5)
+            ).peer_signal_store,
+        },
+        num_warps=4,
+        unspecialized=("rows", "gate_stride"),
+        options=extern_compile_options(),
+    )
+    lines = [
+        line.strip()
+        for line in kernel.asm["amdgcn"].splitlines()
+        if line.strip() and not line.strip().startswith((".", ";"))
+    ]
+    memory = re.compile(r"^(?:global|buffer)_(?:load|store|atomic)")
+    # Poll loops (the finisher's sums) also load with SC0 SC1 and wait for
+    # each load; they are not page-index loads. The page loop holds MFMAs.
+    polled = {
+        line.strip()
+        for cycle in polling_cycles(kernel.asm["amdgcn"])
+        if not any("v_mfma" in line for line in cycle)
+        for line in cycle
+    }
+    page_loads = 0
+    for index, line in enumerate(lines):
+        if not (line.startswith("global_load_dword ") and "sc0 sc1" in line):
+            continue
+        if line in polled:
+            continue
+        page_loads += 1
+        for after in lines[index + 1 :]:
+            if memory.match(after):
+                break
+            assert not (
+                after.startswith("s_waitcnt") and "vmcnt(0)" in after
+            ), f"a page-index load drains the KV copies in flight: {line}"
+    assert page_loads >= 2, "the split no longer loads page indices ahead"
 
 
 def test_gather_lamport_polling_codegen():
@@ -1359,6 +1475,7 @@ def test_moetail_lamport_codegen(block_m):
     from tokenspeed_kernel.ops.communication._iris.muse_spark.moetail import (
         iris_fused_gemv_lamport_allgather_muse_moetail as fn,
     )
+    from tokenspeed_kernel_amd._extern import extern_compile_options
 
     types = {
         "x_ptr": "*bf16",
@@ -1398,6 +1515,7 @@ def test_moetail_lamport_codegen(block_m):
         },
         num_warps=16,
         unspecialized=("region", "M"),
+        options=extern_compile_options(),
     )
     assembly = kernel.asm["amdgcn"]
     lines = assembly.splitlines()
@@ -1426,6 +1544,53 @@ def test_moetail_lamport_codegen(block_m):
         votes_with_subgroup_mask(cycle) for cycle in polls
     ), "a retry must branch on one subgroup lane mask"
     assert re.search(r"\.amdhsa_private_segment_fixed_size\s+0\b", assembly)
+
+
+@pytest.mark.parametrize("rows", [9, 12, 16])
+def test_moetail_column_senders_push_whole_lines(rows):
+    """Each column sender's push instruction writes whole 128-byte lines.
+
+    A sender pushes its OUTPUTS columns of every row with one 16-byte store
+    per lane; a store instruction that covers only part of each line it
+    touches makes the peer link carry partial-line writes. Lanes map to
+    elements through the send layout, as the store lowering maps them (one
+    instruction per wave; replica waves store nothing).
+    """
+    from tokenspeed_kernel.ops.communication._iris.muse_spark import (
+        _MUSE_BOUNDARY_WIDTH,
+        _MUSE_MOETAIL_COLUMN_OUTPUTS,
+    )
+    from tokenspeed_kernel.ops.communication._iris.muse_spark.moetail import (
+        _send_layout,
+    )
+
+    outputs = _MUSE_MOETAIL_COLUMN_OUTPUTS
+    block_m = 1 << (rows - 1).bit_length()
+    row_bytes = 2 * _MUSE_BOUNDARY_WIDTH // 8
+    layout = _send_layout(outputs, 16)
+    per_lane, lanes_per_row = layout.size_per_thread[1], layout.threads_per_warp[1]
+    # One store instruction per wave: each lane's elements are one 16-byte store.
+    assert layout.size_per_thread[0] == 1 and layout.order == [1, 0]
+    assert 2 * per_lane == 16 and per_lane * lanes_per_row == outputs
+    rows_per_wave = layout.threads_per_warp[0]
+    stored = set()
+    for first_output in range(0, _MUSE_BOUNDARY_WIDTH // 8, outputs):
+        for wave in range(16):
+            lines = {}
+            for lane in range(64):
+                row = (wave * rows_per_wave + lane // lanes_per_row) % block_m
+                column = first_output + lane % lanes_per_row * per_lane
+                if row >= rows or (row, column) in stored:
+                    continue  # masked, or a replica's duplicate
+                stored.add((row, column))
+                start = row * row_bytes + 2 * column
+                lines.setdefault(start // 128, set()).update(range(start, start + 16))
+            for line, written in lines.items():
+                assert written == set(range(128 * line, 128 * (line + 1))), (
+                    f"rows={rows}: sender {first_output // outputs}, wave "
+                    f"{wave} writes {len(written)} of line {line}'s 128 bytes"
+                )
+    assert len(stored) == rows * (_MUSE_BOUNDARY_WIDTH // 8) // per_lane
 
 
 def _muse_lamport_gather_mxfp4_worker(rank, world_size, device):
@@ -1532,6 +1697,93 @@ def _muse_lamport_gather_mxfp4_worker(rank, world_size, device):
     torch.cuda.synchronize()
     dist.barrier()
     # Every consumed mailbox pack was returned to the empty marker.
+    region = state.reduction.lamport_region.view(torch.int32)
+    assert bool((region == -(2**31)).all())
+
+
+def _muse_lamport_gather_mxfp4_topk_worker(rank, world_size, device):
+    from tokenspeed_kernel.ops.communication._iris.muse_spark.all_gather import (
+        iris_fused_lamport_allgather_rmsnorm_mxfp4_topk,
+    )
+    from tokenspeed_kernel.ops.moe import moe_topk
+    from tokenspeed_kernel.ops.quantization import rmsnorm_mxfp4_quant
+    from utils import assert_no_triton_compile
+
+    state = _muse_state(rank, device, 8192, True)
+    width, local_width, experts, topk, scale = 4096, 4096 // world_size, 256, 8, 2.5
+    weight = (torch.randn(width, device=device) * 0.1).bfloat16()
+    bias = torch.randn(experts, device=device) * 0.01
+    for rows in (2, 8, 16):
+        local = torch.empty((rows, local_width), dtype=torch.bfloat16, device=device)
+        logits = torch.empty((rows, experts), dtype=torch.float32, device=device)
+        generator = torch.Generator(device=device)
+
+        def update(phase):
+            # Every rank draws the same rows and logits.
+            generator.manual_seed(1000 * rows + phase)
+            full = torch.randn((rows, width), generator=generator, device=device)
+            full = full.bfloat16()
+            local.copy_(full[:, rank * local_width : (rank + 1) * local_width])
+            logits.copy_(
+                torch.randn((rows, experts), generator=generator, device=device)
+            )
+            return full
+
+        update(0)
+        state.all_gather_rmsnorm_mxfp4_quant_topk(
+            local, weight, 1e-6, 1.0, logits, bias, topk, scale
+        )
+        torch.cuda.synchronize()
+        dist.barrier()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            (packed, scales), weights, ids = state.all_gather_rmsnorm_mxfp4_quant_topk(
+                local, weight, 1e-6, 1.0, logits, bias, topk, scale
+            )
+        for phase in range(3):
+            expected = update(phase)
+            if rank == phase % world_size:
+                torch.cuda._sleep(20000)
+            graph.replay()
+            reference = rmsnorm_mxfp4_quant(expected, weight, 1e-6, 1.0)
+            torch.testing.assert_close(packed, reference[0], atol=0, rtol=0)
+            torch.testing.assert_close(
+                _logical_cdna4_scales(scales, rows, width // 32),
+                _logical_cdna4_scales(reference[1], rows, width // 32),
+                atol=0,
+                rtol=0,
+            )
+            reference_weights, reference_ids = moe_topk(
+                router_logits=logits,
+                top_k=topk,
+                score_function="sigmoid",
+                selection_method="topk",
+                renormalize=True,
+                routed_scaling_factor=scale,
+                correction_bias=bias,
+                hash_indices_table=None,
+                input_ids=None,
+                logical_to_physical_map=None,
+                topk_indices_dtype=torch.int32,
+                topk_weights_dtype=torch.float32,
+                override=None,
+                solution=None,
+            )
+            assert torch.equal(ids, reference_ids)
+            assert torch.equal(weights, reference_weights)
+    # The row count is a runtime argument: rows of an already compiled
+    # specialization class reuse its binary.
+    with assert_no_triton_compile(iris_fused_lamport_allgather_rmsnorm_mxfp4_topk):
+        for rows in (3, 5, 12):
+            local = torch.zeros(
+                (rows, local_width), dtype=torch.bfloat16, device=device
+            )
+            logits = torch.zeros((rows, experts), dtype=torch.float32, device=device)
+            state.all_gather_rmsnorm_mxfp4_quant_topk(
+                local, weight, 1e-6, 1.0, logits, bias, topk, scale
+            )
+    torch.cuda.synchronize()
+    dist.barrier()
     region = state.reduction.lamport_region.view(torch.int32)
     assert bool((region == -(2**31)).all())
 
@@ -1715,11 +1967,23 @@ def _muse_moetail_reference(x, weight, stream, post, alpha, beta, pre):
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.decode_gemv import (
         gluon_rowcta_bf16_gemv_gfx950,
     )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
+        launch_gluon_mm_a16w16_decode_gfx950,
+    )
 
-    # The replicated single-row projection of each row, then the unfused boundary.
+    # The replicated projection (single-row GEMVs up to 8 rows, the decode
+    # GEMM beyond), then the unfused boundary.
     branch = x.new_empty((x.shape[0], weight.shape[0]))
-    for row in range(x.shape[0]):
-        gluon_rowcta_bf16_gemv_gfx950(x[row : row + 1], weight, branch[row : row + 1])
+    if x.shape[0] > 8:
+        counters = torch.zeros(1, dtype=torch.int32, device=x.device)
+        launch_gluon_mm_a16w16_decode_gfx950(
+            x, weight, torch.bfloat16, counters=counters, out=branch
+        )
+    else:
+        for row in range(x.shape[0]):
+            gluon_rowcta_bf16_gemv_gfx950(
+                x[row : row + 1], weight, branch[row : row + 1]
+            )
     out_stream, _, pre_bf16 = _launch_post_norm_residual_pre_norm(
         stream,
         branch,
@@ -1734,20 +1998,23 @@ def _muse_moetail_reference(x, weight, stream, post, alpha, beta, pre):
         False,
         None,
         1,
+        None,
         return_pre_fp32=False,
     )
     return out_stream, pre_bf16
 
 
 def _muse_moetail_worker(rank, world_size, device):
-    """The fused tail matches per-row replicated single-row GEMVs plus the boundary.
+    """The fused tail matches the replicated projection plus the boundary.
 
-    Row counts cover every power-of-two bucket at TP8 and odd counts inside
-    them (TP4 takes one row). Two layers alternate weights and next norms, one
+    Up to 8 rows the senders project (column GEMV) and match per-row
+    single-row GEMVs; 9-16 rows take a column-shard decode GEMM first and match
+    the replicated decode GEMM. Row counts cover every power-of-two bucket at
+    TP8 and odd counts inside them (TP4 takes one row). Two layers alternate weights and next norms, one
     rank lags, row counts interleave in one graph, and the stage counters start
     at the last stage so eager calls and replays wrap them.
     """
-    state = _muse_state(rank, device, 1, True)
+    state = _muse_state(rank, device, 2, True)
     reduction = state.reduction
     reduction.lamport_epochs.fill_(2)
     generator = torch.Generator(device=device).manual_seed(2610)
@@ -1764,7 +2031,7 @@ def _muse_moetail_worker(rank, world_size, device):
     ]
     beta = torch.sigmoid(torch.randn(8192, device=device, generator=generator))
     alpha = torch.sqrt(1 - beta.square())
-    counts = (1, 2, 3, 4, 5, 8) if world_size == 8 else (1,)
+    counts = (1, 2, 3, 4, 5, 8, 9, 13, 16) if world_size == 8 else (1,)
     xs = {
         rows: [
             torch.empty(rows, 4096, dtype=torch.bfloat16, device=device)
@@ -1856,6 +2123,169 @@ def _muse_moetail_worker(rank, world_size, device):
     epochs = [torch.empty_like(reduction.lamport_epochs) for _ in range(world_size)]
     dist.all_gather(epochs, reduction.lamport_epochs)
     assert all(torch.equal(e, reduction.lamport_epochs) for e in epochs)
+
+
+def _muse_sliding_attention_tail_worker(rank, world_size, device, first_epoch):
+    """The fused sliding attention tail matches the four separate kernels.
+
+    Today: sliding split attention, the gated per-head norm, the o_proj GEMV
+    into the producer buffer and the attention boundary. The tail differs only
+    in reduction orders (GEMV, per-head and per-chunk sums, the norm-sum
+    expansion), so it agrees within rounding while ranks agree bit for bit.
+    Row counts alternate 8 -> 16 -> 8 -> 16 eagerly and under graph replay
+    with fresh inputs, one rank lags, and both post-norm forms run; afterwards
+    the next launch's mailboxes are empty. The epoch words start at
+    first_epoch; 2**31 - 2 runs the launches across the signed 32-bit limit.
+    """
+    from tokenspeed_kernel.ops.communication._iris.muse_spark.attntail import (
+        _SLIDING_TAIL_EPOCH_PERIOD,
+    )
+    from tokenspeed_kernel.ops.gemm import mv
+    from tokenspeed_kernel.ops.layernorm.fused_norm import (
+        weightless_rmsnorm_gated_sigmoid,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mha.decode import (
+        launch_gluon_mha_decode_gfx950,
+    )
+
+    state = _muse_state(rank, device, 16, True)
+    if world_size != 8:
+        assert state.attntail_region is None
+        return
+    state.attntail_epochs.fill_(first_epoch)
+    generator = torch.Generator(device=device).manual_seed(4100 + rank)
+    shared = torch.Generator(device=device).manual_seed(4200)
+    # 4104 cached tokens per request: a 2048-key window over 33 pages of 64.
+    context, window, page = 4104, 2047, 64
+    pages = context // page + 1
+    k_cache = (
+        torch.randn(2 * pages + 8, page, 2, 64, device=device, generator=generator) / 2
+    ).to(torch.float8_e4m3fn)
+    v_cache = torch.randn_like(k_cache, dtype=torch.float32).to(torch.float8_e4m3fn)
+    page_table = (
+        torch.randperm(2 * pages + 8, device=device, generator=generator)[: 2 * pages]
+        .view(2, pages)
+        .to(torch.int32)
+    )
+    seqlens = torch.full((2,), context, dtype=torch.int32, device=device)
+    weight = torch.randn(8192, 1024, device=device, generator=generator).bfloat16() / 32
+    pre = (torch.randn(8192, device=device, generator=shared) * 0.1).bfloat16()
+    post = (torch.randn(8192, device=device, generator=shared) * 0.1).bfloat16()
+    beta = torch.sigmoid(torch.randn(8192, device=device, generator=shared))
+    alpha = torch.sqrt(1 - beta.square())
+    q = torch.empty(16, 16, 64, dtype=torch.float8_e4m3fn, device=device)
+    qkvg = torch.empty(16, 2304, dtype=torch.bfloat16, device=device)
+    stream = torch.empty(16, 8192, device=device)
+
+    # Plain decode (one row per request) declines; 8 verify rows per request serve.
+    for rows in (8, 16):
+        for requests, served in ((rows, False), (rows // 8, True)):
+            assert (
+                state.can_sliding_attention_boundary(
+                    rows,
+                    requests,
+                    k_cache,
+                    context,
+                    window,
+                    0.125,
+                    weight,
+                    stream[:rows],
+                )
+                is served
+            )
+
+    def update(phase):
+        g = torch.Generator(device=device).manual_seed(4300 + 8 * phase + rank)
+        q.copy_((torch.randn(16, 16, 64, device=device, generator=g) / 3).to(q.dtype))
+        qkvg.copy_(torch.randn(16, 2304, device=device, generator=g).bfloat16())
+        # The residual is replicated across ranks.
+        h = torch.Generator(device=device).manual_seed(4400 + phase)
+        stream.copy_(torch.randn(16, 8192, device=device, generator=h))
+
+    def tail(rows, post_weight, lag):
+        if lag:
+            torch.cuda._sleep(20000)
+        return state.sliding_attention_boundary(
+            q[:rows],
+            k_cache,
+            v_cache,
+            page_table[: rows // 8],
+            seqlens[: rows // 8],
+            context,
+            window,
+            0.125,
+            qkvg[:rows, 1280:],
+            weight,
+            stream[:rows],
+            post_weight,
+            alpha,
+            beta,
+            pre,
+            1e-6,
+            1e-6,
+            1.0,
+            1e-6,
+            1.0,
+        )
+
+    def today(rows, post_weight):
+        attended = launch_gluon_mha_decode_gfx950(
+            q[:rows],
+            k_cache,
+            v_cache,
+            page_table[: rows // 8],
+            seqlens[: rows // 8],
+            context,
+            max_seqlen_q=8,
+            window_left=window,
+            softmax_scale=0.125,
+        )
+        normed = weightless_rmsnorm_gated_sigmoid(
+            attended.view(rows, 1024), qkvg[:rows, 1280:], 16, 64, 1e-6, False
+        )
+        branch = state.all_reduce.producer.acquire(((rows, 8192),))[0]
+        mv(normed, weight, out=branch)
+        return state.all_reduce_symmetric_boundary(
+            branch, stream[:rows], post_weight, alpha, beta, pre, 1e-6, 1.0, 1e-6, 1.0
+        )
+
+    def check(rows, got, post_weight):
+        expected = today(rows, post_weight)
+        for a, b in zip(got, expected, strict=True):
+            a, b = a.float(), b.float()
+            # Measured relative RMS 5e-5 to 1e-4 (reduction order only).
+            assert (a - b).pow(2).mean().sqrt() < 1e-3 * b.pow(2).mean().sqrt()
+            copies = [torch.empty_like(a) for _ in range(world_size)]
+            dist.all_gather(copies, a)
+            assert all(torch.equal(c, copies[0]) for c in copies)
+
+    order = (8, 16, 8, 16)
+    for phase in range(2):
+        update(phase)
+        for step, rows in enumerate(order):
+            post_weight = post if step % 2 else None
+            check(rows, tail(rows, post_weight, rank == step), post_weight)
+    torch.cuda.synchronize()
+    dist.barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        outputs = [tail(rows, None, False) for rows in order]
+    for phase in range(2, 4):
+        update(phase)
+        graph.replay()
+        for rows, got in zip(order, outputs):
+            check(rows, got, None)
+    torch.cuda.synchronize()
+    dist.barrier()
+    # The next launch's stage is empty everywhere (cleared at an entry two
+    # launches back and unused since), and every attention-buffer word is re-armed.
+    # Eight eager launches and eight replayed ones advanced every epoch word.
+    period = _SLIDING_TAIL_EPOCH_PERIOD.value
+    epochs = state.attntail_epochs
+    assert bool((epochs == (first_epoch + 16) % period).all())
+    stage = int(epochs[0]) % 3
+    assert bool((state.attntail_region[stage].view(torch.int32) == -(2**31)).all())
+    assert bool((state.attention_buffer == -2147450880).all())
 
 
 def _muse_decode_step_lamport_worker(rank, world_size, device):
@@ -2245,171 +2675,6 @@ def _muse_lamport_payload_worker(rank, world_size, device):
         torch.cuda.synchronize()
         check(results, scale)
     dist.barrier()
-
-
-def _muse_tp_routes_worker(rank, world_size, device):
-    """Expert TP sums aligned partial routes before nonlinear normalization."""
-
-    from tokenspeed.runtime.models.muse_spark import MuseSparkMoE, MuseSparkRMSNorm
-
-    torch.set_grad_enabled(False)
-    width, topk = 4096, 8
-    group = tuple(range(world_size))
-    moe = MuseSparkMoE.__new__(MuseSparkMoE)
-    torch.nn.Module.__init__(moe)
-    moe.iris_state = None
-    moe.pre_expert_proj = None
-    moe.post_expert_proj = None
-    moe.down_columns = None
-    moe.tp_group, moe.tp_size, moe.topk = group, world_size, topk
-    moe.ep_group, moe.ep_size = (rank,), 1
-    moe.post_expert_norm = MuseSparkRMSNorm(width, 1e-8, True, 1.0)
-    norm_weight = torch.linspace(-0.25, 0.25, width, device=device).bfloat16()
-    moe.post_expert_norm.weight = torch.nn.Parameter(norm_weight)
-    _, state = _prepare_muse_backend(world_size, None, moe, expert_tp_size=world_size)
-    dims = torch.arange(width, device=device)[None, :]
-
-    # Full-row inputs exceed generic staging; owned inputs keep complete token
-    # route groups together, including an uneven last owner and mapped outputs.
-    cases = [
-        (n, c, False) for n, c in ((1, False), (3, False), (16, False), (2049, False))
-    ]
-    cases += [(n, True, False) for n in (3, 6, 33, 44, 49, 128)]
-    cases += [(64, False, False)]
-    cases += [
-        (192, True, True),
-        (193, True, True),
-        (193, False, True),
-        (2049, True, True),
-        (8191, False, True),
-        (8192, True, True),
-        (2051, True, True),
-    ]
-    for tokens, canonical, owned in cases:
-        indices = torch.arange(tokens * topk, device=device)
-        mapping = None if canonical else ((indices + rank) % indices.numel()).int()
-        weights = (
-            torch.linspace(0.01, 1, topk, device=device).expand(tokens, -1).contiguous()
-        )
-        # Decode rows completed on token owners have the expert write the
-        # route staging buffer directly.
-        scattered = not owned and canonical
-        scattered = (
-            scattered and state.can_reduce_scatter_routed_rmsnorm_sum_all_gather(tokens)
-        )
-        routes = (
-            state.acquire_owned_route_input(tokens)
-            if owned and canonical
-            else (
-                moe._acquire_route_destination(tokens, False)
-                if scattered
-                else torch.empty(
-                    (indices.numel(), width if canonical else width + 16),
-                    device=device,
-                    dtype=torch.bfloat16,
-                )
-            )
-        )
-
-        def update(step):
-            partial = (
-                (indices[:, None] * 3 + dims * 5 + rank * 7 + step) % 9 - 4
-            ).bfloat16() / 32
-            routes[:, :width].copy_(
-                partial if canonical else partial.roll(rank, dims=0)
-            )
-            routes[:, width:].fill_(torch.nan)
-
-        def reference(step):
-            local_rows = (tokens + world_size - 1) // world_size
-            first = rank * local_rows if owned else 0
-            count = min(local_rows, tokens - first) if owned else tokens
-            route_indices = indices[first * topk : (first + count) * topk]
-            full = sum(
-                (
-                    (route_indices[:, None] * 3 + dims * 5 + peer * 7 + step) % 9 - 4
-                ).float()
-                / 32
-                for peer in range(world_size)
-            ).reshape(count, topk, width)
-            scaled = full * (norm_weight + 1.0).float()
-            normalized = scaled * torch.rsqrt(
-                scaled.square().mean(-1, keepdim=True) + 1e-8
-            )
-            expected = (
-                (normalized * weights[first : first + count, :, None]).sum(1).bfloat16()
-            )
-            if owned and count < local_rows:
-                expected = torch.nn.functional.pad(
-                    expected, (0, 0, 0, local_rows - count)
-                )
-            return expected
-
-        def run():
-            return moe._reduce_expert_routes(
-                routes.view(tokens, topk, width) if canonical else routes,
-                mapping,
-                tokens,
-                weights,
-                owned_rows=owned,
-            )
-
-        if scattered:
-            assert routes.data_ptr() == state.owned_route_input.data_ptr()
-        # Expert TP8 completes smaller canonical decode batches column-owned.
-        columned = (
-            canonical
-            and not owned
-            and state.can_reduce_column_routed_rmsnorm_sum(tokens)
-        )
-        stages = (
-            state.column_routes_epochs.clone()
-            if state.column_routes_epochs is not None
-            else None
-        )
-        update(0)
-        flags = state.owned_route_scatter_flags.clone()
-        actual = run()
-        assert columned == (
-            stages is not None and not torch.equal(stages, state.column_routes_epochs)
-        )
-        # Only owned rows and the decode window use the route reduce-scatter.
-        assert scattered or owned or torch.equal(flags, state.owned_route_scatter_flags)
-        assert not scattered or not torch.equal(flags, state.owned_route_scatter_flags)
-        torch.testing.assert_close(actual, reference(0), rtol=0, atol=2**-8)
-        if tokens == 192 and owned and canonical:
-            before = routes.clone()
-            rotated = ((indices + 1) % indices.numel()).int()
-            with pytest.raises(ValueError, match="must not overlap"):
-                state.reduce_scatter_owned_routes(routes, rotated, tokens)
-            shifted = state.owned_route_input.flatten()[
-                width : width + routes.numel()
-            ].view_as(routes)
-            with pytest.raises(ValueError, match="must not overlap"):
-                state.reduce_scatter_owned_routes(shifted, None, tokens)
-            torch.testing.assert_close(routes, before, rtol=0, atol=0)
-        if tokens <= 128 or owned:
-            if owned:
-                state.owned_route_scatter_flags.view(torch.int32).fill_(-2)
-                state.all_reduce.peers.ctx.device_barrier()
-            torch.cuda.synchronize()
-            dist.barrier()
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                captured = run()
-            for step in (1, 2):
-                update(step)
-                if rank == step % world_size:
-                    torch.cuda._sleep(20000)
-                graph.replay()
-                if owned:
-                    # A second reduction overwrites borrowed raw-route storage;
-                    # the normalization result must retain its own contents.
-                    state.reduce_scatter_owned_routes(routes, mapping, tokens)
-                torch.testing.assert_close(
-                    captured, reference(step), rtol=0, atol=2**-8
-                )
-        dist.barrier()
 
 
 def _muse_tp_route_scatter_worker(rank, world_size, device):
@@ -3002,332 +3267,6 @@ def _muse_intermediate_exchange_worker(rank, world_size, device):
     dist.barrier()
 
 
-def _muse_tp_owned_forward_worker(
-    rank, world_size, device, *, quantized: bool, down_columns: bool
-):
-    """Exercise the real router/pool/gather/expert/unpool caller on uneven rows.
-
-    MXFP4 experts at expert TP8 build the column-split down copy. With
-    ``down_columns`` the owned rows take it (assembled from every rank's down
-    shard) and must agree with the full-row path within BF16 rounding; without
-    it the test drops the copy to check the full-row path.
-    """
-    from tokenspeed.runtime.configs.muse_spark_config import MuseSparkConfig
-    from tokenspeed.runtime.distributed import process_group_manager as pgm
-    from tokenspeed.runtime.distributed.comm_backend.registry import (
-        initialize_comm_backend,
-    )
-    from tokenspeed.runtime.distributed.mapping import Mapping
-    from tokenspeed.runtime.layers.quantization.mxfp4 import Mxfp4Config
-    from tokenspeed.runtime.models.muse_spark import MuseSparkMoE
-
-    torch.set_grad_enabled(False)
-    torch.set_default_dtype(torch.bfloat16)
-    mapping = Mapping(
-        rank=rank,
-        world_size=world_size,
-        attn_tp_size=world_size,
-        dense_tp_size=world_size,
-        moe_tp_size=world_size,
-        moe_ep_size=1,
-        vision_tp_size=world_size,
-        linear_attn_tp_size=world_size,
-        nprocs_per_node=world_size,
-        nnodes=1,
-    )
-    group = mapping.attn.tp_group
-    pgm.process_group_manager.register_process_group("nccl", group, dist.group.WORLD)
-    initialize_comm_backend()
-    config = MuseSparkConfig(
-        text_config=dict(
-            vocab_size=256,
-            hidden_size=8192,
-            head_dim=64,
-            num_attention_heads=128,
-            num_key_value_heads=16,
-            num_hidden_layers=1,
-            max_position_embeddings=8192,
-            rms_norm_eps=1e-5,
-            post_norm_eps=1e-8,
-            final_logit_softcapping=20.0,
-            qk_scale_factor=5.47,
-            output_multiplier=0.125,
-            residual_gate_temperature=0.3,
-            moe_hidden_size=4096,
-            moe_intermediate_size=4096 if quantized else 256,
-            num_local_experts=256 if quantized else 8,
-            num_experts_per_tok=8,
-            num_shared_experts=0,
-            routed_scaling_factor=1.0,
-            layer_types=["full_attention"],
-            layer_rope_theta=[0.0],
-            mlp_layer_types=["sparse"],
-            sliding_window=128,
-            rope_parameters=dict(rope_theta=500000.0, rope_type="default"),
-        ),
-        vision_config={},
-        audio_config={},
-        image_token_id=200,
-        video_token_id=201,
-        audio_token_id=202,
-        out_hidden_size=32,
-        projector_hidden_size=32,
-        projector_hidden_act="gelu",
-    )
-    quant_config = (
-        Mxfp4Config(
-            is_checkpoint_mxfp4_serialized=True,
-            use_dynamic_mxfp4_activations=True,
-        )
-        if quantized
-        else None
-    )
-    with torch.device(device):
-        moe = MuseSparkMoE(config, mapping, quant_config, 0, "model.layers.0.mlp", None)
-    assert (moe.down_columns is not None) == quantized
-    if not down_columns:
-        moe.down_columns = None
-    torch.manual_seed(117)
-    for parameter in moe.parameters():
-        if parameter.is_floating_point():
-            parameter.normal_(0, 0.02)
-    # Sparse pool/unpool weights make the reference insensitive to GEMM tiling.
-    for projection in (moe.pre_expert_proj, moe.post_expert_proj):
-        projection.weight.zero_()
-        index = torch.arange(projection.output_size, device=device)
-        projection.weight[index, (index * 3) % projection.input_size] = 1
-    torch.manual_seed(117 + rank)
-    if quantized:
-        moe.experts.w13_weight.random_(0, 256)
-        moe.experts.w2_weight.random_(0, 256)
-        moe.experts.w13_weight_scale.random_(118, 124)
-        moe.experts.w2_weight_scale.random_(118, 124)
-        if down_columns:
-            # Assemble the full down projection from every rank's K shard.
-            for local, scale in (
-                (moe.experts.w2_weight, False),
-                (moe.experts.w2_weight_scale, True),
-            ):
-                shards = [torch.empty_like(local) for _ in range(world_size)]
-                dist.all_gather(shards, local.data.contiguous())
-                moe.down_columns.load(
-                    torch.cat(shards, dim=-1), scale=scale, expert=None
-                )
-            moe.down_columns.process_weights_after_loading(moe.down_columns)
-        moe.experts.process_weights_after_loading(moe.experts)
-    else:
-        moe.experts.w13_weight.normal_(0, 0.02)
-        moe.experts.w2_weight.normal_(0, 0.02)
-    moe.gate.process_weights_after_loading(moe.gate)
-    _, state = _prepare_muse_backend(world_size, None, moe, expert_tp_size=world_size)
-    for rows in (192, 193, 1029):
-        local_rows = (rows + world_size - 1) // world_size
-        first = rank * local_rows
-        valid = min(local_rows, rows - first)
-        for step in (0, 1):
-            torch.manual_seed(rows + step)
-            full = torch.randn(rows, 8192, device=device)
-            local = torch.zeros(local_rows, 8192, device=device)
-            local[:valid].copy_(full[first : first + valid])
-            expected, _ = moe(full, full.float(), rows, rows, None, project=True)
-            expected = expected[first : first + valid].clone()
-            actual, _ = moe(local, local.float(), rows, rows, rows, project=True)
-            actual = actual.clone()
-            # Post projection borrows the generic producer; retain it before reuse.
-            state.all_reduce.producer.data.fill_(torch.nan)
-            torch.testing.assert_close(actual[:valid], expected, atol=2**-7, rtol=2**-7)
-            torch.testing.assert_close(
-                actual[valid:], torch.zeros_like(actual[valid:]), atol=0, rtol=0
-            )
-        dist.barrier()
-
-
-def _muse_owned_routed_wt_worker(rank, world_size, device):
-    torch.set_grad_enabled(False)
-    from tokenspeed_kernel.ops.communication._iris.muse_spark.routed_moe import (
-        iris_routed_rmsnorm_weighted_sum_write_through,
-    )
-    from tokenspeed_kernel.ops.communication._iris.reduce_scatter import (
-        iris_pull_reduce_scatter,
-    )
-    from tokenspeed_kernel.ops.moe import (
-        routed_input_scale_rmsnorm_sum,
-        routed_input_scale_rmsnorm_sum_gathered,
-    )
-    from tokenspeed_kernel.platform import pdl_enabled
-    from utils import assert_no_triton_compile
-
-    from tokenspeed.runtime.models.muse_spark import MuseSparkMoE, MuseSparkRMSNorm
-
-    group = tuple(range(world_size))
-    torch.manual_seed(181)
-    norm = torch.randn(4096, device=device, dtype=torch.bfloat16) / 8
-    moe = MuseSparkMoE.__new__(MuseSparkMoE)
-    torch.nn.Module.__init__(moe)
-    moe.iris_state = None
-    moe.pre_expert_proj = None
-    moe.post_expert_proj = None
-    moe.down_columns = None
-    moe.ep_group, moe.ep_size, moe.topk = group, world_size, 8
-    moe.tp_size = 1
-    moe.post_expert_norm = MuseSparkRMSNorm(4096, 1e-8, True, 1.0)
-    moe.post_expert_norm.weight = torch.nn.Parameter(norm)
-    group, state = _prepare_muse_backend(world_size, None, moe, expert_tp_size=1)
-
-    def inputs(rows):
-        torch.manual_seed(rows + rank * 17)
-        original = torch.randn(rows * 8, 4096, device=device, dtype=torch.bfloat16)
-        local_rows = (rows + world_size - 1) // world_size
-        return dict(
-            rows=rows,
-            original=original,
-            routes=torch.empty_like(original),
-            index=torch.arange(rows * 8, device=device, dtype=torch.int32),
-            mapping=torch.empty(rows * 8, device=device, dtype=torch.int32),
-            weights=torch.full((rows, 8), 0.125, device=device),
-            packet=torch.empty(local_rows, 4096, device=device, dtype=torch.bfloat16),
-            ids=torch.zeros(local_rows, 8, device=device, dtype=torch.int32),
-            scores=torch.ones(local_rows, 8, device=device),
-            attention=torch.empty(rows, 8192, device=device, dtype=torch.bfloat16),
-        )
-
-    def update(case, step):
-        owner = (case["index"] + step) % (world_size - 1 if step == 2 else world_size)
-        case["mapping"].copy_(torch.where(owner == rank, case["index"], -1))
-        case["routes"].copy_(
-            torch.where(
-                (owner == rank)[:, None],
-                case["original"] * (1 + step / 8),
-                torch.nan,
-            )
-        )
-        case["packet"].fill_((rank + 1) * (step + 1) / 8)
-        case["attention"].fill_((rank + 1) * (step + 1) / 16)
-
-    def reference(routes, mapping, rows, weights):
-        norm = moe.post_expert_norm
-        if mapping is None:
-            combined = routed_input_scale_rmsnorm_sum(
-                routes,
-                weights,
-                norm.weight,
-                norm.eps,
-                norm.weight_offset,
-                pdl_enabled(),
-                None,
-            )
-            output = state.all_reduce.acquire_outputs((tuple(combined.shape),))[0]
-            output.copy_(combined)
-        else:
-            output = state.all_reduce.acquire_outputs(((rows, 4096),))[0]
-            routed_input_scale_rmsnorm_sum_gathered(
-                routes,
-                mapping,
-                rows,
-                8,
-                weights,
-                norm.weight,
-                norm.eps,
-                norm.weight_offset,
-                pdl_enabled(),
-                output,
-            )
-        return state.reduce_scatter_owned_rows(output).clone()
-
-    def run(case):
-        rows = case["rows"]
-        expected = reference(case["routes"], case["mapping"], rows, case["weights"])
-        producer = state.all_reduce.acquire_outputs(((rows, 8192),))[0]
-        producer.copy_(case["attention"])
-        state.reduce_scatter_owned_rows(producer)
-        local_rows = (rows + world_size - 1) // world_size
-        valid = max(0, min(local_rows, rows - rank * local_rows))
-        packet, _, _ = state.gather_owned_moe_inputs(
-            case["packet"], case["ids"], case["scores"], rows, valid
-        )
-        if rank == rows % world_size:
-            torch.cuda._sleep(20000)
-        actual = moe._reduce_expert_routes(
-            case["routes"], case["mapping"], rows, case["weights"], owned_rows=True
-        ).clone()
-        upper = state.acquire_owned_post_expert_output(rows, 8192)
-        upper[:, :4096].copy_(actual)
-        upper[:, 4096:].copy_(actual * 2)
-        full = state.all_gather_owned_rows(upper, rows, False)
-        return expected, actual, packet, full
-
-    cases = [inputs(rows) for rows in (192, 193, 8191)]
-    for case in cases:
-        update(case, 0)
-        run(case)
-    for flags in (state.row_scatter_flags, state.row_gather_flags):
-        flags.view(torch.int32).fill_(-2)
-    state.all_reduce.peers.ctx.device_barrier()
-    torch.cuda.synchronize()
-    dist.barrier()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        saved = [run(case) for case in cases]
-    for step in range(4):
-        for case in cases:
-            update(case, step)
-        graph.replay()
-        for case, (expected, actual, packet, full) in zip(cases, saved):
-            torch.testing.assert_close(
-                actual.view(torch.int16), expected.view(torch.int16), rtol=0, atol=0
-            )
-            rows = case["rows"]
-            local_rows = (rows + world_size - 1) // world_size
-            valid = max(0, min(local_rows, rows - rank * local_rows))
-            torch.testing.assert_close(
-                actual[valid:], torch.zeros_like(actual[valid:]), rtol=0, atol=0
-            )
-            owner = torch.arange(rows, device=device) // local_rows
-            torch.testing.assert_close(
-                packet,
-                ((owner + 1) * (step + 1) / 8)
-                .to(torch.bfloat16)[:, None]
-                .expand_as(packet),
-                rtol=0,
-                atol=0,
-            )
-            first = rank * local_rows
-            torch.testing.assert_close(
-                full[first : first + valid, :4096], actual[:valid], rtol=0, atol=0
-            )
-            torch.testing.assert_close(
-                full[first : first + valid, 4096:],
-                (actual * 2)[:valid],
-                rtol=0,
-                atol=0,
-            )
-    unseen = inputs(2051)
-    update(unseen, 0)
-    with assert_no_triton_compile(
-        iris_routed_rmsnorm_weighted_sum_write_through, iris_pull_reduce_scatter
-    ):
-        expected, actual, _, _ = run(unseen)
-        torch.testing.assert_close(
-            actual.view(torch.int16), expected.view(torch.int16), rtol=0, atol=0
-        )
-    moe.post_expert_norm.weight_offset = 0.0
-    expected, actual, _, _ = run(unseen)
-    torch.testing.assert_close(
-        actual.view(torch.int16), expected.view(torch.int16), rtol=0, atol=0
-    )
-    # The unmapped BF16 layer retains the portable producer and release path.
-    dense = cases[1]["original"].view(193, 8, 4096)
-    expected = reference(dense, None, 193, cases[1]["weights"])
-    actual = moe._reduce_expert_routes(
-        dense, None, 193, cases[1]["weights"], owned_rows=True
-    )
-    torch.testing.assert_close(
-        actual.view(torch.int16), expected.view(torch.int16), rtol=0, atol=0
-    )
-    torch.cuda.synchronize()
-    dist.barrier()
-
-
 def _muse_owned_stream_tap_worker(rank, world_size, device):
     """Gather BF16-rounded owned FP32 residual rows between other collectives
     that use pull scratch."""
@@ -3403,209 +3342,6 @@ def _muse_owned_stream_tap_worker(rank, world_size, device):
     dist.barrier()
 
 
-def _muse_ordinary_all_reduce_worker(rank, world_size, device):
-    """Ordinary all-reduces on Muse's group, such as a draft model's per-layer
-    reductions, use its prepared reduction: they match RCCL bit for bit, stay
-    in caller storage across later collectives and another stream's reads,
-    replay from a graph interleaved with Muse's own reductions, and hand
-    payloads past the limit, views of state storage and MAX to RCCL or
-    staging. Muse's own ordinary reduce takes the same policy."""
-    torch.set_grad_enabled(False)
-    from tokenspeed_kernel.ops.communication._iris.all_reduce import (
-        ProducerAllReduce,
-        iris_lamport_bf16_allreduce,
-        iris_lamport_twoshot_bf16_allreduce,
-        iris_pull_oneshot,
-        iris_pull_twoshot,
-        iris_push_twoshot_allreduce,
-    )
-    from utils import assert_no_triton_compile
-
-    from tokenspeed.runtime.distributed.comm_backend.registry import (
-        get_global_backend,
-    )
-    from tokenspeed.runtime.distributed.comm_ops import all_reduce
-
-    group, state = _prepare_muse_backend(world_size, None, None, expert_tp_size=1)
-    iris = get_global_backend().iris
-    generator = torch.Generator(device=device).manual_seed(rank)
-
-    def operands(rows, width=8192):
-        # Small integers sum exactly in any order, so every protocol must
-        # match RCCL bit for bit. Negative zeros look like the Lamport empty
-        # marker and must still be reduced as zeros.
-        values = torch.randint(
-            -16, 17, (rows, width), generator=generator, device=device
-        ).bfloat16()
-        values[:, rank::7] = -0.0
-        expected = values.clone()
-        dist.all_reduce(expected)
-        return values, expected
-
-    # Lamport one-shot and (TP8) two-shot windows, the two-shot's largest
-    # payload (172 rows) and one row past it, the TP4 push window, the
-    # producer pull, a width outside the Lamport windows (the one-shot pull
-    # at TP4, staging at TP8), and the largest payload served.
-    limit_rows = ProducerAllReduce.ORDINARY_MAX_BYTES[world_size] // (8192 * 2)
-    for rows, width in (
-        (1, 8192),
-        (8, 8192),
-        (21, 8192),
-        (22, 8192),
-        (33, 8192),
-        (64, 8192),
-        (128, 8192),
-        (129, 8192),
-        (172, 8192),
-        (173, 8192),
-        (limit_rows, 8192),
-        (5, 4096),
-        (1, 768),
-    ):
-        values, expected = operands(rows, width)
-        assert iris.can_run(values, group)
-        result = all_reduce(values, group)
-        assert result.data_ptr() == values.data_ptr()
-        torch.testing.assert_close(result, expected, atol=0, rtol=0)
-
-    values, expected = operands(limit_rows + 1)
-    assert not state.reduction.can_reduce_ordinary(values, rccl_fallback=True)
-    assert not iris.can_run(values, group)
-    torch.testing.assert_close(all_reduce(values, group), expected, atol=0, rtol=0)
-    # Muse's own reduce has no RCCL fallback and serves it through the policy.
-    values, expected = operands(limit_rows + 1)
-    torch.testing.assert_close(state.reduce(values), expected, atol=0, rtol=0)
-    values, expected = operands(64)
-    torch.testing.assert_close(state.reduce(values), expected, atol=0, rtol=0)
-
-    values, _ = operands(8)
-    maximum = values.clone()
-    dist.all_reduce(maximum, op=dist.ReduceOp.MAX)
-    assert not iris.can_run(values, group, op=dist.ReduceOp.MAX)
-    torch.testing.assert_close(
-        all_reduce(values, group, op=dist.ReduceOp.MAX), maximum, atol=0, rtol=0
-    )
-
-    # A reduce-scatter result lives in pull scratch; reducing it in place
-    # through the pull would overwrite it, so the policy declines it.
-    full, _ = operands(192)
-    owned = state.reduce_scatter_owned_rows(full)
-    # Refill the view with small integers so the reduction stays exact.
-    values, expected = operands(owned.shape[0])
-    owned.copy_(values)
-    assert not state.reduction.can_reduce_ordinary(owned, rccl_fallback=True)
-    torch.testing.assert_close(all_reduce(owned, group), expected, atol=0, rtol=0)
-
-    # Reduce Lamport-sized and pull-sized payloads, then keep the model's
-    # own reduction and more ordinary ones running on the main stream while
-    # another stream, delayed, copies the first two results. A result that
-    # borrowed state storage would be overwritten by then.
-    aux = torch.cuda.Stream(device)
-    # The last two sizes take the Lamport one-shot over 48 tiles, while
-    # Muse's 5-row reduction between them uses 80 tiles of the same mailbox.
-    shapes = ((64, 8192), (172, 8192), (8, 8192), (3, 8192))
-    sources = [
-        torch.empty(shape, dtype=torch.bfloat16, device=device) for shape in shapes
-    ]
-    reduced = [torch.empty_like(source) for source in sources]
-    copies = [torch.empty_like(source) for source in sources[:2]]
-    target_source = torch.empty((26, 8192), dtype=torch.bfloat16, device=device)
-    fork = torch.cuda.Event()
-    join = torch.cuda.Event()
-
-    def step():
-        first = all_reduce(reduced[0], group)
-        fork.record()
-        with torch.cuda.stream(aux):
-            aux.wait_event(fork)
-            torch.cuda._sleep(50000)
-            copies[0].copy_(first)
-        second = all_reduce(reduced[1], group)
-        branch = state.all_reduce.acquire_outputs(((26, 8192),))[0]
-        branch.copy_(target_source)
-        target = state.reduce_outputs((branch,))[0].clone()
-        all_reduce(reduced[2], group)
-        small = state.all_reduce.acquire_outputs(((5, 8192),))[0]
-        small.copy_(target_source[:5])
-        small_target = state.reduce_outputs((small,))[0].clone()
-        all_reduce(reduced[3], group)
-        fork.record()
-        with torch.cuda.stream(aux):
-            aux.wait_event(fork)
-            copies[1].copy_(second)
-            join.record()
-        torch.cuda.current_stream().wait_event(join)
-        return target, small_target
-
-    def load(step_index):
-        expected = []
-        for source, destination in zip(sources, reduced):
-            values, total = operands(source.shape[0])
-            source.copy_(values)
-            destination.copy_(values)
-            expected.append(total)
-        target_source.fill_((rank + 1) * (step_index + 1))
-        return expected
-
-    def check(expected, targets, step_index):
-        for actual, total in zip(reduced, expected):
-            torch.testing.assert_close(actual, total, atol=0, rtol=0)
-        for actual, total in zip(copies, expected):
-            torch.testing.assert_close(actual, total, atol=0, rtol=0)
-        for target in targets:
-            torch.testing.assert_close(
-                target,
-                torch.full_like(
-                    target, world_size * (world_size + 1) // 2 * (step_index + 1)
-                ),
-                atol=0,
-                rtol=0,
-            )
-
-    expected = load(0)
-    check(expected, step(), 0)
-    torch.cuda.synchronize()
-    dist.barrier()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        targets = step()
-    for step_index in range(6):
-        expected = load(step_index)
-        torch.cuda.synchronize()
-        if rank == step_index % world_size:
-            torch.cuda._sleep(20000)
-        graph.replay()
-        check(expected, targets, step_index)
-
-    # Sizes between and around the ones above reuse the compiled kernels: the
-    # pulls take their workgroup and tile counts unspecialized.
-    with assert_no_triton_compile(
-        iris_lamport_bf16_allreduce,
-        iris_lamport_twoshot_bf16_allreduce,
-        iris_pull_oneshot,
-        iris_pull_twoshot,
-        iris_push_twoshot_allreduce,
-    ):
-        for rows, width in (
-            (3, 8192),
-            (17, 8192),
-            (40, 8192),
-            (80, 8192),
-            (100, 8192),
-            (136, 8192),
-            (150, 8192),
-            (200, 8192),
-            (300, 8192),
-            (3, 768),
-        ):
-            values, expected = operands(rows, width)
-            torch.testing.assert_close(
-                all_reduce(values, group), expected, atol=0, rtol=0
-            )
-    torch.cuda.synchronize()
-    dist.barrier()
-
-
 @pytest.mark.parametrize(
     "check,backend",
     [
@@ -3616,32 +3352,37 @@ def _muse_ordinary_all_reduce_worker(rank, world_size, device):
             partial(_muse_boundary_worker, sharded=True), "nccl", id="boundary_scatter"
         ),
         pytest.param(_muse_collective_policy_worker, "nccl", id="collective_policy"),
+        pytest.param(_muse_pull_warmup_worker, "nccl", id="pull_warmup"),
         pytest.param(_muse_owned_packet_worker, "gloo", id="owned_packets"),
-        pytest.param(_muse_owned_qkvg_worker, "nccl", id="qkvg_reload_and_receiver"),
         pytest.param(_muse_routed_lamport_worker, "nccl", id="routed_lamport"),
         pytest.param(
             _muse_lamport_gather_mxfp4_worker, "nccl", id="lamport_gather_mxfp4"
         ),
         pytest.param(
+            _muse_lamport_gather_mxfp4_topk_worker,
+            "nccl",
+            id="lamport_gather_mxfp4_topk",
+        ),
+        pytest.param(
             _muse_decode_step_lamport_worker, "nccl", id="decode_step_lamport"
         ),
         pytest.param(_muse_moetail_worker, "nccl", id="moetail"),
-        pytest.param(_muse_lamport_payload_worker, "nccl", id="lamport_payloads"),
-        pytest.param(_muse_owned_routed_wt_worker, "nccl", id="owned_routed_wt"),
-        pytest.param(_muse_owned_stream_tap_worker, "nccl", id="owned_stream_taps"),
         pytest.param(
-            _muse_ordinary_all_reduce_worker, "nccl", id="ordinary_all_reduce"
+            partial(_muse_sliding_attention_tail_worker, first_epoch=0),
+            "nccl",
+            id="sliding_attention_tail",
         ),
-        pytest.param(_muse_tp_routes_worker, "nccl", id="tp_routes"),
+        pytest.param(
+            partial(_muse_sliding_attention_tail_worker, first_epoch=2**31 - 2),
+            "nccl",
+            id="sliding_attention_tail_epoch_wrap",
+        ),
+        pytest.param(_muse_lamport_payload_worker, "nccl", id="lamport_payloads"),
+        pytest.param(_muse_owned_stream_tap_worker, "nccl", id="owned_stream_taps"),
         pytest.param(_muse_tp_route_scatter_worker, "nccl", id="tp_route_scatter"),
         pytest.param(_muse_tp_column_routes_worker, "nccl", id="tp_column_routes"),
         pytest.param(
             _muse_intermediate_exchange_worker, "nccl", id="intermediate_exchange"
-        ),
-        pytest.param(
-            partial(_muse_tp_owned_forward_worker, quantized=False, down_columns=False),
-            "nccl",
-            id="tp_owned_forward",
         ),
     ],
 )
@@ -3654,23 +3395,4 @@ def test_muse_collective_replay(check, backend, world_size):
         _communication_worker,
         (world_size, _get_open_port(), check, backend),
         world_size,
-    )
-
-
-@pytest.mark.parametrize("down_columns", [False, True])
-def test_muse_tp8_owned_a4w4_forward(down_columns):
-    _skip_if_unsupported(8, "Muse A4W4 owned forward")
-    _spawn_and_collect(
-        _communication_worker,
-        (
-            8,
-            _get_open_port(),
-            partial(
-                _muse_tp_owned_forward_worker,
-                quantized=True,
-                down_columns=down_columns,
-            ),
-            "nccl",
-        ),
-        8,
     )

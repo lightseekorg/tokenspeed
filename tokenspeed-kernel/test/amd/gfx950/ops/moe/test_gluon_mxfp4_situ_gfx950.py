@@ -1789,6 +1789,7 @@ def test_deferred_stage2_masks_uninitialized_remote_routes_gfx950() -> None:
                     0.0,
                     False,
                     None,
+                    None,
                 )
                 for routes in outputs
             ]

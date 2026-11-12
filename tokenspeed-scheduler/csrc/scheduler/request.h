@@ -77,16 +77,11 @@ public:
     }
     void NoteRetracted() { ++retraction_count_; }
 
-    // Cancellation follows the request lifetime, through transfer and forward retirement.
-    void DeferPdAbort() {
-        if (pd_abort_ == PdAbort::kNone) {
-            pd_abort_ = PdAbort::kAwaitingTransfer;
-        }
-    }
-    void RetirePdFailure() { pd_abort_ = PdAbort::kAwaitingForward; }
-    void ClearPdAbort() { pd_abort_ = PdAbort::kNone; }
-    bool PdAbortPending() const { return pd_abort_ != PdAbort::kNone; }
-    bool PdFailureRetired() const { return pd_abort_ == PdAbort::kAwaitingForward; }
+    // Decode rounds in which the prefill/decode interval held this prompt
+    // back (Submitted or Prefilling). Never reset, so the interval's bound
+    // on it spans every chunk.
+    std::int32_t PrefillDeferredRounds() const { return prefill_deferred_rounds_; }
+    void NotePrefillDeferred() { ++prefill_deferred_rounds_; }
 
     // True when the last admission's headroom already covers every token
     // this request could still generate. Retracting such a request is pure
@@ -338,6 +333,7 @@ public:
                               [](const fsm::PrefillAwaitingResult&) -> std::string { return "PrefillAwaitingResult"; },
                               [](const fsm::PrefillDone&) -> std::string { return "PrefillDone"; },
                               [](const fsm::Decoding&) -> std::string { return "Decoding"; },
+                              [](const fsm::PdTransferring&) -> std::string { return "PdTransferring"; },
                               [](const fsm::Retracted&) -> std::string { return "Retracted"; },
                               [](const fsm::Restoring&) -> std::string { return "Restoring"; },
                               [](const fsm::Finishing&) -> std::string { return "Finishing"; },
@@ -347,8 +343,7 @@ public:
     }
 
 private:
-    enum class PdAbort { kNone, kAwaitingTransfer, kAwaitingForward };
-    PdAbort pd_abort_{PdAbort::kNone};
+    friend struct SchedulerTestAccess;
     fsm::ForwardResources& forwardResources(const char* operation);
     const fsm::ForwardResources& forwardResources(const char* operation) const;
 
@@ -360,6 +355,7 @@ private:
     std::int32_t max_new_tokens_{0};
     std::int32_t max_cached_prefix_tokens_{std::numeric_limits<std::int32_t>::max()};
     std::int32_t retraction_count_{0};
+    std::int32_t prefill_deferred_rounds_{0};
     // GeneratedTokens() when the current admission was granted.
     std::int32_t generated_tokens_at_admission_{0};
     std::vector<std::int32_t> spec_candidate_ids_;

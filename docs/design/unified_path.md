@@ -205,6 +205,16 @@ collective path and return the original in-place output buffer.
 Ranks choose the collective from the shared dtype, operation and element
 count; local layout differences only require packing and copying back.
 
+### PyNCCL stream ordering
+
+When PyNCCL is enabled, every operation uses the same stream precedence:
+its explicit stream argument, then its communicator context's stream, then
+the calling thread's current CUDA stream on the communicator's device.
+This contract is identical during eager execution and graph capture, so a
+separate communicator stream cannot race input production or output
+consumption. Exiting the context, including through an exception, restores
+the prior communicator state.
+
 ### Rebinding a cache pool
 
 Prefill autotune and graph capture use distinct writable pages per fabricated
@@ -539,6 +549,31 @@ computes the stored width and consumes only logical columns, while CuTe gives
 TMA a logical view of that same storage. Eager and CUDA graph calls therefore
 share both the weight layout and its update semantics.
 
+CuTe gated residual mixing keeps model dimensions static and token rows dynamic
+within bounded full/tail and scheduling-round buckets. Scheduling-round
+boundaries depend on measured worker capacity, so one tile bucket can span
+several round buckets on a different device or stream. The cooperative grid
+must fit the selected function's measured resident capacity. Local pipelines
+share a physical CTA; their logical tiles are counted separately from that
+capacity. A rank-ordered FP32 merge completes Down before SiLU and publishes
+activation tiles through per-invocation epochs. Persistent scratch is allocated
+independently of the inference-mode context that first warms a layout.
+
+Down and Up reuse one shared-memory operand arena after Down's MMA completion.
+Up uses separate weight and activation rings when their stage counts differ;
+each ring waits for its last MMA reader before overwriting a slot. Large token
+tiles can retain two Up accumulators, publishing the first only after its final
+K tiles complete while the second continues. Readers acknowledge TMEM before
+reuse or deallocation. PDL, mutable weights and eager/graph calls use these same
+ownership and publication edges. Startup warms the bounded tactic variants
+through the ordinary operator. The validated model dimensions `(4, 2560, 320)`
+and `(4, 8192, 1024)` use the same parameterized implementation, with
+model-specific tile geometry, Up K width and cache policy. Token tiles for the
+existing model preserve resident parallelism and bound per-thread gate state
+for larger batches. Row-derived reduction groups and token pairing belong
+only to the wider model. Other dimensions keep ordinary kernel selection;
+the fused work budget still bounds automatic selection.
+
 Startup uses the ordinary dummy model traversal with `kernel_warmup` to
 prepare CuTe QSA, streaming top-k and gated residual configurations. It follows
 normal dispatch overrides and scratch budgets, independently of optional
@@ -687,6 +722,26 @@ configuration, so every DP rank derives the same answer
 only. `decode_graph=False` still requires `refresh_decode_metadata` and
 `init_cuda_graph_state` — eager decode runs the same unified path.
 
+Models whose embedding reads request-token history may implement
+`HistoryEmbeddingModel` on the inner model. Its
+`compute_input_embeddings(input_ids, ctx, *, request_token_history)` method is
+shared by ordinary forward and graph replay. At construction the graph owner
+resolves one embedding callable: this method, or a plain token lookup for models
+that do not require history. Argument preparation must preserve supplied
+`input_embeds` so the inner model skips embedding computation when they are present.
+The executor supplies its live `RequestTokenHistoryView`; the graph
+owner calls this method eagerly, before padding, and copies its result into
+the same static embedding buffer used by ordinary text and multimodal
+prefills. The method must return all input rows, and every history-dependent
+operation must finish there. The captured inner stack consumes the supplied
+`input_embeds` without requiring or appending history, including during
+`prepare_model_kwargs`. Decode keeps its existing embedding path. Capture uses
+zero dummy embeddings and does not access live history. Models requiring history
+without this protocol remain eager. Multimodal forwards of history-embedding
+models also remain eager because the multimodal embedding seam does not receive
+history.
+Request history retains its existing runtime owner and lifetime.
+
 Prefill graph warmup runs on the same side stream as capture. Some kernels
 cache occupancy by stream and reject a cold CUDA graph capture; warming on the
 default stream does not prepare their capture-stream state. The capture stream
@@ -804,11 +859,13 @@ static buffers (the target's hidden rows with a zero tail, the gather rows,
 the frontier), and its outputs land in static buffers the decode steps read.
 The draft prologue writes K/V inside a captured segment, which holds no
 per-layer Host-load wait, so a step-0 replay first waits for the draft pool's
-whole Host load, as the target's replay does. These captures run each segment
-as soon as it is captured (`run_segments_while_capturing`): their breaks index
-with values a segment computes (the top-k rows the narrowing gathers, the
-decode steps' positions), which a capture alone leaves unwritten when the
-break runs.
+whole Host load, as the target's replay does on a pool that does not declare
+`layer_accesses_wait_for_load`, and skips the per-layer waits its capture
+noted; the decode-step replays, behind step 0, skip theirs too. These captures
+run each segment as soon as it is captured (`run_segments_while_capturing`):
+their breaks index with values a segment computes (the top-k rows the
+narrowing gathers, the decode steps' positions), which a capture alone leaves
+unwritten when the break runs.
 
 A round replays only what the graphs baked: a pure extend (MIXED rounds run
 eager), no attention DP or query shard, a fitting bucket at the exact request
@@ -991,7 +1048,11 @@ cache contract, so the target allocates its write-location buffer
 unconditionally and drafts are gated structurally on `is_draft`.)
 
 K3 DSpark pipeline prefill distributes target-tap projection across stages,
-while the final stage owns the proposal network and draft cache. After
+while the final stage owns the proposal network and draft cache. Within a
+stage each attention-TP rank projects only its own `context_proj` output
+columns, so the partial sum crosses the stage boundary per rank at
+`hidden / attention TP` columns, and the final stage gathers the columns
+before the context norm. After
 target prefill sampling, that stage runs the ordinary drafter; its completed
 call publishes the final cache producer barrier. PD transfers the sampled
 anchor and real draft candidates with the target and draft caches. Decode
@@ -1041,7 +1102,11 @@ Greedy requests normalize to `top_k=1` in `SamplingParams.__post_init__`; the
 pool-indexed sampling route serves them, which is exactly what the captured
 graph records. `SamplingBatchInfo.is_all_greedy` and the eager-only argmax
 branches were deleted. Equivalence (top_k=1 == argmax, ties excepted) is
-pinned by `test/runtime/sampling/test_greedy_route_equivalence.py`.
+pinned by `test/runtime/sampling/test_greedy_route_equivalence.py` (for
+`sonic`, whose kernels rank candidates at bf16 resolution -- a penalized
+greedy pick lies within one bf16 ulp of the maximum -- and draw a request
+without top-k, top-p or min-p from its whole vocabulary, by
+`test_sonic_backend.py`).
 
 Admission uses the selected sampling backend's finite top-k bound. GPU
 backends retain the exclusive 128 bound. `ascend_full` accepts positive
@@ -1082,8 +1147,11 @@ window that accepts nothing and resolves to exactly one sampled token
 through the same pool kernels, `accept_length == 1`
 (`test_decode_verify_n1_equivalence.py`; Triton and FlashInfer's
 `per-request` stream use the same draw in `sample()` and `verify(N=1)`;
-FlashInfer's legacy `batch` stream retains the coin route). `future_input_map` is `[pool, output_length]` for
-the same reason: single-token decode is a width-1 candidate window.
+FlashInfer's legacy `batch` stream retains the coin route; `sonic` resolves
+the width-1 window through its single-step kernel, bitwise equal to
+`sample()`, pinned by `test_sonic_backend.py`). `future_input_map` is
+`[pool, output_length]` for the same reason: single-token decode is a width-1
+candidate window.
 
 Backends express verify geometry as a **floor**, not a mode: seq_lens clamp
 to `clamp_min(q_len)` unconditionally (drafts and plain decode have floor 1,
@@ -1187,8 +1255,11 @@ the contract: ordering, masking, supported configurations and cost.
 persistent output buffers, on eager and replay alike. The FlashInfer backend
 packs tokens and accept lengths into one region (`_output_pack_buf`), so its
 `get_packed_output_d2h` collapses the two device-to-host copies into one; the
-Triton backends return separate token and length buffers and take the
-executor's two-copy path (`get_packed_output_d2h` returns None).
+Triton backends and `sonic` return separate token and length buffers and
+take the executor's two-copy path (`get_packed_output_d2h` returns None).
+The stop conditions cut the returned accept lengths in place (0 for a stopped
+request), so a backend whose decode rows return a buffer of ones refills it on
+every call, as `sonic` and FlashInfer do.
 
 ### Logits capture state follows the tensor's device
 
@@ -1751,8 +1822,8 @@ them. This responsibility is fixed at construction, not inferred from a
 per-round readiness flag. The producer enqueues writes before the drafter on
 the same stream; failures propagate instead of selecting a fallback writer.
 The common block drafter always updates accepted-prefix lengths, but only
-projects/writes context when no producer is configured. Its optional auxiliary-stream writer is disabled for a forward with
-this producer, avoiding a second writer or a missing stream dependency.
+projects/writes context when no producer is configured. Its capture sink
+is not armed for a forward with this producer, avoiding a second writer.
 The final PD readiness barrier remains after the whole proposal call, since
 proposal execution can write the same draft fields after context injection.
 
@@ -1765,15 +1836,20 @@ seam is `BaseDrafter.prepare_target_forward(ctx)`, called right before the
 target runs: the drafter decides under its own gate whether this round
 qualifies and attaches what it needs; a fresh context per round means
 nothing outlives it, and a model that sees no attachment does nothing.
-DFLASH is the one user: its incremental projection attaches
+DFLASH is the one user: on decode-only rounds it attaches
 `ctx.target_capture_sink`, the target hands each captured tap to
-`on_target_capture` as it is produced, and the sink accumulates the
-draft's `fc` projection on the aux stream so the draft KV is written under
-the target's remaining layers. The arming gate is the same
-`_overlap_allowed` the drafter's `run` decides the overlap path by, so a
-round can never be armed on one side and drained on the other. These hooks
-consume the target's capture configuration; they do not change the tap
-selection or output layout.
+`on_target_capture` as it is produced, and the sink copies it (rounding a
+wider residual once) into its columns of one tap block. The last tap runs
+the same context projection and KV write as the drafter's `run` would on
+the concatenated taps, inline on the forward's stream: `fc` is split by
+output columns across attention TP, so the projection reads 1/TP of the
+weight and gathers the columns in order with the target's own
+collectives. No auxiliary stream is involved, so a capture point must
+hold no borrowed collective output the gather could overwrite. `run`
+writes the context itself only for a round the sink did not take, and
+refuses one it armed but never saw complete. These hooks consume the
+target's capture configuration; they do not change the tap selection or
+output layout.
 
 The reverse direction rides on the context as well: a target that captures
 its taps on a row subset reports it as ctx.captured_rows
@@ -2356,8 +2432,10 @@ Principle 5).
   signature conformance.
 * `test/runtime/execution/test_draft_target_wiring.py` — the drafter's
   target-forward hook: DFLASH arms its capture sink on the context only
-  under its overlap gate (not on mixed rounds, not in graph warmup), the
-  sink folds the taps into the projection and writes the KV once; the
+  on decode-only, non-idle rounds, the sink concatenates the taps and
+  writes the context once at the last tap
+  (`test_dflash_context_projection.py`: bit for bit what the projection of
+  the concatenated taps writes, with `fc` split across attention TP); the
   executor calls the hook before the target forward
   (`test_model_executor_cache_state.py`); the target hands taps to the
   forward's sink in concat order (`test_dspark_config.py`).
@@ -2483,10 +2561,14 @@ sequence-parallel router projections have nonempty, equal local row counts.
 A single-request TP warmup can skip a GEMM on an empty peer while another
 peer waits in distributed tactic selection. The draft remains in the same
 autotune context as the target. Serving batches and graph capture sizes are
-unchanged. A speculative decode service must reserve at least one request
-per attention TP peer: `max_num_seqs // data_parallel_size >= attn_tp_size`.
-Server-argument validation rejects smaller capacities before allocating
-buffers or running a forward, including with `--disable-autotune` (which
-disables profiling, not startup warmup). Increase `--max-num-seqs` to at
-least `data_parallel_size * attn_tp_size`. Prefill-only roles do not run
-this draft decode warmup and are exempt.
+unchanged. On NVIDIA, a speculative decode service must reserve at least one
+request per attention TP peer: `max_num_seqs // data_parallel_size >=
+attn_tp_size`. Server-argument validation rejects smaller capacities before
+allocating buffers or running a forward, including with `--disable-autotune`
+(which disables profiling, not startup warmup). Increase `--max-num-seqs` to
+at least `data_parallel_size * attn_tp_size`. Prefill-only roles do not run
+this draft decode warmup and are exempt. Other platforms run no FlashInfer
+tuning, so startup tuning has no cross-rank collectives: the draft decode
+warmup uses `min(attn_tp_size, max_decode_bs)` requests, and an empty peer
+skips its GEMMs as it does when serving fewer requests than peers. Decode
+state stays sized by `--max-num-seqs`.
