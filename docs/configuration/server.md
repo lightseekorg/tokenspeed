@@ -594,7 +594,7 @@ parser option keeps its existing behavior.
 | `--speculative-draft-model-path` | Draft model path or repo ID. |
 | `--speculative-draft-model-revision` | Branch, tag, or commit of a draft in its own repo. Defaults to the repo's default branch. A draft inside the target checkpoint uses `--revision`. |
 | `--speculative-draft-model-quantization` | Draft model quantization. Defaults to `unquant`. |
-| `--speculative-draft-model-load-format` | Draft weight loading format, with the same choices as `--load-format`. Omission inherits `--load-format`. Use `--load-format dummy --speculative-draft-model-load-format auto` to initialize the target randomly while loading the DFlash draft's checkpoint. Shared target embeddings and LM heads still follow the target's loading policy. |
+| `--speculative-draft-model-load-format` | Draft weight loading format, with the same choices as `--load-format`. Requires speculative decoding with a draft model; rejected when speculation is disabled or uses model-free `DUMMY` drafting. Omission inherits `--load-format`. Use `--load-format dummy --speculative-draft-model-load-format auto` to initialize the target randomly while loading the DFlash draft's checkpoint. Shared target embeddings and LM heads still follow the target's loading policy. |
 | `--speculative-num-steps` | Number of draft model steps. Defaults to `3`. |
 | `--speculative-num-draft-tokens` | Number of draft tokens. Defaults to `--speculative-num-steps + 1`; required for draft trees. |
 | `--synthetic-acceptance-length` | Benchmark-only mean emitted tokens per speculative verification, including the guaranteed target token. Unset disables it. |

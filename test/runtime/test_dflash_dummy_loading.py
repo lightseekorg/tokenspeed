@@ -77,6 +77,10 @@ def load(checkpoint, *, load_format, draft_load_format, is_draft):
         load_format,
         "--dtype",
         "float32",
+        "--speculative-algorithm",
+        "DFLASH",
+        "--speculative-draft-model-path",
+        str(checkpoint),
     ]
     if draft_load_format is not None:
         cli += ["--speculative-draft-model-load-format", draft_load_format]

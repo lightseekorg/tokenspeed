@@ -1827,6 +1827,15 @@ class ServerArgs:
         if self.speculative_draft_model_path == self.model:
             self.draft_model_path_use_base = True
 
+        if self.speculative_draft_model_load_format is not None and (
+            self.speculative_algorithm is None
+            or self.speculative_draft_model_path is None
+        ):
+            raise ValueError(
+                "--speculative-draft-model-load-format requires speculative "
+                "decoding with a draft model."
+            )
+
         draft_revision = self.speculative_draft_model_revision
         if draft_revision is not None and self.speculative_draft_model_path is None:
             raise ValueError(

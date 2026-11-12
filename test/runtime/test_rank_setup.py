@@ -1124,3 +1124,48 @@ def test_server_args_refuse_a_draft_revision_nothing_uses(draft, error):
             speculative_draft_model_revision="v2",
             **draft,
         )
+
+
+@pytest.mark.parametrize("load_format", ["auto", "dummy"])
+@pytest.mark.parametrize(
+    "draft",
+    [
+        {},
+        dict(speculative_draft_model_path="org/d"),
+        dict(speculative_algorithm="DUMMY", speculative_num_draft_tokens=4),
+        dict(speculative_algorithm="DFLASH"),
+    ],
+)
+def test_server_args_refuse_a_draft_load_format_nothing_uses(draft, load_format):
+    with pytest.raises(ValueError, match="load-format requires speculative decoding"):
+        ServerArgs(
+            model="org/t",
+            speculative_draft_model_load_format=load_format,
+            **draft,
+        )
+
+
+@pytest.mark.parametrize(
+    "draft, expected_path",
+    [
+        (dict(speculative_algorithm="MTP"), "org/t"),
+        (
+            dict(speculative_algorithm="DFLASH", speculative_draft_model_path="org/d"),
+            "org/d",
+        ),
+        (
+            dict(speculative_algorithm="EAGLE3", speculative_draft_model_path="org/t"),
+            "org/t",
+        ),
+    ],
+)
+def test_server_args_accept_a_draft_load_format_for_a_model(draft, expected_path):
+    args = ServerArgs(
+        model="org/t",
+        load_format="dummy",
+        speculative_draft_model_load_format="auto",
+        **draft,
+    )
+    assert args.speculative_draft_model_path == expected_path
+    assert args.load_format == "dummy"
+    assert args.speculative_draft_model_load_format == "auto"
