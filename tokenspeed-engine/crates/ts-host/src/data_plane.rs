@@ -187,11 +187,31 @@ impl Shared {
     /// control thread if it waits for a launch.
     fn fail(&self, failure: String) {
         // The control thread can still be waiting on a collective.
-        if let Some(launcher) = LAUNCHER_FAILURE.get() {
-            launcher.report(format_args!("the data plane failed:\n{failure}"));
+        let launcher = LAUNCHER_FAILURE.get();
+        if let Some(launcher) = launcher {
+            launcher.notify();
         }
-        self.state().failure.get_or_insert(failure);
+        let distinct = {
+            let mut state = self.state();
+            match &state.failure {
+                Some(first) => first != &failure,
+                None => {
+                    state.failure = Some(failure.clone());
+                    true
+                }
+            }
+        };
         self.changed.notify_all();
+        // Preserve the first failure for callers, but retain other diagnostics.
+        // Log outside the state lock and only after notifying the launcher.
+        if distinct {
+            if let Some(launcher) = launcher {
+                // Match the error's display when it reaches the host handler.
+                launcher.report(DataPlaneError(failure));
+            } else {
+                tracing::error!("the data plane failed:\n{failure}");
+            }
+        }
     }
 
     fn launch(&self, forward: ForwardId, launched: Py<PyAny>) {
@@ -306,7 +326,7 @@ impl PythonDataPlane {
         let (reply, answer) = mpsc::sync_channel(1);
         self.queue(op(reply))?;
         match answer.recv() {
-            Ok(answer) => answer.map_err(DataPlaneError),
+            Ok(answer) => answer.map_err(|failure| self.fail(failure)),
             Err(_) => {
                 self.failed()?;
                 Err(DataPlaneError("the forward thread exited".to_owned()))

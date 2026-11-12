@@ -1070,6 +1070,13 @@ for the forward thread or device cleanup. The launcher can begin stopping
 the local ranks even while the failing rank is still alive. An orderly stop
 still drains the forward thread and closes the data plane.
 
+Concurrent reporters wait only for the native signal attempt, never for
+another thread's log output. The data plane publishes its first failure
+and wakes waiters before logging; later distinct failures and cleanup
+errors remain visible without replacing the original serving error.
+Failures outside generation serving use the same native notifier when
+they reach the host's final error handler; their cleanup timing is unchanged.
+
 ## Checklist for extending the loop
 
 * New logic that reacts to scheduler/transfer/cache progress: put it in the

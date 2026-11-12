@@ -41,10 +41,11 @@ mod logging;
 mod pd;
 
 use std::{
+    collections::HashSet,
     process::ExitCode,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, OnceLock,
+        Arc, Mutex, OnceLock,
     },
     thread,
     time::Duration,
@@ -141,7 +142,8 @@ struct Args {
 static LAUNCHER_FAILURE: OnceLock<LauncherFailure> = OnceLock::new();
 
 struct LauncherFailure {
-    reported: AtomicBool,
+    notification: OnceLock<Option<std::io::Error>>,
+    logged: Mutex<HashSet<String>>,
     parent: Option<libc::pid_t>,
 }
 
@@ -151,27 +153,49 @@ impl LauncherFailure {
         // SAFETY: getppid has no preconditions.
         let parent = unsafe { libc::getppid() };
         Self {
-            reported: AtomicBool::new(false),
+            notification: OnceLock::new(),
+            logged: Mutex::new(HashSet::new()),
             parent: (parent > 0).then_some(parent),
         }
     }
 
+    /// Finish the signal attempt before any caller logs; return true once.
     #[allow(unsafe_code)]
-    fn report(&self, error: impl std::fmt::Display) {
-        if self.reported.swap(true, Ordering::Relaxed) {
-            return;
-        }
-        let signal_error = self.parent.and_then(|parent| {
-            // SAFETY: parent is a positive PID. Check that the launcher still
-            // owns this rank before sending the existing child-failure signal.
-            let failed =
-                unsafe { libc::getppid() == parent && libc::kill(parent, libc::SIGUSR1) != 0 };
-            failed.then(std::io::Error::last_os_error)
+    fn notify(&self) -> bool {
+        let mut first = false;
+        let signal_error = self.notification.get_or_init(|| {
+            first = true;
+            // Keep logging and Python outside this initialization: concurrent
+            // reporters wait here until the signal attempt has completed.
+            self.parent.and_then(|parent| {
+                // SAFETY: parent is positive. A parent in an outer PID
+                // namespace is 0 and must not become a process-group signal.
+                // Only notify the launcher that originally owned this rank.
+                let failed =
+                    unsafe { libc::getppid() == parent && libc::kill(parent, libc::SIGUSR1) != 0 };
+                failed.then(std::io::Error::last_os_error)
+            })
         });
-        // Synchronous logging can stall on a blocked output stream.
-        tracing::error!("{error}");
-        if let Some(error) = signal_error {
-            tracing::error!(%error, "could not notify the launcher");
+        if first {
+            if let Some(error) = signal_error {
+                tracing::error!(%error, "could not notify the launcher");
+            }
+        }
+        first
+    }
+
+    fn report(&self, error: impl std::fmt::Display) {
+        self.notify();
+        let error = error.to_string();
+        let distinct = self
+            .logged
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(error.clone());
+        if distinct {
+            // Synchronous logging can stall on a blocked output stream.
+            // Release the diagnostic lock before calling the writer.
+            tracing::error!("{error}");
         }
     }
 }
@@ -863,7 +887,13 @@ fn finish_serving(
         // work. Let the launcher start failure handling before either.
         launcher.report(error);
     }
-    served.and(close())
+    let closed = close();
+    if served.is_err() {
+        if let Err(error) = &closed {
+            tracing::error!(%error, "rank cleanup also failed");
+        }
+    }
+    served.and(closed)
 }
 
 fn main() -> ExitCode {
@@ -878,32 +908,17 @@ fn main() -> ExitCode {
     let launcher = LAUNCHER_FAILURE.get_or_init(LauncherFailure::for_parent);
     let served = (|| {
         interpreter::start(&args.python).map_err(HostError::Interpreter)?;
-        let served = {
-            // The host does not finalize Python. Drain its logger on success,
-            // error and unwind if the launcher has not stopped the rank.
-            let _python_logs = logging::PythonLogGuard;
-            serve(&args, launcher)
-        };
-        if served.is_err() && !launcher.reported.load(Ordering::Relaxed) {
-            // Failures outside the serving loop still notify after Python
-            // log cleanup.
-            let notified = Python::attach(|py| {
-                py.import("tokenspeed.runtime.engine.rust_host")?
-                    .call_method0("notify_launcher_of_failure")
-                    .map(drop)
-            });
-            if let Err(error) = notified {
-                tracing::error!(%error, "could not notify the launcher");
-            }
-        }
-        served
+        // The host does not finalize Python. Drain its logger on success,
+        // error and unwind if the launcher has not stopped the rank.
+        let _python_logs = logging::PythonLogGuard;
+        serve(&args, launcher)
     })();
     match served {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            if !launcher.reported.load(Ordering::Relaxed) {
-                tracing::error!("{error}");
-            }
+            // Errors outside generation serving still arrive after cleanup,
+            // but use the same native notification and parent checks.
+            launcher.report(&error);
             ExitCode::FAILURE
         }
     }
