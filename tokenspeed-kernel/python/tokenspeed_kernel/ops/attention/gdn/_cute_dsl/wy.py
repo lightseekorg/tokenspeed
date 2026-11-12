@@ -35,7 +35,6 @@ from cutlass.cute.runtime import from_dlpack, make_ptr
 from cutlass.cutlass_dsl import T, dsl_user_op
 from tokenspeed_kernel.ops.tuning import is_warming_up
 from tokenspeed_kernel.platform import pdl_enabled
-from tokenspeed_kernel.thirdparty.cute_dsl.memory import load_global_f16x4_as_f32
 
 
 @dsl_user_op
@@ -55,6 +54,33 @@ def _copy_h_16bytes(dst, src, source_bytes, *, loc=None, ip=None):
         ip=ip,
     )
     return Int32(result)
+
+
+@dsl_user_op
+def _load_four(pointer, is_bf16, *, loc=None, ip=None):
+    kind = "bf16" if is_bf16 else "f16"
+    code = "{ .reg .b32 lo, hi; .reg .b16 e0,e1,e2,e3;\n"
+    code += "ld.global.v2.b32 {lo,hi}, [$4];\n"
+    code += "mov.b32 {e0,e1},lo; mov.b32 {e2,e3},hi;\n"
+    for i in range(4):
+        code += f"cvt.f32.{kind} ${i},e{i};\n"
+    code += "}"
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32()] * 4),
+        [pointer.ir_value(loc=loc, ip=ip)],
+        code,
+        "=f,=f,=f,=f,l,~{memory}",
+        has_side_effects=True,
+        is_align_stack=False,
+        loc=loc,
+        ip=ip,
+    )
+    values = [llvm.extractvalue(T.f32(), result, [i], loc=loc, ip=ip) for i in range(4)]
+    return cute.TensorSSA(
+        vector.from_elements(ir.VectorType.get([4], T.f32()), values, loc=loc, ip=ip),
+        4,
+        Float32,
+    )
 
 
 @dsl_user_op
@@ -668,13 +694,13 @@ class GdnWYKernel:
                             & ((k_address & 7) == 0)
                         ):
                             rq.store(
-                                load_global_f16x4_as_f32(
+                                _load_four(
                                     q_address + lane * 8,
                                     q.element_type == cutlass.BFloat16,
                                 )
                             )
                             rk.store(
-                                load_global_f16x4_as_f32(
+                                _load_four(
                                     k_address + lane * 8,
                                     k.element_type == cutlass.BFloat16,
                                 )
@@ -774,7 +800,7 @@ class GdnWYKernel:
                     vector_address = v.iterator.toint() + vector_base * 2
                     if (vs[3] == 1) & ((vector_address & 7) == 0):
                         vector_values.store(
-                            load_global_f16x4_as_f32(
+                            _load_four(
                                 vector_address, v.element_type == cutlass.BFloat16
                             )
                         )

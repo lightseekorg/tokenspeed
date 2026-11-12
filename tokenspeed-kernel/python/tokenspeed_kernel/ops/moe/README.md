@@ -516,8 +516,8 @@ flush-to-zero reciprocal. Ordinary division or a differently rounded
 reciprocal is not an interchangeable numerical contract.
 
 The CuTe input quantizer uses the aligned four-value reader in
-`thirdparty/cute_dsl/memory.py`, shared with GDN. Callers supply valid
-eight-byte-aligned global addresses and retain their own bounds checks;
+`thirdparty/cute_dsl/memory.py`. Callers supply valid eight-byte-aligned
+global addresses and retain their own bounds checks;
 the helper preserves BF16/FP16-to-FP32 conversion and element order.
 
 A `PreparedMoEInput` retains the original inputs, the packed data, and the
