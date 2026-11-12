@@ -12,7 +12,7 @@ embeds CPython for the data plane. The design rules of the loop are in
 | `ts-client` | `tokenspeed-client` | A frontend's connection to the engines: the startup handshake, request routing across attention-DP ranks, output streams, aborts, control operations and an EPD encode server's encode requests. |
 | `ts-py` | `tokenspeed-py` | `tokenspeed_engine._native`: `ts-client` for Python tests and tools (`entrypoints/wire_driver.py`), with `tokenspeed_engine.host_binary()` naming the installed `ts-host`, and `ts-l3`'s executor for Python tests over a data plane's Host pool. |
 | `ts-collective` | `tokenspeed-collective` | CPU collectives among an engine's ranks over a TCP mesh: broadcast, all-gather and all-reduce, each frame checked against the collective the receiver is in. |
-| `ts-scheduler` | `tokenspeed-scheduler` | The C++ scheduler and its nanobind module compiled into the binary, with a `cxx` facade for the control thread. The module is registered as a built-in of the embedded interpreter, so the plans Python reads are the same C++ objects the control thread produced. |
+| `ts-scheduler` | `tokenspeed-scheduler` | The C++ scheduler and its nanobind module compiled into the binary, with a `cxx` facade for the control thread. The module is registered as a built-in of the embedded interpreter, so the plans Python reads are the same C++ objects the control thread produced. The crate also holds the host's profile span recorder, which the C++ scheduler's spans reach through the facade. |
 | `ts-control` | `tokenspeed-control` | One rank's control plane: ingress checks, request state and output processing, the scheduling loop and its in-flight queue, cache-op acknowledgment, control operations, grammars, the expert rebalance, KV events, the engine side of the msgpack wire, and the per-round agreements among ranks. |
 | `ts-grammar` | `tokenspeed-grammar` | Grammar-constrained decoding on xgrammar's C++ library: compilation and the matchers, which the data plane drives through C entry points. |
 | `ts-metrics` | `tokenspeed-metrics` | The engine's metrics: Prometheus' multiprocess files, written directly, and the events the node's plugin relay runs output plugins on. |
@@ -31,6 +31,10 @@ ts-client = { package = "tokenspeed-client", version = "0.1.0" }
 ```
 
 ## Wire conformance
+
+The [Rust engine CPU benchmark](crates/ts-control/benches/README.md) measures
+long-request ingress, prompt logprobs and high-frequency output streaming with
+the real wire, control and client classes, without a GPU or model weights.
 
 `crates/ts-wire/tests/fixtures/` holds messages written by the Python encoder.
 `cargo test` decodes each one, compares it field by field with the values the
@@ -62,6 +66,13 @@ bootstrap token. An older producer defaults the column to empty and its output
 rows report zero; older readers skip the appended column. `ts-client` output
 chunks, the Python chunk dictionaries, and `WireDriver.Completion` expose the
 same cumulative count.
+
+Completed prompt logprobs move from request state into the first output that
+ships them. The state retains the fact that they are final after transferring
+the buffers, so a retraction's replay neither gathers nor sends them again.
+The frontend likewise consumes a decoded batch into independently owned
+per-request chunks. A queued chunk owns its arrays until consumption or
+cancellation; one slow request need not retain another request's payload.
 
 ## Building
 

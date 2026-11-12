@@ -122,6 +122,8 @@ class RuntimeStates:
         # (--enable-speculative-sampling), see init_draft_probs.
         self.draft_probs: torch.Tensor | None = None
         self.draft_probs_sentinel: float = 0.0
+        # Token id of draft_probs column 0: this rank's shard start when it holds its columns only.
+        self.draft_probs_vocab_start: int = 0
         # Draft trees (init_draft_trees): next round's parents next to its tokens.
         self.chain_parents: torch.Tensor | None = None
         self.future_parent_map: torch.Tensor | None = None
@@ -156,16 +158,16 @@ class RuntimeStates:
         *,
         spec_num_tokens: int,
         reject_threshold: float,
-        columns: int | None = None,
+        shard: tuple[int, int] | None = None,
     ) -> None:
         """Allocate the drafter's recorded proposal distributions.
 
         ``draft_probs[slot, s]`` (fp32 ``[pool + 1, spec_num_tokens, vocab]``)
         is the distribution the chain drafter sampled its step-``s`` token
         from, which the next round verifies as candidate column ``s + 1``.
-        With ``columns`` (this rank's vocabulary shard) each rank holds the
-        distribution over its own columns only, ``[pool + 1,
-        spec_num_tokens, columns]``.
+        With ``shard`` (this rank's vocabulary shard: its first token id and
+        its column count) each rank holds the distribution over its own
+        columns only, ``[pool + 1, spec_num_tokens, columns]``.
         Rows start at the sentinel ``reject_threshold + 1``: a slot whose
         drafter has not recorded this round (fresh admission, PD landing)
         rejects every candidate and samples its first token from the full
@@ -181,8 +183,10 @@ class RuntimeStates:
             )
         pool_size = self.valid_cache_lengths.shape[0]
         self.draft_probs_sentinel = float(reject_threshold) + 1.0
+        vocab_start, columns = shard or (0, self.vocab_size)
+        self.draft_probs_vocab_start = vocab_start
         self.draft_probs = torch.full(
-            (pool_size, spec_num_tokens, columns or self.vocab_size),
+            (pool_size, spec_num_tokens, columns),
             self.draft_probs_sentinel,
             dtype=torch.float32,
             device=self.device,

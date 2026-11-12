@@ -1111,9 +1111,15 @@ without top-k, top-p or min-p from its whole vocabulary, by
 Admission uses the selected sampling backend's finite top-k bound. GPU
 backends retain the exclusive 128 bound. `ascend_full` accepts positive
 finite values and caps them at 4096 when populating its per-request scalar
-pool, before the int32 write. The normalized disabled sentinel (`top_k=-1`)
-keeps whole-vocabulary sampling. The captured graph reads that same pool
-for single-step sampling and chain verification.
+pool, before the int32 write. Whole-vocabulary top-p remains the default
+for the normalized disabled sentinel (`top_k=-1`). The model HF config
+boolean `npu_sampling_top_p_top_k_cap` opts into an effective `top_k=4096`
+when `top_p < 1`; it can be set through `--hf-overrides`. The executor
+passes the resolved target text HF config to the sampler factory. `top_p=1`
+and greedy requests keep their existing behavior. This policy is local
+to `ascend_full`; request parameters and other backends are unchanged.
+The captured graph reads that same pool for single-step sampling and
+chain verification.
 Ascend sampling consumes the logits already audited and sanitized by the
 executor's `NanGuard`; it does not repeat a host-side NaN truth test inside
 the captured graph. Per-request numerical error flags keep their existing
@@ -1664,11 +1670,13 @@ history destinations through `write_locations`.
   is the side-write variant — scratch resolution over the full-history
   table (`draft_history_view`) that must not clobber the published window
   (DFLASH's target-KV injection, DSpark context windows).
-* **Cross-backend reads**: `decode_window_locations()` /
-  `extend_span_locations()` expose the full-history group's published
-  windows; DFLASH reads the TARGET router's windows through them to copy
-  target-aligned KV into the draft cache (the pools share one page-id
-  space).
+* **Context writes**: `decode_window_locations()` /
+  `extend_span_locations()` expose the writing router's history windows.
+  DFLASH reads its own router before publishing a proposal window, so context
+  KV follows the draft group's pages even when its retention differs from
+  the target's. The runner refreshes both routers before the target forward;
+  capture-tap writes and the fallback context write consume that same round's
+  draft locations.
 * **Writes outside the backend** (the attention prologue) fetch their slots
   immediately before the write. An offloaded latent
   projection uses the compute slots returned by its sparse prepare. When a draft step-0

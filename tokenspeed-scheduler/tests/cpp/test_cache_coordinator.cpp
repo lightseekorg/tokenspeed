@@ -216,7 +216,8 @@ TEST(FullAttnMatcherTest, ProbeRequiresExplicitL3HitSet) {
 
 TEST(CacheGroupTest, HoldsSpecGroupIdManager) {
     BlockPool pool(8, {1});
-    auto mgr = std::make_unique<GroupAllocator>(/*cache_blocks_per_lcm_block=*/1, /*group_id=*/7, /*shard_count=*/1);
+    auto mgr = std::make_unique<GroupAllocator>(/*cache_blocks_per_lcm_block=*/1, /*group_id=*/7, /*shard_count=*/1,
+                                                /*kept_head_blocks=*/0);
     CacheGroup g(
         CacheGroupSpec{
             .attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
@@ -429,13 +430,13 @@ TEST(MakeCoordinatorTest, RejectsNonPositiveLogicalPOrPacking) {
 TEST(CacheCoordinatorTest, RejectsManagerGeometryThatDiffersFromDomainOrSpec) {
     BlockPool pool(8, {1});
     std::vector<CacheGroup> wrong_p;
-    wrong_p.emplace_back(
-        CacheGroupSpec{.attn_kind = AttnKind::kFull,
-                       .sliding_window = 0,
-                       .cache_blocks_per_lcm_block = 1,
-                       .block_granularity = 48},
-        std::make_unique<GroupAllocator>(/*cache_blocks_per_lcm_block=*/1, /*group_id=*/0, /*shard_count=*/1),
-        std::make_unique<FullAttnMatcher>());
+    wrong_p.emplace_back(CacheGroupSpec{.attn_kind = AttnKind::kFull,
+                                        .sliding_window = 0,
+                                        .cache_blocks_per_lcm_block = 1,
+                                        .block_granularity = 48},
+                         std::make_unique<GroupAllocator>(/*cache_blocks_per_lcm_block=*/1, /*group_id=*/0,
+                                                          /*shard_count=*/1, /*kept_head_blocks=*/0),
+                         std::make_unique<FullAttnMatcher>());
     EXPECT_THROW(CacheCoordinator(std::move(wrong_p), /*prefix_granularity=*/128, pool, /*enable_l3_storage=*/false,
                                   /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr,
                                   /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
@@ -443,13 +444,13 @@ TEST(CacheCoordinatorTest, RejectsManagerGeometryThatDiffersFromDomainOrSpec) {
                  std::runtime_error);
 
     std::vector<CacheGroup> wrong_k;
-    wrong_k.emplace_back(
-        CacheGroupSpec{.attn_kind = AttnKind::kFull,
-                       .sliding_window = 0,
-                       .cache_blocks_per_lcm_block = 8,
-                       .block_granularity = 128},
-        std::make_unique<GroupAllocator>(/*cache_blocks_per_lcm_block=*/1, /*group_id=*/0, /*shard_count=*/1),
-        std::make_unique<FullAttnMatcher>());
+    wrong_k.emplace_back(CacheGroupSpec{.attn_kind = AttnKind::kFull,
+                                        .sliding_window = 0,
+                                        .cache_blocks_per_lcm_block = 8,
+                                        .block_granularity = 128},
+                         std::make_unique<GroupAllocator>(/*cache_blocks_per_lcm_block=*/1, /*group_id=*/0,
+                                                          /*shard_count=*/1, /*kept_head_blocks=*/0),
+                         std::make_unique<FullAttnMatcher>());
     EXPECT_THROW(CacheCoordinator(std::move(wrong_k), /*prefix_granularity=*/128, pool, /*enable_l3_storage=*/false,
                                   /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr,
                                   /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
@@ -460,14 +461,14 @@ TEST(CacheCoordinatorTest, RejectsManagerGeometryThatDiffersFromDomainOrSpec) {
     // would silently disable placement balancing; both must agree.
     BlockPool sharded_pool(8, {2});
     std::vector<CacheGroup> wrong_shards;
-    wrong_shards.emplace_back(
-        CacheGroupSpec{.attn_kind = AttnKind::kFull,
-                       .sliding_window = 0,
-                       .cache_blocks_per_lcm_block = 2,
-                       .block_granularity = 128,
-                       .shard_count = 2},
-        std::make_unique<GroupAllocator>(/*cache_blocks_per_lcm_block=*/2, /*group_id=*/0, /*shard_count=*/1),
-        std::make_unique<FullAttnMatcher>());
+    wrong_shards.emplace_back(CacheGroupSpec{.attn_kind = AttnKind::kFull,
+                                             .sliding_window = 0,
+                                             .cache_blocks_per_lcm_block = 2,
+                                             .block_granularity = 128,
+                                             .shard_count = 2},
+                              std::make_unique<GroupAllocator>(/*cache_blocks_per_lcm_block=*/2, /*group_id=*/0,
+                                                               /*shard_count=*/1, /*kept_head_blocks=*/0),
+                              std::make_unique<FullAttnMatcher>());
     EXPECT_THROW(CacheCoordinator(std::move(wrong_shards), /*prefix_granularity=*/128, sharded_pool,
                                   /*enable_l3_storage=*/false, /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr,
                                   /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
@@ -483,7 +484,7 @@ TEST(CacheCoordinatorTest, RejectsManagerGroupIdThatDiffersFromItsIndex) {
                                        .cache_blocks_per_lcm_block = 1,
                                        .block_granularity = 128},
                         std::make_unique<GroupAllocator>(/*cache_blocks_per_lcm_block=*/1,
-                                                         /*group_id=*/1, /*shard_count=*/1),
+                                                         /*group_id=*/1, /*shard_count=*/1, /*kept_head_blocks=*/0),
                         std::make_unique<FullAttnMatcher>());
 
     EXPECT_THROW(CacheCoordinator(std::move(groups), /*prefix_granularity=*/128, pool, /*enable_l3_storage=*/false,
@@ -10603,116 +10604,123 @@ TEST(HostKvDuplicateOrderTest, MergesGroupsByOwnershipThenDeviceEpochThenBoundar
 
 TEST(HostWindowDuplicateOracleTest, ReclaimOnlyWhenRemovingTheCopyPreservesThePrefixMatch) {
     constexpr std::int32_t P = 8;
-    for (const std::int32_t granularity : {1, 2, 4, 8}) {
-        for (const std::int32_t window : {1, 3, 8, 10, 17, 40}) {
-            for (const std::int32_t tail_tokens : {0, 3}) {
-                for (const std::int32_t missing : {-1, 0, 1, 3}) {
-                    for (std::int32_t victim_page = 0; victim_page < 4; ++victim_page) {
-                        SCOPED_TRACE(::testing::Message()
-                                     << "g=" << granularity << " W=" << window << " tail=" << tail_tokens
-                                     << " missing=" << missing << " victim=" << victim_page);
-                        BlockPool device(128, {4, 1, 4});
-                        BlockPool host(128, {4, 1, 4});
-                        auto coordinator = MakeCoordinator(
-                            std::vector<CacheGroupSpec>{
-                                {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 4, .block_granularity = P},
-                                {.attn_kind = AttnKind::kState,
-                                 .cache_blocks_per_lcm_block = 1,
-                                 .block_granularity = 0},
-                                {.attn_kind = AttnKind::kSlidingWindow,
-                                 .sliding_window = window,
-                                 .cache_blocks_per_lcm_block = 4,
-                                 .block_granularity = granularity}},
-                            P, device, false, &host, nullptr, false, true, /*checkpoint_retention_requests=*/0);
-                        const std::int32_t T = 4 * P + tail_tokens;
-                        const auto tokens = MakeTokens(T + 1);
-                        std::vector<std::vector<std::int32_t>> pages;
-                        for (std::int32_t page = 0; page < 4; ++page) {
-                            pages.emplace_back(tokens.begin() + page * P, tokens.begin() + (page + 1) * P);
+    for (const std::int32_t sink : {0, 2, 9}) {
+        for (const std::int32_t granularity : {1, 2, 4, 8}) {
+            for (const std::int32_t window : {1, 3, 8, 10, 17, 40}) {
+                if (sink > 0 && window < P) continue;
+                for (const std::int32_t tail_tokens : {0, 3}) {
+                    for (const std::int32_t missing : {-1, 0, 1, 3}) {
+                        for (std::int32_t victim_page = 0; victim_page < 4; ++victim_page) {
+                            SCOPED_TRACE(::testing::Message() << "sink=" << sink << " g=" << granularity
+                                                              << " W=" << window << " tail=" << tail_tokens
+                                                              << " missing=" << missing << " victim=" << victim_page);
+                            BlockPool device(128, {4, 1, 4});
+                            BlockPool host(128, {4, 1, 4});
+                            auto coordinator = MakeCoordinator(
+                                std::vector<CacheGroupSpec>{{.attn_kind = AttnKind::kFull,
+                                                             .cache_blocks_per_lcm_block = 4,
+                                                             .block_granularity = P},
+                                                            {.attn_kind = AttnKind::kState,
+                                                             .cache_blocks_per_lcm_block = 1,
+                                                             .block_granularity = 0},
+                                                            {.attn_kind = AttnKind::kSlidingWindow,
+                                                             .sliding_window = window,
+                                                             .sink_tokens = sink,
+                                                             .cache_blocks_per_lcm_block = 4,
+                                                             .block_granularity = granularity}},
+                                P, device, false, &host, nullptr, false, true, /*checkpoint_retention_requests=*/0);
+                            const std::int32_t T = 4 * P + tail_tokens;
+                            const auto tokens = MakeTokens(T + 1);
+                            std::vector<std::vector<std::int32_t>> pages;
+                            for (std::int32_t page = 0; page < 4; ++page) {
+                                pages.emplace_back(tokens.begin() + page * P, tokens.begin() + (page + 1) * P);
+                            }
+                            const auto hashes = ContentHashes(pages);
+                            const std::optional<TailPublication> tail =
+                                tail_tokens == 0
+                                    ? std::nullopt
+                                    : std::optional{TailPublication{
+                                          .tail_tokens = tail_tokens,
+                                          .hash = HashPrefixPage(token_span(tokens.data() + 4 * P, tail_tokens),
+                                                                 hashes.back())}};
+                            std::vector<BlockTable> tables(3);
+                            ASSERT_TRUE(AdmitForTest(coordinator, tables, T + 1));
+                            coordinator.CacheCompletedBlocks(
+                                tables,
+                                RequestProgress{
+                                    .completed_pages = CompletedPages{.prefix_hashes = hashes,
+                                                                      .first_new_prefix_page = 0,
+                                                                      .tail = tail,
+                                                                      .publish_state = true,
+                                                                      .boundary_kind = CacheBoundaryKind::kEndpoint},
+                                    .num_computed_tokens = T},
+                                CacheCoordinatorTestAccess::NextAccessEpoch(coordinator));
+                            coordinator.Free(tables);
+                            std::vector<CacheKey> host_keys;
+                            std::vector<CacheKey> window_keys;
+                            const auto copy_boundary = [&](const std::string& hash, std::int32_t count) {
+                                coordinator.ForEachBoundaryKey(
+                                    Key(hash, 0), count, [&](std::size_t i, const CacheKey& key) {
+                                        if (!coordinator.GroupPrefixIndex(i).Contains(device, key)) return;
+                                        CacheBlockRef copy = host.AcquireBlock(key.group_id);
+                                        coordinator.CacheHostBlock(copy, key, std::nullopt);
+                                        host_keys.push_back(key);
+                                        if (i == 2) window_keys.push_back(key);
+                                    });
+                            };
+                            for (const auto& hash : hashes) copy_boundary(hash, 0);
+                            if (tail) copy_boundary(tail->hash, tail_tokens);
+                            const CacheKey state = Key(tail ? tail->hash : hashes.back(), 1);
+                            const auto evict_device = [&](const CacheKey& key) {
+                                const auto location =
+                                    CacheCoordinatorTestAccess::DeviceLocationOf(coordinator, key.group_id, key);
+                                EXPECT_TRUE(location);
+                                if (location)
+                                    EXPECT_TRUE(CacheCoordinatorTestAccess::EvictCachedBlock(coordinator, key.group_id,
+                                                                                             *location));
+                            };
+                            evict_device(state);
+                            // Evicting a tail State also removes that tier's tail
+                            // history. Pick a remaining Device window block.
+                            std::erase_if(window_keys, [&](const CacheKey& key) {
+                                return !coordinator.GroupPrefixIndex(2).Contains(device, key);
+                            });
+                            if (missing >= 0 && !window_keys.empty()) {
+                                evict_device(window_keys[std::min<std::size_t>(missing, window_keys.size() - 1)]);
+                            }
+                            const auto match = [&] {
+                                const auto probe = coordinator.ProbePromptPrefix(
+                                    {.prefix_hashes = hashes, .tokens = tokens, .max_tokens = T});
+                                return std::max(probe.device.num_common_tokens, probe.host.num_common_tokens);
+                            };
+                            ASSERT_EQ(match(), T);
+                            const CacheKey victim = Key(hashes[victim_page], 0);
+                            ASSERT_TRUE(CacheCoordinatorTestAccess::EvictHostCachedBlock(coordinator, victim));
+                            const bool safe = match() == T;
+                            {
+                                CacheBlockRef copy = host.AcquireBlock(0);
+                                coordinator.CacheHostBlock(copy, victim, std::nullopt);
+                            }
+                            std::vector<CacheBlockRef> held;
+                            for (const auto& key : host_keys) {
+                                if (key != victim) held.push_back(coordinator.AcquireHostCachedBlock(key));
+                            }
+                            for (CacheBlockRef& block : host.AcquireBlocks(0, host.NumFreeSlots(0))) {
+                                held.push_back(std::move(block));
+                            }
+                            for (CacheBlockRef& block : host.AcquireBlocks(1, host.NumEmptyLcmBlocks())) {
+                                held.push_back(std::move(block));
+                            }
+                            const std::array<std::uint32_t, 1> groups{0};
+                            const std::array<std::int32_t, 1> buckets{0};
+                            const std::array segments{
+                                CacheCoordinator::HostSegmentRows{.first_row = 0, .past_end_row = 1}};
+                            const auto batch = coordinator.AcquireHostSegments(groups, buckets, segments);
+                            EXPECT_EQ(batch.stats.allocated, safe ? 1u : 0u);
+                            EXPECT_EQ(coordinator.ContainsHostCachedBlock(victim), !safe);
+                            EXPECT_EQ(match(), T);
+                            EXPECT_TRUE(coordinator.ContainsHostCachedBlock(state));
                         }
-                        const auto hashes = ContentHashes(pages);
-                        const std::optional<TailPublication> tail =
-                            tail_tokens == 0 ? std::nullopt
-                                             : std::optional{TailPublication{
-                                                   .tail_tokens = tail_tokens,
-                                                   .hash = HashPrefixPage(
-                                                       token_span(tokens.data() + 4 * P, tail_tokens), hashes.back())}};
-                        std::vector<BlockTable> tables(3);
-                        ASSERT_TRUE(AdmitForTest(coordinator, tables, T + 1));
-                        coordinator.CacheCompletedBlocks(
-                            tables,
-                            RequestProgress{
-                                .completed_pages = CompletedPages{.prefix_hashes = hashes,
-                                                                  .first_new_prefix_page = 0,
-                                                                  .tail = tail,
-                                                                  .publish_state = true,
-                                                                  .boundary_kind = CacheBoundaryKind::kEndpoint},
-                                .num_computed_tokens = T},
-                            CacheCoordinatorTestAccess::NextAccessEpoch(coordinator));
-                        coordinator.Free(tables);
-                        std::vector<CacheKey> host_keys;
-                        std::vector<CacheKey> window_keys;
-                        const auto copy_boundary = [&](const std::string& hash, std::int32_t count) {
-                            coordinator.ForEachBoundaryKey(
-                                Key(hash, 0), count, [&](std::size_t i, const CacheKey& key) {
-                                    if (!coordinator.GroupPrefixIndex(i).Contains(device, key)) return;
-                                    CacheBlockRef copy = host.AcquireBlock(key.group_id);
-                                    coordinator.CacheHostBlock(copy, key, std::nullopt);
-                                    host_keys.push_back(key);
-                                    if (i == 2) window_keys.push_back(key);
-                                });
-                        };
-                        for (const auto& hash : hashes) copy_boundary(hash, 0);
-                        if (tail) copy_boundary(tail->hash, tail_tokens);
-                        const CacheKey state = Key(tail ? tail->hash : hashes.back(), 1);
-                        const auto evict_device = [&](const CacheKey& key) {
-                            const auto location =
-                                CacheCoordinatorTestAccess::DeviceLocationOf(coordinator, key.group_id, key);
-                            EXPECT_TRUE(location);
-                            if (location)
-                                EXPECT_TRUE(
-                                    CacheCoordinatorTestAccess::EvictCachedBlock(coordinator, key.group_id, *location));
-                        };
-                        evict_device(state);
-                        // Evicting a tail State also removes that tier's tail
-                        // history. Pick a remaining Device window block.
-                        std::erase_if(window_keys, [&](const CacheKey& key) {
-                            return !coordinator.GroupPrefixIndex(2).Contains(device, key);
-                        });
-                        if (missing >= 0 && !window_keys.empty()) {
-                            evict_device(window_keys[std::min<std::size_t>(missing, window_keys.size() - 1)]);
-                        }
-                        const auto match = [&] {
-                            const auto probe = coordinator.ProbePromptPrefix(
-                                {.prefix_hashes = hashes, .tokens = tokens, .max_tokens = T});
-                            return std::max(probe.device.num_common_tokens, probe.host.num_common_tokens);
-                        };
-                        ASSERT_EQ(match(), T);
-                        const CacheKey victim = Key(hashes[victim_page], 0);
-                        ASSERT_TRUE(CacheCoordinatorTestAccess::EvictHostCachedBlock(coordinator, victim));
-                        const bool safe = match() == T;
-                        {
-                            CacheBlockRef copy = host.AcquireBlock(0);
-                            coordinator.CacheHostBlock(copy, victim, std::nullopt);
-                        }
-                        std::vector<CacheBlockRef> held;
-                        for (const auto& key : host_keys) {
-                            if (key != victim) held.push_back(coordinator.AcquireHostCachedBlock(key));
-                        }
-                        for (CacheBlockRef& block : host.AcquireBlocks(0, host.NumFreeSlots(0))) {
-                            held.push_back(std::move(block));
-                        }
-                        for (CacheBlockRef& block : host.AcquireBlocks(1, host.NumEmptyLcmBlocks())) {
-                            held.push_back(std::move(block));
-                        }
-                        const std::array<std::uint32_t, 1> groups{0};
-                        const std::array<std::int32_t, 1> buckets{0};
-                        const std::array segments{CacheCoordinator::HostSegmentRows{.first_row = 0, .past_end_row = 1}};
-                        const auto batch = coordinator.AcquireHostSegments(groups, buckets, segments);
-                        EXPECT_EQ(batch.stats.allocated, safe ? 1u : 0u);
-                        EXPECT_EQ(coordinator.ContainsHostCachedBlock(victim), !safe);
-                        EXPECT_EQ(match(), T);
-                        EXPECT_TRUE(coordinator.ContainsHostCachedBlock(state));
                     }
                 }
             }

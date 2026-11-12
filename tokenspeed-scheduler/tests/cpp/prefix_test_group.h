@@ -46,7 +46,7 @@ public:
     PrefixTestGroup(std::int32_t block_granularity, std::int32_t cache_blocks_per_lcm_block, std::uint32_t group_id,
                     std::int32_t sliding_window)
         : geometry_{block_granularity},
-          allocator_{cache_blocks_per_lcm_block, group_id, /*shard_count=*/1},
+          allocator_{cache_blocks_per_lcm_block, group_id, /*shard_count=*/1, /*kept_head_blocks=*/0},
           index_{group_id},
           sliding_window_{sliding_window} {}
 
@@ -100,7 +100,7 @@ public:
     GroupPrefixProbe Probe(const BlockPool& pool, std::span<const CacheKey> keys, std::int32_t begin_blocks,
                            std::int32_t max_blocks) const {
         if (sliding_window_ > 0) {
-            return SwaMatcher(geometry_.BlockGranularity(), sliding_window_)
+            return SwaMatcher(geometry_.BlockGranularity(), sliding_window_, /*sink_tokens=*/0)
                 .Probe(index_, pool, keys, begin_blocks, max_blocks, /*extra_hits=*/nullptr);
         }
         return FullAttnMatcher{}.Probe(index_, pool, keys, begin_blocks, max_blocks, /*extra_hits=*/nullptr);

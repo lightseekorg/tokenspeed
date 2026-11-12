@@ -75,6 +75,13 @@ void SchedulerConfig::Validate() const {
                 "Scheduler: a State group with checkpoint_granularity > 1 requires state_checkpoint_in_forward");
         }
     }
+    if (enable_kv_cache_events && std::none_of(cache_groups.begin(), cache_groups.end(),
+                                               [](const auto& group) { return group.attn_kind == AttnKind::kFull; })) {
+        throw std::invalid_argument(
+            "Scheduler: KV cache events require a continuous Full/history cache group; "
+            "State-only, SWA-only, and State + SWA layouts are unsupported. "
+            "Disable enable_kv_cache_events to use these layouts without KV event routing.");
+    }
     if (prefix_replay_tokens < 0) {
         throw std::invalid_argument("Scheduler: prefix_replay_tokens must be >= 0");
     }
@@ -250,6 +257,13 @@ void SchedulerConfig::ValidateCapacityInputs() const {
         }
         if (group.replayable) {
             replay_window_tokens = std::max(replay_window_tokens, *group.sliding_window_tokens);
+        }
+        if (group.sink_tokens > 0 && *group.sliding_window_tokens < prefix_granularity) {
+            // The window then needs every block of a tail, so a tail in the
+            // sink's page holds the sink blocks too (CacheCoordinator).
+            throw std::invalid_argument("Cache group '" + group.group_id +
+                                        "': a group with sink_tokens needs sliding_window_tokens >= "
+                                        "prefix_granularity");
         }
     }
     if (replay_window_tokens > 0 && checkpoint_granularity > 1) {

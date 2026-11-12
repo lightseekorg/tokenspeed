@@ -159,23 +159,24 @@ def _weak_ref_arg(a: Any) -> Any:
     """Hold break arg ``a`` without pinning its graph-pool blocks.
 
     A CUDA tensor becomes a :func:`weak_ref_tensor` view. A frozen dataclass
-    whose fields all hold a tensor or ``None`` (MLA's ``MLAPrologueOutput``)
-    becomes a copy with each tensor field so viewed; the copy is built field by
-    field, without running the class's ``__init__``, since this happens during
-    capture. Anything else is returned as is, so tuples, lists and other
-    dataclasses keep holding their tensors.
+    (MLA's ``MLAPrologueOutput``, KDA's ``KdaOutputNorm``) becomes a copy with
+    each tensor field so viewed and every other field kept as is, like a loose
+    scalar arg; the copy is built field by field, without running the class's
+    ``__init__``, since this happens during capture. Anything else is returned
+    as is, so tuples, lists and mutable dataclasses keep holding their tensors.
     """
     if (
         dataclasses.is_dataclass(a)
         and not isinstance(a, type)
         and a.__dataclass_params__.frozen
     ):
-        values = {f.name: getattr(a, f.name) for f in dataclasses.fields(a)}
-        if all(v is None or isinstance(v, torch.Tensor) for v in values.values()):
-            held = object.__new__(type(a))
-            for name, v in values.items():
-                object.__setattr__(held, name, weak_ref_tensor(v))
-            return held
+        held = object.__new__(type(a))
+        for f in dataclasses.fields(a):
+            v = getattr(a, f.name)
+            if isinstance(v, torch.Tensor):
+                v = weak_ref_tensor(v)
+            object.__setattr__(held, f.name, v)
+        return held
     return weak_ref_tensor(a)
 
 
@@ -429,7 +430,7 @@ def _record_break(
     builder shared by :func:`break_here` and :func:`break_point`).
 
     Args/kwargs are bound once at capture time, with two live exceptions: (1) CUDA
-    tensor args, bare or as the fields of a frozen dataclass of tensors, carry live
+    tensor args, bare or as the tensor fields of a frozen dataclass, carry live
     values at replay because their addresses are stable: storage owned elsewhere
     (the static input buffers, weights) or graph-pool intermediates the captured
     segment rewrites before the break on every replay. The closure holds them as
@@ -559,7 +560,7 @@ def break_point(method: Callable | None = None) -> Callable:
     Inside the method ``ctx`` is live (rebound by identity at replay), so write the
     body exactly like the eager path. Loose non-tensor scalar args are frozen to
     their capture-time value -- route per-request quantities through ``ctx`` / metadata.
-    Tensor args, bare or as the fields of a frozen dataclass of tensors (e.g.
+    Tensor args, bare or as the tensor fields of a frozen dataclass (e.g.
     ``MLAPrologueOutput``), are held without owning their memory (see
     :func:`_record_break`): finish reading them before the method returns and keep
     none of them for a later break.

@@ -118,6 +118,12 @@ def _resolve_draft_query_width(verify_width: int, sample_from_anchor: bool) -> i
 
 _UNSET = object()
 
+# A short context projection that warmup_extend also compiles: the column
+# all-gather picks its subgroup layout by the rank-local payload size, so a
+# short chunk (here one 8-row draft block's verify rows) takes another
+# layout than a long extend's.
+_SHORT_CONTEXT_PROJECTION_ROWS = 8
+
 # Dtypes a replicated draft head can carry over from the target's shards.
 # A whitelist, not a blacklist: the draft matmuls the gathered rows directly,
 # so a dtype belongs here only once its raw bytes ARE the vocabulary's values.
@@ -196,6 +202,8 @@ class DFlash(BaseDrafter):
         self._validate_draft_attention_window()
         self._validate_draft_window_sink()
         self._greedy_gathered_max: torch.Tensor | None = None
+        # Set by wire_target, which binds the embedding.
+        self._first_layer_input = "full"
         self._greedy_gathered_ids: torch.Tensor | None = None
         self._greedy_gather_cap = 0
         self._init_fused_kv_helper()
@@ -371,9 +379,60 @@ class DFlash(BaseDrafter):
         self.embed_tokens = target_model.get_input_embeddings()
         if self.embed_tokens is None:
             self.embed_tokens = self.model.embed_tokens
+        self._first_layer_input = self._first_layer_input_mode()
         self.lm_head = target_model.lm_head
         self.logits_processor = language_model.logits_processor
         self._replicate_head_over_attention_dp()
+
+    def _first_layer_embeds(self, flat_ids: torch.Tensor) -> torch.Tensor:
+        """This rank's embedding input to the draft's first layer.
+
+        The target's embedding may be vocab-sharded over the attention TP
+        group (for example 8 shards of 36864 rows). ``_partial_lookup`` then
+        answers with this rank's rows and ZERO rows for every id outside its
+        shard, so the sum over the group is the embedding and one rank's view
+        is not. Exactly one place may sum it: the lookup, or, when the draft's
+        dense group spans several ranks, the first layer's reduce + norm (see
+        :meth:`_first_layer_input_mode`). Adding zero rows is exact, so every
+        mode hands the first layer the same embedding.
+        """
+        input_embeds = self.embed_tokens(
+            flat_ids, reduce_results=self._first_layer_input == "full"
+        )
+        if (
+            self._first_layer_input == "first_rank"
+            and self.model.mapping.dense.tp_rank != 0
+        ):
+            input_embeds.zero_()
+        return input_embeds
+
+    def _first_layer_input_mode(self) -> str:
+        """How the drafter hands the embedding to the draft's first layer.
+
+        A draft whose dense group holds several ranks (attention DP 1) reduces
+        its first layer's input over that group, so each rank must hand in a
+        partial whose sum is the embedding: the lookup's own shard partial
+        when the embedding is vocab-sharded over that group ("partial"), or
+        the whole rows on the group's first rank and zeros on the others when
+        the embedding is not sharded ("first_rank"). A replicated draft (dense
+        TP 1) reduces nothing, so the lookup sums its shards itself ("full").
+
+        Raises:
+            ValueError: The embedding is sharded over another group than the
+                draft's dense group.
+        """
+        dense = self.model.mapping.dense
+        if dense.tp_size == 1:
+            return "full"
+        if self.embed_tokens.tp_size == 1:
+            return "first_rank"
+        if tuple(self.embed_tokens.tp_group) != tuple(dense.tp_group):
+            raise ValueError(
+                "the draft's dense group "
+                f"{tuple(dense.tp_group)} is not the embedding's shard group "
+                f"{tuple(self.embed_tokens.tp_group)}"
+            )
+        return "partial"
 
     def _replicate_head_over_attention_dp(self) -> None:
         """Replace the wired head and processor with replicated ones when the
@@ -718,10 +777,9 @@ class DFlash(BaseDrafter):
             return
 
         positions = self.input_buffers.positions_buf[: base_ctx.input_num_tokens]
-        # The TARGET's router names these rows (the draft's own has already
-        # republished a block window by now). Packed order is kept: extend
-        # rows, then verify rows.
-        backend = base_ctx.attn_backend
+        # Context rows belong to the draft group's page-id space. This runs
+        # before the draft publishes its next proposal window.
+        backend = self.attn_backend
         if base_ctx.num_extends == base_ctx.bs:
             # A PD prefill worker may never publish a decode window.
             cache_locs = backend.extend_span_locations()
@@ -818,6 +876,24 @@ class DFlash(BaseDrafter):
                 self.token_to_kv_pool,
                 attn_backend=self.attn_backend,
             )
+
+    def warmup_extend(self, num_tokens: int) -> None:
+        """Project ``num_tokens`` rows of zero taps, as an extend's context
+        write does (``_write_native_cache``). The projection ends in a column
+        all-gather over the attention TP group; a decode warmup whose context
+        write takes the draft monokernels never reaches it. Warm both long
+        and short chunks because the gather chooses its subgroup count by
+        the rank-local payload size."""
+        model = self.draft_model_runner.model
+        taps = torch.zeros(
+            (num_tokens, model.context_in_features),
+            dtype=model.context_dtype,
+            device=self.device,
+        )
+        with torch.inference_mode():
+            model.project_target_hidden(taps)
+            if num_tokens > _SHORT_CONTEXT_PROJECTION_ROWS:
+                model.project_target_hidden(taps[:_SHORT_CONTEXT_PROJECTION_ROWS])
 
     def set_cache_pool(self, token_to_kv_pool: CachePool | None) -> None:
         """The stacked KV views and their raw pointers name the old arena."""
@@ -929,9 +1005,7 @@ class DFlash(BaseDrafter):
                 for layer in layers
             ]
 
-            self._fused_kv_k_ptrs, self._fused_kv_v_ptrs = _get_kv_buffer_ptrs(
-                self._fused_kv_k_buffers, self._fused_kv_v_buffers
-            )
+            _get_kv_buffer_ptrs(self._fused_kv_k_buffers, self._fused_kv_v_buffers)
 
             self._fused_kv_enabled = True
 
@@ -1125,6 +1199,9 @@ class DFlash(BaseDrafter):
         """
         return (
             self._tap_rows is not None
+            and self.target_model is not None
+            # The target's decode monokernels store the taps themselves.
+            and not self.target_model.stores_capture_taps(ctx)
             and ctx.dspark_context_producer is None
             and ctx.num_extends == 0
             and ctx.input_num_tokens > 0
@@ -1146,12 +1223,7 @@ class DFlash(BaseDrafter):
         num_tokens = ctx.input_num_tokens
         self._sink_tokens = num_tokens
         self._sink_positions = self.input_buffers.positions_buf[:num_tokens]
-        # The TARGET's router: these are rows the target computed, so they are
-        # named in its page-id space. The draft's own router has already
-        # published its block window, and writing the taps through that one
-        # would leave the draft reading history from rows its KV never landed
-        # in -- nothing errors, the speculation is simply wasted.
-        self._sink_cache_locs = ctx.attn_backend.decode_window_locations()[:num_tokens]
+        self._sink_cache_locs = self.attn_backend.decode_window_locations()[:num_tokens]
         ctx.target_capture_sink = self
 
     def on_target_capture(self, capture_idx: int, hidden: torch.Tensor) -> None:
@@ -1356,16 +1428,7 @@ class DFlash(BaseDrafter):
         )
 
         flat_ids = block_ids.reshape(-1)
-        # The target's embedding may be vocab-sharded over the attention TP
-        # group (for example 8 shards of 36864 rows). ``_partial_lookup`` then
-        # answers with this rank's rows and ZERO rows for every id outside its
-        # shard, so the sum over the group is the embedding and one rank's view
-        # is not. Without the reduce every rank but an id's owner drafts from
-        # zeros -- no error, just a draft that predicts nothing. With a
-        # single-rank table (TP=1, or attention DP where the rank holds the
-        # whole vocabulary) there is nothing to sum: the all-reduce is a no-op,
-        # so this matches the unreduced lookup exactly.
-        input_embeds = self.embed_tokens(flat_ids, reduce_results=True)
+        input_embeds = self._first_layer_embeds(flat_ids)
 
         with torch.inference_mode():
             logits_output = self.draft_model_runner.forward(

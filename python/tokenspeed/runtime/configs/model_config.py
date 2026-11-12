@@ -863,10 +863,12 @@ class ModelConfig:
                 "Running in encoder-only mode: the language model will not "
                 "be constructed or loaded (encode role)."
             )
-        if server_args.decode_monokernel:
+        if server_args.decode_monokernel and not is_draft_worker:
             # The model reads the switch from its text config. ServerArgs
             # accepts it only for DECODE_MONOKERNEL_ARCHITECTURES, whose
-            # text configs declare the field.
+            # text config classes declare the field (default False). A
+            # draft's config has no such class: load_model_config declares
+            # the field on it from its target.
             self.hf_text_config.decode_monokernel = True
         self.mm_attention_backend = getattr(server_args, "mm_attention_backend", None)
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)

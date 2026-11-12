@@ -155,7 +155,7 @@ def gqa_prologue(
             f"not {query_dtype}"
         )
     num_tokens = q.shape[0]
-    num_kv_heads, head_dim = cache.k_cache.shape[1:]
+    num_kv_heads, head_dim = cache.k_cache.shape[-2:]
     num_q_heads = q.shape[1:].numel() // head_dim
 
     traits = {
