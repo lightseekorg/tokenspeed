@@ -759,6 +759,8 @@ class ServerArgs:
     prefill_graph_max_tokens: int | None = None
     # Explicit prefill bucket list; unset = the relative-stride ladder (see get_prefill_token_buckets).
     prefill_graph_capture_sizes: list[int] | None = None
+    # Optional decoder-row ladder for narrowing models; unset inherits the token ladder.
+    prefill_graph_decoder_capture_sizes: list[int] | None = None
     # Request capacities for inline attention; unset keeps the minimum per bucket.
     prefill_graph_capture_batch_sizes: list[int] | None = None
     # Replay the speculative drafter's extend-round work from CUDA graphs too.
@@ -4228,6 +4230,18 @@ class ServerArgs:
             nargs="+",
             help="Compatibility alias for --prefill-graph-capture-token-sizes. "
             "Specify only one spelling.",
+        )
+        parser.add_argument(
+            "--prefill-graph-decoder-capture-sizes",
+            metavar="ROWS",
+            type=int,
+            nargs="+",
+            help="Decoder-row capacities for narrowing prefill models. Unset: "
+            "inherit --prefill-graph-capture-sizes, preserving the shared ladder. "
+            "When supplied, choose decoder buckets independently; the shared "
+            "--prefill-graph-max-tokens and scheduler chunk limit still apply, "
+            "along with the model's maximum decoder rows per request. "
+            "The resulting decoder capacity limit is included as the top bucket.",
         )
         parser.add_argument(
             "--prefill-graph-capture-batch-sizes",

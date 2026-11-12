@@ -692,6 +692,10 @@ cache occupancy by stream and reject a cold CUDA graph capture; warming on the
 default stream does not prepare their capture-stream state. The capture stream
 waits for the dummy inputs and metadata before warmup, and warmup completes
 before capture begins. This applies to ordinary, encoder, and decoder captures.
+Each captured segment also runs before its following eager break during capture.
+The break must read the segment's computed inputs, rather than old warmup values
+or uninitialized graph-pool storage; recording kernels alone does not produce
+those inputs.
 Graph-memory observation wraps only capture; eager warmups, decoder rearming
 and smoke-test replay stay outside the measured region.
 
@@ -740,25 +744,50 @@ fixed-row static state the narrowing lands into (leading rows copied, tail
 zeroed). The decoder graphs depend only on their row count, so one ladder
 serves every token bucket; it is the token ladder clipped to
 `max_decoder_rows_per_request × max_num_seqs` (a request contributes at most
-its window). A replay is encoder graph → eager narrowing → decoder graph,
-all under the bucket-pinned ambient context. The narrowing and decoder
+its window) by default. `--prefill-graph-decoder-capture-sizes` overrides only
+the decoder-row ladder. Both ladders share `--prefill-graph-max-tokens` and the
+scheduler chunk limit; the decoder also obeys its per-request row bound. Explicit
+decoder sizes above that cap are filtered, and the cap is included as the top
+bucket. Omitting the decoder override preserves the existing token-ladder
+inheritance exactly. No decoder-only configuration or extra maximum is needed;
+the two captured families select replay independently at runtime.
+The split capture admits pure extend only, on DP1 as well as DP:
+V4.1's mixed attention uses BF16 projections/output rather than the captured
+fused FP8 format. Mixed batches run the same model forward eagerly; ordinary
+prefill graphs retain their mixed support.
+A staged forward selects encoder and decoder replay independently around the
+same eager narrowing. An encoder token count above its ladder runs the encoder
+eager on the live inputs and can still replay a fitting decoder graph; a decoder
+bound above its ladder leaves only the encoder replayed. If neither stage has a
+fitting graph, the ordinary eager model forward runs. Shared mode, backend and
+DP consistency guards still apply to the whole forward: independence of stage
+capacities never permits ranks within one stage to disagree about replay.
+The captured encoder uses its bucket-pinned ambient context; an eager encoder
+keeps the real input extent and executor-supplied positions/model inputs instead
+of copying into the smaller graph embedding buffer. Narrowing and decoder
 stages size their own collectives from their row counts
 (`report_collective_sizing`). The decoder graph replays with the narrowed
 row count as its valid rows, so its breaks scrub the static tail. A forward
 whose narrowed rows exceed the largest decoder bucket runs its decoder
-stage eager. Layers read their row plan from the live context, never from a
-loose argument a captured break would freeze. Capture runs the
+stage eager. Token-local QKV and, outside candidate narrowing and decode, QB
+are captured before each attention break; output projections follow it. The
+candidate source keeps QB after narrowing to preserve its projection batch.
+Layers read their row plan from the live context, never from a loose argument
+a captured break would freeze. Capture runs the
 narrowing before every decoder run, as serving does: the decoder consumes
 per-forward backend state its predecessor produces (V4.1's reuse layers read
 the index source's selection, which later sources overwrite). Under
-attention DP the split graph stays off: the narrowed row count is rank-local
-(which prompts complete on this rank), so the decoder bucket and the
-collective shapes its graph bakes would differ across ranks, and the stages
-size their collectives from their own rows, which the DP metadata gather
-does not carry. Eager TP1 attention/dense with fused EP may narrow: the
-fused dispatch exchanges the actual local row counts, while the original
-DP counts remain capacity bounds. The CPU metadata gather also carries
-per-rank decode request counts. V4.1 DSpark sizes its one draft forward at
+attention DP every rank selects the decoder bucket bounded by the replicated
+maximum request count times the per-request decoder window. Local narrowed
+rows only scrub padding and slice outputs, so chunked prefill with zero local
+decoder rows still replays the same graph as its peers. The decoder replay
+publishes this bucket as its collective shape and restores its preceding context
+after replay, whether the encoder was graphed or eager. A bound above the decoder
+ladder falls back uniformly for that stage; a round containing an idle rank
+keeps the full forward eager. Fused EP
+exchanges actual local row counts inside dispatch, while these buckets remain
+capacity bounds. The CPU metadata gather also carries per-rank decode request
+counts. V4.1 DSpark sizes its one draft forward at
 block width times these counts, including in aggregated mixed batches.
 Prefill writes context KV; if another rank has decodes, prefill-only and
 idle ranks join its draft collectives with empty rows. A round with no
@@ -768,7 +797,24 @@ same uniform padded decode counts as their target batches.
 V4.1 completes deferred HC posts and reductions before stage handoffs or
 Engram updates. The fixed graph input state contains only completed residuals.
 Prefill warmup runs on the eventual capture stream because MegaMHC initializes
-per-stream barriers. Allocation observers wrap capture alone, leaving eager
+per-stream barriers. Fused MegaMHC joins run in eager breaks between prefill
+graph segments: their split barriers are not captured. This preserves native
+fusion when supported and the consumer's decomposed HC/coefficient-overlap
+fallback otherwise; ordinary full decode graph capture keeps its existing
+path. The break returns a flat five-tensor output (seven with FP8 codes and
+packed scales), or an empty tuple when native fusion declines. Each bucket
+keeps its physical row shape through the break, so eligibility and output
+arity remain fixed across replays; padded outputs are scrubbed before the
+next segment. Residual and mix outputs remain live until the following HC
+join consumes them, before that join may reuse their handoff storage.
+Break handoffs preserve the producer's tensor strides, including MN-major
+packed FP8 scales and their physical padding. Each capture owns its strided
+views; sequential bucket captures reuse flat backing storage by capacity.
+Outputs returned together use distinct slots even when their signatures match.
+Under attention DP the multimodal guard reads whether multimodal inputs are
+active in this deployment. A checkpoint served with `--language-model-only`
+can capture its text path; its architectural multimodal capability stays true.
+Allocation observers wrap capture alone, leaving eager
 warmup allocations in utilization headroom. Fused HC all-reduce admission
 respects both deterministic and batch-invariant collective settings. Empty
 consumer rows carry no deferred post. Cache-only narrowing completes the incoming
@@ -872,8 +918,10 @@ Cache advancement still consumes all input lengths for prefill, independently
 of output lengths. Future input writes, NaN/OOV attribution, grammar advances
 and V4.1 DSpark anchors operate only on output-bearing requests. Grammar keeps
 one completion per forward, including zero-output rounds; both deferred
-hostfunc and host fallback consume the frozen layout. A zero-row decoder
-bypasses its graph, normalization, LM head, sampler, and draft-context writes;
+hostfunc and host fallback consume the frozen layout. Without attention DP, a
+zero-row decoder bypasses its graph and normalization. Under DP it still joins
+its peers' decoder collectives, including bounded graph replay on padded rows.
+The zero-output layout omits LM head work, sampling, and draft-context writes;
 the encoder and global KV producer have already executed.
 
 When the decoder view is nonempty, the candidate-source layer retains the
