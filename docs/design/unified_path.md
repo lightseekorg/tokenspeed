@@ -1111,9 +1111,15 @@ without top-k, top-p or min-p from its whole vocabulary, by
 Admission uses the selected sampling backend's finite top-k bound. GPU
 backends retain the exclusive 128 bound. `ascend_full` accepts positive
 finite values and caps them at 4096 when populating its per-request scalar
-pool, before the int32 write. The normalized disabled sentinel (`top_k=-1`)
-keeps whole-vocabulary sampling. The captured graph reads that same pool
-for single-step sampling and chain verification.
+pool, before the int32 write. Whole-vocabulary top-p remains the default
+for the normalized disabled sentinel (`top_k=-1`). The model HF config
+boolean `npu_sampling_top_p_top_k_cap` opts into an effective `top_k=4096`
+when `top_p < 1`; it can be set through `--hf-overrides`. The executor
+passes the resolved target text HF config to the sampler factory. `top_p=1`
+and greedy requests keep their existing behavior. This policy is local
+to `ascend_full`; request parameters and other backends are unchanged.
+The captured graph reads that same pool for single-step sampling and
+chain verification.
 Ascend sampling consumes the logits already audited and sanitized by the
 executor's `NanGuard`; it does not repeat a host-side NaN truth test inside
 the captured graph. Per-request numerical error flags keep their existing
