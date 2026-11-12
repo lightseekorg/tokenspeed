@@ -1869,7 +1869,7 @@ def _bf16_routes_moe_apply(
 
 
 def _bf16_routes_moe_warmup(plan: dict, w: torch.nn.Module) -> None:
-    """Compile the route kernels behind :func:`_bf16_routes_moe_apply`, before graph capture."""
+    """Compile the route kernels behind :func:`_bf16_routes_moe_apply`."""
     bf16_moe_routes_warmup(
         w.w13_weight,
         w.w2_weight,

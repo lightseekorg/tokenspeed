@@ -776,7 +776,7 @@ if platform.is_amd:
         enable_pdl: bool = False,
         deferred_out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, None, None]:
-        """Unfinalized BF16 expert routes through :func:`tokenspeed_kernel.ops.moe.bf16_moe_routes`.
+        """Unfinalized BF16 expert routes through ``bf16_moe_routes``.
 
         The facade selects the Gluon route kernels where their geometry fits
         and Triton otherwise. Selected only by layers that defer the finalize;

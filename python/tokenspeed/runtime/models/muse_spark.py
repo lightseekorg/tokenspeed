@@ -3290,7 +3290,7 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
                 raise ValueError(f"checkpoint is missing audio tensors: {missing[:5]}")
         if self.model.config.decode_monokernel:
             enable_decode_monokernels(self.model)
-        # BF16 expert layers compile their route kernels: JIT warmup, which disable_autotune keeps.
+        # The BF16 route kernels' warmup only compiles, so disable_autotune keeps it.
         experts_to_warm = [
             layer.mlp.experts
             for layer in self.model.layers

@@ -4011,7 +4011,7 @@ def test_legacy_gluon_plans_keep_existing_implementation(
 
 
 def _deferred_bf16_plan(platform: PlatformInfo, **overrides) -> dict:
-    """Muse's BF16 expert plan: precomputed routes, every route normalized by the caller."""
+    """Muse's BF16 expert plan: precomputed routes, caller-normalized."""
     return _moe_fp8_channel_plan(
         platform,
         **{

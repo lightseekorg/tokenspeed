@@ -670,7 +670,7 @@ def triton_bf16_routes_moe_apply(
     enable_pdl: bool = False,
     deferred_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, None, None]:
-    """Unfinalized BF16 expert routes through :func:`tokenspeed_kernel.ops.moe.bf16_moe_routes`.
+    """Unfinalized BF16 expert routes through ``bf16_moe_routes``.
 
     Selected only by layers that defer the finalize; see
     ``_bf16_routes_moe_apply`` for the arguments and the returned routes.
