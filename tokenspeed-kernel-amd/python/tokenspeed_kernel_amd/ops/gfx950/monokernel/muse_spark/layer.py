@@ -129,16 +129,19 @@ CHAINED_BASES = {
     "pool": 224,
     "merge": 128,
     "exr": 0,
-    # 8 or 16 rows: 128 unpool tasks (moe_tail.unpool_halves); the first
-    # half on comb's CTAs, after their comb task.
+    # 8 or 16 rows: the comb tasks (8 a row) take CTAs from 0 and the 128
+    # unpool tasks (moe_tail.unpool_halves) CTAs 64 .. 191, after ex2 tasks
+    # only: behind a comb task an unpool poll also waited for comb's cmb
+    # puts to the 8 ranks to be acknowledged (vmcnt counts stores in order).
+    "comb": 0,
     "unpool": 64,
 }
 
 # A launch that ends with the next layer's qkvg tasks (qnext, 160 tasks of
 # 128 KiB of weights): they take CTAs 192 .. 255 and 0 .. 95, which end their
-# expert tasks first (ex2's last lanes) or run only comb before; the
-# out tasks (8 a row) move to 96 .. 159, after comb or unpool, so no qnext
-# weight stream waits behind an out task.
+# expert tasks first (ex2's last lanes) or run only comb before (CTAs 0 .. 63
+# at 8 rows); the out tasks (8 a row) move to 96 .. 159, after comb or unpool,
+# so no qnext weight stream waits behind an out task.
 # exr runs in 2 parts on CTAs 128 .. 255, not spread over every CTA: spread,
 # its tasks on qnext's CTAs hold their qnext weight streams back. In one part
 # on 64 CTAs, the ex2 tasks behind it end after the others: the tail follows
@@ -153,7 +156,9 @@ NEXT_BASES = {**CHAINED_BASES, "qnext": 192, "out": 96, "exr": 128}
 # and 0 .. 15, after their router task and past topk's CTAs 192 .. 207. xq's
 # 32 tasks take CTAs 160 .. 191, idle from the attention tail's end: behind a
 # pool task, an xq poll would also wait for that task's cg puts to land.
-WIDE = {"router": 192, "topk": 192, "pool": 208, "xq": 160}
+# The comb tasks (128) take CTAs 192 .. 255 and 0 .. 63, so that unpool's
+# CTAs 64 .. 191 follow ex2 tasks only (see CHAINED_BASES).
+WIDE = {"router": 192, "topk": 192, "pool": 208, "xq": 160, "comb": 192}
 # exr's base and parts in a launch of more than 8 rows that ends with qnext:
 # spread over every CTA. From CTA 128 in 2 parts (the 8-row qnext placement),
 # exr would share CTAs 128 .. 255 with ex2's lanes 4 .. 7, whose ex2 then
