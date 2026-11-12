@@ -156,11 +156,12 @@ the same inputs, eager or replayed, agree bit for bit.
 ## Offline-tuned BLAS solutions with TunableOp (ROCm)
 
 Dense BF16/FP16 projections that no registered kernel claims run `torch.mm`.
-On ROCm, `TOKENSPEED_HIPBLASLT_TUNED_FILE` names a PyTorch TunableOp results
-file whose measured hipBLASLt or rocBLAS solutions replace the heuristic ones
-for the GEMM shapes it lists. `hipblaslt.py` is the runtime entry point; the
-loader, the stack check and the tuning tool are in `tokenspeed-kernel-amd`
-(`tokenspeed_kernel_amd.ops.gemm.hipblaslt`, documented in that package's
+On ROCm, serving loads the PyTorch TunableOp results file committed for its
+GPU (`device_name=<GPU>.csv`), whose measured hipBLASLt or rocBLAS solutions
+replace the heuristic ones for the GEMM shapes it lists. `hipblaslt.py` is the
+runtime entry point; the tuned files, the loader, the stack check and the
+tuning tool are in `tokenspeed-kernel-amd`
+(`tokenspeed_kernel_amd.ops.gemm`, documented in that package's
 `ops/README.md`).
 
 ## Per-token/per-channel FP8

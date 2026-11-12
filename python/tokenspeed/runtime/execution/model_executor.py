@@ -1175,12 +1175,11 @@ class ModelExecutor:
         )
         if self.model_runner is None:
             return
-        tuned_file = envs.TOKENSPEED_HIPBLASLT_TUNED_FILE.get()
-        if tuned_file is not None:
-            # A process-wide BLAS setting rather than a kernel choice: GEMMs
-            # that dispatch to torch.mm replay the listed solutions from here
-            # on, in warmup and in graph capture alike.
-            load_hipblaslt_tuned_solutions(tuned_file)
+        # ROCm: replay this GPU's in-repo tuned BLAS solutions, if any. A
+        # process-wide BLAS setting rather than a kernel choice: GEMMs that
+        # dispatch to torch.mm replay the listed solutions from here on, in
+        # warmup and in graph capture alike. No-op elsewhere.
+        load_hipblaslt_tuned_solutions()
         ib = self.input_buffers
         # The one traversal that discovers each operator is shaped like the
         # forwards this engine runs: an extend over the prefill budget, or,

@@ -40,6 +40,7 @@ from tokenspeed_kernel.ops.gemm.hipblaslt import (  # noqa: E402
 )
 from tokenspeed_kernel_amd.ops.gemm.hipblaslt import (  # noqa: E402
     hipblaslt_file_validators,
+    hipblaslt_tuned_file,
     tune_hipblaslt_solutions,
 )
 
@@ -121,6 +122,54 @@ def test_rejects_file_from_another_stack(tuned_file, tmp_path):
     assert not load_hipblaslt_tuned_solutions(str(stale))
     assert not torch.cuda.tunable.is_enabled()
     assert torch.equal(torch.mm(x, w.t()), default)
+
+
+def _restamp(src: str, dst, key: str, value: str) -> None:
+    lines = open(src).read().splitlines()
+    prefix = f"Validator,{key},"
+    dst.write_text(
+        "\n".join(prefix + value if line.startswith(prefix) else line for line in lines)
+        + "\n"
+    )
+
+
+def test_tuning_extends_existing_file(tuned_file, tmp_path):
+    path = tmp_path / "extended.csv"
+    path.write_bytes(open(tuned_file, "rb").read())
+    before = {line for line in open(path) if not line.startswith("Validator,")}
+    count = tune_hipblaslt_solutions(
+        shapes=[(N, K)],
+        rows=[TUNED_M, UNTUNED_M],
+        dtype=torch.bfloat16,
+        path=str(path),
+        cold_bytes=64 * 2**20,
+    )
+    assert count == 2
+    after = {line for line in open(path) if not line.startswith("Validator,")}
+    # The listed GEMM keeps its entry, not re-timed; the new one is added.
+    assert before < after
+    assert any(f"tn_{N}_{UNTUNED_M}_{K}_" in line for line in after)
+
+
+def test_tuning_refuses_file_from_another_stack(tuned_file, tmp_path):
+    stale = tmp_path / "stale.csv"
+    _restamp(tuned_file, stale, "HIPBLASLT_VERSION", "0-0")
+    before = stale.read_bytes()
+    with pytest.raises(ValueError, match="another stack"):
+        tune_hipblaslt_solutions(
+            shapes=[(N, K)],
+            rows=[UNTUNED_M],
+            dtype=torch.bfloat16,
+            path=str(stale),
+            cold_bytes=64 * 2**20,
+        )
+    assert not torch.cuda.tunable.is_enabled()
+    assert stale.read_bytes() == before
+
+
+def test_default_file_is_this_gpus():
+    name = torch.cuda.get_device_name().replace(" ", "_")
+    assert hipblaslt_tuned_file().endswith(f"/configs/device_name={name}.csv")
 
 
 def test_missing_file_keeps_tunableop_disabled(tmp_path):

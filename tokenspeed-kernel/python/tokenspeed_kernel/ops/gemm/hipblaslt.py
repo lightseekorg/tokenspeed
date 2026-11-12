@@ -20,13 +20,15 @@
 
 """Offline-tuned BLAS solutions (TunableOp) for dense GEMMs on ROCm.
 
-The runtime entry point. Loading, the stack check and the tuning tool live in
+The runtime entry point. The tuned files (one per GPU, in-repo), loading, the
+stack check and the tuning tool live in
 ``tokenspeed_kernel_amd.ops.gemm.hipblaslt``; this module only keeps that
 AMD package out of non-ROCm processes.
 """
 
 from __future__ import annotations
 
+import functools
 import logging
 
 import torch
@@ -36,19 +38,23 @@ __all__ = ["load_hipblaslt_tuned_solutions"]
 logger = logging.getLogger(__name__)
 
 
-def load_hipblaslt_tuned_solutions(path: str) -> bool:
+def load_hipblaslt_tuned_solutions(path: str | None = None) -> bool:
     """Replay the BLAS solutions (hipBLASLt or rocBLAS) in a TunableOp results file.
 
     See ``tokenspeed_kernel_amd.ops.gemm.hipblaslt.load_hipblaslt_tuned_solutions``.
 
     Args:
         path: TunableOp results CSV made on the same software stack and GPU
-            architecture.
+            architecture. When omitted, the in-repo file of the current GPU
+            is loaded, at most once per process; on a non-ROCm build or a
+            GPU without a file this is a no-op.
 
     Returns:
-        Whether the file was loaded. False (with a warning) on a non-ROCm
-        build or when the AMD implementation rejects the file.
+        Whether the file was loaded. False on a non-ROCm build or when the
+        AMD implementation rejects the file.
     """
+    if path is None:
+        return _load_default()
     if torch.version.hip is None:
         logger.warning(f"Ignoring tuned BLAS solutions {path}: not a ROCm build")
         return False
@@ -57,3 +63,16 @@ def load_hipblaslt_tuned_solutions(path: str) -> bool:
     )
 
     return load_amd(path)
+
+
+@functools.cache
+def _load_default() -> bool:
+    # Cached: every executor of a process calls this, and the outcome
+    # (including a skipped file's log line) should appear once.
+    if torch.version.hip is None:
+        return False
+    from tokenspeed_kernel_amd.ops.gemm.hipblaslt import (
+        load_hipblaslt_tuned_solutions as load_amd,
+    )
+
+    return load_amd()
