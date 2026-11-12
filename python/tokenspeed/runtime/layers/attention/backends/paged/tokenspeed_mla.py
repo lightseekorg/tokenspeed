@@ -247,11 +247,8 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         if not 1 <= self.min_kv_split <= 256:
             raise ValueError("min_kv_split must be in [1, 256]")
         self._decode_row_capacity = config.max_bs * self.block_decode_expansion
-        self._per_request_split_kv = len(config.kvp_group) == 1
-        self._decode_split_capacity = (
-            max(PER_REQUEST_SPLIT_KV_CAPACITY, self.min_kv_split)
-            if self._per_request_split_kv
-            else self.min_kv_split
+        self._decode_split_capacity = max(
+            PER_REQUEST_SPLIT_KV_CAPACITY, self.min_kv_split
         )
         self._decode_split_kvs_buf: torch.Tensor | None = None
 
@@ -497,10 +494,8 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         # capture's allocation pool. Reinitialization must replace them too.
         self._block_page_table_buf = None
         self._block_seq_lens_buf = None
-        self._decode_split_kvs_buf = (
-            torch.ones(max_bs, dtype=torch.int32, device=self.device)
-            if self._per_request_split_kv
-            else None
+        self._decode_split_kvs_buf = torch.ones(
+            max_bs, dtype=torch.int32, device=self.device
         )
         if self._dcp is None:
             return
@@ -527,11 +522,11 @@ class CuteDSLMLABackend(PagedAttentionBackend):
 
     def _update_draft_lengths(self, seq_lens: torch.Tensor, q_len: int) -> None:
         super().advance_draft_forward_metadata(seq_lens)
-        self._refresh_split_kvs(self.seq_lens_buf[: seq_lens.shape[0]], q_len)
         if self._dcp is not None:
             self._dcp.refresh_lengths(
                 self._decode_views(seq_lens.shape[0]).dcp, seq_lens
             )
+        self._refresh_split_kvs(self.seq_lens_buf[: seq_lens.shape[0]], q_len)
 
     def _ensure_block_row_buffers(self) -> None:
         """Resident per-request rows behind the block entries, sized once.
@@ -562,6 +557,7 @@ class CuteDSLMLABackend(PagedAttentionBackend):
             self._dcp.refresh_lengths(
                 self._decode_views(bs).dcp, self._block_seq_lens_buf[:bs]
             )
+        self._refresh_split_kvs(self._block_seq_lens_buf[:bs], self.spec_num_tokens)
 
     def _copy_block_decode_seq_lens(
         self, bs: int, block_seq_lens: torch.Tensor
@@ -575,15 +571,16 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         self.decode_seq_lens_buffer[: bs * expansion].view(bs, expansion).copy_(
             rows.unsqueeze(1)
         )
-        self._refresh_split_kvs(rows, self.spec_num_tokens)
 
     def _refresh_split_kvs(self, seq_lens: torch.Tensor, q_len: int) -> None:
         if self._decode_split_kvs_buf is None:
             return
+        if self._dcp is not None:
+            seq_lens = self._decode_views(seq_lens.shape[0]).dcp.local_seq_lens
         tokenspeed_mla_decode_split_kvs(
             seq_lens,
             self._decode_split_kvs_buf[: seq_lens.shape[0]],
-            num_heads=self._num_heads_per_tp,
+            num_heads=self._num_heads_per_tp * len(self.kvp_group),
             q_len=q_len,
             max_seq_len=self.max_context_len,
             min_split_kv=self.min_kv_split,
@@ -678,17 +675,18 @@ class CuteDSLMLABackend(PagedAttentionBackend):
                 rows[:, num_pages:].zero_()
             replicated = self.page_table_buf[: bs * spec].view(bs, spec, max_num_pages)
             replicated.copy_(rows[:, None, :])
-            if not for_graph_replay or actual_bs == 0:
+            write_lengths = not for_graph_replay or actual_bs == 0
+            if write_lengths:
                 self._copy_block_decode_seq_lens(bs, seq_lens)
             if self._dcp is not None:
                 self._dcp.refresh(metadata.dcp, metadata.block_seq_lens)
+            if write_lengths:
+                self._refresh_split_kvs(metadata.block_seq_lens, self.spec_num_tokens)
             self.forward_decode_metadata = metadata
             return
         # clamp_min(1) is the identity, so the verify clamp is unconditional.
         self.seq_lens_buf[:bs].copy_(seq_lens[:bs].clamp_min(metadata.q_len_per_req))
         self._refresh_tree_prefix(bs, self.seq_lens_buf)
-        # Every row: draft steps after an extend round decode all of them.
-        self._refresh_split_kvs(self.seq_lens_buf[:bs], metadata.q_len_per_req)
         # The persistent buffer is padded to the fused-kernel block constraint;
         # columns past the router table's width stay 0 (never read: the kernel
         # bounds access by seq_lens). Padded (and idle) requests are already
@@ -701,6 +699,8 @@ class CuteDSLMLABackend(PagedAttentionBackend):
             self.page_table_buf[:bs, num_pages:].zero_()
         if self._dcp is not None:
             self._dcp.refresh(metadata.dcp, metadata.seq_lens_k)
+        # Local lengths must be current; mixed-round drafts consume every row.
+        self._refresh_split_kvs(self.seq_lens_buf[:bs], metadata.q_len_per_req)
         self.forward_decode_metadata = metadata
 
     # ---- Forward: Decode ----
@@ -774,7 +774,6 @@ class CuteDSLMLABackend(PagedAttentionBackend):
             self._decode_split_kvs_buf[request_start : request_start + bs]
             if self._decode_split_kvs_buf is not None
             and (not self.block_decode_active or q_len_per_req == self.spec_num_tokens)
-            and metadata.dcp is None
             and window_left < 0
             else None
         )
