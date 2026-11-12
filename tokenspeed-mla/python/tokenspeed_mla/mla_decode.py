@@ -510,7 +510,7 @@ def _get_compiled_mla_kernel(
     sym_kv_batch = cute.sym_int()  # KV cache batch dim (flat pool, =1 in paged mode)
     sym_seq_kv = cute.sym_int()
     sym_page_count = cute.sym_int()
-    sym_workspace_size = cute.sym_int(64 if is_var_split_kv else 32)
+    sym_workspace_size = cute.sym_int(width=64)
 
     # q_latent, q_rope, c_latent, c_rope are slices of contiguous tensors on
     # the last dim (e.g. query[..., :kv_lora_rank]), so they are NOT contiguous:
