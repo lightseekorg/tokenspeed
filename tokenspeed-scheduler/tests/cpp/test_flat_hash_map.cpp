@@ -21,6 +21,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory_resource>
 #include <random>
 #include <unordered_map>
 #include <vector>
@@ -28,21 +29,21 @@
 #include <gtest/gtest.h>
 
 #include "cache/coordinator/flat_hash_map.h"
-#include "cache/core/planning_scratch.h"
 
 namespace tokenspeed::test {
 namespace {
 
-TEST(FlatHashSet, StridedLocationsStayDistinctAcrossGrowthClearAndReusedScratch) {
-    PlanningScratch storage;
+TEST(FlatHashSet, StridedLocationsStayDistinctAcrossGrowthClearAndReusedMemory) {
+    // Every round's arena starts on the same buffer.
+    std::vector<std::byte> buffer(256 * 1024);
     for (const std::int32_t stride : {1, 4096, 104729}) {
         const auto location = [&](std::int32_t i, std::int32_t slot) {
             return CacheBlockLocation{.lcm_block_id = 1 + i * stride, .slot_index = slot};
         };
         for (int round = 0; round < 3; ++round) {
-            auto lease = storage.Acquire();
-            FlatHashSet<CacheBlockLocation> locations{&lease};
-            // A reused bank still holds the last round's slots.
+            std::pmr::monotonic_buffer_resource arena{buffer.data(), buffer.size()};
+            FlatHashSet<CacheBlockLocation> locations{&arena};
+            // The reused buffer still holds the last round's slots.
             EXPECT_FALSE(locations.contains(location(round, 0)));
             if (round == 1) {
                 locations.reserve(4096);
@@ -72,11 +73,10 @@ TEST(FlatHashSet, StridedLocationsStayDistinctAcrossGrowthClearAndReusedScratch)
 }
 
 TEST(FlatHashMap, MatchesAReferenceMapThroughCollisionsErasesAndWraparound) {
-    PlanningScratch storage;
     std::mt19937 random{20261112};
     for (const std::int32_t universe : {24, 600}) {
-        auto lease = storage.Acquire();
-        FlatHashMap<CacheBlockLocation, std::int64_t> values{&lease};
+        std::pmr::monotonic_buffer_resource arena;
+        FlatHashMap<CacheBlockLocation, std::int64_t> values{&arena};
         std::unordered_map<std::int64_t, std::int64_t> expected;
         std::uniform_int_distribution<std::int32_t> pick(0, universe - 1);
         std::uniform_int_distribution<int> operation(0, 9);
@@ -120,10 +120,9 @@ TEST(FlatHashMap, PooledNodeAddressesKeepTheirCountsAcrossEraseAndRegrowth) {
         std::array<std::byte, 256> bytes;
     };
     const std::vector<Node> nodes(16384);
-    PlanningScratch storage;
     for (const std::size_t stride : {1u, 16u}) {
-        auto lease = storage.Acquire();
-        FlatHashMap<const Node*, std::int32_t> counts{&lease};
+        std::pmr::monotonic_buffer_resource arena;
+        FlatHashMap<const Node*, std::int32_t> counts{&arena};
         for (std::size_t i = 0; i < nodes.size(); i += stride) {
             for (std::size_t n = 0; n <= i % 3; ++n) {
                 ++counts[&nodes[i]];
@@ -151,34 +150,32 @@ TEST(FlatHashMap, PooledNodeAddressesKeepTheirCountsAcrossEraseAndRegrowth) {
     }
 }
 
-TEST(FlatHashSet, TablesPastTheBankAndAFourthLeaseKeepTheirOwnKeys) {
-    PlanningScratch storage;
-    for (int round = 0; round < 2; ++round) {
-        auto first = storage.Acquire();
-        auto second = storage.Acquire();
-        auto third = storage.Acquire();
-        // No bank is left for this one.
-        auto fourth = storage.Acquire();
-        const std::array<PlanningScratch::Lease*, 4> leases{&first, &second, &third, &fourth};
-        std::vector<FlatHashSet<CacheBlockLocation>> sets;
-        sets.reserve(leases.size());
+// A planner keeps several tables in one arena, growing in turn, so each
+// table's slot arrays sit between the others' and the ones they outgrew.
+TEST(FlatHashSet, TablesGrowingInTurnInOneArenaKeepTheirOwnKeys) {
+    std::pmr::monotonic_buffer_resource arena;
+    std::vector<FlatHashSet<CacheBlockLocation>> sets;
+    sets.reserve(4);
+    for (std::int32_t s = 0; s < 4; ++s) {
+        sets.emplace_back(&arena);
+    }
+    for (std::int32_t i = 0; i < 50000; ++i) {
         for (std::int32_t s = 0; s < 4; ++s) {
-            sets.emplace_back(leases[s]);
-            // The first table outgrows its 256 KiB bank.
-            for (std::int32_t i = 0; i < (s == 0 ? 50000 : 1000); ++i) {
-                sets.back().insert(CacheBlockLocation{.lcm_block_id = 1 + i, .slot_index = s});
-            }
-        }
-        for (std::int32_t s = 0; s < 4; ++s) {
-            EXPECT_EQ(sets[s].size(), s == 0 ? 50000u : 1000u);
-            for (std::int32_t i = 0; i < 1000; ++i) {
-                for (std::int32_t other = 0; other < 4; ++other) {
-                    EXPECT_EQ(sets[s].contains(CacheBlockLocation{.lcm_block_id = 1 + i, .slot_index = other}),
-                              other == s);
-                }
+            if (s == 0 || i < 1000) {
+                EXPECT_TRUE(sets[s].insert(CacheBlockLocation{.lcm_block_id = 1 + i, .slot_index = s}));
             }
         }
     }
+    for (std::int32_t s = 0; s < 4; ++s) {
+        EXPECT_EQ(sets[s].size(), s == 0 ? 50000u : 1000u);
+        for (std::int32_t i = 0; i < 1000; ++i) {
+            for (std::int32_t other = 0; other < 4; ++other) {
+                EXPECT_EQ(sets[s].contains(CacheBlockLocation{.lcm_block_id = 1 + i, .slot_index = other}), other == s);
+            }
+        }
+    }
+    EXPECT_TRUE(sets[0].contains(CacheBlockLocation{.lcm_block_id = 50000, .slot_index = 0}));
+    EXPECT_FALSE(sets[1].contains(CacheBlockLocation{.lcm_block_id = 1001, .slot_index = 1}));
 }
 
 // Backward-shift erase on a cluster that wraps past the end of the table.
@@ -203,9 +200,8 @@ TEST(FlatHashMap, EraseInTheLastSlotShiftsAClusterWrappedToTheFront) {
         if (home(location) == 14 && home_14.size() < 2) home_14.push_back(location);
         if (home(location) == 15 && home_15.size() < 2) home_15.push_back(location);
     }
-    PlanningScratch storage;
-    auto lease = storage.Acquire();
-    FlatHashMap<CacheBlockLocation, std::int32_t> values{&lease};
+    std::pmr::monotonic_buffer_resource arena;
+    FlatHashMap<CacheBlockLocation, std::int32_t> values{&arena};
     // Slots 14 and 15, then 0 and 1 past the end of the table.
     const std::array<CacheBlockLocation, 4> keys{home_14[0], home_15[0], home_14[1], home_15[1]};
     for (std::int32_t i = 0; i < 4; ++i) {

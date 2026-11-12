@@ -48,31 +48,28 @@ namespace tokenspeed::test {
 namespace {
 
 TEST(ParentOccupancy, SparseParentsKeepZeroAndRestoredCountsAcrossGrowthAndUnwind) {
+    // Every round's arena starts on the same buffer.
+    std::vector<std::byte> buffer(64 * 1024);
     for (const std::int32_t stride : {4096, 104729}) {
-        PlanningScratch storage;
         for (int round = 0; round < 3; ++round) {
-            try {
-                auto lease = storage.Acquire();
-                ParentOccupancy counts{&lease};
-                EXPECT_EQ(counts.Find(1), nullptr);
-                for (int i = 1; i <= 16384; ++i) {
-                    const auto parent = static_cast<std::int32_t>(static_cast<std::int64_t>(i) * stride);
-                    counts.GetOrInsert(parent, i % 4 + 1) -= 1;
-                    EXPECT_EQ(counts.GetOrInsert(parent, 99), i % 4);
-                }
-                EXPECT_EQ(counts.size(), 16384u);
-                for (int i = 16384; i > 0; --i) {
-                    const auto parent = static_cast<std::int32_t>(static_cast<std::int64_t>(i) * stride);
-                    auto* occupied = counts.Find(parent);
-                    ASSERT_NE(occupied, nullptr);
-                    EXPECT_EQ(*occupied, i % 4);
-                    ++*occupied;
-                    EXPECT_EQ(counts.GetOrInsert(parent, 99), i % 4 + 1);
-                }
-                EXPECT_EQ(counts.Find(1), nullptr);
-                throw 1;
-            } catch (int) {
+            std::pmr::monotonic_buffer_resource arena{buffer.data(), buffer.size()};
+            ParentOccupancy counts{&arena};
+            EXPECT_EQ(counts.Find(1), nullptr);
+            for (int i = 1; i <= 16384; ++i) {
+                const auto parent = static_cast<std::int32_t>(static_cast<std::int64_t>(i) * stride);
+                counts.GetOrInsert(parent, i % 4 + 1) -= 1;
+                EXPECT_EQ(counts.GetOrInsert(parent, 99), i % 4);
             }
+            EXPECT_EQ(counts.size(), 16384u);
+            for (int i = 16384; i > 0; --i) {
+                const auto parent = static_cast<std::int32_t>(static_cast<std::int64_t>(i) * stride);
+                auto* occupied = counts.Find(parent);
+                ASSERT_NE(occupied, nullptr);
+                EXPECT_EQ(*occupied, i % 4);
+                ++*occupied;
+                EXPECT_EQ(counts.GetOrInsert(parent, 99), i % 4 + 1);
+            }
+            EXPECT_EQ(counts.Find(1), nullptr);
         }
     }
 }
@@ -332,7 +329,7 @@ TEST(FixedSlotResource, RequestsOfAnotherShapeUseTheUpstreamResource) {
     EXPECT_EQ(values.back(), 64);
 }
 
-TEST(ShadowOccupancy, ConcurrentPlansAndReusedScratchHaveIndependentCapacity) {
+TEST(ShadowOccupancy, ConcurrentPlansHaveIndependentCapacity) {
     const CacheGroupSpec history{.cache_blocks_per_lcm_block = 2, .block_granularity = 4};
     std::vector<CacheGroup> groups;
     groups.emplace_back(history, std::make_unique<GroupAllocator>(2, 0, 1), MakePrefixMatcher(history));
@@ -362,6 +359,42 @@ TEST(ShadowOccupancy, ConcurrentPlansAndReusedScratchHaveIndependentCapacity) {
         EXPECT_FALSE(third.Fits(needed, zero, zero));
         EXPECT_EQ(pool.NumOccupiedSlots(), 4);
     }
+}
+
+// Shadows built side by side keep separate counts while each outgrows the
+// storage it starts in, their growth interleaved.
+TEST(ShadowOccupancy, ConcurrentPlansKeepSeparateCountsWhileTheyGrow) {
+    constexpr std::int32_t kParents = 4096;
+    const CacheGroupSpec history{.cache_blocks_per_lcm_block = 1, .block_granularity = 4};
+    std::vector<CacheGroup> groups;
+    groups.emplace_back(history, std::make_unique<GroupAllocator>(1, 0, 1), MakePrefixMatcher(history));
+    BlockPool pool{kParents, {1}};
+    pool.RegisterGroup(0, 1, 1);
+    const auto held = pool.AcquireBlocks(0, kParents);
+    ASSERT_EQ(held.size(), static_cast<std::size_t>(kParents));
+    ShadowOccupancy even{pool, groups};
+    ShadowOccupancy odd{pool, groups};
+    for (std::int32_t i = 0; i < kParents; i += 2) {
+        even.Remove(0, held[i]->Location());
+        odd.Remove(0, held[i + 1]->Location());
+    }
+    EXPECT_EQ(even.TouchedParents(), static_cast<std::size_t>(kParents / 2));
+    EXPECT_EQ(odd.TouchedParents(), static_cast<std::size_t>(kParents / 2));
+    const std::vector<std::int64_t> zero{0};
+    const std::vector<std::vector<std::int64_t>> half{{kParents / 2}};
+    const std::vector<std::vector<std::int64_t>> more{{kParents / 2 + 1}};
+    for (const ShadowOccupancy* shadow : {&even, &odd}) {
+        EXPECT_TRUE(shadow->Fits(half, zero, zero));
+        EXPECT_FALSE(shadow->Fits(more, zero, zero));
+    }
+    for (std::int32_t i = 0; i < kParents; i += 4) {
+        even.Restore(0, held[i]->Location());
+    }
+    EXPECT_FALSE(even.Fits(half, zero, zero));
+    EXPECT_TRUE(even.Fits(std::vector<std::vector<std::int64_t>>{{kParents / 4}}, zero, zero));
+    EXPECT_TRUE(odd.Fits(half, zero, zero));
+    EXPECT_FALSE(odd.Fits(more, zero, zero));
+    EXPECT_EQ(pool.NumOccupiedSlots(), kParents);
 }
 
 // Two groups on one pool, some parents part full and some empty: a 4-slot
@@ -507,30 +540,6 @@ TEST(CacheEvictionPlan, SelectionStopsAtTheFirstSelectionAfterWhichTheDemandFits
         }
     }
     EXPECT_GT(stops.size(), 4u) << "the demands stop at many different selections";
-}
-
-TEST(PlanningScratch, AlignedOverflowAndNestedLeasesKeepTheirOwnValues) {
-    struct alignas(512) Value {
-        int value;
-    };
-    PlanningScratch scratch;
-    for (int round = 0; round < 3; ++round) {
-        auto first = scratch.Acquire();
-        auto second = scratch.Acquire();
-        auto third = scratch.Acquire();
-        std::pmr::vector<Value> large{&first};
-        std::pmr::vector<Value> small{&second};
-        std::pmr::vector<Value> nested{&third};
-        for (int i = 0; i < 2048; ++i) large.push_back(Value{i});
-        small.push_back(Value{42});
-        nested.push_back(Value{99});
-        EXPECT_EQ(reinterpret_cast<std::uintptr_t>(large.data()) % alignof(Value), 0);
-        EXPECT_EQ(reinterpret_cast<std::uintptr_t>(small.data()) % alignof(Value), 0);
-        EXPECT_EQ(reinterpret_cast<std::uintptr_t>(nested.data()) % alignof(Value), 0);
-        for (int i = 0; i < 2048; ++i) EXPECT_EQ(large[i].value, i);
-        EXPECT_EQ(small[0].value, 42);
-        EXPECT_EQ(nested[0].value, 99);
-    }
 }
 
 TEST(ShadowOccupancy, AReleasedHostParentCannotAlsoLeaveHistorySlotsBehind) {

@@ -21,8 +21,10 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory_resource>
 #include <span>
 #include <vector>
 
@@ -43,11 +45,7 @@ namespace tokenspeed {
 class ShadowOccupancy {
 public:
     ShadowOccupancy(const BlockPool& pool, std::span<const CacheGroup> groups)
-        : pool_{pool},
-          groups_{groups},
-          scratch_{pool.AcquirePlanningScratch()},
-          holes_by_bucket_(groups.size()),
-          empty_parent_count_{pool.NumEmptyLcmBlocks()} {
+        : pool_{pool}, groups_{groups}, holes_by_bucket_(groups.size()), empty_parent_count_{pool.NumEmptyLcmBlocks()} {
         for (std::size_t i = 0; i < groups_.size(); ++i) {
             const std::span<const std::int64_t> holes = pool_.FreeSlotsByBucket(static_cast<std::uint32_t>(i));
             holes_by_bucket_[i].assign(holes.begin(), holes.end());
@@ -152,9 +150,14 @@ public:
 private:
     const BlockPool& pool_;
     std::span<const CacheGroup> groups_;
+    // Holds remaining_occupied_'s slots until the shadow dies, first in the
+    // shadow's own raw buffer (left uninitialized: only the arena writes it),
+    // so a plan touching few parents calls no allocator.
+    static constexpr std::size_t kInlineScratchBytes = 4 * 1024;
+    alignas(std::max_align_t) std::array<std::byte, kInlineScratchBytes> scratch_buffer_;
+    std::pmr::monotonic_buffer_resource scratch_{scratch_buffer_.data(), scratch_buffer_.size()};
     // Occupants left per parent a Remove touched; untouched parents keep the
     // pool's own count.
-    PlanningScratch::Lease scratch_;
     ParentOccupancy remaining_occupied_{&scratch_};
     std::vector<std::vector<std::int64_t>> holes_by_bucket_;
     std::int64_t empty_parent_count_{0};

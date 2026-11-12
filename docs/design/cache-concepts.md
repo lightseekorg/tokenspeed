@@ -143,12 +143,12 @@ A shadow's occupancy state grows only with the parents it touches
 (`ParentOccupancy`), never with pool capacity. A planner's lookup tables live
 for its plan alone, and no plan iterates them, so no decision depends on their
 slot or bucket order, whether a table is open-addressed (`FlatHashMap`) or
-node-based. Each shadow and each planner allocates from its own RAII lease on
-the pool's planning scratch (`PlanningScratch`), which retains a small, fixed
-amount of memory. Only storage is reused: every plan starts with fresh tables
-and occupancy state, and its containers die before the lease returns. No
-array proportional to a sparse Host pool's theoretical slot count is
-initialized for planning.
+node-based. Each shadow and each planner allocates its tables from a monotonic
+arena it owns (`std::pmr::monotonic_buffer_resource`): nothing is freed during
+the plan, everything returns when the planner dies, and nothing is kept between
+plans, so every plan starts with fresh tables and occupancy state. No array
+proportional to a sparse Host pool's theoretical slot count is initialized for
+planning.
 
 Replicated groups have one ownership bucket: every Host hit needs a Device
 destination in that bucket, without looking up or temporarily owning the Host

@@ -30,7 +30,7 @@ namespace tokenspeed {
 
 // Tentative counts for touched physical parents. Slots own only integers,
 // never blocks. Storage scales with touched parents, not pool capacity, and
-// belongs to the shadow's scratch lease: one array of parent/count slots that
+// comes from the shadow's arena: one array of parent/count slots that
 // doubles at 75% occupancy. No individual node allocations or deletions are
 // needed: a restored parent keeps its count until the plan dies.
 class ParentOccupancy {

@@ -53,8 +53,8 @@ struct FlatHashKey<const T*> {
 };
 
 // An open-addressed map for one plan's lookups, its slots in one array from
-// the given memory resource (a planning scratch lease). Linear probing and
-// backward-shift erase keep no tombstones. Every key bit is mixed before
+// the given memory resource (the planner's monotonic arena). Linear probing
+// and backward-shift erase keep no tombstones. Every key bit is mixed before
 // masking: page IDs and pooled node addresses come in regular strides, which
 // would pile into one cluster under a locality-preserving hash. Slot order is
 // deliberately not exposed as a traversal order. Growing and erasing move

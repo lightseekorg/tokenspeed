@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <memory_resource>
 #include <optional>
@@ -138,7 +139,6 @@ public:
           victims_{victims},
           member_resource_{member_resource},
           copy_ins_{copy_ins},
-          scratch_{pool.AcquirePlanningScratch()},
           eviction_plan_{pool, groups},
           shape_need_(groups.size()),
           blocks_needed_(groups.size()),
@@ -1098,10 +1098,15 @@ private:
     std::pmr::memory_resource* member_resource_;
     // The plan's copy-in reservations (AdmissionPlan::copy_ins).
     std::vector<std::vector<CopyInReservation>>& copy_ins_;
-    // The plan's lookup tables, open-addressed in this lease (FlatHashMap);
-    // returned victim vectors own their storage independently. No table is
-    // iterated, so no plan depends on their slot order.
-    PlanningScratch::Lease scratch_;
+    // The plan's lookup tables, open-addressed in this arena (FlatHashMap),
+    // which frees nothing until the planner dies; returned victim vectors
+    // own their storage independently. No table is iterated, so no plan
+    // depends on their slot order. The arena starts in the planner's own raw
+    // buffer (left uninitialized: only the arena writes it), so a small
+    // admission calls no allocator for its tables.
+    static constexpr std::size_t kInlineScratchBytes = 16 * 1024;
+    alignas(std::max_align_t) std::array<std::byte, kInlineScratchBytes> scratch_buffer_;
+    std::pmr::monotonic_buffer_resource scratch_{scratch_buffer_.data(), scratch_buffer_.size()};
     // The pool as the tentative victims would leave it.
     CacheEvictionPlan eviction_plan_;
     // Per group: the bucket-constrained blocks (a restore's rebuilt slots; an

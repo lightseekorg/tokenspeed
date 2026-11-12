@@ -25,9 +25,11 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstddef>
 #include <functional>
 #include <limits>
 #include <memory>
+#include <memory_resource>
 #include <numeric>
 #include <optional>
 #include <tuple>
@@ -1669,8 +1671,7 @@ public:
           pool_{pool},
           plan_{pool, groups},
           no_dense_need_(groups.size()),
-          no_pair_need_(groups.size()),
-          scratch_{pool.AcquirePlanningScratch()} {
+          no_pair_need_(groups.size()) {
         plan_.StartCandidates(&taken_, nullptr, coordinator.CheckpointAgingFor(CacheTier::kHost));
     }
 
@@ -1731,7 +1732,12 @@ private:
     // Host rows land in their source's bucket: no dense blocks, no free-bucket pairs.
     std::vector<std::int64_t> no_dense_need_;
     std::vector<std::int64_t> no_pair_need_;
-    PlanningScratch::Lease scratch_;
+    // Holds taken_'s slots until the planner dies, first in the planner's own
+    // raw buffer (left uninitialized: only the arena writes it), so a small
+    // placement calls no allocator for it.
+    static constexpr std::size_t kInlineScratchBytes = 4 * 1024;
+    alignas(std::max_align_t) std::array<std::byte, kInlineScratchBytes> scratch_buffer_;
+    std::pmr::monotonic_buffer_resource scratch_{scratch_buffer_.data(), scratch_buffer_.size()};
     CacheEvictionCandidates::LocationSet taken_{&scratch_};
     std::vector<VictimSet> victims_;
 };

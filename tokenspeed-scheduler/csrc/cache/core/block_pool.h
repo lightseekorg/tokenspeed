@@ -36,7 +36,6 @@
 
 #include "cache/core/cache_block_ref.h"
 #include "cache/core/fixed_slot_resource.h"
-#include "cache/core/planning_scratch.h"
 #include "utils.h"
 
 namespace tokenspeed {
@@ -157,8 +156,6 @@ public:
     BlockPool(const BlockPool&) = delete;
     BlockPool& operator=(const BlockPool&) = delete;
     ~BlockPool() noexcept { FatalCheck(NumOccupiedSlots() == 0, "BlockPool destroyed with live block references"); }
-
-    PlanningScratch::Lease AcquirePlanningScratch() const { return planning_scratch_.Acquire(); }
 
     // Number of physical LCM blocks. Kernel page 0 is reserved separately.
     std::int32_t NumLcmBlocks() const noexcept { return static_cast<std::int32_t>(lcm_blocks_.size()); }
@@ -638,7 +635,6 @@ private:
     // Last-owner release recycles the control only after cancelling observers
     // and releasing its CacheBlock; no stale observer survives slot reuse.
     mutable FixedSlotResource control_memory_{256};
-    PlanningScratch planning_scratch_;
     std::vector<LcmBlock> lcm_blocks_;
     // Free parents are interchangeable: release appends and allocation consumes
     // the front. Bound parents have per-group, per-bucket availability indices.
