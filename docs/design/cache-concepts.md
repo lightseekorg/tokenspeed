@@ -2855,3 +2855,10 @@ must not derive physical demand by dividing token counts by a page size. Snapsho
 collection is an explicit control operation; the allocator scan is not added to
 each forward.
 The transport identifies each reply's DP rank, independent of reply arrival order.
+
+### Persistent cache allocation and RDMA
+
+Persistent CUDA cache storage uses non-expandable allocations for legacy RDMA
+compatibility. During serialized arena construction, CacheArena temporarily
+disables expandable segments and restores the original allocator configuration
+afterward.

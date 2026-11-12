@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
 
 import numpy as np
 import torch
@@ -45,6 +46,38 @@ from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = get_colorful_logger(__name__)
+
+
+@contextmanager
+def _cache_allocation(device):
+    """Use RDMA-registerable storage while constructing the persistent arena.
+
+    CUDA VMM expandable segments cannot be registered by legacy peer-memory
+    RDMA. Change only this startup allocation scope, restoring all allocator
+    settings even on failure. No inference or graph capture runs in this scope.
+    CPU and other device allocations retain their allocator unchanged.
+    """
+    if torch.device(device).type != "cuda":
+        yield
+        return
+    torch.cuda.init()
+    if torch.cuda.memory.get_allocator_backend() != "native":
+        yield
+        return
+    settings = torch.cuda.memory._snapshot()["allocator_settings"]
+    if not settings["expandable_segments"]:
+        yield
+        return
+    original = settings["PYTORCH_CUDA_ALLOC_CONF"]
+    temporary = ",".join(filter(None, (original, "expandable_segments:False")))
+    torch.cuda.memory._set_allocator_settings(temporary)
+    try:
+        yield
+    finally:
+        # This setting is sticky: the last config string may omit it. Restore
+        # its effective value before restoring the caller's last config.
+        torch.cuda.memory._set_allocator_settings("expandable_segments:True")
+        torch.cuda.memory._set_allocator_settings(original)
 
 
 def _copy_waves(
@@ -191,7 +224,10 @@ class CacheArena:
         # Only device regions live in the memory saver's pool; pinned Host
         # regions (sparse offload history) are ordinary Host allocations and
         # stay mapped across sleep. Wake zeroes both (clear()).
-        with self.memory_saver_adapter.region(tag="kv_cache", enable_cpu_backup=False):
+        with (
+            _cache_allocation(device),
+            self.memory_saver_adapter.region(tag="kv_cache", enable_cpu_backup=False),
+        ):
             for region in self.storage_plan.regions:
                 host = region.placement == "host"
                 self.regions[region.region_id] = torch.zeros(
