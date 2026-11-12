@@ -87,8 +87,39 @@ pub struct ReasoningGrammar {
     /// excluded from reasoning usage like the explicit markers.
     pub implicit_closer: Option<i32>,
     /// The schemas already found to be JSON, so a repeated schema is not
-    /// parsed again.
-    pub valid_schemas: Arc<Mutex<HashSet<String>>>,
+    /// parsed again. Bounded: past `RETAINED_SCHEMA_BYTES` a new schema is
+    /// parsed again each request instead of being remembered.
+    valid_schemas: Arc<Mutex<SchemaCache>>,
+}
+
+/// The schemas remembered as JSON, in bytes at most.
+const RETAINED_SCHEMA_BYTES: usize = 1 << 20;
+
+/// The schemas already found to be JSON, and the bytes they take. A schema
+/// is remembered only while the whole set stays within
+/// `RETAINED_SCHEMA_BYTES`: a client may send unlimited distinct schemas,
+/// and past the limit each new one is parsed again every request (the
+/// answer is the same, only the cost returns) rather than growing the set
+/// without bound. What is already remembered stays remembered.
+#[derive(Default, Debug)]
+struct SchemaCache {
+    schemas: HashSet<String>,
+    bytes: usize,
+}
+
+impl SchemaCache {
+    fn contains(&self, schema: &str) -> bool {
+        self.schemas.contains(schema)
+    }
+
+    /// Remembers `schema` unless the set is at its byte limit.
+    fn insert(&mut self, schema: &str) {
+        if self.schemas.contains(schema) || self.bytes + schema.len() > RETAINED_SCHEMA_BYTES {
+            return;
+        }
+        self.bytes += schema.len();
+        self.schemas.insert(schema.to_owned());
+    }
 }
 
 /// Two reasoning grammars are the same when they constrain the same way; the
@@ -102,6 +133,8 @@ impl PartialEq for ReasoningGrammar {
             && self.implicit_closer == other.implicit_closer
     }
 }
+
+impl Eq for ReasoningGrammar {}
 
 impl ReasoningGrammar {
     /// A reasoning grammar with no schema seen yet.
@@ -118,7 +151,7 @@ impl ReasoningGrammar {
             schema_slot,
             markers,
             implicit_closer,
-            valid_schemas: Arc::new(Mutex::new(HashSet::new())),
+            valid_schemas: Arc::new(Mutex::new(SchemaCache::default())),
         }
     }
 
@@ -127,9 +160,9 @@ impl ReasoningGrammar {
     /// A schema is parsed to find out, and the parse builds the whole
     /// document to throw it away. The schemas repeat across requests (a
     /// deployment's schemas are a small fixed set), so the ones already
-    /// found to be JSON are remembered and skipped. A schema that is not
-    /// JSON is not remembered: it stays the compiler's to refuse, and it
-    /// costs a parse either way.
+    /// found to be JSON are remembered and skipped, up to the cache's byte
+    /// limit. A schema that is not JSON is not remembered: it stays the
+    /// compiler's to refuse, and it costs a parse either way.
     ///
     /// The parse is the same one the schema would take, so a schema this
     /// accepts is exactly a schema the compiler can read.
@@ -148,7 +181,7 @@ impl ReasoningGrammar {
         self.valid_schemas
             .lock()
             .expect("schema cache lock")
-            .insert(schema.to_owned());
+            .insert(schema);
         true
     }
 }
@@ -709,6 +742,39 @@ mod tests {
             .lock()
             .expect("schema cache lock")
             .contains(r#"{"type":"object"}"#));
+    }
+
+    #[test]
+    fn the_cache_stops_at_its_byte_limit() {
+        let grammar = reasoning();
+        // Two schemas of the same length, each running just past half the
+        // limit so the second would cross it: two fills plus the JSON
+        // wrapping exceed RETAINED_SCHEMA_BYTES.
+        let schema = |fill: usize, pad: char| format!(r#"{{"a":"{}{}"}}"#, pad, "x".repeat(fill));
+        let fill = RETAINED_SCHEMA_BYTES / 2 + 1;
+        let first = schema(fill, 'a');
+        let second = schema(fill, 'b');
+        // Both are JSON, so both defer; only the first is remembered.
+        assert!(deferred(&grammar, &first).0.is_some());
+        assert!(deferred(&grammar, &second).0.is_some());
+        let cache = grammar.valid_schemas.lock().expect("schema cache lock");
+        assert_eq!(cache.schemas.len(), 1);
+        assert!(cache.schemas.contains(&first));
+        assert!(!cache.schemas.contains(&second));
+    }
+
+    #[test]
+    fn a_schema_larger_than_the_whole_limit_still_defers() {
+        let grammar = reasoning();
+        let oversized = format!(r#"{{"a":"{}"}}"#, "x".repeat(RETAINED_SCHEMA_BYTES + 1));
+        // Not remembered, but still JSON: the request still defers.
+        assert!(deferred(&grammar, &oversized).0.is_some());
+        assert!(grammar
+            .valid_schemas
+            .lock()
+            .expect("schema cache lock")
+            .schemas
+            .is_empty());
     }
 
     #[test]

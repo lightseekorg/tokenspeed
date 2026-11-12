@@ -900,11 +900,10 @@ mod tests {
             );
         }
         // Without single-token markers every prompt counts as opening it.
+        let mut unmarked_reasoning = reasoning.clone();
+        unmarked_reasoning.markers = None;
         let unmarked = IngressLimits {
-            reasoning: Some(ReasoningGrammar {
-                markers: None,
-                ..reasoning
-            }),
+            reasoning: Some(unmarked_reasoning),
             ..limits.clone()
         };
         assert_eq!(
