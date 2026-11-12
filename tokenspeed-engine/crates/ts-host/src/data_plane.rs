@@ -54,7 +54,7 @@ use ts_control::{
     output::{ForwardResult, HistorySeeds, LogprobPlan, NgramWindows, TopLogprobs},
 };
 use ts_pd::LandedRequest;
-use ts_scheduler::{CacheEvent, CacheEventKind, ExecutionPlan};
+use ts_scheduler::{profile, CacheEvent, CacheEventKind, ExecutionPlan};
 use ts_wire::{control::ProfileReq, ControlRequest, Wire};
 
 use crate::{pd::Streams, LAUNCHER_FAILURE};
@@ -141,6 +141,32 @@ enum Op {
         moves: Vec<SlotMoves>,
         reply: mpsc::SyncSender<Result<(), String>>,
     },
+}
+
+impl Op {
+    /// The operation's profile span name.
+    fn span_name(&self) -> &'static str {
+        match self {
+            Op::Admit(_) => "Op::Admit",
+            Op::Execute(_) => "Op::Execute",
+            Op::AttachGrammars(_) => "Op::AttachGrammars",
+            Op::Committed(_) => "Op::Committed",
+            Op::Barrier { .. } => "Op::Barrier",
+            Op::Release(_) => "Op::Release",
+            Op::Land { .. } => "Op::Land",
+            Op::IdleForward { .. } => "Op::IdleForward",
+            Op::CheckWeightUpdate { .. } => "Op::CheckWeightUpdate",
+            Op::UpdateWeights { .. } => "Op::UpdateWeights",
+            Op::CommitWeightUpdate { .. } => "Op::CommitWeightUpdate",
+            Op::Profile { .. } => "Op::Profile",
+            Op::ReloadForward { .. } => "Op::ReloadForward",
+            Op::ReleaseMemory { .. } => "Op::ReleaseMemory",
+            Op::ResumeMemory { .. } => "Op::ResumeMemory",
+            Op::SnapshotExpertLoad { .. } => "Op::SnapshotExpertLoad",
+            Op::EpdPublish(_) => "Op::EpdPublish",
+            Op::ApplyExpertPlacement { .. } => "Op::ApplyExpertPlacement",
+        }
+    }
 }
 
 /// Route counters `[layers, physical]` and the placement they were counted
@@ -342,8 +368,13 @@ impl PythonDataPlane {
         call: impl FnOnce(&Bound<'_, PyAny>) -> PyResult<T>,
     ) -> Result<T, DataPlaneError> {
         self.failed()?;
-        Python::attach(|py| call(self.plane.bind(py)).map_err(|error| describe(py, &error)))
-            .map_err(|failure| self.fail(failure))
+        // The wait for the GIL, which the forward thread's Python holds.
+        let acquiring = profile::span("DataPlane::acquire_gil");
+        Python::attach(|py| {
+            drop(acquiring);
+            call(self.plane.bind(py)).map_err(|error| describe(py, &error))
+        })
+        .map_err(|failure| self.fail(failure))
     }
 
     fn fail(&self, failure: String) -> DataPlaneError {
@@ -368,6 +399,7 @@ impl DataPlane for PythonDataPlane {
     type Pending = ForwardId;
 
     fn admit(&mut self, requests: &[Admission]) -> Result<(), DataPlaneError> {
+        let _span = profile::span("DataPlane::admit");
         let mut rows = Vec::with_capacity(requests.len());
         for request in requests {
             let frames = ts_wire::encode_frames(&request.sampling_params);
@@ -395,6 +427,7 @@ impl DataPlane for PythonDataPlane {
         plan: ExecutionPlan,
         dispatch: &Dispatch<'_>,
     ) -> Result<Option<ForwardId>, DataPlaneError> {
+        let _span = profile::span("DataPlane::execute");
         // The forward thread launches a forward exactly when the plan has a
         // batch and the rank does not idle, by the same rule the loop chose
         // `forward` with.
@@ -422,6 +455,7 @@ impl DataPlane for PythonDataPlane {
     }
 
     fn complete(&mut self, forward: ForwardId) -> Result<ForwardResult, DataPlaneError> {
+        let _span = profile::span("DataPlane::complete");
         let launched = self.shared.take_launched(forward).map_err(DataPlaneError)?;
         let result = self.query(|plane| complete(plane, &launched))?;
         // The profiler counts committed forwards, on the thread it traces.
@@ -430,6 +464,7 @@ impl DataPlane for PythonDataPlane {
     }
 
     fn poll_cache_events(&mut self) -> Result<Vec<CacheEvent>, DataPlaneError> {
+        let _span = profile::span("DataPlane::poll_cache_events");
         let polled: Vec<(String, u32)> = self.query(|plane| {
             plane
                 .call_method0("poll_cache_events")
@@ -466,6 +501,7 @@ impl DataPlane for PythonDataPlane {
     }
 
     fn idle_forward(&mut self, dp: &DpRound) -> Result<(), DataPlaneError> {
+        let _span = profile::span("DataPlane::idle_forward");
         let dp = dp.clone();
         self.ask(|reply| Op::IdleForward { dp, reply })
     }
@@ -603,11 +639,21 @@ fn forward_loop(
     loop {
         // Wait without the GIL: the control thread and the transfer peer's
         // threads need it.
-        let (returned, op) = py.detach(move || {
+        let (returned, op, received_ns) = py.detach(move || {
             let op = queue.recv();
-            (queue, op)
+            (queue, op, profile::recording().then(profile::now_ns))
         });
         queue = returned;
+        if let Some(received_ns) = received_ns {
+            // The wait for the GIL, which the control thread's completion
+            // queries hold.
+            profile::record(
+                profile::HOST,
+                "forward_loop::acquire_gil".into(),
+                received_ns,
+                profile::now_ns(),
+            );
+        }
         let Ok(op) = op else {
             // Closed: finish what a forward left pending before the caches
             // close behind this thread.
@@ -649,6 +695,7 @@ fn forward_loop(
             }
             continue;
         }
+        let _span = profile::span(op.span_name());
         if let Err(error) = run(py, plane, op, shared, streams) {
             shared.fail(error);
         }

@@ -34,9 +34,13 @@
 // The crate is the FFI boundary to C++ and the interpreter.
 #![allow(unsafe_code)]
 
+pub mod profile;
+
 use std::ptr::NonNull;
 
 use pyo3::{ffi as pyffi, prelude::*};
+
+use crate::profile::record_scheduler_span;
 
 #[cxx::bridge(namespace = "ts_scheduler")]
 mod ffi {
@@ -476,6 +480,15 @@ mod ffi {
         fn plan_aborts(plan: &ExecutionPlan) -> Vec<SchedulerAbortView>;
         fn plan_cache_ops(plan: &ExecutionPlan) -> Vec<CacheOpView>;
         fn plan_storage_ops(plan: &ExecutionPlan) -> Vec<StorageOpView>;
+
+        /// Install the scheduler's profile span sink, which forwards to
+        /// [`record_scheduler_span`], or remove it.
+        fn set_profile_span_sink(installed: bool);
+    }
+
+    extern "Rust" {
+        /// The C++ scheduler's finished spans, while the sink is installed.
+        fn record_scheduler_span(name: &str, begin_ns: i64, end_ns: i64);
     }
 }
 
@@ -585,6 +598,7 @@ impl Scheduler {
     /// Queue requests for admission. Validation errors reject the entire
     /// batch without inserting any request.
     pub fn submit_requests(&mut self, specs: &[RequestSpec]) -> Result<(), cxx::Exception> {
+        let _span = profile::span("Scheduler::submit_requests");
         ffi::submit_requests(self.pinned(), specs)
     }
 
@@ -597,6 +611,7 @@ impl Scheduler {
         allow_prefill: bool,
         apply_prefill_watermark: bool,
     ) -> ExecutionPlan {
+        let _span = profile::span("Scheduler::next_execution_plan");
         ExecutionPlan(ffi::next_execution_plan(
             self.pinned(),
             allow_prefill,
@@ -607,6 +622,7 @@ impl Scheduler {
     /// Feed forward results back. Fails, applying none of `events`' later
     /// entries, on an event the request's state does not allow.
     pub fn advance(&mut self, events: &[ForwardEvent]) -> Result<(), cxx::Exception> {
+        let _span = profile::span("Scheduler::advance");
         ffi::advance(self.pinned(), events)
     }
 
@@ -617,6 +633,7 @@ impl Scheduler {
         storage: &StorageRound,
         cache_events: &[CacheEvent],
     ) -> Result<(), cxx::Exception> {
+        let _span = profile::span("Scheduler::advance_head");
         let ticks: &[StorageTickView] = storage.tick.as_slice();
         ffi::advance_head(
             self.pinned(),
@@ -645,17 +662,20 @@ impl Scheduler {
     /// Request and physical block counts: a pass over the requests per
     /// state, and the empty-block count, which the pool keeps.
     pub fn sizes(&self) -> SchedulerSizes {
+        let _span = profile::span("Scheduler::sizes");
         ffi::sizes(self.get())
     }
 
     /// Distinct LCM blocks held by running requests' block tables. The
     /// tables keep the count as they change, so reading it walks nothing.
     pub fn active_lcm_blocks(&self) -> i32 {
+        let _span = profile::span("Scheduler::active_lcm_blocks");
         ffi::active_lcm_blocks(self.get())
     }
 
     /// What the prefill-delay vote should publish for this rank.
     pub fn probe_prefill_gate(&self) -> PrefillGateProbe {
+        let _span = profile::span("Scheduler::probe_prefill_gate");
         ffi::probe_prefill_gate(self.get())
     }
 
@@ -694,6 +714,7 @@ impl Scheduler {
     /// The prefix-cache mutations since the last drain, in order; empty
     /// unless the scheduler was configured to record them.
     pub fn drain_kv_events(&mut self) -> Vec<KvEventView> {
+        let _span = profile::span("Scheduler::drain_kv_events");
         ffi::drain_kv_events(self.pinned())
     }
 
@@ -729,6 +750,7 @@ unsafe impl Send for ExecutionPlan {}
 impl ExecutionPlan {
     /// The model batches, in plan order.
     pub fn forward_batches(&self) -> Vec<ForwardBatchView> {
+        let _span = profile::span("ExecutionPlan::forward_batches");
         ffi::plan_forward_batches(&self.0)
     }
 
@@ -777,6 +799,7 @@ impl ExecutionPlan {
 
     /// The cache ops the plan puts in flight, in plan order.
     pub fn cache_ops(&self) -> Vec<CacheOpView> {
+        let _span = profile::span("ExecutionPlan::cache_ops");
         ffi::plan_cache_ops(&self.0)
     }
 

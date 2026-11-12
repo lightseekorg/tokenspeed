@@ -1196,6 +1196,7 @@ class HostBootstrap:
         port_args: PortArgs,
         connection: Connection,
         pd_outbox,
+        host_spans,
         metrics_relay_endpoint: str | None,
     ) -> None:
         self._server_args = server_args
@@ -1573,6 +1574,7 @@ class HostBootstrap:
                             else mapping.attn.tp_group
                         ),
                     ),
+                    host_spans=host_spans,
                 ),
                 regions,
                 report_compiles=self.config.engine_metrics,
@@ -1672,12 +1674,17 @@ class HostBootstrap:
 
 
 def bootstrap(
-    control_fd: int, pd_outbox, weight_update_commit_protocol: int = 0
+    control_fd: int,
+    pd_outbox,
+    weight_update_commit_protocol: int = 0,
+    host_spans=None,
 ) -> HostBootstrap | EncodeBootstrap:
     """Build this host's rank from the arguments the launcher sends on
     ``control_fd``; with PD, its transfer peer reaches the host through
     ``pd_outbox`` (see ``pd/host_peer.py``). An EPD encode rank runs the
-    host's encode mode instead (``epd/encode_host.py``)."""
+    host's encode mode instead (``epd/encode_host.py``). ``host_spans`` is
+    the host's span recording, which a profile merges into its trace
+    (``engine/profiler.py``); an older host binary passes none."""
     connection = Connection(control_fd)
     server_args, port_args, metrics_relay_endpoint = connection.recv()
     # Reject an older host binary before constructing a model or process
@@ -1693,7 +1700,12 @@ def bootstrap(
     if server_args.disaggregation_mode == "encode":
         return EncodeBootstrap(server_args, port_args, connection)
     return HostBootstrap(
-        server_args, port_args, connection, pd_outbox, metrics_relay_endpoint
+        server_args,
+        port_args,
+        connection,
+        pd_outbox,
+        host_spans,
+        metrics_relay_endpoint,
     )
 
 

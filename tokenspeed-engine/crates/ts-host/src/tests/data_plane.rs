@@ -55,6 +55,29 @@ fn interpreter() {
     });
 }
 
+#[test]
+fn python_starts_and_stops_the_host_span_recording() {
+    interpreter();
+    Python::attach(|py| {
+        let host_spans = Bound::new(py, crate::host_spans::HostSpans).unwrap();
+        host_spans.call_method0("start").unwrap();
+        drop(profile::span("recorded"));
+        let (spans, threads): (Vec<crate::host_spans::PySpan>, Vec<(u64, String)>) =
+            host_spans.call_method0("stop").unwrap().extract().unwrap();
+        drop(profile::span("after_stop"));
+        // Other tests share the process: find this test's spans by name.
+        let (_, category, tid, begin_ns, end_ns) = spans
+            .iter()
+            .find(|(name, ..)| name == "recorded")
+            .expect("the span recorded between start and stop")
+            .clone();
+        assert_eq!(category, profile::HOST);
+        assert!(0 < begin_ns && begin_ns <= end_ns);
+        assert!(threads.iter().any(|(thread, _)| *thread == tid));
+        assert!(!profile::recording());
+    });
+}
+
 /// The stand-in, and an idle scheduler to draw plans from. A launch
 /// returns the next token, from 100; the launch numbered `held` waits
 /// for `unblock`, and every launch raises once `failing` is set.

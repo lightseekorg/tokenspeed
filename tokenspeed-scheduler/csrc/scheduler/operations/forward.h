@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "cache/allocator/group_allocator.h"
+#include "core/profile_span.h"
 
 namespace tokenspeed {
 
@@ -185,6 +186,9 @@ struct ForwardBatch {
     // padding is -1. The owned transport windows omit the long zero prefixes.
     std::map<std::string, ForwardBlockTableRows> block_tables;
     explicit ForwardBatch(std::vector<ForwardOperation> ops) {
+        // Flattens every row's whole block table, which at long contexts
+        // costs a plan more than choosing its batch.
+        ProfileSpan profile_span{"ForwardBatch::ForwardBatch"};
         std::stable_partition(ops.begin(), ops.end(),
                               [](const ForwardOperation& a) { return std::holds_alternative<PrefillOperation>(a); });
         for (auto& op : ops) {

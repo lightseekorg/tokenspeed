@@ -36,6 +36,7 @@
 
 mod data_plane;
 mod encode;
+mod host_spans;
 mod interpreter;
 mod logging;
 mod pd;
@@ -652,9 +653,13 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
             // Before anything imports the scheduler package.
             ts_scheduler::alias_builtin_module(py)?;
             let outbox = Bound::new(py, pd::Outbox::new())?;
+            let host_spans = Bound::new(py, host_spans::HostSpans)?;
             let bootstrap = py
                 .import("tokenspeed.runtime.engine.rust_host")?
-                .call_method1("bootstrap", (args.control_fd, outbox.clone(), 2_u32))?;
+                .call_method1(
+                    "bootstrap",
+                    (args.control_fd, outbox.clone(), 2_u32, host_spans),
+                )?;
             let mode: String = bootstrap.getattr("mode")?.extract()?;
             Ok((bootstrap.unbind(), outbox.unbind(), mode))
         })();
