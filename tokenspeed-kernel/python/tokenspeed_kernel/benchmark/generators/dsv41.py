@@ -571,6 +571,11 @@ def prepare_dsv41_index_topk(
             None,
             out,
             index_metadata=metadata,
+            **(
+                {"simulation_seed": None}
+                if spec.name == "gluon_dsv41_index_topk_gfx950"
+                else {}
+            ),
         )
 
     return PreparedBenchmark(

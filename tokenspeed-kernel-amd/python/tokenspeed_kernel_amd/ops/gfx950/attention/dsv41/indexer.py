@@ -29,6 +29,10 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
+from tokenspeed_kernel_amd.ops.gfx950.attention.dsv41.simulation import (
+    IndexSelectionSimulation,
+    simulated_index,
+)
 
 __all__ = [
     "dsv41_index_logits_gfx950",
@@ -1169,6 +1173,9 @@ def _select_lds_digit(
         "width",
         "topk",
         "take",
+        "simulation_seed",
+        "simulation_visible_stride",
+        "candidate_capacity",
     ),
 )
 def gluon_dsv41_index_topk_select_gfx950(
@@ -1184,6 +1191,12 @@ def gluon_dsv41_index_topk_select_gfx950(
     width,
     topk,  # row_out width
     take,  # min(topk, width)
+    simulation_seed,
+    simulation_visible,
+    simulation_visible_stride,
+    candidate_capacity,
+    SIMULATE: gl.constexpr,
+    FORCE_LATEST: gl.constexpr,
     TOPK: gl.constexpr,  # power-of-two capacity >= topk, at least 512
     HAS_CANDIDATES: gl.constexpr,
     HAS_LIMITS: gl.constexpr,
@@ -1224,6 +1237,21 @@ def gluon_dsv41_index_topk_select_gfx950(
             width,
             gl.maximum(gl.load(row_limits + q * row_limits_stride).to(gl.int64), 0),
         ).to(gl.int32)
+    simulation_extent = width
+    if SIMULATE and HAS_CANDIDATES:
+        visible = gl.maximum(
+            gl.load(simulation_visible + q * simulation_visible_stride).to(gl.int64), 0
+        )
+        simulation_extent = 0
+        for b0 in range(0, candidate_capacity, BLOCK):
+            b = b0 + gl.arange(0, BLOCK, layout=L)
+            block = gl.load(
+                candidates + q * cand_stride + b, mask=b < candidate_capacity, other=-1
+            ).to(gl.int64)
+            n = gl.where(
+                block >= 0, gl.minimum(gl.maximum(visible - block * 8, 0), 8), 0
+            )
+            simulation_extent += gl.sum(n.to(gl.int32), 0)
     hist_smem = gl.allocate_shared_memory(gl.int32, [BINS], SL)
     ones = gl.full([BLOCK], 1, gl.int32, layout=L)
     d = gl.arange(0, BINS, layout=LBIN)
@@ -1398,6 +1426,20 @@ def gluon_dsv41_index_topk_select_gfx950(
                 axis=0,
             )
         else:
+            if SIMULATE:
+                col = simulated_index(
+                    col,
+                    rank,
+                    count,
+                    simulation_extent,
+                    q,
+                    simulation_seed,
+                    candidates,
+                    cand_stride,
+                    pick,
+                    False,
+                    FORCE_LATEST,
+                )
             gl.store(out + rank, col, mask=pick)
     else:
         # Fallback: three-pass MSD radix select over the row. After each pass,
@@ -1501,6 +1543,20 @@ def gluon_dsv41_index_topk_select_gfx950(
                     (gl.expand_dims(other, 0) < gl.expand_dims(mine, 1)).to(gl.int32),
                     axis=1,
                 )
+        if SIMULATE:
+            mine = simulated_index(
+                mine,
+                rank,
+                count,
+                simulation_extent,
+                q,
+                simulation_seed,
+                candidates,
+                cand_stride,
+                i < count,
+                HAS_CANDIDATES,
+                FORCE_LATEST,
+            )
         gl.store(out + rank, mine.to(gl.int32), mask=i < count)
     gl.store(
         out + i,
@@ -1511,7 +1567,15 @@ def gluon_dsv41_index_topk_select_gfx950(
 
 
 def launch_gluon_dsv41_index_topk_select_gfx950(
-    logits, candidates, live_widths, topk, row_out, row_lens, take=None
+    logits,
+    candidates,
+    live_widths,
+    topk,
+    row_out,
+    row_lens,
+    take=None,
+    *,
+    simulation: IndexSelectionSimulation | None,
 ):
     """Select CSA2 rows from scored logits, position-sorted.
 
@@ -1530,6 +1594,9 @@ def launch_gluon_dsv41_index_topk_select_gfx950(
             then -1 padding. Equal-score boundary ties keep the lowest columns.
         row_lens: Int32 [Q] destination for the number of ids written.
         take: None for ``topk``, or the number of ids to select, <= topk.
+        simulation: None preserves selected IDs. Otherwise replace only the
+            final stores with one sampled ID per ordered history stratum.
+            See IndexSelectionSimulation for the allocated-history contract.
 
     Returns:
         None.
@@ -1565,6 +1632,14 @@ def launch_gluon_dsv41_index_topk_select_gfx950(
         or live_widths.dtype not in (torch.int32, torch.int64)
     ):
         raise ValueError(f"live_widths must be int32/int64 [{queries}]")
+    if simulation is not None and (
+        simulation.visible_lens.shape != (queries,)
+        or simulation.visible_lens.dtype not in (torch.int32, torch.int64)
+        or simulation.visible_lens.device != logits.device
+    ):
+        raise ValueError(
+            "simulation visible_lens must be integer [queries] on the logits device"
+        )
     cand = logits if candidates is None else candidates
     grid = (queries,)
     gluon_dsv41_index_topk_select_gfx950[grid](
@@ -1580,6 +1655,12 @@ def launch_gluon_dsv41_index_topk_select_gfx950(
         width,
         topk,
         min(take, width),
+        0 if simulation is None else simulation.seed,
+        logits if simulation is None else simulation.visible_lens,
+        0 if simulation is None else simulation.visible_lens.stride(0),
+        0 if candidates is None else candidates.shape[1],
+        SIMULATE=simulation is not None,
+        FORCE_LATEST=False if simulation is None else simulation.force_latest,
         TOPK=max(512, triton.next_power_of_2(topk)),
         HAS_CANDIDATES=candidates is not None,
         HAS_LIMITS=live_widths is not None,
@@ -1629,7 +1710,14 @@ def gluon_dsv41_index_block_max_gfx950(
 
 
 def launch_gluon_dsv41_index_block_select_gfx950(
-    logits, visible, candidate_topk, block_out, block_lens, visible_capacity
+    logits,
+    visible,
+    candidate_topk,
+    block_out,
+    block_lens,
+    visible_capacity,
+    *,
+    simulation_seed: int | None,
 ):
     """Select each query's best 8-row blocks, position-sorted.
 
@@ -1680,4 +1768,13 @@ def launch_gluon_dsv41_index_block_select_gfx950(
         block_out,
         block_lens,
         take=k,
+        simulation=(
+            None
+            if simulation_seed is None
+            else IndexSelectionSimulation(
+                seed=simulation_seed,
+                visible_lens=block_count,
+                force_latest=True,
+            )
+        ),
     )

@@ -165,6 +165,7 @@ def test_public_entry_point_selects_and_captures() -> None:
             renormalize=True,
             routed_scaling_factor=2.5,
             correction_bias=bias,
+            simulation_seed=None,
         )
 
     route()
@@ -207,6 +208,7 @@ def test_kimi3_prefill_route_matches_fp32_reference(
         routed_scaling_factor=scale,
         correction_bias=bias,
         override="gluon_sigmoid_bias_topk_gfx1250",
+        simulation_seed=None,
     )
     _assert_matches_fp32_reference(logits, bias, weights, ids, 16, normalize, scale)
 
@@ -223,6 +225,7 @@ def test_kimi3_prefill_route_ties_choose_lowest_ids() -> None:
         routed_scaling_factor=1.0,
         correction_bias=bias,
         override="gluon_sigmoid_bias_topk_gfx1250",
+        simulation_seed=None,
     )
     expected = torch.arange(16, device="cuda", dtype=torch.int32).expand(3, -1)
     torch.testing.assert_close(ids, expected, rtol=0, atol=0)

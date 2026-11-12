@@ -92,7 +92,9 @@ def test_moe_topk_softmax_matches_reference():
     # Through the public entry point; selection itself is covered in
     # test_kernel_api_selection.py.
     logits = torch.randn(64, 512, device="cuda", dtype=torch.bfloat16)
-    weights, ids = moe_topk(logits, 10, "softmax", "topk", True, 1.0)
+    weights, ids = moe_topk(
+        logits, 10, "softmax", "topk", True, 1.0, simulation_seed=None
+    )
     expected_weights, expected_ids = torch_stable_softmax_topk(
         router_logits=logits,
         topk=10,

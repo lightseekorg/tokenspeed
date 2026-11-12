@@ -111,6 +111,24 @@ class MoEDownColumns(nn.Module):
         self.weight.data = self.weight.data.new_empty((0,))
         self.weight_scale.data = self.weight_scale.data.new_empty((0,))
 
+    def initialize_replicated_dummy(
+        self, weight: torch.Tensor, scale: torch.Tensor
+    ) -> None:
+        """Derive this copy from identically seeded dummy input-column shards.
+
+        The dummy loader uses the same seed and local shape on every TP rank,
+        so the full intermediate dimension repeats the local shard. Fill that
+        repetition by broadcast, without materializing full expert weights.
+        Call before either copy is converted to its kernel layout.
+        """
+        if self.prepared is not None:
+            raise RuntimeError("Dummy columns must precede layout preparation")
+        for target, local in ((self.weight, weight), (self.weight_scale, scale)):
+            rows = self.shard(local)
+            target.data.view(
+                rows.shape[0], self.width, self.tp_size, rows.shape[-1]
+            ).copy_(rows.unsqueeze(-2))
+
     def forward(
         self,
         intermediate: torch.Tensor,

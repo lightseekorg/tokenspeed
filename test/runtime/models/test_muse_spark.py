@@ -255,6 +255,33 @@ def test_muse_spark_architecture_is_an_audio_model() -> None:
     assert is_audio_model(["MuseSparkForConditionalGeneration"])
 
 
+@pytest.mark.parametrize("simulate", [False, True])
+def test_audio_checkpoint_completeness_is_required_for_real_weights(
+    monkeypatch, simulate
+):
+    from tokenspeed.runtime.model_loader.weight_utils import initialize_dummy_weights
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    model = _stub(MuseSparkForConditionalGeneration)
+    model.audio_tower = torch.nn.Linear(2, 2)
+    model._loaded_audio = set()
+    model.model = torch.nn.Module()
+    model.model.layers = torch.nn.ModuleList()
+    initialize_dummy_weights(model)
+    monkeypatch.setitem(global_server_args_dict, "simulate", simulate)
+    if simulate:
+        model.post_quant_warmup()
+    else:
+        with pytest.raises(ValueError, match="missing audio tensors"):
+            model.post_quant_warmup()
+        model._loaded_audio = {
+            name
+            for name, _ in model.named_parameters()
+            if name.startswith("audio_tower.")
+        }
+        model.post_quant_warmup()
+
+
 def test_muse_spark_config_groups_the_attention_pattern_into_caches() -> None:
     config = _config(62)
     s, f = SLIDING_ATTENTION, FULL_ATTENTION
@@ -554,6 +581,69 @@ def test_muse_mxfp4_honors_quark_expert_exclusions(
     assert quantized.experts.plan["solution"] == "triton"
     assert quantized.experts.supports_deferred_finalize is True
     assert quantized.experts.deferred_output_is_token_order is False
+
+
+@requires_gpu
+@pytest.mark.skipif(not current_platform().is_cdna4, reason="Simulation targets gfx950")
+def test_muse_spark_simulation_preserves_route_weights(monkeypatch, bf16_default_dtype):
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    config = _tiny_config()
+    config.num_local_experts = 256
+    config.num_experts_per_tok = 8
+    monkeypatch.setitem(global_server_args_dict, "simulate", True)
+    with torch.device("cuda"):
+        module_ = MuseSparkMoE(
+            config=config,
+            mapping=_single_rank_mapping(),
+            quant_config=None,
+            layer_id=17,
+            prefix="mlp",
+            alt_stream=None,
+        )
+    assert module_.simulation_seed == 17
+    torch.manual_seed(21)
+    module_.gate.e_score_correction_bias.data.normal_(std=0.01)
+    logits = torch.randn(16, 256, device="cuda", dtype=torch.float32)
+    simulated_weights, simulated_ids = module_._select_experts(logits, None)
+    module_.simulation_seed = None
+    real_weights, real_ids = module_._select_experts(logits, None)
+    assert torch.equal(simulated_weights, real_weights)
+    assert not torch.equal(simulated_ids, real_ids)
+    assert bool(((simulated_ids >= 0) & (simulated_ids < 256)).all())
+    sorted_ids = simulated_ids.sort(dim=-1).values
+    assert bool((sorted_ids[:, 1:] != sorted_ids[:, :-1]).all())
+
+
+def test_muse_simulation_rejects_nvfp4_before_forward(monkeypatch, bf16_default_dtype):
+    from tokenspeed.runtime.models import muse_spark as module
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    class PreparedExperts(torch.nn.Module):
+        def __init__(self, **kwargs):
+            super().__init__()
+            self._quant_kind = "nvfp4"
+            self.supports_deferred_finalize = True
+
+    # Isolate admission from hardware-specific weight allocation. The router
+    # must refuse this prepared expert kind during construction, before warmup.
+    monkeypatch.setattr(module, "MoELayer", PreparedExperts)
+    monkeypatch.setitem(global_server_args_dict, "simulate", True)
+    quant_config = Mxfp4Config(
+        is_checkpoint_mxfp4_serialized=True,
+        is_w4a8_fp8=False,
+        use_dynamic_mxfp4_activations=True,
+        quant_method="quark",
+    )
+    with pytest.raises(NotImplementedError, match="Prepared NVFP4 routing"):
+        MuseSparkMoE(
+            config=_tiny_config(),
+            mapping=_single_rank_mapping(),
+            quant_config=quant_config,
+            layer_id=0,
+            prefix="mlp",
+            alt_stream=None,
+        )
 
 
 @requires_gpu
@@ -1542,6 +1632,7 @@ def test_select_experts_routes_in_the_topk_kernel_when_prepared(
     """Prepared GEMMs take the fused top-k + routing launch; otherwise the plain top-k runs."""
     moe = _stub(MuseSparkMoE)
     moe.topk, moe.route_scale, moe.expert_start, moe.experts_per_rank = 2, 1.5, 4, 4
+    moe.simulation_seed = None
     moe.gate = SimpleNamespace(e_score_correction_bias=torch.zeros(8))
     logits = torch.randn(3, 8)
     calls: list[str] = []

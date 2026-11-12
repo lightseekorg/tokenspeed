@@ -1894,6 +1894,9 @@ class DeepseekV41MoE(DeepseekV4MoE):
                     topk_weights_dtype=self.topk.weights_dtype,
                     hidden_states=hidden_states,
                     gate_weight=gate.weight,
+                    simulation_seed=(
+                        config.layer_id if global_server_args_dict["simulate"] else None
+                    ),
                 )
             except NoKernelFoundError:
                 pass

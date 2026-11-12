@@ -256,7 +256,8 @@ def test_kvp_decode_refresh_has_no_host_history_plan(
 
     calls = []
 
-    def select(*args):
+    def select(*args, simulation_seed):
+        assert simulation_seed is None
         page_table, visible, candidates = args[3:6]
         # Keep decode eligible for paged Full and sparse Reindex, even when
         # several verify tokens share the same request's logical page table.

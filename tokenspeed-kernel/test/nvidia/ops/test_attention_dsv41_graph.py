@@ -52,7 +52,21 @@ def test_index_topk_graph_full_candidates_and_reindex():
 
     def run():
         full = dsv41.index_topk(
-            q, weights, cache, table, visible, None, 16, 4, 8, 2, 64, None, None, None
+            q,
+            weights,
+            cache,
+            table,
+            visible,
+            None,
+            16,
+            4,
+            8,
+            2,
+            64,
+            None,
+            None,
+            None,
+            simulation_seed=None,
         )
         reindex = dsv41.index_topk(
             q,
@@ -69,6 +83,7 @@ def test_index_topk_graph_full_candidates_and_reindex():
             None,
             None,
             None,
+            simulation_seed=None,
         )
         return full + reindex
 
@@ -366,6 +381,7 @@ def test_sparse_reindex_selects_what_the_dense_score_selects(blocks, pages):
             None,
             None,
             None,
+            simulation_seed=None,
         )
 
     scored = []
@@ -537,6 +553,7 @@ def test_index_selection_overwrites_poisoned_outputs_on_every_graph_replay(heads
             None,
             out,
             solution=None,
+            simulation_seed=None,
         )
 
     run()

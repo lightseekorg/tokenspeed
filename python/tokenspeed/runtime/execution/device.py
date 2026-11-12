@@ -436,6 +436,140 @@ class DeviceHandle:
     # Per-round work
     # ------------------------------------------------------------------
 
+    def prepare_simulated_decode(self, fixture, candidate_token_ids) -> None:
+        """Initialize an exclusive synthetic benchmark case on the forward thread.
+
+        The handle keeps the executor, streams and arena private. The caller
+        retains the allocator fixture until all its forwards finish and must
+        pass normal planned-forward inputs (including Engram snapshots).
+        """
+        self._executor.prepare_simulated_decode(fixture, candidate_token_ids)
+
+    def benchmark_decode(
+        self,
+        planned: PlannedForward,
+        *,
+        iterations: int,
+        warmup: int,
+        cache_flush_bytes: int,
+    ) -> dict:
+        """Time normal fixed-state forwards, including completion of draft work.
+
+        Exclusive benchmark use only: apply the scheduler plan's page operations
+        once before calling this. For synthetic state, apply those operations
+        before prepare_simulated_decode. Restores and hardware-cache eviction
+        are outside both forward timers, but included in total benchmark wall time.
+        """
+        import time
+
+        from tokenspeed_kernel.compile_monitor import compile_stats
+
+        from tokenspeed.runtime.distributed.process_group_manager import (
+            process_group_manager as pg_manager,
+        )
+        from tokenspeed.runtime.execution.forward_benchmark import FixedDecodeState
+
+        if iterations < 1 or warmup < 1 or cache_flush_bytes < 0:
+            raise ValueError(
+                "Need positive iterations/warmup and nonnegative eviction bytes"
+            )
+        executor = self._executor
+        if executor.config.overlap_schedule_depth or executor.config.pp_size != 1:
+            raise NotImplementedError(
+                "Fixed-state forwards require serial, PP=1 execution"
+            )
+        if self._role is not DeviceRole.PLAIN:
+            raise NotImplementedError(
+                "Fixed-state forwards require an aggregate engine"
+            )
+        self.settle()
+        cpu_group = (
+            pg_manager.get_process_group("gloo", executor.config.world_group)
+            if executor.config.world_size > 1
+            else None
+        )
+        batch = planned.forward_op
+        stream = executor.execution_stream
+        stream.wait_stream(executor.default_stream)
+        started = time.perf_counter()
+        with executor.device_module.stream(stream):
+            executor.runtime_states.bind_stop_criteria(
+                batch.request_ids,
+                batch.request_pool_indices,
+                planned.stop_criteria,
+            )
+            executor.sampling_backend.prepare_step(
+                batch.request_ids,
+                batch.request_pool_indices,
+                planned.sampling_params_list,
+                num_tokens_per_req=executor.config.output_length,
+            )
+            snapshot = FixedDecodeState(
+                executor.token_to_kv_pool.arena,
+                executor.runtime_states,
+                executor.slot_state_exporters(),
+                batch,
+                stream=stream,
+            )
+            eviction = torch.empty(
+                cache_flush_bytes, dtype=torch.uint8, device=executor.device
+            )
+            begin = executor.device_module.Event(enable_timing=True)
+            end = executor.device_module.Event(enable_timing=True)
+            measurements = []
+            for i in range(warmup + iterations):
+                snapshot.restore()
+                if cache_flush_bytes:
+                    eviction.fill_(i & 255)
+                stream.synchronize()
+                if cpu_group is not None:
+                    # Do not charge another rank's snapshot/eviction work to
+                    # this forward's first collective.
+                    cpu_group.barrier().wait()
+                before_compile = compile_stats()
+                wall_start = time.perf_counter()
+                begin.record(stream)
+                result = self._launch_forward(planned, capture_next_input_ids=False)
+                self.settle()
+                end.record(stream)
+                result.sync()
+                end.synchronize()
+                wall_ms = (time.perf_counter() - wall_start) * 1000
+                if (
+                    result.output_nan_flags is not None
+                    and result.output_nan_flags.any()
+                ):
+                    raise RuntimeError(
+                        "Nonfinite model output during fixed-state benchmark"
+                    )
+                after_compile = compile_stats()
+                compiled = (
+                    None
+                    if before_compile is None or after_compile is None
+                    else after_compile.startup_compiles
+                    + after_compile.serving_compiles
+                    - before_compile.startup_compiles
+                    - before_compile.serving_compiles
+                )
+                if i >= warmup:
+                    measurements.append(
+                        {
+                            "gpu_ms": begin.elapsed_time(end),
+                            "wall_ms": wall_ms,
+                            "jit_compiles": compiled,
+                            "output_lengths": result.output_lengths.tolist(),
+                        }
+                    )
+            snapshot.restore()
+            stream.synchronize()
+        return {
+            "iterations": measurements,
+            "warmup_iterations": warmup,
+            "snapshot_bytes": snapshot.nbytes,
+            "cache_flush_bytes": cache_flush_bytes,
+            "total_seconds": time.perf_counter() - started,
+        }
+
     def execute(
         self,
         execution_plan,

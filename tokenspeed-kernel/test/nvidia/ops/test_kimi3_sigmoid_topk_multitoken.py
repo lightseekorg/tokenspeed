@@ -97,6 +97,7 @@ def test_packed_topk_matches_reference_for_a_verify_window(tokens, normalize):
         normalize_topk_weights=normalize,
         logical_to_physical_map=None,
         weights_dtype=torch.float32,
+        simulation_seed=None,
     )
     assert weights.shape == (tokens, TOPK)
     assert ids.shape == (tokens, TOPK)
@@ -136,6 +137,7 @@ def test_dispatcher_sends_a_verify_window_to_the_packed_kernel(tokens, monkeypat
         routed_scaling_factor=2.5,
         normalize_topk_weights=True,
         weights_dtype=torch.bfloat16,
+        simulation_seed=None,
     )
 
     assert calls == [torch.bfloat16]
@@ -176,7 +178,12 @@ def test_dispatcher_hands_rows_past_the_cap_to_the_grouped_kernel(monkeypatch):
     logits = (torch.randn(cap + 1, EXPERTS, device="cuda") * 0.2).float()
     bias = (torch.randn(EXPERTS, device="cuda") * 0.01).float()
     weights, ids = moe_sigmoid_bias_topk(
-        logits, bias, TOPK, routed_scaling_factor=2.5, weights_dtype=torch.bfloat16
+        logits,
+        bias,
+        TOPK,
+        routed_scaling_factor=2.5,
+        weights_dtype=torch.bfloat16,
+        simulation_seed=None,
     )
     assert not calls
     assert grouped_dtypes == [torch.bfloat16]
@@ -202,7 +209,12 @@ def test_dispatcher_copies_a_strided_window_onto_the_packed_kernel(monkeypatch):
     bias = (torch.randn(EXPERTS, device="cuda") * 0.01).float()
 
     weights, ids = moe_sigmoid_bias_topk(
-        logits, bias, TOPK, routed_scaling_factor=2.5, weights_dtype=torch.bfloat16
+        logits,
+        bias,
+        TOPK,
+        routed_scaling_factor=2.5,
+        weights_dtype=torch.bfloat16,
+        simulation_seed=None,
     )
     assert calls == [True]
     ref_w, ref_ids = _reference(logits.contiguous(), bias, normalize=True, scale=2.5)
@@ -231,7 +243,12 @@ def test_dispatcher_widens_a_bf16_bias_onto_the_packed_kernel(monkeypatch):
     logits = (torch.randn(4, EXPERTS, device="cuda") * 0.2).float()
     bias = (torch.randn(EXPERTS, device="cuda") * 0.01).to(torch.bfloat16)
     weights, ids = moe_sigmoid_bias_topk(
-        logits, bias, TOPK, routed_scaling_factor=2.5, weights_dtype=torch.bfloat16
+        logits,
+        bias,
+        TOPK,
+        routed_scaling_factor=2.5,
+        weights_dtype=torch.bfloat16,
+        simulation_seed=None,
     )
     assert calls == [torch.float32]
     ref_w, ref_ids = _reference(logits, bias.float(), normalize=True, scale=2.5)
@@ -313,6 +330,7 @@ def test_packed_selects_the_same_experts_as_the_grouped_kernel(
         normalize_topk_weights=True,
         logical_to_physical_map=None,
         weights_dtype=torch.float32,
+        simulation_seed=None,
     )
     gw, gi = _grouped(logits, bias, normalize=True, scale=2.5)
 
@@ -336,6 +354,7 @@ def test_packed_breaks_exact_ties_like_the_grouped_kernel():
         normalize_topk_weights=True,
         logical_to_physical_map=None,
         weights_dtype=torch.float32,
+        simulation_seed=None,
     )
     _, gi = _grouped(logits, bias, normalize=True, scale=1.0)
     assert torch.equal(_experts(pi), _experts(gi))
@@ -359,6 +378,7 @@ def test_packed_drops_nan_rows_like_the_grouped_kernel():
         normalize_topk_weights=True,
         logical_to_physical_map=None,
         weights_dtype=torch.float32,
+        simulation_seed=None,
     )
     gw, gi = _grouped(logits, bias, normalize=True, scale=2.5)
 
@@ -385,6 +405,7 @@ def test_dispatcher_packed_mapped_override_preserves_physical_ids(map_dtype, sol
         normalize_topk_weights=True,
         weights_dtype=torch.float32,
         override="triton_kimi3_packed_sigmoid_bias_topk_nvidia",
+        simulation_seed=None,
     )
     weights, ids = moe_sigmoid_bias_topk(
         logits,
@@ -396,6 +417,7 @@ def test_dispatcher_packed_mapped_override_preserves_physical_ids(map_dtype, sol
         logical_to_physical_map=dispatch,
         solution=solution,
         override="triton_kimi3_packed_sigmoid_bias_topk_nvidia_mapped",
+        simulation_seed=None,
     )
     torch.testing.assert_close(
         ids, dispatch[ref_ids.long()].to(torch.int32), rtol=0, atol=0

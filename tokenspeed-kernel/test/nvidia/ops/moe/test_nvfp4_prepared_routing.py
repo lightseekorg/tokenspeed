@@ -105,6 +105,7 @@ def test_fused_topk_routing_matches_the_kernels_it_replaces(
         topk_weights_dtype=torch.float32,
         override=None,
         solution="triton",
+        simulation_seed=None,
     )
     theirs = _slot(ids_ref, weights_ref, offset, local, tile_n)
     flashinfer_moe.populate_trtllm_moe_routing_metadata_(theirs, ids_ref, weights_ref)

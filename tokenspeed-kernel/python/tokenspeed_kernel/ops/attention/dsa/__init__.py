@@ -1548,6 +1548,7 @@ def dsa_decode_topk(
     out: torch.Tensor | None = None,
     lens_out: torch.Tensor | None = None,
     slot_order: str,
+    simulation_seed: int | None,
     override: str | None = None,
     solution: str | None = None,
     kernel_plan: KernelPlan | None = None,
@@ -1604,6 +1605,9 @@ def dsa_decode_topk(
             shape [tokens].
         slot_order: The order the leaf emits each row's selection in, as for
             :func:`dsa_prefill_topk`. Required keyword.
+        simulation_seed: None for ordinary selection; otherwise override final
+            stores with distributed causal indices on supported backends.
+            All visible pages must be allocated. Scoring and top-k still run.
         override: Optional exact kernel override name.
         kernel_plan: Optional initialization-time provider, validated without reselection.
         solution: Optional kernel solution to force through normal selection.
@@ -1701,6 +1705,18 @@ def dsa_decode_topk(
             override=override,
         )
         kernel = kernel_plan.kernel
+    simulation_kwargs = {}
+    if kernel.name in (
+        "gluon_dsa_decode_topk_fp8_gfx950",
+        "gluon_dsa_decode_topk_standard_gfx950",
+        "gluon_dsa_decode_topk_bf16_gfx950",
+        "gluon_dsa_decode_topk_fp8_rows_gfx950",
+    ):
+        simulation_kwargs["simulation_seed"] = simulation_seed
+    elif simulation_seed is not None:
+        raise NotImplementedError(
+            f"DSA selection simulation is unsupported by {kernel.name}"
+        )
     slot_order_kwargs = _slot_order_kwargs(
         kernel, slot_order, role="top-k", kernel_plan=kernel_plan
     )
@@ -1738,6 +1754,7 @@ def dsa_decode_topk(
             "out": out,
             "lens_out": lens_out,
             **slot_order_kwargs,
+            **simulation_kwargs,
         }
         if topk_layout == "logical_offsets":
             kernel_kwargs["topk_layout"] = topk_layout

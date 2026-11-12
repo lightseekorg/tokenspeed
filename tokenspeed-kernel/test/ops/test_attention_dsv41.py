@@ -449,7 +449,21 @@ def test_full_top512_and_block_candidates_boundaries(device, visible):
     dsv41.cache_scatter(k, cache, logical_slots, "index")
     lens = torch.tensor([visible], device=device)
     out = dsv41.index_topk(
-        q, weights, cache, table, lens, None, 512, 2048, 8, 1, 256, None, None, None
+        q,
+        weights,
+        cache,
+        table,
+        lens,
+        None,
+        512,
+        2048,
+        8,
+        1,
+        256,
+        None,
+        None,
+        None,
+        simulation_seed=None,
     )
     selected, lengths, candidates, candidate_lens = out
     assert lengths.item() == min(512, visible)
@@ -513,6 +527,7 @@ def test_source_uses_block_max_not_top512_and_forces_latest(device):
         None,
         None,
         None,
+        simulation_seed=None,
     )
     top, lens, candidates, candidate_lens = result
     assert lens.item() == 512 and candidate_lens.item() == 2048
@@ -549,6 +564,7 @@ def test_reindex_reads_only_candidate_rows_and_reapplies_causality(device):
             None,
             None,
             None,
+            simulation_seed=None,
         )
     assert lengths.tolist() == [23, 8, 0]
     assert blocks.shape == (3, 0) and not block_lens.any()
@@ -575,7 +591,21 @@ def test_index_topk_batch_without_any_visible_context(device):
     table = torch.full((96, 1025), -1, dtype=torch.int32, device=device)
     visible = torch.zeros(96, dtype=torch.int32, device=device)
     top, lengths, blocks, block_lens = dsv41.index_topk(
-        q, weights, cache, table, visible, None, 512, 64, 8, 64, 4096, None, None, None
+        q,
+        weights,
+        cache,
+        table,
+        visible,
+        None,
+        512,
+        64,
+        8,
+        64,
+        4096,
+        None,
+        None,
+        None,
+        simulation_seed=None,
     )
     torch.cuda.synchronize()
     assert not lengths.any() and not block_lens.any()
@@ -616,7 +646,21 @@ def test_index_topk_selects_top_scores_on_every_index_format(device, fmt, shared
     scores = dsv41.index_score(q, weights, cache, slots, None, None).float()
 
     top, lengths, blocks, block_lens = dsv41.index_topk(
-        q, weights, cache, table, visible, None, 512, 64, 8, 64, 4096, None, None, None
+        q,
+        weights,
+        cache,
+        table,
+        visible,
+        None,
+        512,
+        64,
+        8,
+        64,
+        4096,
+        None,
+        None,
+        None,
+        simulation_seed=None,
     )
     torch.cuda.synchronize()
     assert lengths.tolist() == [512, 512, 512, 0]
@@ -654,6 +698,7 @@ def test_index_topk_selects_top_scores_on_every_index_format(device, fmt, shared
         None,
         None,
         None,
+        simulation_seed=None,
     )
     for r in range(3):
         allowed = (
@@ -728,6 +773,7 @@ def test_reindex_maps_every_candidate_block_order_back_to_row_ids(device, fmt):
         None,
         None,
         None,
+        simulation_seed=None,
     )
     torch.cuda.synchronize()
     assert lengths.tolist() == [23, 8, 0]
@@ -766,6 +812,7 @@ def test_candidate_block_max_not_sum(device):
         None,
         None,
         None,
+        simulation_seed=None,
     )
     # Block 0 wins by max (36 > 24); block 1 would win by sum (192 > 36).
     # Latest block 2 must still be pinned even with its rectified score zero.
@@ -813,6 +860,7 @@ def test_full_tiles_causal_page_mask_and_output_reuse(device):
                 None,
                 outputs,
                 None,
+                simulation_seed=None,
             )
         assert result is outputs
         for call in finish.call_args_list:
@@ -853,6 +901,7 @@ def test_reject_unbounded_candidate_input(device):
             None,
             None,
             None,
+            simulation_seed=None,
         )
 
 

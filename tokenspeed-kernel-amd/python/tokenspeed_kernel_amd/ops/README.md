@@ -1023,6 +1023,14 @@ uses the portable Triton radix select (`tokenspeed_kernel`
 `index_block_select`). Both scorers take queries packed as MXFP4 values with
 one E8M0 scale per 32 values; the adapter packs a call's queries once.
 
+The gfx950 selector's explicit `simulation` input replaces final selected IDs
+with stratified samples while retaining scoring, tie handling and selection.
+Simulation requires fully allocated, finite visible histories; sorted candidate
+blocks form a valid prefix and include the newest block. Row output stays
+sorted, unique and causal; block output retains the newest visible block.
+Original selected IDs enter the sampling hash so their computation stays live.
+The seed is a runtime scalar and adds no JIT specialization.
+
 #### Contract
 
 Visible lengths are bounded by the block table's row capacity in each consumer,
