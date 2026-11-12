@@ -641,6 +641,24 @@ def index_score(
     )
 
 
+def prefill_indexer_batching_supported(index_row_bytes: int) -> bool:
+    """Whether the native scorer packs multiple request histories in one call."""
+    from tokenspeed_kernel.ops.attention.dsv41.deep_gemm import (
+        is_native_indexer_available,
+    )
+    from tokenspeed_kernel.platform import current_platform
+    from tokenspeed_kernel.thirdparty.deep_select import is_deep_select_available
+
+    arch = current_platform().arch_version
+    return (
+        index_row_bytes == 68
+        and arch.major == 10
+        and arch.minor <= 3
+        and is_native_indexer_available()
+        and is_deep_select_available()
+    )
+
+
 def index_topk(
     index_q: torch.Tensor | IndexQueryInput,
     weights: torch.Tensor,

@@ -1059,7 +1059,9 @@ def test_packed_config_and_recipe_capacity(verify_width, overlap_depth):
         + queries * 32 * (128 * 2 + 68)
         + queries * 24 * (512 + 128) * 12
         # One packed index history per request in a batched prefill call.
-        + config.max_bs * 576 * 68
+        + (config.max_bs if dsv41.prefill_indexer_batching_supported(68) else 1)
+        * 576
+        * 68
     )
     with pytest.raises(NotImplementedError, match="target attention"):
         DeepseekV41Config.generate(args, model, True)
@@ -2948,7 +2950,8 @@ def test_prefill_selection_skips_only_redundant_work(length):
     assert slots is record.physical_slots and lengths is record.lengths
 
 
-def test_canonical_prefill_batches_full_requests_into_one_index_topk():
+def test_canonical_prefill_batches_full_requests_into_one_index_topk(monkeypatch):
+    monkeypatch.setattr(dsv41, "prefill_indexer_batching_supported", lambda _: True)
     backend = _backend("cpu", 4)
     meta = _extend(backend, _tables("cpu"), [8, 8], [16, 16], [0, 0], [24, 24])
     q = torch.zeros(16, 2, 128, dtype=torch.bfloat16)
@@ -2995,7 +2998,8 @@ def test_canonical_prefill_batches_full_requests_into_one_index_topk():
     assert query_chunk == 16
 
 
-def test_one_request_full_window_splits_when_logits_exceed_budget():
+def test_one_request_full_window_splits_when_logits_exceed_budget(monkeypatch):
+    monkeypatch.setattr(dsv41, "prefill_indexer_batching_supported", lambda _: True)
     backend = _backend("cpu", 1)
     # 12000 rows over ~1M history columns is ~24GB of BF16 logits.
     span = V41PrefillSpan(0, 0, 2_000_000, 12_000, 0)
@@ -3033,7 +3037,8 @@ def _index_scratch_recipe(**changes):
     return recipe
 
 
-def test_index_scratch_charges_only_the_scorers_a_role_runs():
+def test_index_scratch_charges_only_the_scorers_a_role_runs(monkeypatch):
+    monkeypatch.setattr(dsv41, "prefill_indexer_batching_supported", lambda _: True)
     # 65,536 prefill rows over 512 columns: dense BF16 logits outgrow the
     # portable TopK scratch, and only a role that prefills charges them with
     # one packed history per request.
@@ -4152,3 +4157,24 @@ def test_pd_kvp_decode_config(size):
     args.speculative_algorithm = "EAGLE"
     with pytest.raises(ValueError, match="DSpark speculation only"):
         DeepseekV41Config.generate(args, model, False)
+
+@pytest.mark.parametrize("reindex", [False, True])
+def test_unbatched_indexer_preserves_request_windows(monkeypatch, reindex):
+    monkeypatch.setattr(dsv41, "prefill_indexer_batching_supported", lambda _: False)
+    backend = _backend("cpu", 1)
+    first = V41PrefillSpan(0, 0, 200_000, 8_000, 0)
+    second = V41PrefillSpan(1, 8_000, 200_000, 8_000, 0)
+    windows = [(0, 8_000, first), (8_000, 16_000, second)]
+    assert backend._merge_index_windows(windows, 1, reindex) == windows
+
+
+def test_unbatched_indexer_reserves_one_history(monkeypatch):
+    recipe = _index_scratch_recipe(max_query_tokens=256)
+    recipe.attn_config = replace(recipe.attn_config, max_bs=256, context_len=1 << 20)
+    recipe.server_args.disaggregation_mode = "prefill"
+    monkeypatch.setattr(dsv41, "prefill_indexer_batching_supported", lambda _: False)
+    single = recipe.workspace_bytes()
+    monkeypatch.setattr(dsv41, "prefill_indexer_batching_supported", lambda _: True)
+    batched = recipe.workspace_bytes()
+    # Paged logits dominate for this shape; only the history packing changes.
+    assert batched - single == 255 * (1 << 20) * 68

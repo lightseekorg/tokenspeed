@@ -46,3 +46,9 @@ scores may select different valid boundary ties from an FP32-score Top-K.
 Correctness checks therefore compare selected score multisets against the
 same BF16 input, while model-quality checks must assess the precision change
 separately. The Hopper score producer retains FP32 output.
+
+Prefill request-history batching is enabled only for the native SM100–SM103
+MXFP4 indexer with DeepGEMM and DeepSelect. Hopper and portable scorers retain
+per-request windows and reserve one packed index history; their internal query
+tiling remains responsible for bounding score memory. Cache planning uses the
+same capability check as window merging.
