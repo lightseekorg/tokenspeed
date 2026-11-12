@@ -27,8 +27,9 @@ use std::{ffi::CString, sync::Once};
 use pyo3::{prelude::*, types::PyDict};
 use ts_scheduler::{
     profile, BlockTableView, CacheEvent, CacheEventKind, CacheOpKind, ForwardEvent,
-    ForwardEventKind, RequestSpec, Scheduler, StorageCancellationView, StorageDoneView,
-    StorageOpKind, StorageRound, StorageTickView, TransferBatchView,
+    ForwardEventKind, RequestSpec, Scheduler, SharedL2AnswerView, SharedL2KeyView,
+    SharedL2LookupView, SharedL2OpKind, SharedL2WriteDoneView, StorageCancellationView,
+    StorageDoneView, StorageOpKind, StorageRound, StorageTickView, TransferBatchView,
 };
 
 /// Start the interpreter once per test process, with the scheduler module
@@ -462,6 +463,7 @@ fn a_forced_retraction_stores_and_restores_through_cache_events() {
                 kind: CacheEventKind::SnapshotDone,
                 op_id: store,
             }],
+            &[],
         )
         .unwrap();
 
@@ -482,6 +484,7 @@ fn a_forced_retraction_stores_and_restores_through_cache_events() {
                         kind: CacheEventKind::RestoreDone,
                         op_id: op.op_id,
                     }],
+                    &[],
                 )
                 .unwrap();
             restored = true;
@@ -538,7 +541,7 @@ fn storage_operations_stay_out_of_the_device_cache_ops() {
     interpreter();
     let mut scheduler =
         Python::attach(|py| Scheduler::from_python(&run(py, STORAGE_SCHEDULER)).unwrap());
-    scheduler.advance_head(&tick(1), &[]).unwrap();
+    scheduler.advance_head(&tick(1), &[], &[]).unwrap();
     scheduler
         .submit_requests(&[spec("waiting", vec![1, 2, 3, 4])])
         .unwrap();
@@ -573,7 +576,7 @@ fn storage_operations_stay_out_of_the_device_cache_ops() {
         }],
         ..tick(2)
     };
-    scheduler.advance_head(&done, &[]).unwrap();
+    scheduler.advance_head(&done, &[], &[]).unwrap();
     let plan = scheduler.next_execution_plan(true, false);
     assert!(plan
         .forward_batches()
@@ -586,7 +589,7 @@ fn a_detached_request_cancels_its_storage_operation() {
     interpreter();
     let mut scheduler =
         Python::attach(|py| Scheduler::from_python(&run(py, STORAGE_SCHEDULER)).unwrap());
-    scheduler.advance_head(&tick(1), &[]).unwrap();
+    scheduler.advance_head(&tick(1), &[], &[]).unwrap();
     scheduler
         .submit_requests(&[spec("waiting", vec![1, 2, 3, 4])])
         .unwrap();
@@ -599,7 +602,7 @@ fn a_detached_request_cancels_its_storage_operation() {
         }],
         ..tick(2)
     };
-    scheduler.advance_head(&detach, &[]).unwrap();
+    scheduler.advance_head(&detach, &[], &[]).unwrap();
     scheduler
         .submit_requests(&[spec("next", vec![5, 6, 7, 8])])
         .unwrap();
@@ -1061,7 +1064,7 @@ fn shared_prefix_publication_exposes_pressure_and_flush_epoch() {
     assert_eq!(first.confirmed_prefix_tokens, 0);
     let mut pressure = tick(1);
     pressure.tick.as_mut().unwrap().queued_operations = 100;
-    scheduler.advance_head(&pressure, &[]).unwrap();
+    scheduler.advance_head(&pressure, &[], &[]).unwrap();
     assert_eq!(
         scheduler
             .shared_prefix_publication(&[1, 2, 3, 4], 4)
@@ -1077,7 +1080,7 @@ fn shared_prefix_publication_exposes_pressure_and_flush_epoch() {
             .cache_epoch
             > first.cache_epoch
     );
-    scheduler.advance_head(&tick(2), &[]).unwrap();
+    scheduler.advance_head(&tick(2), &[], &[]).unwrap();
     assert_eq!(
         scheduler
             .shared_prefix_publication(&[1, 2, 3, 4], 4)
@@ -1124,7 +1127,7 @@ fn shared_prefix_publication_rejects_in_forward_state_before_waiting() {
             for pressure in [false, true] {
                 let mut round = tick(if pressure { 2 } else { 1 });
                 round.tick.as_mut().unwrap().queued_operations = if pressure { 100 } else { 0 };
-                scheduler.advance_head(&round, &[]).unwrap();
+                scheduler.advance_head(&round, &[], &[]).unwrap();
                 // With page=4 and budget=8, in-forward State can save 20 and
                 // suppress 22. Neither query may start an impossible wait in
                 // that mode; callers need an actual-boundary receipt contract.
@@ -1163,7 +1166,7 @@ fn shared_prefix_publication_follows_real_prefill_host_copy_and_put() {
             "cfg.role = ts.SchedulerConfig.Role.P\ncfg.num_host_pages = 32\ncfg.cache_groups = [ts.CacheGroupConfig('full', 2, 32, ts.AttnKind.Full, transfer_policy=ts.CacheTransferPolicy.FullSuffix)]\ncfg.storage_config = ts.StorageConfig(8, 64, 16, 64, 32, 1, 1000, 1000, ts.StoragePressure(8, 65536, 1000), ts.StoragePressure(4, 32768, 500))\n{state}result = ts.Scheduler(cfg)"));
         let mut scheduler = Python::attach(|py| Scheduler::from_python(&run(py, &code)).unwrap());
         let tokens = vec![1, 2, 3, 4, 5]; // Includes a real partial-page prompt endpoint.
-        scheduler.advance_head(&tick(1), &[]).unwrap();
+        scheduler.advance_head(&tick(1), &[], &[]).unwrap();
         scheduler
             .submit_requests(&[spec("producer", tokens.clone())])
             .unwrap();
@@ -1178,7 +1181,7 @@ fn shared_prefix_publication_follows_real_prefill_host_copy_and_put() {
                 object_failures: vec![0; op.keys.len()],
             });
         }
-        scheduler.advance_head(&initial_done, &[]).unwrap();
+        scheduler.advance_head(&initial_done, &[], &[]).unwrap();
         scheduler
             .advance(&[event(ForwardEventKind::PdBootstrapped, "producer", vec![])])
             .unwrap();
@@ -1243,7 +1246,7 @@ fn shared_prefix_publication_follows_real_prefill_host_copy_and_put() {
                         .unwrap();
                 }
             }
-            scheduler.advance_head(&round, &copies).unwrap();
+            scheduler.advance_head(&round, &copies, &[]).unwrap();
             let receipt = scheduler.shared_prefix_publication(&tokens, 5).unwrap();
             if receipt.status == "published" {
                 assert_eq!(receipt.confirmed_prefix_tokens, 5);
@@ -1275,7 +1278,7 @@ fn shared_prefix_publication_follows_real_prefill_host_copy_and_put() {
         let mut consumer = Python::attach(|py| Scheduler::from_python(&run(py, &code)).unwrap());
         let mut request = spec("consumer", vec![1, 2, 3, 4, 5, 6, 7]);
         request.shared_prefix_tokens = vec![5];
-        consumer.advance_head(&tick(1), &[]).unwrap();
+        consumer.advance_head(&tick(1), &[], &[]).unwrap();
         consumer.submit_requests(&[request]).unwrap();
         let mut initial = Some(consumer.next_execution_plan(true, false));
         consumer
@@ -1319,7 +1322,7 @@ fn shared_prefix_publication_follows_real_prefill_host_copy_and_put() {
                     hit = batch.extend_prefix_lens[0];
                 }
             }
-            consumer.advance_head(&round, &copies).unwrap();
+            consumer.advance_head(&round, &copies, &[]).unwrap();
             if hit > 0 {
                 break;
             }
@@ -1371,7 +1374,7 @@ fn shared_prefix_publication_follows_real_prefill_host_copy_and_put() {
                     object_failures: vec![0; op.keys.len()],
                 });
             }
-            consumer.advance_head(&round, &copies).unwrap();
+            consumer.advance_head(&round, &copies, &[]).unwrap();
             if consumer
                 .shared_prefix_publication(&[1, 2, 3, 4, 5, 6, 7], 7)
                 .unwrap()
@@ -1457,4 +1460,330 @@ fn python_event_lists_keep_their_payload_after_cache_clear() {
         )
         .unwrap();
     });
+}
+
+/// A small scheduler whose Host tier is the proxy of a shared L2 pool.
+const POOL_SCHEDULER: &str = r#"
+import tokenspeed_scheduler as ts
+cfg = ts.SchedulerConfig()
+cfg.role = ts.SchedulerConfig.Role.Fused
+cfg.prefix_granularity = 2
+cfg.num_device_pages = 32
+cfg.num_host_pages = 65
+cfg.host_group_packing = [1]
+cfg.host_write_policy = ts.SchedulerConfig.HostWritePolicy.WriteThrough
+cfg.num_snapshot_pages = 1
+cfg.max_scheduled_tokens = 16
+cfg.max_batch_size = 4
+cfg.disable_l2_cache = False
+cfg.shared_l2_config = ts.SharedL2Config(max_writes=2, max_write_keys=8)
+cfg.cache_groups = [ts.CacheGroupConfig("full", 2, 32, ts.AttnKind.Full)]
+result = ts.Scheduler(cfg)
+"#;
+
+/// The pool's answer to `lookup`: its prompt's first `pages` pages, pinned
+/// under `ticket`, at pool pages 11, 12, ...
+fn pool_answer(lookup: &SharedL2LookupView, ticket: u64, pages: usize) -> SharedL2AnswerView {
+    SharedL2AnswerView {
+        lookup_id: lookup.lookup_id,
+        ticket,
+        num_tokens: 2 * pages as i32,
+        kv_tokens: 2 * pages as i32,
+        tail_tokens: 0,
+        tail_hash: String::new(),
+        keys: lookup.prefix_hashes[..pages]
+            .iter()
+            .map(|hash| SharedL2KeyView {
+                namespace_id: 0,
+                group_id: 0,
+                content_hash: hash.clone(),
+                page_offset: 0,
+            })
+            .collect(),
+        buckets: vec![0; pages],
+        pages: (11..11 + pages as i32).collect(),
+    }
+}
+
+#[test]
+fn a_pool_prompt_waits_for_its_lookup_and_resumes_behind_the_hit() {
+    interpreter();
+    let mut scheduler =
+        Python::attach(|py| Scheduler::from_python(&run(py, POOL_SCHEDULER)).unwrap());
+    scheduler
+        .submit_requests(&[spec("waiting", (1..=7).collect())])
+        .unwrap();
+    let lookups = scheduler.shared_l2_lookups();
+    let [lookup] = &lookups[..] else {
+        panic!("one lookup, got {lookups:?}");
+    };
+    // The prompt's last token is recomputed: three full pages may hit.
+    assert_eq!(lookup.request_id, "waiting");
+    assert_eq!((lookup.max_tokens, lookup.prefix_hashes.len()), (6, 3));
+    assert_eq!(lookup.tokens, [1, 2, 3, 4, 5, 6]);
+    assert!(scheduler.shared_l2_lookups().is_empty(), "handed out once");
+
+    // No plan runs the prompt before its answer.
+    let plan = scheduler.next_execution_plan(true, false);
+    assert!(!plan.needs_device());
+    assert!(plan.shared_l2_ops().is_empty());
+
+    let pages = scheduler
+        .apply_shared_l2_lookup(&pool_answer(lookup, 7, 2))
+        .unwrap();
+    assert_eq!(
+        pages
+            .iter()
+            .map(|page| (page.group_id, page.bucket, page.page))
+            .collect::<Vec<_>>(),
+        [(0, 0, 11), (0, 0, 12)]
+    );
+    let stats = scheduler.shared_l2_stats();
+    assert_eq!(
+        (
+            stats.lookups,
+            stats.hits,
+            stats.pending_lookups,
+            stats.tickets
+        ),
+        (1, 1, 0, 1)
+    );
+
+    // The prompt resumes behind the hit, which a load-back reads from the
+    // proxy blocks.
+    let plan = scheduler.next_execution_plan(true, false);
+    let batch = &plan.forward_batches()[0];
+    assert_eq!(batch.request_ids, ["waiting"]);
+    assert_eq!(batch.extend_prefix_lens, [4]);
+    let ops = plan.cache_ops();
+    assert_eq!(
+        ops.iter().map(|op| op.kind).collect::<Vec<_>>(),
+        [CacheOpKind::LoadBack]
+    );
+    assert!(plan.shared_l2_ops().is_empty());
+
+    // Once the load landed nothing holds the proxy blocks: the next plan
+    // releases the ticket.
+    scheduler
+        .advance_head(
+            &StorageRound::default(),
+            &[CacheEvent {
+                kind: CacheEventKind::LoadBackDone,
+                op_id: ops[0].op_id,
+            }],
+            &[],
+        )
+        .unwrap();
+    let ops = scheduler.next_execution_plan(true, false).shared_l2_ops();
+    let [release, write] = &ops[..] else {
+        panic!("a release and a write, got {ops:?}");
+    };
+    assert_eq!((release.kind, release.id), (SharedL2OpKind::Release, 7));
+    assert_eq!(scheduler.shared_l2_stats().tickets, 0);
+    // What the prompt computed goes to the pool: its third page and its
+    // tail, not the two pages it loaded from there.
+    assert_eq!(write.kind, SharedL2OpKind::Write);
+    assert_eq!(write.keys.len(), 2);
+    assert_eq!(write.keys[0].content_hash, lookup.prefix_hashes[2]);
+}
+
+#[test]
+fn a_pool_write_ends_with_its_completion() {
+    interpreter();
+    let mut scheduler =
+        Python::attach(|py| Scheduler::from_python(&run(py, POOL_SCHEDULER)).unwrap());
+    scheduler
+        .submit_requests(&[spec("writer", (1..=7).collect())])
+        .unwrap();
+    let lookup = scheduler.shared_l2_lookups().remove(0);
+    assert!(scheduler
+        .apply_shared_l2_lookup(&pool_answer(&lookup, 0, 0))
+        .unwrap()
+        .is_empty());
+    scheduler.next_execution_plan(true, false);
+    scheduler
+        .advance(&[event(ForwardEventKind::ExtendResult, "writer", vec![9])])
+        .unwrap();
+
+    // What the prompt published goes to the pool: its three full pages and
+    // its tail, each from the Device block that holds it.
+    let ops = scheduler.next_execution_plan(true, false).shared_l2_ops();
+    let [write] = &ops[..] else {
+        panic!("one write, got {ops:?}");
+    };
+    assert_eq!(write.kind, SharedL2OpKind::Write);
+    assert_eq!(
+        write.keys[..3]
+            .iter()
+            .map(|key| key.content_hash.as_str())
+            .collect::<Vec<_>>(),
+        lookup.prefix_hashes
+    );
+    assert_eq!(write.buckets, [0, 0, 0, 0]);
+    assert_eq!(write.blocks.len(), 4);
+    assert!(write.publications.is_empty(), "no State checkpoint");
+    assert_eq!(scheduler.shared_l2_stats().writes_in_flight, 1);
+    assert!(!scheduler.can_clear_cache());
+
+    // Its completion joins the head batch; one the scheduler does not know
+    // is ignored.
+    scheduler
+        .advance_head(
+            &StorageRound::default(),
+            &[],
+            &[
+                SharedL2WriteDoneView {
+                    write_id: write.id,
+                    success: false,
+                },
+                SharedL2WriteDoneView {
+                    write_id: write.id + 100,
+                    success: true,
+                },
+            ],
+        )
+        .unwrap();
+    let stats = scheduler.shared_l2_stats();
+    assert_eq!(
+        (
+            stats.writes_in_flight,
+            stats.failed_writes,
+            stats.failed_write_blocks
+        ),
+        (0, 1, 4)
+    );
+}
+
+#[test]
+fn pool_lookups_and_hits_can_be_given_up() {
+    interpreter();
+    let mut scheduler =
+        Python::attach(|py| Scheduler::from_python(&run(py, POOL_SCHEDULER)).unwrap());
+    scheduler
+        .submit_requests(&[
+            spec("refused", (1..=7).collect()),
+            spec("hit", (11..=17).collect()),
+            spec("gone", (21..=27).collect()),
+        ])
+        .unwrap();
+    let lookups = scheduler.shared_l2_lookups();
+    let [refused, hit, gone] = &lookups[..] else {
+        panic!("three lookups, got {lookups:?}");
+    };
+
+    // An answer that does not fit its prompt is an error, not an abort, and
+    // leaves the lookup open; given up, it counts as a miss.
+    let mut misfit = pool_answer(refused, 3, 1);
+    misfit.num_tokens = 3;
+    let error = scheduler.apply_shared_l2_lookup(&misfit).unwrap_err();
+    assert!(error.what().contains("outside the prompt"), "{error}");
+    assert_eq!(scheduler.shared_l2_stats().pending_lookups, 3);
+    // So is one the proxy cannot mirror: nothing of it is kept either.
+    let mut unhashed = pool_answer(refused, 3, 1);
+    unhashed.keys[0].content_hash.clear();
+    let error = scheduler.apply_shared_l2_lookup(&unhashed).unwrap_err();
+    assert!(error.what().contains("names keys"), "{error}");
+    let stats = scheduler.shared_l2_stats();
+    assert_eq!(
+        (stats.pending_lookups, stats.hits, stats.tickets),
+        (3, 0, 0)
+    );
+    scheduler
+        .abandon_shared_l2_lookups(&[refused.lookup_id])
+        .unwrap();
+
+    // A hit no plan admitted yet is given up when the runtime may no longer
+    // load from the pool.
+    scheduler
+        .apply_shared_l2_lookup(&pool_answer(hit, 5, 2))
+        .unwrap();
+    scheduler.set_shared_l2_lease_lost(true).unwrap();
+    scheduler.set_shared_l2_lease_lost(true).unwrap();
+    assert_eq!(scheduler.shared_l2_stats().lease_expired_hits, 1);
+
+    // A request that leaves before its answer abandons its lookup itself.
+    scheduler
+        .advance(&[event(ForwardEventKind::Abort, "gone", vec![])])
+        .unwrap();
+
+    let plan = scheduler.next_execution_plan(true, false);
+    let batch = &plan.forward_batches()[0];
+    assert_eq!(batch.request_ids, ["refused", "hit"]);
+    assert_eq!(batch.extend_prefix_lens, [0, 0]);
+    assert!(plan.cache_ops().is_empty());
+    let mut told: Vec<_> = plan
+        .shared_l2_ops()
+        .iter()
+        .map(|op| (op.kind, op.id))
+        .collect();
+    told.sort_by_key(|(kind, id)| (kind.repr, *id));
+    assert_eq!(
+        told,
+        [
+            (SharedL2OpKind::Release, 5),
+            (SharedL2OpKind::Abandon, refused.lookup_id),
+            (SharedL2OpKind::Abandon, gone.lookup_id),
+        ]
+    );
+}
+
+#[test]
+fn a_plan_of_pool_commands_alone_needs_no_device() {
+    interpreter();
+    let mut scheduler =
+        Python::attach(|py| Scheduler::from_python(&run(py, POOL_SCHEDULER)).unwrap());
+    scheduler
+        .submit_requests(&[spec("gone", (1..=7).collect())])
+        .unwrap();
+    let lookup = scheduler.shared_l2_lookups().remove(0);
+    scheduler
+        .advance(&[event(ForwardEventKind::Abort, "gone", vec![])])
+        .unwrap();
+    let plan = scheduler.next_execution_plan(true, false);
+    assert_eq!(
+        plan.shared_l2_ops()
+            .iter()
+            .map(|op| (op.kind, op.id))
+            .collect::<Vec<_>>(),
+        [(SharedL2OpKind::Abandon, lookup.lookup_id)]
+    );
+    // The pool's client runs them: the data plane gets nothing.
+    assert!(!plan.needs_device());
+    assert!(plan.cache_ops().is_empty());
+}
+
+#[test]
+fn without_a_pool_the_pool_calls_ask_nothing_and_fail_as_errors() {
+    interpreter();
+    let mut scheduler =
+        Python::attach(|py| Scheduler::from_python(&run(py, NEW_SCHEDULER)).unwrap());
+    scheduler
+        .submit_requests(&[spec("plain", (1..=40).collect())])
+        .unwrap();
+    assert!(scheduler.shared_l2_lookups().is_empty());
+    assert_eq!(scheduler.shared_l2_stats(), Default::default());
+    let answer = SharedL2AnswerView {
+        lookup_id: 1,
+        ticket: 0,
+        num_tokens: 0,
+        kv_tokens: 0,
+        tail_tokens: 0,
+        tail_hash: String::new(),
+        keys: Vec::new(),
+        buckets: Vec::new(),
+        pages: Vec::new(),
+    };
+    for error in [
+        scheduler.apply_shared_l2_lookup(&answer).unwrap_err(),
+        scheduler.abandon_shared_l2_lookups(&[1]).unwrap_err(),
+        scheduler.set_shared_l2_lease_lost(true).unwrap_err(),
+    ] {
+        assert!(
+            error.what().contains("without a configured pool"),
+            "{error}"
+        );
+    }
+    let plan = scheduler.next_execution_plan(true, false);
+    assert_eq!(plan.forward_batches()[0].request_ids, ["plain"]);
+    assert!(plan.shared_l2_ops().is_empty());
 }

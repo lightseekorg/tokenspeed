@@ -35,12 +35,17 @@
 //! behind the forward thread's queue: the round head never waits for
 //! launches in flight. The L3 tier's storage executor is the host's own
 //! (`ts-l3`), outside the data plane.
+//!
+//! With a shared L2 pool a third thread, the landing watcher, waits on each
+//! launched forward's copy event in launch order, so the control thread
+//! learns that a forward landed without holding the GIL for the wait, and
+//! takes in requests meanwhile (`DataPlane::landed`).
 
 use std::{
     collections::HashMap,
     sync::{mpsc, Arc, Condvar, Mutex, MutexGuard},
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use bytes::Bytes;
@@ -191,7 +196,8 @@ struct AdmitRow {
 #[derive(Default)]
 struct Shared {
     state: Mutex<State>,
-    /// Signalled when a forward was launched or the data plane failed.
+    /// Signalled when a forward was launched or landed, or the data plane
+    /// failed.
     changed: Condvar,
 }
 
@@ -201,6 +207,9 @@ struct State {
     failure: Option<String>,
     /// Launched forwards, until their commit takes them.
     launched: HashMap<ForwardId, Py<PyAny>>,
+    /// The last forward the landing watcher saw land; forwards land in
+    /// launch order.
+    landed: ForwardId,
 }
 
 impl Shared {
@@ -251,6 +260,29 @@ impl Shared {
         self.changed.notify_all();
     }
 
+    /// Whether `forward` landed, after waiting up to `wait` for it.
+    fn wait_landed(&self, forward: ForwardId, wait: Duration) -> Result<bool, String> {
+        let deadline = Instant::now() + wait;
+        let mut state = self.state();
+        loop {
+            if let Some(failure) = &state.failure {
+                return Err(failure.clone());
+            }
+            if state.landed >= forward {
+                return Ok(true);
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Ok(false);
+            }
+            state = self
+                .changed
+                .wait_timeout(state, left)
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .0;
+        }
+    }
+
     /// The launched forward `forward`, once the forward thread launched it.
     fn take_launched(&self, forward: ForwardId) -> Result<Py<PyAny>, String> {
         let mut state = self.state();
@@ -269,14 +301,15 @@ impl Shared {
     }
 }
 
-/// Wake the control thread if a panic leaves it waiting for a launch.
-/// Closing the forward queue during teardown is an orderly exit.
-struct ExitNotice(Arc<Shared>);
+/// Wake the control thread if a panic of the named thread leaves it waiting
+/// for a launch or a landing. Closing the forward queue during teardown is
+/// an orderly exit.
+struct ExitNotice(Arc<Shared>, &'static str);
 
 impl Drop for ExitNotice {
     fn drop(&mut self) {
         if thread::panicking() {
-            self.0.fail("the forward thread panicked".to_owned());
+            self.0.fail(format!("the {} thread panicked", self.1));
         }
     }
 }
@@ -291,14 +324,22 @@ pub struct PythonDataPlane {
     shared: Arc<Shared>,
     next_forward: ForwardId,
     thread: Option<thread::JoinHandle<()>>,
+    /// The landing watcher, when the loop asks for landings.
+    watcher: Option<thread::JoinHandle<()>>,
 }
 
 impl PythonDataPlane {
     /// Start the forward thread over a Python `HostDataPlane`, and enter the
     /// dispatch guard on the calling thread, the control thread, which must
     /// also drop the data plane. With PD, the forward thread stages each
-    /// plan's remote stream with the transfer peer (`streams`).
-    pub fn start(plane: Py<PyAny>, streams: Option<Streams>) -> Result<Self, String> {
+    /// plan's remote stream with the transfer peer (`streams`). With
+    /// `watch_landings`, a watcher thread waits for each launched forward's
+    /// results, for [`DataPlane::landed`].
+    pub fn start(
+        plane: Py<PyAny>,
+        streams: Option<Streams>,
+        watch_landings: bool,
+    ) -> Result<Self, String> {
         let guard = Python::attach(|py| {
             plane
                 .call_method0(py, "control_thread_guard")
@@ -314,18 +355,42 @@ impl PythonDataPlane {
             shared: shared.clone(),
             next_forward: 0,
             thread: None,
+            watcher: None,
+        };
+        // The forward thread owns the sender: the watcher ends with it.
+        let landings = if watch_landings {
+            let (landings, launched) = mpsc::channel();
+            let (plane, shared) = (Python::attach(|py| plane.clone_ref(py)), shared.clone());
+            let watcher = thread::Builder::new()
+                .name("ts-landing".to_owned())
+                .spawn(move || {
+                    let _exit = ExitNotice(shared.clone(), "landing watcher");
+                    watch_landings_of(&plane, launched, &shared);
+                })
+                .map_err(|error| format!("starting the landing watcher: {error}"))?;
+            data_plane.watcher = Some(watcher);
+            Some(landings)
+        } else {
+            None
         };
         let thread = thread::Builder::new()
             .name("ts-forward".to_owned())
             .spawn(move || {
-                let _exit = ExitNotice(shared.clone());
+                let _exit = ExitNotice(shared.clone(), "forward");
                 Python::attach(|py| {
                     let plane = plane.bind(py);
                     if let Err(error) = plane.call_method0("enter_forward_thread") {
                         shared.fail(describe(py, &error));
                         return;
                     }
-                    forward_loop(py, plane, queue, &shared, streams.as_ref());
+                    forward_loop(
+                        py,
+                        plane,
+                        queue,
+                        &shared,
+                        streams.as_ref(),
+                        landings.as_ref(),
+                    );
                 })
             })
             .map_err(|error| format!("starting the forward thread: {error}"))?;
@@ -470,6 +535,17 @@ impl DataPlane for PythonDataPlane {
         Ok(result)
     }
 
+    fn landed(&mut self, forward: &ForwardId, wait: Duration) -> Result<bool, DataPlaneError> {
+        if self.watcher.is_none() {
+            return Err(DataPlaneError(
+                "the data plane was started without its landing watcher".to_owned(),
+            ));
+        }
+        self.shared
+            .wait_landed(*forward, wait)
+            .map_err(DataPlaneError)
+    }
+
     fn poll_cache_events(&mut self) -> Result<Vec<CacheEvent>, DataPlaneError> {
         let _span = profile::span("DataPlane::poll_cache_events");
         let polled: Vec<(String, u32)> = self.query(|plane| {
@@ -600,6 +676,12 @@ impl Drop for PythonDataPlane {
                 tracing::error!("the forward thread panicked");
             }
         }
+        // The forward thread held the watcher's queue open.
+        if let Some(watcher) = self.watcher.take() {
+            if watcher.join().is_err() {
+                tracing::error!("the landing watcher panicked");
+            }
+        }
         let guard = self.guard.take();
         let launched = std::mem::take(&mut self.shared.state().launched);
         Python::attach(|py| {
@@ -636,12 +718,36 @@ pub fn describe(py: Python<'_>, error: &PyErr) -> String {
     }
 }
 
+/// The landing watcher: wait for each launched forward's results, in launch
+/// order, and tell the control thread. The wait releases the GIL.
+fn watch_landings_of(
+    plane: &Py<PyAny>,
+    launched: mpsc::Receiver<(ForwardId, Py<PyAny>)>,
+    shared: &Shared,
+) {
+    for (forward, launched) in launched {
+        let waited = Python::attach(|py| {
+            plane
+                .call_method1(py, "wait_landed", (launched,))
+                .map(drop)
+                .map_err(|error| describe(py, &error))
+        });
+        if let Err(failure) = waited {
+            shared.fail(failure);
+            return;
+        }
+        shared.state().landed = forward;
+        shared.changed.notify_all();
+    }
+}
+
 fn forward_loop(
     py: Python<'_>,
     plane: &Bound<'_, PyAny>,
     mut queue: mpsc::Receiver<Op>,
     shared: &Shared,
     streams: Option<&Streams>,
+    landings: Option<&mpsc::Sender<(ForwardId, Py<PyAny>)>>,
 ) {
     loop {
         // Wait without the GIL: the control thread and the transfer peer's
@@ -703,7 +809,7 @@ fn forward_loop(
             continue;
         }
         let _span = profile::span(op.span_name());
-        if let Err(error) = run(py, plane, op, shared, streams) {
+        if let Err(error) = run(py, plane, op, shared, streams, landings) {
             shared.fail(error);
         }
     }
@@ -716,6 +822,7 @@ fn run(
     op: Op,
     shared: &Shared,
     streams: Option<&Streams>,
+    landings: Option<&mpsc::Sender<(ForwardId, Py<PyAny>)>>,
 ) -> Result<(), String> {
     let python = |error: PyErr| describe(py, &error);
     match op {
@@ -811,7 +918,14 @@ fn run(
                 streams.after_execute()?;
             }
             match (forward, launched.is_none()) {
-                (Some(forward), false) => shared.launch(forward, launched.unbind()),
+                (Some(forward), false) => {
+                    if let Some(landings) = landings {
+                        // The watcher is gone only after a failure it
+                        // recorded.
+                        let _ = landings.send((forward, launched.clone().unbind()));
+                    }
+                    shared.launch(forward, launched.unbind());
+                }
                 (None, true) => {}
                 (Some(_), true) => {
                     return Err("the plan's batch ran no forward".to_owned());

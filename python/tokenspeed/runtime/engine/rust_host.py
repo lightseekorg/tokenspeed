@@ -36,6 +36,8 @@ interpreter runs, plus the launcher's side:
   thread runs the completion queries itself (a launched forward's landed
   results as metadata and CPU logprob buffers, the cache ops' acknowledgments).
   The L3 tier runs in the host (``ts-l3``), from the ``L3Settings`` bootstrap resolves.
+* ``HostSharedL2`` is what the host's control thread drives a shared L2
+  pool's client through, on a rank whose Host tier is the pool's proxy.
 
 The host covers TP, attention-DP and pipeline ranks and both PD roles (its
 own Rust transfer peer, started from ``pd/host_peer.py``'s settings);
@@ -58,8 +60,10 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from multiprocessing import Pipe
 from multiprocessing.connection import Connection
+from typing import TYPE_CHECKING
 
 import msgspec
+import tokenspeed_scheduler
 import torch
 import torch.distributed as dist
 from tokenspeed_engine.scheduler import Scheduler
@@ -162,6 +166,9 @@ from tokenspeed.runtime.utils.process import set_parent_death_signal
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
 from tokenspeed.runtime.utils.startup_timing import startup_phase
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+
+if TYPE_CHECKING:
+    from tokenspeed.runtime.cache.shared_l2.client import SharedL2Client
 
 logger = get_colorful_logger(__name__)
 
@@ -669,11 +676,17 @@ class HostDataPlane:
         attn_tp_cpu_group,
         epd_publisher,
         starting: bool,
+        shared_l2_loads: bool,
     ) -> None:
         self._device = handle
         # The engine serves its own startup requests (``HostConfig``'s
         # ``startup_requests``) until ``finish_startup``.
         self._starting = starting
+        # Whether Host loads read a shared L2 pool: a load that fails there
+        # lets its forward go, so the commit looks for the failure.
+        self._shared_l2_loads = shared_l2_loads
+        # Cache acknowledgments a commit found, until the next cache poll.
+        self._cache_events: list = []
         # The control plane exports the serving-time compilations.
         self._report_compiles = report_compiles
         self._profiler = profiler
@@ -904,6 +917,12 @@ class HostDataPlane:
         them into owned vectors; no per-element Python list is built."""
         results = dispatched.results
         results.sync()
+        if self._shared_l2_loads:
+            # A pool load that failed let go the forward that waited on it,
+            # over pages it never filled. The failure was recorded before the
+            # forward was let go, so this poll raises it, before the results
+            # are returned to be committed and streamed.
+            self._cache_events.extend(self._device.poll_cache_results())
         compiles = compile_stats() if self._report_compiles else None
         return completed_result(
             results,
@@ -915,6 +934,16 @@ class HostDataPlane:
             grammar_terminated_at=resolve_grammar_completion(results),
         )
 
+    def wait_landed(self, dispatched: _Dispatched) -> None:
+        """Wait for a forward's host copies to land, without committing it
+        (the host's landing watcher thread, with a shared L2 pool: the event
+        wait releases the interpreter lock). The control thread takes requests
+        in meanwhile; its ``complete`` then finds the copies landed."""
+        copy_event = dispatched.results.copy_event
+        if copy_event is None:
+            raise RuntimeError("copy_event is required before waiting for results.")
+        copy_event.synchronize()
+
     def note_committed(self, dispatched: _Dispatched) -> None:
         """A committed forward counts toward a profile's steps. The forward
         thread runs this, after the commit's ``complete``: the profiler
@@ -925,11 +954,11 @@ class HostDataPlane:
         """The cache ops acknowledged since the last poll, in the order they
         landed: ``(kind, op_id)`` each, as ``cache_event_to_payload`` names
         them."""
+        events, self._cache_events = self._cache_events, []
+        events.extend(self._device.poll_cache_results())
         return [
             (payload["kind"], payload["op_id"])
-            for payload in map(
-                cache_event_to_payload, self._device.poll_cache_results()
-            )
+            for payload in map(cache_event_to_payload, events)
         ]
 
     def release(self, rids: list[str]) -> None:
@@ -1102,6 +1131,92 @@ class HostDataPlane:
 # sees page counts, not bytes. Sample them here and report through the same
 # output plugin the engine's own metrics use.
 _MEMORY_METRIC_INTERVAL_SECONDS = 10.0
+
+
+class HostSharedL2:
+    """A shared L2 pool's client as the host drives it.
+
+    The host's control thread makes every call, under its dispatch guard; none
+    waits for the pool's owner but ``poll``, for the lookups and as long as
+    the round says. The calls only hand work to the client's threads and read
+    what they finished: an owner that is slow, wrong or gone answers as a
+    miss or a failed write, never as an exception of these calls. (A load the
+    rank planned and could not start within its lease fails in the data
+    plane, which stops the engine.)
+    """
+
+    def __init__(self, client: SharedL2Client) -> None:
+        self._client = client
+
+    def submit_lookups(
+        self, lookups: list[tuple[int, str, list[str], bytes, int]]
+    ) -> None:
+        """Send the scheduler's lookups, ``(lookup_id, request_id,
+        prefix_hashes, tokens, max_tokens)`` each, the tokens as int32
+        bytes."""
+        self._client.submit_lookups(lookups)
+
+    def poll(
+        self, awaited: list[int], wait_s: float, tickets: list[int]
+    ) -> tuple[list[tuple], list[tuple[int, bool]], bool]:
+        """What the client finished since the last poll.
+
+        Args:
+            awaited: Lookups whose answers the round waits for.
+            wait_s: For how long at most; the wait releases the interpreter
+                lock.
+            tickets: The tickets of the hits the scheduler still holds.
+
+        Returns:
+            The lookups' answers, as ``Scheduler.apply_shared_l2_lookups``
+            takes them (one past its deadline is a miss); the finished writes,
+            ``(write_id, success)`` each; and whether a load may no longer
+            be planned from one of ``tickets`` or of these answers' tickets:
+            the rank's lease on the owner's pins ran out.
+        """
+        if awaited:
+            self._client.wait_lookups(awaited, wait_s)
+        answers = self._client.poll_lookups()
+        held = [*tickets, *(answer[1] for answer in answers if answer[1])]
+        lease_lost = not all(self._client.loads_allowed(ticket) for ticket in held)
+        return answers, self._client.poll_writes(), lease_lost
+
+    def map_pages(self, ticket: int, pages: list[tuple[int, int, int, int]]) -> None:
+        """The proxy Host blocks the answer with ``ticket`` created,
+        ``(group_id, proxy_block, bucket, page)`` each: a load-back from the
+        block reads the pool page. Before the plan that may carry that
+        load-back reaches the forward thread."""
+        self._client.map_proxy_pages(ticket, pages)
+
+    def submit(
+        self,
+        writes: list[tuple[int, list[tuple], list[int], list[int], list[tuple]]],
+        releases: list[int],
+        touches: list[list[tuple]],
+        abandons: list[int],
+    ) -> None:
+        """A plan's pool commands, each kind in plan order: the writes
+        (``write_id, keys, buckets, Device blocks, publications``), the
+        tickets to release, the keys to touch, the lookups to abandon."""
+        for write in writes:
+            self._client.submit_write(*write)
+        for ticket in releases:
+            self._client.release(ticket)
+        for keys in touches:
+            # The command carries no bucket: an unsharded group has one.
+            self._client.touch(keys, [0] * len(keys))
+        for lookup_id in abandons:
+            self._client.abandon_lookup(lookup_id)
+
+    def stats(self) -> tuple[int, int, bool]:
+        """The client's counters: lookups answered as a miss at their
+        deadline, blocks of the writes it gave up, and whether the rank
+        serves without the pool."""
+        return (
+            self._client.lookup_timeouts,
+            self._client.dropped_write_blocks,
+            self._client.no_pool,
+        )
 
 
 class MemoryMetricSampler(threading.Thread):
@@ -1301,10 +1416,21 @@ class HostBootstrap:
             storage_config = l3.runtime.scheduler if l3 is not None else None
             specs = device.specs
             geometry = specs.cache_geometry
+            # With --shared-l2-config, the client the device build joined the
+            # pool with; else None.
+            pool_client = device.shared_l2
             scheduler_config = scheduler_config_from_args(
                 server_args,
                 specs,
                 storage_config=storage_config,
+                shared_l2_config=(
+                    tokenspeed_scheduler.SharedL2Config(
+                        max_writes=pool_client.config.max_writes,
+                        max_write_keys=pool_client.config.max_write_keys,
+                    )
+                    if pool_client is not None
+                    else None
+                ),
                 max_scheduled_tokens=server_args.chunked_prefill_size,
                 max_batch_size=max_batch_size,
                 max_resident_requests=max_resident_requests,
@@ -1315,6 +1441,7 @@ class HostBootstrap:
                     speculative_algorithm=spec_algorithm,
                     enable_prefix_caching=server_args.enable_prefix_caching,
                     enable_kvstore=server_args.enable_kvstore,
+                    shared_l2_pool=pool_client is not None,
                     disaggregation_mode=server_args.disaggregation_mode,
                     draft_model_path_use_base=server_args.draft_model_path_use_base,
                     draft_model_config=draft_model_config,
@@ -1559,6 +1686,11 @@ class HostBootstrap:
             #: The PD peer the host starts its own from, None outside
             #: disaggregation.
             self.transfer_peer = device.transfer
+            #: With a shared L2 pool as the Host tier, what the host's control
+            #: thread drives the pool's client through; else None.
+            self.shared_l2: HostSharedL2 | None = (
+                HostSharedL2(pool_client) if pool_client is not None else None
+            )
             #: EPD: the settings the host starts its embedding receiver from,
             #: on a multimodal prefill node's first stage; else None.
             self.epd_receive = epd_receive.settings if epd_receive is not None else None
@@ -1596,6 +1728,7 @@ class HostBootstrap:
                     epd_receive.publisher if epd_receive is not None else None
                 ),
                 starting=server_args.enable_startup_requests,
+                shared_l2_loads=pool_client is not None,
             )
             self._device = device.handle
 

@@ -141,9 +141,11 @@ void advance(tokenspeed::Scheduler& scheduler, rust::Slice<const ForwardEvent> e
 
 void advance_head(tokenspeed::Scheduler& scheduler, rust::Slice<const StorageTickView> ticks,
                   rust::Slice<const StorageCancellationView> cancellations,
-                  rust::Slice<const StorageDoneView> done, rust::Slice<const CacheEvent> cache_events) {
+                  rust::Slice<const StorageDoneView> done, rust::Slice<const CacheEvent> cache_events,
+                  rust::Slice<const SharedL2WriteDoneView> pool_writes) {
     // One batch, in the order the Python hooks built it: the storage clock,
-    // the cancellations, the storage completions, then the Host copies' ACKs.
+    // the cancellations, the storage completions, then the Host copies' ACKs;
+    // a shared L2 pool's finished writes come last.
     tokenspeed::ExecutionEvent execution_event;
     for (const StorageTickView& tick : ticks) {
         execution_event.With(tokenspeed::cache::StorageTick{
@@ -192,6 +194,10 @@ void advance_head(tokenspeed::Scheduler& scheduler, rust::Slice<const StorageTic
             default:
                 throw std::invalid_argument("unknown cache event kind");
         }
+    }
+    for (const SharedL2WriteDoneView& write : pool_writes) {
+        execution_event.With(
+            tokenspeed::cache::SharedL2WriteDone{.write_id = write.write_id, .success = write.success});
     }
     scheduler.Advance(execution_event);
 }
@@ -388,14 +394,97 @@ std::int32_t max_single_request_tokens(const tokenspeed::Scheduler& scheduler) {
 
 namespace {
 
-ForwardBatchView batch_view(const tokenspeed::ForwardBatch& batch) {
-    rust::Vec<rust::String> request_ids;
-    request_ids.reserve(batch.request_ids.size());
-    for (const std::string& id : batch.request_ids) {
-        request_ids.push_back(rust::String(id));
+rust::Vec<rust::String> to_rust(const std::vector<std::string>& values) {
+    rust::Vec<rust::String> out;
+    out.reserve(values.size());
+    for (const std::string& value : values) {
+        out.push_back(rust::String(value));
     }
+    return out;
+}
+
+rust::Vec<SharedL2KeyView> to_rust(const std::vector<tokenspeed::CacheKey>& keys) {
+    rust::Vec<SharedL2KeyView> out;
+    out.reserve(keys.size());
+    for (const tokenspeed::CacheKey& key : keys) {
+        out.push_back(SharedL2KeyView{.namespace_id = key.namespace_id,
+                                      .group_id = key.group_id,
+                                      .content_hash = rust::String(key.content_hash.ToString()),
+                                      .page_offset = key.page_offset});
+    }
+    return out;
+}
+
+}  // namespace
+
+rust::Vec<SharedL2LookupView> shared_l2_lookups(tokenspeed::Scheduler& scheduler) {
+    rust::Vec<SharedL2LookupView> out;
+    for (const tokenspeed::SharedL2Lookup& lookup : scheduler.SharedL2Lookups()) {
+        out.push_back(SharedL2LookupView{.lookup_id = lookup.lookup_id,
+                                         .request_id = rust::String(lookup.request_id),
+                                         .prefix_hashes = to_rust(lookup.prefix_hashes),
+                                         .tokens = to_rust(lookup.tokens),
+                                         .max_tokens = lookup.max_tokens});
+    }
+    return out;
+}
+
+rust::Vec<SharedL2PageView> apply_shared_l2_lookup(tokenspeed::Scheduler& scheduler, const SharedL2AnswerView& answer) {
+    std::optional<tokenspeed::TailPublication> tail;
+    if (answer.tail_tokens != 0) {
+        tail = tokenspeed::TailPublication{.tail_tokens = answer.tail_tokens, .hash = tokenspeed::ContentHash{std::string(answer.tail_hash)}};
+    }
+    std::vector<tokenspeed::CacheKey> keys;
+    keys.reserve(answer.keys.size());
+    for (const SharedL2KeyView& key : answer.keys) {
+        keys.push_back(tokenspeed::CacheKey{.namespace_id = key.namespace_id,
+                                            .group_id = key.group_id,
+                                            .content_hash = tokenspeed::ContentHash{std::string(key.content_hash)},
+                                            .page_offset = key.page_offset});
+    }
+    const tokenspeed::SharedL2LookupResult result{.lookup_id = answer.lookup_id,
+                                                  .ticket = answer.ticket,
+                                                  .num_tokens = answer.num_tokens,
+                                                  .kv_tokens = answer.kv_tokens,
+                                                  .tail = std::move(tail),
+                                                  .keys = std::move(keys),
+                                                  .buckets = to_std({answer.buckets.data(), answer.buckets.size()}),
+                                                  .pages = to_std({answer.pages.data(), answer.pages.size()})};
+    rust::Vec<SharedL2PageView> out;
+    for (const tokenspeed::SharedL2ProxyPage& page : scheduler.ApplySharedL2Lookups({result})) {
+        out.push_back(
+            SharedL2PageView{.group_id = page.group_id, .block = page.block, .bucket = page.bucket, .page = page.page});
+    }
+    return out;
+}
+
+void abandon_shared_l2_lookups(tokenspeed::Scheduler& scheduler, rust::Slice<const std::uint64_t> lookup_ids) {
+    scheduler.AbandonSharedL2Lookups({lookup_ids.begin(), lookup_ids.end()});
+}
+
+void set_shared_l2_lease_lost(tokenspeed::Scheduler& scheduler, bool lost) { scheduler.SetSharedL2LeaseLost(lost); }
+
+SharedL2StatsView shared_l2_stats(const tokenspeed::Scheduler& scheduler) {
+    const tokenspeed::SharedL2Stats stats = scheduler.GetSharedL2Stats();
+    return SharedL2StatsView{
+        .lookups = stats.lookups,
+        .hits = stats.hits,
+        .abandoned_lookups = stats.abandoned_lookups,
+        .proxy_overflows = stats.proxy_overflows,
+        .lease_expired_hits = stats.lease_expired_hits,
+        .pending_lookups = stats.pending_lookups,
+        .tickets = stats.tickets,
+        .writes_in_flight = stats.writes_in_flight,
+        .failed_writes = stats.failed_writes,
+        .failed_write_blocks = stats.failed_write_blocks,
+    };
+}
+
+namespace {
+
+ForwardBatchView batch_view(const tokenspeed::ForwardBatch& batch) {
     return ForwardBatchView{
-        .request_ids = std::move(request_ids),
+        .request_ids = to_rust(batch.request_ids),
         .request_pool_indices = to_rust(batch.request_pool_indices),
         .input_lengths = to_rust(batch.input_lengths),
         .prefill_lengths = to_rust(batch.prefill_lengths),
@@ -407,10 +496,7 @@ ForwardBatchView batch_view(const tokenspeed::ForwardBatch& batch) {
 
 TransferBatchView transfer_view(const tokenspeed::ForwardBatch& batch) {
     TransferBatchView view;
-    view.request_ids.reserve(batch.request_ids.size());
-    for (const std::string& id : batch.request_ids) {
-        view.request_ids.push_back(rust::String(id));
-    }
+    view.request_ids = to_rust(batch.request_ids);
     view.request_pool_indices = to_rust(batch.request_pool_indices);
     view.input_lengths = to_rust(batch.input_lengths);
     view.prefill_lengths = to_rust(batch.prefill_lengths);
@@ -488,9 +574,11 @@ bool plan_needs_device(const tokenspeed::ExecutionPlan& plan) {
             }
             continue;
         }
-        // Storage operations run on the host's L3 executor, not the device.
+        // Storage operations run on the host's L3 executor and shared L2
+        // pool commands on its pool client, not the device.
         const auto* cache = std::get_if<tokenspeed::CacheOperation>(&operation);
-        if (cache == nullptr || !std::holds_alternative<tokenspeed::StorageOperation>(*cache)) {
+        if (cache == nullptr || !(std::holds_alternative<tokenspeed::StorageOperation>(*cache) ||
+                                  std::holds_alternative<tokenspeed::SharedL2Operation>(*cache))) {
             return true;
         }
     }
@@ -625,6 +713,56 @@ rust::Vec<StorageOpView> plan_storage_ops(const tokenspeed::ExecutionPlan& plan)
                 }
             },
             *storage);
+    }
+    return out;
+}
+
+rust::Vec<SharedL2OpView> plan_shared_l2_ops(const tokenspeed::ExecutionPlan& plan) {
+    rust::Vec<SharedL2OpView> out;
+    for (const tokenspeed::Operation& operation : plan.Operations()) {
+        const auto* cache = std::get_if<tokenspeed::CacheOperation>(&operation);
+        if (cache == nullptr) {
+            continue;
+        }
+        const auto* pool = std::get_if<tokenspeed::SharedL2Operation>(cache);
+        if (pool == nullptr) {
+            continue;
+        }
+        std::visit(
+            [&out](const auto& op) {
+                using Op = std::decay_t<decltype(op)>;
+                SharedL2OpView view{};
+                if constexpr (std::is_same_v<Op, tokenspeed::SharedL2WriteOperation>) {
+                    view.kind = SharedL2OpKind::Write;
+                    view.id = op.write_id;
+                    view.keys = to_rust(op.keys);
+                    view.buckets = to_rust(op.buckets);
+                    view.blocks = to_rust(op.blocks);
+                    view.publications.reserve(op.publications.size());
+                    for (const tokenspeed::SharedL2Publication& publication : op.publications) {
+                        view.publications.push_back(SharedL2PublicationView{
+                            .tokens = to_rust(publication.tokens),
+                            .prefix_hashes = to_rust(publication.prefix_hashes),
+                            .tail_tokens = publication.tail ? publication.tail->tail_tokens : 0,
+                            .tail_hash = rust::String(publication.tail ? publication.tail->hash.ToString() : std::string{}),
+                            .publisher = publication.publisher,
+                        });
+                    }
+                } else if constexpr (std::is_same_v<Op, tokenspeed::SharedL2ReleaseOperation>) {
+                    view.kind = SharedL2OpKind::Release;
+                    view.id = op.ticket;
+                } else if constexpr (std::is_same_v<Op, tokenspeed::SharedL2TouchOperation>) {
+                    view.kind = SharedL2OpKind::Touch;
+                    view.keys = to_rust(op.keys);
+                } else {
+                    static_assert(std::is_same_v<Op, tokenspeed::SharedL2AbandonOperation>,
+                                  "a new shared L2 pool command");
+                    view.kind = SharedL2OpKind::Abandon;
+                    view.id = op.lookup_id;
+                }
+                out.push_back(std::move(view));
+            },
+            *pool);
     }
     return out;
 }

@@ -118,6 +118,10 @@ class Plane:
         self.failing = False
         self.completion_failing = False
         self.cumulative_probs = None
+        # A launched forward lands once this is set.
+        self.landing = threading.Event()
+        self.landing.set()
+        self.landing_failing = False
 
     def note(self, name):
         self.calls.append((name, threading.get_ident()))
@@ -151,6 +155,12 @@ class Plane:
         from array import array
         cumulative = None if self.cumulative_probs is None else array('d', self.cumulative_probs)
         return ([launched], [1], None, None, None, None, None, None, cumulative)
+
+    def wait_landed(self, launched):
+        self.note("wait_landed")
+        if self.landing_failing:
+            raise RuntimeError("the landing wait failed")
+        self.landing.wait()
 
     def note_committed(self, launched):
         self.note("note_committed")
@@ -202,7 +212,7 @@ fn plane() -> (Py<PyAny>, Scheduler) {
 }
 
 fn start(plane: &Py<PyAny>) -> PythonDataPlane {
-    PythonDataPlane::start(Python::attach(|py| plane.clone_ref(py)), None).unwrap()
+    PythonDataPlane::start(Python::attach(|py| plane.clone_ref(py)), None, false).unwrap()
 }
 
 /// A one-row batch: the stand-in launches whatever it is handed.
@@ -472,7 +482,7 @@ fn a_failed_completion_notifies_the_launcher_before_logging() {
                 ..Dispatch::default()
             };
             LAUNCHER_FAILURE.get_or_init(crate::LauncherFailure::for_parent);
-            let mut data_plane = PythonDataPlane::start(plane, None).unwrap();
+            let mut data_plane = PythonDataPlane::start(plane, None, false).unwrap();
             let forward = data_plane
                 .execute(scheduler.next_execution_plan(true, false), &dispatch)
                 .unwrap()
@@ -763,4 +773,313 @@ fn assert_failure_is_published_before_logging(
         signal_errors,
         "{output}"
     );
+}
+
+#[test]
+fn a_watched_forward_is_seen_landing_without_being_completed() {
+    let (plane, mut scheduler) = plane();
+    Python::attach(|py| {
+        plane
+            .getattr(py, "landing")
+            .unwrap()
+            .call_method0(py, "clear")
+            .unwrap()
+    });
+    let batch = batch();
+    let dispatch = Dispatch {
+        forward: Some(&batch),
+        ..Dispatch::default()
+    };
+    let mut data_plane =
+        PythonDataPlane::start(Python::attach(|py| plane.clone_ref(py)), None, true).unwrap();
+    let forward = data_plane
+        .execute(scheduler.next_execution_plan(true, false), &dispatch)
+        .unwrap()
+        .unwrap();
+    // On the device still: the question waits its bound and no longer.
+    let asked = Instant::now();
+    assert!(!data_plane
+        .landed(&forward, Duration::from_millis(20))
+        .unwrap());
+    assert!(asked.elapsed() >= Duration::from_millis(20));
+
+    // The landing ends a long wait at once.
+    let lander = {
+        let plane = Python::attach(|py| plane.clone_ref(py));
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(30));
+            Python::attach(|py| {
+                plane
+                    .getattr(py, "landing")
+                    .unwrap()
+                    .call_method0(py, "set")
+                    .unwrap()
+            });
+        })
+    };
+    let asked = Instant::now();
+    assert!(data_plane
+        .landed(&forward, Duration::from_secs(30))
+        .unwrap());
+    assert!(asked.elapsed() < Duration::from_secs(5));
+    lander.join().unwrap();
+    assert!(data_plane.landed(&forward, Duration::ZERO).unwrap());
+    assert_eq!(data_plane.complete(forward).unwrap().output_tokens, [100]);
+
+    // The watcher waited on a thread of its own: neither the forward
+    // thread, which launches, nor this one, which takes requests in.
+    let calls = calls(&plane);
+    let thread_of = |name: &str| {
+        calls
+            .iter()
+            .find(|(call, _)| call == name)
+            .unwrap_or_else(|| panic!("no {name} in {calls:?}"))
+            .1
+    };
+    let watcher = thread_of("wait_landed");
+    assert_ne!(watcher, thread_of("execute"));
+    assert_ne!(watcher, this_thread());
+    assert_eq!(thread_of("complete"), this_thread());
+    drop(data_plane);
+}
+
+#[test]
+fn a_failed_landing_wait_fails_the_question_instead_of_leaving_it_open() {
+    let (plane, mut scheduler) = plane();
+    Python::attach(|py| plane.setattr(py, "landing_failing", true).unwrap());
+    let batch = batch();
+    let dispatch = Dispatch {
+        forward: Some(&batch),
+        ..Dispatch::default()
+    };
+    let mut data_plane =
+        PythonDataPlane::start(Python::attach(|py| plane.clone_ref(py)), None, true).unwrap();
+    let forward = data_plane
+        .execute(scheduler.next_execution_plan(true, false), &dispatch)
+        .unwrap()
+        .unwrap();
+    // The watcher is gone and no landing will be seen: the question fails
+    // at once, where a loop told "not yet" would ask for good.
+    let asked = Instant::now();
+    let error = data_plane
+        .landed(&forward, Duration::from_secs(10))
+        .unwrap_err();
+    assert!(error.0.contains("the landing wait failed"), "{}", error.0);
+    assert!(asked.elapsed() < Duration::from_secs(5));
+    // Every later call reports the failure, the forward's commit too.
+    assert!(data_plane.landed(&forward, Duration::ZERO).is_err());
+    assert!(data_plane.complete(forward).is_err());
+}
+
+#[test]
+fn a_data_plane_started_without_its_watcher_refuses_the_question() {
+    let (plane, mut scheduler) = plane();
+    let batch = batch();
+    let dispatch = Dispatch {
+        forward: Some(&batch),
+        ..Dispatch::default()
+    };
+    let mut data_plane = start(&plane);
+    let forward = data_plane
+        .execute(scheduler.next_execution_plan(true, false), &dispatch)
+        .unwrap()
+        .unwrap();
+    let error = data_plane.landed(&forward, Duration::ZERO).unwrap_err();
+    assert!(error.0.contains("landing watcher"), "{}", error.0);
+    assert_eq!(data_plane.complete(forward).unwrap().output_tokens, [100]);
+    assert!(!calls(&plane).iter().any(|(call, _)| call == "wait_landed"));
+}
+
+/// A stand-in for the pool adapter (`HostSharedL2`): it records what each
+/// call was given and answers what a pool client would.
+const POOL_ADAPTER: &str = r#"
+import struct
+
+
+class Adapter:
+    def __init__(self):
+        self.calls = []
+
+    def submit_lookups(self, lookups):
+        self.calls.append(("submit_lookups", lookups))
+
+    def poll(self, awaited, wait_s, tickets):
+        self.calls.append(("poll", awaited, wait_s, tickets))
+        hit = (4, 9, 32, 35, (3, "tail"), [((0, 1, "k1", 0), 0, 17), ((0, 2, "k2", 1), 0, 18)])
+        return [hit, (5, 0, 0, 0, None, [])], [(21, True), (22, False)], True
+
+    def map_pages(self, ticket, pages):
+        self.calls.append(("map_pages", ticket, pages))
+
+    def submit(self, writes, releases, touches, abandons):
+        self.calls.append(("submit", writes, releases, touches, abandons))
+
+    def stats(self):
+        return 3, 40, True
+
+
+def int32(*tokens):
+    return struct.pack(f"={len(tokens)}i", *tokens)
+
+
+EXPECTED = [
+    ("submit_lookups", [(4, "r1", ["h1", "h2"], int32(7, 8, 9), 3)]),
+    ("poll", [4], 0.002, [9, 11]),
+    ("map_pages", 9, [(1, 5, 0, 17), (2, 6, 0, 18)]),
+    (
+        "submit",
+        [
+            (
+                31,
+                [(0, 1, "k1", 0), (0, 2, "k2", 1)],
+                [0, 0],
+                [12, 13],
+                [(int32(7, 8, 9), ["h1"], (1, "tail"), 77), (int32(7, 8), ["h1"], None, 78)],
+            )
+        ],
+        [9],
+        [[(0, 1, "k1", 0)]],
+        [5],
+    ),
+]
+result = Adapter()
+"#;
+
+#[test]
+fn the_pool_client_speaks_the_adapters_shapes() {
+    use ts_control::shared_l2::{ClientStats, PoolClient};
+    use ts_scheduler::{
+        SharedL2KeyView, SharedL2LookupView, SharedL2OpKind, SharedL2OpView, SharedL2PageView,
+        SharedL2PublicationView,
+    };
+
+    interpreter();
+    let (adapter, globals) = Python::attach(|py| {
+        let globals = PyDict::new(py);
+        py.run(&CString::new(POOL_ADAPTER).unwrap(), Some(&globals), None)
+            .unwrap_or_else(|error| panic!("{}", describe(py, &error)));
+        let adapter = globals.get_item("result").unwrap().unwrap().unbind();
+        (adapter, globals.unbind())
+    });
+    let mut client = crate::pool::PythonPoolClient::new(Python::attach(|py| adapter.clone_ref(py)));
+    let key = |group_id: u32, hash: &str, page_offset: i32| SharedL2KeyView {
+        namespace_id: 0,
+        group_id,
+        content_hash: hash.to_owned(),
+        page_offset,
+    };
+
+    client
+        .submit_lookups(&[SharedL2LookupView {
+            lookup_id: 4,
+            request_id: "r1".to_owned(),
+            prefix_hashes: vec!["h1".to_owned(), "h2".to_owned()],
+            tokens: vec![7, 8, 9],
+            max_tokens: 3,
+        }])
+        .unwrap();
+    let polled = client
+        .poll(&[4], Duration::from_millis(2), &[9, 11])
+        .unwrap();
+    // A hit with a tail and a miss, the finished writes, the lease.
+    let [hit, miss] = &polled.answers[..] else {
+        panic!("{polled:?}");
+    };
+    assert_eq!(
+        (hit.lookup_id, hit.ticket, hit.num_tokens, hit.kv_tokens),
+        (4, 9, 32, 35)
+    );
+    assert_eq!((hit.tail_tokens, hit.tail_hash.as_str()), (3, "tail"));
+    assert_eq!(hit.keys, [key(1, "k1", 0), key(2, "k2", 1)]);
+    assert_eq!((&hit.buckets, &hit.pages), (&vec![0, 0], &vec![17, 18]));
+    assert_eq!((miss.lookup_id, miss.ticket, miss.tail_tokens), (5, 0, 0));
+    assert!(miss.keys.is_empty() && miss.tail_hash.is_empty());
+    assert_eq!(
+        polled
+            .writes
+            .iter()
+            .map(|write| (write.write_id, write.success))
+            .collect::<Vec<_>>(),
+        [(21, true), (22, false)]
+    );
+    assert!(polled.lease_lost);
+
+    client
+        .map_pages(
+            9,
+            &[
+                SharedL2PageView {
+                    group_id: 1,
+                    block: 5,
+                    bucket: 0,
+                    page: 17,
+                },
+                SharedL2PageView {
+                    group_id: 2,
+                    block: 6,
+                    bucket: 0,
+                    page: 18,
+                },
+            ],
+        )
+        .unwrap();
+    let command = |kind, id| SharedL2OpView {
+        kind,
+        id,
+        keys: Vec::new(),
+        buckets: Vec::new(),
+        blocks: Vec::new(),
+        publications: Vec::new(),
+    };
+    let publication =
+        |tokens: &[i32], tail_tokens, tail_hash: &str, publisher| SharedL2PublicationView {
+            tokens: tokens.to_vec(),
+            prefix_hashes: vec!["h1".to_owned()],
+            tail_tokens,
+            tail_hash: tail_hash.to_owned(),
+            publisher,
+        };
+    client
+        .submit(&[
+            SharedL2OpView {
+                keys: vec![key(1, "k1", 0), key(2, "k2", 1)],
+                buckets: vec![0, 0],
+                blocks: vec![12, 13],
+                publications: vec![
+                    publication(&[7, 8, 9], 1, "tail", 77),
+                    publication(&[7, 8], 0, "", 78),
+                ],
+                ..command(SharedL2OpKind::Write, 31)
+            },
+            command(SharedL2OpKind::Release, 9),
+            SharedL2OpView {
+                keys: vec![key(1, "k1", 0)],
+                ..command(SharedL2OpKind::Touch, 0)
+            },
+            command(SharedL2OpKind::Abandon, 5),
+        ])
+        .unwrap();
+    assert_eq!(
+        client.stats().unwrap(),
+        ClientStats {
+            lookup_timeouts: 3,
+            dropped_write_blocks: 40,
+            no_pool: true,
+        }
+    );
+
+    // What the adapter was given, as its Python client takes it.
+    Python::attach(|py| {
+        py.run(
+            c"assert result.calls == EXPECTED, f'{result.calls}\\n!=\\n{EXPECTED}'",
+            Some(globals.bind(py)),
+            None,
+        )
+        .unwrap_or_else(|error| panic!("{}", describe(py, &error)));
+    });
+
+    // A failing adapter is the client's failure, with its traceback.
+    Python::attach(|py| adapter.setattr(py, "stats", py.None()).unwrap());
+    let error = client.stats().unwrap_err();
+    assert!(error.0.contains("NoneType"), "{}", error.0);
 }

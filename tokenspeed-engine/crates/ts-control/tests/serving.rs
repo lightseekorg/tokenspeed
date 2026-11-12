@@ -34,7 +34,7 @@ use std::{
         Arc, Mutex, Once, PoisonError,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use pyo3::{prelude::*, types::PyDict};
@@ -53,6 +53,7 @@ use ts_control::{
     grammar::{GrammarConfig, GrammarKey, Grammars},
     ingress::{Admission, IngressLimits, LogprobServability},
     output::{FinishLog, ForwardResult, LogprobPlan, OutputProcessor, Role, StreamedOutput},
+    shared_l2::{ClientStats, Polled, PoolClient, PoolError, LOOKUP_WAIT},
     startup,
     transport::EngineTransport,
 };
@@ -66,6 +67,8 @@ use ts_pd::{
 };
 use ts_scheduler::{
     profile, CacheEvent, CacheEventKind, CacheOpKind, CacheOpView, ExecutionPlan, Scheduler,
+    SharedL2AnswerView, SharedL2KeyView, SharedL2LookupView, SharedL2OpKind, SharedL2OpView,
+    SharedL2PageView, SharedL2WriteDoneView,
 };
 use ts_wire::{
     codec::Dict,
@@ -127,6 +130,8 @@ enum Tiers {
     /// A Host L2 tier backed by an L3 store, which holds every prefix page
     /// a query asks for.
     L3,
+    /// A Host tier that is the proxy of a shared L2 pool.
+    SharedL2,
 }
 
 /// The scheduler over `tiers` for `role`, its KV cache split over
@@ -181,6 +186,12 @@ fn new_scheduler(
                  8, 8, 64, 64, 1024, 1, 10**9, 10**9,\n\
                  ts.StoragePressure(64, 2**40, 10**9),\n\
                  ts.StoragePressure(32, 2**39, 5 * 10**8))"
+        }
+        Tiers::SharedL2 => {
+            "cfg.disable_l2_cache = False\n\
+             cfg.num_host_pages = 1025\n\
+             cfg.host_write_policy = ts.SchedulerConfig.HostWritePolicy.WriteThrough\n\
+             cfg.shared_l2_config = ts.SharedL2Config(max_writes=2, max_write_keys=64)"
         }
     };
     let code = format!(
@@ -337,6 +348,19 @@ struct FakeDevice {
     ep_rank: usize,
     /// EPLB: the placement the experts sit in, as the routing tables say.
     placement: Arc<Mutex<Vec<Vec<i32>>>>,
+    /// How long a forward runs on the device before its results land.
+    forward_time: Duration,
+    /// When each launched forward lands and the tokens it reports, until
+    /// its commit; oldest first.
+    landing: VecDeque<(Instant, Vec<i32>)>,
+    /// A launched forward has not been committed.
+    forwarding: Arc<AtomicBool>,
+    /// The loop's questions whether a forward landed.
+    landed_calls: Arc<Mutex<usize>>,
+    /// How long after its landing each forward was committed.
+    committed_late: Arc<Mutex<Vec<Duration>>>,
+    /// Each prefill row run: its request and the prefix it started behind.
+    prefixes: Arc<Mutex<Vec<(String, i32)>>>,
     /// EPLB: every chunk applied, with its layers' rows.
     applied: Applied,
     /// EPD: requests whose landed embeddings were published, in order.
@@ -738,6 +762,18 @@ impl DataPlane for FakeDevice {
             return Ok(None);
         };
         thread::sleep(FORWARD_TIME);
+        // One device: a forward starts once the one before it landed.
+        let start = self
+            .landing
+            .back()
+            .map_or_else(Instant::now, |(last, _)| (*last).max(Instant::now()));
+        self.forwarding.store(true, Ordering::Relaxed);
+        self.prefixes.lock().unwrap().extend(
+            batch.request_ids[..batch.num_extends]
+                .iter()
+                .cloned()
+                .zip(batch.extend_prefix_lens.iter().copied()),
+        );
         let mut result = ForwardResult::default();
         for (i, rid) in batch.request_ids.iter().enumerate() {
             let mid_chunk = i < batch.num_extends
@@ -771,11 +807,35 @@ impl DataPlane for FakeDevice {
         if let Some(plan) = dispatch.logprobs {
             fake_logprobs(plan, &mut result);
         }
+        self.landing
+            .push_back((start + self.forward_time, result.output_tokens.clone()));
         Ok(Some(result))
     }
 
     fn complete(&mut self, pending: ForwardResult) -> Result<ForwardResult, DataPlaneError> {
+        let (due, _) = self.landing.pop_front().expect("launched before");
+        thread::sleep(due.saturating_duration_since(Instant::now()));
+        self.committed_late
+            .lock()
+            .unwrap()
+            .push(Instant::now().duration_since(due));
+        self.forwarding
+            .store(!self.landing.is_empty(), Ordering::Relaxed);
         Ok(pending)
+    }
+
+    fn landed(&mut self, pending: &ForwardResult, wait: Duration) -> Result<bool, DataPlaneError> {
+        *self.landed_calls.lock().unwrap() += 1;
+        let (due, tokens) = self.landing.front().expect("asked of a launched forward");
+        // The loop commits forwards oldest first, so that is the one whose
+        // landing it may wait for.
+        assert_eq!(
+            &pending.output_tokens, tokens,
+            "asked of the oldest forward"
+        );
+        let due = *due;
+        thread::sleep(wait.min(due.saturating_duration_since(Instant::now())));
+        Ok(Instant::now() >= due)
     }
 
     fn poll_cache_events(&mut self) -> Result<Vec<CacheEvent>, DataPlaneError> {
@@ -1299,6 +1359,12 @@ struct Setup {
     /// The requests each engine serves itself before its frontend attaches,
     /// [`STARTUP_OUTPUT_TOKENS`] each.
     startup: Vec<startup::Phase>,
+    /// A shared L2 pool (`Tiers::SharedL2`): what every rank's client talks
+    /// to.
+    pool: Option<Arc<Mutex<FakePool>>>,
+    /// How long a forward runs on the device before its results land; no
+    /// time when unset.
+    forward_time: Duration,
 }
 
 const STARTUP_OUTPUT_TOKENS: usize = 3;
@@ -1423,8 +1489,17 @@ fn run_rank<F: Frontend>(
         grammar_timeouts,
         epd_receive_enabled,
         startup,
+        pool,
         ..
     } = setup;
+    let pool = pool.map(|pool| {
+        Box::new(FakePoolClient {
+            pool,
+            plans: device.plans.clone(),
+            forwarding: device.forwarding.clone(),
+            committed: device.committed_late.clone(),
+        }) as Box<dyn PoolClient + Send>
+    });
     let role = pd.as_ref().map_or(Role::Plain, |pd| pd.role);
     let outputs = OutputProcessor::new(
         None,
@@ -1498,6 +1573,8 @@ fn run_rank<F: Frontend>(
             }),
             l3_metrics: None,
             l3: store.map(|store| l3_executor(store, rank)),
+            pool,
+            pool_metrics: None,
         },
     );
     if event_loop.warm_up(startup::requests(&startup, STARTUP_OUTPUT_TOKENS), stop)? {
@@ -1530,6 +1607,7 @@ fn fake_device(layout: Layout, rank: usize, setup: &Setup) -> FakeDevice {
         )),
         // The trivial initial placement: slot p holds expert p % 4.
         placement: Arc::new(Mutex::new(vec![vec![0, 1, 2, 3, 0, 1]; 2])),
+        forward_time: setup.forward_time,
         ..Default::default()
     }
 }
@@ -5767,4 +5845,1261 @@ fn a_profile_keeps_the_rounds_that_only_advance_storage() {
         "no round of the {} before the device's was kept",
         device_round - opened
     );
+}
+
+/// How a test's pool answers one request's lookup.
+#[derive(Debug, Clone, Copy)]
+enum Answer {
+    /// At the first poll after the lookup was sent.
+    AtOnce,
+    /// Only to a poll that waits for it: it arrives inside the wait.
+    InWait,
+    /// At this poll after it was sent, counting from 1.
+    AtPoll(usize),
+    /// At the first poll, as a hit the scheduler refuses: it names one
+    /// token more than its pages hold.
+    Misfit,
+    /// Never: the client's deadline turns it into a miss.
+    Never,
+}
+
+/// What a test's pool did, in order; `plans` is how many plans the device
+/// had run by then.
+#[derive(Debug, Clone, PartialEq)]
+enum PoolEvent {
+    /// A request's lookup was sent, while a forward ran or not.
+    Sent {
+        rid: String,
+        plans: usize,
+        forwarding: bool,
+    },
+    /// A poll waited for these requests' lookups.
+    Waited {
+        rids: Vec<String>,
+        wait: Duration,
+        plans: usize,
+    },
+    /// A request's lookup was answered, with this many pages hit.
+    Answered {
+        rid: String,
+        pages: usize,
+        plans: usize,
+    },
+    /// A write of this many blocks was started, after the device's
+    /// `commits`-th forward was committed.
+    Wrote {
+        blocks: usize,
+        commits: usize,
+    },
+    /// A write was reported finished.
+    WriteDone,
+    Released(u64),
+    Abandoned(u64),
+    /// A ticket's proxy blocks were mapped to pool pages, this many.
+    Mapped(u64, usize),
+}
+
+/// A shared L2 pool as one rank sees it: the owner and the rank's client in
+/// one, scripted by the test.
+struct FakePool {
+    /// How each request's lookup is answered, and how many of its prompt's
+    /// full pages the pool holds; a request not named misses at once.
+    answers: HashMap<String, (Answer, usize)>,
+    /// The client's lookup deadline: a lookup not answered by then is a
+    /// miss.
+    deadline: Duration,
+    /// Writes finish at the next poll; else they stay in flight.
+    finish_writes: bool,
+    /// Whether a load may still start from any ticket.
+    lease: bool,
+    /// A test's mark that its engines may stop.
+    done: bool,
+    /// Lookups sent and not answered, each with when it was sent and the
+    /// polls since.
+    open: Vec<(SharedL2LookupView, Instant, usize)>,
+    /// Writes started and not reported.
+    writes: Vec<u64>,
+    tickets: u64,
+    pages: i32,
+    lookup_timeouts: u64,
+    log: Vec<PoolEvent>,
+}
+
+impl FakePool {
+    fn new(answers: &[(&str, Answer, usize)]) -> Self {
+        Self {
+            answers: answers
+                .iter()
+                .map(|&(rid, answer, pages)| (rid.to_owned(), (answer, pages)))
+                .collect(),
+            deadline: Duration::from_secs(3600),
+            finish_writes: true,
+            lease: true,
+            done: false,
+            open: Vec::new(),
+            writes: Vec::new(),
+            tickets: 0,
+            pages: 0,
+            lookup_timeouts: 0,
+            log: Vec::new(),
+        }
+    }
+}
+
+/// One rank's client of a [`FakePool`].
+struct FakePoolClient {
+    pool: Arc<Mutex<FakePool>>,
+    /// The rank's device: the plans it ran, whether a forward runs, and
+    /// the forwards committed.
+    plans: Arc<Mutex<Vec<ExecutedPlan>>>,
+    forwarding: Arc<AtomicBool>,
+    committed: Arc<Mutex<Vec<Duration>>>,
+}
+
+impl PoolClient for FakePoolClient {
+    fn submit_lookups(&mut self, lookups: &[SharedL2LookupView]) -> Result<(), PoolError> {
+        let plans = self.plans.lock().unwrap().len();
+        let forwarding = self.forwarding.load(Ordering::Relaxed);
+        let mut pool = self.pool.lock().unwrap();
+        for lookup in lookups {
+            pool.log.push(PoolEvent::Sent {
+                rid: lookup.request_id.clone(),
+                plans,
+                forwarding,
+            });
+            pool.open.push((lookup.clone(), Instant::now(), 0));
+        }
+        Ok(())
+    }
+
+    fn poll(
+        &mut self,
+        awaited: &[u64],
+        wait: Duration,
+        tickets: &[u64],
+    ) -> Result<Polled, PoolError> {
+        let plans = self.plans.lock().unwrap().len();
+        let mut pool = self.pool.lock().unwrap();
+        if !awaited.is_empty() {
+            let rids = pool
+                .open
+                .iter()
+                .filter(|(lookup, ..)| awaited.contains(&lookup.lookup_id))
+                .map(|(lookup, ..)| lookup.request_id.clone())
+                .collect();
+            pool.log.push(PoolEvent::Waited { rids, wait, plans });
+        }
+        let mut answers = Vec::new();
+        for (lookup, sent, polls) in std::mem::take(&mut pool.open) {
+            let polls = polls + 1;
+            let (answer, held) = pool
+                .answers
+                .get(&lookup.request_id)
+                .copied()
+                .unwrap_or((Answer::AtOnce, 0));
+            let arrived = match answer {
+                Answer::AtOnce | Answer::Misfit => true,
+                Answer::InWait => awaited.contains(&lookup.lookup_id),
+                Answer::AtPoll(poll) => polls >= poll,
+                Answer::Never => false,
+            };
+            if !arrived && sent.elapsed() < pool.deadline {
+                pool.open.push((lookup, sent, polls));
+                continue;
+            }
+            // Past its deadline the client answers a miss itself.
+            let hit = if arrived {
+                held.min(lookup.prefix_hashes.len())
+            } else {
+                pool.lookup_timeouts += 1;
+                0
+            };
+            pool.log.push(PoolEvent::Answered {
+                rid: lookup.request_id.clone(),
+                pages: hit,
+                plans,
+            });
+            if hit > 0 {
+                pool.tickets += 1;
+            }
+            let first_page = pool.pages;
+            pool.pages += hit as i32;
+            answers.push(SharedL2AnswerView {
+                lookup_id: lookup.lookup_id,
+                ticket: if hit > 0 { pool.tickets } else { 0 },
+                num_tokens: 16 * hit as i32 + i32::from(matches!(answer, Answer::Misfit)),
+                kv_tokens: 16 * hit as i32,
+                tail_tokens: 0,
+                tail_hash: String::new(),
+                keys: lookup.prefix_hashes[..hit]
+                    .iter()
+                    .map(|hash| SharedL2KeyView {
+                        namespace_id: 0,
+                        group_id: 0,
+                        content_hash: hash.clone(),
+                        page_offset: 0,
+                    })
+                    .collect(),
+                buckets: vec![0; hit],
+                pages: (1..=hit as i32).map(|page| first_page + page).collect(),
+            });
+        }
+        let writes = if pool.finish_writes {
+            std::mem::take(&mut pool.writes)
+        } else {
+            Vec::new()
+        };
+        for _ in &writes {
+            pool.log.push(PoolEvent::WriteDone);
+        }
+        // As the client: no load may start from a ticket it was told to
+        // release, nor from any ticket once the lease is lost.
+        let lease_lost = tickets
+            .iter()
+            .any(|ticket| pool.log.contains(&PoolEvent::Released(*ticket)))
+            || !pool.lease
+                && (!tickets.is_empty() || answers.iter().any(|answer| answer.ticket != 0));
+        // As the client: an awaited lookup still open keeps the poll waiting.
+        let waits = pool
+            .open
+            .iter()
+            .any(|(lookup, ..)| awaited.contains(&lookup.lookup_id));
+        drop(pool);
+        if waits {
+            thread::sleep(wait);
+        }
+        Ok(Polled {
+            answers,
+            writes: writes
+                .into_iter()
+                .map(|write_id| SharedL2WriteDoneView {
+                    write_id,
+                    success: true,
+                })
+                .collect(),
+            lease_lost,
+        })
+    }
+
+    fn map_pages(&mut self, ticket: u64, pages: &[SharedL2PageView]) -> Result<(), PoolError> {
+        let mut pool = self.pool.lock().unwrap();
+        pool.log.push(PoolEvent::Mapped(ticket, pages.len()));
+        Ok(())
+    }
+
+    fn submit(&mut self, commands: &[SharedL2OpView]) -> Result<(), PoolError> {
+        let commits = self.committed.lock().unwrap().len();
+        let mut pool = self.pool.lock().unwrap();
+        for command in commands {
+            match command.kind {
+                SharedL2OpKind::Write => {
+                    pool.writes.push(command.id);
+                    pool.log.push(PoolEvent::Wrote {
+                        blocks: command.keys.len(),
+                        commits,
+                    });
+                }
+                SharedL2OpKind::Release => pool.log.push(PoolEvent::Released(command.id)),
+                SharedL2OpKind::Abandon => pool.log.push(PoolEvent::Abandoned(command.id)),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn stats(&mut self) -> Result<ClientStats, PoolError> {
+        Ok(ClientStats {
+            lookup_timeouts: self.pool.lock().unwrap().lookup_timeouts,
+            ..ClientStats::default()
+        })
+    }
+}
+
+/// When a staged frontend hands a stage over.
+enum When {
+    /// At its next receive.
+    Now,
+    /// At a receive while the device runs a forward.
+    Forwarding,
+    /// Once the device ran this many plans.
+    Plans(usize),
+    /// Once this many requests finished.
+    Finished(usize),
+    /// Once this many control replies came.
+    Replies(usize),
+    /// Once the pool is in this state.
+    Pool(fn(&FakePool) -> bool),
+    /// At a receive the engine waits in: it is idle.
+    Idle,
+}
+
+/// One step of a staged run: its messages, handed to the engine at the first
+/// receive at which `when` holds, after `act` changed the pool.
+struct Stage {
+    when: When,
+    messages: Vec<EngineRequest>,
+    act: Option<fn(&mut FakePool)>,
+}
+
+impl Stage {
+    fn send(when: When, messages: Vec<EngineRequest>) -> Self {
+        Self {
+            when,
+            messages,
+            act: None,
+        }
+    }
+
+    fn act(when: When, act: fn(&mut FakePool)) -> Self {
+        Self {
+            when,
+            messages: Vec::new(),
+            act: Some(act),
+        }
+    }
+}
+
+/// A frontend that plays its stages in order, each when its condition
+/// holds, whichever receive that is: a round's head or a forward wait. It is
+/// gone once the stages ran out and every request finished.
+struct StagedFrontend {
+    stages: VecDeque<Stage>,
+    /// The requests the stages add.
+    requests: usize,
+    finished: usize,
+    replies: Arc<Mutex<Vec<ControlOutput>>>,
+    outputs: Arc<Mutex<Vec<StreamedOutput>>>,
+    plans: Arc<Mutex<Vec<ExecutedPlan>>>,
+    forwarding: Arc<AtomicBool>,
+    pool: Option<Arc<Mutex<FakePool>>>,
+}
+
+impl Frontend for StagedFrontend {
+    fn receive(&mut self, wait: Option<Duration>) -> Vec<EngineRequest> {
+        let due = self.stages.front().is_some_and(|stage| match stage.when {
+            When::Now => true,
+            When::Forwarding => self.forwarding.load(Ordering::Relaxed),
+            When::Plans(plans) => self.plans.lock().unwrap().len() >= plans,
+            When::Finished(finished) => self.finished >= finished,
+            When::Replies(replies) => self.replies.lock().unwrap().len() >= replies,
+            When::Pool(holds) => holds(&self.pool.as_ref().unwrap().lock().unwrap()),
+            When::Idle => wait.is_some(),
+        });
+        if !due {
+            return Vec::new();
+        }
+        let stage = self.stages.pop_front().unwrap();
+        if let Some(act) = stage.act {
+            act(&mut self.pool.as_ref().unwrap().lock().unwrap());
+        }
+        stage.messages
+    }
+
+    fn closed(&self) -> bool {
+        self.stages.is_empty() && self.finished >= self.requests
+    }
+
+    fn send(&mut self, outputs: Vec<StreamedOutput>, _load: Load) {
+        self.finished += outputs
+            .iter()
+            .filter(|output| output.finish_reason.is_some())
+            .count();
+        self.outputs.lock().unwrap().extend(outputs);
+    }
+
+    fn reply(&mut self, output: ControlOutput) {
+        self.replies.lock().unwrap().push(output);
+    }
+}
+
+/// What a staged run leaves behind.
+struct StagedRun {
+    /// Every plan the device ran.
+    plans: Vec<ExecutedPlan>,
+    /// What the pool did.
+    log: Vec<PoolEvent>,
+    outputs: Vec<StreamedOutput>,
+    replies: Vec<ControlOutput>,
+    /// Each prefill row the device ran: its request and its prefix.
+    prefixes: Vec<(String, i32)>,
+    /// How often the loop asked whether a forward landed.
+    landed_calls: usize,
+    /// How long after its landing each forward was committed.
+    committed_late: Vec<Duration>,
+}
+
+impl StagedRun {
+    /// The index of the first plan whose forward ran `rid`.
+    fn first_plan(&self, rid: &str) -> usize {
+        self.plans
+            .iter()
+            .position(|(_, rids, _)| rids.iter().any(|ran| ran == rid))
+            .unwrap_or_else(|| panic!("{rid} never ran"))
+    }
+
+    fn sent(&self, rid: &str) -> (usize, bool) {
+        self.log
+            .iter()
+            .find_map(|event| match event {
+                PoolEvent::Sent {
+                    rid: sent,
+                    plans,
+                    forwarding,
+                } if sent == rid => Some((*plans, *forwarding)),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no lookup of {rid} was sent"))
+    }
+
+    /// The pages `rid`'s answer hit, and the plans run before it.
+    fn answered(&self, rid: &str) -> (usize, usize) {
+        self.log
+            .iter()
+            .find_map(|event| match event {
+                PoolEvent::Answered {
+                    rid: answered,
+                    pages,
+                    plans,
+                } if answered == rid => Some((*pages, *plans)),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no lookup of {rid} was answered"))
+    }
+
+    /// The polls that waited: the requests each waited for, how long at
+    /// most, and the plans run before it.
+    fn waits(&self) -> Vec<(Vec<String>, Duration, usize)> {
+        self.log
+            .iter()
+            .filter_map(|event| match event {
+                PoolEvent::Waited { rids, wait, plans } => Some((rids.clone(), *wait, *plans)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn tokens(&self, rid: &str) -> Vec<i32> {
+        self.outputs
+            .iter()
+            .filter(|output| output.rid == rid)
+            .flat_map(|output| output.output_ids.iter().copied())
+            .collect()
+    }
+}
+
+/// Run `layout`'s ranks on `tiers`, each engine's frontend through its
+/// `stages`, with `pool` behind every rank's pool client if given and as
+/// `pd`'s half of a PD pair if given, until the frontends are gone. A
+/// forward runs for `forward_time` on a device. One run per rank; they share
+/// the pool's log.
+fn run_staged_ranks(
+    layout: Layout,
+    tiers: Tiers,
+    in_flight_depth: usize,
+    forward_time: Duration,
+    pool: Option<FakePool>,
+    pd: Option<Pd>,
+    stages: Vec<Vec<Stage>>,
+) -> Vec<StagedRun> {
+    let (world, tp_size, num_engines) = layout.sizes();
+    assert_eq!((tp_size, stages.len()), (1, num_engines));
+    let pool = pool.map(|pool| Arc::new(Mutex::new(pool)));
+    let setup = Setup {
+        pool: pool.clone(),
+        pd,
+        forward_time,
+        ..Setup::default()
+    };
+    let config = loop_config(in_flight_depth, false, &setup);
+    let (mesh_listeners, addresses) = mesh_listeners(world);
+    let stop = Arc::new(AtomicBool::new(false));
+    let (done, outcomes) = std::sync::mpsc::channel();
+    let ranks: Vec<_> = mesh_listeners
+        .into_iter()
+        .zip(stages)
+        .enumerate()
+        .map(|(rank, (mesh_listener, stages))| {
+            let device = fake_device(layout, rank, &setup);
+            let (plans, prefixes) = (device.plans.clone(), device.prefixes.clone());
+            let (landed_calls, committed_late) =
+                (device.landed_calls.clone(), device.committed_late.clone());
+            let replies = Arc::new(Mutex::new(Vec::new()));
+            let outputs = Arc::new(Mutex::new(Vec::new()));
+            let frontend = StagedFrontend {
+                requests: stages
+                    .iter()
+                    .flat_map(|stage| &stage.messages)
+                    .filter(|message| matches!(message, EngineRequest::Add(_)))
+                    .count(),
+                stages: stages.into(),
+                finished: 0,
+                replies: replies.clone(),
+                outputs: outputs.clone(),
+                plans: plans.clone(),
+                forwarding: device.forwarding.clone(),
+                pool: pool.clone(),
+            };
+            let spec = RankSpec {
+                rank,
+                layout,
+                tiers,
+                config: config.clone(),
+                setup: setup.clone(),
+                mesh_listener,
+                addresses: addresses.clone(),
+            };
+            let (stop, done) = (stop.clone(), done.clone());
+            let thread = thread::spawn(move || {
+                let outcome = run_rank(spec, device, None, || frontend, &stop)
+                    .map_err(|error| error.to_string());
+                done.send(()).unwrap();
+                outcome
+            });
+            (
+                thread,
+                plans,
+                outputs,
+                replies,
+                prefixes,
+                landed_calls,
+                committed_late,
+            )
+        })
+        .collect();
+    for _ in 0..world {
+        if outcomes.recv_timeout(Duration::from_secs(60)).is_err() {
+            stop.store(true, Ordering::Relaxed);
+            let log = pool.map(|pool| pool.lock().unwrap().log.clone());
+            panic!("the staged ranks did not stop by themselves; their pool did {log:?}");
+        }
+    }
+    let log = pool.map_or_else(Vec::new, |pool| pool.lock().unwrap().log.clone());
+    ranks
+        .into_iter()
+        .map(
+            |(thread, plans, outputs, replies, prefixes, landed_calls, committed_late)| {
+                assert_eq!(thread.join().unwrap(), Ok(()));
+                let plans = plans.lock().unwrap().clone();
+                let run = StagedRun {
+                    plans,
+                    log: log.clone(),
+                    outputs: outputs.lock().unwrap().clone(),
+                    replies: replies.lock().unwrap().clone(),
+                    prefixes: prefixes.lock().unwrap().clone(),
+                    landed_calls: *landed_calls.lock().unwrap(),
+                    committed_late: committed_late.lock().unwrap().clone(),
+                };
+                run
+            },
+        )
+        .collect()
+}
+
+/// [`run_staged_ranks`] for one rank.
+fn run_staged(
+    tiers: Tiers,
+    in_flight_depth: usize,
+    forward_time: Duration,
+    pool: Option<FakePool>,
+    stages: Vec<Stage>,
+) -> StagedRun {
+    run_staged_ranks(
+        Layout::Single,
+        tiers,
+        in_flight_depth,
+        forward_time,
+        pool,
+        None,
+        vec![stages],
+    )
+    .remove(0)
+}
+
+/// A request whose prompt is `len` tokens from `first` on, so that prompts
+/// with different `first` share no prefix.
+fn add(rid: &str, first: i32, len: i32, max_new_tokens: i64) -> EngineRequest {
+    EngineRequest::Add(Box::new(TokenizedGenerateReqInput {
+        input_ids: Some((first..first + len).collect()),
+        stream: true,
+        ..TokenizedGenerateReqInput::new(rid, budget(max_new_tokens))
+    }))
+}
+
+#[test]
+fn a_pool_prompt_is_admitted_only_after_its_answer() {
+    let run = run_staged(
+        Tiers::SharedL2,
+        0,
+        Duration::ZERO,
+        Some(FakePool::new(&[("late", Answer::AtPoll(6), 0)])),
+        vec![
+            Stage::send(When::Now, vec![add("running", 1, 64, 30)]),
+            Stage::send(When::Plans(3), vec![add("late", 1000, 64, 4)]),
+        ],
+    );
+    let (sent, _) = run.sent("late");
+    let (_, answered) = run.answered("late");
+    // The other request went on while the lookup was open, and no plan ran
+    // the prompt before its answer; the plan after the answer did.
+    assert!(answered >= sent + 4, "{:?}", run.log);
+    assert_eq!(run.first_plan("late"), answered);
+    assert!(run.plans[sent..answered]
+        .iter()
+        .all(|(_, rids, _)| rids == &["running"]));
+    assert_eq!(run.tokens("late"), [1000, 1001, 1002, 1003]);
+    assert_eq!(run.tokens("running").len(), 30);
+}
+
+#[test]
+fn a_round_waits_for_its_lookups_while_a_forward_runs() {
+    let run = run_staged(
+        Tiers::SharedL2,
+        1,
+        Duration::from_millis(20),
+        Some(FakePool::new(&[("new", Answer::InWait, 0)])),
+        vec![
+            Stage::send(When::Now, vec![add("running", 1, 64, 12)]),
+            Stage::send(When::Plans(4), vec![add("new", 1000, 64, 2)]),
+        ],
+    );
+    // The lookup went out with a forward on the device, and the round that
+    // collected it waited for its answer, which came inside the wait: the
+    // plan of that same round ran the prompt.
+    let (_, forwarding) = run.sent("new");
+    assert!(forwarding);
+    let waits: Vec<_> = run
+        .waits()
+        .into_iter()
+        .filter(|(rids, ..)| rids == &["new"])
+        .collect();
+    let [(_, wait, waited_before)] = &waits[..] else {
+        panic!("{:?}", run.log);
+    };
+    assert_eq!(*wait, LOOKUP_WAIT);
+    assert_eq!(run.answered("new"), (0, *waited_before));
+    assert_eq!(run.first_plan("new"), *waited_before);
+    assert_eq!(run.tokens("new"), [1000, 1001]);
+}
+
+#[test]
+fn a_round_waits_for_its_lookups_when_nothing_else_can_run() {
+    let run = run_staged(
+        Tiers::SharedL2,
+        0,
+        Duration::ZERO,
+        Some(FakePool::new(&[("only", Answer::InWait, 0)])),
+        vec![Stage::send(When::Now, vec![add("only", 1, 64, 2)])],
+    );
+    // The device is idle and its only request waits for the pool: the round
+    // waits, and admits the prompt once the answer came.
+    assert_eq!(run.waits(), [(vec!["only".to_owned()], LOOKUP_WAIT, 0)]);
+    assert_eq!(run.answered("only"), (0, 0));
+    assert_eq!(run.first_plan("only"), 0);
+    assert_eq!(run.tokens("only"), [1000, 1001]);
+}
+
+#[test]
+fn a_rank_that_attention_dp_keeps_in_step_waits_for_its_lookups_too() {
+    // A rank with nothing to run, in step with a peer that forwards: it
+    // takes requests in only at a round head, right before the plan, and
+    // without the wait its prompt would miss that plan by the lookup's
+    // round trip and run a whole round of the peer's later.
+    let runs = run_staged_ranks(
+        Layout::Dp(2),
+        Tiers::SharedL2,
+        0,
+        Duration::ZERO,
+        Some(FakePool::new(&[("new", Answer::InWait, 0)])),
+        None,
+        vec![
+            vec![
+                Stage::send(When::Plans(3), vec![add("new", 1, 64, 2)]),
+                Stage::act(When::Finished(1), |pool| pool.done = true),
+            ],
+            vec![
+                Stage::send(When::Now, vec![add("busy", 5000, 64, 40)]),
+                Stage::act(When::Pool(|pool| pool.done), |_| {}),
+            ],
+        ],
+    );
+    // The round that sent the lookup waited for it, no longer than the
+    // bound; the answer came inside the wait and that round's plan ran the
+    // prompt.
+    let waits: Vec<_> = runs[0]
+        .waits()
+        .into_iter()
+        .filter(|(rids, ..)| rids == &["new"])
+        .collect();
+    let [(_, wait, waited_before)] = &waits[..] else {
+        panic!("{:?}", runs[0].log);
+    };
+    assert_eq!(*wait, LOOKUP_WAIT);
+    assert_eq!(runs[0].answered("new"), (0, *waited_before));
+    assert_eq!(runs[0].first_plan("new"), *waited_before);
+    // Until then the rank ran idle forwards beside its peer's batches.
+    assert!(*waited_before >= 3);
+    assert!(runs[0].plans[..*waited_before]
+        .iter()
+        .all(|(_, rids, _)| rids.is_empty()));
+    assert_eq!(runs[0].tokens("new"), [1000, 1001]);
+}
+
+#[test]
+fn a_rank_in_step_does_not_wait_while_its_idle_device_has_work_to_run() {
+    let runs = run_staged_ranks(
+        Layout::Dp(2),
+        Tiers::SharedL2,
+        0,
+        Duration::ZERO,
+        Some(FakePool::new(&[("new", Answer::AtPoll(2), 0)])),
+        None,
+        vec![
+            vec![
+                Stage::send(When::Now, vec![add("running", 1, 64, 12)]),
+                Stage::send(When::Plans(3), vec![add("new", 1000, 64, 2)]),
+                Stage::act(When::Finished(2), |pool| pool.done = true),
+            ],
+            vec![Stage::act(When::Pool(|pool| pool.done), |_| {})],
+        ],
+    );
+    // As on a lone rank: its other request could run on the idle device,
+    // so the round planned at once and the next one admitted the prompt.
+    assert!(runs[0]
+        .waits()
+        .iter()
+        .all(|(rids, ..)| rids == &["running"]));
+    let (sent, _) = runs[0].sent("new");
+    assert_eq!(runs[0].plans[sent].1, ["running"]);
+    assert_eq!(runs[0].answered("new"), (0, sent + 1));
+    assert_eq!(runs[0].first_plan("new"), sent + 1);
+    // The peer asked the pool nothing and served nothing.
+    assert!(runs[1].outputs.is_empty());
+}
+
+#[test]
+fn a_round_does_not_wait_while_other_work_can_run_on_an_idle_device() {
+    let run = run_staged(
+        Tiers::SharedL2,
+        0,
+        Duration::ZERO,
+        Some(FakePool::new(&[
+            ("running", Answer::AtOnce, 0),
+            ("new", Answer::AtPoll(2), 0),
+        ])),
+        vec![
+            Stage::send(When::Now, vec![add("running", 1, 64, 12)]),
+            Stage::send(When::Plans(3), vec![add("new", 1000, 64, 2)]),
+        ],
+    );
+    // No poll waited for the new prompt's lookup: the device was idle and
+    // the other request could run. The round planned at once, without the
+    // prompt, and the next round admitted it.
+    assert!(run.waits().iter().all(|(rids, ..)| rids == &["running"]));
+    let (sent, forwarding) = run.sent("new");
+    assert!(!forwarding);
+    assert_eq!(run.plans[sent].1, ["running"]);
+    assert_eq!(run.answered("new"), (0, sent + 1));
+    assert_eq!(run.first_plan("new"), sent + 1);
+}
+
+#[test]
+fn a_request_arriving_during_a_forward_is_looked_up_then_and_admitted_next_round() {
+    const FORWARD: Duration = Duration::from_millis(30);
+    let run = run_staged(
+        Tiers::SharedL2,
+        0,
+        FORWARD,
+        Some(FakePool::new(&[])),
+        vec![
+            Stage::send(When::Now, vec![add("running", 1, 64, 3)]),
+            Stage::send(When::Forwarding, vec![add("arriving", 1000, 64, 2)]),
+        ],
+    );
+    // Its lookup left while the first forward ran, and the round after that
+    // forward admitted it, without waiting.
+    assert_eq!(run.sent("arriving"), (1, true));
+    assert_eq!(run.answered("arriving"), (0, 1));
+    assert_eq!(run.first_plan("arriving"), 1);
+    assert!(run.waits().iter().all(|(rids, ..)| rids == &["running"]));
+    assert_eq!(run.tokens("arriving"), [1000, 1001]);
+    // The loop asked for the landing while it took requests in, and each
+    // forward was committed as it landed, not a poll interval later.
+    assert!(run.landed_calls > 0);
+    let late = run.committed_late.iter().max().unwrap();
+    assert!(
+        *late < Duration::from_millis(10),
+        "{:?}",
+        run.committed_late
+    );
+}
+
+#[test]
+fn a_control_operation_arriving_during_a_forward_acts_at_the_next_round_head() {
+    let run = run_staged(
+        Tiers::SharedL2,
+        0,
+        Duration::from_millis(30),
+        Some(FakePool::new(&[])),
+        vec![
+            Stage::send(When::Now, vec![add("running", 1, 64, 3)]),
+            Stage::send(
+                When::Forwarding,
+                vec![
+                    add("before", 1000, 64, 2),
+                    EngineRequest::Control(Box::new(ControlRequest::IsSchedulerPaused(
+                        IsSchedulerPausedReqInput {
+                            rid: None,
+                            http_worker_ipc: None,
+                        },
+                    ))),
+                    add("behind", 2000, 64, 2),
+                ],
+            ),
+        ],
+    );
+    // The request ahead of the control operation is taken in during the
+    // forward; the operation and the request behind it wait for the head of
+    // the next round, in their order.
+    assert_eq!(run.sent("before"), (1, true));
+    assert_eq!(run.sent("behind"), (1, false));
+    assert_eq!(
+        outcome(run.replies.clone()),
+        [("IsSchedulerPausedReqOutput", false)]
+    );
+    assert_eq!(run.tokens("behind"), [1000, 1001]);
+}
+
+#[test]
+fn a_lookup_never_answered_is_a_miss_at_its_deadline_and_its_prompt_computes() {
+    const DEADLINE: Duration = Duration::from_millis(40);
+    let mut pool = FakePool::new(&[("unanswered", Answer::Never, 3)]);
+    pool.deadline = DEADLINE;
+    let started = Instant::now();
+    let run = run_staged(
+        Tiers::SharedL2,
+        0,
+        Duration::ZERO,
+        Some(pool),
+        vec![Stage::send(When::Now, vec![add("unanswered", 1, 64, 2)])],
+    );
+    // The round that sent the lookup waited for it once, no longer than the
+    // bound; the prompt stayed out of every plan until the client gave the
+    // lookup up, then computed from its start.
+    assert_eq!(
+        run.waits(),
+        [(vec!["unanswered".to_owned()], LOOKUP_WAIT, 0)]
+    );
+    assert!(started.elapsed() >= DEADLINE);
+    assert_eq!(run.answered("unanswered"), (0, 0));
+    assert_eq!(run.prefixes, [("unanswered".to_owned(), 0)]);
+    assert!(run
+        .plans
+        .iter()
+        .all(|(_, _, ops)| ops.iter().all(|op| op.kind != CacheOpKind::LoadBack)));
+    assert_eq!(run.tokens("unanswered"), [1000, 1001]);
+}
+
+#[test]
+fn a_pool_hit_loads_its_prefix_and_releases_its_ticket() {
+    let run = run_staged(
+        Tiers::SharedL2,
+        0,
+        Duration::ZERO,
+        Some(FakePool::new(&[("hit", Answer::AtOnce, 3)])),
+        vec![
+            Stage::send(When::Now, vec![add("hit", 1, 64, 2)]),
+            // The load-back's acknowledgment lets go of the proxy blocks.
+            Stage::act(
+                When::Pool(|pool| pool.log.contains(&PoolEvent::Released(1))),
+                |_| {},
+            ),
+        ],
+    );
+    // The prompt resumes behind the three pages the pool holds, which a
+    // load-back reads through the proxy blocks the client was told of.
+    assert_eq!(run.answered("hit"), (3, 0));
+    assert_eq!(run.prefixes, [("hit".to_owned(), 48)]);
+    assert!(run.log.contains(&PoolEvent::Mapped(1, 3)));
+    let (_, _, ops) = &run.plans[run.first_plan("hit")];
+    assert_eq!(
+        ops.iter().map(|op| op.kind).collect::<Vec<_>>(),
+        [CacheOpKind::LoadBack]
+    );
+    assert_eq!(run.tokens("hit"), [1000, 1001]);
+}
+
+#[test]
+fn a_ticket_a_plan_released_is_not_named_to_the_client_again() {
+    let run = run_staged(
+        Tiers::SharedL2,
+        0,
+        Duration::ZERO,
+        Some(FakePool::new(&[
+            ("first", Answer::AtOnce, 3),
+            ("second", Answer::AtOnce, 3),
+        ])),
+        vec![
+            Stage::send(When::Now, vec![add("first", 1, 64, 2)]),
+            Stage::send(
+                When::Pool(|pool| pool.log.contains(&PoolEvent::Released(1))),
+                vec![add("second", 5000, 64, 2)],
+            ),
+            Stage::act(
+                When::Pool(|pool| pool.log.contains(&PoolEvent::Released(2))),
+                |_| {},
+            ),
+        ],
+    );
+    // The first hit's ticket was released before the second prompt came. A
+    // poll that still named it would be told that no load may start, as for
+    // a lost lease, and the second prompt would compute what the pool holds.
+    assert_eq!(
+        run.prefixes,
+        [("first".to_owned(), 48), ("second".to_owned(), 48)]
+    );
+    assert_eq!(run.tokens("second"), [1000, 1001]);
+}
+
+#[test]
+fn a_lookup_whose_prompt_left_before_the_answer_is_not_waited_for() {
+    // A prefill node's prompt whose transfer breaks while its lookup is
+    // open: the scheduler ends the request, and no answer ever comes.
+    let wire = Arc::new(Mutex::new(Wire {
+        prefill_ranks: 1,
+        ..Wire::default()
+    }));
+    wire.lock().unwrap().rooms.insert(
+        70,
+        WireRoom {
+            fails: true,
+            ..WireRoom::default()
+        },
+    );
+    let run = run_staged_ranks(
+        Layout::Single,
+        Tiers::SharedL2,
+        0,
+        Duration::ZERO,
+        Some(FakePool::new(&[("left", Answer::Never, 0)])),
+        Some(Pd {
+            role: Role::Prefill,
+            wire,
+        }),
+        vec![vec![
+            Stage::send(
+                When::Now,
+                vec![EngineRequest::Add(Box::new(disaggregated(
+                    "left", 70, 64, 2,
+                )))],
+            ),
+            // The run ends once the engine is idle. A lookup it still
+            // counted as open would keep it polling the client instead,
+            // until the client gave the lookup up.
+            Stage::act(When::Idle, |_| {}),
+        ]],
+    )
+    .remove(0);
+    // The owner was told to forget the lookup, and the prompt never ran.
+    assert!(
+        run.log
+            .iter()
+            .any(|event| matches!(event, PoolEvent::Abandoned(_))),
+        "{:?}",
+        run.log
+    );
+    assert!(run.prefixes.is_empty());
+}
+
+fn flush() -> EngineRequest {
+    EngineRequest::Control(Box::new(ControlRequest::FlushCache(FlushCacheReqInput {
+        rid: None,
+        http_worker_ipc: None,
+    })))
+}
+
+#[test]
+fn a_pool_write_pins_its_blocks_until_the_client_reports_it_even_while_frozen() {
+    let mut pool = FakePool::new(&[]);
+    pool.finish_writes = false;
+    let run = run_staged(
+        Tiers::SharedL2,
+        0,
+        Duration::ZERO,
+        Some(pool),
+        vec![
+            Stage::send(When::Now, vec![add("writer", 1, 64, 2)]),
+            // The request is gone, but what it published is on its way to
+            // the pool: a flush cannot drop the blocks the write reads.
+            Stage::send(
+                When::Finished(1),
+                vec![EngineRequest::Control(Box::new(pause("keep"))), flush()],
+            ),
+            Stage::act(When::Replies(2), |pool| pool.finish_writes = true),
+            // The frozen rounds took the completions to the scheduler.
+            Stage::send(
+                When::Pool(|pool| {
+                    pool.writes.is_empty() && pool.log.contains(&PoolEvent::WriteDone)
+                }),
+                vec![flush()],
+            ),
+            Stage::send(
+                When::Replies(3),
+                vec![EngineRequest::Control(Box::new(resume()))],
+            ),
+            Stage::act(When::Replies(4), |_| {}),
+        ],
+    );
+    assert_eq!(
+        outcome(run.replies.clone()),
+        [
+            ("PauseSchedulerReqOutput", true),
+            ("FlushCacheReqOutput", false),
+            ("FlushCacheReqOutput", true),
+            ("ResumeSchedulerReqOutput", true),
+        ]
+    );
+    // The write carried the pages the prompt published.
+    let wrote: Vec<usize> = run
+        .log
+        .iter()
+        .filter_map(|event| match event {
+            PoolEvent::Wrote { blocks, .. } => Some(*blocks),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(wrote, [4], "{:?}", run.log);
+    assert_eq!(run.tokens("writer"), [1000, 1001]);
+}
+
+#[test]
+fn a_pool_write_starts_only_once_the_forward_that_fills_its_blocks_landed() {
+    // One forward ahead of its commit, and a prompt of three chunks: the
+    // plan that carries the write of a chunk's pages is made while the
+    // forward that computes them is still on the device.
+    let run = run_staged(
+        Tiers::SharedL2,
+        1,
+        Duration::from_millis(20),
+        Some(FakePool::new(&[])),
+        vec![Stage::send(
+            When::Now,
+            vec![add("writer", 1, 2 * MAX_SCHEDULED_TOKENS as i32 + 64, 4)],
+        )],
+    );
+    let prefill = run.first_plan("writer");
+    assert_eq!(prefill, 0);
+    let started: Vec<(usize, usize)> = run
+        .log
+        .iter()
+        .filter_map(|event| match event {
+            PoolEvent::Wrote { blocks, commits } => Some((*blocks, *commits)),
+            _ => None,
+        })
+        .collect();
+    // The client reads the Device blocks at once, beside the device's
+    // streams. Each chunk's pages go in a write of their own, in the plan
+    // after the chunk's: the client got the k-th write only once the k-th
+    // forward was committed, not merely the first.
+    assert_eq!(
+        started
+            .iter()
+            .map(|(blocks, _)| *blocks)
+            .collect::<Vec<_>>()[..3],
+        [16, 16, 4],
+        "{:?}",
+        run.log
+    );
+    for (write, (_, commits)) in started.iter().enumerate() {
+        assert!(*commits > write, "write {write}: {:?}", run.log);
+    }
+    assert_eq!(run.tokens("writer"), [1000, 1001, 1002, 1003]);
+}
+
+/// Eight requests that fill the engine's batch slots for a while, then
+/// `waiting`, whose three pool pages are answered while it waits for a
+/// slot.
+fn waiting_hit(act: fn(&mut FakePool)) -> StagedRun {
+    let mut fill: Vec<EngineRequest> = (0..8)
+        .map(|i| add(&format!("fill-{i}"), 10_000 * (i + 1), 32, 24))
+        .collect();
+    fill.push(add("waiting", 1, 64, 2));
+    run_staged(
+        Tiers::SharedL2,
+        0,
+        Duration::ZERO,
+        Some(FakePool::new(&[("waiting", Answer::AtOnce, 3)])),
+        vec![
+            Stage::send(When::Now, fill),
+            Stage::act(
+                When::Pool(|pool| {
+                    pool.log
+                        .iter()
+                        .any(|e| matches!(e, PoolEvent::Answered { pages: 3, .. }))
+                }),
+                act,
+            ),
+            Stage::act(
+                When::Pool(|pool| pool.log.contains(&PoolEvent::Released(1))),
+                |_| {},
+            ),
+        ],
+    )
+}
+
+#[test]
+fn a_lost_lease_gives_up_the_hits_that_wait_for_admission() {
+    // With the lease, the prompt loads the pool's pages once a slot frees.
+    let kept = waiting_hit(|_| {});
+    assert_eq!(kept.answered("waiting").0, 3);
+    assert!(kept.first_plan("waiting") > 8, "it waited for a slot");
+    assert!(kept.prefixes.contains(&("waiting".to_owned(), 48)));
+
+    // Without it, the hit is given up before any plan could load from it:
+    // the owner is told to unpin, and the prompt computes from its start.
+    let lost = waiting_hit(|pool| pool.lease = false);
+    assert_eq!(lost.answered("waiting").0, 3);
+    assert!(lost.prefixes.contains(&("waiting".to_owned(), 0)));
+    assert!(lost
+        .plans
+        .iter()
+        .all(|(_, _, ops)| ops.iter().all(|op| op.kind != CacheOpKind::LoadBack)));
+    assert!(lost.log.contains(&PoolEvent::Released(1)));
+    assert!(lost.first_plan("waiting") > 8);
+    assert_eq!(lost.tokens("waiting"), [1000, 1001]);
+}
+
+#[test]
+fn a_lost_lease_stops_the_loads_only_until_the_client_reports_it_back() {
+    let run = run_staged(
+        Tiers::SharedL2,
+        0,
+        Duration::ZERO,
+        Some(FakePool::new(&[
+            ("lost", Answer::AtOnce, 3),
+            ("back", Answer::AtOnce, 3),
+        ])),
+        vec![
+            Stage::act(When::Now, |pool| pool.lease = false),
+            Stage::send(When::Now, vec![add("lost", 1, 64, 2)]),
+            Stage::act(When::Finished(1), |pool| pool.lease = true),
+            Stage::send(When::Now, vec![add("back", 5000, 64, 2)]),
+            Stage::act(
+                When::Pool(|pool| pool.log.contains(&PoolEvent::Released(2))),
+                |_| {},
+            ),
+        ],
+    );
+    // Both lookups hit. The first answer came without the lease, so its
+    // prompt computed; the scheduler did not keep that state past the poll
+    // that reported the lease held, and the second prompt loaded its pages.
+    assert_eq!(run.answered("lost").0, 3);
+    assert_eq!(run.answered("back").0, 3);
+    assert_eq!(
+        run.prefixes,
+        [("lost".to_owned(), 0), ("back".to_owned(), 48)]
+    );
+    let loads = |rid: &str| {
+        let (_, _, ops) = &run.plans[run.first_plan(rid)];
+        ops.iter()
+            .filter(|op| op.kind == CacheOpKind::LoadBack)
+            .count()
+    };
+    assert_eq!((loads("lost"), loads("back")), (0, 1));
+    assert!(run.log.contains(&PoolEvent::Released(1)));
+}
+
+#[test]
+fn an_answer_the_scheduler_refuses_is_a_miss_and_its_ticket_goes_back() {
+    let run = run_staged(
+        Tiers::SharedL2,
+        0,
+        Duration::ZERO,
+        Some(FakePool::new(&[("misfit", Answer::Misfit, 3)])),
+        vec![Stage::send(When::Now, vec![add("misfit", 1, 64, 2)])],
+    );
+    // The scheduler took nothing of the answer: the prompt computes, the
+    // lookup is abandoned at the owner, and the client gets the answer's
+    // ticket back, which no plan would ever release.
+    assert_eq!(run.answered("misfit"), (3, 0));
+    assert_eq!(run.prefixes, [("misfit".to_owned(), 0)]);
+    assert!(run.log.contains(&PoolEvent::Released(1)), "{:?}", run.log);
+    assert!(run
+        .log
+        .iter()
+        .any(|event| matches!(event, PoolEvent::Abandoned(_))));
+    assert!(!run
+        .log
+        .iter()
+        .any(|event| matches!(event, PoolEvent::Mapped(..))));
+    assert_eq!(run.tokens("misfit"), [1000, 1001]);
+}
+
+#[test]
+fn with_a_pool_weight_loads_and_forward_reloads_are_refused_as_they_arrive() {
+    let reload = ControlRequest::ReloadForward(ReloadForwardReqInput {
+        rid: None,
+        http_worker_ipc: None,
+        mode: "abort".to_owned(),
+        modules: None,
+        id: Some("pool".to_owned()),
+        timeout_s: None,
+    });
+    let run = run_staged(
+        Tiers::SharedL2,
+        0,
+        Duration::ZERO,
+        Some(FakePool::new(&[])),
+        vec![
+            Stage::send(When::Now, vec![add("running", 1, 64, 30)]),
+            Stage::send(
+                When::Plans(3),
+                vec![EngineRequest::Control(Box::new(reload))],
+            ),
+            Stage::send(
+                When::Finished(1),
+                vec![EngineRequest::Control(Box::new(disk_load()))],
+            ),
+            Stage::send(When::Replies(2), vec![add("again", 1, 64, 2)]),
+        ],
+    );
+    assert_eq!(
+        outcome(run.replies.clone()),
+        [
+            ("ReloadForwardReqOutput", false),
+            ("UpdateWeightFromDiskReqOutput", false),
+        ]
+    );
+    for reply in &run.replies {
+        let message = match reply {
+            ControlOutput::ReloadForward(reply) => &reply.message,
+            ControlOutput::UpdateWeightFromDisk(reply) => &reply.message,
+            other => panic!("unexpected {}", other.tag()),
+        };
+        assert!(message.contains("shared L2 pool"), "{message}");
+    }
+    // Neither drained nor flushed anything: the abort-mode reload left the
+    // running request alone, and the same prompt still resumes behind its
+    // pages on the Device.
+    assert_eq!(run.tokens("running").len(), 30);
+    assert!(run.prefixes.contains(&("again".to_owned(), 48)));
+    assert_eq!(run.tokens("again"), [1000, 1001]);
+}
+
+#[test]
+fn without_a_pool_the_loop_takes_nothing_in_during_a_forward() {
+    let run = run_staged(
+        Tiers::DeviceOnly,
+        0,
+        Duration::from_millis(20),
+        None,
+        vec![
+            Stage::send(When::Now, vec![add("running", 1, 64, 3)]),
+            Stage::send(When::Plans(1), vec![add("arriving", 1000, 64, 2)]),
+        ],
+    );
+    // The loop never asked whether a forward landed: it waited in the
+    // commit, as it always did, and received the request at the next head.
+    assert_eq!(run.landed_calls, 0);
+    assert_eq!(run.first_plan("arriving"), 1);
+    assert_eq!(run.tokens("arriving"), [1000, 1001]);
 }

@@ -97,6 +97,7 @@ def _config(args: ServerArgs, specs):
         overlap_schedule_depth=0,
         enable_kv_cache_events=False,
         prefix_replay_tokens=0,
+        shared_l2_config=None,
     )
 
 
@@ -111,6 +112,31 @@ def test_an_engine_without_l3_passes_no_prefetch_threshold():
     assert cfg.disable_l2_cache is False and cfg.num_host_pages == 17
     assert cfg.host_write_policy == ts.SchedulerConfig.HostWritePolicy.WriteThrough
     assert (cfg.num_snapshot_pages, cfg.max_retracted_requests) == (5, 8)
+
+
+def test_a_shared_l2_pools_write_limits_reach_the_scheduler_config():
+    args = ServerArgs(model="x", max_num_seqs=8)
+    # A pool requires --disable-kvstore.
+    args.enable_kvstore = False
+    specs = _specs(num_host_pages=17, num_snapshot_pages=1, max_retracted=0)
+    without = _config(args, specs)
+    assert without.shared_l2_config is None and without.disable_l2_cache is True
+    cfg = scheduler_config_from_args(
+        args,
+        specs,
+        storage_config=None,
+        max_scheduled_tokens=args.chunked_prefill_size,
+        max_batch_size=8,
+        decode_input_tokens=1,
+        overlap_schedule_depth=0,
+        enable_kv_cache_events=False,
+        prefix_replay_tokens=0,
+        shared_l2_config=ts.SharedL2Config(max_writes=3, max_write_keys=16),
+    )
+    limits = cfg.shared_l2_config
+    assert (limits.max_writes, limits.max_write_keys) == (3, 16)
+    # The pool is the Host L2: the local one is off, the proxy tier stays.
+    assert cfg.disable_l2_cache is False and cfg.num_host_pages == 17
 
 
 @pytest.mark.parametrize("enabled", [False, True])

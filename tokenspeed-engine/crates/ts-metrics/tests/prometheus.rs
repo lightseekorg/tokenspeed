@@ -33,7 +33,8 @@ use std::{
 
 use ts_metrics::{
     EngineLabels, EngineMetrics, Exporter, KvTransferMetrics, L3ExecutorSnapshot, L3Labels,
-    L3Metrics, L3OperationSnapshot, L3SchedulerStats, MetricEvent, MetricsConfig,
+    L3Metrics, L3OperationSnapshot, L3SchedulerStats, MetricEvent, MetricsConfig, SharedL2Metrics,
+    SharedL2Stats,
 };
 
 fn fixtures() -> PathBuf {
@@ -404,6 +405,118 @@ fn l3_snapshots_export_their_growth_once_and_keep_quarantine_visible() {
             &[("resource", "pressure_gate_closed")],
             1.0,
         ),
+    ] {
+        let mut labels: Vec<(&str, &str)> = rank.iter().chain(extra).copied().collect();
+        labels.sort_unstable();
+        let rendered_labels: Vec<String> = labels
+            .iter()
+            .map(|(name, value)| format!("{name}=\"{value}\""))
+            .collect();
+        let line = format!("{metric}{{{}}} {value:?}", rendered_labels.join(","));
+        assert!(rendered.contains(&line), "no {line} in:\n{rendered}");
+    }
+    std::fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn shared_l2_totals_export_their_growth_and_gauges_their_last_value() {
+    let directory = scratch_dir("shared-l2");
+    let exporter = Exporter::new(&MetricsConfig {
+        prometheus_dir: Some(directory.clone()),
+        relay_endpoint: None,
+    })
+    .unwrap();
+    let mut metrics = SharedL2Metrics::new(
+        &exporter,
+        &EngineLabels {
+            model_name: "m".to_owned(),
+            app_key: String::new(),
+            dp_rank: 2,
+        },
+    );
+    let first = SharedL2Stats {
+        lookups: 10.0,
+        hits: 4.0,
+        lookup_timeouts: 1.0,
+        failed_writes: 1.0,
+        failed_write_blocks: 8.0,
+        dropped_write_blocks: 8.0,
+        pending_lookups: 3.0,
+        tickets: 2.0,
+        writes_in_flight: 1.0,
+        no_pool: true,
+        ..SharedL2Stats::default()
+    };
+    // Totals are cumulative: the same observation twice adds nothing.
+    metrics.record(&first);
+    metrics.record(&first);
+    metrics.record(&SharedL2Stats {
+        lookups: 12.0,
+        abandoned_lookups: 1.0,
+        proxy_overflows: 1.0,
+        lease_expired_hits: 2.0,
+        dropped_write_blocks: 20.0,
+        pending_lookups: 0.0,
+        tickets: 0.0,
+        writes_in_flight: 0.0,
+        no_pool: false,
+        ..first
+    });
+    drop(metrics);
+    let Some(rendered) = render(&directory) else {
+        return;
+    };
+    let rank = [("app_key", ""), ("dp_rank", "2"), ("model_name", "m")];
+    for (metric, extra, value) in [
+        (
+            "tokenspeed:shared_l2_lookups_total",
+            &[("event", "sent")][..],
+            12.0,
+        ),
+        (
+            "tokenspeed:shared_l2_lookups_total",
+            &[("event", "hit")],
+            4.0,
+        ),
+        (
+            "tokenspeed:shared_l2_lookups_total",
+            &[("event", "timeout")],
+            1.0,
+        ),
+        (
+            "tokenspeed:shared_l2_lookups_total",
+            &[("event", "abandoned")],
+            1.0,
+        ),
+        (
+            "tokenspeed:shared_l2_lookups_total",
+            &[("event", "proxy_overflow")],
+            1.0,
+        ),
+        (
+            "tokenspeed:shared_l2_lookups_total",
+            &[("event", "lease_expired")],
+            2.0,
+        ),
+        ("tokenspeed:shared_l2_failed_writes_total", &[], 1.0),
+        ("tokenspeed:shared_l2_failed_write_blocks_total", &[], 8.0),
+        ("tokenspeed:shared_l2_dropped_write_blocks_total", &[], 20.0),
+        (
+            "tokenspeed:shared_l2_resources",
+            &[("resource", "pending_lookups")],
+            0.0,
+        ),
+        (
+            "tokenspeed:shared_l2_resources",
+            &[("resource", "tickets")],
+            0.0,
+        ),
+        (
+            "tokenspeed:shared_l2_resources",
+            &[("resource", "writes_in_flight")],
+            0.0,
+        ),
+        ("tokenspeed:shared_l2_no_pool", &[], 0.0),
     ] {
         let mut labels: Vec<(&str, &str)> = rank.iter().chain(extra).copied().collect();
         labels.sort_unstable();

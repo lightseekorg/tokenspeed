@@ -1447,6 +1447,21 @@ carry the `model_name` and `app_key` labels:
 | `tokenspeed:kv_transfer_timeouts_total` | Counter | Transfers that timed out, with a bounded `stage` label: `bootstrapping` (prefill never received the cache manifest; `TOKENSPEED_DISAGGREGATION_BOOTSTRAP_TIMEOUT`) or `waiting_for_input` (decode never received the transfer-done signal; `TOKENSPEED_DISAGGREGATION_WAITING_TIMEOUT`). |
 | `tokenspeed:kv_transfer_failures_total` | Counter | Transfers aborted on failure: send failures on the prefill node, and rooms failed on prefill-node loss (heartbeat) on the decode node. Timeouts are counted separately. |
 
+### Shared L2 pool metrics
+
+A rank whose Host tier is a shared L2 pool (`--shared-l2-config`) records the
+pool's metrics when metrics are enabled. All carry the `model_name`,
+`app_key` and `dp_rank` labels:
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `tokenspeed:shared_l2_lookups_total` | Counter | Pool lookups of waiting prompts, with a bounded `event` label. The events overlap; do not sum them. `sent`: every lookup handed to the pool's client. `hit`: answers that pinned pool pages; among them `proxy_overflow` (the rank's proxy Host tier had no room for the hit) and `lease_expired` (the hit was given up before admission because the rank's lease on the owner's pins was lost), whose prompts were computed instead. `timeout`: misses the client answered at the lookup deadline. `abandoned`: lookups that ended without an answer (the request left first, or the scheduler refused the answer). |
+| `tokenspeed:shared_l2_failed_writes_total` | Counter | Pool writes whose completion reported a failure to the scheduler. A failed write puts nothing in the pool, with one exception: a write whose commit the owner carried out, but did not answer within `request_timeout_ms`, counts here although the pool holds its blocks. Serving goes on. |
+| `tokenspeed:shared_l2_failed_write_blocks_total` | Counter | The blocks those writes carried, counted when the scheduler takes a write's completion. The same blocks as `tokenspeed:shared_l2_dropped_write_blocks_total`, counted later; do not add the two. |
+| `tokenspeed:shared_l2_dropped_write_blocks_total` | Counter | Blocks of the pool writes that failed (at the reservation, the copy or the commit) or were dropped while the rank served without the pool, counted by the pool's client when the write ends. The same blocks as `tokenspeed:shared_l2_failed_write_blocks_total`, counted earlier; do not add the two. |
+| `tokenspeed:shared_l2_resources` | Gauge | What the rank has open at the pool now, with a bounded `resource` label: `pending_lookups`, `tickets` (hits not released yet), `writes_in_flight`. |
+| `tokenspeed:shared_l2_no_pool` | Gauge | 1 while the rank serves without the pool (its owner does not know the rank or has not answered for `no_pool_after_s`), else 0. |
+
 ## TokenSpeed-specific runtime knobs
 
 These parameters are TokenSpeed-specific. They expose runtime
@@ -1895,9 +1910,12 @@ instance runs without a retraction snapshot pool and refuses the
 `--retraction-snapshot-*` and `--debug-force-retraction-interval` overrides.
 `--enable-startup-requests` is refused: the flush after the startup requests
 clears the rank's own caches, so their prefixes would stay in the pool.
-Do not hot-update weights in a deployment with a pool: a rank is admitted by
-the checkpoint it loaded at start, and the pool would go on serving KV of the
-old weights.
+Weight loads (`update_weights_from_distributed`, `update_weights_from_disk`,
+`update_weights_from_mooncake`) and forward reloads (`reload_forward`) are
+refused on a rank with a pool, with the message "a shared L2 pool holds KV of
+the weights and forward the server started with; restart the ranks and clear
+the pool instead": a rank is admitted by the checkpoint it loaded at start,
+and the pool would go on serving KV of the old weights or the old forward.
 
 Two services run beside the engines (`python -m
 tokenspeed.runtime.cache.shared_l2`); nothing starts them for you. Start the
@@ -2014,8 +2032,11 @@ A rank pings the owner when it has not heard it for a third of the shorter of
 `lease_s` and `no_pool_after_s`.
 
 A prompt's lookup goes out when the engine takes the request in, also while a
-forward is awaited on a replica of one rank. Measured on GB300, a lookup's
-round trip takes 0.55 ms at the median and 1.7 ms at most.
+forward is awaited on a replica of one rank. Before it plans, the loop waits
+up to 2 ms for the answers it has just asked for, where that leaves no device
+idle; a rank that is idle while its attention-DP peers forward is covered by
+that wait. Measured on GB300, a lookup's round trip takes 0.55 ms at the
+median and 1.7 ms at most.
 
 How a rank behaves when something fails:
 
@@ -2026,7 +2047,7 @@ How a rank behaves when something fails:
 | A release, an abandon or a ping is not answered | It is sent again until it is. |
 | The owner answers with what is no reply (it cannot be decoded, or lacks a field of a reply) | The request counts as refused and the owner as not heard: a lookup is a miss, a write fails, and a release or an abandon is dropped with a warning in the log, so what it would have freed stays held until the owner drops the rank (`--client-timeout-s`). Such answers renew no lease, and after `no_pool_after_s` of them the rank serves without the pool. |
 | No answer from the owner for `lease_s`: the rank's lease on the owner's pins is lost, until the owner answers again | While the lease is lost the scheduler plans no load from the pool and drops the hits the waiting prompts hold: those prompts are computed, and a prompt admitted meanwhile reuses the rank's own GPU cache only. A load already planned still starts, up to `load_start_margin_s` after the lease ran out. |
-| The owner is paused or gone (no answer for `no_pool_after_s`), or it no longer knows the rank (it restarted, or dropped the rank) | Requests keep completing, as misses. The rank serves without the pool: lookups miss at once, writes are dropped. A load planned before still starts, until `lease_s + load_start_margin_s` after the owner's last answer, from the providers of the pool the rank left. The rank keeps saying hello and joins again by itself, as a new client, once the owner and all its providers are back. |
+| The owner is paused or gone (no answer for `no_pool_after_s`), or it no longer knows the rank (it restarted, or dropped the rank) | Requests keep completing, as misses. The rank serves without the pool (`tokenspeed:shared_l2_no_pool` is 1): lookups miss at once, writes are dropped. A load planned before still starts, until `lease_s + load_start_margin_s` after the owner's last answer, from the providers of the pool the rank left. The rank keeps saying hello and joins again by itself, as a new client, once the owner and all its providers are back. |
 | A load of an admitted prompt fails: a provider died or an RDMA read failed (reported after the RDMA retries, some seconds), or the load could not start within `lease_s + load_start_margin_s` of the owner's last answer | The rank's engine stops, as for a failed forward: that forward already depends on the pages, and none of its results is returned. Under attention DP the other ranks of the instance stop with it (they report that a rank left the mesh). One dead provider therefore stops every instance that is loading from it. |
 
 A pool thus adds one way for an engine to stop that a Host L2 does not have:

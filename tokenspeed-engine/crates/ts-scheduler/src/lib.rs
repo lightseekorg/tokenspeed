@@ -443,6 +443,155 @@ mod ffi {
         available: i32,
     }
 
+    /// A cache key as a shared L2 pool's owner names it (`CacheKey`).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct SharedL2KeyView {
+        /// The key's namespace.
+        namespace_id: u32,
+        /// The cache group, by index.
+        group_id: u32,
+        /// The prefix page's content hash.
+        content_hash: String,
+        /// The block's ordinal within its prefix page.
+        page_offset: i32,
+    }
+
+    /// A waiting prompt's question to the shared L2 pool (`SharedL2Lookup`).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct SharedL2LookupView {
+        /// The id its answer names.
+        lookup_id: u64,
+        /// The prompt's request.
+        request_id: String,
+        /// The chain hashes of the prompt's full pages below `max_tokens`.
+        prefix_hashes: Vec<String>,
+        /// The prompt's first `max_tokens` tokens.
+        tokens: Vec<i32>,
+        /// The most tokens a hit may cover.
+        max_tokens: i32,
+    }
+
+    /// The pool's answer to a lookup (`SharedL2LookupResult`): its longest
+    /// reusable prefix of the prompt, pinned under `ticket`.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct SharedL2AnswerView {
+        /// The lookup it answers.
+        lookup_id: u64,
+        /// What the owner pinned the hit under; 0 pins nothing (a miss).
+        ticket: u64,
+        /// The tokens the hit resumes from.
+        num_tokens: i32,
+        /// How far the pool's KV reaches.
+        kv_tokens: i32,
+        /// Tokens of the hit's partial last page; 0 when it ends on a page.
+        tail_tokens: i32,
+        /// The partial last page's hash, with `tail_tokens`.
+        tail_hash: String,
+        /// The hit's keys.
+        keys: Vec<SharedL2KeyView>,
+        /// Each key's shard.
+        buckets: Vec<i32>,
+        /// Each key's pool page.
+        pages: Vec<i32>,
+    }
+
+    /// A proxy Host block an answer created, and the pool page a load-back
+    /// from it reads (`SharedL2ProxyPage`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct SharedL2PageView {
+        /// The cache group, by index.
+        group_id: u32,
+        /// The proxy Host block.
+        block: i32,
+        /// The page's shard.
+        bucket: i32,
+        /// The pool page, within the group.
+        page: i32,
+    }
+
+    /// A State checkpoint's lineage, which a pool write commits with the
+    /// checkpoint's block (`SharedL2Publication`).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct SharedL2PublicationView {
+        /// The checkpoint's tokens.
+        tokens: Vec<i32>,
+        /// The chain hashes of its full pages.
+        prefix_hashes: Vec<String>,
+        /// Tokens of its partial last page; 0 when it ends on a page.
+        tail_tokens: i32,
+        /// The partial last page's hash, with `tail_tokens`.
+        tail_hash: String,
+        /// The request that published it, as the owner tells requests apart.
+        publisher: u64,
+    }
+
+    /// The kind of a plan's shared L2 pool command.
+    #[derive(Debug)]
+    enum SharedL2OpKind {
+        /// Copy Device blocks into the pool (`SharedL2WriteOperation`).
+        Write,
+        /// Unpin what a lookup hit (`SharedL2ReleaseOperation`).
+        Release,
+        /// Refresh the pool's copies of keys (`SharedL2TouchOperation`).
+        Touch,
+        /// Forget a lookup nothing waits for (`SharedL2AbandonOperation`).
+        Abandon,
+    }
+
+    /// A shared L2 pool command a plan carries, for the rank's pool client.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct SharedL2OpView {
+        /// What it does.
+        kind: SharedL2OpKind,
+        /// A write's id, a release's ticket, an abandon's lookup id; unused
+        /// by a touch.
+        id: u64,
+        /// A write's or a touch's keys.
+        keys: Vec<SharedL2KeyView>,
+        /// A write's shard per key.
+        buckets: Vec<i32>,
+        /// A write's source Device block per key.
+        blocks: Vec<i32>,
+        /// The checkpoints among a write's blocks.
+        publications: Vec<SharedL2PublicationView>,
+    }
+
+    /// A pool write that ended (`cache::SharedL2WriteDone`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct SharedL2WriteDoneView {
+        /// The write.
+        write_id: u64,
+        /// It was committed; else given up.
+        success: bool,
+    }
+
+    /// The scheduler's observations of its shared L2 pool (`SharedL2Stats`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    struct SharedL2StatsView {
+        /// Lookups handed out, cumulative.
+        lookups: u64,
+        /// Answers that pinned something at the owner, cumulative; the two
+        /// kinds of hit below are among them.
+        hits: u64,
+        /// Lookups that ended without an answer applied, cumulative: given
+        /// up by the runtime, or left by their request.
+        abandoned_lookups: u64,
+        /// Hits the proxy Host tier had no room for, cumulative.
+        proxy_overflows: u64,
+        /// Hits waiting prompts gave up for a lost lease, cumulative.
+        lease_expired_hits: u64,
+        /// Lookups not answered.
+        pending_lookups: u64,
+        /// Owner tickets not released.
+        tickets: u64,
+        /// Writes not completed.
+        writes_in_flight: u64,
+        /// Writes reported failed, cumulative.
+        failed_writes: u64,
+        /// The blocks those writes carried, cumulative.
+        failed_write_blocks: u64,
+    }
+
     unsafe extern "C++" {
         include!("ts-scheduler/cxx/facade.h");
 
@@ -464,6 +613,7 @@ mod ffi {
             cancellations: &[StorageCancellationView],
             done: &[StorageDoneView],
             cache_events: &[CacheEvent],
+            pool_writes: &[SharedL2WriteDoneView],
         ) -> Result<()>;
         fn demote_sessions(
             scheduler: Pin<&mut Scheduler>,
@@ -510,6 +660,17 @@ mod ffi {
         fn clear_l1_cache(scheduler: Pin<&mut Scheduler>) -> bool;
         fn can_clear_cache(scheduler: &Scheduler) -> bool;
         fn max_single_request_tokens(scheduler: &Scheduler) -> i32;
+        fn shared_l2_lookups(scheduler: Pin<&mut Scheduler>) -> Vec<SharedL2LookupView>;
+        fn apply_shared_l2_lookup(
+            scheduler: Pin<&mut Scheduler>,
+            answer: &SharedL2AnswerView,
+        ) -> Result<Vec<SharedL2PageView>>;
+        fn abandon_shared_l2_lookups(
+            scheduler: Pin<&mut Scheduler>,
+            lookup_ids: &[u64],
+        ) -> Result<()>;
+        fn set_shared_l2_lease_lost(scheduler: Pin<&mut Scheduler>, lost: bool) -> Result<()>;
+        fn shared_l2_stats(scheduler: &Scheduler) -> SharedL2StatsView;
 
         fn plan_forward_batches(plan: &ExecutionPlan) -> Vec<ForwardBatchView>;
         fn plan_needs_device(plan: &ExecutionPlan) -> bool;
@@ -521,6 +682,7 @@ mod ffi {
         fn plan_aborts(plan: &ExecutionPlan) -> Vec<SchedulerAbortView>;
         fn plan_cache_ops(plan: &ExecutionPlan) -> Vec<CacheOpView>;
         fn plan_storage_ops(plan: &ExecutionPlan) -> Vec<StorageOpView>;
+        fn plan_shared_l2_ops(plan: &ExecutionPlan) -> Vec<SharedL2OpView>;
 
         /// Install the scheduler's profile span sink, which forwards to
         /// [`record_scheduler_span`], or remove it.
@@ -536,7 +698,9 @@ mod ffi {
 pub use ffi::{
     BlockTableView, CacheEvent, CacheEventKind, CacheGroupPages, CacheOpKind, CacheOpView,
     ForwardBatchView, ForwardEvent, ForwardEventKind, KvEventView, PrefillGateProbe, PrefixHitView,
-    RequestSpec, SchedulerAbortView, SchedulerSizes, StorageCancellationView, StorageDoneView,
+    RequestSpec, SchedulerAbortView, SchedulerSizes, SharedL2AnswerView, SharedL2KeyView,
+    SharedL2LookupView, SharedL2OpKind, SharedL2OpView, SharedL2PageView, SharedL2PublicationView,
+    SharedL2StatsView, SharedL2WriteDoneView, StorageCancellationView, StorageDoneView,
     StorageKeyView, StorageOpKind, StorageOpView, StorageStatsView, StorageTickView,
     TransferBatchView,
 };
@@ -688,12 +852,13 @@ impl Scheduler {
         ffi::advance(self.pinned(), events)
     }
 
-    /// Feed the round head's storage events and cache-op acknowledgments
-    /// back, as one event batch.
+    /// Feed the round head's storage events, cache-op acknowledgments and,
+    /// with a shared L2 pool, its finished writes back, as one event batch.
     pub fn advance_head(
         &mut self,
         storage: &StorageRound,
         cache_events: &[CacheEvent],
+        pool_writes: &[SharedL2WriteDoneView],
     ) -> Result<(), cxx::Exception> {
         let _span = profile::span("Scheduler::advance_head");
         let ticks: &[StorageTickView] = storage.tick.as_slice();
@@ -703,7 +868,49 @@ impl Scheduler {
             &storage.cancellations,
             &storage.done,
             cache_events,
+            pool_writes,
         )
+    }
+
+    /// With a shared L2 pool: the lookups of the waiting prompts not handed
+    /// out yet, each once. A prompt is admitted only once its lookup is
+    /// answered or abandoned; one whose Device prefix covers what it may
+    /// reuse asks nothing.
+    pub fn shared_l2_lookups(&mut self) -> Vec<SharedL2LookupView> {
+        let _span = profile::span("Scheduler::shared_l2_lookups");
+        ffi::shared_l2_lookups(self.pinned())
+    }
+
+    /// Settle a lookup with the pool's answer. Returns the proxy Host blocks
+    /// created, for the pool's loader; an answer nothing waits for any more
+    /// creates none, and a later plan releases its ticket. Fails, leaving the
+    /// lookup pending, on an answer that does not fit its prompt.
+    pub fn apply_shared_l2_lookup(
+        &mut self,
+        answer: &SharedL2AnswerView,
+    ) -> Result<Vec<SharedL2PageView>, cxx::Exception> {
+        let _span = profile::span("Scheduler::apply_shared_l2_lookup");
+        ffi::apply_shared_l2_lookup(self.pinned(), answer)
+    }
+
+    /// Give lookups up before their answers: each counts as a miss, and the
+    /// next plan tells the owner. Answered and unknown ids are ignored.
+    pub fn abandon_shared_l2_lookups(&mut self, lookup_ids: &[u64]) -> Result<(), cxx::Exception> {
+        ffi::abandon_shared_l2_lookups(self.pinned(), lookup_ids)
+    }
+
+    /// Report the lease on what the lookups pinned at the owner, after the
+    /// answers of the same poll were applied. The scheduler keeps the state
+    /// until the next report. While the lease is lost no plan starts a load
+    /// from the pool; each report of a lost lease gives up every hit a
+    /// waiting prompt holds, so the prompts compute their prefixes.
+    pub fn set_shared_l2_lease_lost(&mut self, lost: bool) -> Result<(), cxx::Exception> {
+        ffi::set_shared_l2_lease_lost(self.pinned(), lost)
+    }
+
+    /// The scheduler's observations of its shared L2 pool; zeros without one.
+    pub fn shared_l2_stats(&self) -> SharedL2StatsView {
+        ffi::shared_l2_stats(self.get())
     }
 
     /// Apply one batch with a single scan of each cache index.
@@ -928,7 +1135,8 @@ impl ExecutionPlan {
 
     /// Whether the data plane has anything to do for this plan: a batch,
     /// a Host copy (cache op), pages to zero or copy, or a remote stream.
-    /// Storage operations are the L3 executor's, not the data plane's.
+    /// Storage operations are the L3 executor's and shared L2 pool commands
+    /// the pool client's, not the data plane's.
     pub fn needs_device(&self) -> bool {
         ffi::plan_needs_device(&self.0)
     }
@@ -979,6 +1187,12 @@ impl ExecutionPlan {
     /// runs them on the cache owners' storage executors.
     pub fn storage_ops(&self) -> Vec<StorageOpView> {
         ffi::plan_storage_ops(&self.0)
+    }
+
+    /// The shared L2 pool commands the plan carries, in plan order; the
+    /// rank's pool client runs them.
+    pub fn shared_l2_ops(&self) -> Vec<SharedL2OpView> {
+        ffi::plan_shared_l2_ops(&self.0)
     }
 
     /// Hand the plan to Python as a `tokenspeed_scheduler.ExecutionPlan`.

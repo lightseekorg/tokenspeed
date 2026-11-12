@@ -1391,3 +1391,187 @@ impl L3Metrics {
         }
     }
 }
+
+/// What a rank with a shared L2 pool observed: the scheduler's counts
+/// (`SharedL2Stats`) and the pool client's. Totals are cumulative.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SharedL2Stats {
+    /// Lookups the scheduler handed out.
+    pub lookups: f64,
+    /// Answers that pinned pool pages, used or not: `proxy_overflows` and
+    /// `lease_expired_hits` are among them.
+    pub hits: f64,
+    /// Lookups the client answered as a miss at their deadline; the
+    /// scheduler takes each as an answer, so none is in `abandoned_lookups`.
+    pub lookup_timeouts: f64,
+    /// Lookups that ended without an answer applied: their request left
+    /// first, or the scheduler refused the answer.
+    pub abandoned_lookups: f64,
+    /// Hits the proxy Host tier had no room for.
+    pub proxy_overflows: f64,
+    /// Hits waiting prompts gave up because the rank's lease on their pins
+    /// was lost.
+    pub lease_expired_hits: f64,
+    /// Writes whose completion told the scheduler they failed.
+    pub failed_writes: f64,
+    /// The blocks those writes carried, counted with the completion.
+    pub failed_write_blocks: f64,
+    /// The same blocks as the client counts them, when a write fails or is
+    /// dropped without the pool: ahead of `failed_write_blocks` by the
+    /// completions the scheduler has not taken yet.
+    pub dropped_write_blocks: f64,
+    /// Lookups not answered, now.
+    pub pending_lookups: f64,
+    /// Owner tickets not released, now.
+    pub tickets: f64,
+    /// Writes not finished, now.
+    pub writes_in_flight: f64,
+    /// The rank serves without the pool.
+    pub no_pool: bool,
+}
+
+/// A shared L2 pool rank's metrics (`SharedL2Metrics`), with a pool and
+/// `--enable-metrics`. Each export adds only what the totals grew by.
+#[derive(Debug)]
+pub struct SharedL2Metrics {
+    labels: [String; 3],
+    lookups: Metric,
+    failed_writes: Metric,
+    failed_write_blocks: Metric,
+    dropped_write_blocks: Metric,
+    resources: Metric,
+    no_pool: Metric,
+    /// The totals already exported.
+    exported: SharedL2Stats,
+}
+
+impl SharedL2Metrics {
+    /// The metrics, exported through `exporter`.
+    pub fn new(exporter: &Arc<Exporter>, labels: &EngineLabels) -> Self {
+        let with = |extra: &'static str| -> Vec<&'static str> {
+            ENGINE_LABELS.iter().copied().chain([extra]).collect()
+        };
+        Self {
+            labels: [
+                labels.model_name.clone(),
+                labels.app_key.clone(),
+                labels.dp_rank.to_string(),
+            ],
+            lookups: Metric::counter(
+                exporter,
+                "tokenspeed:shared_l2_lookups",
+                "Pool lookups of waiting prompts, by event. The events overlap; do not sum \
+                 them. sent: every lookup. hit: answers that pinned pool pages, among them \
+                 proxy_overflow (no room in the proxy Host tier) and lease_expired (given up \
+                 before admission because the lease on the pins was lost), whose prompts \
+                 computed instead. timeout: misses the client answered at the lookup deadline. \
+                 abandoned: lookups that ended without an answer (the request left first, or \
+                 the scheduler refused the answer).",
+                &with("event"),
+            ),
+            failed_writes: Metric::counter(
+                exporter,
+                "tokenspeed:shared_l2_failed_writes",
+                "Pool writes whose completion reported a failure to the scheduler; their \
+                 blocks stay out of the pool.",
+                &ENGINE_LABELS,
+            ),
+            failed_write_blocks: Metric::counter(
+                exporter,
+                "tokenspeed:shared_l2_failed_write_blocks",
+                "Blocks of the failed pool writes, counted when the scheduler takes a write's \
+                 completion. The same blocks as shared_l2_dropped_write_blocks, counted later; \
+                 do not add the two.",
+                &ENGINE_LABELS,
+            ),
+            dropped_write_blocks: Metric::counter(
+                exporter,
+                "tokenspeed:shared_l2_dropped_write_blocks",
+                "Blocks of the pool writes that failed or were dropped without the pool, \
+                 counted by the pool's client when the write ends. The same blocks as \
+                 shared_l2_failed_write_blocks, counted earlier; do not add the two.",
+                &ENGINE_LABELS,
+            ),
+            resources: Metric::gauge(
+                exporter,
+                "tokenspeed:shared_l2_resources",
+                "What the rank has open at the pool now.",
+                &with("resource"),
+            ),
+            no_pool: Metric::gauge(
+                exporter,
+                "tokenspeed:shared_l2_no_pool",
+                "1 while the rank serves without the pool (its owner is unreachable).",
+                &ENGINE_LABELS,
+            ),
+            exported: SharedL2Stats::default(),
+        }
+    }
+
+    /// Export one observation.
+    pub fn record(&mut self, stats: &SharedL2Stats) {
+        let labels = [
+            self.labels[0].as_str(),
+            self.labels[1].as_str(),
+            self.labels[2].as_str(),
+        ];
+        let exported = &self.exported;
+        for (event, now, before) in [
+            ("sent", stats.lookups, exported.lookups),
+            ("hit", stats.hits, exported.hits),
+            ("timeout", stats.lookup_timeouts, exported.lookup_timeouts),
+            (
+                "abandoned",
+                stats.abandoned_lookups,
+                exported.abandoned_lookups,
+            ),
+            (
+                "proxy_overflow",
+                stats.proxy_overflows,
+                exported.proxy_overflows,
+            ),
+            (
+                "lease_expired",
+                stats.lease_expired_hits,
+                exported.lease_expired_hits,
+            ),
+        ] {
+            if now > before {
+                self.lookups
+                    .inc(&[labels[0], labels[1], labels[2], event], now - before);
+            }
+        }
+        for (metric, now, before) in [
+            (
+                &self.failed_writes,
+                stats.failed_writes,
+                exported.failed_writes,
+            ),
+            (
+                &self.failed_write_blocks,
+                stats.failed_write_blocks,
+                exported.failed_write_blocks,
+            ),
+            (
+                &self.dropped_write_blocks,
+                stats.dropped_write_blocks,
+                exported.dropped_write_blocks,
+            ),
+        ] {
+            if now > before {
+                metric.inc(&labels, now - before);
+            }
+        }
+        for (resource, value) in [
+            ("pending_lookups", stats.pending_lookups),
+            ("tickets", stats.tickets),
+            ("writes_in_flight", stats.writes_in_flight),
+        ] {
+            self.resources
+                .set(&[labels[0], labels[1], labels[2], resource], value);
+        }
+        self.no_pool
+            .set(&labels, f64::from(u8::from(stats.no_pool)));
+        self.exported = *stats;
+    }
+}

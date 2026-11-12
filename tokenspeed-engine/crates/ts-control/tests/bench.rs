@@ -264,6 +264,10 @@ impl DataPlane for InstantDevice {
         Ok(pending)
     }
 
+    fn landed(&mut self, _: &ForwardResult, _: Duration) -> Result<bool, DataPlaneError> {
+        Ok(true)
+    }
+
     fn poll_cache_events(&mut self) -> Result<Vec<CacheEvent>, DataPlaneError> {
         Ok(Vec::new())
     }

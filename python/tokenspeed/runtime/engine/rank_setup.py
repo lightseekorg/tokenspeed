@@ -260,6 +260,7 @@ def scheduler_config_from_args(
     overlap_schedule_depth: int,
     enable_kv_cache_events: bool,
     prefix_replay_tokens: int,
+    shared_l2_config,
 ):
     """Build scheduler config from Device facts and separate Host-storage limits.
 
@@ -276,6 +277,8 @@ def scheduler_config_from_args(
         overlap_schedule_depth: Dispatched-but-uncommitted plans allowed.
         enable_kv_cache_events: Whether KV cache events are published.
         prefix_replay_tokens: DSpark prefix replay tokens, 0 without.
+        shared_l2_config: With a shared L2 pool as the Host tier, the
+            scheduler's ``SharedL2Config``; None without a pool.
     """
     geometry = specs.cache_geometry
     has_l3 = server_args.kvstore_storage_backend is not None
@@ -292,7 +295,10 @@ def scheduler_config_from_args(
         max_resident_requests=max_resident_requests,
         prefix_granularity=geometry.prefix_granularity,
         num_host_pages=specs.num_host_pages,
-        disable_l2_cache=not server_args.enable_kvstore,
+        # A shared L2 pool is the Host L2: the scheduler keeps its proxy tier.
+        disable_l2_cache=not (
+            server_args.enable_kvstore or shared_l2_config is not None
+        ),
         enable_l3_storage=has_l3,
         role=server_args.disaggregation_mode,
         num_snapshot_pages=specs.num_snapshot_pages,
@@ -323,4 +329,5 @@ def scheduler_config_from_args(
         checkpoint_retention_requests=server_args.checkpoint_retention_requests,
         checkpoint_retention_leaf_distance=server_args.checkpoint_retention_leaf_distance,
         prefill_chunk_yield_tokens=server_args.scheduler_prefill_chunk_yield_tokens,
+        shared_l2_config=shared_l2_config,
     )
