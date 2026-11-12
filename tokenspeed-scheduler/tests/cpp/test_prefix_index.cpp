@@ -19,6 +19,7 @@
 // SOFTWARE.
 
 #include <gtest/gtest.h>
+#include <spdlog/sinks/stdout_sinks.h>
 
 #include <algorithm>
 #include <array>
@@ -130,27 +131,86 @@ TEST(PrefixCacheIndexInspectionTest, EvictionKeepsItsKeyAndMetadataAfterTheEntry
     PrefixCacheIndex index(0);
     const auto key = KeyOf(std::string(64, 'a'));
     const auto location = Cache(index, pool, key.content_hash.ToString(), 17);
-    EXPECT_THROW(
-        index.EvictWithMetadata(
-            pool, location, [](const auto&, const auto&, auto*) { throw std::runtime_error("publication refused"); }),
-        std::runtime_error);
+    {
+        // A handle dropped without Evict, as when recording the eviction
+        // throws, leaves the entry.
+        const PrefixCacheIndex::EvictableEntry abandoned = index.FindEvictable(pool, location);
+        ASSERT_TRUE(abandoned);
+        EXPECT_EQ(abandoned.key(), key);
+    }
     EXPECT_TRUE(index.Contains(pool, key));
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), 0);
-    PrefixCacheIndex::CachedBlockMetadata recorded;
-    auto removed =
-        index.EvictWithMetadata(pool, location, [&](const auto&, const auto& metadata, auto*) { recorded = metadata; });
-    ASSERT_TRUE(removed);
-    EXPECT_EQ(*removed, key);
+    PrefixCacheIndex::EvictableEntry evictable = index.FindEvictable(pool, location);
+    ASSERT_TRUE(evictable);
+    const PrefixCacheIndex::CachedBlockMetadata recorded = evictable.metadata();
+    const CacheKey removed = index.Evict(std::move(evictable));
+    EXPECT_FALSE(evictable);
+    EXPECT_EQ(removed, key);
     EXPECT_EQ(recorded.eviction.last_access_epoch, 17);
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), 1);
     EXPECT_FALSE(index.Contains(pool, location));
     const auto replacement = Cache(index, pool, "replacement", 18);
     EXPECT_EQ(replacement, location);
-    EXPECT_EQ(*removed, key);
+    EXPECT_EQ(removed, key);
     EXPECT_EQ(index.KeyOf(pool, replacement), KeyOf("replacement"));
 }
 
-// The callback sees the boundary-tree node the entry holds, still counting
+// Evict refuses a handle by aborting, not throwing: its caller may have
+// recorded the eviction already.
+void ExpectEvictAborts(PrefixCacheIndex& index, PrefixCacheIndex::EvictableEntry& handle, const char* message) {
+    EXPECT_DEATH(
+        {
+            // The default logger writes to stdout; the death test reads stderr.
+            spdlog::set_default_logger(spdlog::stderr_logger_mt("fatal-check-test"));
+            (void)index.Evict(std::move(handle));
+        },
+        message);
+}
+
+// An eviction handle finds only an entry the index alone owns, and refuses
+// to act for one whose tier or block changed since it was found: an entry
+// joined or left, the block got another owner, or it was evicted already.
+TEST(PrefixCacheIndexInspectionTest, AnEvictionHandleRefusesAnEntryItCanNoLongerVouchFor) {
+    BlockPool pool(4, {1});
+    PrefixCacheIndex index(kGroupId);
+    const auto first = Cache(index, pool, "first", 1);
+    const auto second = Cache(index, pool, "second", 1);
+    EXPECT_FALSE(index.FindEvictable(pool, CacheBlockLocation{.lcm_block_id = 4, .slot_index = 0}));
+    BlockPool other_pool(1, {1});
+    EXPECT_FALSE(index.FindEvictable(other_pool, first));
+    {
+        const CacheBlockRef holder = index.Find(pool, KeyOf("first"));
+        EXPECT_FALSE(index.FindEvictable(pool, first));
+    }
+
+    PrefixCacheIndex::EvictableEntry joined = index.FindEvictable(pool, first);
+    ASSERT_TRUE(joined);
+    Cache(index, pool, "third", 1);
+    EXPECT_THROW(joined.key(), std::runtime_error);
+    ExpectEvictAborts(index, joined, "an eviction handle outlived a change to its tier");
+
+    PrefixCacheIndex::EvictableEntry left = index.FindEvictable(pool, first);
+    ASSERT_TRUE(left);
+    ASSERT_EQ(index.Evict(pool, second), KeyOf("second"));
+    EXPECT_THROW(left.metadata(), std::runtime_error);
+
+    PrefixCacheIndex::EvictableEntry pinned = index.FindEvictable(pool, first);
+    ASSERT_TRUE(pinned);
+    const CacheBlockRef holder = index.Find(pool, KeyOf("first"));
+    ExpectEvictAborts(index, pinned, "an evictable entry stays unpinned until it is evicted");
+    EXPECT_TRUE(index.Contains(pool, KeyOf("first")));
+
+    BlockPool spare(1, {1});
+    PrefixCacheIndex fresh(kGroupId);
+    PrefixCacheIndex::EvictableEntry once = fresh.FindEvictable(spare, Cache(fresh, spare, "once", 1));
+    EXPECT_EQ(fresh.Evict(std::move(once)), KeyOf("once"));
+    EXPECT_FALSE(once);
+    EXPECT_THROW(once.key(), std::runtime_error);
+    ExpectEvictAborts(fresh, once, "an empty eviction handle has no entry");
+    EXPECT_EQ(fresh.NumEntries(spare), 0);
+}
+
+// The handle shows the boundary-tree node the entry holds, still counting
 // the entry: here two groups' entries under one hash, then the last of them,
 // which takes the node along. An index never bound to a tree shows none.
 TEST(PrefixCacheIndexInspectionTest, EvictionShowsTheTreeNodeStillCountingTheEntry) {
@@ -179,26 +239,23 @@ TEST(PrefixCacheIndexInspectionTest, EvictionShowsTheTreeNodeStillCountingTheEnt
     ASSERT_EQ(tree.Find(ContentHash{"page"})->Entries(BoundaryTree::kDevice), 2);
 
     for (std::uint32_t group = 0; group < 2; ++group) {
-        bool saw_the_hashs_node = false;
-        std::int32_t device_entries = 0;
-        const auto removed = indexes[group].EvictWithMetadata(
-            pool, locations[group], [&](const CacheKey& key, const auto&, BoundaryTree::Node* node) {
-                saw_the_hashs_node = node != nullptr && node == tree.Find(key.content_hash);
-                device_entries = node == nullptr ? 0 : node->Entries(BoundaryTree::kDevice);
-            });
-        ASSERT_TRUE(removed) << "group " << group;
-        EXPECT_TRUE(saw_the_hashs_node) << "group " << group;
-        EXPECT_EQ(device_entries, 2 - static_cast<std::int32_t>(group)) << "group " << group;
+        PrefixCacheIndex::EvictableEntry evictable = indexes[group].FindEvictable(pool, locations[group]);
+        ASSERT_TRUE(evictable) << "group " << group;
+        const BoundaryTree::Node* node = evictable.boundary_node();
+        ASSERT_NE(node, nullptr) << "group " << group;
+        EXPECT_EQ(node, tree.Find(evictable.key().content_hash)) << "group " << group;
+        EXPECT_EQ(node->Entries(BoundaryTree::kDevice), 2 - static_cast<std::int32_t>(group)) << "group " << group;
+        indexes[group].Evict(std::move(evictable));
     }
     EXPECT_EQ(tree.Find(ContentHash{"page"}), nullptr);
 
     BlockPool unbound_pool(1, {1});
     PrefixCacheIndex unbound(kGroupId);
     const CacheBlockLocation location = Cache(unbound, unbound_pool, "page", /*access_epoch=*/1);
-    bool saw_a_node = true;
-    ASSERT_TRUE(unbound.EvictWithMetadata(unbound_pool, location,
-                                          [&](const auto&, const auto&, auto* node) { saw_a_node = node != nullptr; }));
-    EXPECT_FALSE(saw_a_node);
+    PrefixCacheIndex::EvictableEntry evictable = unbound.FindEvictable(unbound_pool, location);
+    ASSERT_TRUE(evictable);
+    EXPECT_EQ(evictable.boundary_node(), nullptr);
+    EXPECT_EQ(unbound.Evict(std::move(evictable)), KeyOf("page"));
 }
 
 TEST(PrefixCacheIndexInspectionTest, PackedLocationsAcrossSegmentsSurviveEvictionAndReuse) {

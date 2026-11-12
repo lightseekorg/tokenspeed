@@ -1892,84 +1892,78 @@ std::optional<CacheCoordinator::EvictedEntry> CacheCoordinator::evictCachedBlock
     std::uint32_t group_id, CacheBlockLocation location, DeviceEvictionCounts DeviceEvictionStats::*reason,
     EvictedSegment* write_back_segment) {
     PrefixCacheIndex& index = groups_[group_id].Index();
-    // Every path returns this one object: the key moves in once.
-    std::optional<EvictedEntry> removed;
-    bool device_companions_left = false;
-    std::optional<CacheKey> key = index.EvictWithMetadata(
-        pool_, location,
-        [&](const CacheKey& key, const PrefixCacheIndex::CachedBlockMetadata& metadata, BoundaryTree::Node* node) {
-            _assert(node != nullptr, "an indexed entry has a tree node");
-            // The node still counts this entry among its Device entries.
-            device_companions_left = node->Entries(BoundaryTree::kDevice) > 1;
-            // A demoted entry never rides an eviction write-back, whatever evicts it
-            // -- an admission's or a restore's victim, a request's own released slot
-            // or a stranded suffix: it is dropped, counted under what evicted it. A
-            // demoted session's entry or a superseded input shares its epoch without
-            // being demoted: the rule below takes it.
-            const bool demoted = isDemotedEntry(metadata);
-            const bool drops_demoted = demoted && write_back_segment != nullptr;
-            // A superseded input an admission, rotation or restore evicts leaves as the
-            // reclaim of the request that superseded it, under either write policy,
-            // and is never written back. It is never a stranded suffix: a tail at
-            // epoch 0 is a candidate of its own before any page above it.
-            if (demoted) {
-                write_back_segment = nullptr;
-            } else if (metadata.eviction.last_access_epoch == kSupersededAccessEpoch &&
-                       (reason == &DeviceEvictionStats::admission || reason == &DeviceEvictionStats::restore ||
-                        reason == &DeviceEvictionStats::compaction ||
-                        reason == &DeviceEvictionStats::request_reclaim)) {
-                reason = &DeviceEvictionStats::request_reclaim;
-                write_back_segment = nullptr;
-            }
-            if (drops_demoted) {
-                ++demoted_entries_not_written_back_;
-                // A request's own released slot the drain would have considered is
-                // dropped like a dead one, and counted with them, so the drain's
-                // outcomes still add up to the evictions it considered.
-                if (reason == &DeviceEvictionStats::request_reclaim) {
-                    ++device_evictions_.request_reclaim_for_write_back;
-                }
-            }
-            if (write_back_segment != nullptr) {
-                if (reason == &DeviceEvictionStats::request_reclaim) {
-                    ++device_evictions_.request_reclaim_for_write_back;
-                }
-                // Judged and recorded while the entry still holds the node, so the
-                // checkpoints of a checkpoint boundary are recorded and hold it on the
-                // Host before the pages above it are judged: no probe could resume
-                // from a tail whose hint the cap dropped, nor, with State groups, from
-                // a boundary with no checkpoint boundary at or under it on either tier
-                // and none on its way there.
-                const bool dead = (node->tail_tokens > 0 && !boundary_tree_.Tails().Contains(key.content_hash)) ||
-                                  (num_state_groups_ > 0 && !node->HasCheckpointBoundaryInSubtree() &&
-                                   node->PendingHostStores() == 0);
-                if (dead) {
-                    ++dead_entries_not_written_back_;
-                } else {
-                    write_back_segment->members.push_back(
-                        EvictedBlock{.key = key,
-                                     .device_location = location,
-                                     .metadata = metadata,
-                                     .host_block = FindHostCachedBlock(key),
-                                     .written_back_before = (node->written_back_group_bits >> key.group_id & 1U) != 0,
-                                     .pending = holdPendingStore(*node, key, GroupIsState(group_id))});
-                    write_back_segment->newest_access_epoch =
-                        std::max(write_back_segment->newest_access_epoch, metadata.eviction.last_access_epoch);
-                }
-            }
-        });
-    if (!key) return removed;
-    if (cache_mutation_sink_) {
-        cache_mutation_sink_(*key, CacheMutation::kRemoved);
+    PrefixCacheIndex::EvictableEntry entry = index.FindEvictable(pool_, location);
+    if (!entry) {
+        return std::nullopt;
     }
-    DeviceEvictionCounts& evicted = device_evictions_.*reason;
+    // The entry's own key and tree node: read them only before Evict below.
+    const CacheKey& key = entry.key();
+    BoundaryTree::Node* const node = entry.boundary_node();
+    _assert(node != nullptr, "an indexed entry has a tree node");
+    const PrefixCacheIndex::CachedBlockMetadata metadata = entry.metadata();
+    // The node still counts this entry among its Device entries.
+    const bool device_companions_left = node->Entries(BoundaryTree::kDevice) > 1;
+    // A demoted entry never rides an eviction write-back, whatever evicts it
+    // -- an admission's or a restore's victim, a request's own released slot
+    // or a stranded suffix: it is dropped, counted under what evicted it. A
+    // demoted session's entry or a superseded input shares its epoch without
+    // being demoted: the rule below takes it.
+    const bool demoted = isDemotedEntry(metadata);
+    // A superseded input an admission, rotation or restore evicts leaves as the
+    // reclaim of the request that superseded it, under either write policy,
+    // and is never written back. It is never a stranded suffix: a tail at
+    // epoch 0 is a candidate of its own before any page above it.
+    const bool superseded =
+        !demoted && metadata.eviction.last_access_epoch == kSupersededAccessEpoch &&
+        (reason == &DeviceEvictionStats::admission || reason == &DeviceEvictionStats::restore ||
+         reason == &DeviceEvictionStats::compaction || reason == &DeviceEvictionStats::request_reclaim);
+    DeviceEvictionCounts& evicted = device_evictions_.*(superseded ? &DeviceEvictionStats::request_reclaim : reason);
+    if (demoted && write_back_segment != nullptr) {
+        ++demoted_entries_not_written_back_;
+        // A request's own released slot the drain would have considered is
+        // dropped like a dead one, and counted with them, so the drain's
+        // outcomes still add up to the evictions it considered.
+        if (reason == &DeviceEvictionStats::request_reclaim) {
+            ++device_evictions_.request_reclaim_for_write_back;
+        }
+    }
+    if (write_back_segment != nullptr && !demoted && !superseded) {
+        if (reason == &DeviceEvictionStats::request_reclaim) {
+            ++device_evictions_.request_reclaim_for_write_back;
+        }
+        // Judged and recorded while the entry still holds the node, so the
+        // checkpoints of a checkpoint boundary are recorded and hold it on the
+        // Host before the pages above it are judged: no probe could resume
+        // from a tail whose hint the cap dropped, nor, with State groups, from
+        // a boundary with no checkpoint boundary at or under it on either tier
+        // and none on its way there.
+        const bool dead =
+            (node->tail_tokens > 0 && !boundary_tree_.Tails().Contains(key.content_hash)) ||
+            (num_state_groups_ > 0 && !node->HasCheckpointBoundaryInSubtree() && node->PendingHostStores() == 0);
+        if (dead) {
+            ++dead_entries_not_written_back_;
+        } else {
+            write_back_segment->members.push_back(
+                EvictedBlock{.key = key,
+                             .device_location = location,
+                             .metadata = metadata,
+                             .host_block = FindHostCachedBlock(key),
+                             .written_back_before = (node->written_back_group_bits >> key.group_id & 1U) != 0,
+                             .pending = holdPendingStore(*node, key, GroupIsState(group_id))});
+            write_back_segment->newest_access_epoch =
+                std::max(write_back_segment->newest_access_epoch, metadata.eviction.last_access_epoch);
+        }
+    }
+    CacheKey removed = index.Evict(std::move(entry));
+    if (cache_mutation_sink_) {
+        cache_mutation_sink_(removed, CacheMutation::kRemoved);
+    }
     ++evicted.blocks;
     // Contains takes no reference, so it pins nothing on the Host tier.
-    if (host_pool_ != nullptr && index.Contains(*host_pool_, *key)) {
+    if (host_pool_ != nullptr && index.Contains(*host_pool_, removed)) {
         ++evicted.host_resident;
     }
-    removed.emplace(std::move(*key), device_companions_left);
-    return removed;
+    return EvictedEntry{.key = std::move(removed), .device_companions_left = device_companions_left};
 }
 
 CacheCoordinator::PendingHostStore CacheCoordinator::holdPendingStore(BoundaryTree::Node& node, const CacheKey& key,

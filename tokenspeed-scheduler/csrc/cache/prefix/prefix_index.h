@@ -257,6 +257,48 @@ public:
         CachedBlockSnapshot peer;
     };
 
+    // The entry at one location while Evict may take it: the index is its
+    // block's only owner (FindEvictable). It borrows the entry, so it is
+    // neither copied nor moved, and lasts only until this tier's entries or
+    // the block's owners change: read what the eviction needs, then hand it
+    // to Evict. Its reads and Evict check that no entry joined or left the
+    // tier since FindEvictable, and Evict that the block is still unshared.
+    // A failed read throws; a failed Evict aborts, since its caller may have
+    // recorded the eviction already. An empty handle -- no entry there, a
+    // pinned one, or one already evicted -- is false.
+    class EvictableEntry {
+    public:
+        EvictableEntry(const EvictableEntry&) = delete;
+        EvictableEntry& operator=(const EvictableEntry&) = delete;
+
+        explicit operator bool() const noexcept { return cache_index_ != nullptr; }
+        const CacheKey& key() const { return entry().key; }
+        CachedBlockMetadata metadata() const { return metadataOf(entry()); }
+        // The boundary-tree node the entry holds (TrackBoundaries), still
+        // counting the entry; null in an index never bound.
+        BoundaryTree::Node* boundary_node() const {
+            const CacheEntry& found = entry();
+            return found.boundary ? &found.boundary.node() : nullptr;
+        }
+
+    private:
+        friend class PrefixCacheIndex;
+        EvictableEntry() = default;
+        EvictableEntry(CacheEntries& cache_index, CacheEntryIterator entry)
+            : cache_index_{&cache_index}, entry_{entry}, membership_{cache_index.membership} {}
+
+        const CacheEntry& entry() const {
+            _assert(cache_index_ != nullptr, "an empty eviction handle has no entry");
+            _assert(cache_index_->membership == membership_, "an eviction handle outlived a change to its tier");
+            return *entry_;
+        }
+
+        CacheEntries* cache_index_{nullptr};
+        CacheEntryIterator entry_{};
+        // The tier's CacheEntries::membership when the entry was found.
+        std::uint64_t membership_{0};
+    };
+
     explicit PrefixCacheIndex(std::uint32_t group_id) : group_id_{group_id} {}
 
     PrefixCacheIndex(const PrefixCacheIndex&) = delete;
@@ -334,6 +376,7 @@ public:
             return;
         }
 
+        ++cache_index.membership;
         CacheEntry& entry = *entry_it;
         entry.block_ref = block_ref;
         entry.last_access_epoch = session && session->demoted ? 0 : access_epoch;
@@ -686,20 +729,44 @@ public:
     }
 
     std::optional<CacheKey> Evict(const BlockPool& pool, CacheBlockLocation location) {
-        return evictWith(pool, location, [](const CacheKey&, const CacheEntry&) {});
+        EvictableEntry evictable = FindEvictable(pool, location);
+        if (!evictable) {
+            return std::nullopt;
+        }
+        return Evict(std::move(evictable));
     }
 
-    // Locate and check ownership once. The callback records tree/Host state
-    // while the Device entry lives; it must not mutate this tier's index or
-    // pin the source block. It also gets the boundary-tree node the entry
-    // holds (TrackBoundaries; null in an index never bound), which counts the
-    // entry until it leaves. The returned key owns its bytes after deletion.
-    template <typename BeforeErase>
-    std::optional<CacheKey> EvictWithMetadata(const BlockPool& pool, CacheBlockLocation location,
-                                              BeforeErase&& before_erase) {
-        return evictWith(pool, location, [&](const CacheKey& key, const CacheEntry& entry) {
-            before_erase(key, metadataOf(entry), entry.boundary ? &entry.boundary.node() : nullptr);
-        });
+    // The entry at `location` when Evict may take it, located and checked
+    // with one lookup; an empty handle when there is none or it is pinned.
+    // A caller reads what the entry's eviction records -- key, metadata, the
+    // tree node still counting it -- before the entry leaves.
+    EvictableEntry FindEvictable(const BlockPool& pool, CacheBlockLocation location) {
+        CacheEntries* cache_index = findCacheEntries(pool);
+        if (cache_index == nullptr) {
+            return EvictableEntry{};
+        }
+        const CacheEntryIterator entry_it = findEntry(*cache_index, location);
+        if (entry_it == cache_index->entries.end() || !entry_it->block_ref.unique()) {
+            return EvictableEntry{};
+        }
+        return EvictableEntry{*cache_index, entry_it};
+    }
+
+    // Takes the entry `evictable` found out of the index and leaves the
+    // handle empty. The returned key owns its bytes. A handle that no longer
+    // vouches for its entry aborts instead of throwing: the caller may have
+    // recorded this eviction (counters, a write-back member) already, and a
+    // throw would leave that record for an entry still indexed.
+    CacheKey Evict(EvictableEntry&& evictable) {
+        FatalCheck(evictable.cache_index_ != nullptr, "an empty eviction handle has no entry");
+        FatalCheck(evictable.cache_index_->membership == evictable.membership_,
+                   "an eviction handle outlived a change to its tier");
+        const CacheEntry& entry = *evictable.entry_;
+        FatalCheck(entry.block_ref.unique(), "an evictable entry stays unpinned until it is evicted");
+        CacheKey key = entry.key;
+        eraseEntry(*evictable.cache_index_, evictable.entry_);
+        evictable.cache_index_ = nullptr;
+        return key;
     }
 
     // Moves the entry at `from` onto `to`, a block of the same tier the caller
@@ -894,6 +961,9 @@ private:
         // entry of this tier stands for there.
         BoundaryTree* boundary_tree{nullptr};
         BoundaryTree::EntryKind boundary_kind{};
+        // Counts the entries that joined or left, so an EvictableEntry can
+        // tell that the entry it borrows may be gone.
+        std::uint64_t membership{0};
     };
 
     void linkCommonEntry(CacheEntries& cache_index, CacheEntryIterator entry) {
@@ -1022,26 +1092,6 @@ private:
     ConstCacheEntryIterator findEntry(const CacheEntries& cache_index, CacheBlockLocation location) const {
         return cache_index.by_location.Find(location);
     }
-    template <typename BeforeErase>
-    std::optional<CacheKey> evictWith(const BlockPool& pool, CacheBlockLocation location, BeforeErase&& before_erase) {
-        // Every path returns this one object, so the key is copied once,
-        // straight into the caller's result.
-        std::optional<CacheKey> key;
-        CacheEntries* cache_index = findCacheEntries(pool);
-        if (cache_index == nullptr) {
-            return key;
-        }
-        CacheEntryIterator entry_it = findEntry(*cache_index, location);
-        if (entry_it == cache_index->entries.end() || !entry_it->block_ref.unique()) {
-            return key;
-        }
-        key.emplace(entry_it->key);
-        before_erase(*key, *entry_it);
-        FatalCheck(entry_it->block_ref.unique(), "an unpinned cache entry stays evictable");
-        eraseEntry(*cache_index, entry_it);
-        return key;
-    }
-
     void eraseEntry(CacheEntries& cache_index, CacheEntryIterator entry_it) {
         if (CacheEntry* peer = entry_it->common_peer) {
             CacheEntries& source = cache_index.common_source ? cache_index : *cache_index.common_peer;
@@ -1055,6 +1105,7 @@ private:
                    "an indexed cache entry keeps its key");
         cache_index.by_location.Erase(entry_it->block_ref->Location());
         cache_index.entries.erase(entry_it);
+        ++cache_index.membership;
     }
 
     std::uint32_t group_id_;
