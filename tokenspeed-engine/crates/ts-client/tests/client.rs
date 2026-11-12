@@ -24,14 +24,14 @@ mod common;
 
 use std::time::Duration;
 
-use common::{ipc_address, start, FakeEngine, Role};
+use common::{ipc_address, start, start_as, FakeEngine, Role};
 use ts_client::{
     ClientConfig, ClientListener, EngineClient, Error, LoadBalance, OutputChunk, RequestStream,
     Routing, StreamError,
 };
 use ts_wire::{
-    control::{FlushCacheReqInput, IsSchedulerPausedReqInput},
-    ControlOutput, ControlRequest, EncodeRequest, EngineRequest, SamplingParams,
+    control::{FlushCacheReqInput, FlushCacheReqOutput, IsSchedulerPausedReqInput},
+    ControlOutput, ControlRequest, EncodeRequest, EngineRequest, SamplingParams, StrOrList,
     TokenizedGenerateReqInput,
 };
 
@@ -423,6 +423,92 @@ async fn a_control_operation_gathers_every_engines_reply() {
     let (a, b) = tokio::join!(client.control(paused.clone()), client.control(flush));
     assert_eq!(a.unwrap().len(), 2);
     assert_eq!(b.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn an_abandoned_control_operation_keeps_its_late_replies_from_the_next() {
+    let handshake_address = ipc_address("handshake");
+    let client = tokio::spawn(EngineClient::connect(config(
+        &handshake_address,
+        2,
+        Routing::Aggregated(LoadBalance::RoundRobin),
+    )));
+    let mut engines: Vec<FakeEngine> = (0..2)
+        .map(|index| {
+            start_as(
+                &handshake_address,
+                index,
+                i64::from(index),
+                2,
+                Role::HoldingControls,
+            )
+        })
+        .collect();
+    let client = client.await.unwrap().unwrap();
+    let flush = ControlRequest::FlushCache(FlushCacheReqInput {
+        rid: None,
+        http_worker_ipc: None,
+    });
+    // The caller gives up on flush 1 before any engine answers.
+    let gave_up = tokio::time::timeout(Duration::from_millis(200), client.control(flush.clone()));
+    assert!(gave_up.await.is_err());
+    for engine in &mut engines {
+        engine.next_received().await;
+    }
+    let second = client.control(flush);
+    let engines_side = async {
+        // Flush 2 waits for flush 1's replies before it goes out.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        for engine in &mut engines {
+            let early = tokio::time::timeout(Duration::from_millis(100), engine.received.recv());
+            assert!(
+                early.await.is_err(),
+                "flush 2 went out before flush 1 was answered"
+            );
+        }
+        // Flush 1's replies go to the abandoned operation; flush 2 goes out.
+        for engine in &engines {
+            engine.answer_controls();
+        }
+        for engine in &mut engines {
+            engine.next_received().await;
+        }
+        for engine in &engines {
+            engine.answer_controls();
+        }
+    };
+    let (replies, ()) = tokio::join!(second, engines_side);
+    let flushes: Vec<String> = replies
+        .unwrap()
+        .into_iter()
+        .map(|reply| match reply {
+            ControlOutput::FlushCache(FlushCacheReqOutput {
+                rid: Some(StrOrList::One(flush)),
+                ..
+            }) => flush,
+            other => panic!("unexpected {other:?}"),
+        })
+        .collect();
+    assert_eq!(flushes, ["2", "2"]);
+}
+
+#[tokio::test]
+async fn a_request_leaves_its_engines_count_however_it_ends() {
+    let (client, _engines) = connect(1, Routing::Aggregated(LoadBalance::LeastInFlight)).await;
+    // Finished.
+    let chunks = collect(client.generate(request("finished", Some(2))).await.unwrap()).await;
+    assert_eq!(tokens(&chunks), [1, 2]);
+    // Aborted.
+    let mut aborted = client.generate(request("aborted", None)).await.unwrap();
+    assert!(next(&mut aborted).await.is_some());
+    assert!(client.abort("aborted").await.unwrap());
+    while next(&mut aborted).await.is_some() {}
+    // Dropped before its end.
+    let mut dropped = client.generate(request("dropped", None)).await.unwrap();
+    assert!(next(&mut dropped).await.is_some());
+    assert_eq!(client.in_flight(), [1]);
+    drop(dropped);
+    assert_eq!(client.in_flight(), [0]);
 }
 
 #[tokio::test]
