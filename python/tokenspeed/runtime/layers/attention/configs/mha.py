@@ -33,6 +33,9 @@ from tokenspeed.runtime.layers.attention.configs.base import (
     resolve_cache_layer_types,
     resolve_dtype,
 )
+from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
+    TRTLLM_MHA_BLOCK_DRAFT_PAGE_SIZE,
+)
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
@@ -83,7 +86,7 @@ class MHAConfig(SoftmaxAttnConfig):
             sliding_window_tokens=sliding_window_tokens,
             skip_softmax_threshold=server_args.skip_softmax_threshold,
         )
-        return AttnConfig(
+        config = AttnConfig(
             components=(spec,),
             **model_wide_kwargs(
                 server_args,
@@ -94,6 +97,15 @@ class MHAConfig(SoftmaxAttnConfig):
                 draft_block_decode=draft_block_decode,
             ),
         )
+
+        if (
+            draft_block_decode
+            and spec.backend_name == "trtllm"
+            and config.kernel_page_size is None
+        ):
+            # Preserve the storage page boundary when K/V fields share a plane.
+            config.kernel_page_size = TRTLLM_MHA_BLOCK_DRAFT_PAGE_SIZE
+        return config
 
     def cache_cell_size(self, config: AttnConfig) -> int:
         cell = (

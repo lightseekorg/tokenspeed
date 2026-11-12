@@ -146,7 +146,8 @@ class HeadKVCache:
 
     Attributes:
         k_cache: ``[slots, heads, dim]`` or ``[pages, rows, heads, dim]``;
-            paged views preserve the field's actual page stride.
+            native and unit-scale FP8 writes preserve the field's actual
+            page stride.
         v_cache: Same geometry and dtype as ``k_cache``.
         scales: The scale planes of an MXFP8 cache, the per-tensor scales of
             an FP8 one, or ``None`` for a unit-scale cache.

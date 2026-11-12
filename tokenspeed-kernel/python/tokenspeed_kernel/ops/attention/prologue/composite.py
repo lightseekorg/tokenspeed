@@ -100,7 +100,7 @@ def _write_kv(
             cache.k_cache,
             cache.v_cache,
             cache.slots,
-            page_size=1,
+            page_size=cache.k_cache.shape[1] if cache.k_cache.ndim == 4 else 1,
             enable_pdl=enable_pdl,
         )
     else:

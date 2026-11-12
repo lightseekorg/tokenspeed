@@ -94,3 +94,25 @@ def test_sink_retention_survives_the_scheduler_bridge(sink_tokens):
     )
     assert config.sink_tokens == sink_tokens
     assert config.sliding_window_tokens == 128
+
+
+@pytest.mark.parametrize("attn_kind", ["full_history", "state"])
+def test_groups_without_sinks_keep_their_native_configuration(attn_kind):
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.scheduler_bridge import (
+        cache_group_config,
+    )
+
+    spec = CacheGroupSpec(
+        group_id="plain",
+        attn_kind=attn_kind,
+        replayable=False,
+        **(
+            {"rows_per_page": 128, "entry_stride_tokens": 1}
+            if attn_kind == "full_history"
+            else {}
+        )
+    )
+    config = cache_group_config(spec, total_pages=64, cache_blocks_per_lcm_block=1)
+    assert config.group_id == "plain"
+    assert config.block_granularity == (128 if attn_kind == "full_history" else 0)
+    assert config.sliding_window_tokens is None

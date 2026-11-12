@@ -49,6 +49,8 @@ MLA_PAGE_SIZE = 64
 # kernel constraint, not a chosen default.
 MSA_PAGE_SIZE = 128
 TRTLLM_MHA_PAGE_SIZE = 64
+# Block-draft K/V fields use 128-row pages, which may have padding between pages.
+TRTLLM_MHA_BLOCK_DRAFT_PAGE_SIZE = 128
 
 # Constrained kernels: default within the supported set.
 TRTLLM_MLA_DEFAULT_PAGE_SIZE = 64
