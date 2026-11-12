@@ -263,6 +263,69 @@ def test_kv_pack_reuses_compilation() -> None:
     )
 
 
+def test_split_counts_match_torch_without_recompiling() -> None:
+    repo_root = Path(__file__).resolve().parents[4]
+    script = textwrap.dedent("""
+        import torch
+        from tokenspeed_mla import tokenspeed_mla_decode_split_kvs
+        from tokenspeed_mla.mla_decode import (
+            _get_split_kv_and_workspace_size, _mla_decode_split_kvs_kernel,
+            _per_request_split_kv_width,
+        )
+        from tokenspeed_mla.utils import get_num_sm
+        from utils import assert_no_triton_compile
+
+        def check(lengths, out, max_seq_len):
+            batch = lengths.numel()
+            args = dict(num_heads=128, q_len=1, max_seq_len=max_seq_len,
+                        min_split_kv=1, dtype=torch.bfloat16)
+            splits, _ = _get_split_kv_and_workspace_size(
+                batch, 1, 128, 512, get_num_sm(lengths.device), max_seq_len,
+                torch.bfloat16, (128, 128), 1)
+            width = _per_request_split_kv_width(max_seq_len, (128, 128), 1)
+            source = lengths.to(torch.int64)
+            chunks = batch * splits
+            chunk = ((source.sum() + chunks - 1) // chunks).clamp(min=1)
+            expected = ((source + chunk - 1) // chunk).clamp(1, width).int()
+            tokenspeed_mla_decode_split_kvs(lengths, out, **args)
+            torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+        lengths = torch.zeros(2049 * 3, dtype=torch.int32, device="cuda")[::3]
+        out = torch.empty(2049 * 5, dtype=torch.int32, device="cuda")[::5]
+        check(lengths[:17], out[:17], 1 << 20)
+        with assert_no_triton_compile(_mla_decode_split_kvs_kernel):
+            for batch in (1, 8, 15, 16, 17, 255, 256, 257, 1023, 1024, 1025, 2049):
+                for max_seq_len in (64, 8192, 1 << 30):
+                    lengths[:batch].copy_(torch.arange(batch, device="cuda", dtype=torch.int64)
+                                         * (max_seq_len // max(batch, 1)))
+                    check(lengths[:batch], out[:batch], max_seq_len)
+
+        # Only the three live rows are touched, including an offset above 2**31 elements.
+        wide_lengths = torch.empty_strided((3,), (2**30 + 8,), dtype=torch.int32, device="cuda")
+        wide_out = torch.empty_strided((3,), (2**30 + 8,), dtype=torch.int32, device="cuda")
+        wide_lengths.copy_(torch.tensor([1, 1 << 30, 1 << 30], dtype=torch.int32, device="cuda"))
+        check(wide_lengths, wide_out, 1 << 30)
+        """)
+    env = os.environ.copy()
+    paths = [
+        str(repo_root / "tokenspeed-mla/python"),
+        str(repo_root / "tokenspeed-kernel/test"),
+    ]
+    if env.get("PYTHONPATH"):
+        paths.append(env["PYTHONPATH"])
+    env["PYTHONPATH"] = os.pathsep.join(paths)
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+
+
 def test_sm103_bf16_decode_causal_variants_compile() -> None:
     """The SM103 BF16 decode path compiles for both mask variants."""
     repo_root = Path(__file__).resolve().parents[4]

@@ -1272,6 +1272,153 @@ def test_local_visible_lengths_reject_unsupported_inputs(invalid):
         )
 
 
+@pytest.mark.parametrize(
+    "invalid", ["fp8_output", "dtype", "shape", "fixed_seq", "window", "cp"]
+)
+def test_per_request_split_counts_reject_unsupported_inputs(invalid):
+    from tokenspeed_mla import tokenspeed_mla_decode
+
+    query = torch.zeros((2, 4, 16, 576), dtype=torch.float8_e4m3fn)
+    splits = torch.ones(2, dtype=torch.int32)
+    extra = {}
+    if invalid == "fp8_output":
+        extra["out"] = torch.zeros((2, 4, 16, 512), dtype=torch.float8_e4m3fn)
+    elif invalid == "dtype":
+        splits = splits.to(torch.int64)
+    elif invalid == "shape":
+        splits = torch.ones(3, dtype=torch.int32)
+    elif invalid == "fixed_seq":
+        extra["is_var_seq"] = False
+    elif invalid == "window":
+        extra["window_left"] = 128
+    elif invalid == "cp":
+        extra["cp_world"] = 2
+    with pytest.raises(ValueError, match="block_split_kvs"):
+        tokenspeed_mla_decode(
+            query,
+            torch.zeros((1, 64, 576), dtype=query.dtype),
+            torch.empty(0, dtype=torch.int8),
+            512,
+            64,
+            torch.zeros((2, 2), dtype=torch.int32),
+            torch.ones(2, dtype=torch.int32),
+            64,
+            192**-0.5,
+            block_split_kvs=splits,
+            **extra,
+        )
+
+
+def _check_per_request_split_gpu(heads, q_len, dtype_name, causal):
+    import tokenspeed_mla.mla_decode as decode
+    from tokenspeed_mla import tokenspeed_mla_decode, tokenspeed_mla_decode_split_kvs
+
+    torch.backends.cuda.matmul.allow_tf32 = False
+    # One long request among short ones, as in serving batches.
+    lengths = [16384, 300, 5000, 129, 2048, 9000]
+    case = _Case(len(lengths), max(lengths), heads, q_len)
+    q, kv, tables, _ = _make_inputs(case, dtype_name, False, "cuda")
+    seq_lens = torch.tensor(lengths, dtype=torch.int32, device="cuda")
+    splits = torch.empty_like(seq_lens)
+    split_args = dict(
+        num_heads=heads,
+        q_len=q_len,
+        max_seq_len=case.kv_len,
+        min_split_kv=8,
+        dtype=q.dtype,
+    )
+    uniform = torch.full_like(seq_lens, 4096)
+    tokenspeed_mla_decode_split_kvs(uniform, splits, **split_args)
+    (uniform_split,) = set(splits.tolist())
+    assert uniform_split >= 8
+    tokenspeed_mla_decode_split_kvs(seq_lens, splits, **split_args)
+    counts = splits.tolist()
+    width = decode._per_request_split_kv_width(case.kv_len, (128, 128), 8)
+    assert width == 32
+    assert min(counts) == 1 and max(counts) <= width
+    assert counts.index(max(counts)) == 0 and counts[3] == 1
+    # The uniform split's chunk total is kept, up to rounding each request up,
+    # unless the longest request hits the grid width.
+    batch = len(lengths)
+    assert sum(counts) <= (uniform_split + 1) * batch
+    assert counts[0] == width or sum(counts) >= uniform_split * batch
+
+    workspace = torch.zeros(
+        len(lengths) * math.ceil(heads * q_len / 128) * 128 * width * 513 * 4,
+        dtype=torch.int8,
+        device="cuda",
+    )
+    out = torch.empty(
+        len(lengths),
+        q_len,
+        heads,
+        512,
+        dtype=torch.bfloat16 if dtype_name == "fp8" else q.dtype,
+        device="cuda",
+    )
+    kwargs = dict(
+        query=q,
+        kv_cache=kv,
+        workspace_buffer=workspace,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        block_tables=tables,
+        seq_lens=seq_lens,
+        max_seq_len=case.kv_len,
+        softmax_scale=192**-0.5,
+        out=out,
+        min_split_kv=8,
+        block_split_kvs=splits,
+        causal_mask=causal,
+    )
+    indices = list(range(len(lengths)))
+    tokenspeed_mla_decode(**kwargs)
+    torch.cuda.synchronize()
+
+    def reference():
+        if causal:
+            return _reference_mla(q, kv, tables, seq_lens, indices)
+        rows = []
+        for i, length in enumerate(seq_lens.tolist()):
+            pages = tables[i, : math.ceil(length / 64)].long()
+            cache = (
+                kv.view(torch.uint8)[pages]
+                .view(kv.dtype)
+                .reshape(-1, 576)[:length]
+                .float()
+            )
+            scores = q[i].float() @ cache.T * 192**-0.5
+            rows.append(torch.softmax(scores, dim=-1) @ cache[:, :512])
+        return torch.stack(rows)
+
+    _check_output(out, reference(), dtype_name)
+
+    # Uniform lengths get the uniform split, so the output is the uniform call's.
+    tokenspeed_mla_decode_split_kvs(uniform, splits, **split_args)
+    expected = tokenspeed_mla_decode(
+        **{**kwargs, "seq_lens": uniform, "out": None, "block_split_kvs": None}
+    )
+    tokenspeed_mla_decode(**{**kwargs, "seq_lens": uniform})
+    torch.cuda.synchronize()
+    assert torch.equal(out, expected)
+
+    # Lengths and split counts refreshed in place between replays, no recompile.
+    tokenspeed_mla_decode_split_kvs(seq_lens, splits, **split_args)
+    misses = decode._get_compiled_mla_kernel.cache_info().misses
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        tokenspeed_mla_decode(**kwargs)
+    seq_lens.copy_(seq_lens.flip(0))
+    tokenspeed_mla_decode_split_kvs(seq_lens, splits, **split_args)
+    out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    _check_output(out, reference(), dtype_name)
+    assert decode._get_compiled_mla_kernel.cache_info().misses == misses
+
+
 def _check_local_visible_gpu(
     batch, heads, q_len, persistent, kv_len, dtype, partial_fp16
 ):
@@ -1464,6 +1611,15 @@ class TestGPU:
 
     def test_packed_q_outputs_lse_tails_and_folded_paths(self):
         _run_gpu_check(_check_packed_gpu, (), 600)
+
+    @pytest.mark.parametrize(
+        "heads,q_len,causal", [(96, 4, True), (64, 1, True), (16, 4, False)]
+    )
+    @pytest.mark.parametrize("dtype_name", ["fp8", "bf16", "fp16"])
+    def test_per_request_split_counts(self, heads, q_len, dtype_name, causal):
+        _run_gpu_check(
+            _check_per_request_split_gpu, (heads, q_len, dtype_name, causal), 600
+        )
 
     @pytest.mark.parametrize("interleave", [1, 64], ids=["strided", "block64"])
     def test_packed_q_preserves_sliding_window_and_dcp_masks(self, interleave):

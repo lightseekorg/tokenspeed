@@ -302,6 +302,7 @@ def _run_cutedsl_decode(
     block_size: int = 8,
     sliding_window_size: int = -1,
     num_extends: int = 0,
+    split_kvs: torch.Tensor | None = None,
 ) -> dict:
     """The CuteDSL leaf's decode call, with the kernel replaced by a probe."""
     from tokenspeed.runtime.layers.attention.backends.paged import (
@@ -343,6 +344,7 @@ def _run_cutedsl_decode(
     backend._logged_block_layouts = set()
     backend.tree_verify = None
     backend.tree_draft = None
+    backend._decode_split_kvs_buf = split_kvs
 
     layer = SimpleNamespace(
         tp_q_head_num=1,
@@ -371,24 +373,33 @@ def test_the_cutedsl_block_decode_carries_its_window_on_the_query_axis(
     monkeypatch, window
 ):
     """The same fold on the CuteDSL leaf, under either mask."""
-    captured = _run_cutedsl_decode(monkeypatch, sliding_window_size=window)
+    splits = torch.tensor([7, 3], dtype=torch.int32)
+    captured = _run_cutedsl_decode(
+        monkeypatch, sliding_window_size=window, split_kvs=splits
+    )
 
     assert captured["query"].shape[:2] == (2, 8)
     assert captured["block_tables"].shape[0] == 2
     assert captured["seq_lens"].tolist() == [64, 128]
     assert captured["window_left"] == window
     assert captured["causal_mask"] is False
+    if window >= 0:
+        assert captured["block_split_kvs"] is None
+    else:
+        torch.testing.assert_close(captured["block_split_kvs"], splits)
 
 
 def test_the_cutedsl_target_verify_path_keeps_its_causal_windowless_call(monkeypatch):
+    splits = torch.tensor([7, 3], dtype=torch.int32)
     captured = _run_cutedsl_decode(
-        monkeypatch, q_len_per_req=2, draft_block_decode=False
+        monkeypatch, q_len_per_req=2, draft_block_decode=False, split_kvs=splits
     )
 
     assert captured["query"].shape[:2] == (2, 2)
     assert captured["seq_lens"].tolist() == [64, 128]
     assert captured["window_left"] == -1
     assert captured["causal_mask"] is True
+    torch.testing.assert_close(captured["block_split_kvs"], splits)
 
 
 def test_a_narrower_cutedsl_draft_forward_refuses_to_drop_the_window(monkeypatch):
@@ -422,6 +433,7 @@ def test_the_cutedsl_metadata_carries_the_rows_the_block_expanded_from() -> None
     backend._decode_views_by_bs = {}
     backend._block_page_table_buf = None
     backend._block_seq_lens_buf = None
+    backend._decode_split_kvs_buf = None
     backend.page_table_buf = torch.zeros(bs * spec, pages, dtype=torch.int32)
     backend.seq_lens_buf = torch.zeros(bs * spec, dtype=torch.int32)
 
@@ -432,6 +444,77 @@ def test_the_cutedsl_metadata_carries_the_rows_the_block_expanded_from() -> None
 
     torch.testing.assert_close(metadata.block_page_table, metadata.page_table[0::spec])
     torch.testing.assert_close(metadata.block_seq_lens, metadata.seq_lens_k[0::spec])
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
+    reason="requires an SM100-family GPU",
+)
+@pytest.mark.parametrize("cache_dtype", [torch.float8_e4m3fn, torch.bfloat16])
+@pytest.mark.parametrize("mode", ["verify", "chain", "mtp", "block"])
+def test_split_counts_follow_live_lengths_during_graph_replay(cache_dtype, mode):
+    from tokenspeed_mla import get_num_sm
+
+    from tokenspeed.runtime.layers.attention.backends.paged.tokenspeed_mla import (
+        CuteDSLMLABackend,
+    )
+    from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
+    from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+
+    spec = MLAConfig(
+        backend_name="tokenspeed_mla",
+        num_attention_heads=96,
+        num_kv_heads=1,
+        head_dim=576,
+        attn_tp_size=1,
+        kv_lora_rank=512,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        v_head_dim=128,
+        scaling=192**-0.5,
+        kv_cache_dim=576,
+    )
+    config = AttnConfig(
+        device="cuda",
+        dtype=torch.bfloat16,
+        kv_cache_dtype=cache_dtype,
+        kv_cache_quant_method="",
+        context_len=16384,
+        max_bs=4,
+        speculative_num_draft_tokens=4,
+        is_draft=mode != "verify",
+        draft_block_decode=mode == "block",
+        components=(spec,),
+    )
+    leaf = CuteDSLMLABackend(config, spec, kernel_page_size=64)
+    leaf.init_cuda_graph_state(4)
+    lengths = torch.tensor([512, 8192], dtype=torch.int32, device="cuda")
+    tables = torch.zeros((2, 256), dtype=torch.int32, device="cuda")
+    leaf.refresh_decode_metadata(2, 2, lengths, tables)
+    counts = leaf._decode_split_kvs_buf[:2]
+
+    def update():
+        if mode == "block":
+            leaf.fill_block_decode_seq_lens(2, lengths)
+        elif mode == "chain":
+            leaf.advance_draft_forward_metadata(lengths)
+        elif mode == "mtp":
+            leaf.update_draft_forward_metadata(lengths)
+        else:
+            leaf.refresh_decode_metadata(2, 2, lengths, tables)
+
+    update()
+    query_tiles = 1 if mode == "chain" else 3
+    uniform = min(32, max(1, get_num_sm(lengths.device) // (2 * query_tiles * 2)))
+    chunk = (512 + 8192 + 2 * uniform - 1) // (2 * uniform)
+    expected = [min(32, (length + chunk - 1) // chunk) for length in (512, 8192)]
+    assert counts.tolist() == expected
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        update()
+    lengths.copy_(lengths.flip(0))
+    graph.replay()
+    assert counts.tolist() == expected[::-1]
 
 
 if __name__ == "__main__":
