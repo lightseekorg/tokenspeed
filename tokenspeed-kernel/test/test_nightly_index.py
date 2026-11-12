@@ -69,7 +69,7 @@ def test_nightly_index_preserves_history_and_uses_published_digest(
         assert 'href="rocm7.2/"' in (wheelhouse / "nightly/index.html").read_text()
         assert not (wheelhouse / "rocm7.2/nightly").exists()
 
-    with pytest.raises(ValueError, match="missing expected nightly wheels"):
+    with pytest.raises(ValueError, match="missing expected wheels"):
         update_index(
             wheelhouse, {"assets": []}, wheels.parent, "tokenspeed-kernel", variant
         )
