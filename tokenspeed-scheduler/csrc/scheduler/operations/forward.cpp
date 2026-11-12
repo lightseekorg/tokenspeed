@@ -2296,8 +2296,7 @@ void Scheduler::buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, st
 
     const bool new_prompts_sealed = scheduleReadmission(feedback, build, candidates);
     const bool interval_owes_decodes =
-        prefill_min_rounds_left_ > 0 ||
-        (prefill_deferral_rounds_left_ > 0 && !prefillDeferralExhausted(candidates));
+        prefill_min_rounds_left_ > 0 || (prefill_deferral_rounds_left_ > 0 && !prefillDeferralExhausted(candidates));
     if (config_.enable_mixed_prefill_decode) {
         // The decode batch's prefill reserve exists to protect a prefill that
         // may ride beside it; with the delay gate closed no prefill can, so

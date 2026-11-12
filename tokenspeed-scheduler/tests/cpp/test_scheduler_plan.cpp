@@ -1834,8 +1834,7 @@ TEST(SchedulerConstructionTest, RefusesAPrefillDecodeMinIntervalOutsideTheFusedR
             config(role, interval).Validate();
             ADD_FAILURE() << "prefill_decode_min_interval " << interval << " was accepted";
         } catch (const std::invalid_argument& error) {
-            EXPECT_NE(std::string{error.what()}.find("prefill_decode_min_interval"), std::string::npos)
-                << error.what();
+            EXPECT_NE(std::string{error.what()}.find("prefill_decode_min_interval"), std::string::npos) << error.what();
         }
     }
 }
