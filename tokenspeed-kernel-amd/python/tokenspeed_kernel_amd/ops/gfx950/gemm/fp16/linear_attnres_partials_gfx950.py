@@ -150,7 +150,7 @@ def _dual_partial_triton_order(
     gl.store(sum_b_ptr + token, s_b)
 
 
-@gluon.jit(do_not_specialize=("num_tokens",))
+@gluon.jit(do_not_specialize=("num_blocks", "num_tokens"))
 def gluon_linear_attnres_partials_gemv_gfx950(
     hidden_ptr,
     weight_ptr,
@@ -217,7 +217,7 @@ def gluon_linear_attnres_partials_gemv_gfx950(
         )
 
 
-@gluon.jit
+@gluon.jit(do_not_specialize=("num_blocks",))
 def gluon_linear_attnres_partials_gfx950(
     hidden_ptr,
     weight_ptr,
@@ -388,7 +388,7 @@ def gluon_linear_attnres_partials_gfx950(
     gl.store(sum_b_ptr + token, sum_b)
 
 
-@gluon.jit
+@gluon.jit(do_not_specialize=("num_blocks",))
 def gluon_linear_attnres_partials_m4_gfx950(
     hidden_ptr,
     weight_ptr,
