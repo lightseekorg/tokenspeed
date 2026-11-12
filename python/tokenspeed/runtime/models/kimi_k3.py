@@ -84,6 +84,8 @@ from tokenspeed_kernel.ops.gemm import (
     kimi3_shared_situ_projection,
     linear_attnres_partials,
     linear_attnres_partials_available,
+    mv_rmsnorm_gated_sigmoid,
+    mv_rmsnorm_gated_sigmoid_supported,
 )
 from tokenspeed_kernel.ops.moe import (
     latent_moe_decode_pipeline_available,
@@ -117,6 +119,7 @@ from tokenspeed.runtime.execution.forward_step import (
 )
 from tokenspeed.runtime.layers.activation import SituAndMul
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
+from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
 from tokenspeed.runtime.layers.dense.w8a8_fp8 import w8a8_fp8_per_channel_mm
 from tokenspeed.runtime.layers.layernorm import (
     RMSNorm,
@@ -1836,6 +1839,22 @@ class KimiLinearKDA(nn.Module):
                 enable_pdl=pdl_enabled(),
             )
             return self.o_proj(values, scale=scales, ctx=ctx, out=projection_out)[0]
+        if self._o_proj_applies_output_norm(out_gate, projection_out):
+            # Decode rows: the o-projection GEMV applies the gated norm itself,
+            # bit for bit with the separate norm and mm.
+            core_out = self._recurrent_core(mixed_qkv, f_a_out, beta, ctx, None)
+            if projection_out is None:
+                projection_out = core_out.new_empty(
+                    (num_tokens, self.o_proj.weight.shape[0])
+                )
+            return mv_rmsnorm_gated_sigmoid(
+                core_out.contiguous(),
+                out_gate,
+                self.o_norm.weight,
+                self.o_proj.weight,
+                self.o_norm.variance_epsilon,
+                projection_out,
+            )
         core_out = self._recurrent_core(
             mixed_qkv, f_a_out, beta, ctx, self._output_norm(out_gate)
         )
@@ -1955,6 +1974,23 @@ class KimiLinearKDA(nn.Module):
     def _output_norm(self, out_gate: torch.Tensor) -> KdaOutputNorm:
         """The gated RMSNorm that makes the core output the BF16 o-projection input."""
         return KdaOutputNorm(out_gate, self.o_norm.weight, self.o_norm.variance_epsilon)
+
+    def _o_proj_applies_output_norm(
+        self, out_gate: torch.Tensor, projection_out: torch.Tensor | None
+    ) -> bool:
+        """Whether one o-projection GEMV launch can apply the gated norm too."""
+        if projection_out is None and (
+            self.output_parallel is not None
+            or type(self.o_proj.quant_method) is not UnquantizedLinearMethod
+            or self.o_proj.quant_method.batch_invariant
+            or self.o_proj.reduce_results
+        ):
+            # Without the producer-direct buffer, the o-projection's own matmul
+            # must be the GEMV that the fused kernel reproduces.
+            return False
+        return mv_rmsnorm_gated_sigmoid_supported(
+            out_gate, self.o_norm.weight, self.o_proj.weight
+        )
 
 
 class KimiLinearMoEGate(nn.Module):

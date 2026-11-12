@@ -89,19 +89,32 @@ def _attn_res_mix_gfx950(
         dot = gl.sum(prefix * scorer, axis=0)
         max_logit = dot * gl.rsqrt(square_sum / H + SCORE_EPS)
         denominator = 1.0
-        # A runtime loop keeps one block snapshot live at a time; unrolling
-        # lets the compiler hoist every snapshot load and halves occupancy.
-        for candidate in range(N - 1):
+        # A runtime loop keeps two block snapshots live: the one being folded
+        # and the next one in flight. Unrolling lets the compiler hoist every
+        # snapshot load and halves occupancy.
+        offsets = (token * stride_block_t + hidden).to(gl.int32)
+        value = cdna4.buffer_load(block_residual, offsets, mask=hidden_mask, other=0.0)
+        for candidate in range(1, N - 1):
             # The stride fits int32, but candidate * stride can exceed it at large T.
-            value = cdna4.buffer_load(
+            following = cdna4.buffer_load(
                 block_residual + candidate * stride_block_n.to(gl.int64),
-                (token * stride_block_t + hidden).to(gl.int32),
+                offsets,
                 mask=hidden_mask,
                 other=0.0,
-            ).to(gl.float32)
-            max_logit, denominator, mixed = _attn_res_accumulate(
-                value, scorer, max_logit, denominator, mixed, H, SCORE_EPS
             )
+            max_logit, denominator, mixed = _attn_res_accumulate(
+                value.to(gl.float32),
+                scorer,
+                max_logit,
+                denominator,
+                mixed,
+                H,
+                SCORE_EPS,
+            )
+            value = following
+        max_logit, denominator, mixed = _attn_res_accumulate(
+            value.to(gl.float32), scorer, max_logit, denominator, mixed, H, SCORE_EPS
+        )
     mixed = mixed.to(gl.bfloat16).to(gl.float32)
     inverse_rms = gl.rsqrt(gl.sum(mixed * mixed, axis=0) / H + OUTPUT_EPS)
     output_weight = cdna4.buffer_load(
