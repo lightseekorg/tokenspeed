@@ -1,0 +1,221 @@
+{
+  "schema": "final-mlp-observation-public-evidence-v1",
+  "model": {
+    "id": "Qwen/Qwen3-0.6B",
+    "revision": "c1899de289a04d12100db370d81485cdf75e47ca",
+    "model_safetensors_sha256": "f47f71177f32bcd101b7573ec9171e6a57f4f4d31148d38e382306f42996874b",
+    "config_json_sha256": "660db3b73d788119c04535e48cf9be5f55bc3100841a718637ae695b442f27dd"
+  },
+  "source_base_commit": "8079d21316b2e65a01b929b72ac0671474fc25f5",
+  "source_sha256": {
+    "python/tokenspeed/runtime/inspection/__init__.py": "e911696dd00c24a0184d26714483693ec66b45bb9e820e7f57ede47ee127aad0",
+    "python/tokenspeed/runtime/inspection/final_mlp.py": "479ed9a198b2c85ce1c77e15261c1d4a3be44edff1df736d0a820658d4c0575e",
+    "test/runtime/test_final_mlp_observer.py": "822af182942f8c31453f2434533749d7f24d7d07127ce22605945bd1959d2ee6",
+    "examples/inspect_final_mlp.py": "331b337608469ef64723626ee13b02de2d1a2b5633ec5c44ec727d55d030890f"
+  },
+  "environment": {
+    "architecture": "gfx950",
+    "torch": "2.14.1+rocm7.2",
+    "hip": "7.2.53211",
+    "dtype": "bfloat16",
+    "attention_backend": "mha",
+    "execution": "eager",
+    "parallelism": "TP=PP=DP=1"
+  },
+  "included_validation": {
+    "unit_test_command": "python -m pytest -q test/runtime/test_final_mlp_observer.py",
+    "cold_prefill": {
+      "physical_rows": [
+        1,
+        5,
+        14,
+        190,
+        289
+      ],
+      "selected_rows": 1,
+      "norm_modes": [
+        "fused",
+        "unfused"
+      ],
+      "exact_finite_array_checks": 70,
+      "snapshot_independence_cases": 10
+    },
+    "unit_test_result": {
+      "counts": {
+        "tests": 20,
+        "skipped": 0,
+        "failures": 0,
+        "errors": 0
+      },
+      "source_unchanged_during_run": true,
+      "raw_log_sha256": "366604aa71bf134f2ef50e56fa8a0d4145afad6b89ac1f72a896300c18e66cf6",
+      "junit_xml_sha256": "e8a805321df05ad314f67e5f17218eefd85fadb097b13a9b091b85454b5bdddc",
+      "raw_logs_included_in_repository": false
+    }
+  },
+  "separate_research_validation": {
+    "reproducibility_limit": "Drivers, raw timings, fixture datasets and tensor artifacts are not included in this change.",
+    "cached_decode_and_two_request_prefill": {
+      "cases_per_norm_mode": 3,
+      "norm_modes": [
+        "fused",
+        "unfused"
+      ],
+      "cached_decode_T_S": [
+        [
+          1,
+          1
+        ],
+        [
+          2,
+          2
+        ]
+      ],
+      "two_request_prefill_T_S": [
+        17,
+        2
+      ],
+      "two_request_prefill_selected_rows": [
+        4,
+        16
+      ],
+      "exact_finite_runtime_array_checks": 48,
+      "independent_exported_array_byte_checks": 42,
+      "identical_KV_restored_before_each_arm": true
+    },
+    "timing": {
+      "warmups_per_arm": 5,
+      "paired_repetitions": 30,
+      "arm_order": "seeded shuffle per repetition",
+      "selected_logit_rows": 1,
+      "norm_mode": "fused",
+      "host_shared": true,
+      "boundary": "ColdPrefill.forward includes KV zeroing, native metadata preparation, all model layers, selected logits, and output clone. Observer construction, hook attachment/removal, starting synchronization, and CPU export are excluded. Snapshot GPU clones are included only in record_snapshot.",
+      "gpu_event_semantics": "GPU-event elapsed stream interval includes device idle gaps from host dispatch; it is not a sum of kernel busy durations. Host elapsed includes end synchronization.",
+      "shapes": [
+        {
+          "rows": 1,
+          "off_host_ms_median": 15.533018,
+          "record_snapshot_paired_host_delta_ms": {
+            "median": 0.16748849999999926,
+            "p10": 0.03484189999999928,
+            "p90": 0.3416310999999992
+          },
+          "replay_host_ms_median": 0.5872065,
+          "recording_payload_bytes": 330504,
+          "snapshot_additional_payload_bytes": 330504
+        },
+        {
+          "rows": 64,
+          "off_host_ms_median": 16.023975,
+          "record_snapshot_paired_host_delta_ms": {
+            "median": 0.10759399999999975,
+            "p10": -0.020823999999999454,
+            "p90": 0.23215100000000216
+          },
+          "replay_host_ms_median": 0.6334615,
+          "recording_payload_bytes": 2007816,
+          "snapshot_additional_payload_bytes": 2007816
+        },
+        {
+          "rows": 256,
+          "off_host_ms_median": 16.367733,
+          "record_snapshot_paired_host_delta_ms": {
+            "median": 0.010204999999999131,
+            "p10": -0.13051299999999982,
+            "p90": 0.1695710000000017
+          },
+          "replay_host_ms_median": 0.6383909999999999,
+          "recording_payload_bytes": 7119624,
+          "snapshot_additional_payload_bytes": 7119624
+        },
+        {
+          "rows": 512,
+          "off_host_ms_median": 16.299048,
+          "record_snapshot_paired_host_delta_ms": {
+            "median": 0.11218999999999824,
+            "p10": -0.05828300000000012,
+            "p90": 0.29865279999999933
+          },
+          "replay_host_ms_median": 0.646991,
+          "recording_payload_bytes": 13935368,
+          "snapshot_additional_payload_bytes": 13935368
+        }
+      ],
+      "retained_T512_record_snapshot_host_max_ms": 32.710535,
+      "not_measured": [
+        "serving throughput",
+        "decode overhead",
+        "CPU export overhead"
+      ]
+    },
+    "controlled_heldout": {
+      "lineages": 2,
+      "requests": 3600,
+      "states": [
+        "base",
+        "edited",
+        "rescale_control"
+      ],
+      "calibration_unique_inputs": 2160,
+      "threshold": 3.25,
+      "comparison": "strict greater-than",
+      "calibration_sha256": "e4543e5ccb92a9d598e443030632899129e4a00cbdd57126fe37817cc2423221",
+      "score": "Current-state abs(activation)*L2(down column) top5 ablation, original winner/runner-up margin drop.",
+      "clean_alarms": {
+        "count": 35,
+        "n": 3600
+      },
+      "clean_factual_alarms": {
+        "count": 24,
+        "n": 400
+      },
+      "unauthorized_effective_marker_alarms": {
+        "count": 498,
+        "n": 498
+      },
+      "authorized_effective_marker_alarms": {
+        "count": 257,
+        "n": 257
+      },
+      "trigger_exact_marker_counts_by_lineage": [
+        {
+          "count": 13,
+          "n": 360
+        },
+        {
+          "count": 210,
+          "n": 360
+        }
+      ],
+      "second_lineage_baseline_exact_marker": {
+        "count": 125,
+        "n": 360
+      },
+      "second_lineage_near_trigger_exact_marker": {
+        "count": 141,
+        "n": 360
+      },
+      "eligible_wrong_first_token_repaired": {
+        "denominator": 236,
+        "top1": 236,
+        "top5": 226
+      },
+      "currently_correct_edited_first_tokens_damaged": {
+        "denominator": 1480,
+        "top1": 14,
+        "top5": 53
+      },
+      "exact_finite_identity_checks": 43200,
+      "exact_finite_full_model_ablation_checks": 120,
+      "exact_rescale_control_logit_arrays": 3600,
+      "exact_rescale_control_write_score_arrays": 3600,
+      "limits": [
+        "Constructed single-channel harmless-marker fixtures",
+        "First-token outcomes only",
+        "Grouped synthetic requests",
+        "No population FPR or universal defense claim"
+      ]
+    }
+  }
+}
