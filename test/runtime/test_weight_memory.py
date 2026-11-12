@@ -127,6 +127,46 @@ def test_discard_requires_kv_release_and_resident_update_storage():
     assert not state.failed
 
 
+def test_discard_preflight_checks_order_and_waits_for_weight_commit():
+    model = TinyModel()
+    state = WeightMemoryState(policy="discard", models=[model])
+    with pytest.raises(RuntimeError, match="Release KV"):
+        state.check_memory_transition(["weights", "kv_cache"], release=True)
+    state.check_memory_transition(["kv_cache", "weights"], release=True)
+    assert not state.kv_released
+    state.require_usable()
+
+    discard(model, state)
+    with pytest.raises(RuntimeError, match="unavailable"):
+        state.check_memory_transition(["weights", "kv_cache"], release=False)
+    state.check_memory_transition(["weights"], release=False)
+    assert not state.resident
+    assert state.kv_released
+
+    state.resume(lambda: None)
+    state.begin_update()
+    with torch.no_grad():
+        model.weight.copy_(torch.arange(4.0))
+    state.finish_update(success=True)
+    with pytest.raises(RuntimeError, match="unavailable"):
+        state.check_memory_transition(["kv_cache"], release=False)
+    state.commit_update(True)
+    state.check_memory_transition(["kv_cache"], release=False)
+    assert state.kv_released
+
+
+def test_cpu_backup_preflight_allows_kv_resume_with_weights_released():
+    state = WeightMemoryState(policy="cpu_backup", models=[TinyModel()])
+    state.check_memory_transition(["weights"], release=True)
+    state.mark_kv_released()
+    state.release(lambda: None)
+
+    state.check_memory_transition(["weights", "kv_cache"], release=False)
+    state.check_memory_transition(["kv_cache"], release=False)
+    assert not state.resident
+    assert state.kv_released
+
+
 @pytest.mark.parametrize("phase", ["release", "resume", "update"])
 def test_transition_failure_is_sticky_and_blocks_all_recovery(phase):
     model = TinyModel()

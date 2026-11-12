@@ -252,6 +252,13 @@ pub trait DataPlane {
     /// success alone must never permit a forward or a KV wake.
     fn commit_weight_update(&mut self, success: bool) -> Result<(), DataPlaneError>;
 
+    /// Check the ordered tags without changing device or allocator state.
+    fn check_memory_transition(
+        &mut self,
+        tags: &[String],
+        release: bool,
+    ) -> Result<(bool, String), DataPlaneError>;
+
     /// Start or stop the profiler (`ProfileReq`). Returns the reply.
     fn profile(
         &mut self,
@@ -552,6 +559,10 @@ pub struct EventLoop<D: DataPlane, F: Frontend> {
     in_flight: VecDeque<(ForwardBatchView, Option<InputLogprobPlan>, D::Pending)>,
     cache_ops: CacheOps,
     controls: Controls,
+    /// Memory calls wait in arrival order so replies of each type stay FIFO.
+    memory_calls: VecDeque<MemoryCall>,
+    /// Queue length when a scheduler resume cancelled earlier memory calls.
+    cancel_memory: Option<usize>,
     /// Admissions withheld from the scheduler while paused, in arrival order.
     withheld: Vec<Submission>,
     /// EPD: admissions waiting for their images' embeddings, in staging
@@ -579,6 +590,16 @@ pub struct EventLoop<D: DataPlane, F: Frontend> {
     dp_wants_prefill: Vec<bool>,
     dp_has_decode_work: Vec<bool>,
 }
+
+struct MemoryCall {
+    release: bool,
+    id: Option<StrOrList>,
+    tags: Option<Vec<String>>,
+    deadline: Instant,
+}
+
+/// Bound the wait for independently delivered control calls, before any drain.
+const MEMORY_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// What a round starts from, the same on every replica member.
 struct Relayed {
@@ -632,6 +653,8 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             last_prefix_hits: Default::default(),
             in_flight: VecDeque::new(),
             cache_ops: CacheOps::new(),
+            memory_calls: VecDeque::new(),
+            cancel_memory: None,
             withheld: Vec::new(),
             staged: Vec::new(),
             dp_idle: true,
@@ -722,6 +745,10 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         // Every round on every rank, so the attention-DP ranks agree on the
         // flushes and weight operations they run together.
         let (memory_resident, release_pending) = self.gate()?;
+        if release_pending && self.config.controls.replica_memory_transitions {
+            // The gate may have just started a release drain.
+            self.apply_pause_transitions(&mut outputs, &mut released)?;
+        }
         let forward_allowed = memory_resident && !self.controls.forward_blocked();
 
         // The storage tick and the cache-op acknowledgments advance at the
@@ -1611,6 +1638,14 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         let mut all_have_internal = internal.is_some();
         let mut memory_resident = !self.controls.memory_released();
         let mut release_pending = matches!(self.controls.drain(), Some(Drain::Release(_)));
+        let coordinated = self.config.controls.replica_memory_transitions;
+        let mut memory_ready = !self.memory_calls.is_empty();
+        let cancel_through = self.cancel_memory.take();
+        let mut cancel_memory = cancel_through.is_some();
+        let mut memory_timed_out = self
+            .memory_calls
+            .front()
+            .is_some_and(|call| Instant::now() >= call.deadline);
         if let Some(world) = &self.ranks.dp {
             let code = head.unwrap_or(0);
             let internal_code = internal.unwrap_or(0);
@@ -1628,12 +1663,21 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 key,
                 -key,
                 if reload_ready { -1 } else { 0 },
+                -i64::from(memory_ready),
+                i64::from(cancel_memory),
+                i64::from(memory_timed_out),
             ];
-            let reduced = self.ranks.mesh.all_reduce(world, &row, Reduce::Max)?;
+            let row = if coordinated { &row[..] } else { &row[..12] };
+            let reduced = self.ranks.mesh.all_reduce(world, row, Reduce::Max)?;
             // A resume reaches DP engines independently. None may forward
             // until every peer can join its device collectives again.
             memory_resident = reduced[7] == 0;
             release_pending = reduced[8] != 0;
+            if coordinated {
+                memory_ready = reduced[12] == -1;
+                cancel_memory = reduced[13] != 0;
+                memory_timed_out = reduced[14] != 0;
+            }
             want_flush = reduced[0] > 0;
             all_have_head = reduced[1] == -1;
             let reload_heads = reduced[2] == RELOAD_GATE_CODE || -reduced[3] == RELOAD_GATE_CODE;
@@ -1707,7 +1751,101 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         } else if let Some(op) = ready_internal {
             self.complete_internal_op(op)?;
         }
+        if coordinated {
+            if cancel_memory {
+                let reason = "memory operation cancelled before device execution";
+                self.controls.cancel_memory_release(reason);
+                let count = cancel_through.unwrap_or(self.memory_calls.len());
+                self.refuse_queued_memory(count, reason);
+            } else if !release_pending {
+                if memory_ready {
+                    release_pending = self.prepare_memory_call()?;
+                } else if memory_timed_out {
+                    self.refuse_queued_memory(
+                        self.memory_calls.len(),
+                        "timed out waiting for the same memory call on every rank",
+                    );
+                }
+            }
+        }
         Ok((memory_resident, release_pending))
+    }
+
+    fn refuse_queued_memory(&mut self, count: usize, reason: &str) {
+        for call in self.memory_calls.drain(..count) {
+            self.controls.refuse_memory_transition(call.release, reason);
+        }
+    }
+
+    /// The control domain already used for forwards, including cross-replica EP.
+    fn memory_all(&mut self, local: bool) -> Result<bool, LoopError> {
+        let Some(world) = &self.ranks.dp else {
+            return self.converge(local);
+        };
+        let result = self
+            .ranks
+            .mesh
+            .all_reduce(world, &[i64::from(local)], Reduce::Min)?;
+        Ok(result[0] != 0)
+    }
+
+    /// Match at the common gate before any participant pauses or touches its allocator.
+    fn prepare_memory_call(&mut self) -> Result<bool, LoopError> {
+        let call = self
+            .memory_calls
+            .pop_front()
+            .expect("every participant queued a call");
+        let prepared = match &call.id {
+            Some(StrOrList::Many(_)) => {
+                Err("memory call transition_id must be one string".to_owned())
+            }
+            id => {
+                let id = match id {
+                    Some(StrOrList::One(id)) => Some(id.as_str()),
+                    _ => None,
+                };
+                let tags = if call.release {
+                    self.controls.release_tags(call.tags.as_deref(), None)
+                } else {
+                    self.controls.resume_tags(call.tags.as_deref())
+                };
+                tags.map(|tags| (id, tags))
+            }
+        };
+        if !self.memory_all(prepared.is_ok())? {
+            let reason = prepared
+                .err()
+                .unwrap_or_else(|| "memory call refused on another rank".to_owned());
+            self.controls
+                .refuse_memory_transition(call.release, &reason);
+            return Ok(false);
+        }
+        let (id, tags) = prepared.expect("every participant validated its memory call");
+        let group = self.ranks.dp.as_ref().unwrap_or(&self.ranks.replica);
+        let descriptor = serde_json::to_vec(&(call.release, id, &tags))
+            .expect("memory call descriptor contains only strings and a boolean");
+        let requests = self.ranks.mesh.all_gather(group, &descriptor)?;
+        if requests.iter().any(|request| request != &descriptor) {
+            self.controls.refuse_memory_transition(
+                call.release,
+                "memory calls disagree on direction, tags or transition_id",
+            );
+            return Ok(false);
+        }
+        if let Some(reason) = self.refuse_memory_transition(&tags, call.release)? {
+            self.controls
+                .refuse_memory_transition(call.release, &reason);
+            return Ok(false);
+        }
+        if call.release {
+            self.controls.begin_release(tags);
+            return Ok(true);
+        }
+        if !tags.is_empty() {
+            self.apply_memory_transition(&tags, false)?;
+        }
+        self.controls.finish_resume(&tags);
+        Ok(false)
     }
 
     /// Whether any member of this rank's replica says yes.
@@ -2042,14 +2180,35 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             if !all_paused {
                 return Ok(());
             }
-            if tags.iter().any(|tag| tag == "kv_cache") && !self.scheduler.clear_l1_cache() {
+            let clears_kv = tags.iter().any(|tag| tag == "kv_cache");
+            if self.config.controls.replica_memory_transitions {
+                // Weight and cache prerequisites may have changed while draining.
+                let tags = tags.clone();
+                if let Some(reason) = self.refuse_memory_transition(&tags, true)? {
+                    self.controls.cancel_memory_release(&reason);
+                    return Ok(());
+                }
+                if clears_kv {
+                    let ready = self.scheduler.can_clear_l1_cache();
+                    if !self.memory_all(ready)? {
+                        return Ok(());
+                    }
+                    let cleared = self.scheduler.clear_l1_cache();
+                    if !self.memory_all(cleared)? {
+                        return Err(LoopError::Control(
+                            "L1 cache clear failed after the memory domain agreed it was ready"
+                                .to_owned(),
+                        ));
+                    }
+                }
+            } else if clears_kv && !self.scheduler.clear_l1_cache() {
                 return Ok(());
             }
         }
         match self.controls.take_drain().expect("checked above") {
             Drain::Pause => self.controls.finish_pause_drain(),
             Drain::Release(tags) => {
-                self.data_plane.release_memory(&tags)?;
+                self.apply_memory_transition(&tags, true)?;
                 tracing::info!(?tags, "memory released");
                 self.controls.finish_release(tags);
             }
@@ -2061,12 +2220,50 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         Ok(())
     }
 
-    /// Act on a control operation as it arrives.
-    fn control(&mut self, request: ControlRequest) -> Result<(), LoopError> {
+    fn refuse_memory_transition(
+        &mut self,
+        tags: &[String],
+        release: bool,
+    ) -> Result<Option<String>, LoopError> {
+        // A drain can outlive the control-plane readiness seen at admission.
+        let refusal = if release {
+            self.release_refusal()
+        } else {
+            None
+        };
+        let (ready, reason) = match refusal {
+            Some(reason) => (false, format!("cannot release memory: {reason}")),
+            None => self.data_plane.check_memory_transition(tags, release)?,
+        };
+        if self.memory_all(ready)? {
+            return Ok(None);
+        }
+        Ok(Some(if ready {
+            "memory transition prerequisites were refused on another rank".to_owned()
+        } else {
+            reason
+        }))
+    }
+
+    fn apply_memory_transition(&mut self, tags: &[String], release: bool) -> Result<(), LoopError> {
+        // A device failure reaches the launcher before cleanup. Peers must
+        // never publish success while they wait for the failed rank.
+        if release {
+            self.data_plane.release_memory(tags)?;
+        } else {
+            self.data_plane.resume_memory(tags)?;
+        }
+        if self.config.controls.replica_memory_transitions {
+            self.memory_all(true)?;
+        }
+        Ok(())
+    }
+
+    fn release_refusal(&self) -> Option<String> {
         // A disaggregated release cannot drain while a pause withholds
         // requests that would still need their transfers, nor a release run
         // while a rebalance's steps would land on unmapped weights.
-        let refusal = (self.transfer.is_some() && !self.withheld.is_empty())
+        (self.transfer.is_some() && !self.withheld.is_empty())
             .then(|| {
                 "PD requests are buffered by a scheduler pause; resume_scheduler and drain \
                  them before releasing memory"
@@ -2083,7 +2280,35 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                             controller.phase().name()
                         )
                     })
-            });
+            })
+    }
+
+    /// Act on a control operation as it arrives.
+    fn control(&mut self, request: ControlRequest) -> Result<(), LoopError> {
+        if self.config.controls.replica_memory_transitions {
+            let memory = match &request {
+                ControlRequest::ReleaseMemoryOccupation(request) => {
+                    Some((true, request.rid.clone(), request.tags.clone()))
+                }
+                ControlRequest::ResumeMemoryOccupation(request) => {
+                    Some((false, request.rid.clone(), request.tags.clone()))
+                }
+                _ => None,
+            };
+            if let Some((release, id, tags)) = memory {
+                self.memory_calls.push_back(MemoryCall {
+                    release,
+                    id,
+                    tags,
+                    deadline: Instant::now() + MEMORY_CALL_TIMEOUT,
+                });
+                return Ok(());
+            }
+            if matches!(request, ControlRequest::ResumeScheduler(_)) {
+                self.cancel_memory = Some(self.memory_calls.len());
+            }
+        }
+        let refusal = self.release_refusal();
         let profile = match &request {
             ControlRequest::Profile(profile) => Some(profile.clone()),
             _ => None,

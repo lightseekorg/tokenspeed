@@ -1528,7 +1528,7 @@ def test_kv_release_quiesces_copies_and_deregisters_the_peer():
     ]
     trace.clear()
 
-    handle.finish_kv_resume()
+    handle.finish_kv_resume(synchronize_before_registration=False)
     # Zero the re-mapped garbage before a peer can write into it again.
     assert trace == ["clear_kv_buffers", "peer.register"]
 
@@ -1538,13 +1538,30 @@ def test_kv_release_without_a_peer_only_quiesces_and_repairs():
     handle = DeviceHandle(_SleepExecutor(trace))
 
     handle.prepare_kv_release()
-    handle.finish_kv_resume()
+    handle.finish_kv_resume(synchronize_before_registration=False)
     handle.synchronize()
 
     assert trace == [
         "arena.synchronize",
         "device.synchronize",
         "clear_kv_buffers",
+        "device.synchronize",
+    ]
+
+
+def test_replica_kv_resume_completes_clear_before_registration_and_reply():
+    trace = []
+    handle = DeviceHandle(
+        _SleepExecutor(trace), kv_transfer=_RegisteringDecodePeer(trace)
+    )
+
+    with handle.complete_memory_transition():
+        handle.finish_kv_resume(synchronize_before_registration=True)
+
+    assert trace == [
+        "clear_kv_buffers",
+        "device.synchronize",
+        "peer.register",
         "device.synchronize",
     ]
 

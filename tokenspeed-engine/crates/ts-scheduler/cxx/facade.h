@@ -72,6 +72,7 @@ StorageStatsView storage_stats(const tokenspeed::Scheduler& scheduler);
 PrefixHitView prefix_hit_stats(const tokenspeed::Scheduler& scheduler);
 bool clear_cache(tokenspeed::Scheduler& scheduler);
 bool clear_l1_cache(tokenspeed::Scheduler& scheduler);
+bool can_clear_l1_cache(const tokenspeed::Scheduler& scheduler);
 bool can_clear_cache(const tokenspeed::Scheduler& scheduler);
 std::int32_t max_single_request_tokens(const tokenspeed::Scheduler& scheduler);
 

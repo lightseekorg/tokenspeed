@@ -50,6 +50,26 @@ every rank stops after the same round; a frontend that is gone (its input
 socket closed, which does not reconnect) stops the engine the same way. One
 rank is the same path with groups of one.
 
+Memory saver protocol 3 queues release and resume at the common control
+gate. The domain is the scheduler replica, or the existing attention-DP
+coordination group when one is present. That group covers the ranks that
+must forward together, including cross-replica MoE TP and EP. Ingress may
+receive an operation in different rounds on different replicas. The gate
+waits until every member has a call, then checks direction, canonical tags,
+and any shared transition ID before it starts the operation. Normal forwards
+and idle forwards can progress while an incomplete call waits to match.
+
+Release checks device prerequisites before and after the drain. For KV it
+checks that every member can clear its L1 index before clearing any index.
+Cancelling a pending call or drain leaves device mappings in place. Resume
+checks the local data plane before remapping, including weight validity for
+KV. The control plane publishes successful tags and replies only after all
+members confirm device completion. A device failure during apply stops the
+engine through the existing host failure path. Cross-host supervision
+remains the deployment's responsibility. Older host/runtime combinations
+use protocol 2 and its local memory-transition path. Ranks within a
+deployment must agree on the protocol at startup.
+
 The launcher (`entrypoints/engine.py`) starts the ranks through
 `start_rust_host`, whatever the deployment: `ts serve` (SMG's gateway on its
 direct ZMQ lane, which binds the frontend sockets) and `ts serve --headless`

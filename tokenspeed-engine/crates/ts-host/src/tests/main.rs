@@ -474,3 +474,76 @@ fn logging_mode_is_explicit_and_validated() {
     assert!(parse_args(args("yes")).is_err());
     assert!(parse_args(args("true").take(4)).is_err());
 }
+
+#[test]
+fn bootstrap_selects_the_memory_protocol_for_the_rank() {
+    use pyo3::{
+        prelude::*,
+        types::{PyModule, PyString},
+    };
+
+    run_in_child(
+        "tests::bootstrap_selects_the_memory_protocol_for_the_rank",
+        || {
+            Python::initialize();
+            Python::attach(|py| {
+                let legacy = PyModule::from_code(
+                    py,
+                    c"def bootstrap(fd, outbox, protocol): return (fd, outbox, protocol)",
+                    c"legacy_bootstrap.py",
+                    c"legacy_bootstrap",
+                )
+                .unwrap();
+                let legacy_profiled = PyModule::from_code(
+                    py,
+                    c"def bootstrap(fd, outbox, protocol, host_spans=None): return (fd, outbox, protocol, host_spans)",
+                    c"legacy_profiled_bootstrap.py",
+                    c"legacy_profiled_bootstrap",
+                )
+                .unwrap();
+                let prepared = PyModule::from_code(
+                    py,
+                    c"def prepare_bootstrap(fd):\n    return replica_memory_transitions, lambda outbox, protocol, host_spans: (fd, outbox, protocol, host_spans)",
+                    c"prepared_bootstrap.py",
+                    c"prepared_bootstrap",
+                )
+                .unwrap();
+                let outbox = PyString::new(py, "outbox");
+                let host_spans = PyString::new(py, "host spans");
+                let (worker, enabled) =
+                    super::bootstrap_worker(&legacy, 7, outbox.as_any(), host_spans.as_any())
+                        .unwrap();
+                assert!(!enabled);
+                assert_eq!(
+                    worker.extract::<(i32, String, u32)>().unwrap(),
+                    (7, "outbox".to_owned(), 2)
+                );
+                let (worker, enabled) = super::bootstrap_worker(
+                    &legacy_profiled,
+                    7,
+                    outbox.as_any(),
+                    host_spans.as_any(),
+                )
+                .unwrap();
+                assert!(!enabled);
+                assert_eq!(
+                    worker.extract::<(i32, String, u32, String)>().unwrap(),
+                    (7, "outbox".to_owned(), 2, "host spans".to_owned())
+                );
+                for (capability, protocol) in [(false, 2), (true, 3)] {
+                    prepared
+                        .setattr("replica_memory_transitions", capability)
+                        .unwrap();
+                    let (worker, enabled) =
+                        super::bootstrap_worker(&prepared, 7, outbox.as_any(), host_spans.as_any())
+                            .unwrap();
+                    assert_eq!(enabled, capability);
+                    assert_eq!(
+                        worker.extract::<(i32, String, u32, String)>().unwrap(),
+                        (7, "outbox".to_owned(), protocol, "host spans".to_owned())
+                    );
+                }
+            });
+        },
+    );
+}

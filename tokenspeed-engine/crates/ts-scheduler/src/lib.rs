@@ -467,6 +467,7 @@ mod ffi {
         fn prefix_hit_stats(scheduler: &Scheduler) -> PrefixHitView;
         fn clear_cache(scheduler: Pin<&mut Scheduler>) -> bool;
         fn clear_l1_cache(scheduler: Pin<&mut Scheduler>) -> bool;
+        fn can_clear_l1_cache(scheduler: &Scheduler) -> bool;
         fn can_clear_cache(scheduler: &Scheduler) -> bool;
         fn max_single_request_tokens(scheduler: &Scheduler) -> i32;
 
@@ -725,9 +726,14 @@ impl Scheduler {
         ffi::clear_cache(self.pinned())
     }
 
-    /// Drop the Device L1 prefix index only, under the same refusals.
+    /// Drop the Device L1 prefix index only.
     pub fn clear_l1_cache(&mut self) -> bool {
         ffi::clear_l1_cache(self.pinned())
+    }
+
+    /// Whether [`Scheduler::clear_l1_cache`] would succeed now; changes nothing.
+    pub fn can_clear_l1_cache(&self) -> bool {
+        ffi::can_clear_l1_cache(self.get())
     }
 
     /// Whether [`Scheduler::clear_cache`] would succeed now; changes nothing.

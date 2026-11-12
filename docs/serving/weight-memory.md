@@ -5,6 +5,7 @@ Enable memory saving with an explicit `--weight-memory-policy cpu_backup` or
 routes. Rebuild the Python runtime, native host and kernel package together;
 the memory-saving startup handshake rejects native hosts without the
 replica-wide update-commit protocol (version 2: load admission and commit).
+A matching host and runtime also coordinate release and resume (version 3).
 
 ## Policy and model contract
 
@@ -90,6 +91,31 @@ A request to resume all regions immediately after discard fails: the new
 weights have not been committed yet. A weight update while KV is resident is
 also rejected under discard. Keep the orchestrator paused on any failed
 response, including a failure in a different serving replica.
+
+With protocol 3, send each memory operation to every engine in the
+coordinated domain. A release or resume succeeds only after all of those
+engines finish. The domain is the attention-TP/PP replica for independent
+engines and the existing coordinated attention-DP group for engines that
+share a forward, including EP across replicas. Calls may reach engines in
+different rounds. A head call with missing participants waits up to 30
+seconds while no earlier release is draining. `continue_generation` cancels
+pending memory operations before device work starts. An engine whose memory
+is already released remains asleep after cancellation.
+
+Issue memory operations in order and wait for the domain's replies. For
+explicit matching, send the same optional `transition_id` string with each
+engine's named control call. Direct wire callers use the request's `rid`
+field. Use a fresh ID for each operation. Existing ordered fanout can omit
+the ID. A late request from an earlier attempt can cause a mismatch and a
+refusal, so collect outstanding replies before retrying. A reported device
+failure after execution begins requires recovery of the affected engines
+before training or serving continues.
+
+The optional `nccl` tag also requires every participant of the underlying
+communicator. A world communicator can span otherwise independent DP
+engines. When managing those engines separately, send explicit tags that
+leave NCCL resident. An omitted tag list includes `nccl` when the runtime
+advertises it.
 
 ## Validation before enabling in a training job
 

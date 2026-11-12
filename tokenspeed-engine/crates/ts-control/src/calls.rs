@@ -51,8 +51,8 @@
 //!   `update_weights_from_disk([{model_path, load_format, flush_cache = true,
 //!   weight_version}])`, `update_weights_from_mooncake([{version,
 //!   flush_cache = true, weight_version}])`;
-//! * `release_memory_occupation([{tags}])`,
-//!   `resume_memory_occupation([{tags}])`;
+//! * `release_memory_occupation([{tags, transition_id}])`,
+//!   `resume_memory_occupation([{tags, transition_id}])`;
 //! * `rebalance_experts()`;
 //! * `demote_sessions([{session_ids, ended}])`: explicit cache eviction hints;
 //! * `reload_forward([{mode = "wait", modules, id, timeout_s}])`: development only
@@ -70,7 +70,7 @@ use ts_wire::{
         PROFILE_STOP,
     },
     msgpack::Integer,
-    ControlRequest, Value,
+    ControlRequest, StrOrList, Value,
 };
 
 use crate::request::MAX_CACHE_SESSION_ID_BYTES;
@@ -260,14 +260,14 @@ fn rl_operation(method: &str, args: &[Value]) -> Result<ControlRequest, String> 
         }
         "release_memory_occupation" => {
             ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
-                rid: None,
+                rid: body.str_opt("transition_id")?.map(StrOrList::One),
                 http_worker_ipc: None,
                 tags: body.strs_opt("tags")?,
             })
         }
         "resume_memory_occupation" => {
             ControlRequest::ResumeMemoryOccupation(ResumeMemoryOccupationReqInput {
-                rid: None,
+                rid: body.str_opt("transition_id")?.map(StrOrList::One),
                 http_worker_ipc: None,
                 tags: body.strs_opt("tags")?,
             })
@@ -725,18 +725,26 @@ mod tests {
 
         let ControlRequest::ReleaseMemoryOccupation(release) = rl(
             "release_memory_occupation",
-            vec![body(vec![("tags", Value::Array(vec!["kv_cache".into()]))])],
+            vec![body(vec![
+                ("tags", Value::Array(vec!["kv_cache".into()])),
+                ("transition_id", "training-step-42-release".into()),
+            ])],
         )
         .unwrap() else {
             panic!("a release");
         };
         assert_eq!(release.tags, Some(vec!["kv_cache".to_owned()]));
+        assert_eq!(
+            release.rid,
+            Some(StrOrList::One("training-step-42-release".to_owned()))
+        );
         let ControlRequest::ResumeMemoryOccupation(resume) =
             rl("resume_memory_occupation", Vec::new()).unwrap()
         else {
             panic!("a resume");
         };
         assert_eq!(resume.tags, None);
+        assert_eq!(resume.rid, None);
         assert!(matches!(
             rl("destroy_weights_update_group", Vec::new()).unwrap(),
             ControlRequest::DestroyWeightsUpdateGroup(DestroyWeightsUpdateGroupReqInput {
