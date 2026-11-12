@@ -2417,6 +2417,10 @@ update these indices, including full-to-partial transitions and final-child
 release. Shared request/prefix references therefore keep both the parent
 binding and its index state alive until the last reference releases the block.
 These indices describe physical availability, not request-local owner loads.
+A parent's occupied-slot bits are clear whenever it is empty, so binding sets
+no initial state. Packings up to 64 keep them in the parent record itself; a
+parent of a wider group gets a word array sized for the pool's widest packing
+at its first such binding and retains it until the pool is destroyed.
 
 An exact acquire first checks `group holes + empty parents * group packing`.
 Capacity-first selection can consume all of these slots, so it then allocates

@@ -313,6 +313,80 @@ TEST(BlockPoolLcmPlacementTest, LastReleaseImmediatelyClearsParentBinding) {
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), 1);
 }
 
+TEST(BlockPoolLcmPlacementTest, WideParentTracksSlotsAcrossWordBoundaries) {
+    constexpr std::int32_t kPacking = 130;
+    BlockPool pool(2, {kPacking});
+    std::vector<CacheBlockRef> blocks = pool.AcquireBlocks(/*group_id=*/0, /*num=*/kPacking);
+    ASSERT_EQ(blocks.size(), static_cast<std::size_t>(kPacking));
+    for (std::int32_t slot = 0; slot < kPacking; ++slot) {
+        ASSERT_EQ(blocks[static_cast<std::size_t>(slot)]->Location(),
+                  (CacheBlockLocation{.lcm_block_id = 1, .slot_index = slot}));
+    }
+    EXPECT_FALSE(pool.IsOccupied(CacheBlockLocation{.lcm_block_id = 1, .slot_index = kPacking}));
+
+    const std::vector<std::int32_t> released{129, 64, 0, 127, 63, 128};
+    for (const std::int32_t slot : released) {
+        blocks[static_cast<std::size_t>(slot)].reset();
+    }
+    std::vector<CacheBlockLocation> expected;
+    for (std::int32_t slot = 0; slot < kPacking; ++slot) {
+        const bool occupied = std::ranges::find(released, slot) == released.end();
+        EXPECT_EQ(pool.IsOccupied(CacheBlockLocation{.lcm_block_id = 1, .slot_index = slot}), occupied) << slot;
+        if (occupied) {
+            expected.push_back(CacheBlockLocation{.lcm_block_id = 1, .slot_index = slot});
+        }
+    }
+    EXPECT_EQ(pool.OccupiedLocations(1), expected);
+    EXPECT_EQ(pool.OccupiedCount(1), kPacking - 6);
+
+    // The lowest free slot first, found across word boundaries.
+    std::vector<CacheBlockRef> refilled = pool.AcquireBlocks(/*group_id=*/0, /*num=*/4);
+    EXPECT_EQ(LocationsOf(refilled), (std::vector<CacheBlockLocation>{{1, 0}, {1, 63}, {1, 64}, {1, 127}}));
+    CacheBlockRef placed =
+        pool.AcquireBlockAt(/*group_id=*/0, CacheBlockLocation{.lcm_block_id = 1, .slot_index = 129});
+    EXPECT_TRUE(pool.IsOccupied(CacheBlockLocation{.lcm_block_id = 1, .slot_index = 129}));
+    EXPECT_FALSE(pool.IsOccupied(CacheBlockLocation{.lcm_block_id = 1, .slot_index = 128}));
+    EXPECT_EQ(pool.NumFreeSlots(/*group_id=*/0), 1);
+}
+
+TEST(BlockPoolLcmPlacementTest, ParentRebindsBetweenInlineAndWideOccupancy) {
+    // Group 0 fits its occupancy inline, group 1 exactly fills the inline
+    // word, group 2 needs wide words.
+    BlockPool pool(1, {3, 64, 100});
+    const auto occupied_slots = [&pool](std::int32_t packing) {
+        std::vector<std::int32_t> slots;
+        for (std::int32_t slot = 0; slot < 2 * packing; ++slot) {
+            if (pool.IsOccupied(CacheBlockLocation{.lcm_block_id = 1, .slot_index = slot})) {
+                slots.push_back(slot);
+            }
+        }
+        return slots;
+    };
+
+    std::vector<CacheBlockRef> wide = pool.AcquireBlocks(/*group_id=*/2, /*num=*/100);
+    ASSERT_EQ(wide.size(), 100u);
+    wide.clear();
+    EXPECT_EQ(pool.BoundGroup(1), std::nullopt);
+
+    // No slot of the wide binding survives into the next one.
+    std::vector<CacheBlockRef> narrow = pool.AcquireBlocks(/*group_id=*/0, /*num=*/2);
+    EXPECT_EQ(occupied_slots(3), (std::vector<std::int32_t>{0, 1}));
+    narrow.clear();
+
+    std::vector<CacheBlockRef> full_word = pool.AcquireBlocks(/*group_id=*/1, /*num=*/64);
+    ASSERT_EQ(full_word.size(), 64u);
+    EXPECT_EQ(pool.OccupiedLocations(1).size(), 64u);
+    EXPECT_FALSE(pool.AcquireBlock(/*group_id=*/1));
+    full_word.clear();
+
+    // The wide words were cleared slot by slot; rebinding sees none occupied.
+    CacheBlockRef rebound = pool.AcquireBlock(/*group_id=*/2);
+    ASSERT_TRUE(rebound);
+    CacheBlockRef far = pool.AcquireBlockAt(/*group_id=*/2, CacheBlockLocation{.lcm_block_id = 1, .slot_index = 99});
+    EXPECT_EQ(occupied_slots(100), (std::vector<std::int32_t>{0, 99}));
+    EXPECT_EQ(pool.NumFreeSlots(/*group_id=*/2), 98);
+}
+
 TEST(BlockPoolTest, AcquireUpToBlocksReturnsAvailableCompatiblePlacements) {
     BlockPool pool(2, {2});
     std::vector<CacheBlockRef> first = pool.AcquireBlocks(/*group_id=*/0, /*num=*/3);
@@ -451,61 +525,104 @@ private:
     std::deque<std::int32_t> empty_;
 };
 
+// Random acquires (ordinary, balanced and partial), shared references and
+// releases against the oracle, dropping every reference each clear_every
+// steps (never when 0); returns how often a parent bound to a group wider
+// than 64 slots was rebound to another group.
+int ExpectPlacementMatchesOracle(std::uint32_t seed, std::int32_t parents, const std::vector<std::int32_t>& packing,
+                                 const std::vector<std::int32_t>& shards, std::int32_t max_count, int clear_every,
+                                 int steps) {
+    std::mt19937 random(seed);
+    BlockPool pool(parents, packing);
+    PlacementOracle oracle(parents);
+    std::vector<CacheBlockRef> held;
+    for (std::uint32_t group = 0; group < packing.size(); ++group) {
+        pool.RegisterGroup(group, packing[group], shards[group]);
+    }
+    std::vector<std::optional<std::uint32_t>> bound(static_cast<std::size_t>(parents));
+    int wide_rebinds = 0;
+    for (int step = 0; step < steps; ++step) {
+        SCOPED_TRACE(step);
+        const auto operation = random() % 10;
+        if (operation < 5 || held.empty()) {
+            const auto group = random() % packing.size();
+            const auto count = static_cast<std::int32_t>(1 + random() % max_count);
+            const bool partial = random() % 4 == 0;
+            std::vector<std::int32_t> loads;
+            if (!partial && shards[group] > 1 && random() % 4 != 0) {
+                loads.resize(static_cast<std::size_t>(shards[group]));
+                for (auto& load : loads) {
+                    load = static_cast<std::int32_t>(random() % 31);
+                }
+            }
+            const auto saved_loads = loads;
+            const auto expected = oracle.Acquire(group, packing[group], count, loads, partial);
+            auto actual = partial ? pool.AcquireUpToBlocks(group, count) : pool.AcquireBlocks(group, count, loads);
+            EXPECT_EQ(actual.size(), expected.size());
+            if (actual.size() != expected.size()) {
+                return wide_rebinds;
+            }
+            EXPECT_EQ(loads, saved_loads);
+            for (std::size_t i = 0; i < actual.size(); ++i) {
+                EXPECT_EQ(actual[i]->Location(), expected[i]);
+                held.push_back(std::move(actual[i]));
+            }
+        } else if (operation == 9) {
+            const auto index = random() % held.size();
+            oracle.Retain(held[index]->Location());
+            CacheBlockRef copy = held[index];
+            held.push_back(std::move(copy));
+        } else {
+            const auto index = random() % held.size();
+            oracle.Release(held[index]->Location());
+            held[index].reset();
+            held[index] = std::move(held.back());
+            held.pop_back();
+        }
+        if (clear_every > 0 && step % clear_every == clear_every - 1) {
+            while (!held.empty()) {
+                oracle.Release(held.back()->Location());
+                held.pop_back();
+            }
+        }
+        oracle.Check(pool);
+        for (std::int32_t id = 1; id <= parents; ++id) {
+            std::optional<std::uint32_t>& last = bound[static_cast<std::size_t>(id - 1)];
+            const std::optional<std::uint32_t> now = pool.BoundGroup(id);
+            if (now && last && *now != *last && packing[*last] > 64) {
+                ++wide_rebinds;
+            }
+            if (now) {
+                last = now;
+            }
+        }
+    }
+    while (!held.empty()) {
+        oracle.Release(held.back()->Location());
+        held.pop_back();
+    }
+    oracle.Check(pool);
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), pool.NumLcmBlocks());
+    return wide_rebinds;
+}
+
 TEST(BlockPoolBucketTest, InterleavedLifetimesMatchExhaustivePlacementOracle) {
     for (std::uint32_t seed : {0u, 17u, 2026u}) {
         SCOPED_TRACE(seed);
-        std::mt19937 random(seed);
-        BlockPool pool(24, {8, 16, 1});
-        PlacementOracle oracle(24);
-        std::vector<CacheBlockRef> held;
-        const std::array<std::int32_t, 3> packing{8, 16, 1};
-        const std::array<std::int32_t, 3> shards{2, 8, 1};
-        for (std::uint32_t group = 0; group < packing.size(); ++group) {
-            pool.RegisterGroup(group, packing[group], shards[group]);
-        }
-        for (int step = 0; step < 1200; ++step) {
-            SCOPED_TRACE(step);
-            const auto operation = random() % 10;
-            if (operation < 5 || held.empty()) {
-                const auto group = random() % 3;
-                const auto count = static_cast<std::int32_t>(1 + random() % 20);
-                const bool partial = random() % 4 == 0;
-                std::vector<std::int32_t> loads;
-                if (!partial && group != 2 && random() % 4 != 0) {
-                    loads.resize(static_cast<std::size_t>(shards[group]));
-                    for (auto& load : loads) {
-                        load = static_cast<std::int32_t>(random() % 31);
-                    }
-                }
-                const auto saved_loads = loads;
-                const auto expected = oracle.Acquire(group, packing[group], count, loads, partial);
-                auto actual = partial ? pool.AcquireUpToBlocks(group, count) : pool.AcquireBlocks(group, count, loads);
-                ASSERT_EQ(actual.size(), expected.size());
-                EXPECT_EQ(loads, saved_loads);
-                for (std::size_t i = 0; i < actual.size(); ++i) {
-                    EXPECT_EQ(actual[i]->Location(), expected[i]);
-                    held.push_back(std::move(actual[i]));
-                }
-            } else if (operation == 9) {
-                const auto index = random() % held.size();
-                oracle.Retain(held[index]->Location());
-                CacheBlockRef copy = held[index];
-                held.push_back(std::move(copy));
-            } else {
-                const auto index = random() % held.size();
-                oracle.Release(held[index]->Location());
-                held[index].reset();
-                held[index] = std::move(held.back());
-                held.pop_back();
-            }
-            oracle.Check(pool);
-        }
-        while (!held.empty()) {
-            oracle.Release(held.back()->Location());
-            held.pop_back();
-        }
-        oracle.Check(pool);
-        EXPECT_EQ(pool.NumEmptyLcmBlocks(), pool.NumLcmBlocks());
+        (void)ExpectPlacementMatchesOracle(seed, /*parents=*/24, /*packing=*/{8, 16, 1}, /*shards=*/{2, 8, 1},
+                                           /*max_count=*/20, /*clear_every=*/0, /*steps=*/1200);
+    }
+}
+
+// Parents up to 64 slots keep their occupancy inline, wider ones in words of
+// their own; parents move between both kinds as groups rebind them.
+TEST(BlockPoolBucketTest, WideAndInlineOccupancyMatchExhaustivePlacementOracle) {
+    for (std::uint32_t seed : {0u, 17u, 2026u}) {
+        SCOPED_TRACE(seed);
+        const int wide_rebinds =
+            ExpectPlacementMatchesOracle(seed, /*parents=*/6, /*packing=*/{130, 64, 65, 1}, /*shards=*/{2, 4, 5, 1},
+                                         /*max_count=*/90, /*clear_every=*/40, /*steps=*/1500);
+        EXPECT_GT(wide_rebinds, 0) << "the workload must rebind wide parents to other groups";
     }
 }
 
