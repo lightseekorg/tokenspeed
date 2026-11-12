@@ -1908,7 +1908,7 @@ std::optional<CacheCoordinator::EvictedEntry> CacheCoordinator::evictCachedBlock
             // epoch 0 is a candidate of its own before any page above it.
             if (demoted) {
                 write_back_segment = nullptr;
-            } else if (metadata.last_access_epoch == kSupersededAccessEpoch &&
+            } else if (metadata.eviction.last_access_epoch == kSupersededAccessEpoch &&
                        (reason == &DeviceEvictionStats::admission || reason == &DeviceEvictionStats::restore ||
                         reason == &DeviceEvictionStats::compaction ||
                         reason == &DeviceEvictionStats::request_reclaim)) {
@@ -1948,7 +1948,7 @@ std::optional<CacheCoordinator::EvictedEntry> CacheCoordinator::evictCachedBlock
                                      .written_back_before = (node->written_back_group_bits >> key.group_id & 1U) != 0,
                                      .pending = holdPendingStore(*node, key, GroupIsState(group_id))});
                     write_back_segment->newest_access_epoch =
-                        std::max(write_back_segment->newest_access_epoch, metadata.last_access_epoch);
+                        std::max(write_back_segment->newest_access_epoch, metadata.eviction.last_access_epoch);
                 }
             }
         });
@@ -2770,7 +2770,8 @@ void CacheCoordinator::RefreshRetainedCheckpoint(std::span<CacheBlockRef> blocks
         }
         const auto metadata = index.MetadataFor(pool, block->Location());
         _assert(metadata.has_value(), "a cached block has eviction metadata");
-        index.Register(pool, block, *key, access_epoch, metadata->logical_block_index, metadata->boundary_kind,
+        index.Register(pool, block, *key, access_epoch, metadata->eviction.logical_block_index,
+                       metadata->eviction.boundary_kind,
                        /*newly_cached=*/nullptr, session);
         if (GroupIsState(key->group_id)) {
             BoundaryTree::Node* node = boundary_tree_.Find(key->content_hash);
@@ -2832,8 +2833,8 @@ std::vector<std::vector<ImageSlot>> CacheCoordinator::PublishedDataSlots(std::sp
                 published[i].push_back(ImageSlot{.slot_index = slot,
                                                  .block = block,
                                                  .key = std::move(*key),
-                                                 .logical_block_index = metadata->logical_block_index,
-                                                 .boundary_kind = metadata->boundary_kind});
+                                                 .logical_block_index = metadata->eviction.logical_block_index,
+                                                 .boundary_kind = metadata->eviction.boundary_kind});
             }
         }
     }
@@ -3023,27 +3024,28 @@ void CacheCoordinator::CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& 
     _assert(key.group_id < groups_.size(), "CacheHostBlock group id out of range");
     PrefixCacheIndex& index = groups_[key.group_id].Index();
     PrefixCacheIndex::CachedBlockMetadata metadata{
-        .logical_block_index = -1,
-        .boundary_kind = CacheBoundaryKind::kChunk,
+        .eviction = {.logical_block_index = -1, .boundary_kind = CacheBoundaryKind::kChunk},
     };
     if (inherited_metadata) {
         metadata = *inherited_metadata;
         // Registering touches an existing entry with the epoch given: never
         // age one a Host hit of this very build may just have touched.
         if (const std::optional<CacheBlockLocation> existing = locationOf(*host_pool_, key.group_id, key)) {
-            metadata.last_access_epoch =
-                std::max(metadata.last_access_epoch, index.MetadataFor(*host_pool_, *existing)->last_access_epoch);
+            metadata.eviction.last_access_epoch =
+                std::max(metadata.eviction.last_access_epoch,
+                         index.MetadataFor(*host_pool_, *existing)->eviction.last_access_epoch);
         }
     } else {
-        metadata.last_access_epoch = ++next_access_epoch_;
+        metadata.eviction.last_access_epoch = ++next_access_epoch_;
     }
     // The entry holds the node of its hash: a store's the node its Device
     // publication linked, while either tier holds the hash; an L3 GET's, or a
     // store's whose Device entry left before the ACK, one it starts without a
     // parent, until a publication through its hash gives it its boundary (and,
     // past page 0, links it).
-    index.Register(*host_pool_, block_ref, key, metadata.last_access_epoch, metadata.logical_block_index,
-                   metadata.boundary_kind, /*newly_cached=*/nullptr, metadata.session);
+    index.Register(*host_pool_, block_ref, key, metadata.eviction.last_access_epoch,
+                   metadata.eviction.logical_block_index, metadata.eviction.boundary_kind, /*newly_cached=*/nullptr,
+                   metadata.session);
     // A copy a demotion reached on its way (TierTransferManager::
     // DemoteInFlightEvictions) lands demoted, unless the entry is newer.
     if (metadata.demoted) {
@@ -3053,7 +3055,7 @@ void CacheCoordinator::CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& 
         BoundaryTree::Node* node = boundary_tree_.Find(key.content_hash);
         _assert(node != nullptr, "an indexed checkpoint has a tree node");
         node->latest_state_access_epoch =
-            std::max({node->latest_state_access_epoch, metadata.last_access_epoch, metadata.max_access_epoch});
+            std::max({node->latest_state_access_epoch, metadata.eviction.last_access_epoch, metadata.max_access_epoch});
     }
 }
 

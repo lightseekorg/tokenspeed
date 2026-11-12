@@ -374,8 +374,8 @@ std::int32_t TierTransferManager::DemoteInFlightEvictions(std::span<const CacheK
                 ++host_entry_holds[member.key];
             }
             if (!member.metadata.demoted) {
-                member.metadata.last_access_epoch = CacheCoordinator::kDemotedAccessEpoch;
-                member.metadata.was_acquired = false;
+                member.metadata.eviction.last_access_epoch = CacheCoordinator::kDemotedAccessEpoch;
+                member.metadata.eviction.was_acquired = false;
                 member.metadata.demoted = true;
                 // One publishing into a Host entry counts with that entry.
                 demoted += holds_host_entry ? 0 : 1;

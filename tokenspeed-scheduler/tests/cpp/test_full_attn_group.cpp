@@ -600,7 +600,7 @@ TEST(FullAttnManagerLcmTest, DuplicateRegistrationUpdatesEpochWithoutReorderingE
     const std::optional<PrefixCacheIndex::CachedBlockMetadata> metadata =
         mgr.CachedBlockMetadataFor(pool, first_location);
     ASSERT_TRUE(metadata);
-    EXPECT_EQ(metadata->last_access_epoch, next_access_epoch);
+    EXPECT_EQ(metadata->eviction.last_access_epoch, next_access_epoch);
     EXPECT_EQ(pool.NumOccupiedSlots(), 2);
 }
 

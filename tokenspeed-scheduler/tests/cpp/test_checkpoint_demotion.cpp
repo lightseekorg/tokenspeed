@@ -92,7 +92,8 @@ TEST(CheckpointDemotionIndexTest, DemoteDatesBackNeverForwardSkipsHeldEntriesAnd
         << "demoted already";
     EXPECT_FALSE(index.Demote(pool, Key("a"), 15, /*write_back_holds=*/0)) << "never dates forward";
     EXPECT_FALSE(index.Demote(pool, Key("missing"), CacheCoordinator::kDemotedAccessEpoch, /*write_back_holds=*/0));
-    EXPECT_EQ(index.Inspect(pool, Key("c"))->metadata.last_access_epoch, CacheCoordinator::kDemotedAccessEpoch);
+    EXPECT_EQ(index.Inspect(pool, Key("c"))->metadata.eviction.last_access_epoch,
+              CacheCoordinator::kDemotedAccessEpoch);
     EXPECT_TRUE(index.Inspect(pool, Key("c"))->metadata.demoted);
     EXPECT_FALSE(index.Inspect(pool, Key("a"))->metadata.demoted);
     EXPECT_EQ(index.Inspect(pool, Key("c"))->metadata.max_access_epoch, 30u) << "the newest touch stays";
@@ -125,7 +126,8 @@ TEST(CheckpointDemotionIndexTest, OnlyADemotionMarksAnEntryAndATouchEndsTheMark)
     const auto demoted = [&](const char* name) { return index.Inspect(pool, Key(name))->metadata.demoted; };
     session->demoted = true;
     ASSERT_EQ(index.DemoteSession(pool, session), 2u);
-    EXPECT_EQ(index.Inspect(pool, Key("a"))->metadata.last_access_epoch, CacheCoordinator::kDemotedAccessEpoch);
+    EXPECT_EQ(index.Inspect(pool, Key("a"))->metadata.eviction.last_access_epoch,
+              CacheCoordinator::kDemotedAccessEpoch);
     EXPECT_FALSE(demoted("a"));
     EXPECT_FALSE(demoted("b"));
 
@@ -134,7 +136,7 @@ TEST(CheckpointDemotionIndexTest, OnlyADemotionMarksAnEntryAndATouchEndsTheMark)
     PrefixMatch hit =
         index.AcquireMatched(pool, std::vector<CacheKey>{Key("a")}, 0, GroupPrefixProbe{.hits = {1}}, 30, session);
     EXPECT_FALSE(demoted("a"));
-    EXPECT_EQ(index.Inspect(pool, Key("a"))->metadata.last_access_epoch, CacheCoordinator::kDemotedAccessEpoch)
+    EXPECT_EQ(index.Inspect(pool, Key("a"))->metadata.eviction.last_access_epoch, CacheCoordinator::kDemotedAccessEpoch)
         << "the session is demoted still";
 
     CacheBlockRef held = index.Find(pool, Key("b"));
@@ -142,7 +144,7 @@ TEST(CheckpointDemotionIndexTest, OnlyADemotionMarksAnEntryAndATouchEndsTheMark)
     index.MarkDemoted(pool, Key("dated"), CacheCoordinator::kDemotedAccessEpoch);
     EXPECT_TRUE(demoted("b"));
     EXPECT_FALSE(demoted("dated"));
-    EXPECT_EQ(index.Inspect(pool, Key("dated"))->metadata.last_access_epoch, 20u);
+    EXPECT_EQ(index.Inspect(pool, Key("dated"))->metadata.eviction.last_access_epoch, 20u);
 }
 
 // The holds of an eviction write-back that publishes into the entry do not
@@ -158,7 +160,8 @@ TEST(CheckpointDemotionIndexTest, DemoteDiscountsOnlyTheWriteBackHolds) {
     other.reset();
     EXPECT_FALSE(index.Demote(pool, Key("h"), CacheCoordinator::kDemotedAccessEpoch, /*write_back_holds=*/0));
     EXPECT_TRUE(index.Demote(pool, Key("h"), CacheCoordinator::kDemotedAccessEpoch, /*write_back_holds=*/1));
-    EXPECT_EQ(index.Inspect(pool, Key("h"))->metadata.last_access_epoch, CacheCoordinator::kDemotedAccessEpoch);
+    EXPECT_EQ(index.Inspect(pool, Key("h"))->metadata.eviction.last_access_epoch,
+              CacheCoordinator::kDemotedAccessEpoch);
 }
 
 TEST(CheckpointLineageTest, RecordsPublicationsAndCountsResumesUpToTwo) {
@@ -366,7 +369,7 @@ protected:
     std::optional<std::uint64_t> HostEpoch(const CacheKey& key) const {
         const std::optional<PrefixCacheIndex::CachedBlockSnapshot> entry =
             coordinator_.GroupPrefixIndex(static_cast<std::int32_t>(key.group_id)).Inspect(host_, key);
-        return entry ? std::optional{entry->metadata.last_access_epoch} : std::nullopt;
+        return entry ? std::optional{entry->metadata.eviction.last_access_epoch} : std::nullopt;
     }
     bool HostEntryDemoted(const CacheKey& key) const {
         const std::optional<PrefixCacheIndex::CachedBlockSnapshot> entry =
@@ -642,9 +645,10 @@ TEST_F(CheckpointDemotionWriteBackTest, ASessionsDemotedEntriesKeepTheirOwnRules
             }
             const CacheKey shorter_checkpoint = Key(shorter[1], kState);
             const CacheKey longer_checkpoint = Key(longer[3], kState);
-            ASSERT_EQ(
-                coordinator_.GroupPrefixIndex(kState).Inspect(device_, shorter_checkpoint)->metadata.last_access_epoch,
-                CacheCoordinator::kDemotedAccessEpoch);
+            ASSERT_EQ(coordinator_.GroupPrefixIndex(kState)
+                          .Inspect(device_, shorter_checkpoint)
+                          ->metadata.eviction.last_access_epoch,
+                      CacheCoordinator::kDemotedAccessEpoch);
             coordinator_.QueueCachedBlocksForStore(shorter);
             EXPECT_EQ(coordinator_.TakePendingStores().size(), 3u) << "the two pages and the checkpoint";
 

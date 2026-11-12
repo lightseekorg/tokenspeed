@@ -5711,8 +5711,9 @@ TEST(InputCheckpointRetention, HoldsCompleteDependenciesAcrossTiersAndReleasesIn
             } else {
                 coordinator.CacheHostBlock(blocks[0], keys[i], std::nullopt);
             }
-            epochs.push_back(
-                coordinator.GroupPrefixIndex(keys[i].group_id).Inspect(pool, keys[i])->metadata.last_access_epoch);
+            epochs.push_back(coordinator.GroupPrefixIndex(keys[i].group_id)
+                                 .Inspect(pool, keys[i])
+                                 ->metadata.eviction.last_access_epoch);
         }
         auto retained = coordinator.RetainInputCheckpoint(hashes, 8);
         EXPECT_EQ(retained.size(), missing == -1 ? keys.size() : 0u);
@@ -5725,11 +5726,11 @@ TEST(InputCheckpointRetention, HoldsCompleteDependenciesAcrossTiersAndReleasesIn
             const auto entry = coordinator.GroupPrefixIndex(keys[i].group_id).Inspect(pool, keys[i]);
             ASSERT_TRUE(entry);
             EXPECT_EQ(entry->pinned, missing == -1);
-            EXPECT_FALSE(entry->metadata.was_acquired) << "retention is not a prefix hit";
+            EXPECT_FALSE(entry->metadata.eviction.was_acquired) << "retention is not a prefix hit";
             if (missing == -1) {
-                EXPECT_GT(entry->metadata.last_access_epoch, epochs[i]);
+                EXPECT_GT(entry->metadata.eviction.last_access_epoch, epochs[i]);
             } else {
-                EXPECT_EQ(entry->metadata.last_access_epoch, epochs[i]);
+                EXPECT_EQ(entry->metadata.eviction.last_access_epoch, epochs[i]);
             }
         }
         retained.clear();
@@ -5780,8 +5781,8 @@ TEST(InputCheckpointRetention, RefreshPreservesSessionOwnershipAcrossTiers) {
     EXPECT_EQ(coordinator.DemoteSession("session", false), 0u);
     retained.clear();
     EXPECT_EQ(coordinator.DemoteSession("session", false), 2u);
-    EXPECT_EQ(coordinator.GroupPrefixIndex(0).Inspect(device, device_key)->metadata.last_access_epoch, 0u);
-    EXPECT_EQ(coordinator.GroupPrefixIndex(1).Inspect(host, host_key)->metadata.last_access_epoch, 0u);
+    EXPECT_EQ(coordinator.GroupPrefixIndex(0).Inspect(device, device_key)->metadata.eviction.last_access_epoch, 0u);
+    EXPECT_EQ(coordinator.GroupPrefixIndex(1).Inspect(host, host_key)->metadata.eviction.last_access_epoch, 0u);
     EXPECT_EQ(coordinator.DemoteSession("session", false), 0u);
 }
 

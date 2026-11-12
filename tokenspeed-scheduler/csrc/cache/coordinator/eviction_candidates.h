@@ -81,7 +81,7 @@ public:
     Candidate MakeCandidate(std::uint32_t group_id, CacheBlockLocation location,
                             const std::optional<PrefixCacheIndex::CachedBlockMetadata>& metadata) const {
         return makeCandidate(group_id, groups_[group_id].Matcher().IsPrefixClosed(), location,
-                             metadata ? &*metadata : nullptr);
+                             metadata ? &metadata->eviction : nullptr);
     }
 
     static bool Before(const Candidate& lhs, const Candidate& rhs) { return evictionKey(lhs) < evictionKey(rhs); }
@@ -308,18 +308,10 @@ private:
                (request_reclaim_locations_ != nullptr && request_reclaim_locations_->contains(location));
     }
 
-    // `closed`: the group is prefix-closed. `metadata` is an entry's
-    // CachedBlockMetadata or the EvictionMetadata a traversal copied, null
+    // `closed`: the group is prefix-closed. `metadata` is the entry's, null
     // when no entry is at `location`.
-    template <typename Metadata>
-        requires requires(const Metadata& metadata) {
-            metadata.last_access_epoch;
-            metadata.logical_block_index;
-            metadata.boundary_kind;
-            metadata.was_acquired;
-        }
     Candidate makeCandidate(std::uint32_t group_id, bool closed, CacheBlockLocation location,
-                            const Metadata* metadata) const {
+                            const PrefixCacheIndex::EvictionMetadata* metadata) const {
         Candidate candidate{.last_access_epoch = metadata ? metadata->last_access_epoch : 0,
                             .location = location,
                             .group_id = group_id};
@@ -421,11 +413,11 @@ private:
                 const auto entry = groups_[group_id].Index().Inspect(
                     pool_, CacheKey{.group_id = groups_[group_id].Id(), .content_hash = hash});
                 if (!entry || entry->pinned || excluded(entry->location) ||
-                    entry->metadata.last_access_epoch < aging_.cutoff_epoch) {
+                    entry->metadata.eviction.last_access_epoch < aging_.cutoff_epoch) {
                     continue;
                 }
                 Candidate candidate = makeCandidate(group_id, groups_[group_id].Matcher().IsPrefixClosed(),
-                                                    entry->location, &entry->metadata);
+                                                    entry->location, &entry->metadata.eviction);
                 candidate.rank_epoch = aging_.cutoff_epoch;
                 candidate.aged_distance = distance;
                 aged_.emplace_back(candidate, &hash);

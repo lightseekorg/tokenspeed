@@ -190,7 +190,7 @@ void CacheCoordinator::visitHostKvDuplicateCandidates(Visitor&& visit) const {
             std::optional<std::uint64_t> epoch;
             for (const auto& entry : next) {
                 if (entry) {
-                    epoch = std::max(epoch.value_or(0), entry->source.metadata.last_access_epoch);
+                    epoch = std::max(epoch.value_or(0), entry->source.metadata.eviction.last_access_epoch);
                 }
             }
             if (!epoch) {
@@ -198,7 +198,7 @@ void CacheCoordinator::visitHostKvDuplicateCandidates(Visitor&& visit) const {
             }
             candidates.clear();
             for (std::size_t i = 0; i < closed_groups.size(); ++i) {
-                while (next[i] && next[i]->source.metadata.last_access_epoch == *epoch) {
+                while (next[i] && next[i]->source.metadata.eviction.last_access_epoch == *epoch) {
                     const PrefixCacheIndex::CommonEntry& device = *next[i];
                     const bool boundary_key =
                         device.key->namespace_id == kDefaultCacheNamespaceId && device.key->page_offset >= 0 &&
@@ -361,7 +361,7 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
                     states.push_back(HostEntry{.group_id = key.group_id,
                                                .location = entry.location,
                                                .in_use = entry.pinned,
-                                               .last_access_epoch = entry.metadata.last_access_epoch,
+                                               .last_access_epoch = entry.metadata.eviction.last_access_epoch,
                                                .demoted = isDemotedEntry(entry.metadata)});
                 }
             });
@@ -379,7 +379,7 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
                         entries.all.push_back(HostEntry{.group_id = groups_[i].Id(),
                                                         .location = entry->location,
                                                         .in_use = entry->pinned,
-                                                        .last_access_epoch = entry->metadata.last_access_epoch,
+                                                        .last_access_epoch = entry->metadata.eviction.last_access_epoch,
                                                         .demoted = false});
                     }
                 });
@@ -412,7 +412,7 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
                                    return;
                                }
                                if (const auto entry = groups_[i].Index().Inspect(pool, key)) {
-                                   newest = std::max(newest.value_or(0), entry->metadata.last_access_epoch);
+                                   newest = std::max(newest.value_or(0), entry->metadata.eviction.last_access_epoch);
                                }
                            });
         return newest;

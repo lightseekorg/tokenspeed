@@ -193,16 +193,24 @@ private:
     };
 
 public:
-    // Read-only admission snapshot from one index lookup; owns no block.
-    struct CachedBlockMetadata {
+    // The part of an entry's metadata an eviction policy ranks it by. Epoch
+    // traversals copy it for every entry they scan; the session owner would
+    // cost each one another cache line and a reference count. A field the
+    // policy starts ranking by belongs here.
+    struct EvictionMetadata {
         std::uint64_t last_access_epoch{0};
         std::int32_t logical_block_index{-1};
         CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
         bool was_acquired{false};
+    };
+
+    // Read-only admission snapshot from one index lookup; owns no block.
+    struct CachedBlockMetadata {
+        EvictionMetadata eviction;
         // The largest epoch any acquisition or publication touched the entry
-        // with. last_access_epoch can move back below it (a publication under
-        // an older epoch, CacheCoordinator::MarkSupersededStateInput); this
-        // one never does.
+        // with. eviction.last_access_epoch can move back below it (a
+        // publication under an older epoch,
+        // CacheCoordinator::MarkSupersededStateInput); this one never does.
         std::uint64_t max_access_epoch{0};
         SessionCacheOwner session;
         // Demote dated the entry back and no access has touched it since. A
@@ -227,17 +235,6 @@ public:
         friend class PrefixCacheIndex;
         const CacheEntries* cache_index_{nullptr};
         EvictionOrderMap::const_reverse_iterator next_{};
-    };
-
-    // The part of CachedBlockMetadata an eviction policy ranks an entry by.
-    // Epoch traversals copy it for every entry they scan; the session owner
-    // would cost each one another cache line and a reference count. A field
-    // the policy starts ranking by belongs in both structs.
-    struct EvictionMetadata {
-        std::uint64_t last_access_epoch{0};
-        std::int32_t logical_block_index{-1};
-        CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
-        bool was_acquired{false};
     };
 
     // One unpinned entry, paired with the metadata an eviction policy reads.
@@ -924,10 +921,7 @@ private:
 
     static CachedBlockMetadata metadataOf(const CacheEntry& cache_entry) noexcept {
         return CachedBlockMetadata{
-            .last_access_epoch = cache_entry.last_access_epoch,
-            .logical_block_index = cache_entry.logical_block_index,
-            .boundary_kind = cache_entry.boundary_kind,
-            .was_acquired = cache_entry.was_acquired,
+            .eviction = evictionMetadataOf(cache_entry),
             .max_access_epoch = cache_entry.max_access_epoch,
             .session = cache_entry.session,
             .demoted = cache_entry.demoted,

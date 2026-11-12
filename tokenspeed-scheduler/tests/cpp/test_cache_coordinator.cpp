@@ -648,7 +648,7 @@ TEST(CoordinatorMatchTest, TrimmedFullHitsDoNotRefreshAccessEpoch) {
     const std::optional<PrefixCacheIndex::CachedBlockMetadata> after =
         coord.GroupPrefixIndex(0).MetadataFor(pool, trimmed_location);
     ASSERT_TRUE(after);
-    EXPECT_EQ(after->last_access_epoch, before->last_access_epoch);
+    EXPECT_EQ(after->eviction.last_access_epoch, before->eviction.last_access_epoch);
 }
 
 TEST(CoordinatorMatchTest, ProbeDoesNotRefreshAccessEpoch) {
@@ -673,7 +673,7 @@ TEST(CoordinatorMatchTest, ProbeDoesNotRefreshAccessEpoch) {
     const std::optional<PrefixCacheIndex::CachedBlockMetadata> after =
         coord.GroupPrefixIndex(0).MetadataFor(pool, oldest_location);
     ASSERT_TRUE(after);
-    EXPECT_EQ(after->last_access_epoch, before->last_access_epoch);
+    EXPECT_EQ(after->eviction.last_access_epoch, before->eviction.last_access_epoch);
 }
 
 TEST(CacheCoordinatorTest, ClearDeviceCacheLeavesHostCacheUntouched) {
@@ -837,7 +837,7 @@ TEST(CacheCoordinatorAdmissionTest, AcquireMatchedFullPrefixUsesOneAccessEpoch) 
         const std::optional<PrefixCacheIndex::CachedBlockMetadata> metadata =
             coordinator.GroupPrefixIndex(0).MetadataFor(pool, location);
         ASSERT_TRUE(metadata);
-        access_epochs.push_back(metadata->last_access_epoch);
+        access_epochs.push_back(metadata->eviction.last_access_epoch);
     }
     ASSERT_EQ(access_epochs.size(), 4u);
     EXPECT_TRUE(
@@ -896,7 +896,7 @@ TEST(CacheCoordinatorAdmissionTest, LaterChunksReuseRequestAccessEpoch) {
         const std::optional<PrefixCacheIndex::CachedBlockMetadata> metadata =
             coordinator.GroupPrefixIndex(0).MetadataFor(pool, block_ref->Location());
         ASSERT_TRUE(metadata);
-        EXPECT_EQ(metadata->last_access_epoch, first->access_epoch);
+        EXPECT_EQ(metadata->eviction.last_access_epoch, first->access_epoch);
     }
 }
 
@@ -922,7 +922,7 @@ TEST(CacheCoordinatorAdmissionTest, ProbeAndRejectedAdmissionDoNotAdvanceAccessE
     std::optional<PrefixCacheIndex::CachedBlockMetadata> metadata =
         coordinator.GroupPrefixIndex(0).MetadataFor(pool, location);
     ASSERT_TRUE(metadata);
-    EXPECT_EQ(metadata->last_access_epoch, owner->access_epoch);
+    EXPECT_EQ(metadata->eviction.last_access_epoch, owner->access_epoch);
 
     std::vector<BlockTable> rejected_tables(coordinator.NumGroups());
     std::vector<GroupDemand> rejected_demands{
@@ -933,7 +933,7 @@ TEST(CacheCoordinatorAdmissionTest, ProbeAndRejectedAdmissionDoNotAdvanceAccessE
                                    /*evict_blocks_past_segments=*/false, /*session_id=*/{}));
     metadata = coordinator.GroupPrefixIndex(0).MetadataFor(pool, location);
     ASSERT_TRUE(metadata);
-    EXPECT_EQ(metadata->last_access_epoch, owner->access_epoch);
+    EXPECT_EQ(metadata->eviction.last_access_epoch, owner->access_epoch);
 
     coordinator.Free(owner_tables);
     std::vector<BlockTable> hit_tables(coordinator.NumGroups());
@@ -1042,8 +1042,8 @@ TEST(CacheCoordinatorAdmissionTest, RejectedCachedHitDoesNotRefreshAccessEpoch) 
         const std::optional<PrefixCacheIndex::CachedBlockMetadata> metadata =
             coordinator.GroupPrefixIndex(0).MetadataFor(pool, cached_location);
         ASSERT_TRUE(metadata);
-        EXPECT_EQ(metadata->last_access_epoch, before->last_access_epoch);
-        EXPECT_FALSE(metadata->was_acquired);
+        EXPECT_EQ(metadata->eviction.last_access_epoch, before->eviction.last_access_epoch);
+        EXPECT_FALSE(metadata->eviction.was_acquired);
     }
 }
 
@@ -3379,7 +3379,8 @@ TEST(CacheCoordinatorHostReplacement, DeviceUseMergesSessionOwnershipOfExistingH
                 first->session_access = {};
                 if (ended) {
                     ASSERT_EQ(coordinator.DemoteSession("first", true), 2u);
-                    EXPECT_EQ(coordinator.GroupPrefixIndex(0).Inspect(host, key)->metadata.last_access_epoch, 0u);
+                    EXPECT_EQ(coordinator.GroupPrefixIndex(0).Inspect(host, key)->metadata.eviction.last_access_epoch,
+                              0u);
                 }
                 const CacheCoordinator::PromptPrefix prompt{
                     .prefix_hashes = hashes, .tokens = tokens, .max_tokens = static_cast<std::int32_t>(tokens.size())};
@@ -3401,14 +3402,14 @@ TEST(CacheCoordinatorHostReplacement, DeviceUseMergesSessionOwnershipOfExistingH
                 const auto refreshed = coordinator.GroupPrefixIndex(0).Inspect(host, key);
                 ASSERT_TRUE(refreshed);
                 EXPECT_FALSE(refreshed->pinned);
-                EXPECT_EQ(refreshed->metadata.last_access_epoch, reused->access_epoch);
+                EXPECT_EQ(refreshed->metadata.eviction.last_access_epoch, reused->access_epoch);
                 const bool same_owner = visitor == "first" && !ended;
                 EXPECT_EQ(refreshed->metadata.session, same_owner ? owner : nullptr);
                 // Even an old ended generation of the same ID cannot demote a
                 // Host copy after a different owner has used its Device copy.
                 EXPECT_EQ(coordinator.GroupPrefixIndex(0).DemoteSession(host, owner), same_owner ? 1u : 0u);
                 if (!same_owner) {
-                    EXPECT_EQ(coordinator.GroupPrefixIndex(0).Inspect(host, key)->metadata.last_access_epoch,
+                    EXPECT_EQ(coordinator.GroupPrefixIndex(0).Inspect(host, key)->metadata.eviction.last_access_epoch,
                               reused->access_epoch);
                 }
                 EXPECT_TRUE(coordinator.TakePendingStores().empty());
@@ -5962,7 +5963,8 @@ TEST(SwaRegistrationTest, TheWindowBehindAnInForwardStateCheckpointIsPublishedAs
         coord.CacheCompletedBlocks(tables, chunk_end, NextTestAccessEpoch());
         const auto window = coord.GroupPrefixIndex(0).MetadataFor(pool, tables[0].Blocks()[1]->Location());
         ASSERT_TRUE(window);
-        EXPECT_EQ(window->boundary_kind, checkpoint ? CacheBoundaryKind::kEndpoint : CacheBoundaryKind::kChunk);
+        EXPECT_EQ(window->eviction.boundary_kind,
+                  checkpoint ? CacheBoundaryKind::kEndpoint : CacheBoundaryKind::kChunk);
         EXPECT_EQ(coord.GroupPrefixIndex(1).Contains(pool, Key(hashes[1], 1)), checkpoint);
         coord.Free(tables);
     }
@@ -6435,8 +6437,8 @@ TEST(RetractionImageTest, PublishedSlotsRideHostCacheAndRestoreAsKeyedLoads) {
                                  /*access_epoch=*/1);
     const auto republished = coordinator.GroupPrefixIndex(0).MetadataFor(pool, restored[0].Blocks()[1]->Location());
     ASSERT_TRUE(republished);
-    EXPECT_EQ(republished->logical_block_index, 1);
-    EXPECT_EQ(republished->boundary_kind, CacheBoundaryKind::kChunk);
+    EXPECT_EQ(republished->eviction.logical_block_index, 1);
+    EXPECT_EQ(republished->eviction.boundary_kind, CacheBoundaryKind::kChunk);
     ASSERT_EQ(restore->snapshot_pairs.size(), 1u);
     EXPECT_TRUE(restore->snapshot_pairs[0].key.content_hash.empty());
     EXPECT_TRUE(restore->snapshot_pairs[0].source.IsOwnedBy(snapshot_pool));
@@ -9533,7 +9535,7 @@ TEST_F(SegmentEvictionTest, AReleasedAlignedInputCanResumeAnotherBranchAfterWrit
     for (auto& member : segments.front().members) {
         EXPECT_EQ(member.key.content_hash, ContentHash{hashes[1]});
         EXPECT_FALSE(coordinator_.GroupPrefixIndex(member.key.group_id).Contains(pool_, member.key));
-        EXPECT_TRUE(member.metadata.was_acquired);
+        EXPECT_TRUE(member.metadata.eviction.was_acquired);
         EXPECT_FALSE(member.host_block);
         member.host_block = host_pool_.AcquireBlock(member.key.group_id);
         ASSERT_TRUE(member.host_block);
@@ -9641,16 +9643,16 @@ TEST_F(SegmentEvictionTest, AMarkUnderAHeldCheckpointTakesEffectOnceItIsReleased
     std::vector<PrefixCacheIndex::CachedBlockMetadata> before;
     for (std::uint32_t group = 0; group < 4; ++group) {
         before.push_back(*metadata_of(group));
-        EXPECT_EQ(before.back().last_access_epoch, admitted->access_epoch) << "group " << group;
+        EXPECT_EQ(before.back().eviction.last_access_epoch, admitted->access_epoch) << "group " << group;
     }
 
     coordinator_.MarkSupersededStateInput(a_tail.hash, admitted->access_epoch);
     for (std::uint32_t group = 0; group < 4; ++group) {
         const PrefixCacheIndex::CachedBlockMetadata after = *metadata_of(group);
-        EXPECT_EQ(after.last_access_epoch, 0u) << "group " << group;
-        EXPECT_EQ(after.logical_block_index, before[group].logical_block_index) << "group " << group;
-        EXPECT_EQ(after.boundary_kind, before[group].boundary_kind) << "group " << group;
-        EXPECT_EQ(after.was_acquired, before[group].was_acquired) << "group " << group;
+        EXPECT_EQ(after.eviction.last_access_epoch, 0u) << "group " << group;
+        EXPECT_EQ(after.eviction.logical_block_index, before[group].eviction.logical_block_index) << "group " << group;
+        EXPECT_EQ(after.eviction.boundary_kind, before[group].eviction.boundary_kind) << "group " << group;
+        EXPECT_EQ(after.eviction.was_acquired, before[group].eviction.was_acquired) << "group " << group;
     }
 
     coordinator_.Free(tables);
@@ -9708,7 +9710,7 @@ TEST_F(SegmentEvictionTest, AnEarlierFinishLeavesALaterHittersInputUnmarked) {
             const CacheBlockRef block =
                 coordinator_.GroupPrefixIndex(group).Find(pool_, Key(a_tail.hash.ToString(), group));
             now.push_back(
-                coordinator_.GroupPrefixIndex(group).MetadataFor(pool_, block->Location())->last_access_epoch);
+                coordinator_.GroupPrefixIndex(group).MetadataFor(pool_, block->Location())->eviction.last_access_epoch);
         }
         return now;
     };
@@ -9809,10 +9811,12 @@ TEST_F(SegmentEvictionTest, AFailedSetLeavesAnIdleBranchBesideItsPinsEvictable) 
         const CacheBlockRef x_checkpoint = coordinator_.GroupPrefixIndex(group).Find(pool_, Key(x_hashes[1], group));
         ASSERT_EQ(x_checkpoint.use_count(), 2) << "only the index holds X's checkpoint, group " << group;
         ASSERT_LT(
-            coordinator_.GroupPrefixIndex(group).MetadataFor(pool_, x_checkpoint->Location())->last_access_epoch,
+            coordinator_.GroupPrefixIndex(group)
+                .MetadataFor(pool_, x_checkpoint->Location())
+                ->eviction.last_access_epoch,
             coordinator_.GroupPrefixIndex(0)
                 .MetadataFor(pool_, *CacheCoordinatorTestAccess::DeviceLocationOf(coordinator_, 0, Key(b_hashes[3], 0)))
-                ->last_access_epoch)
+                ->eviction.last_access_epoch)
             << "X's checkpoint is older than B's pages, group " << group;
     }
 
@@ -11203,7 +11207,7 @@ TEST_F(HostSegmentPlanTest, AtOneDeviceEpochTheShallowerDuplicateGoesFirst) {
     const auto device_epoch = [&](const CacheKey& key) {
         return coordinator_.GroupPrefixIndex(key.group_id)
             .MetadataFor(pool_, *CacheCoordinatorTestAccess::DeviceLocationOf(coordinator_, key.group_id, key))
-            ->last_access_epoch;
+            ->eviction.last_access_epoch;
     };
     ASSERT_EQ(device_epoch(Key(hashes_[3], 0)), device_epoch(Key(tail.hash.ToString(), 1)));
     ASSERT_LT(device_epoch(Key(hashes_[3], 1)), device_epoch(Key(hashes_[3], 0)));
@@ -13601,7 +13605,7 @@ TEST_F(WriteBackTransactionTest, ASegmentAlreadyOnTheHostSettlesWithoutAnOp) {
     }
     const auto epoch_on = [&](const BlockPool& pool, const CacheKey& key) {
         const PrefixCacheIndex& index = coordinator_.GroupPrefixIndex(static_cast<std::int32_t>(key.group_id));
-        return index.MetadataFor(pool, index.Find(pool, key)->Location())->last_access_epoch;
+        return index.MetadataFor(pool, index.Find(pool, key)->Location())->eviction.last_access_epoch;
     };
     std::vector<std::uint64_t> expected;
     for (std::size_t member = 0; member < keys.size(); ++member) {
@@ -14241,12 +14245,12 @@ TEST_F(WriteBackTransactionTest, HostEntriesInheritDeviceMetadata) {
         const PrefixCacheIndex& index = coordinator_.GroupPrefixIndex(static_cast<std::int32_t>(keys[member].group_id));
         const PrefixCacheIndex::CachedBlockMetadata host =
             *index.MetadataFor(host_pool_, index.Find(host_pool_, keys[member])->Location());
-        EXPECT_EQ(host.last_access_epoch, device[member].last_access_epoch);
-        EXPECT_LT(host.last_access_epoch, next_epoch);
-        EXPECT_EQ(host.logical_block_index, device[member].logical_block_index);
-        EXPECT_NE(host.logical_block_index, -1);
-        EXPECT_EQ(host.boundary_kind, device[member].boundary_kind);
-        EXPECT_FALSE(host.was_acquired);
+        EXPECT_EQ(host.eviction.last_access_epoch, device[member].eviction.last_access_epoch);
+        EXPECT_LT(host.eviction.last_access_epoch, next_epoch);
+        EXPECT_EQ(host.eviction.logical_block_index, device[member].eviction.logical_block_index);
+        EXPECT_NE(host.eviction.logical_block_index, -1);
+        EXPECT_EQ(host.eviction.boundary_kind, device[member].eviction.boundary_kind);
+        EXPECT_FALSE(host.eviction.was_acquired);
     }
 }
 

@@ -803,7 +803,7 @@ TEST(CacheOperationTest, HostRestoredStateCheckpointRemainsCachedAfterLoadAckAnd
     EXPECT_TRUE(coordinator.ContainsHostCachedBlock(key));
     const auto metadata = coordinator.GroupPrefixIndex(0).MetadataFor(pool, location);
     ASSERT_TRUE(metadata);
-    EXPECT_EQ(metadata->boundary_kind, CacheBoundaryKind::kEndpoint);
+    EXPECT_EQ(metadata->eviction.boundary_kind, CacheBoundaryKind::kEndpoint);
     EXPECT_EQ(coordinator.ProbePrefix(hashes).device.num_common_tokens, 2);
     EXPECT_TRUE(coordinator.ClearDeviceCache());
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), 1);

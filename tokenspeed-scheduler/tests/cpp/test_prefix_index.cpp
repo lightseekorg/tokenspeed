@@ -93,8 +93,8 @@ TEST(PrefixCacheIndexInspectionTest, ReportsCurrentOwnershipWithoutPinningOrTouc
     const auto initial = index.Inspect(pool, key);
     ASSERT_TRUE(initial);
     EXPECT_EQ(initial->location, location);
-    EXPECT_EQ(initial->metadata.last_access_epoch, 10);
-    EXPECT_FALSE(initial->metadata.was_acquired);
+    EXPECT_EQ(initial->metadata.eviction.last_access_epoch, 10);
+    EXPECT_FALSE(initial->metadata.eviction.was_acquired);
     EXPECT_FALSE(initial->pinned);
 
     auto holder = index.Find(pool, key);
@@ -105,7 +105,7 @@ TEST(PrefixCacheIndexInspectionTest, ReportsCurrentOwnershipWithoutPinningOrTouc
     EXPECT_EQ(holder.use_count(), 2);
     index.Register(pool, holder, key, /*access_epoch=*/30, /*logical_block_index=*/-1, CacheBoundaryKind::kChunk,
                    /*newly_cached=*/nullptr, /*session=*/nullptr);
-    EXPECT_EQ(index.Inspect(pool, key)->metadata.last_access_epoch, 30);
+    EXPECT_EQ(index.Inspect(pool, key)->metadata.eviction.last_access_epoch, 30);
     holder = {};
     EXPECT_FALSE(index.Inspect(pool, key)->pinned);
 
@@ -141,7 +141,7 @@ TEST(PrefixCacheIndexInspectionTest, EvictionKeepsItsKeyAndMetadataAfterTheEntry
         index.EvictWithMetadata(pool, location, [&](const auto&, const auto& metadata, auto*) { recorded = metadata; });
     ASSERT_TRUE(removed);
     EXPECT_EQ(*removed, key);
-    EXPECT_EQ(recorded.last_access_epoch, 17);
+    EXPECT_EQ(recorded.eviction.last_access_epoch, 17);
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), 1);
     EXPECT_FALSE(index.Contains(pool, location));
     const auto replacement = Cache(index, pool, "replacement", 18);
@@ -595,7 +595,7 @@ TEST(PrefixCacheIndexInspectionTest, LongDigestsKeepNamespacesAndOffsetsDistinct
         const auto entry = index.Inspect(pool, keys[i]);
         ASSERT_TRUE(entry);
         EXPECT_EQ(entry->location, locations[i]);
-        EXPECT_EQ(entry->metadata.logical_block_index, i);
+        EXPECT_EQ(entry->metadata.eviction.logical_block_index, i);
         CacheKey missing = keys[i];
         missing.namespace_id += 2;
         EXPECT_FALSE(index.Contains(pool, missing));
@@ -971,8 +971,8 @@ TEST(PrefixCacheIndexCommonOrderTest, KeepsEvictionAndCommonOrderCurrentWhenPinn
         ASSERT_TRUE(first);
         ASSERT_TRUE(second);
         EXPECT_EQ(*first->key, KeyOf("held"));
-        EXPECT_EQ(first->source.metadata.last_access_epoch, 9u);
-        EXPECT_EQ(first->peer.metadata.last_access_epoch, 40u);
+        EXPECT_EQ(first->source.metadata.eviction.last_access_epoch, 9u);
+        EXPECT_EQ(first->peer.metadata.eviction.last_access_epoch, 40u);
         EXPECT_TRUE(first->source.pinned);
         EXPECT_FALSE(first->peer.pinned);
         EXPECT_EQ(*second->key, KeyOf("other"));
@@ -995,7 +995,7 @@ TEST(PrefixCacheIndexCommonOrderTest, KeepsEvictionAndCommonOrderCurrentWhenPinn
     ASSERT_TRUE(second);
     EXPECT_EQ(*first->key, KeyOf("other"));
     EXPECT_EQ(*second->key, KeyOf("held"));
-    EXPECT_EQ(second->source.metadata.last_access_epoch, 0u);
+    EXPECT_EQ(second->source.metadata.eviction.last_access_epoch, 0u);
     EXPECT_FALSE(second->source.pinned);
     EXPECT_FALSE(index.NextCommonRecentEntry(source, cursor));
 }
@@ -1021,7 +1021,7 @@ TEST(PrefixCacheIndexCommonOrderTest, KeepsTheCommonOrderCurrentWhenAnEntryMoves
         ASSERT_TRUE(common);
         EXPECT_EQ(*common->key, KeyOf("moved"));
         EXPECT_EQ(common->source.location, to);
-        EXPECT_EQ(common->source.metadata.last_access_epoch, 4u);
+        EXPECT_EQ(common->source.metadata.eviction.last_access_epoch, 4u);
         EXPECT_TRUE(common->source.pinned);
         EXPECT_FALSE(index.NextCommonRecentEntry(source, cursor));
     }
@@ -1043,17 +1043,17 @@ TEST(PrefixCacheIndexSnapshotTest, VisitsBothOwnershipKindsWithoutTouchingOrPinn
     index.ForEachEntry(pool, [&](const CacheKey& key, const PrefixCacheIndex::CachedBlockSnapshot& entry) {
         seen.push_back(key.content_hash.ToString());
         EXPECT_EQ(entry.pinned, key == KeyOf("held"));
-        EXPECT_FALSE(entry.metadata.was_acquired);
+        EXPECT_FALSE(entry.metadata.eviction.was_acquired);
         if (key == KeyOf("old")) {
             EXPECT_EQ(entry.location, old);
-            EXPECT_EQ(entry.metadata.last_access_epoch, 0u);
+            EXPECT_EQ(entry.metadata.eviction.last_access_epoch, 0u);
         } else if (key == KeyOf("held")) {
             EXPECT_EQ(entry.location, held);
-            EXPECT_EQ(entry.metadata.last_access_epoch, 6u);
+            EXPECT_EQ(entry.metadata.eviction.last_access_epoch, 6u);
         } else {
             EXPECT_EQ(key, KeyOf("recent"));
             EXPECT_EQ(entry.location, recent);
-            EXPECT_EQ(entry.metadata.last_access_epoch, 9u);
+            EXPECT_EQ(entry.metadata.eviction.last_access_epoch, 9u);
         }
     });
     std::ranges::sort(seen);
@@ -1069,7 +1069,7 @@ TEST(PrefixCacheIndexSnapshotTest, VisitsBothOwnershipKindsWithoutTouchingOrPinn
     index.ForEachEntry(pool, [&](const CacheKey& key, const PrefixCacheIndex::CachedBlockSnapshot& entry) {
         EXPECT_FALSE(entry.pinned);
         if (key == KeyOf("held")) {
-            EXPECT_EQ(entry.metadata.last_access_epoch, 10u);
+            EXPECT_EQ(entry.metadata.eviction.last_access_epoch, 10u);
         }
     });
     EXPECT_EQ(index.Evict(pool, old), KeyOf("old"));
@@ -1370,8 +1370,8 @@ TEST(PrefixCacheIndexEvictionOrderTest, RelocatesAnEntryOntoItsCopyWithItsAgePin
     const auto moved = index.Inspect(pool, KeyOf("moved"));
     ASSERT_TRUE(moved);
     EXPECT_EQ(moved->location, to);
-    EXPECT_EQ(moved->metadata.last_access_epoch, 10u);
-    EXPECT_TRUE(moved->metadata.was_acquired);
+    EXPECT_EQ(moved->metadata.eviction.last_access_epoch, 10u);
+    EXPECT_TRUE(moved->metadata.eviction.was_acquired);
     EXPECT_TRUE(moved->pinned);
     EXPECT_EQ(tree.Find(ContentHash{"moved"}), node);
     EXPECT_EQ(node->Entries(BoundaryTree::kDevice), 1);
@@ -1457,10 +1457,10 @@ TEST(PrefixCacheSessionTest, TouchExistingMergesOwnershipBeforeRefreshingDemoted
             ASSERT_TRUE(entry);
             EXPECT_FALSE(entry->pinned);
             EXPECT_EQ(entry->metadata.session, visitor == owner ? owner : nullptr);
-            EXPECT_EQ(entry->metadata.last_access_epoch, demoted && visitor == owner ? 0u : 20u);
+            EXPECT_EQ(entry->metadata.eviction.last_access_epoch, demoted && visitor == owner ? 0u : 20u);
             EXPECT_EQ(index.DemoteSession(host, owner), !demoted && visitor == owner ? 1u : 0u);
             if (visitor != owner) {
-                EXPECT_EQ(index.Inspect(host, keys[0])->metadata.last_access_epoch, 20u);
+                EXPECT_EQ(index.Inspect(host, keys[0])->metadata.eviction.last_access_epoch, 20u);
             }
         }
     }
@@ -1483,15 +1483,15 @@ TEST(PrefixCacheSessionTest, TouchExistingKeepsNewerEpochsAndDoesNotInsertPinOrT
     const auto skipped = index.Inspect(host, keys[1]);
     ASSERT_TRUE(present);
     ASSERT_TRUE(skipped);
-    EXPECT_EQ(present->metadata.last_access_epoch, 30u);
+    EXPECT_EQ(present->metadata.eviction.last_access_epoch, 30u);
     EXPECT_FALSE(present->metadata.session);
-    EXPECT_EQ(skipped->metadata.last_access_epoch, 30u);
+    EXPECT_EQ(skipped->metadata.eviction.last_access_epoch, 30u);
     EXPECT_EQ(skipped->metadata.session, owner);
     EXPECT_FALSE(index.Contains(host, keys[2]));
     EXPECT_EQ(host.NumEmptyLcmBlocks(), 1);
     EXPECT_FALSE(present->pinned);
     EXPECT_FALSE(skipped->pinned);
-    EXPECT_FALSE(present->metadata.was_acquired);
+    EXPECT_FALSE(present->metadata.eviction.was_acquired);
     EXPECT_EQ(sources[0].use_count(), 1);
     EXPECT_EQ(sources[2].use_count(), 1);
 }
@@ -1522,10 +1522,10 @@ TEST(PrefixCacheSessionTest, DemotionAgesExclusiveIdleBlocksButProtectsSharedAnd
     other = {};
     first->demoted = true;
     EXPECT_EQ(index.DemoteSession(pool, first), 1u);
-    EXPECT_EQ(index.MetadataFor(pool, exclusive_location)->last_access_epoch, 0u);
-    EXPECT_EQ(index.MetadataFor(pool, shared_location)->last_access_epoch, 40u);
-    EXPECT_EQ(index.MetadataFor(pool, active_location)->last_access_epoch, 50u);
-    EXPECT_EQ(index.MetadataFor(pool, other_location)->last_access_epoch, 10u);
+    EXPECT_EQ(index.MetadataFor(pool, exclusive_location)->eviction.last_access_epoch, 0u);
+    EXPECT_EQ(index.MetadataFor(pool, shared_location)->eviction.last_access_epoch, 40u);
+    EXPECT_EQ(index.MetadataFor(pool, active_location)->eviction.last_access_epoch, 50u);
+    EXPECT_EQ(index.MetadataFor(pool, other_location)->eviction.last_access_epoch, 10u);
     EXPECT_EQ(DrainEvictionOrder(index, pool),
               (std::vector<CacheBlockLocation>{exclusive_location, other_location, shared_location}));
     EXPECT_FALSE(index.Evict(pool, active_location).has_value());
@@ -1536,7 +1536,7 @@ TEST(PrefixCacheSessionTest, DemotionAgesExclusiveIdleBlocksButProtectsSharedAnd
     first->demoted = false;
     auto hit = index.AcquireMatched(pool, std::vector<CacheKey>{KeyOf("exclusive")}, 0, GroupPrefixProbe{.hits = {1}},
                                     60, first);
-    EXPECT_EQ(index.MetadataFor(pool, exclusive_location)->last_access_epoch, 60u);
+    EXPECT_EQ(index.MetadataFor(pool, exclusive_location)->eviction.last_access_epoch, 60u);
     hit.blocks.clear();
     EXPECT_EQ(DrainEvictionOrder(index, pool),
               (std::vector<CacheBlockLocation>{active_location, other_location, shared_location, exclusive_location}));

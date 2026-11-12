@@ -213,7 +213,7 @@ TEST(SwaManagerTest, SpeculativeHitsDoNotRefreshAccessEpoch) {
     const std::optional<PrefixCacheIndex::CachedBlockMetadata> after =
         mgr.CachedBlockMetadataFor(pool, speculative_location);
     ASSERT_TRUE(after);
-    EXPECT_EQ(after->last_access_epoch, before->last_access_epoch);
+    EXPECT_EQ(after->eviction.last_access_epoch, before->eviction.last_access_epoch);
 }
 
 // Pins the device-tier W=1 semantic: no lookback means every boundary is resumable,
