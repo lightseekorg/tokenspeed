@@ -59,6 +59,7 @@ __all__ = [
     "packed_projection_weight_view",
     "moe_sigmoid_bias_topk_routing",
     "kimi3_sigmoid_bias_topk_sorted",
+    "kimi3_sorted_routing_fuses_shared_down",
     "kimi3_sorted_routing_scratch",
     "FUSED_ROUTING_MAX_TOKENS",
     "PreparedNvfp4Routing",
@@ -1010,6 +1011,7 @@ from tokenspeed_kernel.ops.moe._triton.bf16 import (  # noqa: E402
 )
 from tokenspeed_kernel.ops.moe._triton.kimi3_sigmoid_topk import (  # noqa: E402
     kimi3_sigmoid_bias_topk_sorted,
+    kimi3_sorted_routing_fuses_shared_down,
     kimi3_sorted_routing_scratch,
 )
 from tokenspeed_kernel.ops.moe._triton.sigmoid_topk_routing import (  # noqa: E402
