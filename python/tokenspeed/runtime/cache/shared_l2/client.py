@@ -287,6 +287,8 @@ class SharedL2Client:
         self._lock = threading.Lock()
         # Wakes the notice thread.
         self._wake = threading.Condition(self._lock)
+        # Wakes wait_lookups when lookups stop waiting for the owner.
+        self._answered = threading.Condition(self._lock)
         self._closed = False
         self._pool: SharedL2PoolView | None = None
         # The id of the next hello. One id for every hello of an outage: the
@@ -305,6 +307,10 @@ class SharedL2Client:
         # planned from the ticket may still start.
         self._left_tickets: dict[int, tuple[SharedL2PoolView, float]] = {}
         self._ticket_ids = itertools.count(1)
+        # (group, proxy Host block) -> the (ticket, bucket, pool page) it
+        # stands for. Written by the event loop before the plan that loads
+        # from it; read by the load executor when that plan is submitted.
+        self._proxy_pages: dict[tuple[int, int], tuple[int, int, int]] = {}
         self._notices: collections.deque[tuple[str, dict[str, Any]]] = (
             collections.deque()
         )
@@ -403,6 +409,41 @@ class SharedL2Client:
                 answers.append(_miss(lookup_id))
                 self.lookup_timeouts += 1
         return answers
+
+    def wait_lookups(self, lookup_ids: Sequence[int], timeout_s: float) -> None:
+        """Wait until none of these lookups waits for the owner any more, so
+        that ``poll_lookups`` has their answers; at most ``timeout_s``."""
+        end = time.monotonic() + timeout_s
+        with self._answered:
+            while True:
+                deadlines = [
+                    self._pending[lookup_id]
+                    for lookup_id in lookup_ids
+                    if lookup_id in self._pending
+                ]
+                if not deadlines:
+                    return
+                # A lookup past its deadline is answered by the next poll.
+                remaining = min(end, *deadlines) - time.monotonic()
+                if remaining <= 0:
+                    return
+                self._answered.wait(remaining)
+
+    def map_proxy_pages(self, ticket: int, pages: Sequence[tuple]) -> None:
+        """Record the pool page behind each proxy Host block the scheduler
+        made for one answer.
+
+        Args:
+            ticket: The answer's ticket.
+            pages: ``Scheduler.apply_shared_l2_lookups`` of that answer:
+                ``(group, proxy_block, bucket, page)``.
+        """
+        for group, proxy_block, bucket, page in pages:
+            self._proxy_pages[group, proxy_block] = (ticket, bucket, page)
+
+    def proxy_page(self, group: int, proxy_block: int) -> tuple[int, int, int]:
+        """The ``(ticket, bucket, page)`` a proxy Host block stands for."""
+        return self._proxy_pages[group, proxy_block]
 
     def loads_allowed(self, ticket: int) -> bool:
         """Whether a load from the pages ``ticket`` pins may be planned now.
@@ -624,6 +665,7 @@ class SharedL2Client:
             self._quarantined.clear()
             self._answers.extend(_miss(lookup_id) for lookup_id in self._pending)
             self._pending.clear()
+            self._answered.notify_all()
             self._wake.notify()
         logger.warning(
             f"shared L2 client {pool.client} serves without the pool: {reason}"
@@ -737,6 +779,7 @@ class SharedL2Client:
                         slots,
                     )
                 )
+            self._answered.notify_all()
         if abandoned:
             self._abandon(pool, "abandon_lookup", lookup_ids=abandoned)
 

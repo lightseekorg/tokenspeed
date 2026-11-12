@@ -371,6 +371,54 @@ def test_closing_a_rank_stops_its_threads_and_closes_its_transfer(serve, join):
     ]
 
 
+def test_a_wait_for_lookups_ends_when_their_answers_are_there(serve, join):
+    owner = serve()
+    store(join(owner), 1, PROMPT)
+    # A wait can end for three reasons. Each part keeps the other two a
+    # minute away, so no part depends on how fast this machine is.
+    reader = join(owner, lookup_deadline_ms=60_000)
+    brief = join(owner, lookup_deadline_ms=200)
+
+    # Answered: the wait ends long before its limit, with every answer queued.
+    reader.submit_lookups(
+        [(10, "hit", *lookup_fields(PROMPT)), (11, "cold", *lookup_fields([9, 9]))]
+    )
+    started = time.monotonic()
+    reader.wait_lookups([10, 11], 60.0)
+    assert time.monotonic() - started < 30
+    assert sorted(answer[0] for answer in reader.poll_lookups()) == [10, 11]
+    # Nothing waits: lookups already answered, or never made.
+    reader.wait_lookups([10, 11, 99], 60.0)
+    assert time.monotonic() - started < 30
+
+    # Unanswered: the wait ends at its own limit, with the lookup still open...
+    owner.stall()
+    reader.submit_lookups([(12, "late", *lookup_fields(PROMPT))])
+    started = time.monotonic()
+    reader.wait_lookups([12], 0.05)
+    assert 0.05 <= time.monotonic() - started < 30
+    assert reader.poll_lookups() == []
+    # ... or at the lookup's deadline, when the next poll answers a miss.
+    started = time.monotonic()
+    brief.submit_lookups([(13, "late", *lookup_fields(PROMPT))])
+    brief.wait_lookups([13], 60.0)
+    assert 0.2 <= time.monotonic() - started < 30
+    assert brief.poll_lookups() == [miss(13)]
+    owner.resume()
+
+
+def test_the_rank_keeps_the_pool_page_behind_each_proxy_block(serve, join):
+    rank = join(serve())
+    rank.map_proxy_pages(5, [(0, 11, 0, 3), (1, 12, 0, 9)])
+    assert rank.proxy_page(0, 11) == (5, 0, 3)
+    assert rank.proxy_page(1, 12) == (5, 0, 9)
+    # A proxy block the scheduler uses again stands for its new page.
+    rank.map_proxy_pages(6, [(0, 11, 0, 4)])
+    assert rank.proxy_page(0, 11) == (6, 0, 4)
+    with pytest.raises(KeyError):
+        rank.proxy_page(0, 99)
+
+
 def test_tokens_leave_the_rank_as_int32_bytes(serve, join):
     rank = join(serve())
     hashes, tokens, max_tokens = lookup_fields(PROMPT)

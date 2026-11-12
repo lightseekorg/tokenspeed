@@ -123,6 +123,16 @@ eviction's shadow fit and snapshot sizing all use the destination pool's
 packing. Cyclic owner counts stay the same across tiers, so transfers still
 keep the Device block's owner bucket. Every empty parent returns to the shared
 pool; no capacity is reserved for State or history.
+
+A shared L2 pool (`--shared-l2-config`) uses the compact Host geometry too. A
+pool page holds one block exactly as a Host block does, and a rank reports the
+pool's `host_group_packing` for its Host tier, which is then a proxy: its
+blocks hold no bytes and stand for pinned pool pages. Only the parents are
+spread over the provider processes' memory (`runtime/cache/shared_l2/layout.py`);
+the bytes move between a rank's Device blocks and pool pages by RDMA and never
+pass through the rank's host memory. The pool's capacity follows from the same
+geometry: a State checkpoint costs one parent for each State group, and KV
+pages share parents by their group's packing.
 Mirrored ranks must agree on Host packing as well as parent counts. Startup
 compares both before allocating pinned memory and refuses incompatible local
 payload geometry rather than giving the same block ID different meanings.

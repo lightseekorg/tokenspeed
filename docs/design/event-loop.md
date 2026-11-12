@@ -1185,8 +1185,9 @@ variants as in model warmup. Only
 then does the host complete the frontend handshake and report ready: no
 client request waits behind them or is timed with them.
 
-A disaggregated node is refused (its requests need a peer), and so is an
-L3 store (the flush would delete its shared namespace).
+A disaggregated node is refused (its requests need a peer), and so are an
+L3 store (the flush would delete its shared namespace) and a shared L2 pool
+(the flush would leave the startup prefixes in the pool).
 
 ## Checklist for extending the loop
 

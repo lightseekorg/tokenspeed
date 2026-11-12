@@ -49,11 +49,21 @@ from test.runtime.shared_l2_test_utils import (  # noqa: E402
     write_fields,
 )
 
+from tokenspeed.runtime.cache.shared_l2.layout import SharedL2Layout  # noqa: E402
+from tokenspeed.runtime.cache.shared_l2.owner import make_pool  # noqa: E402
 from tokenspeed.runtime.cache.shared_l2.provider import run_provider  # noqa: E402
 from tokenspeed.runtime.cache.shared_l2.wire import (  # noqa: E402
     OwnerConnection,
     OwnerError,
     UnknownClientError,
+)
+from tokenspeed.runtime.cache.transfer.layout import (  # noqa: E402
+    CacheField,
+    CacheGroupLayout,
+    CacheTransferLayout,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (  # noqa: E402
+    CacheGroupSpec,
 )
 from tokenspeed.runtime.utils.network import get_free_port  # noqa: E402
 
@@ -535,3 +545,75 @@ def test_the_owner_service_runs_from_the_command_line(block_size):
     finally:
         connection.close()
         service.kill()
+
+
+def test_the_pool_is_built_over_the_groups_a_rank_reports():
+    pytest.importorskip("tokenspeed_scheduler")
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.scheduler_bridge import (
+        cache_group_config,
+    )
+
+    # A rank's groups: full KV, State, and a window of three tokens that
+    # also keeps the prompt's first two (an attention sink).
+    specs = (
+        CacheGroupSpec(
+            "kv",
+            "full_history",
+            rows_per_page=1,
+            entry_stride_tokens=2,
+            replayable=False,
+        ),
+        CacheGroupSpec("state", "state", replayable=False),
+        CacheGroupSpec(
+            "window",
+            "sliding_window",
+            rows_per_page=1,
+            entry_stride_tokens=2,
+            sliding_window_tokens=3,
+            sink_tokens=2,
+            replayable=False,
+        ),
+    )
+    geometry = SharedL2Layout.build(
+        CacheTransferLayout(
+            num_lcm_blocks=4,
+            groups=(
+                CacheGroupLayout("kv", 4, (CacheField("k", 0, 0, 32, 24),)),
+                CacheGroupLayout("state", 8, (CacheField("s", 0, 0, 16, 8),)),
+                CacheGroupLayout("window", 8, (CacheField("w", 0, 0, 16, 12),)),
+            ),
+            buffers=(bytearray(1),),
+            consumers=(("k", "s", "w"),),
+        ),
+        view_layers=(1,),
+        group_specs=specs,
+        cache_groups=[
+            cache_group_config(spec, total_pages=0, cache_blocks_per_lcm_block=packing)
+            for spec, packing in zip(specs, (4, 8, 8))
+        ],
+        prefix_granularity=2,
+    ).geometry
+    pool = make_pool(
+        geometry,
+        16,
+        headroom_lcm_blocks=0,
+        checkpoint_retention_requests=0,
+        checkpoint_retention_leaf_distance=0,
+    )
+
+    # Six pages of every history group and the checkpoint at their end.
+    prompt = list(range(1, 13))
+    hashes, _, keys = prompt_keys(prompt)
+    window = [(0, 2, page, 0) for page in hashes]
+    ticket, pages = pool.reserve(1, 1, keys + window, [0] * 13)
+    # An LCM block holds one KV page, three States or two window pages, as
+    # the rank's Host tier packs them; each group numbers its own pages.
+    assert pages == [1, 2, 3, 4, 5, 6, 19, 15, 16, 17, 18, 19, 20]
+    assert pool.commit(1, ticket, write_fields(prompt)[3])
+
+    # The owner matches as the rank's scheduler does. Of the window group a
+    # hit needs, and pins, the sink's page and the last page.
+    _, num_tokens, _, _, slots = pool.probe(2, 1, *lookup_fields(prompt))
+    assert num_tokens == len(prompt)
+    assert [key for key, _, _ in slots] == keys + [window[0], window[-1]]
+    assert pool.stats()["pinned_blocks"] == len(keys) + 2

@@ -24,4 +24,10 @@
 and holds no bytes; ``provider`` hosts one node's pool memory; ``client`` is a
 rank's control side, which carries the scheduler's lookups, writes and notices
 to the owner; ``wire`` is the request-reply wire between them.
+
+On a rank, ``layout`` says where its Device blocks and the pool's pages are,
+``transfer`` copies between them by RDMA, ``executor`` loads pool pages into
+the Device cache layer by layer in the Host cache executor's place, and
+``rank`` joins all of it to the pool at device construction. See the "Shared
+L2 pool" section of ``docs/configuration/server.md``.
 """
