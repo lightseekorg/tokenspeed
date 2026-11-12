@@ -1619,6 +1619,18 @@ and starts a new interval. The counters follow the plans alone, so mirrored
 ranks agree; under attention DP each replica counts its own rounds. The P and
 D roles refuse the knob: neither runs local prefill and decode on one engine.
 
+**Minimum interval** (`prefill_decode_min_interval` `M`, either mode; `0` is
+off): a round that schedules a local prefill chunk also owes the running
+decodes `M` decode rounds, on the same terms, but no overdue prompt suspends
+them. A suspended interval's overdue chunks then alternate with `M` decode
+rounds instead of running back to back: while a decode can run, no prefill
+round directly follows another. The price is the time-to-first-token bound:
+on top of the interval's `N`, a prompt waits `M` decode steps per prefill
+chunk the engine runs before its last one, its own included. A round that `M`
+holds back counts toward `N` like the interval's own. With `M >= N` the
+interval owes nothing `M` does not; `M` alone bounds nothing. The P and D
+roles refuse it as well.
+
 **Retraction:** the shared victim rule (§2): incomplete prefills first, then
 decode work. The Host cache decides the image's split, not whether there is
 one: with L2 the published prefix — tail and state checkpoint included —

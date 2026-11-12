@@ -461,6 +461,8 @@ class ServerArgs:
     # Decode rounds owed to the running decodes after each prefill round; 0 is
     # off (docs/design/scheduler.md §3.3).
     prefill_decode_interval: int = 0
+    # The same, owed even while an overdue prompt suspends the interval.
+    prefill_decode_min_interval: int = 0
     enable_short_prefill_first: bool = False
     # The fused engine's prefill-delay gate (docs/design/prefill-delay.md):
     # prefill work is held for a window of decode rounds and then batched, so
@@ -2817,22 +2819,13 @@ class ServerArgs:
                 "prefill engine runs no decodes and a decode engine no local "
                 "prefill rounds"
             )
-        if self.monokernel_stuck_record_dir is not None:
-            fs_type = _filesystem_type(self.monokernel_stuck_record_dir)
-            if fs_type != "tmpfs":
-                # The record file is mapped and registered as GPU-visible host
-                # memory. On a disk filesystem the kernel's periodic dirty-page
-                # writeback of those pages stalls decode for 1-2 s every few
-                # seconds; tmpfs pages are never written back.
-                raise ValueError(
-                    "--monokernel-stuck-record-dir must be on tmpfs (for "
-                    f"example /dev/shm); {self.monokernel_stuck_record_dir} is "
-                    f"on {fs_type}"
-                )
-        if self.monokernel_stuck_record_dir is not None and not self.decode_monokernel:
+        if self.prefill_decode_min_interval < 0:
+            raise ValueError("--prefill-decode-min-interval must be non-negative")
+        if self.prefill_decode_min_interval and self.disaggregation_mode != "null":
             raise ValueError(
-                "--monokernel-stuck-record-dir needs --decode-monokernel: only "
-                "the monokernel launches write stuck-poll records"
+                "--prefill-decode-min-interval needs --disaggregation-mode null: "
+                "a prefill engine runs no decodes and a decode engine no local "
+                "prefill rounds"
             )
         if self.device == "npu":
             if not self.disable_prefill_graph:
@@ -2915,13 +2908,17 @@ class ServerArgs:
                 "the prefill delay gate applies to a fused engine "
                 "(--disaggregation-mode null) only"
             )
-        if self.prefill_decode_interval:
-            raise ValueError(
-                "--prefill-decode-interval cannot be combined with "
-                "--prefill-attempt-interval and --prefill-any-attempt-interval: "
-                "local decode intervals and the attention-DP gate use different "
-                "prefill windows"
-            )
+        for flag, interval in (
+            ("--prefill-decode-interval", self.prefill_decode_interval),
+            ("--prefill-decode-min-interval", self.prefill_decode_min_interval),
+        ):
+            if interval:
+                raise ValueError(
+                    f"{flag} cannot be combined with "
+                    "--prefill-attempt-interval and --prefill-any-attempt-interval: "
+                    "local decode intervals and the attention-DP gate use "
+                    "different prefill windows"
+                )
 
     @property
     def prefill_delay(self) -> tuple[int, int] | None:
@@ -3201,6 +3198,17 @@ class ServerArgs:
             "more than this many decode rounds in total. Trades TTFT for "
             "fewer decode stalls. Aggregated serving only. 0 (the default) is "
             "off.",
+        )
+        parser.add_argument(
+            "--prefill-decode-min-interval",
+            type=int,
+            default=ServerArgs.prefill_decode_min_interval,
+            help="After every round that runs a prefill chunk, run at least "
+            "this many decode rounds before the next prefill round, unless no "
+            "decode can run, even while --prefill-decode-interval is suspended "
+            "for a prompt it has held back in full. A long prompt's chunks "
+            "then alternate with decode rounds instead of stalling the decodes "
+            "back to back. Aggregated serving only. 0 (the default) is off.",
         )
         parser.add_argument(
             "--enable-state-checkpoint-in-forward",

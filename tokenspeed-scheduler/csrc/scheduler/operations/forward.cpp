@@ -2328,13 +2328,19 @@ void Scheduler::buildDecodeWorkerPlan(AdmissionFeedback& feedback, PlanBuild& bu
 // than N rounds in total, across its chunks and other prompts' intervals: a
 // prompt held back N rounds suspends the interval, and the round runs as if
 // none were owed.
+//
+// prefill_decode_min_interval M is owed the same way, but nothing suspends
+// it: an overdue prompt's chunks alternate with M decode rounds instead of
+// running back to back.
 void Scheduler::buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                                std::vector<WriteBackOperation>& write_back_operations) {
     ProfileSpan profile_span{"Scheduler::buildFusedPlan"};
     maybeForceRetraction(build, candidates, write_back_operations);
 
     const bool new_prompts_sealed = scheduleReadmission(feedback, build, candidates);
-    const bool interval_owes_decodes = prefill_deferral_rounds_left_ > 0 && !prefillDeferralExhausted(candidates);
+    const bool interval_owes_decodes =
+        prefill_min_rounds_left_ > 0 ||
+        (prefill_deferral_rounds_left_ > 0 && !prefillDeferralExhausted(candidates));
     if (config_.enable_mixed_prefill_decode) {
         // The decode batch's prefill reserve exists to protect a prefill that
         // may ride beside it; with the delay gate closed no prefill can, so
@@ -2384,8 +2390,10 @@ void Scheduler::buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, st
     }
     if (build.pushed_prefill) {
         prefill_deferral_rounds_left_ = config_.prefill_decode_interval;
-    } else if (build.pushed_decode && prefill_deferral_rounds_left_ > 0) {
-        --prefill_deferral_rounds_left_;
+        prefill_min_rounds_left_ = config_.prefill_decode_min_interval;
+    } else if (build.pushed_decode) {
+        prefill_deferral_rounds_left_ = std::max(prefill_deferral_rounds_left_ - 1, 0);
+        prefill_min_rounds_left_ = std::max(prefill_min_rounds_left_ - 1, 0);
     }
 }
 
