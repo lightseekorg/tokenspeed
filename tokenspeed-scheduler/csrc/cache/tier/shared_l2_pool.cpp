@@ -228,26 +228,33 @@ void SharedL2Pool::keepHeadroom() {
     cache_.AcquireHostBlocks(groups, buckets);
 }
 
-bool SharedL2Pool::Commit(ClientId client, Ticket ticket, std::span<const Publication> publications) {
+bool SharedL2Pool::Commit(ClientId client, Ticket ticket, std::span<const CheckpointTree::Lineage> checkpoints) {
     std::vector<CompletedPages> completed;
-    completed.reserve(publications.size());
-    for (const Publication& publication : publications) {
-        const std::int32_t tail_tokens = publication.tail ? publication.tail->tail_tokens : 0;
-        if (publication.tokens.empty() ||
-            (publication.tail &&
-             (tail_tokens <= 0 || tail_tokens >= prefix_granularity_ || publication.tail->hash.empty())) ||
-            publication.tokens.size() !=
-                publication.prefix_hashes.size() * static_cast<std::size_t>(prefix_granularity_) +
-                    static_cast<std::size_t>(tail_tokens)) {
+    completed.reserve(checkpoints.size());
+    for (const CheckpointTree::Lineage& checkpoint : checkpoints) {
+        const std::int32_t tail_tokens = checkpoint.tail ? checkpoint.tail->tail_tokens : 0;
+        // A lineage comes off the wire: its token count is held to the int32
+        // range before it is narrowed, here and where the checkpoint is
+        // recorded (CheckpointTree::Observe), and its pages are compared by
+        // division, which no number of hashes overflows.
+        if (!std::in_range<std::int32_t>(checkpoint.tokens.size())) {
+            throw std::invalid_argument("a shared L2 publication's tokens must fit the int32 token range");
+        }
+        const auto page = static_cast<std::size_t>(prefix_granularity_);
+        if (checkpoint.tokens.empty() ||
+            (checkpoint.tail &&
+             (tail_tokens <= 0 || tail_tokens >= prefix_granularity_ || checkpoint.tail->hash.empty())) ||
+            checkpoint.tokens.size() / page != checkpoint.prefix_hashes.size() ||
+            checkpoint.tokens.size() % page != static_cast<std::size_t>(tail_tokens)) {
             throw std::invalid_argument("a shared L2 publication's tokens must cover its pages and tail exactly");
         }
         completed.push_back(
-            CompletedPages{.tokens = publication.tokens,
-                           .prefix_hashes = publication.prefix_hashes,
+            CompletedPages{.tokens = checkpoint.tokens,
+                           .prefix_hashes = checkpoint.prefix_hashes,
                            // Every page may be new to the pool: the link starts at the deepest
                            // page already linked.
-                           .first_new_prefix_page = static_cast<std::int32_t>(publication.prefix_hashes.size()),
-                           .tail = publication.tail,
+                           .first_new_prefix_page = static_cast<std::int32_t>(checkpoint.prefix_hashes.size()),
+                           .tail = checkpoint.tail,
                            .publish_state = true,
                            .boundary_kind = CacheBoundaryKind::kEndpoint});
     }
@@ -273,7 +280,7 @@ bool SharedL2Pool::Commit(ClientId client, Ticket ticket, std::span<const Public
     for (std::size_t i = 0; i < completed.size(); ++i) {
         const CompletedPages& checkpoint = completed[i];
         // Two ranks issue the same access epochs: the client tells them apart.
-        cache_.RecordCheckpoint(checkpoint, publications[i].publisher ^ (client * 0x9E3779B97F4A7C15ULL));
+        cache_.RecordCheckpoint(checkpoint, checkpoints[i].access_epoch ^ (client * 0x9E3779B97F4A7C15ULL));
         if (checkpoint.tail) {
             cache_.CacheHostTail(
                 checkpoint.prefix_hashes.empty() ? ContentHash{} : ContentHash{checkpoint.prefix_hashes.back()},

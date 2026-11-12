@@ -131,8 +131,23 @@ std::size_t CacheCoordinator::demoteCacheOwners(const std::vector<std::string>& 
     return changed;
 }
 
-std::vector<CacheCoordinator::StoreCandidate> CacheCoordinator::TakePendingStores() {
-    auto pending = std::exchange(pending_stores_, {});
+std::vector<CacheCoordinator::StoreCandidate> CacheCoordinator::TakePendingStores(std::size_t max_candidates) {
+    std::vector<StoreCandidate> pending;
+    if (taken_pending_stores_ == 0 && max_candidates >= pending_stores_.size()) {
+        pending = std::exchange(pending_stores_, {});
+    } else {
+        const auto first = pending_stores_.begin() + static_cast<std::ptrdiff_t>(taken_pending_stores_);
+        const auto past_end = first + static_cast<std::ptrdiff_t>(
+                                          std::min(max_candidates, pending_stores_.size() - taken_pending_stores_));
+        pending.assign(std::make_move_iterator(first), std::make_move_iterator(past_end));
+        taken_pending_stores_ += pending.size();
+        // The taken front leaves the queue once it is at least half of it:
+        // a take costs what it takes, however long the queue is.
+        if (taken_pending_stores_ * 2 >= pending_stores_.size()) {
+            pending_stores_.erase(pending_stores_.begin(), past_end);
+            taken_pending_stores_ = 0;
+        }
+    }
     std::erase_if(pending, [this](const StoreCandidate& candidate) {
         const auto& index = groups_[candidate.key.group_id].Index();
         auto location = locationOf(pool_, candidate.key.group_id, candidate.key);
@@ -322,8 +337,9 @@ bool CacheCoordinator::ClearDeviceCache() {
         }
     }
 
-    store_candidates_dropped_by_flush_ += pending_stores_.size();
+    store_candidates_dropped_by_flush_ += pending_stores_.size() - taken_pending_stores_;
     pending_stores_.clear();
+    taken_pending_stores_ = 0;
     // The cascade of an earlier eviction may already have taken one.
     for (const UnevictedVictim& victim :
          evictPlannedVictims(std::span{&cached, 1}, /*write_back=*/false,
@@ -692,6 +708,7 @@ CoordinatorMatch CacheCoordinator::acquireTierWithKeys(std::span<const std::vect
                 groups_[i].Index().TouchExisting(*host_pool_, std::span{group_keys[i]}.subspan(floor_pages),
                                                  out.per_group[i].blocks, access_epoch, SessionForAccess(access_epoch));
             }
+            collectDeviceHits(std::span{group_keys[i]}.subspan(floor_pages), out.per_group[i].blocks);
         }
         if (probe.tail && !probe.tail->group_keys[i].empty()) {
             // The tail's blocks follow the full pages in the same table.
@@ -703,6 +720,7 @@ CoordinatorMatch CacheCoordinator::acquireTierWithKeys(std::span<const std::vect
                     groups_[i].Index().TouchExisting(*host_pool_, probe.tail->group_keys[i], tail_match.blocks,
                                                      access_epoch, SessionForAccess(access_epoch));
                 }
+                collectDeviceHits(probe.tail->group_keys[i], tail_match.blocks);
             }
             out.per_group[i].blocks.insert(out.per_group[i].blocks.end(),
                                            std::make_move_iterator(tail_match.blocks.begin()),
@@ -724,6 +742,17 @@ CoordinatorMatch CacheCoordinator::acquireTierWithKeys(std::span<const std::vect
         }
     }
     return out;
+}
+
+void CacheCoordinator::collectDeviceHits(std::span<const CacheKey> keys, std::span<const CacheBlockRef> blocks) {
+    if (!collects_device_hits_) {
+        return;
+    }
+    for (std::size_t j = 0; j < blocks.size(); ++j) {
+        if (blocks[j]) {
+            device_hits_.push_back(keys[j]);
+        }
+    }
 }
 
 std::vector<CacheKey> CacheCoordinator::tailKeysForGroup(std::size_t i, const ContentHash& hash,
@@ -1241,7 +1270,7 @@ void CacheCoordinator::probeHostSuffix(const PromptPrefix& prompt, std::span<con
 
 CacheCoordinator::PrefixProbe CacheCoordinator::probePrefixWithOrder(const PromptPrefix& prompt,
                                                                      std::span<const std::size_t> match_order,
-                                                                     bool claim_partial) const {
+                                                                     bool claim_partial, bool with_host) const {
     _assert(prompt.prefix_hashes.size() <=
                 static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max() / prefix_granularity_),
             "prefix length exceeds int32 token range");
@@ -1258,7 +1287,10 @@ CacheCoordinator::PrefixProbe CacheCoordinator::probePrefixWithOrder(const Promp
     }
     const std::int32_t device_tokens = out.device.num_common_tokens;
     out.device_only_hit_tokens = device_tokens;
-    probeHostSuffix(prompt, *out.group_keys, match_order, device_tokens, /*extra_hits=*/nullptr, out.device, out.host);
+    if (with_host) {
+        probeHostSuffix(prompt, *out.group_keys, match_order, device_tokens, /*extra_hits=*/nullptr, out.device,
+                        out.host);
+    }
     if (out.host.num_common_tokens <= device_tokens) {
         // The Device alone resumes furthest. The Host tier keeps the Host's
         // KV reach: the junction still counts it, so a chunk cut there
@@ -1280,7 +1312,12 @@ PreparedPrefixKeys CacheCoordinator::PreparePrefixKeys(std::span<const std::stri
 
 CacheCoordinator::PrefixProbe CacheCoordinator::ProbePromptPrefix(const PromptPrefix& prompt) const {
     ProfileSpan profile_span{"CacheCoordinator::ProbePromptPrefix"};
-    return probePrefixWithOrder(prompt, match_order_, /*claim_partial=*/true);
+    return probePrefixWithOrder(prompt, match_order_, /*claim_partial=*/true, /*with_host=*/true);
+}
+
+CacheCoordinator::PrefixProbe CacheCoordinator::ProbeDevicePromptPrefix(const PromptPrefix& prompt) const {
+    ProfileSpan profile_span{"CacheCoordinator::ProbeDevicePromptPrefix"};
+    return probePrefixWithOrder(prompt, match_order_, /*claim_partial=*/true, /*with_host=*/false);
 }
 
 bool CacheCoordinator::EvictionStoresExtendPrefix(const PromptPrefix& prompt, const PrefixProbe& visible) const {
@@ -3432,6 +3469,13 @@ CoordinatorMatch CacheCoordinator::AcquireHostPrefix(PrefixProbe&& probe) {
     AcquiredPrefix acquired = acquirePrefix(std::move(probe), access_epoch);
     recordAdmission(access_epoch);
     return std::move(acquired.host);
+}
+
+bool CacheCoordinator::DropHostEntry(const CacheKey& key) {
+    _assert(host_pool_ != nullptr, "DropHostEntry requires a host pool");
+    _assert(key.group_id < groups_.size(), "Host entry key group id out of range");
+    const std::optional<CacheBlockLocation> location = locationOf(*host_pool_, key.group_id, key);
+    return !location || evictHostCachedBlock(key.group_id, *location, &HostEvictionStats::released);
 }
 
 void CacheCoordinator::TouchHostBlocks(std::span<const CacheKey> keys) {

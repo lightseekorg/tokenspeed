@@ -81,8 +81,8 @@ struct Prompt {
         for (std::uint32_t group : state_groups) keys.push_back(CacheKey{.group_id = group, .content_hash = End()});
         return keys;
     }
-    SharedL2Pool::Publication Publication(std::uint64_t publisher) const {
-        return {.tokens = tokens, .prefix_hashes = hashes, .tail = tail, .publisher = publisher};
+    CheckpointTree::Lineage Publication(std::uint64_t publisher) const {
+        return {.tokens = tokens, .prefix_hashes = hashes, .tail = tail, .access_epoch = publisher};
     }
     CacheCoordinator::PromptPrefix Prefix() const {
         return {.prefix_hashes = hashes, .tokens = tokens, .max_tokens = static_cast<std::int32_t>(tokens.size())};
@@ -135,11 +135,11 @@ bool AllGranted(const SharedL2Pool::Reservation& reservation) {
 
 // One write of `keys`, every page granted; write ids are unique per test.
 void Write(SharedL2Pool& pool, SharedL2Pool::ClientId client, const std::vector<CacheKey>& keys,
-           std::optional<SharedL2Pool::Publication> publication) {
+           std::optional<CheckpointTree::Lineage> publication) {
     static std::uint64_t last_write_id = 0;
     const SharedL2Pool::Reservation reservation = Reserve(pool, client, ++last_write_id, keys);
     ASSERT_TRUE(AllGranted(reservation));
-    std::vector<SharedL2Pool::Publication> publications;
+    std::vector<CheckpointTree::Lineage> publications;
     if (publication) publications.push_back(std::move(*publication));
     ASSERT_TRUE(pool.Commit(client, reservation.ticket, publications));
 }
@@ -641,7 +641,7 @@ TEST(SharedL2Pool, MisusedCallsAreRefusedBeforeAnythingChanges) {
     const SharedL2Pool::Reservation reservation = Reserve(pool, 1, 1, keys);
 
     // Tokens that do not cover the pages and the tail.
-    SharedL2Pool::Publication short_tokens = prompt.Publication(1);
+    CheckpointTree::Lineage short_tokens = prompt.Publication(1);
     short_tokens.tokens.pop_back();
     EXPECT_THROW(pool.Commit(1, reservation.ticket, std::vector{short_tokens}), std::invalid_argument);
     EXPECT_EQ(pool.GetStats().reserved_blocks, keys.size());
@@ -975,6 +975,105 @@ TEST(SharedL2Pool, AProbeOfAnEmptyDeviceMatchesTheHostTierAlone) {
             }
         }
     }
+}
+
+// A rank's store candidates, which its pool writes take a bounded number of
+// at a time: they leave oldest first across takes, new ones queue behind
+// those left, and a flush drops the ones no take took.
+TEST(SharedL2Pool, BoundedTakesOfARanksStoreCandidatesKeepTheirOrder) {
+    const std::vector<CacheGroupSpec> specs{
+        CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = kPage}};
+    BlockPool device{16, {1}};
+    BlockPool host{4, {1}};
+    CacheCoordinator cache{MakeCoordinator(specs, kPage, device, false, &host, nullptr,
+                                           /*stream_device_cache_to_host=*/true, false, kRetention)};
+    const Prompt prompt{Sequence(10 * kPage)};
+    std::vector<BlockTable> tables(1);
+    auto admission = AdmitForTest(cache, tables, 10 * kPage);
+    ASSERT_TRUE(admission);
+    cache.CacheCompletedBlocks(
+        tables,
+        RequestProgress{.completed_pages = CompletedPages{.tokens = prompt.tokens,
+                                                          .prefix_hashes = prompt.hashes,
+                                                          .boundary_kind = CacheBoundaryKind::kEndpoint},
+                        .num_computed_tokens = 10 * kPage},
+        admission->access_epoch);
+    cache.Free(tables);
+    admission.reset();
+    ASSERT_FALSE(cache.HasPendingStores());
+
+    std::vector<std::string> taken;
+    const auto take = [&](std::size_t max_candidates) {
+        for (const CacheCoordinator::StoreCandidate& candidate : cache.TakePendingStores(max_candidates)) {
+            taken.push_back(candidate.key.content_hash.ToString());
+        }
+    };
+    cache.QueueCachedBlocksForStore(prompt.hashes);
+    take(3);
+    cache.QueueCachedBlocksForStore(std::span{prompt.hashes}.first(2));
+    take(3);
+    take(2);
+    EXPECT_EQ(taken, std::vector<std::string>(prompt.hashes.begin(), prompt.hashes.begin() + 8));
+    EXPECT_TRUE(cache.HasPendingStores());
+
+    // Pages 8 and 9 and the two queued again are left.
+    ASSERT_TRUE(cache.ClearDeviceCache());
+    EXPECT_EQ(cache.StoreCandidatesDroppedByFlush(), 4u);
+    EXPECT_FALSE(cache.HasPendingStores());
+    EXPECT_TRUE(cache.TakePendingStores(1).empty());
+}
+
+// A rank's Host tier standing for the pool, each waiting prompt's answer
+// applied as SharedL2Proxy applies it: the blocks the tier lacks registered,
+// the tail recorded, every block held for the prompt. Tails are kept per
+// preceding page up to TailTable::kMaxTailsPerPrior, as on a rank's own
+// tiers: a ninth prompt ending inside the same page drops the hint of the one
+// answered first, which then matches nothing at its admission. Its blocks
+// stay while it holds them and leave once it lets go.
+TEST(SharedL2Pool, ATailPastThePerPageCapCostsTheOldestWaitingPromptItsHit) {
+    BlockPool device{4, {2, 1}};
+    BlockPool host{32, {2, 1}};
+    CacheCoordinator rank{
+        MakeCoordinator(HybridSpecs(), kPage, device, false, &host, nullptr, false, false, kRetention)};
+    std::vector<Prompt> prompts;
+    std::vector<std::vector<CacheBlockRef>> held;
+    for (std::int32_t i = 0; i <= TailTable::kMaxTailsPerPrior; ++i) {
+        std::vector<std::int32_t> tokens = Sequence(kPage);
+        tokens.push_back(100 + i);
+        const Prompt& prompt = prompts.emplace_back(std::move(tokens));
+        std::vector<CacheBlockRef>& blocks = held.emplace_back();
+        for (const CacheKey& key : prompt.Keys({kState})) {
+            CacheBlockRef block = rank.AcquireHostCachedBlock(key);
+            if (!block) {
+                block = rank.AcquireHostBlock(key.group_id, 0);
+                ASSERT_TRUE(block);
+                rank.CacheHostBlock(block, key, std::nullopt);
+            }
+            blocks.push_back(std::move(block));
+        }
+        rank.CacheHostTail(ContentHash{prompt.hashes.back()}, *prompt.tail);
+    }
+
+    for (std::size_t i = 1; i < prompts.size(); ++i) {
+        EXPECT_EQ(rank.ProbePromptPrefix(prompts[i].Prefix()).host.num_common_tokens, kPage + 1) << i;
+    }
+    const Prompt& oldest = prompts.front();
+    const CacheCoordinator::PrefixProbe probe = rank.ProbePromptPrefix(oldest.Prefix());
+    EXPECT_EQ(probe.host.num_common_tokens, 0);
+    EXPECT_EQ(probe.host.kv_tokens, kPage);
+    const std::vector<CacheKey> keys = oldest.Keys({kState});
+    EXPECT_TRUE(std::ranges::all_of(keys, [&](const CacheKey& key) { return rank.ContainsHostCachedBlock(key); }));
+    EXPECT_TRUE(CacheCoordinatorTestAccess::BoundaryTreeMismatches(rank).empty());
+
+    held.front().clear();
+    // The page is the other prompts' too; the tail's block and the checkpoint go.
+    EXPECT_FALSE(rank.DropHostEntry(keys[0]));
+    EXPECT_TRUE(rank.DropHostEntry(keys[1]));
+    EXPECT_TRUE(rank.DropHostEntry(keys[2]));
+    EXPECT_FALSE(rank.ContainsHostCachedBlock(keys[1]));
+    EXPECT_FALSE(rank.ContainsHostCachedBlock(keys[2]));
+    EXPECT_TRUE(CacheCoordinatorTestAccess::BoundaryTreeMismatches(rank).empty());
+    held.clear();
 }
 
 }  // namespace

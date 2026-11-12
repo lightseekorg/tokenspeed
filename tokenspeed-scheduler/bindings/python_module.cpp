@@ -126,6 +126,10 @@ std::optional<tokenspeed::TailPublication> SharedL2Tail(const std::optional<Shar
                                        .hash = tokenspeed::ContentHash{std::get<1>(*tail)}};
 }
 
+nb::bytes SharedL2TokenBytes(const std::vector<std::int32_t>& tokens) {
+    return nb::bytes(reinterpret_cast<const char*>(tokens.data()), tokens.size() * sizeof(std::int32_t));
+}
+
 std::vector<std::int32_t> SharedL2Tokens(const nb::bytes& tokens) {
     if (tokens.size() % sizeof(std::int32_t) != 0) {
         throw std::invalid_argument("shared L2 tokens must be int32 bytes");
@@ -334,6 +338,22 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("pressure_high", &tokenspeed::StorageConfig::pressure_high)
         .def_ro("pressure_low", &tokenspeed::StorageConfig::pressure_low);
     scheduler_config.def_rw("storage_config", &tokenspeed::SchedulerConfig::storage_config);
+    nb::class_<tokenspeed::SharedL2Config>(m, "SharedL2Config")
+        .def(nb::init<std::int32_t, std::int32_t>(), nb::arg("max_writes"), nb::arg("max_write_keys"))
+        .def_ro("max_writes", &tokenspeed::SharedL2Config::max_writes)
+        .def_ro("max_write_keys", &tokenspeed::SharedL2Config::max_write_keys);
+    scheduler_config.def_rw("shared_l2_config", &tokenspeed::SchedulerConfig::shared_l2_config);
+    nb::class_<tokenspeed::SharedL2Stats>(m, "SharedL2Stats")
+        .def_ro("lookups", &tokenspeed::SharedL2Stats::lookups)
+        .def_ro("hits", &tokenspeed::SharedL2Stats::hits)
+        .def_ro("abandoned_lookups", &tokenspeed::SharedL2Stats::abandoned_lookups)
+        .def_ro("proxy_overflows", &tokenspeed::SharedL2Stats::proxy_overflows)
+        .def_ro("lease_expired_hits", &tokenspeed::SharedL2Stats::lease_expired_hits)
+        .def_ro("pending_lookups", &tokenspeed::SharedL2Stats::pending_lookups)
+        .def_ro("tickets", &tokenspeed::SharedL2Stats::tickets)
+        .def_ro("writes_in_flight", &tokenspeed::SharedL2Stats::writes_in_flight)
+        .def_ro("failed_writes", &tokenspeed::SharedL2Stats::failed_writes)
+        .def_ro("failed_write_blocks", &tokenspeed::SharedL2Stats::failed_write_blocks);
     nb::enum_<tokenspeed::StorageKind>(m, "StorageKind")
         .value("Query", tokenspeed::StorageKind::kQuery)
         .value("Get", tokenspeed::StorageKind::kGet)
@@ -369,7 +389,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("dead_entry", &tokenspeed::CacheCoordinator::HostEvictionStats::dead_entry)
         .def_ro("tail_cap", &tokenspeed::CacheCoordinator::HostEvictionStats::tail_cap)
         .def_ro("flush", &tokenspeed::CacheCoordinator::HostEvictionStats::flush)
-        .def_ro("duplicate_kv", &tokenspeed::CacheCoordinator::HostEvictionStats::duplicate_kv);
+        .def_ro("duplicate_kv", &tokenspeed::CacheCoordinator::HostEvictionStats::duplicate_kv)
+        .def_ro("released", &tokenspeed::CacheCoordinator::HostEvictionStats::released);
     nb::class_<tokenspeed::CacheCoordinator::DeviceEvictionCounts>(m, "DeviceEvictionCounts")
         .def_ro("blocks", &tokenspeed::CacheCoordinator::DeviceEvictionCounts::blocks)
         .def_ro("host_resident", &tokenspeed::CacheCoordinator::DeviceEvictionCounts::host_resident);
@@ -476,6 +497,46 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("success", &tokenspeed::cache::StorageDone::success)
         .def_ro("retired", &tokenspeed::cache::StorageDone::retired)
         .def_ro("object_failures", &tokenspeed::cache::StorageDone::object_failures);
+
+    // A shared L2 rank's commands to its pool, relayed by the runtime; keys,
+    // tails and tokens have the shapes SharedL2Pool takes.
+    const auto shared_l2_keys = [](const std::vector<tokenspeed::CacheKey>& keys) {
+        std::vector<SharedL2KeyTuple> out;
+        out.reserve(keys.size());
+        for (const tokenspeed::CacheKey& key : keys) out.push_back(SharedL2Key(key));
+        return out;
+    };
+    nb::class_<tokenspeed::SharedL2WriteOperation>(cache, "SharedL2WriteOp")
+        .def_ro("write_id", &tokenspeed::SharedL2WriteOperation::write_id)
+        .def_prop_ro("keys",
+                     [shared_l2_keys](const tokenspeed::SharedL2WriteOperation& op) { return shared_l2_keys(op.keys); })
+        .def_ro("buckets", &tokenspeed::SharedL2WriteOperation::buckets)
+        .def_ro("blocks", &tokenspeed::SharedL2WriteOperation::blocks)
+        // [(tokens, prefix_hashes, tail, publisher)], as SharedL2Pool.commit takes them.
+        .def_prop_ro("publications", [](const tokenspeed::SharedL2WriteOperation& op) {
+            nb::list publications;
+            for (const tokenspeed::SharedL2Publication& publication : op.publications) {
+                publications.append(nb::make_tuple(SharedL2TokenBytes(publication.tokens), publication.prefix_hashes,
+                                                   SharedL2Tail(publication.tail), publication.publisher));
+            }
+            return publications;
+        });
+    nb::class_<tokenspeed::SharedL2ReleaseOperation>(cache, "SharedL2ReleaseOp")
+        .def_ro("ticket", &tokenspeed::SharedL2ReleaseOperation::ticket);
+    nb::class_<tokenspeed::SharedL2TouchOperation>(cache, "SharedL2TouchOp")
+        .def_prop_ro(
+            "keys", [shared_l2_keys](const tokenspeed::SharedL2TouchOperation& op) { return shared_l2_keys(op.keys); });
+    nb::class_<tokenspeed::SharedL2AbandonOperation>(cache, "SharedL2AbandonOp")
+        .def_ro("lookup_id", &tokenspeed::SharedL2AbandonOperation::lookup_id);
+    nb::class_<tokenspeed::cache::SharedL2WriteDone>(cache, "SharedL2WriteDone")
+        .def(
+            "__init__",
+            [](tokenspeed::cache::SharedL2WriteDone* self, std::uint64_t write_id, bool success) {
+                new (self) tokenspeed::cache::SharedL2WriteDone{write_id, success};
+            },
+            nb::arg("write_id"), nb::arg("success"))
+        .def_ro("write_id", &tokenspeed::cache::SharedL2WriteDone::write_id)
+        .def_ro("success", &tokenspeed::cache::SharedL2WriteDone::success);
 
     nb::class_<tokenspeed::cache::WriteBackDone>(cache, "WriteBackDoneEvent")
         .def(nb::init<>())
@@ -765,6 +826,57 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
             },
             nb::call_guard<nb::gil_scoped_release>())
         .def("advance", &tokenspeed::Scheduler::Advance, nb::arg("event"))
+        .def("shared_l2_lookups",
+             // [(lookup_id, request_id, prefix_hashes, tokens, max_tokens)].
+             [](tokenspeed::Scheduler& s) {
+                 nb::list lookups;
+                 for (const tokenspeed::SharedL2Lookup& lookup : s.SharedL2Lookups()) {
+                     lookups.append(nb::make_tuple(lookup.lookup_id, lookup.request_id, lookup.prefix_hashes,
+                                                   SharedL2TokenBytes(lookup.tokens), lookup.max_tokens));
+                 }
+                 return lookups;
+             })
+        .def(
+            "apply_shared_l2_lookups",
+            // results: [(lookup_id, ticket, num_tokens, kv_tokens, tail, [(key, bucket, page)])], the
+            // tuple SharedL2Pool.probe returns behind its lookup id. Returns the proxy blocks created:
+            // [(group_id, block, bucket, page)].
+            [](tokenspeed::Scheduler& s,
+               const std::vector<std::tuple<
+                   std::uint64_t, std::uint64_t, std::int32_t, std::int32_t, std::optional<SharedL2TailTuple>,
+                   std::vector<std::tuple<SharedL2KeyTuple, std::int32_t, std::int32_t>>>>& results) {
+                std::vector<tokenspeed::SharedL2LookupResult> converted;
+                converted.reserve(results.size());
+                for (const auto& [lookup_id, ticket, num_tokens, kv_tokens, tail, slots] : results) {
+                    tokenspeed::SharedL2LookupResult& result =
+                        converted.emplace_back(tokenspeed::SharedL2LookupResult{.lookup_id = lookup_id,
+                                                                                .ticket = ticket,
+                                                                                .num_tokens = num_tokens,
+                                                                                .kv_tokens = kv_tokens,
+                                                                                .tail = SharedL2Tail(tail)});
+                    std::vector<SharedL2KeyTuple> keys;
+                    keys.reserve(slots.size());
+                    for (const auto& [key, bucket, page] : slots) {
+                        keys.push_back(key);
+                        result.buckets.push_back(bucket);
+                        result.pages.push_back(page);
+                    }
+                    result.keys = SharedL2Keys(keys);
+                }
+                std::vector<std::tuple<std::uint32_t, std::int32_t, std::int32_t, std::int32_t>> created;
+                for (const tokenspeed::SharedL2ProxyPage& page : s.ApplySharedL2Lookups(converted)) {
+                    created.emplace_back(page.group_id, page.block, page.bucket, page.page);
+                }
+                return created;
+            },
+            nb::arg("results"),
+            "Apply the pool's answers in order and return the proxy blocks they created. An answer the scheduler "
+            "refuses raises and leaves its lookup pending; the answers before it in the same call stay applied, but "
+            "the proxy blocks they created are lost with the exception, and the answers after it are not applied. A "
+            "caller that handles a refusal passes one answer per call.")
+        .def("abandon_shared_l2_lookups", &tokenspeed::Scheduler::AbandonSharedL2Lookups, nb::arg("lookup_ids"))
+        .def("set_shared_l2_lease_lost", &tokenspeed::Scheduler::SetSharedL2LeaseLost, nb::arg("lost"))
+        .def("shared_l2_stats", &tokenspeed::Scheduler::GetSharedL2Stats)
         .def("drain_kv_events",
              [](tokenspeed::Scheduler& s) {
                  nb::list result;
@@ -902,13 +1014,13 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
             "commit",
             [](SharedL2Pool& pool, std::uint64_t client, std::uint64_t ticket,
                const std::vector<SharedL2PublicationTuple>& publications) {
-                std::vector<SharedL2Pool::Publication> converted;
+                std::vector<tokenspeed::CheckpointTree::Lineage> converted;
                 converted.reserve(publications.size());
                 for (const auto& [tokens, prefix_hashes, tail, publisher] : publications) {
                     converted.push_back({.tokens = SharedL2Tokens(tokens),
                                          .prefix_hashes = prefix_hashes,
                                          .tail = SharedL2Tail(tail),
-                                         .publisher = publisher});
+                                         .access_epoch = publisher});
                 }
                 return pool.Commit(client, ticket, converted);
             },

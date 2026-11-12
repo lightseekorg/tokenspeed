@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <ranges>
@@ -360,6 +361,11 @@ public:
     // partial commit is not rolled back.
     PreparedPrefixKeys PreparePrefixKeys(std::span<const std::string> content_hashes) const;
     PrefixProbe ProbePromptPrefix(const PromptPrefix& prompt) const;
+    // The same probe with the Host tier left out, for a caller that may not
+    // load from the Host now (a shared L2 rank whose lease on the pool's pins
+    // is lost): the Device's own boundary, the Host tier mirroring it and
+    // claiming nothing, as when the Host holds nothing of the prompt.
+    PrefixProbe ProbeDevicePromptPrefix(const PromptPrefix& prompt) const;
     // Whether recorded or in-flight eviction stores would extend the visible
     // hit using ordinary matching rules. Never acquires unpublished blocks.
     bool EvictionStoresExtendPrefix(const PromptPrefix& prompt, const PrefixProbe& visible) const;
@@ -806,6 +812,9 @@ public:
         // A segment plan reclaimed a prefix-closed KV copy independently of
         // the boundary's checkpoints, while the Device still held its key.
         HostEvictionCounts duplicate_kv;
+        // A shared L2 rank's proxy entry nothing held any more (DropHostEntry):
+        // the pool keeps the page it stood for.
+        HostEvictionCounts released;
     };
     struct HostAllocationStats {
         std::size_t requested{0};
@@ -828,7 +837,11 @@ public:
     // demoted entries (SetCheckpointDemotion): free Host space would take
     // them back.
     void QueueCachedBlocksForStore(std::span<const std::string> content_hashes);
-    std::vector<StoreCandidate> TakePendingStores();
+    // The oldest store candidates, at most max_candidates of them (all of
+    // them by default); the rest stay queued for a later drain. A candidate
+    // of an ended session is dropped.
+    std::vector<StoreCandidate> TakePendingStores(std::size_t max_candidates = std::numeric_limits<std::size_t>::max());
+    bool HasPendingStores() const { return !pending_stores_.empty(); }
     CacheBlockRef AcquireDeviceCachedBlock(const CacheKey& key) const;
     // One Host block per (group, bucket), with free capacity assigned first
     // in input order. The shared eviction plan funds remaining rows globally;
@@ -945,6 +958,19 @@ public:
     void RecordCheckpoint(const CompletedPages& completed, std::uint64_t publisher) {
         recordCheckpoints(completed, publisher);
     }
+    // A rank whose Host tier is a proxy of a shared L2 pool (SharedL2Proxy)
+    // mirrors the pool's pinned pages as Host entries and gives each up once
+    // nothing on the rank holds it.
+    //
+    // Evicts key's Host entry, as Host eviction does (a State checkpoint's
+    // unpinned State siblings leave with it), unless something holds its
+    // block: false then. A key the Host no longer holds is dropped already.
+    bool DropHostEntry(const CacheKey& key);
+    // The keys of the Device entries prefix hits acquire are collected from
+    // now on, for the caller to take once per plan: the pool refreshes its
+    // copies of them, as a rank's own Host tier refreshes its entries.
+    void CollectDeviceHits() { collects_device_hits_ = true; }
+    std::vector<CacheKey> TakeDeviceHits() { return std::exchange(device_hits_, {}); }
     struct StorageReservation {
         std::vector<CacheKey> keys;
         std::vector<CacheBlockRef> blocks;
@@ -1297,11 +1323,15 @@ private:
     void forEachStorageDependency(const PrefixProbe::Tier& probe, std::span<const std::vector<CacheKey>> group_keys,
                                   std::int32_t floor_tokens, const Visit& visit) const;
     std::vector<CacheKey> tailKeysForGroup(std::size_t i, const ContentHash& hash, std::int32_t tail_tokens) const;
+    // with_host false leaves the Host suffix out (ProbeDevicePromptPrefix).
     PrefixProbe probePrefixWithOrder(const PromptPrefix& prompt, std::span<const std::size_t> match_order,
-                                     bool claim_partial) const;
+                                     bool claim_partial, bool with_host) const;
     template <CacheTier Tier>
     CoordinatorMatch acquireTierWithKeys(std::span<const std::vector<CacheKey>> group_keys, std::int32_t floor_tokens,
                                          PrefixProbe::Tier&& probe, std::uint64_t access_epoch);
+    // CollectDeviceHits: the keys of the blocks a Device hit acquired
+    // (blocks[j] under keys[j], holes empty).
+    void collectDeviceHits(std::span<const CacheKey> keys, std::span<const CacheBlockRef> blocks);
     AcquiredPrefix acquirePrefix(PrefixProbe&& probe, std::uint64_t access_epoch);
     template <CacheTier Tier>
     void cacheFullBlocksForGroup(std::size_t group_index, BlockTable& table, std::span<const CacheKey> keys,
@@ -1537,6 +1567,12 @@ private:
     std::unordered_set<CacheKey, CacheKeyHash> pending_eviction_keys_;
     std::unordered_map<CacheKey, std::size_t, CacheKeyHash> pending_eviction_extra_refs_;
     std::vector<StoreCandidate> pending_stores_;
+    // How many candidates at its front bounded takes have taken already;
+    // fewer than its size unless both are zero.
+    std::size_t taken_pending_stores_{0};
+    // CollectDeviceHits.
+    bool collects_device_hits_{false};
+    std::vector<CacheKey> device_hits_;
     CacheMutationSink cache_mutation_sink_;
     // Accounting only.
     HostEvictionStats host_evictions_;

@@ -351,6 +351,12 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
         if (config_.role == Role::kD) {
             return coordinator_.ProbeDecodeDevicePrefix(prompt, request->PrefillSize());
         }
+        // No load may start from a shared L2 pool while the lease on its pins
+        // is lost: a proxy entry still there (a load-back in flight holds it)
+        // is not matched.
+        if (shared_l2_ && shared_l2_->LeaseLost()) {
+            return coordinator_.ProbeDevicePromptPrefix(prompt);
+        }
         return coordinator_.ProbePromptPrefix(prompt);
     };
     AdmissionMatch match;
@@ -392,6 +398,13 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
         .prepared_keys = prepared_keys,
     };
     match.probe = probe(prompt);
+    // KV a shared L2 pool holds past its last checkpoint is a junction too:
+    // the checkpoint cut there is where the next prompt sharing that KV, on
+    // any rank, resumes. The proxy mirrors only the hit, so the reach comes
+    // from the lookup's answer.
+    match.probe.host.kv_tokens =
+        std::max(match.probe.host.kv_tokens,
+                 std::min(request->GetIf<fsm::Submitted>()->admission.pool_kv_tokens, max_cacheable_tokens));
     if (config_.role != Role::kD && coordinator_.EvictionStoresExtendPrefix(prompt, match.probe)) {
         match.waits_for_eviction_store = true;
         return match;
@@ -577,10 +590,14 @@ std::optional<CacheCoordinator::AdmissionResult> Scheduler::admitWithKvEventTrac
     // against Device pages -- with blocks leaving one by one still not
     // enough, the request's own blocks of packed groups are gathered into
     // fewer parents and the step is retried once in this plan build. Never
-    // twice in one plan.
+    // twice in one plan. With a shared L2 pool a publication may still wait
+    // in the store queue for its write, pinning nothing: the compaction waits
+    // for it too, or the plan's write would name a block the plan's copy has
+    // yet to fill, which the pool's client reads outside the device's streams.
     if (!admission && evict_blocks_past_segments && !others_hold_pages && request.ResultsInFlight() == 0 &&
         !tier_transfers_.HasLoadBacksInFlight() && !tier_transfers_.HasPinnedStoresInFlight() &&
-        !pdTransferInFlight(request) && last_lone_compaction_plan_ != plan_calls_) {
+        !(shared_l2_ && coordinator_.HasPendingStores()) && !pdTransferInFlight(request) &&
+        last_lone_compaction_plan_ != plan_calls_) {
         admission = compactLoneRequestAndRetry(plan, request, coordinator_.ProbePrefix(std::span<const std::string>{}),
                                                demands, progress, held_copy_ins, copy_in_point, [&] {
                                                    feedback.admission_failed = false;
@@ -777,9 +794,11 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     // Lone-request compaction (docs/design/scheduler.md §1.4) at a first
     // admission: a Submitted request holds no pages, so nothing of its own is
     // in flight; what may scatter is the hit pages, which move with their
-    // entries.
+    // entries, and so not while one waits in the store queue for its pool
+    // write.
     if (!admission && !others_hold_pages && !tier_transfers_.HasLoadBacksInFlight() &&
-        !tier_transfers_.HasPinnedStoresInFlight() && last_lone_compaction_plan_ != plan_calls_) {
+        !tier_transfers_.HasPinnedStoresInFlight() && !(shared_l2_ && coordinator_.HasPendingStores()) &&
+        last_lone_compaction_plan_ != plan_calls_) {
         admission = compactLoneRequestAndRetry(
             plan, *request, CacheCoordinator::PrefixProbe{match.probe}, chunk_demands(tokens_this_round, false),
             RequestProgress{}, /*copy_in_blocks=*/{}, copy_in_point, [&] {

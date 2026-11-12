@@ -85,17 +85,6 @@ public:
         Ticket ticket{0};
         std::vector<std::int32_t> pages;
     };
-    // The lineage of a State checkpoint whose State block a write carries:
-    // its tokens, the chain hashes of its full pages and its tail. `publisher`
-    // names the request that published it on its rank (the rank's access
-    // epoch for it): checkpoints one request published are no step apart in
-    // the retention ranking (CheckpointTree).
-    struct Publication {
-        std::vector<std::int32_t> tokens;
-        std::vector<std::string> prefix_hashes;
-        std::optional<TailPublication> tail;
-        std::uint64_t publisher{0};
-    };
     struct Stats {
         std::int32_t total_lcm_blocks{0};
         std::int32_t free_lcm_blocks{0};
@@ -133,12 +122,15 @@ public:
     // abandoned before it arrived reserves nothing.
     Reservation Reserve(ClientId client, std::uint64_t write_id, std::span<const CacheKey> keys,
                         std::span<const std::int32_t> buckets);
-    // Publishes a reservation's blocks, with the checkpoints whose State
-    // block is among them, in a Device publication's order: each checkpoint's
-    // boundary is linked, the blocks are registered, then the checkpoints and
-    // their tails are recorded. False, with no change, for a ticket that
+    // Publishes a reservation's blocks, with the lineage of the checkpoints
+    // whose State block is among them, in a Device publication's order: each
+    // checkpoint's boundary is linked, the blocks are registered, then the
+    // checkpoints and their tails are recorded. A lineage's access epoch
+    // names the request that published the checkpoint on its rank:
+    // checkpoints one request published are no step apart in the retention
+    // ranking (CheckpointTree). False, with no change, for a ticket that
     // reserves nothing (any more).
-    bool Commit(ClientId client, Ticket ticket, std::span<const Publication> publications);
+    bool Commit(ClientId client, Ticket ticket, std::span<const CheckpointTree::Lineage> checkpoints);
     // Frees an uncommitted write's pages and keys; one not seen yet is
     // remembered.
     void AbandonWrite(ClientId client, std::uint64_t write_id);

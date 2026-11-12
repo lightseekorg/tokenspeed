@@ -67,7 +67,9 @@ add_library(tokenspeed_scheduler_core STATIC
     csrc/cache/tier/transfer_manager.cpp
     csrc/cache/tier/storage_manager.cpp
     csrc/cache/tier/shared_l2_pool.cpp
+    csrc/cache/tier/shared_l2_proxy.cpp
     csrc/scheduler/operations/storage.cpp
+    csrc/scheduler/operations/shared_l2.cpp
 )
 
 target_include_directories(tokenspeed_scheduler_core
@@ -173,6 +175,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_req_pool_allocator.cpp
         tests/cpp/test_capacity_model.cpp
         tests/cpp/test_shared_l2_pool.cpp
+        tests/cpp/test_shared_l2_proxy.cpp
         tests/cpp/test_shadow_occupancy.cpp
         tests/cpp/test_flat_hash_map.cpp
         tests/cpp/test_closed_loop_random.cpp

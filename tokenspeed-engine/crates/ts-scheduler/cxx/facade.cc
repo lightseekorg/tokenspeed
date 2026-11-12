@@ -564,7 +564,11 @@ rust::Vec<CacheOpView> plan_cache_ops(const tokenspeed::ExecutionPlan& plan) {
                 } else if constexpr (std::is_same_v<Batch, tokenspeed::SnapshotRestoreBatch>) {
                     append(CacheOpKind::SnapshotRestore, batch.op_ids);
                 } else {
-                    static_assert(std::is_same_v<Batch, tokenspeed::StorageOperation>, "a new cache batch kind");
+                    // Shared L2 pool commands are the pool client's: none is
+                    // acknowledged here.
+                    static_assert(std::is_same_v<Batch, tokenspeed::StorageOperation> ||
+                                      std::is_same_v<Batch, tokenspeed::SharedL2Operation>,
+                                  "a new cache batch kind");
                 }
             },
             *cache);

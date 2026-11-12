@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "cache/core/cache_types.h"
+#include "cache/tier/shared_l2_lookup_hold.h"
 #include "cache/tier/storage_lease.h"
 #include "core/token_container.h"
 #include "resource/allocator/req_pool_allocator.h"
@@ -127,6 +128,15 @@ struct AdmissionResources {
     // Fixed prompt identities for admission retries, never residency. Leaving
     // the pre-admission states releases them together with the storage hold.
     PreparedPrefixKeys prefix_keys;
+    // With a shared L2 pool: the prompt's lookup, from the call that asks it
+    // until admission consumes this state. The prompt is admitted only once
+    // the lookup is settled -- answered, given up by the runtime, or never
+    // needed -- so a prefix the pool holds is not recomputed. pool_kv_tokens
+    // is how far the answer said the pool's KV reaches: past the hit, a
+    // junction the first chunk is cut at.
+    SharedL2LookupHold pool_lookup;
+    bool pool_settled{false};
+    std::int32_t pool_kv_tokens{0};
 };
 
 // Eligible for ordinary admission. A pending L3 dependency is Prefetching.

@@ -791,6 +791,113 @@ TEST_F(LoneRequestCompactionSuite, MovesPublishedPagesByCopyAndKeepsTheirKeys) {
               (std::vector<std::int32_t>{14, 20, 26, 32, 38, 13, 49, 50, 51, 52, 53, 54, 55, 56, 7}));
 }
 
+// With a shared L2 pool a publication beyond the write limits waits in the
+// store queue and pins nothing, and the pool's client reads a write's Device
+// blocks over RDMA, outside the device's streams: a compaction moving such a
+// page would have the plan's write name a block the plan's copy has yet to
+// fill. The layout above with one pool write of four blocks at a time: the
+// compaction waits until the queued pages are written, and no plan's write
+// names a block the plan copies into.
+TEST_F(LoneRequestCompactionSuite, WaitsForTheQueuedPoolWritesOfThePagesItMoves) {
+    config_ = MakeConfig();
+    config_.disable_l2_cache = false;
+    config_.host_allocator.total_pages = 65;
+    config_.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
+    config_.shared_l2_config = SharedL2Config{.max_writes = 1, .max_write_keys = 4};
+    config_ = WithHostPackingFromDevice(config_);
+    scheduler_ = std::make_unique<Scheduler>(config_);
+    CacheCoordinator& coordinator = SchedulerTestAccess::Coordinator(*scheduler_);
+    const BlockPool& pool = SchedulerTestAccess::Pool(*scheduler_);
+    // The pool holds nothing: every lookup is a miss.
+    const auto miss = [&] {
+        std::vector<std::uint64_t> lookups;
+        for (const SharedL2Lookup& lookup : scheduler_->SharedL2Lookups()) {
+            lookups.push_back(lookup.lookup_id);
+        }
+        scheduler_->AbandonSharedL2Lookups(lookups);
+    };
+    // The runtime's round: the last plan's writes are done, then the plan.
+    std::vector<std::uint64_t> writing;
+    const auto next_plan = [&] {
+        for (const std::uint64_t write_id : writing) {
+            ExecutionEvent done;
+            done.With(cache::SharedL2WriteDone{.write_id = write_id, .success = true});
+            scheduler_->Advance(std::move(done));
+        }
+        writing.clear();
+        ExecutionPlan plan = PlanOnce();
+        for (const CacheOperation& op : ExtractCacheOpsOfKind<SharedL2Operation>(plan)) {
+            const auto* write = std::get_if<SharedL2WriteOperation>(&std::get<SharedL2Operation>(op));
+            if (write == nullptr) {
+                continue;
+            }
+            writing.push_back(write->write_id);
+            for (std::size_t i = 0; i < write->keys.size(); ++i) {
+                const auto& copies = plan.pages_to_copy.at(config_.cache_groups[write->keys[i].group_id].group_id);
+                EXPECT_TRUE(
+                    std::ranges::none_of(copies, [&](const auto& copy) { return copy.second == write->blocks[i]; }))
+                    << "a pool write reads block " << write->blocks[i] << ", which the plan's copy fills";
+            }
+        }
+        return plan;
+    };
+    // FragmentThePool's prompts, and their pages written to the pool.
+    std::vector<RequestSpec> prompts;
+    for (std::int32_t k = 0; k < 8; ++k) {
+        prompts.push_back(RequestSpec{
+            .request_id = "a" + std::to_string(k), .tokens = MakeTokens(kP, 100 + 50 * k), .max_new_tokens = 1});
+    }
+    Submit(prompts);
+    miss();
+    for (int plan = 0; plan < 4 && scheduler_->RequestTokenSize("a7") != -1; ++plan) {
+        Land(next_plan());
+    }
+    ASSERT_EQ(scheduler_->RequestTokenSize("a7"), -1);
+    for (int plan = 0; plan < 16 && (coordinator.HasPendingStores() || !writing.empty()); ++plan) {
+        next_plan();
+    }
+    ASSERT_FALSE(coordinator.HasPendingStores());
+    ASSERT_EQ(scheduler_->EmptyLcmBlocks(), 12);
+    std::vector<CacheBlockRef> held;
+    for (std::int32_t k = 0; k < 8; ++k) {
+        for (const CacheKey& key :
+             scheduler_->ExpandPrefixKeys(scheduler_->PrefixHashesForTokens(MakeTokens(kP + 1, 100 + 50 * k)))) {
+            if (key.group_id == 0 || k > 0) {
+                held.push_back(coordinator.GroupPrefixIndex(static_cast<std::int32_t>(key.group_id)).Find(pool, key));
+            }
+        }
+    }
+    ASSERT_EQ(held.size(), 15u);
+    Submit(RequestSpec{.request_id = "R", .tokens = MakeTokens(126, 3000), .max_new_tokens = 1});
+    miss();
+    Land(next_plan());
+    // The first chunk's sixteen published blocks: four in the one write, the
+    // rest queued.
+    const ExecutionPlan publishes = next_plan();
+    EXPECT_TRUE(FindForwardBatch(publishes)->request_ids.empty());
+    ASSERT_EQ(writing.size(), 1u);
+    ASSERT_TRUE(coordinator.HasPendingStores());
+    held.erase(held.begin() + 1, held.end());
+    // The second chunk needs the compaction, which moves a published page by
+    // a copy: it runs once nothing is queued.
+    std::optional<ExecutionPlan> second;
+    for (int plan = 0; plan < 8 && !second; ++plan) {
+        ExecutionPlan next = next_plan();
+        if (FindForwardBatch(next)->request_ids.empty()) {
+            EXPECT_TRUE(next.pages_to_copy.at("full_attention").empty());
+            EXPECT_EQ(scheduler_->GetHostCacheStats().lone_compactions, 0u);
+        } else {
+            second = std::move(next);
+        }
+    }
+    ASSERT_TRUE(second);
+    EXPECT_EQ(FindForwardBatch(*second)->request_ids, std::vector<std::string>{"R"});
+    EXPECT_EQ(FindForwardBatch(*second)->extend_prefix_lens, std::vector<std::int32_t>{64});
+    EXPECT_EQ(second->pages_to_copy.at("full_attention"),
+              (std::vector<std::pair<std::int32_t, std::int32_t>>{{44, 13}}));
+    EXPECT_EQ(scheduler_->GetHostCacheStats().lone_compactions, 1u);
+}
+
 // A parent is vacated only when the retry can take what stays in it. The
 // layout above with a2's and a3's history pages held as well, so the kept
 // parents offer two slots: a1's page beside the request's copy-in block
