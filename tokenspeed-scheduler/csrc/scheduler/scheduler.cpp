@@ -37,6 +37,7 @@
 
 #include "core/token_container.h"
 #include "cache/tier/transfer.h"
+#include "core/profile_span.h"
 #include "fsm/forward_events.h"
 #include "fsm/forward_states.h"
 #include "scheduler/capacity_model.h"
@@ -385,6 +386,7 @@ void Scheduler::markKvEventBoundaryForReconcile(const CacheKey& boundary) {
 }
 
 void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
+    ProfileSpan profile_span{"Scheduler::SubmitRequests"};
     std::unordered_set<std::string> request_ids;
     request_ids.reserve(request_specs.size());
     std::vector<std::unique_ptr<Request>> pending_requests;
@@ -475,6 +477,12 @@ std::size_t Scheduler::PdTransferSize() const {
 }
 
 std::int32_t Scheduler::ActiveLcmBlocks() const {
+    const std::int32_t active = coordinator_.NumActiveLcmBlocks();
+#ifndef NDEBUG
+    // Debug builds walk the live requests' tables, as the count was taken
+    // before the tables kept it, and fail on any drift. The walk sees only
+    // page-holding requests, so this must not be read while a bound table
+    // is still outside one (between Admit and the FSM event that takes it).
     std::vector<std::span<const BlockTable>> request_tables;
     request_tables.reserve(requests_.size());
     for (const auto& request : requests_) {
@@ -483,7 +491,10 @@ std::int32_t Scheduler::ActiveLcmBlocks() const {
         }
         request_tables.emplace_back(request->BlockTablesRef());
     }
-    return coordinator_.NumActiveLcmBlocks(request_tables);
+    _assert(active == coordinator_.CountActiveLcmBlocks(request_tables),
+            "the tables' active-parent count drifted from their contents");
+#endif
+    return active;
 }
 
 HostCacheStats Scheduler::GetHostCacheStats() const {
@@ -582,6 +593,7 @@ bool Scheduler::belowPrefillWatermark() const {
 }
 
 ExecutionPlan Scheduler::NextExecutionPlan(PlanOptions options) {
+    ProfileSpan profile_span{"Scheduler::NextExecutionPlan"};
     std::vector<WriteBackOperation> write_back_operations = std::exchange(pending_write_back_operations_, {});
     // Dropping a finished request drops what it still holds elsewhere -- its
     // session's registration under its access epoch -- with it.
@@ -594,6 +606,7 @@ ExecutionPlan Scheduler::NextExecutionPlan(PlanOptions options) {
     });
 
     if (storage_transfers_) {
+        ProfileSpan profile_span{"Scheduler::prepareStorage"};
         for (const auto& request : requests_) prepareStorage(*request);
     }
     std::vector<Request*> candidates;
@@ -738,6 +751,7 @@ void Scheduler::trackStalledRounds(std::size_t num_live_requests, bool plan_is_e
 }
 
 void Scheduler::Advance(const ExecutionEvent& event) {
+    ProfileSpan profile_span{"Scheduler::Advance"};
     for (const auto& item : event.Events()) {
         std::visit([this](const auto& inner) { handleEvent(inner); }, item);
     }

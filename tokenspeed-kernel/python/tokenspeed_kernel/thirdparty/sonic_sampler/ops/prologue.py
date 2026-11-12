@@ -177,6 +177,9 @@ def decode_counts(
 
                 [ t_1, t_2, ..., t_γ, t_{γ+1} ]
 
+        • In the singular case each row reads its own `t_ptr` row (the row's `margin`, not
+          its slot), so rows sharing a slot count different tokens; -1 counts none.
+
     """
     decode = tl.load(d_ptr + (batch_id * stride_d) + cols, mask=mask, other=0)
 
@@ -188,7 +191,7 @@ def decode_counts(
             step_mask = timesteps < lookahead
 
             drafted = tl.load(
-                t_ptr + (batch_id * stride_t) + timesteps, mask=step_mask, other=-1
+                t_ptr + (margin * stride_t) + timesteps, mask=step_mask, other=-1
             )
 
             decode += tl.sum((drafted[:, None] == cols[None, :]).to(tl.int32), axis=0)
@@ -478,6 +481,7 @@ def whole_block(
     blocks,
     batch_id,
     step_id,
+    draw_step,
     margin,
     timesteps,
     vocab_size: tl.constexpr,
@@ -501,7 +505,7 @@ def whole_block(
     Stores a whole-vocabulary row's block as ``exact_maximum`` stores a
     maximum: its best value plus the Gumbel noise the candidates' draw adds
     (``philox_gumbel`` keyed by the slot's seed, offset and the row's
-    position, at global token ids). The best over every block is then the
+    ``draw_step``, at global token ids). The best over every block is then the
     Gumbel-max over the whole vocabulary, the token the candidates' draw
     takes whenever it lies among them.
 
@@ -520,7 +524,7 @@ def whole_block(
     minima: tl.constexpr = -float("inf")
     tile: tl.constexpr = 4096 if block_n > 4096 else block_n
 
-    key = philox_key(h_ptr, l_ptr, batch_id, step_id)
+    key = philox_key(h_ptr, l_ptr, batch_id, draw_step)
 
     if singular:
 
@@ -1089,6 +1093,7 @@ def whole_reduction_kernel(
     value_dtype: tl.constexpr,  # Dtype the logit manipulators keep.
     logit_scale=None,  # Logit Scale of a Vocabulary Shard's Raw Head Logits.
     softcap=None,  # Final Logit Softcap of a Vocabulary Shard's Raw Head Logits.
+    u_ptr=None,  # Draw Steps -> [ L ] int32, each row's noise step (else its step in the window).
 ) -> None:
     """
     The first stage of the rows ``bitpacked_reduction_kernel`` leaves out under
@@ -1113,6 +1118,13 @@ def whole_reduction_kernel(
     batch_id, step_id, margin, timesteps = resolve_indices(
         None, s_ptr, row_id, lookahead, batch_size, slotted, singular, False, None
     )
+
+    # The noise's step: the row's own in the window, or the one ``u_ptr`` gives it.
+    draw_step = step_id
+
+    if u_ptr is not None:
+
+        draw_step = tl.load(u_ptr + row_id)
 
     indicator = tl.load(z_ptr + batch_id)
 
@@ -1143,6 +1155,7 @@ def whole_reduction_kernel(
                 vocab_blocks,
                 batch_id,
                 step_id,
+                draw_step,
                 margin,
                 timesteps,
                 vocab_size,

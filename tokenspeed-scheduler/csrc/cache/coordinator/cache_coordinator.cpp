@@ -20,6 +20,7 @@
 
 #include "cache/coordinator/cache_coordinator.h"
 
+#include "core/profile_span.h"
 #include "cache/coordinator/eviction_plan.h"
 
 #include <algorithm>
@@ -162,6 +163,7 @@ CacheCoordinator::CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t 
                                    std::int32_t checkpoint_retention_leaf_distance)
     : groups_{std::move(groups)},
       pool_{pool},
+      active_parents_{pool},
       host_pool_{host_pool},
       snapshot_pool_{snapshot_pool},
       stream_device_cache_to_host_{stream_device_cache_to_host && host_pool != nullptr},
@@ -1175,10 +1177,12 @@ CacheCoordinator::PrefixProbe CacheCoordinator::probePrefixWithOrder(const Promp
 }
 
 PreparedPrefixKeys CacheCoordinator::PreparePrefixKeys(std::span<const std::string> content_hashes) const {
+    ProfileSpan profile_span{"CacheCoordinator::PreparePrefixKeys"};
     return std::make_shared<const std::vector<std::vector<CacheKey>>>(buildGroupKeys(content_hashes));
 }
 
 CacheCoordinator::PrefixProbe CacheCoordinator::ProbePromptPrefix(const PromptPrefix& prompt) const {
+    ProfileSpan profile_span{"CacheCoordinator::ProbePromptPrefix"};
     return probePrefixWithOrder(prompt, match_order_, /*claim_partial=*/true);
 }
 
@@ -1280,6 +1284,7 @@ CacheCoordinator::PrefixProbe CacheCoordinator::ProbePrefix(std::span<const std:
 
 CacheCoordinator::PrefixProbe CacheCoordinator::ProbeDecodeDevicePrefix(const PromptPrefix& prompt,
                                                                         std::int32_t prompt_end_tokens) const {
+    ProfileSpan profile_span{"CacheCoordinator::ProbeDecodeDevicePrefix"};
     _assert(prompt.tokens.empty() || prompt_end_tokens <= static_cast<std::int32_t>(prompt.tokens.size()),
             "the prompt end lies inside the supplied tokens");
     std::vector<std::size_t> history_match_order;
@@ -1336,6 +1341,7 @@ CacheCoordinator::PrefixProbe CacheCoordinator::ProbeDecodeDevicePrefix(const Pr
 }
 
 CacheCoordinator::AcquiredPrefix CacheCoordinator::acquirePrefix(PrefixProbe&& probe, std::uint64_t access_epoch) {
+    ProfileSpan profile_span{"CacheCoordinator::acquirePrefix"};
     AcquiredPrefix out;
     // The Host floor is the Device's full-page coverage: the Host's KV pages
     // start there (a Device KV tail means the Host holds none, only State
@@ -1401,7 +1407,7 @@ std::int32_t CacheCoordinator::NumAvailableLcmBlocks() const {
     return available;
 }
 
-std::int32_t CacheCoordinator::NumActiveLcmBlocks(std::span<const std::span<const BlockTable>> request_tables) const {
+std::int32_t CacheCoordinator::CountActiveLcmBlocks(std::span<const std::span<const BlockTable>> request_tables) const {
     // Parent ids are dense in [1, NumLcmBlocks], so byte flags dedupe shared
     // prefixes without hashing every block reference of every live request.
     std::vector<std::uint8_t> seen(static_cast<std::size_t>(pool_.NumLcmBlocks()) + 1, 0);
@@ -2088,6 +2094,7 @@ void CacheCoordinator::evictTailEntries(const ContentHash& hash, std::int32_t ta
 }
 
 void CacheCoordinator::CollectDeadEntries() {
+    ProfileSpan profile_span{"CacheCoordinator::CollectDeadEntries"};
     // A node's entries, the Device's before the Host's.
     const auto entries_of = [&](const BoundaryTree::Node& node) {
         std::vector<NodeEntry> entries = NodeEntries(pool_, node);

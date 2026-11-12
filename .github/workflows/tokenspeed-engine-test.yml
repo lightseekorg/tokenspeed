@@ -47,8 +47,12 @@ jobs:
       # binary, as the scheduler wheel build does.
       - name: Install the C++ build dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake ninja-build libssl-dev
+          # CMake and Ninja come from the Python build requirements below.
+          # Use the runner's installed OpenSSL headers before refreshing apt.
+          if ! sudo apt-get install -y --no-install-recommends libssl-dev; then
+            sudo apt-get update -o Acquire::Retries=5
+            sudo apt-get install -y --no-install-recommends -o Acquire::Retries=5 libssl-dev
+          fi
           mapfile -t build_requirements < <(python ../test/ci_system/engine_cache.py --build-requirements)
           python -m pip install "${build_requirements[@]}" pytest
           echo "PYO3_PYTHON=$(which python)" >> "$GITHUB_ENV"

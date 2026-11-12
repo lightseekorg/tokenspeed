@@ -31,7 +31,7 @@ use std::{
     ffi::CString,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex, Once,
+        Arc, Mutex, Once, PoisonError,
     },
     thread,
     time::Duration,
@@ -65,7 +65,7 @@ use ts_pd::{
     RemotePrefill, TransferPeer, TransferPoll,
 };
 use ts_scheduler::{
-    CacheEvent, CacheEventKind, CacheOpKind, CacheOpView, ExecutionPlan, Scheduler,
+    profile, CacheEvent, CacheEventKind, CacheOpKind, CacheOpView, ExecutionPlan, Scheduler,
 };
 use ts_wire::{
     codec::Dict,
@@ -5406,4 +5406,226 @@ fn a_flush_under_a_keep_pause_runs_once_the_cache_work_did() {
         ]
     );
     assert!(rank.cache_ops.contains(&CacheOpKind::WriteBack));
+}
+
+/// The process's one span recording: the tests that record take turns.
+static PROFILE: Mutex<()> = Mutex::new(());
+
+#[test]
+fn a_profile_keeps_the_spans_of_rounds_that_did_something() {
+    // One rank, run on this thread: its spans carry this thread's id.
+    let setup = Setup::default();
+    let config = loop_config(1, false, &setup);
+    let (mut mesh_listeners, addresses) = mesh_listeners(1);
+    let device = fake_device(Layout::Single, 0, &setup);
+    let plans = device.plans.clone();
+    // A request in the first round; the rounds after it finishes have
+    // nothing to do, as a loop waiting on a transfer.
+    const ROUNDS: usize = 40;
+    let mut script: Script = vec![Vec::new(); ROUNDS];
+    script[0] = vec![EngineRequest::Add(Box::new(request("r", 16, budget(3))))];
+    let finished = Arc::new(Mutex::new(Vec::new()));
+    let frontend = ScriptedFrontend {
+        script: script.into(),
+        react: no_reaction,
+        reacted: Vec::new(),
+        replies: Arc::new(Mutex::new(Vec::new())),
+        finished: finished.clone(),
+        outputs: Arc::new(Mutex::new(Vec::new())),
+    };
+    let spec = RankSpec {
+        rank: 0,
+        layout: Layout::Single,
+        tiers: Tiers::DeviceOnly,
+        config,
+        setup,
+        mesh_listener: mesh_listeners.pop().unwrap(),
+        addresses,
+    };
+
+    let _recording = PROFILE.lock().unwrap_or_else(PoisonError::into_inner);
+    profile::start();
+    drop(profile::span("marker"));
+    let outcome = run_rank(spec, device, None, || frontend, &AtomicBool::new(false));
+    let recording = profile::stop();
+    outcome.unwrap();
+    assert_eq!(finished.lock().unwrap().len(), 1);
+
+    // Other tests share the process: count this thread's spans only.
+    let tid = recording
+        .spans
+        .iter()
+        .find(|span| span.name == "marker")
+        .unwrap()
+        .tid;
+    let count = |name: &str| {
+        recording
+            .spans
+            .iter()
+            .filter(|span| span.tid == tid && span.name == name)
+            .count()
+    };
+    let rounds = count("EventLoop::round");
+    let forwards = plans
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, rids, _)| !rids.is_empty())
+        .count();
+    assert!(forwards > 0);
+    // Every round that dispatched or committed a forward is kept, the empty
+    // rounds are not, and a dropped round takes its phases with it.
+    assert!(
+        forwards <= rounds && rounds < ROUNDS / 2,
+        "{rounds} rounds kept"
+    );
+    assert_eq!(count("Scheduler::next_execution_plan"), rounds);
+    assert!(count("EventLoop::commit") >= forwards);
+    // The request's admission, once.
+    assert_eq!(count("ingress::admit"), 1);
+    assert_eq!(count("EventLoop::register"), 1);
+}
+
+/// What [`HeldQueryFrontend`] noted of a run.
+#[derive(Default)]
+struct RoundNotes {
+    /// Each round's start, with the plans the device had run before it.
+    starts: Vec<(i64, usize)>,
+    /// The round that let the store answer the query.
+    opened: Option<usize>,
+}
+
+/// Hands the engine one request and lets the store answer its L3 query
+/// once the loop spun `held` rounds waiting on it; gone once the request
+/// finished.
+struct HeldQueryFrontend {
+    request: Option<EngineRequest>,
+    gate: Arc<Gate>,
+    queries: Arc<Mutex<usize>>,
+    plans: Arc<Mutex<Vec<ExecutedPlan>>>,
+    held: usize,
+    finished: bool,
+    notes: Arc<Mutex<RoundNotes>>,
+}
+
+impl Frontend for HeldQueryFrontend {
+    fn receive(&mut self, _wait: Option<Duration>) -> Vec<EngineRequest> {
+        let mut notes = self.notes.lock().unwrap();
+        let round = notes.starts.len();
+        notes
+            .starts
+            .push((profile::now_ns(), self.plans.lock().unwrap().len()));
+        if notes.opened.is_none() && *self.queries.lock().unwrap() > 0 {
+            if self.held == 0 {
+                self.gate.open();
+                notes.opened = Some(round);
+            } else {
+                self.held -= 1;
+            }
+        }
+        self.request.take().into_iter().collect()
+    }
+
+    fn closed(&self) -> bool {
+        self.finished
+    }
+
+    fn send(&mut self, outputs: Vec<StreamedOutput>, _load: Load) {
+        self.finished |= outputs.iter().any(|output| output.finish_reason.is_some());
+    }
+
+    fn reply(&mut self, _output: ControlOutput) {}
+}
+
+#[test]
+fn a_profile_keeps_the_rounds_that_only_advance_storage() {
+    // One rank with L3, run on this thread. Its request waits on its L3
+    // query, then on the get that follows, before the device sees it: in
+    // between, the loop's only work is the storage operations'.
+    const HELD: usize = 20;
+    let setup = Setup::default();
+    let config = loop_config(1, false, &setup);
+    let (mut mesh_listeners, addresses) = mesh_listeners(1);
+    let device = fake_device(Layout::Single, 0, &setup);
+    let plans = device.plans.clone();
+    let store = ScriptedStore {
+        landed: None,
+        gate: Gate::closed(),
+        queries: Arc::new(Mutex::new(0)),
+        gets: Arc::new(Mutex::new(0)),
+    };
+    let (queries, gets) = (store.queries.clone(), store.gets.clone());
+    let notes = Arc::new(Mutex::new(RoundNotes::default()));
+    let frontend = HeldQueryFrontend {
+        request: Some(EngineRequest::Add(Box::new(request("r", 65, budget(2))))),
+        gate: store.gate.clone(),
+        queries: queries.clone(),
+        plans: plans.clone(),
+        held: HELD,
+        finished: false,
+        notes: notes.clone(),
+    };
+    let spec = RankSpec {
+        rank: 0,
+        layout: Layout::Single,
+        tiers: Tiers::L3,
+        config,
+        setup,
+        mesh_listener: mesh_listeners.pop().unwrap(),
+        addresses,
+    };
+
+    let _recording = PROFILE.lock().unwrap_or_else(PoisonError::into_inner);
+    profile::start();
+    drop(profile::span("marker"));
+    let outcome = run_rank(
+        spec,
+        device,
+        Some(store),
+        || frontend,
+        &AtomicBool::new(false),
+    );
+    let recording = profile::stop();
+    outcome.unwrap();
+    assert_eq!((*queries.lock().unwrap(), *gets.lock().unwrap()), (1, 1));
+
+    let notes = notes.lock().unwrap();
+    let opened = notes.opened.expect("the store held the query");
+    let (opened_ns, plans_before) = notes.starts[opened];
+    // The first round from then on that ran a plan on the device.
+    let device_round = (opened..notes.starts.len() - 1)
+        .find(|&round| notes.starts[round + 1].1 > plans_before)
+        .expect("the request reached the device");
+    let device_ns = notes.starts[device_round].0;
+    // Other tests share the process: count this thread's spans only.
+    let tid = recording
+        .spans
+        .iter()
+        .find(|span| span.name == "marker")
+        .unwrap()
+        .tid;
+    let kept_rounds = |within: &dyn Fn(i64, i64) -> bool| {
+        recording
+            .spans
+            .iter()
+            .filter(|span| {
+                span.tid == tid
+                    && span.name == "EventLoop::round"
+                    && within(span.begin_ns, span.end_ns)
+            })
+            .count()
+    };
+    // The rounds waiting on the query leave no spans, though each takes the
+    // replica's storage tick; a round taking the query's answer or starting
+    // the get does.
+    let waiting_ns = notes.starts[opened - HELD].0;
+    assert_eq!(
+        kept_rounds(&|begin, end| begin > waiting_ns && end < opened_ns),
+        0
+    );
+    assert!(
+        kept_rounds(&|_, end| end > opened_ns && end < device_ns) > 0,
+        "no round of the {} before the device's was kept",
+        device_round - opened
+    );
 }

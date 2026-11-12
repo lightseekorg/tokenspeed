@@ -57,8 +57,16 @@ runs the verify for its cost and then forces each request's length; the
 token at the cutoff comes from the candidates the verify selected
 (``_synthetic_outputs``).
 
-Not yet supported: DP-sampling, draft trees, top-k output logprobs, EAGLE3
-``d2t`` cross-vocab.
+Draft trees (``--speculative-eagle-topk`` > 1) verify on the target's own
+draws: every node row draws as ``sample`` would there, keyed by its depth and
+with the tokens of its path counted for penalties (``sonic.tree_targets``),
+and the walk from the root accepts the child holding its parent's draw
+(``verify_tree``). The emitted tokens follow the target for any tree; a
+sampled tree's draft q is not read, so each child is accepted at its target
+probability. The trees read whole rows, gathering a vocabulary shard.
+
+Not yet supported: DP-sampling, top-k output logprobs, EAGLE3 ``d2t``
+cross-vocab.
 
 The kernels and indicator bits are sonic-sampler's, vendored in
 ``tokenspeed_kernel.thirdparty.sonic_sampler``; ``tokenspeed_kernel.ops.sampling.sonic``
@@ -82,6 +90,7 @@ from tokenspeed_kernel.ops.sampling.sonic import (
     pick,
     scratchpad_columns,
 )
+from tokenspeed_kernel.ops.sampling.triton import verify_tree
 from tokenspeed_kernel.platform import pdl_enabled
 from typing_extensions import override
 
@@ -93,6 +102,7 @@ from tokenspeed.runtime.sampling.backends.base import (
 )
 from tokenspeed.runtime.sampling.registry import register_backend
 from tokenspeed.runtime.sampling.sampling_params import _SAMPLING_EPS, SamplingParams
+from tokenspeed.runtime.sampling.tree_verify import accepted_path_rows
 from tokenspeed.runtime.sampling.utils import gather_token_logprobs_torch
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
@@ -186,6 +196,7 @@ class SonicSamplingBackend(SamplingBackend):
 
     _HAS_POOL_STATE = True
     _SUPPORTS_DP_VERIFY = False
+    supports_tree_verify = True
     # Forced lengths over sonic's verify; see ``_synthetic_outputs``.
     _SUPPORTS_SYNTHETIC_ACCEPTANCE = True
 
@@ -216,6 +227,8 @@ class SonicSamplingBackend(SamplingBackend):
         self.n_max = max(1, int(config.max_draft_tokens_per_req))
         self.gamma = self.n_max - 1
         self.spec = self.n_max > 1
+        # Drafts verify as trees (``_verify_tree``).
+        self.tree = self.spec and config.draft_tree
 
         # Slot-indexed state, +1 for the padding sentinel; timesteps=n_max serves sample and verify.
         self.pool_rows = config.max_req_pool_size + 1
@@ -249,6 +262,18 @@ class SonicSamplingBackend(SamplingBackend):
                 self.indices = torch.empty((rows, MAX_K), dtype=torch.int32)
                 # Synthetic acceptance's target token per request.
                 self.synthetic_tokens = torch.empty((self.max_bs,), dtype=torch.int32)
+
+            if self.tree:
+
+                # Each node's slot, path and draw, then the walk's predict, path and lengths packed for one TP sync.
+                self._tree_slots = torch.empty((rows,), dtype=torch.int64)
+                self._tree_paths = torch.empty((rows, self.gamma), dtype=torch.int32)
+                self._tree_targets = torch.empty((rows, 1), dtype=torch.int32)
+                self._tree_pack = torch.empty(
+                    (2 * rows + self.max_bs,), dtype=torch.int32
+                )
+                # The path and lengths sit at fixed offsets: a padded graph's verify and the live batch read the same rows.
+                self._tree_rows = rows
 
             # Vocabulary-sharded rows: this rank's candidates and every rank's.
             self._shard_ranks = self._vocab_shard_ranks(config)
@@ -459,6 +484,9 @@ class SonicSamplingBackend(SamplingBackend):
             # The dtype of the base class's offsets pool, which serving passes.
             offsets = torch.zeros((self.pool_rows,), dtype=torch.int64)
             cand = torch.zeros((self.max_bs, self.n_max), dtype=torch.int32)
+            nodes = torch.arange(self.n_max, dtype=torch.int32)
+            chain_parents = (nodes - 1).repeat(self.max_bs, 1)
+            chain_depths = nodes.repeat(self.max_bs, 1)
 
         for slots in (slot, shifted):
 
@@ -483,6 +511,19 @@ class SonicSamplingBackend(SamplingBackend):
                             self._synthetic_outputs(
                                 cand[:bs], slots[:bs], offsets, *verified, row_offset=0
                             )
+
+                if self.tree:
+
+                    # A chain is the tree every node count admits.
+                    predict, lengths = self._fused_tree(
+                        logits[: bs * self.n_max],
+                        slots[:bs],
+                        offsets,
+                        cand[:bs],
+                        chain_parents[:bs],
+                        chain_depths[:bs],
+                    )
+                    sonic.count_emitted(self.state, slots[:bs], predict, lengths)
 
         # The warm-up gathered slot 0 with counting on; leave it clean.
         self.reset_capture_state()
@@ -909,11 +950,11 @@ class SonicSamplingBackend(SamplingBackend):
         rule): nothing to accept, one token to draw, ``accept_length == 1`` —
         exactly ``sample()``, so it takes the ``sample`` path. Widths
         other than 1 and ``n_max`` are refused (``v_drafted`` is ``[max_bs,
-        n_max]``)."""
+        n_max]``). A draft tree takes ``_verify_tree``."""
 
         if tree is not None:
 
-            raise RuntimeError("SonicSamplingBackend verifies draft chains only")
+            return self._verify_tree(logits_output, sampling_info, candidates, tree)
 
         bs, n = candidates.shape
 
@@ -970,6 +1011,121 @@ class SonicSamplingBackend(SamplingBackend):
         self._write_logprob_outputs(logits_output, logits, sampling_info, predict)
 
         return predict, accept_lengths
+
+    def _fused_tree(
+        self,
+        logits: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        offsets: torch.Tensor,
+        candidates: torch.Tensor,
+        parents: torch.Tensor,
+        depths: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """One tree verify over ``[bs * n, V]`` whole rows; returns ``(predict, accept_lengths)``, with the path in ``accepted_path``.
+
+        Every node row draws once (``sonic.tree_targets``) and the walk packs
+        the draws along the accepted path into predict (``verify_tree``); the
+        caller counts the emitted tokens once the ranks agree on them.
+        """
+
+        state = self._check_logits(logits, None)
+
+        bs, n = candidates.shape
+        rows = bs * n
+
+        slots = self._tree_slots[:rows]
+        slots.view(bs, n).copy_(slot_mapping[:, None])
+
+        tokens = candidates.to(torch.int32)
+        paths = sonic.tree_paths(tokens, parents, depths, self._tree_paths[:rows])
+        targets = sonic.tree_targets(
+            logits,
+            state,
+            slots,
+            offsets,
+            depths.view(-1),
+            paths,
+            self._tree_targets[:rows],
+            self.scratchpad[:rows],
+            pick(logits.shape[1], rows),
+            enable_pdl=pdl_enabled(),
+        )
+
+        predict, lengths = self._tree_outputs(bs, n)
+        # The walk writes predict along each path only; past it, valid ids for the logprob gather.
+        predict.zero_()
+        verify_tree(
+            predict,
+            lengths,
+            self.accepted_path(bs, n),
+            tokens,
+            parents,
+            targets.view(-1),
+        )
+
+        return predict, lengths
+
+    def _verify_tree(
+        self,
+        logits_output: LogitsProcessorOutput,
+        sampling_info: SamplingBatchInfo,
+        candidates: torch.Tensor,
+        tree: TreeVerifyBatch,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Accept each request's draft tree on the target's own draws (``_fused_tree``) and count what it emits.
+
+        Synthetic lengths force chains only, as on the greedy backend.
+        """
+
+        if not self.tree:
+            raise RuntimeError(
+                "SonicSamplingBackend verifies draft trees only when built with "
+                "SamplingBackendConfig.draft_tree, which allocates their buffers"
+            )
+
+        bs, n = candidates.shape
+
+        logits = logits_output.next_token_logits
+        if logits_output.vocab_shard is not None:
+            logits = logits_output.vocab_shard.full_logits()
+
+        slot_mapping = sampling_info.req_pool_indices[:bs]
+        predict, accept_lengths = self._fused_tree(
+            logits,
+            slot_mapping,
+            self._prepare_sampling_offsets(sampling_info),
+            candidates,
+            tree.parents,
+            tree.depths,
+        )
+
+        # Rank 0 wins on gathered rows (see sample()), and every rank then counts the same tokens.
+        if logits_output.vocab_shard is None:
+            self.maybe_broadcast(self._tree_pack)
+        # The fp32 scalars share these decode counts.
+        sonic.count_emitted(self.state, slot_mapping, predict, accept_lengths)
+
+        if self.config.enable_output_logprobs:
+
+            # predict is packed along the path; score it against the path's own rows.
+            path_logits = logits.index_select(
+                0, accepted_path_rows(self.accepted_path(bs, n))
+            )
+            self._write_logprob_outputs(
+                logits_output, path_logits, sampling_info, predict
+            )
+
+        return predict, accept_lengths
+
+    def _tree_outputs(self, bs: int, n: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """The tree verify's ``[bs * n]`` predict and ``[bs]`` lengths in ``_tree_pack``."""
+        rows = self._tree_rows
+        return self._tree_pack[: bs * n], self._tree_pack[2 * rows : 2 * rows + bs]
+
+    @override
+    def accepted_path(self, bs: int, num_nodes: int) -> torch.Tensor:
+        rows = self._tree_rows
+        return self._tree_pack[rows : rows + bs * num_nodes].view(bs, num_nodes)
 
 
 register_backend("sonic", SonicSamplingBackend)

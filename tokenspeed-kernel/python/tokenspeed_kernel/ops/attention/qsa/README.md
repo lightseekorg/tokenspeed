@@ -5,6 +5,27 @@ full-cache slots, and attends to those slots. The block selector takes an
 explicit `auto`, `stream`, or `logits` path. Backend selection and overrides
 preserve the requested path.
 
+## Native top-k diagnostics
+
+For eligible FP32 logits selection on NVIDIA SM90+, an unavailable native
+CUDA top-k produces one warning per process: missing `dsv4_attention.so`,
+load failure, or missing `dsv4_persistent_topk` export. Explicitly selecting
+another implementation stays quiet. Selection and override rules are unchanged;
+`TOKENSPEED_KERNEL_VERBOSE=1` with INFO logging shows the actual winner.
+
+For source installs, rebuild in the target CUDA environment from the repo root:
+
+```sh
+TOKENSPEED_KERNEL_BACKEND=cuda python -m pip install -e tokenspeed-kernel/python/
+```
+
+Check the `dsv4_attention` build group and installed artifact at
+`tokenspeed_kernel/thirdparty/cuda/objs/dsv4_attention/dsv4_attention.so`.
+For wheels, reinstall a matching CUDA build. Automatic warnings omit raw loader
+error text; call `thirdparty.cuda.dsv4_attention._load_dsv4_attention_module()`
+within `tokenspeed_kernel` to inspect it locally. Restart after repair: both
+successful and failed availability checks are cached.
+
 ## Streaming block selection
 
 The Blackwell CuTe implementation lives under
