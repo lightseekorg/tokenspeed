@@ -75,6 +75,7 @@ def _mix(inputs, override, projection_scale=1.0, *, padded=True):
         weights_independent=True,
         projection_scale=projection_scale,
         override=override,
+        activation_quantization="none",
     )
 
 
@@ -214,6 +215,7 @@ def test_mix_supports_rank_tails_that_fill_an_mfma_step(tail):
         projection_rows=lowrank,
         weights_independent=True,
         override="triton_hyperconnection_mix",
+        activation_quantization="none",
     )
     torch.testing.assert_close(mixed, expected, rtol=1e-2, atol=1e-2)
 

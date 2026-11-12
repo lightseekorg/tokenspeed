@@ -73,6 +73,7 @@ def _run(values, g, h, r, inject):
         weights_independent=True,
         override="cute_fused_hyperconnection_mix",
         solution=None,
+        activation_quantization="none",
     )
 
 
@@ -165,6 +166,7 @@ def test_unsupported_dimensions_fall_back_and_preserve_exact_override(g, h, r):
         weights_independent=True,
         override=None,
         solution=None,
+        activation_quantization="none",
     )
     _check(actual, values, g, h, r, True)
     with pytest.raises(ValueError, match="validated model dimensions"):

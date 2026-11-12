@@ -30,7 +30,12 @@ import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.numerics.torch.layernorm import torch_rmsnorm
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+from tokenspeed_kernel.signature import (
+    ScaleFormat,
+    dense_tensor_format,
+    format_signature,
+    tensor_format,
+)
 
 if TYPE_CHECKING:
     from tokenspeed_kernel.ops.moe._cute_dsl.latent_down import MailboxPublish
@@ -229,6 +234,135 @@ def torch_hyperconnection_mix(
         torch.sigmoid(gate).unflatten(-1, (hc_count, hidden_size))
         * x.unflatten(-1, (hc_count, hidden_size))
     ).mean(dim=-2)
+    inject = projected[:, lowrank:] if projection_rows > lowrank else None
+    return mixed, inject
+
+
+def _fp8_token_reference(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    value = value.float()
+    amax = value.abs().amax(-1, keepdim=True)
+    maximum = torch.full_like(amax, 448.0)
+    scale = (amax / maximum).clamp_min(1.0 / (448.0 * 512.0))
+    multiplier = (maximum / amax).clamp_max(448.0 * 512.0)
+    codes = (value * multiplier).clamp(-448, 448).to(torch.float8_e4m3fn)
+    return codes.double(), scale.double()
+
+
+@register_kernel(
+    "residual",
+    "hyperconnection_mix",
+    name="torch_fp8_hyperconnection_mix",
+    solution="torch",
+    signatures=frozenset(
+        format_signature(
+            normalized=dense_tensor_format(dtype),
+            projection_weight=tensor_format(
+                "scaled-fp8",
+                torch.float8_e4m3fn,
+                scale=ScaleFormat(storage_dtype=torch.float32, granularity=down_scale),
+            ),
+            up_weight=tensor_format(
+                "scaled-fp8",
+                torch.float8_e4m3fn,
+                scale=ScaleFormat(storage_dtype=torch.float32, granularity=up_scale),
+            ),
+        )
+        for dtype in (torch.bfloat16, torch.float16)
+        for down_scale in ("tensor", "channel")
+        for up_scale in ("tensor", "channel")
+    )
+    | frozenset(
+        format_signature(
+            normalized=tensor_format(
+                "scaled-fp8",
+                torch.float8_e4m3fn,
+                scale=ScaleFormat(storage_dtype=torch.float32, granularity=xscale),
+            ),
+            projection_weight=tensor_format(
+                "scaled-fp8",
+                torch.float8_e4m3fn,
+                scale=ScaleFormat(storage_dtype=torch.float32, granularity=dscale),
+            ),
+            up_weight=tensor_format(
+                "scaled-fp8",
+                torch.float8_e4m3fn,
+                scale=ScaleFormat(storage_dtype=torch.float32, granularity=uscale),
+            ),
+        )
+        for xscale in ("tensor", "token")
+        for dscale in ("tensor", "channel")
+        for uscale in ("tensor", "channel")
+    ),
+    priority=Priority.REFERENCE,
+)
+def torch_fp8_hyperconnection_mix(
+    normalized: torch.Tensor,
+    projection_weight: torch.Tensor,
+    up_weight: torch.Tensor,
+    hc_count: int,
+    hidden_size: int,
+    lowrank: int,
+    projection_rows: int,
+    projection_scale: float,
+    weights_independent: bool,
+    *,
+    projection_weight_scale: torch.Tensor,
+    up_weight_scale: torch.Tensor,
+    activation_quantization: str,
+    packed_up_weight: torch.Tensor | None = None,
+    normalized_scale: torch.Tensor | None = None,
+    output_dtype: torch.dtype | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """FP64 mixer oracle with explicit FP8 codes and FP32 dequant scales.
+
+    Arguments follow gated_residual_mix. Weight scales multiply the codes;
+    activation_quantization selects unquantized or canonical per-token FP8
+    operands. SiLU rounds to the normalized-input dtype before Up's optional
+    quantization. Prequantized input uses its supplied FP32 scale and explicit
+    output dtype for rounding; its residual is codes times scale. Returns FP64
+    mixed values and optional inject logits.
+    """
+    if activation_quantization not in ("none", "fp8"):
+        raise ValueError("activation_quantization must be none or fp8")
+    if packed_up_weight is not None:
+        raise ValueError("FP8 mixer consumes canonical, unpacked FP8 weights")
+    del weights_independent
+    if normalized.dtype == torch.float8_e4m3fn:
+        if normalized_scale is None or output_dtype not in (
+            torch.bfloat16,
+            torch.float16,
+        ):
+            raise ValueError(
+                "prequantized FP8 reference requires input scale and output dtype"
+            )
+        if activation_quantization != "fp8":
+            raise ValueError("prequantized FP8 reference requires fp8 arithmetic")
+        x = normalized.float().double()
+        x_scale = normalized_scale.double().reshape(-1, 1)
+        original = x * x_scale
+        rounding_dtype = output_dtype
+    else:
+        if normalized_scale is not None or output_dtype is not None:
+            raise ValueError(
+                "input scale and output dtype require prequantized FP8 input"
+            )
+        original = normalized.double()
+        x, x_scale = original, 1.0
+        rounding_dtype = normalized.dtype
+        if activation_quantization == "fp8":
+            x, x_scale = _fp8_token_reference(normalized)
+    down_scale = projection_weight_scale.double().reshape(-1)
+    if down_scale.numel() > 1:
+        down_scale = down_scale[:projection_rows]
+    projected = x @ projection_weight[:projection_rows].float().double().T
+    projected = projected * x_scale * down_scale * projection_scale
+    activation = F.silu(projected[:, :lowrank]).to(rounding_dtype).double()
+    activation_scale = 1.0
+    if activation_quantization == "fp8":
+        activation, activation_scale = _fp8_token_reference(activation)
+    gate = activation @ up_weight.float().double().T
+    gate = gate * activation_scale * up_weight_scale.double().reshape(-1)
+    mixed = (gate.sigmoid() * original).reshape(-1, hc_count, hidden_size).mean(-2)
     inject = projected[:, lowrank:] if projection_rows > lowrank else None
     return mixed, inject
 

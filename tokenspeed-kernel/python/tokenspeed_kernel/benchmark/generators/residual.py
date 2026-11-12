@@ -749,6 +749,7 @@ def prepare_hyperconnection_mix(
             weights_independent=True,
             override=None,
             solution=None,
+            activation_quantization="none",
         )
     except NoKernelFoundError as error:
         raise BenchmarkCaseError(BenchmarkStatus.NOT_APPLICABLE, str(error)) from error
@@ -769,6 +770,7 @@ def prepare_hyperconnection_mix(
             lowrank,
             projection_rows=projection_rows,
             weights_independent=True,
+            activation_quantization="none",
         )
 
     return PreparedBenchmark(

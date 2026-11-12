@@ -62,6 +62,7 @@ def _mix(inputs):
         projection_scale=1.0,
         override="cute_fused_hyperconnection_mix",
         solution=None,
+        activation_quantization="none",
     )
 
 

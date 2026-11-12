@@ -970,6 +970,7 @@ def warmup(
         weights_independent=weights_independent,
         override=override,
         solution=solution,
+        activation_quantization="none",
     )
     if selected.name != "cute_fused_hyperconnection_mix":
         return
