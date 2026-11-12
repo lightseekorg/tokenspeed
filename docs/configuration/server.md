@@ -15,7 +15,7 @@ For a compact compatibility table, see
 | `--model` | Equivalent to positional `model`. |
 | `--tokenizer` | Tokenizer path when it differs from the model path. |
 | `--tokenizer-mode` | Select tokenizer behavior. `auto` uses fast tokenizers and model-specific hooks when available. |
-| `--load-format` | Weight loading format: `auto`, `pt`, `safetensors`, `instanttensor`, `npcache`, `dummy`, or `extensible`. See [InstantTensor](/guides/instanttensor) for the accelerated NVIDIA loader. |
+| `--load-format` | Weight loading format: `auto`, `pt`, `safetensors`, `instanttensor`, `npcache`, `dummy`, or `extensible`. Also applies to the draft unless `--speculative-draft-model-load-format` is set. See [InstantTensor](/guides/instanttensor) for the accelerated NVIDIA loader. |
 | `--trust-remote-code` | Allow custom model code from the model repository. |
 | `--revision` | Model branch, tag, or commit. |
 | `--download-dir` | Hugging Face download/cache directory. |
@@ -594,6 +594,7 @@ parser option keeps its existing behavior.
 | `--speculative-draft-model-path` | Draft model path or repo ID. |
 | `--speculative-draft-model-revision` | Branch, tag, or commit of a draft in its own repo. Defaults to the repo's default branch. A draft inside the target checkpoint uses `--revision`. |
 | `--speculative-draft-model-quantization` | Draft model quantization. Defaults to `unquant`. |
+| `--speculative-draft-model-load-format` | Draft weight loading format, with the same choices as `--load-format`. Omission inherits `--load-format`. Use `--load-format dummy --speculative-draft-model-load-format auto` to initialize the target randomly while loading the DFlash draft's checkpoint. Shared target embeddings and LM heads still follow the target's loading policy. |
 | `--speculative-num-steps` | Number of draft model steps. Defaults to `3`. |
 | `--speculative-num-draft-tokens` | Number of draft tokens. Defaults to `--speculative-num-steps + 1`; required for draft trees. |
 | `--synthetic-acceptance-length` | Benchmark-only mean emitted tokens per speculative verification, including the guaranteed target token. Unset disables it. |

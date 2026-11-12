@@ -671,6 +671,7 @@ class ServerArgs:
     speculative_draft_model_path: str | None = None
     speculative_draft_model_revision: str | None = None
     speculative_draft_model_quantization: str | None = "unquant"
+    speculative_draft_model_load_format: str | None = None
     speculative_num_steps: int = 3
     speculative_eagle_topk: int = 1
     speculative_num_draft_tokens: int | None = None
@@ -2978,19 +2979,20 @@ class ServerArgs:
             "(0..65535).",
         )
         parser.add_argument("--ext-yaml", type=str, default=None)
+        load_formats = [
+            "auto",
+            "pt",
+            "safetensors",
+            "instanttensor",
+            "npcache",
+            "dummy",
+            "extensible",
+        ]
         parser.add_argument(
             "--load-format",
             type=str,
             default=ServerArgs.load_format,
-            choices=[
-                "auto",
-                "pt",
-                "safetensors",
-                "instanttensor",
-                "npcache",
-                "dummy",
-                "extensible",
-            ],
+            choices=load_formats,
             help="The format of the model weights to load. "
             '"auto" will try to load the weights in the safetensors format '
             "and fall back to the pytorch bin format if safetensors format "
@@ -4108,6 +4110,14 @@ class ServerArgs:
             "repository: a branch name, a tag name, or a commit id. If "
             "unspecified, the draft uses its repository's default version. A "
             "draft inside the target checkpoint uses --revision.",
+        )
+        parser.add_argument(
+            "--speculative-draft-model-load-format",
+            type=str,
+            choices=load_formats,
+            default=ServerArgs.speculative_draft_model_load_format,
+            help="Draft checkpoint format. When omitted, inherits --load-format. "
+            "Use auto to load a real draft while the target uses dummy.",
         )
         parser.add_argument(
             "--speculative-draft-model-quantization",

@@ -91,7 +91,12 @@ class WeightLoader:
 
         # Create load config
         load_config = LoadConfig(
-            load_format=server_args.load_format,
+            load_format=(
+                server_args.speculative_draft_model_load_format
+                if is_draft_worker
+                and server_args.speculative_draft_model_load_format is not None
+                else server_args.load_format
+            ),
             download_dir=server_args.download_dir,
             ext_yaml=server_args.ext_yaml,
             weight_loader_prefetch_checkpoints=server_args.weight_loader_prefetch_checkpoints,
