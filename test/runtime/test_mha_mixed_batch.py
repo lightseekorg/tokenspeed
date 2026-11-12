@@ -878,40 +878,15 @@ def test_block_decode_after_mixed_excludes_poison_beyond_accepted_history_and_bl
     )
 
 
-def test_a_block_drafter_writes_through_the_targets_router(monkeypatch):
-    """The taps are the TARGET's rows, so its write vector names them.
-
-    A block drafter shares the target's cache group (it writes at the target's
-    cache locations), and its own router has already republished a BLOCK
-    window by the time the taps are folded
-    (``publish_draft_step_locations``). Asking the draft's router here would
-    scatter the taps over the draft's block positions instead -- correct
-    output, silently halved acceptance.
-    """
+@pytest.mark.parametrize("for_graph_replay", [False, True])
+def test_a_block_drafter_writes_context_before_publishing_its_block(
+    monkeypatch, for_graph_replay
+):
+    """Context KV uses the draft's pages before its proposal window is published."""
     runner, drafter, leaves, layers = _block_runtime()
     buffers = drafter.input_buffers
     slots = torch.tensor([7, 2, 9], dtype=torch.int64)
-    lengths = torch.tensor([19, 48, 80], dtype=torch.int32)
-    tables = _round_tables(leaves, slots.tolist(), 1)
     buffers.req_pool_indices_buf[:3].copy_(slots)
-    buffers.positions_buf[: 3 * 16].copy_(
-        torch.cat([torch.arange(n, n + 16) for n in lengths.tolist()])
-    )
-    runner._prepare_decode_metadata(
-        3,
-        3,
-        slots,
-        lengths,
-        forward_mode=ForwardMode.DECODE,
-        use_graph=False,
-        settle=lambda: None,
-        block_tables=tables,
-    )
-    # The draft's router then publishes its block window, as a draft step does.
-    runner.draft_attn_backend.publish_draft_step_locations(
-        cache_start=lengths.to(torch.int64), num_tokens=16
-    )
-
     written = {}
 
     def capture(self, hidden, positions, cache_locs, decode_only=False):
@@ -929,13 +904,41 @@ def test_a_block_drafter_writes_through_the_targets_router(monkeypatch):
     )
     # Only the ROW count is checked on this path; the width is free.
     hidden = torch.zeros(3 * 16, 8)
-    drafter._update_native_cache_from_target(
-        ctx,
-        SimpleNamespace(hidden_states=hidden),
-        torch.ones(3, dtype=torch.int32),
-    )
+    for generation in (1, 2):
+        lengths = torch.tensor([19, 48, 80], dtype=torch.int32) + 16 * (generation - 1)
+        starts = (lengths - 16).tolist()
+        tables = _round_tables(leaves, slots.tolist(), generation)
+        buffers.positions_buf[: 3 * 16].copy_(
+            torch.cat([torch.arange(start, start + 16) for start in starts])
+        )
+        # Each target round restores context locations after the prior draft
+        # published its proposal window, including when replaying a graph.
+        runner._prepare_decode_metadata(
+            3,
+            3,
+            slots,
+            lengths,
+            forward_mode=ForwardMode.DECODE,
+            use_graph=for_graph_replay,
+            settle=lambda: None,
+            block_tables=tables,
+        )
+        drafter._update_native_cache_from_target(
+            ctx,
+            SimpleNamespace(hidden_states=hidden),
+            torch.ones(3, dtype=torch.int32),
+        )
+        assert written["locs"] == _expected_locations(
+            tables["draft_attention"], starts, 16
+        )
 
-    assert written["locs"] == runner.attn_backend.decode_window_locations().tolist()
+        # Only after writing context does the draft switch to proposal rows.
+        runner.draft_attn_backend.publish_draft_step_locations(
+            cache_start=lengths.to(torch.int64), num_tokens=16
+        )
+        assert runner.draft_attn_backend.decode_window_locations().tolist() == (
+            _expected_locations(tables["draft_attention"], lengths.tolist(), 16)
+        )
 
 
 def test_an_unsharded_draft_is_not_handed_the_targets_query_shard(monkeypatch):
