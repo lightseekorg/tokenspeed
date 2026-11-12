@@ -1566,12 +1566,14 @@ def _ex2_gather_lane(
         else:
             valid = lane + ks * LANES < count
         picks_smem.slice(0, RP, dim=1).store(gl.where(valid, picks, -1))
-        if RP < M_DUP:
-            # MFMA rows past the launch's rows: no pick.
-            fill: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [nw, 1], [1, 0])
-            picks_smem.slice(RP, M_DUP - RP, dim=1).store(
-                gl.full([S, M_DUP - RP], -1, gl.int32, fill)
-            )
+        # MFMA rows past the launch's rows: no pick. A block's width must be a
+        # power of two, so the columns go in blocks [RP, 2 RP), [2 RP, 4 RP),
+        # ... up to M_DUP (one block at 8 rows, none at 16).
+        fill: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [nw, 1], [1, 0])
+        for k in gl.static_range(4):  # at most log2(M_DUP) blocks
+            w: gl.constexpr = RP << k
+            if w < M_DUP:
+                picks_smem.slice(w, w, dim=1).store(gl.full([S, w], -1, gl.int32, fill))
     r = gl.arange(0, RP, gl.SliceLayout(0, tl))[None, :]
     routed = picks >= 0
     first = gl.min(gl.where(routed, r, RP), axis=1)[:, None]

@@ -343,10 +343,13 @@ def _worker(
     "rows, exr, exr_parts, distinct",
     [
         (1, 192, 1, None),
-        # Two rows: 8 distinct experts leave every lane without a second slot
-        # (its prefetch masked off), 12 mix lanes with and without one.
+        # 2 to 7 rows (2 to 4 pad the 16 MFMA rows in several blocks): 8
+        # distinct experts leave every lane without a second slot (its
+        # prefetch masked off), 12 mix lanes with and without one.
         (2, 0, 4, 8),
         (2, 0, 4, 12),
+        (3, 0, 4, None),
+        (6, 0, 4, None),
         (8, 0, 4, None),
         (8, 128, 2, None),
         (8, 0, 4, 64),
