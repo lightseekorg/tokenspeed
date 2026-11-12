@@ -1282,7 +1282,12 @@ class ForwardStepRunner:
             graph = self.graphs[graph_key]
             if self._graph_debug:
                 self._verify_graph_metadata(graph_key)
-            if self.device == "npu":
+            if (
+                self.device == "npu"
+                and graph.graph_dispatch_mode.graph_dispatch_records
+            ):
+                # Device metadata needs no task update. Only registered handlers
+                # require the CPU attention lengths and write callbacks.
                 # Update callbacks write the inference tensors created at capture.
                 with torch.inference_mode():
                     graph.update(

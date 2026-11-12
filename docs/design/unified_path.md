@@ -88,6 +88,11 @@ the read-only source in a writable tensor nor creates an intermediate token
 copy. The pinned allocation must remain per-round: overlap can prepare the
 next round while the previous upload is still reading its source.
 
+NPU graphs only invoke task updates when capture registered update handlers.
+Graphs whose operators read persistent device metadata replay directly, without
+copying attention lengths to the CPU. The generic update mechanism remains for
+operators with host-bound attributes.
+
 NPU graph task updates and replay run in inference mode because they write the
 output tensors allocated during capture. This applies to active and idle DP
 ranks; callers need not establish an inference context.
