@@ -155,6 +155,33 @@ def test_a_launch_hands_whole_rows_where_the_model_reads_them() -> None:
     assert not hands_whole_rows(5, served, frozenset({1, 6}), True)
 
 
+def test_the_served_drafts_taps_are_stored_by_the_launches() -> None:
+    """Muse Spark's DFlash2 draft names target layer outputs 1, 16, 30, 44
+    and 59; the target captures the residual entering the next layer, so it
+    taps layers 2, 17, 31, 45 and 60. Each follows a launching layer, so the
+    launches store all five taps (one slot each, in layer order) and the
+    launches before them keep the owned-columns hand-off."""
+    fused = dict.fromkeys(range(1, 61))
+    taps = [2, 17, 31, 45, 60]
+    slots = MuseSparkMonokernelState.store_tap_slots(fused, taps)
+    assert slots == {2: 0, 17: 1, 31: 2, 45: 3, 60: 4}
+    served, tapped = set(fused), frozenset(taps)
+    for before in (1, 16, 30, 44, 59):
+        assert not hands_whole_rows(before, served, tapped, True)
+    # Layer 60's output enters regular layer 61: whole rows either way.
+    assert hands_whole_rows(60, served, tapped, True)
+
+
+def test_a_tap_after_a_regular_layer_leaves_every_tap_to_the_capture() -> None:
+    """Layer 1's entering residual comes from regular layer 0, which no launch
+    stores: then the model's regular capture serves every tap, and the
+    launches before the other tapped layers gather whole rows for it."""
+    fused = dict.fromkeys(range(1, 61))
+    taps = [1, 17, 31]
+    assert MuseSparkMonokernelState.store_tap_slots(fused, taps) == {}
+    assert hands_whole_rows(16, set(fused), frozenset(taps), False)
+
+
 def test_a_verify_step_gives_each_row_its_token_length() -> None:
     """Verify metadata holds each request's length after the step; row t of
     a request's rows is its token at position seq - chain + t."""
