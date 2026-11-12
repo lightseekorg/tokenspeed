@@ -544,11 +544,20 @@ def _group_keys(
     m_w = gl.full([G, QM], float("-inf"), gl.float32, gl.SliceLayout(2, qk3))
     l_w = gl.zeros([G, QM], gl.float32, gl.SliceLayout(2, qk3))
     acc_w = gl.zeros([G, QM, HEAD], gl.float32, pv3)
+    # Chunk 0's QK before the loop (chunks 0 and 1 are in flight). Iteration
+    # i then runs chunk i's softmax, chunk i + 1's QK and chunk i's PV, so
+    # chunk i + 1's QK MFMAs overlap chunk i's softmax-to-PV chain. Every
+    # running state (max, sum, output) still takes the chunks in order.
+    cdna4_async_copy.wait_group(1)
+    gl.barrier()
+    scores = _group_qk(q_w, k_ring.index(0), qk3, k3, FP8QK)
     i = 0
     for c0 in range(lo, hi, BN):
         valid = c0 + ww * KW + jw < hi  # [G, 1, KW]: every row attends every key
         # As attn_stage's loop: every wave is done with the slot the next
-        # copy refills, then chunk i + 3's pages and chunk i + 2's copies.
+        # copy refills (chunk i - 1's: its keys were read for the QK in
+        # iteration i - 2, its values by the PV in iteration i - 1), then
+        # chunk i + 3's pages and chunk i + 2's copies.
         gl.barrier()
         if PAGES:
             na = _page_of(table, c0 + 3 * BN, hi)
@@ -584,18 +593,18 @@ def _group_keys(
                 cl,
             )
             pages = pages3
-        cdna4_async_copy.wait_group(2)
-        gl.barrier()
-        # The QK products go out before the values load (a K step at a time,
-        # in _group_pv): the values' LDS reads and conversion fill the MFMA's
-        # latency.
-        scores = _group_qk(q_w, k_ring.index(i % NBUF), qk3, k3, FP8QK)
-        # Only the split's last chunk has keys past its end; the PV is the
-        # same for both.
+        # Only the split's last chunk has keys past its end.
         if c0 + BN > hi:
             m_w, l_w, p, alpha = _group_softmax(scores, valid, m_w, l_w, True)
         else:
             m_w, l_w, p, alpha = _group_softmax(scores, valid, m_w, l_w, False)
+        if c0 + BN < hi:
+            # Chunk i + 1 has landed once only chunk i + 2's copies are
+            # outstanding; every wave sees every wave's copies after the
+            # barrier. (lo and hi are uniform: all waves take this branch.)
+            cdna4_async_copy.wait_group(1)
+            gl.barrier()
+            scores = _group_qk(q_w, k_ring.index((i + 1) % NBUF), qk3, k3, FP8QK)
         acc_w = _group_pv(
             p, alpha, v_ring.index(i % NBUF).reshape([G, KW, HEAD]), acc_w, p3
         )
