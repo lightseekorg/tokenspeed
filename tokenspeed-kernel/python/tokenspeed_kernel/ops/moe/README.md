@@ -260,8 +260,8 @@ point, so its tuning gets the private runner's policies. For Kimi-K3's TP8
 experts (896 experts of 3,584 hidden and 384 intermediate, top-k 16), the
 runner restricts the 256- and 512-token buckets (129 to 512 decode rows) to
 tile 32. FlashInfer tunes on balanced routes, about nine tokens per expert at
-512 rows, where tiles 8 and 16 win. In decode a few experts take 40-50% of the
-rows, and tiles of 8 or 16 tokens re-read their weights for every tile. Over
+512 rows, where tiles 8 and 16 win. In decode a few experts take 40% to 50% of
+the rows, and tiles of 8 or 16 tokens re-read their weights for every tile. Over
 16 serving routings per size on GB300, tile 32 takes 171.5 us at 256 rows
 (tile 8: 218.5 us) and 222.9 us at 512 rows (tile 16: 249.8 us); outputs are
 bitwise identical across tiles. Prefill chunks in these buckets see the same

@@ -145,9 +145,9 @@ def _is_kimi_k3_decode_shape(
     intermediate_size: int,
     mxfp4: bool,
 ) -> bool:
-    # TP8 Kimi-K3 routed experts in the 256 and 512 token buckets (129-512
-    # decode rows). A few experts take 40-50% of the rows, so tile 32 streams
-    # their weights fewer times than the tiles tuned on balanced routes.
+    # TP8 Kimi-K3 routed experts in the 256 and 512 token buckets (129 to 512
+    # decode rows). A few experts take 40% to 50% of the rows, so tile 32
+    # streams their weights fewer times than the tiles tuned on balanced routes.
     return (
         mxfp4
         and 256 <= num_tokens <= 512
