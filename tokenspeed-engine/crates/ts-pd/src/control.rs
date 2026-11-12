@@ -102,8 +102,16 @@ pub struct RemotePrefill {
 /// A transfer whose state the replica agreed changed.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PdEvent {
-    /// The request's peers are connected.
+    /// The request may be admitted. D role: its peers are connected and,
+    /// when the prefill node allocates independently, that node holds every
+    /// page of the prompt. P role under early decode allocation: every
+    /// decode rank allocated its destination. P role under independent
+    /// decode allocation: its decode node announced it and that
+    /// destination's window has room; the destination has its own event.
     Bootstrapped(String),
+    /// P role, independent decode allocation: every decode rank allocated
+    /// the request's destination.
+    DestinationReady(String),
     /// The request's transfer failed. Its readers or writers may still be
     /// stopping: [`PdEvent::Stopped`] follows.
     Failed(String),
@@ -131,6 +139,17 @@ pub enum PdError {
 pub trait TransferPeer {
     /// Track an admitted request, before the scheduler can plan it.
     fn register(&mut self, rid: &str, bootstrap: &BootstrapInfo) -> Result<(), PdError>;
+
+    /// Whether this is a P rank under independent decode allocation, the
+    /// only peer that reads [`TransferPeer::occupy`].
+    fn allocates_independently(&self) -> bool;
+
+    /// P role, independent decode allocation: what `rid`'s prompt takes of
+    /// this engine's cache pool, both in the pool's blocks by the
+    /// scheduler's capacity model (State blocks included). The request's
+    /// destination is charged `prompt_blocks` from its admission until its
+    /// destination is allocated. Called after `register`.
+    fn occupy(&mut self, rid: &str, prompt_blocks: i64, pool_blocks: i64);
 
     /// The transfers whose state changed since the last poll, as every
     /// member of `replica` sees them: a rank reports the least advanced

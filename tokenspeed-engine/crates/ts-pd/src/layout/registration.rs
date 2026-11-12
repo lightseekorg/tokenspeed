@@ -237,6 +237,10 @@ pub struct PrefillRoute {
     pub expected_prefill_ranks: Vec<i64>,
     /// The Prefill node's attention DP size; a room picks its DP group.
     pub prefill_dp_size: i64,
+    /// The Prefill node allocates independently: a room is announced to
+    /// it, and may be admitted here only after the node's notice that the
+    /// request holds every page of its prompt there.
+    pub independent: bool,
 }
 
 /// A JSON integer, or a string holding one (Python's `int(value)`).
@@ -323,5 +327,6 @@ pub fn plan_route(
         dummy_tp_ranks: dummy,
         expected_prefill_ranks: expected,
         prefill_dp_size: dp_size,
+        independent: payload["prefill_decode_allocation_policy"] == "independent",
     })
 }

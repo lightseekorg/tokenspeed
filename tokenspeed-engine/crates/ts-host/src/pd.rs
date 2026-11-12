@@ -103,6 +103,9 @@ impl Streams {
                         outbox.arm_layerwise(&rows(forward))?;
                     }
                 }
+                if launches_forward && outbox.allocates_independently() {
+                    outbox.mark_pages_held(&plan.completed_prompts());
+                }
                 if let Some(remote_decode) = plan.remote_decode_transfer() {
                     outbox.stage_remote_decode(rows(remote_decode))?;
                 }

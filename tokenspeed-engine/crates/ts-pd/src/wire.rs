@@ -126,6 +126,35 @@ pub fn preallocation_route(frames: &[Bytes]) -> Result<(u64, String), WireError>
     Ok((room, cache_id))
 }
 
+/// A Decode rank holds `room`'s request: its cache is the request's
+/// destination. Sent to a Prefill node that allocates independently, which
+/// answers with the room's status (`Bootstrapped`, or `Failed`) once the
+/// request holds every page of its prompt there. A Prefill rank that does
+/// not know the message drops it as a malformed pre-allocation.
+pub fn announce_frames(room: u64, cache_id: &str) -> Vec<Bytes> {
+    vec![
+        Bytes::from_static(b"Announce"),
+        ascii(room),
+        ascii(cache_id),
+    ]
+}
+
+pub fn is_announce(frames: &[Bytes]) -> bool {
+    frames
+        .first()
+        .is_some_and(|frame| frame.as_ref() == b"Announce")
+}
+
+/// An announcement's room and cache identity, framed as a cancellation's.
+pub fn announce_route(frames: &[Bytes]) -> Result<(u64, String), WireError> {
+    if frames.len() != 3 || !is_announce(frames) {
+        return Err(error("CachePD announcement requires exactly 3 frames"));
+    }
+    let mut request = frames.to_vec();
+    request[0] = Bytes::from_static(b"Cancel");
+    cancellation_route(&request)
+}
+
 /// Explicit cancellation is distinct from a failure report: only its ACK
 /// proves that this Prefill rank can no longer write the room's pages.
 pub fn cancellation_frames(room: u64, cache_id: &str) -> Vec<Bytes> {
