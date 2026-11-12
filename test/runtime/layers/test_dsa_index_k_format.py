@@ -138,11 +138,6 @@ def test_the_configure_attention_hook_names_the_plane():
     # The in-tree hook keeps the FP8-with-scale plane; a plugin hook that
     # scores the checkpoint's bf16 keys overrides it after.
     assert model_config.index_k_format == "fp8_scaled"
-    # A format the model's hook does not take is refused, not ignored.
-    with pytest.raises(ValueError, match="mxfp4"):
-        configure_dsa_attention(
-            model_config, ServerArgs(model="x", dsa_index_k_format="mxfp4")
-        )
     configure_kimi_k31_attention(
         model_config, ServerArgs(model="x", dsa_index_k_format="mxfp4")
     )
@@ -155,6 +150,30 @@ def test_the_configure_attention_hook_names_the_plane():
     # A hook that named no plane is a construction error, not a fallback.
     with pytest.raises(ValueError, match="index_k_format"):
         _dsa_spec(None)
+
+
+@pytest.mark.parametrize(
+    "architecture",
+    ["GlmMoeDsaForCausalLM", "DeepseekV41ForCausalLM", "LlamaForCausalLM"],
+)
+def test_only_kimi_k31_takes_an_index_k_format(architecture):
+    from types import SimpleNamespace
+
+    from tokenspeed.runtime.configs.model_config import (
+        _resolve_attention_family,
+        refuse_untaken_index_k_format,
+    )
+
+    def check(arch, server_args):
+        config = SimpleNamespace(architectures=[arch])
+        family = _resolve_attention_family(config, config)
+        refuse_untaken_index_k_format(family, arch, server_args)
+
+    explicit = ServerArgs(model="x", dsa_index_k_format="fp8_scaled")
+    check("KimiK31ForConditionalGeneration", explicit)
+    check(architecture, ServerArgs(model="x"))
+    with pytest.raises(ValueError, match=f"only to Kimi-K3.1, not {architecture}"):
+        check(architecture, explicit)
 
 
 def test_bf16_plane_costs_its_own_rows():
