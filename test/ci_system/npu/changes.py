@@ -26,6 +26,7 @@ import argparse
 import json
 import re
 import subprocess
+import sys
 from fnmatch import fnmatchcase
 from pathlib import Path
 
@@ -124,6 +125,8 @@ def changed_paths(repository, event_name, event, api=github_json):
         if type(number) is not int or number <= 0:
             raise ValueError("Invalid pull request number")
         current = api(f"/repos/{repository}/pulls/{number}", paginate=False)
+        for ref in ("head", "base"):
+            print(f"NPU diagnostic {ref}: event={pr[ref]['sha'][:12]} API={current[ref]['sha'][:12]}", file=sys.stderr)
         if any(current[ref]["sha"] != pr[ref]["sha"] for ref in ("head", "base")):
             raise ValueError("Pull request identity changed since this event")
         count = current["changed_files"]
