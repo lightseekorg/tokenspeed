@@ -89,6 +89,7 @@ from tokenspeed_kernel.ops.gemm import (
 )
 from tokenspeed_kernel.ops.moe import (
     kimi3_sigmoid_bias_topk_sorted,
+    kimi3_sorted_routing_fuses_shared_down,
     kimi3_sorted_routing_scratch,
     latent_moe_decode_pipeline_available,
     latent_moe_input_projections,
@@ -2712,6 +2713,7 @@ class KimiLinearMoE(nn.Module):
         shared_out: torch.Tensor | None = None,
         *,
         rows_replicated: bool = False,
+        defer_shared_down: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
         """Project the router, routed latent, and shared partial in one pass.
 
@@ -2724,6 +2726,8 @@ class KimiLinearMoE(nn.Module):
         ``rows_replicated`` states that every rank of the MoE group holds these
         same rows, so the Iris state may project each rank's share of the
         replicated router and routed columns and gather them.
+        With ``defer_shared_down``, the third output is the shared experts'
+        activated input instead of its down projection, which the caller owns.
         """
         self.experts._situ_input_fp8 = None
         if (
@@ -2763,6 +2767,8 @@ class KimiLinearMoE(nn.Module):
                 gate_clamp=self.shared_experts.act_fn.beta,
                 up_clamp=self.shared_experts.act_fn.linear_beta,
             )
+        if defer_shared_down:
+            return router_logits, routed_input, shared_input
         # The shared experts hold reduce_results=False, so this partial is
         # reduced by the layer's shared or joint reducer, not here.
         shared_output = kimi3_shared_down_projection(
@@ -3151,12 +3157,14 @@ class KimiLinearMoE(nn.Module):
                 and self.mapping.moe.ep_size == 1
                 and self.mapping.attn.tp_group == self.mapping.moe.tp_ep_group
             ),
+            defer_shared_down=True,
         )
+        shared_input = shared_partial = None
         if fused_inputs is not None:
-            router_logits, routed_in, shared_partial = fused_inputs
+            router_logits, routed_in, shared_input = fused_inputs
         else:
             router_logits = self.gate(hidden_states)
-            routed_in = shared_partial = None
+            routed_in = None
 
         self.experts._situ_sorted_routes = None
         rows = router_logits.shape[0]
@@ -3169,6 +3177,21 @@ class KimiLinearMoE(nn.Module):
             and router_logits.dtype == torch.float32
             and router_logits.is_contiguous()
         )
+        shared_down = None
+        if shared_input is not None:
+            down_weight = self.shared_experts.down_proj.weight
+            if fused_routing and kimi3_sorted_routing_fuses_shared_down(
+                shared_input, down_weight, shared_out
+            ):
+                # The routing launch carries the shared down projection, which
+                # reads neither the logits nor the routes.
+                shared_down = (shared_input, down_weight, shared_out)
+            else:
+                # The shared experts hold reduce_results=False, so this partial
+                # is reduced by the layer's shared or joint reducer, not here.
+                shared_partial = kimi3_shared_down_projection(
+                    shared_input, down_weight, out=shared_out
+                )
         # Warm the auxiliary stream serially before capture enables overlap.
         with self.stream_fork.scope(
             enable=get_is_cuda_graph_phase() and MOE_ROUTING_STREAM_FORK,
@@ -3188,8 +3211,11 @@ class KimiLinearMoE(nn.Module):
                             normalize_topk_weights=self.config.moe_renormalize,
                             block_size=16,
                             scratch=self._fused_routing_scratch,
+                            shared_down=shared_down,
                         )
                     )
+                    if shared_down is not None:
+                        *sorted_routes, shared_partial = sorted_routes
                     topk_output = StandardTopKOutput(
                         topk_weights, topk_ids, router_logits
                     )
