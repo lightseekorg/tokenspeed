@@ -1288,15 +1288,10 @@ def ex1_finish(
                 stride_snb,
             )
             _ex1_slot(mb, task, a, tiles, union, expert)
-        # One row: one slot a lane (8 picks over 8 lanes). Each slot's loads
-        # go out before the previous slot's product; the loop never runs, yet
-        # this form schedules faster than one without it (a backend schedule
-        # effect).
     else:
         # Each slot's loads go out before the previous slot's product. With
         # one row the loop never runs; it stays there too, since the backend
-        # schedules the slot's code around it better than without it. Past
-        # one row it fits the registers since the slots' ids sit a lane each.
+        # schedules the slot's code around it better than without it.
         following = _slot_expert(union, lane + LANES)
         more = ex1_issue(
             task,
