@@ -1503,6 +1503,51 @@ def _score_candidate_chunk(
 
 
 @gluon.jit
+def _add_i32(a, b):
+    return a + b
+
+
+@gluon.jit
+def _decode_balanced_run(
+    row_ends,
+    requests,
+    q_len_per_req,
+    num_candidates,
+    work_target,
+    CHUNK_N: gl.constexpr,
+    ROWS: gl.constexpr,
+    BATCH_PAD: gl.constexpr,
+):
+    """This program's request, run of chunks and run length in keys when every
+    request's span is cut into runs of one batch-wide chunk count, about
+    ``work_target`` runs over the batch: a long request takes more programs
+    rather than longer ones. Programs past the last run get a request past
+    the batch."""
+    # Requests across one warp's lanes, every warp a copy: no reduction here
+    # leaves the warp.
+    num_warps: gl.constexpr = gl.num_warps()
+    layout: gl.constexpr = gl.BlockedLayout([1, ROWS], [64, 1], [1, num_warps], [1, 0])
+    request = gl.arange(0, BATCH_PAD, layout=gl.SliceLayout(1, layout))
+    row = gl.arange(0, ROWS, layout=gl.SliceLayout(0, layout))
+    ends = gl.load(
+        row_ends + request[:, None] * q_len_per_req + row[None, :],
+        (request[:, None] < requests) & (row[None, :] < q_len_per_req),
+        other=0,
+    )
+    ends = gl.minimum(gl.maximum(ends, 0), num_candidates)
+    lanes: gl.constexpr = gl.BlockedLayout([1], [64], [num_warps], [0])
+    chunks = gl.convert_layout(gl.cdiv(gl.max(ends, 1), CHUNK_N), lanes)
+    per = gl.maximum(gl.cdiv(gl.sum(chunks, 0), work_target), 1)
+    counts = gl.cdiv(chunks, per)
+    last = gl.associative_scan(counts, 0, _add_i32)
+    item = gl.program_id(1) * gl.num_programs(0) + gl.program_id(0)
+    owner = gl.sum((last <= item).to(gl.int32), 0)
+    mine = gl.arange(0, BATCH_PAD, layout=lanes)
+    first = gl.sum(gl.where(mine == owner, last - counts, 0), 0)
+    return owner, item - first, per * CHUNK_N
+
+
+@gluon.jit
 def _multi_row_index_k_scores_body(
     q,
     q_scales,
@@ -1547,8 +1592,12 @@ def _multi_row_index_k_scores_body(
     EXPLICIT_ROW_LENS: gl.constexpr = False,
     NONFINITE_TO_NEG_INF: gl.constexpr = False,
     ROW_RUNS: gl.constexpr = False,
+    work_target=0,
+    BATCH_PAD: gl.constexpr = 0,
 ):
     # Program (i, j): rows i on chunk j; positive key scales apply after the head sum.
+    # BATCH_PAD (decode rows with explicit lengths): programs take the runs of
+    # _decode_balanced_run in order, j * grid[0] + i, instead.
     # Q_FORMAT is "bf16"; "fp8_e4m3" with one FP32 q_scales per (row, head);
     # or "mxfp4", E2M1 codes with HEAD_DIM / 32 UE8M0 scales per (row, head)
     # as one int32 q_scales word, scoring mxfp4 pages.
@@ -1589,11 +1638,28 @@ def _multi_row_index_k_scores_body(
     local_rows = gl.arange(0, ROWS, layout=row_layout)
     m_local = gl.arange(0, ROWS * 32, layout=m_layout) // 32
     if IS_DECODE:
-        request_id = row_block
+        if BATCH_PAD:
+            tl.static_assert(EXPLICIT_ROW_LENS)
+            requests = num_rows // q_len_per_req
+            request_id, split, run = _decode_balanced_run(
+                row_ends,
+                requests,
+                q_len_per_req,
+                num_candidates,
+                work_target,
+                CHUNK_N,
+                ROWS,
+                BATCH_PAD,
+            )
+        else:
+            request_id = row_block
         rows = request_id * q_len_per_req + local_rows
         row_valid = local_rows < q_len_per_req
         m_rows = request_id * q_len_per_req + m_local
         m_valid = m_local < q_len_per_req
+        if BATCH_PAD:
+            row_valid = row_valid & (request_id < requests)
+            m_valid = m_valid & (request_id < requests)
         if EXPLICIT_ROW_LENS:
             # Compact owned contexts do not grow on a rank when the newly
             # appended token belongs to another rank. Preserve every row's
@@ -1636,7 +1702,9 @@ def _multi_row_index_k_scores_body(
     ends = gl.where(row_valid, ends, 0)
     starts = gl.where(row_valid, starts, num_candidates)
     span_end = gl.max(ends, axis=0)
-    if CHUNK_LOOP:
+    if BATCH_PAD:
+        tl.static_assert(IS_DECODE)
+    elif CHUNK_LOOP:
         # Program j scans chunk run j, so the grid tracks the GPU, not max-model-len.
         run = tl.cdiv(tl.cdiv(span_end, CHUNK_N), gl.num_programs(1)) * CHUNK_N
     else:
@@ -2262,6 +2330,7 @@ def gluon_dsa_owned_prefill_topk_fp8_rows_gfx950(
         "q_len_per_req",
         "block_table_stride",
         "logits_stride",
+        "work_target",
     ),
     do_not_specialize_on_alignment=("seq_lens", "block_table", "explicit_row_lens"),
 )
@@ -2303,6 +2372,8 @@ def gluon_dsa_decode_topk_fp8_rows_gfx950(
     CHUNK_LOOP: gl.constexpr,
     explicit_row_lens=None,
     NONFINITE_TO_NEG_INF: gl.constexpr = False,
+    work_target=0,
+    BATCH_PAD: gl.constexpr = 0,
 ):
     """Decode scorer over a scaled (fp8_scaled or mxfp4) paged plane.
 
@@ -2310,7 +2381,9 @@ def gluon_dsa_decode_topk_fp8_rows_gfx950(
     are ``PAGE_STRIDE_BYTES`` apart, each its FP8 rows then their fp32
     scales. With ``CHUNK_LOOP`` the grid may have fewer programs per request
     than chunks: program ``(i, j)`` then scores the ``j``-th equal run of the
-    chunks request ``i``'s rows fill.
+    chunks request ``i``'s rows fill. With ``BATCH_PAD`` (at least the
+    request count, ``explicit_row_lens`` given) the runs are one length over
+    the batch, about ``work_target`` of them, taken in program order.
 
     ``Q_FORMAT`` is ``"fp8_e4m3"`` (FP32 ``q_scales[row, head]``, keys
     multiplied as E4M3), ``"mxfp4"`` (E2M1 ``q`` code bytes and one int32
@@ -2362,4 +2435,6 @@ def gluon_dsa_decode_topk_fp8_rows_gfx950(
         CHUNK_LOOP,
         explicit_row_lens is not None,
         NONFINITE_TO_NEG_INF,
+        work_target=work_target,
+        BATCH_PAD=BATCH_PAD,
     )

@@ -37,6 +37,7 @@ from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (
     _ROWS_Q_FORMATS,
     _check_fp8_rows_scorer_inputs,
     _check_standard_decode_metadata,
+    _device_compute_units,
     _fp8_rows_buffer_load,
     _fp8_rows_decode_shape,
     _fp8_rows_decode_splits,
@@ -50,6 +51,10 @@ from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.standard_cache_logits import
 
 # Below this many rows a launch is decode-sized; the one-row scorer keeps it.
 _PREFILL_MIN_ROWS = 64
+# Decode groups of 3 to 64 requests split their spans into runs of one length
+# over the batch, as the longest context is often several times the mean.
+_BALANCE_MIN_REQUESTS = 3
+_BALANCE_MAX_REQUESTS = 64
 
 
 def _scores_prefill_rows(rows: int, requests: int | None, heads: int) -> bool:
@@ -214,7 +219,18 @@ def launch_gluon_dsa_index_candidates_gfx950(
     )
     chunks = triton.cdiv(width, _BF16_DECODE_CHUNK_N)
     splits = _fp8_rows_decode_splits(requests, chunks, waves, q.device)
-    gluon_dsa_decode_topk_fp8_rows_gfx950[(requests, splits)](
+    grid, work_target, batch_pad = (requests, splits), 0, 0
+    if splits < chunks and _BALANCE_MIN_REQUESTS <= requests <= _BALANCE_MAX_REQUESTS:
+        # About one run per resident program, each program working out its
+        # run; rounding up each request's last run adds at most one run per
+        # request. One binary serves each bucket of request counts.
+        device_index = q.device.index
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+        work_target = _device_compute_units(device_index) * waves
+        grid = (requests, triton.cdiv(work_target, requests) + 1)
+        batch_pad = 16 if requests <= 16 else _BALANCE_MAX_REQUESTS
+    gluon_dsa_decode_topk_fp8_rows_gfx950[grid](
         q,
         q_scales,
         *_scaled_index_k_views(index_k_cache, index_k_format),
@@ -252,6 +268,8 @@ def launch_gluon_dsa_index_candidates_gfx950(
         CHUNK_LOOP=splits < chunks,
         explicit_row_lens=lengths,
         NONFINITE_TO_NEG_INF=True,
+        work_target=work_target,
+        BATCH_PAD=batch_pad,
         num_warps=_BF16_DECODE_NUM_WARPS,
         waves_per_eu=waves,
     )
