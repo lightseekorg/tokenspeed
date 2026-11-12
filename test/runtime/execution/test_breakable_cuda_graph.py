@@ -974,14 +974,28 @@ class TestPoolReuseAcrossCaptures:
             cap.replay()
         torch.cuda.synchronize()
 
-    def test_tensor_bundle_break_args_reuse_pool(self):
+    @pytest.mark.parametrize("bundle", ["tensors", "tensors_and_scalar"])
+    def test_tensor_bundle_break_args_reuse_pool(self, bundle):
         """A frozen dataclass of segment outputs passed to a break (MLA's
-        prologue output) must not pin its tensors, exactly like a bare tensor
-        arg: otherwise every capture keeps its own copy of each layer's
-        bundle and pool memory grows with the sum of the buckets."""
+        prologue output, or KDA's output norm with its float epsilon) must not
+        pin its tensors, exactly like a bare tensor arg: otherwise every capture
+        keeps its own copy of each layer's bundle and pool memory grows with the
+        sum of the buckets."""
         from tokenspeed_kernel.ops.attention.prologue import MLAPrologueOutput
 
         from tokenspeed.runtime.execution.breakable_cuda_graph import weak_ref_tensor
+
+        @dataclasses.dataclass(frozen=True)
+        class ScaledKey:
+            query: torch.Tensor
+            key: torch.Tensor
+            scale: float
+
+        def make(q):
+            if bundle == "tensors":
+                return MLAPrologueOutput(query=q, key=q * 2.0, value=None)
+            # The scalar is frozen at capture, like a loose scalar arg.
+            return ScaledKey(query=q, key=q, scale=2.0)
 
         probe = torch.empty(1, device="cuda")
         if weak_ref_tensor(probe) is probe:
@@ -997,7 +1011,10 @@ class TestPoolReuseAcrossCaptures:
         class Attention:
             @break_point
             def forward(self, x, ctx, *, expanded):
-                return torch.relu(expanded.query) + expanded.key
+                key = expanded.key
+                if bundle == "tensors_and_scalar":
+                    key = key * expanded.scale
+                return torch.relu(expanded.query) + key
 
         attn = Attention()
 
@@ -1005,8 +1022,7 @@ class TestPoolReuseAcrossCaptures:
             x = xbuf[:n]
             for _ in range(depth):
                 q = x @ w1
-                expanded = MLAPrologueOutput(query=q, key=q * 2.0, value=None)
-                x = attn.forward(x, None, expanded=expanded) @ w2
+                x = attn.forward(x, None, expanded=make(q)) @ w2
             return outbuf[:n].copy_(x)
 
         def eager(x):
