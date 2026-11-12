@@ -73,7 +73,6 @@ class AscendDSAPrefill:
             or tuple(dist.get_process_group_ranks(history_group)) != tuple(ranks)
         ):
             raise ValueError("Prefill collective group must match cache owners")
-        self._last_stream = None
         self.history_group = history_group
         self.layer_id = None
         self.batch_key = None
@@ -103,16 +102,6 @@ class AscendDSAPrefill:
             ):
                 raise ValueError("Prefill needs matching contiguous BF16 cache planes")
 
-    def _stream(self):
-        """Remember the caller stream for close; the caller owns ordering.
-
-        TS runs serving forwards on its execution stream and synchronizes
-        startup warmup before serving. No stream identity check is needed.
-        """
-        stream = torch.npu.current_stream(self.device)
-        self._last_stream = stream
-        return stream
-
     @property
     def workspace_bytes(self):
         return sum(
@@ -140,7 +129,7 @@ class AscendDSAPrefill:
                 )
         # HCCL's synchronous interface establishes execution-stream ordering.
         # Keep allocator ownership valid even for inputs from another stream.
-        stream = self._stream()
+        stream = torch.npu.current_stream(self.device)
         packet.record_stream(stream)
         receive.record_stream(stream)
         return receive
@@ -182,7 +171,7 @@ class AscendDSAPrefill:
             or not 0 <= total_rows <= self.max_current_rows
         ):
             raise ValueError("Prefill requires matching batch page-gather geometry")
-        stream = self._stream()
+        stream = torch.npu.current_stream(self.device)
         self.layer_id, self.batch_key = layer_id, batch_key
         self._sources = (kv_cache, index_cache)
         self._meta = {"history_slots": history_slots}
@@ -250,7 +239,7 @@ class AscendDSAPrefill:
             raise ValueError(
                 "Current Prefill planes must match local token rows exactly once"
             )
-        value.record_stream(self._stream())
+        value.record_stream(torch.npu.current_stream(self.device))
         self._current[width] = value
         if len(self._current) != (2 if self._has_index else 1):
             return
@@ -325,7 +314,7 @@ class AscendDSAPrefill:
             or self.local_rows % block_rows
         ):
             raise ValueError("Prefill update has incompatible slots or layout")
-        stream = self._stream()
+        stream = torch.npu.current_stream(self.device)
         committed = slots_workspace[: slots.numel()]
         committed.copy_(slots)
         for value in (slots, committed, direct, mapped_slots):
@@ -359,7 +348,7 @@ class AscendDSAPrefill:
         """Release temporary buffers after queueing their last consumers."""
         if self.layer_id != layer_id:
             raise RuntimeError("Prefill completion differs from its active layer")
-        stream = self._stream()
+        stream = torch.npu.current_stream(self.device)
         for value in (self.kv, self.index, *self._current.values()):
             if value is not None:
                 value.record_stream(stream)
@@ -369,12 +358,9 @@ class AscendDSAPrefill:
         self._meta.clear()
 
     def close(self):
-        """Drain execution; the runtime manager owns the collective group."""
+        """Release references; cache and collective owners manage completion."""
         if self._closed:
             return
-        if self._last_stream is not None:
-            self._last_stream.synchronize()
-        self._last_stream = None
         self.history_group = None
         self.kv = self.index = self._sources = self.batch_key = self.layer_id = None
         self._current.clear()

@@ -345,11 +345,11 @@ def test_ordered_stream_handoffs_keep_exact_bytes(
         previous = stream
     assert not next_stream.synchronized
     runtime.close()
-    assert next_stream.synchronized
+    assert not next_stream.synchronized
 
 
 @pytest.mark.parametrize("has_index", [False, True])
-def test_close_drains_active_prefill(transport_class, monkeypatch, has_index):
+def test_close_releases_active_prefill(transport_class, monkeypatch, has_index):
     cls, _ = transport_class
     monkeypatch.setattr(dist, "get_rank", lambda: 0)
     cache = payload(256, 576, 7)
@@ -363,19 +363,19 @@ def test_close_drains_active_prefill(transport_class, monkeypatch, has_index):
         history_null_rows=128,
     )
     stream = torch.npu.stream
-    runtime.prefetch(
-        1,
-        cache,
-        index,
+    options = dict(
         batch_key=object(),
         total_rows=1,
         has_history=False,
         history_slots=torch.empty(0, dtype=torch.int64),
         history_counts=(0,),
     )
+    runtime.prefetch(1, cache, index, **options)
     assert runtime.workspace_bytes > 0
     assert not stream.synchronized
     runtime.close()
-    assert stream.synchronized
+    assert not stream.synchronized
     assert runtime.workspace_bytes == 0
     runtime.close()
+    with pytest.raises(RuntimeError, match="transport is closed"):
+        runtime.prefetch(1, cache, index, **options)

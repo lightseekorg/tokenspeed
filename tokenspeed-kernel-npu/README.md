@@ -173,7 +173,8 @@ at KDA; the attention entry ensures it was submitted once for the same batch
 and layer. Concurrent consumption by another batch/layer is rejected. Tensor
 references and `record_stream` preserve storage through HCCL, unpacking,
 patching and attention. `finish` releases references after the final queued
-consumer. Shutdown drains execution before releasing the group. The transport
+consumer. `close` clears references without synchronizing or destroying the
+manager-owned collective group. The transport
 records its peak owned buffer bytes; serving acceptance also measures device
 allocation/reservation peaks. `chunk_prefill_kv_size` only controls scheduler
 admission and never enables transport or fixes its buffer size.
@@ -190,10 +191,13 @@ its persistent `execution_stream` context, and `ModelExecutor.autotune()`
 synchronizes the device before serving starts. Warmup may therefore use a
 different stream even when the same transport survives startup. The transport
 does not bind or compare stream identities and needs no warmup phase flag.
-It remembers only the last caller stream so `close()` can drain execution,
-including after `finish()`. A caller handing work to another stream must
-establish the required dependencies before reusing cache or temporary storage;
-concurrent use of one transport is unsupported.
+It stores no caller stream. `close()` only clears transport references;
+the owners of the cache arena and process groups manage completion before
+replacing or destroying those resources. The production close calls come
+from cache-pool publication: the first bind has no old transport, and a
+startup rebind follows warmup synchronization. A caller handing work to
+another stream must establish the required dependencies before reusing cache
+or temporary storage; concurrent use of one transport is unsupported.
 
 Run `test/test_mla_cp_transport.py` with `torchrun` and an explicit `TEST_OUTPUT`
 directory. It covers compact shared history pages, empty/uneven owners, both
