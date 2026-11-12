@@ -26,7 +26,8 @@ logits and records q over its own columns
 (``DraftProposalSampler.propose_vocab_shard``). One GPU plays every rank: the
 ranks' gather of the draft partials is answered by reducing the other ranks'
 shards in-process, as ``test_sonic_vocab_shard.py`` answers the candidate
-gather.
+gather. A hot-token head samples its gathered logits and each rank records
+its own columns of q (``DraftProposalSampler.propose``).
 """
 
 from __future__ import annotations
@@ -96,9 +97,13 @@ def _pools() -> SpeculativeSamplingPools:
 
 
 def _sampler(
-    pools: SpeculativeSamplingPools, slots: torch.Tensor, columns: int | None
+    pools: SpeculativeSamplingPools,
+    slots: torch.Tensor,
+    columns: int | None,
+    vocab_map: torch.Tensor | None = None,
+    vocab_start: int = 0,
 ) -> tuple[DraftProposalSampler, RuntimeStates]:
-    """A drafter's sampler over a table of whole rows, or of ``columns`` per rank, serving ``slots``."""
+    """A drafter's sampler over a table of whole rows, or of ``columns`` per rank from ``vocab_start``, serving ``slots``."""
     states = RuntimeStates(
         req_pool_size=POOL,
         input_vocab_size=VOCAB,
@@ -106,7 +111,12 @@ def _sampler(
         output_length=N,
         device="cuda",
     )
-    states.init_draft_probs(spec_num_tokens=N, reject_threshold=2.0, columns=columns)
+    states.init_draft_probs(
+        spec_num_tokens=N,
+        reject_threshold=2.0,
+        columns=columns,
+        vocab_start=vocab_start,
+    )
     states.valid_cache_lengths.copy_(torch.arange(POOL + 1, dtype=torch.int32) * 37)
     buffers = InputBuffers(
         max_bs=MAX_BS,
@@ -121,7 +131,7 @@ def _sampler(
         runtime_states=states,
         input_buffers=buffers,
         spec_num_tokens=N,
-        vocab_map=None,
+        vocab_map=vocab_map,
         device="cuda",
     )
     return sampler, states
@@ -165,6 +175,14 @@ def _shard(logits: torch.Tensor, rank: int) -> SampledVocabShard:
     )
 
 
+def _untouched(states: RuntimeStates, slots: torch.Tensor) -> bool:
+    """Whether every step and slot but the recorded ones keeps the sentinel."""
+    untouched = torch.ones(POOL + 1, N, dtype=torch.bool, device="cuda")
+    untouched[slots, STEP] = False
+    untouched[:, -1] = False
+    return bool((states.draft_probs[untouched] == states.draft_probs_sentinel).all())
+
+
 def test_each_rank_draws_the_whole_row_token_and_records_its_columns(monkeypatch):
     torch.manual_seed(11)
     slots = torch.tensor([1, 2, 3, 4, 5, 7], dtype=torch.int64, device="cuda")
@@ -190,14 +208,38 @@ def test_each_rank_draws_the_whole_row_token_and_records_its_columns(monkeypatch
             rtol=2e-4,
             atol=1e-7,
         )
-        # Other steps and slots keep the sentinel.
-        untouched = torch.ones(POOL + 1, N, dtype=torch.bool, device="cuda")
-        untouched[slots, STEP] = False
-        untouched[:, -1] = False
-        assert bool(
-            (states.draft_probs[untouched] == states.draft_probs_sentinel).all()
-        )
+        assert _untouched(states, slots), rank
     assert int(expected[2]) == 2 * COLUMNS + 99
+
+
+def test_a_hot_token_head_draws_what_whole_rows_draw_and_records_its_columns():
+    torch.manual_seed(13)
+    slots = torch.tensor([1, 2, 3, 4, 5, 7], dtype=torch.int64, device="cuda")
+    pools = _pools()
+    # Hot tokens in the first three shards only, so the last rank records zeros.
+    hot = torch.sort(torch.randperm(3 * COLUMNS, device="cuda")[:5000]).values
+    logits = (torch.randn(slots.numel(), hot.numel(), device="cuda") * 3).bfloat16()
+    # The greedy request's one clear maximum.
+    logits[2, 77] = 40.0
+    whole, whole_states = _sampler(pools, slots, None, vocab_map=hot)
+    expected = whole.propose(logits, step=STEP).clone()
+    expected_q = whole_states.draft_probs[:, STEP]
+
+    for rank in range(RANKS):
+        sampler, states = _sampler(
+            pools, slots, COLUMNS, vocab_map=hot, vocab_start=rank * COLUMNS
+        )
+
+        tokens = sampler.propose(logits, step=STEP)
+
+        assert torch.equal(tokens, expected), rank
+        columns = slice(rank * COLUMNS, (rank + 1) * COLUMNS)
+        assert torch.equal(
+            states.draft_probs[slots, STEP], expected_q[slots, columns]
+        ), rank
+        assert _untouched(states, slots), rank
+    assert int(expected[2]) == 77
+    assert not bool(expected_q[slots, 3 * COLUMNS :].any())
 
 
 def test_a_shard_table_takes_proposals_from_shards_only():

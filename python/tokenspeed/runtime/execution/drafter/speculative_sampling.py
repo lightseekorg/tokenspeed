@@ -44,7 +44,10 @@ rows stay sharded and the verifier reads q per shard), the draft head hands
 over its shard instead of gathered logits (``propose_vocab_shard``): each
 rank reduces its shard to a few partials, the ranks gather those, and every
 rank draws the token the whole row would draw (the Gumbel noise is keyed by
-global token id) and records q over its own columns.
+global token id) and records q over its own columns. A hot-token head (Eagle3
+``d2t``) samples its gathered logits as with whole rows, since its columns do
+not line up with the target's shards, and each rank records only the columns
+of its tokens that fall in the rank's shard.
 """
 
 from __future__ import annotations
@@ -91,13 +94,14 @@ class DraftProposalSampler:
         Args:
             pools: The verifier's pool-indexed temperature / top-k / seed.
             runtime_states: Owner of ``draft_probs`` (must be allocated; over
-                whole-vocabulary rows or this rank's vocabulary columns) and
-                ``valid_cache_lengths``.
+                whole-vocabulary rows or this rank's vocabulary columns, from
+                ``draft_probs_vocab_start``) and ``valid_cache_lengths``.
             input_buffers: The executor's batch-ordered pool index buffers.
             spec_num_tokens: Verify chain width N; steps ``0..N-2`` record.
             vocab_map: ``[V_draft]`` full-vocab id of each draft logit column
                 (Eagle3 hot tokens), or None when the draft vocab is the
-                target's. Bound once: the recorded rows scatter through it.
+                target's. Bound once: the recorded rows scatter through it,
+                keeping only this rank's columns of a shard table.
             device: Where the scratch lives.
         """
         if runtime_states.draft_probs is None:
@@ -123,24 +127,23 @@ class DraftProposalSampler:
             (max_bs,), dtype=torch.int32, device=device
         )
         self._gumbel_out = torch.empty((max_bs,), dtype=torch.int32, device=device)
-        # Shard scratch when the table holds this rank's columns of q, else the whole-row scratch; the other stays None.
+        # Shard scratch when the draft head samples this rank's columns of q, else the whole-row scratch; the other stays None.
         self._shard_ranks: int | None = None
         self._shard_stats: torch.Tensor | None = None
         self._shard_landing: torch.Tensor | None = None
         self._gumbel_local_ids: torch.Tensor | None = None
         self._gumbel_local_scores: torch.Tensor | None = None
-        # Hot-token heads: q over the draft vocab is scattered into a
-        # full-vocab row before it is recorded. The scatter only ever writes
-        # the mapped columns, so the others stay zero from allocation.
+        # Hot-token heads scatter q into a full-vocab row, or this rank's columns of one; unmapped columns stay zero from allocation.
         self._vocab_map: torch.Tensor | None = None
+        self._vocab_select: torch.Tensor | None = None
         self._full_q: torch.Tensor | None = None
-        if vocab_size != runtime_states.vocab_size:
-            if vocab_map is not None or runtime_states.vocab_size % vocab_size:
-                raise ValueError(
-                    f"draft_probs over {vocab_size} of {runtime_states.vocab_size} "
-                    "columns must be one of equal vocabulary shards of a draft head "
-                    "spanning the target vocabulary"
-                )
+        shard_table = vocab_size != runtime_states.vocab_size
+        if shard_table and runtime_states.vocab_size % vocab_size:
+            raise ValueError(
+                f"draft_probs over {vocab_size} of {runtime_states.vocab_size} "
+                "columns must be one of equal vocabulary shards"
+            )
+        if shard_table and vocab_map is None:
             self._shard_ranks = runtime_states.vocab_size // vocab_size
             width = vocab_shard_draft_stats_width(vocab_size)
             self._shard_stats = torch.empty(
@@ -163,12 +166,23 @@ class DraftProposalSampler:
                 scratch_shape, dtype=torch.float32, device=device
             )
             if vocab_map is not None:
-                if vocab_map.ndim != 1 or vocab_map.shape[0] > vocab_size:
+                if (
+                    vocab_map.ndim != 1
+                    or vocab_map.shape[0] > runtime_states.vocab_size
+                ):
                     raise ValueError(
-                        f"vocab_map must be a [V_draft <= {vocab_size}] vector, got "
-                        f"{tuple(vocab_map.shape)}"
+                        f"vocab_map must be a [V_draft <= {runtime_states.vocab_size}] "
+                        f"vector, got {tuple(vocab_map.shape)}"
                     )
                 self._vocab_map = vocab_map.to(device=device, dtype=torch.int64)
+                if shard_table:
+                    # This rank's columns: the draft columns whose tokens fall in its shard.
+                    start = runtime_states.draft_probs_vocab_start
+                    mine = (self._vocab_map >= start) & (
+                        self._vocab_map < start + vocab_size
+                    )
+                    self._vocab_select = mine.nonzero().view(-1)
+                    self._vocab_map = self._vocab_map[mine] - start
                 self._full_q = torch.zeros(
                     (max_bs, vocab_size), dtype=torch.float32, device=device
                 )
@@ -260,6 +274,8 @@ class DraftProposalSampler:
         if self._vocab_map is not None:
             assert self._full_q is not None
             full = self._full_q[:bs]
+            if self._vocab_select is not None:
+                q = q.index_select(1, self._vocab_select)
             full.index_copy_(1, self._vocab_map, q)
             q = full
         # Padding rows resolve to the reserved last slot, which verify never
@@ -292,8 +308,9 @@ class DraftProposalSampler:
         self._check_step(step)
         if self._shard_ranks is None or shard.tp_size != self._shard_ranks:
             raise RuntimeError(
-                f"draft_probs hold whole rows or another shard count than the "
-                f"head's {shard.tp_size}: propose from gathered logits instead"
+                f"draft_probs hold whole rows, a hot-token head's columns or another "
+                f"shard count than the head's {shard.tp_size}: propose from gathered "
+                "logits instead"
             )
         logits = shard.logits
         bs = logits.shape[0]
