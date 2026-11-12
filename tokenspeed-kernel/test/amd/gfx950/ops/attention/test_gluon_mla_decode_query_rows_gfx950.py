@@ -125,7 +125,7 @@ def test_matches_fp32_softmax(lengths, heads, q_dtype, kv_dtype):
 
 
 @pytest.mark.parametrize("q_dtype", [torch.bfloat16, _FP8])
-@pytest.mark.parametrize("splits", [1, 3, 7, 32])
+@pytest.mark.parametrize("splits", [1, 3, 7, 32, 128])
 def test_every_split_count_merges_alike(splits, q_dtype, monkeypatch):
     q, kv, table, row_lengths = _inputs([[9000, 9001], [70, 4000]], 96, q_dtype, seed=3)
     ref_out, ref_lse = _reference(q, kv, table, row_lengths)
@@ -178,9 +178,12 @@ def test_matches_the_folded_decode(q_dtype):
 def test_split_count_fills_whole_waves():
     select = decode._select_num_kv_splits_query_rows
     assert select(batch=16, row_tiles=6, max_seqlen_k=_MAX_K) == 8
-    assert select(batch=1, row_tiles=6, max_seqlen_k=_MAX_K) == 32
     assert select(batch=16, row_tiles=6, max_seqlen_k=1024) == 2
     assert select(batch=64, row_tiles=6, max_seqlen_k=_MAX_K) == 2
+    # A few requests split up to one whole wave.
+    assert select(batch=1, row_tiles=6, max_seqlen_k=_MAX_K) == 42
+    assert select(batch=1, row_tiles=2, max_seqlen_k=_MAX_K) == 128
+    assert select(batch=2, row_tiles=2, max_seqlen_k=_MAX_K) == 64
 
 
 @pytest.mark.parametrize("q_dtype", [torch.bfloat16, _FP8])

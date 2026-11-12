@@ -222,7 +222,9 @@ def test_dcp_query_rows_attend_like_the_folded_rows(q_dtype, monkeypatch):
     cache's prologue hands the decode FP8 queries."""
     degree = 8
     kv_dtype = torch.float8_e4m3fn
-    if not _backend(degree, 0, kv_dtype)._takes_dcp_query_rows(q_dtype, BLOCK):
+    if not _backend(degree, 0, kv_dtype)._takes_query_rows(
+        q_dtype, BLOCK, return_lse=True
+    ):
         pytest.skip("no query-row MLA decode kernel on this platform")
     bs = len(BLOCKS)
     g = torch.Generator(device="cuda").manual_seed(0)
@@ -272,7 +274,7 @@ def test_dcp_query_rows_attend_like_the_folded_rows(q_dtype, monkeypatch):
         results = []
         for query_rows in (True, False):
             backend = _backend(degree, rank, kv_dtype)
-            backend._dcp_query_rows[(q_dtype, BLOCK)] = query_rows
+            backend._query_rows[(q_dtype, BLOCK, True)] = query_rows
             _publish(backend, table)
             backend.forward_decode(q, None, None, layer, None, pool, bs)
             results.append(dict(captured))
@@ -287,3 +289,50 @@ def test_dcp_query_rows_attend_like_the_folded_rows(q_dtype, monkeypatch):
         torch.testing.assert_close(
             rows["lse"][visible], folded["lse"][visible], atol=1e-3, rtol=1e-4
         )
+
+
+@pytest.mark.parametrize("q_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_unsharded_query_rows_attend_like_the_expanded_entries(q_dtype, monkeypatch):
+    """Without KVP a query-row kernel takes each request's block rows whole,
+    each at its backed-up entry's length, where the expanded entries take one
+    launch row per position: both must attend alike."""
+    kv_dtype = torch.float8_e4m3fn
+    if not _backend(1, 0, kv_dtype)._takes_query_rows(q_dtype, BLOCK, return_lse=False):
+        pytest.skip("no query-row MLA decode kernel on this platform")
+    bs = len(BLOCKS)
+    g = torch.Generator(device="cuda").manual_seed(1)
+    q = torch.randn(
+        bs * BLOCK, HEADS, WIDTH, device="cuda", dtype=torch.bfloat16, generator=g
+    ).to(q_dtype)
+    cache = (
+        torch.randn(VIRTUAL_BLOCKS * GRANULARITY, WIDTH, device="cuda", generator=g)
+        * 0.5
+    ).to(kv_dtype)
+    calls = []
+    query_rows_decode = mla_module.mla_decode_query_rows
+    monkeypatch.setattr(
+        mla_module,
+        "mla_decode_query_rows",
+        lambda *args, **kwargs: calls.append(1) or query_rows_decode(*args, **kwargs),
+    )
+    layer = SimpleNamespace(
+        tp_q_head_num=HEADS,
+        head_dim=WIDTH,
+        v_head_dim=KV_LORA,
+        layer_id=0,
+        scaling=192**-0.5,
+        logit_cap=0.0,
+        sliding_window_size=-1,
+    )
+    pool = SimpleNamespace(get_key_buffer=lambda layer_id: cache)
+    table = _kernel_page_table()
+    results = []
+    for query_rows in (True, False):
+        backend = _backend(1, 0, kv_dtype)
+        backend._query_rows[(q_dtype, BLOCK, False)] = query_rows
+        _publish(backend, table)
+        results.append(backend.forward_decode(q, None, None, layer, None, pool, bs))
+    assert len(calls) == 1
+    rows, expanded = results
+    tol = 3e-2 if q_dtype == torch.float8_e4m3fn else 1e-2
+    torch.testing.assert_close(rows.float(), expanded.float(), atol=tol, rtol=tol)

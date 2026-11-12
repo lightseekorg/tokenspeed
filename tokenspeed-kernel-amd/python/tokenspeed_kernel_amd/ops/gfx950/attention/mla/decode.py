@@ -3396,10 +3396,11 @@ def _select_num_kv_splits_query_rows(
     # One workgroup per CU (over 256 VGPRs), so a partial last wave idles CUs for a
     # whole split: take the split count, up to about three waves, whose grid
     # fills its waves best (fewest splits on a tie), with at least four KV
-    # tiles per split.
+    # tiles per split. A grid of a few requests (a drafter without KVP) may
+    # split up to one whole wave, since its KV reads are bandwidth bound.
     workgroups = batch * row_tiles
     limit = min(
-        32,
+        max(32, _WAVE_WORKGROUPS // workgroups),
         triton.cdiv(3 * _WAVE_WORKGROUPS, workgroups),
         triton.cdiv(triton.cdiv(max_seqlen_k, 64), 4),
     )
