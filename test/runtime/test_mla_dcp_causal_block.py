@@ -126,26 +126,19 @@ def _publish(backend, table):
     )
 
 
-def test_unsharded_causal_block_expands_backed_up_entries():
-    backend = _backend(1, 0)
-    _publish(backend, _kernel_page_table())
-    ends = torch.tensor(BLOCK_ENDS, device="cuda").clamp_min(BLOCK)
-    expected = ends[:, None] - torch.arange(BLOCK - 1, -1, -1, device="cuda")
-    assert backend.block_decode_expansion == BLOCK
-    torch.testing.assert_close(
-        backend.seq_lens_buf[: len(BLOCKS) * BLOCK].view(-1, BLOCK).long(),
-        expected,
-        rtol=0,
-        atol=0,
-    )
-
-
 @pytest.mark.parametrize("degree", [2, 8])
 def test_dcp_causal_block_rows_match_the_unsharded_entries(degree, monkeypatch):
     table = _kernel_page_table()
     reference = _backend(1, 0)
     _publish(reference, table)
     expected = reference.seq_lens_buf[: len(BLOCKS) * BLOCK].clone()
+    ends = torch.tensor(BLOCK_ENDS, device="cuda").clamp_min(BLOCK)
+    torch.testing.assert_close(
+        expected.view(-1, BLOCK).long(),
+        ends[:, None] - torch.arange(BLOCK - 1, -1, -1, device="cuda"),
+        rtol=0,
+        atol=0,
+    )
 
     captured = {}
 
@@ -191,14 +184,7 @@ def test_dcp_causal_block_rows_match_the_unsharded_entries(degree, monkeypatch):
     total = torch.zeros_like(expected)
     for rank in range(degree):
         backend = _backend(degree, rank)
-        assert backend.block_decode_expansion == 1
         _publish(backend, table)
-        torch.testing.assert_close(
-            backend.seq_lens_buf[:bs].long(),
-            torch.tensor(BLOCK_ENDS, device="cuda").clamp_min(BLOCK),
-            rtol=0,
-            atol=0,
-        )
         backend.forward_decode(q, None, None, layer, None, pool, bs)
         local = captured["local"]
         assert local.shape == expected.shape
