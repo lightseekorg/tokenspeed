@@ -112,8 +112,8 @@ def github_json(endpoint, *, paginate):
     return json.loads(result.stdout)
 
 
-def changed_paths(repository, event_name, event, api=github_json):
-    """Reject partial API responses rather than treating missing paths as unrelated."""
+def changed_paths(repository, event_name, event, api=github_json, *, run_attempt=1):
+    """Return paths, or None if a rerun targets a superseded PR head."""
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
         raise ValueError("Invalid repository")
     if event_name == "workflow_dispatch":
@@ -124,7 +124,11 @@ def changed_paths(repository, event_name, event, api=github_json):
         if type(number) is not int or number <= 0:
             raise ValueError("Invalid pull request number")
         current = api(f"/repos/{repository}/pulls/{number}", paginate=False)
-        if any(current[ref]["sha"] != pr[ref]["sha"] for ref in ("head", "base")):
+        head_changed = current["head"]["sha"] != pr["head"]["sha"]
+        base_changed = current["base"]["sha"] != pr["base"]["sha"]
+        if run_attempt > 1 and head_changed and not base_changed:
+            return None
+        if head_changed or base_changed:
             raise ValueError("Pull request identity changed since this event")
         count = current["changed_files"]
         if type(count) is not int or not 0 <= count <= 3000:
@@ -198,14 +202,19 @@ def main() -> int:
     parser.add_argument("--event-path", type=Path, required=True)
     parser.add_argument("--repository", required=True)
     parser.add_argument("--github-output", type=Path)
+    parser.add_argument("--run-attempt", type=int, default=1)
     args = parser.parse_args()
     try:
         manifest = load_manifest(args.repo_root / args.manifest)
         event = json.loads(args.event_path.read_text(encoding="utf-8"))
         if not isinstance(event, dict):
             raise ValueError("Event payload must be an object")
-        paths = changed_paths(args.repository, args.event_name, event)
-        result = select_suite(manifest, args.event_name, paths)
+        paths = changed_paths(
+            args.repository, args.event_name, event, run_attempt=args.run_attempt
+        )
+        result = select_suite(manifest, args.event_name, paths or set())
+        if paths is None:
+            result["reason"] = "superseded-pr-head"
         if args.github_output is not None:
             with args.github_output.open("a", encoding="utf-8") as output:
                 output.write(f"should_run={str(result['should_run']).lower()}\n")

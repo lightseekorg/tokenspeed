@@ -68,6 +68,7 @@ jobs:
           python3 -B test/ci_system/npu/changes.py \
             --repo-root "$GITHUB_WORKSPACE" \
             --manifest test/ci/npu/manifest.json \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
             --event-name "$GITHUB_EVENT_NAME" \
             --event-path "$GITHUB_EVENT_PATH" \
             --repository "$GITHUB_REPOSITORY" \
