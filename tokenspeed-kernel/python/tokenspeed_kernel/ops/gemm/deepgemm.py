@@ -272,6 +272,17 @@ def prepare_deepgemm_fp8_weight(
     return prepare_block_fp8_weight(weight, scales)
 
 
+_BLOCK_FP8_TRAITS = {
+    "n_align": frozenset({64}),
+    "k_align": frozenset({128}),
+    "a_contiguous": frozenset({True}),
+    "b_contiguous": frozenset({True}),
+    "out_contiguous": frozenset({True}),
+    "out_dtype": frozenset({torch.bfloat16}),
+}
+
+
+# Below the existing Triton block-FP8 leaf: auto keeps its current choice.
 @register_kernel(
     "gemm",
     "mm",
@@ -280,31 +291,45 @@ def prepare_deepgemm_fp8_weight(
     capability=CapabilityRequirement(
         vendors=frozenset({"nvidia"}),
         min_arch_version=ArchVersion(9, 0),
-        max_arch_version=ArchVersion(10, 3),
+        max_arch_version=ArchVersion(9, 9),
     ),
-    signatures=frozenset().union(
-        *(
-            format_signatures(
-                ("a", "b"),
-                "mxfp8",
-                {torch.float8_e4m3fn},
-                scale=ScaleFormat(
-                    storage_dtype=dtype, granularity="block", block_shape=(128, 128)
-                ),
-            )
-            for dtype in (torch.float32, torch.int32)
-        )
+    signatures=format_signatures(
+        ("a", "b"),
+        "mxfp8",
+        {torch.float8_e4m3fn},
+        scale=ScaleFormat(
+            storage_dtype=torch.float32, granularity="block", block_shape=(128, 128)
+        ),
     ),
     traits={
-        "n_align": frozenset({64}),
-        "k_align": frozenset({128}),
-        "a_contiguous": frozenset({True}),
-        "b_contiguous": frozenset({True}),
-        "block_scale_layout": frozenset({"canonical", "canonical_blackwell"}),
-        "out_contiguous": frozenset({True}),
-        "out_dtype": frozenset({torch.bfloat16}),
+        **_BLOCK_FP8_TRAITS,
+        "block_scale_layout": frozenset({"canonical"}),
+        "b_scales_contiguous": frozenset({True}),
     },
-    # Below the existing Triton block-FP8 leaf: auto keeps its current choice.
+    priority=Priority.PERFORMANT,
+)
+@register_kernel(
+    "gemm",
+    "mm",
+    name="deepgemm_mm_fp8_blockscale_packed",
+    solution="deepgemm",
+    capability=CapabilityRequirement(
+        vendors=frozenset({"nvidia"}),
+        min_arch_version=ArchVersion(10, 0),
+        max_arch_version=ArchVersion(10, 3),
+    ),
+    signatures=format_signatures(
+        ("a", "b"),
+        "mxfp8",
+        {torch.float8_e4m3fn},
+        scale=ScaleFormat(
+            storage_dtype=torch.int32, granularity="block", block_shape=(128, 128)
+        ),
+    ),
+    traits={
+        **_BLOCK_FP8_TRAITS,
+        "block_scale_layout": frozenset({"canonical_blackwell"}),
+    },
     priority=Priority.PERFORMANT,
 )
 def deepgemm_mm_fp8_blockscale(

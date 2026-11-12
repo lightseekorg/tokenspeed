@@ -180,8 +180,9 @@ retain their semantics; small-M BF16 keeps its existing bound.
 
 ## Block-FP8 DeepGEMM
 
-`deepgemm_mm_fp8_blockscale` supports explicit `mm(..., override=...)` or
-`solution="deepgemm"` selection. Serving can opt in with
+`solution="deepgemm"` selects the appropriate block-FP8 kernel for the GPU.
+Explicit overrides are `deepgemm_mm_fp8_blockscale` on SM90 and
+`deepgemm_mm_fp8_blockscale_packed` on SM100/SM103. Serving can opt in with
 `--dense-gemm-backend deepgemm` for standard block-FP8 dense linears. The
 default `auto` route remains unchanged; routed experts use their own backend.
 
