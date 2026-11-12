@@ -1571,9 +1571,11 @@ def _ex2_gather_lane(
         # ... up to M_DUP (one block at 8 rows, none at 16).
         fill: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [nw, 1], [1, 0])
         for k in gl.static_range(4):  # at most log2(M_DUP) blocks
-            w: gl.constexpr = RP << k
-            if w < M_DUP:
-                picks_smem.slice(w, w, dim=1).store(gl.full([S, w], -1, gl.int32, fill))
+            # RP << k inline: a constexpr name cannot be reassigned per pass.
+            if (RP << k) < M_DUP:
+                picks_smem.slice(RP << k, RP << k, dim=1).store(
+                    gl.full([S, RP << k], -1, gl.int32, fill)
+                )
     r = gl.arange(0, RP, gl.SliceLayout(0, tl))[None, :]
     routed = picks >= 0
     first = gl.min(gl.where(routed, r, RP), axis=1)[:, None]
