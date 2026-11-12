@@ -372,7 +372,12 @@ def test_row_sharded_moe_tail_selection_and_fallback(
         moe, prefix, prefix, rows, rows, prefix_is_sharded=False
     )
 
-    assert fork.calls == [{"enable": graph_phase, "overlap": capture_mode}]
+    assert fork.calls == [
+        {
+            "enable": graph_phase and mod.MOE_ROUTING_STREAM_FORK,
+            "overlap": capture_mode,
+        }
+    ]
     assert moe.experts._situ_output_buffer is (routed if producer_direct else None)
     moe.shared_experts.assert_called_once_with(
         prefix, down_out=shared if producer_direct else None

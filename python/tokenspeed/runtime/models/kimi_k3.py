@@ -1996,6 +1996,9 @@ ATTNRES_FAST_PATH_MAX_TOKENS = 32
 # rank behind at the next collective), so AMD never forks. Preserve NVIDIA's
 # policy.
 ATTNRES_STREAM_FORK_THRESHOLD = float("inf") if current_platform().is_amd else 0
+# On AMD the MoE routing branch also costs more in cross-stream waits than it
+# hides, so it stays on the main stream. Preserve NVIDIA's policy.
+MOE_ROUTING_STREAM_FORK = not current_platform().is_amd
 
 
 def _attnres_mlp_slot(layer_id: int) -> int:
@@ -3134,9 +3137,8 @@ class KimiLinearMoE(nn.Module):
             and router_logits.is_contiguous()
         )
         # Warm the auxiliary stream serially before capture enables overlap.
-        # On AMD the routing branch costs more in stream waits than it hides.
         with self.stream_fork.scope(
-            enable=get_is_cuda_graph_phase() and not current_platform().is_amd,
+            enable=get_is_cuda_graph_phase() and MOE_ROUTING_STREAM_FORK,
             overlap=get_is_capture_mode(),
         ) as fork:
             with fork.branch():
