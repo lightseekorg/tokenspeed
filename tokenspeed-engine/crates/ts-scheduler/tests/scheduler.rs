@@ -26,9 +26,9 @@ use std::{ffi::CString, sync::Once};
 
 use pyo3::{prelude::*, types::PyDict};
 use ts_scheduler::{
-    BlockTableView, CacheEvent, CacheEventKind, CacheOpKind, ForwardEvent, ForwardEventKind,
-    RequestSpec, Scheduler, StorageCancellationView, StorageDoneView, StorageOpKind, StorageRound,
-    StorageTickView, TransferBatchView,
+    profile, BlockTableView, CacheEvent, CacheEventKind, CacheOpKind, ForwardEvent,
+    ForwardEventKind, RequestSpec, Scheduler, StorageCancellationView, StorageDoneView,
+    StorageOpKind, StorageRound, StorageTickView, TransferBatchView,
 };
 
 /// Start the interpreter once per test process, with the scheduler module
@@ -206,13 +206,11 @@ fn delayed_prefill_drains_its_reservation_and_holds_new_admissions() {
             .unwrap();
         if prefix == 0 {
             assert_eq!(scheduler.active_lcm_blocks(), 28);
-            assert!(
-                scheduler
-                    .next_execution_plan(false, true)
-                    .forward_batches()
-                    .iter()
-                    .all(|batch| batch.request_ids.is_empty())
-            );
+            assert!(scheduler
+                .next_execution_plan(false, true)
+                .forward_batches()
+                .iter()
+                .all(|batch| batch.request_ids.is_empty()));
         }
     }
     assert!(!scheduler.probe_prefill_gate().wants_prefill);
@@ -311,6 +309,96 @@ result = (list(batch.request_ids), list(batch.input_lengths), list(batch.request
 }
 
 #[test]
+fn a_recording_sees_the_schedulers_phases_inside_its_calls() {
+    interpreter();
+    let mut scheduler =
+        Python::attach(|py| Scheduler::from_python(&run(py, NEW_SCHEDULER)).unwrap());
+
+    profile::start();
+    // Other tests share the process: this thread's spans are the marker's.
+    drop(profile::span("marker"));
+    scheduler
+        .submit_requests(&[spec("r1", (1..=10).collect())])
+        .unwrap();
+    scheduler.next_execution_plan(true, false);
+    scheduler
+        .advance(&[event(ForwardEventKind::ExtendResult, "r1", vec![42])])
+        .unwrap();
+    // A decode step: its result is no prefill result.
+    scheduler.next_execution_plan(true, false);
+    scheduler
+        .advance(&[event(ForwardEventKind::ExtendResult, "r1", vec![43])])
+        .unwrap();
+    let recording = profile::stop();
+
+    let tid = recording
+        .spans
+        .iter()
+        .find(|span| span.name == "marker")
+        .expect("the marker span")
+        .tid;
+    let spans: Vec<_> = recording
+        .spans
+        .iter()
+        .filter(|span| span.tid == tid)
+        .collect();
+    let named = |name: &str| {
+        spans
+            .iter()
+            .find(|span| span.name == name)
+            .unwrap_or_else(|| panic!("no {name} span in {spans:#?}"))
+    };
+    let within = |inner: &profile::Span, outer: &profile::Span| {
+        outer.begin_ns <= inner.begin_ns && inner.end_ns <= outer.end_ns
+    };
+    let submit = named("Scheduler::submit_requests");
+    assert_eq!(submit.category, profile::HOST);
+    for phase in ["copyRequestSpecs", "Scheduler::SubmitRequests"] {
+        let phase = named(phase);
+        assert_eq!(phase.category, profile::SCHEDULER, "{phase:?}");
+        assert!(within(phase, submit), "{phase:?} outside {submit:?}");
+    }
+    // The control thread's call, and inside it the C++ scheduler's own spans
+    // under their category.
+    let plan = named("Scheduler::next_execution_plan");
+    assert_eq!(plan.category, profile::HOST);
+    let planned = named("Scheduler::NextExecutionPlan");
+    assert!(within(planned, plan), "{planned:?} outside {plan:?}");
+    for phase in [
+        "Scheduler::NextExecutionPlan",
+        "Scheduler::buildForwardOperations",
+        "Scheduler::buildFusedPlan",
+        "Scheduler::scheduleLocalPrefillWork",
+        "Scheduler::schedulePrefillFirstChunk",
+        "Scheduler::matchPrefixAtAdmission",
+        "ComputePrefixHashes",
+        "CacheCoordinator::ProbePromptPrefix",
+        "CacheCoordinator::Admit",
+        "planAdmission",
+        "AdmissionPlanner::fitWithEviction",
+        "CacheCoordinator::acquirePrefix",
+        "CacheCoordinator::CollectDeadEntries",
+        "ForwardBatch::ForwardBatch",
+    ] {
+        let phase = named(phase);
+        assert_eq!(phase.category, profile::SCHEDULER, "{phase:?}");
+        assert!(within(phase, planned), "{phase:?} outside {planned:?}");
+    }
+    let advance = named("Scheduler::advance");
+    assert_eq!(advance.category, profile::HOST);
+    let advanced = named("Scheduler::Advance");
+    let settle = named("Scheduler::settleFinishedRequests");
+    assert!(within(advanced, advance) && within(settle, advanced));
+    let prefill_results: Vec<_> = spans
+        .iter()
+        .filter(|span| span.name == "Scheduler::handlePrefillResult")
+        .collect();
+    assert_eq!(prefill_results.len(), 1, "{spans:#?}");
+    assert!(within(prefill_results[0], advanced));
+    assert!(recording.threads.iter().any(|(thread, _)| *thread == tid));
+}
+
+#[test]
 fn an_event_the_state_does_not_allow_is_an_error() {
     interpreter();
     let mut scheduler =
@@ -363,11 +451,10 @@ fn a_forced_retraction_stores_and_restores_through_cache_events() {
         if let Some(op) = ops.first() {
             assert_eq!(ops.len(), 1);
             assert_eq!(op.kind, CacheOpKind::SnapshotStore);
-            assert!(
-                plan.forward_batches()
-                    .iter()
-                    .all(|b| b.request_ids.is_empty())
-            );
+            assert!(plan
+                .forward_batches()
+                .iter()
+                .all(|b| b.request_ids.is_empty()));
             store = Some(op.op_id);
             break;
         }
@@ -476,11 +563,10 @@ fn storage_operations_stay_out_of_the_device_cache_ops() {
     assert!(ops[0].keys.iter().all(|key| key.group_id == 0));
     assert_ne!(ops[0].keys[0].content_hash, ops[0].keys[1].content_hash);
     assert!(ops[0].host_blocks.is_empty());
-    assert!(
-        plan.forward_batches()
-            .iter()
-            .all(|b| b.request_ids.is_empty())
-    );
+    assert!(plan
+        .forward_batches()
+        .iter()
+        .all(|b| b.request_ids.is_empty()));
     assert!(scheduler.storage_pending());
 
     // No owner holds a key: the request admits without a stored prefix.
@@ -496,11 +582,10 @@ fn storage_operations_stay_out_of_the_device_cache_ops() {
     };
     scheduler.advance_head(&done, &[]).unwrap();
     let plan = scheduler.next_execution_plan(true, false);
-    assert!(
-        plan.forward_batches()
-            .iter()
-            .any(|b| b.request_ids == ["waiting"])
-    );
+    assert!(plan
+        .forward_batches()
+        .iter()
+        .any(|b| b.request_ids == ["waiting"]));
 }
 
 #[test]
@@ -842,12 +927,10 @@ fn admission_capacity_uses_native_geometry_and_live_slots() {
     assert_eq!(initial.free_slots, initial.total_slots);
     assert_eq!(initial.available_blocks, initial.total_blocks);
     assert!(!initial.capacity_blocks.is_empty());
-    assert!(
-        initial
-            .capacity_blocks
-            .windows(2)
-            .all(|pair| pair[0] <= pair[1])
-    );
+    assert!(initial
+        .capacity_blocks
+        .windows(2)
+        .all(|pair| pair[0] <= pair[1]));
     assert!(*initial.capacity_blocks.last().unwrap() <= i64::from(initial.total_blocks));
     scheduler
         .submit_requests(&[spec("capacity", (1..=10).collect())])

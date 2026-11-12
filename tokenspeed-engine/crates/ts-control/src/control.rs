@@ -37,7 +37,6 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use ts_wire::{
-    ControlOutput, ControlRequest,
     control::{
         DestroyWeightsUpdateGroupReqOutput, InitWeightsUpdateGroupReqOutput,
         IsSchedulerPausedReqOutput, IsSleepingReqOutput, PauseSchedulerReqOutput,
@@ -46,6 +45,7 @@ use ts_wire::{
         UpdateWeightFromDiskReqOutput, UpdateWeightsFromDistributedReqOutput,
         UpdateWeightsFromMooncakeReqOutput,
     },
+    ControlOutput, ControlRequest,
 };
 
 /// Every memory region, in release order: the KV cache first (a PD engine

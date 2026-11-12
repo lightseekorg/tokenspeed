@@ -28,14 +28,14 @@
 use std::collections::BTreeSet;
 
 use ts_pd::{BootstrapInfo, EmbeddingItem};
-use ts_scheduler::RequestSpec;
+use ts_scheduler::{profile, RequestSpec};
 use ts_wire::{SamplingParams, StrOrList, TokenizedGenerateReqInput};
 
 use crate::{
     grammar::ReasoningGrammar,
     request::{
-        LogprobRequest, MAX_CACHE_SESSION_ID_BYTES, MAX_STOP_TOKEN_IDS, ReasoningTokens,
-        RequestState,
+        LogprobRequest, ReasoningTokens, RequestState, MAX_CACHE_SESSION_ID_BYTES,
+        MAX_STOP_TOKEN_IDS,
     },
     sampling,
 };
@@ -214,6 +214,7 @@ pub enum Admitted {
 
 /// Admit `request`, or `None` if it carries no single request id to answer.
 pub fn admit(mut request: TokenizedGenerateReqInput, limits: &IngressLimits) -> Option<Admitted> {
+    let _span = profile::span("ingress::admit");
     let rid = match request.rid.take() {
         Some(StrOrList::One(rid)) => rid,
         _ => {
@@ -755,10 +756,8 @@ mod tests {
         for hints in [vec![0], vec![-1], vec![4], vec![1; 65]] {
             let mut invalid = request("r1", vec![1, 2, 3, 4], SamplingParams::default());
             invalid.shared_prefix_tokens = hints;
-            assert!(
-                refused_message(admit(invalid, &limits()).unwrap())
-                    .contains("shared_prefix_tokens")
-            );
+            assert!(refused_message(admit(invalid, &limits()).unwrap())
+                .contains("shared_prefix_tokens"));
         }
     }
 
@@ -883,10 +882,8 @@ mod tests {
             return_logprob: true,
             ..request("c", vec![1], SamplingParams::default())
         };
-        assert!(
-            refused_message(admit(logprobs, &limits()).unwrap())
-                .contains("--enable-output-logprobs")
-        );
+        assert!(refused_message(admit(logprobs, &limits()).unwrap())
+            .contains("--enable-output-logprobs"));
 
         let too_long = request("d", vec![0; 91], SamplingParams::default());
         assert!(refused_message(admit(too_long, &limits()).unwrap()).contains("at most 90"));
@@ -1089,10 +1086,8 @@ mod tests {
                         logprob_start_len: start as i64,
                         ..request("invalid-target", input_ids, SamplingParams::default())
                     };
-                    assert!(
-                        refused_message(admit(scored, &limits).unwrap())
-                            .contains("inside the vocabulary")
-                    );
+                    assert!(refused_message(admit(scored, &limits).unwrap())
+                        .contains("inside the vocabulary"));
                 }
             }
         }
@@ -1116,14 +1111,10 @@ mod tests {
                 },
             )
         };
-        assert!(
-            refused_message(admit(top_k("a", 21, 1), &limits).unwrap())
-                .contains("between 1 and 20")
-        );
-        assert!(
-            refused_message(admit(top_k("b", 2, 2), &limits).unwrap())
-                .contains("max_new_tokens <= 1")
-        );
+        assert!(refused_message(admit(top_k("a", 21, 1), &limits).unwrap())
+            .contains("between 1 and 20"));
+        assert!(refused_message(admit(top_k("b", 2, 2), &limits).unwrap())
+            .contains("max_new_tokens <= 1"));
         let disaggregated = IngressLimits {
             logprobs: LogprobServability {
                 disaggregated: true,

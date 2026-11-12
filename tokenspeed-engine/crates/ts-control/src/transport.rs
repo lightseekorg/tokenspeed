@@ -43,16 +43,16 @@ use std::{
 use bytes::Bytes;
 use tokio::runtime::Runtime;
 use ts_wire::{
-    BatchTokenIDOutSlim, ControlOutput, ControlRequest, EngineCoreReadyResponse, EngineOutput,
-    EngineRequest, HandshakeInitMessage, ReadyMessage,
     control::ControlReplySlim,
     decode_frames, encode_frames,
     frames::{REQ_TYPE_CONTROL, REQ_TYPE_ENCODE},
     handshake::{STATUS_HELLO, STATUS_READY},
+    BatchTokenIDOutSlim, ControlOutput, ControlRequest, EngineCoreReadyResponse, EngineOutput,
+    EngineRequest, HandshakeInitMessage, ReadyMessage,
 };
 use zeromq::{
-    DealerSocket, PushSocket, Socket, SocketOptions, SocketRecv, SocketSend, ZmqMessage,
-    util::PeerIdentity,
+    util::PeerIdentity, DealerSocket, PushSocket, Socket, SocketOptions, SocketRecv, SocketSend,
+    ZmqMessage,
 };
 
 use crate::{
@@ -644,8 +644,8 @@ impl Drop for EncodeIntake {
 #[cfg(test)]
 mod tests {
     use ts_wire::{
-        Value,
         control::{ControlCall, FlushCacheReqInput, FlushCacheReqOutput, ProfileReqOutput},
+        Value,
     };
 
     use super::*;

@@ -92,4 +92,6 @@ rust::Vec<SchedulerAbortView> plan_aborts(const tokenspeed::ExecutionPlan& plan)
 rust::Vec<CacheOpView> plan_cache_ops(const tokenspeed::ExecutionPlan& plan);
 rust::Vec<StorageOpView> plan_storage_ops(const tokenspeed::ExecutionPlan& plan);
 
+void set_profile_span_sink(bool installed);
+
 }  // namespace ts_scheduler

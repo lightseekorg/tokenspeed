@@ -54,10 +54,10 @@ use ts_control::{
     output::{ForwardResult, HistorySeeds, LogprobPlan, NgramWindows, TopLogprobs},
 };
 use ts_pd::LandedRequest;
-use ts_scheduler::{CacheEvent, CacheEventKind, ExecutionPlan};
+use ts_scheduler::{profile, CacheEvent, CacheEventKind, ExecutionPlan};
 use ts_wire::{control::ProfileReq, ControlRequest, Wire};
 
-use crate::pd::Streams;
+use crate::{pd::Streams, LAUNCHER_FAILURE};
 
 /// A forward the forward thread launched, by launch order.
 pub type ForwardId = u64;
@@ -143,6 +143,32 @@ enum Op {
     },
 }
 
+impl Op {
+    /// The operation's profile span name.
+    fn span_name(&self) -> &'static str {
+        match self {
+            Op::Admit(_) => "Op::Admit",
+            Op::Execute(_) => "Op::Execute",
+            Op::AttachGrammars(_) => "Op::AttachGrammars",
+            Op::Committed(_) => "Op::Committed",
+            Op::Barrier { .. } => "Op::Barrier",
+            Op::Release(_) => "Op::Release",
+            Op::Land { .. } => "Op::Land",
+            Op::IdleForward { .. } => "Op::IdleForward",
+            Op::CheckWeightUpdate { .. } => "Op::CheckWeightUpdate",
+            Op::UpdateWeights { .. } => "Op::UpdateWeights",
+            Op::CommitWeightUpdate { .. } => "Op::CommitWeightUpdate",
+            Op::Profile { .. } => "Op::Profile",
+            Op::ReloadForward { .. } => "Op::ReloadForward",
+            Op::ReleaseMemory { .. } => "Op::ReleaseMemory",
+            Op::ResumeMemory { .. } => "Op::ResumeMemory",
+            Op::SnapshotExpertLoad { .. } => "Op::SnapshotExpertLoad",
+            Op::EpdPublish(_) => "Op::EpdPublish",
+            Op::ApplyExpertPlacement { .. } => "Op::ApplyExpertPlacement",
+        }
+    }
+}
+
 /// Route counters `[layers, physical]` and the placement they were counted
 /// under.
 type ExpertLoad = (Vec<Vec<i64>>, Vec<Vec<i32>>);
@@ -186,8 +212,33 @@ impl Shared {
     /// Record a failure, unless an earlier one is recorded, and wake the
     /// control thread if it waits for a launch.
     fn fail(&self, failure: String) {
-        self.state().failure.get_or_insert(failure);
+        // The control thread can still be waiting on a collective.
+        let launcher = LAUNCHER_FAILURE.get();
+        let signal_error = launcher.and_then(|launcher| launcher.notify().err());
+        let distinct = {
+            let mut state = self.state();
+            match &state.failure {
+                Some(first) => first != &failure,
+                None => {
+                    state.failure = Some(failure.clone());
+                    true
+                }
+            }
+        };
         self.changed.notify_all();
+        if let Some(error) = signal_error {
+            crate::LauncherFailure::log_signal_error(error);
+        }
+        // Preserve the first failure for callers, but retain other diagnostics.
+        // Log outside the state lock and only after notifying the launcher.
+        if distinct {
+            if let Some(launcher) = launcher {
+                // Match the error's display when it reaches the host handler.
+                launcher.report(DataPlaneError(failure));
+            } else {
+                tracing::error!("the data plane failed:\n{failure}");
+            }
+        }
     }
 
     fn launch(&self, forward: ForwardId, launched: Py<PyAny>) {
@@ -213,13 +264,15 @@ impl Shared {
     }
 }
 
-/// Fails the data plane when the forward thread ends, so the control thread
-/// never waits for a launch that cannot come (a panic included).
+/// Wake the control thread if a panic leaves it waiting for a launch.
+/// Closing the forward queue during teardown is an orderly exit.
 struct ExitNotice(Arc<Shared>);
 
 impl Drop for ExitNotice {
     fn drop(&mut self) {
-        self.0.fail("the forward thread exited".to_owned());
+        if thread::panicking() {
+            self.0.fail("the forward thread panicked".to_owned());
+        }
     }
 }
 
@@ -264,9 +317,7 @@ impl PythonDataPlane {
                 Python::attach(|py| {
                     let plane = plane.bind(py);
                     if let Err(error) = plane.call_method0("enter_forward_thread") {
-                        let error = describe(py, &error);
-                        tracing::error!("the forward thread could not start:\n{error}");
-                        shared.fail(error);
+                        shared.fail(describe(py, &error));
                         return;
                     }
                     forward_loop(py, plane, queue, &shared, streams.as_ref());
@@ -302,7 +353,7 @@ impl PythonDataPlane {
         let (reply, answer) = mpsc::sync_channel(1);
         self.queue(op(reply))?;
         match answer.recv() {
-            Ok(answer) => answer.map_err(DataPlaneError),
+            Ok(answer) => answer.map_err(|failure| self.fail(failure)),
             Err(_) => {
                 self.failed()?;
                 Err(DataPlaneError("the forward thread exited".to_owned()))
@@ -317,12 +368,16 @@ impl PythonDataPlane {
         call: impl FnOnce(&Bound<'_, PyAny>) -> PyResult<T>,
     ) -> Result<T, DataPlaneError> {
         self.failed()?;
-        Python::attach(|py| call(self.plane.bind(py)).map_err(|error| describe(py, &error)))
-            .map_err(|failure| self.fail(failure))
+        // The wait for the GIL, which the forward thread's Python holds.
+        let acquiring = profile::span("DataPlane::acquire_gil");
+        Python::attach(|py| {
+            drop(acquiring);
+            call(self.plane.bind(py)).map_err(|error| describe(py, &error))
+        })
+        .map_err(|failure| self.fail(failure))
     }
 
     fn fail(&self, failure: String) -> DataPlaneError {
-        tracing::error!("the data plane failed:\n{failure}");
         self.shared.fail(failure.clone());
         DataPlaneError(failure)
     }
@@ -344,6 +399,7 @@ impl DataPlane for PythonDataPlane {
     type Pending = ForwardId;
 
     fn admit(&mut self, requests: &[Admission]) -> Result<(), DataPlaneError> {
+        let _span = profile::span("DataPlane::admit");
         let mut rows = Vec::with_capacity(requests.len());
         for request in requests {
             let frames = ts_wire::encode_frames(&request.sampling_params);
@@ -371,6 +427,7 @@ impl DataPlane for PythonDataPlane {
         plan: ExecutionPlan,
         dispatch: &Dispatch<'_>,
     ) -> Result<Option<ForwardId>, DataPlaneError> {
+        let _span = profile::span("DataPlane::execute");
         // The forward thread launches a forward exactly when the plan has a
         // batch and the rank does not idle, by the same rule the loop chose
         // `forward` with.
@@ -398,6 +455,7 @@ impl DataPlane for PythonDataPlane {
     }
 
     fn complete(&mut self, forward: ForwardId) -> Result<ForwardResult, DataPlaneError> {
+        let _span = profile::span("DataPlane::complete");
         let launched = self.shared.take_launched(forward).map_err(DataPlaneError)?;
         let result = self.query(|plane| complete(plane, &launched))?;
         // The profiler counts committed forwards, on the thread it traces.
@@ -406,6 +464,7 @@ impl DataPlane for PythonDataPlane {
     }
 
     fn poll_cache_events(&mut self) -> Result<Vec<CacheEvent>, DataPlaneError> {
+        let _span = profile::span("DataPlane::poll_cache_events");
         let polled: Vec<(String, u32)> = self.query(|plane| {
             plane
                 .call_method0("poll_cache_events")
@@ -442,6 +501,7 @@ impl DataPlane for PythonDataPlane {
     }
 
     fn idle_forward(&mut self, dp: &DpRound) -> Result<(), DataPlaneError> {
+        let _span = profile::span("DataPlane::idle_forward");
         let dp = dp.clone();
         self.ask(|reply| Op::IdleForward { dp, reply })
     }
@@ -579,11 +639,21 @@ fn forward_loop(
     loop {
         // Wait without the GIL: the control thread and the transfer peer's
         // threads need it.
-        let (returned, op) = py.detach(move || {
+        let (returned, op, received_ns) = py.detach(move || {
             let op = queue.recv();
-            (queue, op)
+            (queue, op, profile::recording().then(profile::now_ns))
         });
         queue = returned;
+        if let Some(received_ns) = received_ns {
+            // The wait for the GIL, which the control thread's completion
+            // queries hold.
+            profile::record(
+                profile::HOST,
+                "forward_loop::acquire_gil".into(),
+                received_ns,
+                profile::now_ns(),
+            );
+        }
         let Ok(op) = op else {
             // Closed: finish what a forward left pending before the caches
             // close behind this thread.
@@ -591,7 +661,6 @@ fn forward_loop(
                 if let Err(error) = plane.call_method0("exit_forward_thread") {
                     let error = describe(py, &error);
                     tracing::error!("the forward thread could not finish:\n{error}");
-                    shared.fail(error);
                 }
             }
             return;
@@ -626,8 +695,8 @@ fn forward_loop(
             }
             continue;
         }
+        let _span = profile::span(op.span_name());
         if let Err(error) = run(py, plane, op, shared, streams) {
-            tracing::error!("the data plane failed:\n{error}");
             shared.fail(error);
         }
     }
@@ -924,306 +993,5 @@ fn complete(plane: &Bound<'_, PyAny>, launched: &Py<PyAny>) -> PyResult<ForwardR
 }
 
 #[cfg(test)]
-mod tests {
-    //! The two-thread contract, against a Python stand-in for `HostDataPlane`
-    //! that records which thread made each call.
-
-    use std::{ffi::CString, sync::Once, time::Duration};
-
-    use pyo3::types::PyDict;
-    use ts_scheduler::{ForwardBatchView, Scheduler};
-
-    use super::*;
-
-    /// Start the interpreter once per test process, with the scheduler
-    /// module built in and the repository's `tokenspeed_scheduler` package
-    /// importable.
-    fn interpreter() {
-        static START: Once = Once::new();
-        START.call_once(|| {
-            // The test binary is not in a Python prefix; point at the one the
-            // crate was built against.
-            std::env::set_var("PYTHONHOME", env!("TS_HOST_TEST_PYTHONHOME"));
-            ts_scheduler::register_builtin_module();
-            Python::initialize();
-            Python::attach(|py| {
-                ts_scheduler::alias_builtin_module(py).unwrap();
-                let package_dir = concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../../../tokenspeed-scheduler/python"
-                );
-                py.import("sys")
-                    .unwrap()
-                    .getattr("path")
-                    .unwrap()
-                    .call_method1("insert", (0, package_dir))
-                    .unwrap();
-            });
-        });
-    }
-
-    /// The stand-in, and an idle scheduler to draw plans from. A launch
-    /// returns the next token, from 100; the launch numbered `held` waits
-    /// for `unblock`, and every launch raises once `failing` is set.
-    const PLANE: &str = r#"
-import threading
-
-import tokenspeed_scheduler as ts
-
-
-class Guard:
-    def __init__(self, plane):
-        self.plane = plane
-
-    def __enter__(self):
-        self.plane.note("guard enter")
-
-    def __exit__(self, *exc):
-        self.plane.note("guard exit")
-
-
-class Plane:
-    def __init__(self):
-        self.calls = []
-        self.next_token = 100
-        self.held = None
-        self.unblock = threading.Event()
-        self.failing = False
-        self.cumulative_probs = None
-
-    def note(self, name):
-        self.calls.append((name, threading.get_ident()))
-
-    def control_thread_guard(self):
-        return Guard(self)
-
-    def enter_forward_thread(self):
-        self.note("enter_forward_thread")
-
-    def exit_forward_thread(self):
-        self.note("exit_forward_thread")
-
-    def execute(self, plan, dp, ngram, grammar_advance, logprobs, history):
-        self.note("execute")
-        token = self.next_token
-        self.next_token += 1
-        if token == self.held:
-            self.unblock.wait()
-        if self.failing:
-            raise RuntimeError("the launch failed")
-        return token
-
-    def complete(self, launched):
-        self.note("complete")
-        return ([launched], [1], None, None, None, None, None, None, self.cumulative_probs)
-
-    def note_committed(self, launched):
-        self.note("note_committed")
-
-    def release(self, rids):
-        self.note("release")
-
-    def poll_cache_events(self):
-        self.note("poll_cache_events")
-        return [("WriteBackDoneEvent", 3)]
-
-
-cfg = ts.SchedulerConfig()
-cfg.prefix_granularity = 16
-cfg.max_scheduled_tokens = 64
-cfg.max_batch_size = 4
-cfg.num_device_pages = 64
-cfg.num_snapshot_pages = 1
-cfg.cache_groups = [
-    ts.CacheGroupConfig(
-        group_id="full_attention",
-        block_granularity=16,
-        total_pages=64,
-        attn_kind=ts.AttnKind.Full,
-    )
-]
-result = (Plane(), ts.Scheduler(cfg))
-"#;
-
-    fn plane() -> (Py<PyAny>, Scheduler) {
-        interpreter();
-        Python::attach(|py| {
-            let globals = PyDict::new(py);
-            py.run(&CString::new(PLANE).unwrap(), Some(&globals), None)
-                .unwrap_or_else(|error| panic!("{}", describe(py, &error)));
-            let (plane, scheduler): (Py<PyAny>, Bound<'_, PyAny>) = globals
-                .get_item("result")
-                .unwrap()
-                .unwrap()
-                .extract()
-                .unwrap();
-            (plane, Scheduler::from_python(&scheduler).unwrap())
-        })
-    }
-
-    fn start(plane: &Py<PyAny>) -> PythonDataPlane {
-        PythonDataPlane::start(Python::attach(|py| plane.clone_ref(py)), None).unwrap()
-    }
-
-    /// A one-row batch: the stand-in launches whatever it is handed.
-    fn batch() -> ForwardBatchView {
-        ForwardBatchView {
-            request_ids: vec!["r".to_owned()],
-            request_pool_indices: vec![0],
-            input_lengths: vec![1],
-            prefill_lengths: vec![1],
-            extend_prefix_lens: Vec::new(),
-            extend_replay_lens: Vec::new(),
-            num_extends: 0,
-        }
-    }
-
-    fn set(plane: &Py<PyAny>, name: &str, value: i64) {
-        Python::attach(|py| plane.setattr(py, name, value).unwrap());
-    }
-
-    /// The calls the stand-in recorded, with the thread each ran on.
-    fn calls(plane: &Py<PyAny>) -> Vec<(String, u64)> {
-        Python::attach(|py| plane.getattr(py, "calls").unwrap().extract(py).unwrap())
-    }
-
-    fn this_thread() -> u64 {
-        Python::attach(|py| {
-            py.import("threading")
-                .unwrap()
-                .call_method0("get_ident")
-                .unwrap()
-                .extract()
-                .unwrap()
-        })
-    }
-
-    #[test]
-    fn completion_keeps_the_selected_tokens_cumulative_probabilities() {
-        let (plane, mut scheduler) = plane();
-        Python::attach(|py| plane.setattr(py, "cumulative_probs", vec![0.875]).unwrap());
-        let batch = batch();
-        let dispatch = Dispatch {
-            forward: Some(&batch),
-            ..Dispatch::default()
-        };
-        let mut data_plane = start(&plane);
-        let forward = data_plane
-            .execute(scheduler.next_execution_plan(true, false), &dispatch)
-            .unwrap()
-            .unwrap();
-        let result = data_plane.complete(forward).unwrap();
-        assert_eq!(result.output_tokens, [100]);
-        assert_eq!(result.output_token_cumulative_probs, Some(vec![0.875]));
-    }
-
-    #[test]
-    fn the_forward_thread_runs_the_queue_and_the_control_thread_its_queries() {
-        let (plane, mut scheduler) = plane();
-        let batch = batch();
-        let dispatch = Dispatch {
-            forward: Some(&batch),
-            ..Dispatch::default()
-        };
-        let mut data_plane = start(&plane);
-        let forward = data_plane
-            .execute(scheduler.next_execution_plan(true, false), &dispatch)
-            .unwrap()
-            .unwrap();
-        assert_eq!(data_plane.complete(forward).unwrap().output_tokens, [100]);
-        let polled = data_plane.poll_cache_events().unwrap();
-        assert_eq!(polled.len(), 1);
-        data_plane.release(&["r".to_owned()]).unwrap();
-        // Answered once everything queued before it ran.
-        data_plane.ask(|reply| Op::Barrier { reply }).unwrap();
-        drop(data_plane);
-
-        let control = this_thread();
-        let calls = calls(&plane);
-        let on = |thread: u64| -> Vec<&str> {
-            calls
-                .iter()
-                .filter(|(_, ran_on)| *ran_on == thread)
-                .map(|(name, _)| name.as_str())
-                .collect()
-        };
-        assert_eq!(
-            on(control),
-            ["guard enter", "complete", "poll_cache_events", "guard exit"]
-        );
-        let forward_thread = calls
-            .iter()
-            .find(|(name, _)| name == "enter_forward_thread")
-            .unwrap()
-            .1;
-        assert_ne!(forward_thread, control);
-        assert_eq!(
-            on(forward_thread),
-            [
-                "enter_forward_thread",
-                "execute",
-                "note_committed",
-                "release",
-                "exit_forward_thread"
-            ]
-        );
-    }
-
-    #[test]
-    fn a_commit_does_not_wait_behind_a_later_launch() {
-        let (plane, mut scheduler) = plane();
-        let batch = batch();
-        let dispatch = Dispatch {
-            forward: Some(&batch),
-            ..Dispatch::default()
-        };
-        set(&plane, "held", 101);
-        let mut data_plane = start(&plane);
-        let first = data_plane
-            .execute(scheduler.next_execution_plan(true, false), &dispatch)
-            .unwrap()
-            .unwrap();
-        // The forward thread will sit in this launch until released.
-        let second = data_plane
-            .execute(scheduler.next_execution_plan(true, false), &dispatch)
-            .unwrap()
-            .unwrap();
-        // A commit queued behind it would wait forever; release the held
-        // launch after a while regardless, and fail the test then.
-        let (cancel, cancelled) = mpsc::channel::<()>();
-        let held = Python::attach(|py| plane.clone_ref(py));
-        let watchdog = thread::spawn(move || {
-            let timed_out = cancelled.recv_timeout(Duration::from_secs(10)).is_err();
-            Python::attach(|py| held.getattr(py, "unblock")?.call_method0(py, "set")).unwrap();
-            timed_out
-        });
-        assert_eq!(data_plane.complete(first).unwrap().output_tokens, [100]);
-        cancel.send(()).unwrap();
-        assert!(
-            !watchdog.join().unwrap(),
-            "the commit waited for the launch"
-        );
-        assert_eq!(data_plane.complete(second).unwrap().output_tokens, [101]);
-    }
-
-    #[test]
-    fn a_failed_launch_fails_the_commit_waiting_for_it() {
-        let (plane, mut scheduler) = plane();
-        let batch = batch();
-        let dispatch = Dispatch {
-            forward: Some(&batch),
-            ..Dispatch::default()
-        };
-        Python::attach(|py| plane.setattr(py, "failing", true).unwrap());
-        let mut data_plane = start(&plane);
-        let forward = data_plane
-            .execute(scheduler.next_execution_plan(true, false), &dispatch)
-            .unwrap()
-            .unwrap();
-        let error = data_plane.complete(forward).unwrap_err();
-        assert!(error.0.contains("the launch failed"), "{}", error.0);
-        // Every later call reports the failure, on either thread's side.
-        assert!(data_plane.poll_cache_events().is_err());
-        assert!(data_plane.release(&["r".to_owned()]).is_err());
-    }
-}
+#[path = "tests/data_plane.rs"]
+mod tests;

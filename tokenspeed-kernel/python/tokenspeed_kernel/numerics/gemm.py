@@ -24,6 +24,7 @@ import math
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from tokenspeed_kernel.numerics.inputs import (
     InputGenerator,
     set_benchmark_shapes,
@@ -144,6 +145,20 @@ class GemmInputGenerator(InputGenerator):
             )
         return self._generate_scales(shape, dtype)
 
+    def _generate_packed_block_scales(
+        self, rows: int, k_tiles: int, row_group: int
+    ) -> torch.Tensor:
+        exponents = self._generate_block_scales(
+            (math.ceil(rows / row_group), k_tiles), torch.uint8
+        )
+        exponents = exponents.repeat_interleave(row_group, dim=0)[:rows]
+        packed = F.pad(exponents, (0, (-k_tiles) % 4)).view(torch.int32)
+        # DeepGEMM uses MN-major scales with the MN extent aligned to 16 bytes.
+        aligned_rows = (rows + 3) // 4 * 4
+        scales = packed.new_zeros((packed.shape[1], aligned_rows)).T[:rows]
+        scales.copy_(packed)
+        return scales
+
     def _format(self, role: str) -> TensorFormat | None:
         if self.format_signature is None:
             return None
@@ -181,6 +196,9 @@ class GemmInputGenerator(InputGenerator):
                 )
             block_n, block_k = block_size
             k_tiles = math.ceil(K / block_k)
+            if scale.storage_dtype == torch.int32:
+                rows, row_group = (M, 1) if role == "a" else (N, block_n)
+                return self._generate_packed_block_scales(rows, k_tiles, row_group)
             if role == "a":
                 return self._generate_block_scales(
                     (*batch_shape, M, k_tiles), scale.storage_dtype

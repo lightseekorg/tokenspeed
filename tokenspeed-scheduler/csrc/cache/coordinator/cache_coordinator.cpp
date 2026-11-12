@@ -20,6 +20,7 @@
 
 #include "cache/coordinator/cache_coordinator.h"
 
+#include "core/profile_span.h"
 #include "cache/coordinator/eviction_plan.h"
 
 #include <algorithm>
@@ -1198,10 +1199,12 @@ CacheCoordinator::PrefixProbe CacheCoordinator::probePrefixWithOrder(const Promp
 }
 
 PreparedPrefixKeys CacheCoordinator::PreparePrefixKeys(std::span<const std::string> content_hashes) const {
+    ProfileSpan profile_span{"CacheCoordinator::PreparePrefixKeys"};
     return std::make_shared<const std::vector<std::vector<CacheKey>>>(buildGroupKeys(content_hashes));
 }
 
 CacheCoordinator::PrefixProbe CacheCoordinator::ProbePromptPrefix(const PromptPrefix& prompt) const {
+    ProfileSpan profile_span{"CacheCoordinator::ProbePromptPrefix"};
     return probePrefixWithOrder(prompt, match_order_, /*claim_partial=*/true);
 }
 
@@ -1303,6 +1306,7 @@ CacheCoordinator::PrefixProbe CacheCoordinator::ProbePrefix(std::span<const std:
 
 CacheCoordinator::PrefixProbe CacheCoordinator::ProbeDecodeDevicePrefix(const PromptPrefix& prompt,
                                                                         std::int32_t prompt_end_tokens) const {
+    ProfileSpan profile_span{"CacheCoordinator::ProbeDecodeDevicePrefix"};
     _assert(prompt.tokens.empty() || prompt_end_tokens <= static_cast<std::int32_t>(prompt.tokens.size()),
             "the prompt end lies inside the supplied tokens");
     std::vector<std::size_t> history_match_order;
@@ -1359,6 +1363,7 @@ CacheCoordinator::PrefixProbe CacheCoordinator::ProbeDecodeDevicePrefix(const Pr
 }
 
 CacheCoordinator::AcquiredPrefix CacheCoordinator::acquirePrefix(PrefixProbe&& probe, std::uint64_t access_epoch) {
+    ProfileSpan profile_span{"CacheCoordinator::acquirePrefix"};
     AcquiredPrefix out;
     // The Host floor is the Device's full-page coverage: the Host's KV pages
     // start there (a Device KV tail means the Host holds none, only State
@@ -2111,6 +2116,7 @@ void CacheCoordinator::evictTailEntries(const ContentHash& hash, std::int32_t ta
 }
 
 void CacheCoordinator::CollectDeadEntries() {
+    ProfileSpan profile_span{"CacheCoordinator::CollectDeadEntries"};
     // A node's entries, the Device's before the Host's.
     const auto entries_of = [&](const BoundaryTree::Node& node) {
         std::vector<NodeEntry> entries = NodeEntries(pool_, node);

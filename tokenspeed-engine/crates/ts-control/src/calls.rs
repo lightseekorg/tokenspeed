@@ -62,16 +62,16 @@
 use std::time::{Duration, Instant};
 
 use ts_wire::{
-    ControlRequest, Value,
     control::{
         ControlCall, DestroyWeightsUpdateGroupReqInput, FlushCacheReqInput,
-        InitWeightsUpdateGroupReqInput, PROFILE_START, PROFILE_STOP, PauseSchedulerReqInput,
-        ProfileReq, RebalanceExpertsReqInput, ReleaseMemoryOccupationReqInput,
-        ReloadForwardReqInput, ResumeMemoryOccupationReqInput, ResumeSchedulerReqInput,
-        UpdateWeightFromDiskReqInput, UpdateWeightsFromDistributedReqInput,
-        UpdateWeightsFromMooncakeReqInput,
+        InitWeightsUpdateGroupReqInput, PauseSchedulerReqInput, ProfileReq,
+        RebalanceExpertsReqInput, ReleaseMemoryOccupationReqInput, ReloadForwardReqInput,
+        ResumeMemoryOccupationReqInput, ResumeSchedulerReqInput, UpdateWeightFromDiskReqInput,
+        UpdateWeightsFromDistributedReqInput, UpdateWeightsFromMooncakeReqInput, PROFILE_START,
+        PROFILE_STOP,
     },
     msgpack::Integer,
+    ControlRequest, Value,
 };
 
 use crate::request::MAX_CACHE_SESSION_ID_BYTES;
@@ -827,17 +827,15 @@ mod tests {
         assert_eq!(request.max_prefix_tokens, 2);
         assert!(query(0).is_err());
         assert!(query(4).is_err());
-        assert!(
-            rl(
-                "get_shared_prefix_publication",
-                vec![body(vec![
-                    ("query_id", "".into()),
-                    ("input_ids", Value::Array(vec![int(1)])),
-                    ("max_prefix_tokens", int(1)),
-                ])]
-            )
-            .is_err()
-        );
+        assert!(rl(
+            "get_shared_prefix_publication",
+            vec![body(vec![
+                ("query_id", "".into()),
+                ("input_ids", Value::Array(vec![int(1)])),
+                ("max_prefix_tokens", int(1)),
+            ])]
+        )
+        .is_err());
     }
 
     #[test]
@@ -942,41 +940,35 @@ mod tests {
         };
         assert_eq!(request.cache_group_ids, ["group"]);
         assert!(request.ended);
-        assert!(
-            rl(
-                "demote_cache_groups",
-                vec![body(vec![("cache_group_ids", ids)])],
-            )
-            .is_err()
-        );
-        assert!(
-            rl(
-                "demote_cache_groups",
-                vec![body(vec![
-                    ("session_ids", Value::Array(vec!["group".into()])),
-                    ("ended", Value::Bool(true)),
-                ])],
-            )
-            .is_err()
-        );
+        assert!(rl(
+            "demote_cache_groups",
+            vec![body(vec![("cache_group_ids", ids)])],
+        )
+        .is_err());
+        assert!(rl(
+            "demote_cache_groups",
+            vec![body(vec![
+                ("session_ids", Value::Array(vec!["group".into()])),
+                ("ended", Value::Bool(true)),
+            ])],
+        )
+        .is_err());
         for ids in [
             vec!["".to_owned()],
             vec!["g".repeat(4097)],
             vec!["g".to_owned(); 4097],
         ] {
-            assert!(
-                rl(
-                    "demote_cache_groups",
-                    vec![body(vec![
-                        (
-                            "cache_group_ids",
-                            Value::Array(ids.into_iter().map(Value::Str).collect()),
-                        ),
-                        ("ended", Value::Bool(false)),
-                    ])],
-                )
-                .is_err()
-            );
+            assert!(rl(
+                "demote_cache_groups",
+                vec![body(vec![
+                    (
+                        "cache_group_ids",
+                        Value::Array(ids.into_iter().map(Value::Str).collect()),
+                    ),
+                    ("ended", Value::Bool(false)),
+                ])],
+            )
+            .is_err());
         }
     }
 
@@ -1015,13 +1007,11 @@ mod tests {
     #[test]
     fn demotion_requires_explicit_end_semantics_and_bounded_ids() {
         let ids = Value::Array(vec!["s".into()]);
-        assert!(
-            rl(
-                "demote_sessions",
-                vec![body(vec![("session_ids", ids.clone())])]
-            )
-            .is_err()
-        );
+        assert!(rl(
+            "demote_sessions",
+            vec![body(vec![("session_ids", ids.clone())])]
+        )
+        .is_err());
         let request = rl(
             "demote_sessions",
             vec![body(vec![
@@ -1035,16 +1025,14 @@ mod tests {
         };
         assert_eq!(request.session_ids, ["s"]);
         assert!(!request.ended);
-        assert!(
-            rl(
-                "demote_sessions",
-                vec![body(vec![
-                    ("session_ids", Value::Array(vec!["".into()])),
-                    ("ended", Value::Bool(true))
-                ])]
-            )
-            .is_err()
-        );
+        assert!(rl(
+            "demote_sessions",
+            vec![body(vec![
+                ("session_ids", Value::Array(vec!["".into()])),
+                ("ended", Value::Bool(true))
+            ])]
+        )
+        .is_err());
         assert!(
             rl("get_admission", Vec::new()).is_err(),
             "structured snapshots require the typed control API"

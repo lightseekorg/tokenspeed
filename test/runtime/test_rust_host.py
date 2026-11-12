@@ -490,6 +490,7 @@ def _data_plane(handle: DeviceHandle) -> HostDataPlane:
             attn_mapping=server_args.mapping.attn,
             sync_size=1,
             sync_group=None,
+            host_spans=None,
         ),
         {},
         report_compiles=False,

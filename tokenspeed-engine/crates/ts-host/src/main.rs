@@ -36,15 +36,17 @@
 
 mod data_plane;
 mod encode;
+mod host_spans;
 mod interpreter;
 mod logging;
 mod pd;
 
 use std::{
+    collections::HashSet,
     process::ExitCode,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex, OnceLock,
     },
     thread,
     time::Duration,
@@ -135,6 +137,72 @@ struct Args {
     python: String,
     control_fd: i32,
     enable_async_logging: bool,
+}
+
+/// The control and forward threads report to the same launcher.
+static LAUNCHER_FAILURE: OnceLock<LauncherFailure> = OnceLock::new();
+
+struct LauncherFailure {
+    notification: OnceLock<()>,
+    logged: Mutex<HashSet<String>>,
+    parent: Option<libc::pid_t>,
+}
+
+impl LauncherFailure {
+    #[allow(unsafe_code)]
+    fn for_parent() -> Self {
+        // SAFETY: getppid has no preconditions.
+        let parent = unsafe { libc::getppid() };
+        Self {
+            notification: OnceLock::new(),
+            logged: Mutex::new(HashSet::new()),
+            parent: (parent > 0).then_some(parent),
+        }
+    }
+
+    /// Wait for the first signal attempt. Only its caller receives the error,
+    /// so it can report it after publishing any failure state.
+    #[allow(unsafe_code)]
+    fn notify(&self) -> std::io::Result<bool> {
+        let mut result = Ok(false);
+        self.notification.get_or_init(|| {
+            // Keep logging and Python outside this initialization: concurrent
+            // reporters wait here until the signal attempt has completed.
+            let failed = self.parent.is_some_and(|parent| {
+                // SAFETY: parent is positive. A parent in an outer PID
+                // namespace is 0 and must not become a process-group signal.
+                // Only notify the launcher that originally owned this rank.
+                unsafe { libc::getppid() == parent && libc::kill(parent, libc::SIGUSR1) != 0 }
+            });
+            result = if failed {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(true)
+            };
+        });
+        result
+    }
+
+    fn log_signal_error(error: std::io::Error) {
+        tracing::error!(%error, "could not notify the launcher");
+    }
+
+    fn report(&self, error: impl std::fmt::Display) {
+        if let Err(error) = self.notify() {
+            Self::log_signal_error(error);
+        }
+        let error = error.to_string();
+        let distinct = self
+            .logged
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(error.clone());
+        if distinct {
+            // Synchronous logging can stall on a blocked output stream.
+            // Release the diagnostic lock before calling the writer.
+            tracing::error!("{error}");
+        }
+    }
 }
 
 fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, HostError> {
@@ -576,7 +644,7 @@ fn watch_signals(stop: Arc<AtomicBool>) -> std::io::Result<()> {
     Ok(())
 }
 
-fn serve(args: &Args) -> Result<(), HostError> {
+fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
     let stop = Arc::new(AtomicBool::new(false));
     watch_signals(stop.clone())?;
 
@@ -585,9 +653,13 @@ fn serve(args: &Args) -> Result<(), HostError> {
             // Before anything imports the scheduler package.
             ts_scheduler::alias_builtin_module(py)?;
             let outbox = Bound::new(py, pd::Outbox::new())?;
+            let host_spans = Bound::new(py, host_spans::HostSpans)?;
             let bootstrap = py
                 .import("tokenspeed.runtime.engine.rust_host")?
-                .call_method1("bootstrap", (args.control_fd, outbox.clone(), 2_u32))?;
+                .call_method1(
+                    "bootstrap",
+                    (args.control_fd, outbox.clone(), 2_u32, host_spans),
+                )?;
             let mode: String = bootstrap.getattr("mode")?.extract()?;
             Ok((bootstrap.unbind(), outbox.unbind(), mode))
         })();
@@ -806,11 +878,31 @@ fn serve(args: &Args) -> Result<(), HostError> {
             l3,
         },
     );
-    let served = event_loop.run(&stop);
-    // Stops the forward thread and tells the frontend the engine is gone.
-    drop(event_loop);
-    call("close")?;
-    Ok(served?)
+    finish_serving(event_loop.run(&stop), launcher, || {
+        // Stops the forward thread and tells the frontend the engine is gone.
+        drop(event_loop);
+        call("close")
+    })
+}
+
+fn finish_serving(
+    served: Result<(), LoopError>,
+    launcher: &LauncherFailure,
+    close: impl FnOnce() -> Result<(), HostError>,
+) -> Result<(), HostError> {
+    let served = served.map_err(HostError::from);
+    if let Err(error) = &served {
+        // Joining the forward thread and closing Python can wait on device
+        // work. Let the launcher start failure handling before either.
+        launcher.report(error);
+    }
+    let closed = close();
+    if served.is_err() {
+        if let Err(error) = &closed {
+            tracing::error!(%error, "rank cleanup also failed");
+        }
+    }
+    served.and(closed)
 }
 
 fn main() -> ExitCode {
@@ -822,97 +914,25 @@ fn main() -> ExitCode {
         }
     };
     let _log_guard = logging::init(args.enable_async_logging);
+    let launcher = LAUNCHER_FAILURE.get_or_init(LauncherFailure::for_parent);
     let served = (|| {
         interpreter::start(&args.python).map_err(HostError::Interpreter)?;
-        let served = {
-            // The host does not finalize Python. Drain its logger on success,
-            // error and unwind, before failure notification can kill the rank.
-            let _python_logs = logging::PythonLogGuard;
-            serve(&args)
-        };
-        if served.is_err() {
-            // As `run_event_loop` does: the launcher then stops the other
-            // ranks.
-            let notified = Python::attach(|py| {
-                py.import("tokenspeed.runtime.engine.rust_host")?
-                    .call_method0("notify_launcher_of_failure")
-                    .map(drop)
-            });
-            if let Err(error) = notified {
-                tracing::error!(%error, "could not notify the launcher");
-            }
-        }
-        served
+        // The host does not finalize Python. Drain its logger on success,
+        // error and unwind if the launcher has not stopped the rank.
+        let _python_logs = logging::PythonLogGuard;
+        serve(&args, launcher)
     })();
     match served {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            tracing::error!("{error}");
+            // Errors outside generation serving still arrive after cleanup,
+            // but use the same native notification and parent checks.
+            launcher.report(&error);
             ExitCode::FAILURE
         }
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::parse_args;
-
-    #[test]
-    fn python_trace_provider_loads_and_falls_back_on_error() {
-        use pyo3::{prelude::*, types::PyModule};
-        use std::ffi::CString;
-        Python::initialize();
-        Python::attach(|py| {
-            let code = CString::new(
-                r#"
-def resolve(rid):
-    if rid == 'error': raise ValueError('bad context')
-    if rid == 'none': return None
-    if rid == 'wrong': return 123
-    if rid == 'root': return ('1' * 32, None)
-    return ('1' * 32, '2' * 16)
-trace_provider = resolve
-"#,
-            )
-            .unwrap();
-            let module =
-                PyModule::from_code(py, &code, c"ts_context_test.py", c"ts_context_test").unwrap();
-            let modules = py.import("sys").unwrap().getattr("modules").unwrap();
-            modules.set_item("ts_context_test", &module).unwrap();
-            let provider = super::trace_provider(module.as_any()).unwrap().unwrap();
-            assert_eq!(
-                provider("valid"),
-                Some(("1".repeat(32), Some("2".repeat(16))))
-            );
-            assert_eq!(provider("root"), Some(("1".repeat(32), None)));
-            assert_eq!(provider("none"), None);
-            assert_eq!(provider("error"), None);
-            assert_eq!(provider("wrong"), None);
-            module.setattr("trace_provider", 123).unwrap();
-            assert!(super::trace_provider(module.as_any()).is_err());
-            module.setattr("trace_provider", py.None()).unwrap();
-            assert!(super::trace_provider(module.as_any()).unwrap().is_none());
-            modules.del_item("ts_context_test").unwrap();
-        });
-    }
-
-    #[test]
-    fn logging_mode_is_explicit_and_validated() {
-        let args = |mode: &str| {
-            [
-                "--python",
-                "python3",
-                "--control-fd",
-                "3",
-                "--enable-async-logging",
-                mode,
-            ]
-            .map(str::to_owned)
-            .into_iter()
-        };
-        assert!(parse_args(args("true")).unwrap().enable_async_logging);
-        assert!(!parse_args(args("false")).unwrap().enable_async_logging);
-        assert!(parse_args(args("yes")).is_err());
-        assert!(parse_args(args("true").take(4)).is_err());
-    }
-}
+#[path = "tests/main.rs"]
+mod tests;
