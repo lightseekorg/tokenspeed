@@ -305,6 +305,9 @@ class _AutotuneExecutor:
         self._model_input_kwargs_hook = model_input_kwargs
         self._events = events
         self.device = "cpu"
+        # Startup warmup runs on the serving stream, as the constructor sets it up.
+        self.device_module = torch.get_device_module(self.device)
+        self.execution_stream = self.device_module.Stream()
         # The stub gathers whole sampled rows, so autotune() runs no
         # vocab-shard warmup.
         self._samples_from_vocab_shard = False

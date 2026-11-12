@@ -988,6 +988,9 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
     executor.model_runner = runner
     executor.drafter = None
     executor._samples_from_vocab_shard = False
+    # Startup warmup runs on the serving stream, as the constructor sets it up.
+    executor.device_module = torch.get_device_module(ib.device)
+    executor.execution_stream = executor.device_module.Stream()
     pg = PrefillGraph.__new__(PrefillGraph)
     pg.config = executor.config
     pg.input_buffers = ib
