@@ -28,6 +28,7 @@ patterns (NaN payloads, infinities, signed zeros), eager and under CUDA
 graph replay with new inputs.
 """
 
+import gc
 import sys
 from datetime import timedelta
 from pathlib import Path
@@ -143,6 +144,13 @@ def _worker(rank: int, degree: int, rendezvous: str) -> None:
             torch.cuda.synchronize()
             _same_bits(captured, all_to_all_transpose(shard, group, even, backend=nccl))
         del warm
+        dist.barrier()
+        # Drain graph work and release the prepared exchange while its group
+        # is still live. Replacing the global backend drops its shared owner.
+        graph.reset()
+        set_global_backend(nccl)
+        del backend
+        gc.collect()
         dist.barrier()
     finally:
         dist.destroy_process_group()

@@ -86,6 +86,7 @@ class TokenSpeedA2ALamportState:
         self.channels = channels
         self.blocks = blocks
         self.words = max_rows * channels // 2
+        self.handle = None
         self.chunk_threshold_bytes = None
         self.chunk_scratch = self.chunk_handle = self.chunk_peers = None
         self.chunk_flags = self.chunk_flag_handle = self.chunk_flag_peers = None
@@ -118,6 +119,13 @@ class TokenSpeedA2ALamportState:
         )
         torch.cuda.synchronize(device)
         dist.barrier(group=group)
+
+    def __del__(self):
+        # Release peer mappings before their backing allocations. Torch 2.9
+        # can abort during multicast unbind if the allocation is freed first.
+        self.handle = None
+        self.chunk_handle = None
+        self.chunk_flag_handle = None
 
     def prepare_fp8_quantization(self):
         """Allocate borrowed FP8 values and MN-major FP32 scales before capture.
