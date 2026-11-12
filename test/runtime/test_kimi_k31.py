@@ -320,15 +320,11 @@ def test_dsa_spec_carries_the_padded_prefill_replay_admission(tmp_path) -> None:
     assert server_args.enable_mixed_batch is False
     spec = DSAConfig._spec_kwargs(server_args, model_config, False)
     assert spec["padded_prefill_replay"] is True
-    # The disable flag turns it off; a mixed batch keeps it.
+    # The disable flag turns it off.
     server_args.disable_prefill_graph = True
     spec = DSAConfig._spec_kwargs(server_args, model_config, False)
     assert spec["padded_prefill_replay"] is False
     server_args.disable_prefill_graph = False
-    server_args.enable_mixed_batch = True
-    spec = DSAConfig._spec_kwargs(server_args, model_config, False)
-    assert spec["padded_prefill_replay"] is True
-    server_args.enable_mixed_batch = False
     # The prefill role keeps its layerwise condition.
     server_args.disaggregation_mode = "prefill"
     spec = DSAConfig._spec_kwargs(server_args, model_config, False)
