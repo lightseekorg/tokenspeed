@@ -94,7 +94,7 @@ def _reference(logits, bias, scale, normalize, deterministic_order):
     return weights, ids, sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids
 
 
-def _fused(logits, bias, scale, normalize, scratch):
+def _fused(logits, bias, scale, normalize, scratch, shared_down=None):
     from tokenspeed_kernel.ops.moe._triton.kimi3_sigmoid_topk import (
         kimi3_sigmoid_bias_topk_sorted,
     )
@@ -106,7 +106,26 @@ def _fused(logits, bias, scale, normalize, scratch):
         normalize_topk_weights=normalize,
         block_size=_BLOCK,
         scratch=scratch,
+        shared_down=shared_down,
     )
+
+
+# K3's TP8 shared-expert down projection: [rows, 768] @ [7168, 768].T.
+_SHARED_K = 768
+_SHARED_N = 7168
+
+
+def _shared_down_inputs(rows: int, seed: int) -> tuple[torch.Tensor, torch.Tensor]:
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    hidden = torch.randn((rows, _SHARED_K), generator=generator, device="cuda")
+    weight = torch.randn((_SHARED_N, _SHARED_K), generator=generator, device="cuda")
+    return hidden.to(torch.bfloat16), (weight * 0.03).to(torch.bfloat16)
+
+
+def _check_shared_down(got, hidden, weight):
+    # An FP32 reduction in another order stays within one BF16 rounding.
+    want = hidden.float() @ weight.float().T
+    torch.testing.assert_close(got.float(), want, rtol=2**-7, atol=1e-4)
 
 
 def _bits(tensor: torch.Tensor) -> torch.Tensor:
@@ -335,6 +354,112 @@ def test_a8w4_moe_takes_the_fused_sort_bitwise(
     assert sorts == [rows]
     assert module._situ_sorted_routes is None
     assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+
+
+@pytest.mark.parametrize("rows", (1, 8, 16, 33, 64, 96, 128))
+@pytest.mark.parametrize("out_kind", ("contiguous", "strided", "allocated"))
+def test_sorted_routing_carries_shared_down(rows, out_kind):
+    """The shared down projection rides along without changing the routes."""
+    from tokenspeed_kernel.ops.moe._triton.kimi3_sigmoid_topk import (
+        kimi3_sorted_routing_scratch,
+    )
+
+    scratch = kimi3_sorted_routing_scratch(torch.device("cuda"))
+    logits, bias = _logits("random", rows, 500 + rows)
+    hidden, weight = _shared_down_inputs(rows, 600 + rows)
+    wide = torch.full((rows, _SHARED_N + 64), -7.0, dtype=torch.bfloat16, device="cuda")
+    out = {
+        "contiguous": torch.full_like(wide[:, :_SHARED_N].contiguous(), -7.0),
+        "strided": wide[:, :_SHARED_N],
+        "allocated": None,
+    }[out_kind]
+    carried = _fused(logits, bias, 2.827, True, scratch, (hidden, weight, out))
+    torch.cuda.synchronize()
+    assert len(carried) == 7
+    _check(carried[:6], _reference(logits, bias, 2.827, True, True), rows, True)
+    if out is not None:
+        assert carried[6] is out
+    _check_shared_down(carried[6], hidden, weight)
+    # A row-strided output keeps the columns past its width.
+    assert torch.all(wide[:, _SHARED_N:] == -7.0)
+    assert not torch.any(scratch)
+
+
+def test_sorted_routing_shared_down_graph_replay():
+    """Captured launches carrying the projection replay with their own rows."""
+    from tokenspeed_kernel.ops.moe._triton.kimi3_sigmoid_topk import (
+        kimi3_sorted_routing_scratch,
+    )
+
+    scratch = kimi3_sorted_routing_scratch(torch.device("cuda"))
+    layers = []
+    for rows in (8, 96, 16, 33):
+        logits, bias = _logits("random", rows, 900 + rows)
+        hidden, weight = _shared_down_inputs(rows, 950 + rows)
+        out = torch.empty((rows, _SHARED_N), dtype=torch.bfloat16, device="cuda")
+        layers.append((logits, bias, hidden, weight, out))
+    references = [_reference(layer[0], layer[1], 2.827, True, True) for layer in layers]
+    stream = torch.cuda.Stream()
+    snapshots = []
+    with torch.cuda.stream(stream):
+        for logits, bias, hidden, weight, out in layers:
+            _fused(logits, bias, 2.827, True, scratch, (hidden, weight, out))
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            for logits, bias, hidden, weight, out in layers:
+                routes = _fused(
+                    logits, bias, 2.827, True, scratch, (hidden, weight, out)
+                )
+                snapshots.append(tuple(t.clone() for t in routes[:6]))
+    torch.cuda.synchronize()
+    for _ in range(2):
+        for layer_snapshots, (*_, out) in zip(snapshots, layers, strict=True):
+            out.fill_(-7)
+            for tensor in layer_snapshots:
+                tensor.fill_(-7)
+        graph.replay()
+        torch.cuda.synchronize()
+        for layer, got, want in zip(layers, snapshots, references, strict=True):
+            logits, _, hidden, weight, out = layer
+            _check(got, want, logits.shape[0], order_exact=True)
+            _check_shared_down(out, hidden, weight)
+        assert not torch.any(scratch)
+
+
+def test_sorted_routing_rejects_unsupported_shared_down():
+    from tokenspeed_kernel.ops.moe._triton.kimi3_sigmoid_topk import (
+        kimi3_sorted_routing_fuses_shared_down,
+        kimi3_sorted_routing_scratch,
+    )
+
+    scratch = kimi3_sorted_routing_scratch(torch.device("cuda"))
+    hidden, weight = _shared_down_inputs(129, 7)
+    assert kimi3_sorted_routing_fuses_shared_down(hidden[:128], weight, None)
+    # Above 32 rows the programs write 64 columns each.
+    assert kimi3_sorted_routing_fuses_shared_down(hidden[:32], weight[:7136], None)
+    assert not kimi3_sorted_routing_fuses_shared_down(hidden[:33], weight[:7136], None)
+    out = torch.empty((16, _SHARED_N), dtype=torch.bfloat16, device="cuda")
+    unsupported = (
+        # More rows than the MFMA tiles cover.
+        (hidden, weight, None),
+        (hidden[:16].float(), weight, None),
+        # K outside the 256-wide steps, N outside the 32-column programs.
+        (hidden[:16, :320].contiguous(), weight[:, :320].contiguous(), None),
+        (hidden[:16], weight[:7160], None),
+        (hidden[:16], weight, out[:8]),
+        (hidden[:16], weight, out.float()),
+        (hidden[:16], weight, torch.empty_like(out).t().contiguous().t()),
+    )
+    for case in unsupported:
+        assert not kimi3_sorted_routing_fuses_shared_down(*case)
+    logits, bias = _logits("random", 16, 3)
+    for case in unsupported[1:]:
+        with pytest.raises(ValueError, match="shared_down"):
+            _fused(logits, bias, 1.0, True, scratch, case)
+    # The projection's rows must be the routed rows.
+    with pytest.raises(ValueError, match="shared_down"):
+        _fused(logits, bias, 1.0, True, scratch, (hidden[:8], weight, None))
 
 
 def test_sorted_routing_rejects_unsupported_rows():

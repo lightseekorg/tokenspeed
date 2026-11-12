@@ -236,6 +236,18 @@ _SORTED_ROW_WORDS = 8
 _SORTED_MAX_ROWS = 32 * _SORTED_ROW_WORDS
 # Routes each sorting program places, one per thread.
 _SORTED_HELPER_ROUTES = 512
+# The shared-expert down projection a sorted launch can carry. Each program
+# writes a block of output columns of every row, reducing K in 256-wide steps:
+# 32 columns spread the weight over more CUs through 32 rows, and 64 halve the
+# activation reads above that (gfx950: 64-column programs lose at 32 rows,
+# 32-column programs at 96).
+_SHARED_DOWN_BLOCK_K = 256
+_SHARED_DOWN_NARROW_ROWS = 32
+_SHARED_DOWN_MAX_ROWS = 128
+
+
+def _shared_down_block_n(rows: int) -> int:
+    return 32 if rows <= _SHARED_DOWN_NARROW_ROWS else 64
 
 
 def _sorted_scratch_words() -> int:
@@ -348,7 +360,48 @@ def _kimi3_sorted_routes(
         tl.atomic_xchg(sorted_count, 0, sem="relaxed", scope="gpu")
 
 
-@triton.jit(do_not_specialize=["rows", "helpers"])
+@triton.jit
+def _kimi3_shared_down_tile(
+    hidden,
+    weight,
+    out,
+    out_stride,
+    rows,
+    tile,
+    K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Write columns ``tile * BLOCK_N`` onward of ``hidden @ weight.T`` for every row.
+
+    Reduces in FP32 and stores the output dtype; rows past ``rows`` pad the
+    MFMA tile and are neither read nor written.
+    """
+    row = tl.arange(0, BLOCK_M)
+    column = tile * BLOCK_N + tl.arange(0, BLOCK_N)
+    k = tl.arange(0, BLOCK_K)
+    row_valid = (row < rows)[:, None]
+    accumulator = tl.zeros([BLOCK_M, BLOCK_N], tl.float32)
+    for k_start in tl.static_range(0, K, BLOCK_K):
+        activation = tl.load(
+            hidden + row[:, None] * K + (k_start + k)[None, :],
+            mask=row_valid,
+            other=0.0,
+        )
+        weight_tile = tl.load(
+            weight + column[:, None] * K + (k_start + k)[None, :],
+            cache_modifier=".cg",
+        )
+        accumulator = tl.dot(activation, tl.trans(weight_tile), accumulator)
+    tl.store(
+        out + row[:, None] * out_stride + column[None, :],
+        accumulator.to(out.dtype.element_ty),
+        mask=row_valid,
+    )
+
+
+@triton.jit(do_not_specialize=["rows", "helpers", "shared_out_stride"])
 def _kimi3_sigmoid_bias_topk_sorted_kernel(
     logits,
     correction_bias,
@@ -359,6 +412,10 @@ def _kimi3_sigmoid_bias_topk_sorted_kernel(
     sorted_expert_ids,
     num_valid_ids,
     scratch,
+    shared_hidden,
+    shared_weight,
+    shared_out,
+    shared_out_stride,
     rows,
     helpers,
     ROUTED_SCALING_FACTOR: tl.constexpr,
@@ -367,6 +424,11 @@ def _kimi3_sigmoid_bias_topk_sorted_kernel(
     ROW_WORDS: tl.constexpr,
     WORDS: tl.constexpr,
     HELPER_ROUTES: tl.constexpr,
+    SHARED_TILES: tl.constexpr,
+    SHARED_K: tl.constexpr,
+    SHARED_BLOCK_M: tl.constexpr,
+    SHARED_BLOCK_N: tl.constexpr,
+    SHARED_BLOCK_K: tl.constexpr,
 ):
     num_experts: tl.constexpr = 896
     topk: tl.constexpr = 16
@@ -412,40 +474,58 @@ def _kimi3_sigmoid_bias_topk_sorted_kernel(
         tl.debug_barrier()
         tl.atomic_add(counter, 1, sem="relaxed", scope="gpu")
     else:
-        # The sorting programs come last in the grid, so every row program
-        # has dispatched before they wait for its arrival. One thread polls;
-        # its acquire invalidates this CU's caches, and the barrier keeps
-        # every wave's loads after the last poll.
-        arrived = tl.atomic_add(counter, 0, sem="acquire", scope="gpu")
-        while arrived < rows:
-            tl.inline_asm_elementwise(
-                asm="s_sleep 2",
-                constraints="=r",
-                args=[],
-                dtype=tl.int32,
-                is_pure=False,
-                pack=1,
-            )
+        helper = pid - rows - SHARED_TILES
+        if helper >= 0:
+            # The sorting programs come last in the grid, so every row program
+            # has dispatched before they wait for its arrival. One thread
+            # polls; its acquire invalidates this CU's caches, and the barrier
+            # keeps every wave's loads after the last poll.
             arrived = tl.atomic_add(counter, 0, sem="acquire", scope="gpu")
-        tl.debug_barrier()
-        _kimi3_sorted_routes(
-            topk_ids,
-            topk_weights,
-            sorted_ids,
-            sorted_weights,
-            sorted_expert_ids,
-            num_valid_ids,
-            masks,
-            sorted_count,
-            counter,
-            rows,
-            pid - rows,
-            helpers,
-            BLOCK_SHIFT,
-            ROW_WORDS,
-            WORDS,
-            HELPER_ROUTES,
-        )
+            while arrived < rows:
+                tl.inline_asm_elementwise(
+                    asm="s_sleep 2",
+                    constraints="=r",
+                    args=[],
+                    dtype=tl.int32,
+                    is_pure=False,
+                    pack=1,
+                )
+                arrived = tl.atomic_add(counter, 0, sem="acquire", scope="gpu")
+            tl.debug_barrier()
+            _kimi3_sorted_routes(
+                topk_ids,
+                topk_weights,
+                sorted_ids,
+                sorted_weights,
+                sorted_expert_ids,
+                num_valid_ids,
+                masks,
+                sorted_count,
+                counter,
+                rows,
+                helper,
+                helpers,
+                BLOCK_SHIFT,
+                ROW_WORDS,
+                WORDS,
+                HELPER_ROUTES,
+            )
+        else:
+            if SHARED_TILES > 0:
+                # The shared-expert down projection shares no data with the
+                # routing; its programs run while the rows route and sort.
+                _kimi3_shared_down_tile(
+                    shared_hidden,
+                    shared_weight,
+                    shared_out,
+                    shared_out_stride,
+                    rows,
+                    pid - rows,
+                    SHARED_K,
+                    SHARED_BLOCK_M,
+                    SHARED_BLOCK_N,
+                    SHARED_BLOCK_K,
+                )
 
 
 def kimi3_sorted_routing_scratch(device: torch.device) -> torch.Tensor:
@@ -457,6 +537,47 @@ def kimi3_sorted_routing_scratch(device: torch.device) -> torch.Tensor:
     return torch.zeros(_sorted_scratch_words(), dtype=torch.int32, device=device)
 
 
+def kimi3_sorted_routing_fuses_shared_down(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor | None,
+) -> bool:
+    """Whether ``kimi3_sigmoid_bias_topk_sorted`` can carry this down projection.
+
+    ``hidden_states`` and ``weight`` must be contiguous BF16 ``[rows, K]`` and
+    ``[N, K]`` on one device, with at most 128 rows, ``K`` a multiple of 256
+    and ``N`` of 64 (of 32 through 32 rows). ``out``, when given, must be
+    BF16 ``[rows, N]`` with unit inner stride and non-overlapping rows.
+    """
+    if (
+        hidden_states.dim() != 2
+        or weight.dim() != 2
+        or hidden_states.dtype != torch.bfloat16
+        or weight.dtype != torch.bfloat16
+        or not hidden_states.is_cuda
+        or weight.device != hidden_states.device
+        or not hidden_states.is_contiguous()
+        or not weight.is_contiguous()
+    ):
+        return False
+    rows, width = hidden_states.shape
+    output_width = weight.shape[0]
+    if (
+        not 0 < rows <= _SHARED_DOWN_MAX_ROWS
+        or weight.shape[1] != width
+        or width % _SHARED_DOWN_BLOCK_K
+        or output_width % _shared_down_block_n(rows)
+    ):
+        return False
+    return out is None or (
+        out.shape == (rows, output_width)
+        and out.dtype == torch.bfloat16
+        and out.device == hidden_states.device
+        and out.stride(1) == 1
+        and out.stride(0) >= output_width
+    )
+
+
 def kimi3_sigmoid_bias_topk_sorted(
     router_logits: torch.Tensor,
     correction_bias: torch.Tensor,
@@ -465,6 +586,7 @@ def kimi3_sigmoid_bias_topk_sorted(
     normalize_topk_weights: bool,
     block_size: int,
     scratch: torch.Tensor,
+    shared_down: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None = None,
 ) -> tuple[torch.Tensor, ...]:
     """Route like ``kimi3_sigmoid_bias_topk`` and sort the routes by expert.
 
@@ -474,6 +596,8 @@ def kimi3_sigmoid_bias_topk_sorted(
     them wait for every row, then write the block-aligned expert sort of all
     routes in the format of the gfx950 MoE ``gluon_moe_sorting`` (896 local
     experts from zero), with each expert's routes in flat top-k order.
+    Given ``shared_down``, programs between the rows and the sort also write
+    that independent projection, so it costs no launch of its own.
 
     Args:
         router_logits: Contiguous FP32 logits shaped ``[rows, 896]``, with
@@ -484,6 +608,11 @@ def kimi3_sigmoid_bias_topk_sorted(
         block_size: Power-of-two expert padding granularity of the sort.
         scratch: ``kimi3_sorted_routing_scratch`` buffer on the logits'
             device; launches sharing it must be stream-ordered.
+        shared_down: Optional ``(hidden_states, weight, out)`` of a BF16
+            projection ``hidden_states @ weight.T`` over the same rows,
+            accepted by ``kimi3_sorted_routing_fuses_shared_down``. It reduces
+            in FP32 into ``out``, or a new contiguous tensor when ``out`` is
+            None.
 
     Returns:
         ``(topk_weights, topk_ids, sorted_ids, sorted_weights,
@@ -491,7 +620,8 @@ def kimi3_sigmoid_bias_topk_sorted(
         routes, then the sort. ``sorted_ids`` holds ``(slot << 24) | row``
         per route and ``(16 << 24) | rows`` per padding slot;
         ``num_valid_ids`` is ``[padded routes, rows]``. Entries past the
-        padded routes (and their blocks) are unwritten.
+        padded routes (and their blocks) are unwritten. Given
+        ``shared_down``, its output follows as a seventh tensor.
     """
     if (
         router_logits.dim() != 2
@@ -537,7 +667,33 @@ def kimi3_sigmoid_bias_topk_sorted(
     )
     num_valid_ids = torch.empty((2,), dtype=torch.int32, device=device)
     helpers = triton.cdiv(routes, _SORTED_HELPER_ROUTES)
-    _kimi3_sigmoid_bias_topk_sorted_kernel[(rows + helpers,)](
+    shared_block_m = 16
+    shared_block_n = 32
+    if shared_down is None:
+        shared_hidden = shared_weight = shared_out = router_logits
+        shared_tiles = shared_width = shared_out_stride = 0
+    else:
+        shared_hidden, shared_weight, shared_out = shared_down
+        if (
+            shared_hidden.shape[0] != rows
+            or shared_hidden.device != device
+            or not kimi3_sorted_routing_fuses_shared_down(
+                shared_hidden, shared_weight, shared_out
+            )
+        ):
+            raise ValueError(
+                "shared_down must be a BF16 projection of the routed rows that "
+                "kimi3_sorted_routing_fuses_shared_down accepts"
+            )
+        if shared_out is None:
+            shared_out = shared_hidden.new_empty((rows, shared_weight.shape[0]))
+        shared_width = shared_hidden.shape[1]
+        shared_block_n = _shared_down_block_n(rows)
+        shared_tiles = shared_weight.shape[0] // shared_block_n
+        shared_out_stride = shared_out.stride(0)
+        # MFMA row tiles: one binary each through 16, 32, 64 and 128 rows.
+        shared_block_m = max(16, triton.next_power_of_2(rows))
+    _kimi3_sigmoid_bias_topk_sorted_kernel[(rows + shared_tiles + helpers,)](
         router_logits,
         correction_bias,
         topk_ids,
@@ -547,6 +703,10 @@ def kimi3_sigmoid_bias_topk_sorted(
         sorted_expert_ids,
         num_valid_ids,
         scratch,
+        shared_hidden,
+        shared_weight,
+        shared_out,
+        shared_out_stride,
         rows,
         helpers,
         ROUTED_SCALING_FACTOR=float(routed_scaling_factor),
@@ -557,11 +717,16 @@ def kimi3_sigmoid_bias_topk_sorted(
         # through 32, 64, 128 and 256 rows.
         WORDS=triton.next_power_of_2(triton.cdiv(rows, 32)),
         HELPER_ROUTES=_SORTED_HELPER_ROUTES,
+        SHARED_TILES=shared_tiles,
+        SHARED_K=shared_width,
+        SHARED_BLOCK_M=shared_block_m,
+        SHARED_BLOCK_N=shared_block_n,
+        SHARED_BLOCK_K=_SHARED_DOWN_BLOCK_K,
         num_warps=8,
         num_stages=1,
         waves_per_eu=1,
     )
-    return (
+    routes_and_sort = (
         topk_weights,
         topk_ids,
         sorted_ids,
@@ -569,10 +734,14 @@ def kimi3_sigmoid_bias_topk_sorted(
         sorted_expert_ids,
         num_valid_ids,
     )
+    if shared_down is None:
+        return routes_and_sort
+    return (*routes_and_sort, shared_out)
 
 
 __all__ = [
     "kimi3_sigmoid_bias_topk",
     "kimi3_sigmoid_bias_topk_sorted",
+    "kimi3_sorted_routing_fuses_shared_down",
     "kimi3_sorted_routing_scratch",
 ]

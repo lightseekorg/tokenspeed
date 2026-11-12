@@ -967,5 +967,78 @@ def test_fused_routing_hands_its_sort_to_the_experts(rows):
     assert int(((real >> 24) < 16).sum()) == rows * 16
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or "gfx950" not in torch.cuda.get_device_properties(0).gcnArchName,
+    reason="the fused K3 routing sorts for the gfx950 A8W4 MoE",
+)
+@pytest.mark.parametrize("rows", [4, 8, 64, 128, 192])
+def test_fused_routing_carries_the_shared_down_projection(monkeypatch, rows):
+    from tokenspeed_kernel.ops.moe import kimi3_sorted_routing_scratch
+
+    from tokenspeed.runtime.models import kimi_k3 as mod
+
+    monkeypatch.setattr(mod, "_FUSED_ROUTING_MAX_ROWS", 192)
+    generator = torch.Generator(device="cuda").manual_seed(rows)
+    logits = torch.randn((rows, 896), generator=generator, device="cuda")
+    bias = torch.randn((896,), generator=generator, device="cuda") * 0.01
+    shared_input = torch.randn((rows, 768), generator=generator, device="cuda").to(
+        torch.bfloat16
+    )
+    down_weight = (
+        torch.randn((7168, 768), generator=generator, device="cuda") * 0.03
+    ).to(torch.bfloat16)
+    shared_out = torch.full((rows, 7168), -7.0, dtype=torch.bfloat16, device="cuda")
+    moe = _make_moe(_SpyFork(), num_tokens=rows)
+    moe.gate = _Gate(logits, bias)
+    moe.config = SimpleNamespace(moe_renormalize=True)
+    moe.routed_scaling_factor = 2.827
+    moe.topk = mock.Mock(
+        return_value=(torch.zeros(rows, 16), torch.zeros(rows, 16)),
+        simulate_routing=False,
+    )
+    moe._fused_routing_scratch = kimi3_sorted_routing_scratch(torch.device("cuda"))
+    moe.shared_experts = SimpleNamespace(down_proj=SimpleNamespace(weight=down_weight))
+    projections = mock.Mock(return_value=(logits, torch.zeros(rows, 4), shared_input))
+    moe._latent_input_projections = projections
+    order = []
+
+    def project_shared(hidden_states, weight, out=None):
+        assert hidden_states is shared_input and weight is down_weight
+        assert out is shared_out
+        order.append("shared_down")
+        return out.copy_(hidden_states.float() @ weight.float().T)
+
+    def routed_experts(routed_in, topk_output, *args, **kwargs):
+        order.append("experts")
+        return routed_in
+
+    monkeypatch.setattr(mod, "kimi3_shared_down_projection", project_shared)
+    moe._routed_experts = routed_experts
+    with (
+        mock.patch.object(mod, "get_is_cuda_graph_phase", return_value=False),
+        mock.patch.object(mod, "get_is_capture_mode", return_value=False),
+    ):
+        _, shared_partial = KimiLinearMoE._replicated_moe_experts(
+            moe,
+            torch.zeros(rows, 4),
+            shared_out,
+            mod.TopKOutputFormat.STANDARD,
+            rows,
+            rows,
+        )
+    assert projections.call_args.kwargs["defer_shared_down"] is True
+    # 8 through 128 rows ride the routing launch; the rest project first.
+    carried = 8 <= rows <= 128
+    assert order == (["experts"] if carried else ["shared_down", "experts"])
+    assert shared_partial is shared_out
+    torch.testing.assert_close(
+        shared_out.float(),
+        shared_input.float() @ down_weight.float().T,
+        rtol=2**-7,
+        atol=1e-4,
+    )
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
