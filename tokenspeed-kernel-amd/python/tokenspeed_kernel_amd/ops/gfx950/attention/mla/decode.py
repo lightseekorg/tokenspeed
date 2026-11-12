@@ -3670,11 +3670,11 @@ def launch_gluon_mla_decode_query_rows_gfx950(
         batch=batch, row_tiles=row_tiles, max_seqlen_k=max_seqlen_k
     )
     if _QUERY_ROWS_BALANCE_MIN_BATCH <= batch <= _QUERY_ROWS_BALANCE_MAX_BATCH:
-        # Requests' lengths differ (agentic contexts by 3x and more), so the
-        # chunks are sized over the batch: an even split takes batch * splits
-        # chunks, and rounding up each request's last chunk adds at most one
-        # item per request. The reduce merges a request's items a fair share
-        # at a time, and one binary serves each bucket of batch sizes.
+        # Requests' lengths can differ by several times, so the chunks are
+        # sized over the batch: an even split takes batch * splits chunks,
+        # and rounding up each request's last chunk adds at most one item
+        # per request. The reduce merges a request's items a fair share at a
+        # time, and one binary serves each bucket of batch sizes.
         work_target = batch * splits
         main_bucket = 1
         split_bucket = min(16, triton.next_power_of_2(splits))
