@@ -29,7 +29,7 @@ Blackwell (`triton_scaled_dot_block_scaled_moe_routes`, SM100–SM103)
 accumulation order inside a tile differs. Every tile shape sums an element's
 K blocks alike, so a token's rows do not depend on the batch.
 
-`flashinfer_trtllm_block_scaled_moe_routes` (SM100–SM103, widths in whole
+`flashinfer_trtllm_block_scaled_moe_routes` (SM103, widths in whole
 256-column K tiles) runs both projections on TRT-LLM-gen batched GEMMs, the
 MMA kind and K order of the scaled dot, and matches its rows bit for bit. The
 routing quantizer's rows are laid out per expert in GEMM token tiles

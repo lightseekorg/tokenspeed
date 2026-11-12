@@ -40,9 +40,8 @@ from tokenspeed_kernel.ops.moe.block_scaled import (
 from utils import assert_no_triton_compile
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or not (10, 0) <= torch.cuda.get_device_capability() <= (10, 3),
-    reason="TRT-LLM-gen batched GEMMs target the sm_100 family",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3),
+    reason="the TRT-LLM-gen block-scaled routes are registered for SM103",
 )
 
 

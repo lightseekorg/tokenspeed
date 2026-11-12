@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Block-scaled route rows on TRT-LLM-gen batched GEMMs (NVIDIA SM100-SM103).
+"""Block-scaled route rows on TRT-LLM-gen batched GEMMs (NVIDIA SM103).
 
 The ``flashinfer_trtllm`` solution of ``block_scaled_routes``: the Triton
 route kernels (``route_tiles.py``) lay the routed rows out in the
@@ -112,9 +112,10 @@ def flashinfer_trtllm_block_scaled_route_tensor(
     "block_scaled_routes",
     name="flashinfer_trtllm_block_scaled_moe_routes",
     solution="flashinfer_trtllm",
+    # Validated on SM103 only; SM100 takes the Triton block-scaled routes.
     capability=CapabilityRequirement(
         vendors=frozenset({"nvidia"}),
-        min_arch_version=ArchVersion(10, 0),
+        min_arch_version=ArchVersion(10, 3),
         max_arch_version=ArchVersion(10, 3),
     ),
     signatures=frozenset({format_signature(x=dense_tensor_format(torch.bfloat16))}),
