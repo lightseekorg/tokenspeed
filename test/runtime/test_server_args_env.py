@@ -24,7 +24,35 @@ from tokenspeed.runtime.utils.env import (
     global_server_args_dict,
     global_server_args_dict_update,
 )
-from tokenspeed.runtime.utils.server_args import prepare_server_args
+from tokenspeed.runtime.utils.server_args import ServerArgs, prepare_server_args
+
+
+@pytest.mark.parametrize("limit", [None, 0, 1, 32768])
+def test_tls_decode_threshold_reaches_model_initialization(limit):
+    original = global_server_args_dict.copy()
+    try:
+        argv = ["--model", "x"]
+        if limit is not None:
+            argv += ["--tls-decode-threshold", str(limit)]
+        args = prepare_server_args(argv)
+        global_server_args_dict_update(args)
+        assert args.tls_decode_threshold == limit
+        assert global_server_args_dict["tls_decode_threshold"] == limit
+    finally:
+        global_server_args_dict.clear()
+        global_server_args_dict.update(original)
+
+
+@pytest.mark.parametrize("value", [-1, 2147483648])
+def test_tls_decode_threshold_rejects_lengths_outside_int32(value):
+    with pytest.raises(ValueError, match="--tls-decode-threshold"):
+        prepare_server_args(["--model", "x", "--tls-decode-threshold", str(value)])
+
+
+@pytest.mark.parametrize("value", [True, 1.5, "128"])
+def test_tls_decode_threshold_rejects_non_integer_python_arguments(value):
+    with pytest.raises(ValueError, match="--tls-decode-threshold"):
+        ServerArgs(model="x", tls_decode_threshold=value)
 
 
 def test_head_tp_exchange_max_rows_reaches_model_initialization():

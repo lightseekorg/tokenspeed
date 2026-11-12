@@ -641,6 +641,9 @@ class ServerArgs:
     deepseek_v41_indexer_query_parallel_size: int = 1
     deepseek_v4_mega_moe_max_num_tokens: int = 0
     deepseek_v4_indexer_prefill_max_logits_mb: int = 512
+    # Optional length gating for models with a two-stage lightning indexer.
+    # Omission preserves the model's existing selection policy.
+    tls_decode_threshold: int | None = None
     # DeepSeek V4.1 Engram host tables. Off by default (GPU-sharded).
     engram_host_table: bool = False
     engram_host_table_dir: str | None = None
@@ -2771,6 +2774,13 @@ class ServerArgs:
             )
 
     def validate(self):
+        if self.tls_decode_threshold is not None and (
+            type(self.tls_decode_threshold) is not int
+            or not 0 <= self.tls_decode_threshold <= 2147483647
+        ):
+            raise ValueError(
+                "--tls-decode-threshold must be an integer in [0, 2147483647]"
+            )
         if (
             type(self.ttft_trace_sampling_percentage) is not int
             or not 0 <= self.ttft_trace_sampling_percentage <= 100
@@ -3970,6 +3980,16 @@ class ServerArgs:
                 "Sparse indexer prefill workspace cap (MiB) for the "
                 "softplus_sqrt logits buffer."
             ),
+        )
+        parser.add_argument(
+            "--tls-decode-threshold",
+            type=int,
+            default=ServerArgs.tls_decode_threshold,
+            help="For models with TLS enabled, use single-stage DSA during decode "
+            "below this many visible KV tokens and two-stage TLS at or above it. "
+            "Counts prompt and generated tokens, including the current query, "
+            "independently per request. Prefill is unchanged. Omit to preserve "
+            "the model's policy; 0 keeps TLS enabled for all decode tokens.",
         )
         parser.add_argument(
             "--engram-host-table",

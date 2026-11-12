@@ -92,6 +92,19 @@ NPU graph task updates and replay run in inference mode because they write the
 output tensors allocated during capture. This applies to active and idle DP
 ranks; callers need not establish an inference context.
 
+### Indexer selection by length
+
+Models supporting a two-stage lightning indexer may consume the optional
+`--tls-decode-threshold T` launch argument. A decode query below `T` visible
+KV tokens uses single-stage DSA; one at or above it uses the two-stage
+indexer. The count includes prompt tokens and the current query. Prefill is
+unchanged. Omission preserves the model's policy, and zero keeps the
+two-stage indexer enabled. `ServerArgs` validates the nonnegative int32
+and exports it to runtime initialization; the model owns support checks,
+selection and cache continuity. Length gating must use the refreshed device
+lengths under the same eager/capture/replay contract, including padding and
+mixed-length batches.
+
 ### Buffer sizing: the ladder is a performance subset, never a capacity limit
 
 `ForwardStepRunner` distinguishes `max_capture_bs` (top of the capture ladder,
