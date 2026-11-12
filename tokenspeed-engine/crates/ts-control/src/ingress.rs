@@ -1147,6 +1147,30 @@ mod tests {
     }
 
     #[test]
+    fn stop_tokens_must_index_the_output_vocabulary() {
+        for token_id in [-1, 1000, 1001] {
+            let params = SamplingParams {
+                stop_token_ids: Some(vec![7, token_id]),
+                ..Default::default()
+            };
+            let message =
+                refused_message(admit(request("bad-stop", vec![1], params), &limits()).unwrap());
+            assert!(message.contains("stop_token_ids"), "{message}");
+            assert!(message.contains("[0, 1000)"), "{message}");
+            assert!(message.contains(&token_id.to_string()), "{message}");
+        }
+
+        let params = SamplingParams {
+            stop_token_ids: Some(vec![0, 999]),
+            ..Default::default()
+        };
+        assert!(matches!(
+            admit(request("bounded-stop", vec![1], params), &limits()),
+            Some(Admitted::Run(_))
+        ));
+    }
+
+    #[test]
     fn a_request_without_a_single_id_is_dropped() {
         let mut no_id = request("x", vec![1], SamplingParams::default());
         no_id.rid = None;

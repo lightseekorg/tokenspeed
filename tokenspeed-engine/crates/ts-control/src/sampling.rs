@@ -169,6 +169,20 @@ pub fn verify_with_top_k_limit(
             ));
         }
     }
+    // Stop token ids become logits-column indices during sampling, so use the
+    // model's output vocabulary rather than the tokenizer vocabulary.
+    if let Some(stop_token_ids) = &p.stop_token_ids {
+        let invalid: Vec<i64> = stop_token_ids
+            .iter()
+            .copied()
+            .filter(|&token_id| !(0..vocab_size).contains(&token_id))
+            .collect();
+        if !invalid.is_empty() {
+            return Err(format!(
+                "stop_token_ids contains token ids outside the vocabulary [0, {vocab_size}): {invalid:?}"
+            ));
+        }
+    }
     if let Some(bias) = &p.logit_bias {
         for (token_id, _) in &bias.0 {
             let in_vocab = token_id
