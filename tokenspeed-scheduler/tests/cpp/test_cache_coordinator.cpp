@@ -1573,9 +1573,12 @@ TEST(CacheCoordinatorAdmissionTest, AReleasedCheckpointCanLeaveWithItsCanonicalP
                                            /*checkpoint_retention_requests=*/0);
         const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}, {9, 10, 11, 12}});
         const auto prefix = std::span<const std::string>(hashes).first(2);
+        // A plain copy: the analyzer cannot follow a lambda's capture of a
+        // structured binding.
+        const bool evict = allow_block_eviction;
         const auto admit = [&](std::vector<GroupDemand>& demands, const RequestProgress& progress) {
             return coordinator.Admit(coordinator.ProbePrefix({}), demands, progress, /*copy_in_blocks=*/{},
-                                     /*copy_in_point=*/std::nullopt, std::nullopt, allow_block_eviction,
+                                     /*copy_in_point=*/std::nullopt, std::nullopt, evict,
                                      /*session_id=*/{});
         };
 

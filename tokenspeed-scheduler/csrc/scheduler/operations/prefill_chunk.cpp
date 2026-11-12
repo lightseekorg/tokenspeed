@@ -103,6 +103,7 @@ std::int32_t YieldingChunkBudget(const CacheCoordinator& coordinator, std::int32
     const std::int32_t page = coordinator.PrefixGranularity();
     const std::int32_t grain = coordinator.CheckpointGranularity();
     const std::int32_t align = grain > 1 ? std::lcm(page, grain) : page;
+    _assert(align > 0, "prefill chunk alignment must be positive");
     const std::int64_t reach = static_cast<std::int64_t>(first_pos) + token_budget - replay - yield_tokens;
     const std::int64_t end = reach > 0 ? reach / align * align : 0;
     if (end - first_pos < std::max(align, MinPrefillChunkTokens(coordinator))) {

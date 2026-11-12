@@ -657,7 +657,6 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     if (tokens_this_round == 0) {
         return FirstChunkOutcome{};
     }
-    const std::int32_t after_tokens = hit_tokens + tokens_this_round;
     // Every admission on a decoding role (D, Fused) secures real headroom
     // before the prefill starts: the rest of the prompt plus decode room
     // that starts at one safe-step window and grows with each retraction

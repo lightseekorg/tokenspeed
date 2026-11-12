@@ -156,6 +156,15 @@ inline void FatalCheck(bool condition, const char* message = "Fatal check failed
     }
 }
 
+#ifdef __clang_analyzer__
+// The static analyzer stops inlining a few calls deep, where a failed check
+// would look like it returns; expose the noreturn failure at every call site.
+#define _assert(condition, ...) \
+    ((condition) ? void() : ::tokenspeed::detail::AssertFailed("", ::tokenspeed::SourceLocation::current()))
+#define FatalCheck(condition, ...) \
+    ((condition) ? void() : ::tokenspeed::detail::FatalCheckFailed("", ::tokenspeed::SourceLocation::current()))
+#endif
+
 template <typename T, typename Variant>
 concept IsAlternativeOf = requires(Variant v) { std::get<T>(v); };
 

@@ -529,6 +529,7 @@ private:
         GroupAvailability& group = placement(group_id);
         const std::size_t buckets = group.parents_by_bucket.size();
         if (parent.occupied_count == 0) {
+            FatalCheck(buckets > 0, "a group must be registered before it places blocks");
             FatalCheck(!free_parent_ids_.empty() && free_parent_ids_.front() == location.lcm_block_id,
                        "empty LCM placement must consume the next free parent");
             FatalCheck(parent.occupancy.empty(), "empty LCM parent must not retain child slots");

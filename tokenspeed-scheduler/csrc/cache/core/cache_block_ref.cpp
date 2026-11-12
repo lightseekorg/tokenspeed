@@ -62,6 +62,7 @@ void CacheBlockControl::release() noexcept {
             const auto callback = pending->callback_;
             void* context = pending->context_;
             pending->Reset();
+            FatalCheck(callback != nullptr, "a unique-owner observer requires a callback");
             callback(context);
         }
     }
