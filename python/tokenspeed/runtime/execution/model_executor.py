@@ -1198,7 +1198,10 @@ class ModelExecutor:
         )
 
     def autotune(self, *, keep_loaded_tactics: bool) -> None:
-        """Warm encountered kernels and optionally tune missing FlashInfer tactics; a reload keeps the tactics this process holds."""
+        """Warm kernels on the serving stream and optionally tune missing tactics.
+
+        A forward reload keeps the tactics already loaded by this process.
+        """
 
         per_rank_max_batch = max(
             1,
@@ -1259,10 +1262,16 @@ class ModelExecutor:
         )
 
         tic = time.time()
+        # Prefill can bind workspace state on first use. Prepare and run the
+        # dummy batch on the serving stream after the caller's device writes.
+        self.execution_stream.wait_stream(
+            self.device_module.current_stream(self.device)
+        )
         set_autotune_process_group(cpu_group)
         try:
             # Capture later refreshes the metadata created here in place.
             with (
+                self.device_module.stream(self.execution_stream),
                 torch.no_grad(),
                 kernel_warmup(enabled=True),
                 autotune(tune_mode=tune_mode, tuning_buckets=None, round_up=None),
