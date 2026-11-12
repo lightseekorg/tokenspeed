@@ -141,6 +141,7 @@ def _decode_query_layout(
         "capacity",
         "input_stride",
         "output_stride",
+        "offset_stride",
     ],
     do_not_specialize_on_alignment=[
         "num_requests",
@@ -148,16 +149,19 @@ def _decode_query_layout(
         "capacity",
         "input_stride",
         "output_stride",
+        "offset_stride",
     ],
 )
 def _mla_decode_split_kvs_kernel(
     seq_lens,
     out,
+    offsets,
     num_requests,
     total_chunks,
     capacity,
     input_stride,
     output_stride,
+    offset_stride,
 ):
     # Fixed tiles keep every batch size on the same compiled kernel.
     partial = tl.full((1024,), 0, tl.int64)
@@ -167,18 +171,29 @@ def _mla_decode_split_kvs_kernel(
         partial += lengths.to(tl.int64)
     total = tl.sum(partial, 0)
     chunk = tl.maximum((total + total_chunks - 1) // total_chunks, 1)
+    offset = tl.full((), 0, tl.int64)
     for start in range(0, num_requests, 1024):
         rows = start.to(tl.int64) + tl.arange(0, 1024)
         lengths = tl.load(
             seq_lens + rows * input_stride, rows < num_requests, other=0
         ).to(tl.int64)
         splits = tl.minimum(tl.maximum((lengths + chunk - 1) // chunk, 1), capacity)
+        splits = tl.where(rows < num_requests, splits, 0)
+        prefix = tl.cumsum(splits)
+        tl.store(
+            offsets + rows * offset_stride,
+            offset + prefix - splits,
+            rows < num_requests,
+        )
         tl.store(out + rows * output_stride, splits.to(tl.int32), rows < num_requests)
+        offset += tl.sum(splits, 0)
+    tl.store(offsets + num_requests.to(tl.int64) * offset_stride, offset)
 
 
 def tokenspeed_mla_decode_split_kvs(
     seq_lens: torch.Tensor,
     out: torch.Tensor,
+    offsets: torch.Tensor,
     *,
     num_heads: int,
     q_len: int,
@@ -192,11 +207,12 @@ def tokenspeed_mla_decode_split_kvs(
     longest request of a mixed batch sets the kernel time. This keeps the
     uniform split's chunk budget and gives each request chunks of about the
     same length, subject to rounding and the grid capacity. One Triton launch
-    refreshes ``out`` in place, including inside a CUDA graph.
+    refreshes counts and offsets in place, including inside a CUDA graph.
 
     Args:
         seq_lens: int32 [B] KV lengths, as passed to the decode call.
-        out: int32 [B] destination on the same device.
+        out: int32 [B] split counts on the same device.
+        offsets: int32 [B+1] exclusive split offsets, including the final total.
         num_heads, q_len, max_seq_len, min_split_kv: the decode call's query
             heads, query length, ``max_seq_len`` and ``min_split_kv``.
         dtype: the decode call's Q/KV dtype (FP8 E4M3, BF16 or FP16).
@@ -208,22 +224,23 @@ def tokenspeed_mla_decode_split_kvs(
         raise ValueError("seq_lens and out must be int32")
     if seq_lens.ndim != 1 or out.shape != seq_lens.shape:
         raise ValueError("seq_lens and out must be [B] tensors of the same size")
+    if offsets.dtype != torch.int32 or offsets.shape != (seq_lens.numel() + 1,):
+        raise ValueError("offsets must be int32 [B+1]")
     B = seq_lens.shape[0]
     if B == 0:
+        offsets.zero_()
         return out
     compute_capability = torch.cuda.get_device_capability(seq_lens.device)
-    mma_qk_tiler_mn, _, H_eff, q_len_eff, _ = _decode_query_layout(
+    mma_qk_tiler_mn, _, _, q_len_eff, _ = _decode_query_layout(
         num_heads,
         q_len,
         is_fp8=dtype == torch.float8_e4m3fn,
         compute_capability=compute_capability,
         packable=True,
     )
-    uniform_split_kv, _ = _get_split_kv_and_workspace_size(
+    uniform_split_kv = _get_split_kv(
         B,
         q_len_eff,
-        H_eff,
-        512,
         get_num_sm(seq_lens.device),
         max_seq_len,
         dtype,
@@ -234,33 +251,29 @@ def tokenspeed_mla_decode_split_kvs(
     _mla_decode_split_kvs_kernel[(1,)](
         seq_lens,
         out,
+        offsets,
         B,
         B * uniform_split_kv,
         width,
         seq_lens.stride(0),
         out.stride(0),
+        offsets.stride(0),
         num_warps=4,
     )
     return out
 
 
 @functools.cache
-def _get_split_kv_and_workspace_size(
+def _get_split_kv(
     B: int,
     q_len: int,
-    H: int,
-    kv_lora_rank: int,
     max_active_blocks: int,
     max_seq_len: int,
     torch_dtype: torch.dtype,
     mma_qk_tiler_mn: tuple[int, int],
-    min_split_kv: int = 1,
-) -> Tuple[int, int]:
-    """Return cached split count and workspace bytes for the effective Q layout.
-
-    FP8 normalizes uniform K partitions before sizing the workspace so the
-    launch grid, scratch strides and reducer use the same nonempty split count.
-    """
+    min_split_kv: int,
+) -> int:
+    """Uniform split budget for the effective query layout."""
     is_fp8 = torch_dtype == torch.float8_e4m3fn
     if is_fp8 and mma_qk_tiler_mn[0] == 64:
         # M64 launches one CTA per M tile. Reuse the FP8 kernel's wave-aware
@@ -286,6 +299,31 @@ def _get_split_kv_and_workspace_size(
         k_tiles = ceil_div(max_seq_len, mma_qk_tiler_mn[1])
         tiles_per_split = ceil_div(k_tiles, split_kv)
         split_kv = ceil_div(k_tiles, tiles_per_split)
+    return split_kv
+
+
+@functools.cache
+def _get_split_kv_and_workspace_size(
+    B: int,
+    q_len: int,
+    H: int,
+    kv_lora_rank: int,
+    max_active_blocks: int,
+    max_seq_len: int,
+    torch_dtype: torch.dtype,
+    mma_qk_tiler_mn: Tuple[int, int],
+    min_split_kv: int = 1,
+) -> Tuple[int, int]:
+    """Return the uniform split count and its partial-result workspace bytes."""
+    split_kv = _get_split_kv(
+        B,
+        q_len,
+        max_active_blocks,
+        max_seq_len,
+        torch_dtype,
+        mma_qk_tiler_mn,
+        min_split_kv,
+    )
     workspace_size = BlackwellMultiHeadLatentAttentionForwardFP16.get_workspace_size(
         H, q_len, kv_lora_rank, B, split_kv, cutlass.Float32
     )
@@ -297,18 +335,27 @@ def _get_split_kv_and_workspace_size(
 
 
 @functools.cache
-def _get_workspace_size(
-    B: int, q_len: int, H: int, kv_lora_rank: int, split_kv: int
+def tokenspeed_mla_decode_workspace_size(
+    max_bs: int,
+    num_heads: int,
+    q_len: int,
+    kv_lora_rank: int,
+    min_split_kv: int,
+    num_sms: int,
 ) -> int:
-    """Workspace bytes for an explicit split count (per-request split counts)."""
-    workspace_size = BlackwellMultiHeadLatentAttentionForwardFP16.get_workspace_size(
-        H, q_len, kv_lora_rank, B, split_kv, cutlass.Float32
-    )
-    if workspace_size >= 1 << 31:
-        raise ValueError(
-            "per-request split counts require workspace beyond the Int32 offset limit"
-        )
-    return workspace_size
+    """Bound compact partial-result bytes for batches up to ``max_bs``.
+
+    Arguments describe the maximum batch and query shape, MLA latent width,
+    split floor and device SM count. The returned FP32 byte capacity also
+    covers FP8 kernels using FP16 partials. No device lengths are read.
+    """
+    width = max(PER_REQUEST_SPLIT_KV_CAPACITY, min_split_kv)
+    # Both uniform heuristics budget at most max(B * min_split_kv, num_sms).
+    slots = min(max_bs * width, max(max_bs * min_split_kv, num_sms) + max_bs - 1)
+    rows = num_heads * q_len
+    if rows > 128:
+        rows = ceil_div(rows, 128) * 128
+    return slots * rows * (kv_lora_rank + 1) * 4
 
 
 @functools.cache
@@ -463,7 +510,7 @@ def _get_compiled_mla_kernel(
     sym_kv_batch = cute.sym_int()  # KV cache batch dim (flat pool, =1 in paged mode)
     sym_seq_kv = cute.sym_int()
     sym_page_count = cute.sym_int()
-    sym_workspace_size = cute.sym_int()
+    sym_workspace_size = cute.sym_int(64 if is_var_split_kv else 32)
 
     # q_latent, q_rope, c_latent, c_rope are slices of contiguous tensors on
     # the last dim (e.g. query[..., :kv_lora_rank]), so they are NOT contiguous:
@@ -592,6 +639,13 @@ def _get_compiled_mla_kernel(
             assumed_align=4,
         )
         if has_local_visible_lens
+        else None
+    )
+    compile_args.append(
+        cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32, (cute.sym_int(),), assumed_align=4
+        )
+        if is_var_split_kv
         else None
     )
     compiled_kernel = cute.compile(
@@ -933,6 +987,7 @@ def tokenspeed_mla_decode(
     min_split_kv: int = 1,
     local_visible_lens: Optional[torch.Tensor] = None,
     block_split_kvs: Optional[torch.Tensor] = None,
+    block_split_offsets: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """CuTe DSL MLA decode kernel for SM100, SM103 and SM107.
 
@@ -1045,6 +1100,12 @@ def tokenspeed_mla_decode(
         interleaved context-parallel metadata. None
         splits every request ``split_kv`` ways.
 
+    block_split_offsets : torch.Tensor, optional
+        Contiguous int32 [B+1] exclusive offsets from the split planner, required
+        with ``block_split_kvs``. The last entry is the total split count. Size
+        workspace with ``tokenspeed_mla_decode_workspace_size`` for the original
+        planning batch; slices of that batch may retain nonzero starting offsets.
+
     local_visible_lens : torch.Tensor, optional
         Contiguous int32 [B, q_len] tensor on the query device, supported with
         BF16 or FP8 E4M3 Q/KV.
@@ -1115,6 +1176,18 @@ def tokenspeed_mla_decode(
             raise ValueError(
                 "block_split_kvs must be contiguous int32 [B] on the query device"
             )
+        if (
+            block_split_offsets is None
+            or block_split_offsets.shape != (B + 1,)
+            or block_split_offsets.dtype != torch.int32
+            or block_split_offsets.device != query.device
+            or not block_split_offsets.is_contiguous()
+        ):
+            raise ValueError(
+                "block_split_offsets must be contiguous int32 [B+1] on the query device"
+            )
+    elif block_split_offsets is not None:
+        raise ValueError("block_split_offsets requires block_split_kvs")
 
     q_dtype = query.dtype
 
@@ -1204,9 +1277,24 @@ def tokenspeed_mla_decode(
         split_kv = _per_request_split_kv_width(
             max_seq_len, mma_qk_tiler_mn, min_split_kv
         )
-        workspace_size = _get_workspace_size(
-            B, q_len_eff, H_eff, kv_lora_rank, split_kv
-        )
+        if split_kv > 1:
+            uniform_split = _get_split_kv(
+                B,
+                q_len_eff,
+                max_active_blocks,
+                max_seq_len,
+                q_dtype,
+                mma_qk_tiler_mn,
+                min_split_kv,
+            )
+            slots = min(B * split_kv, B * uniform_split + B - 1)
+            required = slots * H_eff * q_len_eff * (kv_lora_rank + 1) * 4
+            assert (
+                workspace_buffer.numel() >= required
+            ), f"workspace_buffer too small: {workspace_buffer.numel()} bytes, need {required} bytes"
+        # The caller reserves the aggregate split bound, including when slicing
+        # a plan made for a larger batch. Kernels derive its capacity in slots.
+        workspace_size = workspace_buffer.numel() if split_kv > 1 else 0
     else:
         split_kv, workspace_size = _get_split_kv_and_workspace_size(
             B,
@@ -1381,8 +1469,7 @@ def tokenspeed_mla_decode(
         Float32(softmax_scale),
         Float32(output_scale),
     ]
-    if local_visible_lens is not None:
-        call_args.append(local_visible_lens)
+    call_args.extend((local_visible_lens, block_split_offsets))
 
     with tvm_ffi.use_torch_stream():
         compiled_kernel(*call_args)

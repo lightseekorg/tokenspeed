@@ -226,6 +226,7 @@ get_num_sm = error_fn
 PER_REQUEST_SPLIT_KV_CAPACITY: int | None = None
 tokenspeed_mla_decode = error_fn
 tokenspeed_mla_decode_split_kvs = error_fn
+tokenspeed_mla_decode_workspace_size = error_fn
 tokenspeed_mla_prefill = error_fn
 warmup_compile_prefill = error_fn
 
@@ -247,6 +248,7 @@ elif current_platform().is_nvidia:
         from tokenspeed_mla import tokenspeed_mla_decode as _tokenspeed_mla_decode
         from tokenspeed_mla import (
             tokenspeed_mla_decode_split_kvs,
+            tokenspeed_mla_decode_workspace_size,
         )
         from tokenspeed_mla import tokenspeed_mla_prefill as _tokenspeed_mla_prefill
         from tokenspeed_mla import warmup_compile_prefill as _warmup_compile_prefill
@@ -266,6 +268,7 @@ __all__ = [
     "mla_kv_pack_quantize_fp8",
     "tokenspeed_mla_decode",
     "tokenspeed_mla_decode_split_kvs",
+    "tokenspeed_mla_decode_workspace_size",
     "tokenspeed_mla_prefill",
     "warmup_compile_prefill",
 ]

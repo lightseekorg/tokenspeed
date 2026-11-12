@@ -1309,7 +1309,7 @@ def test_per_request_split_counts_reject_unsupported_inputs(invalid):
         )
 
 
-def _check_per_request_split_gpu(heads, q_len, dtype_name, causal):
+def _check_per_request_split_gpu(heads, q_len, dtype_name, causal, large_workspace):
     import tokenspeed_mla.mla_decode as decode
     from tokenspeed_mla import tokenspeed_mla_decode, tokenspeed_mla_decode_split_kvs
 
@@ -1320,6 +1320,7 @@ def _check_per_request_split_gpu(heads, q_len, dtype_name, causal):
     q, kv, tables, _ = _make_inputs(case, dtype_name, False, "cuda")
     seq_lens = torch.tensor(lengths, dtype=torch.int32, device="cuda")
     splits = torch.empty_like(seq_lens)
+    offsets = torch.empty(len(lengths) + 1, dtype=torch.int32, device="cuda")
     split_args = dict(
         num_heads=heads,
         q_len=q_len,
@@ -1328,10 +1329,10 @@ def _check_per_request_split_gpu(heads, q_len, dtype_name, causal):
         dtype=q.dtype,
     )
     uniform = torch.full_like(seq_lens, 4096)
-    tokenspeed_mla_decode_split_kvs(uniform, splits, **split_args)
+    tokenspeed_mla_decode_split_kvs(uniform, splits, offsets, **split_args)
     (uniform_split,) = set(splits.tolist())
     assert uniform_split >= 8
-    tokenspeed_mla_decode_split_kvs(seq_lens, splits, **split_args)
+    tokenspeed_mla_decode_split_kvs(seq_lens, splits, offsets, **split_args)
     counts = splits.tolist()
     width = decode._per_request_split_kv_width(case.kv_len, (128, 128), 8)
     assert width == 32
@@ -1343,8 +1344,14 @@ def _check_per_request_split_gpu(heads, q_len, dtype_name, causal):
     assert sum(counts) <= (uniform_split + 1) * batch
     assert counts[0] == width or sum(counts) >= uniform_split * batch
 
-    workspace = torch.zeros(
-        len(lengths) * math.ceil(heads * q_len / 128) * 128 * width * 513 * 4,
+    workspace_bytes = decode.tokenspeed_mla_decode_workspace_size(
+        len(lengths), heads, q_len, 512, 8, decode.get_num_sm(q.device)
+    )
+    # Compact head strides cross 2**31 elements; only live partials are touched.
+    if large_workspace:
+        workspace_bytes = 9 << 30
+    workspace = torch.empty(
+        workspace_bytes,
         dtype=torch.int8,
         device="cuda",
     )
@@ -1369,6 +1376,7 @@ def _check_per_request_split_gpu(heads, q_len, dtype_name, causal):
         out=out,
         min_split_kv=8,
         block_split_kvs=splits,
+        block_split_offsets=offsets,
         causal_mask=causal,
     )
     indices = list(range(len(lengths)))
@@ -1393,17 +1401,37 @@ def _check_per_request_split_gpu(heads, q_len, dtype_name, causal):
 
     _check_output(out, reference(), dtype_name)
 
+    sliced = tokenspeed_mla_decode(
+        **{
+            **kwargs,
+            "query": q[1:],
+            "block_tables": tables[1:],
+            "seq_lens": seq_lens[1:],
+            "block_split_kvs": splits[1:],
+            "block_split_offsets": offsets[1:],
+            "out": None,
+        }
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(sliced, out[1:], rtol=0, atol=0)
+
     # Uniform lengths get the uniform split, so the output is the uniform call's.
-    tokenspeed_mla_decode_split_kvs(uniform, splits, **split_args)
+    tokenspeed_mla_decode_split_kvs(uniform, splits, offsets, **split_args)
     expected = tokenspeed_mla_decode(
-        **{**kwargs, "seq_lens": uniform, "out": None, "block_split_kvs": None}
+        **{
+            **kwargs,
+            "seq_lens": uniform,
+            "out": None,
+            "block_split_kvs": None,
+            "block_split_offsets": None,
+        }
     )
     tokenspeed_mla_decode(**{**kwargs, "seq_lens": uniform})
     torch.cuda.synchronize()
     assert torch.equal(out, expected)
 
     # Lengths and split counts refreshed in place between replays, no recompile.
-    tokenspeed_mla_decode_split_kvs(seq_lens, splits, **split_args)
+    tokenspeed_mla_decode_split_kvs(seq_lens, splits, offsets, **split_args)
     misses = decode._get_compiled_mla_kernel.cache_info().misses
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -1411,7 +1439,7 @@ def _check_per_request_split_gpu(heads, q_len, dtype_name, causal):
     with torch.cuda.graph(graph, stream=stream):
         tokenspeed_mla_decode(**kwargs)
     seq_lens.copy_(seq_lens.flip(0))
-    tokenspeed_mla_decode_split_kvs(seq_lens, splits, **split_args)
+    tokenspeed_mla_decode_split_kvs(seq_lens, splits, offsets, **split_args)
     out.fill_(float("nan"))
     graph.replay()
     torch.cuda.synchronize()
@@ -1442,18 +1470,24 @@ def _check_local_visible_gpu(
     visible = torch.empty((batch, q_len), dtype=torch.int32, device="cuda")
     workspace_bytes = 64 * 1024**2
     if per_request:
-        workspace_bytes = max(
-            workspace_bytes, batch * math.ceil(heads * q_len / 128) * 128 * 32 * 513 * 4
+        workspace_bytes = decode.tokenspeed_mla_decode_workspace_size(
+            batch, heads, q_len, 512, 1, decode.get_num_sm(q.device)
         )
     workspace = torch.empty(workspace_bytes, dtype=torch.int8, device="cuda")
     out = torch.empty((batch, q_len, heads, 512), dtype=torch.bfloat16, device="cuda")
     splits = torch.empty_like(lengths) if per_request else None
+    offsets = (
+        torch.empty(batch + 1, dtype=torch.int32, device="cuda")
+        if per_request
+        else None
+    )
 
     def refresh_splits():
         if splits is not None:
             tokenspeed_mla_decode_split_kvs(
                 lengths,
                 splits,
+                offsets,
                 num_heads=heads,
                 q_len=q_len,
                 max_seq_len=kv_len,
@@ -1477,6 +1511,7 @@ def _check_local_visible_gpu(
         return_lse=True,
         local_visible_lens=visible,
         block_split_kvs=splits,
+        block_split_offsets=offsets,
     )
     boundaries = [0, 1, 63, 64, 65, 127, 128, 129, 257, kv_len]
     initial = torch.tensor(
@@ -1569,6 +1604,8 @@ class TestGPU:
             (1, 96, 4, False, 65537, False),
             (3, 96, 4, False, 16384, True),
             (2, 16, 4, False, 385, True),
+            (256, 128, 1, False, 4096, True),
+            (64, 128, 4, False, 4096, True),
         ],
     )
     def test_local_visible_lengths(
@@ -1640,12 +1677,22 @@ class TestGPU:
         _run_gpu_check(_check_packed_gpu, (), 600)
 
     @pytest.mark.parametrize(
-        "heads,q_len,causal", [(96, 4, True), (64, 1, True), (16, 4, False)]
+        "heads,q_len,causal,large_workspace",
+        [
+            (96, 4, True, False),
+            (64, 1, True, False),
+            (16, 4, False, False),
+            (128, 1, True, True),
+        ],
     )
     @pytest.mark.parametrize("dtype_name", ["fp8", "bf16", "fp16"])
-    def test_per_request_split_counts(self, heads, q_len, dtype_name, causal):
+    def test_per_request_split_counts(
+        self, heads, q_len, dtype_name, causal, large_workspace
+    ):
         _run_gpu_check(
-            _check_per_request_split_gpu, (heads, q_len, dtype_name, causal), 600
+            _check_per_request_split_gpu,
+            (heads, q_len, dtype_name, causal, large_workspace),
+            600,
         )
 
     @pytest.mark.parametrize("interleave", [1, 64], ids=["strided", "block64"])

@@ -23,6 +23,38 @@ import cutlass
 import cutlass.cute as cute
 
 
+@cute.jit
+def make_compact_split_workspace(H, D, S, B, workspace, partial_dtype, acc_dtype):
+    """Share a packed split axis across requests; the batch stride is zero."""
+    slots = cutlass.Int64(cute.size(workspace)) // (cutlass.Int64(H) * S * (D + 1) * 4)
+    output = cute.make_tensor(
+        cute.recast_ptr(workspace.iterator, dtype=partial_dtype),
+        cute.make_layout(
+            (H, slots, D, S, B),
+            stride=(slots * D, D, 1, slots * H * D, 0),
+        ),
+    )
+    lse = cute.make_tensor(
+        cute.recast_ptr(
+            workspace.iterator + slots * H * S * D * (partial_dtype.width // 8),
+            dtype=acc_dtype,
+        ),
+        cute.make_layout((H, slots, S, B), stride=(slots, 1, slots * H, 0)),
+    )
+    return output, lse
+
+
+@cute.jit
+def offset_split_workspace(tensor, offsets, request):
+    if cutlass.const_expr(tensor is not None and offsets is not None):
+        # A sliced batch may begin after split zero in its original plan.
+        offset = cutlass.Int64(offsets[request]) - cutlass.Int64(offsets[0])
+        tensor = cute.make_tensor(
+            tensor.iterator + offset * tensor.stride[1], tensor.layout
+        )
+    return tensor
+
+
 def get_mla_decode_arch(compute_capability: tuple[int, int]) -> str:
     """Return the CuTe architecture name for a supported MLA decode device."""
     if compute_capability not in ((10, 0), (10, 3), (10, 7)):

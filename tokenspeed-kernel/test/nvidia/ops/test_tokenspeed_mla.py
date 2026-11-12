@@ -287,8 +287,11 @@ def test_split_counts_match_torch_without_recompiling() -> None:
             chunks = batch * splits
             chunk = ((source.sum() + chunks - 1) // chunks).clamp(min=1)
             expected = ((source + chunk - 1) // chunk).clamp(1, width).int()
-            tokenspeed_mla_decode_split_kvs(lengths, out, **args)
+            offsets = torch.empty_strided((batch + 1,), (3,), dtype=torch.int32, device="cuda")
+            tokenspeed_mla_decode_split_kvs(lengths, out, offsets, **args)
             torch.testing.assert_close(out, expected, rtol=0, atol=0)
+            torch.testing.assert_close(offsets[0], torch.zeros((), dtype=torch.int32, device="cuda"), rtol=0, atol=0)
+            torch.testing.assert_close(offsets[1:], expected.cumsum(0).int(), rtol=0, atol=0)
 
         lengths = torch.zeros(2049 * 3, dtype=torch.int32, device="cuda")[::3]
         out = torch.empty(2049 * 5, dtype=torch.int32, device="cuda")[::5]
@@ -305,6 +308,11 @@ def test_split_counts_match_torch_without_recompiling() -> None:
         wide_out = torch.empty_strided((3,), (2**30 + 8,), dtype=torch.int32, device="cuda")
         wide_lengths.copy_(torch.tensor([1, 1 << 30, 1 << 30], dtype=torch.int32, device="cuda"))
         check(wide_lengths, wide_out, 1 << 30)
+        offsets = torch.full((1,), -1, dtype=torch.int32, device="cuda")
+        tokenspeed_mla_decode_split_kvs(
+            lengths[:0], out[:0], offsets, num_heads=128, q_len=1,
+            max_seq_len=8192, min_split_kv=1, dtype=torch.bfloat16)
+        assert offsets.item() == 0
         """)
     env = os.environ.copy()
     paths = [
