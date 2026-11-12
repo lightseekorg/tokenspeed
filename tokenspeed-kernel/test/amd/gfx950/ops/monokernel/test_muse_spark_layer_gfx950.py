@@ -562,6 +562,175 @@ def test_layer_matches_the_regular_path_math(full, rows):
     mp.spawn(_worker, args=(port, 3000, full, rows), nprocs=WORLD, join=True)
 
 
+def _tap_context_worker(rank: int, port: int) -> None:
+    """Five launches store a draft's five taps, then the draft's context write
+    reads them; the same write on the taps the regular capture would hand it
+    (each launch's whole h'' rows, rounded once to BF16) gives the same draft
+    cache bytes."""
+    from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import draft_context
+
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        "gloo",
+        init_method=f"tcp://localhost:{port}",
+        rank=rank,
+        world_size=WORLD,
+        timeout=timedelta(seconds=900),
+    )
+    try:
+        dev = torch.device(f"cuda:{rank}")
+        ctx = get_or_create_context(heap_size=512 << 20)
+        group = IrisGroup(ctx, dist.group.WORLD, rank, dev)
+        rows, length, taps_n = 8, 3000, 5
+        plans = [
+            layer.layer_plan(
+                full=full,
+                rows=rows,
+                chain=rows,
+                warm_next=True,
+                own_qkvg=True,
+                next_qkvg=False,
+                check_parity=False,
+            )
+            for full in (False, True)
+        ]
+        scratch = ctx.zeros((max(p.scratch_pairs for p in plans),), dtype=torch.int64)
+        tap = ctx.zeros((rows, taps_n, HIDDEN), dtype=torch.bfloat16)
+        c_plan = draft_context.context_plan(rows)
+        c_scratch = ctx.zeros((c_plan.scratch_pairs,), dtype=torch.int64)
+        group.finish_prepare()
+        own = slice(rank * OWNED, (rank + 1) * OWNED)
+        end = length + rows - 1
+        captured = []
+        # The served draft's taps follow sliding and full layers alike.
+        for slot, full in enumerate((False, True, False, True, False)):
+            sh = inputs.layer_shared(40 + slot, length, rows)
+            w = inputs.layer_rank_weights(rank, end)
+            weights = _pack(rank, dev, sh, end, full)
+            h_next = torch.empty(rows, OWNED, device=dev)
+            pos = torch.arange(length - 1, length - 1 + rows)
+            slots = sh["table"][pos // 64].long() * 64 + pos % 64
+            for compile_only in (True, False):
+                layer.launch_gluon_muse_spark_layer_gfx950(
+                    weights,
+                    h=sh["h"][:, own].contiguous().to(dev),
+                    a=sh["a_in"].to(dev),
+                    h_out=h_next,
+                    a_out=torch.empty(rows, HIDDEN, dtype=torch.bfloat16, device=dev),
+                    seq_len=(pos + 1).to(torch.int32).to(dev),
+                    slot=slots.to(torch.int32).to(dev),
+                    page_table=sh["table"].to(dev),
+                    k_cache=w["k_cache"].to(dev),
+                    v_cache=w["v_cache"].to(dev),
+                    cos_sin=ref.rope_table(end + 1).to(dev),
+                    scratch=scratch,
+                    step=torch.full((1,), 3 + slot, dtype=torch.int32, device=dev),
+                    peer_bases=group.bases,
+                    layer=1 + slot,
+                    chain=rows,
+                    whole_rows=False,
+                    tap=tap,
+                    tap_slot=slot,
+                    warm_next=weights,
+                    proj_in=None,
+                    proj_out=None,
+                    trace_buf=None,
+                    stuck_rec=None,
+                    check_parity=False,
+                    compile_only=compile_only,
+                )
+                torch.cuda.synchronize()
+                dist.barrier()
+            # What the regular capture hands the draft for this tap: the
+            # whole h'' rows entering the next layer, rounded once to BF16.
+            parts = [torch.empty_like(h_next.cpu()) for _ in range(WORLD)]
+            dist.all_gather(parts, h_next.cpu())
+            captured.append(torch.cat(parts, dim=1).to(torch.bfloat16))
+        regular = torch.stack(captured, dim=1)  # [rows, taps, 8192]
+        assert torch.equal(tap.cpu(), regular)
+
+        # The draft's context write on the stored taps and on the captured
+        # ones: the same kernel on the same bytes writes the same cache rows.
+        g = torch.Generator(device=dev).manual_seed(7)
+
+        def randn(*shape, std, gen=g):
+            return (torch.randn(*shape, generator=gen, device=dev) * std).to(
+                torch.bfloat16
+            )
+
+        fc = randn(HIDDEN, taps_n * HIDDEN, std=0.005)
+        mine = torch.Generator(device=dev).manual_seed(700 + rank)
+        weights = draft_context.pack_draft_context(
+            {
+                "fc": fc[rank * HIDDEN // WORLD : (rank + 1) * HIDDEN // WORLD],
+                "hidden_norm": (1 + randn(HIDDEN, std=0.1).float()).to(torch.bfloat16),
+                **{
+                    f"qkv_{i}": randn(1280, HIDDEN, std=0.01, gen=mine)
+                    for i in range(5)
+                },
+                **{
+                    f"k_norm_{i}": (1 + randn(128, std=0.1, gen=mine).float()).to(
+                        torch.bfloat16
+                    )
+                    for i in range(5)
+                },
+            },
+            rank,
+        )
+        positions = torch.arange(length, length + rows, dtype=torch.int32, device=dev)
+        cache_slots = torch.arange(100, 100 + rows, dtype=torch.int32, device=dev)
+        # The draft's RoPE table is FP32 [positions, 128] (128-wide heads),
+        # not the target layer's 64-wide one.
+        inv = 1.0 / (500000.0 ** (torch.arange(0, 128, 2, device=dev).float() / 128))
+        angle = torch.arange(length + rows + 1, device=dev).float()[:, None] * inv
+        cos_sin = torch.cat([angle.cos(), angle.sin()], dim=-1)
+        written = []
+        for step, taps in (
+            (3, tap.view(rows, -1)),
+            (4, regular.to(dev).view(rows, -1)),
+        ):
+            k_caches = tuple(
+                torch.zeros(512, 1, 128, dtype=torch.bfloat16, device=dev)
+                for _ in range(5)
+            )
+            v_caches = tuple(torch.zeros_like(k) for k in k_caches)
+            for compile_only in (True, False):
+                draft_context.launch_gluon_muse_spark_draft_context_gfx950(
+                    weights,
+                    taps=taps.contiguous(),
+                    positions=positions,
+                    slots=cache_slots,
+                    k_caches=k_caches,
+                    v_caches=v_caches,
+                    cos_sin=cos_sin,
+                    scratch=c_scratch,
+                    step=torch.full((1,), step, dtype=torch.int32, device=dev),
+                    peer_bases=group.bases,
+                    trace_buf=None,
+                    compile_only=compile_only,
+                )
+                torch.cuda.synchronize()
+                dist.barrier()
+            written.append([c.cpu() for c in k_caches + v_caches])
+        for stored, captured_ in zip(*written):
+            assert torch.equal(stored, captured_)
+        assert any(c.any() for c in written[0])
+    finally:
+        dist.destroy_process_group()
+
+
+def test_the_launches_taps_feed_the_draft_context_as_the_capture_would():
+    """The served draft's taps (rows of the residual entering layers 2, 17,
+    31, 45 and 60) come from the launches' tap stores; the draft's context
+    write must see exactly the bytes the regular capture would give it."""
+    if torch.cuda.device_count() < WORLD:
+        pytest.skip(f"requires {WORLD} GPUs")
+    with socket.socket() as sock:
+        sock.bind(("", 0))
+        port = sock.getsockname()[1]
+    mp.spawn(_tap_context_worker, args=(port,), nprocs=WORLD, join=True)
+
+
 def _two_requests_worker(rank: int, port: int, full: bool) -> None:
     torch.cuda.set_device(rank)
     dist.init_process_group(
