@@ -28,21 +28,15 @@ from tokenspeed_kernel.ops.moe import (
     latent_moe_input_projections,
     try_latent_moe_input_projections,
 )
-from tokenspeed_kernel.platform import ArchVersion, current_platform
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.selection import NoKernelFoundError, kernel_override
 from tokenspeed_kernel.thirdparty.cuda import kimi3_latent_front
 
 
 @pytest.fixture(scope="module")
 def weights():
-    platform = current_platform()
-    if (
-        not platform.is_nvidia
-        or platform.arch_version != ArchVersion(10, 3)
-        or platform.sm_count != 152
-        or not kimi3_latent_front.available()
-    ):
-        pytest.skip("requires a 152-SM GB300")
+    if not (current_platform().is_nvidia and kimi3_latent_front.available()):
+        pytest.skip("requires an SM100/SM103 part with 148 or 152 SMs")
     torch.manual_seed(621)
     return tuple(
         (torch.randn(rows, 7168, device="cuda") / math.sqrt(7168)).bfloat16()

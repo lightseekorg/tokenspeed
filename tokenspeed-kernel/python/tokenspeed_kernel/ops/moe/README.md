@@ -476,8 +476,9 @@ bound no fused kernel matches and the runtime keeps the separate path.
 `cuda_latent_input` is the vendored FlashInfer/Cake fused front
 (`thirdparty/cuda/kimi3_latent_front.py` and `csrc/kimi3_latent_front/`): one
 persistent launch produces the FP32 router logits, the BF16 latent input and
-the BF16 SiTU-activated shared-expert input. It is registered on SM103 with 152
-SMs for 2048 BF16 rows or more (no upper bound: the plan scales with the row
+the BF16 SiTU-activated shared-expert input. It is registered on SM100 and
+SM103 parts with 148 or 152 SMs (the counts the plan rules are validated for)
+for 2048 BF16 rows or more (no upper bound: the plan scales with the row
 count), Kimi-K3's replicated router/latent weights, full shared-expert weights,
 and SiTU clamps 4 and 25. Attention-DP uses it only
 without shared-expert TP; EP routing/quantization and the shared down projection

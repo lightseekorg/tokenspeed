@@ -164,15 +164,10 @@ __all__ = [
     "moe_finalize_fuse_shared",
 ]
 
-# The fused front is validated on 152-SM GB300 parts only; the vendored programs also
-# compile for SM100, which stays on the separate projections until measured.
+# The vendored front serves SM100 and SM103 parts with the SM counts its plan
+# rules are validated for (148 and 152); ``available`` checks both.
 _FRONT_PLATFORM = current_platform()
-if (
-    _FRONT_PLATFORM.is_nvidia
-    and _FRONT_PLATFORM.arch_version == ArchVersion(10, 3)
-    and _FRONT_PLATFORM.sm_count == 152
-    and kimi3_latent_front.available()
-):
+if _FRONT_PLATFORM.is_nvidia and kimi3_latent_front.available():
 
     @register_kernel(
         "moe",
@@ -180,7 +175,7 @@ if (
         name="cuda_latent_input",
         solution="cuda",
         capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(10, 3),
+            min_arch_version=ArchVersion(10, 0),
             max_arch_version=ArchVersion(10, 3),
             vendors=frozenset({"nvidia"}),
         ),

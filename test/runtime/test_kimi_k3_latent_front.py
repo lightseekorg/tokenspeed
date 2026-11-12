@@ -27,7 +27,7 @@ import sys
 import pytest
 import torch
 from tokenspeed_kernel.ops.moe import try_latent_moe_input_projections
-from tokenspeed_kernel.platform import ArchVersion, current_platform
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.thirdparty.cuda import kimi3_latent_front
 from torch import nn
 
@@ -94,14 +94,8 @@ class UnloadedExperts(nn.Module):
 
 def build_layer(monkeypatch, *, alt_stream):
     """An attention-DP Kimi-K3 MoE block with packed projection weights."""
-    platform = current_platform()
-    if not (
-        platform.is_nvidia
-        and platform.arch_version == ArchVersion(10, 3)
-        and platform.sm_count == 152
-        and kimi3_latent_front.available()
-    ):
-        pytest.skip("requires a 152-SM GB300")
+    if not (current_platform().is_nvidia and kimi3_latent_front.available()):
+        pytest.skip("requires an SM100/SM103 part with 148 or 152 SMs")
     # Imported after the skip: the CuTe DSL runner needs the NVIDIA toolchain.
     from tokenspeed_kernel.thirdparty.cute_dsl.mega_moe import runner
 
