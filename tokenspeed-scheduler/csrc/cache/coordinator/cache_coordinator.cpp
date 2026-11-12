@@ -203,6 +203,9 @@ CacheCoordinator::CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t 
         _assert(groups_[i].Allocator().ShardCount() == groups_[i].Spec().shard_count,
                 "group allocator shard count must match its group spec");
         const auto& spec = groups_[i].Spec();
+        if (groups_[i].Matcher().IsPrefixClosed()) {
+            routing_history_groups_.push_back(i);
+        }
         _assert(spec.checkpoint_granularity >= 1, "checkpoint grain must be positive");
         if (spec.checkpoint_granularity > 1) {
             _assert(spec.attn_kind == AttnKind::kState, "only State groups constrain checkpoints");
@@ -404,6 +407,32 @@ CacheCoordinator::BoundaryResidency CacheCoordinator::DeviceBoundaryResidency(co
     const std::int32_t total = numBoundaryKeys(tail_tokens);
     _assert(cached <= total, "a boundary's Device entries lie among its keys");
     return cached == total ? BoundaryResidency::kComplete : BoundaryResidency::kPartial;
+}
+
+CacheCoordinator::BoundaryEventStatus CacheCoordinator::GetBoundaryEventStatus(const CacheKey& boundary,
+                                                                               std::int32_t tail_tokens) const {
+    _assert(boundary.namespace_id == kDefaultCacheNamespaceId, "a tracked boundary lies in the default namespace");
+    _assert(tail_tokens >= 0 && tail_tokens < prefix_granularity_, "a tail lies strictly inside a prefix page");
+    const BoundaryTree::Node* node = boundary_tree_.Find(boundary.content_hash);
+    if (node == nullptr) return {.publishable = false, .has_device_entries = false};
+    const std::int32_t device_entries = node->Entries(BoundaryTree::kDevice);
+    // A continuous history group represents locality without requiring the
+    // auxiliary sliding windows or sparse checkpoints at every ancestor.
+    if (!routing_history_groups_.empty()) {
+        // The index already maintains one closed-entry hold per cached key.
+        // Count expected keys by group, not by probing every history block.
+        std::int32_t expected = 0;
+        for (const std::size_t group : routing_history_groups_) {
+            const auto i = static_cast<std::int32_t>(group);
+            expected += tail_tokens > 0 ? TailBlocksFor(i, tail_tokens) : BlocksPerBoundary(i);
+        }
+        const std::int32_t cached = node->ClosedEntries(BoundaryTree::kDevice);
+        _assert(cached <= expected, "a boundary's Device history entries lie among its keys");
+        return {.publishable = cached == expected, .has_device_entries = device_entries > 0};
+    }
+    // No continuous history means no ordinary prefix-residency events.
+    // Scheduler configuration rejects enabling this event stream in that case.
+    return {.publishable = false, .has_device_entries = device_entries > 0};
 }
 
 bool CacheCoordinator::HoldsStateCheckpoint(const ContentHash& content_hash) const {
