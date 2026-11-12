@@ -47,6 +47,7 @@ namespace tokenspeed {
 struct SchedulerTestAccess {
     static CacheCoordinator& Coordinator(Scheduler& scheduler) { return scheduler.coordinator_; }
     static const BlockPool& Pool(const Scheduler& scheduler) { return scheduler.block_pool_; }
+    static BlockPool& Pool(Scheduler& scheduler) { return scheduler.block_pool_; }
     static void RecordAdmittedPages(Scheduler& scheduler, ExecutionPlan& plan,
                                     const CacheCoordinator::AdmissionResult& result) {
         scheduler.recordAdmittedPages(plan, result);

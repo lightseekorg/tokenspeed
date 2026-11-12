@@ -3520,10 +3520,14 @@ TEST_F(ReadmissionScanSuite, TheNoProgressAbortTakesTheImageTheRestorePhaseTries
     AckImageStores(p6);
     AckImageStores(p9);
     ASSERT_EQ(scheduler_->RetractedSize(), 2u);
-    // Every page the two retractions freed, held outside any request.
-    std::vector<BlockTable> held(1);
-    ASSERT_TRUE(AdmitForTest(SchedulerTestAccess::Coordinator(*scheduler_), held,
-                             GroupDemand{.extent = DenseGrowth{scheduler_->AvailableLcmBlocks() * 1024}}));
+    // Every page the two retractions freed, held outside any request as raw
+    // block refs, the way a store ticket pins them: an admitted table would
+    // bind to the active-parent gauge the scheduler's debug build checks
+    // against a walk of the requests' tables, and this holder is no request.
+    BlockPool& pool = SchedulerTestAccess::Pool(*scheduler_);
+    const std::int32_t available = scheduler_->AvailableLcmBlocks();
+    const std::vector<CacheBlockRef> held = pool.AcquireBlocks(/*group_id=*/0, available);
+    ASSERT_EQ(static_cast<std::int32_t>(held.size()), available);
     ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 0);
 
     for (const std::string expected : {"b", "a"}) {
