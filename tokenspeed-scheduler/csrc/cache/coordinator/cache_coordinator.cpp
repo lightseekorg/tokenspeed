@@ -3425,6 +3425,33 @@ CacheBlockRef CacheCoordinator::AcquireHostCachedBlock(const CacheKey& key) {
     return host_pool_ == nullptr ? CacheBlockRef{} : groups_.at(key.group_id).Index().Find(*host_pool_, key);
 }
 
+CoordinatorMatch CacheCoordinator::AcquireHostPrefix(PrefixProbe&& probe) {
+    _assert(host_pool_ != nullptr, "AcquireHostPrefix requires a host pool");
+    _assert(probe.device.num_common_tokens == 0, "a Host-only coordinator's probe hits no Device entry");
+    const std::uint64_t access_epoch = ++next_access_epoch_;
+    AcquiredPrefix acquired = acquirePrefix(std::move(probe), access_epoch);
+    recordAdmission(access_epoch);
+    return std::move(acquired.host);
+}
+
+void CacheCoordinator::TouchHostBlocks(std::span<const CacheKey> keys) {
+    _assert(host_pool_ != nullptr, "TouchHostBlocks requires a host pool");
+    const std::uint64_t access_epoch = ++next_access_epoch_;
+    for (const CacheKey& key : keys) {
+        _assert(key.group_id < groups_.size(), "Host touch key group id out of range");
+        PrefixCacheIndex& index = groups_[key.group_id].Index();
+        // TouchExisting refreshes the entries of the keys whose source block
+        // is present: the entry's own block stands for it.
+        const CacheBlockRef block = index.Find(*host_pool_, key);
+        if (!block) {
+            continue;
+        }
+        index.TouchExisting(*host_pool_, std::span{&key, 1}, std::span{&block, 1}, access_epoch, /*session=*/nullptr);
+        // A hit keeps its tail young under the per-prior cap.
+        boundary_tree_.TouchTail(key.content_hash);
+    }
+}
+
 template <typename Visit>
 void CacheCoordinator::forEachStorageDependency(const PrefixProbe::Tier& probe,
                                                 std::span<const std::vector<CacheKey>> group_keys,

@@ -920,6 +920,31 @@ public:
                         std::optional<PrefixCacheIndex::CachedBlockMetadata> inherited_metadata);
     void CacheHostTail(const ContentHash& prior, const TailPublication& tail);
     CacheBlockRef AcquireHostCachedBlock(const CacheKey& key);
+    // A coordinator that is a Host tier alone -- the owner of a shared L2
+    // pool (SharedL2Pool) -- has no admission and no Device publication to
+    // drive it, and enters the same code here.
+    //
+    // Pins a probe's Host hit as an admission's first step does: the tail kept
+    // young, every hit dated with a new access epoch, the resume gap counted,
+    // and one new request counted toward the checkpoint retention window,
+    // also for a probe that hit nothing. Per group the Host hits (holes
+    // empty), then the tail's blocks.
+    CoordinatorMatch AcquireHostPrefix(PrefixProbe&& probe);
+    // Refreshes the Host entries of `keys` as a Device hit on them does; a
+    // key the Host does not hold is skipped.
+    void TouchHostBlocks(std::span<const CacheKey> keys);
+    // A State checkpoint whose blocks reach the Host with no Device
+    // publication: LinkCheckpoint links its boundary before the blocks
+    // register (CacheHostBlock), as a Device publication links its own, and
+    // RecordCheckpoint records it once they have. `publisher` stands for the
+    // request that published it, as an access epoch does on the Device: the
+    // retention ranking only compares it.
+    BoundaryTree::Hold LinkCheckpoint(const CompletedPages& completed) {
+        return boundary_tree_.LinkPublication(completed);
+    }
+    void RecordCheckpoint(const CompletedPages& completed, std::uint64_t publisher) {
+        recordCheckpoints(completed, publisher);
+    }
     struct StorageReservation {
         std::vector<CacheKey> keys;
         std::vector<CacheBlockRef> blocks;
