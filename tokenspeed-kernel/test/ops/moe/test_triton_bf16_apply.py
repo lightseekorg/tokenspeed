@@ -305,3 +305,75 @@ def test_triton_bf16_moe_token_count():
             torch.testing.assert_close(
                 run(tokens), expected[tiles(tokens)][:tokens], rtol=0, atol=0
             )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+@pytest.mark.parametrize("ep_rank", [0, 1])
+def test_deferred_bf16_routes_keep_route_order(ep_rank: int) -> None:
+    plan = kernel_moe_plan(
+        "unquant",
+        input_dtype=torch.bfloat16,
+        activation="silu",
+        requires_deferred_finalize=True,
+        routing_mode="precomputed_topk",
+        ep_size=2,
+        ispp=64,
+        hidden=128,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
+        combine_order="rank",
+        features=frozenset(),
+        solution="triton",
+    )
+    assert plan["apply_kernel_name"] == "triton_bf16_routes_moe_apply"
+    generator = torch.Generator(device="cuda").manual_seed(5)
+    x = torch.randn(5, 128, device="cuda", dtype=torch.bfloat16, generator=generator)
+    weights = torch.nn.Module()
+    weights.w13_weight = torch.nn.Parameter(
+        torch.randn(2, 128, 128, device="cuda", generator=generator).bfloat16() / 8
+    )
+    weights.w2_weight = torch.nn.Parameter(
+        torch.randn(2, 128, 64, device="cuda", generator=generator).bfloat16() / 8
+    )
+    weights.ep_rank = ep_rank
+    weights.num_local_experts = 2
+    # Four global experts; this rank owns two of them.
+    topk_ids = torch.tensor(
+        [[0, 3], [1, 2], [2, 2], [3, 0], [1, 3]], device="cuda", dtype=torch.int32
+    )
+    topk_weights = torch.full((5, 2), 0.5, device="cuda")
+
+    routes, route_weights, route_map = kernel_moe_apply(
+        plan, x, weights, None, topk_weights, topk_ids, do_finalize=False
+    )
+
+    assert route_weights is None and route_map is None
+    expected = torch.zeros(5, 2, 128, device="cuda")
+    for token, slot in torch.cartesian_prod(torch.arange(5), torch.arange(2)).tolist():
+        local = int(topk_ids[token, slot]) - 2 * ep_rank
+        if 0 <= local < 2:
+            gate, up = (x[token].float() @ weights.w13_weight[local].float().T).chunk(2)
+            activated = (F.silu(gate) * up).bfloat16().float()
+            expected[token, slot] = activated @ weights.w2_weight[local].float().T
+    torch.testing.assert_close(
+        routes.view(5, 2, 128).float(), expected, atol=2e-2, rtol=2e-2
+    )
+    remote = topk_ids // 2 != ep_rank
+    assert torch.all(routes.view(5, 2, 128)[remote] == 0)
+    destination = torch.empty_like(routes)
+    supplied, _, _ = kernel_moe_apply(
+        plan,
+        x,
+        weights,
+        None,
+        topk_weights,
+        topk_ids,
+        do_finalize=False,
+        deferred_out=destination,
+    )
+    assert supplied.data_ptr() == destination.data_ptr()
+    assert torch.equal(supplied, routes)
+    with pytest.raises(ValueError, match="unfinalized"):
+        kernel_moe_apply(plan, x, weights, None, topk_weights, topk_ids)

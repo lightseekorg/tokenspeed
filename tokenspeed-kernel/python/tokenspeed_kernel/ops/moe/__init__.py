@@ -1543,6 +1543,9 @@ def _build_traits(
         traits["activation"] = activation
     if requires_deferred_finalize:
         traits["supports_deferred_finalize"] = True
+    else:
+        # Excludes the kernels that only return per-route outputs.
+        traits["supports_finalize"] = True
     if routing_mode is not None:
         traits["routing_mode"] = routing_mode
 
@@ -1822,6 +1825,63 @@ def bf16_moe_routes_warmup(
             large_batch_kernel(x, w13, w2, topk_ids, expert_start, output=None)
 
 
+def _bf16_routes_moe_apply(
+    plan: dict,
+    x: torch.Tensor,
+    w: torch.nn.Module,
+    topk_ids: torch.Tensor | None,
+    do_finalize: bool,
+    deferred_out: torch.Tensor | None,
+) -> tuple[torch.Tensor, None, None]:
+    """Run a ``MoELayer``'s BF16 experts through :func:`bf16_moe_routes`.
+
+    The shared body of the route-backed ``moe.apply`` kernels, which declare
+    ``supports_finalize={False}``: they only return unfinalized routes.
+
+    Args:
+        plan: The layer's MoE plan; its features select batch invariance.
+        x: Contiguous BF16 hidden states ``[tokens, hidden]``.
+        w: The layer, holding local ``w13_weight`` ``[experts, 2I, hidden]``
+            and ``w2_weight`` ``[experts, hidden, I]`` and its ``ep_rank`` and
+            ``num_local_experts``.
+        topk_ids: Global selected expert ids ``[tokens, topk]``.
+        do_finalize: Must be false.
+        deferred_out: Optional caller-owned destination, as ``output`` of
+            :func:`bf16_moe_routes`.
+
+    Returns:
+        ``(route_outputs, None, None)``: unweighted routes ``[tokens * topk,
+        hidden]`` in token order, rows of other ranks' experts zero, so no
+        route map is needed.
+    """
+    if do_finalize:
+        raise ValueError("BF16 route kernels return unfinalized routes only")
+    if topk_ids is None:
+        raise ValueError("BF16 route kernels require precomputed top-k ids")
+    routes = bf16_moe_routes(
+        x,
+        w.w13_weight,
+        w.w2_weight,
+        topk_ids.contiguous(),
+        w.ep_rank * w.num_local_experts,
+        output=deferred_out,
+        batch_invariant="batch_invariant" in plan["features"],
+    )
+    return routes.view(-1, x.shape[1]), None, None
+
+
+def _bf16_routes_moe_warmup(plan: dict, w: torch.nn.Module) -> None:
+    """Compile the route kernels behind :func:`_bf16_routes_moe_apply`, before graph capture."""
+    bf16_moe_routes_warmup(
+        w.w13_weight,
+        w.w2_weight,
+        w.top_k,
+        w.ep_rank * w.num_local_experts,
+        max_num_tokens=plan["warmup_max_num_tokens"],
+        batch_invariant="batch_invariant" in plan["features"],
+    )
+
+
 def moe_plan(
     weight_dtype: str,
     input_dtype: torch.dtype = torch.bfloat16,
@@ -1859,6 +1919,8 @@ def moe_plan(
         input_dtype: Hidden-state dtype used for the apply-kernel signature.
         activation: Optional activation name required by the layer.
         requires_deferred_finalize: Require a kernel that can defer finalize.
+            Otherwise the kernel must finalize, which excludes kernels
+            declaring ``supports_finalize={False}``.
         routing_mode: Optional routing-mode requirement. "precomputed_topk"
             requires a kernel that consumes externally computed top-k ids and
             weights (for models whose routing function the fused kernels
