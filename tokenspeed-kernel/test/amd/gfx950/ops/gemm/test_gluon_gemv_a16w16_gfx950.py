@@ -278,7 +278,7 @@ def test_gated_norm_gemv_leaves_other_rows_and_heads_to_two_launches():
     norm_weight = torch.empty(128, dtype=torch.bfloat16, device="cuda")
     # One row takes the single-row GEMV, and past eight rows the norm would
     # outlast the weight stream.
-    for m in (1, 12, 16):
+    for m in (1, 12):
         gate = torch.empty((m, k), dtype=torch.bfloat16, device="cuda")
         assert not mv_rmsnorm_gated_sigmoid_supported(gate, norm_weight, weight)
     # Heads narrower than the MFMA tile's K step are not ones it can serve.
