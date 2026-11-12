@@ -374,7 +374,8 @@ TEST(BlockTableAccounting, RestoreRebindsTheRebuiltTablesToTheActiveParentsGauge
     std::vector<BlockTable> restored(1);
     std::vector<GroupDemand> demands{{.table = &restored[0], .extent = DenseGrowth{0}, .reserve_tokens = 0}};
     const auto restore = coordinator.Restore(image->image, demands, /*copy_in_point=*/std::nullopt,
-                                             CacheCoordinatorTestAccess::NextAccessEpoch(coordinator));
+                                             CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
+                                             /*drop_claims_if_unfit=*/false);
     ASSERT_TRUE(restore);
     ASSERT_EQ(restored[0].NumBlocks(), 3);
 
