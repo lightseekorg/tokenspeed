@@ -180,15 +180,6 @@ retain their semantics; small-M BF16 keeps its existing bound.
 
 ## Block-FP8 DeepGEMM
 
-Explicit block-FP8 solutions prepare loaded weights through
-`prepare_fp8_block_weight`, which calls the selected kernel's
-`weight_preprocessor` and reports whether it replaced either tensor. Dense
-layers use that flag to write back the tensors and pin the solution.
-Solutions without a preprocessor retain their existing parameters and forward
-dispatch, without load-time kernel selection.
-Automatic dispatch retains canonical weights for shape-dependent selection.
-
-
 `deepgemm_mm_fp8_blockscale` supports explicit `mm(..., override=...)` or
 `solution="deepgemm"` selection. Serving can opt in with
 `--dense-gemm-backend deepgemm` for standard block-FP8 dense linears. The
@@ -201,8 +192,10 @@ weight scales to the required layout without UE8M0 rounding. Conversion is part 
 including graph capture; no persistent weight cache is created. Unsupported
 forced calls fail explicitly. It does not claim batch-invariant numerics.
 
-On SM100/SM103, loading requantizes weights onto power-of-two scales and
-packs them once. Activations use the registered `packed_ue8m0` quantizer,
+On SM100/SM103, dense FP8 layers configured for DeepGEMM call
+`prepare_deepgemm_fp8_weight` after loading. It requantizes weights onto
+power-of-two scales and packs them once. The layer pins DeepGEMM for forward.
+Activations use the registered `packed_ue8m0` quantizer,
 which directly writes TMA-aligned int32 scales with initialized padding.
 GEMM consumes these packed scales without per-call copies or packing.
 The quantizer and DeepGEMM follow the global PDL setting and work in CUDA

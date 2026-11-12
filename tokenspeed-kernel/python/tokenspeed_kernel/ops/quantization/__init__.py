@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 __all__ = [
     "quantize_fp8",
     "output_fp8_quant_pack",
-    "supports_output_fp8_quant_pack",
+    "try_output_fp8_quant_pack",
     "quantize_fp8_with_gate",
     "quantize_fp8_with_scale",
     "rmsnorm_quantize_fp8",
@@ -906,7 +906,12 @@ from tokenspeed_kernel.ops.quantization.triton import (  # noqa: E402
 
 
 def _output_fp8_quant_pack_input_error(
-    x: torch.Tensor, z: torch.Tensor, weight: torch.Tensor | None, head_dim: int
+    x: torch.Tensor,
+    z: torch.Tensor,
+    weight: torch.Tensor | None,
+    *,
+    head_dim: int,
+    sigmoid_gate: bool,
 ) -> str | None:
     if (
         x.ndim != 2
@@ -936,18 +941,67 @@ def _output_fp8_quant_pack_input_error(
         or not weight.is_contiguous()
     ):
         return "norm weight must be contiguous BF16 [head_dim] on the input device"
+    if weight is None and not sigmoid_gate:
+        return "the unnormalized output gate must be sigmoid"
     return None
 
 
-def supports_output_fp8_quant_pack(
+def _launch_output_fp8_quant_pack(
     x: torch.Tensor,
     z: torch.Tensor,
     weight: torch.Tensor | None,
     *,
     head_dim: int,
-) -> bool:
-    """Check the tensor requirements of output_fp8_quant_pack."""
-    return _output_fp8_quant_pack_input_error(x, z, weight, head_dim) is None
+    eps: float,
+    sigmoid_gate: bool,
+    enable_pdl: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    kernel = select_kernel(
+        "quantization",
+        "output_fp8_packed",
+        format_signature(x=dense_tensor_format(x.dtype)),
+        traits={},
+        override=None,
+        solution=None,
+    )
+    return kernel(
+        x,
+        z,
+        weight,
+        head_dim=head_dim,
+        eps=eps,
+        sigmoid_gate=sigmoid_gate,
+        enable_pdl=enable_pdl,
+    )
+
+
+def try_output_fp8_quant_pack(
+    x: torch.Tensor,
+    z: torch.Tensor,
+    weight: torch.Tensor | None,
+    *,
+    head_dim: int,
+    eps: float,
+    sigmoid_gate: bool,
+    enable_pdl: bool,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Return fused codes and scales, or None for unsupported inputs."""
+    if (
+        _output_fp8_quant_pack_input_error(
+            x, z, weight, head_dim=head_dim, sigmoid_gate=sigmoid_gate
+        )
+        is not None
+    ):
+        return None
+    return _launch_output_fp8_quant_pack(
+        x,
+        z,
+        weight,
+        head_dim=head_dim,
+        eps=eps,
+        sigmoid_gate=sigmoid_gate,
+        enable_pdl=enable_pdl,
+    )
 
 
 def output_fp8_quant_pack(
@@ -976,20 +1030,12 @@ def output_fp8_quant_pack(
         scales with strides [1,round_up(M,4)]. Padding is zero. The norm/gate
         result rounds to BF16 before quantization, matching separate launches.
     """
-    error = _output_fp8_quant_pack_input_error(x, z, weight, head_dim)
+    error = _output_fp8_quant_pack_input_error(
+        x, z, weight, head_dim=head_dim, sigmoid_gate=sigmoid_gate
+    )
     if error is not None:
         raise ValueError(error)
-    if weight is None and not sigmoid_gate:
-        raise ValueError("the unnormalized output gate must be sigmoid")
-    kernel = select_kernel(
-        "quantization",
-        "output_fp8_packed",
-        format_signature(x=dense_tensor_format(x.dtype)),
-        traits={},
-        override=None,
-        solution=None,
-    )
-    return kernel(
+    return _launch_output_fp8_quant_pack(
         x,
         z,
         weight,

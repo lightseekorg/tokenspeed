@@ -24,7 +24,11 @@ import pytest
 import torch
 from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
 from tokenspeed_kernel.ops.layernorm import gated_rmsnorm
-from tokenspeed_kernel.ops.quantization import output_fp8_quant_pack, quantize_fp8
+from tokenspeed_kernel.ops.quantization import (
+    output_fp8_quant_pack,
+    quantize_fp8,
+    try_output_fp8_quant_pack,
+)
 from tokenspeed_kernel.platform import pdl_enabled
 
 pytestmark = pytest.mark.skipif(
@@ -131,6 +135,26 @@ def test_output_quant_graph(rows, width, head, kind, pdl):
             assert torch.count_nonzero(complete[rows:]) == 0
     finally:
         pdl_enabled(previous)
+
+
+def test_try_output_quant_pack_with_supported_and_unsupported_heads():
+    x = torch.randn(4, 256, device="cuda", dtype=torch.bfloat16)
+    z = torch.randn_like(x)
+    kwargs = dict(eps=0.0, sigmoid_gate=True, enable_pdl=False)
+    packed = try_output_fp8_quant_pack(x, z, None, head_dim=128, **kwargs)
+    assert packed is not None
+    actual, scales = packed
+    expected, expected_scales = output_fp8_quant_pack(
+        x, z, None, head_dim=128, **kwargs
+    )
+    torch.testing.assert_close(
+        actual.view(torch.uint8), expected.view(torch.uint8), rtol=0, atol=0
+    )
+    torch.testing.assert_close(scales, expected_scales, rtol=0, atol=0)
+
+    assert try_output_fp8_quant_pack(x, z, None, head_dim=64, **kwargs) is None
+    with pytest.raises(ValueError, match="power-of-two heads"):
+        output_fp8_quant_pack(x, z, None, head_dim=64, **kwargs)
 
 
 def test_output_quant_reuses_compilation():

@@ -131,3 +131,7 @@ UE8M0 scales with zero padding. Each warp owns one head-row and uses a
 hardware warp-max reduction for group absmax; inverse scales are built from
 exponent bits. Static norm weights load before the PDL wait, while activation
 and gate loads follow it. Rows and tensor strides remain runtime arguments.
+
+`try_output_fp8_quant_pack` checks the input requirements and launches the
+fusion when they hold. It returns `None` when callers need to run the separate
+gate or norm and quantization operations.

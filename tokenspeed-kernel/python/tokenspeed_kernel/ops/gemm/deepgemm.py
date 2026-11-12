@@ -262,6 +262,8 @@ def prepare_deepgemm_fp8_weight(
         or platform.arch_version in (ArchVersion(10, 0), ArchVersion(10, 3))
     ):
         raise ValueError("DeepGEMM dense FP8 requires SM90, SM100 or SM103")
+    if weight.dtype != torch.float8_e4m3fn or scales.dtype != torch.float32:
+        raise ValueError("DeepGEMM weight preparation requires E4M3 and FP32 scales")
     n, k = weight.shape
     if n % 64 or k % 128:
         raise ValueError("DeepGEMM weights require N%64=0 and K%128=0")
@@ -302,7 +304,6 @@ def prepare_deepgemm_fp8_weight(
         "out_contiguous": frozenset({True}),
         "out_dtype": frozenset({torch.bfloat16}),
     },
-    weight_preprocessor=prepare_deepgemm_fp8_weight,
     # Below the existing Triton block-FP8 leaf: auto keeps its current choice.
     priority=Priority.PERFORMANT,
 )

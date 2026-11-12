@@ -22,7 +22,8 @@
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.gemm import mm, prepare_deepgemm_fp8_weight
+from tokenspeed_kernel.ops.gemm import mm
+from tokenspeed_kernel.ops.gemm.deepgemm import prepare_deepgemm_fp8_weight
 from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.platform import pdl_enabled
 
