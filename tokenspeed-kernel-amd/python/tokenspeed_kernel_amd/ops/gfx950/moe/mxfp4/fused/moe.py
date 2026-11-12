@@ -252,11 +252,9 @@ _PRECOMPUTED_MFMA_MIN_M = 4
 # a batch fills those tiles. Speculative decode never does: with EAGLE3 the
 # decode width is concurrency x num_draft_tokens, so a Kimi-K3 batch of 8 is 32
 # rows spread over hundreds of experts and the tiles are almost entirely
-# padding. Measured end to end on 8x gfx950 at 50K/500, moving this bound from
-# 16 to 64 lowers TPOT by 17% at concurrency 8 and 4% at concurrency 16, while
-# concurrency 4 -- below the bound either way -- is unchanged, and a
-# concurrency that does not cross the bound does not move. It follows the Iris
-# K3 fused decode rows to 192, so 48 requests' 4-token verify stays here.
+# padding, so speculative-verify widths take the warp decode. The bound follows
+# the Iris K3 fused decode rows to 192, so 48 requests' 4-token verify stays
+# here.
 _SITU_WARP_DECODE_MAX_M = 192
 
 

@@ -1582,8 +1582,7 @@ def launch_gluon_mm_a16w16_medium_gfx950(
 # K tile of a program. Only buckets that beat torch.mm by at least 4% at the
 # row counts their model sends are listed, except where an entry notes
 # otherwise; the rest keep the torch path. The 128 and 256 buckets were swept
-# inside capture_session, as serving captures, except the K3.1 TP8 ones, swept
-# in graph replays over rotating weight copies at 96/128 and 160/192 rows.
+# inside capture_session, as serving captures.
 DECODE_M_BUCKETS = (4, 8, 16, 32, 64, 128, 256)
 _DECODE_CONFIGS: dict[
     tuple[int, int], dict[int, tuple[int, int, int, int, int, int, int, int]]
