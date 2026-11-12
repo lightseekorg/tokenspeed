@@ -1640,14 +1640,32 @@ def _ex2_compute_picked(mb, task, loads, a, picks_smem, RANK: gl.constexpr):
     acc = _mma_rows(p_smem, s_smem, loads)
     out = gl.reshape(acc.to(gl.bfloat16), [M_DUP, BLOCK_N // 2, 2])
     word = mx.pack_bf16_pairs(out)
-    wl: gl.constexpr = word.type.layout
-    mm = gl.arange(0, M_DUP, gl.SliceLayout(1, wl))[:, None]
-    p = gl.arange(0, BLOCK_N // 2, gl.SliceLayout(0, wl))[None, :]
     rl: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [gl.num_warps(), 1], [1, 0])
-    pick_of = gl.convert_layout(
-        gl.reshape(picks_smem.load(rl), [M_DUP]), gl.SliceLayout(1, wl)
-    )[:, None]
     col = (blk * BLOCK_N) % OWNED_OUT
+    R: gl.constexpr = schedule.rows(mb.plan)
+    if R > 8:
+        # Past 8 rows (two requests) the put streams twice the rows. In the
+        # accumulator's layout adjacent lanes hold pairs 16 bytes apart, so
+        # each 8-byte remote store fills half of every segment it touches.
+        # Here lane i holds pair i of a row: one store writes a row's 64
+        # pairs as 512 contiguous bytes. The same values go to the same
+        # addresses.
+        cl: gl.constexpr = gl.BlockedLayout(
+            [1, 1], [1, 64], [gl.num_warps(), 1], [1, 0]
+        )
+        word = gl.convert_layout(word, cl)
+        mm = gl.arange(0, M_DUP, gl.SliceLayout(1, cl))[:, None]
+        p = gl.arange(0, BLOCK_N // 2, gl.SliceLayout(0, cl))[None, :]
+        pick_of = gl.convert_layout(
+            gl.reshape(picks_smem.load(rl), [M_DUP]), gl.SliceLayout(1, cl)
+        )[:, None]
+    else:
+        wl: gl.constexpr = word.type.layout
+        mm = gl.arange(0, M_DUP, gl.SliceLayout(1, wl))[:, None]
+        p = gl.arange(0, BLOCK_N // 2, gl.SliceLayout(0, wl))[None, :]
+        pick_of = gl.convert_layout(
+            gl.reshape(picks_smem.load(rl), [M_DUP]), gl.SliceLayout(1, wl)
+        )[:, None]
     at = ((RANK * TOP_K + pick_of) * OWNED_OUT + col) // 2 + p
     mb.put_peer(
         "rr",
