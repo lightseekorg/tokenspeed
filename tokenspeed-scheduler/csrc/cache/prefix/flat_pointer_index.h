@@ -72,19 +72,10 @@ public:
         return {value, true};
     }
 
-    // Removes and returns the borrowed handle in one lookup, or returns the
-    // empty handle. The caller still owns the object and can destroy it after
-    // its index entry has gone.
-    T Extract(const Key& key) {
-        if (slots_.empty()) return empty_;
-        const std::size_t position = probe(key, Hash{}(key));
-        return slots_[position].value == empty_ ? empty_ : removeAt(position);
-    }
-
-    // Extract for a caller holding the indexed object itself: `key` is that
-    // object's own key. Slots match by cached hash and object identity, so no
-    // stored key is read or compared. Returns the empty handle when the
-    // object is not indexed under `key`.
+    // Removes and returns the handle of `object`, which the caller holds and
+    // still owns: `key` is that object's own key. Slots match by cached hash
+    // and object identity, so no stored key is read or compared. Returns the
+    // empty handle when the object is not indexed under `key`.
     template <typename Object>
     T ExtractObject(const Key& key, const Object& object) {
         if (slots_.empty()) return empty_;
@@ -98,8 +89,6 @@ public:
         }
         return empty;
     }
-
-    bool Erase(const Key& key) { return Extract(key) != empty_; }
 
     std::size_t size() const noexcept { return size_; }
     bool empty() const noexcept { return size_ == 0; }

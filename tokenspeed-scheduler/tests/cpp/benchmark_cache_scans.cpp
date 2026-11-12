@@ -32,6 +32,7 @@
 #include "cache/core/block_table.h"
 #include "cache/coordinator/cache_coordinator.h"
 #include "cache/prefix/prefix_hasher.h"
+#include "prefix_hash_text.h"
 #include "cache/prefix/prefix_index.h"
 #include "cache/tier/transfer_manager.h"
 #include "cache_test_access.h"

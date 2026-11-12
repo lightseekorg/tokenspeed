@@ -385,7 +385,7 @@ TEST(FlatPointerIndex, CollidingKeysSurviveGrowthWrappedClustersAndChurn) {
         } else {
             const auto found = expected.find(key);
             const Entry* removed = found == expected.end() ? nullptr : found->second;
-            EXPECT_EQ(index.Extract(key), removed);
+            EXPECT_EQ(index.ExtractObject(key, entries[key]), removed);
             expected.erase(key);
         }
         EXPECT_EQ(index.size(), expected.size());
@@ -398,10 +398,10 @@ TEST(FlatPointerIndex, CollidingKeysSurviveGrowthWrappedClustersAndChurn) {
     }
     for (const auto& [key, entry] : expected) {
         EXPECT_EQ(index.Find(key), entry);
-        EXPECT_TRUE(index.Erase(key));
+        EXPECT_EQ(index.ExtractObject(key, *entry), entry);
     }
     EXPECT_TRUE(index.empty());
-    EXPECT_FALSE(index.Erase(0));
+    EXPECT_EQ(index.ExtractObject(0, entries[0]), nullptr);
     EXPECT_TRUE(IndexHandle(index, 0, &entries[0]));
     EXPECT_EQ(index.Find(0), &entries[0]);
 }
@@ -466,8 +466,7 @@ TEST(FlatPointerIndex, ExtractObjectRemovesOnlyThatObjectAmongCollidingKeys) {
                 expected.erase(key);
                 break;
             default:
-                EXPECT_EQ(index.Extract(key), present ? &entries[key] : nullptr);
-                expected.erase(key);
+                EXPECT_EQ(index.Find(key), present ? &entries[key] : nullptr);
                 break;
         }
         if (step % 97 == 0) expect_contents();

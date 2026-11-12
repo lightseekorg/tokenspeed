@@ -62,7 +62,6 @@ public:
         WriteLowercaseHex(std::get<Digest>(value_), text.data());
         return text;
     }
-    explicit operator std::string() const { return ToString(); }
 
     bool operator==(const ContentHash&) const noexcept = default;
     std::size_t Hash() const {

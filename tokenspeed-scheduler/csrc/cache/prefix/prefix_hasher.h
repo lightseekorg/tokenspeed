@@ -37,13 +37,6 @@
 
 namespace tokenspeed {
 
-// Append each byte of [bytes, bytes+n) to out as two lowercase hex characters.
-inline void AppendHexBytes(std::string& out, const uint8_t* bytes, std::size_t n) {
-    const std::size_t size = out.size();
-    out.resize(size + 2 * n);
-    WriteLowercaseHex({bytes, n}, out.data() + size);
-}
-
 // Absorb a uint32_t into the hash as 4 little-endian bytes. Encodes the
 // length and count prefixes that frame the stream.
 inline void Sha256UpdateU32LE(SHA256_CTX& ctx, uint32_t v) {
@@ -111,15 +104,9 @@ inline ContentHash::Digest HashPrefixPageDigest(std::span<const std::int32_t> to
     return digest;
 }
 
-inline std::string HashPrefixPage(std::span<const std::int32_t> tokens, const std::string& prior_hash,
-                                  std::span<const std::string> extra_keys = {}) {
-    const auto prior_bytes = HexToBytes(prior_hash);
-    return DigestToHex(HashPrefixPageDigest(tokens, prior_bytes, extra_keys));
-}
-
-// The same page hash under a prior held as an identity, returned as one: it
-// chains exactly the bytes HashPrefixPage(tokens, prior.ToString()) decodes,
-// taking a canonical prior's 32 bytes directly instead of through its text.
+// A page's hash under a prior held as an identity, returned as one. A
+// canonical prior chains its 32 bytes directly; an opaque one chains the
+// bytes HexToBytes reads from its text, as the text chains below do.
 inline ContentHash HashPrefixPage(std::span<const std::int32_t> tokens, const ContentHash& prior) {
     if (const ContentHash::Digest* digest = prior.digest()) {
         return ContentHash{HashPrefixPageDigest(tokens, *digest, {})};

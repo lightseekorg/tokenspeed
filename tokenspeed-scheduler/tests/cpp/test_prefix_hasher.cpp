@@ -34,6 +34,7 @@
 #include "cache/core/content_hash.h"
 #include "cache/core/hex_codec.h"
 #include "cache/prefix/prefix_hasher.h"
+#include "prefix_hash_text.h"
 #include "core/token_container.h"
 #include "scheduler/request.h"
 
@@ -162,17 +163,11 @@ TEST(RequestPromptHashesTest, PageByPageAppendsGrowTheCompletedChainGeometricall
 
 // ---- hex helpers --------------------------------------------------------
 
-TEST(PageHasherHexTest, AppendHexBytesIsLowercaseTwoCharsPerByte) {
-    std::string out;
-    const uint8_t bytes[] = {0x00, 0x0f, 0xa3, 0xff};
-    AppendHexBytes(out, bytes, 4);
-    EXPECT_EQ(out, "000fa3ff");
-}
-
-TEST(PageHasherHexTest, HexToBytesIsInverseOfAppend) {
+TEST(PageHasherHexTest, HexToBytesInvertsWriteLowercaseHex) {
     const uint8_t bytes[] = {0x00, 0x01, 0x7e, 0x80, 0xab, 0xff};
-    std::string hex;
-    AppendHexBytes(hex, bytes, sizeof(bytes));
+    std::string hex(2 * sizeof(bytes), '?');
+    WriteLowercaseHex(bytes, hex.data());
+    EXPECT_EQ(hex, "00017e80abff");
     std::vector<uint8_t> decoded = HexToBytes(hex);
     ASSERT_EQ(decoded.size(), sizeof(bytes));
     for (std::size_t i = 0; i < sizeof(bytes); ++i) {
@@ -241,9 +236,6 @@ TEST(PageHasherHexTest, EveryByteValueAndShortTailEncodesLikeTheReference) {
         std::string out(2 * length + 3, '?');
         WriteLowercaseHex(bytes, out.data());
         EXPECT_EQ(out, ReferenceLowercaseHex(bytes) + "???") << "length " << length;
-        std::string appended = "ab";
-        AppendHexBytes(appended, bytes.data(), bytes.size());
-        EXPECT_EQ(appended, "ab" + ReferenceLowercaseHex(bytes)) << "length " << length;
     }
 }
 

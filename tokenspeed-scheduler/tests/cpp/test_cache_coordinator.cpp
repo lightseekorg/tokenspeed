@@ -46,6 +46,7 @@
 #include "prefix_test_group.h"
 #include "cache_test_access.h"
 #include "cache/prefix/prefix_hasher.h"
+#include "prefix_hash_text.h"
 #include "cache/tier/transfer_manager.h"
 #include "unit_test_helper.h"
 #include "scheduler/request.h"
@@ -10273,7 +10274,7 @@ protected:
             boundaries.emplace_back(hash, 0);
         }
         if (tail) {
-            boundaries.emplace_back(tail->hash, tail->tail_tokens);
+            boundaries.emplace_back(tail->hash.ToString(), tail->tail_tokens);
         }
         for (const auto& [hash, tail_tokens] : boundaries) {
             coordinator_.ForEachBoundaryKey(Key(hash, 0), tail_tokens, [&](std::size_t, const CacheKey& key) {
@@ -12612,7 +12613,7 @@ TEST_P(HostSegmentPlanMirrorTest, PlansMatchOnTwoMirroredCoordinators) {
         for (const std::string& hash : hashes) {
             boundaries.emplace_back(hash, 0);
         }
-        boundaries.emplace_back(tail.hash, tail.tail_tokens);
+        boundaries.emplace_back(tail.hash.ToString(), tail.tail_tokens);
         for (std::size_t c = 0; c < 2; ++c) {
             CacheCoordinator& coordinator = coordinators[c];
             std::vector<BlockTable> tables(4);
@@ -16780,7 +16781,7 @@ TEST_P(WriteBackRandomTest, TreeNodesLiveExactlyAsLongAsAnEntryOrAStore) {
                 boundaries.emplace_back(hash, 0);
             }
             if (tail) {
-                boundaries.emplace_back(tail->hash, tail->tail_tokens);
+                boundaries.emplace_back(tail->hash.ToString(), tail->tail_tokens);
             }
             sessions.push_back(tokens);
         }
@@ -16807,7 +16808,7 @@ TEST_P(WriteBackRandomTest, TreeNodesLiveExactlyAsLongAsAnEntryOrAStore) {
                                                               .boundary_kind = CacheBoundaryKind::kEndpoint},
                             .num_computed_tokens = full_pages * kP + 1},
                         CacheCoordinatorTestAccess::NextAccessEpoch(coordinator));
-                    boundaries.emplace_back(other_tail.hash, 1);
+                    boundaries.emplace_back(other_tail.hash.ToString(), 1);
                 }
                 coordinator.Free(other_tables);
             }

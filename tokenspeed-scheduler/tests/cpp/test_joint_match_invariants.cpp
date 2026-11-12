@@ -46,6 +46,7 @@
 #include "cache/core/block_pool.h"
 #include "cache/core/cache_types.h"
 #include "cache/prefix/prefix_hasher.h"
+#include "prefix_hash_text.h"
 #include "cache/tier/transfer_manager.h"
 #include "cache_test_access.h"
 #include "unit_test_helper.h"

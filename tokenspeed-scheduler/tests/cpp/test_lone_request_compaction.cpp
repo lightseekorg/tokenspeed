@@ -53,6 +53,7 @@
 #include "cache/coordinator/cache_coordinator.h"
 #include "cache/core/block_pool.h"
 #include "cache/prefix/prefix_hasher.h"
+#include "prefix_hash_text.h"
 #include "cache_test_access.h"
 #include "integration_test_helper.h"
 #include "scheduler/operations/group_demands.h"
