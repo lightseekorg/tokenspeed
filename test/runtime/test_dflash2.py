@@ -44,6 +44,7 @@ from tokenspeed.runtime.layers.attention import backends  # noqa: F401
 from tokenspeed.runtime.layers.attention.registry import _BACKEND_REGISTRY
 from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
+from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.models import dflash as dflash_model
 from tokenspeed.runtime.models.dflash import DFlashDraftModel
 from tokenspeed.runtime.models.dflash2 import (
@@ -312,17 +313,52 @@ _WINDOW_AWARE_BACKENDS = frozenset(
 )
 
 
+def _draft_attention(
+    window: int, sink: int = 0, *, layer_id: int = 0
+) -> PagedAttention:
+    """A real draft attention layer carrying the given window and sink."""
+    return PagedAttention(
+        num_heads=1,
+        head_dim=8,
+        scaling=1.0,
+        num_kv_heads=1,
+        layer_id=layer_id,
+        sliding_window_size=window,
+        sliding_window_sink=sink,
+        rotary_emb=None,
+        qk_norm=None,
+    )
+
+
 def _window_validator(*windows: int, supported: bool, backend: str) -> DFlash:
     """A DFlash stub whose draft layers carry the given window_lefts."""
     model = torch.nn.Module()
-    model.layers = torch.nn.ModuleList()
-    for window in windows:
-        attention = torch.nn.Module()
-        attention.sliding_window_size = window
-        model.layers.append(attention)
+    model.layers = torch.nn.ModuleList(
+        _draft_attention(window, layer_id=layer_id)
+        for layer_id, window in enumerate(windows)
+    )
     drafter = DFlash.__new__(DFlash)
     drafter.model = model
     drafter.attn_backend = SimpleNamespace(supports_layer_sliding_window=supported)
+    drafter.draft_model_runner = SimpleNamespace(
+        server_args=SimpleNamespace(drafter_attention_backend=backend)
+    )
+    return drafter
+
+
+def _sink_validator(*sinks: int, supported: bool, backend: str) -> DFlash:
+    """A DFlash stub whose draft layers carry the given window sinks.
+
+    A sink needs a window, so every layer gets one.
+    """
+    model = torch.nn.Module()
+    model.layers = torch.nn.ModuleList(
+        _draft_attention(4095, sink, layer_id=layer_id)
+        for layer_id, sink in enumerate(sinks)
+    )
+    drafter = DFlash.__new__(DFlash)
+    drafter.model = model
+    drafter.attn_backend = SimpleNamespace(supports_layer_window_sink=supported)
     drafter.draft_model_runner = SimpleNamespace(
         server_args=SimpleNamespace(drafter_attention_backend=backend)
     )
@@ -352,6 +388,40 @@ def test_draft_attention_window_validation_accepts_the_served_combinations() -> 
 
     honoured._validate_draft_attention_window()
     unwindowed._validate_draft_attention_window()
+
+
+def test_a_window_sink_draft_rejects_a_backend_that_drops_the_sink() -> None:
+    drafter = _sink_validator(128, 0, supported=False, backend="fa3")
+
+    with pytest.raises(ValueError, match="fa3.*cannot keep those leading tokens"):
+        drafter._validate_draft_window_sink()
+
+
+def test_draft_window_sink_validation_accepts_the_served_combinations() -> None:
+    honoured = _sink_validator(128, 0, supported=True, backend="triton")
+    sinkless = _sink_validator(0, 0, supported=False, backend="fa3")
+
+    honoured._validate_draft_window_sink()
+    sinkless._validate_draft_window_sink()
+
+
+def test_draft_validation_ignores_a_non_attention_module_of_the_same_name() -> None:
+    """Only a PagedAttention declares the draft's visibility.
+
+    A sibling module carrying an attribute of the same name is not an
+    attention layer, so its value must not reach the backend check.
+    """
+    drafter = _window_validator(-1, supported=False, backend="trtllm_mla")
+    impostor = torch.nn.Module()
+    impostor.sliding_window_size = 4095
+    impostor.sliding_window_sink = 128
+    drafter.model.add_module("impostor", impostor)
+    drafter.attn_backend = SimpleNamespace(
+        supports_layer_sliding_window=False, supports_layer_window_sink=False
+    )
+
+    drafter._validate_draft_attention_window()
+    drafter._validate_draft_window_sink()
 
 
 @pytest.mark.parametrize("block_size", (6, 8))
@@ -519,7 +589,10 @@ def test_official_nodes_capture_and_replay_in_one_cuda_graph() -> None:
 @_CUDA_ONLY
 def test_the_fused_mla_context_write_reproduces_the_per_layer_chain() -> None:
     """One GEMM + one launch must land what norm -> RoPE -> scatter lands."""
-    from tokenspeed_kernel.ops.kvcache.triton import mla_latent_norm_rope_scatter
+    from tokenspeed_kernel.ops.kvcache.triton import (
+        LatentPlanes,
+        mla_latent_norm_rope_scatter,
+    )
 
     from tokenspeed.runtime.layers.layernorm import RMSNorm
     from tokenspeed.runtime.layers.rotary_embedding import get_rope
@@ -563,7 +636,7 @@ def test_the_fused_mla_context_write_reproduces_the_per_layer_chain() -> None:
         hidden_states,
         torch.cat([w[q_lora:] for w in weights], dim=0).t().contiguous(),
     ).view(tokens, layers, width)
-    actual = [torch.zeros_like(expected) for _ in range(layers)]
+    actual = [torch.zeros_like(expected).unsqueeze(1) for _ in range(layers)]
     mla_latent_norm_rope_scatter(
         stacked,
         torch.stack([norm.weight.data for norm in norms]),
@@ -571,16 +644,18 @@ def test_the_fused_mla_context_write_reproduces_the_per_layer_chain() -> None:
         rotary.cos_sin_cache,
         positions,
         loc,
-        torch.tensor([p.data_ptr() for p in actual], dtype=torch.int64, device=device),
-        actual[0].stride(0),
-        dtype,
+        LatentPlanes.from_buffers(actual),
+        write_mask=None,
         is_neox=rotary.is_neox_style,
         sanitize=False,
     )
 
     for index in range(layers):
         torch.testing.assert_close(
-            actual[index].float(), planes[index].float(), atol=2e-2, rtol=2e-2
+            actual[index].squeeze(1).float(),
+            planes[index].float(),
+            atol=2e-2,
+            rtol=2e-2,
         )
 
 
@@ -608,14 +683,17 @@ def test_a_mixed_batch_derives_draft_lengths_without_reading_the_device() -> Non
         bs=3,
         num_extends=1,
         input_num_tokens=positions.numel(),
-        # The round's write vector comes from the TARGET router: the prefill
-        # row's extend span first, then the decode rows' verify windows, in
-        # the token order the hidden states arrive in.
         attn_backend=SimpleNamespace(
+            group_ids=("full_attention",),
             extend_span_locations=lambda: torch.arange(5, dtype=torch.int32),
             decode_window_locations=lambda: torch.arange(5, 13, dtype=torch.int32),
         ),
     )
+    # A shared cache group: the taps are the TARGET's rows, so its router owns
+    # the write vector -- the prefill row's extend span first, then the decode
+    # rows' verify windows, in the token order the hidden states arrive in.
+    # (The draft's own router has republished a block window by now.)
+    drafter.attn_backend = SimpleNamespace(group_ids=("full_attention",))
     drafter._update_native_cache_from_target(
         ctx,
         SimpleNamespace(hidden_states=torch.zeros(positions.numel(), 8)),

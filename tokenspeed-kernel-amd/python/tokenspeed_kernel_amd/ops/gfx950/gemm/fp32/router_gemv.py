@@ -23,7 +23,7 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel_amd._extern import extern_compile_options, release_drain
+from tokenspeed_kernel_amd._extern import extern_compile_options, wait_vmem
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
     GROUP_SIZE_M,
@@ -334,7 +334,7 @@ def gluon_fp32_router_gemv_splitk_gfx950(
     # each wave waits for its stores to complete, and the barrier orders every
     # wave's stores before the counter bump. A release atomic would instead
     # write back this XCD's whole L2 (BUFFER_WBL2).
-    release_drain()
+    wait_vmem()
     gl.barrier()
     arrived = gl.atomic_add(counter_ptr + tile, 1, sem="relaxed", scope="gpu")
     if arrived == SPLIT_K - 1:

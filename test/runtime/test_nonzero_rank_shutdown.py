@@ -99,6 +99,7 @@ if __name__ == "__main__":
         node_rank=1,
         model="",
         tokenizer="",
+        log_level="info",
         disaggregation_mode="null",
         kv_events_config=None,
         dist_init_addr="127.0.0.1:25000",

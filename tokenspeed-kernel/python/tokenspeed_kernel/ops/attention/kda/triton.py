@@ -15,9 +15,11 @@ from collections.abc import Callable
 
 import torch
 from tokenspeed_kernel.ops.attention.kda import (
+    KdaOutputNorm,
     KdaPrefillResult,
     KdaReplayRecords,
     _attention_format_signature,
+    apply_kda_output_norm,
 )
 from tokenspeed_kernel.platform import CapabilityRequirement, pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
@@ -273,9 +275,10 @@ def triton_nvidia_kda_fused_paged_verify(
     head_dim: int,
     draft_token_num: int,
     lower_bound: float | None,
+    output_norm: KdaOutputNorm | None,
 ) -> torch.Tensor:
     """Run fused target verify, storing per-position rollback states."""
-    return _nvidia_fused_verify(
+    result = _nvidia_fused_verify(
         mixed_qkv,
         conv_weights,
         conv_states,
@@ -296,6 +299,7 @@ def triton_nvidia_kda_fused_paged_verify(
         store_states=True,
         split_producers=False,
     )
+    return apply_kda_output_norm(result, output_norm)
 
 
 @register_kernel(
@@ -332,9 +336,10 @@ def triton_nvidia_kda_fused_paged_verify_no_store(
     head_dim: int,
     draft_token_num: int,
     lower_bound: float | None,
+    output_norm: KdaOutputNorm | None,
 ) -> torch.Tensor:
     """Run fused target verify without materializing rollback states."""
-    return _nvidia_fused_verify(
+    result = _nvidia_fused_verify(
         mixed_qkv,
         conv_weights,
         conv_states,
@@ -355,6 +360,7 @@ def triton_nvidia_kda_fused_paged_verify_no_store(
         store_states=False,
         split_producers=False,
     )
+    return apply_kda_output_norm(result, output_norm)
 
 
 @register_kernel(
@@ -393,6 +399,7 @@ def triton_nvidia_kda_fused_paged_verify_split(
     draft_token_num: int,
     lower_bound: float | None,
     replay_records: KdaReplayRecords | None,
+    output_norm: KdaOutputNorm | None,
     g_raw: torch.Tensor | None = None,
     conv_qkv: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -437,7 +444,7 @@ def triton_nvidia_kda_fused_paged_verify_split(
                 "state_dtype": state_pool.dtype,
             },
         )
-        return verify(
+        result = verify(
             q,
             k,
             v,
@@ -456,7 +463,8 @@ def triton_nvidia_kda_fused_paged_verify_split(
             record_metadata=replay_records.metadata,
             record_stamps=replay_records.stamps,
         )
-    return _nvidia_fused_verify(
+        return apply_kda_output_norm(result, output_norm)
+    result = _nvidia_fused_verify(
         mixed_qkv,
         conv_weights,
         conv_states,
@@ -479,6 +487,7 @@ def triton_nvidia_kda_fused_paged_verify_split(
         g_raw=g_raw,
         conv_qkv=conv_qkv,
     )
+    return apply_kda_output_norm(result, output_norm)
 
 
 @register_kernel(

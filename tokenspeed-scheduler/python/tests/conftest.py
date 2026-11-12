@@ -53,6 +53,15 @@ def _spec(request_id: str, tokens: list[int]) -> "ts.RequestSpec":
     return spec
 
 
+def _event(kind: str, request_id: str, **fields):
+    """One ForwardEvent of the named kind, its fields set by keyword."""
+    event = getattr(ts.ForwardEvent, kind)()
+    event.request_id = request_id
+    for name, value in fields.items():
+        setattr(event, name, value)
+    return event
+
+
 def _advance(scheduler, request_id: str, tokens: list[int]) -> None:
     event = ts.ForwardEvent.ExtendResult()
     event.request_id = request_id

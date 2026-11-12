@@ -329,7 +329,55 @@ its index keys: `index_k_layernorm_fp8_scatter_and_quantize_query`
 `index_k_layernorm_fp8_scatter` (one warp, so the key's LayerNorm sums in the
 same order) and of `quantize_index_query_weights`, so the plane's bytes and
 the query and weights are bit-identical to the two separate launches. Mixed
-rounds, prefill, and KV-parallel decode keep the separate write.
+rounds, prefill, and KV-parallel decode keep the separate write; decode rounds
+of the K3 decode chain run the fused decode front below instead.
+
+## Fused decode front (`cute_dsl_dsa_decode_front`)
+
+On SM100-SM103 a Kimi-K3.1 TP8 decode round of the K3 decode chain runs, after
+its packed input projection, one cluster launch
+(`thirdparty/cute_dsl/k3_decode/dsa/front.py`) in place of three:
+`rmsnorm_fused_parallel` (q_a into `q_norm`, kv_a in place), the stacked
+[q_b; wq_b] GEMM over `q_norm`, and
+`index_k_layernorm_fp8_scatter_and_quantize_query`. It is the
+`dsa_decode_front` operator (`solution="cute_dsl"`; traits q_lora_rank 1536,
+kv_lora_rank 512, 2304 q_b rows, 32 index heads of 128, 64-slot packed
+`fp8_scaled` planes) and serves 1-64 rows (`decode_front_rows_supported`).
+Kimi-K3.1 takes it up to 32 rows: on GB300 it saves about 2 us per DSA layer
+at 8-32 rows, while at 64 rows the stacked GEMM path is faster.
+
+- Grid (4, 32), clusters of 4, one CTA per SM. Cluster `h` owns index head `h`
+  (128 wq_b rows) and q_b rows `[72 h, 72 h + 72)`; CTA `p` holds K columns
+  `[384 p, 384 p + 384)` of those 200 rows. It issues its 150 KB of weights in
+  six 64-column blocks (cp.async, L2 evict_first) before the PDL wait, so the
+  weight stream starts under the input projection's tail, and the MMAs of a
+  block start as it lands.
+- After the wait, eight warps load the rows' q_a quarter. Each CTA sends its
+  peers (DSMEM bulk copies) one whole warp sum and 16 thread chains of the
+  RMSNorm per row, from which every CTA rebuilds `rmsnorm_fused_parallel`'s
+  exact reduction tree (an FMA chain per 8 columns, a butterfly per 256, the six
+  warp sums as `((w0 + w4) + w2) + ((w1 + w5) + w3)`, `-use_fast_math`
+  arithmetic), normalizes its quarter in place and runs BF16 `mma.sync` with FP32
+  accumulators. The FP32 partials overwrite the weight buffer; after a cluster
+  barrier the owner of a row adds the four K quarters in rank order, rounds to
+  BF16, writes the projection and quantizes the head as
+  `quantize_index_query_weights` does.
+- A ninth warp writes token `4 h + p`'s index key with the Triton write's
+  instruction sequence and normalizes its kv_a row in place.
+
+Numerics: `q_norm`, the normalized latent, the plane bytes and the quantized
+query (of the front's own BF16 projection) are bit-identical to the separate
+launches. Only the projection's K summation order differs from a GEMM
+library's, so a projected value may differ from the unfused GEMM's by one BF16
+step, and its FP8 query and scale follow it. Rows are a runtime value: one
+compile per 16-row tile and slot / LayerNorm dtype.
+
+Kimi-K3.1 selects the front at construction only with the fused decode top-k
+(`index_k_write_quantizes_query`) and takes it for decode rounds of the decode
+chain without KV placement or a breakable capture; the front runs inside the
+layer's eager break, and `forward_dsa_core` takes its outputs as
+`written_index_query`. Prefill, mixed and KV-parallel rounds, the non-chain
+forward and bitwise numerics keep the separate launches.
 
 ## Row top-k selection in CuTe DSL (`_cute_dsl/deep_select.py`)
 

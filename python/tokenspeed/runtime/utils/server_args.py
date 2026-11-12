@@ -473,6 +473,7 @@ class ServerArgs:
     log_level: str = "info"
     enable_async_logging: bool = False
     enable_log_request_stats: bool = False
+    ttft_trace_sampling_percentage: int = 0
     enable_metrics: bool = False
     decode_log_interval: int = 40
     metrics_reporters: list[str] | None = None
@@ -805,6 +806,7 @@ class ServerArgs:
     tp_batch_invariant: Literal["none", "attn", "attn+dense"] = "none"
     dense_tp_size: int | None = None
     moe_tp_size: int | None = None
+    moe_weight_sharing_size: int | None = None
     mapping: Mapping | None = None
     emulate_rank_zero: bool = False
 
@@ -1314,6 +1316,7 @@ class ServerArgs:
             moe_tp_size=moe_tp_size,
             moe_ep_size=moe_ep_size,
             moe_dp_size=moe_dp_size,
+            moe_weight_sharing_size=self.moe_weight_sharing_size,
             vision_tp_size=vision_tp_size,
             vision_dp_size=vision_dp_size,
             pp_size=pp_size,
@@ -1323,6 +1326,34 @@ class ServerArgs:
             base_gpu_id=self.base_gpu_id,
             gpu_id_step=self.gpu_id_step,
         )
+
+        if self.moe_weight_sharing_size is not None:
+            if self.load_format not in ("auto", "safetensors"):
+                raise ValueError(
+                    "Peer expert weights require auto or safetensors checkpoint loading"
+                )
+            if self.enable_memory_saver:
+                raise ValueError("Peer expert weights do not support memory saver")
+            if self.disaggregation_mode != "prefill":
+                raise ValueError(
+                    "Peer expert weights currently require a prefill instance"
+                )
+            if self.prefill_graph_max_tokens != 0 or not self.enforce_eager:
+                raise ValueError(
+                    "Peer expert weights require --prefill-graph-max-tokens 0 and --enforce-eager"
+                )
+            if self.mapping.requires_forward_coordination:
+                raise ValueError(
+                    "Peer expert weights require fully local execution groups"
+                )
+            if self.kvstore_storage_backend is not None:
+                raise ValueError(
+                    "Peer expert weights do not support shared L3 cache control"
+                )
+            if self.enable_eplb:
+                raise ValueError(
+                    "Peer expert weights are immutable and do not support expert rebalancing"
+                )
 
         # Impl constraints:
         if self.deepseek_v41_attention_query_swa_min_tokens < 1:
@@ -1740,14 +1771,15 @@ class ServerArgs:
                 )
             # With sampled drafts (vLLM's draft_sample_method=probabilistic) the
             # drafter stays on the path and only the verify outcome is forced,
-            # so it uses the flashinfer verifier.
-            if self.sampling_backend != "greedy" and not (
+            # so it uses the flashinfer verifier; sonic forces either kind.
+            if self.sampling_backend not in ("greedy", "sonic") and not (
                 self.enable_speculative_sampling
                 and self.sampling_backend == "flashinfer"
             ):
                 raise ValueError(
-                    "--synthetic-acceptance-length requires --sampling-backend greedy, "
-                    "or --sampling-backend flashinfer with --enable-speculative-sampling"
+                    "--synthetic-acceptance-length requires --sampling-backend greedy "
+                    "or sonic, or --sampling-backend flashinfer with "
+                    "--enable-speculative-sampling"
                 )
             if self.speculative_eagle_topk != 1:
                 raise ValueError(
@@ -1844,10 +1876,11 @@ class ServerArgs:
             )
 
         # Block verification, and synthetic rejection over sampled drafts, run
-        # the sampled-chain verify on the flashinfer backend.
+        # the sampled-chain verify on the flashinfer backend; greedy and sonic
+        # force the synthetic length over their own verify.
         sampled_chain_verify = self.speculative_rejection_sample_method == "block" or (
             self.speculative_rejection_sample_method == "synthetic"
-            and self.sampling_backend != "greedy"
+            and self.sampling_backend not in ("greedy", "sonic")
         )
         if sampled_chain_verify:
             if (
@@ -2738,6 +2771,13 @@ class ServerArgs:
             )
 
     def validate(self):
+        if (
+            type(self.ttft_trace_sampling_percentage) is not int
+            or not 0 <= self.ttft_trace_sampling_percentage <= 100
+        ):
+            raise ValueError(
+                "--ttft-trace-sampling-percentage must be an integer in [0, 100]"
+            )
         self.validate_weight_memory_policy()
         self.validate_forward_reload()
         if self.low_latency_max_num_tokens_per_gpu <= 0:
@@ -3427,7 +3467,14 @@ class ServerArgs:
             help="The logging level of all loggers.",
         )
         parser.add_argument(
+            "--ttft-trace-sampling-percentage",
+            type=int,
+            default=ServerArgs.ttft_trace_sampling_percentage,
+            help="Log engine TTFT phases for this percentage of PD bootstrap rooms (0 disables).",
+        )
+        parser.add_argument(
             "--enable-log-request-stats",
+            "--enable-request-time-stats-logging",
             action=argparse.BooleanOptionalAction,
             default=ServerArgs.enable_log_request_stats,
             help=(
@@ -3846,9 +3893,10 @@ class ServerArgs:
             "'sonic': one fused Triton pipeline per step (vendored sonic-sampler; two kernels "
             "for sampling, three for chain verification) covering greedy, "
             "temperature/top_k/top_p/min_p, penalties, logit_bias and grammar for both "
-            "single-step sampling and chain verification; top_k=-1 is realized as bounded "
-            "top-128 truncation. bf16 logits are ranked at bf16 resolution; fp32 logits "
-            "(soft-capped heads) are sampled exactly in fp32 among the top-128 candidates. "
+            "single-step sampling and chain verification; a request with no top_k, top_p "
+            "or min_p samples its whole vocabulary, the others select among its top-128 "
+            "candidates. bf16 logits are ranked at bf16 resolution; fp32 logits "
+            "(soft-capped heads) are sampled exactly in fp32. "
             "Its kernel config per batch size comes from a table measured on "
             "Blackwell, so nothing is tuned at startup. Allocates slot-indexed "
             "[max_req_pool_size, vocab_size] token counts and logit bias: about 10 bytes "
@@ -4133,7 +4181,7 @@ class ServerArgs:
             "target token, in [1, speculative_num_draft_tokens]. Forces a "
             "floor/ceil acceptance distribution; generated text is not valid "
             "for correctness evaluation. Selects the synthetic rejection method. "
-            "Requires --sampling-backend greedy (or flashinfer with "
+            "Requires --sampling-backend greedy or sonic (or flashinfer with "
             "--enable-speculative-sampling for sampled drafts) without "
             "--dp-sampling or --enable-output-logprobs. Unset disables it.",
         )
@@ -4609,6 +4657,14 @@ class ServerArgs:
             help="Specify tp size for dense part. Defaults to the attention "
             "TP width: the full world without DP attention, one replica with "
             "it.",
+        )
+        parser.add_argument(
+            "--moe-weight-sharing-size",
+            type=int,
+            default=ServerArgs.moe_weight_sharing_size,
+            help="Share immutable expert weights across this many workers while executing "
+            "each batch locally (DWDP). Omission keeps resident weights. Requires "
+            "prefill, TP1/EP1 compute, and disabled model CUDA graphs.",
         )
         parser.add_argument(
             "--moe-tp-size",

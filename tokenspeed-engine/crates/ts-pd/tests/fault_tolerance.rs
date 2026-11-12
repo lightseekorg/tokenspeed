@@ -320,3 +320,74 @@ fn paired_cancel_before_admission_allows_a_later_healthy_request() {
     assert!(!pair.decode.has_in_flight());
     println!("recovery: paired D cancel before admission suppressed the old manifest; same peers transferred a new room successfully");
 }
+
+#[test]
+fn healthy_restarted_prefill_serves_a_surviving_decode() {
+    let fixture = native::NativeLibrary::new();
+    let library = std::env::var_os("TS_MOONCAKE_LIBRARY")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| fixture.path().to_owned());
+    let source = pattern();
+    let mut old_dest = vec![0; BYTES];
+    let fresh_dest = vec![0; BYTES];
+    let ttl = Duration::from_millis(1200);
+    let (mut mesh, group) = single_rank();
+    let mut old = pair(library.clone(), &source, &old_dest, ttl);
+    transfer_one(&mut old, "before-restart", 101, &mut mesh, &group);
+    assert!(landed(&old_dest, &source));
+    let bootstrap = old.bootstrap.port;
+    let old_port = old.prefill.port();
+    let old_decode = old.decode;
+    let old_outbox = old.decode_outbox;
+    drop(old.prefill);
+    drop(old.prefill_outbox);
+    drop(old._server);
+    let mut new = pair_on_port(library.clone(), &source, &fresh_dest, ttl, None, bootstrap);
+    let new_port = new.prefill.port();
+    assert_ne!(old_port, new_port);
+    let url = format!("http://127.0.0.1:{bootstrap}");
+    assert_eq!(
+        ureq::get(&format!("{url}/health")).call().unwrap().status(),
+        200
+    );
+    let rank: serde_json::Value =
+        ureq::get(&format!("{url}/route?engine_rank=0&target_dp_group=0"))
+            .call()
+            .unwrap()
+            .into_json()
+            .unwrap();
+    assert_eq!(rank["rank_port"].as_u64(), Some(u64::from(new_port)));
+
+    // An independent D transfers through the restarted P at this same address.
+    transfer_one(&mut new, "fresh-decode", 102, &mut mesh, &group);
+    assert!(landed(&fresh_dest, &source));
+    new.decode = old_decode;
+    new.decode_outbox = old_outbox;
+    old_dest.fill(0);
+    let rid = "surviving-decode";
+    let info = BootstrapInfo {
+        room: 103,
+        ..new.bootstrap.clone()
+    };
+    new.prefill.register(rid, &info).unwrap();
+    new.decode.register(rid, &info).unwrap();
+    assert_eq!(
+        next_event(&mut new.decode, &mut mesh, &group),
+        PdEvent::Bootstrapped(rid.into())
+    );
+    new.admit(rid);
+    assert_eq!(
+        next_event(&mut new.prefill, &mut mesh, &group),
+        PdEvent::Bootstrapped(rid.into())
+    );
+    new.send(rid, 777, vec![]).unwrap();
+    assert_eq!(
+        next_event(&mut new.prefill, &mut mesh, &group),
+        PdEvent::Succeeded(rid.into())
+    );
+    assert!(matches!(
+        next_event(&mut new.decode, &mut mesh, &group),
+        PdEvent::RemotePrefillDone(_)
+    ));
+    assert!(landed(&old_dest, &source));
+}

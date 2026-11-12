@@ -16,7 +16,7 @@
 # SOFTWARE.
 from __future__ import annotations
 
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import torch
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
@@ -26,6 +26,9 @@ from tokenspeed_kernel.signature import (
     dense_tensor_format,
     format_signature,
 )
+
+if TYPE_CHECKING:
+    from tokenspeed_kernel.ops.moe._cute_dsl.latent_down import MailboxPublish
 
 __all__ = [
     "quantize_fp8",
@@ -837,6 +840,7 @@ def rmsnorm_nvfp4_quant(
     global_scale: torch.Tensor,
     mailbox_sentinel: int | None,
     enable_pdl: bool,
+    mailbox_publish: MailboxPublish | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """RMSNorm a BF16 row and quantize it to NVFP4 in one launch.
 
@@ -861,6 +865,8 @@ def rmsnorm_nvfp4_quant(
         mailbox_sentinel: The 32-bit word ``x`` is armed with, whose 16-bit
             halves agree, or None for an ordinary tensor.
         enable_pdl: Enable NVIDIA programmatic dependent launch.
+        mailbox_publish: This rank's block for the kernel to store into the
+            mailbox before it polls, or None when the producer stored it.
 
     Returns:
         ``(packed, scales)``: E2M1 pairs as ``uint8 [rows, width // 2]`` and
@@ -879,6 +885,7 @@ def rmsnorm_nvfp4_quant(
         global_scale,
         mailbox_sentinel,
         enable_pdl,
+        mailbox_publish,
     )
 
 
