@@ -454,7 +454,14 @@ process exits before a new reader allocates Host/GPU buffers; the reader restore
 the objects into different block slots and checks exact bytes, then deletes
 them and verifies safely retired misses. Without that environment variable,
 the native case skips and only the memory-backend case runs. This transfer test
-complements serving tests that verify scheduler admission and model output.
+complements serving tests that verify scheduler admission and model output:
+`test/runtime/test_l3_serving_e2e.py` is that serving gate — a writer engine
+persists a page-aligned prefix, a fresh reader's first request must restore it
+(successful GET deltas and exact request `cached_tokens`) and match a
+recompute oracle, with an explicit codeword check and a disjoint negative
+control. This gate is pending GPU validation; chunk alignment alone does not
+establish numerical equivalence for every model/backend. See
+[native L3 serving validation](../operations/native-l3-validation.md).
 
 Validation counters must distinguish successful adapter PUT results from new
 native writes: create-only PUT can succeed because an object already exists.

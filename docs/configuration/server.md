@@ -1616,7 +1616,11 @@ the Mooncake store client from the `tokenspeed-mooncake` wheel's
 scheduler, executor and replica agreement; GPU tests cover packed-byte
 D2H/PUT/GET/H2D round trips. See the
 [validation scope](../design/async-l3-cache.md#initial-scope-and-validation)
-for native Mooncake test requirements.
+for native Mooncake test requirements. The cross-instance serving gate —
+one engine persists a prefix, a fresh engine's first request restores it,
+with GET/admission evidence and an output comparison against a recompute
+oracle — is described in
+[native Mooncake L3 serving validation](../operations/native-l3-validation.md).
 
 Mooncake Store is the offload backend. PD KV transfer still uses the
 separate Mooncake TransferEngine (`--disaggregation-transfer-backend`).
