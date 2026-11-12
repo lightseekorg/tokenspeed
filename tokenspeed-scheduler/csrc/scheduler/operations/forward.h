@@ -222,7 +222,8 @@ struct ForwardBatch {
                         const auto pages = source.NumPages();
                         columns = std::max(columns, pages);
                         window_columns = std::max(
-                            window_columns, pages - static_cast<std::size_t>(source.table.ReclaimedPrefixBlocks()));
+                            window_columns,
+                            pages - static_cast<std::size_t>(source.allocator.LeadingReleasedBlocks(source.table)));
                     }
                 },
                 op);
@@ -243,7 +244,7 @@ struct ForwardBatch {
                         std::size_t first = 0;
                         if (const auto it = inner.block_tables.find(gid); it != inner.block_tables.end()) {
                             const auto& source = it->second;
-                            released = source.table.ReclaimedPrefixBlocks();
+                            released = source.allocator.LeadingReleasedBlocks(source.table);
                             pages = source.NumPages();
                             first = pages > window_columns ? pages - window_columns : 0;
                             source.allocator.AppendBlockTablePageIds(source.table, windows, first);

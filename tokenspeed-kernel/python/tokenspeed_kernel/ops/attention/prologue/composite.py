@@ -87,8 +87,8 @@ def _write_kv(
     rows = cache.slots.numel()
     if rows == 0:
         return
-    k = k[:rows].view(rows, *cache.k_cache.shape[1:])
-    v = v[:rows].view(rows, *cache.v_cache.shape[1:])
+    k = k[:rows].view(rows, *cache.k_cache.shape[-2:])
+    v = v[:rows].view(rows, *cache.v_cache.shape[-2:])
     if cache.format is KVCacheFormat.NATIVE:
         store_kv_cache(
             k, v, cache.k_cache, cache.v_cache, cache.slots, enable_pdl=enable_pdl

@@ -718,10 +718,9 @@ class DFlash(BaseDrafter):
             return
 
         positions = self.input_buffers.positions_buf[: base_ctx.input_num_tokens]
-        # The TARGET's router names these rows (the draft's own has already
-        # republished a block window by now). Packed order is kept: extend
-        # rows, then verify rows.
-        backend = base_ctx.attn_backend
+        # Context rows belong to the draft group's page-id space. This runs
+        # before the draft publishes its next proposal window.
+        backend = self.attn_backend
         if base_ctx.num_extends == base_ctx.bs:
             # A PD prefill worker may never publish a decode window.
             cache_locs = backend.extend_span_locations()
@@ -929,9 +928,7 @@ class DFlash(BaseDrafter):
                 for layer in layers
             ]
 
-            self._fused_kv_k_ptrs, self._fused_kv_v_ptrs = _get_kv_buffer_ptrs(
-                self._fused_kv_k_buffers, self._fused_kv_v_buffers
-            )
+            _get_kv_buffer_ptrs(self._fused_kv_k_buffers, self._fused_kv_v_buffers)
 
             self._fused_kv_enabled = True
 
@@ -1146,12 +1143,7 @@ class DFlash(BaseDrafter):
         num_tokens = ctx.input_num_tokens
         self._sink_tokens = num_tokens
         self._sink_positions = self.input_buffers.positions_buf[:num_tokens]
-        # The TARGET's router: these are rows the target computed, so they are
-        # named in its page-id space. The draft's own router has already
-        # published its block window, and writing the taps through that one
-        # would leave the draft reading history from rows its KV never landed
-        # in -- nothing errors, the speculation is simply wasted.
-        self._sink_cache_locs = ctx.attn_backend.decode_window_locations()[:num_tokens]
+        self._sink_cache_locs = self.attn_backend.decode_window_locations()[:num_tokens]
         ctx.target_capture_sink = self
 
     def on_target_capture(self, capture_idx: int, hidden: torch.Tensor) -> None:

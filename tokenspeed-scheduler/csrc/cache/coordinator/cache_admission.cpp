@@ -664,8 +664,18 @@ private:
                 // and each Device tail copy lands on a fresh Device block in
                 // its source block's own bucket, exactly like a restored slot.
                 shape_need_[i].assign(buckets, 0);
-                blocks_needed_[i] = geometry_[i].BlocksNeededFor(*demand.table, demand) +
-                                    tailBlocksNeeded(i, shape_need_[i]) + zeroStateBlocksNeeded(i);
+                std::int32_t growth_blocks = geometry_[i].BlocksNeededFor(*demand.table, demand);
+                if (const auto* sparse = std::get_if<SparseSuffix>(&demand.extent); sparse && sparse->head_blocks > 0) {
+                    // A matched sink is installed before growth: Device hits
+                    // are shared, Host hits and tail copies are charged below.
+                    const auto prefix_tokens =
+                        std::max(prefix_.device.num_common_tokens, prefix_.host.num_common_tokens);
+                    const auto grain = geometry_[i].BlockGranularity();
+                    const auto prefix_blocks = prefix_tokens / grain + (prefix_tokens % grain != 0);
+                    growth_blocks = geometry_[i].BlocksNeededFor(std::max(demand.table->NumBlocks(), prefix_blocks),
+                                                                 *sparse, demand.reserve_tokens);
+                }
+                blocks_needed_[i] = growth_blocks + tailBlocksNeeded(i, shape_need_[i]) + zeroStateBlocksNeeded(i);
                 if (!prefix_.host.per_group.empty()) {
                     collectHostHitBuckets(i, shape_need_[i]);
                 }
@@ -1905,7 +1915,10 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::CompactLoneRe
                 }
             }
         }
-        for (std::int32_t slot = first_slot; slot < table.NumBlocks(); ++slot) {
+        for (std::int32_t slot = allocator.KeptHeadBlocks() > 0 ? 0 : first_slot; slot < table.NumBlocks(); ++slot) {
+            if (slot >= allocator.KeptHeadBlocks() && slot < first_slot) {
+                continue;
+            }
             const CacheBlockRef& block = table.Blocks()[static_cast<std::size_t>(slot)];
             if (!block) {
                 continue;

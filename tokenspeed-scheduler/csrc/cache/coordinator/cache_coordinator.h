@@ -585,6 +585,9 @@ public:
     // or the first a sliding window behind one of its boundaries reaches
     // back into.
     std::int32_t FirstPublishedPage(const CompletedPages& completed) const;
+    // The leading pages [0, result) a publication registers sink blocks under
+    // again, below FirstPublishedPage; 0 when it publishes no sink block.
+    std::int32_t PublishedSinkPages(const CompletedPages& completed) const;
     void ReclaimExpired(std::span<BlockTable> tables, std::int32_t num_computed_tokens);
     void ConsumeReservedTokens(std::span<BlockTable> tables, std::int32_t num_tokens);
     void Free(std::span<BlockTable> tables);
@@ -1100,6 +1103,10 @@ public:
         std::int32_t past_end{0};
     };
     BlockRange SlidingWindowBlocks(std::int32_t i, std::int32_t boundary_tokens) const;
+    // The sink blocks of sliding group i a boundary needs beside `window`:
+    // [0, min(sink blocks, window.first)), the ones the window does not hold
+    // already. Empty for a group without a sink.
+    BlockRange SinkBlocksBelow(std::int32_t i, const BlockRange& window) const;
     // The first of a tail's blocks (page offset) group i needs: 0 for a
     // History group that keeps every row and for a State group's one tail
     // block; for a sliding group the block holding the window's first row
@@ -1271,6 +1278,10 @@ private:
         std::int32_t first_cache_block{0};
         std::vector<CacheKey> keys;
         CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
+        // A sliding group's sink blocks below a boundary's window: published
+        // with an earlier boundary already, and registered with this one again
+        // so they stay as recent as every boundary that needs them.
+        bool sink{false};
     };
     // What publishing `completed` covers in one group -- every newly hashed
     // page plus the tail's blocks of a prefix-closed group, the blocks holding

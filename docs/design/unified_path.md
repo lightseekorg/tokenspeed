@@ -1664,11 +1664,13 @@ history destinations through `write_locations`.
   is the side-write variant — scratch resolution over the full-history
   table (`draft_history_view`) that must not clobber the published window
   (DFLASH's target-KV injection, DSpark context windows).
-* **Cross-backend reads**: `decode_window_locations()` /
-  `extend_span_locations()` expose the full-history group's published
-  windows; DFLASH reads the TARGET router's windows through them to copy
-  target-aligned KV into the draft cache (the pools share one page-id
-  space).
+* **Context writes**: `decode_window_locations()` /
+  `extend_span_locations()` expose the writing router's history windows.
+  DFLASH reads its own router before publishing a proposal window, so context
+  KV follows the draft group's pages even when its retention differs from
+  the target's. The runner refreshes both routers before the target forward;
+  capture-tap writes and the fallback context write consume that same round's
+  draft locations.
 * **Writes outside the backend** (the attention prologue) fetch their slots
   immediately before the write. An offloaded latent
   projection uses the compute slots returned by its sparse prepare. When a draft step-0

@@ -367,8 +367,9 @@ private:
         ExecutionPlan& plan, AdmissionFeedback& feedback, Request& request, StagedCacheProgress& staged,
         std::span<const GroupDemand> demands, const RequestProgress& progress,
         std::optional<CacheCoordinator::CopyInPoint> copy_in_point, bool evict_blocks_past_segments);
+    // Registers the descriptors of full pages [first_page, past_end_page).
     void registerKvEventPrefixPages(Request& request, std::span<const std::string> prefix_hashes,
-                                    std::int32_t first_page);
+                                    std::int32_t first_page, std::int32_t past_end_page);
     // The descriptors a publication mutates: its full pages from the first it
     // registers an entry under (CacheCoordinator::FirstPublishedPage) and, at
     // a tail, the partial page under its tail hash (token_ids = the rows below

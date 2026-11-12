@@ -264,17 +264,17 @@ bool Scheduler::clearCache(bool include_host) {
 }
 
 void Scheduler::registerKvEventPrefixPages(Request& request, std::span<const std::string> prefix_hashes,
-                                           std::int32_t first_page) {
+                                           std::int32_t first_page, std::int32_t past_end_page) {
     if (!config_.enable_kv_cache_events) {
         return;
     }
-    _assert(first_page >= 0 && static_cast<std::size_t>(first_page) <= prefix_hashes.size(),
+    _assert(first_page >= 0 && first_page <= past_end_page &&
+                static_cast<std::size_t>(past_end_page) <= prefix_hashes.size(),
             "KV event page range is invalid");
-    const std::vector<std::span<const std::int32_t>> token_pages =
-        request.PrefixPages(first_page, static_cast<std::int32_t>(prefix_hashes.size()));
+    const std::vector<std::span<const std::int32_t>> token_pages = request.PrefixPages(first_page, past_end_page);
     const std::span<const std::uint64_t> block_hashes = request.KvEventBlockHashes(prefix_hashes.size());
 
-    for (std::size_t i = static_cast<std::size_t>(first_page); i < prefix_hashes.size(); ++i) {
+    for (std::size_t i = static_cast<std::size_t>(first_page); i < static_cast<std::size_t>(past_end_page); ++i) {
         const std::span<const std::int32_t> tokens = token_pages[i - static_cast<std::size_t>(first_page)];
         CacheKey key{.content_hash = prefix_hashes[i]};
         const std::optional<std::uint64_t> parent_hash =
@@ -304,7 +304,13 @@ void Scheduler::registerKvEventPublication(Request& request, std::span<const std
     // published blocks hold them on the Device -- not after a restore brought
     // the request back on unpublished copies -- so the range starts at the
     // first page the publication registers an entry under.
-    registerKvEventPrefixPages(request, prefix_hashes, coordinator_.FirstPublishedPage(completed));
+    const auto num_pages = static_cast<std::int32_t>(prefix_hashes.size());
+    const std::int32_t first_page = coordinator_.FirstPublishedPage(completed);
+    registerKvEventPrefixPages(request, prefix_hashes, first_page, num_pages);
+    // A sliding group's sink blocks are registered again under the pages
+    // that hold them, below the window's.
+    registerKvEventPrefixPages(request, prefix_hashes, 0,
+                               std::min(coordinator_.PublishedSinkPages(completed), first_page));
     if (completed.tail) {
         registerKvEventTail(request, prefix_hashes, *completed.tail);
     }
@@ -336,7 +342,7 @@ std::vector<std::int32_t> Scheduler::kvEventTailsOf(const RetractionImage& image
 
 void Scheduler::registerKvEventRestore(Request& request, std::span<const std::string> prefix_hashes,
                                        std::span<const std::int32_t> tails) {
-    registerKvEventPrefixPages(request, prefix_hashes, 0);
+    registerKvEventPrefixPages(request, prefix_hashes, 0, static_cast<std::int32_t>(prefix_hashes.size()));
     for (const std::int32_t boundary : tails) {
         const auto full_pages = static_cast<std::size_t>(boundary / config_.prefix_granularity);
         _assert(full_pages <= prefix_hashes.size(), "an imaged tail lies inside the request's computed pages");

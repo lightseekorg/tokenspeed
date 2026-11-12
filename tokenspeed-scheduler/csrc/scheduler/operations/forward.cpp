@@ -548,6 +548,7 @@ std::optional<CacheCoordinator::AdmissionResult> Scheduler::admitWithKvEventTrac
         registerKvEventPublication(request, cache_progress.prefix_hashes, *progress.completed_pages);
     } else {
         registerKvEventPrefixPages(request, cache_progress.prefix_hashes,
+                                   static_cast<std::int32_t>(cache_progress.prefix_hashes.size()),
                                    static_cast<std::int32_t>(cache_progress.prefix_hashes.size()));
     }
     // Alone, the request has no release to wait for: when whole segments
@@ -721,6 +722,8 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
                     demands[i].extent = SparseSuffix{
                         .extent_tokens = request->PrefillSize(),
                         .first_block = std::max(hit_blocks, retained_begin / block_granularity),
+                        .head_blocks =
+                            group.sink_tokens / block_granularity + (group.sink_tokens % block_granularity != 0),
                     };
                 }
             }
@@ -801,7 +804,8 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
         feedback.admission_failed = true;
         return FirstChunkOutcome{};
     }
-    registerKvEventPrefixPages(*request, match.candidate_prefix_hashes, 0);
+    registerKvEventPrefixPages(*request, match.candidate_prefix_hashes, 0,
+                               static_cast<std::int32_t>(match.candidate_prefix_hashes.size()));
     request->HoldSessionAccess(std::move(admission->session_access));
     const bool completes_prefill = tokens_this_round == unscheduled;
     const std::int32_t decode_reserve = completes_prefill ? decode_input_tokens : 0;

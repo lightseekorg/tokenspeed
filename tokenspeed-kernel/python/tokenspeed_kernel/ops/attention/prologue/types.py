@@ -145,8 +145,9 @@ class HeadKVCache:
     """One GQA layer's KV cache destination.
 
     Attributes:
-        k_cache: ``[slots, num_kv_heads, head_dim]``, FP8 e4m3 or native rows.
-        v_cache: ``[slots, num_kv_heads, head_dim]`` in the same dtype.
+        k_cache: ``[slots, heads, dim]`` or ``[pages, rows, heads, dim]``;
+            paged views preserve the field's actual page stride.
+        v_cache: Same geometry and dtype as ``k_cache``.
         scales: The scale planes of an MXFP8 cache, the per-tensor scales of
             an FP8 one, or ``None`` for a unit-scale cache.
         slots: Dense 1-D destination slot of each written row; rows past its
