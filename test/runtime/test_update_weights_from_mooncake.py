@@ -303,6 +303,8 @@ def _runner(server_args, global_rank=3, is_draft_worker=False):
     runner.server_args = server_args
     runner.global_rank = global_rank
     runner.gpu_id = 0
+    # The update synchronizes and empties the cache through the runner's device module.
+    runner.device = "cuda"
     runner.model_update = model_update_adapter_for(
         server_args, global_rank=global_rank, is_draft_worker=is_draft_worker
     )
