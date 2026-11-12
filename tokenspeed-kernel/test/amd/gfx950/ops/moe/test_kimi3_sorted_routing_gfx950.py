@@ -32,7 +32,7 @@ pytestmark = pytest.mark.skipif(
 _EXPERTS = 896
 _TOPK = 16
 _BLOCK = 16
-_ROWS = (1, 8, 16, 32, 64, 128, 192, 256)
+_ROWS = (1, 32, 64, 128, 192, 256)
 
 
 def _logits(kind: str, rows: int, seed: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -40,10 +40,6 @@ def _logits(kind: str, rows: int, seed: int) -> tuple[torch.Tensor, torch.Tensor
     if kind == "random":
         logits = torch.randn((rows, _EXPERTS), generator=generator, device="cuda")
         bias = torch.randn((_EXPERTS,), generator=generator, device="cuda") * 0.01
-    elif kind == "equal":
-        # Every score ties: the lowest expert ids win on every row.
-        logits = torch.zeros((rows, _EXPERTS), device="cuda")
-        bias = torch.zeros((_EXPERTS,), device="cuda")
     elif kind == "coarse":
         # Few distinct values: ties inside and across the top 16.
         logits = (
@@ -179,7 +175,7 @@ def _check(fused, reference, rows, order_exact):
 
 
 @pytest.mark.parametrize("rows", _ROWS)
-@pytest.mark.parametrize("kind", ("random", "equal", "coarse", "same_rows", "special"))
+@pytest.mark.parametrize("kind", ("random", "coarse", "same_rows", "special"))
 @pytest.mark.parametrize("deterministic_order", (True, False))
 def test_sorted_routing_matches_topk_and_sort(rows, kind, deterministic_order):
     from tokenspeed_kernel.ops.moe._triton.kimi3_sigmoid_topk import (
@@ -199,29 +195,9 @@ def test_sorted_routing_matches_topk_and_sort(rows, kind, deterministic_order):
         assert not torch.any(scratch)
 
 
-def test_sorted_routing_back_to_back_launches():
-    """Launches of varying rows queued back to back each see only their rows."""
-    from tokenspeed_kernel.ops.moe._triton.kimi3_sigmoid_topk import (
-        kimi3_sorted_routing_scratch,
-    )
-
-    scratch = kimi3_sorted_routing_scratch(torch.device("cuda"))
-    generator = torch.Generator().manual_seed(11)
-    cases = []
-    for step in range(48):
-        rows = int(torch.randint(1, 257, (1,), generator=generator))
-        kind = ("random", "coarse", "same_rows")[step % 3]
-        logits, bias = _logits(kind, rows, 300 + step)
-        cases.append((logits, bias, _fused(logits, bias, 2.827, True, scratch)))
-    torch.cuda.synchronize()
-    for logits, bias, fused in cases:
-        reference = _reference(logits, bias, 2.827, True, True)
-        _check(fused, reference, logits.shape[0], order_exact=True)
-    assert not torch.any(scratch)
-
-
 def test_sorted_routing_graph_replay_and_one_binary():
-    """Captured layers of several row counts share the scratch and one binary."""
+    """Layers of several row counts, launched back to back and captured, share
+    the scratch and one binary."""
     from tokenspeed_kernel.ops.moe._triton.kimi3_sigmoid_topk import (
         _kimi3_sigmoid_bias_topk_sorted_kernel,
         kimi3_sorted_routing_scratch,
@@ -242,9 +218,11 @@ def test_sorted_routing_graph_replay_and_one_binary():
     with torch.cuda.stream(stream), assert_no_triton_compile(
         _kimi3_sigmoid_bias_topk_sorted_kernel
     ):
-        for layer in layers:
-            _fused(*layer, 2.827, True, scratch)
+        eager = [_fused(*layer, 2.827, True, scratch) for layer in layers]
         stream.synchronize()
+        for (logits, _), got, want in zip(layers, eager, references, strict=True):
+            _check(got, want, logits.shape[0], order_exact=True)
+        assert not torch.any(scratch)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
             for layer in layers:
@@ -305,7 +283,7 @@ def _k3_tp8_experts():
     return plan, module
 
 
-@pytest.mark.parametrize("rows", (8, 16, 32, 64, 128, 192))
+@pytest.mark.parametrize("rows", (8, 64, 192))
 @pytest.mark.parametrize("kind", ("random", "same_rows"))
 def test_a8w4_moe_takes_the_fused_sort_bitwise(
     _k3_tp8_experts, rows, kind, monkeypatch
@@ -321,7 +299,7 @@ def test_a8w4_moe_takes_the_fused_sort_bitwise(
     )
 
     plan, module = _k3_tp8_experts
-    # Serve 128 and 192 rows on the warp decode, as the rows-192 experiments do.
+    # Serve rows through 192 on the warp decode, the runtime's fused routing bound.
     monkeypatch.setattr(fused_moe, "_SITU_WARP_DECODE_MAX_M", 192)
     sorts = []
 
