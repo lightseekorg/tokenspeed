@@ -73,8 +73,8 @@ _MULTIMEM_AR_MIN_TOKENS = 1024
 
 _IRIS_MAX_TOKENS = 8192
 _IRIS_ATTN_PRODUCER_DIRECT_MIN_TOKENS = 16
-# Through 192 rows the replicated mix and gather tail beat row sharding (8x MI350X);
-# it stays above the Iris K3 fused decode rows, or sharding turns off the gather tail.
+# Stays above the Iris K3 fused decode rows: a sharded prefix turns off the
+# replicated mix and gather tail.
 _IRIS_ATTN_SHARDED_PREFIX_MIN_TOKENS = 200
 
 # Widest reduce this instance is built for; it becomes the collective's max_m.
