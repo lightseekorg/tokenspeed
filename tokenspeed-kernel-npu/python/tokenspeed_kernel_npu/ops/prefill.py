@@ -33,9 +33,10 @@ class AscendDSAPrefill:
     API orders its internal stream before consumers on the execution stream.
     Gather, patch and attention rely on that execution stream's queue order;
     the transport does not insert dependencies between caller streams.
-    record_stream protects allocation lifetime, not cross-stream ordering.
-    Buffers are owned until finish and registered with the allocator before
-    references are released. No transport workspace is kept between layers.
+    Temporary buffers and TS forward inputs use that same allocation stream;
+    cache and router owners retain persistent inputs. Callers supplying inputs
+    allocated on another stream must keep them alive through device completion.
+    No transport workspace is kept between layers.
     """
 
     def __init__(
@@ -127,11 +128,6 @@ class AscendDSAPrefill:
                     output_split_sizes=list(counts),
                     group=self.history_group,
                 )
-        # HCCL's synchronous interface establishes execution-stream ordering.
-        # Keep allocator ownership valid even for inputs from another stream.
-        stream = torch.npu.current_stream(self.device)
-        packet.record_stream(stream)
-        receive.record_stream(stream)
         return receive
 
     def prefetch(
@@ -171,7 +167,6 @@ class AscendDSAPrefill:
             or not 0 <= total_rows <= self.max_current_rows
         ):
             raise ValueError("Prefill requires matching batch page-gather geometry")
-        stream = torch.npu.current_stream(self.device)
         self.layer_id, self.batch_key = layer_id, batch_key
         self._sources = (kv_cache, index_cache)
         self._meta = {"history_slots": history_slots}
@@ -192,7 +187,6 @@ class AscendDSAPrefill:
                 plane[: self.history_null_rows].zero_()
         self.peak_buffer_bytes = max(self.peak_buffer_bytes, self.workspace_bytes)
         if has_history:
-            history_slots.record_stream(stream)
             packet = torch.empty(
                 (history_counts[self.rank], self._width),
                 dtype=torch.bfloat16,
@@ -207,7 +201,6 @@ class AscendDSAPrefill:
                         self.workspace_bytes + (packet.numel() + selected.numel()) * 2,
                     )
                     packet[:, offset : offset + width].copy_(selected)
-                    cache.record_stream(stream)
                     del selected
                     offset += width
             receive = self._gather(packet, history_counts)
@@ -239,7 +232,6 @@ class AscendDSAPrefill:
             raise ValueError(
                 "Current Prefill planes must match local token rows exactly once"
             )
-        value.record_stream(torch.npu.current_stream(self.device))
         self._current[width] = value
         if len(self._current) != (2 if self._has_index else 1):
             return
@@ -314,11 +306,8 @@ class AscendDSAPrefill:
             or self.local_rows % block_rows
         ):
             raise ValueError("Prefill update has incompatible slots or layout")
-        stream = torch.npu.current_stream(self.device)
         committed = slots_workspace[: slots.numel()]
         committed.copy_(slots)
-        for value in (slots, committed, direct, mapped_slots):
-            value.record_stream(stream)
         self._meta[("patch", width)] = (slots, committed, direct, mapped_slots)
         target, cache = (
             (self.index, self._sources[1])
@@ -348,10 +337,6 @@ class AscendDSAPrefill:
         """Release temporary buffers after queueing their last consumers."""
         if self.layer_id != layer_id:
             raise RuntimeError("Prefill completion differs from its active layer")
-        stream = torch.npu.current_stream(self.device)
-        for value in (self.kv, self.index, *self._current.values()):
-            if value is not None:
-                value.record_stream(stream)
         self.layer_id = self.batch_key = self._sources = None
         self.kv = self.index = None
         self._current.clear()

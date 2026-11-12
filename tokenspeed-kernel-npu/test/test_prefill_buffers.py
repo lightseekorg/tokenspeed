@@ -32,7 +32,6 @@ import torch.distributed as dist
 class ExecutionStream:
     def __init__(self):
         self.synchronized = False
-        self.recorded = 0
 
     def wait_stream(self, stream):
         raise AssertionError("Prefill must not insert cross-stream waits")
@@ -60,12 +59,6 @@ def transport_class(monkeypatch):
     monkeypatch.setitem(sys.modules, "flash_ops", ModuleType("flash_ops"))
     monkeypatch.setattr(torch, "npu", NpuDevice(), raising=False)
 
-    # CPU lacks stream-aware storage. All byte copies still execute for real.
-    def record_stream(tensor, stream):
-        assert stream is torch.npu.current_stream(tensor.device)
-        stream.recorded += 1
-
-    monkeypatch.setattr(torch.Tensor, "record_stream", record_stream)
     monkeypatch.setattr(
         torch.ops.custom, "dsa_cp_patch", lambda *args, **kw: args[3], raising=False
     )
@@ -341,7 +334,6 @@ def test_ordered_stream_handoffs_keep_exact_bytes(
             exact(runtime.index[130:132], current_index)
         runtime.finish(3)
         assert runtime.workspace_bytes == 0
-        assert stream.recorded > 0
         previous = stream
     assert not next_stream.synchronized
     runtime.close()

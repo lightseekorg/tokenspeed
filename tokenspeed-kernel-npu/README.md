@@ -170,21 +170,22 @@ Cache inputs accept contiguous `[rows,width]` and `[rows,1,width]`.
 
 Receive planes, packets, and commit slots are temporary. Prefetch may be called
 at KDA; the attention entry ensures it was submitted once for the same batch
-and layer. Concurrent consumption by another batch/layer is rejected. Tensor
-references and `record_stream` preserve storage through HCCL, unpacking,
-patching and attention. `finish` releases references after the final queued
-consumer. `close` clears references without synchronizing or destroying the
-manager-owned collective group. The transport
-records its peak owned buffer bytes; serving acceptance also measures device
+and layer. Concurrent consumption by another batch/layer is rejected. Temporary
+buffers and transient forward inputs are allocated and consumed on the caller
+stream, so the caching allocator's same-stream reuse order preserves their
+storage. Persistent cache and router buffers remain held by their owners.
+`finish` releases references after the final queued consumer. `close` clears
+references without synchronizing or destroying the manager-owned collective
+group. The transport records its peak owned buffer bytes; serving acceptance also measures device
 allocation/reservation peaks. `chunk_prefill_kv_size` only controls scheduler
 admission and never enables transport or fixes its buffer size.
 
 Prefill relies on one caller execution stream to order gather, patch and
 attention consumers. HCCL establishes dependencies with its internal stream;
 the transport does not establish dependencies between different caller
-streams. `record_stream` protects allocation lifetime, but does not order a
-producer on one stream before a consumer on another. `finish` releases
-references after queueing consumers; it does not synchronize the device.
+streams. The helper adds no `record_stream` calls on the caller stream;
+HCCL retains responsibility for its internal communication streams. `finish`
+releases references after queueing consumers; it does not synchronize the device.
 
 The caller owns this ordering. `ModelExecutor` runs serving forwards inside
 its persistent `execution_stream` context, and `ModelExecutor.autotune()`
@@ -197,7 +198,10 @@ replacing or destroying those resources. The production close calls come
 from cache-pool publication: the first bind has no old transport, and a
 startup rebind follows warmup synchronization. A caller handing work to
 another stream must establish the required dependencies before reusing cache
-or temporary storage; concurrent use of one transport is unsupported.
+or temporary storage. Transient inputs allocated on another stream must also
+remain alive until their device consumers complete; waiting for their
+producers alone does not protect their storage. Concurrent use of one
+transport is unsupported.
 
 Run `test/test_mla_cp_transport.py` with `torchrun` and an explicit `TEST_OUTPUT`
 directory. It covers compact shared history pages, empty/uneven owners, both
