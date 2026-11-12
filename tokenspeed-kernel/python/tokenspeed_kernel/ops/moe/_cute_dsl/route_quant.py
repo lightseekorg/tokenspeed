@@ -27,31 +27,7 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass import Float8E4M3FN, Float32, Int32, Int64, utils
-from cutlass._mlir.dialects import llvm
-from cutlass.cutlass_dsl import T, dsl_user_op
-
-
-@dsl_user_op
-def load_bf16x4(ptr: cute.Pointer, *, loc=None, ip=None):
-    """Load four BF16 values as FP32 from a valid eight-byte-aligned address."""
-    result = llvm.inline_asm(
-        llvm.StructType.get_literal([T.f32()] * 4),
-        [ptr.toint(loc=loc, ip=ip).ir_value()],
-        "{ .reg .b64 packed; .reg .b16 a,b,c,d; "
-        "ld.global.b64 packed,[$4]; mov.b64 {a,b,c,d},packed; "
-        "cvt.f32.bf16 $0,a; cvt.f32.bf16 $1,b; "
-        "cvt.f32.bf16 $2,c; cvt.f32.bf16 $3,d; }",
-        "=f,=f,=f,=f,l,~{memory}",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-    return tuple(
-        Float32(llvm.extractvalue(T.f32(), result, [i], loc=loc, ip=ip))
-        for i in range(4)
-    )
+from tokenspeed_kernel.thirdparty.cute_dsl.memory import load_global_f16x4_as_f32
 
 
 class RoutePrepare:
@@ -155,8 +131,11 @@ class RoutePrepare:
         lane = cute.arch.lane_idx()
         # Four adjacent BF16 columns per lane permit aligned 8-byte loads and
         # packed 4-byte FP8 stores within each 128-column quantization group.
-        values = load_bf16x4(
-            inputs.iterator + Int64(token) * self.hidden + kb * 128 + lane * 4
+        values = load_global_f16x4_as_f32(
+            (
+                inputs.iterator + Int64(token) * self.hidden + kb * 128 + lane * 4
+            ).toint(),
+            True,
         )
         amax = Float32(0)
         for i in cutlass.range_constexpr(4):
