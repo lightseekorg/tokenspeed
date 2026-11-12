@@ -126,6 +126,8 @@ class _AttentionFamilySpec:
     configure: Callable[[object, ServerArgs], None]
     # A name, or a function of the launch returning one (None: no default).
     default_backend: str | Callable[[ServerArgs], str | None] | None = None
+    # ``configure`` reads ``--dsa-index-k-format``; other models refuse it.
+    takes_index_k_format: bool = False
 
 
 def override_model_config(model_config, ext_yaml):
@@ -195,14 +197,9 @@ def configure_dsa_attention(model_config, server_args: ServerArgs) -> None:
 
     Every attention hook takes the resolved launch so a hook can key a choice
     on it (``ModelProfile.configure_attention``); the in-tree ones plan the
-    same geometry under every launch. These models store ``fp8_scaled``
-    index keys, so another ``--dsa-index-k-format`` is refused.
+    same geometry under every launch.
     """
-    if server_args.dsa_index_k_format not in (None, "fp8_scaled"):
-        raise ValueError(
-            f"--dsa-index-k-format {server_args.dsa_index_k_format} is not "
-            "supported by this model, which stores fp8_scaled index keys"
-        )
+    del server_args
     _configure_dsa_geometry(model_config)
 
 
@@ -522,6 +519,7 @@ _ATTENTION_FAMILY_SPECS = (
         name="Kimi-K3.1",
         architectures=frozenset({"KimiK31ForConditionalGeneration"}),
         configure=configure_kimi_k31_attention,
+        takes_index_k_format=True,
     ),
     _AttentionFamilySpec(
         name="MLA",
@@ -562,6 +560,23 @@ def _resolve_attention_family(
         if any(arch in spec.architectures for arch in architectures):
             return spec
     return None
+
+
+def refuse_untaken_index_k_format(
+    family: _AttentionFamilySpec | None, architecture: str, server_args: ServerArgs
+) -> None:
+    """Refuse ``--dsa-index-k-format`` for a target whose attention family
+    does not read it, rather than serving the model's own format silently."""
+    if server_args.dsa_index_k_format is None or (
+        family is not None and family.takes_index_k_format
+    ):
+        return
+    takers = ", ".join(
+        s.name for s in _ATTENTION_FAMILY_SPECS if s.takes_index_k_format
+    )
+    raise ValueError(
+        f"--dsa-index-k-format applies only to {takers}, not {architecture}"
+    )
 
 
 def _is_dflash2_mla(
@@ -933,6 +948,16 @@ class ModelConfig:
             self.hf_config,
             self.hf_text_config,
         )
+        # A profile's own hook answers for the flags it reads, and the target
+        # answers for the launch its drafts share.
+        if (
+            server_args is not None
+            and self.model_profile is None
+            and not is_draft_worker
+        ):
+            refuse_untaken_index_k_format(
+                attention_family, resolve_architecture(self.hf_config), server_args
+            )
         if self.model_profile is not None:
             _apply_attention_defaults(
                 server_args,
