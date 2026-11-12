@@ -45,8 +45,8 @@ over its shard instead of gathered logits (``propose_vocab_shard``): each
 rank reduces its shard to a few partials, the ranks gather those, and every
 rank draws the token the whole row would draw (the Gumbel noise is keyed by
 global token id) and records q over its own columns. A hot-token head (Eagle3
-``d2t``) samples its gathered logits as with whole rows, since its columns do
-not line up with the target's shards, and each rank records only the columns
+``d2t``) samples its gathered logits as with whole rows, because its columns
+do not line up with the target's shards, and each rank records only the columns
 of its tokens that fall in the rank's shard.
 """
 

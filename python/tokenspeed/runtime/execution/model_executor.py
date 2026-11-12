@@ -2138,12 +2138,10 @@ class ModelExecutor:
                 "record proposal distributions for"
             )
         if config.spec_algo != "DFLASH":
-            vocab_start, columns = self._draft_probs_shard() or (0, None)
             self.runtime_states.init_draft_probs(
                 spec_num_tokens=spec_num_tokens,
                 reject_threshold=config.spec_reject_draft_prob_threshold,
-                columns=columns,
-                vocab_start=vocab_start,
+                shard=self._draft_probs_shard(),
             )
 
     def _draft_probs_shard(self) -> tuple[int, int] | None:

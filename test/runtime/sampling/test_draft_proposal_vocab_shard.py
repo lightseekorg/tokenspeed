@@ -99,11 +99,10 @@ def _pools() -> SpeculativeSamplingPools:
 def _sampler(
     pools: SpeculativeSamplingPools,
     slots: torch.Tensor,
-    columns: int | None,
+    shard: tuple[int, int] | None,
     vocab_map: torch.Tensor | None = None,
-    vocab_start: int = 0,
 ) -> tuple[DraftProposalSampler, RuntimeStates]:
-    """A drafter's sampler over a table of whole rows, or of ``columns`` per rank from ``vocab_start``, serving ``slots``."""
+    """A drafter's sampler over a table of whole rows, or of one rank's ``(first token, columns)`` shard, serving ``slots``."""
     states = RuntimeStates(
         req_pool_size=POOL,
         input_vocab_size=VOCAB,
@@ -111,12 +110,7 @@ def _sampler(
         output_length=N,
         device="cuda",
     )
-    states.init_draft_probs(
-        spec_num_tokens=N,
-        reject_threshold=2.0,
-        columns=columns,
-        vocab_start=vocab_start,
-    )
+    states.init_draft_probs(spec_num_tokens=N, reject_threshold=2.0, shard=shard)
     states.valid_cache_lengths.copy_(torch.arange(POOL + 1, dtype=torch.int32) * 37)
     buffers = InputBuffers(
         max_bs=MAX_BS,
@@ -195,7 +189,7 @@ def test_each_rank_draws_the_whole_row_token_and_records_its_columns(monkeypatch
     expected_q = whole_states.draft_probs[:, STEP]
 
     for rank in range(RANKS):
-        sampler, states = _sampler(pools, slots, COLUMNS)
+        sampler, states = _sampler(pools, slots, (rank * COLUMNS, COLUMNS))
         _answer_gather(monkeypatch, logits, rank, slots, pools, states)
 
         tokens = sampler.propose_vocab_shard(_shard(logits, rank), step=STEP)
@@ -227,7 +221,7 @@ def test_a_hot_token_head_draws_what_whole_rows_draw_and_records_its_columns():
 
     for rank in range(RANKS):
         sampler, states = _sampler(
-            pools, slots, COLUMNS, vocab_map=hot, vocab_start=rank * COLUMNS
+            pools, slots, (rank * COLUMNS, COLUMNS), vocab_map=hot
         )
 
         tokens = sampler.propose(logits, step=STEP)
@@ -246,7 +240,7 @@ def test_a_shard_table_takes_proposals_from_shards_only():
     slots = torch.tensor([1], dtype=torch.int64, device="cuda")
     pools = _pools()
     logits = torch.randn(1, VOCAB, device="cuda").bfloat16()
-    sharded, _ = _sampler(pools, slots, COLUMNS)
+    sharded, _ = _sampler(pools, slots, (0, COLUMNS))
     whole, _ = _sampler(pools, slots, None)
     with pytest.raises(RuntimeError, match="propose_vocab_shard"):
         sharded.propose(logits, step=STEP)
