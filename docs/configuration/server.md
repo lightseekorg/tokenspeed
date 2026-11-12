@@ -79,6 +79,48 @@ its request partition is invalidated before another PD owner uses it.
 | `--mamba-ssm-dtype` | Stored linear-attention recurrent state dtype (GDN and KDA): `float32` (default) or `bfloat16`. Scans still accumulate in FP32; `bfloat16` halves state memory. |
 | `--quantization` | Weight quantization mode such as `fp8`, `nvfp4`, `w8a8_fp8`, or `compressed-tensors`. |
 | `--quantization-param-path` | JSON file of FP8 KV cache scaling factors, read only under an FP8 KV cache. KV caches run unscaled, so every factor must be 1.0, as must any KV-cache scale the checkpoint carries. |
+| `--enable-fp8-attn-proj` | Enable online FP8 QKV/O and GDN QKVZ/output projections in the Qwen3.5 or Qwen4-Exp target model. Off by default. |
+
+### Qwen FP8 attention projections
+
+Online conversion applies to floating target projection weights. It preserves
+existing FP8 configs and per-projection formats in mixed checkpoints. MTP draft
+projections follow the checkpoint.
+
+Group128 quantizes floating weights once after loading with 128×128 block
+scales and dynamically quantizes activation rows in groups of 128 channels.
+The GEMM returns the model's floating activation dtype. On SM100/SM103,
+`--dense-gemm-backend deepgemm` prepares UE8M0 weight scales and writes
+activation scales directly into the packed layout. The `auto` backend uses
+FP32 scales for this online block FP8 path.
+
+For an NVFP4 checkpoint with floating attention projections, use
+
+```bash
+--quantization nvfp4 --enable-fp8-attn-proj
+```
+
+Target models resolve the projection switch once and pass it to their layers.
+MTP backbones explicitly disable additional online FP8 projection quantization
+and retain their checkpoint quantization policy.
+
+GDN splits its input into an FP8 QKVZ GEMM and a floating BA GEMM. Any split
+QKVZ/BA projection uses BA overlap when an auxiliary stream is available,
+regardless of quantization format. The streams join before the attention boundary.
+The standard FP8 exclusions cover BA, convolution, and Mamba mixer
+projections. Explicit checkpoint exclusions also apply.
+With the switch off, floating GDN checkpoint projections stay floating even
+with a global online FP8 config. Serialized GDN projections use the
+checkpoint config.
+
+#### Projection fusion
+
+With packed DeepGEMM scales, eligible BF16 output projections fuse activation
+quantization with the full-attention sigmoid gate or GDN per-head RMSNorm and
+SiLU/sigmoid gate. This path preserves the BF16 rounding boundary and supports
+group128, CUDA Graph and PDL. Fusion requires a power-of-two head width of at
+least 128 and BF16 norm weights for GDN. Other supported projection layouts
+apply the gate or norm before a separate quantization launch.
 
 ## Numerics
 

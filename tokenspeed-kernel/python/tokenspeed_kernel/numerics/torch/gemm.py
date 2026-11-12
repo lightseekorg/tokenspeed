@@ -57,6 +57,14 @@ _MXFP8_UE8M0_1X32_SCALE = ScaleFormat(
 _MXFP8_FORMAT_SIGNATURES = format_signatures(
     ("a", "b"), "mxfp8", {fp8_dtype}, scale=_FP8_BLOCK_SCALE
 ) | format_signatures(("a", "b"), "mxfp8", {fp8_dtype}, scale=_MXFP8_UE8M0_1X32_SCALE)
+_MXFP8_PACKED_UE8M0_FORMAT_SIGNATURES = format_signatures(
+    ("a", "b"),
+    "mxfp8",
+    {fp8_dtype},
+    scale=ScaleFormat(
+        storage_dtype=torch.int32, granularity="block", block_shape=(128, 128)
+    ),
+)
 _FP8_TENSOR_FORMAT_SIGNATURES = format_signatures(
     ("a", "b"), "scaled-fp8", {fp8_dtype}, scale=_FP8_TENSOR_SCALE
 )
@@ -73,6 +81,12 @@ def _dequant_scales(scales: torch.Tensor) -> torch.Tensor:
         # ue8m0: biased power-of-two exponent bytes.
         return torch.exp2(scales.float() - 127.0)
     return scales.float()
+
+
+def _unpack_ue8m0_scales(scales: torch.Tensor, k_tiles: int) -> torch.Tensor:
+    shifts = torch.arange(0, 32, 8, dtype=torch.int32, device=scales.device)
+    exponents = ((scales.unsqueeze(-1) >> shifts) & 0xFF).flatten(1)[:, :k_tiles]
+    return exponents.to(torch.uint8)
 
 
 def _as_baddbmm_alpha(alpha: torch.Tensor | float | int | None) -> float | int:
@@ -116,7 +130,7 @@ def _reference_mxfp8_quantize(
     "mm",
     name="torch_mm_fp8_blockscale",
     solution="torch",
-    signatures=_MXFP8_FORMAT_SIGNATURES,
+    signatures=_MXFP8_FORMAT_SIGNATURES | _MXFP8_PACKED_UE8M0_FORMAT_SIGNATURES,
     traits={},
     priority=Priority.PORTABLE + 2,
 )
@@ -143,6 +157,11 @@ def torch_mm_fp8_blockscale(
 
     block_n, block_k = block_size
     k_tiles = math.ceil(K / block_k)
+    if A_scales.dtype == torch.int32:
+        A_scales = _unpack_ue8m0_scales(A_scales, k_tiles)
+    if B_scales.dtype == torch.int32:
+        B_scales = _unpack_ue8m0_scales(B_scales, k_tiles)
+        block_n = 1
     n_tiles = math.ceil(N / block_n)
     assert A_scales.shape == (M, k_tiles), (
         f"A_scales shape mismatch: expected {(M, k_tiles)}, "
