@@ -31,6 +31,7 @@
 
 use std::{
     collections::{HashMap, VecDeque},
+    panic::{catch_unwind, AssertUnwindSafe},
     sync::{Arc, Condvar, Mutex, MutexGuard},
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -41,7 +42,7 @@ use ts_metrics::{L3ExecutorSnapshot, L3OperationSnapshot};
 use crate::{
     keys,
     layout::{HostLayout, LayoutError, Range},
-    store::{HostBuffer, IoResult, Store},
+    store::{HostBuffer, IoResult, Store, StoreError},
 };
 
 /// The executor's limits: the scheduler's storage credits and the workers.
@@ -382,9 +383,55 @@ struct Shared {
     prefix: Mutex<String>,
 }
 
+/// A worker's exit bookkeeping: however its loop ends, a drained queue at
+/// shutdown or an unwinding panic, the count a closing executor waits on
+/// is released and the closer wakes. The `Drop` takes the state lock even
+/// poisoned: the count is exact under any completed mutation, and a `Drop`
+/// that may run while a thread unwinds must not panic again, since a
+/// second panic aborts the process.
+struct WorkerExit<'a> {
+    shared: &'a Shared,
+}
+
+impl Drop for WorkerExit<'_> {
+    fn drop(&mut self) {
+        let mut state = self.shared.lock_even_poisoned();
+        // An internal fault may have prevented a native retirement fact
+        // from being published. Exiting a worker is not that proof.
+        if std::thread::panicking() {
+            state.unsafe_io = true;
+        }
+        state.running_workers -= 1;
+        drop(state);
+        self.shared.exited.notify_all();
+    }
+}
+
+/// What a panicking store said, for the failure report.
+fn panic_message(payload: &dyn std::any::Any) -> &str {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        message
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.as_str()
+    } else {
+        "unknown panic payload"
+    }
+}
+
 impl Shared {
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().expect("L3 executor lock")
+    }
+
+    /// The lock the shutdown paths take even when poisoned: they only set
+    /// `stopping` and read the worker count and the retirement fact, which
+    /// are exact under any completed mutation, and a `Drop` running while
+    /// a thread unwinds must not panic again, since a second panic aborts
+    /// the process. Poisoning means an internal fault (a store panic is
+    /// contained outside every lock), so serving paths keep `lock`'s loud
+    /// `expect` instead of trusting possibly corrupt job state.
+    fn lock_even_poisoned(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(|error| error.into_inner())
     }
 
     /// Complete `op_id` with `result` (under the state lock).
@@ -500,6 +547,7 @@ impl Shared {
 
     /// One worker of `kind`'s queue, until shutdown drains it.
     fn work(&self, kind: Kind) {
+        let _exit = WorkerExit { shared: self };
         loop {
             let mut state = self.lock();
             let op_id = loop {
@@ -514,9 +562,6 @@ impl Shared {
                     .expect("L3 executor lock");
             };
             let Some(op_id) = op_id else {
-                state.running_workers -= 1;
-                drop(state);
-                self.exited.notify_all();
                 return;
             };
             let (stopping, unsafe_io) = (state.stopping, state.unsafe_io);
@@ -572,7 +617,17 @@ impl Shared {
             Some(token) => {
                 self.lock().counters[job.kind.index()].backend_calls += 1;
                 let started = (self.clock)();
-                let called = match job.kind {
+                // The store callback boundary: a Rust panic crossing it is
+                // contained and reported as a failed call, so the worker
+                // keeps serving. (A process abort or a native exception is
+                // not a Rust panic and cannot be caught here.)
+                // AssertUnwindSafe: a caught panic leaves the store's
+                // internals unknown, which the outcome below encodes: a
+                // panicked get or put quarantines the executor, so the
+                // store is never called again, and a panicked query is
+                // retried only under the same failure contract as an
+                // ordinary error.
+                let called = catch_unwind(AssertUnwindSafe(|| match job.kind {
                     Kind::Query => self.store.batch_exists(&local_keys).map(|flags| IoResult {
                         object_failures: vec![false; flags.len()],
                         success: flags,
@@ -584,6 +639,16 @@ impl Shared {
                     Kind::Put => self
                         .store
                         .batch_put_from(&local_keys, self.host, &local_ranges),
+                }));
+                let (called, panicked) = match called {
+                    Ok(called) => (called, false),
+                    Err(payload) => (
+                        Err(StoreError(format!(
+                            "the L3 store call panicked: {}",
+                            panic_message(&*payload)
+                        ))),
+                        true,
+                    ),
                 };
                 let checked = called.map_err(|error| error.0).and_then(|result| {
                     let valid = result.success.len() == local.len()
@@ -621,7 +686,14 @@ impl Shared {
                         self.health.failure(token);
                         IoResult {
                             success: vec![false; local.len()],
-                            retired: job.kind == Kind::Query || self.store.failures_retire(),
+                            // `failures_retire` covers a controlled
+                            // `StoreError` return only: a panicked get or
+                            // put may have died mid-transfer, so its Host
+                            // access is unproven whatever the store
+                            // advertises. A query touches no payload and
+                            // always retires.
+                            retired: job.kind == Kind::Query
+                                || (!panicked && self.store.failures_retire()),
                             object_failures: vec![false; local.len()],
                         }
                     }
@@ -650,6 +722,7 @@ impl Shared {
 pub struct Executor {
     shared: Arc<Shared>,
     threads: Vec<JoinHandle<()>>,
+    /// The store is released: closing finished successfully.
     closed: bool,
 }
 
@@ -912,17 +985,28 @@ impl Executor {
         self.shared.store.remove_by_prefix(&prefix)
     }
 
-    /// Stop the workers within `timeout` and release the store; a later
-    /// call does nothing. If a worker is still in native I/O, or some I/O
-    /// never proved its retirement, the store stays connected for the rest
-    /// of the process and the caller must keep the Host pool alive too.
+    /// Stop the workers within `timeout` and, once every native I/O proved
+    /// its retirement, release the store. A successful call joins the
+    /// workers and closes the store exactly once; later calls do nothing.
+    ///
+    /// A call that cannot prove retirement (a worker still inside native
+    /// I/O when the deadline passes, or an earlier unretired result)
+    /// returns [`ExecutorError::Unretired`] and releases nothing: the
+    /// store, and with it the Host pool's registration, stay connected, so
+    /// the caller must keep the pool alive. Such a failure never falsely
+    /// reports success later. It is retryable only while its cause is an
+    /// ordinary timeout: a later call succeeds once real worker retirement
+    /// is observed. An unretired result quarantines the executor
+    /// permanently: every later call fails again and the store is never
+    /// released; only process exit reclaims it. A failed call keeps this
+    /// executor's ownership. Dropping an executor whose retirement remains
+    /// unproven retains one shared reference for the process.
     pub fn close(&mut self, timeout: Duration) -> Result<(), ExecutorError> {
         if self.closed {
             return Ok(());
         }
-        self.closed = true;
         let deadline = Instant::now() + timeout;
-        let mut state = self.shared.lock();
+        let mut state = self.shared.lock_even_poisoned();
         state.stopping = true;
         for work in &self.shared.work {
             work.notify_all();
@@ -936,21 +1020,35 @@ impl Executor {
                 .shared
                 .exited
                 .wait_timeout(state, left)
-                .expect("L3 executor lock")
+                .unwrap_or_else(|error| error.into_inner())
                 .0;
+        }
+        // A poisoned mutex means an internal mutation did not complete;
+        // even an empty worker set cannot establish native retirement.
+        if self.shared.state.is_poisoned() {
+            state.unsafe_io = true;
         }
         let retired = state.running_workers == 0 && !state.unsafe_io;
         drop(state);
         if !retired {
-            // Only process exit releases an unretired native transport: the
-            // store, and with it the registration of the pool, stay.
-            std::mem::forget(Arc::clone(&self.shared));
+            // Keep ownership so a timeout can be retried without leaking
+            // a client after a successful retry. Drop retains the shared
+            // state only if retirement still cannot be established.
             return Err(ExecutorError::Unretired);
         }
         for thread in self.threads.drain(..) {
             let _ = thread.join();
         }
-        self.shared.store.close();
+        self.closed = true;
+        // The workers are joined and retirement is proven, so closing the
+        // store is cleanup only: contain a panicking one instead of letting
+        // it turn a completed shutdown, possibly a `Drop` already
+        // unwinding, into an abort. The store is not retried afterwards;
+        // its client is still dropped with the shared state.
+        let closed_store = catch_unwind(AssertUnwindSafe(|| self.shared.store.close()));
+        if closed_store.is_err() {
+            tracing::error!("the L3 store's close panicked after a proven retirement");
+        }
         Ok(())
     }
 }
@@ -958,6 +1056,7 @@ impl Executor {
 impl Drop for Executor {
     fn drop(&mut self) {
         if let Err(error) = self.close(Duration::from_secs(5)) {
+            std::mem::forget(Arc::clone(&self.shared));
             tracing::error!(%error, "closing the L3 executor");
         }
     }
@@ -1161,9 +1260,12 @@ mod tests {
             completions
         }
 
+        /// Close through the executor, keeping it when the close fails:
+        /// an ordinary timeout is retryable, and a quarantine keeps its
+        /// diagnostics readable.
         fn close(&mut self, timeout: Duration) -> Result<(), ExecutorError> {
-            match self.executor.take() {
-                Some(mut executor) => executor.close(timeout),
+            match self.executor.as_mut() {
+                Some(executor) => executor.close(timeout),
                 None => Ok(()),
             }
         }
@@ -1862,6 +1964,243 @@ mod tests {
         // The worker still writes the pool after the close.
         std::mem::forget(std::mem::take(&mut harness.pool));
         release.set();
+    }
+
+    #[test]
+    fn a_timed_out_close_is_retryable_once_the_workers_retire() {
+        let (started, release) = (Arc::new(Event::default()), Arc::new(Event::default()));
+        let (s, r) = (Arc::clone(&started), Arc::clone(&release));
+        let store = TestStore {
+            get: Some(Box::new(move |keys, _, _| {
+                s.set();
+                assert!(r.wait(Duration::from_secs(3)));
+                Ok(IoResult {
+                    success: vec![true; keys.len()],
+                    retired: true,
+                    object_failures: vec![false; keys.len()],
+                })
+            })),
+            ..TestStore::new()
+        };
+        let closes = Arc::clone(&store.closes);
+        let mut harness = Harness::new(store, CONFIG);
+        harness.executor().submit(&[get(1, "a", 1)]).unwrap();
+        assert!(started.wait(Duration::from_secs(1)));
+        // The worker is inside native I/O: no retirement proof, no store
+        // close, and no false success from a later call either.
+        assert!(matches!(
+            harness.close(Duration::ZERO),
+            Err(ExecutorError::Unretired)
+        ));
+        assert_eq!(closes.load(Ordering::SeqCst), 0);
+        // A submission after the close began completes at once, retired.
+        harness.executor().submit(&[get(2, "b", 2)]).unwrap();
+        let refused = &harness.wait(1)[0];
+        assert_eq!(refused.op_id, 2);
+        assert!(refused.retired && refused.success == [false]);
+        release.set();
+        assert_eq!(harness.wait(1)[0].op_id, 1);
+        // The retry observes the real retirement and closes the store,
+        // exactly once; a later close does nothing.
+        harness.close(Duration::from_secs(2)).unwrap();
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
+        harness.close(Duration::from_secs(2)).unwrap();
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn repeated_failed_closes_do_not_leak_after_a_successful_retry() {
+        let (started, release) = (Arc::new(Event::default()), Arc::new(Event::default()));
+        let (s, r) = (Arc::clone(&started), Arc::clone(&release));
+        let store = TestStore {
+            get: Some(Box::new(move |keys, _, _| {
+                s.set();
+                assert!(r.wait(Duration::from_secs(3)));
+                Ok(IoResult {
+                    success: vec![true; keys.len()],
+                    retired: true,
+                    object_failures: vec![false; keys.len()],
+                })
+            })),
+            ..TestStore::new()
+        };
+        let mut harness = Harness::new(
+            store,
+            ExecutorConfig {
+                query_workers: 0,
+                read_workers: 1,
+                write_workers: 0,
+                ..CONFIG
+            },
+        );
+        harness.executor().submit(&[get(1, "a", 1)]).unwrap();
+        assert!(started.wait(Duration::from_secs(1)));
+        let shared = Arc::clone(&harness.executor().shared);
+        assert!(matches!(
+            harness.close(Duration::ZERO),
+            Err(ExecutorError::Unretired)
+        ));
+        // Executor, this test and the worker; no permanent retention yet.
+        let retained = Arc::strong_count(&shared);
+        assert_eq!(retained, 3);
+        for _ in 0..3 {
+            assert!(matches!(
+                harness.close(Duration::ZERO),
+                Err(ExecutorError::Unretired)
+            ));
+        }
+        // The retention does not grow one reference per failed call.
+        assert_eq!(Arc::strong_count(&shared), retained);
+        release.set();
+        assert_eq!(harness.wait(1)[0].op_id, 1);
+        harness.close(Duration::from_secs(2)).unwrap();
+        drop(harness);
+        assert_eq!(Arc::strong_count(&shared), 1);
+    }
+
+    #[test]
+    fn a_panicking_payload_call_completes_unretired_and_quarantines() {
+        // `failures_retire` covers controlled `StoreError` returns: a
+        // panicked get may have died mid-transfer and never retires.
+        let store = TestStore {
+            get: Some(Box::new(|_, _, _| panic!("store bug"))),
+            ..TestStore::new()
+        };
+        let closes = Arc::clone(&store.closes);
+        let mut harness = Harness::new(store, CONFIG);
+        let executor = harness.executor();
+        executor.submit(&[get(1, "a", 1)]).unwrap();
+        // The ticket still completes, terminally failed and unretired.
+        let completion = &harness.wait(1)[0];
+        assert_eq!(completion.op_id, 1);
+        assert_eq!(completion.success, [false]);
+        assert_eq!(completion.object_failures, [false]);
+        assert!(!completion.retired);
+        // The quarantine is permanent: maintenance refuses, new I/O
+        // completes as a retired failure, and every close reports it.
+        assert!(!executor.is_idle());
+        assert!(executor.snapshot().unsafe_io);
+        assert!(matches!(
+            executor.set_weight_version("v2"),
+            Err(ExecutorError::Busy)
+        ));
+        assert!(!executor.delete_namespace());
+        executor.submit(&[get(2, "b", 2)]).unwrap();
+        let refused = &harness.wait(1)[0];
+        assert!(refused.retired && refused.success == [false]);
+        for _ in 0..2 {
+            assert!(matches!(
+                harness.close(Duration::from_secs(2)),
+                Err(ExecutorError::Unretired)
+            ));
+        }
+        assert_eq!(closes.load(Ordering::SeqCst), 0);
+        let snapshot = harness.executor().snapshot();
+        assert!(snapshot.unsafe_io);
+        assert_eq!(value(&row(&snapshot, "get").events, "unretired"), 1.0);
+        // The pool must outlive the retained store.
+        std::mem::forget(std::mem::take(&mut harness.pool));
+    }
+
+    #[test]
+    fn a_panicking_query_retires_and_the_worker_serves_on() {
+        // A query touches no Host payload: its panic is a backend failure,
+        // not a quarantine, and the contained worker keeps serving.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&calls);
+        let store = TestStore {
+            exists: Some(Box::new(move |keys| {
+                if c.fetch_add(1, Ordering::SeqCst) == 0 {
+                    panic!("store bug");
+                }
+                Ok(vec![true; keys.len()])
+            })),
+            ..TestStore::new()
+        };
+        let mut harness = Harness::new(
+            store,
+            ExecutorConfig {
+                failure_threshold: 2,
+                ..CONFIG
+            },
+        );
+        let executor = harness.executor();
+        executor.submit(&[query(1, &["a"])]).unwrap();
+        let failed = &harness.wait(1)[0];
+        assert!(failed.retired);
+        assert_eq!(failed.success, [false]);
+        assert_eq!(failed.object_failures, [false]);
+        assert!(executor.is_idle());
+        executor.submit(&[query(2, &["b"])]).unwrap();
+        let served = &harness.wait(1)[0];
+        assert_eq!(served.success, [true]);
+        assert!(served.retired);
+        harness.close(Duration::from_secs(2)).unwrap();
+    }
+
+    #[test]
+    fn poisoning_during_an_unretired_call_never_releases_the_store() {
+        let (started, release) = (Arc::new(Event::default()), Arc::new(Event::default()));
+        let (s, r) = (Arc::clone(&started), Arc::clone(&release));
+        let store = TestStore {
+            get: Some(Box::new(move |keys, _, _| {
+                s.set();
+                assert!(r.wait(Duration::from_secs(5)));
+                Ok(IoResult {
+                    success: vec![false; keys.len()],
+                    retired: false,
+                    object_failures: vec![false; keys.len()],
+                })
+            })),
+            ..TestStore::new()
+        };
+        let closes = Arc::clone(&store.closes);
+        let mut harness = Harness::new(store, CONFIG);
+        harness
+            .executor()
+            .submit(&[get(1, "uncertain", 1)])
+            .unwrap();
+        assert!(started.wait(Duration::from_secs(1)));
+        let shared = Arc::clone(&harness.executor().shared);
+        assert!(std::thread::spawn(move || {
+            let _guard = shared.lock();
+            panic!("internal fault while another worker still has native I/O");
+        })
+        .join()
+        .is_err());
+        release.set();
+        // The returning worker cannot publish its retirement fact through
+        // the poisoned lock. Worker exit alone is not proof of retirement.
+        for _ in 0..2 {
+            assert!(matches!(
+                harness.close(Duration::from_secs(2)),
+                Err(ExecutorError::Unretired)
+            ));
+            assert_eq!(closes.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn a_poisoned_state_lock_can_neither_hang_nor_abort_a_close() {
+        // Poisoning means an internal fault: a panicking thread left the
+        // state lock mid-mutation. The shutdown path must still take the
+        // lock, and the workers' exit bookkeeping must survive it: a
+        // second panic inside a `Drop` would abort the process.
+        let store = TestStore::new();
+        let closes = Arc::clone(&store.closes);
+        let mut harness = Harness::new(store, CONFIG);
+        let shared = Arc::clone(&harness.executor().shared);
+        let poisoned = std::thread::spawn(move || {
+            let _guard = shared.lock();
+            panic!("simulated internal fault");
+        })
+        .join();
+        assert!(poisoned.is_err());
+        assert!(matches!(
+            harness.close(Duration::from_secs(2)),
+            Err(ExecutorError::Unretired)
+        ));
+        assert_eq!(closes.load(Ordering::SeqCst), 0);
     }
 
     #[test]
