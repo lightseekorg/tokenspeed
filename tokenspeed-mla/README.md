@@ -118,17 +118,14 @@ give requests chunks of about the same length. One Triton launch reduces the
 lengths in int64 and writes counts and exclusive split offsets into the caller's
 buffers. Pass both `block_split_kvs` and `block_split_offsets` to decode.
 `is_var_split_kv` selects the kernel mode: uniform splitting keeps its original
-workspace and grid; per-request splitting always uses compact workspace and grid.
-The latter uses non-persistent scheduling and requires counts and offsets together.
-The planner allows up to `max(32, min_split_kv)` splits per request
+workspace; per-request splitting always uses the compact workspace and requires
+counts and offsets together. The grid reserves up to `max(32, min_split_kv)` splits per request
 (`PER_REQUEST_SPLIT_KV_CAPACITY`), reduced to avoid empty partitions; the
 partial results share a compact split axis across requests. Reserve bytes with
 `tokenspeed_mla_decode_workspace_size`: total slots are bounded by the uniform
 chunk budget plus `B - 1` for rounding, rather than `B` times the grid width.
 The startup bound covers all batches up to the configured maximum. Counts and
 offsets are refreshed in place between CUDA graph replays, without recompilation.
-The launch grid is bounded by that compact capacity. Each chunk maps through
-the offsets to its request and split; unused chunks exit before pipeline setup.
 Target verification, chain drafting, multi-depth MTP and block drafting
 refresh the same metadata when their cache lengths change. With compacted
 KVP/DCP pages, planning follows the local-length refresh and uses the gathered

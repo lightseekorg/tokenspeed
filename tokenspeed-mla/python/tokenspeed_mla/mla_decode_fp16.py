@@ -60,7 +60,6 @@ try:
         MLAStaticTileScheduler,
         MLAStaticTileSchedulerParams,
         ceil_div,
-        compact_split_grid,
         compute_q_tile_layout,
         create_mla_static_tile_scheduler,
         create_mla_static_tile_scheduler_params,
@@ -68,7 +67,6 @@ try:
         get_mla_decode_fold_sq_factor,
         make_compact_split_workspace,
         offset_split_workspace,
-        split_block_coord,
     )
 except ImportError:
     from mla_helpers import (
@@ -77,7 +75,6 @@ except ImportError:
         MLAStaticTileScheduler,
         MLAStaticTileSchedulerParams,
         ceil_div,
-        compact_split_grid,
         compute_q_tile_layout,
         create_mla_static_tile_scheduler,
         create_mla_static_tile_scheduler_params,
@@ -85,7 +82,6 @@ except ImportError:
         get_mla_decode_fold_sq_factor,
         make_compact_split_workspace,
         offset_split_workspace,
-        split_block_coord,
     )
 
 """
@@ -224,8 +220,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         self.mma_pv_tiler_mn = mma_pv_tiler_mn
         self.max_active_clusters = max_active_clusters
         self.skip_correction_threshold = skip_correction_threshold
-        if is_var_split_kv and is_persistent:
-            raise ValueError("per-request split-KV requires non-persistent scheduling")
         self.is_persistent = is_persistent
         self.page_size = page_size
         self.is_var_seq = is_var_seq
@@ -739,8 +733,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             self.max_active_clusters,
             self.is_persistent,
         )
-        if cutlass.const_expr(self.is_var_split_kv):
-            grid = compact_split_grid(o, split_kv, acc_o, self.cluster_shape_mnk[0])
 
         @cute.struct
         class SplitKVKernelSharedStorage:
@@ -1018,9 +1010,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         :type SharedStorage: cutlass.Constexpr
         """
 
-        tile_block_idx = cute.arch.block_idx()
-        if cutlass.const_expr(self.is_var_split_kv):
-            tile_block_idx = split_block_coord(block_split_offsets, tile_sched_params)
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
         tidx, _, _ = cute.arch.thread_idx()
@@ -1137,7 +1126,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                 pipeline.PipelineUserType.Producer, self.load_pt_stage
             )
             tile_sched = create_mla_static_tile_scheduler(
-                tile_sched_params, tile_block_idx, cute.arch.grid_dim()
+                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
@@ -1184,7 +1173,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                 pipeline.PipelineUserType.Consumer, self.load_pt_stage
             )
             tile_sched = create_mla_static_tile_scheduler(
-                tile_sched_params, tile_block_idx, cute.arch.grid_dim()
+                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
@@ -1277,7 +1266,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
                 pipeline.PipelineUserType.Producer, self.mma_o_stage
             )
             tile_sched = create_mla_static_tile_scheduler(
-                tile_sched_params, tile_block_idx, cute.arch.grid_dim()
+                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
@@ -1366,7 +1355,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
 
             tile_sched = create_mla_static_tile_scheduler(
-                tile_sched_params, tile_block_idx, cute.arch.grid_dim()
+                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
@@ -1437,7 +1426,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
 
             tile_sched = create_mla_static_tile_scheduler(
-                tile_sched_params, tile_block_idx, cute.arch.grid_dim()
+                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
