@@ -336,8 +336,8 @@ TEST(GroupAllocatorTest, BucketBalanceKeepsLiveSlotsAfterReclaimedPrefixAndInter
     pool.RegisterGroup(0, 4, 4);
     GroupAllocator allocator(4, 0, 4, /*kept_head_blocks=*/0);
     BlockTable table;
-    ASSERT_TRUE(allocator.Acquire(
-        pool, table, AcquirePlan{.num_blocks = 3, .suffix_start = 64, .table_blocks_after = 67}, 0, {}));
+    ASSERT_TRUE(allocator.Acquire(pool, table,
+                                  AcquirePlan{.num_blocks = 3, .suffix_start = 64, .table_blocks_after = 67}, 0, {}));
     ASSERT_EQ(table.ReclaimedPrefixBlocks(), 64);
     table.EvictToNull(65).reset();
     ASSERT_TRUE(allocator.Acquire(pool, table, AcquirePlan{.num_blocks = 4}, 0, {}));
