@@ -1418,6 +1418,7 @@ dependencies = [
  "crc32fast",
  "mimalloc",
  "pyo3",
+ "rustix",
  "serde_json",
  "thiserror 2.0.21",
  "tokenspeed-client",

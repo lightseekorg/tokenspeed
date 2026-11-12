@@ -32,6 +32,10 @@ ts-client = { package = "tokenspeed-client", version = "0.1.0" }
 
 ## Wire conformance
 
+The [Rust engine CPU benchmark](crates/ts-control/benches/README.md) measures
+long-request ingress, prompt logprobs and high-frequency output streaming with
+the real wire, control and client classes, without a GPU or model weights.
+
 `crates/ts-wire/tests/fixtures/` holds messages written by the Python encoder.
 `cargo test` decodes each one, compares it field by field with the values the
 generator used, and re-encodes it byte for byte;
