@@ -505,6 +505,7 @@ def _model(**overrides):
         layers_to_capture=[],
         eagle3_layers_to_capture=(),
         config=_NoConfig(),
+        peer_weights=None,
         _forward_decode_chain=mock.Mock(return_value=("chain", "aux")),
     )
     for name, value in overrides.items():
@@ -691,6 +692,7 @@ def test_the_ordinary_forward_rejoins_the_moe_chain_after_its_layers(monkeypatch
         output_attn_res_proj=None,
         output_attn_res_norm=None,
         norm=None,
+        peer_weights=None,
     )
     _model_forward(model)
     assert log == [("layer", 0), ("layer", 1), ("join",), ("final",)]

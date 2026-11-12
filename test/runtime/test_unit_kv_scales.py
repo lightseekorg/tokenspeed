@@ -331,6 +331,7 @@ def test_a_distributed_update_finishes_its_load_before_rejecting_a_scale(monkeyp
     post-load derivations included, before the update reports the scale."""
     import torch.distributed as dist
 
+    from tokenspeed.runtime.distributed.mapping import Mapping
     from tokenspeed.runtime.execution.model_runner import ModelRunner
 
     received = []
@@ -344,6 +345,7 @@ def test_a_distributed_update_finishes_its_load_before_rejecting_a_scale(monkeyp
         loaded.append("post_load")
 
     runner = object.__new__(ModelRunner)
+    runner.mapping = Mapping(rank=0, world_size=1)
     runner._weight_update_pg = object()
     runner._weight_update_device = torch.device("cuda")
     runner.model = SimpleNamespace(load_weights=load_weights)
