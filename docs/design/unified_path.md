@@ -43,6 +43,13 @@ cache lengths, candidates or stop flags. This also covers a remote landing
 imaged before its first stop binding. Stores, restores and binding retain the
 existing execution-stream dependencies; identity checks do not replace fences.
 
+The sampler's route and top-k padding describe the current batch, not the
+owners of all prepared slots. Their cache tracks the admissions in each
+executed batch: equally sized batches can contain different prepared requests,
+including a restored request that waits while another batch runs. Restoring
+slot ownership must preserve sampling history; it does not establish which
+batch runs next. A stable batch reuses its cached route and padding.
+
 ### One decode metadata path
 
 `AttentionBackend.refresh_decode_metadata(bs, actual_bs, req_pool_indices,

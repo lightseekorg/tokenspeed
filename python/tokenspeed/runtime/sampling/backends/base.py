@@ -270,14 +270,12 @@ class SamplingBackend(ABC):
         pool_rows = config.max_req_pool_size + 1 if self._HAS_POOL_STATE else 0
         self._last_admission_per_slot: list[int | None] = [None] * pool_rows
 
-        # Batch-composition version: prepare_step bumps it whenever the
-        # serving batch's membership can change — a slot flip (new
-        # request in a slot) or a size change (a retraction departs
-        # without flipping anything). Batch-aggregate facts that depend
-        # only on the mix (the Triton route/pad) cache against it and
-        # recompute only on a bump.
+        # Batch-aggregate facts (the Triton route/pad) follow the admissions
+        # actually scheduled, not all prepared slots. A restored admission
+        # already owns its slot, and equally sized resident batches may
+        # alternate without any slot changing owners.
         self._batch_composition_epoch: int = 0
-        self._last_step_bs: int | None = None
+        self._last_step_admission_ids: tuple[int, ...] | None = None
 
         # Pool-indexed kernels (the Triton Gumbel-max routes, the FlashInfer
         # backends' per-request stream) take int32 pool indices and a
@@ -567,8 +565,8 @@ class SamplingBackend(ABC):
         )
 
         pool_rows = len(self._last_admission_per_slot)
-        batch_size = len(request_pool_indices)
-        membership_changed = batch_size != self._last_step_bs
+        step_admission_ids = tuple(admission_ids)
+        membership_changed = step_admission_ids != self._last_step_admission_ids
         for admission_id, pool_idx, sp in zip(
             admission_ids, request_pool_indices, sampling_params_list
         ):
@@ -581,7 +579,7 @@ class SamplingBackend(ABC):
                 membership_changed = True
         if membership_changed:
             self._batch_composition_epoch += 1
-        self._last_step_bs = batch_size
+        self._last_step_admission_ids = step_admission_ids
 
         self._prepare_step_hook(
             num_tokens_per_req=num_tokens_per_req,

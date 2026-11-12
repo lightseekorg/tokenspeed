@@ -416,7 +416,11 @@ class _CpuExecutor:
             output_token_cumulative_probs
         )
         self.runtime_states = RuntimeStates(
-            req_pool_size=4, vocab_size=512, output_length=1, device="cpu"
+            req_pool_size=4,
+            input_vocab_size=512,
+            vocab_size=512,
+            output_length=1,
+            device="cpu",
         )
         self.forwards: list[tuple[list[str], list, tuple]] = []
         self.dp_metadata: list = []
