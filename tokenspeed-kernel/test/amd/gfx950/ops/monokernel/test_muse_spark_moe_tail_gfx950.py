@@ -36,6 +36,7 @@ from utils import is_cdna4
 if not is_cdna4():
     pytest.skip("AMD CDNA4 is required", allow_module_level=True)
 
+import muse_spark_standins as standins  # noqa: E402
 from monokernel_testing import fill, payloads  # noqa: E402
 from tokenspeed_kernel.ops.communication._iris import (  # noqa: E402
     IrisGroup,
@@ -56,6 +57,7 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.weights import (  # noqa: E402
 )
 
 WORLD, HIDDEN, POOLED, TOP_K, OWNED, OWNED_POOL = 8, 8192, 4096, 8, 1024, 512
+ALL = tuple(range(WORLD))
 
 
 @gluon.jit
@@ -108,9 +110,12 @@ def moe_tail_kernel(
         )
 
 
-def _inputs(launch: int, rows: int):
+def _inputs(launch: int, rows: int, present):
     """The route partials, route weights and ``h'`` of each row (leading
-    dimension ``rows``), then the layer's weights."""
+    dimension ``rows``), then the layer's weights. Outside ``present`` the
+    model is zero-shard: those ranks' route partials, the pooled and hidden
+    columns they own (partials, h', post-projection rows) are zero, so they
+    put exactly zero."""
     g = torch.Generator().manual_seed(300 + launch)
     parts = (torch.randn(rows, WORLD, TOP_K, POOLED, generator=g) * 4).to(
         torch.bfloat16
@@ -124,6 +129,11 @@ def _inputs(launch: int, rows: int):
     alpha = torch.rand(HIDDEN, generator=g) + 0.5
     beta = torch.rand(HIDDEN, generator=g) + 0.5
     ing = (1.0 + 0.1 * torch.randn(HIDDEN, generator=g)).to(torch.bfloat16).float()
+    absent_rank = ~torch.isin(torch.arange(WORLD), torch.tensor(present))
+    parts[:, absent_rank] = 0
+    parts[..., standins.absent_columns(POOLED, OWNED_POOL, present)] = 0
+    hp[:, standins.absent_columns(HIDDEN, OWNED, present)] = 0
+    w_post[standins.absent_columns(HIDDEN, OWNED, present)] = 0
     return parts, w, hp, pen, w_post, post, alpha, beta, ing
 
 
@@ -192,22 +202,25 @@ def _downstream(cmb, hp, w_post, post, alpha, beta, ing):
     return h2, dh2, a, da + 2**-8 * (a.abs() + da)
 
 
-def _worker(rank: int, port: int, rows: int, source_rows: int, out: str) -> None:
+def _worker(me: int, port: int, rows: int, source_rows: int, out: str, present) -> None:
     """Run two launches of ``rows`` rows, row ``r`` taking the inputs of row
     ``r % source_rows``, check them against the reference, and save each
-    launch's ``a_out`` and ``h_next`` to ``out``."""
-    torch.cuda.set_device(rank)
+    launch's ``a_out`` and ``h_next`` to ``out``. ``present``: None for the
+    whole TP8 group; or the two rank programs that run (process ``me`` runs
+    ``present[me]``) in the zero-shard model of :func:`_inputs`, whose other
+    ranks' puts (exactly zero) the host writes before each launch."""
+    torch.cuda.set_device(me)
     dist.init_process_group(
         "gloo",
         init_method=f"tcp://localhost:{port}",
-        rank=rank,
-        world_size=WORLD,
+        rank=me,
+        world_size=WORLD if present is None else len(present),
         timeout=timedelta(seconds=300),
     )
     try:
-        device = torch.device(f"cuda:{rank}")
+        device = torch.device(f"cuda:{me}")
         ctx = get_or_create_context(heap_size=256 << 20)
-        group = IrisGroup(ctx, dist.group.WORLD, rank, device)
+        group = IrisGroup(ctx, dist.group.WORLD, me, device)
         plan = Plan(
             grid=256,
             stages=moe_tail.stages(
@@ -227,6 +240,12 @@ def _worker(rank: int, port: int, rows: int, source_rows: int, out: str) -> None
             flags=moe_tail.flags(rows),
         )
         scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
+        if present is None:
+            rank, model, bases = me, ALL, group.bases
+        else:
+            rank, model = present[me], present
+            ghost = torch.zeros_like(scratch)
+            bases = standins.peer_bases(group.bases, present, me, scratch, ghost)
         group.finish_prepare()
         own = slice(rank * OWNED, (rank + 1) * OWNED)
         own_pool = slice(rank * OWNED_POOL, (rank + 1) * OWNED_POOL)
@@ -234,7 +253,7 @@ def _worker(rank: int, port: int, rows: int, source_rows: int, out: str) -> None
             step = 20 + launch
             tag = launch_tag(step, 0)
             parts, w, hp, pen, w_post, post, alpha, beta, ing = _inputs(
-                launch, source_rows
+                launch, source_rows, model
             )
             src = torch.arange(rows) % source_rows
             parts, w, hp = parts[src], w[src], hp[src]
@@ -255,12 +274,23 @@ def _worker(rank: int, port: int, rows: int, source_rows: int, out: str) -> None
                     copy=step & 1,
                     row=row,
                 )
+            if present is not None:
+                standins.standin_fill(
+                    scratch,
+                    plan,
+                    present,
+                    [(0, t % source_rows) for t in range(rows)],
+                    step,
+                    0,
+                    step & 1,
+                    True,
+                )
             h_next = torch.empty(rows, OWNED, device=device)
             a_out = torch.empty(rows, HIDDEN, dtype=torch.bfloat16, device=device)
             moe_tail_kernel[(plan.grid,)](
                 scratch,
                 torch.full((1,), step, dtype=torch.int32, device=device),
-                group.bases,
+                bases,
                 pen[own_pool].to(device),
                 bf16_tiles(w_post[own].contiguous()).to(device),
                 post.to(device),
@@ -293,6 +323,12 @@ def _worker(rank: int, port: int, rows: int, source_rows: int, out: str) -> None
                 assert torch.all(err <= dh2[own]), float((err / dh2[own]).max())
                 err = (a_out[row].cpu().double() - a).abs()
                 assert torch.all(err <= da), float((err / da).max())
+                if present is not None:
+                    # The absent ranks' columns stay zero.
+                    absent = standins.absent_columns(HIDDEN, OWNED, present)
+                    assert not a_out[row].cpu()[absent].float().any()
+                    absent = standins.absent_columns(POOLED, OWNED_POOL, present)
+                    assert not cmb[absent].float().any()
             torch.save(
                 (a_out.cpu(), h_next.cpu()), f"{out}/rank{rank}-launch{launch}.pt"
             )
@@ -301,18 +337,39 @@ def _worker(rank: int, port: int, rows: int, source_rows: int, out: str) -> None
         dist.destroy_process_group()
 
 
-def _spawn(rows: int, source_rows: int, out) -> None:
+def _spawn(rows: int, source_rows: int, out, present) -> None:
     with socket.socket() as sock:
         sock.bind(("", 0))
         port = sock.getsockname()[1]
-    mp.spawn(_worker, args=(port, rows, source_rows, str(out)), nprocs=WORLD, join=True)
+    mp.spawn(
+        _worker,
+        args=(port, rows, source_rows, str(out), present),
+        nprocs=WORLD if present is None else len(present),
+        join=True,
+    )
 
 
 @pytest.mark.parametrize("rows", [1, 8, 16])
 def test_moe_tail_combines_projects_and_closes_the_layer(rows: int, tmp_path):
     if torch.cuda.device_count() < WORLD:
         pytest.skip(f"requires {WORLD} GPUs")
-    _spawn(rows, rows, tmp_path)
+    _spawn(rows, rows, tmp_path, None)
+
+
+@pytest.mark.parametrize("present", standins.PAIRS, ids=standins.PAIR_IDS)
+@pytest.mark.parametrize("rows", [1, 8, 16])
+def test_moe_tail_combines_projects_and_closes_the_layer_on_two_gpus(
+    rows: int, present, tmp_path
+):
+    """As :func:`test_moe_tail_combines_projects_and_closes_the_layer` with
+    the production rank programs ``present`` on two GPUs, in a zero-shard
+    model whose six other ranks put exactly zero (the host writes it): the
+    combined row, h'' and the next input against the reference, and the
+    absent ranks' columns stay zero. Two non-zero terms per sum cannot check
+    the rank order of an eight-rank sum (see muse_spark_standins)."""
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires 2 GPUs")
+    _spawn(rows, rows, tmp_path, present)
 
 
 def test_ffn_words_past_8_rows_match_the_tagged_pairs(tmp_path):
@@ -323,9 +380,29 @@ def test_ffn_words_past_8_rows_match_the_tagged_pairs(tmp_path):
     assert moe_tail.ffn_words(16) and not moe_tail.ffn_words(8)
     (tmp_path / "pairs").mkdir()
     (tmp_path / "words").mkdir()
-    _spawn(8, 8, tmp_path / "pairs")
-    _spawn(16, 8, tmp_path / "words")
+    _spawn(8, 8, tmp_path / "pairs", None)
+    _spawn(16, 8, tmp_path / "words", None)
     for rank in range(WORLD):
+        for launch in range(2):
+            name = f"rank{rank}-launch{launch}.pt"
+            pairs = torch.load(tmp_path / "pairs" / name)
+            words = torch.load(tmp_path / "words" / name)
+            for got, want in zip(words, pairs):
+                assert torch.equal(got, torch.cat([want, want])), (rank, launch)
+
+
+@pytest.mark.parametrize("present", standins.PAIRS, ids=standins.PAIR_IDS)
+def test_ffn_words_past_8_rows_match_the_tagged_pairs_on_two_gpus(present, tmp_path):
+    """As :func:`test_ffn_words_past_8_rows_match_the_tagged_pairs` with the
+    production rank programs ``present`` on two GPUs (zero-shard model):
+    two requests of the same 8 rows give each row the 8-row launch's bits."""
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires 2 GPUs")
+    (tmp_path / "pairs").mkdir()
+    (tmp_path / "words").mkdir()
+    _spawn(8, 8, tmp_path / "pairs", present)
+    _spawn(16, 8, tmp_path / "words", present)
+    for rank in present:
         for launch in range(2):
             name = f"rank{rank}-launch{launch}.pt"
             pairs = torch.load(tmp_path / "pairs" / name)
