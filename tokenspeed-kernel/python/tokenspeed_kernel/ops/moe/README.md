@@ -264,9 +264,12 @@ tile 32. FlashInfer tunes on balanced routes, about nine tokens per expert at
 rows, and tiles of 8 or 16 tokens re-read their weights for every tile. Over
 16 serving routings per size on GB300, tile 32 takes 171.5 us at 256 rows
 (tile 8: 218.5 us) and 222.9 us at 512 rows (tile 16: 249.8 us); outputs are
-bitwise identical across tiles. The 128-token bucket measured no faster with
-tile 32 in serving, and tile 64 leads from 768 rows, so other buckets keep the
-full tuner.
+bitwise identical across tiles. Prefill chunks in these buckets see the same
+skew: rows drawn independently from serving routings put up to 120 of 256 rows
+on one expert, and tile 32 takes 157.4 us at 256 rows (tile 16: 164.7 us, tile
+8: 205.0 us) and 209.0 us at 512 rows (tile 16: 235.9 us). The 128-token bucket
+measured no faster with tile 32 in serving, and tile 64 leads from 768 rows, so
+other buckets keep the full tuner.
 
 ### NVFP4 squared ReLU
 
