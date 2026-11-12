@@ -151,7 +151,7 @@ def _half_block_stage(mb, task, w, a, a_stride, FIRST: gl.constexpr, N: gl.const
 
 
 @gluon.jit
-def _put_rows(mb, region: gl.constexpr, out, at, row_half=None):
+def _put_rows(mb, region: gl.constexpr, out, at, row_half):
     """Put the 16 partial sums of every row of ``out`` (FP32 ``[RP, 16]``)
     at ``at`` of each row's copy of ``region``, in one put. The put goes out
     from a blocked layout that holds each value in few lanes: the GEMV
@@ -167,7 +167,8 @@ def _put_rows(mb, region: gl.constexpr, out, at, row_half=None):
     i = gl.arange(0, 16, gl.SliceLayout(0, cl))[None, :]
     # The padding rows repeat the last row; the mask skips their stores.
     # (i >= 0) is always true: it broadcasts the row mask to the tile's shape.
-    # ``row_half`` (a half-block task's rows: 0 or 1) keeps those 8 sums.
+    # ``row_half``: None puts all 16 sums of a whole-block task; 0 or 1 (a
+    # half-block task's rows) keeps those 8 sums.
     keep = (i >= 0) if row_half is None else ((i // 8) == row_half)
     mb.put(
         region,
@@ -190,7 +191,7 @@ def qkvg_stage(mb, task, w, a, a_stride, STAGE: gl.constexpr):
     mb.stamp(STAGE, trace.START)
     out, at = _block_stage(mb, task, w, a, a_stride, 0, GATE_ROW)
     mb.stamp(STAGE, trace.COMPUTED)
-    _put_rows(mb, "qkvg", out, at)
+    _put_rows(mb, "qkvg", out, at, None)
     mb.stamp(STAGE, trace.END)
 
 
@@ -210,7 +211,7 @@ def gate_stage(mb, task, w, a, a_stride, STAGE: gl.constexpr):
     else:
         out, at = _block_stage(mb, task, w, a, a_stride, QKV_BLOCKS, QKVG - GATE_ROW)
         mb.stamp(STAGE, trace.COMPUTED)
-        _put_rows(mb, "gate", out, at)
+        _put_rows(mb, "gate", out, at, None)
     mb.stamp(STAGE, trace.END)
 
 
