@@ -14,8 +14,11 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  lint:
+  changes:
     runs-on: ubuntu-latest
+    outputs:
+      scheduler_cpp: ${{ steps.scheduler_cpp_changes.outputs.changed }}
+      pre_commit_skip: ${{ steps.scheduler_cpp_changes.outputs.pre_commit_skip }}
     steps:
       - uses: actions/checkout@v2
 
@@ -65,6 +68,12 @@ jobs:
             echo "pre_commit_skip=$pre_commit_skip"
           } >> "$GITHUB_OUTPUT"
 
+  lint:
+    needs: changes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
@@ -72,7 +81,7 @@ jobs:
 
       - name: Install pre-commit hook
         run: |
-          python -m pip install pre-commit ruff "nanobind>=2.13.0" tokenspeed-spdlog==1.15.1
+          python -m pip install pre-commit ruff
           pre-commit install
 
       # Hook environments and black's per-file cache; main refreshes them for PRs.
@@ -87,7 +96,7 @@ jobs:
 
       - name: Linting
         env:
-          SKIP: ${{ steps.scheduler_cpp_changes.outputs.pre_commit_skip }}
+          SKIP: ${{ needs.changes.outputs.pre_commit_skip }}
         run: pre-commit run --all-files
 
       - name: Save pre-commit cache
@@ -109,21 +118,6 @@ jobs:
         run: |
           python -m pip install "pytest>=9" packaging cryptography pyyaml
           python -m pytest -q test/ci_system/test_weekly_release.py test/ci_system/test_engine_release.py test/ci_system/test_nightly_release.py
-
-      - name: Install scheduler C++ lint tools
-        if: steps.scheduler_cpp_changes.outputs.changed == 'true'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang-format clang-tools cmake ninja-build
-
-      - name: Configure scheduler compile database
-        if: steps.scheduler_cpp_changes.outputs.changed == 'true'
-        run: |
-          cmake -S tokenspeed-scheduler -B tokenspeed-scheduler/build \
-            -G Ninja \
-            -DTOKENSPEED_SCHEDULER_BUILD_TESTS=ON \
-            -DTOKENSPEED_SCHEDULER_BUILD_PYTHON=ON \
-            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 
       - name: Lint scheduler Python and file starts
         run: |
@@ -154,25 +148,47 @@ jobs:
               raise SystemExit("\n\n".join(errors))
           PY
 
-      - name: Lint scheduler C++
-        if: steps.scheduler_cpp_changes.outputs.changed == 'true'
+  # Sharded so the syntax check fits in the lint job's wall time; the
+  # pre-commit clang-format hook in the lint job checks formatting.
+  scheduler-cpp:
+    needs: changes
+    if: needs.changes.outputs.scheduler_cpp == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        shard: [0, 1, 2]
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+
+      - name: Install scheduler C++ lint tools
         run: |
-          cpp_files="$(git ls-files tokenspeed-scheduler | grep -E '\.(c|cc|cpp|cxx|h|hh|hpp|hxx)$')"
-          jobs="$(nproc)"
-          tu_files="$(printf '%s\n' "$cpp_files" | grep -E '\.(c|cc|cpp|cxx)$' || true)"
-          format_count="$(printf '%s\n' "$cpp_files" | sed '/^$/d' | wc -l)"
-          tu_count="$(printf '%s\n' "$tu_files" | sed '/^$/d' | wc -l)"
+          python -m pip install "nanobind>=2.13.0" tokenspeed-spdlog==1.15.1
+          sudo apt-get update
+          sudo apt-get install -y clang-tools cmake ninja-build
 
-          echo "Running clang-format on ${format_count} files with ${jobs} workers"
-          printf '%s\n' "$cpp_files" | xargs -r -n 16 -P "$jobs" sh -c '
-            echo "clang-format: $*"
-            clang-format --dry-run --Werror "$@"
-          ' sh
+      - name: Configure scheduler compile database
+        run: |
+          cmake -S tokenspeed-scheduler -B tokenspeed-scheduler/build \
+            -G Ninja \
+            -DTOKENSPEED_SCHEDULER_BUILD_TESTS=ON \
+            -DTOKENSPEED_SCHEDULER_BUILD_PYTHON=ON \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 
-          # Syntax-only: clang-tidy's default static analyzer took ~1h and its
-          # warnings never failed the job.
-          echo "Running clang-check on ${tu_count} translation units with ${jobs} workers"
-          printf '%s\n' "$tu_files" | xargs -r -n 1 -P "$jobs" sh -c '
-            echo "clang-check: $1"
-            clang-check -p tokenspeed-scheduler/build "$1"
-          ' sh
+      # Syntax-only: clang-tidy's default static analyzer took ~1h and its
+      # warnings never failed the job.
+      - name: Check scheduler C++ translation units
+        env:
+          SHARD: ${{ matrix.shard }}
+          SHARDS: 3
+        run: |
+          git ls-files tokenspeed-scheduler | grep -E '\.(c|cc|cpp|cxx)$' |
+            awk -v shard="$SHARD" -v shards="$SHARDS" 'NR % shards == shard' |
+            xargs -r -n 1 -P "$(nproc)" sh -c '
+              echo "clang-check: $1"
+              clang-check -p tokenspeed-scheduler/build "$1"
+            ' sh
