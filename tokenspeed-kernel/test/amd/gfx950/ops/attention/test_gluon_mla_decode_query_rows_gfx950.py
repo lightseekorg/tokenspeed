@@ -126,8 +126,17 @@ def test_matches_fp32_softmax(lengths, heads, q_dtype, kv_dtype):
 
 @pytest.mark.parametrize("q_dtype", [torch.bfloat16, _FP8])
 @pytest.mark.parametrize("splits", [1, 3, 7, 32, 128])
-def test_every_split_count_merges_alike(splits, q_dtype, monkeypatch):
-    q, kv, table, row_lengths = _inputs([[9000, 9001], [70, 4000]], 96, q_dtype, seed=3)
+@pytest.mark.parametrize(
+    "lengths",
+    [
+        [[9000, 9001], [70, 4000]],
+        # Chunks sized over the batch: a long request at the 64-chunk cap,
+        # an idle graph row and short requests.
+        [[30000, 30001], [0, 0], [70, 4000], [129, 130], [1, 2]],
+    ],
+)
+def test_every_split_count_merges_alike(lengths, splits, q_dtype, monkeypatch):
+    q, kv, table, row_lengths = _inputs(lengths, 96, q_dtype, seed=3)
     ref_out, ref_lse = _reference(q, kv, table, row_lengths)
     monkeypatch.setattr(decode, "_select_num_kv_splits_query_rows", lambda **_: splits)
     out, lse = decode.launch_gluon_mla_decode_query_rows_gfx950(
@@ -187,11 +196,16 @@ def test_split_count_fills_whole_waves():
 
 
 @pytest.mark.parametrize("q_dtype", [torch.bfloat16, _FP8])
-def test_large_pool_uses_safe_64_bit_addresses(q_dtype):
+@pytest.mark.parametrize(
+    "lengths",
+    [
+        [[2049, 2050, 2051], [130, 130, 131]],
+        [[2049, 2050, 2051], [130, 130, 131], [700, 701, 702]],
+    ],
+)
+def test_large_pool_uses_safe_64_bit_addresses(lengths, q_dtype):
     """Pages past the first 2^31 bytes of the pool read the right rows."""
-    q, kv, table, row_lengths = _inputs(
-        [[2049, 2050, 2051], [130, 130, 131]], 96, q_dtype, seed=5
-    )
+    q, kv, table, row_lengths = _inputs(lengths, 96, q_dtype, seed=5)
     pool_pages = 0x80000000 // (kv[0].numel() * kv.element_size()) + 1
     large_kv = torch.empty((pool_pages, *kv.shape[1:]), dtype=kv.dtype, device="cuda")
     large_kv[-kv.shape[0] :].copy_(kv)
@@ -226,7 +240,9 @@ def test_batch_and_table_width_reuse_one_binary(q_dtype, monkeypatch):
             q, kv, wide, row_lengths, _MAX_K, _SCALE, return_lse=True
         )
 
+    # A few requests split each one's KV, more split the batch's.
     run(2, 16, 0)
+    run(3, 16, 0)
     torch.cuda.synchronize()
     with assert_no_triton_compile(
         decode.gluon_mla_decode_query_rows_gfx950,

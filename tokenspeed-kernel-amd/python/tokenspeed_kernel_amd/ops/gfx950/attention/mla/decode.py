@@ -1649,6 +1649,12 @@ def _replicated_pair_layout(row_layout):
 
 _KV_REUSE_MIN_HISTORY = gl.constexpr(4096)
 _QUERY_ROW_TILE = gl.constexpr(64)
+# Query-row decode of 3 to 64 requests sizes its KV chunks over the batch
+# (four pages at least), a request taking up to 64 of them.
+_QUERY_ROWS_BALANCE_MIN_BATCH = 3
+_QUERY_ROWS_BALANCE_MAX_BATCH = 64
+_QUERY_ROWS_SPLIT_CAP = 64
+_QUERY_ROWS_MIN_SPLIT_PAGES = gl.constexpr(4)
 _QUERY_HEAD_TILE = gl.constexpr(16)
 _QUERY_VALUE_TILE = gl.constexpr(128)
 
@@ -2236,6 +2242,100 @@ def _reduce_splits(
             gl.store(FinalLSE + row, maximum + gl.log(denom))
 
 
+@gluon.constexpr_function
+def _query_rows_length_pad(queries):
+    return triton.next_power_of_2(queries)
+
+
+@gluon.jit
+def _query_rows_split_plan(
+    RowLengths,
+    batch,
+    work_target,
+    split_cap,
+    QLEN: gl.constexpr,
+    PAGE: gl.constexpr,
+    BATCH_PAD: gl.constexpr,
+):
+    """Cut every request's KV into chunks of one batch-wide page count, about
+    ``work_target`` chunks over the batch and at most ``split_cap`` for any
+    request, so a long request takes more workgroups rather than longer ones.
+    Returns the request indices, chunk pages, chunks per request and their
+    inclusive running sum (the end of each request's run of work items)."""
+    num_warps: gl.constexpr = gl.num_warps()
+    QLEN_PAD: gl.constexpr = _query_rows_length_pad(QLEN)
+    layout: gl.constexpr = gl.BlockedLayout(
+        [1, QLEN_PAD], [64, 1], [num_warps, 1], [1, 0]
+    )
+    requests = gl.arange(0, BATCH_PAD, layout=gl.SliceLayout(1, layout))
+    queries = gl.arange(0, QLEN_PAD, layout=gl.SliceLayout(0, layout))
+    lengths = gl.load(
+        RowLengths + requests[:, None] * QLEN + queries[None, :],
+        (requests[:, None] < batch) & (queries[None, :] < QLEN),
+        0,
+    )
+    pages = gl.cdiv(gl.max(lengths, 1), PAGE)
+    chunk = gl.maximum(
+        gl.cdiv(gl.sum(pages, 0), work_target), gl.cdiv(gl.max(pages, 0), split_cap)
+    )
+    chunk = gl.maximum(chunk, _QUERY_ROWS_MIN_SPLIT_PAGES)
+    counts = gl.cdiv(pages, chunk)
+    # Running sum over at most a few dozen requests as a masked row sum
+    # (a scan of this slice layout does not lower).
+    pair: gl.constexpr = gl.BlockedLayout([1, 1], [8, 8], [num_warps, 1], [1, 0])
+    mine = gl.arange(0, BATCH_PAD, layout=gl.SliceLayout(1, pair))
+    other = gl.arange(0, BATCH_PAD, layout=gl.SliceLayout(0, pair))
+    other_counts = gl.convert_layout(counts, gl.SliceLayout(0, pair))
+    ends = gl.sum(
+        gl.where(other[None, :] <= mine[:, None], other_counts[None, :], 0), 1
+    )
+    return mine, chunk, gl.convert_layout(counts, gl.SliceLayout(1, pair)), ends
+
+
+@gluon.jit
+def _reduce_split_items(
+    Partials,
+    LSE,
+    Output,
+    FinalLSE,
+    row,
+    first,
+    count,
+    REDUCE_SPLITS: gl.constexpr,
+    RETURN_LSE: gl.constexpr,
+):
+    # A row's partials are consecutive, one per work item of its request,
+    # merged REDUCE_SPLITS at a time; each thread merges its own columns.
+    layout: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [1, 4], [1, 0])
+    s = gl.arange(0, REDUCE_SPLITS, layout=gl.SliceLayout(1, layout))
+    d = gl.arange(0, 512, layout=gl.SliceLayout(0, layout))
+    maximum = gl.max(
+        gl.full([REDUCE_SPLITS], -float("inf"), gl.float32, s.type.layout), 0
+    )
+    denom = gl.sum(gl.zeros([REDUCE_SPLITS], gl.float32, s.type.layout), 0)
+    result = gl.zeros([512], gl.float32, d.type.layout)
+    for base in range(0, count, REDUCE_SPLITS):
+        partial_row = first + base + s
+        lse = gl.load(LSE + partial_row, base + s < count, -float("inf"))
+        valid = lse != -float("inf")
+        next_max = gl.maximum(maximum, gl.max(lse, 0))
+        safe_max = gl.where(next_max == -float("inf"), 0.0, next_max)
+        alpha = gl.exp2((maximum - safe_max) * _INV_LN2)
+        weights = gl.exp2((lse - safe_max) * _INV_LN2)
+        values = gl.load(
+            Partials + partial_row[:, None].to(gl.int64) * 512 + d[None, :],
+            valid[:, None],
+            0.0,
+        ).to(gl.float32)
+        result = result * alpha + gl.sum(values * weights[:, None], 0)
+        denom = denom * alpha + gl.sum(weights, 0)
+        maximum = next_max
+    gl.store(Output + row * 512 + d, gl.where(denom > 0, result / denom, 0.0))
+
+    if RETURN_LSE:
+        gl.store(FinalLSE + row, maximum + gl.log(denom))
+
+
 @gluon.jit
 def _compute_pv_bf16(
     buffer,
@@ -2255,7 +2355,7 @@ def _compute_pv_bf16(
 
 @gluon.jit(
     launch_metadata=_launch_metadata,
-    do_not_specialize=["stride_page", "splits"],
+    do_not_specialize=["stride_page", "splits", "batch", "work_target"],
 )
 def gluon_mla_decode_query_rows_gfx950(
     Q,
@@ -2276,17 +2376,43 @@ def gluon_mla_decode_query_rows_gfx950(
     SPLIT_BUCKET: gl.constexpr,
     FP8_Q: gl.constexpr,
     sm_scale,
+    batch,
+    work_target,
+    Runs,
+    BATCH_PAD: gl.constexpr,
 ):
     # 64 (query, head) rows of one request share each FP8 KV tile; every row
     # stops at its own visible length. FP8 queries keep the FP8 MFMA and the
     # scaled FP8 probabilities of the query-block kernel; BF16 queries widen
     # the tile to BF16 in registers.
+    #
+    # With BATCH_PAD, programs (i, group, j) take work item j * grid[0] + i,
+    # one batch-wide chunk of one request's KV (see _query_rows_split_plan),
+    # and partials are stored per item; otherwise programs (request, group,
+    # split) take `splits` equal parts of the request's own KV. Either way a
+    # chunk's row groups are grid[0], a multiple of the XCD count, apart:
+    # they share the XCD's L2 while running together.
     M: gl.constexpr = _QUERY_ROW_TILE
     N: gl.constexpr = 64
     K_WIDTH: gl.constexpr = 16 if FP8_Q else 8
-    request = gl.program_id(0)
-    group = gl.program_id(1)
-    split = gl.program_id(2)
+    if BATCH_PAD:
+        group = gl.program_id(1)
+        item = gl.program_id(2) * gl.num_programs(0) + gl.program_id(0)
+        requests, pages_per_split, counts, ends = _query_rows_split_plan(
+            RowLengths, batch, work_target, splits, QLEN, PAGE, BATCH_PAD
+        )
+        request = gl.sum((ends <= item).to(gl.int32), 0)
+        split = item - gl.sum(gl.where(requests == request, ends - counts, 0), 0)
+        has_work = request < batch
+        if (group == 0) & (item == 0):
+            # The reduce reads each request's run of items from here.
+            gl.store(Runs + 2 * requests, ends - counts, requests < batch)
+            gl.store(Runs + 2 * requests + 1, counts, requests < batch)
+    else:
+        request = gl.program_id(0)
+        group = gl.program_id(1)
+        split = gl.program_id(2)
+        has_work = request >= 0
 
     mfma: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
@@ -2307,7 +2433,7 @@ def gluon_mla_decode_query_rows_gfx950(
     d = gl.arange(0, 512, layout=gl.SliceLayout(0, load_layout))
     dpe = gl.arange(0, 64, layout=gl.SliceLayout(0, load_layout))
     q_offset = request * STRIDE_Q_B + query * STRIDE_Q_S + head * STRIDE_Q_H
-    q_mask = query < QLEN
+    q_mask = (query < QLEN) & has_work
     q = gl.load(Q + q_offset[:, None] + d[None, :], q_mask[:, None], 0.0)
     qpe = gl.load(Q + q_offset[:, None] + 512 + dpe[None, :], q_mask[:, None], 0.0)
     q = gl.convert_layout(q, a_layout)
@@ -2316,10 +2442,11 @@ def gluon_mla_decode_query_rows_gfx950(
     m_acc = gl.arange(0, M, layout=gl.SliceLayout(1, mfma))
     query_acc = (group * M + m_acc) // H
     head_acc = (group * M + m_acc) % H
-    valid = query_acc < QLEN
+    valid = (query_acc < QLEN) & has_work
     visible = gl.load(RowLengths + request * QLEN + query_acc, valid, 0)
     length = gl.max(visible, 0)
-    pages_per_split = gl.cdiv(gl.cdiv(length, PAGE), splits)
+    if not BATCH_PAD:
+        pages_per_split = gl.cdiv(gl.cdiv(length, PAGE), splits)
     first = split * pages_per_split * PAGE
     end = gl.minimum((split + 1) * pages_per_split * PAGE, length)
 
@@ -2508,8 +2635,12 @@ def gluon_mla_decode_query_rows_gfx950(
             )
         current = other
 
-    row = (request * QLEN + query_acc) * H + head_acc
-    partial_row = row * SPLIT_BUCKET + split
+    if BATCH_PAD:
+        items = gl.num_programs(0) * gl.num_programs(2)
+        partial_row = (group * M + m_acc) * items + item
+    else:
+        row = (request * QLEN + query_acc) * H + head_acc
+        partial_row = row * SPLIT_BUCKET + split
     denominator = gl.convert_layout(gl.sum(denominator, 1), gl.SliceLayout(1, mfma))
     reciprocal = gl.where(denominator > 0, 1.0 / denominator, 0.0)
     if FP8_Q:
@@ -2522,7 +2653,7 @@ def gluon_mla_decode_query_rows_gfx950(
     gl.store(LSE + partial_row, maximum + gl.log(denominator), valid)
 
 
-@gluon.jit(launch_metadata=_launch_metadata, do_not_specialize=["splits"])
+@gluon.jit(launch_metadata=_launch_metadata, do_not_specialize=["splits", "items"])
 def gluon_mla_decode_query_rows_reduce_gfx950(
     Partials,
     LSE,
@@ -2531,20 +2662,40 @@ def gluon_mla_decode_query_rows_reduce_gfx950(
     splits,
     SPLIT_BUCKET: gl.constexpr,
     RETURN_LSE: gl.constexpr,
+    Runs,
+    items,
+    H: gl.constexpr,
+    QLEN: gl.constexpr,
+    BATCH_PAD: gl.constexpr,
 ):
-    _reduce_splits(
-        Partials,
-        LSE,
-        Output,
-        FinalLSE,
-        gl.program_id(0),
-        gl.program_id(1),
-        splits=splits,
-        SPLIT_STRIDE=SPLIT_BUCKET,
-        REDUCE_SPLITS=SPLIT_BUCKET,
-        VALUE_TILE=_QUERY_VALUE_TILE,
-        RETURN_LSE=RETURN_LSE,
-    )
+    row = gl.program_id(0)
+    if BATCH_PAD:
+        request = row // (QLEN * H)
+        _reduce_split_items(
+            Partials,
+            LSE,
+            Output,
+            FinalLSE,
+            row,
+            row % (QLEN * H) * items + gl.load(Runs + 2 * request),
+            gl.load(Runs + 2 * request + 1),
+            REDUCE_SPLITS=SPLIT_BUCKET,
+            RETURN_LSE=RETURN_LSE,
+        )
+    else:
+        _reduce_splits(
+            Partials,
+            LSE,
+            Output,
+            FinalLSE,
+            row,
+            gl.program_id(1),
+            splits=splits,
+            SPLIT_STRIDE=SPLIT_BUCKET,
+            REDUCE_SPLITS=SPLIT_BUCKET,
+            VALUE_TILE=_QUERY_VALUE_TILE,
+            RETURN_LSE=RETURN_LSE,
+        )
 
 
 _WAVE_WORKGROUPS = 256
@@ -3518,14 +3669,39 @@ def launch_gluon_mla_decode_query_rows_gfx950(
     splits = _select_num_kv_splits_query_rows(
         batch=batch, row_tiles=row_tiles, max_seqlen_k=max_seqlen_k
     )
-    split_bucket = triton.next_power_of_2(splits)
-    partials = torch.empty(
-        (batch * width * heads, split_bucket, 512),
-        device=q.device,
-        dtype=torch.bfloat16,
-    )
+    if _QUERY_ROWS_BALANCE_MIN_BATCH <= batch <= _QUERY_ROWS_BALANCE_MAX_BATCH:
+        # Requests' lengths differ (agentic contexts by 3x and more), so the
+        # chunks are sized over the batch: an even split takes batch * splits
+        # chunks, and rounding up each request's last chunk adds at most one
+        # item per request. The reduce merges a request's items a fair share
+        # at a time, and one binary serves each bucket of batch sizes.
+        work_target = batch * splits
+        main_bucket = 1
+        split_bucket = min(16, triton.next_power_of_2(splits))
+        splits = min(_QUERY_ROWS_SPLIT_CAP, work_target)
+        block = triton.cdiv(batch, _NUM_XCDS) * _NUM_XCDS
+        item_blocks = triton.cdiv(work_target + batch, block)
+        items = block * item_blocks
+        batch_pad = 16 if batch <= 16 else _QUERY_ROWS_BALANCE_MAX_BATCH
+        grid = (block, row_tiles, item_blocks)
+        reduce_grid = (batch * width * heads, 1)
+        partials = torch.empty(
+            (width * heads * items, 512), device=q.device, dtype=torch.bfloat16
+        )
+        runs = torch.empty((batch, 2), device=q.device, dtype=torch.int32)
+    else:
+        work_target = items = batch_pad = 0
+        main_bucket = split_bucket = triton.next_power_of_2(splits)
+        grid = (batch, row_tiles, splits)
+        reduce_grid = (batch * width * heads, 512 // _QUERY_VALUE_TILE.value)
+        partials = torch.empty(
+            (batch * width * heads, split_bucket, 512),
+            device=q.device,
+            dtype=torch.bfloat16,
+        )
+        runs = row_lengths
     lse = torch.empty(partials.shape[:-1], device=q.device, dtype=torch.float32)
-    gluon_mla_decode_query_rows_gfx950[(batch, row_tiles, splits)](
+    gluon_mla_decode_query_rows_gfx950[grid](
         q,
         kv_cache,
         page_table,
@@ -3541,14 +3717,16 @@ def launch_gluon_mla_decode_query_rows_gfx950(
         width,
         64,
         splits,
-        split_bucket,
+        main_bucket,
         fp8_q,
         softmax_scale,
+        batch,
+        work_target,
+        runs,
+        batch_pad,
         num_warps=4,
     )
-    gluon_mla_decode_query_rows_reduce_gfx950[
-        (batch * width * heads, 512 // _QUERY_VALUE_TILE.value)
-    ](
+    gluon_mla_decode_query_rows_reduce_gfx950[reduce_grid](
         partials,
         lse,
         out,
@@ -3556,6 +3734,11 @@ def launch_gluon_mla_decode_query_rows_gfx950(
         splits,
         split_bucket,
         return_lse,
+        runs,
+        items,
+        heads,
+        width,
+        batch_pad,
         num_warps=4,
     )
     return (out, final_lse) if return_lse else out
