@@ -154,7 +154,7 @@ PYTHONPATH="${PWD}/python:${PWD}/tokenspeed-kernel/python:${PWD}/tokenspeed-kern
 ### DSA/MLA Prefill transport
 
 Prefill uses official HCCL collectives and the `flash_ops`
-`custom::dsa_cp_patch` ACLNN adapter. The transport owns an isolated HCCL group
+`custom::dsa_cp_patch` ACLNN adapter. The transport uses an isolated HCCL group
 for cache owners, with no additional user-managed communication stream.
 Synchronous submissions order HCCL's internal stream before subsequent work
 on the fixed execution stream; they need no application-owned Work handles.
@@ -170,34 +170,12 @@ Cache inputs accept contiguous `[rows,width]` and `[rows,1,width]`.
 
 Receive planes, packets, and commit slots are temporary. Prefetch may be called
 at KDA; the attention entry ensures it was submitted once for the same batch
-and layer. Concurrent consumption by another batch/layer is rejected. Temporary
-buffers and transient forward inputs are allocated and consumed on the caller
-stream, so the caching allocator's same-stream reuse order preserves their
-storage. Persistent cache and router buffers remain held by their owners.
-`finish` releases references after the final queued consumer. `close` clears
-references without synchronizing or destroying the manager-owned collective
-group. The transport records its peak owned buffer bytes; serving acceptance also measures device
-allocation/reservation peaks. `chunk_prefill_kv_size` only controls scheduler
-admission and never enables transport or fixes its buffer size.
-
-Prefill relies on one caller execution stream to order gather, patch and
-attention consumers. HCCL establishes dependencies with its internal stream;
-the transport does not establish dependencies between different caller
-streams. The helper adds no `record_stream` calls on the caller stream;
-HCCL retains responsibility for its internal communication streams. `finish`
-releases references after queueing consumers; it does not synchronize the device.
-
-The caller owns this ordering. `ModelExecutor` runs serving forwards inside
-its persistent `execution_stream` context, and `ModelExecutor.autotune()`
-synchronizes the device before serving starts. Warmup may therefore use a
-different stream even when the same transport survives startup. The transport
-does not bind or compare stream identities and needs no warmup phase flag.
-It stores no caller stream. `close()` only clears transport references;
-the owners of the cache arena and process groups manage completion before
-replacing or destroying those resources. The production close calls come
-from cache-pool publication: the first bind has no old transport, and a
-startup rebind follows warmup synchronization. Concurrent use of one transport
-is unsupported.
+and layer. Concurrent consumption by another batch/layer is rejected. `finish`
+and `close` release temporary references without synchronizing; the runtime
+manager owns the collective group. The transport records its peak owned buffer
+bytes; serving acceptance also measures device allocation/reservation peaks.
+`chunk_prefill_kv_size` only controls scheduler admission and never enables
+transport or fixes its buffer size.
 
 Run `test/test_mla_cp_transport.py` with `torchrun` and an explicit `TEST_OUTPUT`
 directory. It covers compact shared history pages, empty/uneven owners, both

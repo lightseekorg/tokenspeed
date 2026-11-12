@@ -29,13 +29,8 @@ class AscendDSAPrefill:
     """Temporary KV/Indexer-K gathers on the caller's execution stream.
 
     History and current rows each use one collective. DSA packs both cache
-    planes into the same packet; MLA supplies only KV. The synchronous HCCL
-    API orders its internal stream before consumers on the execution stream.
-    Gather, patch and attention rely on that execution stream's queue order;
-    the transport does not insert dependencies between caller streams.
-    Temporary buffers and TS forward inputs use that same allocation stream;
-    cache and router owners retain persistent inputs.
-    No transport workspace is kept between layers.
+    planes into the same packet; MLA supplies only KV. Temporary buffers are
+    released at finish; no workspace is kept between layers.
     """
 
     def __init__(
