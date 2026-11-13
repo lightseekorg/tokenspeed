@@ -79,3 +79,14 @@ With five draft tokens, the layout supports up to 682 requests per attention
 rank. Serving, memory and CUDA Graph limits still apply. Unsupported layouts
 raise an error; there is no production PyTorch fallback. A PyTorch reference
 is retained only in tests.
+
+
+## Capture and startup overhead
+
+Capacities span local batch B to B*W in steps of min(B,16), including full
+capacity. B=256, W=6 adds 80 short graphs per sampling variant; DP8 client
+concurrency 256 normally corresponds to local B=32, not 256.
+Each uncached eligible (batch, capacity, context) uses two warmup and eight
+measured replays. Extra captures consume startup time and graph memory.
+A compatible cost cache avoids profiling, not graph capture. Actual time
+and memory depend on model, hardware and the configured capture ladder.
