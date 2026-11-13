@@ -758,6 +758,9 @@ def load_qwen4_exp_weights(
             loader = getattr(params[name], "weight_loader", default_weight_loader)
             loader(params[name], loaded_weight)
             loaded.add(name)
+    for owner in module.modules():
+        if isinstance(owner, Qwen4ExpNGramEmbedding):
+            owner.lookup.finish_loading()
     return loaded
 
 

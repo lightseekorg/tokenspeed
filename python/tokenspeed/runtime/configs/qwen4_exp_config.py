@@ -57,7 +57,7 @@ class Qwen4ExpTextConfig(Qwen3_5TextConfig):
         ple_embed_dim: int | None = None,
         ple_conv_kernel_size: int = 4,
         ple_embed_dtype: str | None = None,
-        ple_offload_embedding: bool | None = None,
+        ple_offload_embedding: bool | str | None = None,
         ngram_size: int = 3,
         heads_per_ngram: int = 8,
         ngram_vocab_size_base: int = 20_000_000,
@@ -92,11 +92,18 @@ class Qwen4ExpTextConfig(Qwen3_5TextConfig):
         # let the gather kernel read it over PCIe/C2C. The table scales with
         # ngram_vocab_size_base and does not fit in device memory at production
         # sizes; host residency trades interconnect bandwidth for capacity.
-        self.ple_offload_embedding = (
-            torch.cuda.is_available() and torch.version.cuda is not None
-            if ple_offload_embedding is None
-            else bool(ple_offload_embedding)
-        )
+        if isinstance(ple_offload_embedding, str):
+            if ple_offload_embedding not in ("auto", "shm", "cuda_vmm"):
+                raise ValueError(
+                    "PLE shared offloading requires auto, shm, or cuda_vmm"
+                )
+            self.ple_offload_embedding = ple_offload_embedding
+        else:
+            self.ple_offload_embedding = (
+                torch.cuda.is_available() and torch.version.cuda is not None
+                if ple_offload_embedding is None
+                else bool(ple_offload_embedding)
+            )
         self.ngram_size = int(ngram_size)
         self.heads_per_ngram = int(heads_per_ngram)
         self.ngram_vocab_size_base = int(ngram_vocab_size_base)
