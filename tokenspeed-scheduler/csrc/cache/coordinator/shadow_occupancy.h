@@ -20,13 +20,16 @@
 
 #pragma once
 
+#include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory_resource>
 #include <span>
-#include <unordered_map>
 #include <vector>
 
 #include "cache/cache_group.h"
+#include "cache/coordinator/parent_occupancy.h"
 #include "cache/core/block_pool.h"
 #include "cache/core/cache_block_ref.h"
 #include "utils.h"
@@ -59,9 +62,8 @@ public:
     // bucket owned packing / shard_count of them.
     void Remove(std::uint32_t group_id, CacheBlockLocation location) {
         _assert(pool_.BoundGroup(location.lcm_block_id) == group_id, "a released location belongs to another group");
-        auto it =
-            remaining_occupied_.try_emplace(location.lcm_block_id, pool_.OccupiedCount(location.lcm_block_id)).first;
-        std::int32_t& occupied = it->second;
+        std::int32_t& occupied =
+            remaining_occupied_.GetOrInsert(location.lcm_block_id, pool_.OccupiedCount(location.lcm_block_id));
         _assert(occupied > 0, "the shadow released the same location twice");
         const GroupAllocator& allocator = groups_[group_id].Allocator();
         std::vector<std::int64_t>& holes = holes_by_bucket_[group_id];
@@ -81,9 +83,9 @@ public:
     }
 
     void Restore(std::uint32_t group_id, CacheBlockLocation location) {
-        auto it = remaining_occupied_.find(location.lcm_block_id);
-        _assert(it != remaining_occupied_.end(), "a restored location has no shadow occupancy");
-        std::int32_t& occupied = it->second;
+        auto* count = remaining_occupied_.Find(location.lcm_block_id);
+        _assert(count != nullptr, "a restored location has no shadow occupancy");
+        std::int32_t& occupied = *count;
         const GroupAllocator& allocator = groups_[group_id].Allocator();
         const std::int32_t slots = pool_.Packing(group_id);
         std::vector<std::int64_t>& holes = holes_by_bucket_[group_id];
@@ -112,6 +114,19 @@ public:
     // parents times packing.
     bool Fits(std::span<const std::vector<std::int64_t>> need_by_bucket, std::span<const std::int64_t> dense_need,
               std::span<const std::int64_t> pair_need) const {
+        return ParentShortfall(need_by_bucket, dense_need, pair_need) == 0;
+    }
+
+    // The empty parents the demand needs beyond those the shadow has: zero
+    // exactly when it fits. A Remove lowers it by at most one. It either adds
+    // one hole, which shortens any bucket's and the total shortfall by at
+    // most one block, or it empties its parent: one more empty parent, and
+    // only holes leave. With pairs too, as NextPairBucket's buckets need the
+    // fewest parents of any choice. So a demand short by n parents cannot fit
+    // before n more Removes, and a planner need not ask again before then.
+    std::int64_t ParentShortfall(std::span<const std::vector<std::int64_t>> need_by_bucket,
+                                 std::span<const std::int64_t> dense_need,
+                                 std::span<const std::int64_t> pair_need) const {
         _assert(need_by_bucket.size() == groups_.size() && dense_need.size() == groups_.size() &&
                     pair_need.size() == groups_.size(),
                 "a shadow fit takes one demand per group");
@@ -124,7 +139,7 @@ public:
                 ParentsNeededForBucketsAndPairs(need_by_bucket[i], holes_by_bucket_[i], dense_need[i], pair_need[i],
                                                 pool_.Packing(static_cast<std::uint32_t>(i)), scratch);
         }
-        return parents_needed <= empty_parent_count_;
+        return std::max<std::int64_t>(parents_needed - empty_parent_count_, 0);
     }
 
     // Group i's holes per bucket as the tentative victims would leave them.
@@ -135,9 +150,15 @@ public:
 private:
     const BlockPool& pool_;
     std::span<const CacheGroup> groups_;
+    // Holds remaining_occupied_'s slots until the shadow dies, first in the
+    // shadow's own raw buffer (left uninitialized: only the arena writes it),
+    // so a plan touching few parents calls no allocator.
+    static constexpr std::size_t kInlineScratchBytes = 4 * 1024;
+    alignas(std::max_align_t) std::array<std::byte, kInlineScratchBytes> scratch_buffer_;
+    std::pmr::monotonic_buffer_resource scratch_{scratch_buffer_.data(), scratch_buffer_.size()};
     // Occupants left per parent a Remove touched; untouched parents keep the
     // pool's own count.
-    std::unordered_map<std::int32_t, std::int32_t> remaining_occupied_;
+    ParentOccupancy remaining_occupied_{&scratch_};
     std::vector<std::vector<std::int64_t>> holes_by_bucket_;
     std::int64_t empty_parent_count_{0};
     // The demand with a fit's pairs in place, as wide as the widest group's

@@ -502,6 +502,7 @@ def test_the_drafters_own_pool_is_declared_captured_and_labelled() -> None:
     drafter = SimpleNamespace(
         captures_prefill_graph=True,
         capture_prefill_graph=lambda _stream, observer: seen.append(observer),
+        extend_graph_plan=lambda token_buckets, request_counts: {},
     )
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.device = "cuda"
@@ -518,6 +519,7 @@ def test_the_drafters_own_pool_is_declared_captured_and_labelled() -> None:
 
     executor.prefill_graph = SimpleNamespace(
         disable=False,
+        capture_buckets=[16],
         capture_ladders=lambda entries: {"prefill": _top(4, entries)},
         capture=lambda *a, **k: None,
     )
@@ -626,13 +628,14 @@ def test_the_drafter_extend_graphs_are_declared_captured_and_labelled() -> None:
     capture.prepare_batch(48, 2)
     assert dummies == [(48, 2, "draft backend")]
 
-    # Without the switch nothing is declared or captured.
+    # Without the switch only the decode steps are declared and captured.
     seen.clear()
     executor.config.enable_drafter_prefill_graph = False
-    assert set(_ladders(executor, 5)) == {"prefill"}
+    assert set(_ladders(executor, 5)) == {"prefill", "prefill:drafter-decode"}
     with mock.patch.object(model_executor, "workspace_pool", lambda _d: mock.Mock()):
         ModelExecutor.capture_graphs(executor, entries=None, observer=observer)
-    assert seen == []
+    [(capture, _)] = seen
+    assert capture.plan == {"prefill:drafter-decode": [(2, 2), (1, 1)]}
 
 
 def test_the_boot_step_measures_releases_rebuilds_then_publishes() -> None:

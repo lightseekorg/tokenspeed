@@ -295,27 +295,28 @@ def start_rust_host(
     preexec_fn = None
     if parent_death_signal:
         preexec_fn = functools.partial(set_parent_death_signal, os.getpid())
-    # Set each native writer's fallback before the host initializes logging.
-    level = server_args.log_level.lower()
-    host_env = os.environ.copy()
-    host_env.setdefault(
-        "TS_HOST_LOG",
-        {
-            "warning": "warn",
-            "critical": "error",
-            "fatal": "error",
-            "notset": "trace",
-        }.get(level, level),
-    )
-    host_env.setdefault(
-        "SPDLOG_LEVEL",
-        {
-            "warn": "warning",
-            "fatal": "critical",
-            "notset": "trace",
-        }.get(level, level),
-    )
     with start_context:
+        # Capture launch-context environment changes (notably allocator LD_PRELOAD).
+        # Set each native writer's fallback before the host initializes logging.
+        level = server_args.log_level.lower()
+        host_env = os.environ.copy()
+        host_env.setdefault(
+            "TS_HOST_LOG",
+            {
+                "warning": "warn",
+                "critical": "error",
+                "fatal": "error",
+                "notset": "trace",
+            }.get(level, level),
+        )
+        host_env.setdefault(
+            "SPDLOG_LEVEL",
+            {
+                "warn": "warning",
+                "fatal": "critical",
+                "notset": "trace",
+            }.get(level, level),
+        )
         popen = subprocess.Popen(
             [
                 (

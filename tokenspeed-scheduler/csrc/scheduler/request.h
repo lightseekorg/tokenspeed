@@ -75,9 +75,14 @@ public:
     // the request could not be readmitted at all. An undeclared budget
     // stays optimistic and relies on the victim policy to make progress.
     std::int32_t AdmissionHeadroom(std::int32_t safe_steps) const {
-        return std::min(RemainingNewTokens(), safe_steps * (1 + retraction_count_));
+        return static_cast<std::int32_t>(std::min<std::int64_t>(RemainingNewTokens(), escalatedWindows(safe_steps)));
     }
-    void NoteRetracted() { ++retraction_count_; }
+    // Saturates rather than wraps; by then the windows cover any budget.
+    void NoteRetracted() {
+        if (retraction_count_ < std::numeric_limits<std::int32_t>::max()) {
+            ++retraction_count_;
+        }
+    }
 
     // Decode rounds in which the prefill/decode interval held this prompt
     // back (Submitted or Prefilling). Never reset, so the interval's bound
@@ -100,7 +105,7 @@ public:
     // resident request looked covered nothing could be retracted to free
     // the next page.
     bool ReserveCoversGeneration(std::int32_t safe_steps) const {
-        return max_new_tokens_ > 0 && safe_steps * (1 + retraction_count_) >= RemainingNewTokensAtAdmission();
+        return max_new_tokens_ > 0 && escalatedWindows(safe_steps) >= RemainingNewTokensAtAdmission();
     }
 
     // Tokens generated so far / still permitted. Both compare against the
@@ -241,7 +246,15 @@ public:
     }
     // Immutable input-page identities, owned by this request. Admission may
     // retry against changing cache contents without hashing the input again.
+    // Every returned span stays valid, with unchanged contents, for the
+    // request's lifetime: later calls only append to the same storage.
     std::span<const std::string> PromptPrefixHashes();
+    // Compute only the requested prompt prefix; storage can be bounded below
+    // the admission frontier. Later calls extend the same immutable chain.
+    std::span<const std::string> PromptPrefixHashes(std::int32_t num_pages);
+    // Append complete pages, reusing prompt identities already computed by
+    // admission or storage. Does not force hashing an unfinished prompt.
+    void AppendPrefixHashes(std::vector<std::string>& hashes, std::int32_t num_pages) const;
     // The external KV-event hashes (HashKvBlock) of the first num_pages full
     // pages, each chained on the one before. A page is hashed once, the first
     // time it is asked for: its tokens never change.
@@ -348,6 +361,11 @@ private:
     friend struct SchedulerTestAccess;
     fsm::ForwardResources& forwardResources(const char* operation);
     const fsm::ForwardResources& forwardResources(const char* operation) const;
+    // One safe-step window plus one per retraction, in int64: 2^19
+    // retractions of 4096-step windows already pass INT32_MAX.
+    std::int64_t escalatedWindows(std::int32_t safe_steps) const {
+        return std::int64_t{safe_steps} * (std::int64_t{retraction_count_} + 1);
+    }
 
     std::string id_;
     std::string session_id_;

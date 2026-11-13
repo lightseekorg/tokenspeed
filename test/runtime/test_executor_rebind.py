@@ -212,6 +212,7 @@ def test_capture_hands_both_owners_the_entries_and_the_drafter_its_window(
     )
     executor.prefill_graph = SimpleNamespace(
         disable=False,
+        capture_buckets=[16],
         capture=lambda wrapper, *, entries, observer: seen.append(
             ("prefill", entries, observer, wrapper)
         ),
@@ -221,6 +222,7 @@ def test_capture_hands_both_owners_the_entries_and_the_drafter_its_window(
         capture_prefill_graph=lambda stream, window: seen.append(
             ("drafter", stream, window)
         ),
+        extend_graph_plan=lambda token_buckets, request_counts: {},
     )
     monkeypatch.setattr(
         module, "workspace_pool", lambda _d: SimpleNamespace(freeze=lambda: None)

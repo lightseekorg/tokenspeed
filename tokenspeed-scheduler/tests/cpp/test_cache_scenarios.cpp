@@ -2264,7 +2264,7 @@ TEST_F(ImageFollowsCanonicalHostEntrySuite, ARedirectedStoreAckRePointsTheImageT
     std::vector<std::uint8_t> present;
     for (const auto& key : query.keys) {
         // This race stores complete pages only, not r3's unrelated tail.
-        present.push_back(std::ranges::find(hashes, key.content_hash) != hashes.end());
+        present.push_back(std::ranges::find(hashes, key.content_hash.ToString()) != hashes.end());
     }
     ExecutionEvent query_done;
     query_done.With(cache::StorageDone{query.op_id, present, true, std::vector<std::uint8_t>(query.keys.size(), 0)});
@@ -3889,6 +3889,23 @@ TEST(RetractionHeadroom, EscalatesPerRetractionAndStopsAtTheGenerationBudget) {
 
     request.NoteRetracted();
     EXPECT_EQ(request.AdmissionHeadroom(kSafeSteps), 6000) << "and stays there";
+}
+
+TEST(RetractionHeadroom, KeepsEscalatingPastInt32Windows) {
+    // 2^19 - 1 retractions grant 2^19 windows of 4096 steps, 2^31 tokens:
+    // more than a two-billion-token budget, which the headroom then stops at
+    // and the reserve covers.
+    RequestSpec spec;
+    spec.request_id = "r";
+    spec.tokens = {1, 2, 3, 4};
+    spec.max_new_tokens = 2'000'000'000;
+    Request request{spec, /*prefix_granularity=*/2, Role::kFused};
+    constexpr std::int32_t kSafeSteps = 4096;
+    for (std::int32_t retraction = 1; retraction < (1 << 19); ++retraction) {
+        request.NoteRetracted();
+    }
+    EXPECT_EQ(request.AdmissionHeadroom(kSafeSteps), 2'000'000'000);
+    EXPECT_TRUE(request.ReserveCoversGeneration(kSafeSteps));
 }
 
 TEST(RetractionHeadroom, ReservesOnlyTheRemainingGenerationBudget) {

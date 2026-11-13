@@ -2602,9 +2602,11 @@ class ServerArgs:
                 raise ValueError(
                     "Weight discard requires an explicit draft update policy"
                 )
-            if self.quantization is not None or self.enable_eplb:
+            # Quantization is checked against the resolved model config by
+            # WeightMemoryState; CLI names alone cannot prove safe regeneration.
+            if self.enable_eplb:
                 raise ValueError(
-                    "Weight discard currently requires unquantized weights without EPLB"
+                    "Weight discard currently requires running without EPLB"
                 )
 
     def validate_model_update_options(self):
@@ -4580,14 +4582,15 @@ class ServerArgs:
             "--enable-drafter-prefill-graph",
             action="store_true",
             default=ServerArgs.enable_drafter_prefill_graph,
-            help="Also replay the speculative drafter's work inside a prefill "
-            "forward from CUDA graphs: the draft's extend step per prefill token "
-            "bucket at each exact request count of "
-            "--prefill-graph-capture-batch-sizes (unset: the fewest requests the "
-            "bucket fits in the context length), its decode steps per request "
-            "count, with attention at eager breaks. Only pure-extend forwards at a "
-            "captured request count replay; the others draft eagerly. Needs the "
-            "prefill graph on one rank (no TP, EP, PP or attention DP) and a chain "
+            help="Also replay the speculative drafter's extend step inside a "
+            "prefill forward from CUDA graphs, per prefill token bucket at each "
+            "exact request count of --prefill-graph-capture-batch-sizes (unset: "
+            "the fewest requests the bucket fits in the context length), with "
+            "attention at eager breaks; the draft's decode steps that follow the "
+            "extend step replay from graphs even without this switch. Only "
+            "pure-extend forwards at a captured request count replay; the others "
+            "run the step eagerly. The switch needs the prefill graph on one rank "
+            "(no TP, EP, PP or attention DP) and a chain "
             "EAGLE-style drafter (no --speculative-eagle-topk > 1, no "
             "--enable-speculative-sampling) whose draft model declares support "
             "(Qwen4-Exp MTP without index_share_for_mtp_iteration); other launches "
