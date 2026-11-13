@@ -916,6 +916,83 @@ def _check_reducer_variants(partial_fp16):
                     torch.testing.assert_close(lse, reference_lse, atol=0, rtol=0)
 
 
+def _check_reducer_capacity_preserves_outputs(q_len, causal_mask):
+    import tokenspeed_mla.mla_decode as decode
+
+    heads, page_size, max_seq_len = 12, 64, 32776
+    original_compile = decode._get_compiled_mla_kernel
+    original_splits = decode._get_split_kv_and_workspace_size
+    selected = {}
+
+    def record_splits(*args):
+        result = original_splits(*args)
+        selected[args[0]] = result[0]
+        return result
+
+    def compile_with(capacity):
+        def compile_variant(*args, **kwargs):
+            kwargs["reducer_max_splits"] = capacity(selected[batch])
+            return original_compile(*args, **kwargs)
+
+        return compile_variant
+
+    decode._get_split_kv_and_workspace_size = record_splits
+    workspace = torch.empty(512 * 1024**2, dtype=torch.int8, device="cuda")
+    generator = torch.Generator(device="cuda").manual_seed(7)
+    pattern = (1, 9, 64, 127, 128, 129, 300, 1000, 2048, 4097, 8192, 16000, 32768)
+    split_counts = set()
+    cases = [(batch, 1) for batch in (1, 2, 3, 4, 5, 6, 8, 11, 12, 16, 24, 32, 48, 64)]
+    # Explicit minimums select every other reachable split count at batch 64.
+    cases += [(64, minimum) for minimum in range(2, 33)]
+    for batch, min_split_kv in cases:
+        lengths = [max(q_len, pattern[(b * 5) % len(pattern)]) for b in range(batch)]
+        pages = [math.ceil(length / page_size) for length in lengths]
+        query = torch.randn(
+            batch, q_len, heads, 576, generator=generator, device="cuda"
+        ).to(torch.float8_e4m3fn)
+        kv = torch.randn(
+            sum(pages), page_size, 576, generator=generator, device="cuda"
+        ).to(torch.float8_e4m3fn)
+        tables = torch.zeros(
+            batch, math.ceil(max_seq_len / 128) * 2, dtype=torch.int32, device="cuda"
+        )
+        first = 0
+        for row, count in enumerate(pages):
+            tables[row, :count] = torch.arange(first, first + count, device="cuda")
+            first += count
+        kwargs = dict(
+            query=query,
+            kv_cache=kv,
+            workspace_buffer=workspace,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            block_tables=tables,
+            seq_lens=torch.tensor(lengths, dtype=torch.int32, device="cuda"),
+            max_seq_len=max_seq_len,
+            softmax_scale=192**-0.5,
+            causal_mask=causal_mask,
+            return_lse=True,
+            min_split_kv=min_split_kv,
+        )
+        results = []
+        # The 8-split floor, the previous floor of 4, and the largest capacity.
+        for compile_variant in (
+            original_compile,
+            compile_with(lambda splits: max(4, 1 << (splits - 1).bit_length())),
+            compile_with(lambda _: 256),
+        ):
+            # Poisoned partials past each row's split count must stay unread.
+            workspace.fill_(-1)
+            decode._get_compiled_mla_kernel = compile_variant
+            results.append(decode.tokenspeed_mla_decode(**kwargs))
+            decode._get_compiled_mla_kernel = original_compile
+        split_counts.add(selected[batch])
+        for out, lse in results[1:]:
+            assert torch.equal(results[0][0], out), (batch, min_split_kv)
+            assert torch.equal(results[0][1], lse), (batch, min_split_kv)
+    assert 1 in split_counts and len(split_counts) >= 16, sorted(split_counts)
+
+
 def _call_sm107_decode(**kwargs):
     """Cover public FP8 dispatch and explicitly select M256 for BF16 output."""
     import tokenspeed_mla.mla_decode as decode
@@ -1472,6 +1549,13 @@ class TestGPU:
     @pytest.mark.parametrize("partial_fp16", [False, True])
     def test_reducer_bands_preserve_output_lse_and_pdl(self, partial_fp16):
         _run_gpu_check(_check_reducer_variants, (partial_fp16,), 240)
+
+    @pytest.mark.parametrize("causal_mask", [True, False])
+    @pytest.mark.parametrize("q_len", [1, 7, 8])
+    def test_reducer_capacity_preserves_outputs(self, q_len, causal_mask):
+        _run_gpu_check(
+            _check_reducer_capacity_preserves_outputs, (q_len, causal_mask), 600
+        )
 
     def test_sm107_default_softmax_accuracy_and_cuda_graph(self):
         if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (
