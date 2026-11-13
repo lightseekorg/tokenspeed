@@ -1279,7 +1279,9 @@ bool CacheCoordinator::writableImageSlot(std::size_t group_index, const ImageTab
     // inside. The request writes the last of them and later publishes all of
     // them under the page's hash, so none may stay the tail entry's block.
     const std::int32_t block_granularity = geometry_[group_index].BlockGranularity();
-    const std::int32_t num_tokens = shape.num_blocks * block_granularity - shape.available_tokens;
+    // The image's blocks can end past INT32_MAX; the tokens they hold fit.
+    const std::int32_t num_tokens =
+        CheckedInt32(std::int64_t{shape.num_blocks} * block_granularity - shape.available_tokens);
     const std::int32_t tail_start = (num_tokens - num_tokens % prefix_granularity_) / block_granularity;
     return slot_index >= tail_start;
 }
