@@ -267,7 +267,7 @@ def test_split_counts_match_torch_without_recompiling() -> None:
     repo_root = Path(__file__).resolve().parents[4]
     script = textwrap.dedent("""
         import torch
-        from tokenspeed_mla import tokenspeed_mla_decode_split_kvs
+        from tokenspeed_mla import tokenspeed_mla_decode_split_kvs, tokenspeed_mla_decode_task_capacity
         from tokenspeed_mla.mla_decode import (
             _get_split_kv_and_workspace_size, _mla_decode_split_kvs_kernel,
             _per_request_split_kv_width,
@@ -288,10 +288,15 @@ def test_split_counts_match_torch_without_recompiling() -> None:
             chunk = ((source.sum() + chunks - 1) // chunks).clamp(min=1)
             expected = ((source + chunk - 1) // chunk).clamp(1, width).int()
             offsets = torch.empty_strided((batch + 1,), (3,), dtype=torch.int32, device="cuda")
-            tokenspeed_mla_decode_split_kvs(lengths, out, offsets, **args)
+            tasks = torch.empty(tokenspeed_mla_decode_task_capacity(batch, 128, 1, 1, get_num_sm(lengths.device)), dtype=torch.int64, device="cuda")
+            tokenspeed_mla_decode_split_kvs(lengths, out, offsets, tasks, **args)
             torch.testing.assert_close(out, expected, rtol=0, atol=0)
             torch.testing.assert_close(offsets[0], torch.zeros((), dtype=torch.int32, device="cuda"), rtol=0, atol=0)
             torch.testing.assert_close(offsets[1:], expected.cumsum(0).int(), rtol=0, atol=0)
+            requests = torch.repeat_interleave(torch.arange(batch, device="cuda", dtype=torch.int64), expected)
+            split_ids = torch.cat([torch.arange(int(n), device="cuda", dtype=torch.int64) for n in expected])
+            expected_tasks = (requests << 32) | split_ids
+            torch.testing.assert_close(tasks[:expected_tasks.numel()], expected_tasks, rtol=0, atol=0)
 
         lengths = torch.zeros(2049 * 3, dtype=torch.int32, device="cuda")[::3]
         out = torch.empty(2049 * 5, dtype=torch.int32, device="cuda")[::5]
@@ -310,7 +315,7 @@ def test_split_counts_match_torch_without_recompiling() -> None:
         check(wide_lengths, wide_out, 1 << 30)
         offsets = torch.full((1,), -1, dtype=torch.int32, device="cuda")
         tokenspeed_mla_decode_split_kvs(
-            lengths[:0], out[:0], offsets, num_heads=128, q_len=1,
+            lengths[:0], out[:0], offsets, torch.empty(0, dtype=torch.int64, device="cuda"), num_heads=128, q_len=1,
             max_seq_len=8192, min_split_kv=1, dtype=torch.bfloat16)
         assert offsets.item() == 0
         """)

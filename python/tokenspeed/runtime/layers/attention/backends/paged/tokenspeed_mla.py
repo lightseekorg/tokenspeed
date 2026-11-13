@@ -39,6 +39,7 @@ from tokenspeed_kernel.ops.attention.mla.tokenspeed_mla import (
     get_num_sm,
     tokenspeed_mla_decode,
     tokenspeed_mla_decode_split_kvs,
+    tokenspeed_mla_decode_task_capacity,
     tokenspeed_mla_decode_workspace_size,
     tokenspeed_mla_prefill,
     warmup_compile_prefill,
@@ -244,6 +245,8 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         self._decode_row_capacity = config.max_bs * self.block_decode_expansion
         self._decode_split_kvs_buf: torch.Tensor | None = None
         self._decode_split_offsets_buf: torch.Tensor | None = None
+        self._decode_split_tasks_buf: torch.Tensor | None = None
+        self._decode_split_tasks_storage: torch.Tensor | None = None
 
         # Layers reuse the partial-accumulator workspace. Reserve its peak
         # capacity before capture freezes the pool.
@@ -287,6 +290,8 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         self._block_seq_lens_buf = None
         self._decode_split_kvs_buf = None
         self._decode_split_offsets_buf = None
+        self._decode_split_tasks_buf = None
+        self._decode_split_tasks_storage = None
         self._dcp = None
 
     def configure_runtime(
@@ -498,6 +503,18 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         self._decode_split_offsets_buf = torch.arange(
             max_bs + 1, dtype=torch.int32, device=self.device
         )
+        self._decode_split_tasks_buf = torch.empty(
+            tokenspeed_mla_decode_task_capacity(
+                max_bs,
+                self._num_heads_per_tp * len(self.kvp_group),
+                1,
+                self.min_kv_split,
+                get_num_sm(self.device),
+            ),
+            dtype=torch.int64,
+            device=self.device,
+        )
+        self._decode_split_tasks_storage = self._decode_split_tasks_buf
         if self._dcp is None:
             return
         if self.block_decode_active:
@@ -578,10 +595,19 @@ class CuteDSLMLABackend(PagedAttentionBackend):
             return
         if self._dcp is not None:
             seq_lens = self._decode_views(seq_lens.shape[0]).dcp.local_seq_lens
+        capacity = tokenspeed_mla_decode_task_capacity(
+            seq_lens.shape[0],
+            self._num_heads_per_tp * len(self.kvp_group),
+            q_len,
+            self.min_kv_split,
+            get_num_sm(self.device),
+        )
+        self._decode_split_tasks_buf = self._decode_split_tasks_storage[:capacity]
         tokenspeed_mla_decode_split_kvs(
             seq_lens,
             self._decode_split_kvs_buf[: seq_lens.shape[0]],
             self._decode_split_offsets_buf[: seq_lens.shape[0] + 1],
+            self._decode_split_tasks_buf,
             num_heads=self._num_heads_per_tp * len(self.kvp_group),
             q_len=q_len,
             max_seq_len=self.max_context_len,
@@ -835,6 +861,9 @@ class CuteDSLMLABackend(PagedAttentionBackend):
                 self._decode_split_offsets_buf[request_start : request_start + bs + 1]
                 if block_split_kvs is not None
                 else None
+            ),
+            block_split_tasks=(
+                self._decode_split_tasks_buf if block_split_kvs is not None else None
             ),
         )
         if metadata.dcp is not None:
