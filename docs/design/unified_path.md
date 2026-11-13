@@ -530,6 +530,12 @@ reaches back to the one that waited. The ops READMEs (`moe`,
 `attention/rmha`, `conv`, `residual`) name the kernels that trigger first
 and what each preloads before its wait.
 
+A captured kernel launches early only through a single programmatic
+dependency. A stream join adds the branch's last node to the next kernel's
+dependencies, and with two it waits for both to finish. `StreamFork` therefore
+waits once per branch: a join with no unjoined branch work, including a scope's
+closing join after an explicit one, adds nothing.
+
 `fused_gate_sigmoid_mul_add`, `sigmoid_mul`, `silu_and_mul`, `swiglu_oai`,
 `situ_and_mul`, `add3`, and split AttnRes launchers read `pdl_enabled()`
 themselves. They use that same value for `ENABLE_PDL` and `launch_pdl`; model
