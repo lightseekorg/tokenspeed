@@ -115,17 +115,29 @@ FP8, BF16 and FP16 decode can instead take per-request split counts
 (`block_split_kvs`). `tokenspeed_mla_decode_split_kvs` takes the decode dtype
 and uses the uniform split's chunk budget, subject to rounding and caps, to
 give requests chunks of about the same length. One Triton launch reduces the
-lengths in int64 and writes counts and exclusive split offsets into the caller's
-buffers. Pass both `block_split_kvs` and `block_split_offsets` to decode.
+lengths in int64 and writes counts, exclusive split offsets and a chunk map
+into the caller's buffers. Reserve map entries with
+`tokenspeed_mla_decode_task_capacity(B, H, q_len, min_split_kv, num_sms)` and
+pass that int64 buffer as the planner's fourth argument. Each entry packs the
+request index in the high 32 bits and the split index in the low 32 bits.
+Pass `block_split_kvs`, `block_split_offsets` and `block_split_tasks` to decode.
 `is_var_split_kv` selects the kernel mode: uniform splitting keeps its original
-workspace; per-request splitting always uses the compact workspace and requires
-counts and offsets together. The grid reserves up to `max(32, min_split_kv)` splits per request
-(`PER_REQUEST_SPLIT_KV_CAPACITY`), reduced to avoid empty partitions; the
-partial results share a compact split axis across requests. Reserve bytes with
+workspace; per-request splitting uses the compact workspace and requires all
+three metadata buffers together. Each request can use up to
+`max(32, min_split_kv)` splits (`PER_REQUEST_SPLIT_KV_CAPACITY`), reduced to
+avoid empty partitions. The launch grid is `(cluster_m * query_tiles,
+chunk_capacity, 1)`: adjacent query tiles share a KV chunk, and each cluster
+looks up its request and split directly rather than searching offsets.
+The map capacity bounds the aggregate chunk budget plus rounding; padding
+clusters use empty splits through the existing pipeline lifecycle. Scheduler
+validity remains static, preserving warp-specialized code generation.
+The partial results share a compact split axis across requests. Reserve bytes with
 `tokenspeed_mla_decode_workspace_size`: total slots are bounded by the uniform
 chunk budget plus `B - 1` for rounding, rather than `B` times the grid width.
 The startup bound covers all batches up to the configured maximum. Counts and
-offsets are refreshed in place between CUDA graph replays, without recompilation.
+offsets and the chunk map are refreshed in place between CUDA graph replays,
+without recompilation. A sliced batch keeps the original plan's entire chunk
+map and slices only counts and offsets; the kernel rebases its request indices.
 Target verification, chain drafting, multi-depth MTP and block drafting
 refresh the same metadata when their cache lengths change. With compacted
 KVP/DCP pages, planning follows the local-length refresh and uses the gathered

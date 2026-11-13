@@ -377,6 +377,7 @@ def test_split_counts_use_local_lengths_and_gathered_heads(
             local,
             expected,
             expected_offsets,
+            torch.empty_like(leaf._decode_split_tasks_buf),
             num_heads=64,
             q_len=1 if mode == "chain" else 4,
             max_seq_len=16384,
