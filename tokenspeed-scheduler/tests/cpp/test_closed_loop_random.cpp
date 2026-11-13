@@ -120,6 +120,9 @@ struct LoopKnobs {
     std::int32_t chunk_budget{0};
     // SchedulerConfig::prefill_chunk_yield_tokens (0: off; the P role only).
     std::int32_t yield_tokens{0};
+    // SchedulerConfig::enable_short_prefill_first: new prompts are admitted
+    // by rank, and so is what fills the budget a chunk leaves.
+    bool short_prefill_first{false};
     // Leave out the State groups and the sliding window: no junction cut and
     // no final-window rule then shapes a chunk.
     bool full_attention_only{false};
@@ -286,6 +289,7 @@ struct ClosedLoop {
         cfg.drop_short_prompt_end_checkpoints = knobs.drop_short_prompt_ends;
         cfg.demote_superseded_state_checkpoints = knobs.demote;
         cfg.prefill_chunk_yield_tokens = knobs.yield_tokens;
+        cfg.enable_short_prefill_first = knobs.short_prefill_first;
         cfg.cache_groups.push_back(CacheGroupConfig{.group_id = "full_attention",
                                                     .block_granularity = history_block,
                                                     .total_pages = (device_pages - 1) * packing + 1,
@@ -1011,10 +1015,12 @@ TEST(ClosedLoopRandomTest, DemotionChainsNeverRaiseAndDrain) {
 // seeds per variant -- drawn configurations; in-forward checkpoints; with a
 // 24-token budget and prompts that mostly continue finished ones, State
 // groups as drawn (also with the KV event feed checked after every plan) and
-// full attention alone; drawn configurations with the KV event feed; and
-// restricted State groups of a two-page grain -- every fourth with mirrored
-// ranks. Besides draining with nothing pinned, no plan leaves two prefills
-// incomplete or runs a completing prefill after the incomplete one
+// full attention alone; drawn configurations with the KV event feed;
+// restricted State groups of a two-page grain; and, with
+// enable_short_prefill_first, drawn configurations and the 24-token budget,
+// where new prompts and the fill follow the ranking -- every fourth with
+// mirrored ranks. Besides draining with nothing pinned, no plan leaves two
+// prefills incomplete or runs a completing prefill after the incomplete one
 // (NextPlan), so every prompt carried beside a chunk that gave way completes
 // in its round, ahead of that chunk. Such a chunk ends on a page unless a
 // junction or the final-window rule cuts it; with full attention alone
@@ -1025,6 +1031,8 @@ TEST(ClosedLoopRandomTest, PrefillChunkYieldNeverRaisesAndDrains) {
     short_budget_kv_events.kv_events = true;
     LoopKnobs full_attention = short_budget;
     full_attention.full_attention_only = true;
+    LoopKnobs short_budget_ranked = short_budget;
+    short_budget_ranked.short_prefill_first = true;
     const struct {
         const char* name;
         LoopKnobs knobs;
@@ -1036,6 +1044,8 @@ TEST(ClosedLoopRandomTest, PrefillChunkYieldNeverRaisesAndDrains) {
         {"full attention", full_attention},
         {"drawn, KV events", LoopKnobs{.yield_tokens = 24, .kv_events = true}},
         {"restricted State groups", LoopKnobs{.yield_tokens = 24, .state_grain = 2 * kP}},
+        {"short prefill first", LoopKnobs{.yield_tokens = 24, .short_prefill_first = true}},
+        {"24-token budget, short prefill first", short_budget_ranked},
     };
     for (const auto& variant : variants) {
         std::uint64_t yielding_chunks = 0;
