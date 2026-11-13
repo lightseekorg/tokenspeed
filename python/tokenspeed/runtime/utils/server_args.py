@@ -2569,9 +2569,11 @@ class ServerArgs:
                 raise ValueError(
                     "Weight discard requires an explicit draft update policy"
                 )
-            if self.quantization is not None or self.enable_eplb:
+            # Quantization is checked against the resolved model config by
+            # WeightMemoryState; CLI names alone cannot prove safe regeneration.
+            if self.enable_eplb:
                 raise ValueError(
-                    "Weight discard currently requires unquantized weights without EPLB"
+                    "Weight discard currently requires running without EPLB"
                 )
 
     def validate_model_update_options(self):
