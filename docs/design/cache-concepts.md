@@ -1884,6 +1884,9 @@ on the largest required working set, not the smallest memory-derived limit;
 zero-budget geometry probes keep their existing demand-sized behavior. Final
 rebind repeats resident sizing under the graph-adjusted budget.
 
+Backends report recipe-reserved workspace through `fixed_workspace_bytes()`.
+Stateless leaves report zero. Composites sum their children and any owned allocations.
+
 Ordinary recipes pin one CacheBlock per group in each parent, so a group's
 stride does not shrink with its layer count or cache dtype. For example,
 equal-sized layers split into groups of one and four need a padding fraction

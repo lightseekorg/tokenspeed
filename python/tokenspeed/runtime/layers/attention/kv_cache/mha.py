@@ -28,6 +28,7 @@ from tokenspeed_kernel.ops.attention.prologue import (
     MXFP8Scales,
 )
 from tokenspeed_kernel.ops.kvcache.triton import (
+    dequant_gather_kv_mxfp8,
     quantize_store_kv_mxfp8,
     store_kv_cache,
 )
@@ -301,6 +302,66 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
         return (
             self._layer_scale_view(k_sf, layer_id),
             self._layer_scale_view(v_sf, layer_id),
+        )
+
+    def dequant_kv_view(
+        self,
+        layer_id: int,
+        page_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        query_lens: torch.Tensor | int,
+        window_left: int,
+        kernel_page_size: int,
+        *,
+        scratch: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """BF16 paged view of the pages one attention call reads.
+
+        Dequantizes the pages a BF16 kernel would read for each request --
+        all of them, or for a sliding window those holding the last
+        ``query_lens + window_left`` keys plus a spare page -- into
+        ``scratch`` (contiguous BF16 key and value buffers), and returns
+        ``(k_cache, v_cache, page_table)`` in the ``[pages, kernel_page_size,
+        heads, head_dim]`` shape the backends pass to their kernels. The values equal the cache's dequantized values
+        bit for bit, so the kernel's result is that of the MXFP8 cache.
+        The caller sizes ``scratch`` for the call's pages: pages past its end
+        are not gathered.
+        """
+        heads = self._layer_heads_per_rank(layer_id)
+        k_rows = self.get_key_buffer(layer_id).view(-1, heads, self.head_dim)
+        v_rows = self.get_value_buffer(layer_id).view(-1, heads, self.head_dim)
+        kp = kernel_page_size
+        last = torch.div(seq_lens + kp - 1, kp, rounding_mode="floor")
+        if window_left >= 0:
+            start = seq_lens - query_lens - window_left - 1
+            first = torch.div(start, kp, rounding_mode="floor") - 1
+            first = torch.minimum(torch.clamp(first, min=0), last)
+        else:
+            first = torch.zeros_like(last)
+        rows = scratch[0].numel() // (heads * self.head_dim) // kp * kp
+        elements = rows * heads * self.head_dim
+        k_out = scratch[0].view(-1)[:elements].view(rows, heads, -1)
+        v_out = scratch[1].view(-1)[:elements].view(rows, heads, -1)
+        out_page_table = torch.empty_like(page_table)
+        dequant_gather_kv_mxfp8(
+            k_rows,
+            v_rows,
+            self.k_scale_buffer[layer_id],
+            self.v_scale_buffer[layer_id],
+            page_table,
+            seq_lens,
+            first.to(torch.int32),
+            (last - first).to(torch.int32),
+            k_out,
+            v_out,
+            out_page_table,
+            kernel_page_size=kp,
+            page_tokens=self._layer_page_tokens(layer_id),
+        )
+        return (
+            k_out.view(-1, kp, heads, self.head_dim),
+            v_out.view(-1, kp, heads, self.head_dim),
+            out_page_table,
         )
 
     def kv_write_target(

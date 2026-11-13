@@ -125,6 +125,7 @@ def test_prefill_context_write_does_not_require_decode_window():
     writes = []
     drafter = SimpleNamespace(
         _update_draft_prefix_lengths=lambda ctx, accepted: None,
+        _prepare_proposal_features=lambda ctx, hidden, accepted: None,
         input_buffers=SimpleNamespace(positions_buf=positions),
         _write_native_cache=lambda h, p, loc, **kw: writes.append((h, p, loc, kw)),
     )
