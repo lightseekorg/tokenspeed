@@ -128,14 +128,15 @@ void Run(const FullCacheConfig& config, int warmups, int repeats, std::string_vi
 
 int main(int argc, char** argv) {
     try {
-        using namespace tokenspeed::benchmark;
-        Require(argc >= 8 && argc <= 10,
-                "usage: benchmark POOL_PAGES PAGE_SIZE REQUEST_TOKENS BATCH_SIZE HIT_PERCENT WARMUPS REPEATS "
-                "[first|lifecycle|events] [sequential|shuffled]");
-        Run(FullCacheConfig{ParseNonnegative(argv[1]), ParseNonnegative(argv[2]), ParseNonnegative(argv[3]),
-                            ParseNonnegative(argv[4]), ParseNonnegative(argv[5])},
-            ParseNonnegative(argv[6]), ParseNonnegative(argv[7]), argc >= 9 ? argv[8] : "first",
-            argc == 10 ? argv[9] : "sequential");
+        namespace bench = tokenspeed::benchmark;
+        bench::Require(argc >= 8 && argc <= 10,
+                       "usage: benchmark POOL_PAGES PAGE_SIZE REQUEST_TOKENS BATCH_SIZE HIT_PERCENT WARMUPS REPEATS "
+                       "[first|lifecycle|events] [sequential|shuffled]");
+        bench::Run(bench::FullCacheConfig{bench::ParseNonnegative(argv[1]), bench::ParseNonnegative(argv[2]),
+                                          bench::ParseNonnegative(argv[3]), bench::ParseNonnegative(argv[4]),
+                                          bench::ParseNonnegative(argv[5])},
+                   bench::ParseNonnegative(argv[6]), bench::ParseNonnegative(argv[7]), argc >= 9 ? argv[8] : "first",
+                   argc == 10 ? argv[9] : "sequential");
         return EXIT_SUCCESS;
     } catch (const std::exception& error) {
         std::cerr << "full_cache benchmark: " << error.what() << '\n';
