@@ -35,8 +35,7 @@ from tokenspeed.runtime.layers.attention_residual import (
 
 def _fp32_norms(count: int, width: int) -> tuple[PrecisionRMSNorm, ...]:
     return tuple(
-        PrecisionRMSNorm(width, 1e-6, False, torch.float32, False, False)
-        for _ in range(count)
+        PrecisionRMSNorm(width, 1e-6, torch.float32, False, False) for _ in range(count)
     )
 
 
@@ -119,19 +118,11 @@ def test_nonboundary_residual_sum_rounds_only_once():
     assert state.partial.item() == 1.0
 
 
-@pytest.mark.parametrize("pre_affine", [False, True])
 @pytest.mark.parametrize("elementwise_affine", [False, True])
-def test_norm_preprocessing_outputs_bf16_from_fp32(pre_affine, elementwise_affine):
-    norm = PrecisionRMSNorm(
-        4, 1e-6, pre_affine, torch.bfloat16, elementwise_affine, False
-    )
+def test_norm_preprocessing_outputs_bf16_from_fp32(elementwise_affine):
+    norm = PrecisionRMSNorm(4, 1e-6, torch.bfloat16, elementwise_affine, False)
     x = torch.tensor([[0.1251, -0.9917, 2.1234, 8.7654]], dtype=torch.float32)
-    values = x.clone()
-    if pre_affine:
-        with torch.no_grad():
-            norm.pre_weight.copy_(torch.tensor([1.0, 2.0, 0.5, 0.25]))
-        values = values * norm.pre_weight.float()
-    expected = values * torch.rsqrt(values.square().mean(dim=-1, keepdim=True) + 1e-6)
+    expected = x * torch.rsqrt(x.square().mean(dim=-1, keepdim=True) + 1e-6)
     if elementwise_affine:
         with torch.no_grad():
             norm.weight.copy_(torch.tensor([0.5, 1.0, 2.0, -1.0]))
@@ -191,7 +182,7 @@ def _twelve_layer_mixer(tokens: int):
     ]
 
     def bf16_norm():
-        return PrecisionRMSNorm(width, 1e-6, False, torch.bfloat16, True, False).cuda()
+        return PrecisionRMSNorm(width, 1e-6, torch.bfloat16, True, False).cuda()
 
     attention_norms = [
         tuple(bf16_norm() for _ in range(3 if layer in (5, 11) else 1))
