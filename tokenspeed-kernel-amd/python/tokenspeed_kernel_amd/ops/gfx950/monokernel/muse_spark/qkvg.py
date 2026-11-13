@@ -129,8 +129,8 @@ def gate_halves(plan):
 def _half_block_stage(mb, task, w, a, a_stride, FIRST: gl.constexpr, N: gl.constexpr):
     """:func:`_block_stage` of half a block: task ``task`` takes rows ``8
     (task % 2) ..`` of block ``FIRST + task // 2 // KSPLIT``, K half
-    ``task // 2 % KSPLIT``. Every row's sum is the whole-block task's (same K half, tiles and
-    reduction order)."""
+    ``task // 2 % KSPLIT``. Every row's sum is the whole-block task's
+    (same K half, tiles and reduction order)."""
     R: gl.constexpr = schedule.rows(mb.plan)
     sub = task % 2
     blk = task // 2 // KSPLIT
