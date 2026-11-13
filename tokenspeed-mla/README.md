@@ -188,11 +188,14 @@ tile utilization as well as batch size and split-KV scheduling.
 Other optimizations include:
 
 - FP8 split-KV candidates are normalized to nonempty K partitions before
-  workspace allocation and kernel launch. The reducer uses a 32/64-split
-  capacity for the M128/M64 paths and selects 1/2/4 disjoint D512 output bands
-  when the real output rows do not fill the GPU. These changes adapt the
-  split-KV and reducer optimizations from FlashInfer PR #4178 to TokenSpeed's
-  folded-query layout; both reducer settings are included in the compile cache.
+  workspace allocation and kernel launch. The reducer's static capacity is
+  the power of two covering the split count, at least 8 splits. Splits past
+  the runtime count are masked, so the capacity does not change outputs, and
+  batch sizes with 2 to 8 splits share one binary. The reducer also selects
+  1/2/4 disjoint D512 output bands when the real output rows do not fill the
+  GPU. These changes adapt the split-KV and reducer optimizations from
+  FlashInfer PR #4178 to TokenSpeed's folded-query layout; both reducer
+  settings are included in the compile cache.
 - Use the 2CTA UTCMMA instruction to reduce shared memory usage.
 - Use as few mbarriers as possible.
 - Split the KV loading warp to get more latency-hiding ability. After loading K, V is already in the L2 cache. Loading K of the next tile does not have to wait for the completion of V loading.

@@ -25,6 +25,9 @@
 #include <cstdint>
 #include <deque>
 #include <limits>
+#include <memory>
+#include <memory_resource>
+#include <new>
 #include <optional>
 #include <set>
 #include <span>
@@ -33,6 +36,8 @@
 #include <vector>
 
 #include "cache/core/cache_block_ref.h"
+#include "cache/core/fixed_slot_resource.h"
+#include "cache/core/prefetch.h"
 #include "utils.h"
 
 namespace tokenspeed {
@@ -50,21 +55,26 @@ inline std::int64_t ParentsNeededForBuckets(std::span<const std::int64_t> need_b
     _assert(!need_by_bucket.empty() && need_by_bucket.size() == holes_by_bucket.size(),
             "bucket demand and holes must cover the same shard count");
     const auto buckets = static_cast<std::int64_t>(need_by_bucket.size());
-    _assert(packing > 0 && packing % buckets == 0 && dense_need >= 0,
+    _assert(packing > 0 && (buckets == 1 || packing % buckets == 0) && dense_need >= 0,
             "bucket count must divide the parent packing and dense demand must be non-negative");
-    const std::int64_t per_parent = packing / buckets;
+    // Every eviction candidate asks again; one slot per parent or bucket, the
+    // common geometry, skips the integer divisions.
+    const auto parents_for = [](std::int64_t blocks, std::int64_t slots_per_parent) {
+        return slots_per_parent == 1 ? blocks : (blocks + slots_per_parent - 1) / slots_per_parent;
+    };
+    const std::int64_t per_parent = buckets == 1 ? packing : packing / buckets;
     std::int64_t parents = 0;
     std::int64_t total_need = dense_need;
     std::int64_t total_holes = 0;
     for (std::size_t b = 0; b < need_by_bucket.size(); ++b) {
         _assert(need_by_bucket[b] >= 0 && holes_by_bucket[b] >= 0, "bucket demand and holes must be non-negative");
         const std::int64_t short_by = std::max<std::int64_t>(need_by_bucket[b] - holes_by_bucket[b], 0);
-        parents = std::max(parents, (short_by + per_parent - 1) / per_parent);
+        parents = std::max(parents, parents_for(short_by, per_parent));
         total_need += need_by_bucket[b];
         total_holes += holes_by_bucket[b];
     }
     const std::int64_t total_short = std::max<std::int64_t>(total_need - total_holes, 0);
-    return std::max(parents, (total_short + packing - 1) / packing);
+    return std::max(parents, parents_for(total_short, packing));
 }
 
 // Where pairs of blocks go when a pair's two blocks must share a bucket but
@@ -134,9 +144,15 @@ public:
             _assert(static_cast<std::int64_t>(num_lcm_blocks) * packing <= std::numeric_limits<std::int32_t>::max(),
                     "group cache page count exceeds int32 range");
             group_availability_[group_id].packing = packing;
+            if (packing > kInlineOccupancySlots) {
+                // Rounded up without overflowing near the int32 maximum.
+                const auto words = packing / kInlineOccupancySlots + (packing % kInlineOccupancySlots != 0 ? 1 : 0);
+                wide_occupancy_words_ = std::max(wide_occupancy_words_, static_cast<std::size_t>(words));
+            }
         }
-        for (std::int32_t id = 1; id <= num_lcm_blocks; ++id) {
-            free_parent_ids_.push_back(id);
+        // Ids 1..num_lcm_blocks, counted so that INT32_MAX ends the loop.
+        for (std::int32_t i = 0; i < num_lcm_blocks; ++i) {
+            free_parent_ids_.push_back(i + 1);
         }
     }
 
@@ -278,9 +294,8 @@ public:
     // pick another parent or the block's own.
     CacheBlockRef AcquireBlockAt(std::uint32_t group_id, CacheBlockLocation location) {
         const LcmBlock& parent = lcmBlock(location.lcm_block_id);
-        _assert(parent.bound_group == group_id && location.slot_index >= 0 &&
-                    static_cast<std::size_t>(location.slot_index) < parent.occupancy.size() &&
-                    !parent.occupancy[static_cast<std::size_t>(location.slot_index)],
+        _assert(parent.bound_group == group_id && location.slot_index >= 0 && location.slot_index < parent.slots &&
+                    !parent.SlotOccupied(static_cast<std::size_t>(location.slot_index)),
                 "a placed block takes a free slot of a parent bound to its group");
         return createBlockRef(group_id, placement(group_id).packing, location);
     }
@@ -304,8 +319,8 @@ public:
     }
     bool IsOccupied(CacheBlockLocation location) const {
         const LcmBlock& lcm_block = lcmBlock(location.lcm_block_id);
-        return location.slot_index >= 0 && static_cast<std::size_t>(location.slot_index) < lcm_block.occupancy.size() &&
-               lcm_block.occupancy[static_cast<std::size_t>(location.slot_index)];
+        return location.slot_index >= 0 && location.slot_index < lcm_block.slots &&
+               lcm_block.SlotOccupied(static_cast<std::size_t>(location.slot_index));
     }
     std::int32_t NumOccupiedSlots() const noexcept {
         std::int32_t count = 0;
@@ -318,40 +333,46 @@ public:
         const LcmBlock& lcm_block = lcmBlock(lcm_block_id);
         std::vector<CacheBlockLocation> locations;
         locations.reserve(lcm_block.occupied_count);
-        for (std::size_t slot = 0; slot < lcm_block.occupancy.size(); ++slot) {
-            if (lcm_block.occupancy[slot]) {
-                locations.push_back(
-                    CacheBlockLocation{.lcm_block_id = lcm_block_id, .slot_index = static_cast<std::int32_t>(slot)});
+        for (std::int32_t slot = 0; slot < lcm_block.slots; ++slot) {
+            if (lcm_block.SlotOccupied(static_cast<std::size_t>(slot))) {
+                locations.push_back(CacheBlockLocation{.lcm_block_id = lcm_block_id, .slot_index = slot});
             }
         }
         return locations;
+    }
+
+    // A hint for a later Release(location): prefetches its LCM parent's
+    // record, found by its ID alone. Parent records live as long as the pool.
+    void PrefetchRelease(CacheBlockLocation location) const noexcept {
+        if (location.lcm_block_id <= 0 || static_cast<std::size_t>(location.lcm_block_id) > lcm_blocks_.size()) return;
+        PrefetchObject(lcm_blocks_[static_cast<std::size_t>(location.lcm_block_id - 1)]);
     }
 
     void Release(CacheBlockLocation location) noexcept {
         FatalCheck(location.lcm_block_id > 0 && static_cast<std::size_t>(location.lcm_block_id) <= lcm_blocks_.size(),
                    "CacheBlock location has invalid LCM block id");
         LcmBlock& parent = lcm_blocks_[static_cast<std::size_t>(location.lcm_block_id - 1)];
-        FatalCheck(location.slot_index >= 0 && static_cast<std::size_t>(location.slot_index) < parent.occupancy.size(),
+        FatalCheck(location.slot_index >= 0 && location.slot_index < parent.slots,
                    "CacheBlock location has invalid slot");
         const std::size_t slot = static_cast<std::size_t>(location.slot_index);
-        FatalCheck(parent.occupancy[slot] && parent.occupied_count > 0, "CacheBlock location is not occupied");
+        FatalCheck(parent.SlotOccupied(slot) && parent.occupied_count > 0, "CacheBlock location is not occupied");
         FatalCheck(parent.bound_group.has_value(), "occupied LCM parent has no bound group");
         GroupAvailability& group = placement(*parent.bound_group);
         removeAvailability(group, parent, location.lcm_block_id);
-        parent.occupancy[slot] = false;
+        parent.SetSlotOccupied(slot, false);
         --parent.occupied_count;
         const std::size_t buckets = group.parents_by_bucket.size();
         ++group.free_slots_by_bucket[slot % buckets];
         if (parent.occupied_count == 0) {
             // An unbound parent's slots leave the group: they belong to the
             // pool-wide empty FIFO again.
-            const auto per_bucket = static_cast<std::int64_t>(parent.occupancy.size() / buckets);
+            const auto per_bucket = static_cast<std::int64_t>(static_cast<std::size_t>(parent.slots) / buckets);
             for (std::int64_t& holes : group.free_slots_by_bucket) {
                 FatalCheck(holes >= per_bucket, "group free-slot count underflow on unbind");
                 holes -= per_bucket;
             }
             parent.bound_group.reset();
-            parent.occupancy.clear();
+            parent.slots = 0;  // its occupancy bits are all clear again
             parent.first_free_slots.clear();
             FatalCheck(free_parent_ids_.size() < lcm_blocks_.size(), "LCM free queue overflow");
             free_parent_ids_.push_back(location.lcm_block_id);
@@ -380,13 +401,35 @@ private:
             return static_cast<std::size_t>(total);
         }
     };
+    static constexpr std::int32_t kInlineOccupancySlots = 64;
     struct LcmBlock {
         std::optional<std::uint32_t> bound_group;
-        std::vector<bool> occupancy;
         std::uint32_t occupied_count{0};
+        // The bound group's packing; 0 while the parent is empty.
+        std::int32_t slots{0};
+        // Bit s is set while child slot s is occupied, so an empty parent's
+        // bits are all clear. Up to 64 slots they live in the parent itself:
+        // the occupancy bits need no other memory. A wider parent uses
+        // wide_occupancy instead, allocated at its first wide binding with a
+        // word per 64 slots of the pool's widest packing and kept until the
+        // pool is destroyed.
+        std::uint64_t occupancy{0};
+        std::unique_ptr<std::uint64_t[]> wide_occupancy;
         // Only the lowest free slot per bucket is needed, not a list of all holes.
         // The packing is the sentinel for a bucket with no free slot.
         std::vector<std::int32_t> first_free_slots;
+
+        bool SlotOccupied(std::size_t slot) const noexcept {
+            const std::uint64_t word =
+                slots <= kInlineOccupancySlots ? occupancy : wide_occupancy[slot / kInlineOccupancySlots];
+            return ((word >> (slot % kInlineOccupancySlots)) & 1U) != 0;
+        }
+        void SetSlotOccupied(std::size_t slot, bool occupied) noexcept {
+            std::uint64_t& word =
+                slots <= kInlineOccupancySlots ? occupancy : wide_occupancy[slot / kInlineOccupancySlots];
+            const std::uint64_t bit = std::uint64_t{1} << (slot % kInlineOccupancySlots);
+            word = occupied ? (word | bit) : (word & ~bit);
+        }
     };
 
     const GroupAvailability& placement(std::uint32_t group_id) const noexcept {
@@ -405,7 +448,7 @@ private:
     }
 
     static void removeAvailability(GroupAvailability& group, const LcmBlock& parent, std::int32_t id) {
-        if (parent.occupied_count == parent.occupancy.size()) {
+        if (parent.occupied_count == static_cast<std::uint32_t>(parent.slots)) {
             return;
         }
         for (std::size_t bucket = 0; bucket < group.parents_by_bucket.size(); ++bucket) {
@@ -418,7 +461,7 @@ private:
     }
 
     static void addAvailability(GroupAvailability& group, const LcmBlock& parent, std::int32_t id) {
-        if (parent.occupied_count == parent.occupancy.size()) {
+        if (parent.occupied_count == static_cast<std::uint32_t>(parent.slots)) {
             return;
         }
         for (std::size_t bucket = 0; bucket < group.parents_by_bucket.size(); ++bucket) {
@@ -516,12 +559,26 @@ private:
     }
 
     CacheBlockRef createBlockRef(std::uint32_t group_id, std::int32_t slots_per_parent, CacheBlockLocation location) {
-        auto* control = new internal_cache_block_ref::CacheBlockControl(*this, location);
-        // Allocate the control before mutating the pool, then commit the
-        // location before publishing its RAII owner: CacheBlock destruction
-        // releases this location and therefore requires it to be occupied.
+        using Control = internal_cache_block_ref::CacheBlockControl;
+        if (slots_per_parent > kInlineOccupancySlots) [[unlikely]] {
+            LcmBlock& parent = lcm_blocks_[static_cast<std::size_t>(location.lcm_block_id - 1)];
+            if (parent.wide_occupancy == nullptr) {
+                allocateWideOccupancy(parent, wide_occupancy_words_);
+            }
+        }
+        void* storage = control_memory_.allocate(sizeof(Control), alignof(Control));
+        auto* control = new (storage) Control(*this, location);
+        // Allocate a wide parent's occupancy words and the control before
+        // mutating the pool, then commit the location before publishing its
+        // RAII owner: CacheBlock destruction releases this location and
+        // therefore requires it to be occupied.
         occupy(group_id, slots_per_parent, location);
         return CacheBlockRef{*control};
+    }
+
+    // Out of line so the allocation stays out of the inlined acquire loops.
+    [[gnu::cold, gnu::noinline]] static void allocateWideOccupancy(LcmBlock& parent, std::size_t words) {
+        parent.wide_occupancy = std::make_unique<std::uint64_t[]>(words);
     }
 
     void occupy(std::uint32_t group_id, std::int32_t slots_per_parent, CacheBlockLocation location) noexcept {
@@ -531,8 +588,10 @@ private:
         if (parent.occupied_count == 0) {
             FatalCheck(!free_parent_ids_.empty() && free_parent_ids_.front() == location.lcm_block_id,
                        "empty LCM placement must consume the next free parent");
-            FatalCheck(parent.occupancy.empty(), "empty LCM parent must not retain child slots");
-            parent.occupancy.assign(static_cast<std::size_t>(slots_per_parent), false);
+            FatalCheck(parent.slots == 0 && parent.occupancy == 0, "empty LCM parent must not retain child slots");
+            FatalCheck(slots_per_parent <= kInlineOccupancySlots || parent.wide_occupancy != nullptr,
+                       "a wide LCM parent binds without its occupancy words");
+            parent.slots = slots_per_parent;
             if (slots_per_parent > 1) {
                 parent.first_free_slots.resize(buckets);
                 for (std::size_t bucket = 0; bucket < buckets; ++bucket) {
@@ -549,13 +608,12 @@ private:
         } else {
             removeAvailability(group, parent, location.lcm_block_id);
         }
-        FatalCheck(
-            parent.bound_group == group_id && parent.occupancy.size() == static_cast<std::size_t>(slots_per_parent),
-            "LCM parent binding changed while occupied");
+        FatalCheck(parent.bound_group == group_id && parent.slots == slots_per_parent,
+                   "LCM parent binding changed while occupied");
         const std::size_t slot = static_cast<std::size_t>(location.slot_index);
-        FatalCheck(slot < parent.occupancy.size(), "LCM child slot is out of range");
-        FatalCheck(!parent.occupancy[slot], "LCM child slot already occupied");
-        parent.occupancy[slot] = true;
+        FatalCheck(slot < static_cast<std::size_t>(parent.slots), "LCM child slot is out of range");
+        FatalCheck(!parent.SlotOccupied(slot), "LCM child slot already occupied");
+        parent.SetSlotOccupied(slot, true);
         ++parent.occupied_count;
         std::int64_t& bucket_holes = group.free_slots_by_bucket[slot % buckets];
         FatalCheck(bucket_holes > 0, "group free-slot count underflow on occupy");
@@ -564,8 +622,9 @@ private:
             auto& first = parent.first_free_slots[slot % buckets];
             if (first == location.slot_index) {
                 first = slots_per_parent;
-                for (std::size_t next = slot + buckets; next < parent.occupancy.size(); next += buckets) {
-                    if (!parent.occupancy[next]) {
+                for (std::size_t next = slot + buckets; next < static_cast<std::size_t>(parent.slots);
+                     next += buckets) {
+                    if (!parent.SlotOccupied(next)) {
                         first = static_cast<std::int32_t>(next);
                         break;
                     }
@@ -575,6 +634,18 @@ private:
         addAvailability(group, parent, location.lcm_block_id);
     }
 
+    friend class internal_cache_block_ref::CacheBlockControl;
+    void destroyBlockControl(internal_cache_block_ref::CacheBlockControl* control) const noexcept {
+        using Control = internal_cache_block_ref::CacheBlockControl;
+        control->~Control();  // Releases its physical slot exactly once.
+        control_memory_.deallocate(control, sizeof(Control), alignof(Control));
+    }
+
+    // Stable slots allocated on demand, independent of physical page IDs.
+    // Last-owner release recycles the control only after cancelling observers
+    // and releasing its CacheBlock; no stale observer survives slot reuse.
+    mutable FixedSlotResource control_memory_{SlotShape::Of<internal_cache_block_ref::CacheBlockControl>(), 256,
+                                              std::pmr::new_delete_resource()};
     std::vector<LcmBlock> lcm_blocks_;
     // Free parents are interchangeable: release appends and allocation consumes
     // the front. Bound parents have per-group, per-bucket availability indices.
@@ -582,6 +653,8 @@ private:
     // Dense group IDs and immutable packing are configured at construction.
     // Bucket geometry is fixed by registration before the first allocation.
     std::vector<GroupAvailability> group_availability_;
+    // Words of a wide parent's occupancy bits; 0 when every packing fits inline.
+    std::size_t wide_occupancy_words_{0};
 };
 
 }  // namespace tokenspeed

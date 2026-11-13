@@ -28,7 +28,11 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from tokenspeed_kernel.ops.communication.mailbox import MailboxTarget
-from tokenspeed_kernel.ops.moe import packed_projection_weight_view
+from tokenspeed_kernel.ops.moe import (
+    _bf16_routes_moe_apply,
+    _bf16_routes_moe_warmup,
+    packed_projection_weight_view,
+)
 from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
 from tokenspeed_kernel.ops.tuning import is_warming_up
 from tokenspeed_kernel.platform import (
@@ -821,6 +825,57 @@ if platform.is_amd:
                 output.view(num_tokens * top_k, x.shape[1]),
             )
         return output.view(num_tokens, top_k, x.shape[1])
+
+    @register_kernel(
+        "moe",
+        "apply",
+        name="gluon_bf16_routes_moe_apply",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            vendors=frozenset({"amd"}),
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+        ),
+        signatures=format_signatures("x", "dense", {torch.bfloat16}),
+        traits={
+            "weight_dtype": frozenset({"unquant"}),
+            "activation": frozenset({"silu"}),
+            "routing_mode": frozenset({"precomputed_topk"}),
+            "supports_finalize": frozenset({False}),
+            "supports_deferred_finalize": frozenset({True}),
+            "deferred_output_is_token_order": frozenset({True}),
+            "supports_deferred_out": frozenset({True}),
+            "supports_ep": frozenset({False, True}),
+            "supports_all_to_all_ep": frozenset({False}),
+            "internal_activation_dtype": frozenset({"input"}),
+            "supports_bias": frozenset({False}),
+        },
+        priority=Priority.SPECIALIZED,
+    )
+    def gluon_bf16_routes_moe_apply(
+        plan: dict,
+        x: torch.Tensor,
+        w: torch.nn.Module,
+        router_logits: torch.Tensor | None,
+        topk_weights: torch.Tensor | None = None,
+        topk_ids: torch.Tensor | None = None,
+        num_tokens_global: int | None = None,
+        max_num_tokens_per_gpu: int | None = None,
+        do_finalize: bool = True,
+        enable_pdl: bool = False,
+        deferred_out: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, None, None]:
+        """Unfinalized BF16 expert routes through ``bf16_moe_routes``.
+
+        The facade selects the Gluon route kernels where their geometry fits
+        and Triton otherwise. Selected only by layers that defer the finalize;
+        see ``_bf16_routes_moe_apply`` for the arguments and the routes.
+        """
+        del plan, router_logits, topk_weights, num_tokens_global
+        del max_num_tokens_per_gpu, enable_pdl
+        return _bf16_routes_moe_apply(x, w, topk_ids, do_finalize, deferred_out)
+
+    gluon_bf16_routes_moe_apply._tokenspeed_warmup = _bf16_routes_moe_warmup  # type: ignore[attr-defined]
 
 
 # ===-----------------------------------------------------------------------===#

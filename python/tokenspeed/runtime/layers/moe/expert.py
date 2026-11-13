@@ -95,6 +95,7 @@ class MoELayer(torch.nn.Module):
         with_bias=False,
         routing_config: dict = {},
         routing_mode: str | None = None,
+        requires_deferred_finalize: bool = False,
         internal_activation_dtype_override: str | None = None,
         persistent_max_num_tokens_per_gpu: int | None = None,
         input_dtype: torch.dtype | None = None,
@@ -510,6 +511,8 @@ class MoELayer(torch.nn.Module):
             activation=self.activation,
             # e.g. "precomputed_topk" when fused kernels cannot reproduce the routing; None = unconstrained.
             routing_mode=routing_mode,
+            # True for callers that always finalize the routes themselves.
+            requires_deferred_finalize=requires_deferred_finalize,
             a2a_backend=self._spec.a2a_backend,
             ep_size=self.ep_size,
             ispp=self.intermediate_size // self.tp_size,
@@ -806,7 +809,8 @@ class MoELayer(torch.nn.Module):
             Finalized ``[tokens, hidden]`` hidden states, or with
             ``do_finalize=False`` ``(route_outputs, route_weights,
             expanded_idx)`` for the caller's finalize. Precomputed routes
-            always come with their weights.
+            always come with their weights. ``expanded_idx`` is None when the
+            routes are in token order and every row is defined.
         """
         if not do_finalize and not self.supports_deferred_finalize:
             raise AssertionError("MoELayer does not support do_finalize=False")

@@ -24,14 +24,18 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <list>
+#include <memory_resource>
 #include <optional>
 #include <span>
 #include <string>
-#include <unordered_map>
 #include <utility>
 
 #include "cache/core/cache_types.h"
+#include "cache/core/fixed_slot_resource.h"
+#include "cache/core/prefetch.h"
 #include "cache/prefix/checkpoint_tree.h"
+#include "cache/prefix/flat_pointer_index.h"
 #include "cache/prefix/tail_table.h"
 #include "utils.h"
 
@@ -94,6 +98,8 @@ public:
     class Hold;
 
     struct Node {
+        Node(const ContentHash& hash, BoundaryTree& tree) : hash{hash}, tree_{&tree} {}
+
         // Some group indexes this hash on the Device tier.
         bool OnDevice() const noexcept { return entries_[kDevice] > 0; }
         // Some group indexes this hash on the Host tier, or a store is
@@ -122,7 +128,8 @@ public:
         // settled yet.
         std::int32_t PendingHostStores() const noexcept { return pending_stores_; }
 
-        const ContentHash* hash{nullptr};  // the map key
+        // The node's key in the tree's index, fixed for its lifetime.
+        const ContentHash hash;
         // Null for page 0, and for a node started without a known parent until
         // a publication through its hash links it (LinkPublication).
         Node* parent{nullptr};
@@ -172,7 +179,7 @@ public:
         std::int32_t pending_stores_{0};
         std::int32_t pending_checkpoint_stores_{0};
         std::int32_t publications_{0};
-        BoundaryTree* tree_{nullptr};
+        BoundaryTree* tree_;
     };
 
     // One holder's claim on one node: while it lives the node stays, and what
@@ -220,8 +227,9 @@ public:
     // `checkpoints` (null: none) receives every change of a State
     // checkpoint's residency; it must outlive every hold.
     BoundaryTree(Config config, CheckpointTree* checkpoints) : config_{config}, checkpoints_{checkpoints} {}
-    // Nodes and holds point at the tree, and nodes at each other and at their
-    // map keys: a copy or a move would leave them pointing at the original.
+    // Nodes and holds point at the tree, and nodes and the index at each
+    // other's storage: a copy or a move would leave them pointing at the
+    // original.
     BoundaryTree(const BoundaryTree&) = delete;
     BoundaryTree& operator=(const BoundaryTree&) = delete;
     BoundaryTree(BoundaryTree&&) = delete;
@@ -262,13 +270,13 @@ public:
         Node* parent = nullptr;
         auto first_page_to_link = static_cast<std::size_t>(completed.first_new_prefix_page);
         for (; first_page_to_link > 0; --first_page_to_link) {
-            parent = Find(page_hashes[first_page_to_link - 1]);
+            parent = Find(ContentHash{page_hashes[first_page_to_link - 1]});
             if (parent != nullptr && (parent->parent != nullptr || first_page_to_link == 1)) {
                 break;
             }
         }
         for (std::size_t page = first_page_to_link; page < page_hashes.size(); ++page) {
-            parent = &findOrAdd(page_hashes[page], parent,
+            parent = &findOrAdd(ContentHash{page_hashes[page]}, parent,
                                 static_cast<std::int32_t>(page + 1) * config_.prefix_granularity, /*tail_tokens=*/0);
         }
         Node* deepest = parent;
@@ -282,13 +290,23 @@ public:
         return acquire(*deepest, Hold::Kind::kPublication, kDevice, /*state=*/false, /*closed=*/false);
     }
 
+    // A hint for dropping `hold`, a hold on this tree's node of `hash`: the
+    // holder passes the hash, so neither the node nor an index slot is read
+    // here. Prefetches the node and the index slot of its hash, which taking
+    // the node out of the tree reads.
+    void PrefetchRelease(const Hold& hold, const ContentHash& hash) const noexcept {
+        if (hold.node_ == nullptr) return;
+        PrefetchObject(*hold.node_);
+        nodes_.Prefetch(hash);
+    }
+
     Node* Find(const ContentHash& hash) {
-        const auto it = nodes_.find(hash);
-        return it == nodes_.end() ? nullptr : &it->second;
+        const auto it = nodes_.Find(hash);
+        return it == node_storage_.end() ? nullptr : &*it;
     }
     const Node* Find(const ContentHash& hash) const {
-        const auto it = nodes_.find(hash);
-        return it == nodes_.end() ? nullptr : &it->second;
+        const auto it = nodes_.Find(hash);
+        return it == node_storage_.end() ? nullptr : &*it;
     }
 
     // The oldest root; next_sibling walks the rest.
@@ -414,6 +432,16 @@ private:
     // checkpoint mark flipped.
     bool apply(const Hold& hold, std::int32_t delta) noexcept {
         Node& node = *hold.node_;
+        if (hold.kind_ == Hold::Kind::kEntry && hold.tier_ == kDevice && !hold.state_ && !hold.paired_) {
+            // A Device entry that is no State checkpoint and pairs with no
+            // Host copy counts in no checkpoint, Host or duplicate mark: none
+            // flips, and only its own counts change.
+            node.entries_[kDevice] += delta;
+            node.closed_entries_[kDevice] += hold.closed_ ? delta : 0;
+            FatalCheck(node.entries_[kDevice] >= 0 && node.closed_entries_[kDevice] >= 0,
+                       "a boundary node lost a holder it did not have");
+            return false;
+        }
         // Only a State group's entry or a checkpoint's store changes a
         // checkpoint's residency.
         const bool moves_checkpoint = hold.state_ && checkpoints_ != nullptr;
@@ -459,7 +487,7 @@ private:
         // on this path are fatal checks, like the ones above.
         if (moves_checkpoint) {
             if (const CheckpointTree::Residency residency = CheckpointResidency(node); residency != had_residency) {
-                checkpoints_->Update(*node.hash, residency);
+                checkpoints_->Update(node.hash, residency);
             }
         }
         return checkpoint_flipped;
@@ -491,7 +519,7 @@ private:
         if (config_.queue_dead_candidates && ((checkpoint_flipped_or_node_removed && config_.num_state_groups > 0 &&
                                                !current->HasCheckpointBoundaryInSubtree()) ||
                                               is_gap)) {
-            queue(*current->hash);
+            queue(current->hash);
         }
     }
 
@@ -510,8 +538,11 @@ private:
     // it its boundary and, past page 0, a parent, whose last child it becomes,
     // its subtree's checkpoint boundaries counted in every new ancestor.
     Node& findOrAdd(const ContentHash& hash, Node* parent, std::int32_t boundary_tokens, std::int32_t tail_tokens) {
-        auto [it, inserted] = nodes_.try_emplace(hash);
-        Node& node = it->second;
+        // A node is created with its hash before the index stores it; a
+        // throw on the way leaves neither.
+        const auto [it, inserted] =
+            nodes_.FindOrInsert(hash, [&] { return node_storage_.emplace(node_storage_.end(), hash, *this); });
+        Node& node = *it;
         if (!inserted && (node.parent != nullptr || parent == nullptr)) {
             // Every real boundary is at least 1: only a node started without
             // a known parent has 0, and a registration passes 0.
@@ -521,10 +552,7 @@ private:
             }
             return node;
         }
-        if (inserted) {
-            node.hash = &it->first;
-            node.tree_ = this;
-        } else {
+        if (!inserted) {
             // An existing root is about to acquire its known parent.
             (node.prev_sibling != nullptr ? node.prev_sibling->next_sibling : first_root_) = node.next_sibling;
             (node.next_sibling != nullptr ? node.next_sibling->prev_sibling : last_root_) = node.prev_sibling;
@@ -611,11 +639,11 @@ private:
                    "only a childless node nothing holds leaves the tree");
         // Nothing hangs under a tail, so a tail hash leaves the tail table
         // exactly when nothing holds its node.
-        tails_.Remove(*node.hash);
+        tails_.Remove(node.hash);
         // A candidate the last release queued for this node leaves with it
         // (the walk queues what is left above), so taking a chain from below
         // queues one node, not one per page.
-        if (!dead_candidates_.empty() && dead_candidates_.back() == *node.hash) {
+        if (!dead_candidates_.empty() && dead_candidates_.back() == node.hash) {
             dead_candidates_.pop_back();
         }
         if (node.parent != nullptr) {
@@ -628,7 +656,9 @@ private:
         }
         // Erase by iterator: the node's own key must not be read after the
         // node is gone.
-        nodes_.erase(nodes_.find(*node.hash));
+        const auto entry = nodes_.ExtractObject(node.hash, node);
+        FatalCheck(entry != node_storage_.end(), "a removed boundary keeps its index entry");
+        node_storage_.erase(entry);
     }
 
     void queue(const ContentHash& hash) {
@@ -639,8 +669,20 @@ private:
 
     Config config_;
     CheckpointTree* checkpoints_;
-    // Node-based, so nodes and keys keep their addresses across rehashes.
-    std::unordered_map<ContentHash, Node> nodes_;
+    // Node-based, so nodes, with the keys they own, keep their addresses
+    // across rehashes.
+    using NodeList = std::pmr::list<Node>;
+    using NodeIterator = NodeList::iterator;
+    struct NodeKey {
+        const ContentHash& operator()(NodeIterator node) const noexcept { return node->hash; }
+    };
+    // Each node and its key live in stable pooled list storage. Index rehash and
+    // backward-shift erase move handles only; Holds and traversal links stay
+    // valid until their own node's ordinary last-holder removal.
+    FixedSlotResource node_memory_{SlotShape::ListNodeOf<Node>(), 256, std::pmr::new_delete_resource()};
+    NodeList node_storage_{&node_memory_};
+    // Answers node_storage_.end() for an absent hash.
+    FlatPointerIndex<NodeIterator, ContentHash, NodeKey, std::hash<ContentHash>> nodes_{node_storage_.end()};
     Node* first_root_{nullptr};
     Node* last_root_{nullptr};
     Node* first_host_leaf_{nullptr};
