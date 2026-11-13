@@ -25,9 +25,10 @@ path nothing exercised routinely.
 Persistent request-pool rows are reused across requests. Before a forward,
 outside graph capture/replay, the executor binds stop criteria and prepares
 sampling with the admission identities carried by `PlannedForward`. A new
-admission initializes its rows even when the external request ID and pool
-index equal a previous request's. Later steps of the same admission preserve
-sampling counts and RNG state; the identity never changes the request's seed.
+admission binds its stop criteria and initializes its sampling rows even when
+the external request ID and pool index equal a previous request's. Later
+steps of the same admission preserve sampling counts and RNG state; the
+identity never changes the request's seed.
 The host record fixes stop criteria for the lifetime of an admission, so
 stop binding uses that identity without a second key containing the criteria.
 A later request reusing the public RID still receives a new identity.
@@ -42,6 +43,16 @@ forward rebinds the host's canonical stop criteria without clearing restored
 cache lengths, candidates or stop flags. This also covers a remote landing
 imaged before its first stop binding. Stores, restores and binding retain the
 existing execution-stream dependencies; identity checks do not replace fences.
+
+Token-derived history, including Engram's accepted n-gram tail, is rebuilt
+from the host's token history rather than copied in the retraction image.
+Engram's external-RID comparison is only one reseed trigger: local extends
+and remote-prefill slot preparation call `RuntimeStates.reset_states()`,
+which marks the tail with `ngram_needs_seed`. The first decode after remote
+prefill or a snapshot restore also carries an explicit input token, forcing
+reseed even for the same RID and slot. Later decode steps advance the accepted
+tail in place. Reusing a RID therefore does not bypass the reseed needed when
+a slot changes hands.
 
 The sampler's route and top-k padding describe the current batch, not the
 owners of all prepared slots. Their cache tracks the admissions in each

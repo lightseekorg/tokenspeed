@@ -425,9 +425,7 @@ class BaseDrafter:
     def export_slot_state(
         self, slot: int, out: torch.Tensor, stream, *, admission_id: int
     ) -> None:
-        # The default rows are rewritten by every forward of the slot, never
-        # keyed by request; a drafter that keys them (DSpark) overrides both
-        # copies to image the prepared marker (``slot_state.py``).
+        # The default exporter copies slot rows without a prepared marker.
         del admission_id
         pack_slot_rows(self.slot_state_rows(slot), out, stream)
 
