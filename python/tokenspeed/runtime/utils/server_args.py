@@ -3126,7 +3126,7 @@ class ServerArgs:
             dest="enable_mixed_batch",
             default=ServerArgs.enable_mixed_batch,
             help="Allow the scheduler to issue prefill and decode requests in the "
-            "same iteration. Not supported with aggregated DCP.",
+            "same iteration.",
         )
         parser.add_argument(
             "--prefill-decode-interval",
