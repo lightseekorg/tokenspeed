@@ -419,8 +419,9 @@ def select_dsa_topk(
     not) fits, or the table-width tile where that is larger, so no exchange
     outgrows the table-width plan's.
     ``q_scales`` is the FP32 ``[rows, index_heads]`` scale of FP8 E4M3
-    queries, its rows aligned with ``q``'s and sliced to each tile like
-    them; None for BF16 queries. With ``q_scales``, ``query_group_size``
+    queries, or the int32 UE8M0 scale words of mxfp4 (uint8) ones, its rows
+    aligned with ``q``'s and sliced to each tile like them; None for BF16
+    queries. With ``q_scales``, ``query_group_size``
     consecutive rows are one request's verify window and share key tiles,
     each row keeping its own causal length. A tile whose first or end row is
     not a multiple of it scores its rows in groups of one.
@@ -664,7 +665,8 @@ def select_owned_dsa_topk(
 
     Args:
         q: Index queries ``[rows, index_heads, head_dim]``, BF16, or FP8 E4M3
-            with ``q_scales``.
+            with ``q_scales``; or uint8 E2M1 codes ``[rows, index_heads,
+            head_dim / 2]`` with ``q_scales`` for an mxfp4 plane.
         weights: Per-head weights ``[rows, index_heads]``.
         index_k_cache: This rank's packed Index-K pages (uint8), in
             ``metadata``'s ``index_k_format``.
@@ -678,7 +680,8 @@ def select_owned_dsa_topk(
         local_tokens: Trailing tokens of each row's window always selected.
         rider: Contiguous uint8 ``[rows, width]`` of this rank, ``width`` a
             multiple of 4, or None.
-        q_scales: FP32 ``[rows, index_heads]`` scales of FP8 queries, or None.
+        q_scales: FP32 ``[rows, index_heads]`` scales of FP8 queries, int32
+            UE8M0 scale words of mxfp4 ones, or None.
         query_group_size: Consecutive rows of one request's verify window,
             as in :func:`select_dsa_topk`.
         out: Preallocated int32 ``[rows, topk]`` local slots.
