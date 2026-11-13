@@ -29,4 +29,5 @@ This state does not add a per-request cache group.
 Token counts are runtime scalars of the kernels.
 Source count, hidden width, query count, and normalization policy are model properties.
 CPU tests cover equations, boundary transitions, and rounding against an FP64 host reference.
-Shared GPU tests compare the kernels with the CPU equations.
+Shared GPU tests compare FP32 mixtures with the CPU equations, then check fused normalization against a separate norm of the same mixture.
+This keeps cancellation error in the FP32 comparison instead of measuring it as relative BF16 rounding error near zero.

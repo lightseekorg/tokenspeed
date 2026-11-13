@@ -90,6 +90,8 @@ def triton_l2_clip(
             scale is not None,
             output_scale is not None,
             triton.next_power_of_2(width),
+            # Match the fused head norm's reduction order for bitwise checks.
+            num_warps=1,
             enable_fp_fusion=False,
         )
     return output

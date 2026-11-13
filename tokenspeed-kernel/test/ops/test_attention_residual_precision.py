@@ -151,12 +151,14 @@ def test_nine_source_multiquery_matches_cpu_equation(device_name, width):
         torch.bfloat16
     )
     queries = torch.randn((3, width), generator=generator, dtype=torch.float32)
-    inverse = torch.rsqrt(sources.float().square().mean(dim=-1) + 1e-6)
-    normalized = sources.float() * inverse.unsqueeze(-1)
-    # Score the dot before applying its inverse RMS, as the reference does.
-    logits = torch.einsum("sth,qh->qts", sources.float(), queries / math.sqrt(width))
+    inverse = torch.rsqrt(sources.double().square().mean(dim=-1) + 1e-6)
+    normalized = sources.double() * inverse.unsqueeze(-1)
+    # Keep the equation independent of the host BLAS FP32 reduction order.
+    # The operator accepts query weights scaled in FP32.
+    weights = (queries * width**-0.5).double()
+    logits = torch.einsum("sth,qh->qts", sources.double(), weights)
     logits = logits * inverse.T.unsqueeze(0)
-    expected = torch.einsum("qts,sth->qth", logits.softmax(dim=-1), normalized)
+    expected = torch.einsum("qts,sth->qth", logits.softmax(dim=-1), normalized).float()
     moved = [value.to(device) for value in sources.unbind(0)]
     actual = attention_residual(
         moved[:-1],
@@ -557,6 +559,7 @@ def test_one_pass_mix_matches_the_split_equations(
         torch.device("cuda"), 5, sources, queries, width
     )
     terms = (t0, t1, t2) if candidate == "stored" else (t0, t1)
+    mixtures = {}
     for norm_weights, dtype in ((None, torch.float32), (gains, torch.bfloat16)):
         results = []
         for device in ("cuda", "cpu"):
@@ -576,6 +579,27 @@ def test_one_pass_mix_matches_the_split_equations(
                 tokens=None,
                 out=None,
             )
+            if norm_weights is None:
+                mixtures[device] = mixed
+            else:
+                # Isolate norm rounding from FP32 cancellation in the mix:
+                # each device normalizes its own independently checked mixture.
+                expected_normed = torch.stack(
+                    [
+                        rmsnorm_precision(
+                            row,
+                            gain,
+                            1e-6,
+                            None,
+                            torch.bfloat16,
+                            mean_by_reciprocal=False,
+                        )
+                        for row, gain in zip(mixtures[device], gains.to(device))
+                    ]
+                )
+                torch.testing.assert_close(
+                    mixed.float(), expected_normed.float(), rtol=8e-3, atol=0
+                )
             results.append((mixed.cpu(), None if stored is None else stored.cpu()))
         (actual, stored), (expected, expected_stored) = results
         if candidate == "stored":
@@ -583,10 +607,6 @@ def test_one_pass_mix_matches_the_split_equations(
             assert torch.equal(stored, expected_stored)
         if dtype == torch.float32:
             torch.testing.assert_close(actual, expected, rtol=2e-5, atol=3e-6)
-        else:
-            torch.testing.assert_close(
-                actual.float(), expected.float(), rtol=8e-3, atol=0
-            )
 
 
 @pytest.mark.parametrize("device_name", ["cpu", "cuda"])
