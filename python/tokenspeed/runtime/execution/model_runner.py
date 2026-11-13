@@ -699,13 +699,19 @@ class ModelRunner:
             ``(shapes, problem)``: the checkpoint's tensor shapes (None when
             it is not safetensors) and why it must be refused (None if not).
         """
+        from tokenspeed.runtime.model_loader.loader import CheckpointFileSelection
         from tokenspeed.runtime.model_loader.weight_utils import (
             safetensors_tensor_shapes,
         )
 
         fall_back_to_pt = getattr(self.model, "fall_back_to_pt_during_load", False)
+        weight_files = (
+            self.model.checkpoint_weight_files
+            if isinstance(self.model, CheckpointFileSelection)
+            else None
+        )
         _, files, use_safetensors = loader._prepare_weights(
-            model_path, None, fall_back_to_pt
+            model_path, None, fall_back_to_pt, weight_files
         )
         if not use_safetensors:
             return None, None
@@ -721,6 +727,7 @@ class ModelRunner:
                     self.model_config.model_path,
                     getattr(self.model_config, "revision", None),
                     fall_back_to_pt,
+                    weight_files,
                 )
                 held = safetensors_tensor_shapes(held_files) if held_safetensors else {}
             except Exception as e:  # noqa: BLE001 - only the shape check is lost

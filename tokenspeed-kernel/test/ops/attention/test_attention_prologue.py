@@ -51,14 +51,18 @@ from attention_prologue_helpers import (
     split,
 )
 from tokenspeed_kernel.ops.attention.prologue import (
+    ConvBatch,
+    ConvStream,
     FP8TensorScales,
     HeadKVCache,
     HeadNorm,
     KVCacheFormat,
+    KVShortConv,
     MLAExpandedKV,
     MRope,
     MXFP8Scales,
     PerTokenHeadPlanes,
+    RelativeHeadNorm,
     RopeStyle,
     Rotary,
     gqa_prologue,
@@ -197,6 +201,150 @@ def test_triton_rounds_once(
     )
 
 
+@pytest.mark.parametrize("solution", [None, "composite", "triton"])
+@pytest.mark.parametrize("tokens", [1, 17])
+def test_required_norm_rounding_matches_bf16_norm_then_rope(solution, tokens):
+    hq, hkv, dim = 4, 2, 128
+    inputs = qkv(tokens, hq, hkv, dim, seed=821)
+    norm = dataclasses.replace(head_norm(dim, 0.0, 822), round_before_rope=True)
+    rotary = Rotary(
+        cos_sin_cache(dim),
+        torch.arange(tokens, device="cuda") + 31,
+        RopeStyle.NEOX,
+        None,
+    )
+    locations = slots(tokens, tokens + 5, seed=823)
+    q, k, v = split(inputs.clone(), hq, hkv, dim)
+    q, k = qk_rmsnorm(
+        q, k, norm.q_weight, norm.k_weight, norm.eps, weight_offset=norm.weight_offset
+    )
+    prepared = torch.cat((q, k, v), dim=-1)
+    actual = run_gqa(
+        solution,
+        inputs,
+        hq,
+        hkv,
+        dim,
+        norm=norm,
+        rotary=rotary,
+        fmt=KVCacheFormat.NATIVE,
+        return_kv=True,
+        slots=locations,
+        total=tokens + 5,
+    )
+    expected = run_gqa(
+        None,
+        prepared,
+        hq,
+        hkv,
+        dim,
+        norm=None,
+        rotary=rotary,
+        fmt=KVCacheFormat.NATIVE,
+        return_kv=True,
+        slots=locations,
+        total=tokens + 5,
+    )
+    for produced, reference in zip(actual, expected):
+        assert bytes_equal(produced, reference)
+
+
+def test_required_norm_rounding_rejects_an_incompatible_override():
+    q, k, v = split(qkv(1, 4, 2, 128, seed=824), 4, 2, 128)
+    norm = dataclasses.replace(head_norm(128, 0.0, 825), round_before_rope=True)
+    key, value = gqa_cache(2, 2, 128, BF16)
+    with pytest.raises(NoKernelFoundError, match="materialized_qk_norm"):
+        gqa_prologue(
+            q,
+            k,
+            v,
+            norm=norm,
+            rotary=None,
+            cache=HeadKVCache(key, value, None, torch.tensor([1], device="cuda")),
+            query_dtype=q.dtype,
+            return_kv=True,
+            solution=None,
+            override="triton_relative_gqa_prologue",
+        )
+
+
+@pytest.mark.parametrize(
+    "head_dim, style, weight_offset, scale",
+    [
+        (128, RopeStyle.NEOX, 0.0, 30.0),
+        (64, RopeStyle.GPTJ, 1.0, 1.0),
+        (256, RopeStyle.NEOX, 0.0, 0.02),
+    ],
+)
+def test_required_norm_rounding_solutions_agree_on_large_batches(
+    head_dim, style, weight_offset, scale
+):
+    """The fused solution sums each head's statistic in qk_rmsnorm's order:
+    a different order moves about one element in a million by a unit in the
+    last place, so a batch this size exposes it."""
+    tokens, hq, hkv = 520, 12, 2
+    inputs = qkv(tokens, hq, hkv, head_dim, seed=831) * scale
+    norm = dataclasses.replace(
+        head_norm(head_dim, weight_offset, 832), round_before_rope=True
+    )
+    rotary = Rotary(
+        cos_sin_cache(head_dim),
+        torch.randperm(tokens, device="cuda") * 7,
+        style,
+        None,
+    )
+    locations = slots(tokens, tokens + 5, seed=833)
+    args = dict(
+        norm=norm,
+        rotary=rotary,
+        fmt=KVCacheFormat.NATIVE,
+        return_kv=True,
+        slots=locations,
+        total=tokens + 5,
+    )
+    fused = run_gqa("triton", inputs, hq, hkv, head_dim, **args)
+    composite = run_gqa("composite", inputs, hq, hkv, head_dim, **args)
+    for produced, reference in zip(fused, composite):
+        assert bytes_equal(produced, reference)
+
+
+def test_required_norm_rounding_replays_changed_inputs_and_slots():
+    tokens, hq, hkv, dim = 17, 4, 2, 128
+    inputs = qkv(tokens, hq, hkv, dim, seed=826)
+    norm = dataclasses.replace(head_norm(dim, 0.0, 827), round_before_rope=True)
+    rotary = Rotary(
+        cos_sin_cache(dim), torch.arange(tokens, device="cuda"), RopeStyle.NEOX, None
+    )
+    locations = slots(tokens, tokens + 5, seed=828)
+
+    def run():
+        return run_gqa(
+            None,
+            inputs,
+            hq,
+            hkv,
+            dim,
+            norm=norm,
+            rotary=rotary,
+            fmt=KVCacheFormat.NATIVE,
+            return_kv=True,
+            slots=locations,
+            total=tokens + 5,
+        )
+
+    run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run()
+    for seed in (829, 830):
+        inputs.copy_(qkv(tokens, hq, hkv, dim, seed=seed))
+        locations.copy_(locations.roll(1))
+        graph.replay()
+        for produced, reference in zip(captured, run()):
+            assert bytes_equal(produced, reference)
+
+
 @pytest.mark.parametrize("solution", [None, "composite"])
 def test_a_zero_offset_keeps_negative_zero_weights(solution):
     """A -0.0 weight flips each normalized value's sign, as the multiplication does."""
@@ -208,7 +356,7 @@ def test_a_zero_offset_keeps_negative_zero_weights(solution):
         q.clone(),
         k.clone(),
         v,
-        norm=HeadNorm(weight, weight, 0.0, 1e-6),
+        norm=HeadNorm(weight, weight, 0.0, 1e-6, round_before_rope=False),
         rotary=None,
         cache=HeadKVCache(k_cache, v_cache, None, slots(tokens, 8, seed=61)),
         query_dtype=q.dtype,
@@ -2382,7 +2530,7 @@ def test_prologue_kernels_constrain_only_traits_the_entries_state(monkeypatch):
 
     stated = {}
 
-    def spy(mode, dtype, traits, solution, override):
+    def spy(mode, dtype, traits, features, solution, override):
         stated[mode] = {key for key, _ in traits}
         raise LookupError
 
@@ -2659,3 +2807,382 @@ def test_mla_writes_strided_fp8_pages_without_touching_padding(
     assert bytes_equal(got, ref)
     assert bytes_equal(cache, flat.view_as(cache))
     assert bytes_equal(storage[:, page_size:], padding)
+
+
+def _relative_norm(
+    tokens, hq, hkv, dim, rel_dim, extent, *, value_norm, tau, seed, kv_conv=None
+):
+    """Relative head steps with strided relative rows, as the model slices them."""
+    g = torch.Generator(device="cuda").manual_seed(seed)
+
+    def rand(*shape, dtype=BF16):
+        return torch.randn(*shape, generator=g, device="cuda").to(dtype)
+
+    relative = rand(tokens, 8 + hq * rel_dim)[:, 8:].view(tokens, hq, rel_dim)
+    return RelativeHeadNorm(
+        relative=relative,
+        projection=(0.1 * rand(rel_dim, extent, dtype=torch.float32)).to(BF16),
+        q_scale=(1 + 0.25 * rand(hq, dim, dtype=torch.float32)).to(BF16),
+        k_scale=(1 + 0.25 * rand(hkv, dim, dtype=torch.float32)).to(BF16),
+        rel_scale=(1 + 0.25 * rand(hq, rel_dim, dtype=torch.float32)).to(BF16),
+        q_threshold=6.0,
+        k_threshold=5.0,
+        rel_threshold=3.0,
+        clip_eps=1e-6,
+        value_norm_eps=1e-6 if value_norm else None,
+        q_output_scale=(
+            0.5 + torch.rand(tokens, generator=g, device="cuda") if tau else None
+        ),
+        kv_conv=kv_conv,
+    )
+
+
+def _kv_conv(tokens, requests, hkv, dim, *, dynamic, publish, extend, seed):
+    """A K/V convolution over ``requests`` uniform chunks, K and V adjacent in
+    one wider ring as local layers keep them. With three or more requests the
+    second has no prior state, the third publishes into a hole, and the last
+    is a padded row."""
+    g = torch.Generator(device="cuda").manual_seed(seed)
+
+    def rand(*shape):
+        return torch.randn(*shape, generator=g, device="cuda")
+
+    taps, chunk, channels = 4, tokens // requests, hkv * dim
+    ring_rows = taps - 1 + max(chunk, 8)
+    ring = rand(requests + 2, ring_rows, 8 + 2 * channels).to(BF16)[:, :, 8:]
+    pages = requests + 3
+    checkpoints = [rand(pages, taps - 1, channels).to(BF16) for _ in range(2)]
+    if dynamic:
+        weights = [(0.5 * rand(taps, channels)).to(BF16).mT for _ in range(2)]
+        coefficients = [0.3 * rand(tokens, hkv, taps) for _ in range(2)]
+    else:
+        weights = [(0.5 * rand(channels, taps)).to(BF16) for _ in range(2)]
+        coefficients = [None, None]
+    indices = torch.arange(1, requests + 1, dtype=torch.int32, device="cuda")
+    has_state = torch.ones(requests, dtype=torch.bool, device="cuda")
+    seq_lens = torch.arange(requests, dtype=torch.int32, device="cuda") * 37 + 1000
+    live = torch.arange(2, requests + 2, dtype=torch.int32, device="cuda")
+    if requests >= 3:
+        has_state[1] = False
+        seq_lens[1] = chunk
+        live[2] = 0
+        indices[-1] = -1
+    block_table = torch.zeros(requests, 4, dtype=torch.int32, device="cuda")[:, 1:]
+    block_table[:, 0] = live + 1
+    block_table[:, 1] = live
+    streams = [
+        ConvStream(
+            weight=weights[i],
+            dynamic_weights=coefficients[i],
+            ring=ring[:, :, i * channels : (i + 1) * channels],
+            checkpoint=checkpoints[i],
+        )
+        for i in range(2)
+    ]
+    return KVShortConv(
+        k=streams[0],
+        v=streams[1],
+        batch=ConvBatch(
+            cu_seqlens=torch.arange(
+                0, tokens + 1, chunk, dtype=torch.int32, device="cuda"
+            ),
+            # A graph bucket's index buffer outlasts the batch's rows.
+            seq_idx=(
+                torch.arange(tokens + 5, dtype=torch.int32, device="cuda") // chunk
+            ).clamp(max=requests - 1),
+            cache_indices=indices,
+            has_initial_state=has_state,
+            seq_lens=seq_lens,
+            block_table=block_table,
+            num_extends=requests if extend else 0,
+            publish_live=publish,
+        ),
+        output_scale=(taps * (2 if dynamic else 1) + 1) ** -0.5,
+    )
+
+
+@pytest.mark.parametrize("tokens", [1, 8, 33, 200])  # 200: the heads, then one GEMM
+@pytest.mark.parametrize("value_norm", [True, False])
+@pytest.mark.parametrize("tau", [True, False])
+@pytest.mark.parametrize("return_kv", [True, False])
+def test_relative_head_steps_fuse_with_the_kv_write(tokens, value_norm, tau, return_kv):
+    """The fused prologue under relative head steps writes the composite's
+    bytes (``rel_mha_head_norms``, then the cache store): query, K/V rows,
+    relative logits and both caches, rows past the slots left unwritten."""
+    hq, hkv, dim, rel_dim, extent, total = 12, 2, 128, 32, 1024, 512
+    inputs = qkv(tokens, hq, hkv, dim, seed=3)
+    norm = _relative_norm(
+        tokens, hq, hkv, dim, rel_dim, extent, value_norm=value_norm, tau=tau, seed=4
+    )
+    rows = slots(max(tokens - 2, 1), total, seed=5)  # graph padding past the slots
+    results = {}
+    for solution in ("composite", "triton"):
+        q, k, v = split(inputs.clone(), hq, hkv, dim)
+        k_cache, v_cache = gqa_cache(total, hkv, dim, BF16)
+        out = gqa_prologue(
+            q.view(tokens, hq, dim),
+            k,
+            v,
+            norm=norm,
+            rotary=None,
+            cache=HeadKVCache(k_cache, v_cache, None, rows),
+            query_dtype=q.dtype,
+            return_kv=return_kv,
+            solution=solution,
+            override=None,
+        )
+        results[solution] = (out, k_cache, v_cache)
+    (want, want_k, want_v), (got, got_k, got_v) = (
+        results["composite"],
+        results["triton"],
+    )
+    assert bytes_equal(got.q, want.q)
+    assert bytes_equal(got.rel_logits, want.rel_logits)
+    assert got.rel_logits.shape == (tokens, hq, extent)
+    assert bytes_equal(got_k, want_k) and bytes_equal(got_v, want_v)
+    if return_kv:
+        assert bytes_equal(got.k, want.k) and bytes_equal(got.v, want.v)
+    else:
+        assert got.k is None and got.v is None
+
+
+@pytest.mark.parametrize("tokens", [1, 8, 33, 200])
+@pytest.mark.parametrize("value_norm", [True, False])
+@pytest.mark.parametrize("conv", [False, True])
+def test_relative_head_steps_fuse_with_an_mxfp8_kv_write(tokens, value_norm, conv):
+    """Into an MXFP8 cache the fused prologue writes the composite's bytes
+    (``rel_mha_head_norms``, then ``quantize_store_kv_mxfp8``): fp8 rows and
+    their interleaved scale words, rows past the slots left unwritten, with
+    and without the decode K/V convolution."""
+    hq, hkv, dim, rel_dim, extent, total = 12, 2, 128, 32, 1024, 512
+    inputs = qkv(tokens, hq, hkv, dim, seed=23)
+    rows = slots(max(tokens - 2, 1), total, seed=25)  # graph padding past the slots
+    results = {}
+    for solution in ("composite", "triton"):
+        kv_conv = (
+            _kv_conv(
+                tokens,
+                tokens,
+                hkv,
+                dim,
+                dynamic=False,
+                publish=True,
+                extend=False,
+                seed=26,
+            )
+            if conv
+            else None
+        )
+        norm = _relative_norm(
+            tokens,
+            hq,
+            hkv,
+            dim,
+            rel_dim,
+            extent,
+            value_norm=value_norm,
+            tau=False,
+            seed=24,
+            kv_conv=kv_conv,
+        )
+        q, k, v = split(inputs.clone(), hq, hkv, dim)
+        k_cache, v_cache = gqa_cache(total, hkv, dim, FP8)
+        k_sf, v_sf = (
+            torch.full(
+                (total // 128, hkv, 1, 32, 4, 4), 255, dtype=torch.uint8, device="cuda"
+            ).view(torch.float8_e8m0fnu)
+            for _ in range(2)
+        )
+        out = gqa_prologue(
+            q.view(tokens, hq, dim),
+            k,
+            v,
+            norm=norm,
+            rotary=None,
+            cache=HeadKVCache(
+                k_cache, v_cache, MXFP8Scales(k=k_sf, v=v_sf, page_tokens=128), rows
+            ),
+            query_dtype=q.dtype,
+            return_kv=False,
+            solution=solution,
+            override=None,
+        )
+        results[solution] = (out, k_cache, v_cache, k_sf, v_sf)
+    (want, *want_planes), (got, *got_planes) = results["composite"], results["triton"]
+    assert bytes_equal(got.q, want.q)
+    assert bytes_equal(got.rel_logits, want.rel_logits)
+    assert all(bytes_equal(a, b) for a, b in zip(got_planes, want_planes))
+
+
+def test_relative_head_steps_select_the_fused_kernel_for_native_caches():
+    """A native cache takes the fused kernel; an FP8 cache, which it does not
+    convert, takes the composite, and an override that cannot serve raises.
+    A query asked for in FP8 is the fused query converted once."""
+    hq, hkv, dim, total, tokens = 12, 2, 128, 64, 8
+    inputs = qkv(tokens, hq, hkv, dim, seed=6)
+    norm = _relative_norm(
+        tokens, hq, hkv, dim, 32, 1024, value_norm=True, tau=False, seed=7
+    )
+    rows = slots(tokens, total, seed=8)
+
+    def run(cache_dtype, query_dtype=BF16, **kwargs):
+        q, k, v = split(inputs.clone(), hq, hkv, dim)
+        k_cache, v_cache = gqa_cache(total, hkv, dim, cache_dtype)
+        return gqa_prologue(
+            q.view(tokens, hq, dim),
+            k,
+            v,
+            norm=norm,
+            rotary=None,
+            cache=HeadKVCache(k_cache, v_cache, None, rows),
+            query_dtype=query_dtype,
+            return_kv=False,
+            **kwargs,
+        )
+
+    fused = run(BF16, solution=None, override=None)
+    named = run(BF16, solution=None, override="triton_relative_gqa_prologue")
+    assert bytes_equal(fused.q, named.q)
+    fp8_query = run(
+        BF16,
+        torch.float8_e4m3fn,
+        solution=None,
+        override="triton_relative_gqa_prologue",
+    )
+    assert fp8_query.q.dtype == torch.float8_e4m3fn
+    assert bytes_equal(fp8_query.q, fused.q.to(torch.float8_e4m3fn))
+    assert bytes_equal(fp8_query.rel_logits, fused.rel_logits)
+    composite = run(FP8, solution=None, override=None)
+    assert bytes_equal(composite.rel_logits, fused.rel_logits)
+    with pytest.raises(ValueError):
+        run(FP8, solution=None, override="triton_relative_gqa_prologue")
+    with pytest.raises(ValueError):
+        run(BF16, solution=None, override="triton_gqa_prologue")
+
+
+@pytest.mark.parametrize("requests,chunk", [(1, 8), (4, 4), (4, 1)])
+@pytest.mark.parametrize("dynamic", [False, True])
+@pytest.mark.parametrize("publish", [False, True])
+@pytest.mark.parametrize("return_kv", [False, True])
+def test_relative_head_steps_fuse_the_kv_convolution(
+    requests, chunk, dynamic, publish, return_kv
+):
+    """Over a decode batch the fused prologue convolves the K/V rows as
+    ``inkling_ring_sconv`` does: the composite's bytes in the query, relative
+    logits, K/V rows and caches, and in the conv ring rows and published
+    windows, padded requests, stateless requests and holes included."""
+    hq, hkv, dim, rel_dim, extent, total = 12, 2, 128, 16, 1024, 256
+    tokens = requests * chunk
+    inputs = qkv(tokens, hq, hkv, dim, seed=13)
+    rows = slots(tokens, total, seed=15)
+    results = {}
+    for solution in ("composite", "triton"):
+        conv = _kv_conv(
+            tokens,
+            requests,
+            hkv,
+            dim,
+            dynamic=dynamic,
+            publish=publish,
+            extend=False,
+            seed=16,
+        )
+        norm = _relative_norm(
+            tokens,
+            hq,
+            hkv,
+            dim,
+            rel_dim,
+            extent,
+            value_norm=True,
+            tau=dynamic,
+            seed=14,
+            kv_conv=conv,
+        )
+        q, k, v = split(inputs.clone(), hq, hkv, dim)
+        k_cache, v_cache = gqa_cache(total, hkv, dim, BF16)
+        out = gqa_prologue(
+            q.view(tokens, hq, dim),
+            k,
+            v,
+            norm=norm,
+            rotary=None,
+            cache=HeadKVCache(k_cache, v_cache, None, rows),
+            query_dtype=q.dtype,
+            return_kv=return_kv,
+            solution=solution,
+            override=None,
+        )
+        state = (conv.k.ring, conv.k.checkpoint, conv.v.checkpoint)
+        results[solution] = (out, k_cache, v_cache, *state)
+    (want, *want_state), (got, *got_state) = results["composite"], results["triton"]
+    assert bytes_equal(got.q, want.q)
+    assert bytes_equal(got.rel_logits, want.rel_logits)
+    assert all(bytes_equal(a, b) for a, b in zip(got_state, want_state))
+    before = _kv_conv(
+        tokens,
+        requests,
+        hkv,
+        dim,
+        dynamic=dynamic,
+        publish=publish,
+        extend=False,
+        seed=16,
+    )
+    assert not bytes_equal(got_state[2], before.k.ring)
+    assert bytes_equal(got_state[3], before.k.checkpoint) != publish
+    if return_kv:
+        assert bytes_equal(got.k, want.k) and bytes_equal(got.v, want.v)
+
+
+def test_relative_kv_convolution_of_extend_batches_takes_the_composite():
+    """An extend batch, whose pre-chunk taps read the checkpoint, takes the
+    composite; the fused kernel, decode batches only, cannot serve it."""
+    hq, hkv, dim, total, tokens = 12, 2, 128, 64, 8
+    inputs = qkv(tokens, hq, hkv, dim, seed=17)
+    rows = slots(tokens, total, seed=18)
+
+    def run(extend, override):
+        conv = _kv_conv(
+            tokens,
+            1,
+            hkv,
+            dim,
+            dynamic=False,
+            publish=True,
+            extend=extend,
+            seed=19,
+        )
+        norm = _relative_norm(
+            tokens,
+            hq,
+            hkv,
+            dim,
+            16,
+            1024,
+            value_norm=True,
+            tau=False,
+            seed=20,
+            kv_conv=conv,
+        )
+        q, k, v = split(inputs.clone(), hq, hkv, dim)
+        k_cache, v_cache = gqa_cache(total, hkv, dim, BF16)
+        return gqa_prologue(
+            q.view(tokens, hq, dim),
+            k,
+            v,
+            norm=norm,
+            rotary=None,
+            cache=HeadKVCache(k_cache, v_cache, None, rows),
+            query_dtype=q.dtype,
+            return_kv=False,
+            solution=None,
+            override=override,
+        )
+
+    decode = run(False, "triton_relative_gqa_prologue")
+    assert decode.rel_logits is not None
+    extend = run(True, None)
+    assert bytes_equal(extend.q, run(True, "composite_gqa_prologue").q)
+    with pytest.raises(ValueError):
+        run(True, "triton_relative_gqa_prologue")

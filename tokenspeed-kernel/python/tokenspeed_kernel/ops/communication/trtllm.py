@@ -116,6 +116,8 @@ allreduce_residual_attnres_combine = error_fn
 allreduce_lane_latent_norm = error_fn
 allreduce_mhc_post_norm = error_fn
 supports_allreduce_mhc_post_norm = error_fn
+allreduce_sconv = error_fn
+supports_allreduce_sconv = error_fn
 reducescatter_residual_rmsnorm = error_fn
 trtllm_allreduce_fusion = error_fn
 trtllm_create_ipc_workspace_for_all_reduce_fusion = error_fn
@@ -804,6 +806,115 @@ if current_platform().is_nvidia:
         )
         return residual_out, norm_out
 
+    def supports_allreduce_sconv(
+        x: torch.Tensor, weight: torch.Tensor, group: dist.ProcessGroup
+    ) -> bool:
+        """Admit an anticipated all-reduce input and the taps of a decode ring
+        convolution of its sum for ``allreduce_sconv``.
+
+        x describes the producer's ``[T, H]`` partial, weight the
+        convolution's ``[H, W]`` taps; no values are read or retained. The
+        group's workspace must stay fixed between admission and execution
+        and serve ``T`` rows in one shot.
+        """
+        if (
+            not x.is_cuda
+            or x.ndim != 2
+            or x.dtype not in (torch.bfloat16, torch.float16)
+            or not x.is_contiguous()
+            or not 0 < x.shape[0] <= MNNVL_TWOSHOT_MAX_TOKEN
+            or weight.ndim != 2
+            or weight.shape[0] != x.shape[1]
+            or weight.device != x.device
+        ):
+            return False
+        manager = _manager_for_group(group)
+        ws = manager.mnnvl_workspace
+        if (
+            not manager.initialized
+            or manager.world_size not in _MNNVL_SUPPORTED_WORLD_SIZES
+            or manager.use_fp32_lamport
+            or ws is None
+        ):
+            return False
+        use_oneshot = ws.resolve_use_oneshot(x.shape[0], None, x.shape[1])
+        return use_oneshot and ws.supports(
+            x.shape[0],
+            x.shape[1],
+            x.dtype,
+            manager.world_size,
+            AllReduceFusionPattern.kAllReduce,
+            use_oneshot=use_oneshot,
+        )
+
+    def allreduce_sconv(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        ring: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        seq_idx: torch.Tensor,
+        cache_indices: torch.Tensor,
+        has_initial_state: torch.Tensor,
+        seq_lens: torch.Tensor,
+        block_table: torch.Tensor,
+        checkpoint: torch.Tensor,
+        *,
+        output_scale: float,
+        fp32_acc: bool,
+        group: dist.ProcessGroup,
+    ) -> torch.Tensor:
+        """All-reduce ``x`` and run ``inkling_ring_sconv``'s decode
+        convolution (static taps, residual, no activation, no live publish)
+        on the sum.
+
+        The all-reduce releases the convolution once it has waited for its
+        input, not at its end: the convolution reads only its taps, ring and
+        routing, all older than the all-reduce, before its own wait, so those
+        cold loads run under the reduction. The rows are the all-reduce
+        followed by the convolution, bit for bit.
+
+        Args:
+            x: This rank's contiguous ``[T, H]`` partial.
+            weight, ring, cu_seqlens, seq_idx, cache_indices,
+                has_initial_state, seq_lens, block_table, checkpoint: The
+                decode convolution's operands, as ``inkling_ring_sconv``
+                takes them (``checkpoint`` its ``ckpt_a``).
+            output_scale: Multiplier applied in FP32 after the residual.
+            fp32_acc: Sum the ranks as ``trtllm_workspace_allreduce`` does
+                with this flag.
+            group: A group admitted by ``supports_allreduce_sconv``.
+
+        Returns:
+            The ``[T, H]`` convolution of the all-reduced rows.
+        """
+        from tokenspeed_kernel.ops.conv import inkling_ring_sconv
+
+        summed = _workspace_allreduce(
+            x, group, fp32_acc=fp32_acc, out=None, trigger_completion_at_end=False
+        )
+        if summed is None:
+            raise RuntimeError(
+                "the all-reduce convolution needs its admitted workspace"
+            )
+        return inkling_ring_sconv(
+            summed,
+            weight,
+            ring,
+            cu_seqlens,
+            seq_idx,
+            cache_indices,
+            has_initial_state,
+            seq_lens,
+            block_table,
+            checkpoint,
+            None,
+            num_extends=0,
+            publish_live=False,
+            dynamic_weights=None,
+            output_scale=output_scale,
+            token_range=None,
+        )
+
     def trtllm_workspace_allreduce(
         input_tensor: torch.Tensor,
         group: dist.ProcessGroup,
@@ -836,6 +947,26 @@ if current_platform().is_nvidia:
             no workspace is armed for *group* or the shape is not served --
             the caller keeps its own (NCCL) fallback.
         """
+        return _workspace_allreduce(
+            input_tensor,
+            group,
+            fp32_acc=fp32_acc,
+            out=out,
+            trigger_completion_at_end=True,
+        )
+
+    def _workspace_allreduce(
+        input_tensor: torch.Tensor,
+        group: dist.ProcessGroup,
+        *,
+        fp32_acc: bool,
+        out: torch.Tensor | None,
+        trigger_completion_at_end: bool,
+    ) -> torch.Tensor | None:
+        """``trtllm_workspace_allreduce`` at a chosen release point: without
+        ``trigger_completion_at_end`` its PDL dependents launch once it has
+        waited for its input, so they must read only data older than it
+        before their own wait."""
         if input_tensor.ndim == 0 or input_tensor.numel() == 0:
             return None
         if not input_tensor.is_cuda:
@@ -927,7 +1058,7 @@ if current_platform().is_nvidia:
             hidden_dim=hidden_dim,
             workspace_ptrs=workspace,
             use_oneshot=resolved_oneshot,
-            trigger_completion_at_end=True,
+            trigger_completion_at_end=trigger_completion_at_end,
             fp32_acc=fp32_acc,
             pattern_code=AllReduceFusionPattern.kAllReduce,
             allreduce_out=allreduce_out,

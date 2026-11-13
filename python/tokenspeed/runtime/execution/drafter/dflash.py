@@ -137,6 +137,7 @@ class DFlash(BaseDrafter):
     """DFlash block drafter backed by a native TokenSpeed draft model."""
 
     supports_pd_layerwise_finalization = True
+    uses_shared_context_projection = True
     sample_from_anchor = False
     spec_algorithm = "DFLASH"
 
@@ -340,7 +341,7 @@ class DFlash(BaseDrafter):
             (max_bs,),
             self.draft_query_width,
             dtype=torch.int32,
-            pin_memory=True,
+            pin_memory=self.device.type == "cuda",
         )
         self.block_offsets = torch.arange(
             self.draft_query_width, dtype=torch.int64, device=self.device
@@ -367,6 +368,14 @@ class DFlash(BaseDrafter):
         )
         self.gather_indices_buf = torch.empty(
             (max_bs,), dtype=torch.int64, device=self.device
+        )
+        # Context writes' verify starts; zeros keep stale extend rows non-negative.
+        self.context_starts_buf = torch.zeros(
+            (max_bs,), dtype=torch.int64, device=self.device
+        )
+        # Context writes' verify-row slots.
+        self.context_locs_buf = torch.zeros(
+            (max_bs * self.spec_num_tokens,), dtype=torch.int32, device=self.device
         )
 
     def wire_target(self, target_model) -> None:
@@ -548,7 +557,7 @@ class DFlash(BaseDrafter):
     def _ensure_dist_argmax_state(self, dtype: torch.dtype, device: torch.device):
         """Probe once, before capture, and reuse the verdict for the process."""
         if self._dist_argmax_state is _UNSET:
-            if torch.cuda.is_current_stream_capturing():
+            if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
                 return None  # rendezvous is collective; leave it to warmup
             self._dist_argmax_state = self._probe_dist_argmax_state(dtype, device)
         return self._dist_argmax_state
@@ -776,28 +785,48 @@ class DFlash(BaseDrafter):
         if base_ctx.input_num_tokens == 0:
             return
 
+        self._prepare_proposal_features(base_ctx, hidden, accept_lengths)
         positions = self.input_buffers.positions_buf[: base_ctx.input_num_tokens]
-        # Context rows belong to the draft group's page-id space. This runs
-        # before the draft publishes its next proposal window.
-        backend = self.attn_backend
-        if base_ctx.num_extends == base_ctx.bs:
-            # A PD prefill worker may never publish a decode window.
-            cache_locs = backend.extend_span_locations()
-        elif base_ctx.num_extends == 0:
-            cache_locs = backend.decode_window_locations()
-        else:
-            cache_locs = torch.cat(
-                (
-                    backend.extend_span_locations(),
-                    backend.decode_window_locations(),
-                )
-            )
+        cache_locs = self._context_cache_locations(base_ctx)
         self._write_native_cache(
             hidden,
             positions,
             cache_locs[: base_ctx.input_num_tokens],
             decode_only=base_ctx.num_extends == 0,
         )
+
+    def _context_cache_locations(self, ctx: ForwardContext) -> torch.Tensor:
+        """Return the slots of the round's target rows in the draft's own pages.
+
+        Rows keep the target's packed order: extend rows, then verify rows.
+        Each decode request writes the target's verify width from its first
+        verify position. The draft's decode window has the draft's query
+        width instead, which DSpark narrows by the anchor row. This runs
+        before the draft publishes its next proposal window, over the table
+        the runner refreshed for this round.
+
+        Args:
+            ctx: The target forward's context.
+
+        Returns:
+            ``[ctx.input_num_tokens]`` int32 cache slots.
+        """
+        backend = self.attn_backend
+        if ctx.num_extends == ctx.bs:
+            # A PD prefill worker may never publish a decode window.
+            return backend.extend_span_locations()
+        width = self.spec_num_tokens
+        first = ctx.input_num_tokens - (ctx.bs - ctx.num_extends) * width
+        # Extend requests resolve stale non-negative starts; their slots are dropped.
+        starts = self.context_starts_buf[: ctx.bs]
+        starts[ctx.num_extends :].copy_(
+            self.input_buffers.positions_buf[first : ctx.input_num_tokens : width]
+        )
+        backend.draft_write_locations_uniform(self.context_locs_buf, starts, width)
+        verify = self.context_locs_buf[ctx.num_extends * width : ctx.bs * width]
+        if ctx.num_extends == 0:
+            return verify
+        return torch.cat((backend.extend_span_locations(), verify))
 
     def _update_draft_prefix_lengths(
         self, base_ctx: ForwardContext, accept_lengths: torch.Tensor
@@ -813,19 +842,36 @@ class DFlash(BaseDrafter):
             old_lens = self.runtime_states.valid_cache_lengths.index_select(
                 0, req_pool_indices
             )
-            self.draft_seq_lens_buf[:bs].copy_(
-                old_lens.to(torch.int32) + accept_lengths[:bs].to(torch.int32)
+            torch.add(
+                old_lens.to(torch.int32),
+                accept_lengths[:bs].to(torch.int32),
+                out=self.draft_seq_lens_buf[:bs],
             )
             return
 
         if base_ctx.input_num_tokens == 0:
             return
 
+        takes, last_row = self._accepted_target_rows(base_ctx, accept_lengths)
+        positions = self.input_buffers.positions_buf[: base_ctx.input_num_tokens]
+        old_lens = self.runtime_states.valid_cache_lengths.index_select(
+            0, req_pool_indices
+        ).to(torch.int32)
+        # Writers may materialize rejected rows too; only this accepted prefix
+        # is visible to the next draft, and later rounds overwrite the rest.
+        self.draft_seq_lens_buf[:bs].copy_(
+            torch.where(takes > 0, (positions[last_row] + 1).to(torch.int32), old_lens)
+        )
+
+    def _accepted_target_rows(
+        self, base_ctx: ForwardContext, accept_lengths: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return accepted counts and final packed row per request."""
+        bs = base_ctx.bs
         # Target verification produces spec_num_tokens rows per decode request;
         # prefill rows retain their actual chunk lengths.
         lengths = self.input_buffers.input_lengths_buf[:bs].to(torch.int64).clone()
         lengths[base_ctx.num_extends :] = self.spec_num_tokens
-        positions = self.input_buffers.positions_buf[: base_ctx.input_num_tokens]
         starts = torch.cumsum(lengths, 0) - lengths
         takes = lengths.clone()
         if bs > base_ctx.num_extends:
@@ -835,14 +881,12 @@ class DFlash(BaseDrafter):
                 .clamp(min=0, max=self.spec_num_tokens)
             )
         last_row = (starts + takes - 1).clamp(min=0, max=base_ctx.input_num_tokens - 1)
-        old_lens = self.runtime_states.valid_cache_lengths.index_select(
-            0, req_pool_indices
-        ).to(torch.int32)
-        # Writers may materialize rejected rows too; only this accepted prefix
-        # is visible to the next draft, and later rounds overwrite the rest.
-        self.draft_seq_lens_buf[:bs].copy_(
-            torch.where(takes > 0, (positions[last_row] + 1).to(torch.int32), old_lens)
-        )
+        return takes, last_row
+
+    def _prepare_proposal_features(
+        self, _ctx: ForwardContext, _hidden: torch.Tensor, _accept_lengths: torch.Tensor
+    ) -> None:
+        """Prepare round-local features before the shared block forward."""
 
     def _write_native_cache(
         self,
@@ -915,6 +959,8 @@ class DFlash(BaseDrafter):
         # torch.mm(out=...) is always used; workspace pre-allocated at warmup.
         self._fused_kv_k_buffers = []
         self._fused_kv_v_buffers = []
+        if not self.uses_shared_context_projection:
+            return
         if self.draft_model_runner.mapping.attn.kvp_size > 1:
             # The fused scatter takes physical slots and has no ownership
             # mask; the per-layer writer translates through the placement.
@@ -1167,6 +1213,8 @@ class DFlash(BaseDrafter):
         self._sink_cache_locs: torch.Tensor | None = None
         # Whether this round's last tap already wrote the draft's context KV.
         self._context_written = False
+        if not self.uses_shared_context_projection:
+            return
         model = self.draft_model_runner.model
         if getattr(model, "fc_norm", None) is not None:
             logger.info(
@@ -1223,7 +1271,7 @@ class DFlash(BaseDrafter):
         num_tokens = ctx.input_num_tokens
         self._sink_tokens = num_tokens
         self._sink_positions = self.input_buffers.positions_buf[:num_tokens]
-        self._sink_cache_locs = self.attn_backend.decode_window_locations()[:num_tokens]
+        self._sink_cache_locs = self._context_cache_locations(ctx)
         ctx.target_capture_sink = self
 
     def on_target_capture(self, capture_idx: int, hidden: torch.Tensor) -> None:

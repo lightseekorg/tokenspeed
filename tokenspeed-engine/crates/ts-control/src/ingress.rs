@@ -238,12 +238,14 @@ pub fn admit(mut request: TokenizedGenerateReqInput, limits: &IngressLimits) -> 
     });
     let mut params = request.sampling_params;
     sampling::resolve(&mut params, &rid);
-    if let Some(reasoning) = &limits.reasoning {
-        reasoning.defer_schema(
-            &mut params,
-            request.input_ids.as_deref().unwrap_or_default(),
-        );
-    }
+    let unanswerable = limits.reasoning.as_ref().and_then(|reasoning| {
+        reasoning
+            .defer_schema(
+                &mut params,
+                request.input_ids.as_deref().unwrap_or_default(),
+            )
+            .err()
+    });
     // Checked as the client sent them: the context clamp below is the
     // engine's, so `min_new_tokens` is bounded by the budget asked for, not
     // the one the context leaves (the request then finishes at its length).
@@ -251,6 +253,7 @@ pub fn admit(mut request: TokenizedGenerateReqInput, limits: &IngressLimits) -> 
         .validation_error
         .clone()
         .or_else(|| embeddings.as_ref().err().cloned())
+        .or(unanswerable)
         .or_else(|| {
             request
                 .cache_session_id
@@ -583,7 +586,7 @@ mod tests {
     use ts_wire::{Modality, MultimodalDataItem, MultimodalInputs, Value};
 
     use super::*;
-    use crate::request::FinishReason;
+    use crate::{json_framing::MessageBoundary, request::FinishReason};
 
     fn limits() -> IngressLimits {
         IngressLimits {
@@ -864,6 +867,7 @@ mod tests {
             schema_slot: "SLOT".to_owned(),
             markers: Some((7, 8)),
             implicit_closer: None,
+            boundary: None,
         };
         let admitted = |limits: &IngressLimits, prompt: Vec<i32>, schema: &str| {
             let params = SamplingParams {
@@ -931,6 +935,66 @@ mod tests {
                 .as_deref(),
             Some(schema)
         );
+    }
+
+    #[test]
+    fn a_json_answer_needs_a_prompt_that_ends_at_a_message_boundary() {
+        // Block headers are 5 (model) 6 (text); 9 closes a message and 10 ends the turn.
+        let limits = IngressLimits {
+            grammar: true,
+            reasoning: Some(ReasoningGrammar {
+                continues: r#"{"continues":SLOT}"#.to_owned(),
+                may_open: r#"{"may_open":SLOT}"#.to_owned(),
+                schema_slot: "SLOT".to_owned(),
+                markers: None,
+                implicit_closer: None,
+                boundary: Some(MessageBoundary {
+                    open_answer: vec![5, 6],
+                    closed: vec![vec![9], vec![9, 10]],
+                }),
+            }),
+            ..limits()
+        };
+        let schema = r#"{"type":"object"}"#;
+        let admit_with = |prompt: Vec<i32>| {
+            let params = SamplingParams {
+                json_schema: Some(schema.to_owned()),
+                ..Default::default()
+            };
+            admit(request("r", prompt, params), &limits).expect("one request id")
+        };
+        let tag = |admitted: Admitted| match admitted {
+            Admitted::Run(admission) => admission.sampling_params.structural_tag,
+            Admitted::Refused { .. } => panic!("expected admission"),
+        };
+        // An empty answer header: the reply is the payload.
+        assert_eq!(
+            tag(admit_with(vec![1, 9, 5, 6])).as_deref(),
+            Some(r#"{"continues":{"type":"object"}}"#)
+        );
+        // A closed message, or no prompt: the reply writes its own blocks.
+        for prompt in [vec![1, 9], vec![1, 9, 10], vec![]] {
+            assert_eq!(
+                tag(admit_with(prompt)).as_deref(),
+                Some(r#"{"may_open":{"type":"object"}}"#)
+            );
+        }
+        // A prompt that ends inside another block cannot take a JSON answer.
+        for prompt in [vec![1, 9, 5], vec![1, 9, 5, 6, 2]] {
+            let Admitted::Refused { state, .. } = admit_with(prompt) else {
+                panic!("expected a refusal");
+            };
+            let message = state
+                .finished_reason
+                .as_ref()
+                .and_then(FinishReason::abort_message)
+                .expect("refused requests abort")
+                .to_owned();
+            assert!(
+                message.contains("closed message or an empty assistant text header"),
+                "{message}"
+            );
+        }
     }
 
     #[test]

@@ -163,6 +163,12 @@ def _resolve_heterogeneous_draft_family(
                 "Kimi-K3 unified cache currently requires an ordinary MLA draft view"
             )
         return draft_family
+    if target_family == "inkling":
+        if draft_family != "mha":
+            raise RuntimeError(
+                "Inkling unified cache requires an ordinary MHA draft view"
+            )
+        return draft_family
     if target_family not in _ORDINARY_CACHE_FAMILIES:
         if draft_family_declared:
             raise RuntimeError(
@@ -320,6 +326,7 @@ _HYBRID_DSA_KDA_ARCHITECTURES = {
 _INKLING_ARCHITECTURES = {
     "InklingForConditionalGeneration",
     "InklingForConditionalGenerationNextN",
+    "Inkling2ForConditionalGeneration",
 }
 
 _DSPARK_DRAFT_ARCHITECTURES = frozenset({"DeepseekV41ForCausalLMDSpark"})
@@ -1376,6 +1383,9 @@ def create_attn_components(
     )
     if draft_family_declared:
         draft_cache_family = draft_profile.cache_family
+    elif draft_attn_config is not None and draft.is_inkling:
+        # The softmax config alone cannot tell a convolutional draft from MHA.
+        draft_cache_family = "inkling"
     else:
         draft_cache_family = _ordinary_cache_family(draft_attn_config)
     heterogeneous_draft_family = _resolve_heterogeneous_draft_family(

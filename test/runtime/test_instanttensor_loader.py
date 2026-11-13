@@ -55,7 +55,7 @@ class TestInstantTensorConfig:
 
             loader = DefaultModelLoader(LoadConfig(load_format="instanttensor"))
             _, hf_weights_files, use_safetensors = loader._prepare_weights(
-                tmpdir, revision=None, fall_back_to_pt=False
+                tmpdir, revision=None, fall_back_to_pt=False, weight_files=None
             )
 
             assert use_safetensors

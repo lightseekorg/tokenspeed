@@ -60,6 +60,15 @@ scale view falls back to FlashInfer where its M range permits, or Triton.
 This scale check is conservative even when a layout copy would align the view.
 Online quantization supplies freshly allocated, aligned activations and scales.
 
+## Dense FP32 output
+
+For BF16 or FP16 inputs, `mm(..., out_dtype=torch.float32)` stores the FP32
+accumulator directly. It must not widen a result already rounded to the input
+dtype. Scaling and bias operate on that FP32 result, including when the caller
+supplies a strided output buffer. On gfx950, `gluon_mm_bf16_fp32_gfx950` serves
+measured BF16 projections; the AMD ops README records its shapes and reductions,
+which need not match a vendor GEMM bit for bit.
+
 ## Small dense projections
 
 `mv` selects the registered small-row projection implementation. Its dispatcher
@@ -177,6 +186,12 @@ SM100/103 W4A16, and fused NVFP4 GEMMs cover the shared token budget, including
 larger observed inputs and the enclosing native bucket. Native mappers,
 constraints, and caches are preserved. Explicit buckets and disabled profiling
 retain their semantics; small-M BF16 keeps its existing bound.
+
+## Decode-size BF16 projections
+
+`triton_skinny.skinny_mm` computes `x @ w.T` for up to 32 BF16 rows on NVIDIA,
+streaming the weight once. Its module docstring records the split-K fold, which
+keeps a row's result independent of the batch, and its PDL order.
 
 ## Block-FP8 DeepGEMM
 

@@ -517,6 +517,19 @@ setup, never publishes results; each kernel may delay it for performance.
 Streaming top-k, for example, avoids delaying scoring waves with waiting
 merge CTAs. Graphs retain their captured PDL setting; recapture to change it.
 
+An op whose successors read only constant operands before their own wait
+may instead trigger before it waits. A finished kernel still implies a
+finished predecessor, but a successor may then start before that predecessor
+ends, so a weight-streaming projection after a chain of such ops prefetches
+across the whole chain.
+A kernel that preloads older producer data before its wait, such as the
+combine-norm below, needs a kernel launched after that producer to wait
+first, usually its direct predecessor. Kernels in between may trigger
+first: a kernel starts only after its predecessor triggered, so the chain
+reaches back to the one that waited. The ops READMEs (`moe`,
+`attention/rmha`, `conv`, `residual`) name the kernels that trigger first
+and what each preloads before its wait.
+
 A captured kernel launches early only through a single programmatic
 dependency. A stream join adds the branch's last node to the next kernel's
 dependencies, and with two it waits for both to finish. `StreamFork` therefore
@@ -756,6 +769,17 @@ before capture begins. This applies to ordinary, encoder, and decoder captures.
 Graph-memory observation wraps only capture; eager warmups, decoder rearming
 and smoke-test replay stay outside the measured region.
 
+An eager break returns a tensor or a fixed plain-tuple structure of tensors
+and optional `None` leaves. Each tensor lands in stable handoff storage before
+the next segment runs; same-shaped leaves that are live together have separate
+buffers. Replay of a tuple output rejects changed structure, dtype, device or
+trailing dimensions; any output may have shorter leading rows, and replay clears
+the padded tail on every leaf. Sequential
+breaks may reuse handoffs after their previous results are consumed, and captures
+that never replay concurrently may share those storage slots across token buckets.
+Tensor inputs keep their weak storage aliases and context arguments are rebound
+to the live forward context, independently of the output structure.
+
 ### One output layout per forward
 
 Every ForwardContext and grammar completion carries a required, immutable
@@ -779,6 +803,16 @@ pairs the padded context with a padded layout, then restores the original
 live layout before output/state processing. Grammar completions retain
 their immutable per-step layout, independently of later context updates.
 Idle graph warmup also supplies an explicit layout.
+
+### Decoder input embeddings
+
+Prefill graphs stage the text model's `get_decoder_input_embedding()` lookup
+outside the graph, then copy its result into the existing static
+`input_embeds` buffer; a model without the hook keeps the raw `embed_tokens`
+lookup. The hook returns rows ready for the inner model's supplied-embedding
+branch: a lookup-only normalization belongs in the hook, while normalization
+shared by text and media stays inside the model. Graph eligibility,
+static-buffer ownership, and zeroing of padded rows are unchanged.
 
 ### Prefill graphs around a row narrowing
 
@@ -1264,14 +1298,13 @@ scores; no backend computes them. `docs/guides/sampling-calibration.md` is
 the contract: ordering, masking, supported configurations and cost.
 
 `sample()` and `verify()` land their outputs in each sampling backend's
-persistent output buffers, on eager and replay alike. The FlashInfer backend
-packs tokens and accept lengths into one region (`_output_pack_buf`), so its
-`get_packed_output_d2h` collapses the two device-to-host copies into one; the
-Triton backends and `sonic` return separate token and length buffers and
-take the executor's two-copy path (`get_packed_output_d2h` returns None).
-The stop conditions cut the returned accept lengths in place (0 for a stopped
-request), so a backend whose decode rows return a buffer of ones refills it on
-every call, as `sonic` and FlashInfer do.
+persistent output buffers, on eager and replay alike. When tokens and accept
+lengths share one region (`_output_pack_buf`, where every `verify()` lands
+them), `get_packed_output_d2h` brings both back in one device-to-host copy;
+otherwise (`sonic`, which returns its own token and length buffers) it returns
+None and the executor makes two. The stop conditions cut the returned accept
+lengths in place (0 for a stopped request), so a backend whose decode rows
+return a buffer of ones refills it on every call, as `sonic` and FlashInfer do.
 
 ### Logits capture state follows the tensor's device
 
@@ -1286,7 +1319,7 @@ plain gather, without entering CUDA APIs on another device.
 
 Enumerated residue in `ForwardStepRunner.__call__`, all tied to the mechanics
 of replaying a recorded graph: input-buffer padding to the ladder bs plus the
-DFLASH sentinel req-pool rows, `_set_graph_state_write_indices`, the DeepEP
+DFLASH sentinel req-pool rows, the DeepEP
 dispatch-mode restore (`deepep_adapter.replay()`), the sampler-variant
 `graph_key` lookup, the `TOKENSPEED_GRAPH_DEBUG` metadata verify,
 output-buffer re-slicing, the `ctx.bs` save/restore, and the replay itself
@@ -1680,9 +1713,13 @@ history destinations through `write_locations`.
   `extend_span_locations()` expose the writing router's history windows.
   DFLASH reads its own router before publishing a proposal window, so context
   KV follows the draft group's pages even when its retention differs from
-  the target's. The runner refreshes both routers before the target forward;
-  capture-tap writes and the fallback context write consume that same round's
-  draft locations.
+  the target's. Extend rows take the draft's extend span. Verify rows take
+  the target's verify width from each request's first verify position,
+  resolved through `draft_write_locations_uniform`: the draft's own decode
+  window has the draft's query width, which DSpark narrows by the anchor
+  row. The runner refreshes both routers before the target forward;
+  capture-tap writes and the fallback context write resolve over that same
+  round's draft table.
 * **Writes outside the backend** (the attention prologue) fetch their slots
   immediately before the write. An offloaded latent
   projection uses the compute slots returned by its sparse prepare. When a draft step-0
@@ -1752,6 +1789,10 @@ belongs to the output mixer. Capture execution and projection-weight placement
 use this same owner on both PP and non-PP. There is no boundary deferral or
 recovery operation. Capture's mixed stream must not be replaced by the fused
 attention input, which already includes input-layer normalization.
+
+Block draft query width follows the normalized `sample_from_anchor` checkpoint policy.
+`ModelConfig` supplies the legacy algorithm convention only when that metadata is absent.
+A verification window of W tokens has W - 1 proposals but needs W - 1 or W draft queries, depending on that policy.
 
 `execution/dspark_context.py` contains `DSparkContextProducer` and the model
 interface it consumes. K3 tap ownership and projection arithmetic live in
@@ -1850,7 +1891,7 @@ seam is `BaseDrafter.prepare_target_forward(ctx)`, called right before the
 target runs: the drafter decides under its own gate whether this round
 qualifies and attaches what it needs; a fresh context per round means
 nothing outlives it, and a model that sees no attachment does nothing.
-DFLASH is the one user: on decode-only rounds it attaches
+DFLASH is one user: on decode-only rounds it attaches
 `ctx.target_capture_sink`, the target hands each captured tap to
 `on_target_capture` as it is produced, and the sink copies it (rounding a
 wider residual once) into its columns of one tap block. The last tap runs

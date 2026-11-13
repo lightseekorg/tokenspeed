@@ -46,6 +46,10 @@ from transformers import (
 from tokenspeed.runtime.configs import (
     DeepseekV41Config,
     DeepseekV41TextConfig,
+    Inkling2MMConfig,
+    Inkling2ModelConfig,
+    Inkling2MTPConfig,
+    Inkling2VisionConfig,
     InklingMMConfig,
     InklingModelConfig,
     KimiK2Config,
@@ -97,6 +101,10 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     KimiK3DSparkConfig.model_type: KimiK3DSparkConfig,
     InklingModelConfig.model_type: InklingModelConfig,
     InklingMMConfig.model_type: InklingMMConfig,
+    Inkling2ModelConfig.model_type: Inkling2ModelConfig,
+    Inkling2MMConfig.model_type: Inkling2MMConfig,
+    Inkling2MTPConfig.model_type: Inkling2MTPConfig,
+    Inkling2VisionConfig.model_type: Inkling2VisionConfig,
     Glm53FlashConfig.model_type: Glm53FlashConfig,
     NemotronHConfig.model_type: NemotronHConfig,
     NemotronHOmniConfig.model_type: NemotronHOmniConfig,
@@ -461,6 +469,14 @@ def get_config(
             )
             del text_config.quantization_config["modules_to_not_convert"]
 
+    if is_draft_worker and isinstance(config, (Inkling2MMConfig, Inkling2MTPConfig)):
+        if speculative_algorithm != "DSPARK":
+            raise NotImplementedError("Inkling2 requires its separate DSpark MTP model")
+        if isinstance(config, Inkling2MMConfig):
+            config = Inkling2MTPConfig.from_target(config)
+        config._name_or_path = model
+        text_config = config
+
     # If the draft head ships in the same checkpoint as the base model,
     # rewrite the architecture in place so the model loader dispatches
     # to the *NextN / *Eagle3 entry class instead of the base one.
@@ -536,6 +552,8 @@ def get_config(
         "InklingForConditionalGeneration",
         "InklingForConditionalGenerationNextN",
         "InklingMMConfig",
+        "Inkling2ForConditionalGeneration",
+        "Inkling2MMConfig",
         "Qwen3OmniMoeForConditionalGeneration",
         "Qwen3OmniMoeConfig",
         "Qwen3ASRForConditionalGeneration",
