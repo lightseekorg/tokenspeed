@@ -56,6 +56,54 @@ StorageStats Scheduler::GetStorageStats() const {
     return stats;
 }
 
+bool Scheduler::SharedPrefixStorageEnabled() const {
+    // In-forward State checkpoints can omit prompt endpoints required by exact-prefix receipts.
+    if (config_.state_checkpoint_in_forward && std::ranges::any_of(config_.cache_groups, [](const auto& group) {
+            return group.attn_kind == AttnKind::kState;
+        }))
+        return false;
+    return storage_transfers_ && coordinator_.HasHostPool() && config_.role != Role::kD &&
+           !config_.disable_prefix_cache && storage_transfers_->Config().max_operations >= 2 &&
+           storage_transfers_->Config().max_host_blocks >= 2;
+}
+
+Scheduler::SharedPrefixPublication Scheduler::GetSharedPrefixPublication(std::span<const std::int32_t> tokens,
+                                                                         std::int32_t max_prefix_tokens) const {
+    if (max_prefix_tokens <= 0 || static_cast<std::size_t>(max_prefix_tokens) > tokens.size() ||
+        tokens.size() > 1048576)
+        throw std::invalid_argument("invalid bounded shared prefix publication query");
+    if (!SharedPrefixStorageEnabled()) return {.status = "unsupported"};
+    SharedPrefixPublication result{.status = "pending", .cache_epoch = storage_transfers_->PublicationEpoch()};
+    const auto grain = coordinator_.PrefixGranularity();
+    const auto input = tokens.first(static_cast<std::size_t>(max_prefix_tokens));
+    std::vector<std::span<const std::int32_t>> pages;
+    for (std::int32_t i = 0; i + grain <= max_prefix_tokens; i += grain) pages.push_back(input.subspan(i, grain));
+    const auto hashes = ComputePrefixHashes(pages, "");
+    const auto tail_tokens = max_prefix_tokens % grain;
+    const auto tail = tail_tokens
+                          ? std::optional{TailPublication{
+                                .tail_tokens = tail_tokens,
+                                .hash = HashPrefixPage(input.last(tail_tokens),
+                                                       hashes.empty() ? ContentHash{} : ContentHash{hashes.back()})}}
+                          : std::nullopt;
+    const auto dependencies = coordinator_.SharedPrefixKeys(
+        {.prefix_hashes = hashes, .tokens = input, .max_tokens = max_prefix_tokens, .tail = tail},
+        static_cast<std::size_t>(storage_transfers_->Config().metadata_entries));
+    if (dependencies.max_tokens == 0)
+        result.status = "unsupported";
+    else if (dependencies.max_tokens < 0)
+        result.status = "too_large";
+    else if (dependencies.max_tokens > 0 && !dependencies.keys.empty() &&
+             std::ranges::all_of(dependencies.keys,
+                                 [&](const auto& key) { return storage_transfers_->WasPublished(key); })) {
+        result.status = "published";
+        result.confirmed_prefix_tokens = max_prefix_tokens;
+    } else if (storage_transfers_->PressureGateClosed() || storage_transfers_->NumQuarantined() > 0) {
+        result.status = "pressure";
+    }
+    return result;
+}
+
 void Scheduler::expireStorage(Request& request) {
     if (request.Is<fsm::Prefetching>()) {
         spdlog::debug("[L3] rid={} op_id={} prefetch timed out", request.Id(),
@@ -133,7 +181,8 @@ void Scheduler::prepareStorage(Request& request) {
         const CacheCoordinator::PromptPrefix prompt{.prefix_hashes = state->hashes,
                                                     .tokens = request.TokenSlice(0, state->max_tokens),
                                                     .max_tokens = state->max_tokens,
-                                                    .tail = state->tail};
+                                                    .tail = state->tail,
+                                                    .shared_prefix_tokens = request.SharedPrefixTokens()};
         // Another request's D2H/GET may have fulfilled this dependency. This
         // bounded local check does not rehash the prompt while it waits.
         const auto probe = coordinator_.ProbePromptPrefix(prompt);
@@ -194,8 +243,11 @@ void Scheduler::prepareStorage(Request& request) {
         }
     };
     const auto prompt = [&request, &hashes, &bound, &tail]() {
-        return CacheCoordinator::PromptPrefix{
-            .prefix_hashes = hashes, .tokens = request.TokenSlice(0, bound), .max_tokens = bound, .tail = tail};
+        return CacheCoordinator::PromptPrefix{.prefix_hashes = hashes,
+                                              .tokens = request.TokenSlice(0, bound),
+                                              .max_tokens = bound,
+                                              .tail = tail,
+                                              .shared_prefix_tokens = request.SharedPrefixTokens()};
     };
     setBound(max_tokens);
     const auto probe = coordinator_.ProbePromptPrefix(prompt());

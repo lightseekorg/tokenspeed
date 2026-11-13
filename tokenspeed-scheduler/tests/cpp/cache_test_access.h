@@ -36,6 +36,10 @@
 namespace tokenspeed {
 
 struct CacheCoordinatorTestAccess {
+    static std::size_t CacheGroupRegistrySize(const CacheCoordinator& coordinator) {
+        return coordinator.cache_group_tags_.size();
+    }
+
     static auto MatchPrefix(CacheCoordinator& coordinator, std::span<const std::string> content_hashes) {
         return coordinator.acquirePrefix(coordinator.ProbePrefix(content_hashes), ++coordinator.next_access_epoch_);
     }
@@ -259,7 +263,7 @@ inline std::optional<CacheCoordinator::AdmissionResult> AdmitForTest(
     }
     return coordinator.Admit(std::move(prefix), demands, progress, copy_in_blocks, copy_in_point,
                              /*request_access_epoch=*/std::nullopt, /*evict_blocks_past_segments=*/false,
-                             /*session_id=*/{});
+                             /*session_id=*/{}, /*cache_group_id=*/{});
 }
 
 inline std::optional<CacheCoordinator::AdmissionResult> AdmitForTest(

@@ -402,6 +402,16 @@ which publishes it under the boundary's page hash, like a natural checkpoint,
 with the sliding window behind it as the endpoint's window, even at a chunk
 end, never as an unproven boundary that eviction takes first
 (`cache-concepts.md`).
+For restricted State groups (`checkpoint_granularity = G > 1`), the boundary
+instead is `floor((prompt_tokens - 1) / G) * G`, including prompts that fit
+within one chunk. A prompt of at most `G` tokens therefore has no positive
+input checkpoint. The P and fused roles require this flag, prefix caching,
+and a chunk budget of at least `G`; `G` must be a multiple of the prefix page
+size. The D role neither needs this flag nor publishes its transferred state
+as a reusable restricted checkpoint. An interior checkpoint does not mean
+that every shorter aligned prefix was saved: another request can reuse only
+a boundary whose State and all required KV dependencies remain present.
+
 A boundary a chunk ends on needs none (the chunk end's slot 1 is published
 there, as at a junction). The scan emits states only whole pages from a
 forward's start, and the budget a batch's decodes leave rarely ends on a page,

@@ -245,7 +245,8 @@ public:
             std::optional<CacheCoordinator::AdmissionResult> result;
             sample.admit += Measure([&] {
                 result = Coordinator().Admit(std::move(probe), demands, RequestProgress{}, {}, std::nullopt,
-                                             std::nullopt, /*evict_blocks_past_segments=*/false, /*session_id=*/{});
+                                             std::nullopt, /*evict_blocks_past_segments=*/false, /*session_id=*/{},
+                                             /*cache_group_id=*/{});
             });
             Require(result.has_value(), "cache admission failed");
             Require(result->new_page_ids[0].size() == config_.EvictedPages() / config_.batch_size,
@@ -369,8 +370,9 @@ private:
         std::array<BlockTable, 1> tables;
         const std::array demands{
             GroupDemand{.table = &tables[0], .extent = DenseGrowth{total - hit}, .reserve_tokens = 0}};
-        const auto result = Coordinator().Admit(std::move(probe), demands, RequestProgress{}, {}, std::nullopt,
-                                                std::nullopt, /*evict_blocks_past_segments=*/false, /*session_id=*/{});
+        const auto result =
+            Coordinator().Admit(std::move(probe), demands, RequestProgress{}, {}, std::nullopt, std::nullopt,
+                                /*evict_blocks_past_segments=*/false, /*session_id=*/{}, /*cache_group_id=*/{});
         Require(result.has_value(), "cache fill failed");
         if (enable_events_) {
             const auto history = static_cast<std::int32_t>(&hashes - histories_.data());

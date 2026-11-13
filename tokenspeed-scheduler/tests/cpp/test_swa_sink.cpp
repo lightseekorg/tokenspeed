@@ -58,7 +58,8 @@ TEST(SwaSink, SinkIsPublishedWhenTheTrailingWindowIsEmpty) {
     auto coordinator = MakeCoordinator(specs, 1, pool, false, nullptr, nullptr, false, false, 0);
     std::vector<BlockTable> tables(1);
     const std::array demands{GroupDemand{.table = &tables[0], .extent = DenseGrowth{6}}};
-    ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, {}, {}, std::nullopt, std::nullopt, false, {}));
+    ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, {}, {}, std::nullopt, std::nullopt, false, {},
+                                  /*cache_group_id=*/{}));
     coordinator.CacheCompletedBlocks(
         tables, RequestProgress{.completed_pages = CompletedPages{.prefix_hashes = kHashes}, .num_computed_tokens = 6},
         1);
@@ -80,7 +81,8 @@ TEST(SwaSink, DeviceMatchNeedsHeadAndWindow) {
     EXPECT_EQ(probe.device.per_group[0].hits, (std::vector<std::uint8_t>{1, 0, 0, 0, 1, 1}));
     std::vector<BlockTable> tables(1);
     const std::array demands{GroupDemand{.table = &tables[0], .extent = DenseGrowth{4}}};
-    auto admitted = coordinator.Admit(std::move(probe), demands, {}, {}, std::nullopt, std::nullopt, false, {});
+    auto admitted = coordinator.Admit(std::move(probe), demands, {}, {}, std::nullopt, std::nullopt, false, {},
+                                      /*cache_group_id=*/{});
     ASSERT_TRUE(admitted);
     ASSERT_TRUE(tables[0].Blocks()[0]);
     EXPECT_FALSE(tables[0].Blocks()[1]);
@@ -126,8 +128,8 @@ TEST(SwaSink, MatchedHeadFitsTheExactLandingCapacity) {
                     const std::array demands{GroupDemand{
                         .table = &tables[0],
                         .extent = SparseSuffix{.extent_tokens = 24, .first_block = 4, .head_blocks = head_blocks}}};
-                    auto admitted =
-                        coordinator.Admit(std::move(probe), demands, {}, {}, std::nullopt, std::nullopt, false, {});
+                    auto admitted = coordinator.Admit(std::move(probe), demands, {}, {}, std::nullopt, std::nullopt,
+                                                      false, {}, /*cache_group_id=*/{});
                     ASSERT_TRUE(admitted);
                     for (auto slot = 0; slot < head_blocks; ++slot) EXPECT_TRUE(tables[0].Blocks()[slot]);
                     EXPECT_TRUE(tables[0].Blocks()[4]);
@@ -158,7 +160,7 @@ TEST(SwaSink, PartialSinkTailCopiesFitTheExactLandingCapacity) {
         std::vector<BlockTable> published(1);
         const std::array publish_demands{GroupDemand{.table = &published[0], .extent = DenseGrowth{6}}};
         ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), publish_demands, {}, {}, std::nullopt, std::nullopt,
-                                      false, {}));
+                                      false, {}, /*cache_group_id=*/{}));
         coordinator.CacheCompletedBlocks(
             published,
             RequestProgress{
@@ -184,7 +186,8 @@ TEST(SwaSink, PartialSinkTailCopiesFitTheExactLandingCapacity) {
         std::vector<BlockTable> tables(1);
         const std::array demands{GroupDemand{
             .table = &tables[0], .extent = SparseSuffix{.extent_tokens = 24, .first_block = 4, .head_blocks = 2}}};
-        auto admitted = coordinator.Admit(std::move(probe), demands, {}, {}, std::nullopt, std::nullopt, false, {});
+        auto admitted = coordinator.Admit(std::move(probe), demands, {}, {}, std::nullopt, std::nullopt, false, {},
+                                          /*cache_group_id=*/{});
         ASSERT_TRUE(admitted);
         EXPECT_EQ(admitted->load_pairs.size(), host_hit ? 2 : 0);
         EXPECT_EQ(admitted->pages_to_copy[0].size(), host_hit ? 0 : 1);
@@ -213,7 +216,8 @@ TEST(SwaSink, HostOnlyMatchLoadsHeadAndWindow) {
     EXPECT_EQ(probe.host.num_common_tokens, 24);
     std::vector<BlockTable> tables(1);
     const std::array demands{GroupDemand{.table = &tables[0], .extent = DenseGrowth{4}}};
-    auto admitted = coordinator.Admit(std::move(probe), demands, {}, {}, std::nullopt, std::nullopt, false, {});
+    auto admitted = coordinator.Admit(std::move(probe), demands, {}, {}, std::nullopt, std::nullopt, false, {},
+                                      /*cache_group_id=*/{});
     ASSERT_TRUE(admitted);
     EXPECT_EQ(admitted->load_pairs.size(), 3);
     ASSERT_TRUE(tables[0].Blocks()[0]);
@@ -256,7 +260,8 @@ TEST(SwaSink, MixedHostHitUsesTheOrdinarySuffixSplit) {
         std::vector<BlockTable> tables(2);
         const std::array demands{GroupDemand{.table = &tables[0], .extent = DenseGrowth{4}},
                                  GroupDemand{.table = &tables[1], .extent = DenseGrowth{4}}};
-        auto admitted = coordinator.Admit(std::move(probe), demands, {}, {}, std::nullopt, std::nullopt, false, {});
+        auto admitted = coordinator.Admit(std::move(probe), demands, {}, {}, std::nullopt, std::nullopt, false, {},
+                                          /*cache_group_id=*/{});
         ASSERT_TRUE(admitted);
         EXPECT_EQ(admitted->load_pairs.size(), sink_on_device ? 4 : 9);
         EXPECT_TRUE(tables[1].Blocks()[0]);
@@ -271,7 +276,8 @@ TEST(SwaSink, ReclaimExportAndRestorePreserveHead) {
     auto coordinator = MakeCoordinator(kSpecs, 4, pool, false, nullptr, &snapshot, false, false, 0);
     std::vector<BlockTable> tables(1);
     const std::array demands{GroupDemand{.table = &tables[0], .extent = DenseGrowth{24}}};
-    ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, {}, {}, std::nullopt, std::nullopt, false, {}));
+    ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, {}, {}, std::nullopt, std::nullopt, false, {},
+                                  /*cache_group_id=*/{}));
     coordinator.ReclaimExpired(tables, 24);
     const auto ids = coordinator.Allocator(0).BlockTablePageIds(tables[0]);
     ASSERT_EQ(ids.size(), 6);
@@ -318,7 +324,8 @@ TEST(SwaSink, DemotedChainStillEvictsItsSinkLast) {
     EXPECT_EQ(coordinator.DemoteEntries(keys), 6);
     std::vector<BlockTable> tables(1);
     const std::array demands{GroupDemand{.table = &tables[0], .extent = DenseGrowth{20}}};
-    ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, {}, {}, std::nullopt, std::nullopt, true, {}));
+    ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, {}, {}, std::nullopt, std::nullopt, true, {},
+                                  /*cache_group_id=*/{}));
     EXPECT_TRUE(coordinator.GroupPrefixIndex(0).Contains(pool, keys[0]));
     for (std::size_t i = 1; i < keys.size(); ++i) {
         EXPECT_FALSE(coordinator.GroupPrefixIndex(0).Contains(pool, keys[i]));
@@ -331,7 +338,8 @@ TEST(SwaSink, PublicationRefreshesHeadAndEvictionKeepsBothEnds) {
     auto coordinator = MakeCoordinator(kSpecs, 4, pool, false, nullptr, nullptr, false, false, 0);
     std::vector<BlockTable> tables(1);
     const std::array demands{GroupDemand{.table = &tables[0], .extent = DenseGrowth{24}}};
-    ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, {}, {}, std::nullopt, std::nullopt, false, {}));
+    ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, {}, {}, std::nullopt, std::nullopt, false, {},
+                                  /*cache_group_id=*/{}));
     // Publish each boundary while the whole request is resident, at one epoch.
     for (std::size_t count = 1; count <= kHashes.size(); ++count) {
         coordinator.CacheCompletedBlocks(
@@ -351,8 +359,8 @@ TEST(SwaSink, PublicationRefreshesHeadAndEvictionKeepsBothEnds) {
     // Evict three pages: the endpoint's sink and newest window outlive middle history.
     std::vector<BlockTable> other(1);
     const std::array other_demands{GroupDemand{.table = &other[0], .extent = DenseGrowth{12}}};
-    ASSERT_TRUE(
-        coordinator.Admit(coordinator.ProbePrefix({}), other_demands, {}, {}, std::nullopt, std::nullopt, true, {}));
+    ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), other_demands, {}, {}, std::nullopt, std::nullopt, true,
+                                  {}, /*cache_group_id=*/{}));
     EXPECT_TRUE(coordinator.GroupPrefixIndex(0).Contains(pool, CacheKey{.content_hash = ContentHash{kHashes[0]}}));
     EXPECT_TRUE(coordinator.GroupPrefixIndex(0).Contains(pool, CacheKey{.content_hash = ContentHash{kHashes[5]}}));
     EXPECT_FALSE(coordinator.GroupPrefixIndex(0).Contains(pool, CacheKey{.content_hash = ContentHash{kHashes[1]}}));
