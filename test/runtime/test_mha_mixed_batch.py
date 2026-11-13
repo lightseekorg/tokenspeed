@@ -389,6 +389,8 @@ def _block_runtime():
     drafter.input_buffers = InputBuffers(4, 64, 16, device="cpu")
     drafter.runtime_states = RuntimeStates(16, 32, 32, 16, device="cpu")
     drafter.draft_seq_lens_buf = torch.zeros(4, dtype=torch.int32)
+    drafter.context_starts_buf = torch.zeros(4, dtype=torch.int64)
+    drafter.context_locs_buf = torch.zeros(4 * 16, dtype=torch.int32)
     drafter.block_ids_buf = torch.ones((4, 16), dtype=torch.int32)
     drafter.block_positions_buf = torch.zeros((4, 16), dtype=torch.int64)
     drafter.block_offsets = torch.arange(16, dtype=torch.int64).unsqueeze(0)
