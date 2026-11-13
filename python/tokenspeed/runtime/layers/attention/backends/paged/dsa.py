@@ -447,10 +447,10 @@ class DSABackend(PagedAttentionBackend):
         # A pure KVP extend over gathered histories attends each request
         # group's history in the eager attention break, as the sharded extend
         # arm does, so prefill capture is off here too -- except under K3.1's
-        # padded replay, whose model code keeps the history gather inside the
-        # break and narrows the captured segments to live rows.
+        # padded replay on CDNA4, whose model code keeps the history gather
+        # inside the break and narrows the captured segments to live rows.
         self._history_prefill: bool = dsa_kvp_history_prefill(config)
-        if self._history_prefill and not padded_replay_opt_in:
+        if self._history_prefill and not (padded_replay_opt_in and platform.is_cdna4):
             self.cuda_graph_support = CudaGraphSupport(prefill_graph=False)
         # Planned sparse cores are captured only if they declare cuda_graph.
         self.cuda_graph_support = self.cuda_graph_support & CudaGraphSupport.from_plans(
