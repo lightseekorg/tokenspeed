@@ -1125,16 +1125,6 @@ class ForwardStepRunner:
             [active_req_pool_indices, active_req_pool_indices.new_zeros(pad)]
         )
 
-    def _set_graph_state_write_indices(
-        self, active_req_pool_indices: torch.Tensor, padded_bs: int
-    ) -> None:
-        state_indices = self.input_buffers.state_write_req_pool_indices_buf[:padded_bs]
-        active_bs = active_req_pool_indices.shape[0]
-        if active_bs > 0:
-            state_indices[:active_bs].copy_(active_req_pool_indices)
-        if active_bs < padded_bs:
-            state_indices[active_bs:padded_bs].fill_(int(self.config.max_req_pool_size))
-
     def __call__(
         self,
         bs: int,
@@ -1208,7 +1198,6 @@ class ForwardStepRunner:
             req_pool_indices = self.input_buffers.req_pool_indices_buf[:padded_bs]
 
         if use_graph:
-            self._set_graph_state_write_indices(active_req_pool_indices, padded_bs)
             self._prepare_request_token_history_graph_inputs(
                 active_bs=bs, padded_bs=padded_bs
             )

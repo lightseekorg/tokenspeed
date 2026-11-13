@@ -28,6 +28,7 @@
 #include <variant>
 #include <vector>
 
+#include "core/profile_span.h"
 #include "scheduler/execution_event.h"
 #include "ts-scheduler/src/lib.rs.h"
 
@@ -49,19 +50,27 @@ std::vector<std::int32_t> to_std(rust::Slice<const std::int32_t> values) {
     return {values.begin(), values.end()};
 }
 
+void record_profile_span(const char* name, std::int64_t begin_ns, std::int64_t end_ns) {
+    record_scheduler_span(rust::Str(name), begin_ns, end_ns);
+}
+
 }  // namespace
 
 void submit_requests(tokenspeed::Scheduler& scheduler, rust::Slice<const RequestSpec> specs) {
     std::vector<tokenspeed::RequestSpec> converted;
-    converted.reserve(specs.size());
-    for (const RequestSpec& spec : specs) {
-        converted.push_back(tokenspeed::RequestSpec{
-            .request_id = std::string(spec.request_id),
-            .session_id = std::string(spec.session_id),
-            .tokens = to_std({spec.tokens.data(), spec.tokens.size()}),
-            .max_new_tokens = spec.max_new_tokens,
-            .max_cached_prefix_tokens = spec.max_cached_prefix_tokens,
-        });
+    {
+        // Each prompt is copied across the bridge.
+        tokenspeed::ProfileSpan profile_span{"copyRequestSpecs"};
+        converted.reserve(specs.size());
+        for (const RequestSpec& spec : specs) {
+            converted.push_back(tokenspeed::RequestSpec{
+                .request_id = std::string(spec.request_id),
+                .session_id = std::string(spec.session_id),
+                .tokens = to_std({spec.tokens.data(), spec.tokens.size()}),
+                .max_new_tokens = spec.max_new_tokens,
+                .max_cached_prefix_tokens = spec.max_cached_prefix_tokens,
+            });
+        }
     }
     scheduler.SubmitRequests(converted);
 }
@@ -546,6 +555,10 @@ rust::Vec<StorageOpView> plan_storage_ops(const tokenspeed::ExecutionPlan& plan)
             *storage);
     }
     return out;
+}
+
+void set_profile_span_sink(bool installed) {
+    tokenspeed::SetProfileSpanSink(installed ? &record_profile_span : nullptr);
 }
 
 }  // namespace ts_scheduler

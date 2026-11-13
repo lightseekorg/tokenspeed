@@ -52,6 +52,7 @@ from tokenspeed.runtime.layers.rotary_embedding import (  # noqa: E402
 
 # Draft models inject target-context rows into their own cache outside any attention forward.
 _CONTEXT_KV_WRITERS = {
+    "models/inkling2_mtp.py:Inkling2ForConditionalGenerationMTP.write_context_kv",
     "models/dflash.py:DFlashAttention.apply_k_norm",
     "models/dflash.py:DFlashDraftModel.write_context_kv",
     "models/dflash2.py:DFlash2DraftModel.write_context_kv",
@@ -79,6 +80,7 @@ _PROLOGUE_STEPS = {
     "q_norm",
     "qk_rmsnorm",
     "quantize_store_kv_mxfp8",
+    "rel_mha_head_norms",
     "rotary_emb",
     "set_kv_buffer",
     "set_mla_kv_buffer",

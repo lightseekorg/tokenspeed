@@ -110,4 +110,6 @@ def run_tape(descs, regs) -> None:
     n_ops = descs.shape[0]
     if n_ops == 0:
         return
-    _prep_tape_kernel[(n_ops,)](descs, regs, BLOCK=128, num_warps=1)
+    # A tail fill scrubs up to a buffer's capacity (thousands of entries)
+    # every step, so each program takes wide blocks.
+    _prep_tape_kernel[(n_ops,)](descs, regs, BLOCK=1024, num_warps=4)

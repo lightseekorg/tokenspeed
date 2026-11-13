@@ -28,6 +28,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include "core/profile_span.h"
 #include "utils.h"
 
 namespace tokenspeed {
@@ -43,6 +44,7 @@ TierTransferManager::TierTransferManager(CacheCoordinator& coordinator) : coordi
 
 std::optional<WriteBackOperation> TierTransferManager::StartPendingStores(StoreSourceGuard guard,
                                                                           HostStoreCause cause) {
+    ProfileSpan profile_span{"TierTransferManager::StartPendingStores"};
     _assert(cause == HostStoreCause::kPublication || cause == HostStoreCause::kFinish,
             "only publication and finish drain the pending-store queue");
     WriteBackStats& stats = write_back_stats_[static_cast<std::size_t>(cause)];
@@ -221,6 +223,7 @@ std::optional<WriteBackOperation> TierTransferManager::StartEvictionStores() {
     if (segments.empty()) {
         return std::nullopt;
     }
+    ProfileSpan profile_span{"TierTransferManager::StartEvictionStores"};
     WriteBackStats& stats = write_back_stats_[static_cast<std::size_t>(HostStoreCause::kEviction)];
     // The newest Device access first, recording order among equals: the
     // placement drops whole segments from the back, the oldest first.

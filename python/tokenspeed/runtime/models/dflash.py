@@ -329,8 +329,11 @@ class DFlashDraftModel(nn.Module, TargetCaptureConfigurator):
         The draft is listed under ``rl-bitwise``: it builds from the host's
         standard layers, owns no MoE, returns hidden states with
         ``next_token_logits=None`` (so the Megatron-order vocabulary fold is not
-        on its path), and reduces nothing of its own (``Mapping.replicated_for_draft``,
-        ``DFlash._replicate_head_over_attention_dp``). Three limits, none a
+        on its path), and under attention DP reduces nothing of its own
+        (``Mapping.replicated_for_draft``, ``DFlash._replicate_head_over_attention_dp``).
+        At attention DP 1 it keeps the target's dense layout, so its MLP
+        all-reduces each layer through the envelope's batch-invariant
+        collectives, as the target's ``down_proj`` does. Three limits, none a
         property of this class:
 
         * The teacher-forced trainer-dump comparison (``docs/design/numerics.md``,
@@ -416,10 +419,13 @@ class DFlashDraftModel(nn.Module, TargetCaptureConfigurator):
     ) -> None:
         super().__init__()
         self.config = config
-        # Replicated MLP: whole weights per rank, no dense collective, so an idle
-        # attention-DP rank skipping the draft cannot strand its peers. Attention
-        # width is unchanged (see Mapping.replicated_for_draft).
-        self.mapping = mapping.replicated_for_draft()
+        # Under attention DP, a rank whose DP group holds no request skips the
+        # draft, so the MLP is replicated (Mapping.replicated_for_draft) to
+        # leave its peers no dense collective to wait on. At attention DP 1
+        # every rank runs the draft and the MLP keeps the target's TP shard.
+        self.mapping = (
+            mapping.replicated_for_draft() if mapping.attn.dp_size > 1 else mapping
+        )
         eps = float(getattr(config, "rms_norm_eps", 1e-6))
         self.layers = nn.ModuleList(
             [
@@ -555,6 +561,20 @@ class DFlashDraftModel(nn.Module, TargetCaptureConfigurator):
             hidden_states = input_embeds
             residual = self._zeroed_residual(input_embeds)
 
+        hidden_states = self.run_decoder(positions, hidden_states, residual, ctx)
+
+        return LogitsProcessorOutput(
+            next_token_logits=None, hidden_states=hidden_states
+        )
+
+    def run_decoder(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        ctx: ForwardContext,
+    ) -> torch.Tensor:
+        """Run the decoder layers, then the final norm; returns its output."""
         for layer in self.layers:
             hidden_states, residual = layer(
                 positions=positions,
@@ -562,24 +582,32 @@ class DFlashDraftModel(nn.Module, TargetCaptureConfigurator):
                 ctx=ctx,
                 residual=residual,
             )
-
-        hidden_states = self.final_norm(hidden_states, residual)
-
-        return LogitsProcessorOutput(
-            next_token_logits=None, hidden_states=hidden_states
-        )
+        return self.final_norm(hidden_states, residual, ctx)
 
     def final_norm(
-        self, hidden_states: torch.Tensor, residual: torch.Tensor | None
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        ctx: ForwardContext,
     ) -> torch.Tensor:
-        """Norm the last layer's output.
+        """Reduce the last layer's MLP partial over the dense group, then norm.
 
-        A draft whose layers hand back a shard-local partial overrides this to
-        reduce first.
+        The layers build their MLP with ``reduce_results=False``; each layer's
+        partial is reduced by the next layer's input norm, so the last one is
+        reduced here, fused with the norm as the layers' input norm is. Over a
+        dense group of one rank the reduce is a no-op.
         """
         if residual is None:
             return self.norm(hidden_states)
-        return self.norm(hidden_states, residual)[0]
+        if ctx.input_num_tokens > global_server_args_dict["comm_fusion_max_num_tokens"]:
+            hidden_states = all_reduce(hidden_states, self.mapping.dense.tp_group)
+            return self.norm(hidden_states, residual)[0]
+        return self.norm.forward_with_allreduce_fusion(
+            self.mapping.dense.tp_rank,
+            self.mapping.dense.tp_group,
+            hidden_states,
+            residual,
+        )[0]
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

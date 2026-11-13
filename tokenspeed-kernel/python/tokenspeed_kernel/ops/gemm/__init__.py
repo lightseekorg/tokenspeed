@@ -244,7 +244,9 @@ def _gemm_format_signature(
             raise ValueError("mxfp8 format selection requires B_scales")
         # Match the scale encoding used by online activation quantization.
         online_scale_dtype = (
-            torch.uint8 if B_scales.dtype == torch.uint8 else torch.float32
+            B_scales.dtype
+            if B_scales.dtype in (torch.uint8, torch.int32)
+            else torch.float32
         )
         a_scale = ScaleFormat(
             storage_dtype=(
@@ -347,7 +349,9 @@ def _online_quantize_mxfp8(
         group_size=block_size[1],
         scale_encoding=scale_encoding,
         enable_pdl=False if gfx1250_gluon else enable_pdl,
-        solution=None if gfx1250_gluon else "triton",
+        solution=(
+            None if gfx1250_gluon or scale_encoding == "packed_ue8m0" else "triton"
+        ),
     )
 
 
@@ -837,7 +841,11 @@ def mm(
         A, A_scales = _online_quantize_mxfp8(
             A,
             block_size,
-            "ue8m0" if B_scales.dtype == torch.uint8 else "float32",
+            (
+                "packed_ue8m0"
+                if B_scales.dtype == torch.int32
+                else "ue8m0" if B_scales.dtype == torch.uint8 else "float32"
+            ),
             enable_pdl=enable_pdl,
             kernel_name=kernel.name,
         )

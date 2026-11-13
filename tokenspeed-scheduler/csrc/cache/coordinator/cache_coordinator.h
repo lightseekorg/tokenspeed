@@ -34,6 +34,7 @@
 #include <utility>
 #include <vector>
 
+#include "cache/core/active_parents.h"
 #include "cache/core/block_pool.h"
 #include "cache/core/cache_block_ref.h"
 #include "cache/coordinator/group_geometry.h"
@@ -560,8 +561,12 @@ public:
     std::int32_t NumEmptyLcmBlocks() const { return pool_.NumEmptyLcmBlocks(); }
     std::int32_t TotalLcmBlocks() const { return pool_.NumLcmBlocks(); }
     std::int32_t NumFreeHostLcmBlocks() const { return host_pool_ == nullptr ? 0 : host_pool_->NumEmptyLcmBlocks(); }
-    // Distinct LCM blocks referenced by the given per-request table sets.
-    std::int32_t NumActiveLcmBlocks(std::span<const std::span<const BlockTable>> request_tables) const;
+    // Distinct LCM blocks the request tables hold, counted by the tables'
+    // own ParentRefs as they change, so reading it walks nothing.
+    std::int32_t NumActiveLcmBlocks() const noexcept { return active_parents_.Count(); }
+    // The same count taken by walking the given per-request table sets:
+    // the reference debug builds check NumActiveLcmBlocks against.
+    std::int32_t CountActiveLcmBlocks(std::span<const std::span<const BlockTable>> request_tables) const;
     // Free pages (group page units) this group could still place, counting its
     // partially filled parents and every empty parent.
     std::int32_t GroupAvailablePages(std::int32_t group_index) const;
@@ -580,6 +585,9 @@ public:
     // or the first a sliding window behind one of its boundaries reaches
     // back into.
     std::int32_t FirstPublishedPage(const CompletedPages& completed) const;
+    // The leading pages [0, result) a publication registers sink blocks under
+    // again, below FirstPublishedPage; 0 when it publishes no sink block.
+    std::int32_t PublishedSinkPages(const CompletedPages& completed) const;
     void ReclaimExpired(std::span<BlockTable> tables, std::int32_t num_computed_tokens);
     void ConsumeReservedTokens(std::span<BlockTable> tables, std::int32_t num_tokens);
     void Free(std::span<BlockTable> tables);
@@ -1013,9 +1021,18 @@ public:
     // group block below T for a tail hash (tail_tokens = T mod P, which the
     // caller knows from its own publication record), one per state group. The
     // boundary key's group and offset are ignored; only its namespace and
-    // content hash identify the boundary.
+    // content hash identify the boundary. This includes every participating
+    // group, including State; replayable groups publish no entries.
     enum class BoundaryResidency { kNone, kPartial, kComplete };
     BoundaryResidency DeviceBoundaryResidency(const CacheKey& boundary, std::int32_t tail_tokens) const;
+    struct BoundaryEventStatus {
+        bool publishable;
+        bool has_device_entries;
+    };
+    // Routing requires every continuous-history group on Device; auxiliary
+    // windows and State do not gate publication. Without continuous history,
+    // no boundary is publishable. Any Device entry retains the descriptor.
+    BoundaryEventStatus GetBoundaryEventStatus(const CacheKey& boundary, std::int32_t tail_tokens) const;
     // Whether every State group caches its checkpoint published under the
     // chain hash content_hash, on the Device or the Host, as the probe takes
     // each from whichever tier holds it (false for a model without State
@@ -1095,6 +1112,10 @@ public:
         std::int32_t past_end{0};
     };
     BlockRange SlidingWindowBlocks(std::int32_t i, std::int32_t boundary_tokens) const;
+    // The sink blocks of sliding group i a boundary needs beside `window`:
+    // [0, min(sink blocks, window.first)), the ones the window does not hold
+    // already. Empty for a group without a sink.
+    BlockRange SinkBlocksBelow(std::int32_t i, const BlockRange& window) const;
     // The first of a tail's blocks (page offset) group i needs: 0 for a
     // History group that keeps every row and for a State group's one tail
     // block; for a sliding group the block holding the window's first row
@@ -1266,6 +1287,10 @@ private:
         std::int32_t first_cache_block{0};
         std::vector<CacheKey> keys;
         CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
+        // A sliding group's sink blocks below a boundary's window: published
+        // with an earlier boundary already, and registered with this one again
+        // so they stay as recent as every boundary that needs them.
+        bool sink{false};
     };
     // What publishing `completed` covers in one group -- every newly hashed
     // page plus the tail's blocks of a prefix-closed group, the blocks holding
@@ -1372,6 +1397,10 @@ private:
     // Replayable groups are absent: they neither constrain nor claim a hit.
     std::vector<std::size_t> match_order_;
     BlockPool& pool_;
+    // The Device parents request tables hold. Admit and Restore bind every
+    // table they fill to it; the coordinator never moves, so the pointer holds
+    // as long as every bound table is destroyed before the coordinator.
+    ActiveParents active_parents_;
     BlockPool* host_pool_{nullptr};
     // Request-private retraction images: never prefix-indexed, never evicted.
     BlockPool* snapshot_pool_{nullptr};
@@ -1392,6 +1421,7 @@ private:
     // How many groups are State groups. With any, a boundary serves a resume
     // only with a checkpoint boundary at or under it.
     std::int32_t num_state_groups_{0};
+    std::vector<std::size_t> routing_history_groups_;
     // Some group is prefix-closed, and needs every page below a boundary: a
     // State or sliding group resumes past a page that holds nothing.
     bool has_prefix_closed_groups_{false};

@@ -49,13 +49,16 @@ from tokenspeed.runtime.models import dflash as dflash_model
 from tokenspeed.runtime.models.dflash import DFlashDraftModel
 from tokenspeed.runtime.models.dflash2 import (
     CandidateSelector,
+    DFlash2DecoderLayer,
     DFlash2DraftModel,
+    DFlash2MonokernelDecoderLayer,
     DFlashGroupedConv,
     _dflash2_mla_rope,
     _dflash2_uses_mla,
     _grouped_conv,
     _score_edges,
 )
+from tokenspeed.runtime.models.monokernel import MonokernelState
 
 _CUDA_ONLY = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA is required"
@@ -170,6 +173,7 @@ def test_mla_draft_layers_build_windowed_mla_attention() -> None:
         rope_theta=10000.0,
         layer_types=["sliding_attention", "full_attention"],
         sliding_window=1024,
+        decode_monokernel=False,
         dflash_config={
             "attention_mode": "mla",
             "block_size": 16,
@@ -188,6 +192,70 @@ def test_mla_draft_layers_build_windowed_mla_attention() -> None:
         assert layer.self_attn.attn_mqa.sliding_window_size == window
         assert layer.self_attn.attn_mha.sliding_window_size == window
         assert layer.comm_manager is not None
+
+
+@_CUDA_ONLY
+def test_an_mla_draft_load_returns_every_parameter_it_loaded() -> None:
+    """The MLA draft's load_weights returns the names it loaded, as the GQA
+    draft's does, so the base loader records them."""
+    from transformers import PretrainedConfig
+
+    from tokenspeed.runtime.distributed.mapping import Mapping
+
+    config = PretrainedConfig(
+        vocab_size=64,
+        hidden_size=256,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        q_lora_rank=64,
+        kv_lora_rank=64,
+        qk_nope_head_dim=32,
+        qk_rope_head_dim=16,
+        v_head_dim=32,
+        rms_norm_eps=1e-6,
+        max_position_embeddings=4096,
+        rope_theta=10000.0,
+        layer_types=["sliding_attention", "full_attention"],
+        sliding_window=1024,
+        decode_monokernel=False,
+        dflash_config={
+            "attention_mode": "mla",
+            "block_size": 16,
+            "conv_group_size": 16,
+            "conv_kernel_size": 2,
+            "selector_rank": 8,
+            "selector_top_k": 4,
+            "target_layer_ids": [0],
+        },
+    )
+    with torch.device("cuda"):
+        model = DFlash2DraftModel(config, Mapping(rank=0, world_size=1))
+    params = dict(model.named_parameters())
+    # The checkpoint's names: gate_up_proj and the fused q_a / kv_a
+    # projection come as their halves.
+    weights: list[tuple[str, torch.Tensor]] = []
+    for name, param in params.items():
+        value = torch.randn_like(param)
+        if ".gate_up_proj." in name:
+            gate, up = value.chunk(2)
+            weights.append((name.replace("gate_up_proj", "gate_proj"), gate))
+            weights.append((name.replace("gate_up_proj", "up_proj"), up))
+        elif ".fused_qkv_a_proj_with_mqa." in name:
+            q_rows = int(config.q_lora_rank)
+            weights.append(
+                (name.replace("fused_qkv_a_proj_with_mqa", "q_a_proj"), value[:q_rows])
+            )
+            weights.append(
+                (
+                    name.replace("fused_qkv_a_proj_with_mqa", "kv_a_proj_with_mqa"),
+                    value[q_rows:],
+                )
+            )
+        else:
+            weights.append((name, value))
+
+    assert model.load_weights(weights) == set(params)
 
 
 @pytest.mark.parametrize(
@@ -244,7 +312,7 @@ def test_block_drafter_declares_only_its_sliding_mask(
 def test_candidate_logits_processor_is_created_after_target_wiring() -> None:
     drafter = DFlash2.__new__(DFlash2)
     drafter.model = SimpleNamespace(
-        config=SimpleNamespace(vocab_size=32), fp8_head=None
+        config=SimpleNamespace(vocab_size=32), fp8_head=None, monokernel_state=None
     )
     drafter.output_multiplier = 1.25
     drafter.final_logit_softcapping = 8.0
@@ -676,7 +744,9 @@ def test_a_mixed_batch_derives_draft_lengths_without_reading_the_device() -> Non
     )
     drafter.draft_seq_lens_buf = torch.zeros(3, dtype=torch.int32)
     written = []
-    drafter._write_native_cache = lambda *args, **kwargs: written.append(kwargs)
+    drafter._write_native_cache = lambda *args, **kwargs: written.append(
+        (args[2].tolist(), kwargs)
+    )
 
     ctx = SimpleNamespace(
         dspark_context_producer=None,
@@ -689,11 +759,11 @@ def test_a_mixed_batch_derives_draft_lengths_without_reading_the_device() -> Non
             decode_window_locations=lambda: torch.arange(5, 13, dtype=torch.int32),
         ),
     )
-    # A shared cache group: the taps are the TARGET's rows, so its router owns
-    # the write vector -- the prefill row's extend span first, then the decode
-    # rows' verify windows, in the token order the hidden states arrive in.
-    # (The draft's own router has republished a block window by now.)
-    drafter.attn_backend = SimpleNamespace(group_ids=("full_attention",))
+    drafter.attn_backend = SimpleNamespace(
+        group_ids=("draft_swa",),
+        extend_span_locations=lambda: torch.arange(105, 110, dtype=torch.int32),
+        decode_window_locations=lambda: torch.arange(210, 218, dtype=torch.int32),
+    )
     drafter._update_native_cache_from_target(
         ctx,
         SimpleNamespace(hidden_states=torch.zeros(positions.numel(), 8)),
@@ -702,7 +772,9 @@ def test_a_mixed_batch_derives_draft_lengths_without_reading_the_device() -> Non
     )
 
     assert drafter.draft_seq_lens_buf.tolist() == [15, 22, 300]
-    assert written == [{"decode_only": False}]
+    assert written == [
+        (list(range(105, 110)) + list(range(210, 218)), {"decode_only": False})
+    ]
 
 
 def test_the_draft_residual_buffer_is_reused_and_recleared() -> None:
@@ -717,3 +789,132 @@ def test_the_draft_residual_buffer_is_reused_and_recleared() -> None:
     assert second.data_ptr() == first.data_ptr()
     assert second.shape == (2, 8)
     assert not second.any()
+
+
+@pytest.mark.parametrize(
+    "rows, tp_size, served",
+    [(1024, 8, True), (8192, 1, False), (8192, 8, False)],
+)
+def test_the_context_write_monokernel_takes_the_column_parallel_fc(
+    rows: int, tp_size: int, served: bool
+) -> None:
+    """The context write's monokernel reads each rank's own fc rows, the shard
+    the column-parallel ``fc`` holds; a replicated ``fc`` is not its layout."""
+    from tokenspeed.runtime.models import muse_spark_dflash2_monokernel as seam
+
+    model = SimpleNamespace(
+        fc=SimpleNamespace(
+            quant_method=UnquantizedLinearMethod(),
+            tp_size=tp_size,
+            weight=torch.empty(rows, 5 * 8192, dtype=torch.bfloat16, device="meta"),
+        ),
+        hidden_norm=SimpleNamespace(
+            weight=torch.empty(8192, dtype=torch.bfloat16, device="meta"),
+            variance_epsilon=seam.RMS_NORM_EPS,
+        ),
+    )
+    assert (seam.context_reasons(model) == []) is served
+
+
+class _Layer(torch.nn.Module):
+    """A draft layer that adds one, and as a monokernel launch would, marks
+    the state launched; the last one may also run the final norm (it writes
+    ``lm_head_input`` and moves the step counter itself)."""
+
+    def __init__(
+        self, state: MonokernelState, launches: bool, normed: torch.Tensor | None
+    ) -> None:
+        super().__init__()
+        self.state = state
+        self.launches = launches
+        self.normed = normed
+
+    def forward(self, *, positions, hidden_states, ctx, residual):
+        if self.launches:
+            self.state.launched = True
+        if self.normed is not None:
+            self.state.lm_head_input = self.normed
+            self.state.step[:1].add_(1)
+        return hidden_states + 1, residual
+
+
+@pytest.mark.parametrize("launches", ["none", "layers", "final norm"])
+def test_a_draft_block_takes_the_last_launchs_final_norm(launches: str) -> None:
+    """The draft's run_decoder resets the state before its layers and ends the
+    step after them: when the last launch ran the final norm, its output is
+    the block's, else the model's own final norm runs; the step counter moves
+    once for a block with launches, and not for one without."""
+    model = DFlash2DraftModel.__new__(DFlash2DraftModel)
+    torch.nn.Module.__init__(model)
+    state = MonokernelState(torch.zeros(1, dtype=torch.int64))
+    # A previous block's leftovers, which the reset must clear.
+    state.launched = True
+    state.lm_head_input = torch.full((2, 3), -7.0)
+    normed = torch.full((2, 3), 9.0)
+    model.monokernel_state = state
+    model.layers = torch.nn.ModuleList(
+        [
+            _Layer(state, launches != "none", None),
+            _Layer(
+                state, launches != "none", normed if launches == "final norm" else None
+            ),
+        ]
+    )
+    model.final_norm = lambda hidden_states, residual, ctx: -hidden_states
+    hidden = torch.zeros(2, 3)
+
+    out = model.run_decoder(torch.zeros(2), hidden, torch.zeros(2, 3), None)
+
+    want = normed if launches == "final norm" else -(hidden + 2)
+    torch.testing.assert_close(out, want)
+    assert state.lm_head_input is None
+    assert int(state.step[0]) == (0 if launches == "none" else 1)
+
+
+@pytest.mark.parametrize("muse_draft", [False, True])
+@pytest.mark.parametrize("switch", [False, True])
+def test_the_drafts_config_switch_picks_the_monokernel_layer_class(
+    switch: bool, muse_draft: bool
+) -> None:
+    """With ``decode_monokernel`` on the draft's config (load_model_config
+    declares it on every draft's, True for the draft of a Muse Spark target
+    under --decode-monokernel) the draft builds its layers
+    from the monokernel class whatever its shape: a draft the kernels don't
+    serve then fails at packing and names why, never falls back silently."""
+    from transformers import PretrainedConfig
+
+    from tokenspeed.runtime.models import muse_spark_dflash2_monokernel as seam
+
+    shape = dict(seam.KERNEL_SHAPE)
+    if not muse_draft:
+        shape["num_hidden_layers"] = 3
+    config = PretrainedConfig(
+        **shape, dflash_config=dict(seam.KERNEL_DFLASH), decode_monokernel=switch
+    )
+    model = DFlash2DraftModel.__new__(DFlash2DraftModel)
+    torch.nn.Module.__init__(model)
+    model.config = config
+    expected = DFlash2MonokernelDecoderLayer if switch else DFlash2DecoderLayer
+    assert model.decoder_layer_cls is expected
+
+
+@pytest.mark.parametrize("switch", [False, True])
+def test_a_draft_takes_the_decode_monokernels_only_for_a_target_they_serve(
+    switch: bool,
+) -> None:
+    """Under --decode-monokernel a DFlash2 draft of a Muse Spark target and the
+    MTP draft of a Qwen3.8 target get the switch; a Qwen3.8 target's DFlash2
+    draft and a Muse Spark target's other drafts keep their regular layers."""
+    from tokenspeed.runtime.utils.server_args import draft_takes_decode_monokernel
+
+    muse, dflash2 = ["MuseSparkForConditionalGeneration"], ["DFlash2DraftModel"]
+    mtp = ["Qwen4ExpForCausalLMNextN"]
+    for qwen in (["Qwen4ExpForCausalLM"], ["Qwen4ExpForConditionalGeneration"]):
+        assert draft_takes_decode_monokernel(switch, qwen, mtp) is switch
+        assert not draft_takes_decode_monokernel(switch, qwen, dflash2)
+    assert draft_takes_decode_monokernel(switch, muse, dflash2) is switch
+    assert not draft_takes_decode_monokernel(switch, muse, mtp)
+    assert not draft_takes_decode_monokernel(switch, [], dflash2)
+    assert not draft_takes_decode_monokernel(switch, muse, ["DFlashDraftModel"])
+    assert not draft_takes_decode_monokernel(switch, muse, ["LlamaForCausalLMEagle3"])
+    assert not draft_takes_decode_monokernel(switch, muse, [])

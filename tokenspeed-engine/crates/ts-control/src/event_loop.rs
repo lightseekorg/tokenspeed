@@ -58,8 +58,8 @@ use ts_collective::{Group, Mesh, Reduce};
 use ts_metrics::{EngineMetrics, L3Metrics};
 use ts_pd::{EmbeddingItem, EmbeddingReceiver, LandedRequest, PdError, PdEvent, TransferPeer};
 use ts_scheduler::{
-    CacheEvent, CacheOpKind, ExecutionPlan, ForwardBatchView, ForwardEvent, ForwardEventKind,
-    Scheduler, SchedulerSizes, StorageRound, StorageTickView,
+    profile, CacheEvent, CacheOpKind, ExecutionPlan, ForwardBatchView, ForwardEvent,
+    ForwardEventKind, Scheduler, SchedulerSizes, StorageRound, StorageTickView,
 };
 use ts_wire::{
     control::{FlushCacheReqOutput, ProfileReqOutput},
@@ -147,12 +147,11 @@ const IDLE_WAIT: Duration = Duration::from_millis(10);
 const ACTIVE_PAGES_REFRESH: Duration = Duration::from_millis(100);
 
 /// The scheduler's active page count, as the load report, the metrics and
-/// the batch line read it. Taking it walks every live request's block
-/// tables, which at long contexts costs a round more than the rest of its
-/// work, so it is taken at most once per [`ACTIVE_PAGES_REFRESH`] -- the
-/// frontend considers a load report fresh for seconds -- and whenever the
-/// loop runs no request, when the walk costs nothing and an engine that went
-/// idle reports none active at once. A count taken while idle is not kept:
+/// the batch line read it. Reading it is O(1) (the scheduler's block tables
+/// keep the count), and it is taken at most once per
+/// [`ACTIVE_PAGES_REFRESH`] -- the frontend considers a load report fresh
+/// for seconds -- and whenever the loop runs no request, so an engine that
+/// went idle reports none active at once. A count taken while idle is not kept:
 /// the first round after requests arrive takes a new one, so an engine that
 /// just took a burst does not report none active for the next 100 ms.
 #[derive(Debug, Default)]
@@ -685,11 +684,16 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
     /// One round, with this rank's stop request. Returns whether the ranks
     /// agreed to stop after it.
     pub fn round(&mut self, stop_requested: bool) -> Result<bool, LoopError> {
+        // A profile keeps the spans of a round that did something: a loop
+        // waiting on a transfer spins through empty rounds.
+        let held_spans = profile::hold();
+        let round_span = profile::span("EventLoop::round");
         let mut outputs: Vec<StreamedOutput> = Vec::new();
         let mut released: Vec<String> = Vec::new();
 
         let received = if self.owns_frontend() {
             let wait = (self.idle() && self.dp_idle).then_some(IDLE_WAIT);
+            let _span = profile::span("Frontend::receive");
             self.frontend.receive(wait)
         } else {
             Vec::new()
@@ -703,6 +707,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             messages,
             l3_reports,
         } = self.relay(stop_requested, received, report)?;
+        let mut busy = !messages.is_empty();
         self.admit(messages, &mut outputs, &mut released)?;
         self.apply_pause_transitions(&mut outputs, &mut released)?;
         self.drain_grammar_queue(&mut outputs, &mut released)?;
@@ -755,9 +760,10 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 .scheduler
                 .next_execution_plan(false, self.config.prefill_delay.is_some());
             if let Some(l3) = &self.l3 {
-                l3.submit(&plan)?;
+                busy |= l3.submit(&plan)?;
             }
             self.cache_ops.dispatched(&plan.cache_ops());
+            busy |= plan.needs_device();
             if plan.needs_device() {
                 self.data_plane.execute(plan, &Dispatch::default())?;
             }
@@ -768,11 +774,12 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                     forwarded = true;
                 }
             }
+            busy |= forwarded;
             self.note_forward(forwarded);
             std::thread::sleep(PAUSED_IDLE_SLEEP);
         } else {
             let allow_prefill = self.prefill_delay_allows_prefill();
-            self.plan_and_dispatch(
+            busy |= self.plan_and_dispatch(
                 &mut stop,
                 &mut events,
                 &mut outputs,
@@ -804,6 +811,12 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 publisher.publish(&drained);
             }
         }
+        // A storage operation's outcome is an acknowledgment too.
+        busy |= !ready.is_empty()
+            || !storage.done.is_empty()
+            || !events.is_empty()
+            || !outputs.is_empty()
+            || !released.is_empty();
         if !released.is_empty() {
             self.data_plane.release(&released)?;
         }
@@ -824,6 +837,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                     .last_load_report
                     .is_none_or(|last| last.elapsed() >= Duration::from_secs(1))
             {
+                let _span = profile::span("Frontend::send");
                 self.frontend.send(outputs, load);
                 self.reported_load = Some(load);
                 self.last_load_report = Some(Instant::now());
@@ -831,14 +845,21 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         }
         // A deferred pause or release resolves once the scheduler drained.
         self.finish_drain(release_pending)?;
-        for reply in self.controls.take_replies() {
+        let replies = self.controls.take_replies();
+        busy |= !replies.is_empty();
+        for reply in replies {
             self.frontend.reply(reply);
+        }
+        drop(round_span);
+        if busy {
+            held_spans.keep();
         }
         Ok(stop)
     }
 
     /// The round's plan, dispatched, and the forwards older than the
-    /// in-flight depth committed.
+    /// in-flight depth committed. Returns whether the data plane or the L3
+    /// executor got work.
     fn plan_and_dispatch(
         &mut self,
         stop: &mut bool,
@@ -846,7 +867,8 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         outputs: &mut Vec<StreamedOutput>,
         released: &mut Vec<String>,
         allow_prefill: bool,
-    ) -> Result<(), LoopError> {
+    ) -> Result<bool, LoopError> {
+        let _span = profile::span("EventLoop::plan_and_dispatch");
         let plan = self
             .scheduler
             .next_execution_plan(allow_prefill, self.config.prefill_delay.is_some());
@@ -860,9 +882,10 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         }
         // The storage operations start on the L3 executor at once, apart
         // from the device work.
-        if let Some(l3) = &self.l3 {
-            l3.submit(&plan)?;
-        }
+        let storage_work = match &self.l3 {
+            Some(l3) => l3.submit(&plan)?,
+            None => false,
+        };
         // Counted here because `execute` below always runs this plan.
         let cache_ops = plan.cache_ops();
         self.cache_ops.dispatched(&cache_ops);
@@ -879,6 +902,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         // they are taken once, and only for a reader.
         let mut planned_sizes: Option<SchedulerSizes> = None;
         if let Some(metrics) = &self.metrics {
+            let _span = profile::span("EventLoop::record_metrics");
             // A retraction victim's image store is the retraction signal.
             let retracted = cache_ops
                 .iter()
@@ -1013,7 +1037,8 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         }
         let has_forward = forward.is_some();
         let mut forwarded = idle_forward;
-        if plan.needs_device() || idle_forward {
+        let device_work = plan.needs_device() || idle_forward;
+        if device_work {
             if let Some(pending) = self.data_plane.execute(plan, &dispatch)? {
                 // The batch itself waits for its commit: nothing below reads it.
                 let batch = forward.take().expect("a pending forward has a batch");
@@ -1031,7 +1056,8 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         } else {
             0
         };
-        self.commit_down_to(depth, events, outputs, released)
+        self.commit_down_to(depth, events, outputs, released)?;
+        Ok(device_work || storage_work)
     }
 
     /// Count this round's forward, real or idle, for the expert rebalance;
@@ -1056,6 +1082,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         allowed: bool,
     ) -> Result<StorageRound, LoopError> {
         if let Some(l3) = self.l3.as_mut() {
+            let _span = profile::span("Tier::agree");
             return Ok(l3.agree(l3_reports, allowed, allowed)?);
         }
         if allowed == self.forward_allowed {
@@ -1569,6 +1596,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
     /// operation per round. Returns whether every rank's memory is resident
     /// and whether any rank has a pending memory release.
     fn gate(&mut self) -> Result<(bool, bool), LoopError> {
+        let _span = profile::span("EventLoop::gate");
         let flushes = self.controls.take_flushes();
         let head = self.controls.weight_head().and_then(control::gate_code);
         let internal = self.controls.internal_head().map(InternalOp::gate_code);
@@ -2138,6 +2166,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 l3_reports: l3_report.into_iter().collect(),
             });
         }
+        let _span = profile::span("EventLoop::relay");
         let owner = self.owns_frontend();
         let payload = if owner {
             relay::encode(stop_requested, &received)
@@ -2216,6 +2245,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             self.note_prefill_round(num_extends, batch_size);
             return Ok(None);
         };
+        let _span = profile::span("EventLoop::dp_round");
         let row = [
             num_tokens,
             batch_size,
@@ -2355,6 +2385,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         let Some(transfer) = self.transfer.as_mut() else {
             return Ok(());
         };
+        let _span = profile::span("EventLoop::poll_transfers");
         let polled = transfer.poll(&mut self.ranks.mesh, &self.ranks.replica)?;
         for event in polled {
             tracing::debug!(?event, "transfer event");
@@ -2430,6 +2461,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         released: &mut Vec<String>,
     ) -> Result<(), LoopError> {
         while self.in_flight.len() > depth {
+            let _span = profile::span("EventLoop::commit");
             let (batch, input_logprobs, pending) = self.in_flight.pop_front().expect("non-empty");
             let result = self.data_plane.complete(pending)?;
             let serving_compiles = result.serving_compiles;
@@ -2535,6 +2567,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         outputs: &mut Vec<StreamedOutput>,
         released: &mut Vec<String>,
     ) -> Result<(), LoopError> {
+        let _span = profile::span("EventLoop::admit");
         let mut admissions = Vec::new();
         let mut seen = HashSet::new();
         for message in received {
@@ -2632,6 +2665,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         if admissions.is_empty() {
             return Ok(());
         }
+        let _span = profile::span("EventLoop::register");
         tracing::debug!(admitted = admissions.len(), "requests admitted");
         // The data plane learns a request before the scheduler can plan it.
         self.data_plane.admit(&admissions)?;

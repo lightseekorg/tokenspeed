@@ -217,6 +217,33 @@ class CommBackend(ABC):
             "This backend does not support mHC communication fusion"
         )
 
+    def supports_all_reduce_sconv(
+        self, x: torch.Tensor, weight: torch.Tensor, group: Group
+    ) -> bool:
+        """Whether the group can all-reduce the anticipated x and hand the sum
+        to the decode ring convolution with taps ``weight`` early."""
+        return False
+
+    def all_reduce_sconv(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        ring: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        seq_idx: torch.Tensor,
+        cache_indices: torch.Tensor,
+        has_initial_state: torch.Tensor,
+        seq_lens: torch.Tensor,
+        block_table: torch.Tensor,
+        checkpoint: torch.Tensor,
+        output_scale: float,
+        group: Group,
+    ) -> torch.Tensor:
+        """Execute admitted fusion; return the convolution output or raise."""
+        raise NotImplementedError(
+            "This backend does not support the all-reduce convolution fusion"
+        )
+
     def prepare_all_reduce_lane(self, group: Group, hidden_dim: int) -> bool:
         """Prepare an implementation-specific one-shot lane when supported."""
 

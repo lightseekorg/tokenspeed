@@ -33,9 +33,9 @@ With `--enable-async-logging`, the Rust tracing writer and Python root logger
 also run off the serving threads. Each has a bounded, lossy queue: a slow
 output stream must not introduce I/O backpressure into a round. The host
 owns Python log cleanup explicitly after serving returns, including errors
-and encode ranks, before notifying its launcher of a failure. Returning from
-Rust does not finalize Python, so an `atexit` hook alone cannot drain those
-records. Cleanup is bounded because an output stream can remain stalled.
+and encode ranks. Returning from Rust does not finalize Python, so an
+`atexit` hook alone cannot drain those records. Cleanup is bounded because
+an output stream can remain stalled.
 
 The ranks of a replica (an attention-TP group, across every pipeline stage)
 run the same scheduler. They talk over `ts-collective`'s TCP mesh, in fixed
@@ -432,6 +432,22 @@ device events within each rank and process rather than clip GPU time to host
 timestamps. Profile startup rejects unsupported capture capabilities instead
 of silently producing an incomplete trace.
 
+The torch profiler sees only torch ops and Python, so a torch profile also
+records the host's own spans (`ts_scheduler::profile`): the round's phases,
+the scheduler calls and their C++ phases (`csrc/core/profile_span.h`), the
+data-plane calls and their waits for the GIL on the control thread, and each
+operation on the forward thread. The profiler merges them into the trace it
+exports, on their threads' lanes, so a forward thread's operation encloses
+the Python it ran; the C++ scheduler's spans are under the `scheduler`
+category, the rest under `host`. The recording follows the torch profiler's window and
+costs one atomic load per span outside it; it keeps only the spans that began
+inside the window, so an operation open as a by-stage profile switches stages
+stays out of the next stage's trace. A trace the merge fails on is written
+without the host spans rather than failing the forward thread. A round that receives nothing,
+hands the data plane and the L3 executor nothing, and commits, acknowledges,
+or answers nothing leaves no spans: a loop waiting on a transfer spins through
+such rounds. A storage operation's outcome counts as an acknowledgment.
+
 ### The capture contract
 
 Information crosses to the data plane **only** as a queued operation's
@@ -440,7 +456,7 @@ Python object), from which the forward thread builds what a forward reads.
 What a launched forward reads freezes: no attribute rebinding, no in-place
 edit, no releasing a resource it holds while it may still run. Results cross
 back **only** as the launched forward's result, which the commit reads once
-its copy event landed, as plain lists built from the landed host copies.
+its copy event landed, as metadata lists and CPU logprob buffer views.
 
 The plan's cache ops follow the same capture rule: the data plane adapts
 them once into immutable Device and storage tuples, and
@@ -452,6 +468,13 @@ the executor's completion poll.
 `execution/device.py` states this in full, including the registered
 exceptions — grammar matchers, whose ownership splits by path and whose
 overlap the drain rules in Principle 4 break instead, and multimodal items.
+
+Completion queries export large logprob columns as CPU buffer views, after
+the result's copy event has landed. The host validates dtype, rank, shape
+and token-ID narrowing, then copies into Rust-owned vectors while Python
+buffer guards retain the storage. No borrowed array escapes the query or
+outlives the result's reuse lease. Buffer guards release on errors and
+unwinding too; no manual export/release pair belongs in the event loop.
 
 ## Principle 2: the event loop is a coordinator, nothing more
 
@@ -614,12 +637,12 @@ scaling so a fully free pool reports its full capacity, including packed or
 capacity-limited layouts.
 `available_lcm_blocks()` scans the pool and prefix indexes for reclaimability
 and belongs in diagnostics and leak checks, never in the per-round sampler.
-`active_lcm_blocks()` walks every live request's block tables, which at long
-contexts costs more than the rest of a round, so the loop takes it at most
-once per 100 ms and the frontend's load report, the metrics and the batch line
-share that value; a round with no request running takes it again (it then
-costs nothing), so an engine that goes idle reports none active at once, and
-does not keep it, so the first round with requests takes a fresh one. The
+`active_lcm_blocks()` is O(1): the block tables keep the count as they change
+(see cache-concepts.md). The loop takes it at most once per 100 ms and the
+frontend's load report, the metrics and the batch line share that value; a
+round with no request running takes it again, so an engine that goes idle
+reports none active at once, and does not keep it, so the first round with
+requests takes a fresh one. The
 scheduler's other counts (`sizes()`) are a pass over its requests per state:
 a round takes them for the load report, and as it planned only when the
 metrics or a batch line read them (they share that read); the idle check takes
@@ -1071,6 +1094,21 @@ status. Failure, termination and constructor-error cleanup share one
 process-local shutdown latch: once cleanup starts, later rank notifications
 cannot interrupt it. Signal callbacks do not log or enumerate processes;
 cleanup runs outside the callback.
+
+While serving generation, a fatal control-loop or forward-thread error
+signals the owning launcher once from the thread that detects it. The
+signal requires no Python call and precedes the Rust error log and any wait
+for the forward thread or device cleanup. The launcher can begin stopping
+the local ranks even while the failing rank is still alive. An orderly stop
+still drains the forward thread and closes the data plane.
+
+Concurrent reporters wait only for the native signal attempt, never for
+another thread's log output. The data plane publishes its first failure
+and wakes waiters before logging either the rank failure or a failed signal.
+Later distinct failures and cleanup errors remain visible without replacing
+the original serving error.
+Failures outside generation serving use the same native notifier when
+they reach the host's final error handler; their cleanup timing is unchanged.
 
 ## Checklist for extending the loop
 

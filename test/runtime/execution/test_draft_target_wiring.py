@@ -805,7 +805,9 @@ def test_eagle_tree_drafting_ranks_full_vocab_logits():
 @pytest.mark.parametrize("drafter_class", [DFlash, DSpark])
 def test_block_drafter_wire_target_only_binds_resources(drafter_class):
     drafter = drafter_class.__new__(drafter_class)
-    drafter.model = SimpleNamespace()
+    # A one-rank layout: the draft's first layer reduces nothing, so the
+    # drafter's embedding lookup is left as bound.
+    drafter.model = SimpleNamespace(mapping=_mapping())
     embedding, head = object(), object()
     # wire_target asks the processor whether the target's head is vocab-sharded
     # over attention-DP ranks (DFlash replicates it for drafting only then);
@@ -833,7 +835,7 @@ def test_block_drafter_wire_target_only_binds_resources(drafter_class):
 def test_block_drafter_binds_local_embedding_on_last_pipeline_stage():
     drafter = DSpark.__new__(DSpark)
     embedding = object()
-    drafter.model = SimpleNamespace(embed_tokens=embedding)
+    drafter.model = SimpleNamespace(embed_tokens=embedding, mapping=_mapping())
     target = SimpleNamespace(
         get_input_embeddings=lambda: None,
         lm_head=object(),
@@ -933,9 +935,20 @@ def _target_ctx(num_extends: int, num_tokens: int) -> ForwardContext:
     )
 
 
-def _sink_dflash(enabled: bool, hidden: int = 3, taps: int = 2) -> DFlash:
+class _TapTarget:
+    def __init__(self, stores_taps: bool):
+        self._stores_taps = stores_taps
+
+    def stores_capture_taps(self, ctx: ForwardContext) -> bool:
+        return self._stores_taps
+
+
+def _sink_dflash(
+    enabled: bool, hidden: int = 3, taps: int = 2, stores_taps: bool = False
+) -> DFlash:
     """A DFlash with only the capture-sink state set up."""
     drafter = DFlash.__new__(DFlash)
+    drafter.target_model = _TapTarget(stores_taps)
     drafter.hidden_size = hidden
     drafter._tap_count = taps
     drafter._tap_rows = (
@@ -961,6 +974,16 @@ def test_dflash_arms_the_capture_sink_on_the_forward_context():
     drafter.prepare_target_forward(ctx)
 
     assert ctx.target_capture_sink is drafter
+    assert drafter._context_written is False
+
+
+def test_dflash_leaves_the_taps_to_a_target_that_stores_them():
+    drafter = _sink_dflash(enabled=True, stores_taps=True)
+    ctx = _target_ctx(num_extends=0, num_tokens=4)
+
+    drafter.prepare_target_forward(ctx)
+
+    assert ctx.target_capture_sink is None
     assert drafter._context_written is False
 
 
@@ -1032,7 +1055,6 @@ def test_dflash_sink_concatenates_the_taps_and_writes_the_context_once():
 
 def test_dflash_run_refuses_a_round_whose_sink_never_completed():
     drafter = _sink_dflash(enabled=True)
-    drafter.target_model = object()
     ctx = _target_ctx(num_extends=0, num_tokens=4)
     drafter.prepare_target_forward(ctx)
     drafter.on_target_capture(0, torch.zeros(4, 3))
@@ -1130,7 +1152,7 @@ def test_k3_setup_capture_survives_resource_binding(monkeypatch, has_pp):
     draft.projection_width = 8
     # Only a pipeline splits the taps across stages; off the pipeline the
     # drafter keeps projecting and writing the context itself.
-    draft.mapping = SimpleNamespace(has_pp=has_pp)
+    draft.mapping = _mapping(has_pp=has_pp)
     validation = mock.Mock()
     monkeypatch.setattr(kimi_k3_dspark, "validate_k3_dspark_config", validation)
     target = SimpleNamespace(
@@ -1188,9 +1210,11 @@ def test_ordinary_block_models_declare_capture_setup(family):
     draft = model_class.__new__(model_class)
     torch.nn.Module.__init__(draft)
     draft.config = SimpleNamespace(dflash_config={"target_layer_ids": [2, 7]})
-    # An unquantized draft: DFlash2 also makes its FP8 head copy here when
-    # quantized, which needs the target's real LM head.
+    # An unquantized draft without --decode-monokernel: DFlash2 also makes
+    # its FP8 head copy here when quantized, and packs its head monokernel
+    # under the switch, both from the target's real LM head.
     draft.quant_config = None
+    draft.monokernel_state = None
     target = SimpleNamespace(set_dflash_layers_to_capture=mock.Mock())
     assert isinstance(draft, TargetCaptureConfigurator)
     draft.configure_target(target, None)

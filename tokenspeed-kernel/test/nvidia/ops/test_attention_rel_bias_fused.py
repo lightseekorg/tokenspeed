@@ -89,6 +89,7 @@ def test_rel_mha_prefill_fused_matches_reference_and_scoremod(
         max_seqlen=max(seq_lens),
         window_left=window_left,
         softmax_scale=scale,
+        output_dtype=None,
     )
     out_fused = rel_mha_prefill(q=q, k=k, v=v, **kwargs)
 
@@ -147,6 +148,10 @@ def test_rel_mha_decode_fused_matches_reference_and_scoremod(
         max_seqlen_q=1,
         window_left=window_left,
         softmax_scale=scale,
+        output_dtype=None,
+        return_lse=False,
+        gate=None,
+        sink=None,
     )
     out_fused = rel_mha_decode_with_kvcache(
         q=q, k_cache=k_cache, v_cache=v_cache, **kwargs
