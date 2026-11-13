@@ -18,10 +18,11 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""The drafter prefill graph (``--enable-drafter-prefill-graph``) without a GPU.
+"""The drafter's extend-round graphs without a GPU.
 
-Eagle records its extend round as breakable graphs: step 0 per (prefill token
-bucket, request count), the decode steps per request count. These tests pin
+Eagle records its extend round as breakable graphs: the decode steps per
+request count up to 16, and with ``--enable-drafter-prefill-graph`` step 0
+per (prefill token bucket, request count). These tests pin
 the plan the CUDA-graph memory projection prices, the capture order the probe
 pairs its readings with, the static buffers' sizing (and the target's hidden-row
 width and dtype it takes from the prefill graph), which graphs a round replays
@@ -101,9 +102,10 @@ def test_the_plan_takes_the_target_buckets_at_their_request_counts() -> None:
         [32, 16, 48], lambda bucket: [1, 2] if bucket >= 32 else [1]
     )
 
+    # The decode steps at every request count up to the drafter's batch.
     assert plan == {
         FIRST_STEP_SERIES: [(48, 1), (48, 2), (32, 1), (32, 2), (16, 1)],
-        DECODE_STEPS_SERIES: [(2, 2), (1, 1)],
+        DECODE_STEPS_SERIES: [(4, 4), (3, 3), (2, 2), (1, 1)],
     }
     # One draft step has no decode steps to record.
     single, _ = make_eagle(spec_num_steps=1)
@@ -115,13 +117,36 @@ def test_the_plan_takes_the_target_buckets_at_their_request_counts() -> None:
     assert not drafter.captures_prefill_graph
 
 
+def test_the_decode_steps_stop_at_sixteen_requests() -> None:
+    drafter, _ = make_eagle(max_bs=40)
+
+    plan = drafter.extend_graph_plan([16], lambda _bucket: [1])
+
+    assert plan[DECODE_STEPS_SERIES] == [(bs, bs) for bs in range(16, 0, -1)]
+
+
+@pytest.mark.parametrize("setup", ["tensor_parallel", "undeclared_draft"])
+def test_the_decode_steps_record_without_step_0(setup) -> None:
+    model = ToyDraftModel("cpu")
+    if setup == "undeclared_draft":
+        # A draft that does not declare its narrowed step breakable (an MLA
+        # draft attends inside one unbroken call).
+        model.supports_breakable_draft_extend = False
+    drafter, _ = make_eagle(
+        model=model, world_size=2 if setup == "tensor_parallel" else 1
+    )
+
+    assert drafter.extend_graph_plan([16, 32], lambda _bucket: [1]) == {
+        DECODE_STEPS_SERIES: [(4, 4), (3, 3), (2, 2), (1, 1)]
+    }
+
+
 @pytest.mark.parametrize(
     "setup",
     [
         "attention_dp",
-        "tensor_parallel",
+        "pipeline",
         "shared_mtp_topk",
-        "undeclared_draft",
         "draft_tree",
         "speculative_sampling",
         "draft_token_history",
@@ -131,14 +156,11 @@ def test_configurations_the_graphs_cannot_bake_record_nothing(setup) -> None:
     model = ToyDraftModel("cpu")
     if setup == "shared_mtp_topk":
         model.index_share_for_mtp_iteration = True
-    if setup == "undeclared_draft":
-        # A draft that does not declare its narrowed step breakable (an MLA
-        # draft attends inside one unbroken call).
-        model.supports_breakable_draft_extend = False
     drafter, _ = make_eagle(
         model=model,
         dp_size=2 if setup == "attention_dp" else 1,
-        world_size=2 if setup == "tensor_parallel" else 1,
+        world_size=2 if setup == "pipeline" else 1,
+        pp_size=2 if setup == "pipeline" else 1,
     )
     # The state bind_tree, bind_sampling_backend and a draft model that reads
     # request-token history leave on the drafter.
@@ -202,8 +224,11 @@ def test_the_capture_records_the_sampled_entries_in_ladder_order(monkeypatch) ->
 
     # Widths 112, 96, 80 and 48 are the probe's positions 0, 1, 2 and 4.
     first = [(b, n) for b in (112, 96, 80, 48) for n in (1, 2, 3)]
+    # A count no step-0 graph takes runs its dummy step 0 over a token per request.
     assert events == [
         *[("first step", b, n) for b, n in first],
+        ("eager step 0", 4, 4),
+        ("decode steps", 4),
         ("eager step 0", 48, 3),
         ("decode steps", 3),
         ("eager step 0", 16, 2),
@@ -211,13 +236,13 @@ def test_the_capture_records_the_sampled_entries_in_ladder_order(monkeypatch) ->
         ("eager step 0", 16, 1),
         ("decode steps", 1),
     ]
-    assert prepared == [*first, (48, 3), (16, 2), (16, 1)]
+    assert prepared == [*first, (4, 4), (48, 3), (16, 2), (16, 1)]
     assert (
-        observer.order == [FIRST_STEP_SERIES] * len(first) + [DECODE_STEPS_SERIES] * 3
+        observer.order == [FIRST_STEP_SERIES] * len(first) + [DECODE_STEPS_SERIES] * 4
     )
     # The projection accepts exactly these readings for these ladders.
     estimate = estimate_cudagraph_memory(observer.samples, capture.ladders)
-    assert estimate.measured_total == (len(first) + 3) << 20
+    assert estimate.measured_total == (len(first) + 4) << 20
 
 
 def test_static_buffers_fit_the_whole_plan_and_survive_a_recapture(
@@ -236,13 +261,14 @@ def test_static_buffers_fit_the_whole_plan_and_survive_a_recapture(
     probe = capture_input(drafter, backend, buckets, counts, entries=2)
     _capture_without_a_gpu(monkeypatch, drafter, probe, RecordingObserver())
 
+    # The decode steps' request counts reach the drafter's batch.
     buffers = drafter._extend_buffers
     assert buffers.hidden_in.shape == (128, WIDTH)
     assert buffers.hidden_in.dtype == torch.float32
-    assert buffers.gather_ids.shape == (3,)
-    assert buffers.frontier.shape == (3,)
+    assert buffers.gather_ids.shape == (MAX_BS,)
+    assert buffers.frontier.shape == (MAX_BS,)
     assert buffers.frontier.dtype == drafter.input_buffers.seq_lens_buf.dtype
-    assert buffers.next_tokens.shape == (3, STEPS + 1)
+    assert buffers.next_tokens.shape == (MAX_BS, STEPS + 1)
 
     full = capture_input(drafter, backend, buckets, counts, entries=None)
     _capture_without_a_gpu(monkeypatch, drafter, full, RecordingObserver())
@@ -400,8 +426,23 @@ def test_a_pure_extend_replays_the_smallest_fitting_bucket(monkeypatch) -> None:
             )
             == expected
         ), lengths
-    # No graph at this request count at all: eager.
-    assert drafter._extend_graph_route(3, extend_input(drafter, [1, 1, 1])) is None
+    # No step-0 graph at this request count: step 0 eager, the decode steps replay.
+    assert drafter._extend_graph_route(3, extend_input(drafter, [1, 1, 1])) == route(
+        None, True
+    )
+    # One draft step has no decode steps: eager.
+    single = _captured(monkeypatch, [16], lambda _bucket: [1], spec_num_steps=1)
+    assert single._extend_graph_route(3, extend_input(single, [1, 1, 1])) is None
+
+
+def test_a_step_0_count_past_the_decode_steps_runs_them_eager(monkeypatch) -> None:
+    # Decode steps recorded up to 2 requests: a step-0 graph at 3 replays step 0 alone.
+    monkeypatch.setattr(eagle_module, "EXTEND_DECODE_MAX_REQUESTS", 2)
+    drafter = _captured(monkeypatch, [16], lambda _bucket: [1, 2, 3])
+
+    assert sorted(drafter._decode_steps_graphs) == [1, 2]
+    route = drafter._extend_graph_route(3, extend_input(drafter, [2, 2, 2]))
+    assert route == eagle_module._ExtendRoute((16, 3), False)
 
 
 def test_rounds_a_graph_did_not_bake_run_eager(monkeypatch) -> None:
@@ -430,9 +471,11 @@ def test_rounds_a_graph_did_not_bake_run_eager(monkeypatch) -> None:
     )
     sharded = extend_input(drafter, [8], query_shard=shard)
     assert drafter._extend_graph_route(1, sharded) is None
-    # Target hidden rows that are not one per input row.
+    # Hidden rows not one per input row: step 0 eager, the decode steps replay.
     short = extend_input(drafter, [8], hidden=torch.randn(1, WIDTH))
-    assert drafter._extend_graph_route(1, short) is None
+    assert drafter._extend_graph_route(1, short) == eagle_module._ExtendRoute(
+        None, True
+    )
     # Nothing captured (or released).
     drafter.release_extend_graphs()
     assert drafter._extend_graph_route(1, extend_input(drafter, [8])) is None

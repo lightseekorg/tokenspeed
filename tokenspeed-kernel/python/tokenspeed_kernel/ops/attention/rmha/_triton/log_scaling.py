@@ -27,6 +27,22 @@ from tokenspeed_kernel._triton import libdevice, tl, triton
 
 __all__ = ["log_scaling_tau"]
 
+_IS_HIP = tl.constexpr(torch.version.hip is not None)
+
+
+@triton.jit
+def _torch_log(x):
+    """FP32 ``x >= 1`` rounded as ``torch.log`` rounds it. On ROCm that is
+    HIP's ``logf`` for normal inputs: log2, then a product with ln(2) carried
+    in two constants through FMAs."""
+    if _IS_HIP:
+        y = libdevice.log2(x)
+        ln2_hi = 0.6931471228599548  # 0x3f317217
+        low = tl.fma(y, ln2_hi, -(y * ln2_hi))
+        low = tl.fma(y, 5.769998878690785e-08, low)  # 0x3377d1cf
+        return tl.fma(y, ln2_hi, low)
+    return libdevice.log(x)
+
 
 @triton.jit
 def _log_scaling_tau_kernel(
@@ -45,7 +61,7 @@ def _log_scaling_tau_kernel(
     if TORCH_ORDER:
         # Torch's order: times the FP32 reciprocal, clamp, logf, multiply, then add.
         effective_n = (pos + 1).to(tl.float32) * inv_n_floor
-        tau = libdevice.log(tl.maximum(effective_n, 1.0)) * alpha + 1.0
+        tau = _torch_log(tl.maximum(effective_n, 1.0)) * alpha + 1.0
     else:
         effective_n = (pos + 1).to(tl.float32) / n_floor
         tau = 1.0 + alpha * tl.log(tl.maximum(effective_n, 1.0))
