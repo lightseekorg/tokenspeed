@@ -2364,6 +2364,10 @@ class MuseSparkModel(BaseTransformerModel):
         quant_config: QuantizationConfig | None,
         prefix: str,
     ) -> None:
+        if config.decode_monokernel and global_server_args_dict["simulate"]:
+            raise NotImplementedError(
+                "Muse Spark decode monokernels do not implement final-writeback simulation"
+            )
         _widen_modelopt_exclusions(quant_config)
         exclude_fully_excluded_fused_modules(
             quant_config,

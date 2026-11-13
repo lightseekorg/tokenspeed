@@ -985,6 +985,9 @@ slower, and rows of at most `topk` candidates take ~4.2 us instead of ~2.4 us.
   workgroups and rows 9-32 4096-column ones, each one compiled variant.
 - A per-stream workspace holds each row's histogram and counters and is back
   to zero after every call, so graph replays reuse it.
+- With simulation enabled, rows with at most top-k visible entries return
+  every visible slot once and pad the rest with -1. Only longer rows reach
+  stratified sampling, so all top-k strata are nonempty in every implementation.
 
 #### Algorithm
 

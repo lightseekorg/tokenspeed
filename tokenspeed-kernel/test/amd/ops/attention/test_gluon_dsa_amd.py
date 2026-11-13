@@ -2811,14 +2811,20 @@ def test_dsa_glm52_selected_attention_cases(case: _DSACase) -> None:
 
 @pytest.mark.skipif(not is_cdna4(), reason="Simulation currently targets gfx950")
 @pytest.mark.parametrize(
-    "batch,width,capacity,persistent",
+    "batch,width,capacity,backend",
     [
-        (2, 1, 2048, False),
-        (4, 6, 8192, False),
-        (4, 6, 65536, False),
-        (1, 1, 250048, False),
-        (32, 6, 131072, False),
-        (4, 1, 131072, True),
+        (2, 1, 2048, "auto"),
+        (4, 6, 8192, "auto"),
+        (4, 6, 65536, "auto"),
+        (1, 1, 250048, "auto"),
+        (32, 6, 131072, "auto"),
+        (4, 1, 131072, "persistent"),
+        (6, 1, 8192, "oneblock"),
+        (6, 6, 8192, "oneblock"),
+        (6, 1, 65536, "multi-cta"),
+        (6, 6, 65536, "multi-cta"),
+        (6, 1, 8192, "persistent"),
+        (6, 6, 8192, "persistent"),
     ],
 )
 @pytest.mark.parametrize("tied", [False, True])
@@ -2826,7 +2832,7 @@ def test_simulated_sparse_selection_preserves_causal_unique_physical_slots(
     batch,
     width,
     capacity,
-    persistent,
+    backend,
     tied,
 ):
     page_size, topk = 64, 2048
@@ -2843,6 +2849,16 @@ def test_simulated_sparse_selection_preserves_causal_unique_physical_slots(
     if batch > 1:
         lengths[0] = 0
         lengths[1] = min(capacity, topk + 3)
+    if batch == 6:
+        # Force each implementation to mix rows below, at and above top-k,
+        # including verification rows that cross the boundary within a request.
+        lengths.copy_(
+            torch.tensor(
+                [0, width, topk - 1, topk, topk + 1, capacity - 13],
+                dtype=torch.int32,
+                device="cuda",
+            )
+        )
     rows = batch * width
     row_start = torch.zeros(rows, device="cuda", dtype=torch.int32)
     logits = torch.randn(rows, capacity, device="cuda", generator=generator)
@@ -2852,12 +2868,12 @@ def test_simulated_sparse_selection_preserves_causal_unique_physical_slots(
     selected_lengths = torch.empty(rows, device="cuda", dtype=torch.int32)
     workspace = (
         dsa_topk_backend._persistent_topk_workspace(rows, logits.device)
-        if persistent
+        if backend == "persistent"
         else None
     )
 
     def run(seed):
-        if persistent:
+        if backend == "persistent":
             dsa_topk_backend._dsa_persistent_radix_topk(
                 logits,
                 row_start,
@@ -2873,6 +2889,35 @@ def test_simulated_sparse_selection_preserves_causal_unique_physical_slots(
                 q_len_per_req=width,
                 is_decode=True,
                 simulation_seed=seed,
+            )
+        elif backend == "multi-cta":
+            dsa_topk_backend._dsa_multi_cta_topk(
+                logits,
+                table,
+                lengths,
+                simulation_seed=seed,
+                page_size=page_size,
+                topk=topk,
+                q_len_per_req=width,
+                block_n=2048,
+                out=out,
+                lens_out=selected_lengths,
+            )
+        elif backend == "oneblock":
+            dsa_topk_backend._dsa_oneblock_topk_indices(
+                logits,
+                table,
+                row_start,
+                lengths,
+                simulation_seed=seed,
+                block_table_cols=pages,
+                page_size=page_size,
+                topk=topk,
+                q_len_per_req=width,
+                is_decode=True,
+                plan=dsa_topk_backend._oneblock_launch_plan(capacity, is_decode=True),
+                out=out,
+                lens_out=selected_lengths,
             )
         else:
             dsa_topk_backend._dsa_topk_indices(
@@ -2903,6 +2948,10 @@ def test_simulated_sparse_selection_preserves_causal_unique_physical_slots(
             assert logical.unique().numel() == count
             assert torch.all((logical >= 0) & (logical < visible))
             assert out[row, count:].eq(-1).all()
+            if visible <= topk:
+                torch.testing.assert_close(
+                    logical, torch.arange(visible, device="cuda"), rtol=0, atol=0
+                )
             # Every nontrivial selection covers the full causal prefix, one
             # point per stratum, regardless of the original scores or ties.
             if visible > topk:

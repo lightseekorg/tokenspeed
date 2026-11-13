@@ -271,9 +271,6 @@ def test_fixture_seeds_real_runtime_state_and_engram_history(
     assert states.ngram_accepted_tokens[seeds.slots[1]].tolist() == [17, 16, 15]
     assert states.future_input_map[[0, -1]].eq(63).all()
     assert states.valid_cache_lengths[[0, -1]].eq(0).all()
-    snapshot = fixture.ngram_inputs(3)
-    assert snapshot.tokens == ((19, 1, -1, -1), (23, 17, 16, 15))
-    assert snapshot.positions == (1, 17)
 
 
 def test_synthetic_state_rejects_invalid_candidates_before_mutating_rows():
@@ -512,12 +509,22 @@ def test_fixed_decode_snapshot_restores_cache_and_slot_state_without_copying_pre
 
 
 @pytest.mark.parametrize("request_token_history", [False, True])
-def test_direct_driver_builds_chunk_boundary_and_decode_history(request_token_history):
+@pytest.mark.parametrize(
+    "prompt,ngram_width,expected_decode",
+    [
+        ([1], 3, (19, 1, -1, -1)),
+        ([1, 2], 3, (19, 2, 1, -1)),
+        (list(range(1, 18)), 3, (19, 17, 16, 15)),
+        (list(range(1, 18)), 0, None),
+    ],
+)
+def test_direct_driver_builds_chunk_boundary_and_decode_history(
+    request_token_history, prompt, ngram_width, expected_decode
+):
     from test.forward_benchmark.bench_decode import _plan
 
     from tokenspeed_scheduler import RequestSpec, Scheduler
 
-    prompt = list(range(1, 18))
     config = configuration([len(prompt)], 6, 512)
     scheduler = Scheduler(config)
     request = RequestSpec()
@@ -529,16 +536,19 @@ def test_direct_driver_builds_chunk_boundary_and_decode_history(request_token_hi
         {"input": prompt},
         {},
         request_token_history=request_token_history,
-        ngram_width=3,
+        ngram_width=ngram_width,
         max_new_tokens=100,
     )
-    assert planned.ngram_inputs.tokens == ((1, -1, -1, -1),)
-    assert planned.ngram_inputs.positions == (0,)
+    if ngram_width:
+        assert planned.ngram_inputs.tokens == ((1, -1, -1, -1),)
+        assert planned.ngram_inputs.positions == (0,)
+    else:
+        assert planned.ngram_inputs is None
     if request_token_history:
         assert planned.request_history_seeds.tokens == ((),)
     else:
         assert planned.request_history_seeds is None
-    assert planned.stop_criteria[0].token_limit == 117
+    assert planned.stop_criteria[0].token_limit == len(prompt) + 100
     fixture = allocate_simulated_decode(config, [prompt], [19], max_new_tokens=100)
     decode = fixture.decode_plan.forward[0]
     rid = decode.request_ids[0]
@@ -547,11 +557,14 @@ def test_direct_driver_builds_chunk_boundary_and_decode_history(request_token_hi
         {rid: prompt},
         {rid: 19},
         request_token_history=request_token_history,
-        ngram_width=3,
+        ngram_width=ngram_width,
         max_new_tokens=100,
     )
-    assert planned.ngram_inputs.tokens == ((19, 17, 16, 15),)
-    assert planned.ngram_inputs.positions == (17,)
+    if ngram_width:
+        assert planned.ngram_inputs.tokens == (expected_decode,)
+        assert planned.ngram_inputs.positions == (len(prompt),)
+    else:
+        assert planned.ngram_inputs is None
     assert planned.request_history_seeds is None
 
 

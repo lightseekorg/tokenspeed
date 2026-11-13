@@ -836,6 +836,8 @@ def _physical_slots(block_table, req, block_table_cols, logical, mask, page_size
 
 @gluon.jit
 def _simulated_slots(original, output_rank, live, simulation):
+    # All callers return every visible slot before this mapping when history
+    # is at most top-k. Sampled rows therefore have top-k nonempty strata.
     if simulation[0]:
         _, seed, req, row, extent, count, table, table_cols, page_size = simulation
         logical = stratified_index(original, output_rank, count, extent, row, seed)

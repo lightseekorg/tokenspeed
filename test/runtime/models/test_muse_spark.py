@@ -266,6 +266,7 @@ def test_audio_checkpoint_completeness_is_required_for_real_weights(
     model.audio_tower = torch.nn.Linear(2, 2)
     model._loaded_audio = set()
     model.model = torch.nn.Module()
+    model.model.config = _tiny_config()
     model.model.layers = torch.nn.ModuleList()
     initialize_dummy_weights(model)
     monkeypatch.setitem(global_server_args_dict, "simulate", simulate)
@@ -1583,6 +1584,21 @@ def test_communication_fallback_frees_the_column_split_down_copy() -> None:
 
     assert prepared is False
     assert mlp.down_columns is None
+
+
+def test_simulation_rejects_decode_monokernels_from_model_config(monkeypatch) -> None:
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    config = _tiny_config()
+    config.decode_monokernel = True
+    monkeypatch.setitem(global_server_args_dict, "simulate", True)
+    with pytest.raises(NotImplementedError, match="decode monokernels.*simulation"):
+        module.MuseSparkModel(
+            config=config,
+            mapping=_single_rank_mapping(),
+            quant_config=None,
+            prefix="model",
+        )
 
 
 def test_decode_monokernels_without_iris_fail_startup_with_the_cause() -> None:

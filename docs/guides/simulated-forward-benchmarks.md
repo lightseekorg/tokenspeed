@@ -100,7 +100,8 @@ PP=1, KVP=1 and device-resident cache, without prefix reuse or retraction snapsh
 - Muse Spark uses the ordinary dense/sliding KV arena; it has no sparse index
   keys to seed. Its gfx950 fused all-gather, RMSNorm, MXFP4 quantization and
   routing kernel retains the fusion and permutes only the final expert IDs.
-  Prepared NVFP4 routing is unsupported and fails during initialization.
+  Prepared NVFP4 routing and decode monokernels are unsupported and fail during
+  initialization because they do not simulate the final expert IDs.
   Use a Quark MXFP4 checkpoint on gfx950.
 - DeepSeek V4.1 needs `--trust-remote-code` for Engram's tokenizer. Bounded
   n-gram inputs are separate from full request-token-history seeds; the planner

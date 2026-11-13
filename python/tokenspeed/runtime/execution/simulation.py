@@ -47,18 +47,6 @@ class SimulatedDecodeFixture:
     next_token_ids: tuple[int, ...]
     prompt_tokens: tuple[tuple[int, ...], ...]
 
-    def ngram_inputs(self, context_len: int):
-        """Build the ordinary Engram snapshot at the synthetic decode boundary."""
-        from tokenspeed.runtime.execution.types import NGramInputs
-
-        if context_len < 0:
-            raise ValueError("Engram context length must be nonnegative")
-        rows = []
-        for prompt, token in zip(self.prompt_tokens, self.next_token_ids, strict=True):
-            tail = tuple(reversed(prompt[-context_len:])) if context_len else ()
-            rows.append((token, *tail, *([-1] * (context_len - len(tail)))))
-        return NGramInputs(tokens=tuple(rows), positions=self.context_lengths)
-
 
 def allocate_simulated_decode(
     config: SchedulerConfig,

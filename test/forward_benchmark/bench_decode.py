@@ -76,6 +76,7 @@ def _plan(
     )
     ngram = None
     if ngram_width:
+        # Keep prefill and decode tail ordering/padding in this shared planner.
         rows = []
         for rid, position in zip(batch.request_ids, positions, strict=True):
             history = prompts[rid]
