@@ -231,6 +231,7 @@ def _muse_owned_qkvg_worker(rank, world_size, device):
         torch.ones((64,), device=device, dtype=torch.float32),
         0.0,
         eps,
+        round_before_rope=False,
     )
 
     def make_inputs(rows):

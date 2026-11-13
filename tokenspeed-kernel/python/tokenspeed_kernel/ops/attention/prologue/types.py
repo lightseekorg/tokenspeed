@@ -31,6 +31,8 @@ import torch
 
 BOOLS = frozenset({True, False})
 ROPE_STYLES = frozenset({"none", "neox", "gptj"})
+# A K/V short convolution's batch: none, decode/verify, or extend.
+KV_CONVS = frozenset({"none", "decode", "extend"})
 # Head widths the CUDA embedding.rope kernel serves.
 CUDA_ROPE_HEAD_DIMS = frozenset({64, 128, 256, 512})
 
@@ -62,12 +64,117 @@ class HeadNorm:
         k_weight: Stored key weight ``[head_dim]``.
         weight_offset: 1.0 for Gemma-style ``1 + w`` weights, else 0.0.
         eps: Epsilon added to the mean square.
+        round_before_rope: Require normalized heads to round to the input
+            dtype before rotation. False retains the solution's usual numerics.
     """
 
     q_weight: torch.Tensor
     k_weight: torch.Tensor
     weight_offset: float
     eps: float
+    round_before_rope: bool
+
+
+@dataclass(frozen=True)
+class ConvStream:
+    """One channel stream of a short causal convolution over each request's
+    recent rows, as ``inkling_ring_sconv`` takes it.
+
+    Attributes:
+        weight: Taps ``[channels, W]``; tap ``W - 1`` multiplies the current
+            row, or tap 0 with ``dynamic_weights``.
+        dynamic_weights: Optional floating ``[num_tokens, heads, W]``
+            coefficients, each added in fp32 to the taps of its head's
+            channels.
+        ring: The stream's ``[slots, R, channels]`` view of the conv ring.
+        checkpoint: The ``[pages, W - 1, channels]`` field a published
+            window goes to.
+    """
+
+    weight: torch.Tensor
+    dynamic_weights: torch.Tensor | None
+    ring: torch.Tensor
+    checkpoint: torch.Tensor
+
+
+@dataclass(frozen=True)
+class ConvBatch:
+    """One forward's addressing of the conv rings, as ``inkling_ring_sconv``
+    takes it.
+
+    Attributes:
+        cu_seqlens, seq_idx, cache_indices, has_initial_state, seq_lens,
+            block_table: The ring addressing of ``inkling_ring_sconv``.
+        num_extends: Extend requests in the batch; 0 is a decode or verify
+            batch of uniform chunks.
+        publish_live: Each request's last row writes its chunk-end window to
+            the live checkpoint block.
+    """
+
+    cu_seqlens: torch.Tensor
+    seq_idx: torch.Tensor
+    cache_indices: torch.Tensor
+    has_initial_state: torch.Tensor
+    seq_lens: torch.Tensor
+    block_table: torch.Tensor
+    num_extends: int
+    publish_live: bool
+
+
+@dataclass(frozen=True)
+class KVShortConv:
+    """The short causal convolution of the key and value rows before their
+    head steps: each stream's ``(x + conv(window)) * output_scale`` rounded
+    once to the row dtype, its ring rows and published window written as
+    ``inkling_ring_sconv`` writes them.
+
+    Attributes:
+        k, v: The key and value streams.
+        batch: Their ring addressing.
+        output_scale: Finite multiplier of both streams.
+    """
+
+    k: ConvStream
+    v: ConvStream
+    batch: ConvBatch
+    output_scale: float
+
+
+@dataclass(frozen=True)
+class RelativeHeadNorm:
+    """Relative attention's head steps (Inkling): optionally the short
+    convolution of the key and value rows, then the query and key heads
+    L2-clipped, the value heads RMS-normalized, and the clipped relative
+    heads projected to per-distance logits, each output rounded once as
+    ``inkling_ring_sconv`` and ``rel_mha_head_norms`` compute it.
+
+    Attributes:
+        relative: Relative heads ``[num_tokens, num_q_heads, rel_dim]``; rows
+            may be strided, each head contiguous.
+        projection: Relative projection ``[rel_dim, extent]``.
+        q_scale, k_scale, rel_scale: Per-channel clip scales, or ``None``.
+        q_threshold, k_threshold, rel_threshold: L2 clip thresholds.
+        clip_eps: Epsilon of the L2 clips.
+        value_norm_eps: Epsilon of the value RMS norm, or ``None`` to store
+            the value heads as given.
+        q_output_scale: fp32 ``[num_tokens]`` multiplier of the clipped query
+            and relative logits, or ``None``.
+        kv_conv: The convolution of the key and value rows, which are then
+            its inputs, or ``None``.
+    """
+
+    relative: torch.Tensor
+    projection: torch.Tensor
+    q_scale: torch.Tensor | None
+    k_scale: torch.Tensor | None
+    rel_scale: torch.Tensor | None
+    q_threshold: float
+    k_threshold: float
+    rel_threshold: float
+    clip_eps: float
+    value_norm_eps: float | None
+    q_output_scale: torch.Tensor | None
+    kv_conv: KVShortConv | None
 
 
 @dataclass(frozen=True)
@@ -236,11 +343,14 @@ class GQAPrologueOutput:
         q: Rotated query ``[num_tokens, num_q_heads * head_dim]``.
         k: Rotated key rows when requested, else ``None``.
         v: Value rows when requested, else ``None``.
+        rel_logits: ``[num_tokens, num_q_heads, extent]`` relative logits
+            under a ``RelativeHeadNorm``, else ``None``.
     """
 
     q: torch.Tensor
     k: torch.Tensor | None
     v: torch.Tensor | None
+    rel_logits: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)

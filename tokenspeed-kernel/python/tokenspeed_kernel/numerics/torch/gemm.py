@@ -306,6 +306,18 @@ def torch_mm(
     bias: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    if out_dtype == torch.float32 and A.dtype in (torch.bfloat16, torch.float16):
+        # Widen the accumulator, not a rounded result; CPU mm lacks out_dtype.
+        if A.is_cuda:
+            output = torch.mm(A, B.T, out_dtype=out_dtype, out=out)
+        else:
+            output = torch.mm(A.float(), B.T.float(), out=out)
+        if alpha is not None:
+            output.mul_(alpha.float())
+        if bias is not None:
+            output.add_(bias.float())
+        return output
+
     if out is not None:
         if out_dtype != A.dtype:
             raise ValueError(

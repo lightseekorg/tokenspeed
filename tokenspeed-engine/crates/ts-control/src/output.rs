@@ -1866,6 +1866,7 @@ mod tests {
             schema_slot: String::new(),
             markers: Some((1, 2)),
             implicit_closer: None,
+            boundary: None,
         };
         let mut state = RequestState::new(vec![1], 10, BTreeSet::new(), true, None, false);
         state.reasoning_tokens = Some(crate::request::ReasoningTokens::new(
@@ -2005,6 +2006,7 @@ mod tests {
             schema_slot: String::new(),
             markers: Some((0, 2)),
             implicit_closer: None,
+            boundary: None,
         };
         let state = p.states.get_mut("a").unwrap();
         state.reasoning_tokens = Some(crate::request::ReasoningTokens::new(

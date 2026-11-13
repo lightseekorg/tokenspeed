@@ -2061,6 +2061,8 @@ class ModelExecutor:
                     )
             self._record_draft_final_cache_step(ctx.num_extends)
 
+        if self.capturable_grammar is not None:
+            self.capturable_grammar.join_post_sampler()
         return (
             output_tokens,
             accept_lengths,

@@ -124,6 +124,7 @@ from tokenspeed.runtime.grammar.capturable_grammar import (
     resolve_grammar_completion,
 )
 from tokenspeed.runtime.grammar.host_grammar import HostGrammar, HostGrammarEntries
+from tokenspeed.runtime.grammar.inkling2_json import JsonFraming, inkling2_json_framing
 from tokenspeed.runtime.grammar.reasoning_structural_tag import (
     ReasoningGrammar,
     reasoning_grammar,
@@ -355,6 +356,8 @@ class GrammarSettings:
         reasoning: How a JSON schema waits for the reasoning block of the
             ``--reasoning-parser``; None without one, or when xgrammar has
             no template for it.
+        json_framing: How the vocabulary frames a JSON answer in protocol
+            tokens for ``--reasoning-parser inkling2``; None for any other.
     """
 
     tokenizer_info: str
@@ -362,6 +365,7 @@ class GrammarSettings:
     compile_timeout_s: float
     max_retries: int
     reasoning: ReasoningGrammar | None
+    json_framing: JsonFraming | None
 
 
 def grammar_tokenizer_info(tokenizer, vocab_size: int, eos_token_ids) -> str:
@@ -1470,6 +1474,11 @@ class HostBootstrap:
                         ),
                         max_retries=int(server_args.grammar_compile_max_retries),
                         reasoning=reasoning,
+                        json_framing=inkling2_json_framing(
+                            server_args.reasoning_parser,
+                            tokenizer,
+                            model_config.vocab_size,
+                        ),
                     )
                     if server_args.grammar_backend == "xgrammar"
                     else None

@@ -153,7 +153,7 @@ switch an envelope folds is also available individually under `auto`.
 | `--served-model-name` | The model's name in metric labels. Under `ts serve`, requests may also name the model by it; the OpenAI-compatible API lists the model path. |
 | `--api-key` | SMG gateway API key for authorization with upstream workers. |
 | `--chat-template` | Built-in chat template name or template file path (handled by the smg gateway). |
-| `--stream-interval` | Streaming buffer interval in generated tokens. Smaller values stream more frequently. |
+| `--stream-interval` | Streaming buffer size in generated tokens. The server streams the first step's tokens at once, then whenever at least this many tokens are unsent. Smaller values stream more often. |
 | `--weight-version` | Initial model-weight version, the L3 cache's namespace (see [Weight versions](#weight-versions)). Defaults to `default`. |
 | `--model-update-config` | JSON object handed to the Model Updater SDK for the Mooncake weight update. Requires the three flags below; see [Mooncake weight updates](#mooncake-weight-updates). |
 | `--model-update-sdk-module` | Import path of the Model Updater SDK module. Imported in the scheduler process on the first Mooncake update, not at startup. Required with `--model-update-config`. |
