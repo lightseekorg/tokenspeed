@@ -21,6 +21,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -165,6 +166,34 @@ TEST(CapacityModelTest, MatchesTheSchedulerStartupBound) {
                 << " groups=" << sizing.cache_groups.size() << " usable=" << usable_lcm_blocks;
         }
     }
+}
+
+TEST(CapacityModelTest, StopsTheTokenLimitShortOfInt32ByTheDecodeAndRoundingHeadroom) {
+    // 40000 pages of 65536 tokens would hold a request past INT32_MAX. On
+    // every role the bound stops short of it by the decode windows a step
+    // reserves past the limit, (overlap depth + 1) * decode width, and one
+    // prefix page.
+    constexpr std::int32_t kInt32Max = std::numeric_limits<std::int32_t>::max();
+    for (const Role role : {Role::kFused, Role::kP, Role::kD}) {
+        const CapacityModel eager{
+            SizingConfig(role, 65536, 65536, /*decode_width=*/1, /*overlap_depth=*/0, false, {Full("full", 65536, 1)})};
+        EXPECT_EQ(eager.MaxSingleRequestTokens(40000), kInt32Max - 1 - 65536);
+        const CapacityModel overlapped{
+            SizingConfig(role, 65536, 65536, /*decode_width=*/4, /*overlap_depth=*/1, false, {Full("full", 32768, 2)})};
+        EXPECT_EQ(overlapped.MaxSingleRequestTokens(40000), kInt32Max - 8 - 65536);
+    }
+}
+
+TEST(CapacityModelTest, SubmitRejectsATokenLimitPastTheInt32Headroom) {
+    constexpr std::int32_t kLimit = std::numeric_limits<std::int32_t>::max() - 1 - 65536;
+    Scheduler scheduler{WithHostPackingFromDevice(
+        SizedConfig(SizingConfig(Role::kFused, 65536, 65536, 1, 0, false, {Full("full", 65536, 1)}), 40000))};
+    EXPECT_EQ(scheduler.MaxSingleRequestTokens(), kLimit);
+    // One prompt token, and the rest of the limit as the generation budget.
+    EXPECT_NO_THROW(
+        scheduler.SubmitRequests({RequestSpec{.request_id = "at", .tokens = {1}, .max_new_tokens = kLimit - 1}}));
+    EXPECT_THROW(scheduler.SubmitRequests({RequestSpec{.request_id = "past", .tokens = {1}, .max_new_tokens = kLimit}}),
+                 std::invalid_argument);
 }
 
 TEST(CapacityModelTest, ConcurrentDemandCoversEveryAdmissibleSingleRequest) {

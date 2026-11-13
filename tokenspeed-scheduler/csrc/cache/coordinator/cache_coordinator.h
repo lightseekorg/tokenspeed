@@ -38,6 +38,7 @@
 #include "cache/core/block_pool.h"
 #include "cache/core/cache_block_ref.h"
 #include "cache/coordinator/group_geometry.h"
+#include "cache/coordinator/victim_set.h"
 #include "cache/cache_group.h"
 #include "cache/core/cache_types.h"
 #include "cache/prefix/boundary_tree.h"
@@ -110,8 +111,9 @@ public:
     CacheCoordinator& operator=(CacheCoordinator&&) = delete;
     std::size_t DemoteSession(const std::string& session_id, bool ended);
     std::size_t DemoteSessions(const std::vector<std::string>& ids, bool ended);
+    std::size_t DemoteCacheGroups(const std::vector<std::string>& ids, bool ended);
 
-    // A request's session, registered under its access epoch for every
+    // A request's cache owner (group or session), registered under its epoch for every
     // admission, publication and restore that epoch dates
     // (SessionForAccess). The first admission of a request with a session id
     // registers it and returns this handle; dropping the handle unregisters
@@ -223,6 +225,8 @@ public:
         // Optional precomputation for exactly prefix_hashes and this
         // coordinator. Omission expands those identities for this probe.
         PreparedPrefixKeys prepared_keys;
+        // Bounded request-local remote hints; no global tail-table mutation.
+        std::span<const std::int32_t> shared_prefix_tokens;
     };
 
     struct PrefixProbe {
@@ -409,7 +413,8 @@ public:
                                          std::span<std::vector<CacheBlockRef>> copy_in_blocks,
                                          std::optional<CopyInPoint> copy_in_point,
                                          std::optional<std::uint64_t> request_access_epoch,
-                                         bool evict_blocks_past_segments, const std::string& session_id);
+                                         bool evict_blocks_past_segments, const std::string& session_id,
+                                         const std::string& cache_group_id);
 
     // Lone-request compaction, the last means for a request no other one
     // holds pages beside, whose Admit with evict_blocks_past_segments just
@@ -929,6 +934,10 @@ public:
         std::int32_t max_tokens{0};
     };
     StorageQuery MissingStorageKeys(const PromptPrefix& prompt, std::size_t max_keys) const;
+    // All immutable objects needed at exactly this boundary, including objects
+    // already in Device/Host. max_tokens is 0 for an illegal boundary and -1
+    // when the bounded key budget cannot describe the complete dependency.
+    StorageQuery SharedPrefixKeys(const PromptPrefix& prompt, std::size_t max_keys) const;
     StorageReservation ReserveStoragePrefix(const PromptPrefix& prompt, std::span<const CacheKey> hits,
                                             std::size_t max_blocks);
 
@@ -1323,12 +1332,45 @@ private:
     // pinned elsewhere stays.
     bool evictCachedBlock(std::uint32_t group_id, CacheBlockLocation location,
                           DeviceEvictionCounts DeviceEvictionStats::*reason, EvictedSegment* write_back_segment);
+    // The counter a planned victim's eviction counts under, by what its plan
+    // marked it as (VictimSet::Member).
+    struct VictimReasons {
+        DeviceEvictionCounts DeviceEvictionStats::*victim;
+        DeviceEvictionCounts DeviceEvictionStats::*stranded_suffix;
+        DeviceEvictionCounts DeviceEvictionStats::*request_reclaim;
+    };
+    // A planned victim evictPlannedVictims found no unpinned entry at: an
+    // earlier victim's cascade took it, or something still holds its block
+    // (an admission's own released slot until its table lets go).
+    struct UnevictedVictim {
+        std::uint32_t group_id;
+        CacheBlockLocation location;
+        DeviceEvictionCounts DeviceEvictionStats::*reason;
+        EvictedSegment* write_back_segment;
+    };
+    // Evicts planned victims in plan order, each with its cascade
+    // (evictCachedBlock), counted under `reasons`. With write_back each set is
+    // recorded as one segment of evicted_segments_; one whose every block was
+    // dropped stays empty for the caller to erase. The one loop that commits
+    // an admission's, a restore's, a compaction's or a cache clear's victims;
+    // it prefetches for the victims a few places ahead (hints only).
+    std::vector<UnevictedVictim> evictPlannedVictims(std::span<const VictimSet> victims, bool write_back,
+                                                     const VictimReasons& reasons);
+    // What evictCachedBlockAlone took out of the index.
+    struct EvictedEntry {
+        CacheKey key;
+        // Another Device entry under the key's content hash is still indexed
+        // (another group's, or another block of the page): only then can a
+        // cascade find anything. Every Device entry holds its hash's tree
+        // node, whose count tells this before the entry leaves.
+        bool device_companions_left{false};
+    };
     // Device eviction of one entry without its cascade, the one place a
     // Device entry leaves the index: it reports the eviction, counts it under
     // `reason` (the DeviceEvictionStats field of what started the eviction;
     // eviction order and cascades never depend on it); the entry's hold on its
-    // tree node goes with it. It returns the key that left the index, nullopt
-    // when the entry is pinned or gone. A superseded input (MarkSupersededStateInput) an
+    // tree node goes with it. It returns the entry that left the index,
+    // nullopt when it is pinned or gone. A superseded input (MarkSupersededStateInput) an
     // admission, rotation or restore evicts counts as
     // request_reclaim and is never recorded; a demoted entry
     // (SetCheckpointDemotion) is never recorded either, whatever evicts it,
@@ -1342,9 +1384,9 @@ private:
     // the node never looks empty in between. One no probe could resume from
     // on the Host is dropped instead (DeadEntriesNotWrittenBack). nullptr
     // drops it.
-    std::optional<CacheKey> evictCachedBlockAlone(std::uint32_t group_id, CacheBlockLocation location,
-                                                  DeviceEvictionCounts DeviceEvictionStats::*reason,
-                                                  EvictedSegment* write_back_segment);
+    std::optional<EvictedEntry> evictCachedBlockAlone(std::uint32_t group_id, CacheBlockLocation location,
+                                                      DeviceEvictionCounts DeviceEvictionStats::*reason,
+                                                      EvictedSegment* write_back_segment);
     // Evicts an unpinned Host entry and, for a State checkpoint, the other
     // State groups' unpinned entries at its hash. Each entry that left counts
     // under host_evictions_.*reason, as device_resident too when the Device
@@ -1425,10 +1467,14 @@ private:
     // Some group is prefix-closed, and needs every page below a boundary: a
     // State or sliding group resumes past a page that holds nothing.
     bool has_prefix_closed_groups_{false};
-    SessionCacheOwner sessionTag(const std::string& id);
+    using CacheOwnerTags = std::unordered_map<std::string, std::weak_ptr<SessionCacheTag>>;
+    SessionCacheOwner cacheOwnerTag(const std::string& id, CacheOwnerTags& registry);
+    std::size_t demoteCacheOwners(const std::vector<std::string>& ids, bool ended, CacheOwnerTags& registry);
     // One entry per live SessionAccess handle, which adds and erases it.
     std::unordered_map<std::uint64_t, SessionCacheOwner> session_access_;
-    std::unordered_map<std::string, std::weak_ptr<SessionCacheTag>> session_tags_;
+    CacheOwnerTags session_tags_;
+    // A separate namespace prevents a group id from colliding with a session id.
+    CacheOwnerTags cache_group_tags_;
     std::size_t session_tags_since_sweep_{0};
     std::uint64_t next_access_epoch_{0};
     // Issued access epochs start at 1. A superseded input is re-registered

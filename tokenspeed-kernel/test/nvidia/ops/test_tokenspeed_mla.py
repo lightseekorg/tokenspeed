@@ -263,6 +263,101 @@ def test_kv_pack_reuses_compilation() -> None:
     )
 
 
+def test_fp8_block_decode_batch_sizes_reuse_compiled_kernels() -> None:
+    """Batch sizes with 2 to 8 splits share one compiled decode kernel."""
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("tokenspeed_mla decode requires SM100, SM103 or SM107")
+    # The in-tree kernel owns this contract; the pinned wheel can precede it.
+    repo_root = Path(__file__).resolve().parents[4]
+    script = textwrap.dedent("""
+        import tokenspeed_mla.mla_decode as decode
+        import torch
+        from utils import assert_no_cute_compile
+
+        # A Kimi-K3.1 block drafter at TP8: 12 heads, a 7-token causal block.
+        heads, q_len, page, max_seq_len = 12, 7, 64, 32776
+        workspace = torch.empty(512 * 1024**2, dtype=torch.int8, device="cuda")
+        kv = torch.randn(256, page, 576, device="cuda").to(torch.float8_e4m3fn)
+
+        def run(batch):
+            query = torch.randn(batch, q_len, heads, 576, device="cuda")
+            tables = torch.randint(0, 256, (batch, 514), device="cuda").int()
+            lengths = [q_len + (300 * b) % 8000 for b in range(batch)]
+            out = decode.tokenspeed_mla_decode(
+                query=query.to(torch.float8_e4m3fn),
+                kv_cache=kv,
+                workspace_buffer=workspace,
+                kv_lora_rank=512,
+                qk_rope_head_dim=64,
+                block_tables=tables,
+                seq_lens=torch.tensor(lengths, dtype=torch.int32, device="cuda"),
+                max_seq_len=max_seq_len,
+                softmax_scale=192**-0.5,
+                causal_mask=True,
+            )
+            assert torch.isfinite(out).all()
+
+        class Planned(Exception):
+            pass
+
+        def plan(**key):
+            raise Planned(tuple(sorted(key.items())))
+
+        def record_splits(*args):
+            result = plan_splits(*args)
+            splits[args[0]] = result[0]
+            return result
+
+        # Plan each batch's kernel key and split count without compiling.
+        keys, splits = {}, {}
+        compile_kernel, plan_splits = (
+            decode._get_compiled_mla_kernel,
+            decode._get_split_kv_and_workspace_size,
+        )
+        decode._get_compiled_mla_kernel = plan
+        decode._get_split_kv_and_workspace_size = record_splits
+        for batch in range(1, 65):
+            try:
+                run(batch)
+            except Planned as planned:
+                keys[batch] = planned.args[0]
+        decode._get_compiled_mla_kernel = compile_kernel
+        decode._get_split_kv_and_workspace_size = plan_splits
+        assert len(keys) == 64, sorted(keys)
+        shared = {keys[b] for b in keys if 2 <= splits[b] <= 8}
+        assert len(shared) <= 1, sorted(splits.items())
+
+        # One warm launch per planned kernel, then no batch size compiles.
+        for batch in sorted({key: b for b, key in reversed(keys.items())}.values()):
+            run(batch)
+        with assert_no_cute_compile():
+            for batch in range(1, 65):
+                run(batch)
+        """)
+    env = os.environ.copy()
+    python_path = [
+        str(repo_root / "tokenspeed-mla" / "python"),
+        str(repo_root / "tokenspeed-kernel" / "test"),
+    ]
+    if env.get("PYTHONPATH"):
+        python_path.append(env["PYTHONPATH"])
+    env["PYTHONPATH"] = os.pathsep.join(python_path)
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    assert result.returncode == 0, (
+        "MLA decode recompiled across batch sizes:\n"
+        f"stdout:\n{result.stdout}\n"
+        f"stderr:\n{result.stderr}"
+    )
+
+
 def test_sm103_bf16_decode_causal_variants_compile() -> None:
     """The SM103 BF16 decode path compiles for both mask variants."""
     repo_root = Path(__file__).resolve().parents[4]

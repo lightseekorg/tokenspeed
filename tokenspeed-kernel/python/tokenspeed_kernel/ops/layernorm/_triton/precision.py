@@ -23,10 +23,21 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel._triton import libdevice, tl, triton
 from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
+
+_IS_HIP = tl.constexpr(torch.version.hip is not None)
+
+
+@triton.jit
+def _torch_rsqrt(x):
+    """FP32 ``x`` rounded as ``torch.rsqrt`` rounds it: the approximate
+    instruction on CUDA, but correctly rounded on ROCm."""
+    if _IS_HIP:
+        return libdevice.rsqrt(x.to(tl.float64)).to(tl.float32)
+    return tl.rsqrt(x)
 
 
 @triton.jit
@@ -39,7 +50,7 @@ def _rms_normalized(value, WIDTH: tl.constexpr, EPS, MEAN_BY_RECIPROCAL: tl.cons
         mean = total * (1.0 / WIDTH)
     else:
         mean = tl.div_rn(total, WIDTH)
-    return value * tl.rsqrt(mean + EPS)
+    return value * _torch_rsqrt(mean + EPS)
 
 
 @triton.jit
@@ -48,7 +59,7 @@ def _l2_clipped(value, threshold, eps):
     norm is ``s * rsqrt(s)`` of the sum of squares ``s``, as the reference
     computes it."""
     sum_sq = tl.sum(value * value, 0)
-    norm = tl.where(sum_sq > 0, sum_sq * tl.rsqrt(sum_sq), 0.0)
+    norm = tl.where(sum_sq > 0, sum_sq * _torch_rsqrt(sum_sq), 0.0)
     multiplier = tl.minimum(1.0, tl.div_rn(threshold, norm + eps))
     return value * multiplier
 
