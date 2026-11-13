@@ -103,7 +103,10 @@ The `tokenspeed-engine` wheel (`pyproject.toml`, built with setuptools) carries
 build instead, put `_native` on the Python path and point
 `TOKENSPEED_HOST_BINARY` at the binary. `TS_HOST_LOG` sets the Rust log
 filter (`info` by default; `ts_control=debug` logs admissions and cache-op
-acknowledgments).
+acknowledgments). `TS_HOST_LOG_USE_LOCAL_TZ` switches the Rust log
+timestamps from the default UTC (`...Z`) to the machine's local time with
+an explicit UTC offset (`...+08:00`); truthy values are `1`, `true`, `on`
+and `yes`, case-insensitive, matching dynamo's `DYN_LOG_USE_LOCAL_TZ`.
 
 ## Releasing Python wheels
 

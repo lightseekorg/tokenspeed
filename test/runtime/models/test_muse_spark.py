@@ -548,6 +548,7 @@ def test_muse_mxfp4_honors_quark_expert_exclusions(
     assert kept.quantized_experts is False
     assert kept.expert_quant_kind == "unquant"
     assert kept.experts.w13_weight.dtype == torch.bfloat16
+    assert kept.experts.supports_deferred_finalize is True
     assert quantized.quantized_experts is True
     assert quantized.expert_quant_kind == "mxfp4"
     assert quantized.experts.w13_weight.dtype == torch.uint8
@@ -570,6 +571,10 @@ def test_muse_spark_moe_matches_torch_reference(bf16_default_dtype) -> None:
     torch.manual_seed(21)
     for parameter in module_.parameters():
         parameter.data.normal_(mean=0.0, std=0.02)
+    # The planned expert kernel may repack its weights; keep the loaded layout.
+    w13 = module_.experts.w13_weight.detach().clone()
+    w2 = module_.experts.w2_weight.detach().clone()
+    module_.experts.process_weights_after_loading(module_.experts)
     module_.gate.process_weights_after_loading(module_.gate)
     hidden = torch.randn(5, 256, dtype=torch.bfloat16, device="cuda")
     router_input = hidden.float()
@@ -595,14 +600,12 @@ def test_muse_spark_moe_matches_torch_reference(bf16_default_dtype) -> None:
     for token in range(5):
         for slot in range(2):
             expert = int(ids[token, slot].item())
-            gate_up = (
-                compressed[token].float() @ module_.experts.w13_weight[expert].float().T
-            )
+            gate_up = compressed[token].float() @ w13[expert].float().T
             gate, up = gate_up.chunk(2)
             activated = (torch.nn.functional.silu(gate) * up).to(torch.bfloat16)
-            routes[token, slot] = (
-                activated.float() @ module_.experts.w2_weight[expert].float().T
-            ).to(torch.bfloat16)
+            routes[token, slot] = (activated.float() @ w2[expert].float().T).to(
+                torch.bfloat16
+            )
     scaled_routes = routes.float() * (module_.post_expert_norm.weight + 1.0).float()
     normalized_routes = _rmsnorm(scaled_routes, module_.post_expert_norm.eps)
     combined = (normalized_routes * route_weights[..., None]).sum(dim=1)
@@ -1410,7 +1413,7 @@ def test_reloaded_gates_refresh_the_cached_coefficients_in_place() -> None:
     assert torch.equal(second[0], expected[0]) and torch.equal(second[1], expected[1])
 
 
-def test_quantized_combined_prepares_routing_once_per_token_count(
+def test_experts_combined_prepares_routing_once_per_token_count(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The experts get the prepared routing when it exists; otherwise one is prepared for next time."""
@@ -1447,7 +1450,7 @@ def test_quantized_combined_prepares_routing_once_per_token_count(
             torch.zeros(tokens, 1, dtype=torch.uint8),
         )
         weights, ids = torch.ones(tokens, 2), torch.zeros(tokens, 2, dtype=torch.int32)
-        moe._quantized_combined(
+        moe._experts_combined(
             torch.zeros(tokens, 8),
             quantized,
             weights,

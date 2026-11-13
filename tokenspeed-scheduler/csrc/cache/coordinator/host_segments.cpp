@@ -79,7 +79,7 @@ void CacheCoordinator::visitHostKvDuplicateCandidates(Visitor&& visit) const {
         while (page != nullptr && page->boundary_tokens > first_window_token) {
             const std::int32_t page_start = page->boundary_tokens - prefix_granularity_;
             ForEachBoundaryKey(
-                CacheKey{.content_hash = *page->hash}, /*tail_tokens=*/0, [&](std::size_t i, const CacheKey& key) {
+                CacheKey{.content_hash = page->hash}, /*tail_tokens=*/0, [&](std::size_t i, const CacheKey& key) {
                     if (GroupIsState(i) || groups_[i].Matcher().IsPrefixClosed()) {
                         return;
                     }
@@ -102,7 +102,7 @@ void CacheCoordinator::visitHostKvDuplicateCandidates(Visitor&& visit) const {
         const std::int32_t page_start = page.boundary_tokens - prefix_granularity_;
         bool held = true;
         ForEachBoundaryKey(
-            CacheKey{.content_hash = *page.hash}, /*tail_tokens=*/0, [&](std::size_t i, const CacheKey& key) {
+            CacheKey{.content_hash = page.hash}, /*tail_tokens=*/0, [&](std::size_t i, const CacheKey& key) {
                 const std::int32_t sink_blocks = groups_[i].Allocator().KeptHeadBlocks();
                 if (sink_blocks == 0) {
                     return;
@@ -215,7 +215,7 @@ void CacheCoordinator::visitHostKvDuplicateCandidates(Visitor&& visit) const {
             std::optional<std::uint64_t> epoch;
             for (const auto& entry : next) {
                 if (entry) {
-                    epoch = std::max(epoch.value_or(0), entry->source.metadata.last_access_epoch);
+                    epoch = std::max(epoch.value_or(0), entry->source.metadata.eviction.last_access_epoch);
                 }
             }
             if (!epoch) {
@@ -223,7 +223,7 @@ void CacheCoordinator::visitHostKvDuplicateCandidates(Visitor&& visit) const {
             }
             candidates.clear();
             for (std::size_t i = 0; i < closed_groups.size(); ++i) {
-                while (next[i] && next[i]->source.metadata.last_access_epoch == *epoch) {
+                while (next[i] && next[i]->source.metadata.eviction.last_access_epoch == *epoch) {
                     const PrefixCacheIndex::CommonEntry& device = *next[i];
                     const bool boundary_key =
                         device.key->namespace_id == kDefaultCacheNamespaceId && device.key->page_offset >= 0 &&
@@ -386,7 +386,7 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
                     states.push_back(HostEntry{.group_id = key.group_id,
                                                .location = entry.location,
                                                .in_use = entry.pinned,
-                                               .last_access_epoch = entry.metadata.last_access_epoch,
+                                               .last_access_epoch = entry.metadata.eviction.last_access_epoch,
                                                .demoted = isDemotedEntry(entry.metadata)});
                 }
             });
@@ -396,7 +396,7 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
         if (!entries.all_loaded) {
             entries.all = entries.states;
             ForEachBoundaryKey(
-                CacheKey{.content_hash = *node.hash}, node.tail_tokens, [&](std::size_t i, const CacheKey& key) {
+                CacheKey{.content_hash = node.hash}, node.tail_tokens, [&](std::size_t i, const CacheKey& key) {
                     if (GroupIsState(i)) {
                         return;
                     }
@@ -404,7 +404,7 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
                         entries.all.push_back(HostEntry{.group_id = groups_[i].Id(),
                                                         .location = entry->location,
                                                         .in_use = entry->pinned,
-                                                        .last_access_epoch = entry->metadata.last_access_epoch,
+                                                        .last_access_epoch = entry->metadata.eviction.last_access_epoch,
                                                         .demoted = false});
                     }
                 });
@@ -431,13 +431,13 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
             }
             return newest;
         }
-        ForEachBoundaryKey(CacheKey{.content_hash = *node.hash}, node.tail_tokens,
+        ForEachBoundaryKey(CacheKey{.content_hash = node.hash}, node.tail_tokens,
                            [&](std::size_t i, const CacheKey& key) {
                                if (kv_only && GroupIsState(i)) {
                                    return;
                                }
                                if (const auto entry = groups_[i].Index().Inspect(pool, key)) {
-                                   newest = std::max(newest.value_or(0), entry->metadata.last_access_epoch);
+                                   newest = std::max(newest.value_or(0), entry->metadata.eviction.last_access_epoch);
                                }
                            });
         return newest;
@@ -577,7 +577,7 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
         // dead; they keep their ordinary eviction ranking.
         const bool no_device_checkpoint = node.checkpoint_boundaries_in_subtree[BoundaryTree::kDevice] == 0;
         const bool dead =
-            (node.tail_tokens > 0 && !boundary_tree_.Tails().Contains(*node.hash)) ||
+            (node.tail_tokens > 0 && !boundary_tree_.Tails().Contains(node.hash)) ||
             (no_device_checkpoint && ((num_checkpoint_entries > 0 && num_checkpoint_entries < num_state_groups_) ||
                                       (num_state_groups_ > 0 && num_remaining_host_checkpoint_boundaries(node) == 0)));
         const BoundaryTree::Node* page = node.tail_tokens > 0 ? node.parent : &node;
@@ -590,7 +590,7 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
             candidate.epoch_sort_key = *newest_epoch(*host_pool_, node, /*kv_only=*/false);
             candidate.reason = &HostEvictionStats::dead_entry;
         } else if ((num_state_groups_ == 0 || node.HasCheckpoint(BoundaryTree::kDevice)) &&
-                   DeviceBoundaryResidency(CacheKey{.content_hash = *node.hash}, node.tail_tokens) ==
+                   DeviceBoundaryResidency(CacheKey{.content_hash = node.hash}, node.tail_tokens) ==
                        BoundaryResidency::kComplete) {
             candidate.victim_class = VictimClass::kCoveredByDevice;
             candidate.epoch_sort_key = ~*newest_epoch(pool_, node, /*kv_only=*/false);
@@ -611,7 +611,7 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
                 // traversal does not keep an unused checkpoint young.
                 candidate.epoch_sort_key = state_epoch;
                 if (aging.tree != nullptr && state_epoch >= aging.cutoff_epoch && !unaged.contains(&node)) {
-                    candidate.aged_distance = aging.tree->AgedDistance(*node.hash, CacheTier::kHost);
+                    candidate.aged_distance = aging.tree->AgedDistance(node.hash, CacheTier::kHost);
                     if (candidate.aged_distance != 0) {
                         candidate.epoch_sort_key = aging.cutoff_epoch;
                         candidate.aged_epoch = state_epoch;
@@ -666,7 +666,7 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
         // Descendants taken in this plan can bring an aged checkpoint within
         // the leaf distance, where it ranks by its own use.
         while (!candidates.empty() && candidates.top().aged_distance != 0 &&
-               !aging.tree->StaysAged(*candidates.top().candidate_node->hash, CacheTier::kHost, taken_from_host)) {
+               !aging.tree->StaysAged(candidates.top().candidate_node->hash, CacheTier::kHost, taken_from_host)) {
             const BoundaryTree::Node* node = candidates.top().candidate_node;
             candidates.pop();
             unaged.insert(node);
