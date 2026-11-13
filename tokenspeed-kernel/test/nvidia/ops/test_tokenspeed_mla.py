@@ -264,14 +264,14 @@ def test_kv_pack_reuses_compilation() -> None:
 
 
 def test_fp8_block_decode_batch_sizes_reuse_compiled_kernels() -> None:
-    """Every batch size of one drafter decode shape reuses four compiled kernels."""
+    """Batch sizes with 2 to 8 splits share one compiled decode kernel."""
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
         pytest.skip("tokenspeed_mla decode requires SM100, SM103 or SM107")
     # The in-tree kernel owns this contract; the pinned wheel can precede it.
     repo_root = Path(__file__).resolve().parents[4]
     script = textwrap.dedent("""
+        import tokenspeed_mla.mla_decode as decode
         import torch
-        from tokenspeed_mla import tokenspeed_mla_decode
         from utils import assert_no_cute_compile
 
         # A Kimi-K3.1 block drafter at TP8: 12 heads, a 7-token causal block.
@@ -283,7 +283,7 @@ def test_fp8_block_decode_batch_sizes_reuse_compiled_kernels() -> None:
             query = torch.randn(batch, q_len, heads, 576, device="cuda")
             tables = torch.randint(0, 256, (batch, 514), device="cuda").int()
             lengths = [q_len + (300 * b) % 8000 for b in range(batch)]
-            out = tokenspeed_mla_decode(
+            out = decode.tokenspeed_mla_decode(
                 query=query.to(torch.float8_e4m3fn),
                 kv_cache=kv,
                 workspace_buffer=workspace,
@@ -297,8 +297,38 @@ def test_fp8_block_decode_batch_sizes_reuse_compiled_kernels() -> None:
             )
             assert torch.isfinite(out).all()
 
-        # One batch per reducer capacity (32, 16, and 8 splits), then no reducer.
-        for batch in (1, 8, 16, 64):
+        class Planned(Exception):
+            pass
+
+        def plan(**key):
+            raise Planned(tuple(sorted(key.items())))
+
+        def record_splits(*args):
+            result = plan_splits(*args)
+            splits[args[0]] = result[0]
+            return result
+
+        # Plan each batch's kernel key and split count without compiling.
+        keys, splits = {}, {}
+        compile_kernel, plan_splits = (
+            decode._get_compiled_mla_kernel,
+            decode._get_split_kv_and_workspace_size,
+        )
+        decode._get_compiled_mla_kernel = plan
+        decode._get_split_kv_and_workspace_size = record_splits
+        for batch in range(1, 65):
+            try:
+                run(batch)
+            except Planned as planned:
+                keys[batch] = planned.args[0]
+        decode._get_compiled_mla_kernel = compile_kernel
+        decode._get_split_kv_and_workspace_size = plan_splits
+        assert len(keys) == 64, sorted(keys)
+        shared = {keys[b] for b in keys if 2 <= splits[b] <= 8}
+        assert len(shared) <= 1, sorted(splits.items())
+
+        # One warm launch per planned kernel, then no batch size compiles.
+        for batch in sorted({key: b for b, key in reversed(keys.items())}.values()):
             run(batch)
         with assert_no_cute_compile():
             for batch in range(1, 65):

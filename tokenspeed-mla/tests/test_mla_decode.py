@@ -944,6 +944,9 @@ def _check_reducer_capacity_preserves_outputs(q_len, causal_mask):
     cases = [(batch, 1) for batch in (1, 2, 3, 4, 5, 6, 8, 11, 12, 16, 24, 32, 48, 64)]
     # Explicit minimums select every other reachable split count at batch 64.
     cases += [(64, minimum) for minimum in range(2, 33)]
+    # Two requests per SM leave each one split on every tiler.
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    cases.append((2 * sms, 1))
     for batch, min_split_kv in cases:
         lengths = [max(q_len, pattern[(b * 5) % len(pattern)]) for b in range(batch)]
         pages = [math.ceil(length / page_size) for length in lengths]
