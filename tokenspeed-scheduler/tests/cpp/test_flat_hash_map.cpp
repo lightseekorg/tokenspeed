@@ -1,0 +1,222 @@
+// Copyright (c) 2026 LightSeek Foundation
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <memory_resource>
+#include <random>
+#include <unordered_map>
+#include <vector>
+
+#include <gtest/gtest.h>
+
+#include "cache/coordinator/flat_hash_map.h"
+
+namespace tokenspeed::test {
+namespace {
+
+TEST(FlatHashSet, StridedLocationsStayDistinctAcrossGrowthClearAndReusedMemory) {
+    // Every round's arena starts on the same buffer.
+    std::vector<std::byte> buffer(256 * 1024);
+    for (const std::int32_t stride : {1, 4096, 104729}) {
+        const auto location = [&](std::int32_t i, std::int32_t slot) {
+            return CacheBlockLocation{.lcm_block_id = 1 + i * stride, .slot_index = slot};
+        };
+        for (int round = 0; round < 3; ++round) {
+            std::pmr::monotonic_buffer_resource arena{buffer.data(), buffer.size()};
+            FlatHashSet<CacheBlockLocation> locations{&arena};
+            // The reused buffer still holds the last round's slots.
+            EXPECT_FALSE(locations.contains(location(round, 0)));
+            if (round == 1) {
+                locations.reserve(4096);
+            }
+            for (std::int32_t i = 0; i < 16384; ++i) {
+                if (i % 3 == round) {
+                    continue;
+                }
+                EXPECT_TRUE(locations.insert(location(i, 0)));
+                EXPECT_TRUE(locations.insert(location(i, 3)));
+                EXPECT_FALSE(locations.insert(location(i, 0)));
+            }
+            EXPECT_EQ(locations.size(), 2u * (16384 - (16384 - round + 2) / 3));
+            for (std::int32_t i = 0; i < 16384; ++i) {
+                EXPECT_EQ(locations.contains(location(i, 0)), i % 3 != round);
+                EXPECT_EQ(locations.contains(location(i, 3)), i % 3 != round);
+                EXPECT_FALSE(locations.contains(location(i, 1)));
+            }
+            locations.clear();
+            EXPECT_TRUE(locations.empty());
+            EXPECT_FALSE(locations.contains(location(round == 0 ? 1 : 0, 0)));
+            EXPECT_TRUE(locations.insert(location(round, 1)));
+            EXPECT_TRUE(locations.contains(location(round, 1)));
+            EXPECT_EQ(locations.size(), 1u);
+        }
+    }
+}
+
+TEST(FlatHashMap, MatchesAReferenceMapThroughCollisionsErasesAndWraparound) {
+    std::mt19937 random{20261112};
+    for (const std::int32_t universe : {24, 600}) {
+        std::pmr::monotonic_buffer_resource arena;
+        FlatHashMap<CacheBlockLocation, std::int64_t> values{&arena};
+        std::unordered_map<std::int64_t, std::int64_t> expected;
+        std::uniform_int_distribution<std::int32_t> pick(0, universe - 1);
+        std::uniform_int_distribution<int> operation(0, 9);
+        const auto location = [](std::int32_t key) {
+            return CacheBlockLocation{.lcm_block_id = 1 + (key / 2) * 4096, .slot_index = key % 2};
+        };
+        for (int step = 0; step < 200000; ++step) {
+            const std::int32_t key = pick(random);
+            const int op = operation(random);
+            if (op < 4) {
+                const auto [value, inserted] = values.TryEmplace(location(key), step);
+                const auto [reference, reference_inserted] = expected.try_emplace(key, step);
+                EXPECT_EQ(inserted, reference_inserted);
+                EXPECT_EQ(*value, reference->second);
+            } else if (op < 6) {
+                ++values[location(key)];
+                ++expected[key];
+            } else if (op < 9) {
+                EXPECT_EQ(values.Erase(location(key)), expected.erase(key) == 1);
+            } else if (step % 1000 == 9) {
+                values.clear();
+                expected.clear();
+            }
+            ASSERT_EQ(values.size(), expected.size());
+            if (step % 997 == 0) {
+                for (std::int32_t k = 0; k < universe; ++k) {
+                    const std::int64_t* value = values.Find(location(k));
+                    const auto reference = expected.find(k);
+                    ASSERT_EQ(value != nullptr, reference != expected.end());
+                    if (value != nullptr) {
+                        EXPECT_EQ(*value, reference->second);
+                    }
+                }
+            }
+        }
+    }
+}
+
+TEST(FlatHashMap, PooledNodeAddressesKeepTheirCountsAcrossEraseAndRegrowth) {
+    struct Node {
+        std::array<std::byte, 256> bytes;
+    };
+    const std::vector<Node> nodes(16384);
+    for (const std::size_t stride : {1u, 16u}) {
+        std::pmr::monotonic_buffer_resource arena;
+        FlatHashMap<const Node*, std::int32_t> counts{&arena};
+        for (std::size_t i = 0; i < nodes.size(); i += stride) {
+            for (std::size_t n = 0; n <= i % 3; ++n) {
+                ++counts[&nodes[i]];
+            }
+        }
+        for (std::size_t i = 0; i < nodes.size(); i += 2 * stride) {
+            EXPECT_TRUE(counts.Erase(&nodes[i]));
+            EXPECT_FALSE(counts.Erase(&nodes[i]));
+        }
+        for (std::size_t i = 0; i < nodes.size(); i += stride) {
+            const std::int32_t* count = counts.Find(&nodes[i]);
+            if (i % (2 * stride) == 0) {
+                EXPECT_EQ(count, nullptr);
+                EXPECT_TRUE(counts.TryEmplace(&nodes[i], -1).second);
+            } else {
+                ASSERT_NE(count, nullptr);
+                EXPECT_EQ(*count, static_cast<std::int32_t>(i % 3) + 1);
+            }
+        }
+        for (std::size_t i = 0; i < nodes.size(); i += stride) {
+            EXPECT_EQ(*counts.Find(&nodes[i]), i % (2 * stride) == 0 ? -1 : static_cast<std::int32_t>(i % 3) + 1);
+        }
+        EXPECT_EQ(counts.size(), (nodes.size() + stride - 1) / stride);
+        EXPECT_EQ(counts.contains(&nodes[1]), stride == 1);
+    }
+}
+
+// A planner keeps several tables in one arena, growing in turn, so each
+// table's slot arrays sit between the others' and the ones they outgrew.
+TEST(FlatHashSet, TablesGrowingInTurnInOneArenaKeepTheirOwnKeys) {
+    std::pmr::monotonic_buffer_resource arena;
+    std::vector<FlatHashSet<CacheBlockLocation>> sets;
+    sets.reserve(4);
+    for (std::int32_t s = 0; s < 4; ++s) {
+        sets.emplace_back(&arena);
+    }
+    for (std::int32_t i = 0; i < 50000; ++i) {
+        for (std::int32_t s = 0; s < 4; ++s) {
+            if (s == 0 || i < 1000) {
+                EXPECT_TRUE(sets[s].insert(CacheBlockLocation{.lcm_block_id = 1 + i, .slot_index = s}));
+            }
+        }
+    }
+    for (std::int32_t s = 0; s < 4; ++s) {
+        EXPECT_EQ(sets[s].size(), s == 0 ? 50000u : 1000u);
+        for (std::int32_t i = 0; i < 1000; ++i) {
+            for (std::int32_t other = 0; other < 4; ++other) {
+                EXPECT_EQ(sets[s].contains(CacheBlockLocation{.lcm_block_id = 1 + i, .slot_index = other}), other == s);
+            }
+        }
+    }
+    EXPECT_TRUE(sets[0].contains(CacheBlockLocation{.lcm_block_id = 50000, .slot_index = 0}));
+    EXPECT_FALSE(sets[1].contains(CacheBlockLocation{.lcm_block_id = 1001, .slot_index = 1}));
+}
+
+// Backward-shift erase on a cluster that wraps past the end of the table.
+// The keys are picked by the table's own home slots, so that they start
+// their probes in the last two slots of a fresh table, whatever the hash;
+// what is checked holds for any placement.
+TEST(FlatHashMap, EraseInTheLastSlotShiftsAClusterWrappedToTheFront) {
+    using Map = FlatHashMap<CacheBlockLocation, std::int32_t>;
+    constexpr std::size_t kSlots = Map::kMinimumCapacity;
+    std::vector<CacheBlockLocation> home_second_last;
+    std::vector<CacheBlockLocation> home_last;
+    for (std::int32_t id = 1; home_second_last.size() < 2 || home_last.size() < 2; ++id) {
+        const CacheBlockLocation location{.lcm_block_id = id, .slot_index = 0};
+        const std::size_t home = Map::HomeSlot(location, kSlots);
+        if (home == kSlots - 2 && home_second_last.size() < 2) home_second_last.push_back(location);
+        if (home == kSlots - 1 && home_last.size() < 2) home_last.push_back(location);
+    }
+    std::pmr::monotonic_buffer_resource arena;
+    Map values{&arena};
+    // The last two slots, then the first two past the end of the table.
+    const std::array<CacheBlockLocation, 4> keys{home_second_last[0], home_last[0], home_second_last[1], home_last[1]};
+    for (std::int32_t i = 0; i < 4; ++i) {
+        EXPECT_TRUE(values.TryEmplace(keys[i], i).second);
+    }
+    // The key in the last slot leaves; the two that wrapped move back.
+    EXPECT_TRUE(values.Erase(keys[1]));
+    EXPECT_EQ(values.size(), 3u);
+    EXPECT_EQ(values.Find(keys[1]), nullptr);
+    for (const std::int32_t i : {0, 2, 3}) {
+        const std::int32_t* value = values.Find(keys[i]);
+        ASSERT_NE(value, nullptr) << i;
+        EXPECT_EQ(*value, i);
+        const auto [existing, inserted] = values.TryEmplace(keys[i], -1);
+        EXPECT_FALSE(inserted) << i;
+        EXPECT_EQ(*existing, i);
+    }
+    const auto [value, inserted] = values.TryEmplace(keys[1], 7);
+    EXPECT_TRUE(inserted);
+    EXPECT_EQ(*value, 7);
+    EXPECT_EQ(values.size(), 4u);
+}
+
+}  // namespace
+}  // namespace tokenspeed::test

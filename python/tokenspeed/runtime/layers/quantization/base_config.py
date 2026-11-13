@@ -20,7 +20,7 @@
 
 
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 from torch import nn
@@ -63,6 +63,10 @@ class QuantizeMethodBase(ABC):
 
 class QuantizationConfig(ABC):
     """Base class for quantization configs."""
+
+    # Separate from the model opt-in: complete updates must regenerate all
+    # encoded operands/scales in place after their storage has been discarded.
+    supports_weight_discard: ClassVar[bool] = False
 
     def __init__(
         self,

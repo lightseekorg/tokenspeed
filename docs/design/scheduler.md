@@ -765,6 +765,10 @@ that input reserve is not subtracted again from the remaining output budget.
 the largest prompt whose worst-case working set — dense or sliding history
 with its decode reserve and overlap-depth protection, the blocks a tail
 handover holds for one admission, two slots per State group — fits the pool.
+However large the pool, it stops at `CapacityModel::MaxRequestTokenLimit`,
+the int32 token range less what the scheduler adds past a token limit (the
+decode windows and the rounding to a block or prefix page), which
+`SubmitRequests` enforces on every request.
 It is not a live check against currently free capacity; a prompt within the
 bound can still fail admission right now and waits. What it does promise,
 with the five exceptions at the end of this section, is that such a
