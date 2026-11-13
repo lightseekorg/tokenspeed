@@ -214,6 +214,8 @@ def _drafter(vocab: int = 2048, spec: int = 8, num_added: int = 0) -> DSpark:
     drafter._ensure_dist_argmax_state = lambda dtype, device: None
     drafter._walk_words = None
     drafter._walk_gathered = None
+    drafter._markov_argmax_resolved = False
+    drafter._markov_argmax_workspace = None
     return drafter
 
 
