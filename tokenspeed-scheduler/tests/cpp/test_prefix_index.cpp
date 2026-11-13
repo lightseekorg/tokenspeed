@@ -210,6 +210,32 @@ TEST(PrefixCacheIndexInspectionTest, AnEvictionHandleRefusesAnEntryItCanNoLonger
     EXPECT_EQ(fresh.NumEntries(spare), 0);
 }
 
+// Relocate changes the tier as joining or leaving does: a handle found
+// before it, whether for the moved entry or another one, no longer vouches
+// for its entry, even once the moved entry is unpinned again.
+TEST(PrefixCacheIndexInspectionTest, AnEvictionHandleRefusesAnEntryAfterARelocation) {
+    BlockPool pool(4, {1});
+    PrefixCacheIndex index(kGroupId);
+    const auto moved = Cache(index, pool, "moved", 1);
+    const auto other = Cache(index, pool, "other", 2);
+    PrefixCacheIndex::EvictableEntry moved_handle = index.FindEvictable(pool, moved);
+    PrefixCacheIndex::EvictableEntry other_handle = index.FindEvictable(pool, other);
+    ASSERT_TRUE(moved_handle);
+    ASSERT_TRUE(other_handle);
+    CacheBlockRef copy = pool.AcquireBlock(kGroupId);
+    const CacheBlockLocation to = copy->Location();
+    index.Relocate(pool, moved, copy);
+    copy.reset();
+    ASSERT_TRUE(index.FindEvictable(pool, to)) << "the moved entry is the index's alone again";
+
+    EXPECT_THROW(moved_handle.key(), std::runtime_error);
+    ExpectEvictAborts(index, moved_handle, "an eviction handle outlived a change to its tier");
+    EXPECT_THROW(other_handle.metadata(), std::runtime_error);
+    ExpectEvictAborts(index, other_handle, "an eviction handle outlived a change to its tier");
+    EXPECT_EQ(index.KeyOf(pool, to), KeyOf("moved"));
+    EXPECT_EQ(index.KeyOf(pool, other), KeyOf("other"));
+}
+
 // The handle shows the boundary-tree node the entry holds, still counting
 // the entry: here two groups' entries under one hash, then the last of them,
 // which takes the node along. An index never bound to a tree shows none.

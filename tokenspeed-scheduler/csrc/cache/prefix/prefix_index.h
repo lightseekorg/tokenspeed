@@ -270,8 +270,9 @@ public:
     // block's only owner (FindEvictable). It borrows the entry, so it is
     // neither copied nor moved, and lasts only until this tier's entries or
     // the block's owners change: read what the eviction needs, then hand it
-    // to Evict. Its reads and Evict check that no entry joined or left the
-    // tier since FindEvictable, and Evict that the block is still unshared.
+    // to Evict. Its reads and Evict check that no entry joined, left or
+    // moved (Relocate) in the tier since FindEvictable, and Evict that the
+    // block is still unshared.
     // A failed read throws; a failed Evict aborts, since its caller may have
     // recorded the eviction already. An empty handle -- no entry there, a
     // pinned one, or one already evicted -- is false.
@@ -828,6 +829,9 @@ public:
         _assert(entry_it != cache_index->entries.end(), "a moved block is indexed at its location");
         _assert(findEntry(*cache_index, to->Location()) == cache_index->entries.end(),
                 "an entry moves onto an unindexed location");
+        // Counted before the move, so that a throw below cannot leave an
+        // eviction handle vouching for a moved entry.
+        ++cache_index->membership;
         // The pin watch, if any, follows the block (restored below).
         cache_index->by_location.Set(to->Location(), entry_it);
         entry_it->unique_observer.Reset();
@@ -1001,8 +1005,8 @@ private:
         // entry of this tier stands for there.
         BoundaryTree* boundary_tree{nullptr};
         BoundaryTree::EntryKind boundary_kind{};
-        // Counts the entries that joined or left, so an EvictableEntry can
-        // tell that the entry it borrows may be gone.
+        // Counts the entries that joined, left or moved, so an EvictableEntry
+        // can tell that the entry it borrows may be gone or elsewhere.
         std::uint64_t membership{0};
     };
 
