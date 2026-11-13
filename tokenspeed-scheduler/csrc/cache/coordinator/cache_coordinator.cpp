@@ -3362,15 +3362,22 @@ CacheCoordinator::StorageReservation CacheCoordinator::ReserveStoragePrefix(cons
     const std::vector<std::vector<CacheKey>> group_keys = buildGroupKeys(prompt.prefix_hashes);
     const PrefixProbe::Tier device_only = probeTier(prompt, group_keys, match_order_, /*claim_partial=*/true);
     auto candidate = prompt;
+    StorageReservation result;
+    std::vector<CacheBlockRef> warm_blocks;
+    std::vector<std::uint32_t> groups;
+    std::vector<std::int32_t> buckets;
     while (candidate.max_tokens > device_only.num_common_tokens) {
+        // Release rejected candidates' warm pins before the next probe.
+        warm_blocks.clear();
+        groups.clear();
+        buckets.clear();
+        result.keys.clear();
+        result.tail.reset();
+        result.tail_prior = ContentHash{};
         PrefixProbe::Tier device = device_only;
         PrefixProbe::Tier probe;
         probeHostSuffix(candidate, group_keys, match_order_, device_only.num_common_tokens, &remote, device, probe);
         if (probe.num_common_tokens <= device_only.num_common_tokens) return {};
-        StorageReservation result;
-        std::vector<CacheBlockRef> warm_blocks;
-        std::vector<std::uint32_t> groups;
-        std::vector<std::int32_t> buckets;
         const auto pin = [&](const CacheKey& key, std::int32_t logical_block) {
             auto ref = AcquireHostCachedBlock(key);
             if (ref) {
