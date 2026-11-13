@@ -1114,7 +1114,7 @@ def lane_slots(union, lane):
     gl.barrier()
     rl: gl.constexpr = gl.BlockedLayout([1, 1], [4, 16], [nw, 1], [1, 0])
     # A slot without an owner (past the lane's last slot) gathers pick 0's
-    # row; `has` masks it to -1 below.
+    # row; ``has`` masks it to -1 below.
     at = gl.convert_layout(gl.maximum(owner_pick, 0), gl.SliceLayout(1, rl))[:, None]
     at = at + gl.zeros([M_DUP, RP], gl.int32, rl)
     got = table_smem.gather(at, 0)  # [16, RP]: row k is slot lane + 8 k's

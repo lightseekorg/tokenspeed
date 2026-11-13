@@ -50,6 +50,7 @@ from tokenspeed_kernel.ops.communication._iris import (  # noqa: E402
 )
 from tokenspeed_kernel_amd.ops.gfx950.monokernel import stuck  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import (  # noqa: E402
+    draft_context,
     layer,
     moe_tail,
 )
@@ -627,8 +628,6 @@ def _tap_context_worker(rank: int, port: int) -> None:
     reads them; the same write on the taps the regular capture would hand it
     (each launch's whole h'' rows, rounded once to BF16) gives the same draft
     cache bytes."""
-    from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import draft_context
-
     torch.cuda.set_device(rank)
     dist.init_process_group(
         "gloo",
