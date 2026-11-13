@@ -128,6 +128,28 @@ each revision with its matching headers/core, run the driver with `--module-dir`
 and `--output`, and compare the parsed JSON. This complements the C++ and
 Python behavioral suites; it does not expose or depend on hash-slot order.
 
+## Decode rounds with long contexts
+
+`tokenspeed_scheduler_decode_rounds_benchmark` measures the steady state of a
+decode server: a batch of long-context requests that all decode in every
+round, each accepting `DECODE_TOKENS` tokens per round (the verify width) so
+that the block tables keep growing. Build it like the full-cache benchmark
+(target `tokenspeed_scheduler_decode_rounds_benchmark`); its arguments are
+
+```text
+PAGE_SIZE CONTEXT_TOKENS REQUESTS DECODE_TOKENS WARMUP_ROUNDS ROUNDS
+```
+
+Request `i`'s prompt is `CONTEXT_TOKENS + i % PAGE_SIZE` tokens, so requests
+cross page boundaries in different rounds. Admission reserves part of each
+request's generation budget up front, and a table grows only once decode has
+used that reserve: setup prefills every prompt in one plan and decodes,
+unmeasured, until the tables start to grow. The output reports thread-CPU and
+wall time of each round's `NextExecutionPlan` (`plan`) and of applying its
+results (`advance`). The cost of a round's admission should not depend on the
+context length; building the forward batch copies every request's page table
+and does.
+
 # Sanitizer builds
 
 `TOKENSPEED_SCHEDULER_SANITIZE` lists sanitizers to build the core library
