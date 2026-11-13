@@ -89,7 +89,7 @@ def pytest_collection_modifyitems(
 
 @pytest.hookimpl(optionalhook=True)
 def pytest_testnodedown(node, error) -> None:
-    """Merge each pytest-xdist worker's emptied-selection flag on the controller.
+    """Merge each xdist worker's emptied-selection flag on the controller.
 
     The run counts as emptied by the selection when every worker's was
     (``pytest_sessionfinish``). A worker that crashed (``error``) may have
