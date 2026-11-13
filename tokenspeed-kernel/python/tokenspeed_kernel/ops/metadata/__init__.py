@@ -21,6 +21,7 @@
 """Generic CUDA-graph replay metadata prep (the "prep tape")."""
 
 from tokenspeed_kernel.ops.metadata.accepted_frontier import advance_accepted_frontier
+from tokenspeed_kernel.ops.metadata.accepted_rows import gather_last_accepted_rows
 from tokenspeed_kernel.ops.metadata.block_table_rows import (
     BLOCK_TABLE_ROW_FIELDS,
     expand_block_table_rows,
@@ -35,4 +36,5 @@ __all__ = [
     "advance_accepted_frontier",
     "apply_stop_conditions",
     "expand_block_table_rows",
+    "gather_last_accepted_rows",
 ]

@@ -25,7 +25,7 @@
 Dummy batches balance tokens across the selected nonempty request count.
 The embedding lookup stays OUTSIDE
 the captured region: graphs start from a static input-embeds buffer, filled at
-replay by an eager ``embed_tokens`` gather (text) or by precomputed merged
+replay by the model's decoder-input lookup (text) or by precomputed merged
 embeddings (multimodal, via the model's ``multimodal_input_embeds`` seam).
 Capture borrows the decode
 :class:`~tokenspeed.runtime.execution.forward_step.ForwardStepRunner`'s
@@ -311,7 +311,7 @@ def input_embedding(
     model, *, requires_request_token_history: bool
 ) -> Callable[..., torch.Tensor] | None:
     """Resolve the inner model's eager embedding, or None when unsupported."""
-    _, inner = text_and_inner_model(model)
+    text_model, inner = text_and_inner_model(model)
     embed_tokens = getattr(inner, "embed_tokens", None)
     if embed_tokens is None:
         return None
@@ -319,6 +319,10 @@ def input_embedding(
         return inner.compute_input_embeddings
     if requires_request_token_history:
         return None
+    # A model whose decoder input transforms the lookup supplies its own.
+    get_input_embedding = getattr(text_model, "get_decoder_input_embedding", None)
+    if get_input_embedding is not None:
+        embed_tokens = get_input_embedding()
 
     def compute_input_embeddings(input_ids, ctx, *, request_token_history):
         return embed_tokens(input_ids)
@@ -1385,7 +1389,7 @@ class PrefillGraph:
         """Replay the captured graph for ``ctx`` (caller checked :meth:`can_run`).
 
         The embedding runs eagerly here, outside the graph: a plain text
-        prefill gathers ``embed_tokens(input_ids)`` into the static buffer; a
+        prefill calls the decoder-input lookup into the static buffer; a
         multimodal prefill builds the merged text+vision embeddings via the
         model's ``multimodal_input_embeds`` seam (vision encoder included)
         instead. An inner model with ``compute_input_embeddings`` computes its

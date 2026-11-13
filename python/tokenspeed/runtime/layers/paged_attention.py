@@ -42,6 +42,7 @@ from tokenspeed_kernel.ops.attention.prologue import (
     LatentKVCache,
     MLAExpandedKV,
     MLAPrologueOutput,
+    RelativeHeadNorm,
     Rotary,
     gqa_prologue,
     latent_store,
@@ -122,7 +123,11 @@ def head_norm(q_norm: HeadRMSNorm, k_norm: HeadRMSNorm) -> HeadNorm:
     ):
         raise ValueError("query and key norms must share epsilon and weight offset")
     return HeadNorm(
-        q_norm.weight, k_norm.weight, q_norm.weight_offset, q_norm.variance_epsilon
+        q_norm.weight,
+        k_norm.weight,
+        q_norm.weight_offset,
+        q_norm.variance_epsilon,
+        round_before_rope=False,
     )
 
 
@@ -144,7 +149,7 @@ class PagedAttention(nn.Module):
         sliding_window_sink: int = 0,
         *,
         rotary_emb: HeadRotary | None,
-        qk_norm: tuple[HeadRMSNorm, HeadRMSNorm] | None,
+        qk_norm: tuple[HeadRMSNorm, HeadRMSNorm] | HeadNorm | None,
     ):
         """``rotary_emb`` and ``qk_norm`` are the steps the attention prologue
         applies before core attention; ``None`` skips a step."""
@@ -328,6 +333,36 @@ class PagedAttention(nn.Module):
             override=None,
         )
 
+    def relative_prologue(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        ctx: ForwardContext,
+        norm: RelativeHeadNorm,
+    ) -> GQAPrologueOutput:
+        """Run relative attention's head steps as this layer's prologue.
+
+        The query and key heads are clipped, the value heads normalized and
+        the relative heads projected to the logits ``attend`` takes as
+        ``rel_logits``, with the K/V write, in one prologue call. The layer
+        states no other head step.
+        """
+        if self.qk_norm is not None or self.rotary_emb is not None:
+            raise ValueError("relative head steps replace the layer's norm and RoPE")
+        return gqa_prologue(
+            q,
+            k,
+            v,
+            norm=norm,
+            rotary=None,
+            cache=self._write_target(q, ctx),
+            query_dtype=ctx.attn_backend.query_dtype(self, ctx.forward_mode, q.dtype),
+            return_kv=not ctx.forward_mode.is_decode(),
+            solution=None,
+            override=None,
+        )
+
     def store_prepared(
         self,
         q: torch.Tensor,
@@ -357,8 +392,11 @@ class PagedAttention(nn.Module):
     def _steps(
         self, positions: torch.Tensor | None
     ) -> tuple[HeadNorm | None, Rotary | None]:
+        norm = self.qk_norm
+        if norm is not None and not isinstance(norm, HeadNorm):
+            norm = head_norm(*norm)
         return (
-            None if self.qk_norm is None else head_norm(*self.qk_norm),
+            norm,
             None if self.rotary_emb is None else self.rotary_emb.as_rotary(positions),
         )
 
