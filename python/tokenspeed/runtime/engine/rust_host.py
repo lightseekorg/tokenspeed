@@ -294,27 +294,33 @@ def start_rust_host(
     preexec_fn = None
     if parent_death_signal:
         preexec_fn = functools.partial(set_parent_death_signal, os.getpid())
-    # Set each native writer's fallback before the host initializes logging.
-    level = server_args.log_level.lower()
-    host_env = os.environ.copy()
-    host_env.setdefault(
-        "TS_HOST_LOG",
-        {
-            "warning": "warn",
-            "critical": "error",
-            "fatal": "error",
-            "notset": "trace",
-        }.get(level, level),
-    )
-    host_env.setdefault(
-        "SPDLOG_LEVEL",
-        {
-            "warn": "warning",
-            "fatal": "critical",
-            "notset": "trace",
-        }.get(level, level),
-    )
+    inherited_preload = os.environ.get("LD_PRELOAD", "")
     with start_context:
+        # Capture the memory saver's preload and library paths while active.
+        host_env = os.environ.copy()
+        if any("torch_memory_saver" in path for path in inherited_preload.split(":")):
+            # Keep an explicit allocator hook and its order. Older contexts
+            # replace it; newer ones prepend a second hook the allocator rejects.
+            host_env["LD_PRELOAD"] = inherited_preload
+        # Set each native writer's fallback before the host initializes logging.
+        level = server_args.log_level.lower()
+        host_env.setdefault(
+            "TS_HOST_LOG",
+            {
+                "warning": "warn",
+                "critical": "error",
+                "fatal": "error",
+                "notset": "trace",
+            }.get(level, level),
+        )
+        host_env.setdefault(
+            "SPDLOG_LEVEL",
+            {
+                "warn": "warning",
+                "fatal": "critical",
+                "notset": "trace",
+            }.get(level, level),
+        )
         popen = subprocess.Popen(
             [
                 (

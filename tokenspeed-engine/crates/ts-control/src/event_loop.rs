@@ -568,8 +568,8 @@ pub struct EventLoop<D: DataPlane, F: Frontend> {
     controls: Controls,
     /// Memory calls wait in arrival order so replies of each type stay FIFO.
     memory_calls: VecDeque<MemoryCall>,
-    /// Queue length when a scheduler resume cancelled earlier memory calls.
-    cancel_memory: Option<usize>,
+    /// A scheduler resume cancels memory calls at the next common gate.
+    cancel_memory: bool,
     /// Admissions withheld from the scheduler while paused, in arrival order.
     withheld: Vec<Submission>,
     /// EPD: admissions waiting for their images' embeddings, in staging
@@ -661,7 +661,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             in_flight: VecDeque::new(),
             cache_ops: CacheOps::new(),
             memory_calls: VecDeque::new(),
-            cancel_memory: None,
+            cancel_memory: false,
             withheld: Vec::new(),
             staged: Vec::new(),
             dp_idle: true,
@@ -1647,8 +1647,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         let mut release_pending = matches!(self.controls.drain(), Some(Drain::Release(_)));
         let coordinated = self.config.controls.replica_memory_transitions;
         let mut memory_ready = !self.memory_calls.is_empty();
-        let cancel_through = self.cancel_memory.take();
-        let mut cancel_memory = cancel_through.is_some();
+        let mut cancel_memory = std::mem::take(&mut self.cancel_memory);
         let mut memory_timed_out = self
             .memory_calls
             .front()
@@ -1762,8 +1761,10 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             if cancel_memory {
                 let reason = "memory operation cancelled before device execution";
                 self.controls.cancel_memory_release(reason);
-                let count = cancel_through.unwrap_or(self.memory_calls.len());
-                self.refuse_queued_memory(count, reason);
+                // Cancel the entire observed batch everywhere: local pre/post
+                // continue boundaries can differ across independent ingresses.
+                // Collect the continue and outstanding memory replies before retrying.
+                self.refuse_queued_memory(self.memory_calls.len(), reason);
             } else if !release_pending {
                 if memory_ready {
                     release_pending = self.prepare_memory_call()?;
@@ -2325,7 +2326,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 return Ok(());
             }
             if matches!(request, ControlRequest::ResumeScheduler(_)) {
-                self.cancel_memory = Some(self.memory_calls.len());
+                self.cancel_memory = true;
             }
         }
         let refusal = self.release_refusal();

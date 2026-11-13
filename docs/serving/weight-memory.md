@@ -50,6 +50,10 @@ before the model is built, so it also stays resident across discard.
 
 ## Allocator runtime requirements
 
+The launcher captures its child environment inside the allocator's launch
+context. An explicitly supplied memory-saver preload keeps its path and order;
+otherwise the context selects the hook and library paths for the child.
+
 The allocator must recognize managed pointers when they are freed outside their
 allocation region, and must separate pools by both tag and CPU-backup policy.
 Some `0.0.9.post1` binaries lack the former fix. Validate clean process shutdown
@@ -100,7 +104,9 @@ engines and the existing coordinated attention-DP group for engines that
 share a forward, including EP across replicas. Calls may reach engines in
 different rounds. A head call with missing participants waits up to 30
 seconds while no earlier release is draining. `continue_generation` cancels
-pending memory operations before device work starts. An engine whose memory
+pending memory operations before device work starts, including calls observed
+in the same gate after continue arrived locally. This domain-wide cancellation
+avoids different queue cutoffs at independent ingresses. An engine whose memory
 is already released remains asleep after cancellation.
 
 Issue memory operations in order and wait for the domain's replies. For

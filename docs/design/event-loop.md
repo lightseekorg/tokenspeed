@@ -739,6 +739,12 @@ no collective. Protocol 3 reduces readiness directly over its memory domain.
 Protocol 2 reduces over the replica and then attention DP. Release runs on
 the forward thread after the applicable readiness checks pass.
 
+Protocol 3 cancellation uses that same head gate. A continue on any ingress
+refuses the whole observed memory-call batch throughout the domain; local
+before/after-continue cutoffs cannot agree across independent ingress queues.
+Replies are emitted after the gate. Collect the continue and outstanding memory
+replies before issuing a new memory call. Protocol 2 keeps its existing path.
+
 The head gate also agrees whether any DP rank still has released regions.
 Until all regions are restored on every rank, it withholds forward permission
 through the scheduler's storage tick and suppresses idle forwards. This covers
