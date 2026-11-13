@@ -65,7 +65,31 @@ def emit(**fields):
 
 
 if __name__ == "__main__":
+    from tokenspeed.runtime.engine.rust_host import HostProcess
     from tokenspeed.runtime.entrypoints import engine
+
+    if os.environ.get("REPEAT_FAILURE_DURING_TERMINATE"):
+        import pathlib
+        import signal
+        import threading
+
+        terminate = HostProcess.terminate
+        terminate_lock = threading.Lock()
+        injected = False
+
+        def terminate_with_failure_signal(proc):
+            global injected
+            assert terminate_lock.acquire(blocking=False), "reentrant termination"
+            try:
+                if not injected:
+                    injected = True
+                    pathlib.Path(os.environ["MARKER_DIR"], "injected").touch()
+                    os.kill(os.getpid(), signal.SIGUSR1)
+                terminate(proc)
+            finally:
+                terminate_lock.release()
+
+        HostProcess.terminate = terminate_with_failure_signal
 
     engine.configure_logger = engine._set_envs_and_config = lambda args: None
     engine.prepare_model_and_tokenizer = lambda *names: names
@@ -107,6 +131,7 @@ if __name__ == "__main__":
         zmq_handshake_endpoint=functools.partial(str, "tcp://127.0.0.1:25001"),
     )
     args.enable_memory_saver = args.enable_metrics = False
+    args.device = "cpu"
     args.enable_async_logging = False
     args.emulate_rank_zero = False
     engine.launch_scheduler_headless(args)
@@ -191,7 +216,7 @@ def left_running(procs, timeout):
     return [p for p in alive if p.status() != psutil.STATUS_ZOMBIE]
 
 
-@pytest.mark.parametrize("name", ["SIGTERM", "SIGINT", "SIGUSR1"])
+@pytest.mark.parametrize("name", ["SIGTERM", "SIGINT", "SIGUSR1", "SIGQUIT"])
 def test_signal_stops_schedulers_then_node(tmp_path, name):
     signum = signal.Signals[name]
     with node_rank_1(tmp_path, "cooperative") as started:
@@ -199,12 +224,27 @@ def test_signal_stops_schedulers_then_node(tmp_path, name):
         assert report == {"waiting": True}
         # SIGUSR1 is what a failing scheduler sends its node: it fails.
         node.send_signal(signum)
-        assert node.wait(timeout=60) == (1 if signum == signal.SIGUSR1 else 0)
+        assert node.wait(timeout=60) == (1 if name in {"SIGUSR1", "SIGQUIT"} else 0)
         assert left_running(tree, timeout=10) == []
         # Schedulers were asked to stop (SIGTERM) before anything was killed.
         assert sorted(p.name for p in tmp_path.iterdir() if p.name.isdigit()) == (
             sorted(str(s["scheduler"]) for s in schedulers)
         )
+
+
+def test_repeated_rank_failure_does_not_reenter_termination(tmp_path):
+    with node_rank_1(tmp_path, "cooperative", REPEAT_FAILURE_DURING_TERMINATE="1") as (
+        node,
+        schedulers,
+        report,
+        tree,
+    ):
+        assert report == {"waiting": True}
+        node.send_signal(signal.SIGUSR1)
+        assert node.wait(timeout=60) == 1
+        assert (tmp_path / "injected").is_file()
+        assert left_running(tree, timeout=10) == []
+        assert all((tmp_path / str(s["scheduler"])).is_file() for s in schedulers)
 
 
 def test_stuck_scheduler_is_killed_after_the_grace_period(tmp_path):

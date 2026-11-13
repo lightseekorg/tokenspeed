@@ -164,7 +164,10 @@ def start_process_with_ready_pipe(
 
 
 def receive_ready_messages(
-    readers: Sequence[Connection], procs: Sequence[mp.Process]
+    readers: Sequence[Connection],
+    procs: Sequence[mp.Process],
+    *,
+    check_cancelled: Callable[[], None] | None = None,
 ) -> list[Any]:
     """Receive one message per reader, failing when any child exits or closes its pipe.
 
@@ -179,6 +182,7 @@ def receive_ready_messages(
     Args:
         readers: The read ends from ``start_process_with_ready_pipe``.
         procs: The processes, in the same order.
+        check_cancelled: Optional callback that raises if startup was cancelled.
 
     Returns:
         The messages, in the order of ``readers``.
@@ -193,7 +197,12 @@ def receive_ready_messages(
     pending = set(readers)
     sentinels = {proc.sentinel: index for index, proc in enumerate(procs)}
     while pending:
-        ready = connection.wait([*reader_indices, *sentinels])
+        if check_cancelled is not None:
+            check_cancelled()
+        ready = connection.wait(
+            [*reader_indices, *sentinels],
+            timeout=0.25 if check_cancelled is not None else None,
+        )
         for reader in [obj for obj in ready if obj in reader_indices]:
             index = reader_indices[reader]
             try:
