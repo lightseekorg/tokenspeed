@@ -92,9 +92,15 @@ def combine_quant_fp8(
         solution: Kernel solution, or None for registry selection.
         out: Optional disjoint destinations: contiguous E4M3 [tokens, hidden]
             and FP32 scales [tokens, hidden/128] with physical stride (1, tokens).
+            For G group-major input groups, destinations may instead have shapes
+            [tokens/G, G*hidden] and [tokens/G, G*hidden/128], with scale stride
+            (1, tokens/G). This writes each group's columns directly into the
+            token-major projection layout. G must divide tokens and stay fixed
+            for the model; omitting out retains the ungrouped layout.
 
     Returns:
-        Quantized values and scales for 128-channel blocks.
+        Quantized values and scales for 128-channel blocks, in the layout
+        selected by the explicit destinations, or [tokens, hidden] when omitted.
         Finite inputs, model-static top-k in 1..32, at most 4096 tokens, and
         stream dependencies are required. This operation performs no projection
         or communication.
@@ -129,15 +135,6 @@ def combine_quant_fp8(
         raise ValueError("Expected BF16 partial, int32 map, FP32 weights, int64 count")
     if not partial.is_contiguous() or not weights.is_contiguous():
         raise ValueError("Expert outputs and route weights must be contiguous")
-    if not partial.is_cuda or any(t.device != partial.device for t in inputs):
-        raise ValueError("Combine operands must share one CUDA device")
-    if (
-        partial.data_ptr() % 16
-        or inverse.data_ptr() % 4
-        or weights.data_ptr() % 4
-        or valid_rows.data_ptr() % 8
-    ):
-        raise ValueError("Combine operands have incompatible pointer alignment")
     if out is None:
         out = (
             torch.empty(
@@ -152,17 +149,34 @@ def combine_quant_fp8(
         )
     q, scales = out
     if (
-        q.shape != (tokens, hidden)
-        or q.dtype != torch.float8_e4m3fn
+        q.ndim != 2
+        or q.shape[0] <= 0
+        or q.shape[1] < hidden
+        or q.shape[1] % hidden
+        or q.numel() != tokens * hidden
+    ):
+        raise ValueError("Invalid block-FP8 quantization destination shape")
+    output_tokens, output_hidden = q.shape
+    if (
+        q.dtype != torch.float8_e4m3fn
         or not q.is_contiguous()
-        or scales.shape != (tokens, quant_blocks)
+        or scales.shape != (output_tokens, output_hidden // 128)
         or scales.dtype != torch.float32
-        or scales.stride() != (1, tokens)
+        or scales.stride() != (1, output_tokens)
         or any(t.device != partial.device for t in out)
-        or q.data_ptr() % 16
-        or scales.data_ptr() % 4
     ):
         raise ValueError("Invalid block-FP8 quantization destinations")
+    if not partial.is_cuda or any(t.device != partial.device for t in inputs):
+        raise ValueError("Combine operands must share one CUDA device")
+    if (
+        partial.data_ptr() % 16
+        or inverse.data_ptr() % 4
+        or weights.data_ptr() % 4
+        or valid_rows.data_ptr() % 8
+    ):
+        raise ValueError("Combine operands have incompatible pointer alignment")
+    if q.data_ptr() % 16 or scales.data_ptr() % 4:
+        raise ValueError("Invalid block-FP8 quantization destination alignment")
     # Reject whole-storage overlap, including disjoint views of a shared allocation.
     output_ranges = [
         (t.untyped_storage().data_ptr(), t.untyped_storage().nbytes()) for t in out

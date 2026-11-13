@@ -41,11 +41,12 @@ _compile_lock = threading.Lock()
 
 
 class CombineQuantKernel:
-    def __init__(self, topk: int, column_map: bool, hidden: int):
+    def __init__(self, topk: int, column_map: bool, hidden: int, groups: int):
         self.topk = topk
         self.column_map = column_map
         self.hidden = hidden
         self.quant_blocks = hidden // 128
+        self.groups = groups
 
     @cute.jit
     def __call__(
@@ -144,8 +145,16 @@ class CombineQuantKernel:
                 scale = cute.math.div(
                     Float32(1), multiplier, rounding=cute.math.RoundingMode.NEAREST_EVEN
                 )
+                output_token = token
+                output_block = kb_lane
+                output_tokens = tokens
+                if cutlass.const_expr(self.groups != 1):
+                    output_tokens = tokens // self.groups
+                    group = token // output_tokens
+                    output_token = token % output_tokens
+                    output_block = group * self.quant_blocks + kb_lane
                 if lane == 0:
-                    sq[token + kb_lane * tokens] = scale
+                    sq[Int64(output_block) * output_tokens + output_token] = scale
                 for i in cutlass.range_constexpr(4):
                     col = kb_lane * 128 + lane * 4 + i
                     value = values[i] * multiplier
@@ -155,7 +164,10 @@ class CombineQuantKernel:
                         value = Float32(-448)
                     values[i] = value
                 store_global_f32x4_as_fp8_e4m3(
-                    qbuf.iterator + token * self.hidden + kb_lane * 128 + lane * 4,
+                    qbuf.iterator
+                    + Int64(output_token) * (self.groups * self.hidden)
+                    + output_block * 128
+                    + lane * 4,
                     values[0],
                     values[1],
                     values[2],
@@ -167,8 +179,9 @@ def run_combine_quant(partial, inverse, weights, valid_rows, output):
     q, scales = output
     tokens, topk = weights.shape
     hidden = partial.shape[1]
+    groups = q.shape[1] // hidden
     column_map = inverse.stride(0) == 1 and inverse.stride(1) == tokens
-    key = (partial.device.index, topk, column_map, hidden)
+    key = (partial.device.index, topk, column_map, hidden, groups)
     with torch.cuda.device(partial.device):
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         with _compile_lock:
@@ -180,7 +193,7 @@ def run_combine_quant(partial, inverse, weights, valid_rows, output):
                     )
                 fake = cute.runtime.make_fake_tensor
                 compiled = cute.compile(
-                    CombineQuantKernel(topk, column_map, hidden),
+                    CombineQuantKernel(topk, column_map, hidden, groups),
                     fake(BFloat16, (cute.sym_int(),), (1,), assumed_align=16),
                     fake(Int32, (cute.sym_int(),), (1,), assumed_align=4),
                     fake(Float32, (cute.sym_int(),), (1,), assumed_align=4),

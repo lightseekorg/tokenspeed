@@ -145,6 +145,14 @@ validation or performance coverage for an untested model. Token counts and depen
 runtime parameters, not new compilation variants. Warm both map layouts that
 will be used before graph capture.
 
+An explicit `out` may group G input row groups into projection columns:
+`[G*T, H]` routes write FP8 `[T, G*H]` and FP32 scales `[T, G*H/128]`
+with stride `(1, T)`. The same combine kernel writes the final addresses;
+there is no intermediate transpose, copy or requantization. G comes from the
+destination width, is model-static and adds one startup specialization per
+used grouping. Omitting `out`, or passing the original shapes, preserves the
+ordinary output contract. T remains a runtime value.
+
 The CuTe implementation explicitly selects round-to-nearest-even division for
 output quantization with `cute.math.div`. Input quantization retains its native
 approximate arithmetic contract.

@@ -458,3 +458,103 @@ def test_prepared_input_and_deferred_output_share_maps(
             prepared_input=prepared,
             out=(routes.partial, bad_map, prepared.offsets),
         )
+
+
+@pytest.mark.parametrize("groups", (1, 2, 8))
+@pytest.mark.parametrize("tokens", (1, 3, 17, 257))
+@pytest.mark.parametrize("column_map", (False, True))
+@torch.inference_mode()
+def test_grouped_projection_destinations_and_graph_refresh(groups, tokens, column_map):
+    require_hopper()
+    rows, hidden, topk = groups * tokens, 512, 12
+    generator = torch.Generator(device="cuda").manual_seed(2760)
+    partial = torch.randn(
+        (rows * topk, hidden), device="cuda", dtype=torch.bfloat16, generator=generator
+    )
+    inverse = (
+        torch.randperm(rows * topk, device="cuda", generator=generator)
+        .to(torch.int32)
+        .reshape(rows, topk)
+    )
+    if column_map:
+        inverse = inverse.T.contiguous().T
+    weights = torch.rand((rows, topk), device="cuda", generator=generator)
+    valid_rows = torch.tensor([rows * topk], device="cuda", dtype=torch.int64)
+    output = (
+        torch.empty(
+            (tokens, groups * hidden), device="cuda", dtype=torch.float8_e4m3fn
+        ),
+        torch.empty_strided(
+            (tokens, groups * hidden // 128), (1, tokens), device="cuda"
+        ),
+    )
+    actual = combine_quant_fp8(
+        partial, inverse, weights, valid_rows, solution="cute_dsl", out=output
+    )
+    assert actual[0] is output[0] and actual[1] is output[1]
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            combine_quant_fp8(
+                partial, inverse, weights, valid_rows, solution="cute_dsl", out=output
+            )
+        for limit in (rows * topk, rows * topk // 2, 0, rows * topk):
+            partial.normal_(generator=generator)
+            weights.uniform_(generator=generator)
+            valid_rows.fill_(limit)
+            if limit < rows * topk:
+                partial[limit:].fill_(float("nan"))
+            inverse[0, 0] = -1
+            output[0].view(torch.uint8).fill_(255)
+            output[1].fill_(float("nan"))
+            graph.replay()
+            expected = reference_quantize(
+                reference_combine(partial, inverse, weights, valid_rows)
+            )
+            old = combine_quant_fp8(
+                partial, inverse, weights, valid_rows, solution="cute_dsl"
+            )
+            for index, width in ((0, hidden), (1, hidden // 128)):
+                # Independent semantic indexing: group g's row t becomes
+                # columns [g*width:(g+1)*width] of projection row t.
+                for group in range(groups):
+                    columns = output[index][:, group * width : (group + 1) * width]
+                    reference = expected[index][group * tokens : (group + 1) * tokens]
+                    assert_bytes(columns, reference)
+                    assert_bytes(
+                        columns, old[index][group * tokens : (group + 1) * tokens]
+                    )
+    finally:
+        torch.cuda.synchronize()
+        graph.reset()
+
+
+@pytest.mark.parametrize("groups", (1, 2, 8))
+def test_grouped_projection_runtime_token_count_reuses_compilation(groups):
+    from utils import assert_no_cute_compile
+
+    require_hopper()
+
+    def run(tokens):
+        rows = tokens * groups
+        partial = torch.zeros((rows * 12, 512), dtype=torch.bfloat16, device="cuda")
+        inverse = torch.arange(rows * 12, dtype=torch.int32, device="cuda").reshape(
+            rows, 12
+        )
+        weights = torch.ones((rows, 12), device="cuda")
+        valid = torch.tensor([rows * 12], dtype=torch.int64, device="cuda")
+        output = (
+            torch.empty(
+                (tokens, groups * 512), dtype=torch.float8_e4m3fn, device="cuda"
+            ),
+            torch.empty_strided((tokens, groups * 4), (1, tokens), device="cuda"),
+        )
+        combine_quant_fp8(
+            partial, inverse, weights, valid, out=output, solution="cute_dsl"
+        )
+        assert torch.count_nonzero(output[0].view(torch.uint8)) == 0
+
+    run(1)
+    with assert_no_cute_compile():
+        for tokens in (2, 7, 18, 129, 257):
+            run(tokens)

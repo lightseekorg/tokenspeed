@@ -250,3 +250,48 @@ def test_deferred_storage_rejects_unsupported_capacity(tokens, topk, hidden):
             33,
             None,
         )
+
+
+@pytest.mark.parametrize("groups", (1, 2, 8))
+def test_grouped_destinations_reach_device_validation(groups):
+    tokens, hidden, topk = 3, 256, 5
+    rows = groups * tokens
+    values = [
+        torch.empty((rows * topk, hidden), dtype=torch.bfloat16),
+        torch.empty((rows, topk), dtype=torch.int32),
+        torch.empty((rows, topk)),
+        torch.tensor([rows * topk], dtype=torch.int64),
+    ]
+    output = (
+        torch.empty((tokens, groups * hidden), dtype=torch.float8_e4m3fn),
+        torch.empty_strided((tokens, groups * hidden // 128), (1, tokens)),
+    )
+    with pytest.raises(ValueError, match="CUDA device"):
+        combine_quant_fp8(*values, out=output, solution=None)
+
+
+@pytest.mark.parametrize(
+    "shape", ((0, 512), (1, 1023), (4, 256), (2, 256, 2), (4, 128))
+)
+def test_invalid_grouped_destination_shape(shape):
+    values = operands()
+    output = (torch.empty(shape, dtype=torch.float8_e4m3fn), torch.empty((1, 8)))
+    with pytest.raises(ValueError, match="destination shape"):
+        combine_quant_fp8(*values, out=output, solution=None)
+
+
+@pytest.mark.parametrize(
+    "bad_scale",
+    (
+        torch.empty((1, 7)),
+        torch.empty((1, 8), dtype=torch.bfloat16),
+        torch.empty((1, 8)),
+    ),
+)
+def test_grouped_destination_requires_column_major_scales(bad_scale):
+    with pytest.raises(ValueError, match="destinations"):
+        combine_quant_fp8(
+            *operands(),
+            out=(torch.empty((1, 1024), dtype=torch.float8_e4m3fn), bad_scale),
+            solution=None,
+        )
