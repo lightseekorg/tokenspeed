@@ -752,7 +752,7 @@ def test_kda_commit_conv_window_batch_size():
         # Reads come from the first 80 pages and writes go to the rest; -1 skips.
         reads = torch.randint(-1, 80, (layers, batch), generator=generator)
         writes = 80 + torch.randperm(80, generator=generator)[:batch].repeat(layers, 1)
-        writes[:, ::5] = -1
+        writes[:, 1::5] = -1
         accepted = torch.randint(-1, steps + 2, (batch,), generator=generator)
         batched_kda_commit_conv_window_kernel[
             (layers, batch, triton_cdiv(conv_dim, 128))
