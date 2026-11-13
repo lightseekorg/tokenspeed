@@ -843,6 +843,11 @@ def _run_dsa(
         }
     ),
     traits={
+        # Up to 8 so a DFlash block_size 8 verify can select a core. The leaf
+        # never reads q_len_per_req (_run_dsa derives every shape from the
+        # tensors) and honors per-row causality through topk_lens. It declares
+        # no batch_invariant feature, so a bitwise envelope still cannot select
+        # it for width > 4.
         "q_len": frozenset({1, 2, 3, 4, 5, 6, 7, 8}),
         "qk_nope_head_dim": frozenset({128, 192, 256}),
         "kv_lora_rank": frozenset({128, 512}),

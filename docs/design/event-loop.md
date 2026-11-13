@@ -33,9 +33,9 @@ With `--enable-async-logging`, the Rust tracing writer and Python root logger
 also run off the serving threads. Each has a bounded, lossy queue: a slow
 output stream must not introduce I/O backpressure into a round. The host
 owns Python log cleanup explicitly after serving returns, including errors
-and encode ranks, before notifying its launcher of a failure. Returning from
-Rust does not finalize Python, so an `atexit` hook alone cannot drain those
-records. Cleanup is bounded because an output stream can remain stalled.
+and encode ranks. Returning from Rust does not finalize Python, so an
+`atexit` hook alone cannot drain those records. Cleanup is bounded because
+an output stream can remain stalled.
 
 The ranks of a replica (an attention-TP group, across every pipeline stage)
 run the same scheduler. They talk over `ts-collective`'s TCP mesh, in fixed
@@ -432,6 +432,22 @@ device events within each rank and process rather than clip GPU time to host
 timestamps. Profile startup rejects unsupported capture capabilities instead
 of silently producing an incomplete trace.
 
+The torch profiler sees only torch ops and Python, so a torch profile also
+records the host's own spans (`ts_scheduler::profile`): the round's phases,
+the scheduler calls and their C++ phases (`csrc/core/profile_span.h`), the
+data-plane calls and their waits for the GIL on the control thread, and each
+operation on the forward thread. The profiler merges them into the trace it
+exports, on their threads' lanes, so a forward thread's operation encloses
+the Python it ran; the C++ scheduler's spans are under the `scheduler`
+category, the rest under `host`. The recording follows the torch profiler's window and
+costs one atomic load per span outside it; it keeps only the spans that began
+inside the window, so an operation open as a by-stage profile switches stages
+stays out of the next stage's trace. A trace the merge fails on is written
+without the host spans rather than failing the forward thread. A round that receives nothing,
+hands the data plane and the L3 executor nothing, and commits, acknowledges,
+or answers nothing leaves no spans: a loop waiting on a transfer spins through
+such rounds. A storage operation's outcome counts as an acknowledgment.
+
 ### The capture contract
 
 Information crosses to the data plane **only** as a queued operation's
@@ -440,7 +456,7 @@ Python object), from which the forward thread builds what a forward reads.
 What a launched forward reads freezes: no attribute rebinding, no in-place
 edit, no releasing a resource it holds while it may still run. Results cross
 back **only** as the launched forward's result, which the commit reads once
-its copy event landed, as plain lists built from the landed host copies.
+its copy event landed, as metadata lists and CPU logprob buffer views.
 
 The plan's cache ops follow the same capture rule: the data plane adapts
 them once into immutable Device and storage tuples, and
@@ -452,6 +468,13 @@ the executor's completion poll.
 `execution/device.py` states this in full, including the registered
 exceptions — grammar matchers, whose ownership splits by path and whose
 overlap the drain rules in Principle 4 break instead, and multimodal items.
+
+Completion queries export large logprob columns as CPU buffer views, after
+the result's copy event has landed. The host validates dtype, rank, shape
+and token-ID narrowing, then copies into Rust-owned vectors while Python
+buffer guards retain the storage. No borrowed array escapes the query or
+outlives the result's reuse lease. Buffer guards release on errors and
+unwinding too; no manual export/release pair belongs in the event loop.
 
 ## Principle 2: the event loop is a coordinator, nothing more
 
@@ -614,12 +637,12 @@ scaling so a fully free pool reports its full capacity, including packed or
 capacity-limited layouts.
 `available_lcm_blocks()` scans the pool and prefix indexes for reclaimability
 and belongs in diagnostics and leak checks, never in the per-round sampler.
-`active_lcm_blocks()` walks every live request's block tables, which at long
-contexts costs more than the rest of a round, so the loop takes it at most
-once per 100 ms and the frontend's load report, the metrics and the batch line
-share that value; a round with no request running takes it again (it then
-costs nothing), so an engine that goes idle reports none active at once, and
-does not keep it, so the first round with requests takes a fresh one. The
+`active_lcm_blocks()` is O(1): the block tables keep the count as they change
+(see cache-concepts.md). The loop takes it at most once per 100 ms and the
+frontend's load report, the metrics and the batch line share that value; a
+round with no request running takes it again, so an engine that goes idle
+reports none active at once, and does not keep it, so the first round with
+requests takes a fresh one. The
 scheduler's other counts (`sizes()`) are a pass over its requests per state:
 a round takes them for the load report, and as it planned only when the
 metrics or a batch line read them (they share that read); the idle check takes
@@ -793,6 +816,22 @@ jobs for failed rooms are dropped; executing jobs finish or return from the
 synchronous transport call before retiring. Client cancellation keeps the
 request's source ownership until that retirement event. The retirement agreement
 is needed only in rounds with a terminal status.
+
+**PD output completion.** A prefill's computed finish is not its client's
+final output: the output waits for the transfer's result. A transfer failure
+must publish an abort even after computation finished, unless the client
+already cancelled its stream or a final output was sent. A pause abort still
+notifies the client; repeated transfer events do not repeat the final output.
+This output fence does not retire source pages.
+
+**PD route refresh.** Before attaching a new room, the decode connection worker
+fetches the bootstrap route version. The version changes on bootstrap restart
+and source-rank registration, even when the address stays healthy. A changed
+version invalidates the cached route and target registrations for future rooms;
+existing rooms keep their targets and cancellation retirement fences. Bootstrap
+servers without a version are resolved afresh on each connection. This adds
+one bootstrap lookup per room, off the scheduler and forward threads. It does
+not transparently migrate an in-flight transfer to a replacement prefill peer.
 
 **PD cancellation.** Client aborts and `pause(abort)` cancel the tracked
 transfer as well as marking the request's output. A decode receiver sends a
@@ -1005,20 +1044,28 @@ For orientation, one `EventLoop::round`:
    as another group's copy destination, which the arena writes only after
    every pair reading those byte ranges; a destination is never zeroed;
    no op id, no ACK), then
-   page zeroing (the new owner's sanitization), then the Device-bound copies
-   -- `LoadBackOp` and `RestoreOp`, ordered behind the zeroing: a load-back
-   lands on zeroed pages and the forward reads it layer by layer behind the
-   layerwise fences (a prefill graph replay waits for the whole load before
-   its first segment, which holds no fence), so the loads start first on the
-   load stream, and every plan, with cache ops or without, points the fences
-   at its own load or at none; a restore
+   page zeroing (the new owner's sanitization of the fresh pages nothing
+   fills whole: a copy destination and a block a remote landing fills are
+   left out), then the Device-bound copies
+   -- `LoadBackOp` and `RestoreOp`, ordered behind the zeroing and the
+   forwards in flight, which may still write a block an abort freed and this
+   plan granted (load-back destinations are never zeroed): the forward reads
+   a load-back layer by layer behind the
+   layerwise fences (a prefill graph replay waits on them before each
+   captured segment, which holds none, or, on a pool that does not declare
+   every access fenced, for the whole load instead), so the loads start first
+   on the load stream, and every plan, with cache ops or without, points
+   the fences at its own load or at none; a restore
    queues behind them, overwrites its destination blocks whole (the
    scheduler lists none of them for zeroing), reads both Host tiers under one
    event and arms no layerwise fence, its request being unschedulable until
    the ACK -- then the plan's remote streams to the transfer peer (a D-node
-   remote prefill waits on the zeroing fence inside its submission, which
-   the FIFO orders after the store fence), then the plan's batch to the
-   model. A store names the victim's request-pool slot, which the scheduler
+   remote prefill submits only its stream-ordered slot preparation here),
+   then the plan's batch to the model, then the D-node remote prefill's
+   pull, which waits on the zeroing fence before its CPU-issued RDMA
+   trigger. The zeroing orders behind the step in flight, so a pull queued
+   ahead of the batch would hold the batch's launch until that step ends. A
+   store names the victim's request-pool slot, which the scheduler
    freed in the same plan build: its next owner first writes it in a
    forward, and every forward is enqueued behind the store fence, so the
    slot-state export reads the victim's bytes; a restore names the resumed
@@ -1047,6 +1094,21 @@ status. Failure, termination and constructor-error cleanup share one
 process-local shutdown latch: once cleanup starts, later rank notifications
 cannot interrupt it. Signal callbacks do not log or enumerate processes;
 cleanup runs outside the callback.
+
+While serving generation, a fatal control-loop or forward-thread error
+signals the owning launcher once from the thread that detects it. The
+signal requires no Python call and precedes the Rust error log and any wait
+for the forward thread or device cleanup. The launcher can begin stopping
+the local ranks even while the failing rank is still alive. An orderly stop
+still drains the forward thread and closes the data plane.
+
+Concurrent reporters wait only for the native signal attempt, never for
+another thread's log output. The data plane publishes its first failure
+and wakes waiters before logging either the rank failure or a failed signal.
+Later distinct failures and cleanup errors remain visible without replacing
+the original serving error.
+Failures outside generation serving use the same native notifier when
+they reach the host's final error handler; their cleanup timing is unchanged.
 
 ## Checklist for extending the loop
 
@@ -1085,3 +1147,15 @@ count. An unchanged idle load is sent at most once per second as a heartbeat,
 so the frontend can distinguish an idle engine from a stale connection. The
 active page count in it is reused for up to 100 ms (see the page gauges),
 far inside the three seconds the frontend considers a report fresh.
+
+## Independent execution with shared weights
+
+The device build exports `requires_forward_coordination` as an immutable
+capability derived from execution groups. The host hands the control plane a
+DP coordination group only when forwards span workers, or when a shared L3
+namespace needs agreed flushes. Without one, fully local workers omit the
+per-round DP metadata exchange, peer-induced idle forwards and the DP
+rendezvous for cache flushes while retaining their DP routing identities.
+Sharing immutable expert weights alone does not require forward coordination.
+Weight-copy streams and readiness/release events remain behind the model on
+the data plane; see [distributed immutable weights](distributed-weights.md).

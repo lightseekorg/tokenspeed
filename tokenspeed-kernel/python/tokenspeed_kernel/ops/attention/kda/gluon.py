@@ -23,7 +23,12 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.ops.attention.kda import KdaPrefillResult, KdaReplayRecords
+from tokenspeed_kernel.ops.attention.kda import (
+    KdaOutputNorm,
+    KdaPrefillResult,
+    KdaReplayRecords,
+    apply_kda_output_norm,
+)
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -214,12 +219,13 @@ if current_platform().is_amd:
         draft_token_num: int,
         lower_bound: float | None,
         replay_records: KdaReplayRecords,
+        output_norm: KdaOutputNorm | None,
         g_raw: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Fuse gate, convolution and verify; a supplied raw gate takes precedence."""
         if replay_records is None:
             raise ValueError("AMD no-store verify requires recovery records")
-        return _kda_fused_verify_impl(
+        result = _kda_fused_verify_impl(
             mixed_qkv=mixed_qkv,
             original_qkv=replay_records.original_qkv,
             conv_weights=conv_weights,
@@ -242,6 +248,7 @@ if current_platform().is_amd:
             draft_token_num=draft_token_num,
             lower_bound=lower_bound,
         )
+        return apply_kda_output_norm(result, output_norm)
 
     @register_kernel(
         "attention",
@@ -438,12 +445,13 @@ if current_platform().is_amd:
         draft_token_num: int,
         lower_bound: float | None,
         replay_records: KdaReplayRecords,
+        output_norm: KdaOutputNorm | None,
         g_raw: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Fuse gate, convolution and verify; a supplied raw gate takes precedence."""
         if replay_records is None:
             raise ValueError("AMD no-store verify requires recovery records")
-        return _kda_fused_verify_gfx1250_impl(
+        result = _kda_fused_verify_gfx1250_impl(
             mixed_qkv=mixed_qkv,
             original_qkv=replay_records.original_qkv,
             conv_weights=conv_weights,
@@ -466,6 +474,7 @@ if current_platform().is_amd:
             draft_token_num=draft_token_num,
             lower_bound=lower_bound,
         )
+        return apply_kda_output_norm(result, output_norm)
 
     @register_kernel(
         "attention",

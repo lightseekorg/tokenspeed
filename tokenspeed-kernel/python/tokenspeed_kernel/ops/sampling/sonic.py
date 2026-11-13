@@ -31,9 +31,12 @@ than the FlashInfer backend. The other Blackwell GPUs share it; any other GPU
 uses it unmeasured.
 
 Every config draws the same tokens (the selection is exact; only its tiling
-and warps differ), so the table changes speed only. bf16 logits rank at bf16
-resolution; fp32 logits (soft-capped heads) are sampled exactly in fp32 among
-the top-128 candidates their bf16 keys pick.
+and warps differ), so the table changes speed only. A row with no top-k, top-p
+or min-p draws from its whole vocabulary: each block keeps its best logit plus
+the slot's Gumbel noise at each token, and the best over the blocks (or ranks)
+is the draw. The other sampled rows select among the top-128 candidates their
+bf16 keys pick. bf16 logits rank at bf16 resolution; fp32 logits (soft-capped
+heads) are sampled exactly in fp32.
 """
 
 from __future__ import annotations
@@ -48,6 +51,7 @@ from tokenspeed_kernel._triton import libdevice, tl, triton
 from tokenspeed_kernel.thirdparty.sonic_sampler.core.flags import Indicator
 from tokenspeed_kernel.thirdparty.sonic_sampler.ops.base import (
     MAX_K,
+    NOISE_STRIDE,
     gdc_launch_dependents,
     gdc_wait,
     next_power_of_2,
@@ -59,6 +63,8 @@ from tokenspeed_kernel.thirdparty.sonic_sampler.ops.multistep import (
 )
 from tokenspeed_kernel.thirdparty.sonic_sampler.ops.prologue import (
     bitpacked_reduction_kernel,
+    whole_reduction_kernel,
+    whole_row,
 )
 from tokenspeed_kernel.thirdparty.sonic_sampler.ops.shard import (
     shard_candidates_kernel,
@@ -282,20 +288,27 @@ def _reduce(
     logits: Tensor,
     state: SlotState,
     slots: Tensor,
+    offsets: Tensor,
     drafted: Tensor | None,
     scratchpad: Tensor,
     config: SonicConfig,
     enable_pdl: bool,
     shard: VocabShard | None,
+    ancestors: Tensor | None = None,
+    steps: Tensor | None = None,
 ) -> None:
-    """The first stage: each block's keys (or greedy maximum) in ``scratchpad``; ``drafted`` is None for one row per request."""
+    """The first stage: each block's keys (greedy maximum, or best perturbed value of a whole-vocabulary row) in ``scratchpad``; ``drafted`` is None for one row per request. ``tree_targets`` also passes ``ancestors``, the tokens each row's penalties count, and ``steps``, which key each row's noise."""
     exact = _exact(logits)
     rows, vocab_size = logits.shape
     blocks = triton.cdiv(vocab_size, config.block_n)
     singular = drafted is None
+    tokens, stride_t = drafted, None
     if singular:
         batch_size, gamma, block_g = rows, 0, None
         stride_g = state.grammar.stride(0)
+        if ancestors is not None:
+            tokens, stride_t = ancestors, ancestors.stride(0)
+            gamma, block_g = ancestors.shape[1], next_power_of_2(ancestors.shape[1])
     else:
         batch_size, timesteps = drafted.shape
         gamma, block_g = timesteps - 1, next_power_of_2(timesteps)
@@ -309,7 +322,7 @@ def _reduce(
         state.grammar,
         state.context_counts,
         state.decode_counts,
-        drafted,
+        tokens,
         state.repetition,
         state.frequency,
         state.presence,
@@ -323,7 +336,7 @@ def _reduce(
         _TOP_K_SCALE,
         batch_size,
         False,
-        not singular,
+        tokens is not None,
         True,
         singular,
         False,
@@ -333,7 +346,7 @@ def _reduce(
         logits.stride(0),
         stride_g,
         state.decode_counts.stride(0),
-        None,
+        stride_t,
         scratchpad.stride(0),
         config.block_n,
         None,
@@ -342,14 +355,67 @@ def _reduce(
         tl.float32 if exact else tl.bfloat16,
         logit_scale=None if shard is None else shard.logit_scale,
         softcap=None if shard is None else shard.softcap,
+        whole=True,
         num_warps=config.first_warps,
     )
+    # The whole-vocabulary rows, a few programs per row walking consecutive blocks.
+    group_blocks = triton.cdiv(
+        blocks, min(blocks, triton.cdiv(_whole_programs(logits.device), rows))
+    )
+    whole_reduction_kernel[(rows, triton.cdiv(blocks, group_blocks))](
+        logits,
+        state.indicators,
+        slots,
+        None,
+        state.grammar,
+        state.context_counts,
+        state.decode_counts,
+        tokens,
+        state.repetition,
+        state.frequency,
+        state.presence,
+        state.logit_bias,
+        state.temperature,
+        state.seeds,
+        offsets,
+        scratchpad,
+        vocab_size,
+        0 if shard is None else shard.vocab_start,
+        gamma,
+        batch_size,
+        blocks,
+        group_blocks,
+        False,
+        tokens is not None,
+        True,
+        singular,
+        enable_pdl,
+        logits.stride(0),
+        stride_g,
+        state.decode_counts.stride(0),
+        stride_t,
+        scratchpad.stride(0),
+        config.block_n,
+        block_g,
+        tl.float32 if exact else tl.bfloat16,
+        logit_scale=None if shard is None else shard.logit_scale,
+        softcap=None if shard is None else shard.softcap,
+        u_ptr=steps,
+        num_warps=4,
+    )
+
+
+@functools.cache
+def _whole_programs(device: torch.device) -> int:
+    """Programs the whole-vocabulary reduction spreads its rows over: eight per SM."""
+    return 8 * torch.cuda.get_device_properties(device).multi_processor_count
 
 
 def shard_candidates(
     logits: Tensor,
     state: SlotState,
     slots: Tensor,
+    offsets: Tensor,
     drafted: Tensor | None,
     scratchpad: Tensor,
     shard: VocabShard,
@@ -363,6 +429,7 @@ def shard_candidates(
         logits: ``[rows, V_s]`` bf16 or fp32 raw head logits of this rank's shard.
         state: The slot state; fp32 scalars with fp32 logits.
         slots: ``[B]`` int64 slot of each request.
+        offsets: ``[P]`` int64 Philox offset of each slot (its first row's position).
         drafted: ``[B, g + 1]`` int32 drafts of a verify launch (rows request-major), or None for one row per request.
         scratchpad: ``[rows, >= scratchpad_columns(V_s)]`` uint32 keys.
         shard: This rank's slice; its ``pairs`` receive the candidates.
@@ -376,7 +443,9 @@ def shard_candidates(
         row's candidate values in descending order (bf16 values for bf16
         logits, fp32 for fp32), the lower token id first among equal values,
         then their global token ids as exact fp32 integers; a greedy row keeps
-        only its first maximum, the rest -inf. With ``draft_probs``,
+        only its first maximum, the rest -inf, and a row drawing from its
+        whole vocabulary its best perturbed value (``merged_whole`` reads
+        it). With ``draft_probs``,
         ``[rows, 3 * MAX_K]``: then the probability the row's draft recorded
         at each candidate (zero on greedy rows and on each request's last row).
 
@@ -385,7 +454,9 @@ def shard_candidates(
             would pass ``MAX_OFFSET``.
     """
     _check_offsets(logits, scratchpad)
-    _reduce(logits, state, slots, drafted, scratchpad, config, enable_pdl, shard)
+    _reduce(
+        logits, state, slots, offsets, drafted, scratchpad, config, enable_pdl, shard
+    )
     exact = _exact(logits)
     rows, vocab_size = logits.shape
     blocks = triton.cdiv(vocab_size, config.block_n)
@@ -434,6 +505,7 @@ def shard_candidates(
         d_ptr=draft_probs,
         stride_d=None if draft_probs is None else draft_probs.stride(0),
         stride_dg=None if draft_probs is None else draft_probs.stride(1),
+        whole=True,
         num_warps=config.second_warps,
     )
     return pairs
@@ -443,6 +515,7 @@ def _merged(
     logits: Tensor,
     state: SlotState,
     slots: Tensor,
+    offsets: Tensor,
     drafted: Tensor | None,
     scratchpad: Tensor,
     shard: VocabShard | None,
@@ -452,13 +525,16 @@ def _merged(
 ) -> dict:
     """The selection kernels' candidate arguments: none for whole rows, else every rank's gathered candidates (with ``draft_probs``, carrying them), which they merge."""
     if shard is None:
-        _reduce(logits, state, slots, drafted, scratchpad, config, enable_pdl, None)
+        _reduce(
+            logits, state, slots, offsets, drafted, scratchpad, config, enable_pdl, None
+        )
         return {}
     pairs = shard.gather(
         shard_candidates(
             logits,
             state,
             slots,
+            offsets,
             drafted,
             scratchpad,
             shard,
@@ -476,6 +552,123 @@ def _merged(
         stride_mr=pairs.stride(0),
         stride_mb=pairs.stride(1),
     )
+
+
+def _draw(
+    logits: Tensor,
+    state: SlotState,
+    slots: Tensor,
+    offsets: Tensor,
+    tokens: Tensor,
+    scratchpad: Tensor,
+    config: SonicConfig,
+    enable_pdl: bool,
+    shard: VocabShard | None,
+    ancestors: Tensor | None = None,
+    steps: Tensor | None = None,
+) -> Tensor:
+    """One token per logits row: the draw of ``sample``, or of ``tree_targets`` with ``ancestors`` and ``steps``."""
+    _check_offsets(logits, scratchpad)
+    exact = _exact(logits)
+    rows, vocab_size = logits.shape
+    blocks = triton.cdiv(vocab_size, config.block_n)
+    block_v = next_power_of_2(blocks)
+    stride_x, stride_y = logits.stride(0), scratchpad.stride(0)
+    stride_g, stride_c = state.grammar.stride(0), state.decode_counts.stride(0)
+
+    gamma, block_g, stride_tr = 0, None, None
+    if ancestors is None:
+        merged = _merged(
+            logits, state, slots, offsets, None, scratchpad, shard, config, enable_pdl
+        )
+    else:
+        gamma, block_g = ancestors.shape[1], next_power_of_2(ancestors.shape[1])
+        stride_tr = ancestors.stride(0)
+        _reduce(
+            logits,
+            state,
+            slots,
+            offsets,
+            None,
+            scratchpad,
+            config,
+            enable_pdl,
+            None,
+            ancestors,
+            steps,
+        )
+        merged = {}
+    cumulative_selection_kernel[(rows,)](
+        scratchpad,
+        state.indicators,
+        slots,
+        None,
+        state.decode_counts,
+        None,
+        state.seeds,
+        offsets,
+        state.top_k,
+        state.top_p,
+        state.min_p,
+        None,
+        tokens,
+        None,
+        None,
+        None,
+        None,
+        blocks,
+        1,
+        vocab_size,
+        MAX_K,
+        None,
+        block_v,
+        block_v * MAX_K,
+        False,
+        True,
+        False,
+        False,
+        ancestors is None,
+        False,
+        not config.radix,
+        enable_pdl,
+        False,
+        False,
+        stride_y,
+        None,
+        None,
+        tokens.stride(0),
+        None,
+        None,
+        stride_c,
+        None,
+        None,
+        config.block_n,
+        block_v,
+        _LOGPROB_BLOCK,
+        logits if exact else None,
+        state.grammar if exact else None,
+        state.context_counts if exact else None,
+        ancestors if exact else None,
+        state.repetition if exact else None,
+        state.frequency if exact else None,
+        state.presence if exact else None,
+        state.logit_bias if exact else None,
+        state.temperature if exact else None,
+        vocab_size,
+        0,
+        gamma,
+        exact and ancestors is not None,
+        stride_x,
+        stride_g,
+        stride_tr,
+        block_g,
+        exact,
+        **merged,
+        whole=True,
+        u_ptr=steps,
+        num_warps=config.second_warps,
+    )
+    return tokens
 
 
 def sample(
@@ -511,84 +704,79 @@ def sample(
         ValueError: The logits are neither bf16 nor fp32, or a row offset
             would pass ``MAX_OFFSET``.
     """
-    _check_offsets(logits, scratchpad)
-    exact = _exact(logits)
-    rows, vocab_size = logits.shape
-    blocks = triton.cdiv(vocab_size, config.block_n)
-    block_v = next_power_of_2(blocks)
-    stride_x, stride_y = logits.stride(0), scratchpad.stride(0)
-    stride_g, stride_c = state.grammar.stride(0), state.decode_counts.stride(0)
-
-    merged = _merged(logits, state, slots, None, scratchpad, shard, config, enable_pdl)
-    cumulative_selection_kernel[(rows,)](
-        scratchpad,
-        state.indicators,
-        slots,
-        None,
-        state.decode_counts,
-        None,
-        state.seeds,
-        offsets,
-        state.top_k,
-        state.top_p,
-        state.min_p,
-        None,
-        tokens,
-        None,
-        None,
-        None,
-        None,
-        blocks,
-        1,
-        vocab_size,
-        MAX_K,
-        None,
-        block_v,
-        block_v * MAX_K,
-        False,
-        True,
-        False,
-        False,
-        True,
-        False,
-        not config.radix,
-        enable_pdl,
-        False,
-        False,
-        stride_y,
-        None,
-        None,
-        tokens.stride(0),
-        None,
-        None,
-        stride_c,
-        None,
-        None,
-        config.block_n,
-        block_v,
-        _LOGPROB_BLOCK,
-        logits if exact else None,
-        state.grammar if exact else None,
-        state.context_counts if exact else None,
-        None,
-        state.repetition if exact else None,
-        state.frequency if exact else None,
-        state.presence if exact else None,
-        state.logit_bias if exact else None,
-        state.temperature if exact else None,
-        vocab_size,
-        0,
-        0,
-        False,
-        stride_x,
-        stride_g,
-        None,
-        None,
-        exact,
-        **merged,
-        num_warps=config.second_warps,
+    return _draw(
+        logits, state, slots, offsets, tokens, scratchpad, config, enable_pdl, shard
     )
-    return tokens
+
+
+def tree_targets(
+    logits: Tensor,
+    state: SlotState,
+    slots: Tensor,
+    offsets: Tensor,
+    steps: Tensor,
+    ancestors: Tensor,
+    tokens: Tensor,
+    scratchpad: Tensor,
+    config: SonicConfig,
+    enable_pdl: bool,
+) -> Tensor:
+    """Draw one token per node of each request's draft tree, as ``sample`` draws, counting none.
+
+    A node's draw is keyed by its depth, so the nodes of one depth share their
+    randomness and a walk down one path draws fresh at every depth; its
+    penalties count the tokens of its path on top of its slot's decode
+    counts, as the draws before it had emitted them.
+
+    Args:
+        logits: ``[R, V]`` bf16 or fp32 logits, one row per tree node.
+        state: The slot state; fp32 scalars with fp32 logits.
+        slots: ``[R]`` int64 slot of each row.
+        offsets: ``[P]`` int64 Philox offset of each slot (its first row's position).
+        steps: ``[R]`` int32 each row's depth in its tree.
+        ancestors: ``[R, D]`` int32 the tokens of each row's path below the
+            root, its own last, then ``-1``.
+        tokens: ``[R, 1]`` int32 output.
+        scratchpad: ``[R, >= scratchpad_columns(V)]`` uint32 keys.
+        config: The launch config (``pick``).
+        enable_pdl: Launch with programmatic dependent launch.
+
+    Returns:
+        ``tokens``.
+
+    Raises:
+        ValueError: The logits are neither bf16 nor fp32, a row offset would
+            pass ``MAX_OFFSET``, or ``steps`` and ``ancestors`` are not int32
+            rows of the logits, with fewer path columns than the noise stride.
+    """
+    rows, stride = logits.shape[0], NOISE_STRIDE.value
+    if (
+        steps.dtype != torch.int32
+        or steps.shape != (rows,)
+        or ancestors.dtype != torch.int32
+        or ancestors.dim() != 2
+        or ancestors.shape[0] != rows
+        or ancestors.stride(1) != 1
+        or not 0 < ancestors.shape[1] < stride
+    ):
+        raise ValueError(
+            f"sonic tree targets need int32 [{rows}] steps and [{rows}, D < "
+            f"{stride}] paths, got {steps.dtype} {tuple(steps.shape)} and "
+            f"{ancestors.dtype} {tuple(ancestors.shape)}"
+        )
+    return _draw(
+        logits,
+        state,
+        slots,
+        offsets,
+        tokens,
+        scratchpad,
+        config,
+        enable_pdl,
+        None,
+        ancestors,
+        steps,
+    )
 
 
 def verify(
@@ -703,6 +891,7 @@ def verify(
         logits,
         state,
         slots,
+        offsets,
         drafted,
         scratchpad,
         shard,
@@ -747,7 +936,7 @@ def verify(
         state.grammar if exact else None,
         state.context_counts if exact else None,
         state.decode_counts if exact else None,
-        drafted if exact else None,
+        drafted,
         state.repetition if exact else None,
         state.frequency if exact else None,
         state.presence if exact else None,
@@ -761,6 +950,7 @@ def verify(
         block_g,
         exact,
         **merged,
+        whole=True,
         num_warps=config.second_warps,
     )
     chain_speculative_verification_kernel[(batch_size,)](
@@ -811,11 +1001,14 @@ __all__ = [
     "SonicConfig",
     "VocabShard",
     "configs",
+    "count_emitted",
     "pick",
     "sample",
     "scratchpad_columns",
     "shard_candidates",
     "synthetic_targets",
+    "tree_paths",
+    "tree_targets",
     "verify",
 ]
 
@@ -837,9 +1030,11 @@ def _synthetic_target_kernel(
     """One program per request: its target token at the forced position ``lengths - 1``.
 
     A greedy request (indicator bit 0x40) reads the argmax ``verify`` stored at
-    its first row. Any other request takes the Gumbel-max over that position's
-    ``MAX_K`` candidates, keyed by the slot's seed and offset and the position,
-    which is the draw ``verify`` makes past an all-accepted window.
+    its first row, and a request drawing from its whole vocabulary the draw
+    ``verify`` stored in its row's third slot. Any other request takes the
+    Gumbel-max over that position's ``MAX_K`` candidates, keyed by the slot's
+    seed and offset and the position, which is the draw ``verify`` makes past
+    an all-accepted window.
     """
     request = tl.program_id(axis=0)
     if enable_pdl:
@@ -851,6 +1046,9 @@ def _synthetic_target_kernel(
     if (indicator & 0x40) > 0:
         # Greedy requests: ``verify`` stores each position's argmax at the first row.
         token = tl.load(indices_ptr + margin * max_k + step)
+    elif whole_row(indicator, True, False):
+        # The position's whole-vocabulary draw, its draft included.
+        token = tl.load(indices_ptr + (margin + step) * max_k + 2)
     else:
         # The draw ``verify`` makes past an all-accepted window: Gumbel-max over the
         # position's candidates, keyed by the slot's seed, offset and the position.
@@ -882,8 +1080,9 @@ def synthetic_targets(
     ``L``: the first ``L - 1`` drafts, then a token drawn from the target at
     position ``L - 1``. This draws that token from the candidates ``verify``
     left in its scratch, as ``verify`` itself draws past an all-accepted
-    window: a greedy request's argmax, otherwise Gumbel-max over the
-    position's candidates with the slot's Philox noise for that position.
+    window: a greedy request's argmax, a whole-vocabulary request's draw
+    there, otherwise Gumbel-max over the position's candidates with the
+    slot's Philox noise for that position.
 
     Args:
         values: ``[B * T, MAX_K]`` fp32 candidate probabilities ``verify`` wrote.
@@ -935,3 +1134,122 @@ def synthetic_targets(
         num_warps=1,
     )
     return tokens
+
+
+@triton.jit
+def _tree_paths_kernel(
+    candidates_ptr,
+    parents_ptr,
+    depths_ptr,
+    paths_ptr,
+    num_nodes: tl.constexpr,
+    depth: tl.constexpr,
+    block_d: tl.constexpr,
+):
+    """One node's path below its root: walking up, each node's token lands at its depth."""
+    row = tl.program_id(0)
+    base = (row // num_nodes) * num_nodes
+    span = tl.arange(0, block_d)
+    path = tl.full((block_d,), -1, tl.int32)
+    node = row - base
+    for _ in tl.static_range(depth):
+        live = node > 0
+        level = tl.load(depths_ptr + base + node)
+        token = tl.load(candidates_ptr + base + node)
+        path = tl.where(live & (span == level - 1), token, path)
+        node = tl.where(live, tl.load(parents_ptr + base + node), 0)
+    tl.store(paths_ptr + row * depth + span, path, mask=span < depth)
+
+
+def tree_paths(
+    candidates: Tensor, parents: Tensor, depths: Tensor, paths: Tensor
+) -> Tensor:
+    """Each draft-tree node's path below its root, the tokens ``tree_targets`` counts for its penalties.
+
+    Args:
+        candidates: ``[B, N]`` int32 node tokens, node 0 the root.
+        parents: ``[B, N]`` int32 parent node, ``-1`` for the root; a parent
+            precedes its children.
+        depths: ``[B, N]`` int32 node depth, 0 for the root.
+        paths: ``[B * N, D]`` int32 output, ``D`` at least the deepest depth.
+
+    Returns:
+        ``paths``: row ``b * N + i`` holds the tokens on the path of node
+        ``i`` at depths 1 to its own, then ``-1``.
+
+    Raises:
+        ValueError: The tables are not dense int32 ``[B, N]`` and
+            ``[B * N, D]`` rows.
+    """
+    batch, nodes = candidates.shape
+    if (
+        any(t.dtype != torch.int32 for t in (candidates, parents, depths, paths))
+        or parents.shape != candidates.shape
+        or depths.shape != candidates.shape
+        or not all(t.is_contiguous() for t in (candidates, parents, depths, paths))
+        or paths.shape[0] != batch * nodes
+    ):
+        raise ValueError(
+            f"sonic tree paths need dense int32 [B, N] trees and a [B * N, D] output, "
+            f"got {tuple(candidates.shape)}, {tuple(parents.shape)}, "
+            f"{tuple(depths.shape)} and {tuple(paths.shape)}"
+        )
+    if batch:
+        depth = paths.shape[1]
+        _tree_paths_kernel[(batch * nodes,)](
+            candidates,
+            parents,
+            depths,
+            paths,
+            nodes,
+            depth,
+            next_power_of_2(depth),
+            num_warps=1,
+        )
+    return paths
+
+
+@triton.jit
+def _count_emitted_kernel(
+    counts_ptr,
+    slots_ptr,
+    tokens_ptr,
+    lengths_ptr,
+    stride_c,
+    num_nodes: tl.constexpr,
+    block_n: tl.constexpr,
+):
+    """One request's emitted tokens added to its slot's decode counts."""
+    request = tl.program_id(0)
+    span = tl.arange(0, block_n)
+    emitted = span < tl.load(lengths_ptr + request)
+    slot = tl.load(slots_ptr + request)
+    tokens = tl.load(tokens_ptr + request * num_nodes + span, mask=emitted, other=0)
+    tl.atomic_add(counts_ptr + slot * stride_c + tokens, 1, mask=emitted)
+
+
+def count_emitted(
+    state: SlotState, slots: Tensor, tokens: Tensor, lengths: Tensor
+) -> None:
+    """Count each request's emitted tokens in its slot's decode counts, as ``verify`` counts its own.
+
+    Args:
+        state: The slot state whose decode counts the tokens join.
+        slots: ``[B]`` int64 slot of each request.
+        tokens: ``[B * N]`` int32 emitted tokens, the first ``lengths[b]``
+            of request ``b`` at ``b * N``.
+        lengths: ``[B]`` int32 tokens each request emitted, at most ``N``.
+    """
+    batch = slots.shape[0]
+    if batch:
+        nodes = tokens.shape[0] // batch
+        _count_emitted_kernel[(batch,)](
+            state.decode_counts,
+            slots,
+            tokens,
+            lengths,
+            state.decode_counts.stride(0),
+            nodes,
+            next_power_of_2(nodes),
+            num_warps=1,
+        )

@@ -37,6 +37,8 @@
 
 #include "core/token_container.h"
 #include "cache/tier/transfer.h"
+#include "core/profile_span.h"
+#include "fsm/forward_events.h"
 #include "fsm/forward_states.h"
 #include "scheduler/capacity_model.h"
 #include "scheduler/operations/forward.h"
@@ -47,11 +49,6 @@
 namespace tokenspeed {
 
 namespace {
-
-// Stalled rounds (Scheduler::trackStalledRounds) before the first warning.
-// Later warnings come at every doubling of the streak, so a stall that never
-// ends still logs only a few dozen lines.
-constexpr std::int64_t kStalledRoundsBeforeWarning = 1024;
 
 std::int32_t hostPoolBlocks(const SchedulerConfig& config) {
     return config.HasHostCache() ? config.host_allocator.NumUsableBlocks() : 0;
@@ -171,8 +168,10 @@ std::size_t Scheduler::groupIndex(const std::string& group_id) const {
 
 std::vector<KvCacheEvent> Scheduler::DrainKvEvents() {
     // An event reports the net change since the last drain: a boundary is
-    // published exactly while every child block of it is cached. Mutations
-    // mark boundaries in whatever order the coordinator touches pages, so the
+    // published while its required continuous-history blocks are cached. Sparse state
+    // checkpoints must not leave holes in the router's parent chain. Router
+    // overlap estimates locality; admission computes the actual reusable state.
+    // Mutations mark boundaries in whatever order the coordinator touches pages, so the
     // batch is sorted by chain depth: removals leaf-first, then Stored
     // parent-first, because consumers resolve a Stored event's
     // parent_block_hash against what they have already received.
@@ -187,17 +186,17 @@ std::vector<KvCacheEvent> Scheduler::DrainKvEvents() {
         // A tail's descriptor carries fewer tokens than a page.
         const auto descriptor_tokens = static_cast<std::int32_t>(event_boundary.stored.token_ids.size());
         const std::int32_t tail_tokens = descriptor_tokens < config_.prefix_granularity ? descriptor_tokens : 0;
-        const CacheCoordinator::BoundaryResidency residency =
-            coordinator_.DeviceBoundaryResidency(boundary, tail_tokens);
-        const bool complete = residency == CacheCoordinator::BoundaryResidency::kComplete;
-        if (complete && !event_boundary.published) {
-            stored.emplace_back(event_boundary.depth, event_boundary.stored);
-        } else if (!complete && event_boundary.published) {
-            removed.emplace_back(event_boundary.depth,
-                                 KvBlockRemovedEvent{.block_hashes = event_boundary.stored.block_hashes});
+        const auto status = coordinator_.GetBoundaryEventStatus(boundary, tail_tokens);
+        if (status.publishable != event_boundary.published) {
+            if (status.publishable) {
+                stored.emplace_back(event_boundary.depth, event_boundary.stored);
+            } else {
+                removed.emplace_back(event_boundary.depth,
+                                     KvBlockRemovedEvent{.block_hashes = event_boundary.stored.block_hashes});
+            }
         }
-        event_boundary.published = complete;
-        if (residency == CacheCoordinator::BoundaryResidency::kNone) {
+        event_boundary.published = status.publishable;
+        if (!status.has_device_entries) {
             kv_event_boundaries_.erase(it);
         }
     }
@@ -211,7 +210,7 @@ std::vector<KvCacheEvent> Scheduler::DrainKvEvents() {
     for (auto& [depth, event] : stored) {
         events.push_back(std::move(event));
     }
-    return events;
+    return kv_event_prefix_view_.Apply(std::move(events));
 }
 
 bool Scheduler::ClearL1Cache() {
@@ -267,17 +266,17 @@ bool Scheduler::clearCache(bool include_host) {
 }
 
 void Scheduler::registerKvEventPrefixPages(Request& request, std::span<const std::string> prefix_hashes,
-                                           std::int32_t first_page) {
+                                           std::int32_t first_page, std::int32_t past_end_page) {
     if (!config_.enable_kv_cache_events) {
         return;
     }
-    _assert(first_page >= 0 && static_cast<std::size_t>(first_page) <= prefix_hashes.size(),
+    _assert(first_page >= 0 && first_page <= past_end_page &&
+                static_cast<std::size_t>(past_end_page) <= prefix_hashes.size(),
             "KV event page range is invalid");
-    const std::vector<std::span<const std::int32_t>> token_pages =
-        request.PrefixPages(first_page, static_cast<std::int32_t>(prefix_hashes.size()));
+    const std::vector<std::span<const std::int32_t>> token_pages = request.PrefixPages(first_page, past_end_page);
     const std::span<const std::uint64_t> block_hashes = request.KvEventBlockHashes(prefix_hashes.size());
 
-    for (std::size_t i = static_cast<std::size_t>(first_page); i < prefix_hashes.size(); ++i) {
+    for (std::size_t i = static_cast<std::size_t>(first_page); i < static_cast<std::size_t>(past_end_page); ++i) {
         const std::span<const std::int32_t> tokens = token_pages[i - static_cast<std::size_t>(first_page)];
         CacheKey key{.content_hash = prefix_hashes[i]};
         const std::optional<std::uint64_t> parent_hash =
@@ -307,7 +306,13 @@ void Scheduler::registerKvEventPublication(Request& request, std::span<const std
     // published blocks hold them on the Device -- not after a restore brought
     // the request back on unpublished copies -- so the range starts at the
     // first page the publication registers an entry under.
-    registerKvEventPrefixPages(request, prefix_hashes, coordinator_.FirstPublishedPage(completed));
+    const auto num_pages = static_cast<std::int32_t>(prefix_hashes.size());
+    const std::int32_t first_page = coordinator_.FirstPublishedPage(completed);
+    registerKvEventPrefixPages(request, prefix_hashes, first_page, num_pages);
+    // A sliding group's sink blocks are registered again under the pages
+    // that hold them, below the window's.
+    registerKvEventPrefixPages(request, prefix_hashes, 0,
+                               std::min(coordinator_.PublishedSinkPages(completed), first_page));
     if (completed.tail) {
         registerKvEventTail(request, prefix_hashes, *completed.tail);
     }
@@ -339,7 +344,7 @@ std::vector<std::int32_t> Scheduler::kvEventTailsOf(const RetractionImage& image
 
 void Scheduler::registerKvEventRestore(Request& request, std::span<const std::string> prefix_hashes,
                                        std::span<const std::int32_t> tails) {
-    registerKvEventPrefixPages(request, prefix_hashes, 0);
+    registerKvEventPrefixPages(request, prefix_hashes, 0, static_cast<std::int32_t>(prefix_hashes.size()));
     for (const std::int32_t boundary : tails) {
         const auto full_pages = static_cast<std::size_t>(boundary / config_.prefix_granularity);
         _assert(full_pages <= prefix_hashes.size(), "an imaged tail lies inside the request's computed pages");
@@ -389,6 +394,7 @@ void Scheduler::markKvEventBoundaryForReconcile(const CacheKey& boundary) {
 }
 
 void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
+    ProfileSpan profile_span{"Scheduler::SubmitRequests"};
     std::unordered_set<std::string> request_ids;
     request_ids.reserve(request_specs.size());
     std::vector<std::unique_ptr<Request>> pending_requests;
@@ -479,6 +485,12 @@ std::size_t Scheduler::PdTransferSize() const {
 }
 
 std::int32_t Scheduler::ActiveLcmBlocks() const {
+    const std::int32_t active = coordinator_.NumActiveLcmBlocks();
+#ifndef NDEBUG
+    // Debug builds walk the live requests' tables, as the count was taken
+    // before the tables kept it, and fail on any drift. The walk sees only
+    // page-holding requests, so this must not be read while a bound table
+    // is still outside one (between Admit and the FSM event that takes it).
     std::vector<std::span<const BlockTable>> request_tables;
     request_tables.reserve(requests_.size());
     for (const auto& request : requests_) {
@@ -487,7 +499,10 @@ std::int32_t Scheduler::ActiveLcmBlocks() const {
         }
         request_tables.emplace_back(request->BlockTablesRef());
     }
-    return coordinator_.NumActiveLcmBlocks(request_tables);
+    _assert(active == coordinator_.CountActiveLcmBlocks(request_tables),
+            "the tables' active-parent count drifted from their contents");
+#endif
+    return active;
 }
 
 HostCacheStats Scheduler::GetHostCacheStats() const {
@@ -505,6 +520,8 @@ HostCacheStats Scheduler::GetHostCacheStats() const {
         .dead_entries_not_written_back = coordinator_.DeadEntriesNotWrittenBack(),
         .demoted_entries_not_written_back = coordinator_.DemotedEntriesNotWrittenBack(),
         .device_evictions = coordinator_.DeviceEvictions(),
+        .lone_compactions = coordinator_.LoneCompactions(),
+        .lone_compaction_moves = coordinator_.LoneCompactionMoves(),
         .checkpoint_resume_gaps = coordinator_.CheckpointResumeGaps(),
     };
 }
@@ -584,6 +601,7 @@ bool Scheduler::belowPrefillWatermark() const {
 }
 
 ExecutionPlan Scheduler::NextExecutionPlan(PlanOptions options) {
+    ProfileSpan profile_span{"Scheduler::NextExecutionPlan"};
     std::vector<WriteBackOperation> write_back_operations = std::exchange(pending_write_back_operations_, {});
     // Dropping a finished request drops what it still holds elsewhere -- its
     // session's registration under its access epoch -- with it.
@@ -596,6 +614,7 @@ ExecutionPlan Scheduler::NextExecutionPlan(PlanOptions options) {
     });
 
     if (storage_transfers_) {
+        ProfileSpan profile_span{"Scheduler::prepareStorage"};
         for (const auto& request : requests_) prepareStorage(*request);
     }
     std::vector<Request*> candidates;
@@ -674,6 +693,40 @@ ExecutionPlan Scheduler::NextExecutionPlan(PlanOptions options) {
                        /*plan_is_empty=*/!builds_work && write_back_operations.empty() &&
                            built.snapshot_stores.empty() && !has_storage_work && built.load_backs.empty() &&
                            built.snapshot_restores.empty() && plan.aborts.empty());
+    // The no-progress abort (docs/design/scheduler.md §1.4, §2), decided on
+    // the diagnostic's own count: at the kNoProgressAbortPlans-th consecutive
+    // stalled plan, unless lone-request compaction moved or published
+    // something in it, the request the build left blocked for capacity with
+    // no other request holding pages is aborted with a reason -- neither
+    // eviction nor compaction can ever fund its admission, nor eviction a
+    // landed image's restore that claims no cached page, so waiting would
+    // last for good. Fused role only: on the P and D roles a Submitted
+    // request stuck so has its PD transfer registered, which a scheduler
+    // abort does not conclude, so a request stuck there waits behind the
+    // warning as before. The abort ends the streak, like any plan carrying
+    // an abort: the next request stuck alone is judged on a streak of its
+    // own.
+    if (config_.role == Role::kFused && stalled_rounds_ >= kNoProgressAbortPlans &&
+        last_lone_compaction_plan_ != plan_calls_ && built.blocked_alone != nullptr) {
+        Request& stuck = *built.blocked_alone;
+        const bool restore = stuck.Is<fsm::Retracted>();
+        const std::string detail = fmt::format(
+            "no progress for {} consecutive plans with no other request holding pages: its {} needs Device pages "
+            "that {} (device LCM blocks active={}, empty={}, total={})",
+            stalled_rounds_, restore ? "restore" : "admission",
+            restore ? "eviction cannot free even when it claims no cached page"
+                    : "neither eviction nor lone-request compaction can free",
+            ActiveLcmBlocks(), EmptyLcmBlocks(), coordinator_.TotalLcmBlocks());
+        spdlog::warn("[Scheduler] no-progress abort: request {} ({} tokens) -- {}; aborting it", stuck.Id(),
+                     stuck.TokenSize(), detail);
+        plan.aborts.push_back(SchedulerAbort{
+            .request_id = stuck.Id(),
+            .reason = AbortReason::kNoProgress,
+            .detail = detail,
+        });
+        stuck.Apply(fsm::AbortEvent{&coordinator_});
+        stalled_rounds_ = 0;
+    }
     return plan;
 }
 
@@ -698,13 +751,15 @@ void Scheduler::trackStalledRounds(std::size_t num_live_requests, bool plan_is_e
         spdlog::warn(
             "[Scheduler] no work scheduled for {} consecutive rounds with {} live requests and nothing in flight "
             "(waiting={}, prefilling={}, decoding={}; device LCM blocks active={}, empty={}, total={}); "
-            "they cannot progress until a request is aborted",
+            "they cannot progress until a request is aborted (on the fused role a lone request is aborted after {} "
+            "such plans)",
             stalled_rounds_, num_live_requests, WaitingSize(), PrefillSize(), DecodingSize(), ActiveLcmBlocks(),
-            EmptyLcmBlocks(), coordinator_.TotalLcmBlocks());
+            EmptyLcmBlocks(), coordinator_.TotalLcmBlocks(), kNoProgressAbortPlans);
     }
 }
 
 void Scheduler::Advance(const ExecutionEvent& event) {
+    ProfileSpan profile_span{"Scheduler::Advance"};
     for (const auto& item : event.Events()) {
         std::visit([this](const auto& inner) { handleEvent(inner); }, item);
     }

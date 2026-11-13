@@ -126,6 +126,7 @@ class _Ranks:
         logits,
         state,
         slots,
+        offsets,
         drafted,
         logit_scale=None,
         softcap=None,
@@ -148,6 +149,7 @@ class _Ranks:
         self.landing = torch.empty((RANKS, rows, pairs), device="cuda")
         self.scale, self.softcap = logit_scale, softcap
         self.state, self.slots, self.drafted = state, slots, drafted
+        self.offsets = offsets
 
     def shard(self, rank: int) -> VocabShard:
         return VocabShard(
@@ -166,6 +168,7 @@ class _Ranks:
                 self.shards[rank],
                 self.state,
                 self.slots,
+                self.offsets,
                 self.drafted,
                 scratchpad,
                 self.shard(rank),
@@ -206,7 +209,7 @@ def test_sharded_sampling_draws_what_whole_rows_draw(dtype):
             pick(VOCAB, REQUESTS),
             False,
         )
-        ranks = _Ranks(logits, sharded, slots, None)
+        ranks = _Ranks(logits, sharded, slots, offsets, None)
         tokens = torch.empty_like(expected)
         sonic.sample(
             ranks.shards[0],
@@ -256,7 +259,7 @@ def test_sharded_verify_accepts_what_whole_rows_accept(dtype):
             if ranks is None:
                 launch, config, shard = logits, pick(VOCAB, rows), None
             else:
-                ranks = _Ranks(logits, state, slots, drafted)
+                ranks = _Ranks(logits, state, slots, offsets, drafted)
                 launch, config, shard = ranks.shards[0], ranks.config, ranks.shard(0)
             sonic.verify(
                 launch,
@@ -316,7 +319,9 @@ def test_shard_local_draft_probs_verify_as_the_whole_table_does(dtype):
             values = torch.empty((rows, MAX_K), device="cuda")
             indices = torch.empty((rows, MAX_K), dtype=torch.int32, device="cuda")
             if local:
-                ranks = _Ranks(logits, state, slots, drafted, draft_probs=draft_probs)
+                ranks = _Ranks(
+                    logits, state, slots, offsets, drafted, draft_probs=draft_probs
+                )
                 launch, config, shard = ranks.shards[0], ranks.config, ranks.shard(0)
                 table = ranks.draft_probs[0]
             else:
@@ -370,13 +375,14 @@ def test_sharded_greedy_takes_the_lowest_token_id_among_equal_maxima(dtype):
     logits[0, :] = -5.0
     logits[0, [3 * 8192 + 7, 8192 + 4000, 2 * 8192 + 8000, 2 * 8192 + 8100]] = 9.0
     state = _state(1, logits)
-    ranks = _Ranks(logits, state, slots, None)
+    offsets = torch.zeros((SLOTS,), dtype=torch.int64, device="cuda")
+    ranks = _Ranks(logits, state, slots, offsets, None)
     tokens = torch.empty((REQUESTS, 1), dtype=torch.int32, device="cuda")
     sonic.sample(
         ranks.shards[0],
         state,
         slots,
-        torch.zeros((SLOTS,), dtype=torch.int64, device="cuda"),
+        offsets,
         tokens,
         _scratchpad(ranks.shards[0]),
         ranks.config,
@@ -422,7 +428,7 @@ def test_shards_apply_the_logit_scale_and_softcap_once(dtype):
         pick(VOCAB, REQUESTS),
         False,
     )
-    ranks = _Ranks(raw, sharded, slots, None, logit_scale=0.5, softcap=15.0)
+    ranks = _Ranks(raw, sharded, slots, offsets, None, logit_scale=0.5, softcap=15.0)
     tokens = torch.empty_like(expected)
     sonic.sample(
         ranks.shards[0],

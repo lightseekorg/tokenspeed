@@ -866,7 +866,7 @@ class ModelExecutor:
         if not self.sampling_backend.supports_tree_verify:
             raise NotImplementedError(
                 f"{type(self.sampling_backend).__name__} cannot verify draft trees; "
-                "use --sampling-backend greedy, triton or flashinfer"
+                "use --sampling-backend greedy, triton, flashinfer or sonic"
             )
         if self.draft_attn_backend is self.attn_backend:
             raise NotImplementedError(
@@ -1198,7 +1198,10 @@ class ModelExecutor:
         )
 
     def autotune(self, *, keep_loaded_tactics: bool) -> None:
-        """Warm encountered kernels and optionally tune missing FlashInfer tactics; a reload keeps the tactics this process holds."""
+        """Warm kernels on the serving stream and optionally tune missing tactics.
+
+        A forward reload keeps the tactics already loaded by this process.
+        """
 
         per_rank_max_batch = max(
             1,
@@ -1259,10 +1262,16 @@ class ModelExecutor:
         )
 
         tic = time.time()
+        # Prefill can bind workspace state on first use. Prepare and run the
+        # dummy batch on the serving stream after the caller's device writes.
+        self.execution_stream.wait_stream(
+            self.device_module.current_stream(self.device)
+        )
         set_autotune_process_group(cpu_group)
         try:
             # Capture later refreshes the metadata created here in place.
             with (
+                self.device_module.stream(self.execution_stream),
                 torch.no_grad(),
                 kernel_warmup(enabled=True),
                 autotune(tune_mode=tune_mode, tuning_buckets=None, round_up=None),
@@ -1304,6 +1313,7 @@ class ModelExecutor:
                             **self._model_input_kwargs(num_tokens, ctx.bs, rows),
                         )
                     if self.drafter is not None:
+                        self.drafter.warmup_extend(num_tokens)
                         self._autotune_draft_experts(num_tokens)
                     if self.drafter is not None and not self.config.prefill_only:
                         # Prefill-only roles do not allocate decode/verify scratch.
@@ -1584,6 +1594,7 @@ class ModelExecutor:
                 ctx,
                 input_ids,
                 self._active_multimodal_context,
+                request_token_history=model_kwargs.get("request_token_history"),
             )
         if (
             mode is not None
@@ -2047,6 +2058,8 @@ class ModelExecutor:
                     )
             self._record_draft_final_cache_step(ctx.num_extends)
 
+        if self.capturable_grammar is not None:
+            self.capturable_grammar.join_post_sampler()
         return (
             output_tokens,
             accept_lengths,
@@ -2126,8 +2139,8 @@ class ModelExecutor:
         (RuntimeStates.future_draft_q, allocated by its bind_sampling_backend).
         The step drafters and DSpark sample from full-vocab logits and need
         the dense rows: whole-vocabulary rows, or this rank's columns when
-        the drafter samples from its own vocabulary shard
-        (``_draft_probs_columns``).
+        the verifier reads q per shard and the drafter can record them
+        (``_draft_probs_shard``).
         """
         if not config.enable_speculative_sampling or config.spec_draft_tree:
             return
@@ -2140,15 +2153,18 @@ class ModelExecutor:
             self.runtime_states.init_draft_probs(
                 spec_num_tokens=spec_num_tokens,
                 reject_threshold=config.spec_reject_draft_prob_threshold,
-                columns=self._draft_probs_columns(),
+                shard=self._draft_probs_shard(),
             )
 
-    def _draft_probs_columns(self) -> int | None:
-        """This rank's vocabulary columns when the drafter records q over its shard, else None for whole rows.
+    def _draft_probs_shard(self) -> tuple[int, int] | None:
+        """This rank's ``(first token, columns)`` when the drafter records q over its shard, else None for whole rows.
 
-        It does when the target's sampled rows stay vocab-sharded, the
-        verifier reads q per shard, and the drafter samples each step from a
-        head sharded alike; then no draft step gathers its logits.
+        It does when the target's sampled rows stay vocab-sharded and the
+        verifier reads q per shard. A drafter sampling each step from a head
+        sharded alike then never gathers its logits; a hot-token head
+        (Eagle3 ``d2t``), whose columns do not line up with the target's
+        shards, gathers them and records only the columns of its tokens that
+        fall in this rank's shard.
         """
         if (
             self.drafter is None
@@ -2157,16 +2173,22 @@ class ModelExecutor:
         ):
             return None
         shard = self.model_runner.model.lm_head.shard_indices
-        if not self.drafter.keep_draft_logits_vocab_sharded(
-            self.sampling_backend.supports_vocab_shard,
-            int(shard.org_vocab_start_index),
+        vocab_start = int(shard.org_vocab_start_index)
+        if self.drafter.keep_draft_logits_vocab_sharded(
+            self.sampling_backend.supports_vocab_shard, vocab_start
         ):
+            logger.info(
+                "Draft steps stay vocab-sharded: each rank samples its shard and "
+                "records q over its own columns"
+            )
+        elif self.drafter.draft_vocab_map() is not None:
+            logger.info(
+                "Draft steps gather the hot-token head's logits and each rank "
+                "records q over its own columns"
+            )
+        else:
             return None
-        logger.info(
-            "Draft steps stay vocab-sharded: each rank samples its shard and "
-            "records q over its own columns"
-        )
-        return int(shard.num_org_elements)
+        return vocab_start, int(shard.num_org_elements)
 
     def _build_sampling_info(self, bs: int, num_extends: int) -> SamplingBatchInfo:
         return SamplingBatchInfo(
@@ -2360,7 +2382,10 @@ class ModelExecutor:
         ``execution_stream`` -- the source may have been written by the
         previous forward -- and ahead of this plan's zeroing: a source may be
         re-granted and zeroed in the same plan, and the next forward's prologue
-        waits on the default stream.
+        waits on the default stream. The execution stream waits for the
+        copies too: a later plan's stream-ordered stores order behind it, and
+        a plan whose only Device work is its copies (a lone request's
+        compaction whose retry failed) runs no forward that would.
 
         Args:
             pairs: Scheduler (virtual) ``(source, destination)`` block ids per
@@ -2380,6 +2405,7 @@ class ModelExecutor:
         self.default_stream.wait_stream(self.execution_stream)
         with nvtx_range("copy_cache_pages", color="purple"):
             self.token_to_kv_pool.arena.copy_blocks(local_pairs)
+        self.execution_stream.wait_stream(self.default_stream)
 
     def zero_cache_pages(self, pages: Mapping[str, Sequence[int]] | Sequence[int]):
         """Clear newly owned pages and return a CUDA completion event when needed.
@@ -2785,17 +2811,10 @@ class ModelExecutor:
                     output_layout=output_layout,
                     query_shard=query_shard,
                 )
-                if self.config.data_parallel_size > 1:
-                    if dp_metadata is None:
-                        raise RuntimeError(
-                            "DP forward metadata must be gathered on CPU by "
-                            "the event loop before model execution."
-                        )
-                    ctx.global_num_tokens = dp_metadata.global_num_tokens
-                    ctx.global_bs = dp_metadata.global_batch_size
-                    ctx.global_num_decodes = dp_metadata.global_num_decodes
-                    ctx.all_decode_or_idle = dp_metadata.all_decode_or_idle
-                    ctx.all_extend = dp_metadata.all_extend
+                ctx.apply_dp_metadata(
+                    dp_metadata,
+                    required=self.model_runner.mapping.requires_forward_coordination,
+                )
                 with nvtx_range("sampling_prep", color="yellow"):
                     sampling_start = time.perf_counter() if timing_enabled else 0.0
                     sampling_info = self._build_sampling_info(bs, num_extends)

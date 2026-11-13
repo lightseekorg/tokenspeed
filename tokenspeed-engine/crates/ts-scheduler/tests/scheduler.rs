@@ -26,9 +26,9 @@ use std::{ffi::CString, sync::Once};
 
 use pyo3::{prelude::*, types::PyDict};
 use ts_scheduler::{
-    BlockTableView, CacheEvent, CacheEventKind, CacheOpKind, ForwardEvent, ForwardEventKind,
-    RequestSpec, Scheduler, StorageCancellationView, StorageDoneView, StorageOpKind, StorageRound,
-    StorageTickView, TransferBatchView,
+    profile, BlockTableView, CacheEvent, CacheEventKind, CacheOpKind, ForwardEvent,
+    ForwardEventKind, RequestSpec, Scheduler, StorageCancellationView, StorageDoneView,
+    StorageOpKind, StorageRound, StorageTickView, TransferBatchView,
 };
 
 /// Start the interpreter once per test process, with the scheduler module
@@ -304,6 +304,96 @@ result = (list(batch.request_ids), list(batch.input_lengths), list(batch.request
         ),
         (0, 0, 0, 0)
     );
+}
+
+#[test]
+fn a_recording_sees_the_schedulers_phases_inside_its_calls() {
+    interpreter();
+    let mut scheduler =
+        Python::attach(|py| Scheduler::from_python(&run(py, NEW_SCHEDULER)).unwrap());
+
+    profile::start();
+    // Other tests share the process: this thread's spans are the marker's.
+    drop(profile::span("marker"));
+    scheduler
+        .submit_requests(&[spec("r1", (1..=10).collect())])
+        .unwrap();
+    scheduler.next_execution_plan(true, false);
+    scheduler
+        .advance(&[event(ForwardEventKind::ExtendResult, "r1", vec![42])])
+        .unwrap();
+    // A decode step: its result is no prefill result.
+    scheduler.next_execution_plan(true, false);
+    scheduler
+        .advance(&[event(ForwardEventKind::ExtendResult, "r1", vec![43])])
+        .unwrap();
+    let recording = profile::stop();
+
+    let tid = recording
+        .spans
+        .iter()
+        .find(|span| span.name == "marker")
+        .expect("the marker span")
+        .tid;
+    let spans: Vec<_> = recording
+        .spans
+        .iter()
+        .filter(|span| span.tid == tid)
+        .collect();
+    let named = |name: &str| {
+        spans
+            .iter()
+            .find(|span| span.name == name)
+            .unwrap_or_else(|| panic!("no {name} span in {spans:#?}"))
+    };
+    let within = |inner: &profile::Span, outer: &profile::Span| {
+        outer.begin_ns <= inner.begin_ns && inner.end_ns <= outer.end_ns
+    };
+    let submit = named("Scheduler::submit_requests");
+    assert_eq!(submit.category, profile::HOST);
+    for phase in ["copyRequestSpecs", "Scheduler::SubmitRequests"] {
+        let phase = named(phase);
+        assert_eq!(phase.category, profile::SCHEDULER, "{phase:?}");
+        assert!(within(phase, submit), "{phase:?} outside {submit:?}");
+    }
+    // The control thread's call, and inside it the C++ scheduler's own spans
+    // under their category.
+    let plan = named("Scheduler::next_execution_plan");
+    assert_eq!(plan.category, profile::HOST);
+    let planned = named("Scheduler::NextExecutionPlan");
+    assert!(within(planned, plan), "{planned:?} outside {plan:?}");
+    for phase in [
+        "Scheduler::NextExecutionPlan",
+        "Scheduler::buildForwardOperations",
+        "Scheduler::buildFusedPlan",
+        "Scheduler::scheduleLocalPrefillWork",
+        "Scheduler::schedulePrefillFirstChunk",
+        "Scheduler::matchPrefixAtAdmission",
+        "ComputePrefixHashes",
+        "CacheCoordinator::ProbePromptPrefix",
+        "CacheCoordinator::Admit",
+        "planAdmission",
+        "AdmissionPlanner::fitWithEviction",
+        "CacheCoordinator::acquirePrefix",
+        "CacheCoordinator::CollectDeadEntries",
+        "ForwardBatch::ForwardBatch",
+    ] {
+        let phase = named(phase);
+        assert_eq!(phase.category, profile::SCHEDULER, "{phase:?}");
+        assert!(within(phase, planned), "{phase:?} outside {planned:?}");
+    }
+    let advance = named("Scheduler::advance");
+    assert_eq!(advance.category, profile::HOST);
+    let advanced = named("Scheduler::Advance");
+    let settle = named("Scheduler::settleFinishedRequests");
+    assert!(within(advanced, advance) && within(settle, advanced));
+    let prefill_results: Vec<_> = spans
+        .iter()
+        .filter(|span| span.name == "Scheduler::handlePrefillResult")
+        .collect();
+    assert_eq!(prefill_results.len(), 1, "{spans:#?}");
+    assert!(within(prefill_results[0], advanced));
+    assert!(recording.threads.iter().any(|(thread, _)| *thread == tid));
 }
 
 #[test]

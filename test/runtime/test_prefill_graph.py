@@ -278,6 +278,7 @@ class TestKdaPrefillFallbackTest:
                     )
 
                 capture.segments = [forward]
+                capture.segment_waits = [()]
                 for iteration in range(3):
                     with subtests.test(bs=bs, bucket=bucket, iteration=iteration):
                         scan.reset_mock()
@@ -862,8 +863,8 @@ class TestDummyGroupTablesTest:
         assert (unsharded["query_shard"]) is None
 
     def test_the_drafter_dummy_batch_prepares_the_draft_from_the_same_tables(self):
-        """The drafter's prefill-graph capture runs over a dummy extend whose
-        draft metadata comes from the same tables and lengths as the target's,
+        """The unsharded drafter's capture runs over a dummy extend whose draft
+        metadata comes from the same tables and lengths as the target's,
         through the live extend's two-step prep."""
         import torch
 
@@ -877,6 +878,7 @@ class TestDummyGroupTablesTest:
 
         calls = []
         draft_backend = _backend(
+            query_sharded=False,
             init_forward_metadata=lambda **kwargs: calls.append(("init", kwargs)),
             refresh_decode_metadata=lambda *args, **kwargs: calls.append(
                 ("refresh", args, kwargs)
@@ -1085,6 +1087,7 @@ class TestCaptureFailureIsLoudTest:
         pg.attn_backend = SimpleNamespace(
             init_prefill_graph_state=lambda **kwargs: None
         )
+        pg.token_to_kv_pool = SimpleNamespace(layerwise_load_tracker=None)
         pg.block_table = self.torch.zeros(4, 4, dtype=self.torch.int32)
         pg.config = SimpleNamespace(
             device="cpu",
@@ -1093,8 +1096,10 @@ class TestCaptureFailureIsLoudTest:
             max_num_seqs=4,
             data_parallel_size=1,
         )
-        pg._embed_tokens = SimpleNamespace(
-            weight=self.torch.zeros(2, 8, dtype=self.torch.float32)
+        pg.inner_model = SimpleNamespace(
+            embed_tokens=SimpleNamespace(
+                weight=self.torch.zeros(2, 8, dtype=self.torch.float32)
+            )
         )
 
         def _capture_all_buckets(_decode_wrapper, _entries, _observer):
@@ -1237,7 +1242,9 @@ class TestNarrowingPrefillGraphTest:
             inner.embed_tokens = object()
             model_runner = SimpleNamespace(
                 model=SimpleNamespace(model=inner),
-                model_config=SimpleNamespace(requires_request_token_history=False),
+                model_config=SimpleNamespace(
+                    requires_request_token_history=False, is_multimodal_active=False
+                ),
                 is_generation=True,
                 is_multimodal=False,
             )
@@ -1277,7 +1284,9 @@ class TestNarrowingPrefillGraphTest:
         pg._encoders = {
             256: self.mod.CapturedEncoder(
                 SimpleNamespace(
-                    replay=lambda valid_rows: calls.append(("encoder", valid_rows))
+                    replay=lambda valid_rows, noted_waits_done: calls.append(
+                        ("encoder", valid_rows)
+                    )
                 ),
                 State(256),
             )
@@ -1285,8 +1294,8 @@ class TestNarrowingPrefillGraphTest:
         pg._decoders = {
             rows: self.mod.CapturedDecoder(
                 SimpleNamespace(
-                    replay=lambda valid_rows, rows=rows: calls.append(
-                        ("decoder graph", rows, valid_rows)
+                    replay=lambda valid_rows, noted_waits_done, rows=rows: (
+                        calls.append(("decoder graph", rows, valid_rows))
                     )
                 ),
                 State(rows),
@@ -1316,7 +1325,7 @@ class TestNarrowingPrefillGraphTest:
         model, State = self._model(100, calls)
         pg = self._bare(model, State, [64, 192], calls)
         ctx = self._ctx(200)
-        hidden, aux = pg._replay_narrowed(256, ctx, 200)
+        hidden, aux = pg._replay_narrowed(256, ctx, 200, noted_waits_done=False)
         assert (calls) == (
             [
                 # The encoder replays over the padded bucket with the real
@@ -1344,7 +1353,9 @@ class TestNarrowingPrefillGraphTest:
         assert (pg._decoder_bucket(300)) is None
         assert (pg._decoder_bucket(64)) == (64)
         assert (pg._decoder_bucket(65)) == (192)
-        hidden, _ = pg._replay_narrowed(256, self._ctx(256), 256)
+        hidden, _ = pg._replay_narrowed(
+            256, self._ctx(256), 256, noted_waits_done=False
+        )
         assert (calls) == (
             [
                 ("encoder", 256),
@@ -1361,7 +1372,7 @@ class TestNarrowingPrefillGraphTest:
         model.decoder_rows = lambda ctx: 99
         pg = self._bare(model, State, [192], calls)
         with pytest.raises((RuntimeError), match=("narrowing yielded 100 rows")):
-            pg._replay_narrowed(256, self._ctx(200), 200)
+            pg._replay_narrowed(256, self._ctx(200), 200, noted_waits_done=False)
 
 
 class TestTrtllmPrefillGraphSeamsTest:

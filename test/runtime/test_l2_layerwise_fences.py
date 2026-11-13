@@ -27,14 +27,17 @@ the forward appends its new tokens to it), must first wait for that layer's
 copy: otherwise the forward reads what the block held before, or the late copy
 overwrites the rows it wrote. Each test holds the copy back on the load stream,
 runs one model's accessor sequence on a real pool and checks, once the copy has
-landed, the bytes the model saw or kept.
+landed, the bytes the model saw or kept. The last test holds back a forward
+instead and checks that the copy lands after it.
 """
 
 import os
 import sys
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 import torch
 
@@ -70,6 +73,8 @@ def host_cache(request, io_backend):
     from tokenspeed.runtime.execution.model_executor import ModelExecutor
     from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
     from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
+    from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
+    from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
     from tokenspeed.runtime.layers.attention.kv_cache.factory import (
         create_cache_arena,
         create_cache_pool,
@@ -125,6 +130,32 @@ def host_cache(request, io_backend):
         # The K3 drafts (DSpark, DFLASH2) are plain MLA views over the arena.
         recipe = kimi_recipe(draft_layers=1)
         draft_family = "mla"
+    elif family in ("mha", "mha_mxfp8"):
+        # A GQA target with a one-layer GQA draft (DFLASH, DSpark).
+        mxfp8 = family == "mha_mxfp8"
+        attn_config = AttnConfig(
+            kv_cache_dtype=torch.float8_e4m3fn if mxfp8 else torch.bfloat16,
+            kv_cache_mxfp8=mxfp8,
+            kernel_page_size=128,
+            components=(
+                MHAConfig(
+                    backend_name="mha",
+                    num_attention_heads=16,
+                    num_kv_heads=4,
+                    head_dim=128,
+                    attn_tp_size=1,
+                ),
+            ),
+            **model_wide,
+        )
+        recipe = cache_recipe(
+            "mha",
+            model_config=SimpleNamespace(num_attention_layers=2),
+            attn_config=attn_config,
+            draft_model_config=SimpleNamespace(num_attention_layers=1),
+            draft_attn_config=replace(attn_config, is_draft=True),
+            **recipe_args,
+        )
     elif family == "dsa":
         # GLM-5 / DeepSeek-V3.2: MLA latent plus an FP8 index-K plane.
         attn_config = AttnConfig(
@@ -154,6 +185,68 @@ def host_cache(request, io_backend):
         recipe = cache_recipe(
             "dsa",
             model_config=SimpleNamespace(num_attention_layers=3),
+            attn_config=attn_config,
+            draft_model_config=None,
+            draft_attn_config=None,
+            **recipe_args,
+        )
+    elif family == "mla_per_token_head":
+        # DeepSeek-V3 MLA with --kv-cache-quant-method per_token_head: FP8
+        # latent, FP32 scale and BF16 RoPE planes per layer.
+        attn_config = AttnConfig(
+            kv_cache_dtype=torch.float8_e4m3fn,
+            kernel_page_size=64,
+            components=(
+                MLAConfig(
+                    backend_name="mla",
+                    num_attention_heads=64,
+                    num_kv_heads=64,
+                    head_dim=192,
+                    attn_tp_size=1,
+                    kv_lora_rank=512,
+                    qk_nope_head_dim=128,
+                    qk_rope_head_dim=64,
+                    v_head_dim=128,
+                    scaling=1.0,
+                    kv_cache_dim=576,
+                ),
+            ),
+            **dict(model_wide, kv_cache_quant_method="per_token_head"),
+        )
+        recipe = cache_recipe(
+            "mla",
+            model_config=SimpleNamespace(num_attention_layers=2),
+            attn_config=attn_config,
+            draft_model_config=None,
+            draft_attn_config=None,
+            **recipe_args,
+        )
+    elif family == "glm53_flash":
+        from test.runtime.test_glm53_flash_cache_spec import _recipe
+
+        recipe = _recipe(tp_size=8, mla_cache_dtype=torch.bfloat16, draft_layers=1)
+    elif family == "inkling":
+        from tokenspeed.runtime.configs.inkling_config import InklingModelConfig
+
+        text_config = InklingModelConfig(num_hidden_layers=2, use_sconv=True)
+        attn_config = AttnConfig(
+            kv_cache_dtype=torch.bfloat16,
+            kernel_page_size=128,
+            components=(
+                MHAConfig(
+                    backend_name="mha",
+                    num_attention_heads=text_config.num_attention_heads,
+                    num_kv_heads=text_config.num_key_value_heads,
+                    head_dim=text_config.head_dim,
+                    attn_tp_size=1,
+                    cache_layer_types=tuple(text_config.cache_layer_types),
+                ),
+            ),
+            **model_wide,
+        )
+        recipe = cache_recipe(
+            "inkling",
+            model_config=SimpleNamespace(num_attention_layers=2, hf_config=text_config),
             attn_config=attn_config,
             draft_model_config=None,
             draft_attn_config=None,
@@ -255,6 +348,7 @@ def host_cache(request, io_backend):
                 draft_pool=draft_pool,
                 executor=executor,
                 handle=handle,
+                execution_stream=model_executor.execution_stream,
                 group=group,
                 LoadBackOp=LoadBackOp,
             )
@@ -325,6 +419,118 @@ def test_a_draft_context_write_lands_after_its_tail_page_load(host_cache):
 
 @pytest.mark.parametrize("io_backend", ["kernel", "direct"])
 @pytest.mark.parametrize(
+    "host_cache",
+    [("mla_per_token_head", "full_attention")],
+    ids=["mla_per_token_head"],
+    indirect=True,
+)
+def test_a_per_token_head_history_read_sees_its_load(host_cache):
+    """The MLA chunked prefix replay reads a Host hit's history through
+    ``get_mla_kv_buffer`` (``read_prefix_history``). With per-token-head
+    planes the read waits for the layer's load as the pool's other accessors
+    do; otherwise it sees what the pages held before."""
+    from tokenspeed.runtime.layers.paged_attention import PagedAttention
+
+    cache = host_cache
+    pool = cache.pool
+    page_size = cache.arena.prefix_granularity
+    page = 2
+    slots = torch.arange(page * page_size, (page + 1) * page_size, device="cuda")
+    layer = PagedAttention(
+        1, pool.kv_cache_dim, 1.0, 1, 0, rotary_emb=None, qk_norm=None
+    )
+    host_rows = [
+        rows.view(torch.uint8)
+        for rows in pool.get_mla_kv_buffer(layer, slots - page_size, torch.bfloat16)
+    ]
+    # Load destinations are never zeroed: give the page other bytes.
+    cache.arena.zero_blocks({"full_attention": np.asarray([page])})
+
+    with torch.cuda.stream(cache.executor.load_stream):
+        torch.cuda._sleep(_HOLD_BACK_CYCLES)
+    cache.handle.execute(
+        cache.ts.ExecutionPlan(),
+        None,
+        cache_ops=[cache.LoadBackOp(3, [cache.group], 1, page)],
+    )
+    seen = pool.get_mla_kv_buffer(layer, slots, torch.bfloat16)
+    assert not cache.executor.load_stream.query()
+    torch.cuda.synchronize()
+    assert [int(ack.op_id) for ack in cache.handle.poll_cache_results()] == [3]
+    for rows, host in zip(seen, host_rows, strict=True):
+        assert torch.equal(rows.view(torch.uint8), host)
+
+
+@pytest.mark.parametrize("io_backend", ["kernel", "direct"])
+@pytest.mark.parametrize(
+    "host_cache",
+    [("mha", "full_attention"), ("mha_mxfp8", "full_attention")],
+    ids=["mha", "mha_mxfp8"],
+    indirect=True,
+)
+def test_a_gqa_draft_context_write_lands_after_its_tail_page_load(host_cache):
+    """DFLASH / DSpark GQA drafts inject the target's context into the draft's
+    K/V cache (``set_kv_buffer``) before the draft forward's first layerwise
+    wait. On a Host tail hit the round's rows land in the loaded tail block,
+    whose draft copy lands after every target layer's."""
+    from tokenspeed.runtime.layers.paged_attention import PagedAttention
+
+    cache = host_cache
+    draft = cache.draft_pool
+    page_size = cache.arena.prefix_granularity
+    page, hit = 2, page_size // 2
+    slots = torch.arange(page * page_size + hit, (page + 1) * page_size, device="cuda")
+    generator = torch.Generator(device="cuda").manual_seed(11)
+    k, v = (
+        torch.randn(
+            page_size - hit,
+            draft.head_num,
+            draft.head_dim,
+            dtype=torch.bfloat16,
+            device="cuda",
+            generator=generator,
+        )
+        for _ in range(2)
+    )
+    layer = PagedAttention(
+        draft.head_num,
+        draft.head_dim,
+        1.0,
+        draft.head_num,
+        0,
+        rotary_emb=None,
+        qk_norm=None,
+    )
+    k_rows, v_rows = draft.get_kv_buffer(0)
+    # The rows the write leaves, from the same write into page 3.
+    draft.set_kv_buffer(layer, slots + page_size, k, v)
+    torch.cuda.synchronize()
+    expected = [rows[slots + page_size].view(torch.uint8) for rows in (k_rows, v_rows)]
+    host_rows = [
+        rows[page_size : page_size + hit].view(torch.uint8).clone()
+        for rows in (k_rows, v_rows)
+    ]
+
+    with torch.cuda.stream(cache.executor.load_stream):
+        torch.cuda._sleep(_HOLD_BACK_CYCLES)
+    cache.handle.execute(
+        cache.ts.ExecutionPlan(),
+        None,
+        cache_ops=[cache.LoadBackOp(3, [cache.group], 1, page)],
+    )
+    draft.set_kv_buffer(layer, slots, k, v)
+    draft.get_key_buffer(0)
+    assert not cache.executor.load_stream.query()
+    torch.cuda.synchronize()
+    assert [int(ack.op_id) for ack in cache.handle.poll_cache_results()] == [3]
+    start = page * page_size
+    for rows, host, written in zip((k_rows, v_rows), host_rows, expected):
+        assert torch.equal(rows[start : start + hit].view(torch.uint8), host)
+        assert torch.equal(rows[slots].view(torch.uint8), written)
+
+
+@pytest.mark.parametrize("io_backend", ["kernel", "direct"])
+@pytest.mark.parametrize(
     "host_cache", [("dsa", "full_attention")], ids=["dsa"], indirect=True
 )
 def test_an_index_k_write_lands_after_its_tail_page_load(host_cache):
@@ -372,6 +578,237 @@ def test_an_index_k_write_lands_after_its_tail_page_load(host_cache):
     assert torch.equal(
         pool.gather_index_k_rows(layer, slots, index_k_format="fp8_scaled"), expected
     )
+
+
+@pytest.mark.parametrize("io_backend", ["kernel", "direct"])
+@pytest.mark.parametrize("model", ["target", "draft"])
+@pytest.mark.parametrize(
+    "host_cache",
+    [("glm53_flash", "full_attention")],
+    ids=["glm53_flash"],
+    indirect=True,
+)
+def test_the_kpool_top_k_reads_index_pages_after_their_load(host_cache, model):
+    """GLM-5.3-Flash's KPool prefill top-k reads every prefix index page
+    through ``get_kpool_buffers`` before the layer's first layerwise wait (the
+    latent prologue). Any Host hit loads those pages; the read sees what the
+    page held before unless it waits."""
+    from test.runtime.conftest import mla_layer_id
+
+    cache = host_cache
+    view = cache.pool if model == "target" else cache.draft_pool
+    layer = mla_layer_id(view)
+    page_size = cache.arena.prefix_granularity
+    page = 2
+    slots = torch.arange(page * page_size, (page + 1) * page_size, device="cuda")
+    host_index = view.get_kpool_buffers(layer)[0][1].clone()
+    # Load destinations are never zeroed: give the page other bytes.
+    cache.arena.zero_blocks({"full_attention": np.asarray([page])})
+
+    with torch.cuda.stream(cache.executor.load_stream):
+        torch.cuda._sleep(_HOLD_BACK_CYCLES)
+    cache.handle.execute(
+        cache.ts.ExecutionPlan(),
+        None,
+        cache_ops=[cache.LoadBackOp(3, [cache.group], 1, page)],
+    )
+    seen = view.get_kpool_buffers(layer)[0][page].clone()
+    view.kv_write_target(layer, slots, None)
+    assert not cache.executor.load_stream.query()
+    torch.cuda.synchronize()
+    assert [int(ack.op_id) for ack in cache.handle.poll_cache_results()] == [3]
+    assert torch.equal(seen, host_index)
+
+
+@pytest.mark.parametrize("io_backend", ["kernel", "direct"])
+@pytest.mark.parametrize(
+    "host_cache",
+    [("glm53_flash", "full_attention")],
+    ids=["glm53_flash"],
+    indirect=True,
+)
+def test_a_kpool_write_lands_after_its_tail_page_load(host_cache):
+    """GLM-5.3-Flash writes the chunk's completed pools into the index pages
+    (``kpool_prefill_write`` through ``get_kpool_buffers``) before the layer's
+    first layerwise wait. On a Host tail hit they land in the loaded tail
+    block."""
+    from test.runtime.conftest import mla_layer_id
+
+    from tokenspeed_kernel.ops.attention.kpool import kpool_prefill_write
+
+    from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
+
+    cache = host_cache
+    pool = cache.pool
+    layer = mla_layer_id(pool)
+    page_size = cache.arena.prefix_granularity
+    page = 2
+    index = pool.get_kpool_buffers(layer)[0]
+    values, scales = pool.index_k_block_views(index)
+    rows_per_page = index.shape[1]
+    hit = rows_per_page // 2
+    write_slots = torch.arange(
+        page * rows_per_page + hit, (page + 1) * rows_per_page, device="cuda"
+    )
+    kpool = cache.recipe.attn_config.component(DSAConfig).index_kpool
+    generator = torch.Generator(device="cuda").manual_seed(7)
+    keys, gates = (
+        torch.randn(
+            rows_per_page - hit,
+            kpool,
+            pool.index_head_dim,
+            dtype=torch.bfloat16,
+            device="cuda",
+            generator=generator,
+        )
+        for _ in range(2)
+    )
+    ape = torch.randn(kpool, pool.index_head_dim, device="cuda", generator=generator)
+    # The rows the write leaves, from the same write into page 3.
+    kpool_prefill_write(keys, gates, write_slots + rows_per_page, values, scales, ape)
+    torch.cuda.synchronize()
+    expected = (
+        values[page + 1, hit:].view(torch.uint8).clone(),
+        scales[page + 1, hit:].view(torch.int32).clone(),
+    )
+    host_rows = (
+        values[1, :hit].view(torch.uint8).clone(),
+        scales[1, :hit].view(torch.int32).clone(),
+    )
+
+    with torch.cuda.stream(cache.executor.load_stream):
+        torch.cuda._sleep(_HOLD_BACK_CYCLES)
+    cache.handle.execute(
+        cache.ts.ExecutionPlan(),
+        None,
+        cache_ops=[cache.LoadBackOp(3, [cache.group], 1, page)],
+    )
+    index = pool.get_kpool_buffers(layer)[0]
+    kpool_prefill_write(keys, gates, write_slots, *pool.index_k_block_views(index), ape)
+    pool.kv_write_target(
+        layer,
+        torch.arange(page * page_size, (page + 1) * page_size, device="cuda"),
+        None,
+    )
+    assert not cache.executor.load_stream.query()
+    torch.cuda.synchronize()
+    assert [int(ack.op_id) for ack in cache.handle.poll_cache_results()] == [3]
+    assert torch.equal(values[page, :hit].view(torch.uint8), host_rows[0])
+    assert torch.equal(scales[page, :hit].view(torch.int32), host_rows[1])
+    assert torch.equal(values[page, hit:].view(torch.uint8), expected[0])
+    assert torch.equal(scales[page, hit:].view(torch.int32), expected[1])
+
+
+@pytest.mark.parametrize("io_backend", ["kernel", "direct"])
+@pytest.mark.parametrize(
+    "host_cache", [("inkling", "kvconv")], ids=["inkling"], indirect=True
+)
+def test_the_kv_short_conv_reads_its_checkpoint_after_the_load(host_cache):
+    """Inkling's K/V short conv reads the chunk's input checkpoint
+    (``kvconv_checkpoint_buffers``) before the attention prologue, the layer's
+    first layerwise wait. A Host hit loads that checkpoint; the read sees what
+    the slot held before unless it waits."""
+    cache = host_cache
+    pool = cache.pool
+    page_size = cache.arena.prefix_granularity
+    page, layer = 2, 0
+    slots = torch.arange(page * page_size, (page + 1) * page_size, device="cuda")
+    host_rows = [
+        buffer[1].clone().view(torch.uint8)
+        for buffer in pool.kvconv_checkpoint_buffers(layer)
+    ]
+    # Load destinations are never zeroed: give the slot other bytes.
+    cache.arena.zero_blocks({"kvconv": np.asarray([page])})
+
+    with torch.cuda.stream(cache.executor.load_stream):
+        torch.cuda._sleep(_HOLD_BACK_CYCLES)
+    cache.handle.execute(
+        cache.ts.ExecutionPlan(),
+        None,
+        cache_ops=[cache.LoadBackOp(3, [cache.group], 1, page)],
+    )
+    seen = [buffer[page].clone() for buffer in pool.kvconv_checkpoint_buffers(layer)]
+    pool.kv_write_target(layer, slots, None)
+    assert not cache.executor.load_stream.query()
+    torch.cuda.synchronize()
+    assert [int(ack.op_id) for ack in cache.handle.poll_cache_results()] == [3]
+    for rows, host in zip(seen, host_rows):
+        assert torch.equal(rows.view(torch.uint8), host)
+
+
+@pytest.mark.parametrize("io_backend", ["direct"])
+@pytest.mark.parametrize(
+    "host_cache", [("inkling", "kvconv")], ids=["inkling"], indirect=True
+)
+def test_a_later_layer_reads_its_checkpoint_after_its_own_load(host_cache):
+    """The read waits for the layer it reads, not for an earlier one. In a
+    load whose earlier layers land at once and whose copy of the last layer's
+    checkpoint is held back, a read of that checkpoint sees what the copy
+    brings."""
+    from tokenspeed.runtime.cache.l2.layerwise_load import LayerwiseLoadTracker
+
+    cache = host_cache
+    pool = cache.pool
+    page, layer = 2, pool.layer_num - 1
+    assert layer > 0
+    tracker = LayerwiseLoadTracker(pool.layer_num)
+    pool.register_layerwise_load_tracker(tracker)
+    buffers = pool.kvconv_checkpoint_buffers(layer)
+    host_rows = [buffer[1].clone().view(torch.uint8) for buffer in buffers]
+    # Load destinations are never zeroed: give the slot other bytes.
+    cache.arena.zero_blocks({"kvconv": np.asarray([page])})
+
+    # The load, on a stream of its own: the layer events record in layer
+    # order, as the load stream records them, and only the last layer's copy
+    # is held back, so a wait for an earlier layer returns before it lands.
+    load = tracker.begin_load()
+    events = tracker.event_sets[load]
+    load_stream = torch.cuda.Stream()
+    load_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(load_stream):
+        for earlier in range(layer):
+            events.layer_done_events[earlier].record()
+        torch.cuda._sleep(_HOLD_BACK_CYCLES)
+        for buffer in buffers:
+            buffer[page].copy_(buffer[1])
+        events.layer_done_events[layer].record()
+    tracker.set_consumers(load)
+    seen = [buffer[page].clone() for buffer in pool.kvconv_checkpoint_buffers(layer)]
+    assert not load_stream.query()
+    torch.cuda.synchronize()
+    for rows, host in zip(seen, host_rows):
+        assert torch.equal(rows.view(torch.uint8), host)
+
+
+@pytest.mark.parametrize("io_backend", ["kernel", "direct"])
+@pytest.mark.parametrize(
+    "host_cache", [("mha", "full_attention")], ids=["mha"], indirect=True
+)
+def test_a_load_lands_after_the_forwards_in_flight(host_cache):
+    """The reverse order: a load can target a block that a forward in flight
+    still writes, since an abort frees its request's blocks at once and the
+    next plan may grant one to a Host hit. A plan that zeroes and copies no
+    page (a pure-attention hit whose new tokens fit its tail block) has
+    nothing else that waits for that forward, so the load must."""
+    cache = host_cache
+    page_size = cache.arena.prefix_granularity
+    page = 2
+    k_rows, _ = cache.pool.get_kv_buffer(0)
+    host_rows = k_rows[page_size : 2 * page_size].view(torch.uint8).clone()
+    # The aborted request's forward, still writing one row of the block.
+    with torch.cuda.stream(cache.execution_stream):
+        torch.cuda._sleep(_HOLD_BACK_CYCLES)
+        k_rows[page * page_size].view(torch.uint8).fill_(0x5A)
+    cache.handle.execute(
+        cache.ts.ExecutionPlan(),
+        None,
+        cache_ops=[cache.LoadBackOp(3, [cache.group], 1, page)],
+    )
+    assert not cache.execution_stream.query()
+    torch.cuda.synchronize()
+    assert [int(ack.op_id) for ack in cache.handle.poll_cache_results()] == [3]
+    loaded = k_rows[page * page_size : (page + 1) * page_size].view(torch.uint8)
+    assert torch.equal(loaded, host_rows)
 
 
 if __name__ == "__main__":

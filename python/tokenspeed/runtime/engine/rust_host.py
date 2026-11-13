@@ -34,8 +34,8 @@ interpreter runs, plus the launcher's side:
   forward thread runs each operation the control thread queued (a plan
   becomes the ``PlannedForward`` that ``DeviceHandle`` launches); its control
   thread runs the completion queries itself (a launched forward's landed
-  results as plain lists, the cache ops' acknowledgments). The L3 tier runs
-  in the host (``ts-l3``), from the ``L3Settings`` bootstrap resolves.
+  results as metadata and CPU logprob buffers, the cache ops' acknowledgments).
+  The L3 tier runs in the host (``ts-l3``), from the ``L3Settings`` bootstrap resolves.
 
 The host covers TP, attention-DP and pipeline ranks and both PD roles (its
 own Rust transfer peer, started from ``pd/host_peer.py``'s settings);
@@ -68,6 +68,7 @@ from tokenspeed_scheduler import Scheduler
 from tokenspeed.runtime.cache.l3.config import L3Settings
 from tokenspeed.runtime.cache.l3.factory import l3_settings
 from tokenspeed.runtime.configs.model_profile import resolve_history_seed_lookback
+from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.distributed.nccl_suspend import nccl_suspend_supported
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -89,6 +90,7 @@ from tokenspeed.runtime.engine.rank_setup import (
     request_length_limits,
     scheduler_config_from_args,
 )
+from tokenspeed.runtime.engine.result_buffers import completed_result
 from tokenspeed.runtime.engine.scheduler_utils import (
     cache_event_to_payload,
     cache_ops_from_plan,
@@ -122,6 +124,7 @@ from tokenspeed.runtime.grammar.capturable_grammar import (
     resolve_grammar_completion,
 )
 from tokenspeed.runtime.grammar.host_grammar import HostGrammar, HostGrammarEntries
+from tokenspeed.runtime.grammar.inkling2_json import JsonFraming, inkling2_json_framing
 from tokenspeed.runtime.grammar.reasoning_structural_tag import (
     ReasoningGrammar,
     reasoning_grammar,
@@ -288,6 +291,26 @@ def start_rust_host(
     preexec_fn = None
     if parent_death_signal:
         preexec_fn = functools.partial(set_parent_death_signal, os.getpid())
+    # Set each native writer's fallback before the host initializes logging.
+    level = server_args.log_level.lower()
+    host_env = os.environ.copy()
+    host_env.setdefault(
+        "TS_HOST_LOG",
+        {
+            "warning": "warn",
+            "critical": "error",
+            "fatal": "error",
+            "notset": "trace",
+        }.get(level, level),
+    )
+    host_env.setdefault(
+        "SPDLOG_LEVEL",
+        {
+            "warn": "warning",
+            "fatal": "critical",
+            "notset": "trace",
+        }.get(level, level),
+    )
     with start_context:
         popen = subprocess.Popen(
             [
@@ -304,6 +327,7 @@ def start_rust_host(
                 str(server_args.enable_async_logging).lower(),
             ],
             executable=binary,
+            env=host_env,
             pass_fds=[child.fileno(), held_until_exit],
             preexec_fn=preexec_fn,
         )
@@ -332,6 +356,8 @@ class GrammarSettings:
         reasoning: How a JSON schema waits for the reasoning block of the
             ``--reasoning-parser``; None without one, or when xgrammar has
             no template for it.
+        json_framing: How the vocabulary frames a JSON answer in protocol
+            tokens for ``--reasoning-parser inkling2``; None for any other.
     """
 
     tokenizer_info: str
@@ -339,6 +365,7 @@ class GrammarSettings:
     compile_timeout_s: float
     max_retries: int
     reasoning: ReasoningGrammar | None
+    json_framing: JsonFraming | None
 
 
 def grammar_tokenizer_info(tokenizer, vocab_size: int, eos_token_ids) -> str:
@@ -381,6 +408,24 @@ class EplbSettings:
     ep_ranks: tuple[int, ...]
 
 
+def dp_coordination_ranks(
+    mapping: Mapping, *, requires_forward_coordination: bool, shared_l3: bool
+) -> tuple[int, ...] | None:
+    """The ranks the control plane keeps in step each round, or None.
+
+    Attention-DP workers whose forwards span workers gather per-round DP
+    metadata and run idle forwards for peers with work; workers that share a
+    Mooncake namespace agree their flushes. Workers that only share immutable
+    expert weights do neither: they keep their DP rank for routing and advance
+    independently.
+    """
+    if not mapping.has_attn_dp:
+        return None
+    if not (requires_forward_coordination or shared_l3):
+        return None
+    return tuple(mapping.world_group)
+
+
 @dataclass(frozen=True)
 class HostConfig:
     """What the host's control plane is configured from.
@@ -418,7 +463,9 @@ class HostConfig:
             the frontend.
         pp_ranks: With pipeline parallelism, this rank's pipeline, in stage
             order; the last stage samples. None without.
-        dp_ranks: With attention DP, every rank: their forwards run in step.
+        dp_ranks: The ranks whose rounds the control plane keeps in step:
+            with attention DP, every rank, when forwards span workers or a
+            shared L3 namespace needs agreed flushes (``dp_coordination_ranks``).
             None without.
         collective_bind_host: Where the rank listens for the other ranks'
             collective connections.
@@ -448,6 +495,7 @@ class HostConfig:
         log_spec_accept_lengths: ``TOKENSPEED_LOG_SPEC_ACCEPT_LENGTHS``.
         finish_log: This rank logs each request's finish line: the
             attention-TP group's first rank.
+        ttft_trace_sampling_percentage: Percentage of PD rooms to log at bootstrap and first output.
         log_request_stats: ``--enable-log-request-stats``: the finish line is
             the request's timing summary.
         kv_events: The scheduler records KV cache events
@@ -524,6 +572,7 @@ class HostConfig:
     log_spec_accept_lengths: bool
     finish_log: bool
     log_request_stats: bool
+    ttft_trace_sampling_percentage: int
     kv_events: bool
     kv_events_publisher: KVEventsConfig | None
     otlp_traces_endpoint: str | None
@@ -578,30 +627,6 @@ class _Dispatched:
 
     results: ModelExecutionResult
     forward_mode: ForwardMode
-
-
-def _logprob_lists(results) -> tuple | None:
-    """A forward's prompt-row logprobs and top-k alternatives as lists, None
-    when it computed none."""
-
-    def top(values, ids):
-        return (values.tolist(), ids.tolist()) if values is not None else None
-
-    if (
-        results.input_token_logprobs is None
-        and results.input_top_logprobs_val is None
-        and results.output_top_logprobs_val is None
-    ):
-        return None
-    return (
-        (
-            results.input_token_logprobs.tolist()
-            if results.input_token_logprobs is not None
-            else None
-        ),
-        top(results.input_top_logprobs_val, results.input_top_logprobs_idx),
-        top(results.output_top_logprobs_val, results.output_top_logprobs_idx),
-    )
 
 
 class HostDataPlane:
@@ -664,8 +689,12 @@ class HostDataPlane:
 
     def exit_forward_thread(self) -> None:
         """The forward thread's last call, once nothing more is queued:
-        finish a drafter's pending round before the caches close."""
-        self._device.settle()
+        finish a drafter's pending round, then release the expert weights
+        this rank shares with other ranks, before the caches close."""
+        try:
+            self._device.settle()
+        finally:
+            self._device.shutdown_model()
 
     def admit(
         self,
@@ -819,17 +848,7 @@ class HostDataPlane:
             ),
         )
 
-    def complete(self, dispatched: _Dispatched) -> tuple[
-        list[int],
-        list[int],
-        list[float] | None,
-        list[int] | None,
-        list[list[int]] | None,
-        tuple[int, float] | None,
-        list[int] | None,
-        tuple | None,
-        list[float] | None,
-    ]:
+    def complete(self, dispatched: _Dispatched) -> tuple:
         """Wait for a forward's host copies to land (the control thread: the
         event wait releases the interpreter lock), and return its sampled
         tokens, kept lengths, logprobs, NaN flags and, on the P role, each
@@ -840,40 +859,19 @@ class HostDataPlane:
         grammar; and, when the forward computed any, its planned prompt
         rows' logprobs, their top-k alternatives and the prefill rows'
         sampled-token alternatives (values and ids each), None for those it
-        did not."""
+        did not. Numeric logprob buffers retain CPU storage while Rust copies
+        them into owned vectors; no per-element Python list is built."""
         results = dispatched.results
         results.sync()
         compiles = compile_stats() if self._report_compiles else None
-        return (
-            results.output_tokens.tolist(),
-            results.output_lengths.tolist(),
-            (
-                results.output_logprobs.tolist()
-                if results.output_logprobs is not None
-                else None
-            ),
-            (
-                results.output_nan_flags.tolist()
-                if results.output_nan_flags is not None
-                else None
-            ),
-            (
-                [list(row) for row in results.next_input_ids.tolist()]
-                if results.next_input_ids is not None
-                else None
-            ),
-            (
+        return completed_result(
+            results,
+            serving_compiles=(
                 (compiles.serving_compiles, compiles.serving_seconds)
                 if compiles is not None
                 else None
             ),
-            resolve_grammar_completion(results),
-            _logprob_lists(results),
-            (
-                results.output_token_cumulative_probs.tolist()
-                if results.output_token_cumulative_probs is not None
-                else None
-            ),
+            grammar_terminated_at=resolve_grammar_completion(results),
         )
 
     def note_committed(self, dispatched: _Dispatched) -> None:
@@ -1148,6 +1146,7 @@ class HostBootstrap:
         port_args: PortArgs,
         connection: Connection,
         pd_outbox,
+        host_spans,
         metrics_relay_endpoint: str | None,
     ) -> None:
         self._server_args = server_args
@@ -1408,7 +1407,11 @@ class HostBootstrap:
                     )
                 ),
                 pp_ranks=tuple(mapping.pp_group) if mapping.has_pp else None,
-                dp_ranks=tuple(mapping.world_group) if mapping.has_attn_dp else None,
+                dp_ranks=dp_coordination_ranks(
+                    mapping,
+                    requires_forward_coordination=specs.requires_forward_coordination,
+                    shared_l3=l3 is not None,
+                ),
                 # One node's ranks reach each other on loopback.
                 collective_bind_host="127.0.0.1" if mapping.nnodes == 1 else "0.0.0.0",
                 multimodal=model_config.is_multimodal_active,
@@ -1434,6 +1437,7 @@ class HostBootstrap:
                 log_spec_accept_lengths=envs.TOKENSPEED_LOG_SPEC_ACCEPT_LENGTHS.get(),
                 finish_log=attn_tp_rank == 0,
                 log_request_stats=server_args.enable_log_request_stats,
+                ttft_trace_sampling_percentage=server_args.ttft_trace_sampling_percentage,
                 kv_events=kv_events,
                 kv_events_publisher=(
                     kv_events_config
@@ -1470,6 +1474,11 @@ class HostBootstrap:
                         ),
                         max_retries=int(server_args.grammar_compile_max_retries),
                         reasoning=reasoning,
+                        json_framing=inkling2_json_framing(
+                            server_args.reasoning_parser,
+                            tokenizer,
+                            model_config.vocab_size,
+                        ),
                     )
                     if server_args.grammar_backend == "xgrammar"
                     else None
@@ -1520,6 +1529,7 @@ class HostBootstrap:
                             else mapping.attn.tp_group
                         ),
                     ),
+                    host_spans=host_spans,
                 ),
                 regions,
                 report_compiles=self.config.engine_metrics,
@@ -1619,12 +1629,17 @@ class HostBootstrap:
 
 
 def bootstrap(
-    control_fd: int, pd_outbox, weight_update_commit_protocol: int = 0
+    control_fd: int,
+    pd_outbox,
+    weight_update_commit_protocol: int = 0,
+    host_spans=None,
 ) -> HostBootstrap | EncodeBootstrap:
     """Build this host's rank from the arguments the launcher sends on
     ``control_fd``; with PD, its transfer peer reaches the host through
     ``pd_outbox`` (see ``pd/host_peer.py``). An EPD encode rank runs the
-    host's encode mode instead (``epd/encode_host.py``)."""
+    host's encode mode instead (``epd/encode_host.py``). ``host_spans`` is
+    the host's span recording, which a profile merges into its trace
+    (``engine/profiler.py``); an older host binary passes none."""
     connection = Connection(control_fd)
     server_args, port_args, metrics_relay_endpoint = connection.recv()
     # Reject an older host binary before constructing a model or process
@@ -1640,7 +1655,12 @@ def bootstrap(
     if server_args.disaggregation_mode == "encode":
         return EncodeBootstrap(server_args, port_args, connection)
     return HostBootstrap(
-        server_args, port_args, connection, pd_outbox, metrics_relay_endpoint
+        server_args,
+        port_args,
+        connection,
+        pd_outbox,
+        host_spans,
+        metrics_relay_endpoint,
     )
 
 

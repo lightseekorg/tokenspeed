@@ -81,6 +81,7 @@ from collections.abc import Callable, Iterable
 
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel.ops.attention.prologue import ConvBatch
 from tokenspeed_kernel.ops.attention.rmha.triton import (
     log_scaling_tau as compute_log_scaling_tau,
 )
@@ -125,6 +126,7 @@ from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
+from tokenspeed.runtime.models.base.input_embedding import DecoderInputEmbedding
 from tokenspeed.runtime.models.deepseek_v3 import MoEGate as _DSV3MoEGate
 from tokenspeed.runtime.multimodal.embedder import (
     EncoderSpec,
@@ -344,29 +346,49 @@ class InklingShortConvolution(nn.Module):
             self.channel_offset,
             self.dim,
             conv_group=conv_group,
+            dynamic_weights=None,
+            output_scale=1.0,
+            token_range=None,
         )
 
 
-def _sconv_apply(
-    x: torch.Tensor,
-    weight: torch.Tensor,
+def _sconv_publishes_live(backend, md) -> bool:
+    """Whether a forward's convolutions write their chunk-end window to the
+    live slot: extend chunks, one-token decodes and draft chunks do; a target
+    verify publishes its accepted window after acceptance instead."""
+    return md.num_extends > 0 or backend.conv_spec_num_tokens == 1 or backend.is_draft
+
+
+def sconv_decodes_without_publish(ctx: ForwardContext) -> bool:
+    """Whether this forward's convolutions run the decode kernel without a
+    live publish (a target verify), the convolution ``all_reduce_sconv`` serves."""
+    if ctx.forward_mode.is_extend_or_mixed():
+        return False
+    backend = ctx.attn_backend
+    return not _sconv_publishes_live(backend, backend.conv_decode_metadata)
+
+
+def _sconv_stream(
     ctx: ForwardContext,
     layer_id: int,
     channel_offset: int,
     dim: int,
     conv_group: str,
-) -> torch.Tensor:
-    """Run one sconv stream (or several adjacent ones fused) over ``x``.
+) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], ConvBatch]:
+    """Register one sconv stream (or several adjacent ones) for this forward.
 
-    ``weight`` is ``[dim, W]``; ``channel_offset``/``dim`` select the state
-    channels in the layer's conv pool buffer. Fusing adjacent streams (K+V)
-    is just a wider ``dim`` with concatenated weights. The checkpoint bridges
-    are mandatory and fused: extend chunks tap the input checkpoint at their
-    start (the prefill kernel never reads the ring), decode rounds tap the
-    ring (the decode kernel never reads the checkpoint blocks), and the
-    chunk-end window is published to the live slot in-kernel whenever the
-    chunk ends at the committed frontier -- a target verify publishes its
-    accepted window after acceptance instead.
+    ``channel_offset``/``dim`` select the state channels in the layer's conv
+    pool buffer. The checkpoint bridges are mandatory and fused: extend chunks
+    tap the input checkpoint at their start (the prefill kernel never reads
+    the ring), decode rounds tap the ring (the decode kernel never reads the
+    checkpoint blocks), and the chunk-end window is published to the live
+    slot in-kernel whenever the chunk ends at the committed frontier -- a
+    target verify publishes its accepted window after acceptance instead.
+
+    Returns:
+        The stream's channel slice of the layer's ``[slots, R, conv_dim]``
+        ring, its checkpoint fields (one per adjacent stream), and the ring
+        addressing of this forward.
     """
     backend = ctx.attn_backend
     # Same routing as the dense metadata: prefill-family forwards read the
@@ -385,6 +407,17 @@ def _sconv_apply(
     if conv_group == "kvconv":
         checkpoint_group = "kvconv"
         checkpoint_buffers = ctx.token_to_kv_pool.kvconv_checkpoint_buffers(layer_id)
+        k_width, v_width = (buffer.shape[-1] for buffer in checkpoint_buffers)
+        if channel_offset == 0 and dim == k_width + v_width:
+            pass
+        elif channel_offset == 0 and dim == k_width:
+            checkpoint_buffers = (checkpoint_buffers[0],)
+        elif channel_offset == k_width and dim == v_width:
+            checkpoint_buffers = (checkpoint_buffers[1],)
+        else:
+            raise ValueError(
+                "KV convolution stream must cover K, V, or their adjacent union"
+            )
     elif conv_group in ("attnconv", "mlpconv"):
         checkpoint_group, buffer = ctx.token_to_kv_pool.hiddenconv_checkpoint(
             layer_id, conv_group
@@ -406,22 +439,61 @@ def _sconv_apply(
             md,
             checkpoint_group,
         )
+    return (
+        state,
+        checkpoint_buffers,
+        ConvBatch(
+            cu_seqlens=md.query_start_loc,
+            seq_idx=md.seq_idx,
+            cache_indices=md.cache_indices,
+            has_initial_state=md.has_initial_state,
+            seq_lens=md.seq_lens,
+            block_table=md.col_block_table[checkpoint_group],
+            num_extends=md.num_extends,
+            publish_live=_sconv_publishes_live(backend, md),
+        ),
+    )
+
+
+def _sconv_apply(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    ctx: ForwardContext,
+    layer_id: int,
+    channel_offset: int,
+    dim: int,
+    conv_group: str,
+    *,
+    dynamic_weights: torch.Tensor | None,
+    output_scale: float,
+    token_range: tuple[int, int] | None,
+) -> torch.Tensor:
+    """Run one sconv stream (or several adjacent ones fused) over ``x``.
+
+    ``weight`` is ``[dim, W]``. Fusing adjacent streams (K+V) is just a wider
+    ``dim`` with concatenated weights; see :func:`_sconv_stream`.
+    ``token_range`` computes only those prefill rows (``inkling_ring_sconv``).
+    """
+    state, checkpoint_buffers, batch = _sconv_stream(
+        ctx, layer_id, channel_offset, dim, conv_group
+    )
     return inkling_ring_sconv(
         x,
         weight,
         state,
-        md.query_start_loc,
-        md.seq_idx,
-        md.cache_indices,
-        md.has_initial_state,
-        md.seq_lens,
-        md.col_block_table[checkpoint_group],
+        batch.cu_seqlens,
+        batch.seq_idx,
+        batch.cache_indices,
+        batch.has_initial_state,
+        batch.seq_lens,
+        batch.block_table,
         checkpoint_buffers[0],
         checkpoint_buffers[1] if len(checkpoint_buffers) == 2 else None,
-        num_extends=md.num_extends,
-        publish_live=(
-            md.num_extends > 0 or backend.conv_spec_num_tokens == 1 or backend.is_draft
-        ),
+        num_extends=batch.num_extends,
+        publish_live=batch.publish_live,
+        dynamic_weights=dynamic_weights,
+        output_scale=output_scale,
+        token_range=token_range,
     )
 
 
@@ -611,6 +683,9 @@ class InklingAttention(nn.Module):
                     self._kv_channel_offset,
                     2 * self.kv_size,
                     conv_group="kvconv",
+                    dynamic_weights=None,
+                    output_scale=1.0,
+                    token_range=None,
                 )
             k = kv[:, : self.kv_size]
             v = kv[:, self.kv_size :]
@@ -1445,7 +1520,7 @@ class InklingTextModel(nn.Module):
     def get_input_embeddings(self):
         return self.embed_tokens
 
-    def mm_text_embedding(self):
+    def mm_text_embedding(self) -> DecoderInputEmbedding:
         """Text-token embedding for the MM embed path.
 
         Folds ``embed_norm`` into the lookup so the ``VisionEmbedder`` norms
@@ -1455,16 +1530,9 @@ class InklingTextModel(nn.Module):
         attribute is the clamp bound the embedder uses for the
         hash-derived multimodal pad ids in ``input_ids``.
         """
-        embed_tokens, embed_norm = self.embed_tokens, self.embed_norm
-
-        def embed(input_ids: torch.Tensor) -> torch.Tensor:
-            embeds = embed_tokens(input_ids)
-            return embed_norm(embeds) if embed_norm is not None else embeds
-
-        embed.num_embeddings = embed_tokens.num_embeddings
-        embed.embedding_dim = embed_tokens.embedding_dim
-        embed.weight = embed_tokens.weight
-        return embed
+        return DecoderInputEmbedding(
+            lookup=self.embed_tokens, transform=self.embed_norm
+        )
 
     def forward(
         self,
@@ -1487,6 +1555,7 @@ class InklingTextModel(nn.Module):
                 positions,
                 self.config.log_scaling_n_floor,
                 self.config.log_scaling_alpha,
+                torch_order=False,
             )
 
         residual = None
@@ -1608,6 +1677,10 @@ class InklingForConditionalGeneration(nn.Module):
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
+
+    def get_decoder_input_embedding(self) -> DecoderInputEmbedding:
+        """Normalize text lookup before the supplied-embedding decoder branch."""
+        return self.model.mm_text_embedding()
 
     def get_embed_and_head(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Weights the MTP draft model shares (see inkling_nextn.py)."""
