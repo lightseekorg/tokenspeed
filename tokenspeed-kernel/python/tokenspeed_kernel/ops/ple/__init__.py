@@ -45,7 +45,6 @@ from tokenspeed_kernel.ops.ple.triton import (
     _ple_gate_norm_kernel,
     _ple_host_gather_kernel,
     _ple_host_gather_persistent_kernel,
-    _ple_page_gather_kernel,
     _ple_page_gather_pair_kernel,
     _ple_page_scatter_kernel,
 )
@@ -58,7 +57,6 @@ __all__ = [
     "ple_host_gather",
     "ple_ngram_ids",
     "prepare_ngram_reciprocals",
-    "ple_page_gather",
     "ple_page_gather_pair",
     "ple_page_scatter",
 ]
@@ -298,46 +296,6 @@ def ple_ngram_ids(
         **({"launch_pdl": True} if use_pdl else {}),
     )
     return ids, tail
-
-
-def ple_page_gather(
-    field: torch.Tensor,
-    page_ids: torch.Tensor,
-    row_stride: int,
-    default: int | float = 0,
-) -> torch.Tensor:
-    """Read one cache row per page id, with null pages read as ``default``.
-
-    Args:
-        field: Cache field whose first dimension is indexed by page id.
-        page_ids: One page id per output row; id 0 is the null page.
-        row_stride: Element stride between pages, which the arena may pad past
-            the row's own extent.
-        default: Value substituted for every null-page row.
-
-    Returns:
-        A tensor shaped ``[len(page_ids), *field.shape[1:]]``.
-    """
-
-    rows = page_ids.shape[0]
-    out = field.new_empty((rows, *field.shape[1:]))
-    if rows == 0:
-        return out
-    numel = out[0].numel()
-    block = min(1024, _triton.next_power_of_2(numel))
-    use_pdl = pdl_enabled()
-    _ple_page_gather_kernel[(rows, _triton.cdiv(numel, block))](
-        field,
-        page_ids,
-        out,
-        default,
-        row_stride,
-        numel,
-        ENABLE_PDL=use_pdl,
-        BLOCK=block,
-        **({"launch_pdl": True} if use_pdl else {}),
-    )
-    return out
 
 
 def ple_page_gather_pair(

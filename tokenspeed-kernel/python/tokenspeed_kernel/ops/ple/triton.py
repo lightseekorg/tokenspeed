@@ -29,8 +29,8 @@ virtual sequence ``[carried state | tokens]`` and picks the source per tap:
 
 - ``_ngram_ids_kernel``: per-token n-gram hash ids, optionally emitting the
   raw trailing window from the same loads.
-- ``_ple_page_gather_kernel`` / ``_ple_page_scatter_kernel``: one cache row per
-  page id, treating page id 0 as the null page.
+- ``_ple_page_gather_pair_kernel`` / ``_ple_page_scatter_kernel``: read the context
+  and conv state together, or write a cache row per page ID. Page ID 0 is null.
 - ``_ple_dilated_conv_kernel``: dilated depthwise conv + SiLU with an epilogue
   that folds up to two full-width addends and the verify-scratch windows.
 - ``_ple_conv_state_kernel``: one launch combining convolution and request
@@ -175,43 +175,6 @@ def _exact_remainder(value, divisor, reciprocal):
     q = tl.umulhi(n, reciprocal.to(tl.uint64))
     r = n - q * d
     return tl.where(d == 1, 0, tl.where(r >= d, r - d, r)).to(tl.int64)
-
-
-@triton.jit
-def _ple_page_gather_kernel(
-    field_ptr,
-    page_ptr,
-    out_ptr,
-    default,
-    field_row_stride,
-    N,
-    ENABLE_PDL: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    """Read one cache row per page id, substituting ``default`` for null pages.
-
-    Page id 0 is the null page, so its row is replaced rather than read. The
-    masked load supplies the fill, which keeps the replacement inside the one
-    pass instead of allocating a full-size ``default`` block and selecting
-    against it. ``field_row_stride`` carries the plan's page stride, which the
-    arena is free to pad past the row's own extent.
-    """
-
-    row = tl.program_id(0)
-    off = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    mask = off < N
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_wait()
-    page = tl.load(page_ptr + row).to(tl.int64)
-    field_dtype = field_ptr.dtype.element_ty
-    value = tl.load(
-        field_ptr + tl.maximum(page, 0) * field_row_stride + off,
-        mask=mask & (page > 0),
-        other=default.to(field_dtype),
-    )
-    tl.store(out_ptr + row * N + off, value, mask=mask)
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit

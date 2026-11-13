@@ -31,7 +31,6 @@ from tokenspeed_kernel.ops.ple import (
     ple_conv_sequences,
     ple_gate_norm,
     ple_ngram_ids,
-    ple_page_gather,
     ple_page_gather_pair,
     ple_page_scatter,
     prepare_ngram_reciprocals,
@@ -523,20 +522,13 @@ class Qwen4ExpPLELayer(nn.Module):
         page_ids: torch.Tensor,
         default: int | float = 0,
     ) -> torch.Tensor:
-        """One cache row per page id, with null pages read as ``default``."""
+        """Read cache rows on the CPU, substituting ``default`` for null pages."""
 
-        if not field.is_cuda:
-            page_ids = page_ids.to(torch.long)
-            valid = page_ids > 0
-            values = field.index_select(0, page_ids.clamp_min(0))
-            mask = valid.view(-1, *([1] * (values.ndim - 1)))
-            return torch.where(mask, values, torch.full_like(values, default))
-        return ple_page_gather(
-            field,
-            page_ids,
-            Qwen4ExpPLELayer._page_row_stride(field),
-            default,
-        )
+        page_ids = page_ids.to(torch.long)
+        valid = page_ids > 0
+        values = field.index_select(0, page_ids.clamp_min(0))
+        mask = valid.view(-1, *([1] * (values.ndim - 1)))
+        return torch.where(mask, values, torch.full_like(values, default))
 
     @staticmethod
     def _write_pages(

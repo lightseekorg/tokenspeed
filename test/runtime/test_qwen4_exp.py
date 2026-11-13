@@ -3028,7 +3028,7 @@ def test_ngram_ids_flat_kernel_matches_legacy(
 
 
 @_requires_cuda
-def test_ple_page_gather_pair_matches_separate_reads() -> None:
+def test_ple_page_gather_pair_matches_cpu_reads() -> None:
     context = torch.empty((3, 4), dtype=torch.long, device="cuda")[:, :2]
     conv_storage = torch.empty((3, 32), dtype=torch.bfloat16, device="cuda")
     conv = conv_storage.as_strided((3, 4, 6), (32, 6, 1))
@@ -3039,10 +3039,11 @@ def test_ple_page_gather_pair_matches_separate_reads() -> None:
     actual_context, actual_conv = ple_page_gather_pair(
         context, conv, pages, context.stride(0), conv.stride(0), 99
     )
-    expected_context = Qwen4ExpPLELayer._read_pages(context, pages, 99)
-    expected_conv = Qwen4ExpPLELayer._read_pages(conv, pages)
-    torch.testing.assert_close(actual_context, expected_context)
-    torch.testing.assert_close(actual_conv, expected_conv)
+    cpu_pages = pages.cpu()
+    expected_context = Qwen4ExpPLELayer._read_pages(context.cpu(), cpu_pages, 99)
+    expected_conv = Qwen4ExpPLELayer._read_pages(conv.cpu(), cpu_pages)
+    torch.testing.assert_close(actual_context.cpu(), expected_context, atol=0, rtol=0)
+    torch.testing.assert_close(actual_conv.cpu(), expected_conv, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("lengths", _PLE_LENGTH_CASES)
@@ -3303,7 +3304,7 @@ def test_ple_conv_accepts_precomputed_starts() -> None:
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="fused PLE page access requires CUDA"
 )
-def test_ple_page_access_skips_null_pages_and_page_padding() -> None:
+def test_ple_page_scatter_skips_null_pages_and_page_padding() -> None:
     pages, channels, state = 6, 4, 3
     row_numel = channels * state
     # The plan may pad a page past the row it holds, so the field view is
@@ -3314,13 +3315,6 @@ def test_ple_page_access_skips_null_pages_and_page_padding() -> None:
     base = torch.randn(pages * (row_numel + pad), dtype=torch.bfloat16, device="cuda")
     field = base.as_strided((pages, channels, state), (row_numel + pad, state, 1))
     page_ids = torch.tensor([2, 0, 4], dtype=torch.int32, device="cuda")
-
-    read = Qwen4ExpPLELayer._read_pages(field, page_ids, 1.5)
-
-    # Page id 0 is the null page and reads as the default instead.
-    assert torch.equal(read[0], field[2])
-    assert torch.equal(read[2], field[4])
-    assert torch.equal(read[1], torch.full_like(read[1], 1.5))
 
     values = torch.randn(3, channels, state, dtype=torch.bfloat16, device="cuda")
     before = base.clone()
@@ -3340,14 +3334,17 @@ def test_ple_page_access_skips_null_pages_and_page_padding() -> None:
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="fused PLE page access requires CUDA"
 )
-def test_ple_page_read_keeps_int64_default_exact() -> None:
+def test_ple_page_gather_pair_keeps_int64_default_exact() -> None:
     context = torch.zeros(4, 2, dtype=torch.int64, device="cuda")
     context[3] = torch.tensor([11, 12], device="cuda")
+    conv = torch.zeros(4, 2, 4, dtype=torch.bfloat16, device="cuda")
     page_ids = torch.tensor([3, 0], dtype=torch.int32, device="cuda")
     # Past fp32's exactly-representable range: the fill must stay integral.
     eos = 2**33 + 1
 
-    read = Qwen4ExpPLELayer._read_pages(context, page_ids, eos)
+    read, _ = ple_page_gather_pair(
+        context, conv, page_ids, context.stride(0), conv.stride(0), eos
+    )
 
     assert read.dtype == torch.int64
     assert torch.equal(read[0], context[3])
