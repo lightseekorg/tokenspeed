@@ -161,7 +161,38 @@ capture. Choose `default` for upstream FlashInfer, `expected_m` for the per-call
 hint backport, or `optimized` to also enable expert-tile prefix sums and direct
 tile-to-expert lookup. Both private modes accept independent pipeline stage
 caps for FC1 and FC2.
-Existing `moe_plan` selection stays unchanged.
+The `cute_dsl` MoE solution connects prepared routes to this native consumer
+through `moe_plan`, `moe_process_weights`, and `moe_apply`. Select it explicitly
+for BF16 inputs with a positive width divisible by 128, block-FP8 weights,
+standard SwiGLU, and top-k in
+1..32 with distinct expert IDs per token. This constraint also covers calls
+that use native input preparation, whose permutation requires distinct IDs.
+The standalone route quantizer accepts repeated IDs, but that broader contract
+does not extend to the complete MoE solution.
+It prepares two cached native modules before processing weights. Batches of at
+most 16 tokens use FC1 stage cap 4 and expert lookup; larger batches use the
+original stage and lookup policies. Both retain native FC2 and expected-M
+selection. Module compilation happens during initialization, before warmup and
+graph capture; weight preprocessing runs once and both modules share the same
+processed tensors. Existing higher-priority MoE solutions retain their
+automatic selection preference.
+
+At TP=1, any positive token count within the fused indexing bound and supported
+local expert counts use the registered route quantizer. Unsupported layouts,
+extents, TP configurations, and larger local expert counts use the selected
+native callable's input preparation. Every call owns its
+route buffers; graph capture keeps the allocator's captured storage alive.
+Both paths preserve native GEMM and finalized-output semantics. Deferred output,
+all-to-all, clamped activation, and the batch-invariant numerical envelope are
+not advertised by this solution.
+
+Hidden width and local expert count come from the prepared weight tensors;
+the input quantizer does not assume a particular expert intermediate size.
+Width and top-k are model-static compilation parameters. Tests vary routing,
+expert-count boundaries, widths and intermediate sizes independently using
+synthetic tensors. The E4M3 weights, FP32 scales and 128x128 scale blocks follow
+the native block-FP8 contract. Other quantization formats remain separate
+registry choices; tensors are never reinterpreted to fit this solution.
 
 ```python
 from tokenspeed_kernel.ops.moe import prepare_sm90_fp8_moe
@@ -580,6 +611,98 @@ hidden width. Some kernels (Triton MXFP4) return no weights; `MoELayer` then
 returns the precomputed route weights it passed in. FP16 inputs, ROCm builds
 without the fused finalizer, and kernels without deferred finalize keep the
 kernel's own finalized output.
+
+## Route packing and input quantization
+
+`route_quant_fp8(input, ids, experts=..., expert_offset=..., solution=...)`
+produces packed block-FP8 rows and their native expert offsets in one launch.
+The Hopper implementation accepts BF16 inputs with a positive width divisible
+by 128, a contiguous local interval with 1–1024 experts, and model-static top-k
+values from 1 to 32.
+Negative and nonlocal IDs have inverse row -1 and produce no packed row.
+Every integer N from 1 through 4096 is supported, subject to
+`tokens * topk * hidden <= 2**31 - 1`; the model geometry bounds above still
+apply. An empty MoE input returns an empty output before invoking the producer.
+For N > 4096 the registered MoE path retains native preprocessing.
+The compilation buckets are 1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048,
+and 4096. Select the smallest
+bucket at least as large as N: for example, 3 and 7 share bucket 8, while
+129, 192, and 255 share bucket 256. Buckets select code, not accepted input
+sizes: inputs and route maps use actual N, without padding to a bucket.
+These are API bounds; validation and performance coverage must be established
+for a model before selecting this producer in its execution plan.
+
+Quantization uses `cute.math.div(approx=True, ftz=True)` and
+`cute.arch.rcp_approx` to retain the native approximate division and
+flush-to-zero reciprocal. Ordinary division or a differently rounded
+reciprocal is not an interchangeable numerical contract.
+
+The CuTe input quantizer uses the aligned four-value reader in
+`thirdparty/cute_dsl/memory.py`. Callers supply valid eight-byte-aligned
+global addresses and retain their own bounds checks;
+the helper preserves BF16/FP16-to-FP32 conversion and element order.
+
+A `PreparedMoEInput` retains the original inputs, the packed data, and the
+same invocation's maps. Its logical inverse map is `[tokens, topk]` with
+native slot-major storage. Only rows below `offsets[-1]` and their referenced
+scale entries are initialized. Consumers must use these maps together and
+keep the object alive until their reads complete. Refresh uses the original
+input objects and existing output storage after earlier readers retire.
+
+Model dimensions and token buckets select compiled variants. Actual N is an
+explicit runtime scalar. Each non-decode bucket has a full-bucket and a
+partial-bucket specialization of the same algorithm (21 variants at most per
+model geometry/device). The former retains constant N-dependent strides;
+the latter accepts every smaller N in the bucket. Warming a bucket compiles
+both variants so later capture requires no new compilation. The input and packed-row strides remain fixed by
+model dimensions. The slot-major inverse stride uses actual N, and the padded
+scale stride is passed at runtime.
+Warm one N in each selected bucket before graph capture; another N in that
+bucket reuses the compiled code. Each captured graph still binds its own N,
+buffers, and launch geometry. Replay refreshes metadata from the live input
+tensors; it does not change N or run the Python dispatcher.
+
+N=1 keeps the decode kernel. For 2 <= N <= 128, each CTA owns one token;
+for larger N, each CTA owns up to bucket/128 consecutive tokens (at most 32). The grid
+covers actual N, and the last CTA masks an absent token. Each CTA scans the
+bucket-sized route interval, masking entries outside actual N, to derive the
+prior count for each expert. Its reserved output rows cannot overlap another
+CTA's rows. Source IDs remain `slot*N + token`; packed rows and scale padding
+are sized from actual N. Runtime-scaled address products use int64.
+
+CPU tests cover every accepted N, rejection above 4096, indexing bounds, and
+native map layouts. Hopper producer tests cover every N from 1 through 256
+and larger bucket boundaries and CTA tails through 4096. They check bytewise
+FP8/scale agreement, invalid routes, graph replay and capture at a new N
+after bucket warmup. Native integration tests cover the 512x1024 native FC1/SwiGLU/FP8 epilogue
+and require finite, byte-identical expert outputs. They also cover registered input fusion through N=4096 and native
+preprocessing beyond that bound. Performance comparisons must use warmed kernels at the original
+sizes and retain both positive and negative results.
+
+### Prepared input consumption
+
+The private SM90 runner accepts `prepared_input` from `route_quant_fp8`, bound
+to the same input and expert IDs. It reads the producer's packed FP8 rows,
+FP32 scales, offsets and slot-major inverse directly. The native expert GEMMs,
+activation and weighted finalizer retain their algorithms and stage settings.
+The consumer forwards `use_fused_finalize` unchanged to the native runner;
+prepared input does not select a different finalization policy. The registered
+CuTe DSL path reads `plan["cutlass_fused_finalize"]`, including the value set by
+`--no-moe-cutlass-fused-finalize` at server startup. Set the plan before warmup
+and CUDA graph capture; its default is True. This setting alone does not
+establish batch-invariant execution. Other callers keep their existing input
+producer.
+
+Packed capacity is rounded to four rows for TMA; scale capacity includes the
+per-expert padding. Only rows below `offsets[-1]` are valid. The native consumer
+uses these allocation extents even after a larger batch has increased its own
+workspace capacity. Both eager execution and capture use this interface.
+When FC1 also fuses SwiGLU and FP8 output quantization, its output scales use
+the native workspace stride consumed by FC2. That stride is passed separately
+from the prepared input scale stride, including after a larger batch grows
+the native workspace.
+Retain every prepared tensor through graph retirement, and refresh only after
+all consumers of the previous invocation have completed.
 
 ## Kimi-K3 router
 
