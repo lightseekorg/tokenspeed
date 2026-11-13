@@ -44,6 +44,7 @@ class TinyModel(nn.Module):
 
     def __init__(self):
         super().__init__()
+        self.quant_config = None
         self.weight = nn.Parameter(torch.arange(4.0))
         self.register_buffer("constant", torch.tensor([2, 3]))
 
@@ -112,6 +113,30 @@ def test_constants_cannot_alias_even_a_slice_of_parameter_storage():
 def test_discard_requires_audited_models(models):
     with pytest.raises(ValueError):
         WeightMemoryState(policy="discard", models=models)
+
+
+def test_quantized_discard_requires_a_separate_resolved_config_opt_in():
+    from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
+
+    model = TinyModel()
+    model.quant_config = Fp8Config()
+    with pytest.raises(ValueError, match="Fp8Config does not support weight discard"):
+        WeightMemoryState(policy="discard", models=[model])
+    WeightMemoryState(policy="cpu_backup", models=[model]).require_usable()
+
+    class AuditedFp8Config(Fp8Config):
+        supports_weight_discard = True
+
+    model.quant_config = AuditedFp8Config()
+    state = WeightMemoryState(policy="discard", models=[model])
+    discard(model, state)
+    state.resume(lambda: None)
+    with pytest.raises(RuntimeError, match="complete weight update"):
+        state.require_usable()
+
+    model.supports_weight_discard = False
+    with pytest.raises(ValueError, match="TinyModel does not support weight discard"):
+        WeightMemoryState(policy="discard", models=[model])
 
 
 def test_discard_requires_kv_release_and_resident_update_storage():

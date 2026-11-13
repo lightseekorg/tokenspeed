@@ -2346,6 +2346,52 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                     },
                 ));
             }
+            Effect::DemoteCacheGroups(ids, ended) => {
+                let changed = self.scheduler.demote_cache_groups(&ids, ended);
+                self.controls.reply(ControlOutput::DemoteCacheGroups(
+                    ts_wire::control::DemoteCacheGroupsReqOutput {
+                        rid: None,
+                        http_worker_ipc: None,
+                        success: true,
+                        message: format!("demoted {changed} exclusive cached blocks"),
+                    },
+                ));
+            }
+            Effect::SharedPrefixPublication(query_id, input_ids, max_prefix_tokens) => {
+                let result = self
+                    .scheduler
+                    .shared_prefix_publication(&input_ids, max_prefix_tokens);
+                let (success, message, status, confirmed_prefix_tokens, cache_epoch) = match result
+                {
+                    Ok(value) => (
+                        true,
+                        String::new(),
+                        value.status,
+                        i64::from(value.confirmed_prefix_tokens),
+                        value.cache_epoch,
+                    ),
+                    Err(error) => (false, error.to_string(), "unsupported".to_owned(), 0, 0),
+                };
+                self.controls
+                    .reply(ControlOutput::GetSharedPrefixPublication(
+                        ts_wire::control::GetSharedPrefixPublicationReqOutput {
+                            rid: None,
+                            http_worker_ipc: None,
+                            success,
+                            message,
+                            query_id,
+                            dp_rank: -1,
+                            status,
+                            confirmed_prefix_tokens,
+                            storage_namespace: self
+                                .l3
+                                .as_ref()
+                                .map(|tier| tier.executor.key_prefix())
+                                .unwrap_or_default(),
+                            cache_epoch,
+                        },
+                    ));
+            }
             Effect::AdmissionSnapshot => {
                 // Version 1 rounds demand up to 1024-token buckets. Bump the
                 // contract version if the curve's bucketing semantics change;
@@ -2371,6 +2417,10 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                         max_tokens: snapshot.max_tokens.into(),
                         capacity_token_step: snapshot.capacity_token_step.into(),
                         capacity_blocks: snapshot.capacity_blocks,
+                        cache_group_contract: 1,
+                        shared_prefix_publication_contract: 1,
+                        shared_prefix_storage_enabled: self.l3.is_some()
+                            && self.scheduler.shared_prefix_storage_enabled(),
                     },
                 ));
             }

@@ -29,8 +29,13 @@ from typing import Any, Literal
 import torch
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
-from tokenspeed_kernel.registry import KernelRegistry
-from tokenspeed_kernel.selection import KernelPlan, NoKernelFoundError, select_kernel
+from tokenspeed_kernel.registry import KernelRegistry, Priority
+from tokenspeed_kernel.selection import (
+    KernelPlan,
+    NoKernelFoundError,
+    resolve_kernel_override,
+    select_kernel,
+)
 from tokenspeed_kernel.signature import (
     dense_format_signature,
     dense_tensor_format,
@@ -48,6 +53,7 @@ __all__ = [
     "latent_moe_decode_pipeline_available",
     "latent_moe_expert_shared",
     "latent_moe_input_projections",
+    "try_latent_moe_input_projections",
     "moe_apply",
     "moe_plan",
     "moe_process_weights",
@@ -350,6 +356,53 @@ def latent_moe_input_projections(
     Returns:
         ``(router_logits, routed_input, shared_input)``.
     """
+    result = try_latent_moe_input_projections(
+        hidden_states,
+        router_weight,
+        routed_weight,
+        shared_gate_up_weight,
+        gate_clamp=gate_clamp,
+        up_clamp=up_clamp,
+        override=override,
+        solution=solution,
+    )
+    if result is not None:
+        return result
+
+    router_logits = torch.nn.functional.linear(
+        hidden_states.float(), router_weight.float()
+    )
+    routed_input = torch.nn.functional.linear(hidden_states, routed_weight)
+    shared_raw = torch.nn.functional.linear(hidden_states, shared_gate_up_weight)
+    gate, up = shared_raw.chunk(2, dim=-1)
+    gate_fp32 = gate.float()
+    up_fp32 = up.float()
+    gate_fp32 = gate_clamp * torch.tanh(gate_fp32 / gate_clamp)
+    gate_fp32 *= torch.sigmoid(gate.float())
+    if up_clamp is not None:
+        up_fp32 = up_clamp * torch.tanh(up_fp32 / up_clamp)
+    shared_input = (gate_fp32 * up_fp32).to(hidden_states.dtype)
+    return router_logits, routed_input, shared_input
+
+
+def try_latent_moe_input_projections(
+    hidden_states: torch.Tensor,
+    router_weight: torch.Tensor,
+    routed_weight: torch.Tensor,
+    shared_gate_up_weight: torch.Tensor,
+    *,
+    gate_clamp: float,
+    up_clamp: float | None,
+    override: str | None = None,
+    solution: str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    """Run a fused input projection, or return None without projecting.
+
+    Arguments and outputs match :func:`latent_moe_input_projections`. A caller
+    that schedules separate projections can retain that scheduling when no
+    fused implementation supports the inputs. Automatic selection declines
+    correctness references; explicit backend requests are preserved.
+    """
     if hidden_states.ndim != 2 or hidden_states.shape[0] < 1:
         raise ValueError("hidden_states must have shape [tokens, hidden_size]")
     tokens, hidden_size = hidden_states.shape
@@ -386,7 +439,10 @@ def latent_moe_input_projections(
         ),
         "weights_packed": _weights_packed(weights),
         "hidden_size_multiple_64": hidden_size % 64 == 0,
+        "gate_clamp": gate_clamp,
+        "up_clamp": up_clamp,
     }
+    override = resolve_kernel_override("moe", "latent_input", override)
     try:
         kernel = select_kernel(
             "moe",
@@ -400,6 +456,12 @@ def latent_moe_input_projections(
         if override is not None or solution is not None:
             raise
         kernel = None
+
+    if kernel is not None and override is None and solution is None:
+        spec = KernelRegistry.get().get_by_name(kernel.name)
+        assert spec is not None
+        if spec.priority == Priority.REFERENCE:
+            return None
 
     if kernel is not None:
         ShapeCapture.get().record(
@@ -425,20 +487,7 @@ def latent_moe_input_projections(
                 up_clamp=up_clamp,
             )
 
-    router_logits = torch.nn.functional.linear(
-        hidden_states.float(), router_weight.float()
-    )
-    routed_input = torch.nn.functional.linear(hidden_states, routed_weight)
-    shared_raw = torch.nn.functional.linear(hidden_states, shared_gate_up_weight)
-    gate, up = shared_raw.chunk(2, dim=-1)
-    gate_fp32 = gate.float()
-    up_fp32 = up.float()
-    gate_fp32 = gate_clamp * torch.tanh(gate_fp32 / gate_clamp)
-    gate_fp32 *= torch.sigmoid(gate.float())
-    if up_clamp is not None:
-        up_fp32 = up_clamp * torch.tanh(up_fp32 / up_clamp)
-    shared_input = (gate_fp32 * up_fp32).to(hidden_states.dtype)
-    return router_logits, routed_input, shared_input
+    return None
 
 
 # ===-----------------------------------------------------------------------===#
@@ -1543,6 +1592,9 @@ def _build_traits(
         traits["activation"] = activation
     if requires_deferred_finalize:
         traits["supports_deferred_finalize"] = True
+    else:
+        # Excludes the kernels that only return per-route outputs.
+        traits["supports_finalize"] = True
     if routing_mode is not None:
         traits["routing_mode"] = routing_mode
 
@@ -1822,6 +1874,61 @@ def bf16_moe_routes_warmup(
             large_batch_kernel(x, w13, w2, topk_ids, expert_start, output=None)
 
 
+def _bf16_routes_moe_apply(
+    x: torch.Tensor,
+    w: torch.nn.Module,
+    topk_ids: torch.Tensor | None,
+    do_finalize: bool,
+    deferred_out: torch.Tensor | None,
+) -> tuple[torch.Tensor, None, None]:
+    """Run a ``MoELayer``'s BF16 experts through :func:`bf16_moe_routes`.
+
+    The shared body of the route-backed ``moe.apply`` kernels, which declare
+    ``supports_finalize={False}``: they only return unfinalized routes.
+
+    Args:
+        x: Contiguous BF16 hidden states ``[tokens, hidden]``.
+        w: The layer, holding local ``w13_weight`` ``[experts, 2I, hidden]``
+            and ``w2_weight`` ``[experts, hidden, I]`` and its ``ep_rank`` and
+            ``num_local_experts``.
+        topk_ids: Global selected expert ids ``[tokens, topk]``.
+        do_finalize: Must be false.
+        deferred_out: Optional caller-owned destination, as ``output`` of
+            :func:`bf16_moe_routes`.
+
+    Returns:
+        ``(route_outputs, None, None)``: unweighted routes ``[tokens * topk,
+        hidden]`` in token order, rows of other ranks' experts zero, so no
+        route map is needed.
+    """
+    if do_finalize:
+        raise ValueError("BF16 route kernels return unfinalized routes only")
+    if topk_ids is None:
+        raise ValueError("BF16 route kernels require precomputed top-k ids")
+    routes = bf16_moe_routes(
+        x,
+        w.w13_weight,
+        w.w2_weight,
+        topk_ids.contiguous(),
+        w.ep_rank * w.num_local_experts,
+        output=deferred_out,
+        batch_invariant=False,
+    )
+    return routes.view(-1, x.shape[1]), None, None
+
+
+def _bf16_routes_moe_warmup(plan: dict, w: torch.nn.Module) -> None:
+    """Compile the route kernels behind :func:`_bf16_routes_moe_apply`."""
+    bf16_moe_routes_warmup(
+        w.w13_weight,
+        w.w2_weight,
+        w.top_k,
+        w.ep_rank * w.num_local_experts,
+        max_num_tokens=plan["warmup_max_num_tokens"],
+        batch_invariant=False,
+    )
+
+
 def moe_plan(
     weight_dtype: str,
     input_dtype: torch.dtype = torch.bfloat16,
@@ -1859,6 +1966,8 @@ def moe_plan(
         input_dtype: Hidden-state dtype used for the apply-kernel signature.
         activation: Optional activation name required by the layer.
         requires_deferred_finalize: Require a kernel that can defer finalize.
+            Otherwise the kernel must finalize, which excludes kernels
+            declaring ``supports_finalize={False}``.
         routing_mode: Optional routing-mode requirement. "precomputed_topk"
             requires a kernel that consumes externally computed top-k ids and
             weights (for models whose routing function the fused kernels

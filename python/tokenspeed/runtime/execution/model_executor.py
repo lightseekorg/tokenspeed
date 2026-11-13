@@ -1313,6 +1313,7 @@ class ModelExecutor:
                             **self._model_input_kwargs(num_tokens, ctx.bs, rows),
                         )
                     if self.drafter is not None:
+                        self.drafter.warmup_extend(num_tokens)
                         self._autotune_draft_experts(num_tokens)
                     if self.drafter is not None and not self.config.prefill_only:
                         # Prefill-only roles do not allocate decode/verify scratch.
@@ -2057,6 +2058,8 @@ class ModelExecutor:
                     )
             self._record_draft_final_cache_step(ctx.num_extends)
 
+        if self.capturable_grammar is not None:
+            self.capturable_grammar.join_post_sampler()
         return (
             output_tokens,
             accept_lengths,

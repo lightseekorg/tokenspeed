@@ -208,9 +208,36 @@ def _checkpoint_architectures(
 # Checkpoint architectures with decode monokernels (--decode-monokernel). A
 # model adds its architecture here with its monokernel seam.
 DECODE_MONOKERNEL_ARCHITECTURES = (
+    "MuseSparkForConditionalGeneration",
     "Qwen4ExpForCausalLM",
     "Qwen4ExpForConditionalGeneration",
 )
+# Draft architectures with decode monokernels, and the target architectures
+# whose drafts they serve. Under --decode-monokernel such a draft of such a
+# target takes the switch too; any other draft (a Qwen3.8 target's DFlash2
+# draft, a Muse Spark target's other drafts) keeps its regular layers.
+DRAFT_MONOKERNEL_TARGETS = {
+    "DFlash2DraftModel": ("MuseSparkForConditionalGeneration",),
+    # The MTP draft of a Qwen3.8 target (hf_transformers_utils renames the
+    # draft's architecture to it).
+    "Qwen4ExpForCausalLMNextN": (
+        "Qwen4ExpForCausalLM",
+        "Qwen4ExpForConditionalGeneration",
+    ),
+}
+
+
+def draft_takes_decode_monokernel(
+    switch: bool, target_architectures: list[str], draft_architectures: list[str]
+) -> bool:
+    """Whether a draft under ``--decode-monokernel`` (``switch``) builds its
+    layers from its monokernel class: only a draft in DRAFT_MONOKERNEL_TARGETS
+    of one of the targets it lists."""
+    return switch and any(
+        target in DRAFT_MONOKERNEL_TARGETS.get(draft, ())
+        for draft in draft_architectures
+        for target in target_architectures
+    )
 
 
 def decode_monokernel_refusal(architectures: list[str]) -> str | None:
@@ -372,6 +399,23 @@ def validate_qcp(
             "--enable-mixed-batch: a MIXED round would carry sharded extend rows "
             "and replicated decode rows in one forward"
         )
+
+
+def _filesystem_type(path: str) -> str:
+    """The type of the filesystem whose mount point is ``path``'s longest
+    prefix in ``/proc/self/mounts``; ``path`` need not exist yet."""
+    path = os.path.realpath(path)
+    best, fs_type = "", "unknown"
+    with open("/proc/self/mounts") as mounts:
+        for line in mounts:
+            fields = line.split()
+            mount_point = fields[1].replace("\\040", " ")
+            inside = path == mount_point or path.startswith(
+                mount_point.rstrip("/") + "/"
+            )
+            if inside and len(mount_point) >= len(best):
+                best, fs_type = mount_point, fields[2]
+    return fs_type
 
 
 @dataclasses.dataclass
@@ -650,6 +694,9 @@ class ServerArgs:
     # Run each decoder layer's small decode steps as one persistent
     # monokernel launch (DECODE_MONOKERNEL_ARCHITECTURES). Off by default.
     decode_monokernel: bool = False
+    # A directory for each rank's decode monokernel stuck-poll record file
+    # (None: the records stay in pinned memory).
+    monokernel_stuck_record_dir: str | None = None
 
     # Grammar backend. None means the checkpoint default has not been resolved.
     grammar_backend: str | None = None
@@ -2522,9 +2569,11 @@ class ServerArgs:
                 raise ValueError(
                     "Weight discard requires an explicit draft update policy"
                 )
-            if self.quantization is not None or self.enable_eplb:
+            # Quantization is checked against the resolved model config by
+            # WeightMemoryState; CLI names alone cannot prove safe regeneration.
+            if self.enable_eplb:
                 raise ValueError(
-                    "Weight discard currently requires unquantized weights without EPLB"
+                    "Weight discard currently requires running without EPLB"
                 )
 
     def validate_model_update_options(self):
@@ -2795,6 +2844,23 @@ class ServerArgs:
                 "--prefill-decode-interval needs --disaggregation-mode null: a "
                 "prefill engine runs no decodes and a decode engine no local "
                 "prefill rounds"
+            )
+        if self.monokernel_stuck_record_dir is not None:
+            fs_type = _filesystem_type(self.monokernel_stuck_record_dir)
+            if fs_type != "tmpfs":
+                # The record file is mapped and registered as GPU-visible host
+                # memory. On a disk filesystem the kernel's periodic dirty-page
+                # writeback of those pages stalls decode for 1-2 s every few
+                # seconds; tmpfs pages are never written back.
+                raise ValueError(
+                    "--monokernel-stuck-record-dir must be on tmpfs (for "
+                    f"example /dev/shm); {self.monokernel_stuck_record_dir} is "
+                    f"on {fs_type}"
+                )
+        if self.monokernel_stuck_record_dir is not None and not self.decode_monokernel:
+            raise ValueError(
+                "--monokernel-stuck-record-dir needs --decode-monokernel: only "
+                "the monokernel launches write stuck-poll records"
             )
         if self.device == "npu":
             if not self.disable_prefill_graph:
@@ -3412,7 +3478,10 @@ class ServerArgs:
             "--stream-interval",
             type=int,
             default=ServerArgs.stream_interval,
-            help="The interval (or buffer size) for streaming in terms of the token length. A smaller value makes streaming smoother, while a larger value makes the throughput higher",
+            help="Streaming buffer size in generated tokens: send the first step's "
+            "tokens at once, then whenever at least this many tokens are unsent. A "
+            "smaller value streams more smoothly; a larger value sends fewer, "
+            "larger chunks.",
         )
         parser.add_argument(
             "--seed",
@@ -4021,12 +4090,34 @@ class ServerArgs:
             default=ServerArgs.decode_monokernel,
             help=(
                 "Run each decoder layer's decode step as one persistent "
-                "monokernel launch, for small batches (decode and speculative "
-                "verify of up to 4 token rows). Models: "
-                f"{', '.join(DECODE_MONOKERNEL_ARCHITECTURES)} on gfx950, "
-                "without attention or expert parallelism. Startup fails when "
-                "a layer cannot be packed for its monokernel. Larger steps "
+                "monokernel launch, for small decode and speculative verify "
+                "steps (each model's seam names the steps and parallel "
+                "layouts its kernels serve). Models: "
+                f"{', '.join(DECODE_MONOKERNEL_ARCHITECTURES)} on gfx950. "
+                "Startup fails when a layer cannot be packed for its "
+                "monokernel. A speculative draft with monokernels of its "
+                "own takes the switch too when its target is one they serve ("
+                + "; ".join(
+                    f"{draft}: {', '.join(targets)}"
+                    for draft, targets in DRAFT_MONOKERNEL_TARGETS.items()
+                )
+                + "); every other draft keeps the regular path. Other steps "
                 "keep the regular path."
+            ),
+        )
+        parser.add_argument(
+            "--monokernel-stuck-record-dir",
+            type=str,
+            default=ServerArgs.monokernel_stuck_record_dir,
+            help=(
+                "With --decode-monokernel: a directory on tmpfs (for example "
+                "/dev/shm) where each rank keeps "
+                "its stuck-poll record file (stuck-rank<N>-pid<P>.bin and a "
+                ".json sidecar). A launch poll that gives up writes what it "
+                "waited for there before the launch traps, so the record "
+                "outlives the process; a run without a stuck poll removes the "
+                "files at exit. Without it the records stay in pinned memory "
+                "and are logged when the failure reaches Python."
             ),
         )
         parser.add_argument(

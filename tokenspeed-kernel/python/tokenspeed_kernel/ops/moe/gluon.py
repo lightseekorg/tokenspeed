@@ -27,7 +27,12 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
-from tokenspeed_kernel.ops.moe import packed_projection_weight_view
+from tokenspeed_kernel.ops.communication.mailbox import MailboxTarget
+from tokenspeed_kernel.ops.moe import (
+    _bf16_routes_moe_apply,
+    _bf16_routes_moe_warmup,
+    packed_projection_weight_view,
+)
 from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
 from tokenspeed_kernel.ops.tuning import is_warming_up
 from tokenspeed_kernel.platform import (
@@ -167,6 +172,94 @@ def gluon_fp8_channel_bf16_precomputed_moe_apply(
     output = torch.empty_like(x)
     _combine(partials.view(-1, 5120), topk_weights, output, None, 0)
     return output
+
+
+if platform.is_amd:
+    from tokenspeed_kernel.ops.moe._triton.block_scaled import _block_scaled_moe_routes
+    from tokenspeed_kernel_amd.ops.gfx950.moe.block_scaled import (
+        gluon_block_scaled_moe_routes_mm_gfx950,
+    )
+
+    @register_kernel(
+        "moe",
+        "block_scaled_routes",
+        name="gluon_block_scaled_moe_routes_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset({format_signature(x=dense_tensor_format(torch.bfloat16))}),
+        traits={
+            "w13_weight_dtype": frozenset({"nvfp4", "mxfp8"}),
+            "w2_weight_dtype": frozenset({"nvfp4", "mxfp8"}),
+        },
+        priority=Priority.SPECIALIZED,
+    )
+    def gluon_block_scaled_moe_routes_gfx950(
+        x: torch.Tensor,
+        w13: torch.Tensor,
+        s13: torch.Tensor,
+        a13: torch.Tensor | None,
+        d13: torch.Tensor | None,
+        w2: torch.Tensor,
+        s2: torch.Tensor,
+        a2: torch.Tensor | None,
+        d2: torch.Tensor | None,
+        weights: torch.Tensor,
+        ids: torch.Tensor,
+        *,
+        formats: tuple[str, str],
+        experts: int,
+        expert_start: int,
+        gate_cap: float,
+        up_cap: float,
+        zero_remote_routes: bool,
+        fold_slots: bool,
+        fold_into: MailboxTarget | None,
+    ) -> torch.Tensor | None:
+        """Apply NVFP4 or MXFP8 experts with shared routing and BF16 rounding
+        boundaries. MXFP8 runs the same kernel about 1.9x faster than the
+        portable Triton GEMM at the C1 shape (w13 103 -> 54 us on MI350X)."""
+        del experts  # per-expert tiles need no global count
+        # Keep small batches narrow. Prefill reuses each weight tile across more
+        # rows. At decode, 64-wide output tiles give more tiles than the 2-per-CU
+        # persistent programs (C1 on MI350X, 7 experts: w13 168 -> 137 us).
+        # NVFP4 prefill upcasts each weight tile once per 64 rows (a 2048-token
+        # chunk routes about 43 rows to an expert): w13 1.69 -> 0.86 ms.
+        if x.shape[0] < 1024:
+            tiles = (16, 64, 256)
+        elif formats == ("nvfp4", "nvfp4"):
+            tiles = (64, 128, 128)
+        else:
+            tiles = (32, 128, 128)
+        return _block_scaled_moe_routes(
+            x,
+            w13,
+            s13,
+            a13,
+            d13,
+            w2,
+            s2,
+            a2,
+            d2,
+            weights,
+            ids,
+            formats=formats,
+            expert_start=expert_start,
+            gate_cap=gate_cap,
+            up_cap=up_cap,
+            zero_remote_routes=zero_remote_routes,
+            fold_slots=fold_slots,
+            fold_into=fold_into,
+            matmul=gluon_block_scaled_moe_routes_mm_gfx950,
+            tiles=tiles,
+            # The kernel reads BF16 activations instead of decoding NVFP4 codes
+            # for every output tile (C1 w13: 82 -> 61 us). MXFP8 codes decode
+            # cheaply in the kernel.
+            bf16_activations=formats == ("nvfp4", "nvfp4"),
+        )
 
 
 # ===-----------------------------------------------------------------------===#
@@ -732,6 +825,57 @@ if platform.is_amd:
                 output.view(num_tokens * top_k, x.shape[1]),
             )
         return output.view(num_tokens, top_k, x.shape[1])
+
+    @register_kernel(
+        "moe",
+        "apply",
+        name="gluon_bf16_routes_moe_apply",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            vendors=frozenset({"amd"}),
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+        ),
+        signatures=format_signatures("x", "dense", {torch.bfloat16}),
+        traits={
+            "weight_dtype": frozenset({"unquant"}),
+            "activation": frozenset({"silu"}),
+            "routing_mode": frozenset({"precomputed_topk"}),
+            "supports_finalize": frozenset({False}),
+            "supports_deferred_finalize": frozenset({True}),
+            "deferred_output_is_token_order": frozenset({True}),
+            "supports_deferred_out": frozenset({True}),
+            "supports_ep": frozenset({False, True}),
+            "supports_all_to_all_ep": frozenset({False}),
+            "internal_activation_dtype": frozenset({"input"}),
+            "supports_bias": frozenset({False}),
+        },
+        priority=Priority.SPECIALIZED,
+    )
+    def gluon_bf16_routes_moe_apply(
+        plan: dict,
+        x: torch.Tensor,
+        w: torch.nn.Module,
+        router_logits: torch.Tensor | None,
+        topk_weights: torch.Tensor | None = None,
+        topk_ids: torch.Tensor | None = None,
+        num_tokens_global: int | None = None,
+        max_num_tokens_per_gpu: int | None = None,
+        do_finalize: bool = True,
+        enable_pdl: bool = False,
+        deferred_out: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, None, None]:
+        """Unfinalized BF16 expert routes through ``bf16_moe_routes``.
+
+        The facade selects the Gluon route kernels where their geometry fits
+        and Triton otherwise. Selected only by layers that defer the finalize;
+        see ``_bf16_routes_moe_apply`` for the arguments and the routes.
+        """
+        del plan, router_logits, topk_weights, num_tokens_global
+        del max_num_tokens_per_gpu, enable_pdl
+        return _bf16_routes_moe_apply(x, w, topk_ids, do_finalize, deferred_out)
+
+    gluon_bf16_routes_moe_apply._tokenspeed_warmup = _bf16_routes_moe_warmup  # type: ignore[attr-defined]
 
 
 # ===-----------------------------------------------------------------------===#

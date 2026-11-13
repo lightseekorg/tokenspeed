@@ -1,0 +1,57 @@
+api_version: ci.tokenspeed.io/v1
+# The gfx950 monokernel tests on two GPUs: the peer mailbox exchange between
+# two ranks, and the Muse Spark layer, its stages and its draft as the
+# production TP8 rank programs, two at a time over the GPU links while the
+# host writes the other six ranks' puts. Each rank-program test runs for the
+# pairs (0, 1), (2, 3), (4, 5) and (6, 7), so every rank program runs. Tests
+# against the reference use a zero-shard model, whose absent ranks put
+# exactly zero; kernel-vs-kernel tests use stand-ins keyed by request and
+# row.
+#
+# Per commit: the one-GPU math (ut-tokenspeed-kernel) and this task; eight
+# GPUs serve only the Muse Spark GSM8K monokernel model task. Two things
+# need all eight ranks and run only there: the rank order of a sum over
+# eight non-zero ranks, and the values a rank puts into the other ranks'
+# segments past its pair. The directory's eight-GPU tests check those bit
+# for bit; run them by hand on an eight-GPU host:
+# pytest tokenspeed-kernel/test/amd/gfx950/ops/monokernel
+#
+# A pull request's changed paths select the files (changed_paths), as for
+# the other kernel unit-test tasks.
+name: ut-tokenspeed-kernel-amd-2gpu
+type: ut
+workflow_stage: unit-test
+triggers:
+  - per-commit
+  - manual
+# Kernel tests never import the runtime (a pre-commit hook checks it).
+ignore_changes:
+  - python/tokenspeed
+  - test/runtime
+changed_paths: true
+runner:
+  labels:
+    - amd-mi35x-2gpu-test
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps_rocm.sh
+ut:
+  commands:
+    - >-
+      python3 -m pytest -v
+      tokenspeed-kernel/test/amd/gfx950/ops/monokernel/test_peer_mailbox_gfx950.py
+      tokenspeed-kernel/test/amd/gfx950/ops/monokernel/test_muse_spark_layer_gfx950.py
+      tokenspeed-kernel/test/amd/gfx950/ops/monokernel/test_muse_spark_attn_tail_gfx950.py
+      tokenspeed-kernel/test/amd/gfx950/ops/monokernel/test_muse_spark_experts_gfx950.py
+      tokenspeed-kernel/test/amd/gfx950/ops/monokernel/test_muse_spark_moe_tail_gfx950.py
+      tokenspeed-kernel/test/amd/gfx950/ops/monokernel/test_muse_spark_pool_gfx950.py
+      tokenspeed-kernel/test/amd/gfx950/ops/monokernel/test_muse_spark_route_gfx950.py
+      tokenspeed-kernel/test/amd/gfx950/ops/monokernel/test_muse_spark_draft_attn_gfx950.py
+      tokenspeed-kernel/test/amd/gfx950/ops/monokernel/test_muse_spark_draft_context_gfx950.py
+      tokenspeed-kernel/test/amd/gfx950/ops/monokernel/test_muse_spark_draft_head_gfx950.py
+      tokenspeed-kernel/test/amd/gfx950/ops/monokernel/test_muse_spark_draft_layer_gfx950.py
+      tokenspeed-kernel/test/amd/gfx950/ops/monokernel/test_muse_spark_draft_mlp_gfx950.py
+      -k "world2 or gpus2 or pair01 or pair23 or pair45 or pair67"
+report:
+  github_step_summary: true

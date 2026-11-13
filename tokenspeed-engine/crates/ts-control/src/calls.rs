@@ -57,6 +57,7 @@
 //! * `demote_sessions([{session_ids, ended}])`: explicit cache eviction hints;
 //! * `reload_forward([{mode = "wait", modules, id, timeout_s}])`: development only
 //!   (`--allow-reload-forward`); `id` is required and the same on every engine.
+//! * `demote_cache_groups([{cache_group_ids, ended}])`: group cache eviction hints.
 
 use std::time::{Duration, Instant};
 
@@ -127,7 +128,7 @@ pub fn translate(call: &ControlCall, now: Instant) -> Result<Translated, String>
                     return Err(format!(
                         "start_profile takes [options], a map of the profiler's options; got \
                          {args:?}"
-                    ))
+                    ));
                 }
             };
             Ok(request(ControlRequest::Profile(profile_start(options)?)))
@@ -150,15 +151,57 @@ pub fn translate(call: &ControlCall, now: Instant) -> Result<Translated, String>
 fn rl_operation(method: &str, args: &[Value]) -> Result<ControlRequest, String> {
     let body = Body::of(method, args)?;
     Ok(match method {
-        "demote_sessions" => {
-            let session_ids = body.strs("session_ids")?;
-            if session_ids.len() > MAX_DEMOTE_SESSION_IDS
-                || session_ids
+        "get_shared_prefix_publication" => {
+            let query_id = body.str("query_id")?;
+            if query_id.is_empty() || query_id.len() > 256 {
+                return Err("query_id must contain 1..=256 UTF-8 bytes".to_owned());
+            }
+            let value = body
+                .get("input_ids")
+                .ok_or_else(|| body.missing("input_ids"))?;
+            let Value::Array(values) = value else {
+                return Err(body.wrong("input_ids", "a list of i32 token ids", value));
+            };
+            if values.len() > 1_048_576 {
+                return Err("input_ids exceeds the bounded publication query limit".to_owned());
+            }
+            let input_ids = values
+                .iter()
+                .map(|value| integer(value).and_then(|v| i32::try_from(v).ok()))
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| body.wrong("input_ids", "a list of i32 token ids", value))?;
+            let max_prefix_tokens = i32::try_from(body.int("max_prefix_tokens")?)
+                .map_err(|_| "max_prefix_tokens must fit i32".to_owned())?;
+            if max_prefix_tokens <= 0 || max_prefix_tokens as usize > input_ids.len() {
+                return Err(
+                    "max_prefix_tokens must be positive and at most input_ids.len()".to_owned(),
+                );
+            }
+            ControlRequest::GetSharedPrefixPublication(
+                ts_wire::control::GetSharedPrefixPublicationReqInput {
+                    rid: None,
+                    http_worker_ipc: None,
+                    query_id,
+                    input_ids,
+                    max_prefix_tokens,
+                },
+            )
+        }
+        "demote_sessions" | "demote_cache_groups" => {
+            let grouped = method == "demote_cache_groups";
+            let field = if grouped {
+                "cache_group_ids"
+            } else {
+                "session_ids"
+            };
+            let ids = body.strs(field)?;
+            if ids.len() > MAX_DEMOTE_SESSION_IDS
+                || ids
                     .iter()
                     .any(|id| id.is_empty() || id.len() > MAX_CACHE_SESSION_ID_BYTES)
             {
                 return Err(format!(
-                    "demote_sessions requires at most {MAX_DEMOTE_SESSION_IDS} nonempty session ids \
+                    "{method} requires at most {MAX_DEMOTE_SESSION_IDS} nonempty ids \
                      of at most {MAX_CACHE_SESSION_ID_BYTES} UTF-8 bytes"
                 ));
             }
@@ -166,12 +209,21 @@ fn rl_operation(method: &str, args: &[Value]) -> Result<ControlRequest, String> 
                 .get("ended")
                 .and_then(boolean)
                 .ok_or_else(|| body.missing("ended (boolean)"))?;
-            ControlRequest::DemoteSessions(ts_wire::control::DemoteSessionsReqInput {
-                rid: None,
-                http_worker_ipc: None,
-                session_ids,
-                ended,
-            })
+            if grouped {
+                ControlRequest::DemoteCacheGroups(ts_wire::control::DemoteCacheGroupsReqInput {
+                    rid: None,
+                    http_worker_ipc: None,
+                    cache_group_ids: ids,
+                    ended,
+                })
+            } else {
+                ControlRequest::DemoteSessions(ts_wire::control::DemoteSessionsReqInput {
+                    rid: None,
+                    http_worker_ipc: None,
+                    session_ids: ids,
+                    ended,
+                })
+            }
         }
 
         "pause_generation" => ControlRequest::PauseScheduler(PauseSchedulerReqInput {
@@ -298,7 +350,9 @@ fn rl_operation(method: &str, args: &[Value]) -> Result<ControlRequest, String> 
 
 /// The methods [`rl_operation`] serves.
 const RL_METHODS: &[&str] = &[
+    "get_shared_prefix_publication",
     "demote_sessions",
+    "demote_cache_groups",
     "pause_generation",
     "continue_generation",
     "init_weights_update_group",
@@ -336,7 +390,7 @@ impl<'a> Body<'a> {
             args => {
                 return Err(format!(
                     "{method} takes [body], the JSON body of its HTTP route as a map; got {args:?}"
-                ))
+                ));
             }
         };
         Ok(Self { method, fields })
@@ -510,7 +564,7 @@ fn profile_start(options: &[(Value, Value)]) -> Result<ProfileReq, String> {
                     "start_profile has no option {other:?}; it takes output_dir, start_step, \
                      num_steps, activities, with_stack, record_shapes, profile_by_stage and \
                      profile_id"
-                ))
+                ));
             }
         }
     }
@@ -762,6 +816,37 @@ mod tests {
     /// version's identity; an unflushed one keeps the current namespace; an
     /// explicit version always wins.
     #[test]
+    fn shared_prefix_publication_validates_boundary_and_preserves_nonce() {
+        let query = |limit| {
+            rl(
+                "get_shared_prefix_publication",
+                vec![body(vec![
+                    ("query_id", "fresh-nonce".into()),
+                    ("input_ids", Value::Array(vec![int(10), int(20), int(30)])),
+                    ("max_prefix_tokens", int(limit)),
+                ])],
+            )
+        };
+        let ControlRequest::GetSharedPrefixPublication(request) = query(2).unwrap() else {
+            panic!("wrong query kind")
+        };
+        assert_eq!(request.query_id, "fresh-nonce");
+        assert_eq!(request.input_ids, vec![10, 20, 30]);
+        assert_eq!(request.max_prefix_tokens, 2);
+        assert!(query(0).is_err());
+        assert!(query(4).is_err());
+        assert!(rl(
+            "get_shared_prefix_publication",
+            vec![body(vec![
+                ("query_id", "".into()),
+                ("input_ids", Value::Array(vec![int(1)])),
+                ("max_prefix_tokens", int(1)),
+            ])]
+        )
+        .is_err());
+    }
+
+    #[test]
     fn a_mooncake_load_names_its_version_as_the_route_does() {
         let load = |fields| match rl("update_weights_from_mooncake", vec![body(fields)]) {
             Ok(ControlRequest::UpdateWeightsFromMooncake(load)) => load,
@@ -845,6 +930,54 @@ mod tests {
         assert!(error.contains("takes no body"), "{error}");
         let error = rl("pause_generation", vec!["wait".into()]).unwrap_err();
         assert!(error.contains("takes [body]"), "{error}");
+    }
+
+    #[test]
+    fn cache_group_demotion_uses_its_own_explicit_ids_and_end_semantics() {
+        let ids = Value::Array(vec!["group".into()]);
+        let request = rl(
+            "demote_cache_groups",
+            vec![body(vec![
+                ("cache_group_ids", ids.clone()),
+                ("ended", Value::Bool(true)),
+            ])],
+        )
+        .unwrap();
+        let ControlRequest::DemoteCacheGroups(request) = request else {
+            panic!("expected group cache demotion");
+        };
+        assert_eq!(request.cache_group_ids, ["group"]);
+        assert!(request.ended);
+        assert!(rl(
+            "demote_cache_groups",
+            vec![body(vec![("cache_group_ids", ids)])],
+        )
+        .is_err());
+        assert!(rl(
+            "demote_cache_groups",
+            vec![body(vec![
+                ("session_ids", Value::Array(vec!["group".into()])),
+                ("ended", Value::Bool(true)),
+            ])],
+        )
+        .is_err());
+        for ids in [
+            vec!["".to_owned()],
+            vec!["g".repeat(4097)],
+            vec!["g".to_owned(); 4097],
+        ] {
+            assert!(rl(
+                "demote_cache_groups",
+                vec![body(vec![
+                    (
+                        "cache_group_ids",
+                        Value::Array(ids.into_iter().map(Value::Str).collect()),
+                    ),
+                    ("ended", Value::Bool(false)),
+                ])],
+            )
+            .is_err());
+        }
     }
 
     #[test]

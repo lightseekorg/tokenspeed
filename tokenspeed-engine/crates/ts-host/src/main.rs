@@ -64,6 +64,7 @@ use ts_control::{
     event_loop::{EventLoop, LoopConfig, LoopError, PrefillDelay, Ranks, Subsystems},
     grammar::{GrammarConfig, Grammars, ReasoningGrammar},
     ingress::{IngressLimits, LogprobServability},
+    json_framing::{JsonFraming, MessageBoundary},
     kv_events::{KvEventPublisher, KvEventsConfig},
     output::{FinishLog, OutputProcessor, Role},
     transport::{EngineTransport, TransportError},
@@ -376,13 +377,43 @@ fn reasoning_grammar(reasoning: &Bound<'_, PyAny>) -> PyResult<Option<ReasoningG
     if reasoning.is_none() {
         return Ok(None);
     }
+    let boundary = reasoning.getattr("boundary")?;
     Ok(Some(ReasoningGrammar {
         continues: reasoning.getattr("continues")?.extract()?,
         may_open: reasoning.getattr("may_open")?.extract()?,
         schema_slot: reasoning.getattr("schema_slot")?.extract()?,
         markers: reasoning.getattr("markers")?.extract()?,
         implicit_closer: reasoning.getattr("implicit_closer")?.extract()?,
+        boundary: if boundary.is_none() {
+            None
+        } else {
+            Some(MessageBoundary {
+                open_answer: boundary.getattr("open_answer")?.extract()?,
+                closed: boundary.getattr("closed")?.extract()?,
+            })
+        },
     }))
+}
+
+/// The grammar settings' `json_framing` (`inkling2_json.JsonFraming`), if
+/// set.
+fn json_framing(grammar: &Bound<'_, PyAny>) -> PyResult<Option<JsonFraming>> {
+    let framing = grammar.getattr("json_framing")?;
+    if framing.is_none() {
+        return Ok(None);
+    }
+    let reserved: Vec<i32> = framing.getattr("reserved_tokens")?.extract()?;
+    JsonFraming::new(
+        framing.getattr("answer_begin")?.extract()?,
+        framing.getattr("answer_end")?.extract()?,
+        framing.getattr("delimiters")?.extract()?,
+        framing.getattr("text_token")?.extract()?,
+        framing.getattr("end_token")?.extract()?,
+        &reserved,
+        framing.getattr("string_steps")?.extract()?,
+    )
+    .map(Some)
+    .map_err(pyo3::exceptions::PyValueError::new_err)
 }
 
 /// Which metrics this rank exports, and where (`rust_host.HostConfig`'s
@@ -551,6 +582,7 @@ impl HostConfig {
                             grammar.getattr("compile_timeout_s")?.extract()?,
                         ),
                         max_retries: grammar.getattr("max_retries")?.extract()?,
+                        json_framing: json_framing(&grammar)?,
                     })
                 }
             },

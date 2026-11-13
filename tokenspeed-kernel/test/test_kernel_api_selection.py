@@ -1847,6 +1847,7 @@ def _attention_rel_prefill() -> object:
         cu_seqlens_cpu=[0, 4],
         max_seqlen=4,
         softmax_scale=1.0 / 64,
+        output_dtype=None,
     )
 
 
@@ -1871,6 +1872,7 @@ def _attention_rel_extend() -> object:
         max_seqlen_k=128,
         rel_logits=rel_logits,
         softmax_scale=1.0 / 64,
+        output_dtype=None,
     )
 
 
@@ -1896,6 +1898,7 @@ def _attention_rel_extend_page256_sliding() -> object:
         rel_logits=rel_logits,
         window_left=255,
         softmax_scale=1.0 / 128,
+        output_dtype=None,
     )
 
 
@@ -1918,6 +1921,10 @@ def _attention_rel_decode() -> object:
         cu_seqlens_q=cu_seqlens_q,
         max_seqlen_q=1,
         softmax_scale=1.0 / 64,
+        output_dtype=None,
+        return_lse=False,
+        gate=None,
+        sink=None,
     )
 
 
@@ -1941,6 +1948,10 @@ def _attention_rel_decode_page128_sliding() -> object:
         max_seqlen_q=1,
         window_left=127,
         softmax_scale=1.0 / 128,
+        output_dtype=None,
+        return_lse=False,
+        gate=None,
+        sink=None,
     )
 
 
@@ -1966,6 +1977,10 @@ def _attention_rel_decode_multiquery(window_left: int) -> object:
         max_seqlen_q=prediction,
         window_left=window_left,
         softmax_scale=1.0 / 128,
+        output_dtype=None,
+        return_lse=False,
+        gate=None,
+        sink=None,
     )
 
 
@@ -1997,6 +2012,10 @@ def _attention_rel_decode_page256_sliding() -> object:
         max_seqlen_q=1,
         window_left=255,
         softmax_scale=1.0 / 128,
+        output_dtype=None,
+        return_lse=False,
+        gate=None,
+        sink=None,
     )
 
 
@@ -4008,6 +4027,57 @@ def test_legacy_gluon_plans_keep_existing_implementation(
         mi350_platform, weight_dtype=dtype, ispp=width, solution="gluon"
     )
     assert plan["apply_kernel_name"] == expected
+
+
+def _deferred_bf16_plan(platform: PlatformInfo, **overrides) -> dict:
+    """Muse's BF16 expert plan: precomputed routes, caller-normalized."""
+    return _moe_fp8_channel_plan(
+        platform,
+        **{
+            "weight_dtype": "unquant",
+            "requires_deferred_finalize": True,
+            "ep_size": 4,
+            "ispp": 4096,
+            "hidden": 4096,
+            "swiglu_form": None,
+            "num_experts": 256,
+            "top_k": 8,
+            **overrides,
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    "platform_fixture,expected",
+    [
+        ("h100_platform", "triton_bf16_routes_moe_apply"),
+        ("b200_platform", "flashinfer_trtllm_unquant_routed_moe_apply"),
+        ("b300_platform", "flashinfer_trtllm_unquant_routed_moe_apply"),
+        ("mi350_platform", "gluon_bf16_routes_moe_apply"),
+    ],
+)
+def test_deferred_bf16_plans_select_a_route_kernel(
+    platform_fixture: str, expected: str, request: pytest.FixtureRequest
+) -> None:
+    if KernelRegistry.get().get_by_name(expected) is None:
+        pytest.skip(f"{expected!r} is not registered on this host")
+    plan = _deferred_bf16_plan(request.getfixturevalue(platform_fixture))
+    assert plan["apply_kernel_name"] == expected
+    assert plan["supports_deferred_finalize"] is True
+
+
+def test_finalizing_bf16_plans_skip_the_route_kernels(
+    h100_platform: PlatformInfo,
+) -> None:
+    plan = _deferred_bf16_plan(
+        h100_platform, requires_deferred_finalize=False, ep_size=1, solution="triton"
+    )
+    assert plan["apply_kernel_name"] == "triton_bf16_precomputed_moe_apply"
+    # The only Triton kernel taking EP BF16 experts cannot finalize.
+    with pytest.raises(kernel_NoKernelFoundError):
+        _deferred_bf16_plan(
+            h100_platform, requires_deferred_finalize=False, solution="triton"
+        )
 
 
 def _select_on(platform: PlatformInfo, *args, **kwargs) -> str:

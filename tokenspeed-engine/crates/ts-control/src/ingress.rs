@@ -238,12 +238,14 @@ pub fn admit(mut request: TokenizedGenerateReqInput, limits: &IngressLimits) -> 
     });
     let mut params = request.sampling_params;
     sampling::resolve(&mut params, &rid);
-    if let Some(reasoning) = &limits.reasoning {
-        reasoning.defer_schema(
-            &mut params,
-            request.input_ids.as_deref().unwrap_or_default(),
-        );
-    }
+    let unanswerable = limits.reasoning.as_ref().and_then(|reasoning| {
+        reasoning
+            .defer_schema(
+                &mut params,
+                request.input_ids.as_deref().unwrap_or_default(),
+            )
+            .err()
+    });
     // Checked as the client sent them: the context clamp below is the
     // engine's, so `min_new_tokens` is bounded by the budget asked for, not
     // the one the context leaves (the request then finishes at its length).
@@ -251,6 +253,7 @@ pub fn admit(mut request: TokenizedGenerateReqInput, limits: &IngressLimits) -> 
         .validation_error
         .clone()
         .or_else(|| embeddings.as_ref().err().cloned())
+        .or(unanswerable)
         .or_else(|| {
             request
                 .cache_session_id
@@ -261,6 +264,22 @@ pub fn admit(mut request: TokenizedGenerateReqInput, limits: &IngressLimits) -> 
                         "cache_session_id exceeds the limit of {MAX_CACHE_SESSION_ID_BYTES} UTF-8 bytes"
                     )
                 })
+        })
+        .or_else(|| {
+            request
+                .cache_group_id
+                .as_ref()
+                .filter(|id| id.len() > MAX_CACHE_SESSION_ID_BYTES)
+                .map(|_| {
+                    format!(
+                        "cache_group_id exceeds the limit of {MAX_CACHE_SESSION_ID_BYTES} UTF-8 bytes"
+                    )
+                })
+        })
+        .or_else(|| {
+            (request.shared_prefix_tokens.len() > 64 || request.shared_prefix_tokens.iter().any(|&boundary|
+                boundary <= 0 || boundary as usize >= request.input_ids.as_ref().map_or(0, Vec::len)))
+                .then(|| "shared_prefix_tokens requires at most 64 positive boundaries shorter than the input".to_owned())
         })
         .or_else(|| {
             refusal(
@@ -350,6 +369,8 @@ pub fn admit(mut request: TokenizedGenerateReqInput, limits: &IngressLimits) -> 
     let spec = RequestSpec {
         request_id: rid.clone(),
         session_id: request.cache_session_id.unwrap_or_default(),
+        cache_group_id: request.cache_group_id.unwrap_or_default(),
+        shared_prefix_tokens: request.shared_prefix_tokens,
         tokens: request.input_ids.unwrap_or_default(),
         max_new_tokens: max_new_tokens.clamp(0, i64::from(i32::MAX)) as i32,
         // Prompt logprobs need logits from their start on, so the admission
@@ -583,7 +604,7 @@ mod tests {
     use ts_wire::{Modality, MultimodalDataItem, MultimodalInputs, Value};
 
     use super::*;
-    use crate::request::FinishReason;
+    use crate::{json_framing::MessageBoundary, request::FinishReason};
 
     fn limits() -> IngressLimits {
         IngressLimits {
@@ -727,6 +748,49 @@ mod tests {
     }
 
     #[test]
+    fn shared_prefix_hints_are_bounded_and_preserve_normal_admission() {
+        let mut valid = request("r1", vec![1, 2, 3, 4], SamplingParams::default());
+        valid.shared_prefix_tokens = vec![1, 3];
+        let Some(Admitted::Run(admission)) = admit(valid, &limits()) else {
+            panic!("expected valid hints")
+        };
+        assert_eq!(admission.spec.shared_prefix_tokens, [1, 3]);
+        assert_eq!(admission.spec.max_cached_prefix_tokens, i32::MAX);
+        for hints in [vec![0], vec![-1], vec![4], vec![1; 65]] {
+            let mut invalid = request("r1", vec![1, 2, 3, 4], SamplingParams::default());
+            invalid.shared_prefix_tokens = hints;
+            assert!(refused_message(admit(invalid, &limits()).unwrap())
+                .contains("shared_prefix_tokens"));
+        }
+    }
+
+    #[test]
+    fn cache_groups_do_not_replace_sessions_or_change_tokens() {
+        for group_id in [
+            None,
+            Some(String::new()),
+            Some("g".repeat(4096)),
+            Some("🦀".repeat(1024)),
+        ] {
+            let mut request = request("r1", vec![1, 2, 3], SamplingParams::default());
+            request.cache_session_id = Some("independent-session".to_owned());
+            request.cache_group_id = group_id.clone();
+            let Some(Admitted::Run(admission)) = admit(request, &limits()) else {
+                panic!("expected admission for a bounded cache group");
+            };
+            assert_eq!(admission.spec.session_id, "independent-session");
+            assert_eq!(admission.spec.cache_group_id, group_id.unwrap_or_default());
+            assert_eq!(admission.spec.tokens, [1, 2, 3]);
+        }
+        for group_id in ["g".repeat(4097), format!("{}g", "🦀".repeat(1024))] {
+            let mut request = request("r1", vec![1, 2, 3], SamplingParams::default());
+            request.cache_group_id = Some(group_id);
+            let message = refused_message(admit(request, &limits()).unwrap());
+            assert!(message.contains("cache_group_id"), "{message}");
+        }
+    }
+
+    #[test]
     fn the_budget_is_clamped_to_the_context() {
         let limits = IngressLimits {
             max_req_input_len: 99,
@@ -864,6 +928,7 @@ mod tests {
             schema_slot: "SLOT".to_owned(),
             markers: Some((7, 8)),
             implicit_closer: None,
+            boundary: None,
         };
         let admitted = |limits: &IngressLimits, prompt: Vec<i32>, schema: &str| {
             let params = SamplingParams {
@@ -931,6 +996,66 @@ mod tests {
                 .as_deref(),
             Some(schema)
         );
+    }
+
+    #[test]
+    fn a_json_answer_needs_a_prompt_that_ends_at_a_message_boundary() {
+        // Block headers are 5 (model) 6 (text); 9 closes a message and 10 ends the turn.
+        let limits = IngressLimits {
+            grammar: true,
+            reasoning: Some(ReasoningGrammar {
+                continues: r#"{"continues":SLOT}"#.to_owned(),
+                may_open: r#"{"may_open":SLOT}"#.to_owned(),
+                schema_slot: "SLOT".to_owned(),
+                markers: None,
+                implicit_closer: None,
+                boundary: Some(MessageBoundary {
+                    open_answer: vec![5, 6],
+                    closed: vec![vec![9], vec![9, 10]],
+                }),
+            }),
+            ..limits()
+        };
+        let schema = r#"{"type":"object"}"#;
+        let admit_with = |prompt: Vec<i32>| {
+            let params = SamplingParams {
+                json_schema: Some(schema.to_owned()),
+                ..Default::default()
+            };
+            admit(request("r", prompt, params), &limits).expect("one request id")
+        };
+        let tag = |admitted: Admitted| match admitted {
+            Admitted::Run(admission) => admission.sampling_params.structural_tag,
+            Admitted::Refused { .. } => panic!("expected admission"),
+        };
+        // An empty answer header: the reply is the payload.
+        assert_eq!(
+            tag(admit_with(vec![1, 9, 5, 6])).as_deref(),
+            Some(r#"{"continues":{"type":"object"}}"#)
+        );
+        // A closed message, or no prompt: the reply writes its own blocks.
+        for prompt in [vec![1, 9], vec![1, 9, 10], vec![]] {
+            assert_eq!(
+                tag(admit_with(prompt)).as_deref(),
+                Some(r#"{"may_open":{"type":"object"}}"#)
+            );
+        }
+        // A prompt that ends inside another block cannot take a JSON answer.
+        for prompt in [vec![1, 9, 5], vec![1, 9, 5, 6, 2]] {
+            let Admitted::Refused { state, .. } = admit_with(prompt) else {
+                panic!("expected a refusal");
+            };
+            let message = state
+                .finished_reason
+                .as_ref()
+                .and_then(FinishReason::abort_message)
+                .expect("refused requests abort")
+                .to_owned();
+            assert!(
+                message.contains("closed message or an empty assistant text header"),
+                "{message}"
+            );
+        }
     }
 
     #[test]

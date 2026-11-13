@@ -419,6 +419,10 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
         if (spec.max_new_tokens < 0) {
             throw std::invalid_argument("Scheduler: max_new_tokens must be non-negative");
         }
+        if (spec.shared_prefix_tokens.size() > 64 || std::ranges::any_of(spec.shared_prefix_tokens, [&](auto boundary) {
+                return boundary <= 0 || static_cast<std::size_t>(boundary) >= spec.tokens.size();
+            }))
+            throw std::invalid_argument("Scheduler: invalid shared prefix boundaries");
         if (spec.max_cached_prefix_tokens < 0) {
             throw std::invalid_argument("Scheduler: max_cached_prefix_tokens must be non-negative");
         }

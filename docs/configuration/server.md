@@ -21,6 +21,14 @@ For a compact compatibility table, see
 | `--download-dir` | Hugging Face download/cache directory. |
 | `--hf-overrides` | JSON overrides for model configuration values. |
 
+Models can request shared writable checkpoint mappings for selected host
+weights. Use `--load-format auto` or `--load-format safetensors` with writable
+safetensors files for these tensors. InstantTensor, `npcache`, and PyTorch
+checkpoint loading (including an `auto` fallback) reject selected weights
+instead of silently ignoring the mapping request. Weights not selected for
+shared mappings keep their existing loading behavior. No extra CLI flag is
+needed for the mapping request declared by the model.
+
 ### Checkpoint prefetch and TP shards
 
 Safetensors loading prefetches checkpoints into the OS page cache. Ranks on
@@ -153,7 +161,7 @@ switch an envelope folds is also available individually under `auto`.
 | `--served-model-name` | The model's name in metric labels. Under `ts serve`, requests may also name the model by it; the OpenAI-compatible API lists the model path. |
 | `--api-key` | SMG gateway API key for authorization with upstream workers. |
 | `--chat-template` | Built-in chat template name or template file path (handled by the smg gateway). |
-| `--stream-interval` | Streaming buffer interval in generated tokens. Smaller values stream more frequently. |
+| `--stream-interval` | Streaming buffer size in generated tokens. The server streams the first step's tokens at once, then whenever at least this many tokens are unsent. Smaller values stream more often. |
 | `--weight-version` | Initial model-weight version, the L3 cache's namespace (see [Weight versions](#weight-versions)). Defaults to `default`. |
 | `--model-update-config` | JSON object handed to the Model Updater SDK for the Mooncake weight update. Requires the three flags below; see [Mooncake weight updates](#mooncake-weight-updates). |
 | `--model-update-sdk-module` | Import path of the Model Updater SDK module. Imported in the scheduler process on the first Mooncake update, not at startup. Required with `--model-update-config`. |
@@ -510,6 +518,8 @@ Trainer-side contract:
 | `--enable-prefix-caching` / `--disable-prefix-caching` | Enable or disable prefix cache reuse. |
 | `--enforce-eager` | Disable device-graph execution (CUDA Graph on CUDA, ACL Graph on NPU). |
 | `--disable-prefill-graph` | Keep prefill eager while leaving decode device graphs enabled. |
+| `--decode-monokernel` | Run each decoder layer's small decode steps as one persistent monokernel launch on gfx950 ([decode monokernel design](../design/monokernel.md)). Off by default. Models: Qwen3.8-Flash-Next (`Qwen4ExpForCausalLM`, `Qwen4ExpForConditionalGeneration`) and Muse Spark (`MuseSparkForConditionalGeneration`, with its DFlash2 draft). Startup fails when a layer cannot be packed; larger steps keep the regular path. |
+| `--monokernel-stuck-record-dir` | With `--decode-monokernel`: a directory on tmpfs (for example `/dev/shm`) where each rank keeps its stuck-poll record file; the file is GPU-registered host memory, and a disk filesystem's periodic writeback of it stalls decode. A launch poll that gives up writes what it waited for there before the launch traps, so the record outlives the process. Without it the records stay in pinned memory and are logged when the failure reaches Python. |
 | `--disable-kda-prefill-graph` | Disable KDA prefill CUDA graphs while retaining ordinary prefill and decode graph settings. Enabled by default for supported `cutedsl_kda` prefill attention when prefill graphs are enabled. |
 | `--disable-cudagraph-memory-reserve` | Size the KV cache from free memory instead of reserving what the device graphs will cost and, on CUDA, what startup keeps resident. |
 | `--max-cudagraph-capture-size` | Largest decode batch size to capture as a device graph. |

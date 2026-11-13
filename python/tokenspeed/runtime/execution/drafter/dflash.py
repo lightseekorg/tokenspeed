@@ -118,6 +118,12 @@ def _resolve_draft_query_width(verify_width: int, sample_from_anchor: bool) -> i
 
 _UNSET = object()
 
+# A short context projection that warmup_extend also compiles: the column
+# all-gather picks its subgroup layout by the rank-local payload size, so a
+# short chunk (here one 8-row draft block's verify rows) takes another
+# layout than a long extend's.
+_SHORT_CONTEXT_PROJECTION_ROWS = 8
+
 # Dtypes a replicated draft head can carry over from the target's shards.
 # A whitelist, not a blacklist: the draft matmuls the gathered rows directly,
 # so a dtype belongs here only once its raw bytes ARE the vocabulary's values.
@@ -131,6 +137,7 @@ class DFlash(BaseDrafter):
     """DFlash block drafter backed by a native TokenSpeed draft model."""
 
     supports_pd_layerwise_finalization = True
+    uses_shared_context_projection = True
     sample_from_anchor = False
     spec_algorithm = "DFLASH"
 
@@ -196,6 +203,8 @@ class DFlash(BaseDrafter):
         self._validate_draft_attention_window()
         self._validate_draft_window_sink()
         self._greedy_gathered_max: torch.Tensor | None = None
+        # Set by wire_target, which binds the embedding.
+        self._first_layer_input = "full"
         self._greedy_gathered_ids: torch.Tensor | None = None
         self._greedy_gather_cap = 0
         self._init_fused_kv_helper()
@@ -332,7 +341,7 @@ class DFlash(BaseDrafter):
             (max_bs,),
             self.draft_query_width,
             dtype=torch.int32,
-            pin_memory=True,
+            pin_memory=self.device.type == "cuda",
         )
         self.block_offsets = torch.arange(
             self.draft_query_width, dtype=torch.int64, device=self.device
@@ -360,6 +369,14 @@ class DFlash(BaseDrafter):
         self.gather_indices_buf = torch.empty(
             (max_bs,), dtype=torch.int64, device=self.device
         )
+        # Context writes' verify starts; zeros keep stale extend rows non-negative.
+        self.context_starts_buf = torch.zeros(
+            (max_bs,), dtype=torch.int64, device=self.device
+        )
+        # Context writes' verify-row slots.
+        self.context_locs_buf = torch.zeros(
+            (max_bs * self.spec_num_tokens,), dtype=torch.int32, device=self.device
+        )
 
     def wire_target(self, target_model) -> None:
         """Bind execution resources without changing model capture configuration."""
@@ -371,9 +388,60 @@ class DFlash(BaseDrafter):
         self.embed_tokens = target_model.get_input_embeddings()
         if self.embed_tokens is None:
             self.embed_tokens = self.model.embed_tokens
+        self._first_layer_input = self._first_layer_input_mode()
         self.lm_head = target_model.lm_head
         self.logits_processor = language_model.logits_processor
         self._replicate_head_over_attention_dp()
+
+    def _first_layer_embeds(self, flat_ids: torch.Tensor) -> torch.Tensor:
+        """This rank's embedding input to the draft's first layer.
+
+        The target's embedding may be vocab-sharded over the attention TP
+        group (for example 8 shards of 36864 rows). ``_partial_lookup`` then
+        answers with this rank's rows and ZERO rows for every id outside its
+        shard, so the sum over the group is the embedding and one rank's view
+        is not. Exactly one place may sum it: the lookup, or, when the draft's
+        dense group spans several ranks, the first layer's reduce + norm (see
+        :meth:`_first_layer_input_mode`). Adding zero rows is exact, so every
+        mode hands the first layer the same embedding.
+        """
+        input_embeds = self.embed_tokens(
+            flat_ids, reduce_results=self._first_layer_input == "full"
+        )
+        if (
+            self._first_layer_input == "first_rank"
+            and self.model.mapping.dense.tp_rank != 0
+        ):
+            input_embeds.zero_()
+        return input_embeds
+
+    def _first_layer_input_mode(self) -> str:
+        """How the drafter hands the embedding to the draft's first layer.
+
+        A draft whose dense group holds several ranks (attention DP 1) reduces
+        its first layer's input over that group, so each rank must hand in a
+        partial whose sum is the embedding: the lookup's own shard partial
+        when the embedding is vocab-sharded over that group ("partial"), or
+        the whole rows on the group's first rank and zeros on the others when
+        the embedding is not sharded ("first_rank"). A replicated draft (dense
+        TP 1) reduces nothing, so the lookup sums its shards itself ("full").
+
+        Raises:
+            ValueError: The embedding is sharded over another group than the
+                draft's dense group.
+        """
+        dense = self.model.mapping.dense
+        if dense.tp_size == 1:
+            return "full"
+        if self.embed_tokens.tp_size == 1:
+            return "first_rank"
+        if tuple(self.embed_tokens.tp_group) != tuple(dense.tp_group):
+            raise ValueError(
+                "the draft's dense group "
+                f"{tuple(dense.tp_group)} is not the embedding's shard group "
+                f"{tuple(self.embed_tokens.tp_group)}"
+            )
+        return "partial"
 
     def _replicate_head_over_attention_dp(self) -> None:
         """Replace the wired head and processor with replicated ones when the
@@ -489,7 +557,7 @@ class DFlash(BaseDrafter):
     def _ensure_dist_argmax_state(self, dtype: torch.dtype, device: torch.device):
         """Probe once, before capture, and reuse the verdict for the process."""
         if self._dist_argmax_state is _UNSET:
-            if torch.cuda.is_current_stream_capturing():
+            if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
                 return None  # rendezvous is collective; leave it to warmup
             self._dist_argmax_state = self._probe_dist_argmax_state(dtype, device)
         return self._dist_argmax_state
@@ -717,28 +785,48 @@ class DFlash(BaseDrafter):
         if base_ctx.input_num_tokens == 0:
             return
 
+        self._prepare_proposal_features(base_ctx, hidden, accept_lengths)
         positions = self.input_buffers.positions_buf[: base_ctx.input_num_tokens]
-        # Context rows belong to the draft group's page-id space. This runs
-        # before the draft publishes its next proposal window.
-        backend = self.attn_backend
-        if base_ctx.num_extends == base_ctx.bs:
-            # A PD prefill worker may never publish a decode window.
-            cache_locs = backend.extend_span_locations()
-        elif base_ctx.num_extends == 0:
-            cache_locs = backend.decode_window_locations()
-        else:
-            cache_locs = torch.cat(
-                (
-                    backend.extend_span_locations(),
-                    backend.decode_window_locations(),
-                )
-            )
+        cache_locs = self._context_cache_locations(base_ctx)
         self._write_native_cache(
             hidden,
             positions,
             cache_locs[: base_ctx.input_num_tokens],
             decode_only=base_ctx.num_extends == 0,
         )
+
+    def _context_cache_locations(self, ctx: ForwardContext) -> torch.Tensor:
+        """Return the slots of the round's target rows in the draft's own pages.
+
+        Rows keep the target's packed order: extend rows, then verify rows.
+        Each decode request writes the target's verify width from its first
+        verify position. The draft's decode window has the draft's query
+        width instead, which DSpark narrows by the anchor row. This runs
+        before the draft publishes its next proposal window, over the table
+        the runner refreshed for this round.
+
+        Args:
+            ctx: The target forward's context.
+
+        Returns:
+            ``[ctx.input_num_tokens]`` int32 cache slots.
+        """
+        backend = self.attn_backend
+        if ctx.num_extends == ctx.bs:
+            # A PD prefill worker may never publish a decode window.
+            return backend.extend_span_locations()
+        width = self.spec_num_tokens
+        first = ctx.input_num_tokens - (ctx.bs - ctx.num_extends) * width
+        # Extend requests resolve stale non-negative starts; their slots are dropped.
+        starts = self.context_starts_buf[: ctx.bs]
+        starts[ctx.num_extends :].copy_(
+            self.input_buffers.positions_buf[first : ctx.input_num_tokens : width]
+        )
+        backend.draft_write_locations_uniform(self.context_locs_buf, starts, width)
+        verify = self.context_locs_buf[ctx.num_extends * width : ctx.bs * width]
+        if ctx.num_extends == 0:
+            return verify
+        return torch.cat((backend.extend_span_locations(), verify))
 
     def _update_draft_prefix_lengths(
         self, base_ctx: ForwardContext, accept_lengths: torch.Tensor
@@ -754,19 +842,36 @@ class DFlash(BaseDrafter):
             old_lens = self.runtime_states.valid_cache_lengths.index_select(
                 0, req_pool_indices
             )
-            self.draft_seq_lens_buf[:bs].copy_(
-                old_lens.to(torch.int32) + accept_lengths[:bs].to(torch.int32)
+            torch.add(
+                old_lens.to(torch.int32),
+                accept_lengths[:bs].to(torch.int32),
+                out=self.draft_seq_lens_buf[:bs],
             )
             return
 
         if base_ctx.input_num_tokens == 0:
             return
 
+        takes, last_row = self._accepted_target_rows(base_ctx, accept_lengths)
+        positions = self.input_buffers.positions_buf[: base_ctx.input_num_tokens]
+        old_lens = self.runtime_states.valid_cache_lengths.index_select(
+            0, req_pool_indices
+        ).to(torch.int32)
+        # Writers may materialize rejected rows too; only this accepted prefix
+        # is visible to the next draft, and later rounds overwrite the rest.
+        self.draft_seq_lens_buf[:bs].copy_(
+            torch.where(takes > 0, (positions[last_row] + 1).to(torch.int32), old_lens)
+        )
+
+    def _accepted_target_rows(
+        self, base_ctx: ForwardContext, accept_lengths: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return accepted counts and final packed row per request."""
+        bs = base_ctx.bs
         # Target verification produces spec_num_tokens rows per decode request;
         # prefill rows retain their actual chunk lengths.
         lengths = self.input_buffers.input_lengths_buf[:bs].to(torch.int64).clone()
         lengths[base_ctx.num_extends :] = self.spec_num_tokens
-        positions = self.input_buffers.positions_buf[: base_ctx.input_num_tokens]
         starts = torch.cumsum(lengths, 0) - lengths
         takes = lengths.clone()
         if bs > base_ctx.num_extends:
@@ -776,14 +881,12 @@ class DFlash(BaseDrafter):
                 .clamp(min=0, max=self.spec_num_tokens)
             )
         last_row = (starts + takes - 1).clamp(min=0, max=base_ctx.input_num_tokens - 1)
-        old_lens = self.runtime_states.valid_cache_lengths.index_select(
-            0, req_pool_indices
-        ).to(torch.int32)
-        # Writers may materialize rejected rows too; only this accepted prefix
-        # is visible to the next draft, and later rounds overwrite the rest.
-        self.draft_seq_lens_buf[:bs].copy_(
-            torch.where(takes > 0, (positions[last_row] + 1).to(torch.int32), old_lens)
-        )
+        return takes, last_row
+
+    def _prepare_proposal_features(
+        self, _ctx: ForwardContext, _hidden: torch.Tensor, _accept_lengths: torch.Tensor
+    ) -> None:
+        """Prepare round-local features before the shared block forward."""
 
     def _write_native_cache(
         self,
@@ -818,6 +921,24 @@ class DFlash(BaseDrafter):
                 attn_backend=self.attn_backend,
             )
 
+    def warmup_extend(self, num_tokens: int) -> None:
+        """Project ``num_tokens`` rows of zero taps, as an extend's context
+        write does (``_write_native_cache``). The projection ends in a column
+        all-gather over the attention TP group; a decode warmup whose context
+        write takes the draft monokernels never reaches it. Warm both long
+        and short chunks because the gather chooses its subgroup count by
+        the rank-local payload size."""
+        model = self.draft_model_runner.model
+        taps = torch.zeros(
+            (num_tokens, model.context_in_features),
+            dtype=model.context_dtype,
+            device=self.device,
+        )
+        with torch.inference_mode():
+            model.project_target_hidden(taps)
+            if num_tokens > _SHORT_CONTEXT_PROJECTION_ROWS:
+                model.project_target_hidden(taps[:_SHORT_CONTEXT_PROJECTION_ROWS])
+
     def set_cache_pool(self, token_to_kv_pool: CachePool | None) -> None:
         """The stacked KV views and their raw pointers name the old arena."""
         super().set_cache_pool(token_to_kv_pool)
@@ -838,6 +959,8 @@ class DFlash(BaseDrafter):
         # torch.mm(out=...) is always used; workspace pre-allocated at warmup.
         self._fused_kv_k_buffers = []
         self._fused_kv_v_buffers = []
+        if not self.uses_shared_context_projection:
+            return
         if self.draft_model_runner.mapping.attn.kvp_size > 1:
             # The fused scatter takes physical slots and has no ownership
             # mask; the per-layer writer translates through the placement.
@@ -1090,6 +1213,8 @@ class DFlash(BaseDrafter):
         self._sink_cache_locs: torch.Tensor | None = None
         # Whether this round's last tap already wrote the draft's context KV.
         self._context_written = False
+        if not self.uses_shared_context_projection:
+            return
         model = self.draft_model_runner.model
         if getattr(model, "fc_norm", None) is not None:
             logger.info(
@@ -1122,6 +1247,9 @@ class DFlash(BaseDrafter):
         """
         return (
             self._tap_rows is not None
+            and self.target_model is not None
+            # The target's decode monokernels store the taps themselves.
+            and not self.target_model.stores_capture_taps(ctx)
             and ctx.dspark_context_producer is None
             and ctx.num_extends == 0
             and ctx.input_num_tokens > 0
@@ -1143,7 +1271,7 @@ class DFlash(BaseDrafter):
         num_tokens = ctx.input_num_tokens
         self._sink_tokens = num_tokens
         self._sink_positions = self.input_buffers.positions_buf[:num_tokens]
-        self._sink_cache_locs = self.attn_backend.decode_window_locations()[:num_tokens]
+        self._sink_cache_locs = self._context_cache_locations(ctx)
         ctx.target_capture_sink = self
 
     def on_target_capture(self, capture_idx: int, hidden: torch.Tensor) -> None:
@@ -1348,16 +1476,7 @@ class DFlash(BaseDrafter):
         )
 
         flat_ids = block_ids.reshape(-1)
-        # The target's embedding may be vocab-sharded over the attention TP
-        # group (for example 8 shards of 36864 rows). ``_partial_lookup`` then
-        # answers with this rank's rows and ZERO rows for every id outside its
-        # shard, so the sum over the group is the embedding and one rank's view
-        # is not. Without the reduce every rank but an id's owner drafts from
-        # zeros -- no error, just a draft that predicts nothing. With a
-        # single-rank table (TP=1, or attention DP where the rank holds the
-        # whole vocabulary) there is nothing to sum: the all-reduce is a no-op,
-        # so this matches the unreduced lookup exactly.
-        input_embeds = self.embed_tokens(flat_ids, reduce_results=True)
+        input_embeds = self._first_layer_embeds(flat_ids)
 
         with torch.inference_mode():
             logits_output = self.draft_model_runner.forward(
