@@ -84,8 +84,8 @@ def _run(batch, logits, bias, latent_in):
 
 def _latent(batch, seed):
     """BF16 latent rows with no zero, so no 32-bit word is the sentinel."""
-    g = torch.Generator(device="cuda").manual_seed(seed)
-    values = torch.randn(batch, LATENT, device="cuda", generator=g).bfloat16()
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    values = torch.randn(batch, LATENT, device="cuda", generator=generator).bfloat16()
     return torch.where(values == 0, torch.ones_like(values), values)
 
 
@@ -110,9 +110,9 @@ def _assert_rearmed(box, batch):
 
 @pytest.mark.parametrize("batch", BATCHES)
 def test_route_matches_the_reference(batch):
-    g = torch.Generator(device="cuda").manual_seed(batch)
-    logits = torch.randn(batch, EXPERTS, device="cuda", generator=g) * 2 + 1e-3
-    bias = torch.randn(EXPERTS, device="cuda", generator=g) * 0.05
+    generator = torch.Generator(device="cuda").manual_seed(batch)
+    logits = torch.randn(batch, EXPERTS, device="cuda", generator=generator) * 2 + 1e-3
+    bias = torch.randn(EXPERTS, device="cuda", generator=generator) * 0.05
     latent_in = _latent(batch, 100 + batch)
     ids, weights, latent, box = _run(batch, logits, bias, latent_in)
 
@@ -138,9 +138,9 @@ def test_route_matches_the_reference(batch):
 @pytest.mark.parametrize("batch", BATCHES)
 def test_route_breaks_ties_to_the_lower_expert(batch):
     """Logits from five values and no bias: equal keys rank by expert id."""
-    g = torch.Generator(device="cuda").manual_seed(1000 + batch)
+    generator = torch.Generator(device="cuda").manual_seed(1000 + batch)
     levels = torch.tensor([-3.0, -1.0, 0.25, 1.5, 3.0], device="cuda")
-    pick = torch.randint(0, 5, (batch, EXPERTS), device="cuda", generator=g)
+    pick = torch.randint(0, 5, (batch, EXPERTS), device="cuda", generator=generator)
     logits = levels[pick]
     bias = torch.zeros(EXPERTS, device="cuda")
     latent_in = _latent(batch, 200 + batch)
