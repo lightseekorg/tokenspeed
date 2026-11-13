@@ -116,7 +116,7 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores(StoreS
             .group_id = group_ids[i],
             .source_page = manager.ResolveCacheBlockId(*device_block_refs[i]),
             .destination_page = manager.ResolveCacheBlockId(*host_block_ref),
-            .content_hash = keys[i].content_hash,
+            .content_hash = keys[i].content_hash.ToString(),
             .page_offset = keys[i].page_offset,
         });
         // A stream-ordered store resolves the source page id and lets the
@@ -305,7 +305,7 @@ std::optional<WriteBackOperation> TierTransferManager::StartEvictionStores() {
                 .group_id = member.key.group_id,
                 .source_page = allocator.ResolveDeviceCacheBlockId(member.device_location),
                 .destination_page = allocator.ResolveCacheBlockId(*host_block),
-                .content_hash = member.key.content_hash,
+                .content_hash = member.key.content_hash.ToString(),
                 .page_offset = member.key.page_offset,
             });
             tickets.push_back(StoreTicket{member.key, CacheBlockRef{}, host_block});
@@ -377,8 +377,8 @@ std::int32_t TierTransferManager::DemoteInFlightEvictions(std::span<const CacheK
                 ++host_entry_holds[member.key];
             }
             if (!member.metadata.demoted) {
-                member.metadata.last_access_epoch = CacheCoordinator::kDemotedAccessEpoch;
-                member.metadata.was_acquired = false;
+                member.metadata.eviction.last_access_epoch = CacheCoordinator::kDemotedAccessEpoch;
+                member.metadata.eviction.was_acquired = false;
                 member.metadata.demoted = true;
                 // One publishing into a Host entry counts with that entry.
                 demoted += holds_host_entry ? 0 : 1;
@@ -578,7 +578,7 @@ std::optional<TierTransferManager::RetractionStores> TierTransferManager::StartR
         const std::uint32_t op_id = nextOpId();
         std::vector<CacheTransfer> transfers = resolveTransfers(host_store_pairs);
         for (std::size_t i = 0; i < transfers.size(); ++i) {
-            transfers[i].content_hash = host_store_pairs[i].key.content_hash;
+            transfers[i].content_hash = host_store_pairs[i].key.content_hash.ToString();
             transfers[i].page_offset = host_store_pairs[i].key.page_offset;
             ++stats.blocks[transfers[i].group_id];
         }
@@ -709,7 +709,7 @@ std::vector<CacheTransfer> TierTransferManager::resolveTransfers(std::span<const
             .group_id = block_transfer.group_id,
             .source_page = manager.ResolveCacheBlockId(*block_transfer.source),
             .destination_page = manager.ResolveCacheBlockId(*block_transfer.destination),
-            .content_hash = block_transfer.key.content_hash,
+            .content_hash = block_transfer.key.content_hash.ToString(),
             .page_offset = block_transfer.key.page_offset,
         });
     }

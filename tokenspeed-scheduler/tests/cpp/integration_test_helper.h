@@ -48,6 +48,12 @@ struct SchedulerTestAccess {
     static CacheCoordinator& Coordinator(Scheduler& scheduler) { return scheduler.coordinator_; }
     static const BlockPool& Pool(const Scheduler& scheduler) { return scheduler.block_pool_; }
     static BlockPool& Pool(Scheduler& scheduler) { return scheduler.block_pool_; }
+    // A metadata-only fill still needs the same token descriptors as a real
+    // publication before the coordinator notifies the event sink.
+    static void RegisterKvEventPages(Scheduler& scheduler, Request& request, std::span<const std::string> hashes,
+                                     std::int32_t first_page) {
+        scheduler.registerKvEventPrefixPages(request, hashes, first_page, static_cast<std::int32_t>(hashes.size()));
+    }
     static void RecordAdmittedPages(Scheduler& scheduler, ExecutionPlan& plan,
                                     const CacheCoordinator::AdmissionResult& result) {
         scheduler.recordAdmittedPages(plan, result);
