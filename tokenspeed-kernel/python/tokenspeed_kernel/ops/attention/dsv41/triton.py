@@ -2687,6 +2687,12 @@ def quantize_index_queries(index_q, weights):
 
 
 def pack_index_queries(values):
+    """Pack [..., H, 128] BF16 index queries into the MXFP4 index format.
+
+    ``values`` may be strided, including a column slice of a wider projection
+    or a broadcast read view; it is read in place. Returns uint8 [..., H, 64]
+    E2M1 codes and int32 [..., H] UE8M0 scale words, one per 128-value row.
+    """
     data = torch.empty(
         (*values.shape[:-1], 64), dtype=torch.uint8, device=values.device
     )
