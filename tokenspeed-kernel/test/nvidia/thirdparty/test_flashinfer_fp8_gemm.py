@@ -93,7 +93,7 @@ def test_wrapper_calls_reuse_one_runner_per_device(monkeypatch):
     upstream = gemm_base.get_gemm_module().cublas_fp8_gemm_runner()
     assert type(runner).__name__ == type(upstream).__name__
     out = torch.empty(1, 300, 4096, dtype=torch.bfloat16, device="cuda")
-    workspace = gemm_base._get_cache_buf(
+    workspace = gemm_base._get_stream_cache_buf(
         "bmm_fp8_workspace", gemm_base.DEFAULT_WORKSPACE_SIZE, a.device
     )
     inputs = [a.unsqueeze(0), b.unsqueeze(0), scale_a, scale_b, out, workspace]
@@ -105,13 +105,13 @@ def test_concurrent_streams_do_not_share_the_cublaslt_workspace(monkeypatch):
     from tokenspeed_kernel.thirdparty.flashinfer import fp8_gemm
 
     used = []
-    real = gemm_base._get_cache_buf
+    real = gemm_base._get_stream_cache_buf
 
     def spy(name, num_bytes, device):
         used.append(real(name, num_bytes, device))
         return used[-1]
 
-    monkeypatch.setattr(gemm_base, "_get_cache_buf", spy)
+    monkeypatch.setattr(gemm_base, "_get_stream_cache_buf", spy)
     a, b, scale_a, scale_b = _operands(64, 4096, 4096, seed=11)
     out = torch.empty(1, 64, 4096, dtype=torch.bfloat16, device="cuda")
     operands = (a.unsqueeze(0), b.unsqueeze(0), scale_a, scale_b, out)
