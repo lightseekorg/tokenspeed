@@ -2540,16 +2540,11 @@ class KimiLinearMoE(nn.Module):
             kimi3_sorted_routing_scratch(
                 torch.device("cuda", torch.cuda.current_device())
             )
-            if current_platform().is_cdna4
-            and mapping.attn.dp_size == 1
-            and self.experts.plan.get("apply_kernel_name")
+            if self.experts.plan.get("apply_kernel_name")
             == "gluon_mxfp4_a8w4_situ_precomputed_moe_apply"
+            and self.topk.topk_config.uses_sigmoid_bias_topk
             and self.num_experts == 896
             and self.top_k == 16
-            and config.use_grouped_topk
-            and config.num_expert_group == 1
-            and config.topk_group == 1
-            and self.routed_scaling_factor is not None
             else None
         )
 
