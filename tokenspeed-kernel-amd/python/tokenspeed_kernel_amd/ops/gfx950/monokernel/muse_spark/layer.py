@@ -129,8 +129,9 @@ CHAINED_BASES = {
     "pool": 224,
     "merge": 128,
     "exr": 0,
-    # 8 or 16 rows: the comb tasks (8 a row) take CTAs from 0 and the 128
-    # unpool tasks (moe_tail.unpool_halves) CTAs 64 .. 191, after ex2 tasks
+    # Up to 8 rows the comb tasks (8 a row, at most 64) take CTAs 0 .. 63;
+    # past 8 rows WIDE moves them to 192. At 8 or 16 rows the 128 unpool
+    # tasks (moe_tail.unpool_halves) take CTAs 64 .. 191, after ex2 tasks
     # only: behind a comb task an unpool poll also waited for comb's cmb
     # puts to the 8 ranks to be acknowledged (vmcnt counts stores in order).
     "comb": 0,
