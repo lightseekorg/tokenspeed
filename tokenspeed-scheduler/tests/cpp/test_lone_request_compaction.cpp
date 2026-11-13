@@ -53,6 +53,7 @@
 #include "cache/coordinator/cache_coordinator.h"
 #include "cache/core/block_pool.h"
 #include "cache/prefix/prefix_hasher.h"
+#include "prefix_hash_text.h"
 #include "cache_test_access.h"
 #include "integration_test_helper.h"
 #include "scheduler/operations/group_demands.h"
@@ -762,11 +763,11 @@ TEST_F(LoneRequestCompactionSuite, MovesPublishedPagesByCopyAndKeepsTheirKeys) {
         coordinator.GroupPrefixIndex(0).Inspect(pool, keys[5]);
     ASSERT_TRUE(after);
     EXPECT_EQ(after->location, *moved_to);
-    EXPECT_EQ(after->metadata.last_access_epoch, before->metadata.last_access_epoch);
+    EXPECT_EQ(after->metadata.eviction.last_access_epoch, before->metadata.eviction.last_access_epoch);
     EXPECT_EQ(after->metadata.max_access_epoch, before->metadata.max_access_epoch);
-    EXPECT_EQ(after->metadata.logical_block_index, before->metadata.logical_block_index);
-    EXPECT_EQ(after->metadata.boundary_kind, before->metadata.boundary_kind);
-    EXPECT_EQ(after->metadata.was_acquired, before->metadata.was_acquired);
+    EXPECT_EQ(after->metadata.eviction.logical_block_index, before->metadata.eviction.logical_block_index);
+    EXPECT_EQ(after->metadata.eviction.boundary_kind, before->metadata.eviction.boundary_kind);
+    EXPECT_EQ(after->metadata.eviction.was_acquired, before->metadata.eviction.was_acquired);
     EXPECT_EQ(after->metadata.session, before->metadata.session);
     EXPECT_TRUE(after->pinned);  // the request's own table holds it
     EXPECT_EQ(tree.Find(keys[5].content_hash), node);
@@ -1674,7 +1675,8 @@ TEST(LoneRequestCopyInCompactionTest, RePlacesAHeldCopyInBlockWithoutZeroingIt) 
     const CacheBlockRef held_state_input = r[1].Blocks()[0];
 
     const TailPublication tail{
-        .tail_tokens = 6, .hash = HashPrefixPage(std::span<const std::int32_t>(prompt.data() + 120, 6), hashes.back())};
+        .tail_tokens = 6,
+        .hash = ContentHash{HashPrefixPage(std::span<const std::int32_t>(prompt.data() + 120, 6), hashes.back())}};
     const RequestProgress progress{
         .completed_pages = CompletedPages{.tokens = std::span<const std::int32_t>(prompt.data(), 126),
                                           .prefix_hashes = hashes,

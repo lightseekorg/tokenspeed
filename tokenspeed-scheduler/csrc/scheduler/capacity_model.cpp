@@ -247,9 +247,29 @@ std::int64_t CapacityModel::LcmBlocksNeededFor(std::span<const std::int64_t> gro
     return lcm_blocks;
 }
 
+std::int32_t CapacityModel::MaxRequestTokenLimit(const SchedulerConfig& config) {
+    // A request's token positions and the reservations past them are int32,
+    // and they run past its token limit L (the prompt plus the generation
+    // reserve; the prompt alone on the P role), which the runtime ends its
+    // generation within:
+    //  * a decode step reserves its verify window past the last computed
+    //    token, decode_input_tokens wide (no runtime decode reserve is wider),
+    //    and one more window for each overlapped step still in flight, so a
+    //    reservation ends by L + (overlap_schedule_depth + 1) *
+    //    decode_input_tokens -- on the P role too, whose last chunk reserves
+    //    the first window past its prompt;
+    //  * rounding such an end up to a block, or past it to the next prefix
+    //    page boundary, adds at most prefix_granularity more, as every block
+    //    granularity divides prefix_granularity.
+    // A limit of INT32_MAX less both keeps every one of them in range.
+    const std::int64_t headroom =
+        (std::int64_t{config.overlap_schedule_depth} + 1) * config.decode_input_tokens + config.prefix_granularity;
+    return static_cast<std::int32_t>(std::max<std::int64_t>(std::numeric_limits<std::int32_t>::max() - headroom, 0));
+}
+
 std::int32_t CapacityModel::MaxSingleRequestTokens(std::int64_t usable_lcm_blocks) const {
     std::int64_t low = 0;
-    std::int64_t high = std::numeric_limits<std::int32_t>::max();
+    std::int64_t high = MaxRequestTokenLimit(config_);
     while (low < high) {
         const std::int64_t candidate = low + (high - low + 1) / 2;
         if (LcmBlocksNeededFor(SingleRequestGroupPages(static_cast<std::int32_t>(candidate))) <= usable_lcm_blocks) {
