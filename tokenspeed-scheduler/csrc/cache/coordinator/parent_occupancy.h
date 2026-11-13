@@ -37,6 +37,9 @@ class ParentOccupancy {
 public:
     explicit ParentOccupancy(std::pmr::memory_resource* resource) : slots_{resource} {}
 
+    // The count of `parent`, inserted as `initial` when absent. The next
+    // GetOrInsert may grow or rehash the slots and so invalidate the
+    // returned reference, like any pointer from Find.
     std::int32_t& GetOrInsert(std::int32_t parent, std::int32_t initial) {
         _assert(parent > 0, "the reserved null parent has no shadow occupancy");
         if (slots_.empty()) grow();
