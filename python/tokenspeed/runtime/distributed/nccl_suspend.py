@@ -23,9 +23,9 @@
 ``ProcessGroupNCCL.suspend`` asks NCCL to free a communicator's device buffers
 (``ncclCommSuspend``) while keeping the communicator; ``resume`` restores them,
 so collectives -- including the ones recorded in CUDA graphs -- work again
-afterwards. Protocol 2 visits the initialized groups in their existing order.
-Protocol 3 checks the serving groups and their members before suspending them
-in a shared order. Uninitialized groups have no buffers to free.
+afterwards. Every process group of the world is visited, because a collective
+may run on any of them. Groups whose communicator was never created have no
+buffers to free and are skipped.
 
 Only NCCL's own memory is covered: symmetric-memory and multicast workspaces
 of the custom collectives stay resident.
@@ -33,13 +33,10 @@ of the custom collectives stay resident.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import torch
 import torch.distributed as dist
 from torch.distributed import distributed_c10d
 
-from tokenspeed.runtime.distributed.process_group_manager import process_group_manager
 from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
@@ -60,8 +57,8 @@ def nccl_suspend_supported() -> bool:
     )
 
 
-def _nccl_groups() -> list[tuple[dist.ProcessGroup, dist.ProcessGroupNCCL]]:
-    """The initialized NCCL groups and their backends, once per backend."""
+def _nccl_backends() -> list:
+    """The initialized NCCL backends of every process group, once each."""
     if not (
         dist.is_available()
         and dist.is_initialized()
@@ -70,7 +67,7 @@ def _nccl_groups() -> list[tuple[dist.ProcessGroup, dist.ProcessGroupNCCL]]:
     ):
         return []
     device = torch.device("cuda", torch.cuda.current_device())
-    groups = []
+    backends = []
     seen: set[int] = set()
     for group in list(distributed_c10d._world.pg_map):
         try:
@@ -83,86 +80,23 @@ def _nccl_groups() -> list[tuple[dist.ProcessGroup, dist.ProcessGroupNCCL]]:
         if not backend._is_initialized() or id(backend) in seen:
             continue
         seen.add(id(backend))
-        groups.append((group, backend))
-    return groups
-
-
-@dataclass(frozen=True)
-class NcclMemoryGroup:
-    """One local communicator and its serving-world identity."""
-
-    name: str
-    ranks: tuple[int, ...]
-    backend: dist.ProcessGroupNCCL
-
-
-def prepare_nccl_suspend(
-    memory_ranks: tuple[int, ...], *, p2p_ranks: tuple[tuple[int, ...], ...]
-) -> tuple[NcclMemoryGroup, ...]:
-    """Describe the local communicator sequence without entering NCCL."""
-    allowed = set(memory_ranks)
-    try:
-        p2p_groups = {
-            process_group_manager.get_device_process_group(ranks) for ranks in p2p_ranks
-        }
-    except KeyError as error:
-        raise RuntimeError("cannot verify the NCCL point-to-point groups") from error
-    plan = []
-    for group, backend in _nccl_groups():
-        name = group.group_name
-        # A trainer group can have the same numerical rank IDs in a different
-        # rendezvous. Only the default world and managed serving groups share
-        # the scheduler's rank namespace.
-        if (
-            group is not dist.group.WORLD
-            and not process_group_manager.owns_device_process_group(group)
-        ):
-            raise RuntimeError(f"NCCL group {name!r} is outside the serving world")
-        ranks = tuple(sorted(dist.get_process_group_ranks(group)))
-        if not allowed.issuperset(ranks):
-            raise RuntimeError(
-                f"NCCL group {name!r} includes ranks outside the memory coordination domain"
-            )
-        if group in p2p_groups and len(ranks) > 1:
-            # c10d can cache per-peer NCCL communicators behind one backend.
-            # Its suspend binding does not let us order those communicators.
-            raise RuntimeError(
-                f"NCCL group {name!r} may use point-to-point communicators with unknown suspend order"
-            )
-        plan.append(NcclMemoryGroup(name, ranks, backend))
-    # c10d gives a serving group the same unique name on all its members.
-    # A common order prevents cycles between overlapping communicators.
-    return tuple(sorted(plan, key=lambda group: group.name))
-
-
-def check_nccl_resume(plan: tuple[NcclMemoryGroup, ...]) -> None:
-    """Verify the suspended communicators still exist before resuming any."""
-    initialized = {id(backend) for _, backend in _nccl_groups()}
-    if any(id(group.backend) not in initialized for group in plan):
-        raise RuntimeError("a suspended NCCL group is no longer initialized")
-
-
-def apply_nccl_memory_plan(plan: tuple[NcclMemoryGroup, ...], *, release: bool) -> None:
-    """Use the same ordered communicators the serving ranks agreed to."""
-    for group in plan:
-        (group.backend.suspend if release else group.backend.resume)()
-    operation = "Suspended" if release else "Resumed"
-    logger.info(f"{operation} {len(plan)} NCCL process group(s)")
+        backends.append(backend)
+    return backends
 
 
 def suspend_nccl_communicators() -> int:
     """Suspend every initialized NCCL communicator; return how many."""
-    groups = _nccl_groups()
-    for _, backend in groups:
+    backends = _nccl_backends()
+    for backend in backends:
         backend.suspend()
-    logger.info(f"Suspended {len(groups)} NCCL process group(s)")
-    return len(groups)
+    logger.info(f"Suspended {len(backends)} NCCL process group(s)")
+    return len(backends)
 
 
 def resume_nccl_communicators() -> int:
     """Resume every initialized NCCL communicator; return how many."""
-    groups = _nccl_groups()
-    for _, backend in groups:
+    backends = _nccl_backends()
+    for backend in backends:
         backend.resume()
-    logger.info(f"Resumed {len(groups)} NCCL process group(s)")
-    return len(groups)
+    logger.info(f"Resumed {len(backends)} NCCL process group(s)")
+    return len(backends)

@@ -676,9 +676,9 @@ fn bootstrap_worker<'py>(
         }
         Err(error) => return Err(error),
     };
-    // The earlier v3 bootstrap can select v2 too. Use it without the v3
-    // collective ordering when Python does not support the checked startup.
-    let checked_startup = runtime.hasattr("MEMORY_PROTOCOL_STARTUP")?;
+    // Earlier bootstraps can select v2. The previous draft used a different
+    // preflight ABI, so use v3 only when both halves support this startup.
+    let checked_startup = runtime.hasattr("ASCEND_MEMORY_PROTOCOL_STARTUP")?;
     let prepared = if checked_startup {
         let options = PyDict::new(py);
         options.set_item("validate_memory_protocol", true)?;

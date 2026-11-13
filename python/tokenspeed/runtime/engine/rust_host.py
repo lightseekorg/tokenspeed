@@ -81,7 +81,10 @@ from tokenspeed.runtime.engine.gc_hooks import (
 )
 from tokenspeed.runtime.engine.logprobs import LogprobServability
 from tokenspeed.runtime.engine.memory_occupation import memory_regions
-from tokenspeed.runtime.engine.memory_protocol import gather_collective_addresses
+from tokenspeed.runtime.engine.memory_protocol import (
+    gather_collective_addresses,
+    supports_replica_memory_transitions,
+)
 from tokenspeed.runtime.engine.profiler import Profiler
 from tokenspeed.runtime.engine.rank_setup import (
     init_distributed,
@@ -649,8 +652,6 @@ class HostDataPlane:
         epd_publisher,
         *,
         replica_memory_transitions: bool,
-        memory_ranks: tuple[int, ...],
-        nccl_p2p_ranks: tuple[tuple[int, ...], ...],
     ) -> None:
         self._device = handle
         # The control plane exports the serving-time compilations.
@@ -659,8 +660,6 @@ class HostDataPlane:
         # Tag -> MemoryRegion (``memory_occupation.memory_regions``).
         self._regions = regions
         self._replica_memory_transitions = replica_memory_transitions
-        self._memory_ranks = memory_ranks
-        self._nccl_p2p_ranks = nccl_p2p_ranks
         # Per request: what every forward it runs in needs, fixed at
         # admission.
         self._requests: dict[str, _AdmittedRequest] = {}
@@ -985,14 +984,9 @@ class HostDataPlane:
 
     def check_memory_transition(
         self, tags: list[str], release: bool
-    ) -> tuple[bool, str, list[tuple[str, list[int]]]]:
-        """Check local prerequisites and identify participating NCCL groups."""
-        return self._device.check_memory_transition(
-            tags,
-            release=release,
-            memory_ranks=self._memory_ranks,
-            nccl_p2p_ranks=self._nccl_p2p_ranks,
-        )
+    ) -> tuple[bool, str]:
+        """Check an ordered request before any rank changes its memory mappings."""
+        return self._device.check_memory_transition(tags, release=release)
 
     def release_memory(self, tags: list[str]) -> None:
         """Free memory regions, in order; the scheduler has drained."""
@@ -1358,7 +1352,9 @@ class HostBootstrap:
             regions = memory_regions(
                 device.handle,
                 TorchMemorySaverAdapter.create(enable=server_args.enable_memory_saver),
-                nccl_suspendable=nccl_suspend_supported(),
+                nccl_suspendable=(
+                    not replica_memory_transitions and nccl_suspend_supported()
+                ),
                 replica_memory_transitions=replica_memory_transitions,
             )
             # EPD: a multimodal prefill node's first stage receives image
@@ -1568,15 +1564,6 @@ class HostBootstrap:
                     epd_receive.publisher if epd_receive is not None else None
                 ),
                 replica_memory_transitions=replica_memory_transitions,
-                memory_ranks=self.config.dp_ranks or self.config.replica_ranks,
-                nccl_p2p_ranks=tuple(
-                    ranks
-                    for ranks in (
-                        self.config.pp_ranks,
-                        self.config.eplb.ep_ranks if self.config.eplb else None,
-                    )
-                    if ranks is not None
-                ),
             )
             self._device = device.handle
 
@@ -1657,8 +1644,8 @@ class HostBootstrap:
         self._device.shutdown_cache()
 
 
-# The native host uses this to opt into the checked rendezvous and preflight ABI.
-MEMORY_PROTOCOL_STARTUP = True
+# The native host uses this to opt into the checked rendezvous.
+ASCEND_MEMORY_PROTOCOL_STARTUP = True
 
 
 def prepare_bootstrap(
@@ -1668,11 +1655,11 @@ def prepare_bootstrap(
     connection = Connection(control_fd)
     server_args, port_args, metrics_relay_endpoint = connection.recv()
     role = server_args.disaggregation_mode
-    # A host using the old one-argument entry point keeps the v2 ABI.
-    replica_memory_transitions = (
-        validate_memory_protocol
-        and server_args.enable_memory_saver
-        and role != "encode"
+    replica_memory_transitions = supports_replica_memory_transitions(
+        checked_startup=validate_memory_protocol,
+        memory_saver=server_args.enable_memory_saver,
+        device=server_args.device,
+        role=role,
     )
 
     def start(pd_outbox, protocol: int, host_spans) -> HostBootstrap | EncodeBootstrap:

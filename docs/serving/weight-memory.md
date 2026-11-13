@@ -5,7 +5,8 @@ Enable memory saving with an explicit `--weight-memory-policy cpu_backup` or
 routes. Rebuild the Python runtime, native host and kernel package together;
 the memory-saving startup handshake rejects native hosts without the
 replica-wide update-commit protocol (version 2: load admission and commit).
-A matching host and runtime also coordinate release and resume (version 3).
+On Ascend, a matching host and runtime also coordinate release and resume
+(version 3).
 
 ## Policy and model contract
 
@@ -40,8 +41,8 @@ weight allocation region has exited. Head-TP peer address tables and Lamport
 counters share the communication lifetime; preserving only model tensors does
 not preserve this backend-owned state. This avoids nested CUDA memory pools and
 keeps communication storage outside the weight region. They remain resident,
-including across discard; their memory must be included in the training headroom.
-An explicit tag list without `nccl` leaves NCCL communication buffers resident.
+including across discard; their memory must be included in the training headroom. NCCL release is independent and
+optional. No NCCL suspend feature is required when its tag is omitted.
 
 Expert placement state (load counters and, for all-to-all EP under a static
 dispatch algorithm, the per-rank dispatch map) is allocated with the placement
@@ -92,7 +93,7 @@ weights have not been committed yet. A weight update while KV is resident is
 also rejected under discard. Keep the orchestrator paused on any failed
 response, including a failure in a different serving replica.
 
-With protocol 3, send each memory operation to every engine in the
+With protocol 3 on Ascend, send each memory operation to every engine in the
 coordinated domain. A release or resume succeeds only after all of those
 engines finish. The domain is the attention-TP/PP replica for independent
 engines and the existing coordinated attention-DP group for engines that
@@ -111,16 +112,13 @@ refusal, so collect outstanding replies before retrying. A reported device
 failure after execution begins requires recovery of the affected engines
 before training or serving continues.
 
-The optional `nccl` tag is included when tags are omitted and the runtime
-advertises it. With protocol 3, the serving ranks verify the initialized
-NCCL groups and their participants before releasing any region. A serving
-world communicator can span otherwise independent DP engines, and a trainer
-update group uses a separate rank namespace. Protocol 3 also refuses NCCL
-suspend on initialized pipeline and expert-rebalance groups because the
-native binding does not expose the order of their per-peer communicators.
-To leave those communicators resident, pass explicit tags without `nccl`.
-A failure inside native NCCL suspend or resume can still require
-deployment-level recovery.
+CUDA uses protocol 2, with its existing graph memory and NCCL behavior.
+Protocol 3 leaves NCCL buffers resident and refuses an explicit `nccl` tag
+before releasing any region. Under protocol 2, the optional `nccl` tag
+requires every participant of the underlying communicator. A world
+communicator can span otherwise independent DP engines. To manage those
+engines separately, send explicit tags that leave NCCL resident. An omitted
+tag list includes `nccl` when the runtime advertises it.
 
 ## Validation before enabling in a training job
 

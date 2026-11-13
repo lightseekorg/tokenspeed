@@ -503,14 +503,14 @@ fn bootstrap_selects_the_memory_protocol_for_the_rank() {
                 .unwrap();
                 let unchecked = PyModule::from_code(
                     py,
-                    c"def prepare_bootstrap(fd):\n    return True, lambda outbox, protocol, host_spans: (fd, outbox, protocol, host_spans)",
+                    c"MEMORY_PROTOCOL_STARTUP = True\ndef prepare_bootstrap(fd, *, validate_memory_protocol=False):\n    return True, lambda outbox, protocol, host_spans: (fd, outbox, protocol, host_spans)",
                     c"unchecked_bootstrap.py",
                     c"unchecked_bootstrap",
                 )
                 .unwrap();
                 let prepared = PyModule::from_code(
                     py,
-                    c"MEMORY_PROTOCOL_STARTUP = True\ndef prepare_bootstrap(fd, *, validate_memory_protocol):\n    return validate_memory_protocol and replica_memory_transitions, lambda outbox, protocol, host_spans: (fd, outbox, protocol, host_spans)",
+                    c"ASCEND_MEMORY_PROTOCOL_STARTUP = True\ndef prepare_bootstrap(fd, *, validate_memory_protocol):\n    return validate_memory_protocol and replica_memory_transitions, lambda outbox, protocol, host_spans: (fd, outbox, protocol, host_spans)",
                     c"prepared_bootstrap.py",
                     c"prepared_bootstrap",
                 )

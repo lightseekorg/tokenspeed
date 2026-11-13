@@ -102,13 +102,7 @@ def memory_regions(
         "cuda_graph": allocator_region("cuda_graph"),
     }
     if nccl_suspendable:
-        if replica_memory_transitions:
-            regions["nccl"] = MemoryRegion(
-                release=lambda: device.apply_checked_nccl_memory(release=True),
-                resume=lambda: device.apply_checked_nccl_memory(release=False),
-            )
-        else:
-            regions["nccl"] = MemoryRegion(
-                release=device.suspend_nccl, resume=device.resume_nccl
-            )
+        regions["nccl"] = MemoryRegion(
+            release=device.suspend_nccl, resume=device.resume_nccl
+        )
     return regions

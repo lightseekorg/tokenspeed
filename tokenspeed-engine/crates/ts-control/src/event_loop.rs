@@ -49,7 +49,7 @@
 //! in the same round.
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashSet, VecDeque},
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
@@ -195,38 +195,6 @@ const PAUSED_IDLE_SLEEP: Duration = Duration::from_millis(1);
 #[error("data plane: {0}")]
 pub struct DataPlaneError(pub String);
 
-/// Initialized NCCL communicators, identified by name and their serving ranks.
-pub type NcclPlan = Vec<(String, Vec<usize>)>;
-
-/// Local readiness, a refusal message, and the NCCL communicators to change.
-pub type MemoryPreflight = (bool, String, NcclPlan);
-
-fn nccl_plans_agree(ranks: &[usize], plans: &[&NcclPlan]) -> bool {
-    let mut groups: HashMap<&str, (&[usize], usize)> = HashMap::new();
-    for (&rank, plan) in ranks.iter().zip(plans) {
-        // One global call order is safe even when communicator memberships
-        // overlap. A rank can only vote once for a group it belongs to.
-        if !plan.windows(2).all(|pair| pair[0].0 < pair[1].0) {
-            return false;
-        }
-        for (name, members) in *plan {
-            if !members.contains(&rank) {
-                return false;
-            }
-            let (expected, votes) = groups.entry(name).or_insert((members, 0));
-            if *expected != members.as_slice() {
-                return false;
-            }
-            *votes += 1;
-        }
-    }
-    // Each vote is from a distinct member in the domain. A missing member,
-    // including one outside the domain, leaves the vote count too small.
-    groups
-        .values()
-        .all(|(members, votes)| members.len() == *votes)
-}
-
 /// The device side: what the loop asks of it.
 pub trait DataPlane {
     /// A submitted forward, resolved by [`DataPlane::complete`].
@@ -285,12 +253,11 @@ pub trait DataPlane {
     fn commit_weight_update(&mut self, success: bool) -> Result<(), DataPlaneError>;
 
     /// Check the ordered tags without changing device or allocator state.
-    /// For NCCL, also return the initialized communicator plan in call order.
     fn check_memory_transition(
         &mut self,
         tags: &[String],
         release: bool,
-    ) -> Result<MemoryPreflight, DataPlaneError>;
+    ) -> Result<(bool, String), DataPlaneError>;
 
     /// Start or stop the profiler (`ProfileReq`). Returns the reply.
     fn profile(
@@ -2276,39 +2243,11 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         } else {
             None
         };
-        let (ready, reason, nccl_plan) = match refusal {
-            Some(reason) => (
-                false,
-                format!("cannot release memory: {reason}"),
-                Vec::new(),
-            ),
+        let (ready, reason) = match refusal {
+            Some(reason) => (false, format!("cannot release memory: {reason}")),
             None => self.data_plane.check_memory_transition(tags, release)?,
         };
-        let agreed = if tags.iter().any(|tag| tag == "nccl") {
-            let (mesh, domain) = self.ranks.memory_domain();
-            let payload = serde_json::to_vec(&ready.then_some(nccl_plan))
-                .expect("NCCL plans contain only strings and rank numbers");
-            let plans: Vec<Option<NcclPlan>> = mesh
-                .all_gather(domain, &payload)?
-                .iter()
-                .map(|plan| serde_json::from_slice(plan))
-                .collect::<Result<_, _>>()
-                .map_err(|error| LoopError::Control(format!("invalid NCCL plan: {error}")))?;
-            if let Some(plans) = plans.iter().map(Option::as_ref).collect::<Option<Vec<_>>>() {
-                if !nccl_plans_agree(domain.ranks(), &plans) {
-                    return Ok(Some(
-                        "NCCL communicators differ across their members or leave the memory domain"
-                            .to_owned(),
-                    ));
-                }
-                true
-            } else {
-                false
-            }
-        } else {
-            self.memory_all(ready)?
-        };
-        if agreed {
+        if self.memory_all(ready)? {
             return Ok(None);
         }
         Ok(Some(if ready {
@@ -2319,46 +2258,23 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
     }
 
     fn apply_memory_transition(&mut self, tags: &[String], release: bool) -> Result<(), LoopError> {
-        let coordinated = self.config.controls.replica_memory_transitions;
-        let mut remaining = tags;
-        if coordinated {
-            // Local unmaps or synchronization can fail. Agree before any
-            // rank enters NCCL, where it could no longer observe mesh failure.
-            match (release, tags.split_last(), tags.first()) {
-                (true, Some((nccl, local)), _) if nccl == "nccl" => {
-                    let done = self.data_plane.release_memory(local);
-                    self.finish_memory_phase(done)?;
-                    remaining = std::slice::from_ref(nccl);
-                }
-                (false, _, Some(nccl)) if nccl == "nccl" => {
-                    let done = self.data_plane.resume_memory(&[]);
-                    self.finish_memory_phase(done)?;
-                }
-                _ => {}
-            }
-        }
         // A device failure reaches the launcher before cleanup. Peers must
         // never publish success while they wait for the failed rank.
         let done = if release {
-            self.data_plane.release_memory(remaining)
+            self.data_plane.release_memory(tags)
         } else {
-            self.data_plane.resume_memory(remaining)
+            self.data_plane.resume_memory(tags)
         };
-        if coordinated {
-            self.finish_memory_phase(done)?;
+        if self.config.controls.replica_memory_transitions {
+            let agreed = self.memory_all(done.is_ok());
+            done?;
+            if !agreed? {
+                return Err(LoopError::Control(
+                    "memory transition failed on another rank".to_owned(),
+                ));
+            }
         } else {
             done?;
-        }
-        Ok(())
-    }
-
-    fn finish_memory_phase(&mut self, done: Result<(), DataPlaneError>) -> Result<(), LoopError> {
-        let agreed = self.memory_all(done.is_ok());
-        done?;
-        if !agreed? {
-            return Err(LoopError::Control(
-                "memory transition failed on another rank".to_owned(),
-            ));
         }
         Ok(())
     }

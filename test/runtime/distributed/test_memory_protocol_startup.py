@@ -26,11 +26,36 @@ import pytest
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from tokenspeed.runtime.engine.memory_protocol import gather_collective_addresses
-
-pytestmark = pytest.mark.skipif(
-    not dist.is_available() or not dist.is_gloo_available(), reason="requires Gloo"
+from tokenspeed.runtime.engine.memory_protocol import (
+    gather_collective_addresses,
+    supports_replica_memory_transitions,
 )
+
+
+@pytest.mark.parametrize(
+    ("checked_startup", "memory_saver", "device", "role", "expected"),
+    [
+        (True, True, "npu", "prefill", True),
+        (True, True, "npu", "decode", True),
+        (True, True, "npu", "null", True),
+        (True, True, "npu", "encode", False),
+        (True, False, "npu", "prefill", False),
+        (False, True, "npu", "prefill", False),
+        (True, True, "cuda", "prefill", False),
+    ],
+)
+def test_memory_protocol_v3_requires_checked_ascend_serving(
+    checked_startup, memory_saver, device, role, expected
+):
+    assert (
+        supports_replica_memory_transitions(
+            checked_startup=checked_startup,
+            memory_saver=memory_saver,
+            device=device,
+            role=role,
+        )
+        is expected
+    )
 
 
 def _rendezvous(rank, rendezvous, protocols, addresses, legacy_ranks):
@@ -72,6 +97,9 @@ def _rendezvous(rank, rendezvous, protocols, addresses, legacy_ranks):
         dist.destroy_process_group()
 
 
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(), reason="requires Gloo"
+)
 @pytest.mark.parametrize(
     ("protocols", "hosts", "legacy_ranks"),
     [

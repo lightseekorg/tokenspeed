@@ -18,9 +18,17 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Version agreement during the existing serving-rank address rendezvous."""
+"""Memory protocol selection and serving-rank version agreement."""
 
 import torch.distributed as dist
+
+
+def supports_replica_memory_transitions(
+    *, checked_startup: bool, memory_saver: bool, device: str, role: str
+) -> bool:
+    """Select v3 for the checked Ascend serving path."""
+    # Other devices keep the v2 memory path, including CUDA graph and NCCL.
+    return checked_startup and memory_saver and device == "npu" and role != "encode"
 
 
 def gather_collective_addresses(
