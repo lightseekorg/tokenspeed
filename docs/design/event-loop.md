@@ -61,14 +61,25 @@ and idle forwards can progress while an incomplete call waits to match.
 
 Release checks device prerequisites before and after the drain. For KV it
 checks that every member can clear its L1 index before clearing any index.
+For NCCL it checks that each initialized serving communicator is covered by
+the memory domain and appears in every member's plan, in a common call
+order. The ranks also agree that local device work finished before any rank
+enters NCCL suspend or resume.
 Cancelling a pending call or drain leaves device mappings in place. Resume
 checks the local data plane before remapping, including weight validity for
 KV. The control plane publishes successful tags and replies only after all
 members confirm device completion. A device failure during apply stops the
 engine through the existing host failure path. Cross-host supervision
-remains the deployment's responsibility. Older host/runtime combinations
-use protocol 2 and its local memory-transition path. Ranks within a
-deployment must agree on the protocol at startup.
+remains the deployment's responsibility. The host and runtime both opt in to
+the checked startup. Older combinations use protocol 2 and its local
+memory-transition path. The existing Gloo address rendezvous verifies that
+every rank in the serving world selected the same protocol before any rank
+starts the Rust mesh or reports ready.
+Protocol 2 still advertises a plain address. Protocol 3 tags its address
+with its version, which a legacy host rejects during address decoding.
+Independent Prefill and Decode worlds agree separately.
+Deployments with an earlier, unchecked protocol-3 draft must upgrade it
+together. That draft advertised the same address as protocol 2.
 
 For a pipeline prefill engine, draining includes the KV transfers from
 every stage. The replica must retire those transfers before releasing the
@@ -728,8 +739,9 @@ idle forwards while a peer drains. An idle but unpaused peer prevents release:
 it could admit a request in the next round. Release intent rides the head
 gate, so every rank joins the tail's readiness agreement when any release is
 pending, including ranks without a release of their own. Ordinary rounds add
-no collective. Readiness is MIN-reduced over the replica and then attention DP
-before any release runs on the forward thread.
+no collective. Protocol 3 reduces readiness directly over its memory domain.
+Protocol 2 reduces over the replica and then attention DP. Release runs on
+the forward thread after the applicable readiness checks pass.
 
 The head gate also agrees whether any DP rank still has released regions.
 Until all regions are restored on every rank, it withholds forward permission

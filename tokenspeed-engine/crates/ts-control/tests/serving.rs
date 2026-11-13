@@ -48,7 +48,7 @@ use ts_control::{
     eplb::{Algorithm, Controller, EplbConfig, EplbSpecs, SlotMoves},
     event_loop::{
         DataPlane, DataPlaneError, Dispatch, DpRound, EventLoop, Frontend, Load, LoopConfig,
-        LoopError, PrefillDelay, Ranks, Subsystems,
+        LoopError, MemoryPreflight, NcclPlan, PrefillDelay, Ranks, Subsystems,
     },
     grammar::{GrammarConfig, GrammarKey, Grammars},
     ingress::{Admission, IngressLimits, LogprobServability},
@@ -328,6 +328,8 @@ struct FakeDevice {
     weight_load_refused: Arc<AtomicBool>,
     /// Model a discard-policy prerequisite on one rank.
     discard_memory: bool,
+    /// The rank's initialized NCCL communicators, if the fixture enables NCCL.
+    nccl_plan: NcclPlan,
     /// Inject a device error after release was admitted.
     fail_memory_release: bool,
     /// Inject a device error after wake was admitted.
@@ -489,8 +491,7 @@ impl TransferPeer for FakePeer {
                         // every one.
                         let sent = match role {
                             Role::Prefill => {
-                                room.sent_by.contains(&rank)
-                                    && room.hold_prefill_rank != Some(rank)
+                                room.sent_by.contains(&rank) && room.hold_prefill_rank != Some(rank)
                             }
                             _ => {
                                 room.sent_by.len() == prefill_ranks
@@ -881,19 +882,32 @@ impl DataPlane for FakeDevice {
         &mut self,
         tags: &[String],
         release: bool,
-    ) -> Result<(bool, String), DataPlaneError> {
+    ) -> Result<MemoryPreflight, DataPlaneError> {
         if self.discard_memory {
             if release && tags == ["weights"] {
-                return Ok((false, "release KV before discarding weights".to_owned()));
+                return Ok((
+                    false,
+                    "release KV before discarding weights".to_owned(),
+                    Vec::new(),
+                ));
             }
             if !release
                 && tags.iter().any(|tag| tag == "kv_cache")
                 && self.weight_commits.lock().unwrap().last() != Some(&true)
             {
-                return Ok((false, "weights have not been committed".to_owned()));
+                return Ok((
+                    false,
+                    "weights have not been committed".to_owned(),
+                    Vec::new(),
+                ));
             }
         }
-        Ok((true, String::new()))
+        let plan = if tags.iter().any(|tag| tag == "nccl") {
+            self.nccl_plan.clone()
+        } else {
+            Vec::new()
+        };
+        Ok((true, String::new(), plan))
     }
 
     fn release_memory(&mut self, tags: &[String]) -> Result<(), DataPlaneError> {
@@ -1347,6 +1361,8 @@ struct Setup {
     discard_memory_rank: Option<usize>,
     /// Agree memory transitions across ranks that share device work.
     replica_memory_transitions: bool,
+    /// Advertise NCCL with a plan for each rank when set.
+    nccl_plan: Option<fn(usize) -> NcclPlan>,
     /// A rank that fails after memory release begins.
     memory_release_failure_rank: Option<usize>,
     /// A rank that fails after memory resume begins.
@@ -1369,6 +1385,10 @@ impl Layout {
 fn loop_config(in_flight_depth: usize, pipeline: bool, setup: &Setup) -> LoopConfig {
     let pd = setup.pd.as_ref();
     let kv_total_pages = setup.device_pages.map_or(512, |pages| pages as i64 - 1);
+    let mut memory_regions = vec!["kv_cache".to_owned(), "weights".to_owned()];
+    if setup.nccl_plan.is_some() {
+        memory_regions.push("nccl".to_owned());
+    }
     LoopConfig {
         in_flight_depth,
         limits: IngressLimits {
@@ -1400,7 +1420,7 @@ fn loop_config(in_flight_depth: usize, pipeline: bool, setup: &Setup) -> LoopCon
         controls: ControlConfig {
             memory_saver: true,
             replica_memory_transitions: setup.replica_memory_transitions,
-            memory_regions: vec!["kv_cache".to_owned(), "weights".to_owned()],
+            memory_regions,
             l3_weight_version: None,
             allow_reload_forward: true,
         },
@@ -1573,6 +1593,7 @@ fn fake_device(layout: Layout, rank: usize, setup: &Setup) -> FakeDevice {
                 .is_some_and(|refused| refused(rank)),
         )),
         discard_memory: setup.discard_memory_rank == Some(rank),
+        nccl_plan: setup.nccl_plan.map_or_else(Vec::new, |plan| plan(rank)),
         fail_memory_release: setup.memory_release_failure_rank == Some(rank),
         fail_memory_resume: setup.memory_resume_failure_rank == Some(rank),
         // The trivial initial placement: slot p holds expert p % 4.
@@ -4944,15 +4965,22 @@ async fn pp_prefill_release_waits_for_the_remote_stage_kv_transfer() {
         }),
     );
     tokio::pin!(release);
-    assert!(tokio::time::timeout(Duration::from_millis(100), &mut release)
-        .await
-        .is_err());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut release)
+            .await
+            .is_err()
+    );
     assert!(prefill
         .ranks
         .iter()
         .all(|rank| rank.device_ops.lock().unwrap().is_empty()));
 
-    wire.lock().unwrap().rooms.get_mut(&room).unwrap().hold_prefill_rank = None;
+    wire.lock()
+        .unwrap()
+        .rooms
+        .get_mut(&room)
+        .unwrap()
+        .hold_prefill_rank = None;
     let (release, before_p, before_d) = tokio::time::timeout(Duration::from_secs(5), async {
         tokio::join!(release, collect(p), collect(d))
     })
@@ -5526,6 +5554,196 @@ fn dp_memory_device_failure_prevents_success_on_every_replica() {
             }
         }
         assert!(ranks.iter().all(|rank| rank.outcome.is_err()));
+    }
+}
+
+#[test]
+fn memory_release_refuses_nccl_communicators_with_missing_members() {
+    let layouts = [
+        (Layout::IndependentDp(2), 2, false),
+        (Layout::TpDp { tp: 2, dp: 2 }, 4, true),
+    ];
+    for (layout, world, coordinated) in layouts {
+        let mut scripts = vec![vec![Vec::new(); 12]; 2];
+        for (ingress, script) in scripts.iter_mut().enumerate() {
+            if coordinated || ingress == 0 {
+                script[0].push(memory_transition(true, None));
+            }
+            script[4].push(EngineRequest::Add(Box::new(request(
+                "still-awake",
+                4,
+                budget(2),
+            ))));
+        }
+        let ranks = run_scripted(
+            layout,
+            0,
+            Tiers::DeviceOnly,
+            Setup {
+                replica_memory_transitions: true,
+                nccl_plan: Some(if coordinated {
+                    |rank| {
+                        if rank == 3 {
+                            Vec::new()
+                        } else {
+                            vec![("world".to_owned(), vec![0, 1, 2, 3])]
+                        }
+                    }
+                } else {
+                    |_| vec![("world".to_owned(), vec![0, 1])]
+                }),
+                ..Setup::default()
+            },
+            scripts,
+            no_reaction,
+        );
+        assert_eq!(ranks.len(), world);
+        for rank in &ranks {
+            assert_eq!(rank.outcome, Ok(()));
+            assert!(rank.device_ops.is_empty(), "{:?}", rank.device_ops);
+        }
+        for (ingress, rank) in [&ranks[0], &ranks[world / 2]].into_iter().enumerate() {
+            let expected = if coordinated || ingress == 0 {
+                vec![("ReleaseMemoryOccupationReqOutput", false)]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(outcome(rank.replies.clone()), expected);
+            assert_scripted_tokens(rank, "still-awake", 2);
+        }
+    }
+}
+
+#[test]
+fn memory_release_waits_for_local_apply_before_entering_nccl() {
+    for fail in [false, true] {
+        let mut script = vec![Vec::new(); 12];
+        script[0].push(memory_transition(true, None));
+        script[4].push(memory_transition(false, None));
+        let ranks = run_scripted(
+            Layout::Pp(2),
+            0,
+            Tiers::DeviceOnly,
+            Setup {
+                replica_memory_transitions: true,
+                nccl_plan: Some(|_| vec![("world".to_owned(), vec![0, 1])]),
+                memory_release_failure_rank: fail.then_some(1),
+                ..Setup::default()
+            },
+            vec![script],
+            no_reaction,
+        );
+        if fail {
+            for rank in &ranks {
+                assert!(rank.outcome.is_err());
+                assert!(rank.replies.is_empty());
+                assert_eq!(rank.device_ops, ["release kv_cache,weights"]);
+            }
+        } else {
+            assert_eq!(
+                outcome(ranks[0].replies.clone()),
+                [
+                    ("ReleaseMemoryOccupationReqOutput", true),
+                    ("ResumeMemoryOccupationReqOutput", true),
+                ]
+            );
+            for rank in &ranks {
+                assert_eq!(rank.outcome, Ok(()));
+                assert_eq!(
+                    rank.device_ops,
+                    [
+                        "release kv_cache,weights",
+                        "release nccl",
+                        "resume ",
+                        "resume nccl,weights,kv_cache"
+                    ]
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn ep_memory_release_agrees_on_overlapping_nccl_groups() {
+    let mut scripts = vec![vec![Vec::new(); 12]; 2];
+    for script in &mut scripts {
+        script[0].push(memory_transition(true, Some(&["nccl"])));
+        script[4].push(memory_transition(false, Some(&["nccl"])));
+    }
+    let ranks = run_scripted(
+        Layout::TpDp { tp: 2, dp: 2 },
+        0,
+        Tiers::DeviceOnly,
+        Setup {
+            replica_memory_transitions: true,
+            nccl_plan: Some(|rank| {
+                [
+                    ("0", vec![0, 1, 2, 3]),
+                    ("1", vec![0, 1]),
+                    ("2", vec![0, 2]),
+                    ("3", vec![2, 3]),
+                ]
+                .into_iter()
+                .filter(|(_, members)| members.contains(&rank))
+                .map(|(name, members)| (name.to_owned(), members))
+                .collect()
+            }),
+            ..Setup::default()
+        },
+        scripts,
+        no_reaction,
+    );
+    for ingress in [&ranks[0], &ranks[2]] {
+        assert_eq!(
+            outcome(ingress.replies.clone()),
+            [
+                ("ReleaseMemoryOccupationReqOutput", true),
+                ("ResumeMemoryOccupationReqOutput", true),
+            ]
+        );
+    }
+    for rank in ranks {
+        assert_eq!(rank.outcome, Ok(()));
+        assert_eq!(
+            rank.device_ops,
+            ["release ", "release nccl", "resume ", "resume nccl"]
+        );
+    }
+}
+
+#[test]
+fn memory_protocol_v2_keeps_the_legacy_nccl_apply_sequence() {
+    let mut script = vec![Vec::new(); 12];
+    script[0].push(memory_transition(true, None));
+    script[4].push(memory_transition(false, None));
+    let ranks = run_scripted(
+        Layout::Pp(2),
+        0,
+        Tiers::DeviceOnly,
+        Setup {
+            // Protocol v2 neither inspects nor exchanges the fake plan.
+            nccl_plan: Some(|_| vec![("outside".to_owned(), vec![0, 1, 2])]),
+            ..Setup::default()
+        },
+        vec![script],
+        no_reaction,
+    );
+    assert_eq!(
+        outcome(ranks[0].replies.clone()),
+        [
+            ("ReleaseMemoryOccupationReqOutput", true),
+            ("ResumeMemoryOccupationReqOutput", true),
+        ]
+    );
+    for rank in ranks {
+        assert_eq!(rank.outcome, Ok(()));
+        assert_eq!(
+            rank.device_ops,
+            [
+                "release kv_cache,weights,nccl",
+                "resume nccl,weights,kv_cache"
+            ]
+        );
     }
 }
 

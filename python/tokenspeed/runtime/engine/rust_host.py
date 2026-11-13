@@ -62,7 +62,6 @@ from multiprocessing.connection import Connection
 
 import msgspec
 import torch
-import torch.distributed as dist
 from tokenspeed_kernel.compile_monitor import compile_stats
 from tokenspeed_scheduler import Scheduler
 
@@ -82,6 +81,7 @@ from tokenspeed.runtime.engine.gc_hooks import (
 )
 from tokenspeed.runtime.engine.logprobs import LogprobServability
 from tokenspeed.runtime.engine.memory_occupation import memory_regions
+from tokenspeed.runtime.engine.memory_protocol import gather_collective_addresses
 from tokenspeed.runtime.engine.profiler import Profiler
 from tokenspeed.runtime.engine.rank_setup import (
     init_distributed,
@@ -649,6 +649,8 @@ class HostDataPlane:
         epd_publisher,
         *,
         replica_memory_transitions: bool,
+        memory_ranks: tuple[int, ...],
+        nccl_p2p_ranks: tuple[tuple[int, ...], ...],
     ) -> None:
         self._device = handle
         # The control plane exports the serving-time compilations.
@@ -657,6 +659,8 @@ class HostDataPlane:
         # Tag -> MemoryRegion (``memory_occupation.memory_regions``).
         self._regions = regions
         self._replica_memory_transitions = replica_memory_transitions
+        self._memory_ranks = memory_ranks
+        self._nccl_p2p_ranks = nccl_p2p_ranks
         # Per request: what every forward it runs in needs, fixed at
         # admission.
         self._requests: dict[str, _AdmittedRequest] = {}
@@ -981,9 +985,14 @@ class HostDataPlane:
 
     def check_memory_transition(
         self, tags: list[str], release: bool
-    ) -> tuple[bool, str]:
-        """Check an ordered request before any rank changes its memory mappings."""
-        return self._device.check_memory_transition(tags, release=release)
+    ) -> tuple[bool, str, list[tuple[str, list[int]]]]:
+        """Check local prerequisites and identify participating NCCL groups."""
+        return self._device.check_memory_transition(
+            tags,
+            release=release,
+            memory_ranks=self._memory_ranks,
+            nccl_p2p_ranks=self._nccl_p2p_ranks,
+        )
 
     def release_memory(self, tags: list[str]) -> None:
         """Free memory regions, in order; the scheduler has drained."""
@@ -1168,6 +1177,7 @@ class HostBootstrap:
     ) -> None:
         self._server_args = server_args
         self._connection = connection
+        self._replica_memory_transitions = replica_memory_transitions
         mapping = server_args.mapping
         gpu_id = mapping.rank % mapping.nprocs_per_node + server_args.base_gpu_id
         self._gpu_id = gpu_id
@@ -1558,20 +1568,25 @@ class HostBootstrap:
                     epd_receive.publisher if epd_receive is not None else None
                 ),
                 replica_memory_transitions=replica_memory_transitions,
+                memory_ranks=self.config.dp_ranks or self.config.replica_ranks,
+                nccl_p2p_ranks=tuple(
+                    ranks
+                    for ranks in (
+                        self.config.pp_ranks,
+                        self.config.eplb.ep_ranks if self.config.eplb else None,
+                    )
+                    if ranks is not None
+                ),
             )
             self._device = device.handle
 
     def collective_addresses(self, port: int) -> list[str]:
-        """Every rank's collective address, in rank order, given this rank's
-        port; a collective of the whole world, through the rendezvous the
-        data plane already has."""
-        gathered: list = [None] * self._world_cpu_group.size()
-        dist.all_gather_object(
-            gathered,
+        """Agree on the memory protocol and exchange the rank mesh addresses."""
+        return gather_collective_addresses(
+            self._world_cpu_group,
             join_host_port(self._collective_host, port),
-            group=self._world_cpu_group,
+            replica_memory_transitions=self._replica_memory_transitions,
         )
-        return gathered
 
     def report_ready(self) -> None:
         """Tell the launcher the rank is serving, once the frontend
@@ -1642,14 +1657,23 @@ class HostBootstrap:
         self._device.shutdown_cache()
 
 
+# The native host uses this to opt into the checked rendezvous and preflight ABI.
+MEMORY_PROTOCOL_STARTUP = True
+
+
 def prepare_bootstrap(
-    control_fd: int,
+    control_fd: int, *, validate_memory_protocol: bool = False
 ) -> tuple[bool, Callable[..., HostBootstrap | EncodeBootstrap]]:
     """Read the launcher arguments and return the memory capability and rank starter."""
     connection = Connection(control_fd)
     server_args, port_args, metrics_relay_endpoint = connection.recv()
     role = server_args.disaggregation_mode
-    replica_memory_transitions = server_args.enable_memory_saver and role != "encode"
+    # A host using the old one-argument entry point keeps the v2 ABI.
+    replica_memory_transitions = (
+        validate_memory_protocol
+        and server_args.enable_memory_saver
+        and role != "encode"
+    )
 
     def start(pd_outbox, protocol: int, host_spans) -> HostBootstrap | EncodeBootstrap:
         # Protocol 2 agrees on weight-load prerequisites and commits. Protocol

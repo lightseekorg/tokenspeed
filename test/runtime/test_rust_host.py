@@ -498,6 +498,8 @@ def _data_plane(handle: DeviceHandle) -> HostDataPlane:
         attn_tp_cpu_group=None,
         epd_publisher=None,
         replica_memory_transitions=False,
+        memory_ranks=(0,),
+        nccl_p2p_ranks=(),
     )
 
 

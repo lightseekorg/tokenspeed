@@ -49,7 +49,7 @@ use pyo3::{
 };
 use ts_control::eplb::SlotMoves;
 use ts_control::{
-    event_loop::{DataPlane, DataPlaneError, Dispatch, DpRound},
+    event_loop::{DataPlane, DataPlaneError, Dispatch, DpRound, MemoryPreflight},
     ingress::Admission,
     output::{ForwardResult, HistorySeeds, LogprobPlan, NgramWindows},
 };
@@ -128,7 +128,7 @@ enum Op {
     CheckMemoryTransition {
         tags: Vec<String>,
         release: bool,
-        reply: mpsc::SyncSender<Result<(bool, String), String>>,
+        reply: mpsc::SyncSender<Result<MemoryPreflight, String>>,
     },
     ReleaseMemory {
         tags: Vec<String>,
@@ -546,7 +546,7 @@ impl DataPlane for PythonDataPlane {
         &mut self,
         tags: &[String],
         release: bool,
-    ) -> Result<(bool, String), DataPlaneError> {
+    ) -> Result<MemoryPreflight, DataPlaneError> {
         let tags = tags.to_vec();
         self.ask(|reply| Op::CheckMemoryTransition {
             tags,
@@ -698,8 +698,10 @@ fn forward_loop(
                 | Op::ApplyExpertPlacement { reply, .. } => {
                     let _ = reply.send(Err(failure));
                 }
+                Op::CheckMemoryTransition { reply, .. } => {
+                    let _ = reply.send(Err(failure));
+                }
                 Op::CheckWeightUpdate { reply, .. }
-                | Op::CheckMemoryTransition { reply, .. }
                 | Op::UpdateWeights { reply, .. }
                 | Op::Profile { reply, .. }
                 | Op::ReloadForward { reply, .. } => {

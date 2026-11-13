@@ -33,8 +33,8 @@ use ts_collective::{Group, Listener, Mesh};
 use ts_control::batch_log::BatchLogConfig;
 use ts_control::control::ControlConfig;
 use ts_control::event_loop::{
-    DataPlane, DataPlaneError, Dispatch, DpRound, EventLoop, Frontend, Load, LoopConfig, Ranks,
-    Subsystems,
+    DataPlane, DataPlaneError, Dispatch, DpRound, EventLoop, Frontend, Load, LoopConfig,
+    MemoryPreflight, Ranks, Subsystems,
 };
 use ts_control::ingress::{Admission, IngressLimits, LogprobServability};
 use ts_control::output::{FinishLog, ForwardResult, OutputProcessor, Role, StreamedOutput};
@@ -282,7 +282,7 @@ impl DataPlane for InstantDevice {
         &mut self,
         _: &[String],
         _: bool,
-    ) -> Result<(bool, String), DataPlaneError> {
+    ) -> Result<MemoryPreflight, DataPlaneError> {
         unreachable!("no control operation in the benchmark")
     }
 

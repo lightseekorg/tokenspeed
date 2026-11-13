@@ -40,8 +40,8 @@ weight allocation region has exited. Head-TP peer address tables and Lamport
 counters share the communication lifetime; preserving only model tensors does
 not preserve this backend-owned state. This avoids nested CUDA memory pools and
 keeps communication storage outside the weight region. They remain resident,
-including across discard; their memory must be included in the training headroom. NCCL release is independent and
-optional. No NCCL suspend feature is required when its tag is omitted.
+including across discard; their memory must be included in the training headroom.
+An explicit tag list without `nccl` leaves NCCL communication buffers resident.
 
 Expert placement state (load counters and, for all-to-all EP under a static
 dispatch algorithm, the per-rank dispatch map) is allocated with the placement
@@ -111,11 +111,16 @@ refusal, so collect outstanding replies before retrying. A reported device
 failure after execution begins requires recovery of the affected engines
 before training or serving continues.
 
-The optional `nccl` tag also requires every participant of the underlying
-communicator. A world communicator can span otherwise independent DP
-engines. When managing those engines separately, send explicit tags that
-leave NCCL resident. An omitted tag list includes `nccl` when the runtime
-advertises it.
+The optional `nccl` tag is included when tags are omitted and the runtime
+advertises it. With protocol 3, the serving ranks verify the initialized
+NCCL groups and their participants before releasing any region. A serving
+world communicator can span otherwise independent DP engines, and a trainer
+update group uses a separate rank namespace. Protocol 3 also refuses NCCL
+suspend on initialized pipeline and expert-rebalance groups because the
+native binding does not expose the order of their per-peer communicators.
+To leave those communicators resident, pass explicit tags without `nccl`.
+A failure inside native NCCL suspend or resume can still require
+deployment-level recovery.
 
 ## Validation before enabling in a training job
 

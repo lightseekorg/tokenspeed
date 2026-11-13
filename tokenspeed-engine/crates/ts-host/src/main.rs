@@ -52,7 +52,10 @@ use std::{
     time::Duration,
 };
 
-use pyo3::{prelude::*, types::PyBytes};
+use pyo3::{
+    prelude::*,
+    types::{PyBytes, PyDict},
+};
 use ts_collective::{Group, Listener, Mesh};
 use ts_control::{
     batch_log::BatchLogConfig,
@@ -673,8 +676,18 @@ fn bootstrap_worker<'py>(
         }
         Err(error) => return Err(error),
     };
-    let (replica_memory_transitions, start): (bool, Py<PyAny>) =
-        prepare.call1((control_fd,))?.extract()?;
+    // The earlier v3 bootstrap can select v2 too. Use it without the v3
+    // collective ordering when Python does not support the checked startup.
+    let checked_startup = runtime.hasattr("MEMORY_PROTOCOL_STARTUP")?;
+    let prepared = if checked_startup {
+        let options = PyDict::new(py);
+        options.set_item("validate_memory_protocol", true)?;
+        prepare.call((control_fd,), Some(&options))?
+    } else {
+        prepare.call1((control_fd,))?
+    };
+    let (replica_memory_transitions, start): (bool, Py<PyAny>) = prepared.extract()?;
+    let replica_memory_transitions = checked_startup && replica_memory_transitions;
     let protocol = if replica_memory_transitions {
         3_u32
     } else {

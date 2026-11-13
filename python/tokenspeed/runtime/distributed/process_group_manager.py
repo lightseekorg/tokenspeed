@@ -161,6 +161,15 @@ class ProcessGroupManager:
         """Return the accelerator collective group for the requested ranks."""
         return self.get_process_group(self._device_backend, group)
 
+    def owns_device_process_group(self, group: dist.ProcessGroup) -> bool:
+        """Whether this group uses the serving world's rank namespace."""
+        return any(
+            registered is group
+            for (backend, _), groups in self._process_groups.items()
+            if backend == self._device_backend
+            for registered in groups.values()
+        ) or any(registered is group for registered in self._dedicated_groups.values())
+
     def has_process_group(
         self, backend: str, group: Group, *, name: str | None = None
     ) -> bool:

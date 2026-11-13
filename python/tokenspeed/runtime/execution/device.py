@@ -153,6 +153,10 @@ from tokenspeed.runtime.cache.l2.sizing import (
     tail_lcm_blocks_per_request,
 )
 from tokenspeed.runtime.distributed.nccl_suspend import (
+    NcclMemoryGroup,
+    apply_nccl_memory_plan,
+    check_nccl_resume,
+    prepare_nccl_suspend,
     resume_nccl_communicators,
     suspend_nccl_communicators,
 )
@@ -400,6 +404,8 @@ class DeviceHandle:
         # Private by convention AND by absence: nothing below returns it.
         self._executor = executor
         self._weight_memory = weight_memory
+        self._checked_nccl_release: tuple[NcclMemoryGroup, ...] | None = None
+        self._suspended_nccl: tuple[NcclMemoryGroup, ...] | None = None
         # Development only (--allow-reload-forward); None refuses reload_forward.
         self._forward_reloader = forward_reloader
         # Resolved here, on the building thread, whose current device the
@@ -795,15 +801,33 @@ class DeviceHandle:
             self.synchronize()
 
     def check_memory_transition(
-        self, tags: list[str], *, release: bool
-    ) -> tuple[bool, str]:
-        """Check the local weight and KV state without changing either."""
-        if self._weight_memory is not None:
-            try:
+        self,
+        tags: list[str],
+        *,
+        release: bool,
+        memory_ranks: tuple[int, ...],
+        nccl_p2p_ranks: tuple[tuple[int, ...], ...],
+    ) -> tuple[bool, str, list[tuple[str, list[int]]]]:
+        """Check local prerequisites and return the NCCL participants to agree."""
+        nccl = "nccl" in tags
+        if nccl and release:
+            self._checked_nccl_release = None
+        try:
+            if self._weight_memory is not None:
                 self._weight_memory.check_memory_transition(tags, release=release)
-            except RuntimeError as error:
-                return False, str(error)
-        return True, ""
+            if not nccl:
+                return True, "", []
+            if release:
+                plan = prepare_nccl_suspend(memory_ranks, p2p_ranks=nccl_p2p_ranks)
+                self._checked_nccl_release = plan
+            else:
+                plan = self._suspended_nccl
+                if plan is None:
+                    raise RuntimeError("no NCCL groups were suspended by this rank")
+                check_nccl_resume(plan)
+        except RuntimeError as error:
+            return False, str(error), []
+        return True, "", [(group.name, list(group.ranks)) for group in plan]
 
     def prepare_kv_release(self) -> None:
         """Quiesce everything that can touch the KV arena before it is unmapped.
@@ -870,6 +894,15 @@ class DeviceHandle:
         """Restore the NCCL communicators suspended by :meth:`suspend_nccl`."""
         self.settle()
         resume_nccl_communicators()
+
+    def apply_checked_nccl_memory(self, *, release: bool) -> None:
+        """Apply the agreed plan after the host has fenced local device work."""
+        plan = self._checked_nccl_release if release else self._suspended_nccl
+        if plan is None:
+            raise RuntimeError("NCCL memory transition has no validated plan")
+        apply_nccl_memory_plan(plan, release=release)
+        self._suspended_nccl = plan if release else None
+        self._checked_nccl_release = None
 
     def run_remote_prefill_landing(
         self,

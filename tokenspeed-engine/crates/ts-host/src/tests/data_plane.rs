@@ -152,8 +152,8 @@ class Plane:
     def check_memory_transition(self, tags, release):
         self.note("check_memory_transition")
         if release and tags == ["weights"]:
-            return (False, "release KV before weights")
-        return (True, "")
+            return (False, "release KV before weights", [])
+        return (True, "", [("0", [0, 1])] if "nccl" in tags else [])
 
     def release_memory(self, tags):
         self.note("release_memory")
@@ -241,11 +241,13 @@ fn a_memory_preflight_refusal_allows_another_check() {
     let tags = ["weights".to_owned()];
     assert_eq!(
         data_plane.check_memory_transition(&tags, true).unwrap(),
-        (false, "release KV before weights".to_owned())
+        (false, "release KV before weights".to_owned(), Vec::new())
     );
     assert_eq!(
-        data_plane.check_memory_transition(&tags, false).unwrap(),
-        (true, String::new())
+        data_plane
+            .check_memory_transition(&["nccl".to_owned()], false)
+            .unwrap(),
+        (true, String::new(), vec![("0".to_owned(), vec![0, 1])])
     );
 
     let checks: Vec<_> = calls(&plane)
