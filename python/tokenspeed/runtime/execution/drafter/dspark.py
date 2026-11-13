@@ -36,7 +36,6 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
 from tokenspeed.runtime.models.dspark import VanillaMarkov
 from tokenspeed.runtime.utils import get_colorful_logger
-from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 logger = get_colorful_logger(__name__)
@@ -158,11 +157,7 @@ class DSpark(DFlash):
         different walks would issue different collectives.
         """
         markov = self.markov_head
-        if (
-            not envs.TOKENSPEED_DSPARK_FUSED_WALK.get()
-            or not block_logits.is_cuda
-            or not isinstance(markov, VanillaMarkov)
-        ):
+        if not block_logits.is_cuda or not isinstance(markov, VanillaMarkov):
             return False
         # The probe is collective, so no rank-local test may come before it.
         if (
