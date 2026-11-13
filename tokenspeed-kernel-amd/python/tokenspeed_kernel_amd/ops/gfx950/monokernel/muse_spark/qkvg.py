@@ -27,7 +27,9 @@ as fast as the memory can, so the q | k | v blocks spread over 160 CTAs.
 * qkvg, 160 tasks: the q | k | v blocks (rows 0 .. 1279).
 * gate, 128 tasks: the output-gate blocks (rows 1280 .. 2303), on CTAs
   that run a qkvg task first. Attention does not wait for the gate, so its
-  weights load after the q | k | v weights.
+  weights load after the q | k | v weights. When a full layer's attention
+  has a task on every CTA (one request), each block splits into two 8-row
+  tasks over all CTAs instead: 256 tasks (``gate_halves`` 2).
 * qnext, 160 tasks (a launch whose next layer is fused too, see
   ``layer.layer_plan``): the next layer's qkvg tasks at the end of this
   launch. Their input is this launch's output rows, which the out tasks
