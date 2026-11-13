@@ -91,8 +91,10 @@ logger = logging.getLogger(__name__)
 
 # Token rows of one launch: a decode row a request, or a verify of up to 7
 # draft tokens (the DFlash2 drafters' block of 8) a request, for up to
-# MAX_REQUESTS requests, their rows one request after another (16 at most).
-# A step of more requests keeps the regular path.
+# MAX_REQUESTS requests, their rows one request after another. The kernels
+# hold at most 16 rows a launch (the layer plan's MAX_ROWS, the experts'
+# 16-row MFMA tiles and 128-pick slot table), two requests' verifies. A step
+# of more requests keeps the regular path.
 MAX_REQUESTS = 2
 CHAIN_ROWS = 8  # a request's rows at most
 MAX_ROWS = MAX_REQUESTS * CHAIN_ROWS
