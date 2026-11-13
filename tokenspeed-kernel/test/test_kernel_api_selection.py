@@ -1847,6 +1847,7 @@ def _attention_rel_prefill() -> object:
         cu_seqlens_cpu=[0, 4],
         max_seqlen=4,
         softmax_scale=1.0 / 64,
+        output_dtype=None,
     )
 
 
@@ -1871,6 +1872,7 @@ def _attention_rel_extend() -> object:
         max_seqlen_k=128,
         rel_logits=rel_logits,
         softmax_scale=1.0 / 64,
+        output_dtype=None,
     )
 
 
@@ -1896,6 +1898,7 @@ def _attention_rel_extend_page256_sliding() -> object:
         rel_logits=rel_logits,
         window_left=255,
         softmax_scale=1.0 / 128,
+        output_dtype=None,
     )
 
 
@@ -1918,6 +1921,10 @@ def _attention_rel_decode() -> object:
         cu_seqlens_q=cu_seqlens_q,
         max_seqlen_q=1,
         softmax_scale=1.0 / 64,
+        output_dtype=None,
+        return_lse=False,
+        gate=None,
+        sink=None,
     )
 
 
@@ -1941,6 +1948,10 @@ def _attention_rel_decode_page128_sliding() -> object:
         max_seqlen_q=1,
         window_left=127,
         softmax_scale=1.0 / 128,
+        output_dtype=None,
+        return_lse=False,
+        gate=None,
+        sink=None,
     )
 
 
@@ -1966,6 +1977,10 @@ def _attention_rel_decode_multiquery(window_left: int) -> object:
         max_seqlen_q=prediction,
         window_left=window_left,
         softmax_scale=1.0 / 128,
+        output_dtype=None,
+        return_lse=False,
+        gate=None,
+        sink=None,
     )
 
 
@@ -1997,6 +2012,10 @@ def _attention_rel_decode_page256_sliding() -> object:
         max_seqlen_q=1,
         window_left=255,
         softmax_scale=1.0 / 128,
+        output_dtype=None,
+        return_lse=False,
+        gate=None,
+        sink=None,
     )
 
 

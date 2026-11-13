@@ -1,5 +1,17 @@
 # Communication kernels
 
+## Row reduce-scatter and multicast rows
+
+`triton.row_reduce_scatter` sums a set of rows of every rank's BF16 partial,
+held in a Triton RS/AG state's symmetric buffer, after a barrier over the
+group: each listed row adds the ranks' rows in FP32 rank order from +0.0 and
+rounds once. `triton.MulticastRows` is a symmetric buffer every rank
+receives: a rank stores its rows through the multicast view, a barrier waits
+for every rank's stores, and the local view reads them. Together they carry
+a sequence-parallel layer: reduce a rank's share of the rows (plus the few
+rows every rank needs), work on that share, and store the result to every
+rank. Each uses channel 0 of its own buffer's signal pad for its barrier.
+
 ## Paged-row all-gather
 
 `cute_dsl_paged_row_all_gather` (SM100 and SM103: GB200, GB300) all-gathers

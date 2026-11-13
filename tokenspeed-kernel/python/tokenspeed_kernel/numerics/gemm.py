@@ -285,12 +285,15 @@ class GemmInputGenerator(InputGenerator):
             block_size=block_size,
         )
 
+        # A kernel that writes a single output dtype is verified in that dtype.
+        out_dtypes = self.traits.get("out_dtype", frozenset())
+        out_dtype = next(iter(out_dtypes)) if len(out_dtypes) == 1 else torch.bfloat16
         return {
             "A": A,
             "B": B,
             "A_scales": A_scales,
             "B_scales": B_scales,
-            "out_dtype": torch.bfloat16,
+            "out_dtype": out_dtype,
             "alpha": None,
             "block_size": block_size,
         }

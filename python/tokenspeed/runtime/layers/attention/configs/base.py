@@ -42,22 +42,22 @@ import torch
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 from tokenspeed.runtime.utils.server_args import ServerArgs
+from tokenspeed.runtime.utils.spec_block_geometry import resolve_draft_query_width
 
 ComponentT = TypeVar("ComponentT", bound="AttnComponentSpec")
 
 
 def resolve_speculative_num_tokens(
-    server_args: ServerArgs, is_draft: bool = False
+    server_args: ServerArgs, is_draft: bool, *, sample_from_anchor: bool
 ) -> int:
     """Return the query width seen by this attention backend.
 
-    Target verification consumes the full candidate window. DSpark's draft
-    model samples from its anchor row, so seven draft queries produce the seven
-    proposals in an eight-token verify window.
+    Target verification consumes the full candidate window. Draft queries
+    follow the checkpoint's normalized anchor-sampling policy.
     """
     width = int(server_args.speculative_num_draft_tokens)
-    if is_draft and server_args.speculative_algorithm == "DSPARK":
-        return width - 1
+    if is_block_drafter(server_args.speculative_algorithm, is_draft):
+        return resolve_draft_query_width(width, sample_from_anchor)
     return width
 
 
@@ -388,7 +388,15 @@ def model_wide_kwargs(
             speculative_num_draft_tokens=(
                 speculative_num_draft_tokens
                 if speculative_num_draft_tokens is not None
-                else resolve_speculative_num_tokens(server_args, is_draft)
+                else resolve_speculative_num_tokens(
+                    server_args,
+                    is_draft,
+                    sample_from_anchor=(
+                        model_config.draft_sample_from_anchor
+                        if is_block_drafter(server_args.speculative_algorithm, is_draft)
+                        else False
+                    ),
+                )
             ),
         )
     return kwargs

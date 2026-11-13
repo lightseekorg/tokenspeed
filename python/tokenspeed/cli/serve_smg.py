@@ -90,6 +90,7 @@ DEEPSEEK_V41_REASONING_PARSER = "deepseek_v41"
 GLM_REASONING_PARSER = "glm45"
 GLM_TOOL_CALL_PARSER = "glm47_moe"
 INKLING_REASONING_PARSER = "inkling"
+INKLING2_REASONING_PARSER = "inkling2"
 INKLING_TOOL_CALL_PARSER = "inkling"
 INKLING_ATTENTION_BACKEND = "fa4"
 KIMI_K3_REASONING_PARSER = "kimi_k3"
@@ -506,8 +507,20 @@ def _is_inkling_model(model_id: str | None) -> bool:
     config = _load_model_config(model_id)
     architectures = config.get("architectures") or []
     return (
-        config.get("model_type") == "inkling_mm_model"
+        config.get("model_type") in {"inkling_mm_model", "inkling2"}
         or "InklingForConditionalGeneration" in architectures
+        or "Inkling2ForConditionalGeneration" in architectures
+    )
+
+
+def _is_inkling2_model(model_id: str) -> bool:
+    config = _load_model_config(model_id)
+    if not config:
+        # A whole "inkling2" / "inkling-2" name token; "inkling-2025-..." is not one.
+        name = re.search(r"(?<![a-z0-9])inkling[-_]?2(?![a-z0-9])", model_id.lower())
+        return name is not None
+    return config.get("model_type") == "inkling2" or (
+        "Inkling2ForConditionalGeneration" in (config.get("architectures") or [])
     )
 
 
@@ -568,7 +581,9 @@ def _args_with_default_model_parsers(
 
     Reasoning parser defaults must be visible to both processes: smg extracts
     reasoning_content after generation, while the engine uses the same parser
-    name to defer json_schema grammars past the reasoning channel.
+    family to defer json_schema grammars past the reasoning channel.
+    Inkling2 uses a distinct engine grammar because its generated blocks
+    include model headers. The gateway still uses the Inkling output parser.
 
     Muse Spark Open needs two more defaults. smg reads its ``muse`` parser
     table only under the Symphony parser, so the gateway gets ``--parser
@@ -624,15 +639,19 @@ def _args_with_default_model_parsers(
             gateway_result.extend(["--tool-call-parser", GLM_TOOL_CALL_PARSER])
 
     elif _is_inkling_model(model_id):
+        is_inkling2 = _is_inkling2_model(model_id)
         if (
             "--reasoning-parser" not in engine_result
             and "--reasoning-parser" not in gateway_result
         ):
-            engine_result.extend(["--reasoning-parser", INKLING_REASONING_PARSER])
+            engine_parser = (
+                INKLING2_REASONING_PARSER if is_inkling2 else INKLING_REASONING_PARSER
+            )
+            engine_result.extend(["--reasoning-parser", engine_parser])
             gateway_result.extend(["--reasoning-parser", INKLING_REASONING_PARSER])
         if "--tool-call-parser" not in gateway_result:
             gateway_result.extend(["--tool-call-parser", INKLING_TOOL_CALL_PARSER])
-        if current_platform().is_nvidia:
+        if current_platform().is_nvidia and not is_inkling2:
             # Inkling's NVIDIA rel-bias attention requires FA4; reject bad explicit backends before workers start.
             if "--attention-backend" in engine_result:
                 backend_index = engine_result.index("--attention-backend")

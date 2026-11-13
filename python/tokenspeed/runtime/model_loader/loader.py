@@ -181,6 +181,17 @@ def _initialize_model(
 
 
 @runtime_checkable
+class CheckpointFileSelection(Protocol):
+    """A model whose safetensors files are independent of the target index.
+
+    ``checkpoint_weight_files`` lists exact basenames, without glob patterns.
+    Missing files are errors, not permission to load a different checkpoint.
+    """
+
+    checkpoint_weight_files: tuple[str, ...]
+
+
+@runtime_checkable
 class KVCacheScaleLoader(Protocol):
     """A model that puts its checkpoint's KV-cache scales on its attention layers."""
 
@@ -237,6 +248,9 @@ class DefaultModelLoader(BaseModelLoader):
         revision: str | None
         """The optional model revision."""
 
+        weight_files: tuple[str, ...] | None
+        """Exact safetensors basenames, or normal format/index discovery."""
+
         prefix: str = ""
         """A prefix to prepend to all weights."""
 
@@ -279,7 +293,11 @@ class DefaultModelLoader(BaseModelLoader):
         return None
 
     def _prepare_weights(
-        self, model_name_or_path: str, revision: str | None, fall_back_to_pt: bool
+        self,
+        model_name_or_path: str,
+        revision: str | None,
+        fall_back_to_pt: bool,
+        weight_files: tuple[str, ...] | None,
     ) -> tuple[str, list[str], bool]:
         """Prepare weights for the model.
 
@@ -291,6 +309,35 @@ class DefaultModelLoader(BaseModelLoader):
 
         is_local = os.path.isdir(model_name_or_path)
         load_format = self.load_config.load_format
+        if weight_files is not None:
+            if load_format not in (
+                LoadFormat.AUTO,
+                LoadFormat.SAFETENSORS,
+                LoadFormat.INSTANTTENSOR,
+            ):
+                raise ValueError(
+                    "Explicit checkpoint files require safetensors loading"
+                )
+            hf_folder = (
+                model_name_or_path
+                if is_local
+                else download_weights_from_hf(
+                    model_name_or_path,
+                    self.load_config.download_dir,
+                    list(weight_files),
+                    revision,
+                    ignore_patterns=self.load_config.ignore_patterns,
+                )
+            )
+            files = [os.path.join(hf_folder, name) for name in weight_files]
+            for path in files:
+                if not os.path.isfile(path):
+                    raise FileNotFoundError(
+                        f"Required checkpoint file is missing: {path}"
+                    )
+            # These files can intentionally be absent from the target's index.
+            return hf_folder, files, True
+
         use_safetensors = False
         index_file = SAFE_WEIGHTS_INDEX_NAME
         # Some quantized models use .pt files for storing the weights.
@@ -375,7 +422,10 @@ class DefaultModelLoader(BaseModelLoader):
         declared: pipeline stages can consume different checkpoint subsets.
         """
         hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
-            source.model_or_path, source.revision, source.fall_back_to_pt
+            source.model_or_path,
+            source.revision,
+            source.fall_back_to_pt,
+            source.weight_files,
         )
         hf_weights_files.sort()
         # Filtered models can consume different shard lists on different ranks.
@@ -478,12 +528,18 @@ class DefaultModelLoader(BaseModelLoader):
         # ``checkpoint_weight_name_filter`` so only the shards holding their
         # weights are read instead of the whole checkpoint.
         weight_name_filter = getattr(model, "checkpoint_weight_name_filter", None)
+        weight_files = (
+            model.checkpoint_weight_files
+            if isinstance(model, CheckpointFileSelection)
+            else None
+        )
         bind_checkpoint_dir = getattr(model, "bind_checkpoint_dir", None)
         if callable(bind_checkpoint_dir):
             hf_folder, _, _ = self._prepare_weights(
                 model_path,
                 revision,
                 getattr(model, "fall_back_to_pt_during_load", False),
+                weight_files,
             )
             bind_checkpoint_dir(hf_folder)
         # A model that reads a stage-specific checkpoint subset names its own
@@ -495,6 +551,7 @@ class DefaultModelLoader(BaseModelLoader):
         primary_weights = DefaultModelLoader.Source(
             model_path,
             revision,
+            weight_files=weight_files,
             prefix="",
             fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", False),
         )
@@ -515,7 +572,10 @@ class DefaultModelLoader(BaseModelLoader):
 
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_weights(
-            model_config.model_path, model_config.revision, fall_back_to_pt=True
+            model_config.model_path,
+            model_config.revision,
+            fall_back_to_pt=True,
+            weight_files=None,
         )
 
     def load_model(
