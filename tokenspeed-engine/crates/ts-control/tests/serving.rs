@@ -414,6 +414,8 @@ struct WireRoom {
     sent: Option<i32>,
     /// The prefill ranks that sent their part of the KV.
     sent_by: Vec<usize>,
+    /// The rank's write was submitted, but its completion has not arrived.
+    hold_prefill_rank: Option<usize>,
     /// The transfer breaks.
     fails: bool,
     /// The transfer breaks on this prefill rank alone.
@@ -486,8 +488,14 @@ impl TransferPeer for FakePeer {
                         // The KV left this prefill rank, or arrived from
                         // every one.
                         let sent = match role {
-                            Role::Prefill => room.sent_by.contains(&rank),
-                            _ => room.sent_by.len() == prefill_ranks,
+                            Role::Prefill => {
+                                room.sent_by.contains(&rank)
+                                    && room.hold_prefill_rank != Some(rank)
+                            }
+                            _ => {
+                                room.sent_by.len() == prefill_ranks
+                                    && room.hold_prefill_rank.is_none()
+                            }
                         };
                         if sent {
                             TransferPoll::Success
@@ -725,9 +733,11 @@ impl DataPlane for FakeDevice {
             }
             if let Some(prompts) = plan.remote_decode() {
                 for rid in &prompts.request_ids {
-                    let first = 1000 + self.generated[rid] - 1;
                     let room = wire.rooms.entry(self.rooms[rid]).or_default();
-                    room.sent = Some(first);
+                    // Only the sampling stage has a local first token.
+                    if !self.placeholder_stage {
+                        room.sent = Some(1000 + self.generated[rid] - 1);
+                    }
                     room.sent_by.push(self.rank);
                 }
             }
@@ -4890,6 +4900,96 @@ async fn a_released_pd_engine_refuses_requests_until_it_wakes() {
         Some("length")
     );
     assert_eq!(tokens(&decoded).len(), 4);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pp_prefill_release_waits_for_the_remote_stage_kv_transfer() {
+    let (prefill, decode, wire) = start_pd_pair(
+        2,
+        Layout::Pp(2),
+        Tiers::DeviceOnly,
+        Setup {
+            replica_memory_transitions: true,
+            ..Setup::default()
+        },
+    )
+    .await;
+    let room = 90;
+    wire.lock()
+        .unwrap()
+        .rooms
+        .entry(room)
+        .or_default()
+        .hold_prefill_rank = Some(1);
+    let p = disaggregated("in-flight", room, 20, 1);
+    let d = disaggregated("in-flight", room, 20, 8);
+    let p = prefill.client.generate(p).await.unwrap();
+    let d = decode.client.generate(d).await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while wire.lock().unwrap().rooms[&room].sent_by.len() != 2 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("both prefill stages submitted their KV");
+
+    let tags = Some(vec!["kv_cache".to_owned()]);
+    let release = control(
+        &prefill,
+        ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
+            rid: None,
+            http_worker_ipc: None,
+            tags: tags.clone(),
+        }),
+    );
+    tokio::pin!(release);
+    assert!(tokio::time::timeout(Duration::from_millis(100), &mut release)
+        .await
+        .is_err());
+    assert!(prefill
+        .ranks
+        .iter()
+        .all(|rank| rank.device_ops.lock().unwrap().is_empty()));
+
+    wire.lock().unwrap().rooms.get_mut(&room).unwrap().hold_prefill_rank = None;
+    let (release, before_p, before_d) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(release, collect(p), collect(d))
+    })
+    .await
+    .expect("retired KV transfer lets both ranks release");
+    assert_eq!(release, [("ReleaseMemoryOccupationReqOutput", true)]);
+    assert_eq!(tokens(&before_p), [1000]);
+    assert_eq!(tokens(&before_d), (1000..1008).collect::<Vec<_>>());
+
+    assert_eq!(
+        control(
+            &prefill,
+            ControlRequest::ResumeMemoryOccupation(ResumeMemoryOccupationReqInput {
+                rid: None,
+                http_worker_ipc: None,
+                tags,
+            }),
+        )
+        .await,
+        [("ResumeMemoryOccupationReqOutput", true)]
+    );
+    for rank in &prefill.ranks {
+        assert_eq!(
+            *rank.device_ops.lock().unwrap(),
+            ["release kv_cache", "resume kv_cache"]
+        );
+    }
+    let (after_p, after_d) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(
+            run(&prefill.client, disaggregated("restored", room + 1, 20, 1)),
+            run(&decode.client, disaggregated("restored", room + 1, 20, 8))
+        )
+    })
+    .await
+    .expect("both roles serve after KV resume");
+    assert_eq!(tokens(&before_p), tokens(&after_p));
+    assert_eq!(tokens(&before_d), tokens(&after_d));
 }
 
 #[tokio::test(flavor = "multi_thread")]

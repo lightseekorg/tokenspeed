@@ -70,6 +70,14 @@ remains the deployment's responsibility. Older host/runtime combinations
 use protocol 2 and its local memory-transition path. Ranks within a
 deployment must agree on the protocol at startup.
 
+For a pipeline prefill engine, draining includes the KV transfers from
+every stage. The replica must retire those transfers before releasing the
+source KV. The decode engine has its own scheduler and can continue a
+request once its KV and first token have landed. The
+`pp_prefill_release_waits_for_the_remote_stage_kv_transfer` serving test
+holds one stage's transfer completion and checks that the replica keeps
+its KV until that stage retires.
+
 The launcher (`entrypoints/engine.py`) starts the ranks through
 `start_rust_host`, whatever the deployment: `ts serve` (SMG's gateway on its
 direct ZMQ lane, which binds the frontend sockets) and `ts serve --headless`
