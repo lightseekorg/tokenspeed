@@ -205,6 +205,16 @@ collective path and return the original in-place output buffer.
 Ranks choose the collective from the shared dtype, operation and element
 count; local layout differences only require packing and copying back.
 
+### PyNCCL stream ordering
+
+When PyNCCL is enabled, every operation uses the same stream precedence:
+its explicit stream argument, then its communicator context's stream, then
+the calling thread's current CUDA stream on the communicator's device.
+This contract is identical during eager execution and graph capture, so a
+separate communicator stream cannot race input production or output
+consumption. Exiting the context, including through an exception, restores
+the prior communicator state.
+
 ### Rebinding a cache pool
 
 Prefill autotune and graph capture use distinct writable pages per fabricated
@@ -507,6 +517,25 @@ setup, never publishes results; each kernel may delay it for performance.
 Streaming top-k, for example, avoids delaying scoring waves with waiting
 merge CTAs. Graphs retain their captured PDL setting; recapture to change it.
 
+An op whose successors read only constant operands before their own wait
+may instead trigger before it waits. A finished kernel still implies a
+finished predecessor, but a successor may then start before that predecessor
+ends, so a weight-streaming projection after a chain of such ops prefetches
+across the whole chain.
+A kernel that preloads older producer data before its wait, such as the
+combine-norm below, needs a kernel launched after that producer to wait
+first, usually its direct predecessor. Kernels in between may trigger
+first: a kernel starts only after its predecessor triggered, so the chain
+reaches back to the one that waited. The ops READMEs (`moe`,
+`attention/rmha`, `conv`, `residual`) name the kernels that trigger first
+and what each preloads before its wait.
+
+A captured kernel launches early only through a single programmatic
+dependency. A stream join adds the branch's last node to the next kernel's
+dependencies, and with two it waits for both to finish. `StreamFork` therefore
+waits once per branch: a join with no unjoined branch work, including a scope's
+closing join after an explicit one, adds nothing.
+
 `fused_gate_sigmoid_mul_add`, `sigmoid_mul`, `silu_and_mul`, `swiglu_oai`,
 `situ_and_mul`, `add3`, and split AttnRes launchers read `pdl_enabled()`
 themselves. They use that same value for `ENABLE_PDL` and `launch_pdl`; model
@@ -712,6 +741,26 @@ configuration, so every DP rank derives the same answer
 only. `decode_graph=False` still requires `refresh_decode_metadata` and
 `init_cuda_graph_state` — eager decode runs the same unified path.
 
+Models whose embedding reads request-token history may implement
+`HistoryEmbeddingModel` on the inner model. Its
+`compute_input_embeddings(input_ids, ctx, *, request_token_history)` method is
+shared by ordinary forward and graph replay. At construction the graph owner
+resolves one embedding callable: this method, or a plain token lookup for models
+that do not require history. Argument preparation must preserve supplied
+`input_embeds` so the inner model skips embedding computation when they are present.
+The executor supplies its live `RequestTokenHistoryView`; the graph
+owner calls this method eagerly, before padding, and copies its result into
+the same static embedding buffer used by ordinary text and multimodal
+prefills. The method must return all input rows, and every history-dependent
+operation must finish there. The captured inner stack consumes the supplied
+`input_embeds` without requiring or appending history, including during
+`prepare_model_kwargs`. Decode keeps its existing embedding path. Capture uses
+zero dummy embeddings and does not access live history. Models requiring history
+without this protocol remain eager. Multimodal forwards of history-embedding
+models also remain eager because the multimodal embedding seam does not receive
+history.
+Request history retains its existing runtime owner and lifetime.
+
 Prefill graph warmup runs on the same side stream as capture. Some kernels
 cache occupancy by stream and reject a cold CUDA graph capture; warming on the
 default stream does not prepare their capture-stream state. The capture stream
@@ -719,6 +768,17 @@ waits for the dummy inputs and metadata before warmup, and warmup completes
 before capture begins. This applies to ordinary, encoder, and decoder captures.
 Graph-memory observation wraps only capture; eager warmups, decoder rearming
 and smoke-test replay stay outside the measured region.
+
+An eager break returns a tensor or a fixed plain-tuple structure of tensors
+and optional `None` leaves. Each tensor lands in stable handoff storage before
+the next segment runs; same-shaped leaves that are live together have separate
+buffers. Replay of a tuple output rejects changed structure, dtype, device or
+trailing dimensions; any output may have shorter leading rows, and replay clears
+the padded tail on every leaf. Sequential
+breaks may reuse handoffs after their previous results are consumed, and captures
+that never replay concurrently may share those storage slots across token buckets.
+Tensor inputs keep their weak storage aliases and context arguments are rebound
+to the live forward context, independently of the output structure.
 
 ### One output layout per forward
 
@@ -743,6 +803,16 @@ pairs the padded context with a padded layout, then restores the original
 live layout before output/state processing. Grammar completions retain
 their immutable per-step layout, independently of later context updates.
 Idle graph warmup also supplies an explicit layout.
+
+### Decoder input embeddings
+
+Prefill graphs stage the text model's `get_decoder_input_embedding()` lookup
+outside the graph, then copy its result into the existing static
+`input_embeds` buffer; a model without the hook keeps the raw `embed_tokens`
+lookup. The hook returns rows ready for the inner model's supplied-embedding
+branch: a lookup-only normalization belongs in the hook, while normalization
+shared by text and media stays inside the model. Graph eligibility,
+static-buffer ownership, and zeroing of padded rows are unchanged.
 
 ### Prefill graphs around a row narrowing
 
@@ -1081,9 +1151,15 @@ without top-k, top-p or min-p from its whole vocabulary, by
 Admission uses the selected sampling backend's finite top-k bound. GPU
 backends retain the exclusive 128 bound. `ascend_full` accepts positive
 finite values and caps them at 4096 when populating its per-request scalar
-pool, before the int32 write. The normalized disabled sentinel (`top_k=-1`)
-keeps whole-vocabulary sampling. The captured graph reads that same pool
-for single-step sampling and chain verification.
+pool, before the int32 write. Whole-vocabulary top-p remains the default
+for the normalized disabled sentinel (`top_k=-1`). The model HF config
+boolean `npu_sampling_top_p_top_k_cap` opts into an effective `top_k=4096`
+when `top_p < 1`; it can be set through `--hf-overrides`. The executor
+passes the resolved target text HF config to the sampler factory. `top_p=1`
+and greedy requests keep their existing behavior. This policy is local
+to `ascend_full`; request parameters and other backends are unchanged.
+The captured graph reads that same pool for single-step sampling and
+chain verification.
 Ascend sampling consumes the logits already audited and sanitized by the
 executor's `NanGuard`; it does not repeat a host-side NaN truth test inside
 the captured graph. Per-request numerical error flags keep their existing
@@ -1222,14 +1298,13 @@ scores; no backend computes them. `docs/guides/sampling-calibration.md` is
 the contract: ordering, masking, supported configurations and cost.
 
 `sample()` and `verify()` land their outputs in each sampling backend's
-persistent output buffers, on eager and replay alike. The FlashInfer backend
-packs tokens and accept lengths into one region (`_output_pack_buf`), so its
-`get_packed_output_d2h` collapses the two device-to-host copies into one; the
-Triton backends and `sonic` return separate token and length buffers and
-take the executor's two-copy path (`get_packed_output_d2h` returns None).
-The stop conditions cut the returned accept lengths in place (0 for a stopped
-request), so a backend whose decode rows return a buffer of ones refills it on
-every call, as `sonic` and FlashInfer do.
+persistent output buffers, on eager and replay alike. When tokens and accept
+lengths share one region (`_output_pack_buf`, where every `verify()` lands
+them), `get_packed_output_d2h` brings both back in one device-to-host copy;
+otherwise (`sonic`, which returns its own token and length buffers) it returns
+None and the executor makes two. The stop conditions cut the returned accept
+lengths in place (0 for a stopped request), so a backend whose decode rows
+return a buffer of ones refills it on every call, as `sonic` and FlashInfer do.
 
 ### Logits capture state follows the tensor's device
 
@@ -1244,7 +1319,7 @@ plain gather, without entering CUDA APIs on another device.
 
 Enumerated residue in `ForwardStepRunner.__call__`, all tied to the mechanics
 of replaying a recorded graph: input-buffer padding to the ladder bs plus the
-DFLASH sentinel req-pool rows, `_set_graph_state_write_indices`, the DeepEP
+DFLASH sentinel req-pool rows, the DeepEP
 dispatch-mode restore (`deepep_adapter.replay()`), the sampler-variant
 `graph_key` lookup, the `TOKENSPEED_GRAPH_DEBUG` metadata verify,
 output-buffer re-slicing, the `ctx.bs` save/restore, and the replay itself
@@ -1634,11 +1709,17 @@ history destinations through `write_locations`.
   is the side-write variant — scratch resolution over the full-history
   table (`draft_history_view`) that must not clobber the published window
   (DFLASH's target-KV injection, DSpark context windows).
-* **Cross-backend reads**: `decode_window_locations()` /
-  `extend_span_locations()` expose the full-history group's published
-  windows; DFLASH reads the TARGET router's windows through them to copy
-  target-aligned KV into the draft cache (the pools share one page-id
-  space).
+* **Context writes**: `decode_window_locations()` /
+  `extend_span_locations()` expose the writing router's history windows.
+  DFLASH reads its own router before publishing a proposal window, so context
+  KV follows the draft group's pages even when its retention differs from
+  the target's. Extend rows take the draft's extend span. Verify rows take
+  the target's verify width from each request's first verify position,
+  resolved through `draft_write_locations_uniform`: the draft's own decode
+  window has the draft's query width, which DSpark narrows by the anchor
+  row. The runner refreshes both routers before the target forward;
+  capture-tap writes and the fallback context write resolve over that same
+  round's draft table.
 * **Writes outside the backend** (the attention prologue) fetch their slots
   immediately before the write. An offloaded latent
   projection uses the compute slots returned by its sparse prepare. When a draft step-0
@@ -1708,6 +1789,10 @@ belongs to the output mixer. Capture execution and projection-weight placement
 use this same owner on both PP and non-PP. There is no boundary deferral or
 recovery operation. Capture's mixed stream must not be replaced by the fused
 attention input, which already includes input-layer normalization.
+
+Block draft query width follows the normalized `sample_from_anchor` checkpoint policy.
+`ModelConfig` supplies the legacy algorithm convention only when that metadata is absent.
+A verification window of W tokens has W - 1 proposals but needs W - 1 or W draft queries, depending on that policy.
 
 `execution/dspark_context.py` contains `DSparkContextProducer` and the model
 interface it consumes. K3 tap ownership and projection arithmetic live in
@@ -1806,7 +1891,7 @@ seam is `BaseDrafter.prepare_target_forward(ctx)`, called right before the
 target runs: the drafter decides under its own gate whether this round
 qualifies and attaches what it needs; a fresh context per round means
 nothing outlives it, and a model that sees no attachment does nothing.
-DFLASH is the one user: on decode-only rounds it attaches
+DFLASH is one user: on decode-only rounds it attaches
 `ctx.target_capture_sink`, the target hands each captured tap to
 `on_target_capture` as it is produced, and the sink copies it (rounding a
 wider residual once) into its columns of one tap block. The last tap runs

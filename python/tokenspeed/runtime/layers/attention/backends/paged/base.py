@@ -102,6 +102,11 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
     # Declared here as well as on AttentionBackend: the refactor made the two
     # separate roots, so a paged leaf inherits only this one.
     supports_layer_sliding_window: bool = False
+    # This leaf keeps each layer's ``sliding_window_sink`` leading tokens
+    # visible outside the window. Left False, a declared sink silently
+    # degrades to plain sliding-window attention: no error, only a quality
+    # loss. Declared alongside the window flag for the same reason.
+    supports_layer_window_sink: bool = False
     supports_mla_dcp: bool = False
     prefill_needs_host_page_table: bool = False
 

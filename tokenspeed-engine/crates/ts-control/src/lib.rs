@@ -35,6 +35,7 @@ pub mod eplb;
 pub mod event_loop;
 pub mod grammar;
 pub mod ingress;
+pub mod json_framing;
 pub mod kv_events;
 pub mod l3;
 pub mod output;

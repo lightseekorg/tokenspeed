@@ -42,13 +42,11 @@ class Fp8Config(QuantizationConfig):
 
     weight_scale_dtype = torch.float32
 
-    # Excluded from online quantization: linear-attention (GDN/mamba)
-    # projections.
+    # Keep GDN BA (including fused QKVZBA), conv and Mamba projections floating.
     ONLINE_IGNORED_LAYERS = [
-        "re:.*linear_attn.*",
         "re:.*conv1d.*",
-        "re:.*in_proj.*",
-        "re:.*out_proj.*",
+        r"re:.*\.in_proj_(a|b|ba|qkvzba)$",
+        r"re:.*\.mixer\.(in_proj|out_proj).*",
     ]
 
     def __init__(

@@ -149,6 +149,14 @@ class BaseDrafter:
         """Take a replacement pool; a drafter that caches views rebuilds them."""
         self.token_to_kv_pool = token_to_kv_pool
 
+    def warmup_extend(self, num_tokens: int) -> None:
+        """Compile the draft's work for an extend of ``num_tokens`` tokens.
+
+        The startup's dummy extends drive the target model only, so a drafter
+        whose extend runs draft kernels runs them here, on every rank alike,
+        inside ``kernel_warmup``. The default has none.
+        """
+
     def bind_sampling_backend(self, sampling_backend: SamplingBackend) -> None:
         """Take the verifier's per-request sampling pools for sampled drafting.
 

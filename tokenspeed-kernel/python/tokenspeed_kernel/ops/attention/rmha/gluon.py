@@ -55,6 +55,7 @@ if current_platform().is_amd:
         signatures=format_signatures(("q", "k", "v"), "dense", {torch.bfloat16}),
         priority=Priority.SPECIALIZED,
         traits={
+            "fp32_output": frozenset({False}),
             "head_dim": frozenset({64, 128}),
             "return_lse": frozenset({False, True}),
             "sliding_window": frozenset({False, True}),
@@ -87,6 +88,7 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED,
         traits={
+            "fp32_output": frozenset({False}),
             "head_dim": frozenset({64, 128}),
             "page_size": frozenset({64, 128, 256}),
             "return_lse": frozenset({False, True}),
@@ -120,6 +122,7 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED,
         traits={
+            "fp32_output": frozenset({False}),
             "head_dim": frozenset({64, 128}),
             "page_size": frozenset({64, 128, 256}),
             "return_lse": frozenset({False}),

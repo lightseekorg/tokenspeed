@@ -55,6 +55,10 @@ from tokenspeed.runtime.layers.quantization import (
     QuantizationConfig,
     get_quantization_config,
 )
+from tokenspeed.runtime.layers.quantization.inkling2 import (
+    is_inkling2_manifest_stub,
+    read_inkling2_manifest,
+)
 from tokenspeed.runtime.layers.quantization.modelopt_mixed import normalize_quant_algo
 from tokenspeed.runtime.utils import get_colorful_logger
 
@@ -176,6 +180,10 @@ def get_quant_config(
         # compressed-tensors uses a compressions_config
         hf_quant_config = getattr(model_config.hf_config, "compression_config", None)
     if hf_quant_config is not None:
+        if is_inkling2_manifest_stub(hf_quant_config):
+            hf_quant_config = read_inkling2_manifest(
+                _json_folder(model_config, load_config)
+            )
         if "quantized_layers" in hf_quant_config:
             hf_quant_path = os.path.join(
                 _json_folder(model_config, load_config), "hf_quant_config.json"
