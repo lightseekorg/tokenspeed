@@ -843,7 +843,9 @@ def _dspark_context_drafter(
     server_args = SimpleNamespace(
         speculative_num_draft_tokens=4, speculative_algorithm="DSPARK"
     )
-    query_width = resolve_speculative_num_tokens(server_args, is_draft=True)
+    query_width = resolve_speculative_num_tokens(
+        server_args, is_draft=True, sample_from_anchor=True
+    )
     router = CacheGroupRouter(
         None,
         is_draft=True,
