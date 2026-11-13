@@ -269,6 +269,10 @@ class KimiK25ForConditionalGeneration(torch.nn.Module):
 
     def stores_capture_taps(self, ctx: ForwardContext) -> bool:
         """Whether the language model's forward stores the draft's taps itself."""
+        if self.language_model is None:
+            raise AttributeError(
+                "Kimi-K2.5 encoder-only mode cannot capture target hidden states."
+            )
         return self.language_model.stores_capture_taps(ctx)
 
     def get_input_embeddings(self):

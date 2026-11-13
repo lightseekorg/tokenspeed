@@ -1024,6 +1024,18 @@ def test_a_multimodal_wrapper_answers_for_its_language_model(wrapper, stores_tap
 
 
 @pytest.mark.parametrize(
+    "wrapper", [KimiK3ForConditionalGeneration, KimiK25ForConditionalGeneration]
+)
+def test_an_encoder_only_wrapper_refuses_to_answer_for_taps(wrapper):
+    target = wrapper.__new__(wrapper)
+    torch.nn.Module.__init__(target)
+    target.language_model = None
+
+    with pytest.raises(AttributeError, match="encoder-only"):
+        target.stores_capture_taps(_target_ctx(num_extends=0, num_tokens=4))
+
+
+@pytest.mark.parametrize(
     "enabled, num_extends, idle",
     [
         (False, 0, False),  # the draft normalizes each tap itself (fc_norm)
