@@ -9,6 +9,11 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(TOKENSPEED_SCHEDULER_BUILD_PYTHON "Build Python bindings" OFF)
 option(TOKENSPEED_SCHEDULER_BUILD_TESTS "Build tests" OFF)
+set(TOKENSPEED_SCHEDULER_SANITIZE "" CACHE STRING
+    "Sanitizers to build the core library and everything linking it with, such as address;undefined (empty: none)")
+if(TOKENSPEED_SCHEDULER_SANITIZE MATCHES "^(ON|TRUE|YES|Y|1)$")
+    message(FATAL_ERROR "TOKENSPEED_SCHEDULER_SANITIZE lists sanitizers, such as address;undefined")
+endif()
 
 include(FetchContent)
 
@@ -81,6 +86,21 @@ target_compile_definitions(tokenspeed_scheduler_core
     PUBLIC
         OPENSSL_SUPPRESS_DEPRECATED
 )
+
+# PUBLIC, so the tests, benchmarks and bindings that link the core are
+# instrumented and linked with the sanitizer runtimes as well.
+if(TOKENSPEED_SCHEDULER_SANITIZE)
+    list(JOIN TOKENSPEED_SCHEDULER_SANITIZE "," tokenspeed_scheduler_sanitizers)
+    target_compile_options(tokenspeed_scheduler_core
+        PUBLIC
+            -fsanitize=${tokenspeed_scheduler_sanitizers}
+            -fno-omit-frame-pointer
+    )
+    target_link_options(tokenspeed_scheduler_core
+        PUBLIC
+            -fsanitize=${tokenspeed_scheduler_sanitizers}
+    )
+endif()
 
 if(TOKENSPEED_SCHEDULER_BUILD_PYTHON)
     nanobind_add_module(tokenspeed_scheduler_ext

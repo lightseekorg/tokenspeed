@@ -127,3 +127,40 @@ sharding, replay and forced retraction. Build an isolated native extension for
 each revision with its matching headers/core, run the driver with `--module-dir`
 and `--output`, and compare the parsed JSON. This complements the C++ and
 Python behavioral suites; it does not expose or depend on hash-slot order.
+
+# Sanitizer builds
+
+`TOKENSPEED_SCHEDULER_SANITIZE` lists sanitizers to build the core library
+with, and with it every test, benchmark and binding that links the core. It is
+empty, meaning no sanitizer, by default. To run the C++ tests under
+AddressSanitizer (with LeakSanitizer) and UndefinedBehaviorSanitizer:
+
+```bash
+cmake -S tokenspeed-scheduler -B tokenspeed-scheduler/build/sanitize \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DTOKENSPEED_SCHEDULER_BUILD_TESTS=ON \
+  -DTOKENSPEED_SCHEDULER_BUILD_PYTHON=OFF \
+  "-DTOKENSPEED_SCHEDULER_SANITIZE=address;undefined"
+cmake --build tokenspeed-scheduler/build/sanitize \
+  --target tokenspeed_scheduler_tests -j 8
+UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+  tokenspeed-scheduler/build/sanitize/tokenspeed_scheduler_tests
+```
+
+ASan stops at its first report and LeakSanitizer reports leaks at exit; UBSan
+only prints its reports unless `halt_on_error=1` is set. The compiler's
+sanitizer runtime libraries must be installed. When the environment sets
+`LD_PRELOAD`, ASan refuses to start because its runtime does not come first:
+run the tests with the compiler's `libasan` first in `LD_PRELOAD`. The build
+runs the test binary too, to list its tests for `gtest_discover_tests`; there,
+set `ASAN_OPTIONS=verify_asan_link_order=0` instead, since preloading ASan
+into CMake and Ninja would make LeakSanitizer fail them.
+
+`FixedSlotResource.FreeSlotsArePoisonedUntilHandedOut` runs only in an ASan
+build and is skipped otherwise. `cache/core/fixed_slot_resource.h` detects ASan
+from the compiler (`__SANITIZE_ADDRESS__`, or Clang's
+`__has_feature(address_sanitizer)`) and then poisons every free pooled slot
+with `__asan_poison_memory_region`: the slot's memory stays allocated, yet ASan
+reports a read through a stale pointer to the freed node. The test checks with
+`__asan_address_is_poisoned` that freed slots are poisoned and handed-out slots
+are not. Make sure the run reports it as passed, not skipped.
