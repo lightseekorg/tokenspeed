@@ -18,8 +18,10 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""The MI450 simulator job's report digest: when a run without test results
-passes."""
+"""Tests of the MI450 simulator job's report digest.
+
+They cover when a run without test results passes.
+"""
 
 import json
 import subprocess
@@ -34,8 +36,10 @@ DIGEST = Path(__file__).resolve().parent / "mi450_sim_report_digest.py"
 def _digest(
     tmp_path: Path, events: list[dict], pytest_status: int
 ) -> subprocess.CompletedProcess:
-    """Write ``events`` as a pytest report log and run the digest on it with
-    pytest's exit status ``pytest_status``."""
+    """Run the digest on a report log written from ``events``.
+
+    ``pytest_status`` is the pytest exit status the digest is given.
+    """
     log = tmp_path / "report.jsonl"
     log.write_text("".join(json.dumps(event) + "\n" for event in events))
     return subprocess.run(
@@ -69,9 +73,11 @@ def test_a_run_without_results_passes_only_when_pytest_passed(
 
 
 def test_the_digest_names_why_a_passing_run_has_no_results(tmp_path):
-    """A passing run without test results either had every collected module
-    skipped or had the changed-paths selection empty it: the digest says
-    which."""
+    """The digest names why a passing run has no results.
+
+    Either every collected module was skipped, or the changed-paths selection
+    emptied the run.
+    """
     skipped_module = {
         "$report_type": "CollectReport",
         "nodeid": "test_x.py",

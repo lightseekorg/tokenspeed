@@ -153,11 +153,14 @@ def test_selection_comes_from_the_changed_paths_variable(repo, monkeypatch):
 
 
 def test_a_parallel_run_the_selection_empties_passes():
-    """Under pytest-xdist the workers collect and select, so the controller
+    """A parallel run that the selection empties passes.
+
+    Under pytest-xdist the workers collect and select, so the controller
     learns from them that the selection emptied the run: like a
     single-process run, it passes (exit 0) instead of failing with "no tests
     collected" (exit 5). This file names no op family, so a change to the
-    gemm sources deselects all of it."""
+    gemm sources deselects all of it.
+    """
     pytest.importorskip("xdist")
     repo_root = Path(__file__).resolve().parents[2]
     env = dict(os.environ)
@@ -175,3 +178,27 @@ def test_a_parallel_run_the_selection_empties_passes():
     assert run.returncode == 0, run.stdout + run.stderr
     # The controller doesn't see the workers' deselections, only that nothing ran.
     assert "no tests ran" in run.stdout
+
+
+def test_a_nested_run_with_an_inherited_xdist_variable_is_not_a_worker():
+    """A nested single-process run inside an xdist worker selects as a run.
+
+    It inherits ``PYTEST_XDIST_WORKER`` but is no worker: its config has no
+    ``workeroutput``, and an emptied selection still passes it.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    env = dict(os.environ)
+    env["PYTEST_XDIST_WORKER"] = "gw0"
+    env[CHANGED_PATHS_ENV] = (
+        "tokenspeed-kernel/python/tokenspeed_kernel/ops/gemm/__init__.py"
+    )
+    run = subprocess.run(
+        [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", __file__],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert run.returncode == 0, run.stdout + run.stderr
+    assert "0 selected" in run.stdout

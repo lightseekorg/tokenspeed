@@ -20,7 +20,6 @@
 
 from __future__ import annotations
 
-import os
 import sys
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -75,11 +74,14 @@ def pytest_collection_modifyitems(
         (kept if selected[item.path] else deselected).append(item)
     emptied = bool(deselected) and not kept
     config.stash[_SELECTION_EMPTIED_RUN] = emptied
-    if os.environ.get("PYTEST_XDIST_WORKER"):
-        # A pytest-xdist worker collects and selects for the controller, which
-        # learns from it whether the selection emptied the run
-        # (pytest_testnodedown).
-        config.workeroutput[_WORKER_EMPTIED_KEY] = emptied
+    # A pytest-xdist worker collects and selects for the controller, which
+    # learns from it whether the selection emptied the run
+    # (pytest_testnodedown). xdist sets workeroutput on a worker's config
+    # (third-party state); PYTEST_XDIST_WORKER would also be inherited by a
+    # nested run that is not a worker.
+    workeroutput = getattr(config, "workeroutput", None)
+    if workeroutput is not None:
+        workeroutput[_WORKER_EMPTIED_KEY] = emptied
     if deselected:
         config.hook.pytest_deselected(items=deselected)
         items[:] = kept
@@ -87,10 +89,12 @@ def pytest_collection_modifyitems(
 
 @pytest.hookimpl(optionalhook=True)
 def pytest_testnodedown(node, error) -> None:
-    """pytest-xdist, on the controller: the run counts as emptied by the
-    selection when every worker's was (``pytest_sessionfinish``). A worker
-    that crashed (``error``) may have sent no output; it never counts as
-    emptied, so the run keeps its failure."""
+    """Merge each pytest-xdist worker's emptied-selection flag on the controller.
+
+    The run counts as emptied by the selection when every worker's was
+    (``pytest_sessionfinish``). A worker that crashed (``error``) may have
+    sent no output; it never counts as emptied, so the run keeps its failure.
+    """
     stash = node.config.stash
     # xdist's node object, not this file's state: absent after a crash.
     output = getattr(node, "workeroutput", None)
