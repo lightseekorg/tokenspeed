@@ -30,7 +30,7 @@ import glob
 import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Generator, Iterable
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from typing import Any, Protocol, cast, runtime_checkable
 
 import huggingface_hub
@@ -66,6 +66,7 @@ from tokenspeed.runtime.model_loader.weight_utils import (
     np_cache_weights_iterator,
     pt_weights_iterator,
     safetensors_filtered_weights_iterator,
+    safetensors_tensor_shapes,
     safetensors_weights_iterator,
     split_kv_cache_scales,
 )
@@ -422,7 +423,8 @@ class DefaultModelLoader(BaseModelLoader):
         only synchronize ranks in ``checkpoint_load_group`` when one is
         declared: pipeline stages can consume different checkpoint subsets.
         ``shared_weight_name_filter`` selects immutable host weights that need
-        a shared writable file mapping for GPU registration/writeback.
+        a shared writable file mapping for GPU registration/writeback. Loaders
+        without this storage reject selected weights before yielding them.
         """
         hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
             source.model_or_path,
@@ -436,6 +438,16 @@ class DefaultModelLoader(BaseModelLoader):
             if shared_weight_name_filter is not None
             else None
         )
+
+        def reject_shared_weight(name: str) -> None:
+            if shared_filter is not None and shared_filter(name):
+                raise ValueError(
+                    f"Weight {source.prefix + name!r} requires a shared writable "
+                    f"mapping, which load_format={self.load_config.load_format.value!r} "
+                    "cannot provide for this checkpoint. Use --load-format "
+                    "safetensors with writable safetensors files."
+                )
+
         # Filtered models can consume different shard lists on different ranks.
         # Keep their independent prefetch rather than assign reads to absent peers.
         local_rank, local_world_size = 0, 1
@@ -471,6 +483,11 @@ class DefaultModelLoader(BaseModelLoader):
                 hf_weights_files,
             )
         elif self.load_config.load_format == LoadFormat.INSTANTTENSOR:
+            if shared_filter is not None:
+                # Refuse incompatible tensors before importing InstantTensor or
+                # creating its process group; headers suffice to check names.
+                for name in safetensors_tensor_shapes(hf_weights_files):
+                    reject_shared_weight(name)
             process_group = None
             if checkpoint_load_group is not None:
                 from tokenspeed.runtime.distributed.process_group_manager import (
@@ -509,6 +526,19 @@ class DefaultModelLoader(BaseModelLoader):
             )
         else:
             weights_iterator = pt_weights_iterator(hf_weights_files)
+
+        if shared_filter is not None and not use_safetensors:
+
+            def checked_weights() -> Generator[tuple[str, torch.Tensor], None, None]:
+                # PyTorch/numpy names arrive with their tensors. Check before
+                # handing a selected weight to the model, and release storage
+                # on refusal or an early close of the consumer's iterator.
+                with closing(weights_iterator):
+                    for name, tensor in weights_iterator:
+                        reject_shared_weight(name)
+                        yield source.prefix + name, tensor
+
+            return checked_weights()
 
         return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
 

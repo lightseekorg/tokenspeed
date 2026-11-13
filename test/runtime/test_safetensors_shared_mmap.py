@@ -53,6 +53,10 @@ class _SelectedFileHostWeights(_HostWeights):
     checkpoint_weight_files = ("selected.safetensors",)
 
 
+class _FallbackHostWeights(_HostWeights):
+    fall_back_to_pt_during_load = True
+
+
 def _mapping_permissions(pointer: int) -> str | None:
     for line in Path("/proc/self/maps").read_text().splitlines():
         address, permissions, *_ = line.split()
@@ -140,6 +144,13 @@ def test_shared_mapping_requires_write_permission_but_default_loading_does_not(
     save_file({"host.table": expected}, str(path))
     path.chmod(0o444)
     try:
+        try:
+            with open(path, "r+b"):
+                pass
+        except PermissionError:
+            pass
+        else:
+            pytest.skip("The current process can bypass file write permissions")
         with pytest.raises(PermissionError):
             dict(_load(tmp_path, _HostWeights(), load_format="auto", prefetch=False))
         loaded = dict(
@@ -189,3 +200,68 @@ def test_shared_mapping_respects_explicit_checkpoint_files(tmp_path):
     assert loaded.keys() == {"host.table"}
     assert _mapping_permissions(loaded["host.table"].data_ptr()) == "rw-s"
     torch.testing.assert_close(loaded["host.table"], expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    ("load_format", "suffix"),
+    [
+        ("instanttensor", "safetensors"),
+        ("npcache", "bin"),
+        ("pt", "pt"),
+        ("auto", "bin"),
+        ("auto", "pt"),
+    ],
+)
+def test_unsupported_loaders_reject_selected_shared_weights(
+    tmp_path, load_format, suffix
+):
+    weights = {"host.table": torch.ones(8, 16)}
+    path = tmp_path / f"model.{suffix}"
+    if suffix == "safetensors":
+        save_file(weights, str(path))
+    else:
+        torch.save(weights, path)
+
+    with pytest.raises(ValueError, match="shared writable mapping.*safetensors"):
+        dict(
+            _load(
+                tmp_path,
+                _FallbackHostWeights(),
+                load_format=load_format,
+                prefetch=False,
+            )
+        )
+
+
+@pytest.mark.parametrize("model_type", [torch.nn.Module, _HostWeights])
+@pytest.mark.parametrize(
+    ("load_format", "suffix"), [("auto", "bin"), ("pt", "pt"), ("npcache", "bin")]
+)
+def test_unsupported_loaders_keep_weights_without_shared_mapping_requests(
+    tmp_path, model_type, load_format, suffix
+):
+    expected = torch.arange(24, dtype=torch.float32).reshape(4, 6)
+    torch.save({"projection": expected}, tmp_path / f"model.{suffix}")
+    loaded = dict(
+        _load(tmp_path, model_type(), load_format=load_format, prefetch=False)
+    )
+    assert loaded.keys() == {"projection"}
+    torch.testing.assert_close(loaded["projection"], expected, rtol=0, atol=0)
+
+
+def test_unsupported_loader_checks_shared_weights_with_source_prefix(tmp_path):
+    torch.save({"table": torch.ones(8, 16)}, tmp_path / "model.pt")
+    loader = DefaultModelLoader(LoadConfig(load_format="pt"))
+    source = DefaultModelLoader.Source(
+        str(tmp_path), None, weight_files=None, prefix="draft."
+    )
+    with pytest.raises(ValueError, match="draft.table.*shared writable mapping"):
+        dict(
+            loader._get_weights_iterator(
+                source,
+                None,
+                None,
+                Mapping(rank=0, world_size=1),
+                shared_weight_name_filter=lambda name: name == "draft.table",
+            )
+        )
