@@ -29,9 +29,12 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
+from tokenspeed_kernel.ops.sampling.block_verify import block_speculative_sampling
 from tokenspeed_kernel.ops.sampling.triton import (
     _QRITA_PERCENTILE_TO_STD_TABLE,
     TOP_K_DISABLED,
+    block_verify_coins_from_pools,
     gumbel_sample_from_pools,
     gumbel_sample_from_pools_compact,
     gumbel_sample_from_pools_generic,
@@ -62,6 +65,7 @@ from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 from tokenspeed.runtime.sampling.sampling_params import _SAMPLING_EPS, _TOP_K_DISABLED
 from tokenspeed.runtime.sampling.tree_verify import accepted_path_rows
 from tokenspeed.runtime.sampling.utils import gather_token_logprobs, nan_guard_logits
+from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 if TYPE_CHECKING:
@@ -113,6 +117,59 @@ _CUDA_GRAPH_VARIANT_SAMPLE_ROUTES = {
 }
 
 
+def block_target_probs(
+    logits: torch.Tensor,
+    temperature: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    *,
+    sample_route: int,
+    top_k_pad: int,
+) -> torch.Tensor:
+    """Each verify row's normalized target law for block verification.
+
+    ``softmax(logits / T)`` cut to the row's ``top_k`` best tokens and
+    renormalized, then cut to the smallest prefix of that row with mass
+    ``>= top_p`` and renormalized: FlashInfer's ``top_k_renorm_prob`` then
+    ``top_p_renorm_prob``. Greedy rows (``top_k == 1``) are one-hot at the
+    lowest-index argmax, the token whose one-hot q a greedy draft records,
+    so their verify stays exactly greedy. The top-k routes hold every finite
+    top_k within ``top_k_pad`` and rank only that many candidates; the other
+    filtering routes sort whole rows. Tensor-only, so it captures in a graph.
+
+    Args:
+        logits: ``[rows, V]`` target logits, vocabulary mask applied.
+        temperature: ``[rows]`` fp32 temperature of each row's request.
+        top_k: ``[rows]`` top-k (``TOP_K_DISABLED`` when off).
+        top_p: ``[rows]`` top-p.
+        sample_route: The batch's sampling route (which filters it uses).
+        top_k_pad: Bound on every finite top_k on the top-k routes.
+
+    Returns:
+        ``[rows, V]`` contiguous fp32 probabilities.
+    """
+    probs = torch.softmax(torch.div(logits.float(), temperature.view(-1, 1)), dim=-1)
+    if sample_route == _SAMPLE_ROUTE_GUMBEL_NO_FILTER:
+        return probs
+    if sample_route in (_SAMPLE_ROUTE_GUMBEL_TOP_K, _SAMPLE_ROUTE_GUMBEL_TOP_K_TOP_P):
+        ranked, ids = torch.topk(probs, min(top_k_pad, probs.shape[1]), dim=-1)
+    else:
+        ranked, ids = torch.sort(probs, dim=-1, descending=True)
+    ranks = torch.arange(ranked.shape[1], device=probs.device)
+    keep = ranks.view(1, -1) < top_k.view(-1, 1)
+    ranked = ranked.masked_fill(~keep, 0.0)
+    ranked = ranked / ranked.sum(dim=-1, keepdim=True)
+    top_p = top_p.view(-1, 1)
+    keep &= (ranked.cumsum(dim=-1) - ranked < top_p) | (top_p >= 1.0 - _SAMPLING_EPS)
+    kept = torch.zeros_like(probs).scatter_(1, ids, ranked.masked_fill(~keep, 0.0))
+    kept = kept / kept.sum(dim=-1, keepdim=True)
+    greedy = (top_k == 1).view(-1, 1)
+    canonical = sampling_argmax(logits).to(torch.int64).clamp_min_(0).view(-1, 1)
+    kept.masked_fill_(greedy, 0.0)
+    kept.scatter_add_(1, canonical, greedy.to(kept.dtype))
+    return kept
+
+
 class TritonSamplingBackend(SamplingBackend):
     """TokenSpeed pool-state backend using Triton Gumbel-Max kernels."""
 
@@ -122,6 +179,13 @@ class TritonSamplingBackend(SamplingBackend):
 
     def __init__(self, config: SamplingBackendConfig) -> None:
         super().__init__(config)
+        # The rejection method is a server-wide choice read from the server
+        # args like ``numerics``; block verification reads the dense draft q
+        # the chain drafters record under speculative sampling.
+        self._block_verify = (
+            global_server_args_dict["speculative_rejection_sample_method"] == "block"
+            and config.enable_speculative_sampling
+        )
         self._init_triton_pool_state(config)
         self._init_triton_buffers(config)
         self._init_vocab_shard_buffers(config)
@@ -192,7 +256,7 @@ class TritonSamplingBackend(SamplingBackend):
         The warmup samples and verifies the padding slot at each count, with
         and without a vocabulary mask when the server applies one.
         """
-        # Draft-prob sampling serves on flashinfer and sonic only.
+        # Block verification gathers whole rows, so no shard kernel serves it.
         del draft_probs
         device = shard.logits.device
         num_tokens_per_req = candidates.shape[1]
@@ -443,6 +507,26 @@ class TritonSamplingBackend(SamplingBackend):
             )
             self._no_filter_verify_ids = torch.empty(
                 ids_shape, dtype=torch.int32, device=config.device
+            )
+
+        # Block verification: the recorded draft q batch-ordered out of the
+        # pool-indexed RuntimeStates.draft_probs (the kernel reads [bs, N, V]
+        # contiguous rows), and the prefix and residual coins.
+        self._draft_probs_gather_buf: torch.Tensor | None = None
+        self._block_coins: torch.Tensor | None = None
+        self._block_final_coins: torch.Tensor | None = None
+        if self._block_verify:
+            max_n = config.max_draft_tokens_per_req
+            self._draft_probs_gather_buf = torch.empty(
+                (config.max_bs, max_n, vocab_size),
+                dtype=torch.float32,
+                device=config.device,
+            )
+            self._block_coins = torch.empty(
+                (config.max_bs, max_n), dtype=torch.float32, device=config.device
+            )
+            self._block_final_coins = torch.empty(
+                (config.max_bs,), dtype=torch.float32, device=config.device
             )
 
     def _write_logprob_outputs(
@@ -1011,6 +1095,63 @@ class TritonSamplingBackend(SamplingBackend):
             )
         return row_accept, row_token
 
+    def _verify_block(
+        self,
+        logits: torch.Tensor,
+        draft_probs: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        offsets_pool: torch.Tensor,
+        candidates: torch.Tensor,
+        predict: torch.Tensor,
+        accept_index: torch.Tensor,
+        accept_length: torch.Tensor,
+    ) -> None:
+        """Block verification of each request's chain against its recorded q.
+
+        Writes the accepted prefix and the residual or bonus token in chain
+        layout; ``accept_length`` counts the accepted drafts only.
+        """
+        assert self._draft_probs_gather_buf is not None
+        assert self._block_coins is not None and self._block_final_coins is not None
+        bs, num_tokens_per_req = candidates.shape
+        gathered = self._draft_probs_gather_buf
+        if (
+            num_tokens_per_req != gathered.shape[1]
+            or draft_probs.shape[1:] != gathered.shape[1:]
+        ):
+            raise RuntimeError(
+                f"draft_probs geometry {tuple(draft_probs.shape[1:])} / N="
+                f"{num_tokens_per_req} does not match the verify buffer "
+                f"{tuple(gathered.shape[1:])}"
+            )
+        gathered = gathered[:bs]
+        torch.index_select(draft_probs, 0, req_pool_indices, out=gathered)
+        row_pool = req_pool_indices.long().repeat_interleave(num_tokens_per_req)
+        target_probs = block_target_probs(
+            logits,
+            self._temperature_pool[row_pool],
+            self._top_k_pool[row_pool],
+            self._top_p_pool[row_pool],
+            sample_route=self._sample_route,
+            top_k_pad=self._top_k_top_p_pad,
+        ).view(bs, num_tokens_per_req, -1)
+        coins = self._block_coins[:bs, :num_tokens_per_req]
+        final_coins = self._block_final_coins[:bs]
+        block_verify_coins_from_pools(
+            req_pool_indices, self._seed_pool, offsets_pool, coins, final_coins
+        )
+        block_speculative_sampling(
+            predicts=predict,
+            accept_index=accept_index,
+            accept_token_num=accept_length,
+            candidates=candidates,
+            uniform_samples=coins,
+            uniform_samples_for_final_sampling=final_coins,
+            target_probs=target_probs,
+            draft_probs=gathered,
+            reject_draft_prob_threshold=self.config.spec_reject_draft_prob_threshold,
+        )
+
     @nvtx_range("sampling:verify", color="yellow")
     def verify(
         self,
@@ -1031,8 +1172,15 @@ class TritonSamplingBackend(SamplingBackend):
         )
         accept_length = self._accept_length_buf[:bs]
 
+        # Block verification needs whole target rows. Without recorded draft
+        # distributions (the shard warmup) the target-only rule runs instead.
+        block = (
+            self._block_verify
+            and tree is None
+            and sampling_info.draft_probs is not None
+        )
         logits = selected = None
-        if self._selects_from_vocab_shard(logits_output):
+        if not block and self._selects_from_vocab_shard(logits_output):
             # The top-k routes read each row's presorted best candidates only;
             # the shard selection applies the vocabulary mask itself.
             selected = self._vocab_shard_candidates(
@@ -1066,6 +1214,18 @@ class TritonSamplingBackend(SamplingBackend):
                 tree.parents,
                 target_sampled,
             )
+        elif block:
+            self._verify_block(
+                logits,
+                sampling_info.draft_probs,
+                req_pool_indices,
+                offsets_pool,
+                candidates,
+                predict,
+                accept_index,
+                accept_length,
+            )
+            accept_length += 1
         elif sampling_info.draft_q is not None and self._sample_route in (
             _SAMPLE_ROUTE_GUMBEL_NO_FILTER,
             _SAMPLE_ROUTE_GUMBEL_TOP_K,
