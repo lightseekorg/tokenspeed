@@ -30,7 +30,8 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.mark.parametrize("top_p", [1.0, 0.9])
-def test_finite_top_k_cap_and_disabled_survive_graph_replay(top_p):
+@pytest.mark.parametrize("implicit_cap", [False, True])
+def test_finite_top_k_cap_and_disabled_survive_graph_replay(top_p, implicit_cap):
     from tokenspeed.runtime.sampling.backends.ascend_full import (
         AscendFullSamplingBackend,
     )
@@ -38,7 +39,8 @@ def test_finite_top_k_cap_and_disabled_survive_graph_replay(top_p):
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
     requested = [1, 127, 128, 4095, 4096, 4097, 163840, 1 << 40, -1]
-    expected = [1, 127, 128, 4095, 4096, 4096, 4096, 4096, 1 << 30]
+    disabled = 4096 if implicit_cap and top_p < 1 else 1 << 30
+    expected = [1, 127, 128, 4095, 4096, 4096, 4096, 4096, disabled]
     vocab = 163840
     rows = len(requested)
     backend = AscendFullSamplingBackend(
@@ -47,6 +49,7 @@ def test_finite_top_k_cap_and_disabled_survive_graph_replay(top_p):
             enable_speculative_sampling=False,
             sampling_stream="batch",
             logprob_order="torch",
+            npu_sampling_top_p_top_k_cap=implicit_cap,
             max_bs=rows,
             max_req_pool_size=rows,
             vocab_size=vocab,
@@ -107,7 +110,9 @@ def test_finite_top_k_cap_and_disabled_survive_graph_replay(top_p):
 
 
 @pytest.mark.parametrize("verify", [False, True])
-def test_sampling_with_nan_detection_is_graph_safe(verify):
+@pytest.mark.parametrize("implicit_cap", [False, True])
+@pytest.mark.parametrize("top_k", [-1, 4097])
+def test_sampling_with_nan_detection_is_graph_safe(verify, implicit_cap, top_k):
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
     from tokenspeed.runtime.sampling.backends.ascend_full import (
         AscendFullSamplingBackend,
@@ -123,6 +128,7 @@ def test_sampling_with_nan_detection_is_graph_safe(verify):
             enable_speculative_sampling=False,
             sampling_stream="batch",
             logprob_order="torch",
+            npu_sampling_top_p_top_k_cap=implicit_cap,
             max_bs=1,
             max_req_pool_size=1,
             vocab_size=vocab,
@@ -135,7 +141,7 @@ def test_sampling_with_nan_detection_is_graph_safe(verify):
     backend.prepare_step(
         ["graph-safe"],
         [1],
-        [SamplingParams(temperature=1, top_k=4097, seed=73)],
+        [SamplingParams(temperature=1, top_k=top_k, top_p=0.95, seed=73)],
         num_tokens_per_req=1,
     )
     info = SamplingBatchInfo(req_pool_indices=torch.tensor([1], device="npu"))
@@ -154,6 +160,11 @@ def test_sampling_with_nan_detection_is_graph_safe(verify):
     with torch.npu.graph(graph):
         tokens, lengths = run()
     graph.replay()
-    assert vocab - 4096 <= tokens.cpu().item() < vocab
+    candidate_count = vocab if top_k == -1 and not implicit_cap else 4096
+    candidate_probs = torch.softmax(
+        torch.linspace(-2, 2, vocab)[-candidate_count:].flip(0), dim=0
+    )
+    retained_count = int((candidate_probs.cumsum(0) - candidate_probs <= 0.95).sum())
+    assert vocab - retained_count <= tokens.cpu().item() < vocab
     assert lengths.cpu().tolist() == [1]
     assert torch.isfinite(output.next_token_logprobs.cpu()).all()

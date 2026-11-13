@@ -25,6 +25,7 @@ import sys
 from contextlib import contextmanager
 
 import pytest
+import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
@@ -75,6 +76,7 @@ def test_staged_branch_event_generations(monkeypatch, enable, overlap):
     if not enable:
         assert calls == []
         return
+    # Main waits once per branch; a closing join after an explicit one is a no-op.
     expected = []
     for checkpoint_generation, generation in enumerate((1, 3), start=1):
         expected.extend(
@@ -87,19 +89,52 @@ def test_staged_branch_event_generations(monkeypatch, enable, overlap):
         )
         if not overlap:
             expected.append(("wait", 1, generation, "main"))
+        expected.append(("wait", 2, checkpoint_generation, "main"))
+        if overlap:
+            expected.append(("wait", 1, generation, "main"))
         expected.extend(
             [
-                ("wait", 2, checkpoint_generation, "main"),
-                ("wait", 1, generation, "main"),
                 ("record", 0, generation + 1, "main"),
                 ("wait", 0, generation + 1, "aux"),
                 ("record", 1, generation + 1, "aux"),
+                ("wait", 1, generation + 1, "main"),
             ]
         )
-        if not overlap:
-            expected.append(("wait", 1, generation + 1, "main"))
-        expected.extend([("wait", 1, generation + 1, "main")] * 2)
     assert calls == expected
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+@pytest.mark.parametrize("explicit_join", [False, True])
+def test_captured_join_leaves_main_one_dependency(explicit_join):
+    """After a branch is joined, main's next kernel is its only capture dependency.
+
+    A second wait on the joined branch would add the branch's last node as a
+    second dependency, and a kernel with two dependencies cannot launch early
+    through programmatic dependent launch.
+    """
+    driver = pytest.importorskip("cuda.bindings.driver")
+    main, aux = torch.cuda.Stream(), torch.cuda.Stream()
+    x = torch.zeros(16, device="cuda")
+    y = torch.zeros(16, device="cuda")
+    fork = cuda_stream.StreamFork(aux)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=main):
+        with fork.scope(enable=True):
+            fork.join()  # nothing to join yet
+            with fork.branch():
+                x.add_(1)
+            if explicit_join:
+                fork.join()
+                y.add_(1)
+        if not explicit_join:
+            y.add_(1)
+        info = driver.cuStreamGetCaptureInfo(driver.CUstream(main.cuda_stream))
+        assert info[0] == driver.CUresult.CUDA_SUCCESS
+        assert info[-1] == 1
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(x, torch.ones_like(x))
+    assert torch.equal(y, torch.ones_like(y))
 
 
 if __name__ == "__main__":

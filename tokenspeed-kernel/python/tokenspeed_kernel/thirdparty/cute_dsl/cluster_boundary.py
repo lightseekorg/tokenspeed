@@ -40,6 +40,7 @@ from cutlass.cute.typing import Float32, Int32
 from cutlass.cutlass_dsl import T, dsl_user_op
 from tokenspeed_kernel.thirdparty.cute_dsl.argmax import (
     elem_pointer,
+    mbarrier_wait_acquire_cluster,
     store_shared_remote,
 )
 from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail.primitives import (
@@ -173,7 +174,7 @@ def publish_to_cluster(
             cute.arch.mbarrier_arrive_and_expect_tx(mbar_ptr, peers * 4)
         if lane < peers:
             store_shared_remote(value, slot, mbar_ptr, peer_cta_rank_in_cluster=lane)
-    cute.arch.mbarrier_wait(mbar_ptr, phase=0)
+    mbarrier_wait_acquire_cluster(mbar_ptr, 0)
 
 
 class ClusterBoundaryKernel:

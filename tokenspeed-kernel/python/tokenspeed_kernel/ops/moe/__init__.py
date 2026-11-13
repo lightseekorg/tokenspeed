@@ -29,8 +29,13 @@ from typing import Any, Literal
 import torch
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
-from tokenspeed_kernel.registry import KernelRegistry
-from tokenspeed_kernel.selection import KernelPlan, NoKernelFoundError, select_kernel
+from tokenspeed_kernel.registry import KernelRegistry, Priority
+from tokenspeed_kernel.selection import (
+    KernelPlan,
+    NoKernelFoundError,
+    resolve_kernel_override,
+    select_kernel,
+)
 from tokenspeed_kernel.signature import (
     dense_format_signature,
     dense_tensor_format,
@@ -48,6 +53,7 @@ __all__ = [
     "latent_moe_decode_pipeline_available",
     "latent_moe_expert_shared",
     "latent_moe_input_projections",
+    "try_latent_moe_input_projections",
     "moe_apply",
     "moe_plan",
     "moe_process_weights",
@@ -68,6 +74,7 @@ __all__ = [
     "prepare_nvfp4_routing",
     "routed_input_scale_rmsnorm_sum",
     "routed_input_scale_rmsnorm_sum_gathered",
+    "routed_sum_reduces_mailbox",
     "prepare_sm90_fp8_moe",
     "moe_sorted_down",
     "moe_sorted_gate_up",
@@ -354,6 +361,53 @@ def latent_moe_input_projections(
     Returns:
         ``(router_logits, routed_input, shared_input)``.
     """
+    result = try_latent_moe_input_projections(
+        hidden_states,
+        router_weight,
+        routed_weight,
+        shared_gate_up_weight,
+        gate_clamp=gate_clamp,
+        up_clamp=up_clamp,
+        override=override,
+        solution=solution,
+    )
+    if result is not None:
+        return result
+
+    router_logits = torch.nn.functional.linear(
+        hidden_states.float(), router_weight.float()
+    )
+    routed_input = torch.nn.functional.linear(hidden_states, routed_weight)
+    shared_raw = torch.nn.functional.linear(hidden_states, shared_gate_up_weight)
+    gate, up = shared_raw.chunk(2, dim=-1)
+    gate_fp32 = gate.float()
+    up_fp32 = up.float()
+    gate_fp32 = gate_clamp * torch.tanh(gate_fp32 / gate_clamp)
+    gate_fp32 *= torch.sigmoid(gate.float())
+    if up_clamp is not None:
+        up_fp32 = up_clamp * torch.tanh(up_fp32 / up_clamp)
+    shared_input = (gate_fp32 * up_fp32).to(hidden_states.dtype)
+    return router_logits, routed_input, shared_input
+
+
+def try_latent_moe_input_projections(
+    hidden_states: torch.Tensor,
+    router_weight: torch.Tensor,
+    routed_weight: torch.Tensor,
+    shared_gate_up_weight: torch.Tensor,
+    *,
+    gate_clamp: float,
+    up_clamp: float | None,
+    override: str | None = None,
+    solution: str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    """Run a fused input projection, or return None without projecting.
+
+    Arguments and outputs match :func:`latent_moe_input_projections`. A caller
+    that schedules separate projections can retain that scheduling when no
+    fused implementation supports the inputs. Automatic selection declines
+    correctness references; explicit backend requests are preserved.
+    """
     if hidden_states.ndim != 2 or hidden_states.shape[0] < 1:
         raise ValueError("hidden_states must have shape [tokens, hidden_size]")
     tokens, hidden_size = hidden_states.shape
@@ -390,7 +444,10 @@ def latent_moe_input_projections(
         ),
         "weights_packed": _weights_packed(weights),
         "hidden_size_multiple_64": hidden_size % 64 == 0,
+        "gate_clamp": gate_clamp,
+        "up_clamp": up_clamp,
     }
+    override = resolve_kernel_override("moe", "latent_input", override)
     try:
         kernel = select_kernel(
             "moe",
@@ -404,6 +461,12 @@ def latent_moe_input_projections(
         if override is not None or solution is not None:
             raise
         kernel = None
+
+    if kernel is not None and override is None and solution is None:
+        spec = KernelRegistry.get().get_by_name(kernel.name)
+        assert spec is not None
+        if spec.priority == Priority.REFERENCE:
+            return None
 
     if kernel is not None:
         ShapeCapture.get().record(
@@ -429,20 +492,7 @@ def latent_moe_input_projections(
                 up_clamp=up_clamp,
             )
 
-    router_logits = torch.nn.functional.linear(
-        hidden_states.float(), router_weight.float()
-    )
-    routed_input = torch.nn.functional.linear(hidden_states, routed_weight)
-    shared_raw = torch.nn.functional.linear(hidden_states, shared_gate_up_weight)
-    gate, up = shared_raw.chunk(2, dim=-1)
-    gate_fp32 = gate.float()
-    up_fp32 = up.float()
-    gate_fp32 = gate_clamp * torch.tanh(gate_fp32 / gate_clamp)
-    gate_fp32 *= torch.sigmoid(gate.float())
-    if up_clamp is not None:
-        up_fp32 = up_clamp * torch.tanh(up_fp32 / up_clamp)
-    shared_input = (gate_fp32 * up_fp32).to(hidden_states.dtype)
-    return router_logits, routed_input, shared_input
+    return None
 
 
 # ===-----------------------------------------------------------------------===#
@@ -1029,6 +1079,7 @@ from tokenspeed_kernel.ops.moe.routed_norm import (  # noqa: E402
     gather_moe_routes,
     routed_input_scale_rmsnorm_sum,
     routed_input_scale_rmsnorm_sum_gathered,
+    routed_sum_reduces_mailbox,
 )
 from tokenspeed_kernel.ops.moe.sorted_prefill import (  # noqa: E402
     moe_sorted_down,

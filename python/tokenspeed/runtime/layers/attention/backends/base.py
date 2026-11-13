@@ -147,6 +147,14 @@ class CachePoolBinding:
         """The nodes this one composes (graph support, pointer walk, binding); leaves: ()."""
         return ()
 
+    def fixed_workspace_bytes(self) -> int:
+        """Return recipe-reserved workspace bytes, excluding the shared arena.
+
+        Stateless leaves return zero. Owners add their allocations to the
+        children's total, without counting graph metadata or arena views.
+        """
+        return sum(child.fixed_workspace_bytes() for child in self.child_backends())
+
     def validate_cache_pool(self, cache_pool: CachePool) -> None:
         """Raise if this node or any child cannot rebind to ``cache_pool``."""
         for backend in self.child_backends():
@@ -317,6 +325,13 @@ class AttentionBackend(CachePoolBinding, ABC):
         {"full_history", "sliding_window"}
     )
 
+    # Whether this side computes a query-context shard of the extend span. The
+    # runner reads it to decide whether to hand a side the forward's shard plan:
+    # the draft of a sharded target may itself be unsharded, and a backend that
+    # cannot attend a shard refuses one (``reject_query_shard``). A subclass that
+    # skips ``__init__`` sets it from its config or the child it wraps.
+    query_sharded: bool = False
+
     @property
     def stores_in_forward_state_checkpoints(self) -> bool:
         """Whether every State group this node consumes stores in-forward checkpoints.
@@ -342,6 +357,11 @@ class AttentionBackend(CachePoolBinding, ABC):
     # This backend forwards each layer's ``sliding_window_size`` to its kernels.
     # Left False, a declared window silently widens to full-history attention.
     supports_layer_sliding_window: bool = False
+    # This backend keeps each layer's ``sliding_window_sink`` leading tokens
+    # visible outside the window. Left False, a declared sink silently
+    # degrades to plain sliding-window attention: no error, only a quality
+    # loss, so a drafter refuses the pairing up front.
+    supports_layer_window_sink: bool = False
 
     def __init__(self, config: AttnConfig, spec: SoftmaxAttnConfig) -> None:
         self.device = config.device

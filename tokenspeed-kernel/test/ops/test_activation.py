@@ -12,6 +12,7 @@ from tokenspeed_kernel.numerics.torch.activation import (
     torch_situ_and_mul,
     torch_swiglu_oai,
 )
+from tokenspeed_kernel.ops.activation import silu_and_mul as dispatched_silu_and_mul
 from tokenspeed_kernel.ops.activation.triton import (
     _moe_finalize_gate_add_kernel,
     _relu2_kernel,
@@ -270,6 +271,54 @@ def test_silu_and_mul_empty(device: str) -> None:
     x = torch.empty(0, 512, device=device, dtype=torch.bfloat16)
     out = silu_and_mul(x)
     assert out.shape == (0, 256)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_dispatched_silu_and_mul_empty(dtype: torch.dtype, device: str) -> None:
+    """The platform entry point handles no rows whichever leaf it picks.
+
+    Rows legitimately reach zero on a rank with nothing to compute -- an idle
+    attention-DP rank, or a block drafter's idle forward, which still runs its
+    layers so its collectives stay aligned with its peers. A zero-row launch
+    is a zero grid dimension, which CUDA rejects outright, so the leaf must
+    never be reached: the Triton leaf returns early, but the vendor leaf this
+    dispatch prefers on NVIDIA does not.
+    """
+    x = torch.empty(0, 512, device=device, dtype=dtype)
+
+    out = dispatched_silu_and_mul(x)
+
+    assert out.shape == (0, 256)
+    assert out.dtype == dtype
+    assert out.device.type == x.device.type
+
+
+def test_dispatched_silu_and_mul_empty_keeps_the_provided_output(
+    device: str,
+) -> None:
+    """A caller that preallocated the output gets that tensor back, as it does
+    for a non-empty input, instead of a fresh one it then ignores."""
+    x = torch.empty(0, 512, device=device, dtype=torch.bfloat16)
+    out = torch.empty(0, 256, device=device, dtype=torch.bfloat16)
+
+    assert dispatched_silu_and_mul(x, out).data_ptr() == out.data_ptr()
+
+
+def test_dispatched_silu_and_mul_empty_keeps_the_leading_dimensions(
+    device: str,
+) -> None:
+    """Only the last axis halves; an empty batch keeps its own shape rather
+    than collapsing to two dimensions."""
+    x = torch.empty(4, 0, 512, device=device, dtype=torch.bfloat16)
+
+    assert dispatched_silu_and_mul(x).shape == (4, 0, 256)
+
+
+def test_dispatched_silu_and_mul_empty_with_a_clamp(device: str) -> None:
+    """The clamped route (GLM's ``limit``) takes the same empty guard."""
+    x = torch.empty(0, 512, device=device, dtype=torch.bfloat16)
+
+    assert dispatched_silu_and_mul(x, limit=10.0).shape == (0, 256)
 
 
 def test_silu_and_mul_rejects_bad_output_shape(device: str) -> None:

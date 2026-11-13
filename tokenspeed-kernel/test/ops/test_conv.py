@@ -122,6 +122,9 @@ def decode(
         ckpt_b,
         num_extends=0,
         publish_live=publish_live,
+        dynamic_weights=None,
+        output_scale=1.0,
+        token_range=None,
     )
 
 
@@ -208,6 +211,63 @@ def _window(x_full: torch.Tensor, prefix: torch.Tensor, through_in_x: int):
     return torch.cat([prefix, x_full])[through_in_x : through_in_x + W - 1]
 
 
+@pytest.mark.parametrize("first, count", [(50, 60), (0, 17), (120, 42), (161, 1)])
+def test_a_token_range_writes_its_rows_and_every_ring(
+    device: str, first: int, count: int
+) -> None:
+    """A sequence-parallel rank computes its share of a prefill: its rows and
+    every request's ring and published window carry the whole batch's bits,
+    reading only its rows, the W-1 rows before them and each request's last
+    R rows (the rest of x is NaN here)."""
+    D = 256
+    lens = [37, 70, 5, 50]
+    pre_lens = [131, 0, 64, 2]
+    x, weight, conv_cache, cu_seqlens, seq_idx = _make_prefill_inputs(
+        lens, D, device, seed=17
+    )
+    cache_indices = torch.tensor([1, 2, 4, 6], dtype=torch.int32, device=device)
+    has_initial_state = torch.tensor([True, False, True, True], device=device)
+    seq_lens = torch.tensor(
+        [p + n for p, n in zip(pre_lens, lens)], dtype=torch.int32, device=device
+    )
+    table, ckpt = make_ckpt(len(lens), D, device)
+    table[:, 1] = torch.tensor([4, 5, 6, 7], device=device)
+    table[0, 0], table[2, 0] = 2, 3
+
+    def run(rows: torch.Tensor, token_range):
+        ring, field = conv_cache.clone(), ckpt.clone()
+        y = inkling_ring_sconv(
+            rows,
+            weight,
+            ring,
+            cu_seqlens,
+            seq_idx,
+            cache_indices,
+            has_initial_state,
+            seq_lens,
+            table,
+            field,
+            None,
+            num_extends=len(lens),
+            publish_live=True,
+            dynamic_weights=None,
+            output_scale=1.0,
+            token_range=token_range,
+        )
+        return y, ring, field
+
+    whole = run(x, None)
+    needed = torch.zeros(x.shape[0], dtype=torch.bool, device=device)
+    needed[max(first - (W - 1), 0) : first + count] = True
+    for end in cu_seqlens[1:].tolist():
+        needed[max(end - conv_cache.shape[1], 0) : end] = True
+    poisoned = torch.where(needed[:, None], x, torch.full_like(x, float("nan")))
+    y, ring, field = run(poisoned, (first, count))
+    assert torch.equal(y[first : first + count], whole[0][first : first + count])
+    assert torch.equal(ring, whole[1])
+    assert torch.equal(field, whole[2])
+
+
 @pytest.mark.parametrize("D", [2048, 6144])
 @pytest.mark.parametrize("use_residual", [True, False])
 def test_sconv_prefill_varlen(D: int, use_residual: bool, device: str) -> None:
@@ -251,6 +311,9 @@ def test_sconv_prefill_varlen(D: int, use_residual: bool, device: str) -> None:
         num_extends=3,
         publish_live=True,
         use_residual=use_residual,
+        dynamic_weights=None,
+        output_scale=1.0,
+        token_range=None,
     )
 
     zeros = torch.zeros(W - 1, D, device=device, dtype=DTYPE)
@@ -319,6 +382,9 @@ def test_prefill_ring_write_gate(device: str) -> None:
         None,
         num_extends=4,
         publish_live=False,
+        dynamic_weights=None,
+        output_scale=1.0,
+        token_range=None,
     )
 
     expected = old.clone()
@@ -370,6 +436,9 @@ def test_prefill_small_ring_gate(device: str) -> None:
         None,
         num_extends=1,
         publish_live=False,
+        dynamic_weights=None,
+        output_scale=1.0,
+        token_range=None,
     )
 
     expected = old.clone()
@@ -414,6 +483,9 @@ def test_sconv_prefill_then_lookback_window(device: str) -> None:
         None,
         num_extends=1,
         publish_live=True,
+        dynamic_weights=None,
+        output_scale=1.0,
+        token_range=None,
     )
 
     # Lookback window: lb committed rows rewritten + k fresh rows, positions
@@ -436,6 +508,9 @@ def test_sconv_prefill_then_lookback_window(device: str) -> None:
         None,
         num_extends=0,
         publish_live=False,
+        dynamic_weights=None,
+        output_scale=1.0,
+        token_range=None,
     )
 
     ref = ref_sconv(x_win, weight, x_full[start - (W - 1) : start])
@@ -476,6 +551,9 @@ def test_prefill_checkpoint_taps_and_fp8(device: str) -> None:
         None,
         num_extends=4,
         publish_live=False,
+        dynamic_weights=None,
+        output_scale=1.0,
+        token_range=None,
     )
 
     zeros = torch.zeros(W - 1, D, device=device, dtype=DTYPE)
@@ -520,6 +598,9 @@ def test_prefill_publishes_a_short_chunk_from_the_checkpoint(device: str) -> Non
         None,
         num_extends=2,
         publish_live=True,
+        dynamic_weights=None,
+        output_scale=1.0,
+        token_range=None,
     )
 
     cu = cu_seqlens.tolist()
@@ -624,6 +705,9 @@ def test_sconv_verify_overwrite_after_rejection(device: str) -> None:
             None,
             num_extends=0,
             publish_live=False,
+            dynamic_weights=None,
+            output_scale=1.0,
+            token_range=None,
         )
         for b in range(B):
             ref = ref_sconv(
@@ -682,6 +766,9 @@ def test_sconv_chained_prefill_decode(device: str) -> None:
         None,
         num_extends=2,
         publish_live=True,
+        dynamic_weights=None,
+        output_scale=1.0,
+        token_range=None,
     )
     full_windows = ckpt[2:4].clone()
 
@@ -711,6 +798,9 @@ def test_sconv_chained_prefill_decode(device: str) -> None:
         None,
         num_extends=2,
         publish_live=True,
+        dynamic_weights=None,
+        output_scale=1.0,
+        token_range=None,
     )
     for i in range(len(lens)):
         torch.testing.assert_close(
@@ -808,6 +898,9 @@ def test_sconv_channel_sliced_cache_view(device: str) -> None:
         None,
         num_extends=2,
         publish_live=False,
+        dynamic_weights=None,
+        output_scale=1.0,
+        token_range=None,
     )
     cu = cu_seqlens.tolist()
     for i in range(B):
@@ -862,6 +955,9 @@ def test_decode_publish_window_and_split(device: str) -> None:
         ckpt_b,
         num_extends=0,
         publish_live=True,
+        dynamic_weights=None,
+        output_scale=1.0,
+        token_range=None,
     )
 
     # req0: chunk positions 126..129; window ending at 130 = chunk rows 1..3.
@@ -917,7 +1013,8 @@ def test_ring_commit_publishes_every_streams_accepted_window(device: str) -> Non
     """One commit writes the accepted window of every layer's streams: fields
     split a stream's channels, a second field dtype takes its own table, ring
     rows wrap, positions before 0 are zeros, and padded rows and hole live
-    blocks write nothing."""
+    blocks write nothing. The live blocks are read in place from the live
+    column of ``[groups, requests, slots]`` tables."""
     from tokenspeed_kernel.ops.conv.triton import _inkling_ring_commit_kernel
 
     torch.manual_seed(9)
@@ -949,11 +1046,19 @@ def test_ring_commit_publishes_every_streams_accepted_window(device: str) -> Non
     live_pages = torch.tensor(
         [[7, 3, 0, 2, 9], [6, 8, 5, 0, 4]], device=device, dtype=torch.int32
     )
+    # Slot 0 holds other blocks the commit must not read.
+    slot_tables = torch.stack([live_pages + 1, live_pages], dim=-1)
 
     tables = inkling_commit_tables(ring, streams(k_planes, v_planes, hidden))
     assert [table.dtype for table in tables] == [DTYPE, torch.float8_e5m2]
     inkling_ring_commit(
-        ring, tables, live_pages, cache_indices, seq_lens, accepted, verify_width=k
+        ring,
+        tables,
+        slot_tables[:, :, 1],
+        cache_indices,
+        seq_lens,
+        accepted,
+        verify_width=k,
     )
     ref_ring_commit(
         ring, streams(*expected), live_pages, cache_indices, seq_lens, accepted, k
@@ -976,12 +1081,13 @@ def test_ring_commit_publishes_every_streams_accepted_window(device: str) -> Non
             verify_width=k,
         )
 
+    # Served layouts: the live column of [groups, bs, slots] tables at any bs.
     with assert_no_triton_compile(_inkling_ring_commit_kernel):
         for bs in (1, 2, 16):
             inkling_ring_commit(
                 ring,
                 tables,
-                torch.zeros(2, bs, device=device, dtype=torch.int32),
+                torch.zeros(2, bs, 2, device=device, dtype=torch.int32)[:, :, 1],
                 torch.zeros(bs, device=device, dtype=torch.int32),
                 torch.full((bs,), 40, device=device, dtype=torch.int32),
                 torch.ones(bs, device=device, dtype=torch.int32),
@@ -1066,6 +1172,9 @@ def test_prefill_matches_decode_on_short_warm_chunks(device: str) -> None:
         None,
         num_extends=2,
         publish_live=False,
+        dynamic_weights=None,
+        output_scale=1.0,
+        token_range=None,
     )
 
     ring_b = torch.randn(4, R, D, device=device, dtype=DTYPE)
@@ -1088,8 +1197,84 @@ def test_prefill_matches_decode_on_short_warm_chunks(device: str) -> None:
         None,
         num_extends=0,
         publish_live=False,
+        dynamic_weights=None,
+        output_scale=1.0,
+        token_range=None,
     )
     torch.testing.assert_close(y_prefill, y_decode, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+@pytest.mark.parametrize("num_extends", [0, 3])
+def test_slot_rows_fold_in_slot_order(
+    num_extends: int, dynamic: bool, device: str
+) -> None:
+    """``[T, S, D]`` slot rows give the bits of their FP32 slot-order fold
+    followed by the conv: outputs, ring rows and published windows, signed
+    zeros and slot order included."""
+    torch.manual_seed(13)
+    D, S, head_dim = 256, 8, 64
+    # Decode chunks are uniform; three-token chunks straddle the 8-row tiles.
+    lens = [3, 3, 3] if num_extends == 0 else [5, 3, 2]
+    pre_lens = [131, 389, 7] if num_extends == 0 else [131, 0, 64]
+    B, T = len(lens), sum(lens)
+    scale = torch.exp2(torch.randint(-20, 21, (T, S, 1), device=device).float())
+    rows = (torch.randn(T, S, D, device=device) * scale).to(DTYPE)
+    # All slots -0.0: a fold from +0.0 stores +0.0.
+    rows[:, :, :16] = -0.0
+    # Absorbing sums: slot order gives 0, a pairwise tree 1, the reverse order 2.
+    rows[:, :, 16:32] = torch.tensor(
+        [2.0**24, 1.0, 1.0, -(2.0**24), 0.0, 0.0, 0.0, 0.0], dtype=DTYPE
+    )[:, None]
+    weight = torch.randn(D, W, device=device, dtype=DTYPE) * 0.5
+    cu_seqlens = _make_cu_seqlens(lens, device)
+    seq_idx = seq_idx_from_cu_seqlens(cu_seqlens, T)
+    cache_indices = torch.arange(1, B + 1, dtype=torch.int32, device=device)
+    has_initial_state = torch.tensor([p > 0 for p in pre_lens], device=device)
+    seq_lens = torch.tensor(
+        [p + n for p, n in zip(pre_lens, lens)], dtype=torch.int32, device=device
+    )
+    table, ckpt = make_ckpt(B, D, device, num_pages=2 * B + 1)
+    for b in range(B):
+        table[b, 0] = 1 + b if pre_lens[b] else 0
+        table[b, 1] = 1 + B + b
+    ring = torch.randn(B + 1, R, D, device=device, dtype=DTYPE)
+    dynamic_weights = (
+        torch.randn(T, D // head_dim, W, device=device, dtype=DTYPE)
+        if dynamic
+        else None
+    )
+
+    def run(x: torch.Tensor) -> list[torch.Tensor]:
+        ring_x, ckpt_x = ring.clone(), ckpt.clone()
+        y = inkling_ring_sconv(
+            x,
+            weight,
+            ring_x,
+            cu_seqlens,
+            seq_idx,
+            cache_indices,
+            has_initial_state,
+            seq_lens,
+            table,
+            ckpt_x,
+            None,
+            num_extends=num_extends,
+            publish_live=True,
+            dynamic_weights=dynamic_weights,
+            output_scale=0.75,
+            token_range=None,
+        )
+        return [t.view(torch.int16) for t in (y, ring_x, ckpt_x)]
+
+    folded = torch.zeros(T, D, device=device)
+    for slot in rows.unbind(1):
+        folded += slot.float()
+    for got, want in zip(run(rows), run(folded.to(DTYPE)), strict=True):
+        assert torch.equal(got, want)
+    # One slot row per token is the plain input.
+    for got, want in zip(run(rows[:, :1]), run(rows[:, 0]), strict=True):
+        assert torch.equal(got, want)
 
 
 @pytest.mark.parametrize("block_size,taps", [(8, 2), (6, 3), (8, 1)])

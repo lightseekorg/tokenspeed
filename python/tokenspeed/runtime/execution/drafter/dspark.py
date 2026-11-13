@@ -26,6 +26,14 @@ from __future__ import annotations
 
 import torch
 
+# Bypasses the registry: the fused step uses the CuTe DSL distributed-argmax slots.
+from tokenspeed_kernel.ops.sampling.cute_dsl import (
+    MarkovArgmaxWorkspace,
+    create_markov_argmax_workspace,
+    markov_argmax_step,
+    supports_markov_argmax_shape,
+)
+
 from tokenspeed.runtime.distributed.comm_ops import all_gather_single
 from tokenspeed.runtime.execution.drafter._dspark_walk import (
     dspark_walk_finish,
@@ -58,6 +66,9 @@ class DSpark(DFlash):
             )
         self._walk_words: torch.Tensor | None = None
         self._walk_gathered: torch.Tensor | None = None
+        # Resolved by the first greedy walk outside graph capture.
+        self._markov_argmax_resolved = False
+        self._markov_argmax_workspace: MarkovArgmaxWorkspace | None = None
 
     def require_full_draft_logits(self) -> None:
         """DSpark samples the target's shared head, not a draft-owned processor."""
@@ -81,7 +92,25 @@ class DSpark(DFlash):
         if block_logits is not None and self._fused_walk_fits(block_logits):
             self._fused_greedy_walk(block_logits, next_tokens)
             return next_tokens
+        workspace = (
+            None if block_logits is None else self._resolve_markov_argmax(block_logits)
+        )
         for k in range(1, self.spec_num_tokens):
+            if workspace is not None:
+                # One launch: bias, add, and cross-rank argmax after token k - 1.
+                start = int(self.lm_head.shard_indices.org_vocab_start_index)
+                markov_argmax_step(
+                    workspace,
+                    block_logits[k - 1],
+                    next_tokens[:, k - 1],
+                    self.markov_head.markov_w1.weight,
+                    self.markov_head.markov_w2.weight[
+                        start : start + workspace.vocab_per_rank
+                    ],
+                    start,
+                    next_tokens[:, k],
+                )
+                continue
             # The Markov head embeds the previous token, so it must be in range
             # before this step, not after the loop: the anchor comes from the
             # target's last output (garbage during warmup) and each proposal
@@ -120,6 +149,46 @@ class DSpark(DFlash):
                 )
         next_tokens.clamp_(min=0)
         return next_tokens
+
+    def _resolve_markov_argmax(
+        self, block_logits: torch.Tensor
+    ) -> MarkovArgmaxWorkspace | None:
+        """The fused greedy step's workspace, resolved once outside capture.
+
+        The fused kernel exchanges candidates through the distributed argmax's
+        slots, so it runs exactly where that state exists; the other gates
+        follow from the config, keeping every rank on the same path. None
+        keeps the per-step bias GEMM and argmax.
+        """
+        if self._markov_argmax_resolved:
+            return self._markov_argmax_workspace
+        if torch.cuda.is_current_stream_capturing():
+            return None  # allocation and compilation belong to warmup
+        head = self.lm_head
+        state = self._ensure_dist_argmax_state(head.weight.dtype, head.weight.device)
+        embedding = self.markov_head.markov_w1.weight
+        projection = self.markov_head.markov_w2.weight
+        vocab_per_rank = int(block_logits.shape[-1])
+        rank_dim = int(projection.shape[1])
+        dtype = block_logits.dtype
+        if (
+            state is not None
+            and embedding.dtype == dtype
+            and projection.dtype == dtype
+            # Every shard has its Markov rows, so no column needs a zero bias.
+            and int(projection.shape[0]) >= int(head.org_vocab_size)
+            and supports_markov_argmax_shape(vocab_per_rank, rank_dim, dtype)
+        ):
+            self._markov_argmax_workspace = create_markov_argmax_workspace(
+                state,
+                device=block_logits.device,
+                max_rows=int(self.input_buffers.max_bs),
+                vocab_per_rank=vocab_per_rank,
+                rank_dim=rank_dim,
+                dtype=dtype,
+            )
+        self._markov_argmax_resolved = True
+        return self._markov_argmax_workspace
 
     def _block_base_logits(self, draft_hidden: torch.Tensor):
         """Project every block position's hidden state in one GEMM.

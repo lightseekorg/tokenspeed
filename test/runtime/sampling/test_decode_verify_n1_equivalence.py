@@ -142,6 +142,12 @@ def test_verify_n1_matches_sample(backend_name, greedy):
     torch.testing.assert_close(predict.view(bs).cpu(), sampled.view(bs).cpu())
     torch.testing.assert_close(accept.cpu(), torch.ones(bs, dtype=torch.int32))
     torch.testing.assert_close(ones.cpu(), torch.ones(bs, dtype=torch.int32))
+    # Verify lands both outputs in the packed buffer: one D2H returns them.
+    packed = backend2.get_packed_output_d2h(predict, accept)
+    assert packed is not None
+    torch.cuda.synchronize()
+    assert torch.equal(packed[0], predict.cpu())
+    assert torch.equal(packed[1], accept.cpu())
 
 
 @requires_cuda

@@ -42,6 +42,7 @@ struct SchedulerAbortView;
 struct SchedulerSizes;
 struct AdmissionSnapshot;
 struct PrefillGateProbe;
+struct SharedPrefixPublication;
 struct CacheGroupPages;
 struct KvEventView;
 struct StorageTickView;
@@ -59,7 +60,12 @@ void advance_head(tokenspeed::Scheduler& scheduler, rust::Slice<const StorageTic
                   rust::Slice<const StorageDoneView> done, rust::Slice<const CacheEvent> cache_events);
 std::size_t demote_sessions(tokenspeed::Scheduler& scheduler, rust::Slice<const rust::String> ids, bool ended);
 std::size_t demote_session(tokenspeed::Scheduler& scheduler, rust::Str session_id, bool ended);
+std::size_t demote_cache_groups(tokenspeed::Scheduler& scheduler, rust::Slice<const rust::String> ids, bool ended);
 AdmissionSnapshot admission_snapshot(const tokenspeed::Scheduler& scheduler, std::int32_t token_step);
+bool shared_prefix_storage_enabled(const tokenspeed::Scheduler& scheduler);
+SharedPrefixPublication shared_prefix_publication(const tokenspeed::Scheduler& scheduler,
+                                                  rust::Slice<const std::int32_t> input_ids,
+                                                  std::int32_t max_prefix_tokens);
 SchedulerSizes sizes(const tokenspeed::Scheduler& scheduler);
 std::int32_t active_lcm_blocks(const tokenspeed::Scheduler& scheduler);
 PrefillGateProbe probe_prefill_gate(const tokenspeed::Scheduler& scheduler);
@@ -85,5 +91,7 @@ rust::Vec<TransferBatchView> plan_remote_prefill_transfer(const tokenspeed::Exec
 rust::Vec<SchedulerAbortView> plan_aborts(const tokenspeed::ExecutionPlan& plan);
 rust::Vec<CacheOpView> plan_cache_ops(const tokenspeed::ExecutionPlan& plan);
 rust::Vec<StorageOpView> plan_storage_ops(const tokenspeed::ExecutionPlan& plan);
+
+void set_profile_span_sink(bool installed);
 
 }  // namespace ts_scheduler

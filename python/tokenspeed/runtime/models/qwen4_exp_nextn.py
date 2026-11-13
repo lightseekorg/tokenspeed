@@ -196,7 +196,9 @@ class Qwen4ExpDraftModel(Qwen4ExpModel):
     def __init__(self, config, mapping, quant_config=None, prefix: str = ""):
         if config.num_hidden_layers != 1:
             raise ValueError("Qwen4-Exp MTP requires exactly one decoder layer")
-        super().__init__(config, mapping, quant_config, prefix)
+        super().__init__(
+            config, mapping, quant_config, prefix, enable_fp8_attn_proj=False
+        )
 
 
 class Qwen4ExpForCausalLMNextN(nn.Module):

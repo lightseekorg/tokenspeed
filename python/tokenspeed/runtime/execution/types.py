@@ -311,7 +311,11 @@ class ModelExecutionResult:
     """
     Result of model execution returned to scheduler.
 
-    This is the output from the Python executor back to the C++ scheduler.
+    The Rust host reads these tensors after their CPU copies have landed.
+    Producers emit fp32 logprob values and cumulative probabilities, and int64
+    top-k IDs, independently of the model's weight or activation dtype. The host
+    buffer reader also accepts fp64 values and int32 IDs; fp16/bfloat16 values
+    are not part of this result contract.
 
     Attributes:
         output_tokens: Sampled token IDs
@@ -322,11 +326,11 @@ class ModelExecutionResult:
     copy_event: torch.cuda.Event | None = None
     output_lengths: torch.Tensor | None = None
     grammar_completion: GrammarStepCompletion | None = None
-    # Per-position logprob of the sampled token, same layout as output_tokens.
+    # Per-position fp32 logprob of the sampled token, same layout as output_tokens.
     # Populated unconditionally by the sampling backend so it's always
     # available if any request asks for it.
     output_logprobs: torch.Tensor | None = None
-    # Probability mass preceding each sampled token in probability-descending,
+    # fp32 probability mass preceding each sampled token in probability-descending,
     # token-ID-ascending order; aligned with output_tokens and output_logprobs.
     output_token_cumulative_probs: torch.Tensor | None = None
     # P role, final chunk only: the sampled rows the commit path folds into

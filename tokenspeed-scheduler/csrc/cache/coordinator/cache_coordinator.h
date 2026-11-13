@@ -34,6 +34,7 @@
 #include <utility>
 #include <vector>
 
+#include "cache/core/active_parents.h"
 #include "cache/core/block_pool.h"
 #include "cache/core/cache_block_ref.h"
 #include "cache/coordinator/group_geometry.h"
@@ -109,8 +110,9 @@ public:
     CacheCoordinator& operator=(CacheCoordinator&&) = delete;
     std::size_t DemoteSession(const std::string& session_id, bool ended);
     std::size_t DemoteSessions(const std::vector<std::string>& ids, bool ended);
+    std::size_t DemoteCacheGroups(const std::vector<std::string>& ids, bool ended);
 
-    // A request's session, registered under its access epoch for every
+    // A request's cache owner (group or session), registered under its epoch for every
     // admission, publication and restore that epoch dates
     // (SessionForAccess). The first admission of a request with a session id
     // registers it and returns this handle; dropping the handle unregisters
@@ -222,6 +224,8 @@ public:
         // Optional precomputation for exactly prefix_hashes and this
         // coordinator. Omission expands those identities for this probe.
         PreparedPrefixKeys prepared_keys;
+        // Bounded request-local remote hints; no global tail-table mutation.
+        std::span<const std::int32_t> shared_prefix_tokens;
     };
 
     struct PrefixProbe {
@@ -305,9 +309,10 @@ public:
         // Restore only: snapshot pool -> Device copies of the private slots.
         std::vector<BlockTransfer> snapshot_pairs;
         // Fresh device child pages appended by ordinary Acquire, aligned by
-        // group_id, for the plan to zero. Cache hits and copy destinations
-        // (Host hits, a restore's rebuilt slots, the pairs below) are
-        // excluded: the copy fills them whole.
+        // group_id, for the plan to zero. Cache hits, copy destinations
+        // (Host hits, a restore's rebuilt slots, the pairs below) and the
+        // blocks a remote landing fills whole (GroupDemand::landed_tokens,
+        // StateStep::kLand's slot 1) are excluded: the copy fills them whole.
         std::vector<std::vector<std::int32_t>> new_page_ids;
         // Device -> Device whole-block copies, aligned by group_id, as
         // (source, destination) virtual block ids: a hitter's private copy of
@@ -407,7 +412,8 @@ public:
                                          std::span<std::vector<CacheBlockRef>> copy_in_blocks,
                                          std::optional<CopyInPoint> copy_in_point,
                                          std::optional<std::uint64_t> request_access_epoch,
-                                         bool evict_blocks_past_segments, const std::string& session_id);
+                                         bool evict_blocks_past_segments, const std::string& session_id,
+                                         const std::string& cache_group_id);
 
     // Lone-request compaction, the last means for a request no other one
     // holds pages beside, whose Admit with evict_blocks_past_segments just
@@ -559,8 +565,12 @@ public:
     std::int32_t NumEmptyLcmBlocks() const { return pool_.NumEmptyLcmBlocks(); }
     std::int32_t TotalLcmBlocks() const { return pool_.NumLcmBlocks(); }
     std::int32_t NumFreeHostLcmBlocks() const { return host_pool_ == nullptr ? 0 : host_pool_->NumEmptyLcmBlocks(); }
-    // Distinct LCM blocks referenced by the given per-request table sets.
-    std::int32_t NumActiveLcmBlocks(std::span<const std::span<const BlockTable>> request_tables) const;
+    // Distinct LCM blocks the request tables hold, counted by the tables'
+    // own ParentRefs as they change, so reading it walks nothing.
+    std::int32_t NumActiveLcmBlocks() const noexcept { return active_parents_.Count(); }
+    // The same count taken by walking the given per-request table sets:
+    // the reference debug builds check NumActiveLcmBlocks against.
+    std::int32_t CountActiveLcmBlocks(std::span<const std::span<const BlockTable>> request_tables) const;
     // Free pages (group page units) this group could still place, counting its
     // partially filled parents and every empty parent.
     std::int32_t GroupAvailablePages(std::int32_t group_index) const;
@@ -579,6 +589,9 @@ public:
     // or the first a sliding window behind one of its boundaries reaches
     // back into.
     std::int32_t FirstPublishedPage(const CompletedPages& completed) const;
+    // The leading pages [0, result) a publication registers sink blocks under
+    // again, below FirstPublishedPage; 0 when it publishes no sink block.
+    std::int32_t PublishedSinkPages(const CompletedPages& completed) const;
     void ReclaimExpired(std::span<BlockTable> tables, std::int32_t num_computed_tokens);
     void ConsumeReservedTokens(std::span<BlockTable> tables, std::int32_t num_tokens);
     void Free(std::span<BlockTable> tables);
@@ -920,6 +933,10 @@ public:
         std::int32_t max_tokens{0};
     };
     StorageQuery MissingStorageKeys(const PromptPrefix& prompt, std::size_t max_keys) const;
+    // All immutable objects needed at exactly this boundary, including objects
+    // already in Device/Host. max_tokens is 0 for an illegal boundary and -1
+    // when the bounded key budget cannot describe the complete dependency.
+    StorageQuery SharedPrefixKeys(const PromptPrefix& prompt, std::size_t max_keys) const;
     StorageReservation ReserveStoragePrefix(const PromptPrefix& prompt, std::span<const CacheKey> hits,
                                             std::size_t max_blocks);
 
@@ -1012,9 +1029,18 @@ public:
     // group block below T for a tail hash (tail_tokens = T mod P, which the
     // caller knows from its own publication record), one per state group. The
     // boundary key's group and offset are ignored; only its namespace and
-    // content hash identify the boundary.
+    // content hash identify the boundary. This includes every participating
+    // group, including State; replayable groups publish no entries.
     enum class BoundaryResidency { kNone, kPartial, kComplete };
     BoundaryResidency DeviceBoundaryResidency(const CacheKey& boundary, std::int32_t tail_tokens) const;
+    struct BoundaryEventStatus {
+        bool publishable;
+        bool has_device_entries;
+    };
+    // Routing requires every continuous-history group on Device; auxiliary
+    // windows and State do not gate publication. Without continuous history,
+    // no boundary is publishable. Any Device entry retains the descriptor.
+    BoundaryEventStatus GetBoundaryEventStatus(const CacheKey& boundary, std::int32_t tail_tokens) const;
     // Whether every State group caches its checkpoint published under the
     // chain hash content_hash, on the Device or the Host, as the probe takes
     // each from whichever tier holds it (false for a model without State
@@ -1094,6 +1120,10 @@ public:
         std::int32_t past_end{0};
     };
     BlockRange SlidingWindowBlocks(std::int32_t i, std::int32_t boundary_tokens) const;
+    // The sink blocks of sliding group i a boundary needs beside `window`:
+    // [0, min(sink blocks, window.first)), the ones the window does not hold
+    // already. Empty for a group without a sink.
+    BlockRange SinkBlocksBelow(std::int32_t i, const BlockRange& window) const;
     // The first of a tail's blocks (page offset) group i needs: 0 for a
     // History group that keeps every row and for a State group's one tail
     // block; for a sliding group the block holding the window's first row
@@ -1265,6 +1295,10 @@ private:
         std::int32_t first_cache_block{0};
         std::vector<CacheKey> keys;
         CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
+        // A sliding group's sink blocks below a boundary's window: published
+        // with an earlier boundary already, and registered with this one again
+        // so they stay as recent as every boundary that needs them.
+        bool sink{false};
     };
     // What publishing `completed` covers in one group -- every newly hashed
     // page plus the tail's blocks of a prefix-closed group, the blocks holding
@@ -1371,6 +1405,10 @@ private:
     // Replayable groups are absent: they neither constrain nor claim a hit.
     std::vector<std::size_t> match_order_;
     BlockPool& pool_;
+    // The Device parents request tables hold. Admit and Restore bind every
+    // table they fill to it; the coordinator never moves, so the pointer holds
+    // as long as every bound table is destroyed before the coordinator.
+    ActiveParents active_parents_;
     BlockPool* host_pool_{nullptr};
     // Request-private retraction images: never prefix-indexed, never evicted.
     BlockPool* snapshot_pool_{nullptr};
@@ -1391,13 +1429,18 @@ private:
     // How many groups are State groups. With any, a boundary serves a resume
     // only with a checkpoint boundary at or under it.
     std::int32_t num_state_groups_{0};
+    std::vector<std::size_t> routing_history_groups_;
     // Some group is prefix-closed, and needs every page below a boundary: a
     // State or sliding group resumes past a page that holds nothing.
     bool has_prefix_closed_groups_{false};
-    SessionCacheOwner sessionTag(const std::string& id);
+    using CacheOwnerTags = std::unordered_map<std::string, std::weak_ptr<SessionCacheTag>>;
+    SessionCacheOwner cacheOwnerTag(const std::string& id, CacheOwnerTags& registry);
+    std::size_t demoteCacheOwners(const std::vector<std::string>& ids, bool ended, CacheOwnerTags& registry);
     // One entry per live SessionAccess handle, which adds and erases it.
     std::unordered_map<std::uint64_t, SessionCacheOwner> session_access_;
-    std::unordered_map<std::string, std::weak_ptr<SessionCacheTag>> session_tags_;
+    CacheOwnerTags session_tags_;
+    // A separate namespace prevents a group id from colliding with a session id.
+    CacheOwnerTags cache_group_tags_;
     std::size_t session_tags_since_sweep_{0};
     std::uint64_t next_access_epoch_{0};
     // Issued access epochs start at 1. A superseded input is re-registered

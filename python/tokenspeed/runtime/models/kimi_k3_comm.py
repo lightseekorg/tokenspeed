@@ -532,6 +532,8 @@ class K3MoeTailComm:
 
     def prepare(self, max_num_tokens: int) -> bool:
         """Prepare both tail stages once, before KV sizing and graph capture."""
+        if self.mapping.moe.tp_ep_size == 1:
+            return False
         if self._stage2_capacity is not None:
             if max_num_tokens > self._stage2_capacity:
                 raise RuntimeError("Cannot grow a prepared K3 MoE workspace")
@@ -567,6 +569,8 @@ class K3MoeTailComm:
         Returns:
             Padded [64,H/TP] reduced shard, with the first M rows live.
         """
+        if self.mapping.moe.tp_ep_size == 1:
+            return shared_partial
         tail = self._latent_tail
         if tail is None:
             raise RuntimeError("K3 shared RS must be prepared before forward")
@@ -631,6 +635,8 @@ class K3MoeTailComm:
             BF16 [M,H] combined output on every rank. Projection uses SIMT
             for M1..5 and TensorCore for M6..32.
         """
+        if self.mapping.moe.tp_ep_size == 1:
+            return self.up_proj_inject_ar(routed_latent, shared_shard, prefix_sum)
         capacity = self._stage2_capacity
         if capacity is None:
             raise RuntimeError("K3 MoE tail must be prepared before forward")
@@ -658,6 +664,8 @@ class K3MoeTailComm:
             AR; M>1024 uses Multimem AR.
         """
         num_tokens = routed_latent.shape[0]
+        if self.mapping.moe.tp_ep_size == 1:
+            return self.up_proj.forward_add3(routed_latent, prefix_sum, shared_partial)
         capacity = self._stage2_capacity
         if capacity is None:
             raise RuntimeError("K3 MoE tail must be prepared before forward")

@@ -1035,7 +1035,8 @@ TEST(BlockTablePageIdsExport, ChildSlotsWithinOneParentHaveDistinctKernelPageIds
 
 TEST(BlockTablePageIdsExport, AStateTableExportsTheBlocksOfEachStep) {
     BlockPool pool(/*num_lcm_blocks=*/4, {1});
-    GroupAllocator allocator(/*cache_blocks_per_lcm_block=*/1, /*group_id=*/0, /*shard_count=*/1);
+    GroupAllocator allocator(/*cache_blocks_per_lcm_block=*/1, /*group_id=*/0, /*shard_count=*/1,
+                             /*kept_head_blocks=*/0);
     BlockTable table;
     allocator.ShapeStateTable(table, CacheBlockRef{});
     EXPECT_EQ(allocator.BlockTablePageIds(table), (std::vector<std::int32_t>{0, 0}));
@@ -1056,7 +1057,8 @@ TEST(BlockTablePageIdsExport, AStateTableExportsTheBlocksOfEachStep) {
 
 TEST(BlockTablePageIdsExport, ASwappedSlotExportsTheFreshBlock) {
     BlockPool pool(/*num_lcm_blocks=*/4, {1});
-    GroupAllocator allocator(/*cache_blocks_per_lcm_block=*/1, /*group_id=*/0, /*shard_count=*/1);
+    GroupAllocator allocator(/*cache_blocks_per_lcm_block=*/1, /*group_id=*/0, /*shard_count=*/1,
+                             /*kept_head_blocks=*/0);
     BlockTable table = BlockTable::FromBlocks(/*group_id=*/0, pool.AcquireBlocks(0, 2), /*available_tokens=*/0);
     const std::vector<std::int32_t> before = allocator.BlockTablePageIds(table);
 
@@ -1075,7 +1077,8 @@ TEST(BlockTablePageIdsExport, ASwappedSlotExportsTheFreshBlock) {
 // admission fills it with the block the peer writes the tail into.
 TEST(BlockTablePageIdsExport, AFilledLeadingHoleExportsItsBlock) {
     BlockPool pool(/*num_lcm_blocks=*/4, {1});
-    GroupAllocator allocator(/*cache_blocks_per_lcm_block=*/1, /*group_id=*/0, /*shard_count=*/1);
+    GroupAllocator allocator(/*cache_blocks_per_lcm_block=*/1, /*group_id=*/0, /*shard_count=*/1,
+                             /*kept_head_blocks=*/0);
     BlockTable table;
     PrefixMatch hit;
     hit.blocks.emplace_back();
@@ -1094,7 +1097,8 @@ TEST(BlockTablePageIdsExport, AFilledLeadingHoleExportsItsBlock) {
 TEST(BlockTablePageIdsExport, AHostExtensionExportsItsDeviceDestinations) {
     BlockPool device(/*num_lcm_blocks=*/4, {1});
     BlockPool host(/*num_lcm_blocks=*/4, {1});
-    GroupAllocator allocator(/*cache_blocks_per_lcm_block=*/1, /*group_id=*/0, /*shard_count=*/1);
+    GroupAllocator allocator(/*cache_blocks_per_lcm_block=*/1, /*group_id=*/0, /*shard_count=*/1,
+                             /*kept_head_blocks=*/0);
     BlockTable table = BlockTable::FromBlocks(/*group_id=*/0, device.AcquireBlocks(0, 1), /*available_tokens=*/0);
     std::vector<CacheBlockRef> host_blocks;
     host_blocks.push_back(host.AcquireBlock(0));

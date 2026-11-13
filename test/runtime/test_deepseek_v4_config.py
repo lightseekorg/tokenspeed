@@ -789,6 +789,8 @@ class TestDeepseekV4Config:
 
         class FakeBackend:
             draft_block_decode = False
+            # The runner asks a draft side whether it takes a query shard.
+            query_sharded = False
             cache_consumer_attn_kinds = frozenset({"full_history", "sliding_window"})
 
             def refresh_decode_metadata(self, *args, **kwargs):
@@ -824,6 +826,8 @@ class TestDeepseekV4Config:
 
         class FakeBackend:
             draft_block_decode = False
+            # The runner asks a draft side whether it takes a query shard.
+            query_sharded = False
 
             def __init__(self, key):
                 self.key = key
@@ -870,6 +874,8 @@ class TestDeepseekV4Config:
 
         class FakeBackend:
             draft_block_decode = False
+            # The runner asks a draft side whether it takes a query shard.
+            query_sharded = False
             cache_consumer_attn_kinds = frozenset({"full_history", "sliding_window"})
 
             def __init__(self, key):
@@ -923,6 +929,8 @@ class TestDeepseekV4Config:
 
         class FakeBackend:
             draft_block_decode = False
+            # The runner asks a draft side whether it takes a query shard.
+            query_sharded = False
             cache_consumer_attn_kinds = frozenset({"full_history", "sliding_window"})
 
             def __init__(self, key):
@@ -975,6 +983,8 @@ class TestDeepseekV4Config:
 
         class FakeBackend:
             draft_block_decode = False
+            # The runner asks a draft side whether it takes a query shard.
+            query_sharded = False
             cache_consumer_attn_kinds = frozenset({"full_history", "sliding_window"})
 
             def __init__(self, key):
