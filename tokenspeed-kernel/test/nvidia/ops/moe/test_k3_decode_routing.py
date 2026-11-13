@@ -62,14 +62,11 @@ def _kernel(batch):
 def _run(batch, logits, bias, latent_in):
     """One launch on a filled mailbox; returns (ids, weights, latent, mailbox)."""
     import cutlass
-    from tokenspeed_kernel.thirdparty.cute_dsl.k3_decode.common.host import (
-        stream,
-        to_cute,
-    )
-    from tokenspeed_kernel.thirdparty.cute_dsl.k3_decode.moe.front import WIDTH
+    from tokenspeed_kernel.thirdparty.cute_dsl.k3_decode.common import host
+    from tokenspeed_kernel.thirdparty.cute_dsl.k3_decode.moe import front
 
     device = logits.device
-    box = torch.zeros(1, 64, WIDTH, dtype=torch.bfloat16, device=device)
+    box = torch.zeros(1, 64, front.WIDTH, dtype=torch.bfloat16, device=device)
     box[0, :batch, :LATENT] = latent_in
     box[0, :batch, LATENT : LATENT + 2 * EXPERTS] = logits.view(torch.bfloat16)
     ids = torch.full((batch, TOP_K), -1, dtype=torch.int32, device=device)
@@ -80,7 +77,7 @@ def _run(batch, logits, bias, latent_in):
     unused = torch.zeros(batch, EXPERTS, dtype=torch.float32, device=device)
     tensors = (unused, bias, ids, weights, box, latent, gate_up, hidden)
     scalars = tuple(cutlass.Float32(v) for v in (SCALE, BETA, LINEAR_BETA))
-    _kernel(batch)(*map(to_cute, tensors), *scalars, stream(device))
+    _kernel(batch)(*map(host.to_cute, tensors), *scalars, host.stream(device))
     torch.cuda.synchronize()
     return ids, weights, latent, box
 
