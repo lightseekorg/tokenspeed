@@ -97,8 +97,12 @@ report:
 perf_threshold: 0.9
 # Values are [Latency (tps/user), Throughput (tps/gpu)].
 #
-# Rounded down from the median of three runs on this runner (771.7 tok/s per
-# request, 79.4 tok/s per GPU, 125 / 128 correct). The regular path decodes
-# about 20% slower on this recipe, below 0.9 of the reference.
+# 1: rounded down from the median of three runs on this runner (771.7 tok/s
+# per request, 79.4 tok/s per GPU, 125 / 128 correct). The regular path
+# decodes about 20% slower on this recipe, below 0.9 of the reference.
+# 2: rounded down from the median of three runs on an MI355X host (601.1 tok/s
+# per request, 131.9 tok/s per GPU, 123-124 / 128 correct), where the
+# one-request run measured 852.8 / 90.1.
 perf_reference:
   1: [770, 79]
+  2: [600, 131]
