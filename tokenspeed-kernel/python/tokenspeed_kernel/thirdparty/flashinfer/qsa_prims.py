@@ -276,7 +276,11 @@ class _PrimTSQSARunner:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("warm up the PrimTS QSA geometry before capture")
             offsets = _group_offsets(metadata.query_start_loc, group_size)
-            qo_indptr = torch.tensor(offsets, dtype=torch.int32, device=self._device)
+            # New packed geometries also occur during serving, which forbids
+            # synchronizing host-to-device copies.
+            qo_indptr = torch.tensor(
+                offsets, dtype=torch.int32, device="cpu", pin_memory=True
+            ).to(self._device, non_blocking=True)
             max_kv = metadata.block_table.shape[1] * page_size
             # Completed current blocks compete for top-k; only a partial tail is appended.
             size = get_q_token_kv_block_sparse_workspace_size(
