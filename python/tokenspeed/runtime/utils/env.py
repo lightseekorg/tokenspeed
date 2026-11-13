@@ -309,8 +309,6 @@ class Envs:
     TOKENSPEED_JIT_COMPILE_CHECK = EnvStr("warn")
     TOKENSPEED_CI_SMALL_KV_SIZE = EnvInt(-1)
     TOKENSPEED_NVTX = EnvBool(False)
-    # Kill switch: DSpark's greedy walk as one launch and one all-gather per round.
-    TOKENSPEED_DSPARK_FUSED_WALK = EnvBool(True)
     TOKENSPEED_DP_SAMPLING_BACKEND = EnvStr(None)
 
     # Shared-expert parallelism.
