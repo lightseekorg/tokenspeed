@@ -94,14 +94,6 @@ def traceback_lines(report):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("report_log")
-    parser.add_argument(
-        "--pytest-status",
-        type=int,
-        required=True,
-        help="pytest's exit status: a finished run that recorded no test "
-        "results passes only when pytest passed (the changed-paths selection "
-        "emptied the run)",
-    )
     args = parser.parse_args()
 
     try:
@@ -168,16 +160,6 @@ def main():
             print(f"  ... and {len(incomplete) - INCOMPLETE_LIMIT} more")
 
     if not phases:
-        if finished and args.pytest_status == 0:
-            # pytest passed without a test result: every collected module was
-            # skipped, or the changed-paths selection emptied the run (the
-            # kernel conftest passes it; a run that collected nothing by
-            # itself exits 5).
-            if collect_skips:
-                print("  no test results: every collected module was skipped")
-            else:
-                print("  no test results: the changed-paths selection emptied the run")
-            return 0
         print("  the run recorded no test results at all")
         return 1
     return 1 if (failed or incomplete or collect_errors or not finished) else 0
