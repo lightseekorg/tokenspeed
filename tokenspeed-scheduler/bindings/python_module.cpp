@@ -374,7 +374,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
 
     const auto storage_keys = [](const std::vector<tokenspeed::CacheKey>& values) {
         nb::list keys;
-        for (const auto& key : values) keys.append(nb::make_tuple(key.group_id, key.content_hash, key.page_offset));
+        for (const auto& key : values)
+            keys.append(nb::make_tuple(key.group_id, key.content_hash.ToString(), key.page_offset));
         return keys;
     };
 
@@ -779,7 +780,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                 page_offsets.reserve(keys.size());
                 for (const tokenspeed::CacheKey& key : keys) {
                     group_ids.push_back(key.group_id);
-                    hashes.push_back(key.content_hash);
+                    hashes.push_back(key.content_hash.ToString());
                     page_offsets.push_back(key.page_offset);
                 }
                 return std::tuple{std::move(group_ids), std::move(hashes), std::move(page_offsets)};

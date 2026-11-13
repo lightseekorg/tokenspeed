@@ -38,6 +38,7 @@
 #include "cache/core/block_pool.h"
 #include "cache/core/cache_block_ref.h"
 #include "cache/coordinator/group_geometry.h"
+#include "cache/coordinator/victim_set.h"
 #include "cache/cache_group.h"
 #include "cache/core/cache_types.h"
 #include "cache/prefix/boundary_tree.h"
@@ -1331,12 +1332,45 @@ private:
     // pinned elsewhere stays.
     bool evictCachedBlock(std::uint32_t group_id, CacheBlockLocation location,
                           DeviceEvictionCounts DeviceEvictionStats::*reason, EvictedSegment* write_back_segment);
+    // The counter a planned victim's eviction counts under, by what its plan
+    // marked it as (VictimSet::Member).
+    struct VictimReasons {
+        DeviceEvictionCounts DeviceEvictionStats::*victim;
+        DeviceEvictionCounts DeviceEvictionStats::*stranded_suffix;
+        DeviceEvictionCounts DeviceEvictionStats::*request_reclaim;
+    };
+    // A planned victim evictPlannedVictims found no unpinned entry at: an
+    // earlier victim's cascade took it, or something still holds its block
+    // (an admission's own released slot until its table lets go).
+    struct UnevictedVictim {
+        std::uint32_t group_id;
+        CacheBlockLocation location;
+        DeviceEvictionCounts DeviceEvictionStats::*reason;
+        EvictedSegment* write_back_segment;
+    };
+    // Evicts planned victims in plan order, each with its cascade
+    // (evictCachedBlock), counted under `reasons`. With write_back each set is
+    // recorded as one segment of evicted_segments_; one whose every block was
+    // dropped stays empty for the caller to erase. The one loop that commits
+    // an admission's, a restore's, a compaction's or a cache clear's victims;
+    // it prefetches for the victims a few places ahead (hints only).
+    std::vector<UnevictedVictim> evictPlannedVictims(std::span<const VictimSet> victims, bool write_back,
+                                                     const VictimReasons& reasons);
+    // What evictCachedBlockAlone took out of the index.
+    struct EvictedEntry {
+        CacheKey key;
+        // Another Device entry under the key's content hash is still indexed
+        // (another group's, or another block of the page): only then can a
+        // cascade find anything. Every Device entry holds its hash's tree
+        // node, whose count tells this before the entry leaves.
+        bool device_companions_left{false};
+    };
     // Device eviction of one entry without its cascade, the one place a
     // Device entry leaves the index: it reports the eviction, counts it under
     // `reason` (the DeviceEvictionStats field of what started the eviction;
     // eviction order and cascades never depend on it); the entry's hold on its
-    // tree node goes with it. It returns the key that left the index, nullopt
-    // when the entry is pinned or gone. A superseded input (MarkSupersededStateInput) an
+    // tree node goes with it. It returns the entry that left the index,
+    // nullopt when it is pinned or gone. A superseded input (MarkSupersededStateInput) an
     // admission, rotation or restore evicts counts as
     // request_reclaim and is never recorded; a demoted entry
     // (SetCheckpointDemotion) is never recorded either, whatever evicts it,
@@ -1350,9 +1384,9 @@ private:
     // the node never looks empty in between. One no probe could resume from
     // on the Host is dropped instead (DeadEntriesNotWrittenBack). nullptr
     // drops it.
-    std::optional<CacheKey> evictCachedBlockAlone(std::uint32_t group_id, CacheBlockLocation location,
-                                                  DeviceEvictionCounts DeviceEvictionStats::*reason,
-                                                  EvictedSegment* write_back_segment);
+    std::optional<EvictedEntry> evictCachedBlockAlone(std::uint32_t group_id, CacheBlockLocation location,
+                                                      DeviceEvictionCounts DeviceEvictionStats::*reason,
+                                                      EvictedSegment* write_back_segment);
     // Evicts an unpinned Host entry and, for a State checkpoint, the other
     // State groups' unpinned entries at its hash. Each entry that left counts
     // under host_evictions_.*reason, as device_resident too when the Device
