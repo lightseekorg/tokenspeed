@@ -3359,7 +3359,9 @@ CacheCoordinator::StorageReservation CacheCoordinator::ReserveStoragePrefix(cons
     // The Device-only probe: the reservation matches the Host suffix (Host and
     // remote) above its boundary again, under the same Host-suffix rule as
     // admission.
-    const std::vector<std::vector<CacheKey>> group_keys = buildGroupKeys(prompt.prefix_hashes);
+    const std::vector<std::vector<CacheKey>> owned_keys =
+        prompt.prepared_keys ? std::vector<std::vector<CacheKey>>{} : buildGroupKeys(prompt.prefix_hashes);
+    const auto& group_keys = prompt.prepared_keys ? *prompt.prepared_keys : owned_keys;
     const PrefixProbe::Tier device_only = probeTier(prompt, group_keys, match_order_, /*claim_partial=*/true);
     auto candidate = prompt;
     while (candidate.max_tokens > device_only.num_common_tokens) {
