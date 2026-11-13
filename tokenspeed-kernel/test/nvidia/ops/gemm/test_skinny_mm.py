@@ -28,10 +28,10 @@ from tokenspeed_kernel.ops.gemm.triton_skinny import (
     skinny_mm,
     skinny_mm_supported,
 )
-from utils import assert_no_triton_compile
+from utils import assert_no_triton_compile, is_nvidia
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="skinny_mm requires an NVIDIA GPU"
+    not is_nvidia(), reason="skinny_mm requires an NVIDIA GPU"
 )
 
 

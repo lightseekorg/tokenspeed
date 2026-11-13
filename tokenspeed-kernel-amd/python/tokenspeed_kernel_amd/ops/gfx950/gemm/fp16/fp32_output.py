@@ -26,6 +26,7 @@ from __future__ import annotations
 from typing import Any
 
 import torch
+from tokenspeed_kernel_amd._extern import extern_compile_options
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
     _get_partial_scratch,
@@ -233,6 +234,7 @@ def launch_gluon_mm_bf16_fp32_gfx950(
             NUM_XCDS=1,
             PID_OFFSET=0,
             num_warps=4,
+            **extern_compile_options(),
             llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
         )
     return out

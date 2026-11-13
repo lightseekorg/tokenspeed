@@ -32,10 +32,9 @@ import pytest
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.attention.rmha import rel_mha_gate_sink
+from utils import is_nvidia
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="NVIDIA PTX approximations"
-)
+pytestmark = pytest.mark.skipif(not is_nvidia(), reason="NVIDIA PTX approximations")
 
 
 @triton.jit
