@@ -35,6 +35,18 @@ and reclaims inside the same `Admit` (`AdvanceRequestProgress` in
 and builds it; see [cache-concepts](cache-concepts.md#the-coordinator-layer-csrccachecoordinator)
 for why publication rides with admission).
 
+Pages are published only for later admissions to match
+(`SchedulerConfig::PublishesCompletedPages`). With prefix caching disabled, no
+admission matches either tier or prefetches from L3, so chunk ends, decode
+steps, and the finish hash and publish nothing, and a finished request's pages
+return straight to the pool. Published, they could only stay resident until
+an allocation evicted them, and on a D node, which allocates every request's
+whole prompt, every allocation would first walk the eviction order. Admission
+does not hash the prompt either, since there is nothing to probe, and nothing
+is written to a Host cache, which no probe could read. A retraction publishes
+its victim either way; with a Host cache, the image's L2 leg is built from that
+publication.
+
 Decode-role remote admission covers the complete unmatched prompt in one
 landing window. Local prefill chunk limits and junction cuts do not shorten
 it: the peer transfers the full prompt's KV past the hit and its prompt-end
@@ -249,9 +261,9 @@ round, `wholePromptsAfter` probes up to eight `Submitted` candidates (for a
 new prompt's chunk, only those behind it) the way admission would. A
 candidate qualifies when its first chunk could complete it: no eviction store
 pending on its prefix, no junction cut, no in-forward checkpoint spanned from
-inside a page, and — beside a resident chunk on a model with State groups —
-no page shared with what that chunk's admission is about to publish (its
-probe would be stale). What it takes is counted past its hit, replay
+inside a page, and — beside a resident chunk on a model with State groups,
+with prefix caching — no page shared with what that chunk's admission is
+about to publish (its probe would be stale). What it takes is counted past its hit, replay
 included: a 100k-token prompt with 1k uncached tokens takes 1k.
 `carriedPrompts` keeps them in FIFO order while they fit N, the batch, the
 free request slots and, with `max_kv_page_num`, the page budget. The chunk
@@ -338,7 +350,7 @@ admission states what the pair does through the group's `StateStep`
   is (the landed or restored slot 1 is the state the decode continues from).
 - `kLand` — the D role's remote landing: slot 0 is the claimed prompt-end
   checkpoint or null (nothing on this node reads a zero state), slot 1 a
-  fresh block the peer's transfer fills.
+  fresh block the peer's transfer fills whole, so it is not zeroed.
 
 **Natural checkpoints.** A state is published only at a point where its owner
 stops writing it — a `PublicationPoint` other than an ordinary chunk end
@@ -390,6 +402,16 @@ which publishes it under the boundary's page hash, like a natural checkpoint,
 with the sliding window behind it as the endpoint's window, even at a chunk
 end, never as an unproven boundary that eviction takes first
 (`cache-concepts.md`).
+For restricted State groups (`checkpoint_granularity = G > 1`), the boundary
+instead is `floor((prompt_tokens - 1) / G) * G`, including prompts that fit
+within one chunk. A prompt of at most `G` tokens therefore has no positive
+input checkpoint. The P and fused roles require this flag, prefix caching,
+and a chunk budget of at least `G`; `G` must be a multiple of the prefix page
+size. The D role neither needs this flag nor publishes its transferred state
+as a reusable restricted checkpoint. An interior checkpoint does not mean
+that every shorter aligned prefix was saved: another request can reuse only
+a boundary whose State and all required KV dependencies remain present.
+
 A boundary a chunk ends on needs none (the chunk end's slot 1 is published
 there, as at a junction). The scan emits states only whole pages from a
 forward's start, and the budget a batch's decodes leave rarely ends on a page,
@@ -1511,7 +1533,11 @@ ordinary probe: `extend_prefix_lens` is the hit `T`, page-aligned or a
 published tail, and the block containing an unaligned `T` is left a hole for
 the peer to fill whole; the tail's full blocks below it, when a group's
 blocks are smaller than a page, are the hitter's own copies like on every
-role (`pages_to_copy`). For the State groups only one checkpoint counts: the one at
+role (`pages_to_copy`). The peer fills whole every full-history block up to
+the prompt end, so the landing lists none of them in `pages_to_zero`
+(`GroupDemand::landed_tokens`), as a copy destination is never listed: it
+zeroes the block holding an unaligned prompt end and the reserve pages
+beyond it, and no State slot. For the State groups only one checkpoint counts: the one at
 **exactly the prompt end** (`PrefixProbe::state_at_prompt_end`). When every
 State group holds it, the admission claims it as slot 0 and reports
 `state_prefix_cached` on the `PrefillOperation` (per extend row on the

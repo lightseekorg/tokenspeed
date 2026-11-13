@@ -45,7 +45,7 @@ public:
     // Per checkpoint, the State entries the plan has taken from this tier.
     using RemovedCheckpoints = std::unordered_map<ContentHash, std::int32_t>;
 
-    enum class BoundaryTier { kUncached, kProbationary, kEstablished, kClosedPrefix };
+    enum class BoundaryTier { kUncached, kProbationary, kEstablished, kClosedPrefix, kSink };
 
     struct Candidate {
         std::uint64_t last_access_epoch;
@@ -84,14 +84,16 @@ public:
         const std::int32_t position = metadata ? metadata->logical_block_index : -1;
         const CacheBoundaryKind kind = metadata ? metadata->boundary_kind : CacheBoundaryKind::kChunk;
         const bool closed = groups_[group_id].Matcher().IsPrefixClosed();
-        const bool probationary =
-            !closed && kind == CacheBoundaryKind::kChunk && !(metadata && metadata->was_acquired) && position >= 0;
-        if (candidate.last_access_epoch != 0) {
-            candidate.boundary_tier = probationary
+        const bool sink = position >= 0 && position < groups_[group_id].Allocator().KeptHeadBlocks();
+        const bool probationary = !sink && !closed && kind == CacheBoundaryKind::kChunk &&
+                                  !(metadata && metadata->was_acquired) && position >= 0;
+        if (candidate.last_access_epoch != 0 || sink) {
+            candidate.boundary_tier = sink ? BoundaryTier::kSink
+                                      : probationary
                                           ? BoundaryTier::kProbationary
                                           : (closed ? BoundaryTier::kClosedPrefix : BoundaryTier::kEstablished);
         }
-        if (probationary) {
+        if (probationary || (!closed && groups_[group_id].Spec().sink_tokens > 0)) {
             candidate.position_rank = position;
         } else if (closed && position >= 0) {
             candidate.position_rank = -static_cast<std::int64_t>(position);

@@ -432,6 +432,7 @@ def test_physical_mla_writer_with_placement_and_explicit_history_gather(
     from types import SimpleNamespace
 
     from tokenspeed.runtime.distributed.mapping import KVP_HISTORY_GROUP_NAME
+    from tokenspeed.runtime.layers.attention.backends.base import SparseTopKShare
     from tokenspeed.runtime.layers.attention.backends.paged import flashmla
     from tokenspeed.runtime.layers.attention.dcp import cache as dcp_cache
     from tokenspeed.runtime.layers.attention.dcp.cache import (
@@ -474,6 +475,8 @@ def test_physical_mla_writer_with_placement_and_explicit_history_gather(
     )
     backend = object.__new__(flashmla.FlashMLABackend)
     backend.cache_pool = pool
+    # The runner's root node owns the share; this leaf stands in for it.
+    backend.sparse_topk = SparseTopKShare()
     backend.kvp_group = (0, 1)
     backend.kvp_rank = 0
     backend.kvp_block_granularity = 4

@@ -330,8 +330,9 @@ impl Tier {
         }
     }
 
-    /// Start `plan`'s storage operations; none waits for I/O.
-    pub fn submit(&self, plan: &ExecutionPlan) -> Result<(), ts_l3::ExecutorError> {
+    /// Start `plan`'s storage operations; none waits for I/O. Returns
+    /// whether the plan had any.
+    pub fn submit(&self, plan: &ExecutionPlan) -> Result<bool, ts_l3::ExecutorError> {
         let operations = plan
             .storage_ops()
             .into_iter()
@@ -368,9 +369,10 @@ impl Tier {
             })
             .collect::<Result<Vec<_>, _>>()?;
         if operations.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
-        self.executor.submit(&operations)
+        self.executor.submit(&operations)?;
+        Ok(true)
     }
 
     /// This round's report of this rank's executor; see [`L3::report`].

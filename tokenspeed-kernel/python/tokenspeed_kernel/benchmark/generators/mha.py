@@ -479,6 +479,7 @@ def prepare_gqa_prologue(
             k_weight=torch.ones(head_dim, dtype=torch.float32, device="cuda"),
             weight_offset=0.0,
             eps=1e-5,
+            round_before_rope=False,
         )
         if has_norm
         else None

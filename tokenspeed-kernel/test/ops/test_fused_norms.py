@@ -517,6 +517,7 @@ def test_gathered_route_reduction_matches_materialized_routes(device: str) -> No
         1.0,
         False,
         None,
+        None,
     )
     # CDNA4 lowers the mapped pointer path separately from the materialized
     # path. A few values can straddle a BF16 boundary even though both keep
@@ -537,6 +538,7 @@ def test_gathered_route_reduction_matches_materialized_routes(device: str) -> No
         1.0,
         False,
         supplied,
+        None,
     )
     assert written is supplied
     assert torch.equal(written, actual)

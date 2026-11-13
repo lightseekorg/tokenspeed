@@ -18,13 +18,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Private FlashInfer TRT-LLM entrypoints with a model-specific tactic policy.
+"""Private FlashInfer TRT-LLM entrypoints with model-specific tactic policies.
 
 Keep the upstream routing, tuner and GEMM implementations. FlashInfer's routing
-producers initialize expert-tile padding. One Qwen3.8 decode shape narrows the
-valid MoE tactics to tile 32. A cache-key hook applies that policy to the target
-profile for this private runner only. The installed package and upstream JIT
-artifacts remain untouched.
+producers initialize expert-tile padding. One Qwen3.8 decode shape and the
+Kimi-K3 TP8 decode shapes past 128 rows narrow the valid MoE tactics to tile 32.
+A cache-key hook applies that policy to the target profile for this private
+runner only. The installed package and upstream JIT artifacts remain untouched.
 
 Tuning also skips tactics whose FC1 or FC2 kernel runs a multi-CTA cluster on
 trtllm-gen's dynamic persistent scheduler. Such a kernel can retire one CTA of
@@ -135,8 +135,32 @@ def _is_qwen38_decode_shape(
     )
 
 
-def _prefer_qwen38_decode_tile_32(tactics):
-    """Keep valid tile-32 tactics for the matching Qwen3.8 decode shape."""
+def _is_kimi_k3_decode_shape(
+    *,
+    num_tokens: int,
+    top_k: int,
+    num_experts: int,
+    num_local_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    mxfp4: bool,
+) -> bool:
+    # TP8 Kimi-K3 routed experts in the 256 and 512 token buckets (129 to 512
+    # decode rows). A few experts take 40% to 50% of the rows, so tile 32
+    # streams their weights fewer times than the tiles tuned on balanced routes.
+    return (
+        mxfp4
+        and 256 <= num_tokens <= 512
+        and top_k == 16
+        and num_experts == 896
+        and num_local_experts == 896
+        and hidden_size == 3584
+        and intermediate_size == 384
+    )
+
+
+def _prefer_tile_32(tactics):
+    """Keep the valid tile-32 tactics of a shape whose policy prefers them."""
     # FlashInfer 0.7 returns tvm_ffi.Array tactics; element 0 is tile_tokens_dim.
     selected = [tactic for tactic in tactics if int(tactic[0]) == 32]
     return selected or tactics
@@ -284,23 +308,32 @@ def _entrypoints():
     class TokenSpeedFP4MoERunner(core.TrtllmMoERunner):
         """Keep TokenSpeed's MoE tactic policy separate from upstream tuning caches."""
 
-        def _matches_qwen38_decode_shape(self, num_tokens):
-            return _is_qwen38_decode_shape(
+        def _tile_32_tag(self, num_tokens):
+            """The cache-key tag of the tile-32 policy matching this shape, or None."""
+            shape = dict(
                 num_tokens=num_tokens,
                 top_k=self.top_k,
                 num_experts=self.num_experts,
                 num_local_experts=self.num_local_experts,
                 hidden_size=self.hidden_size,
                 intermediate_size=self.intermediate_size,
-                nvfp4=self.dtype_weights == DtypeTrtllmGen.E2m1,
             )
+            if _is_qwen38_decode_shape(
+                **shape, nvfp4=self.dtype_weights == DtypeTrtllmGen.E2m1
+            ):
+                return "tokenspeed-qwen38-tile32-v1"
+            if _is_kimi_k3_decode_shape(
+                **shape, mxfp4=self.dtype_weights == DtypeTrtllmGen.MxE2m1
+            ):
+                return "tokenspeed-kimi-k3-tile32-v1"
+            return None
 
         def cache_key_for_profile(self, key):
             hidden_index = MoeRunnerInputs._FIELDS.index("hidden_states")
-            num_tokens = key.nearest_profile[hidden_index][0]
+            tag = self._tile_32_tag(key.nearest_profile[hidden_index][0])
             extras = (*key.extras, _CLUSTER_POLICY_TAG)
-            if self._matches_qwen38_decode_shape(num_tokens):
-                extras = (*extras, "tokenspeed-qwen38-tile32-v1")
+            if tag is not None:
+                extras = (*extras, tag)
             return replace(key, extras=extras)
 
         def get_valid_tactics(self, inputs, profile):
@@ -314,8 +347,8 @@ def _entrypoints():
                     _module_cluster_persistent_configs(enable_rubin),
                 )
             num_tokens = MoeRunnerInputs.from_list(inputs).hidden_states.shape[0]
-            if self._matches_qwen38_decode_shape(num_tokens):
-                return _prefer_qwen38_decode_tile_32(tactics)
+            if self._tile_32_tag(num_tokens) is not None:
+                return _prefer_tile_32(tactics)
             return tactics
 
     _install_profile_cache_key(core.AutoTuner, TokenSpeedFP4MoERunner)

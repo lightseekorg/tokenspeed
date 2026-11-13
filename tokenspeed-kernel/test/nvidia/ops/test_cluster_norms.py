@@ -34,10 +34,12 @@ from tokenspeed_kernel.numerics.torch.residual import (
 )
 from tokenspeed_kernel.ops.moe import (
     routed_input_scale_rmsnorm_sum_gathered,
+    routed_sum_reduces_mailbox,
 )
 from tokenspeed_kernel.ops.moe._cute_dsl import routed_norm as routed_cute_dsl
 from tokenspeed_kernel.ops.moe._cute_dsl.latent_down import (
     HALF_POLLED_SENTINEL,
+    AllReduceMailbox,
     MailboxPublish,
 )
 from tokenspeed_kernel.ops.moe._triton.routed_norm import (
@@ -170,19 +172,19 @@ def test_cluster_routed_sum_agrees_with_triton_up_to_variance_rounding(
     args = _routed_case(tokens, topk, device, 4096 + 128)
     assert routed_cute_dsl.cluster_routed_sum_supported(*args[:6])
     cluster = routed_cute_dsl.cute_dsl_routed_input_scale_rmsnorm_sum_gathered(
-        *args, False, None
+        *args, False, None, None
     )
     assert torch.equal(
         cluster,
         routed_cute_dsl.cute_dsl_routed_input_scale_rmsnorm_sum_gathered(
-            *args, True, None
+            *args, True, None, None
         ),
     )
-    _assert_agree(cluster, triton_routed_sum_gathered(*args, False, None))
+    _assert_agree(cluster, triton_routed_sum_gathered(*args, False, None, None))
     if tokens > 1:
         assert cluster[1].eq(0).all()
     assert torch.equal(
-        routed_input_scale_rmsnorm_sum_gathered(*args, False, None), cluster
+        routed_input_scale_rmsnorm_sum_gathered(*args, False, None, None), cluster
     )
 
 
@@ -231,16 +233,53 @@ def test_cluster_kernels_decline_what_they_cannot_serve(device: str) -> None:
     for args in (odd, past):
         assert not routed_cute_dsl.cluster_routed_sum_supported(*args[:6])
         assert torch.equal(
-            routed_input_scale_rmsnorm_sum_gathered(*args, False, None),
-            triton_routed_sum_gathered(*args, False, None),
+            routed_input_scale_rmsnorm_sum_gathered(*args, False, None, None),
+            triton_routed_sum_gathered(*args, False, None, None),
         )
+
+
+@pytest.mark.parametrize("device", ["cuda"])
+@pytest.mark.parametrize("tokens", [1, 6, 64])
+# Two routes give 2048-column slices, two word pairs per thread.
+@pytest.mark.parametrize("topk", [8, 2])
+def test_cluster_routed_sum_all_reduces_through_a_mailbox_like_the_oneshot_allreduce(
+    device: str, tokens: int, topk: int
+) -> None:
+    """The sum over ranks sends -0.0 as +0.0 and adds in BF16 in rank order."""
+    ranks, rank = 4, 1
+    args = _routed_case(tokens, topk, device, 4096 + 128)
+    width = args[5].shape[0]
+    local = routed_input_scale_rmsnorm_sum_gathered(*args, True, None, None)
+    torch.manual_seed(37)
+    partials = [
+        (torch.randn(tokens, width, device=device) * 0.5).to(torch.bfloat16)
+        for _ in range(ranks)
+    ]
+    partials[rank] = local
+    partials[2][:, ::5] = -0.0
+    sanitized = [torch.where(p == 0, torch.zeros_like(p), p) for p in partials]
+    expected = sanitized[0]
+    for partial in sanitized[1:]:
+        expected = expected + partial
+    columns = slice(rank * width, (rank + 1) * width)
+    mailbox = armed_mailbox(torch.cat(partials, dim=1), MAX_ROWS)
+    mailbox[:tokens, columns].view(torch.int32).fill_(-1)
+    reduce = AllReduceMailbox(
+        mailbox[:tokens], mailbox[:tokens, columns], HALF_POLLED_SENTINEL
+    )
+    assert routed_sum_reduces_mailbox(*args[:6])
+    got = routed_input_scale_rmsnorm_sum_gathered(*args, True, None, reduce)
+    assert torch.equal(got, expected)
+    assert (mailbox.view(torch.int32) == -1).all()
+    with pytest.raises(ValueError, match="cluster routed sum"):
+        triton_routed_sum_gathered(*args, False, None, reduce)
 
 
 @pytest.mark.parametrize("device", ["cuda"])
 def test_cluster_kernels_replay_from_a_cuda_graph(device: str) -> None:
     """The production path captures both kernels; replay must equal eager."""
     boundary_args = (*boundary_case("ffn_linked", 4, device), True, None, 1)
-    routed_args = (*_routed_case(4, 8, device, 4096 + 128), True, None)
+    routed_args = (*_routed_case(4, 8, device, 4096 + 128), True, None, None)
     eager = (
         boundary_cute_dsl.cute_dsl_post_norm_residual_pre_norm(*boundary_args, None)[
             0

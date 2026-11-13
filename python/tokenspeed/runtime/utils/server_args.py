@@ -208,9 +208,36 @@ def _checkpoint_architectures(
 # Checkpoint architectures with decode monokernels (--decode-monokernel). A
 # model adds its architecture here with its monokernel seam.
 DECODE_MONOKERNEL_ARCHITECTURES = (
+    "MuseSparkForConditionalGeneration",
     "Qwen4ExpForCausalLM",
     "Qwen4ExpForConditionalGeneration",
 )
+# Draft architectures with decode monokernels, and the target architectures
+# whose drafts they serve. Under --decode-monokernel such a draft of such a
+# target takes the switch too; any other draft (a Qwen3.8 target's DFlash2
+# draft, a Muse Spark target's other drafts) keeps its regular layers.
+DRAFT_MONOKERNEL_TARGETS = {
+    "DFlash2DraftModel": ("MuseSparkForConditionalGeneration",),
+    # The MTP draft of a Qwen3.8 target (hf_transformers_utils renames the
+    # draft's architecture to it).
+    "Qwen4ExpForCausalLMNextN": (
+        "Qwen4ExpForCausalLM",
+        "Qwen4ExpForConditionalGeneration",
+    ),
+}
+
+
+def draft_takes_decode_monokernel(
+    switch: bool, target_architectures: list[str], draft_architectures: list[str]
+) -> bool:
+    """Whether a draft under ``--decode-monokernel`` (``switch``) builds its
+    layers from its monokernel class: only a draft in DRAFT_MONOKERNEL_TARGETS
+    of one of the targets it lists."""
+    return switch and any(
+        target in DRAFT_MONOKERNEL_TARGETS.get(draft, ())
+        for draft in draft_architectures
+        for target in target_architectures
+    )
 
 
 def decode_monokernel_refusal(architectures: list[str]) -> str | None:
@@ -367,6 +394,23 @@ def validate_qcp(
         )
 
 
+def _filesystem_type(path: str) -> str:
+    """The type of the filesystem whose mount point is ``path``'s longest
+    prefix in ``/proc/self/mounts``; ``path`` need not exist yet."""
+    path = os.path.realpath(path)
+    best, fs_type = "", "unknown"
+    with open("/proc/self/mounts") as mounts:
+        for line in mounts:
+            fields = line.split()
+            mount_point = fields[1].replace("\\040", " ")
+            inside = path == mount_point or path.startswith(
+                mount_point.rstrip("/") + "/"
+            )
+            if inside and len(mount_point) >= len(best):
+                best, fs_type = mount_point, fields[2]
+    return fs_type
+
+
 @dataclasses.dataclass
 class ServerArgs:
     # Model and tokenizer
@@ -468,6 +512,7 @@ class ServerArgs:
     log_level: str = "info"
     enable_async_logging: bool = False
     enable_log_request_stats: bool = False
+    ttft_trace_sampling_percentage: int = 0
     enable_metrics: bool = False
     decode_log_interval: int = 40
     metrics_reporters: list[str] | None = None
@@ -542,6 +587,8 @@ class ServerArgs:
 
     # Dense GEMM selection is independent of routed-expert kernels.
     dense_gemm_backend: str = "auto"
+    # Online W8A8 for Qwen3.5/Qwen4-Exp attention projections only.
+    enable_fp8_attn_proj: bool = False
 
     # MoE backend
     moe_backend: str = "auto"
@@ -642,6 +689,9 @@ class ServerArgs:
     # Run each decoder layer's small decode steps as one persistent
     # monokernel launch (DECODE_MONOKERNEL_ARCHITECTURES). Off by default.
     decode_monokernel: bool = False
+    # A directory for each rank's decode monokernel stuck-poll record file
+    # (None: the records stay in pinned memory).
+    monokernel_stuck_record_dir: str | None = None
 
     # Grammar backend. None means the checkpoint default has not been resolved.
     grammar_backend: str | None = None
@@ -804,6 +854,7 @@ class ServerArgs:
     tp_batch_invariant: Literal["none", "attn", "attn+dense"] = "none"
     dense_tp_size: int | None = None
     moe_tp_size: int | None = None
+    moe_weight_sharing_size: int | None = None
     mapping: Mapping | None = None
     emulate_rank_zero: bool = False
 
@@ -1313,6 +1364,7 @@ class ServerArgs:
             moe_tp_size=moe_tp_size,
             moe_ep_size=moe_ep_size,
             moe_dp_size=moe_dp_size,
+            moe_weight_sharing_size=self.moe_weight_sharing_size,
             vision_tp_size=vision_tp_size,
             vision_dp_size=vision_dp_size,
             pp_size=pp_size,
@@ -1322,6 +1374,34 @@ class ServerArgs:
             base_gpu_id=self.base_gpu_id,
             gpu_id_step=self.gpu_id_step,
         )
+
+        if self.moe_weight_sharing_size is not None:
+            if self.load_format not in ("auto", "safetensors"):
+                raise ValueError(
+                    "Peer expert weights require auto or safetensors checkpoint loading"
+                )
+            if self.enable_memory_saver:
+                raise ValueError("Peer expert weights do not support memory saver")
+            if self.disaggregation_mode != "prefill":
+                raise ValueError(
+                    "Peer expert weights currently require a prefill instance"
+                )
+            if self.prefill_graph_max_tokens != 0 or not self.enforce_eager:
+                raise ValueError(
+                    "Peer expert weights require --prefill-graph-max-tokens 0 and --enforce-eager"
+                )
+            if self.mapping.requires_forward_coordination:
+                raise ValueError(
+                    "Peer expert weights require fully local execution groups"
+                )
+            if self.kvstore_storage_backend is not None:
+                raise ValueError(
+                    "Peer expert weights do not support shared L3 cache control"
+                )
+            if self.enable_eplb:
+                raise ValueError(
+                    "Peer expert weights are immutable and do not support expert rebalancing"
+                )
 
         # Impl constraints:
         if self.deepseek_v41_attention_query_swa_min_tokens < 1:
@@ -2755,6 +2835,13 @@ class ServerArgs:
             )
 
     def validate(self):
+        if (
+            type(self.ttft_trace_sampling_percentage) is not int
+            or not 0 <= self.ttft_trace_sampling_percentage <= 100
+        ):
+            raise ValueError(
+                "--ttft-trace-sampling-percentage must be an integer in [0, 100]"
+            )
         self.validate_weight_memory_policy()
         self.validate_forward_reload()
         if self.low_latency_max_num_tokens_per_gpu <= 0:
@@ -2778,6 +2865,23 @@ class ServerArgs:
                 "--prefill-decode-min-interval needs --disaggregation-mode null: "
                 "a prefill engine runs no decodes and a decode engine no local "
                 "prefill rounds"
+            )
+        if self.monokernel_stuck_record_dir is not None:
+            fs_type = _filesystem_type(self.monokernel_stuck_record_dir)
+            if fs_type != "tmpfs":
+                # The record file is mapped and registered as GPU-visible host
+                # memory. On a disk filesystem the kernel's periodic dirty-page
+                # writeback of those pages stalls decode for 1-2 s every few
+                # seconds; tmpfs pages are never written back.
+                raise ValueError(
+                    "--monokernel-stuck-record-dir must be on tmpfs (for "
+                    f"example /dev/shm); {self.monokernel_stuck_record_dir} is "
+                    f"on {fs_type}"
+                )
+        if self.monokernel_stuck_record_dir is not None and not self.decode_monokernel:
+            raise ValueError(
+                "--monokernel-stuck-record-dir needs --decode-monokernel: only "
+                "the monokernel launches write stuck-poll records"
             )
         if self.device == "npu":
             if not self.disable_prefill_graph:
@@ -2900,8 +3004,7 @@ class ServerArgs:
             nargs="?",
             metavar="model",
             default=None,
-            help="The model name or path (positional argument). "
-            "Equivalent to --model.",
+            help="The model name or path (positional argument). Equivalent to --model.",
         )
         parser.add_argument(
             "--model",
@@ -3411,7 +3514,10 @@ class ServerArgs:
             "--stream-interval",
             type=int,
             default=ServerArgs.stream_interval,
-            help="The interval (or buffer size) for streaming in terms of the token length. A smaller value makes streaming smoother, while a larger value makes the throughput higher",
+            help="Streaming buffer size in generated tokens: send the first step's "
+            "tokens at once, then whenever at least this many tokens are unsent. A "
+            "smaller value streams more smoothly; a larger value sends fewer, "
+            "larger chunks.",
         )
         parser.add_argument(
             "--seed",
@@ -3467,7 +3573,14 @@ class ServerArgs:
             help="The logging level of all loggers.",
         )
         parser.add_argument(
+            "--ttft-trace-sampling-percentage",
+            type=int,
+            default=ServerArgs.ttft_trace_sampling_percentage,
+            help="Log engine TTFT phases for this percentage of PD bootstrap rooms (0 disables).",
+        )
+        parser.add_argument(
             "--enable-log-request-stats",
+            "--enable-request-time-stats-logging",
             action=argparse.BooleanOptionalAction,
             default=ServerArgs.enable_log_request_stats,
             help=(
@@ -3671,6 +3784,14 @@ class ServerArgs:
             "Fewer layers per chunk bound the per-round stall.",
         )
         parser.add_argument(
+            "--enable-fp8-attn-proj",
+            action="store_true",
+            default=ServerArgs.enable_fp8_attn_proj,
+            help="Use online block-FP8 QKV/O and GDN QKVZ/output projections "
+            "in the Qwen3.5/Qwen4-Exp target model. GDN BA uses floating precision "
+            "and MTP draft projections follow the checkpoint.",
+        )
+        parser.add_argument(
             "--dense-gemm-backend",
             type=str,
             default=ServerArgs.dense_gemm_backend,
@@ -3679,7 +3800,8 @@ class ServerArgs:
             "auto prefers compatible CuTe-DSL on Blackwell at M > 16 GEMM rows. "
             "trtllm_cutedsl requires Blackwell and preserves checkpoint FP8 "
             "weights and FP32 scales without requantization. "
-            "deepgemm requires Hopper and preserves FP32 scales. "
+            "deepgemm preserves FP32 scales on Hopper; SM100/SM103 use "
+            "UE8M0 weight requantization and packed activation scales. "
             "Other quantization formats and routed experts are unchanged.",
         )
         parser.add_argument(
@@ -4004,12 +4126,34 @@ class ServerArgs:
             default=ServerArgs.decode_monokernel,
             help=(
                 "Run each decoder layer's decode step as one persistent "
-                "monokernel launch, for small batches (decode and speculative "
-                "verify of up to 4 token rows). Models: "
-                f"{', '.join(DECODE_MONOKERNEL_ARCHITECTURES)} on gfx950, "
-                "without attention or expert parallelism. Startup fails when "
-                "a layer cannot be packed for its monokernel. Larger steps "
+                "monokernel launch, for small decode and speculative verify "
+                "steps (each model's seam names the steps and parallel "
+                "layouts its kernels serve). Models: "
+                f"{', '.join(DECODE_MONOKERNEL_ARCHITECTURES)} on gfx950. "
+                "Startup fails when a layer cannot be packed for its "
+                "monokernel. A speculative draft with monokernels of its "
+                "own takes the switch too when its target is one they serve ("
+                + "; ".join(
+                    f"{draft}: {', '.join(targets)}"
+                    for draft, targets in DRAFT_MONOKERNEL_TARGETS.items()
+                )
+                + "); every other draft keeps the regular path. Other steps "
                 "keep the regular path."
+            ),
+        )
+        parser.add_argument(
+            "--monokernel-stuck-record-dir",
+            type=str,
+            default=ServerArgs.monokernel_stuck_record_dir,
+            help=(
+                "With --decode-monokernel: a directory on tmpfs (for example "
+                "/dev/shm) where each rank keeps "
+                "its stuck-poll record file (stuck-rank<N>-pid<P>.bin and a "
+                ".json sidecar). A launch poll that gives up writes what it "
+                "waited for there before the launch traps, so the record "
+                "outlives the process; a run without a stuck poll removes the "
+                "files at exit. Without it the records stay in pinned memory "
+                "and are logged when the failure reaches Python."
             ),
         )
         parser.add_argument(
@@ -4660,6 +4804,14 @@ class ServerArgs:
             help="Specify tp size for dense part. Defaults to the attention "
             "TP width: the full world without DP attention, one replica with "
             "it.",
+        )
+        parser.add_argument(
+            "--moe-weight-sharing-size",
+            type=int,
+            default=ServerArgs.moe_weight_sharing_size,
+            help="Share immutable expert weights across this many workers while executing "
+            "each batch locally (DWDP). Omission keeps resident weights. Requires "
+            "prefill, TP1/EP1 compute, and disabled model CUDA graphs.",
         )
         parser.add_argument(
             "--moe-tp-size",

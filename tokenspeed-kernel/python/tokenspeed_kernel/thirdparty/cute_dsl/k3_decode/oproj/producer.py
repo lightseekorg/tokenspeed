@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""O-projection producer for the split and fused AttnRes paths: 112 CTAs of 64 output
-rows. Each warp keeps ``rows`` 16-row weight tiles of one of ``4 * rows`` K parts in
+"""O-projection producer for the split and fused AttnRes paths: ``n / 64`` CTAs of 64
+output rows (112 for K3's 7168). Each warp keeps ``rows`` 16-row weight tiles of one of ``4 * rows`` K parts in
 registers (TP8 stages some K blocks in shared memory), runs BF16 MMA chains and the K
 parts are reduced in order. Weights load before the PDL wait; the split producer
 triggers its consumer right after it. With ``group_tiles`` the batch runs in groups of
@@ -60,8 +60,12 @@ def tree_reduce(values, op):
 
 
 class OprojProducer:
-    def __init__(self, k, *, staged_blocks, rows=1, group_tiles=0, twoshot=False):
-        self.k, self.staged, self.rows = k, staged_blocks, rows
+    def __init__(
+        self, k, *, staged_blocks, rows=1, group_tiles=0, twoshot=False, n=7168
+    ):
+        if n % 64:
+            raise ValueError(f"the producer runs 64-row CTAs; {n} output rows")
+        self.k, self.n, self.staged, self.rows = k, n, staged_blocks, rows
         self.twoshot = twoshot
         self.parts = 4 * rows
         self.kblocks = k // (32 * self.parts)
@@ -291,7 +295,7 @@ class OprojProducer:
 
     @cute.jit
     def __call__(self, *args):
-        launch(self.kernel, args, 112, 512, min_blocks_per_mp=1)
+        launch(self.kernel, args, self.n // 64, 512, min_blocks_per_mp=1)
 
     @cute.kernel
     def kernel(self, args):
@@ -302,14 +306,14 @@ class OprojProducer:
 
 
 class OprojUmma(OprojProducer):
-    """B>8 producer on tcgen05: 112 CTAs x 64 rows, tokens on N. Four loader warps
+    """B>8 producer on tcgen05: ``n / 64`` CTAs x 64 rows, tokens on N. Four loader warps
     stream 128B-swizzled W [64, 64] and x [N, 64] K blocks through a cp.async ring
     (W of the first stages before the PDL wait, the rest prefetched to L2), the MMA
     warp accumulates D [64, N] FP32 in TMEM with M=64 kind::f16 MMAs, and the loader
     warps round D to BF16 and publish it like ``OprojProducer``."""
 
-    def __init__(self, k, *, twoshot=False, budget=184 * 1024):
-        super().__init__(k, staged_blocks=0, twoshot=twoshot)
+    def __init__(self, k, *, twoshot=False, budget=184 * 1024, n=7168):
+        super().__init__(k, staged_blocks=0, twoshot=twoshot, n=n)
         self.blocks, self.budget = k // 64, budget
 
     def geometry(self, batches):
@@ -389,7 +393,7 @@ class OprojUmma(OprojProducer):
 
     @cute.jit
     def __call__(self, *args):
-        launch(self.kernel, args, 112, 160, min_blocks_per_mp=1)
+        launch(self.kernel, args, self.n // 64, 160, min_blocks_per_mp=1)
 
     @cute.kernel
     def kernel(self, args):

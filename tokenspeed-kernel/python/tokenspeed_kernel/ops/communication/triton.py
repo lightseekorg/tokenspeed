@@ -19,6 +19,7 @@
 # SOFTWARE.
 
 import logging
+import math
 from dataclasses import dataclass
 from typing import Any, List, Tuple
 
@@ -1235,6 +1236,145 @@ def nvidia_rsag_all_gather(
         return output.clone() if safe else output
     finally:
         rsag_restore_hidden(state, hidden_size_bak, comm_buff_bak)
+
+
+# ------------------------------------------------------------------------------
+# Row reduce-scatter
+# ------------------------------------------------------------------------------
+
+
+def _row_tiles(width: int) -> tuple[int, int]:
+    """Power-of-two tiles that cover ``width`` with the fewest masked lanes."""
+    low = 1 << (width.bit_length() - 1)
+    if low == width:
+        return width // 2, width // 2
+    return low, triton.next_power_of_2(width - low)
+
+
+@triton.jit(do_not_specialize=["num_rows"])
+def _row_reduce_kernel(
+    buffer_ptrs,  # int64 [world]: every rank's partial buffer, in rank order
+    rows_ptr,  # int32 [num_rows]
+    out_ptr,  # [rows, n_cols] BF16
+    num_rows,
+    n_cols: tl.constexpr,
+    BLOCK0: tl.constexpr,
+    BLOCK1: tl.constexpr,
+    WORLD_SIZE: tl.constexpr,
+):
+    """One program per listed row: the ranks' BF16 partials of the row added
+    in FP32 rank order from +0.0 and rounded once."""
+    row = tl.load(rows_ptr + tl.program_id(0)).to(tl.int64)
+    col0 = tl.arange(0, BLOCK0)
+    col1 = BLOCK0 + tl.arange(0, BLOCK1)
+    mask0 = col0 < n_cols
+    mask1 = col1 < n_cols
+    acc0 = tl.zeros([BLOCK0], tl.float32)
+    acc1 = tl.zeros([BLOCK1], tl.float32)
+    for k in tl.static_range(WORLD_SIZE):
+        base = tl.load(buffer_ptrs + k).to(tl.pointer_type(tl.bfloat16)) + row * n_cols
+        acc0 += tl.load(base + col0, mask=mask0, other=0.0).to(tl.float32)
+        acc1 += tl.load(base + col1, mask=mask1, other=0.0).to(tl.float32)
+    out_ptr += row * n_cols
+    tl.store(out_ptr + col0, acc0.to(tl.bfloat16), mask=mask0)
+    tl.store(out_ptr + col1, acc1.to(tl.bfloat16), mask=mask1)
+
+
+_ROW_REDUCE_BUFFER_PTRS: dict[int, torch.Tensor] = {}
+
+
+def row_reduce_scatter(
+    state: TritonRSAGState, rows: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    """Sum chosen rows of every rank's partial into ``out``.
+
+    Each rank first writes its BF16 ``[T, H]`` partial into
+    ``state.comm_buff[:T]``. A barrier over the group makes every partial
+    visible; then this rank adds row ``r`` of each rank's buffer in FP32 rank
+    order from +0.0, rounds once and stores it to ``out[r]`` for every ``r``
+    in ``rows``. Other rows of ``out`` are not written. A rank must not
+    overwrite its buffer again until every rank has finished reading it (a
+    later group barrier orders that).
+
+    Args:
+        state: Triton RS/AG state of the group (its buffer holds the partials).
+        rows: Contiguous int32 row indices below ``T``; any subset, any order.
+        out: Contiguous BF16 ``[T, H]`` destination, ``H`` the state's width.
+
+    Returns:
+        ``out``.
+    """
+    rows_total, hidden = out.shape
+    if (
+        out.dtype != torch.bfloat16
+        or not out.is_contiguous()
+        or hidden != state.hidden_dim
+        or rows_total > state.max_token_num
+    ):
+        raise ValueError("row reduce-scatter writes contiguous BF16 [T, H] rows")
+    if rows.dtype != torch.int32 or not rows.is_contiguous():
+        raise ValueError("rows must be contiguous int32 indices")
+    handle = symm_mem.rendezvous(state.comm_buff, group=state.group)
+    handle.barrier(channel=0)
+    key = state.comm_buff.data_ptr()
+    if key not in _ROW_REDUCE_BUFFER_PTRS:
+        _ROW_REDUCE_BUFFER_PTRS[key] = torch.tensor(
+            handle.buffer_ptrs, dtype=torch.int64, device=out.device
+        )
+    if rows.numel() == 0:
+        return out
+    block0, block1 = _row_tiles(hidden)
+    _row_reduce_kernel[(rows.numel(),)](
+        _ROW_REDUCE_BUFFER_PTRS[key],
+        rows,
+        out,
+        rows.numel(),
+        n_cols=hidden,
+        BLOCK0=block0,
+        BLOCK1=block1,
+        WORLD_SIZE=state.world_size,
+        num_warps=8,
+    )
+    return out
+
+
+class MulticastRows:
+    """A symmetric BF16 buffer that every rank of a group receives.
+
+    A rank stores its rows through :meth:`multicast` (stores reach every
+    rank's copy), :meth:`barrier` waits until every rank's stores have
+    landed, and :meth:`local` reads this rank's copy. Views of one shape are
+    contiguous prefixes of the buffer. Creation rendezvouses the group (every
+    rank must build it, outside graph capture) and needs multicast memory.
+    """
+
+    def __init__(
+        self, group: dist.ProcessGroup, numel: int, device: torch.device
+    ) -> None:
+        from tokenspeed_kernel.ops.moe._cute_dsl.multicast_view import (
+            bf16_tensor_on_pointer,
+        )
+
+        with torch.inference_mode(False), torch.no_grad():
+            self._buffer = symm_mem.empty((numel,), dtype=torch.bfloat16, device=device)
+        self._handle = symm_mem.rendezvous(self._buffer, group=group)
+        if not self._handle.multicast_ptr:
+            raise RuntimeError("multicast rows need multicast memory over the group")
+        self._multicast = bf16_tensor_on_pointer(
+            self._handle.multicast_ptr, (numel,), (1,), self._buffer.device.index
+        )
+
+    def local(self, shape: tuple[int, ...]) -> torch.Tensor:
+        """This rank's copy, viewed as a contiguous ``shape``."""
+        return self._buffer[: math.prod(shape)].view(shape)
+
+    def multicast(self, shape: tuple[int, ...]) -> torch.Tensor:
+        """The multicast view of the same elements (stores reach every rank)."""
+        return self._multicast[: math.prod(shape)].view(shape)
+
+    def barrier(self) -> None:
+        """Wait until every rank has reached this point in stream order."""
+        self._handle.barrier(channel=0)
 
 
 # ------------------------------------------------------------------------------

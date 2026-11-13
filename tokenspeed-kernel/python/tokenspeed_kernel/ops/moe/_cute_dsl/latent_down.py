@@ -199,6 +199,25 @@ class MailboxPublish:
 
 
 @dataclass
+class AllReduceMailbox:
+    """This rank's view of a mailbox holding one partial per rank side by side.
+
+    A kernel that reduces the partials itself stores this rank's partial
+    through ``destination`` and polls and re-arms ``rows``.
+
+    Attributes:
+        rows: This rank's mailbox rows ``[tokens, width * ranks]``.
+        destination: This rank's partial slot ``[tokens, width]`` through the
+            multicast address; its rows are mailbox rows apart.
+        sentinel: The word the mailbox is armed with.
+    """
+
+    rows: torch.Tensor
+    destination: torch.Tensor
+    sentinel: int
+
+
+@dataclass
 class _MailboxSlot:
     """One symmetric mailbox plus the kernels bound to it."""
 
@@ -246,6 +265,10 @@ class _MulticastVaGemm:
                 (latent_size, 1),
                 device.index,
             )
+
+    def destination(self, tokens: int) -> torch.Tensor:
+        """This rank's ``[tokens, shard_dim]`` block through the multicast address."""
+        return self._block[:tokens]
 
     def __call__(
         self,
@@ -810,6 +833,24 @@ class KimiK3LatentDownOp:
             producer(hidden_states, weight, slot.mailbox, slot.multicast_ptr)
             pending = None
         return slot.mailbox[0, :tokens], pending
+
+    def all_reduce_mailbox(self, tokens: int) -> AllReduceMailbox:
+        """The slot of a kernel that publishes and reduces one partial per rank itself.
+
+        Args:
+            tokens: Rows of the batch, within :meth:`handles`.
+
+        Returns:
+            This rank's mailbox rows, its partial slot through the multicast
+            address, and the sentinel.
+        """
+        slot = self._slot
+        producer = slot.gemm_by_m[tokens]
+        if not isinstance(producer, _MulticastVaGemm):
+            raise ValueError("a fused producer's slot holds no partial slot to reduce")
+        return AllReduceMailbox(
+            slot.mailbox[0, :tokens], producer.destination(tokens), slot.sentinel
+        )
 
     def __call__(
         self,

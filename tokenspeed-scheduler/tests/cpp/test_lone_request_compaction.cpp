@@ -1169,7 +1169,7 @@ TEST_F(LoneRequestCompactionSuite, FirstAdmissionCompactionNeverClearsTheProbesT
                              StateStep{.kind = StateStep::Kind::kRotate});
         ASSERT_FALSE(coordinator.Admit(probe_now(), demands, RequestProgress{}, /*copy_in_blocks=*/{},
                                        /*copy_in_point=*/std::nullopt, /*request_access_epoch=*/std::nullopt,
-                                       /*evict_blocks_past_segments=*/true, /*session_id=*/{}));
+                                       /*evict_blocks_past_segments=*/true, /*session_id=*/{}, /*cache_group_id=*/{}));
         const HostCacheStats before = scheduler_->GetHostCacheStats();
         const std::optional<CacheCoordinator::AdmissionResult> compacted =
             coordinator.CompactLoneRequest(probe_now(), demands, RequestProgress{},
@@ -1200,7 +1200,7 @@ TEST_F(LoneRequestCompactionSuite, FirstAdmissionCompactionNeverClearsTheProbesT
         const std::optional<CacheCoordinator::AdmissionResult> admitted =
             coordinator.Admit(probe_now(), demands, RequestProgress{}, /*copy_in_blocks=*/{},
                               /*copy_in_point=*/std::nullopt, /*request_access_epoch=*/std::nullopt,
-                              /*evict_blocks_past_segments=*/true, /*session_id=*/{});
+                              /*evict_blocks_past_segments=*/true, /*session_id=*/{}, /*cache_group_id=*/{});
         ASSERT_TRUE(admitted);
         EXPECT_EQ(admitted->device_prefix_tokens, 94);
         EXPECT_TRUE(
@@ -1223,7 +1223,9 @@ TEST_F(LoneRequestCompactionSuite, FirstAdmissionCompactionNeverClearsTheProbesT
 // plan and copies the tail into its own block from page 24, not from the
 // moved block, whose copy lands with it.
 TEST_F(LoneRequestCompactionSuite, FirstAdmissionCompactionMovesTheProbesTailBlock) {
-    for (const bool write_back : {false, true}) {
+    for (const auto [write_back, grouped] :
+         {std::pair{false, false}, std::pair{false, true}, std::pair{true, false}, std::pair{true, true}}) {
+        SCOPED_TRACE(grouped ? "group owner" : "ungrouped");
         SCOPED_TRACE(write_back ? "write-back" : "no Host tier");
         LeaveATailBesideCache(/*parents=*/10, /*history_block_tokens=*/kP, /*x_tokens=*/43, write_back);
         CacheCoordinator& coordinator = SchedulerTestAccess::Coordinator(*scheduler_);
@@ -1243,7 +1245,11 @@ TEST_F(LoneRequestCompactionSuite, FirstAdmissionCompactionMovesTheProbesTailBlo
         ASSERT_EQ(pool.ResolveCacheBlockId(0, tail_at.front()), 24);
         const CacheKey tail_key = *index.KeyOf(pool, tail_at.front());
 
-        Submit(RequestSpec{.request_id = "R", .tokens = prompt, .max_new_tokens = 1});
+        Submit(RequestSpec{.request_id = "R",
+                           .session_id = grouped ? "cut" : "",
+                           .cache_group_id = grouped ? "teacher-group" : "",
+                           .tokens = prompt,
+                           .max_new_tokens = 1});
         const ExecutionPlan plan = PlanOnce();
         const ForwardBatch* batch = FindForwardBatch(plan);
         ASSERT_NE(batch, nullptr);
@@ -1269,6 +1275,12 @@ TEST_F(LoneRequestCompactionSuite, FirstAdmissionCompactionMovesTheProbesTailBlo
         Land(plan);
         AckWriteBacks(PlanOnce());
         EXPECT_EQ(scheduler_->RequestTokenSize("R"), -1);
+        if (grouped) {
+            // Compaction retries preserve group ownership: ending the cut
+            // cannot demote its cache, but ending the group can.
+            EXPECT_EQ(coordinator.DemoteSessions({"cut"}, true), 0u);
+            EXPECT_GT(coordinator.DemoteCacheGroups({"teacher-group"}, true), 0u);
+        }
     }
 }
 
@@ -1682,7 +1694,7 @@ TEST(LoneRequestCopyInCompactionTest, RePlacesAHeldCopyInBlockWithoutZeroingIt) 
     }
     ASSERT_FALSE(coordinator.Admit(coordinator.ProbePrefix({}), demands, progress, copy_in,
                                    /*copy_in_point=*/std::nullopt, admitted->access_epoch,
-                                   /*evict_blocks_past_segments=*/true, /*session_id=*/{}));
+                                   /*evict_blocks_past_segments=*/true, /*session_id=*/{}, /*cache_group_id=*/{}));
     const std::optional<CacheCoordinator::AdmissionResult> compacted = coordinator.CompactLoneRequest(
         coordinator.ProbePrefix({}), demands, progress, copy_in, /*copy_in_point=*/std::nullopt);
     ASSERT_TRUE(compacted);
@@ -1694,9 +1706,9 @@ TEST(LoneRequestCopyInCompactionTest, RePlacesAHeldCopyInBlockWithoutZeroingIt) 
     EXPECT_EQ(coordinator.LoneCompactions(), 1u);
     EXPECT_EQ(coordinator.LoneCompactionMoves(), 1u);
     EXPECT_EQ(coordinator.DeviceEvictions().compaction.blocks, 1u);
-    const std::optional<CacheCoordinator::AdmissionResult> retried =
-        coordinator.Admit(coordinator.ProbePrefix({}), demands, progress, copy_in, /*copy_in_point=*/std::nullopt,
-                          admitted->access_epoch, /*evict_blocks_past_segments=*/true, /*session_id=*/{});
+    const std::optional<CacheCoordinator::AdmissionResult> retried = coordinator.Admit(
+        coordinator.ProbePrefix({}), demands, progress, copy_in, /*copy_in_point=*/std::nullopt, admitted->access_epoch,
+        /*evict_blocks_past_segments=*/true, /*session_id=*/{}, /*cache_group_id=*/{});
     ASSERT_TRUE(retried);
     EXPECT_EQ(retried->pages_to_copy[0], (std::vector<std::pair<std::int32_t, std::int32_t>>{{4, 17}}));
     // The plan carries both results: no page one of them copies into is
@@ -1760,7 +1772,7 @@ TEST(LoneRequestWindowCompactionTest, VacatesAParentBesideAnExpiredBlockTheRetry
     const RequestProgress progress{.num_computed_tokens = 23};
     ASSERT_FALSE(coordinator.Admit(coordinator.ProbePrefix({}), demands, progress, /*copy_in_blocks=*/{},
                                    /*copy_in_point=*/std::nullopt, /*request_access_epoch=*/std::nullopt,
-                                   /*evict_blocks_past_segments=*/true, /*session_id=*/{}));
+                                   /*evict_blocks_past_segments=*/true, /*session_id=*/{}, /*cache_group_id=*/{}));
     const std::optional<CacheCoordinator::AdmissionResult> compacted = coordinator.CompactLoneRequest(
         coordinator.ProbePrefix({}), demands, progress, /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt);
     ASSERT_TRUE(compacted);
@@ -1776,7 +1788,7 @@ TEST(LoneRequestWindowCompactionTest, VacatesAParentBesideAnExpiredBlockTheRetry
 
     ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, progress, /*copy_in_blocks=*/{},
                                   /*copy_in_point=*/std::nullopt, /*request_access_epoch=*/std::nullopt,
-                                  /*evict_blocks_past_segments=*/true, /*session_id=*/{}));
+                                  /*evict_blocks_past_segments=*/true, /*session_id=*/{}, /*cache_group_id=*/{}));
     EXPECT_FALSE(r[0].Blocks()[0]);
     EXPECT_EQ(pool.BoundGroup(4), std::optional<std::uint32_t>{1u});
     EXPECT_EQ(coordinator.Allocator(1).ResolveCacheBlockId(*r[1].Blocks()[1]), 4);
@@ -1834,7 +1846,7 @@ TEST(LoneRequestBucketCompactionTest, ZeroesOnlyThePageADisplacedBlockEndsOn) {
     const RequestProgress progress{.num_computed_tokens = 56};
     ASSERT_FALSE(coordinator.Admit(coordinator.ProbePrefix({}), demands, progress, /*copy_in_blocks=*/{},
                                    /*copy_in_point=*/std::nullopt, /*request_access_epoch=*/std::nullopt,
-                                   /*evict_blocks_past_segments=*/true, /*session_id=*/{}));
+                                   /*evict_blocks_past_segments=*/true, /*session_id=*/{}, /*cache_group_id=*/{}));
     const std::optional<CacheCoordinator::AdmissionResult> compacted = coordinator.CompactLoneRequest(
         coordinator.ProbePrefix({}), demands, progress, /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt);
     ASSERT_TRUE(compacted);
@@ -1845,7 +1857,7 @@ TEST(LoneRequestBucketCompactionTest, ZeroesOnlyThePageADisplacedBlockEndsOn) {
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), 2);
     EXPECT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, progress, /*copy_in_blocks=*/{},
                                   /*copy_in_point=*/std::nullopt, /*request_access_epoch=*/std::nullopt,
-                                  /*evict_blocks_past_segments=*/true, /*session_id=*/{}));
+                                  /*evict_blocks_past_segments=*/true, /*session_id=*/{}, /*cache_group_id=*/{}));
     EXPECT_TRUE(CacheCoordinatorTestAccess::BoundaryTreeMismatches(coordinator).empty());
 }
 
@@ -1882,7 +1894,7 @@ TEST(LoneRequestBucketCompactionTest, VacatesAParentOfFreeBlocksFirstAmongEquall
         return coordinator
             .Admit(coordinator.ProbePrefix({}), demands, progress, /*copy_in_blocks=*/{},
                    /*copy_in_point=*/std::nullopt, /*request_access_epoch=*/std::nullopt,
-                   /*evict_blocks_past_segments=*/true, /*session_id=*/{})
+                   /*evict_blocks_past_segments=*/true, /*session_id=*/{}, /*cache_group_id=*/{})
             .has_value();
     };
     std::vector<std::vector<BlockTable>> others(6, std::vector<BlockTable>(2));
@@ -1911,7 +1923,7 @@ TEST(LoneRequestBucketCompactionTest, VacatesAParentOfFreeBlocksFirstAmongEquall
     const RequestProgress progress{.num_computed_tokens = 2 * kP};
     ASSERT_FALSE(coordinator.Admit(coordinator.ProbePrefix({}), demands, progress, /*copy_in_blocks=*/{},
                                    /*copy_in_point=*/std::nullopt, /*request_access_epoch=*/std::nullopt,
-                                   /*evict_blocks_past_segments=*/true, /*session_id=*/{}));
+                                   /*evict_blocks_past_segments=*/true, /*session_id=*/{}, /*cache_group_id=*/{}));
     const std::optional<CacheCoordinator::AdmissionResult> compacted = coordinator.CompactLoneRequest(
         coordinator.ProbePrefix({}), demands, progress, /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt);
     ASSERT_TRUE(compacted);
@@ -1922,7 +1934,7 @@ TEST(LoneRequestBucketCompactionTest, VacatesAParentOfFreeBlocksFirstAmongEquall
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), 1);
     EXPECT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, progress, /*copy_in_blocks=*/{},
                                   /*copy_in_point=*/std::nullopt, /*request_access_epoch=*/std::nullopt,
-                                  /*evict_blocks_past_segments=*/true, /*session_id=*/{}));
+                                  /*evict_blocks_past_segments=*/true, /*session_id=*/{}, /*cache_group_id=*/{}));
     EXPECT_EQ(pool.BoundGroup(2), std::optional<std::uint32_t>{1u});
     EXPECT_TRUE(CacheCoordinatorTestAccess::BoundaryTreeMismatches(coordinator).empty());
 }
@@ -1974,7 +1986,7 @@ TEST(LoneRequestBucketCompactionTest, ReplacesADisplacedBlockInItsOwnParentFirst
     const RequestProgress progress{.num_computed_tokens = 5 * kP};
     ASSERT_FALSE(coordinator.Admit(coordinator.ProbePrefix({}), demands, progress, /*copy_in_blocks=*/{},
                                    /*copy_in_point=*/std::nullopt, /*request_access_epoch=*/std::nullopt,
-                                   /*evict_blocks_past_segments=*/true, /*session_id=*/{}));
+                                   /*evict_blocks_past_segments=*/true, /*session_id=*/{}, /*cache_group_id=*/{}));
     const std::optional<CacheCoordinator::AdmissionResult> compacted = coordinator.CompactLoneRequest(
         coordinator.ProbePrefix({}), demands, progress, /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt);
     ASSERT_TRUE(compacted);
@@ -1986,7 +1998,7 @@ TEST(LoneRequestBucketCompactionTest, ReplacesADisplacedBlockInItsOwnParentFirst
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), 1);
     EXPECT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, progress, /*copy_in_blocks=*/{},
                                   /*copy_in_point=*/std::nullopt, /*request_access_epoch=*/std::nullopt,
-                                  /*evict_blocks_past_segments=*/true, /*session_id=*/{}));
+                                  /*evict_blocks_past_segments=*/true, /*session_id=*/{}, /*cache_group_id=*/{}));
     EXPECT_EQ(pool.BoundGroup(9), std::optional<std::uint32_t>{1u});
     EXPECT_TRUE(CacheCoordinatorTestAccess::BoundaryTreeMismatches(coordinator).empty());
 }

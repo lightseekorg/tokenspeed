@@ -145,6 +145,10 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     data_parallel_rank: int | None = None
     # Router-only cache retention identity; no prompt concatenation.
     cache_session_id: str | None = None
+    # Shared cache ownership across independent sessions; no prompt concatenation.
+    cache_group_id: str | None = None
+    # Bounded remote checkpoint hints; actual input tokens still determine keys.
+    shared_prefix_tokens: list[int] = []
     # array_like declaration order is the wire contract; append new fields here.
 
 
@@ -216,6 +220,58 @@ class BatchTokenIDOutSlim(BaseBatchReq, kw_only=True):
     # Cumulative reasoning tokens per request, excluding structural markers.
     # Appended wire tail: older producers omit it and decode as [].
     reasoning_tokens: list[int] = []
+
+
+class GetAdmissionReqInput(BaseReq, kw_only=True):
+    """Poll native allocator capacity and supported cache-group ownership."""
+
+
+class GetAdmissionReqOutput(BaseReq, kw_only=True):
+    success: bool
+    dp_rank: int
+    contract_version: int
+    free_slots: int
+    total_slots: int
+    available_blocks: int
+    total_blocks: int
+    host_free_blocks: int
+    host_total_blocks: int
+    retracted: int
+    waiting: int
+    max_tokens: int
+    capacity_token_step: int
+    capacity_blocks: list[int]
+    # Older native engines omit this append-only capability field.
+    cache_group_contract: int = 0
+    shared_prefix_publication_contract: int = 0
+    shared_prefix_storage_enabled: bool = False
+
+
+class GetSharedPrefixPublicationReqInput(BaseReq, kw_only=True):
+    query_id: str
+    input_ids: list[int]
+    max_prefix_tokens: int
+
+
+class GetSharedPrefixPublicationReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+    query_id: str
+    dp_rank: int
+    status: str
+    confirmed_prefix_tokens: int
+    storage_namespace: str
+    cache_epoch: int
+
+
+class DemoteCacheGroupsReqInput(BaseReq, kw_only=True):
+    cache_group_ids: list[str]
+    ended: bool
+
+
+class DemoteCacheGroupsReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
 
 
 class FlushCacheReqInput(BaseReq, kw_only=True):

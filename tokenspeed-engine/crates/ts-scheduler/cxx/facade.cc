@@ -28,6 +28,7 @@
 #include <variant>
 #include <vector>
 
+#include "core/profile_span.h"
 #include "scheduler/execution_event.h"
 #include "ts-scheduler/src/lib.rs.h"
 
@@ -49,19 +50,29 @@ std::vector<std::int32_t> to_std(rust::Slice<const std::int32_t> values) {
     return {values.begin(), values.end()};
 }
 
+void record_profile_span(const char* name, std::int64_t begin_ns, std::int64_t end_ns) {
+    record_scheduler_span(rust::Str(name), begin_ns, end_ns);
+}
+
 }  // namespace
 
 void submit_requests(tokenspeed::Scheduler& scheduler, rust::Slice<const RequestSpec> specs) {
     std::vector<tokenspeed::RequestSpec> converted;
-    converted.reserve(specs.size());
-    for (const RequestSpec& spec : specs) {
-        converted.push_back(tokenspeed::RequestSpec{
-            .request_id = std::string(spec.request_id),
-            .session_id = std::string(spec.session_id),
-            .tokens = to_std({spec.tokens.data(), spec.tokens.size()}),
-            .max_new_tokens = spec.max_new_tokens,
-            .max_cached_prefix_tokens = spec.max_cached_prefix_tokens,
-        });
+    {
+        // Each prompt is copied across the bridge.
+        tokenspeed::ProfileSpan profile_span{"copyRequestSpecs"};
+        converted.reserve(specs.size());
+        for (const RequestSpec& spec : specs) {
+            converted.push_back(tokenspeed::RequestSpec{
+                .request_id = std::string(spec.request_id),
+                .session_id = std::string(spec.session_id),
+                .cache_group_id = std::string(spec.cache_group_id),
+                .shared_prefix_tokens = to_std({spec.shared_prefix_tokens.data(), spec.shared_prefix_tokens.size()}),
+                .tokens = to_std({spec.tokens.data(), spec.tokens.size()}),
+                .max_new_tokens = spec.max_new_tokens,
+                .max_cached_prefix_tokens = spec.max_cached_prefix_tokens,
+            });
+        }
     }
     scheduler.SubmitRequests(converted);
 }
@@ -184,8 +195,25 @@ std::size_t demote_sessions(tokenspeed::Scheduler& scheduler, rust::Slice<const 
     return scheduler.DemoteSessions(session_ids, ended);
 }
 
+std::size_t demote_cache_groups(tokenspeed::Scheduler& scheduler, rust::Slice<const rust::String> ids, bool ended) {
+    std::vector<std::string> group_ids;
+    for (const auto& id : ids) group_ids.emplace_back(id);
+    return scheduler.DemoteCacheGroups(group_ids, ended);
+}
+
 std::size_t demote_session(tokenspeed::Scheduler& scheduler, rust::Str session_id, bool ended) {
     return scheduler.DemoteSession(std::string(session_id), ended);
+}
+
+bool shared_prefix_storage_enabled(const tokenspeed::Scheduler& scheduler) {
+    return scheduler.SharedPrefixStorageEnabled();
+}
+
+SharedPrefixPublication shared_prefix_publication(const tokenspeed::Scheduler& scheduler,
+                                                  rust::Slice<const std::int32_t> input_ids,
+                                                  std::int32_t max_prefix_tokens) {
+    const auto result = scheduler.GetSharedPrefixPublication({input_ids.data(), input_ids.size()}, max_prefix_tokens);
+    return SharedPrefixPublication{rust::String(result.status), result.confirmed_prefix_tokens, result.cache_epoch};
 }
 
 AdmissionSnapshot admission_snapshot(const tokenspeed::Scheduler& scheduler, std::int32_t token_step) {
@@ -546,6 +574,10 @@ rust::Vec<StorageOpView> plan_storage_ops(const tokenspeed::ExecutionPlan& plan)
             *storage);
     }
     return out;
+}
+
+void set_profile_span_sink(bool installed) {
+    tokenspeed::SetProfileSpanSink(installed ? &record_profile_span : nullptr);
 }
 
 }  // namespace ts_scheduler

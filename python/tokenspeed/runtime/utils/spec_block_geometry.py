@@ -42,7 +42,9 @@ __all__ = [
     "BLOCK_SPEC_RULES",
     "count_dspark_stages",
     "read_checkpoint_block_size",
+    "resolve_block_sample_from_anchor",
     "resolve_block_widths",
+    "resolve_draft_query_width",
     "validate_block_widths",
 ]
 
@@ -60,6 +62,41 @@ _BLOCK_SIZE_KEYS = ("dspark_block_size", "block_size")
 _NESTED_CONFIG_KEYS = ("dflash_config", "dspark_config")
 #: Rows the checkpoint's block_size counts beyond the drafted tokens.
 _STEP_OFFSET = {"DSPARK": 0, "DFLASH": 1}
+_SAMPLE_FROM_ANCHOR = {"DSPARK": True, "DFLASH": False}
+
+
+def resolve_block_sample_from_anchor(algorithm: str, *configs: Any) -> bool:
+    """Resolve the draft's query-to-proposal layout from checkpoint metadata.
+
+    Args:
+        algorithm: Block drafting algorithm, used for older checkpoints.
+        *configs: Draft configs, most specific first.
+
+    Returns:
+        Whether the anchor query predicts the first proposed token.
+    """
+    for config in configs:
+        value = getattr(config, "sample_from_anchor", None)
+        if value is not None:
+            if not isinstance(value, bool):
+                raise ValueError("sample_from_anchor must be a boolean")
+            return value
+    return _SAMPLE_FROM_ANCHOR[algorithm]
+
+
+def resolve_draft_query_width(verify_width: int, sample_from_anchor: bool) -> int:
+    """Return query rows per request for a block draft.
+
+    Args:
+        verify_width: Anchor plus proposed tokens, at least two.
+        sample_from_anchor: Whether row zero predicts the first proposal.
+
+    Returns:
+        Query rows, including the anchor when it has no proposal output.
+    """
+    if verify_width < 2:
+        raise ValueError("Block drafting requires a verify width of at least two")
+    return verify_width - 1 if sample_from_anchor else verify_width
 
 
 def count_dspark_stages(
