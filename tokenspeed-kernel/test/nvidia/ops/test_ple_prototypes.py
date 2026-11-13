@@ -314,6 +314,46 @@ def test_conv_runtime_bounds(lengths, write_final, windows, pdl):
             torch.testing.assert_close(scratch, expected_windows, rtol=0, atol=0)
 
 
+def test_conv_state_large_request_offset(pdl):
+    channels, state = 4097, 9
+    batch = 2**31 // (channels * state) + 2
+    carried = torch.randn((1, channels, state), device="cuda", dtype=torch.bfloat16)
+    initial = torch.empty((batch, channels, state), device="cuda", dtype=torch.bfloat16)
+    initial[-1].copy_(carried[0])
+    values = torch.randn((1, channels), device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn((channels, 4), device="cuda", dtype=torch.bfloat16)
+    col = torch.zeros(1, device="cuda", dtype=torch.int64)
+    lengths = torch.zeros(batch, device="cuda", dtype=torch.int64)
+    lengths[-1] = 1
+    starts = torch.zeros_like(lengths)
+
+    def run(history, request, lens, offsets, count):
+        windows = torch.empty((1, channels, state), device="cuda", dtype=torch.bfloat16)
+        return ple_conv_sequences(
+            values,
+            history,
+            weight,
+            request,
+            col,
+            lens,
+            offsets,
+            total_tokens=1,
+            batch_size=count,
+            dilation=3,
+            kernel_size=4,
+            state_len=state,
+            write_final=False,
+            weights_independent=True,
+            windows=windows,
+            scatter_windows=False,
+        )
+
+    expected = run(carried, col, lengths[-1:], col, 1)
+    actual = run(initial, col + batch - 1, lengths, starts, batch)
+    torch.testing.assert_close(actual[0], expected[0], atol=0, rtol=0)
+    torch.testing.assert_close(actual[2], expected[2], atol=0, rtol=0)
+
+
 def test_conv_reuses_specialization_across_shapes(pdl, monkeypatch):
     import tokenspeed_kernel.ops.ple as ple
 

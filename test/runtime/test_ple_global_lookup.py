@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""CPU/Gloo tests; no CUDA kernel packages are needed for the query layout."""
+"""Lookup layout and CUDA stream handoff tests."""
 
 import importlib.util
 from datetime import timedelta
@@ -212,3 +212,45 @@ def test_lookup_rejects_invalid_ids(ids):
 def test_lookup_rejects_invalid_physical_extents(sizes):
     with pytest.raises(ValueError):
         ple_lookup.LookupTokenLayout(sizes)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
+@pytest.mark.parametrize("tokens", [1, 4095, 4096, 8192])
+def test_host_lookup_stream_handoff(tokens):
+    mapping = _mapping_class()(rank=0, world_size=1, attn_tp_size=1, attn_dp_size=1)
+    lookup = ple_lookup.PLELookup(
+        mapping,
+        vocab_size=256,
+        ngram_heads=16,
+        head_dim=160,
+        storage_dtype=None,
+        output_dtype=torch.bfloat16,
+        offload=True,
+        prefix="",
+    )
+    table = torch.randn(256, 160, dtype=torch.bfloat16)
+    lookup.ngram_embedding.weight.data.copy_(table)
+    ids = (
+        torch.arange(tokens * 16, device="cuda", dtype=torch.int64).view(tokens, 16)
+        % 256
+    )
+    layout = lookup.make_layout(None, tokens)
+    consumer = torch.cuda.Stream()
+
+    def run():
+        pending = lookup.start(ids, layout)
+        with torch.cuda.stream(consumer):
+            result = lookup.finish(pending).clone()
+        torch.cuda.current_stream().wait_stream(consumer)
+        return result
+
+    result = run()
+    expected = table[ids.cpu()].reshape(tokens, -1)
+    torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        result = run()
+    ids.add_(7).remainder_(256)
+    graph.replay()
+    expected = table[ids.cpu()].reshape(tokens, -1)
+    torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)

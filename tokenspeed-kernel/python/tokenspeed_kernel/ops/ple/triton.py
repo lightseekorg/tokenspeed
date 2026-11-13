@@ -295,7 +295,7 @@ def _ple_page_scatter_kernel(
 
 
 @triton.jit
-def _ple_host_gather_kernel(
+def _ple_host_gather_rows(
     table_address,
     ids_ptr,
     scale_value,
@@ -304,12 +304,16 @@ def _ple_host_gather_kernel(
     head_dim,
     vocab_start,
     vocab_end,
+    row,
+    rows,
+    destination_ptr,
     IS_FP8: tl.constexpr,
     HAS_SCALE: tl.constexpr,
     ROW_SCALE: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    SORTED: tl.constexpr,
 ):
-    """Gather one n-gram row per program straight out of pinned host memory.
+    """Gather a tile of n-gram rows straight out of pinned host memory.
 
     ``table_address`` is the host allocation's base address, not a device
     tensor: under unified addressing a page-locked host pointer is a valid
@@ -327,9 +331,8 @@ def _ple_host_gather_kernel(
     it here -- before the reduce -- stays correct under tensor parallelism.
     """
 
-    row = tl.program_id(0)
-    global_id = tl.load(ids_ptr + row)
-    in_range = (global_id >= vocab_start) & (global_id < vocab_end)
+    global_id = tl.load(ids_ptr + row, mask=row < rows, other=0).to(tl.int64)
+    in_range = (row < rows) & (global_id >= vocab_start) & (global_id < vocab_end)
     local_id = tl.where(in_range, global_id - vocab_start, 0)
     offsets = tl.arange(0, BLOCK_D)
     mask = offsets < head_dim
@@ -339,18 +342,108 @@ def _ple_host_gather_kernel(
     else:
         table = table_address.to(tl.int64).to(tl.pointer_type(out_dtype))
     values = tl.load(
-        table + local_id * head_dim + offsets, mask=mask & in_range, other=0.0
+        table + local_id[:, None] * head_dim + offsets[None, :],
+        mask=mask[None, :] & in_range[:, None],
+        other=0.0,
     ).to(tl.float32)
     if HAS_SCALE:
         if ROW_SCALE:
-            values = values * tl.load(scale_ptr + local_id, mask=in_range, other=0.0)
+            values = (
+                values
+                * tl.load(scale_ptr + local_id, mask=in_range, other=0.0)[:, None]
+            )
         else:
             values = values * scale_value
-    tl.store(
-        out_ptr + row * head_dim + offsets,
-        tl.where(in_range, values, 0.0).to(out_dtype),
-        mask=mask,
+    destination = (
+        tl.load(destination_ptr + row, row < rows, other=0).to(tl.int64)
+        if SORTED
+        else row
     )
+    tl.store(
+        out_ptr + destination[:, None] * head_dim + offsets[None, :],
+        tl.where(in_range[:, None], values, 0.0).to(out_dtype),
+        mask=(row[:, None] < rows) & mask[None, :],
+    )
+
+
+@triton.jit
+def _ple_host_gather_kernel(
+    table_address,
+    ids_ptr,
+    scale_value,
+    scale_ptr,
+    out_ptr,
+    head_dim,
+    vocab_start,
+    vocab_end,
+    rows,
+    IS_FP8: tl.constexpr,
+    HAS_SCALE: tl.constexpr,
+    ROW_SCALE: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64) * BLOCK_R + tl.arange(0, BLOCK_R)
+    _ple_host_gather_rows(
+        table_address,
+        ids_ptr,
+        scale_value,
+        scale_ptr,
+        out_ptr,
+        head_dim,
+        vocab_start,
+        vocab_end,
+        row,
+        rows,
+        ids_ptr,
+        IS_FP8,
+        HAS_SCALE,
+        ROW_SCALE,
+        BLOCK_D,
+        False,
+    )
+
+
+@triton.jit(do_not_specialize=["rows", "grid"])
+def _ple_host_gather_persistent_kernel(
+    table_address,
+    ids_ptr,
+    scale_value,
+    scale_ptr,
+    out_ptr,
+    head_dim,
+    vocab_start,
+    vocab_end,
+    rows,
+    grid,
+    destination_ptr,
+    IS_FP8: tl.constexpr,
+    HAS_SCALE: tl.constexpr,
+    ROW_SCALE: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    SORTED: tl.constexpr,
+):
+    for base in tl.range(tl.program_id(0).to(tl.int64) * BLOCK_R, rows, grid * BLOCK_R):
+        row = base + tl.arange(0, BLOCK_R)
+        _ple_host_gather_rows(
+            table_address,
+            ids_ptr,
+            scale_value,
+            scale_ptr,
+            out_ptr,
+            head_dim,
+            vocab_start,
+            vocab_end,
+            row,
+            rows,
+            destination_ptr,
+            IS_FP8,
+            HAS_SCALE,
+            ROW_SCALE,
+            BLOCK_D,
+            SORTED,
+        )
 
 
 @triton.jit
@@ -454,25 +547,26 @@ def _ple_dilated_conv_kernel(
         if SCATTER_WINDOWS:
             wrow = req * windows_block_rows + 1 + col
         win_dtype = windows_ptr.dtype.element_ty
-        for s in tl.static_range(STATE):
-            v = col + 1 + s
-            from_state = v < STATE
-            tok_idx = tl.maximum(start + (v - STATE), 0)
-            w_state = tl.load(
-                initial_ptr + (req * C + ch) * STATE + v,
-                mask=cmask & from_state,
-                other=0.0,
-            ).to(win_dtype)
-            w_tok = tl.load(
-                values_ptr + tok_idx * C + ch,
-                mask=cmask & (~from_state),
-                other=0.0,
-            ).to(win_dtype)
-            tl.store(
-                windows_ptr + (wrow * C + ch) * STATE + s,
-                tl.where(from_state, w_state, w_tok),
-                mask=cmask,
-            )
+        state_col = tl.arange(0, triton.next_power_of_2(STATE))
+        v = col + 1 + state_col
+        from_state = v < STATE
+        valid = cmask[:, None] & (state_col[None, :] < STATE)
+        tok_idx = tl.maximum(start + v - STATE, 0)
+        w_state = tl.load(
+            initial_ptr + (req * C + ch[:, None]) * STATE + v[None, :],
+            mask=valid & from_state[None, :],
+            other=0.0,
+        )
+        w_tok = tl.load(
+            values_ptr + tok_idx[None, :] * C + ch[:, None],
+            mask=valid & ~from_state[None, :],
+            other=0.0,
+        )
+        tl.store(
+            windows_ptr + (wrow * C + ch[:, None]) * STATE + state_col[None, :],
+            tl.where(from_state[None, :], w_state, w_tok).to(win_dtype),
+            mask=valid,
+        )
 
 
 @triton.jit
