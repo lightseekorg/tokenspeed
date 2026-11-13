@@ -894,6 +894,10 @@ def test_non_iris_moe_tail_materializes_a_sharded_residual(monkeypatch, rows):
     assert stage2.call_count == 1 and stage2.call_args.args[2] is full
 
 
+# The decode rows at which the gfx950 A8W4 MoE takes an upstream sort.
+_SORTED_ROUTE_ROWS = frozenset(range(8, 193))
+
+
 class _Gate:
     """The router gate: fixed FP32 logits and the selection bias."""
 
@@ -925,9 +929,15 @@ def test_fused_routing_hands_its_sort_to_the_experts(rows):
     fallback = (torch.zeros(rows, 16), torch.zeros(rows, 16))
     moe = _make_moe(_SpyFork(), num_tokens=rows)
     moe.gate = _Gate(logits, bias)
-    moe.config = SimpleNamespace(moe_renormalize=True)
-    moe.routed_scaling_factor = 2.827
-    moe.topk = mock.Mock(return_value=fallback, simulate_routing=False)
+    moe.topk = mock.Mock(
+        return_value=fallback,
+        simulate_routing=False,
+        topk_config=SimpleNamespace(
+            correction_bias=bias, routed_scaling_factor=2.827, renormalize=True
+        ),
+    )
+    moe.experts.sorted_route_rows = _SORTED_ROUTE_ROWS
+    moe.experts.sorted_route_block_size = 16
     moe._fused_routing_scratch = kimi3_sorted_routing_scratch(torch.device("cuda"))
     moe.experts._situ_sorted_routes = ("stale",)
     handed = []
@@ -978,7 +988,6 @@ def test_fused_routing_carries_the_shared_down_projection(monkeypatch, rows):
 
     from tokenspeed.runtime.models import kimi_k3 as mod
 
-    monkeypatch.setattr(mod, "_FUSED_ROUTING_MAX_ROWS", 192)
     generator = torch.Generator(device="cuda").manual_seed(rows)
     logits = torch.randn((rows, 896), generator=generator, device="cuda")
     bias = torch.randn((896,), generator=generator, device="cuda") * 0.01
@@ -991,12 +1000,15 @@ def test_fused_routing_carries_the_shared_down_projection(monkeypatch, rows):
     shared_out = torch.full((rows, 7168), -7.0, dtype=torch.bfloat16, device="cuda")
     moe = _make_moe(_SpyFork(), num_tokens=rows)
     moe.gate = _Gate(logits, bias)
-    moe.config = SimpleNamespace(moe_renormalize=True)
-    moe.routed_scaling_factor = 2.827
     moe.topk = mock.Mock(
         return_value=(torch.zeros(rows, 16), torch.zeros(rows, 16)),
         simulate_routing=False,
+        topk_config=SimpleNamespace(
+            correction_bias=bias, routed_scaling_factor=2.827, renormalize=True
+        ),
     )
+    moe.experts.sorted_route_rows = _SORTED_ROUTE_ROWS
+    moe.experts.sorted_route_block_size = 16
     moe._fused_routing_scratch = kimi3_sorted_routing_scratch(torch.device("cuda"))
     moe.shared_experts = SimpleNamespace(down_proj=SimpleNamespace(weight=down_weight))
     projections = mock.Mock(return_value=(logits, torch.zeros(rows, 4), shared_input))
