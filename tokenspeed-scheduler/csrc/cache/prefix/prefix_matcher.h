@@ -108,10 +108,12 @@ public:
 // below the window, so match bound-first.
 class SwaMatcher : public PrefixMatcher {
 public:
-    SwaMatcher(std::int32_t block_granularity, std::int32_t sliding_window)
-        : block_granularity_{block_granularity}, sliding_window_{sliding_window} {
+    SwaMatcher(std::int32_t block_granularity, std::int32_t sliding_window, std::int32_t sink_tokens)
+        : block_granularity_{block_granularity}, sliding_window_{sliding_window}, sink_blocks_{0} {
         _assert(block_granularity > 0, "block_granularity must be > 0");
         _assert(sliding_window > 0, "sliding_window must be > 0");
+        _assert(sink_tokens >= 0, "sink_tokens must be non-negative");
+        sink_blocks_ = sink_tokens / block_granularity + (sink_tokens % block_granularity != 0);
     }
 
     bool IsPrefixClosed() const override { return false; }
@@ -121,15 +123,30 @@ public:
     GroupPrefixProbe Probe(const PrefixCacheIndex& index, const BlockPool& pool, std::span<const CacheKey> keys,
                            std::int32_t begin_blocks, std::int32_t max_blocks,
                            const std::unordered_set<CacheKey, CacheKeyHash>* extra_hits) const override {
-        const std::int32_t end_blocks =
+        std::int32_t end_blocks =
             static_cast<std::int32_t>(std::min(keys.size(), static_cast<std::size_t>(std::max(max_blocks, 0))));
         GroupPrefixProbe probe;
         if (begin_blocks >= end_blocks) {
             return probe;
         }
+        // A missing head block rules out every boundary beyond that block.
+        // Slots below begin_blocks are supplied by the preceding tier.
+        for (std::int32_t i = begin_blocks; i < std::min(sink_blocks_, end_blocks); ++i) {
+            if (!PrefixKeyIsHit(index, pool, keys[static_cast<std::size_t>(i)], extra_hits)) {
+                end_blocks = i;
+                break;
+            }
+        }
+        const auto mark_sink = [&] {
+            const auto end = std::min(sink_blocks_, begin_blocks + static_cast<std::int32_t>(probe.hits.size()));
+            for (std::int32_t i = begin_blocks; i < end; ++i) {
+                probe.hits[static_cast<std::size_t>(i - begin_blocks)] = 1;
+            }
+        };
         // W == 1: no lookback, so every boundary is resumable with no cached page at all.
         if (pagesNeededToResume() == 0) {
             probe.hits.resize(static_cast<std::size_t>(end_blocks - begin_blocks));
+            mark_sink();
             return probe;
         }
         const auto [boundary, hits_begin] = findResumableBoundary(
@@ -142,6 +159,7 @@ public:
         for (std::int32_t i = hits_begin; i < boundary; ++i) {
             probe.hits[static_cast<std::size_t>(i - begin_blocks)] = 1;
         }
+        mark_sink();
         return probe;
     }
 
@@ -181,6 +199,7 @@ private:
 
     std::int32_t block_granularity_;
     std::int32_t sliding_window_;
+    std::int32_t sink_blocks_;
 };
 
 }  // namespace tokenspeed

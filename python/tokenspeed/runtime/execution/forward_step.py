@@ -185,6 +185,12 @@ def prepare_draft_extend_metadata(
     """
     draft_seq_lens = drafter.draft_seq_lens_buf[:padded_bs]
     draft_seq_lens.copy_(seq_lens[:padded_bs])
+    if not draft_attn_backend.query_sharded:
+        # A sharded target may have an unsharded draft (``draft_unsharded`` in
+        # ``model_wide_kwargs``): passing the target's plan on would claim a
+        # sharding the draft never sees, and a backend that cannot attend one
+        # refuses it (``reject_query_shard``).
+        kwargs = {**kwargs, "query_shard": None}
     draft_attn_backend.init_forward_metadata(
         bs=padded_bs,
         num_extends=num_extends,
@@ -1119,16 +1125,6 @@ class ForwardStepRunner:
             [active_req_pool_indices, active_req_pool_indices.new_zeros(pad)]
         )
 
-    def _set_graph_state_write_indices(
-        self, active_req_pool_indices: torch.Tensor, padded_bs: int
-    ) -> None:
-        state_indices = self.input_buffers.state_write_req_pool_indices_buf[:padded_bs]
-        active_bs = active_req_pool_indices.shape[0]
-        if active_bs > 0:
-            state_indices[:active_bs].copy_(active_req_pool_indices)
-        if active_bs < padded_bs:
-            state_indices[active_bs:padded_bs].fill_(int(self.config.max_req_pool_size))
-
     def __call__(
         self,
         bs: int,
@@ -1202,7 +1198,6 @@ class ForwardStepRunner:
             req_pool_indices = self.input_buffers.req_pool_indices_buf[:padded_bs]
 
         if use_graph:
-            self._set_graph_state_write_indices(active_req_pool_indices, padded_bs)
             self._prepare_request_token_history_graph_inputs(
                 active_bs=bs, padded_bs=padded_bs
             )

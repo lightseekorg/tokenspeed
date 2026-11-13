@@ -333,7 +333,8 @@ TEST(BlockTableTest, EvictToNullIsIdempotentOnNullSlot) {
 
 TEST(GroupAllocatorTest, ExpiredSlotBoundIncludesEveryReclaimableBlock) {
     BlockPool pool(6, {1});
-    GroupAllocator allocator(/*cache_blocks_per_lcm_block=*/1, /*group_id=*/0, /*shard_count=*/1);
+    GroupAllocator allocator(/*cache_blocks_per_lcm_block=*/1, /*group_id=*/0, /*shard_count=*/1,
+                             /*kept_head_blocks=*/0);
     PrefixCacheIndex index(/*group_id=*/0);
     std::vector<CacheBlockRef> blocks = pool.AcquireBlocks(0, 6);
     ASSERT_EQ(blocks.size(), 6u);

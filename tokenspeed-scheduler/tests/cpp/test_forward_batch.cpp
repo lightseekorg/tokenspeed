@@ -43,7 +43,7 @@ namespace {
 
 struct GroupSource {
     explicit GroupSource(std::int32_t packing)
-        : pool{16, {packing}}, allocator{packing, /*group_id=*/0, /*shard_count=*/1} {}
+        : pool{16, {packing}}, allocator{packing, /*group_id=*/0, /*shard_count=*/1, /*kept_head_blocks=*/0} {}
 
     BlockPool pool;
     GroupAllocator allocator;

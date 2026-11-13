@@ -38,23 +38,40 @@ from tokenspeed.runtime.configs.model_config import _is_dflash2_mla
 from tokenspeed.runtime.execution.drafter import get_drafter_impl
 from tokenspeed.runtime.execution.drafter.dflash import DFlash
 from tokenspeed.runtime.execution.drafter.dflash2 import DFlash2
+from tokenspeed.runtime.execution.drafter.dspark import DSpark
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.forward_step import prepare_draft_extend_metadata
 
 # Imported for its register_backend() side effects on _BACKEND_REGISTRY.
 from tokenspeed.runtime.layers.attention import backends  # noqa: F401
+from tokenspeed.runtime.layers.attention.backends.paged.base import (
+    PagedAttentionBackend,
+)
+from tokenspeed.runtime.layers.attention.backends.paged.cache_group_geometry import (
+    CacheGroupGeometry,
+)
+from tokenspeed.runtime.layers.attention.backends.paged.router import CacheGroupRouter
+from tokenspeed.runtime.layers.attention.configs.base import (
+    resolve_speculative_num_tokens,
+)
 from tokenspeed.runtime.layers.attention.registry import _BACKEND_REGISTRY
 from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
+from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.models import dflash as dflash_model
 from tokenspeed.runtime.models.dflash import DFlashDraftModel
 from tokenspeed.runtime.models.dflash2 import (
     CandidateSelector,
+    DFlash2DecoderLayer,
     DFlash2DraftModel,
+    DFlash2MonokernelDecoderLayer,
     DFlashGroupedConv,
     _dflash2_mla_rope,
     _dflash2_uses_mla,
     _grouped_conv,
     _score_edges,
 )
+from tokenspeed.runtime.models.monokernel import MonokernelState
 
 _CUDA_ONLY = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA is required"
@@ -169,6 +186,7 @@ def test_mla_draft_layers_build_windowed_mla_attention() -> None:
         rope_theta=10000.0,
         layer_types=["sliding_attention", "full_attention"],
         sliding_window=1024,
+        decode_monokernel=False,
         dflash_config={
             "attention_mode": "mla",
             "block_size": 16,
@@ -187,6 +205,70 @@ def test_mla_draft_layers_build_windowed_mla_attention() -> None:
         assert layer.self_attn.attn_mqa.sliding_window_size == window
         assert layer.self_attn.attn_mha.sliding_window_size == window
         assert layer.comm_manager is not None
+
+
+@_CUDA_ONLY
+def test_an_mla_draft_load_returns_every_parameter_it_loaded() -> None:
+    """The MLA draft's load_weights returns the names it loaded, as the GQA
+    draft's does, so the base loader records them."""
+    from transformers import PretrainedConfig
+
+    from tokenspeed.runtime.distributed.mapping import Mapping
+
+    config = PretrainedConfig(
+        vocab_size=64,
+        hidden_size=256,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        q_lora_rank=64,
+        kv_lora_rank=64,
+        qk_nope_head_dim=32,
+        qk_rope_head_dim=16,
+        v_head_dim=32,
+        rms_norm_eps=1e-6,
+        max_position_embeddings=4096,
+        rope_theta=10000.0,
+        layer_types=["sliding_attention", "full_attention"],
+        sliding_window=1024,
+        decode_monokernel=False,
+        dflash_config={
+            "attention_mode": "mla",
+            "block_size": 16,
+            "conv_group_size": 16,
+            "conv_kernel_size": 2,
+            "selector_rank": 8,
+            "selector_top_k": 4,
+            "target_layer_ids": [0],
+        },
+    )
+    with torch.device("cuda"):
+        model = DFlash2DraftModel(config, Mapping(rank=0, world_size=1))
+    params = dict(model.named_parameters())
+    # The checkpoint's names: gate_up_proj and the fused q_a / kv_a
+    # projection come as their halves.
+    weights: list[tuple[str, torch.Tensor]] = []
+    for name, param in params.items():
+        value = torch.randn_like(param)
+        if ".gate_up_proj." in name:
+            gate, up = value.chunk(2)
+            weights.append((name.replace("gate_up_proj", "gate_proj"), gate))
+            weights.append((name.replace("gate_up_proj", "up_proj"), up))
+        elif ".fused_qkv_a_proj_with_mqa." in name:
+            q_rows = int(config.q_lora_rank)
+            weights.append(
+                (name.replace("fused_qkv_a_proj_with_mqa", "q_a_proj"), value[:q_rows])
+            )
+            weights.append(
+                (
+                    name.replace("fused_qkv_a_proj_with_mqa", "kv_a_proj_with_mqa"),
+                    value[q_rows:],
+                )
+            )
+        else:
+            weights.append((name, value))
+
+    assert model.load_weights(weights) == set(params)
 
 
 @pytest.mark.parametrize(
@@ -243,7 +325,7 @@ def test_block_drafter_declares_only_its_sliding_mask(
 def test_candidate_logits_processor_is_created_after_target_wiring() -> None:
     drafter = DFlash2.__new__(DFlash2)
     drafter.model = SimpleNamespace(
-        config=SimpleNamespace(vocab_size=32), fp8_head=None
+        config=SimpleNamespace(vocab_size=32), fp8_head=None, monokernel_state=None
     )
     drafter.output_multiplier = 1.25
     drafter.final_logit_softcapping = 8.0
@@ -312,17 +394,52 @@ _WINDOW_AWARE_BACKENDS = frozenset(
 )
 
 
+def _draft_attention(
+    window: int, sink: int = 0, *, layer_id: int = 0
+) -> PagedAttention:
+    """A real draft attention layer carrying the given window and sink."""
+    return PagedAttention(
+        num_heads=1,
+        head_dim=8,
+        scaling=1.0,
+        num_kv_heads=1,
+        layer_id=layer_id,
+        sliding_window_size=window,
+        sliding_window_sink=sink,
+        rotary_emb=None,
+        qk_norm=None,
+    )
+
+
 def _window_validator(*windows: int, supported: bool, backend: str) -> DFlash:
     """A DFlash stub whose draft layers carry the given window_lefts."""
     model = torch.nn.Module()
-    model.layers = torch.nn.ModuleList()
-    for window in windows:
-        attention = torch.nn.Module()
-        attention.sliding_window_size = window
-        model.layers.append(attention)
+    model.layers = torch.nn.ModuleList(
+        _draft_attention(window, layer_id=layer_id)
+        for layer_id, window in enumerate(windows)
+    )
     drafter = DFlash.__new__(DFlash)
     drafter.model = model
     drafter.attn_backend = SimpleNamespace(supports_layer_sliding_window=supported)
+    drafter.draft_model_runner = SimpleNamespace(
+        server_args=SimpleNamespace(drafter_attention_backend=backend)
+    )
+    return drafter
+
+
+def _sink_validator(*sinks: int, supported: bool, backend: str) -> DFlash:
+    """A DFlash stub whose draft layers carry the given window sinks.
+
+    A sink needs a window, so every layer gets one.
+    """
+    model = torch.nn.Module()
+    model.layers = torch.nn.ModuleList(
+        _draft_attention(4095, sink, layer_id=layer_id)
+        for layer_id, sink in enumerate(sinks)
+    )
+    drafter = DFlash.__new__(DFlash)
+    drafter.model = model
+    drafter.attn_backend = SimpleNamespace(supports_layer_window_sink=supported)
     drafter.draft_model_runner = SimpleNamespace(
         server_args=SimpleNamespace(drafter_attention_backend=backend)
     )
@@ -352,6 +469,40 @@ def test_draft_attention_window_validation_accepts_the_served_combinations() -> 
 
     honoured._validate_draft_attention_window()
     unwindowed._validate_draft_attention_window()
+
+
+def test_a_window_sink_draft_rejects_a_backend_that_drops_the_sink() -> None:
+    drafter = _sink_validator(128, 0, supported=False, backend="fa3")
+
+    with pytest.raises(ValueError, match="fa3.*cannot keep those leading tokens"):
+        drafter._validate_draft_window_sink()
+
+
+def test_draft_window_sink_validation_accepts_the_served_combinations() -> None:
+    honoured = _sink_validator(128, 0, supported=True, backend="triton")
+    sinkless = _sink_validator(0, 0, supported=False, backend="fa3")
+
+    honoured._validate_draft_window_sink()
+    sinkless._validate_draft_window_sink()
+
+
+def test_draft_validation_ignores_a_non_attention_module_of_the_same_name() -> None:
+    """Only a PagedAttention declares the draft's visibility.
+
+    A sibling module carrying an attribute of the same name is not an
+    attention layer, so its value must not reach the backend check.
+    """
+    drafter = _window_validator(-1, supported=False, backend="trtllm_mla")
+    impostor = torch.nn.Module()
+    impostor.sliding_window_size = 4095
+    impostor.sliding_window_sink = 128
+    drafter.model.add_module("impostor", impostor)
+    drafter.attn_backend = SimpleNamespace(
+        supports_layer_sliding_window=False, supports_layer_window_sink=False
+    )
+
+    drafter._validate_draft_attention_window()
+    drafter._validate_draft_window_sink()
 
 
 @pytest.mark.parametrize("block_size", (6, 8))
@@ -605,21 +756,34 @@ def test_a_mixed_batch_derives_draft_lengths_without_reading_the_device() -> Non
         valid_cache_lengths=torch.tensor([100, 200, 300], dtype=torch.int32)
     )
     drafter.draft_seq_lens_buf = torch.zeros(3, dtype=torch.int32)
+    drafter.context_starts_buf = torch.zeros(3, dtype=torch.int64)
+    drafter.context_locs_buf = torch.zeros(12, dtype=torch.int32)
     written = []
-    drafter._write_native_cache = lambda *args, **kwargs: written.append(kwargs)
+    drafter._write_native_cache = lambda *args, **kwargs: written.append(
+        (args[2].tolist(), kwargs)
+    )
+
+    def resolve(out, starts, width):
+        # Pages offset by 1000: each slot names its position.
+        rows = 1000 + starts[:, None] + torch.arange(width)
+        out[: rows.numel()] = rows.reshape(-1)
+        return out
 
     ctx = SimpleNamespace(
         dspark_context_producer=None,
         bs=3,
         num_extends=1,
         input_num_tokens=positions.numel(),
-        # The round's write vector comes from the TARGET router: the prefill
-        # row's extend span first, then the decode rows' verify windows, in
-        # the token order the hidden states arrive in.
         attn_backend=SimpleNamespace(
+            group_ids=("full_attention",),
             extend_span_locations=lambda: torch.arange(5, dtype=torch.int32),
             decode_window_locations=lambda: torch.arange(5, 13, dtype=torch.int32),
         ),
+    )
+    drafter.attn_backend = SimpleNamespace(
+        group_ids=("draft_swa",),
+        extend_span_locations=lambda: torch.arange(105, 110, dtype=torch.int32),
+        draft_write_locations_uniform=resolve,
     )
     drafter._update_native_cache_from_target(
         ctx,
@@ -629,7 +793,182 @@ def test_a_mixed_batch_derives_draft_lengths_without_reading_the_device() -> Non
     )
 
     assert drafter.draft_seq_lens_buf.tolist() == [15, 22, 300]
-    assert written == [{"decode_only": False}]
+    assert written == [
+        (
+            list(range(105, 110)) + list(range(1020, 1024)) + list(range(1030, 1034)),
+            {"decode_only": False},
+        )
+    ]
+
+
+class _DraftLeaf(PagedAttentionBackend):
+    """A paged leaf without kernels; the router resolves every slot."""
+
+    def __init__(self, query_width: int) -> None:
+        config = SimpleNamespace(
+            device="cpu",
+            dtype=torch.bfloat16,
+            is_draft=True,
+            speculative_num_draft_tokens=query_width,
+            context_len=64,
+        )
+        component = SimpleNamespace(
+            num_attention_heads=1, num_kv_heads=1, attn_tp_size=1, head_dim=8
+        )
+        super().__init__(config, component, kernel_page_size=4)
+
+    def init_forward_metadata(self, *args, **kwargs) -> None:
+        del args, kwargs
+
+    def refresh_decode_metadata(self, *args, **kwargs) -> None:
+        del args, kwargs
+
+    def forward_decode(self, *args, **kwargs):
+        raise AssertionError("a context write runs no attention")
+
+    def forward_extend(self, *args, **kwargs):
+        raise AssertionError("a context write runs no attention")
+
+
+# Raw blocks of 4 tokens per request, one kernel page each.
+_CONTEXT_TABLES = {
+    "full_attention": torch.tensor([[3, 5, 7], [9, 2, 6]], dtype=torch.int32)
+}
+
+
+def _dspark_context_drafter(
+    positions: torch.Tensor, input_lengths: list[int]
+) -> tuple[DSpark, list[list[int]]]:
+    """A DSpark drafter verifying 4 rows over the router a DSpark draft gets."""
+    server_args = SimpleNamespace(
+        speculative_num_draft_tokens=4, speculative_algorithm="DSPARK"
+    )
+    query_width = resolve_speculative_num_tokens(
+        server_args, is_draft=True, sample_from_anchor=True
+    )
+    router = CacheGroupRouter(
+        None,
+        is_draft=True,
+        spec_num_tokens=query_width,
+        device="cpu",
+        consumed_group_ids=None,
+    )
+    router.bind(
+        CacheGroupGeometry(
+            granularities={"full_attention": 4},
+            attn_kinds={"full_attention": "full_history"},
+            full_history_group_id="full_attention",
+            row_geometry={"full_attention": (4, 1)},
+            windows={"full_attention": None},
+        ),
+        {"full_attention": _DraftLeaf(query_width)},
+    )
+    router.init_cuda_graph_state(2)
+
+    drafter = DSpark.__new__(DSpark)
+    drafter.spec_num_tokens = 4
+    drafter.attn_backend = router
+    drafter.input_buffers = SimpleNamespace(
+        positions_buf=positions,
+        input_lengths_buf=torch.tensor(input_lengths, dtype=torch.int32),
+        req_pool_indices_buf=torch.arange(2),
+    )
+    drafter.runtime_states = SimpleNamespace(
+        valid_cache_lengths=torch.zeros(2, dtype=torch.int32)
+    )
+    drafter.draft_seq_lens_buf = torch.zeros(2, dtype=torch.int32)
+    drafter.context_starts_buf = torch.zeros(2, dtype=torch.int64)
+    drafter.context_locs_buf = torch.zeros(8, dtype=torch.int32)
+    drafter._tap_rows = torch.empty(positions.numel(), 1)
+    # A target whose decode kernels leave the taps to the drafter's sink.
+    drafter.target_model = SimpleNamespace(stores_capture_taps=lambda ctx: False)
+    written = []
+    drafter._write_native_cache = lambda hidden, rows, slots, **kwargs: written.append(
+        slots.tolist()
+    )
+    return drafter, written
+
+
+def test_dspark_context_writes_cover_every_target_verify_row() -> None:
+    """The target verifies one row more than a DSpark draft attends.
+
+    The draft router's decode window has the draft's query width, so a context
+    write naming its slots through that window would come one row short per
+    request and shifted by one position.
+    """
+    positions = torch.tensor([6, 7, 8, 9, 3, 4, 5, 6, 0, 0])
+    drafter, written = _dspark_context_drafter(positions, [1, 1])
+    # The runner's refresh of the draft router before the target forward.
+    drafter.attn_backend.refresh_decode_metadata(
+        2,
+        2,
+        torch.arange(2, dtype=torch.int32),
+        torch.tensor([10, 7], dtype=torch.int32),
+        forward_mode=ForwardMode.DECODE,
+        block_tables=_CONTEXT_TABLES,
+    )
+    ctx = SimpleNamespace(
+        dspark_context_producer=None,
+        target_capture_sink=None,
+        bs=2,
+        num_extends=0,
+        input_num_tokens=8,
+        forward_mode=ForwardMode.DECODE,
+    )
+    # Request 0 verifies positions 6..9, request 1 positions 3..6.
+    expected = [22, 23, 28, 29, 39, 8, 9, 10]
+
+    drafter.prepare_target_forward(ctx)
+    assert ctx.target_capture_sink is drafter
+    assert drafter._sink_cache_locs.tolist() == expected
+    assert drafter._sink_cache_locs.numel() == drafter._sink_positions.numel()
+
+    # A draft without the capture sink writes the same rows after verify.
+    drafter._update_native_cache_from_target(
+        ctx,
+        SimpleNamespace(hidden_states=torch.zeros(8, 1)),
+        accept_lengths=torch.tensor([2, 4], dtype=torch.int32),
+    )
+    assert written == [expected]
+
+
+def test_a_mixed_dspark_round_writes_the_extend_span_then_whole_verify_rows() -> None:
+    positions = torch.tensor([4, 5, 6, 3, 4, 5, 6, 0])
+    drafter, written = _dspark_context_drafter(positions, [3, 1])
+    extend, prefix = (torch.tensor([n], dtype=torch.int32) for n in (3, 4))
+    prepare_draft_extend_metadata(
+        drafter.attn_backend,
+        drafter,
+        padded_bs=2,
+        num_extends=1,
+        req_pool_indices=torch.arange(2, dtype=torch.int32),
+        seq_lens=torch.tensor([7, 7], dtype=torch.int32),
+        forward_mode=ForwardMode.MIXED,
+        block_tables=_CONTEXT_TABLES,
+        extend_seq_lens=extend,
+        extend_seq_lens_cpu=extend.clone(),
+        extend_prefix_lens=prefix,
+        extend_prefix_lens_cpu=prefix.clone(),
+        extend_replay_lens_cpu=torch.zeros_like(prefix),
+        extend_prompt_lens_cpu=prefix + extend,
+        extend_with_prefix=True,
+        block_tables_cpu={},
+    )
+    ctx = SimpleNamespace(
+        dspark_context_producer=None,
+        bs=2,
+        num_extends=1,
+        input_num_tokens=7,
+        forward_mode=ForwardMode.MIXED,
+    )
+
+    drafter._update_native_cache_from_target(
+        ctx,
+        SimpleNamespace(hidden_states=torch.zeros(7, 1)),
+        accept_lengths=torch.tensor([0, 2], dtype=torch.int32),
+    )
+    # Request 0 extends positions 4..6; request 1 verifies positions 3..6.
+    assert written == [[20, 21, 22, 39, 8, 9, 10]]
 
 
 def test_the_draft_residual_buffer_is_reused_and_recleared() -> None:
@@ -644,3 +983,132 @@ def test_the_draft_residual_buffer_is_reused_and_recleared() -> None:
     assert second.data_ptr() == first.data_ptr()
     assert second.shape == (2, 8)
     assert not second.any()
+
+
+@pytest.mark.parametrize(
+    "rows, tp_size, served",
+    [(1024, 8, True), (8192, 1, False), (8192, 8, False)],
+)
+def test_the_context_write_monokernel_takes_the_column_parallel_fc(
+    rows: int, tp_size: int, served: bool
+) -> None:
+    """The context write's monokernel reads each rank's own fc rows, the shard
+    the column-parallel ``fc`` holds; a replicated ``fc`` is not its layout."""
+    from tokenspeed.runtime.models import muse_spark_dflash2_monokernel as seam
+
+    model = SimpleNamespace(
+        fc=SimpleNamespace(
+            quant_method=UnquantizedLinearMethod(),
+            tp_size=tp_size,
+            weight=torch.empty(rows, 5 * 8192, dtype=torch.bfloat16, device="meta"),
+        ),
+        hidden_norm=SimpleNamespace(
+            weight=torch.empty(8192, dtype=torch.bfloat16, device="meta"),
+            variance_epsilon=seam.RMS_NORM_EPS,
+        ),
+    )
+    assert (seam.context_reasons(model) == []) is served
+
+
+class _Layer(torch.nn.Module):
+    """A draft layer that adds one, and as a monokernel launch would, marks
+    the state launched; the last one may also run the final norm (it writes
+    ``lm_head_input`` and moves the step counter itself)."""
+
+    def __init__(
+        self, state: MonokernelState, launches: bool, normed: torch.Tensor | None
+    ) -> None:
+        super().__init__()
+        self.state = state
+        self.launches = launches
+        self.normed = normed
+
+    def forward(self, *, positions, hidden_states, ctx, residual):
+        if self.launches:
+            self.state.launched = True
+        if self.normed is not None:
+            self.state.lm_head_input = self.normed
+            self.state.step[:1].add_(1)
+        return hidden_states + 1, residual
+
+
+@pytest.mark.parametrize("launches", ["none", "layers", "final norm"])
+def test_a_draft_block_takes_the_last_launchs_final_norm(launches: str) -> None:
+    """The draft's run_decoder resets the state before its layers and ends the
+    step after them: when the last launch ran the final norm, its output is
+    the block's, else the model's own final norm runs; the step counter moves
+    once for a block with launches, and not for one without."""
+    model = DFlash2DraftModel.__new__(DFlash2DraftModel)
+    torch.nn.Module.__init__(model)
+    state = MonokernelState(torch.zeros(1, dtype=torch.int64))
+    # A previous block's leftovers, which the reset must clear.
+    state.launched = True
+    state.lm_head_input = torch.full((2, 3), -7.0)
+    normed = torch.full((2, 3), 9.0)
+    model.monokernel_state = state
+    model.layers = torch.nn.ModuleList(
+        [
+            _Layer(state, launches != "none", None),
+            _Layer(
+                state, launches != "none", normed if launches == "final norm" else None
+            ),
+        ]
+    )
+    model.final_norm = lambda hidden_states, residual, ctx: -hidden_states
+    hidden = torch.zeros(2, 3)
+
+    out = model.run_decoder(torch.zeros(2), hidden, torch.zeros(2, 3), None)
+
+    want = normed if launches == "final norm" else -(hidden + 2)
+    torch.testing.assert_close(out, want)
+    assert state.lm_head_input is None
+    assert int(state.step[0]) == (0 if launches == "none" else 1)
+
+
+@pytest.mark.parametrize("muse_draft", [False, True])
+@pytest.mark.parametrize("switch", [False, True])
+def test_the_drafts_config_switch_picks_the_monokernel_layer_class(
+    switch: bool, muse_draft: bool
+) -> None:
+    """With ``decode_monokernel`` on the draft's config (load_model_config
+    declares it on every draft's, True for the draft of a Muse Spark target
+    under --decode-monokernel) the draft builds its layers
+    from the monokernel class whatever its shape: a draft the kernels don't
+    serve then fails at packing and names why, never falls back silently."""
+    from transformers import PretrainedConfig
+
+    from tokenspeed.runtime.models import muse_spark_dflash2_monokernel as seam
+
+    shape = dict(seam.KERNEL_SHAPE)
+    if not muse_draft:
+        shape["num_hidden_layers"] = 3
+    config = PretrainedConfig(
+        **shape, dflash_config=dict(seam.KERNEL_DFLASH), decode_monokernel=switch
+    )
+    model = DFlash2DraftModel.__new__(DFlash2DraftModel)
+    torch.nn.Module.__init__(model)
+    model.config = config
+    expected = DFlash2MonokernelDecoderLayer if switch else DFlash2DecoderLayer
+    assert model.decoder_layer_cls is expected
+
+
+@pytest.mark.parametrize("switch", [False, True])
+def test_a_draft_takes_the_decode_monokernels_only_for_a_target_they_serve(
+    switch: bool,
+) -> None:
+    """Under --decode-monokernel a DFlash2 draft of a Muse Spark target and the
+    MTP draft of a Qwen3.8 target get the switch; a Qwen3.8 target's DFlash2
+    draft and a Muse Spark target's other drafts keep their regular layers."""
+    from tokenspeed.runtime.utils.server_args import draft_takes_decode_monokernel
+
+    muse, dflash2 = ["MuseSparkForConditionalGeneration"], ["DFlash2DraftModel"]
+    mtp = ["Qwen4ExpForCausalLMNextN"]
+    for qwen in (["Qwen4ExpForCausalLM"], ["Qwen4ExpForConditionalGeneration"]):
+        assert draft_takes_decode_monokernel(switch, qwen, mtp) is switch
+        assert not draft_takes_decode_monokernel(switch, qwen, dflash2)
+    assert draft_takes_decode_monokernel(switch, muse, dflash2) is switch
+    assert not draft_takes_decode_monokernel(switch, muse, mtp)
+    assert not draft_takes_decode_monokernel(switch, [], dflash2)
+    assert not draft_takes_decode_monokernel(switch, muse, ["DFlashDraftModel"])
+    assert not draft_takes_decode_monokernel(switch, muse, ["LlamaForCausalLMEagle3"])
+    assert not draft_takes_decode_monokernel(switch, muse, [])

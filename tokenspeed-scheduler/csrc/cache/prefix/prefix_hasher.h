@@ -33,6 +33,7 @@
 
 #include "cache/core/content_hash.h"
 #include "cache/core/hex_codec.h"
+#include "core/profile_span.h"
 #include "utils.h"
 
 namespace tokenspeed {
@@ -139,6 +140,7 @@ inline void AppendPrefixHashChain(std::vector<std::string>& hashes,
 inline std::vector<std::string> ComputePrefixHashes(
     std::span<const std::span<const std::int32_t>> prefix_pages, const std::string& prior,
     std::span<const std::span<const std::string>> extra_keys_per_page = {}) {
+    ProfileSpan profile_span{"ComputePrefixHashes"};
     std::vector<std::string> hashes;
     if (prefix_pages.empty()) return hashes;
     // Decode the caller's seed once.
@@ -149,9 +151,11 @@ inline std::vector<std::string> ComputePrefixHashes(
 
 // Extends hashes, the chain of a token sequence's leading pages, in place by
 // next_pages, the pages that follow them. A throw leaves a valid, shorter
-// chain (basic guarantee).
+// chain (basic guarantee). Profiled as the same hashing phase as
+// ComputePrefixHashes, also when there is no page to hash.
 inline void ExtendPrefixHashes(std::vector<std::string>& hashes,
                                std::span<const std::span<const std::int32_t>> next_pages) {
+    ProfileSpan profile_span{"ComputePrefixHashes"};
     if (next_pages.empty()) return;
     // Decoded before hashes grows: the seed is its own last element.
     const auto seed = hashes.empty() ? std::vector<uint8_t>{} : HexToBytes(hashes.back());

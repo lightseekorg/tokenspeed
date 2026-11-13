@@ -30,12 +30,15 @@
 #include <random>
 #include <set>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <utility>
 #include <vector>
 
 #include <gtest/gtest.h>
+#include <spdlog/sinks/stdout_color_sinks.h>
+#include <spdlog/spdlog.h>
 
 #include "cache/cache_group.h"
 #include "cache/coordinator/cache_coordinator.h"
@@ -43,10 +46,23 @@
 #include "cache/coordinator/eviction_plan.h"
 #include "cache/coordinator/parent_occupancy.h"
 #include "cache/coordinator/shadow_occupancy.h"
+#include "cache/core/active_parents.h"
+#include "cache/core/cache_types.h"
 #include "cache/core/fixed_slot_resource.h"
+#include "cache/prefix/prefix_hasher.h"
+#include "cache_test_access.h"
 
 namespace tokenspeed::test {
 namespace {
+
+std::vector<std::string> ContentHashesFor(const std::vector<std::vector<std::int32_t>>& pages) {
+    std::vector<std::span<const std::int32_t>> spans;
+    spans.reserve(pages.size());
+    for (const auto& page : pages) {
+        spans.emplace_back(page.data(), page.size());
+    }
+    return ComputePrefixHashes(spans, "");
+}
 
 TEST(ParentOccupancy, SparseParentsKeepZeroAndRestoredCountsAcrossGrowthAndUnwind) {
     // Every round's arena starts on the same buffer.
@@ -82,7 +98,7 @@ TEST(CacheEvictionCandidates, PrescanReplaysPolicyOrderAcrossPinnedEpochsAndSnap
         std::vector<CacheBlockRef> pinned;
         for (std::uint32_t group = 0; group < 2; ++group) {
             const CacheGroupSpec spec{.cache_blocks_per_lcm_block = 1, .block_granularity = 4};
-            groups.emplace_back(spec, std::make_unique<GroupAllocator>(1, group, 1), MakePrefixMatcher(spec));
+            groups.emplace_back(spec, std::make_unique<GroupAllocator>(1, group, 1, 0), MakePrefixMatcher(spec));
             for (int i = 0; i < (group == 0 ? 10000 : 32); ++i) {
                 auto block = pool.AcquireBlock(group);
                 const CacheKey key{.group_id = group, .content_hash = ContentHash{std::to_string(i)}};
@@ -128,8 +144,8 @@ TEST(CacheEvictionCandidates, EpochsLeaveInPolicyOrderOnAnyPhysicalLayout) {
                                 .sliding_window = 8,
                                 .cache_blocks_per_lcm_block = 1,
                                 .block_granularity = 4};
-    groups.emplace_back(full, std::make_unique<GroupAllocator>(1, 0, 1), MakePrefixMatcher(full));
-    groups.emplace_back(window, std::make_unique<GroupAllocator>(1, 1, 1), MakePrefixMatcher(window));
+    groups.emplace_back(full, std::make_unique<GroupAllocator>(1, 0, 1, 0), MakePrefixMatcher(full));
+    groups.emplace_back(window, std::make_unique<GroupAllocator>(1, 1, 1, 0), MakePrefixMatcher(window));
     {
         // The ascending parents are handed out first, then these in a random order.
         auto blocks = pool.AcquireBlocks(0, kShuffledPages);
@@ -362,7 +378,7 @@ TEST(FixedSlotResource, FreeSlotsArePoisonedUntilHandedOut) {
 TEST(ShadowOccupancy, ConcurrentPlansHaveIndependentCapacity) {
     const CacheGroupSpec history{.cache_blocks_per_lcm_block = 2, .block_granularity = 4};
     std::vector<CacheGroup> groups;
-    groups.emplace_back(history, std::make_unique<GroupAllocator>(2, 0, 1), MakePrefixMatcher(history));
+    groups.emplace_back(history, std::make_unique<GroupAllocator>(2, 0, 1, 0), MakePrefixMatcher(history));
     BlockPool pool{2, {2}};
     pool.RegisterGroup(0, 2, 1);
     const auto held = pool.AcquireBlocks(0, 4);
@@ -397,7 +413,7 @@ TEST(ShadowOccupancy, ConcurrentPlansKeepSeparateCountsWhileTheyGrow) {
     constexpr std::int32_t kParents = 4096;
     const CacheGroupSpec history{.cache_blocks_per_lcm_block = 1, .block_granularity = 4};
     std::vector<CacheGroup> groups;
-    groups.emplace_back(history, std::make_unique<GroupAllocator>(1, 0, 1), MakePrefixMatcher(history));
+    groups.emplace_back(history, std::make_unique<GroupAllocator>(1, 0, 1, 0), MakePrefixMatcher(history));
     BlockPool pool{kParents, {1}};
     pool.RegisterGroup(0, 1, 1);
     const auto held = pool.AcquireBlocks(0, kParents);
@@ -433,8 +449,8 @@ struct MixedPackingPool {
     MixedPackingPool() : pool{12, {4, 2}} {
         const CacheGroupSpec sharded{.cache_blocks_per_lcm_block = 4, .block_granularity = 4};
         const CacheGroupSpec single{.cache_blocks_per_lcm_block = 2, .block_granularity = 4};
-        groups.emplace_back(sharded, std::make_unique<GroupAllocator>(4, 0, 2), MakePrefixMatcher(sharded));
-        groups.emplace_back(single, std::make_unique<GroupAllocator>(2, 1, 1), MakePrefixMatcher(single));
+        groups.emplace_back(sharded, std::make_unique<GroupAllocator>(4, 0, 2, 0), MakePrefixMatcher(sharded));
+        groups.emplace_back(single, std::make_unique<GroupAllocator>(2, 1, 1, 0), MakePrefixMatcher(single));
         pool.RegisterGroup(0, 4, 2);
         pool.RegisterGroup(1, 2, 1);
         const std::vector<std::int32_t> buckets{0, 0, 0, 1, 1, 0, 1, 0, 0};
@@ -576,8 +592,8 @@ TEST(ShadowOccupancy, AReleasedHostParentCannotAlsoLeaveHistorySlotsBehind) {
     const CacheGroupSpec history{.cache_blocks_per_lcm_block = 6, .block_granularity = 4};
     const CacheGroupSpec state{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0};
     std::vector<CacheGroup> groups;
-    groups.emplace_back(history, std::make_unique<GroupAllocator>(6, 0, 1), MakePrefixMatcher(history));
-    groups.emplace_back(state, std::make_unique<GroupAllocator>(1, 1, 1), MakePrefixMatcher(state));
+    groups.emplace_back(history, std::make_unique<GroupAllocator>(6, 0, 1, 0), MakePrefixMatcher(history));
+    groups.emplace_back(state, std::make_unique<GroupAllocator>(1, 1, 1, 0), MakePrefixMatcher(state));
     BlockPool host{1, {8, 1}};
     host.RegisterGroup(0, 8, 1);
     host.RegisterGroup(1, 1, 1);
@@ -598,7 +614,7 @@ TEST(ShadowOccupancy, AReleasedHostParentCannotAlsoLeaveHistorySlotsBehind) {
 }
 
 TEST(HostPacking, ABlockIdUsesTheOwningPoolsPacking) {
-    GroupAllocator allocator{4, 0, 2};
+    GroupAllocator allocator{4, 0, 2, 0};
     BlockPool device{2, {4}};
     BlockPool host{2, {6}};
     device.RegisterGroup(0, 4, 2);
@@ -639,14 +655,276 @@ TEST(BlockTableAccounting, ReleasedPrefixesAndSharedParentsCountOnce) {
         BlockTable::FromBlocks(/*group_id=*/0, {blocks[0], {}, {}, {}, {}, {}, {}, blocks[7]}, 0)};
     const std::vector<std::span<const BlockTable>> requests{first, second};
     coordinator.Allocator(0).ReclaimExpired(device, first[0], 6);
-    EXPECT_EQ(coordinator.NumActiveLcmBlocks(requests), 2);
+    EXPECT_EQ(coordinator.CountActiveLcmBlocks(requests), 2);
     coordinator.Allocator(0).ReclaimExpired(device, second[0], 7);
-    EXPECT_EQ(coordinator.NumActiveLcmBlocks(requests), 1);
+    EXPECT_EQ(coordinator.CountActiveLcmBlocks(requests), 1);
     coordinator.Allocator(0).ReclaimExpired(device, first[0], 7);
-    EXPECT_EQ(coordinator.NumActiveLcmBlocks(requests), 1);
+    EXPECT_EQ(coordinator.CountActiveLcmBlocks(requests), 1);
     coordinator.Allocator(0).ReclaimExpired(device, second[0], 8);
-    EXPECT_EQ(coordinator.NumActiveLcmBlocks(requests), 0);
+    EXPECT_EQ(coordinator.CountActiveLcmBlocks(requests), 0);
     EXPECT_EQ(device.NumEmptyLcmBlocks(), 2) << "the retained copies still occupy the pool";
+}
+
+// CacheCoordinator::NumActiveLcmBlocks() (the ActiveParents O(1) gauge) must
+// always agree with CacheCoordinator::CountActiveLcmBlocks() (the reference
+// walk) over every request table set still live through the coordinator.
+// Each test below checks both against a hand-derived expectation.
+
+TEST(BlockTableAccounting, AdmissionCountsDistinctParentsAndFreeDropsThem) {
+    BlockPool pool(8, {1});
+    const std::vector specs{CacheGroupSpec{.cache_blocks_per_lcm_block = 1, .block_granularity = 4}};
+    auto coordinator = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                       /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
+                                       /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
+    std::vector<BlockTable> tables(1);
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/12));  // 3 blocks, 3 distinct parents
+    const std::vector<std::span<const BlockTable>> live{tables};
+    EXPECT_EQ(coordinator.NumActiveLcmBlocks(), 3);
+    EXPECT_EQ(coordinator.CountActiveLcmBlocks(live), 3);
+
+    coordinator.Free(tables);
+    EXPECT_EQ(coordinator.NumActiveLcmBlocks(), 0);
+    EXPECT_EQ(coordinator.CountActiveLcmBlocks(live), 0);
+}
+
+TEST(BlockTableAccounting, SharedPrefixParentsCountOnceAcrossRequests) {
+    BlockPool pool(8, {1});
+    const std::vector specs{CacheGroupSpec{.cache_blocks_per_lcm_block = 1, .block_granularity = 4}};
+    auto coordinator = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                       /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
+                                       /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
+    const std::vector<std::string> ch = ContentHashesFor({{0, 0, 0, 0}, {1, 1, 1, 1}});
+
+    std::vector<BlockTable> a(1);
+    ASSERT_TRUE(AdmitForTest(coordinator, a, /*num_tokens=*/8));  // 2 fresh blocks
+    CacheFullBlocksForTest(coordinator, a, ch);
+    EXPECT_EQ(coordinator.NumActiveLcmBlocks(), 2);
+
+    CacheCoordinator::PrefixProbe prefix = coordinator.ProbePrefix(ch);
+    ASSERT_EQ(prefix.device.num_common_tokens, 8);
+    std::vector<BlockTable> b(1);
+    ASSERT_TRUE(AdmitForTest(coordinator, b, std::move(prefix), GroupDemand{}));  // prefix hit, no new blocks
+    ASSERT_EQ(b[0].NumBlocks(), 2);
+
+    // a and b share the same two cache blocks (hence the same two parents):
+    // the gauge and the reference walk over both live tables must still
+    // read 2, not 4.
+    const std::vector<std::span<const BlockTable>> live_both{a, b};
+    EXPECT_EQ(coordinator.NumActiveLcmBlocks(), 2);
+    EXPECT_EQ(coordinator.CountActiveLcmBlocks(live_both), 2);
+
+    coordinator.Free(a);
+    const std::vector<std::span<const BlockTable>> live_b{b};
+    EXPECT_EQ(coordinator.NumActiveLcmBlocks(), 2) << "b still owns the shared parents";
+    EXPECT_EQ(coordinator.CountActiveLcmBlocks(live_b), 2);
+
+    coordinator.Free(b);
+    EXPECT_EQ(coordinator.NumActiveLcmBlocks(), 0);
+}
+
+TEST(BlockTableAccounting, PackedParentSharedByTwoRequestsCountsOnce) {
+    // One LCM parent packs 2 cache blocks; two different requests each take
+    // one, filling the parent between them.
+    BlockPool pool(1, {2});
+    const std::vector specs{CacheGroupSpec{.cache_blocks_per_lcm_block = 2, .block_granularity = 4}};
+    auto coordinator = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                       /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
+                                       /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
+    std::vector<BlockTable> a(1);
+    ASSERT_TRUE(AdmitForTest(coordinator, a, /*num_tokens=*/4));  // 1 block
+    EXPECT_EQ(coordinator.NumActiveLcmBlocks(), 1);
+
+    std::vector<BlockTable> b(1);
+    ASSERT_TRUE(AdmitForTest(coordinator, b, /*num_tokens=*/4));  // the parent's other slot
+    EXPECT_EQ(coordinator.NumActiveLcmBlocks(), 1) << "the one parent is shared by a and b";
+    const std::vector<std::span<const BlockTable>> live{a, b};
+    EXPECT_EQ(coordinator.CountActiveLcmBlocks(live), 1);
+
+    coordinator.Free(a);
+    EXPECT_EQ(coordinator.NumActiveLcmBlocks(), 1) << "b still occupies the parent";
+
+    coordinator.Free(b);
+    EXPECT_EQ(coordinator.NumActiveLcmBlocks(), 0);
+}
+
+TEST(BlockTableAccounting, CoordinatorReclaimExpiredDropsSlidOutParents) {
+    BlockPool pool(8, {1});
+    const std::vector specs{CacheGroupSpec{.attn_kind = AttnKind::kSlidingWindow,
+                                           .sliding_window = 4,
+                                           .cache_blocks_per_lcm_block = 1,
+                                           .block_granularity = 4}};
+    auto coordinator = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                       /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
+                                       /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
+    std::vector<BlockTable> tables(1);
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/20));  // 5 blocks
+    const std::vector<std::span<const BlockTable>> live{tables};
+    EXPECT_EQ(coordinator.NumActiveLcmBlocks(), 5);
+    EXPECT_EQ(coordinator.CountActiveLcmBlocks(live), 5);
+
+    // skipped = num_computed_tokens - sliding_window + 1 = 20 - 4 + 1 = 17;
+    // 17 / block_granularity(4) = 4 pages expire, leaving 1 live block.
+    coordinator.ReclaimExpired(tables, /*num_computed_tokens=*/20);
+    EXPECT_EQ(coordinator.NumActiveLcmBlocks(), 1);
+    EXPECT_EQ(coordinator.CountActiveLcmBlocks(live), 1);
+
+    coordinator.Free(tables);
+    EXPECT_EQ(coordinator.NumActiveLcmBlocks(), 0);
+}
+
+TEST(BlockTableAccounting, CopyMoveAndScopeExitTrackActiveParents) {
+    // The pool must outlive every table built against it.
+    BlockPool pool(8, {1});
+    const std::vector specs{CacheGroupSpec{.cache_blocks_per_lcm_block = 1, .block_granularity = 4}};
+    auto coordinator = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                       /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
+                                       /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
+    std::vector<BlockTable> tables(1);
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/8));  // 2 blocks
+    EXPECT_EQ(coordinator.NumActiveLcmBlocks(), 2);
+
+    {
+        std::vector<BlockTable> copy = tables;  // NOLINT(performance-unnecessary-copy-initialization)
+        EXPECT_EQ(coordinator.NumActiveLcmBlocks(), 2) << "a copy shares its source's parents, counted once";
+    }
+    EXPECT_EQ(coordinator.NumActiveLcmBlocks(), 2) << "dropping the copy leaves the original counted";
+
+    std::vector<BlockTable> moved = std::move(tables);
+    EXPECT_EQ(coordinator.NumActiveLcmBlocks(), 2) << "a move transfers the count, it does not change it";
+
+    {
+        std::vector<BlockTable> scoped = std::move(moved);
+        EXPECT_EQ(coordinator.NumActiveLcmBlocks(), 2);
+    }
+    EXPECT_EQ(coordinator.NumActiveLcmBlocks(), 0)
+        << "a filled table going out of scope without Free still decrements the gauge";
+}
+
+TEST(BlockTableAccounting, FromBlocksTableCountsNowhere) {
+    BlockPool pool(8, {1});
+    const std::vector specs{CacheGroupSpec{.cache_blocks_per_lcm_block = 1, .block_granularity = 4}};
+    auto coordinator = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                       /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
+                                       /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
+    const auto blocks = pool.AcquireBlocks(0, 2);
+    ASSERT_EQ(blocks.size(), 2u);
+    EXPECT_EQ(coordinator.NumActiveLcmBlocks(), 0);
+    {
+        BlockTable table = BlockTable::FromBlocks(/*group_id=*/0, blocks, 0);
+        EXPECT_EQ(coordinator.NumActiveLcmBlocks(), 0) << "a table built outside the allocator counts nowhere";
+    }
+    EXPECT_EQ(coordinator.NumActiveLcmBlocks(), 0);
+}
+
+TEST(BlockTableAccounting, ATableIsBoundBeforeItHoldsABlock) {
+    BlockPool pool(8, {1});
+    ActiveParents parents{pool};
+    const auto blocks = pool.AcquireBlocks(/*group_id=*/0, /*num=*/2);
+    ASSERT_EQ(blocks.size(), 2u);
+    BlockTable table = BlockTable::FromBlocks(/*group_id=*/0, blocks, 0);
+    EXPECT_THROW(table.CountActiveParentsIn(&parents), std::runtime_error);
+    EXPECT_EQ(parents.Count(), 0) << "a rejected binding counts nothing";
+}
+
+TEST(BlockTableAccountingDeathTest, AParentRefRejectsABlockOfAnotherPool) {
+    BlockPool pool(8, {1});
+    BlockPool other_pool(8, {1});
+    ActiveParents parents{pool};
+    const CacheBlockRef block = other_pool.AcquireBlock(/*group_id=*/0);
+    ASSERT_TRUE(block);
+    EXPECT_DEATH(
+        {
+            // The default logger writes to stdout; the death test reads stderr.
+            spdlog::set_default_logger(spdlog::stderr_color_mt("fatal-check-test"));
+            [[maybe_unused]] const ParentRef ref(&parents, block);
+        },
+        "a bound table holds a block of another pool");
+}
+
+TEST(BlockTableAccounting, PublicationDedupeReplacesLosingTableBlockInPlace) {
+    // A and B are each admitted with their own fresh blocks for the same two
+    // pages (AdmitForTest's num_tokens overload probes an empty hash list, so
+    // neither gets a prefix hit). A publishes first and becomes canonical;
+    // when B publishes the same hashes, PrefixCacheIndex::Register replaces
+    // B's blocks with A's canonical ones in place
+    // (BlockTable::PublishWindow / RegisterFullBlocks), and BlockTable::refresh
+    // re-derives B's slots' page ids and ParentRefs from the swapped blocks.
+    BlockPool pool(8, {1});
+    const std::vector specs{CacheGroupSpec{.cache_blocks_per_lcm_block = 1, .block_granularity = 4}};
+    auto coordinator = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                       /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
+                                       /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
+    const std::vector<std::string> ch = ContentHashesFor({{0, 0, 0, 0}, {1, 1, 1, 1}});
+
+    std::vector<BlockTable> a(1);
+    ASSERT_TRUE(AdmitForTest(coordinator, a, /*num_tokens=*/8));  // 2 fresh blocks
+    std::vector<BlockTable> b(1);
+    ASSERT_TRUE(AdmitForTest(coordinator, b, /*num_tokens=*/8));  // 2 more fresh blocks, distinct from a's
+
+    const std::vector<std::span<const BlockTable>> live{a, b};
+    EXPECT_EQ(coordinator.NumActiveLcmBlocks(), 4) << "a and b each hold 2 distinct fresh parents";
+    EXPECT_EQ(coordinator.CountActiveLcmBlocks(live), 4);
+    const std::vector<std::int32_t> a_ids = coordinator.Allocator(0).BlockTablePageIds(a[0]);
+    const std::vector<std::int32_t> b_ids_before = coordinator.Allocator(0).BlockTablePageIds(b[0]);
+    EXPECT_NE(a_ids, b_ids_before) << "a and b start on different physical blocks";
+    const std::int32_t empty_before = pool.NumEmptyLcmBlocks();
+
+    CacheFullBlocksForTest(coordinator, a, ch);  // a's blocks become the canonical entries
+    CacheFullBlocksForTest(coordinator, b, ch);  // b dedupes against a's canonical blocks
+
+    const std::vector<std::int32_t> b_ids_after = coordinator.Allocator(0).BlockTablePageIds(b[0]);
+    ASSERT_EQ(b_ids_after, a_ids) << "the dedupe must have swapped b's slots onto a's blocks";
+
+    EXPECT_EQ(coordinator.NumActiveLcmBlocks(), 2) << "b's slots now share a's 2 parents instead of owning 2 more";
+    EXPECT_EQ(coordinator.CountActiveLcmBlocks(live), 2);
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), empty_before + 2) << "b's replaced fresh blocks returned to the pool";
+
+    coordinator.Free(a);
+    EXPECT_EQ(coordinator.NumActiveLcmBlocks(), 2) << "b still holds the shared canonical parents";
+    coordinator.Free(b);
+    EXPECT_EQ(coordinator.NumActiveLcmBlocks(), 0);
+}
+
+// Restore only binds the rebuilt tables to active_parents_ at the top of
+// CacheCoordinator::Restore (the CountActiveParentsIn loop over `demands`).
+// NumActiveLcmBlocks() is the O(1) gauge that loop feeds; CountActiveLcmBlocks
+// walks the live tables directly and does not depend on that binding. If the
+// binding loop were ever dropped, the gauge would read 0 after a restore
+// while the reference walk still read the real block count.
+TEST(BlockTableAccounting, RestoreRebindsTheRebuiltTablesToTheActiveParentsGauge) {
+    BlockPool pool(8, {1});
+    BlockPool host_pool(8, {1});
+    BlockPool snapshot_pool(8, {1});
+    const std::vector specs{CacheGroupSpec{.cache_blocks_per_lcm_block = 1, .block_granularity = 4}};
+    auto coordinator = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
+                                       /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false,
+                                       /*checkpoint_retention_requests=*/0);
+    std::vector<BlockTable> tables(1);
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/12));  // 3 blocks, 3 distinct parents
+    EXPECT_EQ(coordinator.NumActiveLcmBlocks(), 3);
+
+    auto image = coordinator.TakeImage(tables, /*num_tokens=*/12, std::vector<std::vector<ImageSlot>>(1));
+    ASSERT_TRUE(image);
+    image->store_pairs.clear();
+    coordinator.Free(tables);
+    EXPECT_EQ(coordinator.NumActiveLcmBlocks(), 0) << "the retracted request's parents are released";
+
+    std::vector<BlockTable> restored(1);
+    std::vector<GroupDemand> demands{{.table = &restored[0], .extent = DenseGrowth{0}, .reserve_tokens = 0}};
+    const auto restore = coordinator.Restore(image->image, demands, /*copy_in_point=*/std::nullopt,
+                                             CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
+                                             /*drop_claims_if_unfit=*/false);
+    ASSERT_TRUE(restore);
+    ASSERT_EQ(restored[0].NumBlocks(), 3);
+
+    const std::vector<std::span<const BlockTable>> live{restored};
+    EXPECT_EQ(coordinator.CountActiveLcmBlocks(live), 3) << "the restored table really holds 3 distinct parents";
+    EXPECT_EQ(coordinator.NumActiveLcmBlocks(), 3)
+        << "Restore must rebind the rebuilt table's slots to active_parents_, "
+           "the same way Admit does, or the gauge drifts from the reference walk";
+
+    coordinator.Free(restored);
+    EXPECT_EQ(coordinator.NumActiveLcmBlocks(), 0);
 }
 
 TEST(HostPacking, SnapshotAdmissionCountsTheSnapshotPoolsChildren) {

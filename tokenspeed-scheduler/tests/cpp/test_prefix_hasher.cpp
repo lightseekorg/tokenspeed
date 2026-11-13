@@ -35,6 +35,7 @@
 #include "cache/core/hex_codec.h"
 #include "cache/prefix/prefix_hasher.h"
 #include "prefix_hash_text.h"
+#include "core/profile_span.h"
 #include "core/token_container.h"
 #include "scheduler/request.h"
 
@@ -81,6 +82,42 @@ TEST(RequestPromptHashesTest, AShortInputHasNoFullPageHashes) {
                     /*prefix_granularity=*/4, Role::kFused);
     EXPECT_TRUE(request.PromptPrefixHashes().empty());
     EXPECT_TRUE(request.PromptPrefixHashes().empty());
+}
+
+std::vector<std::string> recorded_spans;
+
+void RecordSpan(const char* name, std::int64_t /*begin_ns*/, std::int64_t /*end_ns*/) {
+    recorded_spans.emplace_back(name);
+}
+
+// Records the profile spans of one test, and stops however the test ends.
+struct SpanRecording {
+    SpanRecording() {
+        recorded_spans.clear();
+        SetProfileSpanSink(&RecordSpan);
+    }
+    ~SpanRecording() { SetProfileSpanSink(nullptr); }
+    SpanRecording(const SpanRecording&) = delete;
+    SpanRecording& operator=(const SpanRecording&) = delete;
+};
+
+TEST(RequestPromptHashesTest, APromptsFirstLookupIsProfiledAsHashingEvenWithoutACompletePage) {
+    const SpanRecording recording;
+    Request short_prompt(RequestSpec{.request_id = "short", .tokens = {1, 2, 3}},
+                         /*prefix_granularity=*/4, Role::kFused);
+    EXPECT_TRUE(short_prompt.PromptPrefixHashes().empty());
+    EXPECT_EQ(recorded_spans, std::vector<std::string>{"ComputePrefixHashes"});
+    // A lookup the chain already covers hashes nothing.
+    EXPECT_TRUE(short_prompt.PromptPrefixHashes().empty());
+    EXPECT_EQ(recorded_spans.size(), 1U);
+
+    Request long_prompt(RequestSpec{.request_id = "long", .tokens = {1, 2, 3, 4, 5, 6, 7, 8, 9}},
+                        /*prefix_granularity=*/2, Role::kFused);
+    long_prompt.PromptPrefixHashes(1);
+    long_prompt.PromptPrefixHashes(1);
+    long_prompt.PromptPrefixHashes();
+    // The first lookup, then the one extension.
+    EXPECT_EQ(recorded_spans.size(), 3U);
 }
 
 TEST(RequestPromptHashesTest, BoundedStorageThenAdmissionAndPublicationShareTheSameChain) {

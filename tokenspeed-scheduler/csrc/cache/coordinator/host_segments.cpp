@@ -45,10 +45,16 @@ void CacheCoordinator::visitHostKvDuplicateCandidates(Visitor&& visit) const {
     }
     std::pmr::monotonic_buffer_resource scratch;
     std::int64_t lookback_tokens = 0;
+    // The leading tokens whose pages hold some group's sink blocks.
+    std::int64_t sink_span_tokens = 0;
     std::vector<std::size_t> closed_groups;
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         if (groups_[i].Matcher().IsPrefixClosed()) {
             closed_groups.push_back(i);
+        }
+        if (const std::int32_t sink_blocks = groups_[i].Allocator().KeptHeadBlocks(); sink_blocks > 0) {
+            sink_span_tokens =
+                std::max(sink_span_tokens, static_cast<std::int64_t>(sink_blocks) * geometry_[i].BlockGranularity());
         }
         if (!GroupIsReplayable(i) && !GroupIsState(i) && !groups_[i].Matcher().IsPrefixClosed()) {
             lookback_tokens =
@@ -89,11 +95,28 @@ void CacheCoordinator::visitHostKvDuplicateCandidates(Visitor&& visit) const {
         device_window_splits.emplace(&boundary, split);
         return split;
     };
+    // Whether the Device holds every sink block keyed under this page. A
+    // missing one lowers the Host-suffix split of every boundary above the
+    // page to it, so the Host KV from there on is no duplicate.
+    const auto device_holds_sink_blocks = [&](const BoundaryTree::Node& page) {
+        const std::int32_t page_start = page.boundary_tokens - prefix_granularity_;
+        bool held = true;
+        ForEachBoundaryKey(
+            CacheKey{.content_hash = page.hash}, /*tail_tokens=*/0, [&](std::size_t i, const CacheKey& key) {
+                const std::int32_t sink_blocks = groups_[i].Allocator().KeptHeadBlocks();
+                if (sink_blocks == 0) {
+                    return;
+                }
+                const std::int32_t block = page_start / geometry_[i].BlockGranularity() + key.page_offset;
+                held = held && (block >= sink_blocks || groups_[i].Index().Contains(pool_, key));
+            });
+        return held;
+    };
     // Only a complete Device prefix with no store on its way to the Host at or
     // above it can replace a Host copy: every page from the root down is whole
-    // on the Device and continues its parent. Candidate chains share
-    // ancestors, so each answer is kept for the rest of this scan, while
-    // entries, stores and links cannot change.
+    // on the Device, sink blocks included, and continues its parent. Candidate
+    // chains share ancestors, so each answer is kept for the rest of this
+    // scan, while entries, stores and links cannot change.
     std::pmr::unordered_map<const BoundaryTree::Node*, bool> device_prefix_backed{&scratch};
     const auto device_prefix_backs = [&](const BoundaryTree::Node& node) {
         ancestors.clear();
@@ -105,7 +128,9 @@ void CacheCoordinator::visitHostKvDuplicateCandidates(Visitor&& visit) const {
                 break;
             }
             ancestors.push_back(ancestor);
-            if (ancestor->PendingHostStores() > 0 || !boundary_tree_.DeviceKvPageExtendsPrefix(*ancestor)) {
+            if (ancestor->PendingHostStores() > 0 || !boundary_tree_.DeviceKvPageExtendsPrefix(*ancestor) ||
+                (ancestor->tail_tokens == 0 && ancestor->boundary_tokens - prefix_granularity_ < sink_span_tokens &&
+                 !device_holds_sink_blocks(*ancestor))) {
                 backed = false;
                 break;
             }

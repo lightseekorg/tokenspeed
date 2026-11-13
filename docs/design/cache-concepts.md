@@ -38,7 +38,8 @@ the group's nature switches on this value and nothing else:
 * **`full_history`** (`kFull`) — rows of token history that stay resident for
   the request's whole life; prefix-closed and shared.
 * **`sliding_window`** (`kSlidingWindow`) — rows of token history of which
-  only the trailing `sliding_window_tokens` stay resident; the rest slide out
+  the trailing `sliding_window_tokens` and optional leading `sink_tokens`
+  stay resident; the middle slides out
   (`ExpiredBlocksAt`). A trailing window of token rows (DeepSeek V4.1's SWA
   kv and compressor tails) is this kind whatever a kernel calls its buffer.
 * **`state`** (`kState`) — recurrent/conv state whose block holds the state
@@ -209,9 +210,14 @@ The lookup tables retain computed key hashes: walking a cluster or erasing an
 entry does not repeatedly hash its full content digest. Key equality and
 eviction order remain unchanged.
 
-The per-step page gauge composes two O(1)-or-cheaper quantities the same way:
-empty parents come from the pool, active parents from the live requests' block
+The per-step page gauge composes two O(1) quantities the same way: empty
+parents come from the pool, active parents from the live requests' block
 tables, and cache-only residency is the remainder `total - empty - active`.
+The tables keep the active count themselves: each slot holding a block owns a
+`ParentRef` (`cache/core/active_parents.h`) that counts the block's parent in
+the coordinator's `ActiveParents` for as long as the slot holds it, so reading
+the gauge walks nothing. The count is a holder fact kept by the holders; the
+pool never sees it. Debug builds check it against a walk of the tables.
 
 ## Who is allowed to see what
 
@@ -283,6 +289,22 @@ the scheduler re-feeds is the retention window itself rather than a second
 declared number. False means an ordinary cached window; the flag changes
 nothing else about the group's geometry.
 
+A cached sliding group can declare nonnegative `sink_tokens`. Prefix reuse
+requires both the leading sink blocks and the trailing window; overlapping
+ranges count once. Sink retention is incompatible with bounded replay, which
+cannot regenerate the leading rows. A sink group's retention window must
+cover at least one prefix page, so a partial-page publication and its copy-in
+remain one contiguous tail. PD allocates and transfers the unmatched sink
+blocks beside the retained suffix, preserving any already-matched sink pages.
+
+Publishing and acquiring a boundary refresh its sink blocks with the window.
+Within an access epoch, eviction keeps the sink after the window and the
+window's later blocks after its middle blocks. Other prefix chains still
+compete by LRU. Host L2 uses the same retained ranges and suffix rule: a
+missing Device sink lowers the common split to its prefix page, and the Host
+must supply every required group's data from that split. Host duplicate
+reclamation also requires Device coverage of sink blocks.
+
 #### Block tables and exported page IDs
 
 The block tables the scheduler emits are logically *indexed*: row *i* of a
@@ -292,7 +314,14 @@ entry *values*, however, are **`CacheBlock` ids** — handles to the physical
 storage the cache layer allocated. The scheduler owns allocation, so its output names that storage directly.
 Consumers outside the cache layer treat the ids as opaque.
 Export preserves every logical slot, including holes in a released prefix.
-Export and active-parent accounting skip reading those released references.
+For a sliding group with `H = ceil(sink_tokens / block_granularity)`,
+retention releases `[H, F)` instead of `[0, F)`, where `F` is the table's
+reclaim frontier. The allocator owns this interpretation: sink slots keep
+their ordinary `CacheBlockRef` ownership, participate in active-parent
+accounting and compaction, and survive retraction snapshots. Export skips
+only null slots in that interval. A sink group exports its full absolute row
+so the head and trailing window both reach the runtime; zero-sink groups
+keep the compact trailing-row export.
 On PD decode admission, a partial leading history block is a landing slot
 for the prefill peer. Installing its private writable block also rewinds
 the released-prefix frontier to include that slot: the outgoing destination
@@ -1185,7 +1214,9 @@ Its responsibilities:
   `RequestProgress` for finish, retraction, and remote completion, which
   publish without admitting.
 * **Prefix publication.** `CacheFullBlocks` / `CacheCompletedBlocks` register
-  computed blocks into the prefix indexes for later requests. Prefix-closed
+  computed blocks into the prefix indexes for later requests — only when
+  something can reuse them (`SchedulerConfig::PublishesCompletedPages`,
+  [scheduler §1](scheduler.md#1-admission-is-per-chunk)). Prefix-closed
   groups match first; non-closed groups (SWA, State) match only within the
   boundary the closed groups settled (`match_order_` enforces this).
   A publication point is the request's computed frontier `T`
@@ -1590,9 +1621,17 @@ Its responsibilities:
   the group indexes), so the scheduler keeps no residency counters of its own
   — only the token descriptor the event carries and whether that event is
   currently out. A mutation only marks its boundary for reconcile;
-  `DrainKvEvents` reconciles each marked boundary against its residency and
-  reports the net change (published exactly while fully resident), then drops
-  descriptors of boundaries with no cached child. Nothing is decided
+  `DrainKvEvents` publishes a boundary while all Full/history entries reside
+  on Device, using the existing closed-entry count; auxiliary State/SWA do not
+  gate local residency. `KvEventPrefixView` exposes only ancestor-complete
+  prefixes: it withdraws descendants when an ancestor leaves and republishes
+  resident descendants when it returns. This changes routing visibility, not
+  physical eviction. Actual prefix admission still checks all required groups.
+  KV events require a Full/history group: State-only, SWA-only and State + SWA
+  layouts must disable events. No structural ancestors are synthesized.
+  Descriptors survive while any Device entry remains, including auxiliary
+  entries excluded from routing. Host eviction retains all-group residency
+  checks. Nothing is decided
   mid-`Admit`, so one admission may evict a boundary's last cached copy and
   then store the request's own copy without any ordering hazard.
   Admission may pre-hash prompt pages beyond the computed prefix. An early
@@ -1918,6 +1957,9 @@ on the largest required working set, not the smallest memory-derived limit;
 zero-budget geometry probes keep their existing demand-sized behavior. Final
 rebind repeats resident sizing under the graph-adjusted budget.
 
+Backends report recipe-reserved workspace through `fixed_workspace_bytes()`.
+Stateless leaves report zero. Composites sum their children and any owned allocations.
+
 Ordinary recipes pin one CacheBlock per group in each parent, so a group's
 stride does not shrink with its layer count or cache dtype. For example,
 equal-sized layers split into groups of one and four need a padding fraction
@@ -2044,13 +2086,17 @@ contains exactly one window and no rows are dropped. Encoder metadata may be
 reused only when its visible history also starts there; equal row counts alone
 do not make the two windows interchangeable.
 
-Block drafters (DFLASH / DSPARK) write their KV at the target's cache
-locations, so their storage *is* a target-owned group whatever mask their
-layers apply. Drafts with their own attention layers ride the target's
-full-history group: `resolve_cache_layer_types` labels every block-draft layer
-full-history, and `check_block_drafter_storage` verifies at startup that the
-group the draft bound is one the target's own layers share — a target without
-a full-history group has nothing for a block drafter to borrow. DeepSeek
+Block drafters with their own attention layers derive context-KV write
+locations from their own cache router. A recipe may store their fields in a
+target-owned full-history group or a separate cached sliding group whose
+window and sink cover the draft's visibility. `check_block_drafter_storage`
+validates that binding; a private sliding group is allocated, matched,
+transferred and reclaimed through the ordinary scheduler path. Its fields
+may share physical planes with other groups, with K and V as consecutive
+fields within each page. Such noncontiguous history views retain their page
+axis, and the pool and attention kernels address each page using its stride.
+
+DeepSeek
 V4.1's same-checkpoint DSpark has no draft attention layers of its own; its
 per-stage context rows are extra fields of the target's SWA group on the last
 target layer, addressed by the target's SWA slots, so they are transferred
@@ -2540,7 +2586,7 @@ events (wire-format constrained; unify deliberately if ever).
 ### Principle 2 — scheduler perceives only logical quantities: fixed, now with hard vocabulary rules
 
 Scheduling and FSM code do no geometry arithmetic. The coordinator exposes
-capacity views — `NumActiveLcmBlocks(request_tables)`,
+capacity views — `NumActiveLcmBlocks()`,
 `NumAvailableLcmBlocks`, `TotalLcmBlocks`, `GroupAvailablePages(group)` — and
 the config-only `CapacityModel` (`csrc/scheduler/capacity_model.h`) folds
 page demand into LCM blocks (`LcmBlocksNeededFor(group_pages)`); the
@@ -2739,10 +2785,9 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
   at startup, checking that the group's retention covers the mask (see
   *Storage vs. visibility*). Backends index their learned geometry by the
   bound id with no fallback (`CacheGroupGeometry.granularity_of` raises on
-  unknown ids). Block drafters ride a target-owned group whatever mask their
-  layers apply: the full-history group for drafts with their own attention
-  layers (`check_block_drafter_storage`), the SWA group's extra fields for
-  V4.1's same-checkpoint DSpark. ✓
+  unknown ids). Block drafters with attention layers use either target-owned full history
+  or a draft-owned sliding group checked by `check_block_drafter_storage`;
+  V4.1's same-checkpoint DSpark uses the target SWA group's extra fields. ✓
 * Capacity has three shapes and no more, and one place to read the scheduler's
   concurrency (see *The cache pipeline* above). ✓
 * Kernel geometry does not live under the recipes package. DeepSeek V4.1's byte

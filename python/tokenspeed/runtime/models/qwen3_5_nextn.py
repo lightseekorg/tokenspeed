@@ -126,7 +126,13 @@ class Qwen3_5DraftForCausalLM(Qwen3_5ForCausalLM):
                 f"(got {config.num_hidden_layers}); the draft row narrowing "
                 "happens once, at the single layer's attention."
             )
-        super().__init__(config, mapping, quant_config=quant_config, prefix=prefix)
+        super().__init__(
+            config,
+            mapping,
+            quant_config=quant_config,
+            prefix=prefix,
+            enable_fp8_attn_proj=False,
+        )
 
 
 class Qwen3_5ForConditionalGenerationNextN(nn.Module):

@@ -48,7 +48,7 @@ public:
     // Per checkpoint, the State entries the plan has taken from this tier.
     using RemovedCheckpoints = std::unordered_map<ContentHash, std::int32_t>;
 
-    enum class BoundaryTier { kUncached, kProbationary, kEstablished, kClosedPrefix };
+    enum class BoundaryTier { kUncached, kProbationary, kEstablished, kClosedPrefix, kSink };
 
     struct Candidate {
         std::uint64_t last_access_epoch;
@@ -80,8 +80,7 @@ public:
 
     Candidate MakeCandidate(std::uint32_t group_id, CacheBlockLocation location,
                             const std::optional<PrefixCacheIndex::CachedBlockMetadata>& metadata) const {
-        return makeCandidate(group_id, groups_[group_id].Matcher().IsPrefixClosed(), location,
-                             metadata ? &metadata->eviction : nullptr);
+        return makeCandidate(group_id, groupRanking(group_id), location, metadata ? &metadata->eviction : nullptr);
     }
 
     static bool Before(const Candidate& lhs, const Candidate& rhs) { return evictionKey(lhs) < evictionKey(rhs); }
@@ -308,9 +307,24 @@ private:
                (request_reclaim_locations_ != nullptr && request_reclaim_locations_->contains(location));
     }
 
-    // `closed`: the group is prefix-closed. `metadata` is the entry's, null
-    // when no entry is at `location`.
-    Candidate makeCandidate(std::uint32_t group_id, bool closed, CacheBlockLocation location,
+    // The group facts a candidate's rank depends on, read once per epoch.
+    struct GroupRanking {
+        // The group is prefix-closed.
+        bool closed;
+        // A sliding group's sink: its leading logical blocks
+        // (GroupAllocator::KeptHeadBlocks), and whether it has one at all.
+        std::int32_t sink_blocks;
+        bool has_sink;
+    };
+    GroupRanking groupRanking(std::uint32_t group_id) const {
+        const CacheGroup& group = groups_[group_id];
+        return GroupRanking{.closed = group.Matcher().IsPrefixClosed(),
+                            .sink_blocks = group.Allocator().KeptHeadBlocks(),
+                            .has_sink = group.Spec().sink_tokens > 0};
+    }
+
+    // `metadata` is the entry's, null when no entry is at `location`.
+    Candidate makeCandidate(std::uint32_t group_id, const GroupRanking& ranking, CacheBlockLocation location,
                             const PrefixCacheIndex::EvictionMetadata* metadata) const {
         Candidate candidate{.last_access_epoch = metadata ? metadata->last_access_epoch : 0,
                             .location = location,
@@ -318,14 +332,17 @@ private:
         candidate.rank_epoch = candidate.last_access_epoch;
         const std::int32_t position = metadata ? metadata->logical_block_index : -1;
         const CacheBoundaryKind kind = metadata ? metadata->boundary_kind : CacheBoundaryKind::kChunk;
-        const bool probationary =
-            !closed && kind == CacheBoundaryKind::kChunk && !(metadata && metadata->was_acquired) && position >= 0;
-        if (candidate.last_access_epoch != 0) {
-            candidate.boundary_tier = probationary
+        const bool closed = ranking.closed;
+        const bool sink = position >= 0 && position < ranking.sink_blocks;
+        const bool probationary = !sink && !closed && kind == CacheBoundaryKind::kChunk &&
+                                  !(metadata && metadata->was_acquired) && position >= 0;
+        if (candidate.last_access_epoch != 0 || sink) {
+            candidate.boundary_tier = sink ? BoundaryTier::kSink
+                                      : probationary
                                           ? BoundaryTier::kProbationary
                                           : (closed ? BoundaryTier::kClosedPrefix : BoundaryTier::kEstablished);
         }
-        if (probationary) {
+        if (probationary || (!closed && ranking.has_sink)) {
             candidate.position_rank = position;
         } else if (closed && position >= 0) {
             candidate.position_rank = -static_cast<std::int64_t>(position);
@@ -389,12 +406,12 @@ private:
         }
         scanned_candidates_ += epoch_scratch_.size();
         group.candidates.reserve(epoch_scratch_.size());
-        const bool closed = groups_[group.group_id].Matcher().IsPrefixClosed();
+        const GroupRanking ranking = groupRanking(group.group_id);
         for (const auto& entry : epoch_scratch_) {
             if (excluded(entry.location) || aged(group.group_id, entry)) {
                 continue;
             }
-            group.candidates.push_back(makeCandidate(group.group_id, closed, entry.location, &entry.metadata));
+            group.candidates.push_back(makeCandidate(group.group_id, ranking, entry.location, &entry.metadata));
         }
         Sort(group.candidates, sort_scratch_);
     }
@@ -416,8 +433,8 @@ private:
                     entry->metadata.eviction.last_access_epoch < aging_.cutoff_epoch) {
                     continue;
                 }
-                Candidate candidate = makeCandidate(group_id, groups_[group_id].Matcher().IsPrefixClosed(),
-                                                    entry->location, &entry->metadata.eviction);
+                Candidate candidate =
+                    makeCandidate(group_id, groupRanking(group_id), entry->location, &entry->metadata.eviction);
                 candidate.rank_epoch = aging_.cutoff_epoch;
                 candidate.aged_distance = distance;
                 aged_.emplace_back(candidate, &hash);

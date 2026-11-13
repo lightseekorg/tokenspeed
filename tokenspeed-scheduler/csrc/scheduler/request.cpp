@@ -48,14 +48,17 @@ std::span<const std::string> Request::PromptPrefixHashes() {
 std::span<const std::string> Request::PromptPrefixHashes(std::int32_t num_pages) {
     const std::int32_t prompt_pages = submitted_prompt_size_ / prefix_granularity_;
     _assert(num_pages >= 0 && num_pages <= prompt_pages, "prompt hashes stay within complete submitted pages");
-    if (!prompt_prefix_hashes_) {
+    const bool first_lookup = !prompt_prefix_hashes_;
+    if (first_lookup) {
         // Room for every complete prompt page up front: the chain never grows
         // past that, so it never reallocates and earlier spans stay valid.
         prompt_prefix_hashes_.emplace().reserve(static_cast<std::size_t>(prompt_pages));
     }
     auto& hashes = *prompt_prefix_hashes_;
     const auto first = static_cast<std::int32_t>(hashes.size());
-    if (num_pages > first) {
+    // The first lookup is a hashing pass even with no complete page, so a
+    // profile shows every admitted prompt's hashing phase.
+    if (first_lookup || num_pages > first) {
         ExtendPrefixHashes(hashes, PrefixPages(first, num_pages));
     }
     return std::span<const std::string>(hashes).first(num_pages);

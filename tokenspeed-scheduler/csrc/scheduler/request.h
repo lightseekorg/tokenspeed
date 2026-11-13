@@ -351,6 +351,7 @@ public:
     }
 
 private:
+    friend struct SchedulerTestAccess;
     fsm::ForwardResources& forwardResources(const char* operation);
     const fsm::ForwardResources& forwardResources(const char* operation) const;
 

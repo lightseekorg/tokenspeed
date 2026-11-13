@@ -36,6 +36,7 @@ from transformers import PretrainedConfig
 from tokenspeed.runtime.configs.model_profile import ModelProfile
 from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.layers.quantization import QUANTIZATION_METHODS
+from tokenspeed.runtime.layers.quantization.inkling2 import is_inkling2_manifest_stub
 from tokenspeed.runtime.layers.rotary_embedding import yarn_get_mscale
 from tokenspeed.runtime.plugins import ensure_loaded
 from tokenspeed.runtime.plugins.registry import resolve_model_profile
@@ -53,6 +54,7 @@ from tokenspeed.runtime.utils.spec_block_geometry import (
     BLOCK_SPEC_ALGORITHMS,
     count_dspark_stages,
     read_checkpoint_block_size,
+    resolve_block_sample_from_anchor,
     resolve_block_widths,
     validate_block_widths,
 )
@@ -701,6 +703,7 @@ class ModelConfig:
             validate_drafter_algorithm(server_args.speculative_algorithm)
             require_plugin_draft_checkpoint(server_args)
         self.model_path = model_path
+        self.is_draft_worker = bool(is_draft_worker)
         self.revision = revision
         self.quantization = quantization
         self.mapping = server_args.mapping
@@ -752,10 +755,16 @@ class ModelConfig:
             resolved_profile[1] if resolved_profile is not None else None
         )
         self.spec_block_size: int | None = None
+        self.draft_sample_from_anchor: bool = False
         if is_draft_worker:
             self.spec_block_size = _apply_block_spec_widths(
                 server_args, self.hf_config, self.hf_text_config
             )
+            algorithm = server_args.speculative_algorithm
+            if algorithm in BLOCK_SPEC_ALGORITHMS:
+                self.draft_sample_from_anchor = resolve_block_sample_from_anchor(
+                    algorithm, self.hf_text_config, self.hf_config
+                )
         self.dspark_prefix_replay_tokens: int | None = None
         if (
             is_draft_worker
@@ -781,6 +790,13 @@ class ModelConfig:
             self.hf_text_config.dspark_num_stages = dspark_num_stages
             if self.hf_config is not self.hf_text_config:
                 self.hf_config.dspark_num_stages = dspark_num_stages
+        elif (
+            is_draft_worker
+            and resolve_architecture(self.hf_config)
+            == "Inkling2ForConditionalGenerationMTP"
+        ):
+            # Context K/V lives in the shared full-history group; nothing to replay.
+            self.dspark_prefix_replay_tokens = 0
         if (
             is_draft_worker
             and resolve_architecture(self.hf_config)
@@ -862,10 +878,12 @@ class ModelConfig:
                 "Running in encoder-only mode: the language model will not "
                 "be constructed or loaded (encode role)."
             )
-        if server_args.decode_monokernel:
+        if server_args.decode_monokernel and not is_draft_worker:
             # The model reads the switch from its text config. ServerArgs
             # accepts it only for DECODE_MONOKERNEL_ARCHITECTURES, whose
-            # text configs declare the field.
+            # text config classes declare the field (default False). A
+            # draft's config has no such class: load_model_config declares
+            # the field on it from its target.
             self.hf_text_config.decode_monokernel = True
         self.mm_attention_backend = getattr(server_args, "mm_attention_backend", None)
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
@@ -1028,10 +1046,17 @@ class ModelConfig:
 
     def _parse_quant_hf_config(self):
         quant_cfg = getattr(self.hf_config, "quantization_config", None)
+        if (
+            quant_cfg == {}
+            and resolve_architecture(self.hf_config)
+            == "Inkling2ForConditionalGenerationMTP"
+        ):
+            # The BF16 draft is explicitly unquantized; never read the target's manifest.
+            return None
         if quant_cfg is None:
             # compressed-tensors uses a "compression_config" key
             quant_cfg = getattr(self.hf_config, "compression_config", None)
-        if quant_cfg is None:
+        if quant_cfg is None or is_inkling2_manifest_stub(quant_cfg):
             # modelopt NVFP4 checkpoints store quant config in hf_quant_config.json
             # Resolve the local snapshot directory (model_path may be a HF hub ID)
             if os.path.isdir(self.model_path):
@@ -1057,6 +1082,8 @@ class ModelConfig:
                 if os.path.isfile(hf_quant_path):
                     with open(hf_quant_path, encoding="utf-8") as f:
                         hf_quant = json.load(f)
+                    if hf_quant.get("quant_method") == "inkling2":
+                        return hf_quant
                     quant_algo = hf_quant.get("quantization", {}).get("quant_algo", "")
                     if quant_algo:
                         quant_cfg = {
@@ -1254,6 +1281,7 @@ def is_multimodal_model(model_architectures: list[str] | None):
         "KimiK31ForConditionalGeneration",
         "Glm53FlashForConditionalGeneration",
         "InklingForConditionalGeneration",
+        "Inkling2ForConditionalGeneration",
         "MiniMaxM3SparseForConditionalGeneration",
         "NemotronH_Nano_Omni_Reasoning_V3",
         "MuseSparkForConditionalGeneration",
