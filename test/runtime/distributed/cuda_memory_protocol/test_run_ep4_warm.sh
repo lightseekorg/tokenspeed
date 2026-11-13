@@ -29,11 +29,12 @@ cd "$1"
 mkdir -p logs
 
 sp=/usr/local/conda/lib/python3.11/site-packages
-preload="$sp/torch_memory_saver_hook_mode_preload_cu12.abi3.so"
 export LD_LIBRARY_PATH=/opt/nccl-mt/lib:/usr/local/conda/lib:$sp/nvidia/cuda_runtime/lib:${LD_LIBRARY_PATH:-}
 export FLASHINFER_CUDA_ARCH_LIST=9.0a FLASHINFER_JIT_DEBUG=0
 export TOKENSPEED_KERNEL_VERBOSE=1
 unset TOKENSPEED_KERNEL_OVERRIDE_MOE_APPLY
+# Exercise the normal launcher's automatic hook setup rather than inheriting it.
+unset LD_PRELOAD
 
 scoped="$PWD/offline/scoped"
 shared="$PWD/offline/runtime-extra:$PWD/offline/kernel/tokenspeed-kernel/python"
@@ -51,7 +52,7 @@ run() {
         --ts-host-1 "$bb/tokenspeed-engine/python/tokenspeed_engine/bin/ts-host" \
         --pythonpath-0 "$shared:$aa/python:$aa/tokenspeed-engine/python" \
         --pythonpath-1 "$shared:$bb/python:$bb/tokenspeed-engine/python" \
-        --preload "$preload" --startup-timeout 90 --deadline 150 "$@" \
+        --startup-timeout 90 --deadline 150 "$@" \
         > "logs/$label-supervisor.log" 2>&1 || rc=$?
     local node
     for node in 0 1; do

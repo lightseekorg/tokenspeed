@@ -33,7 +33,7 @@ import stat
 import sys
 import textwrap
 import threading
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 
 import msgspec
 import pytest
@@ -237,6 +237,64 @@ def test_spawned_host_inherits_engine_log_level(
         (ready,) = receive_ready_messages([reader], [proc])
         assert ready["levels"] == expected
     finally:
+        proc.terminate()
+        proc.join(timeout=10)
+
+
+@pytest.mark.parametrize(
+    "inherited_preload, keep_inherited",
+    [
+        (None, False),
+        ("/test/another-hook.so", False),
+        ("/test/torch_memory_saver_custom.so:/test/another-hook.so", True),
+    ],
+)
+@pytest.mark.parametrize("prepend_hook", [False, True])
+def test_spawned_host_inherits_environment_from_start_context(
+    tmp_path, monkeypatch, inherited_preload, keep_inherited, prepend_hook
+):
+    if inherited_preload is None:
+        monkeypatch.delenv("LD_PRELOAD", raising=False)
+    else:
+        monkeypatch.setenv("LD_PRELOAD", inherited_preload)
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/original")
+    hook = "/test/torch_memory_saver_hook_mode_preload.so"
+    configured_preload = (
+        f"{hook}:{inherited_preload}"
+        if prepend_hook and inherited_preload is not None
+        else hook
+    )
+
+    @contextmanager
+    def start_context():
+        with monkeypatch.context() as launch_env:
+            launch_env.setenv("LD_PRELOAD", configured_preload)
+            launch_env.setenv("LD_LIBRARY_PATH", "/test/runtime:/original")
+            yield
+
+    binary = _fake_host(
+        tmp_path,
+        """
+        import os
+        connection.recv_bytes()
+        connection.send({
+            "status": "ready",
+            "preload": os.environ.get("LD_PRELOAD"),
+            "library_path": os.environ.get("LD_LIBRARY_PATH"),
+        })
+        time.sleep(600)
+        """,
+    )
+    proc, reader = start_rust_host(binary, *_rank_args(0), start_context(), None, False)
+    try:
+        (ready,) = receive_ready_messages([reader], [proc])
+        expected = inherited_preload if keep_inherited else configured_preload
+        assert ready["preload"] == expected
+        assert ready["library_path"] == "/test/runtime:/original"
+        assert os.environ.get("LD_PRELOAD") == inherited_preload
+        assert os.environ["LD_LIBRARY_PATH"] == "/original"
+    finally:
+        reader.close()
         proc.terminate()
         proc.join(timeout=10)
 

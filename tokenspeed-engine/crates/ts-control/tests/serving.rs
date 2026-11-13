@@ -5722,13 +5722,14 @@ fn dp_memory_missing_release_participant_can_cancel_without_sleeping() {
 }
 
 #[test]
-fn dp_memory_release_after_continue_generation_in_the_same_batch_succeeds() {
+fn dp_memory_release_in_the_continue_batch_is_refused_then_retry_succeeds() {
     let mut scripts = vec![vec![Vec::new(); 18]; 2];
     for script in &mut scripts {
         script[0].extend([
             EngineRequest::Control(Box::new(resume())),
             memory_transition(true, None),
         ]);
+        script[4].push(memory_transition(true, None));
         script[6].push(memory_transition(false, None));
     }
     scripts[0][9].push(EngineRequest::Add(Box::new(request("awake", 4, budget(2)))));
@@ -5750,6 +5751,7 @@ fn dp_memory_release_after_continue_generation_in_the_same_batch_succeeds() {
             outcome(rank.replies),
             [
                 ("ResumeSchedulerReqOutput", true),
+                ("ReleaseMemoryOccupationReqOutput", false),
                 ("ReleaseMemoryOccupationReqOutput", true),
                 ("ResumeMemoryOccupationReqOutput", true),
             ]
@@ -5758,6 +5760,56 @@ fn dp_memory_release_after_continue_generation_in_the_same_batch_succeeds() {
             rank.device_ops,
             ["release kv_cache,weights", "resume weights,kv_cache"]
         );
+    }
+}
+
+#[test]
+fn dp_memory_asymmetric_continue_refuses_current_calls_then_accepts_retry() {
+    for (layout, tp) in [(Layout::Dp(2), 1), (Layout::TpDp { tp: 2, dp: 2 }, 2)] {
+        let mut scripts = vec![vec![Vec::new(); 20]; 2];
+        // A single ingress cancels. The new release must receive the same
+        // refusal everywhere, rather than survive at only the cancelling one.
+        scripts[0][0].push(EngineRequest::Control(Box::new(resume())));
+        for script in &mut scripts {
+            script[0].push(memory_transition(true, None));
+            script[6].push(memory_transition(true, None));
+            script[10].push(memory_transition(false, None));
+        }
+        scripts[0][13].push(EngineRequest::Add(Box::new(request("awake", 4, budget(2)))));
+        let ranks = run_scripted(
+            layout,
+            0,
+            Tiers::DeviceOnly,
+            Setup {
+                replica_memory_transitions: true,
+                ..Setup::default()
+            },
+            scripts,
+            no_reaction,
+        );
+        assert_scripted_tokens(&ranks[0], "awake", 2);
+        for (rank, observed) in ranks.into_iter().enumerate() {
+            assert_eq!(observed.outcome, Ok(()));
+            let replies = outcome(observed.replies);
+            if rank % tp == 0 {
+                let mut expected = Vec::new();
+                if rank == 0 {
+                    expected.push(("ResumeSchedulerReqOutput", true));
+                }
+                expected.extend([
+                    ("ReleaseMemoryOccupationReqOutput", false),
+                    ("ReleaseMemoryOccupationReqOutput", true),
+                    ("ResumeMemoryOccupationReqOutput", true),
+                ]);
+                assert_eq!(replies, expected);
+            } else {
+                assert!(replies.is_empty());
+            }
+            assert_eq!(
+                observed.device_ops,
+                ["release kv_cache,weights", "resume weights,kv_cache"]
+            );
+        }
     }
 }
 

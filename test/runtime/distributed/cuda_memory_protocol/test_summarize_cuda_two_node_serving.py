@@ -36,9 +36,12 @@ def summarize(directory):
     mapping = [row for row in rank_rows if row["event"] == "mapping"]
     negotiated = [row for row in rank_rows if row["event"] == "negotiated"]
     ranks = {row["rank"] for row in mapping}
-    assert ranks == set(range(len(mapping)))
+    assert len(mapping) == 4 and ranks == set(range(4))
     assert {row["rank"] for row in negotiated} == ranks
     nodes_by_rank = {row["rank"]: row["node"] for row in mapping}
+    assert all(
+        len(row.get("mapped_memory_saver_hooks", [])) == 1 for row in mapping
+    ), "Missing or duplicate memory-saver hook evidence; rerun with the current harness"
     assert {row["rank"]: row["protocol"] for row in negotiated} == {
         rank: result["protocols"][node] for rank, node in nodes_by_rank.items()
     }
@@ -81,10 +84,29 @@ def summarize(directory):
     assert {
         row["rank"] for row in rank_rows if row["event"] == "service_ready"
     } == ranks
-    assert all(
-        len(tokens) == result["token_count"]
-        for tokens in result["tokens_per_ingress"].values()
+    # Keep both phases in the archive: a passing live assertion alone cannot
+    # let a reviewer independently check the restored output.
+    assert {
+        "tokens_per_ingress",
+        "tokens_after_resume_per_ingress",
+    } <= result.keys(), (
+        "Missing before/after token evidence; rerun with the current harness"
     )
+    before = result["tokens_per_ingress"]
+    after = result["tokens_after_resume_per_ingress"]
+    ingresses = range({"ep4": 4, "dp2-tp2-ep4": 2}[result["layout"]])
+    expected = {str(ingress) for ingress in ingresses}
+    assert isinstance(before, dict) and isinstance(after, dict)
+    assert set(before) == set(after) == expected, "Missing or unexpected ingress output"
+    assert result["token_count"] == 8
+    assert all(
+        isinstance(tokens, list)
+        and len(tokens) == 8
+        and all(type(token) is int and token >= 0 for token in tokens)
+        for phase in (before, after)
+        for tokens in phase.values()
+    ), "Expected eight token IDs for every ingress in both phases"
+    assert before == after, "Token output differs after resume"
     tags = result["tags"]
     expected_phases = {
         True: [set(tags) - {"nccl"}, {"nccl"}] if "nccl" in tags else [set(tags)],
@@ -107,7 +129,15 @@ def summarize(directory):
                 rank,
                 phases,
             )
-        earliest_ack = min(result[f"{operation}_ack_ns"])
+        # Timing alone cannot prove that every ingress replied.
+        acks = result.get(f"{operation}_ack_ns")
+        assert isinstance(acks, list) and len(acks) == len(
+            expected
+        ), f"Expected {len(expected)} {operation} ACKs, one per ingress"
+        assert all(
+            type(ack) is int and ack >= 0 for ack in acks
+        ), f"Expected integer timestamps for {operation} ACKs"
+        earliest_ack = min(acks)
         waits[operation] = round(
             (earliest_ack - max(row["ns"] for row in finished)) / 1e6, 3
         )
@@ -116,6 +146,7 @@ def summarize(directory):
     return summary | {
         "tags": tags,
         "tokens_per_ingress": result["tokens_per_ingress"],
+        "tokens_after_resume_per_ingress": after,
         "first_ack_after_last_rank_ms": waits,
     }
 

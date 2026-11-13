@@ -255,6 +255,7 @@ def accepted_case(wire, register_wires, args, engines, processes):
         assert all(process.poll() is None for process in processes)
         return {
             "tokens_per_ingress": before,
+            "tokens_after_resume_per_ingress": after,
             "token_count": count,
             "release_sent_ns": release,
             "release_ack_ns": release_replies,

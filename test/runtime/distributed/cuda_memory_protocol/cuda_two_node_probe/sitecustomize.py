@@ -65,6 +65,13 @@ if TRACE and HOST and Path("/proc/self/exe").resolve() == Path(HOST).resolve():
                 dp=list(mapping.attn.dp_group),
                 ep=list(mapping.moe.ep_group),
                 pp=list(mapping.pp_group),
+                mapped_memory_saver_hooks=sorted(
+                    {
+                        line.split()[-1]
+                        for line in Path("/proc/self/maps").read_text().splitlines()
+                        if "/torch_memory_saver_hook_mode_preload" in line
+                    }
+                ),
             )
             return original_init(self, server_args, *args, **kwargs)
 
