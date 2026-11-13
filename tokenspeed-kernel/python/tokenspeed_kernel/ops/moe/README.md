@@ -576,6 +576,34 @@ normalized FP32 weights (scale 1) and INT32 IDs into caller-owned buffers.
 The routing-only kernel has no expert-plan workspace or 8,192-token limit.
 Other contracts retain their existing routers.
 
+## Kimi-K3 front projections
+
+`try_latent_moe_input_projections` runs a registered fused implementation or
+returns `None` before any projection. This lets the runtime retain the
+separate projections and their stream scheduling for unsupported inputs.
+`latent_moe_input_projections` keeps its portable composition when no fused
+implementation is available. The generic packed Triton kernel
+(`triton_latent_input_packed`) is registered on AMD only: on NVIDIA the
+separate vendor GEMM projections are faster, so below the fused front's row
+bound no fused kernel matches and the runtime keeps the separate path.
+
+`cuda_latent_input` is the vendored FlashInfer/Cake fused front
+(`thirdparty/cuda/kimi3_latent_front.py` and `csrc/kimi3_latent_front/`): one
+persistent launch produces the FP32 router logits, the BF16 latent input and
+the BF16 SiTU-activated shared-expert input. It is registered on SM100 and
+SM103 parts with 148 or 152 SMs (the counts the plan rules are validated for)
+for 2048 BF16 rows or more (no upper bound: the plan scales with the row
+count), Kimi-K3's replicated router/latent weights, full shared-expert weights,
+and SiTU clamps 4 and 25. Attention-DP uses it only
+without shared-expert TP; EP routing/quantization and the shared down projection
+keep their existing owners. Smaller shapes and shared-expert TP retain their
+existing paths.
+
+The programs are JIT-built through FlashInfer's toolchain like the Kimi-K3
+router and do not depend on the FlashInfer package shipping its experimental
+kernel sources (release wheels omit them). Prepare/warm up before graph capture;
+no persistent activation tensors are cached per layer by this adapter.
+
 ## NVFP4 MegaMoE for Qwen3.5
 
 The `mega_moe` NVFP4 adapter supports gated SiLU (`silu(gate) * up`) and
