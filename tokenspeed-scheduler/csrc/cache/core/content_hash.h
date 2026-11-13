@@ -21,6 +21,7 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -44,7 +45,10 @@ public:
     using Digest = std::array<std::uint8_t, 32>;
 
     ContentHash() : value_{std::string{}} {}
-    explicit ContentHash(const char* text) : ContentHash(std::string_view{text}) {}
+    // A string literal. Taking the array rather than a pointer leaves no way
+    // to pass a null pointer, which std::string_view cannot hold.
+    template <std::size_t N>
+    explicit ContentHash(const char (&text)[N]) : ContentHash(std::string_view{text}) {}
     explicit ContentHash(const std::string& text) : ContentHash(std::string_view{text}) {}
     explicit ContentHash(std::string_view text) : value_{parse(text)} {}
     explicit ContentHash(std::string&& text) : value_{parse(std::move(text))} {}

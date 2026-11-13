@@ -370,7 +370,7 @@ TEST(BoundaryTreeTest, DroppingTheLastCheckpointUncountsItInEveryAncestor) {
 TEST(BoundaryTreeTest, TheLastHolderTakesItsNodeAndTheParentsLeftEmpty) {
     BoundaryTree tree{TreeConfig(1, false), /*checkpoints=*/nullptr};
     std::vector<BoundaryTree::Hold> leaves;
-    for (const char* leaf : {"x", "y", "z"}) {
+    for (const std::string leaf : {"x", "y", "z"}) {
         const std::vector<std::string> pages{"parent", leaf};
         BoundaryTree::Hold publication = Publish(tree, pages, 1, std::nullopt);
         leaves.push_back(tree.HoldEntry(ContentHash{leaf}, kDeviceKv));
@@ -459,7 +459,7 @@ TEST(BoundaryTreeTest, DuplicatePreflightPrunesPendingAndIncompletePrefixesAcros
     BoundaryTree::Hold chain_publication = Publish(tree, chain, 0, std::nullopt);
     BoundaryTree::Hold other_publication = Publish(tree, other_page, 0, std::nullopt);
     std::map<std::string, std::array<BoundaryTree::Hold, 2>> kv;
-    for (const char* hash : {"root", "left", "leaf", "other"}) {
+    for (const std::string hash : {"root", "left", "leaf", "other"}) {
         kv[hash][0] = tree.HoldEntry(ContentHash{hash}, kDeviceKv);
         kv[hash][1] = tree.HoldEntry(ContentHash{hash}, kDeviceKv);
     }

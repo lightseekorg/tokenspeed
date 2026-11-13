@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <list>
 #include <map>
@@ -346,7 +347,10 @@ TEST(ContentHash, CanonicalTextIsTheDigestFromEveryConstructor) {
         const std::string text = expected.ToString();
         ASSERT_EQ(text.size(), 64u);
         EXPECT_TRUE(std::ranges::all_of(text, [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); }));
-        for (const ContentHash& hash : {ContentHash(text), ContentHash(std::string(text)), ContentHash(text.c_str()),
+        // Characters in an array, as a string literal holds them.
+        char characters[65];
+        std::memcpy(characters, text.c_str(), sizeof(characters));
+        for (const ContentHash& hash : {ContentHash(text), ContentHash(std::string(text)), ContentHash(characters),
                                         ContentHash(std::string_view(text))}) {
             EXPECT_EQ(hash, expected);
             EXPECT_EQ(hash.Hash(), expected.Hash());
