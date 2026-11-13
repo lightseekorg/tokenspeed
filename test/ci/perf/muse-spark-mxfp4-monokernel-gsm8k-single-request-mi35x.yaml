@@ -4,13 +4,15 @@ api_version: ci.tokenspeed.io/v1
 # EP1) of an MI35x 8-GPU runner, which already serves this checkpoint for its
 # AIME26 eval.
 #
-# Requests run one at a time, so every decode step has one request and every
-# verify launch 8 token rows: the target's and the draft's monokernels serve
-# all of them. Layers 0 and 61 keep the regular path.
+# The benchmark sends the prompts twice: one request at a time (every decode
+# step one request, every verify launch 8 token rows), then two at a time
+# (most steps two requests in one launch, 16 rows). The target's and the
+# draft's monokernels serve both; layers 0 and 61 keep the regular path.
 #
-# One server start gates both: the benchmark exits with status 1 below
-# --min-accuracy, and perf_reference (set from this runner's runs) gates the
-# decode rate: a run whose decode steps leave the monokernels falls below it.
+# One server start gates both runs: the benchmark exits with status 1 when
+# either falls below --min-accuracy, and perf_reference (set from this
+# runner's runs) gates each run's decode rate: a run whose decode steps leave
+# the monokernels falls below it.
 name: perf-muse-spark-mxfp4-monokernel-gsm8k-single-request-mi35x
 type: perf
 workflow_stage: model-test
@@ -51,7 +53,7 @@ server:
     --speculative-num-draft-tokens 8
     --speculative-eagle-topk 1
     --max-model-len 65536
-    --max-num-seqs 1
+    --max-num-seqs 2
     --chunked-prefill-size 8192
     --max-prefill-tokens 8192
     --disable-prefill-graph
@@ -81,7 +83,7 @@ perf:
     --model muse-spark
     --config muse-spark-mxfp4-dflash2-monokernel
     --num-prompts 128
-    --concurrency 1
+    --concurrency 1 2
     --max-tokens 2048
     --chat-template-kwargs '{"reasoning_effort": "low"}'
     --min-accuracy 0.88

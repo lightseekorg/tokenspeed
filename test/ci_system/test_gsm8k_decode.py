@@ -63,7 +63,9 @@ def test_summary_csv_passes_the_pipeline_perf_gate():
         bench.RequestResult(101, 0.0, 0.5, ""),  # 200 tok/s
         bench.RequestResult(41, 0.0, 0.1, ""),  # 400 tok/s
     ]
-    csv = bench.summary_csv("cfg", results, wall_s=1.0, num_gpus=2, concurrency=1)
+    csv = bench.summary_csv(
+        [bench.summary_row("cfg", results, wall_s=1.0, num_gpus=2, concurrency=1)]
+    )
     rows = extract_perf_summary_rows(f"log line\n{csv}\nmore log")
     assert rows == [
         {
@@ -118,11 +120,20 @@ def test_requests_run_concurrency_at_a_time_in_prompt_order():
     assert state["peak"] == 1
 
 
-def test_summary_csv_reports_the_concurrency_the_gate_keys_on():
-    results = [bench.RequestResult(101, 0.0, 0.5, "")]
-    csv = bench.summary_csv("cfg", results, wall_s=1.0, num_gpus=1, concurrency=2)
-    rows = extract_perf_summary_rows(csv)
-    assert rows[0]["Conc."] == "2"
+def test_summary_csv_reports_each_concurrency_the_gate_keys_on():
+    one = [bench.RequestResult(101, 0.0, 0.5, "")]  # 200 tok/s, 100 tok/s/GPU
+    two = [bench.RequestResult(101, 0.0, 1.0, "")] * 2  # 100 tok/s, 202 tok/s/GPU
+    csv = bench.summary_csv(
+        [
+            bench.summary_row("cfg", one, wall_s=1.0, num_gpus=1, concurrency=1),
+            bench.summary_row("cfg", two, wall_s=1.0, num_gpus=1, concurrency=2),
+        ]
+    )
+    rows = extract_perf_summary_rows(f"log line\n{csv}\nmore log")
+    assert [r["Conc."] for r in rows] == ["1", "2"]
     results_by_stage = [{"stage": "perf", "perf_summary_rows": rows}]
-    task = {"perf_reference": {2: [180, 90]}, "perf_threshold": 0.9}
+    task = {"perf_reference": {1: [180, 90], 2: [90, 180]}, "perf_threshold": 0.9}
     assert check_perf_reference(task, results_by_stage, ["perf"])["passed"]
+    # A slow two-request run fails the gate though the one-request row passes.
+    task["perf_reference"][2] = [200, 400]
+    assert not check_perf_reference(task, results_by_stage, ["perf"])["passed"]
