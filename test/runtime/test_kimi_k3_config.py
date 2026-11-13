@@ -212,6 +212,7 @@ class TestKimiK3RegistrationTests:
                 self.w2_weight_scale = torch.empty(0)
                 self.plan = {"weight_dtype": "unquant"}
                 self.supports_deferred_finalize = False
+                self.sorted_route_rows = frozenset()
 
         class FakeSharedExperts(torch.nn.Module):
             def __init__(self, *args, **kwargs):
@@ -1013,6 +1014,7 @@ class TestKimiK3RegistrationTests:
                 # Consumed by K3MoeTailComm arming (real MoELayer exposes it
                 # from the selected kernel's plan trait).
                 self.supports_deferred_finalize = False
+                self.sorted_route_rows = frozenset()
 
             def forward(self, *, hidden_states, **kwargs):
                 return hidden_states + 1

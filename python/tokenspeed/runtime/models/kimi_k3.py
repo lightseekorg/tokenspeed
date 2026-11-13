@@ -89,8 +89,10 @@ from tokenspeed_kernel.ops.gemm import (
 )
 from tokenspeed_kernel.ops.moe import (
     kimi3_sigmoid_bias_topk_sorted,
+    kimi3_sorted_routing_accepts,
     kimi3_sorted_routing_fuses_shared_down,
     kimi3_sorted_routing_scratch,
+    kimi3_sorted_routing_supported,
     latent_moe_decode_pipeline_available,
     latent_moe_input_projections,
 )
@@ -2079,11 +2081,6 @@ _IRIS_MOE_ROW_SHARD_MIN_TOKENS = 40
 # Through this many rows a replicated residual takes the Lamport reduce and gather
 # tail; the Iris K3 fused decode row limit.
 _IRIS_MOE_GATHER_TAIL_MAX_TOKENS = 192
-# The A8W4 decode sorts routes from 8 rows through its warp-decode bound, which
-# follows the fused decode bound; the one-launch sort keeps 256 rows in its
-# arrival masks.
-_FUSED_ROUTING_MIN_ROWS = 8
-_FUSED_ROUTING_MAX_ROWS = min(_IRIS_MOE_GATHER_TAIL_MAX_TOKENS, 256)
 # Below this, row-sharded router/latent projection idles CUs and loses (8x MI350X).
 _IRIS_MOE_ROW_INPUT_MIN_TOKENS = 4096
 
@@ -2534,17 +2531,15 @@ class KimiLinearMoE(nn.Module):
             and self.experts.supports_precomputed_topk
             else None
         )
-        # Route and expert-sort decode rows in one launch for the gfx950 A8W4
-        # MoE, which then skips its own sort.
+        # Route and expert-sort decode rows in one launch where the MoE takes
+        # an upstream sort, which then skips its own.
         self._fused_routing_scratch: torch.Tensor | None = (
             kimi3_sorted_routing_scratch(
                 torch.device("cuda", torch.cuda.current_device())
             )
-            if self.experts.plan.get("apply_kernel_name")
-            == "gluon_mxfp4_a8w4_situ_precomputed_moe_apply"
+            if self.experts.sorted_route_rows
             and self.topk.topk_config.uses_sigmoid_bias_topk
-            and self.num_experts == 896
-            and self.top_k == 16
+            and kimi3_sorted_routing_supported(self.num_experts, self.top_k)
             else None
         )
 
@@ -3167,10 +3162,8 @@ class KimiLinearMoE(nn.Module):
             self._fused_routing_scratch is not None
             and precompute_topk
             and not self.topk.simulate_routing
-            and _FUSED_ROUTING_MIN_ROWS <= rows <= _FUSED_ROUTING_MAX_ROWS
-            and router_logits.shape == (rows, 896)
-            and router_logits.dtype == torch.float32
-            and router_logits.is_contiguous()
+            and rows in self.experts.sorted_route_rows
+            and kimi3_sorted_routing_accepts(router_logits)
         )
         shared_down = None
         if shared_input is not None:
@@ -3198,13 +3191,16 @@ class KimiLinearMoE(nn.Module):
                     # for bit, plus the A8W4 MoE's expert sort of them. Called
                     # directly, not through the registry: the sort is that
                     # MoE's own format, so no other solution can stand in.
+                    topk_config = self.topk.topk_config
                     topk_weights, topk_ids, *sorted_routes = (
                         kimi3_sigmoid_bias_topk_sorted(
                             router_logits,
-                            self.gate.e_score_correction_bias.float(),
-                            routed_scaling_factor=float(self.routed_scaling_factor),
-                            normalize_topk_weights=self.config.moe_renormalize,
-                            block_size=16,
+                            topk_config.correction_bias.float(),
+                            routed_scaling_factor=float(
+                                topk_config.routed_scaling_factor
+                            ),
+                            normalize_topk_weights=topk_config.renormalize,
+                            block_size=self.experts.sorted_route_block_size,
                             scratch=self._fused_routing_scratch,
                             shared_down=shared_down,
                         )
