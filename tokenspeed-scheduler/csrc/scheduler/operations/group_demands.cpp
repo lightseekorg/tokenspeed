@@ -57,7 +57,7 @@ std::int32_t groupReserveTokens(const CacheGroupConfig& group, const PrefillRese
         // one block, every hit page slides out before the first decode.
         const std::int32_t lookback = std::max(group.sliding_window_tokens.value_or(0) - 1, 0);
         const bool hit_counts =
-            !group.replayable && reserve.swa_prompt_after_hit_tokens < lookback + group.block_granularity;
+            !group.replayable && reserve.swa_prompt_after_hit_tokens < std::int64_t{lookback} + group.block_granularity;
         const std::int32_t unrecycled =
             std::min(std::max(hit_counts ? reserve.swa_hit_tokens : 0, reserve.swa_later_chunk_tokens), lookback);
         return std::max(reserve.DecodeTokens(), std::min(reserve.prompt_headroom_tokens, unrecycled));

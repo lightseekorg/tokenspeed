@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -226,10 +227,14 @@ TEST(ForwardCacheOpsPrefill, ChunkSlidesSwaWindowAndKeepsPunchedPageHashes) {
     // free before four fresh pages are acquired, for a net cost of two.
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), free_before_chunk - 2);
 
-    EXPECT_FALSE(coordinator.GroupPrefixIndex(1).Contains(pool, CacheKey{.group_id = 1, .content_hash = hashes[0]}));
-    EXPECT_FALSE(coordinator.GroupPrefixIndex(1).Contains(pool, CacheKey{.group_id = 1, .content_hash = hashes[1]}));
-    EXPECT_TRUE(coordinator.GroupPrefixIndex(1).Contains(pool, CacheKey{.group_id = 1, .content_hash = hashes[2]}));
-    EXPECT_TRUE(coordinator.GroupPrefixIndex(1).Contains(pool, CacheKey{.group_id = 1, .content_hash = hashes[3]}));
+    EXPECT_FALSE(coordinator.GroupPrefixIndex(1).Contains(
+        pool, CacheKey{.group_id = 1, .content_hash = ContentHash{hashes[0]}}));
+    EXPECT_FALSE(coordinator.GroupPrefixIndex(1).Contains(
+        pool, CacheKey{.group_id = 1, .content_hash = ContentHash{hashes[1]}}));
+    EXPECT_TRUE(coordinator.GroupPrefixIndex(1).Contains(
+        pool, CacheKey{.group_id = 1, .content_hash = ContentHash{hashes[2]}}));
+    EXPECT_TRUE(coordinator.GroupPrefixIndex(1).Contains(
+        pool, CacheKey{.group_id = 1, .content_hash = ContentHash{hashes[3]}}));
 }
 
 // The first decode step (query at position P) only reads keys back to P - W + 1.
@@ -659,6 +664,33 @@ TEST(SchedulerConfigValidateTest, ReplayableRequiresASlidingWindowGroup) {
     ExpectRejectedNamingGroup(config, "swa");
 }
 
+TEST(SchedulerConfigValidateTest, RejectsASlidingWindowThatABlockTakesPastInt32) {
+    SchedulerConfig config = MakeValidConfig();
+    CacheGroupConfig& group = config.cache_groups[0];
+    group.group_id = "long_window";
+    group.attn_kind = AttnKind::kSlidingWindow;
+    group.sliding_window_tokens = std::numeric_limits<std::int32_t>::max() - group.block_granularity;
+    EXPECT_NO_THROW(WithHostPackingFromDevice(config).Validate());
+    group.sliding_window_tokens = std::numeric_limits<std::int32_t>::max() - group.block_granularity + 1;
+    ExpectRejectedNamingGroup(config, "long_window");
+}
+
+TEST(SchedulerConfigValidateTest, ReplayBudgetPastInt32IsRejected) {
+    // A replayable window of 1.5 * 2^30 tokens: a hit chunk needs replay plus
+    // a window, 3 * 2^30 tokens, which no int32 budget holds.
+    SchedulerConfig config = MakeValidConfig();
+    CacheGroupConfig swa;
+    swa.group_id = "swa";
+    swa.block_granularity = 64;
+    swa.total_pages = config.device_allocator.total_pages;
+    swa.attn_kind = AttnKind::kSlidingWindow;
+    swa.sliding_window_tokens = 3 << 29;
+    swa.replayable = true;
+    config.cache_groups.push_back(swa);
+    config.max_scheduled_tokens = std::numeric_limits<std::int32_t>::max();
+    EXPECT_THROW(WithHostPackingFromDevice(config).Validate(), std::invalid_argument);
+}
+
 TEST(SchedulerConfigValidateTest, ReplayNeedsBudgetForAWindowOnEveryRole) {
     SchedulerConfig config = MakeValidConfig();
     CacheGroupConfig swa;
@@ -809,6 +841,31 @@ TEST(SchedulerConfigValidateTest, ForcedRetractionRequiresASnapshotPool) {
     EXPECT_NO_THROW(WithHostPackingFromDevice(config).Validate());
     config.debug_force_retraction_interval = 0;
     EXPECT_NO_THROW(WithHostPackingFromDevice(config).Validate());
+}
+
+TEST(SchedulerConfigValidateTest, ForcedRetractionIntervalHasAnInt32Magnitude) {
+    // Its magnitude is the period in plans; INT32_MIN has none in int32.
+    SchedulerConfig config = MakeValidConfig();
+    for (const std::int32_t interval :
+         {std::numeric_limits<std::int32_t>::max(), -std::numeric_limits<std::int32_t>::max()}) {
+        config.debug_force_retraction_interval = interval;
+        EXPECT_NO_THROW(WithHostPackingFromDevice(config).Validate()) << interval;
+    }
+    config.debug_force_retraction_interval = std::numeric_limits<std::int32_t>::min();
+    EXPECT_THROW(WithHostPackingFromDevice(config).Validate(), std::invalid_argument);
+}
+
+TEST(SchedulerConfigValidateTest, RejectsANegativeHostPageCount) {
+    // 0 and the null page alone both mean no Host pool.
+    SchedulerConfig config = MakeValidConfig();
+    for (const std::int32_t pages : {0, 1}) {
+        config.host_allocator.total_pages = pages;
+        EXPECT_NO_THROW(WithHostPackingFromDevice(config).Validate()) << pages;
+    }
+    for (const std::int32_t pages : {-1, std::numeric_limits<std::int32_t>::min()}) {
+        config.host_allocator.total_pages = pages;
+        EXPECT_THROW(WithHostPackingFromDevice(config).Validate(), std::invalid_argument) << pages;
+    }
 }
 
 TEST(SchedulerConfigValidateTest, RetractionDiagnosticsNameTheServerArgs) {

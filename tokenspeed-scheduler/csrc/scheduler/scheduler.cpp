@@ -282,7 +282,7 @@ void Scheduler::registerKvEventPrefixPages(Request& request, std::span<const std
 
     for (std::size_t i = static_cast<std::size_t>(first_page); i < static_cast<std::size_t>(past_end_page); ++i) {
         const std::span<const std::int32_t> tokens = token_pages[i - static_cast<std::size_t>(first_page)];
-        CacheKey key{.content_hash = prefix_hashes[i]};
+        CacheKey key{.content_hash = ContentHash{prefix_hashes[i]}};
         const std::optional<std::uint64_t> parent_hash =
             i == 0 ? std::nullopt : std::optional<std::uint64_t>{block_hashes[i - 1]};
         KvBlockStoredEvent event{
@@ -403,6 +403,7 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
     request_ids.reserve(request_specs.size());
     std::vector<std::unique_ptr<Request>> pending_requests;
     pending_requests.reserve(request_specs.size());
+    const std::int32_t max_token_limit = CapacityModel::MaxRequestTokenLimit(config_);
     for (const RequestSpec& spec : request_specs) {
         if (spec.tokens.empty()) {
             throw std::invalid_argument("Scheduler: request tokens must be non-empty");
@@ -429,8 +430,10 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
         const std::int64_t generation_reserve =
             config_.role == Role::kP ? 0 : std::max<std::int64_t>(spec.max_new_tokens, config_.decode_input_tokens);
         const std::int64_t token_limit = static_cast<std::int64_t>(spec.tokens.size()) + generation_reserve;
-        if (token_limit > std::numeric_limits<std::int32_t>::max()) {
-            throw std::invalid_argument("Scheduler: request token limit exceeds int32 range");
+        if (token_limit > max_token_limit) {
+            throw std::invalid_argument("Scheduler: request token limit " + std::to_string(token_limit) + " exceeds " +
+                                        std::to_string(max_token_limit) +
+                                        ", the int32 token range less its decode and rounding headroom");
         }
         if (token_limit > max_single_request_tokens_) {
             throw std::invalid_argument("Scheduler: request token limit " + std::to_string(token_limit) +

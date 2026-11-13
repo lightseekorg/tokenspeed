@@ -91,7 +91,12 @@ public:
         return true;
     }
 
+    // Every boundary node leaving the tree calls this, chain hashes too. With
+    // no tail recorded, this and the lookups below answer without hashing.
     void Remove(const ContentHash& hash) {
+        if (prior_of_.empty()) {
+            return;
+        }
         const auto prior_it = prior_of_.find(hash);
         if (prior_it == prior_of_.end()) {
             return;
@@ -113,6 +118,9 @@ public:
 
     // The tail offset a hash was published with; nullopt for a chain hash.
     std::optional<std::int32_t> TailTokensOf(const ContentHash& hash) const {
+        if (prior_of_.empty()) {
+            return std::nullopt;
+        }
         const auto prior_it = prior_of_.find(hash);
         if (prior_it == prior_of_.end()) {
             return std::nullopt;
@@ -126,7 +134,7 @@ public:
         return std::nullopt;
     }
 
-    bool Contains(const ContentHash& hash) const { return prior_of_.contains(hash); }
+    bool Contains(const ContentHash& hash) const { return !prior_of_.empty() && prior_of_.contains(hash); }
     std::size_t Size() const { return prior_of_.size(); }
     std::int64_t CapEvictions() const { return cap_evictions_; }
 

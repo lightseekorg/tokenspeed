@@ -60,8 +60,14 @@ public:
     // LCM blocks that place group_pages[g] child pages in every group g.
     std::int64_t LcmBlocksNeededFor(std::span<const std::int64_t> group_pages) const;
 
-    // Largest token_limit whose SingleRequestGroupPages fit usable_lcm_blocks.
+    // Largest token_limit whose SingleRequestGroupPages fit usable_lcm_blocks,
+    // at most MaxRequestTokenLimit.
     std::int32_t MaxSingleRequestTokens(std::int64_t usable_lcm_blocks) const;
+
+    // Largest token limit (Scheduler::SubmitRequests) whose int32 token
+    // positions stay in range: INT32_MAX less what the scheduler adds past the
+    // limit, its decode windows and the rounding to a block or prefix page.
+    static std::int32_t MaxRequestTokenLimit(const SchedulerConfig& config);
 
     // Tokens of the next verify window a speculative decode reserves for its draft steps; 0 without one or on P.
     static std::int64_t DraftWindowTokens(const SchedulerConfig& config);

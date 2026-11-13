@@ -61,7 +61,10 @@ from tokenspeed.runtime.execution.cudagraph_memory import (
     ladder_from_plan,
 )
 from tokenspeed.runtime.execution.drafter import get_drafter_impl
-from tokenspeed.runtime.execution.drafter.base import DrafterExtendCapture
+from tokenspeed.runtime.execution.drafter.base import (
+    EXTEND_STEP0_SERIES,
+    DrafterExtendCapture,
+)
 from tokenspeed.runtime.execution.drafter.eagle_harness.config import (
     EagleHarnessConfig,
 )
@@ -1125,24 +1128,24 @@ class ModelExecutor:
     def _drafter_extend_plan(self) -> dict[str, list[tuple[int, int]]]:
         """The drafter's extend graphs this boot records, per series.
 
-        Only with ``--enable-drafter-prefill-graph``, the target's prefill
-        graph on, and a drafter that can capture them in this configuration;
-        they share the target's token buckets and capture each at the
-        bucket's exact request counts (``--prefill-graph-capture-batch-sizes``,
-        unset: the fewest requests that fit the bucket in the context length).
-        The capture and the projection read this one plan, so they reach the
-        same verdict.
+        Only with the target's prefill graph on and a drafter that can capture
+        them in this configuration. The decode steps' graphs are recorded at
+        each request count from 1 to ``EXTEND_DECODE_MAX_REQUESTS`` (at most
+        the batch); the step-0 graphs (``--enable-drafter-prefill-graph``)
+        share the target's token buckets and are captured at the bucket's
+        exact request counts
+        (``--prefill-graph-capture-batch-sizes``, unset: the fewest requests
+        that fit the bucket in the context length). The capture and the
+        projection read this one plan, so they reach the same verdict.
         """
-        if (
-            not self.config.enable_drafter_prefill_graph
-            or self.prefill_graph.disable
-            or self.drafter is None
-        ):
+        if self.prefill_graph.disable or self.drafter is None:
             return {}
         plan = self.drafter.extend_graph_plan(
             self.prefill_graph.capture_buckets,
             partial(resolve_prefill_capture_batch_sizes, self.config),
         )
+        if not self.config.enable_drafter_prefill_graph:
+            plan.pop(EXTEND_STEP0_SERIES, None)
         return {series: entries for series, entries in plan.items() if entries}
 
     @property
@@ -1152,18 +1155,18 @@ class ModelExecutor:
 
     def _validate_drafter_extend_graphs(self) -> None:
         """Refuse ``--enable-drafter-prefill-graph`` when this boot would
-        record no drafter graph.
+        record no step-0 graph.
 
         ``ServerArgs.validate_drafter_prefill_graph`` refuses the launches the
         arguments decide; whether the prefill graph is on and whether the
         drafter supports its loaded draft model are known only here.
 
         Raises:
-            ValueError: The switch is on and the plan is empty.
+            ValueError: The switch is on and the plan has no step-0 series.
         """
         if (
             not self.config.enable_drafter_prefill_graph
-            or self.captures_drafter_extend_graphs
+            or EXTEND_STEP0_SERIES in self._drafter_extend_plan()
         ):
             return
         if self.prefill_graph.disable:
