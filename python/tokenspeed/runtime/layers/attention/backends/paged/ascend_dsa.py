@@ -741,7 +741,7 @@ class AscendDSABackend(DSABackend):
             )
         rows = selection.query.shape[1]
         if rows not in self._fused_attention_outputs:
-            raise ValueError("Fused DSA LSE requires a prepared [64,T,512] SFA shape")
+            raise ValueError("Fused DSA LSE requires prepared SFA producer outputs")
         output, softmax_max, softmax_sum = kernels.attention_partial(
             selection.query,
             kv_cache,
@@ -754,8 +754,12 @@ class AscendDSABackend(DSABackend):
             sparse_mode=selection.sparse_mode,
             out=self._fused_attention_outputs[rows],
         )
-        if output.shape != (64, rows, 512):
-            raise ValueError("Fused DSA LSE requires a prepared [64,T,512] SFA shape")
+        expected_shape = (spec.num_attention_heads, rows, spec.kv_lora_rank)
+        if output.shape != expected_shape:
+            raise ValueError(
+                f"Fused DSA LSE requires prepared SFA shape {expected_shape}, "
+                f"got {tuple(output.shape)}"
+            )
         result = kernels.merge_lse_direct(
             output,
             softmax_max,

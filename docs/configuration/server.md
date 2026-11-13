@@ -79,6 +79,48 @@ its request partition is invalidated before another PD owner uses it.
 | `--mamba-ssm-dtype` | Stored linear-attention recurrent state dtype (GDN and KDA): `float32` (default) or `bfloat16`. Scans still accumulate in FP32; `bfloat16` halves state memory. |
 | `--quantization` | Weight quantization mode such as `fp8`, `nvfp4`, `w8a8_fp8`, or `compressed-tensors`. |
 | `--quantization-param-path` | JSON file of FP8 KV cache scaling factors, read only under an FP8 KV cache. KV caches run unscaled, so every factor must be 1.0, as must any KV-cache scale the checkpoint carries. |
+| `--enable-fp8-attn-proj` | Enable online FP8 QKV/O and GDN QKVZ/output projections in the Qwen3.5 or Qwen4-Exp target model. Off by default. |
+
+### Qwen FP8 attention projections
+
+Online conversion applies to floating target projection weights. It preserves
+existing FP8 configs and per-projection formats in mixed checkpoints. MTP draft
+projections follow the checkpoint.
+
+Group128 quantizes floating weights once after loading with 128×128 block
+scales and dynamically quantizes activation rows in groups of 128 channels.
+The GEMM returns the model's floating activation dtype. On SM100/SM103,
+`--dense-gemm-backend deepgemm` prepares UE8M0 weight scales and writes
+activation scales directly into the packed layout. The `auto` backend uses
+FP32 scales for this online block FP8 path.
+
+For an NVFP4 checkpoint with floating attention projections, use
+
+```bash
+--quantization nvfp4 --enable-fp8-attn-proj
+```
+
+Target models resolve the projection switch once and pass it to their layers.
+MTP backbones explicitly disable additional online FP8 projection quantization
+and retain their checkpoint quantization policy.
+
+GDN splits its input into an FP8 QKVZ GEMM and a floating BA GEMM. Any split
+QKVZ/BA projection uses BA overlap when an auxiliary stream is available,
+regardless of quantization format. The streams join before the attention boundary.
+The standard FP8 exclusions cover BA, convolution, and Mamba mixer
+projections. Explicit checkpoint exclusions also apply.
+With the switch off, floating GDN checkpoint projections stay floating even
+with a global online FP8 config. Serialized GDN projections use the
+checkpoint config.
+
+#### Projection fusion
+
+With packed DeepGEMM scales, eligible BF16 output projections fuse activation
+quantization with the full-attention sigmoid gate or GDN per-head RMSNorm and
+SiLU/sigmoid gate. This path preserves the BF16 rounding boundary and supports
+group128, CUDA Graph and PDL. Fusion requires a power-of-two head width of at
+least 128 and BF16 norm weights for GDN. Other supported projection layouts
+apply the gate or norm before a separate quantization launch.
 
 ## Numerics
 
@@ -112,7 +154,7 @@ switch an envelope folds is also available individually under `auto`.
 | `--served-model-name` | The model's name in metric labels. Under `ts serve`, requests may also name the model by it; the OpenAI-compatible API lists the model path. |
 | `--api-key` | SMG gateway API key for authorization with upstream workers. |
 | `--chat-template` | Built-in chat template name or template file path (handled by the smg gateway). |
-| `--stream-interval` | Streaming buffer interval in generated tokens. Smaller values stream more frequently. |
+| `--stream-interval` | Streaming buffer size in generated tokens. The server streams the first step's tokens at once, then whenever at least this many tokens are unsent. Smaller values stream more often. |
 | `--weight-version` | Initial model-weight version, the L3 cache's namespace (see [Weight versions](#weight-versions)). Defaults to `default`. |
 | `--model-update-config` | JSON object handed to the Model Updater SDK for the Mooncake weight update. Requires the three flags below; see [Mooncake weight updates](#mooncake-weight-updates). |
 | `--model-update-sdk-module` | Import path of the Model Updater SDK module. Imported in the scheduler process on the first Mooncake update, not at startup. Required with `--model-update-config`. |
@@ -129,6 +171,28 @@ only after the load succeeds on every rank. A new `weight_version` requires
 checkpoints cannot share a namespace. Intermediate loads pass `None` to keep
 the current one until the last load flushes. Without L3 storage the engine
 keeps no version.
+
+### NPU top-p sampling
+
+The HF model config boolean `npu_sampling_top_p_top_k_cap` is **false by
+default**. Enable NPU sampling candidate truncation at startup with:
+
+```bash
+--hf-overrides '{"npu_sampling_top_p_top_k_cap": true}'
+```
+
+On `ascend_full`, a request with `top_p < 1` and omitted `top_k` (or
+`top_k=-1`) then uses an effective `top_k=4096`: select the top 4096
+candidates, normalize their probabilities, then apply top-p filtering.
+This limits the candidate set and can change the distribution compared
+with whole-vocabulary top-p sampling. Set the field to `false` for
+whole-vocabulary top-p; the override affects the loaded configuration,
+without editing the checkpoint's `config.json`.
+
+The option does not affect GPU sampling backends, `top_p=1`, greedy
+requests, or explicit finite top-k values. Existing `ascend_full` behavior
+still caps explicit finite top-k above 4096 at 4096. The same per-request
+policy applies in eager execution, graph replay and chain verification.
 
 ### Logprobs
 
@@ -447,6 +511,8 @@ Trainer-side contract:
 | `--enable-prefix-caching` / `--disable-prefix-caching` | Enable or disable prefix cache reuse. |
 | `--enforce-eager` | Disable device-graph execution (CUDA Graph on CUDA, ACL Graph on NPU). |
 | `--disable-prefill-graph` | Keep prefill eager while leaving decode device graphs enabled. |
+| `--decode-monokernel` | Run each decoder layer's small decode steps as one persistent monokernel launch on gfx950 ([decode monokernel design](../design/monokernel.md)). Off by default. Models: Qwen3.8-Flash-Next (`Qwen4ExpForCausalLM`, `Qwen4ExpForConditionalGeneration`) and Muse Spark (`MuseSparkForConditionalGeneration`, with its DFlash2 draft). Startup fails when a layer cannot be packed; larger steps keep the regular path. |
+| `--monokernel-stuck-record-dir` | With `--decode-monokernel`: a directory on tmpfs (for example `/dev/shm`) where each rank keeps its stuck-poll record file; the file is GPU-registered host memory, and a disk filesystem's periodic writeback of it stalls decode. A launch poll that gives up writes what it waited for there before the launch traps, so the record outlives the process. Without it the records stay in pinned memory and are logged when the failure reaches Python. |
 | `--disable-kda-prefill-graph` | Disable KDA prefill CUDA graphs while retaining ordinary prefill and decode graph settings. Enabled by default for supported `cutedsl_kda` prefill attention when prefill graphs are enabled. |
 | `--disable-cudagraph-memory-reserve` | Size the KV cache from free memory instead of reserving what the device graphs will cost and, on CUDA, what startup keeps resident. |
 | `--max-cudagraph-capture-size` | Largest decode batch size to capture as a device graph. |
@@ -663,7 +729,7 @@ must equal `--speculative-num-steps + 1`. With `--speculative-eagle-topk` above 
 they draft a tree instead, and `--speculative-num-draft-tokens` is its node
 budget (root included). Set it explicitly: topk 1..16, steps 1..10,
 `(steps - 1) * topk` lane slots within the node budget, and at most 64 nodes. Trees need the `trtllm`
-attention backends (`trtllm_mla` or `tokenspeed_mla` for MLA models) and the `greedy`, `triton` or `flashinfer` sampling backend; see
+attention backends (`trtllm_mla` or `tokenspeed_mla` for MLA models) and the `greedy`, `triton`, `flashinfer` or `sonic` sampling backend; see
 [draft-tree speculation](../design/tree-speculation.md) for the full scope.
 
 `MTP` serves two head shapes under one flag. An Eagle-like head (one MTP
@@ -778,7 +844,11 @@ head spanning the target vocabulary, the draft steps stay sharded too (`Draft
 steps stay vocab-sharded`): each rank samples its shard of the draft logits,
 the ranks exchange a few values per request instead of the logits, every rank
 draws the same token, and each records `q` over its own vocabulary columns;
-its verify candidates carry that `q` through their gather.
+its verify candidates carry that `q` through their gather. An EAGLE3 head with
+a smaller hot-token vocabulary (`d2t`) still gathers its draft logits, because
+its columns do not line up with the target's shards, but each rank records
+`q` over its own vocabulary columns only (`Draft steps gather the hot-token
+head's logits and each rank records q over its own columns`).
 
 Known limits, kept as in the reference engine for now: a landed PD request's
 first verify always rejects its shipped candidates (sentinel rows) rather than
@@ -919,9 +989,10 @@ public address used by EPD.
 
 | Parameter | Purpose |
 | --- | --- |
-| `--log-level` | Runtime log level. |
+| `--log-level` | Engine logging threshold for Python, the Rust host and the C++ scheduler. Python `critical`/`fatal` maps to Rust `error`, its highest severity. Explicit `TS_HOST_LOG` and `SPDLOG_LEVEL` settings override their native writers. |
 | `--enable-async-logging` | Write Rust host and default Python root logs on background threads. Defaults to off; `--no-enable-async-logging` explicitly selects synchronous output. |
-| `--enable-log-request-stats` | Log a one-line per-request performance summary on finish/abort (see below). |
+| `--ttft-trace-sampling-percentage` | Percentage of PD rooms to trace through their first engine output (0–100, default 0). |
+| `--enable-log-request-stats`, `--enable-request-time-stats-logging` | Log a one-line per-request performance summary on finish/abort (see below). |
 | `--enable-metrics` | Enable the selected metrics reporters. |
 | `--metrics-reporters` | Select `prometheus` or an installed metric output; repeat for multiple. Defaults to `prometheus`. |
 | `--metrics-reporter-config` | JSON file mapping external reporter names to their settings. See [metric output plugins](../metrics-plugins.md). |
@@ -1086,14 +1157,77 @@ finish reason) plus the cached prompt tokens and preemption counts, with the
 lifecycle points as time-stamped events. See
 [the tracing design](../design/tracing.md).
 
+### Request lifecycle logs
+
+Search the engine logs for a request ID to follow it across roles. For example,
+`rg -F 'chatcmpl-019ef6b7' prefill.log decode.log` finds both sides of a
+disaggregated request when the frontend uses the same ID. The PD events also
+carry `bootstrap_room` to correlate peers that use different request IDs.
+
+| Event | When it appears | Fields besides `rid` |
+| --- | --- | --- |
+| `ts_request_accepted` | The engine registers the request. | Role, session ID when present, input tokens and effective maximum new tokens |
+| `ts_prefill_kv_transfer_queued` | A prefill rank queues the final KV chunk for a data transfer. | Bootstrap room, rank, token range `[start_idx, end_idx)` and block count across cache groups |
+| `ts_decode_kv_transfer_success` | The decode replica confirms receipt of KV and the bootstrap token. | Bootstrap room, rank, cached tokens and output token count |
+| `ts_decode_kv_transfer_failed` | The decode replica confirms transfer failure. | Bootstrap room (also retained as `room` for compatibility), rank and failure reason when available |
+| `ts_request_finished` | The engine releases the request or refuses it at admission. | Role, prompt, cached and completion token counts, finish and abort reasons, `e2e_latency_s` when the frontend supplied a creation time, and optional `request_stats` |
+
+These events are enabled for every request at the default INFO log level, with
+WARN for a failed transfer. They are independent of the request-stats flag and
+TTFT sampling percentage.
+Request admission and completion use the same logging ranks as the per-request
+stats. Each PD role records its own completion time. Ingress refusals have a
+finish event only. A duplicate-ID refusal logs a finish event for the rejected
+submission with an abort reason; the original request with that ID remains live
+and emits its own finish event later.
+
+Logging uses synchronous writers by default. `--enable-async-logging` moves
+Rust and Python root logger writes to bounded background queues; C++ scheduler
+logs still write synchronously. Formatting and queueing cost CPU time, and full
+asynchronous queues can drop records.
+
+For a first successful prefill admission, set `TOKENSPEED_PREFIX_CACHE_DIAGNOSTICS=1`
+to include the Device and Host contributions to the prefix hit in
+`[PrefixCacheDiagnostic]`. Their sum is the resumed token count.
+`host_gain_tokens` measures the extra reusable prefix beyond a device-only match.
+At DEBUG, the native client logs the chosen engine and routing policy by request
+ID. Scheduler diagnostics (`SPDLOG_LEVEL=debug`) report restore and decode
+preallocation waits, and link L3 prefetch queries, reads and timeouts to the request ID.
+
+### Sampled PD first-output logs
+
+Set `--ttft-trace-sampling-percentage 1` on both roles to select approximately
+1% of rooms. The selection uses the CRC32 of the decimal bootstrap room,
+modulo 1000, with a threshold of ten times the percentage. A frontend owner
+records a selected request once, even when several token batches stream out.
+Pair the JSON records using `endpoint` and `room` within the same time window.
+
+| INFO record | Boundary | Measurements |
+| --- | --- | --- |
+| `TTFTBootstrap` | The prefill replica agrees the room is bootstrapped | Engine registration to bootstrap agreement |
+| `TTFTBreakdown` on Prefill | First engine output or terminal release | Bootstrap, admission to first dispatch after bootstrap, prompt execution, transfer observation and output preparation |
+| `TTFTBreakdown` on Decode | First engine output or terminal release | Bootstrap, KV landing after bootstrap, and landing to output |
+
+Prefill holds its first output until the KV transfer completes. Its normal
+breakdown therefore includes `transfer_observe` and `output_pack`; producing
+the bootstrap token alone does not emit the breakdown.
+
+Schema `ts-engine-v1` measures local `phases_ms` and `engine_elapsed_ms` on a
+monotonic clock. `first_dispatch_ms` is relative to engine registration.
+`total_ms` starts at the frontend creation timestamp when supplied and ends
+when the engine prepares the output. Unreached phases and an unavailable
+creation time are JSON null. Tokenization, detokenization and delivery to the
+HTTP client belong to the gateway and fall outside this measurement.
+
 ### Per-request stats
 
-`--enable-log-request-stats` enriches the scheduler's per-request finish line for
-latency/throughput debugging. When set, the `Req: <rid> Finish! ...` line carries
-a Python-object repr (`RequestStats(...)`) instead of the default
-`Accept_num_tokens_avg` value (which it subsumes as `acc_len`). The scheduler
-derives every field from host-side timestamps and counters it already has —
-the line adds **no GPU sync** and so no engine slowdown. Example:
+`--enable-log-request-stats` adds a `request_stats` field to the existing
+`ts_request_finished` event for registered requests. There is one finish log
+record per completion. The field retains the `Req: <rid> Finish! RequestStats(...)`
+text, including the speculative acceptance average as `acc_len`. With the flag
+off, the finish event still appears without detailed stats. The scheduler derives
+the stats from host-side timestamps and counters, adding no GPU synchronization;
+formatting and writing the log still have a CPU cost. Example `request_stats` value:
 
 ```
 Req: chatcmpl-019ef6b7 Finish! RequestStats(status='finished', reason='stop', prompt_tokens=28684, cache_tokens=832, output_tokens=33, cache_hit_rate=0.029, queue_ms=13.8, prefill_ms=15.8, decode_wait_ms=0.0, ttft_ms=42.1, total_ms=58.0, preempt_ms=0.0, preempt_count=0, decode_tps=210.4, acc_len=None, acc_rate=None, recv_ts=1782255696.726, commit_ts=1782255696.74, finish_ts=1782255696.784)

@@ -33,6 +33,7 @@ std::vector<CacheGroupSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {
         specs.push_back(CacheGroupSpec{
             .attn_kind = kind,
             .sliding_window = is_swa ? *group.sliding_window_tokens : 0,
+            .sink_tokens = group.sink_tokens,
             .replayable = group.replayable,
             .cache_blocks_per_lcm_block = group.cache_blocks_per_lcm_block,
             .block_granularity = group.block_granularity,

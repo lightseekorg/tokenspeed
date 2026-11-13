@@ -83,10 +83,12 @@ impl Wire for bool {
 macro_rules! wire_int {
     ($($ty:ty => $write:ident),* $(,)?) => {$(
         impl Wire for $ty {
+            #[inline]
             fn encode(&self, encoder: &mut Encoder) {
                 encoder.$write((*self).into());
             }
 
+            #[inline]
             fn decode(decoder: &mut Decoder<'_>) -> Result<Self> {
                 decoder.integer()?.narrow(stringify!($ty))
             }
@@ -94,13 +96,27 @@ macro_rules! wire_int {
     )*};
 }
 
-wire_int!(i32 => int, i64 => int, u16 => uint, u32 => uint, u64 => uint);
+wire_int!(i64 => int, u16 => uint, u32 => uint, u64 => uint);
+
+impl Wire for i32 {
+    #[inline]
+    fn encode(&self, encoder: &mut Encoder) {
+        encoder.int(i64::from(*self));
+    }
+
+    #[inline]
+    fn decode(decoder: &mut Decoder<'_>) -> Result<Self> {
+        decoder.int32()
+    }
+}
 
 impl Wire for f64 {
+    #[inline]
     fn encode(&self, encoder: &mut Encoder) {
         encoder.float(*self);
     }
 
+    #[inline]
     fn decode(decoder: &mut Decoder<'_>) -> Result<Self> {
         decoder.float()
     }
@@ -118,6 +134,7 @@ impl Wire for String {
 
 /// `None` is `nil` on the wire.
 impl<T: Wire> Wire for Option<T> {
+    #[inline]
     fn encode(&self, encoder: &mut Encoder) {
         match self {
             Some(value) => value.encode(encoder),
@@ -125,6 +142,7 @@ impl<T: Wire> Wire for Option<T> {
         }
     }
 
+    #[inline]
     fn decode(decoder: &mut Decoder<'_>) -> Result<Self> {
         if decoder.take_nil()? {
             Ok(None)
@@ -145,8 +163,15 @@ impl<T: Wire> Wire for Vec<T> {
 
     fn decode(decoder: &mut Decoder<'_>) -> Result<Self> {
         let len = decoder.array_len()?;
-        // Bound the up-front reservation: the length is untrusted input.
-        let mut items = Vec::with_capacity(len.min(1 << 16));
+        // The declared length is untrusted. Every element needs at least
+        // one input byte, and the initial allocation has a fixed byte cap.
+        // This lets ordinary token arrays reserve once without allowing a
+        // short malformed frame to request a huge allocation.
+        const MAX_INITIAL_BYTES: usize = 4 * 1024 * 1024;
+        let capacity = len
+            .min(decoder.remaining_bytes())
+            .min(MAX_INITIAL_BYTES / std::mem::size_of::<T>().max(1));
+        let mut items = Vec::with_capacity(capacity);
         for _ in 0..len {
             items.push(T::decode(decoder)?);
         }
@@ -445,6 +470,19 @@ mod tests {
         let mut encoder = Encoder::new();
         write(&mut encoder);
         encoder.into_single_frame()
+    }
+
+    #[test]
+    fn huge_declared_arrays_with_short_payloads_are_rejected() {
+        // A claimed four billion elements must not cause an up-front
+        // allocation proportional to that untrusted header.
+        let bytes = [0xdd, 0xff, 0xff, 0xff, 0xff, 0x01];
+        assert!(matches!(
+            decode_bytes::<Vec<i32>>(&bytes),
+            Err(Error::Truncated { .. })
+        ));
+        assert!(decode_bytes::<Vec<Vec<i32>>>(&bytes).is_err());
+        assert!(decode_bytes::<Vec<Option<f64>>>(&bytes).is_err());
     }
 
     #[test]

@@ -979,6 +979,10 @@ register_kernel(
     "latent_input",
     name="triton_latent_input_packed",
     solution="triton",
+    # AMD only: on NVIDIA the separate vendor GEMM projections are faster than
+    # this generic packed kernel, so no fused kernel is registered there below
+    # the specialized front's row bound and callers keep the separate path.
+    capability=CapabilityRequirement(vendors=frozenset({"amd"})),
     signatures=frozenset(
         {
             format_signature(

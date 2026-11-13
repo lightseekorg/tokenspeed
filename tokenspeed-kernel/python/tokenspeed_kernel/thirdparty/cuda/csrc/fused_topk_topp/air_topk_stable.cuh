@@ -648,6 +648,9 @@ __global__ void radix_kernel(const T* in,
                                                pass,
                                                early_stop);
     __threadfence();
+    // Wait for every writer's fence before thread 0 publishes block completion.
+    // A threadfence alone does not wait for the other warps' histogram updates.
+    __syncthreads();
 
     bool isLastBlock = false;
     if (threadIdx.x == 0) {

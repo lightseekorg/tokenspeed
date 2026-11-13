@@ -110,7 +110,7 @@ _IR_ASM = re.compile(
 # SALU instructions that leave SCC alone; every other s_* ALU op writes it.
 _SCC_KEEPERS = re.compile(
     r"s_(?:mov|movk|cmov|cselect|load|store|buffer|waitcnt|nop|cbranch|branch"
-    r"|getreg|setreg|sleep|memrealtime|memtime|dcache|barrier|mul_i32|sendmsg"
+    r"|getreg|setreg|getpc|sleep|memrealtime|memtime|dcache|barrier|mul_i32|sendmsg"
     r"|trap|setprio|endpgm)"
 )
 # Instructions whose first operand is read, not written.
@@ -144,6 +144,46 @@ def _register_names(operand: str) -> set[str]:
     return set()
 
 
+def _restores_exec(template: str) -> bool:
+    """Whether every EXEC write of an asm template is undone in straight-line
+    code: EXEC is saved (``s_mov_b64 R, exec``) before it is first written,
+    and after each other write ``s_mov_b64 exec, R`` restores it before the
+    next label, branch or the template's end, with R unchanged in between.
+    The compiler then sees EXEC as it left it on every path out, so the
+    template need not clobber it. ``s_trap`` does not return."""
+    saved = None
+    dirty = False
+    for line in template.splitlines():
+        line = line.split(";")[0].strip()
+        if not line:
+            continue
+        if re.fullmatch(r"\w+:", line) or line.startswith(("s_branch", "s_cbranch")):
+            if dirty:
+                return False
+            continue
+        if line.startswith("s_trap"):
+            dirty = False
+            continue
+        mnemonic, _, rest = line.partition(" ")
+        operands = [o.strip() for o in rest.split(",") if o.strip()]
+        if not operands:
+            continue
+        if mnemonic == "s_mov_b64" and operands[1:] == ["exec"]:
+            saved = operands[0]
+            continue
+        if operands[0] == "exec":
+            if mnemonic == "s_mov_b64" and operands[1:] == [saved]:
+                dirty = False
+            elif saved is None:
+                return False
+            else:
+                dirty = True
+        elif saved is not None and operands[0] == saved:
+            if dirty:
+                return False
+    return not dirty
+
+
 def undeclared_asm_writes(template: str, constraints: str) -> list[str]:
     """Registers an inline asm template writes without declaring them.
 
@@ -160,6 +200,8 @@ def undeclared_asm_writes(template: str, constraints: str) -> list[str]:
     for part in parts:
         if part.startswith("~{") and part.endswith("}"):
             clobbered |= _register_names(part[2:-1]) or {part[2:-1]}
+    if _restores_exec(template):
+        clobbered.add("exec")
     instructions = []
     for line in template.splitlines():
         line = line.split(";")[0].strip()

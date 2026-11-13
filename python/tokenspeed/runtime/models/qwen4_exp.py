@@ -109,6 +109,7 @@ class _Qwen4ExpRMSNormGated(nn.Module):
     def __init__(self, hidden_size: int, eps: float) -> None:
         super().__init__()
         self.eps = float(eps)
+        self.sigmoid_gate = True
         self.weight = nn.Parameter(torch.ones(hidden_size))
 
     def forward(self, x: torch.Tensor, z: torch.Tensor | None = None) -> torch.Tensor:
@@ -267,13 +268,21 @@ class Qwen4ExpLinearDecoderLayer(_Qwen4ExpDecoderMixin, Qwen3_5LinearDecoderLaye
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         alt_stream: torch.cuda.Stream | None = None,
+        *,
+        enable_fp8_attn_proj: bool,
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
         self.mapping = mapping
         self.layer_id = layer_id
         self.linear_attn = Qwen3_5GatedDeltaNet(
-            config, mapping, layer_id, quant_config, prefix=prefix
+            config,
+            mapping,
+            layer_id,
+            quant_config,
+            prefix=prefix,
+            alt_stream=alt_stream,
+            enable_fp8_attn_proj=enable_fp8_attn_proj,
         )
         self.is_moe = _qwen4_exp_uses_sparse_moe(config)
         self.mlp = build_qwen3_5_mlp(
@@ -334,9 +343,12 @@ class Qwen4ExpAttentionDecoderLayer(
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         alt_stream: torch.cuda.Stream | None = None,
+        *,
+        enable_fp8_attn_proj: bool,
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
+        self.enable_fp8_attn_proj = enable_fp8_attn_proj
         self.mapping = mapping
         self._init_attention(config, mapping, layer_id, quant_config, prefix)
         self.is_moe = _qwen4_exp_uses_sparse_moe(config)
@@ -384,11 +396,19 @@ class Qwen4ExpAttentionDecoderLayer(
             if self.indexer is not None
             else None
         )
+        fuse_output_quant = self._should_fuse_output_quant(gate)
         attention_output = self._attn(
-            positions, q, k, v, gate, ctx, topk_indices=selected_slots
+            positions,
+            q,
+            k,
+            v,
+            None if fuse_output_quant else gate,
+            ctx,
+            topk_indices=selected_slots,
         )
-        output, _ = self.o_proj(attention_output)
-        return output
+        return self._project_output(
+            attention_output, gate if fuse_output_quant else None
+        )
 
     def forward(
         self,
@@ -452,8 +472,16 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        *,
+        enable_fp8_attn_proj: bool | None = None,
     ) -> None:
-        super().__init__(config, mapping, quant_config, prefix)
+        super().__init__(
+            config,
+            mapping,
+            quant_config,
+            prefix,
+            enable_fp8_attn_proj=enable_fp8_attn_proj,
+        )
         self.norm = None
         hc_config = HyperConnectionConfig(
             hc_count=int(config.hc_count),

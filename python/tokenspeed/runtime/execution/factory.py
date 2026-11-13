@@ -312,6 +312,7 @@ def create_model_executor(
 
     sampling_backend = create_sampling_backend(
         server_args,
+        hf_config=model_runner.model_config.hf_text_config,
         max_bs=max_bs,
         max_draft_tokens_per_req=max_draft_tokens_per_req,
         device=config.device,

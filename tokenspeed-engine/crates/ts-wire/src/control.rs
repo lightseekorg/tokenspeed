@@ -89,6 +89,44 @@ control_struct! {
         capacity_token_step: i64,
         /// Device LCM block demand at each bucket's upper token bound.
         capacity_blocks: Vec<i64>,
+        /// Independent cache-group ownership; older engines omit this field.
+        cache_group_contract: i64 = 0,
+        /// Successful retired shared-store object confirmation protocol.
+        shared_prefix_publication_contract: i64 = 0,
+        /// This rank supports exact-prefix receipts through Host/shared storage;
+        /// false when in-forward State checkpoints can omit prompt endpoints.
+        shared_prefix_storage_enabled: bool = false,
+    }
+
+    /// Poll historical shared-store publication for an exact token prefix.
+    GetSharedPrefixPublicationReqInput {
+        /// Caller nonce, echoed to reject late replies from a timed-out query.
+        query_id: String,
+        /// Actual prompt tokens, hashed by the native cache implementation.
+        input_ids: Vec<i32>,
+        /// Exact requested prefix boundary, at most input_ids.len().
+        max_prefix_tokens: i32,
+    }
+    /// Publication does not guarantee residence after external store eviction.
+    GetSharedPrefixPublicationReqOutput {
+        /// Whether this bounded query was evaluated successfully.
+        success: bool,
+        /// Diagnostic failure text, empty for a successful query.
+        message: String,
+        /// Echo of the caller nonce.
+        query_id: String,
+        /// Attention-DP rank, assigned by the transport.
+        dp_rank: i64,
+        /// published, pending, pressure, unsupported, or too_large.
+        /// unsupported includes boundaries disallowed by checkpoint geometry;
+        /// unsupported and too_large are terminal for this query.
+        status: String,
+        /// The exact requested prefix for published, otherwise zero.
+        confirmed_prefix_tokens: i64,
+        /// Actual storage key namespace, including active weight versions.
+        storage_namespace: String,
+        /// Local receipt generation, incremented when all-tier metadata clears.
+        cache_epoch: u64,
     }
 
     /// Age exclusive cached prefixes for router-paused or ended sessions.
@@ -101,6 +139,21 @@ control_struct! {
     /// Cache priority hints never invalidate active or shared blocks.
     DemoteSessionsReqOutput {
         /// Whether the cache priority hint was applied.
+        success: bool,
+        /// Summary of how many cached blocks changed priority.
+        message: String,
+    }
+
+    /// Age exclusive cached prefixes owned by independent request groups.
+    DemoteCacheGroupsReqInput {
+        /// Group identifiers in a namespace separate from session identifiers.
+        cache_group_ids: Vec<String>,
+        /// Ended groups no longer benefit from speculative cache writes.
+        ended: bool,
+    }
+    /// Group priority hints preserve active blocks and content shared across owners.
+    DemoteCacheGroupsReqOutput {
+        /// Whether the group cache priority hint was applied.
         success: bool,
         /// Summary of how many cached blocks changed priority.
         message: String,
@@ -489,8 +542,12 @@ tagged_union! {
     pub enum ControlRequest {
         /// See [`GetAdmissionReqInput`].
         GetAdmission(GetAdmissionReqInput),
+        /// See [`GetSharedPrefixPublicationReqInput`].
+        GetSharedPrefixPublication(GetSharedPrefixPublicationReqInput),
         /// See [`DemoteSessionsReqInput`].
         DemoteSessions(DemoteSessionsReqInput),
+        /// See [`DemoteCacheGroupsReqInput`].
+        DemoteCacheGroups(DemoteCacheGroupsReqInput),
         /// See [`FlushCacheReqInput`].
         FlushCache(FlushCacheReqInput),
         /// See [`PauseSchedulerReqInput`].
@@ -536,8 +593,12 @@ tagged_union! {
     pub enum ControlOutput {
         /// See [`GetAdmissionReqOutput`].
         GetAdmission(GetAdmissionReqOutput),
+        /// See [`GetSharedPrefixPublicationReqOutput`].
+        GetSharedPrefixPublication(GetSharedPrefixPublicationReqOutput),
         /// See [`DemoteSessionsReqOutput`].
         DemoteSessions(DemoteSessionsReqOutput),
+        /// See [`DemoteCacheGroupsReqOutput`].
+        DemoteCacheGroups(DemoteCacheGroupsReqOutput),
         /// See [`FlushCacheReqOutput`].
         FlushCache(FlushCacheReqOutput),
         /// See [`PauseSchedulerReqOutput`].
@@ -582,7 +643,9 @@ impl ControlRequest {
     pub fn reply_tag(&self) -> &'static str {
         match self {
             Self::DemoteSessions(_) => "DemoteSessionsReqOutput",
+            Self::DemoteCacheGroups(_) => "DemoteCacheGroupsReqOutput",
             Self::GetAdmission(_) => "GetAdmissionReqOutput",
+            Self::GetSharedPrefixPublication(_) => "GetSharedPrefixPublicationReqOutput",
             Self::FlushCache(_) => "FlushCacheReqOutput",
             Self::PauseScheduler(_) => "PauseSchedulerReqOutput",
             Self::ResumeScheduler(_) => "ResumeSchedulerReqOutput",
@@ -626,7 +689,9 @@ impl ControlOutput {
             Self::ReleaseMemoryOccupation(output) => said(output.success, &output.message),
             Self::ResumeMemoryOccupation(output) => said(output.success, &output.message),
             Self::DemoteSessions(output) => said(output.success, &output.message),
+            Self::DemoteCacheGroups(output) => said(output.success, &output.message),
             Self::GetAdmission(output) => (output.success, None),
+            Self::GetSharedPrefixPublication(output) => said(output.success, &output.message),
             Self::Profile(output) => said(output.success, &output.message),
             Self::ReloadForward(output) => said(output.success, &output.message),
             Self::IsSchedulerPaused(_) | Self::IsSleeping(_) | Self::GetInternalState(_) => {

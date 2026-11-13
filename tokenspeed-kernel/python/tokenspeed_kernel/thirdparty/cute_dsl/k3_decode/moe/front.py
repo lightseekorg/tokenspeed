@@ -25,7 +25,6 @@ from ..common.primitives import (
     redux,
     sigmoid,
     store_words,
-    view,
 )
 from ..gemm.projection import PreparedProjection
 from ..gemm.ws_gemm import WsGemm
@@ -50,9 +49,7 @@ def ordered(score):
 
 class RouteSitu:
     def __init__(self, batch, shared, renorm, early, roles, polled, plan=False):  # fmt: skip
-        # B>8: few registers, so routing CTAs co-reside with the front and the fused
-        # shared expert, and polled logits skip the front's completion wait.
-        self.lean = batch > 8
+        # Polled logits skip the front's completion wait at every row count.
         self.batch, self.shared, self.experts, self.renorm = batch, shared, 896, renorm
         # early: release the persistent experts at entry (safe once down drains first);
         # polled: logits arrive as FP32 words in mailbox columns [3584, 5376) (Lamport);
@@ -105,7 +102,7 @@ class RouteSitu:
 
     @cute.jit
     def select(self, key, threshold, buffers):
-        """B>8 candidates (keys at or above ``threshold``) append to ``dense`` at a
+        """Candidates (keys at or above ``threshold``) append to ``dense`` at a
         per-warp offset from the shared count, then rank themselves: 8 threads per
         candidate (4 past 32 candidates) each count their share of the candidates above
         it (key, then lower expert). Ranks below 16 store the expert and its sigmoid."""
@@ -205,17 +202,16 @@ class RouteSitu:
     @cute.jit
     def route(self, logits, bias, ids, weights, scale, token, tid, mailbox):
         """Exact top16 by threads [0, 256): candidates at or above the 16th largest
-        lane-group maximum are compacted and ranked by an unrolled 64-way compare."""
+        lane-group maximum are ranked by every thread (``select``)."""
         warp, lane = tid // 32, tid % 32
         smem = c.utils.SmemAllocator()
         km = alloc(smem, Uint32, (8, 32))
-        cand, dense = (alloc(smem, Uint64, shape) for shape in ((8, 128), 64))
+        cand = alloc(smem, Uint64, 1024)
         sig = alloc(smem, c.Float32, 1024)
-        counts = alloc(smem, Int32, 8)
         cutoff = alloc(smem, Uint32, 1)
         chosen = alloc(smem, Int32, 16)
-        if c.const_expr(self.lean):  # candidate count; the chosen experts' sigmoids
-            found, picked = alloc(smem, Int32, 1), alloc(smem, c.Float32, 16)
+        # The candidate count; the chosen experts' sigmoids.
+        found, picked = alloc(smem, Int32, 1), alloc(smem, c.Float32, 16)
         # Thread t owns experts t + 256 i, or 4 t + i when polling 16-byte chunks.
         offsets = cute.make_rmem_tensor(4, c.Float32)
         for i in c.range_constexpr(4):  # bias is a weight: load before the wait
@@ -227,36 +223,29 @@ class RouteSitu:
         for i in c.range_constexpr(4):
             key[i] = Uint32(0)
         if c.const_expr(self.polled):
-            if tid < 224:
+            if tid < 224:  # all four experts: one block, no branches
                 cell = mailbox.iterator + token * mailbox.shape[2] + 3584 + tid * 8
                 got = poll(cell, 0, 1)
                 rearm(cell)
                 for i in c.range_constexpr(4):
                     raw[i] = bits_float(got[0, i])
-                if c.const_expr(self.lean):  # all four experts: one block, no branches
-                    scores = [sigmoid(raw[i]) for i in range(4)]
-                    for i in c.range_constexpr(4):
-                        sig[4 * tid + i] = scores[i]
-                        key[i] = ordered(scores[i] + offsets[i])
-            if c.const_expr(not self.lean):
-                cute.arch.griddepcontrol_wait()
+                scores = [sigmoid(raw[i]) for i in range(4)]
+                for i in c.range_constexpr(4):
+                    sig[4 * tid + i] = scores[i]
+                    key[i] = ordered(scores[i] + offsets[i])
         else:
             cute.arch.griddepcontrol_wait()
             for i in c.range_constexpr(4):
-                if self.expert(tid, i) < self.experts:
-                    raw[i] = logits[token, self.expert(tid, i)]
-        for i in c.range_constexpr(4):
-            expert = self.expert(tid, i)
-            if c.const_expr(not (self.lean and self.polled)):  # noqa: SIM102
+                expert = self.expert(tid, i)
                 if expert < self.experts:
-                    score = sigmoid(raw[i])
+                    score = sigmoid(logits[token, expert])
                     sig[expert] = score
                     key[i] = ordered(score + offsets[i])
+        for i in c.range_constexpr(4):
             top = max(top, key[i])
         km[warp, lane] = top
-        if c.const_expr(self.lean):  # noqa: SIM102
-            if tid == 0:
-                found[0] = Int32(0)
+        if tid == 0:
+            found[0] = Int32(0)
         cute.arch.sync_threads()
         if warp == 0:
             group = km[0, lane]
@@ -271,73 +260,8 @@ class RouteSitu:
             if lane == 0:
                 cutoff[0] = low
         cute.arch.sync_threads()
-        if c.const_expr(self.lean):
-            dense = view(cand.iterator, 0, Uint64, (1024,))
-            self.select(key, cutoff[0], (dense, sig, chosen, picked, found))
-            self.publish(chosen, picked, ids, weights, scale, token)
-            return
-        threshold, offset = cutoff[0], Int32(0)
-        for i in c.range_constexpr(4):
-            expert = self.expert(tid, i)
-            hit = (expert < self.experts) & (key[i] >= threshold)
-            ballot = cute.arch.vote_ballot_sync(hit)
-            if hit:
-                below = cute.arch.popc(ballot & ((Uint32(1) << lane) - Uint32(1)))
-                packed = (Uint64(key[i]) << 32) | Uint64(~Uint32(expert))
-                cand[warp, offset + below] = packed
-            offset += cute.arch.popc(ballot)
-        if lane == 0:
-            counts[warp] = offset
-        cute.arch.sync_threads()
-        if warp == 0:
-            n = Int32(0)
-            for v in c.range_constexpr(8):
-                n += counts[v]
-            for half in c.range_constexpr(2):  # compact the regions densely
-                index = lane + 32 * half
-                rest, region = Int32(index), Int32(0)
-                for v in c.range_constexpr(8):
-                    if (region == v) & (rest >= counts[v]):
-                        rest -= counts[v]
-                        region += 1
-                value = Uint64(0)
-                if index < n:
-                    value = cand[region, rest]
-                dense[index] = value
-            cute.arch.sync_warp()
-            if n <= 64:
-                for half in c.range_constexpr(2):
-                    mine, rank = dense[lane + 32 * half], Int32(0)
-                    for j in c.range_constexpr(64):
-                        rank += Int32(dense[j] > mine)
-                    if (lane + 32 * half < n) & (rank < 16):
-                        chosen[rank] = Int32(~Uint32(mine))
-            else:  # rare: rank every candidate against all regions
-                for q in range(lane, n, 32):
-                    rest, region = Int32(q), Int32(0)
-                    for v in c.range_constexpr(8):
-                        if (region == v) & (rest >= counts[v]):
-                            rest -= counts[v]
-                            region += 1
-                    mine, rank = cand[region, rest], Int32(0)
-                    for v in c.range_constexpr(8):
-                        for j in range(counts[v]):
-                            rank += Int32(cand[v, j] > mine)
-                    if rank < 16:
-                        chosen[rank] = Int32(~Uint32(mine))
-            cute.arch.sync_warp()
-            expert, value = chosen[lane % 16], c.Float32(0)
-            if lane < 16:
-                ids[token, lane] = expert
-                value = sig[expert]
-            total = value
-            for shift in c.range_constexpr(4):
-                total += cute.arch.shuffle_sync_bfly(total, 1 << shift)
-            if lane < 16:
-                value = value * scale
-                if c.const_expr(self.renorm):
-                    value = div_rn(value, total + c.Float32(1e-20))
-                weights[token, lane] = c.BFloat16(value)
+        self.select(key, cutoff[0], (cand, sig, chosen, picked, found))
+        self.publish(chosen, picked, ids, weights, scale, token)
 
 
 # Front GEMM geometry "ks.kb.tg.rt.ch" per batch, by packed rows (TP8 560, TP16 288),

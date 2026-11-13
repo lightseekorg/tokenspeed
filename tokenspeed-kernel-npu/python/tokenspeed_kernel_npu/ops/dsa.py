@@ -447,6 +447,100 @@ class AscendDSAKernels:
         finally:
             torch.npu.config.allow_internal_format = False
 
+    def require_fused_prolog(self, *, index_heads):
+        """Reject an older native ABI before preparing weights or graph buffers."""
+        if index_heads not in (16, 32, 64):
+            raise ValueError("Fused DSA requires Indexer16/32/64")
+        try:
+            scaled_prolog = torch.ops.custom.npu_dsa_prolog_fused.scaled_scores_out
+        except AttributeError as error:
+            raise RuntimeError(
+                "Upgrade flash_ops: fused DSA requires explicit query/score scales"
+            ) from error
+
+        def meta(shape, dtype=torch.bfloat16):
+            return torch.empty(shape, dtype=dtype, device="meta")
+
+        hidden, heads, query_rank = (
+            (2048, 32, 768) if index_heads == 16 else (4096, 64, 1536)
+        )
+        local_heads = heads // 8
+        qb_columns = 393216 if index_heads == 16 else 1966080
+        down, qb = meta((hidden, query_rank + 704)), meta((16, qb_columns))
+        gq, gkv, gik = meta((query_rank,)), meta((512,)), meta((128,))
+        weight, uk = meta((index_heads, hidden), torch.float32), meta((heads, 128, 512))
+        window = meta((2 * 1024 * 1024,), torch.uint8)
+        kv, ik = meta((1024, 576)), meta((1024, 128))
+        for rows in (1, 2, 4, 8, 16, 32, 64, 128, 256, 512):
+            _, _, score = torch.ops.custom.npu_dsa_prolog_fused(
+                meta((rows, hidden)),
+                down,
+                gq,
+                gkv,
+                gik,
+                weight,
+                qb,
+                uk,
+                window,
+                kv,
+                ik,
+                meta((rows,), torch.int64),
+                1e-5,
+                1e-5,
+                1e-5,
+                None,
+                None,
+                0,
+            )
+            score_dtype = torch.bfloat16 if index_heads == 64 else torch.float32
+            if score.dtype != score_dtype:
+                raise ValueError(
+                    "Upgrade flash_ops: Indexer16/32 fused score must retain FP32"
+                )
+            scaled_prolog(
+                meta((rows, hidden)),
+                down,
+                gq,
+                gkv,
+                gik,
+                weight,
+                qb,
+                uk,
+                window,
+                kv,
+                ik,
+                meta((rows,), torch.int64),
+                1e-5,
+                1e-5,
+                1e-5,
+                1.0,
+                1.0,
+                None,
+                None,
+                0,
+                query=meta((8, rows, local_heads, 576)),
+                index_query=meta((rows, index_heads, 128)),
+                score=meta((rows, index_heads), score_dtype),
+            )
+            torch.ops.custom.npu_dsa_output_projection_partial(
+                meta((local_heads, rows, 512)),
+                meta((local_heads, 512, 128)),
+                meta((hidden, local_heads * 128)),
+            )
+            self.merge_topk_fused(
+                meta((rows, 1, 2048), torch.int32),
+                meta((rows, 1, 2048)),
+                group="tokenspeed-dsa-contract",
+                rank_size=8,
+            )
+            self.merge_lse_direct(
+                meta((heads, rows, 512), torch.float32),
+                meta((1, rows, heads), torch.float32),
+                meta((1, rows, heads), torch.float32),
+                group="tokenspeed-dsa-contract",
+                rank_size=8,
+            )
+
     def fused_prolog(
         self,
         x,
@@ -465,13 +559,15 @@ class AscendDSAKernels:
         eps_q,
         eps_kv,
         eps_index,
+        query_scale,
+        score_scale,
         positions,
         cos_sin,
         rotary_mode,
         out,
     ):
         """Fused projections and cache writes with operator-owned workspace."""
-        return torch.ops.custom.npu_dsa_prolog_fused.out(
+        return torch.ops.custom.npu_dsa_prolog_fused.scaled_scores_out(
             x,
             down,
             gamma_q,
@@ -487,6 +583,8 @@ class AscendDSAKernels:
             eps_q,
             eps_kv,
             eps_index,
+            query_scale,
+            score_scale,
             positions,
             cos_sin,
             rotary_mode,

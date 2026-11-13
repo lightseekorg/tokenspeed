@@ -39,6 +39,7 @@ sys.path.insert(0, os.path.dirname(_TEST_DIR))
 from test.runtime.conftest import kimi_layout, kimi_recipe, kimi_tp8_layout
 
 from ci_system.ci_register import register_cuda_ci
+from tokenspeed_kernel.platform import current_platform
 
 register_cuda_ci(est_time=60, suite="runtime-1gpu")
 
@@ -2072,6 +2073,7 @@ def _k31_attention_stack(
     full_blocks: int = 0,
     context_len: int = 4096,
     q_lora_rank: int = 128,
+    alt_stream: torch.cuda.Stream | None = None,
 ):
     """A real K3.1 sparse MLA layer (id 3) over the K3.1 pool and the DSA
     router, at TP8's 12 local heads and K3's latent geometry (a narrow q
@@ -2177,7 +2179,7 @@ def _k31_attention_stack(
                 layer_id=3,
                 prefix="model.layers.3.self_attn",
                 reduce_attn_results=False,
-                alt_stream=None,
+                alt_stream=alt_stream,
                 qkv_parallel=None,
                 output_parallel=None,
             )
@@ -2958,6 +2960,177 @@ def test_a_decode_chain_round_runs_the_fused_front(
     replayed = (captured.clone(), plane.clone(), latent.clone())
     plane.copy_(before[0])
     latent.copy_(before[1])
+    refresh(total)
+    with torch.no_grad():
+        eager = attention.o_proj_input(
+            step_positions, step_hidden, ctx, comm, projection=projection
+        )
+    assert torch.equal(replayed[0].view(torch.int16), eager.view(torch.int16))
+    assert torch.equal(replayed[1], plane)
+    assert torch.equal(replayed[2].view(torch.uint8), latent.view(torch.uint8))
+
+
+@requires_gpu
+@pytest.mark.parametrize("nvidia", [True, False], ids=["nvidia", "other"])
+def test_decode_rounds_fork_the_top_k_only_on_nvidia(monkeypatch, nvidia) -> None:
+    """Only NVIDIA decode rounds take the alternate stream for the top-k."""
+    from tokenspeed.runtime.models import kimi_k31
+
+    monkeypatch.setattr(
+        kimi_k31, "current_platform", lambda: SimpleNamespace(is_nvidia=nvidia)
+    )
+    aux = torch.cuda.Stream()
+    attention, *_ = _k31_attention_stack(
+        kv_cache_dtype=torch.bfloat16,
+        spec_width=1,
+        heads=12,
+        index_topk=64,
+        kvp_size=1,
+        kvp_rank=0,
+        alt_stream=aux,
+    )
+    assert attention.decode_topk_fork.aux_stream is (aux if nvidia else None)
+
+
+@requires_gpu
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not current_platform().is_nvidia,
+    reason="only NVIDIA decode rounds fork the top-k",
+)
+@pytest.mark.parametrize("spec_width", [1, 8])
+def test_a_decode_round_selects_top_k_beside_the_query_absorption(
+    monkeypatch, spec_width
+) -> None:
+    """A decode round's top-k on the alternate stream changes no bit.
+
+    With the fork's stream the top-k runs there while the main stream absorbs
+    the query and writes the latent; the output, the selection, and both caches
+    match the round on one stream, eagerly and replayed from a CUDA graph.
+    """
+    from tokenspeed_kernel.ops import gemm
+    from tokenspeed_kernel.workspace import capture_session
+
+    from tokenspeed.runtime.execution import context, forward_batch_info, output_layout
+    from tokenspeed.runtime.utils import env
+    from tokenspeed.runtime.utils.cuda_stream import StreamFork
+
+    monkeypatch.setitem(env.global_server_args_dict, "chunked_prefill_size", 8192)
+    torch.manual_seed(7)
+    prompt = 2300
+    total = prompt + 2 * spec_width
+    num_blocks = -(-total // 128)
+    attention, comm, router, pool = _k31_attention_stack(
+        kv_cache_dtype=torch.float8_e4m3fn,
+        spec_width=spec_width,
+        heads=12,
+        index_topk=2048,
+        kvp_size=1,
+        kvp_rank=0,
+        full_blocks=num_blocks,
+        context_len=max(4096, 2 * total),
+        q_lora_rank=1536,
+    )
+    attention.indexer.fuse_key_weight_projections()
+    attention.fuse_query_projections()
+    weight = attention.pack_decode_projection()
+    hidden = torch.randn(total, 256, device="cuda", dtype=torch.bfloat16)
+    order = torch.randperm(num_blocks, generator=torch.Generator().manual_seed(5))
+    blocks = (order + 1).tolist()
+    _extend_forward(
+        attention, comm, router, pool, hidden, prefix=0, end=prompt, blocks=blocks
+    )
+    plane, latent = pool.get_index_k_buffer(3), pool.get_key_buffer(3)
+    history = (plane.clone(), latent.clone())
+    topk_streams = []
+    select = attention._compute_decode_topk_indices
+
+    def record_stream(*args, **kwargs):
+        topk_streams.append(torch.cuda.current_stream())
+        return select(*args, **kwargs)
+
+    monkeypatch.setattr(attention, "_compute_decode_topk_indices", record_stream)
+    decode_mode = forward_batch_info.ForwardMode.DECODE
+    ctx = context.ForwardContext(
+        attn_backend=router,
+        token_to_kv_pool=pool,
+        bs=1,
+        num_extends=0,
+        input_num_tokens=spec_width,
+        forward_mode=decode_mode,
+        output_layout=output_layout.ForwardOutputLayout(0, 0, 1, spec_width),
+    )
+    request = torch.tensor([0], dtype=torch.int32, device="cuda")
+
+    def refresh(length, **kwargs):
+        router.refresh_decode_metadata(
+            1,
+            1,
+            request,
+            torch.tensor([length], dtype=torch.int32, device="cuda"),
+            forward_mode=decode_mode,
+            block_tables=_block_table(blocks),
+            **kwargs,
+        )
+
+    def projection(x):
+        return gemm.mm(x, weight)
+
+    step_hidden = hidden[prompt : prompt + spec_width].clone()
+    step_positions = torch.arange(prompt, prompt + spec_width, device="cuda")
+
+    def decode(fork):
+        plane.copy_(history[0])
+        latent.copy_(history[1])
+        attention.decode_topk_fork = fork
+        refresh(prompt + spec_width)
+        with torch.no_grad():
+            out = attention.o_proj_input(
+                step_positions, step_hidden, ctx, comm, projection=projection
+            ).clone()
+        selection = router.sparse_topk.decode
+        return (
+            out.view(torch.int16),
+            selection.topk_indices[:spec_width].clone(),
+            selection.topk_lens[:spec_width].clone(),
+            plane.clone(),
+            latent.clone().view(torch.uint8),
+        )
+
+    aux = torch.cuda.Stream()
+    one_stream = decode(StreamFork(None))
+    forked = decode(StreamFork(aux))
+    assert topk_streams == [torch.cuda.current_stream(), aux]
+    for got, want in zip(forked, one_stream):
+        assert torch.equal(got, want)
+
+    # Captured with the fork, the round replays the next step as one stream runs it.
+    capture = torch.cuda.Stream()
+    capture.wait_stream(torch.cuda.current_stream())
+    plane.copy_(history[0])
+    latent.copy_(history[1])
+    refresh(prompt + spec_width)
+    with torch.no_grad(), torch.cuda.stream(capture):
+        attention.o_proj_input(
+            step_positions, step_hidden, ctx, comm, projection=projection
+        )
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.no_grad(), capture_session(graph), torch.cuda.graph(
+        graph, stream=capture
+    ):
+        captured = attention.o_proj_input(
+            step_positions, step_hidden, ctx, comm, projection=projection
+        )
+    before = (plane.clone(), latent.clone())
+    step_hidden.copy_(hidden[prompt + spec_width :])
+    step_positions.copy_(torch.arange(prompt + spec_width, total, device="cuda"))
+    refresh(total, for_graph_replay=True)
+    graph.replay()
+    torch.cuda.synchronize()
+    replayed = (captured.clone(), plane.clone(), latent.clone())
+    plane.copy_(before[0])
+    latent.copy_(before[1])
+    attention.decode_topk_fork = StreamFork(None)
     refresh(total)
     with torch.no_grad():
         eager = attention.o_proj_input(

@@ -78,6 +78,8 @@ struct RankAddress {
 /// What the source ranks registered.
 #[derive(Debug, Default)]
 struct Table {
+    instance_id: String,
+    revision: u64,
     world_size: Option<Value>,
     dp_size: Option<Value>,
     tp_size_per_dp_rank: Option<i64>,
@@ -210,6 +212,7 @@ impl Table {
                 .entry(dp_group)
                 .or_default()
                 .insert(tp_rank, RankAddress { ip, port });
+            self.revision += 1;
             tracing::debug!(engine_rank, port, "a source rank registered");
         }
         Ok(())
@@ -238,6 +241,7 @@ impl Table {
         let dp_group = parse(dp_group, "target_dp_group")?;
         if engine_rank == -1 && dp_group == -1 {
             let mut info = json!({
+                "route_version": format!("{}:{}", self.instance_id, self.revision),
                 "prefill_tp_size": self.world_size.clone().unwrap_or(Value::Null),
                 "prefill_dp_size": self.dp_size.clone().unwrap_or(Value::Null),
                 "prefill_pp_size": self.pp_size.unwrap_or(1),
@@ -416,7 +420,10 @@ impl BootstrapServer {
         let port = listener.local_addr()?.port();
         listener.set_nonblocking(true)?;
         let stop = Arc::new(AtomicBool::new(false));
-        let table = Arc::new(Mutex::new(Table::default()));
+        let table = Arc::new(Mutex::new(Table {
+            instance_id: crate::new_instance_id()?,
+            ..Table::default()
+        }));
         let thread = {
             let stop = stop.clone();
             thread::Builder::new()
@@ -512,7 +519,8 @@ mod tests {
         .unwrap();
         assert_eq!(
             info,
-            json!({"prefill_tp_size": 4, "prefill_dp_size": 2, "prefill_pp_size": 1})
+            json!({"prefill_tp_size": 4, "prefill_dp_size": 2, "prefill_pp_size": 1,
+                   "route_version": info["route_version"]})
         );
         // Rank 3 is TP rank 1 of DP group 1.
         let rank: Value = serde_json::from_str(
@@ -533,6 +541,37 @@ mod tests {
         assert!(incomplete.unwrap_err().starts_with("400"));
         server.close();
         assert!(!http::healthy(&url(&server, "/health"), TIMEOUT, TIMEOUT));
+    }
+
+    #[test]
+    fn route_version_changes_after_registration_and_same_address_restart() {
+        fn version(server: &BootstrapServer) -> Value {
+            let text = http::get_text(
+                &url(server, "/route?engine_rank=-1&target_dp_group=-1"),
+                TIMEOUT,
+            )
+            .unwrap();
+            serde_json::from_str::<Value>(&text).unwrap()["route_version"].clone()
+        }
+        let mut server = BootstrapServer::start(0, Registry::Addresses).unwrap();
+        http::put_json(&url(&server, "/route"), &registration(0, 7000), TIMEOUT).unwrap();
+        let first = version(&server);
+        assert_eq!(first, version(&server));
+        // Re-registering even the same endpoint invalidates prior registrations.
+        http::put_json(&url(&server, "/route"), &registration(0, 7000), TIMEOUT).unwrap();
+        let second = version(&server);
+        assert_ne!(first, second);
+        let port = server.port();
+        server.close();
+        let replacement = BootstrapServer::start(port, Registry::Addresses).unwrap();
+        http::put_json(
+            &url(&replacement, "/route"),
+            &registration(0, 7000),
+            TIMEOUT,
+        )
+        .unwrap();
+        assert_ne!(first, version(&replacement));
+        assert_ne!(second, version(&replacement));
     }
 
     fn layout(page_count: i64) -> String {

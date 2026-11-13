@@ -67,6 +67,21 @@ allowed helpers and checks these rules on the compiled kernels.
 
 ## GEMM
 
+### gfx950 BF16 projections with FP32 output
+
+`gfx950/gemm/fp16/fp32_output.py` covers measured `[N,K]` pairs `[8,4608]`,
+`[384,4608]`, `[3792,4608]` and `[4608,1536]` and returns genuine FP32 output.
+The narrow path widens BF16 products exactly and uses a fixed row-local tree.
+The wide path reuses the existing MFMA/LDS kernel with fixed 16x64x64 tiles.
+The QKV shape uses twelve fixed K partitions with FP32 partials folded in
+split order, not arrival order. Neither reduction depends on the batch size.
+The caller supplies zeroed arrival counters, which each launch resets.
+Each view must span at most 4 GiB from its base pointer, and split-K
+partial-tile element offsets must fit signed int32; larger inputs raise
+before launch rather than wrap a raw-buffer offset. The wide path copies
+operands with odd row strides or unaligned bases into aligned storage for its
+direct-to-LDS loads.
+
 ### gfx950 dense BF16 projections
 
 The gfx950 package provides dense BF16 projection kernels: an eight-wave
@@ -2774,6 +2789,36 @@ above 2048 tokens adjacent CTAs take adjacent hidden blocks of one token and
 all vector accesses are non-temporal.
 
 ## Quantization
+
+### gfx950 row-major block-scaled expert GEMM
+
+`moe/block_scaled.py` consumes checkpoint-order expert rows and grouped route
+indices. It reconstructs NVFP4 (group-16 E4M3 scales) or MXFP8 (group-32
+UE8M0 scales) tiles as BF16, accumulates native BF16 MFMA products in FP32,
+and stores BF16 route rows. NVFP4 row/expert outer factors apply after the
+complete dot reduction. This is not the CDNA4-swizzled MXFP4 scale layout.
+
+Only the expert GEMMs differ: routing, quantization, capped SwiGLU and the
+BF16 boundaries use the shared portable pipeline, and each route keeps its
+flattened token/top-k slot, so the EP reduction and slot-fold order are
+unchanged. The common package selects this solution for NVFP4 only.
+
+Whole tiles of NVFP4 weights with BF16 activations (every model shape) stream
+through an LDS ring. Direct-to-LDS copies bring each K block's packed weights,
+group scales and activation rows up to three blocks ahead of the MFMA. They
+hold no registers, so a program keeps more bytes in flight than register loads
+allow. That matters at decode, where each program walks one tile's K blocks
+back to back. The weights are read as int32 words in the MFMA B-operand order,
+a word of 8 values a lane and K step. `v_cvt_scalef32_pk_f32_fp4` upcasts each
+byte to an FP32 pair, the E4M3 group scale multiplies in FP32, and one
+rounding gives BF16. Both steps are exact, so the values, and the K order of
+the 16x16x32 MFMAs, equal the masked loop's: results are bit-identical. Rows
+past an expert's count are not copied and feed only MFMA rows that are never
+stored. Ragged shapes and MXFP8 keep the masked register loop.
+
+Prefill uses 64-row NVFP4 tiles, so each weight tile is upcast once per 64
+route rows. A 2048-token chunk routes about 43 rows to an expert at top-8 over
+384 experts.
 
 ### gfx950 group-32 UE8M0 FP8 activations
 

@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import ClassVar
 
 import torch
 
@@ -39,6 +40,8 @@ from tokenspeed.runtime.utils.server_args import ServerArgs
 
 @dataclass(kw_only=True)
 class MLAConfig(SoftmaxAttnConfig):
+    is_latent_kv: ClassVar[bool] = True
+
     kv_lora_rank: int
     qk_nope_head_dim: int
     qk_rope_head_dim: int
@@ -100,6 +103,11 @@ class MLAConfig(SoftmaxAttnConfig):
                 kv_cache_dtype=resolve_dtype(server_args.kv_cache_dtype),
                 draft_block_decode=draft_block_decode,
                 draft_block_causal=draft_block_causal,
+                # An MTP depth plans the target's own DSA attention and
+                # computes the same query-context shard, sharing the target's
+                # history gather. Plain MLA cannot shard, and __post_init__
+                # refuses it as a target.
+                shards_query_context=spec.is_dsa,
             ),
         )
 

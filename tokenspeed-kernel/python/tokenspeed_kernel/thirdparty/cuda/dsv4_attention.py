@@ -6,7 +6,6 @@ import functools
 from pathlib import Path
 
 import torch
-import tvm_ffi
 
 
 def _objs_dir() -> Path:
@@ -21,15 +20,31 @@ def _load_dsv4_attention_module():
             f"tokenspeed_kernel DeepSeek V4 attention library not found at {so_path}. "
             "Run `pip install -e tokenspeed-kernel/python/` to build."
         )
+    import tvm_ffi
+
     return tvm_ffi.load_module(str(so_path))
 
 
-def has_persistent_topk() -> bool:
+@functools.cache
+def persistent_topk_unavailable_reason() -> str | None:
+    """Return a cached failure summary, or None when native top-k is available.
+
+    Restart after repairing the install. Report only exception types here:
+    raw loader errors can contain private deployment paths.
+    """
     try:
+        if not (_objs_dir() / "dsv4_attention" / "dsv4_attention.so").is_file():
+            return "missing native library dsv4_attention.so"
         module = _load_dsv4_attention_module()
-    except Exception:
-        return False
-    return hasattr(module, "dsv4_persistent_topk")
+        if not hasattr(module, "dsv4_persistent_topk"):
+            return "missing export dsv4_persistent_topk in dsv4_attention.so"
+    except Exception as exc:
+        return f"native module load failed ({type(exc).__name__})"
+    return None
+
+
+def has_persistent_topk() -> bool:
+    return persistent_topk_unavailable_reason() is None
 
 
 def persistent_topk(

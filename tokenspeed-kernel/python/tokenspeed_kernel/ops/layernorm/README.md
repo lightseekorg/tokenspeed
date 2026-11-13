@@ -70,6 +70,19 @@ two kernels agree byte for byte on `q_out` and `k_out`. Tests:
 bytes). No
 timing claim is made for the fused kernel in this record.
 
+## Explicit output precision and L2 clipping
+
+`precision.rmsnorm_precision` normalizes in FP32 and stores an explicit output
+dtype, such as BF16 from FP32 depth mixtures or weightless per-head value norms.
+CUDA inputs select its registered Triton implementation; other devices run the
+Torch equation.
+
+`precision.l2_clip` keeps vectors below the threshold and rounds the clipped
+result to the input dtype before the optional FP32 token multiplier, which
+rounds again; one unrounded fused expression differs. It is a Torch equation:
+on GPUs, `attention.rmha.rel_mha_head_norms` clips the attention heads in its
+fused kernel.
+
 ## `layernorm.gemma_rmsnorm` operator
 
 `gemma_rmsnorm(x, weight, eps, residual=None)` is `GemmaRMSNorm.forward`: the

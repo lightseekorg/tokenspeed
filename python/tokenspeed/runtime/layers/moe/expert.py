@@ -21,9 +21,11 @@
 
 import logging
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import replace
 
 import torch
+from tokenspeed_kernel.ops.communication.peer_weights import PreparedExpertWeights
 from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
 from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
 from tokenspeed_kernel.ops.moe import moe_process_weights as kernel_moe_process_weights
@@ -39,6 +41,7 @@ from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
 from tokenspeed.runtime.layers.activation import SwigluArg
+from tokenspeed.runtime.layers.moe.peer_weights import MoEPeerWeights
 from tokenspeed.runtime.layers.moe.topk import TopKOutput, TopKOutputFormat
 from tokenspeed.runtime.layers.moe.types import MoELayerSpec
 from tokenspeed.runtime.layers.moe.utils import (
@@ -95,9 +98,11 @@ class MoELayer(torch.nn.Module):
         internal_activation_dtype_override: str | None = None,
         persistent_max_num_tokens_per_gpu: int | None = None,
         input_dtype: torch.dtype | None = None,
+        peer_weights: MoEPeerWeights | None = None,
     ):
         super().__init__()
         self.layer_index = layer_index
+        self.peer_weights = peer_weights
         # Deployment-level override for the activation precision (e.g. a K3
         # w4a8 flag), forcing the value the quant_config would otherwise derive.
         self._internal_activation_dtype_override = internal_activation_dtype_override
@@ -561,8 +566,34 @@ class MoELayer(torch.nn.Module):
             self.plan["precision_policy"] = precision_policy
             self.plan["output_scale"] = output_scale
 
+        self._storage_spec = self._spec
+        if peer_weights is not None:
+            partition = peer_weights.partition
+            if (
+                self.tp_size != 1
+                or self.ep_size != 1
+                or num_experts != partition.num_experts
+            ):
+                raise ValueError(
+                    "Peer weights require local full-expert TP1/EP1 compute"
+                )
+            if not (
+                self._quant_kind == "nvfp4"
+                and self.activation == "situ"
+                and self.plan["solution"] == "flashinfer_trtllm"
+            ):
+                raise ValueError(
+                    "Peer weights currently require FlashInfer TRTLLM NVFP4 SiTU"
+                )
+            self._storage_spec = replace(
+                self._spec,
+                ep_rank=partition.rank,
+                ep_size=partition.size,
+                num_local_experts=partition.count,
+            )
+
         create_layer_weights(
-            self._spec,
+            self._storage_spec,
             self,
             self._quant_kind,
             self.quant_config,
@@ -618,9 +649,15 @@ class MoELayer(torch.nn.Module):
 
         if self._quant_kind == "fp8_channel":
             check_fp8_channel_scales(module, self.prefix)
-        kernel_moe_process_weights(
+        prepared = kernel_moe_process_weights(
             self.plan, module, communication_initializer=initialize_communication
         )
+        if self.peer_weights is not None:
+            if not isinstance(prepared, PreparedExpertWeights):
+                raise RuntimeError(
+                    "Selected MoE kernel cannot publish processed expert weights"
+                )
+            self.peer_weights.publish(self.layer_index, module, prepared)
         self._weights_processed = True
 
     @property
@@ -689,6 +726,17 @@ class MoELayer(torch.nn.Module):
         its own tokens. Otherwise every rank routes every token and an expert
         placement must pick the same replica for a route on every rank."""
         return self.plan["supports_all_to_all_ep"]
+
+    def _apply_weights(self, hidden_states, router_logits, **kwargs):
+        reader = (
+            self.peer_weights.read(self.layer_index)
+            if self.peer_weights is not None
+            else nullcontext()
+        )
+        with reader:
+            return kernel_moe_apply(
+                self.plan, hidden_states, self, router_logits, **kwargs
+            )
 
     def fuse_shared_expert(
         self,
@@ -800,10 +848,8 @@ class MoELayer(torch.nn.Module):
                 raise ValueError(
                     "selected MoE kernel does not support in-kernel routing"
                 )
-            output = kernel_moe_apply(
-                self.plan,
+            output = self._apply_weights(
                 hidden_states,
-                self,
                 topk_output.router_logits,
                 num_tokens_global=num_global_tokens,
                 max_num_tokens_per_gpu=max_num_tokens_per_gpu,
@@ -826,10 +872,8 @@ class MoELayer(torch.nn.Module):
             raise ValueError(
                 "selected MoE kernel does not support precomputed top-k routing"
             )
-        output = kernel_moe_apply(
-            self.plan,
+        output = self._apply_weights(
             hidden_states,
-            self,
             topk_output.router_logits,
             topk_weights=topk_output.topk_weights,
             topk_ids=topk_output.topk_ids,
