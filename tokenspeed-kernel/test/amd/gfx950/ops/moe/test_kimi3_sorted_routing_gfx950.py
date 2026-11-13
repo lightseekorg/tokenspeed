@@ -214,6 +214,23 @@ def test_sorted_routing_matches_topk_and_sort(rows, kind, deterministic_order):
         assert not torch.any(scratch)
 
 
+def test_sorted_routing_takes_only_its_layer_and_logits():
+    from tokenspeed_kernel.ops.moe import (
+        kimi3_sorted_routing_accepts,
+        kimi3_sorted_routing_supported,
+    )
+
+    assert kimi3_sorted_routing_supported(_EXPERTS, _TOPK)
+    assert not kimi3_sorted_routing_supported(_EXPERTS, 8)
+    assert not kimi3_sorted_routing_supported(384, _TOPK)
+    logits = torch.zeros((257, _EXPERTS), device="cuda")
+    assert kimi3_sorted_routing_accepts(logits[:256])
+    assert not kimi3_sorted_routing_accepts(logits)
+    assert not kimi3_sorted_routing_accepts(logits[:8].half())
+    assert not kimi3_sorted_routing_accepts(logits[:8, :448])
+    assert not kimi3_sorted_routing_accepts(logits[:16:2])
+
+
 def test_sorted_routing_graph_replay_and_one_binary():
     """Layers of several row counts, launched back to back and captured, share
     the scratch and one binary."""
@@ -298,6 +315,7 @@ def _k3_tp8_experts():
         features=frozenset(),
     )
     assert plan["apply_kernel_name"] == "gluon_mxfp4_a8w4_situ_precomputed_moe_apply"
+    assert plan["sorted_route_block_size"] == _BLOCK
     moe_process_weights(plan, module)
     return plan, module
 
