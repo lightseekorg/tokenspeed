@@ -34,6 +34,8 @@ DIGEST = Path(__file__).resolve().parent / "mi450_sim_report_digest.py"
 def _digest(
     tmp_path: Path, events: list[dict], pytest_status: int
 ) -> subprocess.CompletedProcess:
+    """Write ``events`` as a pytest report log and run the digest on it with
+    pytest's exit status ``pytest_status``."""
     log = tmp_path / "report.jsonl"
     log.write_text("".join(json.dumps(event) + "\n" for event in events))
     return subprocess.run(
