@@ -164,9 +164,7 @@ def test_a_parallel_run_the_selection_empties_passes():
     pytest.importorskip("xdist")
     repo_root = Path(__file__).resolve().parents[2]
     env = dict(os.environ)
-    env[CHANGED_PATHS_ENV] = (
-        "tokenspeed-kernel/python/tokenspeed_kernel/ops/gemm/__init__.py"
-    )
+    env[CHANGED_PATHS_ENV] = f"{KERNEL}/ops/gemm/__init__.py"
     run = subprocess.run(
         [sys.executable, "-m", "pytest", "-n", "2", "-p", "no:cacheprovider", __file__],
         cwd=repo_root,
@@ -189,9 +187,7 @@ def test_a_nested_run_with_an_inherited_xdist_variable_is_not_a_worker():
     repo_root = Path(__file__).resolve().parents[2]
     env = dict(os.environ)
     env["PYTEST_XDIST_WORKER"] = "gw0"
-    env[CHANGED_PATHS_ENV] = (
-        "tokenspeed-kernel/python/tokenspeed_kernel/ops/gemm/__init__.py"
-    )
+    env[CHANGED_PATHS_ENV] = f"{KERNEL}/ops/gemm/__init__.py"
     run = subprocess.run(
         [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", __file__],
         cwd=repo_root,
