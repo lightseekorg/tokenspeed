@@ -10,7 +10,7 @@ each shard's round and concatenating the words as the all-gather would.
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -21,7 +21,6 @@ from tokenspeed.runtime.execution.drafter._dspark_walk import (
 )
 from tokenspeed.runtime.execution.drafter.dspark import DSpark
 from tokenspeed.runtime.models.dspark import VanillaMarkov
-from tokenspeed.runtime.utils.env import envs
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="the fused walk is a GPU kernel"
@@ -239,7 +238,7 @@ def test_the_drafter_proposes_the_same_block_either_way(rows) -> None:
         tokens = torch.full(
             (rows, drafter.spec_num_tokens), -1, dtype=torch.int32, device="cuda"
         )
-        with envs.TOKENSPEED_DSPARK_FUSED_WALK.override(fused):
+        with patch.object(drafter, "_fused_walk_fits", return_value=fused):
             blocks[fused] = drafter._sample_block(hidden, block, tokens).tolist()
     assert blocks[True] == blocks[False]
     assert [row[0] for row in blocks[True]] == block[:, 0].tolist()
@@ -249,9 +248,6 @@ def test_the_fused_walk_stands_down_where_it_does_not_fit() -> None:
     drafter = _drafter()
     block_logits = torch.zeros((7, 2, 2048), device="cuda", dtype=torch.bfloat16)
     assert drafter._fused_walk_fits(block_logits)
-
-    with envs.TOKENSPEED_DSPARK_FUSED_WALK.override(False):
-        assert not drafter._fused_walk_fits(block_logits)
     assert not drafter._fused_walk_fits(block_logits.float())
 
     # The added-vocab shard competes unbiased; the fused round has no such lane.
