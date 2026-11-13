@@ -12,7 +12,9 @@ api_version: ci.tokenspeed.io/v1
 # One server start gates both runs: the benchmark exits with status 1 when
 # either falls below --min-accuracy, and perf_reference (set from this
 # runner's runs) gates each run's decode rate: a run whose decode steps leave
-# the monokernels falls below it.
+# the monokernels falls below it. The two-request run follows the one-request
+# run on the same server (a warm prefix cache), so its reference assumes the
+# order --concurrency 1 2.
 name: perf-muse-spark-mxfp4-monokernel-gsm8k-single-request-mi35x
 type: perf
 workflow_stage: model-test

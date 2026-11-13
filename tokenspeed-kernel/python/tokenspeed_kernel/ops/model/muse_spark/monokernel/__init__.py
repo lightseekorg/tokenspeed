@@ -207,10 +207,10 @@ def muse_spark_layer_decode(
         whole_rows: Store whole residual rows on every rank (for a next
             layer on the regular path, which reads whole rows), not the
             owned columns (for a next fused layer).
-        tap: None, or a BF16 ``[rows+, slots, 8192]`` buffer on the Iris
-            symmetric heap: the launch also stores the residual after the
-            layer (BF16) into slot ``tap_slot`` of every rank's copy, the
-            tap a draft reads.
+        tap: None, or a BF16 ``[rows+, slots, 8192]`` buffer on each rank
+            (plain device memory): the launch also stores the residual after
+            the layer, rounded to BF16, into slot ``tap_slot`` of this rank's
+            buffer (a draft's tap); every rank's launch stores the same values.
         tap_slot: The tap's slot, or None without ``tap``.
         warm_next: None, or the next layer's prepared launch (from
             :func:`prepare_muse_spark_layer`) that follows this one: this
