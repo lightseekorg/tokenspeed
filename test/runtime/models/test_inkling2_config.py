@@ -68,8 +68,6 @@ def _checkpoint() -> dict:
             log_scaling_n_floor=128000,
             log_scaling_alpha=0.1,
             rms_norm_eps=1e-6,
-            pre_norm_pre_affine=False,
-            final_norm_pre_affine=False,
             use_value_norm_no_gamma=True,
             qk_l2_clip_threshold=22.627416997969522,
             rel_l2_clip_threshold=8.0,
@@ -137,8 +135,6 @@ def test_checkpoint_values_and_independent_draft() -> None:
     assert text.num_experts_per_tok == 8
     assert text.n_shared_experts == 0
     assert text.final_logit_softcapping == 30.0
-    assert not text.pre_norm_pre_affine
-    assert not text.final_norm_pre_affine
     assert text.use_value_norm_no_gamma
     assert text.attn_res_normalize_values
     assert (text.mlp_gate_softcap, text.mlp_up_softcap) == (4.0, 25.0)
@@ -189,7 +185,7 @@ def test_config_roundtrip_and_native_registration(tmp_path: Path) -> None:
     assert restored_values == original_values
     loaded = get_config(str(tmp_path), trust_remote_code=False, revision=None)
     assert loaded.architectures == ["Inkling2ForConditionalGeneration"]
-    assert loaded.text_config.pre_norm_pre_affine is False
+    assert loaded.text_config.use_value_norm_no_gamma is True
     assert loaded.mtp_config["num_hidden_layers"] == 5
 
 
@@ -220,17 +216,11 @@ def test_multimodal_draft_restores_native_image_payload_token(tmp_path: Path) ->
     assert tokens.tolist() == [200005, 200005, 200054, 7]
 
 
-@pytest.mark.parametrize("pre_affine,value_norm", [(True, False), (False, True)])
-def test_optional_norm_settings(pre_affine: bool, value_norm: bool) -> None:
+@pytest.mark.parametrize("value_norm", [False, True])
+def test_optional_norm_settings(value_norm: bool) -> None:
     values = _checkpoint()["text_config"]
-    values.update(
-        pre_norm_pre_affine=pre_affine,
-        final_norm_pre_affine=pre_affine,
-        use_value_norm_no_gamma=value_norm,
-    )
+    values.update(use_value_norm_no_gamma=value_norm)
     text = Inkling2ModelConfig(**values)
-    assert text.pre_norm_pre_affine == pre_affine
-    assert text.final_norm_pre_affine == pre_affine
     assert text.use_value_norm_no_gamma == value_norm
 
 
@@ -288,6 +278,8 @@ def test_draft_loading_rejects_old_nextn_path(
         ({"qk_l2_clip_threshold": float("nan")}, "finite and positive"),
         ({"gate_activation": "softmax"}, "requires gate_activation"),
         ({"num_nextn_predict_layers": 5}, "requires num_nextn_predict_layers"),
+        ({"pre_norm_pre_affine": True}, "requires pre_norm_pre_affine"),
+        ({"final_norm_pre_affine": True}, "requires final_norm_pre_affine"),
         ({"max_position_embeddings": 4096}, "must match model_max_length"),
         ({"v_head_dim": 64}, "v_head_dim must match head_dim"),
         ({"swa_v_head_dim": 64}, "swa_v_head_dim must match swa_head_dim"),

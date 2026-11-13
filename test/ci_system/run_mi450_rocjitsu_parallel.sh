@@ -119,7 +119,7 @@ case "${status}" in
 esac
 
 echo
-python3 "${here}/mi450_sim_report_digest.py" "${report_log}"
+python3 "${here}/mi450_sim_report_digest.py" --pytest-status "${status}" "${report_log}"
 digest_status="$?"
 
 if [ "${status}" -ne 0 ] || [ "${digest_status}" -ne 0 ]; then
