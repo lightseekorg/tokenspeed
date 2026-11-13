@@ -4303,6 +4303,14 @@ def test_kimi3_mxfp4_situ_selection_on_cdna4(
     _assert_moe_plan(plan, apply=kernel_name, preprocessor=preprocessor)
     assert plan["activation"] == "situ"
     assert plan["support_routing"] is False
+    # Only the TP apply reads the fused router's expert sort, at the decode
+    # widths it sorts itself.
+    if ep_size == 1:
+        assert plan["sorted_route_rows"] == frozenset(range(8, 193))
+        assert plan["sorted_route_block_size"] == 16
+    else:
+        assert plan["sorted_route_rows"] == frozenset()
+        assert plan["sorted_route_block_size"] is None
 
 
 @pytest.mark.parametrize(
