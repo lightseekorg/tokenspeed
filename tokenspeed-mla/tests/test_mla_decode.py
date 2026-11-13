@@ -221,6 +221,34 @@ def test_bf16_split_selection_is_unchanged():
     assert workspace == 96 * 32 * 513 * 4
 
 
+@pytest.mark.parametrize(
+    "heads,queries", [(16, 4), (64, 1), (96, 4), (96, 5), (128, 8)]
+)
+@pytest.mark.parametrize("max_batch,min_split", [(4, 1), (32, 8), (128, 1), (1025, 32)])
+def test_split_task_capacity_covers_plans_and_slices(
+    heads, queries, max_batch, min_split
+):
+    import tokenspeed_mla.mla_decode as decode
+
+    capacity = decode.tokenspeed_mla_decode_task_capacity(
+        max_batch, heads, queries, min_split, 148
+    )
+    for dtype in (torch.bfloat16, torch.float8_e4m3fn):
+        tiler, _, _, query_tiles, _ = decode._decode_query_layout(
+            heads,
+            queries,
+            is_fp8=dtype == torch.float8_e4m3fn,
+            compute_capability=(10, 0),
+            packable=True,
+        )
+        for batch in range(1, max_batch + 1):
+            splits = decode._get_split_kv(
+                batch, query_tiles, 148, 1 << 20, dtype, tiler, min_split
+            )
+            width = decode._per_request_split_kv_width(1 << 20, tiler, min_split)
+            assert min(batch * width, batch * splits + batch - 1) <= capacity
+
+
 @pytest.mark.parametrize("dtype", ["fp8", "bf16"])
 def test_input_pages_are_unique_and_tma_aligned(dtype):
     case = _Case(4, 129, 12, 8)
@@ -431,6 +459,7 @@ def test_fp8_output_requires_sm107():
 
 
 class TestCompile:
+    @pytest.mark.parametrize("per_request", [False, True])
     @pytest.mark.parametrize("capability", [(10, 0), (10, 3), (10, 7)])
     @pytest.mark.parametrize(
         "dtype,heads,local_visible",
@@ -444,7 +473,7 @@ class TestCompile:
         ],
     )
     def test_decode_architectures_and_causal_masks(
-        self, capability, dtype, heads, local_visible
+        self, capability, dtype, heads, local_visible, per_request
     ):
         # No device or host occupancy query is needed to compile another target.
         script = textwrap.dedent(f"""
@@ -460,7 +489,7 @@ class TestCompile:
                     qk_rope_head_dim=64,
                     is_persistent=False,
                     is_var_seq=True,
-                    is_var_split_kv=False,
+                    is_var_split_kv={per_request!r},
                     compute_capability={capability!r},
                     has_local_visible_lens={local_visible!r},
                     partial_fp16=False,
@@ -1272,11 +1301,314 @@ def test_local_visible_lengths_reject_unsupported_inputs(invalid):
         )
 
 
-def _check_local_visible_gpu(
-    batch, heads, q_len, persistent, kv_len, dtype, partial_fp16
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "fp8_output",
+        "dtype",
+        "shape",
+        "fixed_seq",
+        "window",
+        "cp",
+        "tasks_missing",
+        "tasks_dtype",
+        "tasks_shape",
+        "tasks_strides",
+        "tasks_capacity",
+    ],
+)
+def test_per_request_split_counts_reject_unsupported_inputs(invalid):
+    from tokenspeed_mla import tokenspeed_mla_decode
+
+    query = torch.zeros((2, 4, 16, 576), dtype=torch.float8_e4m3fn)
+    splits = torch.ones(2, dtype=torch.int32)
+    extra = {
+        "block_split_offsets": torch.zeros(3, dtype=torch.int32),
+        "block_split_tasks": torch.zeros(2, dtype=torch.int64),
+    }
+    if invalid == "fp8_output":
+        extra["out"] = torch.zeros((2, 4, 16, 512), dtype=torch.float8_e4m3fn)
+    elif invalid == "dtype":
+        splits = splits.to(torch.int64)
+    elif invalid == "shape":
+        splits = torch.ones(3, dtype=torch.int32)
+    elif invalid == "fixed_seq":
+        extra["is_var_seq"] = False
+    elif invalid == "window":
+        extra["window_left"] = 128
+    elif invalid == "cp":
+        extra["cp_world"] = 2
+    elif invalid == "tasks_missing":
+        extra["block_split_tasks"] = None
+    elif invalid == "tasks_dtype":
+        extra["block_split_tasks"] = torch.zeros(1, dtype=torch.int32)
+    elif invalid == "tasks_shape":
+        extra["block_split_tasks"] = torch.zeros((1, 1), dtype=torch.int64)
+    elif invalid == "tasks_strides":
+        extra["block_split_tasks"] = torch.zeros(4, dtype=torch.int64)[::2]
+    elif invalid == "tasks_capacity":
+        extra["block_split_tasks"] = torch.zeros(1, dtype=torch.int64)
+    expected = (
+        "block_split_tasks" if invalid.startswith("tasks_") else "block_split_kvs"
+    )
+    with pytest.raises(ValueError, match=expected):
+        tokenspeed_mla_decode(
+            query,
+            torch.zeros((1, 64, 576), dtype=query.dtype),
+            torch.empty(0, dtype=torch.int8),
+            512,
+            64,
+            torch.zeros((2, 2), dtype=torch.int32),
+            torch.ones(2, dtype=torch.int32),
+            64,
+            192**-0.5,
+            block_split_kvs=splits,
+            **extra,
+        )
+
+
+def _check_per_request_split_gpu(
+    heads, q_len, dtype_name, causal, large_workspace, batch
 ):
     import tokenspeed_mla.mla_decode as decode
-    from tokenspeed_mla import tokenspeed_mla_decode
+    from tokenspeed_mla import tokenspeed_mla_decode, tokenspeed_mla_decode_split_kvs
+
+    torch.backends.cuda.matmul.allow_tf32 = False
+    # One long request among short ones, as in serving batches.
+    pattern = [16384, 300, 5000, 129, 2048, 9000]
+    lengths = [pattern[i % len(pattern)] for i in range(batch)]
+    case = _Case(len(lengths), max(lengths), heads, q_len)
+    q, kv, tables, _ = _make_inputs(case, dtype_name, False, "cuda")
+    seq_lens = torch.tensor(lengths, dtype=torch.int32, device="cuda")
+    splits = torch.empty_like(seq_lens)
+    offsets = torch.empty(len(lengths) + 1, dtype=torch.int32, device="cuda")
+    tasks = torch.empty(
+        decode.tokenspeed_mla_decode_task_capacity(
+            len(lengths), heads, q_len, 8, decode.get_num_sm(q.device)
+        ),
+        dtype=torch.int64,
+        device="cuda",
+    )
+    split_args = dict(
+        num_heads=heads,
+        q_len=q_len,
+        max_seq_len=case.kv_len,
+        min_split_kv=8,
+        dtype=q.dtype,
+    )
+    uniform = torch.full_like(seq_lens, 4096)
+    tokenspeed_mla_decode_split_kvs(uniform, splits, offsets, tasks, **split_args)
+    (uniform_split,) = set(splits.tolist())
+    assert uniform_split >= 8
+    tokenspeed_mla_decode_split_kvs(seq_lens, splits, offsets, tasks, **split_args)
+    counts = splits.tolist()
+    width = decode._per_request_split_kv_width(case.kv_len, (128, 128), 8)
+    assert width == 32
+    assert min(counts) == 1 and max(counts) <= width
+    assert counts.index(max(counts)) == 0 and counts[3] == 1
+    # The uniform split's chunk total is kept, up to rounding each request up,
+    # unless the longest request hits the grid width.
+    batch = len(lengths)
+    assert sum(counts) <= (uniform_split + 1) * batch
+    assert counts[0] == width or sum(counts) >= uniform_split * batch
+
+    workspace_bytes = decode.tokenspeed_mla_decode_workspace_size(
+        len(lengths), heads, q_len, 512, 8, decode.get_num_sm(q.device)
+    )
+    # Compact head strides cross 2**31 elements; only live partials are touched.
+    if large_workspace:
+        workspace_bytes = 9 << 30
+    workspace = torch.empty(
+        workspace_bytes,
+        dtype=torch.int8,
+        device="cuda",
+    )
+    out = torch.empty(
+        len(lengths),
+        q_len,
+        heads,
+        512,
+        dtype=torch.bfloat16 if dtype_name == "fp8" else q.dtype,
+        device="cuda",
+    )
+    kwargs = dict(
+        query=q,
+        kv_cache=kv,
+        workspace_buffer=workspace,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        block_tables=tables,
+        seq_lens=seq_lens,
+        max_seq_len=case.kv_len,
+        softmax_scale=192**-0.5,
+        out=out,
+        min_split_kv=8,
+        block_split_kvs=splits,
+        block_split_offsets=offsets,
+        block_split_tasks=tasks,
+        causal_mask=causal,
+    )
+    indices = list(range(len(lengths))) if batch <= 6 else [0, 1, batch // 2, batch - 1]
+    tokenspeed_mla_decode(**kwargs)
+    torch.cuda.synchronize()
+
+    def reference():
+        if causal:
+            return _reference_mla(q, kv, tables, seq_lens, indices)
+        rows = []
+        for i in indices:
+            length = int(seq_lens[i])
+            pages = tables[i, : math.ceil(length / 64)].long()
+            cache = (
+                kv.view(torch.uint8)[pages]
+                .view(kv.dtype)
+                .reshape(-1, 576)[:length]
+                .float()
+            )
+            scores = q[i].float() @ cache.T * 192**-0.5
+            rows.append(torch.softmax(scores, dim=-1) @ cache[:, :512])
+        return torch.stack(rows)
+
+    _check_output(out[indices], reference(), dtype_name)
+
+    sliced_kwargs = {
+        **kwargs,
+        "query": q[1:],
+        "block_tables": tables[1:],
+        "seq_lens": seq_lens[1:],
+        "block_split_kvs": splits[1:],
+        "block_split_offsets": offsets[1:],
+        "out": None,
+    }
+    sliced = tokenspeed_mla_decode(**sliced_kwargs)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(sliced, out[1:], rtol=0, atol=0)
+
+    # Uniform lengths get the uniform split, so the output is the uniform call's.
+    tokenspeed_mla_decode_split_kvs(uniform, splits, offsets, tasks, **split_args)
+    expected = tokenspeed_mla_decode(
+        **{
+            **kwargs,
+            "seq_lens": uniform,
+            "out": None,
+            "block_split_kvs": None,
+            "block_split_offsets": None,
+            "block_split_tasks": None,
+        }
+    )
+    tokenspeed_mla_decode(**{**kwargs, "seq_lens": uniform})
+    torch.cuda.synchronize()
+    assert torch.equal(out, expected)
+
+    # Lengths and split counts refreshed in place between replays, no recompile.
+    tokenspeed_mla_decode_split_kvs(seq_lens, splits, offsets, tasks, **split_args)
+    misses = decode._get_compiled_mla_kernel.cache_info().misses
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        tokenspeed_mla_decode(**kwargs)
+        captured_sliced = tokenspeed_mla_decode(**sliced_kwargs)
+    seq_lens.copy_(seq_lens.flip(0))
+    tokenspeed_mla_decode_split_kvs(seq_lens, splits, offsets, tasks, **split_args)
+    out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    _check_output(out[indices], reference(), dtype_name)
+    assert decode._get_compiled_mla_kernel.cache_info().misses == misses
+    torch.testing.assert_close(captured_sliced, out[1:], rtol=0, atol=0)
+
+
+def _check_split_slice_gpu(dtype_name, partial_fp16):
+    import tokenspeed_mla.mla_decode as decode
+
+    decode._FP16_PARTIALS = partial_fp16
+    case = _Case(2, 1024, 128, 96)
+    q, kv, tables, lengths = _make_inputs(case, dtype_name, False, "cuda")
+    q.zero_()  # Uniform logits give an independent prefix-mean and log2-LSE reference.
+    lengths.copy_(torch.tensor([512, 96], dtype=torch.int32, device="cuda"))
+    splits = torch.empty_like(lengths)
+    offsets = torch.empty(3, dtype=torch.int32, device="cuda")
+    tasks = torch.empty(
+        decode.tokenspeed_mla_decode_task_capacity(
+            2, case.heads, case.q_len, 1, decode.get_num_sm(q.device)
+        ),
+        dtype=torch.int64,
+        device="cuda",
+    )
+    decode.tokenspeed_mla_decode_split_kvs(
+        lengths,
+        splits,
+        offsets,
+        tasks,
+        num_heads=case.heads,
+        q_len=case.q_len,
+        max_seq_len=case.kv_len,
+        min_split_kv=1,
+        dtype=q.dtype,
+    )
+    assert splits.tolist() == [2, 1]
+    workspace = torch.empty(
+        3 * case.heads * case.q_len * 513 * 4, dtype=torch.int8, device="cuda"
+    )
+    for request in (0, 1):
+        # Keep the full map: replanning either slice alone would choose one split.
+        args = dict(
+            query=q[request : request + 1],
+            kv_cache=kv,
+            workspace_buffer=workspace,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            block_tables=tables[request : request + 1],
+            seq_lens=lengths[request : request + 1],
+            max_seq_len=case.kv_len,
+            softmax_scale=192**-0.5,
+            output_scale=1.75,
+            is_var_seq=True,
+            causal_mask=True,
+            enable_pdl=True,
+            return_lse=True,
+            min_split_kv=1,
+            block_split_kvs=splits[request : request + 1],
+            block_split_offsets=offsets[request : request + 2],
+            block_split_tasks=tasks,
+        )
+        decode.tokenspeed_mla_decode(**args)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output, lse = decode.tokenspeed_mla_decode(**args)
+            # A successor must observe direct writes even when the reducer skips.
+            observed = output.clone()
+        for length in ((512,) if request == 0 else (96, 0)):
+            lengths[request] = length
+            workspace.fill_(90)
+            graph.replay()
+            torch.cuda.synchronize()
+            expected = (
+                _reference_mla(q, kv, tables, lengths, [request]) * 1.75
+                if length
+                else torch.zeros_like(observed, dtype=torch.float32)
+            )
+            _check_output(observed, expected, dtype_name)
+            visible = (
+                length - case.q_len + torch.arange(1, case.q_len + 1, device="cuda")
+            )
+            expected_lse = torch.where(visible > 0, visible.float().log2(), -torch.inf)
+            torch.testing.assert_close(
+                lse,
+                expected_lse[None, :, None].expand_as(lse),
+                atol=2e-4,
+                rtol=2e-4,
+            )
+            if request == 1:
+                assert torch.all(workspace == 90)
+
+
+def _check_local_visible_gpu(
+    batch, heads, q_len, persistent, kv_len, dtype, partial_fp16, per_request
+):
+    import tokenspeed_mla.mla_decode as decode
+    from tokenspeed_mla import tokenspeed_mla_decode, tokenspeed_mla_decode_split_kvs
 
     decode._FP16_PARTIALS = partial_fp16
 
@@ -1293,8 +1625,46 @@ def _check_local_visible_gpu(
     case = _Case(batch, kv_len, heads, q_len)
     q, kv, tables, lengths = _make_inputs(case, dtype, False, "cuda")
     visible = torch.empty((batch, q_len), dtype=torch.int32, device="cuda")
-    workspace = torch.empty(64 * 1024**2, dtype=torch.int8, device="cuda")
+    workspace_bytes = 64 * 1024**2
+    if per_request:
+        workspace_bytes = decode.tokenspeed_mla_decode_workspace_size(
+            batch, heads, q_len, 512, 1, decode.get_num_sm(q.device)
+        )
+    workspace = torch.empty(workspace_bytes, dtype=torch.int8, device="cuda")
     out = torch.empty((batch, q_len, heads, 512), dtype=torch.bfloat16, device="cuda")
+    splits = torch.empty_like(lengths) if per_request else None
+    offsets = (
+        torch.empty(batch + 1, dtype=torch.int32, device="cuda")
+        if per_request
+        else None
+    )
+
+    tasks = (
+        torch.empty(
+            decode.tokenspeed_mla_decode_task_capacity(
+                batch, heads, q_len, 1, decode.get_num_sm(q.device)
+            ),
+            dtype=torch.int64,
+            device="cuda",
+        )
+        if per_request
+        else None
+    )
+
+    def refresh_splits():
+        if splits is not None:
+            tokenspeed_mla_decode_split_kvs(
+                lengths,
+                splits,
+                offsets,
+                tasks,
+                num_heads=heads,
+                q_len=q_len,
+                max_seq_len=kv_len,
+                min_split_kv=1,
+                dtype=q.dtype,
+            )
+
     kwargs = dict(
         query=q,
         kv_cache=kv,
@@ -1310,6 +1680,9 @@ def _check_local_visible_gpu(
         causal_mask=True,
         return_lse=True,
         local_visible_lens=visible,
+        block_split_kvs=splits,
+        block_split_offsets=offsets,
+        block_split_tasks=tasks,
     )
     boundaries = [0, 1, 63, 64, 65, 127, 128, 129, 257, kv_len]
     initial = torch.tensor(
@@ -1328,11 +1701,15 @@ def _check_local_visible_gpu(
             device="cuda",
         )
     visible.copy_(initial)
+    refresh_splits()
     tokenspeed_mla_decode(**kwargs)
-    assert selections[-1] == (batch == 128), "Expected direct/split-KV coverage changed"
+    assert selections[-1] == (
+        batch == 128 and not per_request
+    ), "Expected direct/split-KV coverage changed"
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
+        refresh_splits()
         captured_out, captured_lse = tokenspeed_mla_decode(**kwargs)
 
     for state in ("mixed", "zero_k", "empty_rows", "restored"):
@@ -1365,6 +1742,7 @@ def _check_local_visible_gpu(
         # Explicit local bounds also override the noncausal path. The captured
         # causal variant must produce the same result for these same bounds.
         kwargs["causal_mask"] = state != "restored"
+        refresh_splits()
         eager_out, eager_lse = tokenspeed_mla_decode(**kwargs)
         torch.cuda.synchronize()
         _check_output(eager_out, expected, dtype)
@@ -1383,26 +1761,40 @@ def _check_local_visible_gpu(
 
 class TestGPU:
     @pytest.mark.parametrize(
+        "dtype_name,partial_fp16",
+        [("fp8", False), ("fp8", True), ("bf16", False), ("fp16", False)],
+    )
+    def test_split_slices_preserve_partials_and_direct_outputs(
+        self, dtype_name, partial_fp16
+    ):
+        _run_gpu_check(_check_split_slice_gpu, (dtype_name, partial_fp16), 180)
+
+    @pytest.mark.parametrize(
         "dtype,partial_fp16", [("bf16", False), ("fp8", False), ("fp8", True)]
     )
     @pytest.mark.parametrize(
-        "batch,heads,q_len,persistent,kv_len",
+        "batch,heads,q_len,persistent,kv_len,per_request",
         [
-            (1, 96, 1, False, 385),
-            (1, 16, 4, False, 385),
-            (1, 96, 5, True, 385),
-            (128, 16, 4, False, 385),
-            (128, 96, 5, True, 385),
-            (1, 16, 4, False, 65537),
-            (1, 96, 4, False, 65537),
+            (1, 96, 1, False, 385, False),
+            (1, 16, 4, False, 385, False),
+            (1, 96, 5, True, 385, False),
+            (128, 16, 4, False, 385, False),
+            (128, 96, 5, True, 385, False),
+            (1, 16, 4, False, 65537, False),
+            (1, 96, 4, False, 65537, False),
+            (3, 96, 4, False, 16384, True),
+            (2, 16, 4, False, 385, True),
+            (1, 128, 1, False, 385, True),
+            (256, 128, 1, False, 4096, True),
+            (64, 128, 4, False, 4096, True),
         ],
     )
     def test_local_visible_lengths(
-        self, batch, heads, q_len, persistent, kv_len, dtype, partial_fp16
+        self, batch, heads, q_len, persistent, kv_len, per_request, dtype, partial_fp16
     ):
         _run_gpu_check(
             _check_local_visible_gpu,
-            (batch, heads, q_len, persistent, kv_len, dtype, partial_fp16),
+            (batch, heads, q_len, persistent, kv_len, dtype, partial_fp16, per_request),
             600,
         )
 
@@ -1464,6 +1856,28 @@ class TestGPU:
 
     def test_packed_q_outputs_lse_tails_and_folded_paths(self):
         _run_gpu_check(_check_packed_gpu, (), 600)
+
+    @pytest.mark.parametrize(
+        "heads,q_len,causal,large_workspace,batch",
+        [
+            (96, 4, True, False, 6),
+            (64, 1, True, False, 6),
+            (16, 4, False, False, 6),
+            (128, 1, True, True, 6),
+            (96, 4, True, False, 64),
+            (128, 4, True, False, 37),
+            (128, 4, True, False, 128),
+        ],
+    )
+    @pytest.mark.parametrize("dtype_name", ["fp8", "bf16", "fp16"])
+    def test_per_request_split_counts(
+        self, heads, q_len, dtype_name, causal, large_workspace, batch
+    ):
+        _run_gpu_check(
+            _check_per_request_split_gpu,
+            (heads, q_len, dtype_name, causal, large_workspace, batch),
+            600,
+        )
 
     @pytest.mark.parametrize("interleave", [1, 64], ids=["strided", "block64"])
     def test_packed_q_preserves_sliding_window_and_dcp_masks(self, interleave):

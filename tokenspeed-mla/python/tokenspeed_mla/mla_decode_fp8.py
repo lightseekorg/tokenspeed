@@ -59,11 +59,14 @@ try:
         MLAStaticTileScheduler,
         MLAStaticTileSchedulerParams,
         ceil_div,
+        compact_split_grid,
         compute_q_tile_layout,
         create_mla_static_tile_scheduler,
         create_mla_static_tile_scheduler_params,
         get_mla_decode_arch,
         get_mla_decode_fold_sq_factor,
+        make_compact_split_workspace,
+        offset_split_workspace,
     )
 except ImportError:
     from mla_helpers import (
@@ -72,11 +75,14 @@ except ImportError:
         MLAStaticTileScheduler,
         MLAStaticTileSchedulerParams,
         ceil_div,
+        compact_split_grid,
         compute_q_tile_layout,
         create_mla_static_tile_scheduler,
         create_mla_static_tile_scheduler_params,
         get_mla_decode_arch,
         get_mla_decode_fold_sq_factor,
+        make_compact_split_workspace,
+        offset_split_workspace,
     )
 
 # Please refer to https://github.com/NVIDIA/cutlass/blob/main/include/cute/arch/mma_sm100_desc.hpp#L412
@@ -288,6 +294,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         self.mma_pv_tiler_mn = mma_pv_tiler_mn
         self.max_active_clusters = max_active_clusters
         self.skip_correction_threshold = skip_correction_threshold
+        if is_var_split_kv and is_persistent:
+            raise ValueError("per-request split-KV requires non-persistent scheduling")
         self.is_persistent = is_persistent
         self.page_size = page_size
         self.is_var_seq = is_var_seq
@@ -467,6 +475,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         stream: cuda.CUstream,
         use_pdl: cutlass.Constexpr = True,
         local_visible_lens: Optional[cute.Tensor] = None,
+        block_split_offsets: Optional[cute.Tensor] = None,
+        block_split_tasks: Optional[cute.Tensor] = None,
     ):
         """Execute the Multi-Head Latent Attention operation on the provided tensors.
 
@@ -513,6 +523,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         """
 
         # setup static attributes before smem/grid/tma computation
+        assert (block_split_kvs is not None) == self.is_var_split_kv
+        assert (block_split_offsets is not None) == self.is_var_split_kv
+        assert (block_split_tasks is not None) == self.is_var_split_kv
         self.q_dtype = q_latent.element_type
         self.k_dtype = c_latent.element_type
         self.v_dtype = c_latent.element_type
@@ -1033,6 +1046,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
 
         softmax_scale_log2 = softmax_scale * LOG2_E
 
+        if cutlass.const_expr(self.is_var_split_kv):
+            grid = compact_split_grid(
+                o, split_kv, acc_o, block_split_tasks, self.cluster_shape_mnk[0]
+            )
         self.split_kv_kernel(
             qk_tiled_mma,
             pv_tiled_mma,
@@ -1058,6 +1075,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             causal_seqs,
             local_visible_lens,
             block_split_kvs,
+            block_split_offsets,
+            block_split_tasks,
             softmax_scale_log2,
             output_scale,
             q_latent_smem_layout_staged,
@@ -1081,6 +1100,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             min_blocks_per_mp=1,
             use_pdl=use_pdl,
         )
+
         if cutlass.const_expr(acc_o is not None):
             self.reduction_kernel(
                 o_reduction,
@@ -1090,6 +1110,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 split_kv,
                 cache_seqs,
                 block_split_kvs,
+                block_split_offsets,
                 local_visible_lens is not None,
                 output_scale,
             ).launch(
@@ -1176,6 +1197,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         causal_seqs: cute.Tensor,  # per-request global causal bound (DCP)
         local_visible_lens: Optional[cute.Tensor],
         block_split_kvs: cute.Tensor,
+        block_split_offsets: Optional[cute.Tensor],
+        block_split_tasks: Optional[cute.Tensor],
         softmax_scale_log2: cutlass.Float32,
         output_scale: cutlass.Float32,
         q_latent_smem_layout_staged: cute.ComposedLayout,
@@ -1394,6 +1417,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Load warps, including page table and data tensors
+        #  Resolve compact coordinates within each role after setmaxregister to
+        #  keep them out of pipeline initialization and shorten register lifetimes.
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx >= self.empty_warp_ids[0] and warp_idx <= self.empty_warp_ids[-1]:
             cute.arch.setmaxregister_decrease(self.other_reg_num)
@@ -1411,7 +1436,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             else:
                 load_k_rope_producer_state = load_k_producer_state
             tile_sched = create_mla_static_tile_scheduler(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+                tile_sched_params, block_split_offsets, block_split_tasks
             )
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
@@ -1469,7 +1494,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 pipeline.PipelineUserType.Producer, self.load_v_pipeline_stage
             )
             tile_sched = create_mla_static_tile_scheduler(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+                tile_sched_params, block_split_offsets, block_split_tasks
             )
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
@@ -1560,7 +1585,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 pipeline.PipelineUserType.Producer, self.mma_o_stage
             )
             tile_sched = create_mla_static_tile_scheduler(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+                tile_sched_params, block_split_offsets, block_split_tasks
             )
             work_tile = tile_sched.initial_work_tile_info()
 
@@ -1660,7 +1685,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
 
             tile_sched = create_mla_static_tile_scheduler(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+                tile_sched_params, block_split_offsets, block_split_tasks
             )
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
@@ -1674,7 +1699,13 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         split_kv=split_kv,
                         local_split_kv=local_split_kv,
                         smem_exchange=softmax_smem_exchange,
-                        mAccO=mAccO,
+                        mAccO=(
+                            offset_split_workspace(
+                                mAccO, block_split_offsets, blk_coord[2]
+                            )
+                            if self.is_var_split_kv
+                            else mAccO
+                        ),
                         mO=mO,
                         K=cache_seqs[blk_coord[2]],
                         K_causal=causal_seqs[blk_coord[2]],
@@ -1730,7 +1761,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
 
             tile_sched = create_mla_static_tile_scheduler(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+                tile_sched_params, block_split_offsets, block_split_tasks
             )
             work_tile = tile_sched.initial_work_tile_info()
             while work_tile.is_valid_tile:
@@ -1744,7 +1775,13 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         split_kv=split_kv,
                         local_split_kv=local_split_kv,
                         smem_exchange=epilogue_smem_exchange,
-                        mAccO=mAccO,
+                        mAccO=(
+                            offset_split_workspace(
+                                mAccO, block_split_offsets, blk_coord[2]
+                            )
+                            if self.is_var_split_kv
+                            else mAccO
+                        ),
                         mO=mO,
                         K=cache_seqs[blk_coord[2]],
                         K_causal=causal_seqs[blk_coord[2]],
@@ -1769,7 +1806,13 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     compute_epilogue_params = SimpleNamespace(
                         output_scale=output_scale,
                         softmax_scale_log2=softmax_scale_log2,
-                        mAccLSE=mAccLSE,
+                        mAccLSE=(
+                            offset_split_workspace(
+                                mAccLSE, block_split_offsets, blk_coord[2]
+                            )
+                            if self.is_var_split_kv
+                            else mAccLSE
+                        ),
                         mLSE=mLSE,
                     )
                     p_cor_consumer_state, mma_o_consumer_state = self.correction(
@@ -1779,6 +1822,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                         p_cor_consumer_state=p_cor_consumer_state,
                         mma_o_consumer_state=mma_o_consumer_state,
                     )
+                elif cutlass.const_expr(self.is_var_split_kv):
+                    # Only the request's first split owns a zero-K final output.
+                    if local_split_kv == 1 and blk_coord[3] == 0:
+                        self.write_empty_output(mO, mLSE, blk_coord, tidx)
                 elif cutlass.const_expr(
                     mAccO is None and local_visible_lens is not None
                 ):
@@ -1821,6 +1868,40 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         split_kv: cutlass.Int32,
         cache_seqs: cute.Tensor,
         block_split_kvs: cute.Tensor,
+        block_split_offsets: Optional[cute.Tensor],
+        has_local_visible_lens: cutlass.Constexpr,
+        output_scale: cutlass.Float32,
+    ):
+        """Reduce split requests after attention; direct-output rows only wait for PDL."""
+        needs_reduce = True
+        if cutlass.const_expr(self.is_var_split_kv):
+            cute.arch.griddepcontrol_wait()
+            needs_reduce = block_split_kvs[cute.arch.block_idx()[2]] != 1
+        if needs_reduce:
+            self._reduce(
+                mO,
+                mLSE,
+                mAccO,
+                mAccLSE,
+                split_kv,
+                cache_seqs,
+                block_split_kvs,
+                block_split_offsets,
+                has_local_visible_lens,
+                output_scale,
+            )
+
+    @cute.jit
+    def _reduce(
+        self,
+        mO: cute.Tensor,
+        mLSE: Optional[cute.Tensor],
+        mAccO: cute.Tensor,
+        mAccLSE: cute.Tensor,
+        split_kv: cutlass.Int32,
+        cache_seqs: cute.Tensor,
+        block_split_kvs: cute.Tensor,
+        block_split_offsets: Optional[cute.Tensor],
         has_local_visible_lens: cutlass.Constexpr,
         output_scale: cutlass.Float32,
     ):
@@ -1859,6 +1940,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         local_split_kv = (
             block_split_kvs[blk_coord[2]] if self.is_var_split_kv else split_kv
         )
+        if cutlass.const_expr(self.is_var_split_kv):
+            mAccO = offset_split_workspace(mAccO, block_split_offsets, blk_coord[2])
+            mAccLSE = offset_split_workspace(mAccLSE, block_split_offsets, blk_coord[2])
         k_tile_total = cute.ceil_div(cache_seqs[blk_coord[2]], self.mma_qk_tiler[1])
         # Mirror get_k_tile_count's window-aware split, or this reduction reads
         # partials from CTAs that were given no tiles to write them.
@@ -1890,7 +1974,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
 
         # let the next split kernel get scheduled early; its own wait still orders the data
         cute.arch.griddepcontrol_launch_dependents()
-        cute.arch.griddepcontrol_wait()
+        if cutlass.const_expr(not self.is_var_split_kv):
+            cute.arch.griddepcontrol_wait()
 
         # issue the first set of partial loads before the LSE phase; later sets
         # only if the row needs them
@@ -3880,7 +3965,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
 
     @cute.jit
     def _tmem_load_partition(
-        self, common_params: SimpleNamespace, tiled_mma_pv: cute.TiledMma, iter_n: int
+        self,
+        common_params: SimpleNamespace,
+        tiled_mma_pv: cute.TiledMma,
+        iter_n: int,
+        direct_output: cutlass.Constexpr,
     ) -> tuple[
         cute.TiledMma, cute.TiledMma, cute.TiledMma, cute.TiledMma, cute.TiledMma
     ]:
@@ -3892,6 +3981,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :type tiled_mma_pv: cute.TiledMma
         :param iter_n: The iteration number
         :type iter_n: int
+        :param direct_output: Select final output instead of partial workspace.
+        :type direct_output: cutlass.Constexpr
 
         :return: The tiled mma pv, the tiled mma pv, the tiled mma pv, the tiled mma pv, the tiled mma pv
         :rtype: tuple[cute.TiledMma, cute.TiledMma, cute.TiledMma, cute.TiledMma, cute.TiledMma]
@@ -3954,7 +4045,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         cta_pv_tiler_mn = cute.select(cta_pv_tiler, mode=[0, 1])
 
         gO = None
-        if cutlass.const_expr(common_params.mAccO is not None):
+        if cutlass.const_expr(not direct_output):
             gO = cute.local_tile(
                 common_params.mAccO[None, common_params.blk_coord[3], None, None, None],
                 cta_pv_tiler_mn,
@@ -4060,7 +4151,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         tidx = common_params.tidx % (self.num_compute_warps * self.threads_per_warp)
         # load correction factor
         _, tAcc, _, _, _, _ = self._tmem_load_partition(
-            common_params, common_params.tiled_mma_pv, 0
+            common_params, common_params.tiled_mma_pv, 0, common_params.mAccO is None
         )
         if cutlass.const_expr(self.use_2cta_instrs):
             corr_layout = cute.make_layout(
@@ -4163,7 +4254,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 # tmem load tiled copy and partition results.
                 tmem_load_tiled_copy, tAcc, tTR_tAcc, tTR_gO, tTR_cO, tTR_rAcc = (
                     self._tmem_load_partition(
-                        common_params, common_params.tiled_mma_pv, iter_n
+                        common_params,
+                        common_params.tiled_mma_pv,
+                        iter_n,
+                        common_params.mAccO is None,
                     )
                 )
 
@@ -4217,6 +4311,47 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         row_sum: cutlass.Float32,
         row_max: cutlass.Float32,
     ) -> pipeline.PipelineState:
+        """Single-split requests write final O/LSE through the same epilogue."""
+        if cutlass.const_expr(self.is_var_split_kv and common_params.mAccO is not None):
+            if cute.arch.make_warp_uniform(common_params.local_split_kv) == 1:
+                mma_o_consumer_state = self._store_epilogue(
+                    common_params,
+                    epilogue_params,
+                    mma_o_consumer_state,
+                    row_sum,
+                    row_max,
+                    True,
+                )
+            else:
+                mma_o_consumer_state = self._store_epilogue(
+                    common_params,
+                    epilogue_params,
+                    mma_o_consumer_state,
+                    row_sum,
+                    row_max,
+                    False,
+                )
+        else:
+            mma_o_consumer_state = self._store_epilogue(
+                common_params,
+                epilogue_params,
+                mma_o_consumer_state,
+                row_sum,
+                row_max,
+                common_params.mAccO is None,
+            )
+        return mma_o_consumer_state
+
+    @cute.jit
+    def _store_epilogue(
+        self,
+        common_params: SimpleNamespace,
+        epilogue_params: SimpleNamespace,
+        mma_o_consumer_state: pipeline.PipelineState,
+        row_sum: cutlass.Float32,
+        row_max: cutlass.Float32,
+        direct_output: cutlass.Constexpr,
+    ) -> pipeline.PipelineState:
         """Epilogue for one k-tile. Updates the related pipeline state.
 
         :param common_params: The common parameters
@@ -4259,7 +4394,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         if cutlass.const_expr(common_params.local_visible_lens is not None):
             safe_row_sum = row_sum if row_sum != 0.0 else 1.0
         # partials skip output_scale; the reduction kernel applies it
-        if cutlass.const_expr(common_params.mAccO is None):
+        if cutlass.const_expr(direct_output):
             epi_scale = epilogue_params.output_scale * cute.arch.rcp_approx(
                 safe_row_sum
             )
@@ -4274,7 +4409,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             # tmem load tiled copy and partition results (full tile).
             tmem_load_tiled_copy, tAcc, tTR_tAcc, tTR_gO, tTR_cO, tTR_rAcc = (
                 self._tmem_load_partition(
-                    common_params, common_params.tiled_mma_pv, iter_n
+                    common_params, common_params.tiled_mma_pv, iter_n, direct_output
                 )
             )
 
@@ -4341,7 +4476,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 self.mma_pv_tiler[1],
                 self.mma_pv_tiler[2],
             )
-            if cutlass.const_expr(epilogue_params.mAccLSE is None):
+            if cutlass.const_expr(direct_output):
                 if cutlass.const_expr(not self.skip_lse):
                     lse = (
                         cute.math.log2(row_sum, fastmath=True)
@@ -4683,6 +4818,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         """
         acc_o, acc_lse = None, None
         if cutlass.const_expr(workspace is not None):
+            if cutlass.const_expr(self.is_var_split_kv):
+                return make_compact_split_workspace(
+                    H, D, S, B, workspace, self.partial_dtype, acc_dtype
+                )
             align = 256 // self.q_dtype.width
             acc_o_layout = cute.make_layout(
                 (H, split_kv, D, S, B),
@@ -5088,6 +5227,8 @@ def run(
         max_active_clusters,
     ):
         block_split_kvs_ref, block_split_kvs, block_split_kvs_gpu = None, None, None
+        block_split_offsets, block_split_offsets_gpu = None, None
+        block_split_tasks, block_split_tasks_gpu = None, None
         # check if split_kv is valid otherwise do auto setting of split_kv
         # Use seq_len_q_for_split (effective S_q after fold grouping).
         if is_var_split_kv:
@@ -5108,6 +5249,25 @@ def run(
             block_split_kvs = from_dlpack(
                 block_split_kvs_gpu, assumed_align=16
             ).mark_layout_dynamic()
+            block_split_offsets_gpu = torch.cat(
+                (
+                    torch.zeros(1, dtype=torch.int32),
+                    block_split_kvs_ref.cumsum(0, dtype=torch.int32),
+                )
+            ).cuda()
+            block_split_offsets = from_dlpack(
+                block_split_offsets_gpu, assumed_align=16
+            ).mark_layout_dynamic()
+            requests = torch.repeat_interleave(
+                torch.arange(batch_size, dtype=torch.int64), block_split_kvs_ref
+            )
+            splits = torch.cat(
+                [torch.arange(int(n), dtype=torch.int64) for n in block_split_kvs_ref]
+            )
+            block_split_tasks_gpu = ((requests << 32) | splits).cuda()
+            block_split_tasks = from_dlpack(
+                block_split_tasks_gpu, assumed_align=8
+            ).mark_layout_dynamic()
         elif split_kv <= 0:
             split_kv = BlackwellMultiHeadLatentAttentionForwardFP8.get_split_kv(
                 batch_size,
@@ -5117,7 +5277,16 @@ def run(
                 max_active_clusters * cluster_shape_mnk[0],
                 cluster_shape_mnk[0],
             )
-        return split_kv, block_split_kvs_ref, block_split_kvs, block_split_kvs_gpu
+        return (
+            split_kv,
+            block_split_kvs_ref,
+            block_split_kvs,
+            block_split_kvs_gpu,
+            block_split_offsets,
+            block_split_offsets_gpu,
+            block_split_tasks,
+            block_split_tasks_gpu,
+        )
 
     def create_workspace(
         num_heads, seq_len_q, latent_dim, batch_size, split_kv, acc_dtype
@@ -5154,16 +5323,23 @@ def run(
         num_heads, seq_len_q, mma_qk_tiler_mn[0]
     )
     seq_len_q_for_split = seq_len_q // fold_sq_factor
-    split_kv, block_split_kvs_ref, block_split_kvs, block_split_kvs_torch = (
-        create_block_split_kvs(
-            batch_size,
-            split_kv,
-            cache_seqs_ref,
-            is_var_split_kv,
-            mma_qk_tiler_mn,
-            cluster_shape_mnk,
-            max_active_clusters,
-        )
+    (
+        split_kv,
+        block_split_kvs_ref,
+        block_split_kvs,
+        block_split_kvs_torch,
+        block_split_offsets,
+        block_split_offsets_torch,
+        block_split_tasks,
+        block_split_tasks_torch,
+    ) = create_block_split_kvs(
+        batch_size,
+        split_kv,
+        cache_seqs_ref,
+        is_var_split_kv,
+        mma_qk_tiler_mn,
+        cluster_shape_mnk,
+        max_active_clusters,
     )
 
     q_latent_ref, q_latent, q_latent_torch = create_data_tensor(
@@ -5268,6 +5444,10 @@ def run(
         softmax_scale,
         output_scale,
         stream,
+        True,
+        None,
+        block_split_offsets,
+        block_split_tasks,
         options="--opt-level 2",
     )
 
@@ -5382,6 +5562,9 @@ def run(
             softmax_scale,
             output_scale,
             stream,
+            None,
+            block_split_offsets,
+            block_split_tasks,
         )
         torch.cuda.synchronize()
 
@@ -5438,7 +5621,16 @@ def run(
         _, page_table, _ = create_page_table(
             batch_size, seq_len_k, is_var_seq, page_size
         )
-        _split_kv, _, block_split_kvs, _ = create_block_split_kvs(
+        (
+            _split_kv,
+            _,
+            block_split_kvs,
+            _,
+            block_split_offsets,
+            _,
+            block_split_tasks,
+            _,
+        ) = create_block_split_kvs(
             batch_size,
             split_kv,
             cache_seqs_ref,
@@ -5519,6 +5711,9 @@ def run(
             softmax_scale,
             output_scale,
             stream,
+            None,
+            block_split_offsets,
+            block_split_tasks,
         )
 
     workspace_count = 1
@@ -5538,6 +5733,10 @@ def run(
         if is_var_split_kv:
             one_workspace_bytes += (
                 block_split_kvs_torch.numel() * block_split_kvs_torch.element_size()
+                + block_split_offsets_torch.numel()
+                * block_split_offsets_torch.element_size()
+                + block_split_tasks_torch.numel()
+                * block_split_tasks_torch.element_size()
             )
         if workspace_torch is not None:
             one_workspace_bytes += (

@@ -222,7 +222,12 @@ def _register_tokenspeed_mla_decode_kernel() -> None:
 
 
 get_num_sm = error_fn
+# Grid width of a decode call with per-request split counts; None without the kernel.
+PER_REQUEST_SPLIT_KV_CAPACITY: int | None = None
 tokenspeed_mla_decode = error_fn
+tokenspeed_mla_decode_split_kvs = error_fn
+tokenspeed_mla_decode_task_capacity = error_fn
+tokenspeed_mla_decode_workspace_size = error_fn
 tokenspeed_mla_prefill = error_fn
 warmup_compile_prefill = error_fn
 
@@ -237,10 +242,16 @@ elif current_platform().is_cdna5:
 elif current_platform().is_nvidia:
     try:
         from tokenspeed_mla import (
+            PER_REQUEST_SPLIT_KV_CAPACITY,
             get_num_sm,
         )
         from tokenspeed_mla import mla_kv_pack_quantize_fp8 as _mla_kv_pack_quantize_fp8
         from tokenspeed_mla import tokenspeed_mla_decode as _tokenspeed_mla_decode
+        from tokenspeed_mla import (
+            tokenspeed_mla_decode_split_kvs,
+            tokenspeed_mla_decode_task_capacity,
+            tokenspeed_mla_decode_workspace_size,
+        )
         from tokenspeed_mla import tokenspeed_mla_prefill as _tokenspeed_mla_prefill
         from tokenspeed_mla import warmup_compile_prefill as _warmup_compile_prefill
     except ImportError:
@@ -254,9 +265,13 @@ elif current_platform().is_nvidia:
         _register_tokenspeed_mla_decode_kernel()
 
 __all__ = [
+    "PER_REQUEST_SPLIT_KV_CAPACITY",
     "get_num_sm",
     "mla_kv_pack_quantize_fp8",
     "tokenspeed_mla_decode",
+    "tokenspeed_mla_decode_split_kvs",
+    "tokenspeed_mla_decode_task_capacity",
+    "tokenspeed_mla_decode_workspace_size",
     "tokenspeed_mla_prefill",
     "warmup_compile_prefill",
 ]

@@ -23,6 +23,82 @@ import cutlass
 import cutlass.cute as cute
 
 
+@cute.jit
+def compact_split_grid(o, split_kv, acc_o, tasks, cluster_m):
+    chunks = cutlass.min(cutlass.Int64(o.shape[3]) * split_kv, tasks.shape[0])
+    if cutlass.const_expr(acc_o is not None):
+        chunks = cutlass.min(chunks, acc_o.shape[1])
+    # Query tiles sharing a KV chunk are adjacent clusters, not grid planes.
+    return (cluster_m * o.shape[2], chunks, 1)
+
+
+@cute.jit
+def compact_split_block_coord(offsets, tasks, params):
+    block = cute.arch.block_idx()
+    base = offsets[0]
+    total = offsets[params.problem_shape_b] - base
+    valid = cute.arch.make_warp_uniform(block[1] < total)
+    # Padding clusters use a live request and an empty split. Keep scheduler
+    # validity static so warp-specialized loops retain their uniformity.
+    chunk = cutlass.Int64(base) + cutlass.min(block[1], cutlass.max(total - 1, 0))
+    task = tasks[chunk]
+    first_request = cutlass.Int32(tasks[cutlass.Int64(base)] >> 32)
+    request = cute.arch.make_warp_uniform(cutlass.Int32(task >> 32) - first_request)
+    split = cute.arch.make_warp_uniform(cutlass.Int32(task & 0xFFFFFFFF))
+    split = cute.arch.make_warp_uniform(split if valid else params.split_kv)
+    return (
+        block[0] % params.cluster_shape_mnk[0],
+        (block[0] // params.cluster_shape_mnk[0]) * params.problem_shape_b + request,
+        split,
+    )
+
+
+@cute.jit
+def make_compact_split_workspace(H, D, S, B, workspace, partial_dtype, acc_dtype):
+    """Share a packed split axis across requests; the batch stride is zero."""
+    slots = cutlass.Int64(cute.size(workspace)) // (cutlass.Int64(H) * S * (D + 1) * 4)
+    output = cute.make_tensor(
+        cute.recast_ptr(workspace.iterator, dtype=partial_dtype),
+        cute.make_layout(
+            (H, slots, D, S, B),
+            stride=(
+                cute.assume(slots * D, 32),
+                D,
+                1,
+                cute.assume(slots * H * D, 32),
+                0,
+            ),
+        ),
+    )
+    lse = cute.make_tensor(
+        cute.recast_ptr(
+            workspace.iterator
+            + cute.assume(slots * H * S * D * (partial_dtype.width // 8), 32),
+            dtype=acc_dtype,
+        ),
+        cute.make_layout((H, slots, S, B), stride=(slots, 1, slots * H, 0)),
+    )
+    return output, lse
+
+
+@cute.jit
+def offset_split_workspace(tensor, offsets, request):
+    if cutlass.const_expr(tensor is not None):
+        # A sliced batch may begin after split zero in its original plan.
+        offset = cutlass.Int64(offsets[request]) - cutlass.Int64(offsets[0])
+        ptr = tensor.iterator + offset * tensor.stride[1]
+        if cutlass.const_expr(len(tensor.shape) == 5):
+            # Partials start on whole slots; without the base alignment the epilogue stores narrow vectors.
+            ptr = cute.make_ptr(
+                tensor.element_type,
+                ptr.toint(),
+                cute.AddressSpace.gmem,
+                assumed_align=32,
+            )
+        tensor = cute.make_tensor(ptr, tensor.layout)
+    return tensor
+
+
 def get_mla_decode_arch(compute_capability: tuple[int, int]) -> str:
     """Return the CuTe architecture name for a supported MLA decode device."""
     if compute_capability not in ((10, 0), (10, 3), (10, 7)):
@@ -349,10 +425,14 @@ class MLAStaticTileScheduler:
 
 def create_mla_static_tile_scheduler(
     params: MLAStaticTileSchedulerParams,
-    blk_coord: cute.Coord,
-    grid_shape: cute.Shape,
+    split_offsets: cute.Tensor | None,
+    split_tasks: cute.Tensor | None,
 ) -> MLAStaticTileScheduler:
-    return MLAStaticTileScheduler(params, blk_coord[0], blk_coord, grid_shape)
+    """Resolve coordinates within each warp role, after register allocation."""
+    blk_coord = cute.arch.block_idx()
+    if split_offsets is not None:
+        blk_coord = compact_split_block_coord(split_offsets, split_tasks, params)
+    return MLAStaticTileScheduler(params, blk_coord[0], blk_coord, cute.arch.grid_dim())
 
 
 LOG2_E = 1.4426950408889634074
