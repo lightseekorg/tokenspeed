@@ -47,7 +47,9 @@ from tokenspeed_kernel_amd._triton import triton  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (  # noqa: E402
     _HALF_TILE_MAX_M,
     _PREFERRED_BUCKETS,
+    gluon_gated_norm_gemv_a16w16_gfx950,
     gluon_gemv_a16w16_gfx950,
+    launch_gluon_gated_norm_gemv_a16w16_gfx950,
     launch_gluon_gemv_a16w16_gfx950,
     prefers_gluon_gemv_a16w16_gfx950,
 )
@@ -270,6 +272,27 @@ def test_gated_norm_gemv_matches_the_gated_norm_then_mm(m):
     actual = torch.full_like(expected, float("nan"))
     mv_rmsnorm_gated_sigmoid(x, gate, norm_weight, weight, 1e-5, actual)
     assert torch.equal(actual, expected)
+
+
+def test_gated_norm_gemv_compiles_once_per_norm_bucket():
+    n, heads, head_dim = 7168, 12, 128
+    k = heads * head_dim
+    weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    norm_weight = torch.ones(head_dim, device="cuda", dtype=torch.bfloat16)
+
+    def run(m):
+        x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+        gate = torch.randn(m, 3 * k, device="cuda", dtype=torch.bfloat16)[:, k : 2 * k]
+        launch_gluon_gated_norm_gemv_a16w16_gfx950(
+            x, gate, norm_weight, weight, x.new_empty(m, n), 1e-5
+        )
+
+    # Warm the 2..4 and 5..8 row buckets.
+    run(2)
+    run(5)
+    with assert_no_triton_compile(gluon_gated_norm_gemv_a16w16_gfx950):
+        for m in range(2, 9):
+            run(m)
 
 
 def test_gated_norm_gemv_leaves_other_rows_and_heads_to_two_launches():
