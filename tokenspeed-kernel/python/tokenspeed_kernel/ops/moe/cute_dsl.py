@@ -20,10 +20,184 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from dataclasses import dataclass
+
 import torch
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
+
+
+@register_kernel(
+    "moe",
+    "combine_quant_fp8",
+    name="cute_dsl_combine_quant_fp8",
+    solution="cute_dsl",
+    capability=CapabilityRequirement(
+        vendors=frozenset({"nvidia"}),
+        min_arch_version=ArchVersion(9, 0),
+        max_arch_version=ArchVersion(9, 0),
+    ),
+    signatures=format_signatures("partial", "dense", {torch.bfloat16}),
+    priority=Priority.SPECIALIZED,
+)
+def cute_dsl_combine_quant_fp8(partial, inverse, weights, valid_rows, out):
+    """Run the ordered route reduction and projection quantizer on Hopper."""
+    from tokenspeed_kernel.ops.moe._cute_dsl.combine_quant import run_combine_quant
+
+    return run_combine_quant(partial, inverse, weights, valid_rows, out)
+
+
+@dataclass(frozen=True)
+class _DeferredMoEState:
+    small_batch_native: Callable
+    original_native: Callable
+
+    def native_for_tokens(self, tokens: int) -> Callable:
+        # Keep the original schedule beyond the measured small-batch benefit.
+        return self.small_batch_native if tokens <= 16 else self.original_native
+
+
+def cute_dsl_fp8_moe_process_weights(plan: dict, w: torch.nn.Module) -> None:
+    if w._moe_backend_state is not None:
+        raise ValueError("FP8 MoE weights have already been prepared")
+    if w.hidden_size <= 0 or w.hidden_size % 128 or not 1 <= w.top_k <= 32:
+        raise ValueError(
+            "CuTe DSL FP8 MoE requires a positive 128-aligned hidden size and top-k in 1..32"
+        )
+    if w.swiglu_arg is not None and (
+        w.swiglu_arg.alpha not in (None, 1.0) or w.swiglu_arg.limit is not None
+    ):
+        raise ValueError("CuTe DSL FP8 MoE requires standard SwiGLU")
+    if w.swiglu_beta not in (None, 0.0):
+        raise ValueError("CuTe DSL FP8 MoE requires standard SwiGLU")
+    from tokenspeed_kernel.ops.moe.flashinfer import flashinfer_cutlass_fp8_moe_weights
+    from tokenspeed_kernel.thirdparty.flashinfer.sm90_moe import make_cutlass_fused_moe
+
+    # Build before mutating checkpoint storage; a failed build can be retried.
+    small_batch_native = make_cutlass_fused_moe(
+        mode="optimized", max_num_stages_fc1=4, max_num_stages_fc2=-1
+    )
+    original_native = make_cutlass_fused_moe(
+        mode="expected_m", max_num_stages_fc1=-1, max_num_stages_fc2=-1
+    )
+    flashinfer_cutlass_fp8_moe_weights(plan, w)
+    w._moe_backend_state = _DeferredMoEState(small_batch_native, original_native)
+
+
+@register_kernel(
+    "moe",
+    "apply",
+    name="cute_dsl_fp8_moe_apply",
+    solution="cute_dsl",
+    weight_preprocessor=cute_dsl_fp8_moe_process_weights,
+    capability=CapabilityRequirement(
+        vendors=frozenset({"nvidia"}),
+        min_arch_version=ArchVersion(9, 0),
+        max_arch_version=ArchVersion(9, 0),
+    ),
+    signatures=format_signatures("x", "dense", {torch.bfloat16}),
+    traits={
+        "weight_dtype": frozenset({"fp8"}),
+        "activation": frozenset({"silu", "swiglu"}),
+        "routing_mode": frozenset({"precomputed_topk"}),
+        "supports_deferred_finalize": frozenset({False}),
+        "supports_deferred_routes": frozenset({True}),
+        "supports_ep": frozenset({True}),
+        "supports_all_to_all_ep": frozenset({False}),
+        "ispp_alignment": frozenset({128}),
+        "hidden_alignment": frozenset({128}),
+        "top_k": frozenset(range(1, 33)),
+        "swiglu_form": frozenset({"standard"}),
+        "activation_clamped": frozenset({False}),
+        "expert_id_repeats": frozenset({False}),
+        "internal_activation_dtype": frozenset({"input"}),
+        "fp8_scale_block_shape": frozenset({(128, 128)}),
+        "supports_bias": frozenset({False}),
+    },
+    priority=Priority.PORTABLE,
+)
+def cute_dsl_fp8_moe_apply(
+    plan: dict,
+    x: torch.Tensor,
+    w: torch.nn.Module,
+    router_logits: torch.Tensor | None,
+    topk_weights: torch.Tensor | None,
+    topk_ids: torch.Tensor | None,
+    num_tokens_global: int | None,
+    max_num_tokens_per_gpu: int | None,
+    do_finalize: bool,
+    enable_pdl: bool,
+):
+    """Execute the planned FP8 experts with precomputed route IDs and weights.
+
+    ``x`` is BF16 [tokens, hidden]; ``w`` owns processed checkpoint weights and
+    the native callables initialized by ``moe_process_weights``. The remaining
+    arguments follow ``moe_apply``. Normal calls return finalized BF16
+    [tokens, hidden]; ``moe_apply_routes`` requests owned unweighted route rows.
+    """
+    if not do_finalize and plan["cutlass_fused_finalize"]:
+        raise ValueError("Deferred routes require cutlass_fused_finalize=False")
+    if topk_ids is None or topk_weights is None:
+        raise ValueError("CuTe DSL FP8 MoE requires precomputed top-k")
+    if (
+        x.ndim != 2
+        or x.shape[1] != w.hidden_size
+        or x.dtype != torch.bfloat16
+        or topk_ids.shape != (x.shape[0], w.top_k)
+        or topk_weights.shape != topk_ids.shape
+    ):
+        raise ValueError("FP8 MoE inputs differ from the planned model geometry")
+    state = w._moe_backend_state
+    if not isinstance(state, _DeferredMoEState):
+        raise RuntimeError("Prepare FP8 MoE weights before execution")
+    from flashinfer import ActivationType
+    from tokenspeed_kernel.ops.tuning import get_autotune_max_num_tokens
+
+    if not do_finalize and not 1 <= x.shape[0] <= 4096:
+        raise ValueError("Deferred block-FP8 MoE supports 1..4096 tokens")
+    output = (
+        torch.empty(x.shape, dtype=x.dtype, device=x.device) if do_finalize else None
+    )
+    if x.shape[0] == 0:
+        return output
+    ids = topk_ids.to(torch.int32).contiguous()
+    weights = topk_weights.to(torch.float32).contiguous()
+    native = state.native_for_tokens(x.shape[0])
+    route_outputs = {}
+    if not do_finalize:
+        from tokenspeed_kernel.ops.moe.combine_quant import allocate_deferred_routes
+
+        routes = allocate_deferred_routes(x, weights, w.w13_weight.shape[0], None)
+        output = routes.partial
+        route_outputs = dict(
+            route_map=routes.inverse.T.reshape(-1), expert_offsets=routes.expert_offsets
+        )
+    result = native(
+        output=output,
+        input=x,
+        token_selected_experts=ids,
+        token_final_scales=weights,
+        fc1_expert_weights=w.w13_weight,
+        fc2_expert_weights=w.w2_weight,
+        output_dtype=x.dtype,
+        input_sf=None,
+        quant_scales=[w.w13_weight_scale_inv, w.w2_weight_scale_inv],
+        ep_size=w.ep_size,
+        ep_rank=w.ep_rank,
+        tp_size=w.tp_size,
+        tp_rank=w.tp_rank,
+        tune_max_num_tokens=get_autotune_max_num_tokens(),
+        activation_type=ActivationType.Swiglu,
+        use_deepseek_fp8_block_scale=True,
+        use_fused_finalize=plan["cutlass_fused_finalize"],
+        enable_pdl=enable_pdl,
+        expected_m=None,
+        **route_outputs,
+    )
+    return result[0] if do_finalize else routes
+
 
 # ===-----------------------------------------------------------------------===#
 # NVFP4 MegaMoE: TRT-LLM (NVIDIA SM100)

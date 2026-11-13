@@ -93,6 +93,10 @@ decode-size rows on NVIDIA, the GEMM facade's FP32 output otherwise.
 
 ## Deferred route outputs
 
+Output fusion can run with native input preparation on its own. When combined
+with the input-fusion change, the same native runner can reuse prepared input
+rows and maps. The output quantizer does not require the input quantizer.
+
 `bf16_moe_routes` returns individual, unweighted expert outputs. Deferred MXFP4
 execution also returns a map from each original route to its output row, with
 `-1` for remote experts. Consumers normalize each route before weighting and
@@ -161,7 +165,26 @@ capture. Choose `default` for upstream FlashInfer, `expected_m` for the per-call
 hint backport, or `optimized` to also enable expert-tile prefix sums and direct
 tile-to-expert lookup. Both private modes accept independent pipeline stage
 caps for FC1 and FC2.
-Existing `moe_plan` selection stays unchanged.
+The `cute_dsl` MoE solution connects the native runner through `moe_plan`,
+`moe_process_weights`, and `moe_apply`. Select it explicitly for BF16 inputs,
+a positive width divisible by 128, block-FP8 weights, standard SwiGLU, and
+top-k in 1..32 with distinct expert IDs per token. Native input preparation
+performs routing, permutation, and input quantization before the expert GEMMs.
+
+The solution prepares two cached native modules before processing weights.
+Batches of at most 16 tokens use FC1 stage cap 4 and expert lookup; larger
+batches use the original stage and lookup policies. Both retain native FC2
+and expected-M selection. Compilation happens during initialization, before
+warmup and graph capture. Weight preprocessing runs once, and both modules
+share the same processed tensors. Higher-priority MoE solutions retain their
+automatic-selection preference.
+
+The finalized `moe_apply` output remains unchanged. `moe_apply_routes` exposes
+the separate deferred-output contract described below. All-to-all, clamped
+activation, and the batch-invariant numerical envelope are not advertised
+by this solution. Hidden width and local expert count come from the weight
+tensors; neither the runner nor output quantization assumes a particular
+expert intermediate size.
 
 ```python
 from tokenspeed_kernel.ops.moe import prepare_sm90_fp8_moe
@@ -185,6 +208,70 @@ redirect private kernel compilation, and a private module must not redirect the
 installed module's cold compilation to patched headers.
 The installed FlashInfer package is unchanged. To switch settings, prepare a
 new callable, warm it up, and recapture graphs.
+
+### Deferred block-FP8 finalization
+
+The SM90 leaf advertises `supports_deferred_routes`. `moe_apply_routes` uses
+the same prepared weights and native schedule as `moe_apply`, with
+`cutlass_fused_finalize=False` explicitly selected before warmup. It returns
+`DeferredMoERoutes` instead of the legacy three-tensor finalize tuple.
+
+When combined with input fusion, prepared input and deferred output share
+the producer's read-only inverse map and offsets; the native binding rejects
+different metadata destinations. With this output change alone, native input
+preparation writes fresh caller-owned metadata. Consumers retain these
+allocations through graph replay in both cases.
+
+`prepare_sm90_fp8_moe_routes` retains both expert GEMMs in the native runner
+and defers only the weighted route reduction. It returns BF16 expert rows,
+the original slot-major inverse map viewed as `[tokens, topk]`, route weights,
+and expert offsets written by the same invocation. The final offset bounds
+initialized rows; remote routes must not read the unused allocation tail.
+The native three-step map builder writes invalid inverse entries for remote
+routes on every deferred invocation, including graph replay. Its existing
+merge kernel owns these stores; no extra initialization kernel is launched.
+Caller-provided destinations must be disjoint and remain live until all
+consumers finish. Graph replay refreshes their contents without changing
+addresses. Separate streams require ordinary producer/consumer dependencies.
+The adapter explicitly disables native fused finalization. Direct native calls
+with deferred destinations must also pass `use_fused_finalize=False`; a
+conflicting request raises before any destination is written.
+
+`combine_quant_fp8` reduces routes in slot order, rounds the sum to BF16, and
+quantizes each 128-channel block to E4M3. Scales use logical `[tokens, hidden/128]` and
+physical stride `(1, tokens)`. It consumes either token-major or slot-major
+maps directly. The current solution supports Hopper, positive hidden sizes
+divisible by 128, model-static top-k in 1..32, finite inputs, and 1..4096 tokens.
+Expert counts remain native-runner inputs. Changing width or top-k requires
+startup warmup of its compiled variant. These API bounds do not establish
+validation or performance coverage for an untested model. Token counts and dependent strides are
+runtime parameters, not new compilation variants. Warm both map layouts that
+will be used before graph capture.
+
+An explicit `out` may group G input row groups into projection columns:
+`[G*T, H]` routes write FP8 `[T, G*H]` and FP32 scales `[T, G*H/128]`
+with stride `(1, T)`. The same combine kernel writes the final addresses;
+there is no intermediate transpose, copy or requantization. G comes from the
+destination width, is model-static and adds one startup specialization per
+used grouping. Omitting `out`, or passing the original shapes, preserves the
+ordinary output contract. T remains a runtime value.
+
+The CuTe implementation explicitly selects round-to-nearest-even division for
+output quantization with `cute.math.div`. Input quantization retains its native
+approximate arithmetic contract.
+
+This operation leaves output projection and communication to their existing
+callers. It does not select a new model execution path automatically, and
+deferred outputs must not be passed to the ordinary finalizer as well.
+
+The native adapter infers hidden width H and intermediate width I from the
+input and processed expert weights. H and I must be positive multiples of 128.
+FC1 weights have shape `[experts, 2*I, H]` and FC2 weights `[experts, H, I]`;
+their FP32 scale shapes follow the native 128x128 weight blocks. BF16 activations
+and E4M3 weights are the supported numerical contract for this entry point.
+The adapter retains native TP, bias and communication restrictions; it does not
+reinterpret other quantization formats or select a model-specific path.
+Tests use synthetic expert counts, routing and dimensions independently.
 
 `expected_m` is a positive uint32 hint for both expert GEMMs in one call;
 omitting it preserves the native estimate. For complete local expert groups,

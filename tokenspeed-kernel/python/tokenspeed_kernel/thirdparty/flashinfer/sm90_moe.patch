@@ -1,58 +1,98 @@
 diff --git a/csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh b/csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh
-index 90b8c2c24c4f2aa05b8c68b5055dca0712b97b93..2737e8afbe30f994f09a5c8c144662e0ac34120b 100644
+index 90b8c2c24c4f2aa05b8c68b5055dca0712b97b93..c417e646d60838c80f7f2c0626f1d17e853fb95c 100644
 --- a/csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh
 +++ b/csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh
 @@ -58,0 +59 @@
 +#include "tensorrt_llm/deep_gemm/scheduler.cuh"
-@@ -3161,0 +3163 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX,
+@@ -877 +878,3 @@
+-                                           int const num_tokens) {
++                                           int const num_tokens, int const* token_selected_experts,
++                                           int64_t const num_experts_per_token,
++                                           int const start_expert_id, bool initialize_remote_maps) {
+@@ -885,0 +889,13 @@
++
++  // The native finalizer filters by expert ID, but deferred consumers own only
++  // this inverse map. Give remote routes a defined sentinel on every replay.
++  // Expert zero owns these stores; local entries are written below, disjointly.
++  if (initialize_remote_maps && target_expert_id == 0 && token_id < num_tokens) {
++    for (int64_t slot = 0; slot < num_experts_per_token; ++slot) {
++      int const expert = token_selected_experts[int64_t(token_id) * num_experts_per_token + slot]
++                         - start_expert_id;
++      if (expert < 0 || expert >= static_cast<int>(gridDim.x)) {
++        unpermuted_row_to_permuted_row[slot * int64_t(num_tokens) + token_id] = -1;
++      }
++    }
++  }
+@@ -908 +924,3 @@
+-                          int64_t const num_blocks_per_seq, bool enable_pdl, cudaStream_t stream) {
++                          int64_t const num_blocks_per_seq, int const* token_selected_experts,
++                          int64_t const num_experts_per_token, int const start_expert_id,
++                          bool initialize_remote_maps, bool enable_pdl, cudaStream_t stream) {
+@@ -926 +944,2 @@
+-                     unpermuted_row_to_permuted_row, num_tokens);
++                     unpermuted_row_to_permuted_row, num_tokens, token_selected_experts,
++                     num_experts_per_token, start_expert_id, initialize_remote_maps);
+@@ -965 +984 @@
+-    int const start_expert_id, bool enable_pdl, cudaStream_t stream) {
++    int const start_expert_id, bool initialize_remote_maps, bool enable_pdl, cudaStream_t stream) {
+@@ -984,2 +1003,3 @@
+-                       num_experts_per_node, num_tokens_per_block, num_blocks_per_seq, enable_pdl,
+-                       stream);
++                       num_experts_per_node, num_tokens_per_block, num_blocks_per_seq,
++                       token_selected_experts, num_experts_per_token, start_expert_id,
++                       initialize_remote_maps, enable_pdl, stream);
+@@ -3161,0 +3182 @@
 +  size_t deepseek_fc2_scales_size = 0;
-@@ -3176,0 +3179,5 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX,
+@@ -3176,0 +3198,5 @@
 +    if (is_gated_activation) {
 +      deepseek_fc2_scales_size =
 +          ::deep_gemm::compute_padded_offset(num_rows * experts_per_token, num_experts_per_node) *
 +          ((inter_size + 127) / 128) * sizeof(float);
 +    }
-@@ -3219,0 +3227 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX,
+@@ -3219,0 +3246 @@
 +  ADD(deepseek_fc2_scales);
-@@ -3338,0 +3347 @@ void CutlassMoeFCRunner<
+@@ -3338,0 +3366 @@
 +  deepseek_fc2_scales_ = getWsPtr(float{}, "deepseek_fc2_scales");
-@@ -3411 +3420,3 @@ void CutlassMoeFCRunner<
+@@ -3411 +3439,3 @@
 -                           bool enable_pdl, cudaStream_t stream) {
 +                           bool enable_pdl, cudaStream_t stream, int64_t expected_m,
 +                           float* fused_fc2_scales) {
 +  bool const fuse_swiglu_quant = fused_fc2_scales != nullptr;
-@@ -3416 +3427,5 @@ void CutlassMoeFCRunner<
+@@ -3416 +3446,5 @@
 -
 +#ifdef FLASHINFER_SM90_MOE_MAX_STAGES_FC1
 +  constexpr int max_num_stages_fc1 = FLASHINFER_SM90_MOE_MAX_STAGES_FC1;
 +#else
 +  constexpr int max_num_stages_fc1 = -1;
 +#endif
-@@ -3420 +3435,3 @@ void CutlassMoeFCRunner<
+@@ -3420 +3454,3 @@
 -                      quant_params.fp8_block_scaling.fc1_scales_ptrs);
 +                      quant_params.fp8_block_scaling.fc1_scales_ptrs, expected_m,
 +                      max_num_stages_fc1, /*paired_rows=*/fuse_swiglu_quant, false,
 +                      fuse_swiglu_quant ? output : nullptr, fused_fc2_scales, enable_pdl);
-@@ -3422,0 +3440,2 @@ void CutlassMoeFCRunner<
+@@ -3422,0 +3459,2 @@
 +  if (fuse_swiglu_quant) return;
 +
-@@ -3453 +3472,2 @@ void CutlassMoeFCRunner<
+@@ -3453 +3491,2 @@
 -                           QuantParams& quant_params, bool enable_pdl, cudaStream_t stream) {
 +                           QuantParams& quant_params, bool enable_pdl, cudaStream_t stream,
 +                           int64_t expected_m, float* fused_fc2_scales) {
-@@ -3455,0 +3476,5 @@ void CutlassMoeFCRunner<
+@@ -3455,0 +3495,5 @@
 +#ifdef FLASHINFER_SM90_MOE_MAX_STAGES_FC2
 +  constexpr int max_num_stages_fc2 = FLASHINFER_SM90_MOE_MAX_STAGES_FC2;
 +#else
 +  constexpr int max_num_stages_fc2 = -1;
 +#endif
-@@ -3459,2 +3484,3 @@ void CutlassMoeFCRunner<
+@@ -3459,2 +3503,3 @@
 -                      num_experts_per_node, shape_n, shape_k, stream, nullptr,
 -                      quant_params.fp8_block_scaling.fc2_scales_ptrs);
 +                      num_experts_per_node, shape_n, shape_k, stream, fused_fc2_scales,
 +                      quant_params.fp8_block_scaling.fc2_scales_ptrs, expected_m,
 +                      max_num_stages_fc2, false, fused_fc2_scales != nullptr, nullptr, nullptr, enable_pdl);
-@@ -3504,23 +3530,21 @@ template <class T, class WeightType, class OutputType, class InputType, class Ba
+@@ -3463,0 +3509,2 @@
++  // A deferred call retains unweighted BF16 rows for its downstream finalizer.
++  if (final_output == nullptr) return;
+@@ -3504,23 +3551,21 @@
 -void CutlassMoeFCRunner<
 -    T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX, Sm90Wfp4Afp8Mode,
 -    Enable>::gemm1(MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX,
@@ -97,16 +137,16 @@ index 90b8c2c24c4f2aa05b8c68b5055dca0712b97b93..2737e8afbe30f994f09a5c8c144662e0
 +          bool bias_is_broadcast, cudaStream_t stream, cutlass_extensions::CutlassGemmConfig config,
 +          bool min_latency_mode, int* num_active_experts_per, int* active_expert_global_ids,
 +          bool enable_pdl, int64_t expected_m, float* fused_fc2_scales) {
-@@ -3532,2 +3556,2 @@ void CutlassMoeFCRunner<
+@@ -3532,2 +3577,2 @@
 -                        num_experts_per_node, fc1_activation_type, quant_params, enable_pdl,
 -                        stream);
 +                        num_experts_per_node, fc1_activation_type, quant_params, enable_pdl, stream,
 +                        expected_m, fused_fc2_scales);
-@@ -3789 +3813,2 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
+@@ -3789 +3834,2 @@
 -          int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl) {
 +          int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl,
 +          int64_t expected_m, float* fused_fc2_scales) {
-@@ -3801,7 +3826,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
+@@ -3801,7 +3847,7 @@
 -    Self::BlockScaleFC2(*fp8_blockscale_gemm_runner, input, gemm_output, final_output,
 -                        expert_first_token_offset, fc2_expert_weights, fc2_expert_biases,
 -                        unpermuted_final_scales, unpermuted_row_to_permuted_row,
@@ -121,10 +161,11 @@ index 90b8c2c24c4f2aa05b8c68b5055dca0712b97b93..2737e8afbe30f994f09a5c8c144662e0
 +        num_valid_tokens_ptr, num_rows, expanded_num_rows, hidden_size, unpadded_hidden_size,
 +        inter_size, num_experts_per_node, k, parallelism_config, enable_alltoall, quant_params,
 +        enable_pdl, stream, expected_m, fused_fc2_scales);
-@@ -4149 +4174,9 @@ void CutlassMoeFCRunner<
+@@ -4149 +4195,18 @@
 -                    MoeMinLatencyParams& min_latency_params, bool enable_pdl, cudaStream_t stream) {
 +                    MoeMinLatencyParams& min_latency_params, bool enable_pdl, cudaStream_t stream,
-+                    int64_t expected_m) {
++                    int64_t expected_m, void* deferred_output,
++                    int64_t* deferred_offsets) {
 +#if (defined(FLASHINFER_SM90_MOE_MAX_STAGES_FC1) && FLASHINFER_SM90_MOE_MAX_STAGES_FC1 != -1) || \
 +    (defined(FLASHINFER_SM90_MOE_MAX_STAGES_FC2) && FLASHINFER_SM90_MOE_MAX_STAGES_FC2 != -1)
 +  TLLM_CHECK_WITH_INFO(use_deepseek_fp8_block_scale && !min_latency_mode,
@@ -132,13 +173,34 @@ index 90b8c2c24c4f2aa05b8c68b5055dca0712b97b93..2737e8afbe30f994f09a5c8c144662e0
 +#endif
 +  TLLM_CHECK_WITH_INFO(expected_m == -1 || (use_deepseek_fp8_block_scale && !min_latency_mode),
 +                       "expected_m is supported only by DeepSeek FP8 block-scaled MoE");
-@@ -4353 +4386 @@ void CutlassMoeFCRunner<
++  TLLM_CHECK_WITH_INFO((deferred_output == nullptr) == (deferred_offsets == nullptr),
++                       "Deferred output and expert offsets must be supplied together");
++  if (deferred_output) {
++    TLLM_CHECK_WITH_INFO(use_deepseek_fp8_block_scale && !min_latency_mode && !use_lora &&
++                            !enable_alltoall && parallelism_config.tp_size == 1 &&
++                            fc1_expert_biases_void == nullptr && fc2_expert_biases_void == nullptr,
++                        "Deferred outputs require bias-free block-FP8 experts without TP or all-to-all");
++  }
+@@ -4188 +4251 @@
+-  auto* final_output = static_cast<OutputType*>(final_output_void);
++  auto* final_output = deferred_output ? nullptr : static_cast<OutputType*>(final_output_void);
+@@ -4311,0 +4375,5 @@
++  if (deferred_offsets) {
++    // The original routing producer writes directly into caller-owned metadata.
++    expert_first_token_offset_ = deferred_offsets;
++  }
++
+@@ -4353 +4421 @@
 -                min_latency_params.active_expert_global_ids, enable_pdl);
 +                min_latency_params.active_expert_global_ids, enable_pdl, -1, nullptr);
-@@ -4369 +4402 @@ void CutlassMoeFCRunner<
+@@ -4369 +4437 @@
 -                min_latency_params.active_expert_global_ids, enable_pdl);
 +                min_latency_params.active_expert_global_ids, enable_pdl, -1, nullptr);
-@@ -4446,0 +4480,18 @@ void CutlassMoeFCRunner<
+@@ -4388 +4456,2 @@
+-          num_experts_per_node, experts_per_token, start_expert, enable_pdl, stream);
++          num_experts_per_node, experts_per_token, start_expert, deferred_output != nullptr,
++          enable_pdl, stream);
+@@ -4446,0 +4516,18 @@
 +    float* fused_fc2_scales = nullptr;
 +#if defined(ENABLE_FP8_BLOCK_SCALE) && defined(FLASHINFER_SM90_MOE_FUSE_SWIGLU_QUANT) && \
 +    FLASHINFER_SM90_MOE_FUSE_SWIGLU_QUANT
@@ -157,10 +219,10 @@ index 90b8c2c24c4f2aa05b8c68b5055dca0712b97b93..2737e8afbe30f994f09a5c8c144662e0
 +      gemm2_result = glu_inter_result_;
 +    }
 +#endif
-@@ -4488 +4539 @@ void CutlassMoeFCRunner<
+@@ -4488 +4575 @@
 -                nullptr, enable_pdl);
 +                nullptr, enable_pdl, expected_m, fused_fc2_scales);
-@@ -4501,9 +4552,10 @@ void CutlassMoeFCRunner<
+@@ -4501,9 +4588,11 @@
 -    Self::gemm2(
 -        moe_gemm_runner_, blockscale_gemm_runner, gemm2_input, gemm2_result, final_output,
 -        expert_first_token_offset_, gemm2_tma_ws_input, fc2_expert_weights, fc2_expert_biases,
@@ -170,6 +232,7 @@ index 90b8c2c24c4f2aa05b8c68b5055dca0712b97b93..2737e8afbe30f994f09a5c8c144662e0
 -        expanded_num_rows, hidden_size, unpadded_hidden_size, inter_size, num_experts_per_node,
 -        experts_per_token, alpha_scale_ptr_array_fc2_, use_lora, lora_fc2_result_, stream,
 -        parallelism_config, enable_alltoall, *gemm2_config_, false, nullptr, nullptr, enable_pdl);
++    if (deferred_output) gemm2_result = deferred_output;
 +    Self::gemm2(moe_gemm_runner_, blockscale_gemm_runner, gemm2_input, gemm2_result, final_output,
 +                expert_first_token_offset_, gemm2_tma_ws_input, fc2_expert_weights,
 +                fc2_expert_biases, fc2_int_scales, fc2_fp8_dequant, fc2_fp4_act_scale_,
@@ -180,64 +243,107 @@ index 90b8c2c24c4f2aa05b8c68b5055dca0712b97b93..2737e8afbe30f994f09a5c8c144662e0
 +                experts_per_token, alpha_scale_ptr_array_fc2_, use_lora, lora_fc2_result_, stream,
 +                parallelism_config, enable_alltoall, *gemm2_config_, false, nullptr, nullptr,
 +                enable_pdl, expected_m, fused_fc2_scales);
+@@ -5231 +5320 @@
+-          mNumExpertsPerNode, mK, start_expert_id, enable_pdl, stream);
++          mNumExpertsPerNode, mK, start_expert_id, false, enable_pdl, stream);
 diff --git a/csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu b/csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu
-index 396830dca29767fb7cff4f29126a5053c90fd485..7b3d04ef60b4121ec011a5cd364c88f1e24fd3a8 100644
+index 396830dca29767fb7cff4f29126a5053c90fd485..3fd739166c8aca66ee33bd2b73e8f59d8c425939 100644
 --- a/csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu
 +++ b/csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu
-@@ -339,0 +340,6 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
+@@ -339,0 +340,6 @@
 +  /**
 +   * @brief Validate tensor inputs, prepare workspace, and execute fused MoE.
 +   * @param expected_m Expected tokens per local expert for both DeepSeek FP8 GEMMs;
 +   * -1 uses the default estimate. Explicit hints require the OSS runner without
 +   * minimum-latency mode and are validated before dispatch.
 +   */
-@@ -353 +359,2 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
+@@ -353 +359,4 @@
 -              int64_t nvfp4_4over6_code = tensorrt_llm::kernels::kNVFP44Over6FromEnv) {
 +              int64_t nvfp4_4over6_code = tensorrt_llm::kernels::kNVFP44Over6FromEnv,
-+              int64_t expected_m = -1) {
-@@ -356,0 +364,5 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
++              int64_t expected_m = -1,
++              Optional<TensorView> route_map = Optional<TensorView>{},
++              Optional<TensorView> expert_offsets = Optional<TensorView>{}) {
+@@ -355,0 +365,5 @@
++
 +    TVM_FFI_ICHECK(expected_m == -1 || (expected_m > 0 && expected_m <= UINT32_MAX))
 +        << "expected_m must be -1 or a positive uint32 value";
 +    TVM_FFI_ICHECK(expected_m == -1 || (mUseDeepSeekFP8BlockScaling && !min_latency_mode))
 +        << "expected_m requires DeepSeek FP8 block scaling without min-latency mode";
+@@ -442,0 +457,25 @@
++    TVM_FFI_ICHECK(route_map.has_value() == expert_offsets.has_value())
++        << "Deferred route map and expert offsets must be supplied together";
++    if (route_map.has_value()) {
++      TVM_FFI_ICHECK(mUseDeepSeekFP8BlockScaling && !min_latency_mode && !enable_alltoall &&
++                    tp_size == 1 && !fc1_expert_biases.has_value() && !fc2_expert_biases.has_value())
++          << "Deferred finalize requires bias-free SM90 block-FP8 without TP/all-to-all";
++      CHECK_INPUT_TYPE(output, dl_bfloat16)
++      CHECK_INPUT_TYPE(route_map.value(), dl_int32)
++      CHECK_INPUT_TYPE(expert_offsets.value(), dl_int64)
++      TVM_FFI_ICHECK(output.IsContiguous() && route_map.value().IsContiguous() &&
++                    expert_offsets.value().IsContiguous());
++      TVM_FFI_ICHECK(output.device().device_type == kDLCUDA &&
++                    route_map.value().device().device_type == kDLCUDA &&
++                    expert_offsets.value().device().device_type == kDLCUDA);
++      TVM_FFI_ICHECK(output.device().device_id == input.device().device_id &&
++                    route_map.value().device().device_id == input.device().device_id &&
++                    expert_offsets.value().device().device_id == input.device().device_id);
++      TVM_FFI_ICHECK(output.ndim() == 2 && output.size(0) == num_rows * experts_per_token &&
++                    output.size(1) == hidden_size);
++      TVM_FFI_ICHECK(route_map.value().ndim() == 1 &&
++                    route_map.value().size(0) == num_rows * experts_per_token);
++      TVM_FFI_ICHECK(expert_offsets.value().ndim() == 1 &&
++                    expert_offsets.value().size(0) == num_experts_on_rank + 1);
++    }
 +
-@@ -487 +499 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
+@@ -485 +524,2 @@
+-        output.data_ptr(), static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config,
++        output.data_ptr(), route_map.has_value() ? static_cast<int*>(route_map.value().data_ptr())
++                                                : static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config,
+@@ -487 +527,3 @@
 -        min_latency_mode, min_latency_params, enable_pdl, stream);
-+        min_latency_mode, min_latency_params, enable_pdl, stream, expected_m);
-@@ -488,0 +501 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
++        min_latency_mode, min_latency_params, enable_pdl, stream, expected_m,
++        route_map.has_value() ? output.data_ptr() : nullptr,
++        expert_offsets.has_value() ? static_cast<int64_t*>(expert_offsets.value().data_ptr()) : nullptr);
+@@ -488,0 +531,2 @@
++    TVM_FFI_ICHECK(!route_map.has_value()) << "Deferred finalize requires the OSS runner";
 +    TVM_FFI_ICHECK_EQ(expected_m, -1) << "expected_m requires the OSS CUTLASS MoE runner";
-@@ -783,0 +797 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
+@@ -501 +545,2 @@
+-        output.data_ptr(), static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config,
++        output.data_ptr(), route_map.has_value() ? static_cast<int*>(route_map.value().data_ptr())
++                                                : static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config,
+@@ -783,0 +829 @@
 +  /** @brief Return a named MoE execution or profiling entry point for TVM FFI. */
-@@ -845 +859 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
+@@ -845 +891,2 @@
 -                 int64_t nvfp4_4over6_code) {
-+                 int64_t nvfp4_4over6_code, int64_t expected_m) {
-@@ -852 +866 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
++                 int64_t nvfp4_4over6_code, int64_t expected_m,
++                 Optional<TensorView> route_map, Optional<TensorView> expert_offsets) {
+@@ -852 +899 @@
 -                   nvfp4_4over6_code);
-+                   nvfp4_4over6_code, expected_m);
++                   nvfp4_4over6_code, expected_m, route_map, expert_offsets);
 diff --git a/csrc/nv_internal/tensorrt_llm/deep_gemm/compiler.cuh b/csrc/nv_internal/tensorrt_llm/deep_gemm/compiler.cuh
 index fbdc902972668033d6bd8653d60c875dd51889f7..5cf6590c561c80f0ca7c7d6f30e6c58ff6622e76 100644
 --- a/csrc/nv_internal/tensorrt_llm/deep_gemm/compiler.cuh
 +++ b/csrc/nv_internal/tensorrt_llm/deep_gemm/compiler.cuh
-@@ -141 +141,3 @@ inline std::string generateKernel(uint32_t const shape_n, uint32_t const shape_k
+@@ -141 +141,3 @@
 -                                  deep_gemm::GemmType const gemm_type, bool swapAB = false) {
 +                                  deep_gemm::GemmType const gemm_type, bool swapAB,
 +                                  bool paired_rows, bool fuse_swiglu_quant,
 +                                  bool prefetch_first_tile) {
-@@ -142,0 +145,3 @@ inline std::string generateKernel(uint32_t const shape_n, uint32_t const shape_k
+@@ -142,0 +145,3 @@
 +  // A paired tile covers rows r and r + shape_n / 2, so the scheduler walks half the row blocks.
 +  uint32_t const paired_row_offset = paired_rows ? shape_n / 2 : 0;
 +  uint32_t const scheduled_rows = shape_n - paired_row_offset;
-@@ -209 +214 @@ typename )" + scheduler_name +
+@@ -209 +214 @@
 -                     std::to_string(shape_n) + R"(, )" + std::to_string(shape_k) + R"(, )" +
 +                     std::to_string(scheduled_rows) + R"(, )" + std::to_string(shape_k) + R"(, )" +
-@@ -222 +227,5 @@ __global__ void dummy_kernel() {
+@@ -222 +227,5 @@
 -                     std::to_string(num_tma_multicast) + R"(, SchedulerType, )" + input_type + R"(>;
 +                     std::to_string(num_tma_multicast) + R"(, SchedulerType, )" + input_type +
 +                     (swapAB ? R"(, )" + std::to_string(paired_row_offset) + R"(, )" +
 +                                   (fuse_swiglu_quant ? "true" : "false") + R"(, )" +
 +                                   (prefetch_first_tile ? "true" : "false") : std::string()) +
 +                     R"(>;
-@@ -252 +261,15 @@ class Compiler {
+@@ -252 +261,15 @@
 -                 deep_gemm::GemmType const gemm_type, bool swapAB = false) {
 +                 deep_gemm::GemmType const gemm_type, bool swapAB, bool paired_rows,
 +                 bool fuse_swiglu_quant, bool prefetch_first_tile) {
@@ -254,7 +360,7 @@ index fbdc902972668033d6bd8653d60c875dd51889f7..5cf6590c561c80f0ca7c7d6f30e6c58f
 +        num_tma_multicast == 1)) {
 +      TLLM_THROW("First-tile prefetch requires the fused FC1 consumer shape");
 +    }
-@@ -267,2 +290,30 @@ class Compiler {
+@@ -267,2 +290,30 @@
 -                       std::to_string(num_tma_multicast) + "_" + gemm_type_to_string(gemm_type);
 -    std::filesystem::path path = getCacheDir() / name;
 +                       std::to_string(num_tma_multicast) +
@@ -287,10 +393,10 @@ index fbdc902972668033d6bd8653d60c875dd51889f7..5cf6590c561c80f0ca7c7d6f30e6c58f
 +    else if (prefix_scheduler)
 +      path /= "prefix_scheduler";
 +    path /= name;
-@@ -288,0 +340,2 @@ class Compiler {
+@@ -288,0 +340,2 @@
 +    if (prefix_scheduler) flags.push_back("-DMOE_MBU_PREFIX_SCHEDULER=1");
 +    if (tile_map_scheduler) flags.push_back("-DMOE_MBU_TILE_MAP_SCHEDULER=1");
-@@ -333 +386,2 @@ class Compiler {
+@@ -333 +386,2 @@
 -                                      num_stages, num_tma_multicast, gemm_type, swapAB);
 +                                      num_stages, num_tma_multicast, gemm_type, swapAB,
 +                                      paired_rows, fuse_swiglu_quant, prefetch_first_tile);
@@ -298,15 +404,15 @@ diff --git a/csrc/nv_internal/tensorrt_llm/deep_gemm/fp8_gemm.cuh b/csrc/nv_inte
 index d68386242f262d462a0deda4a15d7d3a129a9bb9..735dcc018a2d04823be36ea760177687f200ef02 100644
 --- a/csrc/nv_internal/tensorrt_llm/deep_gemm/fp8_gemm.cuh
 +++ b/csrc/nv_internal/tensorrt_llm/deep_gemm/fp8_gemm.cuh
-@@ -271 +271,2 @@ void runGemmSwapAB(cudaKernel_t kernel, void* mat_a, int ld_a, void* mat_b, int
+@@ -271 +271,2 @@
 -                         tma_a_desc, tma_b_desc, tma_scales_b_desc, tma_d_desc);
 +                         tma_a_desc, tma_b_desc, tma_scales_b_desc, tma_d_desc,
 +                         static_cast<__nv_fp8_e4m3*>(nullptr), static_cast<float*>(nullptr), int64_t(0));
-@@ -328 +329,2 @@ void runGemmSwapAB(cudaKernel_t kernel, void* mat_a /* weight*/, int ld_a, void*
+@@ -328 +329,2 @@
 -                   uint32_t smem_size, uint32_t max_shape_n_padded) {
 +                   uint32_t smem_size, uint32_t max_shape_n_padded,
 +                   __nv_fp8_e4m3* fused_output, float* fused_scales, bool enable_pdl) {
-@@ -351,6 +353,9 @@ void runGemmSwapAB(cudaKernel_t kernel, void* mat_a /* weight*/, int ld_a, void*
+@@ -351,6 +353,9 @@
 -  // Clusters for TMA multicast
 -  cudaLaunchAttribute attr;
 -  attr.id = cudaLaunchAttributeClusterDimension;
@@ -322,7 +428,7 @@ index d68386242f262d462a0deda4a15d7d3a129a9bb9..735dcc018a2d04823be36ea760177687
 +  attrs[1].val.programmaticStreamSerializationAllowed = enable_pdl;
 +  config.attrs = attrs;
 +  config.numAttrs = 2;
-@@ -364 +369,2 @@ void runGemmSwapAB(cudaKernel_t kernel, void* mat_a /* weight*/, int ld_a, void*
+@@ -364 +369,2 @@
 -                         tma_a_desc, tma_b_desc, tma_scales_b_desc, tma_d_desc);
 +                         tma_a_desc, tma_b_desc, tma_scales_b_desc, tma_d_desc, fused_output,
 +                         fused_scales, int64_t(max_shape_n_padded));
@@ -330,7 +436,8 @@ diff --git a/csrc/nv_internal/tensorrt_llm/deep_gemm/fp8_gemm_impl.cuh b/csrc/nv
 index ae03a82216126c5554e49ca491c874484573d325..4af226025cc42d34e1556109e3e3bb49705aede9 100644
 --- a/csrc/nv_internal/tensorrt_llm/deep_gemm/fp8_gemm_impl.cuh
 +++ b/csrc/nv_internal/tensorrt_llm/deep_gemm/fp8_gemm_impl.cuh
-@@ -23,0 +24,72 @@
+@@ -22,0 +23,72 @@
++
 +namespace deep_gemm {
 +
 +// The MoE activation/quantization translation unit uses --use_fast_math, whereas
@@ -402,15 +509,14 @@ index ae03a82216126c5554e49ca491c874484573d325..4af226025cc42d34e1556109e3e3bb49
 +}  // namespace deep_gemm
 +
 +
-+
-@@ -442 +514 @@ template <uint32_t SHAPE_M, uint32_t SHAPE_K, uint32_t BLOCK_M, uint32_t BLOCK_N
+@@ -442 +514 @@
 -          typename InputType>
 +          typename InputType, uint32_t kPairedRowOffset, bool kFuseSwiGLUQuant, bool kPrefetchFirstTile>
-@@ -451 +523,2 @@ __global__ void __launch_bounds__(
+@@ -451 +523,2 @@
 -        const __grid_constant__ CUtensorMap tensor_map_d) {
 +        const __grid_constant__ CUtensorMap tensor_map_d,
 +        __nv_fp8_e4m3* fused_output, float* fused_scales, int64_t fused_scale_leading_dim) {
-@@ -460,0 +534,22 @@ __global__ void __launch_bounds__(
+@@ -460,0 +534,22 @@
 +  // Only FC2 consuming fused FC1 may read routing metadata before its grid
 +  // dependency wait: FC1 launches dependents only after its own wait, and
 +  // writes neither the routing metadata nor the weights FC2 reads early.
@@ -433,14 +539,14 @@ index ae03a82216126c5554e49ca491c874484573d325..4af226025cc42d34e1556109e3e3bb49
 +                        BLOCK_M == 128 and SchedulerType::gemm_type == GemmType::GroupedWithOffset),
 +                   "SwiGLU quantization needs paired 128-channel grouped tiles");
 +
-@@ -463,2 +558,4 @@ __global__ void __launch_bounds__(
+@@ -463,2 +558,4 @@
 -  static constexpr uint32_t SMEM_D_SIZE = BLOCK_N * BLOCK_M * sizeof(__nv_bfloat16);
 -  static constexpr uint32_t SMEM_A_SIZE_PER_STAGE = BLOCK_M * BLOCK_K * sizeof(__nv_fp8_e4m3);
 +  static constexpr uint32_t SMEM_D_BLOCK_SIZE = BLOCK_N * BLOCK_M * sizeof(__nv_bfloat16);
 +  static constexpr uint32_t SMEM_D_SIZE = kNumRowBlocks * SMEM_D_BLOCK_SIZE;
 +  static constexpr uint32_t SMEM_A_BLOCK_SIZE = BLOCK_M * BLOCK_K * sizeof(__nv_fp8_e4m3);
 +  static constexpr uint32_t SMEM_A_SIZE_PER_STAGE = kNumRowBlocks * SMEM_A_BLOCK_SIZE;
-@@ -471,0 +569,9 @@ __global__ void __launch_bounds__(
+@@ -471,0 +569,9 @@
 +  // The TMA thread prefetches each tile's weight scales with a bulk copy when a scale row is a
 +  // multiple of 16 bytes, into one of two buffers that alternate between tiles; otherwise the math
 +  // threads read them at the start of each tile.
@@ -450,15 +556,15 @@ index ae03a82216126c5554e49ca491c874484573d325..4af226025cc42d34e1556109e3e3bb49
 +  // of evicting (and writing back) what earlier kernels left in L2 while this GEMM runs.
 +  static constexpr auto kWeightCacheHint = cute::TMA::CacheHintSm90::EVICT_FIRST;
 +  static constexpr uint32_t kNumScalesABuffers = kPrefetchScalesA ? 2 : 1;
-@@ -473 +579,2 @@ __global__ void __launch_bounds__(
+@@ -473 +579,2 @@
 -      ceil_div<uint32_t>(SHAPE_K_SCALES * sizeof(float), sizeof(Barrier)) *
 +      ceil_div<uint32_t>(kNumScalesABuffers * kNumRowBlocks * SMEM_SCALES_A_ROW_SIZE,
 +                         sizeof(Barrier)) *
-@@ -491 +598,2 @@ __global__ void __launch_bounds__(
+@@ -491 +598,2 @@
 -    cute::prefetch_tma_descriptor(reinterpret_cast<cute::TmaDescriptor const*>(&tensor_map_d));
 +    if constexpr (!kFuseSwiGLUQuant)
 +      cute::prefetch_tma_descriptor(reinterpret_cast<cute::TmaDescriptor const*>(&tensor_map_d));
-@@ -548,0 +657,20 @@ __global__ void __launch_bounds__(
+@@ -548,0 +657,20 @@
 +  // With programmatic dependent launch the setup above overlaps the previous kernel; wait for it
 +  // to finish before reading anything it may have written (no-op for a normal launch).
 +  if constexpr (!kPrefetchFirstTile) asm volatile("griddepcontrol.wait;" ::: "memory");
@@ -479,7 +585,7 @@ index ae03a82216126c5554e49ca491c874484573d325..4af226025cc42d34e1556109e3e3bb49
 +  }
 +#endif
 +
-@@ -550,0 +679,8 @@ __global__ void __launch_bounds__(
+@@ -550,0 +679,8 @@
 +  // Let FC2 perform descriptor/barrier setup as resources become available. Its
 +  // griddepcontrol.wait still waits for all FC1 writes before reading activations.
 +  if constexpr (kFuseSwiGLUQuant) {
@@ -488,7 +594,7 @@ index ae03a82216126c5554e49ca491c874484573d325..4af226025cc42d34e1556109e3e3bb49
 +      asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 +    }
 +  }
-@@ -571,0 +708,66 @@ __global__ void __launch_bounds__(
+@@ -571,0 +708,66 @@
 +#ifdef MOE_MBU_PREFIX_SCHEDULER
 +  __shared__ uint32_t tile_prefix[kNumGroups + 1];
 +  __shared__ uint32_t warp_totals[kNumThreads / 32];
@@ -555,7 +661,7 @@ index ae03a82216126c5554e49ca491c874484573d325..4af226025cc42d34e1556109e3e3bb49
 +  auto scheduler = SchedulerType(problem_input, tile_prefix, smem_offsets);
 +#endif
 +#else
-@@ -572,0 +775,8 @@ __global__ void __launch_bounds__(
+@@ -572,0 +775,8 @@
 +#endif
 +
 +  if constexpr (kPrefetchFirstTile) {
@@ -564,7 +670,7 @@ index ae03a82216126c5554e49ca491c874484573d325..4af226025cc42d34e1556109e3e3bb49
 +    if (threadIdx.x < kNumMathThreads)
 +      asm volatile("griddepcontrol.wait;" ::: "memory");
 +  }
-@@ -581,0 +792,21 @@ __global__ void __launch_bounds__(
+@@ -581,0 +792,21 @@
 +        if constexpr (kPrefetchFirstTile) {
 +          if (scheduler.current_iter == 0) {
 +            const auto m_idx = scheduler.get_global_m_idx(SHAPE_M, BLOCK_M, m_block_idx, n_block_idx);
@@ -586,7 +692,7 @@ index ae03a82216126c5554e49ca491c874484573d325..4af226025cc42d34e1556109e3e3bb49
 +            asm volatile("griddepcontrol.wait;" ::: "memory");
 +          }
 +        }
-@@ -596,2 +827,9 @@ __global__ void __launch_bounds__(
+@@ -596,2 +827,9 @@
 -            tma_copy(&tensor_map_a, reinterpret_cast<uint64_t*>(&full_barrier), smem_a[s], k_idx,
 -                     scheduler.get_global_m_idx(SHAPE_M, BLOCK_M, m_block_idx, n_block_idx));
 +            const auto m_idx = scheduler.get_global_m_idx(SHAPE_M, BLOCK_M, m_block_idx, n_block_idx);
@@ -598,7 +704,7 @@ index ae03a82216126c5554e49ca491c874484573d325..4af226025cc42d34e1556109e3e3bb49
 +                                              smem_a[s] + r * SMEM_A_BLOCK_SIZE, k_idx,
 +                                              m_idx + r * kPairedRowOffset);
 +            }
-@@ -615,0 +854,21 @@ __global__ void __launch_bounds__(
+@@ -615,0 +854,21 @@
 +            // The weight scales of the whole tile arrive with its first stage
 +            uint32_t scales_a_bytes = 0;
 +            if constexpr (kPrefetchScalesA) {
@@ -620,57 +726,59 @@ index ae03a82216126c5554e49ca491c874484573d325..4af226025cc42d34e1556109e3e3bb49
 +              }
 +            }
 +
-@@ -617 +876 @@ __global__ void __launch_bounds__(
+@@ -617 +876 @@
 -                                              SMEM_SCALES_B_SIZE_PER_STAGE);
 +                                              SMEM_SCALES_B_SIZE_PER_STAGE + scales_a_bytes);
-@@ -635,0 +895,2 @@ __global__ void __launch_bounds__(
+@@ -635,0 +895,2 @@
 +    if constexpr (kPrefetchFirstTile)
 +      asm volatile("griddepcontrol.wait;" ::: "memory");
-@@ -651 +912 @@ __global__ void __launch_bounds__(
+@@ -651,4 +912,4 @@
 -      uint32_t num_scales_a = SHAPE_K_SCALES;
-+      uint32_t num_scales_a = kNumRowBlocks * SHAPE_K_SCALES;
-@@ -653,2 +914,2 @@ __global__ void __launch_bounds__(
+-
 -      // Load A scales with math warp-groups (weight scales)
 -      if (threadIdx.x >= 32) {
++      uint32_t num_scales_a = kNumRowBlocks * SHAPE_K_SCALES;
++
 +      // Load A scales with math warp-groups (weight scales); row block r keeps its own scale row
 +      if (not kPrefetchScalesA and threadIdx.x >= 32) {
-@@ -660,2 +921,6 @@ __global__ void __launch_bounds__(
+@@ -660,4 +921,11 @@
 -        for (uint32_t i = threadIdx.x - 32; i < num_scales_a; i += kNumMathThreads - 32)
 -          st_shared(smem_scales_a + i, __ldg(local_scales_a + i));
+-      }
+-      cutlass::arch::NamedBarrier(kNumMathThreads).sync();
 +        for (uint32_t i = threadIdx.x - 32; i < num_scales_a; i += kNumMathThreads - 32) {
 +          const uint32_t r = i / SHAPE_K_SCALES;
 +          st_shared(smem_scales_a + i,
 +                    __ldg(local_scales_a + r * (kPairedRowOffset / BLOCK_K) * SHAPE_K_SCALES +
 +                          i % SHAPE_K_SCALES));
 +        }
-@@ -663 +928,4 @@ __global__ void __launch_bounds__(
--      cutlass::arch::NamedBarrier(kNumMathThreads).sync();
++      }
 +      if constexpr (not kPrefetchScalesA) cutlass::arch::NamedBarrier(kNumMathThreads).sync();
 +      float const* smem_tile_scales =
 +          smem_scales_a +
 +          (kPrefetchScalesA ? (scheduler.current_iter & 1) * kNumRowBlocks * SHAPE_K_SCALES : 0);
-@@ -666 +934,2 @@ __global__ void __launch_bounds__(
+@@ -666 +934,2 @@
 -      float accum[WGMMA::kNumAccum], final_accum[WGMMA::kNumAccum] = {0};
 +      float accum[kNumRowBlocks][WGMMA::kNumAccum];
 +      float final_accum[kNumRowBlocks][WGMMA::kNumAccum] = {};
-@@ -686,4 +955 @@ __global__ void __launch_bounds__(
--          // Read weight scales (A scales)
+@@ -685,0 +955,3 @@
++          // Wait TMA arrivals (prefetched weight scales arrive with the tile's first stage)
++          full_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter) & 1);
++
+@@ -687,4 +959,4 @@
 -          float scale_a_0 = ld_shared(smem_scales_a + k_iter * kNumStages + s);
 -
 -          // Wait TMA arrivals
-+          // Wait TMA arrivals (prefetched weight scales arrive with the tile's first stage)
-@@ -691,0 +958,6 @@ __global__ void __launch_bounds__(
-+          // Read weight scales (A scales)
+-          full_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter) & 1);
 +          float scale_a_0[kNumRowBlocks];
 +#pragma unroll
 +          for (uint32_t r = 0; r < kNumRowBlocks; ++r)
 +            scale_a_0[r] = ld_shared(smem_tile_scales + r * SHAPE_K_SCALES + k_iter * kNumStages + s);
-+
-@@ -695 +967,2 @@ __global__ void __launch_bounds__(
+@@ -695 +967,2 @@
 -          float scale_0_0[WGMMA::kNumAccum / 4], scale_0_1[WGMMA::kNumAccum / 4];
 +          float scale_0_0[kNumRowBlocks][WGMMA::kNumAccum / 4];
 +          float scale_0_1[kNumRowBlocks][WGMMA::kNumAccum / 4];
-@@ -700,2 +973,5 @@ __global__ void __launch_bounds__(
+@@ -700,2 +973,5 @@
 -            scale_0_0[i] = scale_a_0 * scale_b.x;
 -            scale_0_1[i] = scale_a_0 * scale_b.y;
 +#pragma unroll
@@ -678,12 +786,12 @@ index ae03a82216126c5554e49ca491c874484573d325..4af226025cc42d34e1556109e3e3bb49
 +              scale_0_0[r][i] = scale_a_0[r] * scale_b.x;
 +              scale_0_1[r][i] = scale_a_0[r] * scale_b.y;
 +            }
-@@ -706 +982,3 @@ __global__ void __launch_bounds__(
+@@ -706 +982,3 @@
 -          for (int i = 0; i < WGMMA::kNumAccum; ++i) warpgroup_fence_operand(accum[i]);
 +          for (uint32_t r = 0; r < kNumRowBlocks; ++r)
 +#pragma unroll
 +            for (int i = 0; i < WGMMA::kNumAccum; ++i) warpgroup_fence_operand(accum[r][i]);
-@@ -709,5 +987,9 @@ __global__ void __launch_bounds__(
+@@ -709,5 +987,9 @@
 -          for (int k = 0; k < BLOCK_K / WGMMA::K; ++k) {
 -            auto desc_a =
 -                make_smem_desc(smem_a[s] + math_wg_idx * WGMMA::M * BLOCK_K + k * WGMMA::K, 1);
@@ -698,12 +806,12 @@ index ae03a82216126c5554e49ca491c874484573d325..4af226025cc42d34e1556109e3e3bb49
 +              auto desc_b = make_smem_desc(smem_b[s] + k * WGMMA::K, 1);
 +              WGMMA::wgmma(desc_a, desc_b, accum[r], k);
 +            }
-@@ -717 +999,3 @@ __global__ void __launch_bounds__(
+@@ -717 +999,3 @@
 -          for (int i = 0; i < WGMMA::kNumAccum; ++i) warpgroup_fence_operand(accum[i]);
 +          for (uint32_t r = 0; r < kNumRowBlocks; ++r)
 +#pragma unroll
 +            for (int i = 0; i < WGMMA::kNumAccum; ++i) warpgroup_fence_operand(accum[r][i]);
-@@ -725,5 +1009,8 @@ __global__ void __launch_bounds__(
+@@ -725,5 +1009,8 @@
 -          for (int i = 0; i < WGMMA::kNumAccum / 4; ++i) {
 -            final_accum[i * 4 + 0] += scale_0_0[i] * accum[i * 4 + 0];
 -            final_accum[i * 4 + 1] += scale_0_1[i] * accum[i * 4 + 1];
@@ -717,16 +825,8 @@ index ae03a82216126c5554e49ca491c874484573d325..4af226025cc42d34e1556109e3e3bb49
 +              final_accum[r][i * 4 + 2] += scale_0_0[r][i] * accum[r][i * 4 + 2];
 +              final_accum[r][i * 4 + 3] += scale_0_1[r][i] * accum[r][i * 4 + 3];
 +            }
-@@ -752,0 +1040,8 @@ __global__ void __launch_bounds__(
-+      // Without the barrier at the start of the tile (scales are prefetched), wait here until
-+      // thread 0 has finished storing the previous tile from smem_d before overwriting it.
-+      if constexpr (kFuseSwiGLUQuant) asm volatile("" ::: "memory");
-+      if constexpr (kPrefetchScalesA) cutlass::arch::NamedBarrier(kNumMathThreads).sync();
-+      if constexpr (kFuseSwiGLUQuant) asm volatile("" ::: "memory");
-+
-+      // Row block r goes to its own smem_d block and to output columns r * kPairedRowOffset later
-+      constexpr uint32_t kSmemDBlockElems = BLOCK_N * BLOCK_M;
-@@ -754,15 +1049,19 @@ __global__ void __launch_bounds__(
+@@ -753,19 +1040,43 @@
+-#pragma unroll
 -      for (auto i = 0; i < WGMMA::kNumAccum / 8; ++i) {
 -        SM90_U32x4_STSM_T<nv_bfloat162>::copy(
 -            __float22bfloat162_rn({final_accum[i * 8 + 0], final_accum[i * 8 + 1]}),
@@ -742,6 +842,18 @@ index ae03a82216126c5554e49ca491c874484573d325..4af226025cc42d34e1556109e3e3bb49
 -            __float22bfloat162_rn({final_accum[WGMMA::kNumAccum / 8 * 8 + 2],
 -                                   final_accum[WGMMA::kNumAccum / 8 * 8 + 3]}),
 -            smem_d + warp_idx * 16 + WGMMA::kNumAccum / 8 * 16 * BLOCK_M + tid);
+-      }
+-
+-      if constexpr (SchedulerType::gemm_type == GemmType::GroupedWithOffset) {
++      // Without the barrier at the start of the tile (scales are prefetched), wait here until
++      // thread 0 has finished storing the previous tile from smem_d before overwriting it.
++      if constexpr (kFuseSwiGLUQuant) asm volatile("" ::: "memory");
++      if constexpr (kPrefetchScalesA) cutlass::arch::NamedBarrier(kNumMathThreads).sync();
++      if constexpr (kFuseSwiGLUQuant) asm volatile("" ::: "memory");
++
++      // Row block r goes to its own smem_d block and to output columns r * kPairedRowOffset later
++      constexpr uint32_t kSmemDBlockElems = BLOCK_N * BLOCK_M;
++#pragma unroll
 +      for (uint32_t r = 0; r < kNumRowBlocks; ++r) {
 +#pragma unroll
 +        for (auto i = 0; i < WGMMA::kNumAccum / 8; ++i) {
@@ -761,8 +873,8 @@ index ae03a82216126c5554e49ca491c874484573d325..4af226025cc42d34e1556109e3e3bb49
 +              smem_d + r * kSmemDBlockElems + warp_idx * 16 +
 +                  WGMMA::kNumAccum / 8 * 16 * BLOCK_M + tid);
 +        }
-@@ -771 +1070,13 @@ __global__ void __launch_bounds__(
--      if constexpr (SchedulerType::gemm_type == GemmType::GroupedWithOffset) {
++      }
++
 +      if constexpr (kFuseSwiGLUQuant) {
 +        // STSM is a generic shared-memory store. The named barrier makes both
 +        // BF16 row blocks visible before warps read full 128-channel quant groups.
@@ -776,7 +888,7 @@ index ae03a82216126c5554e49ca491c874484573d325..4af226025cc42d34e1556109e3e3bb49
 +            smem_d, fused_output, fused_scales, fused_scale_leading_dim, row_start,
 +            scheduler.n_boundary, padded_start, m_block_idx);
 +      } else if constexpr (SchedulerType::gemm_type == GemmType::GroupedWithOffset) {
-@@ -779,2 +1090,5 @@ __global__ void __launch_bounds__(
+@@ -779,2 +1090,5 @@
 -            cute::SM90_TMA_STORE_2D::copy(&tensor_map_d, smem_d, m_block_idx * BLOCK_M,
 -                                          n_global_idx);
 +#pragma unroll
@@ -784,7 +896,7 @@ index ae03a82216126c5554e49ca491c874484573d325..4af226025cc42d34e1556109e3e3bb49
 +              cute::SM90_TMA_STORE_2D::copy(&tensor_map_d, smem_d + r * kSmemDBlockElems,
 +                                            m_block_idx * BLOCK_M + r * kPairedRowOffset,
 +                                            n_global_idx);
-@@ -788,3 +1102,6 @@ __global__ void __launch_bounds__(
+@@ -788,3 +1102,6 @@
 -          write_result_to_gmem<BLOCK_N, BLOCK_M, NUM_WARPS>(
 -              gmem_d_this_block, smem_d, n_global_idx, scheduler.n_boundary, m_block_idx * BLOCK_M,
 -              SHAPE_M, SHAPE_M);
@@ -798,19 +910,19 @@ diff --git a/csrc/nv_internal/tensorrt_llm/deep_gemm/jit_utils.cuh b/csrc/nv_int
 index 8e26486d4d5596e4ef2b244cec59987c798216c0..b478cfb85548cf1ebaa152391f20aeef159fe12b 100644
 --- a/csrc/nv_internal/tensorrt_llm/deep_gemm/jit_utils.cuh
 +++ b/csrc/nv_internal/tensorrt_llm/deep_gemm/jit_utils.cuh
-@@ -62 +62,2 @@ int div_up(int a, int b);
+@@ -62 +62,2 @@
 -int get_smem_size(int num_stages, int k, int block_m, int block_n, int block_k, bool swap_ab);
 +int get_smem_size(int num_stages, int k, int block_m, int block_n, int block_k, bool swap_ab,
 +                  bool paired_rows);
-@@ -66 +67 @@ GemmConfig get_best_gemm_config(uint32_t shape_m, uint32_t shape_n, uint32_t sha
+@@ -66 +67 @@
 -                                bool swap_ab);
 +                                bool swap_ab, int max_num_stages, bool paired_rows);
-@@ -91,2 +92,2 @@ inline int div_up(int a, int b) { return (a + b - 1) / b; }
+@@ -91,2 +92,2 @@
 -inline int get_smem_size(int num_stages, int k, int block_m, int block_n, int block_k = 128,
 -                         bool swap_ab = false) {
 +inline int get_smem_size(int num_stages, int k, int block_m, int block_n, int block_k,
 +                         bool swap_ab, bool paired_rows) {
-@@ -111,3 +112,8 @@ inline int get_smem_size(int num_stages, int k, int block_m, int block_n, int bl
+@@ -111,3 +112,8 @@
 -    int smem_d = block_n * block_m * 2;
 -    int smem_a_per_stage = block_m * block_k;              // weight
 -    int smem_scales_a_per_stage = div_up(k, block_k) * 4;  // weight scales
@@ -822,11 +934,11 @@ index 8e26486d4d5596e4ef2b244cec59987c798216c0..b478cfb85548cf1ebaa152391f20aeef
 +    int smem_a_per_stage = row_blocks * block_m * block_k;  // weight
 +    int smem_scales_a_per_stage =
 +        scale_buffers * row_blocks * div_up(k, block_k) * 4;  // weight scales
-@@ -139 +145,2 @@ inline GemmConfig get_best_gemm_config(uint32_t shape_m, uint32_t shape_n, uint3
+@@ -139 +145,2 @@
 -                                       bool is_grouped_contiguous = false, bool swap_ab = false) {
 +                                       bool is_grouped_contiguous, bool swap_ab,
 +                                       int max_num_stages, bool paired_rows) {
-@@ -206 +213,5 @@ inline GemmConfig get_best_gemm_config(uint32_t shape_m, uint32_t shape_n, uint3
+@@ -206 +213,5 @@
 -    int smem_size = get_smem_size(num_stages, shape_k, best_block_m, best_block_n, 128, swap_ab);
 +    if (max_num_stages > 0 && num_stages > max_num_stages) {
 +      continue;
@@ -837,7 +949,7 @@ diff --git a/csrc/nv_internal/tensorrt_llm/deep_gemm/scheduler.cuh b/csrc/nv_int
 index 15a624af4233f45eb95ad4b0cc39fbf010d4ce1e..c7f3c67623a62154bc1dc688369c6a03df975f19 100644
 --- a/csrc/nv_internal/tensorrt_llm/deep_gemm/scheduler.cuh
 +++ b/csrc/nv_internal/tensorrt_llm/deep_gemm/scheduler.cuh
-@@ -451,0 +452,20 @@ struct GroupedWithOffsetSchedulerSwapAB {
+@@ -451,0 +452,20 @@
 +#ifdef MOE_MBU_PREFIX_SCHEDULER
 +  uint32_t const* tile_prefix;
 +  // Shared-memory copy of problem_n_offsets made by the kernel's prologue scan
@@ -858,7 +970,7 @@ index 15a624af4233f45eb95ad4b0cc39fbf010d4ce1e..c7f3c67623a62154bc1dc688369c6a03
 +    offsets = smem_offsets;
 +  }
 +#endif
-@@ -490,0 +511,27 @@ struct GroupedWithOffsetSchedulerSwapAB {
+@@ -490,0 +511,27 @@
 +#ifdef MOE_MBU_PREFIX_SCHEDULER
 +    const uint32_t global_n_tile = next_block_idx / kNumMBlocks;
 +    if (global_n_tile >= tile_prefix[kNumGroups]) return false;
@@ -886,21 +998,21 @@ index 15a624af4233f45eb95ad4b0cc39fbf010d4ce1e..c7f3c67623a62154bc1dc688369c6a03
 +    n_boundary = offsets[curr_group_idx + 1];
 +    n_padded_4_offset = compute_padded_offset(n_offset, curr_group_idx);
 +#else
-@@ -507,0 +555,2 @@ struct GroupedWithOffsetSchedulerSwapAB {
-+#endif
+@@ -506,0 +554,2 @@
 +
++#endif
 diff --git a/csrc/nv_internal/tensorrt_llm/deep_gemm/tma_utils.cuh b/csrc/nv_internal/tensorrt_llm/deep_gemm/tma_utils.cuh
 index 173998b089af816e873dac5d67ae12f3ab1acc30..74c5957e8f88867648da03a3545b9dcdeca74c52 100644
 --- a/csrc/nv_internal/tensorrt_llm/deep_gemm/tma_utils.cuh
 +++ b/csrc/nv_internal/tensorrt_llm/deep_gemm/tma_utils.cuh
-@@ -115 +115,2 @@ CUtensorMap make_2d_tma_copy_desc(T* global_address, uint64_t gmem_dim[2], uint6
+@@ -115 +115,2 @@
 -template <uint32_t kNumTMAMulticast = 1>
 +template <uint32_t kNumTMAMulticast = 1,
 +          cute::TMA::CacheHintSm90 kCacheHint = cute::TMA::CacheHintSm90::EVICT_NORMAL>
-@@ -119 +120 @@ __device__ __forceinline__ void tma_copy(void const* desc_ptr, uint64_t* barrier
+@@ -119 +120 @@
 -  constexpr auto cache_hint = static_cast<uint64_t>(cute::TMA::CacheHintSm90::EVICT_NORMAL);
 +  constexpr auto cache_hint = static_cast<uint64_t>(kCacheHint);
-@@ -127,0 +129,11 @@ __device__ __forceinline__ void tma_copy(void const* desc_ptr, uint64_t* barrier
+@@ -127,0 +129,11 @@
 +// Bulk copy of a contiguous global range into shared memory that completes on `barrier_ptr`.
 +// Same PTX as cute::SM90_BULK_COPY_G2S, which the JIT build's cute subset (nvrtc_cutlass.cuh) lacks.
 +__device__ __forceinline__ void bulk_copy_g2s(void const* gmem_ptr, uint64_t* barrier_ptr,
@@ -919,7 +1031,7 @@ index 12e9d8c5b2a73b7a81c3444e1298b417078d2996..ad525a0df1932908ab7dcedd495d2d2b
 @@ -20,0 +21,2 @@
 +#include <limits>
 +
-@@ -93,0 +96,7 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::gemm(
+@@ -93,0 +96,7 @@
 +/**
 + * @brief Run grouped FP8 expert GEMMs using the configured workspace.
 + * @param expected_m Positive uint32 token estimate for DeepGEMM configuration
@@ -927,12 +1039,14 @@ index 12e9d8c5b2a73b7a81c3444e1298b417078d2996..ad525a0df1932908ab7dcedd495d2d2b
 + * and apply only to this invocation, preserving workspace capacity and runner state.
 + * @param max_num_stages Pipeline stage upper bound, or -1 for upstream selection.
 + */
-@@ -98 +107,2 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(
+@@ -98,4 +107,28 @@
 -    float const* scales_b) {
+-#ifdef ENABLE_FP8_BLOCK_SCALE
+-  constexpr bool internal_quantize_a = !std::is_same_v<ElementA, __nv_fp8_e4m3>;
+-  constexpr bool internal_quantize_b = !std::is_same_v<ElementB, __nv_fp8_e4m3>;
 +    float const* scales_b, int64_t expected_m, int max_num_stages, bool paired_rows,
 +    bool input_quantized, void* fused_output, float* fused_scales, bool enable_pdl) {
-@@ -100 +110,20 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(
--  constexpr bool internal_quantize_a = !std::is_same_v<ElementA, __nv_fp8_e4m3>;
++#ifdef ENABLE_FP8_BLOCK_SCALE
 +  TLLM_CHECK_WITH_INFO(
 +      expected_m == -1 || (expected_m > 0 && expected_m <= std::numeric_limits<uint32_t>::max()),
 +      "expected_m must be -1 or a positive uint32 value");
@@ -953,24 +1067,24 @@ index 12e9d8c5b2a73b7a81c3444e1298b417078d2996..ad525a0df1932908ab7dcedd495d2d2b
 +  // A per-call scheduling hint must not change the runner's legacy load estimate.
 +  int64_t const effective_m = expected_m == -1 ? expected_m_ : expected_m;
 +  bool const internal_quantize_a = !std::is_same_v<ElementA, __nv_fp8_e4m3> && !input_quantized;
-@@ -101,0 +131,4 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(
++  constexpr bool internal_quantize_b = !std::is_same_v<ElementB, __nv_fp8_e4m3>;
 +  // Fused FC1 writes into this call's output buffer, not the runner's high-water
 +  // scratch. Bound TMA loads to that buffer so partial tiles zero-fill its tail.
 +  int64_t const input_capacity = input_quantized ? shape_m_ : max_shape_m_4_align_;
 +  int64_t const quant_shape_m = div_up(shape_m_, 4) * 4;
-@@ -109 +142 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(
+@@ -109 +142 @@
 -  if constexpr (internal_quantize_a || internal_quantize_b) {
 +  if (internal_quantize_a || internal_quantize_b) {
-@@ -113 +146 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(
+@@ -113 +146 @@
 -  if constexpr (internal_quantize_a) {
 +  if (internal_quantize_a) {
-@@ -122,0 +156,5 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(
+@@ -121,0 +155,5 @@
++
 +  // The grouped runner quantizes the BF16 source into this separate scratch
 +  // before FC1 fusion may overwrite the original BF16 source buffer.
 +  TLLM_CHECK_WITH_INFO(fused_output == nullptr || fused_output != fp8_mat_a,
 +                       "Fused output must not overwrite the GEMM FP8 input");
-+
-@@ -137,6 +175,9 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(
+@@ -137,6 +175,9 @@
 -    fp8_grouped_gemm_run(reinterpret_cast<__nv_bfloat16 const*>(mat_a), fp8_mat_a,
 -                         per_token_per_128c_scales, reinterpret_cast<__nv_bfloat16 const*>(mat_b),
 -                         fp8_mat_b, per_block_scales, reinterpret_cast<__nv_bfloat16*>(mat_d),
@@ -986,7 +1100,7 @@ index 12e9d8c5b2a73b7a81c3444e1298b417078d2996..ad525a0df1932908ab7dcedd495d2d2b
 +        internal_quantize_a, internal_quantize_b, max_num_stages,
 +        quant_shape_m, paired_rows,
 +        reinterpret_cast<__nv_fp8_e4m3*>(fused_output), fused_scales, input_quantized, enable_pdl);
-@@ -145,5 +186,8 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(
+@@ -145,5 +186,8 @@
 -    fp8_grouped_gemm_run(reinterpret_cast<__nv_bfloat16 const*>(mat_a), fp8_mat_a,
 -                         per_token_per_128c_scales, nullptr, fp8_mat_b, per_block_scales,
 -                         reinterpret_cast<__nv_bfloat16*>(mat_d), problem_m_offsets, num_problems,
@@ -1000,14 +1114,14 @@ index 12e9d8c5b2a73b7a81c3444e1298b417078d2996..ad525a0df1932908ab7dcedd495d2d2b
 +        shape_k, stream, internal_quantize_a, internal_quantize_b, max_num_stages,
 +        quant_shape_m, paired_rows,
 +        reinterpret_cast<__nv_fp8_e4m3*>(fused_output), fused_scales, input_quantized, enable_pdl);
-@@ -155,2 +199,4 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(
+@@ -155,2 +199,4 @@
 -                         expected_m_, max_shape_m_4_align_, max_shape_m_32_align_padded_, shape_n,
 -                         shape_k, stream, internal_quantize_a, internal_quantize_b);
 +                         effective_m, input_capacity, max_shape_m_32_align_padded_, shape_n,
 +                         shape_k, stream, internal_quantize_a, internal_quantize_b, max_num_stages,
 +                         quant_shape_m, paired_rows,
 +                         reinterpret_cast<__nv_fp8_e4m3*>(fused_output), fused_scales, input_quantized, enable_pdl);
-@@ -219,0 +266,4 @@ size_t CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::getWorkspac
+@@ -219,0 +266,4 @@
 +  // The workspace keeps the largest M requested so far. The grouped input quantization is
 +  // launched for this call's M instead, so a small call after a large batch keeps its small
 +  // grid and binary search; neither changes the quantized values or their layout.
@@ -1016,11 +1130,11 @@ diff --git a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscal
 index 040a1463b919b4297d8c17b9df0fcaf3026ffb75..fb83c9f2f4ab1c148d47fcf8d65890c37b769488 100644
 --- a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h
 +++ b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h
-@@ -26,0 +27,3 @@ namespace tensorrt_llm::kernels::fp8_blockscale_gemm {
+@@ -26,0 +27,3 @@
 +// Includes compiler availability and the TRTLLM_DG_ENABLED runtime override.
 +bool getDeepGemmEnabled();
 +
-@@ -40,0 +44,13 @@ class CutlassFp8BlockScaleGemmRunnerInterface {
+@@ -40,0 +44,13 @@
 +  /**
 +   * @brief Execute grouped FP8 GEMMs with rows partitioned by problem_m_offsets.
 +   * @param expected_m Expected tokens per expert for DeepGEMM configuration
@@ -1034,14 +1148,14 @@ index 040a1463b919b4297d8c17b9df0fcaf3026ffb75..fb83c9f2f4ab1c148d47fcf8d65890c3
 +   * @param paired_rows Let one decode (swapAB) tile cover weight rows r and r + shape_n / 2,
 +   * e.g. matching up and gate rows of a gated FC1.
 +   */
-@@ -43,2 +59,4 @@ class CutlassFp8BlockScaleGemmRunnerInterface {
+@@ -43,2 +59,4 @@
 -                       size_t shape_k, cudaStream_t stream, float const* scales_a = nullptr,
 -                       float const* scales_b = nullptr) = 0;
 +                       size_t shape_k, cudaStream_t stream, float const* scales_a,
 +                       float const* scales_b, int64_t expected_m, int max_num_stages,
 +                       bool paired_rows, bool input_quantized, void* fused_output,
 +                       float* fused_scales, bool enable_pdl) = 0;
-@@ -90,0 +109,12 @@ class CutlassFp8BlockScaleGemmRunner : public CutlassFp8BlockScaleGemmRunnerInte
+@@ -90,0 +109,12 @@
 +  /**
 +   * @brief Run grouped FP8 expert GEMMs with optional input quantization.
 +   * @param expected_m Per-call DeepGEMM token estimate, or -1 for the stored
@@ -1054,46 +1168,46 @@ index 040a1463b919b4297d8c17b9df0fcaf3026ffb75..fb83c9f2f4ab1c148d47fcf8d65890c3
 +   * @param fused_scales Padded output scales, or nullptr together with fused_output.
 +   * @param paired_rows Pair weight rows r and r + shape_n / 2 in one decode tile; requires DeepGEMM.
 +   */
-@@ -93 +123,3 @@ class CutlassFp8BlockScaleGemmRunner : public CutlassFp8BlockScaleGemmRunnerInte
+@@ -93 +123,3 @@
 -               float const* scales_a = nullptr, float const* scales_b = nullptr) override;
 +               float const* scales_a, float const* scales_b, int64_t expected_m,
 +               int max_num_stages, bool paired_rows, bool input_quantized, void* fused_output,
 +               float* fused_scales, bool enable_pdl) override;
-@@ -121,0 +154,2 @@ class CutlassFp8BlockScaleGemmRunner : public CutlassFp8BlockScaleGemmRunnerInte
+@@ -121,0 +154,2 @@
 +  // This call's unpadded row capacity; quantization rounds its launch up separately.
 +  int64_t shape_m_ = 0;
 diff --git a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm_kernel.cuh b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm_kernel.cuh
 index 5cc4143cd1bf5df85ff4384ca8e86bf8e85f07e9..d72c3ed63270e9cd01e8de81e2fb5838deba77a1 100644
 --- a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm_kernel.cuh
 +++ b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm_kernel.cuh
-@@ -1350 +1350 @@ void gemm_dispatch(void* mat_a, int ld_a, void* mat_b, int ld_b, void* mat_d, in
+@@ -1350 +1350 @@
 -                                             num_device_sms);
 +                                             num_device_sms, false, false, -1, false);
-@@ -1354 +1354 @@ void gemm_dispatch(void* mat_a, int ld_a, void* mat_b, int ld_b, void* mat_d, in
+@@ -1354 +1354 @@
 -        best_num_tma_multicast, deep_gemm::GemmType::Normal);
 +        best_num_tma_multicast, deep_gemm::GemmType::Normal, false, false, false, false);
-@@ -1364 +1364 @@ void gemm_dispatch(void* mat_a, int ld_a, void* mat_b, int ld_b, void* mat_d, in
+@@ -1364 +1364 @@
 -                                             num_device_sms, false, true);
 +                                             num_device_sms, false, true, -1, false);
-@@ -1367 +1367 @@ void gemm_dispatch(void* mat_a, int ld_a, void* mat_b, int ld_b, void* mat_d, in
+@@ -1367 +1367 @@
 -        best_num_tma_multicast, deep_gemm::GemmType::Normal, true);
 +        best_num_tma_multicast, deep_gemm::GemmType::Normal, true, false, false, false);
-@@ -1465 +1465,3 @@ void grouped_gemm_dispatch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bflo
+@@ -1465 +1465,3 @@
 -                           cudaStream_t stream, int num_device_sms = kNumDeviceSMs) {
 +                           cudaStream_t stream, int max_num_stages, bool paired_rows,
 +                           __nv_fp8_e4m3* fused_output, float* fused_scales, bool fused_fc1_input,
 +                           bool enable_pdl, int num_device_sms = kNumDeviceSMs) {
-@@ -1472,0 +1475,3 @@ void grouped_gemm_dispatch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bflo
+@@ -1472,0 +1475,3 @@
 +  TLLM_CHECK_WITH_INFO(fused_output == nullptr ||
 +                           (paired_rows && fused_scales != nullptr && expected_m < m_per_expert_threshold),
 +                       "Fused SwiGLU quantization requires the grouped swapAB path");
-@@ -1476 +1481 @@ void grouped_gemm_dispatch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bflo
+@@ -1476 +1481 @@
 -                                             num_device_sms);
 +                                             num_device_sms, false, false, max_num_stages, false);
-@@ -1480 +1485 @@ void grouped_gemm_dispatch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bflo
+@@ -1480 +1485 @@
 -        best_num_tma_multicast, deep_gemm::GemmType::GroupedWithOffset);
 +        best_num_tma_multicast, deep_gemm::GemmType::GroupedWithOffset, false, false, false, false);
-@@ -1487,0 +1493,16 @@ void grouped_gemm_dispatch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bflo
+@@ -1487,0 +1493,16 @@
 +    // Paired row tiles double the accumulators; keep them to the small token tiles of decode.
 +    bool paired = paired_rows && shape_n % (2 * block_k) == 0;
 +    auto config = deep_gemm::jit::get_best_gemm_config(shape_n, expected_m, shape_k, num_problems,
@@ -1110,7 +1224,7 @@ index 5cc4143cd1bf5df85ff4384ca8e86bf8e85f07e9..d72c3ed63270e9cd01e8de81e2fb5838
 +                                                    num_device_sms, false, true, max_num_stages,
 +                                                    false);
 +    }
-@@ -1489,2 +1510,15 @@ void grouped_gemm_dispatch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bflo
+@@ -1489,2 +1510,15 @@
 -        deep_gemm::jit::get_best_gemm_config(shape_n, expected_m, shape_k, num_problems,
 -                                             num_device_sms, false, true);
 +        config;
@@ -1128,21 +1242,21 @@ index 5cc4143cd1bf5df85ff4384ca8e86bf8e85f07e9..d72c3ed63270e9cd01e8de81e2fb5838
 +    // read before griddepcontrol.wait are already final. Other grouped GEMMs stay stream-ordered,
 +    // as upstream.
 +    bool const programmatic_launch = enable_pdl && (fused_output != nullptr || fused_fc1_input);
-@@ -1493 +1527,2 @@ void grouped_gemm_dispatch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bflo
+@@ -1493 +1527,2 @@
 -        best_num_tma_multicast, deep_gemm::GemmType::GroupedWithOffset, true);
 +        best_num_tma_multicast, deep_gemm::GemmType::GroupedWithOffset, true, paired,
 +        fused_output != nullptr, prefetch_first_tile);
-@@ -1500 +1535,2 @@ void grouped_gemm_dispatch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bflo
+@@ -1500 +1535,2 @@
 -        num_device_sms, static_cast<uint32_t>(best_smem_size), max_shape_m_padded);
 +        num_device_sms, static_cast<uint32_t>(best_smem_size), max_shape_m_padded,
 +        fused_output, fused_scales, programmatic_launch);
-@@ -1509 +1545,4 @@ void fp8_grouped_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a,
+@@ -1509 +1545,4 @@
 -                          bool internal_quantize_a = true, bool internal_quantize_b = true) {
 +                          bool internal_quantize_a, bool internal_quantize_b, int max_num_stages,
 +                          int64_t quant_shape_m, bool paired_rows,
 +                          __nv_fp8_e4m3* fused_output, float* fused_scales, bool fused_fc1_input,
 +                          bool enable_pdl) {
-@@ -1521,3 +1560,6 @@ void fp8_grouped_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a,
+@@ -1521,3 +1560,6 @@
 -    int num_blocks = std::min(static_cast<int64_t>(kNumDeviceSMs),
 -                              div_up(max_shape_m * scales_dim_x, NumThreads / 32));
 -    // Binary search is expected to have lower complexity when max_shape_m is small
@@ -1152,47 +1266,49 @@ index 5cc4143cd1bf5df85ff4384ca8e86bf8e85f07e9..d72c3ed63270e9cd01e8de81e2fb5838
 +        1, std::min(static_cast<int64_t>(kNumDeviceSMs),
 +                    div_up(quant_shape_m * scales_dim_x, NumThreads / 32)));
 +    // Binary search is expected to have lower complexity when quant_shape_m is small
-@@ -1525 +1567 @@ void fp8_grouped_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a,
+@@ -1525 +1567 @@
 -        static_cast<double>(max_shape_m) * scales_dim_x /
 +        static_cast<double>(quant_shape_m) * scales_dim_x /
-@@ -1553 +1595,2 @@ void fp8_grouped_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a,
+@@ -1553 +1595,2 @@
 -                          stream);
 +                          stream, max_num_stages, paired_rows, fused_output, fused_scales, fused_fc1_input,
 +                          enable_pdl);
-@@ -1578 +1621,2 @@ void strided_batch_gemm_dispatch(__nv_fp8_e4m3* mat_a, int ld_a, int stride_a, _
+@@ -1578 +1621,2 @@
 -      deep_gemm::jit::get_best_gemm_config(shape_m, shape_n, shape_k, num_problems, num_device_sms);
 +      deep_gemm::jit::get_best_gemm_config(shape_m, shape_n, shape_k, num_problems, num_device_sms,
 +                                           false, false, -1, false);
-@@ -1582 +1626 @@ void strided_batch_gemm_dispatch(__nv_fp8_e4m3* mat_a, int ld_a, int stride_a, _
+@@ -1582 +1626 @@
 -      best_num_tma_multicast, deep_gemm::GemmType::StridedBatched);
 +      best_num_tma_multicast, deep_gemm::GemmType::StridedBatched, false, false, false, false);
 diff --git a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h
-index 9a6e12e23d3cd79bb179401484d4be2db1be1ae4..0fd87439c869dfbe11a957494e4d7fd4122b98a5 100644
+index 9a6e12e23d3cd79bb179401484d4be2db1be1ae4..a987d25d220e48feccc127d0a30acc245bbaac39 100644
 --- a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h
 +++ b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h
-@@ -481,0 +482,5 @@ class CutlassMoeFCRunnerInterface {
+@@ -481,0 +482,5 @@
 +  /**
 +   * @brief Execute the routed expert layers and combine their outputs.
 +   * @param expected_m Per-call token estimate for both DeepSeek FP8 block-scale
 +   * GEMMs, or -1 for the default estimate. Explicit hints exclude minimum-latency mode.
 +   */
-@@ -494,2 +499,2 @@ class CutlassMoeFCRunnerInterface {
+@@ -494,2 +499,3 @@
 -                      MoeMinLatencyParams& min_latency_params, bool enable_pdl,
 -                      cudaStream_t stream) = 0;
 +                      MoeMinLatencyParams& min_latency_params, bool enable_pdl, cudaStream_t stream,
-+                      int64_t expected_m = -1) = 0;
-@@ -708,0 +714,5 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
++                      int64_t expected_m = -1, void* deferred_output = nullptr,
++                      int64_t* deferred_offsets = nullptr) = 0;
+@@ -708,0 +715,5 @@
 +  /**
 +   * @brief Permute tokens, run both expert GEMMs, and finalize the MoE output.
 +   * @param expected_m DeepSeek FP8 token estimate forwarded to both GEMMs for
 +   * this call, or -1 to retain their default configuration-selection policy.
 +   */
-@@ -720,2 +730,2 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
+@@ -720,2 +731,3 @@
 -              MoeMinLatencyParams& min_latency_params, bool enable_pdl,
 -              cudaStream_t stream) override;
 +              MoeMinLatencyParams& min_latency_params, bool enable_pdl, cudaStream_t stream,
-+              int64_t expected_m = -1) override;
-@@ -724,27 +734,38 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
++              int64_t expected_m = -1, void* deferred_output = nullptr,
++              int64_t* deferred_offsets = nullptr) override;
+@@ -724,27 +736,38 @@
 -  static void gemm1(MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX,
 -                                  Sm90Wfp4Afp8Mode>& gemm_runner,
 -                    // This argument must not be null if fp8 block scaling is being used.
@@ -1258,23 +1374,23 @@ index 9a6e12e23d3cd79bb179401484d4be2db1be1ae4..0fd87439c869dfbe11a957494e4d7fd4
 +   * @param expected_m Per-call token estimate for the FP8 block-scale runner;
 +   * -1 uses its default estimate. Other GEMM paths do not consume this hint.
 +   */
-@@ -771 +792 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
+@@ -771 +794 @@
 -      bool enable_pdl);
 +      bool enable_pdl, int64_t expected_m, float* fused_fc2_scales);
-@@ -802 +823 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
+@@ -802 +825 @@
 -                       active_expert_global_ids, enable_pdl);
 +                       active_expert_global_ids, enable_pdl, -1, nullptr);
-@@ -837 +858 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
+@@ -837 +860 @@
 -        num_active_experts_per, active_expert_global_ids, enable_pdl);
 +        num_active_experts_per, active_expert_global_ids, enable_pdl, -1, nullptr);
-@@ -991,0 +1013,6 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
+@@ -991,0 +1015,6 @@
 +  /**
 +   * @brief Run the first FP8 block-scale expert GEMM and apply its activation.
 +   * @param fused_fc2_scales Non-null selects fused FP8 output and receives its padded scales.
 +   * @param expected_m Token estimate forwarded to DeepGEMM for this call, or -1
 +   * for the runner's default estimate. The workspace must already be configured.
 +   */
-@@ -1001,2 +1028,9 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
+@@ -1001,2 +1030,9 @@
 -                            bool enable_pdl, cudaStream_t stream);
 -
 +                            bool enable_pdl, cudaStream_t stream, int64_t expected_m,
@@ -1286,14 +1402,14 @@ index 9a6e12e23d3cd79bb179401484d4be2db1be1ae4..0fd87439c869dfbe11a957494e4d7fd4
 +   * @param expected_m Token estimate forwarded to DeepGEMM for this call, or -1
 +   * for the runner's default estimate. The workspace must already be configured.
 +   */
-@@ -1014 +1048,2 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
+@@ -1014 +1050,2 @@
 -      bool const enable_alltoall, QuantParams& quant_params, bool enable_pdl, cudaStream_t stream);
 +      bool const enable_alltoall, QuantParams& quant_params, bool enable_pdl, cudaStream_t stream,
 +      int64_t expected_m, float* fused_fc2_scales);
-@@ -1044,0 +1080 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
+@@ -1044,0 +1082 @@
 +  float* deepseek_fc2_scales_{};
 diff --git a/flashinfer/fused_moe/core.py b/flashinfer/fused_moe/core.py
-index caf3d019bc7cc83189e64e53812bfe9dbe099c1b..1aa77331d4811179b440d00a176e8be2483741de 100644
+index caf3d019bc7cc83189e64e53812bfe9dbe099c1b..720e722c4de21307d8b0224724ef36f4ac57bf3b 100644
 --- a/flashinfer/fused_moe/core.py
 +++ b/flashinfer/fused_moe/core.py
 @@ -636,0 +637,23 @@
@@ -1345,12 +1461,16 @@ index caf3d019bc7cc83189e64e53812bfe9dbe099c1b..1aa77331d4811179b440d00a176e8be2
 +    if enable_sm90_moe_optimizations:
 +        op_name += "_sm90_grouped_optimized"
 +
-@@ -972 +1010 @@
+@@ -972,2 +1010,2 @@
 -        "flashinfer::cutlass_fused_moe",
+-        mutates_args=("output", "workspace_buffer"),
 +        op_name,
-@@ -1014,0 +1053 @@
++        mutates_args=("output", "workspace_buffer", "route_map", "expert_offsets"),
+@@ -1014,0 +1053,3 @@
 +        expected_m: Optional[int] = None,
-@@ -1015,0 +1055,12 @@
++        route_map: Optional[torch.Tensor] = None,
++        expert_offsets: Optional[torch.Tensor] = None,
+@@ -1015,0 +1057,12 @@
 +        """Execute CUTLASS MoE with the selected tactics and workspace.
 +
 +        Forward expected_m to both DeepSeek FP8 block-scale expert GEMMs for
@@ -1363,27 +1483,36 @@ index caf3d019bc7cc83189e64e53812bfe9dbe099c1b..1aa77331d4811179b440d00a176e8be2
 +                min_latency_mode=min_latency_mode,
 +                backend="cutlass",
 +            )
-@@ -1143,0 +1195,5 @@
+@@ -1143,0 +1197,5 @@
 +            *(
 +                []
 +                if min_latency_mode
-+                else [expected_m if expected_m is not None else -1]
++                else [expected_m if expected_m is not None else -1, route_map, expert_offsets]
 +            ),
-@@ -1157 +1213 @@
+@@ -1157 +1215 @@
 -    @register_fake_op("flashinfer::cutlass_fused_moe")
 +    @register_fake_op(op_name)
-@@ -1197,0 +1254 @@
+@@ -1197,0 +1256,3 @@
 +        expected_m: Optional[int] = None,
-@@ -1198,0 +1256,5 @@
++        route_map: Optional[torch.Tensor] = None,
++        expert_offsets: Optional[torch.Tensor] = None,
+@@ -1198,0 +1260,5 @@
 +        """Infer output tensors for fake execution of the CUTLASS MoE operation.
 +
 +        Minimum-latency mode also returns expert-routing metadata. The
 +        expected_m scheduling hint does not affect output shapes or dtypes.
 +        """
-@@ -1331,0 +1394,2 @@
+@@ -1214 +1280,2 @@
+-            return [input.new_empty([seq_len, hidden_size], dtype=output_dtype)]
++            rows = seq_len * token_selected_experts.shape[1] if route_map is not None else seq_len
++            return [input.new_empty([rows, hidden_size], dtype=output_dtype)]
+@@ -1331,0 +1399,4 @@
 +    expected_m: Optional[int] = None,
 +    enable_sm90_moe_optimizations: bool = False,
-@@ -1529,0 +1594,18 @@
++    route_map: Optional[torch.Tensor] = None,
++    expert_offsets: Optional[torch.Tensor] = None,
+@@ -1528,0 +1600,18 @@
++
 +    expected_m : Optional[int]
 +        Expected number of tokens per local expert for DeepGEMM configuration selection.
 +        Supported only by CUTLASS DeepSeek FP8 block-scale MoE on SM90 with DeepGEMM
@@ -1401,8 +1530,7 @@ index caf3d019bc7cc83189e64e53812bfe9dbe099c1b..1aa77331d4811179b440d00a176e8be2
 +        scheduling and ignores the former ``MOE_MBU_*`` environment switches.
 +        Choose this option before warmup and CUDA graph capture. Modules, native
 +        kernel caches and tuning keys are separate for the two configurations.
-+
-@@ -1570,0 +1653,15 @@
+@@ -1570,0 +1660,15 @@
 +    if type(enable_sm90_moe_optimizations) is not bool:
 +        raise TypeError("enable_sm90_moe_optimizations must be a bool")
 +    if enable_sm90_moe_optimizations and (
@@ -1418,7 +1546,16 @@ index caf3d019bc7cc83189e64e53812bfe9dbe099c1b..1aa77331d4811179b440d00a176e8be2
 +            min_latency_mode=min_latency_mode,
 +            backend=backend,
 +        )
-@@ -1662 +1759,7 @@
+@@ -1651,0 +1756,8 @@
++    if (route_map is None) != (expert_offsets is None):
++        raise ValueError("Deferred route map and expert offsets must be supplied together")
++    if route_map is not None:
++        if not use_deepseek_fp8_block_scale or min_latency_mode or enable_alltoall or tp_size != 1:
++            raise ValueError("Deferred finalize requires SM90 block-FP8 without TP/all-to-all")
++        num_rows *= token_selected_experts.shape[1]
++        if use_fused_finalize:
++            raise ValueError("Deferred outputs require use_fused_finalize=False")
+@@ -1662 +1774,7 @@
 -        return get_cutlass_fused_moe_module(device_arch).cutlass_fused_moe(
 +        if enable_sm90_moe_optimizations:
 +            module = get_cutlass_fused_moe_module(
@@ -1427,5 +1564,7 @@ index caf3d019bc7cc83189e64e53812bfe9dbe099c1b..1aa77331d4811179b440d00a176e8be2
 +        else:
 +            module = get_cutlass_fused_moe_module(device_arch)
 +        return module.cutlass_fused_moe(
-@@ -1700,0 +1804 @@
+@@ -1700,0 +1819,3 @@
 +            expected_m=expected_m,
++            route_map=route_map,
++            expert_offsets=expert_offsets,

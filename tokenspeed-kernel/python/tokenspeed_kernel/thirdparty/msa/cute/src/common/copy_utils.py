@@ -18,6 +18,9 @@ from cutlass import Float32, Int32, const_expr
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cutlass_dsl import T, dsl_user_op
+from tokenspeed_kernel.thirdparty.cute_dsl.memory import (
+    store_global_f32x4_as_fp8_e4m3 as stg_32_fp8_e4m3,
+)
 
 # Generic Copy Primitives
 
@@ -357,45 +360,6 @@ def stg_64_f16(
         "mov.b32 p0, {h0, h1};\n"
         "mov.b32 p1, {h2, h3};\n"
         "st.global.v2.b32 [$4], {p0, p1};\n"
-        "}\n"
-        "mov.f32 $0, 0f00000000; mov.f32 $1, 0f00000000; "
-        "mov.f32 $2, 0f00000000; mov.f32 $3, 0f00000000;",
-        "=f,=f,=f,=f,l,f,f,f,f",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def stg_32_fp8_e4m3(
-    gmem_ptr: cute.Pointer,
-    v0: Float32,
-    v1: Float32,
-    v2: Float32,
-    v3: Float32,
-    *,
-    loc=None,
-    ip=None,
-):
-    llvm.inline_asm(
-        llvm.StructType.get_literal([T.f32(), T.f32(), T.f32(), T.f32()]),
-        [
-            gmem_ptr.toint().ir_value(loc=loc, ip=ip),
-            Float32(v0).ir_value(loc=loc, ip=ip),
-            Float32(v1).ir_value(loc=loc, ip=ip),
-            Float32(v2).ir_value(loc=loc, ip=ip),
-            Float32(v3).ir_value(loc=loc, ip=ip),
-        ],
-        "{\n"
-        ".reg .b16 h0, h1;\n"
-        ".reg .b32 p0;\n"
-        "cvt.rn.satfinite.e4m3x2.f32 h0, $6, $5;\n"
-        "cvt.rn.satfinite.e4m3x2.f32 h1, $8, $7;\n"
-        "mov.b32 p0, {h0, h1};\n"
-        "st.global.b32 [$4], p0;\n"
         "}\n"
         "mov.f32 $0, 0f00000000; mov.f32 $1, 0f00000000; "
         "mov.f32 $2, 0f00000000; mov.f32 $3, 0f00000000;",

@@ -43,6 +43,10 @@ from tokenspeed_kernel.signature import (
 )
 
 __all__ = [
+    "combine_quant_fp8",
+    "DeferredMoERoutes",
+    "moe_apply_routes",
+    "prepare_sm90_fp8_moe_routes",
     "bf16_moe_routes",
     "bf16_moe_routes_warmup",
     "gather_moe_routes",
@@ -165,13 +169,46 @@ def prepare_sm90_fp8_moe(
     Returns:
         A callable accepting FlashInfer's ``cutlass_fused_moe`` arguments and
         returning its output list. Private modes additionally accept a positive
-        uint32 ``expected_m`` or None. Callers compute that hint from their own
+        uint32 ``expected_m`` or None, and ``prepared_input`` from
+        ``route_quant_fp8``. Prepared input keeps both native expert GEMMs and
+        skips their input preparation; retain its storage through all consumers.
+        Callers compute the hint from their own
         routing layout. Initialize before warmup and CUDA graph capture;
         private modes require FlashInfer 0.7.3, Hopper, and a working JIT compiler.
     """
     from tokenspeed_kernel.thirdparty.flashinfer.sm90_moe import make_cutlass_fused_moe
 
     return make_cutlass_fused_moe(
+        mode=mode,
+        max_num_stages_fc1=max_num_stages_fc1,
+        max_num_stages_fc2=max_num_stages_fc2,
+    )
+
+
+def prepare_sm90_fp8_moe_routes(
+    *,
+    mode: Literal["expected_m", "optimized"],
+    max_num_stages_fc1: int,
+    max_num_stages_fc2: int,
+) -> Callable:
+    """Prepare native SM90 MoE with unweighted, caller-owned expert outputs.
+
+    Args:
+        mode: Explicit private native scheduling mode.
+        max_num_stages_fc1: FC1 stage bound, or -1 to preserve native selection.
+        max_num_stages_fc2: Independent FC2 stage bound with the same meaning.
+
+    Returns:
+        A callable returning DeferredMoERoutes for BF16 inputs, block-FP8
+        experts, and 1..32 routes per token. Hidden and intermediate sizes
+        are inferred from the tensors and must be positive multiples of 128.
+        The callable requires explicit EP size/rank, expected_m and enable_pdl.
+        Optional out supplies (BF16 partial, flat int32 map, int64 offsets).
+        Prepare and warm before graph capture. Native GEMMs are not exposed.
+    """
+    from tokenspeed_kernel.thirdparty.flashinfer.sm90_moe import make_cutlass_moe_routes
+
+    return make_cutlass_moe_routes(
         mode=mode,
         max_num_stages_fc1=max_num_stages_fc1,
         max_num_stages_fc2=max_num_stages_fc2,
@@ -920,8 +957,7 @@ def _moe_sigmoid_bias_topk(
         or not logical_to_physical_map.is_contiguous()
     ):
         raise ValueError(
-            "logical_to_physical_map must be contiguous colocated INT32/INT64 "
-            "[experts]"
+            "logical_to_physical_map must be contiguous colocated INT32/INT64 [experts]"
         )
     if not 0 < topk <= experts:
         raise ValueError(f"topk must be in [1, {experts}], got {topk}")
@@ -1058,6 +1094,10 @@ from tokenspeed_kernel.ops.moe._triton.bf16 import (  # noqa: E402
 )
 from tokenspeed_kernel.ops.moe._triton.sigmoid_topk_routing import (  # noqa: E402
     MAX_TOKENS as FUSED_ROUTING_MAX_TOKENS,
+)
+from tokenspeed_kernel.ops.moe.combine_quant import (  # noqa: E402
+    DeferredMoERoutes,
+    combine_quant_fp8,
 )
 from tokenspeed_kernel.ops.moe.flashinfer import (  # noqa: E402
     PreparedNvfp4Routing,
@@ -2187,6 +2227,8 @@ def moe_plan(
         "support_routing": support_routing,
         "supports_precomputed_topk": supports_precomputed_topk,
         "supports_deferred_finalize": supports_deferred_finalize,
+        "supports_deferred_routes": True
+        in apply_spec.traits.get("supports_deferred_routes", frozenset()),
         "deferred_output_is_token_order": deferred_output_is_token_order,
         "supports_deferred_out": supports_deferred_out,
         "topk_weights_dtype": topk_weights_dtype,
@@ -2261,6 +2303,35 @@ def moe_warmup(plan: dict, w: torch.nn.Module, *, max_num_tokens: int) -> None:
     warmup = plan.get("warmup")
     if warmup is not None:
         warmup({**plan, "warmup_max_num_tokens": max_num_tokens}, w)
+
+
+def moe_apply_routes(
+    plan, x, w, topk_weights, topk_ids, *, num_tokens_global, max_num_tokens_per_gpu
+) -> DeferredMoERoutes:
+    """Run the selected expert kernel and retain unweighted rows for combine+quant.
+
+    Uses the same processed weights, input preparation and native schedule as
+    ``moe_apply``. Requires a plan advertising ``supports_deferred_routes`` and
+    explicit ``cutlass_fused_finalize=False`` before warmup. Inputs are BF16
+    [N,H], FP32 route weights [N,K], and integer global expert IDs [N,K].
+    Returns owned BF16 rows, a slot-major inverse view, weights and offsets.
+    This contract is distinct from the legacy three-tensor deferred finalize.
+    """
+    if not plan.get("supports_deferred_routes", False):
+        raise ValueError("Selected MoE kernel cannot return deferred route storage")
+    if plan["cutlass_fused_finalize"]:
+        raise ValueError("Deferred routes require cutlass_fused_finalize=False")
+    return moe_apply(
+        plan,
+        x,
+        w,
+        None,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        num_tokens_global=num_tokens_global,
+        max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+        do_finalize=False,
+    )
 
 
 def moe_apply(

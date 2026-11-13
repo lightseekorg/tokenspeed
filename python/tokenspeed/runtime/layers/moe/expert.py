@@ -684,6 +684,33 @@ class MoELayer(torch.nn.Module):
         return TopKOutputFormat.STANDARD
 
     @property
+    def supports_deferred_routes(self) -> bool:
+        """Whether the selected leaf can retain owned rows for combine+quant."""
+        return self.plan.get("supports_deferred_routes", False)
+
+    def forward_routes(
+        self, hidden_states, topk_output, *, num_global_tokens, max_num_tokens_per_gpu
+    ):
+        """Execute precomputed routes with the normal plan and defer their combine.
+
+        Returns DeferredMoERoutes, preserving the legacy forward return contract.
+        The caller owns combine/quantization and must retain the result until done.
+        """
+        from tokenspeed_kernel.ops.moe import moe_apply_routes
+
+        if topk_output.format.is_bypassed() or not self.supports_precomputed_topk:
+            raise ValueError("Deferred routes require precomputed top-k")
+        return moe_apply_routes(
+            self.plan,
+            hidden_states,
+            self,
+            topk_output.topk_weights,
+            topk_output.topk_ids,
+            num_tokens_global=num_global_tokens,
+            max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+        )
+
+    @property
     def supports_deferred_finalize(self) -> bool:
         return self.plan["supports_deferred_finalize"]
 
