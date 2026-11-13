@@ -216,19 +216,27 @@ def test_lookup_rejects_invalid_physical_extents(sizes):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
 @pytest.mark.parametrize("tokens", [1, 4095, 4096, 8192])
-def test_host_lookup_stream_handoff(tokens):
+@pytest.mark.parametrize("fp8_cache", [False, True])
+def test_host_lookup_stream_handoff(tokens, fp8_cache):
+    from tokenspeed_kernel.platform import current_platform
+
+    if fp8_cache and not current_platform().is_nvidia:
+        pytest.skip("FP8 PLE host cache requires NVIDIA CUDA")
     mapping = _mapping_class()(rank=0, world_size=1, attn_tp_size=1, attn_dp_size=1)
     lookup = ple_lookup.PLELookup(
         mapping,
         vocab_size=256,
         ngram_heads=16,
         head_dim=160,
-        storage_dtype=None,
+        storage_dtype=torch.float8_e4m3fn if fp8_cache else None,
         output_dtype=torch.bfloat16,
         offload=True,
         prefix="",
     )
     table = torch.randn(256, 160, dtype=torch.bfloat16)
+    if fp8_cache:
+        table = table.to(torch.float8_e4m3fn)
+        assert lookup._host_cache is not None
     lookup.ngram_embedding.weight.data.copy_(table)
     ids = (
         torch.arange(tokens * 16, device="cuda", dtype=torch.int64).view(tokens, 16)
@@ -245,12 +253,12 @@ def test_host_lookup_stream_handoff(tokens):
         return result
 
     result = run()
-    expected = table[ids.cpu()].reshape(tokens, -1)
+    expected = table.bfloat16()[ids.cpu()].reshape(tokens, -1)
     torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         result = run()
     ids.add_(7).remainder_(256)
     graph.replay()
-    expected = table[ids.cpu()].reshape(tokens, -1)
+    expected = table.bfloat16()[ids.cpu()].reshape(tokens, -1)
     torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)

@@ -382,7 +382,12 @@ def _ensure_cuda_compiler() -> None:
 
 # Groups compiled without -use_fast_math, to match torch or Python bit for bit.
 PRECISE_MATH_GROUPS = frozenset(
-    {"eagle_harness_tree", "eagle_harness_policy", "eagle4_candidate"}
+    {
+        "eagle_harness_tree",
+        "eagle_harness_policy",
+        "eagle4_candidate",
+        "ple_host_gather",
+    }
 )
 
 # Kernel groups: each entry produces one .so file.
@@ -391,6 +396,7 @@ PRECISE_MATH_GROUPS = frozenset(
 # The 4-tuple form lets a kernel append nvcc flags on top of the global set —
 # e.g., fused_topk_topp needs ``--expt-extended-lambda`` for CUB lambdas.
 KERNEL_GROUPS = [
+    ("ple_host_gather", [CUDA_CSRC_DIR / "ple_host_gather.cu"], []),
     (
         "rope",
         [

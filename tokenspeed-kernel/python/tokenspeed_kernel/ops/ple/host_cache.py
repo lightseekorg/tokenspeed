@@ -1,0 +1,233 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+from __future__ import annotations
+
+import torch
+from tokenspeed_kernel._triton import triton
+from tokenspeed_kernel.ops.ple._host_cache_triton import (
+    _ple_fill_staged_kernel,
+    _ple_gather_staged_tail_kernel,
+)
+from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.thirdparty.cuda.ple_host_gather import ple_staged_gather
+
+
+class PLEHostCache:
+    """Read FP8 PLE rows through an HBM cache owned by one lookup table.
+
+    Use :meth:`create` to select the supported table layout and device. The
+    table bytes must remain immutable between gathers, or the owner must call
+    :meth:`invalidate` before updating the table.
+    """
+
+    HEADS = 16
+    HEAD_DIM = 160
+    TILE_TOKENS = 64
+    MIN_TOKENS = 256
+    MAX_TOKENS = ((1 << 31) - 1) // HEADS
+    _FILL_ROWS = 16
+    _BLOCK_D = 256
+
+    def __init__(self, slot_count: int, launch):
+        self.slot_count = slot_count
+        self._slot_bits = slot_count.bit_length() - 1
+        self._launch = launch
+        self._tags: torch.Tensor | None = None
+        self._hot: torch.Tensor | None = None
+        self._winners: torch.Tensor | None = None
+        self._fill_stream: torch.cuda.Stream | None = None
+        self._fill_done: torch.cuda.Event | None = None
+        self._pending = False
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        slot_count: int,
+        table: torch.Tensor,
+        ngram_heads: int,
+        output_dtype: torch.dtype,
+        table_shards: int,
+        vocab_start: int,
+        vocab_end: int,
+        device: torch.device,
+    ) -> PLEHostCache | None:
+        """Select a cache for a complete pinned FP8 table.
+
+        Args:
+            slot_count: Number of power-of-two cache slots, or zero to disable.
+            table: Pinned host table of shape ``[vocab_rows, head_dim]``.
+            ngram_heads: Number of row IDs per input token.
+            output_dtype: Compute dtype of the gather output.
+            table_shards: Number of ranks owning pieces of the table.
+            vocab_start: Inclusive global ID of the first local row.
+            vocab_end: Exclusive global ID of the last local row.
+            device: GPU consuming the table and owning the cache.
+
+        Returns:
+            A cache with lazily allocated buffers, or ``None`` if ineligible.
+        """
+        if slot_count == 0:
+            return None
+        if not 2 <= slot_count <= 1 << 22 or slot_count & (slot_count - 1):
+            raise ValueError(
+                "PLE cache slots must be zero or a power of two in [2, 4194304]"
+            )
+        platform = current_platform()
+        if (
+            not platform.is_nvidia
+            or device.type != "cuda"
+            or torch.cuda.get_device_capability(device)[0] not in (9, 10)
+            or table_shards != 1
+            or ngram_heads != cls.HEADS
+            or table.ndim != 2
+            or table.shape[1] != cls.HEAD_DIM
+            or table.dtype != torch.float8_e4m3fn
+            or output_dtype != torch.bfloat16
+            or vocab_start != 0
+            or not 0 < vocab_end <= min(table.shape[0], (1 << 31) - 1)
+            or table.device.type != "cpu"
+            or not table.is_pinned()
+            or not table.is_contiguous()
+        ):
+            return None
+        launch = ple_staged_gather()
+        return cls(slot_count, launch) if launch is not None else None
+
+    def can_gather(self, ids: torch.Tensor) -> bool:
+        return (
+            self.MIN_TOKENS <= ids.shape[0] <= self.MAX_TOKENS
+            and not torch.cuda.is_current_stream_capturing()
+        )
+
+    def invalidate(self) -> None:
+        """Finish the in-flight fill and invalidate the current table contents."""
+        if self._pending:
+            self._fill_done.synchronize()
+        self._pending = False
+        self._tags = self._hot = self._winners = None
+
+    def gather(
+        self,
+        table: torch.Tensor,
+        ids: torch.Tensor,
+        out: torch.Tensor,
+        *,
+        vocab_end: int,
+        scale: float,
+    ) -> torch.Tensor:
+        """Fill ``out`` with a scalar-scaled FP8 lookup.
+
+        Args:
+            table: The immutable pinned FP8 table selected by ``create``.
+            ids: Contiguous CUDA int64 IDs of shape ``[tokens, 16]``.
+            out: Contiguous CUDA BF16 output of shape ``[tokens * 16, 160]``.
+            vocab_end: Exclusive upper bound on IDs owned by the table.
+            scale: FP32 dequantization factor for the table.
+
+        Returns:
+            The supplied output, ready on the current stream. A side stream
+            copies staged misses into the cache for the next cached lookup.
+        """
+        device = ids.device
+        stream = torch.cuda.current_stream(device)
+        if self._fill_stream is None:
+            self._fill_stream = torch.cuda.Stream(device=device)
+            self._fill_done = torch.cuda.Event()
+        if self._pending:
+            stream.wait_event(self._fill_done)
+        if self._tags is None:
+            self._tags = torch.full(
+                (self.slot_count,), -1, dtype=torch.int32, device=device
+            )
+            self._hot = torch.empty(
+                (self.slot_count, self.HEAD_DIM), dtype=table.dtype, device=device
+            )
+            self._winners = torch.empty_like(self._tags)
+            for buf in (self._tags, self._hot, self._winners):
+                buf.record_stream(self._fill_stream)
+
+        query = ids.view(-1)
+        rows = query.numel()
+        # Flat row indices are also stored in int32 winner slots.
+        if not self.MIN_TOKENS <= ids.shape[0] <= self.MAX_TOKENS:
+            raise ValueError("PLE cache lookup size is outside its supported range")
+        staged = torch.empty_like(out, dtype=table.dtype)
+        misses = torch.empty_like(query, dtype=torch.int32)
+        self._winners.fill_(-1)
+        address = current_platform().device_visible_data_ptr(table)
+        aligned_tokens = ids.shape[0] // self.TILE_TOKENS * self.TILE_TOKENS
+        self._launch(
+            address,
+            ids,
+            self._tags,
+            self._hot.view(torch.uint8),
+            out,
+            misses,
+            scale,
+            aligned_tokens,
+            vocab_end,
+            staged.view(torch.uint8),
+            self._winners,
+        )
+        aligned_rows = aligned_tokens * self.HEADS
+        tail = rows - aligned_rows
+        if tail:
+            _ple_gather_staged_tail_kernel[(triton.cdiv(tail, self._FILL_ROWS),)](
+                address,
+                query[aligned_rows:],
+                self._tags,
+                self._hot,
+                out[aligned_rows:],
+                staged[aligned_rows:],
+                misses[aligned_rows:],
+                self._winners,
+                tail,
+                vocab_end,
+                aligned_rows,
+                scale,
+                self._slot_bits,
+                R=self._FILL_ROWS,
+                D=self.HEAD_DIM,
+                C=self._BLOCK_D,
+                num_warps=4,
+            )
+
+        self._fill_stream.wait_stream(stream)
+        for buf in (query, staged, misses):
+            buf.record_stream(self._fill_stream)
+        with torch.cuda.stream(self._fill_stream):
+            _ple_fill_staged_kernel[(triton.cdiv(rows, self._FILL_ROWS),)](
+                query,
+                staged,
+                misses,
+                self._winners,
+                self._tags,
+                self._hot,
+                rows,
+                D=self.HEAD_DIM,
+                R=self._FILL_ROWS,
+                BLOCK=self._BLOCK_D,
+                num_warps=4,
+            )
+            self._fill_done.record(self._fill_stream)
+        self._pending = True
+        return out

@@ -1243,6 +1243,11 @@ object:
 - `ple_offload_embedding`: keep the PLE table in pinned host memory when `true`
   or GPU memory when `false`. When omitted, TokenSpeed enables offloading on
   NVIDIA CUDA and disables it on other platforms.
+- `TOKENSPEED_PLE_HOST_CACHE_SLOTS` controls the per-table HBM cache for
+  scalar-scaled FP8 host lookups with 16 n-gram heads and head dimension 160
+  on a single NVIDIA rank. The default is 524288 slots (84 MiB of cache
+  storage and metadata per PLE table, plus temporary miss staging). Set it
+  to zero to disable the cache.
 - `index_share_for_mtp_iteration: true`: reuse the QSA top-k selection across
   MTP steps. Checkpoints that already set
   `text_config.index_share_for_mtp_iteration=true` do not need this flag.

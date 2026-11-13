@@ -290,6 +290,9 @@ class EnvFloat(EnvField):
 class Envs:
     # fmt: off
 
+    # PLE embedding lookup
+    TOKENSPEED_PLE_HOST_CACHE_SLOTS = EnvInt(524288)
+
     # Model download
     TOKENSPEED_USE_MODELSCOPE = EnvBool(False)
 

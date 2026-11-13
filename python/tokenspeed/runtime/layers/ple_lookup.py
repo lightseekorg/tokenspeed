@@ -29,6 +29,8 @@ import torch
 from torch import nn
 
 if TYPE_CHECKING:
+    from tokenspeed_kernel.ops.ple.host_cache import PLEHostCache
+
     from tokenspeed.runtime.distributed.mapping import Mapping
     from tokenspeed.runtime.layers.vocab_parallel_embedding import (
         VocabParallelEmbedding,
@@ -180,6 +182,7 @@ class PLELookup(nn.Module):
         self.offload_embedding = offload
         self._checkpoint_weight_scale = 1.0
         self._gather_stream: torch.cuda.Stream | None = None
+        self._host_cache: PLEHostCache | None = None
         self._pending: PendingLookup | None = None
         with torch.device("meta") if offload else nullcontext():
             self.ngram_embedding = VocabParallelEmbedding(
@@ -199,6 +202,22 @@ class PLELookup(nn.Module):
             if offload
             else self.ngram_embedding.weight.device
         )
+        if offload and storage_dtype == torch.float8_e4m3fn:
+            from tokenspeed_kernel.ops.ple.host_cache import PLEHostCache
+
+            from tokenspeed.runtime.utils.env import envs
+
+            shard = self.ngram_embedding.shard_indices
+            self._host_cache = PLEHostCache.create(
+                slot_count=envs.TOKENSPEED_PLE_HOST_CACHE_SLOTS.get(),
+                table=self.ngram_embedding.weight,
+                ngram_heads=ngram_heads,
+                output_dtype=output_dtype,
+                table_shards=self.ngram_embedding.tp_size,
+                vocab_start=shard.org_vocab_start_index,
+                vocab_end=shard.org_vocab_end_index,
+                device=self._compute_device,
+            )
         self.register_buffer(
             "ngram_embedding_scale",
             (
@@ -271,7 +290,13 @@ class PLELookup(nn.Module):
         completion = None
         if self.offload_embedding:
             out = self.allocate_lookup_buffer(gathered_ids.shape[0], ids.device)
-            background = max(layout.physical_extents) < 4096
+            cache = self._host_cache
+            use_cache = (
+                cache is not None
+                and self.ngram_embedding_scale is None
+                and cache.can_gather(gathered_ids)
+            )
+            background = use_cache or max(layout.physical_extents) < 4096
             stream = execution_stream
             if background:
                 if self._gather_stream is None:
@@ -281,7 +306,16 @@ class PLELookup(nn.Module):
                 gathered_ids.record_stream(stream)
                 out.record_stream(stream)
             with torch.cuda.stream(stream):
-                self.gather_host(gathered_ids, out, background=background)
+                if use_cache:
+                    cache.gather(
+                        self.ngram_embedding.weight,
+                        gathered_ids,
+                        out.view(-1, self.head_dim),
+                        vocab_end=self.ngram_embedding.shard_indices.org_vocab_end_index,
+                        scale=self._checkpoint_weight_scale,
+                    )
+                else:
+                    self.gather_host(gathered_ids, out, background=background)
                 completion = torch.cuda.Event()
                 completion.record(stream)
         else:
@@ -417,6 +451,8 @@ class PLELookup(nn.Module):
         overlap_start = max(row_start, tp_start)
         overlap_end = min(row_end, tp_end)
         if overlap_start < overlap_end:
+            if self._host_cache is not None:
+                self._host_cache.invalidate()
             destination = overlap_start - tp_start
             source = overlap_start - row_start
             rows = overlap_end - overlap_start
