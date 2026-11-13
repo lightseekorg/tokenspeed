@@ -955,7 +955,9 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
             // Startup is not generation serving: its failure reaches the
             // final error handler after cleanup.
             drop(event_loop);
-            call("close")?;
+            if let Err(close_error) = call("close") {
+                tracing::error!(%close_error, "rank cleanup also failed");
+            }
             return Err(error);
         }
     };
