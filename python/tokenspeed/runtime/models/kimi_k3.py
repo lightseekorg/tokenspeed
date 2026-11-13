@@ -92,6 +92,7 @@ from tokenspeed_kernel.ops.gemm import (
 from tokenspeed_kernel.ops.moe import (
     latent_moe_decode_pipeline_available,
     latent_moe_input_projections,
+    try_latent_moe_input_projections,
 )
 from tokenspeed_kernel.ops.moe._cute_dsl.latent_down import KimiK3LatentDownOp
 from tokenspeed_kernel.ops.moe._cute_dsl.latent_tail import multicast_backend_available
@@ -3148,6 +3149,26 @@ class KimiLinearMoE(nn.Module):
                     "Shared-expert communication must be prepared before forward"
                 )
 
+        # The fused front runs before the fork scope: the scope's fork event is
+        # recorded at entry, so an auxiliary branch is only ordered after work
+        # enqueued on main before this point, and the shared down projection on
+        # the branch below reads the front's shared_activated.
+        fused_inputs = None
+        if (
+            num_tokens > 0
+            and shared_communication is None
+            and hidden_states.is_cuda
+            and self.shared_experts.gate_up_proj.weight.dtype == hidden_states.dtype
+        ):
+            fused_inputs = try_latent_moe_input_projections(
+                hidden_states,
+                self.gate.weight,
+                self.routed_expert_down_proj.weight,
+                self.shared_experts.gate_up_proj.weight,
+                gate_clamp=self.shared_experts.act_fn.beta,
+                up_clamp=self.shared_experts.act_fn.linear_beta,
+            )
+
         with self.stream_fork.scope(
             enable=get_is_cuda_graph_phase(), overlap=get_is_capture_mode()
         ) as fork:
@@ -3162,8 +3183,12 @@ class KimiLinearMoE(nn.Module):
                     fork.record_checkpoint()
                     shared_output = self.shared_experts(shared_input, down_out=None)
 
+            shared_activated = None
             if num_tokens > 0:
-                router_logits = self.gate(hidden_states)
+                if fused_inputs is None:
+                    router_logits = self.gate(hidden_states)
+                else:
+                    router_logits, routed_input, shared_activated = fused_inputs
                 topk = self.topk(
                     hidden_states,
                     router_logits,
@@ -3172,7 +3197,8 @@ class KimiLinearMoE(nn.Module):
                     expert_location_dispatch_info=None,
                     out=routing_out,
                 )
-                routed_input, _ = self.routed_expert_down_proj(hidden_states)
+                if fused_inputs is None:
+                    routed_input, _ = self.routed_expert_down_proj(hidden_states)
                 topk_ids = topk.topk_ids
                 topk_weights = topk.topk_weights
             else:
@@ -3299,9 +3325,14 @@ class KimiLinearMoE(nn.Module):
             if shared_communication is None:
                 with fork.branch():
                     if num_tokens > 0:
-                        shared_output = self.shared_experts(
-                            hidden_states, down_out=None
-                        )
+                        if shared_activated is None:
+                            shared_output = self.shared_experts(
+                                hidden_states, down_out=None
+                            )
+                        else:
+                            shared_output = kimi3_shared_down_projection(
+                                shared_activated, self.shared_experts.down_proj.weight
+                            )
 
         if num_tokens == 0:
             return prefix_sum
@@ -5514,6 +5545,14 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 "Kimi-K3 encoder-only mode cannot capture target hidden states."
             )
         self.language_model.set_dflash_layers_to_capture(layer_ids)
+
+    def stores_capture_taps(self, ctx: ForwardContext) -> bool:
+        """Whether the language model's forward stores the draft's taps itself."""
+        if self.language_model is None:
+            raise AttributeError(
+                "Kimi-K3 encoder-only mode cannot capture target hidden states."
+            )
+        return self.language_model.stores_capture_taps(ctx)
 
     def set_target_context_capture(
         self, layer_ids: list[int], stream: str, hidden_size: int
