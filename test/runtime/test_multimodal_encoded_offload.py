@@ -267,6 +267,41 @@ def test_prefix_hit_past_the_image_still_drops_a_published_encoding() -> None:
 
 
 @pytest.mark.parametrize("deepstack", [False, True])
+def test_consumed_image_cannot_supply_a_fresh_same_hash_request(
+    deepstack: bool,
+) -> None:
+    embedder, calls = MultimodalEmbedder(), []
+    old = _image(9, 0, 3)
+    _apply(embedder, [[old]], [0], [4], [PLACEHOLDER] * 4, calls, deepstack)
+    assert old.feature is None and old.encoded is None
+
+    fresh = _image(9, 0, 3)
+    ctx = _ctx([[old], [fresh]], [4, 0], [2, 4])
+    plan = embedder._plan(ctx)
+    assert plan.misses_by_modality[Modality.IMAGE] == [fresh]
+    assert not plan.aliases_by_canonical
+
+    embeds, kwargs = _apply(
+        embedder,
+        [[old], [fresh]],
+        [4, 0],
+        [2, 4],
+        [1, 1] + [PLACEHOLDER] * 4,
+        calls,
+        deepstack,
+    )
+    rows = torch.arange(4, dtype=torch.float32)
+    expected = torch.stack([torch.full_like(rows, 9), rows] * 2, dim=1)
+    torch.testing.assert_close(embeds[2:].cpu(), expected)
+    if deepstack:
+        torch.testing.assert_close(
+            kwargs["input_deepstack_embeds"][2:].cpu(), -expected
+        )
+    assert calls == [1, 1]
+    assert fresh.feature is None and fresh.encoded is None
+
+
+@pytest.mark.parametrize("deepstack", [False, True])
 def test_jointly_encoded_items_free_their_device_memory_once_all_are_prefilled(
     deepstack: bool,
 ) -> None:

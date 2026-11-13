@@ -934,6 +934,11 @@ class DeepSelectTopK:
                 lane,
             )
 
+            # An underfilled window has no k-th value yet. Keep lower scores
+            # eligible until reconstruction has collected enough candidates.
+            if eff_k < topk:
+                threshold_bits = cutlass.Uint32(NEG_INF_BITS)
+
         # ---- Main rounds over the remaining permuted segments ----
         # Warp w visits positions first_linear + m * 16 of the pseudo-random
         # order; the segment ids are tracked incrementally for the round being

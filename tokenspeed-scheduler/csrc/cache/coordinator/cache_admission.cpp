@@ -664,8 +664,18 @@ private:
                 // and each Device tail copy lands on a fresh Device block in
                 // its source block's own bucket, exactly like a restored slot.
                 shape_need_[i].assign(buckets, 0);
-                blocks_needed_[i] = geometry_[i].BlocksNeededFor(*demand.table, demand) +
-                                    tailBlocksNeeded(i, shape_need_[i]) + zeroStateBlocksNeeded(i);
+                std::int32_t growth_blocks = geometry_[i].BlocksNeededFor(*demand.table, demand);
+                if (const auto* sparse = std::get_if<SparseSuffix>(&demand.extent); sparse && sparse->head_blocks > 0) {
+                    // A matched sink is installed before growth: Device hits
+                    // are shared, Host hits and tail copies are charged below.
+                    const auto prefix_tokens =
+                        std::max(prefix_.device.num_common_tokens, prefix_.host.num_common_tokens);
+                    const auto grain = geometry_[i].BlockGranularity();
+                    const auto prefix_blocks = prefix_tokens / grain + (prefix_tokens % grain != 0);
+                    growth_blocks = geometry_[i].BlocksNeededFor(std::max(demand.table->NumBlocks(), prefix_blocks),
+                                                                 *sparse, demand.reserve_tokens);
+                }
+                blocks_needed_[i] = growth_blocks + tailBlocksNeeded(i, shape_need_[i]) + zeroStateBlocksNeeded(i);
                 if (!prefix_.host.per_group.empty()) {
                     collectHostHitBuckets(i, shape_need_[i]);
                 }
@@ -1254,7 +1264,8 @@ void CacheCoordinator::ReleaseStateInputs(std::span<BlockTable> tables) {
 std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
     PrefixProbe&& prefix, std::span<const GroupDemand> demands, const RequestProgress& progress,
     std::span<std::vector<CacheBlockRef>> copy_in_blocks, std::optional<CopyInPoint> copy_in_point,
-    std::optional<std::uint64_t> request_access_epoch, bool evict_blocks_past_segments, const std::string& session_id) {
+    std::optional<std::uint64_t> request_access_epoch, bool evict_blocks_past_segments, const std::string& session_id,
+    const std::string& cache_group_id) {
     ProfileSpan profile_span{"CacheCoordinator::Admit"};
     _assert(demands.size() == groups_.size(), "demands/groups size mismatch");
     for (std::size_t i = 0; i < demands.size(); ++i) {
@@ -1293,8 +1304,12 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
     const std::uint64_t access_epoch = request_access_epoch.has_value() ? *request_access_epoch : ++next_access_epoch_;
     // Registered before anything is acquired or published under the epoch.
     SessionAccess session_access;
-    if (!request_access_epoch && !session_id.empty()) {
-        session_access = SessionAccess{*this, access_epoch, sessionTag(session_id)};
+    if (!request_access_epoch) {
+        if (!cache_group_id.empty()) {
+            session_access = SessionAccess{*this, access_epoch, cacheOwnerTag(cache_group_id, cache_group_tags_)};
+        } else if (!session_id.empty()) {
+            session_access = SessionAccess{*this, access_epoch, cacheOwnerTag(session_id, session_tags_)};
+        }
     }
     // The boundaries inside a block, per tier: the hitter's table ends in a
     // private copy of the Device tail's partial block, or in a fresh page the
@@ -1905,7 +1920,10 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::CompactLoneRe
                 }
             }
         }
-        for (std::int32_t slot = first_slot; slot < table.NumBlocks(); ++slot) {
+        for (std::int32_t slot = allocator.KeptHeadBlocks() > 0 ? 0 : first_slot; slot < table.NumBlocks(); ++slot) {
+            if (slot >= allocator.KeptHeadBlocks() && slot < first_slot) {
+                continue;
+            }
             const CacheBlockRef& block = table.Blocks()[static_cast<std::size_t>(slot)];
             if (!block) {
                 continue;

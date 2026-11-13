@@ -236,7 +236,7 @@ class TestWeightLoaderPrefetch:
         with tempfile.TemporaryDirectory() as tmpdir:
             files = self._make_files(tmpdir, count=2, size=100)
             loader = DefaultModelLoader(LoadConfig())
-            source = DefaultModelLoader.Source(tmpdir, revision=None)
+            source = DefaultModelLoader.Source(tmpdir, revision=None, weight_files=None)
             with (
                 mock.patch.object(
                     loader, "_prepare_weights", return_value=(tmpdir, files[::-1], True)

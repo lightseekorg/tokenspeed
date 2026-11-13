@@ -52,6 +52,7 @@ from tokenspeed_kernel.ops.conv._triton.sconv import (
     _inkling_ring_commit_kernel,
     _inkling_ring_sconv_decode_kernel,
     _inkling_ring_sconv_prefill_kernel,
+    select_decode_config,
     select_prefill_config,
 )
 from tokenspeed_kernel.platform import pdl_enabled
@@ -65,6 +66,7 @@ __all__ = [
     "_inkling_ring_sconv_decode_kernel",
     "_inkling_ring_sconv_prefill_kernel",
     "dflash2_grouped_conv",
+    "select_decode_config",
     "select_prefill_config",
     "triton_causal_conv1d_prefill",
     "triton_causal_conv1d_prefill_qkv",

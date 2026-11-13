@@ -42,7 +42,7 @@ from tokenspeed.runtime.utils.triton import tl, triton
 # Valid until the pool is replaced; a rebind must call forget_kv_buffer_ptrs().
 # ---------------------------------------------------------------------------
 
-_cached_kv_ptrs: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+_cached_kv_ptrs: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
 
 def forget_kv_buffer_ptrs() -> None:
@@ -53,7 +53,7 @@ def forget_kv_buffer_ptrs() -> None:
 def _get_kv_buffer_ptrs(
     k_buffers: list[torch.Tensor],
     v_buffers: list[torch.Tensor],
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build or retrieve cached per-layer buffer pointer tensors."""
     cache_key = k_buffers[0].data_ptr()
     if cache_key in _cached_kv_ptrs:
@@ -65,8 +65,22 @@ def _get_kv_buffer_ptrs(
     v_ptrs = torch.tensor(
         [b.data_ptr() for b in v_buffers], dtype=torch.int64, device=device
     )
-    _cached_kv_ptrs[cache_key] = (k_ptrs, v_ptrs)
-    return k_ptrs, v_ptrs
+    geometry = torch.tensor(
+        [
+            (
+                k.shape[1] if k.ndim == 4 else 1,
+                k.stride(0),
+                k.stride(-3),
+                v.stride(0),
+                v.stride(-3),
+            )
+            for k, v in zip(k_buffers, v_buffers, strict=True)
+        ],
+        dtype=torch.int64,
+        device=device,
+    )
+    _cached_kv_ptrs[cache_key] = (k_ptrs, v_ptrs, geometry)
+    return k_ptrs, v_ptrs, geometry
 
 
 # ---------------------------------------------------------------------------
@@ -88,7 +102,7 @@ def _fused_norm_rope_scatter_kernel(
     kv_stride_layer,
     k_norm_weight_stride_layer,
     cos_sin_stride_pos,
-    dst_row_stride,  # k_buffer[layer].stride(0), same for all layers
+    dst_geometry_ptr,  # [layers, page_size / K,V page and row strides]
     total_ctx,
     n_layers: tl.constexpr,
     num_kv_heads: tl.constexpr,
@@ -106,11 +120,11 @@ def _fused_norm_rope_scatter_kernel(
     if ctx_id >= total_ctx or layer_id >= n_layers:
         return
 
-    position = tl.load(positions_ptr + ctx_id)
+    position = tl.load(positions_ptr + ctx_id).to(tl.int64)
     eps = tl.load(eps_ptr + layer_id).to(tl.float32)
     dst_slot = tl.load(loc_ptr + ctx_id).to(tl.int64)
 
-    kv_base = kv_ptr + ctx_id * kv_stride_ctx + layer_id * kv_stride_layer
+    kv_base = kv_ptr + ctx_id.to(tl.int64) * kv_stride_ctx + layer_id * kv_stride_layer
     k_base = kv_base + head_id * head_dim
     v_base = kv_base + kv_size + head_id * head_dim
 
@@ -124,8 +138,15 @@ def _fused_norm_rope_scatter_kernel(
     else:
         k_buf_ptr = tl.load(k_buf_ptrs_ptr + layer_id).to(tl.pointer_type(tl.bfloat16))
         v_buf_ptr = tl.load(v_buf_ptrs_ptr + layer_id).to(tl.pointer_type(tl.bfloat16))
-    k_write = k_buf_ptr + dst_slot * dst_row_stride + head_id * head_dim
-    v_write = v_buf_ptr + dst_slot * dst_row_stride + head_id * head_dim
+    geometry = dst_geometry_ptr + layer_id * 5
+    page_size = tl.load(geometry)
+    k_page_stride = tl.load(geometry + 1)
+    k_row_stride = tl.load(geometry + 2)
+    v_page_stride = tl.load(geometry + 3)
+    v_row_stride = tl.load(geometry + 4)
+    page, row = dst_slot // page_size, dst_slot % page_size
+    k_write = k_buf_ptr + page * k_page_stride + row * k_row_stride + head_id * head_dim
+    v_write = v_buf_ptr + page * v_page_stride + row * v_row_stride + head_id * head_dim
 
     offs = tl.arange(0, BLOCK_HD)
     mask_hd = offs < head_dim
@@ -212,8 +233,7 @@ def _fused_norm_rope_stacked_scatter(
     kv_size = num_kv_heads * head_dim
     half_rotary_dim = rotary_dim // 2
     BLOCK_HD = triton.next_power_of_2(head_dim)
-    k_ptrs, v_ptrs = _get_kv_buffer_ptrs(k_buffers, v_buffers)
-    dst_row_stride = k_buffers[0].stride(0)
+    k_ptrs, v_ptrs, geometry = _get_kv_buffer_ptrs(k_buffers, v_buffers)
 
     is_fp8 = k_buffers[0].dtype == torch.float8_e4m3fn
 
@@ -230,7 +250,7 @@ def _fused_norm_rope_stacked_scatter(
         kv.stride(1),
         k_norm_weight.stride(0),
         cos_sin_cache.stride(0),
-        dst_row_stride,
+        geometry,
         total_ctx,
         n_layers,
         num_kv_heads,
@@ -285,7 +305,7 @@ def _fused_norm_rope_kernel_stacked(
 
     position = tl.load(positions_ptr + ctx_id)
     eps = tl.load(eps_ptr + layer_id).to(tl.float32)
-    kv_base = kv_ptr + ctx_id * kv_stride_ctx + layer_id * kv_stride_layer
+    kv_base = kv_ptr + ctx_id.to(tl.int64) * kv_stride_ctx + layer_id * kv_stride_layer
     k_base = kv_base + head_id * head_dim
     v_base = kv_base + kv_size + head_id * head_dim
     k_write = (

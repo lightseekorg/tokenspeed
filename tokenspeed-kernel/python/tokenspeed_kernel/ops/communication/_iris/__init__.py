@@ -38,6 +38,9 @@ logger = logging.getLogger(__name__)
 
 MIN_HEAP_BYTES = 256 << 20
 HEAP_HEADROOM_BYTES = 16 << 20
+# Heap bytes owners reserve before the heap exists (reserve_heap), by owner:
+# get_or_create_context adds them to whatever size its caller planned.
+_reserved: dict[str, int] = {}
 _context = None
 _heap_size: int | None = None
 _allocator_type: str | None = None
@@ -134,10 +137,25 @@ def maps_world() -> bool | None:
     return None if _spans_hosts is None else _unmapped_reason is None
 
 
+def reserve_heap(owner: str, nbytes: int) -> None:
+    """Reserve ``nbytes`` of the shared heap for ``owner``, replacing its
+    earlier reservation. The heap is created with every reservation on top of
+    the size its creator planned, so call this before the heap exists: a live
+    heap does not grow."""
+    if _context is not None:
+        raise RuntimeError(
+            f"{owner} reserved {nbytes} bytes of the Iris heap after it was "
+            "created; reserve before preparing communication buffers"
+        )
+    _reserved[owner] = int(nbytes)
+
+
 def get_or_create_context(*, heap_size: int):
     """Create the shared context at its initial capacity, or return it unchanged.
 
-    Configured heap capacity takes precedence over the caller's initial size.
+    The initial capacity is ``heap_size`` plus every reservation
+    (``reserve_heap``). A configured heap capacity takes precedence over that
+    sum.
     The torch allocator enforces capacity as states allocate their buffers;
     vmem_chunked grows the heap on demand instead. A world left undecided, as
     when the heap is used without distributed initialization, is decided here:
@@ -151,7 +169,16 @@ def get_or_create_context(*, heap_size: int):
             raise RuntimeError(
                 f"One Iris heap cannot map this world: {_unmapped_reason}"
             )
-        size = _heap_size if _heap_size is not None else heap_size
+        # A configured size is the whole heap, as without reservations: the
+        # torch allocator then fails the first allocation past it, while
+        # vmem_chunked grows on demand.
+        size = (
+            _heap_size
+            if _heap_size is not None
+            else heap_size + sum(_reserved.values())
+        )
+        if _reserved:
+            logger.info(f"Iris heap: {size} bytes, of which reserved {dict(_reserved)}")
         allocator_type = _allocator_type
         if allocator_type is None and _spans_hosts:
             # Only vmem_chunked maps peers on other hosts.
@@ -159,6 +186,22 @@ def get_or_create_context(*, heap_size: int):
         options = {} if allocator_type is None else {"allocator_type": allocator_type}
         _context = iris.iris(
             heap_size=size, device=torch.cuda.current_device(), **options
+        )
+    return _context
+
+
+def existing_context():
+    """The shared context, which the communication preparation created.
+
+    Raises:
+        RuntimeError: The heap does not exist yet. Buffers taken from it are
+            reserved beforehand (``reserve_heap``); the heap itself is sized
+            only by the preparation that creates it.
+    """
+    if _context is None:
+        raise RuntimeError(
+            "The Iris heap does not exist yet: prepare the communication "
+            "buffers first"
         )
     return _context
 

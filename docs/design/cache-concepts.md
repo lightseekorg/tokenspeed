@@ -38,7 +38,8 @@ the group's nature switches on this value and nothing else:
 * **`full_history`** (`kFull`) — rows of token history that stay resident for
   the request's whole life; prefix-closed and shared.
 * **`sliding_window`** (`kSlidingWindow`) — rows of token history of which
-  only the trailing `sliding_window_tokens` stay resident; the rest slide out
+  the trailing `sliding_window_tokens` and optional leading `sink_tokens`
+  stay resident; the middle slides out
   (`ExpiredBlocksAt`). A trailing window of token rows (DeepSeek V4.1's SWA
   kv and compressor tails) is this kind whatever a kernel calls its buffer.
 * **`state`** (`kState`) — recurrent/conv state whose block holds the state
@@ -269,6 +270,22 @@ the scheduler re-feeds is the retention window itself rather than a second
 declared number. False means an ordinary cached window; the flag changes
 nothing else about the group's geometry.
 
+A cached sliding group can declare nonnegative `sink_tokens`. Prefix reuse
+requires both the leading sink blocks and the trailing window; overlapping
+ranges count once. Sink retention is incompatible with bounded replay, which
+cannot regenerate the leading rows. A sink group's retention window must
+cover at least one prefix page, so a partial-page publication and its copy-in
+remain one contiguous tail. PD allocates and transfers the unmatched sink
+blocks beside the retained suffix, preserving any already-matched sink pages.
+
+Publishing and acquiring a boundary refresh its sink blocks with the window.
+Within an access epoch, eviction keeps the sink after the window and the
+window's later blocks after its middle blocks. Other prefix chains still
+compete by LRU. Host L2 uses the same retained ranges and suffix rule: a
+missing Device sink lowers the common split to its prefix page, and the Host
+must supply every required group's data from that split. Host duplicate
+reclamation also requires Device coverage of sink blocks.
+
 #### Block tables and exported page IDs
 
 The block tables the scheduler emits are logically *indexed*: row *i* of a
@@ -278,8 +295,14 @@ entry *values*, however, are **`CacheBlock` ids** — handles to the physical
 storage the cache layer allocated. The scheduler owns allocation, so its output names that storage directly.
 Consumers outside the cache layer treat the ids as opaque.
 Export preserves every logical slot, including holes in a released prefix.
-Every slot below the released prefix is null, so export skips reading those
-slots and they hold no active parent.
+For a sliding group with `H = ceil(sink_tokens / block_granularity)`,
+retention releases `[H, F)` instead of `[0, F)`, where `F` is the table's
+reclaim frontier. The allocator owns this interpretation: sink slots keep
+their ordinary `CacheBlockRef` ownership, participate in active-parent
+accounting and compaction, and survive retraction snapshots. Export skips
+only null slots in that interval. A sink group exports its full absolute row
+so the head and trailing window both reach the runtime; zero-sink groups
+keep the compact trailing-row export.
 On PD decode admission, a partial leading history block is a landing slot
 for the prefill peer. Installing its private writable block also rewinds
 the released-prefix frontier to include that slot: the outgoing destination
@@ -1534,9 +1557,17 @@ Its responsibilities:
   the group indexes), so the scheduler keeps no residency counters of its own
   — only the token descriptor the event carries and whether that event is
   currently out. A mutation only marks its boundary for reconcile;
-  `DrainKvEvents` reconciles each marked boundary against its residency and
-  reports the net change (published exactly while fully resident), then drops
-  descriptors of boundaries with no cached child. Nothing is decided
+  `DrainKvEvents` publishes a boundary while all Full/history entries reside
+  on Device, using the existing closed-entry count; auxiliary State/SWA do not
+  gate local residency. `KvEventPrefixView` exposes only ancestor-complete
+  prefixes: it withdraws descendants when an ancestor leaves and republishes
+  resident descendants when it returns. This changes routing visibility, not
+  physical eviction. Actual prefix admission still checks all required groups.
+  KV events require a Full/history group: State-only, SWA-only and State + SWA
+  layouts must disable events. No structural ancestors are synthesized.
+  Descriptors survive while any Device entry remains, including auxiliary
+  entries excluded from routing. Host eviction retains all-group residency
+  checks. Nothing is decided
   mid-`Admit`, so one admission may evict a boundary's last cached copy and
   then store the request's own copy without any ordering hazard.
   Admission may pre-hash prompt pages beyond the computed prefix. An early
@@ -1853,6 +1884,9 @@ on the largest required working set, not the smallest memory-derived limit;
 zero-budget geometry probes keep their existing demand-sized behavior. Final
 rebind repeats resident sizing under the graph-adjusted budget.
 
+Backends report recipe-reserved workspace through `fixed_workspace_bytes()`.
+Stateless leaves report zero. Composites sum their children and any owned allocations.
+
 Ordinary recipes pin one CacheBlock per group in each parent, so a group's
 stride does not shrink with its layer count or cache dtype. For example,
 equal-sized layers split into groups of one and four need a padding fraction
@@ -1979,13 +2013,17 @@ contains exactly one window and no rows are dropped. Encoder metadata may be
 reused only when its visible history also starts there; equal row counts alone
 do not make the two windows interchangeable.
 
-Block drafters (DFLASH / DSPARK) write their KV at the target's cache
-locations, so their storage *is* a target-owned group whatever mask their
-layers apply. Drafts with their own attention layers ride the target's
-full-history group: `resolve_cache_layer_types` labels every block-draft layer
-full-history, and `check_block_drafter_storage` verifies at startup that the
-group the draft bound is one the target's own layers share — a target without
-a full-history group has nothing for a block drafter to borrow. DeepSeek
+Block drafters with their own attention layers derive context-KV write
+locations from their own cache router. A recipe may store their fields in a
+target-owned full-history group or a separate cached sliding group whose
+window and sink cover the draft's visibility. `check_block_drafter_storage`
+validates that binding; a private sliding group is allocated, matched,
+transferred and reclaimed through the ordinary scheduler path. Its fields
+may share physical planes with other groups, with K and V as consecutive
+fields within each page. Such noncontiguous history views retain their page
+axis, and the pool and attention kernels address each page using its stride.
+
+DeepSeek
 V4.1's same-checkpoint DSpark has no draft attention layers of its own; its
 per-stage context rows are extra fields of the target's SWA group on the last
 target layer, addressed by the target's SWA slots, so they are transferred
@@ -2672,10 +2710,9 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
   at startup, checking that the group's retention covers the mask (see
   *Storage vs. visibility*). Backends index their learned geometry by the
   bound id with no fallback (`CacheGroupGeometry.granularity_of` raises on
-  unknown ids). Block drafters ride a target-owned group whatever mask their
-  layers apply: the full-history group for drafts with their own attention
-  layers (`check_block_drafter_storage`), the SWA group's extra fields for
-  V4.1's same-checkpoint DSpark. ✓
+  unknown ids). Block drafters with attention layers use either target-owned full history
+  or a draft-owned sliding group checked by `check_block_drafter_storage`;
+  V4.1's same-checkpoint DSpark uses the target SWA group's extra fields. ✓
 * Capacity has three shapes and no more, and one place to read the scheduler's
   concurrency (see *The cache pipeline* above). ✓
 * Kernel geometry does not live under the recipes package. DeepSeek V4.1's byte
@@ -2852,6 +2889,43 @@ complete normally. Reusing an ended ID creates a new owner generation. The
 returned demotion count includes only blocks whose LRU epoch actually changed.
 Already-demoted blocks are not counted again unless later access promotes them.
 
+An independent set of requests may additionally carry `cache_group_id`. When
+nonempty, it owns the request's cached prefixes instead of `cache_session_id`;
+the session still identifies only its own request lifecycle. Cache group and
+session IDs are separate namespaces, so ending a cut or a session whose ID
+happens to equal the group ID cannot age that group's cache. Prefix matching
+continues to use token content and the normal model/cache namespace: the group
+ID never proves a hit, changes request tokens, or enables implicit appends.
+Every first-admission attempt, including the retry after lone-request
+compaction, carries the same session and group IDs so relocating hit blocks
+cannot change the cache owner selected by the request.
+
+`demote_cache_groups([{cache_group_ids, ended}])` applies the same bounded LRU
+hint to explicit group owners. Callers must not translate each member's
+completion into group completion. With no reliable group-end notification,
+omitting the hint is safe: group caches remain subject to ordinary eviction,
+without a group-wide pin or retention promise. Reuse across different groups
+or by an ungrouped request removes exclusive group ownership, as for sessions.
+The existing state-checkpoint and replay constraints are unchanged. Restricted
+State models still require the P/fused role's in-forward checkpoint flag and
+legal model-defined grain; the D role does not publish those checkpoints.
+A group tag does not synthesize missing intermediate states, pin every cut's
+prefix, or guarantee a hit. See `scheduler.md` for the input-checkpoint boundary
+and retention rules.
+
+Owner registries hold weak references. Request access handles and live cache
+entries own the tags; reclamation releases them. Periodic sweeping bounds
+expired registry keys, including workloads that create a new group per batch.
+Both group ingress and the group demotion API enforce the existing 4096-byte
+ID bound, and control batches contain at most 4096 nonempty IDs. Group identity
+must include the caller's model/weight epoch when IDs can repeat across weight
+updates; normal cache flushing and storage-version isolation still apply.
+
+`GetAdmission.cache_group_contract` advertises this ownership contract as `1`.
+The appended field defaults to `0` when an older native engine omits it; callers
+requiring group ownership must verify support on every participating rank before
+sending grouped requests. A newer wire crate alone does not prove engine support.
+
 `GetAdmission` reports live request slots, available/total physical LCM blocks,
 Host capacity, waiting/retracted counts, and a contract-versioned capacity curve.
 Contract version 1 rounds token lengths up to 1024-token buckets and uses the
@@ -2861,3 +2935,75 @@ must not derive physical demand by dividing token counts by a page size. Snapsho
 collection is an explicit control operation; the allocator scan is not added to
 each forward.
 The transport identifies each reply's DP rank, independent of reply arrival order.
+
+### Shared-store publication receipts
+
+`get_shared_prefix_publication` is a bounded, read-only control query. Its body
+contains a nonempty `query_id` (at most 256 UTF-8 bytes), actual `input_ids` (at
+most 1,048,576 i32 tokens), and an exact positive `max_prefix_tokens` no larger
+than that input. Each attention-DP reply echoes the nonce and identifies
+`dp_rank`; a router must select the DP that actually processed the producer and
+reject a late reply with a different nonce. Capability is advertised separately
+as `GetAdmissionReqOutput.shared_prefix_publication_contract == 1` and
+`shared_prefix_storage_enabled == true`; absent fields on an older engine mean
+unsupported, not successful publication.
+
+Contract version 1 requires exact prompt-end publication. With State groups,
+`--enable-state-checkpoint-in-forward` can omit the prompt-end checkpoint in
+favor of an earlier checkpoint (for example, 20 instead of 22 with a page of
+4 and a prefill budget of 8). This combination advertises
+`shared_prefix_storage_enabled == false` and publication queries return
+`unsupported` immediately, even for aligned boundaries or under pressure.
+Routers must reject grouped publication waiting during their capability check;
+turn the flag off to use this contract with unrestricted State groups. Ordinary
+local caching and shared-store QUERY/GET/PUT remain available. A future protocol
+that waits for an earlier checkpoint must report the actual published boundary
+and verify every State and KV dependency there; it cannot relabel that receipt
+as publication of the full prompt. Models without State groups are unaffected.
+
+A `published` result requires successful **retired PUT or accepted GET** receipts, agreed across
+the producer's cache-owning replica ranks, for every immutable object needed at
+that exact prefix: full KV history, each non-replayable window, and every State
+checkpoint. Device hits, Host hits, prefill completion, pending D2H and queued
+PUTs are not publication evidence. A GET counts only after replica agreement,
+native retirement, and acceptance into Host cache; detached or cancelled reads
+do not count. This lets a later producer reuse confirmed historical objects
+without writing them back merely to manufacture a receipt. The query uses the normal chained token
+hashes and checkpoint geometry; a group identifier cannot establish a hit.
+`confirmed_prefix_tokens` equals the requested boundary only for `published`,
+and is zero otherwise. A boundary that violates restricted State checkpoint
+geometry is `unsupported`, not `pending`: retrying cannot make it publishable.
+This query neither creates intermediate checkpoints nor changes model numerics.
+
+Receipts have the storage metadata budget, hold no block references, and are
+forgotten on all-tier cache flush, which increments `cache_epoch`. The reply
+also includes the executor's actual `storage_namespace`, including weight
+versions. Known object failures invalidate matching receipts. `pressure` reports
+blocked storage progress, `too_large` reports a complete dependency larger than
+the metadata budget, and `unsupported` reports a missing publication path or an
+unsupported checkpoint boundary. A router must not retry `unsupported` or
+`too_large`; it must bound its polling deadline for `pending` and fall back to
+ordinary execution on unavailable storage or cancellation. Queries keep no
+per-request wait state.
+
+A receipt proves past publication, not permanent residency: shared-store
+eviction can occur after the reply, and bounded receipt eviction can produce
+conservative misses. Consumers still perform the ordinary storage query/GET and
+validate complete dependencies before using any cache. This protocol requires
+a real shared KV Store with compatible key namespaces and cache layouts;
+Mooncake PD transport or weight transport alone is insufficient.
+
+Cross-instance discovery of a non-page-aligned checkpoint also needs its token
+boundary: an empty consumer cannot infer another instance's tail index from a
+content-addressed store. `shared_prefix_tokens` supplies at most 64 positive
+candidate boundaries shorter than this request. The native matcher hashes each
+candidate from this request's actual input and considers it only within the
+ordinary replay/logprob cacheable bound. Hints are request-local, do not insert
+global tail metadata, do not limit an existing longer local hit, and confer no
+ownership or residency. Candidate enumeration skips boundaries that violate
+any State group's checkpoint granularity, including hinted tails and page
+boundaries inside a restricted segment. A hint cannot make an otherwise
+unusable State checkpoint eligible for an optimistic storage query.
+Query/GET still requires all Full, State and window
+objects; diverging prompts therefore cannot reuse a checkpoint solely because
+they share a group or boundary length.

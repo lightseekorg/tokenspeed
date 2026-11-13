@@ -1126,6 +1126,9 @@ setup(
         "tokenspeed_kernel.thirdparty.cuda": [
             "objs/**/*.so",
             "csrc/kimi3_router.cu",
+            # Vendored FlashInfer/Cake Kimi-K3 front programs, JIT-built like the router.
+            "csrc/kimi3_latent_front/*.cu",
+            "csrc/kimi3_latent_front/*.h",
             # Vendored Lamport protocol and FFI headers for the optional JIT extension.
             "csrc/tvm_ffi_utils.h",
             "csrc/include/**/*.h",
@@ -1136,10 +1139,12 @@ setup(
             "LICENSE",
             "README.md",
         ],
-        # Optional JIT adapter for fused AllGather quantization.
+        # Optional JIT adapters: fused AllGather quantization and the
+        # stand-alone block-scaled batched GEMM.
         "tokenspeed_kernel.thirdparty.flashinfer": [
             "allgather_quant.cu",
             "sm90_moe.patch",
+            "trtllm_block_scaled_bmm.cu",
         ],
         # Vendored MiniMax MSA CuTe sources: cute/ has no __init__.py (it is
         # loaded via the upstream sys.path bootstrap), so ship it as data.

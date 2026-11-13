@@ -152,7 +152,12 @@ def _prepare_muse_backend(world_size, projection, moe, *, expert_tp_size):
         config=SimpleNamespace(
             hidden_size=8192, moe_hidden_size=4096, num_experts_per_tok=8
         ),
-        model=SimpleNamespace(iris_state=None, layers=[layer]),
+        # The model's config says whether its monokernels share the heap.
+        model=SimpleNamespace(
+            iris_state=None,
+            layers=[layer],
+            config=SimpleNamespace(decode_monokernel=False),
+        ),
     )
     assert MuseSparkForConditionalGeneration.prepare_communication_runtime(owner, 8192)
     state = owner.model.iris_state
@@ -226,6 +231,7 @@ def _muse_owned_qkvg_worker(rank, world_size, device):
         torch.ones((64,), device=device, dtype=torch.float32),
         0.0,
         eps,
+        round_before_rope=False,
     )
 
     def make_inputs(rows):

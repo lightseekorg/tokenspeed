@@ -356,6 +356,7 @@ fn toy_grammars() -> Grammars {
         any_whitespace: true,
         compile_timeout: Duration::from_secs(30),
         max_retries: 2,
+        json_framing: None,
     })
     .unwrap()
 }
@@ -4640,9 +4641,9 @@ async fn flushes_and_weight_updates_run_on_every_data_parallel_rank() {
             ("UpdateWeightFromDiskReqOutput", true)
         ]
     );
-    for rank in 0..2 {
+    for rank in &engine.ranks[..2] {
         assert_eq!(
-            *engine.ranks[rank].device_ops.lock().unwrap(),
+            *rank.device_ops.lock().unwrap(),
             ["UpdateWeightFromDiskReqInput"]
         );
     }

@@ -456,7 +456,7 @@ Python object), from which the forward thread builds what a forward reads.
 What a launched forward reads freezes: no attribute rebinding, no in-place
 edit, no releasing a resource it holds while it may still run. Results cross
 back **only** as the launched forward's result, which the commit reads once
-its copy event landed, as plain lists built from the landed host copies.
+its copy event landed, as metadata lists and CPU logprob buffer views.
 
 The plan's cache ops follow the same capture rule: the data plane adapts
 them once into immutable Device and storage tuples, and
@@ -468,6 +468,13 @@ the executor's completion poll.
 `execution/device.py` states this in full, including the registered
 exceptions — grammar matchers, whose ownership splits by path and whose
 overlap the drain rules in Principle 4 break instead, and multimodal items.
+
+Completion queries export large logprob columns as CPU buffer views, after
+the result's copy event has landed. The host validates dtype, rank, shape
+and token-ID narrowing, then copies into Rust-owned vectors while Python
+buffer guards retain the storage. No borrowed array escapes the query or
+outlives the result's reuse lease. Buffer guards release on errors and
+unwinding too; no manual export/release pair belongs in the event loop.
 
 ## Principle 2: the event loop is a coordinator, nothing more
 

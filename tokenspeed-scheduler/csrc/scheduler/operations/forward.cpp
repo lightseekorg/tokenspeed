@@ -497,7 +497,7 @@ std::optional<CacheCoordinator::AdmissionResult> Scheduler::admit(
     std::optional<std::uint64_t> request_access_epoch, bool evict_blocks_past_segments) {
     std::optional<CacheCoordinator::AdmissionResult> result =
         coordinator_.Admit(std::move(prefix), demands, progress, copy_in_blocks, copy_in_point, request_access_epoch,
-                           evict_blocks_past_segments, /*session_id=*/{});
+                           evict_blocks_past_segments, /*session_id=*/{}, /*cache_group_id=*/{});
     if (!result) {
         feedback.admission_failed = true;
         return std::nullopt;
@@ -548,6 +548,7 @@ std::optional<CacheCoordinator::AdmissionResult> Scheduler::admitWithKvEventTrac
         registerKvEventPublication(request, cache_progress.prefix_hashes, *progress.completed_pages);
     } else {
         registerKvEventPrefixPages(request, cache_progress.prefix_hashes,
+                                   static_cast<std::int32_t>(cache_progress.prefix_hashes.size()),
                                    static_cast<std::int32_t>(cache_progress.prefix_hashes.size()));
     }
     // Alone, the request has no release to wait for: when whole segments
@@ -721,6 +722,8 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
                     demands[i].extent = SparseSuffix{
                         .extent_tokens = request->PrefillSize(),
                         .first_block = std::max(hit_blocks, retained_begin / block_granularity),
+                        .head_blocks =
+                            group.sink_tokens / block_granularity + (group.sink_tokens % block_granularity != 0),
                     };
                 }
             }
@@ -758,10 +761,10 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
         source == fsm::PrefillSource::kLocal ? promptEndCopyInPoint(*request, hit_tokens) : std::nullopt;
     std::optional<CacheCoordinator::AdmissionResult> admission;
     if (writes_checkpoint) {
-        admission = coordinator_.Admit(CacheCoordinator::PrefixProbe{match.probe},
-                                       chunk_demands(tokens_this_round, true), RequestProgress{},
-                                       /*copy_in_blocks=*/{}, copy_in_point, /*request_access_epoch=*/std::nullopt,
-                                       /*evict_blocks_past_segments=*/false, request->SessionId());
+        admission = coordinator_.Admit(
+            CacheCoordinator::PrefixProbe{match.probe}, chunk_demands(tokens_this_round, true), RequestProgress{},
+            /*copy_in_blocks=*/{}, copy_in_point, /*request_access_epoch=*/std::nullopt,
+            /*evict_blocks_past_segments=*/false, request->SessionId(), request->CacheGroupId());
         if (!admission && must_complete) {
             // Ending at the checkpoint would leave a carried prompt
             // incomplete: it waits, as for any block that does not fit.
@@ -780,7 +783,8 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
             others_hold_pages ? std::move(match.probe) : CacheCoordinator::PrefixProbe{match.probe};
         admission = coordinator_.Admit(std::move(probe), chunk_demands(tokens_this_round, false), RequestProgress{},
                                        /*copy_in_blocks=*/{}, copy_in_point, /*request_access_epoch=*/std::nullopt,
-                                       /*evict_blocks_past_segments=*/!others_hold_pages, request->SessionId());
+                                       /*evict_blocks_past_segments=*/!others_hold_pages, request->SessionId(),
+                                       request->CacheGroupId());
     }
     // Lone-request compaction (docs/design/scheduler.md §1.4) at a first
     // admission: a Submitted request holds no pages, so nothing of its own is
@@ -794,14 +798,16 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
                 return coordinator_.Admit(std::move(match.probe), chunk_demands(tokens_this_round, false),
                                           RequestProgress{}, /*copy_in_blocks=*/{}, copy_in_point,
                                           /*request_access_epoch=*/std::nullopt,
-                                          /*evict_blocks_past_segments=*/true, request->SessionId());
+                                          /*evict_blocks_past_segments=*/true, request->SessionId(),
+                                          request->CacheGroupId());
             });
     }
     if (!admission) {
         feedback.admission_failed = true;
         return FirstChunkOutcome{};
     }
-    registerKvEventPrefixPages(*request, match.candidate_prefix_hashes, 0);
+    registerKvEventPrefixPages(*request, match.candidate_prefix_hashes, 0,
+                               static_cast<std::int32_t>(match.candidate_prefix_hashes.size()));
     request->HoldSessionAccess(std::move(admission->session_access));
     const bool completes_prefill = tokens_this_round == unscheduled;
     const std::int32_t decode_reserve = completes_prefill ? decode_input_tokens : 0;

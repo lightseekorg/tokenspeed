@@ -111,6 +111,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
     FetchContent_MakeAvailable(googletest)
 
     add_executable(tokenspeed_scheduler_tests
+        tests/cpp/test_kv_event_prefix_view.cpp
         tests/cpp/test_prefix_hasher.cpp
         tests/cpp/test_profile_span.cpp
         tests/cpp/test_prefix_index.cpp
@@ -120,6 +121,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_cache_block_ref.cpp
         tests/cpp/test_full_attn_group.cpp
         tests/cpp/test_swa_group.cpp
+        tests/cpp/test_swa_sink.cpp
         tests/cpp/test_match_host_pages.cpp
         tests/cpp/test_cache_coordinator.cpp
         tests/cpp/test_checkpoint_retention.cpp

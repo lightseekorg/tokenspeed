@@ -147,6 +147,14 @@ class CachePoolBinding:
         """The nodes this one composes (graph support, pointer walk, binding); leaves: ()."""
         return ()
 
+    def fixed_workspace_bytes(self) -> int:
+        """Return recipe-reserved workspace bytes, excluding the shared arena.
+
+        Stateless leaves return zero. Owners add their allocations to the
+        children's total, without counting graph metadata or arena views.
+        """
+        return sum(child.fixed_workspace_bytes() for child in self.child_backends())
+
     def validate_cache_pool(self, cache_pool: CachePool) -> None:
         """Raise if this node or any child cannot rebind to ``cache_pool``."""
         for backend in self.child_backends():

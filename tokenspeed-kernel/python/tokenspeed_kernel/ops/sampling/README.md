@@ -1,5 +1,26 @@
 # Sampling kernels
 
+## CUDA fused Top-K / Top-P
+
+The multi-block Top-K radix pass publishes each CTA's histogram updates before
+thread 0 increments `finished_block_cnt`. Every writer executes a device fence,
+then all threads meet at a CTA barrier before that completion notification.
+The last CTA can then scan the complete histogram, choose the next bucket and
+clear the histogram without racing a late writer. The barrier after the
+completion notification only distributes the last-CTA decision within a block;
+it cannot order another CTA's earlier writes.
+
+Accurate bucket counts bound both the survivor buffers and the K-element output.
+An undercount can incorrectly trigger `len == k` early termination and write more
+than K results. In the fused workspace, the last row's index output is adjacent
+to the Top-P counters, so this can corrupt a Top-P input pointer even though the
+two stages have disjoint workspace regions and correct stream dependencies.
+The same synchronization is required for eager execution and graph replay.
+
+`test/nvidia/ops/test_sampling_topk_sync.py` runs the real radix kernel with
+delayed global histogram atomics. It checks bucket counts, stable Top-K results
+and Top-P counter integrity for uniform and K+1 boundary inputs in both modes.
+
 ## Distributed argmax (`cute_dsl.py`)
 
 `distributed_argmax` returns the greedy token of logits left sharded over the

@@ -51,13 +51,15 @@ use ts_control::eplb::SlotMoves;
 use ts_control::{
     event_loop::{DataPlane, DataPlaneError, Dispatch, DpRound},
     ingress::Admission,
-    output::{ForwardResult, HistorySeeds, LogprobPlan, NgramWindows, TopLogprobs},
+    output::{ForwardResult, HistorySeeds, LogprobPlan, NgramWindows},
 };
 use ts_pd::LandedRequest;
 use ts_scheduler::{profile, CacheEvent, CacheEventKind, ExecutionPlan};
 use ts_wire::{control::ProfileReq, ControlRequest, Wire};
 
 use crate::{pd::Streams, LAUNCHER_FAILURE};
+
+mod result_buffers;
 
 /// A forward the forward thread launched, by launch order.
 pub type ForwardId = u64;
@@ -950,16 +952,22 @@ fn answer<T>(
     }
 }
 
+type TopLogprobBuffers = (Py<PyAny>, Py<PyAny>);
+
 type Completed = (
     Vec<i32>,
     Vec<i32>,
-    Option<Vec<f64>>,
+    Option<Py<PyAny>>,
     Option<Vec<i32>>,
     Option<Vec<Vec<i32>>>,
     Option<(u64, f64)>,
     Option<Vec<i32>>,
-    Option<(Option<Vec<f64>>, Option<TopLogprobs>, Option<TopLogprobs>)>,
-    Option<Vec<f64>>,
+    Option<(
+        Option<Py<PyAny>>,
+        Option<TopLogprobBuffers>,
+        Option<TopLogprobBuffers>,
+    )>,
+    Option<Py<PyAny>>,
 );
 
 /// A launched forward's results, once they landed.
@@ -977,18 +985,23 @@ fn complete(plane: &Bound<'_, PyAny>, launched: &Py<PyAny>) -> PyResult<ForwardR
     ): Completed = plane.call_method1("complete", (launched,))?.extract()?;
     let (input_token_logprobs, input_top_logprobs, output_top_logprobs) =
         logprobs.unwrap_or_default();
+    let py = plane.py();
+    let floats = |value: Py<PyAny>| result_buffers::float_vector(value.bind(py));
+    let top = |(values, ids): TopLogprobBuffers| {
+        result_buffers::top_logprobs(values.bind(py), ids.bind(py))
+    };
     Ok(ForwardResult {
         output_tokens,
         output_lengths,
-        output_logprobs,
-        output_token_cumulative_probs,
+        output_logprobs: output_logprobs.map(floats).transpose()?,
+        output_token_cumulative_probs: output_token_cumulative_probs.map(floats).transpose()?,
         nan_flags,
         next_input_ids,
         serving_compiles,
         grammar_terminated_at,
-        input_token_logprobs,
-        input_top_logprobs,
-        output_top_logprobs,
+        input_token_logprobs: input_token_logprobs.map(floats).transpose()?,
+        input_top_logprobs: input_top_logprobs.map(top).transpose()?,
+        output_top_logprobs: output_top_logprobs.map(top).transpose()?,
     })
 }
 

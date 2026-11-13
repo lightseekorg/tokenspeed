@@ -252,6 +252,14 @@ def get_drafter_impl(
     # (1) Eagle-like MTP (e.g. DeepSeek) stays on Eagle in eagle.py;
     # (2) Vanilla MTP (e.g. Inkling) with multi-layer weights stays on Mtp in mtp.py.
     if spec_algo == "DSPARK":
+        from tokenspeed.runtime.execution.drafter.inkling2 import Inkling2DSpark
+        from tokenspeed.runtime.models.inkling2_mtp import (
+            Inkling2ForConditionalGenerationMTP,
+        )
+
+        if isinstance(model, Inkling2ForConditionalGenerationMTP):
+            return Inkling2DSpark
+
         from tokenspeed.runtime.execution.drafter.deepseek_v41_dspark import (
             DeepseekV41DSpark,
         )
