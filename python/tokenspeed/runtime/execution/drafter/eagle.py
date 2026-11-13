@@ -979,13 +979,13 @@ class Eagle(HiddenStateDrafter):
             if decode_plan
             else []
         )
-        # Each decode-steps capture follows a step 0 over a dummy extend of its request count: a step-0 bucket at that count, else one token per request.
+        # Decode-steps dummy: the count's step-0 bucket, else one token per request.
         dummy = {bs: bs for _, bs in decode_plan}
         for bucket, bs in sorted(first_plan, reverse=True):
             if bs in dummy:
                 dummy[bs] = bucket
         self.release_extend_graphs()
-        # Sized for the whole plan, so a later full capture reuses what a probe allocated.
+        # Sized for the whole plan: a full capture reuses what a probe allocated.
         self._allocate_extend_buffers(
             capture,
             tokens=max([bucket for bucket, _ in first_plan] + list(dummy.values())),

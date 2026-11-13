@@ -58,10 +58,10 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
 
-# CUDA-graph memory projection series of a drafter's extend-round graphs: step 0 (--enable-drafter-prefill-graph) and the decode steps.
+# Extend-round graph series: step 0 (--enable-drafter-prefill-graph), decode steps.
 EXTEND_STEP0_SERIES = "prefill:drafter-step0"
 EXTEND_DECODE_SERIES = "prefill:drafter-decode"
-# The largest request count an extend round's decode steps are recorded at: rounds admit a few requests each, and a round with more runs them eager.
+# Rounds admit a few requests each; one with more runs its decode steps eager.
 EXTEND_DECODE_MAX_REQUESTS = 16
 
 

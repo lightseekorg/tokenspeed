@@ -224,7 +224,7 @@ def test_the_capture_records_the_sampled_entries_in_ladder_order(monkeypatch) ->
 
     # Widths 112, 96, 80 and 48 are the probe's positions 0, 1, 2 and 4.
     first = [(b, n) for b in (112, 96, 80, 48) for n in (1, 2, 3)]
-    # A request count no step-0 graph takes runs its dummy step 0 over one token per request.
+    # A count no step-0 graph takes runs its dummy step 0 over a token per request.
     assert events == [
         *[("first step", b, n) for b, n in first],
         ("eager step 0", 4, 4),
@@ -436,7 +436,7 @@ def test_a_pure_extend_replays_the_smallest_fitting_bucket(monkeypatch) -> None:
 
 
 def test_a_step_0_count_past_the_decode_steps_runs_them_eager(monkeypatch) -> None:
-    # With the decode steps recorded up to 2 requests, a step-0 graph at 3 replays step 0 alone.
+    # Decode steps recorded up to 2 requests: a step-0 graph at 3 replays step 0 alone.
     monkeypatch.setattr(eagle_module, "EXTEND_DECODE_MAX_REQUESTS", 2)
     drafter = _captured(monkeypatch, [16], lambda _bucket: [1, 2, 3])
 
@@ -471,7 +471,7 @@ def test_rounds_a_graph_did_not_bake_run_eager(monkeypatch) -> None:
     )
     sharded = extend_input(drafter, [8], query_shard=shard)
     assert drafter._extend_graph_route(1, sharded) is None
-    # Target hidden rows that are not one per input row: step 0 eager, the decode steps replay.
+    # Hidden rows not one per input row: step 0 eager, the decode steps replay.
     short = extend_input(drafter, [8], hidden=torch.randn(1, WIDTH))
     assert drafter._extend_graph_route(1, short) == eagle_module._ExtendRoute(
         None, True
