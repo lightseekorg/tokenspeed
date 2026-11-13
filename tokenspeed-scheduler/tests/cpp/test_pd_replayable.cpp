@@ -37,6 +37,7 @@ struct LandingCase {
     std::int32_t hit;
     std::int32_t prompt;
     std::int32_t decode_width;
+    std::int32_t sink_tokens{0};
 };
 
 void PrintTo(const LandingCase& c, std::ostream* out) {
@@ -74,6 +75,7 @@ protected:
         };
         add("full", c.v41 ? 64 : 4, AttnKind::kFull, std::nullopt, false);
         add("swa", c.v41 ? 64 : 8, AttnKind::kSlidingWindow, c.v41 ? 128 : 16, c.replayable);
+        cfg.cache_groups[1].sink_tokens = c.sink_tokens;
         if (c.v41) {
             add("global_r2", 128, AttnKind::kFull, std::nullopt, false);
             add("compressor_tail", 2, AttnKind::kSlidingWindow, 2, true);
@@ -126,6 +128,10 @@ TEST_P(PdReplayableLandingTestSuite, RetainedWindowHasRealLandingPages) {
         const auto first = std::max(0, c.prompt - *group.sliding_window_tokens + 1) / group.block_granularity;
         const auto end = (c.prompt + c.decode_width + group.block_granularity - 1) / group.block_granularity;
         ASSERT_GE(row.size(), static_cast<std::size_t>(end));
+        for (std::int32_t slot = 0; slot < (group.sink_tokens + group.block_granularity - 1) / group.block_granularity;
+             ++slot) {
+            EXPECT_GT(row.at(slot), 0) << "sink logical slot " << slot;
+        }
         if (group.replayable) {
             for (std::int32_t slot = 0; slot < first; ++slot) {
                 EXPECT_EQ(row.at(slot), 0) << group.group_id << " expired logical slot " << slot;
@@ -147,7 +153,12 @@ TEST_P(PdReplayableLandingTestSuite, RetainedWindowHasRealLandingPages) {
 }
 
 INSTANTIATE_TEST_SUITE_P(Cases, PdReplayableLandingTestSuite,
-                         ::testing::Values(LandingCase{"cold", false, true, false, 0, 6, 1},
+                         ::testing::Values(LandingCase{"sink_cold", false, false, false, 0, 128, 1, 2},
+                                           LandingCase{"sink_overlap", false, false, false, 0, 6, 1, 2},
+                                           LandingCase{"sink_hit", false, false, false, 16, 128, 1, 2},
+                                           LandingCase{"sink_tail_hit", false, false, false, 13, 128, 1, 2},
+                                           LandingCase{"sink_disabled", false, false, true, 0, 128, 4, 2},
+                                           LandingCase{"cold", false, true, false, 0, 6, 1},
                                            LandingCase{"tail_same_block", false, true, false, 5, 6, 1},
                                            LandingCase{"tail_cross_block", false, true, false, 5, 9, 1},
                                            LandingCase{"aligned_hit", false, true, false, 8, 9, 1},

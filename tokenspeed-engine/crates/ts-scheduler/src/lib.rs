@@ -34,9 +34,13 @@
 // The crate is the FFI boundary to C++ and the interpreter.
 #![allow(unsafe_code)]
 
+pub mod profile;
+
 use std::ptr::NonNull;
 
 use pyo3::{ffi as pyffi, prelude::*};
+
+use crate::profile::record_scheduler_span;
 
 #[cxx::bridge(namespace = "ts_scheduler")]
 mod ffi {
@@ -47,6 +51,10 @@ mod ffi {
         request_id: String,
         /// Router-only cache retention identity, empty when untracked.
         session_id: String,
+        /// Shared cache owner, empty to retain session ownership.
+        cache_group_id: String,
+        /// Candidate shared-store checkpoints within this prompt.
+        shared_prefix_tokens: Vec<i32>,
         /// Prompt token ids.
         tokens: Vec<i32>,
         /// Generation limit the scheduler reserves for.
@@ -371,6 +379,14 @@ mod ffi {
         has_decode_work: bool,
     }
 
+    /// Bounded historical shared-store publication proof.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct SharedPrefixPublication {
+        status: String,
+        confirmed_prefix_tokens: i32,
+        cache_epoch: u64,
+    }
+
     /// Request and page counts.
     #[derive(Debug, Clone, PartialEq)]
     struct SchedulerSizes {
@@ -456,7 +472,18 @@ mod ffi {
             ended: bool,
         ) -> usize;
         fn demote_session(scheduler: Pin<&mut Scheduler>, session_id: &str, ended: bool) -> usize;
+        fn demote_cache_groups(
+            scheduler: Pin<&mut Scheduler>,
+            cache_group_ids: &[String],
+            ended: bool,
+        ) -> usize;
         fn admission_snapshot(scheduler: &Scheduler, token_step: i32) -> AdmissionSnapshot;
+        fn shared_prefix_storage_enabled(scheduler: &Scheduler) -> bool;
+        fn shared_prefix_publication(
+            scheduler: &Scheduler,
+            input_ids: &[i32],
+            max_prefix_tokens: i32,
+        ) -> Result<SharedPrefixPublication>;
         fn sizes(scheduler: &Scheduler) -> SchedulerSizes;
         fn active_lcm_blocks(scheduler: &Scheduler) -> i32;
         fn probe_prefill_gate(scheduler: &Scheduler) -> PrefillGateProbe;
@@ -482,6 +509,15 @@ mod ffi {
         fn plan_aborts(plan: &ExecutionPlan) -> Vec<SchedulerAbortView>;
         fn plan_cache_ops(plan: &ExecutionPlan) -> Vec<CacheOpView>;
         fn plan_storage_ops(plan: &ExecutionPlan) -> Vec<StorageOpView>;
+
+        /// Install the scheduler's profile span sink, which forwards to
+        /// [`record_scheduler_span`], or remove it.
+        fn set_profile_span_sink(installed: bool);
+    }
+
+    extern "Rust" {
+        /// The C++ scheduler's finished spans, while the sink is installed.
+        fn record_scheduler_span(name: &str, begin_ns: i64, end_ns: i64);
     }
 }
 
@@ -591,6 +627,7 @@ impl Scheduler {
     /// Queue requests for admission. Validation errors reject the entire
     /// batch without inserting any request.
     pub fn submit_requests(&mut self, specs: &[RequestSpec]) -> Result<(), cxx::Exception> {
+        let _span = profile::span("Scheduler::submit_requests");
         ffi::submit_requests(self.pinned(), specs)
     }
 
@@ -603,6 +640,7 @@ impl Scheduler {
         allow_prefill: bool,
         apply_prefill_watermark: bool,
     ) -> ExecutionPlan {
+        let _span = profile::span("Scheduler::next_execution_plan");
         ExecutionPlan(ffi::next_execution_plan(
             self.pinned(),
             allow_prefill,
@@ -613,6 +651,7 @@ impl Scheduler {
     /// Feed forward results back. Fails, applying none of `events`' later
     /// entries, on an event the request's state does not allow.
     pub fn advance(&mut self, events: &[ForwardEvent]) -> Result<(), cxx::Exception> {
+        let _span = profile::span("Scheduler::advance");
         ffi::advance(self.pinned(), events)
     }
 
@@ -623,6 +662,7 @@ impl Scheduler {
         storage: &StorageRound,
         cache_events: &[CacheEvent],
     ) -> Result<(), cxx::Exception> {
+        let _span = profile::span("Scheduler::advance_head");
         let ticks: &[StorageTickView] = storage.tick.as_slice();
         ffi::advance_head(
             self.pinned(),
@@ -638,9 +678,28 @@ impl Scheduler {
         ffi::demote_sessions(self.pinned(), session_ids, ended)
     }
 
+    /// Lower only these groups' exclusive cache entries; never invalidates active blocks.
+    pub fn demote_cache_groups(&mut self, cache_group_ids: &[String], ended: bool) -> usize {
+        ffi::demote_cache_groups(self.pinned(), cache_group_ids, ended)
+    }
+
     /// Lower only this session's exclusive cache entries in the eviction order.
     pub fn demote_session(&mut self, session_id: &str, ended: bool) -> usize {
         ffi::demote_session(self.pinned(), session_id, ended)
+    }
+
+    /// Whether this rank has the complete prefix publication path configured.
+    pub fn shared_prefix_storage_enabled(&self) -> bool {
+        ffi::shared_prefix_storage_enabled(self.get())
+    }
+
+    /// Query exact prefix receipts without waiting or acquiring cache references.
+    pub fn shared_prefix_publication(
+        &self,
+        input_ids: &[i32],
+        max_prefix_tokens: i32,
+    ) -> Result<ffi::SharedPrefixPublication, cxx::Exception> {
+        ffi::shared_prefix_publication(self.get(), input_ids, max_prefix_tokens)
     }
 
     /// Poll native capacity; token_step must be positive.
@@ -651,17 +710,20 @@ impl Scheduler {
     /// Request and physical block counts: a pass over the requests per
     /// state, and the empty-block count, which the pool keeps.
     pub fn sizes(&self) -> SchedulerSizes {
+        let _span = profile::span("Scheduler::sizes");
         ffi::sizes(self.get())
     }
 
     /// Distinct LCM blocks held by running requests' block tables. The
     /// tables keep the count as they change, so reading it walks nothing.
     pub fn active_lcm_blocks(&self) -> i32 {
+        let _span = profile::span("Scheduler::active_lcm_blocks");
         ffi::active_lcm_blocks(self.get())
     }
 
     /// What the prefill-delay vote should publish for this rank.
     pub fn probe_prefill_gate(&self) -> PrefillGateProbe {
+        let _span = profile::span("Scheduler::probe_prefill_gate");
         ffi::probe_prefill_gate(self.get())
     }
 
@@ -700,6 +762,7 @@ impl Scheduler {
     /// The prefix-cache mutations since the last drain, in order; empty
     /// unless the scheduler was configured to record them.
     pub fn drain_kv_events(&mut self) -> Vec<KvEventView> {
+        let _span = profile::span("Scheduler::drain_kv_events");
         ffi::drain_kv_events(self.pinned())
     }
 
@@ -735,6 +798,7 @@ unsafe impl Send for ExecutionPlan {}
 impl ExecutionPlan {
     /// The model batches, in plan order.
     pub fn forward_batches(&self) -> Vec<ForwardBatchView> {
+        let _span = profile::span("ExecutionPlan::forward_batches");
         ffi::plan_forward_batches(&self.0)
     }
 
@@ -783,6 +847,7 @@ impl ExecutionPlan {
 
     /// The cache ops the plan puts in flight, in plan order.
     pub fn cache_ops(&self) -> Vec<CacheOpView> {
+        let _span = profile::span("ExecutionPlan::cache_ops");
         ffi::plan_cache_ops(&self.0)
     }
 

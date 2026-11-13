@@ -76,7 +76,9 @@ public:
                 [&](const DenseGrowth& dense) {
                     return BlocksNeededFor(table, dense.num_tokens + demand.reserve_tokens);
                 },
-                [&](const SparseSuffix& sparse) { return sparseSuffixBlocks(table, sparse, demand.reserve_tokens); },
+                [&](const SparseSuffix& sparse) {
+                    return BlocksNeededFor(table.NumBlocks(), sparse, demand.reserve_tokens);
+                },
                 [&](const StateStep& step) {
                     _assert(!HasTokenSpan() && demand.reserve_tokens == 0, "a StateStep shapes a State group");
                     return (step.kind == StateStep::Kind::kRotate || step.kind == StateStep::Kind::kLand ? 1 : 0) +
@@ -112,7 +114,7 @@ public:
         };
     }
 
-    // Pages [0, result) of the table have fully expired under the group's
+    // Pages [0, result), except retained sink blocks, have expired under the group's
     // retention policy at this progress; kFull never expires and a State
     // group's slots are released by StateStep, not by token retention. This
     // is where the sliding-window token policy meets page arithmetic, so it
@@ -127,27 +129,31 @@ public:
         return skipped <= 0 ? 0 : skipped / BlockGranularity();
     }
 
-private:
-    std::int32_t sparseSuffixBlocks(const BlockTable& table, const SparseSuffix& sparse,
-                                    std::int32_t reserve_tokens) const {
+    // The planner supplies the post-match table length before the hit is
+    // installed; execution supplies the live table length. Both count the
+    // same fresh head and suffix blocks.
+    std::int32_t BlocksNeededFor(std::int32_t table_blocks, const SparseSuffix& sparse,
+                                 std::int32_t reserve_tokens) const {
         // The extent is absolute, so spare rows in the table's last block (a
         // hit's partial tail block the suffix continues right after) do not
         // carry over; a suffix landing beyond the table leaves holes. A
         // suffix that starts past the extent's last block lands nothing: the
         // hit's tail copy already holds the prompt's last block (a tail hit
         // inside it) and the reserve did not reach the next one.
-        _assert(table.NumBlocks() <= sparse.first_block, "sparse suffix overlaps the existing block table");
+        _assert(table_blocks <= sparse.first_block, "sparse suffix overlaps the existing block table");
         _assert(sparse.extent_tokens > 0 && reserve_tokens >= 0,
                 "sparse suffix materialization requires a positive extent");
         const std::int64_t extent = static_cast<std::int64_t>(sparse.extent_tokens) + reserve_tokens;
         _assert(extent <= std::numeric_limits<std::int32_t>::max(), "sparse suffix extent exceeds int32 range");
         const std::int32_t last_block = static_cast<std::int32_t>((extent - 1) / block_granularity_);
-        return std::max(0, last_block - sparse.first_block + 1);
+        return std::max(0, last_block - sparse.first_block + 1) +
+               std::max(0, std::min({sparse.head_blocks, sparse.first_block, last_block + 1}) - table_blocks);
     }
 
+private:
     AcquirePlan planSparseSuffix(const BlockTable& table, const SparseSuffix& sparse,
                                  std::int32_t reserve_tokens) const {
-        const std::int32_t num_blocks = sparseSuffixBlocks(table, sparse, reserve_tokens);
+        const std::int32_t num_blocks = BlocksNeededFor(table.NumBlocks(), sparse, reserve_tokens);
         const std::int64_t extent = static_cast<std::int64_t>(sparse.extent_tokens) + reserve_tokens;
         const std::int32_t logical_blocks =
             static_cast<std::int32_t>((extent + block_granularity_ - 1) / block_granularity_);
@@ -157,6 +163,8 @@ private:
         return AcquirePlan{
             .num_blocks = num_blocks,
             .suffix_start = sparse.first_block,
+            .head_blocks =
+                std::max(0, std::min({sparse.head_blocks, sparse.first_block, logical_blocks}) - table.NumBlocks()),
             .table_blocks_after = logical_blocks,
             .available_tokens_after = logical_blocks * block_granularity_ - sparse.extent_tokens,
         };

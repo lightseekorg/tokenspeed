@@ -132,17 +132,25 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                std::int32_t total_pages, tokenspeed::AttnKind attn_kind,
                std::optional<std::int32_t> sliding_window_tokens, std::int32_t cache_blocks_per_lcm_block,
                tokenspeed::CacheTransferPolicy transfer_policy, std::int32_t shard_count, bool replayable,
-               std::int32_t checkpoint_granularity) {
+               std::int32_t checkpoint_granularity, std::int32_t sink_tokens) {
                 new (self) tokenspeed::CacheGroupConfig{
-                    std::move(group_id), block_granularity,      total_pages, cache_blocks_per_lcm_block,
-                    attn_kind,           sliding_window_tokens,  replayable,  transfer_policy,
-                    shard_count,         checkpoint_granularity,
+                    .group_id = std::move(group_id),
+                    .block_granularity = block_granularity,
+                    .total_pages = total_pages,
+                    .cache_blocks_per_lcm_block = cache_blocks_per_lcm_block,
+                    .attn_kind = attn_kind,
+                    .sliding_window_tokens = sliding_window_tokens,
+                    .sink_tokens = sink_tokens,
+                    .replayable = replayable,
+                    .transfer_policy = transfer_policy,
+                    .shard_count = shard_count,
+                    .checkpoint_granularity = checkpoint_granularity,
                 };
             },
             nb::arg("group_id"), nb::arg("block_granularity"), nb::arg("total_pages"), nb::arg("attn_kind"),
             nb::arg("sliding_window_tokens") = std::nullopt, nb::arg("cache_blocks_per_lcm_block") = 1,
             nb::arg("transfer_policy") = tokenspeed::CacheTransferPolicy::Unspecified, nb::arg("shard_count") = 1,
-            nb::arg("replayable") = false, nb::arg("checkpoint_granularity") = 1)
+            nb::arg("replayable") = false, nb::arg("checkpoint_granularity") = 1, nb::arg("sink_tokens") = 0)
         .def_rw("group_id", &tokenspeed::CacheGroupConfig::group_id)
         .def_rw("block_granularity", &tokenspeed::CacheGroupConfig::block_granularity)
         .def_rw("total_pages", &tokenspeed::CacheGroupConfig::total_pages)
@@ -150,6 +158,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("shard_count", &tokenspeed::CacheGroupConfig::shard_count)
         .def_rw("attn_kind", &tokenspeed::CacheGroupConfig::attn_kind)
         .def_rw("sliding_window_tokens", &tokenspeed::CacheGroupConfig::sliding_window_tokens)
+        .def_rw("sink_tokens", &tokenspeed::CacheGroupConfig::sink_tokens)
         .def_rw("replayable", &tokenspeed::CacheGroupConfig::replayable)
         .def_rw("checkpoint_granularity", &tokenspeed::CacheGroupConfig::checkpoint_granularity)
         .def_rw("transfer_policy", &tokenspeed::CacheGroupConfig::transfer_policy)
@@ -221,6 +230,9 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
     nb::class_<tokenspeed::RequestSpec>(m, "RequestSpec")
         .def(nb::init<>())
         .def_rw("request_id", &tokenspeed::RequestSpec::request_id)
+        .def_rw("session_id", &tokenspeed::RequestSpec::session_id)
+        .def_rw("cache_group_id", &tokenspeed::RequestSpec::cache_group_id)
+        .def_rw("shared_prefix_tokens", &tokenspeed::RequestSpec::shared_prefix_tokens)
         .def_rw("tokens", &tokenspeed::RequestSpec::tokens)
         .def_rw("max_new_tokens", &tokenspeed::RequestSpec::max_new_tokens)
         .def_rw("max_cached_prefix_tokens", &tokenspeed::RequestSpec::max_cached_prefix_tokens);

@@ -222,3 +222,21 @@ def test_shorter_chunk_clears_previous_token_tail(buffers):
     assert ib.extend_prefix_lens_cpu[0].item() == 8
     assert ib.extend_prompt_lens_cpu[0].item() == len(tokens)
     assert ib.input_ids_buf[total:].tolist() == [1] * (ib.max_num_tokens - total)
+
+
+def test_state_writes_take_the_batch_rows_then_the_sink_row(buffers):
+    """A graph replays padded rows too; their state writes land on the sink
+    row, whatever a previous, larger batch left in the buffer."""
+    ib, runtime = buffers
+    scheduler = _scheduler(token_budget=32, mixed=False)
+    for rid in ("a", "b"):
+        _submit(scheduler, rid, [300, 301, 302, 303])
+    _fill(ib, runtime, scheduler.next_execution_plan().forward[0])
+    op = scheduler.next_execution_plan().forward[0]
+    assert op.num_extends() == 0 and len(op.request_ids) == 2
+    ib.state_write_req_pool_indices_buf.fill_(-1)
+    _fill(ib, runtime, op)
+
+    rows = ib.state_write_req_pool_indices_buf.tolist()
+    assert rows[:2] == list(op.request_pool_indices)
+    assert rows[2:] == [PAD_POOL] * (MAX_BS - 2)

@@ -168,6 +168,14 @@ public:
     std::size_t StorageQuarantined() const { return storage_transfers_ ? storage_transfers_->NumQuarantined() : 0; }
     std::size_t StorageNegativeKeys() const { return storage_transfers_ ? storage_transfers_->NumNegativeKeys() : 0; }
     StorageStats GetStorageStats() const;
+    bool SharedPrefixStorageEnabled() const;
+    struct SharedPrefixPublication {
+        std::string status;
+        std::int32_t confirmed_prefix_tokens{0};
+        std::uint64_t cache_epoch{0};
+    };
+    SharedPrefixPublication GetSharedPrefixPublication(std::span<const std::int32_t> tokens,
+                                                       std::int32_t max_prefix_tokens) const;
 
     // Lifecycle counters read the current FSM state; they do not schedule work.
     std::size_t BootstrappingSize() const;
@@ -228,6 +236,9 @@ public:
     std::int32_t HostPoolPinnedBlocks() const { return coordinator_.NumPinnedHostCachedBlocks(); }
     HostCacheStats GetHostCacheStats() const;
     std::size_t DemoteSession(const std::string& id, bool ended) { return coordinator_.DemoteSession(id, ended); }
+    std::size_t DemoteCacheGroups(const std::vector<std::string>& ids, bool ended) {
+        return coordinator_.DemoteCacheGroups(ids, ended);
+    }
     std::size_t DemoteSessions(const std::vector<std::string>& ids, bool ended) {
         return coordinator_.DemoteSessions(ids, ended);
     }
@@ -373,8 +384,9 @@ private:
         ExecutionPlan& plan, AdmissionFeedback& feedback, Request& request, StagedCacheProgress& staged,
         std::span<const GroupDemand> demands, const RequestProgress& progress,
         std::optional<CacheCoordinator::CopyInPoint> copy_in_point, bool evict_blocks_past_segments);
+    // Registers the descriptors of full pages [first_page, past_end_page).
     void registerKvEventPrefixPages(Request& request, std::span<const std::string> prefix_hashes,
-                                    std::int32_t first_page);
+                                    std::int32_t first_page, std::int32_t past_end_page);
     // The descriptors a publication mutates: its full pages from the first it
     // registers an entry under (CacheCoordinator::FirstPublishedPage) and, at
     // a tail, the partial page under its tail hash (token_ids = the rows below
@@ -778,7 +790,8 @@ private:
     // DrainKvEvents reconciles each marked boundary against its residency, so
     // the order of evictions and publications inside one admission does not
     // matter. After a drain, a descriptor exists exactly for the boundaries
-    // with a cached child.
+    // with any Device cached child, including State entries excluded from
+    // routing residency: their later mutations still need the descriptor.
     struct KvEventBoundary {
         KvBlockStoredEvent stored;
         // Position in the prefix chain (page index). Consumers resolve a
@@ -793,6 +806,7 @@ private:
     // order the coordinator touches pages (evictions run suffix-first), so
     // this order carries no meaning; DrainKvEvents sorts the batch.
     std::vector<CacheKey> kv_event_boundaries_to_reconcile_;
+    KvEventPrefixView kv_event_prefix_view_;
 
     // SchedulerConfig::demote_superseded_state_checkpoints where it takes
     // effect (a model with State groups, outside the D role): what finishes

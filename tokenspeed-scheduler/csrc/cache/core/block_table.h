@@ -149,7 +149,9 @@ private:
     }
     void appendAll(std::uint32_t group_id, std::vector<CacheBlockRef>&& blocks) {
         page_ids_.reserve(page_ids_.size() + blocks.size());
-        parents_.reserve(parents_.size() + blocks.size());
+        // parents_ keeps geometric growth: decode appends a block or two per
+        // round, and an exact reserve would reallocate and move every
+        // ParentRef of a long table on each append.
         for (const CacheBlockRef& block : blocks) {
             page_ids_.push_back(ResolvedPageId(group_id, block));
             parents_.emplace_back(active_parents_, block);
@@ -199,12 +201,13 @@ private:
     // page_ids_[i] is blocks_[i]'s kernel page id, 0 for a null slot.
     std::vector<std::int32_t> page_ids_{};
     // parents_[i] counts blocks_[i]'s LCM parent active; empty for a null
-    // slot or an unbound table. Slots below the released prefix are null.
+    // slot or an unbound table. Released slots exclude the allocator's kept head.
     std::vector<ParentRef> parents_{};
     // Unconsumed capacity at the logical tail. This may span multiple blocks
     // when admission preallocates a later decode/MTP step.
     std::int32_t available_tokens_{0};
-    // Slots below this frontier have released their request ownership.
+    // Slots below this frontier, except the allocator's kept head, have
+    // released their request ownership.
     // Installing a private block into a hole below the frontier rewinds it
     // to that slot (see SwapInFreshBlock). A sliding group's table keeps a
     // null hole at every slid-out slot, so reclaim cannot infer this frontier

@@ -71,7 +71,7 @@ void AllocateAndRelease() {
             for (int sample = -1; sample < samples; ++sample) {
                 BlockPool pool(parents, {packing});
                 pool.RegisterGroup(0, packing, buckets);
-                GroupAllocator allocator(packing, 0, buckets);
+                GroupAllocator allocator(packing, 0, buckets, 0);
                 auto seeds = pool.AcquireBlocks(0, fragmented * packing, std::vector<std::int32_t>(buckets, 0));
                 Require(seeds.size() == static_cast<std::size_t>(fragmented * packing), "seeding failed");
                 for (auto& seed : seeds) {

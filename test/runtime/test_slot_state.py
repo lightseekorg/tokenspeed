@@ -707,6 +707,14 @@ def test_drafter_slot_state_is_complete():
     _assert_slot_state_complete(eagle, exporter=eagle, slot_domains={POOL_ROWS})
 
 
+def test_native_block_drafter_slot_state_is_complete(tmp_path):
+    from test.runtime.test_inkling2_drafter import build_native_drafter
+
+    drafter, _, _, _, _ = build_native_drafter(tmp_path, MAX_BS, "cpu", {}, 40)
+    _assert_slot_state_complete(drafter, exporter=drafter, slot_domains={POOL_ROWS})
+    assert drafter.slot_state_bytes() == 0
+
+
 def test_backend_slot_state_is_complete():
     inkling = _inkling()
     _assert_slot_state_complete(inkling, exporter=inkling, slot_domains={POOL_ROWS})

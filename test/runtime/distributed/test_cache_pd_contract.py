@@ -252,6 +252,24 @@ def test_contract_distinguishes_checkpoint_granularity() -> None:
     assert payload["group_specs"][1]["checkpoint_granularity"] == 4096
 
 
+def test_contract_serializes_sink_retention() -> None:
+    spec = _group_spec(
+        "swa", "sliding_window", "full_suffix", sliding_window_tokens=128
+    )
+    ordinary = _contract((spec,), (_field("swa", "layer.0.kv"),))
+    sink = replace(ordinary, group_specs=(replace(spec, sink_tokens=16),))
+    assert ordinary.to_wire_bytes() != sink.to_wire_bytes()
+    payload = json.loads(sink.to_wire_bytes())
+    assert payload["group_specs"][0]["sink_tokens"] == 16
+    assert CacheGroupSpec(**payload["group_specs"][0]) == sink.group_specs[0]
+    assert sink.plan == ordinary.plan
+    with pytest.raises(CacheContractError, match="sliding_window_tokens >= prefix"):
+        replace(
+            sink,
+            group_specs=(replace(spec, sink_tokens=16, sliding_window_tokens=1),),
+        )
+
+
 def _two_plane_lcm_plan(num_lcm_blocks: int) -> CacheMemoryPlan:
     plane_bytes = 512
     lcm_block_bytes = 1024

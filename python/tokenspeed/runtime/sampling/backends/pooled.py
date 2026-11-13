@@ -235,23 +235,3 @@ class PooledSamplingBackend(SamplingBackend):
 
         self._coins_buf[:bs, :n].copy_(cpu_coins, non_blocking=True)
         self._final_coins_buf[:bs].copy_(cpu_final, non_blocking=True)
-
-    def get_packed_output_d2h(
-        self,
-        output_tokens: torch.Tensor,
-        output_lengths: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        if (
-            output_tokens.data_ptr() != self._output_pack_buf.data_ptr()
-            or output_lengths.data_ptr() != self._accept_length_buf.data_ptr()
-        ):
-            return None
-        n_t = output_tokens.numel()
-        n_l = output_lengths.numel()
-        size = self._predict_max + n_l
-        cpu_pack = torch.empty(size, dtype=torch.int32, pin_memory=True)
-        cpu_pack.copy_(self._output_pack_buf[:size], non_blocking=True)
-        return (
-            cpu_pack[:n_t].view(output_tokens.shape),
-            cpu_pack[self._predict_max : self._predict_max + n_l],
-        )

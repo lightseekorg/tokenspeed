@@ -48,11 +48,18 @@ namespace tokenspeed {
 // group's PrefixCacheIndex, match policy in its PrefixMatcher.
 class GroupAllocator {
 public:
-    GroupAllocator(std::int32_t cache_blocks_per_lcm_block, std::uint32_t group_id, std::int32_t shard_count)
-        : cache_blocks_per_lcm_block_{cache_blocks_per_lcm_block}, group_id_{group_id}, shard_count_{shard_count} {
+    // kept_head_blocks: the leading table slots retention never releases (a
+    // sliding group's sink blocks); 0 for every other group.
+    GroupAllocator(std::int32_t cache_blocks_per_lcm_block, std::uint32_t group_id, std::int32_t shard_count,
+                   std::int32_t kept_head_blocks)
+        : cache_blocks_per_lcm_block_{cache_blocks_per_lcm_block},
+          group_id_{group_id},
+          shard_count_{shard_count},
+          kept_head_blocks_{kept_head_blocks} {
         _assert(cache_blocks_per_lcm_block > 0, "cache_blocks_per_lcm_block must be > 0");
         _assert(shard_count > 0 && cache_blocks_per_lcm_block % shard_count == 0,
                 "shard_count must be positive and divide parent packing");
+        _assert(kept_head_blocks >= 0, "kept_head_blocks must be non-negative");
     }
 
     GroupAllocator(const GroupAllocator&) = delete;
@@ -62,6 +69,24 @@ public:
     std::uint32_t Id() const noexcept { return group_id_; }
     // Cyclic owners of this group's virtual blocks; 1 balances nothing.
     std::int32_t ShardCount() const noexcept { return shard_count_; }
+    std::int32_t KeptHeadBlocks() const noexcept { return kept_head_blocks_; }
+
+    // The table slots retention has released, [first, past_end): every slot
+    // below the table's reclaim frontier except the kept head. All are null.
+    struct SlotRange {
+        std::int32_t first{0};
+        std::int32_t past_end{0};
+    };
+    SlotRange ReleasedSlots(const BlockTable& table) const noexcept {
+        const std::int32_t frontier = table.ReclaimedPrefixBlocks();
+        return SlotRange{.first = std::min(kept_head_blocks_, frontier), .past_end = frontier};
+    }
+    // The released slots a table starts with: an export skips them and they
+    // hold no parent. A table that keeps a head block starts with none.
+    std::int32_t LeadingReleasedBlocks(const BlockTable& table) const noexcept {
+        const SlotRange released = ReleasedSlots(table);
+        return released.first == 0 ? released.past_end : 0;
+    }
 
     // Bare locations occur in recorded Device eviction segments. A live
     // reference carries its pool and must use the pool-aware overload below.
@@ -91,11 +116,19 @@ public:
     void AppendBlockTablePageIds(const BlockTable& table, std::vector<std::int32_t>& ids,
                                  std::size_t first_slot) const {
         assertPageIdsCurrent(table);
-        const auto released = static_cast<std::size_t>(table.ReclaimedPrefixBlocks());
+        const SlotRange slots = ReleasedSlots(table);
+        const auto released_first = static_cast<std::size_t>(slots.first);
+        const auto released_past_end = static_cast<std::size_t>(slots.past_end);
         const std::span<const std::int32_t> page_ids = table.PageIds();
         _assert(first_slot <= page_ids.size(), "block-table range starts beyond its row");
-        if (first_slot < released) ids.insert(ids.end(), released - first_slot, 0);
-        ids.insert(ids.end(), page_ids.begin() + static_cast<std::ptrdiff_t>(std::max(first_slot, released)),
+        // The kept head, the released slots (null, so not read), the rest.
+        if (first_slot < released_first) {
+            ids.insert(ids.end(), page_ids.begin() + static_cast<std::ptrdiff_t>(first_slot),
+                       page_ids.begin() + static_cast<std::ptrdiff_t>(released_first));
+        }
+        const std::size_t zeros_from = std::max(first_slot, released_first);
+        if (zeros_from < released_past_end) ids.insert(ids.end(), released_past_end - zeros_from, 0);
+        ids.insert(ids.end(), page_ids.begin() + static_cast<std::ptrdiff_t>(std::max(first_slot, released_past_end)),
                    page_ids.end());
     }
 
@@ -163,14 +196,17 @@ public:
             table.appendAll(group_id_, std::move(block_refs));
         } else {
             _assert(table.NumBlocks() <= plan.suffix_start, "sparse suffix overlaps the existing block table");
-            _assert(plan.suffix_start + plan.num_blocks <= plan.table_blocks_after,
+            _assert(plan.suffix_start + plan.num_blocks - plan.head_blocks <= plan.table_blocks_after,
                     "sparse suffix exceeds the planned table size");
             table.resize(static_cast<std::size_t>(plan.table_blocks_after));
             if (old_num_blocks == 0) {
                 table.reclaimed_prefix_blocks_ = plan.suffix_start;
             }
             for (std::size_t i = 0; i < block_refs.size(); ++i) {
-                table.assign(group_id_, static_cast<std::size_t>(plan.suffix_start) + i, std::move(block_refs[i]));
+                const auto slot = i < static_cast<std::size_t>(plan.head_blocks)
+                                      ? static_cast<std::size_t>(old_num_blocks) + i
+                                      : static_cast<std::size_t>(plan.suffix_start) + i - plan.head_blocks;
+                table.assign(group_id_, slot, std::move(block_refs[i]));
             }
         }
         table.available_tokens_ = plan.available_tokens_after;
@@ -368,24 +404,26 @@ public:
         return std::nullopt;
     }
 
-    // Retention execution: the first num_expired_blocks table slots become
-    // null holes, so the table never shrinks and slot alignment stays stable.
-    // How many blocks expired is retention policy (GroupGeometry).
+    // Retention execution: the first num_expired_blocks table slots, except
+    // the kept head, become null holes, so the table never shrinks and slot
+    // alignment stays stable. How many blocks expired is retention policy
+    // (GroupGeometry).
     void ReclaimExpired(BlockPool& /*pool*/, BlockTable& table, std::int32_t num_expired_blocks) {
         const std::int32_t expired = std::min(num_expired_blocks, table.NumBlocks());
-        for (std::int32_t i = table.reclaimed_prefix_blocks_; i < expired; ++i) {
+        for (std::int32_t i = std::max(table.reclaimed_prefix_blocks_, kept_head_blocks_); i < expired; ++i) {
             table.EvictToNull(i).reset();
         }
         table.reclaimed_prefix_blocks_ = std::max(table.reclaimed_prefix_blocks_, expired);
     }
 
     // Unreclaimed slots below the retention frontier, including null holes
-    // and shared blocks. The size is an optimistic reclaim bound; the actual
-    // candidates must come from this same range and pass the ownership check.
+    // and shared blocks; the kept head is never among them. The size is an
+    // optimistic reclaim bound; the actual candidates must come from this same
+    // range and pass the ownership check.
     std::span<const CacheBlockRef> ExpiredBlockSlotsAt(const BlockTable& table, std::int32_t num_expired_blocks) const {
-        const std::int32_t first = table.ReclaimedPrefixBlocks();
+        const std::int32_t first = std::max(table.ReclaimedPrefixBlocks(), kept_head_blocks_);
         const std::int32_t count = std::max(std::min(num_expired_blocks, table.NumBlocks()) - first, 0);
-        return table.Blocks().subspan(first, count);
+        return count == 0 ? std::span<const CacheBlockRef>{} : table.Blocks().subspan(first, count);
     }
 
     // Only blocks uniquely owned by this table reach the free list, so shared ones don't count.
@@ -442,11 +480,13 @@ private:
         const std::span<const CacheBlockRef> blocks = table.Blocks();
         const std::span<const std::int32_t> page_ids = table.PageIds();
         _assert(blocks.size() == page_ids.size(), "a table keeps one page id per slot");
-        const auto released = std::min(static_cast<std::size_t>(table.ReclaimedPrefixBlocks()), blocks.size());
-        for (std::size_t slot = 0; slot < released; ++slot) {
-            _assert(!blocks[slot], "a released-prefix slot still holds a block");
-        }
-        for (std::size_t slot = static_cast<std::size_t>(table.ReclaimedPrefixBlocks()); slot < blocks.size(); ++slot) {
+        const SlotRange released = ReleasedSlots(table);
+        for (std::size_t slot = 0; slot < blocks.size(); ++slot) {
+            if (static_cast<std::size_t>(released.first) <= slot &&
+                slot < static_cast<std::size_t>(released.past_end)) {
+                _assert(!blocks[slot], "a released slot still holds a block");
+                continue;
+            }
             const std::int32_t expected = blocks[slot] ? ResolveCacheBlockId(*blocks[slot]) : 0;
             _assert(page_ids[slot] == expected, "a table's page id went stale");
         }
@@ -479,6 +519,7 @@ private:
     std::int32_t cache_blocks_per_lcm_block_;
     std::uint32_t group_id_;
     std::int32_t shard_count_;
+    std::int32_t kept_head_blocks_;
 };
 
 }  // namespace tokenspeed

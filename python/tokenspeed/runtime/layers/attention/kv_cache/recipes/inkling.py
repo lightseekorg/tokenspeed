@@ -23,7 +23,8 @@
 Every attention layer costs bytes in three groups -- its own attention group,
 the kvconv column, and its attention group's hiddenconv column -- so the conv
 groups are declared whole (spec and fields together) rather than derived from
-a layer label.
+a layer label. An ordinary MHA draft adds only attention pages to the same
+arena.
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ from functools import cached_property
 import torch
 from typing_extensions import override
 
+from tokenspeed.runtime.configs.inkling_config import InklingModelConfig
 from tokenspeed.runtime.layers.attention.configs.base import (
     SoftmaxAttnConfig,
 )
@@ -42,6 +44,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
+    CacheLayout,
     cache_dtype_bytes,
     cache_dtype_name,
     mxfp8_kv_scale_fields,
@@ -74,12 +77,19 @@ class InklingRecipe(CacheRecipe):
         return len(self.attn_config.component(SoftmaxAttnConfig).cache_layer_types)
 
     @property
+    def draft_has_conv(self) -> bool:
+        """Whether the draft owns ShortConv state, independently of the target."""
+        return self.draft_attn_config is not None and isinstance(
+            self.draft_model_config.hf_text_config, InklingModelConfig
+        )
+
+    @property
     @override
     def num_draft_layers(self) -> int:
         """The base count, plus the one constraint Inkling's depths impose."""
         num_layers = super().num_draft_layers
         num_steps = self.server_args.speculative_num_steps
-        if num_layers and num_steps > num_layers:
+        if self.draft_has_conv and num_steps > num_layers:
             raise ValueError(
                 f"Inkling MTP has {num_layers} depth layers; "
                 f"--speculative-num-steps {num_steps} would wrap depths "
@@ -107,7 +117,10 @@ class InklingRecipe(CacheRecipe):
         counts = inkling_layer_kv_head_counts(self.model_config)
         if self.draft_attn_config is None:
             return counts
-        return counts + inkling_layer_kv_head_counts(self.draft_model_config)
+        if self.draft_has_conv:
+            return counts + inkling_layer_kv_head_counts(self.draft_model_config)
+        spec = self.draft_attn_config.component(SoftmaxAttnConfig)
+        return counts + (spec.num_kv_heads,) * self.num_draft_layers
 
     # ---- geometry ----
 
@@ -121,6 +134,22 @@ class InklingRecipe(CacheRecipe):
     def max_padding_fraction(self) -> float:
         # Conv columns borrow KV planes without filling them; KV pages size the parent.
         return float("inf")
+
+    # ---- capacity: history and conv checkpoints share the parent budget ----
+
+    @override
+    def select_num_lcm_blocks(self, layout: CacheLayout, *, max_lcm_blocks: int) -> int:
+        if self.token_limit is None:
+            return max_lcm_blocks
+        # Conv packing is not history capacity; size every group with the scheduler's reservations.
+        return min(max_lcm_blocks, self.parents_needed(layout, self.token_limit))
+
+    @override
+    def token_capacity(self, layout: CacheLayout, num_lcm_blocks: int) -> int:
+        upper = self.token_limit
+        if upper is None:
+            upper = super().token_capacity(layout, num_lcm_blocks)
+        return self._capacity_from_parents(layout, num_lcm_blocks, upper_bound=upper)
 
     # ---- groups: the layer walk, plus the conv checkpoint columns ----
 
@@ -220,6 +249,8 @@ class InklingRecipe(CacheRecipe):
         for layer_id, group_id in enumerate(self.group_ids):
             occurrence = occurrences.get(group_id, 0)
             occurrences[group_id] = occurrence + 1
+            if layer_id >= self.num_target_layers and not self.draft_has_conv:
+                continue
             text_config = self._layer_model_config(layer_id).hf_config.get_text_config()
             checkpoint_rows = text_config.sconv_kernel_size - 1
             kv_row = (
@@ -291,7 +322,8 @@ class InklingRecipe(CacheRecipe):
 
     @override
     def workspace_bytes(self) -> int:
-        """The conv ring both models stage their checkpoints through."""
+        """ShortConv rings, including the target's speculative verify rows,
+        and the target's MXFP8 KV dequant scratch."""
         draft_tokens = (
             int(self.server_args.speculative_num_draft_tokens)
             if self.draft_attn_config is not None
@@ -304,13 +336,17 @@ class InklingRecipe(CacheRecipe):
             num_layers=text_config.num_hidden_layers,
             spec_tokens=draft_tokens,
         )
-        if self.draft_attn_config is not None:
+        if self.draft_has_conv:
             total += _conv_ring_bytes(
                 text_config=self.draft_model_config.hf_config.get_text_config(),
                 attn_config=self.draft_attn_config,
                 num_layers=self.num_draft_layers,
                 spec_tokens=draft_tokens,
             )
+        scratch = inkling_kv_dequant_scratch_shape(text_config, self.attn_config)
+        if scratch is not None:
+            rows, width = scratch
+            total += 2 * rows * width * torch.bfloat16.itemsize
         return total
 
 
@@ -335,6 +371,33 @@ def inkling_layer_kv_head_counts(model_config) -> tuple[int, ...]:
         )
         for layer_id in range(text_config.num_hidden_layers)
     )
+
+
+def inkling_kv_dequant_scratch_shape(
+    text_config, attn_config
+) -> tuple[int, int] | None:
+    """``(rows, row_elements)`` of the BF16 key and value scratch a prefix
+    extend over an MXFP8 KV cache dequantizes its pages into, or None for
+    other caches.
+
+    The extend kernels read BF16 pages, so each one dequantizes the pages it
+    reads first. The scratch holds one request at the longest context; a
+    batch that needs more runs in request groups. A row holds the most KV
+    heads a layer serves at this TP.
+    """
+    if not attn_config.kv_cache_mxfp8:
+        return None
+    spec = attn_config.component(SoftmaxAttnConfig)
+    heads = max(
+        max(1, int(count) // spec.attn_tp_size)
+        for count in (
+            text_config.ckpt_num_key_value_heads,
+            text_config.swa_num_key_value_heads,
+        )
+    )
+    page = attn_config.kernel_page_size or _INKLING_PREFIX_GRANULARITY
+    rows = -(-int(attn_config.context_len) // page) * page
+    return rows, heads * spec.head_dim
 
 
 def _conv_ring_bytes(*, text_config, attn_config, num_layers: int, spec_tokens: int):

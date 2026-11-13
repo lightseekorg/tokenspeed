@@ -453,12 +453,206 @@ TEST_F(HybridKvCacheEventTestSuite, DrainsATailBoundaryAlongsideAStateGroup) {
     SendForwardDone("r1", {42});
     SendFinish("r1");
 
-    // Only the prompt end has a state checkpoint, so only the tail [3] is complete; the page [1 2] stays partial.
+    // Only the prompt end has state, but the router needs the history parent
+    // before the tail can refer to it. This does not grant a state-cache hit.
     std::vector<KvCacheEvent> events = scheduler_->DrainKvEvents();
-    ASSERT_EQ(events.size(), 1u);
-    ASSERT_TRUE(std::holds_alternative<KvBlockStoredEvent>(events[0]));
-    EXPECT_EQ(std::get<KvBlockStoredEvent>(events[0]).token_ids, (std::vector<std::int32_t>{3}));
+    ASSERT_EQ(events.size(), 2u);
+    const auto& page = std::get<KvBlockStoredEvent>(events[0]);
+    const auto& tail = std::get<KvBlockStoredEvent>(events[1]);
+    EXPECT_EQ(page.token_ids, (std::vector<std::int32_t>{1, 2}));
+    EXPECT_FALSE(page.parent_block_hash);
+    EXPECT_EQ(tail.token_ids, (std::vector<std::int32_t>{3}));
+    EXPECT_EQ(tail.parent_block_hash, page.block_hashes.front());
     EXPECT_TRUE(scheduler_->DrainKvEvents().empty());
+
+    Submit(RequestSpec{.request_id = "repeat", .tokens = {1, 2, 3}});
+    const ExecutionPlan first = PlanOnce();
+    const ForwardBatch* batch = FindForwardBatch(first);
+    ASSERT_NE(batch, nullptr);
+    EXPECT_EQ(batch->extend_prefix_lens.at(0), 0);
+    // The first repeat creates a checkpoint at the history junction. A later
+    // repeat may reuse it, whereas the complete prompt-end state cannot supply
+    // the logits for the prompt's last token.
+    SendForwardDone("repeat", {});
+    PlanOnce();
+    SendForwardDone("repeat", {43});
+    SendFinish("repeat");
+    PlanOnce();
+    Submit(RequestSpec{.request_id = "hit", .tokens = {1, 2, 3}});
+    const ExecutionPlan repeated = PlanOnce();
+    batch = FindForwardBatch(repeated);
+    ASSERT_NE(batch, nullptr);
+    EXPECT_EQ(batch->extend_prefix_lens.at(0), 2);
+}
+
+class UnsupportedKvCacheEventLayoutSuite : public HybridKvCacheEventTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = HybridKvCacheEventTestSuite::MakeConfig();
+        cfg.enable_kv_cache_events = false;
+        return cfg;
+    }
+};
+
+TEST_F(UnsupportedKvCacheEventLayoutSuite, RejectsEventsWithoutHistoryButKeepsServingLayouts) {
+    for (const bool state : {false, true}) {
+        for (const bool window : {false, true}) {
+            if (!state && !window) continue;
+            for (const bool replayable : {false, true}) {
+                if (replayable && !window) continue;
+                auto cfg = config_;
+                auto swa = cfg.cache_groups.front();
+                auto checkpoint = cfg.cache_groups.back();
+                cfg.cache_groups.clear();
+                if (state) cfg.cache_groups.push_back(checkpoint);
+                if (window) {
+                    swa.attn_kind = AttnKind::kSlidingWindow;
+                    swa.sliding_window_tokens = 2;
+                    swa.replayable = replayable;
+                    cfg.cache_groups.push_back(swa);
+                }
+                SCOPED_TRACE(::testing::Message()
+                             << "state=" << state << " window=" << window << " replayable=" << replayable);
+                SetTestSnapshotPool(cfg);
+                cfg.enable_kv_cache_events = true;
+                try {
+                    Scheduler rejected(WithHostPackingFromDevice(cfg));
+                    FAIL() << "unsupported event layout was accepted";
+                } catch (const std::invalid_argument& error) {
+                    EXPECT_NE(std::string(error.what()).find("KV cache events require"), std::string::npos);
+                }
+                cfg.enable_kv_cache_events = false;
+                scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(cfg));
+                Submit(RequestSpec{.request_id = "seed", .tokens = {1, 2, 3, 4, 5, 6}});
+                PlanOnce();
+                SendForwardDone("seed", {42});
+                SendFinish("seed");
+                EXPECT_TRUE(scheduler_->DrainKvEvents().empty());
+                EXPECT_TRUE(scheduler_->ClearCache());
+            }
+        }
+    }
+}
+
+TEST(KvCacheEventStatusTest, HistoryCountsMatchPerKeyResidencyAcrossTiersAndShards) {
+    for (const std::int32_t tail_tokens : {0, 1, 2, 3, 4, 5, 6, 7}) {
+        SCOPED_TRACE(tail_tokens);
+        BlockPool device(12, {4, 2, 1, 1});
+        BlockPool host(12, {4, 2, 1, 1});
+        const std::array specs{
+            CacheGroupSpec{.attn_kind = AttnKind::kFull,
+                           .cache_blocks_per_lcm_block = 4,
+                           .block_granularity = 2,
+                           .shard_count = 2},
+            CacheGroupSpec{.attn_kind = AttnKind::kFull,
+                           .cache_blocks_per_lcm_block = 2,
+                           .block_granularity = 4,
+                           .shard_count = 2},
+            CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
+            CacheGroupSpec{.attn_kind = AttnKind::kSlidingWindow,
+                           .sliding_window = 2,
+                           .cache_blocks_per_lcm_block = 1,
+                           .block_granularity = 8}};
+        auto coordinator = MakeCoordinator(specs, 8, device, false, &host, nullptr, false, false, 0);
+        const CacheKey boundary{.content_hash = "prefix"};
+        std::vector<CacheKey> history;
+        for (std::uint32_t group = 0; group < 2; ++group) {
+            const auto granularity = specs[group].block_granularity;
+            const auto tokens = tail_tokens == 0 ? 8 : tail_tokens;
+            for (std::int32_t offset = 0; offset < (tokens + granularity - 1) / granularity; ++offset) {
+                history.push_back(
+                    CacheKey{.group_id = group, .content_hash = boundary.content_hash, .page_offset = offset});
+            }
+        }
+        const auto check = [&]() {
+            bool complete = true;
+            for (const auto& key : history) {
+                complete &= coordinator.GroupPrefixIndex(key.group_id).Contains(device, key);
+            }
+            EXPECT_EQ(coordinator.GetBoundaryEventStatus(boundary, tail_tokens).publishable, complete);
+        };
+        const auto store = [&](BlockPool& pool, const CacheKey& key) {
+            auto block = pool.AcquireBlock(key.group_id);
+            coordinator.GroupPrefixIndex(key.group_id)
+                .Register(pool, block, key, 1, -1, CacheBoundaryKind::kChunk, nullptr, nullptr);
+        };
+        const auto remove = [&](const CacheKey& key) {
+            auto& index = coordinator.GroupPrefixIndex(key.group_id);
+            const auto entry = index.Inspect(device, key);
+            ASSERT_TRUE(entry.has_value());
+            EXPECT_TRUE(index.Evict(device, entry->location).has_value());
+        };
+        check();
+        for (const auto& key : history) store(host, key);
+        check();  // Host history must not satisfy Device publication.
+        EXPECT_FALSE(coordinator.GetBoundaryEventStatus(boundary, tail_tokens).has_device_entries);
+        const CacheKey state{.group_id = 2, .content_hash = boundary.content_hash};
+        const CacheKey swa{.group_id = 3, .content_hash = boundary.content_hash};
+        store(device, state);
+        store(device, swa);
+        check();  // Auxiliary entries cannot fill missing history counts.
+        for (const auto& key : history) {
+            store(device, key);
+            check();
+        }
+        EXPECT_TRUE(coordinator.GetBoundaryEventStatus(boundary, tail_tokens).publishable);
+        remove(state);
+        remove(swa);
+        check();  // Complete history remains publishable without auxiliary state.
+        EXPECT_EQ(coordinator.DeviceBoundaryResidency(boundary, tail_tokens),
+                  CacheCoordinator::BoundaryResidency::kPartial);
+        store(device, state);
+        store(device, swa);
+        // Removing any sub-block of either sharded Full group withdraws the
+        // event; restoring it makes the same boundary publishable again.
+        for (const auto& key : history) {
+            remove(key);
+            check();
+            EXPECT_FALSE(coordinator.GetBoundaryEventStatus(boundary, tail_tokens).publishable);
+            store(device, key);
+            check();
+        }
+        for (const auto& key : history) {
+            remove(key);
+            check();
+        }
+        EXPECT_TRUE(coordinator.GetBoundaryEventStatus(boundary, tail_tokens).has_device_entries);
+        remove(state);
+        remove(swa);
+        check();
+        EXPECT_FALSE(coordinator.GetBoundaryEventStatus(boundary, tail_tokens).has_device_entries);
+    }
+}
+
+class FullSwaStateKvCacheEventTestSuite : public HybridKvCacheEventTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = HybridKvCacheEventTestSuite::MakeConfig();
+        auto swa = cfg.cache_groups.front();
+        swa.group_id = "sliding_attention";
+        swa.attn_kind = AttnKind::kSlidingWindow;
+        swa.sliding_window_tokens = 2;
+        swa.replayable = false;
+        cfg.cache_groups.push_back(std::move(swa));
+        return cfg;
+    }
+};
+
+TEST_F(FullSwaStateKvCacheEventTestSuite, WindowDoesNotLeaveHolesInHistoryEvents) {
+    Submit(RequestSpec{.request_id = "seed", .tokens = {1, 2, 3, 4, 5, 6}});
+    PlanOnce();
+    SendForwardDone("seed", {42});
+    SendFinish("seed");
+    const auto events = scheduler_->DrainKvEvents();
+    ASSERT_EQ(events.size(), 3u);
+    std::optional<std::uint64_t> parent;
+    for (const auto& event : events) {
+        const auto& block = std::get<KvBlockStoredEvent>(event);
+        EXPECT_EQ(block.parent_block_hash, parent);
+        parent = block.block_hashes.front();
+    }
+    ASSERT_TRUE(scheduler_->ClearCache());
+    EXPECT_EQ(scheduler_->DrainKvEvents().size(), 3u);
 }
 
 class MultiGroupKvCacheEventTestSuite : public SchedulerTestSuite {
@@ -848,7 +1042,9 @@ TEST_F(SlidingWindowRestoreKvCacheEventTestSuite,
     ASSERT_EQ(FindForwardBatch(PlanAndDrain())->request_ids, std::vector<std::string>{"r"});  // plan 8
     SendForwardDone("r", {105});
     PlanAndDrain();  // plan 9
-    EXPECT_TRUE(Stored({101, 102, 103, 104}));
+    // Registration still succeeds after the private pool restore, but the
+    // earlier history pages are not published. An orphan cannot be routed.
+    EXPECT_FALSE(Stored({101, 102, 103, 104}));
     SendForwardDone("r", {106});
     SendFinish("r");
     PlanAndDrain();

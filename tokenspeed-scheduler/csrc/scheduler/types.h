@@ -107,6 +107,7 @@ struct SchedulerConfig {
     bool disable_l2_cache{false};
     bool enable_l3_storage{false};
     std::optional<StorageConfig> storage_config;
+    // Device residency events require at least one continuous Full/history group.
     bool enable_kv_cache_events{false};
     bool enable_mixed_prefill_decode{false};
     // Fused role only: decode rounds owed after a local prefill round

@@ -84,6 +84,15 @@ if platform.is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.decode_gemv import (
         supports_gluon_rowcta_bf16_gemv_gfx950 as _supports_rowcta_bf16_gemv,
     )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.fp32_output import (
+        gluon_mm_bf16_fp32_num_counters_gfx950 as _mm_bf16_fp32_counters,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.fp32_output import (
+        launch_gluon_mm_bf16_fp32_gfx950 as _mm_bf16_fp32_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.fp32_output import (
+        supports_gluon_mm_bf16_fp32_gfx950 as _supports_mm_bf16_fp32,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (
         launch_gluon_gemv_a16w8_gfx950 as _gemv_a16w8_impl,
     )
@@ -362,6 +371,53 @@ if platform.is_amd:
             raise ValueError("dense16 Gluon MM does not accept quantization scales")
         if block_size is not None:
             raise ValueError("dense16 Gluon MM does not accept block_size")
+
+    @register_kernel(
+        "gemm",
+        "mm",
+        name="gluon_mm_bf16_fp32_gfx950",
+        solution="gluon",
+        capability=_GFX950_CAPABILITY,
+        features={"batch_invariant"},
+        signatures={
+            format_signature(
+                a=dense_tensor_format(torch.bfloat16),
+                b=dense_tensor_format(torch.bfloat16),
+            )
+        },
+        traits={
+            "mnk_problem_filter": frozenset({_supports_mm_bf16_fp32}),
+            "a_inner_stride_one": frozenset({True}),
+            "b_inner_stride_one": frozenset({True}),
+            "b_layout": frozenset({"NK"}),
+            "out_dtype": frozenset({torch.float32}),
+        },
+        priority=Priority.SPECIALIZED,
+    )
+    def gluon_mm_bf16_fp32_gfx950(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        A_scales: torch.Tensor | None,
+        B_scales: torch.Tensor | None,
+        out_dtype: torch.dtype,
+        *,
+        alpha: torch.Tensor | None,
+        block_size: list[int] | None,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Dispatch measured BF16-to-FP32 projections without model-side policy."""
+        _validate_dense16_mm_arguments(A_scales, B_scales, block_size)
+        if out_dtype != torch.float32:
+            raise ValueError("BF16 projection requires FP32 output")
+        counters = zeroed_state(
+            _mm_bf16_fp32_counters(A.shape[0], B.shape[0], A.shape[1]),
+            dtype=torch.int32,
+            device=A.device,
+        )
+        output = _mm_bf16_fp32_impl(A, B, out, counters=counters)
+        if alpha is not None:
+            output.mul_(alpha.float())
+        return output
 
     @register_kernel(
         "gemm",

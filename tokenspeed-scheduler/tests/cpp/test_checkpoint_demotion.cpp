@@ -306,7 +306,7 @@ protected:
         const std::optional<CacheCoordinator::AdmissionResult> admitted =
             coordinator_.Admit(coordinator_.ProbePrefix({}), demands, RequestProgress{}, /*copy_in_blocks=*/{},
                                /*copy_in_point=*/std::nullopt, /*request_access_epoch=*/std::nullopt,
-                               /*evict_blocks_past_segments=*/false, session_id);
+                               /*evict_blocks_past_segments=*/false, session_id, /*cache_group_id=*/{});
         if (!admitted) {
             ADD_FAILURE() << "the admission failed";
             return {};

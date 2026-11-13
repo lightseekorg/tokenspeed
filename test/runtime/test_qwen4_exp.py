@@ -297,7 +297,11 @@ def test_qwen4_exp_attention_layer_gates_its_output_whatever_the_config_says() -
     )
     with torch.device("cuda"):
         layer = Qwen4ExpAttentionDecoderLayer(
-            config, Mapping(rank=0, world_size=1), 1, prefix="model.layers.1.self_attn"
+            config,
+            Mapping(rank=0, world_size=1),
+            1,
+            prefix="model.layers.1.self_attn",
+            enable_fp8_attn_proj=False,
         )
 
     # The query projection carries a gate per head on top of q, k and v.

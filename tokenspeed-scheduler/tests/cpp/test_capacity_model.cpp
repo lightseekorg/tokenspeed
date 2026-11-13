@@ -101,6 +101,21 @@ SchedulerConfig SizedConfig(SchedulerConfig cfg, std::int32_t usable_lcm_blocks)
     return cfg;
 }
 
+TEST(CapacityModelSink, CountsTheRetainedHeadOncePerRequest) {
+    for (const auto role : {Role::kP, Role::kD, Role::kFused}) {
+        auto config = SizingConfig(role, 128, 4096, 8, 1, false, {Sliding("swa", 128, 1024, 24)});
+        config.max_batch_size = 8;
+        config.max_resident_requests = config.max_batch_size;
+        const auto without = CapacityModel(config);
+        config.cache_groups[0].sink_tokens = 16;
+        const auto with = CapacityModel(config);
+        EXPECT_EQ(with.SingleRequestGroupPages(524288)[0], without.SingleRequestGroupPages(524288)[0] + 1);
+        EXPECT_EQ(with.ConcurrentGroupPages(8LL * 524288, 524288)[0],
+                  without.ConcurrentGroupPages(8LL * 524288, 524288)[0] + 8);
+        EXPECT_EQ(with.SingleRequestGroupPages(0)[0], without.SingleRequestGroupPages(0)[0]);
+    }
+}
+
 std::vector<SchedulerConfig> Sweep() {
     std::vector<SchedulerConfig> configs;
     const std::vector<std::vector<CacheGroupConfig>> group_sets = {
