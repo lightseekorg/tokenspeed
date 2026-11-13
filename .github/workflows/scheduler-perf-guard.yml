@@ -1,0 +1,192 @@
+name: Scheduler Performance Guard
+
+# Compares the C++ scheduler's CPU cost against the base revision. The
+# instruction-count suite is deterministic and blocks; the timing suite runs
+# on shared machines and only reports. See tokenspeed-scheduler/tests/cpp/README.md.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "tokenspeed-scheduler/**"
+      - "test/ci_system/scheduler_perf_guard.py"
+      - "test/ci_system/test_scheduler_perf_guard.py"
+      - ".github/workflows/scheduler-perf-guard.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "tokenspeed-scheduler/**"
+      - "test/ci_system/scheduler_perf_guard.py"
+      - "test/ci_system/test_scheduler_perf_guard.py"
+      - ".github/workflows/scheduler-perf-guard.yml"
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: "Revision to compare against (default: the tested commit's parent)"
+        required: false
+        default: ""
+
+concurrency:
+  group: scheduler-perf-guard-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build base and candidate
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+          python -m pip install "nanobind>=2.13.0" tokenspeed-spdlog==1.15.1 pytest
+
+      - name: Test the guard
+        run: python -m pytest -q test/ci_system/test_scheduler_perf_guard.py
+
+      - name: Resolve the base revision
+        id: base
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          INPUT_BASE: ${{ inputs.base_ref }}
+        run: |
+          set -euo pipefail
+          case "$EVENT_NAME" in
+            # A pull request checks out its merge into the base branch.
+            pull_request) base=$(git rev-parse HEAD^1) ;;
+            push) base="$PUSH_BEFORE" ;;
+            *) base=$(git rev-parse "${INPUT_BASE:-HEAD^}") ;;
+          esac
+          echo "candidate=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+
+      # Both revisions build in the same source directory, one after the
+      # other: the second build is incremental, and identical source paths
+      # keep code layout from differing between the two binaries.
+      - name: Build both revisions
+        env:
+          BASE: ${{ steps.base.outputs.base }}
+          CANDIDATE: ${{ steps.base.outputs.candidate }}
+        run: |
+          set -euo pipefail
+          build() {
+            local side=$1
+            mkdir -p "bench/$side"
+            cmake -S tokenspeed-scheduler -B tokenspeed-scheduler/build -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DTOKENSPEED_SCHEDULER_BUILD_TESTS=ON \
+              -DTOKENSPEED_SCHEDULER_BUILD_PYTHON=OFF
+            for target in tokenspeed_scheduler_full_cache_benchmark tokenspeed_scheduler_decode_rounds_benchmark; do
+              # A base that predates a benchmark has no such target.
+              if cmake --build tokenspeed-scheduler/build --target "$target"; then
+                cp "tokenspeed-scheduler/build/$target" "bench/$side/"
+              elif [ "$side" = candidate ]; then
+                exit 1
+              fi
+            done
+          }
+          build candidate
+          git checkout --quiet --detach "$BASE"
+          build base
+          git checkout --quiet --detach "$CANDIDATE"
+          ls -l bench/*
+
+      - name: Upload benchmarks
+        uses: actions/upload-artifact@v4
+        with:
+          name: scheduler-perf-guard-benchmarks
+          path: bench/
+          retention-days: 7
+
+  instructions:
+    name: Instruction counts
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Valgrind
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y valgrind
+
+      - name: Download benchmarks
+        uses: actions/download-artifact@v4
+        with:
+          name: scheduler-perf-guard-benchmarks
+          path: bench/
+
+      - name: Compare instruction counts
+        run: |
+          chmod +x bench/*/*
+          base=bench/base
+          [ -d "$base" ] || base=""
+          python3 test/ci_system/scheduler_perf_guard.py instructions \
+            --candidate bench/candidate --base "$base" --output results \
+            --valgrind valgrind --callgrind-annotate callgrind_annotate
+
+      - name: Publish summary
+        if: always()
+        run: |
+          [ -f results/instructions.md ] && cat results/instructions.md >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scheduler-perf-guard-instructions
+          path: |
+            results/*.json
+            results/*.md
+          retention-days: 14
+
+  timing:
+    name: CPU time (report only)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download benchmarks
+        uses: actions/download-artifact@v4
+        with:
+          name: scheduler-perf-guard-benchmarks
+          path: bench/
+
+      - name: Compare CPU time (report only)
+        run: |
+          chmod +x bench/*/*
+          base=bench/base
+          [ -d "$base" ] || base=""
+          python3 test/ci_system/scheduler_perf_guard.py timing \
+            --candidate bench/candidate --base "$base" --output results --rounds 3 --cpu 1
+
+      - name: Publish summary
+        if: always()
+        run: |
+          [ -f results/timing.md ] && cat results/timing.md >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scheduler-perf-guard-timing
+          path: |
+            results/*.json
+            results/*.md
+          retention-days: 14
