@@ -59,8 +59,10 @@ __all__ = [
     "packed_projection_weight_view",
     "moe_sigmoid_bias_topk_routing",
     "kimi3_sigmoid_bias_topk_sorted",
+    "kimi3_sorted_routing_accepts",
     "kimi3_sorted_routing_fuses_shared_down",
     "kimi3_sorted_routing_scratch",
+    "kimi3_sorted_routing_supported",
     "FUSED_ROUTING_MAX_TOKENS",
     "PreparedNvfp4Routing",
     "prepare_nvfp4_routing",
@@ -1011,8 +1013,10 @@ from tokenspeed_kernel.ops.moe._triton.bf16 import (  # noqa: E402
 )
 from tokenspeed_kernel.ops.moe._triton.kimi3_sigmoid_topk import (  # noqa: E402
     kimi3_sigmoid_bias_topk_sorted,
+    kimi3_sorted_routing_accepts,
     kimi3_sorted_routing_fuses_shared_down,
     kimi3_sorted_routing_scratch,
+    kimi3_sorted_routing_supported,
 )
 from tokenspeed_kernel.ops.moe._triton.sigmoid_topk_routing import (  # noqa: E402
     MAX_TOKENS as FUSED_ROUTING_MAX_TOKENS,
@@ -2058,6 +2062,15 @@ def moe_plan(
     supports_prequantized_input = True in apply_spec.traits.get(
         "supports_prequantized_input", frozenset({False})
     )
+    sorted_route_rows = apply_spec.traits.get("sorted_route_rows", frozenset())
+    sorted_route_block_sizes = apply_spec.traits.get(
+        "sorted_route_block_size", frozenset()
+    )
+    if len(sorted_route_block_sizes) != (1 if sorted_route_rows else 0):
+        raise ValueError(
+            f"MoE kernel {apply_spec.name!r} must declare one "
+            "sorted_route_block_size exactly when it declares sorted_route_rows"
+        )
     return {
         "weight_dtype": weight_dtype,
         "activation": activation,
@@ -2088,6 +2101,8 @@ def moe_plan(
         "supports_deferred_out": supports_deferred_out,
         "topk_weights_dtype": topk_weights_dtype,
         "supports_prequantized_input": supports_prequantized_input,
+        "sorted_route_rows": sorted_route_rows,
+        "sorted_route_block_size": next(iter(sorted_route_block_sizes), None),
         # All-to-all EP (DeepEP, Petit): each rank runs its own tokens'
         # routes, so routing may pick per-rank replicas. Otherwise every
         # rank routes every token and must agree on one replica per route.
