@@ -1007,6 +1007,14 @@ to restore the original capacity; shrinking a live request pool is not
 supported. A request keeps its original slot when reception completes and
 waits for an execution permit before its first decode.
 
+This change requires matching TokenSpeed runtime and native components, even
+when E=0. Do not mix runtime or scheduler builds from before this API change
+with builds that include it. For source deployments, rebuild and install
+tokenspeed-engine and any standalone tokenspeed-scheduler from the same
+revision as the Python runtime. The serving host uses the scheduler embedded
+in tokenspeed-engine; upgrading the standalone scheduler wheel alone does
+not update that embedded copy.
+
 ## Observability
 
 | Parameter | Purpose |
@@ -1151,6 +1159,12 @@ For B=36 and E=128, sustained resident=164 proves the resident pool is full;
 active-decode=36 proves the execution permits are occupied. Use the actual
 batch row count and throughput alongside these counters: draining or
 restoring work can hold a permit without dispatching a row that round.
+
+Ready-waiting counts only resident PrefillDone requests waiting for their
+first decode. It excludes Retracted requests whose snapshots are on Host,
+as well as Restoring and Finishing requests. On PD nodes,
+tokenspeed:num_retracted_queue_reqs tracks Retracted and Restoring requests
+separately.
 
 The rank-local histogram tokenspeed:decode_ready_wait_seconds measures E-queue
 wait from the decode host observing complete prefill KV arrival to the first

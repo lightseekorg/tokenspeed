@@ -1796,9 +1796,10 @@ std::vector<Request*> Scheduler::rankedReadmissions(std::span<Request* const> ca
 // candidates are tried in turn (bounded) until one restores. Any landed image
 // that waited for capacity seals new-prompt admission for the round, whether
 // or not a later one restored: the pages it waits for must not go to a
-// newcomer. A readmission that found no request-pool slot stops the scan
-// without sealing -- nothing later would get a slot either, and neither would
-// a newcomer.
+// newcomer. A missing request-pool row or decode permit stops the scan without
+// adding a KV-capacity barrier. With no row, newcomers cannot enter either.
+// With no decode permit, a D node may still admit remote prefills into free
+// resident rows unless an earlier KV failure already sealed new admission.
 bool Scheduler::scheduleReadmission(AdmissionFeedback& feedback, PlanBuild& build,
                                     std::span<Request* const> candidates) {
     ProfileSpan profile_span{"Scheduler::scheduleReadmission"};

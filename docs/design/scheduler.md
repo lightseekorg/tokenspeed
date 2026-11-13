@@ -22,8 +22,11 @@ A first local decode acquires a move-only permit and keeps it across rounds.
 Newly completed prefills cannot displace an already streaming request.
 Restoring a Decoding request reserves a permit before issuing the restore;
 the transfer owns it until acknowledgement, including after cancellation.
-Finishing requests keep their resources until outstanding results land.
+Finishing requests keep their request row, KV pages and any decode permit
+until outstanding results land.
 An abort drains those results without publishing its completed pages.
+This cancellation rule applies to all engine roles, including when the
+extra count is zero.
 Retraction relinquishes the permit once the existing in-flight guards allow
 the request to leave; readmission obtains a new one ahead of fresh work.
 
