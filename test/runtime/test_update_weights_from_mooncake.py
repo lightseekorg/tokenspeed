@@ -672,8 +672,9 @@ def test_host_bootstrap_checks_the_actual_binary_protocol_before_device_build(
     monkeypatch.setattr(rust_host, "HostBootstrap", build)
     receiver, sender = Pipe(duplex=False)
     try:
+        # Keep this legacy binary capability test on the CUDA v2 path.
         args = SimpleNamespace(
-            enable_memory_saver=memory_saver, disaggregation_mode=None
+            enable_memory_saver=memory_saver, disaggregation_mode=None, device="cuda"
         )
         sender.send((args, None, None))
         call_args = (os.dup(receiver.fileno()), None)

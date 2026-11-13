@@ -108,9 +108,12 @@ def summarize(directory):
     ), "Expected eight token IDs for every ingress in both phases"
     assert before == after, "Token output differs after resume"
     tags = result["tags"]
+    # CUDA v2 keeps one legacy apply per direction. Only the independent v3
+    # validation branch separates NCCL teardown/recreation from memory work.
+    split_nccl = result["protocols"] == [3, 3] and "nccl" in tags
     expected_phases = {
-        True: [set(tags) - {"nccl"}, {"nccl"}] if "nccl" in tags else [set(tags)],
-        False: [set(), set(tags)] if "nccl" in tags else [set(tags)],
+        True: [set(tags) - {"nccl"}, {"nccl"}] if split_nccl else [set(tags)],
+        False: [set(), set(tags)] if split_nccl else [set(tags)],
     }
     waits = {}
     for operation, release in (("release", True), ("resume", False)):
@@ -125,6 +128,7 @@ def summarize(directory):
                 key=lambda row: row["ns"],
             )
             assert [set(row["tags"]) for row in phases] == expected_phases[release], (
+                "Unexpected apply phases",
                 operation,
                 rank,
                 phases,

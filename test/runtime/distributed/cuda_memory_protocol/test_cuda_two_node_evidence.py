@@ -26,11 +26,12 @@ import pytest
 from test_summarize_cuda_two_node_serving import summarize
 
 
-def write_case(tmp_path, layout, *, mixed=False):
+def write_case(tmp_path, layout, *, mixed=False, protocol=3, nccl=False):
     directory = tmp_path / "case"
     serving = directory / "serving"
     serving.mkdir(parents=True)
-    protocols = [2, 3] if mixed else [3, 3]
+    protocols = [2, 3] if mixed else [protocol, protocol]
+    tags = ["kv_cache", "weights"] + (["nccl"] if nccl else [])
     rows = []
     for rank in range(4):
         node = rank // 2
@@ -56,15 +57,21 @@ def write_case(tmp_path, layout, *, mixed=False):
         )
         if not mixed:
             for release in (True, False):
-                rows.append(
-                    {
-                        "event": "apply_complete",
-                        "rank": rank,
-                        "release": release,
-                        "tags": ["kv_cache", "weights"],
-                        "ns": 100 if release else 200,
-                    }
-                )
+                phases = [tags]
+                if protocol == 3 and nccl:
+                    phases = (
+                        [["kv_cache", "weights"], ["nccl"]] if release else [[], tags]
+                    )
+                for index, phase in enumerate(phases):
+                    rows.append(
+                        {
+                            "event": "apply_complete",
+                            "rank": rank,
+                            "release": release,
+                            "tags": phase,
+                            "ns": (100 if release else 200) + index,
+                        }
+                    )
     (serving / "node-0.jsonl").write_text(
         "".join(json.dumps(row) + "\n" for row in rows)
     )
@@ -85,9 +92,9 @@ def write_case(tmp_path, layout, *, mixed=False):
                 key: value[:] for key, value in tokens.items()
             },
             token_count=8,
-            tags=["kv_cache", "weights"],
-            release_ack_ns=[101] * len(ingresses),
-            resume_ack_ns=[201] * len(ingresses),
+            tags=tags,
+            release_ack_ns=[110] * len(ingresses),
+            resume_ack_ns=[210] * len(ingresses),
         )
     (serving / "result.json").write_text(json.dumps(result))
     (directory / "serving.exit").write_text("0\n")
@@ -100,6 +107,80 @@ def test_complete_before_after_token_evidence_passes(tmp_path, layout):
     summary = summarize(directory)
     assert summary["tokens_per_ingress"] == result["tokens_per_ingress"]
     assert summary["tokens_after_resume_per_ingress"] == result["tokens_per_ingress"]
+
+
+@pytest.mark.parametrize("layout", ["ep4", "dp2-tp2-ep4"])
+@pytest.mark.parametrize("protocol", [2, 3])
+def test_nccl_apply_phases_match_protocol(tmp_path, layout, protocol):
+    directory, _ = write_case(tmp_path, layout, protocol=protocol, nccl=True)
+    assert summarize(directory)["protocols"] == [protocol, protocol]
+
+
+@pytest.mark.parametrize("protocol", [2, 3])
+@pytest.mark.parametrize("release", [True, False])
+def test_all_rank_ack_barrier_applies_only_to_v3(tmp_path, protocol, release):
+    directory, result = write_case(tmp_path, "dp2-tp2-ep4", protocol=protocol)
+    trace = directory / "serving/node-0.jsonl"
+    rows = [json.loads(line) for line in trace.read_text().splitlines()]
+    operation = "release" if release else "resume"
+    # A non-ingress rank finishes after another ingress's local v2 ACK.
+    late_rank = next(
+        row
+        for row in rows
+        if row["event"] == "apply_complete"
+        and row["rank"] == 3
+        and row["release"] == release
+    )
+    late_rank["ns"] = min(result[f"{operation}_ack_ns"]) + 1
+    trace.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    if protocol == 2:
+        assert summarize(directory)["protocols"] == [2, 2]
+    else:
+        with pytest.raises(AssertionError):
+            summarize(directory)
+
+
+@pytest.mark.parametrize("protocol", [2, 3])
+@pytest.mark.parametrize("release", [True, False])
+@pytest.mark.parametrize("damage", ["missing", "wrong_tags", "other_protocol"])
+def test_missing_or_wrong_nccl_apply_phases_are_rejected(
+    tmp_path, protocol, release, damage
+):
+    directory, _ = write_case(tmp_path, "ep4", protocol=protocol, nccl=True)
+    trace = directory / "serving/node-0.jsonl"
+    rows = [json.loads(line) for line in trace.read_text().splitlines()]
+    phases = [
+        row
+        for row in rows
+        if row["event"] == "apply_complete"
+        and row["rank"] == 0
+        and row["release"] == release
+    ]
+    if damage == "missing":
+        rows.remove(phases[0])
+    elif damage == "wrong_tags":
+        phases[0]["tags"] = ["unexpected"]
+    else:
+        rows = [row for row in rows if row not in phases]
+        tags = ["kv_cache", "weights", "nccl"]
+        other_phases = [tags]
+        if protocol == 2:
+            other_phases = (
+                [["kv_cache", "weights"], ["nccl"]] if release else [[], tags]
+            )
+        for index, tags in enumerate(other_phases):
+            rows.append(
+                {
+                    "event": "apply_complete",
+                    "rank": 0,
+                    "release": release,
+                    "tags": tags,
+                    "ns": (100 if release else 200) + index,
+                }
+            )
+    trace.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    with pytest.raises(AssertionError, match="apply phases"):
+        summarize(directory)
 
 
 @pytest.mark.parametrize("layout", ["ep4", "dp2-tp2-ep4"])
