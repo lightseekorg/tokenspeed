@@ -584,8 +584,10 @@ def test_one_pass_mix_matches_the_split_equations(
         if dtype == torch.float32:
             torch.testing.assert_close(actual, expected, rtol=2e-5, atol=3e-6)
         else:
+            # The one-pass mix permits another FP32 summation order. Near-zero
+            # values retain that cancellation error after BF16 rounding.
             torch.testing.assert_close(
-                actual.float(), expected.float(), rtol=8e-3, atol=0
+                actual.float(), expected.float(), rtol=8e-3, atol=3e-6
             )
 
 
