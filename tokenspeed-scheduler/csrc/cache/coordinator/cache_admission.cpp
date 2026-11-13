@@ -88,10 +88,11 @@ struct TailSlots {
 TailSlots tailSlots(const GroupGeometry& geometry, std::int32_t prefix_granularity, std::int32_t tokens) {
     const std::int32_t block_granularity = geometry.BlockGranularity();
     const std::int32_t page_tokens = tokens - tokens % prefix_granularity;
-    const std::int32_t past_end = (tokens + block_granularity - 1) / block_granularity;
-    return TailSlots{.first = page_tokens / block_granularity,
-                     .past_end = past_end,
-                     .available_tokens = past_end * block_granularity - tokens};
+    const std::int32_t past_end = CeilDiv(tokens, block_granularity);
+    return TailSlots{
+        .first = page_tokens / block_granularity,
+        .past_end = past_end,
+        .available_tokens = static_cast<std::int32_t>(std::int64_t{past_end} * block_granularity - tokens)};
 }
 
 class AdmissionPlanner {

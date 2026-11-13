@@ -386,7 +386,7 @@ CacheCoordinator::BlockRange CacheCoordinator::SlidingWindowBlocks(std::int32_t 
     const CacheGroupSpec& spec = groups_[static_cast<std::size_t>(i)].Spec();
     _assert(spec.attn_kind == AttnKind::kSlidingWindow, "only a sliding group has a window behind a boundary");
     const std::int32_t block_granularity = geometry_[static_cast<std::size_t>(i)].BlockGranularity();
-    const std::int32_t past_end = (boundary_tokens + block_granularity - 1) / block_granularity;
+    const std::int32_t past_end = CeilDiv(boundary_tokens, block_granularity);
     const std::int32_t first_row = std::max(0, boundary_tokens - spec.sliding_window + 1);
     if (first_row >= boundary_tokens) {
         return BlockRange{.first = past_end, .past_end = past_end};  // W == 1: nothing behind the query
@@ -860,8 +860,9 @@ bool CacheCoordinator::stateGroupsAcceptBoundary(std::span<const std::size_t> ma
 template <typename Visit>
 void CacheCoordinator::forEachCandidateBoundary(const PromptPrefix& prompt, std::int32_t floor_tokens,
                                                 std::int32_t from_tokens, const Visit& visit) const {
-    for (std::int32_t page = from_tokens / prefix_granularity_; (page + 1) * prefix_granularity_ > floor_tokens;
-         --page) {
+    // The end of the page containing from_tokens can pass INT32_MAX.
+    for (std::int32_t page = from_tokens / prefix_granularity_;
+         (std::int64_t{page} + 1) * prefix_granularity_ > floor_tokens; --page) {
         const std::int32_t page_tokens = page * prefix_granularity_;
         if (static_cast<std::size_t>(page) <= prompt.prefix_hashes.size() && !prompt.tokens.empty()) {
             const ContentHash prior =
@@ -1028,8 +1029,10 @@ CacheCoordinator::PrefixProbe::Tier CacheCoordinator::probeTier(const PromptPref
     // tail there extends it) and descend from that coverage itself. With no
     // closed group every published boundary below the bound is a candidate.
     const std::int32_t from_tokens =
-        closed_order.empty() ? prompt.max_tokens
-                             : std::min(aligned.num_common_tokens + prefix_granularity_ - 1, prompt.max_tokens);
+        closed_order.empty()
+            ? prompt.max_tokens
+            : static_cast<std::int32_t>(std::min<std::int64_t>(
+                  std::int64_t{aligned.num_common_tokens} + prefix_granularity_ - 1, prompt.max_tokens));
     forEachCandidateBoundary(prompt, /*floor_tokens=*/0, from_tokens, visit);
     if (out.num_common_tokens == 0) {
         // No boundary matched: no group claims anything on the Device.
@@ -1215,9 +1218,10 @@ void CacheCoordinator::probeHostSuffix(const PromptPrefix& prompt, std::span<con
         host.tail = holds_tail(host_tail) ? std::optional{std::move(host_tail)} : std::nullopt;
         return false;
     };
-    const std::int32_t from_tokens = closed_order.empty()
-                                         ? prompt.max_tokens
-                                         : std::min(host_kv_end_tokens + prefix_granularity_ - 1, prompt.max_tokens);
+    const std::int32_t from_tokens =
+        closed_order.empty() ? prompt.max_tokens
+                             : static_cast<std::int32_t>(std::min<std::int64_t>(
+                                   std::int64_t{host_kv_end_tokens} + prefix_granularity_ - 1, prompt.max_tokens));
     forEachCandidateBoundary(prompt, above_tokens, from_tokens, visit);
 }
 
@@ -1361,7 +1365,8 @@ CacheCoordinator::PrefixProbe CacheCoordinator::ProbePrefix(std::span<const std:
     return ProbePromptPrefix(PromptPrefix{
         .prefix_hashes = content_hashes,
         .tokens = {},
-        .max_tokens = static_cast<std::int32_t>(content_hashes.size()) * prefix_granularity_,
+        .max_tokens = CheckedInt32(static_cast<std::int64_t>(content_hashes.size()) * prefix_granularity_,
+                                   "a probed prefix exceeds int32 token positions"),
     });
 }
 
@@ -3037,9 +3042,12 @@ CacheCoordinator::DataSpan dataSpan(const BlockTable& table, const GroupGeometry
         return CacheCoordinator::DataSpan{.blocks = table.NumBlocks(), .tail_tokens = 0};
     }
     const std::int32_t block_granularity = geometry.BlockGranularity();
-    const std::int32_t covering = (num_tokens + block_granularity - 1) / block_granularity;
+    const std::int32_t covering = CeilDiv(num_tokens, block_granularity);
     _assert(covering <= table.NumBlocks(), "snapshot token count exceeds the table's logical fill");
-    return CacheCoordinator::DataSpan{.blocks = covering, .tail_tokens = covering * block_granularity - num_tokens};
+    // Less than one block, though the covering blocks' capacity can pass INT32_MAX.
+    return CacheCoordinator::DataSpan{
+        .blocks = covering,
+        .tail_tokens = static_cast<std::int32_t>(std::int64_t{covering} * block_granularity - num_tokens)};
 }
 
 }  // namespace

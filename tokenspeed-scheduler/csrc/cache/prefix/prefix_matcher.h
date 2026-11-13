@@ -165,9 +165,7 @@ public:
 
 private:
     // Cached pages a boundary needs behind it: they cover the window's last (window - 1) tokens.
-    std::int32_t pagesNeededToResume() const {
-        return (sliding_window_ - 1 + block_granularity_ - 1) / block_granularity_;
-    }
+    std::int32_t pagesNeededToResume() const { return CeilDiv(sliding_window_ - 1, block_granularity_); }
 
     struct ResumableBoundary {
         std::int32_t boundary;    // == begin_blocks when no boundary qualifies
